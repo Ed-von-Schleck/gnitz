@@ -20,7 +20,7 @@ fn eval_with_emit(ev: &Evaluator, mb: &TestView, row: usize) -> (i64, bool, u64,
     let mut emit_vals: Vec<i64> = Vec::new();
     let mut emit_null_mask: u64 = 0;
     ev.eval_morsels(mb, row, 1, |_, out| {
-        for (src, payload) in ev.emit_targets() {
+        for (src, payload, _is_str) in ev.emit_targets() {
             let mut is_null = false;
             out.for_each_null_row(src as usize, |_| is_null = true);
             if is_null {
@@ -1801,7 +1801,7 @@ fn test_validate_load_col_int_requires_fixed_int() {
     ] {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
-        assert_eq!(prog.validate(Some(&schema), None), Ok(()), "type code {tc}");
+        assert_eq!(prog.validate(Some(&schema), None), Ok(0), "type code {tc}");
     }
 }
 
@@ -1827,8 +1827,8 @@ fn test_validate_load_col_float_requires_float() {
             "LOAD_COL_FLOAT must reject type code {tc}"
         );
     }
-    assert_eq!(case(type_code::F32), Ok(()));
-    assert_eq!(case(type_code::F64), Ok(()));
+    assert_eq!(case(type_code::F32), Ok(0));
+    assert_eq!(case(type_code::F64), Ok(0));
 }
 
 /// The string compares read 16-byte German-string cells with `col_data(pi, 16)`,
@@ -1850,8 +1850,8 @@ fn test_validate_str_opcodes_require_german_string() {
             want: ColKind::GermanString,
         })
     );
-    assert_eq!(vs_const(type_code::STRING), Ok(()));
-    assert_eq!(vs_const(type_code::BLOB), Ok(()));
+    assert_eq!(vs_const(type_code::STRING), Ok(0));
+    assert_eq!(vs_const(type_code::BLOB), Ok(0));
 
     // STR_COL_EQ_COL (43) col_a=1 col_b=2 — both operands are checked.
     let vs_col = |a: u8, b: u8| {
@@ -1875,7 +1875,7 @@ fn test_validate_str_opcodes_require_german_string() {
             want: ColKind::GermanString,
         })
     );
-    assert_eq!(vs_col(type_code::STRING, type_code::BLOB), Ok(()));
+    assert_eq!(vs_col(type_code::STRING, type_code::BLOB), Ok(0));
 }
 
 /// `IsNull`/`IsNotNull` read the NULL bitmap and nothing else, so any payload
@@ -1887,7 +1887,7 @@ fn test_validate_null_tests_accept_any_payload_column() {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         for op in [30u32, 31] {
             let prog = LogicalProgram::from_wire(&[op, 0, 1, 0], 1, 0, vec![]).unwrap();
-            assert_eq!(prog.validate(Some(&schema), None), Ok(()), "opcode {op} type {tc}");
+            assert_eq!(prog.validate(Some(&schema), None), Ok(0), "opcode {op} type {tc}");
         }
     }
 }
@@ -1916,7 +1916,7 @@ fn test_validate_copy_col_type_compatibility() {
         (type_code::U32, type_code::I64),
         (type_code::U8, type_code::I16),
     ] {
-        assert_eq!(pair(src, dst), Ok(()), "{src} -> {dst} must be accepted");
+        assert_eq!(pair(src, dst), Ok(0), "{src} -> {dst} must be accepted");
     }
     for (src, dst) in [
         (type_code::STRING, type_code::U64),
@@ -1941,9 +1941,9 @@ fn test_validate_copy_col_type_compatibility() {
     let in_pk = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
     let out_pk = TestSchema::with_pk_at(0, &[type_code::I64, type_code::U64]);
     let prog = LogicalProgram::from_wire(&[34, 0, 0, 0], 0, 0, vec![]).unwrap();
-    assert_eq!(prog.validate(Some(&in_pk), Some(&out_pk)), Ok(()));
+    assert_eq!(prog.validate(Some(&in_pk), Some(&out_pk)), Ok(0));
     // Both output-side checks are inert for a filter (`out_schema = None`).
-    assert_eq!(prog.validate(Some(&in_pk), None), Ok(()));
+    assert_eq!(prog.validate(Some(&in_pk), None), Ok(0));
 }
 
 /// EMIT stores a whole 8-byte register image: a 16-byte slot panics on the first
@@ -1959,12 +1959,21 @@ fn test_validate_emit_slot_must_be_eight_bytes() {
             .validate(Some(&schema), Some(&schema))
     };
     for tc in [type_code::I64, type_code::U64, type_code::F64] {
-        assert_eq!(case(tc), Ok(()), "type code {tc}");
+        assert_eq!(case(tc), Ok(0), "type code {tc}");
     }
-    for tc in [type_code::STRING, type_code::U128, type_code::F32] {
+    for tc in [type_code::U128, type_code::F32] {
         assert_eq!(
             case(tc),
             Err(ExprValidateErr::EmitSlotNotEightBytes { out: 0, type_code: tc }),
+            "type code {tc}"
+        );
+    }
+    // A German-string slot is refused on class, before the stride rule: the
+    // source register is scalar, and the two errors name different faults.
+    for tc in [type_code::STRING, type_code::BLOB] {
+        assert_eq!(
+            case(tc),
+            Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code: tc }),
             "type code {tc}"
         );
     }
@@ -1985,7 +1994,7 @@ fn test_validate_output_index_map_vs_filter() {
         })
     );
     // The same output opcode in a FILTER (out_schema None) is a harmless no-op.
-    assert_eq!(prog.validate(Some(&in_schema), None), Ok(()));
+    assert_eq!(prog.validate(Some(&in_schema), None), Ok(0));
 }
 
 /// Output coverage: with an `out_schema`, every declared payload slot must be
@@ -2008,7 +2017,7 @@ fn test_validate_rejects_unwritten_output_slot() {
     // Both slots written — accepted.
     assert_eq!(
         map(&[34, 0, 1, 0, 34, 0, 2, 1]).validate(Some(&schema), Some(&schema)),
-        Ok(())
+        Ok(0)
     );
 
     // Only slot 0 written.
@@ -2030,7 +2039,7 @@ fn test_validate_rejects_unwritten_output_slot() {
     );
 
     // A predicate over the same program is unaffected — no output plan.
-    assert_eq!(map(&[34, 0, 1, 0]).validate(Some(&schema), None), Ok(()));
+    assert_eq!(map(&[34, 0, 1, 0]).validate(Some(&schema), None), Ok(0));
 }
 
 #[test]
@@ -2493,4 +2502,356 @@ fn test_int_cast_records_the_source_signedness() {
     };
     assert!(src_signed_of(1), "an I64 column is a signed source");
     assert!(!src_signed_of(2), "a U64 column is an unsigned source");
+}
+
+// ---------------------------------------------------------------------------
+// Register classes and single-assignment
+// ---------------------------------------------------------------------------
+
+use gnitz_wire::{
+    EXPR_BOOL_AND, EXPR_CMP_GT, EXPR_EMIT, EXPR_LOAD_COL_INT, EXPR_LOAD_COL_STR, EXPR_LOAD_CONST, EXPR_STR_CMP_EQ,
+    EXPR_STR_CONCAT, EXPR_STR_SELECT, EXPR_STR_SUBSTR, EXPR_STR_TRIM, EXPR_STR_UPPER,
+};
+
+/// Decode a wire program and keep only the verdict. The class rules are
+/// schema-free, so this is where a forged program meets them — before any schema
+/// is in hand.
+fn from_wire(code: &[u32], num_regs: u32) -> Result<(), ExprValidateErr> {
+    wire_verdict(code, num_regs, 0)
+}
+
+fn wire_verdict(code: &[u32], num_regs: u32, result_reg: u32) -> Result<(), ExprValidateErr> {
+    LogicalProgram::from_wire(code, num_regs, result_reg, vec![]).map(|_| ())
+}
+
+/// A mixed-class register operand is refused whichever way round it goes: a
+/// string opcode reading the scalar file would resolve a lane that was never
+/// written, and an integer opcode reading a string register would interpret
+/// whatever i64 sits at that index.
+#[test]
+fn operand_class_is_enforced_in_both_directions() {
+    // LOAD_COL_INT into reg 0, then UPPER of it.
+    assert_eq!(
+        from_wire(&[EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_STR_UPPER, 1, 0, 0], 2),
+        Err(ExprValidateErr::RegClassMismatch { reg: 0 })
+    );
+    // LOAD_COL_STR into reg 0, then integer ADD of it.
+    assert_eq!(
+        from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0, gnitz_wire::EXPR_INT_ADD, 1, 0, 0], 2),
+        Err(ExprValidateErr::RegClassMismatch { reg: 0 })
+    );
+    // The mixed-class opcodes police each half separately: SUBSTR's source must
+    // be a string and its bounds must not be.
+    assert_eq!(
+        from_wire(&[EXPR_LOAD_CONST, 0, 1, 0, EXPR_STR_SUBSTR, 1, 0, 0], 2),
+        Err(ExprValidateErr::RegClassMismatch { reg: 0 })
+    );
+    assert_eq!(
+        from_wire(
+            &[
+                EXPR_LOAD_COL_STR,
+                0,
+                1,
+                0, //
+                EXPR_LOAD_COL_STR,
+                1,
+                1,
+                0, //
+                EXPR_STR_SUBSTR,
+                2,
+                0,
+                1,
+            ],
+            3
+        ),
+        Err(ExprValidateErr::RegClassMismatch { reg: 1 }),
+        "a string register cannot be a window bound"
+    );
+}
+
+/// Reading a string register *before* its writer is the case that matters: a
+/// stale lane would resolve against a refilled arena and hand back another row's
+/// bytes. It is caught by the same clear bit, which only works because the mask
+/// is maintained in program order by the walk that checks it.
+#[test]
+fn string_operand_read_before_its_writer_is_refused() {
+    // UPPER of reg 1 at instruction 0; reg 1's only writer is instruction 1.
+    let code = [EXPR_STR_UPPER, 0, 1, 0, EXPR_LOAD_COL_STR, 1, 1, 0];
+    assert_eq!(from_wire(&code, 2), Err(ExprValidateErr::RegClassMismatch { reg: 1 }));
+    // The same two instructions in the other order are legal, so the rejection
+    // above is about ordering and not about the instructions themselves.
+    let ordered = [EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_STR_UPPER, 1, 0, 0];
+    assert!(from_wire(&ordered, 2).is_ok());
+}
+
+/// The multi-operand string opcodes join the existing SSA anti-aliasing arms:
+/// their kernels split `str_views` at `dst` while reading a source window, and
+/// `split_windows`' disjointness guard is a `debug_assert` release compiles out.
+#[test]
+fn string_ops_are_anti_aliased_against_their_destination() {
+    let load_two = [EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_LOAD_COL_STR, 1, 2, 0];
+    let alias = |op: u32, dst: u32, a: u32, b: u32| {
+        let mut code = load_two.to_vec();
+        code.extend_from_slice(&[op, dst, a, b]);
+        from_wire(&code, 3)
+    };
+    for (op, a, b) in [(EXPR_STR_CMP_EQ, 0, 1), (EXPR_STR_CONCAT, 0, 1)] {
+        assert!(
+            matches!(alias(op, 0, a, b), Err(ExprValidateErr::RegisterAliasing { .. })),
+            "opcode {op} must not write one of its own sources"
+        );
+    }
+    // STR_SELECT packs `a | b << 16`, and SUBSTR `start | len << 16`.
+    let sel = |dst: u32, cond: u32, a: u32, b: u32| {
+        let mut code = load_two.to_vec();
+        code.extend_from_slice(&[EXPR_STR_SELECT, dst, cond, gnitz_wire::pack_operand_pair(a, b)]);
+        from_wire(&code, 3)
+    };
+    assert!(matches!(sel(1, 2, 0, 1), Err(ExprValidateErr::RegisterAliasing { .. })));
+    // `dst == a` where the register was never written: only the aliasing arm
+    // catches this, since a never-written register also reads as class-clear.
+    let mut code = vec![EXPR_LOAD_COL_STR, 0, 1, 0];
+    code.extend_from_slice(&[EXPR_STR_SUBSTR, 0, 0, 1]);
+    assert!(matches!(
+        from_wire(&code, 2),
+        Err(ExprValidateErr::RegisterAliasing { .. })
+    ));
+}
+
+/// Single-assignment stops being a client convention and becomes a checked rule.
+/// Every planner-emitted program is already SSA (`alloc_reg` is a monotonic
+/// counter), so nothing legitimate is refused.
+#[test]
+fn a_register_may_have_only_one_writer() {
+    // Same class.
+    assert_eq!(
+        from_wire(&[EXPR_LOAD_CONST, 0, 1, 0, EXPR_LOAD_CONST, 0, 2, 0], 1),
+        Err(ExprValidateErr::RegRewrite { reg: 0 })
+    );
+    // Across classes, which is what makes a register's class well-defined.
+    assert_eq!(
+        from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_LOAD_CONST, 0, 2, 0], 1),
+        Err(ExprValidateErr::RegRewrite { reg: 0 })
+    );
+    // The aliasing check keeps precedence, so the more specific diagnosis wins.
+    assert!(matches!(
+        from_wire(&[EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_CMP_GT, 0, 0, 0], 1),
+        Err(ExprValidateErr::RegisterAliasing { .. })
+    ));
+    // A register-free `CopyCol` program has no `dst` to collide.
+    assert!(LogicalProgram::copy_cols(&[0, 1, 2]).payload_copy_srcs().is_some());
+}
+
+/// Rewriting an AND-chain spine register miscompiles the filter, and it does so
+/// in two distinct ways — so a rule that tracked only AND writers would close
+/// one and leave the other open. Both are `RegRewrite` now.
+#[test]
+fn and_chain_spine_rewrites_are_refused() {
+    // Registers 0 and 1 are the compare operands; the leaves start at 2.
+    let leaves = |n: u32| {
+        let mut code = vec![EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_LOAD_CONST, 1, 0, 0];
+        for r in 0..n {
+            code.extend_from_slice(&[EXPR_CMP_GT, 2 + r, 0, 1]);
+        }
+        code
+    };
+    // (a) A second BoolAnd writes the spine register. `and_writer` then points
+    // at the dead rewrite, so the spine is marked from the wrong producer and
+    // the dead tail zeroes `result_reg` for rows the real chain passes.
+    let mut a = leaves(5); // leaves in registers 2..7
+    a.extend_from_slice(&[EXPR_BOOL_AND, 7, 2, 3]);
+    a.extend_from_slice(&[EXPR_BOOL_AND, 8, 7, 4]);
+    a.extend_from_slice(&[EXPR_BOOL_AND, 7, 5, 6]); // the dead rewrite
+    a.extend_from_slice(&[EXPR_BOOL_AND, 9, 8, 5]);
+    assert_eq!(wire_verdict(&a, 10, 9), Err(ExprValidateErr::RegRewrite { reg: 7 }));
+
+    // (b) A *non*-AND writes it. `and_writer` is perfectly correct here and the
+    // mask is still wrong: the trigger fires on the AND's value while the
+    // terminal consumes the overwritten one.
+    let mut b = leaves(3); // leaves in registers 2..5
+    b.extend_from_slice(&[EXPR_BOOL_AND, 5, 2, 3]);
+    b.extend_from_slice(&[EXPR_LOAD_CONST, 5, 1, 0]); // the non-AND rewrite
+    b.extend_from_slice(&[EXPR_BOOL_AND, 6, 5, 4]);
+    assert_eq!(wire_verdict(&b, 7, 6), Err(ExprValidateErr::RegRewrite { reg: 5 }));
+}
+
+/// The legal single-writer shape of the same predicate must still earn its
+/// dead-tail skip, so closing the miscompile does not silently disable the
+/// optimization.
+#[test]
+fn the_legal_and_chain_still_earns_its_trigger_mask() {
+    let schema = schema_pk_ints(3, true);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 1 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        },
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
+        LogicalInstr::LoadColInt { dst: 6, col: 3 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 7,
+            a: 6,
+            b: 1,
+        },
+        LogicalInstr::BoolAnd { dst: 8, a: 5, b: 7 },
+    ];
+    let prog = filter_prog(&schema, instrs, 9, 8, vec![]).prog;
+    assert_eq!(prog.chain_trigger_mask, 1u64 << 5);
+}
+
+/// EMIT's destination must hold what its source register's class stores. A
+/// mismatch either way is caught before eval, where it would write an 8-byte
+/// register image into a 16-byte cell (or the reverse).
+#[test]
+fn emit_class_must_match_its_destination_column() {
+    // out: [U64 PK, STRING].
+    let str_out = TestSchema::with_pk_at(0, &[type_code::U64, type_code::STRING]);
+    let int_out = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
+    let in_str = TestSchema::with_pk_at(0, &[type_code::U64, type_code::STRING]);
+
+    let scalar_src = LogicalProgram::from_wire(&[EXPR_LOAD_CONST, 0, 7, 0, EXPR_EMIT, 0, 0, 0], 1, 0, vec![]).unwrap();
+    assert_eq!(
+        scalar_src.validate(Some(&in_str), Some(&str_out)),
+        Err(ExprValidateErr::EmitClassMismatch {
+            out: 0,
+            type_code: type_code::STRING
+        })
+    );
+
+    let str_src = LogicalProgram::from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_EMIT, 0, 0, 0], 1, 0, vec![]).unwrap();
+    assert_eq!(
+        str_src.validate(Some(&in_str), Some(&int_out)),
+        Err(ExprValidateErr::EmitClassMismatch {
+            out: 0,
+            type_code: type_code::I64
+        })
+    );
+    // The matching pairing is accepted, and reports reg 0 as a string.
+    assert_eq!(str_src.validate(Some(&in_str), Some(&str_out)), Ok(1));
+    assert_eq!(scalar_src.validate(Some(&in_str), Some(&int_out)), Ok(0));
+}
+
+/// The result register's class splits the two resolvers that make the identical
+/// `validate` call: a filter reads its verdict out of the scalar file, while a
+/// SET right-hand side wants exactly a string back.
+#[test]
+fn a_string_result_register_resolves_as_a_scalar_but_not_as_a_filter() {
+    let schema = schema_pk_strings(1, true);
+    let prog = || LogicalProgram::from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0], 1, 0, vec![]).unwrap();
+    assert_eq!(
+        prog().resolve_filter(&schema).err(),
+        Some(ExprValidateErr::RegClassMismatch { reg: 0 })
+    );
+    assert!(prog().resolve_scalar(&schema).is_ok());
+}
+
+#[test]
+fn load_col_str_requires_a_german_string_column() {
+    let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
+    assert_eq!(
+        LogicalProgram::from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0], 1, 0, vec![])
+            .unwrap()
+            .validate(Some(&schema), None),
+        Err(ExprValidateErr::ColKindMismatch {
+            col: 1,
+            type_code: type_code::I64,
+            want: ColKind::GermanString,
+        })
+    );
+}
+
+#[test]
+fn trim_mode_and_cast_target_are_narrowed_at_decode() {
+    let trim = |mode: u32| {
+        LogicalProgram::from_wire(
+            &[
+                EXPR_LOAD_COL_STR,
+                0,
+                1,
+                0,
+                EXPR_STR_TRIM,
+                1,
+                gnitz_wire::pack_operand_pair(0, mode),
+                0,
+            ],
+            2,
+            1,
+            vec![b" ".to_vec()],
+        )
+        .map(|_| ())
+    };
+    for mode in 0..3 {
+        assert!(trim(mode).is_ok(), "mode {mode}");
+    }
+    assert_eq!(trim(3), Err(ExprValidateErr::BadTrimMode { mode: 3 }));
+
+    assert_eq!(
+        wire_verdict(
+            &[EXPR_LOAD_COL_STR, 0, 1, 0, gnitz_wire::EXPR_STR_TO_INT, 1, 0, 999],
+            2,
+            1
+        ),
+        Err(ExprValidateErr::BadCastTarget { tc: 999 })
+    );
+}
+
+/// `UPPER` of a non-nullable column introduces no NULL, so the `no_nulls` fast
+/// path survives it; the parses and SUBSTR do not.
+#[test]
+fn string_nullability_classification() {
+    let schema = schema_pk_strings(1, false);
+    let no_nulls = |tail: Vec<LogicalInstr>, num_regs: u32, result: u32| {
+        let mut instrs = vec![LogicalInstr::LoadColStr { dst: 0, col: 1 }];
+        instrs.extend(tail);
+        scalar_prog(&schema, instrs, num_regs, result, vec![]).prog.no_nulls
+    };
+    assert!(no_nulls(
+        vec![LogicalInstr::StrCase {
+            dst: 1,
+            a: 0,
+            upper: true
+        }],
+        2,
+        1
+    ));
+    assert!(!no_nulls(
+        vec![LogicalInstr::StrToInt {
+            dst: 1,
+            a: 0,
+            tc: type_code::I64 as u32,
+        }],
+        2,
+        1
+    ));
+    // SUBSTR's only NULL is a negative length, so the two forms classify
+    // differently: with a FOR clause it can produce one, without it cannot. The
+    // window itself is total either way.
+    let substr = |len_reg: Option<u16>| {
+        let mut tail = vec![LogicalInstr::LoadConst { dst: 1, val: 1 }];
+        if len_reg.is_some() {
+            tail.push(LogicalInstr::LoadConst { dst: 2, val: 3 });
+        }
+        let dst = if len_reg.is_some() { 3 } else { 2 };
+        tail.push(LogicalInstr::StrSubstr {
+            dst,
+            src: 0,
+            start_reg: 1,
+            len_reg,
+        });
+        no_nulls(tail, dst as u32 + 1, dst as u32)
+    };
+    assert!(substr(None), "no FOR clause writes no fail flag");
+    assert!(!substr(Some(2)), "a FOR clause can name a negative length");
 }

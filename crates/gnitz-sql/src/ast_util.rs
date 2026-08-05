@@ -274,6 +274,19 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
         // CEIL/FLOOR/CAST reach the binder as their own AST nodes rather than as
         // function calls, so their operand needs naming here explicitly.
         Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } | Expr::Cast { expr, .. } => vec![expr],
+        // SUBSTRING and TRIM are keyword-dispatched too. TRIM's `trim_what` is a
+        // literal by the time the binder accepts it, but it is a bound operand
+        // position and belongs in the walk regardless.
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => std::iter::once(expr.as_ref())
+            .chain(substring_from.as_deref())
+            .chain(substring_for.as_deref())
+            .collect(),
+        Expr::Trim { expr, trim_what, .. } => std::iter::once(expr.as_ref()).chain(trim_what.as_deref()).collect(),
         Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
         // CASE operands: the optional operand, every WHEN condition + result, and
         // the optional ELSE — the node set `bind_structural`'s Case arm recurses

@@ -80,15 +80,26 @@ pub(crate) fn is_integer_type(tc: TypeCode) -> bool {
     )
 }
 
-/// Whether a value of this type fits the expression VM's 8-byte register image.
-/// Wide integer-ish types (U128/UUID/I128) have no i64 slot, and STRING/BLOB
-/// hold a 16-byte descriptor whose integer widening reads the prefix as a
-/// garbage signed int. Everything else — narrow and 64-bit ints, and floats —
-/// has a register image and so can be compared, cast, or accumulated there.
-/// The one home for that rule: MIN/MAX (aggregate and scalar) and the CAST
-/// target check all query it.
-pub(crate) fn has_register_image(tc: TypeCode) -> bool {
+/// Whether a value of this type fits the expression VM's 8-byte *scalar*
+/// register. Wide integer-ish types (U128/UUID/I128) have no i64 slot, and
+/// STRING/BLOB hold a 16-byte descriptor whose integer widening reads the prefix
+/// as a garbage signed int. Everything else — narrow and 64-bit ints, and floats
+/// — lands in a scalar register and so can be compared or accumulated there.
+///
+/// Not the same question as `register_image`, which is total over *both*
+/// register classes and maps STRING to itself. The one home for the scalar rule;
+/// MIN/MAX orderability (aggregate and scalar) is its user.
+pub(crate) fn has_scalar_register(tc: TypeCode) -> bool {
     !tc.is_wide_int() && !tc.is_german_string()
+}
+
+/// Whether `CAST(… AS tc)` has a form the VM can compute. STRING joins the
+/// scalar-register types because the VM has a string register class of its own;
+/// BLOB does not, and is not expressible anyway — `sql_type_to_typecode`
+/// produces `TypeCode::Blob` for no SQL type. This is the codebase's only
+/// cast-target gate.
+pub(crate) fn is_cast_target(tc: TypeCode) -> bool {
+    has_scalar_register(tc) || tc == TypeCode::String
 }
 
 /// True iff every value of integer type `child` is representable in integer type

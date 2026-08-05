@@ -3,10 +3,12 @@ use crate::agg::reject_min_max_unorderable;
 use crate::ast_util::{classify_agg_call, function_positional_args, single_fn_name, single_relation_col_name};
 use crate::codec::pk_codec::{extract_sql_literal, SqlLiteral};
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr, NumFunc, UnaryOp};
-use crate::types::{has_register_image, sql_type_to_typecode};
+use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr, NumFunc, StrFunc, TrimMode, UnaryOp};
+use crate::types::{is_cast_target, sql_type_to_typecode};
 use gnitz_core::{ColumnDef, Schema};
-use sqlparser::ast::{BinaryOperator, CaseWhen, CeilFloorKind, DateTimeField, Expr, Function, UnaryOperator, Value};
+use sqlparser::ast::{
+    BinaryOperator, CaseWhen, CeilFloorKind, DateTimeField, Expr, Function, TrimWhereField, UnaryOperator, Value,
+};
 
 /// Bind an expression against a single-relation schema (WHERE, projections,
 /// set-op branches, DML). The structural recursion lives in `bind_structural`;
@@ -100,14 +102,55 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                 return Err(GnitzSqlError::Unsupported("CAST … FORMAT is not supported".into()));
             }
             let to = sql_type_to_typecode(data_type)?;
-            // The register file holds an 8-byte image, so the 16-byte types and
-            // the German strings are not cast targets.
-            if !has_register_image(to) {
+            // The 16-byte wide integer types have no register at all.
+            if !is_cast_target(to) {
                 return Err(GnitzSqlError::Unsupported(format!("CAST to {to:?} is not supported")));
             }
             Ok(BExpr::Cast {
                 expr: Box::new(bind_structural(e, leaf)?),
                 to,
+            })
+        }
+        // SUBSTR and SUBSTRING, the `FROM/FOR` form and the comma form, all
+        // arrive as this one keyword-dispatched node; `special`/`shorthand` only
+        // record which spelling was written. An absent FROM starts at 1.
+        Expr::Substring {
+            expr: e,
+            substring_from,
+            substring_for,
+            special: _,
+            shorthand: _,
+        } => Ok(BExpr::Substr {
+            s: Box::new(bind_structural(e, leaf)?),
+            start: Box::new(match substring_from {
+                Some(f) => bind_structural(f, leaf)?,
+                None => BExpr::LitInt(1),
+            }),
+            len: substring_for
+                .as_deref()
+                .map(|l| bind_structural(l, leaf))
+                .transpose()?
+                .map(Box::new),
+        }),
+        Expr::Trim {
+            trim_where,
+            trim_what,
+            expr: e,
+            trim_characters,
+        } => {
+            if trim_characters.is_some() {
+                return Err(GnitzSqlError::Unsupported(
+                    "TRIM(… , <characters>) is not supported".into(),
+                ));
+            }
+            Ok(BExpr::TrimCall {
+                s: Box::new(bind_structural(e, leaf)?),
+                mode: match trim_where {
+                    Some(TrimWhereField::Leading) => TrimMode::Leading,
+                    Some(TrimWhereField::Trailing) => TrimMode::Trailing,
+                    Some(TrimWhereField::Both) | None => TrimMode::Both,
+                },
+                set: trim_set(trim_what.as_deref())?,
             })
         }
         Expr::IsNull(i) => leaf.bind_null_test(i, true),
@@ -229,6 +272,30 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
     }
 }
 
+/// The bytes a TRIM strips: an ASCII string literal, defaulting to a single
+/// space.
+///
+/// A non-literal, non-ASCII or NULL set is rejected here rather than deferred,
+/// because the set is compile-time data the engine bakes into a membership
+/// table, not a per-row operand. Restricting it to ASCII is what makes the strip
+/// byte-wise and still character-safe: an ASCII byte never occurs inside a
+/// UTF-8 multibyte sequence. PostgreSQL instead treats `btrim(s, NULL)` as
+/// runtime NULL propagation.
+fn trim_set(trim_what: Option<&Expr>) -> Result<String, GnitzSqlError> {
+    let Some(e) = trim_what else {
+        return Ok(" ".to_string());
+    };
+    let bad = || GnitzSqlError::Unsupported("TRIM: the characters to trim must be an ASCII string literal".into());
+    let Expr::Value(v) = e else { return Err(bad()) };
+    // Through the one literal decoder, so TRIM accepts exactly the spellings
+    // every other string-literal position does; a NULL or numeric literal falls
+    // out as a non-`LitStr`.
+    match bind_literal::<()>(&v.value) {
+        Ok(BExpr::LitStr(s)) if s.is_ascii() => Ok(s),
+        _ => Err(bad()),
+    }
+}
+
 /// What a structurally-bound function name binds to.
 #[derive(Clone, Copy)]
 enum Call {
@@ -240,13 +307,18 @@ enum Call {
     Mod,
     /// GREATEST (`true`) / LEAST (`false`).
     MinMax(bool),
+    /// A unary string transform or measure over its single argument.
+    Str(StrFunc),
+    /// `LTRIM`/`RTRIM`: one argument, or two with a literal trim set.
+    Trim1(TrimMode),
+    Concat,
 }
 
 /// The function names `bind_structural` binds above the leaf, keyed by their SQL
 /// spelling (which also names the call in its arity errors). Matched
 /// case-insensitively. The one name→call map, like `AGG_NAMES` is for the
 /// aggregates: a name added here reaches every binding context at once.
-const SCALAR_CALLS: [(&str, Call); 9] = [
+const SCALAR_CALLS: &[(&str, Call)] = &[
     ("COALESCE", Call::Coalesce),
     ("NULLIF", Call::Nullif),
     ("ABS", Call::Unary(NumFunc::Abs)),
@@ -256,6 +328,15 @@ const SCALAR_CALLS: [(&str, Call); 9] = [
     ("MOD", Call::Mod),
     ("GREATEST", Call::MinMax(true)),
     ("LEAST", Call::MinMax(false)),
+    ("UPPER", Call::Str(StrFunc::Upper)),
+    ("LOWER", Call::Str(StrFunc::Lower)),
+    ("LENGTH", Call::Str(StrFunc::LenChars)),
+    ("CHAR_LENGTH", Call::Str(StrFunc::LenChars)),
+    ("CHARACTER_LENGTH", Call::Str(StrFunc::LenChars)),
+    ("OCTET_LENGTH", Call::Str(StrFunc::LenBytes)),
+    ("LTRIM", Call::Trim1(TrimMode::Leading)),
+    ("RTRIM", Call::Trim1(TrimMode::Trailing)),
+    ("CONCAT", Call::Concat),
 ];
 
 fn scalar_call(f: &Function) -> Option<(&'static str, Call)> {
@@ -285,15 +366,10 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
     match call {
         Call::Coalesce => bind_coalesce(&args, leaf),
         Call::Nullif => bind_nullif(&args, leaf),
-        Call::Unary(nf) => {
-            let [arg] = args.as_slice() else {
-                return Err(wrong_arity(name, "exactly one argument"));
-            };
-            Ok(BExpr::Func {
-                f: nf,
-                arg: Box::new(bind_structural(arg, leaf)?),
-            })
-        }
+        Call::Unary(nf) => Ok(BExpr::Func {
+            f: nf,
+            arg: Box::new(bind_one(name, &args, leaf)?),
+        }),
         Call::Round => bind_round(&args, leaf),
         // `MOD` is the `%` operator: the `IntMod` opcode is total, substituting a
         // safe divisor and masking the row NULL when the divisor is zero.
@@ -309,19 +385,46 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
         }
         // NULL skipping is the MAX2/MIN2 opcode's, so no argument needs a
         // null-test rewrite and a computed argument is as good as a column.
-        Call::MinMax(is_max) => {
-            if args.is_empty() {
-                return Err(wrong_arity(name, "at least one argument"));
-            }
-            Ok(BExpr::MinMaxN {
-                is_max,
-                args: args
-                    .iter()
-                    .map(|a| bind_structural(a, leaf))
-                    .collect::<Result<Vec<_>, _>>()?,
+        Call::MinMax(is_max) => Ok(BExpr::MinMaxN {
+            is_max,
+            args: bind_all(name, &args, leaf)?,
+        }),
+        Call::Str(sf) => Ok(BExpr::StrCall {
+            f: sf,
+            arg: Box::new(bind_one(name, &args, leaf)?),
+        }),
+        Call::Trim1(mode) => {
+            let (s, set) = match args.as_slice() {
+                [s] => (*s, None),
+                [s, set] => (*s, Some(*set)),
+                _ => return Err(wrong_arity(name, "one or two arguments")),
+            };
+            Ok(BExpr::TrimCall {
+                s: Box::new(bind_structural(s, leaf)?),
+                mode,
+                set: trim_set(set)?,
             })
         }
+        Call::Concat => Ok(BExpr::ConcatN {
+            args: bind_all(name, &args, leaf)?,
+        }),
     }
+}
+
+/// The single argument of a one-argument function, bound.
+fn bind_one<R: Clone, L: LeafBinder<R>>(name: &str, args: &[&Expr], leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
+    let [arg] = args else {
+        return Err(wrong_arity(name, "exactly one argument"));
+    };
+    bind_structural(arg, leaf)
+}
+
+/// Every argument of a variadic function, bound; at least one is required.
+fn bind_all<R: Clone, L: LeafBinder<R>>(name: &str, args: &[&Expr], leaf: &L) -> Result<Vec<BExpr<R>>, GnitzSqlError> {
+    if args.is_empty() {
+        return Err(wrong_arity(name, "at least one argument"));
+    }
+    args.iter().map(|a| bind_structural(a, leaf)).collect()
 }
 
 /// `ROUND(x)` / `ROUND(x, n)`. The scale rides the IR node rather than being
@@ -390,6 +493,7 @@ fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
         BinaryOperator::LtEq => BinOp::Le,
         BinaryOperator::And => BinOp::And,
         BinaryOperator::Or => BinOp::Or,
+        BinaryOperator::StringConcat => BinOp::Concat,
         o => {
             return Err(GnitzSqlError::Unsupported(format!(
                 "binary operator {o:?} not supported"
@@ -403,7 +507,7 @@ fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
 fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
     match v {
         // NULL is an ordinary value here: it lowers to `LOAD_NULL`, types as
-        // `unify_numeric`'s neutral element, and every consumer of the bound IR
+        // `unify_blend_type`'s neutral element, and every consumer of the bound IR
         // already has a `LitNull` arm. Only `bind_null_test`, which must resolve
         // a column, still rejects it.
         Value::Null => Ok(BExpr::LitNull),
@@ -1167,8 +1271,15 @@ mod tests {
                 other => panic!("{src}: expected Cast, got {other:?}"),
             }
         }
-        // Non-numeric targets: a numeric register has no image for any of them.
-        for src in ["CAST(c AS TEXT)", "CAST(c AS UUID)", "CAST(c AS DECIMAL(38,0))"] {
+        // STRING is a cast target too — the VM has a string register class.
+        for src in ["CAST(c AS TEXT)", "CAST(c AS VARCHAR(10))", "CAST(c AS CHAR(4))"] {
+            match bind_num(src).unwrap() {
+                BoundExpr::Cast { to, .. } => assert_eq!(to, TypeCode::String, "{src}"),
+                other => panic!("{src}: expected Cast, got {other:?}"),
+            }
+        }
+        // The 16-byte integer-ish targets have no register at all.
+        for src in ["CAST(c AS UUID)", "CAST(c AS DECIMAL(38,0))"] {
             assert_unsupported(bind_num(src), "is not supported");
         }
         // BOOLEAN has no gnitz type at all, so it rejects one level earlier.
@@ -1199,5 +1310,128 @@ mod tests {
         assert_unsupported(bind_num("ABS(DISTINCT c)"), "DISTINCT");
         assert_unsupported(bind_num("ABS(c) OVER ()"), "OVER");
         assert_unsupported(bind_num("GREATEST(c) FILTER (WHERE c > 0)"), "FILTER");
+    }
+
+    /// Bind against a schema whose `c` is a STRING, for the string surface.
+    fn bind_str(src: &str) -> Result<BoundExpr, GnitzSqlError> {
+        bind_single_table(&parse(src), &schema_with_val(TypeCode::String))
+    }
+
+    /// Every string function name reaches the same IR node, whichever of its
+    /// spellings is written. `LENGTH` and its two SQL-standard aliases must land
+    /// on the *character* measure and `OCTET_LENGTH` on the byte one — swapping
+    /// them is invisible until a multibyte value shows up.
+    #[test]
+    fn string_function_names_bind_to_their_measure_and_transform() {
+        for (src, want) in [
+            ("UPPER(c)", StrFunc::Upper),
+            ("lower(c)", StrFunc::Lower),
+            ("LENGTH(c)", StrFunc::LenChars),
+            ("CHAR_LENGTH(c)", StrFunc::LenChars),
+            ("character_length(c)", StrFunc::LenChars),
+            ("OCTET_LENGTH(c)", StrFunc::LenBytes),
+        ] {
+            match bind_str(src).unwrap() {
+                BExpr::StrCall { f, .. } => assert_eq!(f, want, "{src}"),
+                other => panic!("{src}: expected StrCall, got {other:?}"),
+            }
+        }
+        for src in ["UPPER()", "UPPER(c, c)", "LENGTH()"] {
+            assert_unsupported(bind_str(src), "exactly one argument");
+        }
+    }
+
+    /// The full TRIM syntax matrix collapses to `(mode, set)`. The keyword form
+    /// and the `LTRIM`/`RTRIM` calls must agree, since they lower identically.
+    #[test]
+    fn trim_syntax_matrix_collapses_to_a_mode_and_a_byte_set() {
+        for (src, mode, set) in [
+            ("TRIM(c)", TrimMode::Both, " "),
+            ("TRIM(BOTH c)", TrimMode::Both, " "),
+            ("TRIM(LEADING c)", TrimMode::Leading, " "),
+            ("TRIM(TRAILING c)", TrimMode::Trailing, " "),
+            ("TRIM(LEADING 'xy' FROM c)", TrimMode::Leading, "xy"),
+            ("TRIM(TRAILING 'xy' FROM c)", TrimMode::Trailing, "xy"),
+            ("TRIM('xy' FROM c)", TrimMode::Both, "xy"),
+            ("LTRIM(c)", TrimMode::Leading, " "),
+            ("RTRIM(c)", TrimMode::Trailing, " "),
+            ("LTRIM(c, 'xy')", TrimMode::Leading, "xy"),
+            ("RTRIM(c, 'xy')", TrimMode::Trailing, "xy"),
+        ] {
+            match bind_str(src).unwrap() {
+                BExpr::TrimCall { mode: m, set: st, .. } => assert_eq!((m, st.as_str()), (mode, set), "{src}"),
+                other => panic!("{src}: expected TrimCall, got {other:?}"),
+            }
+        }
+    }
+
+    /// The trim set is compile-time data the engine bakes into a membership
+    /// table, so it must be a literal — and ASCII, which is what keeps a
+    /// byte-wise strip from splitting a UTF-8 sequence.
+    #[test]
+    fn trim_set_must_be_an_ascii_literal() {
+        for src in ["TRIM(c FROM c)", "LTRIM(c, c)", "TRIM('ä' FROM c)", "TRIM(NULL FROM c)"] {
+            assert_unsupported(bind_str(src), "ASCII string literal");
+        }
+    }
+
+    /// `SUBSTR` and `SUBSTRING`, the `FROM/FOR` form and the comma form, all
+    /// arrive as one AST node; an absent FROM starts the window at 1.
+    #[test]
+    fn substring_spellings_bind_to_one_node() {
+        for src in [
+            "SUBSTRING(c FROM 2 FOR 3)",
+            "SUBSTRING(c, 2, 3)",
+            "SUBSTR(c, 2, 3)",
+            "SUBSTR(c FROM 2 FOR 3)",
+        ] {
+            match bind_str(src).unwrap() {
+                BExpr::Substr { start, len, .. } => {
+                    assert!(matches!(*start, BExpr::LitInt(2)), "{src}");
+                    assert!(matches!(len.as_deref(), Some(BExpr::LitInt(3))), "{src}");
+                }
+                other => panic!("{src}: expected Substr, got {other:?}"),
+            }
+        }
+        match bind_str("SUBSTRING(c)").unwrap() {
+            BExpr::Substr { start, len, .. } => {
+                assert!(matches!(*start, BExpr::LitInt(1)), "an absent FROM starts at 1");
+                assert!(len.is_none());
+            }
+            other => panic!("expected Substr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concat_binds_any_arity_and_the_operator_maps_to_its_own_binop() {
+        match bind_str("CONCAT(c, 'x', 42)").unwrap() {
+            BExpr::ConcatN { args } => assert_eq!(args.len(), 3),
+            other => panic!("expected ConcatN, got {other:?}"),
+        }
+        assert!(matches!(bind_str("CONCAT(c)").unwrap(), BExpr::ConcatN { .. }));
+        assert_unsupported(bind_str("CONCAT()"), "at least one argument");
+        assert!(matches!(
+            bind_str("c || 'x'").unwrap(),
+            BExpr::BinOp(_, BinOp::Concat, _)
+        ));
+    }
+
+    /// The walkers see through the two keyword-dispatched nodes. `EXCLUDED` is
+    /// the observable: a reference the walk cannot reach is one the `EXCLUDED`
+    /// guard and the aggregate collectors would silently miss.
+    #[test]
+    fn expr_operands_reaches_inside_substring_and_trim() {
+        use crate::ast_util::expr_operands;
+        for src in [
+            "SUBSTRING(EXCLUDED.c FROM 1)",
+            "SUBSTRING(c FROM EXCLUDED.n)",
+            "SUBSTRING(c FROM 1 FOR EXCLUDED.n)",
+            "TRIM(EXCLUDED.c)",
+            "TRIM('x' FROM EXCLUDED.c)",
+        ] {
+            let e = parse(src);
+            let found = expr_operands(&e).iter().any(|o| format!("{o}").contains("EXCLUDED"));
+            assert!(found, "{src}: the walker must reach the EXCLUDED reference");
+        }
     }
 }

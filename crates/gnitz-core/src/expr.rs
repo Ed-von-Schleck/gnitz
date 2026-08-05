@@ -1,13 +1,16 @@
 use gnitz_wire::{
-    TypeCode, EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE, EXPR_CMP_GT, EXPR_CMP_LE,
+    TrimMode, TypeCode, EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE, EXPR_CMP_GT, EXPR_CMP_LE,
     EXPR_CMP_LT, EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_FCMP_EQ, EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE,
     EXPR_FCMP_LT, EXPR_FCMP_NE, EXPR_FLOAT_ABS, EXPR_FLOAT_ADD, EXPR_FLOAT_CEIL, EXPR_FLOAT_DIV, EXPR_FLOAT_FLOOR,
     EXPR_FLOAT_MAX2, EXPR_FLOAT_MIN2, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_ROUND, EXPR_FLOAT_SUB,
-    EXPR_FLOAT_TO_F32, EXPR_FLOAT_TO_INT, EXPR_FLOAT_TRUNC, EXPR_INT_ABS, EXPR_INT_ADD, EXPR_INT_CAST, EXPR_INT_DIV,
-    EXPR_INT_IN_SET, EXPR_INT_MAX2, EXPR_INT_MIN2, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB,
-    EXPR_INT_TO_FLOAT, EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST,
-    EXPR_LOAD_NULL, EXPR_SELECT, EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL,
-    EXPR_STR_COL_LE_CONST, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
+    EXPR_FLOAT_TO_F32, EXPR_FLOAT_TO_INT, EXPR_FLOAT_TO_STR, EXPR_FLOAT_TRUNC, EXPR_INT_ABS, EXPR_INT_ADD,
+    EXPR_INT_CAST, EXPR_INT_DIV, EXPR_INT_IN_SET, EXPR_INT_MAX2, EXPR_INT_MIN2, EXPR_INT_MOD, EXPR_INT_MUL,
+    EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT, EXPR_INT_TO_STR, EXPR_IS_NOT_NULL, EXPR_IS_NULL,
+    EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_COL_STR, EXPR_LOAD_CONST, EXPR_LOAD_CONST_STR, EXPR_LOAD_NULL,
+    EXPR_LOAD_NULL_STR, EXPR_SELECT, EXPR_STR_CMP_EQ, EXPR_STR_CMP_LE, EXPR_STR_CMP_LT, EXPR_STR_COL_EQ_COL,
+    EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
+    EXPR_STR_CONCAT, EXPR_STR_CONCAT_NN, EXPR_STR_LEN_BYTES, EXPR_STR_LEN_CHARS, EXPR_STR_LOWER, EXPR_STR_SELECT,
+    EXPR_STR_SUBSTR, EXPR_STR_TO_FLOAT, EXPR_STR_TO_INT, EXPR_STR_TRIM, EXPR_STR_UPPER, STR_SUBSTR_NO_LEN,
 };
 
 /// A compiled expression program: a flat list of 4-word instructions
@@ -267,7 +270,7 @@ impl ExprBuilder {
 
     pub fn select(&mut self, cond: u32, a: u32, b: u32) -> u32 {
         let dst = self.alloc_reg();
-        self.emit(EXPR_SELECT, dst, cond, gnitz_wire::encode_select_operands(a, b));
+        self.emit(EXPR_SELECT, dst, cond, gnitz_wire::pack_operand_pair(a, b));
         dst
     }
 
@@ -355,6 +358,103 @@ impl ExprBuilder {
 
     pub fn str_col_le_col(&mut self, col_a: usize, col_b: usize) -> u32 {
         self.binary_op(EXPR_STR_COL_LE_COL, col_a as u32, col_b as u32)
+    }
+
+    // --- String registers ---
+
+    pub fn load_col_str(&mut self, col_idx: usize) -> u32 {
+        self.unary_op(EXPR_LOAD_COL_STR, col_idx as u32)
+    }
+
+    pub fn load_const_str(&mut self, const_idx: u32) -> u32 {
+        self.unary_op(EXPR_LOAD_CONST_STR, const_idx)
+    }
+
+    /// Materialize a NULL *string* into a fresh register. A string context must
+    /// emit this rather than [`Self::load_null`], so the register's class
+    /// matches what its consumers read.
+    pub fn load_null_str(&mut self) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_LOAD_NULL_STR, dst, 0, 0);
+        dst
+    }
+
+    pub fn str_select(&mut self, cond: u32, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_STR_SELECT, dst, cond, gnitz_wire::pack_operand_pair(a, b));
+        dst
+    }
+
+    pub fn str_cmp_eq(&mut self, a: u32, b: u32) -> u32 {
+        self.binary_op(EXPR_STR_CMP_EQ, a, b)
+    }
+    pub fn str_cmp_lt(&mut self, a: u32, b: u32) -> u32 {
+        self.binary_op(EXPR_STR_CMP_LT, a, b)
+    }
+    pub fn str_cmp_le(&mut self, a: u32, b: u32) -> u32 {
+        self.binary_op(EXPR_STR_CMP_LE, a, b)
+    }
+    pub fn str_len_bytes(&mut self, a: u32) -> u32 {
+        self.unary_op(EXPR_STR_LEN_BYTES, a)
+    }
+    pub fn str_len_chars(&mut self, a: u32) -> u32 {
+        self.unary_op(EXPR_STR_LEN_CHARS, a)
+    }
+    pub fn str_upper(&mut self, a: u32) -> u32 {
+        self.unary_op(EXPR_STR_UPPER, a)
+    }
+    pub fn str_lower(&mut self, a: u32) -> u32 {
+        self.unary_op(EXPR_STR_LOWER, a)
+    }
+
+    /// `len = None` (the no-FOR form) rides the `0xFFFF` sentinel, which no real
+    /// register can collide with.
+    pub fn str_substr(&mut self, src: u32, start: u32, len: Option<u32>) -> u32 {
+        let dst = self.alloc_reg();
+        let len_word = len.unwrap_or(STR_SUBSTR_NO_LEN);
+        self.emit(
+            EXPR_STR_SUBSTR,
+            dst,
+            src,
+            gnitz_wire::pack_operand_pair(start, len_word),
+        );
+        dst
+    }
+
+    /// `set_idx` names the const-pool entry holding the bytes to strip.
+    pub fn str_trim(&mut self, src: u32, mode: TrimMode, set_idx: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(
+            EXPR_STR_TRIM,
+            dst,
+            gnitz_wire::pack_operand_pair(src, mode.to_wire()),
+            set_idx,
+        );
+        dst
+    }
+
+    /// SQL `||`: NULL in either operand, NULL out.
+    pub fn str_concat(&mut self, a: u32, b: u32) -> u32 {
+        self.binary_op(EXPR_STR_CONCAT, a, b)
+    }
+
+    /// One `CONCAT(…)` fold step: a NULL `b` contributes the empty string, while
+    /// a NULL accumulator still propagates.
+    pub fn str_concat_nn(&mut self, a: u32, b: u32) -> u32 {
+        self.binary_op(EXPR_STR_CONCAT_NN, a, b)
+    }
+
+    pub fn int_to_str(&mut self, a: u32) -> u32 {
+        self.unary_op(EXPR_INT_TO_STR, a)
+    }
+    pub fn float_to_str(&mut self, a: u32) -> u32 {
+        self.unary_op(EXPR_FLOAT_TO_STR, a)
+    }
+    pub fn str_to_int(&mut self, a: u32, to: TypeCode) -> u32 {
+        self.binary_op(EXPR_STR_TO_INT, a, to as u32)
+    }
+    pub fn str_to_float(&mut self, a: u32) -> u32 {
+        self.unary_op(EXPR_STR_TO_FLOAT, a)
     }
 
     pub fn build(self, result_reg: u32) -> ExprProgram {

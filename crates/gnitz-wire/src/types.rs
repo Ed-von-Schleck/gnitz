@@ -485,20 +485,30 @@ pub const fn is_valid_type_code(tc: u8) -> bool {
     TypeCode::try_from_u8(tc).is_some()
 }
 
-/// The type of the 8-byte register image the engine materializes for a computed
-/// value of source type `tc`: any float lands as `F64` (`LOAD_COL_FLOAT` widens
-/// `F32` on load), `U64` stays unsigned so a downstream compare re-seeds the
-/// unsigned variant, and every other integer normalizes to `I64`. EMIT stores
-/// that image whole, so a computed column typed any narrower would ship the low
-/// half of an `f64` or wrap a negative value into an unsigned slot. The single
-/// rule behind both the planner's expression typing and [`agg_output_type`]'s
-/// `SUM` arm.
+/// The type of the register image the engine materializes for a computed value
+/// of source type `tc`: any float lands as `F64` (`LOAD_COL_FLOAT` widens `F32`
+/// on load), `U64` stays unsigned so a downstream compare re-seeds the unsigned
+/// variant, and every other integer normalizes to `I64`. EMIT stores that image
+/// whole, so a computed column typed any narrower would ship the low half of an
+/// `f64` or wrap a negative value into an unsigned slot.
+///
+/// `STRING` maps to itself: the VM has a string register class beside the scalar
+/// one, and EMIT stores its 16-byte cell whole. Making the rule total over both
+/// classes is what lets expression typing read it unconditionally.
+///
+/// `BLOB` has no register of either class and normalizes to `I64` with the rest;
+/// no caller reaches this with one, because nothing produces a computed BLOB.
+/// The single rule behind both the planner's expression typing and
+/// [`agg_output_type`]'s `SUM` arm — which is gated to integers and floats
+/// before it gets here.
 #[inline]
 pub(crate) const fn register_image_type(tc: u8) -> u8 {
     if is_float(tc) {
         type_code::F64
     } else if tc == type_code::U64 {
         type_code::U64
+    } else if tc == type_code::STRING {
+        type_code::STRING
     } else {
         type_code::I64
     }

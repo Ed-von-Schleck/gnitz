@@ -11,7 +11,7 @@
 use crate::ast_util::agg_func_name;
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr};
-use crate::types::{has_register_image, is_integer_type};
+use crate::types::{has_scalar_register, is_integer_type};
 use gnitz_core::{ColumnDef, ReduceOutKey, Schema, TypeCode};
 use gnitz_wire::AggFunc as WireAggFunc;
 
@@ -444,7 +444,7 @@ pub(crate) fn default_agg_name(func: AggFunc, idx: usize) -> String {
 /// binds, which both reject ahead of `agg_typing`'s `Bind` backstop so the message
 /// and the error variant are the same on either path.
 pub(crate) fn reject_min_max_unorderable(func: AggFunc, ty: TypeCode) -> Result<(), GnitzSqlError> {
-    if matches!(func, AggFunc::Min | AggFunc::Max) && !has_register_image(ty) {
+    if matches!(func, AggFunc::Min | AggFunc::Max) && !has_scalar_register(ty) {
         return Err(GnitzSqlError::Unsupported(format!(
             "{}: not supported on {ty:?} columns",
             agg_func_name(func).to_ascii_uppercase()
@@ -549,7 +549,7 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
                 }
             }
             AggFunc::Min | AggFunc::Max => {
-                if !has_register_image(tc) {
+                if !has_scalar_register(tc) {
                     return Err(GnitzSqlError::Bind(format!(
                         "{agg_func:?} is not supported on column type {tc:?} ('{}')",
                         c.name,

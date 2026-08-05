@@ -1,5 +1,5 @@
 use crate::error::GnitzSqlError;
-use crate::ir::{BinOp, BoundExpr, NumFunc, UnaryOp};
+use crate::ir::{BinOp, BoundExpr, NumFunc, StrFunc, TrimMode, UnaryOp};
 use gnitz_core::{ColumnDef, ExprBuilder, Schema, TypeCode};
 use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
 
@@ -31,22 +31,60 @@ fn in_list_or_chain(inner: &BoundExpr, items: &[BoundExpr]) -> BoundExpr {
     chain
 }
 
-/// Try to compile a string comparison (col vs const, const vs col, col vs col).
-/// Returns Some((reg, false)) if this is a string comparison, None otherwise.
+/// The three string comparison primitives every SQL comparison reduces to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StrPrim {
+    Eq,
+    Lt,
+    Le,
+}
+
+/// How one of the six SQL comparisons rides the three string primitives: which
+/// primitive to emit, whether to exchange its operands, and whether to negate
+/// its result. The one place that mapping is written; `None` is "not a
+/// comparison".
+///
+/// `GT`/`GE` have two realizations. A site that can exchange its operands gets
+/// the swap, which is one opcode; `col OP 'lit'` cannot — its opcode shape pins
+/// the constant to the right — so it passes `can_swap = false` and pays a
+/// `bool_not` and the register that holds its input. Negation is 3VL-correct
+/// because `bool_not` propagates the null bit, which is what `!=` already
+/// relies on at every site.
+fn str_cmp_reduction(op: BinOp, can_swap: bool) -> Option<(StrPrim, bool, bool)> {
+    Some(match op {
+        BinOp::Eq => (StrPrim::Eq, false, false),
+        BinOp::Ne => (StrPrim::Eq, false, true),
+        BinOp::Lt => (StrPrim::Lt, false, false),
+        BinOp::Le => (StrPrim::Le, false, false),
+        BinOp::Gt if can_swap => (StrPrim::Lt, true, false),
+        BinOp::Ge if can_swap => (StrPrim::Le, true, false),
+        BinOp::Gt => (StrPrim::Le, false, true),
+        BinOp::Ge => (StrPrim::Lt, false, true),
+        _ => return None,
+    })
+}
+
+/// Try to compile a string comparison (col vs const, const vs col, col vs col)
+/// to the `EXPR_STR_COL_*` opcodes, which read the 16-byte cells directly and
+/// need no string register. `None` means "not this shape" — including any
+/// operator that is not one of the six comparisons, which then falls through to
+/// the register channel rather than erroring here (`strcol || 'lit'` would
+/// otherwise die before the channel ever ran).
 fn try_compile_string_cmp(
     left: &BoundExpr,
     op: &BinOp,
     right: &BoundExpr,
     cols: &[ColumnDef],
     eb: &mut ExprBuilder,
-) -> Result<Option<(u32, bool)>, GnitzSqlError> {
-    // ColRef(string) op LitStr(s), or LitStr(s) op ColRef(string).
-    // For the literal-on-left form we swap operands and transpose the
-    // comparison so a single `col <cmp> 'lit'` dispatch covers both:
+) -> Option<u32> {
+    // Checked before anything is emitted: a later bail would leave a dead
+    // const-pool entry behind.
+    // ColRef(string) op LitStr(s), or LitStr(s) op ColRef(string). The opcode
+    // shape pins the constant to the right, so the literal-on-left form
+    // transposes the comparison to get there:
     //   'A' > col  ↔  col < 'A'      'A' >= col ↔ col <= 'A'
     //   'A' < col  ↔  col > 'A'      'A' <= col ↔ col >= 'A'
-    // Eq/Ne are symmetric. `cmp` (the transposed op) drives only the register
-    // dispatch; Unsupported errors still report the original `op`.
+    // Eq/Ne are symmetric.
     let col_lit = match (left, right) {
         (BoundExpr::ColRef(idx), BoundExpr::LitStr(s)) => Some((*idx, s, *op)),
         (BoundExpr::LitStr(s), BoundExpr::ColRef(idx)) => Some((
@@ -57,78 +95,82 @@ fn try_compile_string_cmp(
                 BinOp::Gt => BinOp::Lt,
                 BinOp::Le => BinOp::Ge,
                 BinOp::Ge => BinOp::Le,
-                other => *other, // Eq/Ne symmetric; rest fall through to Unsupported
+                other => *other,
             },
         )),
         _ => None,
     };
     if let Some((idx, s, cmp)) = col_lit {
+        // Resolved before anything is emitted, so a non-comparison declines
+        // rather than leaving a dead const-pool entry behind. The constant is
+        // pinned to the right here, hence `can_swap = false`.
+        let (prim, _, negate) = str_cmp_reduction(cmp, false)?;
         // STRING and BLOB share the 16-byte German-string layout and the engine's
         // `str_col_*` opcodes content-compare both (via `compare_german_strings`),
         // so a BLOB column-vs-literal comparison lowers here too, not to the
         // integer path (which would read the descriptor bytes as a garbage int).
         if cols[idx].type_code.is_german_string() {
             let const_idx = eb.add_const_string(s.clone());
-            let reg = match cmp {
-                BinOp::Eq => eb.str_col_eq_const(idx, const_idx),
-                BinOp::Ne => {
-                    let r = eb.str_col_eq_const(idx, const_idx);
-                    eb.bool_not(r)
-                }
-                BinOp::Lt => eb.str_col_lt_const(idx, const_idx),
-                BinOp::Le => eb.str_col_le_const(idx, const_idx),
-                BinOp::Gt => {
-                    let r = eb.str_col_le_const(idx, const_idx);
-                    eb.bool_not(r)
-                }
-                BinOp::Ge => {
-                    let r = eb.str_col_lt_const(idx, const_idx);
-                    eb.bool_not(r)
-                }
-                _ => {
-                    return Err(GnitzSqlError::Unsupported(format!(
-                        "operator {op:?} not supported for strings/blobs"
-                    )))
-                }
+            let reg = match prim {
+                StrPrim::Eq => eb.str_col_eq_const(idx, const_idx),
+                StrPrim::Lt => eb.str_col_lt_const(idx, const_idx),
+                StrPrim::Le => eb.str_col_le_const(idx, const_idx),
             };
-            return Ok(Some((reg, false)));
+            return Some(if negate { eb.bool_not(reg) } else { reg });
         }
     }
-    // ColRef(string/blob) op ColRef(string/blob)
+    // ColRef(string/blob) op ColRef(string/blob) — two symmetric operands, so
+    // GT/GE ride the swap rather than a negation.
     if let (BoundExpr::ColRef(a), BoundExpr::ColRef(b)) = (left, right) {
         if cols[*a].type_code.is_german_string() && cols[*b].type_code.is_german_string() {
-            let reg = match op {
-                BinOp::Eq => eb.str_col_eq_col(*a, *b),
-                BinOp::Ne => {
-                    let r = eb.str_col_eq_col(*a, *b);
-                    eb.bool_not(r)
-                }
-                BinOp::Lt => eb.str_col_lt_col(*a, *b),
-                BinOp::Le => eb.str_col_le_col(*a, *b),
-                BinOp::Gt => eb.str_col_lt_col(*b, *a),
-                BinOp::Ge => eb.str_col_le_col(*b, *a),
-                _ => {
-                    return Err(GnitzSqlError::Unsupported(format!(
-                        "operator {op:?} not supported for strings/blobs"
-                    )))
-                }
+            let (prim, swap, negate) = str_cmp_reduction(*op, true)?;
+            let (l, r) = if swap { (*b, *a) } else { (*a, *b) };
+            let reg = match prim {
+                StrPrim::Eq => eb.str_col_eq_col(l, r),
+                StrPrim::Lt => eb.str_col_lt_col(l, r),
+                StrPrim::Le => eb.str_col_le_col(l, r),
             };
-            return Ok(Some((reg, false)));
+            return Some(if negate { eb.bool_not(reg) } else { reg });
         }
     }
-    Ok(None)
+    None
+}
+
+/// Which register class a lowered node produced. `Int` and `Float` are the two
+/// scalar shapes — `Float` means the 8-byte register holds an f64 bit pattern —
+/// and `Str` is the string register class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExprKind {
+    Int,
+    Float,
+    Str,
+}
+
+impl ExprKind {
+    fn num(is_float: bool) -> Self {
+        if is_float {
+            ExprKind::Float
+        } else {
+            ExprKind::Int
+        }
+    }
 }
 
 /// Lowers a `BoundExpr` to `ExprProgram` opcodes for the server-side circuit.
-/// Every node produces `(result_reg, is_float)`, where `is_float` indicates the
-/// register holds an f64 bit-pattern rather than a plain i64.
+/// Every node produces `(result_reg, ExprKind)`.
 ///
 /// The single `match` in [`OpcodeBackend::lower`] is the sole walk of the enum:
 /// adding a `BoundExpr` variant makes it non-exhaustive and fails compilation.
 /// `binop` / `case` / `in_list` receive their operands *unevaluated*
 /// (`&BoundExpr`) and drive the recursion themselves, which `binop` needs: it
-/// intercepts a string comparison before recursing into a string literal or
-/// column, both of which `lower` would otherwise reject.
+/// intercepts a column/literal string comparison before recursing, so that shape
+/// keeps the specialized opcodes instead of going through the register channel.
+///
+/// Operands are read through two class-specific helpers — [`Self::lower_num`]
+/// and [`Self::str_operand`] — rather than through bare `lower`, so no arm has
+/// to think about the other class. Bare `lower` survives only where the arm
+/// itself dispatches on the kind: `binop`, `cast`, and `case`'s string-ness
+/// decision.
 pub(crate) struct OpcodeBackend<'a> {
     cols: &'a [ColumnDef],
     eb: &'a mut ExprBuilder,
@@ -136,16 +178,16 @@ pub(crate) struct OpcodeBackend<'a> {
 
 impl OpcodeBackend<'_> {
     /// Lower one node. The lone `match` over `BoundExpr`. Arms that are a single
-    /// builder call live here; only the four that recurse (`binop`, `case`,
-    /// `in_list`, `unop`) and `col_ref`'s type gate have their own method.
-    fn lower(&mut self, expr: &BoundExpr) -> Result<(u32, bool), GnitzSqlError> {
+    /// builder call live here; the ones that recurse have their own method.
+    fn lower(&mut self, expr: &BoundExpr) -> Result<(u32, ExprKind), GnitzSqlError> {
         match expr {
             BoundExpr::ColRef(c) => self.col_ref(*c),
-            BoundExpr::LitInt(v) => Ok((self.eb.load_const(*v), false)),
-            BoundExpr::LitFloat(v) => Ok((self.eb.load_const(v.to_bits() as i64), true)),
-            BoundExpr::LitStr(_) => Err(GnitzSqlError::Unsupported(
-                "string literals not supported in expressions".to_string(),
-            )),
+            BoundExpr::LitInt(v) => Ok((self.eb.load_const(*v), ExprKind::Int)),
+            BoundExpr::LitFloat(v) => Ok((self.eb.load_const(v.to_bits() as i64), ExprKind::Float)),
+            BoundExpr::LitStr(s) => {
+                let idx = self.eb.add_const_string(s.clone());
+                Ok((self.eb.load_const_str(idx), ExprKind::Str))
+            }
             // A wide-integer literal has no VM slot (the register file is 8 bytes
             // wide), so one reject arm here states the limitation for every
             // expression that reaches this walk. A *servable* wide seek is
@@ -155,8 +197,8 @@ impl OpcodeBackend<'_> {
             BoundExpr::LitNull => Ok(self.lit_null()),
             BoundExpr::BinOp(l, op, r) => self.binop(l, *op, r),
             BoundExpr::UnaryOp(op, inner) => self.unop(*op, inner),
-            BoundExpr::IsNull(c) => Ok((self.eb.is_null(*c), false)),
-            BoundExpr::IsNotNull(c) => Ok((self.eb.is_not_null(*c), false)),
+            BoundExpr::IsNull(c) => Ok((self.eb.is_null(*c), ExprKind::Int)),
+            BoundExpr::IsNotNull(c) => Ok((self.eb.is_not_null(*c), ExprKind::Int)),
             BoundExpr::AggCall { .. } => Err(GnitzSqlError::Unsupported(
                 "aggregate function not allowed in expression context".to_string(),
             )),
@@ -165,13 +207,43 @@ impl OpcodeBackend<'_> {
             BoundExpr::Func { f, arg } => self.func(*f, arg),
             BoundExpr::MinMaxN { is_max, args } => self.min_max_n(*is_max, args),
             BoundExpr::Cast { expr, to } => self.cast(expr, *to),
+            BoundExpr::StrCall { f, arg } => self.str_call(*f, arg),
+            BoundExpr::Substr { s, start, len } => self.substr(s, start, len.as_deref()),
+            BoundExpr::TrimCall { s, mode, set } => self.trim_call(s, *mode, set),
+            BoundExpr::ConcatN { args } => self.concat_n(args),
+        }
+    }
+
+    /// Lower `expr` into a scalar register, reporting whether it holds an f64.
+    /// Every numeric operand is read through here, which is what turns a string
+    /// in an arithmetic position into a SQL error instead of an engine-side
+    /// `RegClassMismatch`.
+    fn lower_num(&mut self, expr: &BoundExpr) -> Result<(u32, bool), GnitzSqlError> {
+        match self.lower(expr)? {
+            (r, ExprKind::Int) => Ok((r, false)),
+            (r, ExprKind::Float) => Ok((r, true)),
+            (_, ExprKind::Str) => Err(GnitzSqlError::Unsupported(format!(
+                "{} is a string; strings support comparison, CONCAT/||, \
+                 CASE/COALESCE/NULLIF, the string functions and CAST — not this",
+                self.describe(expr)
+            ))),
+        }
+    }
+
+    /// Name a rejected operand: a bare column by name, so the message points at
+    /// the query text rather than at the expression tree.
+    fn describe(&self, e: &BoundExpr) -> String {
+        match e {
+            BoundExpr::ColRef(i) => format!("column {:?}", self.cols[*i].name),
+            BoundExpr::LitStr(_) => "a string literal".to_string(),
+            _ => "this operand".to_string(),
         }
     }
 
     /// Lower `expr` and, if `want_float`, lift an integer register to f64. The
     /// one place an operand is coerced into a node's unified numeric domain.
     fn lower_as(&mut self, expr: &BoundExpr, want_float: bool) -> Result<u32, GnitzSqlError> {
-        let (r, is_float) = self.lower(expr)?;
+        let (r, is_float) = self.lower_num(expr)?;
         Ok(if want_float && !is_float {
             self.eb.int_to_float(r)
         } else {
@@ -179,16 +251,54 @@ impl OpcodeBackend<'_> {
         })
     }
 
-    fn func(&mut self, f: NumFunc, arg: &BoundExpr) -> Result<(u32, bool), GnitzSqlError> {
+    /// The string channel's operand read.
+    ///
+    /// This is the one place the LitNull-in-string-context rule lives. Lowering
+    /// is eager — every arm appends its instruction immediately, and there is no
+    /// IR to re-type and re-emit from — so a string context must intercept
+    /// `LitNull` *before* recursing into it and emit `load_null_str` rather than
+    /// the scalar `load_null`. Every string operand reads through here: a string
+    /// CASE's branch results and else, `||`'s operands, CONCAT's arguments, and
+    /// each string function's argument.
+    ///
+    /// It deliberately does not extend to comparisons: `UPPER(s) = NULL` stays a
+    /// typed error, consistent with `s = NULL` today.
+    ///
+    /// `coerce_numeric` is CONCAT's implicit numeric→text cast, and nothing
+    /// else's.
+    fn str_operand(&mut self, expr: &BoundExpr, coerce_numeric: bool) -> Result<u32, GnitzSqlError> {
+        if matches!(expr, BoundExpr::LitNull) {
+            return Ok(self.eb.load_null_str());
+        }
+        match self.lower(expr)? {
+            (r, ExprKind::Str) => Ok(r),
+            (r, ExprKind::Int) if coerce_numeric => Ok(self.eb.int_to_str(r)),
+            (r, ExprKind::Float) if coerce_numeric => Ok(self.eb.float_to_str(r)),
+            _ => Err(GnitzSqlError::Unsupported("expected a string value here".to_string())),
+        }
+    }
+
+    /// A SUBSTRING window bound. A float bound is a typed error rather than a
+    /// silent truncation — the opcode reads the register as an integer.
+    fn lower_window_bound(&mut self, e: &BoundExpr, what: &str) -> Result<u32, GnitzSqlError> {
+        match self.lower_num(e)? {
+            (r, false) => Ok(r),
+            (_, true) => Err(GnitzSqlError::Unsupported(format!(
+                "SUBSTRING: {what} must be an integer expression"
+            ))),
+        }
+    }
+
+    fn func(&mut self, f: NumFunc, arg: &BoundExpr) -> Result<(u32, ExprKind), GnitzSqlError> {
         if let NumFunc::Round(n) = f {
             return self.round(n, arg);
         }
-        let (r, is_float) = self.lower(arg)?;
+        let (r, is_float) = self.lower_num(arg)?;
         if !is_float {
             // Every transform is the identity on an integer register, and ABS of
             // an unsigned one likewise — the value is non-negative by definition.
             let needs_abs = f == NumFunc::Abs && arg.infer_type(self.cols).is_signed_int();
-            return Ok((if needs_abs { self.eb.int_abs(r) } else { r }, false));
+            return Ok((if needs_abs { self.eb.int_abs(r) } else { r }, ExprKind::Int));
         }
         let reg = match f {
             NumFunc::Abs => self.eb.float_abs(r),
@@ -197,7 +307,59 @@ impl OpcodeBackend<'_> {
             NumFunc::Trunc => self.eb.float_trunc(r),
             NumFunc::Round(_) => unreachable!("routed to `round` above"),
         };
-        Ok((reg, true))
+        Ok((reg, ExprKind::Float))
+    }
+
+    fn str_call(&mut self, f: StrFunc, arg: &BoundExpr) -> Result<(u32, ExprKind), GnitzSqlError> {
+        let a = self.str_operand(arg, /* coerce_numeric = */ false)?;
+        let reg = match f {
+            StrFunc::Upper => self.eb.str_upper(a),
+            StrFunc::Lower => self.eb.str_lower(a),
+            StrFunc::LenChars => self.eb.str_len_chars(a),
+            StrFunc::LenBytes => self.eb.str_len_bytes(a),
+        };
+        // Class taken from the one result-type statement, not restated here.
+        let kind = if f.result_type() == TypeCode::String {
+            ExprKind::Str
+        } else {
+            ExprKind::Int
+        };
+        Ok((reg, kind))
+    }
+
+    fn substr(
+        &mut self,
+        s: &BoundExpr,
+        start: &BoundExpr,
+        len: Option<&BoundExpr>,
+    ) -> Result<(u32, ExprKind), GnitzSqlError> {
+        let src = self.str_operand(s, false)?;
+        let start_reg = self.lower_window_bound(start, "start")?;
+        let len_reg = len.map(|l| self.lower_window_bound(l, "length")).transpose()?;
+        Ok((self.eb.str_substr(src, start_reg, len_reg), ExprKind::Str))
+    }
+
+    fn trim_call(&mut self, s: &BoundExpr, mode: TrimMode, set: &str) -> Result<(u32, ExprKind), GnitzSqlError> {
+        let src = self.str_operand(s, false)?;
+        let set_idx = self.eb.add_const_string(set.to_string());
+        Ok((self.eb.str_trim(src, mode, set_idx), ExprKind::Str))
+    }
+
+    /// `CONCAT(args…)`. Seeding the fold with the empty string gives every arity
+    /// one shape and makes the one-argument case non-NULL.
+    ///
+    /// The fold is strictly left, which is what makes `str_concat_nn`'s
+    /// asymmetric null rule sound: every argument lands in the `b` operand, so a
+    /// NULL argument contributes the empty string while the accumulator's own
+    /// NULL — the engine's length-overflow verdict — propagates to the result.
+    fn concat_n(&mut self, args: &[BoundExpr]) -> Result<(u32, ExprKind), GnitzSqlError> {
+        let empty = self.eb.add_const_string(String::new());
+        let mut acc = self.eb.load_const_str(empty);
+        for a in args {
+            let r = self.str_operand(a, /* coerce_numeric = */ true)?;
+            acc = self.eb.str_concat_nn(acc, r);
+        }
+        Ok((acc, ExprKind::Str))
     }
 
     /// `ROUND(x, n)`. The scale is applied here rather than in the binder because
@@ -205,13 +367,14 @@ impl OpcodeBackend<'_> {
     /// non-negative scale is the identity, and taking it through f64 instead
     /// would mangle any magnitude past 2^53. Scaling loads the positive power
     /// `10^|n|` in both directions — negative powers of ten are not f64-exact.
-    fn round(&mut self, n: i8, arg: &BoundExpr) -> Result<(u32, bool), GnitzSqlError> {
+    fn round(&mut self, n: i8, arg: &BoundExpr) -> Result<(u32, ExprKind), GnitzSqlError> {
         if n >= 0 && !arg.infer_type(self.cols).is_float() {
-            return self.lower(arg);
+            let (r, is_float) = self.lower_num(arg)?;
+            return Ok((r, ExprKind::num(is_float)));
         }
         let mut v = self.lower_as(arg, true)?;
         if n == 0 {
-            return Ok((self.eb.float_round(v), true));
+            return Ok((self.eb.float_round(v), ExprKind::Float));
         }
         let scale = self.eb.load_const(10f64.powi(n.unsigned_abs() as i32).to_bits() as i64);
         // Multiply first for n > 0, divide first for n < 0; then undo.
@@ -228,18 +391,18 @@ impl OpcodeBackend<'_> {
             } else {
                 self.eb.float_mul(v, scale)
             },
-            true,
+            ExprKind::Float,
         ))
     }
 
     /// GREATEST/LEAST as a left fold of 2-ary extremum opcodes. A non-numeric
-    /// argument needs no check here: the recursion rejects it (a wide/string
-    /// column at `col_ref`, a string literal at `lower`).
-    fn min_max_n(&mut self, is_max: bool, args: &[BoundExpr]) -> Result<(u32, bool), GnitzSqlError> {
+    /// argument needs no check here: `lower_as` reads every argument through
+    /// `lower_num`, which rejects a string, and a wide column dies at `col_ref`.
+    fn min_max_n(&mut self, is_max: bool, args: &[BoundExpr]) -> Result<(u32, ExprKind), GnitzSqlError> {
         let types: Vec<TypeCode> = args.iter().map(|a| a.infer_type(self.cols)).collect();
         let unified = types
             .iter()
-            .fold(TypeCode::I64, |acc, &t| crate::ir::unify_numeric(acc, t));
+            .fold(TypeCode::I64, |acc, &t| crate::ir::unify_blend_type(acc, t));
         let any_float = unified.is_float();
         // The engine taints a register unsigned only from the first U64 operand
         // onward, so a U64 argument must head the fold — otherwise an earlier
@@ -262,25 +425,52 @@ impl OpcodeBackend<'_> {
                 (false, false) => self.eb.int_min2(acc, r),
             };
         }
-        Ok((acc, any_float))
+        Ok((acc, ExprKind::num(any_float)))
     }
 
-    fn cast(&mut self, expr: &BoundExpr, to: TypeCode) -> Result<(u32, bool), GnitzSqlError> {
-        if to.is_float() {
-            let f = self.lower_as(expr, true)?;
-            // F64 needs nothing: the register already holds an f64.
-            return Ok((
-                if to == TypeCode::F32 {
-                    self.eb.float_to_f32(f)
-                } else {
-                    f
-                },
-                true,
-            ));
+    /// CAST, dispatched on the source kind first, then the target — each arm
+    /// leaves only the pairings the next one has to consider, so the numeric
+    /// elide test at the end sees two scalar sides and nothing else.
+    fn cast(&mut self, expr: &BoundExpr, to: TypeCode) -> Result<(u32, ExprKind), GnitzSqlError> {
+        let (r, kind) = self.lower(expr)?;
+        if kind == ExprKind::Str {
+            return Ok(match to {
+                TypeCode::String => (r, ExprKind::Str),
+                TypeCode::F64 => (self.eb.str_to_float(r), ExprKind::Float),
+                TypeCode::F32 => {
+                    let f = self.eb.str_to_float(r);
+                    (self.eb.float_to_f32(f), ExprKind::Float)
+                }
+                _ => (self.eb.str_to_int(r, to), ExprKind::Int),
+            });
         }
-        let (r, src_float) = self.lower(expr)?;
-        if src_float {
-            return Ok((self.eb.float_to_int(r, to), false));
+        if to == TypeCode::String {
+            let reg = if kind == ExprKind::Float {
+                self.eb.float_to_str(r)
+            } else {
+                self.eb.int_to_str(r)
+            };
+            return Ok((reg, ExprKind::Str));
+        }
+        if to.is_float() {
+            // `lower_as(expr, true)` is "lower once, then int_to_float if the
+            // register is an int", so hoisting the lower emits the identical
+            // sequence.
+            let f = if kind == ExprKind::Int {
+                self.eb.int_to_float(r)
+            } else {
+                r
+            };
+            // F64 needs nothing: the register already holds an f64.
+            let reg = if to == TypeCode::F32 {
+                self.eb.float_to_f32(f)
+            } else {
+                f
+            };
+            return Ok((reg, ExprKind::Float));
+        }
+        if kind == ExprKind::Float {
+            return Ok((self.eb.float_to_int(r, to), ExprKind::Int));
         }
         // Elide iff the register provably already holds a value inside `to`'s
         // domain *with* `to`'s register image. The image half matters because the
@@ -292,21 +482,17 @@ impl OpcodeBackend<'_> {
         let elide = to == expr.infer_type(self.cols).register_image()
             || matches!(expr, BoundExpr::ColRef(i) if self.cols[*i].type_code == to);
         if elide {
-            Ok((r, false))
+            Ok((r, ExprKind::Int))
         } else {
-            Ok((self.eb.int_cast(r, to), false))
+            Ok((self.eb.int_cast(r, to), ExprKind::Int))
         }
     }
 
-    fn col_ref(&mut self, idx: usize) -> Result<(u32, bool), GnitzSqlError> {
-        // Every 16-byte column must be rejected here: the engine's payload integer
-        // load handler has arms only for 1/2/4/8-byte columns, so a 16-byte column
-        // hits its no-op arm and the following op reads stale scratch bytes —
-        // silent corruption, no error. A *valid* string/blob use
-        // is one of the six comparisons, which `binop` intercepts via
-        // `try_compile_string_cmp` before any recursion reaches this arm; so a
-        // STRING/BLOB landing here is arithmetic or a mixed-type comparison
-        // (`a.s > b.int`) and must error, not load garbage.
+    fn col_ref(&mut self, idx: usize) -> Result<(u32, ExprKind), GnitzSqlError> {
+        // A 16-byte integer column must be rejected here: the engine's payload
+        // integer load handler has arms only for 1/2/4/8-byte columns, so a wide
+        // column hits its no-op arm and the following op reads stale scratch
+        // bytes — silent corruption, no error.
         let tc = self.cols[idx].type_code;
         if tc.is_wide_int() {
             return Err(GnitzSqlError::Unsupported(format!(
@@ -314,46 +500,57 @@ impl OpcodeBackend<'_> {
                 self.cols[idx].name,
             )));
         }
+        // BLOB shares STRING's 16-byte layout but is deliberately outside this
+        // surface: its only valid use is one of the six comparisons, which
+        // `binop` intercepts before any recursion reaches here.
         if tc.is_german_string() {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "column {:?} is {tc:?}; string/blob columns support only =, <>, <, <=, \
-                 >, >= against another string/blob column or a string literal — not \
-                 arithmetic or comparison with a non-string column",
-                self.cols[idx].name,
-            )));
+            if tc != TypeCode::String {
+                return Err(GnitzSqlError::Unsupported(format!(
+                    "column {:?} is {tc:?}; blob columns support only =, <>, <, <=, >, >= \
+                     against another blob/string column or a string literal",
+                    self.cols[idx].name,
+                )));
+            }
+            return Ok((self.eb.load_col_str(idx), ExprKind::Str));
         }
         if tc.is_float() {
-            return Ok((self.eb.load_col_float(idx), true));
+            return Ok((self.eb.load_col_float(idx), ExprKind::Float));
         }
-        Ok((self.eb.load_col_int(idx), false))
+        Ok((self.eb.load_col_int(idx), ExprKind::Int))
     }
 
-    /// A NULL value: `is_float = false` — LoadNull carries a zero i64 lane with
-    /// the null bit set. If a sibling CASE branch is float, `case` lifts it.
-    /// A method rather than an inline arm because `case` also needs it, for the
-    /// implicit ELSE.
-    fn lit_null(&mut self) -> (u32, bool) {
-        (self.eb.load_null(), false)
+    /// A scalar NULL: LoadNull carries a zero i64 lane with the null bit set. If
+    /// a sibling CASE branch is float, `case` lifts it; a *string* context takes
+    /// `str_operand`'s `load_null_str` path instead and never reaches here.
+    fn lit_null(&mut self) -> (u32, ExprKind) {
+        (self.eb.load_null(), ExprKind::Int)
     }
 
     fn case(
         &mut self,
         branches: &[(BoundExpr, BoundExpr)],
         else_: Option<&BoundExpr>,
-    ) -> Result<(u32, bool), GnitzSqlError> {
+    ) -> Result<(u32, ExprKind), GnitzSqlError> {
+        // Decided before any result is lowered, because lowering is eager: a
+        // `LitNull` result must be emitted as `load_null_str` in a string CASE,
+        // and there is no IR to go back and re-type.
+        let case_ty = BoundExpr::case_type(branches, else_, &|idx: &usize| self.cols[*idx].type_code);
+        if case_ty == TypeCode::String {
+            return self.str_case(branches, else_);
+        }
         // Lower every condition and result, plus the else (implicit NULL when
         // absent). Conditions stay as 0/1 int registers; only the result *values*
         // participate in float unification.
         let mut conds = Vec::with_capacity(branches.len());
         let mut results = Vec::with_capacity(branches.len());
         for (cond, result) in branches {
-            let (cond_reg, _cond_float) = self.lower(cond)?;
+            let (cond_reg, _cond_float) = self.lower_num(cond)?;
             conds.push(cond_reg);
-            results.push(self.lower(result)?);
+            results.push(self.lower_num(result)?);
         }
         let else_out = match else_ {
-            Some(e) => self.lower(e)?,
-            None => self.lit_null(),
+            Some(e) => self.lower_num(e)?,
+            None => (self.lit_null().0, false),
         };
 
         // Float unification is one GLOBAL decision, not a per-pair fold: EXPR_SELECT
@@ -376,10 +573,38 @@ impl OpcodeBackend<'_> {
             let result_reg = lift(self.eb, results[i].0, results[i].1);
             acc = self.eb.select(conds[i], result_reg, acc);
         }
-        Ok((acc, any_float))
+        Ok((acc, ExprKind::num(any_float)))
     }
 
-    fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<(u32, bool), GnitzSqlError> {
+    /// The string half of [`Self::case`]. Conditions stay scalar; every result
+    /// and the else read through `str_operand`, so a `LitNull` branch becomes a
+    /// NULL *string* and a non-NULL scalar branch is a typed error. An implicit
+    /// ELSE is `load_null_str`. No unification pass: string registers carry no
+    /// float/int domain to reconcile.
+    fn str_case(
+        &mut self,
+        branches: &[(BoundExpr, BoundExpr)],
+        else_: Option<&BoundExpr>,
+    ) -> Result<(u32, ExprKind), GnitzSqlError> {
+        let mut conds = Vec::with_capacity(branches.len());
+        let mut results = Vec::with_capacity(branches.len());
+        for (cond, result) in branches {
+            let (cond_reg, _) = self.lower_num(cond)?;
+            conds.push(cond_reg);
+            results.push(self.str_operand(result, false)?);
+        }
+        let mut acc = match else_ {
+            Some(e) => self.str_operand(e, false)?,
+            None => self.eb.load_null_str(),
+        };
+        // Right-to-left, so the first truthy WHEN wins — `case`'s fold.
+        for i in (0..branches.len()).rev() {
+            acc = self.eb.str_select(conds[i], results[i], acc);
+        }
+        Ok((acc, ExprKind::Str))
+    }
+
+    fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<(u32, ExprKind), GnitzSqlError> {
         // Fast path: a ≤8-byte-integer operand + every item a foldable integer
         // literal → one INT_IN_SET. `self.cols` is the schema `inner` was bound
         // against — source schema for a table filter, reduce-output schema for
@@ -391,9 +616,9 @@ impl OpcodeBackend<'_> {
             if let Some(mut values) = items.iter().map(fold_int_literal).collect::<Option<Vec<i64>>>() {
                 values.sort_unstable();
                 values.dedup();
-                let (reg, _is_float) = self.lower(inner)?; // integer ⇒ not float
+                let (reg, _is_float) = self.lower_num(inner)?; // integer ⇒ not float
                 let idx = self.eb.add_const_int_set(&values);
-                return Ok((self.eb.int_in_set(reg, idx), false));
+                return Ok((self.eb.int_in_set(reg, idx), ExprKind::Int));
             }
         }
         // Fallback: OR-chain via the existing binop path (float operand →
@@ -402,24 +627,44 @@ impl OpcodeBackend<'_> {
         self.lower(&in_list_or_chain(inner, items))
     }
 
-    fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<(u32, bool), GnitzSqlError> {
-        // String comparison detection — intercept before recursing into operands
-        // (a bare string literal/column would otherwise error in `lit_str`/`col_ref`).
-        if let Some(result) = try_compile_string_cmp(left, &op, right, self.cols, self.eb)? {
-            return Ok(result);
+    fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<(u32, ExprKind), GnitzSqlError> {
+        // The column/literal shapes keep the specialized opcodes — intercepted
+        // before recursing, so they never build a string register at all.
+        if let Some(reg) = try_compile_string_cmp(left, &op, right, self.cols, self.eb) {
+            return Ok((reg, ExprKind::Int));
         }
 
-        let (mut l, l_float) = self.lower(left)?;
-        let (mut r, r_float) = self.lower(right)?;
-
-        // Boolean ops never need float cast
-        if matches!(op, BinOp::And) {
-            return Ok((self.eb.bool_and(l, r), false));
+        // AND/OR read scalars and return before the operator dispatch below, so
+        // they must reject a string operand themselves: `s AND 'x'` would
+        // otherwise feed string registers to `bool_and` and surface as an
+        // engine-side class mismatch rather than a SQL error.
+        if matches!(op, BinOp::And | BinOp::Or) {
+            let (l, _) = self.lower_num(left)?;
+            let (r, _) = self.lower_num(right)?;
+            let reg = if matches!(op, BinOp::And) {
+                self.eb.bool_and(l, r)
+            } else {
+                self.eb.bool_or(l, r)
+            };
+            return Ok((reg, ExprKind::Int));
         }
-        if matches!(op, BinOp::Or) {
-            return Ok((self.eb.bool_or(l, r), false));
+
+        // `||` reads both operands through the string channel, so `s || NULL` is
+        // a NULL string rather than a type error. There is no implicit numeric
+        // cast on the operator, unlike CONCAT.
+        if matches!(op, BinOp::Concat) {
+            let l = self.str_operand(left, false)?;
+            let r = self.str_operand(right, false)?;
+            return Ok((self.eb.str_concat(l, r), ExprKind::Str));
         }
 
+        let (mut l, l_kind) = self.lower(left)?;
+        let (mut r, r_kind) = self.lower(right)?;
+
+        if l_kind == ExprKind::Str || r_kind == ExprKind::Str {
+            return self.str_binop(op, (l, l_kind), (r, r_kind));
+        }
+        let (l_float, r_float) = (l_kind == ExprKind::Float, r_kind == ExprKind::Float);
         let is_float = l_float || r_float;
 
         // Cast int operand to float if mixed
@@ -432,45 +677,77 @@ impl OpcodeBackend<'_> {
 
         match (op, is_float) {
             // Arithmetic
-            (BinOp::Add, false) => Ok((self.eb.add(l, r), false)),
-            (BinOp::Add, true) => Ok((self.eb.float_add(l, r), true)),
-            (BinOp::Sub, false) => Ok((self.eb.sub(l, r), false)),
-            (BinOp::Sub, true) => Ok((self.eb.float_sub(l, r), true)),
-            (BinOp::Mul, false) => Ok((self.eb.mul(l, r), false)),
-            (BinOp::Mul, true) => Ok((self.eb.float_mul(l, r), true)),
-            (BinOp::Div, false) => Ok((self.eb.div(l, r), false)),
-            (BinOp::Div, true) => Ok((self.eb.float_div(l, r), true)),
-            (BinOp::Mod, false) => Ok((self.eb.modulo(l, r), false)),
+            (BinOp::Add, false) => Ok((self.eb.add(l, r), ExprKind::Int)),
+            (BinOp::Add, true) => Ok((self.eb.float_add(l, r), ExprKind::Float)),
+            (BinOp::Sub, false) => Ok((self.eb.sub(l, r), ExprKind::Int)),
+            (BinOp::Sub, true) => Ok((self.eb.float_sub(l, r), ExprKind::Float)),
+            (BinOp::Mul, false) => Ok((self.eb.mul(l, r), ExprKind::Int)),
+            (BinOp::Mul, true) => Ok((self.eb.float_mul(l, r), ExprKind::Float)),
+            (BinOp::Div, false) => Ok((self.eb.div(l, r), ExprKind::Int)),
+            (BinOp::Div, true) => Ok((self.eb.float_div(l, r), ExprKind::Float)),
+            (BinOp::Mod, false) => Ok((self.eb.modulo(l, r), ExprKind::Int)),
             (BinOp::Mod, true) => Err(GnitzSqlError::Unsupported("float modulo not supported".to_string())),
             // Comparisons — result is always int (0/1)
-            (BinOp::Eq, false) => Ok((self.eb.cmp_eq(l, r), false)),
-            (BinOp::Eq, true) => Ok((self.eb.fcmp_eq(l, r), false)),
-            (BinOp::Ne, false) => Ok((self.eb.cmp_ne(l, r), false)),
-            (BinOp::Ne, true) => Ok((self.eb.fcmp_ne(l, r), false)),
-            (BinOp::Gt, false) => Ok((self.eb.cmp_gt(l, r), false)),
-            (BinOp::Gt, true) => Ok((self.eb.fcmp_gt(l, r), false)),
-            (BinOp::Ge, false) => Ok((self.eb.cmp_ge(l, r), false)),
-            (BinOp::Ge, true) => Ok((self.eb.fcmp_ge(l, r), false)),
-            (BinOp::Lt, false) => Ok((self.eb.cmp_lt(l, r), false)),
-            (BinOp::Lt, true) => Ok((self.eb.fcmp_lt(l, r), false)),
-            (BinOp::Le, false) => Ok((self.eb.cmp_le(l, r), false)),
-            (BinOp::Le, true) => Ok((self.eb.fcmp_le(l, r), false)),
-            // And/Or handled above
-            (BinOp::And, _) | (BinOp::Or, _) => unreachable!(),
+            (BinOp::Eq, false) => Ok((self.eb.cmp_eq(l, r), ExprKind::Int)),
+            (BinOp::Eq, true) => Ok((self.eb.fcmp_eq(l, r), ExprKind::Int)),
+            (BinOp::Ne, false) => Ok((self.eb.cmp_ne(l, r), ExprKind::Int)),
+            (BinOp::Ne, true) => Ok((self.eb.fcmp_ne(l, r), ExprKind::Int)),
+            (BinOp::Gt, false) => Ok((self.eb.cmp_gt(l, r), ExprKind::Int)),
+            (BinOp::Gt, true) => Ok((self.eb.fcmp_gt(l, r), ExprKind::Int)),
+            (BinOp::Ge, false) => Ok((self.eb.cmp_ge(l, r), ExprKind::Int)),
+            (BinOp::Ge, true) => Ok((self.eb.fcmp_ge(l, r), ExprKind::Int)),
+            (BinOp::Lt, false) => Ok((self.eb.cmp_lt(l, r), ExprKind::Int)),
+            (BinOp::Lt, true) => Ok((self.eb.fcmp_lt(l, r), ExprKind::Int)),
+            (BinOp::Le, false) => Ok((self.eb.cmp_le(l, r), ExprKind::Int)),
+            (BinOp::Le, true) => Ok((self.eb.fcmp_le(l, r), ExprKind::Int)),
+            // Handled above, before the operands were lowered.
+            (BinOp::And, _) | (BinOp::Or, _) | (BinOp::Concat, _) => unreachable!(),
         }
     }
 
-    fn unop(&mut self, op: UnaryOp, inner: &BoundExpr) -> Result<(u32, bool), GnitzSqlError> {
-        let (a, a_float) = self.lower(inner)?;
+    /// A binary operator with at least one string operand, having already ruled
+    /// out `||` and the column/literal fast path. Only the six comparisons are
+    /// defined, and both sides must be strings — a comparison carries no
+    /// implicit cast.
+    fn str_binop(
+        &mut self,
+        op: BinOp,
+        (l, l_kind): (u32, ExprKind),
+        (r, r_kind): (u32, ExprKind),
+    ) -> Result<(u32, ExprKind), GnitzSqlError> {
+        // The operator is reported before the operand kinds, so `strcol + 1`
+        // reads as "no such operator on strings" rather than as a demand that
+        // its right-hand side become one.
+        let Some((prim, swap, negate)) = str_cmp_reduction(op, true) else {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "operator {op:?} is not supported on a string operand"
+            )));
+        };
+        if l_kind != ExprKind::Str || r_kind != ExprKind::Str {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "comparison {op:?} against a string needs both operands to be strings"
+            )));
+        }
+        let (l, r) = if swap { (r, l) } else { (l, r) };
+        let reg = match prim {
+            StrPrim::Eq => self.eb.str_cmp_eq(l, r),
+            StrPrim::Lt => self.eb.str_cmp_lt(l, r),
+            StrPrim::Le => self.eb.str_cmp_le(l, r),
+        };
+        Ok((if negate { self.eb.bool_not(reg) } else { reg }, ExprKind::Int))
+    }
+
+    fn unop(&mut self, op: UnaryOp, inner: &BoundExpr) -> Result<(u32, ExprKind), GnitzSqlError> {
+        let (a, a_float) = self.lower_num(inner)?;
         match op {
             UnaryOp::Neg => {
                 if a_float {
-                    Ok((self.eb.float_neg(a), true))
+                    Ok((self.eb.float_neg(a), ExprKind::Float))
                 } else {
-                    Ok((self.eb.neg_int(a), false))
+                    Ok((self.eb.neg_int(a), ExprKind::Int))
                 }
             }
-            UnaryOp::Not => Ok((self.eb.bool_not(a), false)),
+            UnaryOp::Not => Ok((self.eb.bool_not(a), ExprKind::Int)),
         }
     }
 }
@@ -554,24 +831,26 @@ pub(crate) fn compile_filter_evaluator(pred: &BoundExpr, schema: &Schema) -> Res
 /// bit-pattern from an integer, so `append_column_value` would store the raw
 /// bits into an integer column.
 ///
-/// Picks `resolve_scalar`, because a SET RHS is read through
-/// [`Evaluator::eval_row`]. Pairing each resolver with the one way of driving it
-/// is why `expr_unsupported` is private to this module.
+/// Picks `resolve_scalar`, because a SET RHS is read a row at a time. Pairing
+/// each resolver with the one way of driving it is why `expr_unsupported` is
+/// private to this module.
 ///
 /// It runs the backend itself rather than going through
 /// [`compile_bound_expr_to_program`], because it is the one caller that needs
-/// the recursion's `is_float` bit — every other one discards it.
+/// the recursion's kind — to reject a float result. Whether the result is a
+/// string, and so which read-back applies, the caller asks the returned
+/// evaluator (`Evaluator::result_is_str`).
 pub(crate) fn compile_scalar_evaluator(expr: &BoundExpr, schema: &Schema) -> Result<Evaluator, GnitzSqlError> {
     let mut eb = ExprBuilder::new();
-    let (reg, is_float) = OpcodeBackend {
+    let (reg, kind) = OpcodeBackend {
         cols: &schema.columns,
         eb: &mut eb,
     }
     .lower(expr)?;
-    if is_float {
+    if kind == ExprKind::Float {
         // No target type accepts it: the register holds an f64 bit pattern, and
-        // the only column kind a SET value can be written to is a fixed-width
-        // integer (or a string, which never reaches this compiler).
+        // a SET value can only be written to a fixed-width integer or a string
+        // column.
         return Err(GnitzSqlError::Unsupported(
             "SET from a floating-point expression is not supported".to_string(),
         ));
@@ -619,8 +898,7 @@ mod tests {
 
     fn compile(left: &BoundExpr, op: BinOp, right: &BoundExpr, schema: &Schema) -> ExprProgram {
         let mut eb = ExprBuilder::new();
-        let (reg, _) = try_compile_string_cmp(left, &op, right, &schema.columns, &mut eb)
-            .expect("compile ok")
+        let reg = try_compile_string_cmp(left, &op, right, &schema.columns, &mut eb)
             .expect("recognized as a string comparison");
         eb.build(reg)
     }
@@ -638,21 +916,55 @@ mod tests {
         }
     }
 
-    /// The opcodes `expr` lowers to, plus whether its result register is a float.
-    /// `lower_ops` is the same without the float bit.
-    fn lower_ops_isf(expr: &BoundExpr, schema: &Schema) -> (Vec<u32>, bool) {
+    /// The opcodes `expr` lowers to, plus its result register's class.
+    /// `lower_ops` is the same without the class.
+    fn lower_ops_kind(expr: &BoundExpr, schema: &Schema) -> (Vec<u32>, ExprKind) {
         let mut eb = ExprBuilder::new();
-        let (reg, isf) = OpcodeBackend {
+        let (reg, kind) = OpcodeBackend {
             cols: &schema.columns,
             eb: &mut eb,
         }
         .lower(expr)
         .expect("lowers");
-        (opcodes(&eb.build(reg)), isf)
+        (opcodes(&eb.build(reg)), kind)
+    }
+
+    fn lower_ops_isf(expr: &BoundExpr, schema: &Schema) -> (Vec<u32>, bool) {
+        let (ops, kind) = lower_ops_kind(expr, schema);
+        (ops, kind == ExprKind::Float)
     }
 
     fn lower_ops(expr: &BoundExpr, schema: &Schema) -> Vec<u32> {
         lower_ops_isf(expr, schema).0
+    }
+
+    /// The lowering error `expr` produces, for the reject cases.
+    fn lower_err(expr: &BoundExpr, schema: &Schema) -> GnitzSqlError {
+        let mut eb = ExprBuilder::new();
+        OpcodeBackend {
+            cols: &schema.columns,
+            eb: &mut eb,
+        }
+        .lower(expr)
+        .expect_err("must be rejected")
+    }
+
+    /// Lower `expr` and hand the result to the engine's own decoder.
+    ///
+    /// This is the check that matters for the string channel, and it is not an
+    /// opcode snapshot: `from_wire` holds every register operand to the class
+    /// its opcode reads, so a lowering that mixed the classes — a scalar
+    /// `LoadNull` into a string CASE, a string register into `bool_and` — is
+    /// rejected here. `resolve_filter` then refuses a string result register,
+    /// which is what confirms the expression really produced a string.
+    fn assert_str_program(expr: &BoundExpr, schema: &Schema) {
+        let p = compile_bound_expr_to_program(expr, &schema.columns).expect("lowers");
+        let logical = to_logical(p).expect("the engine accepts the program");
+        match logical.resolve_filter(schema) {
+            Err(ExprValidateErr::RegClassMismatch { .. }) => {}
+            Err(e) => panic!("rejected for the wrong reason: {e:?}"),
+            Ok(_) => panic!("a string result register must not resolve as a filter"),
+        }
     }
 
     /// The float opcodes a fold-to-identity must never emit.
@@ -982,13 +1294,20 @@ mod tests {
 
     /// An unsupported operator reports the original op in the error message.
     #[test]
-    fn string_cmp_unsupported_names_op() {
+    /// The column/literal interception *declines* a non-comparison operator
+    /// rather than erroring, so `strcol || 'lit'` reaches the register channel;
+    /// the rejection of a genuinely undefined operator moves there and still
+    /// names it.
+    fn string_cmp_interception_declines_non_comparisons() {
         let schema = str_schema();
         let s = BoundExpr::ColRef(1);
         let lit = BoundExpr::LitStr("x".to_string());
         let mut eb = ExprBuilder::new();
-        let err = try_compile_string_cmp(&lit, &BinOp::Add, &s, &schema.columns, &mut eb)
-            .expect_err("Add is not a string comparison");
+        assert!(try_compile_string_cmp(&lit, &BinOp::Add, &s, &schema.columns, &mut eb).is_none());
+        assert!(eb.build(0).code.is_empty(), "a declined shape must emit nothing");
+
+        let add = BoundExpr::BinOp(Box::new(lit), BinOp::Add, Box::new(s));
+        let err = lower_err(&add, &schema);
         assert!(err.to_string().contains("Add"), "error must name op: {err}");
     }
 
@@ -1117,7 +1436,7 @@ mod tests {
     /// A string-typed CASE result reaches the integer/string-load path and is
     /// rejected (the register file carries 8-byte values only).
     #[test]
-    fn case_string_branch_rejected() {
+    fn case_string_branches_compile_through_the_string_channel() {
         let schema = case_schema();
         let case_str = BoundExpr::Case {
             branches: vec![(
@@ -1130,10 +1449,11 @@ mod tests {
             )],
             else_: Some(Box::new(BoundExpr::LitStr("y".into()))),
         };
-        assert!(matches!(
-            compile_bound_expr_to_program(&case_str, &schema.columns),
-            Err(GnitzSqlError::Unsupported(_))
-        ));
+        assert_eq!(lower_ops_kind(&case_str, &schema).1, ExprKind::Str);
+        // The engine's class validator is the real check: it rejects a scalar
+        // register reaching a string operand, so a CASE that blended its string
+        // branches with the numeric SELECT would fail here rather than compile.
+        assert_str_program(&case_str, &schema);
     }
 
     /// String arithmetic (`a.s + 1`) likewise reaches the integer-load path and is
@@ -1354,5 +1674,289 @@ mod tests {
             matches!(err, GnitzSqlError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The string channel
+    // -----------------------------------------------------------------------
+
+    fn str_col(i: usize) -> BoundExpr {
+        BoundExpr::ColRef(i)
+    }
+    fn lit(s: &str) -> BoundExpr {
+        BoundExpr::LitStr(s.to_string())
+    }
+
+    /// A plain `col op 'lit'` must keep the specialized 16-byte-cell opcodes:
+    /// the register channel exists for computed operands, and routing the hot
+    /// filter shape through it would build a string register per row for
+    /// nothing.
+    #[test]
+    fn plain_column_comparisons_keep_the_specialized_opcodes() {
+        let schema = str_schema();
+        let ops = lower_ops(
+            &BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Eq, Box::new(lit("x"))),
+            &schema,
+        );
+        assert_eq!(ops, [gnitz_wire::EXPR_STR_COL_EQ_CONST]);
+        let cols = lower_ops(
+            &BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Lt, Box::new(str_col(2))),
+            &schema,
+        );
+        assert_eq!(cols, [gnitz_wire::EXPR_STR_COL_LT_COL]);
+    }
+
+    /// A *computed* operand has no specialized form, so it falls through to the
+    /// register compare. The engine's validator is what proves the operands were
+    /// built in the right class.
+    #[test]
+    fn computed_operands_compare_through_the_register_channel() {
+        let schema = str_schema();
+        let upper_eq = BoundExpr::BinOp(
+            Box::new(BoundExpr::StrCall {
+                f: StrFunc::Upper,
+                arg: Box::new(str_col(1)),
+            }),
+            BinOp::Eq,
+            Box::new(lit("X")),
+        );
+        let ops = lower_ops(&upper_eq, &schema);
+        assert!(ops.contains(&gnitz_wire::EXPR_STR_CMP_EQ), "{ops:?}");
+        assert!(!ops.contains(&gnitz_wire::EXPR_STR_COL_EQ_CONST), "{ops:?}");
+        // The comparison is a boolean, so it is a legitimate filter predicate.
+        let p = compile_bound_expr_to_program(&upper_eq, &schema.columns).expect("lowers");
+        assert!(to_logical(p).unwrap().resolve_filter(&schema).is_ok());
+    }
+
+    /// `NE`, `GT` and `GE` have no opcode of their own on either path; they ride
+    /// the three that exist. Getting the swap backwards is invisible until the
+    /// operands differ, so drive it against the transposition directly.
+    #[test]
+    fn register_compare_derives_ne_gt_ge_from_the_three_opcodes() {
+        let schema = str_schema();
+        let up = |i| BoundExpr::StrCall {
+            f: StrFunc::Upper,
+            arg: Box::new(str_col(i)),
+        };
+        let cmp = |op| lower_ops(&BoundExpr::BinOp(Box::new(up(1)), op, Box::new(up(2))), &schema);
+        let tail = |ops: Vec<u32>| ops[ops.len() - 1];
+        assert_eq!(tail(cmp(BinOp::Lt)), gnitz_wire::EXPR_STR_CMP_LT);
+        assert_eq!(tail(cmp(BinOp::Le)), gnitz_wire::EXPR_STR_CMP_LE);
+        // GT/GE swap the operands rather than negating, so no BOOL_NOT appears.
+        assert_eq!(tail(cmp(BinOp::Gt)), gnitz_wire::EXPR_STR_CMP_LT);
+        assert_eq!(tail(cmp(BinOp::Ge)), gnitz_wire::EXPR_STR_CMP_LE);
+        // NE is the negation of EQ.
+        assert_eq!(tail(cmp(BinOp::Ne)), gnitz_wire::EXPR_BOOL_NOT);
+    }
+
+    #[test]
+    fn concat_operator_and_function_compile_and_differ_in_their_null_rule() {
+        let schema = str_schema();
+        // `||` is NULL-propagating, so `s || NULL` is a NULL string rather than a
+        // type error — `str_operand` intercepts the literal before recursing.
+        let pipe_null = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(BoundExpr::LitNull));
+        assert_str_program(&pipe_null, &schema);
+        assert!(lower_ops(&pipe_null, &schema).contains(&gnitz_wire::EXPR_LOAD_NULL_STR));
+
+        let pipe = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(lit("x")));
+        assert!(lower_ops(&pipe, &schema).contains(&gnitz_wire::EXPR_STR_CONCAT));
+
+        // CONCAT folds through the null-as-empty step instead, and seeds the fold
+        // so even a single argument is non-NULL.
+        let one = BoundExpr::ConcatN { args: vec![str_col(1)] };
+        let ops = lower_ops(&one, &schema);
+        assert!(ops.contains(&gnitz_wire::EXPR_STR_CONCAT_NN), "{ops:?}");
+        assert!(!ops.contains(&gnitz_wire::EXPR_STR_CONCAT), "{ops:?}");
+        assert_str_program(&one, &schema);
+    }
+
+    /// CONCAT is the one place a numeric argument is cast to text implicitly;
+    /// `||` is not, so it stays a typed error there.
+    #[test]
+    fn concat_casts_numeric_arguments_but_the_operator_does_not() {
+        let schema = str_schema();
+        let mixed = BoundExpr::ConcatN {
+            args: vec![str_col(1), BoundExpr::LitInt(42), BoundExpr::LitFloat(1.5)],
+        };
+        let ops = lower_ops(&mixed, &schema);
+        assert!(ops.contains(&gnitz_wire::EXPR_INT_TO_STR), "{ops:?}");
+        assert!(ops.contains(&gnitz_wire::EXPR_FLOAT_TO_STR), "{ops:?}");
+        assert_str_program(&mixed, &schema);
+
+        let pipe_int = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(BoundExpr::LitInt(1)));
+        assert!(lower_err(&pipe_int, &schema).to_string().contains("string"));
+    }
+
+    /// NULLIF on strings desugars to `CASE WHEN a = b THEN NULL ELSE a END`, so
+    /// it exercises both halves of the rule at once: the comparison compiles
+    /// through the string channel, and the `LitNull` branch must become a NULL
+    /// *string* or the CASE would blend two classes.
+    #[test]
+    fn string_nullif_and_coalesce_desugars_compile() {
+        let schema = str_schema();
+        let nullif = BoundExpr::Case {
+            branches: vec![(
+                BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Eq, Box::new(str_col(2))),
+                BoundExpr::LitNull,
+            )],
+            else_: Some(Box::new(str_col(1))),
+        };
+        assert_str_program(&nullif, &schema);
+
+        let coalesce = BoundExpr::Case {
+            branches: vec![(BoundExpr::IsNotNull(1), str_col(1))],
+            else_: Some(Box::new(lit("default"))),
+        };
+        assert_str_program(&coalesce, &schema);
+    }
+
+    /// An all-NULL CASE carries no type signal at all, so it keeps the
+    /// pre-existing "ambiguous NULL defaults to I64" behaviour rather than
+    /// silently becoming a string.
+    #[test]
+    fn an_all_null_case_still_types_as_an_integer() {
+        let schema = str_schema();
+        let all_null = BoundExpr::Case {
+            branches: vec![(BoundExpr::LitInt(1), BoundExpr::LitNull)],
+            else_: None,
+        };
+        assert_eq!(all_null.infer_type(&schema.columns), TypeCode::I64);
+        assert_eq!(lower_ops_kind(&all_null, &schema).1, ExprKind::Int);
+    }
+
+    #[test]
+    fn mixed_string_and_numeric_case_branches_are_a_typed_error() {
+        let schema = str_schema();
+        let mixed = BoundExpr::Case {
+            branches: vec![(BoundExpr::LitInt(1), lit("x"))],
+            else_: Some(Box::new(BoundExpr::LitInt(0))),
+        };
+        assert!(matches!(lower_err(&mixed, &schema), GnitzSqlError::Unsupported(_)));
+    }
+
+    /// Every numeric position reads its operands through `lower_num`, so a
+    /// string there is a SQL error rather than an engine-side class mismatch the
+    /// user would see as an opaque internal enum.
+    #[test]
+    fn strings_in_numeric_positions_are_rejected_by_lowering() {
+        let schema = str_schema();
+        let s = || str_col(1);
+        let cases: Vec<BoundExpr> = vec![
+            BoundExpr::BinOp(Box::new(s()), BinOp::Add, Box::new(BoundExpr::LitInt(1))),
+            BoundExpr::BinOp(Box::new(s()), BinOp::And, Box::new(lit("x"))),
+            BoundExpr::BinOp(Box::new(s()), BinOp::Or, Box::new(lit("x"))),
+            BoundExpr::Func {
+                f: NumFunc::Abs,
+                arg: Box::new(s()),
+            },
+            BoundExpr::Func {
+                f: NumFunc::Round(2),
+                arg: Box::new(s()),
+            },
+            BoundExpr::MinMaxN {
+                is_max: true,
+                args: vec![s(), lit("x")],
+            },
+            BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(s())),
+            BoundExpr::UnaryOp(UnaryOp::Not, Box::new(s())),
+            BoundExpr::Substr {
+                s: Box::new(s()),
+                start: Box::new(s()),
+                len: None,
+            },
+        ];
+        for e in &cases {
+            assert!(
+                matches!(lower_err(e, &schema), GnitzSqlError::Unsupported(_)),
+                "{e:?} must be rejected by lowering"
+            );
+        }
+        // A comparison carries no implicit cast either way.
+        let mixed = BoundExpr::BinOp(Box::new(s()), BinOp::Eq, Box::new(BoundExpr::LitInt(1)));
+        assert!(lower_err(&mixed, &schema).to_string().contains("strings"));
+    }
+
+    /// BLOB keeps exactly its existing comparison support: the column/literal
+    /// shapes compile, and everything else — including the string functions —
+    /// rejects.
+    #[test]
+    fn blob_columns_stay_outside_the_string_surface() {
+        let schema = blob_schema();
+        let cmp = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Eq, Box::new(lit("x")));
+        assert_eq!(lower_ops(&cmp, &schema), [gnitz_wire::EXPR_STR_COL_EQ_CONST]);
+
+        let upper = BoundExpr::StrCall {
+            f: StrFunc::Lower,
+            arg: Box::new(str_col(1)),
+        };
+        assert!(lower_err(&upper, &schema).to_string().contains("blob"));
+    }
+
+    /// A string source must never reach the numeric elide test: STRING's
+    /// register image is I64, so it would match and drop the cast, reading the
+    /// 16-byte descriptor as an integer.
+    #[test]
+    fn cast_from_a_string_emits_a_parse_and_is_never_elided() {
+        let schema = str_schema();
+        let to = |tc| BoundExpr::Cast {
+            expr: Box::new(str_col(1)),
+            to: tc,
+        };
+        assert_eq!(
+            lower_ops(&to(TypeCode::I64), &schema),
+            [gnitz_wire::EXPR_LOAD_COL_STR, gnitz_wire::EXPR_STR_TO_INT]
+        );
+        assert_eq!(
+            lower_ops(&to(TypeCode::F64), &schema),
+            [gnitz_wire::EXPR_LOAD_COL_STR, gnitz_wire::EXPR_STR_TO_FLOAT]
+        );
+        assert_eq!(
+            lower_ops(&to(TypeCode::F32), &schema),
+            [
+                gnitz_wire::EXPR_LOAD_COL_STR,
+                gnitz_wire::EXPR_STR_TO_FLOAT,
+                gnitz_wire::EXPR_FLOAT_TO_F32
+            ]
+        );
+        // STRING → STRING is the identity.
+        assert_eq!(
+            lower_ops(&to(TypeCode::String), &schema),
+            [gnitz_wire::EXPR_LOAD_COL_STR]
+        );
+    }
+
+    #[test]
+    fn cast_to_text_emits_the_numeric_to_text_opcode_for_its_source_domain() {
+        let schema = cast_schema();
+        let to_text = |c| BoundExpr::Cast {
+            expr: Box::new(BoundExpr::ColRef(c)),
+            to: TypeCode::String,
+        };
+        assert!(lower_ops(&to_text(1), &schema).contains(&gnitz_wire::EXPR_INT_TO_STR));
+        let f = BoundExpr::Cast {
+            expr: Box::new(BoundExpr::LitFloat(1.5)),
+            to: TypeCode::String,
+        };
+        assert!(lower_ops(&f, &schema).contains(&gnitz_wire::EXPR_FLOAT_TO_STR));
+        assert_str_program(&to_text(1), &schema);
+    }
+
+    /// A computed STRING column must be *declared* STRING. The register image
+    /// maps STRING to I64, which was right while every computed value was an
+    /// 8-byte register.
+    #[test]
+    fn a_computed_string_projection_declares_a_string_column() {
+        let schema = str_schema();
+        let e = BoundExpr::StrCall {
+            f: StrFunc::Upper,
+            arg: Box::new(str_col(1)),
+        };
+        let nominal = e.infer_type(&schema.columns);
+        assert_eq!(nominal, TypeCode::String);
+        let def = ColumnDef::computed(None, 0, nominal);
+        assert_eq!(def.type_code, TypeCode::String);
+        assert!(def.is_nullable);
+        // A numeric expression still takes its register image.
+        assert_eq!(ColumnDef::computed(None, 0, TypeCode::F32).type_code, TypeCode::F64);
     }
 }

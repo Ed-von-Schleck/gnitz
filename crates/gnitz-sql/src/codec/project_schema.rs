@@ -78,9 +78,10 @@ fn resolve_proj_col(
 /// Compile the *payload* slice of a projection (`items` must exclude the
 /// leading PK slots, which the engine carries verbatim) into one expr-map
 /// program: a COPY_COL per pass-through, a compiled expression + EMIT per
-/// computed slot. `payload_idx` is the dense output payload position. EMIT
-/// writes the raw register bits via append_int — correct for float. The
-/// program's `result_reg` is unused (EMIT/COPY_COL write directly).
+/// computed slot. `payload_idx` is the dense output payload position. EMIT is
+/// class-agnostic here — the engine splits it by the source register's class,
+/// storing the raw 8-byte image for a scalar and a German-string cell for a
+/// string. The program's `result_reg` is unused (EMIT/COPY_COL write directly).
 pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Result<ExprProgram, GnitzSqlError> {
     let mut eb = ExprBuilder::new();
     for (payload_idx, item) in items.iter().enumerate() {

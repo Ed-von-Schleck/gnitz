@@ -74,9 +74,10 @@ impl ColumnDef {
     /// - `_expr{idx}` when the item has no alias;
     /// - always nullable — an expression over a NOT NULL column can still be
     ///   NULL (division by zero, an unmatched CASE);
-    /// - typed by the 8-byte register image the engine's `EMIT` stores whole,
-    ///   not the nominal type: `-f32col` computes in f64, so declaring the
-    ///   column `F32` would ship the low half of the double.
+    /// - typed by the register image the engine's `EMIT` stores whole, not the
+    ///   nominal type: `-f32col` computes in f64, so declaring the column `F32`
+    ///   would ship the low half of the double. STRING maps to itself, which
+    ///   `register_image` already accounts for.
     pub fn computed(alias: Option<String>, idx: usize, nominal: TypeCode) -> Self {
         Self::new(
             alias.unwrap_or_else(|| format!("_expr{idx}")),

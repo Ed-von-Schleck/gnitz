@@ -31,7 +31,7 @@ fn raw_scratch(num_regs: usize, no_nulls: bool, n: usize) -> EvalScratch {
         ..Default::default()
     };
     let null_cap = if no_nulls { 0 } else { num_regs * NULL_WORDS_PER_REG };
-    s.grow(num_regs * MORSEL, null_cap, n.div_ceil(64));
+    s.grow(num_regs * MORSEL, null_cap, 0, n.div_ceil(64));
     s
 }
 
@@ -85,7 +85,7 @@ fn test_eval_batch_add() {
         LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
     ];
     let prog = resolved(&schema, instrs, 3, 2);
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, 3);
     eval_batch(&prog, &mb, 0, 3, &mut scratch);
 
@@ -119,7 +119,7 @@ fn golden_int_div_zero_divisor_single_row() {
     ];
     let prog = resolved(&schema, instrs, 3, 2);
 
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
@@ -146,7 +146,7 @@ fn golden_float_div_zero_divisor_single_row() {
     ];
     let prog = resolved(&schema, instrs, 3, 2);
 
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
@@ -166,7 +166,7 @@ fn run_bool_combinator(schema: &TestSchema, batch: &TestView, op: fn(u16, u16, u
         op(2, 0, 1),
     ];
     let prog = resolved(schema, instrs, 3, 2);
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, 1);
     eval_batch(&prog, batch, 0, 1, &mut scratch);
     let val = read_reg_row0(&prog, &scratch, 2);
@@ -225,7 +225,7 @@ fn golden_int_neg_null_source_single_row() {
         },
     ];
     let prog = resolved(&schema, instrs, 2, 1);
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     assert!(
@@ -243,7 +243,7 @@ fn golden_bool_not_null_source_single_row() {
         LogicalInstr::BoolNot { dst: 1, a: 0 },
     ];
     let prog = resolved(&schema, instrs, 2, 1);
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     assert!(
@@ -301,7 +301,7 @@ fn select_boundary_sweep() {
             },
         );
 
-        let mut scratch = EvalScratch::default();
+        let mut scratch = EvalScratch::new(&prog);
         for morsel_start in (0..n).step_by(MORSEL) {
             let m = MORSEL.min(n - morsel_start);
             scratch.ensure_capacity(&prog, m);
@@ -356,7 +356,7 @@ fn select_no_nulls_fast_arm() {
         },
         |_, _| false,
     );
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, n);
     eval_batch(&prog, &mb, 0, n, &mut scratch);
     for row in 0..n {
@@ -409,7 +409,7 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
         "bool reg fed into arithmetic must NOT be bit_only",
     );
 
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
     // r5 lives in regs as 0/1; r7 = r5 + 0 = 1.
@@ -479,7 +479,7 @@ fn int_loads_cover_every_width_and_both_pk_signednesses() {
         })
         .collect();
     let prog = resolved(&schema, instrs, cols.len() as u32, 0);
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, ROWS);
     eval_batch(&prog, &mb, 0, ROWS, &mut scratch);
 
@@ -526,7 +526,7 @@ fn bench_chain(label: &str, prog_on: &ResolvedProgram, prog_off: &ResolvedProgra
     use std::hint::black_box;
     use std::time::Instant;
 
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(prog_on);
     scratch.ensure_capacity(prog_on, MORSEL);
 
     // Warm up and confirm the skip does not change the result.
@@ -668,7 +668,7 @@ fn run_unary_rows(vals: &[i64], nulls: &[bool], mk: impl Fn(u16, u16) -> Logical
     let view = make_n_col_view(&schema, n, |row, _| vals[row], |row, _| nulls[row]);
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }, mk(1, 0)];
     let prog = resolved(&schema, instrs, 2, 1);
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, n);
     eval_batch(&prog, &view, 0, n, &mut scratch);
     (0..n)
@@ -702,7 +702,7 @@ fn run_binary_rows(
         mk(2, 0, 1),
     ];
     let prog = resolved(&schema, instrs, 3, 2);
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, n);
     eval_batch(&prog, &view, 0, n, &mut scratch);
     (0..n)
@@ -831,7 +831,7 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
         },
     ];
     let prog = resolved(&schema, instrs, 2, 1);
-    let mut scratch = EvalScratch::default();
+    let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, n);
     eval_batch(&prog, &view, 0, n, &mut scratch);
     assert_eq!(scratch.regs[1 * MORSEL], 5);
@@ -948,4 +948,697 @@ fn float_minmax2_uses_total_cmp_order() {
         bits_to_float(min[2].0).is_sign_negative(),
         "-0.0 wins MIN under total_cmp"
     );
+}
+
+// ---------------------------------------------------------------------------
+// String registers
+// ---------------------------------------------------------------------------
+
+use crate::test_support::{make_string_view, schema_pk_strings};
+use crate::{Evaluator, StrOp};
+
+/// The program under test over one nullable STRING column (payload slot 0,
+/// column 1), with the view to drive it over. `mk` builds the instructions given
+/// the loaded source register; the last one's `dst` is the result.
+fn str_prog(
+    vals: &[&[u8]],
+    nulls: &[bool],
+    consts: Vec<Vec<u8>>,
+    mk: impl Fn(u16) -> Vec<LogicalInstr>,
+) -> (Evaluator, TestView) {
+    let schema = schema_pk_strings(1, true);
+    let rows: Vec<&[&[u8]]> = vals.iter().map(std::slice::from_ref).collect();
+    let mut view = make_string_view(&schema, &rows);
+    for (row, &is_null) in nulls.iter().enumerate() {
+        if is_null {
+            view.set_null(row, 0);
+        }
+    }
+    let mut instrs = vec![LogicalInstr::LoadColStr { dst: 0, col: 1 }];
+    instrs.extend(mk(0));
+    let result = instrs.len() as u32 - 1;
+    (scalar_prog(&schema, instrs, result + 1, result, consts), view)
+}
+
+/// Read a *string* register back per row.
+fn run_str_rows(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(u16) -> Vec<LogicalInstr>) -> Vec<(Vec<u8>, bool)> {
+    let (ev, view) = str_prog(vals, nulls, vec![], mk);
+    (0..vals.len()).map(|i| row_str(&ev, &view, i)).collect()
+}
+
+/// The same, but reading a *scalar* register — LENGTH, the compares, the
+/// text→number parses.
+fn run_str_to_scalar(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(u16) -> Vec<LogicalInstr>) -> Vec<(i64, bool)> {
+    let (ev, view) = str_prog(vals, nulls, vec![], mk);
+    (0..vals.len()).map(|i| ev.eval_row(&view, i)).collect()
+}
+
+/// One row's string result as `(bytes, is_null)`.
+fn row_str(ev: &Evaluator, view: &TestView, i: usize) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let is_null = ev.eval_row_str(view, i, &mut out);
+    (out, is_null)
+}
+
+/// Values crossing the 12-byte inline/heap boundary, so every kernel is driven
+/// over both cell classes and over a lane whose buffer discriminator changes
+/// row to row.
+const CELL_CLASSES: [&[u8]; 5] = [
+    b"",
+    b"abcdefghijk",   // 11 — inline
+    b"abcdefghijkl",  // 12 — inline, at the threshold
+    b"abcdefghijklm", // 13 — first heap length
+    b"abcdefghijklmnopqrstuvwxyz",
+];
+
+#[test]
+fn case_fold_is_ascii_only_and_leaves_other_bytes_alone() {
+    // The ASCII boundary bytes on both sides of `a-z`/`A-Z`, a multibyte UTF-8
+    // sequence, and a lone continuation byte.
+    let vals: &[&[u8]] = &[b"`az{", b"@AZ[", "straße".as_bytes(), &[0xC3, 0x9F, 0x80]];
+    let up = run_str_rows(vals, &[false; 4], |a| {
+        vec![LogicalInstr::StrCase { dst: 1, a, upper: true }]
+    });
+    assert_eq!(up[0].0, b"`AZ{", "only a-z folds; the neighbours pass through");
+    assert_eq!(up[1].0, b"@AZ[");
+    // Documented deviation from PostgreSQL under a UTF-8 locale: ß is untouched.
+    assert_eq!(up[2].0, "STRAßE".as_bytes());
+    assert_eq!(up[3].0, &[0xC3, 0x9F, 0x80]);
+
+    let lo = run_str_rows(vals, &[false; 4], |a| {
+        vec![LogicalInstr::StrCase {
+            dst: 1,
+            a,
+            upper: false,
+        }]
+    });
+    assert_eq!(lo[0].0, b"`az{");
+    assert_eq!(lo[1].0, b"@az[");
+}
+
+#[test]
+fn case_fold_round_trips_every_cell_class_and_propagates_null() {
+    let nulls = [false, false, true, false, false];
+    let got = run_str_rows(&CELL_CLASSES, &nulls, |a| {
+        vec![
+            LogicalInstr::StrCase { dst: 1, a, upper: true },
+            LogicalInstr::StrCase {
+                dst: 2,
+                a: 1,
+                upper: false,
+            },
+        ]
+    });
+    for (i, want) in CELL_CLASSES.iter().enumerate() {
+        assert_eq!(got[i].1, nulls[i], "row {i} nullness");
+        if !nulls[i] {
+            assert_eq!(&got[i].0, want, "UPPER then LOWER is the identity on ASCII");
+        }
+    }
+}
+
+#[test]
+fn length_counts_characters_and_octets_separately() {
+    // A combining mark, a ZWJ emoji, and bytes that are not UTF-8 at all — the
+    // engine is byte-transparent, so the count must stay total.
+    let vals: &[&[u8]] = &[
+        b"abc",
+        "e\u{0301}".as_bytes(),
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".as_bytes(),
+        &[0xFF, 0xFE, 0x41],
+    ];
+    let chars = run_str_to_scalar(vals, &[false; 4], |a| {
+        vec![LogicalInstr::StrLen { dst: 1, a, chars: true }]
+    });
+    let bytes = run_str_to_scalar(vals, &[false; 4], |a| {
+        vec![LogicalInstr::StrLen {
+            dst: 1,
+            a,
+            chars: false,
+        }]
+    });
+    // The emoji is 5 codepoints (three faces joined by two ZWJs) in 18 bytes —
+    // the byte/character distinction OCTET_LENGTH exists to expose.
+    assert_eq!(chars.iter().map(|r| r.0).collect::<Vec<_>>(), [3, 2, 5, 3]);
+    assert_eq!(bytes.iter().map(|r| r.0).collect::<Vec<_>>(), [3, 3, 18, 3]);
+}
+
+#[test]
+fn length_of_null_is_null() {
+    let got = run_str_to_scalar(&[b"abc"], &[true], |a| {
+        vec![LogicalInstr::StrLen { dst: 1, a, chars: true }]
+    });
+    assert!(got[0].1);
+}
+
+/// The window rule is the totality proof: every endpoint is clamped in i128 to
+/// `[1, N + 1]` before any narrowing, so no start/length pair can panic or read
+/// out of the string.
+#[test]
+fn substring_window_matches_postgres_and_is_total() {
+    let subst = |start: i64, len: Option<i64>| {
+        let mut instrs = vec![LogicalInstr::LoadConst { dst: 1, val: start }];
+        let len_reg = len.map(|l| {
+            instrs.push(LogicalInstr::LoadConst { dst: 2, val: l });
+            2u16
+        });
+        let dst = if len_reg.is_some() { 3 } else { 2 };
+        instrs.push(LogicalInstr::StrSubstr {
+            dst,
+            src: 0,
+            start_reg: 1,
+            len_reg,
+        });
+        instrs
+    };
+    let one = |s: &[u8], start: i64, len: Option<i64>| {
+        let r = run_str_rows(&[s], &[false], |_| subst(start, len));
+        r[0].clone()
+    };
+
+    assert_eq!(one(b"abc", 1, None).0, b"abc");
+    assert_eq!(one(b"abc", 2, None).0, b"bc");
+    // A start at or past the end is empty, never a panic.
+    assert_eq!(one(b"abc", 4, None).0, b"");
+    // A start at or below 0 is the whole string: the upper clamp is N+1 because
+    // the window is half-open, so clamping to N would lose the last character.
+    assert_eq!(one(b"abc", -1, None).0, b"abc");
+    assert_eq!(one(b"abc", 0, Some(2)).0, b"a");
+    assert_eq!(one(b"abc", 1, Some(0)).0, b"");
+    assert_eq!(one(b"abc", 2, Some(1)).0, b"b");
+    // A negative length is NULL (PostgreSQL errors; here every domain error is
+    // a NULL).
+    assert!(one(b"abc", 1, Some(-1)).1);
+    // Bounds near the i64 extremes: the i128 window absorbs the sum.
+    assert_eq!(one(b"abc", i64::MAX, None).0, b"");
+    assert_eq!(one(b"abc", i64::MIN, Some(i64::MAX)).0, b"");
+    assert_eq!(one(b"abc", 1, Some(i64::MAX)).0, b"abc");
+    // Windows are character units, not bytes. The clamp ceiling is the *byte*
+    // length, which only bounds the character count, so a window that lands
+    // between the two must still resolve to the string's end: "äöü" is 3
+    // characters in 6 bytes, and starts/lengths in 4..=6 exercise that gap.
+    assert_eq!(one("äöü".as_bytes(), 2, Some(1)).0, "ö".as_bytes());
+    assert_eq!(one("äöü".as_bytes(), 2, None).0, "öü".as_bytes());
+    assert_eq!(one("äöü".as_bytes(), 4, None).0, b"");
+    assert_eq!(one("äöü".as_bytes(), 3, Some(5)).0, "ü".as_bytes());
+    assert_eq!(one("äöü".as_bytes(), 1, Some(4)).0, "äöü".as_bytes());
+    assert_eq!(one("äöü".as_bytes(), 5, Some(2)).0, b"");
+    // A lone continuation byte belongs to no character, so the value has zero
+    // characters and every window over it is empty — even `FROM 1`, which is the
+    // identity on every well-formed value. The clamp ceiling is the byte length,
+    // so this is the case that distinguishes it from the character count.
+    assert_eq!(one(&[0x80], 1, None).0, b"");
+    assert_eq!(one(&[0x80], i64::MIN, None).0, b"");
+    assert_eq!(one(&[0x80, 0x80], 1, Some(1)).0, b"");
+    // A continuation byte *after* a character start is part of that character.
+    assert_eq!(one(&[0x80, b'a'], 1, None).0, b"a");
+    // A heap-backed source yields a sub-view of the heap, not a copy.
+    assert_eq!(one(b"abcdefghijklmnop", 14, Some(2)).0, b"no");
+}
+
+#[test]
+fn substring_of_a_computed_string_is_a_sub_view_of_the_arena() {
+    let got = run_str_rows(&[b"abcdefghijklmnop"], &[false], |a| {
+        vec![
+            LogicalInstr::StrCase { dst: 1, a, upper: true },
+            LogicalInstr::LoadConst { dst: 2, val: 3 },
+            LogicalInstr::LoadConst { dst: 3, val: 4 },
+            LogicalInstr::StrSubstr {
+                dst: 4,
+                src: 1,
+                start_reg: 2,
+                len_reg: Some(3),
+            },
+        ]
+    });
+    assert_eq!(got[0].0, b"CDEF");
+}
+
+#[test]
+fn trim_strips_the_selected_ends_only() {
+    let set = b"xy".to_vec();
+    let vals: &[&[u8]] = &[b"xyaxybyx", b"xyxy", b"", b"abc"];
+    let run = |mode: u32| {
+        let (ev, view) = str_prog(vals, &[false; 4], vec![set.clone()], |a| {
+            vec![LogicalInstr::StrTrim {
+                dst: 1,
+                a,
+                mode,
+                set_idx: 0,
+            }]
+        });
+        (0..vals.len()).map(|i| row_str(&ev, &view, i).0).collect::<Vec<_>>()
+    };
+    let (both, leading, trailing) = (run(0), run(1), run(2));
+    assert_eq!(leading, [b"axybyx".to_vec(), b"".into(), b"".into(), b"abc".into()]);
+    assert_eq!(trailing, [b"xyaxyb".to_vec(), b"".into(), b"".into(), b"abc".into()]);
+    assert_eq!(both, [b"axyb".to_vec(), b"".into(), b"".into(), b"abc".into()]);
+    // BOTH is exactly LEADING then TRAILING, including where the two overlap.
+    for i in 0..vals.len() {
+        let mut want = leading[i].clone();
+        while want.last().is_some_and(|b| set.contains(b)) {
+            want.pop();
+        }
+        assert_eq!(both[i], want, "row {i}");
+    }
+}
+
+/// The two null rules are the whole difference between `||` and `CONCAT`, and
+/// CONCAT's is asymmetric so a NULL accumulator still propagates.
+#[test]
+fn concat_null_rules_differ_by_operand_side() {
+    let schema = schema_pk_strings(2, true);
+    let rows: Vec<&[&[u8]]> = vec![&[b"ab", b"cd"], &[b"ab", b"cd"], &[b"ab", b"cd"]];
+    let mut view = make_string_view(&schema, &rows);
+    view.set_null(1, 0); // a NULL
+    view.set_null(2, 1); // b NULL
+
+    let run = |skip_null: bool| {
+        let instrs = vec![
+            LogicalInstr::LoadColStr { dst: 0, col: 1 },
+            LogicalInstr::LoadColStr { dst: 1, col: 2 },
+            LogicalInstr::StrConcat {
+                dst: 2,
+                a: 0,
+                b: 1,
+                skip_null,
+            },
+        ];
+        let ev = scalar_prog(&schema, instrs, 3, 2, vec![]);
+        (0..3).map(|i| row_str(&ev, &view, i)).collect::<Vec<_>>()
+    };
+
+    let prop = run(false);
+    assert_eq!(prop[0].0, b"abcd");
+    assert!(prop[1].1 && prop[2].1, "|| propagates NULL from either side");
+
+    let skip = run(true);
+    assert_eq!(skip[0].0, b"abcd");
+    assert!(skip[1].1, "a NULL accumulator still propagates");
+    assert_eq!(skip[2].0, b"ab", "a NULL argument contributes the empty string");
+    assert!(!skip[2].1);
+}
+
+#[test]
+fn concat_is_classified_null_producing_so_the_no_nulls_arm_cannot_take_it() {
+    // Non-nullable columns: everything else about the program is `no_nulls`, but
+    // the u32::MAX length verdict needs a null word to record itself in.
+    let schema = schema_pk_strings(2, false);
+    let concat = scalar_prog(
+        &schema,
+        vec![
+            LogicalInstr::LoadColStr { dst: 0, col: 1 },
+            LogicalInstr::LoadColStr { dst: 1, col: 2 },
+            LogicalInstr::StrConcat {
+                dst: 2,
+                a: 0,
+                b: 1,
+                skip_null: false,
+            },
+        ],
+        3,
+        2,
+        vec![],
+    );
+    assert!(!concat.prog.no_nulls);
+
+    let upper = scalar_prog(
+        &schema,
+        vec![
+            LogicalInstr::LoadColStr { dst: 0, col: 1 },
+            LogicalInstr::StrCase {
+                dst: 1,
+                a: 0,
+                upper: true,
+            },
+        ],
+        2,
+        1,
+        vec![],
+    );
+    assert!(upper.prog.no_nulls, "a pure transform keeps the no_nulls arm");
+}
+
+/// The register compare must agree with `compare_german_strings`, which is the
+/// order consolidation and opcodes 40-45 use. A disagreement would split one
+/// Z-set element's weight across rows that never merge.
+#[test]
+fn register_compare_agrees_with_the_cell_comparator() {
+    let corpus: &[&[u8]] = &[
+        b"",
+        b"a",
+        b"ab",
+        b"ab\0",
+        b"abcd",
+        b"abce",
+        b"abcdefghijkl",
+        b"abcdefghijklm",
+        b"abcdefghijklmnopqrst",
+        b"abcdefghijklmnopqrsu",
+        &[0x80],
+        &[0xFF, 0x00],
+        "zzz".as_bytes(),
+    ];
+    let schema = schema_pk_strings(2, false);
+    let mut blob = Vec::new();
+    let cells: Vec<[u8; 16]> = corpus
+        .iter()
+        .map(|s| gnitz_wire::encode_german_string(s, &mut blob))
+        .collect();
+
+    // The program depends only on the operator, so all three are built once and
+    // driven over every pair — not rebuilt inside the loop.
+    let evs = [StrOp::Eq, StrOp::Lt, StrOp::Le].map(|op| {
+        scalar_prog(
+            &schema,
+            vec![
+                LogicalInstr::LoadColStr { dst: 0, col: 1 },
+                LogicalInstr::LoadColStr { dst: 1, col: 2 },
+                LogicalInstr::StrCmp { op, dst: 2, a: 0, b: 1 },
+            ],
+            3,
+            2,
+            vec![],
+        )
+    });
+
+    for (i, a) in corpus.iter().enumerate() {
+        for (j, b) in corpus.iter().enumerate() {
+            let view = make_string_view(&schema, &[&[a, b]]);
+            let verdicts: Vec<i64> = evs.iter().map(|ev| ev.eval_row(&view, 0).0).collect();
+            let want = gnitz_wire::compare_german_strings(&cells[i], &blob, &cells[j], &blob);
+            assert_eq!(
+                verdicts,
+                [want.is_eq() as i64, want.is_lt() as i64, want.is_le() as i64],
+                "{a:?} vs {b:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
+    // A U64 column above i64::MAX has a negative i64 bit pattern, so the
+    // resolve-time tracking is the only thing that keeps the text unsigned.
+    let schema = TestSchema::new(
+        &[(type_code::U64, false), (type_code::U64, true), (type_code::I64, true)],
+        &[0],
+    );
+    let view = make_int_view(&schema, &[(1, 0, &[u64::MAX as i64, i64::MIN])]);
+    let text = |col: u32| {
+        let ev = scalar_prog(
+            &schema,
+            vec![
+                LogicalInstr::LoadColInt { dst: 0, col },
+                LogicalInstr::IntToStr { dst: 1, a: 0 },
+            ],
+            2,
+            1,
+            vec![],
+        );
+        row_str(&ev, &view, 0).0
+    };
+    assert_eq!(text(1), u64::MAX.to_string().as_bytes());
+    assert_eq!(text(2), i64::MIN.to_string().as_bytes());
+}
+
+/// The magnitude switch is what bounds the output: Rust's positional `Display`
+/// renders `1e300` as 301 digits. Every value must also survive the round trip
+/// back through the parse.
+#[test]
+fn float_to_text_is_bounded_and_round_trips() {
+    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::F64, true)], &[0]);
+    let vals = [
+        0.0,
+        -0.0,
+        1.5,
+        -1.5,
+        1e-4,
+        9.999e14,
+        1e15,
+        1e-5,
+        1e300,
+        -1e300,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        5e-324,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    let rows: Vec<(u64, u64, Vec<i64>)> = vals
+        .iter()
+        .enumerate()
+        .map(|(i, &f)| (i as u64 + 1, 0, vec![float_to_bits(f)]))
+        .collect();
+    let row_refs: Vec<(u64, u64, &[i64])> = rows.iter().map(|(p, n, v)| (*p, *n, v.as_slice())).collect();
+    let view = make_int_view(&schema, &row_refs);
+
+    let ev = scalar_prog(
+        &schema,
+        vec![
+            LogicalInstr::LoadColFloat { dst: 0, col: 1 },
+            LogicalInstr::FloatToStr { dst: 1, a: 0 },
+        ],
+        2,
+        1,
+        vec![],
+    );
+    for (i, &f) in vals.iter().enumerate() {
+        let text = String::from_utf8(row_str(&ev, &view, i).0).expect("decimal text is ASCII");
+        assert!(text.len() <= 24, "{f} rendered {} bytes: {text}", text.len());
+        // PostgreSQL's spelling for the non-finite values, not Rust's `inf`.
+        match f {
+            f if f.is_nan() => assert_eq!(text, "NaN"),
+            f64::INFINITY => assert_eq!(text, "Infinity"),
+            f64::NEG_INFINITY => assert_eq!(text, "-Infinity"),
+            _ => assert_eq!(
+                text.parse::<f64>().unwrap().to_bits(),
+                f.to_bits(),
+                "{f} must round-trip bit-exactly through {text}"
+            ),
+        }
+    }
+    // The sign of zero survives, which is what keeps a retraction cancelling.
+    assert_eq!(row_str(&ev, &view, 1).0, b"-0");
+}
+
+#[test]
+fn text_to_int_accepts_only_plain_decimal_and_range_checks_the_target() {
+    let cases: &[(&[u8], Option<i64>)] = &[
+        (b"42", Some(42)),
+        (b" 42 ", Some(42)),
+        (b"\t-7\n", Some(-7)),
+        (b"+7", Some(7)),
+        (b"-0", Some(0)),
+        (b"", None),
+        (b"   ", None),
+        (b"1.5", None),
+        (b"42abc", None),
+        (b"-", None),
+        // PostgreSQL 16+ accepts these; the decimal loop deliberately does not.
+        (b"0x10", None),
+        (b"1_000", None),
+        // 39 digits overflows i128's accumulate; the checked ops make it NULL,
+        // never a wrap.
+        (b"999999999999999999999999999999999999999", None),
+    ];
+    let vals: Vec<&[u8]> = cases.iter().map(|(s, _)| *s).collect();
+    let got = run_str_to_scalar(&vals, &vec![false; cases.len()], |a| {
+        vec![LogicalInstr::StrToInt {
+            dst: 1,
+            a,
+            tc: type_code::I64 as u32,
+        }]
+    });
+    for (i, (s, want)) in cases.iter().enumerate() {
+        match want {
+            Some(v) => assert_eq!((got[i].0, got[i].1), (*v, false), "{s:?}"),
+            None => assert!(got[i].1, "{s:?} must be NULL"),
+        }
+    }
+
+    // Range-checked against the *target*, not i64.
+    let narrow = run_str_to_scalar(&[b"127", b"128", b"-128", b"-129"], &[false; 4], |a| {
+        vec![LogicalInstr::StrToInt {
+            dst: 1,
+            a,
+            tc: type_code::I8 as u32,
+        }]
+    });
+    assert_eq!(
+        narrow.iter().map(|r| r.1).collect::<Vec<_>>(),
+        [false, true, false, true]
+    );
+}
+
+/// A U64 target must re-seed the register's unsigned tracking, or every
+/// downstream ordered compare picks the signed variant on a value above 2^63.
+#[test]
+fn text_to_u64_seeds_the_unsigned_tracking() {
+    let schema = schema_pk_strings(1, true);
+    let view = make_string_view(&schema, &[&[u64::MAX.to_string().as_bytes()]]);
+    let cmp = |tc: u8| {
+        let ev = scalar_prog(
+            &schema,
+            vec![
+                LogicalInstr::LoadColStr { dst: 0, col: 1 },
+                LogicalInstr::StrToInt {
+                    dst: 1,
+                    a: 0,
+                    tc: tc as u32,
+                },
+                LogicalInstr::LoadConst { dst: 2, val: 5 },
+                LogicalInstr::Cmp {
+                    op: CmpOp::Gt,
+                    dst: 3,
+                    a: 1,
+                    b: 2,
+                },
+            ],
+            4,
+            3,
+            vec![],
+        );
+        ev.eval_row(&view, 0)
+    };
+    assert_eq!(cmp(type_code::U64), (1, false), "u64::MAX > 5 under unsigned order");
+    // The same text does not fit I64 at all, so the parse itself NULLs the row —
+    // there is no signed reading of this value to compare wrongly.
+    assert!(cmp(type_code::I64).1);
+}
+
+#[test]
+fn text_to_float_parses_or_nulls() {
+    let cases: &[(&[u8], Option<f64>)] = &[
+        (b"1.5", Some(1.5)),
+        (b" -2.5e3 ", Some(-2500.0)),
+        (b"42", Some(42.0)),
+        (b"", None),
+        (b"abc", None),
+        (b"1.5x", None),
+    ];
+    let vals: Vec<&[u8]> = cases.iter().map(|(s, _)| *s).collect();
+    let got = run_str_to_scalar(&vals, &vec![false; cases.len()], |a| {
+        vec![LogicalInstr::StrToFloat { dst: 1, a }]
+    });
+    for (i, (s, want)) in cases.iter().enumerate() {
+        match want {
+            Some(f) => assert_eq!((bits_to_float(got[i].0), got[i].1), (*f, false), "{s:?}"),
+            None => assert!(got[i].1, "{s:?} must be NULL"),
+        }
+    }
+    // Invalid UTF-8 is NULL, not a panic: the engine is byte-transparent.
+    let bad = run_str_to_scalar(&[&[0xFF, 0xFE]], &[false], |a| {
+        vec![LogicalInstr::StrToFloat { dst: 1, a }]
+    });
+    assert!(bad[0].1);
+}
+
+/// A morsel-crossing run: the arena is truncated back to its constant prefix at
+/// the top of every morsel, so a lane that survived into the next one would read
+/// another row's bytes.
+#[test]
+fn computed_strings_do_not_leak_across_morsels() {
+    let n = MORSEL + 7;
+    let schema = schema_pk_strings(1, false);
+    let owned: Vec<Vec<u8>> = (0..n)
+        .map(|i| format!("row{i}-abcdefghijklmnop").into_bytes())
+        .collect();
+    let cells: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    let rows: Vec<&[&[u8]]> = cells.iter().map(std::slice::from_ref).collect();
+    let view = make_string_view(&schema, &rows);
+
+    let ev = scalar_prog(
+        &schema,
+        vec![
+            LogicalInstr::LoadColStr { dst: 0, col: 1 },
+            LogicalInstr::StrCase {
+                dst: 1,
+                a: 0,
+                upper: true,
+            },
+        ],
+        2,
+        1,
+        vec![],
+    );
+    let mut seen = Vec::new();
+    ev.eval_morsels(&view, 0, n, |start, out| {
+        for i in 0..out.rows() {
+            seen.push((start + i, out.str_bytes(1, i).to_vec()));
+        }
+    });
+    assert_eq!(seen.len(), n);
+    for (row, bytes) in seen {
+        assert_eq!(bytes, owned[row].to_ascii_uppercase(), "row {row}");
+    }
+}
+
+/// A const view lives in the arena's non-cleared prefix, so it must survive
+/// every morsel reset intact.
+#[test]
+fn string_constants_survive_the_per_morsel_arena_reset() {
+    let n = MORSEL + 3;
+    let schema = schema_pk_strings(1, false);
+    let view = make_string_view(&schema, &vec![&[b"x".as_slice()][..]; n]);
+    let ev = scalar_prog(
+        &schema,
+        vec![LogicalInstr::LoadConstStr { dst: 0, const_idx: 0 }],
+        1,
+        0,
+        vec![b"constant-value".to_vec()],
+    );
+    let mut rows = 0usize;
+    ev.eval_morsels(&view, 0, n, |_, out| {
+        for i in 0..out.rows() {
+            assert_eq!(out.str_bytes(0, i), b"constant-value");
+            rows += 1;
+        }
+    });
+    assert_eq!(rows, n);
+}
+
+/// The blend must carry the *chosen* branch's null bit, not the union — that is
+/// what makes `COALESCE(s, 'default')` yield the default rather than NULL.
+#[test]
+fn string_select_takes_the_chosen_branch_and_its_null_bit() {
+    let schema = schema_pk_strings(2, true);
+    // PKs are 1..=3; `make_string_view` assigns them in row order.
+    let rows: Vec<&[&[u8]]> = vec![&[b"yes", b"no"], &[b"yes", b"no"], &[b"yes", b"no"]];
+    let mut view = make_string_view(&schema, &rows);
+    view.set_null(0, 0); // row 0: the taken branch (`a`) is NULL
+    view.set_null(2, 1); // row 2: the untaken branch (`b`) is NULL
+
+    // cond = (pk != 2): rows 0 and 2 take `a`, row 1 takes `b`.
+    let ev = scalar_prog(
+        &schema,
+        vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 0 },
+            LogicalInstr::LoadConst { dst: 1, val: 2 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Ne,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+            LogicalInstr::LoadColStr { dst: 3, col: 1 },
+            LogicalInstr::LoadColStr { dst: 4, col: 2 },
+            LogicalInstr::StrSelect {
+                dst: 5,
+                cond: 2,
+                a: 3,
+                b: 4,
+            },
+        ],
+        6,
+        5,
+        vec![],
+    );
+    let got: Vec<(Vec<u8>, bool)> = (0..3).map(|i| row_str(&ev, &view, i)).collect();
+    assert!(got[0].1, "row 0 takes the NULL branch");
+    assert_eq!(got[1].0, b"no", "row 1 takes the else branch");
+    assert!(!got[1].1);
+    assert_eq!(got[2].0, b"yes", "row 2's NULL is on the branch not taken");
+    assert!(!got[2].1);
 }

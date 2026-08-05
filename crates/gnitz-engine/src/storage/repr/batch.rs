@@ -604,27 +604,18 @@ impl Batch {
         &mut self.data[off..end]
     }
 
-    /// Split borrow of payload column `pi`'s region and the blob heap — for the
-    /// per-cell string relocators, which append a value's bytes to the blob while
-    /// writing its 16-byte struct into the column. Distinct fields, so one call
-    /// hoists the region resolution out of the row loop that would otherwise need
-    /// `col_data_mut` and `blob` alternately.
+    /// Split borrow of payload column `pi`'s region, the NULL bitmap, and the
+    /// blob heap. One call resolves all three, hoisting the region arithmetic out
+    /// of the row loops that would otherwise reach for them one at a time — the
+    /// per-cell string relocators (column + blob), and EMIT, which writes a
+    /// computed column's slots and sets that column's bit for the same rows
+    /// (column + bitmap, plus the heap for a string register).
+    ///
+    /// Regions are laid out in region-index order and `REG_NULL_BMP` always
+    /// precedes any payload region, so the split is a plain `split_at_mut` at the
+    /// column's offset; `blob` is a field beside `data` and splits off with it.
     #[inline]
-    pub fn col_and_blob_mut(&mut self, pi: usize) -> (&mut [u8], &mut Vec<u8>) {
-        let r = REG_PAYLOAD_START + pi;
-        let off = self.offsets[r];
-        let end = off + self.count * self.strides[r] as usize;
-        (&mut self.data[off..end], &mut self.blob)
-    }
-
-    /// Split borrow of payload column `pi`'s region and the NULL bitmap — for
-    /// EMIT, which writes a computed column's value slots and sets that column's
-    /// bit for the same rows. Regions are laid out in region-index order and
-    /// `REG_NULL_BMP` always precedes any payload region, so the split is a
-    /// plain `split_at_mut` at the column's offset. One call lets a single pass
-    /// over the null rows do both writes.
-    #[inline]
-    pub fn col_and_null_bmp_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8]) {
+    pub fn col_null_and_blob_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
         let n_off = self.offsets[REG_NULL_BMP];
         let n_end = n_off + self.count * 8;
         let r = REG_PAYLOAD_START + pi;
@@ -632,7 +623,7 @@ impl Batch {
         let c_end = c_off + self.count * self.strides[r] as usize;
         debug_assert!(n_end <= c_off, "null bitmap region must precede payload region {pi}");
         let (lo, hi) = self.data.split_at_mut(c_off);
-        (&mut hi[..c_end - c_off], &mut lo[n_off..n_end])
+        (&mut hi[..c_end - c_off], &mut lo[n_off..n_end], &mut self.blob)
     }
 
     /// Return a `DirectWriter` over this batch's data buffer, sized for

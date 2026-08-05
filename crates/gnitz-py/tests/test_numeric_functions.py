@@ -344,13 +344,13 @@ class TestGreatestLeast:
             "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL)",
             schema_name=sn,
         )
-        # The recursion rejects the argument itself, naming the column and the
-        # operators a string column does support.
+        # Every argument is read through the numeric operand helper, which names
+        # the column and the surfaces a string value does have.
         _rejects(
             client,
             sn,
             "CREATE VIEW bad AS SELECT id, GREATEST(s, s) AS g FROM t",
-            'column "s" is String',
+            'column "s" is a string',
         )
 
 
@@ -500,7 +500,6 @@ class TestCast:
             schema_name=sn,
         )
         for expr, why in (
-            ("CAST(i AS TEXT)", "not supported"),
             ("CAST(i AS UUID)", "not supported"),
             ("CAST(i AS BOOLEAN)", "BOOLEAN"),
             # A wide integer literal has no register slot at all — the general

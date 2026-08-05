@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 
-use crate::batch::{eval_batch, for_each_null_row, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
+use crate::batch::{eval_batch, for_each_null_row, view_bytes, EvalScratch, StrView, MORSEL, NULL_WORDS_PER_REG};
 use crate::{BatchView, ColumnLocator, ExprValidateErr, Instr, LogicalProgram, ResolvedProgram, SchemaFacts};
 
 /// A resolved expression program together with the register file it evaluates
@@ -78,10 +78,9 @@ impl LogicalProgram {
     }
 
     fn into_evaluator(self, schema: &dyn SchemaFacts, is_filter: bool) -> Evaluator {
-        Evaluator {
-            prog: self.resolve_program(schema, is_filter),
-            scratch: RefCell::new(EvalScratch::default()),
-        }
+        let prog = self.resolve_program(schema, is_filter);
+        let scratch = RefCell::new(EvalScratch::new(&prog));
+        Evaluator { prog, scratch }
     }
 }
 
@@ -96,6 +95,10 @@ impl Evaluator {
         if self.prog.num_regs == 0 {
             return (0, true);
         }
+        debug_assert!(
+            !self.prog.result_is_str,
+            "string-valued program read through eval_row; use eval_row_str"
+        );
         let no_nulls = self.prog.no_nulls;
         let scratch = &mut *self.scratch.borrow_mut();
         scratch.ensure_capacity(&self.prog, 1);
@@ -183,6 +186,9 @@ impl Evaluator {
             let out = MorselOut {
                 regs: &scratch.regs,
                 null_bits: &scratch.null_bits,
+                str_views: &scratch.str_views,
+                str_arena: &scratch.str_arena,
+                blob: mb.blob(),
                 no_nulls,
                 m,
             };
@@ -200,12 +206,49 @@ impl Evaluator {
     }
 
     /// Every `Emit` in the resolved stream as `(source register, output payload
-    /// slot)` — the computed columns a map writes out of the register file.
-    pub fn emit_targets(&self) -> impl Iterator<Item = (u16, u32)> + '_ {
+    /// slot, is_str)` — the computed columns a map writes out of the register
+    /// file, and which register class each reads.
+    ///
+    /// The `Instr::EmitStr` arm is mandatory rather than convenient: this is a
+    /// `filter_map` with a `_ => None` fallthrough, so a missing arm silently
+    /// drops a string column's writer and ships its region uninitialized.
+    pub fn emit_targets(&self) -> impl Iterator<Item = (u16, u32, bool)> + '_ {
         self.prog.instrs.iter().filter_map(|i| match *i {
-            Instr::Emit { src, out } => Some((src, out)),
+            Instr::Emit { src, out } => Some((src, out, false)),
+            Instr::EmitStr { src, out } => Some((src, out, true)),
             _ => None,
         })
+    }
+
+    /// Whether the result register holds a string, i.e. whether the result must
+    /// be read through [`Self::eval_row_str`] rather than [`Self::eval_row`].
+    /// Resolution knows the answer, so a caller never has to carry it alongside.
+    pub fn result_is_str(&self) -> bool {
+        self.prog.result_is_str
+    }
+
+    /// Evaluate over a single row and append the string result's bytes to `out`,
+    /// reporting whether the row is NULL.
+    ///
+    /// The bytes are copied rather than borrowed because the arena lives behind
+    /// the evaluator's `RefCell`: a borrowed return would have to hand back a
+    /// live `RefMut` guard with it. The caller supplies the buffer so a DML row
+    /// loop reuses one allocation across rows.
+    pub fn eval_row_str<B: BatchView>(&self, mb: &B, row: usize, out: &mut Vec<u8>) -> bool {
+        if self.prog.num_regs == 0 {
+            return true;
+        }
+        debug_assert!(
+            self.prog.result_is_str,
+            "scalar program read through eval_row_str; use eval_row"
+        );
+        let no_nulls = self.prog.no_nulls;
+        let scratch = &mut *self.scratch.borrow_mut();
+        scratch.ensure_capacity(&self.prog, 1);
+        eval_batch(&self.prog, mb, row, 1, scratch);
+        let r = self.prog.result_reg as usize;
+        out.extend_from_slice(scratch.str_reg_bytes(r, 0, mb.blob()));
+        !no_nulls && (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0
     }
 }
 
@@ -214,6 +257,9 @@ impl Evaluator {
 pub struct MorselOut<'a> {
     regs: &'a [i64],
     null_bits: &'a [u64],
+    str_views: &'a [StrView],
+    str_arena: &'a [u8],
+    blob: &'a [u8],
     no_nulls: bool,
     m: usize,
 }
@@ -230,6 +276,17 @@ impl MorselOut<'_> {
     pub fn reg_values(&self, reg: usize) -> &[i64] {
         let base = reg * MORSEL;
         &self.regs[base..base + self.m]
+    }
+
+    /// String register `reg`'s bytes for row `i` of this morsel.
+    ///
+    /// Unlike [`Self::reg_values`], which returns a slice already cut to `m`,
+    /// this is a random-access getter and carries its own bound: an
+    /// out-of-morsel read would otherwise hand back another value's bytes.
+    #[inline(always)]
+    pub fn str_bytes(&self, reg: usize, i: usize) -> &[u8] {
+        debug_assert!(i < self.m, "str_bytes row {i} is outside the morsel's {} rows", self.m);
+        view_bytes(self.str_views[reg * MORSEL + i], self.str_arena, self.blob)
     }
 
     /// Call `f(i)` for each of the morsel's rows where register `reg` is NULL.

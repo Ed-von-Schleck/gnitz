@@ -9,7 +9,7 @@
 //! resolved form are named `gnitz_expr::` at each call site rather than
 //! re-exported here.
 
-use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
+use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram, MorselOut};
 
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::Batch;
@@ -118,7 +118,7 @@ fn copy_column(
                 let src_col = in_batch.col_data(in_pi);
                 // One split borrow, so the destination region is resolved once
                 // rather than per row.
-                let (dst_col, dst_blob) = output.col_and_blob_mut(cm.dst_payload);
+                let (dst_col, _, dst_blob) = output.col_null_and_blob_mut(cm.dst_payload);
                 for i in 0..n {
                     let src_off = (src_start + i) * 16;
                     let cell = crate::storage::relocate_german_string_vec(
@@ -169,9 +169,12 @@ fn copy_column(
 /// string structs verbatim (see [`copy_column`]) instead of relocating every
 /// cell. True iff some `ColMove` copies a German-string column (else there is
 /// nothing to copy) AND every input German-string column is copied by some
-/// `ColMove` — so the shared blob carries no dead heap. A map never computes a
-/// string (EMIT writes ≤8-byte values), so every string output column is a
-/// verbatim passthrough of an input string column. Mirrors `op_filter`'s
+/// `ColMove` — so the shared blob carries no dead heap.
+///
+/// A string EMIT alongside a passthrough is fine and needs no term here: the
+/// adopted blob is the output's own buffer (`share_blob_from` copies the bytes
+/// and takes the id), so the emit appends to it without touching the prefix the
+/// copied cells address. Mirrors `op_filter`'s
 /// blob-passthrough, which is unconditional only because a filter drops no
 /// column (though a filter's row subset, like a relocate's forgone dedup, can
 /// still carry more blob bytes than a from-scratch relocate would).
@@ -303,11 +306,15 @@ struct MapPlan {
     /// `None` and never grows a register file.
     compute: Option<Evaluator>,
     /// `(source register, output payload slot)` per `Emit`, resolved once at
-    /// construction like [`Self::col_moves`]. Empty iff `compute` is `None`.
-    /// Walking the evaluator's instruction stream instead would re-scan it once
-    /// per morsel, which the range-driven `append_map_ranges` path (16-row
-    /// ranges) pays on top of very little work.
+    /// construction like [`Self::col_moves`]. Both lists are empty iff `compute`
+    /// is `None`. Walking the evaluator's instruction stream instead would
+    /// re-scan it once per morsel, which the range-driven `append_map_ranges`
+    /// path (16-row ranges) pays on top of very little work.
     emits: Vec<(usize, usize)>,
+    /// The same, for `EmitStr`. Kept apart from [`Self::emits`] because the two
+    /// write differently: a scalar emit is one bulk copy of the register image,
+    /// a string emit encodes a German-string cell per row.
+    str_emits: Vec<(usize, usize)>,
     /// Precomputed [`compute_blob_passthrough`]: skip per-cell string relocation
     /// and share the input blob when no string column is dropped.
     blob_passthrough: bool,
@@ -343,17 +350,23 @@ impl ScalarFunc {
                 stride: out_stride(out as usize),
             })
             .collect();
-        let emits: Vec<(usize, usize)> = ev
-            .emit_targets()
-            .map(|(reg, out)| (reg as usize, out as usize))
-            .collect();
+        let mut emits: Vec<(usize, usize)> = Vec::new();
+        let mut str_emits: Vec<(usize, usize)> = Vec::new();
+        for (reg, out, is_str) in ev.emit_targets() {
+            let list = if is_str { &mut str_emits } else { &mut emits };
+            list.push((reg as usize, out as usize));
+        }
         // Null permutation: copied columns carry their source null bit (PK
         // sources are skipped inside `NullPerm::new` — the PK has no null bit).
         let null_perm = NullPerm::new(&col_moves);
 
         // Compute is needed iff the program emits a computed register: every
-        // compute instruction exists only to feed an EMIT.
-        let compute = (!emits.is_empty()).then_some(ev);
+        // compute instruction exists only to feed an EMIT. Both lists count —
+        // a view whose only computed column is a string (`SELECT id, UPPER(name)
+        // FROM t`, where `id` is a ColMove) would otherwise drop the kernel and
+        // ship that column's uninitialized region. Validation cannot catch it:
+        // the `Emit` is in the program, so the output-coverage popcount is met.
+        let compute = (!emits.is_empty() || !str_emits.is_empty()).then_some(ev);
 
         let blob_passthrough = compute_blob_passthrough(in_schema, &col_moves);
 
@@ -362,6 +375,7 @@ impl ScalarFunc {
             null_perm,
             compute,
             emits,
+            str_emits,
             blob_passthrough,
             out_schema: *out_schema,
         }))))
@@ -434,6 +448,36 @@ impl ScalarFunc {
         map.map_ranges_into(in_batch, &mut output, &[(0, n)], pk);
         output
     }
+}
+
+/// The NULL half of an EMIT, shared by the scalar (`stride` 8) and string
+/// (`stride` 16) loops: a NULL row's value slot reads as zero, and its bit is set
+/// in the output bitmap.
+///
+/// NULL rows are the exception, so both are done by a sparse bit-scan rather than
+/// a per-row branch that would de-vectorize the value store. The two bitmaps are
+/// transposed — the register file's null bits are register-major (bit i = row i),
+/// the output bitmap row-major (one u64 per row, bit c = payload column c) — so
+/// the merge is a scatter, never a word-at-a-time OR. The read-modify-write on
+/// `nb` is what composes with `null_perm`'s earlier write and with any other emit
+/// over the same bitmap.
+#[inline]
+fn emit_null_rows(
+    out: &MorselOut<'_>,
+    reg: usize,
+    win: &mut [u8],
+    nb: &mut [u8],
+    row0: usize,
+    out_payload: usize,
+    stride: usize,
+) {
+    out.for_each_null_row(reg, |i| {
+        win[i * stride..(i + 1) * stride].fill(0);
+        let off = (row0 + i) * 8;
+        let mut merged = gnitz_wire::read_u64_le(nb, off);
+        gnitz_wire::null_word_set(&mut merged, out_payload, true);
+        gnitz_wire::write_u64_le(nb, off, merged);
+    });
 }
 
 impl MapPlan {
@@ -565,7 +609,7 @@ impl MapPlan {
                     // One split borrow: the value slots and this column's bit in
                     // the row-major NULL bitmap are written in the same pass over
                     // the null rows.
-                    let (col, nb) = output.col_and_null_bmp_mut(out_payload);
+                    let (col, nb, _) = output.col_null_and_blob_mut(out_payload);
 
                     // `check_emit_slot` holds every EMIT destination to an
                     // 8-byte slot, so the morsel's outputs are one contiguous
@@ -582,21 +626,23 @@ impl MapPlan {
                     let regs_le = unsafe { std::slice::from_raw_parts(regs.as_ptr().cast::<u8>(), m * 8) };
                     win.copy_from_slice(regs_le);
 
-                    // A NULL row's value slot reads as zero, and its bit is set
-                    // in the output bitmap. NULL rows are the exception, so both
-                    // are done by a sparse bit-scan rather than a per-row branch
-                    // that would de-vectorize the store above. The two bitmaps
-                    // are transposed — the register file's null bits are
-                    // register-major (bit i = row i), the output bitmap row-major
-                    // (one u64 per row, bit c = payload column c) — so the merge
-                    // is a scatter, never a word-at-a-time OR.
-                    out.for_each_null_row(reg, |i| {
-                        win[i * 8..i * 8 + 8].fill(0);
-                        let off = (row0 + i) * 8;
-                        let mut merged = gnitz_wire::read_u64_le(nb, off);
-                        gnitz_wire::null_word_set(&mut merged, out_payload, true);
-                        gnitz_wire::write_u64_le(nb, off, merged);
-                    });
+                    emit_null_rows(out, reg, win, nb, row0, out_payload, 8);
+                }
+
+                // String EMIT. It keeps the scalar path's two-pass shape rather
+                // than branching per row on nullness, because `MorselOut` exposes
+                // nullness only through `for_each_null_row` — and under
+                // `no_nulls` there is no `null_bits` to index at all. The scalar
+                // path's indexed loop buys nothing here: this body already does a
+                // per-row `encode_german_string`.
+                for &(reg, out_payload) in &self.str_emits {
+                    let (col, nb, blob) = output.col_null_and_blob_mut(out_payload);
+                    let win = &mut col[row0 * 16..(row0 + m) * 16];
+                    for i in 0..m {
+                        let cell = gnitz_wire::encode_german_string(out.str_bytes(reg, i), blob);
+                        win[i * 16..i * 16 + 16].copy_from_slice(&cell);
+                    }
+                    emit_null_rows(out, reg, win, nb, row0, out_payload, 16);
                 }
             });
         }
@@ -942,5 +988,133 @@ mod tests {
         // previous chunk's ranges into this one.
         func.filter_ranges(&batch, &mut ranges);
         assert_eq!(ranges, vec![(1, 3), (4, 6)]);
+    }
+
+    /// A batch of `(pk, string cells)` rows: one STRING payload column per entry
+    /// of `cells`, encoded through the blob heap the map must relocate or share.
+    fn make_string_batch(schema: &SchemaDescriptor, rows: &[&[&[u8]]]) -> Batch {
+        let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
+        for (row, cells) in rows.iter().enumerate() {
+            batch.extend_pk(row as u128 + 1);
+            batch.extend_weight(&1i64.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            for (pi, _col) in schema.payload_columns() {
+                let cell = gnitz_wire::encode_german_string(cells[pi], &mut batch.blob);
+                batch.extend_col(pi, &cell);
+            }
+            batch.count += 1;
+        }
+        batch
+    }
+
+    /// A map whose *only* computed column is a string. The compute kernel is
+    /// gated on the emit lists being non-empty, and a gate that counted only the
+    /// scalar list would drop the kernel here and ship the STRING region
+    /// uninitialized — which validation cannot catch, because the `Emit` is in
+    /// the program and the output-coverage popcount is satisfied.
+    #[test]
+    fn map_whose_only_computed_column_is_a_string_still_runs_the_kernel() {
+        use gnitz_expr::LogicalInstr;
+        // [U64 pk, STRING name] -> [U64 pk, U64 id_copy, STRING upper_name].
+        let in_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
+        let out_schema = make_schema(0, &[type_code::U64, type_code::U64, type_code::STRING]);
+        let mut batch = make_string_batch(&in_schema, &[&[b"abc"], &[b"a-long-value-past-twelve"]]);
+        // The copied column is the PK, which `PkFill::Copy` carries verbatim; give
+        // the output's first payload slot something to hold.
+        batch.count = 2;
+
+        let instrs = vec![
+            LogicalInstr::CopyCol { src_col: 0, out: 0 },
+            LogicalInstr::LoadColStr { dst: 0, col: 1 },
+            LogicalInstr::StrCase {
+                dst: 1,
+                a: 0,
+                upper: true,
+            },
+            LogicalInstr::Emit { src: 1, out: 1 },
+        ];
+        let func = ScalarFunc::from_map(LogicalProgram::new(instrs, 2, 1, vec![]), &in_schema, &out_schema).unwrap();
+        let out = func.evaluate_map_batch(&batch, PkFill::Copy);
+        assert_eq!(out.count, 2);
+        assert_eq!(crate::test_support::read_german_string(&out, 1, 0), b"ABC");
+        assert_eq!(
+            crate::test_support::read_german_string(&out, 1, 1),
+            b"A-LONG-VALUE-PAST-TWELVE",
+            "a heap-backed value must land in the output's own blob"
+        );
+    }
+
+    /// A string EMIT alongside a passthrough of every input string column. The
+    /// copied cells still resolve against the adopted blob after the emit has
+    /// appended to it, and the output stops sharing once it has.
+    #[test]
+    fn string_emit_composes_with_blob_passthrough() {
+        use gnitz_expr::LogicalInstr;
+        // [U64 pk, STRING s] -> [U64 pk, STRING s_copy, STRING s_upper].
+        let in_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
+        let out_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
+        let batch = make_string_batch(&in_schema, &[&[b"a-long-value-past-twelve"], &[b"short"]]);
+
+        let instrs = vec![
+            LogicalInstr::CopyCol { src_col: 1, out: 0 },
+            LogicalInstr::LoadColStr { dst: 0, col: 1 },
+            LogicalInstr::StrCase {
+                dst: 1,
+                a: 0,
+                upper: true,
+            },
+            LogicalInstr::Emit { src: 1, out: 1 },
+        ];
+        let func = ScalarFunc::from_map(LogicalProgram::new(instrs, 2, 1, vec![]), &in_schema, &out_schema).unwrap();
+        let out = func.evaluate_map_batch(&batch, PkFill::Copy);
+
+        assert_eq!(
+            crate::test_support::read_german_string(&out, 0, 0),
+            b"a-long-value-past-twelve"
+        );
+        assert_eq!(crate::test_support::read_german_string(&out, 0, 1), b"short");
+        assert_eq!(
+            crate::test_support::read_german_string(&out, 1, 0),
+            b"A-LONG-VALUE-PAST-TWELVE"
+        );
+        assert_eq!(crate::test_support::read_german_string(&out, 1, 1), b"SHORT");
+        assert!(
+            !out.shares_blob_with(&batch),
+            "appending the emitted bytes must end the sharing, so a later append relocates"
+        );
+    }
+
+    /// A NULL string row must ship a zeroed cell *and* its bitmap bit — a
+    /// non-deterministic value there would leave an insert and its retraction
+    /// unable to cancel.
+    #[test]
+    fn null_string_emit_zeroes_the_cell_and_sets_the_bit() {
+        use gnitz_expr::LogicalInstr;
+        let in_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
+        let out_schema = make_schema(0, &[type_code::U64, type_code::U64, type_code::STRING]);
+        let mut batch = make_string_batch(&in_schema, &[&[b"abc"], &[b"def"]]);
+        // Row 1's source string is NULL.
+        gnitz_wire::write_u64_le(batch.null_bmp_data_mut(), 8, 1);
+
+        let instrs = vec![
+            LogicalInstr::CopyCol { src_col: 0, out: 0 },
+            LogicalInstr::LoadColStr { dst: 0, col: 1 },
+            LogicalInstr::StrCase {
+                dst: 1,
+                a: 0,
+                upper: true,
+            },
+            LogicalInstr::Emit { src: 1, out: 1 },
+        ];
+        let func = ScalarFunc::from_map(LogicalProgram::new(instrs, 2, 1, vec![]), &in_schema, &out_schema).unwrap();
+        let out = func.evaluate_map_batch(&batch, PkFill::Copy);
+
+        assert_eq!(crate::test_support::read_german_string(&out, 1, 0), b"ABC");
+        assert_eq!(&out.col_data(1)[16..32], &[0u8; 16], "a NULL cell is all zeros");
+        assert_eq!(
+            gnitz_wire::read_u64_le(out.null_bmp_data(), 8) & 2,
+            2,
+            "the output bitmap bit for the string column must be set"
+        );
     }
 }

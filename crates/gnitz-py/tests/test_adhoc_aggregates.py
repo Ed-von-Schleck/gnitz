@@ -312,8 +312,10 @@ def test_having_rejections(client, hg):
     plus the 64-register cap, with a control one conjunct under it."""
     # No float-modulo instruction exists.
     _reject_both(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING SUM(v) % 2.0 > 0.5")
-    # A string literal on both sides has no column operand to dispatch on.
-    _reject_both(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 'a' = 'b'")
+    # Two string literals now compare through the string register channel rather
+    # than needing a column operand to dispatch on — so this is a constant-false
+    # HAVING, on both paths.
+    assert _parity(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 'a' = 'b'") == []
 
     # The 64-register cap. The planner's expression builder never reuses a register, so an equality
     # conjunct over a plain group column costs 3 (load_col + load_const + cmp)

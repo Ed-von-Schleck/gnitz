@@ -31,15 +31,13 @@ use sqlparser::ast::{Assignment, AssignmentTarget, FromTable};
 
 /// A compiled SET / `DO UPDATE SET` right-hand side.
 ///
-/// `Const` and `StrCol` are **structural, not an optimisation**: `ColumnValue`
-/// carries an owned `String` and the expression VM has no string result
-/// register, so `SET s = 'lit'` and `SET s = other_str` have no compiled form at
-/// all. A literal integer or NULL joins `Const` because it is the same thing —
-/// a row-independent value — and reaching it through the VM would run a whole
-/// single-row `eval_batch` per matched row to re-derive a constant.
+/// `Const` and `StrCol` are shortcuts for row-independent or verbatim values:
+/// reaching a literal through the VM would run a whole single-row `eval_batch`
+/// per matched row to re-derive a constant, and a bare column read needs no
+/// program at all.
 ///
 /// `StrCol` is gated on `TypeCode::String` rather than `is_german_string()` on
-/// purpose: a BLOB column must fall into `Num`, where `OpcodeBackend`'s column
+/// purpose: a BLOB column must fall into `Expr`, where `OpcodeBackend`'s column
 /// load rejects it. That gate also keeps the arm structurally safe — a PK column
 /// can never be STRING (§1), so `StrCol` can never name one, whose slot in
 /// `ZSetBatch.columns` is an empty placeholder.
@@ -48,10 +46,11 @@ pub(crate) enum SetProgram {
     Const(ColumnValue),
     /// A bare reference to a `TypeCode::String` column, read verbatim.
     StrCol(usize),
-    /// Everything else — integer-valued. Boxed so a `SetProgram` stays small
-    /// enough to sit in a `Vec` beside the other two arms (`Evaluator` owns a
+    /// A computed value. Which read-back applies is the evaluator's own
+    /// `result_is_str`, not a second arm here. Boxed so a `SetProgram` stays
+    /// small enough to sit in a `Vec` beside the other arms (`Evaluator` owns a
     /// resolved program plus its register file).
-    Num(Box<Evaluator>),
+    Expr(Box<Evaluator>),
 }
 
 /// Classify one SET RHS for target column `target` against the schema the rows
@@ -72,14 +71,14 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
         // every batch reaching SET is built from a `Schema`, so the declared type
         // code decides the representation.
         BoundExpr::ColRef(c) if schema.columns[*c].type_code == TypeCode::String => SetProgram::StrCol(*c),
-        _ => SetProgram::Num(Box::new(compile_scalar_evaluator(expr, schema)?)),
+        _ => SetProgram::Expr(Box::new(compile_scalar_evaluator(expr, schema)?)),
     };
     let tc = schema.columns[target].type_code;
     let str_valued = match &p {
         SetProgram::Const(ColumnValue::Null) => return Ok(p), // NULL suits every column
         SetProgram::Const(cv) => matches!(cv, ColumnValue::Str(_)),
         SetProgram::StrCol(_) => true,
-        SetProgram::Num(_) => false,
+        SetProgram::Expr(ev) => ev.result_is_str(),
     };
     if !set_target_admits(tc, str_valued) {
         return Err(GnitzSqlError::Bind(format!(
@@ -103,7 +102,22 @@ pub(crate) fn eval_set_program(p: &SetProgram, view: &ZSetBatchView<'_>, row: us
             },
             other => unreachable!("classify_set_rhs gates StrCol on TypeCode::String, got {other:?}"),
         },
-        SetProgram::Num(ev) => match ev.eval_row(view, row) {
+        SetProgram::Expr(ev) if ev.result_is_str() => {
+            // The evaluator's arena sits behind a `RefCell`, so it lends no
+            // bytes; the row is read into a buffer that then *becomes* the
+            // `String`, so the value is allocated once and never copied.
+            let mut buf = Vec::new();
+            if ev.eval_row_str(view, row, &mut buf) {
+                return ColumnValue::Null;
+            }
+            // Valid UTF-8 by construction: this path runs over the client-side
+            // `ZSetBatchView`, whose strings were UTF-8-validated at the wire
+            // decode boundary, and every string function preserves validity —
+            // ASCII case fold, character-unit substring, ASCII trim set, and
+            // concatenation of valid inputs.
+            String::from_utf8(buf).map_or(ColumnValue::Null, ColumnValue::Str)
+        }
+        SetProgram::Expr(ev) => match ev.eval_row(view, row) {
             (_, true) => ColumnValue::Null,
             (v, false) => ColumnValue::Int(v),
         },
@@ -750,5 +764,50 @@ mod tests {
             Box::new(BoundExpr::LitFloat(1.5)),
         );
         assert!(classify_set_rhs(&cmp, 1, &schema).is_ok());
+    }
+
+    /// A computed *string* RHS is read back through `eval_row_str`: `eval_row`
+    /// would return an i64 — the 16-byte descriptor's prefix as a garbage
+    /// integer. The resolved program carries which one applies.
+    #[test]
+    fn a_computed_string_rhs_routes_to_the_string_arm_and_evaluates() {
+        let schema = two_col(TypeCode::String);
+        let upper = BoundExpr::StrCall {
+            f: crate::ir::StrFunc::Upper,
+            arg: Box::new(BoundExpr::ColRef(1)),
+        };
+        let p = classify_set_rhs(&upper, 1, &schema).expect("compiles");
+        assert!(matches!(&p, SetProgram::Expr(ev) if ev.result_is_str()));
+
+        // Drive it over a real row: a bare column read (`StrCol`) and the
+        // computed form must agree on everything but the transform.
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1u128);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Strings(ref mut v) = batch.columns[1] {
+            v.push(Some("hello".to_string()));
+        }
+        let mut bufs = ViewBuffers::default();
+        let view = bufs.view(&batch, &schema);
+        match eval_set_program(&p, &view, 0) {
+            ColumnValue::Str(s) => assert_eq!(s, "HELLO"),
+            _ => panic!("expected a string value"),
+        }
+    }
+
+    /// The target-kind check runs on the string arm too, so a string-valued RHS
+    /// against an integer column is rejected at compile rather than surfacing
+    /// only once a row matched.
+    #[test]
+    fn a_string_rhs_against_an_integer_column_is_rejected() {
+        let schema = two_col(TypeCode::I64);
+        let concat = BoundExpr::ConcatN {
+            args: vec![BoundExpr::LitInt(1)],
+        };
+        assert!(matches!(
+            classify_set_rhs(&concat, 1, &schema),
+            Err(GnitzSqlError::Bind(_))
+        ));
     }
 }

@@ -42,9 +42,7 @@ pub const EXPR_COPY_COL: u32 = 34;
 /// Conditional select (SQL CASE blend): `[EXPR_SELECT, dst, cond, a | (b << 16)]`.
 /// Three register sources — `cond`, `a`, `b` — packed into two operand words:
 /// `cond` occupies word `a1` alone, while `a`/`b` are packed as the low/high 16
-/// bits of word `a2`. This is the only opcode that packs two registers into one
-/// word (LOAD_CONST packs a 64-bit *value*, not registers; see the decode site
-/// in `gnitz-engine`'s `program.rs`). Rows where `cond` is non-NULL and truthy
+/// bits of word `a2` by [`pack_operand_pair`]. Rows where `cond` is non-NULL and truthy
 /// take `a`'s value + null bit; all other rows (false **or NULL** cond) take
 /// `b`'s. Carries a value, never a boolean classification.
 pub const EXPR_SELECT: u32 = 35;
@@ -103,6 +101,112 @@ pub const EXPR_INT_MIN2: u32 = 54;
 pub const EXPR_FLOAT_MAX2: u32 = 55;
 pub const EXPR_FLOAT_MIN2: u32 = 56;
 
+// String values in the register file. Codes 57-75 continue past the numeric
+// scalar functions, keeping the space dense. These read and write a *string*
+// register — a second class over the same register index space, so the null
+// bits and boolean masks address both classes unchanged.
+
+/// `[EXPR_LOAD_COL_STR, dst, col, 0]` — a German-string column; nulls come from
+/// the batch bitmap.
+pub const EXPR_LOAD_COL_STR: u32 = 57;
+/// `[EXPR_LOAD_CONST_STR, dst, const_idx, 0]` — a const-pool entry's raw bytes.
+pub const EXPR_LOAD_CONST_STR: u32 = 58;
+/// `[EXPR_LOAD_NULL_STR, dst, 0, 0]` — the string-register twin of
+/// `EXPR_LOAD_NULL`: an empty view with the null bit set for every row.
+pub const EXPR_LOAD_NULL_STR: u32 = 59;
+/// String CASE blend; operand packing identical to `EXPR_SELECT`
+/// (`[op, dst, cond, a | b << 16]`, [`pack_operand_pair`]). `cond` is
+/// a scalar register; `a`/`b` are string registers, as is `dst`.
+pub const EXPR_STR_SELECT: u32 = 60;
+/// `[op, dst, a, b]` — compare two string registers, writing 0/1 into the
+/// *scalar* register `dst`. Byte-lexicographic (`[u8]::cmp` over the content
+/// bytes), the same order `compare_german_strings` imposes on canonical cells.
+pub const EXPR_STR_CMP_EQ: u32 = 61;
+pub const EXPR_STR_CMP_LT: u32 = 62;
+pub const EXPR_STR_CMP_LE: u32 = 63;
+/// `[op, dst, a, 0]` — string length into the scalar register `dst`, in bytes
+/// (`OCTET_LENGTH`) or characters (`LENGTH`: the count of non-continuation
+/// bytes, which on valid UTF-8 is the codepoint count).
+pub const EXPR_STR_LEN_BYTES: u32 = 64;
+pub const EXPR_STR_LEN_CHARS: u32 = 65;
+/// `[op, dst, a, 0]` — ASCII-only case fold (`a-z`/`A-Z`); every other byte
+/// passes through, so a multibyte UTF-8 sequence is unchanged.
+pub const EXPR_STR_UPPER: u32 = 66;
+pub const EXPR_STR_LOWER: u32 = 67;
+/// `[EXPR_STR_SUBSTR, dst, src_reg, start_reg | len_reg << 16]`; `len_reg =
+/// 0xFFFF` ⇒ no FOR clause (to the end of the string). 0xFFFF is unreachable as
+/// a real register (`MAX_REGS = 64`). The window is a half-open character range
+/// `[start, start + len)`, 1-based, intersected with the string; a negative
+/// length is NULL.
+pub const EXPR_STR_SUBSTR: u32 = 68;
+/// The `len_reg` value that means "no FOR clause". `MAX_REGS` is 64, so no real
+/// register can collide with it, and `EXPR_STR_SUBSTR` needs no second opcode
+/// for the two-argument form.
+pub const STR_SUBSTR_NO_LEN: u32 = 0xFFFF;
+/// `[EXPR_STR_TRIM, dst, src_reg | mode << 16, set_const_idx]`, where `mode` is a
+/// [`TrimMode`]. The const-pool entry is the raw byte set to strip.
+pub const EXPR_STR_TRIM: u32 = 69;
+
+/// Which end(s) `EXPR_STR_TRIM` strips. The one definition of the mode word both
+/// the planner and the engine encode against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimMode {
+    Both = 0,
+    Leading = 1,
+    Trailing = 2,
+}
+
+impl TrimMode {
+    /// The mode word to pack beside the source register.
+    #[inline]
+    pub const fn to_wire(self) -> u32 {
+        self as u32
+    }
+
+    /// The mode a wire word names, or `None` for an out-of-range one.
+    #[inline]
+    pub const fn from_wire(mode: u32) -> Option<Self> {
+        match mode {
+            0 => Some(TrimMode::Both),
+            1 => Some(TrimMode::Leading),
+            2 => Some(TrimMode::Trailing),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn trims_start(self) -> bool {
+        matches!(self, TrimMode::Both | TrimMode::Leading)
+    }
+
+    #[inline]
+    pub fn trims_end(self) -> bool {
+        matches!(self, TrimMode::Both | TrimMode::Trailing)
+    }
+}
+/// `[EXPR_STR_CONCAT, dst, a, b]` — SQL `||`: NULL-propagating.
+pub const EXPR_STR_CONCAT: u32 = 70;
+/// CONCAT fold step: a NULL `b` contributes the empty string; a NULL `a` (the
+/// accumulator) propagates — the asymmetry that carries the `u32::MAX`
+/// overflow-NULL through a left fold.
+pub const EXPR_STR_CONCAT_NN: u32 = 71;
+/// `[op, dst, a, 0]` — numeric register to decimal text. The integer form reads
+/// its source signed or unsigned per the resolve-time U64 tracking; the float
+/// form is the shortest round-trip decimal, switched to scientific notation
+/// outside `[1e-4, 1e15)` so the output stays bounded (Rust's positional
+/// `Display` renders `1e300` as 301 digits), and spells the non-finite values
+/// `Infinity` / `-Infinity` / `NaN` as PostgreSQL does.
+pub const EXPR_INT_TO_STR: u32 = 72;
+pub const EXPR_FLOAT_TO_STR: u32 = 73;
+/// `[EXPR_STR_TO_INT, dst, a, target_tc]` — parse ASCII decimal (surrounding
+/// whitespace and an optional sign allowed, nothing else) into the scalar
+/// register `dst`. An unparsable string or an out-of-range value is NULL, never
+/// a wrap. `target_tc` rides the `a2` word as for `EXPR_INT_CAST`.
+pub const EXPR_STR_TO_INT: u32 = 74;
+/// `[EXPR_STR_TO_FLOAT, dst, a, 0]` — parse into an f64 scalar register; any
+/// failure (including non-UTF-8 bytes) is NULL.
+pub const EXPR_STR_TO_FLOAT: u32 = 75;
+
 // ---------------------------------------------------------------------------
 // Blob framing constants and operand packing
 // ---------------------------------------------------------------------------
@@ -125,15 +229,17 @@ pub const fn decode_load_const(a1: u32, a2: u32) -> i64 {
     ((a2 as i64) << 32) | (a1 as i64 & 0xFFFF_FFFF)
 }
 
-/// `EXPR_SELECT` packs source registers `a` and `b` as the low and high 16 bits of its
-/// second operand word (`cond` occupies the first word alone). The only two-register
-/// packing in the encoding.
+/// Two 16-bit operands in one 32-bit word, low half first. Used by
+/// `EXPR_SELECT` / `EXPR_STR_SELECT` (`a | b`) and `EXPR_STR_SUBSTR`
+/// (`start_reg | len_reg`) in the `a2` word, and by `EXPR_STR_TRIM`
+/// (`src_reg | mode`) in `a1`. The second half is not always a register:
+/// TRIM's is a mode word and SUBSTR's may be [`STR_SUBSTR_NO_LEN`].
 #[inline]
-pub const fn encode_select_operands(a: u32, b: u32) -> u32 {
+pub const fn pack_operand_pair(a: u32, b: u32) -> u32 {
     (a & 0xFFFF) | ((b & 0xFFFF) << 16)
 }
 #[inline]
-pub const fn decode_select_operands(w: u32) -> (u16, u16) {
+pub const fn unpack_operand_pair(w: u32) -> (u16, u16) {
     ((w & 0xFFFF) as u16, (w >> 16) as u16)
 }
 
@@ -380,13 +486,10 @@ mod tests {
     }
 
     #[test]
-    fn select_operands_round_trip() {
+    fn operand_pair_round_trip() {
         for a in 0u32..64 {
             for b in 0u32..64 {
-                assert_eq!(
-                    decode_select_operands(encode_select_operands(a, b)),
-                    (a as u16, b as u16)
-                );
+                assert_eq!(unpack_operand_pair(pack_operand_pair(a, b)), (a as u16, b as u16));
             }
         }
     }
