@@ -1,424 +1,402 @@
-# Catalog epoch: cross-statement client catalog cache, one validity counter, GET_INDICES retired
+# Relation resolve: one master-served descriptor RPC on the DML path
 
 ## Goal
 
-Cut steady-state ad-hoc statement latency from ~5 server round trips to 1 by
-making the client's catalog knowledge a **cross-statement cache** validated by a
-single global **catalog epoch**, and delete the entire GET_INDICES / per-table
-index-version mechanism, whose job the cache absorbs. (The counter is named
-*epoch*, not *generation*, to avoid conflation with the durable checkpoint
-generation `SEQ_ID_CHECKPOINT_GEN` used for view resume.)
+Replace the client's three-whole-system-table relation resolution with **one
+master-served descriptor RPC**, answered from typed maps the master already
+maintains. Ad-hoc statements drop from 4–6 server round trips to 2–3, and from
+~10 KB of catalog per statement to ~0.3 KB. GET_INDICES is generalized into that
+RPC, not deleted.
 
-## Current state (verified)
+The client keeps a per-name descriptor **hint**, never a trusted cache: it always
+sends a resolve, and the master resolves the name live under one catalog read
+guard. The descriptor a statement plans against is therefore at most one round
+trip old — today's contract, and strictly more consistent than today (§2). The
+hint exists only to let the master *elide* the schema block.
+
+**Scope: the DML path.** DDL keeps the whole-catalog scan path (§3). Measured on
+a full E2E trace, DDL statements account for roughly half of all client catalog
+scans but under 10% of catalog bytes, so this plan captures ~90% of the byte
+defect and ~51% of the round-trip defect. The DDL half is a different change —
+it is about the client reconstructing `-1` retraction rows the server could
+derive itself — and is deliberately not attempted here.
+
+## The problem, measured
 
 Every SQL statement brackets a **statement-scoped** catalog snapshot
 (`GnitzClient::begin_catalog_snapshot` / `end_catalog_snapshot`,
-`crates/gnitz-core/src/client.rs:299-308`) that is dropped at statement end:
+`crates/gnitz-core/src/client.rs:300-317`, bracketed per statement at
+`crates/gnitz-sql/src/lib.rs:101-103`) and drops it at statement end. Every
+statement therefore re-resolves from whole-system-table scans. Client→server
+round trips, traced on a live 4-worker server (SCHEMA_TAB = tid 1,
+TABLE_TAB = 2, VIEW_TAB = 3, COL_TAB = 4):
 
-```rust
-fn scan_catalog(&mut self, tab: u64) -> Result<Option<Arc<ZSetBatch>>, ClientError> {
-    if let Some(snap) = &self.catalog_snapshot {
-        if let Some(cached) = snap.get(&tab) { return Ok(cached.clone()); }
-    }
-    let (_, batch, _) = self.session.scan(tab)?;
-    ...
-```
+| Statement | Requests today | Count |
+|---|---|---|
+| `SELECT * FROM t WHERE x = 5` (indexed non-PK) | scan 1, scan 2, scan 4, GET_INDICES, SCAN_SPEC | **5** |
+| `SELECT * FROM t WHERE id = 2` (PK point) | scan 1, scan 2, scan 4, SCAN_SPEC | **4** |
+| `SELECT * FROM t` (bare star) | scan 1, scan 2, scan 4, plain scan of t | **4** |
+| `INSERT` (warm push) | scan 1, scan 2, scan 4, push | **4** |
+| `UPDATE t SET … WHERE x = 5` | scan 1, scan 2, scan 4, GET_INDICES, SCAN_SPEC, txn frame | **6** |
+| `SELECT * FROM <view>` | scan 1, scan 2, scan 3, scan 4, plain scan | **5** |
 
-So a `SELECT … WHERE x = 5` pays, per statement: a SCHEMA_TAB scan, a TABLE_TAB
-scan, a COL_TAB scan (each shipping the **full** system table over the wire),
-one GET_INDICES round trip (`refresh_indices`, `client.rs:518` — the u8 epoch
-only skips the reply payload, never the round trip; `Session::fetch_indices`,
-`connection.rs:312`), and finally the SCAN_SPEC read. Five round trips, with
-catalog payloads that grow with the number of tables. Raw (non-SQL) clients —
-gnitz-py `resolve_table` + binary `push`, the gnitz-capi DDL helpers — call the
-same catalog readers with **no** snapshot active, so today they always scan
-fresh; that guarantee must be preserved, not silently deleted.
+A PK point read skips GET_INDICES by design (`pk_bound_is_preemptible`,
+`access.rs:255-276`). The bare-star `SELECT *` takes the plain-scan path
+(`gnitz-sql/src/dml/select.rs:214-231` → `client.scan(tid)`), which carries **no
+request flag at all** — it is the fallthrough dispatch keyed only on `target_id`
+(`executor.rs:1222`).
 
-Server-side facts this plan builds on:
+Each catalog scan ships the **whole** system table. Measured reply bytes for the
+`WHERE x = 5` statement (656-byte result), against a catalog grown with 5-column
+filler tables:
 
-- **Bits 40–47 of the flags word** are the index-metadata version field
-  (`crates/gnitz-wire/src/flags.rs:151-163`), used today only by the
-  GET_INDICES request/reply pair. Every other frame carries 0 there. Verified:
-  bits 48–62 are allocated boolean flags; only bits 55 and 63 are free, and
-  they are not contiguous with 40–47 — so widening this field would cost a
-  flag relocation. u8 it stays; the ABA bound below is the accepted trade.
-- **System-catalog scans are master-served** (`handle_system_scan`,
-  `executor.rs:1911` → `send_ok_response`); **SCAN_SPEC / user-table
-  scans / seeks are worker-served** (frames built in
-  `runtime/orchestration/worker/reply.rs`). Both sides must therefore agree on
-  the epoch at every SAL position — which dictates where the bump lives (§1).
-- **IDX_TAB is an ordinary client-scannable system table** (the client already
-  scans it in `drop_index_by_name`, `client.rs:619`) whose rows carry
-  everything GET_INDICES serves: `owner_id`, `source_col_idx`
-  (= `pack_pk_cols(col_list)`), `is_unique`
-  (`crates/gnitz-wire/src/catalog.rs:112-123`). The engine's own uniqueness
-  maintenance is already "OR over live IDX_TAB rows per column list"
-  (`hook_index_register` promotion, `hooks.rs:663-668`; DROP demotion
-  recompute, `hooks.rs:709-718`), so a client-side parse with the same dedup
-  rule is exact — including the FK-auto + UNIQUE promotion case, where two
-  IDX_TAB rows (distinct `index_id`) share one circuit.
-- The per-table u8 `index_version` counter (`catalog/cache.rs:52-57`) and the
-  GET_INDICES handler (`executor.rs:1568`) exist **only** to let the client
-  cache the index list — dead once the list parses from a cached IDX_TAB scan.
-- `SCAN_SPEC` requests carry no version information (`connection.rs:429-445`),
-  so the engine cannot detect a plan built against a stale catalog. The
-  staleness fallbacks that do exist: narrow index bounds degrade to a full
-  cursor (`store_io.rs:352-368`), `SEEK_BY_INDEX` replies `STATUS_NO_INDEX`
-  (`executor.rs:1490-1503`), but a **wide-int** (U128/UUID/I128) bound on a
-  dropped index is a hard, non-retryable statement error
-  (`scan_spec.rs:144-150` → `store_io.rs:151`).
+| filler tables | SCHEMA_TAB | TABLE_TAB | COL_TAB | GET_INDICES | catalog total |
+|---|---|---|---|---|---|
+| 0 | 408 | 2 121 | 7 178 | 560 | **10 267 B** |
+| 25 | 408 | 4 321 | 21 178 | 256 | **26 163 B** |
+| 50 | 408 | 6 521 | 35 178 | 256 | **42 363 B** |
+| 100 | 408 | 10 921 | 63 178 | 256 | **74 763 B** |
+| 200 | 408 | 19 721 | 119 178 | 256 | **139 563 B** |
 
-Load-bearing invariants this design relies on (all verified; state them at the
-epoch's definition site):
+Linear at ≈645 B per table, paid by **every** statement. COL_TAB dominates
+(≈560 B/table): over a full E2E run it is 59.9% of all catalog bytes, TABLE_TAB
+a further 27.2%.
 
-- **tids/vids are monotonic and never reused** (`alloc_table_id`) — a stale
-  tid resolves to the same relation or to a clean "unknown table" error, never
-  to a different relation.
-- **The REPLICATED table flag is immutable** for a table's lifetime.
-- **DROP COLUMN preserves physical slot indices** (hidden-slot retirement), so
-  a stale schema's column indices stay physically valid; visible output is
-  filtered by the *server's* reply schema's hidden flags at presentation.
-- **The catalog cache lives and dies with its connection** — `GnitzClient`
-  builds a fresh cache per connect and no transparent in-place reconnect
-  exists. A server restart resets the epoch to a small value; a reconnecting
-  client starts empty, so no cross-boot ABA arises. If a transparent
-  reconnect is ever added, it must rebuild the cache.
+**Reachable magnitude.** The largest live catalog anywhere in the tree is **10
+tables** (`gnitz-py/tests/test_scan_multi.py:384`, `test_persistence.py:671`);
+TPC-H is 5 (`benchmarks/helpers/tpch.py:26-47`), HTAP 4, the shared session
+server peaks at 8. So the cost reachable *today* is ≈10 KB and 4–6 round trips
+per statement — about 15× the result, not the 213× the 200-table row suggests. A
+dropped table's rows leave the scan (measured: 50 tables created then dropped
+returns COL_TAB to 7 066 B, vs 7 178 B at zero), so DDL churn does not inflate
+it. The **round-trip half is independent of catalog size** and is the larger
+defect; the byte half grows without bound in a real deployment.
+
+The path is heavily exercised: one full E2E run issues **209 290 client→server
+requests over 1 862 connections**, of which **40 326 are catalog scans**.
+
+## The principle
+
+The client asks the wrong question. It downloads O(catalog) to answer an O(1)
+question — "what is the shape of relation X?" — that the master can answer from
+typed maps it already maintains, one of which is the encoded schema block it
+already ships on every read reply:
+
+| client needs | master already has | file:line |
+|---|---|---|
+| schema name → id | `schema_by_name` | `catalog/cache.rs:31` |
+| `"schema.rel"` → id (tables **and** views) | `entity_by_qname`, fed by TABLE_TAB *and* VIEW_TAB (`cache.rs:169-204`) | `cache.rs:33` |
+| pk column list (views included) | `pk_col_of`, fed from `VIEWTAB_PAY_PK_COL_IDX` too (`cache.rs:229-233`) | `cache.rs:40` |
+| columns (any owner kind) | `col_defs` via `read_column_defs` | `cache.rs:43`, `registry.rs:93-100` |
+| the exact schema bytes the client decodes | `schema_wire_cache` | `cache.rs:46` |
+| index list `(cols, is_unique)` | `entry.index_circuits` | `catalog/metadata.rs:22` |
+| relation kind / existence | `dag.relation_kind(tid)` | `executor.rs:1558` |
+| replicated placement | `dag.relation_is_replicated(tid)` | `query/dag/meta.rs:235-239` |
+
+Both per-table maps are built lazily, not eagerly — `get_or_build_schema_wire_block`
+(`executor.rs:228-235` → `runtime/protocol/wire.rs:123-148`) handles the miss and
+awaits nothing, so building them inside a read-guarded handler is sound.
+
+**The decisive simplification** is that an ad-hoc DML statement resolves exactly
+one relation. `reject_derivation` (`gnitz-sql/src/dml/select.rs:47-53`) rejects
+JOIN, set operations, EXISTS/IN subqueries, scalar subqueries, derived tables in
+FROM, and non-pass-through CTEs — the remedy is a view, which resolves as one
+relation. UPDATE/DELETE/INSERT each target one relation. So a statement's whole
+catalog need is **one descriptor**, and one round trip fetches it.
+
+**Why the descriptor is a hint and not a trusted cache.** A cached descriptor's
+staleness is a *name → tid binding* staleness. The only per-relation validators
+on the wire — `schema_version` (bits 24–39) and `index_version` (bits 40–47) —
+are keyed by **tid**, so they structurally cannot certify a binding: after
+`ALTER TABLE t RENAME TO u; CREATE TABLE t`, a request stamped with the old
+descriptor's tid is asking about `u` and every tid-keyed check agrees it is
+fresh. Three further facts close off making them do this job:
+
+- `schema_version` is not a validation token, it is an **elision** token:
+  `wire_should_include_schema(cv, sv) = cv == 0 || cv != sv`
+  (`gnitz-wire/src/flags.rs:290-292`), and the decoder hard-fails when a data
+  frame arrives with the block elided but nothing in `Session::schema_cache` —
+  `DecodeError("FLAG_HAS_DATA without FLAG_HAS_SCHEMA and no cached schema")`
+  (`gnitz-core/src/protocol/message.rs:389-395`).
+- Only bits **55 and 63** are free — 2 bits, not another 16-bit field.
+- There is no verb to hang a binding check on for the common paths anyway: the
+  plain scan carries no flag (`executor.rs:1222`), and `roundtrip_push`'s
+  `SchemaMismatch` recovery re-sends to the **same `target_id`**
+  (`connection.rs:589-605`), so it heals schema identity and cannot heal a
+  binding.
+
+So the binding must be validated by a request that **carries the name**, against
+the map that owns it (`entity_by_qname`) — which is the resolve RPC itself.
+Resolving live on each statement makes that entire class of defect unreachable.
 
 ## Design
 
-One counter, six rules.
+### 1. `FLAG_RESOLVE`: one master-served relation descriptor
 
-### 1. The counter: a global u8 catalog epoch, bumped at the broadcast boundary
+A new request verb on **bit 54** — the bit `FLAG_GET_INDICES` occupies today.
+Resolve subsumes it, so this costs zero new flag bits.
 
-`CatalogCacheSet` gains `catalog_epoch: u8` (starts 1, wraps 255 → 1, never
-emits 0; 0 is the wire sentinel "no information"). The bump site is **not**
-`apply_local` — that is shared by the master-only compensation path
-(`submit_local`, `write_path.rs:51-59`; `compensate_stage_a`,
-`write_path.rs:1123`), so bumping there would let a *failed* DDL (e.g. a
-duplicate CREATE TABLE: COL_TAB applied, TABLE_TAB precheck fails, COL_TAB
-negated) advance the master's count while workers — which receive no broadcast
-on the error path (`executor.rs:2213-2253`) — advance nothing, permanently
-skewing the two and silently degrading every client to rescan-per-statement.
+**Request:** control-only. `target_id` carries the hint's tid (0 when none). The
+`seek_pk_extra` blob carries the canonical `(schema_name, relation_name)`. The
+flags word carries `wire_flags_set_schema_version(FLAG_RESOLVE,
+session.cached_schema_version(hint_tid))` and the hint's `index_version` in bits
+40–47. Bits 24–39 therefore keep **exactly** the meaning they already have —
+"the version of the schema this session has cached under that tid"
+(`connection.rs:456-458`, `:476-478`) — so no existing reader of those bits
+changes, and there is no second schema cache to keep in step.
 
-The bump lives at the **committed-broadcast boundary**, the true 1:1 point:
+**Reply**, built under `shared.catalog_rwlock.read()` (the lock
+`handle_get_indices`'s dispatch arm already takes, `executor.rs:1186-1197`):
 
-- **Master:** once per family batch actually emitted to the SAL in the DDL
-  success path (the `drain_pending_broadcasts()` → `emit_zone_to_sal` loop,
-  `executor.rs:2250-2253`), gated `family != SysFamily::Sequence && count > 0`.
-- **Worker:** once per received DDL_SYNC family batch in `ddl_sync`
-  (`store_io.rs:284`), same gate.
+- **Not found** → `STATUS_ERROR` with the schema-qualified "not found" text
+  `lookup_schema_id` / `lookup_table_record` produce today. Read from the live
+  catalog under the lock, so it is authoritative — never a stale miss.
+- **Found** → `STATUS_OK`, flags stamped with the server's `schema_version` and
+  `index_version`, and:
+  - the **control blob** carries the live `tid`, the relation kind, the packed pk
+    column list, the `relation_is_replicated` bool, and the index list as
+    `(packed_cols u64, is_unique u8)` pairs — 9 bytes per index;
+  - the **schema block** carries the relation's columns, elided iff
+    `req.target_id == live_tid && !wire_should_include_schema(cv, sv)`.
 
-This makes the two sides agree exactly: rolled-back families (never emitted)
-bump neither; the FK-auto-index cascade (self-produced on both sides via
-`submit_local`) bumps neither; boot shard-replay (`fire_hooks`, bypasses this
-boundary) bumps neither; the pre-fork SAL-tail recovery bumps the master and
-workers inherit the value at `fork()`. Post-fork, master emissions ↔ worker
-receipts are 1:1.
+**The reply never carries a data batch.** That is deliberate. A frame has one
+schema-block slot and one data-batch slot (`WireMsg`,
+`runtime/protocol/wire.rs:357-395`), and a data block with the schema elided is
+decoded against `Session::schema_cache[target_id]`
+(`protocol/message.rs:406-425`). Shipping the index list as an INDEX_META `Batch`
+while eliding the relation's schema block — the ordinary state after a
+`CREATE INDEX`, where `schema_version` matches but `index_version` does not —
+would pass the hint branch's version check at `message.rs:389-395` and silently
+decode INDEX_META rows against the relation's schema. Putting the list in the
+control blob makes the reply shape invariant (schema block present or absent,
+nothing else), so that misdecode is unreachable.
 
-The per-table `index_version` counter, `get_index_version`, its
-`apply_index_by_id` bump, its purge, and the `metadata.rs` pass-through are
-**deleted**.
+It is also smaller. Measured, an INDEX_META `Batch` costs a 200 B fixed block +
+104 B for the first row + 32 B per row to convey 9 bytes of real information per
+index (`executor.rs:1691-1694`); the control blob costs the 9 bytes. The client
+currently **discards** the reply's `seek_pk_extra`
+(`let (ctrl_header, error_msg, _seek_pk_extra) = …`, `message.rs:368`), so
+`Message` gains one field — a smaller change than a bespoke multi-frame receive
+path, which `drain_reply_train` could not serve anyway (it merges one schema and
+concatenates data batches, `connection.rs:373-394`).
 
-### 2. The wire field: bits 40–47 become the catalog epoch
+**The `req.target_id == live_tid` conjunct is what makes rename and
+drop-and-recreate self-correcting**: the hint simply fails to match, the full
+descriptor is sent, and the statement plans against the new relation. No error,
+no retry, no invalidation rule. Eviction from `Session::schema_cache` yields a
+stamped version of 0, which also forces the block — self-healing in the same way.
 
-Rename `wire_flags_set_index_version` / `wire_flags_get_index_version` to
-`wire_flags_set_catalog_epoch` / `wire_flags_get_catalog_epoch` (same bits,
-same u8, same 0-sentinel), updating the import sites in `protocol/header.rs`,
-`protocol/mod.rs`, and `connection.rs`.
+**The reply must carry every field a `gnitz_core::Schema` has**, specifically
+`is_serial`, `fk_table_id`, and `fk_col_idx`. This is not optional: `drop_column`
+reads `cd.is_serial` and `cd.fk_table_id` off the schema returned by
+`resolve_table_id` (`ddl/alter.rs:214-224` via
+`resolve_alter_base_table_with_schema`, `alter.rs:378-384`), not off a scan.
+Omitting them would silently accept
+`ALTER TABLE t DROP COLUMN <fk_col>`, which is rejected today. (The `fk_table_id`
+assignments at `ddl/table.rs:343` and `:386` are **writes** into the planner's own
+freshly-built column list, not reads — they do not license omitting the fields.)
 
-**Replies:** every reply-frame builder stamps the current epoch:
+Wire cost: three new per-column fields in the schema block. `is_serial` and a
+2-bit-wide FK presence marker fit the free bit 3 of `pack_col_meta_flags`
+(`gnitz-wire/src/flags.rs:394`, which uses bits 0–2 and 8–15); the FK target
+`(table_id, col_idx)` needs two columns in `meta_schema()`. Engine-side,
+`ColumnDef` (`catalog/types.rs:7-17`) gains `is_serial` — COL_TAB already stores
+it and `scan_column_defs` (`registry.rs:73-80`) is the only production
+constructor, but the struct has **53 literal construction sites** in
+`gnitz-engine` and derives no `Default`. The masks thread through
+`build_schema_wire_block` → `schema_to_batch` (`runtime/protocol/wire.rs:92-170`)
+alongside the existing `hidden_mask` at **22 call sites**, `pack_col_meta_flags`
+gains a parameter (production callers at `flags.rs:393`, `codec.rs:22`,
+`wire.rs:170`), and the client's `schema_to_batch` / `batch_to_schema` pair
+(`protocol/codec.rs:9-31`, `:36-81`) must round-trip them or the test at
+`codec.rs:260` regresses. Budget ~75 mechanical edits, not a handful.
 
-- master: `send_ok_response`, `send_control_only`, `send_error`, and the
-  master-built scan continuation/terminal frames (`executor.rs`);
-- worker: **every** scan/seek frame emitter in
-  `runtime/orchestration/worker/reply.rs` — audit all builders, including the
-  `FLAG_CONTINUATION | FLAG_SCAN_LAST` one at ~line 618 that today stamps no
-  schema version; the selection criterion is "emits a client-bound frame",
-  not "already stamps a schema version".
+### 2. The client hint map
 
-Error frames stamp it too — a rejected statement must still re-anchor the
-client (this is what heals the raw-client push-mismatch loop in §4).
-
-**Requests:** the three read dispatches whose *plan* derives from the catalog —
-`FLAG_SCAN_SPEC`, `FLAG_SEEK`, `FLAG_SEEK_BY_INDEX` — stamp the client's
-**plan basis** (§4): the epoch its catalog cache held when the statement's
-first catalog read ran (0 = no basis, skip validation). Validation is by the
-epoch **alone**; no schema-version check is added anywhere. (The per-table u16
-schema version field survives untouched for its own job — warm-push
-schema-block elision, which is per-table and orthogonal; a global epoch would
-over-invalidate it. It is not a validation input here: any DDL that changes a
-schema also bumps the epoch, so the epoch subsumes it, and for pure-SELECT
-clients `scan_spec` never populates the schema cache anyway.)
-
-Pushes are unchanged (the existing `STATUS_SCHEMA_MISMATCH` machinery fully
-guards them). DDL requests are unchanged (rule 6 makes DDL planning fresh).
-
-### 3. The validation: `STATUS_STALE_CATALOG`
-
-New control status `STATUS_STALE_CATALOG: u32 = 5` (`flags.rs`, after
-`STATUS_TXN_CONFLICT = 4`). In the master's `handle_message`, before
-dispatching a `FLAG_SCAN_SPEC` / `FLAG_SEEK` / `FLAG_SEEK_BY_INDEX` request,
-under the catalog read lock it already holds:
-
-```rust
-let basis = wire_flags_get_catalog_epoch(flags);
-if basis != 0 && basis != shared.cat().catalog_epoch() {
-    send_control_only(peer, target_id, client_id, STATUS_STALE_CATALOG).await;
-    return;
-}
-```
-
-The short-circuit runs **before** any worker fan-out, so the single
-control-only frame is a legal train terminator (`drain_reply_train` is
-continuation-bit-driven) with no desync.
-
-This converts *every* stale-plan execution — including the wide-int
-dropped-index hard error, the one staleness outcome that is neither
-silent-correct nor self-healing today — into one clean retryable rejection
-before any work runs. The residual race (a DDL landing between master
-validation and worker execution) is exactly today's microsecond-class
-plan-vs-execute window.
-
-**`check_response` (`connection.rs:46-72`) must map the new status to a new
-`ClientError::StaleCatalog`** — without that arm, the control frame decodes as
-a successful empty result and the entire retry design is inert. The rejection
-is control-only: nothing executed, so retrying is always safe.
-
-### 4. The cache: persistent, entry-point-gated, torn-statements-abort
-
-In `GnitzClient`, `catalog_snapshot: Option<HashMap<…>>` is replaced by:
+`GnitzClient` replaces `catalog_snapshot`, `indices_refreshed`, and `index_cache`
+with one map keyed by canonical qualified name:
 
 ```rust
-struct CatalogCache {
-    /// Epoch all cached batches were scanned at. 0 = empty.
-    epoch: u8,
-    tabs: HashMap<u64, Option<Arc<ZSetBatch>>>,
+struct RelHint {
+    tid: u64,
+    is_view: bool,
+    replicated: bool,
+    index_version: u8,
+    indexes: Arc<Vec<IndexMeta>>,
 }
+/// Send-only hint, never a substitute for resolving. Bounded LRU; eviction
+/// costs one un-elided reply, never correctness. The schema is NOT held here —
+/// `Session::schema_cache` owns it, so the two can never disagree.
+hints: LruCache<String, RelHint>,
 ```
 
-and `Session` gains `last_seen_epoch: u8`, absorbed via one
-`note_catalog_epoch(flags)` helper called from the **actual** receive
-chokepoints (ignoring 0 per the sentinel convention):
+`resolve_table_id`, `resolve_table_or_view_id`, `resolve_relation_kind`,
+`table_replicated`, `table_indexes`, and `index_for_column` are reimplemented over
+one private `resolve(name)` that **always sends `FLAG_RESOLVE`**, passing whatever
+hint it holds and installing the reply. The schema is installed into
+`Session::schema_cache[live_tid]` with the reply's version — the same (schema,
+version) pairing `recv_cached` performs from a frame's own flags
+(`connection.rs:504-507`) — so the warm-push contract at `executor.rs:1032-1034`
+sees a resolve-seeded entry and a scan-seeded entry identically. The `gnitz-py`
+async transport builds a bare `Session` with no `GnitzClient`
+(`gnitz-py/src/lib.rs:2091`) and holds no hints, so it is untouched.
 
-- the frame loop inside `drain_reply_train` (covers plain scans, SCAN_SPEC —
-  which deliberately bypasses `recv_cached` — and SCAN_MULTI);
-- `recv_cached` (push ACKs, seeks);
-- `send_txn_frame` (`connection.rs:194-198`) — the DDL-ACK and txn-commit
-  receive path; without this, read-your-own-DDL breaks;
-- `roundtrip` (the alloc RPCs).
+**The statement bracket is narrowed, not deleted.** It becomes a per-statement
+memo of resolved names, so one statement resolves each name once. This is
+load-bearing, not an optimization: `resolve_alter_base_table_with_schema`
+(`alter.rs:378-384`) resolves the same name twice within one statement. The
+`scan_catalog` snapshot branch is deleted; `scan_catalog` becomes a plain scan for
+the DDL callers (§3).
 
-**The freshness gate runs at every public catalog-reading entry point, not
-only in `SqlPlanner`.** A shared `GnitzClient` helper —
+**This is strictly more consistent than today.** Today a statement's three
+catalog scans are three unsynchronized round trips at three SAL cuts
+(`client.rs:322-334`), so a concurrent DDL can hand one statement a TABLE_TAB row
+and a newer COL_TAB. The resolve builds the whole descriptor under one read
+guard. The residual window — a DDL landing between the resolve and the read — is
+exactly today's plan-vs-execute window, unchanged.
 
-```rust
-fn ensure_catalog_basis(&mut self) {
-    let seen = self.session.last_seen_epoch();
-    if self.catalog_cache.epoch != 0 && self.catalog_cache.epoch != seen {
-        self.catalog_cache.wipe();
-    }
-}
-```
+### 3. DDL keeps the scan path
 
-— is called on entry by `resolve_table_id`, `resolve_table_or_view_id`,
-`resolve_relation_kind`, `table_replicated`, `table_indexes`,
-`index_for_column`, and every raw DDL helper (`create_table`, `create_view*`,
-`drop_table`, `create_schema`, `drop_schema`, `create_index`,
-`drop_index_by_name`). This preserves today's guarantee for raw gnitz-py /
-gnitz-capi callers that never run a statement bracket: any traffic they do
-(including a failing push's error ACK, now epoch-stamped) re-anchors
-`last_seen_epoch`, and their next catalog read wipes and rescans. Without
-this, a raw py client that `resolve_table`d before a foreign ADD COLUMN would
-push into `STATUS_SCHEMA_MISMATCH` forever. `SqlPlanner` keeps its statement
-bracket only to add the DDL-fresh wipe (rule 6) and to fix the statement
-basis; `end_catalog_snapshot` is deleted.
+DDL must reproduce byte-identical `-1` retraction rows for the engine's CAS, so
+it reads raw catalog rows rather than a projected descriptor: `lookup_schema_id`,
+`lookup_table_record`, `find_view_record`, `extract_col_entries`, and
+`alter_col_pair` stay, over a plain (unsnapshotted) `scan_catalog`.
+`alter_col_pair` does its own `scan_catalog(COL_TAB)` (`client.rs:1423-1426`), so
+the retraction rows are unaffected by §1's projected schema.
 
-**The statement basis is fixed at the statement's first catalog read, and any
-mid-statement change aborts and replans.** `scan_catalog` records the reply
-epoch of the first scan it absorbs for the current statement (a cache hit
-inherits `cache.epoch`); if a later scan in the same statement absorbs a
-*different* epoch — or a resolution-layer refresh (rule 5) wipes the cache
-mid-statement — planning aborts with an internal `StaleCatalog` and the
-statement-layer retry replans from scratch. This is strictly stronger than
-today's snapshot (which tolerates torn views within a statement) and it closes
-the hole where a mid-statement cache clear would advance `cache.epoch` to the
-new value, letting a torn plan stamp a *current* basis and sail through
-validation. Mechanically: the cache carries a monotonically increasing local
-`wipe_count`; the planner captures `(epoch, wipe_count)` after the begin
-check; the request-stamp helper and the bind/plan steps compare before use.
-Cached batches are always same-epoch by construction (a scan absorbing a new
-epoch wipes first, then triggers the abort).
+Two whole-IDX_TAB scans also stay on the DDL path: `index_name_cols`
+(`client.rs:680-697`, the `CREATE INDEX` duplicate-name probe) and
+`drop_index_by_name` (`client.rs:631-670`). §1's argument that an IDX_TAB scan is
+the wrong shape for the *DML* index list does not reach them; they are part of
+the DDL half named in the Scope note.
 
-The client's own DDL needs no special-case invalidation: its ACK (via
-`send_txn_frame`) carries the post-DDL epoch, `last_seen_epoch` advances, and
-the next entry-point gate wipes. Read-your-own-DDL is exact.
+DDL statements resolve their names through §2 like everything else, then scan for
+the raw rows they must retract. A multi-source `CREATE VIEW` therefore pays one
+resolve per source **plus** the DDL scans, where today the statement snapshot
+shared three scans across all sources — a small round-trip increase on that one
+statement shape, on a path that is 10 277 of 209 290 requests (4.9%) and already
+fsync-bound.
 
-### 5. The retry rules
+Nothing here is a correctness requirement: the server re-validates the FK gate
+authoritatively (`validate_fk_column`), and every resolve is live.
 
-- **Resolution-layer retry (kept — it is the only healer raw clients have):**
-  `lookup_schema_id` / `lookup_table_record` / `lookup_relation` — on a miss
-  while the cache was warm (not freshly scanned by this call chain), wipe,
-  rescan, retry the lookup once before reporting "not found". A verified miss
-  is then always fresh-verified, for SQL and raw callers alike. Inside a
-  `SqlPlanner` statement this refresh also trips the torn-statement abort
-  (§4), so a statement never continues on a half-swapped catalog — in
-  particular an RMW build never binds columns against a different catalog
-  than its seek used.
-- **Statement-layer retry:** at the `SqlPlanner` statement entry, re-run the
-  statement (bounded: 3 attempts total, then surface "catalog changed
-  concurrently") when it fails with `GnitzSqlError::Bind`, `::Plan`, or
-  `::Unsupported` while planned warm, or with
-  `Exec(ClientError::StaleCatalog)` (from dispatch-time rejection or the
-  internal torn-statement abort). The predicate is **by variant**, never "does
-  it wrap a ClientError" — a resolution miss is constructed client-side as
-  `ClientError::ServerError` and must not be classified by wrapper type (it
-  is owned by the resolution-layer retry and never reaches this layer as a
-  staleness symptom). All other `Exec(..)` errors and `Conflict` are never
-  auto-retried. Retry safety: the retry granularity is **one `Statement`**
-  (never a multi-statement submission — re-running an earlier statement of a
-  batch would double-buffer its writes); the only wire operations a statement
-  performs before a `Bind`/`Plan` error or a basis abort are idempotent
-  *reads* (the RMW builders dispatch seeks before evaluating SET expressions
-  — `rmw.rs::commit_rmw_or_buffer` — but the txn-buffer mutation is strictly
-  last, so an aborted build leaves the buffer untouched and a retry
-  re-buffers exactly once). The statement retry composes with the RMW
-  driver's own bounded OCC loop (`RMW_MAX_ATTEMPTS = 4`) multiplicatively in
-  the worst case; both are small and both terminate.
-- Auto-retry is kept rather than "wipe and surface the error": today every
-  statement rescans, so foreign DDL essentially never spuriously fails
-  another client's statement. The persistent cache breaks that contract;
-  auto-retry restores it. Even when the retry also fails, the wipe guarantees
-  the next statement plans fresh.
+### 4. Deletions and one behaviour decision
 
-### 6. DDL statements always plan fresh
+Deleted:
 
-The planner passes `fresh = true` — an unconditional wipe before planning —
-for **exactly** these statement arms (the set is total; DDL is rejected inside
-transactions, so no buffered forms exist): `CreateTable`, `CreateView` (both
-variants), `CreateIndex`, `Drop` (table/view/schema/index), `CreateSchema`,
-`AlterTable`, `AlterView`. Honest justification: the server re-validates the
-FK gate authoritatively (`validate_fk_column`), so DDL-fresh is **not** a
-correctness requirement for stale-*accepts*; it exists to (a) prevent spurious
-client-side *rejects* (FK gate, DROP COLUMN guard, name-taken probes) that no
-retry can distinguish from genuine ones, and (b) ensure CREATE VIEW bakes its
-scan bounds (`scan_bound_for_input`) and its replicated-source routing
-(`table_replicated` — immutable flag, but the row must exist) against the
-current catalog, since circuit bounds are persisted and never re-validated by
-the epoch. Cost: full catalog scans on the rare DDL path — today's cost.
+- `FLAG_GET_INDICES`, `handle_get_indices` and its dispatch arm
+  (`executor.rs:1186-1197`, `:1669-1690`), `Session::fetch_indices`,
+  `GnitzClient::refresh_indices`, `index_cache`, `indices_refreshed`, and
+  `SCHEMA_CACHE_CAP` at `client.rs:13` (its only user; the unrelated same-named
+  constant at `connection.rs:24` stays).
+- `catalog_snapshot` and the snapshot branch of `scan_catalog`.
+- `IndexListMemo` (`access.rs:650-666`) — its premise ("`table_indexes` ALWAYS
+  hits the wire") becomes false. The range→equality collector fall-through then
+  reads the hint twice per statement, which is free.
+- The stale GET_INDICES doc references at `access.rs:511`, `access.rs:1629`, and
+  `dml/plan.rs:98`, and the `table_indexes` / `index_for_column` doc comments
+  (`client.rs:490-518`).
 
-### The index list: parsed from the cached IDX_TAB
+Retained: the per-table `index_version` counter, its bump and its purge — it is
+the index-elision validator the resolve reply uses. `get_index_version` and the
+`metadata.rs:80` pass-through stay.
 
-`GnitzClient::table_indexes(tid)` / `index_for_column(tid, col)` are
-reimplemented as pure parses over `scan_catalog(IDX_TAB)`:
+**`pk_bound_is_preemptible` (`access.rs:255-276`) keeps its behaviour; only its
+comment changes.** Its second clause is justified today by "`table_indexes`
+always hits the wire — this keeps the GET_INDICES probe off the common
+`WHERE pk > x` read", which stops being true. But the clause is a real semantic
+guard independent of that cost — a PK bound with nothing pinned is only worth
+abandoning when there is an index-eligible equality to build a unique point
+from — so the predicate stands and the plan shapes it produces are unchanged.
+Rewrite the comment to state that criterion; do not delete the guard.
 
-- iterate **`live_rows()`** (net-consolidated positive-weight rows — a
-  dropped index's retraction nets out; iterating raw rows would leak it);
-- filter `owner_id == tid` (sufficient alone: ids are allocator-unique across
-  tables and views, and indexes are table-only by write-path enforcement);
-- decode `source_col_idx` via the existing `unpack_pk_cols` well-formedness
-  guard, `is_unique` from its column;
-- **dedup by column list** with `is_unique = any(rows)` — exactly the
-  engine's own promotion/demotion rule (§ Current state);
-- return `Arc<Vec<IndexMeta>>` (fresh `Arc::new` per parse, keeping the
-  signature) in IDX_TAB PK (`index_id`) order — deterministic; the
-  seek-candidate collector and `best_index_bound` rank by their own criteria.
-- Rewrite the `table_indexes` / `index_for_column` doc comments
-  (`client.rs:481-539`) — they currently describe the epoch-validated
-  GET_INDICES cache and would become false.
+No new status code, no new `ClientError` variant, no client-side invalidation
+rule, no statement retry, and no changes to any existing verb's frames.
 
-Deleted with this: `refresh_indices`, `Session::fetch_indices` (and its doc),
-`index_cache` + the `SCHEMA_CACHE_CAP` constant at `client.rs:13` (its only
-user; the unrelated same-named constant in `connection.rs:22` stays),
-`FLAG_GET_INDICES` (frees flag bit 54), `handle_get_indices`, the
-`index_version` machinery (§1), and `IndexListMemo`
-(`gnitz-sql/src/dml/plan.rs:327-349`) — its motivating comment
-("`table_indexes` ALWAYS hits the wire") becomes false; the range→equality
-collector fall-through then parses the cached batch twice per statement,
-which is accepted (client CPU on a tiny in-RAM list).
+## Accounting
 
-**Per-call batch walks are retained.** Parsing system-table batches once per
-epoch into typed maps (name→tid, tid→schema) is a client-CPU optimization
-that would add a second invalidation surface; the win this plan targets is
-round trips, so the typed-map layer is deliberately rejected.
+| Statement | Today | After (warm hint) | After (cold / post-DDL) |
+|---|---|---|---|
+| `SELECT … WHERE x = 5` | 5 RT, ~10 KB | **2 RT, ~0.3 KB** | 2 RT, ~0.7 KB |
+| `SELECT … WHERE id = 2` | 4 RT, ~10 KB | **2 RT** | 2 RT |
+| `SELECT * FROM t` | 4 RT, ~10 KB | **2 RT** | 2 RT |
+| `INSERT` (warm push) | 4 RT, ~10 KB | **2 RT** | 2 RT |
+| `UPDATE … WHERE x = 5` | 6 RT | **3 RT** | 3 RT |
+| `SELECT * FROM <view>` | 5 RT | **2 RT** | 2 RT |
+| DDL | 3–4 scans + push | 1 resolve/name + DDL scans + push | same |
 
-## Steady-state round-trip accounting
+Measured block sizes behind those numbers: a schema block is ≈344 + 56·N bytes
+(624 B at 5 columns, 2 584 B at 40); a control-only reply is 256 B; the index
+list is 9 B/index in the blob.
 
-| Statement | Today | After |
-|---|---|---|
-| `SELECT … WHERE x = 5` | 3 catalog scans + GET_INDICES + read = 5 | read = **1** |
-| `INSERT` (warm push) | 3 catalog scans + push = 4 | push = **1** |
-| `UPDATE … WHERE` | 3 scans + GET_INDICES + seek + push | seek + push = **2** |
-| any statement, first after a foreign DDL | n/a | + one refresh cycle (STALE_CATALOG or entry gate) |
-| DDL | scans + push | unchanged |
-
-## ABA bound
-
-The epoch is u8 with period 255. A client mis-validates only if exactly 255·k
-committed catalog family batches land between two of its observations. The
-consequence class is bounded by the invariants above (monotonic tids,
-cols-matched index resolution, schema-version-guarded pushes, presentation
-filtering by the server's reply schema) to today's plan-vs-execute race
-outcomes: correct-but-slower reads, or a clean error healed by the next
-statement. Accepted uniformly — no per-path second counter — and documented
-at the epoch definition.
+**What the hint is worth, stated against the real alternative.** Against a
+resolve that always sends the full reply, the hint saves the schema block —
+~0.8 KB per statement at a 5-column table — and **zero** round trips. On the
+10 267 B baseline: always-full resolve removes 89.5% of the catalog bytes, the
+hint takes it to 97.5%. The 4–6 → 2 collapse is entirely the resolve's doing.
+The hint earns its place because it is now four fields and a `LruCache`, with no
+invalidation rule and no second copy of the schema.
 
 ## Tests
 
-Engine unit (`catalog/tests/`):
-- epoch bumps once per **broadcast** non-Sequence family batch: a CREATE
-  TABLE bundle bumps ≥ 2 (COL_TAB + TABLE_TAB); a **failed** CREATE (duplicate
-  name) bumps **zero** on the master (compensation is bump-free); SEQ_TAB
-  serial refill and user-table pushes bump nothing; wraps 255 → 1 skipping 0.
-- master validation: a scan_spec with basis ≠ current epoch gets
-  `STATUS_STALE_CATALOG`; basis 0 passes; matching basis passes.
-- master/worker agreement: after a mix of successful and failed DDL, a
-  worker-served reply and a master-served reply stamp the same epoch.
+Engine unit (`catalog/tests/`, `runtime/tests/`):
+- resolve: found / not-found; a view resolves through the same `entity_by_qname`
+  and `pk_col_of` paths as a table; `is_serial` and the FK target round-trip
+  through the schema block.
+- elision: a matching `(target_id, schema_version)` elides the schema block; a
+  hint whose tid is stale (rename or drop-and-recreate) elides it **even when the
+  version numbers coincide** — the `req.target_id == live_tid` conjunct; a stamped
+  version of 0 always forces the block.
+- the reply never sets `FLAG_HAS_DATA`, at any index count.
 
 Client/planner unit (`gnitz-sql`):
 - `plan/index_bound.rs` closure-counter tests rewritten (the memo and its
   `calls == 1` assertions are deleted with `IndexListMemo`).
-- IDX_TAB parse: retracted rows excluded via `live_rows`; FK+UNIQUE same-cols
-  rows dedup to one `is_unique` entry; multi-column packed lists round-trip.
-- statement retry predicate: `Bind`/`Plan`/`Unsupported`/`StaleCatalog`
-  retried once-then-surface; `Exec(ServerError)` never retried.
+- a statement resolves each name exactly once, including
+  `ALTER TABLE … DROP COLUMN`, which resolves it twice without the memo.
+- `DROP COLUMN` still rejects a SERIAL column and an FK-carrying column when the
+  schema came from a resolve rather than a scan — the regression guard for §1's
+  field list.
 
-E2E (`gnitz-py`, `GNITZ_WORKERS=4`, new `tests/test_catalog_cache.py`):
-- cross-client heal via SQL: client A `CREATE INDEX` / `DROP INDEX` /
-  `CREATE TABLE` / `DROP TABLE`; idle client B's next statement returns
-  correct results (covers STALE_CATALOG replan, resolution-layer retry, and
-  the wide-int dropped-index case: `DROP INDEX` on a U128-bound column
-  between B's statements must succeed via replan, not error).
-- cross-client heal via the **raw** surface: client B does
-  `resolve_table` + binary `push`; client A runs a DDL touching B's table;
-  B's next pushes/resolves recover without reconnecting (the wedge-regression
-  test for the entry-point gate).
-- own-DDL: `CREATE INDEX` then `SELECT` on the same connection plans against
-  the new index; `CREATE TABLE` then immediate `INSERT`/`SELECT` works.
-- a failed DDL (duplicate CREATE TABLE) followed by SELECTs on both
-  connections: results correct and (assertable via repeated statements) no
-  permanent per-statement rescan regression.
-- repeated SELECTs with no DDL in between return identical results.
+E2E (`gnitz-py`, `GNITZ_WORKERS=4`, new `tests/test_relation_resolve.py`) — each
+runs the second client's statement with a warm hint, since these are the shapes a
+trusted cache would get wrong:
+- client A `ALTER TABLE t RENAME TO u` then `CREATE TABLE t`; idle client B's next
+  bare `SELECT * FROM t` (the plain-scan path) returns the **new** t's rows, and
+  its next `INSERT INTO t` writes into the **new** t.
+- client A `DROP TABLE t` then recreates it; B's next `SELECT` and `INSERT`
+  succeed against the new relation with no error and no reconnect.
+- client A `CREATE INDEX` on B's table; B's next statement plans against it
+  (the `index_version`-only mismatch — the case that would misdecode under a
+  data-block reply).
+- client A `DROP INDEX` on a U128-bound column; B's next `SELECT … WHERE
+  wide = ?` replans without an index. (An `exact` index bound on a dropped index
+  is a hard engine error — `catalog/scan_spec.rs:196-217` →
+  `catalog/store_io.rs:160-172`; `exact` is set only when the WHERE cannot
+  compile to a wire predicate, `gnitz-sql/src/dml/plan.rs:188-230`.)
+- client A `ALTER COLUMN … DROP NOT NULL`; B's next binary `push` through the
+  **raw** surface (`resolve_table` + `push`) succeeds without reconnecting.
+- own-DDL: `CREATE INDEX` then `SELECT` on the same connection plans against the
+  new index; `CREATE TABLE` then immediate `INSERT`/`SELECT` works.
+- repeated SELECTs with no DDL in between issue exactly two requests each, and
+  the resolve reply stays flat as the catalog grows.
 
 ## Sequencing
 
-- [ ] **Engine + wire mechanism (additive):** `catalog_epoch` counter with
-  bumps at the master broadcast-emit loop and worker `ddl_sync`; rename bits
-  40–47 accessors to catalog-epoch (+ the three import sites); stamp all
-  master reply builders and **all** worker frame emitters;
-  `STATUS_STALE_CATALOG` + master basis validation of
-  `SCAN_SPEC`/`SEEK`/`SEEK_BY_INDEX` (requests still send 0, so validation is
-  dormant); engine unit tests for bump agreement + validation.
-- [ ] **Client switch:** `CatalogCache` + `last_seen_epoch` absorption at
-  `drain_reply_train` / `recv_cached` / `send_txn_frame` / `roundtrip`;
-  `ensure_catalog_basis` entry gate on every public catalog-reading and raw
-  DDL method; basis-stamped read requests with the fixed-at-first-read basis
-  + torn-statement abort; `ClientError::StaleCatalog` mapping in
-  `check_response`; resolution-layer retry; `SqlPlanner` statement-layer
-  retry + DDL-fresh rule; IDX_TAB-parsed `table_indexes` /
-  `index_for_column` with rewritten docs; delete `IndexListMemo`; gnitz-sql
-  test updates.
-- [ ] **Delete the dead mechanism:** `FLAG_GET_INDICES`, `fetch_indices`,
-  `refresh_indices`, `index_cache`, `SCHEMA_CACHE_CAP` (client.rs),
-  `handle_get_indices`, the `index_version` counter + bump + purge + the
-  `metadata.rs` pass-through + its unit tests.
-- [ ] **E2E staleness suite** per the test list above; full `make verify` +
-  `make e2e`.
+- [ ] **Schema-block fields:** `is_serial` and the FK target through
+  `pack_col_meta_flags` / `meta_schema()` / `build_schema_wire_block` /
+  `schema_to_batch`, the engine `ColumnDef` field and `scan_column_defs`, and the
+  client `codec.rs` round-trip.
+- [ ] **`Message` surfaces the reply control blob** (`message.rs:368` currently
+  discards `seek_pk_extra`).
+- [ ] **The resolve verb:** `FLAG_RESOLVE` on bit 54; `handle_resolve` serving
+  from `schema_by_name` / `entity_by_qname` / `pk_col_of` / `schema_wire_cache` /
+  `index_circuits` / `dag.relation_kind` / `dag.relation_is_replicated`, with the
+  tid-conjoined schema elision and the blob-packed index list; delete
+  `handle_get_indices` + its dispatch arm, `FLAG_GET_INDICES`,
+  `Session::fetch_indices`; engine unit tests.
+- [ ] **Client switch:** the `hints` LRU and the private `resolve`, installing the
+  schema into `Session::schema_cache`; the six resolver methods reimplemented over
+  it with rewritten docs; the statement bracket narrowed to a per-name memo; the
+  deletions and the `pk_bound_is_preemptible` comment in §4.
+- [ ] **E2E suite** per the test list above; full `make verify` + `make e2e`.
