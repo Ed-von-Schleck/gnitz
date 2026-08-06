@@ -45,7 +45,7 @@ pub enum ExprValidateErr {
     TooManyRegs(u32),
     ResultRegOutOfRange { result_reg: u32, num_regs: u32 },
     RegOutOfRange { reg: u16, num_regs: u32 },
-    RegisterAliasing { dst: u16, a: u16, b: u16 },
+    RegisterAliasing { dst: u16, reg: u16 },
     RegRewrite { reg: u16 },
     RegClassMismatch { reg: u16 },
     ConstIdxOutOfRange { const_idx: u32, n: usize },
@@ -448,12 +448,11 @@ pub(crate) enum Instr {
         pi: u8,
         fi: FixedInt,
     },
-    /// Payload float load. `wide` is the F64-vs-F32 decode selector; `validate`
-    /// pins the column to `ColKind::Float`, so the two arms are total.
-    LoadPayloadFloat {
+    /// Payload F32 load, widened to the register's f64 image. An F64 column
+    /// needs no kernel of its own — it lowers to `LoadPayloadInt` with `I64`.
+    LoadPayloadF32 {
         dst: u16,
         pi: u8,
-        wide: bool,
     },
     /// PK-region integer load: the addressed OPK column at byte `off`. `off`
     /// cannot come from `fi` — it is the column's offset within the OPK region,
@@ -1056,13 +1055,14 @@ impl LogicalProgram {
         // signed→unsigned variant selection, because a U64 >= 2^63 has a
         // negative i64 bit pattern. Unknown counts as not-U64, i.e. signed.
         let mut reg_u64 = [false; MAX_REGS];
-        // Payload slot of a payload-only opcode's column operand. `validate`'s
-        // `ColKind::payload_only` rule rejects a PK column here and callers
-        // validate before resolving, so the `None` arm
-        // is unreachable for any program that ever reaches a batch; it keeps the
-        // sentinel so an unvalidated program (tests) trips the kernels' own
-        // assertions instead of silently addressing payload slot 0.
-        let payload_slot = |ci: usize| schema.payload_slot(ci).unwrap_or(crate::PAYLOAD_MAPPING_PK_SENTINEL);
+        // `validate`'s `ColKind::payload_only` rule rejects a PK column for
+        // every opcode resolved through here, and the constructors validate
+        // before resolving.
+        let payload_slot = |ci: usize| {
+            schema
+                .payload_slot(ci)
+                .expect("validate pinned this operand to a payload column")
+        };
         let mut instrs = Vec::with_capacity(self.instrs.len());
         // Decoded `INT_IN_SET` pools, indexed by the resolved `set_idx`. Decoded
         // once here (never per row); each `IntInSet` re-points its `set_idx` at
@@ -1109,28 +1109,21 @@ impl LogicalProgram {
                     reg_u64[dst as usize] = loc.type_code() == type_code::U64;
                 }
                 L::LoadColFloat { dst, col } => {
-                    // Total on a validated program, the same shape as the
-                    // `LoadColInt` arm above: `validate` runs
-                    // `check_col(.., ColKind::Float)`, so the column is F32 or F64
-                    // and nothing else. Stated positively so an unvalidated
-                    // program panics here rather than reading 8 bytes out of a
-                    // 4-byte region.
-                    let wide = match schema.col_type_code(col as usize) {
-                        type_code::F64 => true,
-                        type_code::F32 => false,
+                    // `validate` pinned this column to F32/F64. Listed
+                    // positively so an unvalidated program panics rather than
+                    // reading 8 bytes out of a 4-byte region.
+                    let pi = payload_slot(col as usize);
+                    instrs.push(match schema.col_type_code(col as usize) {
+                        type_code::F64 => I::LoadPayloadInt {
+                            dst,
+                            pi,
+                            fi: FixedInt::I64,
+                        },
+                        type_code::F32 => I::LoadPayloadF32 { dst, pi },
                         other => unreachable!("validated LoadColFloat names F32/F64, got {other}"),
-                    };
-                    instrs.push(I::LoadPayloadFloat {
-                        dst,
-                        pi: payload_slot(col as usize),
-                        wide,
                     });
-                    reg_u64[dst as usize] = false;
                 }
-                L::LoadConst { dst, val } => {
-                    instrs.push(I::LoadConst { dst, val });
-                    reg_u64[dst as usize] = false;
-                }
+                L::LoadConst { dst, val } => instrs.push(I::LoadConst { dst, val }),
                 L::IntAdd { dst, a, b } => {
                     instrs.push(I::IntAdd { dst, a, b });
                     reg_u64[dst as usize] = reg_u64[a as usize] || reg_u64[b as usize];
@@ -1162,23 +1155,16 @@ impl LogicalProgram {
                     // pick the unsigned form when either operand is U64.
                     let signed = matches!(op, CmpOp::Eq | CmpOp::Ne) || !(reg_u64[a as usize] || reg_u64[b as usize]);
                     instrs.push(I::Cmp { op, dst, a, b, signed });
-                    reg_u64[dst as usize] = false;
                 }
                 L::FCmp { op, dst, a, b } => instrs.push(I::FCmp { op, dst, a, b }),
-                L::FloatUnary { op, dst, a } => {
-                    instrs.push(I::FloatUnary { op, dst, a });
-                    reg_u64[dst as usize] = false;
-                }
+                L::FloatUnary { op, dst, a } => instrs.push(I::FloatUnary { op, dst, a }),
                 // A pure int transform keeps the operand's width and signedness,
                 // so the U64 tracking carries straight through.
                 L::IntUnary { op, dst, a } => {
                     instrs.push(I::IntUnary { op, dst, a });
                     reg_u64[dst as usize] = reg_u64[a as usize];
                 }
-                L::FloatToF32 { dst, a } => {
-                    instrs.push(I::FloatToF32 { dst, a });
-                    reg_u64[dst as usize] = false;
-                }
+                L::FloatToF32 { dst, a } => instrs.push(I::FloatToF32 { dst, a }),
                 // Total on a validated program, the `LoadColInt` shape above:
                 // `validate` gates both opcodes' target word through
                 // `gnitz_wire::is_fixed_int` — the same eight codes
@@ -1209,14 +1195,10 @@ impl LogicalProgram {
                     });
                     reg_u64[dst as usize] = u;
                 }
-                L::FloatMinMax2 { dst, a, b, is_max } => {
-                    instrs.push(I::FloatMinMax2 { dst, a, b, is_max });
-                    reg_u64[dst as usize] = false;
-                }
+                L::FloatMinMax2 { dst, a, b, is_max } => instrs.push(I::FloatMinMax2 { dst, a, b, is_max }),
                 L::IntToFloat { dst, a } => {
                     let signed = !reg_u64[a as usize];
                     instrs.push(I::IntToFloat { dst, a, signed });
-                    reg_u64[dst as usize] = false;
                 }
                 L::Select { dst, cond, a, b } => {
                     // U64-ness flows through Select exactly as through IntAdd: the
@@ -1226,10 +1208,7 @@ impl LogicalProgram {
                     instrs.push(I::Select { dst, cond, a, b });
                     reg_u64[dst as usize] = reg_u64[a as usize] || reg_u64[b as usize];
                 }
-                L::LoadNull { dst } => {
-                    instrs.push(I::LoadNull { dst });
-                    reg_u64[dst as usize] = false;
-                }
+                L::LoadNull { dst } => instrs.push(I::LoadNull { dst }),
                 L::BoolAnd { dst, a, b } => instrs.push(I::BoolAnd { dst, a, b }),
                 L::BoolOr { dst, a, b } => instrs.push(I::BoolOr { dst, a, b }),
                 L::BoolNot { dst, a } => instrs.push(I::BoolNot { dst, a }),
@@ -1317,14 +1296,8 @@ impl LogicalProgram {
                 }
                 L::LoadNullStr { dst } => instrs.push(I::LoadNullStr { dst }),
                 L::StrSelect { dst, cond, a, b } => instrs.push(I::StrSelect { dst, cond, a, b }),
-                L::StrCmp { op, dst, a, b } => {
-                    instrs.push(I::StrCmp { op, dst, a, b });
-                    reg_u64[dst as usize] = false;
-                }
-                L::StrLen { dst, a, chars } => {
-                    instrs.push(I::StrLen { dst, a, chars });
-                    reg_u64[dst as usize] = false;
-                }
+                L::StrCmp { op, dst, a, b } => instrs.push(I::StrCmp { op, dst, a, b }),
+                L::StrLen { dst, a, chars } => instrs.push(I::StrLen { dst, a, chars }),
                 L::StrCase { dst, a, upper } => instrs.push(I::StrCase { dst, a, upper }),
                 L::StrSubstr {
                     dst,
@@ -1375,10 +1348,7 @@ impl LogicalProgram {
                     instrs.push(I::StrToInt { dst, a, fi });
                     reg_u64[dst as usize] = fi == FixedInt::U64;
                 }
-                L::StrToFloat { dst, a } => {
-                    instrs.push(I::StrToFloat { dst, a });
-                    reg_u64[dst as usize] = false;
-                }
+                L::StrToFloat { dst, a } => instrs.push(I::StrToFloat { dst, a }),
                 L::Emit { src, out } => instrs.push(if (str_class >> src) & 1 != 0 {
                     I::EmitStr { src, out }
                 } else {
@@ -1511,40 +1481,17 @@ impl LogicalProgram {
             let u = reg_use(instr);
             if let Some((dst, _)) = u.dst {
                 check_reg(dst, num_regs)?;
+                // No opcode may write a register it reads: `split_windows`
+                // hands out a `&mut` window at `dst` beside shared windows at
+                // the sources.
+                if let Some(&(reg, _)) = u.reads.iter().flatten().find(|&&(r, _)| r == dst) {
+                    return Err(E::RegisterAliasing { dst, reg });
+                }
             }
             for &(reg, _) in u.reads.iter().flatten() {
                 check_reg(reg, num_regs)?;
             }
             match *instr {
-                // Binary register ops (the 13 opcodes `reg3` splits): SSA
-                // anti-aliasing (dst ≠ a, dst ≠ b).
-                L::IntAdd { dst, a, b }
-                | L::IntSub { dst, a, b }
-                | L::IntMul { dst, a, b }
-                | L::IntDiv { dst, a, b }
-                | L::IntMod { dst, a, b }
-                | L::FloatAdd { dst, a, b }
-                | L::FloatSub { dst, a, b }
-                | L::FloatMul { dst, a, b }
-                | L::FloatDiv { dst, a, b }
-                | L::Cmp { dst, a, b, .. }
-                | L::FCmp { dst, a, b, .. }
-                | L::BoolAnd { dst, a, b }
-                | L::BoolOr { dst, a, b }
-                | L::IntMinMax2 { dst, a, b, .. }
-                | L::FloatMinMax2 { dst, a, b, .. }
-                | L::StrCmp { dst, a, b, .. }
-                | L::StrConcat { dst, a, b, .. } => {
-                    if dst == a || dst == b {
-                        return Err(E::RegisterAliasing { dst, a, b });
-                    }
-                }
-                // Ternary select (`reg4`'s raw split): dst distinct from every source.
-                L::Select { dst, cond, a, b } | L::StrSelect { dst, cond, a, b } => {
-                    if dst == cond || dst == a || dst == b {
-                        return Err(E::RegisterAliasing { dst, a, b });
-                    }
-                }
                 // The cast target rides the `a2` word; a forged code must not
                 // reach eval, where it would index a bounds table that has no
                 // arm for it.
@@ -1608,26 +1555,8 @@ impl LogicalProgram {
                     }
                     check_const_idx(set_idx, self.const_strings.len())?;
                 }
-                // `dst` is held distinct from all three sources. Single-assignment
-                // already rules out `dst == src` (a string source has a writer,
-                // so a second write to it is `RegRewrite`), but a *scalar* window
-                // bound need never have been written, so that case reaches here.
-                L::StrSubstr {
-                    dst,
-                    src,
-                    start_reg,
-                    len_reg,
-                } => {
-                    if dst == src || dst == start_reg || len_reg == Some(dst) {
-                        return Err(E::RegisterAliasing {
-                            dst,
-                            a: src,
-                            b: len_reg.unwrap_or(start_reg),
-                        });
-                    }
-                }
-                // Register bounds are all these need, and the hoisted check
-                // above has already applied them.
+                // Register bounds and anti-aliasing are all these need, and the
+                // hoisted checks above have already applied them.
                 L::LoadConst { .. }
                 | L::LoadNull { .. }
                 | L::LoadNullStr { .. }
@@ -1640,7 +1569,27 @@ impl LogicalProgram {
                 | L::StrCase { .. }
                 | L::IntToStr { .. }
                 | L::FloatToStr { .. }
-                | L::StrToFloat { .. } => {}
+                | L::StrToFloat { .. }
+                | L::IntAdd { .. }
+                | L::IntSub { .. }
+                | L::IntMul { .. }
+                | L::IntDiv { .. }
+                | L::IntMod { .. }
+                | L::FloatAdd { .. }
+                | L::FloatSub { .. }
+                | L::FloatMul { .. }
+                | L::FloatDiv { .. }
+                | L::Cmp { .. }
+                | L::FCmp { .. }
+                | L::BoolAnd { .. }
+                | L::BoolOr { .. }
+                | L::IntMinMax2 { .. }
+                | L::FloatMinMax2 { .. }
+                | L::StrCmp { .. }
+                | L::StrConcat { .. }
+                | L::Select { .. }
+                | L::StrSelect { .. }
+                | L::StrSubstr { .. } => {}
                 // CopyCol: any (payload or PK) source column, one output payload
                 // slot that can hold it.
                 L::CopyCol { src_col, out } => {
@@ -2000,14 +1949,12 @@ pub(crate) struct ResolvedProgram {
 
 impl ResolvedProgram {
     /// Per instruction per morsel, from the BOOL arms of `eval_batch`.
-    #[inline(always)]
     pub(crate) fn is_bit_only(&self, reg: usize) -> bool {
         (self.bit_only_mask >> reg) & 1 != 0
     }
 
     /// True iff `reg`'s producer must write `bool_bits[reg]`. Per instruction
     /// per morsel, from `maybe_pack_bool_bits`.
-    #[inline(always)]
     pub(crate) fn needs_bool_pack(&self, reg: usize) -> bool {
         (self.bool_pack_mask >> reg) & 1 != 0
     }
@@ -2215,7 +2162,7 @@ fn classify_registers(instrs: &[Instr], result_reg: u32, is_filter: bool) -> Reg
             }
             // No register reads / not bool.
             LoadPayloadInt { .. }
-            | LoadPayloadFloat { .. }
+            | LoadPayloadF32 { .. }
             | LoadPk { .. }
             | LoadConst { .. }
             | LoadNull { .. }
@@ -2246,10 +2193,7 @@ fn classify_registers(instrs: &[Instr], result_reg: u32, is_filter: bool) -> Reg
 /// which the answer means anything (`pi` operands come from it).
 fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool {
     use Instr::*;
-    let nullable_payload = |pi: u8| -> bool {
-        let a = pi as usize;
-        a < schema.num_payload_cols() && schema.col_nullable(schema.payload_col_idx(a))
-    };
+    let nullable_payload = |pi: u8| schema.col_nullable(schema.payload_col_idx(pi as usize));
     for instr in instrs {
         match *instr {
                 // Division/modulo produce NULL on a zero divisor; the three
@@ -2273,7 +2217,7 @@ fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool 
                 StrSubstr { len_reg: Some(_), .. } => return false,
                 // Column reads: null when the underlying column is nullable.
                 LoadPayloadInt { pi, .. }
-                | LoadPayloadFloat { pi, .. }
+                | LoadPayloadF32 { pi, .. }
                 | StrColConst { pi, .. }
                 | LoadColStr { pi, .. }
                     if nullable_payload(pi) =>
@@ -2291,7 +2235,7 @@ fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool 
                 | IntMinMax2 { .. }
                 | FloatMinMax2 { .. }
                 | LoadPayloadInt { .. }
-                | LoadPayloadFloat { .. }
+                | LoadPayloadF32 { .. }
                 | StrColConst { .. }
                 | StrColCol { .. }
                 | LoadPk { .. }

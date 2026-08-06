@@ -11,7 +11,9 @@
 
 use std::cell::RefCell;
 
-use crate::batch::{eval_batch, for_each_null_row, view_bytes, EvalScratch, StrView, MORSEL, NULL_WORDS_PER_REG};
+use crate::batch::{
+    eval_batch, for_each_null_row, pack_truthy, view_bytes, EvalScratch, StrView, MORSEL, NULL_WORDS_PER_REG,
+};
 use crate::{BatchView, ColumnLocator, ExprValidateErr, Instr, LogicalProgram, ResolvedProgram, SchemaFacts};
 
 /// A resolved expression program together with the register file it evaluates
@@ -133,17 +135,13 @@ impl Evaluator {
             let filter_word_base = morsel_start / 64;
             if no_nulls {
                 // `no_nulls` allocates no `bool_bits`, so the verdict is read out
-                // of `regs`. Split borrow, with the register window sliced once so
-                // the inner loop's bound and base pointer hoist out of it.
+                // of `regs`.
                 let EvalScratch { regs, filter_bits, .. } = &mut *scratch;
                 let base_r = result_reg * MORSEL;
-                for (w, chunk) in regs[base_r..base_r + m].chunks(64).enumerate() {
-                    let mut bits = 0u64;
-                    for (i, &v) in chunk.iter().enumerate() {
-                        bits |= ((v != 0) as u64) << i;
-                    }
-                    filter_bits[filter_word_base + w] = bits;
-                }
+                pack_truthy(
+                    &regs[base_r..base_r + m],
+                    &mut filter_bits[filter_word_base..filter_word_base + m.div_ceil(64)],
+                );
             } else {
                 // Word-level merge: filter bit = truthy & !null.
                 let base = result_reg * NULL_WORDS_PER_REG;
@@ -278,6 +276,18 @@ impl MorselOut<'_> {
         &self.regs[base..base + self.m]
     }
 
+    /// The same values as their little-endian byte image, 8 bytes per row —
+    /// what an 8-byte EMIT slot stores. `check_emit_slot` holds every EMIT
+    /// destination to such a slot, so a caller can blit this straight into one.
+    #[inline(always)]
+    pub fn reg_bytes(&self, reg: usize) -> &[u8] {
+        let regs = self.reg_values(reg);
+        // SAFETY: `i64` has no padding and no invalid bit patterns, and the
+        // crate is little-endian only, so the slice's byte image *is* its
+        // `to_le_bytes()` sequence. `u8` is 1-aligned.
+        unsafe { std::slice::from_raw_parts(regs.as_ptr().cast::<u8>(), regs.len() * 8) }
+    }
+
     /// String register `reg`'s bytes for row `i` of this morsel.
     ///
     /// Unlike [`Self::reg_values`], which returns a slice already cut to `m`,
@@ -304,7 +314,6 @@ impl MorselOut<'_> {
 /// Read register `r`'s value after an m=1 [`eval_batch`]. On the nullable arm a
 /// bit_only register is never unpacked into `regs`, so its truth value lives at
 /// bit 0 of `bool_bits` instead.
-#[inline(always)]
 pub(crate) fn read_reg_row0(prog: &ResolvedProgram, scratch: &EvalScratch, r: usize) -> i64 {
     if !prog.no_nulls && prog.is_bit_only(r) {
         i64::from((scratch.bool_bits[r * NULL_WORDS_PER_REG] & 1) != 0)
@@ -313,33 +322,43 @@ pub(crate) fn read_reg_row0(prog: &ResolvedProgram, scratch: &EvalScratch, r: us
     }
 }
 
-/// Walk `bits` and call `append_range(start, end)` for every maximal run of
-/// set bits. Fast paths: skip all-zero words; emit a whole-word run for
-/// all-ones words. The mixed case bit-scans the word.
+/// Call `append_range(start, end)` for every maximal run of set bits. Steps run
+/// to run, so a word costs one step per run in it rather than 64.
+///
+/// Needs no clamp against `n`: both `filter` arms leave bits past `n` clear.
 fn scan_filter_bits<F: FnMut(usize, usize)>(bits: &[u64], n: usize, append_range: &mut F) {
-    let mut range_start: Option<usize> = None;
+    let mut open: Option<usize> = None;
     for (w, &word) in bits.iter().enumerate() {
         let row_base = w * 64;
-        let chunk = (row_base + 64).min(n) - row_base;
-
+        // An empty word ends any run carried in from the previous one. The loop
+        // below never runs here, so it cannot do this itself.
         if word == 0 {
-            if let Some(s) = range_start.take() {
+            if let Some(s) = open.take() {
                 append_range(s, row_base);
             }
-        } else if word == u64::MAX || (chunk < 64 && word == (1u64 << chunk) - 1) {
-            range_start.get_or_insert(row_base);
-        } else {
-            for i in 0..chunk {
-                let abs = row_base + i;
-                if (word >> i) & 1 != 0 {
-                    range_start.get_or_insert(abs);
-                } else if let Some(s) = range_start.take() {
-                    append_range(s, abs);
+            continue;
+        }
+        let (mut rest, mut pos) = (word, 0usize);
+        while rest != 0 {
+            let zeros = rest.trailing_zeros() as usize;
+            if zeros != 0 {
+                if let Some(s) = open.take() {
+                    append_range(s, row_base + pos);
                 }
+                pos += zeros;
+                rest >>= zeros;
+            }
+            let ones = rest.trailing_ones() as usize;
+            open.get_or_insert(row_base + pos);
+            pos += ones;
+            rest = rest.checked_shr(ones as u32).unwrap_or(0);
+            // A run reaching the word's top may continue into the next word.
+            if pos < 64 {
+                append_range(open.take().expect("run just opened"), row_base + pos);
             }
         }
     }
-    if let Some(s) = range_start {
+    if let Some(s) = open {
         append_range(s, n);
     }
 }

@@ -1704,7 +1704,7 @@ fn test_from_wire_rejects_register_aliasing() {
     // IntAdd dst0 a0 b1: dst aliases a source — breaks reg3's split borrows.
     assert_eq!(
         wire_err(LogicalProgram::from_wire(&[4, 0, 0, 1], 2, 0, vec![])),
-        ExprValidateErr::RegisterAliasing { dst: 0, a: 0, b: 1 }
+        ExprValidateErr::RegisterAliasing { dst: 0, reg: 0 }
     );
 }
 

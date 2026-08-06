@@ -154,6 +154,20 @@ fn filter_range_case(schema: TestSchema) {
     let mut count = 0;
     ev.filter(&none, n, |_, _| count += 1);
     assert_eq!(count, 0);
+
+    // A run ending exactly on a 64-bit word boundary, with the next word all
+    // zero: the run has to be closed at the boundary by the empty word itself,
+    // since a bitmap walk driven off the set bits never visits it.
+    let boundary = make_n_col_view(&schema, n, |row, _| i64::from(row < 64), |_, _| false);
+    let mut ranges = Vec::new();
+    ev.filter(&boundary, n, |start, end| ranges.push((start, end)));
+    assert_eq!(ranges, vec![(0, 64)]);
+
+    // The same, two words on: the gap word is interior rather than trailing.
+    let gap = make_n_col_view(&schema, n, |row, _| i64::from(!(64..192).contains(&row)), |_, _| false);
+    let mut ranges = Vec::new();
+    ev.filter(&gap, n, |start, end| ranges.push((start, end)));
+    assert_eq!(ranges, vec![(0, 64), (192, n)]);
 }
 
 #[test]
@@ -722,4 +736,88 @@ fn str_const_filter_bench() {
             "str_const_filter {name}: {n} rows, best of {PASSES} passes = {best:?} = {mrps:.1} M rows/s (hits={hits})"
         );
     }
+}
+
+/// Retired-instruction harness for the filter kernels. Prints nothing useful on
+/// its own: run it at two pass counts and difference them, so batch setup and
+/// process start cancel out. Wall-clock on these machines is far noisier than
+/// the effects being measured, so it is never reported.
+///
+///   for p in 1 501; do GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
+///     cargo test -p gnitz-expr --release filter_kernel_bench -- --ignored --nocapture; done
+#[test]
+#[ignore]
+fn filter_kernel_bench() {
+    let passes: usize = std::env::var("GNITZ_BENCH_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let n = 200_000usize;
+
+    // `pk > n/2` — the PK-region load.
+    let pk_schema = schema_pk_ints(1, false);
+    let pk_view = make_n_col_view(&pk_schema, n, |_, _| 1, |_, _| false);
+    let pk_filter = filter_prog(
+        &pk_schema,
+        vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 0 },
+            LogicalInstr::LoadConst {
+                dst: 1,
+                val: (n / 2) as i64,
+            },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+        ],
+        3,
+        2,
+        vec![],
+    );
+
+    // `-a > 0 AND b < 80` over nullable columns — unary, the 3VL AND, and the
+    // per-column null-bit gather.
+    let nn_schema = schema_pk_ints(2, true);
+    let nn_view = make_n_col_view(&nn_schema, n, |row, col| ((row * 7 + col) % 100) as i64, |row, _| {
+        row % 32 == 0
+    });
+    let nn_filter = filter_prog(
+        &nn_schema,
+        vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 },
+            LogicalInstr::IntUnary {
+                op: crate::program::IntUnaryOp::Neg,
+                dst: 1,
+                a: 0,
+            },
+            LogicalInstr::LoadConst { dst: 2, val: 0 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 3,
+                a: 1,
+                b: 2,
+            },
+            LogicalInstr::LoadColInt { dst: 4, col: 2 },
+            LogicalInstr::LoadConst { dst: 5, val: 80 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Lt,
+                dst: 6,
+                a: 4,
+                b: 5,
+            },
+            LogicalInstr::BoolAnd { dst: 7, a: 3, b: 6 },
+        ],
+        8,
+        7,
+        vec![],
+    );
+
+    let mut hits = 0usize;
+    for _ in 0..passes {
+        pk_filter.filter(&pk_view, n, |s, e| hits += e - s);
+        nn_filter.filter(&nn_view, n, |s, e| hits += e - s);
+    }
+    println!("filter_kernel_bench passes={passes} n={n} hits={}", std::hint::black_box(hits));
 }

@@ -23,3 +23,15 @@ lto = true
 
 [profile.dev]
 panic = "unwind"
+
+# The E2E suite runs the debug server, and at opt-level 0 LLVM runs no inliner,
+# so every small per-row helper in the expression kernels stays a real call.
+# Optimizing this one crate lets those kernels be written as ordinary Rust
+# instead of annotating each helper `#[inline(always)]`. `debug-assertions` and
+# `overflow-checks` are independent of `opt-level` and stay on.
+#
+# It does not reach across the crate boundary: `ColumnLocator` and `MorselOut`
+# are called per row from gnitz-engine, which is still opt-level 0, so those
+# methods keep their `#[inline(always)]`.
+[profile.dev.package.gnitz-expr]
+opt-level = 1

@@ -1,25 +1,19 @@
 //! Resolved column addressing: where a logical column physically lives in a
 //! row, and the canonical `u128` keys derived from it.
 //!
-//! Every method here is `#[inline(always)]`, per the crate-root inlining rule —
-//! all seven, not just the one-liners. `native_key`, `route_key` and
-//! `native_le_bytes` do no work of their own either: each is a two-arm match
-//! whose arms are a single `gnitz_wire` call, so a plain `#[inline]` would cost
-//! every per-row caller two frames where one would do.
+//! Every method here is `#[inline(always)]`: the per-row callers live in
+//! gnitz-engine, which builds at opt-level 0 in dev, where only the
+//! always-inline pass runs.
 
 use crate::RowSource;
 
 /// The dense payload-slot byte that means "this column has no payload slot" —
 /// it is a PK column. `u8::MAX`, not 0, so it is unambiguous against a real
-/// payload index of 0, and out of range for every schema (a payload slot is
-/// below `MAX_COLUMNS`), so anything that addresses a column with it trips a
-/// bounds check rather than silently reading slot 0.
+/// payload index of 0, and out of range for every schema, so addressing a
+/// column with it trips a bounds check rather than reading slot 0.
 ///
-/// Two users, both relying on that out-of-range property: the engine schema's
-/// `payload_mapping[ci]` table stores it for a PK column, and `resolve` writes
-/// it into a payload-only opcode whose column operand is a PK — reachable only
-/// for an unvalidated program, i.e. tests, since every constructor validates
-/// first. Neither hands it onward as a *value*: reads go through
+/// Stored by the engine schema's `payload_mapping[ci]` table. It is never
+/// handed on as a *value*: reads go through
 /// [`SchemaFacts::payload_slot`](crate::SchemaFacts::payload_slot), which is
 /// `Option`-shaped.
 pub const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;

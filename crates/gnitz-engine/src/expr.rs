@@ -611,20 +611,9 @@ impl MapPlan {
                     // the null rows.
                     let (col, nb, _) = output.col_null_and_blob_mut(out_payload);
 
-                    // `check_emit_slot` holds every EMIT destination to an
-                    // 8-byte slot, so the morsel's outputs are one contiguous
-                    // window and the whole register image is the little-endian
-                    // encoding EMIT stores — one `copy_from_slice`, no per-row
-                    // bounds check and no per-row NULL branch.
+                    // One blit: the morsel's rows are contiguous in the column.
                     let win = &mut col[row0 * 8..(row0 + m) * 8];
-                    let regs = out.reg_values(reg);
-                    // SAFETY: `i64` has no padding and no invalid bit patterns,
-                    // and `main.rs` fails the build on a non-little-endian
-                    // target, so an i64 slice's byte image *is* its
-                    // `to_le_bytes()` sequence. `u8` is 1-aligned, and the window
-                    // is `m` elements of a slice with exactly `m` left.
-                    let regs_le = unsafe { std::slice::from_raw_parts(regs.as_ptr().cast::<u8>(), m * 8) };
-                    win.copy_from_slice(regs_le);
+                    win.copy_from_slice(out.reg_bytes(reg));
 
                     emit_null_rows(out, reg, win, nb, row0, out_payload, 8);
                 }
