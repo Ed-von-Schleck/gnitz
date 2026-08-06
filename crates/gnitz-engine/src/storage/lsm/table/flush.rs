@@ -83,22 +83,6 @@ impl Table {
         Ok(())
     }
 
-    /// Basename and manifest `max_lsn` for the next shard written from the RAM
-    /// tier (spill or barrier) — the unified `shard_{tid}_{lsn}.db` naming.
-    /// `current_lsn` bumps once per ingest and at most one shard is written per
-    /// ingest, so names are unique for this `Table` object. Directories with
-    /// several writer processes (secondary-index dirs, the workers' inherited
-    /// copies of `_sys` tables) can still collide across processes — tolerable
-    /// today only because `Rederive` state is erased at open and readers pin
-    /// their own mmap'd inodes; reloading such state requires making those
-    /// directories single-writer.
-    fn next_shard_name_and_lsn(&self) -> (String, u64) {
-        (
-            super::super::naming::spill_shard_name(self.table_id, self.current_lsn),
-            self.current_lsn - 1,
-        )
-    }
-
     // ------------------------------------------------------------------
     // Barrier / durable flush (two-phase)
     // ------------------------------------------------------------------
@@ -148,12 +132,7 @@ impl Table {
         // a compacted index so the deferred drain can unlink the superseded
         // inputs, and — on the ephemeral round — re-stamp an unchanged or empty
         // partition at the current generation.
-        let sync_paths = self
-            .shard_index
-            .unsynced_paths()
-            .iter()
-            .map(|p| super::super::cstr(p.as_str()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let sync_paths = super::super::shard_index::to_cstrings(self.shard_index.unsynced_paths())?;
         let manifest_c = super::super::cstr(self.manifest_full_path())?;
         let manifest = self
             .shard_index
@@ -161,18 +140,23 @@ impl Table {
         Ok(FlushOutcome::Pending(FlushWork { sync_paths, manifest }))
     }
 
-    /// Commit the RAM tier's single folded net-state run (left by
-    /// the RAM-tier fold, count > 0) to disk: write it **unsynced** at its
-    /// final `shard_{tid}_{lsn}.db` name, register it in the index, mark it for
-    /// the barrier's by-path fdatasync sweep, and drop it from heap. The shared
-    /// commit point of the spill and barrier paths.
+    /// Commit the RAM tier's single folded net-state run to disk at its final
+    /// `shard_{tid}_{lsn}.db` name, register it, drop it from heap, and compact
+    /// if it pushed the disk tier over its threshold. The shared commit point of
+    /// the spill and barrier paths.
+    ///
+    /// The name is unique for this `Table`: `current_lsn` bumps once per ingest
+    /// and at most one shard is written per ingest. Two *processes* writing one
+    /// directory (secondary-index dirs, the workers' inherited `SalReplay` `_sys`
+    /// copies) can still collide — those directories need a single writer.
     ///
     /// Transactional. The run is borrowed — not removed — so a write failure
     /// leaves heap intact for retry with nothing on disk; a registration
     /// failure unlinks the just-written shard before returning. Heap is cleared
     /// only once the shard is written and registered.
     fn persist_l0_run(&mut self, run: Rc<Batch>) -> Result<(), StorageError> {
-        let (shard_name, lsn_max) = self.next_shard_name_and_lsn();
+        let shard_name = super::super::naming::spill_shard_name(self.table_id, self.current_lsn);
+        let lsn_max = self.current_lsn - 1;
         let name_c = super::super::cstr(shard_name.as_str())?;
 
         let dirfd = self.open_dirfd()?;
@@ -182,28 +166,27 @@ impl Table {
             run.count as u32,
             &run.regions(),
             &self.schema,
-            shard_file::ShardWriteOpts {
-                durable: false,   // unsynced; the barrier sweep fdatasyncs it by path
-                pack_ints: false, // L0 spill/checkpoint shards stay plain (no FoR packing)
-            },
+            // L0 spill/checkpoint shards stay plain (no FoR packing).
+            shard_file::ShardWriteOpts::default(),
         );
         drop(dirfd);
         res?; // Write failed: heap still owns `run`; no on-disk residue.
 
-        // Register with real LSNs so a reopen seeds `current_lsn = max_lsn() + 1`.
+        // Real LSNs, so a reopen seeds `current_lsn = max_lsn() + 1`.
         let final_full = format!("{}/{}", self.directory, shard_name);
-        if let Err(e) = self.shard_index.add_shard(&final_full, lsn_max) {
+        if let Err(e) = self.shard_index.add_unsynced_shard(&final_full, lsn_max) {
             // Registration failed: unlink the shard we wrote, keep heap intact.
             let _ = std::fs::remove_file(&final_full);
             return Err(e);
         }
-        // Unsynced on disk: the next barrier's sweep fdatasyncs it (and the gate's
-        // `has_unsynced` disjunct forces that barrier before any SAL reset).
-        self.shard_index.mark_unsynced(&final_full);
 
         // Commit: the run is on disk and registered — safe to drop from heap.
         self.ram_tier.clear();
-        Ok(())
+
+        // The only path that grows L0, so the only place its fan-in can cross
+        // `L0_COMPACT_THRESHOLD`. Publishes no manifest, so a barrier caller
+        // stages one describing the already-compacted index.
+        self.compact_if_needed()
     }
 
     /// Phase 2: rename the manifest `.tmp` into place and return the per-flush
@@ -229,7 +212,10 @@ impl Table {
     /// cross-flush churn (an insert in flush N against its retraction in N+1)
     /// and can reclaim enough to fall back under the ceiling — in which case
     /// this returns without touching disk. Otherwise commit the folded run
-    /// (`persist_l0_run`), then compact the disk tier.
+    /// (`persist_l0_run`), which also bounds the disk tier: a repeatedly-spilling
+    /// table is read only via the non-compacting `open_cursor`, so without that
+    /// its shards would accumulate unbounded and every cursor would merge them
+    /// all.
     ///
     /// Spills are written **unsynced** and marked in the index's `unsynced` set.
     /// For `SalReplay` the next barrier fdatasyncs them by path before publishing
@@ -253,14 +239,6 @@ impl Table {
         if !self.ram_tier.is_full() {
             return Ok(());
         }
-        self.persist_l0_run(run)?;
-
-        // Bound the spilled disk L0. A repeatedly-spilling table is read only
-        // via the non-compacting `open_cursor`, so without this its shards
-        // accumulate unbounded and every cursor merges them all.
-        // `compact_if_needed` publishes no manifest: it defers cleanup to the
-        // next barrier for SalReplay and drains inline for Rederive.
-        self.compact_if_needed()?;
-        Ok(())
+        self.persist_l0_run(run)
     }
 }

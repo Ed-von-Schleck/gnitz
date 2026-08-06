@@ -610,7 +610,7 @@ fn adv_time_multi(c: &mut ReadCursor, stride: usize, total: usize, gap: usize, t
 }
 
 /// Time a cursor `advance_to` sweep through its non-fast-path (Bench 3): a
-/// `Single`/`Pair` cursor always takes the absolute-reposition path, so an
+/// `Single` cursor always takes the absolute-reposition path, so an
 /// ascending sweep (`ascending`) measures the forward slow path, and a descending
 /// sweep the bounded-backward `[0, hint)` leaf gallop (the range-`Lt` reset shape).
 /// `rewind` between sweeps; cold flushes and times only the sweep.
@@ -840,7 +840,7 @@ fn read_cursor_advance_to_rebuild_bench() {
         for &stride in &ADV_STRIDES {
             let schema = adv_bench_schema(stride);
             let count = tier.bytes() / stride;
-            // Single + backward share one full dense shard; Pair/Multi split the
+            // Single + backward share one full dense shard; Multi splits the
             // same budget across 2/4 interleaved shards.
             let single = adv_build_interleaved_shards(&dir, &schema, &format!("b3s_{}_{stride}", tier.tag()), count, 1);
             let pair = adv_build_interleaved_shards(&dir, &schema, &format!("b3p_{}_{stride}", tier.tag()), count, 2);

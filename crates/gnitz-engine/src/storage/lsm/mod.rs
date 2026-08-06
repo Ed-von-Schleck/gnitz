@@ -40,9 +40,10 @@ use super::repr::{batch, bloom, columnar, heap, layout, merge, scatter, shard_fi
 use super::{cstr, cstr_with_tmp_suffix, error};
 
 /// Slot owning `key` in a sorted guard list: the last guard `≤ key`, saturating
-/// to slot 0 for keys below the first guard. The single routing rule shared by
-/// the compaction writer (`compact::find_guard_for_key`) and the read router
-/// (`FLSMLevel::find_guard_idx`), so writer and reader can never disagree.
+/// to slot 0 for keys below the first guard. The read router
+/// (`FLSMLevel::find_guard_idx`) routes through this; `compact::merge_and_route`
+/// reproduces the same slots by binary-searching its sorted survivor buffer, and
+/// the differential oracles route through here to keep the two independent.
 pub(crate) fn guard_slot<T>(guards: &[T], key: u128, gk: impl Fn(&T) -> u128) -> usize {
     guards.partition_point(|g| gk(g) <= key).saturating_sub(1)
 }

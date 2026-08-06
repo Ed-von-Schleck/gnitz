@@ -1189,12 +1189,12 @@ impl WorkerProcess {
                     .cat()
                     .get_schema_desc(target_id)
                     .ok_or_else(|| format!("no schema for tid={target_id}"))?;
-                let mut ptable = self.cat().get_ptable_handle(target_id);
+                let ptable = self.cat().get_ptable_handle(target_id);
                 // Route on verbatim OPK bytes for every PK width: feeding `get_pk`
                 // (OPK-widened) to `has_pk(u128)` would re-OPK-encode it, a double
                 // sign-flip that misses signed PKs.
                 let result = filter_by_pk_bytes(batch.as_ref(), schema, |pkb, _| {
-                    if ptable.as_mut().is_some_and(|pt| pt.has_pk_bytes(pkb)) {
+                    if ptable.as_ref().is_some_and(|pt| pt.has_pk_bytes(pkb)) {
                         Resolved::ProbeKey
                     } else {
                         Resolved::Absent

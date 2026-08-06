@@ -37,12 +37,12 @@ const INMEM_CEILING: usize = 4 * 1024 * 1024;
 // RecoverySource
 // ---------------------------------------------------------------------------
 
-/// How a relation's tail is recovered across a restart. The single fact that
-/// `Table::new` and the boot rebuild read — they can no longer disagree the
-/// way a positional `durable: bool` let them. This controls recovery, not the
-/// flush path: between checkpoints every table keeps its overflow in the RAM
-/// tier, and the checkpoint barrier folds it into a durable shard only for
-/// `SalReplay` tables.
+/// How a relation's tail is recovered across a restart — the one fact both
+/// `Table::new` and the boot rebuild read, so they cannot disagree.
+///
+/// This controls recovery, not the flush path: between checkpoints every table
+/// keeps its overflow in the RAM tier, and the checkpoint barrier folds it into a
+/// durable shard only for `SalReplay` tables.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecoverySource {
     /// The tail is recovered by replaying the fsynced SAL over the shards loaded
@@ -228,15 +228,12 @@ impl Table {
                 // CREATE VIEW pre-flight, where a first-flush failure would be a
                 // worker abort with no client left to tell.
                 set_nocow_dir(&ensure_dir(dir)?);
-                let manifest_path = super::manifest::path(dir);
-                let cpath = super::super::cstr(manifest_path.clone())?;
-                if super::manifest::peek_generation(&cpath)? == Some(committed) {
-                    true
-                } else {
+                let cpath = super::super::cstr(super::manifest::path(dir))?;
+                let generation_matches = super::manifest::peek_generation(&cpath)? == Some(committed);
+                if !generation_matches {
                     erase_stale_shards(dir, table_id);
-                    let _ = std::fs::remove_file(&manifest_path);
-                    false
                 }
+                generation_matches
             }
         };
 
@@ -354,14 +351,20 @@ impl Table {
     // Cursor
     // ------------------------------------------------------------------
 
-    /// Every run this table reads through, newest tier first: memtable, RAM
-    /// tier, shards. The one enumeration of the read tiers — cursor opens, PK
-    /// probes, and the partitioned gather all walk it, so a tier can never be
-    /// visible to one and invisible to another.
+    /// The heap-resident tiers, newest first. The one enumeration behind every
+    /// walk that spans them — cursor opens, PK probes, row counts — so a tier
+    /// cannot be visible to one and invisible to another. The shard tier is not
+    /// here: each walk reaches it differently (gated binary search for a probe, a
+    /// bare count for the estimate).
+    fn ram_tiers(&self) -> [&RunSet; 2] {
+        [&self.memtable, &self.ram_tier]
+    }
+
+    /// Every run this table reads through, newest tier first.
     pub(crate) fn runs(&self) -> impl Iterator<Item = Run> + '_ {
-        let mem = self.memtable.runs().iter().cloned().map(Run::Mem);
-        let ram = self.ram_tier.runs().iter().cloned().map(Run::Mem);
-        mem.chain(ram)
+        self.ram_tiers()
+            .into_iter()
+            .flat_map(|set| set.runs().iter().cloned().map(Run::Mem))
             .chain(self.shard_index.all_shard_arcs_iter().map(Run::Shard))
     }
 
@@ -392,7 +395,7 @@ impl Table {
     /// are counted; that is an upper bound on what a walk would emit, which is
     /// what the index selectivity gate compares its measured range size against.
     pub(crate) fn estimated_rows(&self) -> usize {
-        self.memtable.row_count() + self.ram_tier.row_count() + self.shard_index.total_rows()
+        self.ram_tiers().iter().map(|s| s.row_count()).sum::<usize>() + self.shard_index.total_rows()
     }
 
     /// Test helper: returns true when the memtable has no rows.
@@ -475,8 +478,11 @@ impl Table {
     /// row parked in the RAM tier between checkpoints is found exactly like a
     /// memtable row.
     fn for_each_pk_candidate(&self, key: &[u8], mut f: impl FnMut(StoredRow)) {
-        for set in [&self.memtable, &self.ram_tier] {
-            if !set.may_contain(key) {
+        // One derivation for every filter this walk consults — both RAM-tier
+        // blooms and each shard's XOR8.
+        let probe_key = super::xor8::probe_key(key);
+        for set in self.ram_tiers() {
+            if !set.may_contain(probe_key) {
                 continue;
             }
             for batch in set.runs() {
@@ -488,7 +494,7 @@ impl Table {
         }
         // The shard index's gated binary search already lands on the first
         // match, so the scan resumes from there rather than re-searching.
-        self.shard_index.find_pk_bytes(key, &mut |shard, start| {
+        self.shard_index.find_pk_bytes(key, probe_key, &mut |shard, start| {
             let count = shard.count;
             for row in pk_match_rows_from(&*shard, count, start, key) {
                 f(StoredRow {
@@ -604,16 +610,15 @@ fn set_nocow_dir(dir_c: &CStr) {
     }
 }
 
+/// Drop a rederived table's on-disk state: this table's shard files (the
+/// grammar includes `table_id`, so a shared directory keeps its other tables)
+/// and its manifest. The manifest goes too, or a later open could accept a
+/// generation whose shards are gone.
+///
+/// Creates nothing, which is what keeps a `Rederive` open dirless.
 fn erase_stale_shards(dir: &str, table_id: u32) {
-    // Remove all shard files belonging to this Rederive table (spill shards
-    // and compaction outputs left by a previous process). The grammar includes
-    // table_id, so only this table's files are touched even when tables share
-    // the same directory.
-    //
-    // In steady state a Rederive table writes no shard files at all — its
-    // flushes land in the RAM tier (heap); files appear only past the
-    // `INMEM_CEILING` spill and its disk compaction.
     super::naming::remove_shard_files(dir, table_id, &std::collections::HashSet::new());
+    let _ = std::fs::remove_file(super::manifest::path(dir));
 }
 
 // ---------------------------------------------------------------------------
@@ -2131,33 +2136,46 @@ mod tests {
             }
         }
 
-        // Arm 3 — compaction pending only (unsynced cleared) gates to Pending with
-        // an empty sweep (compaction outputs are already durable) and no new shard.
+        // Arm 3 — a spill-driven compaction gates to Pending and sweeps its own
+        // outputs: compaction writes them unsynced like any other shard, so the
+        // publish that makes them reachable is what makes them durable.
         {
             let dir = tempfile::tempdir().unwrap();
             let tdir = dir.path().join("gate_pending");
-            let mut t = new_table(&tdir, schema, 7902, 1 << 20, RecoverySource::SalReplay);
-            // Five durable barrier shards → L0 over the compaction threshold, each
-            // barrier clearing `unsynced` on commit.
-            for k in 0..5u64 {
-                t.ingest_owned_batch(make_batch(&[(k, 1, 1)])).unwrap();
-                t.flush().unwrap();
+            let mut t = new_table(&tdir, schema, 7902, 128, RecoverySource::SalReplay);
+            t.set_inmem_ceiling_for_test(100);
+            // Five spills put L0 over the threshold, and the fifth registration
+            // compacts — so the last thing to touch `unsynced` is that compaction.
+            for r in 0..5u64 {
+                let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
+                t.ingest_owned_batch(make_batch(&rows)).unwrap();
+                assert_eq!(t.ram_bytes(), 0, "round {r} spilled");
             }
-            // Force the compaction of those durable shards: pending_deletions set,
-            // unsynced empty, RAM tier empty.
-            t.compact_if_needed().unwrap();
+            assert!(
+                compaction_output_count(&tdir, 7902) > 0,
+                "the spills drove a compaction"
+            );
+
             let shards_before = shard_db_files(&tdir, 7902).len();
             match t.flush_prepare(FlushRound::Base).unwrap() {
-                FlushOutcome::Pending(w) => assert!(
-                    w.sync_paths().is_empty(),
-                    "a compaction-only publish sweeps nothing (outputs already durable)"
-                ),
-                _ => panic!("pending deletions must gate to Pending"),
+                FlushOutcome::Pending(w) => {
+                    let swept: Vec<String> = w
+                        .sync_paths()
+                        .iter()
+                        .map(|c| c.to_string_lossy().into_owned())
+                        .collect();
+                    assert!(!swept.is_empty(), "the compaction outputs must be swept");
+                    assert!(
+                        swept.iter().all(|p| p.contains("_L")),
+                        "the superseded inputs must have left the sweep list, got {swept:?}",
+                    );
+                }
+                _ => panic!("unsynced compaction outputs must gate to Pending"),
             }
             assert_eq!(
                 shard_db_files(&tdir, 7902).len(),
                 shards_before,
-                "a compaction-only publish writes no new shard"
+                "an empty RAM tier publishes no new shard"
             );
         }
     }

@@ -86,8 +86,12 @@ pub struct ReducePlan {
     pub(crate) all_linear: bool,
     /// GROUP BY is a permutation of the source PK columns.
     pub(crate) group_by_pk: bool,
-    /// Groups are visited in ascending output-PK order, so the `trace_out`
-    /// retraction probe can gallop from the live position.
+    /// Groups are visited in ascending output-PK order. Read only by the
+    /// debug-only strict-ascent assertion in the group walk — the retraction
+    /// probe galloping from its live position needs no flag, because
+    /// `ReadCursor::advance_to` is backward-capable and never slower than an
+    /// absolute seek.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) monotone_out_pk: bool,
     /// Pre-step MIN/MAX accumulators during the group walk for the AVI
     /// probe-skip path (only meaningful with an AVI; a float MIN/MAX always

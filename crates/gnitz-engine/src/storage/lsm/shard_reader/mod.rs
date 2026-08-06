@@ -99,7 +99,7 @@ pub struct MappedShard {
     pub(crate) blob_len: usize,
     /// XOR8 membership filter (loaded from embedded header data).
     xor8_filter: Option<Xor8>,
-    /// Physical byte width of each PK value on disk (8 for U64, 16 for U128/String).
+    /// Encoded OPK width per row: the sum of the PK columns' widths.
     pub(crate) pk_stride: u8,
 }
 
@@ -157,10 +157,7 @@ mod tests {
             count,
             &regions,
             &make_schema_u64_i64(),
-            ShardWriteOpts {
-                pack_ints: pack,
-                ..Default::default()
-            },
+            ShardWriteOpts { pack_ints: pack },
         )
         .unwrap();
         path.to_str().unwrap().to_string()
@@ -1063,10 +1060,7 @@ mod tests {
                 n,
                 &regions,
                 &schema,
-                ShardWriteOpts {
-                    pack_ints: true,
-                    ..Default::default()
-                },
+                ShardWriteOpts { pack_ints: true },
             )
             .unwrap();
             path.to_str().unwrap().to_string()

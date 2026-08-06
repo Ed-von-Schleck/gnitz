@@ -28,10 +28,13 @@ impl ShardIndex {
         level_idx + 1
     }
 
-    pub fn add_shard(&mut self, path: &str, max_lsn: u64) -> Result<(), StorageError> {
+    /// Open `path`, insert it into the sorted L0 tier, and record it for the
+    /// barrier's fdatasync sweep.
+    pub fn add_unsynced_shard(&mut self, path: &str, max_lsn: u64) -> Result<(), StorageError> {
         let entry = ShardEntry::open(path, &self.schema, max_lsn)?;
         self.l0.push(entry);
         self.sort_l0();
+        self.mark_unsynced(path);
         Ok(())
     }
 
@@ -52,10 +55,9 @@ impl ShardIndex {
         self.l0.len() > L0_COMPACT_THRESHOLD
     }
 
-    /// Record a shard file written unsynced (spill or barrier fold) so the next
-    /// barrier fdatasyncs it by path before publishing the manifest that
-    /// references it.
-    pub fn mark_unsynced(&mut self, path: &str) {
+    /// Hold `path` for the next barrier's fdatasync sweep, which must reach it
+    /// before the manifest referencing it is renamed into place.
+    fn mark_unsynced(&mut self, path: &str) {
         self.unsynced.push(path.to_string());
     }
 
@@ -115,18 +117,18 @@ impl ShardIndex {
     #[cfg(test)]
     pub(crate) fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
         let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
-        self.find_pk_bytes(opk.pk_bytes(), visitor);
+        let xor8_key = super::super::xor8::probe_key(opk.pk_bytes());
+        self.find_pk_bytes(opk.pk_bytes(), xor8_key, visitor);
     }
 
     /// Point lookup by OPK `key` bytes — universal across all PK widths. L0 is
     /// scanned (range-rejected per entry); each L1+ level routes by the guard
     /// key `pack_pk_be(key)` (the same order-preserving space `l1_guard_keys`
     /// builds), restoring O(log N) routing for wide PKs too.
-    pub fn find_pk_bytes(&self, key: &[u8], visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
-        // Both are pure functions of `key`, so the sweep derives them once
-        // instead of once per candidate shard.
+    pub fn find_pk_bytes(&self, key: &[u8], xor8_key: u64, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
+        // A pure function of `key`, so the sweep derives it once instead of once
+        // per candidate shard.
         let route_key = crate::schema::key::pack_pk_be(key);
-        let xor8_key = super::super::xor8::probe_key(key);
         for e in &self.l0 {
             if let Some((arc, idx)) = e.probe_pk_bytes(key, xor8_key) {
                 visitor(arc, idx);
@@ -147,9 +149,11 @@ impl ShardIndex {
         self.all_entries().map(|e| e.max_lsn).max().unwrap_or(0)
     }
 
-    pub(super) fn ensure_level(&mut self, level_num: usize) {
-        let idx = level_num - 1;
-        while self.levels.len() <= idx {
+    /// Grow `levels` so `level_idx` is addressable. Indexed from 0; the 1-based
+    /// level *number* lives only at the two serde boundaries that carry it (the
+    /// shard filename and the manifest `level` field).
+    pub(super) fn ensure_level(&mut self, level_idx: usize) {
+        while self.levels.len() <= level_idx {
             self.levels.push(FLSMLevel::new());
         }
     }
@@ -180,6 +184,19 @@ impl ShardIndex {
             }
         }
         Ok(opened)
+    }
+
+    /// Filenames of `entries` plus their LSN watermark. One derivation, because
+    /// `Table::new` seeds `current_lsn = max_lsn() + 1`: a watermark below an
+    /// input's would let a later spill reuse a live shard's name.
+    fn compaction_inputs<'a>(entries: impl IntoIterator<Item = &'a ShardEntry>) -> (Vec<String>, u64) {
+        let mut files = Vec::new();
+        let mut max_lsn = 0u64;
+        for e in entries {
+            files.push(e.filename.clone());
+            max_lsn = max_lsn.max(e.max_lsn);
+        }
+        (files, max_lsn)
     }
 
     /// The one compaction driver: merge `inputs` into `dest_idx`, routed across
@@ -213,16 +230,18 @@ impl ShardIndex {
 
         self.supersede_files(inputs);
         drop_sources(self);
-        self.ensure_level(dest_idx + 1);
+        self.ensure_level(dest_idx);
         for (gk, entry) in opened {
+            // A crash before the sweep leaves the last-published manifest on the
+            // still-present inputs, so an unswept output is only ever an orphan.
+            self.mark_unsynced(&entry.filename);
             self.levels[dest_idx].get_or_create_guard(gk).entries.push(entry);
         }
         Ok(())
     }
 
     pub fn run_compact(&mut self) -> Result<(), StorageError> {
-        let inputs: Vec<String> = self.l0.iter().map(|e| e.filename.clone()).collect();
-        let max_lsn = self.l0.iter().map(|e| e.max_lsn).max().unwrap_or(0);
+        let (inputs, max_lsn) = Self::compaction_inputs(&self.l0);
         let guard_keys = self.l1_guard_keys();
         self.compact_into(inputs, max_lsn, &guard_keys, 0, |s| s.l0.clear())?;
 
@@ -272,7 +291,7 @@ impl ShardIndex {
     /// The deepest guarded level folds each guard to a single file; shallower
     /// ones keep the wider fan-in.
     fn guard_threshold(level_idx: usize) -> usize {
-        if Self::level_num(level_idx) == FLSM_LEVELS {
+        if level_idx + 1 == FLSM_LEVELS {
             LMAX_FILE_THRESHOLD
         } else {
             GUARD_FILE_THRESHOLD
@@ -306,8 +325,7 @@ impl ShardIndex {
     fn compact_one_guard(&mut self, level_idx: usize, guard_idx: usize) -> Result<(), StorageError> {
         let guard = &self.levels[level_idx].guards[guard_idx];
         let guard_key = guard.guard_key;
-        let max_lsn = guard.entries.iter().map(|e| e.max_lsn).max().unwrap_or(0);
-        let inputs: Vec<String> = guard.entries.iter().map(|e| e.filename.clone()).collect();
+        let (inputs, max_lsn) = Self::compaction_inputs(&guard.entries);
 
         self.compact_into(inputs, max_lsn, &[guard_key], level_idx, |s| {
             s.levels[level_idx].guards[guard_idx].entries.clear();
@@ -321,10 +339,9 @@ impl ShardIndex {
     pub(super) fn compact_guard_vertical(&mut self) -> Result<(), StorageError> {
         const SRC_IDX: usize = 0; // L1
         const DEST_IDX: usize = 1; // L2
-        let src_idx = SRC_IDX;
 
         let worst_idx = {
-            let src = &self.levels[src_idx];
+            let src = &self.levels[SRC_IDX];
             let mut worst = None;
             let mut worst_count = 0;
             for (i, g) in src.guards.iter().enumerate() {
@@ -339,56 +356,44 @@ impl ShardIndex {
             }
         };
 
-        let src_guard_key = self.levels[src_idx].guards[worst_idx].guard_key;
-        let src_max_bound = if worst_idx + 1 < self.levels[src_idx].guards.len() {
-            self.levels[src_idx].guards[worst_idx + 1].guard_key.saturating_sub(1)
+        let src_guard_key = self.levels[SRC_IDX].guards[worst_idx].guard_key;
+        let src_max_bound = if worst_idx + 1 < self.levels[SRC_IDX].guards.len() {
+            self.levels[SRC_IDX].guards[worst_idx + 1].guard_key.saturating_sub(1)
         } else {
             u128::MAX
         };
 
-        let dest_idx = DEST_IDX;
-        self.ensure_level(DEST_IDX + 1);
+        self.ensure_level(DEST_IDX);
 
-        let mut all_input_files: Vec<String> = self.levels[src_idx].guards[worst_idx]
-            .entries
-            .iter()
-            .map(|e| e.filename.clone())
-            .collect();
-
-        let dest_range = self.levels[dest_idx].find_guards_for_range(src_guard_key, src_max_bound);
-        let mut vert_max_lsn = self.levels[src_idx].guards[worst_idx]
-            .entries
-            .iter()
-            .map(|e| e.max_lsn)
-            .max()
-            .unwrap_or(0);
-
-        for dg in &self.levels[dest_idx].guards[dest_range.clone()] {
-            for e in &dg.entries {
-                all_input_files.push(e.filename.clone());
-                if e.max_lsn > vert_max_lsn {
-                    vert_max_lsn = e.max_lsn;
-                }
-            }
-        }
+        let dest_range = self.levels[DEST_IDX].find_guards_for_range(src_guard_key, src_max_bound);
+        // The source guard's files followed by every overlapping destination
+        // guard's, in one pass. Input order does not affect the merge — it orders
+        // by (PK, payload) and sums the weights of equal rows.
+        let (all_input_files, vert_max_lsn) = Self::compaction_inputs(
+            self.levels[SRC_IDX].guards[worst_idx].entries.iter().chain(
+                self.levels[DEST_IDX].guards[dest_range.clone()]
+                    .iter()
+                    .flat_map(|g| g.entries.iter()),
+            ),
+        );
 
         // No overlapping destination guard yet: the source guard's own key seeds
         // one, so the folded rows keep a slot to route to.
         let guard_keys: Vec<u128> = if dest_range.is_empty() {
             vec![src_guard_key]
         } else {
-            self.levels[dest_idx].guards[dest_range.clone()]
+            self.levels[DEST_IDX].guards[dest_range.clone()]
                 .iter()
                 .map(|g| g.guard_key)
                 .collect()
         };
 
-        self.compact_into(all_input_files, vert_max_lsn, &guard_keys, dest_idx, |s| {
-            s.levels[src_idx].guards.remove(worst_idx);
-            s.levels[dest_idx].guards.drain(dest_range);
+        self.compact_into(all_input_files, vert_max_lsn, &guard_keys, DEST_IDX, |s| {
+            s.levels[SRC_IDX].guards.remove(worst_idx);
+            s.levels[DEST_IDX].guards.drain(dest_range);
         })?;
 
-        self.compact_overfull_guards(dest_idx, Self::guard_threshold(dest_idx))
+        self.compact_overfull_guards(DEST_IDX, Self::guard_threshold(DEST_IDX))
     }
 
     pub fn try_cleanup(&mut self) -> usize {

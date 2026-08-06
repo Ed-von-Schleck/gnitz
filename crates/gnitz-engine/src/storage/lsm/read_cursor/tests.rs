@@ -819,7 +819,7 @@ fn copy_current_row_into_invalid_is_noop() {
     assert_eq!(out.count, 0, "invalid cursor copy must not write a row");
 }
 
-// -- Phase A: for_each_pk_group_row ------------------------------------
+// -- PK-group iteration -------------------------------------------------
 
 /// `for_each_pk_group_row` visits one entry per non-ghost (PK, payload)
 /// sub-group with `current_*` committed (the callback reads columns/weight),
@@ -843,7 +843,7 @@ fn for_each_pk_group_row_visits_subgroups_and_exits_clean() {
     assert_eq!(c.current_weight, 1);
 }
 
-// -- Phase C: Pair (k=2) bypass ≡ Multi --------------------------------
+// -- Two-source cursors -------------------------------------------------
 
 /// Write `rows` (each `(pk, weight, val)`) to a freshly-streamed
 /// `(unsigned PK | I64 payload)` shard. `rows` must be PK-ascending.
@@ -891,7 +891,7 @@ pub(super) fn write_test_shard(
 /// A `Multi` merge over several *shard* sources folds cross-source weights:
 /// PK 1 (shards A+C) and PK 7 (A+B) repeat with identical payloads, so each
 /// must emit once at the summed weight. The batch-source equivalent
-/// (`pair_equiv_multi`) does not reach the shard path.
+/// two-source coverage above does not reach the shard path.
 #[test]
 fn multi_shard_merge_folds_cross_source_weights() {
     crate::foundation::posix_io::raise_fd_limit_for_tests();
@@ -1088,7 +1088,7 @@ fn expect_rows(lo: u64, hi: u64) -> Vec<(u64, i64, i64)> {
 
 /// The mode tracks which sources are live, at every count the dispatch
 /// distinguishes, and never destroys a source to get there: a bounded or unbounded
-/// seek collapses `Multi` down to `Pair`/`Single`/`Empty`, while `rewind` and a
+/// seek collapses `Multi` down to `Single`/`Empty`, while `rewind` and a
 /// backward `advance_to` re-liven what a range seek emptied. The from-scratch
 /// oracle at the end pins the landing row and its weight across the whole
 /// collapse, which the mode assertions alone do not.

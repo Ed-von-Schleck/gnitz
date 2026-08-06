@@ -113,6 +113,7 @@ impl RunSet {
     #[cfg(test)]
     pub(super) fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
+        self.bloom.take(); // its key capacity was sized from the old budget
     }
 
     pub(super) fn row_count(&self) -> usize {
@@ -158,10 +159,10 @@ impl RunSet {
         self.runs.first().map(Rc::clone)
     }
 
-    /// Bloom probe for a PK by its OPK bytes, keyed identically to the insert
-    /// side, so it never produces a false negative at any PK width. The first
+    /// Bloom probe for a PK by its [`xor8::probe_key`] — derived by the caller,
+    /// which probes both RAM tiers and every shard with the same key. The first
     /// probe builds the filter from all live runs.
-    pub(super) fn may_contain(&self, opk_key: &[u8]) -> bool {
+    pub(super) fn may_contain(&self, probe_key: u64) -> bool {
         let bloom = self.bloom.get_or_init(|| {
             // Sized to the budget's row capacity, NOT to the row count at first
             // probe — a filter sized to first-probe contents would over-saturate
@@ -172,7 +173,7 @@ impl RunSet {
             }
             bloom
         });
-        bloom.may_contain(xor8::probe_key(opk_key))
+        bloom.may_contain(probe_key)
     }
 }
 
@@ -218,6 +219,12 @@ mod tests {
 
     fn push(set: &mut RunSet, schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) {
         set.push(Rc::new(make_batch(schema, rows)), schema);
+    }
+
+    /// Probe by a narrow PK, deriving the filter key the way the production walk
+    /// does so no assertion spells a second version of it.
+    fn probes(set: &RunSet, pk: u64) -> bool {
+        set.may_contain(xor8::probe_key(&pk.to_be_bytes()))
     }
 
     #[test]
@@ -292,16 +299,16 @@ mod tests {
         let mut set = RunSet::new(1 << 20);
         push(&mut set, &schema, &[(10, 1, 100), (20, 1, 200)]);
 
-        assert!(set.may_contain(&10u64.to_be_bytes()), "first probe builds the filter");
-        assert!(set.may_contain(&20u64.to_be_bytes()));
+        assert!(probes(&set, 10), "first probe builds the filter");
+        assert!(probes(&set, 20));
 
         // Maintained incrementally once built.
         push(&mut set, &schema, &[(30, 1, 300)]);
-        assert!(set.may_contain(&30u64.to_be_bytes()));
+        assert!(probes(&set, 30));
 
         set.fold(&schema);
         for pk in [10u64, 20, 30] {
-            assert!(set.may_contain(&pk.to_be_bytes()), "PK {pk} after fold");
+            assert!(probes(&set, pk), "PK {pk} after fold");
         }
     }
 

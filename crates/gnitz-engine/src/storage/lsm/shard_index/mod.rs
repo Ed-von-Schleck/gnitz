@@ -28,7 +28,9 @@ const GUARD_FILE_THRESHOLD: usize = 4;
 const LMAX_FILE_THRESHOLD: usize = 1;
 const L1_TARGET_FILES: usize = 16;
 
-fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, StorageError> {
+/// Path strings as `CString`s — the compaction input list and the barrier's
+/// by-path fdatasync sweep list take the same conversion.
+pub(super) fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, StorageError> {
     strings.iter().map(|f| super::super::cstr(f.as_str())).collect()
 }
 
@@ -149,12 +151,11 @@ pub struct ShardIndex {
 
     compact_seq: u64,
     pending_deletions: Vec<String>,
-    /// Full paths of shard files written unsynced since the last manifest
-    /// publish — spills (`durable = false`) and the barrier's own folded shard.
-    /// The barrier fdatasyncs exactly this set by path before renaming the new
-    /// manifest, then `clear_unsynced` empties it; a compaction that supersedes
-    /// an unpublished spill prunes it here (`run_compact`). Clean files from
-    /// prior barriers are already durable and never re-synced.
+    /// Full paths of every shard written since the last manifest publish: spills,
+    /// the barrier's own folded shard, and compaction outputs. The barrier
+    /// fdatasyncs exactly this set by path before renaming the new manifest, then
+    /// `clear_unsynced` empties it; a compaction prunes the inputs it consumed.
+    /// Files from prior barriers are already durable and never re-synced.
     unsynced: Vec<String>,
 }
 
@@ -318,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_shard_and_find_pk() {
+    fn test_add_unsynced_shard_and_find_pk() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
@@ -327,8 +328,8 @@ mod tests {
         let path1 = write_test_shard(dir.path(), "s1.db", &[10, 20, 30], &[100, 200, 300]);
         let path2 = write_test_shard(dir.path(), "s2.db", &[25, 35, 40], &[250, 350, 400]);
 
-        idx.add_shard(&path1, 10).unwrap();
-        idx.add_shard(&path2, 20).unwrap();
+        idx.add_unsynced_shard(&path1, 10).unwrap();
+        idx.add_unsynced_shard(&path2, 20).unwrap();
 
         // Find existing keys
         let mut hits = Vec::new();
@@ -357,7 +358,7 @@ mod tests {
             let name = format!("s{i}.db");
             let pk = i * 10 + 1;
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 100]);
-            idx.add_shard(&path, i + 1).unwrap();
+            idx.add_unsynced_shard(&path, i + 1).unwrap();
         }
         idx.run_compact().unwrap();
 
@@ -401,7 +402,7 @@ mod tests {
             let name = format!("s{i}.db");
             let pk = (i + 1) * 10;
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64]);
-            idx.add_shard(&path, i + 1).unwrap();
+            idx.add_unsynced_shard(&path, i + 1).unwrap();
             all_pks.push(pk);
         }
 
@@ -430,7 +431,7 @@ mod tests {
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // Manually populate L1 with > GUARD_FILE_THRESHOLD entries in one guard
-        idx.ensure_level(1);
+        idx.ensure_level(0); // L1
         let guard = idx.levels[0].get_or_create_guard(0);
         let mut all_pks = Vec::new();
         for i in 0..6u64 {
@@ -462,7 +463,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
-        idx.ensure_level(1);
+        idx.ensure_level(0); // L1
 
         // Build a guard at key 0 with 3 entries.
         for i in 0..3u64 {
@@ -516,7 +517,7 @@ mod tests {
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // L1 already has a guard at key 100 (keys 100, 200).
-        idx.ensure_level(1);
+        idx.ensure_level(0); // L1
         let path = write_test_shard(dir.path(), "l1_g100.db", &[100, 200], &[1000, 2000]);
         let entry = ShardEntry::open(&path, &schema, 1).unwrap();
         idx.levels[0].get_or_create_guard(100).entries.push(entry);
@@ -526,7 +527,7 @@ mod tests {
         for (i, &k) in low_keys.iter().enumerate() {
             let name = format!("l0_{i}.db");
             let p = write_test_shard(dir.path(), &name, &[k], &[k as i64 * 10]);
-            idx.add_shard(&p, (i + 2) as u64).unwrap();
+            idx.add_unsynced_shard(&p, (i + 2) as u64).unwrap();
         }
         assert!(idx.should_compact());
         idx.run_compact().unwrap();
@@ -594,41 +595,40 @@ mod tests {
         assert!(!std::path::Path::new(&path2).exists());
     }
 
-    /// The `unsynced` set: `mark_unsynced` records spill/barrier shards, a
-    /// compaction prunes the inputs it consumes (they move to `pending_deletions`
-    /// and no longer need a barrier sweep), and `clear_unsynced` empties the rest.
+    /// Every shard the index registers is unsynced until a barrier sweeps it:
+    /// spills on the way in, compaction outputs on the way out, and the inputs a
+    /// compaction consumed drop out (they move to `pending_deletions`).
     #[test]
-    fn test_unsynced_tracking_mark_prune_clear() {
+    fn test_unsynced_tracking_register_prune_clear() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         assert!(!idx.has_unsynced());
+        let mut spills = Vec::new();
         for i in 0..5u64 {
             let pk = (i + 1) * 10;
             let p = write_test_shard(dir.path(), &format!("shard_42_{i}.db"), &[pk], &[pk as i64]);
-            idx.add_shard(&p, i + 1).unwrap();
-            idx.mark_unsynced(&p);
+            idx.add_unsynced_shard(&p, i + 1).unwrap();
+            spills.push(p);
         }
-        assert!(idx.has_unsynced());
-        assert_eq!(idx.unsynced_paths().len(), 5);
+        assert_eq!(idx.unsynced_paths().len(), 5, "registration marks, on its own");
 
-        // Compaction folds L0 into L1: every consumed input is pruned from
-        // `unsynced` and queued in `pending_deletions`.
         assert!(idx.should_compact());
         idx.run_compact().unwrap();
         assert!(idx.has_pending_deletions(), "compacted inputs queued for deletion");
+        for p in &spills {
+            assert!(
+                !idx.unsynced_paths().contains(p),
+                "consumed input {p} must leave the unsynced set"
+            );
+        }
         assert!(
-            !idx.has_unsynced(),
-            "every compacted L0 spill must be pruned from the unsynced set"
+            idx.has_unsynced(),
+            "the compaction outputs are themselves unsynced until a barrier sweeps them"
         );
 
-        // clear_unsynced empties whatever a later spill marked.
-        let p = write_test_shard(dir.path(), "shard_42_late.db", &[999], &[9990]);
-        idx.add_shard(&p, 9).unwrap();
-        idx.mark_unsynced(&p);
-        assert!(idx.has_unsynced());
         idx.clear_unsynced();
         assert!(!idx.has_unsynced());
     }
@@ -643,15 +643,15 @@ mod tests {
         assert_eq!(idx.max_lsn(), 0);
 
         let path1 = write_test_shard(dir.path(), "lsn1.db", &[10], &[100]);
-        idx.add_shard(&path1, 50).unwrap();
+        idx.add_unsynced_shard(&path1, 50).unwrap();
         assert_eq!(idx.max_lsn(), 50);
 
         let path2 = write_test_shard(dir.path(), "lsn2.db", &[20], &[200]);
-        idx.add_shard(&path2, 200).unwrap();
+        idx.add_unsynced_shard(&path2, 200).unwrap();
         assert_eq!(idx.max_lsn(), 200);
 
         let path3 = write_test_shard(dir.path(), "lsn3.db", &[30], &[300]);
-        idx.add_shard(&path3, 75).unwrap();
+        idx.add_unsynced_shard(&path3, 75).unwrap();
         // max_lsn should still be 200 (from second shard)
         assert_eq!(idx.max_lsn(), 200);
     }
@@ -673,7 +673,7 @@ mod tests {
         for i in 0..5u64 {
             let pk = (i + 1) * 10;
             let path = write_test_shard(dir.path(), &format!("s{i}.db"), &[pk], &[pk as i64]);
-            idx.add_shard(&path, i + 1).unwrap();
+            idx.add_unsynced_shard(&path, i + 1).unwrap();
             all_pks.push(pk);
         }
 
@@ -707,7 +707,7 @@ mod tests {
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
         // Build L1 (levels[0]) and L2 (levels[1])
-        idx.ensure_level(2);
+        idx.ensure_level(1); // L2
 
         // L1 guard at key=100: 5 shards (> GUARD_FILE_THRESHOLD=4) with keys in [100, 199]
         let src_pks: Vec<u64> = vec![100, 120, 140, 160, 180];
@@ -762,7 +762,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
-        idx.ensure_level(2);
+        idx.ensure_level(1); // L2
 
         // Key 250 routes to the gk(100) bucket; 6000 to the gk(5000) bucket.
         // L1 guard gk(100): two entries (keys 100, 110).
@@ -838,7 +838,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
-        idx.ensure_level(2);
+        idx.ensure_level(1); // L2
 
         // L2 guard gk(100) pre-seeded with key 250.
         {
@@ -902,7 +902,7 @@ mod tests {
 
         // Write a live shard and add it to the index.
         let live_path = write_test_shard(dir.path(), "shard_42_1.db", &[10], &[100]);
-        idx.add_shard(&live_path, 1).unwrap();
+        idx.add_unsynced_shard(&live_path, 1).unwrap();
 
         // Drop an orphan shard that the manifest never referenced.
         let orphan_path = dir.path().join("shard_42_99.db");
@@ -1007,9 +1007,9 @@ mod tests {
         // L0 sort orders by pk_min, empty entries last (golden order).
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
         let p_empty = write_test_shard(dir.path(), "empty.db", &[], &[]);
-        idx.add_shard(&p_hi, 1).unwrap();
-        idx.add_shard(&p_lo, 1).unwrap();
-        idx.add_shard(&p_empty, 1).unwrap();
+        idx.add_unsynced_shard(&p_hi, 1).unwrap();
+        idx.add_unsynced_shard(&p_lo, 1).unwrap();
+        idx.add_unsynced_shard(&p_empty, 1).unwrap();
         let order: Vec<bool> = idx.l0.iter().map(|e| e.is_empty()).collect();
         // pk_min holds OPK bytes; widen_pk_be recovers the native U64 value.
         let pk_min_val = |e: &ShardEntry| {

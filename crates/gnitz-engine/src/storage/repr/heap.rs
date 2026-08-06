@@ -195,6 +195,18 @@ impl LoserTree {
         self.tree[0] = self.walk_up(cur, idx, less);
     }
 
+    /// Step the champion to `next_row`, or drop it when its source is exhausted.
+    /// The one spelling of the transition, so no caller has to know that a
+    /// `None` needs `pop_top`'s two-phase sentinel walk rather than
+    /// `replace_top`.
+    #[inline(always)]
+    pub fn step_top(&mut self, next_row: Option<u32>, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
+        match next_row {
+            Some(row) => self.replace_top(row, less),
+            None => self.pop_top(less),
+        }
+    }
+
     /// Remove the champion (its source is exhausted). After return, the
     /// new champion (if any) is at `tree[0]`; otherwise `is_empty()`
     /// returns true.
@@ -269,22 +281,6 @@ pub(crate) fn drive_merge<ADV, SP, EQ, W, EM>(
     W: FnMut(usize, usize) -> i64,
     EM: FnMut(usize, usize, i64) -> std::ops::ControlFlow<()>,
 {
-    // Step the heap root past `(src, row)` into its successor (or pop if
-    // exhausted). Inlined since both call sites share it byte-for-byte.
-    #[inline(always)]
-    fn step(
-        heap: &mut LoserTree,
-        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
-        src: usize,
-        advance: &mut impl FnMut(usize) -> Option<u32>,
-    ) {
-        if let Some(new_row) = advance(src) {
-            heap.replace_top(new_row, less);
-        } else {
-            heap.pop_top(less);
-        }
-    }
-
     loop {
         if heap.is_empty() {
             return;
@@ -300,7 +296,7 @@ pub(crate) fn drive_merge<ADV, SP, EQ, W, EM>(
         // the group exemplar, so the tests would be tautologically true and
         // `eq_payload` walks every payload column (expensive on wide rows).
         let mut net_weight: i64 = weight(group_src, group_row);
-        step(heap, &less, group_src, &mut advance);
+        heap.step_top(advance(group_src), &less);
 
         // Fold tied rows: each iteration peeks the new root, breaks on a PK or
         // payload mismatch, otherwise accumulates weight and steps again. The PK
@@ -316,7 +312,7 @@ pub(crate) fn drive_merge<ADV, SP, EQ, W, EM>(
                 break;
             }
             net_weight += weight(cur_src, cur_row);
-            step(heap, &less, cur_src, &mut advance);
+            heap.step_top(advance(cur_src), &less);
         }
 
         if net_weight != 0 && emit(group_src, group_row, net_weight).is_break() {

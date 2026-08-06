@@ -40,11 +40,7 @@ pub(crate) fn op_partition_filter(batch: &Batch, schema: &SchemaDescriptor, work
             indices.push(i as u32);
         }
     }
-    let mut out = Batch::from_indexed_rows(&mb, &indices, &[], schema);
-    // Filtering keeps the ascending row order and (PK, payload) distinctness of
-    // the input, so the layout carries through unchanged (faithful propagate).
-    out.inherit_layout(batch);
-    out
+    batch.ascending_subset(&indices, schema)
 }
 
 /// Which routing key a non-PK scatter uses; picks between `ScatterKey::Packed`

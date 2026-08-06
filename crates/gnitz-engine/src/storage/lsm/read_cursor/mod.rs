@@ -211,10 +211,7 @@ impl ReadCursor {
     /// may leave a pessimistic `Multi` behind, which costs `drain_single_source`
     /// its bulk-copy path. Seek with this before a bulk drain.
     pub fn seek_bytes(&mut self, key: &[u8]) {
-        for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
-            state.position = src.find_lower_bound_bytes(key);
-        }
-        self.rebuild_and_drive();
+        self.seek_range_bytes(key, None);
     }
 
     /// Galloping lower-bound seek, seeding each source's search at its own live
@@ -284,11 +281,7 @@ impl ReadCursor {
                 break;
             }
             states[src].position = sources[src].advance_to(key, states[src].position);
-            if states[src].is_valid() {
-                heap.replace_top(states[src].position as u32, less);
-            } else {
-                heap.pop_top(less);
-            }
+            heap.step_top(states[src].is_valid().then_some(states[src].position as u32), less);
         }
     }
 
@@ -410,6 +403,7 @@ impl ReadCursor {
     /// is the correct lower bound for the suffix columns at every type.
     pub fn seek_first_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
         let stride = self.schema.pk_stride() as usize;
+        debug_assert!(prefix.len() <= stride, "prefix is wider than the PK");
         let copy_len = prefix.len().min(stride);
         let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         key[..copy_len].copy_from_slice(&prefix[..copy_len]);
@@ -645,6 +639,7 @@ impl ReadCursor {
 /// Build a ReadCursor over `runs`, skipping empty ones. Each `Run` owns its
 /// backing via `Rc`, so the cursor has no borrow lifetime and callers hand it a
 /// lazy iterator rather than materializing a slice per tier.
+///
 pub(crate) fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor) -> ReadCursor {
     let runs = runs.into_iter();
     let cap = runs.size_hint().0;

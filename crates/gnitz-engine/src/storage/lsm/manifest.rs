@@ -78,17 +78,6 @@ pub struct ManifestEntryRaw {
     pub guard_key: u128,
 }
 
-impl Default for ManifestEntryRaw {
-    fn default() -> Self {
-        Self {
-            max_lsn: 0,
-            filename: [0; 128],
-            level: 0,
-            guard_key: 0,
-        }
-    }
-}
-
 /// The NUL-terminated (or buffer-length) prefix of `buf` as UTF-8, `""` if
 /// the bytes are not valid UTF-8.
 fn cstr_from_buf(buf: &[u8]) -> &str {
@@ -115,11 +104,7 @@ pub struct ManifestHeader {
 
 /// Serialize manifest entries into `out_buf`.
 /// Returns bytes written, or `BufferTooSmall` if `out_buf` cannot fit.
-pub fn serialize(
-    out_buf: &mut [u8],
-    entries: &[ManifestEntryRaw],
-    header: ManifestHeader,
-) -> Result<usize, StorageError> {
+fn serialize(out_buf: &mut [u8], entries: &[ManifestEntryRaw], header: ManifestHeader) -> Result<usize, StorageError> {
     let count = entries.len();
     let total = HEADER_SIZE + count * ENTRY_SIZE;
     if out_buf.len() < total {
@@ -148,31 +133,33 @@ pub fn serialize(
     Ok(total)
 }
 
-/// Parse a manifest buffer into an exact-count entry `Vec` plus the header.
+/// Validate a manifest header and return its counters. The single gate for
+/// magic and version, so a header one reader accepts cannot be rejected by the
+/// other.
 ///
-/// Current version only. There is no on-disk data to migrate in dev and the
-/// test suite is green at session start, so any other version is a hard
-/// `InvalidVersion` — no per-version field gating, no shims.
-pub fn parse(buf: &[u8]) -> Result<(Vec<ManifestEntryRaw>, ManifestHeader), StorageError> {
+/// Current version only. There is no on-disk data to migrate in dev, so any
+/// other version is a hard `InvalidVersion` — no per-version field gating, no
+/// shims.
+fn parse_header(buf: &[u8]) -> Result<ManifestHeader, StorageError> {
     if buf.len() < HEADER_SIZE {
         return Err(StorageError::Truncated);
     }
-
-    let magic = read_u64_le(buf, 0);
-    if magic != MAGIC {
+    if read_u64_le(buf, 0) != MAGIC {
         return Err(StorageError::InvalidMagic);
     }
-
-    let version = read_u64_le(buf, 8);
-    let count = read_u64_le(buf, OFF_ENTRY_COUNT) as usize;
-    let header = ManifestHeader {
-        compact_seq: read_u64_le(buf, OFF_COMPACT_SEQ),
-        generation: read_u64_le(buf, OFF_GENERATION),
-    };
-
-    if version != VERSION {
+    if read_u64_le(buf, 8) != VERSION {
         return Err(StorageError::InvalidVersion);
     }
+    Ok(ManifestHeader {
+        compact_seq: read_u64_le(buf, OFF_COMPACT_SEQ),
+        generation: read_u64_le(buf, OFF_GENERATION),
+    })
+}
+
+/// Parse a manifest buffer into an exact-count entry `Vec` plus the header.
+fn parse(buf: &[u8]) -> Result<(Vec<ManifestEntryRaw>, ManifestHeader), StorageError> {
+    let header = parse_header(buf)?;
+    let count = read_u64_le(buf, OFF_ENTRY_COUNT) as usize;
 
     let body = count.checked_mul(ENTRY_SIZE).ok_or(StorageError::Truncated)?;
     let expected_data = HEADER_SIZE.checked_add(body).ok_or(StorageError::Truncated)?;
@@ -308,25 +295,19 @@ pub fn tmp_path(dir: &str) -> String {
     format!("{}.tmp", path(dir))
 }
 
-/// Read just the checkpoint generation from a manifest file's validated header.
-/// `Ok(None)` when the file does not exist yet, `Err(_)` when it is truncated or
-/// not a manifest. Used by the conditional view-state reload: a
-/// `RederiveCheckpointed` table loads its shards only when its manifest
-/// generation equals the committed checkpoint generation, and erases them
-/// otherwise.
+/// The checkpoint generation from a manifest file's header, reading only the
+/// header. `Ok(None)` when the file does not exist yet (never checkpointed).
+///
+/// Validates through the same [`parse_header`] the full read uses, so a manifest
+/// this accepts cannot then be rejected by `parse` — which would turn a view
+/// rebuild into a hard open failure.
 pub fn peek_generation(path: &std::ffi::CStr) -> Result<Option<u64>, StorageError> {
     let Some(fd) = open_owned(path, libc::O_RDONLY) else {
         return Ok(None);
     };
     let mut hdr = [0u8; HEADER_SIZE];
     let n = crate::foundation::posix_io::read_all_fd(fd.as_raw_fd(), &mut hdr).unwrap_or(0);
-    if n < HEADER_SIZE {
-        return Err(StorageError::Truncated);
-    }
-    if read_u64_le(&hdr, 0) != MAGIC {
-        return Err(StorageError::InvalidMagic);
-    }
-    Ok(Some(read_u64_le(&hdr, OFF_GENERATION)))
+    parse_header(&hdr[..n]).map(|h| Some(h.generation))
 }
 
 // ---------------------------------------------------------------------------

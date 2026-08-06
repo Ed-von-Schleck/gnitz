@@ -283,13 +283,10 @@ impl CatalogEngine {
     pub fn flush_family(&mut self, table_id: i64) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
             if let Some(table) = self.sys_table_mut(table_id) {
+                // The flush compacts too: publishing a shard is what makes
+                // compaction due, so L0 cannot accumulate across a DDL-heavy
+                // session without the flush that grew it also bounding it.
                 table.flush().map_err(|e| format!("flush error: {e}"))?;
-                // Compact so L0 shards don't accumulate without bound across
-                // DDL-heavy sessions (system catalog tables are scanned on every
-                // boot and DDL op).
-                table
-                    .compact_if_needed()
-                    .map_err(|e| format!("compaction error: {e:?}"))?;
             }
             Ok(())
         } else {

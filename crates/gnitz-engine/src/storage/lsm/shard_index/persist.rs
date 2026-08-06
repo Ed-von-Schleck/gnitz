@@ -78,9 +78,12 @@ impl ShardIndex {
                 if raw.level >= MAX_LEVELS as u64 {
                     return Err(StorageError::InvalidVersion);
                 }
-                let level_num = raw.level as usize;
-                self.ensure_level(level_num);
-                self.levels[level_num - 1]
+                // The manifest carries the 1-based level number; the in-memory
+                // tier is indexed from 0. This is one of the two places that
+                // conversion happens (the other is `entry_to_raw`, writing it).
+                let level_idx = raw.level as usize - 1;
+                self.ensure_level(level_idx);
+                self.levels[level_idx]
                     .get_or_create_guard(raw.guard_key)
                     .entries
                     .push(entry);
@@ -109,8 +112,8 @@ impl ShardIndex {
 
     /// Serialize the current index into a manifest `.tmp`, returning the prepared
     /// manifest (fd + paths) without modifying any index state. The barrier's
-    /// one-shot shard write already registered its shard via `add_shard`, so the
-    /// current index is authoritative — no pending entry to splice in.
+    /// one-shot shard write already registered its shard, so the current index is
+    /// authoritative — no pending entry to splice in.
     ///
     /// `generation` is the checkpoint generation the manifest is stamped with —
     /// passed by the publish path (the worker's ephemeral round supplies the

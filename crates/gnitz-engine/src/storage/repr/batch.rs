@@ -1231,6 +1231,21 @@ impl Batch {
         })
     }
 
+    /// The rows named by a strictly ascending `indices`, inheriting this batch's
+    /// layout: taking rows in source order preserves (PK, payload) ordering and
+    /// leaves weights untouched, so a consolidated source yields a consolidated
+    /// subset. A reordering caller wants
+    /// [`from_indexed_rows`](Self::from_indexed_rows).
+    pub fn ascending_subset(&self, indices: &[u32], schema: &SchemaDescriptor) -> Self {
+        debug_assert!(
+            indices.windows(2).all(|w| w[0] < w[1]),
+            "ascending_subset requires a strictly ascending index list",
+        );
+        let mut out = Self::from_indexed_rows(&self.as_mem_batch(), indices, &[], schema);
+        out.inherit_layout(self);
+        out
+    }
+
     /// Copy every row into `out_schema`, which must extend this batch's schema
     /// with extra trailing payload columns, filling those columns with NULL.
     /// The PK region, weights and existing payload columns carry over verbatim,

@@ -340,13 +340,14 @@ proptest! {
             table.ingest_owned_batch(wave).unwrap();
             table.flush().unwrap();
         }
-        // flush() does not auto-compact, so all 5 shards are live here.
-        prop_assert_eq!(
-            table.all_shard_arcs().len(), WAVES,
-            "expected WAVES live L0 shards (> L0_COMPACT_THRESHOLD == 4)",
-        );
-
-        table.compact_if_needed().unwrap();
+        // Registering the WAVES'th shard crosses `l0.len() > 4`, so the flush
+        // loop itself compacted. A compaction output carries the `_L` level
+        // marker; the count is not fixed (L0 -> L1 emits one shard per guard).
+        let compacted = std::fs::read_dir(dir.path().join("cp")).unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("_L"))
+            .count();
+        prop_assert!(compacted > 0, "WAVES flushes must have driven an L0->L1 compaction");
 
         let expected = zset_of(&original, &schema);
         prop_assert_eq!(&expected, &zset_of(table.full_scan().as_ref(), &schema));

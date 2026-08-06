@@ -61,13 +61,25 @@ impl Routing {
         matches!(self, Routing::Unhashed { .. })
     }
 
-    /// The children this store holds, in `tables` order.
-    pub fn children(self) -> impl Iterator<Item = ChildAddr<'static>> {
-        let (range, addr): (std::ops::Range<u32>, fn(u32) -> ChildAddr<'static>) = match self {
-            Routing::Unhashed { rank } => (rank..rank + 1, ChildAddr::Local),
-            Routing::Hashed { start, end } => (start..end, ChildAddr::Partition),
+    /// `range` addressed in this routing's child grammar. The one place the
+    /// unhashed-`Local` / hashed-`Partition` pairing is spelled;
+    /// `ChildAddr::is_owned_by` must agree with it or a boot sweep reclaims a
+    /// live child.
+    fn span(self, range: std::ops::Range<u32>) -> impl Iterator<Item = ChildAddr<'static>> {
+        let addr: fn(u32) -> ChildAddr<'static> = if self.is_unhashed() {
+            ChildAddr::Local
+        } else {
+            ChildAddr::Partition
         };
         range.map(addr)
+    }
+
+    /// The children this store holds, in `tables` order.
+    pub fn children(self) -> impl Iterator<Item = ChildAddr<'static>> {
+        self.span(match self {
+            Routing::Unhashed { rank } => rank..rank + 1,
+            Routing::Hashed { start, end } => start..end,
+        })
     }
 
     /// Every child this store has across the whole cluster at `num_workers` —
@@ -75,12 +87,11 @@ impl Routing {
     /// boot resume verdict enumerates manifests through this;
     /// [`children`](Self::children) is this process's slice of the same set.
     pub fn cluster_children(self, num_workers: u32) -> impl Iterator<Item = ChildAddr<'static>> {
-        let (range, addr): (std::ops::Range<u32>, fn(u32) -> ChildAddr<'static>) = if self.is_unhashed() {
-            (0..num_workers, ChildAddr::Local)
+        self.span(if self.is_unhashed() {
+            0..num_workers
         } else {
-            (0..NUM_PARTITIONS, ChildAddr::Partition)
-        };
-        range.map(addr)
+            0..NUM_PARTITIONS
+        })
     }
 }
 
@@ -273,8 +284,7 @@ impl PartitionedTable {
                 if rows.is_empty() {
                     continue;
                 }
-                let sub_batch = Batch::from_indexed_rows(&mb, rows, &[], &self.schema);
-                self.tables[local].ingest_owned_batch(sub_batch)?;
+                self.tables[local].ingest_owned_batch(batch.ascending_subset(rows, &self.schema))?;
             }
             Ok(())
         })
@@ -321,7 +331,7 @@ impl PartitionedTable {
     /// the wrong partition. The sole caller is the test-only lone-PK FK existence
     /// check (passes a native value); all DML retraction routes through `_bytes`.
     #[cfg(test)]
-    pub(crate) fn has_pk(&mut self, key: u128) -> bool {
+    pub(crate) fn has_pk(&self, key: u128) -> bool {
         let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
         self.has_pk_bytes(opk.pk_bytes())
     }
@@ -333,7 +343,7 @@ impl PartitionedTable {
     }
 
     /// Byte-keyed sibling of [`has_pk`] for wide (`pk_stride > 16`) PKs.
-    pub fn has_pk_bytes(&mut self, key: &[u8]) -> bool {
+    pub fn has_pk_bytes(&self, key: &[u8]) -> bool {
         self.slot_for_key(key)
             .is_some_and(|local| self.tables[local].has_pk_bytes(key))
     }

@@ -259,11 +259,8 @@ impl MergeProducer {
         };
         let bytes = self.map.as_slice();
         let less = record_less(bytes, &self.run_starts, self.stride);
-        if row + 1 < self.run_lens[src] {
-            self.tree.replace_top(row + 1, &less);
-        } else {
-            self.tree.pop_top(&less);
-        }
+        self.tree
+            .step_top((row + 1 < self.run_lens[src]).then_some(row + 1), &less);
         self.remaining -= 1;
         let off = self.run_starts[src] + row as usize * self.stride;
         Some(&bytes[off..off + self.stride])

@@ -12,7 +12,6 @@ use super::super::error::StorageError;
 use super::batch::{strides_from_schema, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
 use super::xor8;
-use crate::foundation::posix_io::fdatasync_eintr;
 use crate::foundation::xxh;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
@@ -322,29 +321,27 @@ fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
 /// Per-call policy for the shard writers ([`write_shard_streaming`] /
 /// `Batch::write_as_shard`).
 ///
-/// `durable` fdatasyncs the file before the finalizing rename — spills and
-/// barrier folds pass `false` (the barrier's by-path sweep fdatasyncs them and
-/// then fsyncs the table directory), compaction outputs pass `true`.
 /// `pack_ints` enables FoR (`ENCODING_FOR`) on eligible integer payload
 /// regions — set only by compaction; L0 spill/checkpoint writers stay raw.
+///
+/// Durability is not a per-write choice: the flush barrier fdatasyncs every
+/// registered-unsynced shard in one batched io_uring submission, then fsyncs the
+/// table directory the renames landed in.
 #[derive(Clone, Copy, Default)]
 pub struct ShardWriteOpts {
-    pub durable: bool,
     pub pack_ints: bool,
 }
 
 impl ShardWriteOpts {
-    /// The compaction write policy: outputs must survive a crash on their own,
-    /// and their integer payload regions are FoR-packed. The differential-test
-    /// oracles reuse it so they cannot drift from the production write.
-    pub const COMPACTION: Self = Self {
-        durable: true,
-        pack_ints: true,
-    };
+    /// The compaction write policy: FoR-packed integer payload regions. The
+    /// differential-test oracles reuse it so they cannot drift from the
+    /// production write.
+    pub const COMPACTION: Self = Self { pack_ints: true };
 }
 
-/// Write the .tmp shard, then fdatasync (if `opts.durable`), close, and rename
-/// to `basename`. The sole shard writer.
+/// Write the .tmp shard, close, and rename to `basename`. The sole shard writer.
+/// Unsynced — the caller registers the result for the flush barrier's batched
+/// fdatasync sweep (see [`ShardWriteOpts`]).
 pub fn write_shard_streaming(
     dirfd: c_int,
     basename: &CStr,
@@ -354,12 +351,6 @@ pub fn write_shard_streaming(
     opts: ShardWriteOpts,
 ) -> Result<(), StorageError> {
     let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, row_count, regions, schema, opts)?;
-    if opts.durable && fdatasync_eintr(fd.as_raw_fd()).is_err() {
-        unsafe {
-            libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
-        }
-        return Err(StorageError::Io);
-    }
     drop(fd); // Close before the rename, matching the batched two-phase path.
     unsafe {
         if libc::renameat(dirfd, tmp_name.as_ptr(), dirfd, basename.as_ptr()) < 0 {
@@ -367,17 +358,17 @@ pub fn write_shard_streaming(
             return Err(StorageError::Io);
         }
     }
-    // The renamed directory entry is made durable by the flush barrier, which
-    // fsyncs the table directory through a real `O_DIRECTORY` fd after its
-    // renames. This writer cannot do it: `Batch::write_as_shard` — the only
-    // caller that passes `durable` — addresses the file by path from `AT_FDCWD`,
-    // which is not a directory fd to fsync.
+    // Both the file's contents and the renamed directory entry are made durable
+    // by the flush barrier: it fdatasyncs every registered-unsynced file and then
+    // fsyncs the table directory through a real `O_DIRECTORY` fd. This writer
+    // could not fsync the directory anyway — `Batch::write_as_shard` addresses
+    // the file by path from `AT_FDCWD`, which is not a directory fd.
     Ok(())
 }
 
 /// Open .tmp shard, write header+regions+xor8, leave fd open and unsynced.
-/// Caller is responsible for fdatasync, close, and rename. On error the fd
-/// is closed and the .tmp is unlinked. `opts.durable` is the caller's concern.
+/// Caller is responsible for close and rename. On error the fd is closed and
+/// the .tmp is unlinked.
 #[allow(clippy::needless_range_loop)]
 fn write_shard_streaming_inner(
     dirfd: c_int,
@@ -648,11 +639,15 @@ mod tests {
         ];
 
         let schema = make_schema_desc(2, 0);
-        let opts = ShardWriteOpts {
-            durable: true,
-            ..Default::default()
-        };
-        write_shard_streaming(libc::AT_FDCWD, &cpath, row_count, &regions, &schema, opts).unwrap();
+        write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            row_count,
+            &regions,
+            &schema,
+            ShardWriteOpts::default(),
+        )
+        .unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 3);
@@ -784,11 +779,15 @@ mod tests {
         ];
 
         let schema = make_schema_desc(2, 0);
-        let opts = ShardWriteOpts {
-            durable: true,
-            ..Default::default()
-        };
-        write_shard_streaming(libc::AT_FDCWD, &cpath, row_count, &regions, &schema, opts).unwrap();
+        write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            row_count,
+            &regions,
+            &schema,
+            ShardWriteOpts::default(),
+        )
+        .unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 4);

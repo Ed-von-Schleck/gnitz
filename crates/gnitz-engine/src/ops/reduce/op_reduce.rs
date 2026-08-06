@@ -204,7 +204,6 @@ pub fn op_reduce(
     // multiple groups. Output's pk_indices is in source pk-list order
     // regardless of group_by_cols permutation.
     let group_by_pk = plan.group_by_pk;
-    let monotone_out_pk = plan.monotone_out_pk;
     // Group-comparator descriptors (empty on the natural-PK path).
     let group_descs = &plan.sort_descs[..];
 
@@ -467,7 +466,7 @@ pub fn op_reduce(
         // what this catches. All slices share the loop-invariant output stride,
         // so slice-lex order is OPK order.
         #[cfg(debug_assertions)]
-        if monotone_out_pk {
+        if plan.monotone_out_pk {
             assert!(
                 prev_out_pk.is_empty() || prev_out_pk.as_slice() < out_pk_bytes,
                 "monotone group key must strictly ascend in group-visit order",
