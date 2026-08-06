@@ -12,7 +12,7 @@ use crate::dml::mutate::{build_merged_row, classify_set_rhs, eval_set_program, r
 use crate::dml::overlay::effective_row;
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
-use crate::exec::batch::{copy_batch_row, project, resolve_projection};
+use crate::exec::batch::{project, resolve_projection, RowGather};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::null_word_set;
@@ -412,11 +412,12 @@ fn client_side_filter_do_nothing(
         surviving_indices.push(i);
     }
 
-    let mut out = ZSetBatch::new(schema);
-    for &i in &surviving_indices {
-        copy_batch_row(batch, i, &mut out, schema);
-    }
     let n = surviving_indices.len();
+    let mut out = ZSetBatch::with_capacity(schema, n);
+    let gather = RowGather::new(schema);
+    for &i in &surviving_indices {
+        gather.copy(batch, i, &mut out);
+    }
     Ok((out, n))
 }
 
@@ -445,7 +446,8 @@ fn client_side_merge_do_update(
 
     let stride = schema.pk_stride() as u8;
     let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::new();
-    let mut out = ZSetBatch::new(schema);
+    let mut out = ZSetBatch::with_capacity(schema, batch.pks.len());
+    let gather = RowGather::new(schema);
 
     // Two buffer sets, not one: the `excluded` view holds `&mut bufs_excluded`
     // for the whole loop, so a second concurrent view over the same buffers would
@@ -474,7 +476,7 @@ fn client_side_merge_do_update(
 
         match &existing {
             None => {
-                copy_batch_row(batch, i, &mut out, schema);
+                gather.copy(batch, i, &mut out);
             }
             Some(ex) => {
                 // The stored row is always row 0 of the ≤1-row `effective_row`

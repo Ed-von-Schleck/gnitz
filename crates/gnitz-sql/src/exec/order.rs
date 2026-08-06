@@ -17,7 +17,7 @@ use crate::ast_util::{expr_usize_literal, single_relation_col_name};
 use crate::bind::find_unique_column;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
-use crate::exec::batch::copy_batch_row_owned;
+use crate::exec::batch::RowGather;
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::cmp_typed_le;
@@ -230,17 +230,23 @@ fn resolve_key_col(key: &OrderKey, schema: &Schema) -> Result<usize, GnitzSqlErr
     match &key.target {
         OrderTarget::Position(pos) => {
             let visible: Vec<usize> = schema.visible_columns().map(|(i, _)| i).collect();
-            if *pos == 0 || *pos > visible.len() {
-                return Err(GnitzSqlError::Unsupported(format!(
-                    "ORDER BY position {pos} is out of range (1..={})",
-                    visible.len()
-                )));
-            }
-            Ok(visible[*pos - 1])
+            resolve_position(*pos, &visible)
         }
         OrderTarget::Name(name) => find_unique_column(&schema.columns, name)?
             .ok_or_else(|| GnitzSqlError::Bind(format!("ORDER BY column '{name}' not found"))),
     }
+}
+
+/// The physical column index a 1-based ORDER BY position names, given the
+/// physical indices of the visible columns.
+fn resolve_position(pos: usize, visible: &[usize]) -> Result<usize, GnitzSqlError> {
+    if pos == 0 || pos > visible.len() {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "ORDER BY position {pos} is out of range (1..={})",
+            visible.len()
+        )));
+    }
+    Ok(visible[pos - 1])
 }
 
 /// Resolve the ORDER BY clause to wire `OrderKey`s over the (server-projected)
@@ -279,15 +285,7 @@ pub(crate) fn resolve_read_spec_order(
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
         let col = match &key.target {
-            OrderTarget::Position(pos) => {
-                if *pos == 0 || *pos > visible.len() {
-                    return Err(GnitzSqlError::Unsupported(format!(
-                        "ORDER BY position {pos} is out of range (1..={})",
-                        visible.len()
-                    )));
-                }
-                visible[*pos - 1]
-            }
+            OrderTarget::Position(pos) => resolve_position(*pos, &visible)?,
             OrderTarget::Name(name) => {
                 if let Some(ci) = find_unique_column(&*out_cols, name)? {
                     ci
@@ -390,21 +388,35 @@ pub(crate) fn order_limit_passthrough(
         Some(ob) => resolve_order_by(ob)?,
         None => Vec::new(),
     };
-    // Zero-copy passthrough: nothing to reorder, skip, or bound.
-    if order_keys.is_empty() && offset == 0 && limit.is_none() {
-        return Ok((schema, batch));
-    }
-    let has_cut = limit.is_some() || offset > 0;
     let mut sort_keys = Vec::with_capacity(order_keys.len());
     for k in &order_keys {
         let ci = resolve_key_col(k, &schema)?;
         sort_keys.push(SortKey::new(&schema, ci, k.asc, k.nulls_first));
     }
+    Ok(finish_window(schema, batch, sort_keys, offset, limit))
+}
+
+/// Apply the resolved sort keys and the OFFSET/LIMIT cut — the shared tail of
+/// both sinks. Zero-copy when there is nothing to reorder, skip, or bound.
+///
+/// A cut over a non-total order would pick an arbitrary member of each tie
+/// group, so a cut always gets the identity tiebreak appended.
+fn finish_window(
+    schema: Schema,
+    batch: ZSetBatch,
+    mut sort_keys: Vec<SortKey>,
+    offset: usize,
+    limit: Option<usize>,
+) -> (Schema, ZSetBatch) {
+    let has_cut = limit.is_some() || offset > 0;
+    if sort_keys.is_empty() && !has_cut {
+        return (schema, batch);
+    }
     if has_cut && !sort_keys.is_empty() {
         push_identity_tiebreak(&mut sort_keys, &schema);
     }
     let out = sort_window(&schema, batch, &sort_keys, offset, limit);
-    Ok((schema, out))
+    (schema, out)
 }
 
 /// Sort + window an already-server-projected ScanSpec reply by its wire
@@ -421,19 +433,11 @@ pub(crate) fn read_spec_finish(
     offset: usize,
     limit: Option<usize>,
 ) -> (Schema, ZSetBatch) {
-    if order_keys.is_empty() && offset == 0 && limit.is_none() {
-        return (schema, batch);
-    }
-    let has_cut = limit.is_some() || offset > 0;
-    let mut sort_keys: Vec<SortKey> = order_keys
+    let sort_keys: Vec<SortKey> = order_keys
         .iter()
         .map(|k| SortKey::new(&schema, k.col as usize, !k.desc, k.nulls_first))
         .collect();
-    if has_cut && !sort_keys.is_empty() {
-        push_identity_tiebreak(&mut sort_keys, &schema);
-    }
-    let gathered = sort_window(&schema, batch, &sort_keys, offset, limit);
-    (schema, gathered)
+    finish_window(schema, batch, sort_keys, offset, limit)
 }
 
 /// Sort + multiplicity-window `full` by `sort_keys` (already tiebreak-extended
@@ -477,10 +481,12 @@ fn sort_window(
     let off = offset as u64;
     let hi = limit.map_or(u64::MAX, |l| off.saturating_add(l as u64));
     let ordered_weights: Vec<i64> = perm.iter().map(|&r| full.weights[r]).collect();
-    let mut gathered = ZSetBatch::new(schema);
-    for (pos, surviving) in paginate(&ordered_weights, off, hi) {
-        copy_batch_row_owned(&mut full, perm[pos], &mut gathered, schema);
-        // `copy_batch_row_owned` copied the weight verbatim; overwrite with the
+    let surviving_rows = paginate(&ordered_weights, off, hi);
+    let gather = RowGather::new(schema);
+    let mut gathered = ZSetBatch::with_capacity(schema, surviving_rows.len());
+    for (pos, surviving) in surviving_rows {
+        gather.take(&mut full, perm[pos], &mut gathered);
+        // The gather copied the weight verbatim; overwrite with the
         // window-clipped multiplicity (a boundary entry keeps a reduced one).
         *gathered.weights.last_mut().unwrap() = surviving;
     }

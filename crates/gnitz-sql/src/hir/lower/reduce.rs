@@ -15,9 +15,9 @@ use crate::agg::{
 };
 use crate::codec::project_schema::{compile_projection_map, ProjItem};
 use crate::error::GnitzSqlError;
+use crate::expr_lower::compile_filter_program;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::ir::BExpr;
-use crate::lower::compile_filter_program;
 use crate::validate::reject_duplicate_column_names;
 use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, ReduceOutKey};
 use std::collections::HashSet;

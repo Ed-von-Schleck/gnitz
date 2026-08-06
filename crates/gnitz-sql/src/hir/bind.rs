@@ -10,12 +10,16 @@ use super::{
     as_col, bind_and_lower, col_by_id, widen_if, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, JoinType,
     ProjEntry, RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
 };
-use crate::agg::{agg_output_nullable, agg_typing, default_agg_name, finalize_agg_bexpr, reject_min_max_unorderable};
+use crate::agg::{
+    agg_output_nullable, agg_typing, default_agg_name, finalize_agg_bexpr, finalize_agg_null_test,
+    reject_min_max_unorderable,
+};
 use crate::ast_util::{
-    body_is_grouped, classify_agg_call, classify_from, expand_wildcard_item, extract_table_name_and_alias,
+    aliased_def, body_is_grouped, classify_agg_call, classify_from, expand_wildcard_item, extract_table_name_and_alias,
     flatten_conjuncts, for_each_agg_call, group_by_exprs, has_exists_in_subquery, has_scalar_subquery, is_agg_call,
-    is_wildcard_projection, peel_nested, projection_item_expr, reject_computed_grouped_item, reject_ungrouped_column,
-    reject_unsupported_fn_qualifiers, single_relation_col_name, FromShape,
+    is_name_preserving_wildcard_projection, peel_nested, projection_item_expr, reject_computed_grouped_item,
+    reject_ungrouped_column, reject_unsupported_fn_qualifiers, scalar_projection_item, single_relation_col_name,
+    FromShape,
 };
 use crate::bind::{apply_positional_aliases, cte_passthrough};
 use crate::bind::{bind_structural, find_unique_column, fold_null_test, single_relation_col_idx, Binder, LeafBinder};
@@ -203,59 +207,78 @@ fn bind_linear_select(
 
     // A subquery-carrying single-table body (EXISTS/IN, scalar aggregate, ANY/ALL)
     // routes to the subquery-aware leaf, which binds each subquery as a
-    // `HirRef::Subquery` leaf for decorrelation. GROUP BY / DISTINCT cannot host a
-    // subquery in one circuit: EXISTS/IN + GROUP BY gets the targeted message here,
-    // and every other combination falls through to the plain leaf's per-kind
+    // `HirRef::Subquery` leaf for decorrelation. GROUP BY and DISTINCT cannot host
+    // a subquery in one circuit: EXISTS/IN under either gets the targeted message
+    // here, and every other combination falls through to the plain leaf's per-kind
     // default `bind_subquery` rejection below.
     let has_exists_in = has_exists_in_subquery(select);
     if has_exists_in || has_scalar_subquery(select) {
-        if grouped && has_exists_in {
-            return Err(GnitzSqlError::Unsupported(
-                "EXISTS/IN subqueries are not supported together with GROUP BY/aggregates; \
+        if has_exists_in && (grouped || distinct) {
+            let clause = if grouped {
+                "GROUP BY/aggregates"
+            } else {
+                "SELECT DISTINCT"
+            };
+            return Err(GnitzSqlError::Unsupported(format!(
+                "EXISTS/IN subqueries are not supported together with {clause}; \
                  put the subquery in an inner view"
-                    .into(),
-            ));
+            )));
         }
         if !grouped && !distinct {
             return bind_linear_subquery_body(client, binder, ids, select, source, env, &outer_alias);
         }
     }
 
-    let leaf = HirSingleTable { env: &env };
+    bind_body_suffix(
+        ids,
+        select,
+        source,
+        &env,
+        &HirSingleTable { env: &env },
+        "CREATE VIEW projection",
+    )
+}
 
-    // WHERE — flatten to conjuncts, bind each through the HIR leaf.
+/// WHERE, then the projection in whichever shape the body carries — the tail
+/// every single-table, subquery and join body shares once its source relation
+/// and leaf binder are resolved. `env` is the leaf's column scope and `ctx`
+/// names the surface in messages.
+///
+/// DISTINCT outranks a grouped shape. The projection is bound in SELECT order
+/// (`place_pk_front` is physical, applied at lowering).
+fn bind_body_suffix<L: LeafBinder<HirRef>>(
+    ids: &ColIdGen,
+    select: &Select,
+    source: Rc<RelExpr>,
+    env: &[HirCol],
+    leaf: &L,
+    ctx: &str,
+) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let mut rel = source;
     if let Some(where_expr) = &select.selection {
-        rel = RelExpr::filter(rel, bind_conjuncts(where_expr, &leaf)?);
+        rel = RelExpr::filter(rel, bind_conjuncts(where_expr, leaf)?);
     }
-
-    // DISTINCT outranks a grouped shape (matching the old classify order); a real
-    // GROUP BY is already rejected by the gate above on this path.
-    if distinct {
+    if select.distinct.is_some() {
         // The dup-name guard fires in `lower_distinct` over the full output
         // column list (the synthetic `_distinct_pk` included) — a strict superset
         // of this projection, so checking it again here would be redundant.
-        let items = bind_projection(&select.projection, &env, &leaf, ids, "CREATE VIEW projection")?;
+        let items = bind_projection(&select.projection, env, leaf, ids, ctx)?;
         return Ok(RelExpr::distinct(RelExpr::project(rel, items)));
     }
-    if grouped {
-        return bind_grouped_suffix(ids, select, rel, &leaf);
+    if body_is_grouped(select) {
+        return bind_grouped_suffix(ids, select, rel, leaf);
     }
-
-    // Projection — SELECT order (place_pk_front is physical, applied at lowering).
-    let items = bind_projection(&select.projection, &env, &leaf, ids, "CREATE VIEW projection")?;
-    // Dup-name check for a non-wildcard projection (matching lower_linear); a pure
-    // `SELECT *` carries duplicates through positionally.
-    reject_dup_proj_names(&items, &select.projection, "CREATE VIEW projection")?;
+    let items = bind_projection(&select.projection, env, leaf, ids, ctx)?;
+    reject_dup_proj_names(&items, &select.projection, ctx)?;
     Ok(RelExpr::project(rel, items))
 }
 
-/// Reject duplicate output names in a bound projection. A pure `SELECT *`
-/// carries duplicates through positionally (the wildcard expansion is the
-/// source's own column list), so only an explicit projection is checked — one
-/// home for the guard the four bind sites otherwise repeat verbatim.
+/// Reject duplicate output names in a bound projection — one home for the guard
+/// the bind sites otherwise repeat verbatim. A projection that names nothing of
+/// its own (`*`, `* EXCEPT/EXCLUDE`) is skipped: its names are the source's, so
+/// a duplicate there is the source's and rides through positionally.
 fn reject_dup_proj_names(items: &[ProjEntry], projection: &[SelectItem], ctx: &str) -> Result<(), GnitzSqlError> {
-    if is_wildcard_projection(projection) {
+    if is_name_preserving_wildcard_projection(projection) {
         return Ok(());
     }
     // Hidden slots are skipped, exactly as `reject_duplicate_column_names` does:
@@ -306,11 +329,10 @@ fn bind_projection<L: LeafBinder<HirRef>>(
             // single-table projection item — it falls to the `_` reject arm, as in
             // `resolve_projection_items`).
             SelectItem::Wildcard(_) => items.extend(expand_wildcard(item, env, ctx, ids)?),
-            SelectItem::UnnamedExpr(expr) => items.push(bind_proj_expr(expr, None, idx, env, leaf, ids)?),
-            SelectItem::ExprWithAlias { expr, alias } => {
-                items.push(bind_proj_expr(expr, Some(alias.value.clone()), idx, env, leaf, ids)?)
+            _ => {
+                let (expr, alias) = scalar_projection_item(item, ctx)?;
+                items.push(bind_proj_expr(expr, alias, idx, env, leaf, ids)?);
             }
-            _ => return Err(GnitzSqlError::Unsupported(format!("unsupported SELECT item in {ctx}"))),
         }
     }
     Ok(items)
@@ -333,11 +355,7 @@ fn bind_proj_expr<L: LeafBinder<HirRef>>(
 ) -> Result<ProjEntry, GnitzSqlError> {
     let bound = bind_structural(expr, leaf)?;
     let out_def = if let BExpr::ColRef(HirRef::Col(id)) = &bound {
-        let mut def = hircol_of(env, *id).def.clone();
-        if let Some(name) = alias {
-            def.name = name;
-        }
-        def
+        aliased_def(&hircol_of(env, *id).def, alias)
     } else {
         ColumnDef::computed(alias, idx, bound.infer_type_with(&|r: &HirRef| type_of(env, r)))
     };
@@ -516,13 +534,7 @@ fn bind_linear_subquery_body(
             outer_alias,
         }),
     };
-    let mut rel = get;
-    if let Some(where_expr) = &select.selection {
-        rel = RelExpr::filter(rel, bind_conjuncts(where_expr, &leaf)?);
-    }
-    let items = bind_projection(&select.projection, &env, &leaf, ids, "CREATE VIEW projection")?;
-    reject_dup_proj_names(&items, &select.projection, "CREATE VIEW projection")?;
-    Ok(RelExpr::project(rel, items))
+    bind_body_suffix(ids, select, get, &env, &leaf, "CREATE VIEW projection")
 }
 
 /// The resolved inner relation of a subquery: `Filter?(Get)` with the inner-local
@@ -959,41 +971,12 @@ fn bind_join_select(
         scope.widen_step(kind);
     }
 
-    // WHERE → a `Filter` over the top join (raw conjuncts; the rewrite places them).
-    let mut rel = left;
-    if let Some(where_expr) = &select.selection {
-        rel = RelExpr::filter(rel, bind_conjuncts(where_expr, &join_leaf(&scope))?);
-    }
-
-    // DISTINCT / GROUP BY over a join: the operator sits above the join tree (the
-    // lowering cuts the join to a hidden segment). DISTINCT outranks grouped.
-    if distinct {
-        // Guarded by `lower_distinct` over the full output columns (see above).
-        let items = bind_projection(
-            &select.projection,
-            &scope.combined,
-            &join_leaf(&scope),
-            ids,
-            "JOIN view",
-        )?;
-        return Ok(RelExpr::distinct(RelExpr::project(rel, items)));
-    }
-    if grouped {
-        let leaf = join_leaf(&scope);
-        return bind_grouped_suffix(ids, select, rel, &leaf);
-    }
-
-    // Projection over the join output scope (column references + wildcard only —
-    // a computed expression over a join output is rejected).
-    let items = bind_projection(
-        &select.projection,
-        &scope.combined,
-        &join_leaf(&scope),
-        ids,
-        "JOIN view",
-    )?;
-    reject_dup_proj_names(&items, &select.projection, "join view")?;
-    Ok(RelExpr::project(rel, items))
+    // The WHERE lands as a `Filter` over the top join (raw conjuncts; the rewrite
+    // places them). A DISTINCT / GROUP BY over a join sits above the join tree —
+    // the lowering cuts the join to a hidden segment. The projection resolves
+    // against the join output scope (column references + wildcard only; a
+    // computed expression over a join output is rejected).
+    bind_body_suffix(ids, select, left, &scope.combined, &join_leaf(&scope), "JOIN view")
 }
 
 /// The name-resolution scope of a FROM-join body: all in-scope (null-widened)
@@ -1303,11 +1286,7 @@ fn bind_finalize_projection<L: LeafBinder<HirRef>>(
 ) -> Result<Vec<ProjEntry>, GnitzSqlError> {
     let mut items = Vec::new();
     for (idx, item) in select.projection.iter().enumerate() {
-        let (expr, alias) = match item {
-            SelectItem::UnnamedExpr(e) => (e, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
-            _ => return Err(GnitzSqlError::Unsupported("GROUP BY: unsupported SELECT item".into())),
-        };
+        let (expr, alias) = scalar_projection_item(item, "GROUP BY")?;
         if let Some(agg_idx) = item_agg[idx] {
             let ga = &aggs[agg_idx];
             let name = alias.unwrap_or_else(|| default_agg_name(ga.agg.func, idx));
@@ -1327,10 +1306,7 @@ fn bind_finalize_projection<L: LeafBinder<HirRef>>(
                 let name = col_by_id(env, id).map(|c| c.def.name.clone()).unwrap_or_default();
                 return Err(reject_ungrouped_column(&name));
             }
-            let mut def = col_by_id(env, id).expect("group col in env").def.clone();
-            if let Some(a) = alias {
-                def.name = a;
-            }
+            let def = aliased_def(&col_by_id(env, id).expect("group col in env").def, alias);
             items.push(ProjEntry {
                 expr: BExpr::ColRef(HirRef::Col(id)),
                 out: HirCol { id: ids.next(), def },
@@ -1392,25 +1368,24 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
         if is_agg_call(f) {
             return Ok(finalize_agg_expr(self.find_agg(f)?));
         }
-        self.leaf.bind_function(f)
+        // A non-aggregate call gets the same answer whatever the FROM shape is,
+        // so HAVING states it rather than delegating to the FROM leaf — a join
+        // leaf's wording names its own clause and would report "JOIN ON".
+        reject_unsupported_fn_qualifiers(f, "aggregates")?;
+        Err(GnitzSqlError::Unsupported(format!(
+            "function '{}' not supported",
+            f.name.to_string().to_ascii_lowercase()
+        )))
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
         let peeled = peel_nested(inner);
         if let Expr::Function(f) = peeled {
             if is_agg_call(f) {
                 let ga = self.find_agg(f)?;
-                if let Some(cnt) = &ga.agg.companion {
-                    // Nullable SUM / AVG: NULL ⇔ COUNT_NON_NULL companion is 0.
-                    let bop = if want_null { BinOp::Eq } else { BinOp::Ne };
-                    return Ok(BExpr::BinOp(
-                        Box::new(BExpr::ColRef(HirRef::Col(cnt.id))),
-                        bop,
-                        Box::new(BExpr::LitInt(0)),
-                    ));
-                }
-                return Ok(fold_null_test(
-                    ga.output_nullable,
+                return Ok(finalize_agg_null_test(
                     HirRef::Col(ga.agg.out.id),
+                    ga.agg.companion.as_ref().map(|c| HirRef::Col(c.id)),
+                    ga.output_nullable,
                     want_null,
                 ));
             }

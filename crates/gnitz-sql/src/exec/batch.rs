@@ -1,32 +1,50 @@
 use crate::ast_util::{
-    is_bare_wildcard_projection, single_relation_col_name, wildcard_name_is_visible, WildcardRewrite,
+    aliased_def, is_bare_wildcard_projection, scalar_projection_item, single_relation_col_name,
+    wildcard_name_is_visible, WildcardRewrite,
 };
 use crate::bind::find_unique_column;
 use crate::error::GnitzSqlError;
 use gnitz_core::{null_word_get, null_word_set, ColData, PkColumn, Schema, ZSetBatch};
 use sqlparser::ast::SelectItem;
 
-pub(crate) fn copy_batch_row(src: &ZSetBatch, i: usize, dst: &mut ZSetBatch, schema: &Schema) {
-    dst.pks.push_from(&src.pks, i);
-    dst.weights.push(src.weights[i]);
-    dst.nulls.push(src.nulls[i]);
-    for (_pi, ci, col_def) in schema.payload_columns() {
-        let stride = col_def.type_code.wire_stride();
-        src.columns[ci].push_row_from(i, stride, &mut dst.columns[ci]);
-    }
+/// One schema's payload copy plan: each payload column's index and wire stride,
+/// resolved once. A row-at-a-time gather builds this before its loop —
+/// `Schema::payload_columns` re-scans `pk_cols` per column and re-matches each
+/// type code, which over a million-row ordered result dominates the copy itself.
+pub(crate) struct RowGather {
+    payload: Vec<(usize, usize)>,
 }
 
-/// Consuming variant of [`copy_batch_row`] for a source batch the caller owns
-/// and drops after the gather: String/Blob cells are moved out
-/// (`ColData::take_row_into`) instead of cloned. Each source row must be
-/// gathered at most once.
-pub(crate) fn copy_batch_row_owned(src: &mut ZSetBatch, i: usize, dst: &mut ZSetBatch, schema: &Schema) {
-    dst.pks.push_from(&src.pks, i);
-    dst.weights.push(src.weights[i]);
-    dst.nulls.push(src.nulls[i]);
-    for (_pi, ci, col_def) in schema.payload_columns() {
-        let stride = col_def.type_code.wire_stride();
-        src.columns[ci].take_row_into(i, stride, &mut dst.columns[ci]);
+impl RowGather {
+    pub(crate) fn new(schema: &Schema) -> Self {
+        RowGather {
+            payload: schema
+                .payload_columns()
+                .map(|(_pi, ci, def)| (ci, def.type_code.wire_stride()))
+                .collect(),
+        }
+    }
+
+    /// Append `src`'s row `i` to `dst`, cloning String/Blob cells.
+    pub(crate) fn copy(&self, src: &ZSetBatch, i: usize, dst: &mut ZSetBatch) {
+        dst.pks.push_from(&src.pks, i);
+        dst.weights.push(src.weights[i]);
+        dst.nulls.push(src.nulls[i]);
+        for &(ci, stride) in &self.payload {
+            src.columns[ci].push_row_from(i, stride, &mut dst.columns[ci]);
+        }
+    }
+
+    /// Consuming variant for a source the caller owns and drops after the
+    /// gather: String/Blob cells are moved out (`ColData::take_row_into`)
+    /// instead of cloned, so each source row must be gathered at most once.
+    pub(crate) fn take(&self, src: &mut ZSetBatch, i: usize, dst: &mut ZSetBatch) {
+        dst.pks.push_from(&src.pks, i);
+        dst.weights.push(src.weights[i]);
+        dst.nulls.push(src.nulls[i]);
+        for &(ci, stride) in &self.payload {
+            src.columns[ci].take_row_into(i, stride, &mut dst.columns[ci]);
+        }
     }
 }
 
@@ -97,7 +115,8 @@ pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> 
                     out_defs.push(def);
                 }
             }
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            _ => {
+                let (e, alias) = scalar_projection_item(item, "SELECT projection")?;
                 let name = single_relation_col_name(e).ok_or_else(|| {
                     GnitzSqlError::Unsupported(
                         "only simple column references supported in SELECT projection".to_string(),
@@ -106,16 +125,7 @@ pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> 
                 let idx = find_unique_column(&schema.columns, name)?
                     .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in projection")))?;
                 col_indices.push(idx);
-                let mut def = schema.columns[idx].clone();
-                if let SelectItem::ExprWithAlias { alias, .. } = item {
-                    def.name = alias.value.clone();
-                }
-                out_defs.push(def);
-            }
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "only simple column references supported in SELECT projection".to_string(),
-                ))
+                out_defs.push(aliased_def(&schema.columns[idx], alias));
             }
         }
     }
@@ -306,7 +316,7 @@ mod tests {
     use crate::test_support::compound_schema_u64_u64;
 
     #[test]
-    fn compound_pk_copy_batch_row_preserves_compound_pk() {
+    fn compound_pk_row_gather_preserves_compound_pk() {
         let schema = compound_schema_u64_u64();
         let mut src = ZSetBatch::new(&schema);
         let mut pk_bytes = [0u8; 16];
@@ -320,7 +330,7 @@ mod tests {
         }
 
         let mut dst = ZSetBatch::new(&schema);
-        copy_batch_row(&src, 0, &mut dst, &schema);
+        RowGather::new(&schema).copy(&src, 0, &mut dst);
         assert_eq!(dst.pks.len(), 1);
         match &dst.pks {
             PkColumn::Bytes { stride: 16, buf } => {

@@ -6,11 +6,11 @@
 //! `hir::physical::physicalize_projection`; `build_read_projection` is the ad-hoc
 //! read path's variant (PK hidden-prepended, user column order preserved).
 
-use crate::ast_util::expand_wildcard_item;
+use crate::ast_util::{aliased_def, expand_wildcard_item, scalar_projection_item};
 use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
+use crate::expr_lower::compile_bound_expr;
 use crate::ir::BoundExpr;
-use crate::lower::compile_bound_expr;
 use gnitz_core::{ColumnDef, ExprBuilder, ExprProgram, Schema};
 use sqlparser::ast::SelectItem;
 
@@ -47,24 +47,13 @@ fn resolve_proj_col(
     idx: usize,
     source_schema: &Schema,
 ) -> Result<(ProjItem, ColumnDef), GnitzSqlError> {
-    let (expr, alias) = match item {
-        SelectItem::UnnamedExpr(expr) => (expr, None),
-        SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
-        _ => {
-            return Err(GnitzSqlError::Unsupported(
-                "unsupported SELECT item in projection".to_string(),
-            ))
-        }
-    };
+    let (expr, alias) = scalar_projection_item(item, "projection")?;
     let bound = bind_single_table(expr, source_schema)?;
     // A (possibly aliased / qualified / parenthesized) bare column reference is a
     // pass-through; an alias only renames the output column. Anything else is a
     // computed column, built by `ColumnDef::computed` from its `infer_type`.
     if let BoundExpr::ColRef(ci) = bound {
-        let mut col = source_schema.columns[ci].clone();
-        if let Some(name) = alias {
-            col.name = name;
-        }
+        let col = aliased_def(&source_schema.columns[ci], alias);
         Ok((ProjItem::PassThrough { src_col: ci }, col))
     } else {
         let nominal = bound.infer_type(&source_schema.columns);

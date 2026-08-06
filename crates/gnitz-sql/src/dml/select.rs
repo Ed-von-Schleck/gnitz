@@ -27,8 +27,8 @@ use crate::dml::plan::{bound_and_predicate, extract_limit, extract_offset, fetch
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, AggFinish};
 use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
+use crate::expr_lower::compile_filter_evaluator;
 use crate::ir::BoundExpr;
-use crate::lower::compile_filter_evaluator;
 use crate::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
     HonoredClauses, HonoredQueryClauses,

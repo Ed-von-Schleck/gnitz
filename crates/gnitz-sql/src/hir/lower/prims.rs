@@ -4,8 +4,8 @@
 //! builders, the range-relation converse, and the key-arity guard.
 
 use crate::error::GnitzSqlError;
+use crate::expr_lower::compile_bound_expr_to_program;
 use crate::ir::{BinOp, BoundExpr};
-use crate::lower::compile_bound_expr_to_program;
 use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, NodeId, Schema, TypeCode};
 
 /// Multi-column NULL predicate for a Filter over a composite equijoin key,

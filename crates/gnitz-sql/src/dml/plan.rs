@@ -12,8 +12,8 @@ use crate::access::{
 };
 use crate::ast_util::expr_usize_literal;
 use crate::error::GnitzSqlError;
+use crate::expr_lower::compile_wire_predicate;
 use crate::ir::BoundExpr;
-use crate::lower::compile_wire_predicate;
 use gnitz_core::{ClientError, GnitzClient, IndexMeta, PkTuple, Schema, ZSetBatch};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 use sqlparser::ast::LimitClause;

@@ -262,7 +262,7 @@ impl<R> BExpr<R> {
 /// column reference, or a null test over one (`true` = `IS NULL`). These are the
 /// only three arms that carry an `R`, so they are the only ones a rebuild has to
 /// decide anything about.
-pub(crate) enum Leaf<'a, R> {
+enum Leaf<'a, R> {
     Col(&'a R),
     NullTest(&'a R, bool),
 }
@@ -275,7 +275,7 @@ impl<R> BExpr<R> {
     /// `leaf` returns a whole `BExpr<S>`, not a reference, which is what lets the
     /// two instantiations differ in kind — one keeps a leaf a leaf, the other
     /// expands it into an arbitrary sub-expression.
-    pub(crate) fn try_rebuild<S, E>(&self, leaf: &impl Fn(Leaf<'_, R>) -> Result<BExpr<S>, E>) -> Result<BExpr<S>, E> {
+    fn try_rebuild<S, E>(&self, leaf: &impl Fn(Leaf<'_, R>) -> Result<BExpr<S>, E>) -> Result<BExpr<S>, E> {
         let go = |e: &BExpr<R>| e.try_rebuild(leaf);
         let boxed = |e: &BExpr<R>| go(e).map(Box::new);
         let opt = |e: Option<&BExpr<R>>| e.map(boxed).transpose();
@@ -469,11 +469,26 @@ impl BinOp {
     /// The six ordering/equality operators — the ones defined on every scalar
     /// domain, and the only ones defined on strings. The single spelling of that
     /// set.
-    pub(crate) fn is_comparison(self) -> bool {
+    fn is_comparison(self) -> bool {
         matches!(
             self,
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
         )
+    }
+
+    /// The order-reversing converse: `x OP y` ⟺ `y OP.converse() x`. Only the
+    /// four ordering operators flip; `Eq`/`Ne` are symmetric and every other
+    /// operator (where operand order is not a comparison at all) passes through
+    /// unchanged, so callers that transpose a whole expression can apply this
+    /// unconditionally.
+    pub(crate) fn converse(self) -> BinOp {
+        match self {
+            BinOp::Lt => BinOp::Gt,
+            BinOp::Gt => BinOp::Lt,
+            BinOp::Le => BinOp::Ge,
+            BinOp::Ge => BinOp::Le,
+            other => other,
+        }
     }
 }
 

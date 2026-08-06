@@ -8,9 +8,9 @@ use super::physical::PhysProjection;
 use super::SegInput;
 use crate::codec::project_schema::{compile_projection_map, ProjItem};
 use crate::error::GnitzSqlError;
+use crate::expr_lower::compile_filter_program;
 use crate::hir::chain::EmitPieces;
 use crate::ir::BoundExpr;
-use crate::lower::compile_filter_program;
 use gnitz_core::CircuitBuilder;
 use gnitz_wire::ScanBound;
 

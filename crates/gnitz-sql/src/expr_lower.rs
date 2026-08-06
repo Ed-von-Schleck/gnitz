@@ -1,3 +1,10 @@
+//! Expression lowering: a bound `BoundExpr` → the VM's opcode program, as a
+//! wire `ExprProgram`, a resolved `Evaluator`, or raw predicate bytes.
+//!
+//! This is the *scalar* half of lowering. `hir::lower` is the *relational* half
+//! (`RelExpr` → DBSP circuit) and calls into this one for every filter, map and
+//! projection expression it emits.
+
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, NumFunc, StrFunc, TrimMode, UnaryOp};
 use gnitz_core::{ColumnDef, ExprBuilder, Schema, TypeCode};
@@ -87,17 +94,7 @@ fn try_compile_string_cmp(
     // Eq/Ne are symmetric.
     let col_lit = match (left, right) {
         (BoundExpr::ColRef(idx), BoundExpr::LitStr(s)) => Some((*idx, s, *op)),
-        (BoundExpr::LitStr(s), BoundExpr::ColRef(idx)) => Some((
-            *idx,
-            s,
-            match op {
-                BinOp::Lt => BinOp::Gt,
-                BinOp::Gt => BinOp::Lt,
-                BinOp::Le => BinOp::Ge,
-                BinOp::Ge => BinOp::Le,
-                other => *other,
-            },
-        )),
+        (BoundExpr::LitStr(s), BoundExpr::ColRef(idx)) => Some((*idx, s, op.converse())),
         _ => None,
     };
     if let Some((idx, s, cmp)) = col_lit {
@@ -140,7 +137,7 @@ fn try_compile_string_cmp(
 /// scalar shapes — `Float` means the 8-byte register holds an f64 bit pattern —
 /// and `Str` is the string register class.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ExprKind {
+enum ExprKind {
     Int,
     Float,
     Str,

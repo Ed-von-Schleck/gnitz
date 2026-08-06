@@ -201,10 +201,6 @@ fn binop_to_range_rel(op: BinOp) -> Option<RangeRel> {
 
 /// Decorrelate every subquery leaf in `rel`, minting mark columns from `ids`.
 pub(crate) fn decorrelate(rel: Rc<RelExpr>, ids: &ColIdGen) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    decorrelate_rel(rel, ids)
-}
-
-fn decorrelate_rel(rel: Rc<RelExpr>, ids: &ColIdGen) -> Result<Rc<RelExpr>, GnitzSqlError> {
     // Subqueries live only in a single-table linear body's `Project(Filter?(Get))`
     // (bind rejects them elsewhere); transform that node, else recurse.
     if let RelExpr::Project { input, items } = rel.as_ref() {
@@ -212,7 +208,7 @@ fn decorrelate_rel(rel: Rc<RelExpr>, ids: &ColIdGen) -> Result<Rc<RelExpr>, Gnit
             return decorrelate_body(items, input, ids);
         }
     }
-    RelExpr::map_children(&rel, &mut |c| decorrelate_rel(Rc::clone(c), ids))
+    RelExpr::map_children(&rel, &mut |c| decorrelate(Rc::clone(c), ids))
 }
 
 /// Whether an expression carries a `HirRef::Subquery` leaf.
@@ -491,7 +487,7 @@ fn as_uncorrelated_scalar_cmp(pred: &HirExpr) -> Option<(ColId, BinOp, &Subquery
         return Some((oc, op, s));
     }
     if let (Some(s), Some(oc)) = (uncorr_scalar(l), as_col(r)) {
-        return Some((oc, converse_binop(op), s));
+        return Some((oc, op.converse(), s));
     }
     None
 }
@@ -502,17 +498,6 @@ fn uncorr_scalar(e: &HirExpr) -> Option<&SubqueryRef> {
             Some(s)
         }
         _ => None,
-    }
-}
-
-/// The order-reversing converse of a `BinOp` comparison (`x OP y ⟺ y converse(OP) x`).
-fn converse_binop(op: BinOp) -> BinOp {
-    match op {
-        BinOp::Lt => BinOp::Gt,
-        BinOp::Le => BinOp::Ge,
-        BinOp::Gt => BinOp::Lt,
-        BinOp::Ge => BinOp::Le,
-        other => other, // Eq is symmetric
     }
 }
 

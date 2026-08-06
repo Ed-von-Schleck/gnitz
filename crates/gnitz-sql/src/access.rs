@@ -415,16 +415,16 @@ fn try_col_range_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, Ra
     let BExpr::BinOp(left, op, right) = expr else {
         return None;
     };
-    if !matches!(op, BinOp::Gt | BinOp::Ge | BinOp::Lt | BinOp::Le) {
-        return None;
-    }
     let (col_idx, lit, flipped) = bound_col_vs_literal(left, right)?;
-    let (side, mk): (RangeSide, fn(u128) -> Cut) = match (*op, flipped) {
-        (BinOp::Gt, false) | (BinOp::Lt, true) => (RangeSide::Start, Cut::After), // col > lit / lit < col
-        (BinOp::Ge, false) | (BinOp::Le, true) => (RangeSide::Start, Cut::Before), // col >= lit / lit <= col
-        (BinOp::Lt, false) | (BinOp::Gt, true) => (RangeSide::End, Cut::Before),  // col < lit / lit > col
-        (BinOp::Le, false) | (BinOp::Ge, true) => (RangeSide::End, Cut::After),   // col <= lit / lit >= col
-        _ => unreachable!("operator set guarded above"),
+    // Orient to `col OP lit` first, so the four arms below read as the operator
+    // they name rather than as eight (operator, side) pairs.
+    let op = if flipped { op.converse() } else { *op };
+    let (side, mk): (RangeSide, fn(u128) -> Cut) = match op {
+        BinOp::Gt => (RangeSide::Start, Cut::After),
+        BinOp::Ge => (RangeSide::Start, Cut::Before),
+        BinOp::Lt => (RangeSide::End, Cut::Before),
+        BinOp::Le => (RangeSide::End, Cut::After),
+        _ => return None,
     };
     let tc = schema.columns[col_idx].type_code;
     let BoundLit::Num(n) = lit else {

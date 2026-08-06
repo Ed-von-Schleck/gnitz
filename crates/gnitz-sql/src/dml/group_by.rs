@@ -6,16 +6,16 @@
 //! / DISTINCT bodies are compiled by the HIR pipeline instead.
 
 use crate::agg::{
-    agg_arg_col, append_agg_mapping, default_agg_name, finalize_agg_bexpr, group_col_reduce_pos, AggMapping, AggSpec,
-    GroupByLayout, GroupBySelectItem,
+    agg_arg_col, append_agg_mapping, default_agg_name, finalize_agg_bexpr, finalize_agg_null_test,
+    group_col_reduce_pos, AggMapping, AggSpec, GroupByLayout, GroupBySelectItem,
 };
 use crate::ast_util::{
-    expand_wildcard_item, for_each_agg_call, group_by_exprs, is_bare_wildcard_projection, reject_computed_grouped_item,
-    reject_ungrouped_column, single_relation_col_name,
+    aliased_def, expand_wildcard_item, for_each_agg_call, group_by_exprs, is_bare_wildcard_projection,
+    reject_computed_grouped_item, reject_ungrouped_column, scalar_projection_item, single_relation_col_name,
 };
 use crate::bind::{bind_single_table, bind_structural, find_unique_column, fold_null_test, LeafBinder, SingleTable};
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BinOp, BoundExpr};
+use crate::ir::{AggFunc, BoundExpr};
 use crate::validate::{reject_float_key, reject_float_keys};
 use gnitz_core::{ColumnDef, ReduceOutKey, Schema};
 use sqlparser::ast::{Expr, SelectItem};
@@ -60,15 +60,7 @@ pub(crate) fn analyze_group_by(
     let mut agg_specs: Vec<AggSpec> = Vec::new();
 
     for (idx, item) in select.projection.iter().enumerate() {
-        let (expr, alias) = match item {
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
-            SelectItem::UnnamedExpr(expr) => (expr, None),
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "GROUP BY: unsupported SELECT item".to_string(),
-                ))
-            }
-        };
+        let (expr, alias) = scalar_projection_item(item, "GROUP BY")?;
 
         let bound = bind_single_table(expr, source_schema)?;
         match &bound {
@@ -275,39 +267,23 @@ impl LeafBinder for Having<'_> {
         ))
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
-        // IS [NOT] NULL over the grouped relation. A companion-carrying aggregate
-        // (nullable SUM / AVG) reads the hidden COUNT_NON_NULL companion — its raw
-        // value column's saturating has_value bit is unreliable (a linear-fold SUM
-        // emits 0, not NULL, once its last non-null contributor is retracted, and
-        // AVG has no single raw column). Everything else — a Direct aggregate's
-        // value column or a bare group column — routes through the shared
-        // `fold_null_test` with its authoritative nullability, so a never-null
-        // shape const-folds: the fast-path win of `fold_null_test` (keeps
-        // eval_batch's no_nulls arm), and for a non-nullable group column it also
-        // keeps EXPR_IS_NULL off the PK sentinel (see eval_is_null's assertion).
+        // IS [NOT] NULL over the grouped relation: an aggregate goes through the
+        // shared companion-vs-value rule, a bare group column through the plain
+        // nullability fold (which for a non-nullable column also keeps
+        // EXPR_IS_NULL off the PK sentinel — see eval_is_null's assertion).
         match inner {
             Expr::Nested(i) => self.bind_null_test(i, want_null),
             Expr::Function(func) => {
                 let m = resolve_having_mapping(func, self.ctx)?;
                 let val_col = self.ctx.agg_col_offset + m.specs_start;
-                if m.shape.has_count_companion() {
-                    // Nullable SUM / AVG: NULL ⇔ COUNT_NON_NULL companion (at
-                    // specs_start + 1) is 0 — the same gate the SELECT
-                    // projection applies.
-                    let bop = if want_null { BinOp::Eq } else { BinOp::Ne };
-                    Ok(BoundExpr::BinOp(
-                        Box::new(BoundExpr::ColRef(val_col + 1)),
-                        bop,
-                        Box::new(BoundExpr::LitInt(0)),
-                    ))
-                } else {
-                    // Direct aggregate: the value column's raw null bit is
-                    // authoritative, exactly as the SELECT projection reads it.
-                    Ok(fold_null_test(m.output_nullable, val_col, want_null))
-                }
+                Ok(finalize_agg_null_test(
+                    val_col,
+                    m.shape.has_count_companion().then_some(val_col + 1),
+                    m.output_nullable,
+                    want_null,
+                ))
             }
             _ => {
-                // A bare group-column reference.
                 let col_name = single_relation_col_name(inner).ok_or_else(|| {
                     GnitzSqlError::Unsupported(
                         "HAVING: IS [NOT] NULL is only supported on an aggregate or a group column".to_string(),
@@ -356,27 +332,15 @@ pub(crate) fn resolve_set_projection(
                     out_cols.push(out);
                 }
             }
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                // Resolve the column once; an alias only renames the output column.
-                let ci = match bind_single_table(expr, source_schema)? {
-                    BoundExpr::ColRef(ci) => ci,
-                    _ => {
-                        return Err(GnitzSqlError::Unsupported(format!(
-                            "{context}: computed expressions are not supported"
-                        )))
-                    }
+            _ => {
+                let (expr, alias) = scalar_projection_item(item, context)?;
+                let BoundExpr::ColRef(ci) = bind_single_table(expr, source_schema)? else {
+                    return Err(GnitzSqlError::Unsupported(format!(
+                        "{context}: computed expressions are not supported"
+                    )));
                 };
                 indices.push(ci);
-                let mut col = source_schema.columns[ci].clone();
-                if let SelectItem::ExprWithAlias { alias, .. } = item {
-                    col.name = alias.value.clone();
-                }
-                out_cols.push(col);
-            }
-            _ => {
-                return Err(GnitzSqlError::Unsupported(format!(
-                    "{context}: unsupported SELECT item"
-                )))
+                out_cols.push(aliased_def(&source_schema.columns[ci], alias));
             }
         }
     }

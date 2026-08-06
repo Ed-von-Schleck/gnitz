@@ -470,7 +470,7 @@ pub(crate) fn emit_filter<'a>(
     cols: &[ColumnDef],
 ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
     match physical::fold_preds(preds, layout)? {
-        Some(folded) => match crate::lower::compile_filter_program(&folded, cols)? {
+        Some(folded) => match crate::expr_lower::compile_filter_program(&folded, cols)? {
             Some(prog) => Ok(cb.filter(node, Some(prog))),
             None => Ok(node),
         },

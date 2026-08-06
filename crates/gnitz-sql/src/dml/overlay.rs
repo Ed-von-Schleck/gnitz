@@ -24,7 +24,7 @@
 //! map before touching a row.
 
 use crate::error::GnitzSqlError;
-use crate::exec::batch::copy_batch_row;
+use crate::exec::batch::RowGather;
 use gnitz_core::{GnitzClient, PkTuple, Schema, ZSetBatch};
 use std::collections::HashMap;
 
@@ -52,8 +52,8 @@ pub(crate) fn effective_row(
         // Weight sign is the net effect: negative = buffered delete (absent),
         // else the live buffered row, copied out owned.
         return Ok((batch.weights[row] >= 0).then(|| {
-            let mut one = ZSetBatch::new(schema);
-            copy_batch_row(batch, row, &mut one, schema);
+            let mut one = ZSetBatch::with_capacity(schema, 1);
+            RowGather::new(schema).copy(batch, row, &mut one);
             one
         }));
     }
@@ -90,9 +90,10 @@ pub(crate) fn buffered_net<'a>(client: &'a GnitzClient, tid: u64, keys: Option<&
 /// NOT NULL on both sides — identical bytes).
 pub(crate) fn present_rows(net: &Net, schema: &Schema) -> ZSetBatch {
     let mut out = ZSetBatch::with_capacity(schema, net.len());
+    let gather = RowGather::new(schema);
     for op in net.values() {
         if let Buffered::Present(batch, row) = op {
-            copy_batch_row(batch, *row, &mut out, schema);
+            gather.copy(batch, *row, &mut out);
         }
     }
     out

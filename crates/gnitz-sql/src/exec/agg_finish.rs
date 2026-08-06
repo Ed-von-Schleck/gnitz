@@ -341,11 +341,11 @@ fn combine(acc: &mut ColAcc, partial: &ZSetBatch, schema: &Schema, ci: usize, ro
         // pattern is the true sum mod 2^64 — the same i64 accumulator the
         // engine folds).
         ColAcc::IntSum { bits, seen, .. } => {
-            *bits = bits.wrapping_add(w.wrapping_mul(read_i64_8(partial, ci, row)));
+            *bits = bits.wrapping_add(w.wrapping_mul(i64::from_le_bytes(read_le8(partial, ci, row))));
             *seen = true;
         }
         ColAcc::FloatSum { val, seen } => {
-            *val += (w as f64) * read_f64(partial, ci, row);
+            *val += (w as f64) * f64::from_le_bytes(read_le8(partial, ci, row));
             *seen = true;
         }
         ColAcc::Extreme { best, is_max, tc } => {
@@ -371,12 +371,9 @@ fn fixed_slice(partial: &ZSetBatch, ci: usize, row: usize, stride: usize) -> &[u
     }
 }
 
-fn read_i64_8(partial: &ZSetBatch, ci: usize, row: usize) -> i64 {
-    i64::from_le_bytes(fixed_slice(partial, ci, row, 8).try_into().unwrap())
-}
-
-fn read_f64(partial: &ZSetBatch, ci: usize, row: usize) -> f64 {
-    f64::from_le_bytes(fixed_slice(partial, ci, row, 8).try_into().unwrap())
+/// One 8-byte partial-aggregate cell; the caller picks how to read it.
+fn read_le8(partial: &ZSetBatch, ci: usize, row: usize) -> [u8; 8] {
+    fixed_slice(partial, ci, row, 8).try_into().unwrap()
 }
 
 // ---------------------------------------------------------------------------

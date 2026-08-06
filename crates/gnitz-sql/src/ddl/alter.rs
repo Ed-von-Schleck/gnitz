@@ -155,7 +155,7 @@ fn rename_column(
     new_col: &str,
 ) -> Result<SqlResult, GnitzSqlError> {
     let source_name = extract_name(source, "ALTER TABLE")?;
-    if resolve_alter_base_table(client, schema_name, &source_name, if_exists, "RENAME COLUMN")?.is_none() {
+    if !alter_base_table_exists(client, schema_name, &source_name, if_exists, "RENAME COLUMN")? {
         return Ok(altered("column", new_col.to_string()));
     }
     client
@@ -296,7 +296,7 @@ fn add_constraint(
     reject_unhonored_unique_fields(u, "ADD CONSTRAINT")?;
 
     let source_name = extract_name(source, "ALTER TABLE")?;
-    if resolve_alter_base_table(client, schema_name, &source_name, if_exists, "ADD CONSTRAINT")?.is_none() {
+    if !alter_base_table_exists(client, schema_name, &source_name, if_exists, "ADD CONSTRAINT")? {
         return Ok(altered("constraint", source_name));
     }
 
@@ -328,7 +328,7 @@ fn drop_constraint(
 ) -> Result<SqlResult, GnitzSqlError> {
     validate_user_index_name(name)?;
     let source_name = extract_name(source, "ALTER TABLE")?;
-    if resolve_alter_base_table(client, schema_name, &source_name, tbl_if_exists, "DROP CONSTRAINT")?.is_none() {
+    if !alter_base_table_exists(client, schema_name, &source_name, tbl_if_exists, "DROP CONSTRAINT")? {
         return Ok(altered("constraint", name.to_string()));
     }
     client
@@ -339,32 +339,32 @@ fn drop_constraint(
 
 // --- shared helpers ---
 
-/// Resolve the ALTER target as a writable base table (validated name, view and
-/// system relation rejected). `Ok(None)` is the `IF EXISTS` no-op — the target
+/// Check the ALTER target is a writable base table (validated name, view and
+/// system relation rejected). `Ok(false)` is the `IF EXISTS` no-op — the target
 /// does not exist and the caller returns its success result untouched.
-fn resolve_alter_base_table(
+fn alter_base_table_exists(
     client: &mut GnitzClient,
     schema_name: &str,
     source_name: &str,
     if_exists: bool,
     op: &str,
-) -> Result<Option<u64>, GnitzSqlError> {
+) -> Result<bool, GnitzSqlError> {
     validate_user_name(source_name)?;
     match client
         .resolve_relation_kind(schema_name, source_name)
         .map_err(GnitzSqlError::Exec)?
     {
-        None if if_exists => Ok(None),
+        None if if_exists => Ok(false),
         None => Err(missing("Table", schema_name, source_name)),
         Some((_, true)) => Err(require_base_table(source_name, op)),
         Some((id, false)) => {
             reject_system_relation(id)?;
-            Ok(Some(id))
+            Ok(true)
         }
     }
 }
 
-/// As [`resolve_alter_base_table`], but also loads the resolved base table's full
+/// As [`alter_base_table_exists`], but also loads the resolved base table's full
 /// physical schema — columns include any hidden (dropped) slot and `pk_cols` are
 /// physical indices — for the DROP COLUMN / DROP NOT NULL column-level guards.
 /// `Ok(None)` is the `IF EXISTS` no-op.
@@ -375,7 +375,7 @@ fn resolve_alter_base_table_with_schema(
     if_exists: bool,
     op: &str,
 ) -> Result<Option<(u64, gnitz_core::Schema)>, GnitzSqlError> {
-    if resolve_alter_base_table(client, schema_name, source_name, if_exists, op)?.is_none() {
+    if !alter_base_table_exists(client, schema_name, source_name, if_exists, op)? {
         return Ok(None);
     }
     let (tid, schema) = client

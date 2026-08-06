@@ -691,3 +691,55 @@ fn test_replace_rejected_in_cte_body() {
     }
     assert!(client.resolve_table_or_view_id(&sn, "v").is_err(), "must not register");
 }
+
+/// `RENAME` names its output, so it can collide with a column the wildcard also
+/// passes through — unlike `EXCEPT`/`EXCLUDE`, which only drop. The duplicate
+/// check must therefore see a RENAME-bearing wildcard, or the view registers
+/// two visible columns of the same name.
+#[test]
+fn test_rename_colliding_with_existing_column_is_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
+    );
+    match try_exec(&mut client, &sn, "CREATE VIEW v AS SELECT * RENAME (a AS b) FROM t").unwrap_err() {
+        GnitzSqlError::Plan(s) => assert!(s.contains("duplicate column name"), "got: {s}"),
+        e => panic!("expected Plan(duplicate column name), got {e:?}"),
+    }
+    assert!(client.resolve_table_or_view_id(&sn, "v").is_err(), "must not register");
+}
+
+/// The exemption a bare `*` and `* EXCEPT(...)` still need: over a join whose
+/// two sides share a column name, the wildcard passes the source's own duplicate
+/// through positionally, which is allowed.
+#[test]
+fn test_except_wildcard_still_allows_a_join_source_duplicate() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE l (id BIGINT PRIMARY KEY, val BIGINT, x BIGINT)",
+    );
+    exec(&mut client, &sn, "CREATE TABLE r (id BIGINT PRIMARY KEY, val BIGINT)");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT * EXCEPT (x) FROM l JOIN r ON l.id = r.id",
+    );
+    let s = view_schema(&mut client, &sn, "v");
+    assert_eq!(
+        visible_names(&s).iter().filter(|n| *n == "val").count(),
+        2,
+        "both sides' val columns survive"
+    );
+}

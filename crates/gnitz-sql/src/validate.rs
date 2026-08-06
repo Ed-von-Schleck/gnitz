@@ -142,7 +142,7 @@ pub(crate) fn non_key_eligible_error(name: &str, tc: TypeCode, role: &str) -> Gn
 /// The single spelling of an "unhonored clause" rejection. `reject_unhonored_select_clauses`,
 /// `reject_unhonored_query_clauses`, and the `Cte`-envelope reject all funnel through this, so the
 /// `"{context}: {clause} is not supported"` grammar cannot drift per site.
-pub(crate) fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
+fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
     GnitzSqlError::Unsupported(format!("{context}: {clause} is not supported"))
 }
 
@@ -166,10 +166,10 @@ pub(crate) fn reject_column_overflow(what: &str, cols: usize) -> Result<(), Gnit
 #[derive(Clone, Copy)]
 pub(crate) struct HonoredClauses {
     /// `GROUP BY` and its `HAVING`. Honored only by the grouped-aggregate path.
-    pub grouping: bool,
+    pub(crate) grouping: bool,
     /// Plain `DISTINCT`. Honored only by the DISTINCT path (which dedups after
     /// this returns). `DISTINCT ON` is always rejected, independent of this flag.
-    pub distinct: bool,
+    pub(crate) distinct: bool,
 }
 
 impl HonoredClauses {
@@ -313,18 +313,18 @@ pub(crate) struct HonoredQueryClauses {
     /// binder cache, so a FROM name a CTE shadows resolves to the CTE's source;
     /// a non-pass-through CTE rejects the whole query as a derivation). A CTE
     /// body (nested CTE) and an INSERT source reject it.
-    pub with: bool,
+    pub(crate) with: bool,
     /// The site runs the client-side ordering sink: `ORDER BY` and `LIMIT`/`OFFSET` are applied
     /// to the fetched batch. Honored only by direct SELECT, which also rejects the `LIMIT … BY`
     /// sub-form with its own message; when `true` this guard leaves `order_by` and `limit_clause`
     /// to the caller.
-    pub ordering_sink: bool,
+    pub(crate) ordering_sink: bool,
 }
 
 impl HonoredQueryClauses {
     /// A site that honors no envelope clause at all — every narrowing site
     /// except direct SELECT.
-    pub const NONE: Self = HonoredQueryClauses {
+    pub(crate) const NONE: Self = HonoredQueryClauses {
         with: false,
         ordering_sink: false,
     };
@@ -412,7 +412,16 @@ pub(crate) fn plain_select_body<'a>(
     q: &'a sqlparser::ast::Query,
     ctx: &str,
 ) -> Result<&'a sqlparser::ast::Select, GnitzSqlError> {
-    match reject_query_envelope_body(q, ctx)? {
+    as_plain_select(reject_query_envelope_body(q, ctx)?, ctx)
+}
+
+/// A relational body narrowed to the plain `Select` a surface requires — one
+/// home for that rejection's message, shared by the sub-query and CTE unwraps.
+fn as_plain_select<'a>(
+    body: &'a sqlparser::ast::SetExpr,
+    ctx: &str,
+) -> Result<&'a sqlparser::ast::Select, GnitzSqlError> {
+    match body {
         sqlparser::ast::SetExpr::Select(s) => Ok(s.as_ref()),
         _ => Err(GnitzSqlError::Unsupported(format!(
             "{ctx}: only a plain SELECT body is supported"
@@ -448,12 +457,7 @@ pub(crate) fn cte_select_body<'a>(
     cte: &'a sqlparser::ast::Cte,
     ctx: &str,
 ) -> Result<&'a sqlparser::ast::Select, GnitzSqlError> {
-    match cte_body(cte, ctx)? {
-        sqlparser::ast::SetExpr::Select(s) => Ok(s.as_ref()),
-        _ => Err(GnitzSqlError::Unsupported(format!(
-            "{ctx}: only a plain SELECT body is supported"
-        ))),
-    }
+    as_plain_select(cte_body(cte, ctx)?, ctx)
 }
 
 /// Reject a CTE's envelope (a trailing FROM plus every unhonored `Query` clause)

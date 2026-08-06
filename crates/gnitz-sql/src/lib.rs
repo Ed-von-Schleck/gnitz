@@ -8,9 +8,9 @@ mod dispatch;
 mod dml;
 mod error;
 mod exec;
+mod expr_lower;
 mod hir;
 mod ir;
-mod lower;
 #[cfg(test)]
 mod test_support;
 mod types;

@@ -17,12 +17,18 @@ pub(crate) fn extract_name(name: &sqlparser::ast::ObjectName, context: &str) -> 
         .ok_or_else(|| GnitzSqlError::Bind(format!("empty name in {context}")))
 }
 
-/// True when every projection item is `*` — the shared test behind the
-/// "pass every source column through unchanged" wildcard fast paths.
-pub(crate) fn is_wildcard_projection(projection: &[sqlparser::ast::SelectItem]) -> bool {
+/// True when every projection item is a wildcard that names no output column of
+/// its own: a bare `*`, or `* EXCEPT/EXCLUDE(…)`, which only drop columns. The
+/// output names are then the source's own, so a duplicate among them belongs to
+/// the source (a join surfacing both sides' `val`) and is carried through
+/// positionally rather than rejected.
+///
+/// `RENAME` does name its output and can collide with a column the same wildcard
+/// passes through, so it is excluded here and gets the duplicate check.
+pub(crate) fn is_name_preserving_wildcard_projection(projection: &[sqlparser::ast::SelectItem]) -> bool {
     projection
         .iter()
-        .all(|p| matches!(p, sqlparser::ast::SelectItem::Wildcard(_)))
+        .all(|p| matches!(p, sqlparser::ast::SelectItem::Wildcard(o) if o.opt_rename.is_none()))
 }
 
 /// True when a SELECT carries a GROUP BY — either `GROUP BY ALL` or a non-empty
@@ -82,7 +88,7 @@ const AGG_NAMES: [(&str, AggFunc); 5] = [
 /// The single name→aggregate map: the binder's `bind_function` dispatches the
 /// argument shape from it (COUNT(*) vs COUNT(x)), and the dispatch walkers use
 /// it to detect an aggregate — an aggregate added here reaches them all at once.
-pub(crate) fn agg_func_from_name(name: &str) -> Option<AggFunc> {
+fn agg_func_from_name(name: &str) -> Option<AggFunc> {
     AGG_NAMES
         .into_iter()
         .find_map(|(n, f)| name.eq_ignore_ascii_case(n).then_some(f))
@@ -167,7 +173,7 @@ pub(crate) fn body_is_grouped(select: &sqlparser::ast::Select) -> bool {
 /// aggregate, or rejects a computed-over-aggregate via its strict validator)
 /// instead of to the scalar `Simple` builder. The recursion mirrors the binder's
 /// `bind_structural` node set so the two agree on where an aggregate can hide.
-pub(crate) fn projection_has_aggregate(select: &sqlparser::ast::Select) -> bool {
+fn projection_has_aggregate(select: &sqlparser::ast::Select) -> bool {
     // `*` / `tbl.*` (the `None` items) cannot be an aggregate.
     select
         .projection
@@ -176,16 +182,18 @@ pub(crate) fn projection_has_aggregate(select: &sqlparser::ast::Select) -> bool 
         .any(expr_has_aggregate)
 }
 
+/// Whether `e` or any node beneath it satisfies `p` — the one recursive
+/// existence walk over the [`expr_operands`] node set, so a walker written
+/// against it inherits that set rather than re-spelling the recursion.
+fn expr_any(e: &sqlparser::ast::Expr, p: &impl Fn(&sqlparser::ast::Expr) -> bool) -> bool {
+    p(e) || expr_operands(e).into_iter().any(|o| expr_any(o, p))
+}
+
 /// Recursively test whether an expression contains an aggregate function call:
 /// the call itself, or — for a non-aggregate wrapper over one (`abs(SUM(x))`,
 /// still a grouped shape) — any of its operands.
 fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
-    if let sqlparser::ast::Expr::Function(f) = e {
-        if is_agg_call(f) {
-            return true;
-        }
-    }
-    expr_operands(e).into_iter().any(expr_has_aggregate)
+    expr_any(e, &|e| matches!(e, sqlparser::ast::Expr::Function(f) if is_agg_call(f)))
 }
 
 /// Whether a function call names one of the aggregates.
@@ -334,6 +342,30 @@ pub(crate) fn projection_item_expr(item: &sqlparser::ast::SelectItem) -> Option<
     }
 }
 
+/// A non-wildcard SELECT item as `(expr, alias)` — the alias-carrying sibling of
+/// [`projection_item_expr`]. `ctx` names the clause the reject speaks for. A
+/// multi-alias item (`expr AS (a, b)`) is not a scalar projection and rejects
+/// here with the wildcards.
+pub(crate) fn scalar_projection_item<'a>(
+    item: &'a SelectItem,
+    ctx: &str,
+) -> Result<(&'a sqlparser::ast::Expr, Option<String>), GnitzSqlError> {
+    match item {
+        SelectItem::UnnamedExpr(expr) => Ok((expr, None)),
+        SelectItem::ExprWithAlias { expr, alias } => Ok((expr, Some(alias.value.clone()))),
+        _ => Err(GnitzSqlError::Unsupported(format!("{ctx}: unsupported SELECT item"))),
+    }
+}
+
+/// A source column re-emitted as an output column: an alias only renames it.
+pub(crate) fn aliased_def(src: &ColumnDef, alias: Option<String>) -> ColumnDef {
+    let mut def = src.clone();
+    if let Some(name) = alias {
+        def.name = name;
+    }
+    def
+}
+
 /// The two expression surfaces subquery detection scans — a SELECT's WHERE and its
 /// projection items (a wildcard contributes none). The one definition of "which
 /// surfaces decide subquery detection", shared by the EXISTS/IN and scalar/ANY/ALL
@@ -350,25 +382,24 @@ fn select_exprs(select: &sqlparser::ast::Select) -> impl Iterator<Item = &sqlpar
 /// walk visits each (under OR/NOT, inside CASE, in a projection) without descending
 /// into its body.
 pub(crate) fn has_exists_in_subquery(select: &sqlparser::ast::Select) -> bool {
-    select_exprs(select).any(expr_has_exists_in)
+    select_exprs(select).any(|e| expr_any(e, &is_exists_in))
 }
 
-fn expr_has_exists_in(e: &sqlparser::ast::Expr) -> bool {
+fn is_exists_in(e: &sqlparser::ast::Expr) -> bool {
     use sqlparser::ast::Expr;
-    matches!(e, Expr::Exists { .. } | Expr::InSubquery { .. }) || expr_operands(e).into_iter().any(expr_has_exists_in)
+    matches!(e, Expr::Exists { .. } | Expr::InSubquery { .. })
 }
 
 /// Whether `select` carries a scalar `Expr::Subquery` or an `Expr::AnyOp` /
 /// `Expr::AllOp` anywhere in its WHERE or projection. (EXISTS/IN are detected
 /// separately by [`has_exists_in_subquery`].)
 pub(crate) fn has_scalar_subquery(select: &sqlparser::ast::Select) -> bool {
-    select_exprs(select).any(expr_has_scalar_subquery)
+    select_exprs(select).any(|e| expr_any(e, &is_scalar_subquery))
 }
 
-fn expr_has_scalar_subquery(e: &sqlparser::ast::Expr) -> bool {
+fn is_scalar_subquery(e: &sqlparser::ast::Expr) -> bool {
     use sqlparser::ast::Expr;
     matches!(e, Expr::Subquery(_) | Expr::AnyOp { .. } | Expr::AllOp { .. })
-        || expr_operands(e).into_iter().any(expr_has_scalar_subquery)
 }
 
 /// The classified shape of a FROM clause — the one definition of "a single plain
@@ -408,8 +439,8 @@ pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShap
 
 /// Flattens an `AND`-tree into its leaf conjuncts, left to right. Descends
 /// through `AND` nesting and unwraps parenthesised `Nested` wrappers; any other
-/// node (an equality, a range, an `OR`-group, …) is a leaf kept intact. Shared
-/// by the DML access-path planner and the CREATE VIEW shape classifier.
+/// node (an equality, a range, an `OR`-group, …) is a leaf kept intact. The
+/// AST form; `access::flatten_bound_conjuncts` is the `BoundExpr` analogue.
 pub(crate) fn flatten_conjuncts<'e>(expr: &'e sqlparser::ast::Expr, out: &mut Vec<&'e sqlparser::ast::Expr>) {
     use sqlparser::ast::{BinaryOperator, Expr};
     match expr {
@@ -427,8 +458,7 @@ pub(crate) fn flatten_conjuncts<'e>(expr: &'e sqlparser::ast::Expr, out: &mut Ve
 }
 
 /// Extract table name from a TableFactor::Table. Strict — a derived table
-/// (subquery in FROM) is rejected; only the CREATE VIEW planner paths that
-/// pre-compile derived tables may accept one (`extract_relation_name`).
+/// (subquery in FROM) is rejected.
 ///
 /// The one acceptance point for a base-relation FROM factor, so every semantic
 /// qualifier gnitz does not implement is rejected here (exhaustive destructure,
@@ -484,31 +514,15 @@ pub(crate) fn extract_table_factor_name(
     extract_name(name, context)
 }
 
-/// Extract the resolvable relation name of a CREATE VIEW FROM factor: a table's
-/// name, or a derived table's alias. Only for the view-planner paths that run
-/// *after* the front door pre-compiled every top-level derived table into a
-/// hidden view registered under its alias — elsewhere (DML, set-op sides, CTE
-/// bodies) a derived table is NOT pre-compiled and the alias would mis-resolve,
-/// so those paths use the strict `extract_table_factor_name`. An unaliased
-/// derived table cannot be referenced, so it is rejected.
-pub(crate) fn extract_relation_name(tf: &sqlparser::ast::TableFactor, context: &str) -> Result<String, GnitzSqlError> {
-    match tf {
-        sqlparser::ast::TableFactor::Derived { alias: Some(a), .. } => Ok(a.name.value.clone()),
-        sqlparser::ast::TableFactor::Derived { alias: None, .. } => Err(GnitzSqlError::Unsupported(format!(
-            "{context}: a derived table (subquery in FROM) needs an alias"
-        ))),
-        _ => extract_table_factor_name(tf, context),
-    }
-}
-
-/// Extract `(relation name, effective alias)` from a CREATE VIEW FROM factor —
-/// the declared alias when present, else the name itself. Derived tables resolve
-/// by alias (see `extract_relation_name` for when that is sound).
+/// Extract `(relation name, effective alias)` from a plain-table FROM factor —
+/// the declared alias when present, else the name itself. Every caller has
+/// already routed a derived table elsewhere (the HIR binds it as an inline
+/// subtree), so anything but a table rejects here.
 pub(crate) fn extract_table_name_and_alias(
     tf: &sqlparser::ast::TableFactor,
     context: &str,
 ) -> Result<(String, String), GnitzSqlError> {
-    let name = extract_relation_name(tf, context)?;
+    let name = extract_table_factor_name(tf, context)?;
     let alias = match tf {
         sqlparser::ast::TableFactor::Table { alias: Some(a), .. } => a.name.value.clone(),
         _ => name.clone(),
@@ -875,7 +889,7 @@ mod tests {
     /// route the view to the subquery-bearing builder.
     #[test]
     fn expr_operands_exposes_a_subquery_under_a_cast() {
-        assert!(expr_has_scalar_subquery(&parse("CAST((SELECT 1) AS INT)")));
-        assert!(expr_has_exists_in(&parse("CAST(x AS INT) IN (SELECT y FROM t)")));
+        assert!(expr_any(&parse("CAST((SELECT 1) AS INT)"), &is_scalar_subquery));
+        assert!(expr_any(&parse("CAST(x AS INT) IN (SELECT y FROM t)"), &is_exists_in));
     }
 }

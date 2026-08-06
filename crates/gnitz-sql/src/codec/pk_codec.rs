@@ -121,7 +121,7 @@ pub(crate) fn extract_sql_literal(expr: &Expr) -> Option<SqlLiteral<'_>> {
 /// Routes through `parse_pk_literal_packed` (numerics) or `parse_uuid_str`
 /// (UUID); the returned u128's low `wire_stride` bytes carry the column's
 /// native LE bytes.
-pub(crate) fn parse_one_pk_literal(pk_expr: &Expr, tc: TypeCode, col_name: &str) -> Result<u128, GnitzSqlError> {
+fn parse_one_pk_literal(pk_expr: &Expr, tc: TypeCode, col_name: &str) -> Result<u128, GnitzSqlError> {
     match extract_sql_literal(pk_expr) {
         Some(SqlLiteral::Number(n, negated)) => parse_pk_literal_packed(tc, n, negated).ok_or_else(|| {
             if negated

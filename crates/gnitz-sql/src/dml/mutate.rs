@@ -12,10 +12,10 @@ use crate::dml::overlay::{buffered_net, present_rows};
 use crate::dml::plan::{bound_and_predicate, fetch_bound, AccessPlan, ReadBudget};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
-use crate::exec::batch::copy_batch_row_owned;
+use crate::exec::batch::RowGather;
 use crate::exec::residual::matching_indices;
+use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
-use crate::lower::compile_scalar_evaluator;
 use crate::SqlResult;
 use gnitz_core::null_word_set;
 use gnitz_core::{
@@ -293,6 +293,12 @@ fn resolve_where_matches(
     reply_schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let mut committed = fetch_bound(client, tid, plan, sink, reply_schema)?;
+    // In autocommit there is no buffer to overlay, and `buffered_scope`'s gather
+    // can be megabytes of `PkTuple` for a large `pk IN (…)` — so ask only when a
+    // transaction is open, which is the condition its doc already states.
+    if client.txn_buffer().is_none() {
+        return Ok(committed.unwrap_or_else(|| ZSetBatch::new(reply_schema)));
+    }
     let (keys, preds) = plan.buffered_scope(schema);
     let net = buffered_net(client, tid, keys.as_deref());
     if net.is_empty() {
@@ -303,18 +309,19 @@ fn resolve_where_matches(
 
     let n = committed.as_ref().map_or(0, ZSetBatch::len) + matched.len();
     let mut eff = ZSetBatch::with_capacity(reply_schema, n);
+    let gather = RowGather::new(reply_schema);
     if let Some(b) = &mut committed {
         let stride = schema.pk_stride() as u8;
         for i in 0..b.len() {
             // A PK the transaction has written is decided by its buffered version
             // below, whatever the committed row said.
             if !net.contains_key(&b.pks.get_tuple(i, stride)) {
-                copy_batch_row_owned(b, i, &mut eff, reply_schema);
+                gather.take(b, i, &mut eff);
             }
         }
     }
     for i in matched {
-        copy_batch_row_owned(&mut present, i, &mut eff, reply_schema);
+        gather.take(&mut present, i, &mut eff);
     }
     Ok(eff)
 }

@@ -1,7 +1,7 @@
 use crate::error::GnitzSqlError;
 use crate::exec::batch::filter_batch;
+use crate::expr_lower::compile_filter_evaluator;
 use crate::ir::BoundExpr;
-use crate::lower::compile_filter_evaluator;
 use gnitz_core::{Schema, ZSetBatch};
 
 /// Indices of the rows of `batch` that pass every residual predicate, in

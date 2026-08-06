@@ -9,6 +9,7 @@
 //! shape (it sinks only into shared lower layers, never up into `plan`).
 
 use crate::ast_util::agg_func_name;
+use crate::bind::fold_null_test;
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr};
 use crate::types::{has_scalar_register, is_integer_type};
@@ -61,24 +62,6 @@ pub(crate) struct AggSpec {
     pub(crate) op: WireAggFunc,
     pub(crate) col: usize,
     pub(crate) out_type: TypeCode,
-}
-
-/// The aggregate output type, via the single shared planner/engine rule
-/// (`gnitz_wire::agg_output_type`), over the argument column's definition. AVG is
-/// planner-lowered (SUM/COUNT + a finalize divide) before the wire and always
-/// produces F64. A source-less aggregate (COUNT) passes I64, which the rule maps
-/// to its own default arms.
-pub(crate) fn agg_result_type_of(func: AggFunc, arg: Option<&ColumnDef>) -> TypeCode {
-    let wire_func = match func {
-        AggFunc::Avg => return TypeCode::F64,
-        AggFunc::Count => gnitz_core::AggFunc::Count,
-        AggFunc::CountNonNull => gnitz_core::AggFunc::CountNonNull,
-        AggFunc::Sum => gnitz_core::AggFunc::Sum,
-        AggFunc::Min => gnitz_core::AggFunc::Min,
-        AggFunc::Max => gnitz_core::AggFunc::Max,
-    };
-    let src_tc = arg.map(|c| c.type_code as u8).unwrap_or(TypeCode::I64 as u8);
-    TypeCode::from_validated_u8(gnitz_core::agg_output_type(wire_func, src_tc))
 }
 
 /// What each SELECT item represents in a GROUP BY query (in SELECT order).
@@ -203,7 +186,7 @@ pub(crate) fn synthetic_fold_cols(
 /// The raw reduce column's nullability for one physical spec, via the shared
 /// `AggFunc::raw_output_nullable` the engine's `build_reduce_output_schema`
 /// obeys — so the planner's virtual reduce schema and the physical one agree.
-pub(crate) fn agg_raw_nullable(source_schema: &Schema, spec: &AggSpec, is_global: bool) -> bool {
+fn agg_raw_nullable(source_schema: &Schema, spec: &AggSpec, is_global: bool) -> bool {
     let src_nullable = source_schema
         .columns
         .get(spec.col)
@@ -257,6 +240,15 @@ impl<'a> ReduceShape<'a> {
 pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
     let (source_schema, agg_specs) = (sh.source_schema, sh.specs);
     let is_global = sh.global_ground;
+    // Every layout ends with one `_agg` column per physical spec, at the spec's
+    // own type and the shared per-spec nullability rule.
+    let agg_cols = |cols: &mut Vec<ColumnDef>| {
+        cols.extend(
+            agg_specs
+                .iter()
+                .map(|s| ColumnDef::new("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
+        )
+    };
     let (columns, pk_cols) = match sh.out_key {
         ReduceOutKey::PkPermutation => {
             let mut cols: Vec<ColumnDef> = source_schema
@@ -265,20 +257,12 @@ pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
                 .map(|&pi| source_schema.columns[pi].clone())
                 .collect();
             let pk: Vec<usize> = (0..cols.len()).collect();
-            cols.extend(
-                agg_specs
-                    .iter()
-                    .map(|s| ColumnDef::new("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
-            );
+            agg_cols(&mut cols);
             (cols, pk)
         }
         ReduceOutKey::SingleNaturalCol => {
             let mut cols = vec![source_schema.columns[sh.group_cols[0]].clone()];
-            cols.extend(
-                agg_specs
-                    .iter()
-                    .map(|s| ColumnDef::new("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
-            );
+            agg_cols(&mut cols);
             (cols, vec![0])
         }
         // The shared SyntheticFold layout (also the ad-hoc partial schema).
@@ -494,6 +478,31 @@ pub(crate) fn finalize_agg_bexpr<R>(value: R, companion: Option<R>, func: AggFun
     }
 }
 
+/// `IS [NOT] NULL` over a finalized aggregate — the null-test sibling of
+/// [`finalize_agg_bexpr`], generic over the leaf reference `R` for the same
+/// reason (the ad-hoc path addresses reduce-output positions, the view path
+/// `ColId`s).
+///
+/// A companion-carrying aggregate (nullable SUM / AVG) tests the hidden
+/// COUNT_NON_NULL companion instead of the value column: a linear-fold SUM's
+/// saturating has_value bit stays set once its last non-null contributor
+/// retracts, so the value column would report 0 where NULL is correct, and AVG
+/// has no single raw column at all. Everything else routes through
+/// [`fold_null_test`] with its authoritative nullability, so a never-null shape
+/// const-folds away.
+pub(crate) fn finalize_agg_null_test<R>(
+    value: R,
+    companion: Option<R>,
+    output_nullable: bool,
+    want_null: bool,
+) -> BExpr<R> {
+    let Some(cnt) = companion else {
+        return fold_null_test(output_nullable, value, want_null);
+    };
+    let bop = if want_null { BinOp::Eq } else { BinOp::Ne };
+    BExpr::BinOp(Box::new(BExpr::ColRef(cnt)), bop, Box::new(BExpr::LitInt(0)))
+}
+
 /// Whether an aggregate's **finalize** output is nullable. AVG's and nullable-SUM's
 /// null-ness lives in the COUNT_NON_NULL companion (the finalize renders NULL via
 /// div-by-zero), so a companion-carrying shape is unconditionally nullable; a direct
@@ -585,11 +594,15 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
         AggFunc::Sum => (AggShape::Direct, vec![op(WireAggFunc::Sum)]),
         AggFunc::Avg => (AggShape::Avg, vec![op(WireAggFunc::Sum), op(WireAggFunc::CountNonNull)]),
     };
-    Ok(AggTyping {
-        shape,
-        view_type: agg_result_type_of(agg_func, arg),
-        ops,
-    })
+    // AVG is planner-lowered to SUM/COUNT plus a finalize divide, so what SELECT
+    // sees is F64 rather than the SUM component's type; every other aggregate
+    // renders its value op's own output type.
+    let view_type = if agg_func == AggFunc::Avg {
+        TypeCode::F64
+    } else {
+        ops[0].1
+    };
+    Ok(AggTyping { shape, view_type, ops })
 }
 
 /// Every planner-built reduce gates group existence on a NULL-blind COUNT(*)
@@ -702,7 +715,7 @@ mod tests {
             ],
             pk_cols: vec![0],
         };
-        let rt = |f, i: usize| agg_result_type_of(f, Some(&s.columns[i]));
+        let rt = |f, i: usize| agg_typing(f, Some(&s.columns[i])).unwrap().view_type;
         assert_eq!(rt(AggFunc::Sum, 1), TypeCode::U64); // SUM(u64) → U64
         assert_eq!(rt(AggFunc::Sum, 2), TypeCode::I64); // SUM(u32) → I64
         assert_eq!(rt(AggFunc::Sum, 3), TypeCode::I64); // SUM(i64) → I64
