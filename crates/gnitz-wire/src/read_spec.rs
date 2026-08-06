@@ -14,6 +14,7 @@
 use crate::catalog::MAX_COLUMNS;
 use crate::circuit::AggFunc;
 use crate::range::RangeDescriptor;
+use crate::reader::Reader;
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
 pub const MAX_ORDER_KEYS: usize = 16;
@@ -21,7 +22,7 @@ pub const MAX_ORDER_KEYS: usize = 16;
 /// several gathers or as an ordinary predicate scan, never rejected.
 pub const MAX_PK_SET_KEYS: usize = 65_536;
 /// Decode-side ceiling on a full encoded `ReadSpec` blob.
-pub const MAX_READ_SPEC_BYTES: usize = 2 << 20;
+pub(crate) const MAX_READ_SPEC_BYTES: usize = 2 << 20;
 
 const VERSION: u8 = 3;
 
@@ -211,70 +212,6 @@ pub fn peek_pk_range(buf: &[u8]) -> Option<RangeDescriptor> {
     read_range_descriptor(&mut r).ok()
 }
 
-/// A bounds-checked forward reader over the encoded blob — every field access
-/// is a `take` that rejects a truncated frame rather than panicking.
-struct Reader<'a> {
-    buf: &'a [u8],
-    off: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Reader { buf, off: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let end = self.off.checked_add(n).ok_or("read_spec: length overflow")?;
-        if end > self.buf.len() {
-            return Err(format!(
-                "read_spec: truncated (need {n} bytes at offset {}, {} remain)",
-                self.off,
-                self.buf.len() - self.off
-            ));
-        }
-        let s = &self.buf[self.off..end];
-        self.off = end;
-        Ok(s)
-    }
-
-    fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Result<u16, String> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-    fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn u64(&mut self) -> Result<u64, String> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-    fn u128(&mut self) -> Result<u128, String> {
-        Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
-    }
-
-    /// A `u32`-length-prefixed byte section — the inverse of [`put_bytes32`].
-    /// The length is bounds-checked by `take`, so a hostile prefix is a clean
-    /// `Err` rather than an over-large allocation.
-    fn bytes32(&mut self) -> Result<&'a [u8], String> {
-        let n = self.u32()? as usize;
-        self.take(n)
-    }
-
-    /// The next byte without consuming it — used to compute a variable-length
-    /// `RangeDescriptor`'s span from its leading `n_eq`.
-    fn peek_u8(&self) -> Result<u8, String> {
-        self.buf
-            .get(self.off)
-            .copied()
-            .ok_or_else(|| "read_spec: truncated reading descriptor length".to_string())
-    }
-
-    fn remaining(&self) -> usize {
-        self.buf.len() - self.off
-    }
-}
-
 /// Read an embedded `RangeDescriptor`: peek its `n_eq` to learn its span, slice
 /// exactly that many bytes, and defer full validation to `RangeDescriptor::decode`.
 /// (`n_eq` is one byte, so `encoded_len` cannot overflow; a pathological value
@@ -326,9 +263,9 @@ impl ReadSpec {
             }
             ReadBound::PkSet(keys) => {
                 out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
-                for k in keys {
-                    out.extend_from_slice(&k.to_le_bytes());
-                }
+                // One memcpy: on a little-endian target the `u128` slice already
+                // IS its wire image. A `pk IN (…)` set reaches MAX_PK_SET_KEYS.
+                out.extend_from_slice(crate::as_le_bytes(keys));
             }
         }
 
@@ -415,10 +352,11 @@ impl ReadSpec {
                 // a raw-`u128` set cannot see the wire keys that collide once
                 // truncated to the PK's width. The reject lives in the worker's
                 // schema-aware gather.
-                let mut keys = Vec::with_capacity(count);
-                for _ in 0..count {
-                    keys.push(r.u128()?);
-                }
+                let raw = r.take(count * 16)?;
+                let keys = raw
+                    .chunks_exact(16)
+                    .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
                 ReadBound::PkSet(keys)
             }
             other => return Err(format!("read_spec: unknown bound kind {other}")),

@@ -2,7 +2,6 @@
 
 use core::cmp::Ordering;
 
-#[allow(dead_code)]
 pub mod type_code {
     pub const U8: u8 = 1;
     pub const I8: u8 = 2;
@@ -139,8 +138,8 @@ impl TypeCode {
     /// The 16-byte integer-ish types (U128, UUID, I128) with no i64 slot in the
     /// expression VM: a bound on such a column cannot be re-imposed by a
     /// compiled predicate, so a range walk over it must be byte-exact
-    /// (un-gated). The SQL layer (conjunct stripping) and the engine worker
-    /// (walk gating) both derive that split from this one predicate.
+    /// (un-gated). The SQL layer reads this when deciding which conjuncts it may
+    /// strip; it then ships the verdict as the `exact` bit on the bound.
     pub const fn is_wide_int(&self) -> bool {
         matches!(self, TypeCode::U128 | TypeCode::UUID | TypeCode::I128)
     }
@@ -204,7 +203,7 @@ impl TypeCode {
     /// Narrow unsigned/signed integers are excluded; only the natural key-width
     /// unsigned types qualify.
     #[inline]
-    pub const fn is_natural_reduce_key(&self) -> bool {
+    pub(crate) const fn is_natural_reduce_key(&self) -> bool {
         matches!(self, TypeCode::U64 | TypeCode::U128 | TypeCode::UUID)
     }
 
@@ -262,6 +261,9 @@ impl TypeCode {
 #[inline]
 pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
     debug_assert_eq!(a.len(), b.len(), "cmp_typed_le: windows must be equal length");
+    // Pin `b` to `a`'s width once. Without it every arm below dispatches on
+    // `b.len()` a second time, since the debug assert above is gone in release.
+    let b = &b[..a.len()];
     match tc {
         type_code::U128 | type_code::UUID => {
             u128::from_le_bytes(a.try_into().unwrap()).cmp(&u128::from_le_bytes(b.try_into().unwrap()))
@@ -754,9 +756,8 @@ pub const fn resolve_reindex_type(src_tc: u8, carried_tc: u8) -> u8 {
 /// Inverse of [`resolve_reindex_type`]: the per-slot carried target tc to PERSIST
 /// for a key column of source type `src_tc` whose pair resolved to common type
 /// `common_tc`. Returns `0` ("derive from source") when the column already
-/// self-derives to `common_tc` — keeping same-type / U128-vs-UUID / string
-/// circuits byte-identical to the pre-promotion serialization — else the carried
-/// `common_tc`. Co-located with `resolve_reindex_type` so the encode (planner)
+/// self-derives to `common_tc` — so a slot that needs no promotion costs no
+/// param row — else the carried `common_tc`. Co-located with `resolve_reindex_type` so the encode (planner)
 /// and decode (engine) ends of the rule round-trip:
 /// `resolve_reindex_type(src, carried_reindex_tc(src, t)) == t` for any `t` a key
 /// of `src` can be promoted to (see the round-trip test).
@@ -1079,7 +1080,7 @@ mod tests {
     #[test]
     fn carried_reindex_tc_round_trips_with_resolve() {
         use type_code::*;
-        // Self-deriving slots collapse to 0 — the legacy / byte-identical path.
+        // A slot that needs no promotion collapses to 0 and carries no target.
         assert_eq!(carried_reindex_tc(I32, I32), 0);
         assert_eq!(carried_reindex_tc(U64, U64), 0);
         assert_eq!(carried_reindex_tc(STRING, U128), 0);

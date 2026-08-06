@@ -25,8 +25,8 @@
 use crate::catalog::col;
 use crate::{
     encode_german_string, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireSysCol, IPC_CONTROL_TID,
-    NUM_FIXED_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION,
-    WAL_HEADER_SIZE, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
+    REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION, WAL_HEADER_SIZE,
+    WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
 const CONTROL_COLS: &[WireSysCol] = &[
@@ -44,9 +44,9 @@ const CONTROL_COLS: &[WireSysCol] = &[
 
 const NUM_COLUMNS: usize = CONTROL_COLS.len();
 
-/// WAL region count for a CONTROL_SCHEMA block: the fixed regions (pk, weight,
-/// null_bmp) + (NUM_COLUMNS - 1) payload columns + 1 blob region.
-const NUM_REGIONS: usize = NUM_FIXED_REGIONS + (NUM_COLUMNS - 1) + 1;
+/// WAL region count for a CONTROL_SCHEMA block. The PK is column 0, so the
+/// block has `NUM_COLUMNS - 1` payload columns.
+const NUM_REGIONS: usize = crate::wal::num_regions(NUM_COLUMNS - 1);
 
 /// Region index of the payload column named `name`: the fixed regions, then the
 /// payload columns in schema order (`pay_index_in`, valid here because the PK is
@@ -175,7 +175,7 @@ const CTRL_BLOCK_TEMPLATE: [u8; CTRL_BLOCK_SIZE_NO_BLOB] = {
     template_write(&mut buf, WAL_OFF_NUM_REGIONS, (NUM_REGIONS as u32).to_le_bytes());
     let mut r = 0;
     while r < NUM_REGIONS {
-        let dir = WAL_HEADER_SIZE + r * 8;
+        let dir = crate::wal::dir_entry_offset(r);
         template_write(&mut buf, dir, (ctrl_region_offset(r) as u32).to_le_bytes());
         template_write(&mut buf, dir + 4, (ctrl_region_size(r) as u32).to_le_bytes());
         r += 1;
@@ -244,7 +244,7 @@ pub fn encode_ctrl_block(
         buf[OFF_SEEK_PK_EXTRA..OFF_SEEK_PK_EXTRA + 16].copy_from_slice(&st);
     }
     buf[OFF_NULL_BMP..OFF_NULL_BMP + 8].copy_from_slice(&null_word.to_le_bytes());
-    crate::write_u32_le(buf, WAL_HEADER_SIZE + REG_BLOB * 8 + 4, blob.len() as u32);
+    crate::write_u32_le(buf, crate::wal::dir_entry_offset(REG_BLOB) + 4, blob.len() as u32);
     buf[CTRL_BLOCK_SIZE_NO_BLOB..CTRL_BLOCK_SIZE_NO_BLOB + blob.len()].copy_from_slice(&blob);
     crate::write_u32_le(buf, WAL_OFF_SIZE, total as u32);
     total

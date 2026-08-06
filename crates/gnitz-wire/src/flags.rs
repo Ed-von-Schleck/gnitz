@@ -69,8 +69,6 @@ pub const FLAG_CONTINUATION: u64 = 1 << 52;
 /// GET_INDICES request flag. Client-only and never written to SAL, so it sits
 /// above the SAL mirror (bits 0-15) and the wire packed fields rather than in
 /// the request-flag run at 4..256 — all of bits 0-15 are already allocated.
-/// Bit 54 is the lowest free request bit (50/51/53 are the engine-internal
-/// FLAG_BATCH_SORTED / FLAG_BATCH_CONSOLIDATED / FLAG_SCAN_LAST below).
 pub const FLAG_GET_INDICES: u64 = 1 << 54;
 
 /// ALLOCATE_SERIAL_RANGE request flag. The client→master leg of a user-table
@@ -86,9 +84,8 @@ pub const FLAG_ALLOCATE_SERIAL_RANGE: u64 = 1 << 56;
 /// hint: it is consumed at `handle_message` routing and is NEVER written to the
 /// SAL — each family is broadcast under its own `FLAG_DDL_SYNC` group and the
 /// zone's `FLAG_TXN_COMMIT` sentinel is unrelated `sal.rs` state — so it takes a
-/// free high client-only bit (bit 57, above the SAL mirror at bits 0-15 and the
-/// bit-16–47 packed fields; 56 is the current top). Disjoint from every other
-/// flag by the compile-time guard below.
+/// high client-only bit, above the SAL mirror at bits 0-15 and the bit-16–47
+/// packed fields. Disjoint from every other flag by the compile-time guard below.
 pub const FLAG_DDL_TXN: u64 = 1 << 57;
 
 /// ID-allocation request flags (client→master, answered master-locally,
@@ -102,14 +99,12 @@ pub const FLAG_ALLOCATE_INDEX_ID: u64 = 1 << 60;
 /// analogue of `FLAG_DDL_TXN`, which is exclusive to system families). Purely a
 /// wire-level decode hint consumed at `handle_message` routing; it is NEVER
 /// written to the SAL — each family is emitted under its own `FLAG_PUSH` group
-/// inside one zone closed by the engine-internal `FLAG_TXN_COMMIT` sentinel. Bit
-/// 61, the next free high client-only bit above `FLAG_ALLOCATE_INDEX_ID`.
+/// inside one zone closed by the engine-internal `FLAG_TXN_COMMIT` sentinel.
 pub const FLAG_PUSH_TXN: u64 = 1 << 61;
 
 /// SCAN_MULTI request flag. Client→master frame naming N relations to snapshot
 /// at one SAL cut. Wire-level routing hint consumed at `handle_message`; never
-/// written to the SAL. Bit 62 — the next free high client-only bit above
-/// `FLAG_PUSH_TXN` (61); bit 63 is free.
+/// written to the SAL.
 pub const FLAG_SCAN_MULTI: u64 = 1 << 62;
 
 /// Maximum relations in one SCAN_MULTI request. A product / master-state limit

@@ -293,52 +293,34 @@ pub fn encode_expr_blob(num_regs: u32, result_reg: u32, code: &[u32], const_stri
 /// alignment, region lengths, and the string-count OOM bound. Does **not** validate program
 /// semantics (opcodes, register operands, column indices) — that is the decoder-consumer's job.
 pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
-    if blob.len() < EXPR_BLOB_HEADER_SIZE {
+    let mut r = crate::reader::Reader::new(blob);
+    if r.u32().ok()? != EXPR_BLOB_MAGIC || r.u8().ok()? != EXPR_BLOB_VERSION || r.u8().ok()? != 0 {
         return None;
     }
-    if crate::read_u32_le(blob, 0) != EXPR_BLOB_MAGIC {
-        return None;
+    let num_regs = r.u16().ok()? as u32;
+    let result_reg = r.u16().ok()? as u32;
+    if r.u16().ok()? != 0 {
+        return None; // reserved
     }
-    if blob[4] != EXPR_BLOB_VERSION {
-        return None;
-    }
-    if blob[5] != 0 || blob[10] != 0 || blob[11] != 0 {
-        return None;
-    }
-    let num_regs = crate::read_u16_le(blob, 6) as u32;
-    let result_reg = crate::read_u16_le(blob, 8) as u32;
-    let n = crate::read_u32_le(blob, 12);
+    let n = r.u32().ok()?;
     if !n.is_multiple_of(4) {
         return None;
     }
-    let code_bytes = (n as usize) * 4;
-    let code_end = EXPR_BLOB_HEADER_SIZE + code_bytes;
-    if blob.len() < code_end + 4 {
-        return None;
-    }
-    let code: Vec<u32> = blob[EXPR_BLOB_HEADER_SIZE..code_end]
+    let code: Vec<u32> = r
+        .take(n as usize * 4)
+        .ok()?
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let s_count = crate::read_u32_le(blob, code_end);
-    let mut cur = code_end + 4;
+    let s_count = r.u32().ok()? as usize;
     // Each string costs at least its 4-byte length prefix; bound s_count against the
     // remaining bytes before reserving, so a corrupt count can't drive a huge with_capacity.
-    if (s_count as usize) > blob.len().saturating_sub(cur) / 4 {
+    if s_count > r.remaining() / 4 {
         return None;
     }
-    let mut const_strings = Vec::with_capacity(s_count as usize);
+    let mut const_strings = Vec::with_capacity(s_count);
     for _ in 0..s_count {
-        if blob.len() < cur + 4 {
-            return None;
-        }
-        let l = crate::read_u32_le(blob, cur) as usize;
-        cur += 4;
-        if blob.len() < cur + l {
-            return None;
-        }
-        const_strings.push(blob[cur..cur + l].to_vec());
-        cur += l;
+        const_strings.push(r.bytes32().ok()?.to_vec());
     }
     Some(ExprBlob {
         num_regs,

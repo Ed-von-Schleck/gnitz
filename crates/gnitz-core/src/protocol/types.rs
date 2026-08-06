@@ -384,18 +384,12 @@ impl gnitz_expr::SchemaFacts for Schema {
     }
 }
 
-/// Returns the META_SCHEMA singleton (4 columns: col_idx/U64 pk=0, type_code/U64, flags/U64, name/String).
+/// The schema block's own schema, built from the shared wire definition so the
+/// engine's encoder and this decoder cannot disagree on its shape.
 pub fn meta_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| Schema {
-        columns: vec![
-            ColumnDef::new("col_idx", TypeCode::U64, false),
-            ColumnDef::new("type_code", TypeCode::U64, false),
-            ColumnDef::new("flags", TypeCode::U64, false),
-            ColumnDef::new("name", TypeCode::String, false),
-        ],
-        pk_cols: vec![0],
-    })
+    INSTANCE
+        .get_or_init(|| crate::types::schema_from_wire_cols(gnitz_wire::META_SCHEMA_COLS, gnitz_wire::META_SCHEMA_PK))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

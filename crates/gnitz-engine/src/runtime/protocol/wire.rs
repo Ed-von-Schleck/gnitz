@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch, MAX_WIRE_REGIONS};
 use gnitz_wire::control::german_spill_len;
 use gnitz_wire::encode_german_string;
@@ -68,16 +68,22 @@ use gnitz_wire::WAL_OFF_TID;
 // Internal schema descriptors for the wire control and schema blocks
 // ---------------------------------------------------------------------------
 
-const U64_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
-const STR_COL: SchemaColumn = SchemaColumn::new(type_code::STRING, 0);
+/// The schema block's columns, derived from the shared `gnitz-wire` definition
+/// the client's `meta_schema()` also builds from — the block travels between the
+/// two, so its shape is stated once, there, not once per side.
+const META_SCHEMA_COLUMNS: [SchemaColumn; gnitz_wire::META_SCHEMA_COLS.len()] = {
+    let mut out = [SchemaColumn::EMPTY; gnitz_wire::META_SCHEMA_COLS.len()];
+    let mut i = 0;
+    while i < out.len() {
+        let c = &gnitz_wire::META_SCHEMA_COLS[i];
+        out[i] = SchemaColumn::new(c.type_code as u8, c.nullable as u8);
+        i += 1;
+    }
+    out
+};
 
 pub(crate) const META_SCHEMA_DESC: SchemaDescriptor =
-    SchemaDescriptor::new(&[U64_COL, U64_COL, U64_COL, STR_COL], &[0]);
-
-const _: () = assert!(
-    META_SCHEMA_DESC.num_columns() == 4,
-    "META_SCHEMA layout changed; update schema_to_batch and decode_schema_block",
-);
+    SchemaDescriptor::new(&META_SCHEMA_COLUMNS, gnitz_wire::META_SCHEMA_PK);
 
 // ---------------------------------------------------------------------------
 // Schema ↔ batch conversion
@@ -176,9 +182,9 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]], hi
         batch.extend_pk(ci as u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
-        batch.extend_col(0, &type_code_val.to_le_bytes());
-        batch.extend_col(1, &flags.to_le_bytes());
-        batch.extend_col(2, &name_st);
+        batch.extend_col(gnitz_wire::META_SCHEMA_PAY_TYPE_CODE, &type_code_val.to_le_bytes());
+        batch.extend_col(gnitz_wire::META_SCHEMA_PAY_FLAGS, &flags.to_le_bytes());
+        batch.extend_col(gnitz_wire::META_SCHEMA_PAY_NAME, &name_st);
         batch.count += 1;
     }
     batch
@@ -505,10 +511,10 @@ pub struct SchemaWithVersion<'a> {
 }
 
 // META_SCHEMA_DESC payload regions, after the fixed pk (= col_idx) / weight /
-// null_bmp trio: type_code (U64), flags (U64), name (STRING), then the blob.
-// Only the two U64 columns are read here; the name is carried but unused.
-const REG_TYPE_CODE: usize = gnitz_wire::REG_PAYLOAD_START;
-const REG_FLAGS: usize = gnitz_wire::REG_PAYLOAD_START + 1;
+// null_bmp trio. Only the two U64 columns are read here; the name is carried but
+// unused. The payload slots come from the shared definition the encoder uses.
+const REG_TYPE_CODE: usize = gnitz_wire::REG_PAYLOAD_START + gnitz_wire::META_SCHEMA_PAY_TYPE_CODE;
+const REG_FLAGS: usize = gnitz_wire::REG_PAYLOAD_START + gnitz_wire::META_SCHEMA_PAY_FLAGS;
 
 pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
     // Parse directly from WAL block bytes; no Batch allocation needed.

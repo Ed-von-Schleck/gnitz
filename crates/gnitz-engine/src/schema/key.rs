@@ -815,7 +815,7 @@ mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::pk_only_schema;
-    use gnitz_wire::{read_signed, read_unsigned};
+    use gnitz_wire::{read_signed_exact, read_unsigned_exact};
 
     /// Independent typed reference comparator over native-LE PK bytes. This is
     /// the per-column column-walk that `compare_pk_bytes` used *before* the OPK
@@ -836,9 +836,9 @@ mod tests {
                     va.cmp(&vb)
                 }
                 type_code::U64 | type_code::U32 | type_code::U16 | type_code::U8 => {
-                    read_unsigned(&a[off..], cs).cmp(&read_unsigned(&b[off..], cs))
+                    read_unsigned_exact(&a[off..off + cs]).cmp(&read_unsigned_exact(&b[off..off + cs]))
                 }
-                _ => read_signed(&a[off..], cs).cmp(&read_signed(&b[off..], cs)),
+                _ => read_signed_exact(&a[off..off + cs]).cmp(&read_signed_exact(&b[off..off + cs])),
             };
             if ord != Ordering::Equal {
                 return ord;
@@ -955,7 +955,7 @@ mod tests {
         };
         let neg = mk(1, -5);
         let zero = mk(1, 0);
-        // Per-column dispatch picks read_signed for col 1 even though col 0
+        // Per-column dispatch picks read_signed_exact for col 1 even though col 0
         // is unsigned: -5 < 0.
         assert_eq!(cmp_pk_le(&s, &neg, &zero), Ordering::Less);
         assert_opk_equivalence(&s, &neg, &zero);

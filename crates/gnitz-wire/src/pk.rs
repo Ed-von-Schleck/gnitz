@@ -186,9 +186,9 @@ pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mu
 /// mirrors: the general arm's `copy_from_slice` has a runtime length, so it
 /// lowers to a zeroed 16-byte stack buffer plus a `memcpy` call, while a whole-
 /// width arm is one load and one `bswap`. This is the bottom of every PK→u128
-/// conversion — partition routing, XOR8 probes, the merge path — so the four
-/// arms buy ~2.5× there. A compound PK region of an unlisted total width
-/// (e.g. `(U32, U64)` = 12) falls to the general arm, which is why it stays.
+/// conversion — partition routing, XOR8 probes, the merge path. A compound PK
+/// region of an unlisted total width (e.g. `(U32, U64)` = 12) falls to the
+/// general arm, which is why it stays.
 /// `widen_pk_be_matches_the_general_form` pins every stride against it.
 #[inline(always)]
 pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
@@ -252,12 +252,11 @@ pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
 /// value, and they did so only by spelling the same branch twice.
 /// `#[inline(always)]`, not `#[inline]`: this is a per-row call on two hot paths
 /// (`IndexKeySpec::write_span`'s PK arm, `ColPromoter::write_into`), and at
-/// `opt-level=0` — the debug binary the E2E suite runs — LLVM inlines nothing but
-/// the always-inline pass, so the hint leaves a ~38-instruction frame around what
+/// `opt-level=0` — the debug binary the E2E suite runs — LLVM runs only the
+/// always-inline pass, so a plain hint would leave a real call frame around what
 /// is otherwise a `copy_from_slice`. (The `debug_assert!` is deliberately not
 /// `debug_assert_eq!`: the latter takes both lengths by reference and spills
-/// them, ~13 instructions, for a message the following `copy_from_slice` panic
-/// already implies.)
+/// them, for a message the following `copy_from_slice` panic already implies.)
 #[inline(always)]
 pub fn promote_opk_column(src_opk: &[u8], src_tc: u8, target_tc: u8, dst: &mut [u8]) {
     if src_tc == target_tc {
@@ -319,20 +318,30 @@ pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
 
 /// Which worker owns `partition`. The second half of the routing function:
 /// [`partition_for_key`] maps a row to one of [`PARTITION_COUNT`] buckets, this
-/// maps a bucket to a worker by contiguous chunks.
+/// maps a bucket to a worker by contiguous chunks. `num_workers` is
+/// `1..=PARTITION_COUNT`; past that the chunk width would be zero.
 #[inline]
 pub fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
+    debug_assert!((1..=PARTITION_COUNT).contains(&num_workers));
     let chunk = PARTITION_COUNT / num_workers;
     (partition / chunk).min(num_workers - 1)
 }
 
 /// [`worker_for_partition`] for every partition, hoisting the division out of a
 /// per-row routing loop.
+///
+/// Written as contiguous fills rather than a per-partition divide: `chunk` is a
+/// runtime value, so the divide cannot be strength-reduced and the plain loop
+/// costs 256 hardware divisions on every batch that builds a map.
+/// `build_w_map_matches_worker_for_partition` pins the two against each other.
 #[inline]
 pub fn build_w_map(num_workers: usize) -> [usize; PARTITION_COUNT] {
-    let mut map = [0usize; PARTITION_COUNT];
-    for (p, item) in map.iter_mut().enumerate() {
-        *item = worker_for_partition(p, num_workers);
+    let chunk = PARTITION_COUNT / num_workers;
+    // The last worker owns the remainder, which is what `worker_for_partition`'s
+    // `.min(num_workers - 1)` tail expresses.
+    let mut map = [num_workers - 1; PARTITION_COUNT];
+    for w in 0..num_workers - 1 {
+        map[w * chunk..(w + 1) * chunk].fill(w);
     }
     map
 }
@@ -400,7 +409,7 @@ pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_c
             u128::from_be_bytes(opk)
         }
         crate::TypeCode::F32 | crate::TypeCode::F64 | crate::TypeCode::String | crate::TypeCode::Blob => {
-            crate::read_unsigned(src, col_size.min(8)) as u128
+            crate::read_unsigned_exact(&src[..col_size.min(8)]) as u128
         }
     }
 }
@@ -427,7 +436,7 @@ pub fn payload_native_key(col_data: &[u8], offset: usize, col_size: usize, type_
         crate::TypeCode::U128 | crate::TypeCode::UUID | crate::TypeCode::I128 => {
             u128::from_le_bytes(src.try_into().unwrap())
         }
-        _ => crate::read_unsigned(src, col_size.min(8)) as u128,
+        _ => crate::read_unsigned_exact(&src[..col_size.min(8)]) as u128,
     }
 }
 
@@ -591,7 +600,7 @@ mod tests {
                 let want = if crate::is_signed_int(tc) {
                     let mut back = [0u8; 8];
                     decode_pk_column(&opk[..sz], tc, &mut back[..sz]);
-                    crate::read_signed(&back, sz)
+                    crate::read_signed_exact(&back[..sz])
                 } else {
                     widen_pk_be(&opk[..sz], sz) as i64
                 };
@@ -607,6 +616,19 @@ mod tests {
         let mut opk = [0u8; 8];
         encode_pk_column(&u64::MAX.to_le_bytes(), type_code::U64, &mut opk);
         assert_eq!(decode_opk_i64(&opk, crate::FixedInt::U64), -1i64);
+    }
+
+    /// `build_w_map` is a second spelling of `worker_for_partition`; they must
+    /// agree at every worker count, over the whole partition space.
+    #[test]
+    fn build_w_map_matches_worker_for_partition() {
+        for nw in 1..=PARTITION_COUNT {
+            let map = build_w_map(nw);
+            for (p, &w) in map.iter().enumerate() {
+                assert_eq!(w, worker_for_partition(p, nw), "nw={nw} p={p}");
+            }
+            assert_eq!(map[PARTITION_COUNT - 1], nw - 1, "the last worker owns the tail");
+        }
     }
 
     #[test]

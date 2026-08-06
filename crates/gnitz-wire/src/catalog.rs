@@ -72,10 +72,24 @@ pub const fn pay_index_in(cols: &[WireSysCol], name: &str) -> usize {
     ci - 1
 }
 
-// Every system table's column shape is defined once, here, and derived by
-// both sides: the engine builds its `SchemaDescriptor`s and the COL_TAB
-// self-description rows from these slices, the client builds its `Schema`s.
-// PK = column [0] unless noted otherwise.
+// Every system table's column shape is defined once, here, and derived by both
+// sides: the engine builds its `SchemaDescriptor`s and the COL_TAB
+// self-description rows from these slices, the client builds its `Schema`s. Each
+// table's `*_PK` names the columns that key it — the client and the engine must
+// agree on both halves, and a disagreement on the key is a `pk_stride` mismatch
+// the wire decode rejects, so neither half is left for a consumer to restate.
+
+/// The primary key of every system table whose key is its single leading column.
+pub(crate) const LEADING_COL_PK: &[u32] = &[0];
+
+pub const SCHEMA_TAB_PK: &[u32] = LEADING_COL_PK;
+pub const TABLE_TAB_PK: &[u32] = LEADING_COL_PK;
+pub const VIEW_TAB_PK: &[u32] = LEADING_COL_PK;
+pub const COL_TAB_PK: &[u32] = LEADING_COL_PK;
+pub const IDX_TAB_PK: &[u32] = LEADING_COL_PK;
+pub const SEQ_TAB_PK: &[u32] = LEADING_COL_PK;
+/// `(view_id, dep_table_id)`.
+pub const DEP_TAB_PK: &[u32] = &[0, 1];
 
 pub const SCHEMA_TAB_COLS: &[WireSysCol] = &[
     col("schema_id", TypeCode::U64, false),
@@ -146,6 +160,27 @@ pub const DEP_TAB_COLS: &[WireSysCol] = &[
     col("dep_view_id", TypeCode::U64, false),
 ];
 
+/// The reply **schema block**'s column shape. Not a system table — it is the
+/// per-message block describing a reply's columns — but it is a wire schema both
+/// ends build, so it belongs with them: the engine encodes it, the client decodes
+/// it, and the `flags` word is packed by [`crate::pack_col_meta_flags`].
+pub const META_SCHEMA_COLS: &[WireSysCol] = &[
+    col("col_idx", TypeCode::U64, false),
+    col("type_code", TypeCode::U64, false),
+    col("flags", TypeCode::U64, false),
+    col("name", TypeCode::String, false),
+];
+pub const META_SCHEMA_PK: &[u32] = LEADING_COL_PK;
+
+/// Payload index of the schema block's `type_code` column — the slot both
+/// decoders read it from, rather than each hardcoding a region number.
+pub const META_SCHEMA_PAY_TYPE_CODE: usize = pay_index_in(META_SCHEMA_COLS, "type_code");
+/// Payload index of the schema block's `flags` column. See
+/// [`META_SCHEMA_PAY_TYPE_CODE`].
+pub const META_SCHEMA_PAY_FLAGS: usize = pay_index_in(META_SCHEMA_COLS, "flags");
+/// Payload index of the schema block's `name` column.
+pub const META_SCHEMA_PAY_NAME: usize = pay_index_in(META_SCHEMA_COLS, "name");
+
 pub const SEQ_TAB_COLS: &[WireSysCol] = &[
     col("seq_id", TypeCode::U64, false),
     col("next_val", TypeCode::U64, false),
@@ -199,7 +234,8 @@ pub const CIRCUIT_NODES_TAB: u64 = 11;
 pub const CIRCUIT_EDGES_TAB: u64 = 12;
 pub const CIRCUIT_NODE_COLUMNS_TAB: u64 = 13;
 
-/// The circuit families' compound primary key: columns `(view_id, sub)`.
+/// The circuit families' compound primary key: columns `(view_id, sub)`. Shared
+/// by all three, which is why it is named once rather than per family.
 pub const CIRCUIT_FAMILY_PK: &[u32] = &[0, 1];
 
 pub const FIRST_USER_TABLE_ID: u64 = 16;
@@ -325,6 +361,21 @@ pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
 /// table.
 pub const PK_LIST_MAX_COLS: usize = 4;
 
+/// Width of the packed decoded-count field (bits `[0..4)`).
+const PK_LIST_COUNT_BITS: u32 = 4;
+/// Width of each packed column-index field (bits `[4 + 7i..)`), and so the
+/// exclusive ceiling on a column index the list can carry.
+const PK_LIST_COL_BITS: u32 = 7;
+const PK_LIST_COL_MAX: u32 = (1 << PK_LIST_COL_BITS) - 1;
+
+/// The PK-list arity rule: `1..=PK_LIST_MAX_COLS` columns. One predicate behind
+/// every spelling of it — the panicking constructors, the fallible decode, and
+/// the validator — so they cannot disagree on the bound.
+#[inline]
+pub(crate) const fn pk_list_arity_ok(n: usize) -> bool {
+    n >= 1 && n <= PK_LIST_MAX_COLS
+}
+
 // The packed u64 lays the decoded count in bits [0..4) and each column index in
 // a 7-bit field at bit 4 + 7*i; the packed flag occupies bit 63. Guard the
 // ceilings at compile time so bumping PK_LIST_MAX_COLS past what the encoding
@@ -332,12 +383,12 @@ pub const PK_LIST_MAX_COLS: usize = 4;
 // silently corrupting the catalog word.
 const _: () = assert!(PK_LIST_MAX_COLS >= 1);
 const _: () = assert!(
-    PK_LIST_MAX_COLS <= 0xf, // count field is 4 bits
-    "PK_LIST_MAX_COLS overflows the 4-bit packed count field"
+    PK_LIST_MAX_COLS < (1 << PK_LIST_COUNT_BITS),
+    "PK_LIST_MAX_COLS overflows the packed count field"
 );
 const _: () = assert!(
-    4 + 7 * PK_LIST_MAX_COLS <= 62, // column fields clear bits 62 and 63
-    "PK_LIST_MAX_COLS overflows the packed u64 column region"
+    PK_LIST_COUNT_BITS as usize + PK_LIST_COL_BITS as usize * PK_LIST_MAX_COLS <= 62,
+    "PK_LIST_MAX_COLS overflows the packed u64 column region" // bits 62/63 are flags
 );
 const _: () = assert!(
     PK_LIST_MAX_COLS < MAX_PK_COLUMNS, // leave the index-prefix slot
@@ -398,8 +449,8 @@ impl PkColList {
     /// Fallible [`Self::from_slice`] for untrusted (wire-decoded) input: `None`
     /// on an out-of-range length instead of a panic. The arity rule lives here,
     /// so decode boundaries need no mirrored pre-check.
-    pub fn try_from_slice(cols: &[u32]) -> Option<Self> {
-        if !(1..=PK_LIST_MAX_COLS).contains(&cols.len()) {
+    pub(crate) fn try_from_slice(cols: &[u32]) -> Option<Self> {
+        if !pk_list_arity_ok(cols.len()) {
             return None;
         }
         let mut arr = [0u32; PK_LIST_MAX_COLS];
@@ -424,7 +475,7 @@ impl PkColList {
     /// so without this check an over-range list reads back truncated and an
     /// empty one reads back as zero columns.
     pub fn is_well_formed(&self) -> bool {
-        (1..=PK_LIST_MAX_COLS).contains(&self.len)
+        pk_list_arity_ok(self.len)
     }
     /// Always in bounds: indexes at most the `PK_LIST_MAX_COLS`-element
     /// backing array even when the decoded count is out of range. A crafted
@@ -441,21 +492,18 @@ impl PkColList {
 /// repeated column. Call this at user-input boundaries so `pack_pk_cols` and
 /// `PkColList::from_slice` can never panic downstream.
 pub fn validate_pk_col_list(cols: &[u32]) -> Result<(), String> {
-    if !(1..=PK_LIST_MAX_COLS).contains(&cols.len()) {
-        return Err(format!(
-            "column count {} out of range 1..={PK_LIST_MAX_COLS}",
-            cols.len()
-        ));
-    }
-    for (i, &c) in cols.iter().enumerate() {
-        if c >= 128 {
-            return Err(format!("column index {c} exceeds 127"));
+    // The rule itself is `validate_pk_indices`; the packed 7-bit field is this
+    // list's column-count bound. Only the wording differs — these lists are also
+    // secondary-index column lists, which "primary key ..." would misname.
+    crate::validate_pk_indices(cols, 1 << PK_LIST_COL_BITS).map_err(|rule| match rule {
+        crate::PkRule::Empty | crate::PkRule::TooManyColumns { .. } => {
+            format!("column count {} out of range 1..={PK_LIST_MAX_COLS}", cols.len())
         }
-        if cols[..i].contains(&c) {
-            return Err(format!("duplicate column {c} in list"));
-        }
-    }
-    Ok(())
+        crate::PkRule::IndexOutOfRange { col } => format!("column index {col} exceeds {PK_LIST_COL_MAX}"),
+        crate::PkRule::Duplicate { col } => format!("duplicate column {col} in list"),
+        // `validate_pk_indices` reports only the structural rules above.
+        other => other.to_string(),
+    })
 }
 
 /// Validate a `CLUSTER BY` column list against the table's PK, returning the
@@ -488,14 +536,14 @@ pub fn validate_dist_prefix(pk: &[u32], cols: &[u32]) -> Result<usize, String> {
 /// lists before calling this (see [`validate_pk_col_list`]).
 pub fn pack_pk_cols(pk_cols: &[u32]) -> u64 {
     assert!(
-        (1..=PK_LIST_MAX_COLS).contains(&pk_cols.len()),
+        pk_list_arity_ok(pk_cols.len()),
         "pack_pk_cols: count {} out of range 1..={PK_LIST_MAX_COLS}",
         pk_cols.len(),
     );
-    let mut v = pk_cols.len() as u64; // bits [0..4)
+    let mut v = pk_cols.len() as u64; // the count field
     for (i, &c) in pk_cols.iter().enumerate() {
-        assert!(c < 128, "pack_pk_cols: column index {c} exceeds 7-bit field");
-        v |= (c as u64 & 0x7f) << (4 + 7 * i);
+        assert!(c <= PK_LIST_COL_MAX, "pack_pk_cols: column index {c} exceeds its field");
+        v |= (c as u64) << (PK_LIST_COUNT_BITS + PK_LIST_COL_BITS * i as u32);
     }
     v | PK_LIST_PACKED_FLAG
 }
@@ -507,28 +555,31 @@ pub fn pack_pk_cols(pk_cols: &[u32]) -> u64 {
 pub fn unpack_pk_cols(packed: u64) -> PkColList {
     if packed & PK_LIST_PACKED_FLAG == 0 {
         // Bare single index: an unmodified gnitz-core client, or an
-        // engine-written system-table row (always bare `0`).
-        return PkColList::single(packed as u32);
+        // engine-written system-table row (always bare `0`). Saturate rather
+        // than truncate — a word too wide for a column index is malformed, and
+        // `u32::MAX` fails every downstream range check where the low 32 bits
+        // might not have.
+        return PkColList::single(u32::try_from(packed).unwrap_or(u32::MAX));
     }
-    let n = (packed & 0xf) as usize; // 0..=15, validated later
+    let n = (packed & ((1 << PK_LIST_COUNT_BITS) - 1)) as usize; // validated later
     let mut cols = [0u32; PK_LIST_MAX_COLS];
     for (i, slot) in cols.iter_mut().enumerate().take(n.min(PK_LIST_MAX_COLS)) {
-        *slot = ((packed >> (4 + 7 * i)) & 0x7f) as u32;
+        *slot = ((packed >> (PK_LIST_COUNT_BITS + PK_LIST_COL_BITS * i as u32)) & PK_LIST_COL_MAX as u64) as u32;
     }
     PkColList { cols, len: n }
 }
 
 /// Width of one `seek_by_index` key slot on the wire: a native `u128`, LE.
-pub const INDEX_KEY_SLOT: usize = 16;
+pub(crate) const INDEX_KEY_SLOT: usize = 16;
 
 /// Pack K native index-key values into the `PkTuple` a `seek_by_index` request
 /// carries — one 16-byte LE slot each, which `split_wire` then routes as slot 0
 /// → `seek_pk` and slots 1..K → `seek_pk_extra`. A prefix seek supplies K < the
-/// index's arity. Returns the packed bytes; `K * INDEX_KEY_SLOT <= MAX_PK_BYTES`
-/// bounds K at 4, the same ceiling as [`PK_LIST_MAX_COLS`].
+/// index's arity. Returns the packed bytes; K is bounded by [`PK_LIST_MAX_COLS`],
+/// so at most `PK_LIST_MAX_COLS * INDEX_KEY_SLOT` of the buffer is ever written.
 pub fn pack_index_key_slots(key_vals: &[u128]) -> ([u8; MAX_PK_BYTES], usize) {
     assert!(
-        (1..=PK_LIST_MAX_COLS).contains(&key_vals.len()),
+        pk_list_arity_ok(key_vals.len()),
         "pack_index_key_slots: count {} out of range 1..={PK_LIST_MAX_COLS}",
         key_vals.len(),
     );
@@ -623,6 +674,34 @@ pub fn table_flags_dist_prefix(flags: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every system table's key must be admissible for its own column list. The
+    /// pair is the thing both crates build from, so it is validated here rather
+    /// than trusted at each derivation site.
+    #[test]
+    fn system_table_keys_are_valid_for_their_columns() {
+        let families: &[(&str, &[WireSysCol], &[u32])] = &[
+            ("_schemas", SCHEMA_TAB_COLS, SCHEMA_TAB_PK),
+            ("_tables", TABLE_TAB_COLS, TABLE_TAB_PK),
+            ("_views", VIEW_TAB_COLS, VIEW_TAB_PK),
+            ("_columns", COL_TAB_COLS, COL_TAB_PK),
+            ("_indices", IDX_TAB_COLS, IDX_TAB_PK),
+            ("_sequences", SEQ_TAB_COLS, SEQ_TAB_PK),
+            ("_view_deps", DEP_TAB_COLS, DEP_TAB_PK),
+            ("_circuit_nodes", CIRCUIT_NODES_COLS, CIRCUIT_FAMILY_PK),
+            ("_circuit_edges", CIRCUIT_EDGES_COLS, CIRCUIT_FAMILY_PK),
+            ("_circuit_node_columns", CIRCUIT_NODE_COLUMNS_COLS, CIRCUIT_FAMILY_PK),
+            ("meta_schema", META_SCHEMA_COLS, META_SCHEMA_PK),
+        ];
+        for &(name, cols, pk) in families {
+            assert!(cols.len() <= MAX_COLUMNS, "{name}: too many columns");
+            crate::validate_pk_tuple(pk, cols.len(), |c| {
+                let col = &cols[c as usize];
+                (col.type_code as u8, col.nullable)
+            })
+            .unwrap_or_else(|rule| panic!("{name}: invalid primary key: {rule}"));
+        }
+    }
 
     #[test]
     fn from_slice_roundtrips_as_slice() {

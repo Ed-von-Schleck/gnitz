@@ -52,7 +52,7 @@ pub const HELLO_PAYLOAD_LEN: u32 = 8;
 pub const HELLO_ACK_PAYLOAD_LEN: u32 = 20;
 
 /// Total wire size of an ACK frame (length prefix + payload).
-pub const HELLO_ACK_FRAME_SIZE: usize = 4 + HELLO_ACK_PAYLOAD_LEN as usize;
+pub(crate) const HELLO_ACK_FRAME_SIZE: usize = 4 + HELLO_ACK_PAYLOAD_LEN as usize;
 
 /// Status field in the ACK frame. Success is the only value the ACK carries —
 /// version/auth failures use a `STATUS_ERROR` control block, not the ACK.

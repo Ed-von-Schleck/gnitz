@@ -553,8 +553,8 @@ fn encode_col_list_with_tcs(kind: u64, cols: &[u16], target_tcs: &[u8]) -> Vec<N
 /// `OpNode`).
 pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
     match op {
-        // An unbounded `ScanDelta` carries no param rows and no blob — byte-identical
-        // to a pre-bound circuit, so every stored view round-trips unchanged.
+        // An unbounded `ScanDelta` carries no param rows and no blob: the common
+        // shape costs nothing, and "absent" and "empty" stay the same bytes.
         OpNode::ScanDelta { source, bound: None } => ((OPCODE_SCAN_DELTA, Some(source), None), Vec::new()),
         OpNode::ScanDelta { source, bound: Some(b) } => (
             (OPCODE_SCAN_DELTA, Some(source), Some(b.desc.encode())),
@@ -574,6 +574,8 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         }
         OpNode::Map(MapKind::HashRow(cols, target_tcs, branch_id)) => {
             let mut kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_PROJ, &cols, &target_tcs);
+            // Always written, unlike the sparse GLOBAL_GROUND / REDUCE_OUT_KEY rows
+            // — the planner circuit snapshots pin this row's presence.
             kind_rows.push((NODE_COL_KIND_BRANCH_ID, 0, branch_id as u64, 0));
             ((OPCODE_MAP_HASH_ROW, None, None), kind_rows)
         }
@@ -593,8 +595,7 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
                 kind_rows.push((NODE_COL_KIND_AGG_SPEC, i as u16, func.as_u64(), col as u64));
             }
             // Only the user's global scalar aggregate carries the row; an
-            // ordinary grouped / range-join reduce omits it (decodes to `false`),
-            // keeping every existing reduce circuit byte-identical on the wire.
+            // ordinary grouped / range-join reduce omits it and decodes to `false`.
             if global_ground {
                 kind_rows.push((NODE_COL_KIND_GLOBAL_GROUND, 0, 1, 0));
             }
@@ -979,6 +980,98 @@ mod tests {
             })
             .collect();
         decode_op_node(opcode, src_tab, blob, &cols)
+    }
+
+    /// Every `OpNode` shape survives `encode_op_node` → `decode_op_node`. This is
+    /// the crate's largest codec and the only one whose bugs land in a persisted
+    /// circuit, so the variant set is swept rather than sampled.
+    #[test]
+    fn every_op_node_variant_roundtrips() {
+        let nodes = vec![
+            OpNode::ScanDelta { source: 7, bound: None },
+            OpNode::Filter(None),
+            OpNode::Filter(Some(vec![1, 2, 3, 4])),
+            OpNode::Map(MapKind::Projection(vec![])),
+            OpNode::Map(MapKind::Projection(vec![4, 0, 9])),
+            OpNode::Map(MapKind::Expression {
+                program: vec![9, 9],
+                reindex_cols: vec![],
+                reindex_target_tcs: vec![],
+            }),
+            OpNode::Map(MapKind::Expression {
+                program: vec![1],
+                reindex_cols: vec![2, 5],
+                reindex_target_tcs: vec![0, crate::type_code::I64],
+            }),
+            OpNode::Map(MapKind::HashRow(vec![1, 2], vec![0, crate::type_code::I32], 0)),
+            OpNode::Map(MapKind::HashRow(vec![3], vec![0], 1)),
+            OpNode::Negate,
+            OpNode::Union,
+            OpNode::Distinct,
+            OpNode::PositivePart,
+            OpNode::Reduce {
+                group_cols: vec![],
+                agg: vec![(AggFunc::Count, 0)],
+                global_ground: true,
+                out_key: ReduceOutKey::SyntheticFold,
+            },
+            OpNode::Reduce {
+                group_cols: vec![2, 7],
+                agg: vec![(AggFunc::Sum, 1), (AggFunc::Max, 3), (AggFunc::SumZero, 0)],
+                global_ground: false,
+                out_key: ReduceOutKey::PkPermutation,
+            },
+            OpNode::Reduce {
+                group_cols: vec![4],
+                agg: vec![(AggFunc::Min, 4)],
+                global_ground: false,
+                out_key: ReduceOutKey::SingleNaturalCol,
+            },
+            OpNode::Join(JoinKind::DeltaTrace),
+            OpNode::Join(JoinKind::DeltaTraceRange {
+                n_eq: 3,
+                rel: RangeRel::Ge,
+            }),
+            OpNode::IntegrateSink,
+            OpNode::IntegrateTrace,
+            OpNode::ExchangeShard { shard_cols: vec![0, 2] },
+            OpNode::NullExtend {
+                type_codes: vec![crate::type_code::I64, crate::type_code::STRING],
+            },
+            OpNode::PartitionFilter,
+        ];
+        for node in nodes {
+            assert_eq!(roundtrip(node.clone()).unwrap(), node, "round-trip failed for {node:?}");
+        }
+    }
+
+    /// Each wire enum's `as_u64`/`from_wire` pair must be mutually inverse, and
+    /// `from_wire` must reject everything outside the set — the closure property
+    /// `TypeCode` already pins for the type table.
+    #[test]
+    fn wire_enums_round_trip_and_reject_unknown() {
+        let aggs = [
+            AggFunc::Count,
+            AggFunc::Sum,
+            AggFunc::Min,
+            AggFunc::Max,
+            AggFunc::CountNonNull,
+            AggFunc::SumZero,
+        ];
+        let rels = [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge];
+        let keys = [
+            ReduceOutKey::SyntheticFold,
+            ReduceOutKey::PkPermutation,
+            ReduceOutKey::SingleNaturalCol,
+        ];
+        for v in 0u64..64 {
+            assert_eq!(AggFunc::from_wire(v), aggs.iter().copied().find(|a| a.as_u64() == v));
+            assert_eq!(RangeRel::from_wire(v), rels.iter().copied().find(|r| r.as_u64() == v));
+            assert_eq!(
+                ReduceOutKey::from_wire(v),
+                keys.iter().copied().find(|k| k.as_u64() == v)
+            );
+        }
     }
 
     /// A bounded `ScanDelta` round-trips its descriptor and its column list — in

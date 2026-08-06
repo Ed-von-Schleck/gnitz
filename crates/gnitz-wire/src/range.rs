@@ -148,7 +148,7 @@ impl RangeDescriptor {
 
     /// The exact wire span of a descriptor with `n_eq` equality values — the
     /// one definition of the `2 + 16·(n_eq + 2)` layout.
-    pub const fn encoded_len(n_eq: usize) -> usize {
+    pub(crate) const fn encoded_len(n_eq: usize) -> usize {
         2 + 16 * (n_eq + 2)
     }
 

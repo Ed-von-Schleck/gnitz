@@ -30,17 +30,15 @@ use crate::{align8, checksum, read_u32_le, read_u64_le, write_u32_le, write_u64_
 pub const REG_PK: usize = 0;
 pub const REG_WEIGHT: usize = 1;
 pub const REG_NULL_BMP: usize = 2;
-pub const NUM_FIXED_REGIONS: usize = 3;
-pub const REG_PAYLOAD_START: usize = NUM_FIXED_REGIONS;
-// The fixed regions are exactly `REG_PK..=REG_NULL_BMP`, so the payload start and
-// the fixed-region count are the same number by construction.
-const _: () = assert!(REG_NULL_BMP + 1 == NUM_FIXED_REGIONS);
+/// The fixed regions are exactly `REG_PK..=REG_NULL_BMP`, so the first payload
+/// region index is also how many fixed regions precede it.
+pub const REG_PAYLOAD_START: usize = REG_NULL_BMP + 1;
 
 /// Region count of a batch with `num_payload_cols` payload columns: the fixed
 /// three, one per payload column, and the trailing blob heap. The blob region's
 /// index is `REG_PAYLOAD_START + num_payload_cols`, i.e. `num_regions(n) - 1`.
 pub const fn num_regions(num_payload_cols: usize) -> usize {
-    NUM_FIXED_REGIONS + num_payload_cols + 1
+    REG_PAYLOAD_START + num_payload_cols + 1
 }
 
 pub const WAL_HEADER_SIZE: usize = 32;
@@ -65,24 +63,24 @@ pub const MAX_WIRE_REGIONS: usize = 69;
 /// Compute the total byte size of a WAL block with the given regions.
 /// The region count is `region_sizes.len()` — no separate count param.
 pub fn block_size(region_sizes: &[u32]) -> usize {
-    let mut pos = WAL_HEADER_SIZE + region_sizes.len() * 8;
-    for &sz in region_sizes {
-        pos = align8(pos);
-        pos += sz as usize;
-    }
-    pos
+    block_size_from(region_sizes.len(), region_sizes.iter().map(|&sz| sz as usize))
 }
 
 /// Total byte size of the WAL block that would frame `regions` — the
-/// slice-taking sibling of [`block_size`]. A caller that already holds the
-/// `&[&[u8]]` [`encode`] takes can size its output buffer straight from it,
-/// without materializing a parallel `&[u32]` size array. [`encode`] derives
-/// the identical total internally.
+/// slice-taking sibling of [`block_size`], for a caller that already holds the
+/// `&[&[u8]]` [`encode`] takes and would otherwise materialize a parallel
+/// `&[u32]` size array just to measure it.
 pub fn block_size_of(regions: &[&[u8]]) -> usize {
-    let mut pos = WAL_HEADER_SIZE + regions.len() * 8;
-    for r in regions {
-        pos = align8(pos);
-        pos += r.len();
+    block_size_from(regions.len(), regions.iter().map(|r| r.len()))
+}
+
+/// The block-size walk both public forms share: header, directory, then each
+/// region `align8`-padded before its data — the same walk
+/// [`write_header_and_directory`] performs.
+fn block_size_from(count: usize, sizes: impl Iterator<Item = usize>) -> usize {
+    let mut pos = WAL_HEADER_SIZE + count * 8;
+    for sz in sizes {
+        pos = align8(pos) + sz;
     }
     pos
 }
@@ -115,12 +113,14 @@ pub fn write_header_and_directory(
     let mut pos = WAL_HEADER_SIZE + num_regions * 8;
     for (i, &sz) in region_sizes.iter().enumerate() {
         let aligned = align8(pos);
-        if aligned > pos {
-            block[pos..aligned].fill(0);
+        // At most 7 bytes: bounding the count keeps this a handful of stores
+        // instead of a `memset` call per region.
+        for b in block[pos..aligned].iter_mut().take(7) {
+            *b = 0;
         }
         pos = aligned;
         positions[i] = pos;
-        let dir_off = WAL_HEADER_SIZE + i * 8;
+        let dir_off = dir_entry_offset(i);
         write_u32_le(block, dir_off, pos as u32);
         write_u32_le(block, dir_off + 4, sz);
         pos += sz as usize;
@@ -146,17 +146,25 @@ pub fn stamp_checksum(block: &mut [u8], total_size: usize) {
 /// know the block covers its full directory: production decoders reach the
 /// directory through [`validate_and_parse`] (which bounds every entry), and the
 /// remaining callers are the 1-row control-block reader (each region size-guarded
-/// on use) and the malformed-block tests that patch a directory byte. The one
-/// place the entry layout (`WAL_HEADER_SIZE + r*8`, offset then size) is spelled out.
+/// on use) and the malformed-block tests that patch a directory byte. The entry's
+/// position comes from [`dir_entry_offset`]; the size follows the offset.
 #[inline]
 pub fn dir_entry(block: &[u8], r: usize) -> (usize, usize) {
-    let base = WAL_HEADER_SIZE + r * 8;
+    let base = dir_entry_offset(r);
     (read_u32_le(block, base) as usize, read_u32_le(block, base + 4) as usize)
+}
+
+/// Byte offset of region `r`'s directory entry within the block. The directory
+/// follows the header, 8 bytes per entry (offset then size) — the one place that
+/// layout is spelled out.
+#[inline]
+pub const fn dir_entry_offset(r: usize) -> usize {
+    WAL_HEADER_SIZE + r * 8
 }
 
 /// Header fields of a validated WAL block, as returned by
 /// [`validate_and_parse`].
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WalBlockHeader {
     pub table_id: u32,
     pub entry_count: u32,
@@ -213,8 +221,7 @@ pub fn encode(
     // `copy_from_slice` — one memcpy per non-empty region. Coalescing
     // source-adjacent runs into a single `copy_nonoverlapping` is unsound here:
     // the regions are independent `&[u8]` slices, so a copy spanning past region
-    // `i`'s length reads outside its provenance. The saving would be a fixed
-    // ~1-2 ns/region anyway, off the durable-write scatter path.
+    // `i`'s length reads outside its provenance.
     for (i, r) in regions.iter().enumerate() {
         if r.is_empty() {
             continue;
@@ -283,7 +290,7 @@ pub fn validate_and_parse(
         return Err(WalError::InvalidShard);
     }
     for i in 0..n {
-        let dir_off = WAL_HEADER_SIZE + i * 8;
+        let dir_off = dir_entry_offset(i);
         if dir_off + 8 > total_size {
             return Err(WalError::Truncated);
         }

@@ -25,6 +25,7 @@ mod handshake;
 mod pk;
 mod range;
 mod read_spec;
+mod reader;
 mod types;
 mod uuid;
 
@@ -46,23 +47,19 @@ pub use uuid::*;
 // Flat-export `wal`'s constants (referenced everywhere) but not its framer
 // functions (`encode`/`block_size`/… stay `gnitz_wire::wal::`-qualified).
 pub use wal::{
-    IPC_CONTROL_TID, MAX_WIRE_REGIONS, NUM_FIXED_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
-    WAL_FORMAT_VERSION, WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE,
-    WAL_OFF_TID, WAL_OFF_VERSION,
+    IPC_CONTROL_TID, MAX_WIRE_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, WAL_FORMAT_VERSION,
+    WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
 // ---------------------------------------------------------------------------
 // Low-level byte primitives.
 //
-// Three calling conventions over two rules, deliberately: the `*_le(buf, off)`
-// offset form for region walks (no slice construction at the call site), and —
-// for typed cell reads — `read_{signed,unsigned}_exact(cell)` where the slice is
-// already the column, plus the `(bytes, size)` width form for callers holding a
-// tail. The width form IS the exact form after one sub-slice, so there is still
-// one ladder per signedness; splitting the entry point only moves the sub-slice
-// to the callers that actually need it. That matters: at `opt-level=0` the
-// `bytes[..size]` bound is an out-of-line `Range::index` call, and `cmp_typed_le`
-// would pay it twice per comparison over windows that are exact already.
+// Two calling conventions over two rules: the `*_le(buf, off)` offset form for
+// region walks (no slice construction at the call site), and
+// `read_{signed,unsigned}_exact(cell)` for typed cell reads, where the slice IS
+// the column. A caller holding a tail sub-slices it itself — at `opt-level=0`
+// the `bytes[..size]` bound is an out-of-line `Range::index` call, so the
+// comparators over already-exact windows must not pay it.
 // ---------------------------------------------------------------------------
 
 /// Align `n` up to an 8-byte boundary.
@@ -150,24 +147,6 @@ pub fn read_unsigned_exact(bytes: &[u8]) -> u64 {
         8 => u64::from_le_bytes(bytes.try_into().unwrap()),
         _ => unreachable!("read_unsigned_exact: unexpected column width"),
     }
-}
-
-/// [`read_signed_exact`] for a caller holding the cell plus a tail — the leading
-/// `size` bytes are the value.
-#[inline(always)]
-pub fn read_signed(bytes: &[u8], size: usize) -> i64 {
-    debug_assert!(bytes.len() >= size, "read_signed: buffer shorter than the column width");
-    read_signed_exact(&bytes[..size])
-}
-
-/// [`read_unsigned_exact`] for a caller holding the cell plus a tail.
-#[inline(always)]
-pub fn read_unsigned(bytes: &[u8], size: usize) -> u64 {
-    debug_assert!(
-        bytes.len() >= size,
-        "read_unsigned: buffer shorter than the column width"
-    );
-    read_unsigned_exact(&bytes[..size])
 }
 
 /// True iff payload null-bit `pi` is set in `word` (the column is NULL).
@@ -259,23 +238,23 @@ mod tests {
     #[test]
     fn read_unsigned_zero_extends() {
         // size 1: high-bit-set vs small — must match u8.cmp.
-        assert_eq!(read_unsigned(&[0xFF], 1), 0xFF);
-        assert_eq!(read_unsigned(&[0x01], 1), 0x01);
-        assert!(read_unsigned(&[0xFF], 1) > read_unsigned(&[0x01], 1));
+        assert_eq!(read_unsigned_exact(&[0xFF]), 0xFF);
+        assert_eq!(read_unsigned_exact(&[0x01]), 0x01);
+        assert!(read_unsigned_exact(&[0xFF]) > read_unsigned_exact(&[0x01]));
 
         // size 2: 0xFFFE > 0x0001 as unsigned (sign-extension would invert).
-        assert_eq!(read_unsigned(&0xFFFEu16.to_le_bytes(), 2), 0xFFFE);
-        assert_eq!(read_unsigned(&0x0001u16.to_le_bytes(), 2), 0x0001);
-        assert!(read_unsigned(&0xFFFEu16.to_le_bytes(), 2) > read_unsigned(&0x0001u16.to_le_bytes(), 2),);
+        assert_eq!(read_unsigned_exact(&0xFFFEu16.to_le_bytes()), 0xFFFE);
+        assert_eq!(read_unsigned_exact(&0x0001u16.to_le_bytes()), 0x0001);
+        assert!(read_unsigned_exact(&0xFFFEu16.to_le_bytes()) > read_unsigned_exact(&0x0001u16.to_le_bytes()),);
 
         // size 4.
         let big: u32 = 0xFFFF_FFFE;
         let small: u32 = 0x0000_0001;
-        assert_eq!(read_unsigned(&big.to_le_bytes(), 4), big as u64);
-        assert!(read_unsigned(&big.to_le_bytes(), 4) > read_unsigned(&small.to_le_bytes(), 4),);
+        assert_eq!(read_unsigned_exact(&big.to_le_bytes()), big as u64);
+        assert!(read_unsigned_exact(&big.to_le_bytes()) > read_unsigned_exact(&small.to_le_bytes()),);
 
         // size 8: full u64 round-trip.
         let v: u64 = 0xDEAD_BEEF_CAFE_BABE;
-        assert_eq!(read_unsigned(&v.to_le_bytes(), 8), v);
+        assert_eq!(read_unsigned_exact(&v.to_le_bytes()), v);
     }
 }
