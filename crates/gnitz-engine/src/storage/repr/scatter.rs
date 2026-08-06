@@ -1,20 +1,57 @@
 //! Exchange repartition: column-first scatter of selected (possibly reordered,
 //! multi-source) rows into a `DirectWriter`.
 //!
-//! Carved verbatim from `merge.rs` — the merge half consolidates sorted runs in
-//! place; this half *scatters* arbitrary row selections during exchange
-//! repartition, joins, distinct, and reduce. The three public entry points
+//! The merge half of `merge.rs` consolidates sorted runs in place; this half
+//! *scatters* arbitrary row selections during exchange repartition, joins,
+//! distinct, and reduce. The three public entry points
 //! (`scatter_copy`, `scatter_multi_source`, `scatter_unified_sources_with_weights`)
 //! share one shape: a fused PK + weight + null_bmp pass dispatched on `pk_stride`
 //! to a const-width (`PKS`) helper, then one sequential pass per payload column
 //! (column widths dispatched to a const-`N` gather). Those const-generic arms and
-//! every `#[inline(always)]` are load-bearing and moved unchanged;
-//! the writer's fixed-region buffers are written directly, so `DirectWriter` keeps
-//! them `pub(super)`.
+//! every `#[inline(always)]` are load-bearing: the literal width is what keeps the
+//! per-row copy a fixed-width load/store rather than a `memcpy` call. The writer's
+//! fixed-region buffers are written directly, so `DirectWriter` keeps them
+//! `pub(super)`.
 
 use super::batch::FIXED_REGION_BYTES;
 use super::merge::{DirectWriter, MemBatch, UnifiedSource};
 use gnitz_wire::is_german_string;
+
+/// Instantiate `$f` at the const PK width matching `$stride`. The literal width
+/// is what lets the fused per-row pass emit fixed-width loads/stores instead of a
+/// `memcpy`; `PKS = 0` is the runtime-stride sentinel for compound widths outside
+/// the ladder (e.g. U64+U32 = 12), whose instantiation reads `writer.pk_stride`.
+///
+/// One spelling for all three scatter entry points, so a width added here reaches
+/// every one of them.
+macro_rules! pk_stride_dispatch {
+    ($stride:expr, $f:ident, $($arg:expr),* $(,)?) => {
+        match $stride {
+            1 => $f::<1>($($arg),*),
+            2 => $f::<2>($($arg),*),
+            4 => $f::<4>($($arg),*),
+            8 => $f::<8>($($arg),*),
+            16 => $f::<16>($($arg),*),
+            _ => $f::<0>($($arg),*),
+        }
+    };
+}
+
+/// Instantiate `$f` at the const column width matching `$cs`, or evaluate `$fallback`
+/// for a width outside the ladder. Same role as [`pk_stride_dispatch`] for the
+/// per-payload-column gathers.
+macro_rules! col_width_dispatch {
+    ($cs:expr, $f:ident, ($($arg:expr),* $(,)?), $fallback:expr) => {
+        match $cs {
+            1 => $f::<1>($($arg),*),
+            2 => $f::<2>($($arg),*),
+            4 => $f::<4>($($arg),*),
+            8 => $f::<8>($($arg),*),
+            16 => $f::<16>($($arg),*),
+            _ => $fallback,
+        }
+    };
+}
 
 /// Scatter-copy rows from a batch at the given indices.
 /// Indices are NOT sorted — rows are written in the order given.
@@ -54,18 +91,7 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
     let base = writer.count; // first output row for this scatter
 
     // Fused PK + weight + null_bmp gather: one pass over `indices` instead of three.
-    // PK stride dispatches to a const-`PKS` helper so the inner loop sees a
-    // literal width (1/2/4/8/16). Wider/compound strides take the `PKS = 0`
-    // sentinel instantiation, which reads the stride at runtime — trading the
-    // literal-width store for a memcpy per row.
-    match writer.pk_stride {
-        1 => scatter_col_first_fixed::<1>(batch, indices, base, writer),
-        2 => scatter_col_first_fixed::<2>(batch, indices, base, writer),
-        4 => scatter_col_first_fixed::<4>(batch, indices, base, writer),
-        8 => scatter_col_first_fixed::<8>(batch, indices, base, writer),
-        16 => scatter_col_first_fixed::<16>(batch, indices, base, writer),
-        _ => scatter_col_first_fixed::<0>(batch, indices, base, writer),
-    }
+    pk_stride_dispatch!(writer.pk_stride, scatter_col_first_fixed, batch, indices, base, writer);
 
     let schema = writer.schema;
     for (pi, col) in schema.payload_columns() {
@@ -78,23 +104,17 @@ fn scatter_col_first(batch: &MemBatch<'_>, indices: &[u32], writer: &mut DirectW
                 writer.write_string_cell(pi, src_struct, batch.blob, base + out);
             }
         } else {
-            // Source null cells are zero by Batch invariant, so we copy
-            // unconditionally and let `gather_col` vectorize.
+            // The null *bit* governs what a cell means, so the value bytes are
+            // copied unconditionally — no per-row null test, letting `gather_col`
+            // vectorize. A null cell's bytes are never read back as a value.
             let src_col = batch.col_data(pi, cs);
             let dst_col = &mut writer.col_bufs[pi][base * cs..];
-            match cs {
-                1 => gather_col::<1>(src_col, dst_col, indices),
-                2 => gather_col::<2>(src_col, dst_col, indices),
-                4 => gather_col::<4>(src_col, dst_col, indices),
-                8 => gather_col::<8>(src_col, dst_col, indices),
-                16 => gather_col::<16>(src_col, dst_col, indices),
-                _ => {
-                    for (out, &idx) in indices.iter().enumerate() {
-                        let i = idx as usize;
-                        dst_col[out * cs..][..cs].copy_from_slice(&src_col[i * cs..][..cs]);
-                    }
+            col_width_dispatch!(cs, gather_col, (src_col, dst_col, indices), {
+                for (out, &idx) in indices.iter().enumerate() {
+                    let i = idx as usize;
+                    dst_col[out * cs..][..cs].copy_from_slice(&src_col[i * cs..][..cs]);
                 }
-            }
+            });
         }
     }
 
@@ -192,6 +212,12 @@ fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
 /// `sources[i]` holds the MemBatch for source `i`; entries in `rows` are `(src_idx, row_idx)`
 /// in emission order. Destination writes are sequential per column; source reads are scattered.
 /// No zero-weight check — callers must filter before calling.
+///
+/// **Precondition: no entry of `rows` may name a `None` source, and every
+/// `row_idx` must be `< sources[src_idx].count`.** The per-column gathers reach
+/// the source through `get_unchecked(..).unwrap_unchecked()`, so naming an absent
+/// source is undefined behaviour, not a panic. Callers build `rows` by walking the
+/// `Some` sources (`ops::exchange::relay`), which upholds it by construction.
 pub fn scatter_multi_source(sources: &[Option<MemBatch<'_>>], rows: &[(u8, u32)], writer: &mut DirectWriter<'_>) {
     if rows.is_empty() {
         return;
@@ -208,14 +234,7 @@ pub fn scatter_multi_source(sources: &[Option<MemBatch<'_>>], rows: &[(u8, u32)]
     let n = rows.len();
     let base = writer.count;
 
-    match writer.pk_stride {
-        1 => scatter_mb_pk_wt_nbm::<1>(sources, rows, base, writer),
-        2 => scatter_mb_pk_wt_nbm::<2>(sources, rows, base, writer),
-        4 => scatter_mb_pk_wt_nbm::<4>(sources, rows, base, writer),
-        8 => scatter_mb_pk_wt_nbm::<8>(sources, rows, base, writer),
-        16 => scatter_mb_pk_wt_nbm::<16>(sources, rows, base, writer),
-        _ => scatter_mb_pk_wt_nbm::<0>(sources, rows, base, writer),
-    }
+    pk_stride_dispatch!(writer.pk_stride, scatter_mb_pk_wt_nbm, sources, rows, base, writer);
 
     // One pass per column keeps destination writes sequential.
     let schema = writer.schema;
@@ -270,21 +289,14 @@ fn scatter_mb_pk_wt_nbm<const PKS: usize>(
 // copy for unusual column widths.
 #[inline(always)]
 fn gather_mb_col_dispatch(sources: &[Option<MemBatch<'_>>], rows: &[(u8, u32)], pi: usize, cs: usize, dst: &mut [u8]) {
-    match cs {
-        1 => gather_mb_col::<1>(sources, rows, pi, dst),
-        2 => gather_mb_col::<2>(sources, rows, pi, dst),
-        4 => gather_mb_col::<4>(sources, rows, pi, dst),
-        8 => gather_mb_col::<8>(sources, rows, pi, dst),
-        16 => gather_mb_col::<16>(sources, rows, pi, dst),
-        _ => {
-            for (out, &(si, ri)) in rows.iter().enumerate() {
-                let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
-                let row = ri as usize;
-                let src_off = src.offsets[super::batch::REG_PAYLOAD_START + pi] + row * cs;
-                dst[out * cs..][..cs].copy_from_slice(&src.data[src_off..src_off + cs]);
-            }
+    col_width_dispatch!(cs, gather_mb_col, (sources, rows, pi, dst), {
+        for (out, &(si, ri)) in rows.iter().enumerate() {
+            let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
+            let row = ri as usize;
+            let src_off = src.offsets[super::batch::REG_PAYLOAD_START + pi] + row * cs;
+            dst[out * cs..][..cs].copy_from_slice(&src.data[src_off..src_off + cs]);
         }
-    }
+    });
 }
 
 #[inline(always)]
@@ -302,7 +314,7 @@ fn gather_mb_col<const N: usize>(sources: &[Option<MemBatch<'_>>], rows: &[(u8, 
 /// weights from the merge walk.
 ///
 /// Used by the read-cursor drain (`ReadCursor::scatter_drained_into`) and the
-/// flush-path `merge_batches`. Callers must pass only net-nonzero weights; both
+/// flush-path `merge_survivors` + `scatter_survivors`. Callers must pass only net-nonzero weights; both
 /// the drain walk and `drive_merge`'s group fold emit only net-nonzero groups.
 pub(crate) fn scatter_unified_sources_with_weights(
     sources: &[UnifiedSource],
@@ -322,18 +334,8 @@ pub(crate) fn scatter_unified_sources_with_weights(
     let n = rows.len();
     let base = writer.count;
 
-    // Fused PK + weight + null_bmp pass. PK stride dispatches into a
-    // const-`PKS` helper so the inner loop sees a literal width (1/2/4/8/16) —
-    // without that, `copy_from_slice` lowers to memcpy. Compound widths take
-    // the runtime-stride `PKS = 0` sentinel instantiation.
-    match writer.pk_stride {
-        1 => scatter_unified_pk_wt_nbm::<1>(sources, rows, base, writer),
-        2 => scatter_unified_pk_wt_nbm::<2>(sources, rows, base, writer),
-        4 => scatter_unified_pk_wt_nbm::<4>(sources, rows, base, writer),
-        8 => scatter_unified_pk_wt_nbm::<8>(sources, rows, base, writer),
-        16 => scatter_unified_pk_wt_nbm::<16>(sources, rows, base, writer),
-        _ => scatter_unified_pk_wt_nbm::<0>(sources, rows, base, writer),
-    }
+    // Fused PK + weight + null_bmp pass.
+    pk_stride_dispatch!(writer.pk_stride, scatter_unified_pk_wt_nbm, sources, rows, base, writer);
 
     let schema = writer.schema;
     for (pi, col) in schema.payload_columns() {
@@ -402,19 +404,12 @@ fn gather_unified_col_dispatch(
     cs: usize,
     dst: &mut [u8],
 ) {
-    match cs {
-        1 => gather_unified_col::<1>(sources, rows, pi, dst),
-        2 => gather_unified_col::<2>(sources, rows, pi, dst),
-        4 => gather_unified_col::<4>(sources, rows, pi, dst),
-        8 => gather_unified_col::<8>(sources, rows, pi, dst),
-        16 => gather_unified_col::<16>(sources, rows, pi, dst),
-        _ => {
-            for (out, &(si, ri, _)) in rows.iter().enumerate() {
-                let src = unsafe { sources.get_unchecked(si as usize) };
-                dst[out * cs..][..cs].copy_from_slice(unsafe { src.cols[pi].row(ri as usize, cs) });
-            }
+    col_width_dispatch!(cs, gather_unified_col, (sources, rows, pi, dst), {
+        for (out, &(si, ri, _)) in rows.iter().enumerate() {
+            let src = unsafe { sources.get_unchecked(si as usize) };
+            dst[out * cs..][..cs].copy_from_slice(unsafe { src.cols[pi].row(ri as usize, cs) });
         }
-    }
+    });
 }
 
 // `N` is a const so LLVM emits fixed-width load/store and not a memcpy call.
@@ -438,27 +433,11 @@ mod tests {
     use super::super::batch::Batch;
     use super::super::merge::ColPtr;
     use super::*;
-    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+    use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
     use crate::test_support::{make_schema_u128_i64, wide_pk_3xu64_schema};
 
     fn make_batch_i64(rows: &[(u128, i64, i64)]) -> Batch {
         crate::test_support::make_batch_u128_raw(&make_schema_u128_i64(), rows)
-    }
-
-    fn read_pk_packed(out_pk: &[u8], i: usize, stride: usize) -> u128 {
-        // PK region is OPK (order-preserving big-endian); widen_pk_be recovers
-        // the native unsigned value from the right-aligned BE bytes.
-        gnitz_wire::widen_pk_be(&out_pk[i * stride..(i + 1) * stride], stride)
-    }
-
-    fn make_schema_u64_pk() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
     }
 
     // -----------------------------------------------------------------------
@@ -499,7 +478,7 @@ mod tests {
 
         let mut result = Vec::new();
         for i in 0..count {
-            let pk = read_pk_packed(&out_pk, i, pk_stride);
+            let pk = crate::test_support::read_pk_opk(&out_pk, i, pk_stride);
             let lo = pk as u64;
             let hi = (pk >> 64) as u64;
             let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
@@ -730,7 +709,7 @@ mod tests {
     /// Build a stride-8 `(U64 pk, I64 payload)` batch from raw 8-byte PK
     /// patterns. PK bytes are stored verbatim (scatter is byte-transparent).
     fn make_batch_pk8(rows: &[([u8; 8], i64, i64)]) -> Batch {
-        let schema = make_schema_u64_pk();
+        let schema = crate::test_support::make_schema_u64_i64();
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(rows.len().max(1));
         for (pk, w, val) in rows {
@@ -761,7 +740,7 @@ mod tests {
 
     #[test]
     fn test_scatter_multi_source_const_pk8() {
-        let schema = make_schema_u64_pk(); // stride 8
+        let schema = crate::test_support::make_schema_u64_i64(); // stride 8
         let pk_a = [0x11u8; 8];
         let pk_b = [0x22u8; 8];
         let pk_c = [0x33u8; 8];
@@ -832,7 +811,7 @@ mod tests {
 
     #[test]
     fn test_scatter_unified_sources_const_pk8() {
-        let schema = make_schema_u64_pk(); // stride 8
+        let schema = crate::test_support::make_schema_u64_i64(); // stride 8
         let pk_a = [0x11u8; 8];
         let pk_b = [0x22u8; 8];
         let pk_c = [0x33u8; 8];

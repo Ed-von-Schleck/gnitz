@@ -94,15 +94,22 @@ pub(crate) fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -
     b
 }
 
+/// A single-column PK of type `tc` plus one I64 payload column — the shape
+/// almost every storage unit test wants, parameterized by PK type.
+pub(crate) fn pk_i64_schema(tc: u8) -> SchemaDescriptor {
+    SchemaDescriptor::new(&[SchemaColumn::new(tc, 0), SchemaColumn::new(type_code::I64, 0)], &[0])
+}
+
 /// The canonical narrow test schema: U64 pk + a single I64 payload column.
 pub(crate) fn make_schema_u64_i64() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
+    pk_i64_schema(type_code::U64)
+}
+
+/// Read row `i`'s PK out of a raw `stride`-wide OPK region as its native
+/// unsigned value — the read-back twin of `Batch::extend_pk` for tests that
+/// inspect a scatter/merge destination buffer directly.
+pub(crate) fn read_pk_opk(region: &[u8], i: usize, stride: usize) -> u128 {
+    gnitz_wire::widen_pk_be(&region[i * stride..(i + 1) * stride], stride)
 }
 
 /// Build a batch over [`make_schema_u64_i64`]-shaped schemas from native
@@ -149,13 +156,7 @@ pub(crate) fn make_batch_u128_raw(schema: &SchemaDescriptor, rows: &[(u128, i64,
 /// U128 pk + a single I64 payload column — the 16-byte-PK sibling of
 /// [`make_schema_u64_i64`].
 pub(crate) fn make_schema_u128_i64() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
+    pk_i64_schema(type_code::U128)
 }
 
 /// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)

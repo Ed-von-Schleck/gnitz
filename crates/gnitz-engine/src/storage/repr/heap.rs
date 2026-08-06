@@ -22,8 +22,8 @@
 //! (`compare_pk_ordering`) reads each player's bytes straight from its source.
 //!
 //! No `pos_map`. No caller advances a non-root entry: ReadCursor folds
-//! tied rows by repeatedly popping/replacing the root; merge_batches
-//! and compact peel the root one at a time.
+//! tied rows by repeatedly popping/replacing the root; the flush merge
+//! and compaction peel the root one at a time.
 
 #[derive(Clone, Copy)]
 pub(crate) struct HeapNode {
@@ -158,8 +158,8 @@ impl LoserTree {
     /// the latter case to handle a fully-drained tree: phase 1 leaves
     /// `idx == 0` with a sentinel cur, and walk_up safely returns it.
     /// Any other sentinel-cur entry would invoke `less(loser, cur)`,
-    /// which (in two of three callsites) indexes `cursors[cur.source_idx]`
-    /// and panics on `usize::MAX`.
+    /// which indexes `cursors[cur.source_idx]` in the merge drivers and panics
+    /// on the sentinel index.
     ///
     /// `inline(always)` so this flattens into the public-API callers, which run
     /// one comparison per tournament level. (The comparator itself is a separate
@@ -252,7 +252,7 @@ impl LoserTree {
 ///   `row` (a `u32` index) or `None` when exhausted.
 /// `same_pk(a_src, a_row, b_src, b_row) -> bool` — true when both positions carry
 ///   the same PK (OPK byte equality, width-agnostic). The PK term of the group
-///   boundary, replacing the old cached-key comparison.
+///   boundary.
 /// `eq_payload(a_src, a_row, b_src, b_row) -> bool` — true when both positions
 ///   carry the same payload. The payload term of the group boundary; never inside
 ///   the heap.
@@ -300,9 +300,8 @@ pub(crate) fn drive_merge<ADV, SP, EQ, W, EM>(
 
         // Fold tied rows: each iteration peeks the new root, breaks on a PK or
         // payload mismatch, otherwise accumulates weight and steps again. The PK
-        // term (`same_pk`) replaces the old cached-key compare; the byte equality
-        // is exact at every width, so a low-16-prefix collision can no longer
-        // false-merge two distinct wide PKs.
+        // term (`same_pk`) is exact at every width, so a low-16-prefix collision
+        // cannot false-merge two distinct wide PKs.
         while !heap.is_empty() {
             let (cur_src, cur_row) = {
                 let top = heap.peek();
@@ -631,10 +630,10 @@ mod tests {
     }
 
     /// Keyless ordering by full PK bytes: two players whose OPK bytes agree on
-    /// the low 16 but disagree past byte 16 must emit in full-byte order. With a
-    /// cached `u128` prefix key (pre-Phase B) the prefix collision risked folding
-    /// them; the keyless tree always reads the full bytes through `less`, so this
-    /// pins that the tournament orders purely by the comparator.
+    /// the low 16 but disagree past byte 16 must emit in full-byte order. A cached
+    /// `u128` prefix key would risk folding them; the keyless tree always reads the
+    /// full bytes through `less`, so this pins that the tournament orders purely by
+    /// the comparator.
     #[test]
     fn loser_tree_orders_by_full_bytes() {
         // Two 24-byte keys sharing their low-16 (1,1) prefix, differing past

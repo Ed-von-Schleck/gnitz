@@ -1,7 +1,7 @@
 //! In-memory N-way merge for run-set consolidation.
 //!
-//! Operates on flat columnar buffers: pk[u128 LE], weight[i64],
-//! null_bitmap[u64], payload columns, blob arena.
+//! Operates on flat columnar buffers: pk[OPK big-endian, `pk_stride` B/row],
+//! weight[i64 LE], null_bitmap[u64 LE], payload columns, blob arena.
 //!
 //! The merge is a fused k-way merge + inline consolidation: rows with the same
 //! (PK, payload) have their weights summed; rows whose net weight is zero are dropped.
@@ -9,15 +9,14 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
+use super::batch_pool::tls_pool;
 use super::columnar::{schema_is_fixedint_nonnull, with_payload_cmp, ColumnarSource};
 // `columnar` as a module path is needed only by the test module's
 // `compare_rows` calls; dispatch uses `with_payload_cmp!`.
 #[cfg(test)]
 use super::columnar;
 use super::heap::{drive_merge, HeapNode, LoserTree};
-#[cfg(test)]
-use crate::schema::key::compare_pk_bytes;
-use crate::schema::key::{compare_pk_ordering, pack_pk_be};
+use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, pk_width_dispatch, PkSortKey};
 use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
 use gnitz_expr::{BatchView, RowSource};
 use gnitz_wire::{is_german_string, read_u64_le};
@@ -26,8 +25,8 @@ use rustc_hash::FxHashMap;
 // ---------------------------------------------------------------------------
 // ColPtr / UnifiedSource: type-erased column accessors that work uniformly
 // for in-memory `MemBatch` regions (always Raw, base = data + offset) and
-// shard `ScalarRegion::{Raw, Constant}` regions (Raw via mmap offset, Constant
-// via inline `value` buffer with stride 0). Stride 0 makes
+// shard `RegionView` regions (Raw via mmap offset, Constant via its single
+// inline element with stride 0). Stride 0 makes
 // `base.add(ri * stride) == base` for every row, so a Constant region reads
 // the same bytes for every output row without any branch in the hot loop.
 // ---------------------------------------------------------------------------
@@ -115,6 +114,29 @@ pub(crate) fn mem_batch_to_unified(mb: &MemBatch, schema: &SchemaDescriptor) -> 
 /// inside the destination blob where the bytes were appended.
 pub(crate) type BlobCache = FxHashMap<(usize, usize, usize), usize>;
 
+/// Reserve hint for a destination heap taking `out_rows` of a `src_rows`-row
+/// source whose heap is `src_blob` bytes: that slice's row-proportional share.
+///
+/// Every N-way split — the per-partition ingest scatter, the per-worker relay
+/// batches, the per-guard compaction outputs, a shard row-slice — needs this, and
+/// reserving the *whole* source heap per target instead would ask for N× the
+/// bytes any one of them can write, evicting pooled buffers and mallocing fresh
+/// above the recycle cap.
+///
+/// Rounds the per-row share up, so a source holding fewer heap bytes than rows
+/// still reserves something rather than nothing; computes the product in `u128`,
+/// so a large heap times a large row count cannot overflow into a small estimate;
+/// and clamps to `src_blob`, since no slice needs more than the whole heap. A
+/// hint only — every consumer grows on demand — so being off costs one realloc.
+pub(crate) fn prorated_blob_cap(src_blob: usize, src_rows: usize, out_rows: usize) -> usize {
+    if src_blob == 0 || src_rows == 0 {
+        return 1;
+    }
+    let per_row = src_blob.div_ceil(src_rows) as u128;
+    let est = (per_row * out_rows as u128).min(src_blob as u128) as usize;
+    est.max(1)
+}
+
 /// Copy a 16-byte German string cell and (for long strings) migrate the
 /// out-of-line payload from `src_blob` into `dst_blob`.
 ///
@@ -188,10 +210,10 @@ fn relocate_long_german_string(
 }
 
 // ---------------------------------------------------------------------------
-// Blob cache: TLS-pooled HashMap<(blob_id, offset), new_offset> used by
-// `relocate_german_string_vec` to dedupe long-string copies. Allocating the
-// HashMap on every scan was hot in the profile; pool it across calls and
-// only acquire one when the schema actually contains a STRING column.
+// Blob cache: TLS-pooled map from a source long-string span to its offset in the
+// destination heap, used by `relocate_german_string_vec` to copy each span once.
+// Allocating the HashMap on every scan was hot in the profile; pool it across
+// calls and only acquire one when the schema actually contains a STRING column.
 // ---------------------------------------------------------------------------
 
 /// Don't recycle caches that grew beyond this many buckets — keeps idle pool
@@ -199,32 +221,20 @@ fn relocate_long_german_string(
 /// long-string spans; oversized caches are dropped instead of pooled.
 const BLOB_CACHE_RECYCLE_CAP: usize = 65_536;
 
+/// Upper bound on the up-front `reserve` in [`BlobCacheGuard::acquire`].
+///
+/// The row count callers pass is an upper bound on *rows*, but only long
+/// (`> SHORT_STRING_THRESHOLD`) cells ever reach the map, so it wildly
+/// over-estimates the entry count on the whole-relation sizes `write_to_batch`
+/// is handed (a full scan passes its Σ-input row count). Reserving that far also
+/// pushes capacity past `BLOB_CACHE_RECYCLE_CAP`, so the cache is dropped instead
+/// of pooled — turning the pool into a guaranteed malloc/free per call. The map
+/// grows on demand past this, and the pool converges to the real working set.
+const BLOB_CACHE_RESERVE_CAP: usize = 4096;
+
 thread_local! {
     static BLOB_CACHE_POOL: Cell<Vec<BlobCache>> =
         const { Cell::new(Vec::new()) };
-}
-
-fn acquire_blob_cache() -> BlobCache {
-    BLOB_CACHE_POOL
-        .try_with(|p| {
-            let mut pool = p.take();
-            let cache = pool.pop().unwrap_or_default();
-            p.set(pool);
-            cache
-        })
-        .unwrap_or_default()
-}
-
-fn recycle_blob_cache(mut cache: BlobCache) {
-    if cache.capacity() > BLOB_CACHE_RECYCLE_CAP {
-        return;
-    }
-    cache.clear();
-    let _ = BLOB_CACHE_POOL.try_with(|p| {
-        let mut pool = p.take();
-        pool.push(cache);
-        p.set(pool);
-    });
 }
 
 /// RAII wrapper that returns a pooled blob cache only when the schema has at
@@ -232,10 +242,12 @@ fn recycle_blob_cache(mut cache: BlobCache) {
 pub(crate) struct BlobCacheGuard(Option<BlobCache>);
 
 impl BlobCacheGuard {
+    /// `max_rows` is a sizing hint, clamped to [`BLOB_CACHE_RESERVE_CAP`] here so
+    /// no caller has to remember to bound it.
     pub(crate) fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
         if schema.has_german_string() {
-            let mut cache = acquire_blob_cache();
-            cache.reserve(max_rows);
+            let mut cache = tls_pool::acquire(&BLOB_CACHE_POOL);
+            cache.reserve(max_rows.min(BLOB_CACHE_RESERVE_CAP));
             Self(Some(cache))
         } else {
             Self(None)
@@ -259,8 +271,12 @@ impl BlobCacheGuard {
 
 impl Drop for BlobCacheGuard {
     fn drop(&mut self) {
-        if let Some(cache) = self.0.take() {
-            recycle_blob_cache(cache);
+        if let Some(mut cache) = self.0.take() {
+            if cache.capacity() > BLOB_CACHE_RECYCLE_CAP {
+                return;
+            }
+            cache.clear();
+            tls_pool::recycle(&BLOB_CACHE_POOL, cache);
         }
     }
 }
@@ -323,6 +339,10 @@ impl<'a> ColumnarSource for SortedMemBatch<'a> {
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         self.0.get_weight(row)
+    }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.0.count
     }
 }
 
@@ -464,6 +484,10 @@ impl<'a> ColumnarSource for MemBatch<'a> {
     fn get_weight(&self, row: usize) -> i64 {
         MemBatch::get_weight(self, row)
     }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.count
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +518,38 @@ impl PosCursor {
     #[inline]
     pub(crate) fn advance(&mut self) {
         self.position += 1;
+    }
+}
+
+/// Write one payload cell of `src.len()` bytes at `off` in a column buffer.
+///
+/// The width is dispatched to a literal because the row-at-a-time writer only
+/// knows it as a runtime `col.size()`, and `copy_from_slice` on a runtime length
+/// lowers to an out-of-line `memcpy` call — an indirect libc call to move 8
+/// bytes, once per (row, column). Through `&mut [u8; N]` the copy is a typed
+/// move instead. The arms are every `SchemaColumn::size()` a payload column can
+/// have; the fallback keeps the function total.
+///
+/// The column-first `repr::scatter` kernels get the same effect from their
+/// const-`N` gathers; this is the row-at-a-time twin.
+#[inline(always)]
+fn write_cell(dst: &mut [u8], off: usize, src: &[u8]) {
+    macro_rules! fixed {
+        ($n:literal) => {{
+            // Both slices are exactly `$n` bytes here — `dst` by the range, `src`
+            // by the arm's own `src.len()` match — so neither conversion can fail.
+            let d: &mut [u8; $n] = (&mut dst[off..off + $n]).try_into().expect("dst cell width");
+            let s: &[u8; $n] = src.try_into().expect("src cell width");
+            *d = *s;
+        }};
+    }
+    match src.len() {
+        1 => fixed!(1),
+        2 => fixed!(2),
+        4 => fixed!(4),
+        8 => fixed!(8),
+        16 => fixed!(16),
+        n => dst[off..off + n].copy_from_slice(src),
     }
 }
 
@@ -558,9 +614,9 @@ impl<'a> DirectWriter<'a> {
     }
 
     // `#[inline]`: the only hot caller is `scatter_copy`'s explicit-weight loop,
-    // now in the sibling `repr::scatter` module. Same-module placement used to
-    // inline this for free; across the module boundary (release builds have no
-    // LTO and default codegen-units) the hint restores it.
+    // in the sibling `repr::scatter` module. Release builds have no LTO and use
+    // default codegen-units, so the hint is what carries the inline across the
+    // module boundary.
     #[inline]
     pub fn write_row(&mut self, batch: &MemBatch, row: usize, weight: i64) {
         if weight == 0 {
@@ -587,9 +643,8 @@ impl<'a> DirectWriter<'a> {
         if schema_is_fixedint_nonnull(schema) {
             for (payload_idx, col) in schema.payload_columns() {
                 let col_size = col.size() as usize;
-                let off = out_row * col_size;
                 let src = batch.get_col_ptr(row, payload_idx, col_size);
-                self.col_bufs[payload_idx][off..off + col_size].copy_from_slice(src);
+                write_cell(self.col_bufs[payload_idx], out_row * col_size, src);
             }
             return;
         }
@@ -606,8 +661,7 @@ impl<'a> DirectWriter<'a> {
                 self.write_string_cell(payload_idx, src_struct, batch.blob, out_row);
             } else {
                 let src = batch.get_col_ptr(row, payload_idx, col_size);
-                let off = out_row * col_size;
-                self.col_bufs[payload_idx][off..off + col_size].copy_from_slice(src);
+                write_cell(self.col_bufs[payload_idx], out_row * col_size, src);
             }
         }
     }
@@ -615,8 +669,8 @@ impl<'a> DirectWriter<'a> {
     /// Write one 16-byte German string struct from raw source slices.
     ///
     /// `#[inline]`: called per row in the German-string column pass of all three
-    /// `repr::scatter` entry points (a sibling module since the carve). Restores
-    /// the cross-module inlining that same-module placement gave for free.
+    /// `repr::scatter` entry points, a sibling module — the hint is what carries
+    /// the inline across that boundary.
     #[inline]
     pub(super) fn write_string_cell(&mut self, payload_col: usize, src_struct: &[u8], src_blob: &[u8], out_row: usize) {
         let dest = relocate_german_string_vec(src_struct, src_blob, self.blob, self.blob_cache.get_mut());
@@ -635,7 +689,7 @@ impl<'a> DirectWriter<'a> {
 
 /// N-way (PK, payload) merge + consolidation over any sorted columnar sources —
 /// the single owner of the merge that flush ([`merge_survivors`]) and shard
-/// compaction (`compact::open_and_merge`) share.
+/// compaction (`compact::merge_and_route`) share.
 ///
 /// Rows with the same (PK, payload) have their weights summed; zero-weight
 /// (PK, payload) groups are dropped. The payload-aware heap ordering puts equal
@@ -649,22 +703,26 @@ impl<'a> DirectWriter<'a> {
 /// settled by `compare_pk_ordering` (one byte comparator at every width).
 /// Sources are ghost-free by construction (shards are verified at open;
 /// `SortedMemBatch` runs are consolidated); `drive_merge`'s net-weight fold
-/// drops cross-source zeros. `counts[i]` is source `i`'s row count — the two
-/// source types keep it in a public field the callers already read.
+/// drops cross-source zeros. Each source's walk bound is its own
+/// [`ColumnarSource::row_count`].
 /// `emit(group_src, group_row, net_weight)` fires once per surviving (net ≠ 0)
 /// group; the caller turns `(src, row)` into its output (a `DirectWriter` row for
 /// flush, a guard-routed shard append for compaction).
 pub(crate) fn run_merge<S: ColumnarSource>(
     sources: &[S],
-    counts: &[usize],
     schema: &SchemaDescriptor,
     emit: impl FnMut(usize, usize, i64),
 ) {
-    debug_assert_eq!(sources.len(), counts.len(), "one row count per source");
     if sources.is_empty() {
         return;
     }
-    let mut cursors: Vec<PosCursor> = counts.iter().map(|&count| PosCursor { position: 0, count }).collect();
+    let mut cursors: Vec<PosCursor> = sources
+        .iter()
+        .map(|s| PosCursor {
+            position: 0,
+            count: s.row_count(),
+        })
+        .collect();
 
     // Dispatch the payload comparator, monomorphizing one branch-free copy of the
     // merge loop; the PK axis is `compare_pk_ordering` (no stride dispatch).
@@ -794,15 +852,14 @@ fn run_merge_body<S, RowCmp>(
 /// Split from the scatter so the caller can size the output arena to the
 /// **survivor count** rather than the Σ-input upper bound: cross-run cancellation
 /// (a retract folding an earlier insert — pervasive in aggregation trace folds)
-/// makes survivors far fewer than inputs, and the arena zero-fill + allocation
-/// then cost the output size, not the pre-cancellation input size.
+/// makes survivors far fewer than inputs, so the arena allocation and its
+/// first-touch page faults cost the output size, not the pre-cancellation one.
 pub(crate) fn merge_survivors(batches: &[SortedMemBatch], schema: &SchemaDescriptor) -> Vec<(u32, u32, i64)> {
-    let counts: Vec<usize> = batches.iter().map(|b| b.count).collect();
     // Reserve the survivor upper bound (Σ input counts) so the push loop never reallocates.
-    let mut survivors = Vec::with_capacity(counts.iter().sum());
+    let mut survivors = Vec::with_capacity(batches.iter().map(|b| b.count).sum());
     // `src`/`row` originate as `u32` fields of `HeapNode` in `drive_merge`, so the
     // casts are lossless.
-    run_merge(batches, &counts, schema, |src, row, w| {
+    run_merge(batches, schema, |src, row, w| {
         survivors.push((src as u32, row as u32, w))
     });
     survivors
@@ -856,18 +913,24 @@ pub(crate) fn sort_and_consolidate(batch: &MemBatch, schema: &SchemaDescriptor, 
     with_payload_cmp!(schema, sort_consolidate_inner, n, batch, schema, writer)
 }
 
-/// A `(pk, row-index)` pair used by the sort-consolidate path below. Keeps the
-/// PK co-located with its index so the comparator reads from the element being
-/// positioned rather than a separate array.
+/// A `(sort key, row-index)` pair. Keeps the key co-located with its index so the
+/// comparator reads from the element being positioned rather than chasing a
+/// separate key array.
 #[derive(Copy, Clone)]
-struct SortEntry {
-    pk: u128,
+struct SortEntry<K> {
+    key: K,
     idx: u32,
 }
 
-/// Sort-plus-consolidate for all PK widths. Primary key is the order-preserving
-/// `pack_pk_be`; ties break on raw OPK bytes (implied-equal/free for narrow,
-/// separating wide low-16 collisions) then payload.
+/// Sort-plus-consolidate. The sort key is the width-matched [`PkSortKey`], which
+/// is the *whole* OPK image up to a 32-byte stride — so the key compare is exact
+/// and a tie goes straight to the payload comparator. The previous fixed `u128`
+/// key was only an order-preserving *prefix*, forcing an OPK-byte tiebreak on
+/// every equal-key pair; below stride 17 that compare is provably `Equal`
+/// (`pack_pk_be` is injective there) yet still ran as an out-of-line `bcmp` on
+/// each one, and duplicate PKs are the normal case here (`map_reindex` group
+/// keys, join output keyed by the left PK, the MIN/MAX value index). Strides past
+/// the widest register key keep the byte compare.
 #[inline]
 fn sort_consolidate_inner<RowCmp>(
     n: usize,
@@ -878,24 +941,31 @@ fn sort_consolidate_inner<RowCmp>(
 ) where
     RowCmp: for<'x> RowComparator<MemBatch<'x>>,
 {
-    let mut entries: Vec<SortEntry> = (0..n as u32)
-        .map(|i| SortEntry {
-            pk: pack_pk_be(batch.get_pk_bytes(i as usize)),
-            idx: i,
-        })
-        .collect();
-
-    entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
-        Ordering::Equal => match batch
-            .get_pk_bytes(a.idx as usize)
-            .cmp(batch.get_pk_bytes(b.idx as usize))
-        {
-            Ordering::Equal => row_cmp(schema, batch, a.idx as usize, batch, b.idx as usize),
-            ord => ord,
+    pk_width_dispatch!(
+        batch.pk_stride as usize,
+        |K| {
+            let mut entries: Vec<SortEntry<K>> = (0..n as u32)
+                .map(|i| SortEntry {
+                    key: K::from_opk(batch.get_pk_bytes(i as usize)),
+                    idx: i,
+                })
+                .collect();
+            entries.sort_unstable_by(|a, b| {
+                let (x, y) = (a.idx as usize, b.idx as usize);
+                a.key.cmp(&b.key).then_with(|| row_cmp(schema, batch, x, batch, y))
+            });
+            drain_groups_into(n, batch, schema, writer, row_cmp, |pos| entries[pos].idx as usize);
         },
-        ord => ord,
-    });
-    drain_groups_into(n, batch, schema, writer, row_cmp, |pos| entries[pos].idx as usize);
+        {
+            let mut order: Vec<u32> = (0..n as u32).collect();
+            order.sort_unstable_by(|&a, &b| {
+                let (x, y) = (a as usize, b as usize);
+                compare_pk_bytes(batch.get_pk_bytes(x), batch.get_pk_bytes(y))
+                    .then_with(|| row_cmp(schema, batch, x, batch, y))
+            });
+            drain_groups_into(n, batch, schema, writer, row_cmp, |pos| order[pos] as usize);
+        }
+    )
 }
 
 /// Weight-fold an already-sorted batch: sum weights for identical (PK, payload)
@@ -973,10 +1043,10 @@ fn drain_groups_into<RowCmp>(
 
 #[cfg(test)]
 mod tests {
-    // Claim 6: the malformed-long-string fallback must zero both the length
-    // field (dest[0..4]) AND the prefix field (dest[4..8]).  Before the fix,
-    // dest[4..8] was left containing the garbage bytes copied from the corrupt
-    // source cell.
+    // The malformed-long-string fallback must zero both the length field
+    // (dest[0..4]) and the prefix field (dest[4..8]) — a prefix left holding the
+    // corrupt source cell's bytes would compare unequal to a canonical empty
+    // string that reads identically.
     #[test]
     fn test_malformed_long_string_fallback_clean_header() {
         let mut src_cell = [0u8; 16];
@@ -1055,9 +1125,7 @@ mod tests {
     use crate::test_support::make_schema_u128_i64;
 
     /// Build an owned `Batch` from a row tuple list. Tests obtain a `MemBatch`
-    /// view via `batch.as_mem_batch()`. Avoids the prior pattern of building
-    /// disjoint pk/weight/null/col Vecs, which doesn't fit the new MemBatch
-    /// layout (single `data` slice + offsets).
+    /// view via `batch.as_mem_batch()`.
     fn make_batch_i64(rows: &[(u128, i64, i64)]) -> Batch {
         crate::test_support::make_batch_u128_raw(&make_schema_u128_i64(), rows)
     }
@@ -1106,12 +1174,6 @@ mod tests {
         gnitz_expr::assert_batchview_consistent(&b.as_mem_batch(), ROWS, &[(0, 4), (1, 16), (2, 8)]);
     }
 
-    fn read_pk_packed(out_pk: &[u8], i: usize, stride: usize) -> u128 {
-        // PK region is OPK (order-preserving big-endian); widen_pk_be recovers
-        // the native unsigned value from the right-aligned BE bytes.
-        gnitz_wire::widen_pk_be(&out_pk[i * stride..(i + 1) * stride], stride)
-    }
-
     /// Build a large sorted `(PK | I64)` batch with a high duplicate-PK rate:
     /// `dup` consecutive rows share a PK (distinct ascending payloads), so the
     /// merge's equal-PK tiebreak (`compare_pk_bytes` after the `pack_pk_be` prefix
@@ -1153,11 +1215,10 @@ mod tests {
             let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
             let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
             let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
-            let counts: Vec<usize> = sorted.iter().map(|b| b.count).collect();
             let mut sink = 0i64;
             let t = Instant::now();
             for _ in 0..ITERS {
-                run_merge(&sorted, &counts, &schema, |_s, _r, w| {
+                run_merge(&sorted, &schema, |_s, _r, w| {
                     sink = sink.wrapping_add(std::hint::black_box(w));
                 });
             }
@@ -1263,12 +1324,9 @@ mod tests {
             let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
             let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
 
-            let counts: Vec<usize> = sorted.iter().map(|b| b.count).collect();
-            let total_rows: usize = counts.iter().sum();
+            let total_rows: usize = sorted.iter().map(|b| b.count).sum();
             let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total_rows);
-            run_merge(&sorted, &counts, schema, |s, r, w| {
-                survivors.push((s as u32, r as u32, w))
-            });
+            run_merge(&sorted, schema, |s, r, w| survivors.push((s as u32, r as u32, w)));
             let total_blob: usize = mem.iter().map(|m| m.blob.len()).sum();
             let unified: Vec<UnifiedSource> = mem.iter().map(|m| mem_batch_to_unified(m, schema)).collect();
 
@@ -1310,7 +1368,7 @@ mod tests {
     /// The view-output-store shape of `v_rev` (the dominant shape in the
     /// profiled flush workload): one hidden U64 group key + two non-null I64
     /// aggregates, 40 B/row, `FixedIntNonnull` payload comparator. Shared by
-    /// `merge_batches_skewed_bench` and `write_to_batch_arena_zeroing_bench`.
+    /// `merge_batches_skewed_bench` and `write_to_batch_arena_provision_bench`.
     fn make_schema_flush() -> SchemaDescriptor {
         SchemaDescriptor::new(
             &[
@@ -1395,14 +1453,14 @@ mod tests {
     }
 
     /// The arena-provisioning cost of `write_to_batch` (the pooled-buffer
-    /// `resize(arena_size, 0)` memset) as a function of `max_rows`, separated
-    /// from the scatter work. Arm (a) is pure acquire+zero+wrap; (b) scatters
+    /// allocation and first-touch page faults) as a function of `max_rows`,
+    /// separated from the scatter work. Arm (a) is pure acquire+wrap; (b) scatters
     /// all `max_rows` survivors; (c) scatters every 64th survivor. (a) ≈ (c)
     /// (both ≪ (b) in written rows) is the direct evidence that provisioning is
     /// O(max_rows), not O(rows written).
     #[test]
     #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-    fn write_to_batch_arena_zeroing_bench() {
+    fn write_to_batch_arena_provision_bench() {
         use super::super::batch::write_to_batch;
         use super::super::scatter::scatter_unified_sources_with_weights;
         use std::hint::black_box;
@@ -1501,7 +1559,7 @@ mod tests {
             let count = writer.row_count();
             let mut result = Vec::with_capacity(count);
             for i in 0..count {
-                let pk = read_pk_packed(&out_pk, i, pk_stride);
+                let pk = crate::test_support::read_pk_opk(&out_pk, i, pk_stride);
                 let lo = pk as u64;
                 let hi = (pk >> 64) as u64;
                 let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
@@ -1737,7 +1795,7 @@ mod tests {
 
         let mut result = Vec::new();
         for i in 0..count {
-            let pk = read_pk_packed(&out_pk, i, pk_stride);
+            let pk = crate::test_support::read_pk_opk(&out_pk, i, pk_stride);
             let lo = pk as u64;
             let hi = (pk >> 64) as u64;
             let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
@@ -1855,16 +1913,6 @@ mod tests {
     // MemBatch PK-accessor tests (OPK byte view vs widened value)
     // -----------------------------------------------------------------------
 
-    fn make_schema_u64_pk() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
-
     #[test]
     fn mem_batch_get_pk_bytes_matches_get_pk_u128() {
         let schema = make_schema_u128_i64();
@@ -1890,7 +1938,7 @@ mod tests {
 
     #[test]
     fn mem_batch_get_pk_bytes_matches_get_pk_u64() {
-        let schema = make_schema_u64_pk();
+        let schema = crate::test_support::make_schema_u64_i64();
         let pks: &[u64] = &[0, 1, 1 << 32, u64::MAX];
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(pks.len());
@@ -1974,7 +2022,7 @@ mod tests {
         }
         let mut result = Vec::new();
         for i in 0..count {
-            let pk = read_pk_packed(&out_pk, i, pk_stride);
+            let pk = crate::test_support::read_pk_opk(&out_pk, i, pk_stride);
             let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
             let v = gnitz_wire::read_i64_le(&out_col0, i * 8);
             result.push((pk as u64, (pk >> 64) as u64, w, v));
@@ -2577,9 +2625,9 @@ mod tests {
     // -----------------------------------------------------------------------
     // Columnar materialization differential
     //
-    // `merge_batches` now materializes survivors column-at-a-time through
-    // `scatter_unified_sources_with_weights` instead of row-at-a-time
-    // `write_row`. These tests pin the two materializations value-identical —
+    // The flush merge materializes survivors column-at-a-time through
+    // `scatter_unified_sources_with_weights`, where `write_row` goes
+    // row-at-a-time. These tests pin the two materializations value-identical —
     // same decoded PK / payload / weight / null bit / row count — over an
     // adversarial schema (two German-string columns + a nullable int) with
     // long / inline / empty / duplicate strings, a null STRING cell, and
@@ -2765,9 +2813,8 @@ mod tests {
             let total_blob: usize = sorted.iter().map(|b| b.blob.len()).sum();
 
             // Capture the merge's (src, row, net_weight) emission stream.
-            let counts: Vec<usize> = sorted.iter().map(|b| b.count).collect();
             let mut stream: Vec<(usize, usize, i64)> = Vec::new();
-            run_merge(&sorted, &counts, schema, |s, r, w| stream.push((s, r, w)));
+            run_merge(&sorted, schema, |s, r, w| stream.push((s, r, w)));
             assert!(!stream.is_empty(), "merge produced no survivors");
 
             // Row-major reference: replay write_row over the stream (the prior body).
@@ -2964,11 +3011,11 @@ mod tests {
     // -----------------------------------------------------------------------
     // OPK consolidation-output equivalence (signed / compound / wide)
     //
-    // `sort_and_consolidate` now sorts by an order-preserving key instead of a
+    // `sort_and_consolidate` sorts by an order-preserving key rather than a
     // per-comparison typed column decode. These tests pin that the consolidated
     // output is identical to an independent reference built directly from
     // `compare_pk_bytes` + `compare_rows` — the canonical total order — for the
-    // signed, compound, and wide PK shapes the new sort key covers.
+    // signed, compound, and wide PK shapes the sort key covers.
     // -----------------------------------------------------------------------
 
     /// Independent reference: argsort by `compare_pk_bytes` then `compare_rows`,

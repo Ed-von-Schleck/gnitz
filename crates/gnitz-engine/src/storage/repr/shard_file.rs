@@ -67,8 +67,9 @@ impl RegionEncoding {
 /// Returns `Constant` if every element is identical, else `Raw`.
 fn detect_encoding(data: &[u8], element_width: usize) -> RegionEncoding {
     debug_assert!(!data.is_empty() && data.len().is_multiple_of(element_width));
-    // The Constant payload buffer is 16 bytes; wider regions (compound
-    // PK strides > 16) cannot use this encoding and stay Raw.
+    // Not attempted past 16 bytes: the only regions that wide are compound-PK
+    // strides, where an all-equal region needs every PK column to repeat — rare
+    // enough that the scan is not worth running on every shard write.
     if element_width > 16 {
         return RegionEncoding::Raw;
     }
@@ -209,12 +210,14 @@ fn build_for_buffer(data: &[u8], stride: usize, signed: bool, n: usize, referenc
     buf
 }
 
-/// Try to FoR-encode a fixed-int region: `(bw, image)` on a win, `None` to keep
-/// it Raw. `for_params` makes the pack-or-not decision without allocating, so
-/// the image is built only for winners.
-fn encode_for_region(data: &[u8], stride: usize, signed: bool, n: usize) -> Option<(usize, Vec<u8>)> {
+/// Try to FoR-encode a fixed-int region: the on-disk image on a win, `None` to
+/// keep it Raw. `for_params` makes the pack-or-not decision without allocating,
+/// so the image is built only for winners. The chosen `bw` is recoverable from
+/// the image as `(len - 8) / n` — the same derivation `decode_for_region` uses —
+/// so it is not returned.
+fn encode_for_region(data: &[u8], stride: usize, signed: bool, n: usize) -> Option<Vec<u8>> {
     let (reference, bw) = for_params(data, stride, signed, n)?;
-    Some((bw, build_for_buffer(data, stride, signed, n, reference, bw)))
+    Some(build_for_buffer(data, stride, signed, n, reference, bw))
 }
 
 /// A FoR region decoded back to its raw little-endian image. Backed by
@@ -430,18 +433,14 @@ fn write_shard_streaming_inner(
             match (detect_encoding(src, width), for_signed) {
                 (c @ RegionEncoding::Constant { .. }, _) => c,
                 (_, Some(signed)) => match encode_for_region(src, width, signed, n) {
-                    Some((_, buf)) => RegionEncoding::For { buf },
+                    Some(buf) => RegionEncoding::For { buf },
                     None => RegionEncoding::Raw,
                 },
                 _ => RegionEncoding::Raw,
             }
         };
-        let actual = match &enc {
-            RegionEncoding::Raw => orig_sz,
-            _ => enc.encoded_bytes(src).len(),
-        };
+        actual_sizes.push(enc.encoded_bytes(src).len());
         encodings.push(enc);
-        actual_sizes.push(actual);
     }
 
     // --- Phase 2: XOR8 filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
@@ -754,7 +753,7 @@ mod tests {
         );
     }
 
-    /// Bug 3: streaming write with regions that trigger Constant encoding.
+    /// Streaming write with regions that trigger Constant encoding.
     #[test]
     fn test_write_shard_streaming_encodings() {
         let dir = tempfile::tempdir().unwrap();
@@ -985,7 +984,9 @@ mod for_codec_tests {
     fn roundtrip(vals: &[i128], stride: usize, signed: bool) -> Option<usize> {
         let raw = pack(vals, stride);
         let n = vals.len();
-        let (bw, image) = encode_for_region(&raw, stride, signed, n)?;
+        let image = encode_for_region(&raw, stride, signed, n)?;
+        // The width the writer chose, recovered exactly as `decode_for_region` does.
+        let bw = (image.len() - 8) / n;
         assert_eq!(image.len(), for_encoded_size(n, bw), "emitted size == for_encoded_size");
         assert!(bw >= 1 && bw < stride, "bw {bw} in [1, {stride})");
         let decoded = decode_for_region(&image, n, stride);
@@ -1136,7 +1137,8 @@ mod for_codec_tests {
         let n = 1_000_000usize;
         let vals: Vec<i128> = (0..n).map(|i| 3_000_000_000i128 + (i % 4000) as i128).collect();
         let raw = pack(&vals, 8);
-        let (bw, image) = encode_for_region(&raw, 8, true, n).expect("region must pack");
+        let image = encode_for_region(&raw, 8, true, n).expect("region must pack");
+        let bw = (image.len() - 8) / n;
 
         let raw_bytes = align64(n * 8);
         let packed_bytes = align64(for_encoded_size(n, bw));

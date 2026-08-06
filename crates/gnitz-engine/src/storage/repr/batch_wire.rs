@@ -1,9 +1,8 @@
 //! Wire / shard serialization for `Batch`.
 //!
-//! This is the one `storage` repr-side module that depends *up* on the disk
-//! half (`wal` block layout, `shard_file` image writing). Hoisting the
-//! serialization cluster out of `batch.rs` lets the pure in-memory repr there
-//! name no disk/LSM module.
+//! Keeping the serialization cluster here rather than in `batch.rs` lets the
+//! pure in-memory repr name no wire or shard module: this is the only place that
+//! knows both the batch layout and the `wal` block / `shard_file` image formats.
 //!
 //! These run per-flush / per-IPC, not per-row; the region-copy loops stay
 //! `#[inline]`-friendly and read every stride/offset off the `Batch` /
@@ -13,7 +12,8 @@ use std::ffi::CStr;
 
 use super::super::error::StorageError;
 use super::batch::{
-    acquire_arena, compute_offsets, strides_from_schema, Batch, Fill, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK,
+    acquire_arena, compute_offsets, copy_regions, strides_from_schema, Batch, Fill, MAX_BATCH_REGIONS,
+    MAX_WIRE_REGIONS, REG_PK,
 };
 use super::merge::MemBatch;
 use super::shard_file;
@@ -96,29 +96,56 @@ impl Batch {
 
     // ── Wire serialization (used by runtime::sal / runtime::wire) ───────────
 
-    /// Byte count of the WAL-block encoding for this batch.
-    pub fn wire_byte_size(&self) -> usize {
-        let nr_wire = self.num_regions_total();
-        let mut sizes = [0u32; MAX_WIRE_REGIONS];
-        for (i, size) in sizes[..nr_wire].iter_mut().enumerate() {
-            *size = self.region_size(i) as u32;
-        }
-        wal::block_size(&sizes[..nr_wire])
-    }
-
-    /// Byte count of the WAL-block encoding for `count` rows from this batch.
-    /// Only valid for wire-safe schemas — all region strides are multiples of 8
-    /// so there is no alignment padding and the result is linear in `count`.
-    pub fn wire_byte_size_range(&self, count: usize) -> usize {
+    /// WAL-block byte size for `count` rows of this batch's fixed regions plus a
+    /// `blob_len`-byte heap — the sizing half of the region convention, shared by
+    /// the whole-batch and range encoders below.
+    fn wire_size_of(&self, count: usize, blob_len: usize) -> usize {
         let blob_idx = self.num_regions as usize;
-        let nr_wire = blob_idx + 1;
         let mut sizes = [0u32; MAX_WIRE_REGIONS];
         for (i, size) in sizes[..blob_idx].iter_mut().enumerate() {
             *size = (count * self.region_stride(i) as usize) as u32;
         }
-        // blob is always empty for wire-safe schemas
-        sizes[blob_idx] = 0;
-        wal::block_size(&sizes[..nr_wire])
+        sizes[blob_idx] = blob_len as u32;
+        wal::block_size(&sizes[..blob_idx + 1])
+    }
+
+    /// Byte count of the WAL-block encoding for this batch.
+    pub fn wire_byte_size(&self) -> usize {
+        self.wire_size_of(self.count, self.blob.len())
+    }
+
+    /// Byte count of the WAL-block encoding for `count` rows from this batch.
+    /// Only valid for wire-safe schemas — all region strides are multiples of 8
+    /// so there is no alignment padding and the result is linear in `count`, and
+    /// the heap is empty because such a schema carries no long strings.
+    pub fn wire_byte_size_range(&self, count: usize) -> usize {
+        self.wire_size_of(count, 0)
+    }
+
+    /// Encode rows `[start_row, start_row + count)` of every fixed region, plus
+    /// `blob` as the trailing heap region, as one WAL block at `out[offset..]`.
+    /// Returns bytes written. The one region-array build both encoders share.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_regions(
+        &self,
+        start_row: usize,
+        count: usize,
+        blob: &[u8],
+        table_id: u32,
+        out: &mut [u8],
+        offset: usize,
+        checksum: bool,
+    ) -> usize {
+        let blob_idx = self.num_regions as usize;
+        let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
+        for (i, region) in regions[..blob_idx].iter_mut().enumerate() {
+            let stride = self.region_stride(i) as usize;
+            *region = &self.region_slice(i)[start_row * stride..(start_row + count) * stride];
+        }
+        regions[blob_idx] = blob;
+        let new_offset = wal::encode(out, offset, table_id, count as u32, &regions[..blob_idx + 1], checksum)
+            .expect("WAL encode failed: buffer too small");
+        new_offset - offset
     }
 
     /// Encode rows `[start_row, start_row + count)` into WAL V4 wire format at
@@ -158,32 +185,15 @@ impl Batch {
              carry no long strings; the heap would be silently dropped",
             self.blob.len(),
         );
-        let blob_idx = self.num_regions as usize;
-        let nr_wire = blob_idx + 1;
-        let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
-        for (i, region) in regions[..blob_idx].iter_mut().enumerate() {
-            let stride = self.region_stride(i) as usize;
-            // Sub-range [start_row, start_row + count) of region `i`; the assert
-            // above bounds (start_row + count) <= self.count, so the slice is in
-            // the region's `self.count * stride` bytes.
-            *region = &self.region_slice(i)[start_row * stride..(start_row + count) * stride];
-        }
-        // blob region stays empty (&[]) — wire-safe schemas carry no long strings.
-        let new_offset = wal::encode(out, offset, table_id, count as u32, &regions[..nr_wire], checksum)
-            .expect("WAL encode failed: buffer too small");
-        new_offset - offset
+        // The assert above bounds `start_row + count <= self.count`, so each
+        // region sub-slice stays inside its `self.count * stride` bytes. The blob
+        // region is passed empty — wire-safe schemas carry no long strings.
+        self.encode_regions(start_row, count, &[], table_id, out, offset, checksum)
     }
 
     /// Encode self into WAL wire format at out[offset..]. Returns bytes written.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize, checksum: bool) -> usize {
-        let nr_wire = self.num_regions_total();
-        let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
-        for (i, region) in regions[..nr_wire].iter_mut().enumerate() {
-            *region = self.region_slice(i);
-        }
-        let new_offset = wal::encode(out, offset, table_id, self.count as u32, &regions[..nr_wire], checksum)
-            .expect("WAL encode failed: buffer too small");
-        new_offset - offset
+        self.encode_regions(0, self.count, &self.blob, table_id, out, offset, checksum)
     }
 
     /// Decode a WAL block from `data` using `schema` into an owned `Batch`.
@@ -224,21 +234,19 @@ impl Batch {
         // (`wal::encode` copies each region's `count * stride` bytes and skips
         // the padding, and shard/wire/clone paths are all `count`-bounded).
         let mut data_buf = acquire_arena(total, Fill::Uninit);
-        for r in 0..nr_usize {
-            let len = mb.count * strides[r] as usize;
-            if len == 0 {
-                continue;
-            }
-            // SAFETY: both extents are in bounds — the source region was
-            // validated to `count * stride` bytes, the destination sized by
-            // compute_offsets for `mb.count` rows; distinct allocations.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    mb.data.as_ptr().add(mb.offsets[r]),
-                    data_buf.as_mut_ptr().add(offsets[r]),
-                    len,
-                );
-            }
+        // SAFETY: both extents are in bounds — each source region was validated to
+        // exactly `count * stride` bytes by the parse above, the destination sized
+        // by `compute_offsets` for `mb.count` rows; distinct allocations.
+        unsafe {
+            copy_regions(
+                mb.data,
+                &mb.offsets,
+                &mut data_buf,
+                &offsets,
+                &strides,
+                nr_usize,
+                mb.count,
+            );
         }
         let mut blob = acquire_arena(mb.blob.len(), Fill::Reserve);
         blob.extend_from_slice(mb.blob);
@@ -374,15 +382,11 @@ fn decode_mem_batch_inner<'a>(
 mod tests {
     use super::super::batch::{REG_PAYLOAD_START, REG_WEIGHT};
     use super::*;
-    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-
-    fn single_col_pk_schema(tc: u8) -> SchemaDescriptor {
-        SchemaDescriptor::new(&[SchemaColumn::new(tc, 0), SchemaColumn::new(type_code::I64, 0)], &[0])
-    }
+    use crate::schema::type_code;
 
     #[test]
     fn decode_from_wal_block_rejects_mismatched_pk_stride() {
-        let schema = single_col_pk_schema(type_code::U64); // pk_stride = 8
+        let schema = crate::test_support::pk_i64_schema(type_code::U64); // pk_stride = 8
         let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(42u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -402,7 +406,7 @@ mod tests {
 
     #[test]
     fn decode_from_wal_block_rejects_mismatched_weight_region() {
-        let schema = single_col_pk_schema(type_code::U64);
+        let schema = crate::test_support::pk_i64_schema(type_code::U64);
         let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(42u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -422,7 +426,7 @@ mod tests {
 
     #[test]
     fn decode_from_wal_block_rejects_region_offset_past_block() {
-        let schema = single_col_pk_schema(type_code::U64);
+        let schema = crate::test_support::pk_i64_schema(type_code::U64);
         let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(42u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -447,7 +451,7 @@ mod tests {
 
     #[test]
     fn decode_mem_batch_rejects_blob_region_past_block() {
-        let schema = single_col_pk_schema(type_code::U64);
+        let schema = crate::test_support::pk_i64_schema(type_code::U64);
         let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(42u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -474,7 +478,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "wire-safe schemas")]
     fn encode_range_to_wire_panics_on_nonempty_blob() {
-        let schema = single_col_pk_schema(type_code::U64);
+        let schema = crate::test_support::pk_i64_schema(type_code::U64);
         let mut b = Batch::with_capacity(schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());

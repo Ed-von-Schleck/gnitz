@@ -160,4 +160,8 @@ impl ColumnarSource for Run {
             Run::Shard(s) => s.get_weight(row),
         }
     }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        Run::count(self)
+    }
 }

@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 
 use crate::schema::key::{compare_pk_ordering, pack_pk_be};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
+use crate::storage::{prorated_blob_cap, scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
 
 use super::router::{RouteMode, ScatterKey};
 use gnitz_wire::build_w_map;
@@ -57,7 +57,7 @@ fn worker_rows_to_batches(
             if rows.is_empty() {
                 return Batch::empty_with_schema(schema);
             }
-            let blob_cap = (total_blob * rows.len() / total_rows).max(1);
+            let blob_cap = prorated_blob_cap(total_blob, total_rows, rows.len());
             write_to_batch(schema, rows.len(), blob_cap, |writer| {
                 scatter_multi_source(mem_batches, rows, writer);
             })

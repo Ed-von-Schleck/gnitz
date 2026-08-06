@@ -11,6 +11,7 @@ use std::ffi::CStr;
 
 use super::batch::write_to_batch;
 use super::error::StorageError;
+use super::merge::prorated_blob_cap;
 use super::merge::{run_merge, UnifiedSource};
 use super::scatter::scatter_unified_sources_with_weights;
 use super::shard_file::ShardWriteOpts;
@@ -56,8 +57,7 @@ pub fn merge_and_route(
     assert!(!guard_keys.is_empty(), "merge_and_route requires at least one guard");
 
     let shards = open_shards(input_files, schema)?;
-    let counts: Vec<usize> = shards.iter().map(|s| s.count).collect();
-    let total_rows: usize = counts.iter().sum(); // survivor upper bound
+    let total_rows: usize = shards.iter().map(|s| s.count).sum(); // survivor upper bound
     let total_blob: usize = shards.iter().map(|s| s.blob_len).sum();
 
     // Phase 1 — merge into survivors, sorted (PK, payload). The emit stays a bare
@@ -65,7 +65,7 @@ pub fn merge_and_route(
     // one contiguous run and the split points are `guard_keys.len()` binary
     // searches over the finished buffer rather than a guard lookup per row.
     let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total_rows);
-    run_merge(&shards, &counts, schema, |src, row, w| {
+    run_merge(&shards, schema, |src, row, w| {
         survivors.push((src as u32, row as u32, w));
     });
 
@@ -94,12 +94,7 @@ pub fn merge_and_route(
             "{output_dir}/{}",
             super::naming::compact_shard_name(table_id, compact_seq, level_num as usize, guard_key)
         );
-        // Reserve this run's row-proportional share of the blob arena, not the
-        // whole `total_blob` per guard: a string-heavy split would otherwise
-        // malloc the full arena once per guard (and `DirectWriter` still grows it
-        // if a run's strings exceed the estimate). Widen to u128 for the product
-        // so a huge (blob-bytes × rows) intermediate can't overflow the estimate.
-        let blob_cap = (total_blob as u128 * bucket.len() as u128 / nsurv.max(1) as u128).max(1) as usize;
+        let blob_cap = prorated_blob_cap(total_blob, nsurv, bucket.len());
         let batch = write_to_batch(schema, bucket.len(), blob_cap, |writer| {
             scatter_unified_sources_with_weights(&unified, bucket, writer);
         });
@@ -1186,10 +1181,9 @@ mod tests {
     /// the columnar path is checked against.
     fn oracle_compact_row_at_a_time(input_files: &[&CStr], output_file: &CStr, schema: &SchemaDescriptor) {
         let shards = open_shards(input_files, schema).unwrap();
-        let counts: Vec<usize> = shards.iter().map(|s| s.count).collect();
         let mut batch = Batch::with_capacity(*schema, 1024);
         let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
-        run_merge(&shards, &counts, schema, |src, row, w| {
+        run_merge(&shards, schema, |src, row, w| {
             let pk_bytes = shards[src].get_pk_bytes(row);
             batch.append_row_from_source_bytes(pk_bytes, w, &shards[src], row, blob_cache.get_mut());
         });
@@ -1302,11 +1296,10 @@ mod tests {
         schema: &SchemaDescriptor,
     ) -> Vec<Option<String>> {
         let shards = open_shards(input_files, schema).unwrap();
-        let counts: Vec<usize> = shards.iter().map(|s| s.count).collect();
         let n = guard_keys.len();
         let mut batches: Vec<Batch> = (0..n).map(|_| Batch::with_capacity(*schema, 256)).collect();
         let mut blob_caches: Vec<BlobCacheGuard> = (0..n).map(|_| BlobCacheGuard::acquire(schema, 256)).collect();
-        run_merge(&shards, &counts, schema, |src, row, w| {
+        run_merge(&shards, schema, |src, row, w| {
             let pk = shards[src].get_pk_bytes(row);
             let g = find_guard_for_key(guard_keys, pack_pk_be(pk));
             batches[g].append_row_from_source_bytes(pk, w, &shards[src], row, blob_caches[g].get_mut());

@@ -3,17 +3,18 @@
 //! (`batch_wire`), TLS buffer recycling (`batch_pool`), the columnar comparators
 //! (`columnar`), sort-merge consolidation (`merge`), exchange repartition
 //! (`scatter`), the fused k-way merge kernel (`heap`), the PK-probe filters
-//! (`bloom`, `xor8`), and the pure byte
-//! codecs of the on-disk formats: the shard image (`shard_file`) and the
-//! shard-format constants (`layout`). The low-level WAL-block framer lives in
-//! `gnitz_wire::wal` (the one definition client and engine share); `batch_wire`
-//! and the SAL scatter writer call it.
+//! (`bloom`, `xor8`), the shard-image encoder and its atomic writer
+//! (`shard_file`), and the shard-format constants (`layout`). The low-level
+//! WAL-block framer lives in `gnitz_wire::wal` (the one definition client and
+//! engine share); `batch_wire` and the SAL scatter writer call it.
 //!
 //! `repr/` has **no outward facade of its own** — `storage/mod.rs` curates the
 //! single combined storage surface and reaches into these submodules, re-exporting
 //! each leaf's items and aliasing the submodules so the L3/LSM siblings keep their
-//! `super::<mod>` / `crate::storage::<mod>` paths. Every edge points downward
-//! (schema/foundation) or sideways within this layer.
+//! `super::<mod>` / `crate::storage::<mod>` paths. Every production edge points
+//! downward (schema/foundation) or sideways within this layer; `shard_file`'s
+//! test module is the one exception, reaching up to `lsm::shard_reader` to read
+//! back what it wrote.
 
 pub(super) mod batch;
 pub(crate) mod batch_pool;

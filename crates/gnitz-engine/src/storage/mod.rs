@@ -57,7 +57,9 @@ pub(crate) use lsm::partitioned_table::PartitionProbe;
 pub(crate) use lsm::read_cursor::REWIND_CALLS;
 pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor};
 pub(crate) use lsm::spill::{KeyProducer, SpillSort};
-pub(crate) use merge::{relocate_german_string_vec, BlobCache, BlobCacheGuard, DirectWriter, RowComparator};
+pub(crate) use merge::{
+    prorated_blob_cap, relocate_german_string_vec, BlobCache, BlobCacheGuard, DirectWriter, RowComparator,
+};
 
 /// Convert a path string to a `CString`, mapping an interior NUL to
 /// `InvalidPath` — the one conversion every storage path takes.

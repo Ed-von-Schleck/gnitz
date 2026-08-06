@@ -1,4 +1,5 @@
-//! Thread-local buffer pool for `Vec<u8>` recycling.
+//! Thread-local buffer pool for `Vec<u8>` recycling, over the generic
+//! [`tls_pool`] every `repr` object pool is built from.
 //!
 //! Batch uses only 2 heap allocations (data + blob). This pool
 //! recycles those buffers so steady-state batch operations allocate nothing.
@@ -8,12 +9,49 @@
 
 use std::cell::Cell;
 
-const MAX_POOLED: usize = 64;
-/// Buffers larger than this are dropped on recycle rather than pooled.
-/// Matches `HUGEPAGE_THRESHOLD` in batch.rs: data buffers already bypass the
-/// pool on allocation above this size; blob buffers have no such bypass, so
-/// this cap prevents a large-string outlier from trapping memory permanently.
-const MAX_RECYCLE_CAPACITY: usize = 2 * 1024 * 1024;
+/// The take/pop/set half of every thread-local object pool in `repr` — the byte
+/// arenas here and the blob-relocation caches in `merge`. Each pool keeps its own
+/// admission rule (what is too big to retain); this owns only the plumbing, so
+/// the pool-length cap and the thread-teardown handling are stated once.
+pub(crate) mod tls_pool {
+    use std::cell::Cell;
+    use std::thread::LocalKey;
+
+    /// Entries retained per pool. Bounds idle memory when a burst returns more
+    /// items than steady state needs.
+    pub(crate) const MAX_POOLED: usize = 64;
+
+    /// Take an item, or `T::default()` when the pool is empty or the
+    /// thread-local is being torn down.
+    pub(crate) fn acquire<T: Default>(pool: &'static LocalKey<Cell<Vec<T>>>) -> T {
+        pool.try_with(|p| {
+            let mut items = p.take();
+            let item = items.pop().unwrap_or_default();
+            p.set(items);
+            item
+        })
+        .unwrap_or_default()
+    }
+
+    /// Return an item, dropping it if the pool is already full or the
+    /// thread-local is gone. Callers apply their own size admission first.
+    pub(crate) fn recycle<T>(pool: &'static LocalKey<Cell<Vec<T>>>, item: T) {
+        let _ = pool.try_with(|p| {
+            let mut items = p.take();
+            if items.len() < MAX_POOLED {
+                items.push(item);
+            }
+            p.set(items);
+        });
+    }
+}
+
+/// Buffers larger than this are dropped on recycle rather than pooled. Data
+/// buffers already bypass the pool on allocation at this size (they want
+/// `MADV_HUGEPAGE`, which a pooled buffer would not carry); blob buffers have no
+/// such bypass, so this cap prevents a large-string outlier from trapping memory
+/// permanently.
+const MAX_RECYCLE_CAPACITY: usize = super::batch::HUGEPAGE_THRESHOLD;
 
 thread_local! {
     static BUF_POOL: Cell<Vec<Vec<u8>>> = const { Cell::new(Vec::new()) };
@@ -22,33 +60,19 @@ thread_local! {
 /// Take a buffer from the pool (retains previous capacity).
 /// Returns `Vec::new()` (0 capacity) when the pool is empty.
 pub(crate) fn acquire_buf() -> Vec<u8> {
-    BUF_POOL
-        .try_with(|p| {
-            let mut pool = p.take();
-            let buf = pool.pop().unwrap_or_default();
-            p.set(pool);
-            buf
-        })
-        .unwrap_or_default()
+    tls_pool::acquire(&BUF_POOL)
 }
 
 /// Return a buffer to the pool (clears content, retains capacity).
 /// Zero-capacity buffers (moved-from state) and buffers larger than
 /// `MAX_RECYCLE_CAPACITY` are dropped instead of pooled.
-/// Uses `try_with` to handle thread-local teardown gracefully.
 pub(crate) fn recycle_buf(mut buf: Vec<u8>) {
     let cap = buf.capacity();
     if cap == 0 || cap > MAX_RECYCLE_CAPACITY {
         return;
     }
     buf.clear();
-    let _ = BUF_POOL.try_with(|p| {
-        let mut pool = p.take();
-        if pool.len() < MAX_POOLED {
-            pool.push(buf);
-        }
-        p.set(pool);
-    });
+    tls_pool::recycle(&BUF_POOL, buf);
 }
 
 /// A pooled send buffer that returns itself to the pool on drop.
@@ -114,13 +138,13 @@ mod tests {
     #[test]
     fn pool_capped_at_max_pooled() {
         drain_pool();
-        for _ in 0..MAX_POOLED + 4 {
+        for _ in 0..tls_pool::MAX_POOLED + 4 {
             recycle_buf(vec![0u8; 128]);
         }
         let mut count = 0usize;
         while acquire_buf().capacity() > 0 {
             count += 1;
         }
-        assert_eq!(count, MAX_POOLED);
+        assert_eq!(count, tls_pool::MAX_POOLED);
     }
 }

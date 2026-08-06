@@ -20,7 +20,8 @@ fn next_blob_id() -> u64 {
 
 /// Minimum allocation size to request transparent hugepage backing.
 /// Below this, hugepage promotion is impossible (no full 2MB PMD region).
-const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
+/// Also the pool's recycle ceiling (`batch_pool::MAX_RECYCLE_CAPACITY`).
+pub(super) const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Cost of relocating one German-string cell, in bytes of whole-heap memcpy — the
 /// unit that lets [`Batch::should_relocate_blob`] weigh the two arms with one
@@ -278,14 +279,15 @@ fn carve_at<'a>(
 
 /// Copy `count` rows of every region from `src` (regions at `src_offsets`)
 /// into `dst` (regions at `dst_offsets`), one bulk copy per region. Shared by
-/// the `reserve_rows` out-of-place grow and `clone_batch`.
+/// the `reserve_rows` out-of-place grow, `clone_batch`, and the wire decode in
+/// `batch_wire`.
 ///
 /// # Safety
 /// `src` and `dst` are distinct allocations; for every region `i < nr`, both
 /// `src_offsets[i] + count * strides[i]` and `dst_offsets[i] + count *
 /// strides[i]` are in bounds (both sides sized by `compute_offsets` for at
 /// least `count` rows).
-unsafe fn copy_regions(
+pub(super) unsafe fn copy_regions(
     src: &[u8],
     src_offsets: &[usize; MAX_BATCH_REGIONS],
     dst: &mut [u8],
@@ -335,7 +337,7 @@ pub(crate) enum Layout {
 /// contain data.  The PK region uses pk_stride bytes/row; 8 for U64, 16 for
 /// U128, wider for compound PKs.
 ///
-/// **2 heap allocations** (data + blob) instead of N+7.
+/// **2 heap allocations**: `data` and `blob`.
 pub struct Batch {
     data: Vec<u8>,
     pub blob: Vec<u8>,
@@ -428,7 +430,7 @@ impl Batch {
     /// uninitialized memory from that row on regardless.
     ///
     /// Skipping the memset is worth 11–14% of scatter time
-    /// (`write_to_batch_arena_zeroing_bench`), and a real one above
+    /// (`write_to_batch_arena_provision_bench`), and a real one above
     /// `HUGEPAGE_THRESHOLD`.
     ///
     /// Publishing `count` before filling is fine (`capacity_writer` does it);
@@ -637,8 +639,14 @@ impl Batch {
     /// the writer is dropped.
     pub(crate) fn capacity_writer(&mut self) -> merge::DirectWriter<'_> {
         let cap = self.capacity as usize;
+        let nr = self.num_regions as usize;
         let schema = self.schema.as_ref().expect("capacity_writer requires schema");
-        let (pk, weight, null_bmp, col_slices) = carve_writer_slices(&mut self.data, schema, cap);
+        // `carve_at`, not `carve_writer_slices`: `self.offsets` was computed by
+        // `reserve_rows` for exactly `self.capacity` rows, so re-deriving it would
+        // re-walk the schema to reproduce values already in hand — and would let
+        // writer and reader disagree on region starts if the two derivations ever
+        // drifted, instead of sharing one array by construction.
+        let (pk, weight, null_bmp, col_slices) = carve_at(&mut self.data, &self.strides, nr, &self.offsets, cap);
         merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut self.blob, schema, cap)
     }
 
@@ -1201,7 +1209,9 @@ impl Batch {
         }
     }
 
-    /// Total bytes occupied by all buffers.
+    /// Live row bytes: each region bounded to `count`, plus the blob. Excludes
+    /// unused capacity and inter-region padding, so a caller sizing a RAM budget
+    /// against it is measuring rows held, not bytes allocated.
     pub fn total_bytes(&self) -> usize {
         let nr = self.num_regions as usize;
         let mut total = self.blob.len();
@@ -1219,13 +1229,7 @@ impl Batch {
         if indices.is_empty() {
             return Self::empty_with_schema(schema);
         }
-        // Reserve this slice's row-proportional share of the source blob heap,
-        // not the whole heap per target: an N-way split (the 64-or-more partition
-        // scatter on every ingest) would otherwise ask for N × the bytes it can
-        // possibly write, evicting pooled buffers and mallocing fresh above the
-        // recycle cap. `blob_cap` is only a reserve hint — `DirectWriter` grows
-        // it on demand — so an under-estimate costs at most one realloc.
-        let blob_cap = (batch.blob.len() * indices.len() / batch.count.max(1)).max(1);
+        let blob_cap = merge::prorated_blob_cap(batch.blob.len(), batch.count, indices.len());
         write_to_batch(schema, indices.len(), blob_cap, |writer| {
             super::scatter::scatter_copy(batch, indices, weights, writer);
         })
@@ -1300,8 +1304,7 @@ impl Batch {
         output
     }
 
-    /// Clone all buffers into a new independent Batch.
-    /// 2 allocations (data + blob) instead of N+7.
+    /// Clone all buffers into a new independent Batch (2 allocations).
     pub fn clone_batch(&self) -> Self {
         // Only clone the actually-used portion of data (count-based, not capacity-based).
         let nr = self.num_regions as usize;
@@ -1357,7 +1360,7 @@ impl Batch {
     pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         let stride = self.pk_stride() as usize;
         let cp = self.pk_col_ptr();
-        super::columnar::lower_bound_opk(self.count, key, stride, |i| unsafe { cp.row(i, stride) })
+        unsafe { super::columnar::seek_lower_bound(self.count, stride, cp, key) }
     }
 
     /// Galloping forward lower bound seeded at `hint` (the caller's live
@@ -1368,7 +1371,7 @@ impl Batch {
     pub fn advance_to(&self, key: &[u8], hint: usize) -> usize {
         let stride = self.pk_stride() as usize;
         let cp = self.pk_col_ptr();
-        super::columnar::gallop_opk(self.count, key, hint, stride, |i| unsafe { cp.row(i, stride) })
+        unsafe { super::columnar::seek_advance_to(self.count, stride, cp, key, hint) }
     }
 
     /// Append all of `src`, relocating German-string blob data into `self`'s
@@ -1414,22 +1417,6 @@ impl Batch {
         self.append_mem_batch_ranges(&src.as_mem_batch(), ranges, WeightFill::Copy, guard.get_mut());
     }
 
-    /// Gather every `[start, end)` row range of `src`, in list order, into a
-    /// fresh batch — the survivor list of one filter pass, materialized.
-    ///
-    /// The blob is shared up front, so a German-string column copies its 16-byte
-    /// structs verbatim rather than relocating each cell: both batches then hold
-    /// identical heaps, and every offset inside a struct stays valid. Sharing an
-    /// empty blob is a no-op, so this needs no non-empty guard — an all-short-
-    /// string batch (≤12 bytes, stored inline) has an empty heap and must not be
-    /// dropped to the per-cell path.
-    ///
-    /// That trade is right for a batch consumed in-process (the circuit's
-    /// `op_filter`): one memcpy of the heap beats a probe per surviving cell, and
-    /// downstream operators relocate anyway. A gather whose result is *shipped* —
-    /// the wire index range-seek — must not share, or the dropped rows' spans go
-    /// over the wire; it builds the output with `append_ranges` instead, which
-    /// relocates only the survivors, deduped.
     /// Whether copying `row_count` rows out of a `src_count`-row source whose heap
     /// is `src_blob_len` bytes should relocate the slice's own string cells rather
     /// than carry the source's whole heap.
@@ -1447,6 +1434,22 @@ impl Batch {
         src_count > 0 && src_blob_len > row_count.saturating_mul(RELOCATE_CELL_COST_BYTES + src_blob_len / src_count)
     }
 
+    /// Gather every `[start, end)` row range of `src`, in list order, into a
+    /// fresh batch — the survivor list of one filter pass, materialized.
+    ///
+    /// The blob is shared up front, so a German-string column copies its 16-byte
+    /// structs verbatim rather than relocating each cell: both batches then hold
+    /// identical heaps, and every offset inside a struct stays valid. Sharing an
+    /// empty blob is a no-op, so this needs no non-empty guard — an all-short-
+    /// string batch (≤12 bytes, stored inline) has an empty heap and must not be
+    /// dropped to the per-cell path.
+    ///
+    /// That trade is right for a batch consumed in-process (the circuit's
+    /// `op_filter`): one memcpy of the heap beats a probe per surviving cell, and
+    /// downstream operators relocate anyway. A gather whose result is *shipped* —
+    /// the wire index range-seek — must not share, or the dropped rows' spans go
+    /// over the wire; it builds the output with `append_ranges` instead, which
+    /// relocates only the survivors, deduped.
     pub fn from_ranges(src: &Batch, ranges: &[(usize, usize)], schema: &SchemaDescriptor) -> Batch {
         let rows = range_rows(ranges);
         if rows == 0 {
@@ -1634,18 +1637,10 @@ impl Batch {
         self.num_regions as usize + 1
     }
 
-    /// Get region size by index.
-    pub fn region_size(&self, idx: usize) -> usize {
-        if idx < self.num_regions as usize {
-            self.count * self.strides[idx] as usize
-        } else {
-            self.blob.len()
-        }
-    }
-
-    /// Safe `&[u8]` view of region `idx` (`region_size(idx)` bytes), for callers
-    /// that frame the batch into a byte buffer (`batch_wire`'s wire encoders) —
-    /// the region copy stays bounds-checked, no raw pointers.
+    /// Safe `&[u8]` view of region `idx` — `count * stride` bytes for a fixed
+    /// region, the whole heap for the trailing blob — for callers that frame the
+    /// batch into a byte buffer (`batch_wire`'s wire encoders) or hand it to the
+    /// shard writer. The region copy stays bounds-checked, no raw pointers.
     pub fn region_slice(&self, idx: usize) -> &[u8] {
         let blob_idx = self.num_regions as usize;
         if idx < blob_idx {
@@ -1920,6 +1915,10 @@ impl ColumnarSource for Batch {
     fn get_weight(&self, row: usize) -> i64 {
         Batch::get_weight(self, row)
     }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.count
+    }
 }
 
 /// Allocate a single contiguous arena, run a merge/copy operation via
@@ -2134,10 +2133,6 @@ mod tests {
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::wide_pk_3xu64_schema;
 
-    fn single_col_pk_schema(tc: u8) -> SchemaDescriptor {
-        SchemaDescriptor::new(&[SchemaColumn::new(tc, 0), SchemaColumn::new(type_code::I64, 0)], &[0])
-    }
-
     // Compound-PK regression guard for the precomputed payload→logical
     // mapping. 4-column schema with pk_indices=[1, 2]: payload slot 0
     // must map to logical column 0, slot 1 to logical column 3 — never
@@ -2186,7 +2181,7 @@ mod tests {
     fn widen_pk_be_extend_pk_round_trips() {
         // extend_pk writes right-aligned BE; get_pk_bytes is the stored OPK and
         // get_pk recovers the value. extend_pk(widen_pk_be(bytes)) == bytes.
-        let schema = single_col_pk_schema(type_code::U64);
+        let schema = crate::test_support::pk_i64_schema(type_code::U64);
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(1);
         b.extend_pk(42);
@@ -2219,7 +2214,7 @@ mod tests {
             (type_code::U32, u32::MAX as u128),
         ];
         for &(tc, pk) in cases {
-            let schema = single_col_pk_schema(tc);
+            let schema = crate::test_support::pk_i64_schema(tc);
             let mut b = Batch::empty_with_schema(&schema);
             b.reserve_rows(1);
             b.extend_pk(pk);
@@ -2246,7 +2241,7 @@ mod tests {
         // U8/U16/U32 = strides 1/2/4 (the buggy non-8-aligned cases at 3 rows);
         // U64 = stride 8 (always aligned) as a control.
         for tc in [type_code::U8, type_code::U16, type_code::U32, type_code::U64] {
-            let schema = single_col_pk_schema(tc);
+            let schema = crate::test_support::pk_i64_schema(tc);
             let stride = schema.pk_stride() as usize;
 
             let mut src = Batch::empty_with_schema(&schema);
@@ -2286,7 +2281,7 @@ mod tests {
 
     #[test]
     fn extend_pk_roundtrip_across_u64_boundary() {
-        let schema = single_col_pk_schema(type_code::U128);
+        let schema = crate::test_support::pk_i64_schema(type_code::U128);
         let mut b = Batch::with_capacity(schema, 8);
         let keys: [u128; 5] = [0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
         for &pk in &keys {
@@ -2305,7 +2300,7 @@ mod tests {
 
     #[test]
     fn set_pk_at_overwrites_existing_row() {
-        let schema = single_col_pk_schema(type_code::U128);
+        let schema = crate::test_support::pk_i64_schema(type_code::U128);
         let mut b = Batch::with_capacity(schema, 4);
         for pk in [10u128, 20, 30, 40] {
             b.extend_pk(pk);
@@ -2431,7 +2426,7 @@ mod tests {
 
     #[test]
     fn pk_stride_u128_roundtrip() {
-        let schema = single_col_pk_schema(type_code::U128);
+        let schema = crate::test_support::pk_i64_schema(type_code::U128);
         let pks: &[u128] = &[0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(pks.len());
@@ -2485,7 +2480,7 @@ mod tests {
 
     #[test]
     fn extend_pk_bytes_then_get_pk_bytes_roundtrip_u128() {
-        let schema = single_col_pk_schema(type_code::U128);
+        let schema = crate::test_support::pk_i64_schema(type_code::U128);
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(3);
         let pks: [[u8; 16]; 3] = [
@@ -2510,7 +2505,7 @@ mod tests {
 
     #[test]
     fn set_pk_at_bytes_overwrites_existing_row() {
-        let schema = single_col_pk_schema(type_code::U128);
+        let schema = crate::test_support::pk_i64_schema(type_code::U128);
         let mut b = Batch::with_capacity(schema, 4);
         for pk in [10u128, 20, 30] {
             b.extend_pk(pk);
@@ -2757,7 +2752,7 @@ mod tests {
     // `set_layout_unchecked`. This hands a *lying* tag to a consumer skip-point so
     // the debug verifier can be caught tripping.
     fn flagged_batch(rows: &[(u128, i64, i64)], sorted: bool, consolidated: bool) -> (Batch, SchemaDescriptor) {
-        let schema = single_col_pk_schema(type_code::U64);
+        let schema = crate::test_support::pk_i64_schema(type_code::U64);
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(rows.len());
         for &(pk, w, v) in rows {
@@ -2842,7 +2837,7 @@ mod tests {
     // resets to `Raw`.
     #[test]
     fn layout_lifecycle_default_raise_and_lower() {
-        let schema = single_col_pk_schema(type_code::U64);
+        let schema = crate::test_support::pk_i64_schema(type_code::U64);
         let mut b = Batch::with_capacity(schema, 4);
         assert_eq!(b.layout(), Layout::Raw, "constructor defaults Raw");
         append_test_row(&mut b, 1, 1, 10, 0);
@@ -2868,7 +2863,7 @@ mod tests {
     // `Raw` needs no per-reader audit.
     #[test]
     fn empty_batch_reads_sorted_and_consolidated() {
-        let schema = single_col_pk_schema(type_code::U64);
+        let schema = crate::test_support::pk_i64_schema(type_code::U64);
         let b = Batch::with_capacity(schema, 4);
         assert_eq!(b.count, 0);
         assert_eq!(b.layout(), Layout::Raw);
@@ -2876,8 +2871,7 @@ mod tests {
         assert!(b.is_consolidated(), "empty batch is structurally consolidated");
     }
 
-    // ── Tests relocated from the former memtable module: these exercise
-    // `Batch` and the batch pool, not any LSM tier. ──────────────────────
+    // ── `Batch` and batch-pool behaviour (no LSM tier involved) ──────────
 
     fn make_schema_cols(cols: &[(u8, u8)], pk_index: u32) -> SchemaDescriptor {
         let mut columns = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
@@ -2957,9 +2951,9 @@ mod tests {
         // 2 columns: PK (U64) + payload (I64) — regions pk(0), weight(1),
         // null(2), col0(3), blob(4).
         assert_eq!(batch.num_regions_total(), 5);
-        assert_eq!(batch.region_size(0), 8);
-        assert_eq!(batch.region_size(3), 8);
-        assert!(!batch.region_slice(0).is_empty());
+        assert_eq!(batch.region_slice(0).len(), 8);
+        assert_eq!(batch.region_slice(3).len(), 8);
+        assert!(batch.region_slice(4).is_empty(), "no strings ⇒ empty heap");
     }
 
     #[test]

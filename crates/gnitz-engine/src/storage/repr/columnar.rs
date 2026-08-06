@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 
+use super::merge::ColPtr;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
 use gnitz_wire::{compare_german_strings, null_word_get, read_unsigned_exact};
@@ -25,13 +26,18 @@ use gnitz_wire::{compare_german_strings, null_word_get, read_unsigned_exact};
 pub(crate) trait ColumnarSource: RowSource {
     /// The row's signed Z-set weight / multiplicity (region[1]).
     fn get_weight(&self, row: usize) -> i64;
+
+    /// Rows in this source — the N-way merge's per-source walk bound. Every
+    /// implementor already exposes it, so the merge reads it here rather than
+    /// taking a parallel `counts` slice each caller has to keep in step.
+    fn row_count(&self) -> usize;
 }
 
 // ---------------------------------------------------------------------------
 // Generic compare_rows
 // ---------------------------------------------------------------------------
 
-/// Compare two rows from any ColumnarSource implementations by payload columns.
+/// Compare two rows from any [`RowSource`] implementations by payload columns.
 ///
 /// This is the canonical implementation with the hoisted null_word optimisation:
 /// null words are read once per row outside the column loop.
@@ -267,6 +273,36 @@ pub(crate) fn gallop_opk<'a>(
 }
 
 // ---------------------------------------------------------------------------
+// Region-addressed seek entry points
+//
+// Every sorted PK-region holder — an owned `Batch`, a `MappedShard`, and the
+// `Run` that is either — seeks through the same `(count, stride, ColPtr)` triple.
+// These two wrappers own the row-addressing `unsafe`, so it is written once here
+// rather than repeated at each holder's method.
+// ---------------------------------------------------------------------------
+
+/// First row of `pk` whose OPK bytes are `>= key`. `key` must be exactly
+/// `stride` OPK bytes; memcmp order is typed order at every width.
+///
+/// # Safety
+/// `pk` must address at least `count` rows of `stride` bytes.
+#[inline]
+pub(crate) unsafe fn seek_lower_bound(count: usize, stride: usize, pk: ColPtr, key: &[u8]) -> usize {
+    lower_bound_opk(count, key, stride, |i| pk.row(i, stride))
+}
+
+/// [`seek_lower_bound`] seeded at `hint` (the caller's live position):
+/// `O(log gap)` when the boundary is just ahead, `O(1)` when it IS the hint,
+/// never worse than the from-scratch search.
+///
+/// # Safety
+/// As [`seek_lower_bound`].
+#[inline]
+pub(crate) unsafe fn seek_advance_to(count: usize, stride: usize, pk: ColPtr, key: &[u8], hint: usize) -> usize {
+    gallop_opk(count, key, hint, stride, |i| pk.row(i, stride))
+}
+
+// ---------------------------------------------------------------------------
 // Fast path: fixed-width integer, non-nullable schemas (any signedness)
 // ---------------------------------------------------------------------------
 
@@ -388,6 +424,9 @@ mod tests {
         fn get_weight(&self, _row: usize) -> i64 {
             1
         }
+        fn row_count(&self) -> usize {
+            self.null_bmp.len() / 8
+        }
     }
 
     /// Build a 3-column schema: [PK:U64, nullable I64, F64].
@@ -423,7 +462,7 @@ mod tests {
         }
     }
 
-    /// Ports test_comparator: null < non-null ordering.
+    /// Null sorts below non-null.
     #[test]
     fn test_compare_rows_null_lt_non_null() {
         let schema = make_schema_nullable_float();
@@ -439,7 +478,7 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 1, &batch, 0), Ordering::Greater);
     }
 
-    /// Ports test_comparator: null == null (both null → skip to next col).
+    /// Two nulls compare equal, so the next column decides.
     #[test]
     fn test_compare_rows_null_eq_null() {
         let schema = make_schema_nullable_float();
@@ -452,7 +491,7 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
     }
 
-    /// Ports test_comparator: float comparison (5.0 > -5.0).
+    /// Float ordering: 5.0 > -5.0.
     #[test]
     fn test_compare_rows_float() {
         let schema = make_schema_nullable_float();
@@ -463,7 +502,7 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Greater);
     }
 
-    /// Ports test_comparator: equality.
+    /// A row compares equal to itself.
     #[test]
     fn test_compare_rows_equality() {
         let schema = make_schema_nullable_float();
@@ -551,9 +590,9 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 2, &batch, 0), Ordering::Greater);
     }
 
-    // Item 10: distinct UUID payloads must not collapse to Equal. The wildcard
-    // arm's read_signed returns 0 for col_size=16, making all UUIDs compare
-    // Equal and silently dropping rows in consolidation/compaction.
+    // Distinct UUID payloads must not collapse to Equal: a 16-byte read that
+    // returned 0 would make every UUID compare Equal and silently drop rows in
+    // consolidation/compaction.
     #[test]
     fn test_compare_rows_uuid_distinct() {
         let schema = SchemaDescriptor::new(
@@ -580,9 +619,8 @@ mod tests {
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
     }
 
-    // Item 38: unsigned payloads with the high bit set (u64::MAX) must not be
-    // read as negative by the wildcard read_signed arm, which would reverse
-    // sort order. 0 < u64::MAX must hold for U64/U32/U16/U8.
+    // Unsigned payloads with the high bit set must not be read as negative,
+    // which would reverse sort order: 0 < MAX must hold for U64/U32/U16/U8.
     #[test]
     fn test_compare_rows_unsigned_high_bit() {
         for (tc, size) in [
@@ -697,8 +735,8 @@ mod tests {
         );
 
         // Multi-column schemas. (I32, I64) is all-signed (primary diff col 0,
-        // tie-break col 1); (I32, U32) and (U64, I64) mix signedness — the case
-        // the old whole-schema split missed (it fell back to the generic path).
+        // tie-break col 1); (I32, U32) and (U64, I64) mix signedness, which the
+        // per-column sign flip must handle without falling back.
         for (c0, c1) in [
             (type_code::I32, type_code::I64),
             (type_code::I32, type_code::U32),
@@ -763,7 +801,7 @@ mod tests {
             (type_code::U32, 0),
             (type_code::U64, 0),
         ])));
-        // Mixed signed/unsigned, non-nullable → true (the old split missed this)
+        // Mixed signed/unsigned, non-nullable → true
         assert!(schema_is_fixedint_nonnull(&make_schema(&[
             (type_code::I64, 0),
             (type_code::U32, 0),

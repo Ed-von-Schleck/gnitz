@@ -6,7 +6,7 @@ use std::ptr;
 use super::super::batch::{
     acquire_arena, Fill, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
 };
-use super::super::merge::{relocate_german_string_vec, BlobCacheGuard, ColPtr, UnifiedSource};
+use super::super::merge::{prorated_blob_cap, relocate_german_string_vec, BlobCacheGuard, ColPtr, UnifiedSource};
 use super::super::xor8;
 use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion};
 use crate::schema::key::PkBuf;
@@ -172,18 +172,17 @@ impl MappedShard {
     pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         let stride = self.pk_stride as usize;
         let cp = self.pk_col_ptr();
-        super::super::columnar::lower_bound_opk(self.count, key, stride, |i| unsafe { cp.row(i, stride) })
+        unsafe { super::super::columnar::seek_lower_bound(self.count, stride, cp, key) }
     }
 
     /// Galloping forward lower bound seeded at `hint` (the caller's live
     /// position): `O(log gap)` when the boundary is just ahead, `O(1)` when it
-    /// IS the hint, never worse than `find_lower_bound_bytes`. Byte-identical
-    /// body to `Batch::advance_to` — same `count`/`pk_col_ptr` seek contract.
-    /// `key` must be exactly `pk_stride` OPK bytes.
+    /// IS the hint, never worse than `find_lower_bound_bytes`. `key` must be
+    /// exactly `pk_stride` OPK bytes.
     pub fn advance_to(&self, key: &[u8], hint: usize) -> usize {
         let stride = self.pk_stride as usize;
         let cp = self.pk_col_ptr();
-        super::super::columnar::gallop_opk(self.count, key, hint, stride, |i| unsafe { cp.row(i, stride) })
+        unsafe { super::super::columnar::seek_advance_to(self.count, stride, cp, key, hint) }
     }
 
     /// Test-only u128 oracle (exact-match point lookup) cross-checking the
@@ -323,15 +322,9 @@ impl MappedShard {
         // touching a cell.
         let blob = if relocate {
             debug_assert!(start + row_count <= self.count, "slice out of range");
-            // The slice's share of the heap — an estimate, so `div_ceil` rather than
-            // a truncating quotient that would reserve nothing for a shard holding
-            // fewer heap bytes than rows.
-            let mut out = acquire_arena(self.blob_len.div_ceil(self.count) * row_count, Fill::Reserve);
-            // Cap the dedup-map hint: a hint above `BLOB_CACHE_RECYCLE_CAP`'s
-            // capacity would make the map too large to return to the pool, so a
-            // chunked drain would malloc and free one per chunk. Entry count is
-            // bounded by *distinct* spans, which is below `row_count` anyway.
-            let mut guard = BlobCacheGuard::acquire(schema, row_count.min(4096));
+            let cap = prorated_blob_cap(self.blob_len, self.count, row_count);
+            let mut out = acquire_arena(cap, Fill::Reserve);
+            let mut guard = BlobCacheGuard::acquire(schema, row_count);
             let src_blob = self.blob_slice();
             for (pi, col) in schema.payload_columns() {
                 if !gnitz_wire::is_german_string(col.type_code) {
@@ -434,5 +427,9 @@ impl super::super::columnar::ColumnarSource for MappedShard {
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         MappedShard::get_weight(self, row)
+    }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.count
     }
 }
