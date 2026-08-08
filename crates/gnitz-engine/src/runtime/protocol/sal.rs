@@ -21,6 +21,16 @@ use gnitz_wire::align8;
 
 pub const MAX_WORKERS: usize = 64;
 
+/// Leading marker of every out-of-space refusal from `SalWriter::begin`, and
+/// the whole contract a caller may match on. The condition is transient by
+/// construction: an ordinary group must leave the sentinel headroom and the
+/// checkpoint band untouched (`effective_capacity`), so it is refused while the
+/// log is near full, and the watchdog's reclaim — a fire-and-forget barrier once
+/// less than 1/8 of the mapping is free — frees the whole mapping within one
+/// 100 ms tick. A refused read or push is therefore retryable, unlike every
+/// other server error.
+pub const SAL_FULL: &str = "SAL full";
+
 /// Group header: 24 fixed (lsn u64, flags u32, target_id u32, slot count u32,
 /// pad u32) followed by one u32 offset and one u32 size per slot. Always a
 /// multiple of 8. The group's size and epoch live in the atomically-published
@@ -773,6 +783,13 @@ impl SalWriter {
     /// Reserve a group for `worker_sizes.len()` workers at the write cursor and
     /// write its header + directory. `what` names the caller in the
     /// out-of-space error. The group must be handed to `finish`.
+    ///
+    /// The only way this fails is that the group does not fit the space an
+    /// ordinary group may occupy (`effective_capacity`), so the message says
+    /// exactly that and carries [`SAL_FULL`] — the stable marker a caller may
+    /// match to tell this transient, reclaim-clears-it refusal from a real
+    /// failure. It reaches clients verbatim, so the write cursor stays out of it
+    /// and goes to the operator log instead.
     fn begin(
         &self,
         what: &str,
@@ -793,7 +810,16 @@ impl SalWriter {
                 worker_sizes,
             )
         }
-        .ok_or_else(|| format!("SAL {what} failed (cursor={})", self.write_cursor.get()))
+        .ok_or_else(|| {
+            crate::gnitz_debug!(
+                "SAL {} refused: cursor={} mmap={} epoch={}",
+                what,
+                self.write_cursor.get(),
+                self.mmap_size,
+                self.epoch.get()
+            );
+            format!("{SAL_FULL}: {what} did not fit")
+        })
     }
 
     /// Publish `group` and advance the write cursor past it.
@@ -1309,5 +1335,21 @@ impl SalReader {
 
     pub fn wait(&self, timeout_ms: i32) -> i32 {
         posix_io::eventfd_wait(self.m2w_efd, timeout_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `SAL_FULL` reaches clients as text, and the E2E reader loop in
+    /// `crates/gnitz-py/tests/test_sal_read_reclaim.py` matches that text to tell
+    /// a transient refusal (retry) from a real failure (fail the test). Nothing
+    /// links the two literals, so editing this one silently turns those tests
+    /// back into the coin flip they were: the reader would treat every refusal as
+    /// fatal. Change both together.
+    #[test]
+    fn sal_full_marker_is_the_literal_the_e2e_readers_match() {
+        assert_eq!(SAL_FULL, "SAL full");
     }
 }

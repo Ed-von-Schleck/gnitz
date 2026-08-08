@@ -47,13 +47,51 @@ def _live_rows(client, tid):
     return {row[0]: row[2] for row in client.scan(tid)}
 
 
+# The server's marker for an out-of-space SAL refusal (`SAL_FULL`, engine-side).
+# An ordinary group must leave the sentinel headroom and the checkpoint band
+# alone, so once the readers below have driven the cursor past the watchdog's
+# line a scan can be refused until the next reclaim — by design, and the whole
+# point of the reserve. A real client retries; so does this loop.
+SAL_FULL = "SAL full"
+
+# How long a reader tolerates an UNBROKEN run of `SAL full` before calling it a
+# wedge. The reclaim that clears it is at most one 100 ms watchdog tick away —
+# two if a DDL window is open, since the watchdog and the committer both refuse
+# to reclaim inside one. Anything past this is the failure these tests exist to
+# catch: with the watchdog removed the read loops never recover, and this is what
+# still makes them say so rather than spin silently until the test's own timeout.
+SAL_FULL_GRACE_S = 5.0
+
+
 def _read_loop(target, tid, expected, errors, keep_going):
     """Scan `tid` on its own connection while `keep_going()`, recording the first
-    mismatch or connection failure in `errors`."""
+    mismatch or connection failure in `errors`. A transient `SAL full` refusal is
+    retried rather than recorded; one that never clears is recorded."""
     try:
         with gnitz.connect(target) as c:
             while keep_going():
-                got = _live_rows(c, tid)
+                # Retries do NOT consume `keep_going`: a counted loop's budget is
+                # a number of scans, not of attempts. That also leaves the grace
+                # below as the one thing that ends a wedged reader, instead of it
+                # racing a budget that could expire first and exit looking clean.
+                # Deliberately no backoff: a refused scan writes nothing, and the
+                # pressure these readers keep on the cursor is what holds it on
+                # the margin the reclaim path is being tested at. Sleeping here
+                # would make the tests pass by not reaching that margin.
+                refused_since = None
+                while True:
+                    try:
+                        got = _live_rows(c, tid)
+                        break
+                    except Exception as e:
+                        if SAL_FULL not in str(e):
+                            raise
+                        now = time.monotonic()
+                        if refused_since is None:
+                            refused_since = now
+                        elif now - refused_since > SAL_FULL_GRACE_S:
+                            errors.append(f"SAL never reclaimed: {e!r}")
+                            return
                 if got != expected:
                     errors.append(f"wrong rows: {got}")
                     return
