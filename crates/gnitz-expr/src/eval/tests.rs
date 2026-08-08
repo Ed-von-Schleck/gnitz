@@ -780,9 +780,12 @@ fn filter_kernel_bench() {
     // `-a > 0 AND b < 80` over nullable columns — unary, the 3VL AND, and the
     // per-column null-bit gather.
     let nn_schema = schema_pk_ints(2, true);
-    let nn_view = make_n_col_view(&nn_schema, n, |row, col| ((row * 7 + col) % 100) as i64, |row, _| {
-        row % 32 == 0
-    });
+    let nn_view = make_n_col_view(
+        &nn_schema,
+        n,
+        |row, col| ((row * 7 + col) % 100) as i64,
+        |row, _| row % 32 == 0,
+    );
     let nn_filter = filter_prog(
         &nn_schema,
         vec![
@@ -819,5 +822,8 @@ fn filter_kernel_bench() {
         pk_filter.filter(&pk_view, n, |s, e| hits += e - s);
         nn_filter.filter(&nn_view, n, |s, e| hits += e - s);
     }
-    println!("filter_kernel_bench passes={passes} n={n} hits={}", std::hint::black_box(hits));
+    println!(
+        "filter_kernel_bench passes={passes} n={n} hits={}",
+        std::hint::black_box(hits)
+    );
 }
