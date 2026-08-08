@@ -519,6 +519,54 @@ fn test_fk_u128() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── test_fk_auto_index_skips_non_leading_pk_column ───────────────────
+// The auto-index skip reads the owner's FULL PK column list: on a compound PK an
+// FK sitting at a non-leading PK position is already stored in the PK region and
+// must mint no `__fk_` index, while an FK on a non-PK column of the same table
+// must still get one. A skip that consulted only the first PK column would mint
+// a redundant, undroppable index (`precheck_index_family` refuses to drop an
+// internal FK index).
+
+#[test]
+fn test_fk_auto_index_skips_non_leading_pk_column() {
+    let dir = temp_dir("fk_compound_pk_skip");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_tid = engine
+        .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
+        .unwrap();
+    let fk_col = |name: &str| ColumnDef {
+        name: name.into(),
+        type_code: type_code::U64,
+        is_nullable: false,
+        fk_table_id: parent_tid,
+        fk_col_idx: 0,
+        is_hidden: false,
+    };
+
+    // PK = (a, pid_fk): the FK is PK column 1, not 0. `plain_fk` is not a PK column.
+    let child_cols = vec![col_def("a", type_code::U64), fk_col("pid_fk"), fk_col("plain_fk")];
+    engine.create_table("public.child", &child_cols, &[0, 1]).unwrap();
+
+    assert!(
+        !engine
+            .caches
+            .index_by_name
+            .contains_key(&make_fk_index_name("public", "child", "pid_fk")),
+        "an FK at a non-leading PK position is covered by the PK region — no auto-index",
+    );
+    assert!(
+        engine
+            .caches
+            .index_by_name
+            .contains_key(&make_fk_index_name("public", "child", "plain_fk")),
+        "an FK on a non-PK column must still get its auto-index",
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── test_fk_inline_child_pk_column_is_fk ─────────────────────────────
 // A child whose LONE PK column is itself the FK into the parent (a junction
 // table keyed by its FK). The FK value lives in the PK region — there is no

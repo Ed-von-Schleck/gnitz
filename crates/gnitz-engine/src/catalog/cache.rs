@@ -35,7 +35,6 @@ pub(crate) struct CatalogCacheSet {
     /// reads only the count — the non-empty-schema DROP guard — and the two
     /// kinds are told apart through `dag.tables[id].kind` where it matters.
     pub(crate) members_by_schema: FxHashMap<i64, FxHashSet<i64>>,
-    pub(crate) pk_col_of: FxHashMap<i64, PkColList>,
     /// Full decoded column definitions per table (`fill_column_caches`). The
     /// one COL_TAB read every name / hidden-flag consumer goes through.
     pub(crate) col_defs: FxHashMap<i64, Rc<Vec<ColumnDef>>>,
@@ -219,39 +218,6 @@ impl CatalogEngine {
                 if e.get().is_empty() {
                     e.remove();
                 }
-            }
-        }
-        Ok(())
-    }
-
-    /// Maintain `pk_col_of` from a TABLE_TAB or VIEW_TAB delta, reading each
-    /// family's own packed-PK payload column.
-    pub(crate) fn apply_pk_col_of(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
-        let pk_pay_idx = match family {
-            SysFamily::View => VIEWTAB_PAY_PK_COL_IDX,
-            _ => TABTAB_PAY_PK_COL_IDX,
-        };
-        for i in 0..batch.count {
-            let weight = batch.get_weight(i);
-            let tid = batch.get_pk(i) as i64;
-
-            if weight > 0 {
-                // Malformed wire values (count 0 or 5..=15) are NOT defended
-                // here: hook_table_register / hook_view_register fires
-                // immediately after this applier in the same call, retracts the
-                // row via the matching -1 weight, and removes the entry before
-                // any other code can observe it. `PkColList::as_slice` is
-                // panic-free regardless. A view's PK is its persisted leading-k
-                // list (0..k for a compound-source projection, bare 0 otherwise).
-                let pk_list = unpack_pk_cols(batch.read_payload_u64(i, pk_pay_idx));
-                // Invalidate only on a real change: retract-reinsert with an
-                // identical PK list would otherwise spuriously bump the version.
-                let old = self.caches.pk_col_of.insert(tid, pk_list);
-                if old != Some(pk_list) {
-                    self.caches.invalidate_col_names(tid);
-                }
-            } else {
-                self.caches.pk_col_of.remove(&tid);
             }
         }
         Ok(())

@@ -556,13 +556,15 @@ impl CatalogEngine {
     // -- FK auto-index creation -------------------------------------------
 
     pub(crate) fn create_fk_indices(&mut self, table_id: i64) -> Result<(), String> {
+        // An unregistered owner has no columns to auto-index; checked before the
+        // COL_TAB read so the miss costs nothing. The registered schema is where
+        // the PK list lives: `register_relation` builds it from the same
+        // `TABLE_TAB.pk_col_idx` the row persisted.
+        let Some(owner_schema) = self.dag.tables.get(&table_id).map(|e| e.schema) else {
+            return Ok(());
+        };
+        let pk_cols = owner_schema.pk_indices();
         let col_defs = self.read_column_defs(table_id);
-        let pk_list = self
-            .caches
-            .pk_col_of
-            .get(&table_id)
-            .copied()
-            .unwrap_or_else(|| PkColList::single(0));
 
         let (schema_name, table_name) = self.caches.entity_by_id.get(&table_id).cloned().unwrap_or_default();
 
@@ -572,7 +574,7 @@ impl CatalogEngine {
             }
             // Skip every PK column: the PK region already stores them, so an
             // FK whose column is part of the PK needs no separate auto-index.
-            if pk_list.as_slice().contains(&(col_idx as u32)) {
+            if pk_cols.contains(&(col_idx as u32)) {
                 continue;
             }
             let index_name = make_fk_index_name(&schema_name, &table_name, &cd.name);

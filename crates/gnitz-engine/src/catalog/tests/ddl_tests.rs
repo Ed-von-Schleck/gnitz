@@ -476,94 +476,38 @@ fn test_hook_table_register_rejects_malformed_pk() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_pk_change_invalidates_col_name_cache ────────────────────────
+// ── test_pk_list_round_trips_into_registered_schema ──────────────────
 
-// `apply_pk_col_of` fires before `hook_table_register` and invalidates
-// the column-name cache only when a table's PK column assignment
-// changes. An identical retract/reinsert (same PK column) must NOT
-// invalidate. Also pins PK-list reconstruction through `create_table`.
+// `TABLE_TAB.pk_col_idx` is reconstructed element-for-element into the
+// registered schema's PK list, for a single-column and for compound PKs.
+// That descriptor is the one source of a table's PK columns — `create_fk_indices`
+// reads it to skip auto-indexing a PK column — so a truncated or reordered
+// reconstruction would silently mint a redundant FK index.
 #[test]
-fn test_pk_change_invalidates_col_name_cache() {
-    let dir = temp_dir("pk_cache_inval");
+fn test_pk_list_round_trips_into_registered_schema() {
+    let dir = temp_dir("pk_list_roundtrip");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![col_def("a", type_code::U64), col_def("b", type_code::U64)];
+
+    // Single-column PK, and a recreate under a different PK column: the
+    // reconstructed schema reflects the new list, not the old one.
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-
-    // Populate the col-name cache.
-    let _ = engine.read_column_defs(tid);
-    assert!(engine.caches.col_defs.contains_key(&tid));
-
-    // Drive `apply_pk_col_of` directly (like `test_apply_pk_col_of_round_trips_..`):
-    // a bare `+1` re-ingest of an already-live TABLE_TAB row is a duplicate live
-    // head the §3.3 retraction contract now rejects at `precheck_family`, so this
-    // pins the applier's change-detection in isolation rather than the full write
-    // path. Invalidation is observed through the schema version.
-    let ingest_pk = |engine: &mut CatalogEngine, raw_pk_cols: u64| {
-        let batch = build_table_tab_row(&dir, tid, raw_pk_cols, "t");
-        engine.apply_pk_col_of(SysFamily::Table, &batch).unwrap();
-    };
-
-    let v0 = engine.caches.get_schema_version(tid);
-
-    // Identical retract/reinsert (same PK column 0): no invalidation.
-    ingest_pk(&mut engine, pack_pk_cols(&[0]));
-    assert_eq!(
-        engine.caches.get_schema_version(tid),
-        v0,
-        "identical PK reinsert must not bump the schema version",
-    );
-
-    // PK column changes 0 → 1: invalidation.
-    ingest_pk(&mut engine, pack_pk_cols(&[1]));
-    assert_ne!(
-        engine.caches.get_schema_version(tid),
-        v0,
-        "PK column change must invalidate (bump the schema version)",
-    );
-
-    // Drop and recreate with a different PK column; the reconstructed
-    // schema must reflect the new PK list.
+    assert_eq!(engine.get_schema_desc(tid).unwrap().pk_indices(), &[0]);
     engine.drop_table("public.t").unwrap();
     let tid2 = engine.create_table("public.t", &cols, &[1]).unwrap();
-    let schema = engine.get_schema_desc(tid2).unwrap();
-    assert_eq!(schema.pk_indices(), &[1]);
+    assert_eq!(engine.get_schema_desc(tid2).unwrap().pk_indices(), &[1]);
 
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── test_apply_pk_col_of_round_trips_compound_list ──────────────────
-
-// `apply_pk_col_of` must store the full PK column list in the cache,
-// not just the first element.
-#[test]
-fn test_apply_pk_col_of_round_trips_compound_list() {
-    let dir = temp_dir("pk_col_of_roundtrip");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-
-    // Single-column PK: cache entry equals PkColList::single(idx).
-    let single_tid: i64 = 9001;
-    let batch_single = build_table_tab_row(&dir, single_tid, pack_pk_cols(&[2]), "t");
-    engine.apply_pk_col_of(SysFamily::Table, &batch_single).unwrap();
-    assert_eq!(
-        engine.caches.pk_col_of.get(&single_tid).copied(),
-        Some(PkColList::single(2)),
-    );
-
-    // Compound PK lists 2..=4 round-trip element-for-element.
-    for (tid_offset, pk_cols) in [(0i64, vec![0u32, 1]), (1, vec![0u32, 3, 5]), (2, vec![1u32, 2, 7, 11])] {
-        let tid: i64 = 9100 + tid_offset;
-        let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&pk_cols), "t");
-        engine.apply_pk_col_of(SysFamily::Table, &batch).unwrap();
-        let stored = engine
-            .caches
-            .pk_col_of
-            .get(&tid)
-            .copied()
-            .expect("pk_col_of entry must exist after apply");
+    // Compound PK lists round-trip in full.
+    let wide: Vec<_> = (0..8).map(|i| col_def(&format!("c{i}"), type_code::U64)).collect();
+    for (n, pk_cols) in [vec![0u32, 1], vec![0u32, 3, 5], vec![1u32, 2, 7]]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("public.w{n}");
+        let tid = engine.create_table(&name, &wide, &pk_cols).unwrap();
         assert_eq!(
-            stored.as_slice(),
+            engine.get_schema_desc(tid).unwrap().pk_indices(),
             pk_cols.as_slice(),
             "compound PK list must round-trip in full (input={pk_cols:?})"
         );

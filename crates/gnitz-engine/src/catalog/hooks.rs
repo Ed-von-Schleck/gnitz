@@ -77,7 +77,6 @@ impl CatalogEngine {
             SysFamily::Table => {
                 self.apply_entity_caches(batch)?;
                 self.apply_schema_members(batch)?;
-                self.apply_pk_col_of(SysFamily::Table, batch)?;
                 self.hook_table_register(batch)?;
                 self.apply_needs_lock(SysFamily::Table, batch)?;
                 self.hook_cascade_fk(batch)?;
@@ -85,7 +84,6 @@ impl CatalogEngine {
             SysFamily::View => {
                 self.apply_entity_caches(batch)?;
                 self.apply_schema_members(batch)?;
-                self.apply_pk_col_of(SysFamily::View, batch)?;
                 self.hook_view_register(batch)?;
             }
             SysFamily::Column => {

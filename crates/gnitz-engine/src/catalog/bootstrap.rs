@@ -223,7 +223,6 @@ impl CatalogEngine {
             self.caches
                 .entity_by_id
                 .insert(info.id, ("_system".into(), info.name.into()));
-            self.caches.pk_col_of.insert(info.id, PkColList::single(0));
             self.dag.register_table(
                 info.id,
                 StoreHandle::Borrowed(&mut **store),
