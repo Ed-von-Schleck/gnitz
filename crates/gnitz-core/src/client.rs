@@ -261,6 +261,26 @@ pub struct GnitzClient {
     last_seen_lsn: u64,
 }
 
+// The client-facing types must stay `Send`, so nothing reachable from them may
+// hold an `Rc`. The requirement comes from the Python binding: every blocking
+// call runs inside `Python::detach`, whose `Ungil` bound resolves to `Send` on
+// both the closure (capturing `&mut GnitzClient`) and its return value — and the
+// async transport moves a bare `Session` into its I/O thread. An `Rc` anywhere in
+// that reachable set breaks the build in `gnitz-py`, a crate away, with an error
+// naming a pyo3 trait rather than the field. Asserted here so the failure lands
+// on the line that caused it.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send::<GnitzClient>();
+    assert_send::<Session>();
+    assert_send::<ZSetBatch>();
+    assert_send::<ClientError>();
+    // Handed back as `Arc<Schema>` by the scan path, and `Arc<T>: Send` requires
+    // `T: Send + Sync`, so this one is the stricter bound.
+    assert_send_sync::<Schema>();
+};
+
 impl GnitzClient {
     pub fn connect(socket_path: &str) -> Result<Self, ClientError> {
         // Seed the OCC basis from the HELLO ACK watermark. A restart yields a
@@ -596,15 +616,13 @@ impl GnitzClient {
             validate_index_col_type(ct)?;
         }
 
-        // Reject a duplicate name before allocating an index_id: a duplicate would
-        // create an undroppable orphan in IDX_TAB (`drop_index_by_name` returns
-        // after the first match, leaving the second row with a catalog entry but no
-        // circuit). Mirrors the engine DDL path's `index_by_name` check, which the
-        // client push otherwise bypasses.
-        if self.index_name_cols()?.iter().any(|(name, _)| *name == index_name) {
-            return Err(ClientError::ServerError(format!("index '{index_name}' already exists")));
-        }
-
+        // No client-side duplicate-name probe: the engine rejects one
+        // authoritatively. `handle_ddl_txn` prechecks every bundle family before
+        // applying any of it, and the IDX_TAB arm fails the whole bundle on a name
+        // already in `index_by_name`, so a second row under one name is never
+        // written and the "undroppable orphan" a client probe would guard against
+        // is unreachable. A rejected bundle burns this index_id; ids are monotonic
+        // and never reused, so that costs nothing.
         let index_id = self.alloc_index_id()?;
 
         let idx_schema = idx_tab_schema();
