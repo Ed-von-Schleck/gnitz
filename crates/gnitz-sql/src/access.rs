@@ -644,8 +644,12 @@ fn collect_index_range_candidates<'e>(
 }
 
 /// Memoizes one `table_indexes` list across the range → equality collector
-/// fall-through: `table_indexes` ALWAYS hits the wire, so within one statement the
-/// second collector reuses the first's list rather than fetch it twice.
+/// fall-through, so one bound extraction fetches at most once regardless of how
+/// the caller's `fetch` is backed. It does not assume `table_indexes` hits the
+/// wire — inside a statement snapshot that call is already served from the
+/// client's epoch-validated cache — the point is that this function's own
+/// "called at most once" contract holds locally, without depending on a caching
+/// detail of a lower layer.
 #[derive(Default)]
 struct IndexListMemo(Option<Arc<Vec<IndexMeta>>>);
 
