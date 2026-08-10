@@ -426,10 +426,9 @@ impl BExpr<usize> {
 /// `None` when there are none. Every predicate the client compiles — the view
 /// filter, the wire ReadSpec residual, the DML residual — is built here.
 ///
-/// Left-association is not cosmetic. The VM's AND-chain dead-tail skip requires
-/// the terminal instruction to be a `BoolAnd` writing the result register and
-/// then walks the accumulator spine, which `((a∧b)∧c)∧d` is exactly; a
-/// right-associated tree loses the skip.
+/// Left-association is `reduce`'s own shape, not a downstream requirement:
+/// nothing that consumes the folded predicate inspects its association — this
+/// crate's own conjunct flatteners recurse into both sides.
 pub(crate) fn and_fold(preds: impl IntoIterator<Item = BoundExpr>) -> Option<BoundExpr> {
     preds
         .into_iter()

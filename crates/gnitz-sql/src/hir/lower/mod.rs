@@ -459,9 +459,11 @@ pub(crate) fn lower_linear(
 
 /// Resolve `preds` against `layout`, AND-fold them, compile the program, and emit
 /// the filter — passing `node` through untouched when there is nothing to filter
-/// or the predicate folds to a constant true. The one home of that idiom, which
-/// every WHERE / HAVING / residual emit in the lowering shares (the HIR analogue
-/// of `predicates::and_fold_compile`).
+/// or the predicate folds to a constant true. Shared by the emits that fold and
+/// compile in one step: HAVING, the join and EXISTS residuals, and a set-op
+/// segment's WHERE. A primary-position WHERE does not come through here —
+/// `linear` and `reduce` fold it earlier, because the scan bound reads that same
+/// folded predicate, and compile it themselves.
 pub(crate) fn emit_filter<'a>(
     cb: &mut gnitz_core::CircuitBuilder,
     node: gnitz_core::NodeId,

@@ -225,80 +225,98 @@ fn golden_is_null_and_is_not_null_single_row() {
     assert!(passes(&kind, &mb, 0));
 }
 
-/// Differential test: 3-clause AND over nullable columns. For every morsel
-/// boundary in 1..=MORSEL+1, verify the filter agrees with a per-row 3VL
-/// reference computed from the column values.
+/// Differential test: the left-deep chain `col0 > k AND col1 > 1 AND col2 > 1`
+/// over nullable columns must agree with a per-row 3VL reference at every morsel
+/// boundary in 1..=MORSEL+1 — covering m < 64, m = 64 exactly, m crossing 64,
+/// the full MORSEL, and the multi-morsel case.
+///
+/// Two data arrangements, because a whole morsel failing the leading clause is
+/// the case a word-at-a-time kernel can treat differently from a scattered one:
+/// `mixed` spreads failures and NULLs through every word, while
+/// `clustered_leading` makes col0 monotonic and never null, so the leading
+/// clause is definite-FALSE — not NULL — for all of morsel 0 and the survivors
+/// all land in later morsels.
 #[test]
-fn bit_only_three_and_chain_boundary_sweep() {
+fn three_and_chain_boundary_sweep() {
     let schema = schema_pk_ints(3, true);
-
-    // (col0 > 1) AND (col1 > 1) AND (col2 > 1)
-    let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col0
-        LogicalInstr::LoadConst { dst: 1, val: 1 },  // r1 = 1
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            dst: 2,
-            a: 0,
-            b: 1,
-        }, // r2 = r0 > 1
-        LogicalInstr::LoadColInt { dst: 3, col: 2 }, // r3 = col1
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            dst: 4,
-            a: 3,
-            b: 1,
-        }, // r4 = r3 > 1
-        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 }, // r5 = r2 AND r4
-        LogicalInstr::LoadColInt { dst: 6, col: 3 }, // r6 = col2
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            dst: 7,
-            a: 6,
-            b: 1,
-        }, // r7 = r6 > 1
-        LogicalInstr::BoolAnd { dst: 8, a: 5, b: 7 }, // r8 = r5 AND r7  (result_reg)
-    ];
-
-    // Test sizes that cover: m < 64, m = 64 exactly, m crossing 64, the full
-    // MORSEL=256, and the multi-morsel case (MORSEL + 1).
-    for &n in &[1, 7, 63, 64, 65, 127, 128, 255, 256, 257, 300] {
-        let mb = make_n_col_view(
-            &schema,
-            n,
-            // value cycles 0..4 to mix matching/non-matching rows
-            |row, col| ((row + col) as i64) % 4,
-            // null every 5th row in col0, every 7th in col1, every 11th in col2
+    // (label, col0's threshold, value, null_at). col1/col2 always cycle 0..5 and
+    // are NULL every 7th/11th row; only the leading column's shape varies. The
+    // cycle is mod 5, not mod 4: with `> 1` on three columns whose values are
+    // three *consecutive* residues, mod 4 admits no passing row at all and the
+    // sweep degenerates into asserting that everything fails.
+    type Arrangement = (&'static str, i64, fn(usize, usize) -> i64, fn(usize, usize) -> bool);
+    let arrangements: [Arrangement; 2] = [
+        (
+            "mixed",
+            1,
+            |row, col| ((row + col) as i64) % 5,
             |row, col| match col {
                 0 => row % 5 == 0,
                 1 => row % 7 == 0,
                 _ => row % 11 == 0,
             },
-        );
+        ),
+        (
+            "clustered_leading",
+            255,
+            |row, col| if col == 0 { row as i64 } else { ((row + col) as i64) % 5 },
+            |row, col| match col {
+                0 => false,
+                1 => row % 7 == 0,
+                _ => row % 11 == 0,
+            },
+        ),
+    ];
 
-        let kind = filter_prog(&schema, instrs.clone(), 9, 8, vec![]);
+    for (label, k0, value, null_at) in arrangements {
+        let instrs = vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col0
+            LogicalInstr::LoadConst { dst: 1, val: k0 }, // r1 = k0
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            }, // r2 = col0 > k0
+            LogicalInstr::LoadColInt { dst: 3, col: 2 }, // r3 = col1
+            LogicalInstr::LoadConst { dst: 4, val: 1 },  // r4 = 1
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 5,
+                a: 3,
+                b: 4,
+            }, // r5 = col1 > 1
+            LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 }, // r6 = r2 AND r5
+            LogicalInstr::LoadColInt { dst: 7, col: 3 }, // r7 = col2
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 8,
+                a: 7,
+                b: 4,
+            }, // r8 = col2 > 1
+            LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 }, // r9 = r6 AND r8  (result_reg)
+        ];
 
-        let passed = passing_rows(&kind, &mb, n);
+        for &n in &[1, 7, 63, 64, 65, 127, 128, 255, 256, 257, 300] {
+            let mb = make_n_col_view(&schema, n, value, null_at);
+            let ev = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
 
-        for (row, &got) in passed.iter().enumerate() {
-            let v0 = (row as i64) % 4;
-            let v1 = ((row + 1) as i64) % 4;
-            let v2 = ((row + 2) as i64) % 4;
-            let n0 = row % 5 == 0;
-            let n1 = row % 7 == 0;
-            let n2 = row % 11 == 0;
-            let b0 = if n0 { None } else { Some(v0 > 1) };
-            let b1 = if n1 { None } else { Some(v1 > 1) };
-            let b2 = if n2 { None } else { Some(v2 > 1) };
-            let (v01, n01) = ref_and(b0, b1);
-            let combined = if n01 { None } else { Some(v01) };
-            let (v_all, n_all) = ref_and(combined, b2);
-            let expected = !n_all && v_all;
-            assert_eq!(
-                got, expected,
-                "n={n} row={row} v0={v0}(null={n0}) v1={v1}(null={n1}) v2={v2}(null={n2}) \
-                 batch={got} expected={expected}",
-            );
+            for (row, &got) in passing_rows(&ev, &mb, n).iter().enumerate() {
+                // NULL column → unknown clause; otherwise the compare's verdict.
+                let clause = |col: usize| {
+                    let k = if col == 0 { k0 } else { 1 };
+                    (!null_at(row, col)).then(|| value(row, col) > k)
+                };
+                let (v01, n01) = ref_and(clause(0), clause(1));
+                let (v_all, n_all) = ref_and((!n01).then_some(v01), clause(2));
+                let expected = !n_all && v_all;
+                assert_eq!(
+                    got,
+                    expected,
+                    "{label}: n={n} row={row} cols={:?} got={got} expected={expected}",
+                    [clause(0), clause(1), clause(2)],
+                );
+            }
         }
     }
 }
@@ -498,11 +516,11 @@ type FilterShape = (Vec<LogicalInstr>, u32, u32);
 /// A named null arrangement: the `null_pred` a sweep hands `make_n_col_view`.
 type NullArrangement = (&'static str, fn(usize, usize) -> bool);
 
-/// The null arrangements the sweeps run every shape over. `none` is the one that
-/// makes a null-test AND chain definite-FALSE for a whole morsel, and so the one
-/// that fires the nullable arm's dead-tail skip; the other three keep at least
-/// one live row in every 256-row morsel, so they exercise the path that does
-/// not.
+/// The null arrangements the sweeps run every shape over: the two extremes plus
+/// two mixed densities. `none` and `all` make every null test uniformly definite
+/// for a whole morsel; `spread` scatters NULLs through every 64-bit word, while
+/// `clustered` gives alternating words that are entirely NULL or entirely not —
+/// the difference a word-at-a-time kernel could see and a per-row one cannot.
 const ARM_SWEEP_NULLS: [NullArrangement; 4] = [
     ("none", |_, _| false),
     ("all", |_, _| true),
@@ -552,10 +570,9 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
                 1,
             ),
         ),
-        // Three conjuncts, so the non-terminal AND (r2) is a chain trigger: the
-        // nullable arm can take its dead-tail skip on this shape and the
-        // `no_nulls` arm has none, which is the one behavioural difference the
-        // reclassification introduces.
+        // Three conjuncts: the deepest chain in the set, so the accumulator
+        // spine is two ANDs long and a null test feeds another AND rather than
+        // the result register directly.
         (
             "and_chain",
             (
@@ -598,8 +615,8 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
 /// only because `IS [NOT] NULL` no longer disqualifies it must select the same
 /// rows as it would have on the nullable arm. The two are different code — the
 /// fast arm computes in `regs` and packs the verdict once, the nullable arm
-/// computes in packed `bool_bits`/`null_bits` and can take the AND-chain
-/// dead-tail skip — so agreement is the property, not the shape of either.
+/// computes in packed `bool_bits`/`null_bits` — so agreement is the property,
+/// not the shape of either.
 ///
 /// After the change these programs cannot reach the nullable arm by
 /// construction, so the B side is forced with `prog.no_nulls = false`. Adding a
@@ -690,162 +707,117 @@ fn is_null_and_is_not_null_are_complementary() {
     }
 }
 
-/// The 3-clause chain `col0 > 255 AND col1 > 1 AND col2 > 1`, leading column
-/// clustered (`col0 = row`, never null). Morsel 0 (rows 0..255) is entirely
-/// definite-FALSE on the leading clause, so the dead-tail skip fires; later
-/// morsels carry survivors, so it must not. Across the boundary sweep,
-/// the filter must match a per-row 3VL reference at every n — covering the
-/// firing path, the survivor path, and partial-morsel tail handling.
+/// A NULL row keeps whatever bytes its column held, and `Cmp` does not clear
+/// `regs` at null rows — only the two string kernels call `zero_null_rows`. So a
+/// NULL row reaches the 3VL OR carrying a *set* `bool_bits` bit, and the `!na` /
+/// `!nb` masks are the only thing keeping it out of the definite-true term. Here
+/// col1 is NULL on row 0 but holds 10, which satisfies the compare:
+/// `NULL OR FALSE` is NULL, and the filter drops it.
 #[test]
-fn and_chain_skip_fires_boundary_sweep() {
-    let schema = schema_pk_ints(3, true);
-
-    // col0 > 255 AND col1 > 1 AND col2 > 1  (const regs: 255 and 1)
-    let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },  // r0 = col0
-        LogicalInstr::LoadConst { dst: 1, val: 255 }, // r1 = 255
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            dst: 2,
-            a: 0,
-            b: 1,
-        }, // r2 = col0 > 255
-        LogicalInstr::LoadColInt { dst: 3, col: 2 },  // r3 = col1
-        LogicalInstr::LoadConst { dst: 4, val: 1 },   // r4 = 1
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            dst: 5,
-            a: 3,
-            b: 4,
-        }, // r5 = col1 > 1
-        LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 }, // r6 = r2 AND r5  (trigger)
-        LogicalInstr::LoadColInt { dst: 7, col: 3 },  // r7 = col2
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            dst: 8,
-            a: 7,
-            b: 4,
-        }, // r8 = col2 > 1
-        LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 }, // r9 = r6 AND r8  (result_reg)
-    ];
-
-    for &n in &[1, 7, 63, 64, 65, 127, 128, 255, 256, 257, 300] {
-        let mb = make_n_col_view(
-            &schema,
-            n,
-            // col0 = row (clustered); col1, col2 cycle 0..4
-            |row, col| match col {
-                0 => row as i64,
-                1 => ((row + 1) as i64) % 4,
-                _ => ((row + 2) as i64) % 4,
-            },
-            // col0 never null (leading clause is definite-FALSE, not NULL);
-            // null col1 every 7th row, col2 every 11th
-            |row, col| match col {
-                0 => false,
-                1 => row % 7 == 0,
-                _ => row % 11 == 0,
-            },
-        );
-
-        let kind = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
-
-        let passed = passing_rows(&kind, &mb, n);
-
-        for (row, &got) in passed.iter().enumerate() {
-            let v0 = row as i64;
-            let v1 = ((row + 1) as i64) % 4;
-            let v2 = ((row + 2) as i64) % 4;
-            let n1 = row % 7 == 0;
-            let n2 = row % 11 == 0;
-            let b0 = Some(v0 > 255); // col0 never null
-            let b1 = if n1 { None } else { Some(v1 > 1) };
-            let b2 = if n2 { None } else { Some(v2 > 1) };
-            let (v01, n01) = ref_and(b0, b1);
-            let combined = if n01 { None } else { Some(v01) };
-            let (v_all, n_all) = ref_and(combined, b2);
-            let expected = !n_all && v_all;
-            assert_eq!(
-                got, expected,
-                "n={n} row={row} v0={v0} v1={v1}(null={n1}) v2={v2}(null={n2}) got={got} expected={expected}",
-            );
-        }
-    }
-}
-
-/// NULL-flooded morsel must not misfire. `col0 = -1 AND col1 > 0 AND col2 > 0`
-/// with col0 NULL on 3 of every 4 rows: the leading clause (hence the trigger
-/// AND) is NULL — not definite-FALSE — on those rows, so `alive != 0` and the
-/// skip must not fire. The 1-in-4 survivor rows (col0 = -1) must still pass; a
-/// misfire would zero the terminal and wrongly drop them. (An all-NULL morsel
-/// could not catch a misfire: NULL and FALSE both mean "excluded", so the
-/// output would be identical either way — the survivors are what make it sharp.)
-#[test]
-fn and_chain_null_flood_does_not_misfire() {
-    let schema = schema_pk_ints(3, true);
-
-    // col0 = -1 AND col1 > 0 AND col2 > 0  (const regs: -1 and 0)
+fn or_does_not_take_a_null_row_stored_value_as_definite_true() {
+    let schema = schema_pk_ints(2, true);
+    let n = 1;
+    let mb = make_n_col_view(&schema, n, |_, col| if col == 0 { 10 } else { 0 }, |_, col| col == 0);
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: -1 },
+        LogicalInstr::LoadConst { dst: 1, val: 5 },
         LogicalInstr::Cmp {
-            op: CmpOp::Eq,
+            op: CmpOp::Gt,
             dst: 2,
             a: 0,
             b: 1,
         },
         LogicalInstr::LoadColInt { dst: 3, col: 2 },
-        LogicalInstr::LoadConst { dst: 4, val: 0 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 5,
+            dst: 4,
             a: 3,
-            b: 4,
+            b: 1,
         },
-        LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 }, // trigger
-        LogicalInstr::LoadColInt { dst: 7, col: 3 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            dst: 8,
-            a: 7,
-            b: 4,
-        },
-        LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 }, // result_reg
+        LogicalInstr::BoolOr { dst: 5, a: 2, b: 4 },
     ];
-
-    for &n in &[64, 256, 257] {
-        let mb = make_n_col_view(
-            &schema,
-            n,
-            // col0 = -1 (meaningful only on survivor rows); col1 = col2 = 5
-            |_row, col| if col == 0 { -1 } else { 5 },
-            // col0 NULL on 3 of every 4 rows; col1/col2 never null
-            |row, col| col == 0 && row % 4 != 0,
-        );
-
-        let kind = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
-
-        let passed = passing_rows(&kind, &mb, n);
-
-        for (row, &got) in passed.iter().enumerate() {
-            // survivor rows (row % 4 == 0): col0 = -1 → all clauses TRUE → pass.
-            // other rows: col0 NULL → chain NULL → fail.
-            let expected = row % 4 == 0;
-            assert_eq!(got, expected, "n={n} row={row} got={got} expected={expected}");
-        }
-    }
+    let ev = filter_prog(&schema, instrs, 6, 5, vec![]);
+    assert_eq!(
+        passing_rows(&ev, &mb, n),
+        vec![false],
+        "NULL OR FALSE is NULL, which the filter drops"
+    );
 }
 
-/// Non-nullable AND chain: the same predicate over NOT NULL columns selects the
-/// `no_nulls` arm, where `bool_bits`/`null_bits` are never allocated. The skip
-/// lives only on the nullable arm, so it must never run here — were it to, the
-/// `alive` reduce would index the empty `bool_bits` and panic. Results must
-/// still be correct.
+/// A 3-conjunct chain read through `eval_row`, which reports the null bit
+/// directly where `filter` cannot: it consumes `bool_bits & !null_bits`, so a
+/// cleared bool already forces the verdict and NULL is indistinguishable from
+/// FALSE there. A filter-resolved program really is driven this way — `passes`
+/// above is exactly that.
+///
+/// Two rows, because the interesting cases are the two the chain can produce:
+/// `TRUE AND NULL AND TRUE` is NULL, and a definite-FALSE chain is FALSE rather
+/// than the previous drive's NULL carried forward in the scratch.
 #[test]
-fn and_chain_non_nullable_skips_runtime_check() {
-    let schema = schema_pk_ints(3, false);
+fn and_chain_null_and_false_through_eval_row() {
+    let schema = schema_pk_ints(3, true);
+    // Row 0: col1 = 1 (true), col2 NULL holding 5, col3 = 1 (true)
+    //        → acc = TRUE AND NULL = NULL, terminal = NULL AND TRUE = NULL.
+    // Row 1: col1 = 0, so acc is definite-FALSE and so is the terminal.
+    let value = |row: usize, col: usize| match (row, col) {
+        (0, 0) | (0, 2) => 1,
+        (0, 1) => 5,
+        _ => 0,
+    };
+    let mb = make_n_col_view(&schema, 2, value, |row, col| row == 0 && col == 1);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        },
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
+        LogicalInstr::LoadColInt { dst: 6, col: 3 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 7,
+            a: 6,
+            b: 1,
+        },
+        LogicalInstr::BoolAnd { dst: 8, a: 5, b: 7 },
+    ];
+    let ev = filter_prog(&schema, instrs, 9, 8, vec![]);
 
-    // col0 = -1 AND col1 > 0 AND col2 > 0
+    assert_eq!(ev.eval_row(&mb, 0), (0, true), "TRUE AND NULL AND TRUE is NULL");
+    assert_eq!(
+        ev.eval_row(&mb, 1),
+        (0, false),
+        "a definite-FALSE chain is FALSE, not the previous drive's NULL"
+    );
+}
+
+/// `col0 = -1 AND col1 > 0 AND col2 > 0` must select the same 1-in-4 survivor
+/// rows however the other three quarters are excluded, and on either arm.
+///
+/// - `null_flood` (nullable schema): col0 is NULL on 3 of every 4 rows, so the
+///   leading clause is NULL rather than definite-FALSE, and the packed 3VL word
+///   loop has to carry that through two more ANDs. An all-NULL morsel would not
+///   be sharp — NULL and FALSE both read as "excluded" out of a filter — so the
+///   survivors are what separate 3VL NULL from FALSE.
+/// - `definite_false` (NOT NULL schema): the same rows fail on value instead,
+///   which selects the `no_nulls` arm — `bin_op!` over `regs`, with no
+///   `bool_bits`/`null_bits` allocated at all.
+///
+/// Same instruction stream and same expected rows for both, so the two arms are
+/// held to one answer rather than to two hand-written ones.
+#[test]
+fn and_chain_survivors_agree_across_arms() {
+    // col0 = -1 AND col1 > 0 AND col2 > 0  (const regs: -1 and 0)
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadConst { dst: 1, val: -1 },
@@ -874,31 +846,33 @@ fn and_chain_non_nullable_skips_runtime_check() {
         LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 },
     ];
 
-    for &n in &[64, 256, 257] {
-        let mb = make_n_col_view(
-            &schema,
-            n,
-            // survivor rows (row % 4 == 0): col0 = -1; others col0 = 0 (!= -1)
-            |row, col| {
-                if col != 0 {
-                    5
-                } else if row % 4 == 0 {
-                    -1
-                } else {
-                    0
-                }
-            },
-            // non-nullable: no nulls anywhere
-            |_row, _col| false,
-        );
-
-        let kind = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
-
-        let passed = passing_rows(&kind, &mb, n);
-
-        for (row, &got) in passed.iter().enumerate() {
-            let expected = row % 4 == 0; // col0 == -1
-            assert_eq!(got, expected, "n={n} row={row} got={got} expected={expected}");
+    // A survivor is `row % 4 == 0` in both; col1 = col2 = 5 always passes.
+    let survives = |row: usize| row.is_multiple_of(4);
+    for (label, nullable) in [("null_flood", true), ("definite_false", false)] {
+        let schema = schema_pk_ints(3, nullable);
+        for &n in &[64, 256, 257] {
+            // Nullable: col0 = -1 everywhere and the non-survivors are NULL.
+            // NOT NULL: the non-survivors hold 0, which simply is not -1.
+            let mb = make_n_col_view(
+                &schema,
+                n,
+                |row, col| match col {
+                    0 if nullable || survives(row) => -1,
+                    0 => 0,
+                    _ => 5,
+                },
+                |row, col| nullable && col == 0 && !survives(row),
+            );
+            let ev = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
+            assert_eq!(
+                ev.prog.no_nulls, !nullable,
+                "{label}: wrong arm — the drive proves nothing"
+            );
+            assert_eq!(
+                passing_rows(&ev, &mb, n),
+                (0..n).map(survives).collect::<Vec<_>>(),
+                "{label}: n={n}"
+            );
         }
     }
 }
@@ -1140,8 +1114,8 @@ fn filter_kernel_bench() {
 
 /// `col1 IS NULL AND col2 > k AND ... ` over `is_null_bench_schema`: `n_cmp`
 /// compares of NOT NULL columns hung off one null test, so the whole predicate
-/// still resolves `no_nulls`. With `n_cmp >= 2` the non-terminal ANDs are chain
-/// triggers, which is what gives the nullable arm its dead-tail skip.
+/// still resolves `no_nulls`. `n_cmp` sets the chain depth, which is what scales
+/// the per-conjunct cost the arms are being compared on.
 fn is_null_chain(k: i64, n_cmp: u16) -> FilterShape {
     let mut instrs = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
     if n_cmp == 0 {
@@ -1200,14 +1174,13 @@ fn is_null_bench_schema() -> TestSchema {
 ///         is_null_arm_bench -- --ignored --nocapture --test-threads=1
 ///   done; done; done
 ///
-/// Moving to the fast arm is cheaper on every shape here except one: at
-/// `-C target-cpu=x86-64-v3` (what `crates/.cargo/config.toml` ships) the wins
-/// run from −3.7 % retired instructions (`map`) to −40.0 % (`chain_spread`).
-/// `chain_clustered` is the regression, +31.6 %: its falsity is packed tightly
-/// enough that the nullable arm's dead-tail skip fires on 7 of every 8 morsels,
-/// and the fast arm has none. Read that figure as a floor — the skip also elides
-/// column loads, whose cost is memory stalls that retired instructions do not
-/// count, and the same pair is about +68 % in `cycles:u`.
+/// Moving to the fast arm is cheaper on every shape here, at
+/// `-C target-cpu=x86-64-v3` (what `crates/.cargo/config.toml` ships): −3.7 %
+/// retired instructions on `map`, −6.3 % on `bare`, −28.0 % on `one_and`, and
+/// −38 % to −39.3 % across the four 4-conjunct chains. What separates the chain
+/// shapes from each other is only their NULL arrangement, and it no longer
+/// separates them by much — the arms run the same kernels over the same word
+/// count, so the gap is the per-row null gather the fast arm skips.
 ///
 /// Take both events. `instructions:u` repeats here to under 0.001 %, `cycles:u`
 /// to a few percent; the first is the reproducible one, the second is the one
@@ -1234,11 +1207,10 @@ fn is_null_arm_bench() {
     let schema = is_null_bench_schema();
 
     // Three views, shared by the shapes that want the same NULL arrangement.
-    // The dead-tail skip fires on a morsel holding no row that is both NULL and
-    // over the compare constant, so the arrangement is what selects the regime:
-    // `spread`'s 16 NULLs per morsel make that essentially never, `rare`'s 4
-    // make it occasional, and `clustered` gives 7 of every 8 morsels no NULL at
-    // all, which fires it almost every morsel.
+    // They span how the NULLs are distributed rather than just how many there
+    // are: `spread` puts 16 per morsel, `rare` 4, and `clustered` gives 7 of
+    // every 8 morsels no NULL at all — the arrangement a morsel-granular
+    // optimization would be most sensitive to.
     let value = |row: usize, col: usize| ((row * 7 + col * 13) % 100) as i64;
     let spread = make_n_col_view(&schema, n, value, |row, col| col == 0 && row.is_multiple_of(16));
     let clustered = make_n_col_view(&schema, n, value, |row, col| {

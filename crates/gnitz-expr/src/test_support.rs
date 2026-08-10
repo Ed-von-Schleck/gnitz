@@ -328,9 +328,8 @@ pub fn scalar_prog(
         .expect("test program must validate")
 }
 
-/// Build and resolve a filter program — the arm where AND-chain detection runs
-/// and `result_reg` stays bit_only-eligible. Same unwrap rule as
-/// [`scalar_prog`].
+/// Build and resolve a filter program — the arm where `result_reg` stays
+/// bit_only-eligible. Same unwrap rule as [`scalar_prog`].
 pub fn filter_prog(
     schema: &TestSchema,
     instrs: Vec<LogicalInstr>,
@@ -376,8 +375,8 @@ pub fn passing_ranges(ev: &Evaluator, mb: &TestView, n: usize) -> Vec<(usize, us
 /// Resolve one program twice: once as classification decides, once forced onto
 /// the nullable arm. The forced side is a faithful baseline — `ensure_capacity`
 /// re-reads `prog.no_nulls` on every drive and sizes the null buffers from it,
-/// and the bit_only / bool_pack / chain_trigger masks are computed independently
-/// of the arm — so it really runs the kernels the fast side skips.
+/// and the bit_only / bool_pack masks are computed independently of the arm —
+/// so it really runs the kernels the fast side skips.
 ///
 /// The point is differential testing of programs that, after classification, can
 /// no longer reach the nullable arm by construction. `label` names the subject in

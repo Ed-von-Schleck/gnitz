@@ -28,8 +28,9 @@ use gnitz_wire::{
 };
 
 /// The register file is capped at 64: the BOOL_AND/BOOL_OR 3VL paths, the
-/// null-bit propagation, and every register-indexed mask (`bit_only_mask`,
-/// `bool_pack_mask`, `chain_trigger_mask`) address registers by bit in a `u64`.
+/// null-bit propagation, and every register-indexed mask — `bit_only_mask` and
+/// `bool_pack_mask` on the resolved program, `written_regs` and `str_class` in
+/// `validate` — address registers by bit in a `u64`.
 /// Public because a rejection message states the limit, and the number a caller
 /// prints must be the one [`LogicalProgram::from_wire`] enforces.
 pub const MAX_REGS: usize = u64::BITS as usize;
@@ -1044,9 +1045,9 @@ impl LogicalProgram {
         ok.then_some(base as usize)
     }
 
-    /// Lower to the resolved form, then run the three one-shot analyses over the
-    /// resolved instruction stream — nullability, register roles, AND-chain — for
-    /// the given context (`is_filter = true` keeps `result_reg` eligible for
+    /// Lower to the resolved form, then run the two one-shot analyses over the
+    /// resolved instruction stream — nullability and register roles — for the
+    /// given context (`is_filter = true` keeps `result_reg` eligible for
     /// bit_only). Consuming: a `Vec<LogicalInstr>` cannot be mutated in place into
     /// a `Vec<Instr>`. Preserves the per-register U64 signed→unsigned tracking.
     pub(crate) fn resolve_program(self, schema: &dyn SchemaFacts, is_filter: bool) -> ResolvedProgram {
@@ -1373,18 +1374,13 @@ impl LogicalProgram {
                 }),
             }
         }
-        // Three independent passes over `instrs`, so the struct is built once,
+        // Two independent passes over `instrs`, so the struct is built once,
         // fully resolved — there is no moment where a mask field is a placeholder.
-        let RegisterRoles {
-            bit_only,
-            bool_input,
-            use_count,
-        } = classify_registers(&instrs, self.result_reg, is_filter);
+        let RegisterRoles { bit_only, bool_input } = classify_registers(&instrs, self.result_reg, is_filter);
         ResolvedProgram {
             no_nulls: is_strictly_non_nullable(&instrs, schema),
             bit_only_mask: bit_only,
             bool_pack_mask: bit_only | bool_input,
-            chain_trigger_mask: and_chain_mask(&instrs, self.result_reg, is_filter, &use_count),
             instrs,
             num_regs: self.num_regs,
             result_reg: self.result_reg,
@@ -1620,8 +1616,7 @@ impl LogicalProgram {
                 }
             }
             // Single assignment: one writer is what makes a register's class
-            // well-defined for its whole life, and what `and_chain_mask`'s
-            // unique-writer premise rests on.
+            // well-defined for its whole life.
             if let Some((dst, class)) = u.dst {
                 if (written_regs >> dst) & 1 != 0 {
                     return Err(E::RegRewrite { reg: dst });
@@ -1950,13 +1945,6 @@ pub(crate) struct ResolvedProgram {
     /// its two halves: `needs_bool_pack` is the only reader and runs per
     /// instruction per morsel.
     bool_pack_mask: u64,
-    /// Destination registers of the non-terminal ANDs in the one result-terminal
-    /// AND chain: bit `r` set means "if the AND writing register `r` is all
-    /// definite-FALSE for the morsel, the filter result is too — write the terminal
-    /// (`result_reg`) all-FALSE and stop". 0 for non-filter programs and programs
-    /// with no such chain. Every register is `< num_regs ≤ 64` (asserted in
-    /// `LogicalProgram::new`), so a u64 indexed by register suffices.
-    pub(crate) chain_trigger_mask: u64,
 }
 
 impl ResolvedProgram {
@@ -1972,72 +1960,6 @@ impl ResolvedProgram {
     }
 }
 
-/// Detect the one result-terminal AND chain and return, as `chain_trigger_mask`,
-/// the destination registers of its non-terminal ANDs. At runtime, when such an
-/// AND is all definite-FALSE for a morsel, `eval_batch` writes the terminal
-/// (`result_reg`) all-FALSE and breaks (see the `BoolAnd` nullable arm). Only
-/// the accumulator spine is walked, so an inner AND reached through a
-/// `BoolNot`/`BoolOr` operand is never marked — forcing FALSE under those would
-/// be a miscompile.
-///
-/// `use_count` comes from [`classify_registers`], which already visits every
-/// register read: a second exhaustive walk could silently under-count an opcode
-/// that gained an operand, and an under-counted register reads as a clean chain
-/// link when it is not.
-fn and_chain_mask(instrs: &[Instr], result_reg: u32, is_filter: bool, use_count: &[u8; MAX_REGS]) -> u64 {
-    let n = instrs.len();
-    // Filter-only; need ≥ 3 instrs for a ≥ 2-AND chain. A filter has one
-    // register per instruction, so n == num_regs ≤ MAX_REGS (asserted),
-    // keeping `pc as u8` and the register-indexed scratch array in range.
-    if !is_filter || !(3..=MAX_REGS).contains(&n) {
-        return 0;
-    }
-    // Terminal = last instruction = expression root; must be an AND on result_reg.
-    let Instr::BoolAnd {
-        dst: term_dst,
-        a: term_a,
-        b: term_b,
-    } = instrs[n - 1]
-    else {
-        return 0;
-    };
-    if term_dst as u32 != result_reg {
-        return 0;
-    }
-    // Each register has one writer — `validate`'s `RegRewrite` rule enforces it,
-    // which is what makes this table's last-write-wins fill unambiguous. Track
-    // only AND writers: a spine link must be an AND, so a non-MAX slot already
-    // means "written by an AND".
-    let mut and_writer = [u8::MAX; MAX_REGS];
-    for (pc, ins) in instrs.iter().enumerate() {
-        if let Instr::BoolAnd { dst, .. } = *ins {
-            and_writer[dst as usize] = pc as u8;
-        }
-    }
-    // A spine link is an AND-written register used exactly once (clean chain).
-    let is_link = |r: u16| and_writer[r as usize] != u8::MAX && use_count[r as usize] == 1;
-    // Walk the accumulator spine; mark every non-terminal chain AND by its dst.
-    let mut mask = 0u64;
-    let (mut a, mut b) = (term_a, term_b);
-    loop {
-        let acc = if is_link(a) {
-            a
-        } else if is_link(b) {
-            b
-        } else {
-            break;
-        };
-        mask |= 1u64 << acc;
-        let w = and_writer[acc as usize] as usize;
-        let Instr::BoolAnd { a: na, b: nb, .. } = instrs[w] else {
-            break;
-        };
-        a = na;
-        b = nb;
-    }
-    mask
-}
-
 /// What [`classify_registers`] derives in its one pass over the instruction
 /// stream.
 struct RegisterRoles {
@@ -2047,19 +1969,15 @@ struct RegisterRoles {
     /// Bit `r` set iff a boolean consumer reads `r`, so its producer must
     /// populate `bool_bits[r]`.
     bool_input: u64,
-    /// How many instructions read each register, saturating at 255.
-    use_count: [u8; MAX_REGS],
 }
 
-/// Classify each register's role on the nullable-arm hot path, and count every
-/// register read while doing it. A filter's `result_reg` is forced to be a bool
-/// input (the filter fast path reads `bool_bits` of it directly). A map has no
-/// result register to force — its only register consumer is `Emit`, which
-/// already marks its source non-bool.
+/// Classify each register's role on the nullable-arm hot path. A filter's
+/// `result_reg` is forced to be a bool input (the filter fast path reads
+/// `bool_bits` of it directly). A map has no result register to force — its only
+/// register consumer is `Emit`, which already marks its source non-bool.
 ///
-/// This is the **one** exhaustive walk over register operands: `use_count` is
-/// accumulated here rather than by a second visitor, so an opcode that gains an
-/// operand cannot be classified correctly and counted wrong.
+/// The match has no `_` arm, so a new opcode has to be classified here rather
+/// than defaulting to "reads nothing, produces nothing".
 ///
 /// Every `1u64 << reg` below is in range: `LogicalProgram::new` asserts
 /// `num_regs <= MAX_REGS` and bounds every register operand by `num_regs`.
@@ -2068,11 +1986,9 @@ fn classify_registers(instrs: &[Instr], result_reg: u32, is_filter: bool) -> Reg
     let mut bool_produced: u64 = 0;
     let mut non_bool_read: u64 = 0;
     let mut bool_input: u64 = 0;
-    let mut use_count = [0u8; MAX_REGS];
-    // Record each register read and OR it into the mask naming how it is read.
+    // OR each register read into the mask naming how it is read.
     macro_rules! read {
         ($mask:ident, $($r:expr),+) => {{ $(
-            use_count[$r as usize] = use_count[$r as usize].saturating_add(1);
             $mask |= 1u64 << $r;
         )+ }};
     }
@@ -2195,7 +2111,6 @@ fn classify_registers(instrs: &[Instr], result_reg: u32, is_filter: bool) -> Reg
     RegisterRoles {
         bit_only: bool_produced & !non_bool_read,
         bool_input,
-        use_count,
     }
 }
 
@@ -2263,15 +2178,6 @@ fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool 
                 // bitmap and write a definite boolean. A program that also
                 // *loads* the tested column is held on the nullable arm by that
                 // load, not by these.
-                //
-                // Admitting them here costs one shape. `BoolAnd`'s dead-tail skip
-                // reduces over packed bool words, which only the nullable arm
-                // keeps, so a ≥2-AND chain containing a null test loses it when it
-                // lands on `no_nulls` — measurably (`is_null_arm_bench`) when a
-                // whole 256-row morsel is definite-FALSE. Giving the fast arm an
-                // equivalent skip means a per-row reduce over `regs` in place of a
-                // 4-word OR, charged to every chain that never fires; the skip
-                // stays nullable-arm-only rather than paying that toll.
                 | IsNull { .. }
                 | IsNotNull { .. }
                 // Set membership introduces no NULL beyond its input register; a
