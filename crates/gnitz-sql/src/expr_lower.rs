@@ -1594,6 +1594,25 @@ mod tests {
         );
     }
 
+    /// Why the fused compare cannot be dropped in favour of the register
+    /// channel, stated as a budget rather than a speed. A string `IN` list is an
+    /// OR chain, and `alloc_reg` never reuses, so the per-term register cost is
+    /// what caps the list: one register per fused compare plus one per OR, over
+    /// a `MAX_REGS` of 64. At 22 items that is 43 and compiles; through the
+    /// register channel each term would spend three instead of one, putting the
+    /// same list over the cap.
+    #[test]
+    fn in_list_string_list_fits_only_because_the_compare_is_fused() {
+        let schema = str_schema();
+        let items: Vec<BoundExpr> = (0..22).map(|i| BoundExpr::LitStr(format!("tag{i}"))).collect();
+        let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema.columns).unwrap();
+        assert_eq!(prog.num_regs, 2 * 22 - 1, "one register per fused compare, one per OR");
+        assert!(
+            prog.num_regs + 22 > 64,
+            "the same list must not fit once each term costs a third register"
+        );
+    }
+
     /// A non-literal item (a column) forces the OR-chain even for an int operand.
     #[test]
     fn in_list_non_literal_item_falls_back_to_or_chain() {
@@ -1684,10 +1703,23 @@ mod tests {
         BoundExpr::LitStr(s.to_string())
     }
 
-    /// A plain `col op 'lit'` must keep the specialized 16-byte-cell opcodes:
-    /// the register channel exists for computed operands, and routing the hot
-    /// filter shape through it would build a string register per row for
-    /// nothing.
+    /// A plain `col op 'lit'` must keep the specialized 16-byte-cell opcodes;
+    /// the register channel exists for computed operands. Routing this shape
+    /// through it would build a string register per row for nothing: the fused
+    /// kernel short-circuits on the cell's 4-byte prefix, which a `StrView`
+    /// does not carry. `str_const_filter_bench` in gnitz-expr runs both channels
+    /// over four value domains and prints the ratio; the prefix collision rate
+    /// controls it, and nothing bounds that rate, so there is no one number to
+    /// quote here.
+    ///
+    /// The register cap is the part that does not depend on speed at all.
+    /// `alloc_reg` never reuses a register and `MAX_REGS` is 64. A string
+    /// `IN (N)` list lowers to an OR chain; each term intercepted into a fused
+    /// compare costs one register, plus one per OR — `2N-1`. Through the
+    /// register channel a term is a column load, a const load and a compare,
+    /// three registers where the fused form spends one, so the same list caps
+    /// strictly lower. `in_list_string_list_fits_only_because_the_compare_is_fused`
+    /// pins the case that separates them.
     #[test]
     fn plain_column_comparisons_keep_the_specialized_opcodes() {
         let schema = str_schema();

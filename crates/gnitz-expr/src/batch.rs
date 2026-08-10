@@ -1067,11 +1067,12 @@ impl<'a> StrOperand<'a> {
         }
     }
 
-    /// The resolved constant cell, shared by every row.
-    fn constant(prog: &'a ResolvedProgram, const_idx: usize) -> Self {
+    /// The resolved constant cell, shared by every row. Its heap half, if it has
+    /// one, lives in the program's own constant arena — never the batch's blob.
+    fn constant(prog: &'a ResolvedProgram, cell_idx: usize) -> Self {
         StrOperand {
-            cells: &prog.const_cells[const_idx],
-            blob: &prog.const_blob,
+            cells: &prog.const_cells[cell_idx],
+            blob: &prog.const_arena,
             stride: 0,
             null_bit: 0,
         }
@@ -1743,11 +1744,11 @@ pub(crate) fn eval_batch<B: BatchView>(
             // operand B comes from differs. `str_cmp!` keeps the three-way
             // operator branch outside the row loop, so each `StrOp` still gets
             // its own monomorphic, branch-free kernel.
-            Instr::StrColConst { op, dst, pi, const_idx } => str_cmp!(
+            Instr::StrColConst { op, dst, pi, cell_idx } => str_cmp!(
                 op,
                 dst as usize,
                 StrOperand::column(mb, pi),
-                StrOperand::constant(prog, const_idx as usize)
+                StrOperand::constant(prog, cell_idx as usize)
             ),
             Instr::StrColCol { op, dst, pi_a, pi_b } => str_cmp!(
                 op,

@@ -684,8 +684,27 @@ fn ref_and(a: Option<bool>, b: Option<bool>) -> (bool, bool) {
 }
 
 /// Regression guard for the shared German-string comparator on the
-/// `col <op> 'const'` filter loop — ~1M rows, non-nullable STRING, mixed
-/// short/long cells. `#[ignore]`; run release:
+/// `col <op> 'const'` filter loop — ~1M rows, non-nullable STRING. Both channels
+/// for that shape run over the same view: the fused 16-byte-cell opcode, and the
+/// `LOAD_COL_STR` + `LOAD_CONST_STR` + `STR_CMP` register compare. Asserting
+/// their hit counts equal rules out the two channels doing different amounts of
+/// work; the reported figure is still wall-clock on a box whose absolute timings
+/// are noisy, so read the ratio and ignore the milliseconds.
+///
+/// The controlled pair is `digits-first` against `abcd-shared-prefix`: same
+/// lengths, same content bytes, differing only in whether the 4-byte prefix
+/// collides. Only the cell form can short-circuit on that prefix — a `StrView`
+/// carries none — so the fused time moves between the two and the register time
+/// does not, and the gap remaining at `abcd*` is the register lane's own cost of
+/// materialising each row into a `MORSEL`-wide lane. Matching the lengths is
+/// what makes that attributable: the fall-through compare is a plain byte
+/// compare, so a shorter value would have moved both channels.
+///
+/// Both channels run in one process, so a `perf stat` over this test measures
+/// their sum — separating retired instructions per kernel would need one process
+/// each, which this test does not do.
+///
+/// `#[ignore]`; run release:
 ///   cargo test -p gnitz-expr --release str_const_filter_bench \
 ///       -- --ignored --nocapture --test-threads=1
 #[test]
@@ -693,48 +712,103 @@ fn ref_and(a: Option<bool>, b: Option<bool>) -> (bool, bool) {
 fn str_const_filter_bench() {
     let schema = TestSchema::new(&[(type_code::U64, false), (type_code::STRING, false)], &[0]);
     let n = 1_000_000usize;
-    let mut mb = TestView::new(n, 8);
-    mb.push_col(16);
-    for row in 0..n {
-        mb.set_pk_col(row, 0, &(row as u64 + 1).to_le_bytes(), type_code::U64);
-        // ~1/16 rows match; every 7th row is a long (heap-backed) string.
-        let s = if row % 16 == 0 {
-            "match_target".to_string()
-        } else if row % 7 == 0 {
-            format!("long_string_variant_number_{row}")
-        } else {
-            format!("k{}", row % 97)
-        };
-        mb.set_string(row, 0, s.as_bytes());
-    }
+    // (domain, constant, value per row). `mixed` is the original fixture:
+    // ~1/16 rows match and every 7th row is a long (heap-backed) string.
+    type Domain = (&'static str, &'static str, fn(usize) -> String);
+    let domains: [Domain; 4] = [
+        ("mixed", "match_target", |row| {
+            if row % 16 == 0 {
+                "match_target".to_string()
+            } else if row % 7 == 0 {
+                format!("long_string_variant_number_{row}")
+            } else {
+                format!("k{}", row % 97)
+            }
+        }),
+        ("long", "long_string_variant_number_42", |row| {
+            format!("long_string_variant_number_{}", row % 97)
+        }),
+        // The controlled pair: `{i}abcd` and `abcd{i}` hold the same bytes at the
+        // same lengths, so the prefix is the only thing that differs.
+        ("digits-first", "42abcd", |row| format!("{}abcd", row % 97)),
+        ("abcd-shared-prefix", "abcd42", |row| format!("abcd{}", row % 97)),
+    ];
+    const PASSES: usize = 30;
 
-    for (name, op) in [("eq", StrOp::Eq), ("lt", StrOp::Lt)] {
-        let instrs = vec![LogicalInstr::StrColConst {
-            op,
-            dst: 0,
-            col: 1,
-            const_idx: 0,
-        }];
-        let func = filter_prog(&schema, instrs, 1, 0, vec![b"match_target".to_vec()]);
-
-        // Warm-up, then report the FASTEST of many timed passes — the minimum
-        // is robust against thermal throttling and scheduler noise, unlike a
-        // mean over the whole run.
-        let mut hits = 0usize;
-        func.filter(&mb, n, |s, e| hits += e - s);
-        const PASSES: usize = 30;
-        let mut best = std::time::Duration::MAX;
-        for _ in 0..PASSES {
-            let t = std::time::Instant::now();
-            let mut h = 0usize;
-            func.filter(&mb, n, |s, e| h += e - s);
-            std::hint::black_box(h);
-            best = best.min(t.elapsed());
+    for (domain, constant, value) in domains {
+        let mut mb = TestView::new(n, 8);
+        mb.push_col(16);
+        for row in 0..n {
+            mb.set_pk_col(row, 0, &(row as u64 + 1).to_le_bytes(), type_code::U64);
+            mb.set_string(row, 0, value(row).as_bytes());
         }
-        let mrps = n as f64 / best.as_secs_f64() / 1e6;
-        println!(
-            "str_const_filter {name}: {n} rows, best of {PASSES} passes = {best:?} = {mrps:.1} M rows/s (hits={hits})"
-        );
+
+        for (name, op) in [("eq", StrOp::Eq), ("lt", StrOp::Lt)] {
+            let consts = vec![constant.as_bytes().to_vec()];
+            let fused = filter_prog(
+                &schema,
+                vec![LogicalInstr::StrColConst {
+                    op,
+                    dst: 0,
+                    col: 1,
+                    const_idx: 0,
+                }],
+                1,
+                0,
+                consts.clone(),
+            );
+            let regs = filter_prog(
+                &schema,
+                vec![
+                    LogicalInstr::LoadColStr { dst: 0, col: 1 },
+                    LogicalInstr::LoadConstStr { dst: 1, const_idx: 0 },
+                    LogicalInstr::StrCmp { op, dst: 2, a: 0, b: 1 },
+                ],
+                3,
+                2,
+                consts,
+            );
+
+            // Warm-up (which is also the equality check), then report the
+            // FASTEST of many timed passes — the minimum is robust against
+            // thermal throttling and scheduler noise, unlike a mean over the
+            // whole run.
+            let count = |f: &Evaluator| {
+                let mut hits = 0usize;
+                f.filter(&mb, n, |s, e| hits += e - s);
+                hits
+            };
+            let hits = count(&fused);
+            assert_eq!(hits, count(&regs), "{domain}/{name}: the channels disagree");
+
+            let pass = |f: &Evaluator| {
+                let t = std::time::Instant::now();
+                let mut h = 0usize;
+                f.filter(&mb, n, |s, e| h += e - s);
+                std::hint::black_box(h);
+                t.elapsed()
+            };
+            // Alternate which channel is timed first, so a drift over the run
+            // cannot land wholly on whichever one always went second.
+            let (mut bf, mut br) = (std::time::Duration::MAX, std::time::Duration::MAX);
+            for i in 0..PASSES {
+                if i % 2 == 0 {
+                    bf = bf.min(pass(&fused));
+                    br = br.min(pass(&regs));
+                } else {
+                    br = br.min(pass(&regs));
+                    bf = bf.min(pass(&fused));
+                }
+            }
+            println!(
+                "str_const_filter {domain}/{name}: {n} rows, best of {PASSES} passes = \
+                 fused {bf:?} ({:.1} M rows/s), registers {br:?} ({:.1} M rows/s), \
+                 ratio {:.2}x (hits={hits})",
+                n as f64 / bf.as_secs_f64() / 1e6,
+                n as f64 / br.as_secs_f64() / 1e6,
+                br.as_secs_f64() / bf.as_secs_f64()
+            );
+        }
     }
 }
 

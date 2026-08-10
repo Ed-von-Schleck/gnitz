@@ -329,8 +329,8 @@ pub enum LogicalInstr {
         col_b: u32,
     },
     /// Integer set membership: `dst = value_reg ∈ set[set_idx]`. `set_idx` is a
-    /// const-pool index (`u32`, like `StrColConst.const_idx`) — the packed
-    /// sorted-i64 pool, decoded once at `resolve`.
+    /// const-pool index (`u32`, like this enum's `StrColConst.const_idx`) — the
+    /// packed sorted-i64 pool, decoded once at `resolve`.
     IntInSet {
         dst: u16,
         value_reg: u16,
@@ -605,11 +605,14 @@ pub(crate) enum Instr {
         dst: u16,
         pi: u8,
     },
+    /// A German-string column against a constant. The constant is encoded at
+    /// `resolve` into `ResolvedProgram.const_cells`; `cell_idx` indexes that
+    /// vector, not the const pool.
     StrColConst {
         op: StrOp,
         dst: u16,
         pi: u8,
-        const_idx: u32,
+        cell_idx: u32,
     },
     StrColCol {
         op: StrOp,
@@ -1073,11 +1076,18 @@ impl LogicalProgram {
         // decoded into, so two TRIMs over one set share a table.
         let mut trim_sets: Vec<[u64; 4]> = Vec::new();
         let mut trim_slots: Vec<Option<u32>> = vec![None; self.const_strings.len()];
-        // The string constants' bytes, concatenated. Each `LoadConstStr` bakes
-        // its span in, so a const view is an ordinary arena view and `StrView`
-        // needs no third buffer discriminator.
+        // The one pool of constant bytes both string channels resolve against.
+        // Each `LoadConstStr` bakes its span in, so a const view is an ordinary
+        // arena view and `StrView` needs no third buffer discriminator; a long
+        // `StrColConst` cell's heap half lands here too, reached through the
+        // operand's own blob reference rather than a second program buffer.
         let mut const_arena: Vec<u8> = Vec::new();
         let mut const_spans: Vec<Option<(u32, u32)>> = vec![None; self.const_strings.len()];
+        // The 16-byte German-string cells the str-vs-const eval arm compares
+        // through `gnitz_wire::compare_german_strings`. `cell_slots` maps a
+        // const-pool index to the cell it was encoded into.
+        let mut const_cells: Vec<[u8; 16]> = Vec::new();
+        let mut cell_slots: Vec<Option<u32>> = vec![None; self.const_strings.len()];
         // Which registers hold strings, off the same `reg_use` table `validate`
         // reads. Maintained in program order so an `Emit` sees the class of a
         // register already written, matching how `validate` built the mask it
@@ -1225,12 +1235,26 @@ impl LogicalProgram {
                     dst,
                     col,
                     const_idx,
-                } => instrs.push(I::StrColConst {
-                    op,
-                    dst,
-                    pi: payload_slot(col as usize),
-                    const_idx,
-                }),
+                } => {
+                    let ci = const_idx as usize;
+                    // Encoded on first reference, so a pool entry no `StrColConst`
+                    // names — an `INT_IN_SET` set, a TRIM byte set — costs neither
+                    // a cell nor a copy of its bytes into the arena. An IN list
+                    // rides one pool entry of 8 bytes per item and nothing caps its
+                    // length, so encoding it unread would park that many bytes in
+                    // every cached plan for the plan's life.
+                    let cell_idx = *cell_slots[ci].get_or_insert_with(|| {
+                        let slot = const_cells.len() as u32;
+                        const_cells.push(encode_german_string(&self.const_strings[ci], &mut const_arena));
+                        slot
+                    });
+                    instrs.push(I::StrColConst {
+                        op,
+                        dst,
+                        pi: payload_slot(col as usize),
+                        cell_idx,
+                    })
+                }
                 L::StrColCol { op, dst, col_a, col_b } => instrs.push(I::StrColCol {
                     op,
                     dst,
@@ -1282,16 +1306,12 @@ impl LogicalProgram {
                     let ci = const_idx as usize;
                     // Appended on first reference, not once per instruction: two
                     // opcodes may share a const index.
-                    let (off, len) = match const_spans[ci] {
-                        Some(span) => span,
-                        None => {
-                            let bytes = &self.const_strings[ci];
-                            let span = (const_arena.len() as u32, bytes.len() as u32);
-                            const_arena.extend_from_slice(bytes);
-                            const_spans[ci] = Some(span);
-                            span
-                        }
-                    };
+                    let (off, len) = *const_spans[ci].get_or_insert_with(|| {
+                        let bytes = &self.const_strings[ci];
+                        let span = (const_arena.len() as u32, bytes.len() as u32);
+                        const_arena.extend_from_slice(bytes);
+                        span
+                    });
                     instrs.push(I::LoadConstStr { dst, off, len });
                 }
                 L::LoadNullStr { dst } => instrs.push(I::LoadNullStr { dst }),
@@ -1313,22 +1333,19 @@ impl LogicalProgram {
                     len_signed: len_reg.is_none_or(|l| !reg_u64[l as usize]),
                 }),
                 L::StrTrim { dst, a, mode, set_idx } => {
+                    let si = set_idx as usize;
                     // Decoded once per distinct pool index, never per row —
                     // `LoadConstStr` shares its index the same way. Immutable
                     // read of the pool: two opcodes may name one index.
-                    let new_idx = match trim_slots[set_idx as usize] {
-                        Some(slot) => slot,
-                        None => {
-                            let mut table = [0u64; 4];
-                            for &byte in &self.const_strings[set_idx as usize] {
-                                table[(byte >> 6) as usize] |= 1u64 << (byte & 63);
-                            }
-                            let slot = trim_sets.len() as u32;
-                            trim_sets.push(table);
-                            trim_slots[set_idx as usize] = Some(slot);
-                            slot
+                    let new_idx = *trim_slots[si].get_or_insert_with(|| {
+                        let mut table = [0u64; 4];
+                        for &byte in &self.const_strings[si] {
+                            table[(byte >> 6) as usize] |= 1u64 << (byte & 63);
                         }
-                    };
+                        let slot = trim_sets.len() as u32;
+                        trim_sets.push(table);
+                        slot
+                    });
                     instrs.push(I::StrTrim {
                         dst,
                         a,
@@ -1356,16 +1373,6 @@ impl LogicalProgram {
                 }),
             }
         }
-        // Encode each string constant once into a 16-byte German-string cell
-        // over one shared const blob, so the str-vs-const eval arm compares it
-        // through `gnitz_wire::compare_german_strings` — no per-morsel
-        // re-derivation and no parallel prefix/length tables.
-        let mut const_blob: Vec<u8> = Vec::new();
-        let const_cells: Vec<[u8; 16]> = self
-            .const_strings
-            .iter()
-            .map(|s| encode_german_string(s, &mut const_blob))
-            .collect();
         // Three independent passes over `instrs`, so the struct is built once,
         // fully resolved — there is no moment where a mask field is a placeholder.
         let RegisterRoles {
@@ -1382,7 +1389,6 @@ impl LogicalProgram {
             num_regs: self.num_regs,
             result_reg: self.result_reg,
             const_cells,
-            const_blob,
             int_sets,
             trim_sets,
             const_arena,
@@ -1898,11 +1904,13 @@ pub(crate) struct ResolvedProgram {
     /// the filter entry points, and [`LogicalProgram::validate_predicate`]
     /// rejects a register-free program so a filter's is always in range.
     pub(crate) result_reg: u32,
-    /// Per-constant 16-byte German-string cell (indexed by `const_idx`) over
-    /// the one shared `const_blob` — encoded once at resolve, compared by
-    /// `gnitz_wire::compare_german_strings`.
+    /// The 16-byte German-string cells, indexed by the resolved `cell_idx`,
+    /// with any heap half in `const_arena`. Only the constants a `StrColConst`
+    /// names get one — encoded once at resolve, compared by
+    /// `gnitz_wire::compare_german_strings`. `cell_idx` is in range because
+    /// `resolve` hands it back from the same push, not because `validate`
+    /// bounds it: it is not a const-pool index and no validator sees it.
     pub(crate) const_cells: Vec<[u8; 16]>,
-    pub(crate) const_blob: Vec<u8>,
     /// Decoded `INT_IN_SET` value pools, indexed by the resolved `set_idx`. Each
     /// pool is sorted ascending in signed-i64 `Ord` by `resolve` — the wire order
     /// is not trusted — so `eval_batch` binary-searches it directly. Duplicates
@@ -1912,9 +1920,13 @@ pub(crate) struct ResolvedProgram {
     /// resolved `set_idx`. Held here rather than inlined into `Instr` — 32 bytes
     /// would dominate the enum.
     pub(crate) trim_sets: Vec<[u64; 4]>,
-    /// The string constants' bytes. This is the string arena's non-cleared
-    /// prefix: the per-morsel reset truncates back to `const_arena.len()`, so a
-    /// `LoadConstStr` span stays valid for the evaluator's life.
+    /// Every constant byte the program needs at run time: the spans a
+    /// `LoadConstStr` bakes in, and the heap half of each long `const_cells`
+    /// entry. Holds only the constants some opcode names, so an unreferenced
+    /// pool entry is not carried for the plan's life. Also the string arena's
+    /// non-cleared prefix: the per-morsel reset truncates back to
+    /// `const_arena.len()`, so a `LoadConstStr` span stays valid for the
+    /// evaluator's life.
     pub(crate) const_arena: Vec<u8>,
     /// True iff any register holds a string. A program without one allocates no
     /// string lanes and pays a single length compare in `ensure_capacity`.

@@ -1336,6 +1336,100 @@ fn register_compare_agrees_with_the_cell_comparator() {
     }
 }
 
+/// A constant past `SHORT_STRING_THRESHOLD` has no inline content: its cell
+/// carries a heap offset into the program's own constant arena, not into the
+/// batch's blob. Two constants, so the second sits at a non-zero offset, and no
+/// row holds either one at the offset its cell names — so resolving a constant
+/// against the batch's blob lands on unrelated bytes rather than matching by
+/// luck.
+#[test]
+fn heap_backed_constants_at_two_arena_offsets() {
+    let schema = schema_pk_strings(2, false);
+    let a: &[u8] = b"alpha-value-past-twelve";
+    let b: &[u8] = b"bravo-value-past-twelve-and-then-some";
+    let vals: Vec<[&[u8]; 2]> = vec![
+        [b"zulu-value-past-twelve", b"zulu-value-past-twelve"],
+        [a, b],
+        [a, b"short"],
+        [b"short", b],
+    ];
+    let rows: Vec<&[&[u8]]> = vals.iter().map(|r| &r[..]).collect();
+    let view = make_string_view(&schema, &rows);
+    let ev = filter_prog(
+        &schema,
+        vec![
+            LogicalInstr::StrColConst {
+                op: StrOp::Eq,
+                dst: 0,
+                col: 1,
+                const_idx: 0,
+            },
+            LogicalInstr::StrColConst {
+                op: StrOp::Eq,
+                dst: 1,
+                col: 2,
+                const_idx: 1,
+            },
+            LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
+        ],
+        3,
+        2,
+        vec![a.to_vec(), b.to_vec()],
+    );
+    let mut got = vec![false; rows.len()];
+    ev.filter(&view, rows.len(), |s, e| got[s..e].fill(true));
+    assert_eq!(got, vec![false, true, false, false]);
+}
+
+/// A cell index is not a const-pool index. `resolve` encodes a cell only for
+/// the constants a `StrColConst` names, and numbers them by first reference —
+/// so `WHERE pk IN (2,3) AND t = 'b' AND s = 'a'` puts the packed `IN` set at
+/// pool 0 with no cell, and pool 2 ahead of pool 1 in `const_cells`. Every
+/// index here differs from the pool index it came from, so a resolver that
+/// passed the pool index through would read past a two-element vector.
+#[test]
+fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
+    let schema = schema_pk_strings(2, false);
+    let a: &[u8] = b"alpha-value-past-twelve";
+    let b: &[u8] = b"bravo-value-past-twelve";
+    // PKs are 1..=4; the set admits rows 1 and 2.
+    let vals: Vec<[&[u8]; 2]> = vec![[a, b], [a, b], [a, b"short"], [b"short", b]];
+    let rows: Vec<&[&[u8]]> = vals.iter().map(|r| &r[..]).collect();
+    let view = make_string_view(&schema, &rows);
+    let set: Vec<u8> = [2i64, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let ev = filter_prog(
+        &schema,
+        vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 0 },
+            LogicalInstr::IntInSet {
+                dst: 1,
+                value_reg: 0,
+                set_idx: 0,
+            },
+            LogicalInstr::StrColConst {
+                op: StrOp::Eq,
+                dst: 2,
+                col: 2,
+                const_idx: 2,
+            },
+            LogicalInstr::StrColConst {
+                op: StrOp::Eq,
+                dst: 3,
+                col: 1,
+                const_idx: 1,
+            },
+            LogicalInstr::BoolAnd { dst: 4, a: 2, b: 3 },
+            LogicalInstr::BoolAnd { dst: 5, a: 1, b: 4 },
+        ],
+        6,
+        5,
+        vec![set, a.to_vec(), b.to_vec()],
+    );
+    let mut got = vec![false; rows.len()];
+    ev.filter(&view, rows.len(), |s, e| got[s..e].fill(true));
+    assert_eq!(got, vec![false, true, false, false]);
+}
+
 #[test]
 fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
     // A U64 column above i64::MAX has a negative i64 bit pattern, so the
