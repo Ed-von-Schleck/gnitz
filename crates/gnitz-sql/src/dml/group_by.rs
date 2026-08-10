@@ -269,8 +269,12 @@ impl LeafBinder for Having<'_> {
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
         // IS [NOT] NULL over the grouped relation: an aggregate goes through the
         // shared companion-vs-value rule, a bare group column through the plain
-        // nullability fold (which for a non-nullable column also keeps
-        // EXPR_IS_NULL off the PK sentinel — see eval_is_null's assertion).
+        // nullability fold. The fold is also what keeps a null test off a group
+        // column that reduce laid out in the PK region: those layouts admit only
+        // non-nullable columns (`PkPermutation` takes source PK columns,
+        // `SingleNaturalCol` requires `!nullable`), so the fold settles every one
+        // of them at bind time and no key column is ever referenced by a null
+        // test — which a PK operand could not express anyway.
         match inner {
             Expr::Nested(i) => self.bind_null_test(i, want_null),
             Expr::Function(func) => {

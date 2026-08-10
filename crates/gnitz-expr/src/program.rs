@@ -2212,8 +2212,6 @@ fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool 
                 // narrowing casts produce NULL on an out-of-range value.
                 IntDiv { .. } | IntMod { .. } | FloatDiv { .. } => return false,
                 FloatToInt { .. } | IntCast { .. } | FloatToF32 { .. } => return false,
-                // IS_NULL / IS_NOT_NULL read the batch null bits.
-                IsNull { .. } | IsNotNull { .. } => return false,
                 // LoadNull manufactures a NULL for every row — forces the nullable path.
                 LoadNull { .. } | LoadNullStr { .. } => return false,
                 // The two text→number parses NULL an unparsable or out-of-range
@@ -2260,6 +2258,22 @@ fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool 
                 | FloatMul { .. }
                 | Cmp { .. }
                 | FCmp { .. }
+                // The two register-producing opcodes whose result nullability is
+                // independent of the source column's: they read the batch's null
+                // bitmap and write a definite boolean. A program that also
+                // *loads* the tested column is held on the nullable arm by that
+                // load, not by these.
+                //
+                // Admitting them here costs one shape. `BoolAnd`'s dead-tail skip
+                // reduces over packed bool words, which only the nullable arm
+                // keeps, so a ≥2-AND chain containing a null test loses it when it
+                // lands on `no_nulls` — measurably (`is_null_arm_bench`) when a
+                // whole 256-row morsel is definite-FALSE. Giving the fast arm an
+                // equivalent skip means a per-row reduce over `regs` in place of a
+                // 4-word OR, charged to every chain that never fires; the skip
+                // stays nullable-arm-only rather than paying that toll.
+                | IsNull { .. }
+                | IsNotNull { .. }
                 // Set membership introduces no NULL beyond its input register; a
                 // nullable source column is already disqualified at its `Load`.
                 | IntInSet { .. }

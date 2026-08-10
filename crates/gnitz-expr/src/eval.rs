@@ -150,10 +150,13 @@ impl Evaluator {
                     scratch.filter_bits[filter_word_base + w] =
                         scratch.bool_bits[base + w] & !scratch.null_bits[base + w];
                 }
-                // Mask the dirty tail, once rather than per word: ops like
-                // IS_NOT_NULL leave 1s beyond `m % 64` (`bool_bits =
-                // !null_word`); without this mask those phantom bits become
-                // false-positive passing rows.
+                // Mask the dirty tail, once rather than per word: BOOL_NOT
+                // complements whole words (`bool_bits = !va & !na`), leaving 1s
+                // beyond `m % 64`. This upholds `scan_filter_bits`' precondition
+                // that no bit past `n` is set. Those phantom bits sit at row `n`
+                // and above, so they cannot pass a real row; unmasked they append
+                // the degenerate range `(n, n)`, breaking the maximal-non-empty-run
+                // contract `filter` documents.
                 let tail_bits = m % 64;
                 if tail_bits != 0 {
                     scratch.filter_bits[filter_word_base + words_m - 1] &= (1u64 << tail_bits) - 1;

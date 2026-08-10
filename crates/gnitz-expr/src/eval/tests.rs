@@ -11,7 +11,8 @@ use gnitz_wire::type_code;
 
 use crate::batch::MORSEL;
 use crate::test_support::{
-    filter_prog, make_int_row, make_int_view, make_n_col_view, schema_pk_ints, TestSchema, TestView,
+    both_arms, filter_prog, make_int_row, make_int_view, make_n_col_view, map_prog, passing_ranges, passing_rows,
+    schema_pk_ints, TestSchema, TestView,
 };
 use crate::{CmpOp, Evaluator, LogicalInstr, StrOp};
 
@@ -106,9 +107,9 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
 /// are stitched rather than flushed at 256.
 ///
 /// Run over both nullability arms: they pack `filter_bits` by different routes
-/// (`no_nulls` reads `regs`, the nullable arm merges `bool_bits & !null_bits`
-/// and masks the `m % 64` tail), and `n = MORSEL + 8` gives the second morsel an
-/// 8-row tail so phantom bits above it would show up as extra passing rows.
+/// (`no_nulls` reads `regs`, the nullable arm merges `bool_bits & !null_bits`),
+/// and `n = MORSEL + 8` gives the second morsel an 8-row tail, so a route that
+/// mishandled a partial word would split or drop the run reaching row `n`.
 #[test]
 fn filter_emits_exact_maximal_ranges() {
     for nullable in [false, true] {
@@ -139,15 +140,11 @@ fn filter_range_case(schema: TestSchema) {
     ];
     let ev = filter_prog(&schema, instrs, 3, 2, vec![]);
 
-    let mut ranges = Vec::new();
-    ev.filter(&mb, n, |start, end| ranges.push((start, end)));
-    assert_eq!(ranges, vec![(1, 3), (4, MORSEL - 1), (MORSEL, n)]);
+    assert_eq!(passing_ranges(&ev, &mb, n), vec![(1, 3), (4, MORSEL - 1), (MORSEL, n)]);
 
     // An all-pass batch is one range covering everything, not one per morsel.
     let all = make_n_col_view(&schema, n, |_, _| 1, |_, _| false);
-    let mut ranges = Vec::new();
-    ev.filter(&all, n, |start, end| ranges.push((start, end)));
-    assert_eq!(ranges, vec![(0, n)]);
+    assert_eq!(passing_ranges(&ev, &all, n), vec![(0, n)]);
 
     // An all-fail batch calls back zero times.
     let none = make_n_col_view(&schema, n, |_, _| 0, |_, _| false);
@@ -159,15 +156,11 @@ fn filter_range_case(schema: TestSchema) {
     // zero: the run has to be closed at the boundary by the empty word itself,
     // since a bitmap walk driven off the set bits never visits it.
     let boundary = make_n_col_view(&schema, n, |row, _| i64::from(row < 64), |_, _| false);
-    let mut ranges = Vec::new();
-    ev.filter(&boundary, n, |start, end| ranges.push((start, end)));
-    assert_eq!(ranges, vec![(0, 64)]);
+    assert_eq!(passing_ranges(&ev, &boundary, n), vec![(0, 64)]);
 
     // The same, two words on: the gap word is interior rather than trailing.
     let gap = make_n_col_view(&schema, n, |row, _| i64::from(!(64..192).contains(&row)), |_, _| false);
-    let mut ranges = Vec::new();
-    ev.filter(&gap, n, |start, end| ranges.push((start, end)));
-    assert_eq!(ranges, vec![(0, 64), (192, n)]);
+    assert_eq!(passing_ranges(&ev, &gap, n), vec![(0, 64), (192, n)]);
 }
 
 #[test]
@@ -285,10 +278,7 @@ fn bit_only_three_and_chain_boundary_sweep() {
 
         let kind = filter_prog(&schema, instrs.clone(), 9, 8, vec![]);
 
-        let mut passed = vec![false; n];
-        kind.filter(&mb, n, |s, e| {
-            passed[s..e].fill(true);
-        });
+        let passed = passing_rows(&kind, &mb, n);
 
         for (row, &got) in passed.iter().enumerate() {
             let v0 = (row as i64) % 4;
@@ -410,19 +400,17 @@ fn bit_only_all_null_word_and() {
     ];
     let kind = filter_prog(&schema, instrs, 6, 5, vec![]);
 
-    let mut passed = vec![false; n];
-    kind.filter(&mb, n, |s, e| {
-        passed[s..e].fill(true);
-    });
+    let passed = passing_rows(&kind, &mb, n);
     assert!(passed.iter().all(|&p| !p), "all-null AND must reject every row");
 }
 
-/// IS_NOT_NULL feeds into BOOL_AND. Tests the tail-mask in the filter
-/// fast-path: IS_NOT_NULL writes `bool_bits[dst] = !null_word`, leaving 1s
-/// above bit `m % 64` of the last word. Without the tail mask those phantom
-/// bits become false-positive passing rows.
+/// An absolute verdict for the AND of two null tests, over 65 rows so the last
+/// word is partial. The sweeps below only check that the two arms agree, and
+/// `is_null_and_is_not_null_are_complementary` only pins the atoms; neither
+/// composes to "AND of two null tests selects the right rows", which is what
+/// this holds.
 #[test]
-fn bit_only_is_not_null_tail_mask() {
+fn is_not_null_and_over_partial_word() {
     let schema = schema_pk_ints(2, true);
     // 65 rows — straddles the 64-bit word boundary so tail handling matters.
     let n = 65;
@@ -437,11 +425,7 @@ fn bit_only_is_not_null_tail_mask() {
     ];
     let kind = filter_prog(&schema, instrs, 3, 2, vec![]);
 
-    let mut passed = vec![false; n];
-    kind.filter(&mb, n, |s, e| {
-        passed[s..e].fill(true);
-    });
-    for (row, &got) in passed.iter().enumerate() {
+    for (row, &got) in passing_rows(&kind, &mb, n).iter().enumerate() {
         let nn1 = row % 2 != 0;
         let nn2 = row % 3 != 0;
         let expected = nn1 && nn2;
@@ -449,6 +433,260 @@ fn bit_only_is_not_null_tail_mask() {
             got, expected,
             "row {row}: nn1={nn1} nn2={nn2} expected={expected} got={got}",
         );
+    }
+}
+
+/// The filter's nullable-arm tail mask. BOOL_NOT is the op that dirties the
+/// tail: it complements whole `bool_bits` words (`!va & !na`), so every bit
+/// above `m % 64` of the last word comes out set, and the word merge into
+/// `filter_bits` carries them through. The loaded nullable column is what keeps
+/// the program off the `no_nulls` arm, where the verdict is packed out of `regs`
+/// and no such word exists.
+///
+/// A phantom bit cannot pass a real row — it sits at row `n` or above, so the
+/// run it opens is the degenerate `(n, n)`. The assertion is therefore on the
+/// runs, each non-empty and inside the batch, and it only bites when the row
+/// directly under the tail *fails*: otherwise the phantom merges into a real run
+/// ending at `n` and reads as correct either way. Every `n` here is chosen so
+/// row `n - 1` fails.
+#[test]
+fn bool_not_tail_mask() {
+    let schema = schema_pk_ints(1, true);
+    for &n in &[1, 65, 300] {
+        // NOT (col1 >= 0), with col1 cycling -1, 0, 1 and NULL every 5th row.
+        let mb = make_n_col_view(&schema, n, |row, _| (row % 3) as i64 - 1, |row, _| row % 5 == 0);
+        let instrs = vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 },
+            LogicalInstr::LoadConst { dst: 1, val: 0 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Ge,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+            LogicalInstr::BoolNot { dst: 3, a: 2 },
+        ];
+        let ev = filter_prog(&schema, instrs, 4, 3, vec![]);
+        assert!(
+            !ev.prog.no_nulls,
+            "the nullable column load must keep this on the nullable arm"
+        );
+
+        let mut passed = vec![false; n];
+        for (s, e) in passing_ranges(&ev, &mb, n) {
+            assert!(
+                s < e && e <= n,
+                "n={n}: run ({s}, {e}) is not a non-empty run of 0..{n}"
+            );
+            passed[s..e].fill(true);
+        }
+        for (row, &got) in passed.iter().enumerate() {
+            // 3VL: NOT NULL is NULL, which the filter drops.
+            let expected = row % 5 != 0 && (row % 3) as i64 - 1 < 0;
+            assert_eq!(got, expected, "n={n} row={row} got={got} expected={expected}");
+        }
+    }
+}
+
+/// Row counts straddling the 64-bit word and the 256-row morsel, for every
+/// arms-agree sweep below.
+const ARM_SWEEP_ROWS: [usize; 7] = [63, 64, 65, 255, 256, 257, 300];
+
+/// A predicate as `filter_prog` takes it: `(instrs, num_regs, result_reg)`.
+type FilterShape = (Vec<LogicalInstr>, u32, u32);
+
+/// A named null arrangement: the `null_pred` a sweep hands `make_n_col_view`.
+type NullArrangement = (&'static str, fn(usize, usize) -> bool);
+
+/// The null arrangements the sweeps run every shape over. `none` is the one that
+/// makes a null-test AND chain definite-FALSE for a whole morsel, and so the one
+/// that fires the nullable arm's dead-tail skip; the other three keep at least
+/// one live row in every 256-row morsel, so they exercise the path that does
+/// not.
+const ARM_SWEEP_NULLS: [NullArrangement; 4] = [
+    ("none", |_, _| false),
+    ("all", |_, _| true),
+    ("spread", |row, col| (row + col) % 3 == 0),
+    ("clustered", |row, _| (row / 64) % 2 == 0),
+];
+
+/// Predicates whose only contact with a nullable column is a null test, which is
+/// exactly the set `is_strictly_non_nullable` moved onto the `no_nulls` arm.
+/// Against `schema_pk_ints(3, true)`.
+fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
+    vec![
+        ("is_null", (vec![LogicalInstr::IsNull { dst: 0, col: 1 }], 1, 0)),
+        ("is_not_null", (vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }], 1, 0)),
+        (
+            "and",
+            (
+                vec![
+                    LogicalInstr::IsNull { dst: 0, col: 1 },
+                    LogicalInstr::IsNotNull { dst: 1, col: 2 },
+                    LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
+                ],
+                3,
+                2,
+            ),
+        ),
+        (
+            "or",
+            (
+                vec![
+                    LogicalInstr::IsNull { dst: 0, col: 1 },
+                    LogicalInstr::IsNull { dst: 1, col: 2 },
+                    LogicalInstr::BoolOr { dst: 2, a: 0, b: 1 },
+                ],
+                3,
+                2,
+            ),
+        ),
+        (
+            "not",
+            (
+                vec![
+                    LogicalInstr::IsNull { dst: 0, col: 1 },
+                    LogicalInstr::BoolNot { dst: 1, a: 0 },
+                ],
+                2,
+                1,
+            ),
+        ),
+        // Three conjuncts, so the non-terminal AND (r2) is a chain trigger: the
+        // nullable arm can take its dead-tail skip on this shape and the
+        // `no_nulls` arm has none, which is the one behavioural difference the
+        // reclassification introduces.
+        (
+            "and_chain",
+            (
+                vec![
+                    LogicalInstr::IsNull { dst: 0, col: 1 },
+                    LogicalInstr::IsNull { dst: 1, col: 2 },
+                    LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
+                    LogicalInstr::IsNull { dst: 3, col: 3 },
+                    LogicalInstr::BoolAnd { dst: 4, a: 2, b: 3 },
+                ],
+                5,
+                4,
+            ),
+        ),
+        // CASE WHEN col1 IS NULL THEN 1 ELSE 0 END — the null test as a SELECT
+        // condition, which the nullable arm reads out of `bool_bits` and the
+        // `no_nulls` arm out of `regs`.
+        (
+            "case_cond",
+            (
+                vec![
+                    LogicalInstr::IsNull { dst: 0, col: 1 },
+                    LogicalInstr::LoadConst { dst: 1, val: 1 },
+                    LogicalInstr::LoadConst { dst: 2, val: 0 },
+                    LogicalInstr::Select {
+                        dst: 3,
+                        cond: 0,
+                        a: 1,
+                        b: 2,
+                    },
+                ],
+                4,
+                3,
+            ),
+        ),
+    ]
+}
+
+/// The reclassification's proof obligation: a program that resolves `no_nulls`
+/// only because `IS [NOT] NULL` no longer disqualifies it must select the same
+/// rows as it would have on the nullable arm. The two are different code — the
+/// fast arm computes in `regs` and packs the verdict once, the nullable arm
+/// computes in packed `bool_bits`/`null_bits` and can take the AND-chain
+/// dead-tail skip — so agreement is the property, not the shape of either.
+///
+/// After the change these programs cannot reach the nullable arm by
+/// construction, so the B side is forced with `prog.no_nulls = false`. Adding a
+/// nullable column load instead would test a different program: that load's own
+/// nullability, not the null test, is what would hold it there.
+#[test]
+fn is_null_arms_agree() {
+    let schema = schema_pk_ints(3, true);
+    for (name, (instrs, num_regs, result_reg)) in null_test_shapes() {
+        // One evaluator per arm for the whole sweep: `ensure_capacity` never
+        // shrinks, so reusing them across row counts is also how the engine
+        // drives an evaluator.
+        let (fast, nullable) = both_arms(name, || {
+            filter_prog(&schema, instrs.clone(), num_regs, result_reg, vec![])
+        });
+
+        for &n in &ARM_SWEEP_ROWS {
+            for (arrangement, null_pred) in ARM_SWEEP_NULLS {
+                let mb = make_n_col_view(&schema, n, |row, col| ((row + col) % 5) as i64, null_pred);
+                assert_eq!(
+                    passing_rows(&fast, &mb, n),
+                    passing_rows(&nullable, &mb, n),
+                    "{name}/{arrangement}: arms disagree at n={n}",
+                );
+            }
+        }
+    }
+}
+
+/// The same obligation on the map drive, where the result leaves through
+/// `Emit`'s register rather than a filter bitmap: both the values and the set of
+/// NULL rows must match across the arms.
+#[test]
+fn is_null_map_arms_agree() {
+    let in_schema = schema_pk_ints(1, true);
+    let out_schema = schema_pk_ints(1, false);
+    let instrs = vec![
+        LogicalInstr::IsNull { dst: 0, col: 1 },
+        LogicalInstr::Emit { src: 0, out: 0 },
+    ];
+    let (fast, nullable) = both_arms("map", || map_prog(&in_schema, &out_schema, instrs.clone(), 1, 0));
+
+    // The emitted value per row. `eval_is_null` clears the result's null bit and
+    // the fast arm has none to begin with, so a NULL row here is a stale bit on
+    // either arm — asserted directly rather than compared, which would pass on
+    // two identically-stale arms.
+    let drive = |ev: &Evaluator, mb: &TestView, n: usize| {
+        let mut vals = Vec::with_capacity(n);
+        ev.eval_morsels(mb, 0, n, |_, out| {
+            vals.extend_from_slice(out.reg_values(0));
+            out.for_each_null_row(0, |i| panic!("row {i} of a null test must never be NULL"));
+        });
+        vals
+    };
+
+    for &n in &ARM_SWEEP_ROWS {
+        for (arrangement, null_pred) in ARM_SWEEP_NULLS {
+            let mb = make_n_col_view(&in_schema, n, |row, _| row as i64, null_pred);
+            assert_eq!(
+                drive(&fast, &mb, n),
+                drive(&nullable, &mb, n),
+                "{arrangement}: map arms disagree at n={n}",
+            );
+        }
+    }
+}
+
+/// A sign flip inside `eval_is_null` would survive every arms-agree assertion
+/// above — both arms run that one kernel. Pin the polarity absolutely: `IS NULL`
+/// selects exactly the NULL rows, and `IS NOT NULL` selects exactly the rest.
+///
+/// The batch-drive counterpart to `golden_is_null_and_is_not_null_single_row`,
+/// which pins the same polarity through the `m = 1` `eval_row` drive. Polarity is
+/// row-local, so one multi-morsel `n` says everything a sweep would; the boundary
+/// counts belong to the packing routes, which `is_null_arms_agree` sweeps.
+#[test]
+fn is_null_and_is_not_null_are_complementary() {
+    let schema = schema_pk_ints(1, true);
+    let null_row = |row: usize| row % 7 < 3;
+    let n = 300;
+    let mb = make_n_col_view(&schema, n, |row, _| row as i64, |row, _| null_row(row));
+    let run = |instr| passing_rows(&filter_prog(&schema, vec![instr], 1, 0, vec![]), &mb, n);
+    let is_null = run(LogicalInstr::IsNull { dst: 0, col: 1 });
+    let is_not_null = run(LogicalInstr::IsNotNull { dst: 0, col: 1 });
+    for row in 0..n {
+        assert_eq!(is_null[row], null_row(row), "row {row}: IS NULL");
+        assert_ne!(is_null[row], is_not_null[row], "row {row}: not complementary");
     }
 }
 
@@ -512,10 +750,7 @@ fn and_chain_skip_fires_boundary_sweep() {
 
         let kind = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
 
-        let mut passed = vec![false; n];
-        kind.filter(&mb, n, |s, e| {
-            passed[s..e].fill(true);
-        });
+        let passed = passing_rows(&kind, &mb, n);
 
         for (row, &got) in passed.iter().enumerate() {
             let v0 = row as i64;
@@ -590,10 +825,7 @@ fn and_chain_null_flood_does_not_misfire() {
 
         let kind = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
 
-        let mut passed = vec![false; n];
-        kind.filter(&mb, n, |s, e| {
-            passed[s..e].fill(true);
-        });
+        let passed = passing_rows(&kind, &mb, n);
 
         for (row, &got) in passed.iter().enumerate() {
             // survivor rows (row % 4 == 0): col0 = -1 → all clauses TRUE → pass.
@@ -662,10 +894,7 @@ fn and_chain_non_nullable_skips_runtime_check() {
 
         let kind = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
 
-        let mut passed = vec![false; n];
-        kind.filter(&mb, n, |s, e| {
-            passed[s..e].fill(true);
-        });
+        let passed = passing_rows(&kind, &mb, n);
 
         for (row, &got) in passed.iter().enumerate() {
             let expected = row % 4 == 0; // col0 == -1
@@ -819,13 +1048,20 @@ fn str_const_filter_bench() {
 ///
 ///   for p in 1 501; do GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
 ///     cargo test -p gnitz-expr --release filter_kernel_bench -- --ignored --nocapture; done
+/// The pass count the `#[ignore]`d benches loop over, from `GNITZ_BENCH_PASSES`.
+/// Two runs at different counts, differenced, cancel everything that happens
+/// once per process.
+fn bench_passes() -> usize {
+    std::env::var("GNITZ_BENCH_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
 #[test]
 #[ignore]
 fn filter_kernel_bench() {
-    let passes: usize = std::env::var("GNITZ_BENCH_PASSES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+    let passes = bench_passes();
     let n = 200_000usize;
 
     // `pk > n/2` — the PK-region load.
@@ -900,4 +1136,182 @@ fn filter_kernel_bench() {
         "filter_kernel_bench passes={passes} n={n} hits={}",
         std::hint::black_box(hits)
     );
+}
+
+/// `col1 IS NULL AND col2 > k AND ... ` over `is_null_bench_schema`: `n_cmp`
+/// compares of NOT NULL columns hung off one null test, so the whole predicate
+/// still resolves `no_nulls`. With `n_cmp >= 2` the non-terminal ANDs are chain
+/// triggers, which is what gives the nullable arm its dead-tail skip.
+fn is_null_chain(k: i64, n_cmp: u16) -> FilterShape {
+    let mut instrs = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
+    if n_cmp == 0 {
+        // No compare, so no constant to load — an unread `LoadConst` would still
+        // cost a register write per morsel and blunt the bare shape's figure.
+        return (instrs, 1, 0);
+    }
+    instrs.push(LogicalInstr::LoadConst { dst: 1, val: k });
+    let mut acc = 0u16;
+    for i in 0..n_cmp {
+        let base = 2 + i * 3;
+        instrs.push(LogicalInstr::LoadColInt {
+            dst: base,
+            col: u32::from(i) + 2,
+        });
+        instrs.push(LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: base + 1,
+            a: base,
+            b: 1,
+        });
+        instrs.push(LogicalInstr::BoolAnd {
+            dst: base + 2,
+            a: acc,
+            b: base + 1,
+        });
+        acc = base + 2;
+    }
+    let num_regs = u32::from(2 + n_cmp * 3);
+    (instrs, num_regs, u32::from(acc))
+}
+
+/// One nullable column (the null test's) plus four NOT NULL ones (the
+/// compares'). Mixing the two is what the bench is about: a compare over a
+/// nullable column would hold the program on the nullable arm through its own
+/// load, whatever the null test is classified as.
+fn is_null_bench_schema() -> TestSchema {
+    let mut cols = vec![(type_code::U64, false), (type_code::I64, true)];
+    cols.extend(std::iter::repeat_n((type_code::I64, false), 4));
+    TestSchema::new(&cols, &[0])
+}
+
+/// A/B for the arm an `IS [NOT] NULL` predicate lands on. Each shape is built
+/// twice from one instruction stream — once as resolution classifies it
+/// (`no_nulls`), once forced onto the nullable arm — and the two are asserted to
+/// select the same rows before either is driven. Prints no measurement itself,
+/// like [`filter_kernel_bench`]: `GNITZ_BENCH_SHAPE` and `GNITZ_BENCH_ARM` cut
+/// the run down to one driven loop, and differencing two pass counts under
+/// `perf` cancels fixture construction, the warm-up and process start.
+///
+///   for s in bare one_and chain_spread chain_clustered \
+///            chain_nonselective chain_rare map; do
+///     for arm in fast nullable; do for p in 1 201; do \
+///       GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_ARM=$arm GNITZ_BENCH_PASSES=$p \
+///       perf stat -e instructions:u,cycles:u cargo test -p gnitz-expr --release \
+///         is_null_arm_bench -- --ignored --nocapture --test-threads=1
+///   done; done; done
+///
+/// Moving to the fast arm is cheaper on every shape here except one: at
+/// `-C target-cpu=x86-64-v3` (what `crates/.cargo/config.toml` ships) the wins
+/// run from −3.7 % retired instructions (`map`) to −40.0 % (`chain_spread`).
+/// `chain_clustered` is the regression, +31.6 %: its falsity is packed tightly
+/// enough that the nullable arm's dead-tail skip fires on 7 of every 8 morsels,
+/// and the fast arm has none. Read that figure as a floor — the skip also elides
+/// column loads, whose cost is memory stalls that retired instructions do not
+/// count, and the same pair is about +68 % in `cycles:u`.
+///
+/// Take both events. `instructions:u` repeats here to under 0.001 %, `cycles:u`
+/// to a few percent; the first is the reproducible one, the second is the one
+/// that sees a stall. Neither is a constant — batch size, NULL rate and
+/// clustering all move them.
+#[test]
+#[ignore]
+fn is_null_arm_bench() {
+    let passes = bench_passes();
+    let arm = std::env::var("GNITZ_BENCH_ARM").unwrap_or_else(|_| "both".to_string());
+    let (run_fast, run_nullable) = (arm != "nullable", arm != "fast");
+    // Which shape to drive. Every shape is still built and checked; only the
+    // driven loop is skipped, so a `perf stat` over the process attributes its
+    // pass-count difference to the one named here.
+    let only = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "all".to_string());
+    // Both selectors are decoded by inequality, so a typo would silently drive
+    // nothing (or both arms) and read out as a 0 % effect rather than an error.
+    assert!(
+        matches!(arm.as_str(), "both" | "fast" | "nullable"),
+        "GNITZ_BENCH_ARM must be both/fast/nullable, got {arm:?}"
+    );
+    let driven = |name: &str, want: bool| want && (only == "all" || only == name);
+    let n = 200_000usize;
+    let schema = is_null_bench_schema();
+
+    // Three views, shared by the shapes that want the same NULL arrangement.
+    // The dead-tail skip fires on a morsel holding no row that is both NULL and
+    // over the compare constant, so the arrangement is what selects the regime:
+    // `spread`'s 16 NULLs per morsel make that essentially never, `rare`'s 4
+    // make it occasional, and `clustered` gives 7 of every 8 morsels no NULL at
+    // all, which fires it almost every morsel.
+    let value = |row: usize, col: usize| ((row * 7 + col * 13) % 100) as i64;
+    let spread = make_n_col_view(&schema, n, value, |row, col| col == 0 && row.is_multiple_of(16));
+    let clustered = make_n_col_view(&schema, n, value, |row, col| {
+        col == 0 && (row / MORSEL).is_multiple_of(8)
+    });
+    let rare = make_n_col_view(&schema, n, value, |row, col| col == 0 && row.is_multiple_of(64));
+
+    // `k = 50` passes about half the rows; `k = -1` passes every row, which is
+    // the non-selective variant.
+    let shapes: [(&str, &TestView, FilterShape); 6] = [
+        ("bare", &spread, is_null_chain(50, 0)),
+        ("one_and", &spread, is_null_chain(50, 1)),
+        ("chain_spread", &spread, is_null_chain(50, 4)),
+        ("chain_clustered", &clustered, is_null_chain(50, 4)),
+        ("chain_nonselective", &spread, is_null_chain(-1, 4)),
+        ("chain_rare", &rare, is_null_chain(50, 4)),
+    ];
+
+    let mut selected = 0usize;
+    for (name, view, (instrs, num_regs, result_reg)) in &shapes {
+        let (fast, nullable) = both_arms(name, || {
+            filter_prog(&schema, instrs.clone(), *num_regs, *result_reg, vec![])
+        });
+        // Also the warm-up, and outside the driven region.
+        let passed = passing_rows(&fast, view, n);
+        assert_eq!(passed, passing_rows(&nullable, view, n), "{name}: the arms disagree");
+        let hits = passed.iter().filter(|&&p| p).count();
+
+        let run = |ev: &Evaluator| {
+            let mut h = 0usize;
+            for _ in 0..passes {
+                ev.filter(*view, n, |s, e| h += e - s);
+            }
+            std::hint::black_box(h);
+        };
+        for (want, ev) in [(run_fast, &fast), (run_nullable, &nullable)] {
+            if driven(name, want) {
+                selected += 1;
+                run(ev);
+            }
+        }
+        println!("is_null_arm_bench {name}: passes={passes} n={n} hits={hits}");
+    }
+
+    // The map drive, which leaves through EMIT's register rather than a bitmap.
+    let out_schema = schema_pk_ints(1, false);
+    let map_instrs = vec![
+        LogicalInstr::IsNull { dst: 0, col: 1 },
+        LogicalInstr::Emit { src: 0, out: 0 },
+    ];
+    let (fast, nullable) = both_arms("map", || map_prog(&schema, &out_schema, map_instrs.clone(), 1, 0));
+    // The warm-up doubles as the agreement check, as it does per filter shape.
+    let emitted = |ev: &Evaluator| {
+        let mut vals = Vec::with_capacity(n);
+        ev.eval_morsels(&spread, 0, n, |_, out| vals.extend_from_slice(out.reg_values(0)));
+        vals
+    };
+    assert_eq!(emitted(&fast), emitted(&nullable), "map: the arms disagree");
+    let run = |ev: &Evaluator| {
+        let mut acc = 0i64;
+        for _ in 0..passes {
+            ev.eval_morsels(&spread, 0, n, |_, out| acc += out.reg_values(0).iter().sum::<i64>());
+        }
+        std::hint::black_box(acc);
+    };
+    for (want, ev) in [(run_fast, &fast), (run_nullable, &nullable)] {
+        if driven("map", want) {
+            selected += 1;
+            run(ev);
+        }
+    }
+    println!("is_null_arm_bench map: passes={passes} n={n}");
+    // A misspelled shape name would otherwise drive nothing at all, and the two
+    // pass counts would difference to a 0 % effect instead of failing.
+    assert!(selected > 0, "GNITZ_BENCH_SHAPE matched no shape: {only:?}");
 }

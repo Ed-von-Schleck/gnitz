@@ -343,6 +343,53 @@ pub fn filter_prog(
         .expect("test predicate must validate")
 }
 
+/// Build and resolve a map program, checked against both the schema it reads
+/// and the one it writes. Same unwrap rule as [`scalar_prog`].
+pub fn map_prog(
+    in_schema: &TestSchema,
+    out_schema: &TestSchema,
+    instrs: Vec<LogicalInstr>,
+    num_regs: u32,
+    result_reg: u32,
+) -> Evaluator {
+    LogicalProgram::new(instrs, num_regs, result_reg, vec![])
+        .resolve_map(in_schema, out_schema)
+        .expect("test map must validate")
+}
+
+/// Run `ev` as a filter and report a per-row verdict — the shape almost every
+/// filter test wants, since `filter` reports runs rather than rows.
+pub fn passing_rows(ev: &Evaluator, mb: &TestView, n: usize) -> Vec<bool> {
+    let mut passed = vec![false; n];
+    ev.filter(mb, n, |s, e| passed[s..e].fill(true));
+    passed
+}
+
+/// The runs `ev` reports, verbatim. For tests whose subject is the range
+/// stitching itself rather than which rows pass.
+pub fn passing_ranges(ev: &Evaluator, mb: &TestView, n: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    ev.filter(mb, n, |s, e| ranges.push((s, e)));
+    ranges
+}
+
+/// Resolve one program twice: once as classification decides, once forced onto
+/// the nullable arm. The forced side is a faithful baseline — `ensure_capacity`
+/// re-reads `prog.no_nulls` on every drive and sizes the null buffers from it,
+/// and the bit_only / bool_pack / chain_trigger masks are computed independently
+/// of the arm — so it really runs the kernels the fast side skips.
+///
+/// The point is differential testing of programs that, after classification, can
+/// no longer reach the nullable arm by construction. `label` names the subject in
+/// the assertion that the A side is in fact the fast arm.
+pub fn both_arms(label: &str, build: impl Fn() -> Evaluator) -> (Evaluator, Evaluator) {
+    let fast = build();
+    assert!(fast.prog.no_nulls, "{label}: the fast side must resolve no_nulls");
+    let mut nullable = build();
+    nullable.prog.no_nulls = false;
+    (fast, nullable)
+}
+
 /// Reinterpret an `f64`'s bits as the `i64` a float register holds, and back —
 /// spelled exactly as the kernel's own `encode_f64` / `decode_f64`, so a test
 /// cannot disagree with it about the float-register encoding.

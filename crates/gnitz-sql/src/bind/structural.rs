@@ -588,9 +588,8 @@ fn bind_nullif<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result<B
 }
 
 /// Shared NOT-NULL fold: a never-null value makes `IS [NOT] NULL` a constant
-/// (never null, never — for IS NULL — true), keeping the null-tracking opcode
-/// (which forces `eval_batch`'s slow path — `is_strictly_non_nullable` returns
-/// false on any is_null) out of the program. `nullable` is the caller's
+/// (never null, never — for IS NULL — true), so the answer is settled at bind
+/// time and the opcode never reaches the program. `nullable` is the caller's
 /// authoritative nullability fact for the value referenced by `r` — a schema
 /// column's `is_nullable`, or a HAVING aggregate's structural nullability.
 /// Generic over the leaf reference `R`: the `usize` runtime leaves reuse it via

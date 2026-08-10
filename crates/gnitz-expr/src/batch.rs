@@ -307,6 +307,11 @@ fn fill_null_bits_mask(s: &mut EvalScratch, di: usize, mo: &Morsel<'_>, mask: u6
 /// IS [NOT] NULL: read payload column `pi`'s null bit per row, optionally invert
 /// (`invert` for IS NOT NULL), and write the boolean into register `dst`. The result
 /// register is always non-null (`clear_null_reg`).
+///
+/// The bitmap read here is the *batch's* — `Morsel` carries it whatever the
+/// arm — and the two scratch calls either side no-op under `no_nulls`. So the
+/// result is a definite boolean in `regs` on both arms, which is what lets
+/// `is_strictly_non_nullable` classify the opcode never-null.
 fn eval_is_null(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: usize, pi: usize, invert: bool) {
     scratch.clear_null_reg(dst, mo.m);
     {

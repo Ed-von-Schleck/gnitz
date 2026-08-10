@@ -9,7 +9,7 @@ use super::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
 use crate::eval::read_reg_row0;
 use crate::program::IntUnaryOp;
 use crate::test_support::{
-    bits_to_float, filter_prog, float_to_bits, make_int_row, make_int_view, make_n_col_view, scalar_prog,
+    bits_to_float, filter_prog, float_to_bits, make_int_row, make_int_view, make_n_col_view, passing_rows, scalar_prog,
     schema_pk_ints, TestSchema, TestView,
 };
 use crate::{CmpOp, LogicalInstr, ResolvedProgram};
@@ -1376,9 +1376,7 @@ fn heap_backed_constants_at_two_arena_offsets() {
         2,
         vec![a.to_vec(), b.to_vec()],
     );
-    let mut got = vec![false; rows.len()];
-    ev.filter(&view, rows.len(), |s, e| got[s..e].fill(true));
-    assert_eq!(got, vec![false, true, false, false]);
+    assert_eq!(passing_rows(&ev, &view, rows.len()), vec![false, true, false, false]);
 }
 
 /// A cell index is not a const-pool index. `resolve` encodes a cell only for
@@ -1425,9 +1423,7 @@ fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
         5,
         vec![set, a.to_vec(), b.to_vec()],
     );
-    let mut got = vec![false; rows.len()];
-    ev.filter(&view, rows.len(), |s, e| got[s..e].fill(true));
-    assert_eq!(got, vec![false, true, false, false]);
+    assert_eq!(passing_rows(&ev, &view, rows.len()), vec![false, true, false, false]);
 }
 
 #[test]

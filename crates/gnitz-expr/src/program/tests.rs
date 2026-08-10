@@ -2392,6 +2392,43 @@ fn test_no_nulls_classification_of_the_new_opcodes() {
     }
 }
 
+/// A null test reads the batch's null bitmap and yields a definite boolean, so
+/// it does not by itself force the nullable arm — even over a nullable column.
+/// What does force it is *loading* that column, which is a separate opcode with
+/// its own verdict. Both directions are pinned here: the classification is this
+/// module's, and `eval/tests.rs` only consumes it.
+#[test]
+fn a_null_test_alone_keeps_no_nulls_but_a_load_of_the_column_does_not() {
+    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::I64, true)], &[0]);
+    let no_nulls = |instrs: Vec<LogicalInstr>, num_regs: u32, result: u32| {
+        scalar_prog(&schema, instrs, num_regs, result, vec![]).prog.no_nulls
+    };
+
+    for instr in [
+        LogicalInstr::IsNull { dst: 0, col: 1 },
+        LogicalInstr::IsNotNull { dst: 0, col: 1 },
+    ] {
+        assert!(
+            no_nulls(vec![instr], 1, 0),
+            "a null test over a nullable column is definite"
+        );
+    }
+
+    // The same nullable column, now also loaded: the load is what carries the
+    // NULL into a register, so the program belongs on the nullable arm.
+    assert!(
+        !no_nulls(
+            vec![
+                LogicalInstr::IsNull { dst: 0, col: 1 },
+                LogicalInstr::LoadColInt { dst: 1, col: 1 },
+            ],
+            2,
+            0
+        ),
+        "loading the tested column must force the nullable arm"
+    );
+}
+
 /// `IntMinMax2` picks its compare domain from the U64 tracking of BOTH
 /// operands, and re-taints its own dst — which is what makes the lowering's
 /// fold-head rotation sufficient to fix the domain for a whole n-ary fold.
