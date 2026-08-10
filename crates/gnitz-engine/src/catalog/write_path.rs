@@ -539,8 +539,12 @@ impl CatalogEngine {
         }
     }
 
-    /// SCHEMA_TAB: a CREATE must not collide with a live schema name, and a DROP
-    /// must find the schema empty.
+    /// SCHEMA_TAB: the per-PK CAS + net contract, then a CREATE must not collide
+    /// with a live schema name and a DROP must find the schema empty.
+    ///
+    /// The CAS is what lets `apply_schema_caches` and `hook_schema_dir` act on the
+    /// batch payload's name: an applied `-1` carries the retracted row's own name,
+    /// so neither can be aimed at a different live schema.
     ///
     /// The empty-schema guard is the engine-side, caller-agnostic half of the
     /// DROP SCHEMA member cascade — it runs before any WAL write, so a rejected
@@ -555,6 +559,9 @@ impl CatalogEngine {
     /// NOT be probed against the relation-keyed dep map — the member count is
     /// the whole guard.
     fn precheck_schema_family(&mut self, batch: &Batch) -> Result<(), String> {
+        for sig in pk_signatures(batch) {
+            self.check_cas_and_net(SysFamily::Schema, batch, &sig, "system-catalog schema")?;
+        }
         for i in 0..batch.count {
             if batch.get_weight(i) > 0 {
                 let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
@@ -673,8 +680,12 @@ impl CatalogEngine {
     }
 
     /// IDX_TAB: a CREATE must name a base-table owner with an admissible column
-    /// list and a free index name; a DROP must not strip the uniqueness an FK
-    /// depends on.
+    /// list and a free index name; a DROP must pass the per-PK CAS + net contract
+    /// and must not strip the uniqueness an FK depends on.
+    ///
+    /// The CAS is what lets `apply_index_caches` unmap `index_by_name` by the
+    /// batch payload's name: an applied `-1` carries the retracted row's own name,
+    /// so it cannot unmap a different live index.
     ///
     /// IDX_TAB carries no rewrite pair, so raw `weight < 0` is already net-dead.
     fn precheck_index_family(&mut self, batch: &Batch) -> Result<(), String> {
@@ -708,6 +719,12 @@ impl CatalogEngine {
         // it is exempt (the table drop already passed its own precheck).
         if self.ctx.in_cascade_drop() {
             return Ok(());
+        }
+        // After the exemption, like the Column family's: a cascade's `-1` is a
+        // `retract_single_row` copy of the very row the CAS re-reads, so the
+        // contract could reject nothing there.
+        for sig in pk_signatures(batch) {
+            self.check_cas_and_net(SysFamily::Index, batch, &sig, "system-catalog index")?;
         }
         let mut drop_ids: Vec<i64> = (0..batch.count)
             .filter(|&i| batch.get_weight(i) < 0)

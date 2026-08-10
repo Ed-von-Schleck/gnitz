@@ -10,6 +10,7 @@ mod reopen_rebuild_tests;
 mod scan_spec_bench;
 mod scan_spec_tests;
 mod source_cursor_tests;
+mod sys_retraction_tests;
 mod uuid_tests;
 mod view_preflight_tests;
 mod wide_pk_validation;

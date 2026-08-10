@@ -193,6 +193,11 @@ impl CatalogEngine {
             } else {
                 // Queue for deletion on successful DROP SCHEMA and on CREATE SCHEMA
                 // rollback when compensate_stage_a re-fires this hook with -1.
+                // The path comes from this row's payload name and the queue is
+                // drained by `remove_dir_all`. Only the master live-DDL path acts
+                // on it (workers discard theirs), and there
+                // `precheck_schema_family`'s CAS has proved the name is the
+                // retracted schema's own.
                 self.pending_dir_deletions.push(path);
             }
         }

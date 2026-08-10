@@ -646,6 +646,9 @@ impl GnitzClient {
     /// DROP landing in the gap resurfaces the very "not found" `IF EXISTS` must
     /// suppress). `ALTER TABLE ... DROP CONSTRAINT IF EXISTS` sets it; the plain
     /// `DROP INDEX` statement passes `false` (drops loudly, like DROP TABLE/VIEW).
+    /// The swallow covers only the scan below finding no such index: a concurrent
+    /// DROP landing between that scan and the push surfaces the engine's
+    /// retraction-contract rejection, `if_exists` or not.
     pub fn drop_index_by_name(&mut self, index_name: &str, if_exists: bool) -> Result<(), ClientError> {
         let index_name = canon_name(index_name);
         let not_found = |name: &str| -> Result<(), ClientError> {
