@@ -3,8 +3,8 @@
 Ported from py_client/tests/test_catalog.py — only the tests not already
 covered by test_ddl.py, test_dml.py, and test_views.py.
 
-Skipped from py_client: raw system-table push tests (SCHEMA_TAB, COL_TAB,
-DEP_TAB), FK constraint tests (require allocate_table_id + raw COL_TAB push),
+Skipped from py_client: raw system-table push tests (SCHEMA_TAB, COL_TAB),
+FK constraint tests (require allocate_table_id + raw COL_TAB push),
 and ID-allocation sequence tests (allocate_table_id/schema_id not in gnitz-py
 API).
 """
@@ -93,8 +93,8 @@ class TestSchemaDDL:
         cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
                 gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
         tid = client.create_table(s1, "t", cols)
-        # A view in s2 reading s1.t (by tid) — a cross-schema dependent. This
-        # writes a DEP_TAB edge keyed by s1.t's tid, so dropping s1.t is blocked.
+        # A view in s2 reading s1.t (by tid) — a cross-schema dependent. Its
+        # circuit scans s1.t, so dropping s1.t is blocked.
         client.create_view(s2, "v", tid, gnitz.Schema(cols))
 
         # The cascade tries to drop s1.t, which the engine precheck blocks
@@ -670,3 +670,99 @@ class TestViewLifecycle:
         finally:
             client.drop_table(sn, tn)
             client.drop_schema(sn)
+
+
+# ===========================================================================
+# The catalog guards its own id space
+# ===========================================================================
+
+class TestSystemRelationGuards:
+    """The engine — not the SQL planner — must reject a mutation of a
+    system-range relation. Both paths below are shipped client bindings that
+    validate nothing on the way in."""
+
+    def _sys_relation_ids(self, client):
+        """Every system-range relation bootstrap registered under `_system`."""
+        return {r["table_id"] for r in client.scan(gnitz.TABLE_TAB)
+                if r["table_id"] < gnitz.FIRST_USER_TABLE_ID}
+
+    def test_drop_system_table_rejected(self, client):
+        before = self._sys_relation_ids(client)
+        assert before, "bootstrap registered no system relations"
+
+        with pytest.raises(gnitz.GnitzError):
+            client.drop_table("_system", "_tables")
+
+        assert self._sys_relation_ids(client) == before
+
+    def test_drop_system_schema_rejected(self, client):
+        before = self._sys_relation_ids(client)
+
+        with pytest.raises(gnitz.GnitzError):
+            client.drop_schema("_system")
+
+        # The cascade must not have retracted a single member on its way to the
+        # SCHEMA_TAB row it would have been rejected on.
+        assert self._sys_relation_ids(client) == before
+
+
+class TestViewDependencyGraph:
+    """The dependency graph the engine derives from a view's circuit: it gates
+    DROP TABLE and it drives which views tick on a source delta."""
+
+    def test_drop_base_under_live_view_rejected_then_ordered_drop_succeeds(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        tid = client.create_table(sn, "t", cols)
+        client.create_view(sn, "v", tid, gnitz.Schema(cols))
+
+        with pytest.raises(gnitz.GnitzError):
+            client.drop_table(sn, "t")
+        # The rejected drop left the table intact.
+        assert client.resolve_table(sn, "t")[0] == tid
+
+        client.drop_view(sn, "v")
+        client.drop_table(sn, "t")
+        client.drop_schema(sn)
+
+
+def test_two_source_view_maintained_from_both_sources_across_restart(own_server):
+    """A view over two base tables ticks from either source, and still does
+    after a crash restart — the rebuild and the tick fan-out read the same
+    graph."""
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+
+    conn.create_schema("s")
+    conn.execute_sql(
+        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+        schema_name="s")
+    conn.execute_sql(
+        "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+        schema_name="s")
+    conn.execute_sql(
+        "CREATE VIEW ab AS SELECT pk, val FROM a UNION ALL SELECT pk, val FROM b",
+        schema_name="s")
+
+    def view_vals(c):
+        vid = c.resolve_table("s", "ab")[0]
+        return sorted(r["val"] for r in c.scan(vid))
+
+    conn.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name="s")
+    conn.execute_sql("INSERT INTO b VALUES (2, 20)", schema_name="s")
+    assert view_vals(conn) == [10, 20], "the view must tick from both sources"
+
+    conn.close()
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
+
+    assert view_vals(conn) == [10, 20], "the recovered view keeps both sources' rows"
+    conn.execute_sql("INSERT INTO a VALUES (3, 30)", schema_name="s")
+    conn.execute_sql("INSERT INTO b VALUES (4, 40)", schema_name="s")
+    assert view_vals(conn) == [10, 20, 30, 40], (
+        "after a restart the view must still tick from both sources")
+
+    conn.close()

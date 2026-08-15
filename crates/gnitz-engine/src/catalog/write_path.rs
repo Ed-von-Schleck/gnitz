@@ -69,6 +69,23 @@ fn sys_topo_priority(tid: i64) -> u8 {
     SysFamily::from_id(tid).map_or(99, SysFamily::topo_priority)
 }
 
+/// Reject a mutation of a bootstrap-owned id in one of the catalog's id spaces
+/// (`what` names it, `first_user` is its floor). The reject is a property of
+/// the id space, not of the mutation's shape, so it covers every sign: a `-1`
+/// drops a bootstrap row, a bare `+1` aliases a bootstrap id into the caches,
+/// and a pair renames one. Runs before the CAS, so it fires whether or not the
+/// family holds a live row at that id.
+fn reject_system_id(sig: &PkSignature, what: &str, first_user: i64) -> Result<(), String> {
+    let id = sig.pk as i64;
+    if id < first_user {
+        return Err(format!(
+            "cannot {} a system {what} (id {id} < {first_user})",
+            sig.verb()
+        ));
+    }
+    Ok(())
+}
+
 impl CatalogEngine {
     // -- System table accessors ------------------------------------------------
     //
@@ -281,15 +298,16 @@ impl CatalogEngine {
     }
 
     /// §3.3: the TABLE_TAB / VIEW_TAB precheck — the shared CAS + net contract
-    /// plus the two relation-only guards: a rewrite pair on a system-range id is
-    /// rejected, and a pair's `+1` may differ from the live row only in `name`
-    /// (`name_pay`). `compare_rows_except` routes STRING/BLOB through each
-    /// side's own blob heap, so a name > 12 bytes is compared by content.
+    /// plus the two relation-only guards: no mutation of a system-range id
+    /// passes, whatever its sign, and a rewrite pair's `+1` may differ from the
+    /// live row only in `name` (`name_pay`). `compare_rows_except` routes
+    /// STRING/BLOB through each side's own blob heap, so a name > 12 bytes is
+    /// compared by content.
     ///
     /// Returns the PKs whose net is dead (`≤ 0`) — the genuine drops — so the
     /// relation drop guards re-key on net-liveness (a rename's net-live `-1` is
     /// excluded) rather than raw batch weights.
-    fn precheck_retraction_contract(
+    fn precheck_relation_signatures(
         &self,
         family: SysFamily,
         batch: &Batch,
@@ -298,14 +316,7 @@ impl CatalogEngine {
         let schema = family.schema();
         let mut net_dead: Vec<i64> = Vec::new();
         for sig in pk_signatures(batch) {
-            // A rewrite pair on a system-range id is rejected up front — before
-            // the CAS, so it fires regardless of whether a live row exists.
-            if sig.is_pair() && (sig.pk as i64) < FIRST_USER_TABLE_ID {
-                return Err(format!(
-                    "cannot ALTER a system relation (id {} < {FIRST_USER_TABLE_ID})",
-                    sig.pk
-                ));
-            }
+            reject_system_id(&sig, "relation", FIRST_USER_TABLE_ID)?;
 
             let (live, net) = self.check_cas_and_net(family, batch, &sig, "system-catalog row")?;
 
@@ -341,12 +352,14 @@ impl CatalogEngine {
     ///   `{name, is_hidden, is_nullable}` must match, and `is_hidden` /
     ///   `is_nullable` may change only `0→1` (forward path; compensation replays
     ///   `1→0` through `submit_local`, which bypasses precheck).
+    /// - **Owner guard** — every rewrite pair, RENAME included, requires a
+    ///   registered user base table owner (not a view, not system-range).
     /// - **Transition-scoped guards** — scoped to the transition rather than
-    ///   blanket, which would reject RENAME: a `name`-only pair (RENAME COLUMN)
-    ///   is always accepted; an `is_hidden 0→1` (DROP COLUMN) or
-    ///   `is_nullable 0→1` (DROP NOT NULL) pair requires the owner to be a
-    ///   registered user base table (not a view, not system-range) with **no
-    ///   dependent views**, and the column not to be a PK column.
+    ///   blanket, which would reject RENAME: an `is_hidden 0→1` (DROP COLUMN) or
+    ///   `is_nullable 0→1` (DROP NOT NULL) pair additionally requires **no
+    ///   dependent views** and that the column not be a PK column; a `name`-only
+    ///   pair (RENAME COLUMN) is accepted with neither (views bind columns by
+    ///   ordinal, and renaming a PK column is legal).
     /// - **Unpaired `-1`** on a registered owner is rejected (physical column
     ///   removal does not exist); **unpaired `+1`** is rejected (no column-append
     ///   feature). An unregistered owner is a live CREATE TABLE COL append (the
@@ -408,15 +421,15 @@ impl CatalogEngine {
                         return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
                     }
 
+                    // Every rewrite pair — RENAME included — needs a user base
+                    // table owner. A view registers as `RelationKind::View` and
+                    // a system family as `SystemCatalog`, so both fail here.
+                    if !is_base {
+                        return Err(format!("cannot ALTER a column of {owner_id}: not a user base table"));
+                    }
+
                     let is_drop = (hid_old == 0 && hid_new == 1) || (null_old == 0 && null_new == 1);
                     if is_drop {
-                        // Owner must be a registered user base table; the column
-                        // must not be a PK column.
-                        if !is_base || owner_id < FIRST_USER_TABLE_ID {
-                            return Err(format!(
-                                "cannot DROP COLUMN / DROP NOT NULL on a column of {owner_id}: not a user base table"
-                            ));
-                        }
                         let col_idx = gnitz_wire::unpack_col_id(pk as u64).1 as u32;
                         if owner_schema.pk_indices().contains(&col_idx) {
                             return Err("cannot DROP COLUMN / DROP NOT NULL on a primary-key column".into());
@@ -432,9 +445,6 @@ impl CatalogEngine {
                             ));
                         }
                     }
-                    // name-only / no-op pair (RENAME COLUMN, already-nullable DROP
-                    // NOT NULL): accepted with no further guard — always safe,
-                    // including with dependent views (views bind columns by ordinal).
                 }
                 (Some(_), None) => {
                     return Err(
@@ -534,11 +544,9 @@ impl CatalogEngine {
                 self.precheck_column_family(batch)
             }
             SysFamily::Index => self.precheck_index_family(batch),
-            SysFamily::ViewDep
-            | SysFamily::Sequence
-            | SysFamily::CircuitNodes
-            | SysFamily::CircuitEdges
-            | SysFamily::CircuitNodeColumns => Ok(()),
+            SysFamily::Sequence | SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => {
+                Ok(())
+            }
         }
     }
 
@@ -563,6 +571,7 @@ impl CatalogEngine {
     /// the whole guard.
     fn precheck_schema_family(&mut self, batch: &Batch) -> Result<(), String> {
         for sig in pk_signatures(batch) {
+            reject_system_id(&sig, "schema", FIRST_USER_SCHEMA_ID)?;
             self.check_cas_and_net(SysFamily::Schema, batch, &sig, "system-catalog schema")?;
         }
         for i in 0..batch.count {
@@ -593,7 +602,7 @@ impl CatalogEngine {
         let is_table = family == SysFamily::Table;
         let kind = if is_table { "table" } else { "view" };
         // TABLE_TAB and VIEW_TAB agree on the name slot (asserted in gnitz-wire).
-        let net_dead = self.precheck_retraction_contract(family, batch, TABTAB_PAY_NAME)?;
+        let net_dead = self.precheck_relation_signatures(family, batch, TABTAB_PAY_NAME)?;
 
         for i in 0..batch.count {
             if batch.get_weight(i) <= 0 {

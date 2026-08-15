@@ -46,17 +46,18 @@ pub const WAL_HEADER_SIZE: usize = 32;
 /// block-layout change or a system-family column-shape change: a SAL frame
 /// carries its own schema block and replay decodes against that, so nothing but
 /// this word rejects a stale frame — or an old client's catalog writes.
-pub const WAL_FORMAT_VERSION: u32 = 7;
+pub const WAL_FORMAT_VERSION: u32 = 8;
 
-/// A system family's column shape is part of what these two words guard, and
-/// nothing else notices it changing — so pin it. If this fails, bump
-/// `WAL_FORMAT_VERSION` above and `SHARD_VERSION` in the engine's
-/// `storage::repr::layout`, then paste the reported digest here.
+/// A system family's column shape is part of what this word guards, and nothing
+/// else notices it changing — so pin it. If this fails, bump
+/// `WAL_FORMAT_VERSION` above, then paste the reported digest here. The engine's
+/// `storage::repr::layout` pins the same digest to `SHARD_VERSION`; bump that
+/// too.
 #[test]
 fn stored_shape_is_pinned_to_the_format_words() {
     assert_eq!(
         (crate::SYS_SCHEMA_DIGEST, WAL_FORMAT_VERSION),
-        (6289364944729779012, 7),
+        (5353188239287564337, 8),
         "system-family column shapes changed"
     );
 }

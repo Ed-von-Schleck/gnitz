@@ -235,18 +235,16 @@ impl CatalogEngine {
             .get(&qualified)
             .ok_or_else(|| format!("View does not exist: {qualified}"))?;
 
+        // Clears the plan caches only — the view stays registered, so the
+        // cascade's `dag.tables` guard still resolves it.
         self.dag.invalidate(vid);
 
         // Retract only the VIEW_TAB row. Its -1 fires hook_view_register, which
-        // cascades cascade_retract_circuit_and_deps (sys_circuit_* AND
-        // sys_view_deps) + cascade_retract_columns, and queues the view
-        // directory for deferred deletion (the executor removes it after the DDL
-        // zone is durable — no synchronous delete that would race the WAL
-        // fdatasync). dag.invalidate(vid) only clears the plan caches — it does
-        // NOT unregister the view — so the cascade's dag.tables.contains_key(vid)
-        // guard holds and the -1 cleans up identically on replay and worker sync.
-        // The view's sys_view_deps rows are retracted by that cascade, so no
-        // separate DEP_TAB retraction is needed here.
+        // cascades cascade_retract_circuit + cascade_retract_columns and queues
+        // the view directory for deferred deletion (the executor removes it
+        // after the DDL zone is durable, so no delete races the WAL fdatasync).
+        // Keeping the cascade in the hook makes replay and worker sync clean up
+        // identically.
         self.submit_retraction(SysFamily::View, vid as u128)
     }
 
@@ -608,23 +606,6 @@ impl CatalogEngine {
     ) -> Result<(), String> {
         let batch = self.build_col_batch(owner_id, kind, col_defs, 1);
         self.submit(SysFamily::Column, batch)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn write_view_deps(&mut self, vid: i64, dep_ids: &[i64]) -> Result<(), String> {
-        let schema = SysFamily::ViewDep.schema();
-        let mut bb = BatchBuilder::new(schema);
-        for &dep_tid in dep_ids {
-            // Compound PK (view_id, dep_table_id); dep_view_id is the only payload.
-            bb.begin_row(pack_view_pk(vid, dep_tid as u64), 1);
-            bb.put_u64(0); // dep_view_id
-            bb.end_row();
-        }
-        let batch = bb.finish();
-        if batch.count > 0 {
-            self.submit(SysFamily::ViewDep, batch)?;
-        }
-        Ok(())
     }
 }
 

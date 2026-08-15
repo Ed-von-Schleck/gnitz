@@ -6,7 +6,16 @@ pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// system family needs a bump here too, not just a header/region layout change.
 /// A shard written under a wider schema passes the per-region size and checksum
 /// checks; nothing but this word rejects it.
-pub(crate) const SHARD_VERSION: u64 = 9;
+pub(crate) const SHARD_VERSION: u64 = 10;
+
+/// Pin the system-family column shapes to the version word above, the way
+/// `gnitz_wire::wal` pins them to `WAL_FORMAT_VERSION`. Nothing else notices a
+/// shape change. If this fails, bump `SHARD_VERSION` and paste the reported
+/// digest here.
+const _: () = assert!(
+    gnitz_wire::SYS_SCHEMA_DIGEST == 5353188239287564337 && SHARD_VERSION == 10,
+    "system-family column shapes changed: bump SHARD_VERSION"
+);
 pub(crate) const HEADER_SIZE: usize = 64;
 pub(crate) const DIR_ENTRY_SIZE: usize = 32;
 pub(crate) const ALIGNMENT: usize = 64;

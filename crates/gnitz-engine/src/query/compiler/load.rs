@@ -14,7 +14,7 @@ use gnitz_wire::col_index_in as cidx;
 // (view_id, sub); the denormalised data columns follow. A renamed/reordered wire
 // column shifts these automatically or fails `col_index_in`'s const `panic!`.
 const NODES_COL_NODE_ID: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "node_id");
-const NODES_COL_OPCODE_NEW: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "opcode");
+const NODES_COL_OPCODE: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "opcode");
 const NODES_COL_SOURCE_TABLE: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "source_table");
 const NODES_COL_EXPR_PROGRAM: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "expr_program");
 const EDGES_COL_DST_NODE: usize = cidx(gnitz_wire::CIRCUIT_EDGES_COLS, "dst_node");
@@ -35,6 +35,31 @@ fn open_system_cursor(table: *mut Table) -> Option<ReadCursor> {
     }
     let t = unsafe { &*table };
     Some(t.open_cursor())
+}
+
+/// Visit every `(view_id, source_table)` scan edge in the CircuitNodes store —
+/// one call per `ScanDelta` node carrying a source, the same rows `load_circuit`
+/// turns into `OpNode::ScanDelta`. Repeats are not filtered; the caller dedups.
+pub(crate) fn for_each_scan_edge(sys_nodes: *mut Table, mut f: impl FnMut(i64, i64)) {
+    let Some(mut cur) = open_system_cursor(sys_nodes) else {
+        return;
+    };
+    // No prefix — every view's nodes, in view_id order.
+    cur.for_each_positive_with_prefix(&[], |ch| {
+        if ch.read_i64(NODES_COL_OPCODE) != gnitz_wire::OPCODE_SCAN_DELTA as i64
+            || ch.col_is_null(NODES_COL_SOURCE_TABLE)
+        {
+            return;
+        }
+        let source = ch.read_i64(NODES_COL_SOURCE_TABLE);
+        if source <= 0 {
+            return;
+        }
+        // Compound PK `(view_id, node_id)`: view_id is the leading big-endian
+        // 8 bytes of the 16-byte PK region.
+        let view_id = u64::from_be_bytes(ch.current_pk_bytes()[0..8].try_into().unwrap()) as i64;
+        f(view_id, source);
+    });
 }
 
 /// Non-negative-`i32` node-id gate: an id that would truncate into a colliding
@@ -94,7 +119,7 @@ pub(crate) fn load_circuit(
             invalid = true;
             return;
         };
-        let opcode = ch.read_i64(NODES_COL_OPCODE_NEW) as u64;
+        let opcode = ch.read_i64(NODES_COL_OPCODE) as u64;
 
         let src_tab: Option<u64> = if ch.col_is_null(NODES_COL_SOURCE_TABLE) {
             None

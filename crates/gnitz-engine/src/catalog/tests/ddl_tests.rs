@@ -624,15 +624,15 @@ fn test_drop_view_removes_directory() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_drop_view_cascades_columns_and_view_deps ────────────────────
+// ── test_drop_view_cascades_columns_and_circuit_rows ─────────────────
 // DROP VIEW retracts only the VIEW_TAB row; the cascade in hook_view_register
-// must clean up BOTH the view's sys_columns rows and its sys_view_deps rows.
-// The sys_view_deps assertion is the regression guard for removing drop_view's
-// manual dep retraction — it proves the VIEW_TAB cascade
-// (cascade_retract_circuit_and_deps) still clears the dep rows on its own.
+// must clean up BOTH the view's sys_columns rows and its circuit rows. The
+// circuit assertion is the regression guard for removing drop_view's manual
+// retraction — it proves the VIEW_TAB cascade (cascade_retract_circuit) still
+// clears the circuit rows on its own.
 
 #[test]
-fn test_drop_view_cascades_columns_and_view_deps() {
+fn test_drop_view_cascades_columns_and_circuit_rows() {
     let dir = temp_dir("drop_view_cascade");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
@@ -640,28 +640,26 @@ fn test_drop_view_cascades_columns_and_view_deps() {
         .create_table("public.base", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
 
-    // Baseline: system + base-table column rows; no view-dep rows yet.
+    // Baseline: system + base-table column rows; no circuit rows yet.
     let base_cols = count_records(engine.sys_store_mut(SysFamily::Column));
-    let base_deps = count_records(engine.sys_store_mut(SysFamily::ViewDep));
+    let base_nodes = count_records(engine.sys_store_mut(SysFamily::CircuitNodes));
 
-    // Register a view (column records precede the VIEW_TAB row) and a
-    // dependency row on the base table.
+    // Register a view (column and circuit records precede the VIEW_TAB row).
     let vid = engine.next_table_id;
     let view_cols = vec![col_def("id", type_code::U64)];
+    write_identity_circuit(&mut engine, vid, base_tid, None);
     engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
 
     let batch = build_view_tab_row(vid, "depview", "SELECT id FROM base");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
-
-    engine.write_view_deps(vid, &[base_tid]).unwrap();
 
     assert!(
         count_records(engine.sys_store_mut(SysFamily::Column)) > base_cols,
         "view column rows must be present before drop"
     );
     assert!(
-        count_records(engine.sys_store_mut(SysFamily::ViewDep)) > base_deps,
-        "view-dep row must be present before drop"
+        count_records(engine.sys_store_mut(SysFamily::CircuitNodes)) > base_nodes,
+        "circuit node rows must be present before drop"
     );
 
     // Drop the view: the VIEW_TAB -1 cascade must retract both families.
@@ -674,9 +672,9 @@ fn test_drop_view_cascades_columns_and_view_deps() {
         "sys_columns must return to baseline after drop_view (column cascade)"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::ViewDep)),
-        base_deps,
-        "sys_view_deps must return to baseline after drop_view (dep cascade)"
+        count_records(engine.sys_store_mut(SysFamily::CircuitNodes)),
+        base_nodes,
+        "circuit rows must return to baseline after drop_view (circuit cascade)"
     );
 
     engine.close();
@@ -843,7 +841,6 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     ] {
         write_identity_circuit(&mut engine, vid, src, None);
         engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
-        engine.write_view_deps(vid, &[src]).unwrap();
     }
 
     // One VIEW_TAB batch, consumers first — the dependency-reversed row order.

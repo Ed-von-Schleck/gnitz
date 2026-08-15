@@ -207,22 +207,82 @@ fn duplicate_live_head_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The guard keys on the id space, not the batch shape: every sign is rejected,
+/// on both relation families, at an id the SQL layer cannot even name. Each
+/// batch reproduces the bootstrap row byte-for-byte where it carries a `-1`, so
+/// the CAS would pass and only the id-space guard can stop it.
 #[test]
-fn system_range_rewrite_rejected() {
+fn system_range_mutations_rejected() {
     let dir = temp_dir("alter_sysrange");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    // A rewrite pair on a system-range tid, submitted directly to precheck_family
-    // (unreachable via the SQL layer). The system-range guard fires before the CAS.
-    let sys_tid: i64 = 5; // < FIRST_USER_TABLE_ID
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-    for (weight, name) in [(-1i64, "a"), (1i64, "b")] {
-        push_table_tab_row(&mut bb, sys_tid, PUBLIC_SCHEMA_ID, name, pack_pk_cols(&[0]), 0, weight);
+
+    let table_drop = {
+        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+        push_table_tab_row(&mut bb, IDX_TAB_ID, SYSTEM_SCHEMA_ID, "_indices", 0, 0, -1);
+        bb.finish()
+    };
+    let table_rename = {
+        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+        push_table_tab_row(&mut bb, IDX_TAB_ID, SYSTEM_SCHEMA_ID, "_indices", 0, 0, -1);
+        push_table_tab_row(&mut bb, IDX_TAB_ID, SYSTEM_SCHEMA_ID, "renamed", 0, 0, 1);
+        bb.finish()
+    };
+    let view_rename = {
+        let mut bb = BatchBuilder::new(SysFamily::View.schema());
+        push_view_tab_row(&mut bb, -1, IDX_TAB_ID, "a", "");
+        push_view_tab_row(&mut bb, 1, IDX_TAB_ID, "b", "");
+        bb.finish()
+    };
+    // A bare `+1` on VIEW_TAB at a system TABLE_TAB id: VIEW_TAB holds no live
+    // row there, so the net test passes and the caches would alias
+    // `_system._indices` away.
+    let view_create = build_view_tab_row(IDX_TAB_ID, "v", "SELECT 1");
+
+    let members_before = engine.schema_member_count(PUBLIC_SCHEMA_ID);
+    for (family, batch, verb) in [
+        (SysFamily::Table, &table_drop, "DROP"),
+        (SysFamily::Table, &table_rename, "ALTER"),
+        (SysFamily::View, &view_rename, "ALTER"),
+        (SysFamily::View, &view_create, "CREATE"),
+    ] {
+        let err = engine.ingest_to_family(family.info().id, batch).unwrap_err();
+        assert!(err.contains(&format!("cannot {verb} a system relation")), "{err}");
     }
-    let err = engine.precheck_family(SysFamily::Table, &bb.finish()).unwrap_err();
-    assert!(
-        err.contains("system relation"),
-        "a rewrite on a system-range id must be rejected: {err}"
+
+    // Nothing was torn down or aliased on the way to the reject.
+    for info in &SYS_FAMILIES {
+        assert!(engine.dag.tables.contains_key(&info.id), "{} unregistered", info.name);
+    }
+    assert!(engine.pending_dir_deletions.is_empty());
+    assert_eq!(
+        engine.caches.entity_by_id.get(&IDX_TAB_ID),
+        Some(&("_system".to_string(), "_indices".to_string())),
+        "the system relation must still resolve under its own name"
     );
+    assert_eq!(engine.caches.entity_by_qname.get("public.v"), None);
+    assert_eq!(engine.schema_member_count(PUBLIC_SCHEMA_ID), members_before);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The same guard on the schema id space: `public` and `_system` are bootstrap
+/// rows, so no DROP or rename of one passes.
+#[test]
+fn system_range_schema_mutations_rejected() {
+    let dir = temp_dir("alter_sysrange_schema");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    for sid in [SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID] {
+        let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
+        bb.begin_row(sid as u128, -1);
+        bb.put_string("gone");
+        bb.end_row();
+        let err = engine.ingest_to_family(SCHEMA_TAB_ID, &bb.finish()).unwrap_err();
+        assert!(err.contains("cannot DROP a system schema"), "{err}");
+        assert!(engine.caches.schema_by_id.contains_key(&sid), "schema {sid} dropped");
+    }
+
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -269,6 +329,81 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
         cols_before - 2,
         "DROP TABLE must cascade-retract both columns"
     );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── The column-ALTER owner guard covers every rewrite pair ──────────────────
+
+fn rename_to(new_name: &str) -> impl FnOnce(&mut ColumnDef) + '_ {
+    move |c: &mut ColumnDef| c.name = new_name.to_string()
+}
+
+/// RENAME COLUMN on a view and on a system table — neither is a user base
+/// table, and the SQL planner is not the trust boundary that stops them.
+#[test]
+fn column_rename_on_non_base_owner_rejected() {
+    let dir = temp_dir("alter_col_owner");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![col_def("id", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let vid = register_identity_view(&mut engine, tid, "v", &cols);
+
+    let err = engine
+        .precheck_family(
+            SysFamily::Column,
+            &col_alter_pair(vid, OWNER_KIND_VIEW, 0, &cols[0], rename_to("id2")),
+        )
+        .unwrap_err();
+    assert!(err.contains("not a user base table"), "view owner: {err}");
+
+    // A system table's own COL_TAB self-description row, read back from what
+    // bootstrap wrote so the `-1` cannot drift from it.
+    let sys_col = engine.scan_column_defs(IDX_TAB_ID, true).unwrap().swap_remove(0);
+    let err = engine
+        .precheck_family(
+            SysFamily::Column,
+            &col_alter_pair(IDX_TAB_ID, OWNER_KIND_TABLE, 0, &sys_col, rename_to("renamed")),
+        )
+        .unwrap_err();
+    assert!(err.contains("not a user base table"), "system owner: {err}");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The two guards that stay inside `is_drop`: a rename is legal on a PK column
+/// and on a table with dependent views (views bind columns by ordinal).
+#[test]
+fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
+    let dir = temp_dir("alter_col_rename_ok");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let vid = register_identity_view(&mut engine, tid, "v", &cols);
+    assert_eq!(
+        engine.dag.get_dep_map().get(&tid),
+        Some(&vec![vid]),
+        "precondition: the table has a dependent view"
+    );
+
+    for (col_idx, new_name) in [(0usize, "id2"), (1, "val2")] {
+        engine
+            .precheck_family(
+                SysFamily::Column,
+                &col_alter_pair(
+                    tid,
+                    OWNER_KIND_TABLE,
+                    col_idx as i64,
+                    &cols[col_idx],
+                    rename_to(new_name),
+                ),
+            )
+            .expect("renaming a column with dependent views is legal");
+    }
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

@@ -48,7 +48,7 @@ impl CatalogEngine {
     //   * Live DDL: every catalog write arrives as one `FLAG_DDL_TXN` bundle,
     //     and the server ingest loop (`handle_ddl_txn`) applies the bundle's
     //     families in ascending `SysFamily::topo_priority` order under one zone —
-    //     COL_TAB(1) before the TABLE_TAB(6)/VIEW_TAB(7) register hook that reads
+    //     COL_TAB before the TABLE_TAB/VIEW_TAB register hook that reads
     //     it. The client send order is irrelevant; the server sorts.
     //   * Wire: the SAL is a single FIFO; worker `FLAG_DDL_SYNC` dispatch
     //     preserves master broadcast order.
@@ -100,17 +100,17 @@ impl CatalogEngine {
                 self.apply_index_caches(batch)?;
                 self.hook_index_register(batch)?;
             }
-            SysFamily::ViewDep => {
-                self.dag.invalidate_dep_map();
-            }
             // Restore the user-sequence high-water from a durably-committed or
             // SAL-replayed advance so a committed SERIAL id is never re-issued.
             SysFamily::Sequence => {
                 self.hook_sequence_register(batch)?;
             }
-            // No cache/side-effect reactions: the circuit graph is loaded by
+            // The dependency map is derived from the `ScanDelta` nodes, so a
+            // circuit-node write restates the graph. Edges and node columns
+            // carry no dependency and the circuit itself is loaded by
             // `load_circuit`, not by hooks.
-            SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => {}
+            SysFamily::CircuitNodes => self.dag.invalidate_dep_map(),
+            SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => {}
         }
         Ok(())
     }
@@ -304,7 +304,7 @@ impl CatalogEngine {
 
     /// Tear a relation out of the registry — the shared net-dead `-1` half of
     /// the two register hooks. `cascade` retracts the dependent system rows the
-    /// relation owns (indices/columns for a table, circuit/deps/columns for a
+    /// relation owns (indices/columns for a table, circuit/columns for a
     /// view) and runs before the unregister, while the entry is still resolvable.
     ///
     /// The version counters are purged AFTER the cascade: its own
@@ -374,8 +374,8 @@ impl CatalogEngine {
                     // Under atomic CREATE the COL_TAB rows are applied via the
                     // enqueuing path, so they are in compensation's drained set and
                     // negated directly. CREATE rollback replays descending topo, so
-                    // this TABLE_TAB(6) -1 fires its cascade BEFORE the drained
-                    // COL_TAB(1) -1: an unguarded cascade_retract_columns would
+                    // this TABLE_TAB -1 fires its cascade BEFORE the drained
+                    // COL_TAB -1: an unguarded cascade_retract_columns would
                     // retract the columns, then the drained -1 would retract them
                     // again → a net -1 ghost. Skip it during rollback so
                     // compensation's direct negate is the sole retractor. (The
@@ -574,16 +574,16 @@ impl CatalogEngine {
                 // A genuine drop (net-dead): a rename pair's `-1` is net-live, so
                 // this teardown is skipped and the view registration survives.
                 self.drop_relation(vid, |s| {
-                    // Under atomic CREATE the circuit/dep/COL_TAB rows are applied
+                    // Under atomic CREATE the circuit/COL_TAB rows are applied
                     // via the enqueuing path, so they are in compensation's drained
                     // set and negated directly. CREATE rollback replays descending
-                    // topo, so this VIEW_TAB(7) -1 fires its cascade BEFORE the
-                    // drained circuit(3–5)/DEP(2)/COL(1) -1s: an unguarded cascade
+                    // topo, so this VIEW_TAB -1 fires its cascade BEFORE the
+                    // drained circuit/COL -1s: an unguarded cascade
                     // would retract them, then the drained -1s would retract them
                     // again → a net -1 ghost. Skip it during rollback so
                     // compensation's direct negate is the sole retractor.
                     if !s.ctx.in_rollback() {
-                        s.cascade_retract_circuit_and_deps(vid)?;
+                        s.cascade_retract_circuit(vid)?;
                         s.cascade_retract_columns(vid)?;
                     }
                     Ok(())
@@ -593,12 +593,11 @@ impl CatalogEngine {
         Ok(())
     }
 
-    fn cascade_retract_circuit_and_deps(&mut self, vid: i64) -> Result<(), String> {
+    fn cascade_retract_circuit(&mut self, vid: i64) -> Result<(), String> {
         for family in [
             SysFamily::CircuitNodes,
             SysFamily::CircuitEdges,
             SysFamily::CircuitNodeColumns,
-            SysFamily::ViewDep,
         ] {
             let schema = family.schema();
             // These families use the compound PK `(view_id, sub)`, so one view's

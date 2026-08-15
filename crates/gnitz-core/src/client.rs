@@ -1,6 +1,4 @@
-use crate::connection::{
-    MultiScanResult, ScanResult, Session, COL_TAB, DEP_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
-};
+use crate::connection::{MultiScanResult, ScanResult, Session, COL_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB};
 use crate::error::ClientError;
 use crate::protocol::types::type_code_from_u64;
 use crate::protocol::{
@@ -13,8 +11,8 @@ use std::sync::Arc;
 const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
 use crate::circuit::Circuit;
 use crate::types::{
-    circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, dep_tab_schema,
-    idx_tab_schema, schema_tab_schema, table_tab_schema, view_tab_schema,
+    circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, idx_tab_schema,
+    schema_tab_schema, table_tab_schema, view_tab_schema,
 };
 use gnitz_wire::{
     CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, COLTAB_COL_COL_IDX, COLTAB_COL_FK_COL_IDX,
@@ -1093,12 +1091,13 @@ impl GnitzClient {
 
     /// Create every view in `views` in one atomic `DDL_TXN`. Row order carries no
     /// meaning — the engine orders registration and backfill by the dependencies it
-    /// reads out of DEP_TAB. Returns the vids in input order.
+    /// derives from the `ScanDelta` nodes of the circuit rows. Returns the vids in
+    /// input order.
     ///
     /// **One `BatchAppender` per family spans all views** — the engine's derived
     /// per-family lists (`family_pks_by_sign`, `families.find`) read only the
-    /// first block per tid, so a chain must merge every view's COL/DEP/circuit
-    /// rows into a single batch per family and one all-`+1` VIEW_TAB batch in
+    /// first block per tid, so a chain must merge every view's COL/circuit rows
+    /// into a single batch per family and one all-`+1` VIEW_TAB batch in
     /// input order. A single `push_ddl_txn` then commits — or, via the engine's
     /// per-family precheck/compensate loop, rolls back — the whole chain.
     ///
@@ -1173,14 +1172,12 @@ impl GnitzClient {
         // always non-empty; the circuit families are included only if some view
         // contributed rows.
         let col_s = col_tab_schema();
-        let dep_s = dep_tab_schema();
         let nodes_s = circuit_nodes_schema();
         let edges_s = circuit_edges_schema();
         let ncol_s = circuit_node_columns_schema();
         let view_s = view_tab_schema();
 
         let mut col_batch = ZSetBatch::new(col_s);
-        let mut dep_batch = ZSetBatch::new(dep_s);
         let mut nodes_batch = ZSetBatch::new(nodes_s);
         let mut edges_batch = ZSetBatch::new(edges_s);
         let mut ncol_batch = ZSetBatch::new(ncol_s);
@@ -1188,7 +1185,6 @@ impl GnitzClient {
 
         {
             let mut col_a = BatchAppender::new(&mut col_batch, col_s);
-            let mut dep_a = BatchAppender::new(&mut dep_batch, dep_s);
             let mut nodes_a = BatchAppender::new(&mut nodes_batch, nodes_s);
             let mut edges_a = BatchAppender::new(&mut edges_batch, edges_s);
             let mut ncol_a = BatchAppender::new(&mut ncol_batch, ncol_s);
@@ -1204,32 +1200,19 @@ impl GnitzClient {
                 // 1. Column records.
                 append_col_rows(&mut col_a, vid, OWNER_KIND_VIEW, &pv.output_columns)?;
 
-                // 2. Dependency records — every ScanDelta source_table.
+                // 2–4. Materialise the typed circuit into the three-table bundle.
                 //
-                // CONVERGENCE INVARIANT (all circuit-PK packings below too): the
-                // client packs view_id in the LOW u128 half while the engine's
-                // `pack_view_pk` packs it in the HIGH half. These produce the
-                // IDENTICAL view_id-major big-endian at-rest OPK image only because
-                // the client's multi-column `PkColumn::Bytes` arm OPK-encodes each
-                // 8-byte PK column independently (low u128 bytes → first column)
-                // while the engine writes the whole u128 big-endian — byte-order
-                // duals that agree only because every circuit-PK column is exactly
-                // 8 bytes and unsigned. `load_circuit` / `retract_rows_by_view`
-                // prefix-seek on `view_id.to_be_bytes()` and depend on this. Do NOT
-                // "align" the two packings: flipping the client to `(vid << 64) |
-                // sub` moves `sub` into the leading at-rest bytes and breaks every
-                // view-load prefix seek.
-                for dep_tid in pv.circuit.dependencies() {
-                    // Compound PK (view_id, dep_table_id): low 8 bytes = view_id.
-                    let pk = (vid as u128) | ((dep_tid as u128) << 64);
-                    dep_a.add_row(pk, 1).u64_val(0); // dep_view_id
-                }
-
-                // 3–5. Materialise the typed circuit into the three-table bundle.
+                // Every circuit PK in `append_circuit_rows` is `(view_id, sub)`
+                // with view_id in the LOW u128 half: the multi-column
+                // `PkColumn::Bytes` arm OPK-encodes each 8-byte column
+                // independently, low bytes first, so view_id lands in the
+                // leading at-rest bytes. The engine prefix-seeks a view's rows
+                // on `view_id.to_be_bytes()`; packing `(vid << 64) | sub`
+                // instead puts `sub` there and breaks every view load.
                 let rows = pv.circuit.into_rows();
                 append_circuit_rows(&mut nodes_a, &mut edges_a, &mut ncol_a, vid, &rows);
 
-                // 6. View record — the VIEW_TAB register hook triggers server-side
+                // 5. View record — the VIEW_TAB register hook triggers server-side
                 // compilation. Encode the view PK with the shared wire packer so the
                 // engine catalog decodes it identically to a TABLE_TAB PK.
                 let pk_packed = gnitz_wire::pack_pk_cols(&pv.pk_cols);
@@ -1252,9 +1235,6 @@ impl GnitzClient {
         // re-sorts by topo priority anyway.
         let mut families: Vec<(u64, &Schema, ZSetBatch)> = Vec::new();
         families.push((COL_TAB, col_s, col_batch));
-        if !dep_batch.is_empty() {
-            families.push((DEP_TAB, dep_s, dep_batch));
-        }
         if !nodes_batch.is_empty() {
             families.push((CIRCUIT_NODES_TAB, nodes_s, nodes_batch));
         }

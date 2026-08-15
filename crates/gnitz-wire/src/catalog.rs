@@ -62,8 +62,8 @@ pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
 /// where the payload index collapses to `col_index_in(..) - 1`. Every list this
 /// is called with is one (`SCHEMA_TAB`, `TABLE_TAB`, `VIEW_TAB`, `COL_TAB`,
 /// `IDX_TAB`, `SEQ_TAB`, and the IPC control block); the compound-PK lists
-/// (`DEP_TAB`, the circuit families) renumber around *every* PK position, so
-/// the closed form does not hold for them and this must not be used there. The
+/// (the circuit families) renumber around *every* PK position, so the closed
+/// form does not hold for them and this must not be used there. The
 /// `assert!` rejects the PK column itself, and `col_index_in`'s own const-eval
 /// panic covers a renamed column — both at compile time.
 pub(crate) const fn pay_index_in(cols: &[WireSysCol], name: &str) -> usize {
@@ -88,8 +88,6 @@ pub const VIEW_TAB_PK: &[u32] = LEADING_COL_PK;
 pub const COL_TAB_PK: &[u32] = LEADING_COL_PK;
 pub const IDX_TAB_PK: &[u32] = LEADING_COL_PK;
 pub const SEQ_TAB_PK: &[u32] = LEADING_COL_PK;
-/// `(view_id, dep_table_id)`.
-pub const DEP_TAB_PK: &[u32] = &[0, 1];
 
 pub const SCHEMA_TAB_COLS: &[WireSysCol] = &[
     col("schema_id", TypeCode::U64, false),
@@ -145,13 +143,6 @@ pub const IDX_TAB_COLS: &[WireSysCol] = &[
     col("source_col_idx", TypeCode::U64, false),
     col("name", TypeCode::String, false),
     col("is_unique", TypeCode::U64, false),
-];
-
-// PK = columns [0, 1]; dep_view_id is the only payload.
-pub const DEP_TAB_COLS: &[WireSysCol] = &[
-    col("view_id", TypeCode::U64, false),
-    col("dep_table_id", TypeCode::U64, false),
-    col("dep_view_id", TypeCode::U64, false),
 ];
 
 /// The reply **schema block**'s column shape. Not a system table — it is the
@@ -325,7 +316,6 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
     h = fold_family(h, COL_TAB_COLS, COL_TAB_PK);
     h = fold_family(h, IDX_TAB_COLS, IDX_TAB_PK);
     h = fold_family(h, SEQ_TAB_COLS, SEQ_TAB_PK);
-    h = fold_family(h, DEP_TAB_COLS, DEP_TAB_PK);
     h = fold_family(h, CIRCUIT_NODES_COLS, CIRCUIT_FAMILY_PK);
     h = fold_family(h, CIRCUIT_EDGES_COLS, CIRCUIT_FAMILY_PK);
     h = fold_family(h, CIRCUIT_NODE_COLUMNS_COLS, CIRCUIT_FAMILY_PK);
@@ -351,7 +341,6 @@ pub const TABLE_TAB: u64 = 2;
 pub const VIEW_TAB: u64 = 3;
 pub const COL_TAB: u64 = 4;
 pub const IDX_TAB: u64 = 5;
-pub const DEP_TAB: u64 = 6;
 pub const SEQ_TAB: u64 = 7;
 pub const CIRCUIT_NODES_TAB: u64 = 11;
 pub const CIRCUIT_EDGES_TAB: u64 = 12;
@@ -810,7 +799,6 @@ mod tests {
             ("_columns", COL_TAB_COLS, COL_TAB_PK),
             ("_indices", IDX_TAB_COLS, IDX_TAB_PK),
             ("_sequences", SEQ_TAB_COLS, SEQ_TAB_PK),
-            ("_view_deps", DEP_TAB_COLS, DEP_TAB_PK),
             ("_circuit_nodes", CIRCUIT_NODES_COLS, CIRCUIT_FAMILY_PK),
             ("_circuit_edges", CIRCUIT_EDGES_COLS, CIRCUIT_FAMILY_PK),
             ("_circuit_node_columns", CIRCUIT_NODE_COLUMNS_COLS, CIRCUIT_FAMILY_PK),

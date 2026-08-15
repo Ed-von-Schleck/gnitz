@@ -987,7 +987,7 @@ mod tests {
     use proptest::test_runner::TestCaseError;
 
     /// Client `encode_ddl_txn` → server `decode_ddl_txn` → `Batch::decode_from_wal_block`
-    /// against the server `sys_tab_schema`, for 1-, 2-, 3-, and 6-family bundles.
+    /// against the server `sys_tab_schema`, for 1-, 2-, 3-, and 5-family bundles.
     /// This is the one place a cross-crate sys-schema drift or a silent misframe
     /// can hide, so it encodes with the *client* schemas and decodes with the
     /// *server* schemas — the two crates hand-keep those identical.
@@ -995,12 +995,11 @@ mod tests {
     fn ddl_txn_roundtrip_client_to_server() {
         use gnitz_core::protocol::types::{BatchAppender, Schema, ZSetBatch};
         use gnitz_core::types::{
-            circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, dep_tab_schema,
-            idx_tab_schema, table_tab_schema, view_tab_schema,
+            circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, idx_tab_schema,
+            table_tab_schema, view_tab_schema,
         };
         use gnitz_wire::{
-            COL_TAB, DEP_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB,
-            {CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB},
+            COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB, {CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB},
         };
 
         // Build a small COL_TAB batch for `oid` with `n` U64 columns.
@@ -1050,7 +1049,7 @@ mod tests {
 
         // Verify a bundle roundtrips: family count, order (tid), per-row weight,
         // and — for single-PK families — the PK. `check_pk` skips the compound-PK
-        // circuit/dep families whose engine `get_pk` returns the packed narrow key
+        // circuit families whose engine `get_pk` returns the packed narrow key
         // rather than the client's low/high u128 layout.
         let verify = |families: &[(u64, &'static Schema, ZSetBatch)], check_pk: &[bool]| {
             let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, families);
@@ -1096,18 +1095,10 @@ mod tests {
             &[true, true, true],
         );
 
-        // 6-family: CREATE VIEW (COL + DEP + 3 circuit + VIEW). The compound-PK
+        // 5-family: CREATE VIEW (COL + 3 circuit + VIEW). The compound-PK
         // families are built with the client's exact low/high u128 packing.
         let vid: u64 = 20;
         let src: u64 = 16;
-        let dep = {
-            let s = dep_tab_schema();
-            let mut b = ZSetBatch::new(s);
-            BatchAppender::new(&mut b, s)
-                .add_row((vid as u128) | ((src as u128) << 64), 1)
-                .u64_val(0);
-            b
-        };
         // Compound-PK families: `pk = view_id (low) | sub (high)`, matching the
         // client's low/high packing. `check_pk` is false for these, so the exact
         // sub values are arbitrary — pick non-trivial ones (clippy `identity_op`).
@@ -1167,14 +1158,13 @@ mod tests {
         verify(
             &[
                 (COL_TAB, col_tab_schema(), col_batch(vid, 1, 1)),
-                (DEP_TAB, dep_tab_schema(), dep),
                 (CIRCUIT_NODES_TAB, circuit_nodes_schema(), nodes),
                 (CIRCUIT_EDGES_TAB, circuit_edges_schema(), edges),
                 (CIRCUIT_NODE_COLUMNS_TAB, circuit_node_columns_schema(), node_cols),
                 (VIEW_TAB, view_tab_schema(), view),
             ],
-            // Skip pk check on the compound-PK DEP/circuit families.
-            &[true, false, false, false, false, true],
+            // Skip pk check on the compound-PK circuit families.
+            &[true, false, false, false, true],
         );
     }
 

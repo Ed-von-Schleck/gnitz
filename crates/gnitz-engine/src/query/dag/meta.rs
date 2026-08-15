@@ -69,40 +69,30 @@ impl DepMap {
         self.valid = false;
     }
 
-    /// Rebuild both maps from the DepTab system table if stale and return the
-    /// forward (source → views) map. `dep_tab` is passed in (a Copy raw pointer)
-    /// because the table lives on `DagEngine`; reading it through `self` here would
-    /// double-borrow against the `&mut self.dep`.
-    pub fn get_or_rebuild(&mut self, dep_tab: *mut Table) -> &FxHashMap<i64, Vec<i64>> {
+    /// Rebuild both maps from the CircuitNodes system table if stale and return
+    /// the forward (source → views) map. An edge is one `ScanDelta` node, read
+    /// through the same reader that builds the circuit, so the graph the
+    /// scheduler walks names the sources the circuit actually scans.
+    ///
+    /// `nodes` is passed in (a Copy raw pointer) because the table lives on
+    /// `DagEngine`; reading it through `self` here would double-borrow against
+    /// the `&mut self.dep`.
+    pub fn get_or_rebuild(&mut self, nodes: *mut Table) -> &FxHashMap<i64, Vec<i64>> {
         if self.valid {
             return &self.forward;
         }
         self.forward.clear();
         self.reverse.clear();
-        // Duplicate (view, dep) rows are adjacent per view in PK order, but a
-        // source's forward entries interleave across views — dedup with a seen
-        // set instead of a per-row `Vec::contains` scan.
+        // A view scanning one source twice yields two nodes, and a source's
+        // forward entries interleave across views — dedup with a seen set
+        // instead of a per-row `Vec::contains` scan.
         let mut seen: FxHashSet<(i64, i64)> = FxHashSet::default();
-        if !dep_tab.is_null() {
-            let t = unsafe { &*dep_tab };
-            let mut ch = t.open_cursor();
-            while ch.valid {
-                let w = ch.current_weight;
-                if w > 0 {
-                    // DepTab compound PK = (view_id, dep_table_id); both live in
-                    // the 16-byte PK region as OPK (big-endian for these unsigned
-                    // columns): view_id_BE in bytes 0..8, dep_BE in 8..16.
-                    let pk = ch.current_pk_bytes();
-                    let v_id = u64::from_be_bytes(pk[0..8].try_into().unwrap()) as i64;
-                    let dep_tid = u64::from_be_bytes(pk[8..16].try_into().unwrap()) as i64;
-                    if dep_tid > 0 && seen.insert((v_id, dep_tid)) {
-                        self.forward.entry(dep_tid).or_default().push(v_id);
-                        self.reverse.entry(v_id).or_default().push(dep_tid);
-                    }
-                }
-                ch.advance();
+        compiler::for_each_scan_edge(nodes, |v_id, dep_tid| {
+            if seen.insert((v_id, dep_tid)) {
+                self.forward.entry(dep_tid).or_default().push(v_id);
+                self.reverse.entry(v_id).or_default().push(dep_tid);
             }
-        }
+        });
         self.valid = true;
         &self.forward
     }
@@ -110,7 +100,7 @@ impl DepMap {
     /// Transitive closure of `seeds` over one half of the map, seeds excluded.
     /// Both directions are this one walk, so they cannot drift: `forward` reaches
     /// a source's dependents, `reverse` reaches a view's sources, and
-    /// `get_or_rebuild` writes both halves from the same DepTab row.
+    /// `get_or_rebuild` writes both halves from the same `ScanDelta` node.
     pub(super) fn closure(edges: &FxHashMap<i64, Vec<i64>>, seeds: Vec<i64>) -> FxHashSet<i64> {
         let mut reachable: FxHashSet<i64> = FxHashSet::default();
         let mut stack = seeds;
@@ -128,10 +118,10 @@ impl DepMap {
 impl DagEngine {
     // ── Dependency map ──────────────────────────────────────────────────
 
-    /// Rebuild the dependency maps from the DepTab system table if stale and
-    /// return the forward (source → views) map.
+    /// Rebuild the dependency maps from the CircuitNodes system table if stale
+    /// and return the forward (source → views) map.
     pub fn get_dep_map(&mut self) -> &FxHashMap<i64, Vec<i64>> {
-        self.dep.get_or_rebuild(self.sys.dep_tab)
+        self.dep.get_or_rebuild(self.sys.nodes)
     }
 
     /// Return all direct source table IDs for a view.

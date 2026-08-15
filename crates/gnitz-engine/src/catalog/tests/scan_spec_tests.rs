@@ -29,12 +29,7 @@ fn weighted_fixture(name: &str, rows: impl Iterator<Item = (u64, i64, i64)>) -> 
     let cols = id_val_cols();
     let (mut engine, tid, _dir) = table_fixture(name, &cols);
 
-    let vid = engine.allocate_table_id();
-    write_identity_circuit(&mut engine, vid, tid, None);
-    engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
-    engine.write_view_deps(vid, &[tid]).unwrap();
-    let batch = build_view_tab_row(vid, "v_weighted", "SELECT * FROM t");
-    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
+    let vid = register_identity_view(&mut engine, tid, "v_weighted", &cols);
 
     let mut bb = BatchBuilder::new(engine.get_schema_desc(vid).unwrap());
     for (id, val, w) in rows {

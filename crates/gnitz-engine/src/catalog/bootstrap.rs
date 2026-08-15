@@ -237,7 +237,6 @@ impl CatalogEngine {
             nodes: self.sys_store_ptr(SysFamily::CircuitNodes),
             edges: self.sys_store_ptr(SysFamily::CircuitEdges),
             node_columns: self.sys_store_ptr(SysFamily::CircuitNodeColumns),
-            dep_tab: self.sys_store_ptr(SysFamily::ViewDep),
         };
         self.dag.set_sys_tables(refs);
     }

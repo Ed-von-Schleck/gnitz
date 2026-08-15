@@ -627,23 +627,124 @@ fn test_column_defs_cached() {
 }
 
 #[test]
-fn test_view_deps_compound_pk_round_trip() {
-    // After the dep_tab compound-PK migration, get_dep_map must extract
-    // (view_id, dep_table_id) from the PK region. Write deps for view 7 →
-    // tables 100 and 200, then verify the rebuilt dep/source maps.
-    let dir = temp_dir("view_deps_compound");
+fn test_dep_map_is_the_scan_delta_nodes() {
+    // The dep map is derived from the circuit's `ScanDelta` nodes: the view id
+    // off the compound PK region, the source off the `source_table` column. Two
+    // distinct sources give two edges; a repeated source gives one; and neither
+    // a non-`ScanDelta` node carrying a `source_table` nor a non-positive source
+    // id gives any.
+    let dir = temp_dir("dep_map_scan_delta");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    engine.write_view_deps(7, &[100, 200]).unwrap();
-    engine.dag.invalidate_dep_map();
+    write_circuit_chain(
+        &mut engine,
+        7,
+        &[
+            (gnitz_wire::OPCODE_SCAN_DELTA, Some(100), None),
+            (gnitz_wire::OPCODE_SCAN_DELTA, Some(200), None),
+            (gnitz_wire::OPCODE_SCAN_DELTA, Some(100), None),
+            (gnitz_wire::OPCODE_SCAN_DELTA, Some(0), None),
+            (gnitz_wire::OPCODE_INTEGRATE, Some(300), None),
+        ],
+    );
 
     let dep_map = engine.dag.get_dep_map().clone();
-    assert_eq!(dep_map.get(&100), Some(&vec![7]), "table 100 must feed view 7");
+    assert_eq!(dep_map.get(&100), Some(&vec![7]), "the repeated source yields one edge");
     assert_eq!(dep_map.get(&200), Some(&vec![7]), "table 200 must feed view 7");
+    assert_eq!(dep_map.get(&300), None, "a non-ScanDelta node contributes no edge");
+    assert_eq!(dep_map.get(&0), None, "a non-positive source id contributes no edge");
 
     let mut sources = engine.dag.get_source_ids(7);
     sources.sort_unstable();
-    assert_eq!(sources, vec![100, 200], "view 7 sources extracted from PK");
+    assert_eq!(sources, vec![100, 200], "both ScanDelta sources of view 7");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_dep_map_view_on_view_chain() {
+    // A view over a view: each segment's own `ScanDelta` is its edge, in both
+    // map directions.
+    let dir = temp_dir("dep_map_view_chain");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    write_identity_circuit(&mut engine, 7, 100, None);
+    write_identity_circuit(&mut engine, 8, 7, None);
+
+    let dep_map = engine.dag.get_dep_map().clone();
+    assert_eq!(dep_map.get(&100), Some(&vec![7]), "base 100 feeds view 7");
+    assert_eq!(dep_map.get(&7), Some(&vec![8]), "view 7 feeds view 8");
+    assert_eq!(engine.dag.get_source_ids(7), vec![100]);
+    assert_eq!(engine.dag.get_source_ids(8), vec![7]);
+    // The dependency order every cascade walks — `hook_view_register`'s
+    // registration order and `compute_invalid_views`' invalidity propagation.
+    assert_eq!(engine.dag.order_by_view_deps(&[8, 7]), vec![7, 8]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A retired view contributes no edges: DROP VIEW and the ALTER VIEW
+/// `replaces` path both retract the outgoing view's circuit rows, and the map
+/// is rebuilt from what remains.
+#[test]
+fn test_dep_map_drops_a_retired_views_edges() {
+    let dir = temp_dir("dep_map_retired");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![col_def("id", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+
+    let v1 = register_identity_view(&mut engine, tid, "v1", &cols);
+    assert_eq!(engine.dag.get_dep_map().get(&tid), Some(&vec![v1]));
+
+    // ALTER VIEW: one VIEW_TAB batch retiring v1 and registering v2.
+    let v2 = engine.allocate_table_id();
+    write_identity_circuit(&mut engine, v2, tid, None);
+    engine.write_column_records(v2, OWNER_KIND_VIEW, &cols).unwrap();
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
+    push_view_tab_row(&mut bb, -1, v1, "v1", "");
+    push_view_tab_row(&mut bb, 1, v2, "v1", "");
+    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
+    assert_eq!(
+        engine.dag.get_dep_map().get(&tid),
+        Some(&vec![v2]),
+        "the replaced view's edge is gone, the replacement's is present"
+    );
+
+    // DROP VIEW retires the last edge, so the base table is a dep-map orphan.
+    engine.drop_view("public.v1").unwrap();
+    engine.drain_pending_dir_deletions();
+    assert_eq!(engine.dag.get_dep_map().get(&tid), None);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The two dependent-view RESTRICTs — DROP TABLE and DROP COLUMN — both read
+/// the CIRCUIT_NODES-backed map.
+#[test]
+fn test_dependent_view_restricts_fire_from_circuit_rows() {
+    let dir = temp_dir("dep_map_restrict");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+
+    register_identity_view(&mut engine, tid, "v", &cols);
+
+    let err = engine.drop_table("public.t").unwrap_err();
+    assert!(err.contains("View dependency"), "DROP TABLE RESTRICT: {err}");
+
+    // DROP NOT NULL on `val` — an `is_nullable 0→1` rewrite pair.
+    let mut nullable = cols[1].clone();
+    nullable.is_nullable = true;
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+    push_col_tab_row(&mut bb, tid, OWNER_KIND_TABLE, 1, &cols[1], -1);
+    push_col_tab_row(&mut bb, tid, OWNER_KIND_TABLE, 1, &nullable, 1);
+    let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
+    assert!(err.contains("dependent views"), "DROP NOT NULL RESTRICT: {err}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

@@ -541,7 +541,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     // climb, a freshly-allocated schema id eventually equals an EARLIER table
     // id. The negative-weight (DROP) precheck must not probe the table-keyed
     // view-dependency map with a SCHEMA_TAB drop id — a schema row is never a
-    // dep_map source. Probing it spuriously matches the unrelated table's
+    // dependency source. Probing it spuriously matches the unrelated table's
     // dependents and wrongly rejects the DROP SCHEMA.
     //
     // Pre-fix: drop_schema("victim") fails with "View dependency: owner.t".
@@ -554,7 +554,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
         .create_table("owner.t", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
     let vid = engine.allocate_table_id();
-    engine.write_view_deps(vid, &[tid]).unwrap();
+    write_identity_circuit(&mut engine, vid, tid, None);
     assert_eq!(
         engine.dag.get_dep_map().get(&tid),
         Some(&vec![vid]),

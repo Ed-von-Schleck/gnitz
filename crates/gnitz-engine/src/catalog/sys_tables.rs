@@ -62,7 +62,6 @@ pub(super) const TABLE_TAB_ID: i64 = gnitz_wire::TABLE_TAB as i64;
 pub(super) const VIEW_TAB_ID: i64 = gnitz_wire::VIEW_TAB as i64;
 pub(super) const COL_TAB_ID: i64 = gnitz_wire::COL_TAB as i64;
 pub(super) const IDX_TAB_ID: i64 = gnitz_wire::IDX_TAB as i64;
-pub(super) const DEP_TAB_ID: i64 = gnitz_wire::DEP_TAB as i64;
 pub(crate) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
 pub(super) const CIRCUIT_NODES_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODES_TAB as i64;
 pub(super) const CIRCUIT_EDGES_TAB_ID: i64 = gnitz_wire::CIRCUIT_EDGES_TAB as i64;
@@ -268,6 +267,15 @@ impl PkSignature {
     pub(super) fn is_pair(&self) -> bool {
         self.neg.is_some() && self.pos.is_some()
     }
+
+    /// The DDL verb this shape performs, for guard messages.
+    pub(super) fn verb(&self) -> &'static str {
+        match (self.neg.is_some(), self.pos.is_some()) {
+            (true, true) => "ALTER",
+            (true, false) => "DROP",
+            _ => "CREATE",
+        }
+    }
 }
 
 /// One [`PkSignature`] per distinct PK, in first-appearance order. Zero-weight
@@ -426,26 +434,15 @@ pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
     gnitz_wire::pack_col_id(owner_id as u64, col_idx as u64).expect("catalog col-id packing out of range")
 }
 
-/// Pack a circuit/dep compound PK `(view_id, sub)` into a `u128` whose
+/// Pack a circuit compound PK `(view_id, sub)` into the `u128` whose
 /// `extend_pk` (big-endian) at-rest image is OPK column order: `view_id_BE`
-/// (bytes 0..8) then `sub_BE` (bytes 8..16). `view_id` is PK column 0, so it
-/// must occupy the high `u128` half to land in the leading at-rest bytes — the
-/// prefix that `retract_rows_by_view` / `load_circuit` / `get_dep_map` seek and
-/// decode. `sub` is the per-view secondary (node_id, dep_table_id, or an
-/// edge/node-column field pack).
+/// (bytes 0..8) then `sub_BE` (bytes 8..16), so a view_id prefix seek lands on
+/// the leading bytes. Pinned by `pack_view_pk_at_rest_is_view_id_leading_opk`.
+/// `sub` is the per-view secondary (node_id or an edge/node-column field pack).
 ///
-/// CONVERGENCE INVARIANT: the client (`create_view_chain`) packs the same
-/// compound PK with `view_id` in the LOW u128 half (`vid | (sub << 64)`),
-/// the byte-order dual of this `(vid << 64) | sub`. The two reach storage
-/// through different encoders — the client OPK-encodes each 8-byte PK column
-/// independently (low u128 bytes → first column), the engine writes the whole
-/// u128 big-endian — and produce the IDENTICAL view_id-major at-rest image
-/// only because every circuit-PK column is exactly 8 bytes and unsigned.
-/// Changing either encoder, the column widths, or the signedness breaks view
-/// loading (prefix seeks on `view_id.to_be_bytes()`).
-///
-/// Production circuit rows arrive pre-packed over the wire; only the tests
-/// (here and in `reopen_rebuild_tests`) build them engine-side.
+/// Test-only: production circuit rows arrive pre-packed from the client, which
+/// reaches the same at-rest image through a different encoder (see
+/// `create_view_chain`).
 #[cfg(test)]
 pub(super) fn pack_view_pk(view_id: i64, sub: u64) -> u128 {
     ((view_id as u64 as u128) << 64) | (sub as u128)
@@ -487,14 +484,14 @@ pub(crate) const SYS_FAMILIES: [SysFamilyInfo; SysFamily::COUNT] = [
         name: "_tables",
         cols: gnitz_wire::TABLE_TAB_COLS,
         pk_cols: gnitz_wire::TABLE_TAB_PK,
-        topo_priority: 6,
+        topo_priority: 5,
     },
     SysFamilyInfo {
         id: VIEW_TAB_ID,
         name: "_views",
         cols: gnitz_wire::VIEW_TAB_COLS,
         pk_cols: gnitz_wire::VIEW_TAB_PK,
-        topo_priority: 7,
+        topo_priority: 6,
     },
     SysFamilyInfo {
         id: COL_TAB_ID,
@@ -508,14 +505,7 @@ pub(crate) const SYS_FAMILIES: [SysFamilyInfo; SysFamily::COUNT] = [
         name: "_indices",
         cols: gnitz_wire::IDX_TAB_COLS,
         pk_cols: gnitz_wire::IDX_TAB_PK,
-        topo_priority: 8,
-    },
-    SysFamilyInfo {
-        id: DEP_TAB_ID,
-        name: "_view_deps",
-        cols: gnitz_wire::DEP_TAB_COLS,
-        pk_cols: gnitz_wire::DEP_TAB_PK,
-        topo_priority: 2,
+        topo_priority: 7,
     },
     SysFamilyInfo {
         id: SEQ_TAB_ID,
@@ -529,21 +519,21 @@ pub(crate) const SYS_FAMILIES: [SysFamilyInfo; SysFamily::COUNT] = [
         name: "_circuit_nodes",
         cols: gnitz_wire::CIRCUIT_NODES_COLS,
         pk_cols: gnitz_wire::CIRCUIT_FAMILY_PK,
-        topo_priority: 3,
+        topo_priority: 2,
     },
     SysFamilyInfo {
         id: CIRCUIT_EDGES_TAB_ID,
         name: "_circuit_edges",
         cols: gnitz_wire::CIRCUIT_EDGES_COLS,
         pk_cols: gnitz_wire::CIRCUIT_FAMILY_PK,
-        topo_priority: 4,
+        topo_priority: 3,
     },
     SysFamilyInfo {
         id: CIRCUIT_NODE_COLUMNS_TAB_ID,
         name: "_circuit_node_columns",
         cols: gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS,
         pk_cols: gnitz_wire::CIRCUIT_FAMILY_PK,
-        topo_priority: 5,
+        topo_priority: 4,
     },
 ];
 
@@ -587,7 +577,6 @@ pub(crate) enum SysFamily {
     View,
     Column,
     Index,
-    ViewDep,
     Sequence,
     CircuitNodes,
     CircuitEdges,
@@ -595,7 +584,7 @@ pub(crate) enum SysFamily {
 }
 
 impl SysFamily {
-    pub(crate) const COUNT: usize = 10;
+    pub(crate) const COUNT: usize = 9;
 
     /// Discriminant index into the per-family arrays.
     #[inline]
@@ -635,7 +624,6 @@ impl SysFamily {
             VIEW_TAB_ID => Some(SysFamily::View),
             COL_TAB_ID => Some(SysFamily::Column),
             IDX_TAB_ID => Some(SysFamily::Index),
-            DEP_TAB_ID => Some(SysFamily::ViewDep),
             SEQ_TAB_ID => Some(SysFamily::Sequence),
             CIRCUIT_NODES_TAB_ID => Some(SysFamily::CircuitNodes),
             CIRCUIT_EDGES_TAB_ID => Some(SysFamily::CircuitEdges),
@@ -684,9 +672,8 @@ mod tests {
             SysFamily::CircuitNodes.schema(),
             SysFamily::CircuitEdges.schema(),
             SysFamily::CircuitNodeColumns.schema(),
-            SysFamily::ViewDep.schema(),
         ] {
-            assert_eq!(schema.pk_indices(), &[0, 1], "circuit/dep PK must be (col0, col1)");
+            assert_eq!(schema.pk_indices(), &[0, 1], "circuit PK must be (col0, col1)");
             assert_eq!(schema.pk_stride(), 16, "two U64 PK columns pack to 16 bytes");
         }
     }

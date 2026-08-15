@@ -270,3 +270,34 @@ fn build_view_tab_row(vid: i64, view_name: &str, sql: &str) -> Batch {
     push_view_tab_row(&mut bb, 1, vid, view_name, sql);
     bb.finish()
 }
+
+/// Register an identity view over `base_tid` through the raw system-table path,
+/// returning its vid. The circuit and column records precede the VIEW_TAB row —
+/// the order `hook_view_register` needs to resolve the view's sources and
+/// schema.
+fn register_identity_view(engine: &mut CatalogEngine, base_tid: i64, name: &str, cols: &[ColumnDef]) -> i64 {
+    let vid = engine.allocate_table_id();
+    write_identity_circuit(engine, vid, base_tid, None);
+    engine.write_column_records(vid, OWNER_KIND_VIEW, cols).unwrap();
+    let batch = build_view_tab_row(vid, name, "");
+    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
+    vid
+}
+
+/// A COL_TAB rewrite pair on column `col_idx` of `owner_id`: `mutate` produces
+/// the `+1` row from a clone of `old`, while the `-1` reproduces `old`
+/// byte-for-byte — so only the guard under test can reject it.
+fn col_alter_pair(
+    owner_id: i64,
+    owner_kind: i64,
+    col_idx: i64,
+    old: &ColumnDef,
+    mutate: impl FnOnce(&mut ColumnDef),
+) -> Batch {
+    let mut altered = old.clone();
+    mutate(&mut altered);
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+    push_col_tab_row(&mut bb, owner_id, owner_kind, col_idx, old, -1);
+    push_col_tab_row(&mut bb, owner_id, owner_kind, col_idx, &altered, 1);
+    bb.finish()
+}

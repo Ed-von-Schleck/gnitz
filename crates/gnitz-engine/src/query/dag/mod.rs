@@ -163,17 +163,14 @@ impl TableEntry {
 // System table references
 // ---------------------------------------------------------------------------
 
-/// Handles for the four system tables that the compiler reads: CircuitNodes,
-/// CircuitEdges, CircuitNodeColumns, and DepTab. No schemas are threaded — the
-/// compiler's cursor readers source each table's schema from the cursor itself
-/// (`ReadCursor::schema`), and `get_dep_map` reads DepTab's compound PK directly
-/// from the cursor's PK bytes.
+/// Handles for the three circuit system tables the compiler reads. No schemas
+/// are threaded — the compiler's cursor readers source each table's schema from
+/// the cursor itself (`ReadCursor::schema`).
 pub struct SysTableRefs {
     // Table handles (DagEngine borrows them).
     pub nodes: *mut Table,
     pub edges: *mut Table,
     pub node_columns: *mut Table,
-    pub dep_tab: *mut Table,
 }
 
 // SAFETY: same single-thread guarantee.
@@ -185,7 +182,6 @@ impl SysTableRefs {
             nodes: std::ptr::null_mut(),
             edges: std::ptr::null_mut(),
             node_columns: std::ptr::null_mut(),
-            dep_tab: std::ptr::null_mut(),
         }
     }
 }
@@ -663,7 +659,7 @@ mod tests {
     }
 
     /// Install `edges` (source → view) into an already-valid dep map, the same
-    /// pair of entries `DepMap::get_or_rebuild` writes per DepTab row.
+    /// pair of entries `DepMap::get_or_rebuild` writes per `ScanDelta` node.
     fn dag_with_deps(edges: &[(i64, i64)]) -> DagEngine {
         let mut dag = DagEngine::new();
         for &(src, view) in edges {

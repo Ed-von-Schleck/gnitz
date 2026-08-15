@@ -65,15 +65,9 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     // Secondary index on val (backfills the N committed rows).
     engine.create_index("public.base", &["val"], false).unwrap();
 
-    // Identity view over base. Circuit and dep rows precede the VIEW_TAB row,
-    // the order registration needs to resolve the view's sources and schema.
-    let vid = engine.allocate_table_id();
-    write_identity_circuit(&mut engine, vid, tid, None);
-    engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
-    engine.write_view_deps(vid, &[tid]).unwrap();
-
-    let batch = build_view_tab_row(vid, "v_base", "SELECT * FROM base");
-    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
+    // Identity view over base. The circuit rows precede the VIEW_TAB row, the
+    // order registration needs to resolve the view's sources and schema.
+    let vid = register_identity_view(&mut engine, tid, "v_base", &cols);
 
     // Registration alone materialises nothing — the runtime's distributed
     // backfill is the sole driver, and a catalog-layer fill here would

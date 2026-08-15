@@ -16,7 +16,7 @@ use crate::protocol::{
 use lru::LruCache;
 
 pub use gnitz_wire::{
-    COL_TAB, DEP_TAB, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB, VIEW_TAB,
+    COL_TAB, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB, VIEW_TAB,
 };
 
 /// Per-connection schema LRU capacity. Sized to comfortably hold a session's

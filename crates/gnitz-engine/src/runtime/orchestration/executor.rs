@@ -2278,7 +2278,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
 
     // Ingest the families in ascending topo order so every register/index hook
     // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
-    // new view's base sources once the circuit/dep families are in the memtable
+    // new view's base sources once the circuit families are in the memtable
     // (so get_source_ids resolves) but before VIEW_TAB registers the view — after
     // registration the view is a dependent of those bases, so an undrained pending
     // delta would tick it through `evaluate_dag` over rows the backfill below also

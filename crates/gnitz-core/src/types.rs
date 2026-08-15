@@ -26,11 +26,6 @@ pub fn view_tab_schema() -> &'static Schema {
     INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::VIEW_TAB_COLS, gnitz_wire::VIEW_TAB_PK))
 }
 
-pub fn dep_tab_schema() -> &'static Schema {
-    static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::DEP_TAB_COLS, gnitz_wire::DEP_TAB_PK))
-}
-
 pub fn idx_tab_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| schema_from_wire_cols(gnitz_wire::IDX_TAB_COLS, gnitz_wire::IDX_TAB_PK))

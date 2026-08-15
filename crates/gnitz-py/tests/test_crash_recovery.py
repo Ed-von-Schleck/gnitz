@@ -183,7 +183,7 @@ def test_ddl_crash_with_workers_no_orphans(own_server):
 def test_ddl_crash_fk_and_view_no_orphan(own_server):
     """A CREATE TABLE child(... REFERENCES parent) and a CREATE VIEW over parent
     that abort after broadcasts but before the commit sentinel must leave no
-    durable trace — no orphan COL_TAB/DEP_TAB that would block the parent. The
+    durable trace — no orphan COL_TAB rows that would block the parent. The
     pre-fix cross-zone orphan (COL_TAB committed in its own zone before the
     owning TABLE_TAB) is structurally unconstructible once a CREATE is one atomic
     message, so this is the regression proof."""
