@@ -2,6 +2,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::error::StorageError;
 use crate::foundation::posix_io::open_owned;
+use crate::foundation::xxh;
 use gnitz_wire::{read_u64_le, write_u64_le};
 
 // ---------------------------------------------------------------------------
@@ -10,11 +11,11 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 //
 // Header (48 bytes):
 //   [0,8)   Magic   0x4D414E49464E5447
-//   [8,16)  Version u64 (7)
+//   [8,16)  Version u64 (8)
 //   [16,24) Count   u64
 //   [24,32) Compaction sequence u64
 //   [32,40) Checkpoint generation u64
-//   [40,48) Reserved
+//   [40,48) Checksum — XXH3-64 over the whole file, these eight bytes excluded
 //
 // Entry (160 bytes each):
 //   [0,8)     max_lsn    u64
@@ -32,14 +33,14 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 // writer and read router share.
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION: u64 = 7;
+const VERSION: u64 = 8;
 const HEADER_SIZE: usize = 48;
 const ENTRY_SIZE: usize = 160;
 
-/// Operator-state / on-disk-layout format version. Bump on any change to an
-/// operator-state schema or to the shard/manifest layout; a mismatch (recorded
-/// in `_sequences` via `SEQ_ID_TOPOLOGY`) wipes all Rederive view state at boot,
-/// always correct because it re-derives.
+/// Operator-state format version. Bump on any change to an operator-state
+/// schema; a mismatch (recorded in `_sequences` via `SEQ_ID_TOPOLOGY`) marks
+/// every Rederive view invalid at boot, so its state is rebuilt. Shard and
+/// manifest layout changes are carried by their own version words.
 pub const STATE_FORMAT: u32 = 5;
 
 /// The durable topology word recorded in `_sequences` (`SEQ_ID_TOPOLOGY`):
@@ -54,6 +55,7 @@ pub fn topology_word(worker_count: u32) -> u64 {
 const OFF_ENTRY_COUNT: usize = 16;
 const OFF_COMPACT_SEQ: usize = 24;
 const OFF_GENERATION: usize = 32;
+const OFF_CHECKSUM: usize = 40;
 
 // Field offsets within an entry, kept in sync with the doc-comment above.
 const OFF_MAX_LSN: usize = 0;
@@ -130,17 +132,31 @@ fn serialize(out_buf: &mut [u8], entries: &[ManifestEntryRaw], header: ManifestH
         out_buf[off + OFF_GUARD_KEY..off + OFF_GUARD_KEY + 16].copy_from_slice(&e.guard_key.to_le_bytes());
     }
 
+    // Spans the whole serialized prefix, which is exactly what `prepare_file`
+    // writes and therefore exactly what `verify` hashes back.
+    write_u64_le(
+        out_buf,
+        OFF_CHECKSUM,
+        xxh::digest_with_hole(&[], &out_buf[..total], OFF_CHECKSUM),
+    );
+
     Ok(total)
 }
 
-/// Validate a manifest header and return its counters. The single gate for
-/// magic and version, so a header one reader accepts cannot be rejected by the
-/// other.
+/// The one gate a manifest buffer passes before any field is believed. Returns
+/// the header and the entry count.
 ///
 /// Current version only. There is no on-disk data to migrate in dev, so any
 /// other version is a hard `InvalidVersion` — no per-version field gating, no
 /// shims.
-fn parse_header(buf: &[u8]) -> Result<ManifestHeader, StorageError> {
+///
+/// Both `parse` and the header-only [`peek_generation`] come through here, so
+/// neither can accept a manifest the other rejects.
+fn verify(buf: &[u8]) -> Result<(ManifestHeader, usize), StorageError> {
+    // Ordered: each check makes the next one's reads meaningful. Magic and
+    // version come before the body-length check so a wrong-format file names
+    // its actual defect, and both lengths come before the digest so a truncated
+    // file is not reported as a hash mismatch.
     if buf.len() < HEADER_SIZE {
         return Err(StorageError::Truncated);
     }
@@ -150,23 +166,29 @@ fn parse_header(buf: &[u8]) -> Result<ManifestHeader, StorageError> {
     if read_u64_le(buf, 8) != VERSION {
         return Err(StorageError::InvalidVersion);
     }
-    Ok(ManifestHeader {
-        compact_seq: read_u64_le(buf, OFF_COMPACT_SEQ),
-        generation: read_u64_le(buf, OFF_GENERATION),
-    })
-}
-
-/// Parse a manifest buffer into an exact-count entry `Vec` plus the header.
-fn parse(buf: &[u8]) -> Result<(Vec<ManifestEntryRaw>, ManifestHeader), StorageError> {
-    let header = parse_header(buf)?;
     let count = read_u64_le(buf, OFF_ENTRY_COUNT) as usize;
-
     let body = count.checked_mul(ENTRY_SIZE).ok_or(StorageError::Truncated)?;
-    let expected_data = HEADER_SIZE.checked_add(body).ok_or(StorageError::Truncated)?;
-    if buf.len() < expected_data {
+    if buf.len() < HEADER_SIZE.checked_add(body).ok_or(StorageError::Truncated)? {
         return Err(StorageError::Truncated);
     }
+    // Over the whole buffer rather than the expected length: guard keys, LSNs
+    // and the header counters have no other check, and hashing past the entries
+    // also rejects bytes appended to an otherwise honest manifest.
+    if xxh::digest_with_hole(&[], buf, OFF_CHECKSUM) != read_u64_le(buf, OFF_CHECKSUM) {
+        return Err(StorageError::ChecksumMismatch);
+    }
+    Ok((
+        ManifestHeader {
+            compact_seq: read_u64_le(buf, OFF_COMPACT_SEQ),
+            generation: read_u64_le(buf, OFF_GENERATION),
+        },
+        count,
+    ))
+}
 
+/// Decode a verified manifest buffer into an exact-count entry `Vec`.
+fn parse(buf: &[u8]) -> Result<(Vec<ManifestEntryRaw>, ManifestHeader), StorageError> {
+    let (header, count) = verify(buf)?;
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
         let off = HEADER_SIZE + i * ENTRY_SIZE;
@@ -192,17 +214,23 @@ pub const fn serialized_size(count: usize) -> usize {
 // File I/O (read + atomic write)
 // ---------------------------------------------------------------------------
 
-/// Read and parse a manifest file in one open. Returns `Ok(None)` when the
-/// file does not exist yet (first-time table boot ⇒ empty manifest); any other
-/// read failure is `Err(Io)`.
-pub fn read_file(path: &std::ffi::CStr) -> Result<Option<(Vec<ManifestEntryRaw>, ManifestHeader)>, StorageError> {
+/// Read a manifest file into memory. `Ok(None)` when it does not exist yet
+/// (first-time table boot ⇒ empty manifest); any other read failure is
+/// `Err(Io)`.
+fn read_bytes(path: &std::ffi::CStr) -> Result<Option<Vec<u8>>, StorageError> {
     use std::os::unix::ffi::OsStrExt;
-    let buf = match std::fs::read(std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()))) {
-        Ok(buf) => buf,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(StorageError::Io),
-    };
-    parse(&buf).map(Some)
+    match std::fs::read(std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()))) {
+        Ok(buf) => Ok(Some(buf)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(StorageError::Io),
+    }
+}
+
+/// Read and parse a manifest file in one open. `Ok(None)` when the file does
+/// not exist yet; a damaged one is an error, since its shards are already open
+/// for business and dropping them silently would lose data.
+pub fn read_file(path: &std::ffi::CStr) -> Result<Option<(Vec<ManifestEntryRaw>, ManifestHeader)>, StorageError> {
+    read_bytes(path)?.map(|buf| parse(&buf)).transpose()
 }
 
 /// Open .tmp manifest at "<path>.tmp", serialize entries into it, and return
@@ -295,19 +323,15 @@ pub fn tmp_path(dir: &str) -> String {
     format!("{}.tmp", path(dir))
 }
 
-/// The checkpoint generation from a manifest file's header, reading only the
-/// header. `Ok(None)` when the file does not exist yet (never checkpointed).
+/// The checkpoint generation a manifest was published at. `Ok(None)` when there
+/// is no usable manifest — absent, or damaged: a damaged manifest names no
+/// generation, and every caller answers that by rebuilding. Only a failed read
+/// is `Err(Io)`; that is not evidence of staleness, so it must not erase.
 ///
-/// Validates through the same [`parse_header`] the full read uses, so a manifest
-/// this accepts cannot then be rejected by `parse` — which would turn a view
-/// rebuild into a hard open failure.
+/// The digest spans the entries, so no header-only peek can skip reading them,
+/// but decoding them is another matter — this stops at [`verify`].
 pub fn peek_generation(path: &std::ffi::CStr) -> Result<Option<u64>, StorageError> {
-    let Some(fd) = open_owned(path, libc::O_RDONLY) else {
-        return Ok(None);
-    };
-    let mut hdr = [0u8; HEADER_SIZE];
-    let n = crate::foundation::posix_io::read_all_fd(fd.as_raw_fd(), &mut hdr).unwrap_or(0);
-    parse_header(&hdr[..n]).map(|h| Some(h.generation))
+    Ok(read_bytes(path)?.and_then(|buf| Some(verify(&buf).ok()?.0.generation)))
 }
 
 // ---------------------------------------------------------------------------
@@ -348,45 +372,6 @@ mod tests {
             level: 1,
             guard_key: 42,
         }
-    }
-
-    #[test]
-    fn roundtrip() {
-        let entries: Vec<ManifestEntryRaw> = (0..4)
-            .map(|i| make_entry(100 + i as u64, &format!("shard_{i}.db")))
-            .collect();
-        let n = entries.len();
-        let mut buf = vec![0u8; serialized_size(n)];
-
-        let written = serialize(&mut buf, &entries, hdr(7, 3)).unwrap();
-        assert_eq!(written, buf.len());
-
-        let (out, header) = parse(&buf).unwrap();
-        assert_eq!(out.len(), n);
-        assert_eq!(header, hdr(7, 3), "header must round-trip through serialize/parse");
-
-        for i in 0..n {
-            assert_eq!(out[i].max_lsn, entries[i].max_lsn);
-            assert_eq!(out[i].level, entries[i].level);
-            assert_eq!(out[i].guard_key, entries[i].guard_key);
-            assert_eq!(out[i].filename, entries[i].filename);
-        }
-    }
-
-    #[test]
-    fn generation_roundtrip() {
-        // The generation stamp must survive serialize/parse.
-        let entries = vec![make_entry(1, "shard_1.db")];
-        let header = ManifestHeader {
-            compact_seq: 9,
-            generation: 42,
-        };
-        let mut buf = vec![0u8; serialized_size(1)];
-        serialize(&mut buf, &entries, header).unwrap();
-
-        let (out, got) = parse(&buf).unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(got, header, "generation must round-trip through serialize/parse");
     }
 
     #[test]
@@ -510,6 +495,74 @@ mod tests {
         let (out, header) = read_file(&cpath).unwrap().unwrap();
         assert!(out.is_empty());
         assert_eq!(header.compact_seq, 42);
+    }
+
+    /// A serialized manifest for `count` entries, ready to forge against.
+    fn serialized(count: usize) -> Vec<u8> {
+        let entries: Vec<ManifestEntryRaw> = (0..count)
+            .map(|i| make_entry(100 + i as u64, &format!("shard_7_{i}.db")))
+            .collect();
+        let mut buf = vec![0u8; serialized_size(count)];
+        serialize(&mut buf, &entries, hdr(11, 5)).unwrap();
+        buf
+    }
+
+    #[test]
+    fn roundtrips_at_zero_one_and_many_entries() {
+        for count in [0usize, 1, 5] {
+            let buf = serialized(count);
+            assert_eq!(buf.len(), serialized_size(count));
+            let (out, header) = parse(&buf).unwrap();
+            assert_eq!(header, hdr(11, 5), "count={count}");
+            assert_eq!(out.len(), count);
+            for (i, e) in out.iter().enumerate() {
+                assert_eq!(e.max_lsn, 100 + i as u64);
+                assert_eq!(e.filename_str(), format!("shard_7_{i}.db"));
+                assert_eq!((e.level, e.guard_key), (1, 42));
+            }
+        }
+    }
+
+    #[test]
+    fn forged_entry_count_up_reports_truncated() {
+        // The length check runs ahead of the digest, which is what pins `parse`'s
+        // order: a genuinely short file must not report a hash mismatch.
+        let mut buf = serialized(5);
+        write_u64_le(&mut buf, OFF_ENTRY_COUNT, 6);
+        assert_eq!(parse(&buf).unwrap_err(), StorageError::Truncated);
+    }
+
+    #[test]
+    fn forged_entry_count_down_reports_checksum_mismatch() {
+        // The count field is inside the digest. Were it not, a shrunk count
+        // would drop shards from the live set, and `gc_orphans` unlinks any
+        // shard the loaded manifest does not name.
+        let mut buf = serialized(5);
+        write_u64_le(&mut buf, OFF_ENTRY_COUNT, 4);
+        assert_eq!(parse(&buf).unwrap_err(), StorageError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn trailing_bytes_report_checksum_mismatch() {
+        // The neighbouring case the count field cannot close: bytes appended to
+        // an otherwise honest manifest. The digest spans the whole buffer.
+        let mut buf = serialized(2);
+        buf.extend_from_slice(&[0u8; 16]);
+        assert_eq!(parse(&buf).unwrap_err(), StorageError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn every_byte_past_the_count_field_is_inside_the_digest() {
+        // Filenames, levels, guard keys, LSNs and the header counters have no
+        // other check, so the sweep is over every byte rather than a chosen few.
+        // It starts past the count field, whose forgeries split between
+        // `Truncated` and `ChecksumMismatch` and have their own tests above.
+        let base = serialized(3);
+        for off in OFF_COMPACT_SEQ..base.len() {
+            let mut buf = base.clone();
+            buf[off] ^= 0x01;
+            assert_eq!(parse(&buf).unwrap_err(), StorageError::ChecksumMismatch, "byte {off}");
+        }
     }
 
     #[test]

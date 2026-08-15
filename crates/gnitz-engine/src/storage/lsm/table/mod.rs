@@ -2095,6 +2095,74 @@ mod tests {
         );
     }
 
+    /// A damaged manifest names no checkpoint generation, so the
+    /// `RederiveCheckpointed` arm rebuilds rather than failing the boot. A failed
+    /// read is not evidence of staleness: it propagates and erases nothing.
+    #[test]
+    fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let table_id = 7911;
+
+        // A checkpointed table with one published shard, and the path to the
+        // manifest that names it.
+        let checkpointed = |name: &str| -> (std::path::PathBuf, std::path::PathBuf) {
+            let tdir = dir.path().join(name);
+            let mut t = new_table(&tdir, schema, table_id, 128, RecoverySource::SalReplay);
+            t.ingest_owned_batch(make_batch(&[(1, 1, 100)])).unwrap();
+            flush_ephemeral_at(&mut t, 7);
+            assert_eq!(shard_db_files(&tdir, table_id).len(), 1, "{name}: shard published");
+            let manifest = std::path::PathBuf::from(crate::storage::lsm::manifest::path(tdir.to_str().unwrap()));
+            (tdir, manifest)
+        };
+        let reopen = |tdir: &std::path::Path| {
+            Table::new(
+                tdir.to_str().unwrap(),
+                schema,
+                table_id,
+                128,
+                RecoverySource::RederiveCheckpointed { committed: 7 },
+            )
+        };
+
+        type Damage = fn(&mut Vec<u8>);
+        let damages: [(&str, Damage); 3] = [
+            ("truncated", |b| b.truncate(20)),
+            ("bad_magic", |b| b[0] ^= 0xFF),
+            // Inside the first entry's filename, which only the digest checks.
+            ("checksum", |b| b[60] ^= 0x01),
+        ];
+        for (name, damage) in damages {
+            let (tdir, manifest) = checkpointed(name);
+            let mut buf = std::fs::read(&manifest).unwrap();
+            damage(&mut buf);
+            std::fs::write(&manifest, &buf).unwrap();
+
+            let t = reopen(&tdir)
+                .unwrap_or_else(|e| panic!("{name}: a damaged manifest must rebuild, not fail the boot: {e:?}"));
+            assert!(
+                !t.has_pk_bytes(&1u64.to_be_bytes()),
+                "{name}: the rebuild verdict opens empty"
+            );
+            assert!(
+                shard_db_files(&tdir, table_id).is_empty(),
+                "{name}: stale shards erased"
+            );
+        }
+
+        // Replacing the manifest with a directory makes `std::fs::read` fail
+        // with something other than NotFound.
+        let (tdir, manifest) = checkpointed("io_err");
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        assert_eq!(reopen(&tdir).err(), Some(StorageError::Io));
+        assert_eq!(
+            shard_db_files(&tdir, table_id).len(),
+            1,
+            "a failed read must not erase the shards"
+        );
+    }
+
     /// The three-disjunct barrier gate, one arm each: RAM empty + nothing →
     /// `Empty`; RAM empty + a lone unsynced spill → `Pending` with the spill in
     /// the sweep list; RAM empty + compaction pending only (unsynced cleared) →

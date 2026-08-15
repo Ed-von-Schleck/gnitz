@@ -1,6 +1,14 @@
 //! Cold open-time path for [`MappedShard`]: header + directory validation,
 //! region decoding, optional per-region checksum verification, and the XOR8
 //! membership-filter load. Runs once per shard open, never per row.
+//!
+//! Two digests are unconditional, over the two spans this path reads in full
+//! regardless of `validate_checksums`: the descriptive prefix (header +
+//! directory), which decides how every payload byte is interpreted, and the
+//! serialized filter, whose corruption answers "not present" rather than
+//! failing. The payload regions stay behind `validate_checksums` — they are
+//! demand-paged, so hashing them here would fault in a whole shard for a point
+//! lookup. Only compaction passes it; the boot/reload path opens with it off.
 
 use std::ffi::CStr;
 
@@ -37,9 +45,6 @@ impl MappedShard {
             return Err(StorageError::InvalidVersion);
         }
 
-        let count = read_u64_le(data, OFF_ROW_COUNT) as usize;
-        let dir_off = read_u64_le(data, OFF_DIR_OFFSET) as usize;
-
         let pk_stride = schema.pk_stride();
         // Writer↔reader region-layout contract, shared with
         // `write_shard_streaming`: `strides` holds each fixed-width region's
@@ -47,6 +52,18 @@ impl MappedShard {
         let (strides, nr) = strides_from_schema(schema);
         let nr = nr as usize;
         let num_regions = nr + 1;
+
+        // Ahead of every structural check, so no forged byte reaches unchecked
+        // arithmetic. The span's length comes from the schema, so a file written
+        // at another arity fails here rather than being re-chunked.
+        if desc_len(num_regions) > file_size {
+            return Err(StorageError::Truncated);
+        }
+        if desc_digest(shard_basename(path.to_bytes()), data, num_regions) != read_u64_le(data, OFF_DESC_CHECKSUM) {
+            return Err(StorageError::ChecksumMismatch);
+        }
+
+        let count = read_u64_le(data, OFF_ROW_COUNT) as usize;
 
         // Parse directory entries
         struct DirEntry {
@@ -58,25 +75,20 @@ impl MappedShard {
 
         let mut entries: Vec<DirEntry> = Vec::with_capacity(num_regions);
         for i in 0..num_regions {
-            let entry_off = dir_off + i * DIR_ENTRY_SIZE;
-            if entry_off + DIR_ENTRY_SIZE > file_size {
-                return Err(StorageError::InvalidShard);
-            }
+            let entry_off = dir_entry_off(i);
             let r_off = read_u64_le(data, entry_off) as usize;
             let r_sz = read_u64_le(data, entry_off + 8) as usize;
             let r_cs = read_u64_le(data, entry_off + 16);
 
-            let encoding = data[entry_off + 24];
-            // Validate reserved bytes [25..32] are all zero
-            for b in &data[entry_off + 25..entry_off + 32] {
-                if *b != 0 {
-                    return Err(StorageError::InvalidShard);
-                }
-            }
             // The encoding byte is validated per role by the region builders
             // below — each role accepts exactly its legal encoding set, so an
-            // unknown or misplaced byte is rejected at its decode site.
+            // unknown or misplaced byte is rejected at its decode site. The
+            // entry's reserved bytes [25,32) get no check of their own: the
+            // digest above already covers them.
+            let encoding = data[entry_off + 24];
 
+            // Keeps the region slice inside the mapping — a file truncated below
+            // an intact prefix would slice past its end.
             if r_off.saturating_add(r_sz) > file_size {
                 return Err(StorageError::InvalidShard);
             }
@@ -109,7 +121,9 @@ impl MappedShard {
                 ENCODING_CONSTANT => (0, elem_width.min(count * elem_width)),
                 _ => return Err(StorageError::InvalidShard),
             };
-            if e.size < needed {
+            // The writer rejects any region that is not exactly count*stride, so
+            // an inexact size here is corruption rather than a legal variant.
+            if e.size != needed {
                 return Err(StorageError::InvalidShard);
             }
             Ok(RegionView {
@@ -153,7 +167,7 @@ impl MappedShard {
             };
         let build_weight_region = |e: &DirEntry| -> Result<WeightRegion, StorageError> {
             if e.encoding == ENCODING_TWO_VALUE {
-                if e.size < 16 + count.div_ceil(8) {
+                if e.size != 16 + count.div_ceil(8) {
                     return Err(StorageError::InvalidShard);
                 }
                 return Ok(WeightRegion::TwoValue {
@@ -188,8 +202,15 @@ impl MappedShard {
 
         let xor8_off = read_u64_le(data, OFF_XOR8_OFFSET) as usize;
         let xor8_sz = read_u64_le(data, OFF_XOR8_SIZE) as usize;
+        // Unconditional: `deserialize` reads every one of these bytes anyway. A
+        // corrupt filter answers "not present" for keys the shard holds instead
+        // of failing, so it has to be rejected here rather than degrade probes.
         let xor8_filter = if xor8_off > 0 && xor8_sz >= 16 && xor8_off + xor8_sz <= file_size {
-            xor8::deserialize(&data[xor8_off..xor8_off + xor8_sz])
+            let bytes = &data[xor8_off..xor8_off + xor8_sz];
+            if xxh::checksum(bytes) != read_u64_le(data, OFF_XOR8_CHECKSUM) {
+                return Err(StorageError::ChecksumMismatch);
+            }
+            xor8::deserialize(bytes)
         } else {
             None
         };

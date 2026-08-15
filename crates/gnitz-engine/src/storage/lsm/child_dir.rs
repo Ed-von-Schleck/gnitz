@@ -186,6 +186,55 @@ mod tests {
         }
     }
 
+    /// `seed_missing_locals` hard-links rank 0's shards into a sibling child
+    /// under the same basename, which is what keeps their descriptive digests
+    /// valid where they land.
+    #[test]
+    fn seeded_child_shard_opens_under_its_linked_name() {
+        use crate::storage::lsm::shard_reader::MappedShard;
+        use crate::test_support::{make_batch, make_schema_u64_i64};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let rel_dir = tmp.path().to_str().unwrap().to_string();
+        let schema = make_schema_u64_i64();
+        let source = ChildAddr::Local(0).dir(&rel_dir);
+        super::super::table::ensure_dir(&source).unwrap();
+
+        let name = "shard_42_1.db";
+        let rows: Vec<(u64, i64, i64)> = (1..=4).map(|i| (i, 1, i as i64 * 10)).collect();
+        make_batch(&schema, &rows)
+            .write_as_shard(
+                &cstr(format!("{source}/{name}")).unwrap(),
+                &schema,
+                super::super::shard_file::ShardWriteOpts::default(),
+            )
+            .unwrap();
+
+        let mut filename = [0u8; 128];
+        filename[..name.len()].copy_from_slice(name.as_bytes());
+        let entries = [manifest::ManifestEntryRaw {
+            max_lsn: 1,
+            filename,
+            level: 0,
+            guard_key: 0,
+        }];
+        manifest::prepare_file(
+            &cstr(manifest::path(&source)).unwrap(),
+            &entries,
+            manifest::ManifestHeader::default(),
+        )
+        .unwrap()
+        .commit()
+        .unwrap();
+
+        seed_missing_locals(&rel_dir, 2).unwrap();
+
+        let target = ChildAddr::Local(1).dir(&rel_dir);
+        let shard = MappedShard::open(&cstr(format!("{target}/{name}")).unwrap(), &schema, true)
+            .expect("a hard-linked shard keeps its basename, so its digest still validates");
+        assert_eq!(shard.count, 4);
+    }
+
     #[test]
     fn ownership_follows_the_live_grammar() {
         let local = Routing::Unhashed { rank: 0 };

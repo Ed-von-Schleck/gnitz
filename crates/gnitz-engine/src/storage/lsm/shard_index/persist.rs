@@ -11,8 +11,12 @@ use super::{ShardEntry, ShardIndex, MAX_LEVELS};
 
 /// Basename of a shard's full path — its manifest identity. Shard files always
 /// live flat in the table's `output_dir`, which `load_manifest` re-prepends.
+///
+/// The reduction itself is the shard reader's, so the name recorded here is the
+/// name a shard's descriptive digest is seeded with. Splitting UTF-8 at an ASCII
+/// `/` leaves UTF-8, so the conversion back cannot fail.
 fn shard_basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap()
+    std::str::from_utf8(crate::storage::repr::layout::shard_basename(path.as_bytes())).unwrap()
 }
 
 impl ShardIndex {

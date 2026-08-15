@@ -293,8 +293,7 @@ pub(crate) fn decode_for_region(encoded: &[u8], n: usize, elem_width: usize) -> 
 /// test modules.
 #[cfg(test)]
 pub(crate) fn region_dir(image: &[u8], i: usize) -> (usize, u8) {
-    let dir_off = read_u64_le(image, OFF_DIR_OFFSET) as usize;
-    let d = dir_off + i * DIR_ENTRY_SIZE;
+    let d = dir_entry_off(i);
     (read_u64_le(image, d + 8) as usize, image[d + 24])
 }
 
@@ -369,6 +368,25 @@ pub fn write_shard_streaming(
     Ok(())
 }
 
+/// The caller's regions must match the layout `schema` implies: one fixed
+/// region per role, each exactly one element per row, plus the variable-length
+/// blob region. The reader re-derives that layout from the schema alone, and the
+/// descriptive digest is computed from these same bytes — so a region that
+/// disagrees would validate at every open and be mis-read forever. This is the
+/// one writer↔reader disagreement no digest can catch, which is why it is
+/// checked here rather than asserted.
+fn check_region_shape(regions: &[&[u8]], n: usize, strides: &[u8], nr: usize) -> Result<(), StorageError> {
+    if regions.len() != nr + 1 {
+        return Err(StorageError::InvalidShard);
+    }
+    for (i, src) in regions[..nr].iter().enumerate() {
+        if src.len() != n * strides[i] as usize {
+            return Err(StorageError::InvalidShard);
+        }
+    }
+    Ok(())
+}
+
 /// Open .tmp shard, write header+regions+xor8, leave fd open and unsynced.
 /// Caller is responsible for close and rename. On error the fd is closed and
 /// the .tmp is unlinked.
@@ -385,11 +403,10 @@ fn write_shard_streaming_inner(
     let n = row_count as usize;
     // Writer↔reader region-layout contract, shared with `MappedShard::open`:
     // `strides` holds each fixed-width region's per-element width, `nr` is the
-    // trailing blob region's index. Debug-only checks: production callers derive
-    // `regions` and `schema` from the same batch.
+    // trailing blob region's index.
     let (strides, nr) = strides_from_schema(schema);
     let nr = nr as usize;
-    debug_assert_eq!(num_regions, nr + 1, "region count must be 3 + num_payload_cols + 1");
+    check_region_shape(regions, n, &strides, nr)?;
     // Shards are ghost-free by construction: flush persists the run set's
     // consolidated net-state run and compaction's merge drops net-zero groups.
     debug_assert!(
@@ -404,20 +421,18 @@ fn write_shard_streaming_inner(
     for i in 0..num_regions {
         let src = regions[i];
         let orig_sz = src.len();
-        // The blob region is variable-length (always Raw); empty regions never
-        // reach the encoders.
-        if n == 0 || orig_sz == 0 || i >= nr {
+        // The blob region is variable-length (always Raw); a rowless shard has
+        // nothing to encode. `check_region_shape` already tied every other
+        // region's length to `n`.
+        if n == 0 || i >= nr {
             encodings.push(RegionEncoding::Raw);
             actual_sizes.push(orig_sz);
             continue;
         }
-        // A wrong-stride schema would silently mis-chunk the directory.
         let width = strides[i] as usize;
-        debug_assert_eq!(
-            orig_sz,
-            n * width,
-            "region {i}: schema width {width} × {n} rows != region size {orig_sz}"
-        );
+        if orig_sz != n * width {
+            return Err(StorageError::InvalidShard);
+        }
         // FoR eligibility: only fixed-int payload regions, only when the caller
         // opted in (compaction outputs). `Some(signed)` when eligible.
         let for_signed = (opts.pack_ints && i >= REG_PAYLOAD_START)
@@ -451,9 +466,8 @@ fn write_shard_streaming_inner(
     };
 
     // --- Phase 3: compute offsets ---
-    let dir_size = num_regions * DIR_ENTRY_SIZE;
-    let dir_offset = HEADER_SIZE;
-    let mut pos = align64(dir_offset + dir_size);
+    let hdr_dir_size = desc_len(num_regions);
+    let mut pos = align64(hdr_dir_size);
     let mut region_offsets = Vec::with_capacity(num_regions);
     for &actual_sz in actual_sizes.iter().take(num_regions) {
         region_offsets.push(pos);
@@ -472,7 +486,6 @@ fn write_shard_streaming_inner(
     };
 
     // --- Phase 4: build header + directory buffer ---
-    let hdr_dir_size = HEADER_SIZE + dir_size;
     let mut hdr_buf = vec![0u8; hdr_dir_size];
 
     for i in 0..num_regions {
@@ -485,7 +498,7 @@ fn write_shard_streaming_inner(
             0
         };
 
-        let d = dir_offset + i * DIR_ENTRY_SIZE;
+        let d = dir_entry_off(i);
         write_u64_le(&mut hdr_buf, d, region_offsets[i] as u64);
         write_u64_le(&mut hdr_buf, d + 8, actual_sizes[i] as u64);
         write_u64_le(&mut hdr_buf, d + 16, cs);
@@ -501,9 +514,22 @@ fn write_shard_streaming_inner(
     write_u64_le(&mut hdr_buf, OFF_MAGIC, SHARD_MAGIC);
     write_u64_le(&mut hdr_buf, OFF_VERSION, SHARD_VERSION);
     write_u64_le(&mut hdr_buf, OFF_ROW_COUNT, row_count as u64);
-    write_u64_le(&mut hdr_buf, OFF_DIR_OFFSET, dir_offset as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_SIZE, xor8_size as u64);
+    // A filterless shard carries 0 here and `xor8_offset == 0`, which is the
+    // reader's own filterless arm. The field sits in the header, so the digest
+    // below closes over it: a forged filter cannot be re-stamped to match.
+    write_u64_le(
+        &mut hdr_buf,
+        OFF_XOR8_CHECKSUM,
+        xor8_data.as_ref().map_or(0, |d| xxh::checksum(d)),
+    );
+
+    // Last, over every other field. `basename` is the *final* name — the `.tmp`
+    // suffix below is applied afterwards and the rename restores it — so writer
+    // and reader seed the digest identically.
+    let desc = desc_digest(shard_basename(basename.to_bytes()), &hdr_buf, num_regions);
+    write_u64_le(&mut hdr_buf, OFF_DESC_CHECKSUM, desc);
 
     let tmp_name = super::super::cstr_with_tmp_suffix(basename)?;
 
@@ -545,18 +571,10 @@ fn write_shard_streaming_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::lsm::shard_reader::MappedShard;
+    use crate::test_support::{make_schema_u64_i64, pk_only_schema};
     use gnitz_wire::as_le_bytes;
-
-    fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
-        let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
-        cols[0] = SchemaColumn::new(8, 0);
-        if num_cols > 1 {
-            cols[1] = SchemaColumn::new(9, 0);
-        }
-        SchemaDescriptor::new(&cols[..num_cols as usize], &[pk_index])
-    }
 
     #[test]
     fn build_image_roundtrip() {
@@ -583,7 +601,7 @@ mod tests {
             &cpath,
             row_count,
             &regions,
-            &make_schema_desc(2, 0),
+            &make_schema_u64_i64(),
             ShardWriteOpts::default(),
         )
         .unwrap();
@@ -605,7 +623,7 @@ mod tests {
         let regions: Vec<&[u8]> = vec![&[], &[], &[], &[]];
 
         // All-PK single-column schema (num_payload_cols = 0) → 4 regions.
-        let schema = make_schema_desc(1, 0);
+        let schema = pk_only_schema(&[type_code::U64]);
         write_shard_streaming(libc::AT_FDCWD, &cpath, 0, &regions, &schema, ShardWriteOpts::default()).unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
@@ -637,7 +655,7 @@ mod tests {
             &blob,
         ];
 
-        let schema = make_schema_desc(2, 0);
+        let schema = make_schema_u64_i64();
         write_shard_streaming(
             libc::AT_FDCWD,
             &cpath,
@@ -686,7 +704,7 @@ mod tests {
             &blob,
         ];
 
-        let schema = make_schema_desc(2, 0);
+        let schema = make_schema_u64_i64();
         write_shard_streaming(libc::AT_FDCWD, &cpath, n, &regions, &schema, ShardWriteOpts::default()).unwrap();
         let image = std::fs::read(&path).unwrap();
         assert_eq!(
@@ -739,7 +757,7 @@ mod tests {
             &cpath,
             n,
             &regions,
-            &make_schema_desc(2, 0),
+            &make_schema_u64_i64(),
             ShardWriteOpts::default(),
         )
         .unwrap();
@@ -777,7 +795,7 @@ mod tests {
             &blob,
         ];
 
-        let schema = make_schema_desc(2, 0);
+        let schema = make_schema_u64_i64();
         write_shard_streaming(
             libc::AT_FDCWD,
             &cpath,
@@ -907,6 +925,54 @@ mod tests {
             (n_c * 8, ENCODING_RAW),
             "C weight ≥3 distinct → raw"
         );
+    }
+
+    /// `check_region_shape`, both arms. It runs ahead of every syscall, so a
+    /// rejected write leaves neither the shard nor its staging file behind.
+    #[test]
+    fn regions_disagreeing_with_the_schema_fail_the_write_and_leave_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = 4u32;
+        let pk_bytes: Vec<u8> = (1u64..=4).flat_map(|p| p.to_be_bytes()).collect();
+        let weights: Vec<i64> = vec![1; 4];
+        let nulls: Vec<u64> = vec![0; 4];
+        let vals: Vec<i64> = vec![10, 20, 30, 40];
+        let blob: Vec<u8> = vec![];
+        let full: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&weights),
+            as_le_bytes(&nulls),
+            as_le_bytes(&vals),
+            &blob,
+        ];
+        // Three payload values where the schema's stride implies four, and a
+        // region list one short of the schema's arity.
+        let mut short_payload = full.clone();
+        short_payload[REG_PAYLOAD_START] = &as_le_bytes(&vals)[..24];
+
+        for (name, regions) in [
+            ("short payload region", &short_payload),
+            ("missing region", &full[..4].to_vec()),
+        ] {
+            let path = dir.path().join(format!("{name}.db"));
+            assert_eq!(
+                write_shard_streaming(
+                    libc::AT_FDCWD,
+                    &std::ffi::CString::new(path.to_str().unwrap()).unwrap(),
+                    n,
+                    regions,
+                    &make_schema_u64_i64(),
+                    ShardWriteOpts::default(),
+                ),
+                Err(StorageError::InvalidShard),
+                "{name}",
+            );
+            assert!(!path.exists(), "{name}: no shard file");
+            assert!(
+                !dir.path().join(format!("{name}.db.tmp")).exists(),
+                "{name}: no staging file either",
+            );
+        }
     }
 
     #[test]

@@ -108,12 +108,13 @@ pub struct MappedShard {
 
 #[cfg(test)]
 mod tests {
-    use super::super::batch::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+    use super::super::batch::{strides_from_schema, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
     use super::super::error::StorageError;
     use super::super::layout::*;
     use super::super::shard_file::{region_dir, ShardWriteOpts};
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
+    use crate::foundation::xxh;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, read_german_string};
 
@@ -161,6 +162,48 @@ mod tests {
         )
         .unwrap();
         path.to_str().unwrap().to_string()
+    }
+
+    /// Region count under `schema`: the fixed roles plus the trailing blob.
+    fn num_regions(schema: &SchemaDescriptor) -> usize {
+        strides_from_schema(schema).1 as usize + 1
+    }
+
+    /// Patch a copy of `base` — the image already written at `path` — write it
+    /// back to `path`, and open it. The descriptive digest is left stale, so a
+    /// patch inside the prefix is rejected by the digest. Writing back to the
+    /// same path keeps the basename, and with it the digest's seed, unchanged;
+    /// under a fresh name every case would fail on the name alone.
+    ///
+    /// Opens with checksum validation off. Both unconditional digests run ahead
+    /// of that gate, so it cannot change any verdict here — only mask one, by
+    /// tripping on a per-region checksum left stale by the patch.
+    fn open_patched(
+        path: &str,
+        schema: &SchemaDescriptor,
+        base: &[u8],
+        patch: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<MappedShard, StorageError> {
+        let mut data = base.to_vec();
+        patch(&mut data);
+        std::fs::write(path, &data).unwrap();
+        MappedShard::open(&std::ffi::CString::new(path).unwrap(), schema, false)
+    }
+
+    /// As [`open_patched`], but re-stamp the descriptive digest after the patch,
+    /// so the forgery reaches the structural check under test.
+    fn open_patched_restamped(
+        path: &str,
+        schema: &SchemaDescriptor,
+        base: &[u8],
+        patch: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<MappedShard, StorageError> {
+        open_patched(path, schema, base, |data| {
+            patch(data);
+            let cpath = std::ffi::CString::new(path).unwrap();
+            let cs = desc_digest(shard_basename(cpath.to_bytes()), data, num_regions(schema));
+            write_u64_le(data, OFF_DESC_CHECKSUM, cs);
+        })
     }
 
     #[test]
@@ -233,8 +276,7 @@ mod tests {
 
         let path_str = cpath.to_str().unwrap();
         let mut data = std::fs::read(path_str).unwrap();
-        let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
-        let pk_lo_off = read_u64_le(&data, dir_off) as usize;
+        let pk_lo_off = read_u64_le(&data, HEADER_SIZE) as usize;
         data[pk_lo_off] ^= 0xFF;
         std::fs::write(path_str, &data).unwrap();
 
@@ -383,37 +425,12 @@ mod tests {
         let rows: Vec<(u64, i64)> = vec![(1, 10)];
         let path = build_test_shard(dir.path(), &rows);
         let schema = make_schema_u64_i64();
+        let base = std::fs::read(&path).unwrap();
 
-        // Corrupt: set encoding byte of first region to 0x10
-        let mut data = std::fs::read(&path).unwrap();
-        let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
-        data[dir_off + 24] = 0x10; // unknown encoding
-        std::fs::write(&path, &data).unwrap();
-
-        let cpath = std::ffi::CString::new(path).unwrap();
+        // Set the first region's encoding byte to 0x10, re-stamping the digest so
+        // the verdict is the decode site's rather than the digest's.
         assert_eq!(
-            MappedShard::open(&cpath, &schema, false).err(),
-            Some(StorageError::InvalidShard)
-        );
-    }
-
-    #[test]
-    fn nonzero_reserved_rejected() {
-        raise_fd_limit_for_tests();
-        let dir = tempfile::tempdir().unwrap();
-        let rows: Vec<(u64, i64)> = vec![(1, 10)];
-        let path = build_test_shard(dir.path(), &rows);
-        let schema = make_schema_u64_i64();
-
-        // Corrupt: set a reserved byte to non-zero
-        let mut data = std::fs::read(&path).unwrap();
-        let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
-        data[dir_off + 25] = 0xFF; // reserved byte
-        std::fs::write(&path, &data).unwrap();
-
-        let cpath = std::ffi::CString::new(path).unwrap();
-        assert_eq!(
-            MappedShard::open(&cpath, &schema, false).err(),
+            open_patched_restamped(&path, &schema, &base, |data| data[dir_entry_off(REG_PK) + 24] = 0x10).err(),
             Some(StorageError::InvalidShard)
         );
     }
@@ -434,26 +451,24 @@ mod tests {
         // The weight region must be TwoValue.  Shrink its size field in the
         // directory entry so bitvec_len < ceil(n/8) = 8 bytes.  Weight
         // region is entry index 1 in the directory.
-        let mut data = std::fs::read(&path).unwrap();
-        let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
-        // Entry index 1 = weight region.
-        let weight_entry_off = dir_off + DIR_ENTRY_SIZE;
-        let orig_size = read_u64_le(&data, weight_entry_off + 8);
+        let base = std::fs::read(&path).unwrap();
+        let weight_entry_off = dir_entry_off(REG_WEIGHT);
         // Only write the two values (16 bytes), drop the bitvec.
         let truncated_size = 16u64;
         assert!(
-            orig_size > truncated_size,
+            read_u64_le(&base, weight_entry_off + 8) > truncated_size,
             "weight region must be larger than 16 bytes for this test"
         );
-        // Patch the size field.  Checksum validation is disabled below so the
-        // stale checksum doesn't mask the InvalidShard we're expecting.
-        gnitz_wire::write_u64_le(&mut data, weight_entry_off + 8, truncated_size);
-        std::fs::write(&path, &data).unwrap();
-
-        let cpath = std::ffi::CString::new(path).unwrap();
-        // Must be rejected — the bitvec is too short for 64 rows.
+        // Re-stamped, so the digest passes and the bitvec-length check is what
+        // rejects it; checksum validation is off so the stale per-region
+        // checksum doesn't mask the InvalidShard we're expecting.
         assert_eq!(
-            MappedShard::open(&cpath, &schema, false).err(),
+            open_patched_restamped(&path, &schema, &base, |data| write_u64_le(
+                data,
+                weight_entry_off + 8,
+                truncated_size
+            ))
+            .err(),
             Some(StorageError::InvalidShard),
             "truncated TwoValue bitvec must be rejected at open time"
         );
@@ -475,14 +490,11 @@ mod tests {
 
         // Patch the pk directory entry's encoding byte (entry 0, offset +24) to
         // ENCODING_TWO_VALUE. Checksums off so the stale checksum doesn't mask it.
-        let mut data = std::fs::read(&path).unwrap();
-        let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
-        data[dir_off + 24] = ENCODING_TWO_VALUE;
-        std::fs::write(&path, &data).unwrap();
-
-        let cpath = std::ffi::CString::new(path).unwrap();
+        let base = std::fs::read(&path).unwrap();
         assert_eq!(
-            MappedShard::open(&cpath, &schema, false).err(),
+            open_patched_restamped(&path, &schema, &base, |data| data[dir_entry_off(REG_PK) + 24] =
+                ENCODING_TWO_VALUE)
+            .err(),
             Some(StorageError::InvalidShard),
             "TwoValue on the pk region must be rejected at open time"
         );
@@ -867,23 +879,6 @@ mod tests {
         region_dir(&std::fs::read(path).unwrap(), region_idx)
     }
 
-    /// Clone `base`, apply `patch`, write it to `name` under `dir`, and open it
-    /// with checksum validation off (so a stale checksum doesn't mask the
-    /// verdict under test).
-    fn open_patched(
-        dir: &std::path::Path,
-        name: &str,
-        base: &[u8],
-        patch: impl FnOnce(&mut Vec<u8>),
-    ) -> Result<MappedShard, StorageError> {
-        let mut data = base.to_vec();
-        patch(&mut data);
-        let path = dir.join(name);
-        std::fs::write(&path, &data).unwrap();
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        MappedShard::open(&cpath, &make_schema_u64_i64(), false)
-    }
-
     #[test]
     fn packed_roundtrip_all_surfaces() {
         raise_fd_limit_for_tests();
@@ -966,13 +961,13 @@ mod tests {
         let path = build_i64_shard(dir.path(), "forge.db", &pks, &vals, false);
 
         // Forge ENCODING_FOR onto each non-payload role (pk / weight / null /
-        // blob); every one must be rejected at open (`open_patched` disables
-        // checksum validation, isolating the role check).
+        // blob); every one must be rejected at open by the role check, so the
+        // digest is re-stamped and checksum validation left off.
         let base = std::fs::read(&path).unwrap();
+        let schema = make_schema_u64_i64();
         for region_idx in [REG_PK, REG_WEIGHT, REG_NULL_BMP, 4 /* blob */] {
-            let opened = open_patched(dir.path(), &format!("forged_{region_idx}.db"), &base, |data| {
-                let dir_off = read_u64_le(data, OFF_DIR_OFFSET) as usize;
-                data[dir_off + region_idx * DIR_ENTRY_SIZE + 24] = ENCODING_FOR;
+            let opened = open_patched_restamped(&path, &schema, &base, |data| {
+                data[dir_entry_off(region_idx) + 24] = ENCODING_FOR;
             });
             assert_eq!(
                 opened.err(),
@@ -992,35 +987,33 @@ mod tests {
         // Confirm it packed.
         assert_eq!(payload_dir_entry(&path, REG_PAYLOAD_START).1, ENCODING_FOR);
         let base = std::fs::read(&path).unwrap();
-        let dir_off = read_u64_le(&base, OFF_DIR_OFFSET) as usize;
-        let d = dir_off + REG_PAYLOAD_START * DIR_ENTRY_SIZE;
+        let schema = make_schema_u64_i64();
+        let d = dir_entry_off(REG_PAYLOAD_START);
         let sz = read_u64_le(&base, d + 8);
 
-        // (a) count == 0: patch the header row count to 0.
+        // (a) count == 0: patch the header row count to 0. The fixed regions'
+        // sizes go to 0 with it, or the exact-size check rejects the PK region
+        // (128 != 0) before the divisor guard this case names is reached.
         assert_eq!(
-            open_patched(dir.path(), "count0.db", &base, |data| write_u64_le(
-                data,
-                OFF_ROW_COUNT,
-                0
-            ))
+            open_patched_restamped(&path, &schema, &base, |data| {
+                write_u64_le(data, OFF_ROW_COUNT, 0);
+                for r in [REG_PK, REG_WEIGHT, REG_NULL_BMP] {
+                    write_u64_le(data, dir_entry_off(r) + 8, 0);
+                }
+            })
             .err(),
             Some(StorageError::InvalidShard),
             "count == 0 must be rejected",
         );
         // (b) size < 8: patch the payload entry size to 4.
         assert_eq!(
-            open_patched(dir.path(), "size4.db", &base, |data| write_u64_le(data, d + 8, 4)).err(),
+            open_patched_restamped(&path, &schema, &base, |data| write_u64_le(data, d + 8, 4)).err(),
             Some(StorageError::InvalidShard),
             "size < 8 must be rejected",
         );
         // (c) size not an exact 8 + count·bw: bump by one non-multiple byte.
         assert_eq!(
-            open_patched(dir.path(), "size_off.db", &base, |data| write_u64_le(
-                data,
-                d + 8,
-                sz + 1
-            ))
-            .err(),
+            open_patched_restamped(&path, &schema, &base, |data| write_u64_le(data, d + 8, sz + 1)).err(),
             Some(StorageError::InvalidShard),
             "inexact 8 + count·bw size must be rejected",
         );
@@ -1088,8 +1081,7 @@ mod tests {
 
         // Flip a byte in the packed payload region's on-disk offset bytes.
         let mut data = std::fs::read(&path).unwrap();
-        let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
-        let d = dir_off + REG_PAYLOAD_START * DIR_ENTRY_SIZE;
+        let d = dir_entry_off(REG_PAYLOAD_START);
         let roff = read_u64_le(&data, d) as usize;
         data[roff + 16] ^= 0xFF; // past the 8-byte ref, into the offset bytes
         std::fs::write(&path, &data).unwrap();
@@ -1108,7 +1100,7 @@ mod tests {
     /// Passing the cells in lets a caller give two rows the *same* heap span,
     /// which a per-row `encode_german_string` never does (it appends
     /// unconditionally). Rows must be PK-ascending.
-    fn write_string_shard(dir: &std::path::Path, name: &str, rows: &[(u64, [u8; 16])], blob: &[u8]) -> MappedShard {
+    fn write_string_shard(dir: &std::path::Path, name: &str, rows: &[(u64, [u8; 16])], blob: &[u8]) -> String {
         use crate::storage::Batch;
         let schema = make_schema_pk_u64_payload_string();
         let mut batch = Batch::with_capacity(schema, rows.len().max(1));
@@ -1120,11 +1112,36 @@ mod tests {
             batch.extend_col(0, &cell);
             batch.count += 1;
         }
-        let cpath = std::ffi::CString::new(dir.join(name).to_str().unwrap()).unwrap();
+        let path = dir.join(name).to_str().unwrap().to_string();
         batch
-            .write_as_shard(&cpath, &schema, ShardWriteOpts::default())
+            .write_as_shard(
+                &std::ffi::CString::new(path.as_str()).unwrap(),
+                &schema,
+                ShardWriteOpts::default(),
+            )
             .unwrap();
-        MappedShard::open(&cpath, &schema, false).unwrap()
+        path
+    }
+
+    /// Open a `(U64 PK | STRING payload)` shard written by [`write_string_shard`].
+    fn open_string_shard(path: &str) -> MappedShard {
+        let schema = make_schema_pk_u64_payload_string();
+        MappedShard::open(&std::ffi::CString::new(path).unwrap(), &schema, false).unwrap()
+    }
+
+    /// One distinct heap string per row — the blob-region shape the fixed-size
+    /// relations cannot reach, since a blob length is genuinely non-derivable.
+    fn build_string_shard(dir: &std::path::Path, name: &str, n: usize, width: usize) -> String {
+        let mut blob = Vec::new();
+        let rows: Vec<(u64, [u8; 16])> = (0..n)
+            .map(|i| {
+                (
+                    i as u64 + 1,
+                    gnitz_wire::encode_german_string(&wide_string(i, width), &mut blob),
+                )
+            })
+            .collect();
+        write_string_shard(dir, name, &rows, &blob)
     }
 
     /// A `width`-byte string unique to row `i`, long enough to spill to the heap.
@@ -1160,7 +1177,7 @@ mod tests {
             )
         }));
         let schema = make_schema_pk_u64_payload_string();
-        let shard = write_string_shard(dir.path(), "reloc.db", &rows, &blob);
+        let shard = open_string_shard(&write_string_shard(dir.path(), "reloc.db", &rows, &blob));
         assert_eq!(shard.blob_len, (N - 1) * W, "row 1 added no bytes");
 
         let one = shard.slice_to_owned_batch(37, 1, &schema);
@@ -1221,7 +1238,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let shard = write_string_shard(dir.path(), &format!("bench_{w}.db"), &rows, &blob);
+            let shard = open_string_shard(&write_string_shard(dir.path(), &format!("bench_{w}.db"), &rows, &blob));
             for &pct in &[
                 1usize, 2, 3, 4, 6, 8, 12, 16, 20, 25, 33, 40, 50, 60, 68, 75, 85, 90, 99,
             ] {
@@ -1240,5 +1257,311 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Descriptive-prefix and filter integrity
+    // -----------------------------------------------------------------------
+
+    /// Byte offset of directory entry `i`.
+    fn dir_entry_off(i: usize) -> usize {
+        HEADER_SIZE + i * DIR_ENTRY_SIZE
+    }
+
+    /// The forgeries a byte-wise sweep cannot model: each one *permutes* or
+    /// *relocates* bytes that are individually unchanged, so it is rejected only
+    /// because the digest is order- and position-sensitive. Every one of them
+    /// leaves a self-consistent file that passes every structural check.
+    #[test]
+    fn permuted_directory_entries_rejected() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        // Distinct PKs (Raw), all-1 weights (Constant), all-0 nulls (Constant),
+        // varying payload (Raw).
+        let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let base = std::fs::read(&path).unwrap();
+        assert_eq!(region_dir(&base, REG_NULL_BMP), (8, ENCODING_CONSTANT));
+        assert_eq!(region_dir(&base, REG_PAYLOAD_START), (80, ENCODING_RAW));
+
+        let pk_e = dir_entry_off(REG_PK);
+        let w_e = dir_entry_off(REG_WEIGHT);
+        let nb_e = dir_entry_off(REG_NULL_BMP);
+        let pay_e = dir_entry_off(REG_PAYLOAD_START);
+        let swap = |d: &mut Vec<u8>, a: usize, b: usize| {
+            for k in 0..DIR_ENTRY_SIZE {
+                d.swap(a + k, b + k);
+            }
+        };
+
+        // Each entry keeps the size its encoding demands, so every per-role
+        // check passes and the payload column collapses to the null bitmap's
+        // constant. A per-region checksum cannot catch this: it travels inside
+        // the entry and moves with it.
+        assert_eq!(
+            open_patched(&path, &schema, &base, |d| swap(d, nb_e, pay_e)).err(),
+            Some(StorageError::ChecksumMismatch),
+            "null_bmp <-> payload entries swapped",
+        );
+        // weight and null_bmp are both Constant at 8 bytes, so the swapped
+        // entries are byte-identical in every field a relation could check.
+        assert_eq!(
+            open_patched(&path, &schema, &base, |d| swap(d, w_e, nb_e)).err(),
+            Some(StorageError::ChecksumMismatch),
+            "identical (size, encoding) entries swapped",
+        );
+        // A region offset pointed at another region: every byte it names is
+        // real, and the size still matches the schema.
+        assert_eq!(
+            open_patched(&path, &schema, &base, |d| {
+                let w_off = read_u64_le(d, w_e);
+                write_u64_le(d, pk_e, w_off);
+            })
+            .err(),
+            Some(StorageError::ChecksumMismatch),
+            "pk offset redirected to the weight region",
+        );
+    }
+
+    /// A file truncated inside its directory reports `Truncated`, not a digest
+    /// mismatch — the prefix-length check runs ahead of the digest.
+    #[test]
+    fn truncated_directory_reports_truncated() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let base = std::fs::read(&path).unwrap();
+        assert_eq!(
+            open_patched(&path, &schema, &base, |d| d.truncate(dir_entry_off(2))).err(),
+            Some(StorageError::Truncated),
+        );
+    }
+
+    /// The filter's own digest, which lives outside the descriptive prefix. A
+    /// corrupt filter still deserializes and answers "not present" for keys the
+    /// shard holds, so rejecting it is not optional.
+    #[test]
+    fn forged_xor8_rejected() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let base = std::fs::read(&path).unwrap();
+        let xoff = read_u64_le(&base, OFF_XOR8_OFFSET) as usize;
+        let xsz = read_u64_le(&base, OFF_XOR8_SIZE) as usize;
+        assert!(xoff > 0 && xsz >= 16);
+
+        // The patches land outside the prefix, so the stale descriptive digest is
+        // irrelevant and the verdict is the filter digest's.
+        for (name, at) in [("seed", xoff + 4), ("fingerprint", xoff + xsz - 1)] {
+            assert_eq!(
+                open_patched(&path, &schema, &base, |d| d[at] ^= 0x01).err(),
+                Some(StorageError::ChecksumMismatch),
+                "{name} flip",
+            );
+        }
+
+        // Re-stamping the filter's checksum to match a forged filter is rejected
+        // by the descriptive digest — which is why the field lives in the header.
+        assert_eq!(
+            open_patched(&path, &schema, &base, |d| {
+                d[xoff + 4] ^= 0x01;
+                let cs = xxh::checksum(&d[xoff..xoff + xsz]);
+                write_u64_le(d, OFF_XOR8_CHECKSUM, cs);
+            })
+            .err(),
+            Some(StorageError::ChecksumMismatch),
+            "a re-stamped filter checksum is inside the descriptive digest",
+        );
+    }
+
+    #[test]
+    fn empty_shard_carries_no_filter_and_a_zero_checksum() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let path = build_test_shard(dir.path(), &[]);
+        let image = std::fs::read(&path).unwrap();
+        assert_eq!(read_u64_le(&image, OFF_XOR8_OFFSET), 0);
+        assert_eq!(read_u64_le(&image, OFF_XOR8_CHECKSUM), 0);
+        let shard = MappedShard::open(&std::ffi::CString::new(path).unwrap(), &schema, true).unwrap();
+        assert!(!shard.has_xor8());
+    }
+
+    /// The digest is seeded with the basename and nothing else: a shard renamed
+    /// out from under the manifest fails to open, while one hard-linked into
+    /// another directory under the same name still opens. The second half is
+    /// what `seed_missing_locals` relies on when it seeds a sibling child.
+    #[test]
+    fn the_digest_seed_separates_names_not_directories() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let open = |p: &std::path::Path| {
+            MappedShard::open(&std::ffi::CString::new(p.to_str().unwrap()).unwrap(), &schema, false)
+        };
+
+        let sibling = dir.path().join("child");
+        std::fs::create_dir(&sibling).unwrap();
+        let linked = sibling.join("test.db");
+        std::fs::hard_link(&path, &linked).unwrap();
+        assert_eq!(open(&linked).unwrap().count, 4, "same name, another directory");
+
+        let moved = dir.path().join("renamed.db");
+        std::fs::rename(&path, &moved).unwrap();
+        assert_eq!(open(&moved).err(), Some(StorageError::ChecksumMismatch), "new name");
+    }
+
+    /// The shard shapes the sweep below runs over: one per *region count*, since
+    /// that is what sets the digest's span, plus the encodings that vary within
+    /// one. `(label, path, schema)`.
+    fn sweep_shapes(dir: &std::path::Path) -> Vec<(&'static str, String, SchemaDescriptor)> {
+        let n = 32usize;
+        let seq: Vec<u64> = (1..=n as u64).collect();
+        // All-PK (no payload column), so 4 regions rather than 5 — the arity the
+        // reader derives from the schema and checks the prefix length against.
+        let all_pk = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+        let pk_only: Vec<u8> = seq.iter().flat_map(|&p| p.to_be_bytes()).collect();
+        let cpath = std::ffi::CString::new(dir.join("sw_pkonly.db").to_str().unwrap()).unwrap();
+        super::super::shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            n as u32,
+            &[&pk_only, as_le_bytes(&vec![1i64; n]), as_le_bytes(&vec![0u64; n]), &[]],
+            &all_pk,
+            ShardWriteOpts::default(),
+        )
+        .unwrap();
+
+        vec![
+            // Constant PK / Constant weight / Constant null / Constant payload.
+            (
+                "all-constant",
+                build_test_shard_weights(
+                    dir,
+                    "sw_const.db",
+                    &vec![1u64; n],
+                    &vec![1i64; n],
+                    &vec![7i64; n],
+                    false,
+                ),
+                make_schema_u64_i64(),
+            ),
+            // TwoValue weight, and a FoR-packed payload.
+            (
+                "two-value weight, for-packed payload",
+                build_test_shard_weights(
+                    dir,
+                    "sw_twoval_for.db",
+                    &seq,
+                    &(0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect::<Vec<_>>(),
+                    &(0..n as i64).map(|i| 5_000_000 + i).collect::<Vec<_>>(),
+                    true,
+                ),
+                make_schema_u64_i64(),
+            ),
+            // A blob region with real content.
+            (
+                "string payload",
+                build_string_shard(dir, "sw_string.db", 24, 48),
+                make_schema_pk_u64_payload_string(),
+            ),
+            ("all-pk (4 regions)", cpath.to_str().unwrap().to_string(), all_pk),
+        ]
+    }
+
+    /// The verdict a corruption at `off` inside the prefix must produce. Magic and
+    /// version are checked ahead of the digest so a wrong-format or wrong-build
+    /// file names its actual defect; every other byte is the digest's.
+    fn prefix_verdict(off: usize) -> StorageError {
+        match off {
+            o if o < OFF_VERSION => StorageError::InvalidMagic,
+            o if o < OFF_ROW_COUNT => StorageError::InvalidVersion,
+            _ => StorageError::ChecksumMismatch,
+        }
+    }
+
+    /// Every bit of the descriptive prefix, including the digest field itself,
+    /// is inside the digest: no single-bit change to it opens.
+    #[test]
+    fn every_single_bit_flip_in_the_prefix_is_rejected() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        for (label, path, schema) in sweep_shapes(dir.path()) {
+            let base = std::fs::read(&path).unwrap();
+            let n_desc = desc_len(num_regions(&schema));
+            assert!(n_desc <= base.len());
+            for off in 0..n_desc {
+                for bit in 0..8u32 {
+                    assert_eq!(
+                        open_patched(&path, &schema, &base, |d| d[off] ^= 1 << bit).err(),
+                        Some(prefix_verdict(off)),
+                        "{label}: byte {off} bit {bit}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every fixed-width region carries exactly what the schema implies — one
+    /// byte either way is rejected. Re-stamped, so the verdict is the size
+    /// check's rather than the digest's.
+    #[test]
+    fn off_by_one_region_sizes_rejected() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 3)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let base = std::fs::read(&path).unwrap();
+
+        for region in [REG_PK, REG_WEIGHT, REG_NULL_BMP, REG_PAYLOAD_START] {
+            let e = dir_entry_off(region);
+            let sz = read_u64_le(&base, e + 8);
+            for delta in [-1i64, 1] {
+                assert_eq!(
+                    open_patched_restamped(&path, &schema, &base, |d| write_u64_le(
+                        d,
+                        e + 8,
+                        (sz as i64 + delta) as u64
+                    ))
+                    .err(),
+                    Some(StorageError::InvalidShard),
+                    "region {region} size {sz}{delta:+}",
+                );
+            }
+        }
+    }
+
+    /// The long direction of the TwoValue bitvec relation — the short direction is
+    /// `two_value_truncated_bitvec_rejected`.
+    #[test]
+    fn two_value_long_bitvec_rejected() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let n = 64usize;
+        let path = build_test_shard_weights(
+            dir.path(),
+            "twoval_long.db",
+            &(1..=n as u64).collect::<Vec<_>>(),
+            &(0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect::<Vec<_>>(),
+            &(0..n as i64).collect::<Vec<_>>(),
+            false,
+        );
+        let base = std::fs::read(&path).unwrap();
+        let e = dir_entry_off(REG_WEIGHT);
+        let sz = read_u64_le(&base, e + 8);
+        assert_eq!(sz as usize, 16 + n.div_ceil(8), "weight region must be TwoValue");
+        assert_eq!(
+            open_patched_restamped(&path, &schema, &base, |d| write_u64_le(d, e + 8, sz + 1)).err(),
+            Some(StorageError::InvalidShard),
+        );
     }
 }

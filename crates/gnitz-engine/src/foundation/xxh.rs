@@ -5,16 +5,32 @@ use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 /// non-WAL callers keep `xxh::checksum` without a second identical wrapper.
 pub use gnitz_wire::checksum;
 
+/// XXH3-64 over `seed` followed by `buf` with the eight bytes at `hole`
+/// excluded — the shape a self-describing file header needs, since the field
+/// holding the digest cannot be part of it. `seed` binds the digest to
+/// something outside the buffer; pass `&[]` where there is nothing to bind to.
+///
+/// Writer and reader call this identically, so neither can restate the hashed
+/// span differently from the other.
+#[inline]
+pub fn digest_with_hole(seed: &[u8], buf: &[u8], hole: usize) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3Default::default();
+    h.update(seed);
+    h.update(&buf[..hole]);
+    h.update(&buf[hole + 8..]);
+    h.digest()
+}
+
 /// Hash a 128-bit key to a 64-bit hash via XXH3-64.
 #[inline]
 pub fn hash_u128(pk: u128) -> u64 {
     xxh3_64(&pk.to_le_bytes())
 }
 
-/// Streaming XXH3-128 hasher — the one entry point for a digest built from
-/// several pieces (a row's columns, a group key's columns). Row and group
-/// identity hash to 128 bits for the same reason [`checksum_128`] does: a
-/// 64-bit birthday bound would silently coalesce distinct rows.
+/// Streaming XXH3-128 hasher for row and group identity, built column by
+/// column. Row and group identity hash to 128 bits for the same reason
+/// [`checksum_128`] does: a 64-bit birthday bound would silently coalesce
+/// distinct rows.
 pub use xxhash_rust::xxh3::Xxh3Default as RowHasher;
 
 /// XXH3-128 over arbitrary bytes (no seed). Full 128-bit image — use where a
@@ -60,6 +76,39 @@ mod tests {
         assert_ne!(a >> 64, 0, "128-bit hash must populate the high half");
         // Distinct content → distinct 128-bit keys (no truncation collision).
         assert_ne!(checksum_128(b"abc"), checksum_128(b"abd"));
+    }
+
+    #[test]
+    fn digest_with_hole_equals_checksum_over_the_spliced_bytes() {
+        // The streaming spans must reassemble into exactly seed ++ buf-without-
+        // the-hole. Swept across the 240-byte input size where xxh3 switches
+        // algorithms, and with the hole at both ends of the buffer.
+        let buf: Vec<u8> = (0..600u32).map(|i| (i * 31 + 7) as u8).collect();
+        for &len in &[8usize, 64, 239, 240, 241, 600] {
+            // Every hole must fit: `digest_with_hole` requires `hole + 8 <= len`.
+            for &hole in [0usize, 24, len - 8].iter().filter(|&&h| h + 8 <= len) {
+                for seed in [b"".as_slice(), b"shard_7_1.db".as_slice()] {
+                    let mut spliced = seed.to_vec();
+                    spliced.extend_from_slice(&buf[..hole]);
+                    spliced.extend_from_slice(&buf[hole + 8..len]);
+                    assert_eq!(
+                        digest_with_hole(seed, &buf[..len], hole),
+                        checksum(&spliced),
+                        "len={len} hole={hole} seed={}",
+                        seed.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn digest_with_hole_ignores_the_hole_and_separates_seeds() {
+        let mut buf: Vec<u8> = (0..128u8).collect();
+        let base = digest_with_hole(b"a.db", &buf, 24);
+        buf[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(digest_with_hole(b"a.db", &buf, 24), base, "the hole is excluded");
+        assert_ne!(digest_with_hole(b"b.db", &buf, 24), base, "the seed is included");
     }
 
     #[test]

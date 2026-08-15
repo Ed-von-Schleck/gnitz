@@ -62,28 +62,6 @@ pub(crate) fn pwrite_all_fd(fd: c_int, buf: &[u8], offset: libc::off_t) -> std::
     })
 }
 
-/// Read up to `buf.len()` bytes from `fd`, handling EINTR. Returns the number
-/// of bytes read — short only at EOF.
-pub(crate) fn read_all_fd(fd: c_int, buf: &mut [u8]) -> std::io::Result<usize> {
-    let total = buf.len();
-    let mut offset: usize = 0;
-    while offset < total {
-        let ret = unsafe { libc::read(fd, buf[offset..].as_mut_ptr() as *mut libc::c_void, total - offset) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(err);
-        }
-        if ret == 0 {
-            break; // EOF
-        }
-        offset += ret as usize;
-    }
-    Ok(offset)
-}
-
 /// `libc::openat` returning an `OwnedFd`, or `None` on failure (errno untouched).
 pub(crate) fn openat_owned(dirfd: c_int, name: &std::ffi::CStr, flags: c_int) -> Option<OwnedFd> {
     let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, 0o644 as libc::mode_t) };
@@ -905,10 +883,8 @@ mod tests {
         assert_eq!(st.st_nlink, 0, "O_TMPFILE inode must have no directory entry");
         assert_eq!(st.st_size as usize, data.len(), "written size");
 
-        assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0, "rewind");
-        let mut back = vec![0u8; data.len()];
-        assert_eq!(read_all_fd(fd, &mut back).expect("read back"), data.len());
-        assert_eq!(&back, data, "round-trip through the anonymous file");
+        let mapped = Mmap::from_fd(fd, data.len()).expect("map the anonymous file back");
+        assert_eq!(mapped.as_slice(), data, "round-trip through the anonymous file");
     }
 
     #[test]
