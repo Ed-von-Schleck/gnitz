@@ -24,9 +24,9 @@
 
 use crate::catalog::col;
 use crate::{
-    encode_german_string, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireSysCol, IPC_CONTROL_TID,
-    REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION, WAL_HEADER_SIZE,
-    WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
+    checksum, encode_german_string, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireSysCol,
+    IPC_CONTROL_TID, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION,
+    WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
 const CONTROL_COLS: &[WireSysCol] = &[
@@ -307,13 +307,27 @@ fn read_u128_region(data: &[u8], r: usize) -> Result<u128, &'static str> {
 /// materializing a batch. Each directory entry stores (data_offset: u32,
 /// data_size: u32) at `WAL_HEADER_SIZE + region * 8`. For a 1-row control
 /// block every u64 region is exactly 8 bytes, so the fields index directly.
+///
+/// Verifies the block's checksum, like the schema and data blocks beside it —
+/// use this on frames that crossed a durability or trust boundary (SAL replay,
+/// client ingress). For frames written by `encode_ipc`, which leaves the
+/// checksum zero, use [`peek_control_block_ipc`].
 pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
+    peek_control_block_impl(data, true)
+}
+
+/// [`peek_control_block`] without checksum verification, for the intra-process
+/// frames `encode_ipc` writes: the W2M ring and client egress.
+pub fn peek_control_block_ipc(data: &[u8]) -> Result<DecodedControl, &'static str> {
+    peek_control_block_impl(data, false)
+}
+
+fn peek_control_block_impl(data: &[u8], verify_checksum: bool) -> Result<DecodedControl, &'static str> {
     let dir_end = WAL_HEADER_SIZE + NUM_REGIONS * 8;
     if data.len() < dir_end {
         return Err("control block too small");
     }
 
-    // Validate identity fields without computing the checksum.
     if read_u32_le(data, WAL_OFF_TID) != IPC_CONTROL_TID {
         return Err("control block wrong TID");
     }
@@ -325,6 +339,20 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     }
     if read_u32_le(data, WAL_OFF_NUM_REGIONS) as usize != NUM_REGIONS {
         return Err("control block wrong region count");
+    }
+
+    // `SIZE` frames the rest of the slot and sits outside the block's own
+    // checksum, so the exact blob relation is what constrains it.
+    let block_size = read_u32_le(data, WAL_OFF_SIZE) as usize;
+    if block_size != CTRL_BLOCK_SIZE_NO_BLOB + crate::wal::dir_entry(data, REG_BLOB).1 {
+        return Err("control block size disagrees with its blob region");
+    }
+    if block_size > data.len() {
+        return Err("control block truncated");
+    }
+
+    if verify_checksum && checksum(&data[WAL_HEADER_SIZE..block_size]) != read_u64_le(data, WAL_OFF_CHECKSUM) {
+        return Err("control block checksum mismatch");
     }
 
     let null_bmp = read_u64_region(data, REG_NULL_BMP)?;
@@ -376,7 +404,6 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         )?
     };
 
-    let block_size = read_u32_le(data, WAL_OFF_SIZE) as usize;
     Ok(DecodedControl {
         status,
         client_id,
@@ -405,7 +432,7 @@ mod tests {
         let mut buf = vec![0u8; ctrl_block_size(0, 0)];
         let n = encode_ctrl_block(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, 7, b"", b"");
         assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB);
-        let dec = peek_control_block(&buf[..n]).expect("decode empty");
+        let dec = peek_control_block_ipc(&buf[..n]).expect("decode empty");
         assert_eq!(dec.target_id, 1);
         assert_eq!(dec.client_id, 2);
         assert_eq!(dec.flags, 3);
@@ -422,7 +449,7 @@ mod tests {
         let mut buf = vec![0u8; ctrl_block_size(short.len(), short.len())];
         let n = encode_ctrl_block(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, 7, short, short);
         assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB, "inline strings must not grow the block");
-        let dec = peek_control_block(&buf[..n]).expect("decode short");
+        let dec = peek_control_block_ipc(&buf[..n]).expect("decode short");
         assert_eq!(dec.error_msg, short);
         assert_eq!(dec.seek_pk_extra, short);
 
@@ -432,7 +459,7 @@ mod tests {
         let mut buf = vec![0u8; ctrl_block_size(err.len(), extra.len())];
         let n = encode_ctrl_block(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, 7, err, extra);
         assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB + err.len() + extra.len());
-        let dec = peek_control_block(&buf[..n]).expect("decode long");
+        let dec = peek_control_block_ipc(&buf[..n]).expect("decode long");
         assert_eq!(dec.error_msg, err);
         assert_eq!(dec.seek_pk_extra, extra);
         assert_eq!(dec.block_size, n);
@@ -447,7 +474,7 @@ mod tests {
         buf.truncate(n);
         let (err_off, _) = crate::wal::dir_entry(&buf, REG_ERROR_MSG);
         buf[err_off + 8..err_off + 16].copy_from_slice(&u64::MAX.to_le_bytes());
-        match peek_control_block(&buf) {
+        match peek_control_block_ipc(&buf) {
             Err("error_msg string offset out of bounds") => {}
             Err(other) => panic!("wrong error: {other}"),
             Ok(_) => panic!("OOB error_msg offset must be rejected"),

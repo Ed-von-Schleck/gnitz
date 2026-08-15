@@ -1,7 +1,7 @@
 use crate::runtime::wire::{
     batch_to_schema, build_schema_wire_block, decode_ddl_txn, decode_push_txn, decode_scan_multi, decode_wire,
-    encode_ctrl_block_direct, peek_client_control, peek_control_block, schema_to_batch, WireData, WireMsg,
-    CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
+    encode_ctrl_block_direct, peek_client_control, peek_control_block, peek_control_block_ipc, schema_to_batch,
+    WireData, WireMsg, CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
 };
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout};
@@ -717,8 +717,8 @@ fn decode_wire_truncated_data_block_returns_err() {
 /// every variable field distinct and non-zero so a swapped offset corrupts the
 /// bytes detectably; `offset = 64` so writes accidentally indexing through
 /// `out[offset + OFF_X..]` rather than the sub-slice are also caught. Runs
-/// with and without the engine's checksum stamp — `peek_control_block` never
-/// verifies the checksum, so both frames must decode identically.
+/// with and without the engine's checksum stamp, decoded at the matching
+/// verification setting, so both frames must decode identically.
 #[test]
 fn encode_ctrl_block_direct_roundtrips() {
     const OFFSET: usize = 64;
@@ -750,7 +750,13 @@ fn encode_ctrl_block_direct_roundtrips() {
             n, CTRL_BLOCK_SIZE_NO_BLOB,
             "encoder size mismatch (checksum={checksum})"
         );
-        let dec = peek_control_block(&buf[OFFSET..OFFSET + n]).expect("decode");
+        let block = &buf[OFFSET..OFFSET + n];
+        let dec = if checksum {
+            peek_control_block(block)
+        } else {
+            peek_control_block_ipc(block)
+        }
+        .expect("decode");
         assert_eq!(dec.target_id, target_id);
         assert_eq!(dec.client_id, client_id);
         assert_eq!(dec.flags, wire_flags);

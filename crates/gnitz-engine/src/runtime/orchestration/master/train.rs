@@ -35,7 +35,7 @@ pub(super) fn scan_decode_err(w: usize, e: &'static str) -> String {
 /// (worker scan chunks, chunked seek/gather replies, unique pre-flight frames)
 /// sets `FLAG_CONTINUATION` on every frame and `FLAG_SCAN_LAST` on the last.
 pub(super) fn parse_train_header(slot: &W2mSlot, w: usize, what: &str) -> Result<(wire::DecodedControl, bool), String> {
-    let ctrl = peek_control_block(slot.bytes()).map_err(|e| scan_decode_err(w, e))?;
+    let ctrl = peek_control_block_ipc(slot.bytes()).map_err(|e| scan_decode_err(w, e))?;
     if let Some(e) = super::worker_error(w, what, &ctrl) {
         return Err(e);
     }

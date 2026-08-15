@@ -1,15 +1,30 @@
 use crate::foundation::posix_io;
+use crate::foundation::posix_io::write_u32_raw;
 use crate::runtime::sal::{
-    atomic_load_u64, effective_max, group_header_size, sal_begin_group, sal_read_group_header, sal_tail_slot_count,
-    sal_write_group, SalReader, SalWriter, CHECKPOINT_RESERVE, FLAG_DDL_SYNC, FLAG_FLUSH, FLAG_FLUSH_EPH,
-    FLAG_SHUTDOWN, FLAG_TXN_COMMIT, MAX_WORKERS, MIN_SAL_BYTES, SENTINEL_SIZE,
+    atomic_load_u64, effective_max, group_header_size, sal_begin_group, sal_probe_header, sal_read_group_header,
+    sal_tail_slot_count, sal_write_group, EpochGate, SalRead, SalReadResult, SalReader, SalWriter, CHECKPOINT_RESERVE,
+    FLAG_DDL_SYNC, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_SHUTDOWN, FLAG_TXN_COMMIT, MAX_WORKERS, MIN_SAL_BYTES,
+    SENTINEL_SIZE,
 };
 use crate::runtime::wire::CTRL_BLOCK_SIZE_NO_BLOB;
-use crate::test_support::SharedRegion;
+use crate::test_support::{sweep_bit_flips, SharedRegion};
 use gnitz_wire::align8;
 
 fn make_test_data(val: u8, len: usize) -> Vec<u8> {
     vec![val; len]
+}
+
+/// The group `worker` reads at `base`, or a panic if the bytes are not one.
+unsafe fn group_at(ptr: *const u8, base: u64, worker: u32, size: usize) -> SalReadResult {
+    match sal_read_group_header(ptr, base, worker, EpochGate::Any, size as u64) {
+        SalRead::Group(r) => r,
+        _ => panic!("group present at offset {base}"),
+    }
+}
+
+/// The authenticated epoch of the header at `base`.
+unsafe fn epoch_at(ptr: *const u8, base: u64, size: usize) -> u32 {
+    sal_probe_header(ptr, base, size as u64).expect("header verifies").1
 }
 
 #[test]
@@ -31,10 +46,10 @@ fn test_sal_round_trip() {
         assert!(new_cursor > 0);
 
         for w in 0..4u32 {
-            let rr = sal_read_group_header(ptr, 0, w, None).expect("group present");
+            let rr = group_at(ptr, 0, w, size);
             assert_eq!(rr.lsn, 100);
             assert_eq!(rr.target_id, 42);
-            assert_eq!(rr.epoch, 1);
+            assert_eq!(epoch_at(ptr, 0, size), 1);
             assert_eq!(rr.advance, new_cursor);
 
             if bufs[w as usize].is_empty() {
@@ -61,11 +76,11 @@ fn test_sal_unicast_isolation() {
         sal_write_group(ptr, 0, 10, 1, 0, 1, size as u64, &payloads).expect("group fits");
 
         for w in [0u32, 1, 3] {
-            let rr = sal_read_group_header(ptr, 0, w, None).expect("group present");
+            let rr = group_at(ptr, 0, w, size);
             assert!(rr.data_ptr.is_null(), "no data slot for worker {w}");
             assert!(rr.advance > 0);
         }
-        let rr = sal_read_group_header(ptr, 0, 2, None).expect("group present");
+        let rr = group_at(ptr, 0, 2, size);
         assert!(!rr.data_ptr.is_null());
         let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
         assert_eq!(data, buf.as_slice());
@@ -88,7 +103,7 @@ fn test_sal_multiple_groups() {
 
         let mut rc = 0u64;
         for g in 0..3u64 {
-            let rr = sal_read_group_header(ptr, rc, 0, None).expect("group present");
+            let rr = group_at(ptr, rc, 0, size);
             assert!(!rr.data_ptr.is_null());
             assert_eq!(rr.lsn, g * 10);
             assert_eq!(rr.target_id, g as u32);
@@ -96,7 +111,10 @@ fn test_sal_multiple_groups() {
             assert_eq!(data, vec![(g + 1) as u8; 64].as_slice());
             rc += rr.advance;
         }
-        assert!(sal_read_group_header(ptr, rc, 0, None).is_none());
+        assert!(matches!(
+            sal_read_group_header(ptr, rc, 0, EpochGate::Any, size as u64),
+            SalRead::Absent
+        ));
     }
 }
 
@@ -110,8 +128,8 @@ fn test_sal_epoch_write_read() {
         let buf = make_test_data(0x11, 32);
         sal_write_group(ptr, 0, 0, 0, 0, 42, size as u64, &[&buf]).expect("group fits");
 
-        let rr = sal_read_group_header(ptr, 0, 0, None).expect("group present");
-        assert_eq!(rr.epoch, 42);
+        group_at(ptr, 0, 0, size);
+        assert_eq!(epoch_at(ptr, 0, size), 42);
     }
 }
 
@@ -154,7 +172,7 @@ fn test_sal_cross_process() {
         let r = posix_io::eventfd_wait(efd, 5000);
         assert!(r > 0, "eventfd timed out");
 
-        let rr = sal_read_group_header(ptr, 0, 0, None).expect("group present");
+        let rr = group_at(ptr, 0, 0, size);
         assert!(!rr.data_ptr.is_null());
         assert_eq!(rr.lsn, 555);
         assert_eq!(rr.target_id, 99);
@@ -181,8 +199,8 @@ fn test_sal_checkpoint_reset() {
         let buf2 = make_test_data(0x22, 32);
         sal_write_group(ptr, 0, 0, 0, 0, 2, size as u64, &[&buf2]).expect("group fits");
 
-        let rr = sal_read_group_header(ptr, 0, 0, None).expect("group present");
-        assert_eq!(rr.epoch, 2);
+        let rr = group_at(ptr, 0, 0, size);
+        assert_eq!(epoch_at(ptr, 0, size), 2);
         let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
         assert_eq!(data, vec![0x22u8; 32].as_slice());
     }
@@ -209,12 +227,12 @@ fn a_group_hides_the_slots_of_a_wider_group_at_the_same_offset() {
         sal_write_group(ptr, 0, 0, 0, 0, 2, size as u64, &narrow_refs).expect("group fits");
 
         assert_eq!(
-            sal_tail_slot_count(ptr),
+            sal_tail_slot_count(ptr, size as u64),
             Some(2),
             "the tail's own count is the narrow one"
         );
         for w in 0..8u32 {
-            let r = sal_read_group_header(ptr, 0, w, None).expect("group is readable");
+            let r = group_at(ptr, 0, w, size);
             assert_eq!(r.slots, 2);
             if w < 2 {
                 assert_eq!(r.data_size, 32, "slot {w} is the narrow group's");
@@ -346,10 +364,10 @@ fn test_sal_epoch_fence() {
         let c1 = sal_write_group(ptr, 0, 0, 0, 0, 5, size as u64, &[&buf]).expect("group fits");
         sal_write_group(ptr, c1, 0, 0, 0, 6, size as u64, &[&buf]).expect("group fits");
 
-        let rr1 = sal_read_group_header(ptr, 0, 0, None).expect("group present");
-        assert_eq!(rr1.epoch, 5);
-        let rr2 = sal_read_group_header(ptr, rr1.advance, 0, None).expect("group present");
-        assert_eq!(rr2.epoch, 6);
+        let rr1 = group_at(ptr, 0, 0, size);
+        assert_eq!(epoch_at(ptr, 0, size), 5);
+        group_at(ptr, rr1.advance, 0, size);
+        assert_eq!(epoch_at(ptr, rr1.advance, size), 6);
     }
 }
 
@@ -383,11 +401,11 @@ fn test_commit_sentinel_round_trip() {
         sal_write_group(ptr, writer.cursor(), 102, 8, 0, 1, size as u64, &payloads).expect("group fits");
 
         // Walk the SAL via SalReader (worker 0 perspective).
-        let reader = SalReader::new(ptr as *const u8, 0, size, efd1);
-        let (m1, c1) = reader.try_read(0, None).unwrap();
-        let (m2, c2) = reader.try_read(c1, None).unwrap();
-        let (m3, c3) = reader.try_read(c2, None).unwrap();
-        let (m4, _) = reader.try_read(c3, None).unwrap();
+        let reader = SalReader::for_walk(ptr as *const u8, 0, size);
+        let (m1, c1) = reader.try_read(0, EpochGate::Any).unwrap();
+        let (m2, c2) = reader.try_read(c1, EpochGate::Any).unwrap();
+        let (m3, c3) = reader.try_read(c2, EpochGate::Any).unwrap();
+        let (m4, _) = reader.try_read(c3, EpochGate::Any).unwrap();
 
         assert_eq!(m1.lsn, 7);
         assert_eq!(m2.lsn, 7);
@@ -423,8 +441,8 @@ fn test_commit_sentinel_zero_payload() {
         writer.write_commit_sentinel(123).unwrap();
 
         for w in 0..4 {
-            let reader = SalReader::new(ptr as *const u8, w, size, efd1);
-            let (msg, _) = reader.try_read(0, None).unwrap();
+            let reader = SalReader::for_walk(ptr as *const u8, w, size);
+            let (msg, _) = reader.try_read(0, EpochGate::Any).unwrap();
             assert_eq!(msg.lsn, 123);
             assert!(
                 msg.wire_data.is_none(),
@@ -464,10 +482,10 @@ fn test_batched_push_shares_zone_lsn() {
         writer.reset(c2, 1);
         writer.write_commit_sentinel(zone_lsn).unwrap();
 
-        let reader = SalReader::new(ptr as *const u8, 0, size, efds[0]);
-        let (m1, c1) = reader.try_read(0, None).unwrap();
-        let (m2, c2) = reader.try_read(c1, None).unwrap();
-        let (m3, _) = reader.try_read(c2, None).unwrap();
+        let reader = SalReader::for_walk(ptr as *const u8, 0, size);
+        let (m1, c1) = reader.try_read(0, EpochGate::Any).unwrap();
+        let (m2, c2) = reader.try_read(c1, EpochGate::Any).unwrap();
+        let (m3, _) = reader.try_read(c2, EpochGate::Any).unwrap();
         assert_eq!(m1.lsn, zone_lsn);
         assert_eq!(m2.lsn, zone_lsn);
         assert_eq!(m3.lsn, zone_lsn);
@@ -480,7 +498,7 @@ fn test_batched_push_shares_zone_lsn() {
             let mut set = std::collections::HashSet::new();
             let mut off = 0u64;
             while (off as usize) + 8 < size {
-                let (msg, next) = match reader.try_read(off, None) {
+                let (msg, next) = match reader.try_read(off, EpochGate::Any) {
                     Some(v) => v,
                     None => break,
                 };
@@ -534,10 +552,10 @@ fn test_zone_two_groups_one_sentinel() {
 
         // Walk on every worker's perspective; assert zone shape.
         for w in 0..nw {
-            let reader = SalReader::new(ptr as *const u8, w, size, efds[w as usize]);
-            let (m1, c1) = reader.try_read(0, None).unwrap();
-            let (m2, c2) = reader.try_read(c1, None).unwrap();
-            let (m3, _) = reader.try_read(c2, None).unwrap();
+            let reader = SalReader::for_walk(ptr as *const u8, w, size);
+            let (m1, c1) = reader.try_read(0, EpochGate::Any).unwrap();
+            let (m2, c2) = reader.try_read(c1, EpochGate::Any).unwrap();
+            let (m3, _) = reader.try_read(c2, EpochGate::Any).unwrap();
             assert_eq!(m1.lsn, zone_lsn);
             assert_eq!(m2.lsn, zone_lsn);
             assert_eq!(m3.lsn, zone_lsn);
@@ -572,8 +590,8 @@ fn test_two_groups_same_lsn() {
         let buf2 = make_test_data(0x20, 32);
         sal_write_group(ptr, c1, 8, 42, 0, 1, size as u64, &[&buf2]).expect("group fits");
 
-        let rr1 = sal_read_group_header(ptr, 0, 0, None).expect("group present");
-        let rr2 = sal_read_group_header(ptr, rr1.advance, 0, None).expect("group present");
+        let rr1 = group_at(ptr, 0, 0, size);
+        let rr2 = group_at(ptr, rr1.advance, 0, size);
         assert_eq!(rr1.lsn, 42);
         assert_eq!(rr2.lsn, 42);
         assert_eq!(rr1.target_id, 7);
@@ -607,14 +625,14 @@ fn test_sal_cross_process_checkpoint() {
         }
 
         posix_io::eventfd_wait(efd, 5000);
-        let rr1 = sal_read_group_header(ptr, 0, 0, None).expect("group present");
-        assert_eq!(rr1.epoch, 1);
+        let rr1 = group_at(ptr, 0, 0, size);
+        assert_eq!(epoch_at(ptr, 0, size), 1);
         assert_eq!(rr1.lsn, 10);
         posix_io::eventfd_signal(efd2);
 
         posix_io::eventfd_wait(efd, 5000);
-        let rr2 = sal_read_group_header(ptr, 0, 0, None).expect("group present");
-        assert_eq!(rr2.epoch, 2);
+        let rr2 = group_at(ptr, 0, 0, size);
+        assert_eq!(epoch_at(ptr, 0, size), 2);
         assert_eq!(rr2.lsn, 20);
 
         let mut status = 0i32;
@@ -638,26 +656,29 @@ fn test_sal_prefix_epoch_gate() {
         let buf = make_test_data(0x5A, 48);
         let new_cursor = sal_write_group(ptr, 0, 7, 11, 0, 1, size as u64, &[&buf]).expect("group fits");
 
-        let reader = SalReader::new(ptr as *const u8, 0, size, -1);
+        let reader = SalReader::new(ptr as *const u8, 0, size, -1, 1);
 
         // Wrong expected epoch: parked without touching header bytes.
         assert!(
-            reader.try_read(0, Some(2)).is_none(),
+            reader.try_read(0, EpochGate::Live(2)).is_none(),
             "epoch-mismatched slot must park the reader"
         );
 
         // Matching epoch: consumable.
-        let (msg, cursor) = reader.try_read(0, Some(1)).expect("matching epoch reads the group");
-        assert_eq!(msg.epoch, 1);
+        let (msg, cursor) = reader
+            .try_read(0, EpochGate::Live(1))
+            .expect("matching epoch reads the group");
+        assert_eq!(epoch_at(ptr, 0, size), 1);
         assert_eq!(msg.lsn, 11);
         assert_eq!(msg.target_id, 7);
         assert_eq!(cursor, new_cursor);
 
         // Ungated recovery read: consumable without knowing the epoch.
         let (msg, _) = reader
-            .try_read(0, None)
+            .try_read(0, EpochGate::Any)
             .expect("recovery walk reads without an expectation");
-        assert_eq!(msg.epoch, 1);
+        assert_eq!(msg.lsn, 11);
+        assert_eq!(epoch_at(ptr, 0, size), 1);
     }
 }
 
@@ -677,8 +698,8 @@ fn test_sal_prefix_packing_boundaries() {
         let word = atomic_load_u64(ptr);
         assert_eq!((word >> 32) as u32, u32::MAX);
         assert_eq!((word & 0xFFFF_FFFF) as usize, group_header_size(1));
-        let rr = sal_read_group_header(ptr, 0, 0, None).expect("group present");
-        assert_eq!(rr.epoch, u32::MAX);
+        let rr = group_at(ptr, 0, 0, size);
+        assert_eq!(epoch_at(ptr, 0, size), u32::MAX);
         assert_eq!(rr.advance, (8 + group_header_size(1)) as u64);
         assert_eq!(new_cursor, rr.advance);
 
@@ -690,9 +711,9 @@ fn test_sal_prefix_packing_boundaries() {
         let word = atomic_load_u64(ptr);
         assert_eq!((word >> 32) as u32, 1);
         assert_eq!((word & 0xFFFF_FFFF) as usize, expected_payload);
-        let rr = sal_read_group_header(ptr, 0, 0, Some(1)).expect("group present");
+        let rr = group_at(ptr, 0, 0, size);
         assert!(!rr.data_ptr.is_null());
-        assert_eq!(rr.epoch, 1);
+        assert_eq!(epoch_at(ptr, 0, size), 1);
         assert_eq!(rr.advance, (8 + expected_payload) as u64);
         assert_eq!(rr.data_size as usize, 3 << 20);
     }
@@ -809,4 +830,191 @@ fn test_wire_group_footprint_non_wire_safe_shared_span_dedup() {
     }
     batch.blob = blob;
     unsafe { assert_footprint_exact(&schema, &batch, true, 3) };
+}
+
+// ---------------------------------------------------------------------------
+// The group header's own integrity: a digest over the header, seeded with the
+// group's byte offset. Every one of the fields swept below is a routing or
+// replay decision that was taken entirely on trust before.
+// ---------------------------------------------------------------------------
+
+/// `lsn`, `flags`, `target_id`, `slot_count`, the epoch word and every directory
+/// entry live inside the digested span; the digest field itself is excluded from
+/// it but is what the verdict compares against. One bit anywhere in the header
+/// must therefore fail the probe.
+#[test]
+fn every_single_bit_flip_in_a_group_header_is_rejected() {
+    unsafe {
+        let size = 1 << 20;
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
+        let buf = make_test_data(0x5A, 64);
+        let payloads: [&[u8]; 3] = [&buf, &[], &buf];
+        sal_write_group(ptr, 0, 42, 100, FLAG_DDL_SYNC, 1, size as u64, &payloads).expect("group fits");
+
+        let hdr_len = group_header_size(3);
+        assert!(
+            sal_probe_header(ptr, 0, size as u64).is_some(),
+            "the clean header verifies"
+        );
+
+        let hdr = std::slice::from_raw_parts_mut(ptr.add(8), hdr_len);
+        sweep_bit_flips(hdr, 0..hdr_len, |byte, bit, _| {
+            assert!(
+                sal_probe_header(ptr, 0, size as u64).is_none(),
+                "header byte {byte} bit {bit} must fail the digest"
+            );
+        });
+    }
+}
+
+/// The digest is seeded with the group's byte offset, which makes a valid header
+/// self-locating: the resync scan trials every 8-byte-aligned word, so a header
+/// that verified anywhere it was copied to would let the walk resume on the wrong
+/// group.
+#[test]
+fn a_header_only_verifies_at_the_offset_it_was_published_at() {
+    unsafe {
+        let size = 1 << 20;
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
+        let buf = make_test_data(0x11, 64);
+        let cur = sal_write_group(ptr, 0, 42, 100, 0, 1, size as u64, &[&buf]).expect("group fits");
+        sal_write_group(ptr, cur, 43, 101, 0, 1, size as u64, &[&buf]).expect("group fits");
+
+        let hdr_len = group_header_size(1);
+        let b_hdr: Vec<u8> = std::slice::from_raw_parts(ptr.add(cur as usize + 8), hdr_len).to_vec();
+        // Group B's whole header over group A's — same epoch, same shape, a
+        // different address.
+        std::ptr::copy_nonoverlapping(b_hdr.as_ptr(), ptr.add(8), hdr_len);
+        assert!(
+            sal_probe_header(ptr, 0, size as u64).is_none(),
+            "a header published elsewhere must not verify here"
+        );
+    }
+}
+
+/// The probe's two mapping bounds protect different reads, and both must reject
+/// before the read they guard. The region is mapped at exactly `size` bytes, so a
+/// read past it faults rather than merely returning garbage.
+#[test]
+fn a_probe_never_reads_past_the_end_of_the_mapping() {
+    unsafe {
+        let size = 1 << 20;
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
+        // A non-zero tail, so the prefix test does not answer for either fixture.
+        std::ptr::write_bytes(ptr.add(size - 4096), 0xEE, 4096);
+
+        // (a) The fixed part does not fit: `slot_count` would be read 16 bytes
+        // past the mapping.
+        assert!(
+            sal_probe_header(ptr, (size - 8) as u64, size as u64).is_none(),
+            "a candidate 8 bytes from the end must be rejected before the slot-count read"
+        );
+
+        // (b) The fixed part fits but a MAX_WORKERS directory does not.
+        let base = size - 8 - group_header_size(0);
+        write_u32_raw(ptr, base + 8 + 16, MAX_WORKERS as u32);
+        assert!(
+            sal_probe_header(ptr, base as u64, size as u64).is_none(),
+            "a MAX_WORKERS directory that overruns the mapping must be rejected before the digest read"
+        );
+    }
+}
+
+/// The stride the reader derives from the authenticated directory must equal the
+/// `payload_size` the writer put in the prefix, at every width — including one
+/// with empty slots interleaved among non-empty ones, where `align8(0) = 0` is
+/// what makes the derivation exact.
+#[test]
+fn the_derived_stride_equals_the_writers_payload_size_at_every_width() {
+    unsafe {
+        let size = 8 << 20;
+        let region = SharedRegion::new(size);
+        let ptr = region.ptr();
+        for &slots in &[1usize, 2, 4, MAX_WORKERS] {
+            std::ptr::write_bytes(ptr, 0, size);
+            let buf = make_test_data(0x33, 100);
+            // Every other slot empty from slot 1 on, so the widths past 1 all carry
+            // the interleaved shape.
+            let payloads: Vec<&[u8]> = (0..slots)
+                .map(|w| if w % 2 == 1 { &[][..] } else { buf.as_slice() })
+                .collect();
+            let cursor = sal_write_group(ptr, 0, 7, 9, 0, 1, size as u64, &payloads).expect("group fits");
+
+            let (probed, epoch) = sal_probe_header(ptr, 0, size as u64).expect("header verifies");
+            assert_eq!(probed as usize, slots);
+            assert_eq!(epoch, 1);
+
+            let word = atomic_load_u64(ptr);
+            let payload_size = (word & 0xFFFF_FFFF) as usize;
+            let rr = group_at(ptr, 0, 0, size);
+            assert_eq!(
+                rr.advance as usize,
+                8 + payload_size,
+                "the derived stride must equal the prefix's payload_size at {slots} slots"
+            );
+            assert_eq!(rr.advance, cursor, "and the writer's own cursor advance");
+
+            // The writer's own header arithmetic, which the committer's fit check
+            // rests on, must agree with the layout byte for byte.
+            let expected = group_header_size(slots) + payloads.iter().filter(|p| !p.is_empty()).count() * align8(100);
+            assert_eq!(payload_size, expected, "group_header_size disagrees at {slots} slots");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The live drain's response to the two verdicts the digest can produce: a
+// leftover parks, damage aborts.
+// ---------------------------------------------------------------------------
+
+/// The prefix gate compares an unauthenticated copy of the epoch, so a leftover
+/// whose prefix epoch flipped up to the current one passes it with an entirely
+/// intact older header. Only the header's own epoch rejects it — and it must
+/// park, not abort: this is a leftover, not damage.
+#[test]
+fn the_live_path_parks_on_a_leftover_whose_prefix_epoch_was_raised() {
+    let size = 1 << 20;
+    let region = SharedRegion::new(size);
+    let ptr = region.ptr();
+    unsafe {
+        sal_write_group(ptr, 0, 7, 11, 0, 1, size as u64, &[&[0u8; 32]]).expect("group fits");
+        // Raise only the prefix's epoch copy: 1 -> 2, header untouched.
+        let word = ptr as *mut u64;
+        *word = (*word & 0xFFFF_FFFF) | (2u64 << 32);
+    }
+    let reader = SalReader::new(ptr as *const u8, 0, size, -1, 2);
+    assert!(
+        reader.next().is_none(),
+        "a previous epoch's group must park, whatever its prefix claims"
+    );
+}
+
+/// A digest mismatch under a passing epoch gate can only be corruption, and the
+/// live drain fail-stops rather than reading it as end-of-log.
+#[test]
+fn the_live_path_aborts_on_a_damaged_header() {
+    crate::test_support::assert_test_aborts_134("the_live_path_aborts_on_a_damaged_header_internal", &[]);
+}
+
+/// Runs only in the re-exec'd abort child.
+#[test]
+fn the_live_path_aborts_on_a_damaged_header_internal() {
+    if !crate::test_support::in_abort_child() {
+        return;
+    }
+    let size = 1 << 20;
+    let region = SharedRegion::new(size);
+    let ptr = region.ptr();
+    unsafe {
+        sal_write_group(ptr, 0, 7, 11, 0, 1, size as u64, &[&[0u8; 32]]).expect("group fits");
+        // A sanity read before the damage, so the abort below is the damage.
+        assert!(SalReader::new(ptr as *const u8, 0, size, -1, 1).next().is_some());
+        *ptr.add(8) ^= 1;
+    }
+    let reader = SalReader::new(ptr as *const u8, 0, size, -1, 1);
+    let _ = reader.next();
+    unreachable!("a damaged header on the live path must fail-stop, not park");
 }

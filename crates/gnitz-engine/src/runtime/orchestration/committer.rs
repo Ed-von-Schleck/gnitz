@@ -678,6 +678,9 @@ async fn commit_pushes(
         // user-table push pins no system-family counter, so the floor is 0.
         let zone_lsn = shared.lsn_alloc.reserve(0);
 
+        // Claimed by the first group that actually reaches the SAL.
+        let mut needs_zone_start = true;
+
         // Emit every unit into the zone, in unit order (transactions first).
         for unit in &units {
             let span = unit.groups.clone();
@@ -686,7 +689,7 @@ async fn commit_pushes(
                 // `sal_begin_group` writes zero bytes and simply skips it.
                 let g = &mut groups[span.start];
                 if g.write_err.is_none() {
-                    g.write_err = write_group(shared, g, zone_lsn);
+                    g.write_err = write_group(shared, g, zone_lsn, &mut needs_zone_start);
                 }
                 continue;
             }
@@ -711,7 +714,7 @@ async fn commit_pushes(
                     let mut first_fail = None;
                     for gi in span.clone() {
                         let g = &mut groups[gi];
-                        match write_group(shared, g, zone_lsn) {
+                        match write_group(shared, g, zone_lsn, &mut needs_zone_start) {
                             None => committed_a_family = true,
                             Some(e) if committed_a_family => crate::gnitz_fatal_abort!(
                                 "txn family emission failed after an earlier family committed to the SAL: {}",
@@ -910,12 +913,20 @@ fn invalidate_filters(shared: &Rc<Shared>, tid: i64) {
 
 /// Emit one group into the open zone, returning the write error if any. Wrapped
 /// in `guard_panic` so a malformed batch fails the group instead of the node.
-fn write_group(shared: &Rc<Shared>, g: &GroupInfo, zone_lsn: u64) -> Option<String> {
-    guard_panic("commit_write", || {
+///
+/// Clears `needs_zone_start` on a group that actually reached the SAL: the zone's
+/// span must start at the first group recovery can see, not the first attempted —
+/// a group whose `sal_begin_group` was refused writes no bytes at all.
+fn write_group(shared: &Rc<Shared>, g: &GroupInfo, zone_lsn: u64, needs_zone_start: &mut bool) -> Option<String> {
+    let err = guard_panic("commit_write", || {
         Ok(shared
             .disp()
-            .write_commit_group(g.tid, zone_lsn, &g.merged, g.mode, &g.req_ids)
+            .write_commit_group(g.tid, zone_lsn, &g.merged, g.mode, &g.req_ids, *needs_zone_start)
             .err())
     })
-    .unwrap_or_else(Some)
+    .unwrap_or_else(Some);
+    if err.is_none() {
+        *needs_zone_start = false;
+    }
+    err
 }

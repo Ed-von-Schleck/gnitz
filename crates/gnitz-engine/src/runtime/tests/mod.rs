@@ -1,3 +1,4 @@
+mod block_integrity;
 mod sal;
 mod unique_preflight;
 mod w2m;

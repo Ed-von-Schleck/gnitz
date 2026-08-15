@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::foundation::fault::Seam;
-use crate::runtime::sal::MAX_WORKERS;
+use crate::runtime::sal::{FLAG_ZONE_START, MAX_WORKERS};
 
 /// Yields the set bit positions of a worker mask, lowest first.
 struct BitIter(u64);
@@ -133,11 +133,12 @@ impl MasterDispatcher {
         unsafe { &mut *self.catalog }
     }
 
-    /// Boot-time SAL reset: sentinel prefix cleared, cursor 0, epoch 1 (the
-    /// first live epoch — epoch 0 is the empty-slot sentinel prefix). Sole
-    /// caller is `server_main` after all workers finish recovery.
-    pub fn reset_sal(&self) {
-        self.sal.boot_reset();
+    /// Boot-time SAL reset: sentinel prefix cleared, cursor 0, `epoch` (the
+    /// recovered walk epoch plus one, so epochs stay monotone across boots and a
+    /// previous boot's leftover can never be read as current). Sole caller is
+    /// `server_main` after all workers finish recovery.
+    pub fn reset_sal(&self, epoch: u32) {
+        self.sal.boot_reset(epoch);
     }
 
     /// Return the schema descriptor, a cached prebuilt schema wire block,
@@ -1023,13 +1024,14 @@ impl MasterDispatcher {
 
     /// Broadcast a DDL batch to every worker. `lsn` is the caller's zone
     /// LSN — one LSN across all broadcasts of a DDL so recovery can group
-    /// them as an atomic zone.
-    pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), String> {
+    /// them as an atomic zone. `zone_start` marks this as the zone's first group,
+    /// which is what gives the zone a byte span recovery can attribute damage to.
+    pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64, zone_start: bool) -> Result<(), String> {
         let (schema, schema_block, _safe, _stride) = self.cached_schema_block(target_id);
         self.sal.write_broadcast_direct(
             target_id as u32,
             lsn,
-            FLAG_DDL_SYNC,
+            FLAG_DDL_SYNC | if zone_start { FLAG_ZONE_START } else { 0 },
             Some(batch),
             Some(&schema),
             None,
@@ -1210,6 +1212,7 @@ impl MasterDispatcher {
         batch: &Batch,
         mode: WireConflictMode,
         req_ids: &[u64],
+        zone_start: bool,
     ) -> Result<(), String> {
         self.arm_injected_tick_emit_error(target_id, batch.count);
         let (schema, schema_block, wire_safe, wire_row_stride) = self.cached_schema_block(target_id);
@@ -1226,7 +1229,7 @@ impl MasterDispatcher {
                 &schema,
                 target_id as u32,
                 lsn,
-                FLAG_PUSH,
+                FLAG_PUSH | if zone_start { FLAG_ZONE_START } else { 0 },
                 wire_flags,
                 0,
                 req_ids,

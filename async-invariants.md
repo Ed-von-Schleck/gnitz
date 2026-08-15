@@ -108,6 +108,16 @@ proves the group is fully written, immutable, and ordered-visible. The
 ungated (`expected_epoch = None`) read exists only for the recovery walkers,
 which run against a quiescent SAL with no concurrent writer.
 
+The gate is a guard, not a verdict: the header itself carries an XXH3 digest
+seeded with the group's byte offset (`sal_probe_header`), verified after the
+gate passes, and the generation the reader trusts is the epoch inside that
+digested span rather than the prefix's unauthenticated copy. Because gate-pass
+already implies a fully-published current-epoch header, a digest mismatch on
+the live path can only be corruption, and `SalReader::next` fail-stops in layer
+(`gnitz_fatal_abort!`). Parking there instead would surface as a silent
+end-of-drain: `next_sal_message` reads `None` as "caught up", and the committer
+would then wait forever on an ACK nobody will send.
+
 **Drain-window servicing.** While the committer awaits a Drain `done` /
 Quiesce `acked` (`await_servicing`), it keeps the SAL live: a **Reclaim**
 Barrier (relay-space) is serviced by a reclaim-only base round (no gen

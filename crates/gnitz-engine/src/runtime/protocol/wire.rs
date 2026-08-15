@@ -485,7 +485,7 @@ impl<'a> WireMsg<'a> {
 
 /// Decoded control fields + directory-driven control-block decoder — the
 /// shared codec both ends run.
-pub use gnitz_wire::control::{peek_control_block, DecodedControl};
+pub use gnitz_wire::control::{peek_control_block, peek_control_block_ipc, DecodedControl};
 
 /// Full decoded wire message.
 pub struct DecodedWire {
@@ -559,9 +559,11 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
     // an unsigned U64 PK column stored OPK (big-endian) at rest, so decode
     // it big-endian to recover the native index. `validate_and_parse` already
     // bounded each region's extent to the block, so only the schema-level
-    // "big enough for `count` columns" check remains.
+    // "exactly `count` columns" check remains. Exact, not a lower bound: a forged
+    // smaller COUNT passes the col_idx monotonicity check on the truncated prefix
+    // `[0, 1, …]` and yields a descriptor that silently dropped columns.
     let (pk_off, pk_sz) = (offs[gnitz_wire::REG_PK] as usize, sizes[gnitz_wire::REG_PK] as usize);
-    if pk_sz < count * 8 {
+    if pk_sz != count * 8 {
         return Err("schema col_idx region OOB");
     }
     let pk_data = &data[pk_off..pk_off + count * 8];
@@ -575,10 +577,10 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
     let (tc_off, tc_sz) = (offs[REG_TYPE_CODE] as usize, sizes[REG_TYPE_CODE] as usize);
     let (fl_off, fl_sz) = (offs[REG_FLAGS] as usize, sizes[REG_FLAGS] as usize);
 
-    if tc_sz < count * 8 {
+    if tc_sz != count * 8 {
         return Err("schema type_code region OOB");
     }
-    if fl_sz < count * 8 {
+    if fl_sz != count * 8 {
         return Err("schema flags region OOB");
     }
 
@@ -645,9 +647,8 @@ pub fn peek_client_control(data: &[u8]) -> Result<DecodedControl, &'static str> 
 }
 
 /// Client-boundary decode with a pre-parsed control block (the `handle_message`
-/// single-parse path). Full checksum verification on the schema/data blocks —
-/// the control block itself is never checksummed by design; its integrity is
-/// covered by the frame length + directory bounds checks in the peek.
+/// single-parse path). Full checksum verification on all three blocks — the
+/// control block's by the `peek_client_control` that produced `control`.
 pub fn decode_wire_with_ctrl(
     data: &[u8],
     control: DecodedControl,
@@ -832,7 +833,11 @@ fn decode_wire_impl(
     verify_checksum: bool,
 ) -> Result<DecodedWire, &'static str> {
     let ctrl = wal_block_slice_at(data, 0)?;
-    let control = peek_control_block(ctrl)?;
+    let control = if verify_checksum {
+        peek_control_block(ctrl)?
+    } else {
+        peek_control_block_ipc(ctrl)?
+    };
     decode_wire_body(data, ctrl.len(), control, schema_hint, verify_checksum)
 }
 

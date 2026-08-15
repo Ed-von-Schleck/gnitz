@@ -503,8 +503,8 @@ impl WorkerProcess {
             //    with a different source and emit schema-mismatched relays.
             (DispatchContext::TopLevel, SalMessageKind::Tick) => self.run_via_dispatch_inner(kind, target_id, wire),
             (DispatchContext::InEval { .. }, SalMessageKind::Tick) => {
-                // Only the request id is needed; peek it from the control block
-                // instead of running a full checksum-verifying frame decode.
+                // Only the request id is needed; peek the control block instead of
+                // decoding the whole frame.
                 let req_id = wire
                     .and_then(|d| ipc::peek_client_control(d).ok())
                     .map(|c| c.request_id)
@@ -1420,7 +1420,7 @@ mod tests {
             let (data_ptr, sz, new_rc, _req_id) =
                 unsafe { w2m_ring::try_consume(hdr, region_ptr as *const u8, rc).expect("expected a message") };
             let data = unsafe { std::slice::from_raw_parts(data_ptr, sz as usize) };
-            let decoded = ipc::decode_wire(data).expect("decode_wire");
+            let decoded = ipc::decode_wire_ipc(data).expect("decode_wire_ipc");
             decoded_ids.push(decoded.control.request_id);
             rc = new_rc;
         }
@@ -1639,7 +1639,7 @@ mod tests {
         write(c2, 44, 102, FLAG_PUSH, 2);
 
         let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
-        wp.sal_reader = SalReader::new(sal_ptr as *const u8, 0, SAL_SIZE, -1);
+        wp.sal_reader = SalReader::new(sal_ptr as *const u8, 0, SAL_SIZE, -1, 1);
 
         assert_eq!(
             wp.next_sal_message().map(|(k, t, _)| (k, t)),
@@ -1837,7 +1837,7 @@ mod tests {
         );
 
         let data = consume_one(ptr);
-        let ctrl = ipc::peek_control_block(&data).expect("peek_control_block");
+        let ctrl = ipc::peek_control_block_ipc(&data).expect("peek_control_block");
         assert_eq!(ctrl.status, STATUS_OK);
         assert_ne!(
             ctrl.flags & FLAG_SCAN_LAST,
@@ -1887,7 +1887,7 @@ mod tests {
         assert!(wp.pending_streams.is_empty(), "a one-chunk train pops after one emit");
         let frames = walk_frames(ptr);
         assert_eq!(frames.len(), 1);
-        let ctrl = ipc::peek_control_block(&frames[0].1).unwrap();
+        let ctrl = ipc::peek_control_block_ipc(&frames[0].1).unwrap();
         assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
         assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
     }
@@ -1948,7 +1948,7 @@ mod tests {
         assert!(wp.pending_streams.is_empty(), "the single blob frame pops the train");
         let frames = walk_frames(ptr);
         assert_eq!(frames.len(), 1);
-        let ctrl = ipc::peek_control_block(&frames[0].1).unwrap();
+        let ctrl = ipc::peek_control_block_ipc(&frames[0].1).unwrap();
         assert_eq!(ctrl.status, STATUS_OK);
         assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
         assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
@@ -2093,7 +2093,7 @@ mod tests {
             let train: Vec<_> = frames.iter().filter(|(r, _)| *r == req).collect();
             let mut rows = 0usize;
             for (i, (_, bytes)) in train.iter().enumerate() {
-                let ctrl = ipc::peek_control_block(bytes).expect("ctrl");
+                let ctrl = ipc::peek_control_block_ipc(bytes).expect("ctrl");
                 assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
                 let is_last = i == train.len() - 1;
                 assert_eq!(

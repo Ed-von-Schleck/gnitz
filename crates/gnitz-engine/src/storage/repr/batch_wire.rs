@@ -341,10 +341,10 @@ fn decode_mem_batch_inner<'a>(
     // every producer writes exact sizes, and stride-deriving consumers divide
     // size by count, so an inexact size is a corrupt or mis-schema'd block. `validate_and_parse` already bounded
     // `off + sz` to the block, so an exact-size region is also fully in-bounds.
+    //
+    // The relation holds at `n == 0` too, where it demands zero-size regions: a
+    // block whose COUNT was flipped to 0 still carries its rows' bytes and fails.
     for (r, offset) in offsets.iter_mut().enumerate().take(nr) {
-        if n == 0 {
-            continue; // offsets stay 0; regions are empty
-        }
         if sizes[r] as usize != n * strides[r] as usize {
             return Err("data WAL region size mismatch");
         }

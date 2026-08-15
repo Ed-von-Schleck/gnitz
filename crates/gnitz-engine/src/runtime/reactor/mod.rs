@@ -683,7 +683,7 @@ impl Reactor {
                 self.route_scan_slot(slot);
                 continue;
             }
-            let ctrl = wire::peek_control_block(slot.bytes()).expect("W2M control block corrupt — ring corrupt");
+            let ctrl = wire::peek_control_block_ipc(slot.bytes()).expect("W2M control block corrupt — ring corrupt");
             let prefix = slot.internal_req_id;
             let decoded = self.decode_slot_owned(slot, ctrl);
             self.route_reply(w, prefix, decoded);
@@ -3293,10 +3293,10 @@ mod tests {
 
         // await twice → frames returned in arrival order (100 then 101).
         let f0 = r.block_on(r.await_scan_slot(req_id));
-        let rid0 = wire::peek_control_block(f0.bytes()).unwrap().request_id;
+        let rid0 = wire::peek_control_block_ipc(f0.bytes()).unwrap().request_id;
         drop(f0);
         let f1 = r.block_on(r.await_scan_slot(req_id));
-        let rid1 = wire::peek_control_block(f1.bytes()).unwrap().request_id;
+        let rid1 = wire::peek_control_block_ipc(f1.bytes()).unwrap().request_id;
         drop(f1);
         assert_eq!(
             (rid0, rid1),
@@ -3336,7 +3336,7 @@ mod tests {
 
         for i in 0..N {
             let f = r.block_on(r.await_scan_slot(req_id));
-            let rid = wire::peek_control_block(f.bytes()).unwrap().request_id;
+            let rid = wire::peek_control_block_ipc(f.bytes()).unwrap().request_id;
             assert_eq!(rid, 100 + i as u64, "frame {i} delivered in arrival order");
             drop(f);
         }

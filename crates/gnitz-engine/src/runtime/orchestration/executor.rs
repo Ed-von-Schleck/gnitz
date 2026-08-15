@@ -2520,8 +2520,10 @@ fn push_target_error(shared: &Shared, target_id: i64) -> Option<String> {
 fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)], zone_lsn: u64) -> FsyncFuture {
     let disp = shared.disp();
     if let Err(e) = guard_panic(op, || unsafe {
-        for (tid, bat) in drained {
-            disp.broadcast_ddl(*tid, bat, zone_lsn)?;
+        // The first family opens the zone; a failure here aborts the loop, so no
+        // later family can become the first one recovery sees.
+        for (i, (tid, bat)) in drained.iter().enumerate() {
+            disp.broadcast_ddl(*tid, bat, zone_lsn, i == 0)?;
         }
         // Abort after broadcasts but BEFORE the commit sentinel — exercises the
         // recovery skip of a half-written zone.

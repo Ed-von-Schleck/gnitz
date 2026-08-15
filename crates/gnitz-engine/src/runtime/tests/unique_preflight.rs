@@ -15,7 +15,7 @@ use crate::runtime::sal::{unique_preflight_wire_schema, SalMessageKind, FLAG_UNI
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring;
 use crate::runtime::wire::{
-    self, peek_control_block, SchemaWithVersion, FLAG_CONTINUATION, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
+    self, peek_control_block_ipc, SchemaWithVersion, FLAG_CONTINUATION, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
 };
 use crate::runtime::worker::send_unique_preflight_keys;
 use crate::schema::key::PkBuf;
@@ -89,7 +89,7 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
             slot.internal_req_id, expected_req_id as u32,
             "ring prefix must carry the request id",
         );
-        let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
+        let ctrl = peek_control_block_ipc(slot.bytes()).expect("ctrl decodes");
         assert_eq!(ctrl.status, 0);
         assert_ne!(
             ctrl.flags & FLAG_CONTINUATION,
@@ -189,7 +189,7 @@ fn preflight_train_empty_partition_single_terminal_frame() {
     with_test_ring(|writer, receiver| {
         send_unique_preflight_keys(writer, 77, &frame_schema, 7, 4, &mut producer_of(&[]));
         let slot = receiver.try_read_slot(0).expect("terminal frame");
-        let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
+        let ctrl = peek_control_block_ipc(slot.bytes()).expect("ctrl decodes");
         assert_eq!(ctrl.status, 0);
         assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0, "single frame must be terminal");
         assert_eq!(ctrl.flags & wire::FLAG_HAS_DATA, 0, "no data on empty train");

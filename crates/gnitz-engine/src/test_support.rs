@@ -294,6 +294,23 @@ pub(crate) fn assert_test_aborts_134(internal_test: &str, envs: &[(&str, &str)])
     );
 }
 
+/// Flip each bit of `buf[span]` in turn, run `check(byte, bit, buf)` with it
+/// damaged, and restore it — so no case can leave the fixture altered for the
+/// ones after it.
+pub(crate) fn sweep_bit_flips(
+    buf: &mut [u8],
+    span: std::ops::Range<usize>,
+    mut check: impl FnMut(usize, usize, &[u8]),
+) {
+    for byte in span {
+        for bit in 0..8 {
+            buf[byte] ^= 1 << bit;
+            check(byte, bit, buf);
+            buf[byte] ^= 1 << bit;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SharedRegion — anonymous shared-memory test region
 // ---------------------------------------------------------------------------

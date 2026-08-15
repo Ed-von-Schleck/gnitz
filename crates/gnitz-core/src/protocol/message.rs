@@ -60,7 +60,7 @@ pub fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u
 /// `error_msg` is empty when the null bit for error_msg is set;
 /// `seek_pk_extra` is empty when the null bit for seek_pk_extra is set.
 pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), ProtocolError> {
-    let dc = gnitz_wire::control::peek_control_block(data).map_err(|e| ProtocolError::DecodeError(e.into()))?;
+    let dc = gnitz_wire::control::peek_control_block_ipc(data).map_err(|e| ProtocolError::DecodeError(e.into()))?;
     let error_msg =
         String::from_utf8(dc.error_msg).map_err(|e| ProtocolError::DecodeError(format!("utf8 in error_msg: {e}")))?;
     let header = Header {
