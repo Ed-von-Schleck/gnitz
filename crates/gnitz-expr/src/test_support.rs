@@ -202,7 +202,7 @@ impl SchemaFacts for TestSchema {
 
 /// Push one payload column per `schema` payload slot, sized from its declared
 /// type, and return the widths.
-fn push_payload_cols(v: &mut TestView, schema: &TestSchema) -> Vec<usize> {
+pub fn push_payload_cols(v: &mut TestView, schema: &TestSchema) -> Vec<usize> {
     let widths: Vec<usize> = (0..schema.num_payload_cols())
         .map(|pi| schema.locate(schema.payload_col_idx(pi)).size())
         .collect();
@@ -217,7 +217,7 @@ fn push_payload_cols(v: &mut TestView, schema: &TestSchema) -> Vec<usize> {
 /// cannot disagree with the addressing the kernels use. A compound PK gets the
 /// same source value in each column, truncated to that column's width; `pk` is a
 /// bit pattern, so a signed column reads it two's-complement.
-fn set_row_pk(v: &mut TestView, schema: &TestSchema, row: usize, pk: u64) {
+pub fn set_row_pk(v: &mut TestView, schema: &TestSchema, row: usize, pk: u64) {
     for ci in 0..schema.num_columns() {
         if let ColumnLocator::Pk {
             byte_off,
@@ -298,15 +298,14 @@ pub fn make_n_col_view(
     f: impl Fn(usize, usize) -> i64,
     null_pred: impl Fn(usize, usize) -> bool,
 ) -> TestView {
-    let ncols = schema.num_payload_cols();
     let mut v = TestView::new(n, schema.pk_stride());
-    push_payload_cols(&mut v, schema);
+    let widths = push_payload_cols(&mut v, schema);
     for row in 0..n {
         set_row_pk(&mut v, schema, row, row as u64 + 1);
         let mut null_word = 0u64;
-        for col in 0..ncols {
+        for (col, &w) in widths.iter().enumerate() {
             gnitz_wire::null_word_set(&mut null_word, col, null_pred(row, col));
-            v.set_payload(row, col, &f(row, col).to_le_bytes());
+            v.set_payload(row, col, &f(row, col).to_le_bytes()[..w.min(8)]);
         }
         v.set_null_word(row, null_word);
     }
@@ -350,8 +349,9 @@ pub fn map_prog(
     instrs: Vec<LogicalInstr>,
     num_regs: u32,
     result_reg: u32,
+    const_strings: Vec<Vec<u8>>,
 ) -> Evaluator {
-    LogicalProgram::new(instrs, num_regs, result_reg, vec![])
+    LogicalProgram::new(instrs, num_regs, result_reg, const_strings)
         .resolve_map(in_schema, out_schema)
         .expect("test map must validate")
 }

@@ -421,6 +421,49 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
     assert_eq!(scratch.regs[7 * MORSEL], 1, "downstream arithmetic reads bool as i64");
 }
 
+/// A `NOT NULL` load *clears* its destination's null words rather than skipping
+/// the write, so a word left behind by a previous drive can never surface as a
+/// phantom NULL. Run one scratch through two programs writing the same register
+/// — a nullable load that sets bits, then a `NOT NULL` load on the nullable arm
+/// — and assert the second leaves none. This is the test that fails if the clear
+/// is ever turned into a skip.
+///
+/// At the `eval_batch` level because an `Evaluator` owns its scratch privately:
+/// no caller-facing drive can point two programs at one register file.
+#[test]
+fn not_null_load_clears_a_previous_programs_null_bits() {
+    let schema = TestSchema::new(
+        &[(type_code::U64, false), (type_code::I64, true), (type_code::I64, false)],
+        &[0],
+    );
+    let m = 128;
+    let words = m / 64;
+    let mb = make_n_col_view(&schema, m, |row, _| row as i64, |row, col| col == 0 && row % 2 == 0);
+
+    let nullable_load = resolved(&schema, vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }], 1, 0);
+    // The `NOT NULL` load classifies onto the fast arm on its own; forced onto
+    // the nullable one it runs the kernel whose write is the subject here.
+    let mut not_null_load = resolved(&schema, vec![LogicalInstr::LoadColInt { dst: 0, col: 2 }], 1, 0);
+    assert!(not_null_load.no_nulls, "a NOT NULL load must classify as no_nulls");
+    not_null_load.no_nulls = false;
+
+    let mut scratch = EvalScratch::new(&nullable_load);
+    scratch.ensure_capacity(&nullable_load, 0);
+    eval_batch(&nullable_load, &mb, 0, m, &mut scratch);
+    assert!(
+        scratch.null_bits[0..words].iter().any(|&w| w != 0),
+        "the nullable load must leave null bits behind for the next program to inherit",
+    );
+
+    scratch.ensure_capacity(&not_null_load, 0);
+    eval_batch(&not_null_load, &mb, 0, m, &mut scratch);
+    assert!(
+        scratch.null_bits[0..words].iter().all(|&w| w == 0),
+        "a NOT NULL load left a stale null bit behind: {:?}",
+        &scratch.null_bits[0..words],
+    );
+}
+
 /// Every `LoadPayloadInt` width in both signednesses, and a compound PK whose
 /// two columns differ in signedness — the arms `FixedInt` selects between. A
 /// swapped `U16`/`I16` arm or a dropped OPK sign-flip miscomputes silently, and

@@ -12,7 +12,7 @@ use gnitz_wire::type_code;
 use crate::batch::MORSEL;
 use crate::test_support::{
     both_arms, filter_prog, make_int_row, make_int_view, make_n_col_view, map_prog, passing_ranges, passing_rows,
-    schema_pk_ints, TestSchema, TestView,
+    push_payload_cols, scalar_prog, schema_pk_ints, set_row_pk, TestSchema, TestView,
 };
 use crate::{CmpOp, Evaluator, LogicalInstr, StrOp};
 
@@ -657,7 +657,9 @@ fn is_null_map_arms_agree() {
         LogicalInstr::IsNull { dst: 0, col: 1 },
         LogicalInstr::Emit { src: 0, out: 0 },
     ];
-    let (fast, nullable) = both_arms("map", || map_prog(&in_schema, &out_schema, instrs.clone(), 1, 0));
+    let (fast, nullable) = both_arms("map", || {
+        map_prog(&in_schema, &out_schema, instrs.clone(), 1, 0, vec![])
+    });
 
     // The emitted value per row. `eval_is_null` clears the result's null bit and
     // the fast arm has none to begin with, so a NULL row here is a stale bit on
@@ -680,6 +682,306 @@ fn is_null_map_arms_agree() {
                 drive(&nullable, &mb, n),
                 "{arrangement}: map arms disagree at n={n}",
             );
+        }
+    }
+}
+
+/// The all-`NOT NULL` schema the sweep runs over: `pk U64`, then one payload
+/// column per load kernel under test — `I64`, `F32`, and two `STRING`s.
+fn not_null_load_schema() -> TestSchema {
+    TestSchema::new(
+        &[
+            (type_code::U64, false),
+            (type_code::I64, false),
+            (type_code::F32, false),
+            (type_code::STRING, false),
+            (type_code::STRING, false),
+        ],
+        &[0],
+    )
+}
+
+/// `n` rows over [`not_null_load_schema`], every row's whole null word set to
+/// `null_word`.
+fn not_null_load_view(n: usize, null_word: u64) -> TestView {
+    let schema = not_null_load_schema();
+    let mut v = TestView::new(n, schema.pk_stride());
+    push_payload_cols(&mut v, &schema);
+    for row in 0..n {
+        set_row_pk(&mut v, &schema, row, row as u64 + 1);
+        v.set_null_word(row, null_word);
+        v.set_payload(row, 0, &((row % 5) as i64 - 2).to_le_bytes());
+        v.set_payload(row, 1, &(row as f32).to_bits().to_le_bytes());
+        v.set_string(row, 2, if row % 3 == 0 { b"alpha" } else { b"zeta" });
+        v.set_string(row, 3, if row % 2 == 0 { b"beta" } else { b"omega" });
+    }
+    v
+}
+
+/// One shape per column-reading instruction, all against
+/// [`not_null_load_schema`], each paired with whether its loaded register holds
+/// a string. Every shape writes the loaded value to register 0. The const pool's
+/// entry 0 is the string constant the two string shapes compare against.
+fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
+    vec![
+        (
+            "load_payload_int",
+            (
+                vec![
+                    LogicalInstr::LoadColInt { dst: 0, col: 1 },
+                    LogicalInstr::LoadConst { dst: 1, val: 0 },
+                    LogicalInstr::Cmp {
+                        op: CmpOp::Gt,
+                        dst: 2,
+                        a: 0,
+                        b: 1,
+                    },
+                ],
+                3,
+                2,
+            ),
+            false,
+        ),
+        (
+            "load_payload_f32",
+            (
+                vec![
+                    LogicalInstr::LoadColFloat { dst: 0, col: 2 },
+                    LogicalInstr::LoadConst { dst: 1, val: 3 },
+                    LogicalInstr::IntToFloat { dst: 2, a: 1 },
+                    LogicalInstr::FCmp {
+                        op: CmpOp::Gt,
+                        dst: 3,
+                        a: 0,
+                        b: 2,
+                    },
+                ],
+                4,
+                3,
+            ),
+            false,
+        ),
+        (
+            "load_col_str",
+            (
+                vec![
+                    LogicalInstr::LoadColStr { dst: 0, col: 3 },
+                    LogicalInstr::LoadConstStr { dst: 1, const_idx: 0 },
+                    LogicalInstr::StrCmp {
+                        op: StrOp::Lt,
+                        dst: 2,
+                        a: 0,
+                        b: 1,
+                    },
+                ],
+                3,
+                2,
+            ),
+            true,
+        ),
+        (
+            "str_col_const",
+            (
+                vec![LogicalInstr::StrColConst {
+                    op: StrOp::Lt,
+                    dst: 0,
+                    col: 3,
+                    const_idx: 0,
+                }],
+                1,
+                0,
+            ),
+            false,
+        ),
+        (
+            "str_col_col",
+            (
+                vec![LogicalInstr::StrColCol {
+                    op: StrOp::Lt,
+                    dst: 0,
+                    col_a: 3,
+                    col_b: 4,
+                }],
+                1,
+                0,
+            ),
+            false,
+        ),
+    ]
+}
+
+/// A `NOT NULL` column drops out of `nullable_slots`, so a load from one clears
+/// its destination's null words instead of gathering them: both arms must select
+/// the same rows, emit the same values, and report no NULL at all. One shape per
+/// column-reading kernel, since each names its own payload slots.
+///
+/// The batch's own null word is swept over a clean value and one with every
+/// payload bit forged set. The forged word is the discriminating input: a load
+/// that still read the bit would report every row NULL on the nullable arm while
+/// the `no_nulls` arm — which never reads the bitmap — read the same rows as
+/// live data.
+#[test]
+fn not_null_load_arms_agree_and_report_no_null() {
+    let schema = not_null_load_schema();
+    let consts = || vec![b"m".to_vec()];
+    // Every shape loads into register 0 and, as a map, emits it.
+    const LOAD_REG: u16 = 0;
+
+    for (name, (instrs, num_regs, result_reg), is_str) in not_null_load_shapes() {
+        let out_tc = if is_str { type_code::STRING } else { type_code::I64 };
+        let out_schema = TestSchema::new(&[(type_code::U64, false), (out_tc, false)], &[0]);
+
+        let (fast_filter, nullable_filter) = both_arms(name, || {
+            filter_prog(&schema, instrs.clone(), num_regs, result_reg, consts())
+        });
+        let map_instrs: Vec<LogicalInstr> = instrs
+            .iter()
+            .copied()
+            .chain([LogicalInstr::Emit { src: LOAD_REG, out: 0 }])
+            .collect();
+        let (fast_map, nullable_map) = both_arms(name, || {
+            map_prog(
+                &schema,
+                &out_schema,
+                map_instrs.clone(),
+                num_regs,
+                LOAD_REG as u32,
+                consts(),
+            )
+        });
+
+        // The emitted value per row, plus the direct assertion that no row
+        // reports NULL — comparing the arms alone would pass on two identically
+        // stale ones.
+        let drive_map = |ev: &Evaluator, mb: &TestView, n: usize| {
+            let reg = LOAD_REG as usize;
+            let mut vals: Vec<Vec<u8>> = Vec::with_capacity(n);
+            ev.eval_morsels(mb, 0, n, |_, out| {
+                if is_str {
+                    vals.extend((0..out.rows()).map(|i| out.str_bytes(reg, i).to_vec()));
+                } else {
+                    vals.extend(out.reg_bytes(reg).chunks_exact(8).map(<[u8]>::to_vec));
+                }
+                out.for_each_null_row(reg, |i| {
+                    panic!("{name}: row {i} of a NOT NULL load must never report NULL")
+                });
+            });
+            vals
+        };
+
+        for &n in &ARM_SWEEP_ROWS {
+            for (bitmap, null_word) in [("clean", 0u64), ("forged", 0b1111u64)] {
+                let mb = not_null_load_view(n, null_word);
+                assert_eq!(
+                    passing_rows(&fast_filter, &mb, n),
+                    passing_rows(&nullable_filter, &mb, n),
+                    "{name}/{bitmap}: filter arms disagree at n={n}",
+                );
+                assert_eq!(
+                    drive_map(&fast_map, &mb, n),
+                    drive_map(&nullable_map, &mb, n),
+                    "{name}/{bitmap}: map arms disagree at n={n}",
+                );
+            }
+        }
+    }
+}
+
+/// `nullable_slots` is indexed by payload slot, not column index, so an
+/// all-`NOT NULL` schema — where the mask is empty — cannot catch an off-by-one
+/// in how it is built. Load a nullable column beside a `NOT NULL` one, which is
+/// also what keeps the program on the nullable arm without forcing it, and pin
+/// each register's NULL rows absolutely.
+///
+/// Every `NOT NULL` slot carries a forged bit in the batch's bitmap, on a
+/// different row set than its nullable neighbour, so a gather against a
+/// misaligned mask reports NULL on rows the right one never touches.
+#[test]
+fn nullable_and_not_null_columns_side_by_side() {
+    let schema = TestSchema::new(
+        &[
+            (type_code::U64, false),    // 0: pk
+            (type_code::I64, true),     // 1: payload slot 0
+            (type_code::I64, false),    // 2: payload slot 1
+            (type_code::STRING, true),  // 3: payload slot 2
+            (type_code::STRING, false), // 4: payload slot 3
+            (type_code::F32, true),     // 5: payload slot 4
+            (type_code::F32, false),    // 6: payload slot 5
+        ],
+        &[0],
+    );
+    // Which rows carry a set bit for each payload slot. The odd slots are
+    // declared NOT NULL, so theirs are forged — and set on rows their nullable
+    // neighbour's are not.
+    let slot_bit = |pi: usize, row: usize| match pi {
+        0 => row.is_multiple_of(3),
+        1 => row % 3 == 1,
+        2 => row.is_multiple_of(5),
+        3 => row % 5 == 2,
+        4 => row.is_multiple_of(7),
+        _ => row % 7 == 3,
+    };
+    let n = 300;
+    let mut v = TestView::new(n, schema.pk_stride());
+    push_payload_cols(&mut v, &schema);
+    for row in 0..n {
+        set_row_pk(&mut v, &schema, row, row as u64 + 1);
+        let mut word = 0u64;
+        for pi in 0..6 {
+            gnitz_wire::null_word_set(&mut word, pi, slot_bit(pi, row));
+        }
+        v.set_null_word(row, word);
+        v.set_payload(row, 0, &(row as i64).to_le_bytes());
+        v.set_payload(row, 1, &(row as i64).to_le_bytes());
+        v.set_string(row, 2, if row % 3 == 0 { b"alpha" } else { b"zeta" });
+        v.set_string(row, 3, if row % 2 == 0 { b"beta" } else { b"omega" });
+        v.set_payload(row, 4, &(row as f32).to_bits().to_le_bytes());
+        v.set_payload(row, 5, &(row as f32).to_bits().to_le_bytes());
+    }
+
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::LoadColFloat { dst: 2, col: 5 },
+        LogicalInstr::LoadColFloat { dst: 3, col: 6 },
+        LogicalInstr::LoadColStr { dst: 4, col: 3 },
+        LogicalInstr::LoadColStr { dst: 5, col: 4 },
+        LogicalInstr::StrColConst {
+            op: StrOp::Lt,
+            dst: 6,
+            col: 4,
+            const_idx: 0,
+        },
+        LogicalInstr::StrColCol {
+            op: StrOp::Lt,
+            dst: 7,
+            col_a: 3,
+            col_b: 4,
+        },
+    ];
+    let ev = scalar_prog(&schema, instrs, 8, 0, vec![b"m".to_vec()]);
+    assert!(
+        !ev.prog.no_nulls,
+        "a nullable column load must keep the program on the nullable arm",
+    );
+
+    // Per register, the rows it must report NULL on. Every `NOT NULL` load and
+    // compare reports none, forged bit or not.
+    let want_null = |reg: usize, row: usize| match reg {
+        0 => slot_bit(0, row),     // nullable I64
+        2 => slot_bit(4, row),     // nullable F32
+        4 | 7 => slot_bit(2, row), // nullable STRING, and the compare it feeds
+        _ => false,
+    };
+    let mut seen = vec![vec![false; n]; 8];
+    ev.eval_morsels(&v, 0, n, |rel_start, out| {
+        for (reg, rows) in seen.iter_mut().enumerate() {
+            out.for_each_null_row(reg, |i| rows[rel_start + i] = true);
+        }
+    });
+    for (reg, rows) in seen.iter().enumerate() {
+        for (row, &is_null) in rows.iter().enumerate() {
+            assert_eq!(is_null, want_null(reg, row), "reg {reg}, row {row}");
         }
     }
 }
@@ -1175,12 +1477,15 @@ fn is_null_bench_schema() -> TestSchema {
 ///   done; done; done
 ///
 /// Moving to the fast arm is cheaper on every shape here, at
-/// `-C target-cpu=x86-64-v3` (what `crates/.cargo/config.toml` ships): −3.7 %
-/// retired instructions on `map`, −6.3 % on `bare`, −28.0 % on `one_and`, and
-/// −38 % to −39.3 % across the four 4-conjunct chains. What separates the chain
-/// shapes from each other is only their NULL arrangement, and it no longer
-/// separates them by much — the arms run the same kernels over the same word
-/// count, so the gap is the per-row null gather the fast arm skips.
+/// `-C target-cpu=x86-64-v3` (what `crates/.cargo/config.toml` ships): −3.0 %
+/// retired instructions on `map`, −5.9 % on `bare`, −11.1 % on `one_and`, and
+/// −13.8 % to −14.5 % across the four 4-conjunct chains. What separates the
+/// chain shapes from each other is only their NULL arrangement, and it barely
+/// separates them at all — the arms run the same kernels over the same word
+/// count. The compares read NOT NULL columns, which are outside
+/// `nullable_slots`, so the nullable arm clears their null words rather than
+/// gathering per row; what is left is the null bookkeeping the fast arm has
+/// none of.
 ///
 /// Take both events. `instructions:u` repeats here to under 0.001 %, `cycles:u`
 /// to a few percent; the first is the reproducible one, the second is the one
@@ -1261,7 +1566,9 @@ fn is_null_arm_bench() {
         LogicalInstr::IsNull { dst: 0, col: 1 },
         LogicalInstr::Emit { src: 0, out: 0 },
     ];
-    let (fast, nullable) = both_arms("map", || map_prog(&schema, &out_schema, map_instrs.clone(), 1, 0));
+    let (fast, nullable) = both_arms("map", || {
+        map_prog(&schema, &out_schema, map_instrs.clone(), 1, 0, vec![])
+    });
     // The warm-up doubles as the agreement check, as it does per filter shape.
     let emitted = |ev: &Evaluator| {
         let mut vals = Vec::with_capacity(n);

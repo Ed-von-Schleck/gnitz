@@ -208,11 +208,8 @@ impl EvalScratch {
         if self.no_nulls {
             return;
         }
-        let words = m.div_ceil(64);
         let base = reg * NULL_WORDS_PER_REG;
-        for w in 0..words {
-            self.null_bits[base + w] = 0;
-        }
+        self.null_bits[base..base + m.div_ceil(64)].fill(0);
     }
 }
 
@@ -276,20 +273,27 @@ fn null_copy1(s: &mut EvalScratch, dst: usize, src: usize, m: usize) {
     if s.no_nulls {
         return;
     }
-    let words = m.div_ceil(64);
     let base_s = src * NULL_WORDS_PER_REG;
-    let base_d = dst * NULL_WORDS_PER_REG;
-    for w in 0..words {
-        s.null_bits[base_d + w] = s.null_bits[base_s + w];
-    }
+    s.null_bits
+        .copy_within(base_s..base_s + m.div_ceil(64), dst * NULL_WORDS_PER_REG);
 }
 
 /// Fill null bits into register `di` for the payload columns selected by
-/// `mask` (bit N = payload slot N): a row is null iff any masked column is
+/// `cols` (bit N = payload slot N): a row is null iff any selected column is
 /// null. A single-column caller passes `1 << pi`; the two-operand string
 /// compare passes both columns' bits in one pass.
-fn fill_null_bits_mask(s: &mut EvalScratch, di: usize, mo: &Morsel<'_>, mask: u64) {
+///
+/// `NOT NULL` columns drop out here, against the program's `nullable_slots`, so
+/// no column-reading opcode carries nullability of its own. Once every selected
+/// column is `NOT NULL` the gather below could only write zero words, so it
+/// collapses into a clear.
+fn fill_null_bits_mask(s: &mut EvalScratch, di: usize, mo: &Morsel<'_>, cols: u64) {
     if s.no_nulls {
+        return;
+    }
+    let mask = cols & mo.prog.nullable_slots;
+    if mask == 0 {
+        s.clear_null_reg(di, mo.m);
         return;
     }
     let base = di * NULL_WORDS_PER_REG;

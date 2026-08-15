@@ -1102,6 +1102,14 @@ impl LogicalProgram {
         // one.
         let RegisterRoles { bit_only, bool_input } = register_roles(&self.instrs, self.result_reg, is_filter);
         let no_nulls = is_strictly_non_nullable(&self.instrs, schema);
+        // Off the schema alone, so a column-reading opcode gets the NOT NULL
+        // collapse without wiring anything of its own. A PK column has no
+        // payload slot and so contributes no bit, which is the same rule that
+        // makes `LoadPk`'s destination unconditionally non-null.
+        let nullable_slots = (0..schema.num_columns())
+            .filter(|&ci| schema.col_nullable(ci))
+            .filter_map(|ci| schema.payload_slot(ci))
+            .fold(0u64, |m, pi| m | 1u64 << pi);
         // Which registers hold strings, off the same operand table `validate`
         // reads. Maintained in program order so an `Emit` sees the same class
         // `validate` saw when it approved that output slot.
@@ -1393,6 +1401,7 @@ impl LogicalProgram {
         }
         ResolvedProgram {
             no_nulls,
+            nullable_slots,
             bit_only_mask: bit_only,
             bool_pack_mask: bit_only | bool_input,
             instrs,
@@ -2066,6 +2075,15 @@ pub(crate) struct ResolvedProgram {
     /// Resolved once — the answer is only meaningful for that one schema, since
     /// the payload indices in `instrs` were assigned from it.
     pub(crate) no_nulls: bool,
+    /// Bit `N` set iff payload slot `N`'s column admits NULL in the schema this
+    /// program was resolved against. A column read from a slot outside this mask
+    /// contributes no null bit, so its destination register's null words are
+    /// cleared instead of gathered per row.
+    ///
+    /// Carries the same schema caveat as [`Self::no_nulls`], and rests on the
+    /// same assumption it does: a `NOT NULL` column's declared flag is believed
+    /// over the bit the batch carries for it.
+    pub(crate) nullable_slots: u64,
     /// Bit `r` set iff register `r` is only consumed by boolean ops, so its
     /// producer can skip the i64 unpack into `regs[r]`.
     bit_only_mask: u64,

@@ -206,14 +206,21 @@ struct NullPerm {
 }
 
 impl NullPerm {
-    /// Build from the column moves (a PK source is skipped — the PK has no
-    /// null bit).
-    fn new(col_moves: &[ColMove]) -> Self {
+    /// Build from the column moves. A source contributes a pair only if it can
+    /// carry a set bit: a PK source has no null bit at all, and a `NOT NULL`
+    /// payload source is believed over the bit the batch carries for it — the
+    /// same trust the expression evaluator's `nullable_slots` rests on. A
+    /// projection whose sources are all `NOT NULL` therefore has no pairs, and
+    /// [`Self::write_rows`] fills zeros instead of permuting per row.
+    fn new(col_moves: &[ColMove], in_schema: &SchemaDescriptor) -> Self {
         let pairs = col_moves
             .iter()
             .filter_map(|cm| match cm.src {
                 ColumnLocator::Pk { .. } => None,
-                ColumnLocator::Payload { slot, .. } => Some((slot, cm.dst_payload as u8)),
+                ColumnLocator::Payload { slot, .. } => {
+                    let src_col = in_schema.payload_col_idx(slot as usize);
+                    (in_schema.columns[src_col].nullable != 0).then_some((slot, cm.dst_payload as u8))
+                }
             })
             .collect();
         NullPerm { pairs }
@@ -356,9 +363,9 @@ impl ScalarFunc {
             let list = if is_str { &mut str_emits } else { &mut emits };
             list.push((reg as usize, out as usize));
         }
-        // Null permutation: copied columns carry their source null bit (PK
-        // sources are skipped inside `NullPerm::new` — the PK has no null bit).
-        let null_perm = NullPerm::new(&col_moves);
+        // Null permutation: copied columns carry their source null bit. Sources
+        // that cannot have one are dropped inside `NullPerm::new`.
+        let null_perm = NullPerm::new(&col_moves, in_schema);
 
         // Compute is needed iff the program emits a computed register: every
         // compute instruction exists only to feed an EMIT. Both lists count —
