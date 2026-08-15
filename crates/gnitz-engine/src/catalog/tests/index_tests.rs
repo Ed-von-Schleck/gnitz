@@ -85,27 +85,17 @@ fn test_system_table_flush_compacts_l0() {
     // assert the shard count stays bounded.
     let dir = temp_dir("sys_compact_l0");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let schema = SysFamily::Index.schema();
-    let flushes = 40u64;
+    let flushes = 40i64;
     for i in 0..flushes {
-        let mut bb = BatchBuilder::new(schema);
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(0); // owner_id
-        bb.put_u64(0); // owner_kind
-        bb.put_u64(0); // source_col_idx
-        bb.put_string(&format!("idx{i}"));
-        bb.put_u64(0); // is_unique
-        bb.put_string(""); // cache_directory
-        bb.end_row();
         engine
             .sys_store_mut(SysFamily::Index)
-            .ingest_borrowed_batch(&bb.finish())
+            .ingest_borrowed_batch(&idx_tab_batch(i, 0, 0, &format!("idx{i}"), false, 1))
             .unwrap();
         engine.flush_family(IDX_TAB_ID).unwrap();
     }
     let shards = engine.sys_store_mut(SysFamily::Index).all_shard_arcs().len();
     assert!(
-        (shards as u64) < flushes / 2,
+        (shards as i64) < flushes / 2,
         "system catalog L0 must be compacted: {shards} shards after {flushes} flushes"
     );
     engine.close();

@@ -1,4 +1,8 @@
 use super::*;
+use gnitz_wire::{
+    COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND,
+    IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME, TABTAB_PAY_SCHEMA_ID,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 

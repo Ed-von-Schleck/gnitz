@@ -83,19 +83,9 @@ fn test_orphaned_metadata_recovery() {
     // First open: inject an index record pointing to non-existent table 99999
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
-        let idx_schema = SysFamily::Index.schema();
-        let mut bb = BatchBuilder::new(idx_schema);
-        bb.begin_row(888u128, 1);
-        bb.put_u64(99999); // owner_id (non-existent)
-        bb.put_u64(OWNER_KIND_TABLE as u64);
-        bb.put_u64(1); // source_col_idx
-        bb.put_string("orphaned_idx");
-        bb.put_u64(0); // is_unique
-        bb.put_string(""); // cache_dir
-        bb.end_row();
         engine
             .sys_store_mut(SysFamily::Index)
-            .ingest_borrowed_batch(&bb.finish())
+            .ingest_borrowed_batch(&idx_tab_batch(888, 99999, 1, "orphaned_idx", false, 1))
             .unwrap();
         let _ = engine.sys_store_mut(SysFamily::Index).flush();
         engine.close();
@@ -288,37 +278,14 @@ fn test_sequence_gap_recovery() {
         engine.create_table("public.t1", &cols, &[0]).unwrap();
 
         // Inject table record for tid=250 directly into sys_tables
-        let tbl_schema = SysFamily::Table.schema();
-        let mut bb = BatchBuilder::new(tbl_schema);
-        bb.begin_row(250u128, 1);
-        bb.put_u64(PUBLIC_SCHEMA_ID as u64); // schema_id
-        bb.put_string("gap_table");
-        bb.put_string(&format!("{dir}/public/gap"));
-        bb.put_u64(0); // pk_col_idx
-        bb.put_u64(0); // created_lsn
-        bb.put_u64(0); // flags
-        bb.end_row();
         engine
             .sys_store_mut(SysFamily::Table)
-            .ingest_borrowed_batch(&bb.finish())
+            .ingest_borrowed_batch(&build_table_tab_row(250, 0, "gap_table"))
             .unwrap();
 
         // Inject column record for tid=250
-        let col_schema = SysFamily::Column.schema();
-        let mut cbb = BatchBuilder::new(col_schema);
-        let pk = pack_column_id(250, 0);
-        cbb.begin_row(pk as u128, 1);
-        cbb.put_u64(250); // owner_id
-        cbb.put_u64(OWNER_KIND_TABLE as u64);
-        cbb.put_u64(0); // col_idx
-        cbb.put_string("id");
-        cbb.put_u64(type_code::U64 as u64);
-        cbb.put_u64(0); // is_nullable
-        cbb.put_u64(0); // fk_table_id
-        cbb.put_u64(0); // fk_col_idx
-        cbb.put_u64(0); // is_serial
-        cbb.put_u64(0); // is_hidden
-        cbb.end_row();
+        let mut cbb = BatchBuilder::new(SysFamily::Column.schema());
+        push_col_tab_row(&mut cbb, 250, OWNER_KIND_TABLE, 0, &col_def("id", type_code::U64), 1);
         engine
             .sys_store_mut(SysFamily::Column)
             .ingest_borrowed_batch(&cbb.finish())

@@ -2104,6 +2104,15 @@ impl BatchBuilder {
     /// Finish the current row (writes null bitmap). The batch stays `Raw` (its
     /// constructor default; `extend_*` never raises the layout).
     pub(crate) fn end_row(&mut self) {
+        // Nothing else notices a row that skipped a column: the count still
+        // advances and the short region keeps whatever bytes were there.
+        debug_assert_eq!(
+            self.curr_col,
+            self.schema().num_payload_cols(),
+            "BatchBuilder row got {} of {} payload columns",
+            self.curr_col,
+            self.schema().num_payload_cols(),
+        );
         self.batch.extend_null_bmp(&self.curr_null_word.to_le_bytes());
         self.batch.count += 1;
     }
@@ -2113,7 +2122,6 @@ impl BatchBuilder {
         self.batch
     }
 
-    #[cfg(test)]
     fn schema(&self) -> &SchemaDescriptor {
         self.batch
             .schema

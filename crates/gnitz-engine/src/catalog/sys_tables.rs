@@ -4,8 +4,15 @@
 //!
 //! Pure data and stateless codecs — no state, no CatalogEngine dependency.
 
+use super::ColumnDef;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, BatchBuilder};
+
+use gnitz_wire::{
+    IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID,
+    IDXTAB_PAY_SOURCE_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID,
+    VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -77,7 +84,7 @@ pub(super) use gnitz_wire::{pack_pk_cols, PK_LIST_MAX_COLS, PK_LIST_PACKED_FLAG}
 /// (the raw decoded count, not the clamped slice length) is what gates
 /// `1..=PK_LIST_MAX_COLS`, so a crafted over-range count is rejected rather
 /// than silently truncated.
-pub(super) fn validate_pk_cols(col_defs: &[super::types::ColumnDef], pk: &PkColList) -> Result<(), String> {
+pub(super) fn validate_pk_cols(col_defs: &[ColumnDef], pk: &PkColList) -> Result<(), String> {
     if !pk.is_well_formed() {
         return Err(format!(
             "Primary Key column count {} out of range 1..={}",
@@ -122,7 +129,7 @@ pub(super) fn validate_pk_cols(col_defs: &[super::types::ColumnDef], pk: &PkColL
 /// *payload* column's, and this is the trust boundary where COL_TAB rows become
 /// a `SchemaDescriptor` (see `gnitz_wire::is_valid_type_code` for why an unknown
 /// code is not inert).
-pub(super) fn check_col_defs(col_defs: &[super::types::ColumnDef]) -> Result<(), String> {
+pub(super) fn check_col_defs(col_defs: &[ColumnDef]) -> Result<(), String> {
     if col_defs.len() > crate::schema::MAX_COLUMNS {
         return Err(format!(
             "has {} columns (max {})",
@@ -147,7 +154,7 @@ pub(super) fn validate_relation_defs(
     kind: &str,
     id: i64,
     name: &str,
-    col_defs: &[super::types::ColumnDef],
+    col_defs: &[ColumnDef],
     pk: &PkColList,
 ) -> Result<(), String> {
     if col_defs.is_empty() {
@@ -160,62 +167,6 @@ pub(super) fn validate_relation_defs(
     check_col_defs(col_defs).map_err(|e| format!("{kind} '{name}' (id={id}) {e}"))?;
     validate_pk_cols(col_defs, pk)
 }
-
-// ---------------------------------------------------------------------------
-// Positional column constants — derived at compile time from the shared
-// gnitz-wire column slices, so a reshaped table re-derives every index.
-// `*_COL_*` are full-schema indices (cursor reads); `*_PAY_*` are payload
-// indices (batch reads, single leading PK column excluded).
-// ---------------------------------------------------------------------------
-
-use gnitz_wire::{col_index_in, pay_index_in};
-
-pub(super) const SCHEMATAB_PAY_NAME: usize = pay_index_in(gnitz_wire::SCHEMA_TAB_COLS, "name");
-
-pub(super) const TABTAB_PAY_SCHEMA_ID: usize = pay_index_in(gnitz_wire::TABLE_TAB_COLS, "schema_id");
-pub(super) const TABTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::TABLE_TAB_COLS, "name");
-pub(super) const TABTAB_PAY_PK_COL_IDX: usize = pay_index_in(gnitz_wire::TABLE_TAB_COLS, "pk_col_idx");
-pub(super) const TABTAB_PAY_FLAGS: usize = pay_index_in(gnitz_wire::TABLE_TAB_COLS, "flags");
-
-pub(super) const VIEWTAB_PAY_SCHEMA_ID: usize = pay_index_in(gnitz_wire::VIEW_TAB_COLS, "schema_id");
-pub(super) const VIEWTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::VIEW_TAB_COLS, "name");
-pub(super) const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in(gnitz_wire::VIEW_TAB_COLS, "pk_col_idx");
-
-// `apply_entity_caches` / `apply_schema_members` decode TABLE_TAB and VIEW_TAB
-// batches through one code path (reading the TABTAB_PAY_* positions); the two
-// families must agree on the leading `(schema_id, name)` payload prefix.
-const _: () = {
-    assert!(TABTAB_PAY_SCHEMA_ID == VIEWTAB_PAY_SCHEMA_ID);
-    assert!(TABTAB_PAY_NAME == VIEWTAB_PAY_NAME);
-};
-
-pub(super) const COLTAB_COL_NAME: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "name");
-pub(super) const COLTAB_COL_TYPE_CODE: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "type_code");
-pub(super) const COLTAB_COL_IS_NULLABLE: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "is_nullable");
-pub(super) const COLTAB_COL_FK_TABLE_ID: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "fk_table_id");
-pub(super) const COLTAB_COL_FK_COL_IDX: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "fk_col_idx");
-pub(super) const COLTAB_COL_IS_HIDDEN: usize = col_index_in(gnitz_wire::COL_TAB_COLS, "is_hidden");
-pub(super) const COLTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "name");
-pub(super) const COLTAB_PAY_OWNER_ID: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "owner_id");
-pub(super) const COLTAB_PAY_OWNER_KIND: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "owner_kind");
-pub(super) const COLTAB_PAY_COL_IDX: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "col_idx");
-pub(super) const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "fk_table_id");
-pub(super) const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "fk_col_idx");
-pub(super) const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "is_nullable");
-pub(super) const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in(gnitz_wire::COL_TAB_COLS, "is_hidden");
-
-pub(super) const IDXTAB_COL_OWNER_ID: usize = col_index_in(gnitz_wire::IDX_TAB_COLS, "owner_id");
-// Holds `pack_pk_cols(&col_indices)` for every row (single- and multi-column
-// indexes alike); decoded via `unpack_pk_cols`.
-pub(super) const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(gnitz_wire::IDX_TAB_COLS, "source_col_idx");
-pub(super) const IDXTAB_COL_IS_UNIQUE: usize = col_index_in(gnitz_wire::IDX_TAB_COLS, "is_unique");
-pub(super) const IDXTAB_PAY_OWNER_ID: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "owner_id");
-pub(super) const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "source_col_idx");
-pub(super) const IDXTAB_PAY_NAME: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "name");
-pub(super) const IDXTAB_PAY_IS_UNIQUE: usize = pay_index_in(gnitz_wire::IDX_TAB_COLS, "is_unique");
-
-pub(super) const SEQTAB_COL_VALUE: usize = col_index_in(gnitz_wire::SEQ_TAB_COLS, "next_val");
-pub(super) const SEQTAB_PAY_VALUE: usize = pay_index_in(gnitz_wire::SEQ_TAB_COLS, "next_val");
 
 // ---------------------------------------------------------------------------
 // Per-family row-view decoders — the one reading of each family's payload
@@ -371,58 +322,74 @@ pub(crate) fn family_pks_by_sign(batch: &Batch, positive: bool) -> Vec<i64> {
 
 // ---------------------------------------------------------------------------
 // Per-family row builders — the one writing of each family's payload layout,
-// shared by the fresh-DB bootstrap self-description and the test-only DDL
-// entry points.
+// for every engine-side writer: bootstrap's self-description, the DDL
+// emitters, and the test fixtures that drive the applier directly.
 // ---------------------------------------------------------------------------
 
-/// Append one COL_TAB row for column `col_idx` of `owner_id`.
-#[allow(clippy::too_many_arguments)]
+/// Append one COL_TAB row for column `col_idx` of `owner_id`. Takes the whole
+/// `ColumnDef` rather than its fields, mirroring `registry.rs`'s read side,
+/// which reassembles exactly this struct.
 pub(super) fn push_col_tab_row(
     bb: &mut BatchBuilder,
     owner_id: i64,
     owner_kind: i64,
     col_idx: i64,
-    name: &str,
-    type_code: u8,
-    is_nullable: bool,
-    fk_table_id: i64,
-    fk_col_idx: i64,
-    is_hidden: bool,
+    cd: &ColumnDef,
     weight: i64,
 ) {
     bb.begin_row(pack_column_id(owner_id, col_idx) as u128, weight);
     bb.put_u64(owner_id as u64);
     bb.put_u64(owner_kind as u64);
     bb.put_u64(col_idx as u64);
-    bb.put_string(name);
-    bb.put_u64(type_code as u64);
-    bb.put_u64(if is_nullable { 1 } else { 0 });
-    bb.put_u64(fk_table_id as u64);
-    bb.put_u64(fk_col_idx as u64);
+    bb.put_string(&cd.name);
+    bb.put_u64(cd.type_code as u64);
+    bb.put_u64(if cd.is_nullable { 1 } else { 0 });
+    bb.put_u64(cd.fk_table_id as u64);
+    bb.put_u64(cd.fk_col_idx as u64);
     bb.put_u64(0); // is_serial — neither engine-side writer marks SERIAL
-    bb.put_u64(if is_hidden { 1 } else { 0 });
+    bb.put_u64(if cd.is_hidden { 1 } else { 0 });
     bb.end_row();
 }
 
-/// Append one TABLE_TAB registration row (weight +1, created_lsn 0 — both
-/// engine-side writers register fresh tables).
+/// Append one TABLE_TAB row at `weight`.
 pub(super) fn push_table_tab_row(
     bb: &mut BatchBuilder,
     tid: i64,
     schema_id: i64,
     name: &str,
-    directory: &str,
     pk_col_idx: u64,
     flags: u64,
+    weight: i64,
 ) {
-    bb.begin_row(tid as u128, 1);
+    bb.begin_row(tid as u128, weight);
     bb.put_u64(schema_id as u64);
     bb.put_string(name);
-    bb.put_string(directory);
     bb.put_u64(pk_col_idx);
-    bb.put_u64(0); // created_lsn
     bb.put_u64(flags);
     bb.end_row();
+}
+
+/// The one-row IDX_TAB batch at `weight` — `+1` registers an index, `-1`
+/// retracts one. A `-1` must reproduce the `+1`'s payload exactly: the
+/// retraction CAS rejects a mismatch, and only byte-equal `(PK, payload)` rows
+/// cancel. Every engine-side IDX_TAB write is a single row; multi-row batches
+/// come from the client.
+pub(super) fn idx_tab_batch(
+    index_id: i64,
+    owner_id: i64,
+    packed_cols: u64,
+    name: &str,
+    is_unique: bool,
+    weight: i64,
+) -> Batch {
+    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
+    bb.begin_row(index_id as u128, weight);
+    bb.put_u64(owner_id as u64);
+    bb.put_u64(packed_cols);
+    bb.put_string(name);
+    bb.put_u64(if is_unique { 1 } else { 0 });
+    bb.end_row();
+    bb.finish()
 }
 
 // Default arena sizes for system tables and user tables

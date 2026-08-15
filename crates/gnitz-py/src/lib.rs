@@ -2514,6 +2514,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("TABLE_TAB", gnitz_wire::TABLE_TAB)?;
     m.add("IDX_TAB", gnitz_wire::IDX_TAB)?;
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
+    // IDX_TAB column positions, so a test reading a catalog batch names the slot
+    // rather than counting to it.
+    m.add("IDXTAB_COL_OWNER_ID", gnitz_wire::IDXTAB_COL_OWNER_ID)?;
+    m.add("IDXTAB_COL_SOURCE_COLS", gnitz_wire::IDXTAB_COL_SOURCE_COLS)?;
+    m.add("IDXTAB_COL_IS_UNIQUE", gnitz_wire::IDXTAB_COL_IS_UNIQUE)?;
     m.add_function(wrap_pyfunction!(unpack_pk_cols, m)?)?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
     Ok(())

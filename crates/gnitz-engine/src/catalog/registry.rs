@@ -3,6 +3,10 @@
 //! and sequence advancement.
 
 use super::*;
+use gnitz_wire::{
+    COLTAB_COL_FK_COL_IDX, COLTAB_COL_FK_TABLE_ID, COLTAB_COL_IS_HIDDEN, COLTAB_COL_IS_NULLABLE, COLTAB_COL_NAME,
+    COLTAB_COL_TYPE_CODE,
+};
 
 /// The one place COL_TAB column records become a `SchemaDescriptor`, so it is
 /// where their admissibility is enforced — not at the callers.

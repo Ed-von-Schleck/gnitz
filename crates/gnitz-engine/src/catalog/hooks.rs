@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::schema::make_index_schema;
+use gnitz_wire::{SCHEMATAB_PAY_NAME, SEQTAB_PAY_VALUE};
 use rustc_hash::FxHashMap;
 
 /// What `register_relation` needs to build and register one relation: the
@@ -616,7 +617,7 @@ impl CatalogEngine {
     }
 
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
-        // Index name lives in the batch's payload column 3; apply_index_by_name
+        // Index name lives in the batch's `IDXTAB_PAY_NAME` slot; apply_index_by_name
         // already populated the name-indexed caches from there, so we don't
         // read the string here — it would just be a wasted allocation.
         for i in 0..batch.count {

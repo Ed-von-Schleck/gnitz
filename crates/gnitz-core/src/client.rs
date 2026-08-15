@@ -16,7 +16,14 @@ use crate::types::{
     circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, dep_tab_schema,
     idx_tab_schema, schema_tab_schema, table_tab_schema, view_tab_schema,
 };
-use gnitz_wire::{CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, OWNER_KIND_TABLE, OWNER_KIND_VIEW};
+use gnitz_wire::{
+    CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, COLTAB_COL_COL_IDX, COLTAB_COL_FK_COL_IDX,
+    COLTAB_COL_FK_TABLE_ID, COLTAB_COL_IS_HIDDEN, COLTAB_COL_IS_NULLABLE, COLTAB_COL_IS_SERIAL, COLTAB_COL_NAME,
+    COLTAB_COL_OWNER_ID, COLTAB_COL_OWNER_KIND, COLTAB_COL_TYPE_CODE, IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_NAME,
+    IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME,
+    TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX, TABTAB_COL_SCHEMA_ID, VIEWTAB_COL_NAME,
+    VIEWTAB_COL_PK_COL_IDX, VIEWTAB_COL_SCHEMA_ID, VIEWTAB_COL_SQL,
+};
 
 // --- Module-private helpers ---
 
@@ -129,9 +136,7 @@ pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
 struct TableRecord {
     tid: u64,
     schema_id: u64,
-    directory: String,
     pk_col_idx: u64,
-    created_lsn: u64,
     flags: u64,
 }
 
@@ -140,9 +145,17 @@ struct ViewRecord {
     schema_id: u64,
     name: String,
     sql_definition: String,
-    cache_directory: String,
-    created_lsn: u64,
     pk_col_idx: u64,
+}
+
+/// `is_unique` stays the stored word rather than a `bool`, so a DROP echoes
+/// back exactly what it read.
+struct IndexRecord {
+    index_id: u64,
+    owner_id: u64,
+    source_cols: u64,
+    name: String,
+    is_unique: u64,
 }
 
 // --- GnitzClient ---
@@ -570,7 +583,7 @@ impl GnitzClient {
             for i in b.live_rows() {
                 fresh.push(IndexMeta {
                     cols: unpack_well_formed(b.pks.get(i) as u64)?,
-                    is_unique: col_u64(&b.columns[1], i)? != 0,
+                    is_unique: col_u64(&b.columns[gnitz_wire::INDEXMETA_COL_IS_UNIQUE], i)? != 0,
                 });
             }
         }
@@ -627,14 +640,17 @@ impl GnitzClient {
 
         let idx_schema = idx_tab_schema();
         let mut batch = ZSetBatch::new(idx_schema);
-        BatchAppender::new(&mut batch, idx_schema)
-            .add_row(index_id as u128, 1)
-            .u64_val(table_id)
-            .u64_val(0)
-            .u64_val(gnitz_wire::pack_pk_cols(col_indices))
-            .str_val(&index_name)
-            .u64_val(is_unique as u64)
-            .str_val("");
+        append_idx_tab_row(
+            &mut BatchAppender::new(&mut batch, idx_schema),
+            1,
+            &IndexRecord {
+                index_id,
+                owner_id: table_id,
+                source_cols: gnitz_wire::pack_pk_cols(col_indices),
+                name: index_name,
+                is_unique: is_unique as u64,
+            },
+        );
 
         self.push_ddl(&[(IDX_TAB, idx_schema, batch)])?;
         Ok(index_id)
@@ -663,28 +679,14 @@ impl GnitzClient {
             return not_found(&index_name);
         };
         for i in idx_batch.live_rows() {
-            let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
-            if name != index_name {
+            if col_str(&idx_batch.columns[IDXTAB_COL_NAME], i)? != Some(index_name.as_str()) {
                 continue;
             }
-
-            let index_id = idx_batch.pks.get(i) as u64;
-            let owner_id = col_u64(&idx_batch.columns[1], i)?;
-            let owner_kind = col_u64(&idx_batch.columns[2], i)?;
-            let src_col = col_u64(&idx_batch.columns[3], i)?;
-            let is_unique = col_u64(&idx_batch.columns[5], i)?;
-            let cache_dir = col_str(&idx_batch.columns[6], i)?.unwrap_or("").to_string();
+            let rec = decode_index_record(&idx_batch, i)?;
 
             let idx_schema = idx_tab_schema();
             let mut batch = ZSetBatch::new(idx_schema);
-            BatchAppender::new(&mut batch, idx_schema)
-                .add_row(index_id as u128, -1)
-                .u64_val(owner_id)
-                .u64_val(owner_kind)
-                .u64_val(src_col)
-                .str_val(&index_name)
-                .u64_val(is_unique)
-                .str_val(&cache_dir);
+            append_idx_tab_row(&mut BatchAppender::new(&mut batch, idx_schema), -1, &rec);
             self.push_ddl(&[(IDX_TAB, idx_schema, batch)])?;
             return Ok(());
         }
@@ -695,9 +697,8 @@ impl GnitzClient {
     /// canonical lowercase, since `create_index`/`create_table` canonicalize at
     /// store time). `create_index` checks it for a duplicate name; the planner uses
     /// it to reject a re-index of an identical column set under the auto base name
-    /// and to disambiguate an auto-generated name against the taken set. Name is
-    /// column 4, the packed source columns are column 3 — the same slots
-    /// `create_index` writes and `drop_index_by_name` reads.
+    /// and to disambiguate an auto-generated name against the taken set. Reads the
+    /// same slots `create_index` writes and `drop_index_by_name` reads.
     pub fn index_name_cols(&mut self) -> Result<Vec<(String, gnitz_wire::PkColList)>, ClientError> {
         let (_, idx_batch, _) = self.session.scan(IDX_TAB)?;
         let Some(idx_batch) = idx_batch else {
@@ -705,10 +706,10 @@ impl GnitzClient {
         };
         let mut out = Vec::new();
         for i in idx_batch.live_rows() {
-            let Some(name) = col_str(&idx_batch.columns[4], i)? else {
+            let Some(name) = col_str(&idx_batch.columns[IDXTAB_COL_NAME], i)? else {
                 continue;
             };
-            let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch.columns[3], i)?);
+            let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch.columns[IDXTAB_COL_SOURCE_COLS], i)?);
             out.push((name.to_string(), cols));
         }
         Ok(out)
@@ -972,14 +973,17 @@ impl GnitzClient {
         // TABLE_TAB family.
         let tbl_schema = table_tab_schema();
         let mut tb = ZSetBatch::new(tbl_schema);
-        BatchAppender::new(&mut tb, tbl_schema)
-            .add_row(new_tid as u128, 1)
-            .u64_val(schema_id)
-            .str_val(&table_name)
-            .str_val("")
-            .u64_val(pk_packed)
-            .u64_val(0)
-            .u64_val(gnitz_wire::pack_table_flags(replicated, dist_prefix_len));
+        append_table_tab_row(
+            &mut BatchAppender::new(&mut tb, tbl_schema),
+            1,
+            &TableRecord {
+                tid: new_tid,
+                schema_id,
+                pk_col_idx: pk_packed,
+                flags: gnitz_wire::pack_table_flags(replicated, dist_prefix_len),
+            },
+            &table_name,
+        );
 
         // IDX_TAB family — every inline UNIQUE index as one multi-row batch
         // (`hook_index_register` loops over rows). Allocate ids and validate up
@@ -1006,13 +1010,17 @@ impl GnitzClient {
             {
                 let mut a = BatchAppender::new(&mut idx_batch, idx_schema);
                 for (spec, &index_id) in unique_indexes.iter().zip(&index_ids) {
-                    a.add_row(index_id as u128, 1)
-                        .u64_val(new_tid) // owner_id
-                        .u64_val(0) // owner_kind = table
-                        .u64_val(gnitz_wire::pack_pk_cols(spec.col_indices)) // source_col_idx
-                        .str_val(&canon_name(spec.name))
-                        .u64_val(1) // is_unique
-                        .str_val(""); // cache_directory
+                    append_idx_tab_row(
+                        &mut a,
+                        1,
+                        &IndexRecord {
+                            index_id,
+                            owner_id: new_tid,
+                            source_cols: gnitz_wire::pack_pk_cols(spec.col_indices),
+                            name: canon_name(spec.name),
+                            is_unique: 1,
+                        },
+                    );
                 }
             }
             families.push((IDX_TAB, idx_schema, idx_batch));
@@ -1233,8 +1241,6 @@ impl GnitzClient {
                         schema_id,
                         name: canon_name(&pv.name),
                         sql_definition: pv.sql_text,
-                        cache_directory: String::new(),
-                        created_lsn: 0,
                         pk_col_idx: pk_packed,
                     },
                 );
@@ -1517,7 +1523,10 @@ impl GnitzClient {
             if tbl_batch.pks.get(i) as u64 != tid {
                 continue;
             }
-            return Ok(gnitz_wire::table_flags_replicated(col_u64(&tbl_batch.columns[6], i)?));
+            return Ok(gnitz_wire::table_flags_replicated(col_u64(
+                &tbl_batch.columns[TABTAB_COL_FLAGS],
+                i,
+            )?));
         }
         Ok(false)
     }
@@ -1717,26 +1726,28 @@ fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) ->
     // regardless of storage/scan order.
     let mut col_entries: Vec<(u64, ColumnDef)> = Vec::new();
     for i in col_batch.live_rows() {
-        let row_owner_id = col_u64(&col_batch.columns[1], i)?;
-        let row_owner_kind = col_u64(&col_batch.columns[2], i)?;
+        let row_owner_id = col_u64(&col_batch.columns[COLTAB_COL_OWNER_ID], i)?;
+        let row_owner_kind = col_u64(&col_batch.columns[COLTAB_COL_OWNER_KIND], i)?;
         if row_owner_id != owner_id || row_owner_kind != owner_kind {
             continue;
         }
 
-        let col_idx = col_u64(&col_batch.columns[3], i)?;
-        let name = col_str(&col_batch.columns[4], i)?.unwrap_or("").to_string();
-        let tc_val = col_u64(&col_batch.columns[5], i)?;
+        let col_idx = col_u64(&col_batch.columns[COLTAB_COL_COL_IDX], i)?;
+        let name = col_str(&col_batch.columns[COLTAB_COL_NAME], i)?
+            .unwrap_or("")
+            .to_string();
+        let tc_val = col_u64(&col_batch.columns[COLTAB_COL_TYPE_CODE], i)?;
         let type_code = type_code_from_u64(tc_val).map_err(ClientError::Protocol)?;
         col_entries.push((
             col_idx,
             ColumnDef {
                 name,
                 type_code,
-                is_nullable: col_u64(&col_batch.columns[6], i)? != 0,
-                fk_table_id: col_u64(&col_batch.columns[7], i)?,
-                fk_col_idx: col_u64(&col_batch.columns[8], i)?,
-                is_serial: col_u64(&col_batch.columns[9], i)? != 0,
-                is_hidden: col_u64(&col_batch.columns[10], i)? != 0,
+                is_nullable: col_u64(&col_batch.columns[COLTAB_COL_IS_NULLABLE], i)? != 0,
+                fk_table_id: col_u64(&col_batch.columns[COLTAB_COL_FK_TABLE_ID], i)?,
+                fk_col_idx: col_u64(&col_batch.columns[COLTAB_COL_FK_COL_IDX], i)?,
+                is_serial: col_u64(&col_batch.columns[COLTAB_COL_IS_SERIAL], i)? != 0,
+                is_hidden: col_u64(&col_batch.columns[COLTAB_COL_IS_HIDDEN], i)? != 0,
             },
         ));
     }
@@ -1771,7 +1782,7 @@ fn assemble_schema(columns: Vec<ColumnDef>, pk_col_idx: u64) -> Result<Schema, C
 /// corrupt catalog batch.
 fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientError> {
     for i in batch.live_rows() {
-        if col_str(&batch.columns[1], i)? == Some(name) {
+        if col_str(&batch.columns[SCHEMATAB_COL_NAME], i)? == Some(name) {
             return Ok(Some(batch.pks.get(i) as u64));
         }
     }
@@ -1782,19 +1793,17 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientEr
 /// corrupt `TABLE_TAB` batch.
 fn find_table_record(batch: &ZSetBatch, schema_id: u64, table_name: &str) -> Result<Option<TableRecord>, ClientError> {
     for i in batch.live_rows() {
-        if col_u64(&batch.columns[1], i)? != schema_id {
+        if col_u64(&batch.columns[TABTAB_COL_SCHEMA_ID], i)? != schema_id {
             continue;
         }
-        if col_str(&batch.columns[2], i)? != Some(table_name) {
+        if col_str(&batch.columns[TABTAB_COL_NAME], i)? != Some(table_name) {
             continue;
         }
         return Ok(Some(TableRecord {
             tid: batch.pks.get(i) as u64,
             schema_id,
-            directory: col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
-            pk_col_idx: col_u64(&batch.columns[4], i)?,
-            created_lsn: col_u64(&batch.columns[5], i)?,
-            flags: col_u64(&batch.columns[6], i)?,
+            pk_col_idx: col_u64(&batch.columns[TABTAB_COL_PK_COL_IDX], i)?,
+            flags: col_u64(&batch.columns[TABTAB_COL_FLAGS], i)?,
         }));
     }
     Ok(None)
@@ -1806,12 +1815,10 @@ fn find_table_record(batch: &ZSetBatch, schema_id: u64, table_name: &str) -> Res
 fn decode_view_record(batch: &ZSetBatch, i: usize) -> Result<ViewRecord, ClientError> {
     Ok(ViewRecord {
         vid: batch.pks.get(i) as u64,
-        schema_id: col_u64(&batch.columns[1], i)?,
-        name: col_str(&batch.columns[2], i)?.unwrap_or("").to_string(),
-        sql_definition: col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
-        cache_directory: col_str(&batch.columns[4], i)?.unwrap_or("").to_string(),
-        created_lsn: col_u64(&batch.columns[5], i)?,
-        pk_col_idx: col_u64(&batch.columns[6], i)?,
+        schema_id: col_u64(&batch.columns[VIEWTAB_COL_SCHEMA_ID], i)?,
+        name: col_str(&batch.columns[VIEWTAB_COL_NAME], i)?.unwrap_or("").to_string(),
+        sql_definition: col_str(&batch.columns[VIEWTAB_COL_SQL], i)?.unwrap_or("").to_string(),
+        pk_col_idx: col_u64(&batch.columns[VIEWTAB_COL_PK_COL_IDX], i)?,
     })
 }
 
@@ -1880,8 +1887,6 @@ fn append_view_row(a: &mut BatchAppender<'_>, weight: i64, rec: &ViewRecord) {
         .u64_val(rec.schema_id)
         .str_val(&rec.name)
         .str_val(&rec.sql_definition)
-        .str_val(&rec.cache_directory)
-        .u64_val(rec.created_lsn)
         .u64_val(rec.pk_col_idx);
 }
 
@@ -1893,20 +1898,41 @@ fn append_table_tab_row(a: &mut BatchAppender<'_>, weight: i64, rec: &TableRecor
     a.add_row(rec.tid as u128, weight)
         .u64_val(rec.schema_id)
         .str_val(name)
-        .str_val(&rec.directory)
         .u64_val(rec.pk_col_idx)
-        .u64_val(rec.created_lsn)
         .u64_val(rec.flags);
+}
+
+/// Append one `IDX_TAB` row — the single home for the layout, mirrored by
+/// [`decode_index_record`]. The engine rejects a `-1` whose payload differs
+/// from the live row, and only byte-equal rows cancel, so a DROP must
+/// reproduce its CREATE exactly.
+fn append_idx_tab_row(a: &mut BatchAppender<'_>, weight: i64, rec: &IndexRecord) {
+    a.add_row(rec.index_id as u128, weight)
+        .u64_val(rec.owner_id)
+        .u64_val(rec.source_cols)
+        .str_val(&rec.name)
+        .u64_val(rec.is_unique);
+}
+
+/// Read-side mirror of [`append_idx_tab_row`].
+fn decode_index_record(batch: &ZSetBatch, i: usize) -> Result<IndexRecord, ClientError> {
+    Ok(IndexRecord {
+        index_id: batch.pks.get(i) as u64,
+        owner_id: col_u64(&batch.columns[IDXTAB_COL_OWNER_ID], i)?,
+        source_cols: col_u64(&batch.columns[IDXTAB_COL_SOURCE_COLS], i)?,
+        name: col_str(&batch.columns[IDXTAB_COL_NAME], i)?.unwrap_or("").to_string(),
+        is_unique: col_u64(&batch.columns[IDXTAB_COL_IS_UNIQUE], i)?,
+    })
 }
 
 /// `Ok(None)` = absent (a legitimate miss); `Err` = a decode error on a corrupt
 /// `VIEW_TAB` batch.
 fn find_view_record(batch: &ZSetBatch, schema_id: u64, view_name: &str) -> Result<Option<ViewRecord>, ClientError> {
     for i in batch.live_rows() {
-        if col_u64(&batch.columns[1], i)? != schema_id {
+        if col_u64(&batch.columns[VIEWTAB_COL_SCHEMA_ID], i)? != schema_id {
             continue;
         }
-        if col_str(&batch.columns[2], i)? != Some(view_name) {
+        if col_str(&batch.columns[VIEWTAB_COL_NAME], i)? != Some(view_name) {
             continue;
         }
         return Ok(Some(decode_view_record(batch, i)?));
@@ -1926,10 +1952,10 @@ fn collect_view_records_with_prefix(
 ) -> Result<Vec<ViewRecord>, ClientError> {
     let mut out = Vec::new();
     for i in batch.live_rows() {
-        if col_u64(&batch.columns[1], i)? != schema_id {
+        if col_u64(&batch.columns[VIEWTAB_COL_SCHEMA_ID], i)? != schema_id {
             continue;
         }
-        if !matches!(col_str(&batch.columns[2], i)?, Some(n) if n.starts_with(prefix)) {
+        if !matches!(col_str(&batch.columns[VIEWTAB_COL_NAME], i)?, Some(n) if n.starts_with(prefix)) {
             continue;
         }
         out.push(decode_view_record(batch, i)?);
@@ -1938,17 +1964,18 @@ fn collect_view_records_with_prefix(
 }
 
 /// Collect the entity names of every live row in a `TABLE_TAB`/`VIEW_TAB` batch
-/// whose `schema_id` column matches. Both families carry `schema_id` at column 1
-/// and the entity name at column 2, so this mirrors `find_table_record` /
+/// whose `schema_id` column matches. One code path over both families, which the
+/// static assert beside their column constants licenses: the two agree on where
+/// `schema_id` and the entity name sit. Mirrors `find_table_record` /
 /// `find_view_record`'s scan minus the name filter — keeping the whole set rather
 /// than one row. Drives the `drop_schema` member cascade.
 fn collect_schema_member_names(batch: &ZSetBatch, schema_id: u64) -> Result<Vec<String>, ClientError> {
     let mut out = Vec::new();
     for i in batch.live_rows() {
-        if col_u64(&batch.columns[1], i)? != schema_id {
+        if col_u64(&batch.columns[TABTAB_COL_SCHEMA_ID], i)? != schema_id {
             continue;
         }
-        if let Some(name) = col_str(&batch.columns[2], i)? {
+        if let Some(name) = col_str(&batch.columns[TABTAB_COL_NAME], i)? {
             out.push(name.to_string());
         }
     }
@@ -2213,15 +2240,13 @@ mod tests {
             .add_row(7, 1)
             .u64_val(1) // schema_id
             .str_val("t") // name
-            .str_val("") // directory
             .u64_val(0) // pk_col_idx
-            .u64_val(0) // created_lsn
             .u64_val(0); // flags
 
-        // Truncate columns[1] (schema_id, Fixed) so `col_u64` on the live row is
+        // Truncate the schema_id column (Fixed) so `col_u64` on the live row is
         // out of bounds — a real decode error, which must surface as Err rather
         // than be masked as an absent-name miss.
-        let ColData::Fixed(bytes) = &mut batch.columns[1] else {
+        let ColData::Fixed(bytes) = &mut batch.columns[TABTAB_COL_SCHEMA_ID] else {
             panic!("expected Fixed column");
         };
         bytes.clear();
@@ -2231,20 +2256,53 @@ mod tests {
         }
     }
 
+    /// Round-trips `append_table_tab_row` back through `find_table_record`, so
+    /// transposing two slots in either one fails here. Every field holds a
+    /// different value, which a fixture writing `0` everywhere would not catch.
+    /// `schema_id` is not asserted: `find_table_record` echoes the search
+    /// argument into the record rather than decoding the column.
     #[test]
-    fn find_table_record_miss_is_none() {
+    fn table_record_round_trips_through_append_and_find() {
         let schema = table_tab_schema();
+        let rec = TableRecord {
+            tid: 7,
+            schema_id: 3,
+            pk_col_idx: gnitz_wire::pack_pk_cols(&[1, 0]),
+            flags: gnitz_wire::pack_table_flags(true, 0),
+        };
         let mut batch = ZSetBatch::new(schema);
-        BatchAppender::new(&mut batch, schema)
-            .add_row(7, 1)
-            .u64_val(1)
-            .str_val("t")
-            .str_val("")
-            .u64_val(0)
-            .u64_val(0)
-            .u64_val(0);
-        assert!(find_table_record(&batch, 1, "absent").unwrap().is_none());
-        assert!(find_table_record(&batch, 1, "t").unwrap().is_some());
+        append_table_tab_row(&mut BatchAppender::new(&mut batch, schema), 1, &rec, "t");
+
+        assert!(find_table_record(&batch, 3, "absent").unwrap().is_none());
+        assert!(find_table_record(&batch, 4, "t").unwrap().is_none(), "wrong schema_id");
+
+        let back = find_table_record(&batch, 3, "t").unwrap().expect("row present");
+        assert_eq!(back.tid, rec.tid);
+        assert_eq!(back.pk_col_idx, rec.pk_col_idx);
+        assert_eq!(back.flags, rec.flags);
+    }
+
+    /// The VIEW_TAB counterpart, likewise with every field distinct — the write
+    /// side (`append_view_row`) round-trips back through the read side.
+    #[test]
+    fn view_record_round_trips_through_append_and_decode() {
+        let schema = view_tab_schema();
+        let rec = ViewRecord {
+            vid: 9,
+            schema_id: 4,
+            name: "v".into(),
+            sql_definition: "SELECT id FROM t".into(),
+            pk_col_idx: gnitz_wire::pack_pk_cols(&[2]),
+        };
+        let mut batch = ZSetBatch::new(schema);
+        append_view_row(&mut BatchAppender::new(&mut batch, schema), 1, &rec);
+
+        let back = decode_view_record(&batch, 0).unwrap();
+        assert_eq!(back.vid, rec.vid);
+        assert_eq!(back.schema_id, rec.schema_id);
+        assert_eq!(back.name, rec.name);
+        assert_eq!(back.sql_definition, rec.sql_definition);
+        assert_eq!(back.pk_col_idx, rec.pk_col_idx);
     }
 
     #[test]

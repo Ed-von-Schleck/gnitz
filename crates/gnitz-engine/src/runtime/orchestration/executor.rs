@@ -47,7 +47,7 @@ use crate::runtime::sal::{BACKFILL_DECISION_CONTINUE, FLAG_SCAN_SPEC};
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, FLAG_GET_INDICES, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
-use crate::schema::{type_code, validate_schema_match, SchemaColumn, SchemaDescriptor};
+use crate::schema::{validate_schema_match, SchemaDescriptor};
 use crate::storage::{Batch, BatchBuilder};
 
 pub(crate) const TICK_COALESCE_ROWS: usize = 10_000;
@@ -1654,11 +1654,8 @@ async fn handle_seek_by_index(
 /// per circuit (circuits dedup by column list), so a valid PK. The server ships
 /// this block on the data path; the client decodes against it and reads columns
 /// by position.
-const INDEX_META_SCHEMA: SchemaDescriptor = {
-    let u64c = SchemaColumn::new(type_code::U64, 0);
-    SchemaDescriptor::new(&[u64c, u64c], &[0])
-};
-const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"cols", b"is_unique"];
+const INDEX_META_SCHEMA: SchemaDescriptor =
+    crate::schema::from_wire_cols(gnitz_wire::INDEX_META_COLS, gnitz_wire::INDEX_META_PK);
 
 /// GET_INDICES: serve the client's durable, epoch-validated cache of a table's
 /// secondary-index metadata — the `(col_idx, is_unique)` set, projected from the
@@ -1684,7 +1681,8 @@ async fn handle_get_indices(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
     // schema and never needs — or pollutes — the per-table schema cache.
     let desc = INDEX_META_SCHEMA;
     // Build the schema block before the descriptor is moved into BatchBuilder.
-    let schema_block = ipc::build_schema_wire_block(&desc, &INDEX_META_COL_NAMES[..], 0, target_id as u32);
+    let col_names: Vec<&[u8]> = gnitz_wire::INDEX_META_COLS.iter().map(|c| c.name.as_bytes()).collect();
+    let schema_block = ipc::build_schema_wire_block(&desc, &col_names, 0, target_id as u32);
     let mut bb = BatchBuilder::new(desc);
     if let Some(entry) = shared.cat().dag.tables.get(&target_id) {
         for ic in &entry.index_circuits {

@@ -34,7 +34,7 @@ def _drop_all(client, sn, tables=(), views=(), indices=()):
 
 def _table_has_index(client, sn, table):
     """True if any live IdxTab row names `table` as its owner."""
-    from gnitz import IDX_TAB
+    from gnitz import IDX_TAB, IDXTAB_COL_OWNER_ID
     batch_obj = client.scan(IDX_TAB)
     if batch_obj.schema is None:
         return False
@@ -42,7 +42,7 @@ def _table_has_index(client, sn, table):
     for i in range(len(batch_obj.pks)):
         if batch_obj.weights[i] <= 0:
             continue
-        if batch_obj.columns[1][i] == tid:
+        if batch_obj.columns[IDXTAB_COL_OWNER_ID][i] == tid:
             return True
     return False
 
@@ -80,7 +80,7 @@ class TestIndexDdl:
 
             # Verify IdxTab row exists with correct owner_id and source_cols
             # (the packed column-list u64, decoded via the shared codec).
-            from gnitz import IDX_TAB, unpack_pk_cols
+            from gnitz import IDX_TAB, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, unpack_pk_cols
             batch_obj = client.scan(IDX_TAB)
             assert batch_obj.schema is not None
             found = False
@@ -88,8 +88,8 @@ class TestIndexDdl:
             for i in range(len(batch_obj.pks)):
                 if batch_obj.weights[i] <= 0:
                     continue
-                owner_id = batch_obj.columns[1][i] if batch_obj.columns[1] else None
-                src_col  = batch_obj.columns[3][i] if batch_obj.columns[3] else None
+                owner_id = batch_obj.columns[IDXTAB_COL_OWNER_ID][i] if batch_obj.columns[IDXTAB_COL_OWNER_ID] else None
+                src_col  = batch_obj.columns[IDXTAB_COL_SOURCE_COLS][i] if batch_obj.columns[IDXTAB_COL_SOURCE_COLS] else None
                 if owner_id == tid and unpack_pk_cols(src_col) == [1]:
                     found = True
                     break
@@ -113,16 +113,16 @@ class TestIndexDdl:
             )
             assert results[0]["type"] == "IndexCreated"
             # is_unique flag should be 1 in IdxTab
-            from gnitz import IDX_TAB
+            from gnitz import IDX_TAB, IDXTAB_COL_OWNER_ID, IDXTAB_COL_IS_UNIQUE
             batch_obj = client.scan(IDX_TAB)
             assert batch_obj.schema is not None
             tid, _ = client.resolve_table(sn, "t")
             for i in range(len(batch_obj.pks)):
                 if batch_obj.weights[i] <= 0:
                     continue
-                owner_id = batch_obj.columns[1][i]
+                owner_id = batch_obj.columns[IDXTAB_COL_OWNER_ID][i]
                 if owner_id == tid:
-                    is_unique = batch_obj.columns[5][i]
+                    is_unique = batch_obj.columns[IDXTAB_COL_IS_UNIQUE][i]
                     assert is_unique == 1
                     break
         finally:
@@ -144,14 +144,14 @@ class TestIndexDdl:
             assert results[0]["type"] == "Dropped"
 
             # Verify row is gone from IdxTab
-            from gnitz import IDX_TAB
+            from gnitz import IDX_TAB, IDXTAB_COL_OWNER_ID
             batch_obj = client.scan(IDX_TAB)
             if batch_obj is not None:
                 tid, _ = client.resolve_table(sn, "t")
                 for i in range(len(batch_obj.pks)):
                     if batch_obj.weights[i] <= 0:
                         continue
-                    assert batch_obj.columns[1][i] != tid, "IdxTab row should be gone"
+                    assert batch_obj.columns[IDXTAB_COL_OWNER_ID][i] != tid, "IdxTab row should be gone"
         finally:
             _drop_all(client, sn, tables=["t"])
 

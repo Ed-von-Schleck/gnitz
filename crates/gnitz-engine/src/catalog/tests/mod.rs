@@ -166,25 +166,19 @@ fn ingest_fixture(
 }
 
 /// Build a raw TABLE_TAB row for tests that drive the catalog applier or
-/// hook layer directly (bypassing `create_table`). `dir` only feeds the
-/// stored directory string — the path is never actually created on disk.
-fn build_table_tab_row(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str) -> Batch {
-    build_table_tab_row_flags(dir, tid, raw_pk_cols, table_name, 0)
+/// hook layer directly (bypassing `create_table`).
+fn build_table_tab_row(tid: i64, raw_pk_cols: u64, table_name: &str) -> Batch {
+    build_table_tab_row_flags(tid, raw_pk_cols, table_name, 0)
 }
 
 /// Like `build_table_tab_row` but with an explicit packed `flags` word (so a test
 /// can build a row that passes precheck yet fails `hook_table_register`, e.g. a
-/// REPLICATED table with a non-default distribution prefix).
-fn build_table_tab_row_flags(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str, flags: u64) -> Batch {
+/// REPLICATED table with a non-default distribution prefix). Writes through the
+/// production row builder, so a fixture cannot drift from the layout the engine
+/// registers tables with.
+fn build_table_tab_row_flags(tid: i64, raw_pk_cols: u64, table_name: &str, flags: u64) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-    bb.begin_row(tid as u128, 1);
-    bb.put_u64(PUBLIC_SCHEMA_ID as u64);
-    bb.put_string(table_name);
-    bb.put_string(&format!("{dir}/public/{table_name}"));
-    bb.put_u64(raw_pk_cols);
-    bb.put_u64(0); // created_lsn
-    bb.put_u64(flags);
-    bb.end_row();
+    push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, table_name, raw_pk_cols, flags, 1);
     bb.finish()
 }
 
@@ -194,7 +188,6 @@ fn build_table_tab_row_flags(dir: &str, tid: i64, raw_pk_cols: u64, table_name: 
 /// CLUSTER BY (a distribution prefix shorter than the PK).
 fn create_flagged_table(
     engine: &mut CatalogEngine,
-    dir: &str,
     table_name: &str,
     cols: &[ColumnDef],
     pk_cols: &[u32],
@@ -202,7 +195,7 @@ fn create_flagged_table(
 ) -> i64 {
     let tid = engine.allocate_table_id();
     engine.write_column_records(tid, OWNER_KIND_TABLE, cols).unwrap();
-    let batch = build_table_tab_row_flags(dir, tid, pack_pk_cols(pk_cols), table_name, flags);
+    let batch = build_table_tab_row_flags(tid, pack_pk_cols(pk_cols), table_name, flags);
     engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
     tid
 }
@@ -258,9 +251,7 @@ fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, s
     );
 }
 
-/// Append one raw VIEW_TAB row at `weight`. `sql` is stored verbatim;
-/// cache_directory is left empty (the register hook computes the real view
-/// directory itself and neither column is read back by the appliers). The bare
+/// Append one raw VIEW_TAB row at `weight`. `sql` is stored verbatim. The bare
 /// `0` pk_col_idx decodes back to a single-column PK `[0]`. A `-1` reproduces
 /// exactly what a `+1` wrote, which is what the §3.3 retraction CAS compares.
 fn push_view_tab_row(bb: &mut BatchBuilder, weight: i64, vid: i64, view_name: &str, sql: &str) {
@@ -268,8 +259,6 @@ fn push_view_tab_row(bb: &mut BatchBuilder, weight: i64, vid: i64, view_name: &s
     bb.put_u64(PUBLIC_SCHEMA_ID as u64);
     bb.put_string(view_name);
     bb.put_string(sql);
-    bb.put_string(""); // cache_directory
-    bb.put_u64(0); // created_lsn
     bb.put_u64(0); // pk_col_idx
     bb.end_row();
 }

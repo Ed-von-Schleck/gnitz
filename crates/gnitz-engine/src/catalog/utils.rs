@@ -53,8 +53,7 @@ pub(crate) fn sys_catalog_dir(base_dir: &str) -> String {
 }
 
 /// `<base_dir>/_system_catalog/<family_name>` — one system family's store
-/// directory. The same string reaches the store and the family's `TABLE_TAB`
-/// self-description row, so both are built here.
+/// directory.
 pub(crate) fn sys_family_dir(base_dir: &str, family_name: &str) -> String {
     format!("{}/{family_name}", sys_catalog_dir(base_dir))
 }

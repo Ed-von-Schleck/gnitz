@@ -44,17 +44,17 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
     // sort is a no-op.
     let mut pk_pairs: Vec<(u8, usize)> = Vec::new();
 
-    let type_code_fixed = match &batch.columns[1] {
+    let type_code_fixed = match &batch.columns[gnitz_wire::METASCHEMA_COL_TYPE_CODE] {
         ColData::Fixed(v) => v,
-        _ => return Err(ProtocolError::DecodeError("col 1 (type_code) must be Fixed".into())),
+        _ => return Err(ProtocolError::DecodeError("type_code column must be Fixed".into())),
     };
-    let flags_fixed = match &batch.columns[2] {
+    let flags_fixed = match &batch.columns[gnitz_wire::METASCHEMA_COL_FLAGS] {
         ColData::Fixed(v) => v,
-        _ => return Err(ProtocolError::DecodeError("col 2 (flags) must be Fixed".into())),
+        _ => return Err(ProtocolError::DecodeError("flags column must be Fixed".into())),
     };
-    let names_col = match &batch.columns[3] {
+    let names_col = match &batch.columns[gnitz_wire::METASCHEMA_COL_NAME] {
         ColData::Strings(v) => v,
-        _ => return Err(ProtocolError::DecodeError("col 3 (name) must be Strings".into())),
+        _ => return Err(ProtocolError::DecodeError("name column must be Strings".into())),
     };
 
     for i in 0..count {

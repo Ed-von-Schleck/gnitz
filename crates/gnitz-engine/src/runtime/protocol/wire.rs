@@ -182,9 +182,9 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]], hi
         batch.extend_pk(ci as u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
-        batch.extend_col(gnitz_wire::META_SCHEMA_PAY_TYPE_CODE, &type_code_val.to_le_bytes());
-        batch.extend_col(gnitz_wire::META_SCHEMA_PAY_FLAGS, &flags.to_le_bytes());
-        batch.extend_col(gnitz_wire::META_SCHEMA_PAY_NAME, &name_st);
+        batch.extend_col(gnitz_wire::METASCHEMA_PAY_TYPE_CODE, &type_code_val.to_le_bytes());
+        batch.extend_col(gnitz_wire::METASCHEMA_PAY_FLAGS, &flags.to_le_bytes());
+        batch.extend_col(gnitz_wire::METASCHEMA_PAY_NAME, &name_st);
         batch.count += 1;
     }
     batch
@@ -513,8 +513,8 @@ pub struct SchemaWithVersion<'a> {
 // META_SCHEMA_DESC payload regions, after the fixed pk (= col_idx) / weight /
 // null_bmp trio. Only the two U64 columns are read here; the name is carried but
 // unused. The payload slots come from the shared definition the encoder uses.
-const REG_TYPE_CODE: usize = gnitz_wire::REG_PAYLOAD_START + gnitz_wire::META_SCHEMA_PAY_TYPE_CODE;
-const REG_FLAGS: usize = gnitz_wire::REG_PAYLOAD_START + gnitz_wire::META_SCHEMA_PAY_FLAGS;
+const REG_TYPE_CODE: usize = gnitz_wire::REG_PAYLOAD_START + gnitz_wire::METASCHEMA_PAY_TYPE_CODE;
+const REG_FLAGS: usize = gnitz_wire::REG_PAYLOAD_START + gnitz_wire::METASCHEMA_PAY_FLAGS;
 
 pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
     // Parse directly from WAL block bytes; no Batch allocation needed.
@@ -1032,8 +1032,6 @@ mod tests {
                 .add_row(tid as u128, weight)
                 .u64_val(3) // schema_id
                 .str_val("t")
-                .str_val("")
-                .u64_val(0)
                 .u64_val(0)
                 .u64_val(0);
             b
@@ -1044,11 +1042,9 @@ mod tests {
             BatchAppender::new(&mut b, s)
                 .add_row(idx_id as u128, 1)
                 .u64_val(owner)
-                .u64_val(0)
                 .u64_val(gnitz_wire::pack_pk_cols(&[1]))
                 .str_val("idx_t_b")
-                .u64_val(1)
-                .str_val("");
+                .u64_val(1);
             b
         };
 
@@ -1165,8 +1161,6 @@ mod tests {
                 .u64_val(3)
                 .str_val("v")
                 .str_val("")
-                .str_val("")
-                .u64_val(0)
                 .u64_val(0);
             b
         };

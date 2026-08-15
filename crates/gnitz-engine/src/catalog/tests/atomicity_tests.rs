@@ -13,35 +13,12 @@ fn build_schema_tab_row(sid: i64, name: &str) -> Batch {
     bb.finish()
 }
 
-fn build_idx_tab_row(idx_id: i64, owner_id: i64, source_col_idx: u64, name: &str, is_unique: bool) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
-    bb.begin_row(idx_id as u128, 1);
-    bb.put_u64(owner_id as u64);
-    bb.put_u64(OWNER_KIND_TABLE as u64);
-    bb.put_u64(source_col_idx);
-    bb.put_string(name);
-    bb.put_u64(if is_unique { 1 } else { 0 });
-    bb.put_string("");
-    bb.end_row();
-    bb.finish()
-}
-
+/// Write one column record at an arbitrary `col_idx` — the gap and
+/// out-of-order shapes `build_col_batch`, which numbers columns by position,
+/// cannot produce.
 fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, cd: &ColumnDef) -> Result<(), String> {
-    let schema = SysFamily::Column.schema();
-    let mut bb = BatchBuilder::new(schema);
-    let pk = pack_column_id(owner_id, col_idx);
-    bb.begin_row(pk as u128, 1);
-    bb.put_u64(owner_id as u64);
-    bb.put_u64(OWNER_KIND_TABLE as u64);
-    bb.put_u64(col_idx as u64);
-    bb.put_string(&cd.name);
-    bb.put_u64(cd.type_code as u64);
-    bb.put_u64(if cd.is_nullable { 1 } else { 0 });
-    bb.put_u64(cd.fk_table_id as u64);
-    bb.put_u64(cd.fk_col_idx as u64);
-    bb.put_u64(0); // is_serial (engine ColumnDef has no SERIAL marker)
-    bb.put_u64(0); // is_hidden (engine ColumnDef has no visibility marker)
-    bb.end_row();
+    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+    push_col_tab_row(&mut bb, owner_id, OWNER_KIND_TABLE, col_idx, cd, 1);
     engine.ingest_to_family(COL_TAB_ID, &bb.finish())
 }
 
@@ -63,7 +40,7 @@ fn test_table_tab_no_cols_leaves_clean_state() {
 
     let tid = engine.allocate_table_id();
     // No column records written — TABLE_TAB ingestion must fail.
-    let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "badtable");
+    let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "badtable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
     assert!(result.is_err(), "expected error for TABLE_TAB with no column records");
 
@@ -104,7 +81,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
     let cols = vec![col_def("label", type_code::STRING)];
     engine.write_column_records(tid, OWNER_KIND_TABLE, &cols).unwrap();
 
-    let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "badpktable");
+    let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "badpktable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
     assert!(
         result.is_err(),
@@ -149,7 +126,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
     let new_tid = engine.allocate_table_id();
     engine.write_column_records(new_tid, OWNER_KIND_TABLE, &cols).unwrap();
 
-    let batch = build_table_tab_row(&dir, new_tid, pack_pk_cols(&[0]), "dupname");
+    let batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "dupname");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
     assert!(
         result.is_err(),
@@ -191,7 +168,7 @@ fn test_table_tab_col_contiguity_gap_rejected() {
     write_col_at_index(&mut engine, tid, 0, &col_def("id", type_code::U64)).unwrap();
     write_col_at_index(&mut engine, tid, 2, &col_def("gapped", type_code::U64)).unwrap();
 
-    let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "gaptable");
+    let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "gaptable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
     assert!(
         result.is_err(),
@@ -309,7 +286,7 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
 
     let nonexistent_owner = engine.allocate_table_id();
     let idx_id = engine.allocate_index_id();
-    let batch = build_idx_tab_row(idx_id, nonexistent_owner, 0, "bad_owner_idx", false);
+    let batch = idx_tab_batch(idx_id, nonexistent_owner, 0, "bad_owner_idx", false, 1);
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
     assert!(result.is_err(), "expected error for IDX_TAB with non-existent owner");
 
@@ -358,7 +335,7 @@ fn test_idx_tab_view_owner_rejected() {
 
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
     let idx_id = engine.allocate_index_id();
-    let batch = build_idx_tab_row(idx_id, vid, 0, "idx_on_view", false);
+    let batch = idx_tab_batch(idx_id, vid, 0, "idx_on_view", false, 1);
     let err = engine
         .ingest_to_family(IDX_TAB_ID, &batch)
         .expect_err("IDX_TAB row naming a view owner must be rejected");
@@ -409,7 +386,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     let orig_name = "public__idxtest__idx_val";
     let new_idx_id = engine.allocate_index_id();
     // Same name, different col (ts at index 2) — bypasses create_index dup check.
-    let batch = build_idx_tab_row(new_idx_id, tid, 2, orig_name, false);
+    let batch = idx_tab_batch(new_idx_id, tid, 2, orig_name, false, 1);
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
     assert!(
         result.is_err(),
@@ -511,7 +488,7 @@ fn test_next_index_id_advances_on_index_register() {
     // Register an index with an idx_id far ahead of the current counter,
     // simulating a worker receiving a broadcast for a master-allocated ID.
     let large_idx_id = engine.next_index_id + 500;
-    let batch = build_idx_tab_row(large_idx_id, tid, 1, "public__seqsync__idx_val_sync", false);
+    let batch = idx_tab_batch(large_idx_id, tid, 1, "public__seqsync__idx_val_sync", false, 1);
     engine.ingest_to_family(IDX_TAB_ID, &batch).unwrap();
 
     // next_index_id must now be > large_idx_id so that a local
@@ -640,7 +617,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
         ("at the ceiling", sys_tables::RELATION_ID_CEILING),
         ("above the ceiling", sys_tables::RELATION_ID_CEILING + 4096),
     ] {
-        let table_batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "banded");
+        let table_batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "banded");
         let err = engine
             .precheck_family(SysFamily::Table, &table_batch)
             .expect_err(&format!("TABLE_TAB id at/above the ceiling must be rejected ({label})"));
@@ -661,12 +638,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
 
     // A ceiling, not a blanket ban: an ordinary durable id below it still passes
     // this guard (it fails later for unrelated reasons, if at all).
-    let ok_batch = build_table_tab_row(
-        &dir,
-        sys_tables::RELATION_ID_CEILING - 1,
-        pack_pk_cols(&[0]),
-        "just_below",
-    );
+    let ok_batch = build_table_tab_row(sys_tables::RELATION_ID_CEILING - 1, pack_pk_cols(&[0]), "just_below");
     let err = engine
         .precheck_family(SysFamily::Table, &ok_batch)
         .err()
@@ -704,7 +676,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 
     // TABLE_TAB(6): precheck fails (duplicate name), so the handler's loop never
     // applies it and its marker stays None. Compensation reconstructs nothing.
-    let table_batch = build_table_tab_row(&dir, new_tid, pack_pk_cols(&[0]), "dupname");
+    let table_batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "dupname");
     assert!(
         engine.precheck_family(SysFamily::Table, &table_batch).is_err(),
         "duplicate-name TABLE_TAB must fail precheck"
@@ -753,7 +725,7 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
 
     // REPLICATED + dist_prefix = 1: passes precheck, rejected by hook_table_register.
     let flags = gnitz_wire::pack_table_flags(true, 1);
-    let table_batch = build_table_tab_row_flags(&dir, new_tid, pack_pk_cols(&[0]), "hooktbl", flags);
+    let table_batch = build_table_tab_row_flags(new_tid, pack_pk_cols(&[0]), "hooktbl", flags);
     engine
         .precheck_family(SysFamily::Table, &table_batch)
         .expect("replicated + dist_prefix passes precheck (it is a hook-layer check)");

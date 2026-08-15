@@ -13,6 +13,9 @@ use std::num::NonZeroU64;
 use super::*;
 use crate::schema::make_index_schema;
 use crate::storage::{compare_rows, compare_rows_except};
+use gnitz_wire::{
+    COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME,
+};
 
 /// The only handle the DDL/imperative layer has on catalog state: submit one
 /// system-family delta. It cannot name a `sys_*` table, so DDL code physically
@@ -588,9 +591,9 @@ impl CatalogEngine {
     /// "referenced by FK" / "View dependency".
     fn precheck_relation_family(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         let is_table = family == SysFamily::Table;
-        let name_pay = if is_table { TABTAB_PAY_NAME } else { VIEWTAB_PAY_NAME };
         let kind = if is_table { "table" } else { "view" };
-        let net_dead = self.precheck_retraction_contract(family, batch, name_pay)?;
+        // TABLE_TAB and VIEW_TAB agree on the name slot (asserted in gnitz-wire).
+        let net_dead = self.precheck_retraction_contract(family, batch, TABTAB_PAY_NAME)?;
 
         for i in 0..batch.count {
             if batch.get_weight(i) <= 0 {

@@ -2,22 +2,6 @@ use super::*;
 use crate::schema::key::PkBuf;
 use crate::schema::make_index_schema;
 
-/// Build the one-row IDX_TAB batch registering an index (`weight` +1) or
-/// retracting a failed registration (−1). The single writer of the 6-column
-/// IDX_TAB row layout in the DDL emitters.
-fn idx_tab_row(index_id: i64, owner_id: i64, packed_cols: u64, name: &str, is_unique: bool, weight: i64) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
-    bb.begin_row(index_id as u128, weight);
-    bb.put_u64(owner_id as u64);
-    bb.put_u64(OWNER_KIND_TABLE as u64);
-    bb.put_u64(packed_cols);
-    bb.put_string(name);
-    bb.put_u64(if is_unique { 1 } else { 0 });
-    bb.put_string(""); // cache_directory
-    bb.end_row();
-    bb.finish()
-}
-
 impl CatalogEngine {
     /// Locally retract an index registration whose +1 was applied but never
     /// broadcast. A failed rollback leaves the +1 in sys_indices while the
@@ -199,7 +183,6 @@ impl CatalogEngine {
             self.validate_fk_column(cd, tid, pk.as_slice(), self_pk_type)?;
         }
 
-        let directory = relation_dir(&self.base_dir, schema_name, RelationKind::BaseTable, tid);
         // This in-process test shortcut always builds partitioned, full-PK-distributed
         // tables (`replicated = false`, `k = 0` = default). REPLICATED and CLUSTER BY
         // routing are exercised through the catalog hook / SQL planner, not here.
@@ -211,7 +194,7 @@ impl CatalogEngine {
         // Write table record (triggers hook)
         {
             let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-            push_table_tab_row(&mut bb, tid, sid, table_name, &directory, raw_pk_cols, flags);
+            push_table_tab_row(&mut bb, tid, sid, table_name, raw_pk_cols, flags, 1);
             let batch = bb.finish();
             self.submit(SysFamily::Table, batch)?;
         }
@@ -324,7 +307,7 @@ impl CatalogEngine {
         // restart's replay doesn't try to reconstruct a broken index.
         {
             let packed_cols = gnitz_wire::pack_pk_cols(&col_indices);
-            let batch = idx_tab_row(index_id, owner_id, packed_cols, &index_name, is_unique, 1);
+            let batch = idx_tab_batch(index_id, owner_id, packed_cols, &index_name, is_unique, 1);
             if let Err(e) = self.submit(SysFamily::Index, batch) {
                 // The +1 failed in hook_index_register *before* it was enqueued
                 // into pending_broadcasts, so it was never broadcast to workers.
@@ -333,7 +316,7 @@ impl CatalogEngine {
                 // Broadcasting the −1 would deliver a phantom retraction to
                 // workers that never saw the +1, leaving an orphaned
                 // negative-weight row in their sys_indices.
-                let undo = idx_tab_row(index_id, owner_id, packed_cols, &index_name, is_unique, -1);
+                let undo = idx_tab_batch(index_id, owner_id, packed_cols, &index_name, is_unique, -1);
                 self.rollback_index_registration(undo, index_id);
                 // The index directory is already gone: the hook staged it before
                 // `Table::new`, and `with_staged_dir` reclaims a stage whose
@@ -586,7 +569,7 @@ impl CatalogEngine {
 
             // Write index record to sys_indices (FK indices are not unique).
             let packed_cols = gnitz_wire::pack_pk_cols(&[col_idx as u32]);
-            let batch = idx_tab_row(index_id, table_id, packed_cols, &index_name, false, 1);
+            let batch = idx_tab_batch(index_id, table_id, packed_cols, &index_name, false, 1);
             // hook_cascade_fk fires on master and every worker, so each side
             // creates its own FK indices locally; submit_local applies + fires
             // hooks without a broadcast. submit would broadcast IDX_TAB before
@@ -597,7 +580,7 @@ impl CatalogEngine {
                 // reverse the storage write and any partial cache updates;
                 // otherwise the next boot's replay opens a missing index
                 // directory and crashes.
-                let undo = idx_tab_row(index_id, table_id, packed_cols, &index_name, false, -1);
+                let undo = idx_tab_batch(index_id, table_id, packed_cols, &index_name, false, -1);
                 self.rollback_index_registration(undo, index_id);
                 return Err(e);
             }
@@ -611,19 +594,7 @@ impl CatalogEngine {
     pub(crate) fn build_col_batch(&self, owner_id: i64, kind: i64, col_defs: &[ColumnDef], weight: i64) -> Batch {
         let mut bb = BatchBuilder::new(SysFamily::Column.schema());
         for (i, cd) in col_defs.iter().enumerate() {
-            push_col_tab_row(
-                &mut bb,
-                owner_id,
-                kind,
-                i as i64,
-                &cd.name,
-                cd.type_code,
-                cd.is_nullable,
-                cd.fk_table_id,
-                cd.fk_col_idx as i64,
-                cd.is_hidden,
-                weight,
-            );
+            push_col_tab_row(&mut bb, owner_id, kind, i as i64, cd, weight);
         }
         bb.finish()
     }

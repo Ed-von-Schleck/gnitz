@@ -359,9 +359,9 @@ fn gc_recreated_schema_survives_drain() {
 
 /// Register a REPLICATED base table with one row flushed, and return
 /// `(tid, relation_directory)`.
-fn replicated_table_with_a_shard(engine: &mut CatalogEngine, dir: &str, flush: bool) -> (i64, String) {
+fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (i64, String) {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
-    let rt = create_flagged_table(engine, dir, "rt", &cols, &[0], gnitz_wire::pack_table_flags(true, 0));
+    let rt = create_flagged_table(engine, "rt", &cols, &[0], gnitz_wire::pack_table_flags(true, 0));
 
     let rel_dir = engine.dag.tables[&rt].directory.clone();
     let mut bb = BatchBuilder::new(engine.get_schema_desc(rt).unwrap());
@@ -396,7 +396,7 @@ fn fabricate_dir(path: &str, marker: &str) {
 fn retired_copies_are_reclaimed_and_missing_ones_seeded() {
     let dir = temp_dir("reconcile_child_dirs_core");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, &dir, true);
+    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, true);
     assert!(Path::new(&format!("{rel}/rep_0/manifest.bin")).exists());
     let rep0_files = file_names(&format!("{rel}/rep_0"));
 
@@ -448,7 +448,7 @@ fn retired_copies_are_reclaimed_and_missing_ones_seeded() {
 fn reconcile_skips_a_never_flushed_table() {
     let dir = temp_dir("reconcile_child_dirs_unflushed");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, &dir, false);
+    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, false);
     assert!(!Path::new(&format!("{rel}/rep_0/manifest.bin")).exists());
 
     fabricate_dir(&format!("{rel}/rep_9"), "marker");
@@ -491,7 +491,7 @@ fn reconcile_never_touches_a_hashed_store() {
 
     // Cross-grammar residue, both directions: what a shape flip leaves behind.
     fabricate_dir(&format!("{hashed}/rep_1"), "marker");
-    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, &dir, true);
+    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, true);
     for p in [64u32, 192] {
         fabricate_dir(&format!("{rel}/part_{p}"), "marker");
     }

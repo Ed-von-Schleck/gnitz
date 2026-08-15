@@ -10,6 +10,7 @@
 //! `ddl_tests` / `dir_deletion_tests`.
 
 use super::*;
+use gnitz_wire::{IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS};
 use std::path::Path;
 
 /// A one-row SCHEMA_TAB batch (the family's only payload column is the name).
@@ -21,9 +22,16 @@ fn schema_tab_batch(sid: i64, weight: i64, name: &str) -> Batch {
     bb.finish()
 }
 
-/// The live IDX_TAB payload for `idx_id`:
-/// `(owner_id, owner_kind, source_cols, name, is_unique, cache_directory)`.
-type IdxRow = (u64, u64, u64, String, u64, String);
+/// The live IDX_TAB payload for one index. Named fields rather than a tuple
+/// because these tests hand the row around and mutate one field of it, which a
+/// positional `.2` makes silently easy to get wrong.
+#[derive(Clone)]
+struct IdxRow {
+    owner_id: i64,
+    source_cols: u64,
+    name: String,
+    is_unique: bool,
+}
 
 fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
     let schema = SysFamily::Index.schema();
@@ -32,33 +40,23 @@ fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
         c.advance_to_exact_live(sys_opk(&schema, idx_id as u128).pk_bytes()),
         "live IDX_TAB row for index {idx_id} missing"
     );
-    (
-        cursor_read_u64(&c, 1),
-        cursor_read_u64(&c, 2),
-        cursor_read_u64(&c, 3),
-        cursor_read_string(&c, 4),
-        cursor_read_u64(&c, 5),
-        cursor_read_string(&c, 6),
-    )
+    IdxRow {
+        owner_id: cursor_read_u64(&c, IDXTAB_COL_OWNER_ID) as i64,
+        source_cols: cursor_read_u64(&c, IDXTAB_COL_SOURCE_COLS),
+        name: cursor_read_string(&c, IDXTAB_COL_NAME),
+        is_unique: cursor_read_u64(&c, IDXTAB_COL_IS_UNIQUE) != 0,
+    }
 }
 
 /// A one-row IDX_TAB batch at `weight` reproducing `row` — what a client's
 /// read-then-push drop helper builds.
-fn idx_tab_batch(idx_id: i64, weight: i64, row: &IdxRow) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
-    bb.begin_row(idx_id as u128, weight);
-    bb.put_u64(row.0);
-    bb.put_u64(row.1);
-    bb.put_u64(row.2);
-    bb.put_string(&row.3);
-    bb.put_u64(row.4);
-    bb.put_string(&row.5);
-    bb.end_row();
-    bb.finish()
+fn idx_row_batch(idx_id: i64, weight: i64, row: &IdxRow) -> Batch {
+    idx_tab_batch(idx_id, row.owner_id, row.source_cols, &row.name, row.is_unique, weight)
 }
 
-/// Every stored weight under `idx_id` in IDX_TAB: empty for a cleanly dropped
-/// index (the cursor skips a net-zero PK), `[-1]` for a durable ghost.
+/// Every stored weight under `idx_id` in IDX_TAB: empty once a `(+1, -1)` pair
+/// has cancelled (the cursor skips a net-zero PK), `[1]` for a live index,
+/// `[-1]` for a durable ghost.
 fn idx_weights_for(engine: &CatalogEngine, idx_id: i64) -> Vec<i64> {
     let mut c = engine.sys_store(SysFamily::Index).open_cursor();
     let mut v = Vec::new();
@@ -154,6 +152,35 @@ fn schema_retraction_under_another_schemas_name_rejected() {
 
 // ── IDX_TAB ─────────────────────────────────────────────────────────────────
 
+/// The accepted path, to the tests below's rejected one: `drop_index` builds its
+/// `-1` by copying the live row, so the pair must consolidate away and leave no
+/// stored row at all.
+#[test]
+fn create_then_drop_unique_index_cancels_to_empty() {
+    let dir = temp_dir("idx_create_drop_cancels");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![col_def("pk", type_code::U64), col_def("val", type_code::I64)];
+    engine.create_table("public.cancels", &cols, &[0]).unwrap();
+    let idx_id = engine.create_index("public.cancels", &["val"], true).unwrap();
+    assert_eq!(
+        idx_weights_for(&engine, idx_id),
+        vec![1],
+        "the create leaves one live row"
+    );
+
+    engine
+        .drop_index(&make_secondary_index_name("public", "cancels", "val"))
+        .unwrap();
+    assert!(
+        idx_weights_for(&engine, idx_id).is_empty(),
+        "the drop's `-1` must cancel the create's `+1`, leaving no stored row"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn stale_index_retraction_leaves_no_ghost_row() {
     let (mut engine, _tid, dir) = table_fixture(
@@ -162,10 +189,10 @@ fn stale_index_retraction_leaves_no_ghost_row() {
     );
     let idx = engine.create_index("public.t", &["val"], false).unwrap();
     let row = live_index_row(&engine, idx);
-    engine.drop_index(&row.3).unwrap();
+    engine.drop_index(&row.name).unwrap();
 
     let err = engine
-        .ingest_to_family(IDX_TAB_ID, &idx_tab_batch(idx, -1, &row))
+        .ingest_to_family(IDX_TAB_ID, &idx_row_batch(idx, -1, &row))
         .unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
@@ -175,7 +202,7 @@ fn stale_index_retraction_leaves_no_ghost_row() {
         idx_weights_for(&engine, idx).is_empty(),
         "the rejected `-1` must leave no negative-weight row in sys_indices"
     );
-    assert!(!engine.caches.index_by_name.contains_key(&row.3));
+    assert!(!engine.caches.index_by_name.contains_key(&row.name));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -192,12 +219,12 @@ fn stale_index_retraction_after_recreate_keeps_the_live_index_nameable() {
     );
     let idx1 = engine.create_index("public.t", &["val"], false).unwrap();
     let row1 = live_index_row(&engine, idx1);
-    engine.drop_index(&row1.3).unwrap();
+    engine.drop_index(&row1.name).unwrap();
     let idx2 = engine.create_index("public.t", &["val"], false).unwrap();
     assert_ne!(idx1, idx2, "the recreate must allocate a fresh index id");
 
     let err = engine
-        .ingest_to_family(IDX_TAB_ID, &idx_tab_batch(idx1, -1, &row1))
+        .ingest_to_family(IDX_TAB_ID, &idx_row_batch(idx1, -1, &row1))
         .unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
@@ -205,7 +232,7 @@ fn stale_index_retraction_after_recreate_keeps_the_live_index_nameable() {
     );
 
     assert_eq!(
-        engine.caches.index_by_name.get(&row1.3),
+        engine.caches.index_by_name.get(&row1.name),
         Some(&idx2),
         "the live index must keep its name mapping"
     );
@@ -236,17 +263,17 @@ fn index_retraction_under_another_indexs_name_rejected() {
 
     // i1's PK and payload, but i2's name — `net = 0`, so only the CAS sees it.
     let mut mismatched = row1.clone();
-    mismatched.3 = row2.3.clone();
+    mismatched.name = row2.name.clone();
     let err = engine
-        .ingest_to_family(IDX_TAB_ID, &idx_tab_batch(i1, -1, &mismatched))
+        .ingest_to_family(IDX_TAB_ID, &idx_row_batch(i1, -1, &mismatched))
         .unwrap_err();
     assert!(
         err.contains("catalog changed concurrently"),
         "a `-1` on i1's id carrying i2's name must be rejected: {err}"
     );
 
-    assert_eq!(engine.caches.index_by_name.get(&row1.3), Some(&i1));
-    assert_eq!(engine.caches.index_by_name.get(&row2.3), Some(&i2));
+    assert_eq!(engine.caches.index_by_name.get(&row1.name), Some(&i1));
+    assert_eq!(engine.caches.index_by_name.get(&row2.name), Some(&i2));
     assert_eq!(idx_weights_for(&engine, i1), vec![1]);
 
     engine.close();
@@ -266,7 +293,7 @@ fn duplicate_live_head_rejected_for_index_and_schema() {
     let idx = engine.create_index("public.t", &["val"], false).unwrap();
     let row = live_index_row(&engine, idx);
     let err = engine
-        .ingest_to_family(IDX_TAB_ID, &idx_tab_batch(idx, 1, &row))
+        .ingest_to_family(IDX_TAB_ID, &idx_row_batch(idx, 1, &row))
         .unwrap_err();
     assert!(
         err.contains("net weight 2"),

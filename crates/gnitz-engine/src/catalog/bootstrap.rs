@@ -1,5 +1,6 @@
 use super::*;
 use crate::foundation::env::env_usize;
+use gnitz_wire::SEQTAB_COL_VALUE;
 
 impl CatalogEngine {
     // -- Open engine (main entry point) ------------------------------------
@@ -117,8 +118,7 @@ impl CatalogEngine {
         {
             let mut bb = BatchBuilder::new(SysFamily::Table.schema());
             for info in &SYS_FAMILIES {
-                let dir = sys_family_dir(&self.base_dir, info.name);
-                push_table_tab_row(&mut bb, info.id, SYSTEM_SCHEMA_ID, info.name, &dir, 0, 0);
+                push_table_tab_row(&mut bb, info.id, SYSTEM_SCHEMA_ID, info.name, 0, 0, 1);
             }
             let batch = bb.finish();
             self.sys_store_mut(SysFamily::Table)
@@ -128,25 +128,20 @@ impl CatalogEngine {
 
         // 3. Column records for all system tables — the COL_TAB self-description,
         // derived from the same gnitz-wire slices the schemas are built from, so
-        // the introspectable shape can never drift from the physical one. System
-        // columns carry no FK and are never SERIAL or hidden.
+        // the introspectable shape can never drift from the physical one.
         {
             let mut bb = BatchBuilder::new(SysFamily::Column.schema());
             for info in &SYS_FAMILIES {
                 for (i, c) in info.cols.iter().enumerate() {
-                    push_col_tab_row(
-                        &mut bb,
-                        info.id,
-                        OWNER_KIND_TABLE,
-                        i as i64,
-                        c.name,
-                        c.type_code as u8,
-                        c.nullable,
-                        0,
-                        0,
-                        false,
-                        1,
-                    );
+                    let cd = ColumnDef {
+                        name: c.name.to_string(),
+                        type_code: c.type_code as u8,
+                        is_nullable: c.nullable,
+                        fk_table_id: 0,
+                        fk_col_idx: 0,
+                        is_hidden: false,
+                    };
+                    push_col_tab_row(&mut bb, info.id, OWNER_KIND_TABLE, i as i64, &cd, 1);
                 }
             }
             let batch = bb.finish();

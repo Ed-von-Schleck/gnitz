@@ -1,4 +1,6 @@
 use super::*;
+use gnitz_wire::{COLTAB_COL_COL_IDX, COLTAB_COL_NAME, COLTAB_COL_OWNER_ID, COLTAB_COL_OWNER_KIND};
+use std::collections::HashMap;
 
 // ── test_identifiers ─────────────────────────────────────────────────
 
@@ -55,6 +57,57 @@ fn test_bootstrap() {
     assert_eq!(count_records(engine2.sys_store_mut(SysFamily::Table)), tables_before);
     engine2.close();
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// What a client scanning `_columns` on a fresh server sees: every system
+/// family describes itself with one row per column of its wire list, named and
+/// in `col_idx` order, under its own id — and nothing else is described.
+///
+/// Guards `push_col_tab_row`'s argument order, which `test_bootstrap`'s row
+/// count cannot see. Both sides derive from the same `gnitz-wire` slice, so it
+/// cannot catch the schema and its self-description drifting apart.
+#[test]
+fn bootstrap_self_description_matches_the_wire_column_lists() {
+    let dir = temp_dir("bootstrap_self_description");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Every live COL_TAB row, grouped by the table it describes.
+    let mut described: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
+    let mut c = engine.sys_store(SysFamily::Column).open_cursor();
+    while c.valid {
+        if c.current_weight > 0 && cursor_read_u64(&c, COLTAB_COL_OWNER_KIND) == OWNER_KIND_TABLE as u64 {
+            let owner = cursor_read_u64(&c, COLTAB_COL_OWNER_ID);
+            let entry = (
+                cursor_read_u64(&c, COLTAB_COL_COL_IDX),
+                cursor_read_string(&c, COLTAB_COL_NAME),
+            );
+            described.entry(owner).or_default().push(entry);
+        }
+        c.advance();
+    }
+
+    // Driven off `SYS_FAMILIES` rather than a hand-written list, so a family
+    // added later is covered without touching this test.
+    for info in &SYS_FAMILIES {
+        let mut rows = described
+            .remove(&(info.id as u64))
+            .unwrap_or_else(|| panic!("family {} describes no columns", info.name));
+        rows.sort_by_key(|(idx, _)| *idx);
+        let names: Vec<&str> = rows.iter().map(|(_, n)| n.as_str()).collect();
+        let expected: Vec<&str> = info.cols.iter().map(|c| c.name).collect();
+        assert_eq!(names, expected, "family {} self-description", info.name);
+    }
+    // A fresh server holds no user tables, so the system families are the whole
+    // of COL_TAB — anything left over is a row describing a table that is not a
+    // registered family.
+    assert!(
+        described.is_empty(),
+        "COL_TAB describes unregistered table ids: {:?}",
+        described.keys().collect::<Vec<_>>()
+    );
+
+    engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -448,7 +501,7 @@ fn test_hook_table_register_rejects_malformed_pk() {
     engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
 
     let mut assert_rejects = |raw_pk_cols: u64, snippet: &str| {
-        let batch = build_table_tab_row(&dir, tid, raw_pk_cols, "bad_table");
+        let batch = build_table_tab_row(tid, raw_pk_cols, "bad_table");
         let res = engine.ingest_to_family(TABLE_TAB_ID, &batch);
         let err = res.expect_err(&format!("expected Err containing '{snippet}', got Ok"));
         assert!(err.contains(snippet), "expected '{snippet}', got: {err}");
@@ -771,14 +824,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
 
     // A REPLICATED base table.
-    let rt = create_flagged_table(
-        &mut engine,
-        &dir,
-        "rt",
-        &cols,
-        &[0],
-        gnitz_wire::pack_table_flags(true, 0),
-    );
+    let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], gnitz_wire::pack_table_flags(true, 0));
 
     // A partitioned base table, for the negative direction.
     let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();

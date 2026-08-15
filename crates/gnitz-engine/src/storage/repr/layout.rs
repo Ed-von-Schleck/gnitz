@@ -1,7 +1,12 @@
 //! Shared shard file format constants.
 
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
-pub(crate) const SHARD_VERSION: u64 = 8;
+/// Shard file format version. A shard records no schema — the reader derives
+/// its regions from the live `SchemaDescriptor` — so a column-shape change to a
+/// system family needs a bump here too, not just a header/region layout change.
+/// A shard written under a wider schema passes the per-region size and checksum
+/// checks; nothing but this word rejects it.
+pub(crate) const SHARD_VERSION: u64 = 9;
 pub(crate) const HEADER_SIZE: usize = 64;
 pub(crate) const DIR_ENTRY_SIZE: usize = 32;
 pub(crate) const ALIGNMENT: usize = 64;

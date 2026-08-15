@@ -66,7 +66,7 @@ pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
 /// the closed form does not hold for them and this must not be used there. The
 /// `assert!` rejects the PK column itself, and `col_index_in`'s own const-eval
 /// panic covers a renamed column — both at compile time.
-pub const fn pay_index_in(cols: &[WireSysCol], name: &str) -> usize {
+pub(crate) const fn pay_index_in(cols: &[WireSysCol], name: &str) -> usize {
     let ci = col_index_in(cols, name);
     assert!(ci != 0, "the leading PK column has no payload index");
     ci - 1
@@ -100,11 +100,9 @@ pub const TABLE_TAB_COLS: &[WireSysCol] = &[
     col("table_id", TypeCode::U64, false),
     col("schema_id", TypeCode::U64, false),
     col("name", TypeCode::String, false),
-    col("directory", TypeCode::String, false),
     // Packed PK column list (`pack_pk_cols`); a bare index (flag bit clear)
     // decodes as a single-column PK.
     col("pk_col_idx", TypeCode::U64, false),
-    col("created_lsn", TypeCode::U64, false),
     // See `pack_table_flags` for the bit layout.
     col("flags", TypeCode::U64, false),
 ];
@@ -114,8 +112,6 @@ pub const VIEW_TAB_COLS: &[WireSysCol] = &[
     col("schema_id", TypeCode::U64, false),
     col("name", TypeCode::String, false),
     col("sql_definition", TypeCode::String, false),
-    col("cache_directory", TypeCode::String, false),
-    col("created_lsn", TypeCode::U64, false),
     // Packed view-PK column list (`pack_pk_cols`). A bare `0` (flag bit clear)
     // decodes as the single-column PK `[0]`.
     col("pk_col_idx", TypeCode::U64, false),
@@ -144,13 +140,11 @@ pub const COL_TAB_COLS: &[WireSysCol] = &[
 pub const IDX_TAB_COLS: &[WireSysCol] = &[
     col("index_id", TypeCode::U64, false),
     col("owner_id", TypeCode::U64, false),
-    col("owner_kind", TypeCode::U64, false),
     // Holds `pack_pk_cols(&col_indices)` for every row (single- and
     // multi-column indexes alike); decoded via `unpack_pk_cols`.
     col("source_col_idx", TypeCode::U64, false),
     col("name", TypeCode::String, false),
     col("is_unique", TypeCode::U64, false),
-    col("cache_directory", TypeCode::String, false),
 ];
 
 // PK = columns [0, 1]; dep_view_id is the only payload.
@@ -172,14 +166,14 @@ pub const META_SCHEMA_COLS: &[WireSysCol] = &[
 ];
 pub const META_SCHEMA_PK: &[u32] = LEADING_COL_PK;
 
-/// Payload index of the schema block's `type_code` column — the slot both
-/// decoders read it from, rather than each hardcoding a region number.
-pub const META_SCHEMA_PAY_TYPE_CODE: usize = pay_index_in(META_SCHEMA_COLS, "type_code");
-/// Payload index of the schema block's `flags` column. See
-/// [`META_SCHEMA_PAY_TYPE_CODE`].
-pub const META_SCHEMA_PAY_FLAGS: usize = pay_index_in(META_SCHEMA_COLS, "flags");
-/// Payload index of the schema block's `name` column.
-pub const META_SCHEMA_PAY_NAME: usize = pay_index_in(META_SCHEMA_COLS, "name");
+/// The GET_INDICES reply block's column shape — like [`META_SCHEMA_COLS`], a
+/// wire schema both ends build rather than a system table. The PK carries
+/// `pack_pk_cols(&col_indices)`, unique per index circuit.
+pub const INDEX_META_COLS: &[WireSysCol] = &[
+    col("cols", TypeCode::U64, false),
+    col("is_unique", TypeCode::U64, false),
+];
+pub const INDEX_META_PK: &[u32] = LEADING_COL_PK;
 
 pub const SEQ_TAB_COLS: &[WireSysCol] = &[
     col("seq_id", TypeCode::U64, false),
@@ -218,6 +212,135 @@ pub const CIRCUIT_NODE_COLUMNS_COLS: &[WireSysCol] = &[
     col("value1", TypeCode::U64, false),
     col("value2", TypeCode::U64, false),
 ];
+
+// ---------------------------------------------------------------------------
+// Catalog column positions
+// ---------------------------------------------------------------------------
+//
+// Resolved by name from the lists above, so a dropped or renamed column fails
+// the build instead of shifting a literal. Both the engine and the client read
+// catalog batches and must agree on every position, so they are stated once,
+// here, rather than derived again in each crate.
+//
+// `*_COL_*` index a full schema (`ZSetBatch::columns[..]` / a cursor read, PK
+// included); `*_PAY_*` index the payload region only (§6).
+
+pub const SCHEMATAB_COL_NAME: usize = col_index_in(SCHEMA_TAB_COLS, "name");
+pub const SCHEMATAB_PAY_NAME: usize = pay_index_in(SCHEMA_TAB_COLS, "name");
+
+pub const TABTAB_COL_SCHEMA_ID: usize = col_index_in(TABLE_TAB_COLS, "schema_id");
+pub const TABTAB_COL_NAME: usize = col_index_in(TABLE_TAB_COLS, "name");
+pub const TABTAB_COL_PK_COL_IDX: usize = col_index_in(TABLE_TAB_COLS, "pk_col_idx");
+pub const TABTAB_COL_FLAGS: usize = col_index_in(TABLE_TAB_COLS, "flags");
+pub const TABTAB_PAY_SCHEMA_ID: usize = pay_index_in(TABLE_TAB_COLS, "schema_id");
+pub const TABTAB_PAY_NAME: usize = pay_index_in(TABLE_TAB_COLS, "name");
+pub const TABTAB_PAY_PK_COL_IDX: usize = pay_index_in(TABLE_TAB_COLS, "pk_col_idx");
+pub const TABTAB_PAY_FLAGS: usize = pay_index_in(TABLE_TAB_COLS, "flags");
+
+pub const VIEWTAB_COL_SCHEMA_ID: usize = col_index_in(VIEW_TAB_COLS, "schema_id");
+pub const VIEWTAB_COL_NAME: usize = col_index_in(VIEW_TAB_COLS, "name");
+pub const VIEWTAB_COL_SQL: usize = col_index_in(VIEW_TAB_COLS, "sql_definition");
+pub const VIEWTAB_COL_PK_COL_IDX: usize = col_index_in(VIEW_TAB_COLS, "pk_col_idx");
+pub const VIEWTAB_PAY_SCHEMA_ID: usize = pay_index_in(VIEW_TAB_COLS, "schema_id");
+pub const VIEWTAB_PAY_NAME: usize = pay_index_in(VIEW_TAB_COLS, "name");
+pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in(VIEW_TAB_COLS, "pk_col_idx");
+
+/// One code path decodes TABLE_TAB and VIEW_TAB on both sides — the engine's
+/// `apply_entity_caches`, the client's `collect_schema_member_names` — reading
+/// either family through the `TABTAB_*` positions. That needs the two to agree
+/// on where `(schema_id, name)` sits.
+const _: () = {
+    assert!(TABTAB_COL_SCHEMA_ID == VIEWTAB_COL_SCHEMA_ID);
+    assert!(TABTAB_COL_NAME == VIEWTAB_COL_NAME);
+};
+
+pub const COLTAB_COL_OWNER_ID: usize = col_index_in(COL_TAB_COLS, "owner_id");
+pub const COLTAB_COL_OWNER_KIND: usize = col_index_in(COL_TAB_COLS, "owner_kind");
+pub const COLTAB_COL_COL_IDX: usize = col_index_in(COL_TAB_COLS, "col_idx");
+pub const COLTAB_COL_NAME: usize = col_index_in(COL_TAB_COLS, "name");
+pub const COLTAB_COL_TYPE_CODE: usize = col_index_in(COL_TAB_COLS, "type_code");
+pub const COLTAB_COL_IS_NULLABLE: usize = col_index_in(COL_TAB_COLS, "is_nullable");
+pub const COLTAB_COL_FK_TABLE_ID: usize = col_index_in(COL_TAB_COLS, "fk_table_id");
+pub const COLTAB_COL_FK_COL_IDX: usize = col_index_in(COL_TAB_COLS, "fk_col_idx");
+pub const COLTAB_COL_IS_SERIAL: usize = col_index_in(COL_TAB_COLS, "is_serial");
+pub const COLTAB_COL_IS_HIDDEN: usize = col_index_in(COL_TAB_COLS, "is_hidden");
+pub const COLTAB_PAY_OWNER_ID: usize = pay_index_in(COL_TAB_COLS, "owner_id");
+pub const COLTAB_PAY_OWNER_KIND: usize = pay_index_in(COL_TAB_COLS, "owner_kind");
+pub const COLTAB_PAY_COL_IDX: usize = pay_index_in(COL_TAB_COLS, "col_idx");
+pub const COLTAB_PAY_NAME: usize = pay_index_in(COL_TAB_COLS, "name");
+pub const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in(COL_TAB_COLS, "fk_table_id");
+pub const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in(COL_TAB_COLS, "fk_col_idx");
+pub const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in(COL_TAB_COLS, "is_nullable");
+pub const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in(COL_TAB_COLS, "is_hidden");
+
+pub const IDXTAB_COL_OWNER_ID: usize = col_index_in(IDX_TAB_COLS, "owner_id");
+pub const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(IDX_TAB_COLS, "source_col_idx");
+pub const IDXTAB_COL_NAME: usize = col_index_in(IDX_TAB_COLS, "name");
+pub const IDXTAB_COL_IS_UNIQUE: usize = col_index_in(IDX_TAB_COLS, "is_unique");
+pub const IDXTAB_PAY_OWNER_ID: usize = pay_index_in(IDX_TAB_COLS, "owner_id");
+pub const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in(IDX_TAB_COLS, "source_col_idx");
+pub const IDXTAB_PAY_NAME: usize = pay_index_in(IDX_TAB_COLS, "name");
+pub const IDXTAB_PAY_IS_UNIQUE: usize = pay_index_in(IDX_TAB_COLS, "is_unique");
+
+pub const SEQTAB_COL_VALUE: usize = col_index_in(SEQ_TAB_COLS, "next_val");
+pub const SEQTAB_PAY_VALUE: usize = pay_index_in(SEQ_TAB_COLS, "next_val");
+
+// ---------------------------------------------------------------------------
+// Stored-shape digest
+// ---------------------------------------------------------------------------
+
+/// FNV-1a over one family's column shape — each column's name, type and
+/// nullability, then its key columns.
+const fn fold_family(mut h: u64, cols: &[WireSysCol], pk: &[u32]) -> u64 {
+    const PRIME: u64 = 0x100_0000_01b3;
+    let mut i = 0;
+    while i < cols.len() {
+        let name = cols[i].name.as_bytes();
+        let mut j = 0;
+        while j < name.len() {
+            h = (h ^ name[j] as u64).wrapping_mul(PRIME);
+            j += 1;
+        }
+        h = (h ^ cols[i].type_code as u64).wrapping_mul(PRIME);
+        h = (h ^ cols[i].nullable as u64).wrapping_mul(PRIME);
+        i += 1;
+    }
+    let mut k = 0;
+    while k < pk.len() {
+        h = (h ^ pk[k] as u64).wrapping_mul(PRIME);
+        k += 1;
+    }
+    h
+}
+
+/// Digest of every system family's stored shape. Shards and SAL frames are
+/// decoded against the *live* schema, so a shape change silently reinterprets
+/// an existing data directory unless a format word rejects it first — see the
+/// pin in [`crate::wal::WAL_FORMAT_VERSION`]'s test.
+pub const SYS_SCHEMA_DIGEST: u64 = {
+    let mut h = 0xcbf2_9ce4_8422_2325;
+    h = fold_family(h, SCHEMA_TAB_COLS, SCHEMA_TAB_PK);
+    h = fold_family(h, TABLE_TAB_COLS, TABLE_TAB_PK);
+    h = fold_family(h, VIEW_TAB_COLS, VIEW_TAB_PK);
+    h = fold_family(h, COL_TAB_COLS, COL_TAB_PK);
+    h = fold_family(h, IDX_TAB_COLS, IDX_TAB_PK);
+    h = fold_family(h, SEQ_TAB_COLS, SEQ_TAB_PK);
+    h = fold_family(h, DEP_TAB_COLS, DEP_TAB_PK);
+    h = fold_family(h, CIRCUIT_NODES_COLS, CIRCUIT_FAMILY_PK);
+    h = fold_family(h, CIRCUIT_EDGES_COLS, CIRCUIT_FAMILY_PK);
+    h = fold_family(h, CIRCUIT_NODE_COLUMNS_COLS, CIRCUIT_FAMILY_PK);
+    h
+};
+
+// The two reply blocks that are wire schemas rather than system tables.
+pub const METASCHEMA_COL_TYPE_CODE: usize = col_index_in(META_SCHEMA_COLS, "type_code");
+pub const METASCHEMA_COL_FLAGS: usize = col_index_in(META_SCHEMA_COLS, "flags");
+pub const METASCHEMA_COL_NAME: usize = col_index_in(META_SCHEMA_COLS, "name");
+pub const METASCHEMA_PAY_TYPE_CODE: usize = pay_index_in(META_SCHEMA_COLS, "type_code");
+pub const METASCHEMA_PAY_FLAGS: usize = pay_index_in(META_SCHEMA_COLS, "flags");
+pub const METASCHEMA_PAY_NAME: usize = pay_index_in(META_SCHEMA_COLS, "name");
+
+pub const INDEXMETA_COL_IS_UNIQUE: usize = col_index_in(INDEX_META_COLS, "is_unique");
 
 // ---------------------------------------------------------------------------
 // System table IDs

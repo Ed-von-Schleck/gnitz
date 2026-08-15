@@ -7,41 +7,45 @@
 //! `crates/gnitz-sql/tests/planner_alter.rs`.
 
 use super::*;
+use gnitz_wire::{TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX, TABTAB_COL_SCHEMA_ID};
 use std::path::Path;
 
-/// The live TABLE_TAB row's payload fields for `tid`
-/// `(schema_id, name, directory, pk_col_idx, created_lsn, flags)`.
-fn live_table_row(engine: &CatalogEngine, tid: i64) -> (u64, String, String, u64, u64, u64) {
+/// The live TABLE_TAB row's payload for `tid`. Named fields rather than a tuple
+/// because these tests rebuild the row with one field changed.
+struct TableRow {
+    schema_id: u64,
+    name: String,
+    pk_col_idx: u64,
+    flags: u64,
+}
+
+fn live_table_row(engine: &CatalogEngine, tid: i64) -> TableRow {
     let mut c = engine.sys_store(SysFamily::Table).open_cursor();
     c.seek_bytes(&(tid as u64).to_be_bytes());
     assert!(
         c.valid && c.current_key_narrow() as u64 == tid as u64,
         "live TABLE_TAB row for tid {tid} missing"
     );
-    (
-        cursor_read_u64(&c, 1),
-        cursor_read_string(&c, 2),
-        cursor_read_string(&c, 3),
-        cursor_read_u64(&c, 4),
-        cursor_read_u64(&c, 5),
-        cursor_read_u64(&c, 6),
-    )
+    TableRow {
+        schema_id: cursor_read_u64(&c, TABTAB_COL_SCHEMA_ID),
+        name: cursor_read_string(&c, TABTAB_COL_NAME),
+        pk_col_idx: cursor_read_u64(&c, TABTAB_COL_PK_COL_IDX),
+        flags: cursor_read_u64(&c, TABTAB_COL_FLAGS),
+    }
+}
+
+/// One TABLE_TAB row at `weight` reproducing `row`, with `name` substituted.
+fn push_table_row(bb: &mut BatchBuilder, tid: i64, row: &TableRow, name: &str, weight: i64) {
+    push_table_tab_row(bb, tid, row.schema_id as i64, name, row.pk_col_idx, row.flags, weight);
 }
 
 /// A TABLE_TAB rename pair: `-1` reproduces the live payload byte-for-byte (so
 /// the CAS accepts it), `+1` differs only in `name`.
 fn table_rename_pair(engine: &CatalogEngine, tid: i64, new_name: &str) -> Batch {
-    let (sid, old_name, dir, pk_col_idx, created_lsn, flags) = live_table_row(engine, tid);
+    let row = live_table_row(engine, tid);
     let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-    for (weight, name) in [(-1i64, old_name.as_str()), (1i64, new_name)] {
-        bb.begin_row(tid as u128, weight);
-        bb.put_u64(sid);
-        bb.put_string(name);
-        bb.put_string(&dir);
-        bb.put_u64(pk_col_idx);
-        bb.put_u64(created_lsn);
-        bb.put_u64(flags);
-        bb.end_row();
+    for (weight, name) in [(-1i64, row.name.as_str()), (1i64, new_name)] {
+        push_table_row(&mut bb, tid, &row, name, weight);
     }
     bb.finish()
 }
@@ -167,17 +171,10 @@ fn stale_snapshot_rename_rejected_long_name() {
     let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
     // The `-1` carries a stale (wrong) old name > 12 bytes that does not match the
     // live row — the CAS must reject it.
-    let (sid, _live, d, pk, lsn, fl) = live_table_row(&engine, tid);
+    let row = live_table_row(&engine, tid);
     let mut bb = BatchBuilder::new(SysFamily::Table.schema());
     for (weight, name) in [(-1i64, "stale_wrong_long_name"), (1i64, "new_desired_long_name")] {
-        bb.begin_row(tid as u128, weight);
-        bb.put_u64(sid);
-        bb.put_string(name);
-        bb.put_string(&d);
-        bb.put_u64(pk);
-        bb.put_u64(lsn);
-        bb.put_u64(fl);
-        bb.end_row();
+        push_table_row(&mut bb, tid, &row, name, weight);
     }
     let err = engine.ingest_to_family(TABLE_TAB_ID, &bb.finish()).unwrap_err();
     assert!(
@@ -198,16 +195,9 @@ fn duplicate_live_head_rejected() {
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     // A bare `+1` re-ingest of the live row → net weight 2 (a duplicate live head).
-    let (sid, name, d, pk, lsn, fl) = live_table_row(&engine, tid);
+    let row = live_table_row(&engine, tid);
     let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-    bb.begin_row(tid as u128, 1);
-    bb.put_u64(sid);
-    bb.put_string(&name);
-    bb.put_string(&d);
-    bb.put_u64(pk);
-    bb.put_u64(lsn);
-    bb.put_u64(fl);
-    bb.end_row();
+    push_table_row(&mut bb, tid, &row, &row.name, 1);
     let err = engine.ingest_to_family(TABLE_TAB_ID, &bb.finish()).unwrap_err();
     assert!(
         err.contains("net weight 2") || err.contains("expected 0 or 1"),
@@ -226,14 +216,7 @@ fn system_range_rewrite_rejected() {
     let sys_tid: i64 = 5; // < FIRST_USER_TABLE_ID
     let mut bb = BatchBuilder::new(SysFamily::Table.schema());
     for (weight, name) in [(-1i64, "a"), (1i64, "b")] {
-        bb.begin_row(sys_tid as u128, weight);
-        bb.put_u64(PUBLIC_SCHEMA_ID as u64);
-        bb.put_string(name);
-        bb.put_string("");
-        bb.put_u64(pack_pk_cols(&[0]));
-        bb.put_u64(0);
-        bb.put_u64(0);
-        bb.end_row();
+        push_table_tab_row(&mut bb, sys_tid, PUBLIC_SCHEMA_ID, name, pack_pk_cols(&[0]), 0, weight);
     }
     let err = engine.precheck_family(SysFamily::Table, &bb.finish()).unwrap_err();
     assert!(
@@ -256,24 +239,19 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
     ];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let col_idx: i64 = 1;
-    let pk = pack_column_id(tid, col_idx) as u128;
 
     // A COL_TAB rewrite pair whose `-1` carries a stale (wrong) old column name
     // > 12 bytes — the Column precheck arm must reject it via the CAS.
     let mut bb = BatchBuilder::new(SysFamily::Column.schema());
     for (weight, name) in [(-1i64, "stale_wrong_column_x"), (1i64, "new_column_name_here")] {
-        bb.begin_row(pk, weight);
-        bb.put_u64(tid as u64);
-        bb.put_u64(OWNER_KIND_TABLE as u64);
-        bb.put_u64(col_idx as u64);
-        bb.put_string(name);
-        bb.put_u64(type_code::U64 as u64);
-        bb.put_u64(0); // is_nullable
-        bb.put_u64(0); // fk_table_id
-        bb.put_u64(0); // fk_col_idx
-        bb.put_u64(0); // is_serial
-        bb.put_u64(0); // is_hidden
-        bb.end_row();
+        push_col_tab_row(
+            &mut bb,
+            tid,
+            OWNER_KIND_TABLE,
+            col_idx,
+            &col_def(name, type_code::U64),
+            weight,
+        );
     }
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
     assert!(
