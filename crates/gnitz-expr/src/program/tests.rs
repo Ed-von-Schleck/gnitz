@@ -4,7 +4,7 @@
 
 use gnitz_wire::type_code;
 
-use super::{classify_registers, RegisterRoles};
+use super::{register_roles, RegisterRoles};
 use crate::program::IntUnaryOp;
 use crate::test_support::{
     bits_to_float, filter_prog, float_to_bits, make_int_view, make_string_view, scalar_prog, schema_pk_ints,
@@ -453,6 +453,51 @@ fn test_emit_with_targets() {
     assert!(!is_null);
     assert_eq!(mask, 0);
     assert_eq!(emit_vals[0], 30);
+}
+
+/// `r5 = (col1 > 1) AND (col2 > 1)` over `schema_pk_ints(2, _)`, using registers
+/// 0-5. The classification tests below and the EMIT test share it.
+fn conjunction_over_two_cols() -> Vec<LogicalInstr> {
+    vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 1 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        },
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
+    ]
+}
+
+/// EMIT counts as a non-bool read of its source, so a boolean it ships is not
+/// `bit_only` and its producer writes `regs`. Were the source missing from the
+/// operand table, BOOL_AND would skip the unpack and EMIT would read a stale
+/// lane.
+#[test]
+fn an_emitted_boolean_lands_in_regs() {
+    // Nullable payload columns: under `no_nulls`, BOOL_AND writes `regs`
+    // whatever `bit_only` says, which would make the value assertion vacuous.
+    let schema = schema_pk_ints(2, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[10, 20])]);
+    let mut instrs = conjunction_over_two_cols();
+    instrs.push(LogicalInstr::Emit { src: 5, out: 0 });
+    let prog = scalar_prog(&schema, instrs, 6, 5, vec![]);
+    assert!(
+        !prog.prog.no_nulls,
+        "nullable columns keep the test off the no_nulls arm"
+    );
+    assert!(!prog.prog.is_bit_only(5), "a register read by EMIT is not bit_only");
+    let (_, _, _, emit_vals) = eval_with_emit(&prog, &mb, 0);
+    assert_eq!(emit_vals[0], 1, "EMIT must ship the AND value, not a stale lane");
 }
 
 #[test]
@@ -1377,13 +1422,40 @@ fn test_select_classification() {
         LogicalInstr::LoadColInt { dst: 4, col: 4 }, // other bool
         LogicalInstr::BoolAnd { dst: 5, a: 3, b: 4 },
     ];
-    let prog = filter_prog(&schema, instrs, 6, 5, vec![]);
-    let RegisterRoles {
-        bit_only, bool_input, ..
-    } = classify_registers(&prog.prog.instrs, 5, true);
+    let RegisterRoles { bit_only, bool_input } = register_roles(&instrs, 5, true);
+    // The same program must also be a legal filter.
+    filter_prog(&schema, instrs, 6, 5, vec![]);
     assert_ne!(bool_input & (1 << 0), 0, "cond is read as a bool_input");
     assert_ne!(bool_input & (1 << 3), 0, "select result feeds BOOL_AND as bool_input");
     assert_eq!(bit_only & (1 << 3), 0, "select dst is a value register, never bit_only");
+}
+
+/// SELECT blends branch values, so its destination is a `WriteAs::Value`. As a
+/// `WriteAs::Bool` it would be `bit_only` here — read by nobody, and
+/// `is_filter = false` keeps `result_reg` out of `bool_input` — and `eval_row`
+/// would return the packed truth bit instead of the branch value.
+#[test]
+fn a_select_result_reads_back_as_a_value() {
+    // The nullable column load turns `no_nulls` off; `eval_row` consults
+    // `bit_only` only on the nullable arm.
+    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::I64, true)], &[0]);
+    let mb = make_int_view(&schema, &[(1, 0, &[1])]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond, truthy
+        LogicalInstr::LoadConst { dst: 1, val: 5 },
+        LogicalInstr::LoadConst { dst: 2, val: 7 },
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+    ];
+    let prog = scalar_prog(&schema, instrs, 4, 3, vec![]);
+    assert!(!prog.prog.no_nulls, "the nullable load keeps this off the no_nulls arm");
+    let (val, is_null) = prog.eval_row(&mb, 0);
+    assert!(!is_null);
+    assert_eq!(val, 5, "SELECT returns the chosen branch value, not a truth bit");
 }
 
 /// `dst` aliasing any of `cond`/`a`/`b` violates the SELECT anti-alias rule that
@@ -2038,34 +2110,10 @@ fn test_int_in_set_validate_rejects_out_of_range_set_idx() {
 #[test]
 fn classifier_pure_conjunction_filter() {
     let schema = schema_pk_ints(2, true);
-    let prog = filter_prog(
-        &schema,
-        vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 1 },
-            LogicalInstr::LoadConst { dst: 1, val: 1 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
-            },
-            LogicalInstr::LoadColInt { dst: 3, col: 2 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                dst: 4,
-                a: 3,
-                b: 1,
-            },
-            LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
-        ],
-        6,
-        5,
-        vec![],
-    )
-    .prog;
-    let RegisterRoles {
-        bit_only, bool_input, ..
-    } = classify_registers(&prog.instrs, 5, true);
+    let instrs = conjunction_over_two_cols();
+    let RegisterRoles { bit_only, bool_input } = register_roles(&instrs, 5, true);
+    // The same program must also be a legal filter.
+    filter_prog(&schema, instrs, 6, 5, vec![]);
     // Bool producers: r2 (CMP_GT), r4 (CMP_GT), r5 (BOOL_AND).
     // Non-bool readers consume r0/r1/r3 (CMPs read them as i64), so those
     // never qualify for bit_only. r2/r4 are read only by BOOL_AND, and r5
@@ -2252,6 +2300,31 @@ fn a_null_test_alone_keeps_no_nulls_but_a_load_of_the_column_does_not() {
         ),
         "loading the tested column must force the nullable arm"
     );
+}
+
+/// A PK column carries no null bit — the null bitmap is payload-indexed — so
+/// loading one never forces the nullable arm. `TestSchema` validates nothing,
+/// so it can state the nullable PK both production implementors reject, which
+/// is what makes the guard's absence observable.
+#[test]
+fn a_nullable_pk_column_load_keeps_no_nulls() {
+    let schema = TestSchema::new(&[(type_code::U64, true), (type_code::I64, false)], &[0]);
+    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }];
+    assert!(scalar_prog(&schema, instrs, 1, 0, vec![]).prog.no_nulls);
+}
+
+/// A float column load inherits its column's null bit, like every other typed
+/// column operand. Both directions, so a table marking every column `FromCol`
+/// would fail too.
+#[test]
+fn a_float_column_load_carries_its_null_bit() {
+    let no_nulls_over = |nullable: bool| {
+        let schema = TestSchema::new(&[(type_code::U64, false), (type_code::F64, nullable)], &[0]);
+        let instrs = vec![LogicalInstr::LoadColFloat { dst: 0, col: 1 }];
+        scalar_prog(&schema, instrs, 1, 0, vec![]).prog.no_nulls
+    };
+    assert!(!no_nulls_over(true), "a nullable F64 column forces the nullable arm");
+    assert!(no_nulls_over(false), "a non-nullable one does not");
 }
 
 /// `IntMinMax2` picks its compare domain from the U64 tracking of BOTH
@@ -2534,6 +2607,16 @@ fn emit_class_must_match_its_destination_column() {
     // The matching pairing is accepted, and reports reg 0 as a string.
     assert_eq!(str_src.validate(Some(&in_str), Some(&str_out)), Ok(1));
     assert_eq!(scalar_src.validate(Some(&in_str), Some(&int_out)), Ok(0));
+}
+
+/// EMIT's source is exempt from the class check — its class picks the
+/// destination-column rule — but not from the bound every other read gets.
+#[test]
+fn emit_bounds_checks_its_source_register() {
+    assert_eq!(
+        from_wire(&[EXPR_EMIT, 0, 5, 0], 2),
+        Err(ExprValidateErr::RegOutOfRange { reg: 5, num_regs: 2 })
+    );
 }
 
 /// The result register's class splits the two resolvers that make the identical

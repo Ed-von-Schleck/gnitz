@@ -109,6 +109,18 @@ impl ColKind {
     fn payload_only(self) -> bool {
         matches!(self, ColKind::AnyPayload | ColKind::Float | ColKind::GermanString)
     }
+
+    /// True iff the destination register is NULL exactly where this column is.
+    ///
+    /// It follows from the type requirement: an opcode decodes a column's value
+    /// only if it knows the type, and decoding is what makes the register
+    /// inherit the null bit. The two untyped kinds are the null-bitmap readers
+    /// (`IS [NOT] NULL`) and the columnar `CopyCol`, neither of which puts the
+    /// value in a register — `CopyCol` still propagates its source's null bit,
+    /// but columnar, outside the register file.
+    fn carries_null_to_register(self) -> bool {
+        !matches!(self, ColKind::AnyCol | ColKind::AnyPayload)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,15 +165,6 @@ pub enum StrOp {
     Eq,
     Lt,
     Le,
-}
-
-/// Which register file a register lives in. String opcodes and scalar opcodes
-/// share one register index space — so the null bits and boolean masks apply
-/// unchanged to both — and a register's class is fixed by its one writer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Class {
-    Scalar,
-    Str,
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +442,11 @@ pub enum LogicalInstr {
 /// One resolved, evaluable instruction. `signed` flags carry the result of the
 /// per-register U64 type tracking: `signed: false` selects the unsigned path on
 /// `Cmp`/`IntDiv`/`IntMod`/`IntToFloat`, reinterpreting the i64 register as u64.
+///
+/// Operands and null behaviour are classified on [`LogicalInstr`], by
+/// [`operands`]. A variant here with no 1:1 logical counterpart therefore
+/// inherits both from whichever opcode lowers into it, and must match it in
+/// each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Instr {
     /// Payload integer load. `fi` *is* the eight-arm decode the kernel dispatches
@@ -1089,16 +1097,24 @@ impl LogicalProgram {
         // const-pool index to the cell it was encoded into.
         let mut const_cells: Vec<[u8; 16]> = Vec::new();
         let mut cell_slots: Vec<Option<u32>> = vec![None; self.const_strings.len()];
-        // Which registers hold strings, off the same `reg_use` table `validate`
-        // reads. Maintained in program order so an `Emit` sees the class of a
-        // register already written, matching how `validate` built the mask it
-        // checked the operands against.
+        // Resolution is 1:1 and carries every register operand through by name,
+        // so masks taken off the logical stream apply unchanged to the resolved
+        // one.
+        let RegisterRoles { bit_only, bool_input } = register_roles(&self.instrs, self.result_reg, is_filter);
+        let no_nulls = is_strictly_non_nullable(&self.instrs, schema);
+        // Which registers hold strings, off the same operand table `validate`
+        // reads. Maintained in program order so an `Emit` sees the same class
+        // `validate` saw when it approved that output slot.
         let mut str_class = 0u64;
         for li in self.instrs {
-            if let Some((dst, Class::Str)) = reg_use(&li).dst {
+            if let Some((dst, WriteAs::Str)) = operands(&li).dst {
                 str_class |= 1u64 << dst;
             }
-            match li {
+            // One logical instruction, one resolved instruction. An arm may set
+            // `reg_u64[dst]` before reading `reg_u64[a]` for the value it
+            // returns: `validate`'s anti-aliasing rule keeps `dst` out of the
+            // same instruction's reads.
+            instrs.push(match li {
                 L::LoadColInt { dst, col } => {
                     // One query: the locator already carries the type code the
                     // per-register tracking wants, so asking `col_type_code`
@@ -1113,18 +1129,18 @@ impl LogicalProgram {
                     // what makes the kernel's wide-column wildcard unnecessary.
                     let fi = FixedInt::from_type_code(TypeCode::from_validated_u8(loc.type_code()))
                         .expect("validated LoadColInt names a fixed-int column");
-                    instrs.push(match loc {
+                    reg_u64[dst as usize] = loc.type_code() == type_code::U64;
+                    match loc {
                         ColumnLocator::Pk { byte_off, .. } => I::LoadPk { dst, off: byte_off, fi },
                         ColumnLocator::Payload { slot, .. } => I::LoadPayloadInt { dst, pi: slot, fi },
-                    });
-                    reg_u64[dst as usize] = loc.type_code() == type_code::U64;
+                    }
                 }
                 L::LoadColFloat { dst, col } => {
                     // `validate` pinned this column to F32/F64. Listed
                     // positively so an unvalidated program panics rather than
                     // reading 8 bytes out of a 4-byte region.
                     let pi = payload_slot(col as usize);
-                    instrs.push(match schema.col_type_code(col as usize) {
+                    match schema.col_type_code(col as usize) {
                         type_code::F64 => I::LoadPayloadInt {
                             dst,
                             pi,
@@ -1132,105 +1148,106 @@ impl LogicalProgram {
                         },
                         type_code::F32 => I::LoadPayloadF32 { dst, pi },
                         other => unreachable!("validated LoadColFloat names F32/F64, got {other}"),
-                    });
+                    }
                 }
-                L::LoadConst { dst, val } => instrs.push(I::LoadConst { dst, val }),
+                L::LoadConst { dst, val } => I::LoadConst { dst, val },
                 L::IntAdd { dst, a, b } => {
-                    instrs.push(I::IntAdd { dst, a, b });
                     reg_u64[dst as usize] = reg_u64[a as usize] || reg_u64[b as usize];
+                    I::IntAdd { dst, a, b }
                 }
                 L::IntSub { dst, a, b } => {
-                    instrs.push(I::IntSub { dst, a, b });
                     reg_u64[dst as usize] = reg_u64[a as usize] || reg_u64[b as usize];
+                    I::IntSub { dst, a, b }
                 }
                 L::IntMul { dst, a, b } => {
-                    instrs.push(I::IntMul { dst, a, b });
                     reg_u64[dst as usize] = reg_u64[a as usize] || reg_u64[b as usize];
+                    I::IntMul { dst, a, b }
                 }
                 L::IntDiv { dst, a, b } => {
                     let u = reg_u64[a as usize] || reg_u64[b as usize];
-                    instrs.push(I::IntDiv { dst, a, b, signed: !u });
                     reg_u64[dst as usize] = u;
+                    I::IntDiv { dst, a, b, signed: !u }
                 }
                 L::IntMod { dst, a, b } => {
                     let u = reg_u64[a as usize] || reg_u64[b as usize];
-                    instrs.push(I::IntMod { dst, a, b, signed: !u });
                     reg_u64[dst as usize] = u;
+                    I::IntMod { dst, a, b, signed: !u }
                 }
-                L::FloatAdd { dst, a, b } => instrs.push(I::FloatAdd { dst, a, b }),
-                L::FloatSub { dst, a, b } => instrs.push(I::FloatSub { dst, a, b }),
-                L::FloatMul { dst, a, b } => instrs.push(I::FloatMul { dst, a, b }),
-                L::FloatDiv { dst, a, b } => instrs.push(I::FloatDiv { dst, a, b }),
+                L::FloatAdd { dst, a, b } => I::FloatAdd { dst, a, b },
+                L::FloatSub { dst, a, b } => I::FloatSub { dst, a, b },
+                L::FloatMul { dst, a, b } => I::FloatMul { dst, a, b },
+                L::FloatDiv { dst, a, b } => I::FloatDiv { dst, a, b },
                 L::Cmp { op, dst, a, b } => {
                     // EQ/NE are bit-identical signed/unsigned; ordered compares
                     // pick the unsigned form when either operand is U64.
                     let signed = matches!(op, CmpOp::Eq | CmpOp::Ne) || !(reg_u64[a as usize] || reg_u64[b as usize]);
-                    instrs.push(I::Cmp { op, dst, a, b, signed });
+                    I::Cmp { op, dst, a, b, signed }
                 }
-                L::FCmp { op, dst, a, b } => instrs.push(I::FCmp { op, dst, a, b }),
-                L::FloatUnary { op, dst, a } => instrs.push(I::FloatUnary { op, dst, a }),
+                L::FCmp { op, dst, a, b } => I::FCmp { op, dst, a, b },
+                L::FloatUnary { op, dst, a } => I::FloatUnary { op, dst, a },
                 // A pure int transform keeps the operand's width and signedness,
                 // so the U64 tracking carries straight through.
                 L::IntUnary { op, dst, a } => {
-                    instrs.push(I::IntUnary { op, dst, a });
                     reg_u64[dst as usize] = reg_u64[a as usize];
+                    I::IntUnary { op, dst, a }
                 }
-                L::FloatToF32 { dst, a } => instrs.push(I::FloatToF32 { dst, a }),
+                L::FloatToF32 { dst, a } => I::FloatToF32 { dst, a },
                 // Total on a validated program, the `LoadColInt` shape above:
                 // `validate` gates both opcodes' target word through
                 // `gnitz_wire::is_fixed_int` — the same eight codes
                 // `from_type_code` answers `Some` for.
                 L::FloatToInt { dst, a, tc } => {
                     let fi = validated_cast_target(tc);
-                    instrs.push(I::FloatToInt { dst, a, fi });
                     reg_u64[dst as usize] = fi == FixedInt::U64;
+                    I::FloatToInt { dst, a, fi }
                 }
                 L::IntCast { dst, a, tc } => {
                     let fi = validated_cast_target(tc);
-                    instrs.push(I::IntCast {
+                    reg_u64[dst as usize] = fi == FixedInt::U64;
+                    I::IntCast {
                         dst,
                         a,
                         fi,
                         src_signed: !reg_u64[a as usize],
-                    });
-                    reg_u64[dst as usize] = fi == FixedInt::U64;
+                    }
                 }
                 L::IntMinMax2 { dst, a, b, is_max } => {
                     let u = reg_u64[a as usize] || reg_u64[b as usize];
-                    instrs.push(I::IntMinMax2 {
+                    reg_u64[dst as usize] = u;
+                    I::IntMinMax2 {
                         dst,
                         a,
                         b,
                         is_max,
                         signed: !u,
-                    });
-                    reg_u64[dst as usize] = u;
+                    }
                 }
-                L::FloatMinMax2 { dst, a, b, is_max } => instrs.push(I::FloatMinMax2 { dst, a, b, is_max }),
-                L::IntToFloat { dst, a } => {
-                    let signed = !reg_u64[a as usize];
-                    instrs.push(I::IntToFloat { dst, a, signed });
-                }
+                L::FloatMinMax2 { dst, a, b, is_max } => I::FloatMinMax2 { dst, a, b, is_max },
+                L::IntToFloat { dst, a } => I::IntToFloat {
+                    dst,
+                    a,
+                    signed: !reg_u64[a as usize],
+                },
                 L::Select { dst, cond, a, b } => {
                     // U64-ness flows through Select exactly as through IntAdd: the
                     // result is U64 if *either* branch is U64, so a downstream
                     // ordered compare / div / int_to_float on the CASE result picks
                     // the unsigned variant and values >= 2^63 order correctly.
-                    instrs.push(I::Select { dst, cond, a, b });
                     reg_u64[dst as usize] = reg_u64[a as usize] || reg_u64[b as usize];
+                    I::Select { dst, cond, a, b }
                 }
-                L::LoadNull { dst } => instrs.push(I::LoadNull { dst }),
-                L::BoolAnd { dst, a, b } => instrs.push(I::BoolAnd { dst, a, b }),
-                L::BoolOr { dst, a, b } => instrs.push(I::BoolOr { dst, a, b }),
-                L::BoolNot { dst, a } => instrs.push(I::BoolNot { dst, a }),
-                L::IsNull { dst, col } => instrs.push(I::IsNull {
+                L::LoadNull { dst } => I::LoadNull { dst },
+                L::BoolAnd { dst, a, b } => I::BoolAnd { dst, a, b },
+                L::BoolOr { dst, a, b } => I::BoolOr { dst, a, b },
+                L::BoolNot { dst, a } => I::BoolNot { dst, a },
+                L::IsNull { dst, col } => I::IsNull {
                     dst,
                     pi: payload_slot(col as usize),
-                }),
-                L::IsNotNull { dst, col } => instrs.push(I::IsNotNull {
+                },
+                L::IsNotNull { dst, col } => I::IsNotNull {
                     dst,
                     pi: payload_slot(col as usize),
-                }),
+                },
                 L::StrColConst {
                     op,
                     dst,
@@ -1249,19 +1266,19 @@ impl LogicalProgram {
                         const_cells.push(encode_german_string(&self.const_strings[ci], &mut const_arena));
                         slot
                     });
-                    instrs.push(I::StrColConst {
+                    I::StrColConst {
                         op,
                         dst,
                         pi: payload_slot(col as usize),
                         cell_idx,
-                    })
+                    }
                 }
-                L::StrColCol { op, dst, col_a, col_b } => instrs.push(I::StrColCol {
+                L::StrColCol { op, dst, col_a, col_b } => I::StrColCol {
                     op,
                     dst,
                     pi_a: payload_slot(col_a as usize),
                     pi_b: payload_slot(col_b as usize),
-                }),
+                },
                 L::IntInSet {
                     dst,
                     value_reg,
@@ -1285,24 +1302,22 @@ impl LogicalProgram {
                     set.sort_unstable();
                     let new_idx = int_sets.len() as u32;
                     int_sets.push(set);
-                    instrs.push(I::IntInSet {
+                    I::IntInSet {
                         dst,
                         value_reg,
                         set_idx: new_idx,
-                    });
+                    }
                 }
-                L::CopyCol { src_col, out } => {
-                    // The source's location, width, and type — dropped from the wire
-                    // `CopyCol` — resolve to the one canonical record.
-                    instrs.push(I::CopyCol {
-                        out,
-                        src: schema.locate(src_col as usize),
-                    });
-                }
-                L::LoadColStr { dst, col } => instrs.push(I::LoadColStr {
+                // The source's location, width, and type — dropped from the wire
+                // `CopyCol` — resolve to the one canonical record.
+                L::CopyCol { src_col, out } => I::CopyCol {
+                    out,
+                    src: schema.locate(src_col as usize),
+                },
+                L::LoadColStr { dst, col } => I::LoadColStr {
                     dst,
                     pi: payload_slot(col as usize),
-                }),
+                },
                 L::LoadConstStr { dst, const_idx } => {
                     let ci = const_idx as usize;
                     // Appended on first reference, not once per instruction: two
@@ -1313,26 +1328,26 @@ impl LogicalProgram {
                         const_arena.extend_from_slice(bytes);
                         span
                     });
-                    instrs.push(I::LoadConstStr { dst, off, len });
+                    I::LoadConstStr { dst, off, len }
                 }
-                L::LoadNullStr { dst } => instrs.push(I::LoadNullStr { dst }),
-                L::StrSelect { dst, cond, a, b } => instrs.push(I::StrSelect { dst, cond, a, b }),
-                L::StrCmp { op, dst, a, b } => instrs.push(I::StrCmp { op, dst, a, b }),
-                L::StrLen { dst, a, chars } => instrs.push(I::StrLen { dst, a, chars }),
-                L::StrCase { dst, a, upper } => instrs.push(I::StrCase { dst, a, upper }),
+                L::LoadNullStr { dst } => I::LoadNullStr { dst },
+                L::StrSelect { dst, cond, a, b } => I::StrSelect { dst, cond, a, b },
+                L::StrCmp { op, dst, a, b } => I::StrCmp { op, dst, a, b },
+                L::StrLen { dst, a, chars } => I::StrLen { dst, a, chars },
+                L::StrCase { dst, a, upper } => I::StrCase { dst, a, upper },
                 L::StrSubstr {
                     dst,
                     src,
                     start_reg,
                     len_reg,
-                } => instrs.push(I::StrSubstr {
+                } => I::StrSubstr {
                     dst,
                     src,
                     start_reg,
                     len_reg,
                     start_signed: !reg_u64[start_reg as usize],
                     len_signed: len_reg.is_none_or(|l| !reg_u64[l as usize]),
-                }),
+                },
                 L::StrTrim { dst, a, mode, set_idx } => {
                     let si = set_idx as usize;
                     // Decoded once per distinct pool index, never per row —
@@ -1347,38 +1362,37 @@ impl LogicalProgram {
                         trim_sets.push(table);
                         slot
                     });
-                    instrs.push(I::StrTrim {
+                    I::StrTrim {
                         dst,
                         a,
                         mode: validated_trim_mode(mode),
                         set_idx: new_idx,
-                    });
+                    }
                 }
-                L::StrConcat { dst, a, b, skip_null } => instrs.push(I::StrConcat { dst, a, b, skip_null }),
-                L::IntToStr { dst, a } => instrs.push(I::IntToStr {
+                L::StrConcat { dst, a, b, skip_null } => I::StrConcat { dst, a, b, skip_null },
+                L::IntToStr { dst, a } => I::IntToStr {
                     dst,
                     a,
                     signed: !reg_u64[a as usize],
-                }),
-                L::FloatToStr { dst, a } => instrs.push(I::FloatToStr { dst, a }),
+                },
+                L::FloatToStr { dst, a } => I::FloatToStr { dst, a },
                 L::StrToInt { dst, a, tc } => {
                     let fi = validated_cast_target(tc);
-                    instrs.push(I::StrToInt { dst, a, fi });
                     reg_u64[dst as usize] = fi == FixedInt::U64;
+                    I::StrToInt { dst, a, fi }
                 }
-                L::StrToFloat { dst, a } => instrs.push(I::StrToFloat { dst, a }),
-                L::Emit { src, out } => instrs.push(if (str_class >> src) & 1 != 0 {
-                    I::EmitStr { src, out }
-                } else {
-                    I::Emit { src, out }
-                }),
-            }
+                L::StrToFloat { dst, a } => I::StrToFloat { dst, a },
+                L::Emit { src, out } => {
+                    if (str_class >> src) & 1 != 0 {
+                        I::EmitStr { src, out }
+                    } else {
+                        I::Emit { src, out }
+                    }
+                }
+            });
         }
-        // Two independent passes over `instrs`, so the struct is built once,
-        // fully resolved — there is no moment where a mask field is a placeholder.
-        let RegisterRoles { bit_only, bool_input } = classify_registers(&instrs, self.result_reg, is_filter);
         ResolvedProgram {
-            no_nulls: is_strictly_non_nullable(&instrs, schema),
+            no_nulls,
             bit_only_mask: bit_only,
             bool_pack_mask: bit_only | bool_input,
             instrs,
@@ -1476,22 +1490,25 @@ impl LogicalProgram {
             Ok(())
         };
         for instr in &self.instrs {
-            // Bound every register operand off the one per-opcode register
-            // table, so no arm below restates them. `Emit`'s source is
-            // deliberately absent from `reads` (its class picks a destination
-            // rule rather than being held to one), so that arm bounds its own.
-            let u = reg_use(instr);
-            if let Some((dst, _)) = u.dst {
+            // Bound every register and column operand off the one per-opcode
+            // operand table, so no arm below restates them.
+            let ops = operands(instr);
+            if let Some((dst, _)) = ops.dst {
                 check_reg(dst, num_regs)?;
                 // No opcode may write a register it reads: `split_windows`
                 // hands out a `&mut` window at `dst` beside shared windows at
                 // the sources.
-                if let Some(&(reg, _)) = u.reads.iter().flatten().find(|&&(r, _)| r == dst) {
+                if let Some(&(reg, _)) = ops.reads.iter().flatten().find(|&&(r, _)| r == dst) {
                     return Err(E::RegisterAliasing { dst, reg });
                 }
             }
-            for &(reg, _) in u.reads.iter().flatten() {
+            for &(reg, _) in ops.reads.iter().flatten() {
                 check_reg(reg, num_regs)?;
+            }
+            // Ahead of the arm match: `check_copy_types` indexes the schema
+            // with `src_col`, so the bound must already hold there.
+            for &(col, kind) in ops.cols.iter().flatten() {
+                check_col(in_schema, col, kind)?;
             }
             match *instr {
                 // The cast target rides the `a2` word; a forged code must not
@@ -1502,29 +1519,14 @@ impl LogicalProgram {
                         return Err(E::BadCastTarget { tc });
                     }
                 }
-                // EMIT reads a source register and writes an output payload slot.
-                // Its source's class picks which slot rule applies.
+                // EMIT writes an output payload slot; its source's class picks
+                // which slot rule applies.
                 L::Emit { src, out } => {
-                    check_reg(src, num_regs)?;
                     check_out(out)?;
                     check_emit_slot(out_schema, out, (str_class >> src) & 1 != 0)?;
                 }
-                // LoadColInt: the payload and PK integer load kernels have arms only
-                // for the eight fixed-width integer types. A float column has a
-                // loadable *width* but not a loadable *type* (its bits would be
-                // reinterpreted as an integer), and an unknown type code reports
-                // width 8 and would slip through a width test.
-                L::LoadColInt { col, .. } => check_col(in_schema, col, ColKind::FixedInt)?,
-                // LoadColFloat: the float load kernel branches on width alone, so a
-                // 1- or 2-byte integer column makes it slice an 8-byte stride out of
-                // a narrower region.
-                L::LoadColFloat { col, .. } => check_col(in_schema, col, ColKind::Float)?,
-                L::IsNull { col, .. } | L::IsNotNull { col, .. } => check_col(in_schema, col, ColKind::AnyPayload)?,
-                L::StrColConst { col, const_idx, .. } => {
-                    check_const_idx(const_idx, self.const_strings.len())?;
-                    // The compare reads 16-byte German-string cells; a narrower
-                    // column makes `col_data(pi, 16)` over-read its region.
-                    check_col(in_schema, col, ColKind::GermanString)?;
+                L::StrColConst { const_idx, .. } | L::LoadConstStr { const_idx, .. } => {
+                    check_const_idx(const_idx, self.const_strings.len())?
                 }
                 // Set membership over the register `value_reg`; `set_idx` is a
                 // const-pool index whose entry must be a whole number of 8-byte
@@ -1537,14 +1539,6 @@ impl LogicalProgram {
                         return Err(E::IntSetNotAligned { set_idx, len });
                     }
                 }
-                L::StrColCol { col_a, col_b, .. } => {
-                    check_col(in_schema, col_a, ColKind::GermanString)?;
-                    check_col(in_schema, col_b, ColKind::GermanString)?;
-                }
-                // The string-register column load reads the same 16-byte cells
-                // `EXPR_STR_COL_*` does, so it carries the same column requirement.
-                L::LoadColStr { col, .. } => check_col(in_schema, col, ColKind::GermanString)?,
-                L::LoadConstStr { const_idx, .. } => check_const_idx(const_idx, self.const_strings.len())?,
                 // The trim mode rides the `a1` word beside the source register,
                 // and the byte set is a const-pool entry. The set is not held to
                 // ASCII here: STRING/BLOB are byte-transparent at this layer, so
@@ -1557,9 +1551,15 @@ impl LogicalProgram {
                     }
                     check_const_idx(set_idx, self.const_strings.len())?;
                 }
-                // Register bounds and anti-aliasing are all these need, and the
-                // hoisted checks above have already applied them.
-                L::LoadConst { .. }
+                // The hoisted register and column checks above are all these
+                // need.
+                L::LoadColInt { .. }
+                | L::LoadColFloat { .. }
+                | L::IsNull { .. }
+                | L::IsNotNull { .. }
+                | L::StrColCol { .. }
+                | L::LoadColStr { .. }
+                | L::LoadConst { .. }
                 | L::LoadNull { .. }
                 | L::LoadNullStr { .. }
                 | L::IntUnary { .. }
@@ -1592,10 +1592,7 @@ impl LogicalProgram {
                 | L::Select { .. }
                 | L::StrSelect { .. }
                 | L::StrSubstr { .. } => {}
-                // CopyCol: any (payload or PK) source column, one output payload
-                // slot that can hold it.
                 L::CopyCol { src_col, out } => {
-                    check_col(in_schema, src_col, ColKind::AnyCol)?;
                     check_out(out)?;
                     check_copy_types(in_schema, out_schema, src_col, out)?;
                 }
@@ -1609,20 +1606,23 @@ impl LogicalProgram {
             // one. That also rejects read-before-def of a string operand, which a
             // stale `str_views` lane would otherwise turn into another row's
             // bytes: `str_class` is filled in program order by this same walk, so
-            // a read whose writer comes later sees a clear bit.
-            for &(reg, want) in u.reads.iter().flatten() {
-                if ((str_class >> reg) & 1 != 0) != (want == Class::Str) {
-                    return Err(E::RegClassMismatch { reg });
+            // a read whose writer comes later sees a clear bit. `OutputClass`
+            // (`Emit`'s source) has no class to be held to.
+            for &(reg, read) in ops.reads.iter().flatten() {
+                if let Some(want_str) = read.wants_str() {
+                    if ((str_class >> reg) & 1 != 0) != want_str {
+                        return Err(E::RegClassMismatch { reg });
+                    }
                 }
             }
             // Single assignment: one writer is what makes a register's class
             // well-defined for its whole life.
-            if let Some((dst, class)) = u.dst {
+            if let Some((dst, write)) = ops.dst {
                 if (written_regs >> dst) & 1 != 0 {
                     return Err(E::RegRewrite { reg: dst });
                 }
                 written_regs |= 1u64 << dst;
-                if class == Class::Str {
+                if write == WriteAs::Str {
                     str_class |= 1u64 << dst;
                 }
             }
@@ -1648,128 +1648,258 @@ fn check_const_idx(const_idx: u32, n: usize) -> Result<(), ExprValidateErr> {
     }
 }
 
-/// Which registers an instruction touches: the one it writes, with the class it
-/// writes there, and each one it reads, with the class its kernel reads it as.
+/// How a kernel consumes a register operand.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadAs {
+    /// The register's i64 / f64 image out of `regs`.
+    Value,
+    /// A German-string view out of `str_views`.
+    Str,
+    /// A packed truth bit out of `bool_bits`, never the i64 image — which is
+    /// what lets a producer whose every reader is a `Bool` skip the unpack
+    /// (`bit_only`).
+    Bool,
+    /// `Emit`'s source, whose class *selects* the destination-column rule
+    /// instead of being held to one. Bounded and counted as a value read like
+    /// any other; exempt from the class check alone.
+    OutputClass,
+}
+
+/// What an opcode writes into its destination register. String and scalar
+/// opcodes share one register index space — so the null bits and boolean masks
+/// apply unchanged to both — and a register's class is fixed by its one writer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteAs {
+    /// A scalar value.
+    Value,
+    /// A scalar whose i64 image is exactly its truth bit, 0 or 1. A reader may
+    /// therefore take the packed `bool_bits` bit instead, and the kernel may
+    /// skip writing `regs` when the register is `bit_only`. A mask-style `-1`
+    /// for true is the violation this rules out.
+    Bool,
+    /// A German-string view.
+    Str,
+}
+
+impl ReadAs {
+    /// Whether this operand's register must hold a string, or `None` for the one
+    /// read `validate` does not hold to a class.
+    fn wants_str(self) -> Option<bool> {
+        match self {
+            ReadAs::Value | ReadAs::Bool => Some(false),
+            ReadAs::Str => Some(true),
+            ReadAs::OutputClass => None,
+        }
+    }
+}
+
+/// Every operand of one opcode — the register it writes, the registers it reads,
+/// the columns it addresses — each with what its kernel requires of it, plus
+/// whether the kernel can manufacture a NULL of its own.
 ///
-/// The **one** per-opcode register table. `validate` holds every read to its
-/// class and records the write; `resolve_program` takes only the write. Splitting
-/// it in two would let the halves drift, and the observable of a drift is an
-/// `Instr::Emit` writing an 8-byte register image into the 16-byte column
-/// `check_emit_slot` approved as a string slot.
-///
-/// `Emit`'s source register is deliberately absent from `reads`: its class picks
-/// which *destination column* rule applies rather than being held to one.
-struct RegUse {
+/// The **one** per-opcode table: `validate`, `register_roles`,
+/// `is_strictly_non_nullable` and `resolve_program` all read it, so a new opcode
+/// is classified once. Every arm destructures every field of every variant it
+/// matches, with `_` for fields it ignores and **no `..`** — so an opcode that
+/// gains an operand is a compile error here rather than an unbounded operand
+/// reaching the kernels.
+struct Operands {
     /// `None` for the two output opcodes, which write no register.
-    dst: Option<(u16, Class)>,
-    reads: [Option<(u16, Class)>; MAX_READS],
+    dst: Option<(u16, WriteAs)>,
+    reads: [Option<(u16, ReadAs)>; MAX_READS],
+    cols: [Option<(u32, ColKind)>; MAX_COL_OPERANDS],
+    /// True iff the kernel can turn non-NULL input into a NULL result — a zero
+    /// divisor, an out-of-range cast, an unparsable text→number, a CONCAT past
+    /// `u32::MAX`, `LoadNull*` on every row. A column operand's own nullability
+    /// is `cols`, not this.
+    makes_null: bool,
 }
 
 /// SELECT and SUBSTRING, the widest opcodes, read three registers.
 const MAX_READS: usize = 3;
+/// `StrColCol` compares two columns; no opcode addresses more.
+const MAX_COL_OPERANDS: usize = 2;
 
-fn writes(dst: u16, class: Class) -> RegUse {
-    RegUse {
-        dst: Some((dst, class)),
+/// The two output opcodes, which write no register.
+fn nothing() -> Operands {
+    Operands {
+        dst: None,
         reads: [None; MAX_READS],
+        cols: [None; MAX_COL_OPERANDS],
+        makes_null: false,
     }
 }
 
-impl RegUse {
-    fn reading(mut self, reg: u16, class: Class) -> Self {
+fn writes(dst: u16, write: WriteAs) -> Operands {
+    Operands {
+        dst: Some((dst, write)),
+        ..nothing()
+    }
+}
+
+impl Operands {
+    /// Mark the kernel a NULL producer; see [`Operands::makes_null`].
+    fn may_null(mut self) -> Self {
+        self.makes_null = true;
+        self
+    }
+
+    fn reading(mut self, reg: u16, read: ReadAs) -> Self {
         let slot = self
             .reads
             .iter()
             .position(Option::is_none)
             .expect("an opcode reads at most MAX_READS registers");
-        self.reads[slot] = Some((reg, class));
+        self.reads[slot] = Some((reg, read));
         self
     }
 
-    fn reading_opt(self, reg: Option<u16>, class: Class) -> Self {
+    fn reading_opt(self, reg: Option<u16>, read: ReadAs) -> Self {
         match reg {
-            Some(r) => self.reading(r, class),
+            Some(r) => self.reading(r, read),
             None => self,
         }
     }
 
-    /// The two output opcodes.
-    fn nothing() -> Self {
-        RegUse {
-            dst: None,
-            reads: [None; MAX_READS],
-        }
+    fn on_col(mut self, col: u32, kind: ColKind) -> Self {
+        let slot = self
+            .cols
+            .iter()
+            .position(Option::is_none)
+            .expect("an opcode addresses at most MAX_COL_OPERANDS columns");
+        self.cols[slot] = Some((col, kind));
+        self
     }
 }
 
-fn reg_use(li: &LogicalInstr) -> RegUse {
-    use Class::{Scalar, Str};
+fn operands(li: &LogicalInstr) -> Operands {
+    use ColKind::{AnyCol, AnyPayload, Float, GermanString};
     use LogicalInstr as L;
+    use ReadAs::{Bool as RBool, OutputClass, Str as RStr, Value as RVal};
+    use WriteAs::{Bool as WBool, Str as WStr, Value as WVal};
     match *li {
-        // --- Scalar in, scalar out ---
+        // --- Two scalar registers in, one scalar value out ---
         L::IntAdd { dst, a, b }
         | L::IntSub { dst, a, b }
         | L::IntMul { dst, a, b }
-        | L::IntDiv { dst, a, b }
-        | L::IntMod { dst, a, b }
         | L::FloatAdd { dst, a, b }
         | L::FloatSub { dst, a, b }
         | L::FloatMul { dst, a, b }
-        | L::FloatDiv { dst, a, b }
-        | L::Cmp { dst, a, b, .. }
-        | L::FCmp { dst, a, b, .. }
-        | L::BoolAnd { dst, a, b }
-        | L::BoolOr { dst, a, b }
-        | L::IntMinMax2 { dst, a, b, .. }
-        | L::FloatMinMax2 { dst, a, b, .. } => writes(dst, Scalar).reading(a, Scalar).reading(b, Scalar),
-        L::IntUnary { dst, a, .. }
-        | L::IntToFloat { dst, a }
-        | L::BoolNot { dst, a }
-        | L::FloatUnary { dst, a, .. }
-        | L::FloatToF32 { dst, a }
-        | L::FloatToInt { dst, a, .. }
-        | L::IntCast { dst, a, .. } => writes(dst, Scalar).reading(a, Scalar),
-        L::Select { dst, cond, a, b } => writes(dst, Scalar)
-            .reading(cond, Scalar)
-            .reading(a, Scalar)
-            .reading(b, Scalar),
-        L::IntInSet { dst, value_reg, .. } => writes(dst, Scalar).reading(value_reg, Scalar),
-        // Column and constant loads, the null tests, and the 40-45 compares all
-        // read their operands from the batch, never from a register.
-        L::LoadColInt { dst, .. }
-        | L::LoadColFloat { dst, .. }
-        | L::LoadConst { dst, .. }
-        | L::LoadNull { dst }
-        | L::IsNull { dst, .. }
-        | L::IsNotNull { dst, .. }
-        | L::StrColConst { dst, .. }
-        | L::StrColCol { dst, .. } => writes(dst, Scalar),
-
-        // --- Crossing the classes ---
-        L::IntToStr { dst, a } | L::FloatToStr { dst, a } => writes(dst, Str).reading(a, Scalar),
-        L::StrLen { dst, a, .. } | L::StrToInt { dst, a, .. } | L::StrToFloat { dst, a } => {
-            writes(dst, Scalar).reading(a, Str)
+        | L::IntMinMax2 { dst, a, b, is_max: _ }
+        | L::FloatMinMax2 { dst, a, b, is_max: _ } => writes(dst, WVal).reading(a, RVal).reading(b, RVal),
+        // A zero divisor yields NULL.
+        L::IntDiv { dst, a, b } | L::IntMod { dst, a, b } | L::FloatDiv { dst, a, b } => {
+            writes(dst, WVal).reading(a, RVal).reading(b, RVal).may_null()
         }
-        L::StrCmp { dst, a, b, .. } => writes(dst, Scalar).reading(a, Str).reading(b, Str),
+        L::Cmp { op: _, dst, a, b } | L::FCmp { op: _, dst, a, b } => {
+            writes(dst, WBool).reading(a, RVal).reading(b, RVal)
+        }
+        L::BoolAnd { dst, a, b } | L::BoolOr { dst, a, b } => writes(dst, WBool).reading(a, RBool).reading(b, RBool),
+        L::BoolNot { dst, a } => writes(dst, WBool).reading(a, RBool),
+        L::IntUnary { op: _, dst, a } | L::FloatUnary { op: _, dst, a } | L::IntToFloat { dst, a } => {
+            writes(dst, WVal).reading(a, RVal)
+        }
+        // The three narrowing casts yield NULL on an out-of-range value.
+        L::FloatToF32 { dst, a } | L::FloatToInt { dst, a, tc: _ } | L::IntCast { dst, a, tc: _ } => {
+            writes(dst, WVal).reading(a, RVal).may_null()
+        }
+        // `cond` is a truth bit; the branches are values. `dst` is a value
+        // write, not a boolean one — see `WriteAs::Bool`.
+        L::Select { dst, cond, a, b } => writes(dst, WVal).reading(cond, RBool).reading(a, RVal).reading(b, RVal),
+        L::IntInSet {
+            dst,
+            value_reg,
+            set_idx: _,
+        } => writes(dst, WBool).reading(value_reg, RVal),
+        L::LoadConst { dst, val: _ } => writes(dst, WVal),
+        // A NULL on every row.
+        L::LoadNull { dst } => writes(dst, WVal).may_null(),
 
-        // --- String in, string out ---
-        L::StrCase { dst, a, .. } | L::StrTrim { dst, a, .. } => writes(dst, Str).reading(a, Str),
-        L::StrConcat { dst, a, b, .. } => writes(dst, Str).reading(a, Str).reading(b, Str),
+        // --- Column operands ---
+        // The integer load kernels decode only the eight fixed-width integer
+        // codes. `ColKind::FixedInt` is not payload-only, so this is the one
+        // column operand that may name a PK column.
+        L::LoadColInt { dst, col } => writes(dst, WVal).on_col(col, ColKind::FixedInt),
+        // The float load kernel branches on width alone, so a 1- or 2-byte
+        // integer column would make it slice an 8-byte stride from a narrower
+        // region.
+        L::LoadColFloat { dst, col } => writes(dst, WVal).on_col(col, Float),
+        // The null-bitmap readers decode no value, so `AnyPayload` admits U128
+        // and STRING, and their boolean is definite over a NULL row.
+        L::IsNull { dst, col } | L::IsNotNull { dst, col } => writes(dst, WBool).on_col(col, AnyPayload),
+        // The German-string compares read 16-byte cells; a narrower column
+        // would make `col_data(pi, 16)` over-read its region. The verdict is a
+        // bool, but a NULL operand makes it NULL, so the null bit flows.
+        L::StrColConst {
+            op: _,
+            dst,
+            col,
+            const_idx: _,
+        } => writes(dst, WBool).on_col(col, GermanString),
+        L::StrColCol {
+            op: _,
+            dst,
+            col_a,
+            col_b,
+        } => writes(dst, WBool)
+            .on_col(col_a, GermanString)
+            .on_col(col_b, GermanString),
+        // The string-register column load reads the same 16-byte cells the
+        // `EXPR_STR_COL_*` compares do, so it carries the same requirement.
+        L::LoadColStr { dst, col } => writes(dst, WStr).on_col(col, GermanString),
+
+        // --- String registers ---
+        L::LoadConstStr { dst, const_idx: _ } => writes(dst, WStr),
+        // A NULL on every row.
+        L::LoadNullStr { dst } => writes(dst, WStr).may_null(),
+        L::IntToStr { dst, a } | L::FloatToStr { dst, a } => writes(dst, WStr).reading(a, RVal),
+        L::StrLen { dst, a, chars: _ } => writes(dst, WVal).reading(a, RStr),
+        // Both text→number parses yield NULL on an unparsable or out-of-range
+        // value.
+        L::StrToInt { dst, a, tc: _ } | L::StrToFloat { dst, a } => writes(dst, WVal).reading(a, RStr).may_null(),
+        L::StrCmp { op: _, dst, a, b } => writes(dst, WBool).reading(a, RStr).reading(b, RStr),
+        L::StrCase { dst, a, upper: _ }
+        | L::StrTrim {
+            dst,
+            a,
+            mode: _,
+            set_idx: _,
+        } => writes(dst, WStr).reading(a, RStr),
+        // A combined length above `u32::MAX` yields NULL, which is easy to miss
+        // because CONCAT otherwise looks like a pure transform.
+        L::StrConcat {
+            dst,
+            a,
+            b,
+            skip_null: _,
+        } => writes(dst, WStr).reading(a, RStr).reading(b, RStr).may_null(),
         // A scalar condition blending two string branches.
-        L::StrSelect { dst, cond, a, b } => writes(dst, Str).reading(cond, Scalar).reading(a, Str).reading(b, Str),
-        // A string source with integer window bounds.
+        L::StrSelect { dst, cond, a, b } => writes(dst, WStr).reading(cond, RBool).reading(a, RStr).reading(b, RStr),
+        // A string source with integer window bounds. SUBSTR's only NULL is a
+        // negative length, so the no-FOR form makes none — the window itself
+        // clamps every out-of-range endpoint.
         L::StrSubstr {
             dst,
             src,
             start_reg,
             len_reg,
-        } => writes(dst, Str)
-            .reading(src, Str)
-            .reading(start_reg, Scalar)
-            .reading_opt(len_reg, Scalar),
-        L::LoadColStr { dst, .. } | L::LoadConstStr { dst, .. } | L::LoadNullStr { dst } => writes(dst, Str),
+        } => {
+            let ops = writes(dst, WStr)
+                .reading(src, RStr)
+                .reading(start_reg, RVal)
+                .reading_opt(len_reg, RVal);
+            if len_reg.is_some() {
+                ops.may_null()
+            } else {
+                ops
+            }
+        }
 
-        L::CopyCol { .. } | L::Emit { .. } => RegUse::nothing(),
+        // --- Output opcodes: no destination register ---
+        // The copy is columnar and bypasses the register file, so any source
+        // column will do and no register takes its null bit.
+        L::CopyCol { src_col, out: _ } => nothing().on_col(src_col, AnyCol),
+        L::Emit { src, out: _ } => nothing().reading(src, OutputClass),
     }
 }
 
@@ -1960,8 +2090,7 @@ impl ResolvedProgram {
     }
 }
 
-/// What [`classify_registers`] derives in its one pass over the instruction
-/// stream.
+/// What [`register_roles`] derives in its one pass over the instruction stream.
 struct RegisterRoles {
     /// Bit `r` set iff `r` is only consumed by boolean ops, so its producer can
     /// skip the i64 unpack into `regs[r]`.
@@ -1971,141 +2100,34 @@ struct RegisterRoles {
     bool_input: u64,
 }
 
-/// Classify each register's role on the nullable-arm hot path. A filter's
-/// `result_reg` is forced to be a bool input (the filter fast path reads
-/// `bool_bits` of it directly). A map has no result register to force — its only
-/// register consumer is `Emit`, which already marks its source non-bool.
+/// Classify each register's role on the nullable-arm hot path, off the one
+/// operand table.
 ///
-/// The match has no `_` arm, so a new opcode has to be classified here rather
-/// than defaulting to "reads nothing, produces nothing".
+/// A filter's `result_reg` is forced to be a bool input: the filter's nullable
+/// arm consumes the result as packed bits, so its producer must populate
+/// `bool_bits` whatever opcode it is. A map's result register needs no such
+/// force — `Emit` already marks its source non-bool — and a bare scalar's may
+/// legitimately stay `bit_only`.
 ///
 /// Every `1u64 << reg` below is in range: `LogicalProgram::new` asserts
 /// `num_regs <= MAX_REGS` and bounds every register operand by `num_regs`.
-fn classify_registers(instrs: &[Instr], result_reg: u32, is_filter: bool) -> RegisterRoles {
-    use Instr::*;
-    let mut bool_produced: u64 = 0;
-    let mut non_bool_read: u64 = 0;
-    let mut bool_input: u64 = 0;
-    // OR each register read into the mask naming how it is read.
-    macro_rules! read {
-        ($mask:ident, $($r:expr),+) => {{ $(
-            $mask |= 1u64 << $r;
-        )+ }};
-    }
-    for instr in instrs {
-        match *instr {
-            // Bool producers that are also binary register readers.
-            Cmp { dst, a, b, .. } | FCmp { dst, a, b, .. } => {
-                bool_produced |= 1u64 << dst;
-                read!(non_bool_read, a, b);
+fn register_roles(instrs: &[LogicalInstr], result_reg: u32, is_filter: bool) -> RegisterRoles {
+    let (mut bool_produced, mut non_bool_read, mut bool_input) = (0u64, 0u64, 0u64);
+    for li in instrs {
+        let ops = operands(li);
+        if let Some((dst, WriteAs::Bool)) = ops.dst {
+            bool_produced |= 1u64 << dst;
+        }
+        for &(reg, read) in ops.reads.iter().flatten() {
+            let bit = 1u64 << reg;
+            if read == ReadAs::Bool {
+                bool_input |= bit;
+            } else {
+                non_bool_read |= bit;
             }
-            // Bool producer reading one integer register (its value operand).
-            IntInSet { dst, value_reg, .. } => {
-                bool_produced |= 1u64 << dst;
-                read!(non_bool_read, value_reg);
-            }
-            // Binary register readers (non-bool-producing).
-            IntAdd { a, b, .. }
-            | IntSub { a, b, .. }
-            | IntMul { a, b, .. }
-            | IntDiv { a, b, .. }
-            | IntMod { a, b, .. }
-            | FloatAdd { a, b, .. }
-            | FloatSub { a, b, .. }
-            | FloatMul { a, b, .. }
-            | FloatDiv { a, b, .. } => {
-                read!(non_bool_read, a, b);
-            }
-            // Bool producers whose operands are payload columns, not regs.
-            StrColConst { dst, .. } | StrColCol { dst, .. } | IsNull { dst, .. } | IsNotNull { dst, .. } => {
-                bool_produced |= 1u64 << dst;
-            }
-            // Binary bool consumers: producer + bool_input (not non_bool_read).
-            BoolAnd { dst, a, b } | BoolOr { dst, a, b } => {
-                bool_produced |= 1u64 << dst;
-                read!(bool_input, a, b);
-            }
-            // Unary bool consumer.
-            BoolNot { dst, a } => {
-                bool_produced |= 1u64 << dst;
-                read!(bool_input, a);
-            }
-            // Unary register readers (non-bool).
-            IntUnary { a, .. }
-            | IntToFloat { a, .. }
-            | FloatUnary { a, .. }
-            | FloatToInt { a, .. }
-            | IntCast { a, .. }
-            | FloatToF32 { a, .. } => {
-                read!(non_bool_read, a);
-            }
-            IntMinMax2 { a, b, .. } | FloatMinMax2 { a, b, .. } => {
-                read!(non_bool_read, a, b);
-            }
-            // Ternary select: `cond` is read as a boolean (its producer must
-            // pack `bool_bits`), `a`/`b` as values. `dst` carries a value, so
-            // it is deliberately in neither set — keeping it out of
-            // `bool_produced` keeps it out of `bit_only`.
-            Select { cond, a, b, .. } => {
-                read!(bool_input, cond);
-                read!(non_bool_read, a, b);
-            }
-            Emit { src, .. } | EmitStr { src, .. } => {
-                read!(non_bool_read, src);
-            }
-            // Bool producer over two string operands. Both masks are keyed by
-            // register index alone, so the operands' class does not enter.
-            StrCmp { dst, a, b, .. } => {
-                bool_produced |= 1u64 << dst;
-                read!(non_bool_read, a, b);
-            }
-            // String producers/consumers reading their operands as values.
-            StrLen { a, .. }
-            | StrCase { a, .. }
-            | StrTrim { a, .. }
-            | IntToStr { a, .. }
-            | FloatToStr { a, .. }
-            | StrToInt { a, .. }
-            | StrToFloat { a, .. } => {
-                read!(non_bool_read, a);
-            }
-            StrConcat { a, b, .. } => {
-                read!(non_bool_read, a, b);
-            }
-            // `cond` is read as a boolean, mirroring `Select`.
-            StrSelect { cond, a, b, .. } => {
-                read!(bool_input, cond);
-                read!(non_bool_read, a, b);
-            }
-            StrSubstr {
-                src,
-                start_reg,
-                len_reg,
-                ..
-            } => {
-                read!(non_bool_read, src, start_reg);
-                if let Some(l) = len_reg {
-                    read!(non_bool_read, l);
-                }
-            }
-            // No register reads / not bool.
-            LoadPayloadInt { .. }
-            | LoadPayloadF32 { .. }
-            | LoadPk { .. }
-            | LoadConst { .. }
-            | LoadNull { .. }
-            | LoadColStr { .. }
-            | LoadConstStr { .. }
-            | LoadNullStr { .. }
-            | CopyCol { .. } => {}
         }
     }
     if is_filter {
-        // The filter's nullable arm consumes the result as packed bits
-        // (a word-level `bool_bits & !null_bits` merge), so the result
-        // producer must populate `bool_bits` whatever opcode it is —
-        // marking it a bool input routes every non-bool producer through
-        // `maybe_pack_bool_bits`.
         bool_input |= 1u64 << result_reg as usize;
     }
     RegisterRoles {
@@ -2114,102 +2136,20 @@ fn classify_registers(instrs: &[Instr], result_reg: u32, is_filter: bool) -> Reg
     }
 }
 
-/// Returns true if no instruction in `instrs` can produce a NULL result (so the
-/// evaluator can skip null-bit tracking entirely). Called once, from `resolve`,
-/// against the schema the program was resolved against — the only schema for
-/// which the answer means anything (`pi` operands come from it).
-fn is_strictly_non_nullable(instrs: &[Instr], schema: &dyn SchemaFacts) -> bool {
-    use Instr::*;
-    let nullable_payload = |pi: u8| schema.col_nullable(schema.payload_col_idx(pi as usize));
-    for instr in instrs {
-        match *instr {
-                // Division/modulo produce NULL on a zero divisor; the three
-                // narrowing casts produce NULL on an out-of-range value.
-                IntDiv { .. } | IntMod { .. } | FloatDiv { .. } => return false,
-                FloatToInt { .. } | IntCast { .. } | FloatToF32 { .. } => return false,
-                // LoadNull manufactures a NULL for every row — forces the nullable path.
-                LoadNull { .. } | LoadNullStr { .. } => return false,
-                // The two text→number parses NULL an unparsable or out-of-range
-                // value. StrConcat belongs here too, which is easy to miss
-                // because it looks like a pure transform: a combined length above
-                // u32::MAX yields NULL rather than tripping
-                // `encode_german_string`'s release assert, and on the `no_nulls`
-                // arm there is no null word to record that in.
-                StrToInt { .. } | StrToFloat { .. } | StrConcat { .. } => return false,
-                // SUBSTR's only NULL is a negative length, so the no-FOR form
-                // cannot produce one — its kernel never writes a fail flag. The
-                // window itself is total: every out-of-range endpoint clamps.
-                StrSubstr { len_reg: Some(_), .. } => return false,
-                // Column reads: null when the underlying column is nullable.
-                LoadPayloadInt { pi, .. }
-                | LoadPayloadF32 { pi, .. }
-                | StrColConst { pi, .. }
-                | LoadColStr { pi, .. }
-                    if nullable_payload(pi) =>
-                {
-                    return false
-                }
-                StrColCol { pi_a, pi_b, .. } if nullable_payload(pi_a) || nullable_payload(pi_b) => return false,
-                // Exhaustive remainder (no `_` wildcard): a future null-producing
-                // variant must be classified here, not silently treated as safe.
-                // FloatUnary/IntUnary propagate their operand's null bit; MinMax2
-                // outputs null only when both operands are, which the operand
-                // columns' own nullability already accounts for.
-                FloatUnary { .. }
-                | IntUnary { .. }
-                | IntMinMax2 { .. }
-                | FloatMinMax2 { .. }
-                | LoadPayloadInt { .. }
-                | LoadPayloadF32 { .. }
-                | StrColConst { .. }
-                | StrColCol { .. }
-                | LoadPk { .. }
-                | LoadConst { .. }
-                | IntAdd { .. }
-                | IntSub { .. }
-                | IntMul { .. }
-                | FloatAdd { .. }
-                | FloatSub { .. }
-                | FloatMul { .. }
-                | Cmp { .. }
-                | FCmp { .. }
-                // The two register-producing opcodes whose result nullability is
-                // independent of the source column's: they read the batch's null
-                // bitmap and write a definite boolean. A program that also
-                // *loads* the tested column is held on the nullable arm by that
-                // load, not by these.
-                | IsNull { .. }
-                | IsNotNull { .. }
-                // Set membership introduces no NULL beyond its input register; a
-                // nullable source column is already disqualified at its `Load`.
-                | IntInSet { .. }
-                | IntToFloat { .. }
-                // Select only copies branch values — any NULL a branch can
-                // produce is already accounted for by that branch's own producer
-                // (a nullable branch forces `no_nulls` off there), so Select adds
-                // no NULL of its own. LoadNull is handled above (returns false).
-                | Select { .. }
-                | BoolAnd { .. }
-                | BoolOr { .. }
-                | BoolNot { .. }
-                // The string transforms and measures propagate their operand's
-                // null bit and introduce none of their own.
-                | LoadColStr { .. }
-                | LoadConstStr { .. }
-                | StrSubstr { len_reg: None, .. }
-                | StrCase { .. }
-                | StrTrim { .. }
-                | StrLen { .. }
-                | StrCmp { .. }
-                | StrSelect { .. }
-                | IntToStr { .. }
-                | FloatToStr { .. }
-                | CopyCol { .. }
-                | Emit { .. }
-                | EmitStr { .. } => {}
-        }
-    }
-    true
+/// True iff no instruction can produce a NULL against `schema`, so the evaluator
+/// skips null-bit tracking entirely. Called once, from `resolve`, against the
+/// schema the program is about to be resolved against — the only schema for
+/// which the answer means anything.
+///
+/// A PK column operand never contributes: the null bitmap is payload-indexed, so
+/// the PK region carries no null bit for a load to inherit.
+fn is_strictly_non_nullable(instrs: &[LogicalInstr], schema: &dyn SchemaFacts) -> bool {
+    !instrs.iter().map(operands).any(|ops| {
+        ops.makes_null
+            || ops.cols.iter().flatten().any(|&(col, kind)| {
+                kind.carries_null_to_register() && !schema.is_pk_col(col as usize) && schema.col_nullable(col as usize)
+            })
+    })
 }
 
 #[cfg(test)]

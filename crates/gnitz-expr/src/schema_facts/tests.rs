@@ -39,15 +39,15 @@ impl SchemaFacts for OffByOnePayloadColIdx {
 
 /// Run the harness over [`TestSchema`] — the fixture every kernel test in this
 /// crate resolves its programs against, so its payload slots and OPK offsets are
-/// what decide those tests' `no_nulls` and column addresses.
+/// what decide those tests' column addresses.
 #[test]
 fn schema_facts_harness_accepts_a_faithful_impl() {
     crate::assert_schema_facts_matrix(TestSchema::new);
 }
 
 /// The harness must not be vacuous: an off-by-one `payload_col_idx` — the
-/// forwarder-reimplementation failure mode that silently flips `no_nulls` —
-/// has to fail it.
+/// forwarder-reimplementation failure mode that silently type-checks a COPY_COL
+/// or EMIT against a neighbouring output column — has to fail it.
 #[test]
 #[should_panic(expected = "payload_col_idx")]
 fn schema_facts_harness_rejects_an_off_by_one_payload_col_idx() {

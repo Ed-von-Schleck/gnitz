@@ -38,10 +38,10 @@ pub trait SchemaFacts {
     /// Caller must ensure `pi < num_payload_cols()`.
     ///
     /// Derived from [`Self::locate`] like the two above, so the two directions
-    /// cannot disagree — and this is the direction that decides `no_nulls`, so a
-    /// hand-written one that is off by one reads a neighbouring column's
-    /// nullability and silently drops null handling. Override only to answer it
-    /// in O(1) from a precomputed table.
+    /// cannot disagree — and this is the direction that names the *output*
+    /// column a COPY_COL or EMIT is type-checked against, so a hand-written one
+    /// that is off by one approves the write against a neighbouring column's
+    /// type. Override only to answer it in O(1) from a precomputed table.
     fn payload_col_idx(&self, pi: usize) -> usize {
         (0..self.num_columns())
             .filter(|&ci| !self.is_pk_col(ci))
