@@ -21,7 +21,14 @@ pub mod tls;
 /// wire" rides verbatim inside the TLS stream). The inner enum is private:
 /// construction goes through `connect`, so a `ClientTransport` is always a
 /// fully-handshaken connection, and rustls types stay out of the public API.
-pub struct ClientTransport(Inner);
+pub struct ClientTransport {
+    inner: Inner,
+    /// Frames written to this connection since it was opened. Counted here —
+    /// the one place every send funnels through — so no request path can
+    /// forget to. Read through `Session::requests_sent`, which the
+    /// round-trip-count tests assert on.
+    frames_sent: u64,
+}
 
 enum Inner {
     Unix(OwnedFd),
@@ -35,6 +42,15 @@ const fn assert_send<T: Send>() {}
 const _: () = assert_send::<ClientTransport>();
 
 impl ClientTransport {
+    fn new(inner: Inner) -> Self {
+        ClientTransport { inner, frames_sent: 0 }
+    }
+
+    /// Frames written to this connection since it was opened.
+    pub fn frames_sent(&self) -> u64 {
+        self.frames_sent
+    }
+
     /// Connect to `target`: a literal `tls://HOST:PORT[?insecure|?ca=PATH]`
     /// prefix selects TLS; anything else (including any path containing
     /// `:`) is an AF_UNIX socket path — the prefix is the sole
@@ -44,7 +60,7 @@ impl ClientTransport {
             return tls::connect_tls(rest);
         }
         let stream = std::os::unix::net::UnixStream::connect(target).map_err(ProtocolError::IoError)?;
-        Ok(ClientTransport(Inner::Unix(stream.into())))
+        Ok(ClientTransport::new(Inner::Unix(stream.into())))
     }
 
     /// Wrap an already-connected AF_UNIX stream fd, taking ownership of it
@@ -53,14 +69,14 @@ impl ClientTransport {
     pub(crate) fn from_unix_fd(fd: RawFd) -> Self {
         use std::os::fd::FromRawFd;
         // SAFETY: the caller transfers exclusive ownership of a valid fd.
-        ClientTransport(Inner::Unix(unsafe { OwnedFd::from_raw_fd(fd) }))
+        ClientTransport::new(Inner::Unix(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
     /// The underlying stream socket fd (AF_UNIX socket, or the TcpStream
     /// under `StreamOwned`). For socket-option tweaks in tests and for
     /// `waker()`; never used for framed I/O on the TLS variant.
     pub fn as_raw_fd(&self) -> RawFd {
-        match &self.0 {
+        match &self.inner {
             Inner::Unix(fd) => fd.as_raw_fd(),
             Inner::Tls(s) => s.sock.as_raw_fd(),
         }
@@ -74,7 +90,8 @@ impl ClientTransport {
     /// Send multiple buffers as a single logical frame (one length prefix
     /// over the concatenation).
     pub fn send_framed_iov(&mut self, bufs: &[&[u8]]) -> Result<(), ProtocolError> {
-        match &mut self.0 {
+        self.frames_sent += 1;
+        match &mut self.inner {
             Inner::Unix(fd) => send_framed_iov(fd.as_raw_fd(), bufs),
             Inner::Tls(s) => tls::send_framed_iov(s, bufs),
         }
@@ -85,7 +102,8 @@ impl ClientTransport {
     /// concatenation), so callers can ship pre-split message blocks without
     /// flattening.
     pub fn send_framed_batch<F: FrameSegments>(&mut self, frames: &[F]) -> Result<(), ProtocolError> {
-        match &mut self.0 {
+        self.frames_sent += frames.len() as u64;
+        match &mut self.inner {
             Inner::Unix(fd) => send_framed_batch(fd.as_raw_fd(), frames),
             Inner::Tls(s) => tls::send_framed_batch(s, frames),
         }
@@ -94,7 +112,7 @@ impl ClientTransport {
     /// Receive one length-prefixed frame, enforcing `max_payload_len` and
     /// rejecting the zero-length close sentinel.
     pub fn recv_framed(&mut self, max_payload_len: usize) -> Result<Vec<u8>, ProtocolError> {
-        match &mut self.0 {
+        match &mut self.inner {
             Inner::Unix(fd) => recv_framed(fd.as_raw_fd(), max_payload_len),
             Inner::Tls(s) => tls::recv_framed(s, max_payload_len),
         }
@@ -104,7 +122,7 @@ impl ClientTransport {
     /// connect/handshake deadline so established connections block forever
     /// on reads — the kernel `recv` is the wait, on every transport.
     fn mark_established(&mut self) -> Result<(), ProtocolError> {
-        match &self.0 {
+        match &self.inner {
             Inner::Unix(_) => Ok(()),
             Inner::Tls(s) => s.sock.set_read_timeout(None).map_err(ProtocolError::IoError),
         }

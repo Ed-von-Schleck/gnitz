@@ -317,7 +317,7 @@ impl CatalogEngine {
         cascade(self)?;
         self.dag.unregister_table(id);
         self.pending_dir_deletions.push(directory);
-        self.caches.purge_table_versions(id);
+        self.caches.purge_schema_version(id);
         Ok(())
     }
 

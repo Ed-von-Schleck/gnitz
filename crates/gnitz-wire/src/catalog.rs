@@ -157,15 +157,6 @@ pub const META_SCHEMA_COLS: &[WireSysCol] = &[
 ];
 pub const META_SCHEMA_PK: &[u32] = LEADING_COL_PK;
 
-/// The GET_INDICES reply block's column shape — like [`META_SCHEMA_COLS`], a
-/// wire schema both ends build rather than a system table. The PK carries
-/// `pack_pk_cols(&col_indices)`, unique per index circuit.
-pub const INDEX_META_COLS: &[WireSysCol] = &[
-    col("cols", TypeCode::U64, false),
-    col("is_unique", TypeCode::U64, false),
-];
-pub const INDEX_META_PK: &[u32] = LEADING_COL_PK;
-
 pub const SEQ_TAB_COLS: &[WireSysCol] = &[
     col("seq_id", TypeCode::U64, false),
     col("next_val", TypeCode::U64, false),
@@ -322,15 +313,13 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
     h
 };
 
-// The two reply blocks that are wire schemas rather than system tables.
+// The one reply block that is a wire schema rather than a system table.
 pub const METASCHEMA_COL_TYPE_CODE: usize = col_index_in(META_SCHEMA_COLS, "type_code");
 pub const METASCHEMA_COL_FLAGS: usize = col_index_in(META_SCHEMA_COLS, "flags");
 pub const METASCHEMA_COL_NAME: usize = col_index_in(META_SCHEMA_COLS, "name");
 pub const METASCHEMA_PAY_TYPE_CODE: usize = pay_index_in(META_SCHEMA_COLS, "type_code");
 pub const METASCHEMA_PAY_FLAGS: usize = pay_index_in(META_SCHEMA_COLS, "flags");
 pub const METASCHEMA_PAY_NAME: usize = pay_index_in(META_SCHEMA_COLS, "name");
-
-pub const INDEXMETA_COL_IS_UNIQUE: usize = col_index_in(INDEX_META_COLS, "is_unique");
 
 // ---------------------------------------------------------------------------
 // System table IDs

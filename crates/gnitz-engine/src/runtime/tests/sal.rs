@@ -755,7 +755,7 @@ unsafe fn assert_footprint_exact(
     writer.reset(0, 1); // epoch >= 1 for sal_begin_group's debug_assert
 
     let target_id = 16u32;
-    let block = build_schema_wire_block(schema, &[], 0, target_id);
+    let block = build_schema_wire_block(schema, target_id);
     let props = compute_wire_props(schema);
     let req_ids: Vec<u64> = (0..nw as u64).map(|i| i + 1).collect();
 

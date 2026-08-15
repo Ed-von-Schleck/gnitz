@@ -152,24 +152,20 @@ impl<'a> Binder<'a> {
         // would otherwise open (a hidden segment returns "is a view", a missing
         // name returns "not found").
         crate::validate::validate_user_name(name)?;
-        // `resolve_table_id` consults TABLE_TAB only, so a view name misses it.
-        match client.resolve_table_id(self.schema_name, name) {
-            Ok((tid, schema)) => {
-                let rc = Rc::new(schema);
-                self.cache_relation(name, tid, Rc::clone(&rc), Some(RelationKind::Table));
-                Ok((tid, rc))
-            }
-            // Miss: kind-probe (id-only, no schema assembly) to tell "is a view"
-            // (reject as read-only) from "does not exist" (propagate the
-            // original error).
-            Err(not_found) => match client.resolve_relation_kind(self.schema_name, name) {
-                Ok(Some((_, true))) => Err(GnitzSqlError::Unsupported(format!(
-                    "'{name}' is a view; INSERT, UPDATE, DELETE and CREATE INDEX \
-                     require a base table"
-                ))),
-                _ => Err(GnitzSqlError::Exec(not_found)),
-            },
+        // One resolve answers id, schema and kind together, so "is a view" and
+        // "does not exist" are distinguished without a second probe.
+        let (tid, schema, is_view) = client
+            .resolve_relation(self.schema_name, name)
+            .map_err(GnitzSqlError::Exec)?;
+        if is_view {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "'{name}' is a view; INSERT, UPDATE, DELETE and CREATE INDEX \
+                 require a base table"
+            )));
         }
+        let rc = Rc::new(schema);
+        self.cache_relation(name, tid, Rc::clone(&rc), Some(RelationKind::Table));
+        Ok((tid, rc))
     }
 
     /// Cache a CTE / derived-table alias as resolving to the given

@@ -1563,7 +1563,7 @@ mod zone_block_tests {
     fn push_zone(writer: &SalWriter, lsn: u64, targets: &[u32]) -> Vec<u64> {
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-        let block = build_schema_wire_block(&schema, &[], 0, TID);
+        let block = build_schema_wire_block(&schema, TID);
         let props = compute_wire_props(&schema);
         let req_ids: Vec<u64> = (0..NW as u64).collect();
         let mut bases = Vec::new();

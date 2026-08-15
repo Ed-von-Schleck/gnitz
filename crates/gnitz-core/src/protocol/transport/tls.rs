@@ -393,7 +393,7 @@ pub(super) fn connect_tls(rest: &str) -> Result<ClientTransport, ProtocolError> 
             .map_err(|e| decode_err(format!("tls handshake with {}:{}: {e}", target.host, target.port)))?;
     }
 
-    Ok(ClientTransport(Inner::Tls(Box::new(tls))))
+    Ok(ClientTransport::new(Inner::Tls(Box::new(tls))))
 }
 
 /// Drain `slices` (`remaining` bytes total) into rustls's plaintext sink as

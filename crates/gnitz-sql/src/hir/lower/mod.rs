@@ -48,8 +48,8 @@ pub(crate) struct SegInput {
     pub layout: Vec<ColId>,
     /// Whether `tid` names a catalog relation rather than a chain-minted segment.
     /// Every catalog probe (scan-bound index lookup, replication) is gated on it:
-    /// a segment's vid is not in `TABLE_TAB` yet, so probing it is a full catalog
-    /// scan that can only answer by fall-through.
+    /// minted segment ids start at 1 and so alias real relation ids, and probing
+    /// one would describe whichever relation happens to hold that id.
     pub from_catalog: bool,
 }
 

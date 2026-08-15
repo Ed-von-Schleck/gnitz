@@ -1,23 +1,20 @@
-use crate::connection::{MultiScanResult, ScanResult, Session, COL_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB};
+use crate::connection::{
+    MultiScanResult, RelTarget, ScanResult, Session, COL_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
+};
 use crate::error::ClientError;
-use crate::protocol::types::type_code_from_u64;
 use crate::protocol::{
     BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, WireConflictMode, ZSetBatch,
 };
-use lru::LruCache;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
 use crate::circuit::Circuit;
 use crate::types::{
     circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, idx_tab_schema,
     schema_tab_schema, table_tab_schema, view_tab_schema,
 };
 use gnitz_wire::{
-    CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, COLTAB_COL_COL_IDX, COLTAB_COL_FK_COL_IDX,
-    COLTAB_COL_FK_TABLE_ID, COLTAB_COL_IS_HIDDEN, COLTAB_COL_IS_NULLABLE, COLTAB_COL_IS_SERIAL, COLTAB_COL_NAME,
-    COLTAB_COL_OWNER_ID, COLTAB_COL_OWNER_KIND, COLTAB_COL_TYPE_CODE, IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_NAME,
+    CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_NAME,
     IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME,
     TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX, TABTAB_COL_SCHEMA_ID, VIEWTAB_COL_NAME,
     VIEWTAB_COL_PK_COL_IDX, VIEWTAB_COL_SCHEMA_ID, VIEWTAB_COL_SQL,
@@ -69,6 +66,17 @@ fn canon_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+/// The canonical `"schema.relation"` key — the engine's `entity_by_qname` key
+/// and the statement memo's. Built in one allocation, not three.
+fn qualified_name(schema_name: &str, name: &str) -> String {
+    let mut q = String::with_capacity(schema_name.len() + 1 + name.len());
+    q.push_str(schema_name);
+    q.push('.');
+    q.push_str(name);
+    q.make_ascii_lowercase();
+    q
+}
+
 /// A secondary index maps the indexed column to the PK of the index table, so
 /// the indexed column must be PK-eligible. Defer to the canonical
 /// `is_pk_eligible` allow-list (the exact set the server's `get_index_key_type`
@@ -81,33 +89,6 @@ fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
         ));
     }
     Ok(())
-}
-
-/// Unpack a persisted column-list `u64` (`TABLE_TAB.pk_col_idx`,
-/// `IDX_TAB.source_col_idx`). The shared `gnitz_wire::unpack_pk_cols` handles
-/// both the bare-scalar (pre-compound) row form and the packed compound form.
-/// Rejects a malformed count (`is_well_formed`) — an empty or
-/// over-`PK_LIST_MAX_COLS` payload the server would have rejected too;
-/// silently truncating here would hide the divergence from the client.
-fn unpack_well_formed(packed: u64) -> Result<gnitz_wire::PkColList, ClientError> {
-    let pkl = gnitz_wire::unpack_pk_cols(packed);
-    if !pkl.is_well_formed() {
-        return Err(ClientError::ServerError(format!(
-            "packed column-list count {} out of range 1..={}",
-            pkl.decoded_count(),
-            gnitz_wire::PK_LIST_MAX_COLS
-        )));
-    }
-    Ok(pkl)
-}
-
-/// Decode the persisted PK-list `u64` into a `Vec<usize>` for the `Schema` type.
-fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
-    Ok(unpack_well_formed(packed)?
-        .as_slice()
-        .iter()
-        .map(|&c| c as usize)
-        .collect())
 }
 
 fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
@@ -158,16 +139,11 @@ struct IndexRecord {
 
 // --- GnitzClient ---
 
-/// A tiny owned secondary-index descriptor. `index_id` has no consumer, so it
-/// is omitted; `cols` is the index's declared column list (the unique key — the
-/// circuit list is deduped by column list) and `is_unique` is the system's
-/// operative uniqueness truth. `PkColList` is `Copy`, so `IndexMeta` stays
-/// `Copy` (no `.cloned()` churn at its consumers).
-#[derive(Clone, Copy, Debug)]
-pub struct IndexMeta {
-    pub cols: gnitz_wire::PkColList,
-    pub is_unique: bool,
-}
+/// A secondary-index descriptor: the declared column list (the unique key — the
+/// circuit list is deduped by column list) and the system's operative
+/// uniqueness truth. This is the wire type verbatim, so a resolved descriptor's
+/// index list moves into the client instead of being re-collected.
+pub use gnitz_wire::RelIndex as IndexMeta;
 
 /// One inline `UNIQUE` constraint to fold into a `CREATE TABLE`'s atomic DDL
 /// bundle. `col_indices` are the constrained columns (a 1-element list for a
@@ -233,21 +209,38 @@ pub struct PlannedView {
     pub pk_cols: Vec<u32>,
 }
 
+/// Everything a statement needs to know about one relation. Statement-scoped:
+/// built by a resolve, dropped at `end_statement`, never carried across. That is
+/// what makes a stale name → id binding unreachable rather than merely checked —
+/// there is nothing retained to go stale, so nothing to invalidate.
+struct RelDescriptor {
+    tid: u64,
+    is_view: bool,
+    replicated: bool,
+    schema: Arc<Schema>,
+    indexes: Arc<Vec<IndexMeta>>,
+}
+
+/// What one statement has already read, dropped whole at `end_statement`.
+///
+/// `relations` holds one entry per resolved canonical `"schema.name"`, absent
+/// verdicts included, so a two-probe error ladder costs one round trip rather
+/// than two. `catalog` holds one scan batch per system table for the reads that
+/// still go through the wire (`lookup_schema_id`, the DDL `-1` payload reads);
+/// a family this statement also *writes* must bypass it, or the write's own
+/// retraction reads back as still live.
+#[derive(Default)]
+struct StatementScope {
+    relations: HashMap<String, Option<Arc<RelDescriptor>>>,
+    catalog: HashMap<u64, Option<Arc<ZSetBatch>>>,
+}
+
 pub struct GnitzClient {
     session: Session,
-    index_cache: LruCache<u64, (Arc<Vec<IndexMeta>>, u8)>,
     serial_cache: HashMap<u64, SerialRange>,
-    /// Statement-scoped catalog snapshot: while `Some`, the first read of each
-    /// system table caches its scan batch here and later reads within the same
-    /// statement reuse it (see `begin_catalog_snapshot`). `None` outside a
-    /// statement — reads scan the wire directly.
-    catalog_snapshot: Option<HashMap<u64, Option<Arc<ZSetBatch>>>>,
-    /// Table ids whose index list has already been refreshed within the current
-    /// statement snapshot — the index-list half of that snapshot, so a multi-segment
-    /// statement pays one `GET_INDICES` per table instead of one per segment.
-    /// Cleared with the snapshot, so a `CREATE INDEX` is visible to the next
-    /// statement exactly as before.
-    indices_refreshed: HashSet<u64>,
+    /// What the current statement has resolved and scanned; `None` outside a
+    /// statement, so a read issued between statements always hits the wire.
+    scope: Option<StatementScope>,
     /// Open transaction, if any. `Some` between `txn_begin` and its
     /// `txn_commit`/`txn_rollback`: **every** user-table write on this client
     /// (`push`, `push_with_mode`, `delete` — and so every SQL DML statement, C
@@ -299,13 +292,17 @@ impl GnitzClient {
         let (session, last_seen_lsn) = Session::connect(socket_path)?;
         Ok(GnitzClient {
             session,
-            index_cache: LruCache::new(SCHEMA_CACHE_CAP),
             serial_cache: HashMap::new(),
-            catalog_snapshot: None,
-            indices_refreshed: HashSet::new(),
+            scope: None,
             txn: None,
             last_seen_lsn,
         })
+    }
+
+    /// Request frames this connection has written. Exposed for the
+    /// round-trip-count assertions; see [`Session::requests_sent`].
+    pub fn requests_sent(&self) -> u64 {
+        self.session.requests_sent()
     }
 
     /// The client's current OCC basis (running max of observed watermarks).
@@ -328,38 +325,31 @@ impl GnitzClient {
         r
     }
 
-    /// Begin a statement-scoped catalog snapshot: subsequent catalog reads
-    /// (`lookup_schema_id`, `lookup_table_record`, `load_owner_schema`, the
-    /// view-branch `VIEW_TAB` scan, `table_replicated`) scan each system table
-    /// over the wire at most once and reuse it for the rest of the statement.
-    /// The SQL planner brackets each statement with begin/end; nothing else
-    /// should hold a snapshot across a catalog write.
-    pub fn begin_catalog_snapshot(&mut self) {
-        self.catalog_snapshot = Some(HashMap::new());
-        self.indices_refreshed.clear();
+    /// Open a statement scope: everything this statement resolves or scans is
+    /// remembered in it and dropped at [`Self::end_statement`], so nothing
+    /// survives a catalog write and there is no cross-statement state to
+    /// invalidate. The SQL planner brackets each statement with begin/end.
+    pub fn begin_statement(&mut self) {
+        self.scope = Some(StatementScope::default());
     }
 
-    /// End the current catalog snapshot (drop the cached batches). The next
-    /// statement begins a fresh one, so a DDL write in this statement is
-    /// visible to the next — there is no cross-statement state to invalidate.
-    pub fn end_catalog_snapshot(&mut self) {
-        self.catalog_snapshot = None;
-        self.indices_refreshed.clear();
+    /// Close the statement scope. The next statement opens a fresh one, so a DDL
+    /// write in this statement is visible to the next.
+    pub fn end_statement(&mut self) {
+        self.scope = None;
     }
 
-    /// Scan a system table, served from the statement snapshot when one is
-    /// active (caching the batch on the first read). The batch is shared via
-    /// `Arc`, so a snapshot hit is a refcount bump, never a batch copy.
+    /// Scan a system table, served from the statement scope when one is active
+    /// (caching the batch on the first read). The batch is shared via `Arc`, so
+    /// a scope hit is a refcount bump, never a batch copy.
     fn scan_catalog(&mut self, tab: u64) -> Result<Option<Arc<ZSetBatch>>, ClientError> {
-        if let Some(snap) = &self.catalog_snapshot {
-            if let Some(cached) = snap.get(&tab) {
-                return Ok(cached.clone());
-            }
+        if let Some(cached) = self.scope.as_ref().and_then(|s| s.catalog.get(&tab)) {
+            return Ok(cached.clone());
         }
         let (_, batch, _) = self.session.scan(tab)?;
         let batch = batch.map(Arc::new);
-        if let Some(snap) = &mut self.catalog_snapshot {
-            snap.insert(tab, batch.clone());
+        if let Some(s) = &mut self.scope {
+            s.catalog.insert(tab, batch.clone());
         }
         Ok(batch)
     }
@@ -518,76 +508,54 @@ impl GnitzClient {
         self.session.seek_by_index(table_id, col_indices, key_vals)
     }
 
-    /// The secondary-index descriptor for `col_idx` of `table_id`, served from a
-    /// durable, epoch-validated cache instead of an `IDX_TAB` scan. The cache
-    /// holds the projected `(cols, is_unique)` circuit list at the server's
-    /// index epoch; a GET_INDICES round-trip either confirms it (unchanged) or
-    /// replaces it. The column list is unique per row (the server dedups
-    /// circuits by list), so a plain `find` is exact.
+    /// The secondary-index descriptor for `col_idx` of `table_id`, read off the
+    /// statement's resolved descriptor. The column list is unique per entry (the
+    /// server dedups circuits by list), so a plain `find` is exact.
     ///
     /// The reported uniqueness matches the server's authoritative pre-create FK
     /// gate `validate_fk_column` exactly — both read `is_unique` off the same
-    /// `index_circuits` — so the cached client check can never accept an FK the
-    /// server would reject, nor reject one it would accept. (The old IDX_TAB
-    /// scan could diverge by reporting a phantom unique index masked by the
-    /// circuit dedup; the circuit list does not.)
+    /// `index_circuits` — so this check can never accept an FK the server would
+    /// reject, nor reject one it would accept.
     pub fn index_for_column(&mut self, table_id: u64, col_idx: usize) -> Result<Option<IndexMeta>, ClientError> {
-        let list = self.refresh_indices(table_id)?;
+        let list = self.table_indexes(table_id)?;
         // Exact single-element match: a composite index does NOT answer a
         // single-column FK/uniqueness query (a `(a, b)` index does not guarantee
         // uniqueness of `a` alone).
         Ok(list.iter().find(|m| m.cols.as_slice() == [col_idx as u32]).copied())
     }
 
-    /// The full secondary-index list for `table_id`, served from the same
-    /// durable, epoch-validated cache `index_for_column` uses (one GET_INDICES
-    /// round-trip, no extra wire traffic). Used by the SQL point-lookup planner,
-    /// which must see every index's full declared column list to plan a
-    /// leading-prefix seek.
+    /// The full secondary-index list for `table_id`. Used by the SQL
+    /// point-lookup planner, which must see every index's full declared column
+    /// list to plan a leading-prefix seek.
     pub fn table_indexes(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
-        self.refresh_indices(table_id)
+        Ok(Arc::clone(&self.descriptor_by_tid(table_id)?.indexes))
     }
 
-    /// GET_INDICES refresh-and-cache: send the cached index epoch; on an
-    /// unchanged epoch reuse the cached `Arc<Vec<IndexMeta>>`, otherwise decode
-    /// the fresh descriptor list and replace the cache entry. The PK column of
-    /// each descriptor carries `pack_pk_cols(col_list)`, decoded via the shared
-    /// `unpack_pk_cols`; a malformed decode is rejected by the same
-    /// `is_well_formed` guard `decode_pk_cols` uses (reading `pks.get(i) as u32`
-    /// would truncate the packed `u64`'s high columns and drop the
-    /// `PK_LIST_PACKED_FLAG` at bit 63).
-    fn refresh_indices(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
-        // Inside a statement snapshot, one refresh per table is authoritative: a
-        // statement cannot create or drop an index and then read it back (DDL has
-        // its own atomic commit and is rejected mid-transaction), so a second probe
-        // can only re-fetch the same epoch. Without this a CREATE VIEW pays one
-        // GET_INDICES round-trip per linear segment for the same answer. An LRU
-        // eviction between the two calls simply falls through to the wire.
-        if self.catalog_snapshot.is_some() && !self.indices_refreshed.insert(table_id) {
-            if let Some((list, _)) = self.index_cache.get(&table_id) {
-                return Ok(Arc::clone(list));
-            }
+    /// True iff relation `tid` is REPLICATED. The SQL planner consults this when
+    /// building an aggregate directly over a source: a reduce over a replicated
+    /// relation must be the shard-free `reduce_multi_local` (every worker holds
+    /// the full copy, so a sharded reduce would N-fold-multiply the aggregate —
+    /// see the replicated-tables design).
+    pub fn table_replicated(&mut self, tid: u64) -> Result<bool, ClientError> {
+        Ok(self.descriptor_by_tid(tid)?.replicated)
+    }
+
+    /// The statement's descriptor for `tid`. A tid normally comes from resolving
+    /// that same relation by name earlier in the statement, so this is a scope
+    /// hit; the by-id round trip keeps the answer correct for a caller holding a
+    /// tid from anywhere else, rather than handing it an empty index list and a
+    /// `false` placement. The statement resolves a handful of relations, so the
+    /// linear search costs less than a second map to keep in step.
+    fn descriptor_by_tid(&mut self, tid: u64) -> Result<Arc<RelDescriptor>, ClientError> {
+        let hit = self
+            .scope
+            .as_ref()
+            .and_then(|s| s.relations.values().flatten().find(|d| d.tid == tid));
+        if let Some(d) = hit {
+            return Ok(Arc::clone(d));
         }
-        let cached_epoch = self.index_cache.peek(&table_id).map(|(_, e)| *e).unwrap_or(0);
-        let (batch, epoch) = self.session.fetch_indices(table_id, cached_epoch)?;
-        if epoch == cached_epoch && cached_epoch != 0 {
-            // Unchanged: the server only sends the no-data reply with a returned
-            // epoch equal to a non-zero cached epoch, so the entry is present.
-            return Ok(self.index_cache.get(&table_id).map(|(l, _)| Arc::clone(l)).unwrap());
-        }
-        let mut fresh = Vec::new();
-        if let Some(b) = batch {
-            // None ⇒ changed-to-empty list
-            for i in b.live_rows() {
-                fresh.push(IndexMeta {
-                    cols: unpack_well_formed(b.pks.get(i) as u64)?,
-                    is_unique: col_u64(&b.columns[gnitz_wire::INDEXMETA_COL_IS_UNIQUE], i)? != 0,
-                });
-            }
-        }
-        let rc = Arc::new(fresh);
-        self.index_cache.put(table_id, (Arc::clone(&rc), epoch));
-        Ok(rc)
+        self.fetch_descriptor(RelTarget::Id(tid))?
+            .ok_or_else(|| ClientError::ServerError(format!("relation {tid} not found")))
     }
 
     /// Persist a secondary-index catalog row over an already-resolved base table.
@@ -1031,10 +999,7 @@ impl GnitzClient {
     pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> Result<(), ClientError> {
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
-        let schema_id = self.lookup_schema_id(&schema_name)?;
-        let record = self
-            .lookup_table_record(schema_id, &table_name)?
-            .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
+        let record = self.table_record(&schema_name, &table_name)?;
 
         let tbl_schema = table_tab_schema();
         let mut tb = ZSetBatch::new(tbl_schema);
@@ -1151,7 +1116,7 @@ impl GnitzClient {
         // The outgoing view's records, resolved before any id is allocated so a
         // missing view surfaces with no residue.
         let retracted: Vec<ViewRecord> = match replaces {
-            Some(old) => self.view_drop_records(&schema_name, schema_id, &canon_name(old))?,
+            Some(old) => self.view_drop_records(&schema_name, &canon_name(old))?,
             None => Vec::new(),
         };
 
@@ -1260,8 +1225,7 @@ impl GnitzClient {
     pub fn drop_view(&mut self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
         let schema_name = canon_name(schema_name);
         let view_name = canon_name(view_name);
-        let schema_id = self.lookup_schema_id(&schema_name)?;
-        let records = self.view_drop_records(&schema_name, schema_id, &view_name)?;
+        let records = self.view_drop_records(&schema_name, &view_name)?;
 
         // One VIEW_TAB batch: the user view's `-1` plus every hidden member's
         // `-1`, full payload reproduced per record.
@@ -1285,18 +1249,15 @@ impl GnitzClient {
     /// definition. Each record carries the row's full payload, which is what the
     /// engine's §3.3 CAS compares a `-1` against. DROP VIEW and the replacing
     /// half of ALTER VIEW retract exactly this set.
-    fn view_drop_records(
-        &mut self,
-        schema_name: &str,
-        schema_id: u64,
-        view_name: &str,
-    ) -> Result<Vec<ViewRecord>, ClientError> {
+    fn view_drop_records(&mut self, schema_name: &str, view_name: &str) -> Result<Vec<ViewRecord>, ClientError> {
         let not_found = || ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found"));
+        let vid = self.resolve(schema_name, view_name)?.ok_or_else(not_found)?.tid;
         let (_, view_batch, _) = self.session.scan(VIEW_TAB)?;
         let view_batch = view_batch.ok_or_else(not_found)?;
-        let vr = find_view_record(&view_batch, schema_id, view_name)?.ok_or_else(not_found)?;
+        let vr = find_view_record_by_id(&view_batch, vid)?.ok_or_else(not_found)?;
 
         let prefix = hidden_view_prefix(vr.vid);
+        let schema_id = vr.schema_id;
         let mut records = vec![vr];
         records.extend(collect_view_records_with_prefix(&view_batch, schema_id, &prefix)?);
         Ok(records)
@@ -1304,28 +1265,28 @@ impl GnitzClient {
 
     /// Rename a table or view: a `(-1, +1)` rewrite pair on TABLE_TAB / VIEW_TAB,
     /// same id, the live record's exact payload at `-1` (the engine's §3.3 CAS
-    /// requires byte-equality) with only the `name` changed at `+1`. `is_view`
-    /// selects the family. One atomic `push_ddl`; the catalog write lock quiesces
-    /// pushes for the whole zone, and a rename changes no comparator or layout, so
-    /// no tick/exchange quiesce is needed.
+    /// requires byte-equality) with only the `name` changed at `+1`. The resolved
+    /// descriptor picks the family, so the kind cannot disagree with the id.
+    /// One atomic `push_ddl`; the catalog write lock quiesces pushes for the whole
+    /// zone, and a rename changes no comparator or layout, so no tick/exchange
+    /// quiesce is needed.
     pub fn alter_rename_relation(
         &mut self,
         schema_name: &str,
-        is_view: bool,
         current_name: &str,
         new_name: &str,
     ) -> Result<(), ClientError> {
         let schema_name = canon_name(schema_name);
         let current_name = canon_name(current_name);
         let new_name = canon_name(new_name);
-        let schema_id = self.lookup_schema_id(&schema_name)?;
+        let not_found = || ClientError::ServerError(format!("Relation '{schema_name}.{current_name}' not found"));
+        // Key the family lookup on the resolved id — the family's own PK — rather
+        // than on `(schema_id, name)`, which would need a SCHEMA_TAB probe first.
+        let desc = self.resolve(&schema_name, &current_name)?.ok_or_else(not_found)?;
 
-        if is_view {
-            let view_batch = self
-                .scan_catalog(VIEW_TAB)?
-                .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{current_name}' not found")))?;
-            let vr = find_view_record(&view_batch, schema_id, &current_name)?
-                .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{current_name}' not found")))?;
+        if desc.is_view {
+            let view_batch = self.scan_catalog(VIEW_TAB)?.ok_or_else(not_found)?;
+            let vr = find_view_record_by_id(&view_batch, desc.tid)?.ok_or_else(not_found)?;
             let view_s = view_tab_schema();
             let mut vb = ZSetBatch::new(view_s);
             {
@@ -1336,9 +1297,8 @@ impl GnitzClient {
             }
             self.push_ddl(&[(VIEW_TAB, view_s, vb)])?;
         } else {
-            let record = self
-                .lookup_table_record(schema_id, &current_name)?
-                .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{current_name}' not found")))?;
+            let tbl_batch = self.scan_catalog(TABLE_TAB)?.ok_or_else(not_found)?;
+            let record = find_table_record_by_id(&tbl_batch, desc.tid)?.ok_or_else(not_found)?;
             let tbl_s = table_tab_schema();
             let mut tb = ZSetBatch::new(tbl_s);
             {
@@ -1366,34 +1326,41 @@ impl GnitzClient {
     ) -> Result<(), ClientError> {
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
-        let schema_id = self.lookup_schema_id(&schema_name)?;
-        let record = self
-            .lookup_table_record(schema_id, &table_name)?
-            .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
-        self.alter_col_pair(
-            record.tid,
-            |columns| {
-                let col_idx = columns
-                    .iter()
-                    .position(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(old_col))
-                    .ok_or_else(|| {
-                        ClientError::ServerError(format!(
-                            "column '{old_col}' not found in '{schema_name}.{table_name}'"
-                        ))
-                    })?;
-                if columns
-                    .iter()
-                    .enumerate()
-                    .any(|(i, c)| i != col_idx && !c.is_hidden && c.name.eq_ignore_ascii_case(new_col))
-                {
-                    return Err(ClientError::ServerError(format!(
-                        "column '{new_col}' already exists in '{schema_name}.{table_name}'"
-                    )));
-                }
-                Ok(col_idx)
-            },
-            |cd| cd.name = new_col.to_string(),
-        )
+        // One resolve yields the tid and the schema together. The base-table
+        // check is this gateway's own backstop for non-SQL front ends (the SQL
+        // layer rejects a view earlier, with a better error): `alter_col_pair`
+        // writes `owner_kind = OWNER_KIND_TABLE`, so against a stored view row
+        // its `-1` would fail as an opaque CAS conflict.
+        let desc = match self.resolve(&schema_name, &table_name)? {
+            Some(d) if !d.is_view => d,
+            Some(_) => {
+                return Err(ClientError::ServerError(format!(
+                    "'{table_name}' is a view; ALTER COLUMN requires a base table"
+                )))
+            }
+            None => {
+                return Err(ClientError::ServerError(format!(
+                    "Table '{schema_name}.{table_name}' not found"
+                )))
+            }
+        };
+        let columns = &desc.schema.columns;
+        let col_idx = columns
+            .iter()
+            .position(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(old_col))
+            .ok_or_else(|| {
+                ClientError::ServerError(format!("column '{old_col}' not found in '{schema_name}.{table_name}'"))
+            })?;
+        if columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| i != col_idx && !c.is_hidden && c.name.eq_ignore_ascii_case(new_col))
+        {
+            return Err(ClientError::ServerError(format!(
+                "column '{new_col}' already exists in '{schema_name}.{table_name}'"
+            )));
+        }
+        self.alter_col_pair(desc.tid, col_idx, |cd| cd.name = new_col.to_string())
     }
 
     /// `ALTER TABLE … DROP COLUMN` (logical): a `(-1, +1)` COL_TAB rewrite pair on
@@ -1403,7 +1370,7 @@ impl GnitzClient {
     /// its comparator. One atomic `push_ddl`; the engine precheck arm validates
     /// the drop shape and the dependent-view RESTRICT.
     pub fn alter_drop_column(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
-        self.alter_col_pair(tid, |cols| visible_at(cols, col_idx, tid), |cd| cd.is_hidden = true)
+        self.alter_col_pair(tid, col_idx, |cd| cd.is_hidden = true)
     }
 
     /// `ALTER TABLE … ALTER COLUMN … DROP NOT NULL`: a `(-1, +1)` COL_TAB rewrite
@@ -1412,27 +1379,32 @@ impl GnitzClient {
     /// permits a null bit there and the engine swaps the table comparator
     /// `FixedIntNonnull → Generic` (if the table was all-non-null-fixed-int).
     pub fn alter_drop_not_null(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
-        self.alter_col_pair(tid, |cols| visible_at(cols, col_idx, tid), |cd| cd.is_nullable = true)
+        self.alter_col_pair(tid, col_idx, |cd| cd.is_nullable = true)
     }
 
-    /// Build and push a COL_TAB `(-1, +1)` rewrite pair for one column of base
-    /// table `tid`: `resolve` picks the column from the live catalog entries, the
-    /// live row goes in verbatim at `-1` (stored name preserved, so the engine's
-    /// byte-equality CAS accepts it) and the same row with `flip` applied at `+1`.
-    /// The single client-side pipeline behind RENAME COLUMN, DROP COLUMN, and
-    /// DROP NOT NULL.
+    /// Build and push a COL_TAB `(-1, +1)` rewrite pair for column `col_idx` of
+    /// base table `tid`: the live row goes in verbatim at `-1` and the same row
+    /// with `flip` applied at `+1`. The single client-side pipeline behind
+    /// RENAME COLUMN, DROP COLUMN, and DROP NOT NULL.
+    ///
+    /// The `-1` must be byte-equal to the stored row or the engine's CAS rejects
+    /// the batch, which is why the columns come from this statement's own
+    /// resolve of `tid` rather than from a caller-supplied `Schema`. That is
+    /// fail-safe either way: the `-1`'s PK is `pack_col_id(tid, col_idx)`, so a
+    /// wrong payload can only be rejected, never retract a different row.
     fn alter_col_pair(
         &mut self,
         tid: u64,
-        resolve: impl FnOnce(&[ColumnDef]) -> Result<usize, ClientError>,
+        col_idx: usize,
         flip: impl FnOnce(&mut ColumnDef),
     ) -> Result<(), ClientError> {
-        let col_batch = self
-            .scan_catalog(COL_TAB)?
-            .ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
-        let columns = extract_col_entries(&col_batch, tid, OWNER_KIND_TABLE)?;
-        let col_idx = resolve(&columns)?;
-        let cd = &columns[col_idx];
+        let desc = self.descriptor_by_tid(tid)?;
+        let cd = desc
+            .schema
+            .columns
+            .get(col_idx)
+            .filter(|c| !c.is_hidden)
+            .ok_or_else(|| ClientError::ServerError(format!("column index {col_idx} not found on table {tid}")))?;
         let mut new_cd = cd.clone();
         flip(&mut new_cd);
 
@@ -1447,31 +1419,30 @@ impl GnitzClient {
         Ok(())
     }
 
+    /// Resolve `table_name` under `schema_name` to its id and schema. A view is
+    /// reported as absent — callers that need to tell the two apart use
+    /// [`Self::resolve_relation`], which returns the kind.
     pub fn resolve_table_id(&mut self, schema_name: &str, table_name: &str) -> Result<(u64, Schema), ClientError> {
-        let schema_name = canon_name(schema_name);
-        let table_name = canon_name(table_name);
-        let schema_id = self.lookup_schema_id(&schema_name)?;
-        let record = self
-            .lookup_table_record(schema_id, &table_name)?
-            .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
-        let schema = self.load_owner_schema(record.tid, OWNER_KIND_TABLE, record.pk_col_idx)?;
-        Ok((record.tid, schema))
+        let d = self.resolve(schema_name, table_name)?;
+        match d.filter(|d| !d.is_view) {
+            Some(d) => Ok((d.tid, (*d.schema).clone())),
+            None => Err(ClientError::ServerError(format!(
+                "Table '{}' not found",
+                qualified_name(schema_name, table_name)
+            ))),
+        }
     }
 
     /// Resolve `name` under `schema_name` to `(id, schema, is_view)`; the kind
-    /// comes from the same `lookup_relation` probe as the id.
+    /// comes from the same descriptor as the id, so the two can never disagree.
     pub fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema, bool), ClientError> {
-        let schema_name = canon_name(schema_name);
-        let name = canon_name(name);
-        let schema_id = self.lookup_schema_id(&schema_name)?;
-        let (id, owner_kind, pk_col_idx) = self
-            .lookup_relation(schema_id, &name)?
-            .ok_or_else(|| ClientError::ServerError(format!("Table or view '{schema_name}.{name}' not found")))?;
-        // The view PK is the persisted leading-k column list: a single synthetic
-        // hash column for join/set-op/distinct views, or the source PK passed
-        // through (0..k) for a plain projection over a compound-PK table.
-        let schema = self.load_owner_schema(id, owner_kind, pk_col_idx)?;
-        Ok((id, schema, owner_kind == OWNER_KIND_VIEW))
+        let d = self.resolve(schema_name, name)?.ok_or_else(|| {
+            ClientError::ServerError(format!(
+                "Table or view '{}' not found",
+                qualified_name(schema_name, name)
+            ))
+        })?;
+        Ok((d.tid, (*d.schema).clone(), d.is_view))
     }
 
     pub fn resolve_table_or_view_id(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema), ClientError> {
@@ -1479,43 +1450,45 @@ impl GnitzClient {
         Ok((id, schema))
     }
 
-    /// Resolve `name` under `schema_name` to `(id, is_view)` WITHOUT assembling
-    /// its column schema — the id-only kind probe. Every table-vs-view
-    /// disambiguation (the binder's writable-target check, ALTER's target
-    /// resolution) routes through here rather than re-spelling the probe order.
-    /// `Ok(None)` = no such relation; `Err` = a missing schema or a catalog
-    /// decode error, which must surface rather than be masked as a miss.
+    /// Resolve `name` under `schema_name` to `(id, is_view)` — the kind probe.
+    /// Every table-vs-view disambiguation (the binder's writable-target check,
+    /// ALTER's target resolution) routes through here rather than re-spelling
+    /// it. `Ok(None)` = no such relation; `Err` = a missing schema or a decode
+    /// error, which must surface rather than be masked as a miss.
     pub fn resolve_relation_kind(&mut self, schema_name: &str, name: &str) -> Result<Option<(u64, bool)>, ClientError> {
-        let schema_name = canon_name(schema_name);
-        let name = canon_name(name);
-        let schema_id = self.lookup_schema_id(&schema_name)?;
-        Ok(self
-            .lookup_relation(schema_id, &name)?
-            .map(|(id, owner_kind, _)| (id, owner_kind == OWNER_KIND_VIEW)))
+        Ok(self.resolve(schema_name, name)?.map(|d| (d.tid, d.is_view)))
     }
 
-    /// True iff base table `tid` is REPLICATED (decoded from `TABLE_TAB.flags`).
-    /// Scans `TABLE_TAB` and matches by PK; a `tid` that is not a base table
-    /// (e.g. a view id, absent from `TABLE_TAB`) yields `false`. The SQL planner
-    /// consults this when building an aggregate directly over a source: a reduce
-    /// over a replicated relation must be the shard-free `reduce_multi_local`
-    /// (every worker holds the full copy, so a sharded reduce would
-    /// N-fold-multiply the aggregate — see the replicated-tables design).
-    pub fn table_replicated(&mut self, tid: u64) -> Result<bool, ClientError> {
-        let tbl_batch = self.scan_catalog(TABLE_TAB)?;
-        let Some(tbl_batch) = tbl_batch else {
-            return Ok(false);
-        };
-        for i in tbl_batch.live_rows() {
-            if tbl_batch.pks.get(i) as u64 != tid {
-                continue;
-            }
-            return Ok(gnitz_wire::table_flags_replicated(col_u64(
-                &tbl_batch.columns[TABTAB_COL_FLAGS],
-                i,
-            )?));
+    // --- Relation resolution ---
+
+    /// The statement's descriptor for `schema_name.name`, or `None` when no such
+    /// relation exists. One round trip per relation per statement: the scope
+    /// holds the absent verdict too, so a two-probe error ladder does not pay
+    /// twice.
+    fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
+        let qname = qualified_name(schema_name, name);
+        if let Some(hit) = self.scope.as_ref().and_then(|s| s.relations.get(&qname)) {
+            return Ok(hit.clone());
         }
-        Ok(false)
+        let found = self.fetch_descriptor(RelTarget::Name(&qname))?;
+        if let Some(s) = &mut self.scope {
+            s.relations.insert(qname, found.clone());
+        }
+        Ok(found)
+    }
+
+    /// One RESOLVE round trip. `Ok(None)` is a relation-absent verdict.
+    fn fetch_descriptor(&mut self, target: RelTarget<'_>) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
+        let Some((tid, schema, blob)) = self.session.resolve(target)? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(RelDescriptor {
+            tid,
+            is_view: blob.is_view,
+            replicated: blob.replicated,
+            schema,
+            indexes: Arc::new(blob.indexes),
+        })))
     }
 
     // --- Private catalog-lookup helpers ---
@@ -1532,40 +1505,15 @@ impl GnitzClient {
         .ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))
     }
 
-    /// Find `table_name`'s TABLE_TAB record under `schema_id`. `Ok(None)` = the
-    /// name is absent (an empty TABLE_TAB folds into the same miss); `Err` = a
-    /// decode error on a corrupt batch, which must surface rather than be
-    /// masked as a miss.
-    fn lookup_table_record(&mut self, schema_id: u64, table_name: &str) -> Result<Option<TableRecord>, ClientError> {
-        let batch = self.scan_catalog(TABLE_TAB)?;
-        match &batch {
-            Some(b) => find_table_record(b, schema_id, table_name),
-            None => Ok(None),
-        }
-    }
-
-    /// Find `name`'s live relation record under `schema_id`:
-    /// `(id, owner_kind, pk_col_idx)`. Probes TABLE_TAB first (most common
-    /// path); a decode error there is real catalog corruption and must surface
-    /// — only a genuine miss falls through to the VIEW_TAB probe.
-    fn lookup_relation(&mut self, schema_id: u64, name: &str) -> Result<Option<(u64, u64, u64)>, ClientError> {
-        if let Some(record) = self.lookup_table_record(schema_id, name)? {
-            return Ok(Some((record.tid, OWNER_KIND_TABLE, record.pk_col_idx)));
-        }
-        let Some(view_batch) = self.scan_catalog(VIEW_TAB)? else {
-            return Ok(None);
-        };
-        Ok(find_view_record(&view_batch, schema_id, name)?.map(|r| (r.vid, OWNER_KIND_VIEW, r.pk_col_idx)))
-    }
-
-    /// Load an owner's (table's or view's) columns from COL_TAB and assemble
-    /// its validated `Schema`. Called only on a resolved owner, so miss paths
-    /// never pay the COL_TAB scan.
-    fn load_owner_schema(&mut self, owner_id: u64, owner_kind: u64, pk_col_idx: u64) -> Result<Schema, ClientError> {
-        let col_batch = self.scan_catalog(COL_TAB)?;
-        let col_batch = col_batch.ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
-        let columns = extract_col_entries(&col_batch, owner_id, owner_kind)?;
-        assemble_schema(columns, pk_col_idx)
+    /// The live TABLE_TAB record for `schema_name.table_name` (both already
+    /// canonicalized), keyed on the resolved id — the family's own PK — so no
+    /// SCHEMA_TAB probe is needed to search by `(schema_id, name)`. The full
+    /// payload is what a `-1` must reproduce byte-for-byte.
+    fn table_record(&mut self, schema_name: &str, table_name: &str) -> Result<TableRecord, ClientError> {
+        let not_found = || ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found"));
+        let tid = self.resolve(schema_name, table_name)?.ok_or_else(not_found)?.tid;
+        let batch = self.scan_catalog(TABLE_TAB)?.ok_or_else(not_found)?;
+        find_table_record_by_id(&batch, tid)?.ok_or_else(not_found)
     }
 }
 
@@ -1697,74 +1645,6 @@ impl TxnBuffer {
     }
 }
 
-/// [`GnitzClient::alter_col_pair`] resolver for the visible column at physical
-/// `col_idx` (the planner resolves only visible columns, so an out-of-range or
-/// already-hidden index is a catalog race).
-fn visible_at(columns: &[ColumnDef], col_idx: usize, tid: u64) -> Result<usize, ClientError> {
-    columns
-        .get(col_idx)
-        .filter(|c| !c.is_hidden)
-        .map(|_| col_idx)
-        .ok_or_else(|| ClientError::ServerError(format!("column index {col_idx} not found on table {tid}")))
-}
-
-fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) -> Result<Vec<ColumnDef>, ClientError> {
-    // Keyed by COL_TAB `col_idx` so the returned columns are in schema order
-    // regardless of storage/scan order.
-    let mut col_entries: Vec<(u64, ColumnDef)> = Vec::new();
-    for i in col_batch.live_rows() {
-        let row_owner_id = col_u64(&col_batch.columns[COLTAB_COL_OWNER_ID], i)?;
-        let row_owner_kind = col_u64(&col_batch.columns[COLTAB_COL_OWNER_KIND], i)?;
-        if row_owner_id != owner_id || row_owner_kind != owner_kind {
-            continue;
-        }
-
-        let col_idx = col_u64(&col_batch.columns[COLTAB_COL_COL_IDX], i)?;
-        let name = col_str(&col_batch.columns[COLTAB_COL_NAME], i)?
-            .unwrap_or("")
-            .to_string();
-        let tc_val = col_u64(&col_batch.columns[COLTAB_COL_TYPE_CODE], i)?;
-        let type_code = type_code_from_u64(tc_val).map_err(ClientError::Protocol)?;
-        col_entries.push((
-            col_idx,
-            ColumnDef {
-                name,
-                type_code,
-                is_nullable: col_u64(&col_batch.columns[COLTAB_COL_IS_NULLABLE], i)? != 0,
-                fk_table_id: col_u64(&col_batch.columns[COLTAB_COL_FK_TABLE_ID], i)?,
-                fk_col_idx: col_u64(&col_batch.columns[COLTAB_COL_FK_COL_IDX], i)?,
-                is_serial: col_u64(&col_batch.columns[COLTAB_COL_IS_SERIAL], i)? != 0,
-                is_hidden: col_u64(&col_batch.columns[COLTAB_COL_IS_HIDDEN], i)? != 0,
-            },
-        ));
-    }
-    col_entries.sort_by_key(|e| e.0);
-    // The physical `col_idx` values must be exactly `0..n`. A gap or duplicate
-    // (`[0, 2]`) would silently condense to contiguous positions, shifting every
-    // column's schema position relative to the server's physical layout — a
-    // silent type/offset corruption. Surface it as an error instead.
-    for (expected, (actual, _)) in col_entries.iter().enumerate() {
-        if *actual != expected as u64 {
-            return Err(ClientError::ServerError(format!(
-                "COL_TAB for owner {owner_id} (kind {owner_kind}): column index gap or \
-                 duplicate — expected {expected}, got {actual}"
-            )));
-        }
-    }
-    Ok(col_entries.into_iter().map(|(_, cd)| cd).collect())
-}
-
-/// Assemble and validate a `Schema` from decoded catalog parts.
-/// `Schema::from_parts` (shared with the wire schema-block decoder) checks the
-/// PK indices — bounds, duplicates, non-nullable, PK-eligible type — so a
-/// corrupt `pk_col_idx` or COL_TAB row surfaces as a clean error here rather
-/// than a `columns[ci]` panic in `pk_stride`/sort-merge downstream.
-fn assemble_schema(columns: Vec<ColumnDef>, pk_col_idx: u64) -> Result<Schema, ClientError> {
-    let pk_cols = decode_pk_cols(pk_col_idx)?;
-    Schema::from_parts(columns, pk_cols)
-        .map_err(|e| ClientError::ServerError(format!("catalog schema is invalid: {e}")))
-}
-
 /// `Ok(None)` = name absent (a legitimate miss); `Err` = a decode error on a
 /// corrupt catalog batch.
 fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientError> {
@@ -1776,22 +1656,27 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientEr
     Ok(None)
 }
 
-/// `Ok(None)` = name absent (a legitimate miss); `Err` = a decode error on a
-/// corrupt `TABLE_TAB` batch.
-fn find_table_record(batch: &ZSetBatch, schema_id: u64, table_name: &str) -> Result<Option<TableRecord>, ClientError> {
+/// Decode row `i` of a `TABLE_TAB` batch into a `TableRecord` — the single home
+/// for the TABLE_TAB column layout on the read side (`append_table_tab_row` is
+/// the write side, minus the `name` it takes separately); both finders below
+/// build on it.
+fn decode_table_record(batch: &ZSetBatch, i: usize) -> Result<TableRecord, ClientError> {
+    Ok(TableRecord {
+        tid: batch.pks.get(i) as u64,
+        schema_id: col_u64(&batch.columns[TABTAB_COL_SCHEMA_ID], i)?,
+        pk_col_idx: col_u64(&batch.columns[TABTAB_COL_PK_COL_IDX], i)?,
+        flags: col_u64(&batch.columns[TABTAB_COL_FLAGS], i)?,
+    })
+}
+
+/// The TABLE_TAB record with PK `tid`. `Ok(None)` = absent (a legitimate miss);
+/// `Err` = a decode error on a corrupt batch, which must surface rather than be
+/// masked as a miss.
+fn find_table_record_by_id(batch: &ZSetBatch, tid: u64) -> Result<Option<TableRecord>, ClientError> {
     for i in batch.live_rows() {
-        if col_u64(&batch.columns[TABTAB_COL_SCHEMA_ID], i)? != schema_id {
-            continue;
+        if batch.pks.get(i) as u64 == tid {
+            return Ok(Some(decode_table_record(batch, i)?));
         }
-        if col_str(&batch.columns[TABTAB_COL_NAME], i)? != Some(table_name) {
-            continue;
-        }
-        return Ok(Some(TableRecord {
-            tid: batch.pks.get(i) as u64,
-            schema_id,
-            pk_col_idx: col_u64(&batch.columns[TABTAB_COL_PK_COL_IDX], i)?,
-            flags: col_u64(&batch.columns[TABTAB_COL_FLAGS], i)?,
-        }));
     }
     Ok(None)
 }
@@ -1877,8 +1762,8 @@ fn append_view_row(a: &mut BatchAppender<'_>, weight: i64, rec: &ViewRecord) {
         .u64_val(rec.pk_col_idx);
 }
 
-/// Append one `TABLE_TAB` row — the write-side mirror of `find_table_record`
-/// (which reads every payload column except the `name` search key). The `name`
+/// Append one `TABLE_TAB` row — the write-side mirror of `decode_table_record`
+/// (which reads every payload column except the `name`). The `name`
 /// is passed separately so a DROP or RENAME reproduces the live payload
 /// byte-for-byte (§3.3 CAS); the create/drop/rename paths all write through here.
 fn append_table_tab_row(a: &mut BatchAppender<'_>, weight: i64, rec: &TableRecord, name: &str) {
@@ -1912,17 +1797,13 @@ fn decode_index_record(batch: &ZSetBatch, i: usize) -> Result<IndexRecord, Clien
     })
 }
 
-/// `Ok(None)` = absent (a legitimate miss); `Err` = a decode error on a corrupt
-/// `VIEW_TAB` batch.
-fn find_view_record(batch: &ZSetBatch, schema_id: u64, view_name: &str) -> Result<Option<ViewRecord>, ClientError> {
+/// The VIEW_TAB record with PK `vid` — the VIEW_TAB peer of
+/// [`find_table_record_by_id`].
+fn find_view_record_by_id(batch: &ZSetBatch, vid: u64) -> Result<Option<ViewRecord>, ClientError> {
     for i in batch.live_rows() {
-        if col_u64(&batch.columns[VIEWTAB_COL_SCHEMA_ID], i)? != schema_id {
-            continue;
+        if batch.pks.get(i) as u64 == vid {
+            return Ok(Some(decode_view_record(batch, i)?));
         }
-        if col_str(&batch.columns[VIEWTAB_COL_NAME], i)? != Some(view_name) {
-            continue;
-        }
-        return Ok(Some(decode_view_record(batch, i)?));
     }
     Ok(None)
 }
@@ -1953,9 +1834,8 @@ fn collect_view_records_with_prefix(
 /// Collect the entity names of every live row in a `TABLE_TAB`/`VIEW_TAB` batch
 /// whose `schema_id` column matches. One code path over both families, which the
 /// static assert beside their column constants licenses: the two agree on where
-/// `schema_id` and the entity name sit. Mirrors `find_table_record` /
-/// `find_view_record`'s scan minus the name filter — keeping the whole set rather
-/// than one row. Drives the `drop_schema` member cascade.
+/// `schema_id` and the entity name sit. Keeps the whole matching set rather than
+/// one row. Drives the `drop_schema` member cascade.
 fn collect_schema_member_names(batch: &ZSetBatch, schema_id: u64) -> Result<Vec<String>, ClientError> {
     let mut out = Vec::new();
     for i in batch.live_rows() {
@@ -2189,37 +2069,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_pk_cols_bare_single() {
-        let v = decode_pk_cols(3).unwrap();
-        assert_eq!(v, vec![3]);
-    }
-
-    #[test]
-    fn decode_pk_cols_packed_compound() {
-        let packed = gnitz_wire::pack_pk_cols(&[2, 5, 7, 1]);
-        let v = decode_pk_cols(packed).unwrap();
-        assert_eq!(v, vec![2, 5, 7, 1]);
-    }
-
-    #[test]
-    fn decode_pk_cols_rejects_overflow_count() {
-        // Craft a count one past the cap (still inside the 4-bit count field;
-        // the layout guard keeps PK_LIST_MAX_COLS ≤ 8). `as_slice()` clamps to
-        // PK_LIST_MAX_COLS, so the decoded_count/len divergence always fires and
-        // the client must surface it as an error instead of silently truncating.
-        let bad_count = gnitz_wire::PK_LIST_MAX_COLS + 1;
-        let bad = gnitz_wire::PK_LIST_PACKED_FLAG | bad_count as u64;
-        let err = decode_pk_cols(bad).expect_err(&format!("expected error on count={bad_count}"));
-        match err {
-            ClientError::ServerError(s) => assert!(
-                s.contains(&bad_count.to_string()),
-                "expected '{bad_count}' in message, got: {s}"
-            ),
-            other => panic!("expected ServerError, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn find_table_record_surfaces_decode_error_not_miss() {
         let schema = table_tab_schema();
         let mut batch = ZSetBatch::new(schema);
@@ -2237,17 +2086,15 @@ mod tests {
             panic!("expected Fixed column");
         };
         bytes.clear();
-        match find_table_record(&batch, 1, "t") {
+        match find_table_record_by_id(&batch, 7) {
             Err(ClientError::ServerError(s)) => assert!(s.contains("out of bounds"), "got: {s}"),
             _ => panic!("expected decode ServerError, got a non-error result"),
         }
     }
 
-    /// Round-trips `append_table_tab_row` back through `find_table_record`, so
-    /// transposing two slots in either one fails here. Every field holds a
+    /// Round-trips `append_table_tab_row` back through `find_table_record_by_id`,
+    /// so transposing two slots in either one fails here. Every field holds a
     /// different value, which a fixture writing `0` everywhere would not catch.
-    /// `schema_id` is not asserted: `find_table_record` echoes the search
-    /// argument into the record rather than decoding the column.
     #[test]
     fn table_record_round_trips_through_append_and_find() {
         let schema = table_tab_schema();
@@ -2260,11 +2107,11 @@ mod tests {
         let mut batch = ZSetBatch::new(schema);
         append_table_tab_row(&mut BatchAppender::new(&mut batch, schema), 1, &rec, "t");
 
-        assert!(find_table_record(&batch, 3, "absent").unwrap().is_none());
-        assert!(find_table_record(&batch, 4, "t").unwrap().is_none(), "wrong schema_id");
+        assert!(find_table_record_by_id(&batch, 8).unwrap().is_none());
 
-        let back = find_table_record(&batch, 3, "t").unwrap().expect("row present");
+        let back = find_table_record_by_id(&batch, 7).unwrap().expect("row present");
         assert_eq!(back.tid, rec.tid);
+        assert_eq!(back.schema_id, rec.schema_id);
         assert_eq!(back.pk_col_idx, rec.pk_col_idx);
         assert_eq!(back.flags, rec.flags);
     }
@@ -2299,67 +2146,5 @@ mod tests {
         BatchAppender::new(&mut batch, schema).add_row(3, 1).str_val("foo");
         assert_eq!(find_schema_id(&batch, "foo").unwrap(), Some(3));
         assert!(find_schema_id(&batch, "bar").unwrap().is_none());
-    }
-
-    #[test]
-    fn assemble_schema_rejects_out_of_range_pk() {
-        let cols = vec![
-            ColumnDef::new("a", TypeCode::U64, false),
-            ColumnDef::new("b", TypeCode::U64, false),
-        ];
-        // pk_col_idx 5 decodes to the single-column PK `[5]`, out of range for a
-        // 2-column table — must surface here, not panic downstream.
-        match assemble_schema(cols.clone(), 5).expect_err("expected invalid schema") {
-            ClientError::ServerError(s) => assert!(s.contains("catalog schema is invalid"), "got: {s}"),
-            other => panic!("expected ServerError, got {other:?}"),
-        }
-        // A valid `(columns, pk_col_idx)` returns the Schema.
-        let assembled = assemble_schema(cols, 0).unwrap();
-        assert_eq!(assembled.pk_cols, vec![0]);
-        assert_eq!(assembled.columns.len(), 2);
-    }
-
-    fn push_col_row(a: &mut BatchAppender<'_>, owner_id: u64, col_idx: u64, name: &str) {
-        a.add_row(pack_col_id(owner_id, col_idx as usize).unwrap() as u128, 1)
-            .u64_val(owner_id) // owner_id
-            .u64_val(OWNER_KIND_TABLE) // owner_kind
-            .u64_val(col_idx) // col_idx
-            .str_val(name) // name
-            .u64_val(TypeCode::U64 as u64) // type_code
-            .u64_val(0) // is_nullable
-            .u64_val(0) // fk_table_id
-            .u64_val(0) // fk_col_idx
-            .u64_val(0) // is_serial
-            .u64_val(0); // is_hidden
-    }
-
-    #[test]
-    fn extract_col_entries_rejects_index_gap() {
-        let schema = col_tab_schema();
-        let mut batch = ZSetBatch::new(schema);
-        {
-            let mut a = BatchAppender::new(&mut batch, schema);
-            push_col_row(&mut a, 1, 0, "a");
-            push_col_row(&mut a, 1, 2, "c"); // gap: col_idx 1 is missing
-        }
-        match extract_col_entries(&batch, 1, OWNER_KIND_TABLE).expect_err("expected gap error") {
-            ClientError::ServerError(s) => assert!(s.contains("column index gap or duplicate"), "got: {s}"),
-            other => panic!("expected ServerError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn extract_col_entries_contiguous_ok() {
-        let schema = col_tab_schema();
-        let mut batch = ZSetBatch::new(schema);
-        {
-            let mut a = BatchAppender::new(&mut batch, schema);
-            push_col_row(&mut a, 1, 1, "b"); // out of storage order
-            push_col_row(&mut a, 1, 0, "a");
-        }
-        let cols = extract_col_entries(&batch, 1, OWNER_KIND_TABLE).unwrap();
-        assert_eq!(cols.len(), 2);
-        assert_eq!(cols[0].name, "a");
-        assert_eq!(cols[1].name, "b");
     }
 }

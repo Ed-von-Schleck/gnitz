@@ -18,14 +18,7 @@ fn test_fk_lock_set() {
     // returned sorted ascending so both use the same acquisition order.
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "fk".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("fk", type_code::U64, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
     let mut expected = vec![parent_tid, child_tid];
@@ -44,14 +37,7 @@ fn test_fk_lock_set() {
     // Second child: parent's neighborhood grows; each child only sees itself + parent.
     let child2_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "fk".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("fk", type_code::U64, parent_tid, 0),
     ];
     let child2_tid = engine.create_table("public.child2", &child2_cols, &[0]).unwrap();
     let mut expected3 = vec![parent_tid, child_tid, child2_tid];
@@ -84,14 +70,7 @@ fn test_fk_referential_integrity() {
     // Child table with FK
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "pid_fk".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("pid_fk", type_code::U64, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.children", &child_cols, &[0]).unwrap();
 
@@ -138,12 +117,8 @@ fn test_fk_nullability_and_retractions() {
     let child_cols = vec![
         col_def("id", type_code::U64),
         ColumnDef {
-            name: "pid_fk".into(),
-            type_code: type_code::U64,
             is_nullable: true,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
+            ..fk_def("pid_fk", type_code::U64, parent_tid, 0)
         },
     ];
     let child_tid = engine.create_table("public.c", &child_cols, &[0]).unwrap();
@@ -181,14 +156,7 @@ fn test_fk_drop_protections() {
         .unwrap();
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "pid_fk".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("pid_fk", type_code::U64, parent_tid, 0),
     ];
     engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
@@ -225,14 +193,7 @@ fn test_fk_invalid_targets() {
     // FK targeting non-PK column (col_idx=1) should fail
     let bad_cols = vec![
         col_def("pk", type_code::U64),
-        ColumnDef {
-            name: "fk".into(),
-            type_code: type_code::I64,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 1,
-            is_hidden: false,
-        },
+        fk_def("fk", type_code::I64, parent_tid, 1),
     ];
     assert!(engine.create_table("public.c_bad", &bad_cols, &[0]).is_err());
 
@@ -252,12 +213,8 @@ fn test_fk_self_reference() {
     let emp_cols = vec![
         col_def("emp_id", type_code::U64),
         ColumnDef {
-            name: "mgr_id".into(),
-            type_code: type_code::U64,
             is_nullable: true,
-            fk_table_id: next_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
+            ..fk_def("mgr_id", type_code::U64, next_tid, 0)
         },
     ];
     let emp_tid = engine.create_table("public.employees", &emp_cols, &[0]).unwrap();
@@ -338,14 +295,7 @@ fn test_push_reads_committed_state() {
         .unwrap();
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "fk".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("fk", type_code::U64, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.c", &child_cols, &[0]).unwrap();
     assert!(engine.push_reads_committed_state(child_tid, Update));
@@ -359,12 +309,8 @@ fn test_push_reads_committed_state() {
     let tree_cols = vec![
         col_def("id", type_code::U64),
         ColumnDef {
-            name: "parent_id".into(),
-            type_code: type_code::U64,
             is_nullable: true,
-            fk_table_id: next_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
+            ..fk_def("parent_id", type_code::U64, next_tid, 0)
         },
     ];
     let tree_tid = engine.create_table("public.tree", &tree_cols, &[0]).unwrap();
@@ -390,14 +336,7 @@ fn test_fk_parent_map_cleanup() {
         .unwrap();
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "fk".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("fk", type_code::U64, parent_tid, 0),
     ];
     engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
@@ -432,14 +371,7 @@ fn test_fk_multiple_children_same_parent() {
     let mk_child = |engine: &mut CatalogEngine, name: &str| -> i64 {
         let cols = vec![
             col_def("cid", type_code::U64),
-            ColumnDef {
-                name: "fk".into(),
-                type_code: type_code::U64,
-                is_nullable: false,
-                fk_table_id: parent_tid,
-                fk_col_idx: 0,
-                is_hidden: false,
-            },
+            fk_def("fk", type_code::U64, parent_tid, 0),
         ];
         engine.create_table(name, &cols, &[0]).unwrap()
     };
@@ -481,14 +413,7 @@ fn test_fk_u128() {
     // U128 FK child
     let child_cols = vec![
         col_def("id", type_code::U64),
-        ColumnDef {
-            name: "ufk".into(),
-            type_code: type_code::U128,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("ufk", type_code::U128, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.uchildren", &child_cols, &[0]).unwrap();
 
@@ -535,14 +460,7 @@ fn test_fk_auto_index_skips_non_leading_pk_column() {
     let parent_tid = engine
         .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
         .unwrap();
-    let fk_col = |name: &str| ColumnDef {
-        name: name.into(),
-        type_code: type_code::U64,
-        is_nullable: false,
-        fk_table_id: parent_tid,
-        fk_col_idx: 0,
-        is_hidden: false,
-    };
+    let fk_col = |name: &str| fk_def(name, type_code::U64, parent_tid, 0);
 
     // PK = (a, pid_fk): the FK is PK column 1, not 0. `plain_fk` is not a PK column.
     let child_cols = vec![col_def("a", type_code::U64), fk_col("pid_fk"), fk_col("plain_fk")];
@@ -583,14 +501,7 @@ fn test_fk_inline_child_pk_column_is_fk() {
         .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
         .unwrap();
 
-    let child_cols = vec![ColumnDef {
-        name: "pid_fk".into(),
-        type_code: type_code::U64,
-        is_nullable: false,
-        fk_table_id: parent_tid,
-        fk_col_idx: 0,
-        is_hidden: false,
-    }];
+    let child_cols = vec![fk_def("pid_fk", type_code::U64, parent_tid, 0)];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Insert a parent row with pid = 10.

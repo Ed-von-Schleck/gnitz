@@ -2,9 +2,9 @@
 
 use std::rc::Rc;
 
+use crate::catalog::ColumnDef;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch, MAX_WIRE_REGIONS};
-use gnitz_wire::control::german_spill_len;
 use gnitz_wire::encode_german_string;
 
 // ---------------------------------------------------------------------------
@@ -27,10 +27,9 @@ pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
 /// so the client's loop termination — "stop on no FLAG_CONTINUATION" — still works).
 pub(crate) use gnitz_wire::FLAG_SCAN_LAST;
 pub use gnitz_wire::{
-    wire_flags_get_conflict_mode, wire_flags_get_index_version, wire_flags_get_schema_version,
-    wire_flags_set_index_version, wire_flags_set_schema_version, WireConflictMode, FLAG_BATCH_CONSOLIDATED,
-    FLAG_BATCH_SORTED, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_GET_INDICES, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
-    STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    wire_flags_get_conflict_mode, wire_flags_get_schema_version, wire_flags_set_schema_version, WireConflictMode,
+    FLAG_BATCH_CONSOLIDATED, FLAG_BATCH_SORTED, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
+    FLAG_RESOLVE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 
 /// Map a batch's layout claim to its wire flag bits. Encode normalizes
@@ -89,34 +88,30 @@ pub(crate) const META_SCHEMA_DESC: SchemaDescriptor =
 // Schema ↔ batch conversion
 // ---------------------------------------------------------------------------
 
-/// Encode a schema descriptor + column names into a standalone WAL wire block.
+/// Encode a schema descriptor into a standalone WAL wire block carrying only
+/// the physical column shape — no names, no catalog flags. This is what SAL
+/// entries and one-off reply blocks ship: nothing engine-side reads a name, and
+/// the client decodes such a block against a schema it already holds.
 ///
 /// The returned bytes are a self-contained schema block identical to what
 /// `encode_wire_into` would embed. Callers cache this per table and pass it
 /// as `prebuilt_schema_block` to `wire_size` / `encode_wire_into` to skip the
 /// `Batch` allocation on every SEEK/SCAN response.
-pub fn build_schema_wire_block(
-    schema: &SchemaDescriptor,
-    col_names: &[&[u8]],
-    hidden_mask: u128,
-    target_tid: u32,
-) -> Vec<u8> {
-    let schema_batch = schema_to_batch(schema, col_names, hidden_mask);
-    let sz = schema_batch.wire_byte_size();
-    let mut block = vec![0u8; sz];
-    schema_batch.encode_to_wire(target_tid, &mut block, 0, true);
-    block
+pub fn build_schema_wire_block(schema: &SchemaDescriptor, target_tid: u32) -> Vec<u8> {
+    encode_schema_block(&schema_to_batch(schema, None), target_tid)
 }
 
-/// Convert a slice of column names to a stack-allocated `[&[u8]; MAX_COLUMNS]`,
-/// capped at MAX_COLUMNS. Returns the filled array and the fill count.
-pub(crate) fn col_names_as_refs<S: AsRef<[u8]>>(names: &[S]) -> ([&[u8]; crate::schema::MAX_COLUMNS], usize) {
-    let mut refs = [&[][..]; crate::schema::MAX_COLUMNS];
-    let n = names.len().min(crate::schema::MAX_COLUMNS);
-    for (i, name) in names.iter().take(n).enumerate() {
-        refs[i] = name.as_ref();
-    }
-    (refs, n)
+/// [`build_schema_wire_block`] plus the per-column catalog facts the descriptor
+/// does not carry — name, `is_hidden`, `is_serial`. The block a *client* decodes
+/// into a `Schema`, so it is the one that must be named.
+pub(crate) fn build_named_schema_wire_block(schema: &SchemaDescriptor, defs: &[ColumnDef], target_tid: u32) -> Vec<u8> {
+    encode_schema_block(&schema_to_batch(schema, Some(defs)), target_tid)
+}
+
+fn encode_schema_block(schema_batch: &Batch, target_tid: u32) -> Vec<u8> {
+    let mut block = vec![0u8; schema_batch.wire_byte_size()];
+    schema_batch.encode_to_wire(target_tid, &mut block, 0, true);
+    block
 }
 
 /// Get-or-build the cached schema wire block for `tid`, returning the full
@@ -134,14 +129,18 @@ pub(crate) fn get_or_build_schema_wire_block(
     if let Some(cached) = cat.get_cached_schema_wire_block(tid) {
         return cached;
     }
+    // `defs` is empty exactly when `tid` names no relation: the caller then
+    // passes `SchemaDescriptor::minimal_u64` as a placeholder, and a placeholder
+    // has no names or flags to carry. A relation that does exist has one COL_TAB
+    // row per physical column, which is what makes `defs[ci]` describe
+    // `schema.columns[ci]` — callers with a *projected* schema build a one-off
+    // anonymous block instead of coming here.
     let defs = cat.read_column_defs(tid);
-    let hidden = defs
-        .iter()
-        .enumerate()
-        .fold(0u128, |m, (i, cd)| m | ((cd.is_hidden as u128) << i));
-    let names: Vec<&str> = defs.iter().map(|cd| cd.name.as_str()).collect();
-    let (name_refs, n) = col_names_as_refs(&names);
-    let block = Rc::new(build_schema_wire_block(schema, &name_refs[..n], hidden, tid as u32));
+    let block = Rc::new(if defs.is_empty() {
+        build_schema_wire_block(schema, tid as u32)
+    } else {
+        build_named_schema_wire_block(schema, &defs, tid as u32)
+    });
     let (wire_safe, wire_row_fixed_stride) = crate::storage::compute_wire_props(schema);
     let entry = crate::catalog::SchemaWireEntry {
         block,
@@ -153,14 +152,16 @@ pub(crate) fn get_or_build_schema_wire_block(
     entry
 }
 
-/// `hidden_mask`: bit N set ⇔ column N is a hidden key slot (COL_TAB
-/// `is_hidden`), echoed as `META_FLAG_HIDDEN` so clients can suppress the
-/// column in presentation. Engine-internal blocks (SAL entries, nameless
-/// one-offs) pass 0 — nothing engine-side reads the flag.
-pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]], hidden_mask: u128) -> Batch {
+/// One row per column: the physical shape from `schema`, and the per-column
+/// catalog facts (name, `META_FLAG_HIDDEN`, `META_FLAG_SERIAL`) from `defs`.
+///
+/// `defs` is all-or-nothing, not per-column: a relation either has one COL_TAB
+/// row per physical column — so `defs[ci]` describes `schema.columns[ci]` — or
+/// it has none, and every name comes out empty with every catalog flag clear.
+pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, defs: Option<&[ColumnDef]>) -> Batch {
     let ncols = schema.num_columns();
-    let meta = META_SCHEMA_DESC;
-    let mut batch = Batch::with_capacity(meta, ncols);
+    debug_assert!(defs.is_none_or(|d| d.len() == ncols));
+    let mut batch = Batch::with_capacity(META_SCHEMA_DESC, ncols);
 
     for ci in 0..ncols {
         let col = &schema.columns[ci];
@@ -173,16 +174,22 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]], hi
             .iter()
             .position(|&p| p as usize == ci)
             .map(|p| p as u8);
-        let flags = gnitz_wire::pack_col_meta_flags(col.nullable != 0, hidden_mask & (1 << ci) != 0, pk_pos);
-
-        let type_code_val = col.type_code as u64;
-        let name = if ci < col_names.len() { col_names[ci] } else { b"" };
-        let name_st = encode_german_string(name, &mut batch.blob);
+        let def = defs.map(|d| &d[ci]);
+        let flags = gnitz_wire::pack_col_meta_flags(
+            col.nullable != 0,
+            def.is_some_and(|d| d.is_hidden),
+            def.is_some_and(|d| d.is_serial),
+            pk_pos,
+        );
+        let name_st = encode_german_string(def.map_or(&b""[..], |d| d.name.as_bytes()), &mut batch.blob);
 
         batch.extend_pk(ci as u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
-        batch.extend_col(gnitz_wire::METASCHEMA_PAY_TYPE_CODE, &type_code_val.to_le_bytes());
+        batch.extend_col(
+            gnitz_wire::METASCHEMA_PAY_TYPE_CODE,
+            &(col.type_code as u64).to_le_bytes(),
+        );
         batch.extend_col(gnitz_wire::METASCHEMA_PAY_FLAGS, &flags.to_le_bytes());
         batch.extend_col(gnitz_wire::METASCHEMA_PAY_NAME, &name_st);
         batch.count += 1;
@@ -281,26 +288,18 @@ pub(crate) fn encode_ctrl_block_direct(
     n
 }
 
-/// Encoded size of the schema wire block for `schema` + `col_names`, or the
-/// prebuilt block's length when one is supplied. Shared by `wire_size` and
-/// `wire_size_range` so the two size paths cannot drift.
-fn schema_block_wire_size(
-    schema: Option<&SchemaDescriptor>,
-    col_names: Option<&[&[u8]]>,
-    prebuilt_schema_block: Option<&[u8]>,
-) -> usize {
+/// Encoded size of the schema wire block for `schema`, or the prebuilt block's
+/// length when one is supplied. Shared by `wire_size` and `wire_size_range` so
+/// the two size paths cannot drift.
+///
+/// The no-prebuilt arm allows no blob bytes: a [`WireMsg`] encodes its block
+/// through [`schema_to_batch`] with no defs, so every name is empty and spills nothing.
+/// A named block always arrives prebuilt.
+fn schema_block_wire_size(schema: Option<&SchemaDescriptor>, prebuilt_schema_block: Option<&[u8]>) -> usize {
     if let Some(prebuilt) = prebuilt_schema_block {
         return prebuilt.len();
     }
-    let s = schema.unwrap();
-    let ncols = s.num_columns();
-    let schema_blob: usize = col_names
-        .unwrap_or(&[])
-        .iter()
-        .take(ncols)
-        .map(|n| german_spill_len(n.len()))
-        .sum();
-    crate::storage::wire_block_size(&META_SCHEMA_DESC, ncols, schema_blob)
+    crate::storage::wire_block_size(&META_SCHEMA_DESC, schema.unwrap().num_columns(), 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +369,6 @@ pub struct WireMsg<'a> {
     pub status: u32,
     pub error_msg: &'a [u8],
     pub schema: Option<&'a SchemaDescriptor>,
-    pub col_names: Option<&'a [&'a [u8]]>,
     pub data: WireData<'a>,
     /// When `Some`, these bytes *are* the schema block: they are copied in
     /// verbatim instead of encoding `schema`, and their length sizes the block.
@@ -392,7 +390,7 @@ impl<'a> WireMsg<'a> {
     pub fn size(&self) -> usize {
         let mut total = gnitz_wire::control::ctrl_block_size(self.error_msg.len(), self.seek_pk_extra.len());
         if self.has_schema() {
-            total += schema_block_wire_size(self.schema, self.col_names, self.prebuilt_schema_block);
+            total += schema_block_wire_size(self.schema, self.prebuilt_schema_block);
         }
         if self.has_data() {
             total += self.data.wire_byte_size();
@@ -459,7 +457,7 @@ impl<'a> WireMsg<'a> {
                 out[pos..end].copy_from_slice(prebuilt);
                 pos = end;
             } else {
-                let schema_batch = schema_to_batch(self.schema.unwrap(), self.col_names.unwrap_or(&[]), 0);
+                let schema_batch = schema_to_batch(self.schema.unwrap(), None);
                 pos += schema_batch.encode_to_wire(self.target_id as u32, out, pos, checksum);
             }
         }
@@ -985,7 +983,7 @@ mod tests {
     use crate::schema::MAX_PK_COLUMNS;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Layout;
-    use crate::test_support::arb_type_code;
+    use crate::test_support::{arb_type_code, named_col_defs};
     use gnitz_wire::is_pk_eligible;
     use proptest::collection::vec;
     use proptest::prelude::*;
@@ -1262,11 +1260,8 @@ mod tests {
         #[test]
         fn schema_roundtrip_engine_codec(original in arb_schema(MAX_PK_COLUMNS)) {
             let original = &original;
-            let names: Vec<Vec<u8>> = (0..original.num_columns())
-                .map(|i| format!("c{i}").into_bytes())
-                .collect();
-            let (refs, n) = col_names_as_refs(&names);
-            let wire = build_schema_wire_block(original, &refs[..n], 0, 0);
+            let names: Vec<String> = (0..original.num_columns()).map(|i| format!("c{i}")).collect();
+            let wire = build_named_schema_wire_block(original, &named_col_defs(&names), 0);
             let decoded = decode_schema_block(&wire, true)
                 .expect("decode must succeed for any valid schema");
             assert_descriptor_eq(original, &decoded)?;
@@ -1300,11 +1295,8 @@ mod tests {
             use gnitz_core::protocol::wal_block::decode_wal_block_verified;
 
             let original = &original;
-            let names: Vec<Vec<u8>> = (0..original.num_columns())
-                .map(|i| format!("c{i}").into_bytes())
-                .collect();
-            let (refs, n) = col_names_as_refs(&names);
-            let wire = build_schema_wire_block(original, &refs[..n], 0, 0);
+            let names: Vec<String> = (0..original.num_columns()).map(|i| format!("c{i}")).collect();
+            let wire = build_named_schema_wire_block(original, &named_col_defs(&names), 0);
 
             let ms = meta_schema();
             let (decoded_batch, _) =
@@ -1345,7 +1337,7 @@ mod tests {
         // mirroring how the nullable-PK test patches the flags region.
         let cols = [SchemaColumn::new(type_code::U64, 0)];
         let sd = SchemaDescriptor::new(&cols, &[0]);
-        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
+        let mut wire = build_named_schema_wire_block(&sd, &named_col_defs(&["c0"]), 0);
         let (tc_off, _) = gnitz_wire::wal::dir_entry(&wire, 3);
         wire[tc_off..tc_off + 8].copy_from_slice(&(type_code::F64 as u64).to_le_bytes());
         // verify_checksum=false: the type_code region is inside the checksummed body.
@@ -1364,7 +1356,7 @@ mod tests {
     fn decode_schema_block_rejects_nullable_pk() {
         let cols = [SchemaColumn::new(type_code::U64, 0)];
         let sd = SchemaDescriptor::new(&cols, &[0]);
-        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
+        let mut wire = build_named_schema_wire_block(&sd, &named_col_defs(&["c0"]), 0);
         // Region 4 is the flags column; OR in NULLABLE on the PK (col 0).
         let (fl_off, _) = gnitz_wire::wal::dir_entry(&wire, 4);
         let f = gnitz_wire::read_u64_le(&wire, fl_off) | gnitz_wire::META_FLAG_NULLABLE;
@@ -1383,7 +1375,7 @@ mod tests {
     fn decode_schema_block_rejects_directory_overflow() {
         let cols = [SchemaColumn::new(type_code::U64, 0)];
         let sd = SchemaDescriptor::new(&cols, &[0]);
-        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
+        let mut wire = build_named_schema_wire_block(&sd, &named_col_defs(&["c0"]), 0);
         // num_regions lives in the header (outside the checksummed body), so a
         // huge value still passes the checksum and trips the directory guard.
         wire[gnitz_wire::WAL_OFF_NUM_REGIONS..gnitz_wire::WAL_OFF_NUM_REGIONS + 4]
@@ -1418,11 +1410,9 @@ mod tests {
         batch.count += 1;
         batch.certify_layout(Layout::Consolidated, &schema);
 
-        let col_names = [b"pk".as_slice(), b"v".as_slice()];
         let wire = WireMsg {
             target_id: 7,
             schema: Some(&schema),
-            col_names: Some(&col_names),
             data: WireData::Whole(Some(&batch)),
             ..Default::default()
         }

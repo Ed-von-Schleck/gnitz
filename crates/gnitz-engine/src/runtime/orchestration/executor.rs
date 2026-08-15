@@ -45,10 +45,10 @@ use crate::runtime::reactor::{
 };
 use crate::runtime::sal::{BACKFILL_DECISION_CONTINUE, FLAG_SCAN_SPEC};
 use crate::runtime::wire::{
-    self as ipc, SchemaWithVersion, FLAG_GET_INDICES, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
+    self as ipc, SchemaWithVersion, FLAG_RESOLVE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
 use crate::schema::{validate_schema_match, SchemaDescriptor};
-use crate::storage::{Batch, BatchBuilder};
+use crate::storage::Batch;
 
 pub(crate) const TICK_COALESCE_ROWS: usize = 10_000;
 const TICK_DEADLINE_MS: u64 = 20;
@@ -1103,7 +1103,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         let seq_id = target_id; // = table_id
         let count = decoded.control.seek_col_idx.max(1) as i64;
         match commit_serial_range_durable(shared, seq_id, count).await {
-            Ok(base) => send_alloc(peer, base, client_id).await,
+            Ok(base) => send_control_only(peer, base, client_id, STATUS_OK).await,
             Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
         }
         return;
@@ -1121,7 +1121,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
             None
         };
         if let Some(new_id) = alloc {
-            send_alloc(peer, new_id, client_id).await;
+            send_control_only(peer, new_id, client_id, STATUS_OK).await;
             return;
         }
     }
@@ -1179,20 +1179,24 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         return;
     }
 
-    // GET_INDICES must be routed before the generic empty-batch scan dispatch
-    // below, which keys only on target_id and would otherwise swallow it. The
-    // epoch read and the descriptor build both run under the catalog read lock,
-    // so there is no torn read between the epoch and the circuit list.
-    if flags & FLAG_GET_INDICES != 0 {
-        let _g = shared.catalog_rwlock.read().await;
-        handle_get_indices(
-            shared,
-            peer,
-            client_id,
-            target_id,
-            ipc::wire_flags_get_index_version(flags),
-        )
-        .await;
+    // RESOLVE must be routed before the generic empty-batch scan dispatch below
+    // and the `target_id < FIRST_USER_TABLE_ID` fallthrough, both of which key
+    // on target_id alone: a by-name resolve carries `target_id = 0` and a by-id
+    // resolve an arbitrary client-chosen tid, so either would swallow it.
+    //
+    // A plain read guard, not `read_lock`: a resolve answers catalog shape, and
+    // a view tick moves a view's rows, never its shape — so the tick drain
+    // `read_lock` waits for buys nothing here. The guard scope ends at the reply
+    // buffer, so the lock is never held across the send.
+    if flags & FLAG_RESOLVE != 0 {
+        let reply = {
+            let _g = shared.catalog_rwlock.read().await;
+            build_resolve_reply(shared, client_id, target_id, &decoded.control.seek_pk_extra)
+        };
+        match reply {
+            Ok(buf) => peer.send_buffer_or_close(buf).await,
+            Err(msg) => send_error(peer, target_id, client_id, msg.as_bytes()).await,
+        }
         return;
     }
 
@@ -1393,23 +1397,24 @@ async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
         // Standard single-frame ACK, seek_pk = zone LSN (uncorrelated, as
         // push_ddl_txn's reply is).
         Ok(PushTxnOutcome::Committed(lsn)) => {
-            let buf = encode_response_buffer(0, client_id, None, STATUS_OK, b"", None, lsn as u128, 0);
+            let buf = encode_response_buffer(ipc::WireMsg {
+                client_id,
+                seek_pk: lsn as u128,
+                status: STATUS_OK,
+                ..Default::default()
+            });
             peer.send_buffer_or_close(buf).await;
         }
         // OCC precondition failed: a control-only STATUS_TXN_CONFLICT frame whose
         // `seek_pk` carries the fresh basis. Empty message — the client
         // synthesizes any human-readable text from the tid it sent.
         Ok(PushTxnOutcome::Conflict(fresh_basis)) => {
-            let buf = encode_response_buffer(
-                0,
+            let buf = encode_response_buffer(ipc::WireMsg {
                 client_id,
-                None,
-                ipc::STATUS_TXN_CONFLICT,
-                b"",
-                None,
-                fresh_basis as u128,
-                0,
-            );
+                seek_pk: fresh_basis as u128,
+                status: ipc::STATUS_TXN_CONFLICT,
+                ..Default::default()
+            });
             peer.send_buffer_or_close(buf).await;
         }
         Err(e) => send_error(peer, 0, client_id, e.as_bytes()).await,
@@ -1649,62 +1654,121 @@ async fn handle_seek_by_index(
     }
 }
 
-/// Wire schema for the GET_INDICES descriptor list: `(packed_cols PK, is_unique)`,
-/// with its column names. The PK carries `pack_pk_cols(&col_indices)` — unique
-/// per circuit (circuits dedup by column list), so a valid PK. The server ships
-/// this block on the data path; the client decodes against it and reads columns
-/// by position.
-const INDEX_META_SCHEMA: SchemaDescriptor =
-    crate::schema::from_wire_cols(gnitz_wire::INDEX_META_COLS, gnitz_wire::INDEX_META_PK);
-
-/// GET_INDICES: serve the client's durable, epoch-validated cache of a table's
-/// secondary-index metadata — the `(col_idx, is_unique)` set, projected from the
-/// DAG `index_circuits` (the system's operative truth for "is this column
-/// enforced-unique", identical to the server's own FK gate `validate_fk_column`).
-/// The client's cached epoch arrives in the index-version wire bits; on a match
-/// we reply "unchanged" (no schema, no data), otherwise the fresh list.
-async fn handle_get_indices(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_epoch: u8) {
-    let server_epoch = shared.cat().get_index_version(target_id); // absent ⇒ 1
-    let flags = ipc::wire_flags_set_index_version(0, server_epoch);
-
-    // Warm hit (and the missing-table race, since both resolve to epoch 1 with
-    // an empty list): OK, no schema, no data → client keeps its cached Rc.
-    if client_epoch == server_epoch {
-        let buf = encode_response_buffer(target_id, client_id, None, STATUS_OK, b"", None, 0, flags);
-        peer.send_buffer_or_close(buf).await;
-        return;
-    }
-
-    // Changed / first fetch: project every index circuit (FK + non-unique
-    // included) to (col_idx PK, is_unique). The response always carries its own
-    // schema block on the data path, so the client decodes against the wire
-    // schema and never needs — or pollutes — the per-table schema cache.
-    let desc = INDEX_META_SCHEMA;
-    // Build the schema block before the descriptor is moved into BatchBuilder.
-    let col_names: Vec<&[u8]> = gnitz_wire::INDEX_META_COLS.iter().map(|c| c.name.as_bytes()).collect();
-    let schema_block = ipc::build_schema_wire_block(&desc, &col_names, 0, target_id as u32);
-    let mut bb = BatchBuilder::new(desc);
-    if let Some(entry) = shared.cat().dag.tables.get(&target_id) {
-        for ic in &entry.index_circuits {
-            // PK = packed column list (unique per circuit: deduped by list).
-            bb.begin_row(gnitz_wire::pack_pk_cols(ic.col_indices.as_slice()) as u128, 1);
-            bb.put_u64(ic.is_unique as u64); // payload: is_unique
-            bb.end_row();
+/// The relation a RESOLVE names, with its kind — or `None` when it names none.
+/// `Err` is the one hard failure a resolve has: an unusable request blob, or a
+/// schema that does not exist.
+///
+/// The `dag.relation_kind` lookup is the gate that makes the id safe to
+/// describe: `read_column_defs` seeks `pack_column_id(owner_id, 0)`, whose range
+/// check would abort the master on an out-of-range owner, and only ids
+/// `allocate_table_id` issued reach `dag.tables`. Returning the kind is what
+/// lets the caller consume that proof instead of re-asserting it.
+fn resolve_request_target(
+    shared: &Rc<Shared>,
+    target_id: i64,
+    name_blob: &[u8],
+) -> Result<Option<(i64, RelationKind)>, String> {
+    // By-id: the tid is the client's, unvalidated until the gate below. By-name:
+    // the blob is the canonical `"schema_name.relation_name"`, which is exactly
+    // the `entity_by_qname` key.
+    let candidate = if name_blob.is_empty() {
+        target_id
+    } else {
+        let qname = std::str::from_utf8(name_blob).map_err(|_| "RESOLVE: name is not valid UTF-8".to_string())?;
+        match shared.cat().entity_id_by_qname(qname) {
+            Some(tid) => tid,
+            None => {
+                // Distinguish "no such schema" from "no such relation in it"
+                // only here — a qname hit already implies its schema exists.
+                // Split at the first `.`: that is where `qualified_name` joined
+                // the two halves, and a name a validating front end would have
+                // rejected can only misreport which half was missing.
+                let (schema_name, _) = qname
+                    .split_once('.')
+                    .ok_or_else(|| format!("RESOLVE: '{qname}' is not a qualified relation name"))?;
+                if !shared.cat().has_schema(schema_name) {
+                    return Err(format!("Schema '{schema_name}' not found"));
+                }
+                return Ok(None);
+            }
         }
+    };
+    // A qname hit is not evidence of registration: `apply_entity_caches` inserts
+    // on the raw row sign while `hook_table_register` registers only on net-live,
+    // so the two maps are not maintained on one liveness rule.
+    Ok(shared.cat().dag.relation_kind(candidate).map(|kind| (candidate, kind)))
+}
+
+/// Build the RESOLVE reply: the schema block plus the [`RelDescriptorBlob`]
+/// carrying what the block cannot (kind, placement, foreign keys, secondary
+/// indexes). Served entirely from the typed caches the master already
+/// maintains; it writes no SAL group and wakes no worker.
+fn build_resolve_reply(
+    shared: &Rc<Shared>,
+    client_id: u64,
+    target_id: i64,
+    name_blob: &[u8],
+) -> Result<PooledSendBuf, String> {
+    let Some((tid, kind)) = resolve_request_target(shared, target_id, name_blob)? else {
+        // Relation absent is a successful answer, not an error: the client owes a
+        // different wording per entry point ("Table …", "Table or view …",
+        // `Ok(None)`), so it renders it itself. An empty descriptor blob says so,
+        // and `target_id = 0` names no relation.
+        return Ok(encode_response_buffer(ipc::WireMsg {
+            client_id,
+            status: STATUS_OK,
+            ..Default::default()
+        }));
+    };
+
+    // Only a base table reports its placement. A view and a system family are
+    // both *stamped* `Replicated`, but this bit is a planner hint for a reduce
+    // built directly over a source, and a view's locality is settled by the
+    // compiler from the new view's own stamped placement instead. Reporting the
+    // stamp here would re-plan an aggregate over a view on a second authority.
+    let replicated = kind.is_base_table() && shared.cat().dag.relation_is_replicated(tid);
+
+    let defs = shared.cat().read_column_defs(tid);
+    let fks: Vec<gnitz_wire::RelFk> = defs
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.fk_table_id != 0)
+        .map(|(ci, d)| gnitz_wire::RelFk {
+            col_idx: ci as u32,
+            fk_col_idx: d.fk_col_idx,
+            fk_table_id: d.fk_table_id as u64,
+        })
+        .collect();
+    let indexes: Vec<gnitz_wire::RelIndex> = shared
+        .cat()
+        .index_circuits(tid)
+        .iter()
+        .map(|ic| gnitz_wire::RelIndex {
+            cols: ic.col_indices,
+            is_unique: ic.is_unique,
+        })
+        .collect();
+    let blob = gnitz_wire::RelDescriptorBlob {
+        is_view: kind.is_view(),
+        replicated,
+        fks,
+        indexes,
     }
-    let batch = bb.finish();
-    let result = if batch.count > 0 { Some(&batch) } else { None };
-    let buf = encode_response_buffer(
-        target_id,
+    .encode();
+
+    // Clone the `Rc` block out of the cache so no `cat()` borrow outlives it.
+    // The reply always carries the block: a resolving client holds no descriptor
+    // to validate a version against.
+    let (schema_block, server_version) = shared.get_schema_wire_block(tid);
+    Ok(encode_response_buffer(ipc::WireMsg {
+        target_id: tid as u64,
         client_id,
-        result,
-        STATUS_OK,
-        b"",
-        Some(schema_block.as_slice()),
-        0,
-        flags,
-    );
-    peer.send_buffer_or_close(buf).await;
+        flags: ipc::wire_flags_set_schema_version(0, server_version),
+        status: STATUS_OK,
+        prebuilt_schema_block: Some(schema_block.as_slice()),
+        seek_pk_extra: &blob,
+        ..Default::default()
+    }))
 }
 
 /// Drive one tick of everything pending, returning with NO catalog lock held.
@@ -1841,7 +1905,14 @@ fn negotiate_scan_schema(shared: &Rc<Shared>, tid: i64, client_version: u16) -> 
 /// a single scan, deferred to the one-cut Phase 2 for a multi-scan.
 fn build_prelim_schema_frame(tid: i64, client_id: u64, server_version: u16, block: &[u8]) -> PooledSendBuf {
     let prelim_flags = ipc::wire_flags_set_schema_version(ipc::FLAG_CONTINUATION, server_version);
-    encode_response_buffer(tid, client_id, None, STATUS_OK, b"", Some(block), 0, prelim_flags)
+    encode_response_buffer(ipc::WireMsg {
+        target_id: tid as u64,
+        client_id,
+        flags: prelim_flags,
+        status: STATUS_OK,
+        prebuilt_schema_block: Some(block),
+        ..Default::default()
+    })
 }
 
 async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
@@ -1885,7 +1956,13 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
 
 fn make_terminal_scan_frame(target_id: i64, client_id: u64, lsn: u64) -> PooledSendBuf {
     // Terminal scan frame: no schema block, no data. Client ignores schema version here.
-    encode_response_buffer(target_id, client_id, None, STATUS_OK, b"", None, lsn as u128, 0)
+    encode_response_buffer(ipc::WireMsg {
+        target_id: target_id as u64,
+        client_id,
+        seek_pk: lsn as u128,
+        status: STATUS_OK,
+        ..Default::default()
+    })
 }
 
 /// Finish one scan-shaped fan-out: `Ok(true)` → the terminal frame (stamped
@@ -2401,28 +2478,9 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
 // Wire-protocol response helpers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn encode_response_buffer(
-    target_id: i64,
-    client_id: u64,
-    result: Option<&Batch>,
-    status: u32,
-    error_msg: &[u8],
-    prebuilt_schema: Option<&[u8]>,
-    seek_pk: u128,
-    flags: u64,
-) -> PooledSendBuf {
-    let msg = ipc::WireMsg {
-        target_id: target_id as u64,
-        client_id,
-        flags,
-        seek_pk,
-        status,
-        error_msg,
-        data: ipc::WireData::Whole(result),
-        prebuilt_schema_block: prebuilt_schema,
-        ..Default::default()
-    };
+/// Frame one reply into a pooled send buffer. Callers build the [`ipc::WireMsg`]
+/// with the fields they actually set and leave the rest at `Default`.
+fn encode_response_buffer(msg: ipc::WireMsg<'_>) -> PooledSendBuf {
     let sz = msg.size();
     let total = 4 + sz;
     let mut inner = crate::storage::batch_pool::acquire_buf();
@@ -2456,17 +2514,30 @@ async fn send_ok_response(
     } else {
         None
     };
-    let flags = ipc::wire_flags_set_schema_version(0, server_version);
-    let buf = encode_response_buffer(target_id, client_id, result, STATUS_OK, b"", schema_arg, seek_pk, flags);
+    let buf = encode_response_buffer(ipc::WireMsg {
+        target_id: target_id as u64,
+        client_id,
+        flags: ipc::wire_flags_set_schema_version(0, server_version),
+        seek_pk,
+        status: STATUS_OK,
+        data: ipc::WireData::Whole(result),
+        prebuilt_schema_block: schema_arg,
+        ..Default::default()
+    });
     peer.send_buffer_or_close(buf).await;
 }
 
-/// Control-only reply carrying just a status code: no schema, no data, no error
-/// text. The schema-mismatch (`STATUS_SCHEMA_MISMATCH`) and no-index
-/// (`STATUS_NO_INDEX`) responses are byte-identical apart from the status, and
-/// the client treats each frame as a pure signal.
+/// Control-only reply carrying just a status code and a target id: no schema,
+/// no data, no error text. Every reply whose whole content is the header — the
+/// schema-mismatch and no-index signals, and an id allocation, whose answer *is*
+/// the target id — goes out through here.
 async fn send_control_only(peer: &Peer, target_id: i64, client_id: u64, status: u32) {
-    let buf = encode_response_buffer(target_id, client_id, None, status, b"", None, 0, 0);
+    let buf = encode_response_buffer(ipc::WireMsg {
+        target_id: target_id as u64,
+        client_id,
+        status,
+        ..Default::default()
+    });
     peer.send_buffer_or_close(buf).await;
 }
 
@@ -2474,7 +2545,13 @@ async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8
     // STATUS_ERROR suppresses the schema block (has_schema = false), so
     // prebuilt_schema = None is correct and saves the cache lookup.
     // flags=0: client ignores schema version on error responses.
-    let buf = encode_response_buffer(target_id, client_id, None, STATUS_ERROR, error_msg, None, 0, 0);
+    let buf = encode_response_buffer(ipc::WireMsg {
+        target_id: target_id as u64,
+        client_id,
+        status: STATUS_ERROR,
+        error_msg,
+        ..Default::default()
+    });
     peer.send_buffer_or_close(buf).await;
 }
 
@@ -2557,7 +2634,7 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)],
 /// **Reserve + mutate + emit under both locks, release both BEFORE the fsync.**
 /// The whole reserve/mutate/emit span is synchronous (the only `.await`s are the
 /// two lock acquisitions), so catalog readers — SEEK / SEEK_BY_INDEX* /
-/// GET_INDICES / tick emission, all of which take `catalog_rwlock.read()` — block
+/// RESOLVE / tick emission, all of which take `catalog_rwlock.read()` — block
 /// only for that brief span, never across the `fdatasync`. Distinctness and
 /// publish-after-fsync are the `ZoneLsnAllocator` contract; the reservation
 /// floor is `sys_sequences`' own counter, computed by `reserve_user_sequence`
@@ -2633,37 +2710,4 @@ async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i6
     // sys_sequences delta is not yet on disk.
     shared.lsn_alloc.publish(zone_lsn);
     Ok(base)
-}
-
-async fn send_alloc(peer: &Peer, new_id: i64, client_id: u64) {
-    // Alloc responses carry no schema block; schema version irrelevant.
-    let buf = encode_response_buffer(new_id, client_id, None, STATUS_OK, b"", None, 0, 0);
-    peer.send_buffer_or_close(buf).await;
-}
-
-#[cfg(test)]
-mod tests {
-    /// Demonstrates that the name_refs_arr slice is bounded by .min(MAX_COLUMNS).
-    /// Before the fix, `&name_refs_arr[..col_names.len()]` panicked when
-    /// col_names.len() > MAX_COLUMNS; after the fix it is always safe.
-    #[test]
-    fn col_names_slice_is_bounded_at_max_columns() {
-        use crate::schema::MAX_COLUMNS;
-        let mut arr = [&[] as &[u8]; MAX_COLUMNS];
-        let names: Vec<Vec<u8>> = (0..MAX_COLUMNS).map(|i| vec![i as u8]).collect();
-        for (i, n) in names.iter().enumerate() {
-            arr[i] = n.as_slice();
-        }
-        // .min(MAX_COLUMNS) must not change the result for len == MAX_COLUMNS ...
-        let slice = &arr[..names.len().min(MAX_COLUMNS)];
-        assert_eq!(slice.len(), MAX_COLUMNS);
-        assert_eq!(slice[0], &[0u8][..]);
-        assert_eq!(slice[MAX_COLUMNS - 1], &[(MAX_COLUMNS - 1) as u8][..]);
-        // ... and must cap at MAX_COLUMNS rather than panic for len > MAX_COLUMNS.
-        let capped = names.len().min(MAX_COLUMNS);
-        assert_eq!(
-            capped, MAX_COLUMNS,
-            "min(MAX_COLUMNS) is identity when len == MAX_COLUMNS"
-        );
-    }
 }

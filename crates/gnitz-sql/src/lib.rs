@@ -98,9 +98,9 @@ impl<'a> SqlPlanner<'a> {
         let txn_was_active = self.client.txn_active();
         let mut results = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
-            self.client.begin_catalog_snapshot();
+            self.client.begin_statement();
             let r = dispatch::execute_statement(self.client, &self.schema_name, stmt);
-            self.client.end_catalog_snapshot();
+            self.client.end_statement();
             match r {
                 Ok(res) => results.push(res),
                 Err(e) => {

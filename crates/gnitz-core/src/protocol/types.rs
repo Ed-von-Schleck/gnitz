@@ -22,9 +22,10 @@ pub struct ColumnDef {
     pub fk_col_idx: u64,
     /// True for a Postgres-style SERIAL/BIGSERIAL/SMALLSERIAL primary key: an
     /// auto-assigned, client-stamped id the user may not supply. Round-trips
-    /// through `COL_TAB` so a connection that only fetched the schema can still
-    /// distinguish it from a user-supplied non-null integer PK. The engine
-    /// stores the marker but has no SERIAL awareness.
+    /// through the wire meta-schema (`META_FLAG_SERIAL`) and `COL_TAB`, so a
+    /// connection that only resolved the relation can still distinguish it from
+    /// a user-supplied non-null integer PK. The engine stores the marker but has
+    /// no SERIAL awareness.
     pub is_serial: bool,
     /// True for a hidden key slot — a physical schema column carrying a real
     /// PK/routing value (a synthetic view key like `_join_pk`/`_group_pk`, or an

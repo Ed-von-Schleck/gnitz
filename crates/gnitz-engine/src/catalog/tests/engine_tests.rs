@@ -527,14 +527,7 @@ fn test_fk_index_metadata_queries() {
     // Create child table with FK to parent
     let child_cols = vec![
         col_def("id", type_code::U64),
-        ColumnDef {
-            name: "parent_id".into(),
-            type_code: crate::schema::type_code::U64,
-            is_nullable: false,
-            fk_table_id: tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("parent_id", crate::schema::type_code::U64, tid, 0),
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
@@ -587,30 +580,9 @@ fn test_column_defs_cached() {
     let dir = temp_dir("catalog_colnames");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![
-        ColumnDef {
-            name: "pk".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
-        ColumnDef {
-            name: "alpha".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
-        ColumnDef {
-            name: "beta".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        col_def("pk", type_code::U64),
+        col_def("alpha", type_code::U64),
+        col_def("beta", type_code::U64),
     ];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 

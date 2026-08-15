@@ -10,6 +10,7 @@
 // ---------------------------------------------------------------------------
 
 use crate::catalog::PK_LIST_MAX_COLS;
+use crate::codec::{Reader, Writer};
 use crate::types::{FixedInt, TypeCode};
 
 const START_AFTER: u8 = 1 << 0;
@@ -153,8 +154,6 @@ impl RangeDescriptor {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::encoded_len(self.n_eq));
-        out.push(self.n_eq as u8);
         let mut flags = 0u8;
         if self.start.is_after() {
             flags |= START_AFTER;
@@ -162,13 +161,13 @@ impl RangeDescriptor {
         if self.end.is_after() {
             flags |= END_AFTER;
         }
-        out.push(flags);
+        let mut w = Writer::with_capacity(Self::encoded_len(self.n_eq));
+        w.u8(self.n_eq as u8).u8(flags);
         for v in self.eq_vals() {
-            out.extend_from_slice(&v.to_le_bytes());
+            w.u128(*v);
         }
-        out.extend_from_slice(&self.start.value().to_le_bytes());
-        out.extend_from_slice(&self.end.value().to_le_bytes());
-        out
+        w.u128(self.start.value()).u128(self.end.value());
+        w.into_vec()
     }
 
     /// Decode and validate at the trust boundary: the exact length implied by
@@ -178,11 +177,9 @@ impl RangeDescriptor {
     /// arity check against the actual column list stays with the engine
     /// method, which holds the list.)
     pub fn decode(buf: &[u8]) -> Result<Self, String> {
-        if buf.len() < 2 {
-            return Err("range descriptor shorter than 2 bytes".to_string());
-        }
-        let n_eq = buf[0] as usize;
-        let flags = buf[1];
+        let mut r = Reader::new(buf, "range descriptor");
+        let n_eq = r.u8()? as usize;
+        let flags = r.u8()?;
         if n_eq >= PK_LIST_MAX_COLS {
             return Err(format!(
                 "range descriptor n_eq {n_eq} leaves no range column within \
@@ -192,22 +189,13 @@ impl RangeDescriptor {
         if flags & !(START_AFTER | END_AFTER) != 0 {
             return Err(format!("range descriptor has unknown flag bits {flags:#04x}"));
         }
-        let expected = Self::encoded_len(n_eq);
-        if buf.len() != expected {
-            return Err(format!("range descriptor length {} != expected {expected}", buf.len()));
-        }
-        let mut off = 2;
-        let mut next = || {
-            let v = u128::from_le_bytes(buf[off..off + 16].try_into().unwrap());
-            off += 16;
-            v
-        };
         let mut eq = [0u128; PK_LIST_MAX_COLS];
         for slot in eq.iter_mut().take(n_eq) {
-            *slot = next();
+            *slot = r.u128()?;
         }
-        let start = Cut::new(flags & START_AFTER != 0, next());
-        let end = Cut::new(flags & END_AFTER != 0, next());
+        let start = Cut::new(flags & START_AFTER != 0, r.u128()?);
+        let end = Cut::new(flags & END_AFTER != 0, r.u128()?);
+        r.expect_consumed()?;
         Ok(RangeDescriptor { eq, n_eq, start, end })
     }
 }

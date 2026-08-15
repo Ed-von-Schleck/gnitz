@@ -82,9 +82,9 @@ pub(crate) fn lower_reduce(
     }
     ensure_cardinality_count(&source_schema.columns, &mut specs)?;
 
-    // Reduce strategy (two-phase global / replicated / sharded). The replication
-    // probe is a full `TABLE_TAB` scan, so it is gated on catalog provenance: a
-    // chain-minted segment is not registered yet and is never replicated.
+    // Reduce strategy (two-phase global / replicated / sharded). Gated on
+    // catalog provenance: chain-minted segment ids start at 1 and so alias the
+    // system families' ids, and a segment is never replicated anyway.
     let source_replicated = source.from_catalog && client.table_replicated(source_tid).map_err(GnitzSqlError::Exec)?;
     let shape = ReduceShape::new(&source_schema, &group_positions, &specs, source_replicated);
     let out_key = shape.out_key;

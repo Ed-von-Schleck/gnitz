@@ -262,9 +262,11 @@ pub(crate) fn try_extract_pk_range<'e>(
 ///   which an `IndexRange` bound never does; and when the point covers the whole
 ///   PK it already admits one row. [`Schema`] carries no `dist_prefix_len`, so
 ///   "nothing pinned" is the only test available here.
-/// * **An index-eligible equality exists.** Nothing a unique point could be built
-///   from otherwise, and `table_indexes` always hits the wire — this keeps the
-///   GET_INDICES probe off the common `WHERE pk > x` read.
+/// * **An index-eligible equality exists.** A PK bound is only worth abandoning
+///   when there is something to build a unique point *from*; with no
+///   index-eligible equality among the conjuncts, no index seek can cover a
+///   whole UNIQUE key, so giving up the PK bound would trade a real bound for
+///   nothing.
 pub(crate) fn pk_bound_is_preemptible(desc: &RangeDescriptor, where_expr: &BoundExpr, schema: &Schema) -> bool {
     if !desc.eq_vals().is_empty() || desc.is_point() {
         return false;
@@ -508,8 +510,7 @@ impl IndexSeekCandidate<'_> {
 }
 
 /// Every index-servable seek candidate among the conjuncts of `expr`, best first.
-/// `fetch_indexes` (one epoch-validated GET_INDICES round-trip) is called only when
-/// at least one eligible equality exists.
+/// `fetch_indexes` is called only when at least one eligible equality exists.
 fn collect_index_seek_candidates<'e>(
     expr: &'e BoundExpr,
     schema: &Schema,
@@ -646,8 +647,8 @@ fn collect_index_range_candidates<'e>(
 /// Memoizes one `table_indexes` list across the range → equality collector
 /// fall-through, so one bound extraction fetches at most once regardless of how
 /// the caller's `fetch` is backed. It does not assume `table_indexes` hits the
-/// wire — inside a statement snapshot that call is already served from the
-/// client's epoch-validated cache — the point is that this function's own
+/// wire — inside a statement bracket that call is already served from the
+/// statement's resolved descriptor — the point is that this function's own
 /// "called at most once" contract holds locally, without depending on a caching
 /// detail of a lower layer.
 #[derive(Default)]
@@ -671,7 +672,7 @@ impl IndexListMemo {
 
 /// The best index range/equality bound for `where_expr` as a full
 /// [`IndexRangeCandidate`] — descriptor plus the chosen candidate's residual (the
-/// WHERE conjuncts the bound does not apply). `fetch` (the GET_INDICES probe) is
+/// WHERE conjuncts the bound does not apply). `fetch` (the index-list probe) is
 /// injected and called **at most once** (both collectors are lazy and share one
 /// [`IndexListMemo`]).
 ///
@@ -1630,7 +1631,8 @@ mod tests {
     }
 
     /// No index-eligible equality: nothing a unique point could be built from, so
-    /// the GET_INDICES probe stays off the common bounded-read path.
+    /// the PK bound stands rather than being traded for an index seek that could
+    /// not cover a whole UNIQUE key.
     #[test]
     fn no_index_eligible_equality_is_not_preemptible() {
         assert!(!preemptible("pk > 5 AND val > 1", &two_col(TypeCode::U64)));

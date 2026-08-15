@@ -79,14 +79,7 @@ fn test_uuid_fk_valid_single() {
 
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "uid_fk".into(),
-            type_code: type_code::UUID,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("uid_fk", type_code::UUID, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.uuid_chi", &child_cols, &[0]).unwrap();
 
@@ -121,14 +114,7 @@ fn test_uuid_fk_invalid_single() {
 
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "uid_fk".into(),
-            type_code: type_code::UUID,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("uid_fk", type_code::UUID, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.uuid_chi2", &child_cols, &[0]).unwrap();
 
@@ -156,14 +142,7 @@ fn test_uuid_fk_multiple_children_same_parent() {
 
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "uid_fk".into(),
-            type_code: type_code::UUID,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("uid_fk", type_code::UUID, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.uuid_chi3", &child_cols, &[0]).unwrap();
 
@@ -201,14 +180,7 @@ fn test_uuid_fk_multiple_children_mixed() {
 
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "uid_fk".into(),
-            type_code: type_code::UUID,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("uid_fk", type_code::UUID, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.uuid_chi4", &child_cols, &[0]).unwrap();
 
@@ -246,14 +218,7 @@ fn test_uuid_fk_parent_not_yet_ingested() {
 
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "uid_fk".into(),
-            type_code: type_code::UUID,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("uid_fk", type_code::UUID, parent_tid, 0),
     ];
     let child_tid = engine.create_table("public.uuid_chi5", &child_cols, &[0]).unwrap();
 
@@ -283,12 +248,8 @@ fn test_uuid_fk_nullable_column() {
     let child_cols = vec![
         col_def("cid", type_code::U64),
         ColumnDef {
-            name: "uid_fk".into(),
-            type_code: type_code::UUID,
             is_nullable: true,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
+            ..fk_def("uid_fk", type_code::UUID, parent_tid, 0)
         },
     ];
     let child_tid = engine.create_table("public.uuid_chi6", &child_cols, &[0]).unwrap();
@@ -319,14 +280,7 @@ fn test_uuid_fk_u64pk_parent_rejected() {
     // UUID FK child → U64 PK parent should fail DDL
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "uid_fk".into(),
-            type_code: type_code::UUID,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("uid_fk", type_code::UUID, parent_tid, 0),
     ];
     assert!(engine.create_table("public.uuid_chi7", &child_cols, &[0]).is_err());
 
@@ -348,14 +302,7 @@ fn test_uuid_fk_u128_col_references_uuid_pk() {
     // U128 FK column → UUID PK parent should fail (different type codes)
     let child_cols = vec![
         col_def("cid", type_code::U64),
-        ColumnDef {
-            name: "uid_fk".into(),
-            type_code: type_code::U128,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("uid_fk", type_code::U128, parent_tid, 0),
     ];
     assert!(engine.create_table("public.uuid_chi8", &child_cols, &[0]).is_err());
 

@@ -107,7 +107,7 @@ impl<'e> AccessPlan<'e> {
 /// UNIQUE index, which admits at most one row. A LIKE / string-arithmetic WHERE
 /// the expression VM cannot compile is an `Unsupported`, propagated.
 ///
-/// `fetch_indexes` is the GET_INDICES probe, injected so the ladder stays
+/// `fetch_indexes` is the index-list probe, injected so the ladder stays
 /// client-free; it is called at most once per statement (`best_index_bound`
 /// memoizes across its two collectors, and the ladder reaches it once).
 pub(crate) fn bound_and_predicate<'e, F>(

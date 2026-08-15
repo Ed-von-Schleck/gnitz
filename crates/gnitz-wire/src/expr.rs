@@ -1,5 +1,7 @@
 //! Expression bytecode: opcodes, operand packing, and blob framing.
 
+use crate::codec::Writer;
+
 pub const EXPR_LOAD_COL_INT: u32 = 1;
 pub const EXPR_LOAD_COL_FLOAT: u32 = 2;
 pub const EXPR_LOAD_CONST: u32 = 3;
@@ -268,32 +270,31 @@ pub struct ExprBlob {
 /// ```
 pub fn encode_expr_blob(num_regs: u32, result_reg: u32, code: &[u32], const_strings: &[&[u8]]) -> Vec<u8> {
     debug_assert!(code.len().is_multiple_of(4), "code length {} not 4-aligned", code.len());
-    let mut buf = Vec::with_capacity(
+    let mut w = Writer::with_capacity(
         EXPR_BLOB_HEADER_SIZE + code.len() * 4 + 4 + const_strings.iter().map(|s| 4 + s.len()).sum::<usize>(),
     );
-    buf.extend_from_slice(&EXPR_BLOB_MAGIC.to_le_bytes());
-    buf.push(EXPR_BLOB_VERSION);
-    buf.push(0); // reserved
-    buf.extend_from_slice(&(num_regs as u16).to_le_bytes());
-    buf.extend_from_slice(&(result_reg as u16).to_le_bytes());
-    buf.extend_from_slice(&[0, 0]); // reserved
-    buf.extend_from_slice(&(code.len() as u32).to_le_bytes());
+    w.u32(EXPR_BLOB_MAGIC)
+        .u8(EXPR_BLOB_VERSION)
+        .u8(0) // reserved
+        .u16(num_regs as u16)
+        .u16(result_reg as u16)
+        .u16(0) // reserved
+        .u32(code.len() as u32);
     for &word in code {
-        buf.extend_from_slice(&word.to_le_bytes());
+        w.u32(word);
     }
-    buf.extend_from_slice(&(const_strings.len() as u32).to_le_bytes());
+    w.u32(const_strings.len() as u32);
     for &s in const_strings {
-        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        buf.extend_from_slice(s);
+        w.bytes32(s);
     }
-    buf
+    w.into_vec()
 }
 
 /// Inverse of `encode_expr_blob`. Validates magic, version, reserved bytes, code-length
 /// alignment, region lengths, and the string-count OOM bound. Does **not** validate program
 /// semantics (opcodes, register operands, column indices) — that is the decoder-consumer's job.
 pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
-    let mut r = crate::reader::Reader::new(blob);
+    let mut r = crate::codec::Reader::new(blob, "expr blob");
     if r.u32().ok()? != EXPR_BLOB_MAGIC || r.u8().ok()? != EXPR_BLOB_VERSION || r.u8().ok()? != 0 {
         return None;
     }
@@ -322,6 +323,7 @@ pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
     for _ in 0..s_count {
         const_strings.push(r.bytes32().ok()?.to_vec());
     }
+    r.expect_consumed().ok()?;
     Some(ExprBlob {
         num_regs,
         result_reg,

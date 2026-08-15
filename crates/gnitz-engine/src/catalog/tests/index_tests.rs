@@ -474,14 +474,7 @@ fn test_drop_table_cascades_fk_index() {
 
     let child_cols = vec![
         col_def("pk", type_code::U64),
-        ColumnDef {
-            name: "parent_ref".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        fk_def("parent_ref", type_code::U64, parent_tid, 0),
     ];
     engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
@@ -601,22 +594,8 @@ fn test_compound_pk_secondary_index_seek() {
     // Source PK stride = 8 → index PK stride = 8 (promoted U64) + 8 = 16,
     // which keeps the index cursor on the narrow-PK fast path.
     let cols = vec![
-        ColumnDef {
-            name: "a".into(),
-            type_code: type_code::U32,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
-        ColumnDef {
-            name: "b".into(),
-            type_code: type_code::U32,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        col_def("a", type_code::U32),
+        col_def("b", type_code::U32),
         col_def("val", type_code::U64),
     ];
     let tid = engine.create_table("public.cpk_t", &cols, &[0, 1]).unwrap();
@@ -667,22 +646,8 @@ fn test_compound_pk_secondary_index_retract() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     let cols = vec![
-        ColumnDef {
-            name: "a".into(),
-            type_code: type_code::U32,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
-        ColumnDef {
-            name: "b".into(),
-            type_code: type_code::U32,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        col_def("a", type_code::U32),
+        col_def("b", type_code::U32),
         col_def("val", type_code::U64),
     ];
     let tid = engine.create_table("public.cpk_r", &cols, &[0, 1]).unwrap();
@@ -830,96 +795,14 @@ fn test_seek_by_index_orphan_entry_terminates() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── index epoch: durable client-cache invalidation token ─────────────────
-//
-// Each owner-affecting IDX_TAB write bumps the per-table index epoch (wraps
-// 255 → 1, never 0). Clients echo their cached epoch in GET_INDICES; the server
-// re-sends the projected (col_idx, is_unique) list only on a mismatch. These
-// guard the §1 counter mechanics directly: bump on every index DDL, never 0,
-// and the post-cascade purge that stops a dropped tid from leaking a counter.
-
 #[test]
-fn index_version_bumps_on_create_and_drop_index() {
-    let (mut engine, tid, dir) = table_fixture(
-        "index_version_create_drop",
-        &[col_def("id", type_code::U64), col_def("val", type_code::I64)],
-    );
-
-    // No index DDL yet → the base epoch (absent ⇒ 1), never 0.
-    assert_eq!(engine.get_index_version(tid), 1);
-
-    engine.create_index("public.t", &["val"], false).unwrap();
-    let after_create = engine.get_index_version(tid);
-    assert!(
-        after_create != 1 && after_create != 0,
-        "CREATE INDEX must move the epoch off the base, never to 0: got {after_create}"
-    );
-
-    let idx_name = make_secondary_index_name("public", "t", "val");
-    engine.drop_index(&idx_name).unwrap();
-    let after_drop = engine.get_index_version(tid);
-    assert!(
-        after_drop != after_create && after_drop != 0,
-        "DROP INDEX must move the epoch again, never to 0: got {after_drop}"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn index_version_bumps_on_unique_index() {
-    let (mut engine, tid, dir) = table_fixture(
-        "index_version_unique",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
-    );
-    assert_eq!(engine.get_index_version(tid), 1);
-    engine.create_index("public.t", &["val"], true).unwrap(); // UNIQUE
-    assert!(
-        engine.get_index_version(tid) > 1,
-        "CREATE UNIQUE INDEX must bump the epoch"
-    );
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn index_version_bumps_on_fk_auto_index() {
-    // The FK auto-index is created with the child table; its IDX_TAB +1 must
-    // bump the child's epoch just like an explicit CREATE INDEX.
-    let dir = temp_dir("index_version_fk_auto");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-    let parent_cols = vec![col_def("pk", type_code::U64), col_def("name", type_code::U64)];
-    let parent_tid = engine.create_table("public.parent", &parent_cols, &[0]).unwrap();
-    let child_cols = vec![
-        col_def("pk", type_code::U64),
-        ColumnDef {
-            name: "parent_ref".into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: parent_tid,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
-    assert!(
-        engine.get_index_version(child_tid) > 1,
-        "FK auto-index creation must bump the child's index epoch"
-    );
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn drop_table_purges_both_version_counters() {
-    // Regression for the post-cascade purge. Dropping a table must remove BOTH
-    // its index_version and schema_version entries. The drop cascade re-ingests
-    // IDX_TAB / COL_TAB retractions whose appliers `or_insert` the counters
-    // straight back, so a removal in apply_entity_caches (which fires *before*
-    // the cascade) is immediately undone — leaking memory for a tid that is
-    // never reused. The purge runs at the tail of the drop hook, after the
-    // cascade, so both must end up absent.
+fn drop_table_purges_the_schema_version_counter() {
+    // Regression for the post-cascade purge. Dropping a table must remove its
+    // schema_version entry. The drop cascade re-ingests COL_TAB retractions
+    // whose applier `or_insert`s the counter straight back, so a removal in
+    // apply_entity_caches (which fires *before* the cascade) is immediately
+    // undone — leaking memory for a tid that is never reused. The purge runs at
+    // the tail of the drop hook, after the cascade, so it must end up absent.
     let (mut engine, tid, dir) = table_fixture(
         "drop_purges_versions",
         &[col_def("id", type_code::U64), col_def("val", type_code::I64)],
@@ -927,20 +810,12 @@ fn drop_table_purges_both_version_counters() {
     engine.create_index("public.t", &["val"], false).unwrap();
 
     assert!(
-        engine.caches.index_version.contains_key(&tid),
-        "live indexed table must have an index_version entry"
-    );
-    assert!(
         engine.caches.schema_version.contains_key(&tid),
         "live table must have a schema_version entry"
     );
 
     engine.drop_table("public.t").unwrap();
 
-    assert!(
-        !engine.caches.index_version.contains_key(&tid),
-        "index_version must be purged post-cascade (the index retraction re-creates it)"
-    );
     assert!(
         !engine.caches.schema_version.contains_key(&tid),
         "schema_version must be purged post-cascade (the column retraction re-creates it)"
@@ -956,14 +831,7 @@ fn drop_table_purges_both_version_counters() {
 fn test_create_unique_index_on_string_blob_rejected() {
     let dir = temp_dir("uidx_string_reject");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let blob_col = ColumnDef {
-        name: "data".into(),
-        type_code: type_code::BLOB,
-        is_nullable: false,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-        is_hidden: false,
-    };
+    let blob_col = col_def("data", type_code::BLOB);
     let cols = vec![
         col_def("id", type_code::U64),
         col_def("name", type_code::STRING),
@@ -1025,7 +893,10 @@ fn test_promote_unique_index_over_fk_column_empty() {
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
-    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("refc", type_code::U64, parent_tid, 0),
+    ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // FK auto-index registered (non-unique) on col 1 at create time.
@@ -1054,7 +925,10 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
-    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("refc", type_code::U64, parent_tid, 0),
+    ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Seed DISTINCT refc values (ingest_to_family bypasses FK validation).
@@ -1087,7 +961,10 @@ fn test_unique_index_over_fk_column_duplicate_data_rejected() {
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
-    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("refc", type_code::U64, parent_tid, 0),
+    ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Seed DUPLICATE refc values.
@@ -1127,7 +1004,10 @@ fn test_drop_unique_index_on_fk_column_demotes() {
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
-    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("refc", type_code::U64, parent_tid, 0),
+    ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     engine.create_index("public.child", &["refc"], true).unwrap();
@@ -1165,7 +1045,10 @@ fn test_drop_unique_index_on_fk_column_keeps_shared_directory() {
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
-    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("refc", type_code::U64, parent_tid, 0),
+    ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
     engine.create_index("public.child", &["refc"], true).unwrap();
 
@@ -1237,7 +1120,10 @@ fn test_drop_index_permitted_on_lone_pk_target() {
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
-    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("p", parent_tid, 0)];
+    let child_cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("p", type_code::U64, parent_tid, 0),
+    ];
     engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Redundant unique index on the parent's lone PK column.
@@ -1264,7 +1150,10 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
     engine.create_index("public.parent", &["email"], true).unwrap();
 
     // Child references parent.email (col 1), legal because email is unique.
-    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("e", parent_tid, 1)];
+    let child_cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("e", type_code::U64, parent_tid, 1),
+    ];
     engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     let idx = make_secondary_index_name("public", "parent", "email");
@@ -1396,7 +1285,10 @@ fn test_promote_unique_duplicate_across_chunks_rejected() {
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
-    let child_cols = vec![col_def("cid", type_code::U64), fk_col_def("refc", parent_tid, 0)];
+    let child_cols = vec![
+        col_def("cid", type_code::U64),
+        fk_def("refc", type_code::U64, parent_tid, 0),
+    ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Duplicate refc=42 at pk 0 and pk 9; distinct in between (ingest_to_family
@@ -1566,14 +1458,7 @@ fn test_composite_index_null_in_any_key_skipped() {
         &[
             col_def("id", type_code::U64),
             col_def("a", type_code::U64),
-            ColumnDef {
-                name: "b".into(),
-                type_code: type_code::U64,
-                is_nullable: true,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-                is_hidden: false,
-            },
+            nullable_def("b", type_code::U64),
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
@@ -2315,17 +2200,7 @@ fn test_seek_by_index_range_retraction() {
 fn test_seek_by_index_range_null_excluded() {
     let (mut engine, tid, dir) = table_fixture(
         "catalog_range_null",
-        &[
-            col_def("id", type_code::U64),
-            ColumnDef {
-                name: "x".into(),
-                type_code: type_code::I64,
-                is_nullable: true,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-                is_hidden: false,
-            },
-        ],
+        &[col_def("id", type_code::U64), nullable_def("x", type_code::I64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
     let schema = engine.get_schema_desc(tid).unwrap();
@@ -2845,14 +2720,7 @@ fn test_seek_by_index_composite_prefix_null_gate() {
         &[
             col_def("id", type_code::U64),
             col_def("a", type_code::U64),
-            ColumnDef {
-                name: "b".into(),
-                type_code: type_code::U64,
-                is_nullable: true,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-                is_hidden: false,
-            },
+            nullable_def("b", type_code::U64),
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();

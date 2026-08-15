@@ -28,7 +28,7 @@ impl CatalogEngine {
     #[cfg(test)]
     pub(crate) fn create_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
-        if self.caches.schema_by_name.contains_key(name) {
+        if self.has_schema(name) {
             return Err(format!("Schema already exists: {name}"));
         }
         let sid = self.allocate_schema_id();
@@ -52,7 +52,7 @@ impl CatalogEngine {
     #[cfg(test)]
     pub(crate) fn drop_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
-        if !self.caches.schema_by_name.contains_key(name) {
+        if !self.has_schema(name) {
             return Err("Schema does not exist".into());
         }
         if name == "_system" {
@@ -159,7 +159,7 @@ impl CatalogEngine {
         validate_user_identifier(schema_name)?;
         validate_user_identifier(table_name)?;
 
-        if !self.caches.schema_by_name.contains_key(schema_name) {
+        if !self.has_schema(schema_name) {
             return Err("Schema does not exist".into());
         }
         let qualified = format!("{schema_name}.{table_name}");

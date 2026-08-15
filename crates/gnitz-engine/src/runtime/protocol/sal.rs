@@ -946,8 +946,7 @@ impl SalWriter {
     /// counter (Design 2: caller controls zone-LSN allocation).
     ///
     /// `prebuilt_schema_block`: when `Some`, the bytes are copied into each
-    /// slot's schema region instead of building one from `schema` + names.
-    /// Mutually exclusive with `col_names_opt`; passing both is a bug.
+    /// slot's schema region instead of building one from `schema`.
     ///
     /// `schema: None` (with no prebuilt block) emits no schema block at all —
     /// the command verbs whose worker arm resolves its own schema from its own
@@ -964,7 +963,6 @@ impl SalWriter {
         wire_flags: u64,
         worker_batches: &[Option<&Batch>],
         schema: Option<&SchemaDescriptor>,
-        col_names_opt: Option<&[&[u8]]>,
         seek_pk: u128,
         seek_col_idx: u64,
         req_ids: &[u64],
@@ -982,10 +980,6 @@ impl SalWriter {
             nw
         );
         debug_assert!(
-            prebuilt_schema_block.is_none() || col_names_opt.is_none(),
-            "write_group_direct: prebuilt_schema_block and col_names_opt are mutually exclusive",
-        );
-        debug_assert!(
             schema.is_some() || prebuilt_schema_block.is_some() || worker_batches.iter().all(|b| b.is_none()),
             "write_group_direct: data without a schema — `decode_wire` rejects FLAG_HAS_DATA \
              without FLAG_HAS_SCHEMA",
@@ -1001,7 +995,6 @@ impl SalWriter {
             seek_col_idx,
             request_id: req_ids[w],
             schema,
-            col_names: col_names_opt,
             data: WireData::Whole(worker_batches.get(w).and_then(|opt| *opt)),
             prebuilt_schema_block,
             seek_pk_extra,
@@ -1138,7 +1131,6 @@ impl SalWriter {
                 wire_flags,
                 &refs,
                 Some(schema),
-                None,
                 0,
                 seek_col_idx,
                 req_ids,
@@ -1156,7 +1148,7 @@ impl SalWriter {
         let schema_block: &[u8] = match prebuilt_schema_block {
             Some(b) => b,
             None => {
-                owned_block = build_schema_wire_block(schema, &[], 0, target_id);
+                owned_block = build_schema_wire_block(schema, target_id);
                 &owned_block
             }
         };
@@ -1219,8 +1211,7 @@ impl SalWriter {
     /// Does NOT sync/signal. `lsn` is supplied by the caller.
     ///
     /// `prebuilt_schema_block`: when `Some`, the bytes are copied into the
-    /// schema region instead of being built from `schema` + names. Mutually
-    /// exclusive with `col_names_opt`; passing both is a bug.
+    /// schema region instead of being built from `schema`.
     ///
     /// `schema: None` emits no schema block, as in `write_group_direct` — the
     /// control-only broadcasts (`FLAG_FLUSH`/`FLAG_FLUSH_EPH`/`FLAG_SHUTDOWN`)
@@ -1233,15 +1224,10 @@ impl SalWriter {
         sal_flags: u32,
         batch: Option<&Batch>,
         schema: Option<&SchemaDescriptor>,
-        col_names_opt: Option<&[&[u8]]>,
         seek_pk: u128,
         prebuilt_schema_block: Option<&[u8]>,
     ) -> Result<(), String> {
         let nw = self.m2w_efds.len();
-        debug_assert!(
-            prebuilt_schema_block.is_none() || col_names_opt.is_none(),
-            "write_broadcast_direct: prebuilt_schema_block and col_names_opt are mutually exclusive",
-        );
         debug_assert!(
             schema.is_some() || prebuilt_schema_block.is_some() || batch.is_none(),
             "write_broadcast_direct: data without a schema — `decode_wire` rejects FLAG_HAS_DATA \
@@ -1252,7 +1238,6 @@ impl SalWriter {
             target_id: target_id as u64,
             seek_pk,
             schema,
-            col_names: col_names_opt,
             data: WireData::Whole(batch),
             prebuilt_schema_block,
             ..Default::default()

@@ -577,7 +577,7 @@ impl CatalogEngine {
         for i in 0..batch.count {
             if batch.get_weight(i) > 0 {
                 let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
-                if self.caches.schema_by_name.contains_key(&name) {
+                if self.has_schema(&name) {
                     return Err(format!("Schema already exists: {name}"));
                 }
             } else {

@@ -50,12 +50,6 @@ pub(crate) struct CatalogCacheSet {
     /// Absent entries implicitly resolve to version 1 (base version).
     /// Version 0 is reserved as "client has no cached schema".
     pub(crate) schema_version: FxHashMap<i64, u16>,
-    /// Per-table index-metadata version (wraps 255 → 1, never 0).
-    /// Absent ⇒ 1 (base). 0 is the client sentinel "no cached index list".
-    /// `u8` because it travels in 8 free wire bits (bits 40-47); a wider
-    /// counter truncated to 8 bits would both alias distinct values and emit
-    /// the reserved `0` sentinel on overflow.
-    pub(crate) index_version: FxHashMap<i64, u8>,
     pub(crate) index_by_name: FxHashMap<String, i64>,
     pub(crate) index_by_id: FxHashMap<i64, String>,
     pub(crate) indices_by_owner: FxHashMap<i64, Vec<i64>>,
@@ -119,20 +113,13 @@ impl CatalogCacheSet {
         self.schema_version.get(&id).copied().unwrap_or(1)
     }
 
-    /// Return the current index-metadata version for `id`. Absent = version 1.
-    pub(crate) fn get_index_version(&self, id: i64) -> u8 {
-        self.index_version.get(&id).copied().unwrap_or(1)
-    }
-
-    /// Drop both per-table version counters when a table/view is fully removed.
-    /// Call this at the tail of the drop hook — *after* the column / index
-    /// cascade, whose `invalidate_col_names` / `apply_index_caches` bumps would
-    /// otherwise `or_insert` the counters straight back. Table ids are
-    /// monotonic and never reused, so a counter left behind here would become
-    /// permanent dead memory.
-    pub(crate) fn purge_table_versions(&mut self, id: i64) {
+    /// Drop the per-table schema version when a table/view is fully removed.
+    /// Call this at the tail of the drop hook — *after* the column cascade,
+    /// whose `invalidate_col_names` bump would otherwise `or_insert` the counter
+    /// straight back. Table ids are monotonic and never reused, so a counter
+    /// left behind here would become permanent dead memory.
+    pub(crate) fn purge_schema_version(&mut self, id: i64) {
         self.schema_version.remove(&id);
-        self.index_version.remove(&id);
     }
 }
 
@@ -194,11 +181,11 @@ impl CatalogEngine {
                 // `clear_col_cache_no_bump` is the only column-cache cleanup on
                 // the rollback path (`ctx.in_rollback()`) where
                 // `cascade_retract_columns` is skipped.
-                // The schema_version / index_version counters are NOT removed
-                // here: the column/index cascade fires AFTER this applier
-                // (it runs before hook_table_register) and would `or_insert`
-                // them straight back. They are purged post-cascade by
-                // `purge_table_versions` at the tail of the drop hook.
+                // The schema_version counter is NOT removed here: the column
+                // cascade fires AFTER this applier (it runs before
+                // hook_table_register) and would `or_insert` it straight back.
+                // It is purged post-cascade by `purge_schema_version` at the
+                // tail of the drop hook.
                 self.caches.clear_col_cache_no_bump(tid);
                 self.caches.entity_by_id.remove(&tid);
             }
@@ -244,9 +231,9 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Maintain `index_by_name`, `index_by_id`, `indices_by_owner` and the
-    /// per-owner index version from one pass over an IDX_TAB delta — all four
-    /// key off the same row and share their lifecycle.
+    /// Maintain `index_by_name`, `index_by_id` and `indices_by_owner` from one
+    /// pass over an IDX_TAB delta — all three key off the same row and share
+    /// their lifecycle.
     pub(crate) fn apply_index_caches(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
@@ -263,17 +250,6 @@ impl CatalogEngine {
                 self.caches.index_by_id.remove(&idx_id);
                 remove_where(&mut self.caches.indices_by_owner, owner_id, |&id| id == idx_id);
             }
-            // Bump unconditionally so DROP-then-recreate on the same column
-            // changes the epoch even when the net (col_idx, is_unique) set looks
-            // identical. Per-row (not per-batch) matches schema_version, which
-            // also bumps per row in apply_col_names_invalidate. Over-bumping
-            // within one DDL only ever costs a client a spurious re-fetch — it
-            // is never incorrect, because the epoch is always validated against
-            // a fresh fetch. The post-cascade purge (purge_table_versions)
-            // removes the entry an owner drop re-creates here. The bump wraps
-            // 255 → 1, never 0 (the client sentinel "no cached index list").
-            let v = self.caches.index_version.entry(owner_id).or_insert(1);
-            *v = if *v == u8::MAX { 1 } else { *v + 1 };
         }
         Ok(())
     }

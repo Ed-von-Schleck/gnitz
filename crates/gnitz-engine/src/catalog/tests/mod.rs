@@ -21,22 +21,10 @@ use crate::schema::type_code;
 
 use std::fs;
 
-use crate::test_support::scratch_dir;
+use crate::test_support::{col_def, fk_def, nullable_def, scratch_dir, uuid_def};
 
 fn temp_dir(name: &str) -> String {
     scratch_dir("catalog", name)
-}
-
-/// A plain non-nullable, non-FK, non-hidden column of the given type.
-fn col_def(name: &str, type_code: u8) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        type_code,
-        is_nullable: false,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-        is_hidden: false,
-    }
 }
 
 // Arbitrary fixed 128-bit values for UUID columns; distinct from each other,
@@ -44,20 +32,6 @@ fn col_def(name: &str, type_code: u8) -> ColumnDef {
 // and a valid child references, `UUID_B` a value no parent holds.
 const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
 const UUID_B: u128 = 0x0000_0000_0000_BEEF_0000_0000_0000_DEAD;
-
-/// A plain non-nullable UUID column.
-fn uuid_def(name: &str) -> ColumnDef {
-    col_def(name, type_code::UUID)
-}
-
-/// A U64 column carrying an FK onto `(parent_tid, parent_col)`.
-fn fk_col_def(name: &str, parent_tid: i64, parent_col: u32) -> ColumnDef {
-    ColumnDef {
-        fk_table_id: parent_tid,
-        fk_col_idx: parent_col,
-        ..col_def(name, type_code::U64)
-    }
-}
 
 /// A non-nullable U64 schema column — the building block of the compound-PK
 /// fixtures below.

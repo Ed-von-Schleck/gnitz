@@ -2,14 +2,21 @@
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Column definition for create_table.
-#[derive(Clone, Debug)]
+/// Column definition for create_table. `Default` is the plain column — no
+/// nullability, no FK, no marker flags — so a construction site names only what
+/// it actually varies.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ColumnDef {
     pub(crate) name: String,
     pub(crate) type_code: u8,
     pub(crate) is_nullable: bool,
     pub(crate) fk_table_id: i64,
     pub(crate) fk_col_idx: u32,
+    /// SERIAL marker (COL_TAB `is_serial`). Like `is_hidden` the engine never
+    /// branches on it — it is echoed verbatim into reply schema blocks
+    /// (`META_FLAG_SERIAL`), which is what lets a client plan an INSERT into a
+    /// SERIAL table off a resolved schema instead of a COL_TAB scan.
+    pub(crate) is_serial: bool,
     /// Hidden key slot (COL_TAB `is_hidden`). The engine never branches on it —
     /// it is echoed verbatim into reply schema blocks (`META_FLAG_HIDDEN`) so
     /// clients can suppress the column in presentation.

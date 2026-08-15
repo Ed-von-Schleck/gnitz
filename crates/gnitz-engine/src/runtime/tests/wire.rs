@@ -5,6 +5,7 @@ use crate::runtime::wire::{
 };
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout};
+use crate::test_support::named_col_defs;
 use gnitz_wire::{encode_german_string, try_decode_german_string};
 
 fn simple_schema() -> SchemaDescriptor {
@@ -67,11 +68,9 @@ fn test_encode_decode_roundtrip_no_data() {
 #[test]
 fn test_encode_decode_roundtrip_with_schema() {
     let sd = simple_schema();
-    let names: Vec<&[u8]> = vec![b"id", b"value"];
     let wire = WireMsg {
         target_id: 1,
         schema: Some(&sd),
-        col_names: Some(&names),
         ..Default::default()
     }
     .encode_to_vec();
@@ -89,11 +88,9 @@ fn test_encode_decode_roundtrip_with_schema() {
 fn test_encode_decode_roundtrip_with_data() {
     let sd = simple_schema();
     let batch = make_simple_batch(100, 999);
-    let names: Vec<&[u8]> = vec![b"id", b"val"];
     let wire = WireMsg {
         target_id: 5,
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -203,8 +200,8 @@ fn test_wire_size_includes_request_id() {
 #[test]
 fn test_schema_roundtrip_with_names() {
     let sd = string_schema();
-    let names: Vec<&[u8]> = vec![b"pk_col", b"int_col", b"name_col"];
-    let batch = schema_to_batch(&sd, &names, 0);
+    let names = ["pk_col", "int_col", "name_col"];
+    let batch = schema_to_batch(&sd, Some(&named_col_defs(&names)));
     let (sd2, names2) = batch_to_schema(&batch).unwrap();
     assert_eq!(sd2.num_columns(), 3);
     assert_eq!(sd2.pk_indices(), &[0]);
@@ -221,10 +218,8 @@ fn test_schema_roundtrip_with_names() {
 fn test_flag_has_data_requires_schema() {
     let sd = simple_schema();
     let batch = make_simple_batch(1, 2);
-    let names: Vec<&[u8]> = vec![b"a", b"b"];
     let mut wire = WireMsg {
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -242,13 +237,13 @@ fn test_flag_has_data_requires_schema() {
 #[test]
 fn test_schema_roundtrip_long_names() {
     let sd = simple_schema();
-    let long_name = b"this_is_a_very_long_column_name_exceeding_twelve_bytes";
-    let names: Vec<&[u8]> = vec![b"pk", long_name];
-    let batch = schema_to_batch(&sd, &names, 0);
+    let long_name = "this_is_a_very_long_column_name_exceeding_twelve_bytes";
+    let names = ["pk", long_name];
+    let batch = schema_to_batch(&sd, Some(&named_col_defs(&names)));
     let (sd2, names2) = batch_to_schema(&batch).unwrap();
     assert_eq!(sd2.num_columns(), 2);
     assert_eq!(names2[0], b"pk");
-    assert_eq!(names2[1], long_name);
+    assert_eq!(names2[1], long_name.as_bytes());
 }
 
 /// Compound-PK order (including a non-identity `pk_indices` permutation) must
@@ -267,7 +262,7 @@ fn schema_roundtrip_wire_preserves_pk_order() {
     ];
     for &(cols, pk_indices) in cases {
         let original = SchemaDescriptor::new(cols, pk_indices);
-        let batch = schema_to_batch(&original, &[], 0);
+        let batch = schema_to_batch(&original, None);
         let (decoded, _names) = batch_to_schema(&batch).unwrap();
         assert!(
             original == decoded,
@@ -298,11 +293,9 @@ fn test_encode_decode_string_column() {
     batch.extend_col(1, &st2);
     batch.count += 1;
 
-    let names: Vec<&[u8]> = vec![b"id", b"val", b"name"];
     let wire = WireMsg {
         target_id: 10,
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -337,17 +330,14 @@ fn wire_size_matches_encode() {
     assert_eq!(sz, wire.len(), "wire_size mismatch (no data)");
 
     let sd = simple_schema();
-    let names: Vec<&[u8]> = vec![b"id", b"val"];
     let sz = WireMsg {
         schema: Some(&sd),
-        col_names: Some(&names),
         ..Default::default()
     }
     .size();
     let wire = WireMsg {
         target_id: 1,
         schema: Some(&sd),
-        col_names: Some(&names),
         ..Default::default()
     }
     .encode_to_vec();
@@ -356,7 +346,6 @@ fn wire_size_matches_encode() {
     let batch = make_simple_batch(100, 999);
     let sz = WireMsg {
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -364,7 +353,6 @@ fn wire_size_matches_encode() {
     let wire = WireMsg {
         target_id: 5,
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -390,11 +378,9 @@ fn wire_size_matches_encode() {
 fn encode_wire_into_roundtrip() {
     let sd = simple_schema();
     let batch = make_simple_batch(100, 999);
-    let names: Vec<&[u8]> = vec![b"id", b"val"];
 
     let sz = WireMsg {
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -403,7 +389,6 @@ fn encode_wire_into_roundtrip() {
     let written = WireMsg {
         target_id: 5,
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -425,7 +410,6 @@ fn encode_wire_into_roundtrip() {
 fn encode_wire_into_matches_encode_wire() {
     let sd = simple_schema();
     let batch = make_simple_batch(42, 123);
-    let names: Vec<&[u8]> = vec![b"id", b"val"];
 
     let wire = WireMsg {
         target_id: 10,
@@ -434,7 +418,6 @@ fn encode_wire_into_matches_encode_wire() {
         seek_pk: 5u128 | (6u128 << 64),
         seek_col_idx: 7,
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -442,7 +425,6 @@ fn encode_wire_into_matches_encode_wire() {
 
     let sz = WireMsg {
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -455,7 +437,6 @@ fn encode_wire_into_matches_encode_wire() {
         seek_pk: 5u128 | (6u128 << 64),
         seek_col_idx: 7,
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -469,7 +450,6 @@ fn encode_wire_into_matches_encode_wire() {
 #[test]
 fn prebuilt_schema_block_matches_inline_encode() {
     let sd = simple_schema();
-    let names: Vec<&[u8]> = vec![b"id", b"val"];
     let batch = make_simple_batch(7, 42);
     let target_id: u64 = 99;
 
@@ -477,14 +457,13 @@ fn prebuilt_schema_block_matches_inline_encode() {
     let inline = WireMsg {
         target_id,
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
     .encode_to_vec();
 
     // Prebuilt path.
-    let prebuilt = build_schema_wire_block(&sd, &names, 0, target_id as u32);
+    let prebuilt = build_schema_wire_block(&sd, target_id as u32);
     let sz = WireMsg {
         schema: Some(&sd),
         prebuilt_schema_block: Some(&prebuilt),
@@ -505,11 +484,12 @@ fn prebuilt_schema_block_matches_inline_encode() {
     assert_eq!(buf, inline, "prebuilt schema block must produce identical wire bytes");
 }
 
-/// A cached schema block with no col_names is valid and round-trips correctly.
+/// A cached schema block with no column defs — every name empty — is valid and
+/// round-trips correctly.
 #[test]
 fn prebuilt_schema_block_no_col_names_roundtrips() {
     let sd = simple_schema();
-    let prebuilt = build_schema_wire_block(&sd, &[], 0, 5);
+    let prebuilt = build_schema_wire_block(&sd, 5);
     let sz = WireMsg {
         schema: Some(&sd),
         prebuilt_schema_block: Some(&prebuilt),
@@ -559,11 +539,9 @@ fn test_decode_wire_uses_embedded_schema() {
     );
 
     let batch = make_simple_batch(1, 42);
-    let names: Vec<&[u8]> = vec![b"id", b"val"];
     let wire = WireMsg {
         target_id: 1,
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -660,12 +638,10 @@ fn peek_client_control_rejects_short_data() {
 #[test]
 fn decode_wire_truncated_schema_block_returns_err() {
     let sd = simple_schema();
-    let names: Vec<&[u8]> = vec![b"id", b"val"];
     // Encode with schema but no data.
     let wire = WireMsg {
         target_id: 1,
         schema: Some(&sd),
-        col_names: Some(&names),
         ..Default::default()
     }
     .encode_to_vec();
@@ -686,11 +662,9 @@ fn decode_wire_truncated_schema_block_returns_err() {
 fn decode_wire_truncated_data_block_returns_err() {
     let sd = simple_schema();
     let batch = make_simple_batch(1, 42);
-    let names: Vec<&[u8]> = vec![b"id", b"val"];
     let wire = WireMsg {
         target_id: 1,
         schema: Some(&sd),
-        col_names: Some(&names),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }

@@ -31,7 +31,7 @@ fn schema_block_4col() -> Vec<u8> {
         SchemaColumn::new(type_code::F64, 1),
     ];
     let schema = SchemaDescriptor::new(&cols, &[0]);
-    build_schema_wire_block(&schema, &[], 0, 7)
+    build_schema_wire_block(&schema, 7)
 }
 
 fn set_u32(buf: &mut [u8], off: usize, v: u32) {
@@ -312,7 +312,7 @@ fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
 
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-        let block = build_schema_wire_block(&schema, &[], 0, 16);
+        let block = build_schema_wire_block(&schema, 16);
         let props = compute_wire_props(&schema);
         let req_ids: Vec<u64> = (0..nw as u64).collect();
         with_commit_indices(&batch, &schema, nw, |wi| {

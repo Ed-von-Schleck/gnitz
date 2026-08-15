@@ -137,9 +137,7 @@ impl CatalogEngine {
                         name: c.name.to_string(),
                         type_code: c.type_code as u8,
                         is_nullable: c.nullable,
-                        fk_table_id: 0,
-                        fk_col_idx: 0,
-                        is_hidden: false,
+                        ..Default::default()
                     };
                     push_col_tab_row(&mut bb, info.id, OWNER_KIND_TABLE, i as i64, &cd, 1);
                 }

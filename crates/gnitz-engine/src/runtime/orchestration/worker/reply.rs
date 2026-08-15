@@ -71,7 +71,7 @@ impl WorkerProcess {
             // table's version does not describe it — reporting the table's would
             // let a version-suppression path drop a block the reader still needs.
             ReplySchema::OneOff(s) => {
-                let block = Rc::new(ipc::build_schema_wire_block(s, &[], 0, tid_key as u32));
+                let block = Rc::new(ipc::build_schema_wire_block(s, tid_key as u32));
                 (Some(block), 0, schema_wire_safe(s))
             }
             ReplySchema::Table(s) => {
@@ -527,7 +527,7 @@ pub(crate) fn send_unique_preflight_keys(
     keys: &mut crate::storage::KeyProducer,
 ) {
     debug_assert!(keys_per_frame > 0, "keys_per_frame must be positive");
-    let schema_block = ipc::build_schema_wire_block(frame_schema, &[], 0, target_id as u32);
+    let schema_block = ipc::build_schema_wire_block(frame_schema, target_id as u32);
 
     // Reusable chunk batch: filled, encoded, and cleared per frame, sized up
     // front to exactly one frame's fill.

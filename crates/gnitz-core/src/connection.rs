@@ -7,12 +7,13 @@ use crate::protocol::message::{
 };
 use crate::protocol::{
     encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, recv_message, send_message,
-    send_message_with_extra, wire_flags_get_index_version, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
-    wire_flags_set_index_version, wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError,
-    Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE,
-    FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_PUSH, FLAG_SCAN_SPEC, FLAG_SEEK,
-    FLAG_SEEK_BY_INDEX, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    send_message_with_extra, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
+    wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError, Schema, WireConflictMode,
+    ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
+    FLAG_CONTINUATION, FLAG_PUSH, FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_ERROR,
+    STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
+use gnitz_wire::RelDescriptorBlob;
 use lru::LruCache;
 
 pub use gnitz_wire::{
@@ -78,6 +79,16 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
     Ok(msg)
 }
 
+/// Which relation a RESOLVE request describes. The wire carries an id field and
+/// a name blob and lets the name win, but exactly one is ever meaningful — this
+/// says which, so no caller has to encode that as a `0` / `""` sentinel pair.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum RelTarget<'a> {
+    /// The canonical `"schema_name.relation_name"`.
+    Name(&'a str),
+    Id(u64),
+}
+
 /// A protocol session: the transport plus all per-connection protocol state
 /// (client id, negotiated frame ceiling, the schema LRU, and the warm/cold
 /// packing, continuation reassembly, cache absorption, and status→error
@@ -118,6 +129,13 @@ impl Session {
 
     pub fn close(self) {
         // The transport is dropped here, which closes the connection.
+    }
+
+    /// Request frames this session has written since it connected. Counted in
+    /// the transport, so it covers every verb without a per-path bump. Tests
+    /// assert on it to pin the per-statement round-trip count.
+    pub fn requests_sent(&self) -> u64 {
+        self.transport.frames_sent()
     }
 
     /// Handle that unblocks a blocking recv parked in another thread (the
@@ -294,31 +312,61 @@ impl Session {
         self.recover_schema(table_id, msg)
     }
 
-    /// Pure transport for GET_INDICES: send the cached index epoch and receive
-    /// the server's reply on a dedicated path — `recv_message(fd, None, ..)`,
-    /// never the cache-aware recv — so the per-table `schema_cache` is
-    /// untouched. The reply is schema-bearing only when the list changed; the
-    /// "unchanged" reply carries no data and needs no schema. Returns the raw
-    /// `(data_batch, server_epoch)` and leaves the `IndexMeta` decode to
-    /// `GnitzClient`, where the `col_u64` helper lives.
-    pub(crate) fn fetch_indices(
+    /// Describe one relation in a single round trip: `(live tid, schema,
+    /// descriptor)`, or `None` when no such relation exists — a successful
+    /// answer the caller renders in its own wording.
+    ///
+    /// The descriptor's foreign keys are merged into the schema here, while the
+    /// `Arc` is still unique, so the block installed in `schema_cache` is the
+    /// same FK-complete schema the caller gets rather than a second copy of it.
+    ///
+    /// The reply is received uncorrelated (`recv_message(.., None, ..)`): it
+    /// never carries data, and the cache-aware `recv_cached` would key the block
+    /// under the *requested* tid, which for a by-name resolve is 0. The block is
+    /// instead installed under the **live** tid the reply carries, which is what
+    /// keeps a following `scan`/`push` on its warm path.
+    pub(crate) fn resolve(
         &mut self,
-        table_id: u64,
-        cached_epoch: u8,
-    ) -> Result<(Option<ZSetBatch>, u8), ClientError> {
-        let flags = wire_flags_set_index_version(FLAG_GET_INDICES, cached_epoch);
-        send_message(
+        target: RelTarget<'_>,
+    ) -> Result<Option<(u64, Arc<Schema>, RelDescriptorBlob)>, ClientError> {
+        // The one place the request's "name wins, else id" encoding is spelled.
+        let (target_id, qname) = match target {
+            RelTarget::Name(q) => (0, q),
+            RelTarget::Id(tid) => (tid, ""),
+        };
+        // The name rides an explicit extra blob: `send_message` would derive one
+        // from `PkTuple::split_wire` and silently truncate past `MAX_PK_BYTES`.
+        send_message_with_extra(
             &mut self.transport,
-            table_id,
+            target_id,
             self.client_id,
-            flags,
-            &PkTuple::EMPTY,
+            FLAG_RESOLVE,
             0,
-            None,
-            None,
+            qname.as_bytes(),
         )?;
         let msg = check_response(recv_message(&mut self.transport, None, self.max_payload_len)?)?;
-        Ok((msg.data_batch, wire_flags_get_index_version(msg.flags)))
+        let ncols = msg.schema.as_ref().map_or(0, |s| s.columns.len());
+        let Some(desc) = RelDescriptorBlob::decode(&msg.seek_pk_extra, ncols).map_err(ClientError::ServerError)? else {
+            return Ok(None);
+        };
+        let mut schema = msg
+            .schema
+            .ok_or_else(|| ClientError::ServerError("resolve reply carried no schema block".to_string()))?;
+        // `batch_to_schema` rebuilds every column-layout fact but leaves the FK
+        // fields at 0 — a reference to *another* relation rides the descriptor.
+        // `decode` bounded every `col_idx` against this schema's column count.
+        if !desc.fks.is_empty() {
+            let cols = &mut Arc::make_mut(&mut schema).columns;
+            for fk in &desc.fks {
+                cols[fk.col_idx as usize].fk_table_id = fk.fk_table_id;
+                cols[fk.col_idx as usize].fk_col_idx = fk.fk_col_idx as u64;
+            }
+        }
+        self.schema_cache.put(
+            msg.target_id,
+            (Arc::clone(&schema), wire_flags_get_schema_version(msg.flags)),
+        );
+        Ok(Some((msg.target_id, schema, desc)))
     }
 
     // ── Async-shared protocol surface ──────────────────────────────────────
@@ -654,6 +702,7 @@ mod tests {
             schema: None,
             data_batch: None,
             error_text,
+            seek_pk_extra: Vec::new(),
         }
     }
 

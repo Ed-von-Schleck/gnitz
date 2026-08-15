@@ -193,7 +193,6 @@ impl MasterDispatcher {
             wire_flags,
             &[],
             None,
-            None,
             seek_pk,
             seek_col_idx,
             req_ids,
@@ -232,7 +231,6 @@ impl MasterDispatcher {
             0,
             worker_batches,
             Some(schema),
-            None,
             seek_pk,
             seek_col_idx,
             req_ids,
@@ -328,7 +326,7 @@ impl MasterDispatcher {
         seek_pk: u128,
     ) -> Result<(), String> {
         self.sal
-            .write_broadcast_direct(target_id as u32, lsn, flags, None, schema, None, seek_pk, None)?;
+            .write_broadcast_direct(target_id as u32, lsn, flags, None, schema, seek_pk, None)?;
         self.signal_all();
         Ok(())
     }
@@ -1034,7 +1032,6 @@ impl MasterDispatcher {
             FLAG_DDL_SYNC | if zone_start { FLAG_ZONE_START } else { 0 },
             Some(batch),
             Some(&schema),
-            None,
             0,
             Some(schema_block.as_slice()),
         )?;

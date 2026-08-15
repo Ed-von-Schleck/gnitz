@@ -1330,6 +1330,7 @@ mod tests {
     use super::*;
     use crate::runtime::w2m_ring;
     use crate::schema::SchemaDescriptor;
+    use crate::test_support::col_def;
 
     fn test_schema() -> SchemaDescriptor {
         use crate::schema::{type_code, SchemaColumn};
@@ -1720,7 +1721,7 @@ mod tests {
     fn test_pending_scan_first_chunk_includes_schema() {
         let schema = test_schema();
         let batch = make_n_row_batch(schema, 10);
-        let schema_block = Rc::new(ipc::build_schema_wire_block(&schema, &[], 0, 1));
+        let schema_block = Rc::new(ipc::build_schema_wire_block(&schema, 1));
 
         let (region, writer) = make_ring();
         let ptr = region.ptr();
@@ -1899,29 +1900,11 @@ mod tests {
     /// TEXT dimension table hits.
     #[test]
     fn test_force_fifo_queues_non_wire_safe_single_frame() {
-        use crate::catalog::ColumnDef;
         use crate::schema::type_code;
 
         let dir = worker_temp_dir("force_fifo_text");
         let mut engine = CatalogEngine::open(&dir).unwrap();
-        let cols = vec![
-            ColumnDef {
-                name: "id".into(),
-                type_code: type_code::U64,
-                is_nullable: false,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-                is_hidden: false,
-            },
-            ColumnDef {
-                name: "s".into(),
-                type_code: type_code::STRING,
-                is_nullable: false,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-                is_hidden: false,
-            },
-        ];
+        let cols = vec![col_def("id", type_code::U64), col_def("s", type_code::STRING)];
         let tid = engine.create_table("public.tfifo", &cols, &[0]).unwrap();
         let schema = engine.get_schema_desc(tid).unwrap();
         assert!(!schema_wire_safe(&schema), "STRING schema must be non-wire-safe");
@@ -2026,8 +2009,8 @@ mod tests {
         );
         let batch_a = make_n_row_batch(schema_a, 10);
         let batch_b = make_n_row_batch(schema_b, 5);
-        let block_a = Rc::new(ipc::build_schema_wire_block(&schema_a, &[], 0, 1));
-        let block_b = Rc::new(ipc::build_schema_wire_block(&schema_b, &[], 0, 2));
+        let block_a = Rc::new(ipc::build_schema_wire_block(&schema_a, 1));
+        let block_b = Rc::new(ipc::build_schema_wire_block(&schema_b, 2));
 
         // Budget: first chunk (with A's schema block) carries ~4 rows, so
         // train A spans at least two frames.
@@ -2198,29 +2181,11 @@ mod tests {
     /// the variable-width streaming chunker is an explicit non-goal.
     #[test]
     fn test_stream_batch_response_oversized_string_errors() {
-        use crate::catalog::ColumnDef;
         use crate::schema::type_code;
 
         let dir = worker_temp_dir("string_oversized");
         let mut engine = CatalogEngine::open(&dir).unwrap();
-        let cols = vec![
-            ColumnDef {
-                name: "id".into(),
-                type_code: type_code::U64,
-                is_nullable: false,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-                is_hidden: false,
-            },
-            ColumnDef {
-                name: "s".into(),
-                type_code: type_code::STRING,
-                is_nullable: false,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-                is_hidden: false,
-            },
-        ];
+        let cols = vec![col_def("id", type_code::U64), col_def("s", type_code::STRING)];
         let tid = engine.create_table("public.tstr", &cols, &[0]).unwrap();
         let schema = engine.get_schema_desc(tid).unwrap();
         assert!(!schema_wire_safe(&schema));
@@ -2247,20 +2212,15 @@ mod tests {
     /// table reply would be decoded with the projected stride).
     #[test]
     fn test_stream_batch_response_projected_schema_one_off_block() {
-        use crate::catalog::ColumnDef;
         use crate::schema::type_code;
 
         let dir = worker_temp_dir("projected_one_off");
         let mut engine = CatalogEngine::open(&dir).unwrap();
-        let mk = |name: &str| ColumnDef {
-            name: name.into(),
-            type_code: type_code::U64,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        };
-        let cols = vec![mk("id"), mk("a"), mk("b")];
+        let cols = vec![
+            col_def("id", type_code::U64),
+            col_def("a", type_code::U64),
+            col_def("b", type_code::U64),
+        ];
         let tid = engine.create_table("public.tproj", &cols, &[0]).unwrap();
         let table_schema = engine.get_schema_desc(tid).unwrap();
         let projected = crate::schema::project_schema(&table_schema, &[1]);
@@ -2290,7 +2250,7 @@ mod tests {
             .stream_batch_response(tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0)
             .is_ok());
         assert_eq!(wp.pending_streams.len(), 1);
-        let expected_block = ipc::build_schema_wire_block(&projected, &[], 0, tid as u32);
+        let expected_block = ipc::build_schema_wire_block(&projected, tid as u32);
         let ps = wp.pending_streams.front().unwrap();
         assert!(
             matches!(ps.kind, PendingScanKind::WireSafe { .. }),

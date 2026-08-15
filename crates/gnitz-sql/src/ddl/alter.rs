@@ -139,7 +139,7 @@ fn rename_relation(
     validate_user_name(&new_name)?;
 
     client
-        .alter_rename_relation(schema_name, is_view, &source_name, &new_name)
+        .alter_rename_relation(schema_name, &source_name, &new_name)
         .map_err(GnitzSqlError::Exec)?;
     Ok(altered(relation_kind(is_view), new_name))
 }
@@ -224,8 +224,9 @@ fn drop_column(
     // Reject a column covered by a secondary index (best-effort UX — a concurrent
     // CREATE INDEX could still slip one in; the engine does not re-guard, but a
     // leftover index over the still-NOT-NULL hidden column is harmless and
-    // dormant). One GET_INDICES round-trip; `cols` are physical indices in the
-    // same space as `col_idx`, so a composite-index member is caught.
+    // dormant). Served from the statement's resolved descriptor; `cols` are
+    // physical indices in the same space as `col_idx`, so a composite-index
+    // member is caught.
     let indexes = client.table_indexes(tid).map_err(GnitzSqlError::Exec)?;
     if indexes.iter().any(|im| im.cols.as_slice().contains(&(col_idx as u32))) {
         return Err(GnitzSqlError::Unsupported(format!(
@@ -378,6 +379,7 @@ fn resolve_alter_base_table_with_schema(
     if !alter_base_table_exists(client, schema_name, source_name, if_exists, op)? {
         return Ok(None);
     }
+    // Second call, but a memo hit inside the statement bracket: no round trip.
     let (tid, schema) = client
         .resolve_table_id(schema_name, source_name)
         .map_err(GnitzSqlError::Exec)?;

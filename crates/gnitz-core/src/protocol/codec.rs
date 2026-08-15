@@ -2,7 +2,7 @@ use super::error::ProtocolError;
 use super::types::{
     meta_schema, type_code_from_u64, BatchAppender, ColData, ColumnDef, Schema, ZSetBatch, MAX_COLUMNS,
 };
-use gnitz_wire::{col_meta_hidden, col_meta_nullable, col_meta_pk_pos, pack_col_meta_flags};
+use gnitz_wire::{col_meta_hidden, col_meta_nullable, col_meta_pk_pos, col_meta_serial, pack_col_meta_flags};
 
 /// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
 /// Mirrors Python's `schema_to_batch`.
@@ -19,7 +19,7 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
             // Position-in-PK-tuple is carried so compound `PRIMARY KEY (b, a)`
             // decodes back to the user-declared order.
             let pk_pos = schema.pk_cols.iter().position(|&p| p == ci).map(|p| p as u8);
-            let flags = pack_col_meta_flags(col.is_nullable, col.is_hidden, pk_pos);
+            let flags = pack_col_meta_flags(col.is_nullable, col.is_hidden, col.is_serial, pk_pos);
             appender
                 .add_row(ci as u128, 1)
                 .u64_val(col.type_code as u64)
@@ -83,6 +83,9 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
         let mut col = ColumnDef::new(name, tc, is_nullable);
         if is_hidden {
             col = col.hidden();
+        }
+        if col_meta_serial(flags) {
+            col = col.serial();
         }
         columns.push(col);
     }
@@ -247,7 +250,7 @@ mod tests {
     fn test_schema_meta_roundtrip() {
         let original = Schema {
             columns: vec![
-                ColumnDef::new("id", TypeCode::U64, false).hidden(),
+                ColumnDef::new("id", TypeCode::U64, false).hidden().serial(),
                 ColumnDef::new("name", TypeCode::String, true),
                 ColumnDef::new("score", TypeCode::F64, false),
                 ColumnDef::new("tag", TypeCode::I32, true),

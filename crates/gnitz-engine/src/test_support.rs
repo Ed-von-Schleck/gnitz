@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 
 use proptest::prelude::*;
 
+use crate::catalog::ColumnDef;
 use crate::schema::key::{compare_pk_bytes, encode_leading_opk};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout};
@@ -375,4 +376,46 @@ impl Drop for SharedRegion {
             libc::munmap(self.ptr as *mut libc::c_void, self.size);
         }
     }
+}
+
+// ── Catalog ColumnDef fixtures ────────────────────────────────────────────
+//
+// `ColumnDef: Default` is the plain column, so each builder names only what it
+// varies and a new field costs no construction site anything.
+
+/// A plain non-nullable, non-FK, non-hidden column of the given type.
+pub(crate) fn col_def(name: &str, type_code: u8) -> ColumnDef {
+    ColumnDef {
+        name: name.into(),
+        type_code,
+        ..Default::default()
+    }
+}
+
+/// A plain non-nullable UUID column.
+pub(crate) fn uuid_def(name: &str) -> ColumnDef {
+    col_def(name, type_code::UUID)
+}
+
+/// A nullable column of the given type.
+pub(crate) fn nullable_def(name: &str, type_code: u8) -> ColumnDef {
+    ColumnDef {
+        is_nullable: true,
+        ..col_def(name, type_code)
+    }
+}
+
+/// A column of `type_code` carrying an FK onto `(parent_tid, parent_col)`.
+pub(crate) fn fk_def(name: &str, type_code: u8, parent_tid: i64, parent_col: u32) -> ColumnDef {
+    ColumnDef {
+        fk_table_id: parent_tid,
+        fk_col_idx: parent_col,
+        ..col_def(name, type_code)
+    }
+}
+
+/// Column defs carrying just the names, for a test that needs a *named* schema
+/// block. Type and nullability come off the descriptor, so only `name` matters.
+pub(crate) fn named_col_defs<S: AsRef<str>>(names: &[S]) -> Vec<ColumnDef> {
+    names.iter().map(|n| col_def(n.as_ref(), 0)).collect()
 }

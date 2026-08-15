@@ -4,8 +4,8 @@
 
 use super::*;
 use gnitz_wire::{
-    COLTAB_COL_FK_COL_IDX, COLTAB_COL_FK_TABLE_ID, COLTAB_COL_IS_HIDDEN, COLTAB_COL_IS_NULLABLE, COLTAB_COL_NAME,
-    COLTAB_COL_TYPE_CODE,
+    COLTAB_COL_FK_COL_IDX, COLTAB_COL_FK_TABLE_ID, COLTAB_COL_IS_HIDDEN, COLTAB_COL_IS_NULLABLE, COLTAB_COL_IS_SERIAL,
+    COLTAB_COL_NAME, COLTAB_COL_TYPE_CODE,
 };
 
 /// The one place COL_TAB column records become a `SchemaDescriptor`, so it is
@@ -80,6 +80,7 @@ impl CatalogEngine {
                     is_nullable: cursor_read_u64(&cursor, COLTAB_COL_IS_NULLABLE) != 0,
                     fk_table_id: cursor_read_u64(&cursor, COLTAB_COL_FK_TABLE_ID) as i64,
                     fk_col_idx: cursor_read_u64(&cursor, COLTAB_COL_FK_COL_IDX) as u32,
+                    is_serial: cursor_read_u64(&cursor, COLTAB_COL_IS_SERIAL) != 0,
                     is_hidden: cursor_read_u64(&cursor, COLTAB_COL_IS_HIDDEN) != 0,
                 });
             }
@@ -120,7 +121,6 @@ impl CatalogEngine {
             .unwrap_or("")
     }
 
-    #[cfg(test)]
     pub(crate) fn has_schema(&self, name: &str) -> bool {
         self.caches.schema_by_name.contains_key(name)
     }
@@ -202,10 +202,14 @@ impl CatalogEngine {
         self.get_qualified_name(table_id).unwrap_or(("?", "?"))
     }
 
+    /// The entity id registered under a canonical `"schema.relation"` key.
+    pub(crate) fn entity_id_by_qname(&self, qname: &str) -> Option<i64> {
+        self.caches.entity_by_qname.get(qname).copied()
+    }
+
     #[cfg(test)]
     pub(crate) fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<i64> {
-        let qualified = format!("{schema_name}.{table_name}");
-        self.caches.entity_by_qname.get(&qualified).copied()
+        self.entity_id_by_qname(&format!("{schema_name}.{table_name}"))
     }
 
     #[cfg(test)]

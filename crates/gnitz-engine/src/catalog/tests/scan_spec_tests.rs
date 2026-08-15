@@ -558,14 +558,7 @@ fn all_pk_sourced_projection_zeroes_null_words_across_chunks() {
 fn permuted_gather_with_string_and_nullable_across_chunks() {
     let cols = vec![
         col_def("id", type_code::U64),
-        ColumnDef {
-            name: "nv".into(),
-            type_code: type_code::I64,
-            is_nullable: true,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        nullable_def("nv", type_code::I64),
         col_def("s", type_code::STRING),
     ];
     const N: u64 = 200;
@@ -635,14 +628,7 @@ fn permuted_gather_with_string_and_nullable_across_chunks() {
 fn compute_projection_writes_at_keeper_tail_across_chunks() {
     let cols = vec![
         col_def("id", type_code::U64),
-        ColumnDef {
-            name: "nv".into(),
-            type_code: type_code::I64,
-            is_nullable: true,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        nullable_def("nv", type_code::I64),
         col_def("keep", type_code::I64),
     ];
     const N: u64 = 300;

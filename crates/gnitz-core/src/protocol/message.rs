@@ -22,6 +22,10 @@ pub struct Message {
     pub schema: Option<std::sync::Arc<Schema>>,
     pub data_batch: Option<ZSetBatch>,
     pub error_text: Option<String>, // Some(_) when status == STATUS_ERROR
+    /// The control block's arbitrary-length BLOB cell. On a RESOLVE reply it
+    /// carries the relation-descriptor blob (`gnitz_wire::RelDescriptorBlob`);
+    /// every other reply leaves it empty.
+    pub seek_pk_extra: Vec<u8>,
 }
 
 // ── Control block ─────────────────────────────────────────────────────────────
@@ -365,7 +369,7 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         return Err(ProtocolError::DecodeError("control block truncated".into()));
     }
 
-    let (ctrl_header, error_msg, _seek_pk_extra) = decode_control_block(&buf[..ctrl_size])?;
+    let (ctrl_header, error_msg, seek_pk_extra) = decode_control_block(&buf[..ctrl_size])?;
 
     let flags = ctrl_header.flags;
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
@@ -443,6 +447,7 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         schema,
         data_batch,
         error_text,
+        seek_pk_extra,
     })
 }
 

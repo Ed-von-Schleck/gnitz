@@ -13,8 +13,8 @@
 
 use crate::catalog::MAX_COLUMNS;
 use crate::circuit::AggFunc;
+use crate::codec::{Reader, Writer};
 use crate::range::RangeDescriptor;
-use crate::reader::Reader;
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
 pub const MAX_ORDER_KEYS: usize = 16;
@@ -160,14 +160,6 @@ pub struct ReadSpec {
     pub sink: ReadSink,
 }
 
-/// Append a `u32`-length-prefixed byte section — the one variable-length
-/// section shape this format uses, and the exact inverse of
-/// [`Reader::bytes32`].
-fn put_bytes32(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
 /// Pack a ScanSpec request's control-block `seek_pk_extra` blob: the encoded
 /// `ReadSpec` followed by the reply-schema wire block, each `u32`-length-
 /// prefixed. Bundling both in the arbitrary-length `seek_pk_extra` BLOB lets the
@@ -176,21 +168,18 @@ fn put_bytes32(out: &mut Vec<u8>, bytes: &[u8]) {
 /// does not travel back: the worker decodes it into the read's output shape,
 /// and the client decodes the reply against its own copy.
 pub fn pack_scan_spec_extra(spec: &[u8], reply_block: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + spec.len() + reply_block.len());
-    put_bytes32(&mut out, spec);
-    put_bytes32(&mut out, reply_block);
-    out
+    let mut w = Writer::with_capacity(8 + spec.len() + reply_block.len());
+    w.bytes32(spec).bytes32(reply_block);
+    w.into_vec()
 }
 
 /// Split a ScanSpec `seek_pk_extra` blob back into `(spec_bytes, reply_block)`
 /// at the trust boundary — rejecting a truncated / trailing-byte frame.
 pub fn unpack_scan_spec_extra(extra: &[u8]) -> Result<(&[u8], &[u8]), String> {
-    let mut r = Reader::new(extra);
+    let mut r = Reader::new(extra, "scan_spec extra");
     let spec = r.bytes32()?;
     let block = r.bytes32()?;
-    if r.remaining() != 0 {
-        return Err(format!("scan_spec extra: {} trailing bytes", r.remaining()));
-    }
+    r.expect_consumed()?;
     Ok((spec, block))
 }
 
@@ -203,7 +192,7 @@ pub fn unpack_scan_spec_extra(extra: &[u8]) -> Result<(&[u8], &[u8]), String> {
 /// compare rather than a megabyte-scale parse. [`ReadSpec::decode`] remains the
 /// worker's full validating parse.
 pub fn peek_pk_range(buf: &[u8]) -> Option<RangeDescriptor> {
-    let mut r = Reader::new(buf);
+    let mut r = Reader::new(buf, "read_spec");
     if r.u8().ok()? != VERSION || r.u8().ok()? != BOUND_PK_RANGE {
         return None;
     }
@@ -250,26 +239,25 @@ impl ReadSpec {
                 ReadSink::Rows { projection, order, .. } => projection.len() + 4 * order.len(),
                 ReadSink::Fold(agg) => 2 * agg.group_cols.len() + 3 * agg.aggs.len(),
             };
-        let mut out = Vec::with_capacity(cap);
-        out.extend_from_slice(&[VERSION, bound.kind(), sink_tag, 0u8]);
+        let mut w = Writer::with_capacity(cap);
+        w.u8(VERSION).u8(bound.kind()).u8(sink_tag).u8(0);
 
         match bound {
             ReadBound::None => {}
-            ReadBound::PkRange(desc) => out.extend_from_slice(&desc.encode()),
+            ReadBound::PkRange(desc) => {
+                w.raw(&desc.encode());
+            }
             ReadBound::IndexRange { idx_cols, exact, desc } => {
-                out.extend_from_slice(&idx_cols.to_le_bytes());
-                out.push(*exact as u8);
-                out.extend_from_slice(&desc.encode());
+                w.u64(*idx_cols).u8(*exact as u8).raw(&desc.encode());
             }
             ReadBound::PkSet(keys) => {
-                out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
                 // One memcpy: on a little-endian target the `u128` slice already
                 // IS its wire image. A `pk IN (…)` set reaches MAX_PK_SET_KEYS.
-                out.extend_from_slice(crate::as_le_bytes(keys));
+                w.u32(keys.len() as u32).raw(crate::as_le_bytes(keys));
             }
         }
 
-        put_bytes32(&mut out, predicate);
+        w.bytes32(predicate);
 
         match sink {
             ReadSink::Rows {
@@ -277,10 +265,8 @@ impl ReadSpec {
                 order,
                 limit_k,
             } => {
-                out.push(order.len() as u8);
-                out.extend_from_slice(&limit_k.to_le_bytes());
+                w.u8(order.len() as u8).u64(*limit_k);
                 for key in order {
-                    out.extend_from_slice(&key.col.to_le_bytes());
                     let mut flags = 0u8;
                     if key.desc {
                         flags |= ORDER_DESC;
@@ -288,24 +274,22 @@ impl ReadSpec {
                     if key.nulls_first {
                         flags |= ORDER_NULLS_FIRST;
                     }
-                    out.push(flags);
-                    out.push(0u8); // reserved
+                    w.u16(key.col).u8(flags).u8(0); // trailing byte reserved
                 }
-                put_bytes32(&mut out, projection);
+                w.bytes32(projection);
             }
             ReadSink::Fold(agg) => {
-                out.extend_from_slice(&(agg.group_cols.len() as u16).to_le_bytes());
+                w.u16(agg.group_cols.len() as u16);
                 for &c in &agg.group_cols {
-                    out.extend_from_slice(&c.to_le_bytes());
+                    w.u16(c);
                 }
-                out.push(agg.aggs.len() as u8);
+                w.u8(agg.aggs.len() as u8);
                 for item in &agg.aggs {
-                    out.push(item.op as u8);
-                    out.extend_from_slice(&item.src_col.to_le_bytes());
+                    w.u8(item.op as u8).u16(item.src_col);
                 }
             }
         }
-        out
+        w.into_vec()
     }
 
     /// Decode and validate at the trust boundary. Rejects: an over-cap blob,
@@ -321,7 +305,7 @@ impl ReadSpec {
                 buf.len()
             ));
         }
-        let mut r = Reader::new(buf);
+        let mut r = Reader::new(buf, "read_spec");
         let version = r.u8()?;
         if version != VERSION {
             return Err(format!("read_spec: unknown version {version}"));
@@ -424,9 +408,7 @@ impl ReadSpec {
             other => return Err(format!("read_spec: unknown sink tag {other}")),
         };
 
-        if r.remaining() != 0 {
-            return Err(format!("read_spec: {} trailing bytes", r.remaining()));
-        }
+        r.expect_consumed()?;
 
         Ok(ReadSpec { bound, predicate, sink })
     }

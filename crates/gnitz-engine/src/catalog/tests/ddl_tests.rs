@@ -194,18 +194,7 @@ fn test_edge_cases() {
 
     // 9. Invalid PK type (STRING)
     assert!(engine
-        .create_table(
-            "public.bad_pk",
-            &[ColumnDef {
-                name: "id".into(),
-                type_code: type_code::STRING,
-                is_nullable: false,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-                is_hidden: false
-            }],
-            &[0]
-        )
+        .create_table("public.bad_pk", &[col_def("id", type_code::STRING)], &[0])
         .is_err());
 
     // 10. Too many columns (> MAX_COLUMNS = 65)
@@ -442,17 +431,7 @@ fn test_nullable_pk_rejected() {
     let dir = temp_dir("nullable_pk");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let cols = vec![
-        ColumnDef {
-            name: "id".into(),
-            type_code: type_code::U64,
-            is_nullable: true,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
-        col_def("name", type_code::STRING),
-    ];
+    let cols = vec![nullable_def("id", type_code::U64), col_def("name", type_code::STRING)];
     let err = engine.create_table("public.bad_pk_null", &cols, &[0]).unwrap_err();
     assert!(err.contains("nullable"), "expected nullable-PK error, got: {err}");
 
@@ -480,22 +459,8 @@ fn test_hook_table_register_rejects_malformed_pk() {
     let col_defs = vec![
         col_def("c0", type_code::U64),
         col_def("c1", type_code::STRING),
-        ColumnDef {
-            name: "c2".into(),
-            type_code: type_code::U64,
-            is_nullable: true,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
-        ColumnDef {
-            name: "c3".into(),
-            type_code: type_code::F32,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_hidden: false,
-        },
+        nullable_def("c2", type_code::U64),
+        col_def("c3", type_code::F32),
     ];
     let tid = engine.allocate_table_id();
     engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();

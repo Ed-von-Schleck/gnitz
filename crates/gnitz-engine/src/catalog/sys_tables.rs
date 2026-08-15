@@ -354,7 +354,7 @@ pub(super) fn push_col_tab_row(
     bb.put_u64(if cd.is_nullable { 1 } else { 0 });
     bb.put_u64(cd.fk_table_id as u64);
     bb.put_u64(cd.fk_col_idx as u64);
-    bb.put_u64(0); // is_serial — neither engine-side writer marks SERIAL
+    bb.put_u64(if cd.is_serial { 1 } else { 0 });
     bb.put_u64(if cd.is_hidden { 1 } else { 0 });
     bb.end_row();
 }
