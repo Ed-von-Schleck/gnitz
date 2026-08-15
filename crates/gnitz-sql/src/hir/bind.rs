@@ -65,7 +65,7 @@ pub(crate) fn bind_ctes(
             if s.selection.is_none() && !body_is_grouped(s) && s.distinct.is_none() {
                 reject_unhonored_select_clauses(s, HonoredClauses::PLAIN, &ctx)?;
                 if let Some(resolved) = cte_passthrough(client, s, &cte.alias.columns, binder)? {
-                    binder.cache_alias(&name, resolved, true)?;
+                    binder.cache_alias(&name, resolved)?;
                     continue;
                 }
             }
@@ -77,9 +77,8 @@ pub(crate) fn bind_ctes(
             apply_positional_aliases(&cte.alias.columns, cols.iter_mut().collect(), &ctx)?;
             Ok(((circuit, cols, pk), ()))
         })?;
-        let resolved = (seg_vid, seg_schema);
-        // A chain-minted segment id, not a catalog one: no index bound.
-        binder.cache_alias(&name, resolved, false)?;
+        // A chain-minted segment id, not a catalog one: no kind, no index bound.
+        binder.cache_alias(&name, (seg_vid, seg_schema, None))?;
     }
     Ok(())
 }
@@ -163,9 +162,8 @@ fn resolve_table_factor(
         return Ok((subtree, alias.name.value.clone(), cols));
     }
     let (name, alias) = extract_table_name_and_alias(factor, "CREATE VIEW")?;
-    let (tid, schema) = binder.resolve(client, &name)?;
-    let from_catalog = binder.is_catalog_relation(&name);
-    let get = RelExpr::get(ids, tid, schema, from_catalog);
+    let (tid, schema, kind) = binder.resolve(client, &name)?;
+    let get = RelExpr::get(ids, tid, schema, kind.is_some());
     let cols = get.cols();
     Ok((get, alias, cols))
 }
@@ -574,9 +572,8 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_, '_>, subquery: &'e Query) -> Result
             "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
         )));
     }
-    let (inner_tid, inner_schema) = cx.binder.resolve(cx.client, &inner_name)?;
-    let from_catalog = cx.binder.is_catalog_relation(&inner_name);
-    let inner_get = RelExpr::get(cx.ids, inner_tid, inner_schema, from_catalog);
+    let (inner_tid, inner_schema, inner_kind) = cx.binder.resolve(cx.client, &inner_name)?;
+    let inner_get = RelExpr::get(cx.ids, inner_tid, inner_schema, inner_kind.is_some());
     let inner_cols = inner_get.cols();
 
     // Split the inner WHERE against the (outer, inner) scope by `ColId` membership.

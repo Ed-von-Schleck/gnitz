@@ -46,24 +46,35 @@ pub(crate) fn find_unique_column<'a>(
     Ok(found)
 }
 
-/// One Binder cache entry. Unlike a join `AliasMap`'s `ResolvedRelation` this
-/// needs no `col_offset` (the cache is a single-table context) but does need
-/// catalog provenance — the index-bound gate.
+/// What the catalog issued an id as. `None` wherever this appears means the id
+/// was not catalog-issued at all — see [`CachedRelation::catalog_kind`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RelationKind {
+    Table,
+    View,
+}
+
+/// One Binder cache entry: a name's resolved id and schema, plus how that id was
+/// issued.
 ///
-/// `from_catalog` is false for a chain-minted CTE/derived-table segment id.
+/// `catalog_kind` is `None` for a chain-minted CTE/derived-table segment id.
 /// Those ids are minted `1, 2, 3, …` per chain, so they alias real relation ids
 /// (`SCHEMA_TAB = 1`, `TABLE_TAB = 2`, … `FIRST_USER_TABLE_ID = 16`): asking the
 /// catalog for segment 1's indexes probes the system schema table, and at `>= 16`
 /// it would match a *foreign* user table's index column indices against this
 /// segment's schema by pure numeric coincidence — a bogus bound, and a wasted
-/// round-trip per segment. The flag lives IN the entry so an alias that shadows
+/// round-trip per segment. The field lives IN the entry so an alias that shadows
 /// an earlier resolution (`FROM (SELECT * FROM t) t` re-caching `t` as a minted
 /// segment) atomically replaces id and provenance together.
 struct CachedRelation {
     table_id: u64,
     schema: Rc<Schema>,
-    from_catalog: bool,
+    catalog_kind: Option<RelationKind>,
 }
+
+/// A resolved relation: its id, its schema, and `None` if the id was chain-minted
+/// rather than catalog-issued.
+pub(crate) type Resolved = (u64, Rc<Schema>, Option<RelationKind>);
 
 pub(crate) struct Binder<'a> {
     schema_name: &'a str,
@@ -78,36 +89,29 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// True iff `name` currently resolves to an id the catalog issued. An unseen
-    /// name is `false`: a bound may only be extracted for an id whose index list
-    /// is meaningful.
-    pub(crate) fn is_catalog_relation(&self, name: &str) -> bool {
-        self.cache
-            .get(&name.to_ascii_lowercase())
-            .is_some_and(|e| e.from_catalog)
-    }
-
     /// Cache a `name → relation` entry, keyed by the canonical ASCII-lowercase
     /// form — the single fold site, so a case-varying reference (`WITH Cc … FROM
-    /// cc`) hits regardless of which caller inserted (matching the join
-    /// `AliasMap` convention; SQL identifiers are case-insensitive).
-    /// `from_catalog` marks `table_id` as catalog-issued (see [`CachedRelation`]).
-    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Rc<Schema>, from_catalog: bool) {
+    /// cc`) hits regardless of which caller inserted (SQL identifiers are
+    /// case-insensitive).
+    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Rc<Schema>, catalog_kind: Option<RelationKind>) {
         self.cache.insert(
             name.to_ascii_lowercase(),
             CachedRelation {
                 table_id,
                 schema,
-                from_catalog,
+                catalog_kind,
             },
         );
     }
 
-    pub(crate) fn resolve(&mut self, client: &mut GnitzClient, name: &str) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
+    /// Resolve `name` to its id, schema and provenance. The provenance rides the
+    /// same entry as the id, so a caller that needs it makes no second lookup and
+    /// the two can never disagree.
+    pub(crate) fn resolve(&mut self, client: &mut GnitzClient, name: &str) -> Result<Resolved, GnitzSqlError> {
         // Probe with the canonical key — the cache holds base-table resolutions
         // *and* CTE/derived-table aliases (which never reach the catalog).
         if let Some(entry) = self.cache.get(&name.to_ascii_lowercase()) {
-            return Ok((entry.table_id, Rc::clone(&entry.schema)));
+            return Ok((entry.table_id, Rc::clone(&entry.schema), entry.catalog_kind));
         }
         // Referenced relations obey the same reserved-prefix rule as created
         // ones: a fresh catalog probe of a leading-`_` name can only be a user
@@ -117,12 +121,17 @@ impl<'a> Binder<'a> {
         // on insert (`cache_alias` validates; `cache_relation` is fed from these
         // already-validated probes), never a raw `__h…` catalog name.
         crate::validate::validate_user_name(name)?;
-        let (tid, schema) = client
-            .resolve_table_or_view_id(self.schema_name, name)
+        let (tid, schema, is_view) = client
+            .resolve_relation(self.schema_name, name)
             .map_err(GnitzSqlError::Exec)?;
+        let kind = Some(if is_view {
+            RelationKind::View
+        } else {
+            RelationKind::Table
+        });
         let rc = Rc::new(schema);
-        self.cache_relation(name, tid, Rc::clone(&rc), true);
-        Ok((tid, rc))
+        self.cache_relation(name, tid, Rc::clone(&rc), kind);
+        Ok((tid, rc, kind))
     }
 
     /// Resolve a write/index target that must be a base table. INSERT, UPDATE,
@@ -147,7 +156,7 @@ impl<'a> Binder<'a> {
         match client.resolve_table_id(self.schema_name, name) {
             Ok((tid, schema)) => {
                 let rc = Rc::new(schema);
-                self.cache_relation(name, tid, Rc::clone(&rc), true);
+                self.cache_relation(name, tid, Rc::clone(&rc), Some(RelationKind::Table));
                 Ok((tid, rc))
             }
             // Miss: kind-probe (id-only, no schema assembly) to tell "is a view"
@@ -169,19 +178,13 @@ impl<'a> Binder<'a> {
     /// probed before validation), so it is held to the same reserved-prefix rule
     /// here — the one gate every alias passes to become resolvable.
     ///
-    /// `from_catalog` is the caller's, because "registered as an alias" and
-    /// "chain-minted" are different facts and only the second disqualifies a bound:
-    /// a pass-through CTE caches its *source table's* real catalog id and passes
-    /// `true`, while a compiled derived table / CTE segment mints a provisional id
-    /// and passes `false`.
-    pub(crate) fn cache_alias(
-        &mut self,
-        name: &str,
-        resolved: (u64, Rc<Schema>),
-        from_catalog: bool,
-    ) -> Result<(), GnitzSqlError> {
+    /// `catalog_kind` is the caller's: a pass-through CTE passes its source's
+    /// kind, a compiled derived table / CTE segment passes `None` (see
+    /// [`CachedRelation`]).
+    pub(crate) fn cache_alias(&mut self, name: &str, resolved: Resolved) -> Result<(), GnitzSqlError> {
         crate::validate::validate_user_name(name)?;
-        self.cache_relation(name, resolved.0, resolved.1, from_catalog);
+        let (table_id, schema, catalog_kind) = resolved;
+        self.cache_relation(name, table_id, schema, catalog_kind);
         Ok(())
     }
 }
@@ -219,27 +222,31 @@ pub(crate) fn apply_positional_aliases(
 
 /// The pure pass-through predicate shared by the CTE binding (`bind_ctes`) and the
 /// ad-hoc read route (`dml::select`): a CTE body that is a bare single-table (or
-/// view) identity/positional projection resolves directly to its source `(tid,
-/// schema)`, with any column aliases applied. Returns `Some((tid, schema))` for
-/// such an aliasable pass-through, `None` for everything else (a joined /
-/// multi-FROM / derived-table FROM or a non-identity projection); `Err` only on a
-/// hard bind failure (unknown source relation). The caller decides what `None`
-/// means: the CTE binding compiles a hidden segment; the read route rejects the
-/// whole query as a derivation. Both callers reject a WHERE'd / grouped / DISTINCT
-/// / exotic-clause body BEFORE calling (each with its own verdict), so such a body
-/// never reaches this predicate.
+/// view) identity/positional projection resolves directly to its source relation,
+/// with any column aliases applied. Returns `Some(resolved)` for such an aliasable
+/// pass-through, `None` for everything else (a joined / multi-FROM / derived-table
+/// FROM or a non-identity projection); `Err` only on a hard bind failure (unknown
+/// source relation). The caller decides what `None` means: the CTE binding compiles
+/// a hidden segment; the read route rejects the whole query as a derivation. Both
+/// callers reject a WHERE'd / grouped / DISTINCT / exotic-clause body BEFORE
+/// calling (each with its own verdict), so such a body never reaches this
+/// predicate.
+///
+/// The source's provenance rides the result: a pass-through over an earlier CTE
+/// that compiled to a chain-minted segment inherits that segment's `None`, so the
+/// alias never claims a catalog id it does not have.
 pub(crate) fn cte_passthrough(
     client: &mut GnitzClient,
     cte_select: &Select,
     column_aliases: &[TableAliasColumnDef],
     binder: &mut Binder<'_>,
-) -> Result<Option<(u64, Rc<Schema>)>, GnitzSqlError> {
+) -> Result<Option<Resolved>, GnitzSqlError> {
     // A single plain table/view FROM, no joins, no derived table.
     if !matches!(classify_from(&cte_select.from), FromShape::SinglePlainRelation) {
         return Ok(None);
     }
     let cte_table_name = extract_table_factor_name(&cte_select.from[0].relation, "CTE")?;
-    let (cte_tid, cte_schema) = binder.resolve(client, &cte_table_name)?;
+    let (cte_tid, cte_schema, cte_kind) = binder.resolve(client, &cte_table_name)?;
     // Positional identity projection: `*`, or one identifier per source column in
     // order. The qualified form (`SELECT t.a, t.b FROM t`) parses as `CompoundIdentifier`
     // and is the same positional pass-through; a dup-named source fails the per-position
@@ -268,7 +275,7 @@ pub(crate) fn cte_passthrough(
     } else {
         cte_schema
     };
-    Ok(Some((cte_tid, cte_schema)))
+    Ok(Some((cte_tid, cte_schema, cte_kind)))
 }
 
 #[cfg(test)]
@@ -280,40 +287,44 @@ mod tests {
         ColumnDef::new(name, tc, false)
     }
 
-    /// The index-bound gate: an alias cached as chain-minted is NOT a catalog
-    /// relation, one cached as catalog-issued is, and an unseen name is not.
-    /// A chain-minted id aliases real relation ids, so treating it as
+    /// The index-bound gate: a cached alias reports back the provenance it was
+    /// cached with, keyed case-insensitively, and an unseen name resolves to
+    /// nothing. A chain-minted id aliases real relation ids, so treating it as
     /// catalog-issued would bound a scan against a foreign table's index columns.
     #[test]
-    fn catalog_provenance_tracks_the_cache_alias_flag() {
+    fn catalog_provenance_tracks_the_cache_alias_kind() {
         let schema = std::rc::Rc::new(Schema {
             columns: vec![col("a", TypeCode::U64)],
             pk_cols: vec![0],
         });
+        let kind = |b: &Binder<'_>, n: &str| b.cache.get(&n.to_ascii_lowercase()).map(|e| e.catalog_kind);
         let mut b = Binder::new("public");
-        b.cache_alias("minted", (1, Rc::clone(&schema)), false).unwrap();
-        b.cache_alias("real", (16, Rc::clone(&schema)), true).unwrap();
+        b.cache_alias("minted", (1, Rc::clone(&schema), None)).unwrap();
+        b.cache_alias("real", (16, Rc::clone(&schema), Some(RelationKind::Table)))
+            .unwrap();
+        b.cache_alias("aview", (17, Rc::clone(&schema), Some(RelationKind::View)))
+            .unwrap();
 
-        assert!(
-            !b.is_catalog_relation("minted"),
+        assert_eq!(
+            kind(&b, "minted"),
+            Some(None),
             "a chain-minted id is not catalog-issued"
         );
-        assert!(b.is_catalog_relation("real"), "a pass-through CTE's real id is");
-        assert!(
-            !b.is_catalog_relation("unseen"),
-            "an unseen name is never catalog-issued"
-        );
+        assert_eq!(kind(&b, "real"), Some(Some(RelationKind::Table)));
+        assert_eq!(kind(&b, "aview"), Some(Some(RelationKind::View)));
+        assert_eq!(kind(&b, "unseen"), None);
         // Provenance keys on the same lowercased string as the resolution.
-        assert!(b.is_catalog_relation("REAL"));
-        assert!(!b.is_catalog_relation("MINTED"));
+        assert_eq!(kind(&b, "REAL"), Some(Some(RelationKind::Table)));
+        assert_eq!(kind(&b, "MINTED"), Some(None));
 
         // Shadowing: a minted alias overwriting a catalog resolution must drop
         // the provenance with it — `FROM (SELECT * FROM t) t` re-caches `t` as a
-        // chain-minted segment, and a stale `true` here would probe a foreign
+        // chain-minted segment, and a stale `Some(_)` here would probe a foreign
         // table's indexes for the segment's bound.
-        b.cache_alias("real", (2, Rc::clone(&schema)), false).unwrap();
-        assert!(
-            !b.is_catalog_relation("real"),
+        b.cache_alias("real", (2, Rc::clone(&schema), None)).unwrap();
+        assert_eq!(
+            kind(&b, "real"),
+            Some(None),
             "an alias shadowing a catalog resolution must shed its provenance"
         );
     }

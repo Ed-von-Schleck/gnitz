@@ -717,6 +717,56 @@ pub(crate) fn reject_unhonored_drop_clauses(
     Ok(())
 }
 
+/// Reject every `EXPLAIN` option `execute_explain` does not honor. EXPLAIN
+/// describes the plan a query *would* take, so it consumes only the statement it
+/// wraps: `analyze` runs the query (the one option that changes what EXPLAIN
+/// does), and `verbose` / `query_plan` / `estimate` / `format` / `options` each
+/// ask for a rendering this output shape does not have. `describe_alias` is inert
+/// phrasing — `EXPLAIN`, `DESCRIBE` and `DESC` all introduce the same statement.
+///
+/// Exhaustive destructure (no `..`): a future `sqlparser` field stops the build
+/// until it is classified honored-or-rejected.
+pub(crate) fn reject_unhonored_explain_clauses(
+    stmt: &sqlparser::ast::Statement,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    let sqlparser::ast::Statement::Explain {
+        describe_alias: _, // EXPLAIN / DESCRIBE / DESC all introduce the same statement
+        analyze,
+        verbose,
+        query_plan,
+        estimate,
+        statement: _, // the caller's own pattern supplies it
+        format,
+        options,
+    } = stmt
+    else {
+        return Err(GnitzSqlError::Bind("not an EXPLAIN statement".to_string()));
+    };
+    let reject = |clause: &str| unsupported_clause(context, clause);
+    if *analyze {
+        return Err(reject("ANALYZE"));
+    }
+    if *verbose {
+        return Err(reject("VERBOSE"));
+    }
+    if *query_plan {
+        return Err(reject("QUERY PLAN"));
+    }
+    if *estimate {
+        return Err(reject("ESTIMATE"));
+    }
+    if format.is_some() {
+        return Err(reject("FORMAT"));
+    }
+    // `GenericDialect` sets `supports_explain_with_utility_options`, so the
+    // parenthesized Postgres form parses into `options` rather than failing here.
+    if options.is_some() {
+        return Err(reject("the parenthesized option list"));
+    }
+    Ok(())
+}
+
 /// Reject every `START TRANSACTION` / `BEGIN` clause the SQL transaction surface
 /// does not honor. `transaction` (the BEGIN/START keyword kind), `begin`, and
 /// `has_end_keyword` are inert phrasing. Rejected: `modes` (`READ ONLY` /

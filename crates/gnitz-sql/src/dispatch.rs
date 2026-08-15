@@ -7,8 +7,9 @@ use crate::error::GnitzSqlError;
 use crate::validate::{
     reject_unhonored_alter_table_clauses, reject_unhonored_alter_view_clauses, reject_unhonored_commit_clauses,
     reject_unhonored_create_index_clauses, reject_unhonored_create_table_clauses, reject_unhonored_create_view_clauses,
-    reject_unhonored_delete_clauses, reject_unhonored_drop_clauses, reject_unhonored_insert_clauses,
-    reject_unhonored_rollback_clauses, reject_unhonored_start_transaction_clauses, reject_unhonored_update_clauses,
+    reject_unhonored_delete_clauses, reject_unhonored_drop_clauses, reject_unhonored_explain_clauses,
+    reject_unhonored_insert_clauses, reject_unhonored_rollback_clauses, reject_unhonored_start_transaction_clauses,
+    reject_unhonored_update_clauses,
 };
 use crate::SqlResult;
 use crate::{ddl, dml};
@@ -26,6 +27,9 @@ fn reject_in_transaction(client: &GnitzClient, stmt: &Statement) -> Result<(), G
         stmt,
         Statement::Insert(_)
             | Statement::Query(_)
+            // EXPLAIN issues strictly less than the `Query` above: catalog
+            // lookups and no data-path request.
+            | Statement::Explain { .. }
             | Statement::Update(_)
             | Statement::Delete(_)
             // A nested BEGIN is allowed through to `txn_begin`, which raises
@@ -94,7 +98,18 @@ pub(crate) fn execute_statement(
             reject_unhonored_insert_clauses(insert, "INSERT")?;
             dml::execute_insert(client, schema_name, insert, &mut binder)
         }
-        Statement::Query(query) => dml::execute_select(client, schema_name, query, &mut binder),
+        Statement::Query(query) => dml::execute_select(client, query, &mut binder),
+        // Bare `DESC t` is `Statement::ExplainTable` — table introspection, a
+        // separate feature — and falls to the catch-all.
+        Statement::Explain { statement, .. } => {
+            reject_unhonored_explain_clauses(stmt, "EXPLAIN")?;
+            match statement.as_ref() {
+                Statement::Query(query) => dml::execute_explain(client, query, &mut binder),
+                _ => Err(GnitzSqlError::Unsupported(
+                    "EXPLAIN describes a SELECT; this statement is not one".to_string(),
+                )),
+            }
+        }
         Statement::CreateIndex(ci) => {
             reject_unhonored_create_index_clauses(ci, "CREATE INDEX")?;
             ddl::execute_create_index(client, schema_name, ci, &mut binder)

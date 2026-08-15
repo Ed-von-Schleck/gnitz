@@ -1458,7 +1458,9 @@ impl GnitzClient {
         Ok((record.tid, schema))
     }
 
-    pub fn resolve_table_or_view_id(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema), ClientError> {
+    /// Resolve `name` under `schema_name` to `(id, schema, is_view)`; the kind
+    /// comes from the same `lookup_relation` probe as the id.
+    pub fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema, bool), ClientError> {
         let schema_name = canon_name(schema_name);
         let name = canon_name(name);
         let schema_id = self.lookup_schema_id(&schema_name)?;
@@ -1469,6 +1471,11 @@ impl GnitzClient {
         // hash column for join/set-op/distinct views, or the source PK passed
         // through (0..k) for a plain projection over a compound-PK table.
         let schema = self.load_owner_schema(id, owner_kind, pk_col_idx)?;
+        Ok((id, schema, owner_kind == OWNER_KIND_VIEW))
+    }
+
+    pub fn resolve_table_or_view_id(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema), ClientError> {
+        let (id, schema, _) = self.resolve_relation(schema_name, name)?;
         Ok((id, schema))
     }
 

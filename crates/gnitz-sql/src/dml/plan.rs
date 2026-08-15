@@ -82,6 +82,18 @@ impl<'e> AccessPlan<'e> {
             None => (None, self.where_expr.as_slice()),
         }
     }
+
+    /// The walk this plan pushes down. Read-only: running still needs the private
+    /// compiled predicate, so [`fetch_bound`] stays the only way to execute a plan.
+    pub(super) fn bound(&self) -> &ReadBound {
+        &self.bound
+    }
+
+    /// Whether a compiled predicate ships with the bound. False means the bound
+    /// is exact — the walk alone is the whole WHERE.
+    pub(super) fn has_predicate(&self) -> bool {
+        !self.predicate.is_empty()
+    }
 }
 
 /// Bind-once WHERE → the access plan that serves it. The one way any statement
