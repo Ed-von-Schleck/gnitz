@@ -1,255 +1,84 @@
+//! The client's two adapters to the shared meta-schema block codec
+//! (`gnitz_wire::schema_block`): `Schema` → block bytes, block bytes →
+//! `Schema`. The block's layout and every rule about what makes one admissible
+//! live in `gnitz-wire`, so the engine cannot enforce a different set.
+
 use super::error::ProtocolError;
-use super::types::{
-    meta_schema, type_code_from_u64, BatchAppender, ColData, ColumnDef, Schema, ZSetBatch, MAX_COLUMNS,
-};
-use gnitz_wire::{col_meta_hidden, col_meta_nullable, col_meta_pk_pos, col_meta_serial, pack_col_meta_flags};
+use super::types::{type_code_from_u64, ColumnDef, Schema};
+use gnitz_wire::schema_block::{SchemaBlock, SchemaBlockCol};
+use gnitz_wire::{col_meta_hidden, col_meta_nullable, col_meta_serial, pack_col_meta_flags, PK_LIST_MAX_COLS};
 
-/// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
-/// Mirrors Python's `schema_to_batch`.
-pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
-    let ms = meta_schema();
-    let mut batch = ZSetBatch::new(ms);
-
-    // Route through the validated, schema-aware appender so the META_SCHEMA
-    // layout lives in exactly one place (`meta_schema()`). The cursor skips the
-    // `col_idx` PK column, so the chained values land in cols 1/2/3.
-    {
-        let mut appender = BatchAppender::new(&mut batch, ms);
-        for (ci, col) in schema.columns.iter().enumerate() {
+/// Encode the meta-schema WAL block for `schema` under table id `tid` — the
+/// exact bytes a schema-bearing push embeds. Shared by the plain-push encoder,
+/// the always-schema-bearing `FLAG_PUSH_TXN` per-family block, and the ScanSpec
+/// request's reply schema.
+///
+/// `pub` for the engine's cross-side wire tests (which take gnitz-core as a
+/// dev-dependency) — the only coverage that the two crates' adapters produce
+/// and accept the same bytes. No production caller outside this crate.
+pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
+    let cols: Vec<SchemaBlockCol> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(ci, col)| SchemaBlockCol {
+            type_code: col.type_code as u8,
             // Position-in-PK-tuple is carried so compound `PRIMARY KEY (b, a)`
             // decodes back to the user-declared order.
-            let pk_pos = schema.pk_cols.iter().position(|&p| p == ci).map(|p| p as u8);
-            let flags = pack_col_meta_flags(col.is_nullable, col.is_hidden, col.is_serial, pk_pos);
-            appender
-                .add_row(ci as u128, 1)
-                .u64_val(col.type_code as u64)
-                .u64_val(flags)
-                .str_val(&col.name);
-        }
-    }
-
-    batch
+            flags: pack_col_meta_flags(
+                col.is_nullable,
+                col.is_hidden,
+                col.is_serial,
+                schema.pk_cols.iter().position(|&p| p == ci).map(|p| p as u8),
+            ),
+            name: col.name.as_bytes(),
+        })
+        .collect();
+    gnitz_wire::schema_block::encode(tid, &cols, true)
 }
 
-/// Reconstruct a Schema from a META_SCHEMA-shaped ZSetBatch.
-/// Mirrors Python's `batch_to_schema`.
-pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
-    let count = batch.len();
-    if count > MAX_COLUMNS {
-        return Err(ProtocolError::DecodeError("schema exceeds column limit".into()));
-    }
-    let mut columns: Vec<ColumnDef> = Vec::with_capacity(count);
-    // Collect (position, column_idx) so we can sort by position before
-    // building `pk_cols`. Single-PK schemas all carry position 0 and the
-    // sort is a no-op.
-    let mut pk_pairs: Vec<(u8, usize)> = Vec::new();
-
-    let type_code_fixed = match &batch.columns[gnitz_wire::METASCHEMA_COL_TYPE_CODE] {
-        ColData::Fixed(v) => v,
-        _ => return Err(ProtocolError::DecodeError("type_code column must be Fixed".into())),
-    };
-    let flags_fixed = match &batch.columns[gnitz_wire::METASCHEMA_COL_FLAGS] {
-        ColData::Fixed(v) => v,
-        _ => return Err(ProtocolError::DecodeError("flags column must be Fixed".into())),
-    };
-    let names_col = match &batch.columns[gnitz_wire::METASCHEMA_COL_NAME] {
-        ColData::Strings(v) => v,
-        _ => return Err(ProtocolError::DecodeError("name column must be Strings".into())),
-    };
-
-    for i in 0..count {
-        let col_idx = batch.pks.get(i) as u64;
-        if col_idx != i as u64 {
-            return Err(ProtocolError::DecodeError(format!(
-                "schema batch col_idx out of order: expected {i}, got {col_idx}"
-            )));
-        }
-
-        let type_code_raw = u64::from_le_bytes(type_code_fixed[i * 8..(i + 1) * 8].try_into().unwrap());
-        let flags = u64::from_le_bytes(flags_fixed[i * 8..(i + 1) * 8].try_into().unwrap());
-        let name = match &names_col[i] {
-            Some(s) => s.clone(),
-            None => return Err(ProtocolError::DecodeError(format!("null name at col {i}"))),
-        };
-
-        let tc = type_code_from_u64(type_code_raw)?;
-        let is_nullable = col_meta_nullable(flags);
-        let is_hidden = col_meta_hidden(flags);
-
-        if let Some(pos) = col_meta_pk_pos(flags) {
-            pk_pairs.push((pos, i));
-        }
-
-        let mut col = ColumnDef::new(name, tc, is_nullable);
-        if is_hidden {
+/// Reconstruct a `Schema` from meta-schema block bytes.
+///
+/// `PK_LIST_MAX_COLS` is the client's own PK-arity limit — the capacity of the
+/// persisted PK-list codec a key must round-trip through — not the engine's,
+/// which is wider for its internal secondary-index schema.
+///
+/// `pub` for the same reason as [`encode_schema_block`].
+pub fn schema_from_block(block: &[u8]) -> Result<Schema, ProtocolError> {
+    let sb = SchemaBlock::decode(block, false, PK_LIST_MAX_COLS).map_err(|e| ProtocolError::DecodeError(e.into()))?;
+    let mut columns = Vec::with_capacity(sb.num_columns());
+    for c in sb.columns() {
+        let name =
+            std::str::from_utf8(c.name).map_err(|e| ProtocolError::DecodeError(format!("utf8 in column name: {e}")))?;
+        // The shared decoder already rejected an unknown code; this re-reads it
+        // as the client's typed `TypeCode` rather than trusting a cast.
+        let mut col = ColumnDef::new(
+            name,
+            type_code_from_u64(c.type_code as u64)?,
+            col_meta_nullable(c.flags),
+        );
+        if col_meta_hidden(c.flags) {
             col = col.hidden();
         }
-        if col_meta_serial(flags) {
+        if col_meta_serial(c.flags) {
             col = col.serial();
         }
         columns.push(col);
     }
-
-    pk_pairs.sort_by_key(|(p, _)| *p);
-    let pk_cols: Vec<usize> = pk_pairs.into_iter().map(|(_, i)| i).collect();
-
+    let pk_cols: Vec<usize> = sb.pk_indices().iter().map(|&i| i as usize).collect();
     Schema::from_parts(columns, pk_cols).map_err(|e| ProtocolError::DecodeError(e.into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{meta_schema, ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
-    use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
+    use crate::protocol::types::TypeCode;
 
-    // ── type_code_from_u64 error paths ──────────────────────────────────────
-
+    /// Every fact a `Schema` carries must survive the block round-trip: column
+    /// types, nullability, names, the `hidden`/`serial` markers, and the
+    /// declared PK order (which is not column order here).
     #[test]
-    fn test_unknown_type_code_zero() {
-        use crate::protocol::error::ProtocolError;
-        use crate::protocol::types::type_code_from_u64;
-        assert!(matches!(type_code_from_u64(0), Err(ProtocolError::UnknownTypeCode(0))));
-    }
-
-    #[test]
-    fn test_unknown_type_code_16() {
-        // 16 is the first unassigned type-code value after I128 (15).
-        use crate::protocol::error::ProtocolError;
-        use crate::protocol::types::type_code_from_u64;
-        assert!(matches!(
-            type_code_from_u64(16),
-            Err(ProtocolError::UnknownTypeCode(16))
-        ));
-    }
-
-    #[test]
-    fn test_unknown_type_code_max() {
-        use crate::protocol::error::ProtocolError;
-        use crate::protocol::types::type_code_from_u64;
-        assert!(matches!(
-            type_code_from_u64(u64::MAX),
-            Err(ProtocolError::UnknownTypeCode(_))
-        ));
-    }
-
-    // ── batch_to_schema error paths ──────────────────────────────────────────
-
-    /// Build a valid META_SCHEMA batch for `ncols` columns (all U64, col 0 is PK).
-    /// Routes through the real `schema_to_batch` encoder so the META_SCHEMA layout
-    /// is defined in exactly one place; the error-path tests then corrupt the
-    /// returned batch to exercise `batch_to_schema`'s validation.
-    /// Overwrite row `row`'s PK in place — the error-path tests corrupt the
-    /// col_idx key to exercise `batch_to_schema`'s validation.
-    fn set_pk(batch: &mut ZSetBatch, row: usize, v: u64) {
-        let s = batch.pks.stride as usize;
-        batch.pks.buf[row * s..(row + 1) * s].copy_from_slice(&v.to_le_bytes()[..s]);
-    }
-
-    fn make_meta_batch(ncols: usize) -> ZSetBatch {
-        let schema = Schema {
-            columns: (0..ncols)
-                .map(|i| ColumnDef::new(format!("col{i}"), TypeCode::U64, false))
-                .collect(),
-            pk_cols: vec![0],
-        };
-        schema_to_batch(&schema)
-    }
-
-    #[test]
-    fn test_batch_to_schema_no_pk_flag() {
-        use crate::protocol::error::ProtocolError;
-        let mut batch = make_meta_batch(2);
-        // Clear all IS_PK flags
-        if let ColData::Fixed(ref mut v) = batch.columns[2] {
-            for b in v.iter_mut() {
-                *b = 0;
-            }
-        }
-        let res = batch_to_schema(&batch);
-        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
-    }
-
-    #[test]
-    fn test_batch_to_schema_col_idx_out_of_order() {
-        use crate::protocol::error::ProtocolError;
-        let mut batch = make_meta_batch(2);
-        set_pk(&mut batch, 0, 1); // [1, 0] instead of [0, 1]
-        set_pk(&mut batch, 1, 0);
-        let res = batch_to_schema(&batch);
-        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
-    }
-
-    #[test]
-    fn test_batch_to_schema_col_idx_gap() {
-        use crate::protocol::error::ProtocolError;
-        let mut batch = make_meta_batch(2);
-        set_pk(&mut batch, 1, 5); // gap: [0, 5]
-        let res = batch_to_schema(&batch);
-        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
-    }
-
-    #[test]
-    fn test_batch_to_schema_col_idx_duplicate() {
-        use crate::protocol::error::ProtocolError;
-        let mut batch = make_meta_batch(2);
-        set_pk(&mut batch, 1, 0); // duplicate: [0, 0]
-        let res = batch_to_schema(&batch);
-        assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
-    }
-
-    #[test]
-    fn test_batch_to_schema_nullable_pk_rejected() {
-        use crate::protocol::error::ProtocolError;
-        use crate::protocol::META_FLAG_NULLABLE;
-        let mut batch = make_meta_batch(2);
-        // Set the NULLABLE flag on the PK column (col 0).
-        if let ColData::Fixed(ref mut v) = batch.columns[2] {
-            let f = u64::from_le_bytes(v[0..8].try_into().unwrap()) | META_FLAG_NULLABLE;
-            v[0..8].copy_from_slice(&f.to_le_bytes());
-        }
-        let err = batch_to_schema(&batch).unwrap_err();
-        assert!(matches!(err, ProtocolError::DecodeError(ref m) if m.contains("non-nullable")));
-    }
-
-    #[test]
-    fn test_batch_to_schema_ineligible_pk_rejected() {
-        use crate::protocol::error::ProtocolError;
-        let mut batch = make_meta_batch(2);
-        // Retype the PK column (col 0) to F64 (10), which is not PK-eligible.
-        if let ColData::Fixed(ref mut v) = batch.columns[1] {
-            v[0..8].copy_from_slice(&10u64.to_le_bytes());
-        }
-        let err = batch_to_schema(&batch).unwrap_err();
-        assert!(matches!(err, ProtocolError::DecodeError(ref m) if m.contains("PK-eligible")));
-    }
-
-    #[test]
-    fn test_batch_to_schema_too_many_pk_rejected() {
-        use crate::protocol::error::ProtocolError;
-        use crate::protocol::META_FLAG_IS_PK;
-        // PK_LIST_MAX_COLS is 4; flag 6 columns as PK.
-        let mut batch = make_meta_batch(6);
-        if let ColData::Fixed(ref mut v) = batch.columns[2] {
-            for i in 0..6 {
-                v[i * 8..i * 8 + 8].copy_from_slice(&META_FLAG_IS_PK.to_le_bytes());
-            }
-        }
-        let err = batch_to_schema(&batch).unwrap_err();
-        assert!(matches!(err, ProtocolError::DecodeError(_)));
-    }
-
-    #[test]
-    fn test_batch_to_schema_exceeds_column_limit_rejected() {
-        use crate::protocol::error::ProtocolError;
-        let batch = make_meta_batch(MAX_COLUMNS + 1);
-        let err = batch_to_schema(&batch).unwrap_err();
-        assert!(matches!(err, ProtocolError::DecodeError(ref m) if m.contains("column limit")));
-    }
-
-    // ── schema/meta roundtrip ────────────────────────────────────────────────
-
-    #[test]
-    fn test_schema_meta_roundtrip() {
+    fn schema_survives_the_block_roundtrip() {
         let original = Schema {
             columns: vec![
                 ColumnDef::new("id", TypeCode::U64, false).hidden().serial(),
@@ -260,13 +89,92 @@ mod tests {
             ],
             pk_cols: vec![0],
         };
+        let block = encode_schema_block(&original, 0);
+        assert_eq!(schema_from_block(&block).unwrap(), original);
+    }
 
-        let ms = meta_schema();
-        let meta_batch = schema_to_batch(&original);
-        let encoded = encode_wal_block(ms, 0, &meta_batch);
-        let (decoded_batch, _) = decode_wal_block_verified(&encoded, ms).unwrap();
-        let reconstructed = batch_to_schema(&decoded_batch).unwrap();
+    #[test]
+    fn compound_pk_decodes_in_declared_order() {
+        let original = Schema {
+            columns: vec![
+                ColumnDef::new("a", TypeCode::U64, false),
+                ColumnDef::new("b", TypeCode::I32, false),
+                ColumnDef::new("v", TypeCode::String, true),
+            ],
+            // `PRIMARY KEY (b, a)` — the reverse of column order.
+            pk_cols: vec![1, 0],
+        };
+        let block = encode_schema_block(&original, 9);
+        assert_eq!(schema_from_block(&block).unwrap().pk_cols, vec![1, 0]);
+    }
 
-        assert_eq!(original, reconstructed, "schema mismatch after meta roundtrip");
+    /// A column name that spills the German-string inline cell must come back
+    /// whole, from the block's blob heap.
+    #[test]
+    fn a_long_column_name_survives_the_blob_heap() {
+        let long = "a_column_name_well_past_the_inline_cell";
+        let original = Schema {
+            columns: vec![
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new(long, TypeCode::I64, false),
+            ],
+            pk_cols: vec![0],
+        };
+        let block = encode_schema_block(&original, 1);
+        assert_eq!(schema_from_block(&block).unwrap().columns[1].name, long);
+    }
+
+    /// The wire caps the client enforces on a decoded block. The rejections
+    /// themselves are `gnitz-wire`'s; what this pins is that the client asks for
+    /// *its* limits — in particular `PK_LIST_MAX_COLS`, not the engine's wider
+    /// `MAX_PK_COLUMNS`.
+    #[test]
+    fn a_pk_wider_than_the_client_codec_is_rejected() {
+        let n = PK_LIST_MAX_COLS + 1;
+        let cols: Vec<SchemaBlockCol> = (0..n)
+            .map(|i| SchemaBlockCol {
+                type_code: TypeCode::U64 as u8,
+                flags: pack_col_meta_flags(false, false, false, Some(i as u8)),
+                name: b"k",
+            })
+            .collect();
+        let block = gnitz_wire::schema_block::encode(1, &cols, true);
+        assert!(matches!(schema_from_block(&block), Err(ProtocolError::DecodeError(_))));
+    }
+
+    #[test]
+    fn a_truncated_block_is_a_decode_error_not_a_panic() {
+        let schema = Schema {
+            columns: vec![ColumnDef::new("id", TypeCode::U64, false)],
+            pk_cols: vec![0],
+        };
+        let block = encode_schema_block(&schema, 1);
+        for cut in [0, 8, block.len() / 2, block.len() - 1] {
+            assert!(schema_from_block(&block[..cut]).is_err(), "cut at {cut}");
+        }
+    }
+
+    // ── type_code_from_u64 error paths ──────────────────────────────────────
+
+    #[test]
+    fn test_unknown_type_code_zero() {
+        assert!(matches!(type_code_from_u64(0), Err(ProtocolError::UnknownTypeCode(0))));
+    }
+
+    #[test]
+    fn test_unknown_type_code_16() {
+        // 16 is the first unassigned type-code value after I128 (15).
+        assert!(matches!(
+            type_code_from_u64(16),
+            Err(ProtocolError::UnknownTypeCode(16))
+        ));
+    }
+
+    #[test]
+    fn test_unknown_type_code_max() {
+        assert!(matches!(
+            type_code_from_u64(u64::MAX),
+            Err(ProtocolError::UnknownTypeCode(_))
+        ));
     }
 }

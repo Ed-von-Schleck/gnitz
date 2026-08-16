@@ -147,8 +147,9 @@ pub const IDX_TAB_COLS: &[WireSysCol] = &[
 
 /// The reply **schema block**'s column shape. Not a system table — it is the
 /// per-message block describing a reply's columns — but it is a wire schema both
-/// ends build, so it belongs with them: the engine encodes it, the client decodes
-/// it, and the `flags` word is packed by [`crate::pack_col_meta_flags`].
+/// ends exchange, so it belongs with them. Its codec is
+/// [`crate::schema_block`], which is what both ends actually run; the `flags`
+/// word is packed by [`crate::pack_col_meta_flags`].
 pub const META_SCHEMA_COLS: &[WireSysCol] = &[
     col("col_idx", TypeCode::U64, false),
     col("type_code", TypeCode::U64, false),
@@ -315,10 +316,9 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
     h
 };
 
-// The one reply block that is a wire schema rather than a system table.
-pub const METASCHEMA_COL_TYPE_CODE: usize = col_index_in(META_SCHEMA_COLS, "type_code");
-pub const METASCHEMA_COL_FLAGS: usize = col_index_in(META_SCHEMA_COLS, "flags");
-pub const METASCHEMA_COL_NAME: usize = col_index_in(META_SCHEMA_COLS, "name");
+// The one reply block that is a wire schema rather than a system table. Only
+// the payload slots are named: `schema_block` is its sole codec, and a region
+// walk addresses payload columns.
 pub const METASCHEMA_PAY_TYPE_CODE: usize = pay_index_in(META_SCHEMA_COLS, "type_code");
 pub const METASCHEMA_PAY_FLAGS: usize = pay_index_in(META_SCHEMA_COLS, "flags");
 pub const METASCHEMA_PAY_NAME: usize = pay_index_in(META_SCHEMA_COLS, "name");

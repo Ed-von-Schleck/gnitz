@@ -32,10 +32,8 @@ pub use scatter::{scatter_copy, scatter_multi_source};
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use batch::carve_writer_slices;
-pub(crate) use batch::{BatchBuilder, Layout, MAX_WIRE_REGIONS};
-pub(crate) use batch_wire::{
-    compute_wire_props, schema_wire_safe, wire_block_size, wire_header_dir_size, wire_region_sizes,
-};
+pub(crate) use batch::{BatchBuilder, Layout};
+pub(crate) use batch_wire::{compute_wire_props, schema_wire_safe, wire_header_dir_size, wire_region_sizes};
 // `ColumnarSource` is deliberately NOT re-exported: it adds only the Z-set
 // weight, and every out-of-storage consumer (the comparators, the group-key
 // extractors, the row appenders) reads rows through `gnitz_expr::RowSource`.

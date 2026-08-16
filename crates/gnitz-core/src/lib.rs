@@ -28,12 +28,11 @@ pub use gnitz_wire::{
     PkColList, RangeDescriptor, FK_INDEX_INFIX,
 };
 pub use protocol::{
-    batch_to_schema, encode_message_parts, encode_wal_block, hello_handshake, meta_schema, null_word_get,
-    null_word_set, parse_response, schema_to_batch, send_message, wire_flags_get_schema_version,
-    wire_flags_set_conflict_mode, BatchAppender, ClientTransport, ColData, ColumnDef, FixedInt, Header, Message,
-    MessageParts, PkColumn, PkTuple, ProtocolError, Schema, TransportWaker, TypeCode, ViewBuffers, WireConflictMode,
-    ZSetBatch, ZSetBatchView, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_TABLE_ID,
-    FLAG_CONTINUATION, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_PK, FLAG_HAS_SCHEMA, FLAG_PUSH, FLAG_SEEK,
-    FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN, MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, META_FLAG_NULLABLE, PK_LIST_MAX_COLS,
-    STATUS_ERROR, STATUS_OK,
+    encode_message_parts, encode_wal_block, hello_handshake, null_word_get, null_word_set, parse_response,
+    send_message, wire_flags_get_schema_version, wire_flags_set_conflict_mode, BatchAppender, ClientTransport, ColData,
+    ColumnDef, FixedInt, Header, Message, MessageParts, PkColumn, PkTuple, ProtocolError, Schema, TransportWaker,
+    TypeCode, ViewBuffers, WireConflictMode, ZSetBatch, ZSetBatchView, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID,
+    FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_PK,
+    FLAG_HAS_SCHEMA, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN, MAX_COLUMNS, MAX_PK_BYTES,
+    MAX_PK_COLUMNS, META_FLAG_NULLABLE, PK_LIST_MAX_COLS, STATUS_ERROR, STATUS_OK,
 };

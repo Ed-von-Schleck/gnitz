@@ -106,10 +106,11 @@ pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32)
 }
 
 /// Like [`decode_wal_block`] but verifies the block's XXH3 body checksum.
-/// Kept `pub` for the cross-codec round-trip tests (here and in the engine's
-/// wire tests, which use gnitz-core as a dev-dependency) — the only coverage
-/// that client-encoded checksums are correct.
-pub fn decode_wal_block_verified(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
+/// The crate's round-trip tests are its only callers — the only coverage that
+/// client-encoded checksums are correct; production decodes run over a trusted
+/// stream and go through [`decode_wal_block`].
+#[cfg(test)]
+pub(crate) fn decode_wal_block_verified(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
     decode_wal_block_impl(data, schema, true)
 }
 

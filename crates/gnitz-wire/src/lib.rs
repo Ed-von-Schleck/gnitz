@@ -5,8 +5,8 @@
 //!
 //! The crate is organized into topic modules, but every item is re-exported
 //! flat at the crate root (`gnitz_wire::FOO`) so callers need not track which
-//! module a symbol lives in. `control`, `type_code`, and `wal` are the
-//! exceptions: they remain named modules because callers reference their
+//! module a symbol lives in. `control`, `schema_block`, `type_code`, and `wal`
+//! are the exceptions: they remain named modules because callers reference their
 //! functions by path (`gnitz_wire::wal::encode`) — the generic names would
 //! collide at the crate root. `wal`'s *constants* (`WAL_*`, `MAX_WIRE_REGIONS`,
 //! the `REG_*` region-convention indices) are still flat-exported, since they are
@@ -31,6 +31,7 @@ mod types;
 mod uuid;
 
 pub mod control;
+pub mod schema_block;
 pub mod wal;
 
 pub use catalog::*;

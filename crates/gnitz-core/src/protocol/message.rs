@@ -1,7 +1,7 @@
-use super::codec::{batch_to_schema, schema_to_batch};
+use super::codec::{encode_schema_block, schema_from_block};
 use super::error::ProtocolError;
 use super::transport::ClientTransport;
-use super::types::{meta_schema, PkTuple, Schema, ZSetBatch};
+use super::types::{PkTuple, Schema, ZSetBatch};
 use super::wal_block::{decode_wal_block, encode_wal_block};
 use super::WAL_BLOCK_HEADER_SIZE;
 use super::{
@@ -187,15 +187,6 @@ pub fn encode_message_noschema_parts(
     }
 }
 
-/// Encode the client's meta-schema WAL block for `schema` under table id `tid`
-/// — the exact bytes a schema-bearing push embeds (the `encode_wal_block(
-/// meta_schema(), tid, &schema_to_batch(s))` expression `encode_message_parts`
-/// uses). Shared by the plain-push encoder, the always-schema-bearing
-/// `FLAG_PUSH_TXN` per-family block, and the ScanSpec request's reply schema.
-pub(crate) fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
-    encode_wal_block(meta_schema(), tid, &schema_to_batch(schema))
-}
-
 /// Encode the shared prologue of a transaction-shaped request frame: the reused
 /// control block (`target_id = 0`, all seek fields zero, the given `flags`)
 /// followed by the `u32` item count. The encode-side mirror of the decoder's
@@ -365,8 +356,7 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
     if has_schema {
         let block = gnitz_wire::wal::block_slice_at(buf, off)?;
         off += block.len();
-        let (sbatch, _) = decode_wal_block(block, meta_schema())?;
-        wire_schema = Some(batch_to_schema(&sbatch)?);
+        wire_schema = Some(schema_from_block(block)?);
     } else if has_data {
         match schema_hint {
             None => {
@@ -493,7 +483,6 @@ mod tests {
         off += 4;
         assert_eq!(count, 3);
 
-        let ms = meta_schema();
         let expected = [
             (16u64, WireConflictMode::Update, 2usize),
             (17, WireConflictMode::Error, 1),
@@ -507,8 +496,7 @@ mod tests {
             let stid = u32_at(&payload, off) as u64;
             assert_eq!(stid, exp_tid);
             let ssz = u32_at(&payload, off + gnitz_wire::WAL_OFF_SIZE);
-            let (sbatch, _) = decode_wal_block(&payload[off..off + ssz], ms).unwrap();
-            let decoded_schema = batch_to_schema(&sbatch).unwrap();
+            let decoded_schema = schema_from_block(&payload[off..off + ssz]).unwrap();
             off += ssz;
             // Data block under the decoded schema.
             let dsz = u32_at(&payload, off + gnitz_wire::WAL_OFF_SIZE);

@@ -1,5 +1,4 @@
 use super::error::ProtocolError;
-use std::sync::OnceLock;
 
 pub use gnitz_wire::{FixedInt, ReduceOutKey, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS};
@@ -394,14 +393,6 @@ impl gnitz_expr::SchemaFacts for Schema {
     fn col_nullable(&self, ci: usize) -> bool {
         self.columns[ci].is_nullable
     }
-}
-
-/// The schema block's own schema, built from the shared wire definition so the
-/// engine's encoder and this decoder cannot disagree on its shape.
-pub fn meta_schema() -> &'static Schema {
-    static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE
-        .get_or_init(|| crate::types::schema_from_wire_cols(gnitz_wire::META_SCHEMA_COLS, gnitz_wire::META_SCHEMA_PK))
 }
 
 /// A batch's PK region in memory: `stride` bytes per row, **native

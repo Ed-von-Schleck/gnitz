@@ -1,7 +1,7 @@
 use crate::runtime::wire::{
-    batch_to_schema, build_schema_wire_block, decode_ddl_txn, decode_push_txn, decode_scan_multi, decode_wire,
-    encode_ctrl_block_direct, peek_client_control, peek_control_block, peek_control_block_ipc, schema_to_batch,
-    WireData, WireMsg, CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
+    build_named_schema_wire_block, build_schema_wire_block, decode_ddl_txn, decode_push_txn, decode_scan_multi,
+    decode_schema_block, decode_wire, encode_ctrl_block_direct, peek_client_control, peek_control_block,
+    peek_control_block_ipc, WireData, WireMsg, CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
 };
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout};
@@ -197,21 +197,28 @@ fn test_wire_size_includes_request_id() {
     assert_eq!(sz2, wire2.len());
 }
 
+/// The column names a schema block carries, read back through the shared codec.
+fn block_col_names(block: &[u8]) -> Vec<String> {
+    gnitz_wire::schema_block::SchemaBlock::decode(block, true, gnitz_wire::MAX_PK_COLUMNS)
+        .unwrap()
+        .columns()
+        .map(|c| String::from_utf8(c.name.to_vec()).unwrap())
+        .collect()
+}
+
 #[test]
 fn test_schema_roundtrip_with_names() {
     let sd = string_schema();
     let names = ["pk_col", "int_col", "name_col"];
-    let batch = schema_to_batch(&sd, Some(&named_col_defs(&names)));
-    let (sd2, names2) = batch_to_schema(&batch).unwrap();
+    let block = build_named_schema_wire_block(&sd, &named_col_defs(&names), 0);
+    let sd2 = decode_schema_block(&block, true).unwrap();
     assert_eq!(sd2.num_columns(), 3);
     assert_eq!(sd2.pk_indices(), &[0]);
     assert_eq!(sd2.columns[0].type_code, type_code::U64);
     assert_eq!(sd2.columns[1].type_code, type_code::U64);
     assert_eq!(sd2.columns[2].type_code, type_code::STRING);
     assert_eq!(sd2.columns[2].size(), 16);
-    assert_eq!(names2[0], b"pk_col");
-    assert_eq!(names2[1], b"int_col");
-    assert_eq!(names2[2], b"name_col");
+    assert_eq!(block_col_names(&block), names);
 }
 
 #[test]
@@ -239,15 +246,13 @@ fn test_schema_roundtrip_long_names() {
     let sd = simple_schema();
     let long_name = "this_is_a_very_long_column_name_exceeding_twelve_bytes";
     let names = ["pk", long_name];
-    let batch = schema_to_batch(&sd, Some(&named_col_defs(&names)));
-    let (sd2, names2) = batch_to_schema(&batch).unwrap();
-    assert_eq!(sd2.num_columns(), 2);
-    assert_eq!(names2[0], b"pk");
-    assert_eq!(names2[1], long_name.as_bytes());
+    let block = build_named_schema_wire_block(&sd, &named_col_defs(&names), 0);
+    assert_eq!(decode_schema_block(&block, true).unwrap().num_columns(), 2);
+    assert_eq!(block_col_names(&block), names);
 }
 
 /// Compound-PK order (including a non-identity `pk_indices` permutation) must
-/// survive the `schema_to_batch` → `batch_to_schema` wire round-trip. The
+/// survive the schema-block wire round-trip. The
 /// catalog-restart peer of this — `schema_roundtrip_catalog_preserves_pk_order`
 /// in `catalog/tests/compound_pk_smoke.rs` — exercises the same property through
 /// the catalog API.
@@ -262,8 +267,8 @@ fn schema_roundtrip_wire_preserves_pk_order() {
     ];
     for &(cols, pk_indices) in cases {
         let original = SchemaDescriptor::new(cols, pk_indices);
-        let batch = schema_to_batch(&original, None);
-        let (decoded, _names) = batch_to_schema(&batch).unwrap();
+        let block = build_schema_wire_block(&original, 0);
+        let decoded = decode_schema_block(&block, true).unwrap();
         assert!(
             original == decoded,
             "pk_indices {pk_indices:?} did not survive wire round-trip",

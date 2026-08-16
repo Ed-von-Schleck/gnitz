@@ -2,9 +2,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::error::ClientError;
-use crate::protocol::message::{
-    encode_message_noschema_parts, encode_message_parts, encode_schema_block, MessageParts,
-};
+use crate::protocol::codec::encode_schema_block;
+use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
 use crate::protocol::{
     encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, recv_message, send_message,
     send_message_with_extra, wire_flags_get_schema_version, wire_flags_set_conflict_mode,

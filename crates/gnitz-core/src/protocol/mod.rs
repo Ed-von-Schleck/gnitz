@@ -6,7 +6,6 @@ pub mod transport;
 pub mod types;
 pub mod wal_block;
 
-pub use codec::{batch_to_schema, schema_to_batch};
 pub use error::ProtocolError;
 // The wire protocol's own vocabulary, re-exported at the module root so the
 // client's protocol code has one import path for it. `Header` is
@@ -30,7 +29,7 @@ pub use message::{
 pub use regions::{ViewBuffers, ZSetBatchView};
 pub use transport::{hello_handshake, ClientTransport, FrameSegments, TransportWaker, FRAME_SEGMENTS};
 pub use types::{
-    meta_schema, null_word_get, null_word_set, BatchAppender, ColData, ColumnDef, FixedInt, PkColumn, PkTuple, Schema,
-    TypeCode, ZSetBatch, MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS,
+    null_word_get, null_word_set, BatchAppender, ColData, ColumnDef, FixedInt, PkColumn, PkTuple, Schema, TypeCode,
+    ZSetBatch, MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS,
 };
-pub use wal_block::{decode_wal_block, decode_wal_block_verified, encode_wal_block};
+pub use wal_block::{decode_wal_block, encode_wal_block};
