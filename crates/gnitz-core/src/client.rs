@@ -9,10 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::circuit::Circuit;
-use crate::types::{
-    circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, idx_tab_schema,
-    schema_tab_schema, table_tab_schema, view_tab_schema,
-};
+use crate::types::sys_schema;
 use gnitz_wire::{
     CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_NAME,
     IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME,
@@ -600,7 +597,7 @@ impl GnitzClient {
         // and never reused, so that costs nothing.
         let index_id = self.session.alloc_index_id()?;
 
-        let idx_schema = idx_tab_schema();
+        let idx_schema = sys_schema(IDX_TAB);
         let mut batch = ZSetBatch::new(idx_schema);
         append_idx_tab_row(
             &mut BatchAppender::new(&mut batch, idx_schema),
@@ -614,7 +611,7 @@ impl GnitzClient {
             },
         );
 
-        self.push_ddl(&[(IDX_TAB, idx_schema, batch)])?;
+        self.push_ddl(&[(IDX_TAB, batch)])?;
         Ok(index_id)
     }
 
@@ -646,10 +643,10 @@ impl GnitzClient {
             }
             let rec = decode_index_record(&idx_batch, i)?;
 
-            let idx_schema = idx_tab_schema();
+            let idx_schema = sys_schema(IDX_TAB);
             let mut batch = ZSetBatch::new(idx_schema);
             append_idx_tab_row(&mut BatchAppender::new(&mut batch, idx_schema), -1, &rec);
-            self.push_ddl(&[(IDX_TAB, idx_schema, batch)])?;
+            self.push_ddl(&[(IDX_TAB, batch)])?;
             return Ok(());
         }
         not_found(&index_name)
@@ -770,7 +767,7 @@ impl GnitzClient {
     /// at the state owner, mirroring `push_with_mode`'s single branch for data
     /// writes; the SQL front end's own rejection is then a friendlier early error,
     /// not the sole enforcement.
-    fn push_ddl(&mut self, families: &[(u64, &Schema, ZSetBatch)]) -> Result<u64, ClientError> {
+    fn push_ddl(&mut self, families: &[(u64, ZSetBatch)]) -> Result<u64, ClientError> {
         if self.txn.is_some() {
             return Err(ClientError::ServerError(
                 "DDL is not allowed inside a transaction".into(),
@@ -786,12 +783,12 @@ impl GnitzClient {
         crate::validate_user_identifier(name).map_err(ClientError::ServerError)?;
         let name = canon_name(name);
         let new_sid = self.session.alloc_schema_id()?;
-        let schema = schema_tab_schema();
+        let schema = sys_schema(SCHEMA_TAB);
         let mut batch = ZSetBatch::new(schema);
         BatchAppender::new(&mut batch, schema)
             .add_row(new_sid as u128, 1)
             .str_val(&name);
-        self.push_ddl(&[(SCHEMA_TAB, schema, batch)])?;
+        self.push_ddl(&[(SCHEMA_TAB, batch)])?;
         Ok(new_sid)
     }
 
@@ -863,12 +860,12 @@ impl GnitzClient {
         self.drain_drops(tables, |c, m| c.drop_table(&name, m))?;
 
         // Schema now empty; the engine member-count guard accepts this row.
-        let schema = schema_tab_schema();
+        let schema = sys_schema(SCHEMA_TAB);
         let mut batch = ZSetBatch::new(schema);
         BatchAppender::new(&mut batch, schema)
             .add_row(schema_id as u128, -1)
             .str_val(&name);
-        self.push_ddl(&[(SCHEMA_TAB, schema, batch)])?;
+        self.push_ddl(&[(SCHEMA_TAB, batch)])?;
         Ok(())
     }
 
@@ -933,7 +930,7 @@ impl GnitzClient {
         let col_family = build_col_tab_batch(new_tid, OWNER_KIND_TABLE, columns)?;
 
         // TABLE_TAB family.
-        let tbl_schema = table_tab_schema();
+        let tbl_schema = sys_schema(TABLE_TAB);
         let mut tb = ZSetBatch::new(tbl_schema);
         append_table_tab_row(
             &mut BatchAppender::new(&mut tb, tbl_schema),
@@ -965,9 +962,9 @@ impl GnitzClient {
             }
             index_ids.push(self.session.alloc_index_id()?);
         }
-        let mut families: Vec<(u64, &Schema, ZSetBatch)> = vec![col_family, (TABLE_TAB, tbl_schema, tb)];
+        let mut families: Vec<(u64, ZSetBatch)> = vec![col_family, (TABLE_TAB, tb)];
         if !unique_indexes.is_empty() {
-            let idx_schema = idx_tab_schema();
+            let idx_schema = sys_schema(IDX_TAB);
             let mut idx_batch = ZSetBatch::new(idx_schema);
             {
                 let mut a = BatchAppender::new(&mut idx_batch, idx_schema);
@@ -985,7 +982,7 @@ impl GnitzClient {
                     );
                 }
             }
-            families.push((IDX_TAB, idx_schema, idx_batch));
+            families.push((IDX_TAB, idx_batch));
         }
         self.push_ddl(&families)?;
 
@@ -997,10 +994,10 @@ impl GnitzClient {
         let table_name = canon_name(table_name);
         let record = self.table_record(&schema_name, &table_name)?;
 
-        let tbl_schema = table_tab_schema();
+        let tbl_schema = sys_schema(TABLE_TAB);
         let mut tb = ZSetBatch::new(tbl_schema);
         append_table_tab_row(&mut BatchAppender::new(&mut tb, tbl_schema), -1, &record, &table_name);
-        self.push_ddl(&[(TABLE_TAB, tbl_schema, tb)])?;
+        self.push_ddl(&[(TABLE_TAB, tb)])?;
 
         Ok(())
     }
@@ -1132,11 +1129,11 @@ impl GnitzClient {
         // One batch per family, spanning all views. COL_TAB and VIEW_TAB are
         // always non-empty; the circuit families are included only if some view
         // contributed rows.
-        let col_s = col_tab_schema();
-        let nodes_s = circuit_nodes_schema();
-        let edges_s = circuit_edges_schema();
-        let ncol_s = circuit_node_columns_schema();
-        let view_s = view_tab_schema();
+        let col_s = sys_schema(COL_TAB);
+        let nodes_s = sys_schema(CIRCUIT_NODES_TAB);
+        let edges_s = sys_schema(CIRCUIT_EDGES_TAB);
+        let ncol_s = sys_schema(CIRCUIT_NODE_COLUMNS_TAB);
+        let view_s = sys_schema(VIEW_TAB);
 
         let mut col_batch = ZSetBatch::new(col_s);
         let mut nodes_batch = ZSetBatch::new(nodes_s);
@@ -1193,18 +1190,18 @@ impl GnitzClient {
         // One families entry per tid (mandatory: the engine's derived lists read
         // only the first block per family), in dependency order — the server
         // re-sorts by topo priority anyway.
-        let mut families: Vec<(u64, &Schema, ZSetBatch)> = Vec::new();
-        families.push((COL_TAB, col_s, col_batch));
+        let mut families: Vec<(u64, ZSetBatch)> = Vec::new();
+        families.push((COL_TAB, col_batch));
         if !nodes_batch.is_empty() {
-            families.push((CIRCUIT_NODES_TAB, nodes_s, nodes_batch));
+            families.push((CIRCUIT_NODES_TAB, nodes_batch));
         }
         if !edges_batch.is_empty() {
-            families.push((CIRCUIT_EDGES_TAB, edges_s, edges_batch));
+            families.push((CIRCUIT_EDGES_TAB, edges_batch));
         }
         if !ncol_batch.is_empty() {
-            families.push((CIRCUIT_NODE_COLUMNS_TAB, ncol_s, ncol_batch));
+            families.push((CIRCUIT_NODE_COLUMNS_TAB, ncol_batch));
         }
-        families.push((VIEW_TAB, view_s, view_batch));
+        families.push((VIEW_TAB, view_batch));
 
         self.push_ddl(&families)?;
 
@@ -1224,7 +1221,7 @@ impl GnitzClient {
 
         // One VIEW_TAB batch: the user view's `-1` plus every hidden member's
         // `-1`, full payload reproduced per record.
-        let view_s = view_tab_schema();
+        let view_s = sys_schema(VIEW_TAB);
         let mut vb = ZSetBatch::new(view_s);
         {
             let mut a = BatchAppender::new(&mut vb, view_s);
@@ -1232,7 +1229,7 @@ impl GnitzClient {
                 append_view_row(&mut a, -1, rec);
             }
         }
-        self.push_ddl(&[(VIEW_TAB, view_s, vb)])?;
+        self.push_ddl(&[(VIEW_TAB, vb)])?;
 
         Ok(())
     }
@@ -1282,7 +1279,7 @@ impl GnitzClient {
         if desc.is_view {
             let view_batch = self.scan_catalog(VIEW_TAB)?.ok_or_else(not_found)?;
             let vr = find_view_record_by_id(&view_batch, desc.tid)?.ok_or_else(not_found)?;
-            let view_s = view_tab_schema();
+            let view_s = sys_schema(VIEW_TAB);
             let mut vb = ZSetBatch::new(view_s);
             {
                 let mut a = BatchAppender::new(&mut vb, view_s);
@@ -1290,18 +1287,18 @@ impl GnitzClient {
                 let renamed = ViewRecord { name: new_name, ..vr };
                 append_view_row(&mut a, 1, &renamed);
             }
-            self.push_ddl(&[(VIEW_TAB, view_s, vb)])?;
+            self.push_ddl(&[(VIEW_TAB, vb)])?;
         } else {
             let tbl_batch = self.scan_catalog(TABLE_TAB)?.ok_or_else(not_found)?;
             let record = find_table_record_by_id(&tbl_batch, desc.tid)?.ok_or_else(not_found)?;
-            let tbl_s = table_tab_schema();
+            let tbl_s = sys_schema(TABLE_TAB);
             let mut tb = ZSetBatch::new(tbl_s);
             {
                 let mut a = BatchAppender::new(&mut tb, tbl_s);
                 append_table_tab_row(&mut a, -1, &record, &current_name);
                 append_table_tab_row(&mut a, 1, &record, &new_name);
             }
-            self.push_ddl(&[(TABLE_TAB, tbl_s, tb)])?;
+            self.push_ddl(&[(TABLE_TAB, tb)])?;
         }
         Ok(())
     }
@@ -1393,13 +1390,13 @@ impl GnitzClient {
         }
         let col_idx = desc.schema.num_columns();
 
-        let col_s = col_tab_schema();
+        let col_s = sys_schema(COL_TAB);
         let mut cb = ZSetBatch::new(col_s);
         {
             let mut a = BatchAppender::new(&mut cb, col_s);
             append_col_row(&mut a, tid, OWNER_KIND_TABLE, col_idx, &def.name, def, 1)?;
         }
-        self.push_ddl(&[(COL_TAB, col_s, cb)])?;
+        self.push_ddl(&[(COL_TAB, cb)])?;
         Ok(())
     }
 
@@ -1429,14 +1426,14 @@ impl GnitzClient {
         let mut new_cd = cd.clone();
         flip(&mut new_cd);
 
-        let col_s = col_tab_schema();
+        let col_s = sys_schema(COL_TAB);
         let mut cb = ZSetBatch::new(col_s);
         {
             let mut a = BatchAppender::new(&mut cb, col_s);
             append_col_row(&mut a, tid, OWNER_KIND_TABLE, col_idx, &cd.name, cd, -1)?;
             append_col_row(&mut a, tid, OWNER_KIND_TABLE, col_idx, &new_cd.name, &new_cd, 1)?;
         }
-        self.push_ddl(&[(COL_TAB, col_s, cb)])?;
+        self.push_ddl(&[(COL_TAB, cb)])?;
         Ok(())
     }
 
@@ -1922,15 +1919,11 @@ fn append_col_rows(
 }
 
 /// Build the `COL_TAB` family batch for a table/view's column records — a pure
-/// batch builder returning `(target_id, schema, batch)` for `push_ddl_txn` to
-/// bundle. Touches no connection state; the DDL's whole family set is ingested
+/// batch builder returning `(target_id, batch)` for `push_ddl_txn` to bundle.
+/// Touches no connection state; the DDL's whole family set is ingested
 /// atomically server-side, so column records no longer need a standalone RPC.
-fn build_col_tab_batch(
-    owner_id: u64,
-    owner_kind: u64,
-    columns: &[ColumnDef],
-) -> Result<(u64, &'static Schema, ZSetBatch), ClientError> {
-    let schema = col_tab_schema();
+fn build_col_tab_batch(owner_id: u64, owner_kind: u64, columns: &[ColumnDef]) -> Result<(u64, ZSetBatch), ClientError> {
+    let schema = sys_schema(COL_TAB);
     let mut batch = ZSetBatch::new(schema);
     append_col_rows(
         &mut BatchAppender::new(&mut batch, schema),
@@ -1938,7 +1931,7 @@ fn build_col_tab_batch(
         owner_kind,
         columns,
     )?;
-    Ok((COL_TAB, schema, batch))
+    Ok((COL_TAB, batch))
 }
 
 #[cfg(test)]
@@ -2087,7 +2080,7 @@ mod tests {
 
     #[test]
     fn find_table_record_surfaces_decode_error_not_miss() {
-        let schema = table_tab_schema();
+        let schema = sys_schema(TABLE_TAB);
         let mut batch = ZSetBatch::new(schema);
         BatchAppender::new(&mut batch, schema)
             .add_row(7, 1)
@@ -2114,7 +2107,7 @@ mod tests {
     /// different value, which a fixture writing `0` everywhere would not catch.
     #[test]
     fn table_record_round_trips_through_append_and_find() {
-        let schema = table_tab_schema();
+        let schema = sys_schema(TABLE_TAB);
         let rec = TableRecord {
             tid: 7,
             schema_id: 3,
@@ -2137,7 +2130,7 @@ mod tests {
     /// side (`append_view_row`) round-trips back through the read side.
     #[test]
     fn view_record_round_trips_through_append_and_decode() {
-        let schema = view_tab_schema();
+        let schema = sys_schema(VIEW_TAB);
         let rec = ViewRecord {
             vid: 9,
             schema_id: 4,
@@ -2158,7 +2151,7 @@ mod tests {
 
     #[test]
     fn find_schema_id_miss_vs_hit() {
-        let schema = schema_tab_schema();
+        let schema = sys_schema(SCHEMA_TAB);
         let mut batch = ZSetBatch::new(schema);
         BatchAppender::new(&mut batch, schema).add_row(3, 1).str_val("foo");
         assert_eq!(find_schema_id(&batch, "foo").unwrap(), Some(3));

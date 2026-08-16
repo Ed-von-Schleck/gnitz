@@ -216,7 +216,7 @@ impl CatalogEngine {
     pub fn collect_all_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
         let mut map = std::collections::HashMap::new();
         for (info, table) in SYS_FAMILIES.iter().zip(&self.sys_stores) {
-            map.insert(info.id, table.current_lsn());
+            map.insert(info.id(), table.current_lsn());
         }
         for (&tid, entry) in self.dag.tables.iter() {
             if tid >= FIRST_USER_TABLE_ID {

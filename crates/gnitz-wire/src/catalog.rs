@@ -341,6 +341,75 @@ pub const CIRCUIT_NODE_COLUMNS_TAB: u64 = 13;
 /// by all three, which is why it is named once rather than per family.
 pub const CIRCUIT_FAMILY_PK: &[u32] = &[0, 1];
 
+/// One system family's wire identity: the table id both sides address it by,
+/// its name, and the column shape they each build their schema type from.
+/// Grouping these means a caller holding a table id can *derive* the shape
+/// instead of being handed a separately-chosen one that may not match.
+pub struct WireSysFamily {
+    pub id: u64,
+    /// The table's name, and its subdirectory under the engine's catalog root.
+    pub name: &'static str,
+    pub cols: &'static [WireSysCol],
+    pub pk_cols: &'static [u32],
+}
+
+const fn fam(id: u64, name: &'static str, cols: &'static [WireSysCol], pk_cols: &'static [u32]) -> WireSysFamily {
+    WireSysFamily {
+        id,
+        name,
+        cols,
+        pk_cols,
+    }
+}
+
+/// Every system family, in the order both sides index them by.
+pub const SYS_FAMILIES: &[WireSysFamily] = &[
+    fam(SCHEMA_TAB, "_schemas", SCHEMA_TAB_COLS, SCHEMA_TAB_PK),
+    fam(TABLE_TAB, "_tables", TABLE_TAB_COLS, TABLE_TAB_PK),
+    fam(VIEW_TAB, "_views", VIEW_TAB_COLS, VIEW_TAB_PK),
+    fam(COL_TAB, "_columns", COL_TAB_COLS, COL_TAB_PK),
+    fam(IDX_TAB, "_indices", IDX_TAB_COLS, IDX_TAB_PK),
+    fam(SEQ_TAB, "_sequences", SEQ_TAB_COLS, SEQ_TAB_PK),
+    fam(
+        CIRCUIT_NODES_TAB,
+        "_circuit_nodes",
+        CIRCUIT_NODES_COLS,
+        CIRCUIT_FAMILY_PK,
+    ),
+    fam(
+        CIRCUIT_EDGES_TAB,
+        "_circuit_edges",
+        CIRCUIT_EDGES_COLS,
+        CIRCUIT_FAMILY_PK,
+    ),
+    fam(
+        CIRCUIT_NODE_COLUMNS_TAB,
+        "_circuit_node_columns",
+        CIRCUIT_NODE_COLUMNS_COLS,
+        CIRCUIT_FAMILY_PK,
+    ),
+];
+
+/// Position of family `id` in [`SYS_FAMILIES`], or `None` for a non-family id.
+pub const fn sys_family_index(id: u64) -> Option<usize> {
+    let mut i = 0;
+    while i < SYS_FAMILIES.len() {
+        if SYS_FAMILIES[i].id == id {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The [`WireSysFamily`] with table id `id`, or `None` for a non-family id.
+pub const fn sys_family(id: u64) -> Option<&'static WireSysFamily> {
+    match sys_family_index(id) {
+        Some(i) => Some(&SYS_FAMILIES[i]),
+        None => None,
+    }
+}
+
 pub const FIRST_USER_TABLE_ID: u64 = 16;
 pub const FIRST_USER_SCHEMA_ID: u64 = 3;
 

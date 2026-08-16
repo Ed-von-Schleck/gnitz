@@ -245,13 +245,17 @@ fn system_range_mutations_rejected() {
         (SysFamily::View, &view_rename, "ALTER"),
         (SysFamily::View, &view_create, "CREATE"),
     ] {
-        let err = engine.ingest_to_family(family.info().id, batch).unwrap_err();
+        let err = engine.ingest_to_family(family.info().id(), batch).unwrap_err();
         assert!(err.contains(&format!("cannot {verb} a system relation")), "{err}");
     }
 
     // Nothing was torn down or aliased on the way to the reject.
     for info in &SYS_FAMILIES {
-        assert!(engine.dag.tables.contains_key(&info.id), "{} unregistered", info.name);
+        assert!(
+            engine.dag.tables.contains_key(&info.id()),
+            "{} unregistered",
+            info.wire.name
+        );
     }
     assert!(engine.pending_dir_deletions.is_empty());
     assert_eq!(

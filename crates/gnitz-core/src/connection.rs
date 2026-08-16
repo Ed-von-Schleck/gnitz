@@ -183,9 +183,11 @@ impl Session {
     /// and known to both sides, so the frame carries a schema block per family
     /// (via `encode_wal_block`) and the server resolves each family's schema from
     /// its own catalog.
-    pub fn push_ddl_txn(&mut self, families: &[(u64, &Schema, ZSetBatch)]) -> Result<u64, ClientError> {
-        for (_, schema, batch) in families {
-            batch.validate(schema).map_err(ClientError::ServerError)?;
+    pub fn push_ddl_txn(&mut self, families: &[(u64, ZSetBatch)]) -> Result<u64, ClientError> {
+        for (tid, batch) in families {
+            batch
+                .validate(crate::types::sys_schema(*tid))
+                .map_err(ClientError::ServerError)?;
         }
         let payload = encode_ddl_txn(self.client_id, families);
         self.send_txn_frame(&payload)

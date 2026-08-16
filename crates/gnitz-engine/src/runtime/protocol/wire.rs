@@ -959,18 +959,15 @@ mod tests {
     /// *server* schemas — the two crates hand-keep those identical.
     #[test]
     fn ddl_txn_roundtrip_client_to_server() {
-        use gnitz_core::protocol::types::{BatchAppender, Schema, ZSetBatch};
-        use gnitz_core::types::{
-            circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, idx_tab_schema,
-            table_tab_schema, view_tab_schema,
-        };
+        use gnitz_core::protocol::types::{BatchAppender, ZSetBatch};
+        use gnitz_core::types::sys_schema;
         use gnitz_wire::{
             COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB, {CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB},
         };
 
         // Build a small COL_TAB batch for `oid` with `n` U64 columns.
         let col_batch = |oid: u64, kind: u64, n: usize| -> ZSetBatch {
-            let s = col_tab_schema();
+            let s = sys_schema(COL_TAB);
             let mut b = ZSetBatch::new(s);
             {
                 let mut a = BatchAppender::new(&mut b, s);
@@ -991,7 +988,7 @@ mod tests {
             b
         };
         let table_batch = |tid: u64, weight: i64| -> ZSetBatch {
-            let s = table_tab_schema();
+            let s = sys_schema(TABLE_TAB);
             let mut b = ZSetBatch::new(s);
             BatchAppender::new(&mut b, s)
                 .add_row(tid as u128, weight)
@@ -1002,7 +999,7 @@ mod tests {
             b
         };
         let idx_batch = |idx_id: u64, owner: u64| -> ZSetBatch {
-            let s = idx_tab_schema();
+            let s = sys_schema(IDX_TAB);
             let mut b = ZSetBatch::new(s);
             BatchAppender::new(&mut b, s)
                 .add_row(idx_id as u128, 1)
@@ -1017,11 +1014,11 @@ mod tests {
         // and — for single-PK families — the PK. `check_pk` skips the compound-PK
         // circuit families whose engine `get_pk` returns the packed narrow key
         // rather than the client's low/high u128 layout.
-        let verify = |families: &[(u64, &'static Schema, ZSetBatch)], check_pk: &[bool]| {
+        let verify = |families: &[(u64, ZSetBatch)], check_pk: &[bool]| {
             let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, families);
             let decoded = decode_ddl_txn(&payload).expect("decode_ddl_txn");
             assert_eq!(decoded.len(), families.len(), "family count");
-            for (fi, ((exp_tid, _s, exp_batch), (got_tid, slice))) in families.iter().zip(&decoded).enumerate() {
+            for (fi, ((exp_tid, exp_batch), (got_tid, slice))) in families.iter().zip(&decoded).enumerate() {
                 assert_eq!(*got_tid, *exp_tid as i64, "family {fi} tid/order");
                 let schema = crate::catalog::sys_tab_schema(*got_tid);
                 let (batch, _) = Batch::decode_from_wal_block(slice, &schema, false).expect("decode family batch");
@@ -1040,23 +1037,20 @@ mod tests {
         };
 
         // 1-family: DROP TABLE (one TABLE_TAB -1).
-        verify(&[(TABLE_TAB, table_tab_schema(), table_batch(16, -1))], &[true]);
+        verify(&[(TABLE_TAB, table_batch(16, -1))], &[true]);
 
         // 2-family: CREATE TABLE (COL_TAB + TABLE_TAB).
         verify(
-            &[
-                (COL_TAB, col_tab_schema(), col_batch(17, 0, 2)),
-                (TABLE_TAB, table_tab_schema(), table_batch(17, 1)),
-            ],
+            &[(COL_TAB, col_batch(17, 0, 2)), (TABLE_TAB, table_batch(17, 1))],
             &[true, true],
         );
 
         // 3-family: CREATE TABLE + inline UNIQUE index (COL_TAB + TABLE_TAB + IDX_TAB).
         verify(
             &[
-                (COL_TAB, col_tab_schema(), col_batch(18, 0, 2)),
-                (TABLE_TAB, table_tab_schema(), table_batch(18, 1)),
-                (IDX_TAB, idx_tab_schema(), idx_batch(100, 18)),
+                (COL_TAB, col_batch(18, 0, 2)),
+                (TABLE_TAB, table_batch(18, 1)),
+                (IDX_TAB, idx_batch(100, 18)),
             ],
             &[true, true, true],
         );
@@ -1069,7 +1063,7 @@ mod tests {
         // client's low/high packing. `check_pk` is false for these, so the exact
         // sub values are arbitrary — pick non-trivial ones (clippy `identity_op`).
         let nodes = {
-            let s = circuit_nodes_schema();
+            let s = sys_schema(CIRCUIT_NODES_TAB);
             let mut b = ZSetBatch::new(s);
             {
                 let mut a = BatchAppender::new(&mut b, s);
@@ -1087,7 +1081,7 @@ mod tests {
             b
         };
         let edges = {
-            let s = circuit_edges_schema();
+            let s = sys_schema(CIRCUIT_EDGES_TAB);
             let mut b = ZSetBatch::new(s);
             let sub = (2u128 << 8) | 1u128; // (dst_node, dst_port)
             BatchAppender::new(&mut b, s)
@@ -1098,7 +1092,7 @@ mod tests {
             b
         };
         let node_cols = {
-            let s = circuit_node_columns_schema();
+            let s = sys_schema(CIRCUIT_NODE_COLUMNS_TAB);
             let mut b = ZSetBatch::new(s);
             let sub = (1u128 << 24) | (2u128 << 16) | 3u128; // (node_id, kind, position)
             BatchAppender::new(&mut b, s)
@@ -1111,7 +1105,7 @@ mod tests {
             b
         };
         let view = {
-            let s = view_tab_schema();
+            let s = sys_schema(VIEW_TAB);
             let mut b = ZSetBatch::new(s);
             BatchAppender::new(&mut b, s)
                 .add_row(vid as u128, 1)
@@ -1123,11 +1117,11 @@ mod tests {
         };
         verify(
             &[
-                (COL_TAB, col_tab_schema(), col_batch(vid, 1, 1)),
-                (CIRCUIT_NODES_TAB, circuit_nodes_schema(), nodes),
-                (CIRCUIT_EDGES_TAB, circuit_edges_schema(), edges),
-                (CIRCUIT_NODE_COLUMNS_TAB, circuit_node_columns_schema(), node_cols),
-                (VIEW_TAB, view_tab_schema(), view),
+                (COL_TAB, col_batch(vid, 1, 1)),
+                (CIRCUIT_NODES_TAB, nodes),
+                (CIRCUIT_EDGES_TAB, edges),
+                (CIRCUIT_NODE_COLUMNS_TAB, node_cols),
+                (VIEW_TAB, view),
             ],
             // Skip pk check on the compound-PK circuit families.
             &[true, false, false, false, true],

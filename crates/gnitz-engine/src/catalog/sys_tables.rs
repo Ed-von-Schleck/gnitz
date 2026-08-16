@@ -414,10 +414,10 @@ use crate::schema::from_wire_cols;
 // places every family `Replicated`, so a reader single-sources one copy instead of
 // gathering N (`DagEngine::relation_is_replicated`).
 static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
-    let mut arr = [from_wire_cols(SYS_FAMILIES[0].cols, SYS_FAMILIES[0].pk_cols); SysFamily::COUNT];
+    let mut arr = [from_wire_cols(SYS_FAMILIES[0].wire.cols, SYS_FAMILIES[0].wire.pk_cols); SysFamily::COUNT];
     let mut i = 1;
     while i < SysFamily::COUNT {
-        arr[i] = from_wire_cols(SYS_FAMILIES[i].cols, SYS_FAMILIES[i].pk_cols);
+        arr[i] = from_wire_cols(SYS_FAMILIES[i].wire.cols, SYS_FAMILIES[i].wire.pk_cols);
         i += 1;
     }
     arr
@@ -453,13 +453,11 @@ pub(super) fn pack_view_pk(view_id: i64, sub: u64) -> u128 {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct SysFamilyInfo {
-    pub(crate) id: i64,
-    /// The table's name AND its subdirectory under `_system_catalog/`.
-    pub(crate) name: &'static str,
-    /// The shared wire column slice the schema, the COL_TAB self-description
-    /// rows, and the client's `Schema` all derive from.
-    pub(crate) cols: &'static [gnitz_wire::WireSysCol],
-    pub(crate) pk_cols: &'static [u32],
+    /// The family's shared wire identity: its table id, its name (which is also
+    /// its subdirectory under `_system_catalog/`), and the column shape the
+    /// schema, the COL_TAB self-description rows, and the client's `Schema` all
+    /// derive from. Held by reference so the engine restates none of it.
+    pub(crate) wire: &'static gnitz_wire::WireSysFamily,
     /// Topological creation priority. Lower = earlier in the dependency chain
     /// (created first, destroyed last). Orders the `DDL_TXN` handler's
     /// ascending forward ingest (so every register/index hook sees its
@@ -469,72 +467,37 @@ pub(crate) struct SysFamilyInfo {
     pub(crate) topo_priority: u8,
 }
 
+impl SysFamilyInfo {
+    /// This family's table id, narrowed to the `i64` the catalog storage edge
+    /// and every `sys_*` signature use.
+    #[inline]
+    pub(crate) const fn id(&self) -> i64 {
+        self.wire.id as i64
+    }
+}
+
+/// Bind a family's shared wire descriptor to its engine-only topological
+/// priority. Const-panics on an id `gnitz-wire` does not know, so the table
+/// below cannot name a family that does not exist.
+const fn fam(id: u64, topo_priority: u8) -> SysFamilyInfo {
+    match gnitz_wire::sys_family(id) {
+        Some(wire) => SysFamilyInfo { wire, topo_priority },
+        None => panic!("not a wire system family"),
+    }
+}
+
 /// One descriptor per system family, indexed by `SysFamily` discriminant
 /// (asserted below).
 pub(crate) const SYS_FAMILIES: [SysFamilyInfo; SysFamily::COUNT] = [
-    SysFamilyInfo {
-        id: SCHEMA_TAB_ID,
-        name: "_schemas",
-        cols: gnitz_wire::SCHEMA_TAB_COLS,
-        pk_cols: gnitz_wire::SCHEMA_TAB_PK,
-        topo_priority: 0,
-    },
-    SysFamilyInfo {
-        id: TABLE_TAB_ID,
-        name: "_tables",
-        cols: gnitz_wire::TABLE_TAB_COLS,
-        pk_cols: gnitz_wire::TABLE_TAB_PK,
-        topo_priority: 5,
-    },
-    SysFamilyInfo {
-        id: VIEW_TAB_ID,
-        name: "_views",
-        cols: gnitz_wire::VIEW_TAB_COLS,
-        pk_cols: gnitz_wire::VIEW_TAB_PK,
-        topo_priority: 6,
-    },
-    SysFamilyInfo {
-        id: COL_TAB_ID,
-        name: "_columns",
-        cols: gnitz_wire::COL_TAB_COLS,
-        pk_cols: gnitz_wire::COL_TAB_PK,
-        topo_priority: 1,
-    },
-    SysFamilyInfo {
-        id: IDX_TAB_ID,
-        name: "_indices",
-        cols: gnitz_wire::IDX_TAB_COLS,
-        pk_cols: gnitz_wire::IDX_TAB_PK,
-        topo_priority: 7,
-    },
-    SysFamilyInfo {
-        id: SEQ_TAB_ID,
-        name: "_sequences",
-        cols: gnitz_wire::SEQ_TAB_COLS,
-        pk_cols: gnitz_wire::SEQ_TAB_PK,
-        topo_priority: 99,
-    },
-    SysFamilyInfo {
-        id: CIRCUIT_NODES_TAB_ID,
-        name: "_circuit_nodes",
-        cols: gnitz_wire::CIRCUIT_NODES_COLS,
-        pk_cols: gnitz_wire::CIRCUIT_FAMILY_PK,
-        topo_priority: 2,
-    },
-    SysFamilyInfo {
-        id: CIRCUIT_EDGES_TAB_ID,
-        name: "_circuit_edges",
-        cols: gnitz_wire::CIRCUIT_EDGES_COLS,
-        pk_cols: gnitz_wire::CIRCUIT_FAMILY_PK,
-        topo_priority: 3,
-    },
-    SysFamilyInfo {
-        id: CIRCUIT_NODE_COLUMNS_TAB_ID,
-        name: "_circuit_node_columns",
-        cols: gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS,
-        pk_cols: gnitz_wire::CIRCUIT_FAMILY_PK,
-        topo_priority: 4,
-    },
+    fam(gnitz_wire::SCHEMA_TAB, 0),
+    fam(gnitz_wire::TABLE_TAB, 5),
+    fam(gnitz_wire::VIEW_TAB, 6),
+    fam(gnitz_wire::COL_TAB, 1),
+    fam(gnitz_wire::IDX_TAB, 7),
+    fam(gnitz_wire::SEQ_TAB, 99),
+    fam(gnitz_wire::CIRCUIT_NODES_TAB, 2),
+    fam(gnitz_wire::CIRCUIT_EDGES_TAB, 3),
+    fam(gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB, 4),
 ];
 
 // `SYS_FAMILIES[f.index()]` must describe family `f`: verify the array order
@@ -542,7 +505,7 @@ pub(crate) const SYS_FAMILIES: [SysFamilyInfo; SysFamily::COUNT] = [
 const _: () = {
     let mut i = 0;
     while i < SysFamily::COUNT {
-        match SysFamily::from_id(SYS_FAMILIES[i].id) {
+        match SysFamily::from_id(SYS_FAMILIES[i].id()) {
             Some(f) => assert!(
                 f as usize == i,
                 "SYS_FAMILIES order must match SysFamily discriminant order"
@@ -595,7 +558,7 @@ impl SysFamily {
     /// The `*_TAB_ID` constant for this family.
     #[inline]
     pub(crate) const fn id(self) -> i64 {
-        SYS_FAMILIES[self.index()].id
+        SYS_FAMILIES[self.index()].id()
     }
 
     /// This family's descriptor entry.

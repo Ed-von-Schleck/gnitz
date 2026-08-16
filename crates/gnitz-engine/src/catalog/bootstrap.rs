@@ -17,14 +17,14 @@ impl CatalogEngine {
         let mut stores = Vec::with_capacity(SysFamily::COUNT);
         for info in &SYS_FAMILIES {
             let table = Table::new(
-                &sys_family_dir(base_dir, info.name),
-                sys_tab_schema(info.id),
-                info.id as u32,
+                &sys_family_dir(base_dir, info.wire.name),
+                sys_tab_schema(info.id()),
+                info.id() as u32,
                 SYS_TABLE_ARENA,
                 RelationKind::SystemCatalog.recovery_source(),
             )
             .map(Box::new)
-            .map_err(|e| format!("Failed to create system table '{}': error {}", info.name, e))?;
+            .map_err(|e| format!("Failed to create system table '{}': error {}", info.wire.name, e))?;
             stores.push(table);
         }
         let sys_stores: [Box<Table>; SysFamily::COUNT] = stores
@@ -118,7 +118,7 @@ impl CatalogEngine {
         {
             let mut bb = BatchBuilder::new(SysFamily::Table.schema());
             for info in &SYS_FAMILIES {
-                push_table_tab_row(&mut bb, info.id, SYSTEM_SCHEMA_ID, info.name, 0, 0, 1);
+                push_table_tab_row(&mut bb, info.id(), SYSTEM_SCHEMA_ID, info.wire.name, 0, 0, 1);
             }
             let batch = bb.finish();
             self.sys_store_mut(SysFamily::Table)
@@ -132,14 +132,14 @@ impl CatalogEngine {
         {
             let mut bb = BatchBuilder::new(SysFamily::Column.schema());
             for info in &SYS_FAMILIES {
-                for (i, c) in info.cols.iter().enumerate() {
+                for (i, c) in info.wire.cols.iter().enumerate() {
                     let cd = ColumnDef {
                         name: c.name.to_string(),
                         type_code: c.type_code as u8,
                         is_nullable: c.nullable,
                         ..Default::default()
                     };
-                    push_col_tab_row(&mut bb, info.id, OWNER_KIND_TABLE, i as i64, &cd, 1);
+                    push_col_tab_row(&mut bb, info.id(), OWNER_KIND_TABLE, i as i64, &cd, 1);
                 }
             }
             let batch = bb.finish();
@@ -210,16 +210,16 @@ impl CatalogEngine {
 
         let base_dir = self.base_dir.clone();
         for (info, store) in SYS_FAMILIES.iter().zip(self.sys_stores.iter_mut()) {
-            let dir = sys_family_dir(&base_dir, info.name);
-            let qualified = format!("_system.{}", info.name);
-            self.caches.entity_by_qname.insert(qualified, info.id);
+            let dir = sys_family_dir(&base_dir, info.wire.name);
+            let qualified = format!("_system.{}", info.wire.name);
+            self.caches.entity_by_qname.insert(qualified, info.id());
             self.caches
                 .entity_by_id
-                .insert(info.id, ("_system".into(), info.name.into()));
+                .insert(info.id(), ("_system".into(), info.wire.name.into()));
             self.dag.register_table(
-                info.id,
+                info.id(),
                 StoreHandle::Borrowed(&mut **store),
-                sys_tab_schema(info.id),
+                sys_tab_schema(info.id()),
                 RelationKind::SystemCatalog,
                 0,
                 dir,

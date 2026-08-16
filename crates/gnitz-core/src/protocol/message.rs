@@ -8,6 +8,7 @@ use super::{
     wire_flags_get_schema_version, Header, WireConflictMode, FLAG_DDL_TXN, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
     FLAG_PUSH_TXN, FLAG_SCAN_MULTI, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
+use crate::types::sys_schema;
 
 pub struct Message {
     pub status: u32,
@@ -281,10 +282,14 @@ pub fn encode_scan_multi(client_id: u64, relations: &[(u64, u16)]) -> Vec<u8> {
 /// block embeds its own `table_id` (WAL offset 8) and total size (WAL offset
 /// 16), so the server decoder walks the list by header alone with no schema in
 /// hand and defers schema resolution to the catalog layer.
-pub fn encode_ddl_txn(client_id: u64, families: &[(u64, &Schema, ZSetBatch)]) -> Vec<u8> {
+///
+/// Each family is named by its system table id alone: the schema its batch is
+/// encoded against is that id's, derived here through [`sys_schema`], so a
+/// caller cannot pair one family's id with another's shape.
+pub fn encode_ddl_txn(client_id: u64, families: &[(u64, ZSetBatch)]) -> Vec<u8> {
     let mut out = encode_txn_frame_prologue(client_id, FLAG_DDL_TXN, families.len());
-    for (tid, schema, batch) in families {
-        out.extend_from_slice(&encode_wal_block(schema, *tid as u32, batch));
+    for (tid, batch) in families {
+        out.extend_from_slice(&encode_wal_block(sys_schema(*tid), *tid as u32, batch));
     }
     out
 }

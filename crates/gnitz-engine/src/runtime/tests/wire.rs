@@ -1161,16 +1161,24 @@ fn decode_ddl_txn_is_unaffected_by_the_appended_section() {
     // A DDL frame is control block + family count + data blocks (no mode byte,
     // no schema block, no precondition section). decode_ddl_txn shares only the
     // prologue with decode_push_txn, so it must still walk families cleanly.
-    let schema = core_schema();
-    let fams = vec![
-        (5u64, &schema, core_batch(&schema)),
-        (6u64, &schema, core_batch(&schema)),
-    ];
-    let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, &fams);
+    // Two *different* system families, so the walk cannot pass by reading one
+    // block length twice.
+    use gnitz_core::types::sys_schema;
+    use gnitz_wire::{SCHEMA_TAB, SEQ_TAB};
+
+    let sch_s = sys_schema(SCHEMA_TAB);
+    let mut sch_b = ZSetBatch::new(sch_s);
+    BatchAppender::new(&mut sch_b, sch_s).add_row(3, 1).str_val("s");
+
+    let seq_s = sys_schema(SEQ_TAB);
+    let mut seq_b = ZSetBatch::new(seq_s);
+    BatchAppender::new(&mut seq_b, seq_s).add_row(1, 1).u64_val(42);
+
+    let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, &[(SCHEMA_TAB, sch_b), (SEQ_TAB, seq_b)]);
     let decoded = decode_ddl_txn(&payload).unwrap();
     assert_eq!(decoded.len(), 2);
-    assert_eq!(decoded[0].0, 5);
-    assert_eq!(decoded[1].0, 6);
+    assert_eq!(decoded[0].0, SCHEMA_TAB as i64);
+    assert_eq!(decoded[1].0, SEQ_TAB as i64);
 }
 
 #[test]

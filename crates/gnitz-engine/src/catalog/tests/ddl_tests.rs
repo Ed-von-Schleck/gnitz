@@ -91,12 +91,12 @@ fn bootstrap_self_description_matches_the_wire_column_lists() {
     // added later is covered without touching this test.
     for info in &SYS_FAMILIES {
         let mut rows = described
-            .remove(&(info.id as u64))
-            .unwrap_or_else(|| panic!("family {} describes no columns", info.name));
+            .remove(&(info.id() as u64))
+            .unwrap_or_else(|| panic!("family {} describes no columns", info.wire.name));
         rows.sort_by_key(|(idx, _)| *idx);
         let names: Vec<&str> = rows.iter().map(|(_, n)| n.as_str()).collect();
-        let expected: Vec<&str> = info.cols.iter().map(|c| c.name).collect();
-        assert_eq!(names, expected, "family {} self-description", info.name);
+        let expected: Vec<&str> = info.wire.cols.iter().map(|c| c.name).collect();
+        assert_eq!(names, expected, "family {} self-description", info.wire.name);
     }
     // A fresh server holds no user tables, so the system families are the whole
     // of COL_TAB — anything left over is a row describing a table that is not a
