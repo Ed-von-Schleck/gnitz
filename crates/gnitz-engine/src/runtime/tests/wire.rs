@@ -1182,8 +1182,8 @@ fn decode_ddl_txn_is_unaffected_by_the_appended_section() {
     let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, &[(SCHEMA_TAB, sch_b), (SEQ_TAB, seq_b)]);
     let decoded = decode_ddl_txn(&payload).unwrap();
     assert_eq!(decoded.len(), 2);
-    assert_eq!(decoded[0].0, SCHEMA_TAB as i64);
-    assert_eq!(decoded[1].0, SEQ_TAB as i64);
+    assert_eq!(decoded[0].0, SCHEMA_TAB as u32);
+    assert_eq!(decoded[1].0, SEQ_TAB as u32);
 }
 
 #[test]

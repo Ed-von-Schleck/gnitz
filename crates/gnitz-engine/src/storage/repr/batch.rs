@@ -1994,6 +1994,23 @@ pub(crate) struct BatchBuilder {
     pub(crate) curr_col: usize,
 }
 
+/// The engine half of the shared catalog row codecs: the sink
+/// `gnitz_wire::sys_rows` writes a system-table row into.
+impl gnitz_wire::sys_rows::SysRowSink for BatchBuilder {
+    fn begin_row(&mut self, pk: u128, weight: i64) {
+        BatchBuilder::begin_row(self, pk, weight);
+    }
+    fn put_u64(&mut self, v: u64) {
+        BatchBuilder::put_u64(self, v);
+    }
+    fn put_string(&mut self, s: &str) {
+        BatchBuilder::put_string(self, s);
+    }
+    fn end_row(&mut self) {
+        BatchBuilder::end_row(self);
+    }
+}
+
 impl BatchBuilder {
     pub(crate) fn new(schema: SchemaDescriptor) -> Self {
         BatchBuilder {

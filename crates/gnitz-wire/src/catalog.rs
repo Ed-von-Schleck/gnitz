@@ -226,6 +226,7 @@ pub const VIEWTAB_COL_SQL: usize = col_index_in(VIEW_TAB_COLS, "sql_definition")
 pub const VIEWTAB_COL_PK_COL_IDX: usize = col_index_in(VIEW_TAB_COLS, "pk_col_idx");
 pub const VIEWTAB_PAY_SCHEMA_ID: usize = pay_index_in(VIEW_TAB_COLS, "schema_id");
 pub const VIEWTAB_PAY_NAME: usize = pay_index_in(VIEW_TAB_COLS, "name");
+pub const VIEWTAB_PAY_SQL: usize = pay_index_in(VIEW_TAB_COLS, "sql_definition");
 pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in(VIEW_TAB_COLS, "pk_col_idx");
 
 /// One code path decodes TABLE_TAB and VIEW_TAB on both sides — the engine's
@@ -846,6 +847,24 @@ pub fn table_flags_dist_prefix(flags: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A COL_TAB key packs `(owner_id, col_idx)` into one word, so both halves
+    /// must be bounded: an overflowing index or owner would alias another
+    /// column's record rather than fail.
+    #[test]
+    fn col_id_packing_is_bounded_on_both_halves() {
+        assert!(pack_col_id(1, (1 << COL_ID_IDX_BITS) - 1).is_ok());
+        assert!(pack_col_id(1, 1 << COL_ID_IDX_BITS).is_err());
+        let max_owner = u64::MAX >> COL_ID_IDX_BITS;
+        assert!(pack_col_id(max_owner, 0).is_ok());
+        assert!(pack_col_id(max_owner + 1, 0).is_err());
+        assert!(pack_col_id(u64::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn col_id_packing_roundtrips() {
+        assert_eq!(unpack_col_id(pack_col_id(12345, 7).unwrap()), (12345, 7));
+    }
 
     /// Every system table's key must be admissible for its own column list. The
     /// pair is the thing both crates build from, so it is validated here rather

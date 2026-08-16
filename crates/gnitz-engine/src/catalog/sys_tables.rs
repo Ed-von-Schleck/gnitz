@@ -7,6 +7,7 @@
 use super::ColumnDef;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, BatchBuilder};
+use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
 
 use gnitz_wire::{
     IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID,
@@ -329,9 +330,11 @@ pub(crate) fn family_pks_by_sign(batch: &Batch, positive: bool) -> Vec<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Per-family row builders — the one writing of each family's payload layout,
-// for every engine-side writer: bootstrap's self-description, the DDL
-// emitters, and the test fixtures that drive the applier directly.
+// Per-family row builders — the engine's entry points into the shared
+// `gnitz_wire::sys_rows` codecs, which own each family's payload layout for
+// both sides of the wire. These adapt the catalog's `i64` ids and `ColumnDef`
+// to a codec row, for every engine-side writer: bootstrap's self-description,
+// the DDL emitters, and the test fixtures that drive the applier directly.
 // ---------------------------------------------------------------------------
 
 /// Append one COL_TAB row for column `col_idx` of `owner_id`. Takes the whole
@@ -345,18 +348,25 @@ pub(super) fn push_col_tab_row(
     cd: &ColumnDef,
     weight: i64,
 ) {
-    bb.begin_row(pack_column_id(owner_id, col_idx) as u128, weight);
-    bb.put_u64(owner_id as u64);
-    bb.put_u64(owner_kind as u64);
-    bb.put_u64(col_idx as u64);
-    bb.put_string(&cd.name);
-    bb.put_u64(cd.type_code as u64);
-    bb.put_u64(if cd.is_nullable { 1 } else { 0 });
-    bb.put_u64(cd.fk_table_id as u64);
-    bb.put_u64(cd.fk_col_idx as u64);
-    bb.put_u64(if cd.is_serial { 1 } else { 0 });
-    bb.put_u64(if cd.is_hidden { 1 } else { 0 });
-    bb.end_row();
+    // Catalog callers pass DDL-validated ids, so an out-of-range one here is
+    // catalog corruption — abort rather than alias another column's record.
+    gnitz_wire::sys_rows::write_col_tab_row(
+        bb,
+        &ColTabRow {
+            owner_id: owner_id as u64,
+            owner_kind: owner_kind as u64,
+            col_idx: col_idx as u64,
+            name: &cd.name,
+            type_code: cd.type_code as u64,
+            is_nullable: cd.is_nullable,
+            fk_table_id: cd.fk_table_id as u64,
+            fk_col_idx: cd.fk_col_idx as u64,
+            is_serial: cd.is_serial,
+            is_hidden: cd.is_hidden,
+        },
+        weight,
+    )
+    .expect("catalog col-id packing out of range");
 }
 
 /// Append one TABLE_TAB row at `weight`.
@@ -369,12 +379,17 @@ pub(super) fn push_table_tab_row(
     flags: u64,
     weight: i64,
 ) {
-    bb.begin_row(tid as u128, weight);
-    bb.put_u64(schema_id as u64);
-    bb.put_string(name);
-    bb.put_u64(pk_col_idx);
-    bb.put_u64(flags);
-    bb.end_row();
+    gnitz_wire::sys_rows::write_table_tab_row(
+        bb,
+        &TableTabRow {
+            table_id: tid as u64,
+            schema_id: schema_id as u64,
+            name,
+            pk_col_idx,
+            flags,
+        },
+        weight,
+    );
 }
 
 /// The one-row IDX_TAB batch at `weight` — `+1` registers an index, `-1`
@@ -391,12 +406,17 @@ pub(super) fn idx_tab_batch(
     weight: i64,
 ) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Index.schema());
-    bb.begin_row(index_id as u128, weight);
-    bb.put_u64(owner_id as u64);
-    bb.put_u64(packed_cols);
-    bb.put_string(name);
-    bb.put_u64(if is_unique { 1 } else { 0 });
-    bb.end_row();
+    gnitz_wire::sys_rows::write_idx_tab_row(
+        &mut bb,
+        &IdxTabRow {
+            index_id: index_id as u64,
+            owner_id: owner_id as u64,
+            source_col_idx: packed_cols,
+            name,
+            is_unique: is_unique as u64,
+        },
+        weight,
+    );
     bb.finish()
 }
 

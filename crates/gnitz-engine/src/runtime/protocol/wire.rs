@@ -59,8 +59,6 @@ pub(crate) fn layout_from_wire_flags(flags: u64) -> crate::storage::Layout {
     }
 }
 
-use gnitz_wire::WAL_OFF_TID;
-
 // ---------------------------------------------------------------------------
 // The meta-schema block: this side's adapter to the shared codec
 // ---------------------------------------------------------------------------
@@ -463,145 +461,16 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
     decode_wire_impl(data, None, true)
 }
 
-/// Walk a transaction frame's shared prologue — control block, then the `u32`
-/// family count — returning `(count, offset of the first family, capacity hint)`.
-/// The hint bounds `count` by what the remaining bytes can physically hold
-/// (`min_family_bytes` is the least a single family can encode to), so a hostile
-/// count cannot force a giant pre-allocation on an ingress-capped frame.
-fn txn_frame_prologue(data: &[u8], min_family_bytes: usize) -> Result<(usize, usize, usize), &'static str> {
-    let ctrl = gnitz_wire::wal::block_slice_at(data, 0)?;
-    peek_control_block(ctrl)?;
-    let off = ctrl.len();
-    if off + 4 > data.len() {
-        return Err("TXN family count truncated");
-    }
-    let count = gnitz_wire::read_u32_le(data, off) as usize;
-    let off = off + 4;
-    let max_families = data.len().saturating_sub(off) / min_family_bytes + 1;
-    Ok((count, off, count.min(max_families)))
-}
-
-/// Decode a `FLAG_DDL_TXN` frame into its per-family `(table_id, wal-block
-/// slice)` list, in send order. Walks the concatenated family blocks by header
-/// alone — `table_id` at `WAL_OFF_TID`, total size at `WAL_OFF_SIZE` — so no
-/// schema is needed here; the caller resolves each family's schema from the
-/// catalog and calls `Batch::decode_from_wal_block` on its slice. The frame is:
-/// control block, then `u32` family count, then `count` data blocks. The control
-/// block is validated (version, region count) but not returned — the caller
-/// already has the routing header from `handle_message`'s peek.
-pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(i64, &[u8])>, &'static str> {
-    let (count, mut off, cap) = txn_frame_prologue(data, gnitz_wire::WAL_HEADER_SIZE)?;
-    let mut families = Vec::with_capacity(cap);
-    for _ in 0..count {
-        let block = gnitz_wire::wal::block_slice_at(data, off)?;
-        let tid = gnitz_wire::read_u32_le(block, WAL_OFF_TID) as i64;
-        families.push((tid, block));
-        off += block.len();
-    }
-    Ok(families)
-}
-
-/// One decoded `FLAG_PUSH_TXN` family: the target `tid` (read from the data
-/// block's `WAL_OFF_TID`), the conflict `mode` byte, and the borrowed schema and
-/// data WAL-block slices — same lifetime discipline as `decode_ddl_txn`'s
-/// `(i64, &[u8])`. The master validates the schema block against its catalog and
-/// decodes the data block via `Batch::decode_from_wal_block`.
-pub struct TxnFamilyWire<'a> {
-    pub tid: i64,
-    pub mode: u8,
-    pub schema_block: &'a [u8],
-    pub wal_block: &'a [u8],
-}
-
-/// The two lists a `FLAG_PUSH_TXN` frame decodes to: its per-family write bundle
-/// and its OCC preconditions (each `(tid, basis_lsn)`). Named to keep
-/// `decode_push_txn`'s signature legible (and clear of `clippy::type_complexity`).
-pub type DecodedPushTxn<'a> = (Vec<TxnFamilyWire<'a>>, Vec<(i64, u64)>);
-
-/// Decode a `FLAG_PUSH_TXN` frame into its per-family list plus its OCC
-/// precondition list, in send order — the user-table analogue of
-/// `decode_ddl_txn`. The frame is: control block, `u32` family count, then per
-/// family a `u8` conflict mode, a self-sized meta-schema WAL block, and a
-/// self-sized data WAL block; then — appended after the last family — a `u32`
-/// precondition count and that many `[u64 tid][u64 basis_lsn]` pairs (all LE).
-/// The precondition section is always present (a zero count still encodes its
-/// 4-byte length). Truncation at any field rejects the whole frame. The section
-/// is appended *after* the families (not before `family_count`) so the shared
-/// `txn_frame_prologue` and `decode_ddl_txn` are untouched.
-pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, &'static str> {
-    // A family is at least a mode byte plus two WAL headers (schema + data).
-    let (count, mut off, cap) = txn_frame_prologue(data, 1 + 2 * gnitz_wire::WAL_HEADER_SIZE)?;
-    let mut families = Vec::with_capacity(cap);
-    for _ in 0..count {
-        if off + 1 > data.len() {
-            return Err("PUSH_TXN family mode truncated");
-        }
-        let mode = data[off];
-        off += 1;
-        let schema_block = gnitz_wire::wal::block_slice_at(data, off)?;
-        off += schema_block.len();
-        let wal_block = gnitz_wire::wal::block_slice_at(data, off)?;
-        let tid = gnitz_wire::read_u32_le(wal_block, WAL_OFF_TID) as i64;
-        off += wal_block.len();
-        families.push(TxnFamilyWire {
-            tid,
-            mode,
-            schema_block,
-            wal_block,
-        });
-    }
-    // Precondition section: `u32` count, then count × `[u64 tid][u64 basis]`.
-    if off + 4 > data.len() {
-        return Err("PUSH_TXN precondition count truncated");
-    }
-    let pre_count = gnitz_wire::read_u32_le(data, off) as usize;
-    off += 4;
-    // Bound the count by the bytes physically remaining (16 per precondition) so
-    // a hostile count cannot force a giant pre-allocation, and the reads below
-    // stay in bounds.
-    if pre_count > data.len().saturating_sub(off) / 16 {
-        return Err("PUSH_TXN precondition section truncated");
-    }
-    let mut preconditions = Vec::with_capacity(pre_count);
-    for _ in 0..pre_count {
-        let tid = gnitz_wire::read_u64_le(data, off) as i64;
-        let basis = gnitz_wire::read_u64_le(data, off + 8);
-        off += 16;
-        preconditions.push((tid, basis));
-    }
-    Ok((families, preconditions))
-}
-
-/// Decode a `FLAG_SCAN_MULTI` frame into its per-relation `(tid,
-/// client_schema_version)` list, in request order. The frame is: control block,
-/// then a `u32` relation count, then per relation a `u64` tid and a `u16` cached
-/// schema version (all LE). The control block is validated (version, region
-/// count) but not returned — `handle_message`'s peek already holds the routing
-/// header. Truncation at any field rejects the whole frame; the count/duplicate/
-/// tid-legality shape rules are the handler's (`handle_scan_multi`), so a
-/// well-formed but empty or over-cap list decodes cleanly and is rejected there
-/// with a specific message.
+/// The three transaction-shaped request frames — `PUSH_TXN`, `DDL_TXN` and
+/// `SCAN_MULTI` — decode through the shared `gnitz_wire::txn_frame` codec, the
+/// same one the client encodes them with, so neither end can walk a layout the
+/// other does not write. Re-exported (not wrapped) so the handlers name them
+/// through `ipc::` as before.
 ///
-/// Shares the control-block + `u32` count
-/// prologue with `decode_ddl_txn`/`decode_push_txn` via `txn_frame_prologue`; the
-/// explicit 10-byte-record bound below then rejects a hostile count before
-/// allocating (the per-record reads would otherwise panic on a short slice).
-pub fn decode_scan_multi(data: &[u8]) -> Result<Vec<(u64, u16)>, &'static str> {
-    // A relation record is exactly 10 bytes (u64 tid + u16 version).
-    const RECORD_BYTES: usize = 10;
-    let (count, mut off, _cap) = txn_frame_prologue(data, RECORD_BYTES)?;
-    if count > data.len().saturating_sub(off) / RECORD_BYTES {
-        return Err("SCAN_MULTI relation section truncated");
-    }
-    let mut relations = Vec::with_capacity(count);
-    for _ in 0..count {
-        let tid = gnitz_wire::read_u64_le(data, off);
-        let version = gnitz_wire::read_u16_le(data, off + 8);
-        off += RECORD_BYTES;
-        relations.push((tid, version));
-    }
-    Ok(relations)
-}
+/// Shape rules beyond the layout — an empty bundle, a duplicate or illegal tid,
+/// a count past the per-frame cap — stay with the handlers, so a well-formed but
+/// unacceptable frame is rejected there with a specific message.
+pub use gnitz_wire::txn_frame::{decode_ddl_txn, decode_push_txn, decode_scan_multi};
 
 /// Like `decode_wire` but skips WAL block checksum verification.  Use for
 /// trusted intra-process IPC (W2M ring).
@@ -840,8 +709,8 @@ mod tests {
             let decoded = decode_ddl_txn(&payload).expect("decode_ddl_txn");
             assert_eq!(decoded.len(), families.len(), "family count");
             for (fi, ((exp_tid, exp_batch), (got_tid, slice))) in families.iter().zip(&decoded).enumerate() {
-                assert_eq!(*got_tid, *exp_tid as i64, "family {fi} tid/order");
-                let schema = crate::catalog::sys_tab_schema(*got_tid);
+                assert_eq!(*got_tid, *exp_tid as u32, "family {fi} tid/order");
+                let schema = crate::catalog::sys_tab_schema(*got_tid as i64);
                 let (batch, _) = Batch::decode_from_wal_block(slice, &schema, false).expect("decode family batch");
                 assert_eq!(batch.count, exp_batch.len(), "row count tid {got_tid}");
                 for i in 0..batch.count {

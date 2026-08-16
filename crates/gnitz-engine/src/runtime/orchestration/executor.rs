@@ -1446,7 +1446,8 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
     let _cat = shared.catalog_rwlock.read().await;
     let mut families: Vec<TxnFamily> = Vec::with_capacity(raw.len());
     for fam in &raw {
-        let tid = fam.tid;
+        // The wire carries the tid as u32; the catalog addresses it as i64.
+        let tid = fam.tid as i64;
         if tid < FIRST_USER_TABLE_ID {
             return Err(format!("TXN: {tid} is not a user table"));
         }
@@ -1496,6 +1497,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
     //     commit are one atomic step. Reading the map borrow ends at each
     //     statement; no borrow crosses an `.await`.
     for &(tid, basis) in &preconditions {
+        let tid = tid as i64;
         if !family_tids.contains(&tid) {
             return Err(format!("TXN: precondition on {tid}: not a written table"));
         }
@@ -2242,7 +2244,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     let family_count = raw_families.len();
     let mut families: Vec<(SysFamily, Batch)> = Vec::with_capacity(family_count);
     for &(tid, slice) in &raw_families {
-        match decode_sys_family(tid, slice) {
+        match decode_sys_family(tid as i64, slice) {
             Ok(fb) => families.push(fb),
             Err(e) => {
                 let msg = format!("DDL_TXN: {e}");

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::circuit::Circuit;
 use crate::types::sys_schema;
+use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::{
     CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_NAME,
     IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME,
@@ -86,10 +87,6 @@ fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
         ));
     }
     Ok(())
-}
-
-fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
-    gnitz_wire::pack_col_id(owner_id, col_idx as u64).map_err(ClientError::ServerError)
 }
 
 /// Build the `-1` retraction batch for `pks`: the server's `retract_pk` matches
@@ -1674,10 +1671,11 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientEr
     Ok(None)
 }
 
-/// Decode row `i` of a `TABLE_TAB` batch into a `TableRecord` — the single home
-/// for the TABLE_TAB column layout on the read side (`append_table_tab_row` is
-/// the write side, minus the `name` it takes separately); both finders below
-/// build on it.
+/// Decode row `i` of a `TABLE_TAB` batch into a `TableRecord` — this crate's one
+/// reading of the TABLE_TAB layout; both finders below build on it. The write
+/// side is `gnitz_wire::sys_rows::write_table_tab_row`, which the whole tree
+/// shares. `name` is not decoded here — `append_table_tab_row` takes it
+/// separately, since a DROP or RENAME supplies it from elsewhere.
 fn decode_table_record(batch: &ZSetBatch, i: usize) -> Result<TableRecord, ClientError> {
     Ok(TableRecord {
         tid: batch.pks.get(i) as u64,
@@ -1697,9 +1695,9 @@ fn find_table_record_by_id(batch: &ZSetBatch, tid: u64) -> Result<Option<TableRe
         .transpose()
 }
 
-/// Decode row `i` of a `VIEW_TAB` batch into a `ViewRecord` — the single home
-/// for the VIEW_TAB column layout on the read side (`append_view_row` is the
-/// write side); every row filter builds on it.
+/// Decode row `i` of a `VIEW_TAB` batch into a `ViewRecord` — this crate's one
+/// reading of the VIEW_TAB layout; every row filter builds on it. The write side
+/// is `gnitz_wire::sys_rows::write_view_tab_row`.
 fn decode_view_record(batch: &ZSetBatch, i: usize) -> Result<ViewRecord, ClientError> {
     Ok(ViewRecord {
         vid: batch.pks.get(i) as u64,
@@ -1766,16 +1764,21 @@ fn append_circuit_rows(
     }
 }
 
-/// Append one `VIEW_TAB` row — the single home for the VIEW_TAB payload layout
-/// on the write side, mirroring `decode_view_record`. A drop's `-1` row must
+/// Append one `VIEW_TAB` row through the shared codec. A drop's `-1` row must
 /// reproduce the `+1`'s payload byte-for-byte to cancel in the Z-set, so the
 /// create and drop-cascade paths both write through here.
 fn append_view_row(a: &mut BatchAppender<'_>, weight: i64, rec: &ViewRecord) {
-    a.add_row(rec.vid as u128, weight)
-        .u64_val(rec.schema_id)
-        .str_val(&rec.name)
-        .str_val(&rec.sql_definition)
-        .u64_val(rec.pk_col_idx);
+    gnitz_wire::sys_rows::write_view_tab_row(
+        a,
+        &ViewTabRow {
+            view_id: rec.vid,
+            schema_id: rec.schema_id,
+            name: &rec.name,
+            sql_definition: &rec.sql_definition,
+            pk_col_idx: rec.pk_col_idx,
+        },
+        weight,
+    );
 }
 
 /// Append one `TABLE_TAB` row — the write-side mirror of `decode_table_record`
@@ -1783,23 +1786,35 @@ fn append_view_row(a: &mut BatchAppender<'_>, weight: i64, rec: &ViewRecord) {
 /// is passed separately so a DROP or RENAME reproduces the live payload
 /// byte-for-byte (§3.3 CAS); the create/drop/rename paths all write through here.
 fn append_table_tab_row(a: &mut BatchAppender<'_>, weight: i64, rec: &TableRecord, name: &str) {
-    a.add_row(rec.tid as u128, weight)
-        .u64_val(rec.schema_id)
-        .str_val(name)
-        .u64_val(rec.pk_col_idx)
-        .u64_val(rec.flags);
+    gnitz_wire::sys_rows::write_table_tab_row(
+        a,
+        &TableTabRow {
+            table_id: rec.tid,
+            schema_id: rec.schema_id,
+            name,
+            pk_col_idx: rec.pk_col_idx,
+            flags: rec.flags,
+        },
+        weight,
+    );
 }
 
-/// Append one `IDX_TAB` row — the single home for the layout, mirrored by
+/// Append one `IDX_TAB` row through the shared codec, read back by
 /// [`decode_index_record`]. The engine rejects a `-1` whose payload differs
 /// from the live row, and only byte-equal rows cancel, so a DROP must
 /// reproduce its CREATE exactly.
 fn append_idx_tab_row(a: &mut BatchAppender<'_>, weight: i64, rec: &IndexRecord) {
-    a.add_row(rec.index_id as u128, weight)
-        .u64_val(rec.owner_id)
-        .u64_val(rec.source_cols)
-        .str_val(&rec.name)
-        .u64_val(rec.is_unique);
+    gnitz_wire::sys_rows::write_idx_tab_row(
+        a,
+        &IdxTabRow {
+            index_id: rec.index_id,
+            owner_id: rec.owner_id,
+            source_col_idx: rec.source_cols,
+            name: &rec.name,
+            is_unique: rec.is_unique,
+        },
+        weight,
+    );
 }
 
 /// Read-side mirror of [`append_idx_tab_row`].
@@ -1865,9 +1880,9 @@ fn collect_schema_member_names(batch: &ZSetBatch, schema_id: u64) -> Result<Vec<
 
 /// Append one `COL_TAB` row for column `col_idx` of `owner_id` at `weight`, with
 /// `name` (column names are case-preserved) and the rest of the payload from
-/// `cd`. The single home for the COL_TAB row layout — the create path
-/// (`append_col_rows`) and a RENAME COLUMN's `-1`/`+1` pair both write through
-/// here, so a rename's `-1` reproduces the live row byte-for-byte (§3.3 CAS).
+/// `cd`. The create path (`append_col_rows`) and a RENAME COLUMN's `-1`/`+1`
+/// pair both write through here — and through the shared codec below it — so a
+/// rename's `-1` reproduces the live row byte-for-byte (§3.3 CAS).
 ///
 /// The FK fields are resolved against `owner_id`/`owner_kind` instead of taken
 /// from `cd`: `SELF_FK_TABLE_ID` becomes `owner_id` (the id the planner could
@@ -1892,18 +1907,23 @@ fn append_col_row(
     } else {
         (cd.fk_table_id, cd.fk_col_idx)
     };
-    a.add_row(pack_col_id(owner_id, col_idx)? as u128, weight)
-        .u64_val(owner_id)
-        .u64_val(owner_kind)
-        .u64_val(col_idx as u64)
-        .str_val(name)
-        .u64_val(cd.type_code as u64)
-        .u64_val(if cd.is_nullable { 1 } else { 0 })
-        .u64_val(fk_table_id)
-        .u64_val(fk_col_idx)
-        .u64_val(if cd.is_serial { 1 } else { 0 })
-        .u64_val(if cd.is_hidden { 1 } else { 0 });
-    Ok(())
+    gnitz_wire::sys_rows::write_col_tab_row(
+        a,
+        &ColTabRow {
+            owner_id,
+            owner_kind,
+            col_idx: col_idx as u64,
+            name,
+            type_code: cd.type_code as u64,
+            is_nullable: cd.is_nullable,
+            fk_table_id,
+            fk_col_idx,
+            is_serial: cd.is_serial,
+            is_hidden: cd.is_hidden,
+        },
+        weight,
+    )
+    .map_err(ClientError::ServerError)
 }
 
 fn append_col_rows(
@@ -2035,27 +2055,6 @@ mod tests {
         assert!(buf.last_op(tid, &PkTuple::from_u128(8, 9)).is_none(), "untouched PK");
         assert!(buf.last_op(17, &PkTuple::from_u128(8, 1)).is_none(), "other tid");
         assert_eq!(buf.last_ops(tid).count(), 3);
-    }
-
-    #[test]
-    fn pack_col_id_rejects_col_idx_too_large() {
-        assert!(pack_col_id(1, 511).is_ok());
-        assert!(pack_col_id(1, 512).is_err());
-    }
-
-    #[test]
-    fn pack_col_id_rejects_owner_id_too_large() {
-        let max_valid = u64::MAX >> 9;
-        assert!(pack_col_id(max_valid, 0).is_ok());
-        assert!(pack_col_id(max_valid + 1, 0).is_err());
-        assert!(pack_col_id(u64::MAX, 0).is_err());
-    }
-
-    #[test]
-    fn pack_col_id_roundtrip() {
-        let id = pack_col_id(12345, 7).unwrap();
-        assert_eq!(id >> 9, 12345);
-        assert_eq!(id & 0x1FF, 7);
     }
 
     #[test]

@@ -1004,6 +1004,23 @@ pub struct BatchAppender<'a> {
     payload_to_ci: Vec<usize>,
 }
 
+/// The client half of the shared catalog row codecs: the sink
+/// `gnitz_wire::sys_rows` writes a system-table row into. `end_row` is a no-op
+/// because this builder writes the null word eagerly in `add_row` and needs no
+/// per-row close.
+impl gnitz_wire::sys_rows::SysRowSink for BatchAppender<'_> {
+    fn begin_row(&mut self, pk: u128, weight: i64) {
+        self.add_row(pk, weight);
+    }
+    fn put_u64(&mut self, v: u64) {
+        self.u64_val(v);
+    }
+    fn put_string(&mut self, s: &str) {
+        self.str_val(s);
+    }
+    fn end_row(&mut self) {}
+}
+
 impl<'a> BatchAppender<'a> {
     pub fn new(batch: &'a mut ZSetBatch, schema: &'a Schema) -> Self {
         let payload_to_ci: Vec<usize> = schema.payload_columns().map(|(_, ci, _)| ci).collect();
