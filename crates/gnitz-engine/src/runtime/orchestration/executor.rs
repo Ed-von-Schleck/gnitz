@@ -312,6 +312,15 @@ impl Shared {
             .unwrap_or(self.boot_seed)
     }
 
+    /// Drop the per-relation state of a relation whose DROP is durable. Takes the
+    /// catalog write guard because every `table_lock` acquisition is enclosed by a
+    /// catalog *read* guard, so holding the write guard is what proves no task
+    /// holds or awaits the lock being removed.
+    fn forget_relation(&self, _catalog_write: &WriteGuard, id: i64) {
+        self.table_locks.borrow_mut().remove(&id);
+        self.table_commit_lsn.borrow_mut().remove(&id);
+    }
+
     /// True iff some pending tid has crossed the row coalesce threshold.
     /// Used by the tick task to skip the deadline coalesce window.
     fn any_threshold_crossed(&self) -> bool {
@@ -2341,7 +2350,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // parks the tick loop on a release this handler only sends once the barrier
     // returns — which needs the sequence to finish.
     with_ddl_window(shared, async {
-        let _write = shared.catalog_rwlock.write().await;
+        let catalog_write = shared.catalog_rwlock.write().await;
 
         if view_create {
             // Lock-held committer barrier: a push could have committed between the
@@ -2408,13 +2417,15 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
             (*cat_ptr_raw).ctx.open_ddl_zone(zone_lsn_nz);
         }
 
-        // The post-fsync unique-filter maintenance needs the durably-dropped tids and
+        // The post-fsync reclamation needs the durably-dropped relation ids and
         // (owner, packed-cols) pairs (the -1 rows); the ingest loop consumes
         // `families`, so extract those minimal lists now instead of cloning the whole
-        // TABLE_TAB / IDX_TAB batches. A bundle is one DDL, so at most one family
-        // carries -1 rows; a CREATE bundle yields empty lists.
+        // TABLE_TAB / VIEW_TAB / IDX_TAB batches. A bundle is one DDL, so at most one
+        // family carries -1 rows; a CREATE bundle yields empty lists.
         let dropped_tids: Vec<i64> =
             bundle_family(&families, SysFamily::Table).map_or_else(Vec::new, |b| family_pks_by_sign(b, false));
+        let dropped_view_ids: Vec<i64> =
+            bundle_family(&families, SysFamily::View).map_or_else(Vec::new, |b| family_pks_by_sign(b, false));
         let dropped_indices: Vec<(i64, u64)> = bundle_family(&families, SysFamily::Index)
             .map(idx_tab_drops)
             .unwrap_or_default();
@@ -2507,6 +2518,10 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         // recreated table with the same ID does not inherit stale filter entries.
         for &tid in &dropped_tids {
             shared.disp().unique_filter_invalidate_table(tid);
+        }
+        // Relation ids are never reissued within a boot, so these entries are dead.
+        for &id in dropped_tids.iter().chain(&dropped_view_ids) {
+            shared.forget_relation(&catalog_write, id);
         }
         // Keying by the whole packed list means dropping `(a, b)` never clears a
         // distinct single-column filter on `a`.

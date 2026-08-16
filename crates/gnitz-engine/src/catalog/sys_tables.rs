@@ -675,4 +675,23 @@ mod tests {
             "sub (PK col 1) follows view_id",
         );
     }
+
+    #[test]
+    fn family_pks_by_sign_separates_a_drop_from_a_rename() {
+        // A plain `-1` TABLE_TAB row is a DROP.
+        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+        push_table_tab_row(&mut bb, 42, PUBLIC_SCHEMA_ID, "t", 0, 0, -1);
+        let dropped = bb.finish();
+        assert_eq!(family_pks_by_sign(&dropped, false), vec![42]);
+        assert!(family_pks_by_sign(&dropped, true).is_empty());
+
+        // A rename is a `(-1, +1)` rewrite pair on one PK: neither a create nor a
+        // drop, so DDL paths keyed off these lists leave a renamed table alone.
+        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+        push_table_tab_row(&mut bb, 42, PUBLIC_SCHEMA_ID, "t", 0, 0, -1);
+        push_table_tab_row(&mut bb, 42, PUBLIC_SCHEMA_ID, "t2", 0, 0, 1);
+        let renamed = bb.finish();
+        assert!(family_pks_by_sign(&renamed, false).is_empty());
+        assert!(family_pks_by_sign(&renamed, true).is_empty());
+    }
 }

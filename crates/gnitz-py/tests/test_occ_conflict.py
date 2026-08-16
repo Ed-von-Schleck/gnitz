@@ -431,3 +431,37 @@ def test_raw_transaction_context_manager_conflict_is_typed(server):
         b.close()
         with gnitz.connect(server) as c:
             c.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# A rename is not a drop: DDL reclamation must leave the watermark alone
+# ---------------------------------------------------------------------------
+
+
+def test_rename_between_read_and_commit_still_conflicts(server):
+    # A durable DROP reclaims the relation's OCC commit watermark. A rename reaches
+    # the same DDL path but must not: a cleared watermark would let A's stale
+    # precondition pass, silently losing B's update.
+    with gnitz.connect(server) as setup:
+        sn = _schema(setup)
+        _table(setup, sn)
+        setup.execute_sql("INSERT INTO t VALUES (1, 0)", schema_name=sn)
+    a = gnitz.connect(server)
+    b = gnitz.connect(server)
+    try:
+        tid, _ = a.resolve_table(sn, "t")
+        a.execute_sql("BEGIN", schema_name=sn)
+        a.execute_sql("UPDATE t SET val = val + 1 WHERE pk = 1", schema_name=sn)
+        b.execute_sql("UPDATE t SET val = val + 100 WHERE pk = 1", schema_name=sn)
+        b.execute_sql("ALTER TABLE t RENAME TO t2", schema_name=sn)
+        with pytest.raises(gnitz.GnitzConflictError):
+            a.execute_sql("COMMIT", schema_name=sn)
+        # The rename really committed (so the DDL path above really ran), and the
+        # tid outlives it: only B's write is durable.
+        assert a.resolve_table(sn, "t2")[0] == tid
+        assert _scan(a, tid) == [(1, 100)]
+    finally:
+        a.close()
+        b.close()
+        with gnitz.connect(server) as c:
+            c.drop_schema(sn)
