@@ -1154,10 +1154,7 @@ impl LogicalProgram {
         // collapse without wiring anything of its own. A PK column has no
         // payload slot and so contributes no bit, which is the same rule that
         // makes `LoadPk`'s destination unconditionally non-null.
-        let nullable_slots = (0..schema.num_columns())
-            .filter(|&ci| schema.col_nullable(ci))
-            .filter_map(|ci| schema.payload_slot(ci))
-            .fold(0u64, |m, pi| m | 1u64 << pi);
+        let nullable_slots = schema.nullable_payload_slots();
         // Which registers hold strings, off the same operand table `validate`
         // reads. Maintained in program order so an `Emit` sees the same class
         // `validate` saw when it approved that output slot.

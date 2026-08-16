@@ -150,7 +150,6 @@ fn build_check_batch_with<K>(
     pooled: Option<Batch>,
     mut push_pk: impl FnMut(&mut Batch, &K),
 ) -> Batch {
-    let npc = schema.num_payload_cols();
     let n = keys.len();
     let mut batch = match pooled {
         Some(b) if b.schema.as_ref() == Some(schema) => {
@@ -161,7 +160,7 @@ fn build_check_batch_with<K>(
         }
         _ => Batch::with_capacity(*schema, n),
     };
-    let null_word: u64 = gnitz_wire::all_payload_null_mask(npc);
+    let null_word: u64 = gnitz_expr::SchemaFacts::nullable_payload_slots(schema);
     for key in keys {
         batch.ensure_row_capacity();
         push_pk(&mut batch, &key);
@@ -1700,8 +1699,7 @@ mod tests {
     #[test]
     fn check_batch_64_payload_cols_full_null_word() {
         // 65 columns: 1 U64 PK + 64 nullable payload cols → npc == 64, the
-        // shift-by-width boundary. Must not panic (debug) and must mark every
-        // payload column null (release silent-miss guard).
+        // widest null word a probe row can carry.
         let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
         for _ in 0..64 {
             cols.push(SchemaColumn::new(type_code::I64, 1));
@@ -1715,6 +1713,28 @@ mod tests {
 
         let null_word = u64::from_le_bytes(batch.null_bmp_data()[0..8].try_into().unwrap());
         assert_eq!(null_word, u64::MAX, "all 64 payload columns must be marked null");
+    }
+
+    /// The probe row's null word is the schema's *nullable* slots, not "every
+    /// payload column": a bit under a NOT NULL column is exactly what the
+    /// null-blind `FixedIntNonnull` row comparator and `is_null` disagree about,
+    /// and the probe batch crosses the wire into the worker's generic decode
+    /// path, where nothing knows it is special.
+    #[test]
+    fn check_batch_leaves_not_null_columns_unmarked() {
+        let cols = vec![
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
+        ];
+        let schema = SchemaDescriptor::new(&cols, &[0]);
+
+        let batch = build_check_batch(&schema, &[42u128], type_code::U64, None);
+        assert_eq!(batch.count, 1);
+
+        let null_word = u64::from_le_bytes(batch.null_bmp_data()[0..8].try_into().unwrap());
+        assert_eq!(null_word, 0b010, "only the nullable payload column may be marked null");
     }
 
     #[test]

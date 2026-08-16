@@ -37,6 +37,33 @@ impl SchemaFacts for OffByOnePayloadColIdx {
     }
 }
 
+/// [`TestSchema`] whose `nullable_payload_slots` override has drifted one slot
+/// off its column table. The masks are provided methods, so this is what an
+/// implementor that answers them from a precomputed field can get wrong while
+/// every per-column forwarder still reports the truth.
+struct DriftedNullableMask(TestSchema);
+
+impl SchemaFacts for DriftedNullableMask {
+    fn locate(&self, ci: usize) -> ColumnLocator {
+        self.0.locate(ci)
+    }
+    fn num_payload_cols(&self) -> usize {
+        self.0.num_payload_cols()
+    }
+    fn num_columns(&self) -> usize {
+        self.0.num_columns()
+    }
+    fn col_type_code(&self, ci: usize) -> u8 {
+        self.0.col_type_code(ci)
+    }
+    fn col_nullable(&self, ci: usize) -> bool {
+        self.0.col_nullable(ci)
+    }
+    fn nullable_payload_slots(&self) -> u64 {
+        self.0.nullable_payload_slots() << 1
+    }
+}
+
 /// Run the harness over [`TestSchema`] — the fixture every kernel test in this
 /// crate resolves its programs against, so its payload slots and OPK offsets are
 /// what decide those tests' column addresses.
@@ -56,4 +83,13 @@ fn schema_facts_harness_rejects_an_off_by_one_payload_col_idx() {
         &TINY,
         &TINY_PK,
     );
+}
+
+/// The nullability masks decide which null bits a batch may carry, and an
+/// implementor is free to override them off a precomputed field — so the harness
+/// has to fail one that disagrees with the column table it was built from.
+#[test]
+#[should_panic(expected = "nullable_payload_slots")]
+fn schema_facts_harness_rejects_a_drifted_nullable_mask() {
+    assert_schema_facts_consistent(&DriftedNullableMask(TestSchema::new(&TINY, &TINY_PK)), &TINY, &TINY_PK);
 }

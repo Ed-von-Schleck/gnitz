@@ -965,12 +965,7 @@ impl ZSetBatch {
         // read the raw bytes as live data — an inconsistency the schema forbids.
         // Reject it. `pi` is the dense payload index (null-bitmap bit position),
         // matching the convention the FK/unique skips use.
-        let mut not_null_mask: u64 = 0;
-        for (pi, _ci, col_def) in schema.payload_columns() {
-            if !col_def.is_nullable {
-                null_word_set(&mut not_null_mask, pi, true);
-            }
-        }
+        let not_null_mask = gnitz_expr::SchemaFacts::not_null_payload_slots(schema);
         if not_null_mask != 0 {
             for (row, &word) in self.nulls.iter().enumerate() {
                 let offending = word & not_null_mask;

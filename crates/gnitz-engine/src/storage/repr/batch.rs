@@ -1135,6 +1135,8 @@ impl Batch {
     #[inline]
     pub(crate) fn certify_layout(&mut self, layout: Layout, schema: &SchemaDescriptor) {
         #[cfg(debug_assertions)]
+        self.debug_verify_null_bits(schema);
+        #[cfg(debug_assertions)]
         match layout {
             Layout::Raw => {}
             Layout::Sorted => self.debug_verify_sorted(schema),
@@ -1177,10 +1179,40 @@ impl Batch {
             .then_with(|| compare_rows(schema, self, i, self, i + 1))
     }
 
+    /// Debug-only: assert no row sets a null bit under a payload column `schema`
+    /// declares NOT NULL — the invariant the client-decode boundary enforces in
+    /// release, checked here against every batch the engine itself builds.
+    /// Runs for every layout including `Raw`, since an unsorted arrival (a union
+    /// concat, a null-extend widening) is exactly where a null-fill enters.
+    ///
+    /// Consumers are free to read the bit raw (`compare_by_group_cols`) or to
+    /// believe the declaration (`FixedIntNonnull`, the evaluator's
+    /// `nullable_slots`, a projection's `NullPerm`) only because this holds.
+    #[cfg(debug_assertions)]
+    fn debug_verify_null_bits(&self, schema: &SchemaDescriptor) {
+        let nonnull = gnitz_expr::SchemaFacts::not_null_payload_slots(schema);
+        if nonnull == 0 {
+            return;
+        }
+        let mut acc = 0u64;
+        for row in 0..self.count {
+            acc |= self.get_null_word(row);
+        }
+        debug_assert_eq!(
+            acc & nonnull,
+            0,
+            "batch sets a null bit under a payload column the operating schema declares \
+             NOT NULL (slots={:#x}, first offending row={:?} of {})",
+            acc & nonnull,
+            (0..self.count).find(|&r| self.get_null_word(r) & nonnull != 0),
+            self.count,
+        );
+    }
+
     /// Debug-only: assert the data is sorted by (PK, payload) — non-decreasing,
     /// adjacent ties permitted. The `sorted` contract, nothing more.
     #[cfg(debug_assertions)]
-    pub(crate) fn debug_verify_sorted(&self, schema: &SchemaDescriptor) {
+    fn debug_verify_sorted(&self, schema: &SchemaDescriptor) {
         for i in 0..self.count.saturating_sub(1) {
             debug_assert_ne!(
                 self.adjacent_pair_ord(schema, i),

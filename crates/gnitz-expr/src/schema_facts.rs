@@ -59,6 +59,26 @@ pub trait SchemaFacts {
     fn col_type_code(&self, ci: usize) -> u8;
     /// True iff column `ci` admits NULL.
     fn col_nullable(&self, ci: usize) -> bool;
+
+    /// Payload-slot bitmap of the columns that admit NULL: bit `pi` is set iff
+    /// `payload_col_idx(pi)` is nullable. A PK column has no payload slot and so
+    /// contributes no bit.
+    ///
+    /// Computed, not cached: every caller is per-program-compile or per-batch,
+    /// never per row.
+    fn nullable_payload_slots(&self) -> u64 {
+        (0..self.num_columns())
+            .filter(|&ci| self.col_nullable(ci))
+            .filter_map(|ci| self.payload_slot(ci))
+            .fold(0u64, |m, pi| m | 1u64 << pi)
+    }
+
+    /// The bits a conforming batch never sets: this schema's live payload slots
+    /// minus [`Self::nullable_payload_slots`]. The batch validators reject a bit
+    /// in here.
+    fn not_null_payload_slots(&self) -> u64 {
+        gnitz_wire::all_payload_null_mask(self.num_payload_cols()) & !self.nullable_payload_slots()
+    }
 }
 
 /// One [`SCHEMA_FACTS_CASES`] entry: a schema's column table as
@@ -183,8 +203,27 @@ pub(crate) fn assert_schema_facts_consistent(s: &dyn SchemaFacts, cols: &[(u8, b
         running += gnitz_wire::wire_stride(cols[ci].0);
     }
 
+    // The two whole-schema nullability masks, accumulated below off the
+    // payload-slot rule stated directly (non-PK columns numbered 0, 1, 2, … left
+    // to right) rather than off the trait's own slot answer. Both are checked as
+    // absolute values, not one plus a complement: `not_null_payload_slots` also
+    // has to mask off the slots past `num_payload_cols`, which a `!nullable`
+    // check alone would not see.
+    let mut want_nullable_mask = 0u64;
+    let mut want_not_null_mask = 0u64;
+    let mut next_pi = 0usize;
+
     for (ci, &(want_tc, want_nullable)) in cols.iter().enumerate() {
         let want_pk = pk.contains(&ci);
+        if !want_pk {
+            let bit = 1u64 << next_pi;
+            *if want_nullable {
+                &mut want_nullable_mask
+            } else {
+                &mut want_not_null_mask
+            } |= bit;
+            next_pi += 1;
+        }
         // The exact type code, not merely a matching width: `wire_stride`
         // collapses 15 codes onto 5 widths, so a forwarder handing back U64 for
         // F64 would satisfy every width-shaped check below while breaking the
@@ -217,6 +256,17 @@ pub(crate) fn assert_schema_facts_consistent(s: &dyn SchemaFacts, cols: &[(u8, b
             }
         }
     }
+
+    assert_eq!(
+        s.nullable_payload_slots(),
+        want_nullable_mask,
+        "nullable_payload_slots()"
+    );
+    assert_eq!(
+        s.not_null_payload_slots(),
+        want_not_null_mask,
+        "not_null_payload_slots()"
+    );
 }
 
 #[cfg(test)]

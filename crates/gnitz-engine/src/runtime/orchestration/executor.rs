@@ -1539,31 +1539,64 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
     Ok(PushTxnOutcome::Committed(lsn))
 }
 
-/// Decode a CLIENT-supplied frame and neutralize any client-claimed batch
-/// layout flags. FLAG_BATCH_SORTED / FLAG_BATCH_CONSOLIDATED assert "already
-/// sorted/consolidated, skip the work" — a client must never be trusted to
-/// claim that, so every client-boundary decode goes through this (or its
-/// sibling `decode_client_batch`); downstream consolidation (the catalog DDL
-/// ingest and the commit path) re-establishes the invariants. No-op for
-/// conforming clients, which never set these.
+/// Decode a CLIENT-supplied frame. `decode_wire_with_ctrl` is the client-trust
+/// entry: it leaves the batch `Raw`, dropping any FLAG_BATCH_SORTED /
+/// FLAG_BATCH_CONSOLIDATED claim ("already sorted/consolidated, skip the work"),
+/// which a client must never be trusted to make; downstream consolidation (the
+/// catalog DDL ingest and the commit path) establishes those invariants. Every
+/// client-boundary decode goes through this or its sibling
+/// `decode_client_batch`.
 fn decode_client_wire(
     data: &[u8],
     ctrl: ipc::DecodedControl,
     hint: Option<SchemaWithVersion<'_>>,
 ) -> Result<ipc::DecodedWire, &'static str> {
-    let mut decoded = ipc::decode_wire_with_ctrl(data, ctrl, hint)?;
-    if let Some(b) = decoded.data_batch.as_mut() {
-        b.downgrade();
+    let decoded = ipc::decode_wire_with_ctrl(data, ctrl, hint)?;
+    // `decode_wire_body` builds a data batch only against a resolved schema, so
+    // the two are present or absent together.
+    if let (Some(b), Some(schema)) = (decoded.data_batch.as_ref(), decoded.schema.as_ref()) {
+        reject_not_null_bits(b, schema)?;
     }
     Ok(decoded)
 }
 
-/// `decode_client_wire`'s sibling for a raw WAL-block family batch inside a
-/// client FLAG_DDL_TXN bundle: decode + neutralize the layout claim.
+/// A raw WAL-block family batch inside a client FLAG_DDL_TXN bundle.
+/// `decode_from_wal_block` builds every batch `Raw`, so like
+/// `decode_client_wire` this carries no client layout claim.
 fn decode_client_batch(slice: &[u8], schema: &SchemaDescriptor) -> Result<Batch, &'static str> {
-    let (mut b, _) = Batch::decode_from_wal_block(slice, schema, false)?;
-    b.downgrade();
+    let (b, _) = Batch::decode_from_wal_block(slice, schema, false)?;
+    reject_not_null_bits(&b, schema)?;
     Ok(b)
+}
+
+/// A client-supplied batch must not set a null bit on a payload column the
+/// schema declares NOT NULL. `is_null` and `compare_by_group_cols` read such a
+/// bit as a live NULL, while the evaluator's `nullable_slots`, a projection's
+/// `NullPerm` and the `FixedIntNonnull` row comparator believe the schema
+/// instead — a split that can turn a rejected UNIQUE duplicate into a committed,
+/// durable row. Rejecting the bit here is what lets the rest of the engine pick
+/// either camp freely.
+///
+/// Here rather than in `Batch::decode_from_wal_block`: this is a statement about
+/// a CLIENT, and that decode also serves the worker's SAL consumption, the
+/// master's W2M read and boot replay, where a rejection aborts the process
+/// instead of answering the caller.
+fn reject_not_null_bits(b: &Batch, schema: &SchemaDescriptor) -> Result<(), &'static str> {
+    let not_null = gnitz_expr::SchemaFacts::not_null_payload_slots(schema);
+    if not_null == 0 {
+        return Ok(());
+    }
+    // OR-reduce, then one test: the conforming case walks every row either way,
+    // so a per-row branch would only add work.
+    let mb = b.as_mem_batch();
+    let mut acc = 0u64;
+    for row in 0..b.count {
+        acc |= mb.get_null_word(row);
+    }
+    if acc & not_null != 0 {
+        return Err("client batch sets a null bit on a NOT NULL column");
+    }
+    Ok(())
 }
 
 /// Resolve a read target's relation kind, rejecting an unknown table id.

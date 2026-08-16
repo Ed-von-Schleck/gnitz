@@ -637,6 +637,108 @@ mod tests {
         assert_eq!(result.count, 3);
     }
 
+    /// Schemas for a UNION whose sides disagree on the payload column's
+    /// nullability: `(left NOT NULL, right nullable, merged output)`. The merged
+    /// one is the OR the emit layer's `union_nullability_merge` produces, which
+    /// for this pair is the right side's.
+    fn union_nullability_schemas() -> (SchemaDescriptor, SchemaDescriptor, SchemaDescriptor) {
+        let pk = SchemaColumn::new(type_code::U128, 0);
+        let not_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
+        let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
+        (not_null, nullable, nullable)
+    }
+
+    /// One row under `schema`: PK 1, weight +1, payload -3, no null bit.
+    fn one_negative_row(schema: SchemaDescriptor) -> Batch {
+        let mut b = Batch::with_capacity(schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &(-3i64).to_le_bytes());
+        b.count += 1;
+        b
+    }
+
+    /// A UNION whose sides disagree on a payload column's nullability must run
+    /// under the OUTPUT register's schema. Only the merged schema selects the
+    /// null-aware comparator, which sorts a NULL cell below -3; the left input's
+    /// null-blind one reads the cell's zero bytes as the integer 0 and sorts it
+    /// above. `op_union_merge` certifies whichever order it produced `Sorted`,
+    /// so the next `into_consolidated` trusts it rather than re-sorting.
+    #[test]
+    fn test_union_runs_under_the_merged_output_schema() {
+        let (schema_a, schema_b, merged) = union_nullability_schemas();
+
+        // Both rows on the same PK, so the merge resolves them against each
+        // other: left is a negative value, right a canonical zero-filled NULL.
+        let mut left = one_negative_row(schema_a);
+        left.certify_layout(Layout::Sorted, &schema_a);
+
+        let mut right = Batch::with_capacity(schema_b, 1);
+        right.extend_pk(1u128);
+        right.extend_weight(&1i64.to_le_bytes());
+        right.extend_null_bmp(&1u64.to_le_bytes());
+        right.fill_col_zero(0, 8);
+        right.count += 1;
+        right.certify_layout(Layout::Sorted, &schema_b);
+
+        let mut builder = ProgramBuilder::new();
+        builder.push(Instr::Union {
+            in_a: 0,
+            in_b: 2,
+            out_reg: 1,
+        });
+        builder.push(Instr::Halt);
+        let reg_meta = [
+            RegisterMeta::delta(schema_a),
+            RegisterMeta::delta(merged),
+            RegisterMeta::delta(schema_b),
+        ];
+        let vm = builder.build(&reg_meta);
+        let result = execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, left), (2u16, right)], 1).unwrap();
+
+        assert_eq!(result.count, 2, "Z-Set + keeps both rows");
+        assert!(
+            gnitz_wire::null_word_get(result.get_null_word(0), 0),
+            "the merged schema's null-aware comparator sorts NULL below -3; the left \
+             input's null-blind one reads the null cell as 0 and sorts it above",
+        );
+    }
+
+    /// `op_union`'s O(1) identity path returns the left operand verbatim, label
+    /// included, so a batch leaves the VM carrying the left input's schema unless
+    /// the epilogue stamps the output register's own. The exchange wire carries
+    /// that label to a master that cannot re-derive it.
+    #[test]
+    fn test_union_identity_path_output_carries_out_register_schema() {
+        let (schema_a, schema_b, merged) = union_nullability_schemas();
+
+        // in_b is never seeded, so `op_union` takes the b.count == 0 identity
+        // path and hands `batch_a` straight back with `schema_a` still on it.
+        let left = one_negative_row(schema_a);
+
+        let mut builder = ProgramBuilder::new();
+        builder.push(Instr::Union {
+            in_a: 0,
+            in_b: 2,
+            out_reg: 1,
+        });
+        builder.push(Instr::Halt);
+        let reg_meta = [
+            RegisterMeta::delta(schema_a),
+            RegisterMeta::delta(merged),
+            RegisterMeta::delta(schema_b),
+        ];
+        let vm = builder.build(&reg_meta);
+        let result = execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, left)], 1).unwrap();
+        assert_eq!(result.count, 1);
+        assert_eq!(
+            result.schema,
+            Some(merged),
+            "a batch leaving the VM carries its output register's schema, not the operand's",
+        );
+    }
+
     // Item 7: Union with in_a == in_b is Z + Z and must double every weight.
     // The naive by-value path moves batch_a out then reads an emptied batch_b,
     // producing +1 instead of +2.

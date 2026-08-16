@@ -191,7 +191,10 @@ pub(crate) fn execute_epoch_multi(
             }
 
             Instr::Union { in_a, in_b, out_reg } => {
-                let schema = &program.reg_meta[*in_a as usize].schema;
+                // The union's own (nullability-merged) schema, not the left
+                // input's — see `op_union` for why a narrower one mis-sorts
+                // nulls.
+                let out_schema = &program.reg_meta[*out_reg as usize].schema;
                 if in_a == in_b {
                     // Self-union: Z + Z doubles every weight in-place. Reading
                     // batch_b after moving batch_a out would see an empty batch
@@ -202,7 +205,7 @@ pub(crate) fn execute_epoch_multi(
                 } else {
                     let batch_b = &reg!(*in_b).batch;
                     let batch_a = reg_mut!(*in_a).batch.take();
-                    reg_mut!(*out_reg).batch = ops::op_union(batch_a, batch_b, schema);
+                    reg_mut!(*out_reg).batch = ops::op_union(batch_a, batch_b, out_schema);
                 }
             }
 
@@ -361,9 +364,24 @@ pub(crate) fn execute_epoch_multi(
 
     gnitz_debug!("vm: dispatch done");
 
-    // 4. Extract output
+    // 4. Extract output, labelled with the output register's own schema. An
+    // operator's identity path can hand an input batch straight back (see
+    // `op_union`), so the label on it may be an operand's; downstream — the
+    // exchange wire, `prepare_relay`, `queue_dependents` — cannot re-derive it.
     let out = &mut regfile.registers[output_reg as usize];
-    (out.batch.count > 0).then(|| out.batch.take())
+    (out.batch.count > 0).then(|| {
+        let mut batch = out.batch.take();
+        let want = program.reg_meta[output_reg as usize].schema;
+        // Only a narrower nullability may legitimately arrive here. A different
+        // physical layout means the batch was built against another schema
+        // entirely, which the stamp would hide from the wire encode.
+        debug_assert!(
+            batch.schema.is_none_or(|got| got.same_physical_layout(&want)),
+            "VM output register {output_reg}: batch label is not the register's physical layout",
+        );
+        batch.set_schema(want);
+        batch
+    })
 }
 
 #[cfg(test)]

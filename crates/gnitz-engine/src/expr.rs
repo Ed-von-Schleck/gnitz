@@ -9,7 +9,7 @@
 //! resolved form are named `gnitz_expr::` at each call site rather than
 //! re-exported here.
 
-use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram, MorselOut};
+use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram, MorselOut, SchemaFacts};
 
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::Batch;
@@ -200,7 +200,6 @@ fn compute_blob_passthrough(in_schema: &SchemaDescriptor, col_moves: &[ColMove])
 // NullPerm — columnar null bitmap permutation
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
 struct NullPerm {
     pairs: Vec<(u8, u8)>,
 }
@@ -209,17 +208,18 @@ impl NullPerm {
     /// Build from the column moves. A source contributes a pair only if it can
     /// carry a set bit: a PK source has no null bit at all, and a `NOT NULL`
     /// payload source is believed over the bit the batch carries for it — the
-    /// same trust the expression evaluator's `nullable_slots` rests on. A
-    /// projection whose sources are all `NOT NULL` therefore has no pairs, and
-    /// [`Self::write_rows`] fills zeros instead of permuting per row.
+    /// same trust the expression evaluator's `nullable_slots` rests on, resolved
+    /// off the same mask. A projection whose sources are all `NOT NULL`
+    /// therefore has no pairs, and [`Self::write_rows`] fills zeros instead of
+    /// permuting per row.
     fn new(col_moves: &[ColMove], in_schema: &SchemaDescriptor) -> Self {
+        let nullable = in_schema.nullable_payload_slots();
         let pairs = col_moves
             .iter()
             .filter_map(|cm| match cm.src {
                 ColumnLocator::Pk { .. } => None,
                 ColumnLocator::Payload { slot, .. } => {
-                    let src_col = in_schema.payload_col_idx(slot as usize);
-                    (in_schema.columns[src_col].nullable != 0).then_some((slot, cm.dst_payload as u8))
+                    gnitz_wire::null_word_get(nullable, slot as usize).then_some((slot, cm.dst_payload as u8))
                 }
             })
             .collect();

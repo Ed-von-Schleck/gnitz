@@ -179,15 +179,12 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
 /// body shared by the schema-walking [`extract_group_key`] and the baked
 /// [`GroupKeyCols::key_row`] — a divergence would silently merge or split
 /// groups in the non-linear REDUCE fallback (wrong MIN/MAX).
+///
+/// Reads the null bit unconditionally, like the sibling `compare_by_group_cols`:
+/// a NOT NULL column never carries one, so masking it off would cost a per-row
+/// AND to change nothing.
 #[inline]
-fn hash_group_col<R: RowSource>(
-    hasher: &mut RowHasher,
-    src: &R,
-    row: usize,
-    null_word: u64,
-    loc: ColumnLocator,
-    nullable: bool,
-) {
+fn hash_group_col<R: RowSource>(hasher: &mut RowHasher, src: &R, row: usize, null_word: u64, loc: ColumnLocator) {
     match loc {
         ColumnLocator::Pk { .. } => {
             // PK columns are non-nullable; canonical OPK-derived route key, so
@@ -197,7 +194,7 @@ fn hash_group_col<R: RowSource>(
             hasher.update(&loc.route_key(src, row).to_le_bytes());
         }
         ColumnLocator::Payload { slot, size, type_code } => {
-            if nullable && gnitz_wire::null_word_get(null_word, slot as usize) {
+            if gnitz_wire::null_word_get(null_word, slot as usize) {
                 hasher.update(&[0u8]); // null marker
                 return;
             }
@@ -255,41 +252,26 @@ pub(super) fn extract_group_key<R: RowSource>(
     // cheap as `reset()` — no thread-local or per-row reuse needed.
     let mut hasher = RowHasher::new();
     for &c_idx_u32 in group_by_cols {
-        let c_idx = c_idx_u32 as usize;
-        hash_group_col(
-            &mut hasher,
-            src,
-            row,
-            null_word,
-            schema.locate(c_idx),
-            schema.columns[c_idx].nullable != 0,
-        );
+        hash_group_col(&mut hasher, src, row, null_word, schema.locate(c_idx_u32 as usize));
     }
     hasher.digest128()
 }
 
-/// The baked form of [`extract_group_key`]: per-column locators and
-/// nullability (the one schema fact a locator does not carry) resolved once at
+/// The baked form of [`extract_group_key`]: per-column locators resolved once at
 /// plan-bake time, for per-row hot loops (the non-linear REDUCE fallback's
-/// per-trace-row routing). Consumes the same bodies (`ColumnLocator::route_key`
-/// / `hash_group_col`) as the schema-walking form, so a baked key and an ad-hoc
-/// key are byte-identical by construction.
+/// per-trace-row routing). Consumes the same bodies
+/// (`ColumnLocator::route_key` / `hash_group_col`) as the schema-walking form,
+/// so a baked key and an ad-hoc key are byte-identical by construction.
 pub(super) struct GroupKeyCols {
     canonical: bool,
-    cols: Vec<(ColumnLocator, bool)>,
+    cols: Vec<ColumnLocator>,
 }
 
 impl GroupKeyCols {
     pub(super) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Self {
         GroupKeyCols {
             canonical: single_col_canonical_group_key(schema, group_by_cols),
-            cols: group_by_cols
-                .iter()
-                .map(|&c| {
-                    let ci = c as usize;
-                    (schema.locate(ci), schema.columns[ci].nullable != 0)
-                })
-                .collect(),
+            cols: group_by_cols.iter().map(|&c| schema.locate(c as usize)).collect(),
         }
     }
 
@@ -298,12 +280,12 @@ impl GroupKeyCols {
     #[inline]
     pub(super) fn key_row<R: RowSource>(&self, src: &R, row: usize) -> u128 {
         if self.canonical {
-            return self.cols[0].0.route_key(src, row);
+            return self.cols[0].route_key(src, row);
         }
         let null_word = src.get_null_word(row);
         let mut hasher = RowHasher::new();
-        for &(loc, nullable) in &self.cols {
-            hash_group_col(&mut hasher, src, row, null_word, loc, nullable);
+        for &loc in &self.cols {
+            hash_group_col(&mut hasher, src, row, null_word, loc);
         }
         hasher.digest128()
     }

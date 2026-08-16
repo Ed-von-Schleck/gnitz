@@ -240,6 +240,16 @@ mod tests {
         assert_eq!(w, 0b100000);
     }
 
+    /// `npc == 64` is the row-major cap, where the naive `(1 << npc) - 1` would
+    /// shift by the word width.
+    #[test]
+    fn all_payload_null_mask_covers_the_full_word() {
+        assert_eq!(all_payload_null_mask(0), 0);
+        assert_eq!(all_payload_null_mask(1), 0b1);
+        assert_eq!(all_payload_null_mask(63), u64::MAX >> 1);
+        assert_eq!(all_payload_null_mask(64), u64::MAX);
+    }
+
     #[test]
     fn read_unsigned_zero_extends() {
         // size 1: high-bit-set vs small — must match u8.cmp.

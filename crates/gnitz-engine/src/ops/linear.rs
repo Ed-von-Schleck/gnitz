@@ -117,7 +117,14 @@ pub fn op_negate(batch: &Batch) -> Batch {
 
 /// Union: algebraic addition of two Z-Set streams.
 /// When both inputs are sorted, performs O(N) merge preserving sort order.
-pub fn op_union(batch_a: Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
+///
+/// `out_schema` is the UNION's own schema, not either input's: the two sides
+/// share a physical layout but may disagree on a column's nullability, and only
+/// the OR of the two (`union_nullability_merge`) selects a row comparator that
+/// orders a NULL cell apart from a zero one. The merge below certifies its
+/// output `Sorted` under this schema, so a comparator narrower than the merged
+/// rows would leave a false order claim behind for `into_consolidated` to trust.
+pub fn op_union(batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
     if batch_b.count == 0 {
         // O(1) pass-through: no allocation, sorted/consolidated preserved.
         gnitz_debug!("op_union: a={} b=0 identity", batch_a.count);
@@ -128,12 +135,12 @@ pub fn op_union(batch_a: Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> B
         return b.clone_batch();
     }
 
-    if batch_a.sorted_verified(schema) && b.sorted_verified(schema) {
-        return op_union_merge(&batch_a, b, schema);
+    if batch_a.sorted_verified(out_schema) && b.sorted_verified(out_schema) {
+        return op_union_merge(&batch_a, b, out_schema);
     }
 
     // Unsorted: concatenate (the appends leave `output` `Raw`).
-    let mut output = Batch::with_capacity(*schema, batch_a.count + b.count);
+    let mut output = Batch::with_capacity(*out_schema, batch_a.count + b.count);
     output.append_batch(&batch_a, 0, batch_a.count);
     output.append_batch(b, 0, b.count);
     gnitz_debug!(
@@ -146,18 +153,23 @@ pub fn op_union(batch_a: Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> B
 }
 
 /// Sorted merge of two sorted batches with contiguous-run batching.
-fn op_union_merge(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
-    with_payload_cmp!(schema, op_union_merge_inner, batch_a, batch_b, schema)
+fn op_union_merge(batch_a: &Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
+    with_payload_cmp!(out_schema, op_union_merge_inner, batch_a, batch_b, out_schema)
 }
 
 #[inline]
-fn op_union_merge_inner<RowCmp>(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor, row_cmp: RowCmp) -> Batch
+fn op_union_merge_inner<RowCmp>(
+    batch_a: &Batch,
+    batch_b: &Batch,
+    out_schema: &SchemaDescriptor,
+    row_cmp: RowCmp,
+) -> Batch
 where
     RowCmp: for<'x> RowComparator<MemBatch<'x>>,
 {
     let n_a = batch_a.count;
     let n_b = batch_b.count;
-    let mut output = Batch::with_capacity(*schema, n_a + n_b);
+    let mut output = Batch::with_capacity(*out_schema, n_a + n_b);
 
     let mb_a = batch_a.as_mem_batch();
     let mb_b = batch_b.as_mem_batch();
@@ -175,7 +187,7 @@ where
         let (j, j_end) = (rb.start, rb.end);
         let (mut ia, mut jb) = (i, j);
         if ia < i_end && jb < j_end {
-            let mut prev_a = row_cmp(schema, &mb_a, ia, &mb_b, jb) != Ordering::Greater;
+            let mut prev_a = row_cmp(out_schema, &mb_a, ia, &mb_b, jb) != Ordering::Greater;
             let mut run_start = if prev_a { ia } else { jb };
             if prev_a {
                 ia += 1;
@@ -183,7 +195,7 @@ where
                 jb += 1;
             }
             while ia < i_end && jb < j_end {
-                let pick_a = row_cmp(schema, &mb_a, ia, &mb_b, jb) != Ordering::Greater;
+                let pick_a = row_cmp(out_schema, &mb_a, ia, &mb_b, jb) != Ordering::Greater;
                 if pick_a != prev_a {
                     if prev_a {
                         out.append_batch(batch_a, run_start, ia);
@@ -227,7 +239,7 @@ where
 
     // Payload-aware merge of two sorted inputs ⇒ genuinely (PK, payload)-sorted,
     // but unfolded (Z-Set `+` does not sum weights). Certify `Sorted`.
-    output.certify_layout(Layout::Sorted, schema);
+    output.certify_layout(Layout::Sorted, out_schema);
     gnitz_debug!("op_union: a={} b={} out={} sorted_merge", n_a, n_b, output.count);
     output
 }

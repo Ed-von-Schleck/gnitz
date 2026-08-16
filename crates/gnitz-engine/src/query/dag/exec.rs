@@ -78,12 +78,12 @@ impl DagEngine {
                         } else {
                             input.as_ref().unwrap().clone_batch()
                         };
-                        let mut pre = Self::execute_sub_plan(&mut side.plan, delta, src_id)
+                        // `exchange_schema()` IS the side's out-register schema,
+                        // which the VM stamps on what it returns, so the wire
+                        // encode already sees the side's pre-exchange schema
+                        // (never the view's combine-widened final one).
+                        let pre = Self::execute_sub_plan(&mut side.plan, delta, src_id)
                             .unwrap_or_else(|| Batch::empty_with_schema(&schema));
-                        // Label with the side's pre-exchange output schema for
-                        // the wire encode (never the view's combine-widened
-                        // final schema).
-                        pre.set_schema(schema);
                         let relay_key = if unary { 0 } else { side.source_id };
                         Self::consolidate_exchanged(relay(pre, relay_key), &schema)
                     } else {
@@ -441,7 +441,7 @@ impl DagEngine {
             };
 
             if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
-                if let (true, Some(d)) = (existing_idx < pending.len(), delta) {
+                if let Some(d) = delta {
                     let existing = pending[existing_idx].batch.take();
                     let schema = existing.schema.unwrap_or(src_schema);
                     let merged = ops::op_union(existing, d, &schema);

@@ -447,6 +447,10 @@ pub fn peek_client_control(data: &[u8]) -> Result<DecodedControl, &'static str> 
 /// Client-boundary decode with a pre-parsed control block (the `handle_message`
 /// single-parse path). Full checksum verification on all three blocks — the
 /// control block's by the `peek_client_control` that produced `control`.
+///
+/// The batch comes back `Raw`: unlike `decode_wire_impl` this never installs the
+/// frame's `FLAG_BATCH_SORTED` / `FLAG_BATCH_CONSOLIDATED` claim, which a client
+/// must not be trusted to make.
 pub fn decode_wire_with_ctrl(
     data: &[u8],
     control: DecodedControl,
@@ -489,7 +493,18 @@ fn decode_wire_impl(
     } else {
         peek_control_block_ipc(ctrl)?
     };
-    decode_wire_body(data, ctrl.len(), control, schema_hint, verify_checksum)
+    let mut decoded = decode_wire_body(data, ctrl.len(), control, schema_hint, verify_checksum)?;
+    // An engine-authored frame (SAL consumption, W2M, boot replay): its layout
+    // claim is real and skipping the re-sort is the point of sending it, so
+    // raise the batch off `Raw`. `certify_layout` debug-verifies what it
+    // installs, which is why the client path (`decode_wire_with_ctrl`) does not
+    // come through here — a lying client frame must be answered with an error,
+    // not a debug-build abort.
+    let flags = decoded.control.flags;
+    if let (Some(b), Some(schema)) = (decoded.data_batch.as_mut(), decoded.schema.as_ref()) {
+        b.certify_layout(layout_from_wire_flags(flags), schema);
+    }
+    Ok(decoded)
 }
 
 /// Like `decode_wire_ipc` but supplies a versioned schema hint for W2M
@@ -526,6 +541,8 @@ fn resolve_continuation_schema(
     }
 }
 
+/// Leaves the decoded batch `Raw`. Whether the frame's layout claim may be
+/// installed on top depends on who sent it, so that is the caller's call.
 fn decode_wire_body(
     data: &[u8],
     ctrl_size: usize,
@@ -567,10 +584,7 @@ fn decode_wire_body(
     let data_batch = if has_data {
         let eff_schema = wire_schema.as_ref().ok_or("no schema for data block")?;
         let dblock = gnitz_wire::wal::block_slice_at(data, off)?;
-        let (mut batch, _) = Batch::decode_from_wal_block(dblock, eff_schema, verify_checksum)?;
-        // The constructor defaults `Raw`; raise to the wire's claim, debug-verifying
-        // the decoded data against it (the backstop against a lying frame).
-        batch.certify_layout(layout_from_wire_flags(flags), eff_schema);
+        let (batch, _) = Batch::decode_from_wal_block(dblock, eff_schema, verify_checksum)?;
         Some(batch)
     } else {
         None
