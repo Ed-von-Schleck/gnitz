@@ -130,7 +130,7 @@ pub(super) struct EmitCtx<'a> {
 impl EmitCtx<'_> {
     /// The view's stamped `replicated` bit — every `ScanDelta` source is
     /// replicated, so the view runs correct-local on every worker. The
-    /// `PartitionFilter` arm bakes its trim as a keep-all identity, and
+    /// `WorkerFilter` arm bakes its trim as a keep-all identity, and
     /// `emit_reduce` makes every worker the owner of the global-aggregate seed.
     /// Read through `loaded` rather than cached, so the compile-time flag and the
     /// runtime decision cannot drift apart.
@@ -194,7 +194,7 @@ impl EmitCtx<'_> {
         // manifests). Never reached from index-circuit compilation (index tables
         // stay plain `Rederive`).
         let recovery = RecoverySource::rederive_checkpointed_now();
-        Table::new(&child_dir, schema, self.view_id as u32, 256 * 1024, recovery)
+        Table::new(&child_dir, schema, self.view_id as u32, recovery)
             .map_err(|_| CompileError::Rejected("child table create failed"))
     }
 
@@ -598,16 +598,16 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
             return Err(CompileError::Rejected("chained exchange nodes"));
         }
 
-        gnitz_wire::OpNode::PartitionFilter => {
+        gnitz_wire::OpNode::WorkerFilter => {
             // Pass-through schema; drops the rows this worker does not own before
             // they reach `integrate_trace`. Worker identity is the compile-time
             // `(worker_rank, num_workers)` of this process (default `(0, 1)` =
             // keep-all for single-process / unit tests). An all-replicated view runs
             // correct-local over the full broadcast on every worker, so it bakes
-            // `(0, 1)` too — `op_partition_filter` degenerates to a keep-all identity
+            // `(0, 1)` too — `op_worker_filter` degenerates to a keep-all identity
             // at `num_workers <= 1`, integrating the full input instead of trimming
             // away the rows this worker does not own.
-            let in_reg = in_reg(&in_regs, PORT_IN, "partition-filter: missing input port")?;
+            let in_reg = in_reg(&in_regs, PORT_IN, "worker-filter: missing input port")?;
             let (worker_id, num_workers) = if ctx.replicated() {
                 (0, 1)
             } else {
@@ -621,7 +621,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: i32) -> Result<(), 
                 return Ok(());
             }
             ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(ctx.reg_meta[in_reg as usize].schema);
-            ctx.builder.push(Instr::PartitionFilter {
+            ctx.builder.push(Instr::WorkerFilter {
                 in_reg: in_reg as u16,
                 out_reg: reg_id as u16,
                 worker_id,
@@ -835,13 +835,13 @@ pub(super) fn emit_reduce(
     }
 
     // Bake worker ownership of the global-aggregate seed, exactly as the
-    // `PartitionFilter` arm bakes `(worker_rank(), num_workers())`. A worker seeds
+    // `WorkerFilter` arm bakes `(worker_rank(), num_workers())`. A worker seeds
     // when it holds the whole input: either the view is stamped replicated (it runs
     // correct-local everywhere and the read single-sources worker 0, which is not
-    // `worker_for_partition(V₀)`) or the reduce has no upstream `ExchangeShard`
+    // `worker_for_key(V₀)`) or the reduce has no upstream `ExchangeShard`
     // (`reduce_multi_local`, also reachable over a partitioned table through the raw
     // `reduce()` binding — which is why the two tests stay separate). A sharded
-    // global aggregate funnels every row to `partition_for_key(V₀)`'s owner, so only
+    // global aggregate funnels every row to `worker_for_key(V₀)`, so only
     // that worker seeds. The shard test reads the static `loaded.incoming` graph,
     // which keeps the `ExchangeShard → Reduce` edge across the post-phase split (the
     // ExchangeShard node itself emits no instruction). Meaningful only when
@@ -855,10 +855,7 @@ pub(super) fn emit_reduce(
         && (ctx.replicated()
             || unsharded
             || worker_rank() as usize
-                == gnitz_wire::worker_for_partition(
-                    gnitz_wire::partition_for_key(crate::ops::global_group_key()),
-                    num_workers() as usize,
-                ));
+                == gnitz_wire::worker_for_key(crate::ops::global_group_key(), num_workers() as usize));
 
     let avi_table_idx = (!avi_table_ptr.is_null()).then(|| ctx.builder.table_idx(avi_table_ptr) as u16);
 

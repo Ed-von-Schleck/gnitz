@@ -2,7 +2,7 @@
 //!
 //! Replaces the historical `Result<_, i32>` / negative-i32 sentinel pattern
 //! that several modules (wal, manifest, shard_file, shard_reader, run_set,
-//! table, partitioned_table, shard_index, compact) used to share —
+//! table, shard_index, compact) used to share —
 //! sometimes with overlapping `-1`/`-2`/`-3` meanings.
 //!
 //! The mapping is intentionally coarse: the engine treats almost all
@@ -32,10 +32,6 @@ pub enum StorageError {
     InvalidShard,
     /// CString conversion failed (path contained an interior NUL).
     InvalidPath,
-    /// An ingested row routed to a partition this store does not hold. Its
-    /// relation was placed by one key and is addressed by another; the row count
-    /// and partition are logged at the detection site.
-    MisroutedRows,
 }
 
 impl fmt::Display for StorageError {
@@ -49,7 +45,6 @@ impl fmt::Display for StorageError {
             StorageError::BufferTooSmall => "buffer too small",
             StorageError::InvalidShard => "invalid shard layout",
             StorageError::InvalidPath => "invalid path",
-            StorageError::MisroutedRows => "rows routed outside this store's partitions",
         };
         f.write_str(s)
     }

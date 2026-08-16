@@ -266,14 +266,14 @@ pub(crate) fn execute_epoch_multi(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::PartitionFilter {
+            Instr::WorkerFilter {
                 in_reg,
                 out_reg,
                 worker_id,
                 num_workers,
             } => {
                 let schema = &program.reg_meta[*in_reg as usize].schema;
-                let result = ops::op_partition_filter(&reg!(*in_reg).batch, schema, *worker_id, *num_workers);
+                let result = ops::op_worker_filter(&reg!(*in_reg).batch, schema, *worker_id, *num_workers);
                 reg_mut!(*out_reg).batch = result;
             }
 

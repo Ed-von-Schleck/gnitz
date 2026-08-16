@@ -2,15 +2,13 @@
 //!
 //! Distinct from the exchange operator's routing (`ops::exchange`), which routes
 //! a *join/group* key over a derived schema. This one routes by the table's
-//! distribution prefix (`SchemaDescriptor::partition_for_pk`), exactly as
-//! `PartitionedTable` ingest and probe do, so a pushed row lands on the worker
-//! that owns its partition.
+//! distribution prefix (`SchemaDescriptor::worker_for_pk`), exactly as the
+//! worker-side probe does, so a pushed row lands on the worker that owns it.
 
 use std::cell::RefCell;
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
-use gnitz_wire::build_w_map;
 
 // Reuse the index scratch across calls so a steady-state push allocates nothing
 // for its routing table.
@@ -28,24 +26,15 @@ fn prepare_slots(out: &mut Vec<Vec<u32>>, num_workers: usize) -> &mut [Vec<u32>]
     slots
 }
 
-// Weight-0 rows are dropped by both fills: they are not Z-set elements, and a
-// client is free to send one. Filtering here rather than by rebuilding the batch
-// means every consumer of these indices reads the same row set for free.
-
-/// Partition each row to its owning worker.
+/// Route each row to its owning worker, through the shared placement rule the
+/// boot relayout also drives.
 fn fill_scatter(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, out: &mut Vec<Vec<u32>>) {
-    let mb = batch.as_mem_batch();
-    let w_map = build_w_map(num_workers);
     let slots = prepare_slots(out, num_workers);
-    for i in 0..batch.count {
-        if mb.get_weight(i) == 0 {
-            continue;
-        }
-        slots[w_map[schema.partition_for_pk(mb.get_pk_bytes(i))]].push(i as u32);
-    }
+    crate::storage::route_rows_by_pk(&batch.as_mem_batch(), schema, slots);
 }
 
-/// Give every worker every row.
+/// Give every worker every row. Weight-0 rows are dropped, as in `fill_scatter`:
+/// they are not Z-set elements, and a client is free to send one.
 fn fill_broadcast(batch: &Batch, num_workers: usize, out: &mut Vec<Vec<u32>>) {
     let mb = batch.as_mem_batch();
     let slots = prepare_slots(out, num_workers);
@@ -107,13 +96,13 @@ where
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use gnitz_wire::{partition_for_pk_bytes, worker_for_partition};
+    use gnitz_wire::worker_for_pk_bytes;
 
     // The master-side scatter (keyed by the table's distribution prefix) and the
-    // worker-side route (`partition_for_pk_bytes` + `worker_for_partition`) must
-    // agree on every row, or a pushed row lands on a worker that never owns its
-    // partition. (These schemas' distribution prefix is the whole PK, so the two
-    // hash domains coincide here by construction.)
+    // worker-side route (`worker_for_pk_bytes`) must agree on every row, or a
+    // pushed row lands on a worker that never owns it. (These schemas'
+    // distribution prefix is the whole PK, so the two hash domains coincide here
+    // by construction.)
 
     fn u64_pk_col() -> SchemaColumn {
         SchemaColumn::new(type_code::U64, 0)
@@ -152,12 +141,7 @@ mod tests {
         });
 
         let worker_workers: Vec<usize> = (0..batch.count)
-            .map(|i| {
-                worker_for_partition(
-                    partition_for_pk_bytes(batch.as_mem_batch().get_pk_bytes(i)),
-                    num_workers,
-                )
-            })
+            .map(|i| worker_for_pk_bytes(batch.as_mem_batch().get_pk_bytes(i), num_workers))
             .collect();
 
         assert_eq!(

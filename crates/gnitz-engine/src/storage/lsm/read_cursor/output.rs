@@ -128,7 +128,7 @@ impl ReadCursor {
             // Faithful verbatim copy carrying the source's own flags (no
             // re-sort / re-consolidate) — exactly `drain_chunk`'s prior
             // fast-path behavior. Every drain caller opens over
-            // Table/PartitionedTable, whose single `Batch` sources are always
+            // `Table`, whose single `Batch` sources are always
             // sorted + consolidated, so the propagated flags are `true`.
             return (batch.count > 0).then_some(batch);
         }

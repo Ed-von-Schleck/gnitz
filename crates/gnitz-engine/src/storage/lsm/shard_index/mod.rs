@@ -344,7 +344,7 @@ mod tests {
     /// doesn't observe).
     fn publish_manifest(idx: &ShardIndex, path: &std::path::Path) {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let m = idx.prepare_manifest(&cpath, 0).unwrap();
+        let m = idx.prepare_manifest(&cpath, 0, 0).unwrap();
         m.commit().unwrap();
     }
 
@@ -635,7 +635,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
 
-        assert!(!idx.has_unsynced());
+        assert!(idx.unsynced_paths().is_empty());
         let mut spills = Vec::new();
         for i in 0..5u64 {
             let pk = (i + 1) * 10;
@@ -647,7 +647,10 @@ mod tests {
 
         assert!(idx.should_compact());
         idx.run_compact().unwrap();
-        assert!(idx.has_pending_deletions(), "compacted inputs queued for deletion");
+        assert!(
+            !idx.pending_deletions.is_empty(),
+            "compacted inputs queued for deletion"
+        );
         for p in &spills {
             assert!(
                 !idx.unsynced_paths().contains(p),
@@ -655,12 +658,12 @@ mod tests {
             );
         }
         assert!(
-            idx.has_unsynced(),
+            !idx.unsynced_paths().is_empty(),
             "the compaction outputs are themselves unsynced until a barrier sweeps them"
         );
 
         idx.clear_unsynced();
-        assert!(!idx.has_unsynced());
+        assert!(idx.unsynced_paths().is_empty());
     }
 
     #[test]

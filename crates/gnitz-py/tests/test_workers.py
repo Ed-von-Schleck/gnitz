@@ -1162,9 +1162,9 @@ def test_range_scan_max_arity_descriptor(client):
 #
 # Both sides reindex onto [eq keys…, range key]. A band join (n_eq ≥ 1) scatters
 # its delta by the eq PREFIX, so equal eq-values co-partition both sides and the
-# range walk runs partition-local (no PartitionFilter). A pure range join
+# range walk runs worker-local (no WorkerFilter). A pure range join
 # (n_eq == 0) has no eq prefix: its delta is broadcast to every worker and probed
-# against the other side's PartitionFilter-owned trace by an ordered range walk.
+# against the other side's WorkerFilter-owned trace by an ordered range walk.
 # Either way the output is re-keyed onto the source-PK pair (a.pk, b.pk) and
 # exchanged by it, so the view is PK-partitioned like every other view. These run
 # at GNITZ_WORKERS=4 under `make e2e`, exercising the eq-prefix scatter (band) and
@@ -1257,7 +1257,7 @@ class TestRangeJoin:
         spread across all four workers, and each group's rows sit on DIFFERENT
         base-table PK partitions (their ids differ by the group count) before the
         eq-prefix scatter re-homes them onto hash(k). A mis-routed scatter (lost
-        matches) or a wrongly-retained PartitionFilter (which hashes the full
+        matches) or a wrongly-retained WorkerFilter (which hashes the full
         [k, lo] key and drops rows whose full-key partition ≠ their [k] partition)
         fails the cross-filter reference.
 
@@ -1301,7 +1301,7 @@ class TestRangeJoin:
         epoch's broadcast delta outnumbers the per-worker trace, forcing the
         degenerate single-group `range_merge_walk`. The small `b` side is seeded
         first; the larger `a` side is then inserted in one epoch. Because pure
-        range broadcasts the delta in full but PartitionFilters the trace to ~1/W
+        range broadcasts the delta in full but WorkerFilters the trace to ~1/W
         per worker, the `join_ab` term's |ΔA| (full) exceeds its trace_b slice and
         takes Strategy 2. The merge emits the same pairs as the per-row probe
         (trace-major, re-ordered downstream); the result equals the cross-filter
@@ -1423,7 +1423,7 @@ class TestRangeJoin:
             # Point-seek every live pair by its compound PK. The seek key is the
             # native packed pair (col0 in the low 64 bits, col1 in the high 64);
             # the server OPK-encodes it per the view schema and unicasts to
-            # partition_for_pk_bytes(OPK)'s owner. A hit ⟺ the output exchange
+            # worker_for_pk_bytes(OPK)'s owner. A hit ⟺ the output exchange
             # routed the pair to that same worker — the compound-key alignment
             # invariant. (U64 PK columns: native packing is exact.)
             for (aid, bid) in pairs:
@@ -1595,7 +1595,7 @@ class TestRangeJoin:
 
     def test_compound_source_pks_wide_pair_pk(self, client):
         """Compound source PKs make a 4-column pair-PK (4×8 = 32 bytes > 16 → the
-        wide `partition_for_pk_bytes` xxh routing path on the output exchange).
+        wide `worker_for_pk_bytes` xxh routing path on the output exchange).
         The full pair identity is (a.k1, a.k2, b.k1, b.k2)."""
         sn = "rc" + _uid()
         client.create_schema(sn)

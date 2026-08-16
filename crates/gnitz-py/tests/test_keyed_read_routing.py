@@ -7,13 +7,12 @@ silent under-reporting — a key routed to no partition, or to the wrong one, co
 back as "no such row" — so every case here asserts the FULL result set over keys
 that span every worker.
 
-Run with GNITZ_WORKERS=4 (routing is a no-op at one partition slice):
+Run with GNITZ_WORKERS=4 (routing is a no-op at a single worker):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_keyed_read_routing.py -v
 """
 import random
 
-# Enough distinct keys that, at 256 partitions and any worker count, the set
-# spans many partitions on every worker.
+# Enough distinct keys that the set spans every worker at any worker count.
 NROWS = 400
 
 

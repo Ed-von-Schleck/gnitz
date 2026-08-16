@@ -292,7 +292,7 @@ pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
 /// `hash(pk1, pk0)` rather than by the view's declared PK `(pk0, pk1)` — so the
 /// multi-worker gather drops the rows that hashed to a different worker.
 /// Sharding in PK order keeps the reduce co-partitioned with the source (the
-/// exchange is skipped, or routes by `partition_for_pk_bytes`), so the view
+/// exchange is skipped, or routes by `worker_for_pk_bytes`), so the view
 /// stays partitioned by its real PK. The other kinds keep the user order: their
 /// synthetic/single-natural PK and reduce layout depend on it
 /// (`group_col_reduce_pos`'s synthetic arm indexes by GROUP BY order).

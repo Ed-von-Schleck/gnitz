@@ -30,10 +30,9 @@ impl Table {
         super::super::flush_barrier::flush_barrier([self as *mut Table], super::super::flush_barrier::FlushRound::Base)
     }
 
-    /// Open the partition directory fd on demand (`O_RDONLY|O_DIRECTORY`).
-    /// Opened per flush/compaction rather than held for the table's lifetime,
-    /// so a 256-partition table pins 0 directory fds at rest instead of 256
-    /// (which exhausted the default `ulimit -n` after a handful of tables).
+    /// Open the table directory fd on demand (`O_RDONLY|O_DIRECTORY`).
+    /// Opened per flush/compaction rather than held for the table's lifetime, so
+    /// a relation pins 0 directory fds at rest.
     /// The caller owns the returned `OwnedFd`, which closes it on drop — so an
     /// error `?` anywhere downstream releases it with no manual close.
     ///
@@ -93,50 +92,40 @@ impl Table {
     /// `flush_commit` renames the manifest alone.
     ///
     /// A rederived table on the **base** round publishes nothing — it is rebuilt
-    /// from its sources at open — and just folds to RAM inline.
+    /// from its sources at open — and just folds to RAM inline. The base round
+    /// stamps generation 0, so a manifest published here would be the one a
+    /// `RederiveCheckpointed` open accepts while the committed generation is
+    /// still 0: the view would resume from a base-round snapshot its operator
+    /// traces never matched, and the replayed delta would land twice.
     ///
-    /// Otherwise the tier is published iff it holds new state (the RAM tier is
-    /// non-empty after the fold), OR the index carries unpublished/unsynced
-    /// spills (`has_unsynced` — else the checkpoint's global SAL reset would drop
-    /// acknowledged rows), OR compaction has superseded files since the last
-    /// publish (`has_pending_deletions` — else the deferred drain would unlink
-    /// files the surviving manifest still references).
-    ///
-    /// The **ephemeral** round overrides that gate and publishes unconditionally,
-    /// even for an unchanged or empty partition: the boot resume verdict
-    /// (`compute_invalid_views`) and the per-partition conditional load
-    /// (`Table::new`) both require **every** view partition's manifest to carry
-    /// the current checkpoint generation. A gated round would leave an empty
-    /// partition with no manifest and an unchanged partition at an older
-    /// generation, and the verdict would then reject the whole (valid) view every
-    /// restart — resume would never trigger.
+    /// Every other table publishes on both rounds, even when unchanged or empty,
+    /// because two boot decisions read "has a manifest" as a fact about the
+    /// cluster: the resume verdict wants every view child at the current
+    /// generation, and the relayout wants a complete `w{k}of{n}` set. A gated
+    /// round would leave a skewed relation's empty children indistinguishable
+    /// from a relation that had never been checkpointed. That costs `W` manifests
+    /// per relation per checkpoint, whose `fdatasync`s `flush_barrier` batches
+    /// through one ring.
     pub(in crate::storage) fn flush_prepare(&mut self, round: FlushRound) -> Result<FlushOutcome, StorageError> {
-        let generation = round.generation();
-        if generation.is_none() && self.recovery_source != RecoverySource::SalReplay {
+        if matches!(round, FlushRound::Base) && self.recovery_source != RecoverySource::SalReplay {
             self.flush_to_ram()?;
             return Ok(FlushOutcome::Done);
         }
 
-        // Fold-first, then gate, then one shard.
+        // Fold-first, then one shard.
         self.fold_memtable_into_l0();
         if let Some(run) = self.ram_tier.fold_to_single(&self.schema) {
             self.persist_l0_run(run)?;
-        } else if generation.is_none() && !self.shard_index.has_unsynced() && !self.shard_index.has_pending_deletions()
-        {
-            // Nothing ingested since the last checkpoint, no unpublished spills,
-            // and nothing compacted — the SAL covers it (base round only).
-            return Ok(FlushOutcome::Done);
         }
-        // Otherwise publish: capture unpublished spills into a durable manifest
-        // before the SAL reset (else the global reset drops them), republish over
-        // a compacted index so the deferred drain can unlink the superseded
-        // inputs, and — on the ephemeral round — re-stamp an unchanged or empty
-        // partition at the current generation.
+        // Publish: capture unpublished spills into a durable manifest before the
+        // SAL reset (else the global reset drops them), republish over a compacted
+        // index so the deferred drain can unlink the superseded inputs, and
+        // re-stamp an unchanged or empty child.
         let sync_paths = super::super::shard_index::to_cstrings(self.shard_index.unsynced_paths())?;
         let manifest_c = super::super::cstr(self.manifest_full_path())?;
         let manifest = self
             .shard_index
-            .prepare_manifest(&manifest_c, generation.unwrap_or(0))?;
+            .prepare_manifest(&manifest_c, round.checkpoint_gen(), self.layout_seq)?;
         Ok(FlushOutcome::Pending(FlushWork { sync_paths, manifest }))
     }
 
@@ -148,7 +137,10 @@ impl Table {
     /// The name is unique for this `Table`: `current_lsn` bumps once per ingest
     /// and at most one shard is written per ingest. Two *processes* writing one
     /// directory (secondary-index dirs, the workers' inherited `SalReplay` `_sys`
-    /// copies) can still collide — those directories need a single writer.
+    /// copies) can still collide — those directories need a single writer. It is
+    /// also why the boot repartition writes through the compaction grammar
+    /// instead: it stamps a manifest LSN floor below the names it just wrote, and
+    /// this counter is re-derived from that floor at the next open.
     ///
     /// Transactional. The run is borrowed — not removed — so a write failure
     /// leaves heap intact for retry with nothing on disk; a registration
@@ -219,8 +211,7 @@ impl Table {
     ///
     /// Spills are written **unsynced** and marked in the index's `unsynced` set.
     /// For `SalReplay` the next barrier fdatasyncs them by path before publishing
-    /// (the `has_unsynced` gate disjunct guarantees a barrier fires while
-    /// unpublished spills exist, so the checkpoint's global SAL reset never drops
+    /// (every barrier publishes, so the checkpoint's global SAL reset never drops
     /// an acknowledged spill). Rederive spills publish no manifest and are
     /// erased+rebuilt at open, so their `unsynced` marks are pruned by disk
     /// compaction and never swept.

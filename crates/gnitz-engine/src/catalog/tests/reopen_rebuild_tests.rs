@@ -49,7 +49,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     const N: i64 = 7;
     let dir = temp_dir("reopen_rebuild_once");
 
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
@@ -74,7 +74,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     // double-count against it.
     let view_entry = engine.dag.tables.get(&vid).expect("view registered");
     assert_eq!(
-        sum_weights(view_entry.handle.open_cursor()),
+        sum_weights(view_entry.open_cursor()),
         0,
         "hook_view_register must leave the view empty"
     );
@@ -89,14 +89,14 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     engine.close();
     drop(engine); // release locks before re-open
 
-    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
 
     // The base table must be non-empty after reopen: it came back from its
     // durable shards. Without this guard an empty base would rebuild an empty
     // index and the equality below would pass vacuously.
     let base_entry = engine2.dag.tables.get(&tid).expect("base table replayed");
     assert_eq!(
-        sum_weights(base_entry.handle.open_cursor()),
+        sum_weights(base_entry.open_cursor()),
         N,
         "base table must survive close() → open() from its durable shards"
     );
@@ -106,7 +106,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     // else the master-driven rebuild), covered by the E2E suite.
     let view_entry = engine2.dag.tables.get(&vid).expect("view replayed");
     assert_eq!(
-        sum_weights(view_entry.handle.open_cursor()),
+        sum_weights(view_entry.open_cursor()),
         0,
         "view must come back empty at catalog open — rebuild deferred to runtime"
     );
@@ -140,7 +140,7 @@ fn index_rebuilds_across_chunk_boundary() {
     let n: usize = crate::catalog::DDL_SCAN_CHUNK_ROWS + 3;
     let dir = temp_dir("reopen_rebuild_chunked");
 
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
@@ -164,11 +164,11 @@ fn index_rebuilds_across_chunk_boundary() {
     engine.close();
     drop(engine);
 
-    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
 
     let base_entry = engine2.dag.tables.get(&tid).expect("base table replayed");
     assert_eq!(
-        sum_weights(base_entry.handle.open_cursor()),
+        sum_weights(base_entry.open_cursor()),
         n as i64,
         "base table must survive close() → open() from its durable shards"
     );
@@ -199,7 +199,7 @@ fn index_rebuilds_across_chunk_boundary() {
 fn backfill_all_indexes_rebuilds_exactly_once() {
     const N: i64 = 7;
     let dir = temp_dir("backfill_all_indexes_once");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();

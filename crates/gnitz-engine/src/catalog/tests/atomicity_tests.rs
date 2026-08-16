@@ -35,7 +35,7 @@ fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, c
 #[test]
 fn test_table_tab_no_cols_leaves_clean_state() {
     let dir = temp_dir("atomicity_no_cols");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
     let tid = engine.allocate_table_id();
@@ -73,7 +73,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
     // validate_pk_cols runs inside hook_table_register *after*
     // apply_entity_by_qname has already dirtied the cache (pre-fix).
     let dir = temp_dir("atomicity_bad_pk_type");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
     let tid = engine.allocate_table_id();
@@ -117,7 +117,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
     // rejected.  Pre-fix: apply_entity_by_qname overwrites the cache entry
     // with the new tid.
     let dir = temp_dir("atomicity_dup_name");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let orig_tid = engine.create_table("public.dupname", &cols, &[0]).unwrap();
@@ -160,7 +160,7 @@ fn test_table_tab_col_contiguity_gap_rejected() {
     // causing schema mismatches downstream.  The test asserts the DDL fails
     // and leaves no trace in the catalog.
     let dir = temp_dir("atomicity_col_gap");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
     let tid = engine.allocate_table_id();
@@ -199,7 +199,7 @@ fn test_view_tab_no_cols_leaves_clean_state() {
     // hook_view_register fires col_defs.is_empty() after apply_entity_by_qname
     // (pre-fix), leaving entity_by_qname dirty.
     let dir = temp_dir("atomicity_view_no_cols");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::View));
 
     let vid = engine.allocate_table_id();
@@ -240,7 +240,7 @@ fn test_view_tab_too_many_cols_rejected() {
     // assert backstop. This is the engine-side counterpart to the client guard in
     // create_view_chain.
     let dir = temp_dir("atomicity_view_too_many_cols");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::View));
 
     let vid = engine.allocate_table_id();
@@ -281,7 +281,7 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
     // Pre-fix: apply_index_by_name runs before hook_index_register, so the
     // cache entry is inserted before the hook returns Err for missing owner.
     let dir = temp_dir("atomicity_idx_bad_owner");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
 
     let nonexistent_owner = engine.allocate_table_id();
@@ -317,7 +317,7 @@ fn test_idx_tab_view_owner_rejected() {
     // rejects CREATE INDEX on a view by name resolution; this is the
     // engine-side guard for a raw IDX_TAB push naming a view owner.
     let dir = temp_dir("atomicity_idx_view_owner");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     engine
         .create_table("public.base", &[col_def("id", type_code::U64)], &[0])
@@ -372,7 +372,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     // Pre-fix: apply_index_by_name overwrites the cache entry with new_idx_id
     // when two IDX_TAB rows carry the same name string.
     let dir = temp_dir("atomicity_idx_dup");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![
         col_def("id", type_code::U64),
@@ -422,7 +422,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     // directory first, and `with_staged_dir` reclaims a stage whose closure
     // failed — no caller has to remember to drain.
     let dir = temp_dir("atomicity_idx_dir_leak");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.leaktest", &cols, &[0]).unwrap();
@@ -480,7 +480,7 @@ fn test_next_index_id_advances_on_index_register() {
     // that the master already assigned to an explicit user index, causing
     // directory collisions.
     let dir = temp_dir("atomicity_idx_seq");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.seqsync", &cols, &[0]).unwrap();
@@ -512,7 +512,7 @@ fn test_next_schema_id_advances_on_schema_register() {
     // CREATE SCHEMA re-allocates the same schema_id. Mirrors
     // test_next_index_id_advances_on_index_register.
     let dir = temp_dir("atomicity_schema_seq");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // A SCHEMA_TAB row whose id is far ahead of the recovered counter, standing
     // in for a durable CREATE SCHEMA whose sys_sequences advance never reached a
@@ -546,7 +546,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     //
     // Pre-fix: drop_schema("victim") fails with "View dependency: owner.t".
     let dir = temp_dir("atomicity_schema_id_collision");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Table T (in schema `owner`) with a dependent view V → dep_map[T] = [V].
     engine.create_schema("owner").unwrap();
@@ -611,7 +611,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 #[test]
 fn precheck_rejects_relation_id_at_or_above_ceiling() {
     let dir = temp_dir("relation_id_ceiling_reject");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     for (label, tid) in [
         ("at the ceiling", sys_tables::RELATION_ID_CEILING),
@@ -656,7 +656,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
 #[test]
 fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     let dir = temp_dir("ddl_txn_precheck_ghost");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     // Occupy the qualified name "public.dupname".
@@ -712,7 +712,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 #[test]
 fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     let dir = temp_dir("ddl_txn_hook_rollback");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let cols_before = count_records(engine.sys_store_mut(SysFamily::Column));

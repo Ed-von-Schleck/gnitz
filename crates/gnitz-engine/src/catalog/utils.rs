@@ -78,13 +78,15 @@ pub(crate) fn preflight_dir(base_dir: &str, schema_name: &str, vid: i64) -> Stri
 }
 
 /// `<owner_dir>/idx_<idx_id>` — an index's directory, nested in its owner.
+/// `ChildAddr` owns the name so the boot sweeps that walk a relation directory
+/// classify it instead of tripping over it.
 pub(crate) fn index_dir(owner_dir: &str, idx_id: i64) -> String {
-    format!("{owner_dir}/idx_{idx_id}")
+    ChildAddr::Index { id: idx_id }.dir(owner_dir)
 }
 
 /// True if `name` is shaped like an index directory (`idx_<digits>`).
 pub(crate) fn is_index_dir_name(name: &str) -> bool {
-    name.strip_prefix("idx_").is_some_and(has_numeric_id)
+    matches!(ChildAddr::parse(name), Some(ChildAddr::Index { .. }))
 }
 
 /// The directory holding THIS process's copy of an index table: the index dir
@@ -113,14 +115,8 @@ pub(crate) fn new_index_table(idx_dir: &str, index_id: i64, idx_schema: SchemaDe
     // `Table::new` itself opens dirless and would create the path only on its
     // first spill.)
     std::fs::create_dir_all(&table_dir).map_err(|e| format!("Failed to create index dir {table_dir}: {e}"))?;
-    Table::new(
-        &table_dir,
-        idx_schema,
-        index_id as u32,
-        SYS_TABLE_ARENA,
-        RecoverySource::Rederive,
-    )
-    .map_err(|e| format!("Failed to create index table {index_id}: error {e}"))
+    Table::new(&table_dir, idx_schema, index_id as u32, RecoverySource::Rederive)
+        .map_err(|e| format!("Failed to create index table {index_id}: error {e}"))
 }
 
 /// True if `name` is a per-rank index subdir (`w<digits>`), as written by
@@ -147,12 +143,13 @@ pub(crate) fn remove_stale_index_rank_dirs(idx_dir: &str) {
 }
 
 /// Remove a relation's child directories that this boot's worker count no longer
-/// owns — `ChildAddr::is_owned_by` holds the rule. Names in none of the child
-/// grammars (an `idx_{id}` dir, say) are left alone.
-pub(crate) fn reclaim_retired_children(dir: &str, routing: Routing, num_workers: u32) {
+/// owns — `ChildAddr::is_owned_by` holds the rule. Names in neither child
+/// grammar (an `idx_{id}` dir, say) are left alone. Runs after the boot
+/// repartition, which has already consumed any previous-layout set it needed.
+pub(crate) fn reclaim_retired_children(dir: &str, num_workers: u32) {
     for name in subdir_names(dir) {
         let Some(child) = ChildAddr::parse(&name) else { continue };
-        if !child.is_owned_by(routing, num_workers) {
+        if !child.is_owned_by(num_workers) {
             let full = format!("{dir}/{name}");
             gnitz_debug!("recovery: removing retired child dir {}", full);
             crate::storage::remove_child(&full);
@@ -169,24 +166,6 @@ pub(crate) fn is_table_dir_name(name: &str) -> bool {
 /// A directory-name id component: non-empty and all ASCII digits.
 fn has_numeric_id(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-}
-
-/// Immediate sub-directory names of `path`. Empty if `path` is missing or
-/// unreadable — both mean "nothing to scan" for the orphan sweep. Non-directory
-/// entries are skipped.
-///
-/// Materialized rather than streamed: every caller unlinks entries from the
-/// directory it is walking, and `readdir` may skip entries when the directory
-/// is modified mid-iteration.
-pub(crate) fn subdir_names(path: &str) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect()
 }
 
 // ---------------------------------------------------------------------------

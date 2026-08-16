@@ -17,7 +17,7 @@
 //!   the batch (all retractions before all insertions, §3.1) so a rewrite pair
 //!   (a rename's -1,+1 on one PK) applies its retraction before its insertion.
 //! * `hook_*` — side-effectful handlers that create directories, allocate store
-//!   partitions, register DAG entries, or backfill derived state. Storage is
+//!   stores, register DAG entries, or backfill derived state. Storage is
 //!   applied before hooks fire, so the register/cascade hooks reconcile against
 //!   the row's *net* live state (`advance_to_exact_live`) rather than its own sign — a
 //!   rename pair (net-live before and after) fires neither teardown nor
@@ -32,10 +32,10 @@ mod cache;
 mod ddl;
 mod hooks;
 mod metadata;
-mod partition_lsn;
 mod registry;
 mod scan_spec;
 mod store_io;
+mod store_lsn;
 mod sys_tables;
 mod types;
 mod utils;
@@ -50,7 +50,7 @@ use std::rc::Rc;
 
 use crate::query::{DagEngine, RelationKind, StoreHandle};
 use crate::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, PartitionedTable, ReadCursor, RecoverySource, Routing, Table};
+use crate::storage::{Batch, ReadCursor, RecoverySource, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
@@ -61,7 +61,7 @@ pub(crate) use types::{ColumnDef, FkEdge};
 // The reply path's cached schema wire block.
 pub(crate) use cache::SchemaWireEntry;
 // The master's ScanSpec confinement test.
-pub(crate) use scan_spec::scan_spec_partition;
+pub(crate) use scan_spec::scan_spec_worker;
 // The fixed system-table schema for a family tid. The production DDL decode
 // reaches it through the `CatalogEngine::sys_family_schema` instance method
 // (preserving the layering); the crate-wide handle exists for the cross-crate
@@ -82,13 +82,13 @@ pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use registry::raise_id_counter;
 pub(in crate::catalog) use sys_tables::{PUBLIC_SCHEMA_ID, SYSTEM_SCHEMA_ID};
-// Partition layout is owned by storage; the catalog only consumes it.
-pub(in crate::catalog) use crate::storage::{ChildAddr, NUM_PARTITIONS};
+// The child-directory grammar is owned by storage; the catalog only consumes it.
+pub(in crate::catalog) use crate::storage::{subdir_names, ChildAddr};
 pub(in crate::catalog) use utils::{
     cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, index_dir, is_index_dir_name, is_table_dir_name,
     make_fk_index_name, new_index_table, preflight_dir, reclaim_retired_children, relation_dir,
-    remove_stale_index_rank_dirs, retract_key_range, retract_single_row, schema_dir, subdir_names, sys_catalog_dir,
-    sys_family_dir, sys_opk,
+    remove_stale_index_rank_dirs, retract_key_range, retract_single_row, schema_dir, sys_catalog_dir, sys_family_dir,
+    sys_opk,
 };
 #[cfg(test)]
 pub(in crate::catalog) use utils::{make_secondary_index_name, parse_qualified_name};
@@ -125,8 +125,17 @@ pub struct CatalogEngine {
     /// because a user sequence's values live in worker-owned rows the master
     /// cannot re-derive.
     pub(crate) user_sequences: std::collections::HashMap<i64, i64>,
-    pub(crate) active_part_start: u32,
-    pub(crate) active_part_end: u32,
+
+    /// The launched worker count. Threaded in from `run_server` rather than read
+    /// off `worker_ctx`, which is 1 in the master process (`set_worker_rank` runs
+    /// only post-fork): a store built from the ambient value would be named
+    /// `w0of1` while the boot repartition wrote `w0of{W}..`, the child-dir sweep
+    /// would delete it as unowned, and worker 0 would inherit a deleted directory.
+    pub(crate) num_workers: u32,
+    /// True while this process owns its relations' stores. The post-fork master
+    /// detaches every user relation and stays inert, so anything reading local
+    /// base data must check this first.
+    pub(crate) owns_stores: bool,
 
     /// The committed checkpoint generation. Recovered from `SEQ_ID_CHECKPOINT_GEN`
     /// at boot (0 on a fresh DB), bumped once per checkpoint via
@@ -146,7 +155,7 @@ pub struct CatalogEngine {
     /// a clean same-topology restart (every view resumes).
     pub(crate) invalid_views: rustc_hash::FxHashSet<i64>,
 
-    // --- System tables (owned, single-partition, durable) ---
+    // --- System tables (owned, one `Table` each, durable) ---
     //
     // One store per family, indexed by `SysFamily` discriminant (parallel to
     // `SYS_FAMILIES`). The `Box` keeps each table's heap address stable, so the

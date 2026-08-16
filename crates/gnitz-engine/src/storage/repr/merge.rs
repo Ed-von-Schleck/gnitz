@@ -124,7 +124,7 @@ pub(crate) type BlobCache = FxHashMap<(usize, usize, usize), usize>;
 /// Reserve hint for a destination heap taking `out_rows` of a `src_rows`-row
 /// source whose heap is `src_blob` bytes: that slice's row-proportional share.
 ///
-/// Every N-way split — the per-partition ingest scatter, the per-worker relay
+/// Every N-way split — the per-worker ingest scatter, the per-worker relay
 /// batches, the per-guard compaction outputs, a shard row-slice — needs this, and
 /// reserving the *whole* source heap per target instead would ask for N× the
 /// bytes any one of them can write, evicting pooled buffers and mallocing fresh

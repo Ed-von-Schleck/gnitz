@@ -1,0 +1,270 @@
+//! Per-worker store lifecycle across the fork — detach, re-home, child-dir
+//! reclamation, invalid-view reset — and the flushed-LSN bookkeeping that
+//! recovery and the DDL zone allocator read.
+
+use super::*;
+use rustc_hash::FxHashSet;
+
+impl CatalogEngine {
+    // -- Store management (for multi-worker fork) -----------------------------
+
+    /// Detach every user relation's store (master after fork), so master and
+    /// worker 0 do not both hold a live `Table` on `w0of{W}`: two processes
+    /// writing one directory is the hazard `naming.rs` exists to prevent. System
+    /// tables keep their `Borrowed` handles, so the filter is the handle.
+    pub fn detach_user_stores(&mut self) {
+        self.owns_stores = false;
+        for entry in self.dag.tables.values_mut() {
+            if !matches!(entry.handle, StoreHandle::Borrowed(_)) {
+                entry.handle = StoreHandle::Detached;
+            }
+        }
+    }
+
+    /// Panic unless this is the pre-fork master. Both boot passes below reach
+    /// across the whole cluster — one reclaims every relation's retired children,
+    /// the other peeks every launched rank's manifest — which only that one
+    /// process may do: the workers do not exist yet and the post-fork master owns
+    /// no store to speak for them.
+    fn assert_pre_fork(&self, who: &str) {
+        assert!(
+            !crate::foundation::worker_ctx::is_worker() && self.owns_stores,
+            "{who} must run pre-fork on the master, which still owns its stores",
+        );
+    }
+
+    /// Re-open every store this worker inherited on someone else's child.
+    ///
+    /// The pre-fork master builds every relation at rank 0 and every worker
+    /// inherits those handles; since all workers share the data directory,
+    /// leaving them there would have every worker flush the same shard files.
+    /// The inherited handle is empty — the master ingests no user data — so
+    /// re-opening loses nothing: this rank's checkpointed shards load from its
+    /// own child and the FLAG_PUSH replay adds the SAL tail.
+    ///
+    /// A handle already homed here is left alone rather than special-cased by
+    /// rank: that covers worker 0's inherited child and the live CREATE path,
+    /// which builds at the worker's own rank to begin with. Re-opening one would
+    /// briefly put two live `Table`s on one directory.
+    pub fn rehome_stores(&mut self) -> Result<(), String> {
+        let home = ChildAddr::this_worker(self.num_workers);
+        let tids: Vec<i64> = self
+            .dag
+            .tables
+            .iter()
+            .filter(|(_, e)| {
+                e.handle
+                    .as_owned_mut()
+                    .is_some_and(|t| t.directory() != home.dir(&e.directory))
+            })
+            .map(|(&tid, _)| tid)
+            .collect();
+        for tid in tids {
+            self.rebuild_relation_store(tid, "rehome store")?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild `tid`'s store handle from its registered `(directory, schema,
+    /// kind)` and install it. `build_relation_store` opens this worker's own
+    /// child, so the rebuilt handle is homed wherever the caller now runs. The
+    /// caller does whatever on-disk preparation its case needs first.
+    fn rebuild_relation_store(&mut self, tid: i64, what: &str) -> Result<(), String> {
+        let (dir, schema, kind) = {
+            let e = self
+                .dag
+                .tables
+                .get(&tid)
+                .ok_or_else(|| format!("{what}: relation {tid} not registered"))?;
+            (e.directory.clone(), e.schema, e.kind)
+        };
+        let handle = self
+            .build_relation_store(kind, &dir, tid, schema)
+            .map_err(|e| format!("{what} tid={tid}: {e}"))?;
+        self.dag.tables.get_mut(&tid).expect("entry read above").handle = handle;
+        Ok(())
+    }
+
+    /// Reclaim every live relation's child directories that this boot's worker
+    /// count no longer owns — the on-disk counterpart of `rehome_stores`, which
+    /// then opens what this leaves behind. Runs after the boot relayout, so what
+    /// it deletes is a set the relayout has already consumed.
+    ///
+    /// Unconditional rather than triggered on "the launched count changed": a
+    /// boot that dies between this sweep and `record_topology` leaves the
+    /// recorded count unchanged, so such a trigger would skip the repair on the
+    /// retry. It is idempotent, so running it every boot converges instead.
+    pub fn reconcile_child_dirs(&self) {
+        self.assert_pre_fork("reconcile_child_dirs");
+        for entry in self.dag.tables.values() {
+            // System tables are `Borrowed` single `Table`s with no children.
+            if matches!(entry.handle, StoreHandle::Borrowed(_)) {
+                continue;
+            }
+            reclaim_retired_children(&entry.directory, self.num_workers);
+        }
+    }
+
+    /// Reset an invalid view's output store and per-worker operator scratch to an
+    /// empty, well-formed state, then drop its cached plan — recovery step-4, run
+    /// per worker on its own store before the view is rebuilt.
+    ///
+    /// Unlinks this worker's child manifest first, so the empty rebuild below (a
+    /// `RederiveCheckpointed` open) peeks `None` and *erases* the stale
+    /// generation-`g` shards rather than reloading them — without which a
+    /// transitively-invalid view whose own manifests are still at `g` would reload
+    /// them. Then rebuilds the handle empty via `build_relation_store`,
+    /// removes this worker's scratch operator dirs, and invalidates the
+    /// plan cache so the next backfill recompiles against the empty store + fresh
+    /// scratch.
+    pub(crate) fn reset_view_output_for_rebuild(&mut self, vid: i64) -> Result<(), String> {
+        let dir = self
+            .dag
+            .tables
+            .get(&vid)
+            .ok_or_else(|| format!("reset_view_output_for_rebuild: view {vid} not registered"))?
+            .directory
+            .clone();
+
+        let rank = crate::foundation::worker_ctx::worker_rank();
+        let _ = std::fs::remove_file(ChildAddr::this_worker(self.num_workers).manifest(&dir));
+
+        // Rebuild empty. `Table::new` erases the stale shards (manifest now
+        // absent → `RederiveCheckpointed` peek `None`).
+        self.rebuild_relation_store(vid, "reset view output")?;
+
+        // Remove this worker's per-view operator scratch dirs (rank-stamped).
+        for name in subdir_names(&dir) {
+            if matches!(ChildAddr::parse(&name), Some(ChildAddr::Scratch { rank: r, .. }) if r == rank) {
+                let _ = std::fs::remove_dir_all(format!("{dir}/{name}"));
+            }
+        }
+
+        // Drop the cached plan so the next backfill recompiles against the empty
+        // store + fresh scratch.
+        self.dag.invalidate(vid);
+        Ok(())
+    }
+
+    /// Invalidate all cached plans.
+    pub fn invalidate_all_plans(&mut self) {
+        self.dag.invalidate_all();
+    }
+
+    /// Get max flushed LSN for a table. Recovery itself reads the bulk map
+    /// from `collect_all_flushed_lsns`; this single-table form is test-only.
+    #[cfg(test)]
+    pub(crate) fn get_max_flushed_lsn(&self, table_id: i64) -> u64 {
+        if let Some(family) = SysFamily::from_id(table_id) {
+            return self.sys_store(family).current_lsn();
+        }
+        let entry = match self.dag.tables.get(&table_id) {
+            Some(e) => e,
+            None => return 0,
+        };
+        entry.handle.current_lsn()
+    }
+
+    /// Every known store's `(table id, current_lsn)` — each system family, then
+    /// each user relation. The registry's own system entries are `Borrowed`
+    /// re-exports of `sys_stores`, so they are skipped and each id appears once.
+    /// The one walk behind both the recovery dedup map and the zone-allocator
+    /// floor.
+    fn all_store_lsns(&self) -> impl Iterator<Item = (i64, u64)> + '_ {
+        let sys = SYS_FAMILIES
+            .iter()
+            .zip(&self.sys_stores)
+            .map(|(info, table)| (info.id(), table.current_lsn()));
+        let user = self
+            .dag
+            .tables
+            .iter()
+            .filter(|(&tid, _)| tid >= FIRST_USER_TABLE_ID)
+            .map(|(&tid, entry)| (tid, entry.handle.current_lsn()));
+        sys.chain(user)
+    }
+
+    /// Build a map of every known table id → max flushed LSN, covering
+    /// both system tables and user tables. Recovery uses this as the
+    /// dedup filter for the unified two-pass walk.
+    pub fn collect_all_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
+        self.all_store_lsns().collect()
+    }
+
+    /// Compute the set of view ids whose checkpointed output state must be
+    /// rejected at boot and rebuilt, rather than resumed from its manifests.
+    ///
+    /// A view is **valid** (resumed) iff:
+    ///   * the recorded topology matches the launched `(worker_count, STATE_FORMAT)`
+    ///     — a different worker count re-shapes every keyed store's row placement;
+    ///   * every one of its output-store child manifests is stamped with the
+    ///     committed checkpoint generation — `worker_ctx::committed_generation()`,
+    ///     the in-memory recovered `G`, NOT the recovery-start-bumped durable
+    ///     `G+1` — matching what `Table::new`'s conditional load peeks; and
+    ///   * every VIEW it scans is itself valid — else it could read a rebuilt
+    ///     sibling's freshly-emptied output store.
+    ///
+    /// Two phases. Phase 1 decides each view's **local** validity (topology +
+    /// output manifests). Phase 2 propagates invalidity to any view scanning an
+    /// invalid source, walking the views in dependency order so one pass reaches
+    /// the whole cascade.
+    ///
+    /// Output manifests are enumerated as `w{k}of{launched}` for every launched
+    /// rank — exactly the set the checkpoint's ephemeral round stamps, so the two
+    /// must be read together when either changes. A view checkpointed at a
+    /// different worker count carries a different set of names and finds no
+    /// manifest at all, which is the same verdict the topology word already gives.
+    pub fn compute_invalid_views(&mut self) -> FxHashSet<i64> {
+        self.assert_pre_fork("compute_invalid_views");
+        let launched_workers = self.num_workers;
+        let g = crate::foundation::worker_ctx::committed_generation();
+        let topo_value = crate::storage::topology_word(launched_workers);
+        let topo_valid = self.recorded_topology == topo_value;
+
+        let view_ids = self.dag.view_ids();
+
+        // Phase 1: local validity (topology + every output child's manifest at g).
+        let mut invalid: FxHashSet<i64> = FxHashSet::default();
+        for &vid in &view_ids {
+            let local_ok = topo_valid && {
+                let entry = self.dag.tables.get(&vid).expect("vid taken from tables iter");
+                let dir = &entry.directory;
+                let at_g = |child: ChildAddr| match std::ffi::CString::new(child.manifest(dir)) {
+                    Ok(c) => matches!(crate::storage::peek_header(&c), Ok(Some(h)) if h.checkpoint_gen == g),
+                    Err(_) => false,
+                };
+                // The whole cluster's children, not just this process's.
+                crate::storage::cluster_children(launched_workers).all(at_g)
+            };
+            if !local_ok {
+                invalid.insert(vid);
+            }
+        }
+        if invalid.is_empty() {
+            // Clean same-topology restart: nothing to propagate, skip the
+            // dependency-map reads below.
+            return invalid;
+        }
+
+        // Phase 2: propagate invalidity to any still-valid view that scans an
+        // invalid source. Base sources never enter `invalid`, so they pass. A
+        // source view precedes every view scanning it in `order_by_view_deps`,
+        // so a single pass carries invalidity down the whole chain.
+        for vid in self.dag.order_by_view_deps(&view_ids) {
+            if !invalid.contains(&vid) && self.dag.get_source_ids(vid).iter().any(|s| invalid.contains(s)) {
+                invalid.insert(vid);
+            }
+        }
+        invalid
+    }
+
+    /// Maximum `current_lsn` across all tables — system and user. The
+    /// executor seeds its zone-LSN allocator from this at boot and passes it
+    /// as the reservation floor per DDL, so every allocated zone LSN is
+    /// strictly greater than each table's current counter: no recovery
+    /// watermark a checkpoint persisted can cover a committed-but-unflushed
+    /// zone, and a failed zone's pinned LSN is never reused.
+    pub fn max_table_current_lsn(&self) -> u64 {
+        self.all_store_lsns().map(|(_, lsn)| lsn).max().unwrap_or(0)
+    }
+}

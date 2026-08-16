@@ -10,7 +10,7 @@ use crate::ops;
 use crate::query::compiler::{self, CompileOutput, SubPlan};
 use crate::query::vm;
 use crate::schema::{Placement, SchemaDescriptor};
-use crate::storage::{Batch, PartitionedTable, RecoverySource, StorageError, Table};
+use crate::storage::{Batch, RecoverySource, StorageError, Table};
 use gnitz_wire::PkColList;
 
 mod exec;
@@ -21,7 +21,7 @@ mod store_handle;
 use meta::DepMap;
 pub(crate) use meta::ViewMeta;
 
-pub(crate) use store_handle::{StoreHandle, StoreProbe};
+pub(crate) use store_handle::StoreHandle;
 
 // ---------------------------------------------------------------------------
 // Index circuit entry
@@ -147,6 +147,19 @@ pub struct TableEntry {
 }
 
 impl TableEntry {
+    /// Non-compacting cursor over this relation's store. The entry's own schema
+    /// is what a detached handle opens empty in, so reading through here is what
+    /// keeps that answer in the relation's shape without the handle holding a
+    /// second copy of the descriptor to keep in step across an ALTER.
+    pub fn open_cursor(&self) -> crate::storage::ReadCursor {
+        self.handle.open_cursor(&self.schema)
+    }
+
+    /// Materialize every positive-weight row of this relation's store.
+    pub fn full_scan(&self) -> std::rc::Rc<Batch> {
+        self.handle.full_scan(&self.schema)
+    }
+
     /// The index circuit covering exactly `cols`, if one exists. The circuit
     /// list is deduped by ordered column list, so at most one entry matches —
     /// this is the one place that match is spelled.
@@ -333,19 +346,17 @@ impl DagEngine {
     /// columns (`MappedShard::null_pad_mask`).
     ///
     /// Updates the registry copy (`TableEntry.schema`) and pushes the same value
-    /// down through the store's owned copies — `PartitionedTable` → each
-    /// partition `Table` (table/memtable/shard-index) — plus dropping
-    /// `Table::cached_full_scan`.
+    /// down into the owned `Table` (memtable, RAM tier, shard index), plus
+    /// dropping `Table::cached_full_scan`.
     pub(crate) fn swap_table_schema(&mut self, table_id: i64, schema: SchemaDescriptor) -> Result<(), String> {
         let entry = self
             .tables
             .get_mut(&table_id)
             .expect("swap_table_schema: table must be registered");
-        // Post-fork the master holds no user partitions, so the store's partition
-        // set is empty and the swap is the descriptor-only `TableEntry.schema`
-        // update. On every worker the store has live partitions and it fans out.
-        if let Some(pt) = entry.handle.as_partitioned_mut() {
-            pt.swap_schema(schema)
+        // A worker reaches its `Table`; the post-fork master has none.
+        if let Some(store) = entry.handle.as_owned_mut() {
+            store
+                .swap_schema(schema)
                 .map_err(|e| format!("ALTER on table {table_id}: reopening shards failed: {e}"))?;
         }
         entry.schema = schema;
@@ -450,7 +461,7 @@ impl DagEngine {
     /// `catalog::utils::preflight_dir` for why it is not the view's own.
     ///
     /// The verdict is worker-independent: worker context reaches the compile only
-    /// as the scratch path component (which `root` overrides), as `PartitionFilter`
+    /// as the scratch path component (which `root` overrides), as `WorkerFilter`
     /// and `ReducePlan` operands baked into instructions nothing here executes, and
     /// as the committed generation a manifest-less directory makes moot.
     pub(crate) fn preflight_compile(&self, view_id: i64, root: &str) -> Result<(), compiler::CompileError> {
@@ -524,7 +535,7 @@ mod tests {
         let schema = SchemaDescriptor::default();
         let dir = dag_test_dir(name);
         let _ = std::fs::remove_dir_all(&dir);
-        Box::new(Table::new(&dir, schema, 99, 256 * 1024, RecoverySource::Rederive).unwrap())
+        Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive).unwrap())
     }
 
     #[test]
@@ -718,7 +729,7 @@ mod tests {
         let idx_schema = crate::schema::SchemaDescriptor::minimal_u64();
         let idx_dir = dag_test_dir("flush_ic_idx");
         let _ = std::fs::remove_dir_all(&idx_dir);
-        let idx_tbl = Box::new(Table::new(&idx_dir, idx_schema, 1, 256 * 1024, RecoverySource::SalReplay).unwrap());
+        let idx_tbl = Box::new(Table::new(&idx_dir, idx_schema, 1, RecoverySource::SalReplay).unwrap());
         dag.add_index_circuit(70, &[1], 999, idx_tbl, idx_schema, false);
 
         // Put one row in the index table's memtable.
@@ -766,14 +777,7 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_signed");
-        let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(),
-            schema,
-            1234,
-            crate::storage::Routing::Hashed { start: 0, end: 256 },
-            RecoverySource::Rederive,
-        )
-        .unwrap();
+        let mut pt = Table::new(tdir.to_str().unwrap(), schema, 1234, RecoverySource::Rederive).unwrap();
 
         // Seed the store with a negative-PK row (PK=-5, payload=100).
         let mut seed = Batch::with_capacity(schema, 1);
@@ -834,14 +838,7 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_weight_norm");
-        let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(),
-            schema,
-            1234,
-            crate::storage::Routing::Hashed { start: 0, end: 256 },
-            RecoverySource::Rederive,
-        )
-        .unwrap();
+        let mut pt = Table::new(tdir.to_str().unwrap(), schema, 1234, RecoverySource::Rederive).unwrap();
 
         let row_pk1 = |payload: i64, weight: i64| {
             let mut b = Batch::with_capacity(schema, 1);
@@ -902,14 +899,7 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_absent");
-        let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(),
-            schema,
-            1234,
-            crate::storage::Routing::Hashed { start: 0, end: 256 },
-            RecoverySource::Rederive,
-        )
-        .unwrap();
+        let mut pt = Table::new(tdir.to_str().unwrap(), schema, 1234, RecoverySource::Rederive).unwrap();
 
         // Seed an unrelated row (PK=-5) so the store is non-empty.
         let mut seed = Batch::with_capacity(schema, 1);
@@ -969,14 +959,7 @@ mod tests {
         let schema = wide_pk_3xu64_schema();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_wide");
-        let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(),
-            schema,
-            555,
-            crate::storage::Routing::Hashed { start: 0, end: 256 },
-            RecoverySource::Rederive,
-        )
-        .unwrap();
+        let mut pt = Table::new(tdir.to_str().unwrap(), schema, 555, RecoverySource::Rederive).unwrap();
 
         let pk24 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
 
@@ -1015,31 +998,6 @@ mod tests {
         assert!(pt.has_pk_bytes(&pk24(7, 8, 9)), "K2 survives +1,-1,+1 at net +1");
     }
 
-    /// `StoreHandle::Partitioned` must dispatch `recovery_lsn` → the table's
-    /// `min_flushed_lsn` (recovery watermark) and `current_lsn` → its `current_lsn`
-    /// (the LSN-allocator max). Built on the partial-flush fixture where the two
-    /// diverge, so a swapped dispatch is caught. (The underlying min/max
-    /// aggregation is pinned storage-side by
-    /// `min_flushed_lsn_floors_recovery_watermark_after_partial_flush`.)
-    #[test]
-    fn store_handle_partitioned_lsn_dispatch() {
-        let f = crate::storage::partial_flush_lsn_fixture();
-        let (recovery, current) = (f.recovery_lsn, f.current_lsn);
-        assert!(recovery < current, "fixture must have min < max to distinguish the two");
-
-        let handle = StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(f.pt)));
-        assert_eq!(
-            handle.recovery_lsn(),
-            recovery,
-            "Partitioned recovery_lsn → min_flushed_lsn"
-        );
-        assert_eq!(
-            handle.current_lsn(),
-            current,
-            "Partitioned current_lsn → max current_lsn"
-        );
-    }
-
     // A storage error while applying committed data in `ingest_store_and_indices`
     // must _exit(134) (fail-stop; recovery is restart + SAL replay). Driven via
     // the `GNITZ_INJECT_INGEST_APPLY_ERROR` debug seam. The `index`-stage
@@ -1067,7 +1025,7 @@ mod tests {
         let schema = crate::schema::SchemaDescriptor::minimal_u64();
         let dir = dag_test_dir("seam_abort");
         let _ = std::fs::remove_dir_all(&dir);
-        let mut tbl = Box::new(Table::new(&dir, schema, 99, 256 * 1024, RecoverySource::Rederive).unwrap());
+        let mut tbl = Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive).unwrap());
         dag.register_table(
             70,
             StoreHandle::Borrowed(&mut *tbl as *mut Table),

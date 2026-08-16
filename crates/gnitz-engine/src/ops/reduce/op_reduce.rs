@@ -168,7 +168,7 @@ pub fn op_reduce(
         // this is the only place to mint the one row SQL requires over a
         // never-populated / fully-retracted source. Idempotent and owner-guarded:
         //   * Only the V₀ owner seeds — every worker runs this pad, but exactly one
-        //     owns partition `partition_for_key(V₀)`. `i_am_owner` is always true
+        //     is `worker_for_key(V₀)`. `i_am_owner` is always true
         //     for a replicated reduce (single-source-read from worker 0).
         //   * Only if `trace_out` has no row at V₀ yet — the reduce integrates its
         //     own output within the epoch and `refresh_owned_cursors` rebuilds the

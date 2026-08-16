@@ -138,7 +138,7 @@ pub(super) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &
 /// callable at emit time (no batch exists) and over an empty delta — where
 /// `extract_group_key`'s unconditional `null_word()` read would index an empty
 /// slice and panic (a safe slice index, so it panics in release too). The single
-/// seam where `V₀` is defined: the owner-bake's `partition_for_key`, the seed's
+/// seam where `V₀` is defined: the owner-bake's `worker_for_key`, the seed's
 /// `emit_global_ground` PK and `trace_out` probe all route through this, while the
 /// runtime router and PK-stamp use the equal `extract_group_key` over a real row —
 /// so every site agrees byte-for-byte with no embedded literal.

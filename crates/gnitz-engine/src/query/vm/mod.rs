@@ -63,7 +63,7 @@ pub(crate) enum Instr {
         n_eq: u8,
         rel: gnitz_wire::RangeRel,
     },
-    PartitionFilter {
+    WorkerFilter {
         in_reg: u16,
         out_reg: u16,
         worker_id: u32,
@@ -114,7 +114,7 @@ pub(crate) fn reads_reg(instr: &Instr, r: u16) -> bool {
         Instr::Filter { in_reg, .. }
         | Instr::Map { in_reg, .. }
         | Instr::Negate { in_reg, .. }
-        | Instr::PartitionFilter { in_reg, .. }
+        | Instr::WorkerFilter { in_reg, .. }
         | Instr::NullExtend { in_reg, .. }
         | Instr::WeightClamp { in_reg, .. }
         | Instr::Integrate { in_reg, .. }
@@ -396,7 +396,7 @@ mod tests {
     /// what keeps the pointer valid once the table moves into `owned_tables`.
     fn owned_table(dir: &std::path::Path, name: &str, schema: SchemaDescriptor) -> (Box<Table>, *mut Table) {
         let mut t = Box::new(
-            Table::new(
+            Table::with_arena(
                 dir.join(name).to_str().unwrap(),
                 schema,
                 0,
@@ -1015,7 +1015,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cursor_test");
-        let mut table = Table::new(
+        let mut table = Table::with_arena(
             tdir.to_str().unwrap(),
             schema,
             0,

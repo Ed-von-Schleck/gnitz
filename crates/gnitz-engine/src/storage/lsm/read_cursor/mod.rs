@@ -76,11 +76,18 @@ trait RowComparator: merge::RowComparator<Run> {}
 impl<F: merge::RowComparator<Run>> RowComparator for F {}
 
 impl ReadCursor {
+    /// The schema every row this cursor yields is shaped by — fixed at open, so
+    /// a consumer reads it from here rather than carrying a second copy that
+    /// could go stale against the store the cursor came from.
+    pub(crate) fn schema(&self) -> &SchemaDescriptor {
+        &self.schema
+    }
+
     /// Build a ReadCursor from owned in-memory batches (no shards) — a test-only
     /// helper for reading a batch directly without a backing `Table` (no scratch
     /// dir / `mkdir`).
     #[cfg(test)]
-    pub(crate) fn from_owned(snapshots: &[Rc<Batch>], schema: SchemaDescriptor) -> ReadCursor {
+    pub(crate) fn from_owned(snapshots: &[std::rc::Rc<Batch>], schema: SchemaDescriptor) -> ReadCursor {
         create_read_cursor(snapshots, &[], schema)
     }
 
@@ -653,6 +660,13 @@ pub(crate) fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescr
         }
     }
     ReadCursor::new(sources, states, schema)
+}
+
+/// A cursor over nothing, in `schema`'s shape — what a relation this process
+/// holds no store for reads as, so a detached handle answers every read the way
+/// a store holding none of the requested rows does.
+pub(crate) fn empty(schema: SchemaDescriptor) -> ReadCursor {
+    from_runs(std::iter::empty(), schema)
 }
 
 /// Test-only shorthand for [`from_runs`] over a batch slice and a shard slice.

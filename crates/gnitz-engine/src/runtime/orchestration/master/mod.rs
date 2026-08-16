@@ -31,7 +31,6 @@ use crate::runtime::wire::{
 use crate::schema::key::PkBuf;
 use crate::storage::Batch;
 use gnitz_wire::wire_flags_set_conflict_mode;
-use gnitz_wire::worker_for_partition;
 use scatter::{with_commit_indices, with_worker_indices};
 
 // ---------------------------------------------------------------------------
@@ -129,7 +128,7 @@ pub(crate) fn first_worker_error_opt(op: &str, decoded: &[Option<DecodedWire>]) 
 /// Which workers a scan-shaped dispatch goes to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fanout {
-    /// Every worker; each answers for the partitions it owns.
+    /// Every worker; each answers for the rows it owns.
     Broadcast,
     /// This worker alone.
     One(usize),

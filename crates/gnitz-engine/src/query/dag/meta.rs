@@ -17,7 +17,7 @@ pub(crate) struct ViewMeta {
     /// The sink-nearest `ExchangeShard`'s shard columns — the master relay's
     /// routing key — and `None` when the circuit carries no `ExchangeShard` at
     /// all. The two states are distinct: an ungrouped global aggregate shards on
-    /// `∅`, a real exchange that funnels every row onto partition 0's owner.
+    /// `∅`, a real exchange that funnels every row onto `worker_for_key(V₀)`.
     pub shard_cols: Option<Rc<[i32]>>,
     /// source table id → join/group reindex `(column, carried promotion tc)`
     /// pairs — the scatter key per source, mirroring the trace-side reindex
@@ -248,7 +248,7 @@ impl DagEngine {
     ///
     /// The `Local` arm is deliberately conservative — a view whose source is
     /// `Local` is `Local` even when its own exchange would re-key it. That
-    /// direction is always safe (an unhashed store holds every local row; the read
+    /// direction is always safe (a replicated store holds every row; the read
     /// gathers all workers) and it avoids a second, subtler predicate for "does
     /// this exchange actually run at runtime".
     pub(crate) fn view_placement(&mut self, view_id: i64, sources: &[i64], pk_arity: usize) -> Placement {

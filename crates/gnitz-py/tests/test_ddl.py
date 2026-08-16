@@ -85,7 +85,7 @@ def test_create_then_drop_no_worker_race(race_server):
 
     With the debug-only `GNITZ_INJECT_TABLE_CREATE_DELAY_MS` seam active
     (see the `race_server` fixture), each worker sleeps between creating the
-    table dir and its partition subdirs.  Pre-fix, the master removed the dir
+    table dir and its own child subdir.  Pre-fix, the master removed the dir
     on DROP while a worker was mid-create → worker ENOENT abort → the next
     request fails with "connection closed".  Post-fix the master defers
     removal to the next checkpoint, so the worker finishes safely.

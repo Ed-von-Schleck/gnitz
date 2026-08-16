@@ -2,14 +2,14 @@ use super::*;
 
 // ── test_enforce_unique_pk ───────────────────────────────────────────
 
-/// Unique-PK enforcement through the production partitioned path: insert,
+/// Unique-PK enforcement through the production store path: insert,
 /// intra-batch dedup, insert+delete cancellation, and the `+1, -1, +1`
 /// re-insert regression (the deleted Single-store variant netted this to 0 by
 /// failing to clear its intra-batch `seen` map on the delete).
 #[test]
 fn test_enforce_unique_pk() {
     let dir = temp_dir("enforce_upk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.get_schema_desc(tid).unwrap();
@@ -82,7 +82,7 @@ fn test_orphaned_metadata_recovery() {
 
     // First open: inject an index record pointing to non-existent table 99999
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         engine
             .sys_store_mut(SysFamily::Index)
             .ingest_borrowed_batch(&idx_tab_batch(888, 99999, 1, "orphaned_idx", false, 1))
@@ -93,7 +93,7 @@ fn test_orphaned_metadata_recovery() {
     }
 
     // Re-open should fail because the orphaned index references table 99999
-    let result = CatalogEngine::open(&dir);
+    let result = CatalogEngine::open(&dir, 1);
     assert!(result.is_err(), "Orphaned index metadata should cause error on reload");
 
     let _ = fs::remove_dir_all(&dir);
@@ -106,7 +106,7 @@ fn test_orphaned_metadata_recovery() {
 #[test]
 fn test_reserve_user_sequence_seed_and_contiguous() {
     let dir = temp_dir("reserve_user_seq");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let seq_id = FIRST_USER_TABLE_ID;
 
     // Seed-on-first-use: absent sequence ⇒ base 1, high-water 64.
@@ -130,7 +130,7 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
 #[test]
 fn test_reserve_user_sequence_saturates() {
     let dir = temp_dir("reserve_user_seq_sat");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let seq_id = FIRST_USER_TABLE_ID;
     engine.user_sequences.insert(seq_id, i64::MAX - 1);
 
@@ -151,7 +151,7 @@ fn test_user_sequence_durable_roundtrip() {
     let dir = temp_dir("user_seq_roundtrip");
     let user_seq = FIRST_USER_TABLE_ID + 3;
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let (base, delta, _) = engine.reserve_user_sequence(user_seq, 64);
         assert_eq!(base, 1);
         // Clear the synchronously-set map entry to prove the hook re-populates it.
@@ -161,7 +161,7 @@ fn test_user_sequence_durable_roundtrip() {
         let _ = engine.sys_store_mut(SysFamily::Sequence).flush();
         engine.close();
     }
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(engine.user_sequences.get(&user_seq).copied(), Some(64));
     let (base2, _delta, _) = engine.reserve_user_sequence(user_seq, 64);
     assert_eq!(base2, 65, "next id continues after the recovered high-water");
@@ -177,7 +177,7 @@ fn test_recover_checkpoint_gen_and_topology() {
     let dir = temp_dir("recover_ckpt_records");
     let expected_topology = crate::storage::topology_word(4);
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(engine.committed_generation, 0, "fresh DB starts at generation 0");
         assert_eq!(engine.recorded_topology, 0, "fresh DB has no topology row");
         // Boot order: the topology row is written first and its durability
@@ -188,7 +188,7 @@ fn test_recover_checkpoint_gen_and_topology() {
         assert_eq!(engine.bump_checkpoint_generation(), 2, "generation is monotonic");
         engine.close();
     }
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
         engine.committed_generation, 2,
         "recovered checkpoint generation survives a reopen",
@@ -210,7 +210,7 @@ fn test_recovery_start_generation_bump_monotonic() {
     let dir = temp_dir("recovery_start_gen_bump");
     {
         // Simulate two prior checkpoints so the recovered G is 2, not 0.
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         engine.record_topology(4);
         assert_eq!(engine.bump_checkpoint_generation(), 1);
         assert_eq!(engine.bump_checkpoint_generation(), 2);
@@ -218,7 +218,7 @@ fn test_recovery_start_generation_bump_monotonic() {
     }
     {
         // Recovery start: bump G=2 → 3 durably; the field advances.
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(engine.committed_generation, 2, "recovered G");
         engine.recovery_start_generation_bump().unwrap();
         assert_eq!(
@@ -230,7 +230,7 @@ fn test_recovery_start_generation_bump_monotonic() {
         engine.close();
     }
     // The final durable generation survives a reopen monotonically.
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
         engine.committed_generation, 4,
         "recovery-start + boot_checkpoint bumps recovered monotonically",
@@ -246,7 +246,7 @@ fn test_recover_ignores_sub_user_seq_id() {
     let dir = temp_dir("recover_gap_guard");
     let stray = 7i64; // below FIRST_USER_TABLE_ID
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let schema = SysFamily::Sequence.schema();
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(stray as u128, 1);
@@ -259,7 +259,7 @@ fn test_recover_ignores_sub_user_seq_id() {
         let _ = engine.sys_store_mut(SysFamily::Sequence).flush();
         engine.close();
     }
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine.user_sequences.contains_key(&stray));
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -274,7 +274,7 @@ fn test_sequence_gap_recovery() {
 
     // First open: create a table, then inject a table record with high ID 250
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         engine.create_table("public.t1", &cols, &[0]).unwrap();
 
         // Inject table record for tid=250 directly into sys_tables
@@ -299,7 +299,7 @@ fn test_sequence_gap_recovery() {
 
     // Re-open: sequence should recover to 251
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let new_tid = engine.create_table("public.tnext", &cols, &[0]).unwrap();
         assert_eq!(new_tid, 251, "Sequence recovery: expected 251, got {new_tid}");
         engine.close();
@@ -313,7 +313,7 @@ fn test_sequence_gap_recovery() {
 #[test]
 fn test_ingest_scan_seek_family() {
     let dir = temp_dir("catalog_ingest_scan_seek");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.get_schema_desc(tid).unwrap();
@@ -363,7 +363,7 @@ fn test_ingest_scan_seek_family() {
 #[test]
 fn seek_family_resolves_system_table_row() {
     let dir = temp_dir("catalog_seek_system_table");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
@@ -383,12 +383,12 @@ fn seek_family_resolves_system_table_row() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_ingest_pk_enforced_partitioned ───────────────────────────────
+// ── test_ingest_pk_enforced_through_the_store ───────────────────────────────
 
 #[test]
-fn test_ingest_pk_enforced_partitioned() {
-    let dir = temp_dir("catalog_pk_enforced_partitioned");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+fn test_ingest_pk_enforced_through_the_store() {
+    let dir = temp_dir("catalog_pk_enforced_store");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let schema = engine.get_schema_desc(tid).unwrap();
@@ -423,7 +423,7 @@ fn test_ingest_pk_enforced_partitioned() {
 #[test]
 fn test_ddl_sync() {
     let dir = temp_dir("catalog_ddl_sync");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Create a schema via normal DDL
     engine.create_schema("app").unwrap();
@@ -457,7 +457,7 @@ fn test_ddl_sync_zone_lsn_tracking() {
 
     let zone = |lsn: u64| NonZeroU64::new(lsn).unwrap();
     let dir = temp_dir("catalog_zone_lsn");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Zone 5: create a schema. SCHEMA_TAB pinned to lsn=5.
     engine.ctx.open_ddl_zone(zone(5));
@@ -496,18 +496,25 @@ fn test_ddl_sync_zone_lsn_tracking() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_partition_management ─────────────────────────────────────────
+// ── test_store_detach ─────────────────────────────────────────────────
 
+/// Detaching (what the post-fork master does) leaves every registered relation
+/// readable-as-empty and writable-as-a-no-op, rather than panicking or holding a
+/// second live `Table` on worker 0's directory.
 #[test]
-fn test_partition_management() {
-    let dir = temp_dir("catalog_partition_mgmt");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+fn test_store_detach() {
+    let dir = temp_dir("catalog_store_detach");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let _tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    assert!(engine.owns_stores);
 
-    // These should not panic
-    engine.set_active_partitions(0, 64);
-    engine.trim_worker_partitions(0, 64);
+    engine.detach_user_stores();
+    assert!(!engine.owns_stores);
+    let entry = engine.dag.tables.get(&tid).unwrap();
+    assert!(entry.handle.is_detached());
+    assert!(!entry.open_cursor().valid, "a detached store reads empty");
+    assert_eq!(entry.handle.current_lsn(), 0);
     engine.invalidate_all_plans();
 
     engine.close();
@@ -519,7 +526,7 @@ fn test_partition_management() {
 #[test]
 fn test_fk_index_metadata_queries() {
     let dir = temp_dir("catalog_fk_idx_meta");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.parent", &cols, &[0]).unwrap();
@@ -556,7 +563,7 @@ fn test_fk_index_metadata_queries() {
 #[test]
 fn test_iter_user_table_ids_and_lsn() {
     let dir = temp_dir("catalog_iter_lsn");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid1 = engine.create_table("public.t1", &cols, &[0]).unwrap();
@@ -578,7 +585,7 @@ fn test_iter_user_table_ids_and_lsn() {
 #[test]
 fn test_column_defs_cached() {
     let dir = temp_dir("catalog_colnames");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
         col_def("pk", type_code::U64),
         col_def("alpha", type_code::U64),
@@ -606,7 +613,7 @@ fn test_dep_map_is_the_scan_delta_nodes() {
     // a non-`ScanDelta` node carrying a `source_table` nor a non-positive source
     // id gives any.
     let dir = temp_dir("dep_map_scan_delta");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     write_circuit_chain(
         &mut engine,
@@ -639,7 +646,7 @@ fn test_dep_map_view_on_view_chain() {
     // A view over a view: each segment's own `ScanDelta` is its edge, in both
     // map directions.
     let dir = temp_dir("dep_map_view_chain");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     write_identity_circuit(&mut engine, 7, 100, None);
     write_identity_circuit(&mut engine, 8, 7, None);
@@ -663,7 +670,7 @@ fn test_dep_map_view_on_view_chain() {
 #[test]
 fn test_dep_map_drops_a_retired_views_edges() {
     let dir = temp_dir("dep_map_retired");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -699,7 +706,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
 #[test]
 fn test_dependent_view_restricts_fire_from_circuit_rows() {
     let dir = temp_dir("dep_map_restrict");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -725,7 +732,7 @@ fn test_dependent_view_restricts_fire_from_circuit_rows() {
 #[test]
 fn test_circuit_table_surface_introspectable() {
     let dir = temp_dir("circuit_surface");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Inject a row directly into CIRCUIT_NODES so the store is non-empty.
     // Compound-PK layout: (view_id U64, sub U64) primary key, then payload

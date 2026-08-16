@@ -53,6 +53,26 @@ macro_rules! col_width_dispatch {
     };
 }
 
+/// Route each live row of `mb` into its owning worker's slot of `slots`, by the
+/// relation's distribution prefix (`slots.len()` is the worker count).
+///
+/// The one placement rule for a table key. The master's push fan-out and the
+/// boot relayout both drive it, and they have to agree row-for-row: a relayout
+/// that placed a row where the push path would not is a row no read can reach.
+///
+/// Weight-0 rows are dropped — they are not Z-set elements, and a client is free
+/// to send one. Dropping them here means every consumer of the indices reads the
+/// same row set for free.
+pub(crate) fn route_rows_by_pk(mb: &MemBatch, schema: &crate::schema::SchemaDescriptor, slots: &mut [Vec<u32>]) {
+    let num_workers = slots.len();
+    for i in 0..mb.count {
+        if mb.get_weight(i) == 0 {
+            continue;
+        }
+        slots[schema.worker_for_pk(mb.get_pk_bytes(i), num_workers)].push(i as u32);
+    }
+}
+
 /// Scatter-copy rows from a batch at the given indices.
 /// Indices are NOT sorted — rows are written in the order given.
 /// If `weights` is non-empty, uses weights[i] for row i; otherwise reads

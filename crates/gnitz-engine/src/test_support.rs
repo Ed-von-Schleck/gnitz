@@ -53,7 +53,7 @@ pub(crate) fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
 /// Build a consolidated wide-PK batch from native `(c0, c1, c2, weight, payload)`
 /// tuples. The PK is OPK-encoded via [`Batch::extend_pk_opk`] (big-endian per
 /// column — the at-rest §6 layout), so the bytes are byte-identical to an
-/// ingested row and to what `partition_for_pk_bytes` routes.
+/// ingested row and to what `worker_for_pk_bytes` routes.
 ///
 /// `rows` must be OPK-sorted (non-decreasing PK). The explicit assert below runs
 /// in every build (unlike `certify_layout`'s debug-only verify) and gives a

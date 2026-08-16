@@ -15,8 +15,8 @@ use crate::foundation::posix_io::open_owned;
 
 /// Concurrent-fd budget for one barrier chunk. Bounds both the per-table
 /// accumulation before a chunk publishes and the sub-chunk its by-path sweep
-/// opens, so a 256-partition family never holds thousands of fds at once
-/// (EMFILE).
+/// opens, so a checkpoint over many relations never holds thousands of fds at
+/// once (EMFILE).
 const FD_CHUNK_THRESHOLD: usize = 256;
 
 /// Which checkpoint round a barrier publishes.
@@ -31,13 +31,13 @@ pub enum FlushRound {
 }
 
 impl FlushRound {
-    /// The generation to stamp a published manifest with. `None` on the base
-    /// round, which publishes no generation — only `RederiveCheckpointed` opens
-    /// read one back.
-    pub(super) fn generation(self) -> Option<u64> {
+    /// The checkpoint generation to stamp a published manifest with. The base
+    /// round stamps 0: only a `RederiveCheckpointed` open reads this field back,
+    /// and such a table publishes nothing on the base round.
+    pub(super) fn checkpoint_gen(self) -> u64 {
         match self {
-            FlushRound::Base => None,
-            FlushRound::Ephemeral(g) => Some(g),
+            FlushRound::Base => 0,
+            FlushRound::Ephemeral(g) => g,
         }
     }
 }
@@ -81,6 +81,24 @@ pub fn flush_barrier(tables: impl IntoIterator<Item = *mut Table>, round: FlushR
     Ok(())
 }
 
+/// Make every file in `paths` durable: open each `O_RDONLY` and fdatasync it
+/// through one ring submission per sub-chunk, so a large set never holds more
+/// than [`FD_CHUNK_THRESHOLD`] fds open at once (EMFILE). The one spelling of
+/// "these written files are now on disk" — the checkpoint barrier and the boot
+/// relayout both go through it.
+pub(super) fn sync_by_path(ring: &mut LazyRing, paths: &[&CStr]) -> Result<(), StorageError> {
+    for sub in paths.chunks(FD_CHUNK_THRESHOLD) {
+        let owned: Vec<OwnedFd> = sub
+            .iter()
+            .map(|p| open_owned(p, libc::O_RDONLY).ok_or(StorageError::Io))
+            .collect::<Result<_, _>>()?;
+        let raw: Vec<libc::c_int> = owned.iter().map(|f| f.as_raw_fd()).collect();
+        ring.batch_sync(&raw, DATASYNC)?;
+        // `owned` drops here → fds closed before the next sub-chunk
+    }
+    Ok(())
+}
+
 /// One fd-bounded chunk: batch-fdatasync the manifest `.tmp` fds and the
 /// unsynced files, rename each manifest into place, then batch-fsync the
 /// directories that received one. Every fd this chunk opened is closed before
@@ -97,21 +115,11 @@ fn publish_chunk(
     let manifest_fds: Vec<libc::c_int> = pending.iter().map(|(_, w)| w.manifest_fd()).collect();
     ring.batch_sync(&manifest_fds, DATASYNC)?;
 
-    // Sweep: open every unsynced file O_RDONLY and fdatasync it by path, in
-    // sub-chunks so a large table set never holds thousands of fds open at once.
     let paths: Vec<&CStr> = pending
         .iter()
         .flat_map(|(_, w)| w.sync_paths().iter().map(|c| c.as_c_str()))
         .collect();
-    for sub in paths.chunks(FD_CHUNK_THRESHOLD) {
-        let owned: Vec<OwnedFd> = sub
-            .iter()
-            .map(|p| open_owned(p, libc::O_RDONLY).ok_or(StorageError::Io))
-            .collect::<Result<_, _>>()?;
-        let raw: Vec<libc::c_int> = owned.iter().map(|f| f.as_raw_fd()).collect();
-        ring.batch_sync(&raw, DATASYNC)?;
-        // `owned` drops here → fds closed before the next sub-chunk
-    }
+    sync_by_path(ring, &paths)?;
 
     // Publish, then make the renames durable. A directory needs a full fsync,
     // not fdatasync: the rename is metadata.
@@ -129,7 +137,7 @@ const DATASYNC: io_uring::types::FsyncFlags = io_uring::types::FsyncFlags::DATAS
 /// io_uring created on first use: a barrier over a table set that turns out to
 /// need no I/O should not pay `io_uring_setup` plus its two mmaps.
 #[derive(Default)]
-struct LazyRing(Option<io_uring::IoUring>);
+pub(super) struct LazyRing(Option<io_uring::IoUring>);
 
 impl LazyRing {
     /// Submit one FSYNC SQE per fd and await completion of all of them. Drains

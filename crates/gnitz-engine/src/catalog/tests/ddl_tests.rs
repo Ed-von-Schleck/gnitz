@@ -38,7 +38,7 @@ fn test_identifiers() {
 #[test]
 fn test_bootstrap() {
     let dir = temp_dir("bootstrap");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     assert!(engine.has_schema("_system"));
     assert!(engine.has_schema("public"));
@@ -52,7 +52,7 @@ fn test_bootstrap() {
     drop(engine); // Release WAL locks before re-open
 
     // Idempotent re-open: bootstrap must not duplicate records
-    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(count_records(engine2.sys_store_mut(SysFamily::Schema)), schemas_before);
     assert_eq!(count_records(engine2.sys_store_mut(SysFamily::Table)), tables_before);
     engine2.close();
@@ -70,7 +70,7 @@ fn test_bootstrap() {
 #[test]
 fn bootstrap_self_description_matches_the_wire_column_lists() {
     let dir = temp_dir("bootstrap_self_description");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Every live COL_TAB row, grouped by the table it describes.
     let mut described: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
@@ -116,7 +116,7 @@ fn bootstrap_self_description_matches_the_wire_column_lists() {
 #[test]
 fn test_ddl() {
     let dir = temp_dir("ddl");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let init_schemas = count_records(engine.sys_store_mut(SysFamily::Schema));
     let init_tables = count_records(engine.sys_store_mut(SysFamily::Table));
@@ -158,7 +158,7 @@ fn test_ddl() {
 #[test]
 fn test_edge_cases() {
     let dir = temp_dir("edge_cases");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
 
     // 1. Drop non-existent schema
@@ -280,7 +280,7 @@ fn test_edge_cases() {
 #[test]
 fn test_nonempty_schema_drop_rejected() {
     let dir = temp_dir("nonempty_schema_drop_rejected");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     engine.create_schema("s").unwrap();
     let tid = engine
@@ -327,7 +327,7 @@ fn test_restart_full() {
     let first_tid;
 
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         engine.create_schema("marketing").unwrap();
         first_tid = engine.create_table("marketing.products", &cols, &[0]).unwrap();
 
@@ -341,7 +341,7 @@ fn test_restart_full() {
     }
 
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert!(engine.has_schema("marketing"));
         assert!(engine.get_by_name("marketing", "products").is_some());
         // Dropped should stay gone
@@ -372,7 +372,7 @@ fn test_restart_long_strings() {
     assert!(long_name.len() > gnitz_wire::SHORT_STRING_THRESHOLD);
 
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         engine.create_schema("longtest").unwrap();
         let cols = vec![col_def("id", type_code::U64), col_def(long_name, type_code::STRING)];
         engine.create_table("longtest.tbl", &cols, &[0]).unwrap();
@@ -380,7 +380,7 @@ fn test_restart_long_strings() {
         drop(engine);
     }
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert!(engine.get_by_name("longtest", "tbl").is_some());
         // Verify column name survived out-of-line blob round-trip
         let tid = engine.get_by_name("longtest", "tbl").unwrap();
@@ -397,7 +397,7 @@ fn test_restart_long_strings() {
 #[test]
 fn test_edge_cases_extended() {
     let dir = temp_dir("edge_ext");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
 
     // #16. Multiple dots in qualified name — second part contains dot
@@ -429,7 +429,7 @@ fn test_edge_cases_extended() {
 #[test]
 fn test_nullable_pk_rejected() {
     let dir = temp_dir("nullable_pk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![nullable_def("id", type_code::U64), col_def("name", type_code::STRING)];
     let err = engine.create_table("public.bad_pk_null", &cols, &[0]).unwrap_err();
@@ -453,7 +453,7 @@ fn test_nullable_pk_rejected() {
 #[test]
 fn test_hook_table_register_rejects_malformed_pk() {
     let dir = temp_dir("pk_reject");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Columns: [c0 U64 non-null, c1 STRING non-null, c2 U64 nullable, c3 F32 non-null].
     let col_defs = vec![
@@ -504,7 +504,7 @@ fn test_hook_table_register_rejects_malformed_pk() {
 #[test]
 fn test_pk_list_round_trips_into_registered_schema() {
     let dir = temp_dir("pk_list_roundtrip");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("a", type_code::U64), col_def("b", type_code::U64)];
 
@@ -543,7 +543,7 @@ fn test_pk_list_round_trips_into_registered_schema() {
 #[test]
 fn test_drop_view_removes_directory() {
     let dir = temp_dir("drop_view_dir");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // A view needs a base table to reference.
     let base_cols = vec![col_def("id", type_code::U64)];
@@ -599,7 +599,7 @@ fn test_drop_view_removes_directory() {
 #[test]
 fn test_drop_view_cascades_columns_and_circuit_rows() {
     let dir = temp_dir("drop_view_cascade");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let base_tid = engine
         .create_table("public.base", &[col_def("id", type_code::U64)], &[0])
@@ -682,7 +682,7 @@ fn ddl_emitters_use_no_raw_handle_capability() {
 #[test]
 fn drop_cascade_broadcasts_children_before_parents() {
     let dir = temp_dir("drop_cascade_broadcast_order");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Table with one (non-unique) secondary index.
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
@@ -733,7 +733,7 @@ fn drop_cascade_broadcasts_children_before_parents() {
 #[test]
 fn table_retract_applies_qname_before_id() {
     let dir = temp_dir("table_retract_qname_before_id");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
 
@@ -782,7 +782,7 @@ fn table_retract_applies_qname_before_id() {
 #[test]
 fn replicated_bit_is_transitive_and_survives_replay() {
     let dir = temp_dir("replicated_bit_transitive");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
 
@@ -841,7 +841,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     engine.close();
     drop(engine); // release locks before re-open
 
-    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert_stamps(&engine2, "after replay");
     engine2.close();
 

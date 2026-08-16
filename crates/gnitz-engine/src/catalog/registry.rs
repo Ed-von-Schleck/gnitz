@@ -317,7 +317,7 @@ impl CatalogEngine {
     /// stamped `G` (→ silently resumed as stale) with the SAL already consumed.
     /// Advancing the durable `_sequences` generation from the recovered `G` to
     /// `G+1` here means any crash from now until `boot_checkpoint` leaves durable
-    /// gen ≥ `G+1` while those views are stamped `G`, so the per-partition
+    /// gen ≥ `G+1` while those views are stamped `G`, so the per-child
     /// generation verdict forces a full rebuild. Every crash window is covered:
     /// windows inside `boot_checkpoint` by its own gen bump before the ephemeral
     /// stamp, the reset→boot_checkpoint gap by this one.

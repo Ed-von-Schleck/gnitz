@@ -17,21 +17,38 @@ use super::manifest::PreparedManifest;
 use super::read_cursor::{self, ReadCursor};
 use super::run::{pk_match_rows_from, Run, StoredRow};
 use super::run_set::RunSet;
-use super::shard_index::{ShardEntry, ShardIndex};
+use super::shard_index::ShardIndex;
 #[cfg(test)]
 use super::shard_reader::MappedShard;
 use crate::schema::SchemaDescriptor;
 
-/// Hard per-table (per child `Table` = per partition) heap ceiling for the RAM
-/// tier. A flush that would exceed it folds first; if the folded net state still
-/// exceeds it, the tier spills to a shard file. Bounds heap at this value per
-/// table at all times. The aggregate un-spilled RAM across the cluster is
-/// bounded by the un-checkpointed SAL tail: every ingested byte flows through
-/// the fsynced SAL, and a spill frees the RAM.
+/// Hard per-`Table` (= per relation per worker) heap ceiling for the RAM tier. A
+/// flush that would exceed it folds first; if the folded net state still exceeds
+/// it, the tier spills to a shard file. Bounds heap at this value per table at
+/// all times. The aggregate un-spilled RAM across the cluster is bounded by the
+/// un-checkpointed SAL tail: every ingested byte flows through the fsynced SAL,
+/// and a spill frees the RAM.
 ///
-/// Swept jointly with `run_set::FOLD_THRESHOLD` on `test_view_maintenance`
-/// (W=4): 8 MiB regressed at both threshold 16 and 32, so 4 MiB stays.
-const INMEM_CEILING: usize = 4 * 1024 * 1024;
+/// Swept at the **production** checkpoint cadence (`GNITZ_SAL_BYTES` at its 1 GiB
+/// default, threshold 75% of it), 4M rows, W=4, btrfs: at 4 MiB a worker's single
+/// store wrote 98.7 MB of RAM-tier spill per 4M rows (~25 B/row) that the old
+/// 256-child-per-relation layout did not; at 32 MiB that spill is gone and
+/// throughput sits 23–28% above that layout, for +45 MB of cluster RSS. An
+/// earlier sweep found this constant flat from 4 to 128 MiB, but ran at a 4 MiB
+/// checkpoint threshold — 192× more frequent than production — which drains the
+/// tier continuously and is exactly the regime where the ceiling cannot bind.
+///
+/// Spilling past the ceiling stays the intended safety valve; 32 MiB is where
+/// ordinary ingest stops reaching it, not a promise that nothing will.
+const INMEM_CEILING: usize = 32 * 1024 * 1024;
+
+/// Memtable arena of every store [`Table::new`] opens — every system table,
+/// every user relation, every view's operator scratch. Measured on btrfs, W=4,
+/// 4 views, 200k rows, interleaved ×3: 256 KiB and 1 MiB are indistinguishable
+/// in total stall (545/543/540 ms against 544/563/550 ms), so the smaller value
+/// stands. A separate non-interleaved sweep appeared to show 256 KiB winning by
+/// 1.5×; interleaving dissolved it.
+const DEFAULT_ARENA: u64 = 256 << 10;
 
 // ---------------------------------------------------------------------------
 // RecoverySource
@@ -85,10 +102,8 @@ impl RecoverySource {
 
 /// Outcome of `Table::flush_prepare`.
 pub(in crate::storage) enum FlushOutcome {
-    /// Nothing left to publish: a `Rederive` table folded into the RAM tier
-    /// (no file I/O), or a `SalReplay` table whose memtable and RAM tier are
-    /// net-empty with no unpublished spills and no compaction pending (the
-    /// SAL covers it).
+    /// Nothing to publish: a rederived table on the base round, which folded into
+    /// the RAM tier with no file I/O.
     Done,
     /// `SalReplay`: the folded shard is written at its final name (unsynced) and
     /// a manifest `.tmp` is staged; the barrier fdatasyncs `sync_paths` then
@@ -167,6 +182,12 @@ pub struct Table {
 
     current_lsn: u64,
 
+    /// This child set's layout sequence. Loaded at open and re-stamped by every
+    /// publish, so it survives checkpoints; the boot relayout stamps a target set
+    /// one above its source's, which is what decides the live set when two
+    /// complete sets survive a crash.
+    layout_seq: u64,
+
     /// Reused candidate pool for `retract_pk_bytes`' grouping pass; cleared per
     /// call (dropping its `Rc`s) with capacity retained, so the path stops
     /// allocating once warmed up.
@@ -187,6 +208,18 @@ impl Table {
         dir: &str,
         schema: SchemaDescriptor,
         table_id: u32,
+        recovery_source: RecoverySource,
+    ) -> Result<Self, StorageError> {
+        Self::with_arena(dir, schema, table_id, DEFAULT_ARENA, recovery_source)
+    }
+
+    /// [`Table::new`] with an explicit memtable arena. Every production store
+    /// takes `DEFAULT_ARENA`; this exists for the tests that drive spill
+    /// pressure by shrinking it.
+    pub(crate) fn with_arena(
+        dir: &str,
+        schema: SchemaDescriptor,
+        table_id: u32,
         arena_size: u64,
         recovery_source: RecoverySource,
     ) -> Result<Self, StorageError> {
@@ -199,7 +232,7 @@ impl Table {
         //     would hold nothing, ever. `open_dirfd` (the single choke point
         //     every file write goes through) creates it lazily on the first
         //     spill, making a Rederive open free of filesystem work (this is
-        //     what keeps an index circuit's per-partition scratch tables
+        //     what keeps an index circuit's per-worker scratch tables
         //     syscall-free). A dir left by a previous boot still gets
         //     its stale shards erased (a missing dir erases nothing).
         //   RederiveCheckpointed → load only when the manifest's checkpoint
@@ -229,7 +262,8 @@ impl Table {
                 // worker abort with no client left to tell.
                 set_nocow_dir(&ensure_dir(dir)?);
                 let cpath = super::super::cstr(super::manifest::path(dir))?;
-                let generation_matches = super::manifest::peek_generation(&cpath)? == Some(committed);
+                let generation_matches =
+                    super::manifest::peek_header(&cpath)?.map(|h| h.checkpoint_gen) == Some(committed);
                 if !generation_matches {
                     erase_stale_shards(dir, table_id);
                 }
@@ -247,20 +281,27 @@ impl Table {
             directory: dir.to_string(),
             recovery_source,
             current_lsn: 1,
+            layout_seq: 0,
             retract_scratch: Vec::new(),
             cached_full_scan: None,
         };
 
         if load_shards {
-            table.shard_index.load_manifest(&table.manifest_full_path())?;
+            let header = table.shard_index.load_manifest(&table.manifest_full_path())?;
             table.shard_index.gc_orphans();
             table.current_lsn = table.shard_index.max_lsn() + 1;
             if table.current_lsn == 0 {
                 table.current_lsn = 1;
             }
+            table.layout_seq = header.map_or(0, |h| h.layout_seq);
         }
 
         Ok(table)
+    }
+
+    /// The directory this store's shards live in — the child it is homed at.
+    pub fn directory(&self) -> &str {
+        &self.directory
     }
 
     /// Full path of this table's manifest — a pure function of the directory.
@@ -270,29 +311,23 @@ impl Table {
         super::manifest::path(&self.directory)
     }
 
-    /// Fallible half of a column-ALTER schema swap: re-open every registered
-    /// shard under `schema`, mutating nothing. Empty for an equal-region ALTER
-    /// (RENAME COLUMN, DROP COLUMN, DROP NOT NULL); one entry per shard for the
-    /// region-count growth of ADD COLUMN. The caller runs this over every
-    /// partition of a store before committing any of them, so a failure on one
-    /// partition cannot leave an earlier one already widened.
-    pub(super) fn prepare_swap_schema(&self, schema: &SchemaDescriptor) -> Result<Vec<ShardEntry>, StorageError> {
-        self.shard_index.reopen_all(schema)
-    }
-
-    /// Infallible half: publish `schema` across this partition, installing the
-    /// shard handles [`prepare_swap_schema`](Self::prepare_swap_schema) staged.
+    /// Publish `schema` across this store (any column ALTER): re-open every
+    /// registered shard under it, then install the result.
     ///
-    /// Widening the resident tiers reads `self.schema` as the runs' input
-    /// schema, so it must precede the reassignment. `cached_full_scan` is
-    /// dropped either way: it was materialized under the old column set / null
-    /// interpretation.
-    pub(super) fn commit_swap_schema(&mut self, schema: SchemaDescriptor, staged: Vec<ShardEntry>) {
+    /// The re-open runs first and mutates nothing, so a failure leaves the store
+    /// entirely on the old schema, never half-widened where a NULL could
+    /// consolidate against a real `0`. Widening the resident tiers reads
+    /// `self.schema` as the runs' input schema, so it must precede the
+    /// reassignment. `cached_full_scan` was materialized under the old column
+    /// set, so it is dropped either way.
+    pub fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
+        let staged = self.shard_index.reopen_all(&schema)?;
         self.memtable.widen_runs(&self.schema, &schema);
         self.ram_tier.widen_runs(&self.schema, &schema);
         self.shard_index.install_reopened(staged, schema);
         self.schema = schema;
         self.cached_full_scan = None;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -300,7 +335,7 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// Ingest an already-constructed Batch into the memtable.
-    /// Used by PartitionedTable after hash-routing.
+    /// The relation-store ingest entry point.
     pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         if batch.count == 0 {
             return Ok(());
@@ -660,9 +695,9 @@ mod tests {
         make_batch_raw(&make_schema_u64_i64(), rows)
     }
 
-    /// `Table::new(...)` with the per-test boilerplate folded away.
+    /// `Table::with_arena(...)` with the per-test boilerplate folded away.
     fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, id: u32, arena: u64, rs: RecoverySource) -> Table {
-        Table::new(dir.to_str().unwrap(), schema, id, arena, rs).unwrap()
+        Table::with_arena(dir.to_str().unwrap(), schema, id, arena, rs).unwrap()
     }
 
     /// Names of the "flat" `shard_{table_id}_{lsn}.db` files directly in `dir` —
@@ -1048,6 +1083,53 @@ mod tests {
         );
     }
 
+    /// A table's layout sequence is loaded at open and re-stamped by every
+    /// publish, so it survives an arbitrary number of checkpoints. That
+    /// persistence is what lets the boot relayout resolve two complete sets after
+    /// a crash by picking the newer one — a publish that reset it to 0 would make
+    /// a stale set win.
+    #[test]
+    fn base_publish_preserves_the_layout_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("layout_seq");
+        let schema = make_schema_u64_i64();
+        let cpath = crate::storage::cstr(super::super::manifest::path(tdir.to_str().unwrap())).unwrap();
+        let peek_layout_seq =
+            |p: &std::ffi::CStr| super::super::manifest::peek_header(p).unwrap().map(|h| h.layout_seq);
+
+        // Stamp a set at sequence 7, as the relayout's target write would.
+        {
+            let mut t = new_table(&tdir, schema, 88, 1 << 20, RecoverySource::SalReplay);
+            t.ingest_owned_batch(make_batch(&[(1, 1, 10)])).unwrap();
+            t.flush().unwrap();
+            let (entries, header) = super::super::manifest::read_file(&cpath).unwrap().unwrap();
+            super::super::manifest::prepare_file(
+                &cpath,
+                &entries,
+                super::super::manifest::ManifestHeader {
+                    layout_seq: 7,
+                    ..header
+                },
+            )
+            .unwrap()
+            .commit()
+            .unwrap();
+        }
+
+        // Two further checkpoints, one with new rows and one without, must both
+        // re-stamp 7 rather than reset it.
+        let mut t = new_table(&tdir, schema, 88, 1 << 20, RecoverySource::SalReplay);
+        t.ingest_owned_batch(make_batch(&[(2, 1, 20)])).unwrap();
+        t.flush().unwrap();
+        assert_eq!(peek_layout_seq(&cpath), Some(7));
+        t.flush().unwrap();
+        assert_eq!(
+            peek_layout_seq(&cpath),
+            Some(7),
+            "an unchanged publish must not reset the layout sequence"
+        );
+    }
+
     /// Table::new on a corrupted manifest must return Err and must not run
     /// gc_orphans — any stray shard files must survive untouched.
     #[test]
@@ -1065,7 +1147,7 @@ mod tests {
         let stray = tdir.join("shard_200_1.db");
         std::fs::write(&stray, b"orphan").unwrap();
 
-        let result = Table::new(tdir.to_str().unwrap(), schema, 200, 1 << 20, RecoverySource::SalReplay);
+        let result = Table::with_arena(tdir.to_str().unwrap(), schema, 200, 1 << 20, RecoverySource::SalReplay);
         assert!(result.is_err(), "Table::new must fail on corrupted manifest");
         assert!(stray.exists(), "stray shard must survive when gc_orphans did not run");
     }
@@ -1908,7 +1990,7 @@ mod tests {
     /// F1 regression. A `SalReplay` table whose only post-checkpoint write
     /// spilled — clearing the RAM tier, one lone L0 shard, no compaction, so no
     /// manifest was published — must still barrier-flush to `Pending` (via the
-    /// `has_unsynced` gate disjunct) and durably capture the spill. Without the
+    /// every barrier publishes) and durably capture the spill. Without the
     /// disjunct the barrier returns `Empty`, the spill is never manifested, and a
     /// reopen's `gc_orphans` deletes it — acknowledged rows lost.
     #[test]
@@ -2026,7 +2108,7 @@ mod tests {
         let tdir = dir.path().join("gen_republish");
         let schema = make_schema_u64_i64();
         let manifest_path = std::ffi::CString::new(tdir.join("manifest.bin").to_str().unwrap()).unwrap();
-        let read_generation = |path: &std::ffi::CStr| -> u64 { read_file(path).unwrap().unwrap().1.generation };
+        let read_generation = |path: &std::ffi::CStr| -> u64 { read_file(path).unwrap().unwrap().1.checkpoint_gen };
 
         // Publish at generation G1 with a compaction pending.
         let mut t = new_table(&tdir, schema, 7900, 128, RecoverySource::SalReplay);
@@ -2129,7 +2211,7 @@ mod tests {
             (tdir, manifest)
         };
         let reopen = |tdir: &std::path::Path| {
-            Table::new(
+            Table::with_arena(
                 tdir.to_str().unwrap(),
                 schema,
                 table_id,
@@ -2176,24 +2258,35 @@ mod tests {
         );
     }
 
-    /// The three-disjunct barrier gate, one arm each: RAM empty + nothing →
-    /// `Empty`; RAM empty + a lone unsynced spill → `Pending` with the spill in
-    /// the sweep list; RAM empty + compaction pending only (unsynced cleared) →
-    /// `Pending` with an empty sweep and no new shard.
+    /// A `SalReplay` table publishes on every barrier, whatever its tier holds:
+    /// an unchanged one re-stamps its manifest (which is what makes "every
+    /// `w{k}of{n}` has a manifest" a decidable completeness test for the boot
+    /// relayout), a lone unsynced spill lands in the sweep list, and compaction
+    /// outputs are swept while the inputs they superseded are not.
     #[test]
     fn barrier_gate_matrix() {
         let schema = make_schema_u64_i64();
 
-        // Arm 1 — clean tier gates to Empty.
+        // Arm 1 — an unchanged tier still publishes, with nothing to sweep and no
+        // new shard.
         {
             let dir = tempfile::tempdir().unwrap();
             let tdir = dir.path().join("gate_empty");
             let mut t = new_table(&tdir, schema, 7900, 1 << 20, RecoverySource::SalReplay);
             t.ingest_owned_batch(make_batch(&[(1, 1, 1)])).unwrap();
             t.flush().unwrap();
-            assert!(
-                matches!(t.flush_prepare(FlushRound::Base).unwrap(), FlushOutcome::Done),
-                "a clean SalReplay tier (no RAM, no unsynced, no pending) gates to Done"
+            let shards_before = shard_db_files(&tdir, 7900).len();
+            match t.flush_prepare(FlushRound::Base).unwrap() {
+                FlushOutcome::Pending(w) => assert!(
+                    w.sync_paths().is_empty(),
+                    "an unchanged tier has nothing left to fdatasync"
+                ),
+                FlushOutcome::Done => panic!("a SalReplay table must publish even when unchanged"),
+            }
+            assert_eq!(
+                shard_db_files(&tdir, 7900).len(),
+                shards_before,
+                "an empty RAM tier publishes no new shard"
             );
         }
 

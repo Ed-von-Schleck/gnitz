@@ -183,7 +183,7 @@ impl CatalogEngine {
             self.validate_fk_column(cd, tid, pk.as_slice(), self_pk_type)?;
         }
 
-        // This in-process test shortcut always builds partitioned, full-PK-distributed
+        // This in-process test shortcut always builds a keyed, full-PK-distributed
         // tables (`replicated = false`, `k = 0` = default). REPLICATED and CLUSTER BY
         // routing are exercised through the catalog hook / SQL planner, not here.
         let flags = gnitz_wire::pack_table_flags(false, 0);

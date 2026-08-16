@@ -2473,7 +2473,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
 
     // Publish only after fsync, then close the zone and defer dir removals to the
     // next checkpoint (whose worker-ACK barrier proves every worker consumed past
-    // this DROP; removing here races a lagging worker's partition-dir create).
+    // this DROP; removing here races a lagging worker's child-dir create).
     shared.lsn_alloc.publish(zone_lsn);
     unsafe {
         (*cat_ptr_raw).ctx.close_ddl_zone();

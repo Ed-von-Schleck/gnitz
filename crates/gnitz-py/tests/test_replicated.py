@@ -830,7 +830,7 @@ def test_replicated_band_join_inner_and_left(client):
 
 def test_replicated_pure_range_join_inner_and_left(client):
     """Pure-range join (`a.x < b.y`, n_eq=0) over two replicated tables. The broadcast
-    input is normally trimmed by a PartitionFilter to the owning worker's slice; under
+    input is normally trimmed by a WorkerFilter to the owning worker's slice; under
     an all-replicated local run that filter must be gone (Part B) or it discards rows.
     Includes a LEFT with a NULL range key, exercising the second (NULL-branch) filter."""
     sn = "r" + _uid()
@@ -867,7 +867,7 @@ def test_replicated_pure_range_join_inner_and_left(client):
 
 def test_replicated_pure_range_exists(client):
     """Pure-range EXISTS/NOT EXISTS (`b.y < a.x` -> `a.x > MIN(b.y)`) over two
-    replicated tables. Carries the same broadcast-trim PartitionFilters as the
+    replicated tables. Carries the same broadcast-trim WorkerFilters as the
     pure-range LEFT join (Part B). A NULL outer range key exercises the NOT EXISTS
     NULL-branch filter."""
     sn = "r" + _uid()

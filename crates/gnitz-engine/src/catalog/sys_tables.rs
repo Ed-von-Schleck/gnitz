@@ -48,7 +48,7 @@ pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
 ///
 /// It sits well below the true `u32` physical ceiling a relation id narrows to at
 /// every boundary — the SAL group header carries it as a u32 (`sal_begin_group`),
-/// `Table` stores `table_id: u32`, `PartitionedTable::new`/`ShardIndex::new` take
+/// `Table` stores `table_id: u32`, `Table::new`/`ShardIndex::new` take
 /// a u32, `Batch::encode_to_wire` stamps a u32, and shard **file names on disk**
 /// embed it (`shard_{tid}_{lsn}.db`). The `i64` used for `dag.tables` keys and
 /// `target_id` parameters is a convenience width over that u32. `1<<31` is a safe
@@ -419,9 +419,6 @@ pub(super) fn idx_tab_batch(
     );
     bb.finish()
 }
-
-// Default arena sizes for system tables and user tables
-pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024; // 256 KB
 
 // ---------------------------------------------------------------------------
 // Schema derivation from the shared wire column slices

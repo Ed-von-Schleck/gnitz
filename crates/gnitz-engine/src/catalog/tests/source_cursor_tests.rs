@@ -43,7 +43,7 @@ fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid
 /// `(engine, base tid, view id)`.
 fn fixture_with(name: &str, bound: Option<ScanBound>, val_of: impl Fn(u64) -> u64) -> (CatalogEngine, i64, i64) {
     let dir = temp_dir(name);
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
 
@@ -91,9 +91,9 @@ fn val_bound(start: Cut, end: Cut) -> ScanBound {
 
 /// Drain a cursor to `(pk, weight)` pairs, in chunks of `chunk` so a chunk
 /// boundary lands mid-range.
-fn drain_all(engine: &CatalogEngine, source: i64, cur: &mut SourceCursor, chunk: usize) -> Vec<(u128, i64)> {
+fn drain_all(cur: &mut SourceCursor, chunk: usize) -> Vec<(u128, i64)> {
     let mut out = Vec::new();
-    while let Some(b) = cur.drain_chunk(engine.partitioned_store(source), chunk) {
+    while let Some(b) = cur.drain_chunk(chunk) {
         for i in 0..b.count {
             out.push((b.get_pk(i), b.get_weight(i)));
         }
@@ -106,7 +106,7 @@ fn drain_all(engine: &CatalogEngine, source: i64, cur: &mut SourceCursor, chunk:
 /// compared against.
 fn full_drain(engine: &mut CatalogEngine, source: i64) -> Vec<(u128, i64)> {
     let mut cur = SourceCursor::Full(Box::new(engine.open_store_cursor(source).unwrap()));
-    drain_all(engine, source, &mut cur, 64)
+    drain_all(&mut cur, 64)
 }
 
 /// The headline case: a selective range takes the index, and yields exactly the
@@ -125,7 +125,7 @@ fn bounded_cursor_yields_in_range_rows_across_chunks() {
 
     // Chunk of 3 forces several boundaries inside the range, each re-probing the
     // held base cursor backwards.
-    let got = drain_all(&engine, tid, &mut cur, 3);
+    let got = drain_all(&mut cur, 3);
     let want: Vec<(u128, i64)> = (50..60u128).map(|i| (i, 1)).collect();
     assert_eq!(got, want);
 
@@ -138,21 +138,21 @@ fn bounded_cursor_yields_in_range_rows_across_chunks() {
     engine.close();
 }
 
-/// The gather routes each collected PK to its own partition, so the chunk it
-/// emits must still be strictly PK-ascending — `drain_chunk` certifies
+/// The gather walks the collected PKs in ascending order, so the chunk it emits
+/// must be strictly PK-ascending — `drain_chunk` certifies
 /// `Layout::Consolidated`, which `debug_verify_consolidated` checks — and the
 /// whole drain must be the same multiset at every chunk size, unchunked
 /// included.
 #[test]
 fn bounded_drain_is_chunk_size_invariant_and_ascending() {
-    // val ∈ [500, 600) ⇒ ids 50..60, scattered over ten partitions.
+    // val ∈ [500, 600) ⇒ ids 50..60.
     let (mut engine, tid, vid) = fixture("srccur_chunkinv", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     let want: Vec<(u128, i64)> = (50..60u128).map(|i| (i, 1)).collect();
     for chunk in [1usize, 3, 7, 64, usize::MAX] {
         let mut cur = engine.open_source_cursor(vid, tid).unwrap();
         assert!(matches!(cur, SourceCursor::Bounded(_)), "chunk {chunk}");
         let mut got = Vec::new();
-        while let Some(b) = cur.drain_chunk(engine.partitioned_store(tid), chunk) {
+        while let Some(b) = cur.drain_chunk(chunk) {
             for i in 1..b.count {
                 assert!(b.get_pk(i - 1) < b.get_pk(i), "chunk {chunk}: rows out of PK order");
             }
@@ -166,11 +166,9 @@ fn bounded_drain_is_chunk_size_invariant_and_ascending() {
     engine.close();
 }
 
-/// Per-partition exhaustion is **local**. A probed PK past its own partition's
-/// last key says nothing about the PKs still to come in other partitions, so the
-/// gather must skip it and keep going: breaking out of the PK loop there — which
-/// is correct only over a whole-store cursor — would silently drop every later
-/// row of the chunk.
+/// A collected PK with no live base row says nothing about the PKs still to come
+/// in the same chunk, so the gather must skip it and keep going: breaking out of
+/// the PK loop there would silently drop every later row of the chunk.
 ///
 /// The trigger is a live index entry whose base row is gone. It is written by
 /// retracting the base row **alone**, straight into the store: the DML path
@@ -180,16 +178,10 @@ fn bounded_drain_is_chunk_size_invariant_and_ascending() {
 fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
     let (mut engine, tid, vid) = fixture("srccur_midchunk", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     let schema = engine.get_schema_desc(tid).unwrap();
-    let part = |id: u64| {
-        let opk = crate::schema::key::opk_key(&schema, &(id as u128).to_le_bytes());
-        schema.partition_for_pk(opk.pk_bytes())
-    };
-    // An in-range id whose partition holds no larger base key: once it is gone,
-    // the probe leaves that partition exhausted, while ids above it — in other
-    // partitions — are still to come in the same chunk.
-    let victim = (50u64..59)
-        .find(|&id| (id + 1..NBASE).all(|other| part(other) != part(id)))
-        .expect("an in-range id whose partition holds no larger base key");
+    // An id in the middle of the range, so its index entry is still collected
+    // while its base row is gone and ids above it are still to come in the same
+    // chunk.
+    let victim = 55u64;
 
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(victim as u128, -1);
@@ -205,26 +197,22 @@ fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
         .ingest_borrowed_batch(&retraction)
         .unwrap();
 
-    // The premise this pins: the victim's partition is now exhausted at its key,
-    // which is what makes the gather's per-PK probe report "nothing at or past"
-    // in the middle of the chunk.
+    // The premise this pins: the store now holds no live row at the victim's key,
+    // which is what makes the gather's per-PK probe copy nothing in the middle of
+    // the chunk.
     let victim_key = crate::schema::key::opk_key(&schema, &(victim as u128).to_le_bytes());
-    let mut probe = engine
-        .partitioned_store(tid)
-        .unwrap()
-        .open_cursor_for_key(victim_key.pk_bytes())
-        .unwrap();
-    probe.advance_to(victim_key.pk_bytes());
+    let probe_entry = engine.dag.tables.get(&tid).unwrap();
+    let mut probe = probe_entry.open_cursor();
     assert!(
-        !probe.valid,
-        "the victim's partition must hold nothing at or past its key"
+        !probe.advance_to_exact_live(victim_key.pk_bytes()),
+        "the store must hold no live row at the victim's key"
     );
     drop(probe);
 
     // One chunk holds the whole range, so the absent PK sits in the middle of it.
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
-    let got = drain_all(&engine, tid, &mut cur, 64);
+    let got = drain_all(&mut cur, 64);
     let want: Vec<(u128, i64)> = (50..60u128).filter(|&i| i != victim as u128).map(|i| (i, 1)).collect();
     assert_eq!(
         got, want,
@@ -233,8 +221,8 @@ fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
     engine.close();
 }
 
-/// The gate is measured against `PartitionedTable::estimated_rows` — the raw run
-/// and shard rows across the local partitions — so its verdict must flip exactly
+/// The gate is measured against `Table::estimated_rows` — the raw run and shard
+/// rows of this worker's store — so its verdict must flip exactly
 /// at 1/16 of the base. 200 rows ⇒ 12 in-range entries take the index, 13 do not.
 #[test]
 fn selectivity_gate_flips_at_one_sixteenth_of_the_base() {
@@ -251,45 +239,6 @@ fn selectivity_gate_flips_at_one_sixteenth_of_the_base() {
         matches!(engine.open_source_cursor(vid, tid).unwrap(), SourceCursor::Full(_)),
         "13 of 200 rows is past it"
     );
-    engine.close();
-}
-
-/// A range whose every source PK lands in a partition this process does not own
-/// resolves to nothing. The probe declines those keys — it must not fall back to
-/// a whole-store cursor, which would answer for partitions the worker never
-/// holds.
-#[test]
-fn range_over_unowned_partitions_resolves_nothing() {
-    let (mut engine, tid, _vid) = fixture("srccur_unowned", None);
-    let schema = engine.get_schema_desc(tid).unwrap();
-    let part = |id: u64| {
-        let opk = crate::schema::key::opk_key(&schema, &(id as u128).to_le_bytes());
-        schema.partition_for_pk(opk.pk_bytes())
-    };
-    // Keep exactly one partition, chosen to hold none of the ids the range picks.
-    let banned: std::collections::HashSet<usize> = (50..60u64).map(part).collect();
-    let keep = (0..crate::storage::NUM_PARTITIONS).find(|p| !banned.contains(&(*p as usize)));
-    let keep = keep.expect("a partition holding none of the ten in-range ids");
-    engine
-        .dag
-        .tables
-        .get(&tid)
-        .unwrap()
-        .handle
-        .as_partitioned_mut()
-        .unwrap()
-        .close_partitions_outside(keep, keep + 1);
-
-    // The un-gated wire range seek: no selectivity fallback to muddy the result.
-    let r = engine
-        .seek_by_index_range(
-            tid,
-            &[1],
-            &RangeDescriptor::new(&[], Cut::Before(500), Cut::Before(600)),
-        )
-        .unwrap()
-        .0;
-    assert!(r.is_none(), "no PK of the range is local, so nothing resolves");
     engine.close();
 }
 
@@ -314,7 +263,7 @@ fn bounded_cursor_backward_probe_across_exhausted_chunk() {
     // Chunk of 3: chunk 0 collects vals {10,20,30} ⇒ ids {197,198,199}, ending on
     // the base's last PK group and exhausting the cursor; each later chunk's first
     // probe is a lower id, seeking backward from that invalid cursor.
-    let got = drain_all(&engine, tid, &mut cur, 3);
+    let got = drain_all(&mut cur, 3);
     let want: Vec<(u128, i64)> = (190..200u128).map(|i| (i, 1)).collect();
     assert_eq!(got, want, "every in-range row emitted across backward chunk boundaries");
 
@@ -343,7 +292,7 @@ fn bounded_and_full_agree_with_a_retracted_row_single_source() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
 
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
-    let got = drain_all(&engine, tid, &mut cur, 4);
+    let got = drain_all(&mut cur, 4);
     let want: Vec<(u128, i64)> = (50..60u128).filter(|&i| i != 55).map(|i| (i, 1)).collect();
     assert_eq!(got, want, "a retracted row must be absent from the bounded scan");
 
@@ -374,7 +323,7 @@ fn updated_indexed_column_emits_the_row_once() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
 
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
-    let got = drain_all(&engine, tid, &mut cur, 64);
+    let got = drain_all(&mut cur, 64);
     let mut want: Vec<(u128, i64)> = (50..60u128).map(|i| (i, 1)).collect();
     want.push((10, 1));
     want.sort_unstable();
@@ -399,7 +348,7 @@ fn range_spanning_old_and_new_indexed_value_emits_once() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
 
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
-    let got = drain_all(&engine, tid, &mut cur, 64);
+    let got = drain_all(&mut cur, 64);
     let want: Vec<(u128, i64)> = (50..60u128).map(|i| (i, 1)).collect();
     assert_eq!(
         got, want,
@@ -415,7 +364,7 @@ fn degenerate_point_range_returns_one_key_group() {
     let (mut engine, tid, vid) = fixture("srccur_point", Some(val_bound(Cut::Before(730), Cut::After(730))));
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
-    assert_eq!(drain_all(&engine, tid, &mut cur, 64), vec![(73u128, 1)]);
+    assert_eq!(drain_all(&mut cur, 64), vec![(73u128, 1)]);
     engine.close();
 }
 
@@ -467,7 +416,7 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
     // the drain would stop there and lose every later id.
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
-    let got = drain_all(&engine, tid, &mut cur, 1);
+    let got = drain_all(&mut cur, 1);
     let want: Vec<(u128, i64)> = (50..60u128).map(|i| (i, 1)).collect();
     assert_eq!(
         got, want,
@@ -490,7 +439,7 @@ fn unselective_range_falls_back_to_full_scan() {
         matches!(cur, SourceCursor::Full(_)),
         "an unselective range must full-scan"
     );
-    let got = drain_all(&engine, tid, &mut cur, 64);
+    let got = drain_all(&mut cur, 64);
     assert_eq!(got, full_drain(&mut engine, tid), "the gate must not consume any row");
     assert_eq!(got.len(), NBASE as usize);
     engine.close();
@@ -504,7 +453,7 @@ fn dropped_index_falls_back_to_full_scan() {
     engine.drop_index("public__base__idx_val").unwrap();
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)));
-    assert_eq!(drain_all(&engine, tid, &mut cur, 64).len(), NBASE as usize);
+    assert_eq!(drain_all(&mut cur, 64).len(), NBASE as usize);
     engine.close();
 }
 
@@ -520,7 +469,7 @@ fn inverted_range_is_empty_not_none() {
         .open_source_cursor(vid, tid)
         .expect("an empty range is Some, never None");
     assert!(matches!(cur, SourceCursor::Empty));
-    assert!(cur.drain_chunk(engine.partitioned_store(tid), 64).is_none());
+    assert!(cur.drain_chunk(64).is_none());
     engine.close();
 }
 
@@ -561,6 +510,6 @@ fn unbounded_plan_full_scans() {
     let (mut engine, tid, vid) = fixture("srccur_unbounded", None);
     let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)));
-    assert_eq!(drain_all(&engine, tid, &mut cur, 64).len(), NBASE as usize);
+    assert_eq!(drain_all(&mut cur, 64).len(), NBASE as usize);
     engine.close();
 }

@@ -1,29 +1,29 @@
-//! Exchange partition routing: `RouteMode`, `ScatterKey`, `scatter_is_pk_routed`,
+//! Exchange worker routing: `RouteMode`, `ScatterKey`, `scatter_is_pk_routed`,
 //! and the per-row routing-key helpers.
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, MemBatch};
-use gnitz_wire::{build_w_map, partition_for_key, partition_for_pk_bytes};
+use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 
 use super::super::reindex::ReindexPacker;
 use super::super::util::GroupKeyCols;
 
-/// Keep only the rows this worker owns, by packed-PK partition — the trace-side
+/// Keep only the rows this worker owns, by packed-PK hash — the trace-side
 /// counterpart of the **pure** range-join broadcast input relay. A pure range
 /// join (n_eq == 0) has no eq prefix to scatter by, so it broadcasts; every worker
 /// receives the full delta and, before it integrates into the trace, this drops
-/// the rows whose `partition_for_pk_bytes` partition is not assigned to
+/// the rows whose `worker_for_pk_bytes` owner is not
 /// `worker_id`. (A band join scatters by the eq prefix instead — its trace is
-/// already eq-prefix-partitioned and carries no `PartitionFilter`.) It is the SAME
+/// already eq-prefix-partitioned and carries no `WorkerFilter`.) It is the SAME
 /// hash the equality scatter (`RouteMode::JoinPromote`)
 /// applies to the SAME packed PK bytes, so the integrated trace is partitioned
 /// identically to a scattered equi-join trace — no trace replicates, no match
 /// duplicates. Worker identity is a compile-time constant baked into the emitted
 /// instruction; `num_workers <= 1` (single process) keeps every row.
-pub(crate) fn op_partition_filter(batch: &Batch, schema: &SchemaDescriptor, worker_id: u32, num_workers: u32) -> Batch {
+pub(crate) fn op_worker_filter(batch: &Batch, schema: &SchemaDescriptor, worker_id: u32, num_workers: u32) -> Batch {
     let n = batch.count;
     if num_workers <= 1 || n == 0 {
-        // Single process owns every partition; degenerate to identity (preserving
+        // Single process owns every row; degenerate to identity (preserving
         // the source's sorted/consolidated flags via clone_batch).
         return batch.clone_batch();
     }
@@ -31,20 +31,19 @@ pub(crate) fn op_partition_filter(batch: &Batch, schema: &SchemaDescriptor, work
     let wid = worker_id as usize;
     let mb = batch.as_mem_batch();
 
-    // Keep just this worker's partitions, routed by the same partition→worker
-    // map the equality scatter uses (division hoisted out of the row loop).
-    let w_map = build_w_map(nw);
+    // Keep just this worker's rows, routed by the same key→worker function the
+    // equality scatter uses.
     let mut indices: Vec<u32> = Vec::with_capacity(n / nw + 1);
     for i in 0..n {
-        if w_map[partition_for_pk_bytes(mb.get_pk_bytes(i))] == wid {
+        if worker_for_pk_bytes(mb.get_pk_bytes(i), nw) == wid {
             indices.push(i as u32);
         }
     }
     batch.ascending_subset(&indices, schema)
 }
 
-/// Which routing key a non-PK scatter uses; picks between `ScatterKey::Packed`
-/// and `ScatterKey::Fold` (whose docs carry the two contracts). The two keys
+/// Which routing key a non-PK scatter uses; picks between `ScatterKind::Packed`
+/// and `ScatterKind::Fold` (whose docs carry the two contracts). The two keys
 /// diverge for nullable and string columns, so the scatter caller picks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RouteMode {
@@ -62,7 +61,7 @@ pub(crate) enum RouteMode {
 ///   reindex Map stamps as the `_join_pk`, so the delta scatter and the
 ///   reindexed trace co-partition byte-for-byte. It is null-blind and
 ///   value-preserving by design — a LEFT-join NULL-key bypass row reads its
-///   canonically-zeroed key slot and routes to the `_join_pk 0` partition, the
+///   canonically-zeroed key slot and routes to the `_join_pk 0` owner, the
 ///   same place the reindex Map stamps it. (Float columns, the only type whose
 ///   OPK image would diverge from the routing hash, cannot be join keys — they
 ///   are rejected at plan time — so packing every `JoinPromote` key is exact.)
@@ -79,7 +78,7 @@ pub(crate) enum RouteMode {
 // the `ReindexPacker` and its scratch stay inline — boxing would add a heap
 // alloc and a per-row pointer chase for no benefit.
 #[allow(clippy::large_enum_variant)]
-pub(super) enum ScatterKey {
+pub(super) enum ScatterKind {
     PkBytes,
     Packed {
         packer: ReindexPacker,
@@ -90,22 +89,37 @@ pub(super) enum ScatterKey {
     },
 }
 
+/// A [`ScatterKind`] bound to the worker count it routes into. The count is
+/// carried here rather than passed per row so a scatter cannot route two rows
+/// against different cluster shapes.
+pub(super) struct ScatterKey {
+    kind: ScatterKind,
+    num_workers: usize,
+}
+
 impl ScatterKey {
     #[inline]
-    pub(super) fn new(mode: RouteMode, cols: &[u32], tcs: &[u8], schema: &SchemaDescriptor) -> Self {
-        if scatter_is_pk_routed(cols, tcs, schema) {
-            ScatterKey::PkBytes
+    pub(super) fn new(
+        mode: RouteMode,
+        cols: &[u32],
+        tcs: &[u8],
+        schema: &SchemaDescriptor,
+        num_workers: usize,
+    ) -> Self {
+        let kind = if scatter_is_pk_routed(cols, tcs, schema) {
+            ScatterKind::PkBytes
         } else {
             match mode {
-                RouteMode::JoinPromote => ScatterKey::Packed {
+                RouteMode::JoinPromote => ScatterKind::Packed {
                     packer: ReindexPacker::new(schema, cols, tcs),
                     buf: [0u8; crate::schema::MAX_PK_BYTES],
                 },
-                RouteMode::GroupKey => ScatterKey::Fold {
+                RouteMode::GroupKey => ScatterKind::Fold {
                     keys: GroupKeyCols::new(schema, cols),
                 },
             }
-        }
+        };
+        ScatterKey { kind, num_workers }
     }
 
     /// Whether this scatter routes by native PK bytes — the callers' gate for
@@ -113,33 +127,34 @@ impl ScatterKey {
     /// its source).
     #[inline]
     pub(super) fn is_pk_routed(&self) -> bool {
-        matches!(self, ScatterKey::PkBytes)
+        matches!(self.kind, ScatterKind::PkBytes)
     }
 
-    /// Route one row to its partition.
+    /// Route one row to its owning worker.
     #[inline]
-    pub(super) fn partition(&mut self, mb: &MemBatch, row: usize) -> usize {
-        match self {
-            ScatterKey::PkBytes => partition_for_pk_bytes(mb.get_pk_bytes(row)),
-            ScatterKey::Packed { packer, buf } => {
+    pub(super) fn worker(&mut self, mb: &MemBatch, row: usize) -> usize {
+        let nw = self.num_workers;
+        match &mut self.kind {
+            ScatterKind::PkBytes => worker_for_pk_bytes(mb.get_pk_bytes(row), nw),
+            ScatterKind::Packed { packer, buf } => {
                 packer.pack_into(&mut buf[..packer.out_stride], mb, row);
-                partition_for_pk_bytes(&buf[..packer.out_stride])
+                worker_for_pk_bytes(&buf[..packer.out_stride], nw)
             }
-            ScatterKey::Fold { keys } => partition_for_key(keys.key_row(mb, row)),
+            ScatterKind::Fold { keys } => worker_for_key(keys.key_row(mb, row), nw),
         }
     }
 }
 
 /// One home for the relay-scatter "route by native PK bytes" gate: strict
 /// sequence equality with the schema's PK list (set equality would route a
-/// permuted compound PK differently from `partition_for_pk_bytes`, which
+/// permuted compound PK differently from `worker_for_pk_bytes`, which
 /// hashes OPK bytes in schema order) AND no cross-width promotion — a promoted
-/// key (`tc != 0`) packs at the wider `T` via `ScatterKey::Packed`, so its
+/// key (`tc != 0`) packs at the wider `T` via `ScatterKind::Packed`, so its
 /// narrow source PK bytes must not route natively. Consulted once, in
 /// `ScatterKey::new`, so the relay scatter paths cannot drift.
 ///
 /// Deliberately NOT used by the write-path fan-out, which routes by the table's
-/// distribution prefix (`schema.partition_for_pk`) — a different hash domain
+/// distribution prefix (`schema.worker_for_pk`) — a different hash domain
 /// with no promotion concept.
 #[inline]
 pub(super) fn scatter_is_pk_routed(col_indices: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
@@ -158,62 +173,47 @@ mod tests {
     use crate::test_support::{make_batch, make_schema_u64_i64};
 
     #[test]
-    fn test_partition_filter_partitions_rows_by_owner() {
+    fn test_worker_filter_keeps_only_this_workers_rows() {
         let schema = make_schema_u64_i64();
         let num_workers = 4u32;
         let rows: Vec<(u64, i64, i64)> = (0..40u64).map(|i| (i * 7 + 1, 1, i as i64)).collect();
         let batch = make_batch(&schema, &rows);
 
-        // Each row kept by exactly the worker that owns its PK partition; the
+        // Each row kept by exactly the worker that owns its PK; the
         // union across workers is the whole batch with no duplication.
         let mut total_kept = 0usize;
         for wid in 0..num_workers {
-            let out = op_partition_filter(&batch, &schema, wid, num_workers);
+            let out = op_worker_filter(&batch, &schema, wid, num_workers);
             total_kept += out.count;
             for r in 0..out.count {
                 let pk = out.get_pk_bytes(r);
-                let owner = gnitz_wire::worker_for_partition(partition_for_pk_bytes(pk), num_workers as usize);
+                let owner = worker_for_pk_bytes(pk, num_workers as usize);
                 assert_eq!(owner as u32, wid, "row routed to wrong worker");
             }
         }
-        assert_eq!(total_kept, batch.count, "partition filter dropped or duplicated rows");
+        assert_eq!(total_kept, batch.count, "worker filter dropped or duplicated rows");
     }
 
     #[test]
-    fn test_partition_filter_single_worker_keeps_all() {
+    fn test_worker_filter_single_worker_keeps_all() {
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-        let out = op_partition_filter(&batch, &schema, 0, 1);
+        let out = op_worker_filter(&batch, &schema, 0, 1);
         assert_eq!(out.count, 3, "(0, 1) must keep every row");
     }
 
     #[test]
-    fn test_partition_filter_empty_in_empty_out() {
+    fn test_worker_filter_empty_in_empty_out() {
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[]);
-        let out = op_partition_filter(&batch, &schema, 1, 4);
+        let out = op_worker_filter(&batch, &schema, 1, 4);
         assert_eq!(out.count, 0);
-    }
-
-    #[test]
-    fn test_partition_routing_invariance_narrow_pk() {
-        use crate::foundation::xxh::hash_u128;
-        let num_workers = 4usize;
-        let pks: Vec<u64> = vec![1, 42, 100, 1000, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX / 2];
-        for &pk in &pks {
-            let pk_u128 = pk as u128;
-            let partition = (hash_u128(pk_u128) % num_workers as u64) as usize;
-            assert!(
-                partition < num_workers,
-                "partition {partition} out of range for pk={pk}"
-            );
-        }
     }
 
     /// The `ScatterKey` collapse replaced the single-column `route_partition_key`
     /// (routable-int → `route_key`, string → `german_string_promote_key`) and the
     /// `compound_join_packer` path with one packed-`ReindexPacker` route.
-    /// For every reachable JoinPromote key shape, the packed partition must equal
+    /// For every reachable JoinPromote key shape, the packed owner must equal
     /// what the pre-collapse routing produced — so no row moves workers. The
     /// NULL arms are null-blind by design (they read the canonically-zeroed key
     /// slot), exactly as the deleted `route_partition_key` was.
@@ -221,11 +221,12 @@ mod tests {
     fn test_scatter_key_packed_matches_legacy_routing() {
         use crate::storage::MemBatch;
 
-        // Run the JoinPromote `ScatterKey` over `row` and return its partition.
+        // Run the JoinPromote `ScatterKey` over `row` and return its worker.
+        const NW: usize = 4;
         fn packed(schema: &SchemaDescriptor, cols: &[u32], tcs: &[u8], mb: &MemBatch, row: usize) -> usize {
-            let mut sk = ScatterKey::new(RouteMode::JoinPromote, cols, tcs, schema);
+            let mut sk = ScatterKey::new(RouteMode::JoinPromote, cols, tcs, schema, NW);
             assert!(!sk.is_pk_routed(), "test key shapes must take the packed route");
-            sk.partition(mb, row)
+            sk.worker(mb, row)
         }
 
         // (1) non-null I64 payload; (2) NULL I64 payload (nullable col).
@@ -250,8 +251,8 @@ mod tests {
             b.count += 1;
             let mb = b.as_mem_batch();
             for row in 0..2 {
-                // Legacy: routable-int → loc.route_key → partition_for_key (null-blind).
-                let legacy = partition_for_key(schema.locate(1).route_key(&mb, row));
+                // Legacy: routable-int → loc.route_key → worker_for_key (null-blind).
+                let legacy = worker_for_key(schema.locate(1).route_key(&mb, row), NW);
                 assert_eq!(packed(&schema, &[1], &[], &mb, row), legacy, "I64 row {row}");
             }
         }
@@ -279,17 +280,17 @@ mod tests {
             b.count += 1;
             let mb = b.as_mem_batch();
             for row in 0..2 {
-                // Legacy: string → german_string_promote_key → partition_for_key.
-                let legacy = partition_for_key(crate::ops::reindex::german_string_promote_key(
-                    mb.get_col_ptr(row, 0, 16),
-                    mb.blob,
-                ));
+                // Legacy: string → german_string_promote_key → worker_for_key.
+                let legacy = worker_for_key(
+                    crate::ops::reindex::german_string_promote_key(mb.get_col_ptr(row, 0, 16), mb.blob),
+                    NW,
+                );
                 assert_eq!(packed(&schema, &[1], &[], &mb, row), legacy, "STRING row {row}");
             }
         }
 
         // (5) U128 payload key: `is_pk_eligible` includes U128, so the
-        // wide arm of `loc.route_key` fed `partition_for_key`.
+        // wide arm of `loc.route_key` fed `worker_for_key`.
         {
             let schema = SchemaDescriptor::new(
                 &[
@@ -305,7 +306,7 @@ mod tests {
             b.extend_col(0, &(u128::MAX - 7).to_le_bytes());
             b.count += 1;
             let mb = b.as_mem_batch();
-            let legacy = partition_for_key(schema.locate(1).route_key(&mb, 0));
+            let legacy = worker_for_key(schema.locate(1).route_key(&mb, 0), NW);
             assert_eq!(packed(&schema, &[1], &[], &mb, 0), legacy, "U128 payload");
         }
 
@@ -332,7 +333,7 @@ mod tests {
             b.count += 1;
             let mb = b.as_mem_batch();
             for col in [0u32, 1u32] {
-                let legacy = partition_for_key(extract_group_key(&mb, 0, &schema, &[col]));
+                let legacy = worker_for_key(extract_group_key(&mb, 0, &schema, &[col]), NW);
                 assert_eq!(
                     packed(&schema, &[col], &[], &mb, 0),
                     legacy,

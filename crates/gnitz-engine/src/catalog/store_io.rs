@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::schema::project_schema;
-use crate::storage::{BoundedIndexCursor, PartitionProbe};
+use crate::storage::BoundedIndexCursor;
 
 impl CatalogEngine {
     /// The registry entry for `table_id`, or the shared "Unknown table_id"
@@ -15,21 +15,6 @@ impl CatalogEngine {
             .tables
             .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))
-    }
-
-    /// The partitioned store behind `table_id`, or `None` when it is
-    /// unregistered or a borrowed system table. Every driver of a chunked
-    /// [`SourceCursor`] re-reads it per chunk — the cursor cannot hold the
-    /// borrow across a `&mut CatalogEngine` use.
-    pub(crate) fn partitioned_store(&self, table_id: i64) -> Option<&PartitionedTable> {
-        self.dag.tables.get(&table_id).and_then(|e| e.handle.as_partitioned())
-    }
-
-    /// The next up-to-`max_rows` rows of `source` from `cursor`. Re-resolves the
-    /// scanned relation's store per chunk, which a `SourceCursor` cannot hold a
-    /// borrow on across the `&mut CatalogEngine` uses between chunks.
-    pub fn drain_source_chunk(&self, cursor: &mut SourceCursor, source: i64, max_rows: usize) -> Option<Batch> {
-        cursor.drain_chunk(self.partitioned_store(source), max_rows)
     }
 
     /// Ingest a user-table batch and return the effective delta (after PK
@@ -72,7 +57,7 @@ impl CatalogEngine {
     /// re-copies) the descriptor.
     pub fn scan_family(&mut self, table_id: i64) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
         let entry = self.table_entry(table_id)?;
-        Ok((entry.handle.full_scan(), entry.schema))
+        Ok((entry.full_scan(), entry.schema))
     }
 
     /// Point lookup by the wire seek pair. Decodes `(seek_pk, seek_pk_extra)` to
@@ -101,27 +86,25 @@ impl CatalogEngine {
         Ok(Self::seek_entry_bytes(entry, pk))
     }
 
-    /// The seek+materialise primitive: open a cursor over the one partition `pk`
-    /// can live in and copy every live row of its PK group. Correct at any PK
-    /// width. A base table's PK is unique (`enforce_unique_pk` on ingest) so this
-    /// emits one row; a view output store enforces nothing, and a synthetic view
-    /// key (`_join_pk`) names one row per row the join produced for it — walking
-    /// the group is what makes a seek answer the same rows a point-range read of
-    /// that key does. A borrowed system table is one unpartitioned `Table` with
-    /// nothing to route among, so it opens whole.
+    /// The seek+materialise primitive: open a cursor over this worker's store and
+    /// copy every live row of `pk`'s group. Correct at any PK width. A base
+    /// table's PK is unique (`enforce_unique_pk` on ingest) so this emits one row;
+    /// a view output store enforces nothing, and a synthetic view key
+    /// (`_join_pk`) names one row per row the join produced for it — walking the
+    /// group is what makes a seek answer the same rows a point-range read of that
+    /// key does.
     fn seek_entry_bytes(entry: &crate::query::TableEntry, pk: &[u8]) -> Option<Batch> {
-        let mut cursor = entry.handle.open_cursor_for_key(pk)?;
+        let mut cursor = entry.open_cursor();
         let mut batch = Batch::empty_with_schema(&entry.schema);
         cursor.copy_live_pk_group_into(pk, &mut batch);
         (batch.count > 0).then_some(batch)
     }
 
-    /// Batched point lookup. Route each PK in `pks` (verbatim OPK bytes) to the
-    /// one partition that can hold it and seek there, appending the stored row
-    /// (weight 1) for every present, live key into a result batch projected to
-    /// `project`. Each `seek` re-probes every source independently, so order is
-    /// not required for correctness; passing `pks` ascending keeps each routed
-    /// cursor's binary-search probes monotonic for better cache locality.
+    /// Batched point lookup. Seek each PK in `pks` (verbatim OPK bytes) in this
+    /// worker's store, appending the stored row (weight 1) for every present,
+    /// live key into a result batch projected to `project`. Order is not required
+    /// for correctness; passing `pks` ascending keeps the cursor's binary-search
+    /// probes monotonic for better cache locality.
     /// Absent / retracted keys are skipped — identical to `seek_family`'s
     /// single-key `None` — so a removed PK with no committed row contributes
     /// nothing. `project` lists the parent column indices to return (all
@@ -134,11 +117,11 @@ impl CatalogEngine {
     /// The seek and `pk IN (…)` readers, whose consumers take whole groups, walk
     /// instead.
     ///
-    /// Reuses one cursor per touched partition across all keys (cheaper than N
-    /// `seek_family` calls, each of which re-opens a cursor). Projection keeps
-    /// the result scalar-only — FK-referenced columns are never STRING/BLOB — so
-    /// the blob arena is never touched. Works for both narrow and wide PKs: the
-    /// OPK bytes are seeked verbatim, with no native→OPK re-encode.
+    /// Reuses one cursor across all keys (cheaper than N `seek_family` calls,
+    /// each of which re-opens one). Projection keeps the result scalar-only —
+    /// FK-referenced columns are never STRING/BLOB — so the blob arena is never
+    /// touched. Works for both narrow and wide PKs: the OPK bytes are seeked
+    /// verbatim, with no native→OPK re-encode.
     pub fn gather_family_bytes<'k>(
         &mut self,
         table_id: i64,
@@ -163,13 +146,12 @@ impl CatalogEngine {
             })
             .collect();
         let mut out = Batch::with_capacity(result_schema, pks.len());
-        // The probe also drops the keys this process holds no partition for —
-        // the master broadcasts the list, so most of it belongs elsewhere.
-        let store = entry.handle.as_partitioned();
-        let mut probe = entry.handle.open_probe();
+        // The cursor also drops the keys this process holds no row for — the
+        // master broadcasts the list, so most of it belongs elsewhere.
+        let mut cursor = entry.open_cursor();
         for pk in pks {
-            if let Some(cursor) = probe.advance_to_exact_live(store, pk) {
-                copy_cursor_cols_to_batch(cursor, &mut out, &proj);
+            if cursor.advance_to_exact_live(pk) {
+                copy_cursor_cols_to_batch(&cursor, &mut out, &proj);
             }
         }
         Ok(out)
@@ -228,8 +210,8 @@ impl CatalogEngine {
     /// planner; none of them reach this layer.
     ///
     /// Returns this worker's matching source rows; the master broadcasts to every
-    /// worker and merges (the index is partitioned by source PK, so a range's
-    /// matches scatter across workers).
+    /// worker and merges (the index shadows this worker's own base slice, so a
+    /// range's matches scatter across workers).
     pub fn seek_by_index_range(
         &mut self,
         table_id: i64,
@@ -246,12 +228,7 @@ impl CatalogEngine {
         let Some(mut cur) = self.open_index_range_cursor(table_id, col_indices, range)? else {
             return Ok((None, src_schema));
         };
-        // Resolved again rather than threaded out of the opener: the cursor holds
-        // no borrow, so the base store is a per-drain argument.
-        let store = self
-            .partitioned_store(table_id)
-            .expect("open_index_range_cursor already required a partitioned store");
-        Ok((cur.drain_chunk(store, usize::MAX).filter(|b| b.count > 0), src_schema))
+        Ok((cur.drain_chunk(usize::MAX).filter(|b| b.count > 0), src_schema))
     }
 
     /// Open an un-gated streaming cursor over the secondary-index range `range`
@@ -263,13 +240,8 @@ impl CatalogEngine {
     /// (the point/range seek, an `exact` ScanSpec index bound) drive this directly.
     ///
     /// Preserves the write-ordering guarantee of the non-atomic base-then-index
-    /// write path: the index cursor snapshots first and each base partition is
-    /// opened later, so every entry the walk yields already had its base row
-    /// written.
-    ///
-    /// Only user base tables own index circuits, so a resolved index implies a
-    /// partitioned base; the `Err` is a registry corruption, not a shape
-    /// production can build.
+    /// write path: the index cursor snapshots first and the base cursor after, so
+    /// every entry the walk yields already had its base row written.
     pub(crate) fn open_index_range_cursor(
         &mut self,
         table_id: i64,
@@ -277,21 +249,19 @@ impl CatalogEngine {
         range: &gnitz_wire::RangeDescriptor,
     ) -> Result<Option<BoundedIndexCursor>, String> {
         let (entry, ic) = self.table_and_index(table_id, col_indices)?;
-        let src_schema = entry.schema;
-        let store = entry
-            .handle
-            .as_partitioned()
-            .ok_or_else(|| format!("index range on non-partitioned table {table_id}"))?;
         let Some((start, end)) = index_range_keys(ic, range)? else {
             return Ok(None);
         };
+        // Index cursor first, base cursor after — the write-ordering guarantee
+        // above.
+        let idx = ic.table_mut().open_cursor();
+        let src = entry.open_cursor();
         Ok(Some(BoundedIndexCursor::new(
-            ic.table_mut().open_cursor(),
-            PartitionProbe::new(store),
+            idx,
+            src,
             start,
             end,
             ic.key_spec,
-            src_schema,
             // No measured range size on this path; the PK scratch grows.
             0,
         )))
@@ -341,7 +311,7 @@ impl CatalogEngine {
     /// caller mutates OTHER relations (index table, view family) between
     /// chunks; the scanned relation itself must not be written mid-loop.
     pub(crate) fn open_store_cursor(&self, table_id: i64) -> Option<ReadCursor> {
-        self.dag.tables.get(&table_id).map(|e| e.handle.open_cursor())
+        self.dag.tables.get(&table_id).map(|e| e.open_cursor())
     }
 
     /// The whole-relation source cursor for `source` — what every non-`Bounded`
@@ -376,15 +346,15 @@ impl CatalogEngine {
         let Some(bound) = bound else {
             return self.full_source(source);
         };
-        // A bounded cursor is only sound in a process that owns base partitions: an
+        // A bounded cursor is only sound in a process that owns its base store: an
         // index circuit is a local shadow of the local base slice, and where no
         // slice is owned (the master) a bounded cursor returns zero rows rather
         // than an error — the fallbacks below would not catch it and the view would
         // silently fill empty. Hard, not `debug_assert!`: release is a supported
         // deployment, and this costs one compare per bounded backfill, not per row.
         assert!(
-            self.owns_partitions(),
-            "bounded source cursor in a process owning no base partitions (view {view_id}, source {source})",
+            self.owns_stores,
+            "bounded source cursor in a process owning no base store (view {view_id}, source {source})",
         );
 
         self.open_bounded_source(source, bound.idx_cols.as_slice(), &bound.desc)
@@ -420,16 +390,16 @@ impl CatalogEngine {
             Err(_) => return self.full_source(source),
         };
 
-        // Only user base tables own index circuits, so a resolved index implies a
-        // partitioned base; a borrowed system table degrades to the full scan
-        // like every other non-`Bounded` outcome here.
-        let Some(store) = entry.handle.as_partitioned() else {
+        // Only user base tables own index circuits, so a resolved index implies an
+        // owned base store; a borrowed system table degrades to the full scan like
+        // every other non-`Bounded` outcome here.
+        let Some(store) = entry.handle.as_owned_mut() else {
             return self.full_source(source);
         };
         // `ingest_store_and_indices` writes base-then-index non-atomically, so the
         // index must be snapshotted no later than the base: this opens the index
-        // cursor now and the probe opens each base partition later, which is the
-        // safe order (every entry the walk yields had its base row written first).
+        // cursor now and the base cursor after, which is the safe order (every
+        // entry the walk yields had its base row written first).
         let idx = ic.table_mut().open_cursor();
         // The only cost model. A bounded scan is not unconditionally cheaper: for a
         // range matching M of N rows it costs an index walk of M, an M log M sort,
@@ -439,19 +409,19 @@ impl CatalogEngine {
         // before the first row is read (`count_range_raw` is `&self` and
         // repositions nothing). N comes from `estimated_rows` — arithmetic over
         // the children's run and shard counts — rather than a cursor's
-        // `estimated_length`, so the whole-store cursor is built inside the
-        // `Full` arm alone instead of speculatively on every open.
+        // `estimated_length`, so the base cursor is opened only once the gate
+        // passes, instead of speculatively on every open.
         let m = idx.count_range_raw(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
         if m > store.estimated_rows() / INDEX_SCAN_RATIO {
             return self.full_source(source);
         }
+        let src = store.open_cursor();
         Some(SourceCursor::Bounded(Box::new(BoundedIndexCursor::new(
             idx,
-            PartitionProbe::new(store),
+            src,
             start,
             end,
             ic.key_spec,
-            entry.schema,
             // The PK scratch's exact per-chunk bound: the measured range size,
             // capped at the drivers' chunk size.
             m.min(self.ddl_scan_chunk_rows),
@@ -479,19 +449,11 @@ pub(crate) enum SourceCursor {
 }
 
 impl SourceCursor {
-    /// The next up-to-`max_rows` source rows. `store` is the scanned relation's
-    /// partitioned store — read per chunk by the driver, since a cursor cannot
-    /// hold that borrow across the `&mut CatalogEngine` uses between chunks.
-    /// `None` for a borrowed system table, which only ever reaches the `Full`
-    /// arm (a `Bounded` cursor requires an index, and only user base tables own
-    /// index circuits).
-    pub(crate) fn drain_chunk(&mut self, store: Option<&PartitionedTable>, max_rows: usize) -> Option<Batch> {
+    /// The next up-to-`max_rows` source rows.
+    pub(crate) fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         match self {
             SourceCursor::Full(c) => c.drain_chunk(max_rows),
-            SourceCursor::Bounded(c) => c.drain_chunk(
-                store.expect("a bounded source cursor is only built over a partitioned base"),
-                max_rows,
-            ),
+            SourceCursor::Bounded(c) => c.drain_chunk(max_rows),
             SourceCursor::Empty => None,
         }
     }

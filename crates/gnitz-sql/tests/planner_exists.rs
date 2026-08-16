@@ -7,8 +7,8 @@ use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{
     OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_FILTER, OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_RANGE,
-    OPCODE_MAP_EXPR, OPCODE_NEGATE, OPCODE_NULL_EXTEND, OPCODE_PARTITION_FILTER, OPCODE_POSITIVE_PART, OPCODE_REDUCE,
-    OPCODE_UNION,
+    OPCODE_MAP_EXPR, OPCODE_NEGATE, OPCODE_NULL_EXTEND, OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_UNION,
+    OPCODE_WORKER_FILTER,
 };
 
 mod common;
@@ -136,7 +136,7 @@ fn test_band_exists_circuit_shape() {
     assert_eq!(n(OPCODE_JOIN_DELTA_TRACE_RANGE), 2, "the 2 band join terms");
     assert_eq!(n(OPCODE_EXCHANGE_SHARD), 1, "one output exchange over the source PK");
     assert_eq!(n(OPCODE_POSITIVE_PART), 1, "the ν clamp");
-    assert_eq!(n(OPCODE_PARTITION_FILTER), 0, "band scatters by eq prefix — no trim");
+    assert_eq!(n(OPCODE_WORKER_FILTER), 0, "band scatters by eq prefix — no trim");
     assert_eq!(n(OPCODE_REDUCE), 0, "band uses π_A(inner), not a threshold");
 }
 
@@ -181,7 +181,7 @@ fn test_pure_range_exists_circuit_shape() {
         assert_eq!(n(vid, OPCODE_REDUCE), 1, "the inline m = MIN/MAX reduce");
         assert_eq!(n(vid, OPCODE_EXCHANGE_SHARD), 1, "one output exchange");
         assert_eq!(n(vid, OPCODE_POSITIVE_PART), 0, "threshold form needs no clamp");
-        assert_eq!(n(vid, OPCODE_PARTITION_FILTER), 1, "int_a trims the broadcast");
+        assert_eq!(n(vid, OPCODE_WORKER_FILTER), 1, "int_a trims the broadcast");
     }
     // Semi = matched alone; anti = A − matched (one negate, one more union).
     assert_eq!(n(semi, OPCODE_NEGATE), 0);

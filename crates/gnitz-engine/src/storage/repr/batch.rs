@@ -2681,11 +2681,10 @@ mod tests {
             ],
             &[0],
         );
-        let mut pt = crate::storage::PartitionedTable::new(
+        let mut pt = crate::storage::Table::new(
             tdir.to_str().unwrap(),
             schema,
             100,
-            crate::storage::Routing::Unhashed { rank: 0 },
             crate::storage::RecoverySource::Rederive,
         )
         .unwrap();

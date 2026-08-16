@@ -259,7 +259,7 @@ class TestNativePkDml:
 
 @_NEEDS_MULTI
 class TestNativePkMultiWorker:
-    """Master routes SEEK via partition_for_key(pk). INSERT and SEEK must
+    """Master routes SEEK via worker_for_key(pk). INSERT and SEEK must
     produce the same u128 for the same logical literal — otherwise they land
     on different workers and SEEK misses."""
 

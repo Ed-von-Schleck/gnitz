@@ -97,7 +97,7 @@ pub(super) fn annotate(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> (JoinS
 /// nowhere between:
 ///
 /// - `k == 1`: the output key is that one column's route key, the same
-///   `widen_pk_be` value `partition_for_pk_bytes` derives from the prefix
+///   `widen_pk_be` value `worker_for_pk_bytes` derives from the prefix
 ///   (routing is invariant under left zero-padding at `len <= 16`).
 /// - `k == |PK|`: the output re-emits the source PK verbatim.
 /// - `1 < k < |PK|`: a multi-column key streams into an Xxh3 fold whose u128 is

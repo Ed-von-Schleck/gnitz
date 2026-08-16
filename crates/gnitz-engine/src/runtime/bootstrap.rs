@@ -18,7 +18,7 @@ use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring::{self, W2M_REGION_SIZE};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
-use crate::storage::{partition_range, Batch};
+use crate::storage::Batch;
 
 /// Boot-progress line on stdout (the server log). Used instead of the log
 /// macros where the raw, untagged line is the documented boot output (e.g. the
@@ -477,7 +477,7 @@ fn recover_from_sal(
                 let owned = if reslice && !replicated {
                     // Re-cut with the write path's own router, so what survives is exactly
                     // what the master would have written to this rank's slot: same
-                    // distribution-prefix hash, same partition→worker map.
+                    // distribution-prefix hash, same key→worker map.
                     let mb = batch.as_mem_batch();
                     crate::runtime::master::scatter::with_worker_indices(&batch, &schema, num_workers as usize, |wi| {
                         Batch::from_indexed_rows(&mb, &wi[rank as usize], &[], &schema)
@@ -576,7 +576,7 @@ fn recovery_tick_sweep(catalog: &mut CatalogEngine, dispatcher: &MasterDispatche
 
 /// Step-4: rebuild only the views the boot verdict rejected, through the same
 /// dependency-ordered driver a live CREATE VIEW uses. The worker resets a view's
-/// output partitions + operator scratch on the FIRST backfill command it receives
+/// output store + operator scratch on the FIRST backfill command it receives
 /// (gated on its COW-inherited `invalid_views` set), then fills. The driver is
 /// view-scoped, so a resumed sibling's loaded shards are never re-derived and
 /// double-counted.
@@ -704,7 +704,7 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
-/// `worker_N.log`, trim to its partition range, recover, and run the worker
+/// `worker_N.log`, recover, and run the worker
 /// loop. Never returns — the worker exits via `libc::_exit`.
 #[allow(clippy::too_many_arguments)]
 fn run_worker_child(
@@ -767,11 +767,6 @@ fn run_worker_child(
 
     let catalog = unsafe { &mut *catalog_ptr };
 
-    // Set active partition range
-    let (part_start, part_end) = partition_range(w as u32, num_workers);
-    catalog.set_active_partitions(part_start, part_end);
-    catalog.trim_worker_partitions(part_start, part_end);
-
     // `boot_epoch` is what the master's `boot_reset` will set, so the live drain
     // accepts exactly the groups written after the reset.
     let sal_reader = SalReader::new(
@@ -783,12 +778,11 @@ fn run_worker_child(
     );
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w], W2M_REGION_SIZE as u64);
 
-    // Re-home inherited unhashed (replicated / replicated-derived) stores
-    // from the pre-fork master's `rep_0` to THIS worker's own `rep_{w}` dir before
-    // any flush — all workers share the data directory, so a fixed `rep_0` would
-    // collide. The inherited store is empty; the pre-fork `reconcile_child_dirs`
-    // already put this rank's checkpointed shards under `rep_{w}` (loaded on open)
-    // and FLAG_PUSH replay adds the SAL tail.
+    // Re-home every inherited store from the pre-fork master's `w0of{W}` to THIS
+    // worker's own `w{w}of{W}` dir before any flush — all workers share the data
+    // directory, so a fixed rank 0 would collide. The inherited store is empty;
+    // this rank's checkpointed shards under `w{w}of{W}` load on open and FLAG_PUSH
+    // replay adds the SAL tail.
     //
     // Then recover: rebuild indexes, replay the SAL tail (buffering effective base
     // deltas), boot-flush the replayed rows durable. The buffered deltas seed
@@ -799,8 +793,8 @@ fn run_worker_child(
     // Either failure rides the startup ACK, which fails boot before the master
     // zeroes the SAL sentinel.
     let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) = match catalog
-        .rehome_unhashed_stores()
-        .map_err(|e| format!("W{w} rehome unhashed stores failed: {e}"))
+        .rehome_stores()
+        .map_err(|e| format!("W{w} rehome stores failed: {e}"))
         .and_then(|()| worker_boot_recovery(catalog, ipc.sal_ptr as *const u8, w as u32, num_workers, boot_epoch - 1))
     {
         Ok(pd) => (pd, None),
@@ -814,11 +808,10 @@ fn run_worker_child(
     catalog.invalidate_all_plans();
 
     boot_log(&format!(
-        "Worker {} (pid {}) partitions [{}, {})\n",
+        "Worker {} (pid {}) of {}\n",
         w,
         unsafe { libc::getpid() },
-        part_start,
-        part_end,
+        num_workers
     ));
 
     let mut worker = WorkerProcess::new(master_pid, catalog_ptr, sal_reader, w2m_writer, pending_deltas);
@@ -841,12 +834,12 @@ fn run_server(
     // their forked children rebuild slice-local.
     crate::foundation::worker_ctx::set_master_role();
 
-    // Raise fd limit (partition directories + shard files)
+    // Raise fd limit (child directories + shard files)
     posix_io::raise_fd_limit(65536);
 
     gnitz_info!("Opening database at {}", data_dir);
 
-    let catalog = CatalogEngine::open(data_dir).map_err(|e| format!("failed to open catalog: {e}"))?;
+    let catalog = CatalogEngine::open(data_dir, num_workers).map_err(|e| format!("failed to open catalog: {e}"))?;
     let catalog_ptr = Box::into_raw(Box::new(catalog));
 
     let nw = num_workers as usize;
@@ -886,20 +879,17 @@ fn run_server(
         // for an orphan.
         catalog.gc_orphan_directories();
 
-        // Bring the relation child directories into this boot's worker count and
-        // seed any replicated base table copy it needs. Must run after SAL replay
-        // (so `dag.tables` is complete and dropped subtrees are already gone) and
-        // before the fork, since each worker's `rehome_unhashed_stores`
-        // opens `rep_{rank}` unconditionally.
-        catalog
-            .reconcile_child_dirs(num_workers)
-            .map_err(|e| format!("child-dir reconciliation failed: {e}"))?;
+        // Drop the child directories this boot's worker count no longer owns.
+        // Must run after SAL replay (so `dag.tables` is complete and dropped
+        // subtrees are already gone) and before the fork, since each worker's
+        // `rehome_stores` then opens what this leaves behind.
+        catalog.reconcile_child_dirs();
     }
 
     // --- Boot invalid-view verdict + recovery-start generation bump ---
     //
-    // Both pre-fork, while the master's active range is still full: the verdict's
-    // manifest peeks see every partition, and the durable generation advance is
+    // Both pre-fork: the verdict peeks every launched rank's manifest on behalf
+    // of workers that do not exist yet, and the durable generation advance is
     // COW-inherited by every worker (and is durable long before the parent resets
     // the SAL after worker readiness).
     {
@@ -908,7 +898,7 @@ fn run_server(
         // (generation + topology + transitive source validity). Reads
         // `worker_ctx::committed_generation()` (the recovered G), so it runs BEFORE
         // the recovery-start bump advances the durable generation.
-        let invalid = catalog.compute_invalid_views(num_workers);
+        let invalid = catalog.compute_invalid_views();
         catalog.invalid_views = invalid;
 
         // Durably advance the checkpoint generation G → G+1 without publishing to
@@ -966,8 +956,7 @@ fn run_server(
 
     // --- Parent process ---
     let catalog = unsafe { &mut *catalog_ptr };
-    catalog.close_user_table_partitions();
-    catalog.set_active_partitions(0, 0);
+    catalog.detach_user_stores();
 
     let sal_writer = SalWriter::new(ipc.sal_ptr, ipc.sal_fd, sal_mmap_size() as u64, ipc.m2w_efds.clone());
     let w2m_receiver = std::rc::Rc::new(W2mReceiver::new(ipc.w2m_ptrs.clone()));

@@ -69,7 +69,7 @@ fn live_rows_for(engine: &CatalogEngine, tid: i64) -> usize {
 #[test]
 fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     let dir = temp_dir("alter_no_cascade");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
     let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
     let table_path = format!("{dir}/public/t_{tid}");
@@ -108,7 +108,7 @@ fn rename_then_reopen_resolves_flushed_data() {
     let dir = temp_dir("alter_reopen");
     let tid;
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
         tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
         // Flush a row so only the on-disk (id-only) path can serve it after reopen.
@@ -127,7 +127,7 @@ fn rename_then_reopen_resolves_flushed_data() {
 
     // Reopen: boot replay re-registers at the id-only path `t_{tid}` (unchanged by
     // the rename), so the flushed row still resolves under the new name.
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
         engine.caches.entity_by_qname.get("public.renamed").copied(),
         Some(tid),
@@ -150,7 +150,7 @@ fn valid_long_name_rename_accepted() {
     // blob heap, so the `-1` and live rows carry independent heap offsets. The CAS
     // compares German-string content, so a valid rename to a long name is accepted.
     let dir = temp_dir("alter_long_ok");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
     let pair = table_rename_pair(&engine, tid, "renamed_to_a_long_name");
@@ -166,7 +166,7 @@ fn valid_long_name_rename_accepted() {
 #[test]
 fn stale_snapshot_rename_rejected_long_name() {
     let dir = temp_dir("alter_stale");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.original_long_name", &cols, &[0]).unwrap();
     // The `-1` carries a stale (wrong) old name > 12 bytes that does not match the
@@ -191,7 +191,7 @@ fn stale_snapshot_rename_rejected_long_name() {
 #[test]
 fn duplicate_live_head_rejected() {
     let dir = temp_dir("alter_dup_head");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     // A bare `+1` re-ingest of the live row → net weight 2 (a duplicate live head).
@@ -214,7 +214,7 @@ fn duplicate_live_head_rejected() {
 #[test]
 fn system_range_mutations_rejected() {
     let dir = temp_dir("alter_sysrange");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let table_drop = {
         let mut bb = BatchBuilder::new(SysFamily::Table.schema());
@@ -275,7 +275,7 @@ fn system_range_mutations_rejected() {
 #[test]
 fn system_range_schema_mutations_rejected() {
     let dir = temp_dir("alter_sysrange_schema");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     for sid in [SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID] {
         let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
@@ -296,7 +296,7 @@ fn system_range_schema_mutations_rejected() {
 #[test]
 fn stale_column_rename_rejected_and_drop_cascade_passes() {
     let dir = temp_dir("alter_col");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
         col_def("id", type_code::U64),
         col_def("original_column_name", type_code::U64),
@@ -349,7 +349,7 @@ fn rename_to(new_name: &str) -> impl FnOnce(&mut ColumnDef) + '_ {
 #[test]
 fn column_rename_on_non_base_owner_rejected() {
     let dir = temp_dir("alter_col_owner");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -383,7 +383,7 @@ fn column_rename_on_non_base_owner_rejected() {
 #[test]
 fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
     let dir = temp_dir("alter_col_rename_ok");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();

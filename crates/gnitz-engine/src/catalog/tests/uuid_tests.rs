@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn test_uuid_pk_create_and_drop() {
     let dir = temp_dir("uuid_pk_create");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let tid = engine.create_table("public.uuid_tab", &[uuid_def("id")], &[0]).unwrap();
     let s = engine.get_schema_desc(tid).unwrap();
@@ -21,7 +21,7 @@ fn test_uuid_pk_create_and_drop() {
 #[test]
 fn test_uuid_non_pk_column() {
     let dir = temp_dir("uuid_non_pk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), uuid_def("uid")];
     let tid = engine.create_table("public.uuid_payload", &cols, &[0]).unwrap();
@@ -46,7 +46,7 @@ fn test_uuid_non_pk_column() {
 #[test]
 fn test_uuid_secondary_index() {
     let dir = temp_dir("uuid_idx");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), uuid_def("uid")];
     let tid = engine.create_table("public.uuid_idxtab", &cols, &[0]).unwrap();
@@ -73,7 +73,7 @@ fn test_uuid_secondary_index() {
 #[test]
 fn test_uuid_fk_valid_single() {
     let dir = temp_dir("uuid_fk_valid");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine.create_table("public.uuid_par", &[uuid_def("id")], &[0]).unwrap();
 
@@ -106,7 +106,7 @@ fn test_uuid_fk_valid_single() {
 #[test]
 fn test_uuid_fk_invalid_single() {
     let dir = temp_dir("uuid_fk_invalid");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.uuid_par2", &[uuid_def("id")], &[0])
@@ -134,7 +134,7 @@ fn test_uuid_fk_invalid_single() {
 #[test]
 fn test_uuid_fk_multiple_children_same_parent() {
     let dir = temp_dir("uuid_fk_multi");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.uuid_par3", &[uuid_def("id")], &[0])
@@ -172,7 +172,7 @@ fn test_uuid_fk_multiple_children_same_parent() {
 #[test]
 fn test_uuid_fk_multiple_children_mixed() {
     let dir = temp_dir("uuid_fk_mixed");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.uuid_par4", &[uuid_def("id")], &[0])
@@ -210,7 +210,7 @@ fn test_uuid_fk_multiple_children_mixed() {
 #[test]
 fn test_uuid_fk_parent_not_yet_ingested() {
     let dir = temp_dir("uuid_fk_no_parent");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.uuid_par5", &[uuid_def("id")], &[0])
@@ -239,7 +239,7 @@ fn test_uuid_fk_parent_not_yet_ingested() {
 #[test]
 fn test_uuid_fk_nullable_column() {
     let dir = temp_dir("uuid_fk_nullable");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.uuid_par6", &[uuid_def("id")], &[0])
@@ -271,7 +271,7 @@ fn test_uuid_fk_nullable_column() {
 #[test]
 fn test_uuid_fk_u64pk_parent_rejected() {
     let dir = temp_dir("uuid_fk_u64_mismatch");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.u64par", &[col_def("id", type_code::U64)], &[0])
@@ -293,7 +293,7 @@ fn test_uuid_fk_u64pk_parent_rejected() {
 #[test]
 fn test_uuid_fk_u128_col_references_uuid_pk() {
     let dir = temp_dir("uuid_fk_u128_vs_uuid");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.uuid_par8", &[uuid_def("id")], &[0])

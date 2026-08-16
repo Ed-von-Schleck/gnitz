@@ -212,7 +212,7 @@ def test_compound_pk_stride_24_accepted_round_trip(client):
 def test_compound_pk_stride24_point_seek_colliding_prefix(client):
     """Stride-24 (U64,U64,U64) point seek where two rows share their first 16 OPK
     bytes (a, b) = (1, 1) and differ only in the trailing U64 c. The seek routes
-    on the FULL OPK (`partition_for_pk_bytes` hashes all 24 bytes, len > 16), and
+    on the FULL OPK (`worker_for_pk_bytes` hashes all 24 bytes, len > 16), and
     `seek_exact_live`'s past-byte-16 tie-break must return the exact row, never
     the colliding-prefix sibling — under 4 workers the two siblings can land on
     different workers, so a misroute would return empty."""

@@ -213,12 +213,12 @@ pub(crate) enum Placement {
     /// single-source worker 0.
     Replicated,
     /// Rows live on whichever worker produced them and are **not** keyed by
-    /// `partition_for_pk` at all — a view over any source that is itself not
+    /// `worker_for_pk` at all — a view over any source that is itself not
     /// `Keyed` (a replicated table, or another `Local` view). The union across
     /// workers is the relation; a read must gather every worker.
     Local,
     /// Hash-distributed: a row's owner is
-    /// `partition_for_pk_bytes(OPK(pk_indices()[..prefix_len]))`.
+    /// `worker_for_pk_bytes(OPK(pk_indices()[..prefix_len]))`.
     /// `prefix_len == pk_count` is the default (full-PK) distribution.
     Keyed { prefix_len: u8 },
 }
@@ -252,10 +252,9 @@ impl Placement {
     }
 
     /// True iff a row's owning worker is derived from its key. A relation that
-    /// is not key-routed is built `Routing::Unhashed`, because a 256-partition
-    /// store trimmed to the worker's range cannot address a row whose key
-    /// partition the worker does not own — the ingest scatter reports
-    /// `MisroutedRows` and the write fails stop.
+    /// is not key-routed still holds one store per worker; what differs is which
+    /// rows arrive there — a broadcast copy (`Replicated`) or whatever that
+    /// worker produced (`Local`), rather than the key's own hash slice.
     #[inline]
     pub(crate) const fn is_key_routed(self) -> bool {
         matches!(self, Placement::Keyed { .. })
@@ -269,7 +268,7 @@ impl Placement {
 
     /// The number of leading PK columns the router hashes. A relation that is
     /// not key-routed is sliced by nothing, so it takes the full-PK width and
-    /// every `partition_for_pk` slice stays well-defined.
+    /// every `worker_for_pk` slice stays well-defined.
     const fn dist_prefix_len(self, pk_count: usize) -> usize {
         match self {
             Placement::Keyed { prefix_len } => prefix_len as usize,
@@ -310,7 +309,7 @@ pub(crate) struct SchemaDescriptor {
     pk_stride: u8,
     /// Byte width of the **distribution prefix** — the OPK bytes of the leading
     /// PK columns the placement keys by, the slice every write-side table-key
-    /// router (`partition_for_pk_bytes`) hashes to pick a partition. Derived from
+    /// router (`worker_for_pk_bytes`) hashes to pick a partition. Derived from
     /// `placement` by walking the PK columns in PK-list order, so it matches the
     /// OPK encoder's tight big-endian layout exactly. `dist_stride == pk_stride`
     /// for the default (full-PK) distribution and for a non-`Keyed` placement
@@ -548,15 +547,15 @@ impl SchemaDescriptor {
     }
 
     /// Byte width of the distribution prefix (the leading PK slice that
-    /// `partition_for_pk` hashes); `pk_stride()` for the full-PK default. Prefer
-    /// `partition_for_pk` over reading this and slicing by hand.
+    /// `worker_for_pk` hashes); `pk_stride()` for the full-PK default. Prefer
+    /// `worker_for_pk` over reading this and slicing by hand.
     #[inline]
     pub(crate) const fn dist_stride(&self) -> u8 {
         self.dist_stride
     }
 
-    /// The single **table-key router**: maps a row's full OPK PK bytes to a
-    /// partition by hashing only the leading distribution prefix
+    /// The single **table-key router**: maps a row's full OPK PK bytes to its
+    /// owning worker by hashing only the leading distribution prefix
     /// (`key[..dist_stride()]`). Every write-side scatter, ingest/probe, and seek
     /// routes a base-table PK through here, so the "slice to the distribution
     /// prefix" contract — the load-bearing half of the prefix-distribution feature
@@ -565,15 +564,15 @@ impl SchemaDescriptor {
     /// hashing the whole PK. `key` is the full PK (`key.len() >= dist_stride()`).
     ///
     /// Not for **join-key** routing: the exchange relay scatters route an already
-    /// reindexed `_join_pk` over a derived schema and call `partition_for_pk_bytes`
+    /// reindexed `_join_pk` over a derived schema and call `worker_for_pk_bytes`
     /// directly (their key is the whole region, never a table prefix).
     #[inline]
-    pub(crate) fn partition_for_pk(&self, key: &[u8]) -> usize {
-        gnitz_wire::partition_for_pk_bytes(&key[..self.dist_stride() as usize])
+    pub(crate) fn worker_for_pk(&self, key: &[u8], num_workers: usize) -> usize {
+        gnitz_wire::worker_for_pk_bytes(&key[..self.dist_stride() as usize], num_workers)
     }
 
     /// Where this relation's rows live — the one value the store shape
-    /// (`build_partitioned_storage`), the write scatter (broadcast vs
+    /// (`build_relation_store`), the write scatter (broadcast vs
     /// partition-scatter), the read gather / seek unicast, and the join and
     /// exchange analyzers all read, so they cannot disagree. Crate-visible so the
     /// ALTER … DROP NOT NULL descriptor rebuild (`hook_column_alter`) can carry it
@@ -691,7 +690,7 @@ impl SchemaDescriptor {
     /// `i32`; PK indices are small and non-negative, so the compare is exact.
     ///
     /// False for any placement that is not `Keyed`: such a relation's rows are
-    /// not placed by `partition_for_pk` at all, so no shard key names the worker
+    /// not placed by `worker_for_pk` at all, so no shard key names the worker
     /// its rows are already on. (A replicated *join* source still skips its
     /// exchange, through the replication arm of `compute_co_partitioned` — a
     /// different fact.)
@@ -1080,7 +1079,7 @@ mod tests {
     }
 
     /// A relation the router slices by nothing takes the full-PK width, so every
-    /// `partition_for_pk` slice over it stays in range.
+    /// `worker_for_pk` slice over it stays in range.
     #[test]
     fn unkeyed_placement_takes_the_full_pk_width() {
         for p in [Placement::Replicated, Placement::Local] {
@@ -1116,7 +1115,7 @@ mod tests {
         assert!(!k2.shard_cols_match_dist_key(&[0, 1, 2]));
     }
 
-    /// A relation whose rows are not placed by `partition_for_pk` has no shard
+    /// A relation whose rows are not placed by `worker_for_pk` has no shard
     /// key that names where they already are — whatever its PK columns look
     /// like. This is what stops a co-partition/exchange elision from firing onto
     /// an unkeyed source.

@@ -1698,7 +1698,7 @@ def _assert_reslice_ran(srv):
 def test_tail_survives_worker_count_change(wrote, launched, own_server):
     """SIGKILL with an un-checkpointed tail at `wrote` workers, restart at
     `launched`. Every launched rank must read all `wrote` slots and keep exactly
-    the rows its own partition range owns — on the growth leg three of the four
+    the rows its own slice owns — on the growth leg three of the four
     ranks have no slot of their own at all and depend entirely on slot 0 being
     re-cut. Pre-fix, growth lost 150 of 200 rows.
 

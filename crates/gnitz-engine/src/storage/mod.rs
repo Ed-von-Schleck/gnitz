@@ -23,11 +23,10 @@ mod data_roundtrip_proptest;
 pub use batch::{range_rows, write_to_batch, Batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
-pub use lsm::partitioned_table::{partition_range, PartitionedTable, Routing, NUM_PARTITIONS};
-
 pub use lsm::flush_barrier::{flush_barrier, FlushRound};
 pub use lsm::table::{RecoverySource, Table};
 pub use merge::MemBatch;
+pub(crate) use scatter::route_rows_by_pk;
 pub use scatter::{scatter_copy, scatter_multi_source};
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
@@ -45,15 +44,13 @@ pub(crate) use columnar::{
 // across two import paths, visibly — `ops/reduce/sort.rs` and
 // `catalog/scan_spec.rs` each imported from both in adjacent lines.
 pub(crate) use gnitz_wire::wal::write_header_and_directory as wal_write_header_and_directory;
-pub(crate) use lsm::child_dir::{remove_child, seed_missing_locals, ChildAddr};
+pub(crate) use lsm::child_dir::{cluster_children, remove_child, subdir_names, ChildAddr};
 pub(crate) use lsm::index_gather::BoundedIndexCursor;
-pub(crate) use lsm::manifest::{peek_generation, topology_word};
-#[cfg(test)]
-pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
-pub(crate) use lsm::partitioned_table::PartitionProbe;
+pub(crate) use lsm::manifest::{peek_header, topology_word};
 #[cfg(test)]
 pub(crate) use lsm::read_cursor::REWIND_CALLS;
-pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor};
+pub(crate) use lsm::read_cursor::{empty as empty_cursor, DrainGuard, ReadCursor};
+pub(crate) use lsm::repartition::repartition_relation;
 pub(crate) use lsm::spill::{KeyProducer, SpillSort};
 pub(crate) use merge::{
     prorated_blob_cap, relocate_german_string_vec, BlobCache, BlobCacheGuard, DirectWriter, RowComparator,

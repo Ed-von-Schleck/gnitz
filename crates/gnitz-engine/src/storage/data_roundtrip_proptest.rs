@@ -192,7 +192,7 @@ fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
 // Tests
 // ---------------------------------------------------------------------------
 
-// Table::new(dir, name, schema, table_id, arena_size, persistence). The two
+// Table::with_arena(dir, name, schema, table_id, arena_size, persistence). The two
 // numerics are table_id = 1 and arena_size = 1 MiB (the memtable arena byte
 // budget), not a row capacity. Table::new calls ensure_dir, so the not-yet-
 // existing sub-dir is created here. full_scan / has_pk_bytes / retract_pk_bytes
@@ -205,7 +205,7 @@ fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> 
     } else {
         RecoverySource::Rederive
     };
-    Table::new(dir.to_str().unwrap(), schema, 1, 1 << 20, p).unwrap()
+    Table::with_arena(dir.to_str().unwrap(), schema, 1, 1 << 20, p).unwrap()
 }
 
 proptest! {

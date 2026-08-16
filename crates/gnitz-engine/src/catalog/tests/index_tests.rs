@@ -6,7 +6,7 @@ use crate::schema::{make_index_schema, IndexKeySpec, MAX_PK_BYTES};
 #[test]
 fn test_index_creation_and_backfill() {
     let dir = temp_dir("index_backfill");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.tfanout", &cols, &[0]).unwrap();
@@ -40,7 +40,7 @@ fn test_index_creation_and_backfill() {
 #[test]
 fn test_index_live_fanout() {
     let dir = temp_dir("idx_fanout");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.tfanout", &cols, &[0]).unwrap();
@@ -84,7 +84,7 @@ fn test_system_table_flush_compacts_l0() {
     // compact_if_needed call they accumulate unbounded. Drive many flushes and
     // assert the shard count stays bounded.
     let dir = temp_dir("sys_compact_l0");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let flushes = 40i64;
     for i in 0..flushes {
         engine
@@ -399,7 +399,7 @@ fn test_seek_by_index_u16_column() {
 #[test]
 fn test_drop_table_cleans_up_indices() {
     let dir = temp_dir("drop_table_idx");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("pk", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.idx_tbl", &cols, &[0]).unwrap();
@@ -429,7 +429,7 @@ fn test_drop_table_cleans_up_indices() {
 #[test]
 fn test_drop_table_cascades_secondary_index() {
     let dir = temp_dir("drop_table_cascade_sec");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("pk", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.cascade_tbl", &cols, &[0]).unwrap();
@@ -458,7 +458,7 @@ fn test_drop_table_cascades_secondary_index() {
     // the orphaned sys_indices row references tid which no longer exists.
     engine.close();
     drop(engine);
-    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine2.caches.index_by_name.contains_key(idx_name.as_str()));
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
@@ -467,7 +467,7 @@ fn test_drop_table_cascades_secondary_index() {
 #[test]
 fn test_drop_table_cascades_fk_index() {
     let dir = temp_dir("drop_table_cascade_fk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_cols = vec![col_def("pk", type_code::U64), col_def("name", type_code::U64)];
     let parent_tid = engine.create_table("public.parent", &parent_cols, &[0]).unwrap();
@@ -496,7 +496,7 @@ fn test_drop_table_cascades_fk_index() {
     // Reopen catalog — must succeed.
     engine.close();
     drop(engine);
-    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine2.caches.index_by_name.contains_key(fk_idx_name.as_str()));
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
@@ -564,7 +564,7 @@ fn test_drop_table_cascades_multiple_indices() {
     // Reopen: replay must succeed without orphaned sys_indices rows
     engine.close();
     drop(engine);
-    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine2.caches.index_by_id.contains_key(&idx1));
     assert!(!engine2.caches.index_by_id.contains_key(&idx2));
     engine2.close();
@@ -588,7 +588,7 @@ fn test_drop_table_cascades_multiple_indices() {
 #[test]
 fn test_compound_pk_secondary_index_seek() {
     let dir = temp_dir("compound_pk_idx_seek");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Compound PK = (a: U32, b: U32), payload = val: U64.
     // Source PK stride = 8 → index PK stride = 8 (promoted U64) + 8 = 16,
@@ -643,7 +643,7 @@ fn test_compound_pk_secondary_index_seek() {
 #[test]
 fn test_compound_pk_secondary_index_retract() {
     let dir = temp_dir("compound_pk_idx_retract");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![
         col_def("a", type_code::U32),
@@ -752,7 +752,7 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
 #[test]
 fn test_seek_by_index_orphan_entry_terminates() {
     let dir = temp_dir("seek_by_index_orphan");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.orphan_t", &cols, &[0]).unwrap();
@@ -830,7 +830,7 @@ fn drop_table_purges_the_schema_version_counter() {
 #[test]
 fn test_create_unique_index_on_string_blob_rejected() {
     let dir = temp_dir("uidx_string_reject");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let blob_col = col_def("data", type_code::BLOB);
     let cols = vec![
         col_def("id", type_code::U64),
@@ -888,7 +888,7 @@ fn count_idx_dirs(tbl_dir: &str) -> usize {
 #[test]
 fn test_promote_unique_index_over_fk_column_empty() {
     let dir = temp_dir("promote_unique_fk_empty");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
@@ -920,7 +920,7 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     // Masking-bug regression (clean data): CREATE UNIQUE INDEX over an FK column
     // populated with distinct values must promote and enforce, not be masked.
     let dir = temp_dir("promote_unique_fk_distinct");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
@@ -956,7 +956,7 @@ fn test_unique_index_over_fk_column_duplicate_data_rejected() {
     // with DUPLICATE values must fail and net sys_indices back to zero, instead
     // of silently dropping the constraint.
     let dir = temp_dir("promote_unique_fk_dup");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
@@ -999,7 +999,7 @@ fn test_drop_unique_index_on_fk_column_demotes() {
     // Dropping the user unique index of a UNIQUE+FK column must DEMOTE the
     // circuit (the FK auto-index still covers the column), not destroy it.
     let dir = temp_dir("demote_unique_fk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
@@ -1040,7 +1040,7 @@ fn test_drop_unique_index_on_fk_column_keeps_shared_directory() {
     // index must NOT delete that shared directory (the FK still needs it); a
     // subsequent drop_table removes the whole table dir, leaving no orphan.
     let dir = temp_dir("dir_correct_unique_fk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
@@ -1115,7 +1115,7 @@ fn test_drop_index_permitted_on_lone_pk_target() {
     // A redundant unique index on a lone-PK column that is an FK target may be
     // dropped: the PK itself preserves uniqueness for FK child validation.
     let dir = temp_dir("drop_idx_lone_pk_fk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
@@ -1142,7 +1142,7 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
     // A non-PK FK-target column with a unique index cannot have that index
     // dropped while a child references it and no other unique index survives.
     let dir = temp_dir("drop_idx_nonpk_fk_blocked");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Parent (id PK, email) with a UNIQUE index on the non-PK `email` column.
     let parent_cols = vec![col_def("id", type_code::U64), col_def("email", type_code::U64)];
@@ -1280,7 +1280,7 @@ fn test_promote_unique_duplicate_across_chunks_rejected() {
     // same chunked scan; a cross-chunk duplicate must reject the promotion
     // and leave the incumbent non-unique.
     let dir = temp_dir("promote_dup_cross_chunk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
@@ -2551,18 +2551,16 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // reorders by the full 24-byte key.
     //
     // Wide PKs are DDL-rejected for base tables, so this builds the DAG table and
-    // index circuit directly (as `wide_pk_validation.rs` does). The base is a
-    // 256-way `PartitionedTable`, the only shape an index owner takes in
-    // production — the range gather routes each collected PK to its own
-    // partition, which a borrowed single `Table` could not exercise. The leading
-    // PK column is distinct per row: the base flush orders each partition's shard
-    // by the wide PK, which the resolve's binary-search seek relies on.
+    // index circuit directly (as `wide_pk_validation.rs` does). The base is an
+    // owned `Table`, the shape an index owner takes in production. The leading
+    // PK column is distinct per row: the base flush orders the shard by the wide
+    // PK, which the resolve's binary-search seek relies on.
     use crate::query::{DagEngine, RelationKind, StoreHandle};
     use crate::schema::SchemaDescriptor;
-    use crate::storage::{PartitionedTable, RecoverySource, Routing, Table};
+    use crate::storage::{RecoverySource, Table};
 
     let dir = temp_dir("catalog_range_wide_pk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.next_table_id;
 
     // pk_stride = 24: three U64 PK columns + one U64 payload `x` (source col 3).
@@ -2589,19 +2587,11 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
         &idx_schema,
     );
 
-    let mut base = PartitionedTable::new(
-        &format!("{dir}/base"),
-        schema,
-        tid as u32,
-        Routing::Hashed { start: 0, end: 256 },
-        RecoverySource::Rederive,
-    )
-    .unwrap();
+    let mut base = Table::new(&format!("{dir}/base"), schema, tid as u32, RecoverySource::Rederive).unwrap();
     let mut idx = Table::new(
         &format!("{dir}/idx"),
         idx_schema,
         tid as u32 + 1,
-        256 * 1024,
         RecoverySource::Rederive,
     )
     .unwrap();
@@ -2612,7 +2602,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
 
     engine.dag.register_table(
         tid,
-        StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(base))),
+        StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(base))),
         schema,
         RelationKind::BaseTable,
         0,

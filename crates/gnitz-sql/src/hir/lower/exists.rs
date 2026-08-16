@@ -295,7 +295,7 @@ impl ExistsCore<'_> {
 
         let (primary, unmatched): (NodeId, Option<NodeId>) = if n_eq == 0 {
             // Pure range: the one-row threshold m = MAX/MIN(b.range) decides existence.
-            let int_a = cb.partition_filter(reindex_a);
+            let int_a = cb.worker_filter(reindex_a);
             let trace_a = cb.integrate_trace(int_a);
             // Only the branches that subtract from A (`A − matched`) need the passthrough.
             let want_a_pass = kind != JoinType::Semi;

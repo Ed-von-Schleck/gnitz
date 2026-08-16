@@ -98,8 +98,6 @@ fn flush_cadence_amplification_bench() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    // 256 KiB arena matching the `Routing::Hashed` per-partition arena.
-    const ARENA: u64 = 256 << 10;
     let schema = make_schema_flush();
 
     // Untimed warmup: warm the thread-local batch pool before the first config.
@@ -109,7 +107,6 @@ fn flush_cadence_amplification_bench() {
             dir.path().join("warmup").to_str().unwrap(),
             schema,
             1,
-            ARENA,
             RecoverySource::Rederive,
         )
         .unwrap();
@@ -140,7 +137,6 @@ fn flush_cadence_amplification_bench() {
             dir.path().join(label).to_str().unwrap(),
             schema,
             100 + id as u32,
-            ARENA,
             RecoverySource::Rederive,
         )
         .unwrap();

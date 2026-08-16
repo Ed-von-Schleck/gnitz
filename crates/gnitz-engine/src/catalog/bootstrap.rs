@@ -5,14 +5,15 @@ use gnitz_wire::SEQTAB_COL_VALUE;
 impl CatalogEngine {
     // -- Open engine (main entry point) ------------------------------------
 
-    /// Opens or creates a GnitzDB instance at `base_dir`.
-    /// Equivalent of `open_engine()`.
-    pub fn open(base_dir: &str) -> Result<Self, String> {
+    /// Opens or creates a GnitzDB instance at `base_dir`, laid out for
+    /// `num_workers` workers — passed in rather than read off `worker_ctx`, for
+    /// the reason on [`CatalogEngine::num_workers`].
+    pub fn open(base_dir: &str, num_workers: u32) -> Result<Self, String> {
         ensure_dir(base_dir)?;
 
         ensure_dir(&sys_catalog_dir(base_dir))?;
 
-        // Create system tables (single-partition; durability derived from the
+        // Create system tables (one `Table` each; durability derived from the
         // kind they are later registered under).
         let mut stores = Vec::with_capacity(SysFamily::COUNT);
         for info in &SYS_FAMILIES {
@@ -20,7 +21,6 @@ impl CatalogEngine {
                 &sys_family_dir(base_dir, info.wire.name),
                 sys_tab_schema(info.id()),
                 info.id() as u32,
-                SYS_TABLE_ARENA,
                 RelationKind::SystemCatalog.recovery_source(),
             )
             .map(Box::new)
@@ -44,8 +44,8 @@ impl CatalogEngine {
             next_table_id: FIRST_USER_TABLE_ID,
             next_index_id: FIRST_USER_INDEX_ID,
             user_sequences: std::collections::HashMap::new(),
-            active_part_start: 0,
-            active_part_end: NUM_PARTITIONS,
+            num_workers,
+            owns_stores: true,
             committed_generation: 0,
             recorded_topology: 0,
             invalid_views: rustc_hash::FxHashSet::default(),
@@ -268,10 +268,10 @@ impl CatalogEngine {
     /// path can abort before the SAL — the only durable copy of replayed DDL —
     /// is reset.
     pub fn flush_all_system_tables(&mut self) -> Result<(), String> {
-        // One barrier over the whole set, not ten: the round batches every dirty
+        // One barrier over the whole set, not ten: the round batches every
         // family's manifest, data and directory syncs into three submissions and
         // builds at most one io_uring. System tables are `SalReplay`, so each
-        // folds memtable + L0 into a durable shard; a clean family costs nothing.
+        // folds memtable + L0 into a durable shard and re-stamps its manifest.
         let tables = self.sys_stores.iter_mut().map(|b| &mut **b as *mut Table);
         crate::storage::flush_barrier(tables, crate::storage::FlushRound::Base)
             .map_err(|e| format!("boot flush of the system catalog failed: {e:?}"))
@@ -284,11 +284,11 @@ impl CatalogEngine {
         // Flush all user tables before clearing DagEngine. System tables hold
         // Borrowed handles and are flushed below.
         for entry in self.dag.tables.values_mut() {
-            if let StoreHandle::Partitioned(cell) = &mut entry.handle {
+            if let StoreHandle::Owned(cell) = &mut entry.handle {
                 let _ = cell.get_mut().flush();
             }
         }
-        // tables.clear() in dag.close() drops Box<PartitionedTable> automatically.
+        // tables.clear() in dag.close() drops the owned `Box<Table>` automatically.
         self.dag.close();
         let _ = self.flush_all_system_tables();
     }

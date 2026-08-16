@@ -5,7 +5,7 @@ use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{
     OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_FILTER, OPCODE_INTEGRATE_TRACE, OPCODE_JOIN_DELTA_TRACE,
     OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR, OPCODE_MAP_PROJ, OPCODE_NEGATE, OPCODE_NULL_EXTEND,
-    OPCODE_PARTITION_FILTER, OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_SCAN_DELTA, OPCODE_UNION,
+    OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_SCAN_DELTA, OPCODE_UNION, OPCODE_WORKER_FILTER,
 };
 
 mod common;
@@ -992,7 +992,7 @@ fn test_band_left_join_accepts_wide_range_column() {
 /// `A − matched` subtraction). Crucially the sources stay the SAME two
 /// (`a`, `b` — no `__m`/`__sent` delta), it keeps exactly **one** `ExchangeShard`
 /// (the pair-PK output — the reduce is shard-free) and the inner's two
-/// `PartitionFilter`s (`trace_m`/`reindex_m` have none), and adds **zero**
+/// `WorkerFilter`s (`trace_m`/`reindex_m` have none), and adds **zero**
 /// `distinct`. No `__pls_left__m`/`__pls_left__sent` catalog objects are created.
 #[test]
 fn test_pure_range_left_join_circuit_shape() {
@@ -1073,8 +1073,8 @@ fn test_pure_range_left_join_circuit_shape() {
     );
 
     // Single output exchange (the reduce is SHARD-FREE — run locally on every worker
-    // over the broadcast b); trace_m is replicated (no PartitionFilter); the inner's
-    // two side PartitionFilters are unchanged.
+    // over the broadcast b); trace_m is replicated (no WorkerFilter); the inner's
+    // two side WorkerFilters are unchanged.
     assert_eq!(
         n_left(OPCODE_EXCHANGE_SHARD),
         1,
@@ -1086,9 +1086,9 @@ fn test_pure_range_left_join_circuit_shape() {
         "INNER pure-range has one output exchange"
     );
     assert_eq!(
-        n_left(OPCODE_PARTITION_FILTER),
+        n_left(OPCODE_WORKER_FILTER),
         2,
-        "two side PartitionFilters; trace_m has none"
+        "two side WorkerFilters; trace_m has none"
     );
 
     // No equi join machinery.
@@ -1321,16 +1321,16 @@ fn test_range_join_pair_pk_at_cap() {
     );
 }
 
-// ── Range/band-join circuit shape (the §1 PartitionFilter split) ─────────────
+// ── Range/band-join circuit shape (the §1 WorkerFilter split) ─────────────
 
 /// The §1 split, pinned at the circuit level. A band join (`n_eq ≥ 1`) is
 /// eq-prefix-scattered, so its per-side trace is already partitioned and the
-/// circuit carries NO `PartitionFilter`. A pure range join (`n_eq == 0`)
-/// broadcasts, so each side keeps a `PartitionFilter` to drop the rows the worker
+/// circuit carries NO `WorkerFilter`. A pure range join (`n_eq == 0`)
+/// broadcasts, so each side keeps a `WorkerFilter` to drop the rows the worker
 /// does not own before integrating — two of them, one per side. Both are range
 /// circuits: each has two `Join(DeltaTraceRange)` terms (the bilinear AB/BA form).
 #[test]
-fn test_range_join_partition_filter_circuit_shape() {
+fn test_range_join_worker_filter_circuit_shape() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -1364,14 +1364,14 @@ fn test_range_join_partition_filter_circuit_shape() {
     let nodes = nodes.as_ref();
 
     assert_eq!(
-        opcode_node_count(nodes, band, OPCODE_PARTITION_FILTER),
+        opcode_node_count(nodes, band, OPCODE_WORKER_FILTER),
         0,
-        "band join scatters by the eq prefix — no PartitionFilter"
+        "band join scatters by the eq prefix — no WorkerFilter"
     );
     assert_eq!(
-        opcode_node_count(nodes, pure, OPCODE_PARTITION_FILTER),
+        opcode_node_count(nodes, pure, OPCODE_WORKER_FILTER),
         2,
-        "pure range join broadcasts — one PartitionFilter per side"
+        "pure range join broadcasts — one WorkerFilter per side"
     );
 
     assert_eq!(
@@ -1394,7 +1394,7 @@ fn test_range_join_partition_filter_circuit_shape() {
 /// re-key → project → `union` (inner ∪ null-fill): `map_reindex ×3`, `map ×2`,
 /// `distinct ×1`, `negate ×1`, `union ×2`, `null_extend ×1`. Crucially it adds
 /// **zero** ExchangeShard, range/anti/outer Join, IntegrateTrace, or
-/// PartitionFilter — the null-fill is partition-local and reuses the inner output,
+/// WorkerFilter — the null-fill is partition-local and reuses the inner output,
 /// riding the one existing pair-PK output exchange. The INNER view is unchanged
 /// (no distinct / null_extend / negate).
 #[test]
@@ -1480,11 +1480,7 @@ fn test_band_left_join_circuit_shape() {
         n_inner(OPCODE_INTEGRATE_TRACE),
         "no added IntegrateTrace"
     );
-    assert_eq!(
-        n_left(OPCODE_PARTITION_FILTER),
-        0,
-        "band LEFT carries no PartitionFilter"
-    );
+    assert_eq!(n_left(OPCODE_WORKER_FILTER), 0, "band LEFT carries no WorkerFilter");
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
 
     // Exactly one positive_part, no distinct, and the INNER view is shape-unchanged.
@@ -2212,7 +2208,7 @@ fn test_band_right_full_circuit_shape() {
             "the single shared pair-PK output exchange"
         );
         assert_eq!(n(vid, OPCODE_DISTINCT), 0, "weight-exact null-fill uses no distinct");
-        assert_eq!(n(vid, OPCODE_PARTITION_FILTER), 0, "band carries no PartitionFilter");
+        assert_eq!(n(vid, OPCODE_WORKER_FILTER), 0, "band carries no WorkerFilter");
     }
 
     assert_eq!(n(inner, OPCODE_POSITIVE_PART), 0, "INNER band has no positive_part");

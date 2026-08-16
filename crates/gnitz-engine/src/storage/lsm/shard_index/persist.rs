@@ -36,32 +36,17 @@ impl ShardIndex {
     }
 
     fn entry_to_raw(&self, e: &ShardEntry, level: u64, gk: u128) -> ManifestEntryRaw {
-        // Store the basename, not the full path: a full path could exceed the
-        // 128-byte filename field, and a truncated name is an unopenable shard
-        // at reload. Basenames are bounded well under the field width — a
-        // violation is a naming-scheme bug, so fail loudly instead of truncating.
-        let name_bytes = shard_basename(&e.filename).as_bytes();
-        assert!(
-            name_bytes.len() < 128,
-            "shard basename overflows the manifest filename field: {}",
-            e.filename,
-        );
-        let mut filename = [0u8; 128];
-        filename[..name_bytes.len()].copy_from_slice(name_bytes);
-        ManifestEntryRaw {
-            max_lsn: e.max_lsn,
-            filename,
-            level,
-            guard_key: gk,
-        }
+        ManifestEntryRaw::new(shard_basename(&e.filename), e.max_lsn, level, gk)
     }
 
-    pub fn load_manifest(&mut self, path: &str) -> Result<(), StorageError> {
+    /// Load the shard set `path` names, returning the header it carried — the
+    /// only read of that file, so the caller's own header fields come from here
+    /// rather than a second peek. `Ok(None)` when the manifest is absent
+    /// (first-time table boot); other read errors propagate.
+    pub fn load_manifest(&mut self, path: &str) -> Result<Option<ManifestHeader>, StorageError> {
         let cpath = super::super::cstr(path)?;
-        // Missing manifest file ⇒ first-time table boot, treat as empty.
-        // Other read errors propagate.
         let Some((entries, header)) = manifest::read_file(&cpath)? else {
-            return Ok(());
+            return Ok(None);
         };
         // Compaction output names must never reuse a value baked into a live,
         // manifest-referenced shard across a restart.
@@ -94,7 +79,7 @@ impl ShardIndex {
             }
         }
         self.sort_l0();
-        Ok(())
+        Ok(Some(header))
     }
 
     /// Startup GC: removes orphaned shard/compaction files and stale `.tmp`
@@ -119,15 +104,19 @@ impl ShardIndex {
     /// one-shot shard write already registered its shard, so the current index is
     /// authoritative — no pending entry to splice in.
     ///
-    /// `generation` is the checkpoint generation the manifest is stamped with —
-    /// passed by the publish path (the worker's ephemeral round supplies the
-    /// committed generation; base `SalReplay` publishes stamp 0, which is never
-    /// read back).
-    pub fn prepare_manifest(&self, manifest_path: &CStr, generation: u64) -> Result<PreparedManifest, StorageError> {
+    /// The header's two sequence fields come from the publisher: the checkpoint
+    /// generation from the round, the layout sequence from the table's child set.
+    pub fn prepare_manifest(
+        &self,
+        manifest_path: &CStr,
+        checkpoint_gen: u64,
+        layout_seq: u64,
+    ) -> Result<PreparedManifest, StorageError> {
         let entries = self.build_manifest_entries();
         let header = ManifestHeader {
             compact_seq: self.compact_seq,
-            generation,
+            checkpoint_gen,
+            layout_seq,
         };
         manifest::prepare_file(manifest_path, &entries, header)
     }

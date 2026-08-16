@@ -1642,7 +1642,7 @@ mod tests {
     /// The digest is seeded with the basename and nothing else: a shard renamed
     /// out from under the manifest fails to open, while one hard-linked into
     /// another directory under the same name still opens. The second half is
-    /// what `seed_missing_locals` relies on when it seeds a sibling child.
+    /// what `link_child` relies on when it seeds a sibling child.
     #[test]
     fn the_digest_seed_separates_names_not_directories() {
         raise_fd_limit_for_tests();

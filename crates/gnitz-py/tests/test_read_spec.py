@@ -231,7 +231,7 @@ def test_empty_pk_range_count_returns_zero(client):
         _cleanup(client, sn, "t")
 
 
-def test_pk_in_spans_every_partition(client):
+def test_pk_in_spans_every_worker(client):
     """`pk IN (…)` broadcasts and each worker keeps only the keys it can own —
     a filter that must mirror the cursor exactly, or the result comes up short."""
     sn = "rs" + _uid()

@@ -167,8 +167,8 @@ def test_two_serialized_add_columns(client):
         client.drop_schema(sn)
 
 
-def test_add_column_reaches_every_partition(client):
-    """Enough rows to spread across all 256 partitions on 4 workers: the swap has
+def test_add_column_reaches_every_worker(client):
+    """Enough rows to spread across all 4 workers: the swap has
     to widen every partition's resident runs, or a scan would read the appended
     column off a narrow run."""
     sn = "aadd" + _uid()

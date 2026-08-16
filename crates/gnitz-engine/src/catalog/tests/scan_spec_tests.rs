@@ -114,9 +114,9 @@ fn pk_set_gathers_named_keys() {
     assert_eq!(got, vec![(2u128, 200, 1), (5u128, 500, 1), (7u128, 700, 1)]);
 }
 
-/// A system table's store is one unpartitioned `Table` holding every key, which
+/// A system table's store is one `Table` holding every key, which
 /// the cursor reads whole — so the gather's ownership filter must keep every key
-/// there. Treating it like a hashed store would answer zero rows.
+/// there. Routing the key to its owning worker instead would answer zero rows.
 #[test]
 fn pk_set_over_a_system_table_keeps_every_key() {
     let (mut e, tid, _dir) = table_fixture("ss_pkset_sys", &id_val_cols());
@@ -148,21 +148,20 @@ fn pk_set_rejects_keys_colliding_after_truncation() {
     assert!(err.contains("duplicate"), "{err}");
 }
 
-/// A REPLICATED base table is an **unhashed** store: one child holding the whole
-/// local dataset, its rows not keyed by `partition_for_pk` at all. Every keyed
-/// read has to resolve through `slot_for_key`, which maps any key to that one
-/// child — routing by the key's partition id alone finds no local slot and would
-/// silently answer zero rows.
+/// A REPLICATED base table holds a full copy of the dataset in this worker's own
+/// store, its rows not keyed by `worker_for_pk` at all. Every keyed read must
+/// resolve through that store rather than through the key's owning worker, which
+/// for most keys is some other worker and would silently answer zero rows.
 #[test]
 fn keyed_reads_over_a_replicated_table_find_every_key() {
     const N: u128 = 20;
     let dir = temp_dir("ss_replicated");
-    let mut e = CatalogEngine::open(&dir).unwrap();
+    let mut e = CatalogEngine::open(&dir, 1).unwrap();
     let cols = id_val_cols();
     let tid = create_flagged_table(&mut e, "rep", &cols, &[0], gnitz_wire::pack_table_flags(true, 0));
     assert!(
-        e.dag.tables.get(&tid).unwrap().handle.is_unhashed(),
-        "REPLICATED must build an unhashed store"
+        e.get_schema_desc(tid).unwrap().placement().is_replicated(),
+        "REPLICATED must stamp a replicated placement"
     );
 
     let schema = e.get_schema_desc(tid).unwrap();
@@ -300,16 +299,16 @@ fn pk_set_drains_a_group_larger_than_the_chunk_budget() {
 }
 
 /// A `CLUSTER BY` table hashes only the leading PK column, so a range that pins
-/// it is confined to one partition and the scan opens only that one. It must
-/// still return the whole group — and a range that spans the leading column is
-/// not confinable (partition ids are `mix(pk) >> 56`, not monotone in key order)
-/// and must stay on the merged cursor and return every row.
+/// it lives on one worker and the master unicasts it. A range that spans the
+/// leading column is not confinable (an owner is a hash of the key, not monotone
+/// in key order) and stays a broadcast. Either way the scan itself must return
+/// every row of this worker's slice that the range covers.
 #[test]
 fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
     const NA: u64 = 4;
     const NB: u64 = 5;
     let dir = temp_dir("ss_clustered");
-    let mut e = CatalogEngine::open(&dir).unwrap();
+    let mut e = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
         col_def("a", type_code::U64),
         col_def("b", type_code::U64),
@@ -351,10 +350,10 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
     };
 
     // `a = 2 AND b >= 0` — a whole trailing-column range inside one `a` group,
-    // which shares the distribution prefix and so routes to one partition.
+    // which shares the distribution prefix and so routes to one worker.
     let confined = RangeDescriptor::new(&[2], Cut::Before(0), Cut::After(u64::MAX as u128));
     assert!(
-        scan_spec_partition(&schema, &confined).is_some(),
+        scan_spec_worker(&schema, &confined, 4).is_some(),
         "the fixture's confined range must be the routed shape"
     );
     assert_eq!(
@@ -363,17 +362,17 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
         "a confined range still returns its whole group"
     );
 
-    // `1 <= a < 3` spans two `a` groups, so it is not confinable and keeps the
-    // merged cursor.
+    // `1 <= a < 3` spans two `a` groups, so it is not confinable and stays a
+    // broadcast.
     let spanning = RangeDescriptor::new(&[], Cut::Before(1), Cut::Before(3));
-    assert!(scan_spec_partition(&schema, &spanning).is_none());
+    assert!(scan_spec_worker(&schema, &spanning, 4).is_none());
     let mut want: Vec<(u64, u64, i64)> = Vec::new();
     for a in 1..3 {
         for b in 0..NB {
             want.push((a, b, (a * 100 + b) as i64));
         }
     }
-    assert_eq!(scan(&mut e, spanning), want, "a range spanning partitions loses no row");
+    assert_eq!(scan(&mut e, spanning), want, "a range spanning workers loses no row");
 
     e.close();
     let _ = fs::remove_dir_all(&dir);

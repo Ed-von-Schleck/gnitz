@@ -64,7 +64,7 @@ fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str,
 /// Names of the entries directly under `public`'s schema directory — where the
 /// pre-flight's throwaway root lives.
 fn schema_entries(dir: &str) -> Vec<String> {
-    let mut names = crate::catalog::utils::subdir_names(&format!("{dir}/public"));
+    let mut names = crate::storage::subdir_names(&format!("{dir}/public"));
     names.sort();
     names
 }
@@ -79,7 +79,7 @@ fn schema_entries(dir: &str) -> Vec<String> {
 #[test]
 fn test_preflight_compile_verdict_and_no_residue() {
     let dir = temp_dir("preflight_verdict");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
 
@@ -141,7 +141,7 @@ fn test_preflight_compile_verdict_and_no_residue() {
 #[test]
 fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     let dir = temp_dir("preflight_qname");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let old_vid = register_filtered_view(&mut engine, base_tid, "vw", &pred_lt_blob(1, 100));
@@ -186,7 +186,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
 #[test]
 fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let dir = temp_dir("preflight_rollback");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let base_cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let old_vid = register_filtered_view(&mut engine, base_tid, "vw", &pred_lt_blob(1, 100));

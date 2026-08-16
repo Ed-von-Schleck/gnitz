@@ -3,8 +3,9 @@
 //! (`shard_index`), the N-way compaction kernel (`compact`), the sorted run
 //! (`run`) and the RAM-tier run sets built from it (`run_set`), the opaque read
 //! cursor (`read_cursor`), the manifest serde (`manifest`), the filename grammar
-//! (`naming`), and the `Table` / `PartitionedTable` facades. The pure byte codecs
-//! (`wal`, `shard_file`, `layout`) live one layer down in `repr/`.
+//! (`naming`), the boot relayout (`repartition`), and the `Table` facade. The
+//! pure byte codecs (`wal`, `shard_file`, `layout`) live one layer down in
+//! `repr/`.
 //!
 //! `lsm/` has **no outward facade of its own** — `storage/mod.rs` curates the
 //! single combined storage surface and re-exports the public items from these
@@ -19,8 +20,8 @@ pub(super) mod child_dir;
 pub(super) mod flush_barrier;
 pub(super) mod index_gather;
 pub(super) mod manifest;
-pub(super) mod partitioned_table;
 pub(super) mod read_cursor;
+pub(super) mod repartition;
 pub(super) mod spill;
 pub(super) mod table;
 

@@ -36,27 +36,24 @@ pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, seek_pk_e
 /// The one worker that can answer this read, or `None` when nothing proves one —
 /// a relation whose rows are not key-placed, a non-`PkRange` bound, a forged
 /// descriptor (left for the worker to reject at the trust boundary), or a range
-/// spanning partitions. An `IndexRange` bound is never confined: a secondary index
+/// spanning workers. An `IndexRange` bound is never confined: a secondary index
 /// is one unpartitioned table per worker, so nothing derives its owner from the
 /// key.
 ///
-/// Only a hashed store is key-routable, and the catalog — not the master's own
-/// stores — answers whether a relation is: the master's routing depends on when
-/// the relation was built (a post-fork CREATE reports `Hashed` over the master's
-/// empty active range), so it disagrees with the workers' across a restart.
+/// Only a key-routed relation names an owner, and the catalog — not the master's
+/// own stores — answers whether a relation is: the master holds no store at all
+/// after the fork, so its own handles cannot speak for the workers'.
 fn confined_worker(disp: &MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> Option<usize> {
     let cat = disp.cat();
     let schema = cat.get_schema_desc(target_id)?;
-    // The same predicate `build_partitioned_storage` chose the store shape with:
-    // anything but `Keyed` is built unhashed, so no key names an owner and the
-    // read cannot route against a shape the registration chose differently.
+    // For anything but `Keyed` no key names an owner, so nothing can be routed
+    // against a placement the write path scatters differently.
     if !schema.placement().is_key_routed() {
         return None;
     }
     let (spec, _block) = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).ok()?;
     let desc = gnitz_wire::peek_pk_range(spec)?;
-    let partition = crate::catalog::scan_spec_partition(&schema, &desc)?;
-    Some(worker_for_partition(partition, disp.num_workers))
+    crate::catalog::scan_spec_worker(&schema, &desc, disp.num_workers)
 }
 
 /// Timeout for the synchronous `W2mReceiver::wait_for` fallback in the two
@@ -723,7 +720,7 @@ impl MasterDispatcher {
         // eq-values co-partition both sides and the range probe is partition-local.
         // A pure range join (n_eq == 0) has no eq prefix: its matches are spread
         // over the whole key space, so it BROADCASTS the full delta and each worker
-        // trims to its owned slice (PartitionFilter) before integrating. The output
+        // trims to its owned slice (WorkerFilter) before integrating. The output
         // relay (source_id == 0) is NOT a join relay (is_join is false there) and
         // keeps the GroupKey scatter.
         let range_n_eq = if is_join { meta.range_join_n_eq } else { None };
@@ -880,13 +877,13 @@ impl MasterDispatcher {
             .get_schema_desc(target_id)
             .ok_or_else(|| format!("seek: table {target_id} not found"))?;
         // Decode the wire pair to the OPK bytes (width-universal), then route off
-        // the distribution prefix via the shared `partition_for_pk`. A FLAG_SEEK
+        // the distribution prefix via the shared `worker_for_pk`. A FLAG_SEEK
         // always carries the full PK and the prefix ⊆ the PK, so a full-PK seek
         // pins exactly one worker — no broadcast clause. Hashing the native value
         // instead of the OPK bytes would misroute signed and compound PKs.
         let opk = crate::schema::key::seek_opk_bytes(&schema, pk, seek_pk_extra)
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
-        let worker = worker_for_partition(schema.partition_for_pk(opk.pk_bytes()), num_workers);
+        let worker = schema.worker_for_pk(opk.pk_bytes(), num_workers);
         let (mut slots, _req_ids, _lease) = dispatch_scan_fanout(
             disp,
             reactor,
@@ -991,8 +988,8 @@ impl MasterDispatcher {
     /// Fan out a SCAN — to all workers (`unicast == -1`), or to ONE worker for a
     /// **replicated** relation, whose full copy lives on every worker (an
     /// all-worker fan-out would concatenate W identical copies; worker 0 always
-    /// exists and replicated tables are exempt from the bootstrap trim, so it
-    /// holds the full copy at partition 0). Forwards every response frame
+    /// exists and every replicated child is a copy of every other, so it holds
+    /// the full copy). Forwards every response frame
     /// directly to the client, continuation chunks included, and returns
     /// `Ok(true)` when all drained trains finish, `Ok(false)` if the client
     /// disconnects mid-stream, `Err` on a worker error.
@@ -1551,7 +1548,7 @@ mod checkpoint_finalize_tests {
         let dir = finalize_temp_dir("seq_survives_reset");
         let user_seq = FIRST_USER_TABLE_ID + 3;
         {
-            let mut engine = CatalogEngine::open(&dir).unwrap();
+            let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
             // Reserve + ingest straight into the catalog — no SAL involved, so the
             // advance lands ONLY in the sys_sequences MemTable (mirrors
@@ -1583,7 +1580,7 @@ mod checkpoint_finalize_tests {
             drop(engine);
         }
 
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(
             engine.user_sequences.get(&user_seq).copied(),
             Some(64),

@@ -149,10 +149,10 @@ impl ColumnLocator {
     }
 
     /// Canonical sign-aware *routing* key for the value in `row` — the form
-    /// `partition_for_pk_bytes` compares on, and the routing counterpart to
+    /// `worker_for_pk_bytes` compares on, and the routing counterpart to
     /// [`Self::native_key`]. A PK column widens its OPK
     /// bytes; a payload column OPK-encodes then widens, so equal logical values
-    /// route to the same partition whether stored as a PK or a payload column.
+    /// route to the same worker whether stored as a PK or a payload column.
     /// Callers must `is_null`-gate first. STRING/BLOB have no order-preserving
     /// routing image (this returns `payload_route_key`'s raw low-8-byte image for
     /// them); a caller routing by string content hashes it before reaching here.

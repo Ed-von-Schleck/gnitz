@@ -1,6 +1,6 @@
 //! Worker process event loop.
 //!
-//! Owns a subset of partitions for every user table. Receives requests from
+//! Owns one store per user relation — this worker's slice of it. Receives requests from
 //! the master via the SAL (shared append-only log), sends responses via a
 //! per-worker W2M shared region.
 
@@ -907,12 +907,12 @@ impl WorkerProcess {
     }
 
     /// Distributed CREATE-VIEW backfill, worker side. Streams this worker's
-    /// committed `source_tid` partition through the incremental plan one chunk at
-    /// a time (peak RAM ~O(chunk), not O(partition)), driving an exchange round
+    /// committed slice of `source_tid` through the incremental plan one chunk at
+    /// a time (peak RAM ~O(chunk), not O(slice)), driving an exchange round
     /// per chunk per exchanging view across the cross-worker barrier.
     ///
-    /// All workers must issue the SAME number of rounds, but partitions are
-    /// unequal — so a worker that has drained its partition keeps issuing EMPTY
+    /// All workers must issue the SAME number of rounds, but slices are
+    /// unequal — so a worker that has drained its own keeps issuing EMPTY
     /// (pad) rounds to stay in lockstep, until the master signals stop. The stop
     /// decision is collective: each worker stamps a per-chunk pad bit onto every
     /// FLAG_EXCHANGE it issues (`do_exchange_wait`), the master ANDs them and
@@ -930,7 +930,7 @@ impl WorkerProcess {
     /// reactor), so it never yields to live traffic between chunks.
     fn handle_backfill(&mut self, source_tid: i64, view_id: i64, request_id: u64) -> Result<(), String> {
         // Recovery step-4: the FIRST backfill command for an invalid view resets
-        // its output partitions + operator scratch on THIS worker before any fill,
+        // its output store + operator scratch on THIS worker before any fill,
         // so the rebuild starts from an empty, well-formed store (the tick sweep
         // may have polluted its tentatively-loaded state). Gated on the
         // COW-inherited `invalid_views` set and self-clearing, so a multi-source
@@ -955,9 +955,7 @@ impl WorkerProcess {
             // `None` ⇒ partition exhausted: this round is an empty PAD. The
             // master ANDs the pad bit across workers and stamps the collective
             // stop/continue/checkpoint decision back onto each relay.
-            let drained = handle
-                .as_mut()
-                .and_then(|h| self.cat().drain_source_chunk(h, source_tid, chunk_rows));
+            let drained = handle.as_mut().and_then(|h| h.drain_chunk(chunk_rows));
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
             self.exchange.backfill_pad = Some(pad);
@@ -1189,12 +1187,12 @@ impl WorkerProcess {
                     .cat()
                     .get_schema_desc(target_id)
                     .ok_or_else(|| format!("no schema for tid={target_id}"))?;
-                let ptable = self.cat().get_ptable_handle(target_id);
+                let store = self.cat().get_store_handle(target_id);
                 // Route on verbatim OPK bytes for every PK width: feeding `get_pk`
                 // (OPK-widened) to `has_pk(u128)` would re-OPK-encode it, a double
                 // sign-flip that misses signed PKs.
                 let result = filter_by_pk_bytes(batch.as_ref(), schema, |pkb, _| {
-                    if ptable.as_ref().is_some_and(|pt| pt.has_pk_bytes(pkb)) {
+                    if store.as_ref().is_some_and(|t| t.has_pk_bytes(pkb)) {
                         Resolved::ProbeKey
                     } else {
                         Resolved::Absent
@@ -1218,7 +1216,7 @@ impl WorkerProcess {
         )
     }
 
-    /// Base checkpoint round: flush every user relation's partitions + index
+    /// Base checkpoint round: flush every user relation's store + index
     /// circuits (`SalReplay` publishes; rederived tables fold to RAM inline).
     fn handle_flush_all(&mut self) -> Result<(), String> {
         // pending_deltas is intentionally NOT cleared here. A checkpoint can
@@ -1903,7 +1901,7 @@ mod tests {
         use crate::schema::type_code;
 
         let dir = worker_temp_dir("force_fifo_text");
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let cols = vec![col_def("id", type_code::U64), col_def("s", type_code::STRING)];
         let tid = engine.create_table("public.tfifo", &cols, &[0]).unwrap();
         let schema = engine.get_schema_desc(tid).unwrap();
@@ -2184,7 +2182,7 @@ mod tests {
         use crate::schema::type_code;
 
         let dir = worker_temp_dir("string_oversized");
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let cols = vec![col_def("id", type_code::U64), col_def("s", type_code::STRING)];
         let tid = engine.create_table("public.tstr", &cols, &[0]).unwrap();
         let schema = engine.get_schema_desc(tid).unwrap();
@@ -2215,7 +2213,7 @@ mod tests {
         use crate::schema::type_code;
 
         let dir = worker_temp_dir("projected_one_off");
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let cols = vec![
             col_def("id", type_code::U64),
             col_def("a", type_code::U64),

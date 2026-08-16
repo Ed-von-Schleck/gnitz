@@ -276,74 +276,53 @@ pub fn promote_opk_column(src_opk: &[u8], src_tc: u8, target_tc: u8, dst: &mut [
 /// Widest PK region that still fits in a packed `u128` word, the boundary where
 /// a key stops fitting one register. At or below it [`widen_pk_be`] recovers the
 /// exact key as a `u128` (wider regions must be read as bytes) and
-/// [`partition_for_pk_bytes`] routes through that value; above it a key is
+/// [`worker_for_pk_bytes`] routes through that value; above it a key is
 /// ordered and hashed as raw bytes.
 pub const NARROW_PK_MAX_BYTES: usize = 16;
 
-/// Number of partition buckets a routing hash spreads over. Both
-/// [`partition_for_key`] and [`partition_for_pk_bytes`] take the top 8 bits of
-/// their hash, so every partition index is in `0..PARTITION_COUNT`.
-pub const PARTITION_COUNT: usize = 256;
-
-/// Route a native PK value to a partition.
-///
-/// Multiplicative hash: two Fibonacci multipliers XOR'd together. ~4
-/// instructions vs ~20 for XXH3-64; distribution across 256 buckets is
-/// sufficient for worker routing. XXH3 is reserved for filters (xor8, bloom)
-/// where collision quality matters.
+/// Map a 64-bit hash onto `0..num_workers` — a multiply-shift, no divide and no
+/// branch, uniform over the range at every count. The one spelling both routing
+/// arms below use.
 #[inline(always)]
-pub fn partition_for_key(pk: u128) -> usize {
+fn bucket(h: u64, num_workers: usize) -> usize {
+    debug_assert!(num_workers >= 1, "worker routing: num_workers must be >= 1");
+    ((h as u128 * num_workers as u128) >> 64) as usize
+}
+
+/// Which worker owns `key`.
+///
+/// Multiplicative hash: two Fibonacci multipliers XOR'd together, then
+/// [`bucket`]. XXH3 is reserved for filters (xor8, bloom) where collision
+/// quality matters.
+///
+/// The count is a parameter: every producer and consumer of a row must route it
+/// against the same cluster shape, so it travels with the call rather than being
+/// read from anywhere ambient.
+#[inline(always)]
+pub fn worker_for_key(pk: u128, num_workers: usize) -> usize {
     let lo = pk as u64;
     let hi = (pk >> 64) as u64;
-    let h = lo.wrapping_mul(0x9e3779b97f4a7c15_u64) ^ hi.wrapping_mul(0x6c62272e07bb0142_u64);
-    (h >> 56) as usize
+    bucket(
+        lo.wrapping_mul(0x9e3779b97f4a7c15_u64) ^ hi.wrapping_mul(0x6c62272e07bb0142_u64),
+        num_workers,
+    )
 }
 
-/// Route an OPK PK region (any width) to a partition. For a narrow region the
-/// OPK bytes are big-endian, so [`widen_pk_be`] right-aligns them to recover the
+/// Route an OPK PK region (any width) to a worker. For a narrow region the OPK
+/// bytes are big-endian, so [`widen_pk_be`] right-aligns them to recover the
 /// native unsigned value (sign-flipped for signed) and the result is
-/// `partition_for_key(widen_pk_be(bytes))` by construction. This is the
-/// invariant the join router relies on: `ColumnLocator::route_key` (both PK and
+/// `worker_for_key(widen_pk_be(bytes))` by construction. This is the invariant
+/// the join router relies on: `ColumnLocator::route_key` (both PK and
 /// OPK-encoded payload paths) also funnels through `widen_pk_be`, so the two
-/// sides of a distributed join agree. For wide regions it takes the top 8 bits
-/// of xxh3 of the OPK bytes directly (uniformly distributed already).
+/// sides of a distributed join agree. A wide region takes the xxh3 of the OPK
+/// bytes (uniformly distributed already) through the same multiply-shift.
 #[inline]
-pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
+pub fn worker_for_pk_bytes(bytes: &[u8], num_workers: usize) -> usize {
     if bytes.len() <= NARROW_PK_MAX_BYTES {
-        partition_for_key(widen_pk_be(bytes, bytes.len()))
+        worker_for_key(widen_pk_be(bytes, bytes.len()), num_workers)
     } else {
-        (crate::checksum(bytes) >> 56) as usize
+        bucket(crate::checksum(bytes), num_workers)
     }
-}
-
-/// Which worker owns `partition`. The second half of the routing function:
-/// [`partition_for_key`] maps a row to one of [`PARTITION_COUNT`] buckets, this
-/// maps a bucket to a worker by contiguous chunks. `num_workers` is
-/// `1..=PARTITION_COUNT`; past that the chunk width would be zero.
-#[inline]
-pub fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
-    debug_assert!((1..=PARTITION_COUNT).contains(&num_workers));
-    let chunk = PARTITION_COUNT / num_workers;
-    (partition / chunk).min(num_workers - 1)
-}
-
-/// [`worker_for_partition`] for every partition, hoisting the division out of a
-/// per-row routing loop.
-///
-/// Written as contiguous fills rather than a per-partition divide: `chunk` is a
-/// runtime value, so the divide cannot be strength-reduced and the plain loop
-/// costs 256 hardware divisions on every batch that builds a map.
-/// `build_w_map_matches_worker_for_partition` pins the two against each other.
-#[inline]
-pub fn build_w_map(num_workers: usize) -> [usize; PARTITION_COUNT] {
-    let chunk = PARTITION_COUNT / num_workers;
-    // The last worker owns the remainder, which is what `worker_for_partition`'s
-    // `.min(num_workers - 1)` tail expresses.
-    let mut map = [num_workers - 1; PARTITION_COUNT];
-    for w in 0..num_workers - 1 {
-        map[w * chunk..(w + 1) * chunk].fill(w);
-    }
-    map
 }
 
 // Two distinct key spaces derive a `u128` from a column. They coincide for
@@ -351,7 +330,7 @@ pub fn build_w_map(num_workers: usize) -> [usize; PARTITION_COUNT] {
 //
 // * ROUTING (`*_route_key`): the canonical `widen_pk_be(OPK)` value — sign-
 //   flipped for signed. Used by exchange/`extract_group_key`, matching
-//   `partition_for_pk_bytes`, which is schema-less and *cannot* decode, so it
+//   `worker_for_pk_bytes`, which is schema-less and *cannot* decode, so it
 //   must hash the OPK bytes' widened value. Both sides of a distributed join
 //   agree only in this space.
 // * INDEX (`*_native_key`): the native value (signed integers keep their
@@ -618,16 +597,114 @@ mod tests {
         assert_eq!(decode_opk_i64(&opk, crate::FixedInt::U64), -1i64);
     }
 
-    /// `build_w_map` is a second spelling of `worker_for_partition`; they must
-    /// agree at every worker count, over the whole partition space.
+    /// The largest worker count the SAL group format supports
+    /// (`runtime::protocol::sal::MAX_WORKERS`). Restated here because
+    /// `gnitz-wire` sits below the engine, and the router must be uniform over
+    /// exactly the counts the engine can launch.
+    const MAX_WORKERS: usize = 64;
+
+    /// Peak worker load divided by the mean, over `keys` at `nw` workers.
+    fn load_spread(keys: &[u128], nw: usize) -> f64 {
+        let mut counts = vec![0usize; nw];
+        for &k in keys {
+            counts[worker_for_key(k, nw)] += 1;
+        }
+        let mean = keys.len() as f64 / nw as f64;
+        counts.iter().map(|&c| c as f64 / mean).fold(0.0, f64::max)
+    }
+
+    /// The multiply-shift re-bucketing must spread every *structured* key set
+    /// evenly at every launchable worker count — the shapes a real PK actually
+    /// takes. These sets are deterministic and low-discrepancy under a
+    /// golden-ratio multiplier, so 1.01× is achievable rather than merely
+    /// plausible; the random arm below carries its own (looser) bound.
     #[test]
-    fn build_w_map_matches_worker_for_partition() {
-        for nw in 1..=PARTITION_COUNT {
-            let map = build_w_map(nw);
-            for (p, &w) in map.iter().enumerate() {
-                assert_eq!(w, worker_for_partition(p, nw), "nw={nw} p={p}");
+    fn router_spreads_structured_keys_evenly() {
+        const N: u128 = 100_000;
+        let sequential: Vec<u128> = (0..N).collect();
+        // i64 spanning zero, in the canonical (sign-flipped) routing space.
+        let signed: Vec<u128> = (0..N)
+            .map(|i| (i as i64 - N as i64 / 2) as u64 as u128 ^ (1u128 << 63))
+            .collect();
+        let strided: Vec<u128> = (0..N).map(|i| i * 4096).collect();
+        // Compound OPK: (hi, lo) packed as one u128, one half held constant.
+        // `const_lo` is also the wide-key arm — it is the u128 shape that varies
+        // the high word. A key varying *both* halves in lockstep is not covered
+        // here: the mix XORs one multiply per half, so correlated halves
+        // partially cancel and measure ~1.02–1.08 at high worker counts.
+        // Genuinely independent 128-bit keys (UUIDs) are the random arm below.
+        let const_hi: Vec<u128> = (0..N).map(|i| (7u128 << 64) | i).collect();
+        let const_lo: Vec<u128> = (0..N).map(|i| (i << 64) | 7).collect();
+
+        for (name, keys) in [
+            ("sequential u64", &sequential),
+            ("signed i64", &signed),
+            ("strided", &strided),
+            ("compound const-hi", &const_hi),
+            ("compound const-lo", &const_lo),
+        ] {
+            for nw in 1..=MAX_WORKERS {
+                let spread = load_spread(keys, nw);
+                assert!(spread <= 1.01, "{name}: worker load {spread:.4}x the mean at nw={nw}",);
             }
-            assert_eq!(map[PARTITION_COUNT - 1], nw - 1, "the last worker owns the tail");
+        }
+    }
+
+    /// Independent 128-bit keys — the UUID shape, and the wide arm the
+    /// structured test leaves to this one.
+    ///
+    /// Random keys carry their own sampling noise: at `nw = 64` and 100k keys,
+    /// max/mean sits in 1.044–1.090 for a *correct* router, so the structured
+    /// arm's 1.01× would be a flaky test here. 500k keys bring the same
+    /// measurement into 1.026–1.037, which 1.05× bounds with room.
+    #[test]
+    fn router_spreads_random_keys_evenly() {
+        const N: usize = 500_000;
+        // SplitMix64-style stream over both halves — deterministic, no rand dep.
+        let mut s: u64 = 0x243f_6a88_85a3_08d3;
+        let mut next = || {
+            s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let keys: Vec<u128> = (0..N).map(|_| ((next() as u128) << 64) | next() as u128).collect();
+        for nw in [1, 2, 3, 4, 8, 16, 32, MAX_WORKERS] {
+            let spread = load_spread(&keys, nw);
+            assert!(spread <= 1.05, "random keys: {spread:.4}x the mean at nw={nw}");
+        }
+    }
+
+    /// `worker_for_pk_bytes` on a narrow OPK region is `worker_for_key` of the
+    /// widened value, by construction — the invariant that makes a distributed
+    /// join's two sides agree, since `ColumnLocator::route_key` funnels through
+    /// `widen_pk_be` too.
+    #[test]
+    fn worker_for_pk_bytes_matches_widened_key() {
+        for &(tc, sz) in &[
+            (type_code::U8, 1usize),
+            (type_code::I8, 1),
+            (type_code::U16, 2),
+            (type_code::I16, 2),
+            (type_code::U32, 4),
+            (type_code::I32, 4),
+            (type_code::U64, 8),
+            (type_code::I64, 8),
+            (type_code::U128, 16),
+        ] {
+            for v in [0i128, 1, -1, 7, -7, 127, -128, 1000, -1000, i32::MAX as i128] {
+                let le = (v as u128).to_le_bytes();
+                let mut opk = [0u8; 16];
+                encode_pk_column(&le[..sz], tc, &mut opk[..sz]);
+                for nw in [1usize, 2, 3, 4, 7, 16, MAX_WORKERS] {
+                    assert_eq!(
+                        worker_for_pk_bytes(&opk[..sz], nw),
+                        worker_for_key(widen_pk_be(&opk[..sz], sz), nw),
+                        "tc={tc} v={v} nw={nw}",
+                    );
+                }
+            }
         }
     }
 

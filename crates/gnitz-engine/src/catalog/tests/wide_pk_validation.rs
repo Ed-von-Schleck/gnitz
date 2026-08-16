@@ -45,21 +45,11 @@ fn setup_wide_unique(
     let schema = wide_unique_schema();
     let idx_schema = make_index_schema(&[3], &schema).unwrap();
 
-    let mut base = Box::new(
-        Table::new(
-            &format!("{dir}/base"),
-            schema,
-            tid as u32,
-            256 * 1024,
-            RecoverySource::Rederive,
-        )
-        .unwrap(),
-    );
+    let mut base = Box::new(Table::new(&format!("{dir}/base"), schema, tid as u32, RecoverySource::Rederive).unwrap());
     let mut idx = Table::new(
         &format!("{dir}/idx"),
         idx_schema,
         tid as u32 + 1,
-        256 * 1024,
         RecoverySource::Rederive,
     )
     .unwrap();
@@ -94,7 +84,7 @@ fn setup_wide_unique(
 #[test]
 fn index_circuit_for_col_finds_index_and_uniqueness() {
     let dir = temp_dir("index_circuit_for_col");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.next_table_id;
 
     // setup_wide_unique installs a UNIQUE secondary index on source col 3.
@@ -123,7 +113,7 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
 #[test]
 fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
     let dir = temp_dir("wide_fk_nonpk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Parent: wide PK (cols 0..3) + non-PK column `email` (col 3). This is the
     // only test that resolves a genuinely wide (24-byte) PK via
@@ -136,7 +126,6 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
         &format!("{dir}/p_base"),
         parent_schema,
         parent_tid as u32,
-        256 * 1024,
         RecoverySource::Rederive,
     )
     .unwrap();
@@ -177,7 +166,7 @@ fn read_u64_col(batch: &Batch, payload_idx: usize) -> u64 {
 #[test]
 fn seek_family_bytes_matches_seek_family_narrow() {
     let dir = temp_dir("seek_bytes_narrow");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Plain narrow U64-PK table created through the normal path.
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];

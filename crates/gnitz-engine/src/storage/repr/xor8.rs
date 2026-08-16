@@ -13,8 +13,8 @@ const HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + seed + block_length + fp_co
 /// bytes into a `u128` via `widen_pk_be`; wide keys (`> 16` bytes — a compound
 /// PK past `u128`) collapse to the full 64-bit xxh3 checksum, zero-extended. The
 /// filter is keyed by the full logical PK, so this keeps the entire entropy —
-/// it is deliberately *not* `partition_for_pk_bytes`, which reduces the same two
-/// hashes to a top-8-bit bucket index.
+/// it is deliberately *not* `worker_for_pk_bytes`, which reduces the same two
+/// hashes to one worker index.
 #[inline]
 pub(crate) fn probe_key(opk: &[u8]) -> u64 {
     let fingerprint = if opk.len() > 16 {

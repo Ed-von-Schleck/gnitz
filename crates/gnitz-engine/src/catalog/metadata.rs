@@ -114,18 +114,15 @@ impl CatalogEngine {
 
     // -- Store handle accessors -----------------------------------------------
 
-    /// Get a `&mut PartitionedTable` for a user table, or `None` if the table is
-    /// absent or not partitioned (e.g. a `Borrowed` system table).
+    /// Get a `&mut Table` for a user relation's own store, or `None` if the
+    /// relation is absent, detached, or a `Borrowed` system table.
     ///
     /// SAFETY: hands out `&mut` from `&self` through the same `UnsafeCell`
-    /// contract as [`StoreHandle::as_partitioned_mut`] — no aliasing `&mut` into
+    /// contract as [`StoreHandle::as_owned_mut`] — no aliasing `&mut` into
     /// the same store may be live across the call.
     #[allow(clippy::mut_from_ref)]
-    pub(crate) fn get_ptable_handle(&self, table_id: i64) -> Option<&mut PartitionedTable> {
-        self.dag
-            .tables
-            .get(&table_id)
-            .and_then(|e| e.handle.as_partitioned_mut())
+    pub(crate) fn get_store_handle(&self, table_id: i64) -> Option<&mut Table> {
+        self.dag.tables.get(&table_id).and_then(|e| e.handle.as_owned_mut())
     }
 
     /// Get schema descriptor for a table. Registry-uniform: system tables are

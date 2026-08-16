@@ -9,7 +9,7 @@ use std::path::Path;
 #[test]
 fn defer_then_drain_gated_deletions() {
     let dir = temp_dir("defer_then_drain_gated");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
 
     engine.create_schema("s").unwrap();
@@ -55,7 +55,7 @@ fn defer_then_drain_gated_deletions() {
 #[test]
 fn drop_then_recreate_schema_survives_gated_drain() {
     let dir = temp_dir("recreate_schema_trap");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
 
     engine.create_schema("s").unwrap();
@@ -90,7 +90,7 @@ fn drop_then_recreate_schema_survives_gated_drain() {
 #[test]
 fn gc_reclaims_orphan_table_dir() {
     let dir = temp_dir("gc_orphan_table");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
@@ -128,7 +128,7 @@ fn gc_reclaims_orphan_table_dir() {
 #[test]
 fn gc_reclaims_orphan_view_dir() {
     let dir = temp_dir("gc_orphan_view");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let live_dir = format!("{dir}/public/t_{tid}");
@@ -156,7 +156,7 @@ fn gc_reclaims_orphan_view_dir() {
 #[test]
 fn gc_reclaims_orphan_index_dir() {
     let dir = temp_dir("gc_orphan_index");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
@@ -187,7 +187,7 @@ fn gc_reclaims_orphan_index_dir() {
 #[test]
 fn gc_leaves_live_entities_untouched() {
     let dir = temp_dir("gc_live_untouched");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let t1 = engine.create_table("public.flushed", &cols, &[0]).unwrap();
@@ -236,7 +236,7 @@ fn gc_leaves_live_entities_untouched() {
 #[test]
 fn gc_skips_non_table_shaped_entries() {
     let dir = temp_dir("gc_non_table_entries");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
     engine.create_table("public.t", &cols, &[0]).unwrap();
 
@@ -258,7 +258,7 @@ fn gc_skips_non_table_shaped_entries() {
 #[test]
 fn gc_is_idempotent() {
     let dir = temp_dir("gc_idempotent");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let live = format!("{dir}/public/t_{tid}");
@@ -284,7 +284,7 @@ fn gc_is_idempotent() {
 #[test]
 fn gc_drains_sal_replay_queue() {
     let dir = temp_dir("gc_drain_replay_queue");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let gone_schema = format!("{dir}/goneschema");
     let gone_table = format!("{gone_schema}/t_1");
@@ -311,7 +311,7 @@ fn gc_drains_sal_replay_queue() {
 #[test]
 fn gc_recreated_schema_survives_drain() {
     let dir = temp_dir("gc_recreate_schema_drain");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let schema_path = format!("{dir}/s");
 
     // Reproduce the recovery residue directly: a replayed DROP s left <base>/s
@@ -348,16 +348,17 @@ fn gc_recreated_schema_survives_drain() {
 }
 
 // ---------------------------------------------------------------------------
-// Child-dir reconciliation (`reconcile_child_dirs`)
+// Boot relayout (`repartition_relation`) and child-dir reclamation
+// (`reconcile_child_dirs`)
 //
-// A single-partition (replicated) store names its one child by the rank that
-// owns it (`rep_{k}`); a hashed store names its 256 children by partition index
-// (`part_{p}`). The grammars are disjoint, so the boot pass can reclaim what
-// this topology does not own — and seed a launched rank's missing copy from
-// `rep_0` — without a directory→shape index.
+// A relation's children are named `w{k}of{n}`, so a set laid out for a different
+// worker count is a disjoint set of names. That is what lets the boot rewrite
+// write the new layout beside the old one and lets the sweep afterwards reclaim
+// whatever the rewrite already consumed. Both run inside `CatalogEngine::open`,
+// so reopening the same directory at a different count is the whole test.
 // ---------------------------------------------------------------------------
 
-/// Register a REPLICATED base table with one row flushed, and return
+/// Register a REPLICATED base table with one row, and return
 /// `(tid, relation_directory)`.
 fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (i64, String) {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
@@ -392,124 +393,467 @@ fn fabricate_dir(path: &str, marker: &str) {
     fs::write(format!("{path}/{marker}"), b"x").unwrap();
 }
 
-#[test]
-fn retired_copies_are_reclaimed_and_missing_ones_seeded() {
-    let dir = temp_dir("reconcile_child_dirs_core");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, true);
-    assert!(Path::new(&format!("{rel}/rep_0/manifest.bin")).exists());
-    let rep0_files = file_names(&format!("{rel}/rep_0"));
+/// `rel`'s `w{k}of{of}` child directory, and its manifest — the grammar spelled
+/// once here rather than in every assertion below.
+fn child_path(rel: &str, k: u32, of: u32) -> String {
+    ChildAddr::Worker { rank: k, of }.dir(rel)
+}
 
-    // (i) A shrink from 4 workers (plus a scratch dir from a rank that no longer
-    // exists). Ranks below the launched count keep their own copies untouched.
-    for k in 1..4 {
-        let d = format!("{rel}/rep_{k}");
-        fabricate_dir(&d, "marker");
-        fs::write(format!("{d}/manifest.bin"), b"stub").unwrap();
+fn child_manifest(rel: &str, k: u32, of: u32) -> String {
+    ChildAddr::Worker { rank: k, of }.manifest(rel)
+}
+
+/// Open one child directly, outside any catalog. A `CatalogEngine` is one
+/// process at rank 0, so a test that needs a *complete* `w{k}of{n}` set — the
+/// state a real cluster's checkpoint leaves behind — has to write the other
+/// ranks itself.
+fn open_child(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> crate::storage::Table {
+    crate::storage::Table::new(&child_path(rel, k, of), schema, tid as u32, RecoverySource::SalReplay).unwrap()
+}
+
+/// The subset of `rows` that `worker_for_pk` places on worker `k` of `of` — the
+/// router's own verdict, so seeding and expectation cannot disagree.
+fn rows_for_worker(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32, k: u32) -> Vec<(u128, i64)> {
+    rows.iter()
+        .copied()
+        .filter(|&(pk, _)| {
+            let opk = crate::schema::key::opk_key(schema, &pk.to_le_bytes());
+            schema.worker_for_pk(opk.pk_bytes(), of as usize) == k as usize
+        })
+        .collect()
+}
+
+/// The sorted `(worker, pk, weight)` triples `rows` must read back as at `of`
+/// workers — what `set_rows` is compared against.
+fn expected_placement(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32) -> Vec<(u32, u128, i64)> {
+    let mut want: Vec<(u32, u128, i64)> = rows
+        .iter()
+        .map(|&(pk, _)| {
+            let opk = crate::schema::key::opk_key(schema, &pk.to_le_bytes());
+            (schema.worker_for_pk(opk.pk_bytes(), of as usize) as u32, pk, 1)
+        })
+        .collect();
+    want.sort_unstable();
+    want
+}
+
+/// Ingest `rows` into one already-open child and publish it.
+fn fill_child(t: &mut crate::storage::Table, schema: SchemaDescriptor, rows: &[(u128, i64)]) {
+    if !rows.is_empty() {
+        let mut bb = BatchBuilder::new(schema);
+        for &(pk, x) in rows {
+            bb.begin_row(pk, 1);
+            bb.put_i64(x);
+            bb.end_row();
+        }
+        t.ingest_borrowed_batch(&bb.finish()).unwrap();
     }
-    fabricate_dir(&format!("{rel}/scratch_agg_w7"), "marker");
+    t.flush().unwrap();
+}
 
-    engine.reconcile_child_dirs(3).unwrap();
+/// Sorted `(worker, pk, weight)` triples across every child of the `of`-worker set.
+fn set_rows(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32, u128, i64)> {
+    let mut v = Vec::new();
+    for k in 0..of {
+        let t = open_child(rel, k, of, schema, tid);
+        let batch = t.open_cursor().materialize();
+        for i in 0..batch.count {
+            v.push((k, batch.get_pk(i), batch.get_weight(i)));
+        }
+    }
+    v.sort_unstable();
+    v
+}
+
+/// Replace the `of`-worker child set of `tid` with exactly `rows`, each routed by
+/// `worker_for_pk` and every child published — including the empty ones, which is
+/// what a real checkpoint's unconditional base round does. Any existing set at
+/// that count is discarded first, so the result is the set and nothing else.
+fn seed_child_set(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
+    for k in 0..of {
+        crate::storage::remove_child(&child_path(rel, k, of));
+        let mut t = open_child(rel, k, of, schema, tid);
+        fill_child(&mut t, schema, &rows_for_worker(&schema, rows, of, k));
+    }
+}
+
+#[test]
+fn retired_children_are_reclaimed() {
+    let dir = temp_dir("reconcile_retired");
+    let mut engine = CatalogEngine::open(&dir, 3).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let rel = engine.dag.tables[&tid].directory.clone();
+
+    // A set laid out for another count, a rank above the launched count, and a
+    // scratch dir from a rank that no longer exists.
+    for k in 0..2 {
+        fabricate_dir(&child_path(&rel, k, 2), "marker");
+    }
+    fabricate_dir(&format!("{rel}/w9of3"), "marker");
+    fabricate_dir(&format!("{rel}/scratch_agg_w7"), "marker");
+    // Not a child at all: an index dir must be left alone.
+    fabricate_dir(&format!("{rel}/idx_7"), "marker");
+
+    engine.reconcile_child_dirs();
 
     assert!(
-        Path::new(&format!("{rel}/rep_0")).exists(),
-        "worker 0's copy is the source"
+        Path::new(&child_path(&rel, 0, 3)).exists(),
+        "this process's own child is what it owns"
     );
-    assert!(!Path::new(&format!("{rel}/rep_3")).exists(), "rank 3 is retired at W=3");
+    for k in 0..2 {
+        assert!(!Path::new(&child_path(&rel, k, 2)).exists(), "wrong layout count");
+    }
+    assert!(!Path::new(&format!("{rel}/w9of3")).exists(), "rank 9 is not launched");
     assert!(!Path::new(&format!("{rel}/scratch_agg_w7")).exists());
-    for k in 1..3 {
-        assert!(
-            Path::new(&format!("{rel}/rep_{k}/marker")).exists(),
-            "rep_{k} already has a manifest, so it is current and must not be rebuilt"
-        );
-    }
-
-    // (ii) A rank whose copy is gone entirely is rebuilt from rep_0.
-    fs::remove_dir_all(format!("{rel}/rep_2")).unwrap();
-    engine.reconcile_child_dirs(3).unwrap();
-    assert_eq!(file_names(&format!("{rel}/rep_2")), rep0_files);
-    assert!(!Path::new(&format!("{rel}/rep_2/marker")).exists());
-
-    // (iii) A torn repair — shards present, no manifest — is redone, not adopted.
-    fs::remove_dir_all(format!("{rel}/rep_1")).unwrap();
-    fabricate_dir(&format!("{rel}/rep_1"), "0000000000000001.shard");
-    engine.reconcile_child_dirs(3).unwrap();
-    assert_eq!(
-        file_names(&format!("{rel}/rep_1")),
-        rep0_files,
-        "a manifest-less copy is rebuilt, so the manifest is the completeness witness"
+    assert!(
+        Path::new(&format!("{rel}/idx_7")).exists(),
+        "an index dir is not a child"
     );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A replicated table's children are copies of one another, so growing the
+/// worker count hard-links rank 0's shards into every launched rank and retires
+/// the old set.
 #[test]
-fn reconcile_skips_a_never_flushed_table() {
-    let dir = temp_dir("reconcile_child_dirs_unflushed");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, false);
-    assert!(!Path::new(&format!("{rel}/rep_0/manifest.bin")).exists());
+fn replicated_table_is_relinked_at_a_new_worker_count() {
+    let dir = temp_dir("repartition_replicated");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let (rt, rel) = replicated_table_with_a_shard(&mut engine, true);
+    let schema = engine.get_schema_desc(rt).unwrap();
+    let source_files = file_names(&child_path(&rel, 0, 1));
+    assert!(source_files.contains(&"manifest.bin".to_string()));
+    engine.close();
 
-    fabricate_dir(&format!("{rel}/rep_9"), "marker");
-    engine.reconcile_child_dirs(4).unwrap();
-
-    for k in 1..4 {
-        assert!(
-            !Path::new(&format!("{rel}/rep_{k}")).exists(),
-            "nothing to copy from an unflushed table, so rep_{k} stays absent"
+    let engine = CatalogEngine::open(&dir, 3).unwrap();
+    for k in 0..3 {
+        assert_eq!(
+            file_names(&child_path(&rel, k, 3)),
+            source_files,
+            "every launched rank holds a copy of the replicated dataset"
         );
     }
-    assert!(!Path::new(&format!("{rel}/rep_9")).exists(), "rank 9 is retired at W=4");
+    assert_eq!(
+        set_rows(&rel, 3, schema, rt),
+        (0..3).map(|k| (k, 1u128, 1i64)).collect::<Vec<_>>(),
+        "every rank reads back the full copy"
+    );
+    assert!(
+        !Path::new(&child_path(&rel, 0, 1)).exists(),
+        "the source set is retired"
+    );
 
-    engine.close();
+    drop(engine);
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The round trip that matters: over a grid of `(W_old, W_new)`, every row must
+/// come back at its exact weight and land on `worker_for_pk(pk, W_new)`. Weights,
+/// not row presence — the failure mode the retry guard exists for is weight 2,
+/// which every presence-only check passes.
 #[test]
-fn reconcile_never_touches_a_hashed_store() {
-    let dir = temp_dir("reconcile_child_dirs_hashed");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
-    let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();
-    let hashed = engine.dag.tables[&pt].directory.clone();
-    for p in 0..NUM_PARTITIONS {
-        assert!(Path::new(&format!("{hashed}/part_{p}")).exists());
+fn keyed_table_round_trips_across_worker_counts() {
+    const N: u128 = 300;
+    for (w_old, w_new) in [(1u32, 1u32), (1, 4), (4, 1), (2, 3), (3, 2), (4, 5), (5, 8), (8, 4)] {
+        let dir = temp_dir(&format!("repartition_grid_{w_old}_{w_new}"));
+        let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+
+        let mut engine = CatalogEngine::open(&dir, w_old).unwrap();
+        let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+        let rel = engine.dag.tables[&tid].directory.clone();
+        let schema = engine.get_schema_desc(tid).unwrap();
+        engine.close();
+
+        let rows: Vec<(u128, i64)> = (0..N).map(|id| (id, id as i64 * 10)).collect();
+        seed_child_set(&rel, w_old, schema, tid, &rows);
+
+        let engine = CatalogEngine::open(&dir, w_new).unwrap();
+        let got = set_rows(&rel, w_new, schema, tid);
+        let want = expected_placement(&schema, &rows, w_new);
+        assert_eq!(got, want, "{w_old}->{w_new}: the Z-set must survive exactly");
+        if w_old != w_new {
+            assert!(
+                !Path::new(&child_path(&rel, 0, w_old)).exists(),
+                "{w_old}->{w_new}: the source set must be retired"
+            );
+        }
+        drop(engine);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// A `CLUSTER BY` table whose rows all share the distribution prefix puts every
+/// row on one worker, so most children are empty. The unconditional base-round
+/// publish is what gives those empty children a manifest — without it the set is
+/// never complete and the relayout silently loses every row.
+#[test]
+fn repartition_handles_a_relation_with_empty_children() {
+    let dir = temp_dir("repartition_empty_child");
+    let cols = vec![
+        col_def("a", type_code::U64),
+        col_def("b", type_code::U64),
+        col_def("x", type_code::I64),
+    ];
+    let mut engine = CatalogEngine::open(&dir, 3).unwrap();
+    // CLUSTER BY (a): every row shares `a = 1`, so all of them hash alike.
+    let tid = create_flagged_table(
+        &mut engine,
+        "cb",
+        &cols,
+        &[0, 1],
+        gnitz_wire::pack_table_flags(false, 1),
+    );
+    let rel = engine.dag.tables[&tid].directory.clone();
+    let schema = engine.get_schema_desc(tid).unwrap();
+    engine.close();
+
+    // `opk_key` reads the packed native value in PK-list order, so PK column 0
+    // (`a`) is the LOW u128 half: `a = 1` for every row, `b` varies.
+    let rows: Vec<(u128, i64)> = (0..20u128).map(|b| (1u128 | (b << 64), b as i64)).collect();
+    seed_child_set(&rel, 3, schema, tid, &rows);
+    let occupied = (0..3)
+        .filter(|&k| open_child(&rel, k, 3, schema, tid).open_cursor().materialize().count > 0)
+        .count();
+    assert_eq!(occupied, 1, "a shared distribution prefix puts every row on one worker");
+    for k in 0..3 {
+        assert!(
+            Path::new(&child_manifest(&rel, k, 3)).exists(),
+            "an empty child still publishes a manifest, which is what makes the set complete"
+        );
     }
 
-    // A hashed store's per-worker ranges tile 0..256 exactly at every worker
-    // count, so no partition is ever stale — the sweep must keep all 256.
-    for n in [1u32, 2, 4] {
-        engine.reconcile_child_dirs(n).unwrap();
-        for p in 0..NUM_PARTITIONS {
+    let engine = CatalogEngine::open(&dir, 2).unwrap();
+    let got = set_rows(&rel, 2, schema, tid);
+    assert_eq!(got.len(), 20, "every row survives a relayout off a skewed set");
+    assert!(got.iter().all(|&(_, _, w)| w == 1), "no row may double");
+    let mut pks: Vec<u128> = got.iter().map(|&(_, pk, _)| pk).collect();
+    pks.sort_unstable();
+    assert_eq!(pks, rows.iter().map(|&(pk, _)| pk).collect::<Vec<_>>());
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Crash after the target set is written but before the source is removed: two
+/// complete sets survive. The layout sequence — one above the source's — is what
+/// picks the newer one; resolving by "whichever count the boot happens to launch"
+/// would come up on stale rows the moment the cluster reboots at the old count.
+#[test]
+fn two_complete_sets_resolve_by_layout_sequence() {
+    let dir = temp_dir("repartition_two_sets");
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let mut engine = CatalogEngine::open(&dir, 2).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let rel = engine.dag.tables[&tid].directory.clone();
+    let schema = engine.get_schema_desc(tid).unwrap();
+    engine.close();
+
+    // A 2-set holding the current content, relayed to a 4-set — which the
+    // relayout stamps one layout sequence above its source's.
+    let new_rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64 + 1000)).collect();
+    seed_child_set(&rel, 2, schema, tid, &new_rows);
+    let engine = CatalogEngine::open(&dir, 4).unwrap();
+    drop(engine);
+    assert!(!Path::new(&child_path(&rel, 0, 2)).exists());
+
+    // A resurrected 2-set holding the *old* content — the state a crash between
+    // "target durable" and "source removed" leaves. Freshly published, so it
+    // carries layout sequence 0, below the relayed 4-set's.
+    let old_rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
+    seed_child_set(&rel, 2, schema, tid, &old_rows);
+
+    // Reboot at a third count: the newer (4-worker) set must be the source.
+    let engine = CatalogEngine::open(&dir, 3).unwrap();
+    let got = set_rows(&rel, 3, schema, tid);
+    assert_eq!(got.len(), 40);
+    for k in 0..3 {
+        let t = open_child(&rel, k, 3, schema, tid);
+        let batch = t.open_cursor().materialize();
+        for i in 0..batch.count {
             assert!(
-                Path::new(&format!("{hashed}/part_{p}")).exists(),
-                "partition {p} of a hashed store must survive reconcile at W={n}"
+                batch.read_payload_u64(i, 0) >= 1000,
+                "the stale 2-set won: row {} carries the old payload",
+                batch.get_pk(i)
             );
         }
     }
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
 
-    // Cross-grammar residue, both directions: what a shape flip leaves behind.
-    fabricate_dir(&format!("{hashed}/rep_1"), "marker");
-    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, true);
-    for p in [64u32, 192] {
-        fabricate_dir(&format!("{rel}/part_{p}"), "marker");
-    }
+/// A repartition that died part-way through writing its target must not have its
+/// leftovers merged into the retry: the two would consolidate and every base row
+/// would reach weight 2 — a positivity violation no DELETE can repair, since
+/// `enforce_unique_pk` emits a single `-1` against the located row.
+#[test]
+fn a_partial_target_is_cleared_rather_than_merged() {
+    let dir = temp_dir("repartition_partial_target");
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let mut engine = CatalogEngine::open(&dir, 2).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let rel = engine.dag.tables[&tid].directory.clone();
+    let schema = engine.get_schema_desc(tid).unwrap();
+    engine.close();
 
-    engine.reconcile_child_dirs(4).unwrap();
+    let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
+    seed_child_set(&rel, 2, schema, tid, &rows);
 
-    assert!(
-        !Path::new(&format!("{hashed}/rep_1")).exists(),
-        "a rep_* child under a hashed store is residue"
+    // Attempt 1 got as far as `w0of4`, holding rows it had already placed.
+    let mut torn = open_child(&rel, 0, 4, schema, tid);
+    fill_child(&mut torn, schema, &rows_for_worker(&schema, &rows, 4, 0));
+    drop(torn);
+
+    let engine = CatalogEngine::open(&dir, 4).unwrap();
+    let got = set_rows(&rel, 4, schema, tid);
+    let want = expected_placement(&schema, &rows, 4);
+    assert_eq!(got, want, "attempt 1's rows must be cleared, not summed to weight 2");
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A boot that aborts between two workers' publishes leaves a torn set at the
+/// launched count. Nothing has moved and nothing is missing — a child with no
+/// manifest holds no reachable rows — so the next boot must carry on rather than
+/// refuse, and every published row must still be there.
+#[test]
+fn a_torn_set_at_the_launched_count_is_not_a_relayout() {
+    let dir = temp_dir("repartition_torn_at_launched");
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let mut engine = CatalogEngine::open(&dir, 3).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let rel = engine.dag.tables[&tid].directory.clone();
+    let schema = engine.get_schema_desc(tid).unwrap();
+    engine.close();
+
+    let rows: Vec<(u128, i64)> = (0..60u128).map(|id| (id, id as i64)).collect();
+    seed_child_set(&rel, 3, schema, tid, &rows);
+    // Worker 2 never got as far as publishing.
+    fs::remove_file(child_manifest(&rel, 2, 3)).unwrap();
+    let published = set_rows(&rel, 3, schema, tid);
+
+    let engine = CatalogEngine::open(&dir, 3).unwrap();
+    assert_eq!(
+        set_rows(&rel, 3, schema, tid),
+        published,
+        "a torn set at the launched count is left exactly as it was"
     );
-    for p in [64u32, 192] {
-        assert!(
-            !Path::new(&format!("{rel}/part_{p}")).exists(),
-            "a part_* child under a single-partition store is residue"
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A child directory in no grammar this build knows may hold rows the sweep
+/// would never reclaim and the store would never read. Refusing to boot is what
+/// keeps that from looking like "never checkpointed".
+#[test]
+fn repartition_refuses_an_unreadable_child_grammar() {
+    let dir = temp_dir("repartition_refuses");
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let rel = engine.dag.tables[&tid].directory.clone();
+    engine.close();
+
+    fabricate_dir(&format!("{rel}/part_7"), "manifest.bin");
+    let Err(err) = CatalogEngine::open(&dir, 1) else {
+        panic!("an unknown child grammar must refuse to boot");
+    };
+    assert!(err.contains("part_7"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A manifest at a worker count that has no complete set is data this pass
+/// cannot place. Coming up without it would be silent loss, so the boot refuses.
+#[test]
+fn repartition_refuses_a_torn_set_at_a_foreign_count() {
+    let dir = temp_dir("repartition_refuses_torn");
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let mut engine = CatalogEngine::open(&dir, 4).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let rel = engine.dag.tables[&tid].directory.clone();
+    let schema = engine.get_schema_desc(tid).unwrap();
+    engine.close();
+
+    seed_child_set(
+        &rel,
+        4,
+        schema,
+        tid,
+        &(0..40u128).map(|id| (id, id as i64)).collect::<Vec<_>>(),
+    );
+    fs::remove_file(child_manifest(&rel, 3, 4)).unwrap();
+
+    let Err(err) = CatalogEngine::open(&dir, 2) else {
+        panic!("an incomplete foreign-count set must refuse to boot");
+    };
+    assert!(err.contains("Refusing to boot"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Rebooting at the same count moves no data: the live set is already at the
+/// launched count, so no shard is rewritten.
+#[test]
+fn repartition_is_not_run_on_an_unchanged_restart() {
+    let dir = temp_dir("repartition_unchanged");
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let mut engine = CatalogEngine::open(&dir, 2).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let rel = engine.dag.tables[&tid].directory.clone();
+    let schema = engine.get_schema_desc(tid).unwrap();
+    engine.close();
+
+    seed_child_set(
+        &rel,
+        2,
+        schema,
+        tid,
+        &(0..50u128).map(|id| (id, id as i64)).collect::<Vec<_>>(),
+    );
+    let before: Vec<(String, std::time::SystemTime)> = (0..2)
+        .flat_map(|k| {
+            let child = child_path(&rel, k, 2);
+            file_names(&child)
+                .into_iter()
+                .map(move |f| {
+                    let full = format!("{child}/{f}");
+                    let m = fs::metadata(&full).unwrap().modified().unwrap();
+                    (full, m)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(!before.is_empty());
+
+    let engine = CatalogEngine::open(&dir, 2).unwrap();
+    for (full, mtime) in &before {
+        assert_eq!(
+            fs::metadata(full).unwrap().modified().unwrap(),
+            *mtime,
+            "{full} was rewritten on an unchanged restart"
         );
     }
-    assert!(Path::new(&format!("{rel}/rep_0")).exists());
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
 
-    engine.close();
+/// A child with no manifest holds no reachable rows, so a relation that was
+/// never checkpointed has nothing to relay — the launched set is simply created
+/// empty rather than refused.
+#[test]
+fn repartition_skips_a_never_flushed_table() {
+    let dir = temp_dir("repartition_unflushed");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let (_rt, rel) = replicated_table_with_a_shard(&mut engine, false);
+    // Make the catalog durable WITHOUT flushing the user store, so the relation
+    // is registered at the next open while its child carries no manifest.
+    engine.flush_all_system_tables().unwrap();
+    assert!(!Path::new(&child_manifest(&rel, 0, 1)).exists());
+    drop(engine);
+
+    let engine = CatalogEngine::open(&dir, 4).unwrap();
+    assert!(Path::new(&child_path(&rel, 0, 4)).exists());
+    assert!(!Path::new(&child_manifest(&rel, 0, 4)).exists());
+    drop(engine);
     let _ = fs::remove_dir_all(&dir);
 }

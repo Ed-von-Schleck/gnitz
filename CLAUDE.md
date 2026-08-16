@@ -464,21 +464,17 @@ they are separate crates, so a `storage`-layer `use gnitz_expr::RowSource` is no
 an up-edge into the engine's own `expr` module. Read `expr` in the ladder above as
 the engine-local expression layer only.
 
-- **`foundation`** (L0) — unrelated leaves grouped only for layering: `log` (the `gnitz_*` macros), `env` (numeric `GNITZ_*` overrides), `xxh` (XXH3), `posix_io` (fd I/O, fsync, sockets, mmap + its unaligned `*_raw` accessors, eventfd/futex/memfd), `worker_ctx` (worker rank/count). Every little-endian byte primitive lives in `gnitz-wire`, not here.
-- **`schema`** — SQL type constants, schema descriptors, row-format helpers, and the order-preserving-key cluster (`key`). Shared by the storage, IPC, and query layers.
-- **`storage`** — the WAL/shard/MemTable stack behind one curated facade, in two sub-layers:
-  - `repr` (L2) — the in-memory batch and the kernels over it: `batch` (region layout), `batch_wire` (wire/shard serde), `batch_pool` (buffer recycling), `columnar` (comparators), `merge` (sort-merge consolidation), `scatter` (exchange repartition), `heap` (k-way merge), `bloom`/`xor8` (PK-probe filters).
-  - `lsm` (L3) — the on-disk half: `wal`, `shard_file`/`shard_reader`/`shard_index`, `compact` (N-way compaction), `memtable`, `read_cursor`, and the `Table`/`PartitionedTable` facades.
-- **`expr`** — `ScalarFunc`: the filter/map plan the VM drives, over a `gnitz_expr::Evaluator` plus the columnar column-move and null-permutation halves. The evaluator itself lives in `gnitz-expr`.
-- **`ops`** — the DBSP operators: `join` (equi and range/band inner join, both Δ⋈trace; LEFT/RIGHT/FULL outer are built join-free from inner + `positive_part`, §3), `reduce` (aggregation), `exchange` (repartition: `router` + `relay`), `distinct`, `linear` (filter/map/negate/union), `scan`, `reindex` (re-key for join/group), `cogroup`, `index` (secondary indexes).
-- **`query`** (L5) — the circuit layer behind the `dag` facade: `compiler` (view → DBSP circuit → VM program), `vm` (executes the program), `dag` (`DagEngine`: plan cache, epoch evaluator, ingestion). `catalog` and `runtime` reach this layer only through `dag`.
-- **`catalog`** — the DDL/metadata engine wrapping `DagEngine`: `ddl`, `sys_tables`, `hooks`, `registry`, `metadata`, `validation`, `write_path`, persistence (`store_io`, `partition_lsn`), `cache`, `bootstrap`.
-- **`runtime`** (L7) — the multi-process server (`main.rs` builds `gnitz-server`):
-  - `orchestration` — `master` (SAL dispatcher: fans push/scan out to workers, collects via W2M), `worker` (event loop owning a partition subset), `executor` (single-threaded server executor), `committer` (durable-commit batcher).
-  - `protocol` — `wire` (IPC message format), `sal` (shared append-only log), `w2m`/`w2m_ring` (lock-free worker→master ring).
-  - `reactor` — the single-threaded io_uring reactor (`block_on`/`spawn`/`timer`/reply routing).
+- **`foundation`** (L0) — unrelated leaves grouped only for layering: logging macros, `GNITZ_*` env overrides, hashing, POSIX/mmap wrappers, worker rank/count. Every little-endian byte primitive lives in `gnitz-wire`, not here.
+- **`schema`** — SQL type constants, schema descriptors, row-format helpers, and the order-preserving-key cluster. Shared by the storage, IPC, and query layers.
+- **`storage`** — the WAL/shard/MemTable stack behind one curated facade, in two sub-layers: `repr` (L2), the in-memory batch and the kernels over it; `lsm` (L3), the on-disk half plus the `Table` facade.
+- **`expr`** — the filter/map plan the VM drives, over a `gnitz_expr::Evaluator`. The evaluator itself lives in `gnitz-expr`.
+- **`ops`** — the DBSP operators: join, reduce, exchange, distinct, the linear ops, scan, reindex, cogroup, secondary indexes.
+- **`query`** (L5) — the circuit layer behind the `dag` facade: compiler (view → DBSP circuit → VM program), VM, and `DagEngine` (plan cache, epoch evaluator, ingestion). `catalog` and `runtime` reach this layer only through `dag`.
+- **`catalog`** — the DDL/metadata engine wrapping `DagEngine`: DDL intent, system tables, hooks, registry, validation, write path, persistence.
+- **`runtime`** (L7) — the multi-process server (`main.rs` builds `gnitz-server`): orchestration (master dispatcher, worker event loop, executor, committer), protocol (IPC wire format, SAL, worker→master ring), and the single-threaded io_uring reactor.
 
-Test scaffolding lives in `test_support` / `test_rng` and per-module `tests/`.
+A relation is stored as one `Table` per worker. Test scaffolding lives in
+`test_support` / `test_rng` and per-module `tests/`.
 
 ## Running E2E tests
 
@@ -576,35 +572,32 @@ wake the workers without it, since a lost command needs no recovery
 
 The **checkpoint** is the sole shard-durability point: between checkpoints no
 table publishes a manifest on the ingest path, so the fsynced SAL alone carries
-durability and every table's overflow lives in the RAM tier. A steady-state
-checkpoint runs **two flush rounds** — a base round (`FLAG_FLUSH`, `SalReplay`
-base + system tables) and, after draining pending view ticks, an ephemeral round
-(`FLAG_FLUSH_EPH`) that persists every view's operator-trace tables and output
-stores, stamping each manifest with a monotonic checkpoint generation. The
-ephemeral round publishes **unconditionally** — every view partition (even empty
-or unchanged) re-stamps its manifest at the current generation, so after a
-completed checkpoint *every* view partition carries generation `g`; that is what
-makes the per-view resume verdict decidable.
+durability and every table's overflow lives in the RAM tier. A checkpoint runs
+two flush rounds — a base round over the `SalReplay` base and system tables,
+then, after draining pending view ticks, an ephemeral round that persists every
+view's operator traces and output stores under a monotonic checkpoint
+generation. Both rounds publish **unconditionally**, even for an empty or
+unchanged store: the resume verdict and the boot relayout each decide by "every
+child carries a manifest", which a gated publish would make undecidable.
 
 At open a view is **resumed from its checkpoint when generation-valid, rebuilt
-otherwise; secondary indexes are always rebuilt.** Resume is *incremental*, not a
-rebuild: the view's checkpointed output store and DBSP operator traces are loaded
-from their shards (`Table::new` conditional load), and only the un-checkpointed
-SAL tail is fed through the circuit by the tick sweep (`O(tail)`) — the view is
-never re-derived from the base. A full rebuild from base
-(`O(base-through-circuits)`) happens only for a generation-*invalid* view. The
-per-view verdict (`compute_invalid_views`, master pre-fork) resumes a view iff
-the recorded topology matches the launched `(worker_count, STATE_FORMAT)`, every one of its
-output-partition manifests is at the committed generation, and every view it
-scans (its `ScanDelta` cascade deps) is itself valid; else it is reset (on the
-workers) and rebuilt. Recovery is **non-windowed**: the
-un-checkpointed SAL tail is replayed once and applied by one master-driven tick
-sweep on a freshly-reset SAL, so peak recovery RAM is ~(effective tail)/W per
-worker (≈1.5 GiB only at W=1). A **recovery-start generation bump** (durably
-advancing `SEQ_ID_CHECKPOINT_GEN` `G → G+1` before the fork, without touching
-`worker_ctx`) closes the reset→boot_checkpoint crash window: any crash there
-leaves durable gen ≥ `G+1` while un-checkpointed views are stamped `G`, forcing a
-rebuild rather than a silently-stale resume.
+otherwise; secondary indexes are always rebuilt.** Resume is *incremental*: the
+checkpointed output store and operator traces load from their shards, and only
+the un-checkpointed SAL tail is fed through the circuit — the view is never
+re-derived from the base. A view resumes iff the recorded topology matches the
+launched `(worker_count, STATE_FORMAT)`, every one of its output children is at
+the committed generation, and every view it scans is itself valid; else it is
+reset and rebuilt from base. Recovery is **non-windowed**: the un-checkpointed
+tail is replayed once on a freshly-reset SAL, so peak recovery RAM is
+~(tail)/W per worker. The checkpoint generation is durably advanced before the
+fork, which closes the reset→boot-checkpoint crash window: a crash there leaves
+the durable generation ahead of every un-checkpointed view, forcing a rebuild
+rather than a silently-stale resume.
+
+A restart at a **different worker count** relays each base relation's children
+onto the launched count before any store opens — writing the new set beside the
+old and removing the source only once every target is durable, so a crash at any
+point leaves the older set intact and the next boot redoes the work.
 
 ## Benchmarking
 

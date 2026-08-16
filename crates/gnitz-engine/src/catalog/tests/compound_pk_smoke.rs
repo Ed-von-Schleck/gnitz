@@ -2,7 +2,7 @@ use super::*;
 use crate::schema::type_code;
 
 // The routing-symmetry tests (master `compute_worker_indices` vs worker
-// `partition_for_pk_bytes`) live next to the code they exercise, in
+// `worker_for_pk_bytes`) live next to the code they exercise, in
 // `ops::exchange::router`.
 
 #[test]
@@ -15,12 +15,12 @@ fn schema_roundtrip_catalog_preserves_pk_order() {
     let dir = temp_dir("cpk_pk_order_roundtrip");
 
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         engine.create_table("public.cpk_order", &cols, &[2, 1]).unwrap();
         engine.close();
     }
     {
-        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let tid = engine.get_by_name("public", "cpk_order").unwrap();
         let schema = engine.get_schema_desc(tid).unwrap();
         assert_eq!(

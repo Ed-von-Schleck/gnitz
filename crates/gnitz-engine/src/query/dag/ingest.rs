@@ -95,14 +95,17 @@ impl DagEngine {
         };
 
         let schema = entry.schema;
-        // BaseTable ⟹ Partitioned: system tables are the only Borrowed handles,
-        // and they are SystemCatalog. The debug_assert catches a stray Borrowed
-        // base-table registration.
+        // BaseTable ⟹ Owned, except on the post-fork master, whose relations are
+        // all `Detached` and which ingests no user data. The debug_assert catches
+        // a stray Borrowed base-table registration.
         let effective_batch = if entry.kind.is_base_table() {
-            match entry.handle.as_partitioned_mut() {
-                Some(ptable) => Self::enforce_unique_pk(ptable, &schema, batch),
+            match entry.handle.as_owned_mut() {
+                Some(store) => Self::enforce_unique_pk(store, &schema, batch),
                 None => {
-                    debug_assert!(false, "base table {table_id} must be a PartitionedTable");
+                    debug_assert!(
+                        entry.handle.is_detached(),
+                        "base table {table_id} must own its store or be detached"
+                    );
                     batch
                 }
             }
@@ -200,10 +203,10 @@ impl DagEngine {
     }
 
     /// Collect the tables the base checkpoint round (`FLAG_FLUSH`) flushes:
-    /// every registered user relation's partitions plus its index-circuit
-    /// tables. System tables (`StoreHandle::Borrowed`) are skipped — workers
-    /// never barrier-flush their inherited `_sys` copies. `SalReplay` partitions
-    /// publish (`Pending`); rederived partitions and index tables fold to RAM
+    /// every registered user relation's store plus its index-circuit tables.
+    /// System tables (`StoreHandle::Borrowed`) are skipped — workers never
+    /// barrier-flush their inherited `_sys` copies. `SalReplay` stores publish
+    /// (`Pending`); rederived stores and index tables fold to RAM
     /// (`FlushOutcome::Done`), which the generic flush loop consumes.
     ///
     /// Same `*mut Table` validity argument as `collect_ephemeral_flush_tables`
@@ -211,10 +214,8 @@ impl DagEngine {
     pub(crate) fn collect_base_flush_tables(&mut self) -> Vec<*mut Table> {
         let mut out: Vec<*mut Table> = Vec::new();
         for entry in self.tables.values_mut() {
-            if let Some(pt) = entry.handle.as_partitioned_mut() {
-                for t in pt.partitions_mut() {
-                    out.push(t as *mut Table);
-                }
+            if let Some(t) = entry.handle.as_owned_mut() {
+                out.push(t as *mut Table);
             }
             for ic in &mut entry.index_circuits {
                 out.push(ic.table_mut() as *mut Table);
@@ -225,7 +226,7 @@ impl DagEngine {
 
     /// Collect the tables the ephemeral checkpoint round force-persists, in two
     /// disjoint sets: (1) every compiled view plan's operator-trace tables, and
-    /// (2) every view's output-store partitions. The worker flushes set 1 fully
+    /// (2) every view's output store. The worker flushes set 1 fully
     /// durable before set 2 (the flush-ordering invariant: any output manifest at
     /// generation G implies that view's traces are durable at G).
     ///
@@ -233,7 +234,7 @@ impl DagEngine {
     /// so they cannot be keyed by `tid`, and the engine already passes
     /// `*mut Table`. Valid because the worker flush handler is a synchronous `fn`
     /// on a single-threaded process: no reactor yield and no concurrent
-    /// `cache`/`tables` mutation, so the partition set is frozen for the flush.
+    /// `cache`/`tables` mutation, so the table set is frozen for the flush.
     /// `cache` and `tables` are separate fields (clean disjoint borrow) and the
     /// two sets are disjoint allocations (scratch dirs vs the view dir). Index
     /// tables are excluded: they live in `TableEntry::index_circuits`, not the
@@ -265,12 +266,8 @@ impl DagEngine {
             if !entry.kind.is_view() {
                 continue;
             }
-            // Views are always `Partitioned`; a replicated view holds exactly its
-            // one worker-owned child.
-            if let Some(pt) = entry.handle.as_partitioned_mut() {
-                for t in pt.partitions_mut() {
-                    outputs.push(t as *mut Table);
-                }
+            if let Some(t) = entry.handle.as_owned_mut() {
+                outputs.push(t as *mut Table);
             }
         }
         (traces, outputs)
@@ -290,11 +287,7 @@ impl DagEngine {
     /// (which `opk_key` would re-encode, double-flipping a signed PK's sign bit,
     /// so the probe would match no stored row and the retraction would be
     /// silently dropped).
-    pub(super) fn enforce_unique_pk(
-        ptable: &mut PartitionedTable,
-        schema: &SchemaDescriptor,
-        mut batch: Batch,
-    ) -> Batch {
+    pub(super) fn enforce_unique_pk(store: &mut Table, schema: &SchemaDescriptor, mut batch: Batch) -> Batch {
         // Empty-batch guard: empty batches reach the engine via the
         // `CatalogStore` ingest wrappers, which — unlike the worker loop — do
         // not pre-filter `count == 0`.
@@ -329,7 +322,7 @@ impl DagEngine {
             // point lookup for a PK the batch touches again.
             if !st.store_probed {
                 st.store_probed = true;
-                let (_existing_w, stored_row) = ptable.retract_pk_bytes(pkb);
+                let (_existing_w, stored_row) = store.retract_pk_bytes(pkb);
                 if let Some(stored_row) = stored_row {
                     // The located stored row is an owned `ColumnarSource` view;
                     // copy it in at weight -1 via the canonical source-append.

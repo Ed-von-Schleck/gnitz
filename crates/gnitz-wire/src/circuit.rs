@@ -32,7 +32,7 @@ pub const OPCODE_JOIN_DELTA_TRACE_RANGE: u64 = 32;
 /// Drop trace rows this worker does not own (**pure** range-join broadcast input;
 /// a band join scatters by its eq prefix and omits this node). Worker identity is
 /// a compile-time constant, so the node carries no payload.
-pub const OPCODE_PARTITION_FILTER: u64 = 33;
+pub const OPCODE_WORKER_FILTER: u64 = 33;
 /// Multiplicity-preserving sibling of DISTINCT: clamps each consolidated
 /// (PK, payload)'s net weight to `[0, i64::MAX]` (vs DISTINCT's `[-1, 1]`). The
 /// bag preset for EXCEPT ALL / INTERSECT ALL; shares DISTINCT's engine body.
@@ -459,11 +459,11 @@ pub enum OpNode {
     NullExtend {
         type_codes: Vec<u8>,
     },
-    /// `OPCODE_PARTITION_FILTER = 33`. Keep only rows whose packed-PK partition is
+    /// `OPCODE_WORKER_FILTER = 33`. Keep only rows whose packed-PK partition is
     /// owned by this worker (**pure** range-join broadcast input; a band join
     /// scatters by its eq prefix and omits this node). Worker identity is a
     /// compile-time constant, so no payload travels on the wire.
-    PartitionFilter,
+    WorkerFilter,
 }
 
 /// One decoded row of the `CircuitNodeColumns` system table for a single node,
@@ -621,7 +621,7 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             (OPCODE_NULL_EXTEND, None, None),
             encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes),
         ),
-        OpNode::PartitionFilter => ((OPCODE_PARTITION_FILTER, None, None), Vec::new()),
+        OpNode::WorkerFilter => ((OPCODE_WORKER_FILTER, None, None), Vec::new()),
     }
 }
 
@@ -774,7 +774,7 @@ pub fn decode_op_node(
         OPCODE_NULL_EXTEND => OpNode::NullExtend {
             type_codes: collect_typecodes(NODE_COL_KIND_NULL_EXT)?,
         },
-        OPCODE_PARTITION_FILTER => OpNode::PartitionFilter,
+        OPCODE_WORKER_FILTER => OpNode::WorkerFilter,
         _ => return Err(format!("unknown opcode {opcode}")),
     })
 }
@@ -918,9 +918,9 @@ mod tests {
 
     /// The partition-filter opcode decodes to the payload-free node.
     #[test]
-    fn decode_partition_filter() {
-        let node = decode_op_node(OPCODE_PARTITION_FILTER, None, None, &[]).unwrap();
-        assert_eq!(node, OpNode::PartitionFilter);
+    fn decode_worker_filter() {
+        let node = decode_op_node(OPCODE_WORKER_FILTER, None, None, &[]).unwrap();
+        assert_eq!(node, OpNode::WorkerFilter);
     }
 
     /// A non-zero `value2` that is not a PK-eligible type code is rejected at the
@@ -1038,7 +1038,7 @@ mod tests {
             OpNode::NullExtend {
                 type_codes: vec![crate::type_code::I64, crate::type_code::STRING],
             },
-            OpNode::PartitionFilter,
+            OpNode::WorkerFilter,
         ];
         for node in nodes {
             assert_eq!(roundtrip(node.clone()).unwrap(), node, "round-trip failed for {node:?}");

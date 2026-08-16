@@ -1,8 +1,13 @@
 use super::*;
 
+use crate::foundation::fault::Seam;
 use crate::schema::make_index_schema;
 use gnitz_wire::{SCHEMATAB_PAY_NAME, SEQTAB_PAY_VALUE};
 use rustc_hash::FxHashMap;
+
+/// `GNITZ_INJECT_TABLE_CREATE_DELAY_MS`: stall a user table's create between its
+/// directory and its child subdir, so a concurrent DROP races it.
+static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS");
 
 /// What `register_relation` needs to build and register one relation: the
 /// values decoded off its TABLE_TAB / VIEW_TAB row, plus the placement and
@@ -21,22 +26,8 @@ impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
     //
     // Dispatch is a static per-system-table sequence, and the order of calls
-    // is the dependency order.
-    //
-    // Two categories of handler are dispatched from here:
-    //
-    //   * `apply_*`  — pure cache-delta appliers. Each row's weight drives
-    //     a HashMap/HashSet insert (weight > 0) or remove (weight < 0). They
-    //     run over a sign-partitioned view of the batch (all retractions before
-    //     all insertions, §3.1 `sign_partition_batch`), so a rewrite pair (a
-    //     rename's -1,+1 on one PK) applies its retraction before its insertion
-    //     — the order the retract-then-insert appliers require.
-    //   * `hook_*`   — side-effectful handlers that build directories, allocate
-    //     partitions, register DAG entries, or backfill derived state. Storage
-    //     is applied before hooks fire, so the register/cascade hooks gate on
-    //     the row's *net* live state (`advance_to_exact_live`) rather than its own
-    //     sign: a rename pair (net-live before and after) fires no teardown and
-    //     no re-registration, in any row order, on every application path.
+    // is the dependency order. The `apply_*` / `hook_*` split is described in
+    // the module doc.
     //
     // Cross-sys-table ordering contract (required by `hook_table_register`
     // and `hook_view_register`, which read sys_columns via
@@ -205,51 +196,80 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Build the partitioned storage for a top-level relation. Recovery is
-    /// derived from `kind`, so a relation cannot be (e.g.) ephemeral but
-    /// SAL-replayed. Only user relations are built here (system catalog tables
-    /// are plain single `Table`s built at bootstrap), so the partition count is
-    /// always `NUM_PARTITIONS`.
-    /// The `with_staged_dir` crash-cleanup wrapping the call in
-    /// `hook_table_register`/`hook_view_register` is deliberately left at each
-    /// call site: this helper takes `&self` and is pure construction, so
-    /// callers own crash-cleanup.
-    pub(crate) fn build_partitioned_storage(
+    /// Build this process's store for a top-level relation: one `Table` under
+    /// `w{rank}of{num_workers}`. Recovery is derived from `kind`, so a relation
+    /// cannot be (e.g.) ephemeral but SAL-replayed. Only user relations are built
+    /// here — system catalog tables are plain single `Table`s built at bootstrap.
+    ///
+    /// The child is homed at THIS process's own worker rank, so a live CREATE on
+    /// each worker post-fork builds a distinct dir directly. The post-fork master
+    /// owns no store at all: it registers the relation `Detached` so it and
+    /// worker 0 do not both hold a live `Table` on `w0of{W}`.
+    ///
+    /// Crash-cleanup of the directory is the caller's: this takes `&self` and is
+    /// pure construction.
+    pub(crate) fn build_relation_store(
         &self,
         kind: RelationKind,
         directory: &str,
-        name: &str,
         id: i64,
         schema: SchemaDescriptor,
-    ) -> Result<PartitionedTable, String> {
-        // A relation whose stamped placement is not `Keyed` — a replicated base
-        // table, or a view over any source that is itself not keyed — holds its
-        // whole local dataset in one child, because its rows are not placed by
-        // `partition_for_pk`. A 256-partition store trimmed to the worker's range
-        // cannot address a row whose key partition the worker does not own: the
-        // ingest scatter reports `MisroutedRows` and the write fails stop, so
-        // every such relation would be unwritable. How such a store is read
-        // (single-source vs union-gather) is the read path's decision, not the
-        // store shape's.
-        //
-        // The single child is homed at THIS process's own worker rank (see
-        // `PartitionedTable::new`), so a live CREATE on each worker post-fork
-        // builds a distinct dir directly. The unhashed path must NOT fire for an
-        // empty active range (the post-fork master, `[0, 0)`): there the master
-        // builds zero child Tables and stays inert via the `tables.is_empty()`
-        // guards.
-        let routing = if !schema.placement().is_key_routed() && self.owns_partitions() {
-            Routing::Unhashed {
-                rank: crate::foundation::worker_ctx::worker_rank(),
+    ) -> Result<StoreHandle, String> {
+        ensure_dir(directory)?;
+        if !self.owns_stores {
+            return Ok(StoreHandle::Detached);
+        }
+
+        // Widen the window where the table dir exists but its child subdir does
+        // not, so a concurrent master remove_dir_all (DROP) deterministically
+        // races this create. User tables only.
+        if kind.is_base_table() {
+            if let Some(ms) = TABLE_CREATE_DELAY.count() {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
             }
-        } else {
-            Routing::Hashed {
-                start: self.active_part_start,
-                end: self.active_part_end,
-            }
-        };
-        PartitionedTable::new(directory, schema, id as u32, routing, kind.recovery_source())
-            .map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))
+        }
+
+        let child = ChildAddr::this_worker(self.num_workers);
+        let table = Table::new(&child.dir(directory), schema, id as u32, kind.recovery_source())
+            .map_err(|e| format!("Failed to open relation {id}: error {e} (dir={directory})"))?;
+        Ok(StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(table))))
+    }
+
+    /// A live CREATE's store. This call is what creates the relation directory,
+    /// so it is staged for crash-cleanup: if the rest of Stage-A fails,
+    /// `compensate_stage_a`'s drain removes what was made here.
+    fn create_relation_store(
+        &mut self,
+        kind: RelationKind,
+        directory: &str,
+        id: i64,
+        schema: SchemaDescriptor,
+    ) -> Result<StoreHandle, String> {
+        let staged = directory.to_string();
+        self.with_staged_dir(staged, |s| s.build_relation_store(kind, directory, id, schema))
+    }
+
+    /// A boot replay's store, on the pre-fork master. The directory already holds
+    /// the relation's rows, so — unlike a live CREATE — it is never staged for
+    /// cleanup: an error here leaves them for the next boot to retry.
+    ///
+    /// The relayout is bound to this open rather than run as its own pass because
+    /// it needs the previous child set, which opening the store would shadow and
+    /// `reconcile_child_dirs` deletes right afterwards. Views are exempt: a
+    /// worker-count change invalidates every one of them, so
+    /// `rebuild_invalid_views` refills them from base and relaying their state
+    /// would be waste.
+    fn reopen_relation_store(
+        &self,
+        kind: RelationKind,
+        directory: &str,
+        id: i64,
+        schema: SchemaDescriptor,
+    ) -> Result<StoreHandle, String> {
+        if kind.is_base_table() {
+            crate::storage::repartition_relation(directory, &schema, id as u32, self.num_workers)?;
+        }
+        self.build_relation_store(kind, directory, id, schema)
     }
 
     /// Build a relation's store and enter it in the registry — the shared `+1`
@@ -276,28 +296,21 @@ impl CatalogEngine {
         let directory = relation_dir(&self.base_dir, &schema_name, kind, id);
         let schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), placement)?;
         gnitz_debug!(
-            "catalog: creating {} dir={} name={} id={} parts={}",
+            "catalog: creating {} dir={} name={} id={} workers={}",
             kind_str,
             directory,
             name,
             id,
-            NUM_PARTITIONS
+            self.num_workers
         );
-        // Staged so that if Stage-A fails after the directory is created,
-        // compensate_stage_a's drain removes it.
-        let pt = self.with_staged_dir(directory.clone(), |s| {
-            s.build_partitioned_storage(kind, &directory, name, id, schema)
-        })?;
+        let handle = if self.ctx.is_live() {
+            self.create_relation_store(kind, &directory, id, schema)?
+        } else {
+            self.reopen_relation_store(kind, &directory, id, schema)?
+        };
 
         fsync_dir(&schema_dir(&self.base_dir, &schema_name));
-        self.dag.register_table(
-            id,
-            StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))),
-            schema,
-            kind,
-            depth,
-            directory,
-        );
+        self.dag.register_table(id, handle, schema, kind, depth, directory);
         raise_id_counter(&mut self.next_table_id, id);
         Ok(())
     }

@@ -1445,7 +1445,7 @@ mod tests {
         // (big-endian) image leads the PK region (where load_circuit seeks).
         let pk = |sub: u64| -> u128 { ((view_id as u128) << 64) | (sub as u128) };
 
-        let mut nodes_tab = Table::new(
+        let mut nodes_tab = Table::with_arena(
             &format!("{dir}/nodes"),
             nodes_schema,
             0,
@@ -1463,7 +1463,7 @@ mod tests {
             bb.end_row();
             nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
         }
-        let mut edges_tab = Table::new(
+        let mut edges_tab = Table::with_arena(
             &format!("{dir}/edges"),
             edges_schema,
             0,
@@ -1472,7 +1472,7 @@ mod tests {
         )
         .unwrap();
         let _ = &mut edges_tab; // empty
-        let mut cols_tab = Table::new(
+        let mut cols_tab = Table::with_arena(
             &format!("{dir}/cols"),
             cols_schema,
             0,
@@ -1510,7 +1510,7 @@ mod tests {
         // (big-endian) image leads the PK region (where load_circuit seeks).
         let pk = |sub: u64| -> u128 { ((view_id as u128) << 64) | (sub as u128) };
 
-        let mut nodes_tab = Table::new(
+        let mut nodes_tab = Table::with_arena(
             &format!("{dir}/nodes"),
             nodes_schema,
             0,
@@ -1536,7 +1536,7 @@ mod tests {
             bb.end_row();
             nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
         }
-        let mut edges_tab = Table::new(
+        let mut edges_tab = Table::with_arena(
             &format!("{dir}/edges"),
             edges_schema,
             0,
@@ -1554,7 +1554,7 @@ mod tests {
             bb.end_row();
             edges_tab.ingest_owned_batch(bb.finish()).unwrap();
         }
-        let mut cols_tab = Table::new(
+        let mut cols_tab = Table::with_arena(
             &format!("{dir}/cols"),
             cols_schema,
             0,
@@ -2051,11 +2051,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reindex_cols_through_filters_with_partition_filter_after_map() {
+    fn test_reindex_cols_through_filters_with_worker_filter_after_map() {
         use gnitz_wire::{MapKind, OpNode};
-        // A reindex Map followed by a PartitionFilter, with NO join node present
+        // A reindex Map followed by a WorkerFilter, with NO join node present
         // (so is_join_view == false and the feeds_trace_or_join guard is off): the
-        // walk reaches the Map and returns its cols, then stops — a PartitionFilter
+        // walk reaches the Map and returns its cols, then stops — a WorkerFilter
         // is not a Filter, so it is never stepped through. The real range circuit,
         // where a Join node IS present (is_join_view == true) and the reindex feeds
         // it directly, is covered by
@@ -2071,36 +2071,36 @@ mod tests {
                 reindex_target_tcs: vec![],
             }),
         );
-        nodes.insert(2, OpNode::PartitionFilter);
+        nodes.insert(2, OpNode::WorkerFilter);
         nodes.insert(3, OpNode::IntegrateTrace);
         let edges = vec![
             (0, 1, PORT_IN), // ScanDelta → reindex Map
-            (1, 2, PORT_IN), // Map → PartitionFilter
-            (2, 3, PORT_IN), // PartitionFilter → IntegrateTrace
+            (1, 2, PORT_IN), // Map → WorkerFilter
+            (2, 3, PORT_IN), // WorkerFilter → IntegrateTrace
         ];
         let loaded = make_loaded(nodes, edges);
         assert_eq!(
             reindex_cols_through_filters(&loaded, 0),
             vec![(2, 0)],
-            "PartitionFilter after the reindex Map must not change the walk result"
+            "WorkerFilter after the reindex Map must not change the walk result"
         );
     }
 
     /// Real pure-range-join shape (planner.rs, `n_eq == 0`): the reindex Map feeds
     /// the `Join(DeltaTraceRange)` node DIRECTLY as the delta term AND feeds a
-    /// `PartitionFilter → IntegrateTrace` toward the trace term. A Join node is
+    /// `WorkerFilter → IntegrateTrace` toward the trace term. A Join node is
     /// present, so `is_join_view == true` and the `feeds_trace_or_join` guard is
     /// live — and it returns true via the DIRECT Map→Join edge, so the reindex key
     /// is still collected as the scatter key. This is what keeps
     /// `get_join_shard_cols` non-empty for a pure range join (hence
     /// `prepare_relay`'s `is_join` / `range_n_eq` and the broadcast routing). Guards
-    /// against the misreading that the reindex only feeds the PartitionFilter.
+    /// against the misreading that the reindex only feeds the WorkerFilter.
     #[test]
     fn test_reindex_cols_through_filters_range_join_feeds_join_directly() {
         use gnitz_wire::{JoinKind, MapKind, OpNode};
         let dummy_blob = dummy_expr_blob();
         // ScanDelta(99) ─► Map(reindex=[2]) ─┬─► Join(DeltaTraceRange)  [delta, PORT_IN_A]
-        //                                     └─► PartitionFilter ─► IntegrateTrace ─► Join  [PORT_TRACE]
+        //                                     └─► WorkerFilter ─► IntegrateTrace ─► Join  [PORT_TRACE]
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(99));
         nodes.insert(
@@ -2111,7 +2111,7 @@ mod tests {
                 reindex_target_tcs: vec![],
             }),
         );
-        nodes.insert(2, OpNode::PartitionFilter);
+        nodes.insert(2, OpNode::WorkerFilter);
         nodes.insert(3, OpNode::IntegrateTrace);
         nodes.insert(
             4,
@@ -2123,8 +2123,8 @@ mod tests {
         let edges = vec![
             (0, 1, PORT_IN),    // ScanDelta → reindex Map
             (1, 4, PORT_IN_A),  // reindex Map → Join (delta term, DIRECT edge)
-            (1, 2, PORT_IN),    // reindex Map → PartitionFilter (toward the trace)
-            (2, 3, PORT_IN),    // PartitionFilter → IntegrateTrace
+            (1, 2, PORT_IN),    // reindex Map → WorkerFilter (toward the trace)
+            (2, 3, PORT_IN),    // WorkerFilter → IntegrateTrace
             (3, 4, PORT_TRACE), // IntegrateTrace → Join (trace term)
         ];
         let loaded = make_loaded(nodes, edges);
@@ -2132,7 +2132,7 @@ mod tests {
             reindex_cols_through_filters(&loaded, 0),
             vec![(2, 0)],
             "the reindex feeds the Join directly, so feeds_trace_or_join is true \
-             even with a PartitionFilter toward the trace"
+             even with a WorkerFilter toward the trace"
         );
     }
 
@@ -2373,7 +2373,7 @@ mod tests {
     // The view exchange-skip detector's source resolution. The skip itself has no
     // observable "fired" signal at the E2E layer (exchanging is also correct), so
     // these unit tests are what pin that the walk engages exactly when it should:
-    // through Filter chains, never across a re-keying Map / PartitionFilter / fan-in.
+    // through Filter chains, never across a re-keying Map / WorkerFilter / fan-in.
 
     /// A bare `ScanDelta → ExchangeShard` (the no-`WHERE` case) resolves to the source
     /// tid; `ScanDelta → Filter → ExchangeShard` (filtered `GROUP BY prefix`) does too,
@@ -2467,21 +2467,21 @@ mod tests {
         );
     }
 
-    /// A `PartitionFilter` (range-join broadcast input) is a distinct OpNode variant,
+    /// A `WorkerFilter` (range-join broadcast input) is a distinct OpNode variant,
     /// not a `Filter`, so it is never crossed — the same exclusion
     /// `reindex_cols_through_filters` makes on the forward walk.
     #[test]
-    fn test_scan_tid_through_filters_partition_filter() {
+    fn test_scan_tid_through_filters_worker_filter() {
         use gnitz_wire::OpNode;
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(7));
-        nodes.insert(1, OpNode::PartitionFilter);
+        nodes.insert(1, OpNode::WorkerFilter);
         nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
         let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
         assert_eq!(
             scan_tid_through_filters(&loaded, 2),
             None,
-            "PartitionFilter is not a Filter; the walk must bail"
+            "WorkerFilter is not a Filter; the walk must bail"
         );
     }
 

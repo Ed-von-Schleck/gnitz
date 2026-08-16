@@ -270,13 +270,13 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
     // Two probe-support consumers count like the trace/probe itself (they appear only
     // in pure-range circuits, where the reindex may reach the trace/probe through no
     // other edge — the pure-range EXISTS circuit has exactly these two shapes):
-    //   - a `PartitionFilter` whose own consumer is the trace/probe (the broadcast
+    //   - a `WorkerFilter` whose own consumer is the trace/probe (the broadcast
     //     trimmer between a scattered reindex and its integrate);
     //   - a `Map(HashRow)` (the head of the inline `m = MAX/MIN(b.range)` threshold
     //     reduce over the broadcast side).
     // Neither re-classifies any other reindex: the pure-range LEFT join's sibling
     // reindexes already qualify directly (same key, deduped), and the null-key /
-    // null-fill re-keys feed a PartitionFilter-into-Union or a plain Map, not these.
+    // null-fill re-keys feed a WorkerFilter-into-Union or a plain Map, not these.
     let is_join_view = loaded
         .nodes
         .values()
@@ -292,7 +292,7 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
             outs.iter().any(|&(d, _)| {
                 is_trace_or_join(d)
                     || match loaded.nodes.get(&d) {
-                        Some(gnitz_wire::OpNode::PartitionFilter) => loaded
+                        Some(gnitz_wire::OpNode::WorkerFilter) => loaded
                             .outgoing
                             .get(&d)
                             .is_some_and(|outs2| outs2.iter().any(|&(d2, _)| is_trace_or_join(d2))),
@@ -353,7 +353,7 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
 /// operator transparent to the shard key: row-selective, never re-keys the PK
 /// region, never moves a row
 /// off-worker; Map/Reduce/Distinct/join change the key or its distribution, and a
-/// `PartitionFilter` (range-join broadcast input) is not a `Filter` either. The
+/// `WorkerFilter` (range-join broadcast input) is not a `Filter` either. The
 /// backward dual of `reindex_cols_through_filters`, reading the same `loaded.incoming`
 /// adjacency as `ancestors_inclusive` / `exchange_input_node`. The chain is acyclic —
 /// both `compile_view` and `load_meta_circuit` reject a malformed cyclic circuit (the

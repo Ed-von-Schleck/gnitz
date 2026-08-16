@@ -319,6 +319,11 @@ mod tests {
         opk_pk,
     };
 
+    /// Worker count the co-partition pins route against. Any count works — the
+    /// property is that producer and consumer agree — but the wide-arm formula
+    /// pin needs a fixed one to recompute against.
+    const NW: usize = 4;
+
     /// Arity-1 golden oracle (test-only). Wraps a single column classified via
     /// `classify_promote`; `promote`/`promote_into` derive the expected synthetic
     /// key independently of the production `ReindexPacker`'s row loop, so the
@@ -358,7 +363,7 @@ mod tests {
         /// Promote every row of `output` from `batch`, hoisting the per-batch kind
         /// dispatch out of the row loop. Every arm emits sign-aware OPK bytes
         /// right-aligned into `output.pk_stride()`, so the synthetic reindex key is
-        /// byte-identical to how `ColumnLocator::route_key`, `partition_for_pk_bytes`, and
+        /// byte-identical to how `ColumnLocator::route_key`, `worker_for_pk_bytes`, and
         /// storage encode the same value. Production goes through `ReindexPacker`
         /// (which generalises this to N columns); the arity-1 byte-identity test
         /// asserts `ReindexPacker` matches this oracle.
@@ -966,8 +971,8 @@ mod tests {
             // Trace side (stored _join_pk) == scatter side (scratch buffer).
             assert_eq!(out.get_pk_bytes(row), &buf[..packer.out_stride], "row {row} key bytes");
             assert_eq!(
-                gnitz_wire::partition_for_pk_bytes(out.get_pk_bytes(row)),
-                gnitz_wire::partition_for_pk_bytes(&buf[..packer.out_stride]),
+                gnitz_wire::worker_for_pk_bytes(out.get_pk_bytes(row), NW),
+                gnitz_wire::worker_for_pk_bytes(&buf[..packer.out_stride], NW),
                 "row {row} co-partition",
             );
         }
@@ -978,15 +983,16 @@ mod tests {
     #[test]
     fn test_reindex_packer_copartition_contract_wide() {
         // WIDE-branch (key len > 16) co-partition pin. A 3×U64 reindex key is 24
-        // OPK bytes, so `partition_for_pk_bytes` takes its `len > 16` arm
-        // (`xxh3_64(bytes) >> 56`), NOT the narrow `mix(widen_pk_be(..))` arm the
-        // existing 12-byte contract test exercises. The wide key is built by three
-        // INDEPENDENT code paths — the exchange scatter (`pack_into` → scratch),
-        // the reindexed trace store (`promote_into` → `get_pk_bytes`), and the
-        // storage/ingest OPK encoder (`opk_pk` = `encode_order_preserving_pk`,
-        // which never touches `ReindexPacker`) — so a fork in any single path's
-        // wide-key construction breaks the byte-equality teeth, and a fork in
-        // `partition_for_pk_bytes`'s wide arm breaks the formula-pin teeth.
+        // OPK bytes, so `worker_for_pk_bytes` takes its `len > 16` arm
+        // (multiply-shift over `xxh3_64(bytes)`), NOT the narrow
+        // `mix(widen_pk_be(..))` arm the existing 12-byte contract test exercises.
+        // The wide key is built by three INDEPENDENT code paths — the exchange
+        // scatter (`pack_into` → scratch), the reindexed trace store
+        // (`promote_into` → `get_pk_bytes`), and the storage/ingest OPK encoder
+        // (`opk_pk` = `encode_order_preserving_pk`, which never touches
+        // `ReindexPacker`) — so a fork in any single path's wide-key construction
+        // breaks the byte-equality teeth, and a fork in `worker_for_pk_bytes`'s
+        // wide arm breaks the formula-pin teeth.
         //
         // Source: narrow U64 PK + three U64 payload columns; reindex on the three
         // payloads (the `map_reindex` repartition-by-3-column-key shape).
@@ -1051,24 +1057,24 @@ mod tests {
         assert_eq!(consumer, oracle.as_slice(), "trace store == ingest OPK encoder");
         assert_eq!(producer, oracle.as_slice(), "scatter == ingest OPK encoder");
 
-        // (2) CO-PARTITION teeth: producer and consumer route to the same partition
-        // through the WIDE arm of partition_for_pk_bytes.
-        let p_consumer = gnitz_wire::partition_for_pk_bytes(consumer);
-        let p_producer = gnitz_wire::partition_for_pk_bytes(producer);
-        let p_oracle = gnitz_wire::partition_for_pk_bytes(oracle.as_slice());
+        // (2) CO-PARTITION teeth: producer and consumer route to the same worker
+        // through the WIDE arm of worker_for_pk_bytes.
+        let p_consumer = gnitz_wire::worker_for_pk_bytes(consumer, NW);
+        let p_producer = gnitz_wire::worker_for_pk_bytes(producer, NW);
+        let p_oracle = gnitz_wire::worker_for_pk_bytes(oracle.as_slice(), NW);
         assert_eq!(p_producer, p_consumer, "producer/consumer co-partition (wide)");
         assert_eq!(p_consumer, p_oracle, "trace store / ingest co-partition (wide)");
 
-        // (3) WIDE-ARM FORMULA pin: the partition is the top 8 bits of XXH3-64 over
-        // the OPK bytes, recomputed independently here. A forked hash seed or a
-        // shifted bucket-bit extraction in `partition_for_pk_bytes`'s `len > 16`
+        // (3) WIDE-ARM FORMULA pin: the owner is the multiply-shift re-bucketing of
+        // XXH3-64 over the OPK bytes, recomputed independently here. A forked hash
+        // seed or a shifted bucket extraction in `worker_for_pk_bytes`'s `len > 16`
         // arm diverges from this reference even though it would still keep
         // producer == consumer (both call the same forked function). This is the
-        // teeth that survives the "both paths share one partition_for_pk_bytes"
+        // teeth that survives the "both paths share one worker_for_pk_bytes"
         // case called out for cluster C2.
-        let expected = (crate::foundation::xxh::checksum(consumer) >> 56) as usize;
-        assert_eq!(p_consumer, expected, "wide partition == (xxh3_64(opk) >> 56)");
-        assert!(expected < 256, "256-bucket routing (top 8 bits)");
+        let expected = ((crate::foundation::xxh::checksum(consumer) as u128 * NW as u128) >> 64) as usize;
+        assert_eq!(p_consumer, expected, "wide owner == ((xxh3_64(opk) * W) >> 64)");
+        assert!(expected < NW, "the owner is a launched worker");
     }
 
     #[test]

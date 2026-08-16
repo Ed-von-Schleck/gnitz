@@ -9,7 +9,6 @@ use crate::schema::SchemaDescriptor;
 use crate::storage::{prorated_blob_cap, scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
 
 use super::router::{RouteMode, ScatterKey};
-use gnitz_wire::build_w_map;
 // Reached only from the `#[cfg(test)]` co-partition tests; production relay
 // paths build their own worker-row scratch (`WORKER_ROWS`), route through one
 // hoisted `ScatterKey`, and settle PK ties with the canonical
@@ -19,9 +18,7 @@ use super::super::reindex::ReindexPacker;
 #[cfg(test)]
 use crate::schema::key::compare_pk_bytes;
 #[cfg(test)]
-use gnitz_wire::worker_for_partition;
-#[cfg(test)]
-use gnitz_wire::{partition_for_key, partition_for_pk_bytes};
+use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 
 // Thread-local pool: reuse Vec<Vec<(u8,u32)>> worker-row scratch across calls.
 thread_local! {
@@ -83,8 +80,6 @@ pub(crate) fn op_repartition_batches_mode(
         "source index must fit in u8 (got {})",
         sources.len()
     );
-    let w_map = build_w_map(num_workers);
-
     let mem_batches: Vec<Option<MemBatch>> = sources
         .iter()
         .map(|opt| match opt {
@@ -105,10 +100,10 @@ pub(crate) fn op_repartition_batches_mode(
         }
 
         // One `ScatterKey` per scatter, built out of the row loop: native PK
-        // bytes when the key is exactly the PK (so the partition matches
-        // `PartitionedTable::local_index`), a packed `_join_pk` for a
-        // `JoinPromote` key, the group fold for a `GroupKey` key.
-        let mut scatter_key = ScatterKey::new(mode, col_indices, target_tcs, schema);
+        // bytes when the key is exactly the PK (so the owner matches the one the
+        // write path routes to), a packed `_join_pk` for a `JoinPromote` key, the
+        // group fold for a `GroupKey` key.
+        let mut scatter_key = ScatterKey::new(mode, col_indices, target_tcs, schema, num_workers);
         let is_pk_routing = scatter_key.is_pk_routed();
         for (si, mb_opt) in mem_batches.iter().enumerate() {
             let mb = match mb_opt {
@@ -116,8 +111,7 @@ pub(crate) fn op_repartition_batches_mode(
                 None => continue,
             };
             for i in 0..mb.count {
-                let partition = scatter_key.partition(mb, i);
-                worker_rows[w_map[partition]].push((si as u8, i as u32));
+                worker_rows[scatter_key.worker(mb, i)].push((si as u8, i as u32));
             }
         }
 
@@ -157,13 +151,12 @@ pub(crate) fn op_repartition_batches_mode(
 /// PK, so equal keys are byte-equal) and reserves the byte tiebreak for a `> 16`
 /// prefix collision — then on ascending source index (deterministic under
 /// `swap_remove`'s scramble of `active_sources`). `route` partitions each emitted
-/// row through `partition_for_pk_bytes` (or the group/packer path) — byte-correct at
+/// row through `worker_for_pk_bytes` (or the group/packer path) — byte-correct at
 /// any width. No width fork, no `get_pk`, no `pk_cache`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn relay_walk_inner<'a, Route>(
     mem_batches: &[Option<MemBatch<'a>>],
-    w_map: &[usize; 256],
     worker_rows: &mut [Vec<(u8, u32)>],
     order_cache: &mut [u128; 256],
     mut cursors: [u32; 256],
@@ -179,7 +172,7 @@ fn relay_walk_inner<'a, Route>(
             let si = active_sources[0] as usize;
             let mb = mem_batches[si].as_ref().unwrap();
             for row in cursors[si] as usize..mb.count {
-                worker_rows[w_map[route(mb, row)]].push((si as u8, row as u32));
+                worker_rows[route(mb, row)].push((si as u8, row as u32));
             }
             return;
         }
@@ -221,7 +214,7 @@ fn relay_walk_inner<'a, Route>(
         let row = cursors[best_si] as usize;
         cursors[best_si] += 1;
         let mb = mem_batches[best_si].as_ref().unwrap();
-        worker_rows[w_map[route(mb, row)]].push((best_si as u8, row as u32));
+        worker_rows[route(mb, row)].push((best_si as u8, row as u32));
 
         let new_cur = cursors[best_si] as usize;
         if new_cur == mb.count {
@@ -251,7 +244,6 @@ fn relay_scatter_merge_walk(
         "source index must fit in u8 (got {})",
         mem_batches.len()
     );
-    let w_map = build_w_map(num_workers);
     let cursors = [0u32; 256];
     let mut order_cache = [0u128; 256];
     let mut active_sources = [0u8; 256];
@@ -277,20 +269,19 @@ fn relay_scatter_merge_walk(
     }
 
     // One `ScatterKey` picked once (never per row): native PK bytes when the key
-    // is exactly the PK (byte-identical to the old narrow `partition_for_key(get_pk)`
+    // is exactly the PK (byte-identical to the old narrow `worker_for_key(get_pk)`
     // route — both reduce to `mix(widen_pk_be(bytes))`), a packed `_join_pk` for
     // JoinPromote, the group fold for GroupKey. The `&mut scatter_key` capture
     // (the packer's inline scratch) is why `relay_walk_inner` takes `FnMut`.
-    let mut scatter_key = ScatterKey::new(mode, col_indices, target_tcs, schema);
+    let mut scatter_key = ScatterKey::new(mode, col_indices, target_tcs, schema, num_workers);
     relay_walk_inner(
         mem_batches,
-        &w_map,
         worker_rows,
         &mut order_cache,
         cursors,
         active_sources,
         num_active,
-        |mb: &MemBatch, row: usize| scatter_key.partition(mb, row),
+        |mb: &MemBatch, row: usize| scatter_key.worker(mb, row),
     );
 }
 
@@ -508,10 +499,10 @@ mod tests {
                     "worker {w} row {r} out of order",
                 );
             }
-            // (b) Every row routed to partition_for_pk_bytes's worker.
+            // (b) Every row routed to worker_for_pk_bytes's worker.
             for r in 0..sb.count {
                 let pk = sb.get_pk_bytes(r);
-                let expected = worker_for_partition(partition_for_pk_bytes(pk), num_workers);
+                let expected = worker_for_pk_bytes(pk, num_workers);
                 assert_eq!(expected, w, "wide PK routed to wrong worker");
             }
         }
@@ -617,7 +608,7 @@ mod tests {
         );
         let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
         // col_indices = [0, 1] is the full PK set: exercises the compound-PK-set
-        // is_pk_routing path (route_pk via partition_for_pk_bytes over the OPK bytes).
+        // is_pk_routing path (route_pk via worker_for_pk_bytes over the OPK bytes).
         let result = op_relay_scatter_consolidated(&sources, &[0u32, 1u32], &schema, num_workers);
 
         assert_eq!(total_rows(&result), 9);
@@ -632,11 +623,11 @@ mod tests {
                     "worker {w} row {r} out of order (compound PK)",
                 );
             }
-            // (b) Routing matches partition_for_pk_bytes (the canonical PK route
+            // (b) Routing matches worker_for_pk_bytes (the canonical PK route
             // for narrow PKs via fill_worker_indices' is_compound_pk path).
             for r in 0..sb.count {
                 let pk = sb.get_pk_bytes(r);
-                let expected = worker_for_partition(partition_for_pk_bytes(pk), num_workers);
+                let expected = worker_for_pk_bytes(pk, num_workers);
                 assert_eq!(expected, w, "compound PK routed to wrong worker");
             }
         }
@@ -721,7 +712,7 @@ mod tests {
         for (w, sb) in result.iter().enumerate() {
             for r in 0..sb.count {
                 let pk = sb.get_pk_bytes(r);
-                let expected = worker_for_partition(partition_for_pk_bytes(pk), num_workers);
+                let expected = worker_for_pk_bytes(pk, num_workers);
                 assert_eq!(expected, w, "bulk-drain wide PK routed to wrong worker");
             }
         }
@@ -748,7 +739,7 @@ mod tests {
         assert_eq!(total_rows(&sub_batches), pk_vals.len());
 
         for &pk in pk_vals {
-            let expected = worker_for_partition(partition_for_key(pk as u128), num_workers);
+            let expected = worker_for_key(pk as u128, num_workers);
             let found = (0..sub_batches[expected].count).any(|r| (sub_batches[expected].get_pk(r) as u64) == pk);
             assert!(found, "pk={pk} not found in worker {expected}");
         }
@@ -781,7 +772,7 @@ mod tests {
         assert_eq!(total_rows(&sub_batches), n);
 
         for &pk in pks {
-            let expected = worker_for_partition(partition_for_key(pk), num_workers);
+            let expected = worker_for_key(pk, num_workers);
             let found = (0..sub_batches[expected].count).any(|r| sub_batches[expected].get_pk(r) == pk);
             assert!(found, "pk={pk} not in worker {expected}");
         }
@@ -1044,8 +1035,7 @@ mod tests {
             // columns are sign-flipped via payload_route_key) so a payload FK
             // routes identically to the same value stored as a PK column.
             let route_key = gnitz_wire::payload_route_key(&v.to_le_bytes(), 0, 8, type_code::I64);
-            let expected_partition = partition_for_key(route_key);
-            let expected_worker = worker_for_partition(expected_partition, num_workers);
+            let expected_worker = worker_for_key(route_key, num_workers);
             let found = (0..sub_batches[expected_worker].count).any(|r| {
                 i64::from_le_bytes(
                     sub_batches[expected_worker].col_data(0)[r * 8..r * 8 + 8]
@@ -1153,11 +1143,10 @@ mod tests {
     #[test]
     fn test_op_repartition_batches_compound_pk_routes_by_bytes() {
         // op_repartition_batches_mode must route compound-PK rows by raw PK
-        // bytes (partition_for_pk_bytes), matching PartitionedTable::
-        // local_index. The pre-fix code only branched on (single_pk &&
-        // wide), falling through to the group-key hash path for narrow
-        // compound PKs — which would route to a different worker than
-        // the data lives on.
+        // bytes (worker_for_pk_bytes), matching the write path's own route. The
+        // pre-fix code only branched on (single_pk && wide), falling through to
+        // the group-key hash path for narrow compound PKs — which would route to
+        // a different worker than the data lives on.
         let schema = make_narrow_compound_schema();
         let num_workers = 4;
         let b0 = make_narrow_compound_batch(
@@ -1184,7 +1173,7 @@ mod tests {
         for (w, sb) in sub_batches.iter().enumerate() {
             for r in 0..sb.count {
                 let pk = sb.get_pk_bytes(r);
-                let expected = worker_for_partition(partition_for_pk_bytes(pk), num_workers);
+                let expected = worker_for_pk_bytes(pk, num_workers);
                 assert_eq!(expected, w, "compound-PK row routed to wrong worker");
             }
         }
@@ -1226,7 +1215,7 @@ mod tests {
     fn test_compound_join_promote_scatter_copartitions_both_functions() {
         // A compound JoinPromote scatter must route every row by the SAME packed
         // OPK bytes the reindex Map writes as `_join_pk` — i.e. by
-        // `partition_for_pk_bytes(ReindexPacker::pack(cols, row))`, NOT by
+        // `worker_for_pk_bytes(ReindexPacker::pack(cols, row))`, NOT by
         // `extract_group_key`. Exercised through BOTH production scatter
         // functions: the non-consolidated row loop in `op_repartition_batches_mode`
         // and the consolidated merge-walk's `route_group` in
@@ -1254,7 +1243,7 @@ mod tests {
         let expected_worker = |sb: &Batch, r: usize| -> usize {
             let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
             packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
-            worker_for_partition(partition_for_pk_bytes(&buf[..packer.out_stride]), num_workers)
+            worker_for_pk_bytes(&buf[..packer.out_stride], num_workers)
         };
 
         // Helper: assert every output row routed to the worker its packed key
@@ -1344,7 +1333,7 @@ mod tests {
         let expected_worker = |sb: &Batch, r: usize| -> usize {
             let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
             packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
-            worker_for_partition(partition_for_pk_bytes(&buf[..packer.out_stride]), num_workers)
+            worker_for_pk_bytes(&buf[..packer.out_stride], num_workers)
         };
         let check = |result: &[Batch], label: &str| {
             assert_eq!(total_rows(result), rows.len(), "{label}: no dropped rows");
@@ -1424,7 +1413,7 @@ mod tests {
                 let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
                 pk_packer.pack_into(&mut buf[..pk_packer.out_stride], &sb.as_mem_batch(), r);
                 assert_eq!(
-                    worker_for_partition(partition_for_pk_bytes(&buf[..pk_packer.out_stride]), num_workers),
+                    worker_for_pk_bytes(&buf[..pk_packer.out_stride], num_workers),
                     w,
                     "PK-key fast-path must be gated: routed by native PK not packed T"
                 );
@@ -1446,7 +1435,7 @@ mod tests {
     /// relay's O(K) linear winner-scan.
     fn relay_walk_cachefree(
         mem_batches: &[Option<MemBatch<'_>>],
-        w_map: &[usize; 256],
+        num_workers: usize,
         worker_rows: &mut [Vec<(u8, u32)>],
         mut cursors: [u32; 256],
         mut active_sources: [u8; 256],
@@ -1457,7 +1446,7 @@ mod tests {
                 let si = active_sources[0] as usize;
                 let mb = mem_batches[si].as_ref().unwrap();
                 for row in cursors[si] as usize..mb.count {
-                    worker_rows[w_map[partition_for_pk_bytes(mb.get_pk_bytes(row))]].push((si as u8, row as u32));
+                    worker_rows[worker_for_pk_bytes(mb.get_pk_bytes(row), num_workers)].push((si as u8, row as u32));
                 }
                 return;
             }
@@ -1485,7 +1474,7 @@ mod tests {
             let row = cursors[best_si] as usize;
             cursors[best_si] += 1;
             let mb = mem_batches[best_si].as_ref().unwrap();
-            worker_rows[w_map[partition_for_pk_bytes(mb.get_pk_bytes(row))]].push((best_si as u8, row as u32));
+            worker_rows[worker_for_pk_bytes(mb.get_pk_bytes(row), num_workers)].push((best_si as u8, row as u32));
             let new_cur = cursors[best_si] as usize;
             if new_cur == mb.count {
                 num_active -= 1;
@@ -1522,7 +1511,6 @@ mod tests {
         let bench = |label: &str, cbs: &[Batch]| {
             let mem_batches: Vec<Option<MemBatch>> = cbs.iter().map(|cb| Some(cb.as_mem_batch())).collect();
             let total: usize = mem_batches.iter().flatten().map(|m| m.count).sum();
-            let w_map = build_w_map(num_workers);
             let cursors = [0u32; 256];
             let mut active_sources = [0u8; 256];
             let mut num_active = 0usize;
@@ -1532,7 +1520,7 @@ mod tests {
                     num_active += 1;
                 }
             }
-            let route_pk = |mb: &MemBatch, row: usize| partition_for_pk_bytes(mb.get_pk_bytes(row));
+            let route_pk = |mb: &MemBatch, row: usize| worker_for_pk_bytes(mb.get_pk_bytes(row), num_workers);
             let mut order_cache = [0u128; 256];
             let reset_cache = |oc: &mut [u128; 256]| {
                 for &s8 in active_sources.iter().take(num_active) {
@@ -1547,7 +1535,6 @@ mod tests {
             reset_cache(&mut order_cache);
             relay_walk_inner(
                 &mem_batches,
-                &w_map,
                 &mut wr_a,
                 &mut order_cache,
                 cursors,
@@ -1555,7 +1542,14 @@ mod tests {
                 num_active,
                 route_pk,
             );
-            relay_walk_cachefree(&mem_batches, &w_map, &mut wr_b, cursors, active_sources, num_active);
+            relay_walk_cachefree(
+                &mem_batches,
+                num_workers,
+                &mut wr_b,
+                cursors,
+                active_sources,
+                num_active,
+            );
             assert_eq!(wr_a, wr_b, "{label}: cached vs cache-free walk diverged");
 
             let mut dur_a = Duration::ZERO;
@@ -1566,7 +1560,6 @@ mod tests {
                 let t = Instant::now();
                 relay_walk_inner(
                     &mem_batches,
-                    &w_map,
                     &mut wr_a,
                     &mut order_cache,
                     cursors,
@@ -1579,7 +1572,14 @@ mod tests {
 
                 wr_b.iter_mut().for_each(Vec::clear);
                 let t = Instant::now();
-                relay_walk_cachefree(&mem_batches, &w_map, &mut wr_b, cursors, active_sources, num_active);
+                relay_walk_cachefree(
+                    &mem_batches,
+                    num_workers,
+                    &mut wr_b,
+                    cursors,
+                    active_sources,
+                    num_active,
+                );
                 dur_b += t.elapsed();
                 black_box(&wr_b);
             }
@@ -1628,7 +1628,7 @@ mod tests {
     /// Release-only microbench pinning the single-column `JoinPromote` scatter
     /// route after the `ScatterKey` collapse: the per-row cost moved from
     /// `route_key` (register sign-flip + widen) to `pack_into` (one ≤8-byte OPK
-    /// store) + `partition_for_pk_bytes`. Times the whole
+    /// store) + `worker_for_pk_bytes`. Times the whole
     /// `op_relay_scatter_consolidated_mode` over 1M rows keyed by a single I64
     /// payload column. Run before/after the router commit to confirm parity:
     /// `cd crates && cargo test -p gnitz-engine --release scatter_route_bench -- --ignored --nocapture --test-threads=1`

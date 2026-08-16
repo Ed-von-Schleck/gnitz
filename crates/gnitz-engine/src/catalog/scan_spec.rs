@@ -6,9 +6,9 @@
 //! and the sink is materialized. No DBSP circuit, no operator state, no
 //! exchange.
 //!
-//! A bound that names its keys — a `pk IN (…)` set, or a PK range confined to
-//! one distribution prefix — reads only the partitions those keys hash into; an
-//! unconfined bound merges every local partition.
+//! The cursor spans this worker's whole slice of the relation; a bound that
+//! names its keys narrows the walk within it. Which worker answers at all is the
+//! master's question (`scan_spec_worker`), not this module's.
 //!
 //! The reply schema arrives as the client's raw wire block (decoded by the
 //! worker one layer up); this module takes the decoded `SchemaDescriptor`. The
@@ -23,7 +23,6 @@ use super::store_io::SourceCursor;
 use super::*;
 use crate::expr::ScalarFunc;
 use crate::ops::AdhocFold;
-use crate::query::StoreProbe;
 use crate::schema::key::{compare_pk_bytes, opk_key, PkBuf};
 use crate::schema::ColumnLocator;
 use crate::storage::{cmp_col_window, compare_rows};
@@ -35,7 +34,7 @@ use gnitz_expr::{LogicalProgram, RowSource};
 const MAX_WORKER_TOPK: u64 = 65_536;
 
 impl CatalogEngine {
-    /// Execute `spec` against `target_id` on this worker's partitions,
+    /// Execute `spec` against `target_id` on this worker's slice,
     /// returning one keeper batch in the `reply_schema` shape. The caller
     /// (the worker dispatch arm) decoded `reply_schema` from the client's wire
     /// block and replies with no block at all; this method does the bound walk,
@@ -65,9 +64,6 @@ impl CatalogEngine {
         let group_cap = self.adhoc_group_cap;
         let mut source = self.open_scan_spec_cursor(target_id, &spec.bound, &src_schema)?;
         let ctx = ScanSinkCtx {
-            // The routed cursors' store, re-read on every chunk (a cursor holds
-            // no borrow on it). `None` for a borrowed system table.
-            store: self.partitioned_store(target_id),
             predicate: predicate.as_ref(),
             chunk_rows,
         };
@@ -133,10 +129,9 @@ impl CatalogEngine {
         }
     }
 
-    /// Open the source cursor for `bound` over `source` — routed to the
-    /// partitions the bound's keys reach where it names them, merged over every
-    /// local partition where it does not. Each arm owns its own trust-boundary
-    /// rejections; see the per-bound openers below.
+    /// Open the source cursor for `bound` over `source`, bounded within this
+    /// worker's store by whatever the bound names. Each arm owns its own
+    /// trust-boundary rejections; see the per-bound openers below.
     fn open_scan_spec_cursor(
         &mut self,
         source: i64,
@@ -145,7 +140,7 @@ impl CatalogEngine {
     ) -> Result<ScanSpecCursor, String> {
         match bound {
             ReadBound::None => Ok(ScanSpecCursor::Source(SourceCursor::Full(Box::new(
-                self.table_entry(source)?.handle.open_cursor(),
+                self.table_entry(source)?.open_cursor(),
             )))),
             ReadBound::PkRange(desc) => self.open_pk_range_cursor(source, desc, src_schema),
             ReadBound::IndexRange { idx_cols, exact, desc } => {
@@ -159,12 +154,10 @@ impl CatalogEngine {
     /// point lookup drains exactly its group, never a boundary chunk of
     /// over-read.
     ///
-    /// A range whose every key shares the distribution prefix lives in one
-    /// partition — the same test `scan_spec_partition` uses to unicast the
-    /// request. `open_cursor_for_key` resolves through `slot_for_key`, never
-    /// through the global partition id, so an unhashed store lands on its one
-    /// child and `None` means this process holds no such partition. A range
-    /// spanning partitions keeps the merge.
+    /// The cursor spans this worker's whole slice of the relation; the range cut
+    /// is what bounds the walk. Whether the range is confined to one worker is the
+    /// master's question (`scan_spec_worker`, which turns the broadcast into a
+    /// unicast), not this one's.
     fn open_pk_range_cursor(
         &mut self,
         source: i64,
@@ -174,16 +167,7 @@ impl CatalogEngine {
         let Some((start, end)) = pk_range_keys(src_schema, desc)? else {
             return Ok(ScanSpecCursor::Source(SourceCursor::Empty));
         };
-        let handle = &self.table_entry(source)?.handle;
-        let confined = crate::schema::key::range_shares_prefix(&start, end.as_ref(), src_schema.dist_stride() as usize);
-        let mut cursor = if confined {
-            match handle.open_cursor_for_key(start.pk_bytes()) {
-                Some(c) => c,
-                None => return Ok(ScanSpecCursor::Source(SourceCursor::Empty)),
-            }
-        } else {
-            handle.open_cursor()
-        };
+        let mut cursor = self.table_entry(source)?.open_cursor();
         cursor.seek_range_bytes(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
         Ok(ScanSpecCursor::Source(SourceCursor::Full(Box::new(cursor))))
     }
@@ -233,7 +217,7 @@ impl CatalogEngine {
                 "scan_spec: PkSet gather requires a single-column PK (table {source})"
             ));
         }
-        let handle = &self.table_entry(source)?.handle;
+        let entry = self.table_entry(source)?;
         let stride = src_schema.pk_stride() as usize;
         // OPK order IS typed PK order, so sorting the images byte-wise makes the
         // gather one monotone forward sweep regardless of wire key order. A
@@ -258,12 +242,10 @@ impl CatalogEngine {
                 &w[0][..stride]
             ));
         }
-        // The probe answers a key this worker cannot reach with `None` — the
-        // request is broadcast, so at W workers most of the list belongs
-        // elsewhere — and routes the rest to the one partition that can hold
-        // them instead of the whole store's merge.
+        // A key this worker holds no row for copies nothing — the request is
+        // broadcast, so at W workers most of the list belongs elsewhere.
         Ok(ScanSpecCursor::PkSet(Box::new(PkSetGather {
-            cursor: handle.open_probe(),
+            cursor: entry.open_cursor(),
             keys: opk_keys,
             stride,
             next: 0,
@@ -275,7 +257,7 @@ impl CatalogEngine {
 /// A `pk IN (…)` gather: every live row of each key's PK group, in ascending
 /// OPK order.
 struct PkSetGather {
-    cursor: StoreProbe,
+    cursor: ReadCursor,
     /// OPK images of the keys, sorted; the leading `stride` bytes are the key.
     keys: Vec<[u8; 16]>,
     stride: usize,
@@ -289,8 +271,7 @@ struct PkSetGather {
 enum ScanSpecCursor {
     /// Full cursor, bounded index walk, or provably-empty bound — the shared
     /// source cursor. A PK range is a Full cursor positioned on `[start, end)`
-    /// (`seek_range_bytes`), so it exhausts exactly at the cut; when the range is
-    /// confined to one distribution prefix that cursor spans one partition.
+    /// (`seek_range_bytes`), so it exhausts exactly at the cut.
     Source(SourceCursor),
     /// `pk IN (…)` gather (boxed: `SourceCursor` is three words and this holds a
     /// key list and a schema — one allocation per request, never per chunk).
@@ -300,15 +281,14 @@ enum ScanSpecCursor {
 impl ScanSpecCursor {
     /// The next source rows, or `None` once the bound is exhausted. A returned
     /// batch may be empty (a window of PkSet misses, or of keys this worker holds
-    /// no partition for); `None` strictly means "no further rows". `store` is the
-    /// scanned relation's partitioned store, `None` for a borrowed system table.
+    /// no row for); `None` strictly means "no further rows".
     ///
     /// `max_rows` bounds a `Source` chunk exactly; a `PkSet` chunk tests it before
     /// each key and then drains that key's whole group, so it can overshoot to
     /// `max_rows - 1 + |largest group|`. Both sinks read `chunk.count`.
-    fn next_chunk(&mut self, store: Option<&PartitionedTable>, max_rows: usize) -> Option<Batch> {
+    fn next_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         match self {
-            ScanSpecCursor::Source(source) => source.drain_chunk(store, max_rows),
+            ScanSpecCursor::Source(source) => source.drain_chunk(max_rows),
             ScanSpecCursor::PkSet(g) => {
                 if g.next >= g.keys.len() {
                     return None;
@@ -318,9 +298,9 @@ impl ScanSpecCursor {
                 while g.next < g.keys.len() && out.count < max_rows {
                     let key = &g.keys[g.next][..g.stride];
                     g.next += 1;
-                    // An absent key, or one this worker holds no partition for,
-                    // copies nothing: the discard the broadcast list needs.
-                    g.cursor.copy_live_pk_group_into(store, key, &mut out);
+                    // An absent key, or one this worker holds no row for, copies
+                    // nothing: the discard the broadcast list needs.
+                    g.cursor.copy_live_pk_group_into(key, &mut out);
                 }
                 // An all-miss window returns an empty batch only when the key list
                 // is exhausted; otherwise it advanced `next` and there is more.
@@ -330,10 +310,9 @@ impl ScanSpecCursor {
     }
 }
 
-/// The per-request context both sinks read on every chunk: the routed cursors'
-/// store, the compiled predicate, and the drain size.
+/// The per-request context both sinks read on every chunk: the compiled
+/// predicate and the drain size.
 struct ScanSinkCtx<'a> {
-    store: Option<&'a PartitionedTable>,
     predicate: Option<&'a ScalarFunc>,
     chunk_rows: usize,
 }
@@ -353,7 +332,7 @@ fn run_scan_fold_sink(
 ) -> Result<Batch, String> {
     let mut fold = AdhocFold::new(src_schema, reply_schema, agg, group_cap)?;
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    while let Some(chunk) = source.next_chunk(ctx.store, ctx.chunk_rows) {
+    while let Some(chunk) = source.next_chunk(ctx.chunk_rows) {
         if chunk.count == 0 {
             continue;
         }
@@ -421,7 +400,7 @@ fn run_scan_rows_sink(
     // Per-request scratch, reused across chunks.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
 
-    while let Some(chunk) = source.next_chunk(ctx.store, drain_rows) {
+    while let Some(chunk) = source.next_chunk(drain_rows) {
         if chunk.count == 0 {
             continue;
         }
@@ -621,19 +600,23 @@ fn pk_range_keys(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Result<O
     )
 }
 
-/// The one partition every row matching `range` can live in, or `None` when the
-/// range spans partitions (or is provably empty) — the master's confinement test,
+/// The one worker every row matching `range` can live on, or `None` when the
+/// range spans workers (or is provably empty) — the master's confinement test,
 /// which turns a broadcast into a unicast.
 ///
-/// `partition_for_pk` hashes only `key[..dist_stride]`, so the range is confined
+/// `worker_for_pk` hashes only `key[..dist_stride]`, so the range is confined
 /// iff every key in it shares that prefix, which `range_shares_prefix` decides
-/// from the range's first and last keys. Partition ids are `mix(pk) >> 56` and so
+/// from the range's first and last keys. An owner is a hash of the key and so
 /// not monotone in key order; a prefix match over the whole range is what makes
 /// the single hash of `start` speak for all of it.
-pub(crate) fn scan_spec_partition(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Option<usize> {
+pub(crate) fn scan_spec_worker(
+    schema: &SchemaDescriptor,
+    range: &RangeDescriptor,
+    num_workers: usize,
+) -> Option<usize> {
     let (start, end) = pk_range_keys(schema, range).ok().flatten()?;
     crate::schema::key::range_shares_prefix(&start, end.as_ref(), schema.dist_stride() as usize)
-        .then(|| schema.partition_for_pk(start.pk_bytes()))
+        .then(|| schema.worker_for_pk(start.pk_bytes(), num_workers))
 }
 
 /// Decode + validate a client predicate blob against `schema`, then build its
@@ -767,40 +750,42 @@ mod tests {
         assert!(pk_range_keys(&s, &d).is_err());
     }
 
-    // ── scan_spec_partition — the master's confinement test ──────────────────
+    // ── scan_spec_worker — the master's confinement test ─────────────────────
 
-    /// A full point is confined to the partition of its own PK bytes, at every PK
+    /// Worker count the confinement tests route against.
+    const NW: usize = 4;
+
+    /// A full point is confined to the worker of its own PK bytes, at every PK
     /// shape — single, wide, and compound (where the point pins the leading
     /// columns through `eq_vals` and points at the last).
     #[test]
-    fn scan_spec_partition_confines_a_full_point() {
+    fn scan_spec_worker_confines_a_full_point() {
         let u64s = pk_only_schema(&[type_code::U64]);
         assert_eq!(
-            scan_spec_partition(&u64s, &RangeDescriptor::new(&[], Before(42), After(42))),
-            Some(u64s.partition_for_pk(&opk_pk(&u64s, &[42])))
+            scan_spec_worker(&u64s, &RangeDescriptor::new(&[], Before(42), After(42)), NW),
+            Some(u64s.worker_for_pk(&opk_pk(&u64s, &[42]), NW))
         );
 
         let u128s = pk_only_schema(&[type_code::U128]);
         let wide = (1u128 << 100) | 7;
         assert_eq!(
-            scan_spec_partition(&u128s, &RangeDescriptor::new(&[], Before(wide), After(wide))),
-            Some(u128s.partition_for_pk(&opk_pk(&u128s, &[wide])))
+            scan_spec_worker(&u128s, &RangeDescriptor::new(&[], Before(wide), After(wide)), NW),
+            Some(u128s.worker_for_pk(&opk_pk(&u128s, &[wide]), NW))
         );
 
         let comp = pk_only_schema(&[type_code::U32, type_code::U64]);
         assert_eq!(
-            scan_spec_partition(&comp, &RangeDescriptor::new(&[9], Before(4), After(4))),
-            Some(comp.partition_for_pk(&opk_pk(&comp, &[9, 4])))
+            scan_spec_worker(&comp, &RangeDescriptor::new(&[9], Before(4), After(4)), NW),
+            Some(comp.worker_for_pk(&opk_pk(&comp, &[9, 4]), NW))
         );
     }
 
     /// With a `Keyed { prefix_len: 1 }` placement every row sharing the leading
-    /// column lands in one partition, so pinning it and ranging the trailing
-    /// column is confined — to the same partition full points on `(a, b)` reach.
-    /// At the full-PK default
-    /// the same bound spans partitions.
+    /// column lands on one worker, so pinning it and ranging the trailing column
+    /// is confined — to the same worker full points on `(a, b)` reach. At the
+    /// full-PK default the same bound spans workers.
     #[test]
-    fn scan_spec_partition_follows_the_distribution_prefix() {
+    fn scan_spec_worker_follows_the_distribution_prefix() {
         let cols = [
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
@@ -808,21 +793,21 @@ mod tests {
         let prefix = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 1 });
         // `a = 7 AND b > 3` — a whole trailing-column range inside one `a` group.
         let ranged = RangeDescriptor::new(&[7], After(3), After(u64::MAX as u128));
-        let want = prefix.partition_for_pk(&opk_pk(&prefix, &[7, 0]));
-        assert_eq!(scan_spec_partition(&prefix, &ranged), Some(want));
+        let want = prefix.worker_for_pk(&opk_pk(&prefix, &[7, 0]), NW);
+        assert_eq!(scan_spec_worker(&prefix, &ranged, NW), Some(want));
         for b in [4u128, u64::MAX as u128] {
             assert_eq!(
-                scan_spec_partition(&prefix, &RangeDescriptor::new(&[7], Before(b), After(b))),
+                scan_spec_worker(&prefix, &RangeDescriptor::new(&[7], Before(b), After(b)), NW),
                 Some(want),
-                "a full point on (7, {b}) shares the group's partition"
+                "a full point on (7, {b}) shares the group's worker"
             );
         }
 
         let full = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 2 });
         assert_eq!(
-            scan_spec_partition(&full, &ranged),
+            scan_spec_worker(&full, &ranged, NW),
             None,
-            "hashing the whole PK spreads one `a` group across partitions"
+            "hashing the whole PK spreads one `a` group across workers"
         );
     }
 
@@ -830,7 +815,7 @@ mod tests {
     /// the all-`0xFF` last key must still confine it rather than broadcast. The
     /// signed maximum's OPK is all-`0xFF` too (sign-flip).
     #[test]
-    fn scan_spec_partition_confines_a_maximal_point() {
+    fn scan_spec_worker_confines_a_maximal_point() {
         for tc in [type_code::U64, type_code::I64] {
             let s = pk_only_schema(&[tc]);
             let max = if tc == type_code::U64 {
@@ -844,31 +829,31 @@ mod tests {
                 "After(max) carries out"
             );
             assert_eq!(
-                scan_spec_partition(&s, &d),
-                Some(s.partition_for_pk(&opk_pk(&s, &[max])))
+                scan_spec_worker(&s, &d, NW),
+                Some(s.worker_for_pk(&opk_pk(&s, &[max]), NW))
             );
         }
     }
 
-    /// A range wider than one partition's key span is not confinable: partition
-    /// ids are `mix(pk) >> 56`, not monotone in key order, so only a whole-range
-    /// prefix match proves confinement. A provably-empty range is not confinable
+    /// A range wider than one worker's key span is not confinable: owners are a
+    /// hash of the key, not monotone in key order, so only a whole-range prefix
+    /// match proves confinement. A provably-empty range is not confinable
     /// either — the worker answers it (a fold sink still owes its ground row).
     #[test]
-    fn scan_spec_partition_declines_a_multi_key_range() {
+    fn scan_spec_worker_declines_a_multi_key_range() {
         let s = pk_only_schema(&[type_code::U64]);
         assert_eq!(
-            scan_spec_partition(&s, &RangeDescriptor::new(&[], Before(0), After(1000))),
+            scan_spec_worker(&s, &RangeDescriptor::new(&[], Before(0), After(1000)), NW),
             None
         );
         assert_eq!(
-            scan_spec_partition(&s, &RangeDescriptor::new(&[], After(1000), Before(0))),
+            scan_spec_worker(&s, &RangeDescriptor::new(&[], After(1000), Before(0)), NW),
             None,
             "an inverted range is provably empty"
         );
         // Unbounded above from a non-maximal start: the last key is 0xFF…FF.
         assert_eq!(
-            scan_spec_partition(&s, &RangeDescriptor::new(&[], Before(5), After(u64::MAX as u128))),
+            scan_spec_worker(&s, &RangeDescriptor::new(&[], Before(5), After(u64::MAX as u128)), NW),
             None
         );
     }

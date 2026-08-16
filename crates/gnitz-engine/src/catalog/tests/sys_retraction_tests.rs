@@ -77,7 +77,7 @@ fn stale_schema_retraction_spares_the_live_schemas_directory() {
     // dead id then lands carrying the name `s` — now the live schema's. Without
     // the net check the deletion queue takes `<dir>/s`.
     let dir = temp_dir("sysretract_stale_schema");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
 
     engine.create_schema("s").unwrap();
@@ -120,7 +120,7 @@ fn schema_retraction_under_another_schemas_name_rejected() {
     // `net = 0`, so only the CAS catches it — the member-count guard counts
     // members of the retracted (empty) id, not of the named schema.
     let dir = temp_dir("sysretract_schema_mismatch");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64)];
 
     engine.create_schema("a").unwrap();
@@ -158,7 +158,7 @@ fn schema_retraction_under_another_schemas_name_rejected() {
 #[test]
 fn create_then_drop_unique_index_cancels_to_empty() {
     let dir = temp_dir("idx_create_drop_cancels");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("pk", type_code::U64), col_def("val", type_code::I64)];
     engine.create_table("public.cancels", &cols, &[0]).unwrap();

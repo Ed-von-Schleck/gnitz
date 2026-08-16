@@ -1,40 +1,51 @@
 //! The child directories under a relation's directory: how they are named, and
-//! how a boot gives a launched rank the copy it is missing. Sibling of
-//! `naming`, which owns the file grammar *inside* one of these. Every builder
-//! sits next to its parser, so the paths that create children and the sweeps
-//! that reclaim them cannot drift.
+//! which of them a launched worker count still owns. Sibling of `naming`, which
+//! owns the file grammar *inside* one of these. Every builder sits next to its
+//! parser, so the paths that create children and the sweeps that reclaim them
+//! cannot drift.
 
 use std::fs;
 
+use super::error::StorageError;
 use super::manifest;
-use super::partitioned_table::Routing;
-use super::{cstr, error::StorageError};
 
-/// One child directory of a relation. The three grammars are disjoint, so a
-/// name on disk identifies its kind without knowing how the store was built —
-/// which is what lets a boot sweep reclaim children of a shape the relation no
-/// longer has, and what makes a shape flip find no manifest (and rebuild)
-/// rather than resume the wrong layout.
+/// One child directory of a relation. The grammars are disjoint and together
+/// cover every name a relation directory can legitimately hold, so a name on
+/// disk identifies its kind without knowing how the store was built — which is
+/// what lets a boot sweep reclaim children of a shape the relation no longer
+/// has, and lets an unparseable name be treated as foreign data.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChildAddr<'a> {
-    /// `part_{p}` — one bucket of a hashed store's 256-way tiling.
-    Partition(u32),
-    /// `rep_{k}` — worker `k`'s single child of an unhashed store: a
-    /// replicated base table's full copy, or a replicated-derived view's local
-    /// slice. Addressed by rank rather than partition index, so it stays put
-    /// when the worker count changes.
-    Local(u32),
+    /// `w{k}of{n}` — worker `k`'s store of a relation laid out for `n` workers.
+    /// The worker count is in the name so the boot repartition can write the new
+    /// layout beside the old one: the two sets are disjoint, so the source stays
+    /// intact and readable until the target is durable.
+    Worker { rank: u32, of: u32 },
     /// `scratch_{child}_w{k}` — worker `k`'s operator-state table for a view.
     Scratch { child: &'a str, rank: u32 },
+    /// `idx_{id}` — a secondary index's own directory. Not a store of the owner
+    /// relation: never repartitioned, and owned at every worker count (each
+    /// worker rebuilds its slice inside it). Named here so one parser covers the
+    /// whole namespace and no caller has to pre-filter.
+    Index { id: i64 },
 }
 
 impl<'a> ChildAddr<'a> {
+    /// This worker's store of a relation laid out for `of` workers. The master
+    /// is rank 0 pre-fork, so it opens the child worker 0 will inherit.
+    pub fn this_worker(of: u32) -> Self {
+        ChildAddr::Worker {
+            rank: crate::foundation::worker_ctx::worker_rank(),
+            of,
+        }
+    }
+
     /// The directory name, relative to the relation's directory.
     pub fn name(&self) -> String {
         match *self {
-            ChildAddr::Partition(p) => format!("part_{p}"),
-            ChildAddr::Local(k) => format!("rep_{k}"),
+            ChildAddr::Worker { rank, of } => format!("w{rank}of{of}"),
             ChildAddr::Scratch { child, rank } => format!("scratch_{child}_w{rank}"),
+            ChildAddr::Index { id } => format!("idx_{id}"),
         }
     }
 
@@ -49,95 +60,113 @@ impl<'a> ChildAddr<'a> {
         manifest::path(&self.dir(rel_dir))
     }
 
-    /// The child `name` denotes, or `None` if it is in none of the grammars.
-    /// The scratch split is right-anchored because child names contain `_`
+    /// The child `name` denotes, or `None` if it is in neither grammar. The
+    /// scratch split is right-anchored because child names contain `_`
     /// themselves (`_reduce_in_{vid}_{nid}`).
     pub fn parse(name: &'a str) -> Option<Self> {
-        if let Some(p) = numeric_suffix(name, "part_") {
-            return Some(ChildAddr::Partition(p));
+        if let Some(rest) = name.strip_prefix('w') {
+            if let Some((rank, of)) = rest.split_once("of") {
+                return Some(ChildAddr::Worker {
+                    rank: parse_id(rank)?,
+                    of: parse_id(of)?,
+                });
+            }
         }
-        if let Some(k) = numeric_suffix(name, "rep_") {
-            return Some(ChildAddr::Local(k));
+        if let Some(id) = name.strip_prefix("idx_") {
+            return Some(ChildAddr::Index { id: parse_id(id)? });
         }
         let (child, rank) = name.strip_prefix("scratch_")?.rsplit_once("_w")?;
         Some(ChildAddr::Scratch {
             child,
-            rank: parse_u32(rank)?,
+            rank: parse_id(rank)?,
         })
     }
 
-    /// True when a store routed by `routing`, launched at `num_workers`, still
-    /// owns this child. A hashed store's per-worker ranges tile 0..256 exactly
-    /// at every count, so a partition is never stale; a rank-stamped child
-    /// above the launched count is. A child in the grammar the store does not
-    /// use is residue left by a shape flip. Scratch is judged by rank either
-    /// way — the next compile recreates what it needs.
-    pub fn is_owned_by(&self, routing: Routing, num_workers: u32) -> bool {
-        let unhashed = routing.is_unhashed();
+    /// True when a relation launched at `num_workers` still owns this child. A
+    /// worker child laid out for a different count is the previous layout, which
+    /// the boot repartition has already consumed; one above the launched count is
+    /// stale either way. Scratch is judged by rank alone — the next compile
+    /// recreates what it needs. An index directory is owned at every count; its
+    /// own contents are swept by the catalog.
+    pub fn is_owned_by(&self, num_workers: u32) -> bool {
         match *self {
-            ChildAddr::Partition(_) => !unhashed,
-            ChildAddr::Local(k) => unhashed && k < num_workers,
+            ChildAddr::Worker { rank, of } => rank < num_workers && of == num_workers,
             ChildAddr::Scratch { rank, .. } => rank < num_workers,
+            ChildAddr::Index { .. } => true,
         }
     }
 }
 
-fn parse_u32(s: &str) -> Option<u32> {
+/// Every child a relation has across the whole cluster at `num_workers` — one
+/// per launched rank. The boot resume verdict enumerates manifests through this,
+/// and the checkpoint's ephemeral round stamps exactly this set, so the two must
+/// be read together when either changes.
+pub fn cluster_children(num_workers: u32) -> impl Iterator<Item = ChildAddr<'static>> {
+    (0..num_workers).map(move |rank| ChildAddr::Worker { rank, of: num_workers })
+}
+
+/// Immediate sub-directory names of `path`. Empty if `path` is missing or
+/// unreadable — both mean "nothing to scan" for a boot sweep. Non-directory
+/// entries are skipped.
+///
+/// Materialized rather than streamed: callers unlink entries from the directory
+/// they are walking, and `readdir` may skip entries when the directory is
+/// modified mid-iteration.
+pub fn subdir_names(path: &str) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(path) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// A directory-name id component: non-empty and all ASCII digits, so no sign,
+/// whitespace or `+` slips through `FromStr`.
+fn parse_id<T: std::str::FromStr>(s: &str) -> Option<T> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     s.parse().ok()
 }
 
-fn numeric_suffix(name: &str, prefix: &str) -> Option<u32> {
-    parse_u32(name.strip_prefix(prefix)?)
-}
-
-/// Give every launched rank a copy of an unhashed **base table**, by
-/// hard-linking rank 0's shards — worker 0's child, which is current at every
-/// worker count. A rank whose child already has a manifest is left alone, so a
-/// shrink or an unchanged restart does no work at all.
+/// Hard-link the shards `entries` names from `source` into `target`, then
+/// publish `target`'s own manifest. Only sound where the two children are copies
+/// of one another: a replicated base table's are, a key-routed table's are not.
 ///
-/// Only sound where the children are copies of one another. A replicated-derived
-/// view's child is the slice *that worker* produced, not a copy of anyone else's,
-/// so a missing one must be re-derived instead.
+/// Links the manifest's shard set, not whatever the directory holds, so orphans
+/// and half-written `.tmp` files are never carried over. A published shard is
+/// never rewritten in place, so the link is byte-equivalent at O(shards).
 ///
-/// Links the shard set the manifest names, not whatever the directory holds, so
-/// orphans and half-written `.tmp` files are never carried over — a `.tmp` link
-/// would be truncated out from under rank 0 by a same-name reopen. A published
-/// shard is never rewritten in place, so a link is byte-equivalent and costs
-/// O(shards) rather than O(bytes).
-///
-/// The manifest is linked last, under the staging name, and renamed only after
-/// the directory is durable: a crash leaves a manifest-less directory that the
-/// next boot redoes, never a manifest whose shards are missing. Runs on the
-/// master pre-fork, so no worker can be writing either directory.
-pub fn seed_missing_locals(rel_dir: &str, num_workers: u32) -> Result<(), StorageError> {
-    let source = ChildAddr::Local(0).dir(rel_dir);
-    let Some((entries, _)) = manifest::read_file(&cstr(manifest::path(&source))?)? else {
-        return Ok(()); // never checkpointed — nothing to copy
-    };
-    for k in 1..num_workers {
-        let target = ChildAddr::Local(k).dir(rel_dir);
-        if fs::metadata(manifest::path(&target)).is_ok() {
-            continue;
-        }
-        remove_child(&target); // a torn earlier attempt
-        super::table::ensure_dir(&target)?;
-        for e in &entries {
-            fs::hard_link(
-                format!("{source}/{}", e.filename_str()),
-                format!("{target}/{}", e.filename_str()),
-            )
-            .map_err(|_| StorageError::Io)?;
-        }
-        let staged = manifest::tmp_path(&target);
-        fs::hard_link(manifest::path(&source), &staged).map_err(|_| StorageError::Io)?;
-        fsync_dir(&target)?;
-        fs::rename(&staged, manifest::path(&target)).map_err(|_| StorageError::Io)?;
-        fsync_dir(&target)?;
+/// The manifest is rewritten rather than linked, because `layout_seq` differs;
+/// `compact_seq` carries over verbatim, so a later compaction cannot name an
+/// output after a value already baked into a shard just linked in.
+pub(super) fn link_child(
+    source: &str,
+    target: &str,
+    entries: &[manifest::ManifestEntryRaw],
+    compact_seq: u64,
+    layout_seq: u64,
+) -> Result<(), StorageError> {
+    super::table::ensure_dir(target)?;
+    for e in entries {
+        fs::hard_link(
+            format!("{source}/{}", e.filename_str()),
+            format!("{target}/{}", e.filename_str()),
+        )
+        .map_err(|_| StorageError::Io)?;
     }
-    Ok(())
+    manifest::publish_sync(
+        target,
+        entries,
+        manifest::ManifestHeader {
+            compact_seq,
+            checkpoint_gen: 0,
+            layout_seq,
+        },
+    )
 }
 
 /// Unlink a child's manifest, make that durable, then remove the directory.
@@ -152,7 +181,7 @@ pub fn remove_child(dir: &str) {
 }
 
 /// `fsync` a directory so its entries are durable.
-fn fsync_dir(dir: &str) -> Result<(), StorageError> {
+pub(super) fn fsync_dir(dir: &str) -> Result<(), StorageError> {
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|_| StorageError::Io)
@@ -160,18 +189,19 @@ fn fsync_dir(dir: &str) -> Result<(), StorageError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cstr;
     use super::*;
 
     #[test]
     fn parse_inverts_name_for_every_grammar() {
         for addr in [
-            ChildAddr::Partition(0),
-            ChildAddr::Partition(255),
-            ChildAddr::Local(3),
+            ChildAddr::Worker { rank: 0, of: 1 },
+            ChildAddr::Worker { rank: 3, of: 64 },
             ChildAddr::Scratch {
                 child: "_reduce_in_9_3",
                 rank: 2,
             },
+            ChildAddr::Index { id: 7 },
         ] {
             let name = addr.name();
             assert_eq!(ChildAddr::parse(&name), Some(addr), "round-trip of {name}");
@@ -181,23 +211,57 @@ mod tests {
 
     #[test]
     fn parse_rejects_names_in_no_grammar() {
-        for name in ["part_", "rep_x", "scratch_x_wq", "idx_7", "w3", "manifest.bin"] {
+        for name in [
+            "part_0",
+            "part_255",
+            "rep_3",
+            "w3",
+            "wof",
+            "w3of",
+            "wxof4",
+            "w3ofx",
+            "scratch_x_wq",
+            "idx_",
+            "idx_x",
+            "manifest.bin",
+        ] {
             assert_eq!(ChildAddr::parse(name), None, "{name} is not a child dir");
         }
     }
 
-    /// `seed_missing_locals` hard-links rank 0's shards into a sibling child
-    /// under the same basename, which is what keeps their descriptive digests
-    /// valid where they land.
     #[test]
-    fn seeded_child_shard_opens_under_its_linked_name() {
+    fn ownership_follows_the_launched_count() {
+        // A worker child survives iff its rank is launched AND it was laid out
+        // for exactly this count.
+        assert!(ChildAddr::Worker { rank: 2, of: 3 }.is_owned_by(3));
+        assert!(!ChildAddr::Worker { rank: 3, of: 3 }.is_owned_by(3));
+        assert!(!ChildAddr::Worker { rank: 0, of: 2 }.is_owned_by(4));
+        assert!(!ChildAddr::Worker { rank: 0, of: 8 }.is_owned_by(4));
+        // Scratch is judged by rank alone.
+        let scratch = |rank| ChildAddr::Scratch { child: "agg", rank };
+        assert!(scratch(1).is_owned_by(2));
+        assert!(!scratch(7).is_owned_by(2));
+    }
+
+    #[test]
+    fn cluster_children_is_the_launched_set() {
+        let got: Vec<String> = cluster_children(3).map(|c| c.name()).collect();
+        assert_eq!(got, ["w0of3", "w1of3", "w2of3"]);
+        assert!(cluster_children(3).all(|c| c.is_owned_by(3)));
+    }
+
+    /// `link_child` hard-links the source's shards into a sibling child under
+    /// the same basename, which is what keeps their descriptive digests valid
+    /// where they land.
+    #[test]
+    fn linked_child_shard_opens_under_its_linked_name() {
         use crate::storage::lsm::shard_reader::MappedShard;
         use crate::test_support::{make_batch, make_schema_u64_i64};
 
         let tmp = tempfile::tempdir().unwrap();
         let rel_dir = tmp.path().to_str().unwrap().to_string();
         let schema = make_schema_u64_i64();
-        let source = ChildAddr::Local(0).dir(&rel_dir);
+        let source = ChildAddr::Worker { rank: 0, of: 2 }.dir(&rel_dir);
         super::super::table::ensure_dir(&source).unwrap();
 
         let name = "shard_42_1.db";
@@ -210,46 +274,20 @@ mod tests {
             )
             .unwrap();
 
-        let mut filename = [0u8; 128];
-        filename[..name.len()].copy_from_slice(name.as_bytes());
-        let entries = [manifest::ManifestEntryRaw {
-            max_lsn: 1,
-            filename,
-            level: 0,
-            guard_key: 0,
-        }];
-        manifest::prepare_file(
-            &cstr(manifest::path(&source)).unwrap(),
-            &entries,
-            manifest::ManifestHeader::default(),
-        )
-        .unwrap()
-        .commit()
-        .unwrap();
+        let entries = [manifest::ManifestEntryRaw::new(name, 1, 0, 0)];
 
-        seed_missing_locals(&rel_dir, 2).unwrap();
+        let target = ChildAddr::Worker { rank: 1, of: 2 }.dir(&rel_dir);
+        link_child(&source, &target, &entries, 0, 1).unwrap();
 
-        let target = ChildAddr::Local(1).dir(&rel_dir);
         let shard = MappedShard::open(&cstr(format!("{target}/{name}")).unwrap(), &schema, true)
             .expect("a hard-linked shard keeps its basename, so its digest still validates");
         assert_eq!(shard.count, 4);
-    }
-
-    #[test]
-    fn ownership_follows_the_live_grammar() {
-        let local = Routing::Unhashed { rank: 0 };
-        let hashed = Routing::Hashed { start: 0, end: 256 };
-        // A rank-stamped child survives iff its rank is still launched.
-        assert!(ChildAddr::Local(2).is_owned_by(local, 3));
-        assert!(!ChildAddr::Local(3).is_owned_by(local, 3));
-        // Partitions tile the whole space at every count, so none is ever stale.
-        assert!(ChildAddr::Partition(255).is_owned_by(hashed, 1));
-        // Residue in the other grammar, both directions.
-        assert!(!ChildAddr::Local(0).is_owned_by(hashed, 4));
-        assert!(!ChildAddr::Partition(0).is_owned_by(local, 4));
-        // Scratch is judged by rank whatever the store shape is.
-        let scratch = |rank| ChildAddr::Scratch { child: "agg", rank };
-        assert!(scratch(1).is_owned_by(hashed, 2) && scratch(1).is_owned_by(local, 2));
-        assert!(!scratch(7).is_owned_by(hashed, 2) && !scratch(7).is_owned_by(local, 2));
+        assert_eq!(
+            manifest::peek_header(&cstr(manifest::path(&target)).unwrap())
+                .unwrap()
+                .map(|h| h.layout_seq),
+            Some(1),
+            "the linked child carries the target layout sequence",
+        );
     }
 }

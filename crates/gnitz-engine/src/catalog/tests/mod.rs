@@ -105,7 +105,7 @@ fn rows_spec(
 /// the dir too, so a test that inspects or removes it does not re-derive it.
 fn table_fixture(name: &str, cols: &[ColumnDef]) -> (CatalogEngine, i64, String) {
     let dir = temp_dir(name);
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.create_table("public.t", cols, &[0]).unwrap();
     (engine, tid, dir)
 }
@@ -158,7 +158,7 @@ fn build_table_tab_row_flags(tid: i64, raw_pk_cols: u64, table_name: &str, flags
 
 /// Register a base table through the DDL hooks with an explicit packed `flags`
 /// word — the routing shapes `create_table` cannot make (it always builds a
-/// full-PK-hashed, non-replicated table): REPLICATED (an unhashed store) and
+/// full-PK-distributed, non-replicated table): REPLICATED and
 /// CLUSTER BY (a distribution prefix shorter than the PK).
 fn create_flagged_table(
     engine: &mut CatalogEngine,

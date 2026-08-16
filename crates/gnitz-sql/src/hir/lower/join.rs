@@ -282,7 +282,7 @@ fn emit_range(
     } = range_prologue(&mut cb, left_in, right_in, input_a_raw, input_b_raw, eq, range)?;
 
     let (int_a, int_b) = if n_eq == 0 {
-        (cb.partition_filter(reindex_a), cb.partition_filter(reindex_b))
+        (cb.worker_filter(reindex_a), cb.worker_filter(reindex_b))
     } else {
         (reindex_a, reindex_b)
     };
@@ -1090,7 +1090,7 @@ pub(crate) fn band_union_schema(all_tcs: &[TypeCode], left: &Schema, right: &Sch
 /// NULL-key rows never reach the integrated trace (3VL) and never match the
 /// threshold, so they get their own branch off the NULL-gate-unfiltered
 /// `source`, re-keyed to the preserved side's source PK and routed ONCE by a
-/// local `partition_filter` (no exchange) — broadcast would emit W× copies the
+/// local `worker_filter` (no exchange) — broadcast would emit W× copies the
 /// output shard would sum. (The compiler makes the filter a keep-all identity
 /// for an all-replicated view, which runs correct-local over the full broadcast
 /// on every worker.) `source` is the caller's semantic preserved input (the raw
@@ -1104,6 +1104,6 @@ fn union_null_key_rows(
 ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
     let anull = cb.filter(source, Some(multi_null_filter_prog(cols, &schema.columns, true)?));
     let anull_keyed = rekey_on_source_pk(cb, anull, schema);
-    let anull_owned = cb.partition_filter(anull_keyed);
+    let anull_owned = cb.worker_filter(anull_keyed);
     Ok(cb.union(nf_match, anull_owned))
 }

@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn test_fk_lock_set() {
     let dir = temp_dir("fk_lock_set");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // A base table with no FK yet: needs a lock for itself (its writes run
     // enforce_unique_pk against the store), but no peers.
@@ -60,7 +60,7 @@ fn test_fk_lock_set() {
 #[test]
 fn test_fk_referential_integrity() {
     let dir = temp_dir("fk_integrity");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Parent table
     let parent_tid = engine
@@ -109,7 +109,7 @@ fn test_fk_referential_integrity() {
 #[test]
 fn test_fk_nullability_and_retractions() {
     let dir = temp_dir("fk_null");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.p", &[col_def("id", type_code::U64)], &[0])
@@ -149,7 +149,7 @@ fn test_fk_nullability_and_retractions() {
 #[test]
 fn test_fk_drop_protections() {
     let dir = temp_dir("fk_prot");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
@@ -180,7 +180,7 @@ fn test_fk_drop_protections() {
 #[test]
 fn test_fk_invalid_targets() {
     let dir = temp_dir("fk_invalid");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table(
@@ -206,7 +206,7 @@ fn test_fk_invalid_targets() {
 #[test]
 fn test_fk_self_reference() {
     let dir = temp_dir("fk_self");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Self-referential table: employees.mgr_id -> employees.emp_id
     let next_tid = engine.next_table_id;
@@ -250,7 +250,7 @@ fn test_push_reads_committed_state() {
     use gnitz_wire::WireConflictMode::{Error, Update};
 
     let dir = temp_dir("push_reads_state");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Plain unconstrained base table: an upsert validates nothing, so it may
     // hold its table lock shared. The same table under Error mode must not —
@@ -329,7 +329,7 @@ fn test_push_reads_committed_state() {
 #[test]
 fn test_fk_parent_map_cleanup() {
     let dir = temp_dir("fk_pmap");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
@@ -362,7 +362,7 @@ fn test_fk_parent_map_cleanup() {
 #[test]
 fn test_fk_multiple_children_same_parent() {
     let dir = temp_dir("fk_multi_child");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
@@ -403,7 +403,7 @@ fn test_fk_multiple_children_same_parent() {
 #[test]
 fn test_fk_u128() {
     let dir = temp_dir("fk_u128");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // U128 parent
     let parent_tid = engine
@@ -455,7 +455,7 @@ fn test_fk_u128() {
 #[test]
 fn test_fk_auto_index_skips_non_leading_pk_column() {
     let dir = temp_dir("fk_compound_pk_skip");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
@@ -495,7 +495,7 @@ fn test_fk_auto_index_skips_non_leading_pk_column() {
 #[test]
 fn test_fk_inline_child_pk_column_is_fk() {
     let dir = temp_dir("fk_pk_col_is_fk");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let parent_tid = engine
         .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])

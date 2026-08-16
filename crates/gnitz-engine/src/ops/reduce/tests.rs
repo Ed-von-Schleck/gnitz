@@ -4709,7 +4709,7 @@ fn avi_read_extreme(
     let tc_enum = TypeCode::from_validated_u8(in_schema.columns[col_idx as usize].type_code);
     let avi_schema = make_avi_schema(in_schema, group_by);
     let tmp = tempfile::tempdir().unwrap();
-    let mut avi_t = Table::new(
+    let mut avi_t = Table::with_arena(
         tmp.path().to_str().unwrap(),
         avi_schema,
         0,
@@ -6658,7 +6658,7 @@ fn build_combined_avi(
 ) -> crate::storage::Table {
     use crate::ops::index::{make_avi_schema, op_integrate_with_indexes, AviDesc};
     let avi_schema = make_avi_schema(in_schema, group_cols);
-    let mut t = crate::storage::Table::new(
+    let mut t = crate::storage::Table::with_arena(
         dir.to_str().unwrap(),
         avi_schema,
         0,
@@ -7365,7 +7365,7 @@ fn run_reduce_trace_epochs(
 ) -> (std::rc::Rc<Batch>, usize) {
     // A fresh tempdir per call isolates shard files, so a constant table_id is
     // collision-free.
-    let mut trace = crate::storage::Table::new(
+    let mut trace = crate::storage::Table::with_arena(
         dir.to_str().unwrap(),
         *out_schema,
         0,
@@ -7743,10 +7743,11 @@ fn run_minmax_epochs(
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
 
-    let mut trace_out = Table::new(dir, *out_schema, 0, 1 << 20, RecoverySource::Rederive).unwrap();
-    let mut trace_in = (!use_avi).then(|| Table::new(dir, *in_schema, 1, 1 << 20, RecoverySource::Rederive).unwrap());
+    let mut trace_out = Table::with_arena(dir, *out_schema, 0, 1 << 20, RecoverySource::Rederive).unwrap();
+    let mut trace_in =
+        (!use_avi).then(|| Table::with_arena(dir, *in_schema, 1, 1 << 20, RecoverySource::Rederive).unwrap());
     let avi_schema = make_avi_schema(in_schema, group_by);
-    let mut avi_t = use_avi.then(|| Table::new(dir, avi_schema, 2, 1 << 20, RecoverySource::Rederive).unwrap());
+    let mut avi_t = use_avi.then(|| Table::with_arena(dir, avi_schema, 2, 1 << 20, RecoverySource::Rederive).unwrap());
 
     // Value-indexed (MIN/MAX) subset in descriptor order — exactly what the
     // compiler feeds the integrate instruction and the reduce read side.

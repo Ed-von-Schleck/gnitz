@@ -73,11 +73,14 @@ fn parse_level(s: &str) -> u32 {
     }
 }
 
-/// Parse and validate `--workers=N` against the hard `MAX_WORKERS` limit.
-/// Values above it cannot work — `worker_for_partition` divides by
-/// `256 / num_workers` (zero when `num_workers > 256`, panicking) and the SAL
-/// write path rejects groups wider than `MAX_WORKERS` — so reject them at the
-/// boundary with a clear message instead of crashing later.
+/// Parse and validate `--workers=N` against the hard `MAX_WORKERS` limit, which
+/// the SAL group format sets: `sal_begin_group` rejects a group wider than
+/// `MAX_WORKERS`.
+///
+/// This is also the only thing standing between `--workers=0` and a silent
+/// single-worker cluster: `worker_for_key`'s multiply-shift by a zero count
+/// returns 0 for every key, and only a `debug_assert!` catches it. No other
+/// entry point may bypass this check.
 fn parse_workers(val: &str) -> Result<u32, String> {
     const MAX: u32 = runtime::MAX_WORKERS as u32;
     match val.parse::<u32>() {
@@ -219,8 +222,8 @@ mod tests {
 
     #[test]
     fn parse_workers_rejects_above_max() {
-        // Regression: values > MAX_WORKERS reached worker_for_partition and
-        // divided by `256 / num_workers == 0` (panic for num_workers > 256).
+        // Regression: values > MAX_WORKERS reached the SAL group writer, which
+        // cannot describe a group that wide.
         assert!(parse_workers(&(MAX_WORKERS + 1).to_string()).is_err());
         assert!(parse_workers("100000").is_err());
     }

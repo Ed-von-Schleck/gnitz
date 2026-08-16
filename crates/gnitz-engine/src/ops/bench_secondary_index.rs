@@ -117,7 +117,7 @@ fn time_upsert(
     let mut total = Duration::ZERO;
     for i in 0..=ITERS as u32 {
         let pre = build_pre();
-        let mut t = Table::new(
+        let mut t = Table::with_arena(
             tmp.to_str().unwrap(),
             schema,
             base_id + i,
@@ -194,7 +194,7 @@ fn secondary_index_bench_avi_decomposition() {
 
     let mut id = 2000u32;
     let full = time(|| {
-        let mut t = Table::new(
+        let mut t = Table::with_arena(
             tmp.path().to_str().unwrap(),
             avi_schema,
             id,

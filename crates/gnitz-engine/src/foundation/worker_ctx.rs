@@ -1,7 +1,7 @@
 //! Per-process worker identity: the worker rank and the worker count baked into
 //! this process's compiled plans. Multi-process runtime state, not a planner
 //! concern — written once by the worker bootstrap post-fork, read by the
-//! compiler when emitting `PartitionFilter` nodes and naming scratch tables.
+//! compiler when emitting `WorkerFilter` nodes and naming scratch tables.
 
 /// Process-local worker rank, set once per forked worker (and left at 0 in the
 /// master / single-worker mode). Scratch operator-state tables (`Distinct`
@@ -16,7 +16,7 @@ static WORKER_RANK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 
 /// Sibling of `WORKER_RANK`: the worker count baked into this process's compiled
 /// plans. Set alongside the rank post-fork. Defaults to 1 (single process /
-/// unit tests), which makes `PartitionFilter` a keep-all identity and the
+/// unit tests), which makes `WorkerFilter` a keep-all identity and the
 /// broadcast input relay degenerate. `num_workers` is fixed for a process's
 /// lifetime, so a topology change is a restart-and-recompile, not a live
 /// plan-cache invalidation.
@@ -49,7 +49,7 @@ const ROLE_WORKER: u8 = 2;
 
 /// Set the calling process's worker rank and worker count, and latch its role
 /// to Worker. Called post-fork before any view is compiled, so the scratch
-/// tables a worker opens carry its own rank, its `PartitionFilter` nodes are
+/// tables a worker opens carry its own rank, its `WorkerFilter` nodes are
 /// emitted with this process's `(worker_id, num_workers)`, and its index tables
 /// home into a per-rank subdirectory.
 pub(crate) fn set_worker_rank(rank: u32, num_workers: u32) {

@@ -319,7 +319,7 @@ const EXPECTED_05: &str = r#"seg 0:
 #7 UNION <- (#8@0,#13@1)
 #8 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,3,0)] <- (#9@0)
 #9 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#10@0)
-#10 PARTITION_FILTER <- (#11@0)
+#10 WORKER_FILTER <- (#11@0)
 #11 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#12@0)
 #12 SCAN_DELTA src:base:pls_a
 #13 NEGATE <- (#14@0)
@@ -343,7 +343,7 @@ const EXPECTED_05: &str = r#"seg 0:
 #31 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0);(PROJ,3,4,0)] <- (#32@0)
 #32 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,2)] <- (#11@0,#33@1)
 #33 INTEGRATE_TRACE <- (#34@0)
-#34 PARTITION_FILTER <- (#23@0)
+#34 WORKER_FILTER <- (#23@0)
 #35 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,1,0);(PROJ,3,2,0)] <- (#36@0)
 #36 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,0)] <- (#23@0,#27@1)
 "#;
@@ -839,14 +839,14 @@ const EXPECTED_14B: &str = r#"seg 0:
 #7 MAP_EXPR params:[(REINDEX,0,2,0)] <- (#8@0)
 #8 SCAN_DELTA src:base:a
 #9 INTEGRATE_TRACE <- (#10@0)
-#10 PARTITION_FILTER <- (#11@0)
+#10 WORKER_FILTER <- (#11@0)
 #11 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#12@0)
 #12 FILTER <- (#13@0)
 #13 SCAN_DELTA src:seg:1
 #14 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0);(PROJ,3,1,0);(PROJ,4,2,0)] <- (#15@0)
 #15 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,0)] <- (#11@0,#16@1)
 #16 INTEGRATE_TRACE <- (#17@0)
-#17 PARTITION_FILTER <- (#7@0)
+#17 WORKER_FILTER <- (#7@0)
 
 seg 1:
 #0 INTEGRATE_SINK <- (#1@0)

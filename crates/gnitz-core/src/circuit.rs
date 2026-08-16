@@ -310,8 +310,8 @@ impl CircuitBuilder {
     /// (a band join's eq-prefix scatter omits this node — its trace is already
     /// eq-prefix-partitioned). Worker identity is baked in at compile time, so the
     /// node carries no payload; single-process compiles emit `(0, 1)` = keep-all.
-    pub fn partition_filter(&mut self, input: NodeId) -> NodeId {
-        self.alloc_unary(OpNode::PartitionFilter, input)
+    pub fn worker_filter(&mut self, input: NodeId) -> NodeId {
+        self.alloc_unary(OpNode::WorkerFilter, input)
     }
 
     /// Shared `Reduce`-node construction: map the group cols + agg specs, alloc
@@ -530,16 +530,16 @@ mod tests {
     }
 
     /// A range-join node round-trips its `(n_eq, rel)` through the single
-    /// NODE_COL_KIND_RANGE_JOIN param row, and a partition-filter node round-trips
+    /// NODE_COL_KIND_RANGE_JOIN param row, and a worker-filter node round-trips
     /// as a bare opcode.
     #[test]
-    fn range_join_and_partition_filter_roundtrip() {
+    fn range_join_and_worker_filter_roundtrip() {
         use gnitz_wire::NODE_COL_KIND_RANGE_JOIN;
         let mut cb = CircuitBuilder::new(9, 100);
         let a = cb.input_delta_tagged(100);
         let b = cb.input_delta_tagged(200);
         let reindex_b = cb.map_reindex(b, &[0], &[], empty_prog());
-        let filt_b = cb.partition_filter(reindex_b);
+        let filt_b = cb.worker_filter(reindex_b);
         let trace_b = cb.integrate_trace(filt_b);
         let join = cb.join_with_trace_range_node(a, trace_b, 1, RangeRel::Le);
         cb.sink(join);
@@ -555,7 +555,7 @@ mod tests {
         assert_eq!(rj, vec![(0, 1, RangeRel::Le.as_u64())]);
 
         let decoded = Circuit::from_rows(9, rows).expect("from_rows");
-        assert!(decoded.nodes.values().any(|n| matches!(n, OpNode::PartitionFilter)));
+        assert!(decoded.nodes.values().any(|n| matches!(n, OpNode::WorkerFilter)));
         assert!(decoded.nodes.values().any(|n| matches!(
             n,
             OpNode::Join(JoinKind::DeltaTraceRange {

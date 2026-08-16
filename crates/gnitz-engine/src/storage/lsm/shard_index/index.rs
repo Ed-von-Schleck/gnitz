@@ -72,10 +72,6 @@ impl ShardIndex {
         self.unsynced.push(path.to_string());
     }
 
-    pub fn has_unsynced(&self) -> bool {
-        !self.unsynced.is_empty()
-    }
-
     /// The unsynced set, cloned by `flush_prepare` into the barrier's sweep list.
     pub fn unsynced_paths(&self) -> &[String] {
         &self.unsynced
@@ -85,13 +81,6 @@ impl ShardIndex {
     /// and renamed the manifest that references them.
     pub fn clear_unsynced(&mut self) {
         self.unsynced.clear();
-    }
-
-    /// True when compaction has superseded files since the last publish — the
-    /// barrier must still publish (over the swapped index) so the deferred drain
-    /// can unlink them without stranding the old manifest over deleted files.
-    pub fn has_pending_deletions(&self) -> bool {
-        !self.pending_deletions.is_empty()
     }
 
     /// Move compaction-superseded input files to `pending_deletions` for the
@@ -105,7 +94,7 @@ impl ShardIndex {
     }
 
     /// Every live shard's `Rc`, yielded lazily — callers `extend` without an
-    /// intermediate `Vec` (the per-partition cursor gather).
+    /// intermediate `Vec` (the per-worker cursor gather).
     pub fn all_shard_arcs_iter(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
         self.all_entries().map(|e| Rc::clone(&e.shard))
     }
