@@ -709,13 +709,15 @@ fn encode_ctrl_block_direct_roundtrips() {
         let n = encode_ctrl_block_direct(
             &mut buf,
             OFFSET,
-            target_id,
-            client_id,
-            wire_flags,
-            seek_pk,
-            seek_col_idx,
-            request_id,
-            status,
+            &gnitz_wire::control::ControlHeader {
+                status,
+                target_id,
+                client_id,
+                flags: wire_flags,
+                seek_pk,
+                seek_col_idx,
+                request_id,
+            },
             b"",
             &[],
             checksum,
@@ -938,13 +940,15 @@ fn encode_ctrl_block_direct_error_path_roundtrips() {
     let n = encode_ctrl_block_direct(
         &mut buf,
         OFFSET,
-        7,
-        11,
-        13,
-        17u128,
-        19,
-        23,
-        STATUS_ERROR,
+        &gnitz_wire::control::ControlHeader {
+            status: STATUS_ERROR,
+            target_id: 7,
+            client_id: 11,
+            flags: 13,
+            seek_pk: 17,
+            seek_col_idx: 19,
+            request_id: 23,
+        },
         err,
         &[],
         true,
@@ -953,6 +957,20 @@ fn encode_ctrl_block_direct_error_path_roundtrips() {
     assert_eq!(dec.status, STATUS_ERROR);
     assert_eq!(dec.error_msg, err);
     assert_eq!(dec.block_size, n);
+}
+
+/// A header with a distinct value per field, so a transposed pair fails an
+/// assertion rather than round-tripping unnoticed.
+fn probe_ctrl_header(status: u32) -> gnitz_wire::control::ControlHeader {
+    gnitz_wire::control::ControlHeader {
+        status,
+        target_id: 1,
+        client_id: 2,
+        flags: 3,
+        seek_pk: 4,
+        seek_col_idx: 5,
+        request_id: 6,
+    }
 }
 
 /// Round-trip the new `seek_pk_extra` blob through encode + decode.
@@ -967,10 +985,7 @@ fn ctrl_block_seek_pk_extra_roundtrip() {
     // Case 1: both empty — the empty seek_pk_extra path the direct/IPC
     // equivalence test already covers, asserted here from the decoder side.
     let mut buf = vec![0u8; 1024];
-    let n = encode_ctrl_block_direct(
-        &mut buf, 0, /*target*/ 1, /*client*/ 2, /*flags*/ 3, /*seek_pk*/ 4u128,
-        /*seek_col_idx*/ 5, /*request_id*/ 6, STATUS_OK, b"", b"", true,
-    );
+    let n = encode_ctrl_block_direct(&mut buf, 0, &probe_ctrl_header(STATUS_OK), b"", b"", true);
     let dec = peek_control_block(&buf[..n]).expect("decode empty");
     assert_eq!(dec.error_msg, Vec::<u8>::new());
     assert_eq!(dec.seek_pk_extra, Vec::<u8>::new());
@@ -979,7 +994,7 @@ fn ctrl_block_seek_pk_extra_roundtrip() {
     // Case 2: seek_pk_extra short (≤12 bytes, inline; no blob spill).
     let short = b"abcd"; // 4 bytes, fits inline
     let mut buf = vec![0u8; 1024];
-    let n = encode_ctrl_block_direct(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, STATUS_OK, b"", short, true);
+    let n = encode_ctrl_block_direct(&mut buf, 0, &probe_ctrl_header(STATUS_OK), b"", short, true);
     let dec = peek_control_block(&buf[..n]).expect("decode short");
     assert_eq!(dec.error_msg, Vec::<u8>::new());
     assert_eq!(dec.seek_pk_extra, short);
@@ -990,7 +1005,7 @@ fn ctrl_block_seek_pk_extra_roundtrip() {
     let err = b"this error message is definitely longer than twelve bytes";
     let extra = b"and so is this wide-pk-extra blob payload past 12B";
     let mut buf = vec![0u8; 1024];
-    let n = encode_ctrl_block_direct(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, STATUS_ERROR, err, extra, true);
+    let n = encode_ctrl_block_direct(&mut buf, 0, &probe_ctrl_header(STATUS_ERROR), err, extra, true);
     let dec = peek_control_block(&buf[..n]).expect("decode long");
     assert_eq!(dec.error_msg, err);
     assert_eq!(dec.seek_pk_extra, extra);

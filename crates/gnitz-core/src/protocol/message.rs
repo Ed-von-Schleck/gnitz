@@ -1,13 +1,13 @@
 use super::codec::{batch_to_schema, schema_to_batch};
 use super::error::ProtocolError;
-use super::header::WAL_BLOCK_HEADER_SIZE;
-use super::header::{
-    wire_flags_get_schema_version, Header, WireConflictMode, FLAG_DDL_TXN, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
-    FLAG_PUSH_TXN, FLAG_SCAN_MULTI, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
-};
 use super::transport::ClientTransport;
 use super::types::{meta_schema, PkTuple, Schema, ZSetBatch};
 use super::wal_block::{decode_wal_block, encode_wal_block};
+use super::WAL_BLOCK_HEADER_SIZE;
+use super::{
+    wire_flags_get_schema_version, Header, WireConflictMode, FLAG_DDL_TXN, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
+    FLAG_PUSH_TXN, FLAG_SCAN_MULTI, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
+};
 
 pub struct Message {
     pub status: u32,
@@ -42,19 +42,7 @@ pub struct Message {
 pub fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u8]) -> Vec<u8> {
     let total = gnitz_wire::control::ctrl_block_size(error_msg.len(), seek_pk_extra.len());
     let mut buf = vec![0u8; total];
-    gnitz_wire::control::encode_ctrl_block(
-        &mut buf,
-        0,
-        header.target_id,
-        header.client_id,
-        header.flags,
-        header.seek_pk,
-        header.seek_col_idx,
-        header.request_id,
-        header.status,
-        error_msg.as_bytes(),
-        seek_pk_extra,
-    );
+    gnitz_wire::control::encode_ctrl_block(&mut buf, 0, header, error_msg.as_bytes(), seek_pk_extra);
     // Client frames carry a body checksum, matching `encode_wal_block`.
     gnitz_wire::wal::stamp_checksum(&mut buf, total);
     buf
@@ -65,17 +53,9 @@ pub fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u
 /// `seek_pk_extra` is empty when the null bit for seek_pk_extra is set.
 pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), ProtocolError> {
     let dc = gnitz_wire::control::peek_control_block_ipc(data).map_err(|e| ProtocolError::DecodeError(e.into()))?;
+    let header = dc.header();
     let error_msg =
         String::from_utf8(dc.error_msg).map_err(|e| ProtocolError::DecodeError(format!("utf8 in error_msg: {e}")))?;
-    let header = Header {
-        status: dc.status,
-        target_id: dc.target_id,
-        client_id: dc.client_id,
-        flags: dc.flags,
-        seek_pk: dc.seek_pk,
-        seek_col_idx: dc.seek_col_idx,
-        request_id: dc.request_id,
-    };
     Ok((header, error_msg, dc.seek_pk_extra))
 }
 
@@ -465,10 +445,10 @@ pub fn recv_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::header::wire_flags_set_schema_version;
-    use crate::protocol::header::{Header, FLAG_PUSH, FLAG_PUSH_TXN, FLAG_SEEK, STATUS_ERROR};
     use crate::protocol::types::{BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, ZSetBatch};
+    use crate::protocol::wire_flags_set_schema_version;
     use crate::protocol::WireConflictMode;
+    use crate::protocol::{Header, FLAG_PUSH, FLAG_PUSH_TXN, FLAG_SEEK, STATUS_ERROR};
     use std::os::unix::io::RawFd;
 
     // ── FLAG_PUSH_TXN frame encode + engine-style walk ─────────────────────

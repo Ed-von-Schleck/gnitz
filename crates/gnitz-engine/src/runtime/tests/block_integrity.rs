@@ -272,7 +272,18 @@ fn the_control_blocks_size_field_is_exact() {
         b"an error message well past the twelve-byte inline threshold",
     ] {
         let mut buf = vec![0u8; 1024];
-        let n = encode_ctrl_block_direct(&mut buf, 0, 7, 0, 0, 0, 0, 0, STATUS_OK, error_msg, &[], true);
+        let n = encode_ctrl_block_direct(
+            &mut buf,
+            0,
+            &gnitz_wire::control::ControlHeader {
+                status: STATUS_OK,
+                target_id: 7,
+                ..Default::default()
+            },
+            error_msg,
+            &[],
+            true,
+        );
         buf.truncate(n);
         assert_eq!(peek_control_block(&buf).expect("clean control block").block_size, n);
         assert!(

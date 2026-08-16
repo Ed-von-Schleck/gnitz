@@ -1186,13 +1186,14 @@ impl SalWriter {
                 encode_ctrl_block_direct(
                     slot,
                     0,
-                    target_id as u64,
-                    0,
-                    full_wire_flags,
-                    0,
-                    seek_col_idx,
-                    req_ids[w],
-                    STATUS_OK,
+                    &gnitz_wire::control::ControlHeader {
+                        status: STATUS_OK,
+                        target_id: target_id as u64,
+                        flags: full_wire_flags,
+                        seek_col_idx,
+                        request_id: req_ids[w],
+                        ..Default::default()
+                    },
                     b"",
                     &[],
                     // Checksummed like every other block in the slot: SAL replay

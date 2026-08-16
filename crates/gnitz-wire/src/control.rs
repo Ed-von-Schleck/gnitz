@@ -205,26 +205,20 @@ const CTRL_BLOCK_TEMPLATE: [u8; CTRL_BLOCK_SIZE_NO_BLOB] = {
 pub fn encode_ctrl_block(
     out: &mut [u8],
     offset: usize,
-    target_id: u64,
-    client_id: u64,
-    wire_flags: u64,
-    seek_pk: u128,
-    seek_col_idx: u64,
-    request_id: u64,
-    status: u32,
+    hdr: &ControlHeader,
     error_msg: &[u8],
     seek_pk_extra: &[u8],
 ) -> usize {
     let total = ctrl_block_size(error_msg.len(), seek_pk_extra.len());
     let buf = &mut out[offset..offset + total];
     buf[..CTRL_BLOCK_SIZE_NO_BLOB].copy_from_slice(&CTRL_BLOCK_TEMPLATE);
-    buf[OFF_STATUS..OFF_STATUS + 8].copy_from_slice(&(status as u64).to_le_bytes());
-    buf[OFF_CLIENT_ID..OFF_CLIENT_ID + 8].copy_from_slice(&client_id.to_le_bytes());
-    buf[OFF_TARGET_ID..OFF_TARGET_ID + 8].copy_from_slice(&target_id.to_le_bytes());
-    buf[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&wire_flags.to_le_bytes());
-    buf[OFF_SEEK_PK..OFF_SEEK_PK + 16].copy_from_slice(&seek_pk.to_le_bytes());
-    buf[OFF_SEEK_COL_IDX..OFF_SEEK_COL_IDX + 8].copy_from_slice(&seek_col_idx.to_le_bytes());
-    buf[OFF_REQUEST_ID..OFF_REQUEST_ID + 8].copy_from_slice(&request_id.to_le_bytes());
+    buf[OFF_STATUS..OFF_STATUS + 8].copy_from_slice(&(hdr.status as u64).to_le_bytes());
+    buf[OFF_CLIENT_ID..OFF_CLIENT_ID + 8].copy_from_slice(&hdr.client_id.to_le_bytes());
+    buf[OFF_TARGET_ID..OFF_TARGET_ID + 8].copy_from_slice(&hdr.target_id.to_le_bytes());
+    buf[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&hdr.flags.to_le_bytes());
+    buf[OFF_SEEK_PK..OFF_SEEK_PK + 16].copy_from_slice(&hdr.seek_pk.to_le_bytes());
+    buf[OFF_SEEK_COL_IDX..OFF_SEEK_COL_IDX + 8].copy_from_slice(&hdr.seek_col_idx.to_le_bytes());
+    buf[OFF_REQUEST_ID..OFF_REQUEST_ID + 8].copy_from_slice(&hdr.request_id.to_le_bytes());
 
     if error_msg.is_empty() && seek_pk_extra.is_empty() {
         return CTRL_BLOCK_SIZE_NO_BLOB;
@@ -248,6 +242,25 @@ pub fn encode_ctrl_block(
     buf[CTRL_BLOCK_SIZE_NO_BLOB..CTRL_BLOCK_SIZE_NO_BLOB + blob.len()].copy_from_slice(&blob);
     crate::write_u32_le(buf, WAL_OFF_SIZE, total as u32);
     total
+}
+
+/// The control block's seven scalar fields — the routing header both sides of
+/// the wire agree on. Named rather than positional: `target_id`/`client_id` are
+/// adjacent `u64`s, so a transposed pair in an argument list would encode
+/// cleanly and misroute the frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlHeader {
+    pub status: u32,
+    pub target_id: u64,
+    pub client_id: u64,
+    pub flags: u64,
+    pub seek_pk: u128,
+    pub seek_col_idx: u64,
+    /// Master-allocated reply-routing key. Clients send 0; the master sets a
+    /// per-request value when fanning out to workers, and workers echo it back
+    /// in their W2M reply. Reserved: `0` — unsolicited / untagged;
+    /// `u64::MAX` — broadcast reply.
+    pub request_id: u64,
 }
 
 /// Decoded control fields from a wire message.
@@ -418,9 +431,39 @@ fn peek_control_block_impl(data: &[u8], verify_checksum: bool) -> Result<Decoded
     })
 }
 
+impl DecodedControl {
+    /// The seven routing scalars as a [`ControlHeader`], for a caller that
+    /// re-encodes what it decoded.
+    pub fn header(&self) -> ControlHeader {
+        ControlHeader {
+            status: self.status,
+            target_id: self.target_id,
+            client_id: self.client_id,
+            flags: self.flags,
+            seek_pk: self.seek_pk,
+            seek_col_idx: self.seek_col_idx,
+            request_id: self.request_id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A header with a distinct value per field, so a transposed pair fails an
+    /// assertion rather than round-tripping unnoticed.
+    fn probe_header() -> ControlHeader {
+        ControlHeader {
+            target_id: 1,
+            client_id: 2,
+            flags: 3,
+            seek_pk: 4,
+            seek_col_idx: 5,
+            request_id: 6,
+            status: 7,
+        }
+    }
 
     /// The template-and-patch fast path and the blob fallback agree on the
     /// shared fixed-region image: encoding with empty strings then with
@@ -430,7 +473,7 @@ mod tests {
     fn encode_roundtrip_all_paths() {
         // Fast path.
         let mut buf = vec![0u8; ctrl_block_size(0, 0)];
-        let n = encode_ctrl_block(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, 7, b"", b"");
+        let n = encode_ctrl_block(&mut buf, 0, &probe_header(), b"", b"");
         assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB);
         let dec = peek_control_block_ipc(&buf[..n]).expect("decode empty");
         assert_eq!(dec.target_id, 1);
@@ -447,7 +490,7 @@ mod tests {
         // Inline strings (≤ 12 bytes, no blob spill).
         let short = b"abcd";
         let mut buf = vec![0u8; ctrl_block_size(short.len(), short.len())];
-        let n = encode_ctrl_block(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, 7, short, short);
+        let n = encode_ctrl_block(&mut buf, 0, &probe_header(), short, short);
         assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB, "inline strings must not grow the block");
         let dec = peek_control_block_ipc(&buf[..n]).expect("decode short");
         assert_eq!(dec.error_msg, short);
@@ -457,7 +500,7 @@ mod tests {
         let err = b"this error message is definitely longer than twelve bytes";
         let extra = b"and so is this wide-pk-extra blob payload past 12B";
         let mut buf = vec![0u8; ctrl_block_size(err.len(), extra.len())];
-        let n = encode_ctrl_block(&mut buf, 0, 1, 2, 3, 4u128, 5, 6, 7, err, extra);
+        let n = encode_ctrl_block(&mut buf, 0, &probe_header(), err, extra);
         assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB + err.len() + extra.len());
         let dec = peek_control_block_ipc(&buf[..n]).expect("decode long");
         assert_eq!(dec.error_msg, err);
@@ -470,7 +513,18 @@ mod tests {
     fn peek_rejects_oob_error_msg_offset() {
         let long_msg = b"this error message exceeds twelve bytes so it spills into the blob";
         let mut buf = vec![0u8; ctrl_block_size(long_msg.len(), 0)];
-        let n = encode_ctrl_block(&mut buf, 0, 1, 2, 0, 0, 0, 0, 1, long_msg, b"");
+        let n = encode_ctrl_block(
+            &mut buf,
+            0,
+            &ControlHeader {
+                status: 1,
+                target_id: 1,
+                client_id: 2,
+                ..Default::default()
+            },
+            long_msg,
+            b"",
+        );
         buf.truncate(n);
         let (err_off, _) = crate::wal::dir_entry(&buf, REG_ERROR_MSG);
         buf[err_off + 8..err_off + 16].copy_from_slice(&u64::MAX.to_le_bytes());

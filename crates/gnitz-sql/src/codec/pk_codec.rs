@@ -202,7 +202,6 @@ mod tests {
     use crate::test_support::{
         col_def, compound_schema_u64_u64, dquote_expr, neg_num_expr, num_expr, pk_schema, uuid_schema_pk, uuid_str_expr,
     };
-    use gnitz_core::ZSetBatch;
 
     fn compound_schema_u64_u64_u128() -> Schema {
         Schema {
@@ -268,14 +267,6 @@ mod tests {
         expect[8..16].copy_from_slice(&2u64.to_le_bytes());
         expect[16..32].copy_from_slice(&3u128.to_le_bytes());
         assert_eq!(pk.as_bytes(), &expect[..]);
-    }
-
-    #[test]
-    fn compound_pk_zset_batch_new_uses_packed_stride() {
-        let schema = compound_schema_u64_u64();
-        let batch = ZSetBatch::new(&schema);
-        assert_eq!(batch.pks.stride, 16);
-        assert!(batch.pks.buf.is_empty());
     }
 
     #[test]

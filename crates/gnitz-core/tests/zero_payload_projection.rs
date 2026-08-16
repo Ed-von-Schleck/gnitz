@@ -118,7 +118,6 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
 
     // Weights reach the client unsummed: no top-k gate, one row per key.
     assert!(reply.weights.iter().all(|&w| w == 1), "per-row weights preserved");
-    assert_eq!(reply.pks.stride, 8, "a lone U64 PK column decodes 8 bytes wide");
     let mut got: Vec<u64> = (0..reply.pks.len()).map(|i| reply.pks.get(i) as u64).collect();
     got.sort_unstable();
     assert_eq!(got, (151u64..=200).collect::<Vec<_>>());

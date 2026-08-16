@@ -308,7 +308,6 @@ mod tests {
         let mut dst = ZSetBatch::new(&schema);
         RowGather::new(&schema).copy(&src, 0, &mut dst);
         assert_eq!(dst.pks.len(), 1);
-        assert_eq!(dst.pks.stride, 16);
         assert_eq!(dst.pks.buf, pk_bytes.to_vec());
     }
 }

@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn test_batch_to_schema_nullable_pk_rejected() {
         use crate::protocol::error::ProtocolError;
-        use crate::protocol::header::META_FLAG_NULLABLE;
+        use crate::protocol::META_FLAG_NULLABLE;
         let mut batch = make_meta_batch(2);
         // Set the NULLABLE flag on the PK column (col 0).
         if let ColData::Fixed(ref mut v) = batch.columns[2] {
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn test_batch_to_schema_too_many_pk_rejected() {
         use crate::protocol::error::ProtocolError;
-        use crate::protocol::header::META_FLAG_IS_PK;
+        use crate::protocol::META_FLAG_IS_PK;
         // PK_LIST_MAX_COLS is 4; flag 6 columns as PK.
         let mut batch = make_meta_batch(6);
         if let ColData::Fixed(ref mut v) = batch.columns[2] {

@@ -1245,19 +1245,16 @@ mod tests {
     #[test]
     fn filler_columns_encode_without_panic() {
         // The client delete path builds retraction batches from `filler_columns`
-        // (bypassing BatchAppender, whose `add_row` takes a scalar PK). Each
-        // payload variant must match the wire encoder's expectation; regression:
-        // a duplicated copy of this mapping once sent an I128 payload column as
-        // `Fixed` and panicked in `encode_wal_block` ("expected U128s"). Cover
+        // (bypassing BatchAppender, whose `add_row` takes a scalar PK). Cover
         // every payload family — including a nullable String — the same way
         // `push` exercises them: validate, then encode.
         let schema = Schema {
             columns: vec![
                 ColumnDef::new("pk", TypeCode::U64, false),
-                ColumnDef::new("i", TypeCode::I64, false),    // Fixed
-                ColumnDef::new("big", TypeCode::I128, false), // U128s (the regression)
-                ColumnDef::new("u", TypeCode::U128, false),   // U128s
-                ColumnDef::new("uid", TypeCode::UUID, false), // U128s
+                ColumnDef::new("i", TypeCode::I64, false),    // Fixed, 8B
+                ColumnDef::new("big", TypeCode::I128, false), // Fixed, 16B
+                ColumnDef::new("u", TypeCode::U128, false),   // Fixed, 16B
+                ColumnDef::new("uid", TypeCode::UUID, false), // Fixed, 16B
                 ColumnDef::new("s", TypeCode::String, true),  // Strings, nullable
                 ColumnDef::new("b", TypeCode::Blob, false),   // Bytes
             ],
@@ -1271,7 +1268,6 @@ mod tests {
             columns: ZSetBatch::filler_columns(&schema, count),
         };
         batch.validate(&schema).expect("filler batch must validate");
-        // Must not panic: I128/U128/UUID → U128s, String/Blob → 16 zero bytes.
         let _ = crate::protocol::encode_wal_block(&schema, 7, &batch);
     }
 

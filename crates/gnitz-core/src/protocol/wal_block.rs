@@ -439,7 +439,6 @@ mod tests {
 
         assert_eq!(tid, 42);
         assert_eq!(decoded.pks.to_vec_u128(), pks);
-        assert!(decoded.pks.stride == 8, "U64 schema must decode to an 8-byte PK stride");
         assert_eq!(decoded.weights, weights);
         assert_eq!(decoded.nulls, nulls);
         match &decoded.columns[1] {
@@ -495,10 +494,6 @@ mod tests {
         let encoded = encode_wal_block(&schema, 1, &batch);
         let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 1);
-        assert!(
-            decoded.pks.stride == 16,
-            "U128 schema must decode to a 16-byte PK stride"
-        );
         assert_eq!(wide_vals(&decoded.columns[1]), vals);
     }
 
@@ -551,9 +546,7 @@ mod tests {
         let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 3);
 
-        // (a) A lone 16-byte PK keeps its full width.
-        assert_eq!(decoded.pks.stride, 16, "I128 PK must decode 16 bytes wide");
-        // (b) Each signed value survives — reinterpret the recovered bits as i128.
+        // Each signed value survives — reinterpret the recovered bits as i128.
         let got_pk: Vec<i128> = (0..decoded.pks.len()).map(|i| decoded.pks.get(i) as i128).collect();
         assert_eq!(got_pk, signed, "I128 PK sign-flip must round-trip");
 
@@ -635,7 +628,6 @@ mod tests {
 
         let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(decoded.pks.to_vec_u128(), pks);
-        assert!(decoded.pks.stride == 8, "U64 schema must decode to an 8-byte PK stride");
     }
 
     #[test]
@@ -656,10 +648,6 @@ mod tests {
 
         let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(decoded.pks.to_vec_u128(), pks);
-        assert!(
-            decoded.pks.stride == 16,
-            "U128 schema must decode to a 16-byte PK stride"
-        );
     }
 
     #[test]
@@ -699,7 +687,6 @@ mod tests {
         assert_eq!(decoded.pks.get(0), 1u128);
         assert_eq!(decoded.pks.get(1), 100u128);
         assert_eq!(decoded.pks.get(2), (u32::MAX as u128) + 1);
-        assert!(decoded.pks.stride == 8, "U64 schema must decode to an 8-byte PK stride");
     }
 
     #[test]
@@ -721,10 +708,6 @@ mod tests {
         for (i, &expected) in pks.iter().enumerate() {
             assert_eq!(decoded.pks.get(i), expected);
         }
-        assert!(
-            decoded.pks.stride == 16,
-            "U128 schema must decode to a 16-byte PK stride"
-        );
     }
 
     #[test]

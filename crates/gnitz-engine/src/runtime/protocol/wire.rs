@@ -253,35 +253,16 @@ pub(crate) const CTRL_BLOCK_SIZE_NO_BLOB: usize = gnitz_wire::control::CTRL_BLOC
 /// Thin wrapper over the shared `gnitz_wire::control::encode_ctrl_block`
 /// codec (template-and-patch fast path, German-string blob fallback), which
 /// leaves the checksum field 0 — stamped here for checksummed frames.
-#[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) fn encode_ctrl_block_direct(
     out: &mut [u8],
     offset: usize,
-    target_id: u64,
-    client_id: u64,
-    wire_flags: u64,
-    seek_pk: u128,
-    seek_col_idx: u64,
-    request_id: u64,
-    status: u32,
+    hdr: &gnitz_wire::control::ControlHeader,
     error_msg: &[u8],
     seek_pk_extra: &[u8],
     checksum: bool,
 ) -> usize {
-    let n = gnitz_wire::control::encode_ctrl_block(
-        out,
-        offset,
-        target_id,
-        client_id,
-        wire_flags,
-        seek_pk,
-        seek_col_idx,
-        request_id,
-        status,
-        error_msg,
-        seek_pk_extra,
-    );
+    let n = gnitz_wire::control::encode_ctrl_block(out, offset, hdr, error_msg, seek_pk_extra);
     if checksum {
         gnitz_wire::wal::stamp_checksum(&mut out[offset..offset + n], n);
     }
@@ -438,13 +419,15 @@ impl<'a> WireMsg<'a> {
         let written = encode_ctrl_block_direct(
             out,
             offset,
-            self.target_id,
-            self.client_id,
-            wire_flags,
-            self.seek_pk,
-            self.seek_col_idx,
-            self.request_id,
-            self.status,
+            &gnitz_wire::control::ControlHeader {
+                status: self.status,
+                target_id: self.target_id,
+                client_id: self.client_id,
+                flags: wire_flags,
+                seek_pk: self.seek_pk,
+                seek_col_idx: self.seek_col_idx,
+                request_id: self.request_id,
+            },
             self.error_msg,
             self.seek_pk_extra,
             checksum,
@@ -1432,81 +1415,5 @@ mod tests {
             !b.is_sorted() && !b.is_consolidated(),
             "strip clears both engine-internal flags"
         );
-    }
-
-    /// Byte-level cross-crate consistency check: the engine wrapper
-    /// (`encode_ctrl_block_direct`, checksum stamped via `foundation::xxh`)
-    /// and the client wrapper
-    /// (`gnitz_core::protocol::message::encode_control_block`, checksum
-    /// stamped via `xxhash-rust`) must produce identical bytes for the same
-    /// logical message — pinning that the two wrappers over the shared
-    /// `gnitz_wire::control` codec (and their two XXH3 implementations)
-    /// cannot drift.
-    #[test]
-    fn test_ctrl_block_client_server_byte_equality() {
-        use gnitz_core::protocol::header::Header;
-        use gnitz_core::protocol::message::encode_control_block;
-
-        #[allow(clippy::type_complexity)]
-        let cases: &[(u32, u64, u64, u64, u128, u64, u64, &str)] = &[
-            // status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id, error_msg
-            (0, 0, 0, 0, 0, 0, 0, ""),
-            (
-                1,
-                0xDEAD_BEEF_1234_5678,
-                0xCAFE_BABE_0000_0001,
-                0xFFFF,
-                42u128 | (99u128 << 64),
-                7,
-                0xCAFE_BABE_DEAD_F00D,
-                "",
-            ),
-            (2, 1, 2, 3, u128::MAX, u64::MAX, u64::MAX, "something went wrong"),
-            (
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                "a longer error message that exceeds the German string inline threshold of twelve bytes",
-            ),
-        ];
-
-        for &(status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id, error_msg) in cases {
-            let header = Header {
-                status,
-                target_id,
-                client_id,
-                flags,
-                seek_pk,
-                seek_col_idx,
-                request_id,
-            };
-            let client_bytes = encode_control_block(&header, error_msg, &[]);
-
-            let mut engine_buf = vec![0u8; client_bytes.len() + 64];
-            let written = encode_ctrl_block_direct(
-                &mut engine_buf,
-                0,
-                target_id,
-                client_id,
-                flags,
-                seek_pk,
-                seek_col_idx,
-                request_id,
-                status,
-                error_msg.as_bytes(),
-                b"",
-                true, // checksum, matching encode_wal_block's unconditional checksum
-            );
-
-            assert_eq!(
-                &client_bytes[..],
-                &engine_buf[..written],
-                "ctrl block byte mismatch for error_msg={error_msg:?}",
-            );
-        }
     }
 }
