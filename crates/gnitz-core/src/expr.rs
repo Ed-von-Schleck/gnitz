@@ -9,8 +9,9 @@ use gnitz_wire::{
     EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_COL_STR, EXPR_LOAD_CONST, EXPR_LOAD_CONST_STR, EXPR_LOAD_NULL,
     EXPR_LOAD_NULL_STR, EXPR_SELECT, EXPR_STR_CMP_EQ, EXPR_STR_CMP_LE, EXPR_STR_CMP_LT, EXPR_STR_COL_EQ_COL,
     EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
-    EXPR_STR_CONCAT, EXPR_STR_CONCAT_NN, EXPR_STR_LEN_BYTES, EXPR_STR_LEN_CHARS, EXPR_STR_LOWER, EXPR_STR_SELECT,
-    EXPR_STR_SUBSTR, EXPR_STR_TO_FLOAT, EXPR_STR_TO_INT, EXPR_STR_TRIM, EXPR_STR_UPPER, STR_SUBSTR_NO_LEN,
+    EXPR_STR_CONCAT, EXPR_STR_CONCAT_NN, EXPR_STR_ILIKE, EXPR_STR_LEN_BYTES, EXPR_STR_LEN_CHARS, EXPR_STR_LIKE,
+    EXPR_STR_LOWER, EXPR_STR_SELECT, EXPR_STR_SUBSTR, EXPR_STR_TO_FLOAT, EXPR_STR_TO_INT, EXPR_STR_TRIM,
+    EXPR_STR_UPPER, STR_SUBSTR_NO_LEN,
 };
 
 /// A compiled expression program: a flat list of 4-word instructions
@@ -429,6 +430,22 @@ impl ExprBuilder {
             dst,
             gnitz_wire::pack_operand_pair(src, mode.to_wire()),
             set_idx,
+        );
+        dst
+    }
+
+    /// `src [I]LIKE <pattern at pat_idx>` → a fresh 0/1 boolean register.
+    /// `escape = None` disables escaping and rides as byte 0; `pat_idx` names the
+    /// const-pool entry holding the raw pattern bytes. `ci` picks ILIKE's
+    /// ASCII-case-insensitive opcode.
+    pub fn str_like(&mut self, src: u32, escape: Option<u8>, pat_idx: u32, ci: bool) -> u32 {
+        let dst = self.alloc_reg();
+        let op = if ci { EXPR_STR_ILIKE } else { EXPR_STR_LIKE };
+        self.emit(
+            op,
+            dst,
+            gnitz_wire::pack_operand_pair(src, escape.unwrap_or(0) as u32),
+            pat_idx,
         );
         dst
     }

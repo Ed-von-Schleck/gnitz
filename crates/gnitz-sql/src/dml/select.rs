@@ -9,7 +9,7 @@
 //! single-relation sink; [`route_select`] rejects it from the AST alone
 //! (`reject_derivation`) with one actionable message pointing at CREATE VIEW,
 //! which maintains the derived relation incrementally. A single-relation read the
-//! direct path cannot express (a LIKE / string-function WHERE, an ORDER BY
+//! direct path cannot express (a LIKE whose pattern is not a literal, an ORDER BY
 //! expression) is a feature-named `Unsupported`, never the derivation template. A
 //! pass-through CTE over one relation is inlined (`cte_passthrough`) so trivial
 //! `WITH` queries keep reading through the direct path.

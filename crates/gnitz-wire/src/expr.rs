@@ -208,6 +208,14 @@ pub const EXPR_STR_TO_INT: u32 = 74;
 /// `[EXPR_STR_TO_FLOAT, dst, a, 0]` — parse into an f64 scalar register; any
 /// failure (including non-UTF-8 bytes) is NULL.
 pub const EXPR_STR_TO_FLOAT: u32 = 75;
+/// `[EXPR_STR_LIKE, dst, src_reg | escape << 16, pat_idx]` — SQL LIKE over a
+/// string register, writing 0/1 into the *scalar* register `dst`, the
+/// [`EXPR_STR_TRIM`] shape. `escape` is the escape character, or 0 to disable
+/// escaping; the const-pool entry at `pat_idx` is the raw pattern bytes. The
+/// matcher is compiled at resolve, never per row.
+pub const EXPR_STR_LIKE: u32 = 76;
+/// ASCII-case-insensitive LIKE, same operand shape.
+pub const EXPR_STR_ILIKE: u32 = 77;
 
 // ---------------------------------------------------------------------------
 // Blob framing constants and operand packing
@@ -234,8 +242,9 @@ pub const fn decode_load_const(a1: u32, a2: u32) -> i64 {
 /// Two 16-bit operands in one 32-bit word, low half first. Used by
 /// `EXPR_SELECT` / `EXPR_STR_SELECT` (`a | b`) and `EXPR_STR_SUBSTR`
 /// (`start_reg | len_reg`) in the `a2` word, and by `EXPR_STR_TRIM`
-/// (`src_reg | mode`) in `a1`. The second half is not always a register:
-/// TRIM's is a mode word and SUBSTR's may be [`STR_SUBSTR_NO_LEN`].
+/// (`src_reg | mode`) and `EXPR_STR_LIKE` (`src_reg | escape`) in `a1`. The
+/// second half is not always a register: TRIM's is a mode word, LIKE's an escape
+/// byte, and SUBSTR's may be [`STR_SUBSTR_NO_LEN`].
 #[inline]
 pub const fn pack_operand_pair(a: u32, b: u32) -> u32 {
     (a & 0xFFFF) | ((b & 0xFFFF) << 16)

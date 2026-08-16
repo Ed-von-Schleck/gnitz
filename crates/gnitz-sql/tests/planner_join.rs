@@ -1777,6 +1777,35 @@ fn test_residual_string_inequality() {
     );
 }
 
+/// A literal-pattern LIKE residual compiles like any other string predicate.
+#[test]
+fn test_residual_like_literal_pattern() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t VARCHAR NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t VARCHAR NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.k = b.k AND a.t LIKE 'x%'",
+    );
+    assert!(
+        client.resolve_table_or_view_id(&sn, "v").is_ok(),
+        "a literal-pattern LIKE residual should register"
+    );
+}
+
 // A BLOB-column residual (`a.b1 <> b.b2`) exercises the same §6.6a path, but BLOB
 // columns are not SQL-DDL-creatable (`sql_type_to_typecode` has no BLOB keyword —
 // blobs are created only via the wire `ColumnDef` API), so it cannot be expressed
@@ -1855,10 +1884,11 @@ fn test_residual_only_on_rejected() {
     );
 }
 
-/// An unsupported residual construct (`LIKE`) is rejected at CREATE when the
-/// residual binder reaches an expression type the core does not handle.
+/// A LIKE residual whose pattern is another column is rejected at CREATE: the
+/// pattern is compile-time data, so only a literal one can be baked in. A
+/// literal-pattern residual is served (below).
 #[test]
-fn test_residual_like_rejected() {
+fn test_residual_like_with_a_computed_pattern_rejected() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,

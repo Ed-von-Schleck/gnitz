@@ -871,7 +871,7 @@ fn run_str_rows(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(u16) -> Vec<LogicalI
     (0..vals.len()).map(|i| row_str(&ev, &view, i)).collect()
 }
 
-/// The same, but reading a *scalar* register — LENGTH, the compares, the
+/// The same, but reading a *scalar* register — LENGTH, LIKE, the compares, the
 /// text→number parses.
 fn run_str_to_scalar(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(u16) -> Vec<LogicalInstr>) -> Vec<(i64, bool)> {
     let (ev, view) = str_prog(vals, nulls, vec![], mk);
@@ -1086,6 +1086,35 @@ fn trim_strips_the_selected_ends_only() {
         }
         assert_eq!(both[i], want, "row {i}");
     }
+}
+
+/// LIKE over both cell classes and a NULL row. `eval_row` normalizes a NULL row
+/// whatever the matcher answered on its stored bytes — `'%'` matches anything —
+/// so it reports `(0, true)` like every other producer.
+#[test]
+fn like_over_inline_and_heap_cells_with_a_null_row() {
+    let vals: &[&[u8]] = &[b"abc", b"abcdefghijklm", b"xyz", b"abc"];
+    let nulls = [false, false, false, true];
+    let run = |pattern: &str, ci: bool| {
+        let (ev, view) = str_prog(vals, &nulls, vec![pattern.as_bytes().to_vec()], |a| {
+            vec![LogicalInstr::StrLike {
+                dst: 1,
+                src: a,
+                escape: b'\\' as u32,
+                pat_idx: 0,
+                ci,
+            }]
+        });
+        (0..vals.len()).map(|i| ev.eval_row(&view, i)).collect::<Vec<_>>()
+    };
+    let null_row = (0, true);
+    assert_eq!(run("abc", false), [(1, false), (0, false), (0, false), null_row]);
+    // A heap cell reached through its view, not its inline prefix.
+    assert_eq!(run("%ijklm", false), [(0, false), (1, false), (0, false), null_row]);
+    assert_eq!(run("%", false), [(1, false), (1, false), (1, false), null_row]);
+    // ILIKE folds ASCII case; LIKE does not.
+    assert_eq!(run("ABC", true), [(1, false), (0, false), (0, false), null_row]);
+    assert_eq!(run("ABC", false), [(0, false), (0, false), (0, false), null_row]);
 }
 
 /// The two null rules are the whole difference between `||` and `CONCAT`, and

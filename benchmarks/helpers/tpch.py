@@ -1,6 +1,6 @@
 """TPC-H-subset generator with realistic column types and skew.
 
-The expressible subset (no LIKE/CAST/DECIMAL/DATE): money is integer cents
+The expressible subset (no CAST/DECIMAL/DATE): money is integer cents
 (BIGINT), rates (l_disc, l_tax) are DOUBLE, dates are integer day-ordinals
 (BIGINT), flags/status/mode are short TEXT (<=12 chars, inline German strings).
 Skew: o_cust (hot customers) and lineitem's l_order FK are drawn Zipfian.

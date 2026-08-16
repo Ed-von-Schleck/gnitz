@@ -207,6 +207,7 @@ impl OpcodeBackend<'_> {
             BoundExpr::StrCall { f, arg } => self.str_call(*f, arg),
             BoundExpr::Substr { s, start, len } => self.substr(s, start, len.as_deref()),
             BoundExpr::TrimCall { s, mode, set } => self.trim_call(s, *mode, set),
+            BoundExpr::Like { s, pattern, escape, ci } => self.like(s, pattern, *escape, *ci),
             BoundExpr::ConcatN { args } => self.concat_n(args),
         }
     }
@@ -220,7 +221,7 @@ impl OpcodeBackend<'_> {
             (r, ExprKind::Int) => Ok((r, false)),
             (r, ExprKind::Float) => Ok((r, true)),
             (_, ExprKind::Str) => Err(GnitzSqlError::Unsupported(format!(
-                "{} is a string; strings support comparison, CONCAT/||, \
+                "{} is a string; strings support comparison, LIKE/ILIKE, CONCAT/||, \
                  CASE/COALESCE/NULLIF, the string functions and CAST — not this",
                 self.describe(expr)
             ))),
@@ -340,6 +341,20 @@ impl OpcodeBackend<'_> {
         let src = self.str_operand(s, false)?;
         let set_idx = self.eb.add_const_string(set.to_string());
         Ok((self.eb.str_trim(src, mode, set_idx), ExprKind::Str))
+    }
+
+    /// `s [I]LIKE 'pattern'`. The result is a boolean, so `NOT LIKE`'s `unop`
+    /// reads it like any other.
+    fn like(
+        &mut self,
+        s: &BoundExpr,
+        pattern: &str,
+        escape: Option<u8>,
+        ci: bool,
+    ) -> Result<(u32, ExprKind), GnitzSqlError> {
+        let src = self.str_operand(s, false)?;
+        let pat_idx = self.eb.add_const_string(pattern.to_string());
+        Ok((self.eb.str_like(src, escape, pat_idx, ci), ExprKind::Int))
     }
 
     /// `CONCAT(args…)`. Seeding the fold with the empty string gives every arity
@@ -1968,6 +1983,77 @@ mod tests {
         };
         assert!(lower_ops(&f, &schema).contains(&gnitz_wire::EXPR_FLOAT_TO_STR));
         assert_str_program(&to_text(1), &schema);
+    }
+
+    fn like_of(s: BoundExpr, pattern: &str, escape: Option<u8>, ci: bool) -> BoundExpr {
+        BoundExpr::Like {
+            s: Box::new(s),
+            pattern: pattern.to_string(),
+            escape,
+            ci,
+        }
+    }
+
+    /// The pattern is a plain pool entry and the escape rides the operand word
+    /// beside the source register, TRIM's shape.
+    #[test]
+    fn like_lowers_to_one_opcode_carrying_its_escape() {
+        use gnitz_wire::{unpack_operand_pair, EXPR_LOAD_COL_STR, EXPR_STR_ILIKE, EXPR_STR_LIKE};
+        let schema = str_schema();
+        let prog = |escape, ci| {
+            compile_bound_expr_to_program(&like_of(str_col(1), "a%", escape, ci), &schema.columns).unwrap()
+        };
+        // The escape is the second half of the LIKE instruction's `a1` word.
+        let escape_of = |p: &ExprProgram| unpack_operand_pair(p.code[6]).1;
+
+        let p = prog(Some(b'\\'), false);
+        assert_eq!(opcodes(&p), [EXPR_LOAD_COL_STR, EXPR_STR_LIKE]);
+        assert_eq!(p.const_strings[0], b"a%");
+        assert_eq!(escape_of(&p), b'\\' as u16);
+        // ILIKE is the same shape under the case-insensitive opcode …
+        assert_eq!(opcodes(&prog(Some(b'\\'), true)), [EXPR_LOAD_COL_STR, EXPR_STR_ILIKE]);
+        // … and `ESCAPE ''` rides as byte 0.
+        assert_eq!(escape_of(&prog(None, false)), 0);
+    }
+
+    /// The subject is an ordinary string operand: any expression the string
+    /// channel produces, including the bare `NULL` its `LitNull` rule catches.
+    #[test]
+    fn like_takes_a_computed_subject_and_propagates_a_null_literal() {
+        use gnitz_wire::{EXPR_LOAD_COL_STR, EXPR_LOAD_NULL_STR, EXPR_STR_LIKE, EXPR_STR_UPPER};
+        let schema = str_schema();
+        let upper = BoundExpr::StrCall {
+            f: StrFunc::Upper,
+            arg: Box::new(str_col(1)),
+        };
+        assert_eq!(
+            lower_ops(&like_of(upper, "A%", Some(b'\\'), false), &schema),
+            [EXPR_LOAD_COL_STR, EXPR_STR_UPPER, EXPR_STR_LIKE]
+        );
+        assert_eq!(
+            lower_ops(&like_of(BoundExpr::LitNull, "a", Some(b'\\'), false), &schema),
+            [EXPR_LOAD_NULL_STR, EXPR_STR_LIKE]
+        );
+        // The verdict is a boolean, so `NOT LIKE` reads it like any other.
+        let negated = BoundExpr::UnaryOp(UnaryOp::Not, Box::new(like_of(str_col(1), "a", Some(b'\\'), false)));
+        assert_eq!(
+            lower_ops(&negated, &schema),
+            [EXPR_LOAD_COL_STR, EXPR_STR_LIKE, gnitz_wire::EXPR_BOOL_NOT]
+        );
+    }
+
+    /// The subject goes through the shared string-operand channel, so a numeric
+    /// one draws that channel's rejection rather than a LIKE-specific one.
+    #[test]
+    fn like_over_a_numeric_operand_is_a_typed_error() {
+        let schema = case_schema(); // col1 = i (I64)
+        let err =
+            compile_bound_expr_to_program(&like_of(BoundExpr::ColRef(1), "a", Some(b'\\'), false), &schema.columns)
+                .expect_err("a numeric subject has no string channel");
+        let GnitzSqlError::Unsupported(msg) = &err else {
+            panic!("expected Unsupported, got {err:?}")
+        };
+        assert!(msg.contains("expected a string value"), "got {msg}");
     }
 
     /// A computed STRING column must be *declared* STRING. The register image

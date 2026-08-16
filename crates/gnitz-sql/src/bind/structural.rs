@@ -8,6 +8,7 @@ use crate::types::{is_cast_target, sql_type_to_typecode};
 use gnitz_core::{ColumnDef, Schema};
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CeilFloorKind, DateTimeField, Expr, Function, TrimWhereField, UnaryOperator, Value,
+    ValueWithSpan,
 };
 
 /// Bind an expression against a single-relation schema (WHERE, projections,
@@ -153,6 +154,37 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                 set: trim_set(trim_what.as_deref())?,
             })
         }
+        // LIKE and ILIKE differ only in case folding, so one arm binds both and
+        // takes `ci` from the node it matched. Only the subject is an operand:
+        // the pattern and the escape are compile-time data (`like_pattern` /
+        // `like_escape`), which is also what lets the trailing-escape rule be
+        // decided here rather than per row.
+        Expr::Like {
+            negated,
+            any,
+            expr: subject,
+            pattern,
+            escape_char,
+        }
+        | Expr::ILike {
+            negated,
+            any,
+            expr: subject,
+            pattern,
+            escape_char,
+        } => {
+            if *any {
+                return Err(GnitzSqlError::Unsupported("LIKE ANY is not supported".into()));
+            }
+            let escape = like_escape(escape_char.as_ref())?;
+            let node = BExpr::Like {
+                s: Box::new(bind_structural(subject, leaf)?),
+                pattern: like_pattern(pattern, escape)?,
+                escape,
+                ci: matches!(expr, Expr::ILike { .. }),
+            };
+            Ok(maybe_negate(node, *negated))
+        }
         Expr::IsNull(i) => leaf.bind_null_test(i, true),
         Expr::IsNotNull(i) => leaf.bind_null_test(i, false),
         Expr::Nested(i) => bind_structural(i, leaf),
@@ -224,12 +256,10 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                 BinOp::Le,
                 Box::new(bind_structural(high, leaf)?),
             );
-            let between = BExpr::BinOp(Box::new(ge), BinOp::And, Box::new(le));
-            Ok(if *negated {
-                BExpr::UnaryOp(UnaryOp::Not, Box::new(between))
-            } else {
-                between
-            })
+            Ok(maybe_negate(
+                BExpr::BinOp(Box::new(ge), BinOp::And, Box::new(le)),
+                *negated,
+            ))
         }
         // `e IN (l)` IS `e = l` — the same structural desugar as BETWEEN above, and
         // what makes the equality visible to the `access` recognizers, which all gate
@@ -254,11 +284,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                         .collect::<Result<Vec<_>, _>>()?,
                 },
             };
-            Ok(if *negated {
-                BExpr::UnaryOp(UnaryOp::Not, Box::new(node))
-            } else {
-                node
-            })
+            Ok(maybe_negate(node, *negated))
         }
         // Subquery placement is the leaf's decision: the HIR view leaf records the
         // node for decorrelation; every other leaf keeps the default per-kind
@@ -286,12 +312,74 @@ fn trim_set(trim_what: Option<&Expr>) -> Result<String, GnitzSqlError> {
         return Ok(" ".to_string());
     };
     let bad = || GnitzSqlError::Unsupported("TRIM: the characters to trim must be an ASCII string literal".into());
-    let Expr::Value(v) = e else { return Err(bad()) };
-    // Through the one literal decoder, so TRIM accepts exactly the spellings
-    // every other string-literal position does; a NULL or numeric literal falls
-    // out as a non-`LitStr`.
-    match bind_literal::<()>(&v.value) {
-        Ok(BExpr::LitStr(s)) if s.is_ascii() => Ok(s),
+    literal_expr_string(e).filter(|s| s.is_ascii()).ok_or_else(bad)
+}
+
+/// The `NOT` wrapper the negatable predicates (BETWEEN, IN, LIKE) share.
+fn maybe_negate<R>(node: BExpr<R>, negated: bool) -> BExpr<R> {
+    if negated {
+        BExpr::UnaryOp(UnaryOp::Not, Box::new(node))
+    } else {
+        node
+    }
+}
+
+/// A string literal's value, read through the one literal decoder so every
+/// compile-time-data position (TRIM's byte set, LIKE's pattern and escape)
+/// accepts exactly the spellings every other string-literal position does.
+/// `None` for anything else — a NULL or numeric literal falls out as a
+/// non-`LitStr`.
+fn literal_string(v: &Value) -> Option<String> {
+    match bind_literal::<()>(v) {
+        Ok(BExpr::LitStr(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// [`literal_string`] of an expression in a compile-time-data position.
+/// Parentheses are peeled first, so `TRIM(s, ('ab'))` reads like `TRIM(s, 'ab')`
+/// — the operand positions get that from `bind_structural`'s `Nested` arm.
+fn literal_expr_string(e: &Expr) -> Option<String> {
+    match crate::ast_util::peel_nested(e) {
+        Expr::Value(v) => literal_string(&v.value),
+        _ => None,
+    }
+}
+
+/// The pattern of a LIKE: a string literal, and not one ending in a live escape
+/// character.
+///
+/// A non-literal pattern is rejected for `trim_set`'s reason — it is
+/// compile-time data the engine tokenizes once per program, not a per-row
+/// operand. `s LIKE NULL` falls out as a non-`LitStr` and is rejected, where
+/// PostgreSQL evaluates it to NULL — the deviation `btrim(s, NULL)` already
+/// carries.
+fn like_pattern(pattern: &Expr, escape: Option<u8>) -> Result<String, GnitzSqlError> {
+    let bad = || GnitzSqlError::Unsupported("LIKE pattern must be a string literal".into());
+    let s = literal_expr_string(pattern).ok_or_else(bad)?;
+    // The engine's own tokenizer answers, so the binder's rule and the matcher's
+    // cannot drift.
+    if gnitz_expr::like_pattern_ends_with_live_escape(s.as_bytes(), escape) {
+        return Err(GnitzSqlError::Bind(
+            "LIKE pattern must not end with escape character".to_string(),
+        ));
+    }
+    Ok(s)
+}
+
+/// The escape character of a LIKE: `\` by default (PostgreSQL's and MySQL's
+/// choice; the standard specifies none), a single ASCII non-NUL character from
+/// `ESCAPE 'c'`, or `None` — escaping disabled — from `ESCAPE ''`.
+///
+/// Two deviations from PostgreSQL, which takes any single character of the
+/// database encoding: the escape is one byte on the wire, so `ESCAPE 'é'` is an
+/// error, and byte 0 encodes "escaping disabled", so `ESCAPE '<NUL>'` is one too.
+fn like_escape(escape_char: Option<&ValueWithSpan>) -> Result<Option<u8>, GnitzSqlError> {
+    let Some(v) = escape_char else { return Ok(Some(b'\\')) };
+    let bad = || GnitzSqlError::Unsupported("LIKE: ESCAPE must be a single non-NUL ASCII character or ''".into());
+    match literal_string(&v.value).ok_or_else(bad)?.as_bytes() {
+        [] => Ok(None),
+        &[b] if b != 0 => Ok(Some(b)),
         _ => Err(bad()),
     }
 }
@@ -1316,6 +1404,73 @@ mod tests {
         bind_single_table(&parse(src), &schema_with_val(TypeCode::String))
     }
 
+    /// The `(pattern, escape, ci)` a LIKE bound to, unwrapping a `NOT` if one is
+    /// there.
+    fn like_parts(src: &str) -> (String, Option<u8>, bool, bool) {
+        let (e, negated) = match bind_str(src).unwrap() {
+            BoundExpr::UnaryOp(UnaryOp::Not, inner) => (*inner, true),
+            other => (other, false),
+        };
+        match e {
+            BoundExpr::Like {
+                pattern, escape, ci, ..
+            } => (pattern, escape, ci, negated),
+            other => panic!("expected Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn like_binds_its_pattern_escape_and_case_folding() {
+        assert_eq!(like_parts("c LIKE 'a%'"), ("a%".to_string(), Some(b'\\'), false, false));
+        assert_eq!(like_parts("c ILIKE 'a%'"), ("a%".to_string(), Some(b'\\'), true, false));
+        assert_eq!(
+            like_parts("c NOT LIKE 'a%'"),
+            ("a%".to_string(), Some(b'\\'), false, true)
+        );
+        assert_eq!(
+            like_parts("c NOT ILIKE 'a%'"),
+            ("a%".to_string(), Some(b'\\'), true, true)
+        );
+        // `ESCAPE ''` disables escaping; any other single ASCII byte overrides.
+        assert_eq!(
+            like_parts(r"c LIKE 'a\%' ESCAPE ''"),
+            (r"a\%".to_string(), None, false, false)
+        );
+        assert_eq!(
+            like_parts("c LIKE 'a!%' ESCAPE '!'"),
+            ("a!%".to_string(), Some(b'!'), false, false)
+        );
+        // Parentheses around the literal are peeled, as they are in an operand
+        // position.
+        assert_eq!(like_parts("c LIKE ('a%')").0, "a%");
+    }
+
+    #[test]
+    fn like_rejects_what_it_cannot_bake_in() {
+        assert_unsupported(bind_str("c LIKE c"), "LIKE pattern must be a string literal");
+        assert_unsupported(bind_str("c LIKE NULL"), "LIKE pattern must be a string literal");
+        assert_unsupported(bind_str("c LIKE 1"), "LIKE pattern must be a string literal");
+        assert_unsupported(bind_str("c LIKE ANY ('a%')"), "LIKE ANY is not supported");
+        // Two characters, non-ASCII, and NUL are all rejected escapes.
+        for esc in ["'ab'", "'é'", "'\0'", "1"] {
+            assert_unsupported(bind_str(&format!("c LIKE 'a' ESCAPE {esc}")), "ESCAPE must be a single");
+        }
+    }
+
+    /// A pattern ending in a *live* escape is rejected; one whose trailing
+    /// escape is itself escaped is legal, and only the tokenizer walk tells
+    /// them apart.
+    #[test]
+    fn like_rejects_a_pattern_ending_in_a_live_escape() {
+        match bind_str(r"c LIKE 'ab\'").unwrap_err() {
+            GnitzSqlError::Bind(msg) => assert_eq!(msg, "LIKE pattern must not end with escape character"),
+            e => panic!("expected Bind, got {e:?}"),
+        }
+        assert_eq!(like_parts(r"c LIKE 'ab\\'").0, r"ab\\");
+        // With escaping disabled the byte is ordinary.
+        assert_eq!(like_parts(r"c LIKE 'ab\' ESCAPE ''").0, r"ab\");
+    }
+
     /// Every string function name reaches the same IR node, whichever of its
     /// spellings is written. `LENGTH` and its two SQL-standard aliases must land
     /// on the *character* measure and `OCTET_LENGTH` on the byte one — swapping
@@ -1371,6 +1526,12 @@ mod tests {
     fn trim_set_must_be_an_ascii_literal() {
         for src in ["TRIM(c FROM c)", "LTRIM(c, c)", "TRIM('ä' FROM c)", "TRIM(NULL FROM c)"] {
             assert_unsupported(bind_str(src), "ASCII string literal");
+        }
+        // Parentheses around the literal are peeled, as they are in an operand
+        // position.
+        match bind_str("LTRIM(c, ('ab'))").unwrap() {
+            BoundExpr::TrimCall { set, .. } => assert_eq!(set, "ab"),
+            other => panic!("expected TrimCall, got {other:?}"),
         }
     }
 

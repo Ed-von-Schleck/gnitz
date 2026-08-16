@@ -33,12 +33,14 @@
 
 mod batch;
 mod eval;
+mod like;
 mod locator;
 mod program;
 mod schema_facts;
 mod view;
 
 pub use eval::*;
+pub use like::*;
 pub use locator::*;
 pub use program::*;
 pub use schema_facts::*;

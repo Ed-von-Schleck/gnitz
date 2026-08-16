@@ -385,7 +385,7 @@ fn explain_returns_the_selects_own_rejection() {
         "SELECT t.v FROM t JOIN u ON t.id = u.id",
         "SELECT v FROM t UNION SELECT k FROM u",
         "SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
-        "SELECT v FROM t WHERE CAST(v AS CHAR) LIKE 'a%'",
+        "SELECT v FROM t WHERE CAST(v AS CHAR) LIKE CAST(w AS CHAR)",
         "SELECT v FROM t ORDER BY v + 1",
     ] {
         let direct = try_exec(&mut client, &sn, sql).expect_err(&format!("`{sql}` must be rejected"));

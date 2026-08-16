@@ -42,6 +42,10 @@ pub(crate) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
 #[derive(Default)]
 pub(crate) struct EvalScratch {
     /// Register buffers, register-major layout: regs[reg * MORSEL + row].
+    ///
+    /// A lane at a NULL row holds whatever its kernel computed from the row's
+    /// stored bytes: kernels run unconditionally to stay branch-free, so a
+    /// consumer must read `regs` against [`Self::null_bits`], never alone.
     pub(crate) regs: Vec<i64>,
     /// Null bitmask, register-major: null_bits[reg * NULL_WORDS_PER_REG + word].
     /// Empty (capacity 0) when `no_nulls` is true.
@@ -440,18 +444,6 @@ pub(crate) fn for_each_null_row(null_bits: &[u64], base: usize, m: usize, mut f:
     }
 }
 
-/// Walk `dst`'s null mask and zero the matching register entries. Used by
-/// the string-comparison helpers, which compute results unconditionally for
-/// vectorization and then clear null rows in a post-pass.
-fn zero_null_rows(scratch: &mut EvalScratch, dst: usize, m: usize) {
-    if scratch.no_nulls {
-        return;
-    }
-    let base_d = dst * MORSEL;
-    let EvalScratch { regs, null_bits, .. } = scratch;
-    for_each_null_row(null_bits, dst * NULL_WORDS_PER_REG, m, |i| regs[base_d + i] = 0);
-}
-
 /// OR a per-row failure flag into `dst`'s null words. The flags are collected a
 /// byte per row and packed here in a second pass: folding the packing into the
 /// value loop makes every iteration read-modify-write the same mask word, which
@@ -612,7 +604,7 @@ fn char_count(s: &[u8]) -> usize {
 ///
 /// Resuming from a known character start is what keeps a bounded window's cost
 /// proportional to the window rather than to the string.
-fn char_offset(s: &[u8], from: usize, n: usize) -> usize {
+pub(crate) fn char_offset(s: &[u8], from: usize, n: usize) -> usize {
     char_starts(&s[from..]).nth(n).map_or(s.len(), |k| k + from)
 }
 
@@ -749,7 +741,9 @@ fn str_to_str(
 }
 
 /// Measure every row of string register `a` into scalar register `dst`. `f` is
-/// total — the operand's null bit is the only NULL, so no fail mask is packed.
+/// total — the operand's null bit is the only NULL, so no fail mask is packed —
+/// and runs over NULL rows too, on whatever view they carry, keeping the loop
+/// branch-free.
 fn str_to_scalar(scratch: &mut EvalScratch, mo: &Morsel<'_>, blob: &[u8], dst: u16, a: u16, f: impl Fn(&[u8]) -> i64) {
     let (d, ai) = (dst as usize, a as usize);
     let (base_a, base_d) = (ai * MORSEL, d * MORSEL);
@@ -824,9 +818,8 @@ fn num_to_str(scratch: &mut EvalScratch, dst: u16, a: u16, m: usize, f: impl Fn(
     null_copy1(scratch, d, ai, m);
 }
 
-/// The register-channel string compare. Rows whose operands are NULL get their
-/// result cleared in a post-pass, keeping the compare loop branch-free — the
-/// [`eval_str_cmp`] shape, over views instead of column cells.
+/// The register-channel string compare — the [`eval_str_cmp`] shape, over views
+/// instead of column cells.
 fn eval_str_reg_cmp(
     scratch: &mut EvalScratch,
     mo: &Morsel<'_>,
@@ -854,7 +847,6 @@ fn eval_str_reg_cmp(
         }
     }
     null_or2(scratch, dst, a, b, mo.m);
-    zero_null_rows(scratch, dst, mo.m);
     maybe_pack_bool_bits(scratch, mo, dst);
 }
 
@@ -1093,9 +1085,8 @@ impl<'a> StrOperand<'a> {
     }
 }
 
-/// The one string-compare kernel. Rows where either operand's column is null get
-/// their result cleared in a post-pass; the compare itself runs unconditionally
-/// (a valid but irrelevant value), keeping the loop branch-free.
+/// The one string-compare kernel. The compare runs unconditionally, including on
+/// rows where either operand's column is null, keeping the loop branch-free.
 fn eval_str_cmp(
     scratch: &mut EvalScratch,
     mo: &Morsel<'_>,
@@ -1111,7 +1102,6 @@ fn eval_str_cmp(
         let ord = compare_german_strings(a.cell(row), a.blob, b.cell(row), b.blob);
         scratch.regs[base_d + i] = pred(ord) as i64;
     }
-    zero_null_rows(scratch, dst, mo.m);
     maybe_pack_bool_bits(scratch, mo, dst);
 }
 
@@ -1874,6 +1864,11 @@ pub(crate) fn eval_batch<B: BatchView>(
                     }
                     StrView::at(v.src, base_off + lo, hi - lo)
                 });
+            }
+
+            Instr::StrLike { dst, src, matcher_idx } => {
+                let matcher = &prog.like_matchers[matcher_idx as usize];
+                str_to_scalar(scratch, &mo, mb.blob(), dst, src, |s| matcher.matches(s) as i64);
             }
 
             Instr::StrConcat { dst, a, b, skip_null } => {

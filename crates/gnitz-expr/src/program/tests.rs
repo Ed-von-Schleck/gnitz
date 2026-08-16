@@ -2445,7 +2445,7 @@ fn test_int_cast_records_the_source_signedness() {
 
 use gnitz_wire::{
     EXPR_CMP_GT, EXPR_EMIT, EXPR_LOAD_COL_INT, EXPR_LOAD_COL_STR, EXPR_LOAD_CONST, EXPR_STR_CMP_EQ, EXPR_STR_CONCAT,
-    EXPR_STR_SELECT, EXPR_STR_SUBSTR, EXPR_STR_TRIM, EXPR_STR_UPPER,
+    EXPR_STR_ILIKE, EXPR_STR_LIKE, EXPR_STR_SELECT, EXPR_STR_SUBSTR, EXPR_STR_TRIM, EXPR_STR_UPPER,
 };
 
 /// Decode a wire program and keep only the verdict. The class rules are
@@ -2681,6 +2681,83 @@ fn trim_mode_and_cast_target_are_narrowed_at_decode() {
         ),
         Err(ExprValidateErr::BadCastTarget { tc: 999 })
     );
+}
+
+#[test]
+fn like_rejects_a_forged_escape_or_operand() {
+    // LOAD_COL_STR into reg 0, then LIKE of it into reg 1, with the escape
+    // packed above the source register.
+    let load_like = |op, escape: u32, pat_idx| {
+        [
+            EXPR_LOAD_COL_STR,
+            0,
+            1,
+            0,
+            op,
+            1,
+            gnitz_wire::pack_operand_pair(0, escape),
+            pat_idx,
+        ]
+    };
+    let pool = || vec![b"a%".to_vec()];
+    let decode = |code: [u32; 8], pool: Vec<Vec<u8>>| LogicalProgram::from_wire(&code, 2, 1, pool).map(|_| ());
+
+    assert!(decode(load_like(EXPR_STR_LIKE, b'\\' as u32, 0), pool()).is_ok());
+    // Escape 0 disables escaping, and an empty pool entry is the legal `LIKE ''`.
+    assert!(decode(load_like(EXPR_STR_ILIKE, 0, 0), pool()).is_ok());
+    assert!(decode(load_like(EXPR_STR_LIKE, 0, 0), vec![Vec::new()]).is_ok());
+
+    assert_eq!(
+        decode(load_like(EXPR_STR_LIKE, b'\\' as u32, 9), pool()),
+        Err(ExprValidateErr::ConstIdxOutOfRange { const_idx: 9, n: 1 })
+    );
+    // The escape is one byte, so the half above it must be clear.
+    assert_eq!(
+        decode(load_like(EXPR_STR_LIKE, 0x1_5C, 0), pool()),
+        Err(ExprValidateErr::BadLikeEscape { escape: 0x1_5C })
+    );
+    // The source must be a string register …
+    assert_eq!(
+        decode([EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_STR_LIKE, 1, 0, 0], pool()),
+        Err(ExprValidateErr::RegClassMismatch { reg: 0 })
+    );
+    // … and the destination may not alias it.
+    assert_eq!(
+        LogicalProgram::from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_STR_LIKE, 0, 0, 0], 1, 0, pool()).map(|_| ()),
+        Err(ExprValidateErr::RegisterAliasing { dst: 0, reg: 0 })
+    );
+}
+
+/// A matcher is compiled per instruction, not per pool index: the same pattern
+/// under LIKE and under ILIKE are two different matchers.
+#[test]
+fn two_like_opcodes_over_one_pool_index_get_a_matcher_each() {
+    let schema = schema_pk_strings(1, false);
+    let like = |dst, ci| LogicalInstr::StrLike {
+        dst,
+        src: 0,
+        escape: b'\\' as u32,
+        pat_idx: 0,
+        ci,
+    };
+    let instrs = vec![
+        LogicalInstr::LoadColStr { dst: 0, col: 1 },
+        like(1, false),
+        like(2, true),
+    ];
+    let ev = scalar_prog(&schema, instrs, 3, 1, vec![b"abc".to_vec()]);
+    assert_eq!(ev.prog.like_matchers.len(), 2);
+
+    let rows: Vec<&[&[u8]]> = vec![&[b"ABC"]];
+    let view = make_string_view(&schema, &rows);
+    // Register 1 is the case-sensitive verdict (the program's result); the
+    // ILIKE one is read off the same row through `reg_values`. Captured rather
+    // than asserted inside the callback, which a non-firing morsel loop would
+    // let pass vacuously.
+    assert_eq!(ev.eval_row(&view, 0), (0, false));
+    let mut ci_verdicts: Vec<i64> = Vec::new();
+    ev.eval_morsels(&view, 0, 1, |_, out| ci_verdicts.push(out.reg_values(2)[0]));
+    assert_eq!(ci_verdicts, [1]);
 }
 
 /// `UPPER` of a non-nullable column introduces no NULL, so the `no_nulls` fast

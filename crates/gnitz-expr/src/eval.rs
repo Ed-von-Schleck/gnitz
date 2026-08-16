@@ -106,11 +106,17 @@ impl Evaluator {
         scratch.ensure_capacity(&self.prog, 1);
         eval_batch(&self.prog, mb, row, 1, scratch);
         let r = self.prog.result_reg as usize;
-        let val = read_reg_row0(&self.prog, scratch, r);
         // `ensure_capacity` allocates no `null_bits` under `no_nulls`, so the
         // read must stay behind the guard — an unguarded index hits an empty
         // `Vec`.
         let is_null = !no_nulls && (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
+        // Normalized so a NULL row returns a fixed pair rather than whatever its
+        // kernel left in the register (see `EvalScratch::regs`).
+        let val = if is_null {
+            0
+        } else {
+            read_reg_row0(&self.prog, scratch, r)
+        };
         (val, is_null)
     }
 

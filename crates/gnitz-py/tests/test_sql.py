@@ -354,10 +354,11 @@ class TestSqlSelect:
 
     def test_direct_path_feature_limits_are_not_derivation_errors(self, client):
         """A single-relation read using a feature the direct path cannot express
-        (LIKE / string-function WHERE, an ORDER BY expression) is a feature-named
-        error — never the derivation template. A string HAVING is not one of them:
-        it compiles through the same expression compiler a grouped view's
-        post-reduce FILTER uses, so it is served."""
+        (a LIKE whose pattern is not a literal, an ORDER BY expression) is a
+        feature-named error — never the derivation template. A string HAVING is
+        not one of them: it compiles through the same expression compiler a
+        grouped view's post-reduce FILTER uses, so it is served — and so is a
+        LIKE against a literal pattern."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -366,7 +367,7 @@ class TestSqlSelect:
                 schema_name=sn,
             )
             client.execute_sql("INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b')", schema_name=sn)
-            for sql in ["SELECT pk FROM t WHERE s LIKE 'a%'", "SELECT pk FROM t ORDER BY pk + 1"]:
+            for sql in ["SELECT pk FROM t WHERE s LIKE s", "SELECT pk FROM t ORDER BY pk + 1"]:
                 with pytest.raises(gnitz.GnitzError) as ei:
                     client.execute_sql(sql, schema_name=sn)
                 assert "this query derives a new one" not in str(ei.value), (
@@ -379,6 +380,10 @@ class TestSqlSelect:
             assert res[0]["type"] == "Rows", res[0]
             got = sorted((r.s, r.c) for r in res[0]["rows"])
             assert got == [("a", 1)], f"string HAVING must be served on the direct path, got {got}"
+            # A literal-pattern LIKE contributes no access path, but it is served
+            # as a residual filter.
+            res = client.execute_sql("SELECT pk FROM t WHERE s LIKE 'a%'", schema_name=sn)
+            assert [r.pk for r in res[0]["rows"]] == [1], res[0]
         finally:
             client.drop_schema(sn)
 

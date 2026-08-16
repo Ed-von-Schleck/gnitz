@@ -1009,12 +1009,11 @@ fn is_null_and_is_not_null_are_complementary() {
     }
 }
 
-/// A NULL row keeps whatever bytes its column held, and `Cmp` does not clear
-/// `regs` at null rows — only the two string kernels call `zero_null_rows`. So a
-/// NULL row reaches the 3VL OR carrying a *set* `bool_bits` bit, and the `!na` /
-/// `!nb` masks are the only thing keeping it out of the definite-true term. Here
-/// col1 is NULL on row 0 but holds 10, which satisfies the compare:
-/// `NULL OR FALSE` is NULL, and the filter drops it.
+/// A NULL row keeps whatever bytes its column held, so it reaches the 3VL OR
+/// carrying a *set* `bool_bits` bit, and the `!na` / `!nb` masks are the only
+/// thing keeping it out of the definite-true term. Here col1 is NULL on row 0
+/// but holds 10, which satisfies the compare: `NULL OR FALSE` is NULL, and the
+/// filter drops it.
 #[test]
 fn or_does_not_take_a_null_row_stored_value_as_definite_true() {
     let schema = schema_pk_ints(2, true);

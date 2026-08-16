@@ -371,12 +371,20 @@ fn assert_feature_rejection(client: &mut GnitzClient, sn: &str, sql: &str) -> St
     msg.clone()
 }
 
+/// A LIKE contributes no access path — there is no ordered index over a string
+/// column to seek — so it rides the read as a residual filter and is served. Its
+/// one feature limit is a pattern the binder cannot bake in: a non-literal one.
 #[test]
-fn like_where_is_a_feature_rejection() {
+fn like_where_is_served_and_only_a_computed_pattern_is_rejected() {
     let Some(srv) = ServerHandle::start() else { return };
     let (mut client, sn) = make_planner(&srv);
     seed(&mut client, &sn);
-    assert_feature_rejection(&mut client, &sn, "SELECT id FROM t WHERE s LIKE 'a%'");
+
+    let (s, b) = read_sql(&mut client, &sn, "SELECT id FROM t WHERE s LIKE 'a%'");
+    assert_eq!(col_weights(&s, &b, "id"), vec![(1, 1), (3, 1), (6, 1)]);
+
+    let msg = assert_feature_rejection(&mut client, &sn, "SELECT id FROM t WHERE s LIKE g");
+    assert!(msg.contains("LIKE pattern"), "the rejection must name LIKE, got: {msg}");
 }
 
 #[test]

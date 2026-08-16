@@ -668,6 +668,9 @@ mod tests {
             "FLOOR(EXCLUDED.a)",
             "ABS(EXCLUDED.a)",
             "GREATEST(val, EXCLUDED.a)",
+            // Both of LIKE's bound sub-expressions, which the binder reaches.
+            "EXCLUDED.s LIKE 'a%'",
+            "s ILIKE EXCLUDED.s",
         ] {
             assert!(expr_contains_excluded(&parse(src)), "must detect EXCLUDED in {src}");
         }

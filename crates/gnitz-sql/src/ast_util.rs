@@ -295,6 +295,9 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
             .chain(substring_for.as_deref())
             .collect(),
         Expr::Trim { expr, trim_what, .. } => std::iter::once(expr.as_ref()).chain(trim_what.as_deref()).collect(),
+        // Same for LIKE's pattern. Its `escape_char` is a `Value`, not an `Expr`,
+        // so it contributes nothing.
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => vec![expr, pattern],
         Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
         // CASE operands: the optional operand, every WHEN condition + result, and
         // the optional ELSE — the node set `bind_structural`'s Case arm recurses

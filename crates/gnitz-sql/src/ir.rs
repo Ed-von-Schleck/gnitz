@@ -97,6 +97,17 @@ pub(crate) enum BExpr<R> {
         mode: TrimMode,
         set: String,
     },
+    /// `s [NOT] LIKE/ILIKE 'pattern' [ESCAPE c]`. Like `TrimCall`, one expression
+    /// operand plus compile-time data: the pattern and its escape (`None` =
+    /// escaping disabled) are literals the binder has already checked, which the
+    /// engine tokenizes once per program. `ci` is ILIKE's ASCII-only case
+    /// folding. `NOT LIKE` is the outer `UnaryOp(Not, Like)`.
+    Like {
+        s: Box<BExpr<R>>,
+        pattern: String,
+        escape: Option<u8>,
+        ci: bool,
+    },
     /// `CONCAT(args…)` with PostgreSQL's semantics — a NULL argument is the
     /// empty string, so the result is never NULL. Distinct from `BinOp::Concat`
     /// (`||`), which propagates NULL.
@@ -212,8 +223,9 @@ impl<R> BExpr<R> {
                 _ => TypeCode::I64,
             },
             BExpr::Case { branches, else_ } => Self::case_type(branches, else_.as_deref(), leaf_ty),
-            // The membership test is a boolean, like the comparison `BinOp` arm.
-            BExpr::InList { .. } => TypeCode::I64,
+            // The membership and pattern tests are booleans, like the comparison
+            // `BinOp` arm.
+            BExpr::InList { .. } | BExpr::Like { .. } => TypeCode::I64,
             // Every transform is the identity on an integer register and its own
             // IEEE result on a float one — i.e. the argument's register image.
             // Only a negative ROUND scale forces the f64 lift on an integer.
@@ -332,6 +344,12 @@ impl<R> BExpr<R> {
                 mode: *mode,
                 set: set.clone(),
             },
+            BExpr::Like { s, pattern, escape, ci } => BExpr::Like {
+                s: boxed(s)?,
+                pattern: pattern.clone(),
+                escape: *escape,
+                ci: *ci,
+            },
             BExpr::ConcatN { args } => BExpr::ConcatN { args: all(args)? },
         })
     }
@@ -407,7 +425,7 @@ impl<R> BExpr<R> {
                     l.for_each_ref(f);
                 }
             }
-            BExpr::TrimCall { s, .. } => s.for_each_ref(f),
+            BExpr::TrimCall { s, .. } | BExpr::Like { s, .. } => s.for_each_ref(f),
             BExpr::ConcatN { args } => args.iter().for_each(|a| a.for_each_ref(f)),
         }
     }
