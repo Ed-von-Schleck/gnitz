@@ -151,15 +151,13 @@ mod tests {
         matches!(net.get(&PkTuple::from_u128(8, pk)), Some(Buffered::Deleted))
     }
 
-    fn rows_of(schema: &Schema, b: &ZSetBatch) -> Vec<(u128, i64)> {
-        let stride = schema.pk_stride() as u8;
+    fn rows_of(b: &ZSetBatch) -> Vec<(u128, i64)> {
         let mut out: Vec<(u128, i64)> = (0..b.len())
             .map(|i| {
-                let pk = b.pks.get_tuple(i, stride).split_wire().0;
-                let val = match &b.columns[1] {
-                    ColData::Fixed(buf) => i64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()),
-                    _ => 0,
-                };
+                let pk = b.pks.get(i);
+                let val = b.columns[1]
+                    .cell(i, 8)
+                    .map_or(0, |c| i64::from_le_bytes(c.try_into().unwrap()));
                 (pk, val)
             })
             .collect();
@@ -223,7 +221,7 @@ mod tests {
     #[test]
     fn present_rows_of_an_empty_net_is_empty() {
         let schema = two_col(TypeCode::I64);
-        assert!(rows_of(&schema, &present_rows(&Net::new(), &schema)).is_empty());
+        assert!(rows_of(&present_rows(&Net::new(), &schema)).is_empty());
     }
 
     /// The live half of the net: an override and a transaction-born row are both
@@ -238,7 +236,7 @@ mod tests {
         buf.push(tid, &schema, &batch(&schema, &[(5, 50, 1)])); // transaction-born
 
         let present = present_rows(&net_of(&buf, tid), &schema);
-        assert_eq!(rows_of(&schema, &present), vec![(1, 99), (5, 50)]);
+        assert_eq!(rows_of(&present), vec![(1, 99), (5, 50)]);
     }
 
     #[test]
@@ -257,6 +255,6 @@ mod tests {
             .collect();
         assert_eq!(full.len(), 2);
         assert_eq!(only_1.len(), 1);
-        assert_eq!(rows_of(&schema, &present_rows(&only_1, &schema)), vec![(1, 11)]);
+        assert_eq!(rows_of(&present_rows(&only_1, &schema)), vec![(1, 11)]);
     }
 }

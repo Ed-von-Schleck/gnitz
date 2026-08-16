@@ -174,9 +174,8 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
         .expect("a compound PK-only reply must not be rejected")
         .expect("three rows match");
 
-    let stride = reply_schema.pk_stride() as u8;
     let mut got: Vec<Vec<u8>> = (0..reply.pks.len())
-        .map(|i| reply.pks.get_tuple(i, stride).as_bytes().to_vec())
+        .map(|i| reply.pks.get_tuple(i).as_bytes().to_vec())
         .collect();
     let mut want: Vec<Vec<u8>> = rows[1..]
         .iter()

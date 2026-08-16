@@ -6,7 +6,7 @@
 
 use crate::error::GnitzSqlError;
 use gnitz_core::{Circuit, ColumnDef, GnitzClient, PlannedView, Schema};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Circuit + output columns + pk-list — the pieces every view emitter returns
 /// for a pre-allocated view id; the caller wraps them into a `PlannedView`.
@@ -86,8 +86,8 @@ pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
 
 /// A `Schema` from emitted pieces: the output columns plus the pk-list (the
 /// leading `k` slots, widened from the wire's `u32` indices).
-fn schema_of(cols: &[ColumnDef], pk: &[u32]) -> Rc<Schema> {
-    Rc::new(Schema {
+fn schema_of(cols: &[ColumnDef], pk: &[u32]) -> Arc<Schema> {
+    Arc::new(Schema {
         columns: cols.to_vec(),
         pk_cols: pk.iter().map(|&c| c as usize).collect(),
     })
@@ -134,7 +134,7 @@ impl ViewChain {
         &mut self,
         client: &mut GnitzClient,
         emit: impl FnOnce(&mut GnitzClient, &mut ViewChain, u64) -> Result<(EmitPieces, T), GnitzSqlError>,
-    ) -> Result<(u64, Rc<Schema>, T), GnitzSqlError> {
+    ) -> Result<(u64, Arc<Schema>, T), GnitzSqlError> {
         let vid = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
         let ((circuit, cols, pk), extra) = emit(client, self, vid)?;
         debug_assert_exchange_topology(&circuit);

@@ -7,21 +7,6 @@ use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
-/// `&str` / `String` convenience wrappers over the wire German-string codec,
-/// used only by the round-trip tests (production STRING cells are built by
-/// `regions.rs` and read back by `decode_german_col`).
-#[cfg(test)]
-fn encode_german_str(s: &str, blob: &mut Vec<u8>) -> [u8; 16] {
-    gnitz_wire::encode_german_string(s.as_bytes(), blob)
-}
-
-#[cfg(test)]
-fn decode_german_str(st: [u8; 16], blob: &[u8]) -> Result<String, ProtocolError> {
-    let bytes = gnitz_wire::try_decode_german_string(&st, blob)
-        .ok_or_else(|| ProtocolError::DecodeError("German String blob arena out of bounds".into()))?;
-    String::from_utf8(bytes).map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {e}")))
-}
-
 /// Decode a STRING/BLOB column region into per-row raw-byte cells: `None` for
 /// a null row, else the German string resolved against `blob`. Shared by the
 /// STRING and BLOB decode arms (STRING then UTF-8-validates each cell).
@@ -55,7 +40,7 @@ fn decode_german_col(
 // ── Region read helpers ───────────────────────────────────────────────────────
 
 /// Read a region of 64-bit values (u64 or i64) via bulk memcpy. Correct on little-endian.
-fn read_64bit_region<T: Copy + Default>(
+fn read_64bit_region<T: Copy>(
     data: &[u8],
     off: usize,
     sz: usize,
@@ -70,11 +55,13 @@ fn read_64bit_region<T: Copy + Default>(
         )));
     }
     let src = &data[off..off + expected];
-    let mut v: Vec<T> = vec![T::default(); count];
+    let mut v: Vec<T> = Vec::with_capacity(count);
     // SAFETY: src is `expected` bytes (bounds-checked above); v has room for
-    // `count` Ts = `expected` bytes.  Both are valid, non-overlapping regions.
+    // `count` Ts = `expected` bytes. Both are valid, non-overlapping regions,
+    // and the copy initializes every element `set_len` then publishes.
     unsafe {
         std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr() as *mut u8, expected);
+        v.set_len(count);
     }
     Ok(v)
 }
@@ -259,10 +246,7 @@ fn decode_wal_block_impl(
 mod tests {
     use super::*;
     use crate::protocol::types::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
-    use gnitz_wire::{
-        WAL_FORMAT_VERSION, WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT,
-        WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
-    };
+    use gnitz_wire::{WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE, WAL_OFF_VERSION};
 
     /// Return the `(offset, size)` of a region from a block's directory.
     fn get_region_offset_size(block: &[u8], region_idx: usize) -> (usize, usize) {
@@ -315,105 +299,32 @@ mod tests {
         }
     }
 
-    // ── Header roundtrip ───────────────────────────────────────────────────
-
+    /// A German cell whose blob offset overruns the arena must surface as a
+    /// `DecodeError` from the production decode path, not a panic. The German
+    /// codec itself is covered in `gnitz-wire`; what this pins is the client's
+    /// mapping of its `None` onto a protocol error.
     #[test]
-    fn test_header_roundtrip() {
-        let mut buf = [0u8; WAL_BLOCK_HEADER_SIZE];
-        buf[WAL_OFF_TID..WAL_OFF_TID + 4].copy_from_slice(&456u32.to_le_bytes());
-        buf[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].copy_from_slice(&10u32.to_le_bytes());
-        buf[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].copy_from_slice(&200u32.to_le_bytes());
-        buf[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
-        buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].copy_from_slice(&789u64.to_le_bytes());
-        buf[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].copy_from_slice(&5u32.to_le_bytes());
-
-        assert_eq!(
-            u32::from_le_bytes(buf[WAL_OFF_TID..WAL_OFF_TID + 4].try_into().unwrap()),
-            456
-        );
-        assert_eq!(
-            u32::from_le_bytes(buf[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].try_into().unwrap()),
-            10
-        );
-        assert_eq!(
-            u32::from_le_bytes(buf[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()),
-            200
-        );
-        assert_eq!(
-            u32::from_le_bytes(buf[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].try_into().unwrap()),
-            WAL_FORMAT_VERSION
-        );
-        assert_eq!(
-            u64::from_le_bytes(buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].try_into().unwrap()),
-            789
-        );
-        assert_eq!(
-            u32::from_le_bytes(buf[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].try_into().unwrap()),
-            5
-        );
+    fn a_string_cell_pointing_past_the_blob_is_a_decode_error() {
+        let schema = str_schema();
+        let batch = ZSetBatch {
+            pks: PkColumn::from_u128s(8, [1u128]),
+            weights: vec![1],
+            nulls: vec![0],
+            columns: vec![
+                ColData::Fixed(vec![]),
+                ColData::Strings(vec![Some("a value well past the inline cell".into())]),
+            ],
+        };
+        let mut block = encode_wal_block(&schema, 7, &batch);
+        // The lone payload region holds one 16-byte German cell; its bytes
+        // 8..16 are the blob offset. Push it past the arena.
+        let (off, _) = get_region_offset_size(&block, gnitz_wire::REG_PAYLOAD_START);
+        block[off + 8..off + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_wal_block(&block, &schema),
+            Err(ProtocolError::DecodeError(_))
+        ));
     }
-
-    // ── German String ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_german_string_short() {
-        for s in &["", "a", "abcd", "abcdefghijkl"] {
-            let mut blob = Vec::new();
-            let st = encode_german_str(s, &mut blob);
-            assert!(blob.is_empty(), "short string '{s}' should not use blob");
-            let decoded = decode_german_str(st, &[]).unwrap();
-            assert_eq!(&decoded, s, "roundtrip failed for '{s}'");
-        }
-    }
-
-    #[test]
-    fn test_german_string_long() {
-        for s in &["abcdefghijklm", "hello world 12345", "a".repeat(100).as_str()] {
-            let mut blob = Vec::new();
-            let st = encode_german_str(s, &mut blob);
-            assert!(!blob.is_empty(), "long string should use blob");
-            let decoded = decode_german_str(st, &blob).unwrap();
-            assert_eq!(&decoded, s, "roundtrip failed for long string");
-        }
-    }
-
-    #[test]
-    fn test_german_string_boundary() {
-        // length=12 → inline (SHORT_STRING_THRESHOLD)
-        let s12 = "123456789012";
-        assert_eq!(s12.len(), 12);
-        let mut blob12 = Vec::new();
-        let st12 = encode_german_str(s12, &mut blob12);
-        assert!(blob12.is_empty());
-        assert_eq!(decode_german_str(st12, &[]).unwrap(), s12);
-
-        // length=13 → blob
-        let s13 = "1234567890123";
-        assert_eq!(s13.len(), 13);
-        let mut blob13 = Vec::new();
-        let st13 = encode_german_str(s13, &mut blob13);
-        assert_eq!(blob13.len(), 13);
-        assert_eq!(decode_german_str(st13, &blob13).unwrap(), s13);
-    }
-
-    #[test]
-    fn test_german_string_out_of_bounds_offset_errors() {
-        // A long-string struct (len > 12) whose blob offset overruns the arena must
-        // decode to a DecodeError, not panic: the offset bounds check now lives
-        // entirely in the wire `try_decode_german_string`. Match the variant, not
-        // the message text.
-        let mut st = [0u8; 16];
-        st[0..4].copy_from_slice(&100u32.to_le_bytes()); // len = 100 (> 12 → reads blob)
-        st[8..16].copy_from_slice(&0u64.to_le_bytes()); // offset 0
-        let blob = vec![0u8; 50]; // shorter than len → out of bounds
-        let result = decode_german_str(st, &blob);
-        assert!(
-            matches!(result, Err(ProtocolError::DecodeError(_))),
-            "out-of-bounds long-string offset must return DecodeError, got {result:?}"
-        );
-    }
-
-    // ── encode/decode roundtrips ──────────────────────────────────────────
 
     #[test]
     fn test_encode_decode_fixed() {

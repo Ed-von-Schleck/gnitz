@@ -18,6 +18,7 @@ use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, Ident, ObjectName, RenameTableNameKind,
     TableConstraint,
 };
+use std::sync::Arc;
 
 pub(crate) fn execute_alter_table(
     client: &mut GnitzClient,
@@ -444,7 +445,7 @@ fn resolve_alter_base_table_with_schema(
     source_name: &str,
     if_exists: bool,
     op: &str,
-) -> Result<Option<(u64, gnitz_core::Schema)>, GnitzSqlError> {
+) -> Result<Option<(u64, Arc<gnitz_core::Schema>)>, GnitzSqlError> {
     if !alter_base_table_exists(client, schema_name, source_name, if_exists, op)? {
         return Ok(None);
     }

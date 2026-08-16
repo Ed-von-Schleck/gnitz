@@ -8,7 +8,7 @@ mod common;
 use common::*;
 
 /// Resolve the table just created and return its server-side schema.
-fn schema_after_create(client: &mut GnitzClient, sn: &str, table: &str) -> gnitz_core::Schema {
+fn schema_after_create(client: &mut GnitzClient, sn: &str, table: &str) -> std::sync::Arc<gnitz_core::Schema> {
     let (_, schema) = client.resolve_table_id(sn, table).unwrap();
     schema
 }

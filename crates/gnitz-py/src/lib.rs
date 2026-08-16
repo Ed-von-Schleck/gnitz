@@ -1756,7 +1756,7 @@ impl PyGnitzClient {
     /// resolve_table(schema_name, table_name) -> (tid: int, schema: Schema)
     pub fn resolve_table(&mut self, py: Python<'_>, schema_name: &str, table_name: &str) -> PyResult<Py<PyAny>> {
         let (tid, schema) = self.call(py, |c| c.resolve_table_or_view_id(schema_name, table_name))?;
-        let py_schema = rust_schema_to_py(py, &Arc::new(schema))?.into_any();
+        let py_schema = rust_schema_to_py(py, &schema)?.into_any();
         let tid_obj = tid.into_pyobject(py)?.into_any().unbind();
         Ok(PyTuple::new(py, [tid_obj, py_schema])?.into_any().unbind())
     }

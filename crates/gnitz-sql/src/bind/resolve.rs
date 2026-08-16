@@ -3,7 +3,7 @@ use crate::error::GnitzSqlError;
 use gnitz_core::{ColumnDef, GnitzClient, Schema};
 use sqlparser::ast::{Expr, Select, SelectItem, TableAliasColumnDef};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Find the column named `col_name` in `columns`, case-insensitively.
 ///
@@ -68,13 +68,13 @@ pub(crate) enum RelationKind {
 /// segment) atomically replaces id and provenance together.
 struct CachedRelation {
     table_id: u64,
-    schema: Rc<Schema>,
+    schema: Arc<Schema>,
     catalog_kind: Option<RelationKind>,
 }
 
 /// A resolved relation: its id, its schema, and `None` if the id was chain-minted
 /// rather than catalog-issued.
-pub(crate) type Resolved = (u64, Rc<Schema>, Option<RelationKind>);
+pub(crate) type Resolved = (u64, Arc<Schema>, Option<RelationKind>);
 
 pub(crate) struct Binder<'a> {
     schema_name: &'a str,
@@ -93,7 +93,7 @@ impl<'a> Binder<'a> {
     /// form — the single fold site, so a case-varying reference (`WITH Cc … FROM
     /// cc`) hits regardless of which caller inserted (SQL identifiers are
     /// case-insensitive).
-    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Rc<Schema>, catalog_kind: Option<RelationKind>) {
+    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Arc<Schema>, catalog_kind: Option<RelationKind>) {
         self.cache.insert(
             name.to_ascii_lowercase(),
             CachedRelation {
@@ -111,7 +111,7 @@ impl<'a> Binder<'a> {
         // Probe with the canonical key — the cache holds base-table resolutions
         // *and* CTE/derived-table aliases (which never reach the catalog).
         if let Some(entry) = self.cache.get(&name.to_ascii_lowercase()) {
-            return Ok((entry.table_id, Rc::clone(&entry.schema), entry.catalog_kind));
+            return Ok((entry.table_id, Arc::clone(&entry.schema), entry.catalog_kind));
         }
         // Referenced relations obey the same reserved-prefix rule as created
         // ones: a fresh catalog probe of a leading-`_` name can only be a user
@@ -129,9 +129,8 @@ impl<'a> Binder<'a> {
         } else {
             RelationKind::Table
         });
-        let rc = Rc::new(schema);
-        self.cache_relation(name, tid, Rc::clone(&rc), kind);
-        Ok((tid, rc, kind))
+        self.cache_relation(name, tid, Arc::clone(&schema), kind);
+        Ok((tid, schema, kind))
     }
 
     /// Resolve a write/index target that must be a base table. INSERT, UPDATE,
@@ -144,7 +143,7 @@ impl<'a> Binder<'a> {
         &mut self,
         client: &mut GnitzClient,
         name: &str,
-    ) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
+    ) -> Result<(u64, Arc<Schema>), GnitzSqlError> {
         // Same reserved-prefix rule as the read funnel: a write/index target
         // naming a leading-`_` relation can only be a user reaching for system
         // plumbing (a hidden segment). Rejecting here — before the catalog probe —
@@ -163,9 +162,8 @@ impl<'a> Binder<'a> {
                  require a base table"
             )));
         }
-        let rc = Rc::new(schema);
-        self.cache_relation(name, tid, Rc::clone(&rc), Some(RelationKind::Table));
-        Ok((tid, rc))
+        self.cache_relation(name, tid, Arc::clone(&schema), Some(RelationKind::Table));
+        Ok((tid, schema))
     }
 
     /// Cache a CTE / derived-table alias as resolving to the given
@@ -267,7 +265,7 @@ pub(crate) fn cte_passthrough(
     let cte_schema = if !column_aliases.is_empty() {
         let mut s = (*cte_schema).clone();
         apply_positional_aliases(column_aliases, s.columns.iter_mut().collect(), "CTE")?;
-        Rc::new(s)
+        Arc::new(s)
     } else {
         cte_schema
     };
@@ -289,16 +287,16 @@ mod tests {
     /// catalog-issued would bound a scan against a foreign table's index columns.
     #[test]
     fn catalog_provenance_tracks_the_cache_alias_kind() {
-        let schema = std::rc::Rc::new(Schema {
+        let schema = Arc::new(Schema {
             columns: vec![col("a", TypeCode::U64)],
             pk_cols: vec![0],
         });
         let kind = |b: &Binder<'_>, n: &str| b.cache.get(&n.to_ascii_lowercase()).map(|e| e.catalog_kind);
         let mut b = Binder::new("public");
-        b.cache_alias("minted", (1, Rc::clone(&schema), None)).unwrap();
-        b.cache_alias("real", (16, Rc::clone(&schema), Some(RelationKind::Table)))
+        b.cache_alias("minted", (1, Arc::clone(&schema), None)).unwrap();
+        b.cache_alias("real", (16, Arc::clone(&schema), Some(RelationKind::Table)))
             .unwrap();
-        b.cache_alias("aview", (17, Rc::clone(&schema), Some(RelationKind::View)))
+        b.cache_alias("aview", (17, Arc::clone(&schema), Some(RelationKind::View)))
             .unwrap();
 
         assert_eq!(
@@ -317,7 +315,7 @@ mod tests {
         // the provenance with it — `FROM (SELECT * FROM t) t` re-caches `t` as a
         // chain-minted segment, and a stale `Some(_)` here would probe a foreign
         // table's indexes for the segment's bound.
-        b.cache_alias("real", (2, Rc::clone(&schema), None)).unwrap();
+        b.cache_alias("real", (2, Arc::clone(&schema), None)).unwrap();
         assert_eq!(
             kind(&b, "real"),
             Some(None),

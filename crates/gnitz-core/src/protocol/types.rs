@@ -1,7 +1,7 @@
 use super::error::ProtocolError;
 
 pub use gnitz_wire::{FixedInt, ReduceOutKey, TypeCode};
-pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS};
+pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
 
 /// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
 /// Use at wire/network boundaries; internal data should use `TypeCode::from_validated_u8`.
@@ -108,23 +108,6 @@ pub struct Schema {
     pub columns: Vec<ColumnDef>,
     /// PK column indices in compound-key order; length >= 1.
     pub pk_cols: Vec<usize>,
-}
-
-/// The client's rendering of a [`gnitz_wire::PkRule`]. The rule set itself lives
-/// in `gnitz-wire` and is shared with the SQL planner and the engine catalog;
-/// only the wording is per-layer. The client's is a `&'static str` so its DDL
-/// gateways and the C ABI stay allocation-free on the error path.
-fn pk_rule_message(rule: gnitz_wire::PkRule) -> &'static str {
-    use gnitz_wire::PkRule;
-    match rule {
-        PkRule::Empty => "pk_cols must not be empty",
-        PkRule::TooManyColumns { .. } => "pk_cols exceeds PK_LIST_MAX_COLS",
-        PkRule::IndexOutOfRange { .. } => "pk_cols index out of range",
-        PkRule::Duplicate { .. } => "pk_cols contains duplicates",
-        PkRule::Nullable { .. } => "PK column must be non-nullable",
-        PkRule::NotEligible { .. } => "PK column type not PK-eligible",
-        PkRule::StrideOutOfRange { .. } => "PK total stride exceeds MAX_PK_BYTES",
-    }
 }
 
 impl Schema {
@@ -297,9 +280,9 @@ impl Schema {
     /// `MAX_PK_COLUMNS`: these surfaces never build the engine-internal
     /// secondary-index schema that uses the extra `MAX_PK_COLUMNS` slot, so a
     /// PK they accept must round-trip through the codec.
-    pub fn validate_pk_cols(pk_cols: &[usize], ncols: usize) -> Result<(), &'static str> {
+    pub fn validate_pk_cols(pk_cols: &[usize], ncols: usize) -> Result<(), String> {
         let idx: Vec<u32> = pk_cols.iter().map(|&c| c.min(u32::MAX as usize) as u32).collect();
-        gnitz_wire::validate_pk_indices(&idx, ncols).map_err(pk_rule_message)
+        gnitz_wire::validate_pk_indices(&idx, ncols).map_err(|r| r.to_string())
     }
 
     /// The single definition of "these parts form an admissible schema": the
@@ -311,9 +294,9 @@ impl Schema {
     /// [`Schema::from_parts`], the client's `create_table` / `create_view_chain`
     /// DDL gateways, and capi's `gnitz_batch_new`, so a malformed spec is a
     /// clean client error rather than a server-side assert.
-    pub fn validate_parts(pk_cols: &[usize], columns: &[ColumnDef]) -> Result<(), &'static str> {
+    pub fn validate_parts(pk_cols: &[usize], columns: &[ColumnDef]) -> Result<(), String> {
         if columns.len() > MAX_COLUMNS {
-            return Err("column count exceeds MAX_COLUMNS");
+            return Err("column count exceeds MAX_COLUMNS".into());
         }
         Self::validate_pk_cols(pk_cols, columns.len())?;
         let idx: Vec<u32> = pk_cols.iter().map(|&c| c as u32).collect();
@@ -322,13 +305,13 @@ impl Schema {
             (cd.type_code as u8, cd.is_nullable)
         })
         .map(|_stride| ())
-        .map_err(pk_rule_message)
+        .map_err(|r| r.to_string())
     }
 
     /// Fallible constructor for a schema assembled from untrusted parts — a
     /// wire schema block or catalog rows. Runs [`Schema::validate_parts`],
     /// so every decode boundary applies the same rule set.
-    pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: Vec<usize>) -> Result<Schema, &'static str> {
+    pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: Vec<usize>) -> Result<Schema, String> {
         Self::validate_parts(&pk_cols, &columns)?;
         Ok(Schema { columns, pk_cols })
     }
@@ -455,10 +438,7 @@ impl PkColumn {
     /// meaningful for a key that fits in 16 bytes; a wider compound key has no
     /// scalar projection and callers read [`Self::get_bytes`] instead.
     pub fn get(&self, i: usize) -> u128 {
-        let mut b = [0u8; 16];
-        let s = self.width().min(16);
-        b[..s].copy_from_slice(&self.buf[i * self.width()..i * self.width() + s]);
-        u128::from_le_bytes(b)
+        low16_le(self.get_bytes(i))
     }
 
     /// Append one raw PK tuple, already in on-wire LE layout.
@@ -482,21 +462,14 @@ impl PkColumn {
         self.buf.extend_from_slice(&pk.to_le_bytes()[..s]);
     }
 
-    pub fn clear(&mut self) {
-        self.buf.clear();
-    }
-
     pub fn truncate(&mut self, len: usize) {
         self.buf.truncate(len * self.width());
     }
 
-    /// Read row `i` into a `PkTuple`.
-    pub fn get_tuple(&self, i: usize, stride: u8) -> PkTuple {
-        debug_assert_eq!(stride, self.stride);
-        let mut t = PkTuple::new(stride);
-        let s = self.width();
-        t.buf[..s].copy_from_slice(&self.buf[i * s..(i + 1) * s]);
-        t
+    /// Read row `i` into a `PkTuple`. The tuple's stride is this column's, so
+    /// it cannot disagree with the bytes it carries.
+    pub fn get_tuple(&self, i: usize) -> PkTuple {
+        PkTuple::from_bytes(self.get_bytes(i))
     }
 
     /// Append the row at `src[i]` to `self`. Strides must match.
@@ -604,14 +577,20 @@ impl PkTuple {
     /// For narrow PKs (stride ≤ 16) `extra` is empty and the frame is byte-
     /// identical to the pre-compound-PK path.
     pub fn split_wire(&self) -> (u128, &[u8]) {
-        let stride = self.stride as usize;
-        let n = stride.min(16);
-        let mut lo = [0u8; 16];
-        lo[..n].copy_from_slice(&self.buf[..n]);
-        let low_16 = u128::from_le_bytes(lo);
-        let extra: &[u8] = if stride > 16 { &self.buf[16..stride] } else { &[] };
-        (low_16, extra)
+        let bytes = self.as_bytes();
+        let extra: &[u8] = if bytes.len() > 16 { &bytes[16..] } else { &[] };
+        (low16_le(bytes), extra)
     }
+}
+
+/// A packed PK's low 16 bytes as a u128 — the scalar projection both
+/// [`PkColumn::get`] and [`PkTuple::split_wire`] hand out. A key wider than 16
+/// bytes has no scalar form; its remaining bytes travel separately.
+fn low16_le(key: &[u8]) -> u128 {
+    let n = key.len().min(16);
+    let mut b = [0u8; 16];
+    b[..n].copy_from_slice(&key[..n]);
+    u128::from_le_bytes(b)
 }
 
 impl PartialEq for PkTuple {
@@ -657,11 +636,9 @@ impl ColData {
     /// mismatch is a construction bug, not a runtime condition. `fixed_stride`
     /// is the per-element byte width, used only by the `Fixed` variant.
     ///
-    /// Matching on `self` (rather than the `(self, dst)` pair under a `_`
-    /// wildcard) makes the compiler force every variant to be handled here:
-    /// adding a new `ColData` variant fails to compile until this copy path
-    /// covers it, instead of silently falling into a runtime panic — which is
-    /// exactly how the `Bytes` variant was once left uncopied.
+    /// Matching on `self` alone (rather than the `(self, dst)` pair under a `_`
+    /// wildcard) makes a new `ColData` variant a compile error here rather than
+    /// a runtime panic.
     pub fn push_row_from(&self, idx: usize, fixed_stride: usize, dst: &mut ColData) {
         match self {
             ColData::Fixed(s) => {
@@ -695,6 +672,25 @@ impl ColData {
                 d.push(s[idx].take());
             }
             ColData::Fixed(_) => self.push_row_from(idx, fixed_stride, dst),
+        }
+    }
+
+    /// The wire cell at `row` of a fixed-width column: exactly `stride` bytes.
+    /// `None` if the row is past the end or this is not a `Fixed` column —
+    /// callers decide whether that is an error, a panic, or a fallback.
+    pub fn cell(&self, row: usize, stride: usize) -> Option<&[u8]> {
+        match self {
+            ColData::Fixed(b) => b.get(row * stride..(row + 1) * stride),
+            _ => None,
+        }
+    }
+
+    /// Reserve room for `n` more cells of wire type `tc`.
+    pub fn reserve(&mut self, tc: TypeCode, n: usize) {
+        match self {
+            ColData::Fixed(v) => v.reserve(n * tc.wire_stride()),
+            ColData::Strings(v) => v.reserve(n),
+            ColData::Bytes(v) => v.reserve(n),
         }
     }
 
@@ -795,6 +791,7 @@ impl ZSetBatch {
                     ColData::Fixed(vec![])
                 } else {
                     let mut cd = ColData::empty_for(col.type_code);
+                    cd.reserve(col.type_code, count);
                     for _ in 0..count {
                         cd.push_filler(col.type_code);
                     }
@@ -814,11 +811,7 @@ impl ZSetBatch {
         b.weights.reserve(n);
         b.nulls.reserve(n);
         for (_pi, ci, col) in schema.payload_columns() {
-            match &mut b.columns[ci] {
-                ColData::Fixed(v) => v.reserve(n * col.type_code.wire_stride()),
-                ColData::Strings(v) => v.reserve(n),
-                ColData::Bytes(v) => v.reserve(n),
-            }
+            b.columns[ci].reserve(col.type_code, n);
         }
         b
     }
@@ -902,6 +895,37 @@ impl ZSetBatch {
         }
     }
 
+    /// Every payload column carries the variant its declared type calls for, at
+    /// the row count `self.len()` implies. Split out of [`Self::validate`]
+    /// because the region builder needs the same rule for a batch that never
+    /// went through the push path.
+    ///
+    /// The variant is decided by the *declared* type, never by the one found: a
+    /// String-typed column carrying `Fixed` has a valid `n * 16` byte length, so
+    /// the length check cannot see it — and it would reach the expression
+    /// kernels as German cells with arbitrary heap offsets.
+    pub fn check_columns(&self, schema: &Schema) -> Result<(), std::string::String> {
+        let n = self.len();
+        for (_pi, ci, col_def) in schema.payload_columns() {
+            let col = &self.columns[ci];
+            if !col.matches_type(col_def.type_code) {
+                return Err(format!(
+                    "column {ci}: ColData variant contradicts schema type {:?}",
+                    col_def.type_code
+                ));
+            }
+            let (got, want) = match col {
+                ColData::Fixed(b) => (b.len(), n * col_def.type_code.wire_stride()),
+                ColData::Strings(v) => (v.len(), n),
+                ColData::Bytes(v) => (v.len(), n),
+            };
+            if got != want {
+                return Err(format!("column {ci}: length {got} != expected {want}"));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate that all vectors are consistently sized for the given schema.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
         // The PK buffer's own shape, checked before `len()` divides by the
@@ -938,28 +962,7 @@ impl ZSetBatch {
                 schema.num_columns()
             ));
         }
-        for (_pi, ci, col_def) in schema.payload_columns() {
-            let col = &self.columns[ci];
-            // The variant is decided by the *declared* type, never by the one
-            // found: a String-typed column carrying `Fixed` has a valid `n * 16`
-            // byte length, so the size check below cannot see it — and it would
-            // reach the expression kernels as German cells with arbitrary heap
-            // offsets.
-            if !col.matches_type(col_def.type_code) {
-                return Err(format!(
-                    "column {ci}: ColData variant contradicts schema type {:?}",
-                    col_def.type_code
-                ));
-            }
-            let (got, want) = match col {
-                ColData::Fixed(b) => (b.len(), n * col_def.type_code.wire_stride()),
-                ColData::Strings(v) => (v.len(), n),
-                ColData::Bytes(v) => (v.len(), n),
-            };
-            if got != want {
-                return Err(format!("column {ci}: length {got} != expected {want}"));
-            }
-        }
+        self.check_columns(schema)?;
         // A null bit on a NOT NULL payload column would make FK/unique validation
         // skip the value (treating it as absent) while consolidation and decoders
         // read the raw bytes as live data — an inconsistency the schema forbids.
@@ -1052,43 +1055,45 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
-    /// Append a u64 value to the next Fixed column.
-    pub fn u64_val(&mut self, v: u64) -> &mut Self {
+    /// Append one fixed-width cell to the next column: `bytes` is the column's
+    /// whole wire region entry, so its length must be the declared stride —
+    /// otherwise the region ends up the wrong size and every later row reads at
+    /// the wrong offset.
+    fn fixed_val(&mut self, bytes: &[u8]) -> &mut Self {
         let ci = self.col_index();
+        let tc = self.schema.columns[ci].type_code;
         match &mut self.batch.columns[ci] {
-            ColData::Fixed(buf) => buf.extend_from_slice(&v.to_le_bytes()),
-            _ => panic!("BatchAppender: u64_val called on non-Fixed column at schema index {ci}"),
+            ColData::Fixed(buf) => {
+                assert_eq!(
+                    bytes.len(),
+                    tc.wire_stride(),
+                    "BatchAppender: {tc:?} column at schema index {ci} takes {} bytes",
+                    tc.wire_stride(),
+                );
+                buf.extend_from_slice(bytes);
+            }
+            _ => panic!("BatchAppender: fixed value written to {tc:?} column at schema index {ci}"),
         }
         self.cursor += 1;
         self
     }
 
-    /// Append a SQL NULL to the next Fixed (U64) column: writes a zero filler and
-    /// marks the column NULL in the row bitmap. The Fixed-column sibling of
-    /// `str_null`/`bytes_null` — self-sufficient, so a nullable U64 needs no
-    /// out-of-band `null_mask` call.
-    pub fn u64_null(&mut self) -> &mut Self {
-        let ci = self.col_index();
-        match &mut self.batch.columns[ci] {
-            ColData::Fixed(buf) => buf.extend_from_slice(&0u64.to_le_bytes()),
-            _ => panic!("BatchAppender: u64_null called on non-Fixed column at schema index {ci}"),
-        }
-        self.mark_current_null(ci);
-        self.cursor += 1;
-        self
+    /// Append a u64 value to the next Fixed column.
+    pub fn u64_val(&mut self, v: u64) -> &mut Self {
+        self.fixed_val(&v.to_le_bytes())
     }
 
     /// Append an i64 value to the next Fixed column. Same eight bytes as
     /// [`Self::u64_val`]; the separate name keeps a signed column's writer
     /// honest at the call site.
     pub fn i64_val(&mut self, v: i64) -> &mut Self {
-        let ci = self.col_index();
-        match &mut self.batch.columns[ci] {
-            ColData::Fixed(buf) => buf.extend_from_slice(&v.to_le_bytes()),
-            _ => panic!("BatchAppender: i64_val called on non-Fixed column at schema index {ci}"),
-        }
-        self.cursor += 1;
-        self
+        self.fixed_val(&v.to_le_bytes())
+    }
+
+    /// Append a u128 value to the next Fixed column: its 16 native LE bytes,
+    /// which are the column's wire region (U128/UUID/I128).
+    pub fn u128_val(&mut self, v: u128) -> &mut Self {
+        self.fixed_val(&v.to_le_bytes())
     }
 
     /// Append a string value to the next Strings column.
@@ -1098,33 +1103,6 @@ impl<'a> BatchAppender<'a> {
             ColData::Strings(v) => v.push(Some(s.to_string())),
             _ => panic!("BatchAppender: str_val called on non-Strings column at schema index {ci}"),
         }
-        self.cursor += 1;
-        self
-    }
-
-    /// Mark column `ci` NULL in the current row's null bitmap. The read side
-    /// (the expression evaluator, the WAL encoder) gates on `nulls[row] & (1 << payload_idx)`
-    /// and consults the `Option` only when that bit is clear, so a pushed `None`
-    /// and the bitmap must agree. Setting the bit here makes `str_null`/`bytes_null`
-    /// self-sufficient — no out-of-band `null_mask` call required.
-    fn mark_current_null(&mut self, ci: usize) {
-        let pi = self.schema.payload_idx(ci);
-        let word = self
-            .batch
-            .nulls
-            .last_mut()
-            .expect("BatchAppender: mark_current_null called before add_row");
-        null_word_set(word, pi, true);
-    }
-
-    /// Append a SQL NULL to the next Strings column.
-    pub fn str_null(&mut self) -> &mut Self {
-        let ci = self.col_index();
-        match &mut self.batch.columns[ci] {
-            ColData::Strings(v) => v.push(None),
-            _ => panic!("BatchAppender: str_null called on non-Strings column at schema index {ci}"),
-        }
-        self.mark_current_null(ci);
         self.cursor += 1;
         self
     }
@@ -1140,26 +1118,23 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
-    /// Append a SQL NULL to the next Bytes (BLOB) column.
-    pub fn bytes_null(&mut self) -> &mut Self {
+    /// Append a SQL NULL to the next column, whatever its type: the variant's
+    /// null cell plus the row bitmap bit. Self-sufficient — no out-of-band
+    /// `null_mask` call.
+    ///
+    /// The read side (the expression evaluator, the WAL encoder) gates on
+    /// `nulls[row] & (1 << payload_idx)` and consults the `Option` only when that
+    /// bit is clear, so the pushed cell and the bitmap must agree.
+    pub fn null(&mut self) -> &mut Self {
         let ci = self.col_index();
-        match &mut self.batch.columns[ci] {
-            ColData::Bytes(v) => v.push(None),
-            _ => panic!("BatchAppender: bytes_null called on non-Bytes column at schema index {ci}"),
-        }
-        self.mark_current_null(ci);
-        self.cursor += 1;
-        self
-    }
-
-    /// Append a u128 value to the next Fixed column: its 16 native LE bytes,
-    /// which are the column's wire region (U128/UUID/I128).
-    pub fn u128_val(&mut self, v: u128) -> &mut Self {
-        let ci = self.col_index();
-        match &mut self.batch.columns[ci] {
-            ColData::Fixed(buf) => buf.extend_from_slice(&v.to_le_bytes()),
-            _ => panic!("BatchAppender: u128_val called on non-Fixed column at schema index {ci}"),
-        }
+        self.batch.columns[ci].push_null(self.schema.columns[ci].type_code);
+        let pi = self.schema.payload_idx(ci);
+        let word = self
+            .batch
+            .nulls
+            .last_mut()
+            .expect("BatchAppender: null called before add_row");
+        null_word_set(word, pi, true);
         self.cursor += 1;
         self
     }
@@ -1215,39 +1190,27 @@ mod tests {
         assert!(Schema::validate_parts(&[0], &cols).is_ok());
         assert!(Schema::validate_parts(&[0, 1], &cols).is_ok());
 
-        // Structural rejects: empty, over-long, out-of-range, duplicate.
-        assert_eq!(Schema::validate_parts(&[], &cols), Err("pk_cols must not be empty"));
-        assert_eq!(
-            Schema::validate_parts(&[0, 1, 0, 1, 0], &cols),
-            Err("pk_cols exceeds PK_LIST_MAX_COLS")
-        );
-        assert_eq!(Schema::validate_parts(&[9], &cols), Err("pk_cols index out of range"));
-        assert_eq!(
-            Schema::validate_parts(&[0, 0], &cols),
-            Err("pk_cols contains duplicates")
-        );
-
-        // Per-column rejects: nullable and PK-ineligible (String/float).
-        assert_eq!(
-            Schema::validate_parts(&[3], &cols),
-            Err("PK column must be non-nullable")
-        );
-        assert_eq!(
-            Schema::validate_parts(&[2], &cols),
-            Err("PK column type not PK-eligible")
-        );
-        assert_eq!(
-            Schema::validate_parts(&[4], &cols),
-            Err("PK column type not PK-eligible")
-        );
+        // Each rule rejects, and names itself. The wording is `PkRule`'s.
+        for (pk, want) in [
+            (&[][..], "at least one column"),             // empty
+            (&[0, 1, 0, 1, 0][..], "out of range 1..=4"), // over-long
+            (&[9][..], "index 9 out of bounds"),          // out of range
+            (&[0, 0][..], "column 0 twice"),              // duplicate
+            (&[3][..], "must not be nullable"),           // nullable column
+            (&[2][..], "only fixed-width integer"),       // STRING is ineligible
+            (&[4][..], "only fixed-width integer"),       // F64 is ineligible
+        ] {
+            let got = Schema::validate_parts(pk, &cols).unwrap_err();
+            assert!(got.contains(want), "pk {pk:?}: {got:?} does not mention {want:?}");
+        }
 
         // Column-count cap: the null bitmap is one u64, so > MAX_COLUMNS rejects.
         let wide: Vec<ColumnDef> = (0..=MAX_COLUMNS)
             .map(|i| ColumnDef::new(format!("c{i}"), TypeCode::U64, i > 0))
             .collect();
         assert_eq!(
-            Schema::validate_parts(&[0], &wide),
-            Err("column count exceeds MAX_COLUMNS")
+            Schema::validate_parts(&[0], &wide).unwrap_err(),
+            "column count exceeds MAX_COLUMNS"
         );
         assert!(Schema::validate_parts(&[0], &wide[..MAX_COLUMNS]).is_ok());
     }
@@ -1501,7 +1464,7 @@ mod tests {
             let mut a = BatchAppender::new(&mut batch, &schema);
             a.add_row(1u128, 1).i64_val(10).str_val("a");
             a.add_row(2u128, 1).i64_val(20).str_val("b");
-            a.add_row(3u128, 1).i64_val(30).str_null();
+            a.add_row(3u128, 1).i64_val(30).null();
         }
         assert!(batch.validate(&schema).is_ok());
     }
@@ -1919,94 +1882,46 @@ mod tests {
 
     // --- Step 4: Type-mismatch panics ---
 
-    #[test]
-    #[should_panic(expected = "u64_val called on non-Fixed")]
-    fn test_appender_type_mismatch_u64_on_string() {
-        let schema = Schema {
+    fn kv_schema(v: TypeCode) -> Schema {
+        Schema {
             columns: vec![
                 ColumnDef::new("pk", TypeCode::U64, false),
-                ColumnDef::new("s", TypeCode::String, false),
+                ColumnDef::new("v", v, false),
             ],
             pk_cols: vec![0],
-        };
+        }
+    }
+
+    /// A fixed-width value written into a German-string column panics before the
+    /// region can go out of shape — one message for `u64_val`/`i64_val`/`u128_val`,
+    /// since they share one body.
+    #[test]
+    #[should_panic(expected = "fixed value written to String column")]
+    fn a_fixed_value_in_a_string_column_panics() {
+        let schema = kv_schema(TypeCode::String);
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u64_val(42);
     }
 
     #[test]
-    #[should_panic(expected = "i64_val called on non-Fixed")]
-    fn test_appender_type_mismatch_i64_on_string() {
-        let schema = Schema {
-            columns: vec![
-                ColumnDef::new("pk", TypeCode::U64, false),
-                ColumnDef::new("s", TypeCode::String, false),
-            ],
-            pk_cols: vec![0],
-        };
-        let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).i64_val(-7);
-    }
-
-    #[test]
     #[should_panic(expected = "str_val called on non-Strings")]
-    fn test_appender_type_mismatch_str_on_fixed() {
-        let schema = Schema {
-            columns: vec![
-                ColumnDef::new("pk", TypeCode::U64, false),
-                ColumnDef::new("v", TypeCode::U64, false),
-            ],
-            pk_cols: vec![0],
-        };
+    fn a_string_in_a_fixed_column_panics() {
+        let schema = kv_schema(TypeCode::U64);
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
             .add_row(1u128, 1)
             .str_val("oops");
     }
 
+    /// A 16-byte write into an 8-byte column shares the `Fixed` variant, so only
+    /// the declared stride can catch it — and it is caught at the write, not
+    /// deferred to `validate`'s region-length check.
     #[test]
-    #[should_panic(expected = "str_null called on non-Strings")]
-    fn test_appender_type_mismatch_str_null_on_fixed() {
-        let schema = Schema {
-            columns: vec![
-                ColumnDef::new("pk", TypeCode::U64, false),
-                ColumnDef::new("v", TypeCode::U64, false),
-            ],
-            pk_cols: vec![0],
-        };
-        let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).str_null();
-    }
-
-    #[test]
-    #[should_panic(expected = "u128_val called on non-Fixed")]
-    fn test_appender_type_mismatch_u128_on_strings() {
-        let schema = Schema {
-            columns: vec![
-                ColumnDef::new("pk", TypeCode::U64, false),
-                ColumnDef::new("s", TypeCode::String, false),
-            ],
-            pk_cols: vec![0],
-        };
+    #[should_panic(expected = "U64 column at schema index 1 takes 8 bytes")]
+    fn a_wide_value_in_a_narrow_column_panics() {
+        let schema = kv_schema(TypeCode::U64);
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u128_val(1);
-    }
-
-    /// A 16-byte write into an 8-byte column shares the `Fixed` variant, so the
-    /// appender cannot see it; the region length is what disagrees, and
-    /// `validate` is where that surfaces.
-    #[test]
-    fn test_appender_wide_value_in_narrow_column_fails_validate() {
-        let schema = Schema {
-            columns: vec![
-                ColumnDef::new("pk", TypeCode::U64, false),
-                ColumnDef::new("v", TypeCode::U64, false),
-            ],
-            pk_cols: vec![0],
-        };
-        let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u128_val(1);
-        let err = batch.validate(&schema).expect_err("16 bytes in an 8-byte column");
-        assert!(err.contains("length 16 != expected 8"), "unexpected error: {err}");
     }
 
     #[test]
@@ -2023,7 +1938,7 @@ mod tests {
         {
             let mut a = BatchAppender::new(&mut batch, &schema);
             a.add_row(1u128, 1).i64_val(10).str_val("hello");
-            a.add_row(2u128, -1).i64_val(20).str_null();
+            a.add_row(2u128, -1).i64_val(20).null();
         }
         assert!(batch.validate(&schema).is_ok());
     }
@@ -2043,7 +1958,7 @@ mod tests {
         PkTuple::from_bytes(&[0u8; MAX_PK_BYTES + 1]);
     }
 
-    // --- §5.1: str_null / bytes_null set the null bitmap bit ---
+    // --- `null()` sets the null bitmap bit ---
 
     fn nullable_str_blob_schema() -> Schema {
         Schema {
@@ -2057,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn str_null_sets_null_bit() {
+    fn null_sets_the_bitmap_bit() {
         let schema = nullable_str_blob_schema();
         // payload_idx(col 1 = String) = 0 → bit 0; payload_idx(col 2 = Blob) = 1 → bit 1
         let str_bit = 1u64 << schema.payload_idx(1);
@@ -2065,21 +1980,21 @@ mod tests {
         let mut batch = ZSetBatch::new(&schema);
         {
             let mut a = BatchAppender::new(&mut batch, &schema);
-            a.add_row(1, 1).str_null().bytes_null();
+            a.add_row(1, 1).null().null();
         }
         assert_eq!(batch.nulls[0], str_bit | blob_bit, "both null bits must be set");
         assert!(batch.validate(&schema).is_ok());
     }
 
     #[test]
-    fn str_null_self_sufficiency_round_trips_as_null() {
+    fn a_null_cell_round_trips_as_null() {
         use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
         let schema = nullable_str_blob_schema();
         let mut batch = ZSetBatch::new(&schema);
         {
             let mut a = BatchAppender::new(&mut batch, &schema);
-            // No null_mask call — str_null / bytes_null must be self-sufficient.
-            a.add_row(42, 1).str_null().bytes_null();
+            // No null_mask call — `null()` must be self-sufficient.
+            a.add_row(42, 1).null().null();
         }
         let encoded = encode_wal_block(&schema, 1, &batch);
         let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
@@ -2106,7 +2021,7 @@ mod tests {
         let schema = nullable_str_blob_schema(); // 2 payload columns
         let mut batch = ZSetBatch::new(&schema);
         let mut a = BatchAppender::new(&mut batch, &schema);
-        a.add_row(1, 1).str_null(); // only 1 of 2 payload cols pushed
+        a.add_row(1, 1).null(); // only 1 of 2 payload cols pushed
         a.add_row(2, 1); // should panic: previous row incomplete
     }
 

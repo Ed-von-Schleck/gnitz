@@ -21,7 +21,7 @@ use crate::ir::BExpr;
 use crate::validate::reject_duplicate_column_names;
 use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, ReduceOutKey};
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Lower a `Project(Filter_having?(Reduce(...)))` body's reduce to circuit pieces
 /// for `view_id`, returning the pieces plus the output `ColId` layout. `items` is
@@ -64,7 +64,7 @@ pub(crate) fn lower_reduce(
             (cut_segment(client, chain, memo, input, &live)?, None, None)
         }
     };
-    let (source_tid, source_schema) = (source.tid, Rc::clone(&source.schema));
+    let (source_tid, source_schema) = (source.tid, Arc::clone(&source.schema));
     let source_layout = &source.layout;
 
     let group_positions: Vec<usize> = group_cols

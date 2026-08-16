@@ -561,18 +561,29 @@ pub fn hello_handshake(t: &mut ClientTransport) -> Result<(u32, u64), ProtocolEr
     Err(ProtocolError::DecodeError(err))
 }
 
+/// Both ends of a connected Unix socketpair — the loopback every framing test
+/// runs over. Lives here, beside `from_unix_fd`, so the transport and message
+/// test modules share one definition.
+#[cfg(test)]
+pub(crate) fn make_socketpair() -> (RawFd, RawFd) {
+    let mut fds = [0i32; 2];
+    unsafe {
+        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
+    }
+    (fds[0], fds[1])
+}
+
+/// [`make_socketpair`] as a transport pair; dropping them closes the fds.
+#[cfg(test)]
+pub(crate) fn make_transport_pair() -> (ClientTransport, ClientTransport) {
+    let (a, b) = make_socketpair();
+    (ClientTransport::from_unix_fd(a), ClientTransport::from_unix_fd(b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::io::RawFd;
-
-    fn make_socketpair() -> (RawFd, RawFd) {
-        let mut fds = [0i32; 2];
-        unsafe {
-            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
-        }
-        (fds[0], fds[1])
-    }
 
     const TEST_LIMIT: usize = gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT;
 

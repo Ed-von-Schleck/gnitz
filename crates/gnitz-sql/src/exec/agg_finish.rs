@@ -364,10 +364,9 @@ fn combine(acc: &mut ColAcc, partial: &ZSetBatch, schema: &Schema, ci: usize, ro
 }
 
 fn fixed_slice(partial: &ZSetBatch, ci: usize, row: usize, stride: usize) -> &[u8] {
-    match &partial.columns[ci] {
-        ColData::Fixed(buf) => &buf[row * stride..(row + 1) * stride],
-        _ => unreachable!("ad-hoc numeric agg partial column is not Fixed"),
-    }
+    partial.columns[ci]
+        .cell(row, stride)
+        .expect("ad-hoc numeric agg partial column is Fixed and in range")
 }
 
 /// One 8-byte partial-aggregate cell; the caller picks how to read it.

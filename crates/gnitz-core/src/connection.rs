@@ -267,17 +267,30 @@ impl Session {
         Ok(results)
     }
 
-    pub fn seek(&mut self, target_id: u64, pk: &PkTuple) -> ScanResult {
-        let flags = self.versioned_flags(target_id, FLAG_SEEK);
-        send_message(&mut self.transport, target_id, self.client_id, flags, pk, 0, None, None)?;
+    /// One single-frame seek round trip. `base_flag` picks the seek kind; the
+    /// cached schema version is embedded so the server can omit the schema block
+    /// on a warm-cache hit (matching push/scan).
+    fn seek_roundtrip(&mut self, target_id: u64, base_flag: u64, pk: &PkTuple, seek_col_idx: u64) -> ScanResult {
+        let flags = self.versioned_flags(target_id, base_flag);
+        send_message(
+            &mut self.transport,
+            target_id,
+            self.client_id,
+            flags,
+            pk,
+            seek_col_idx,
+            None,
+            None,
+        )?;
         let msg = self.recv_checked(target_id)?;
         self.recover_schema(target_id, msg)
     }
 
+    pub fn seek(&mut self, target_id: u64, pk: &PkTuple) -> ScanResult {
+        self.seek_roundtrip(target_id, FLAG_SEEK, pk, 0)
+    }
+
     pub fn seek_by_index(&mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128]) -> ScanResult {
-        // Embed the cached schema version so the server can omit the schema
-        // block on a warm-cache hit (matching push/scan).
-        let flags = self.versioned_flags(table_id, FLAG_SEEK_BY_INDEX);
         // `send_message`'s `split_wire` routes slot 0 → seek_pk and slots 1..K →
         // seek_pk_extra, where the worker reassembles them with
         // `unpack_index_key_slots`. Arity is validated upstream in
@@ -285,18 +298,7 @@ impl Session {
         let (buf, len) = gnitz_wire::pack_index_key_slots(key_vals);
         let pk = PkTuple::from_bytes(&buf[..len]);
         let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
-        send_message(
-            &mut self.transport,
-            table_id,
-            self.client_id,
-            flags,
-            &pk,
-            seek_col_idx,
-            None,
-            None,
-        )?;
-        let msg = self.recv_checked(table_id)?;
-        self.recover_schema(table_id, msg)
+        self.seek_roundtrip(table_id, FLAG_SEEK_BY_INDEX, &pk, seek_col_idx)
     }
 
     /// Describe one relation in a single round trip: `(live tid, schema,
@@ -432,12 +434,8 @@ impl Session {
     /// absorb any schema block into the cache, and recover the schema from the
     /// cache if the response was schema-less. Same body as the sync `scan`.
     pub fn recv_scan(&mut self, target_id: u64) -> ScanResult {
-        let (mut schema, data, lsn) = self.drain_reply_train(|s| s.recv_cached(target_id))?;
-        // Warm-cache responses omit the schema block. Recover once from the LRU.
-        if schema.is_none() {
-            schema = self.schema_cache.get(&target_id).map(|(s, _)| Arc::clone(s));
-        }
-        Ok((schema, data, lsn))
+        let (schema, data, lsn) = self.drain_reply_train(|s| s.recv_cached(target_id))?;
+        Ok((self.schema_or_cached(target_id, schema), data, lsn))
     }
 
     /// Ship a parameterized bounded read (`ReadSpec`) and reassemble its result.
@@ -512,14 +510,20 @@ impl Session {
         wire_flags_set_schema_version(base, self.cached_schema_version(target_id))
     }
 
-    /// Recover the schema for a single-frame seek response and assemble the
-    /// `ScanResult`: prefer the in-frame schema, else fall back to the cache.
-    /// Shared tail of `seek` / `seek_by_index`.
+    /// The schema for a reply: the one the frame carried, else the cached one —
+    /// a warm-cache response omits the block, so the LRU is the only source.
+    fn schema_or_cached(&mut self, target_id: u64, in_frame: Option<Arc<Schema>>) -> Option<Arc<Schema>> {
+        in_frame.or_else(|| self.schema_cache.get(&target_id).map(|(s, _)| Arc::clone(s)))
+    }
+
+    /// Assemble the `ScanResult` for a single-frame seek response. Shared tail
+    /// of `seek` / `seek_by_index`.
     fn recover_schema(&mut self, target_id: u64, msg: Message) -> ScanResult {
-        let schema = msg
-            .schema
-            .or_else(|| self.schema_cache.get(&target_id).map(|(s, _)| Arc::clone(s)));
-        Ok((schema, msg.data_batch, msg.seek_pk as u64))
+        Ok((
+            self.schema_or_cached(target_id, msg.schema),
+            msg.data_batch,
+            msg.seek_pk as u64,
+        ))
     }
 
     /// Receive one framed message, using the LRU cache to decode continuation
@@ -599,6 +603,20 @@ impl Session {
         // an empty batch (a legitimate empty Z-set delta) is ACKed as a no-op
         // push instead of being mistaken for a scan request.
         let base_flags = wire_flags_set_conflict_mode(FLAG_PUSH, mode);
+        let client_id = self.client_id;
+        // Cold path: include the schema block, version = 0. Also the retry
+        // frame, so the two spell the same request.
+        let cold = || {
+            encode_message_parts(
+                target_id,
+                client_id,
+                base_flags,
+                &PkTuple::EMPTY,
+                0,
+                Some(schema),
+                Some(batch),
+            )
+        };
         let warm_version: Option<u16> = match self.schema_cache.peek(&target_id) {
             Some((cached_schema, v)) if *v != 0 && schema.types_match(cached_schema.as_ref()) => Some(*v),
             _ => None,
@@ -607,47 +625,26 @@ impl Session {
             // Warm path: omit schema block, embed cached version.
             Some(cached_version) => {
                 let flags = wire_flags_set_schema_version(base_flags, cached_version);
-                encode_message_noschema_parts(target_id, self.client_id, flags, schema, batch)
+                encode_message_noschema_parts(target_id, client_id, flags, schema, batch)
             }
-            // Cold path: include schema block, version = 0.
-            None => encode_message_parts(
-                target_id,
-                self.client_id,
-                base_flags,
-                &PkTuple::EMPTY,
-                0,
-                Some(schema),
-                Some(batch),
-            ),
+            None => cold(),
         };
         self.transport.send_framed_iov(&parts.segments())?;
         let ack = match self.recv_checked(target_id) {
             Err(ClientError::SchemaMismatch) => {
                 // Stale cache: evict and retry with full schema.
                 self.schema_cache.pop(&target_id);
-                let parts = encode_message_parts(
-                    target_id,
-                    self.client_id,
-                    base_flags,
-                    &PkTuple::EMPTY,
-                    0,
-                    Some(schema),
-                    Some(batch),
-                );
-                self.transport.send_framed_iov(&parts.segments())?;
+                self.transport.send_framed_iov(&cold().segments())?;
                 self.recv_checked(target_id)?
             }
             Ok(msg) => msg,
             Err(e) => return Err(e),
         };
-        // No manual cache write here. Whenever the server changed the schema
-        // version it also included the schema block in the ACK
-        // (wire_should_include_schema), and recv_cached already cached that
-        // authoritative schema (with the server's real column names). A
-        // schema.clone() here would clobber it with the caller's copy —
-        // dropping the server's column names, and on schema evolution pairing
-        // the OLD schema with the NEW version. On the pure warm path the
-        // version is unchanged: nothing to do.
+        // The cache is written by `recv_cached` alone. Whenever the server
+        // changes the schema version it also ships the schema block in the ACK
+        // (`wire_should_include_schema`), so the cached entry carries the
+        // server's real column names paired with the matching version. Writing
+        // the caller's copy here would clobber both.
         Ok(ack)
     }
 }

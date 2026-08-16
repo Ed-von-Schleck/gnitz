@@ -8,33 +8,27 @@ pub mod error;
 pub mod protocol;
 pub mod types;
 
-pub use circuit::{
-    agg_output_type, AggFunc, Circuit, CircuitBuilder, CircuitRows, JoinKind, MapKind, NodeId, OpNode, RangeRel,
-    ReduceOutKey,
-};
+// The crate prelude: the names a client of gnitz-core names by hand. Every
+// module is `pub`, so anything omitted here is still reachable by its own path —
+// this list carries no meaning beyond "spelled often enough to be worth
+// shortening".
+pub use circuit::{agg_output_type, Circuit, CircuitBuilder, CircuitRows, NodeId, OpNode, RangeRel, ReduceOutKey};
 pub use client::{
     hidden_view_name, retraction_batch, GnitzClient, IndexMeta, InlineUniqueIndex, PlannedView, TxnBuffer,
     MAX_CHAIN_SEGMENTS,
 };
-pub use connection::{
-    ScanResult, Session, COL_TAB, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB,
-    VIEW_TAB,
-};
+pub use connection::{Session, FIRST_USER_TABLE_ID, TABLE_TAB};
 pub use error::ClientError;
 // The expression emitter lives in `gnitz-expr`, beside the decoder it must
 // agree with. Re-exported here because `gnitz-capi` exposes 18 `gnitz_expr_*` C
 // symbols over it without depending on that crate.
 pub use gnitz_expr::{ExprBuilder, ExprProgram};
 pub use gnitz_wire::{
-    index_key_types, pack_table_flags, table_flags_dist_prefix, validate_dist_prefix, validate_user_identifier, Cut,
-    PkColList, RangeDescriptor, FK_INDEX_INFIX,
+    index_key_types, validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, FK_INDEX_INFIX,
 };
 pub use protocol::{
-    encode_message_parts, encode_wal_block, hello_handshake, null_word_get, null_word_set, parse_response,
-    send_message, wire_flags_get_schema_version, wire_flags_set_conflict_mode, BatchAppender, ClientTransport, ColData,
-    ColumnDef, FixedInt, Header, Message, MessageParts, PkColumn, PkTuple, ProtocolError, Schema, TransportWaker,
-    TypeCode, ViewBuffers, WireConflictMode, ZSetBatch, ZSetBatchView, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID,
-    FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_PK,
-    FLAG_HAS_SCHEMA, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN, MAX_COLUMNS, MAX_PK_BYTES,
-    MAX_PK_COLUMNS, META_FLAG_NULLABLE, PK_LIST_MAX_COLS, STATUS_ERROR, STATUS_OK,
+    encode_message_parts, null_word_get, null_word_set, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
+    BatchAppender, ColData, ColumnDef, FixedInt, MessageParts, PkColumn, PkTuple, ProtocolError, Schema,
+    TransportWaker, TypeCode, ViewBuffers, WireConflictMode, ZSetBatch, ZSetBatchView, FLAG_PUSH, MAX_COLUMNS,
+    MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };

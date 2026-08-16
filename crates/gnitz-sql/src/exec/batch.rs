@@ -203,7 +203,6 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
         // view (a duplicated lone PK — `SELECT pk, pk` — has a scalar source but
         // a two-slot Bytes destination), and this path is cold: the common
         // full-projection case took `pk_preserved` above.
-        let src_stride = schema.pk_stride();
 
         // Per-PK (col_off, stride) is invariant across rows — hoist.
         let pk_mappings: Vec<(usize, usize)> = new_schema
@@ -222,7 +221,7 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
         // bytes out of the source tuple at that column's offset.
         new_batch.pks.buf.reserve(row_count * new_schema.pk_stride());
         for i in 0..row_count {
-            let row = src_pks.get_tuple(i, src_stride as u8);
+            let row = src_pks.get_tuple(i);
             for &(col_off, stride) in &pk_mappings {
                 new_batch.pks.buf.extend_from_slice(&row.buf[col_off..col_off + stride]);
             }

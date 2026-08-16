@@ -14,10 +14,12 @@
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
+use gnitz_core::protocol::{
+    hello_handshake, parse_response, send_message, ClientTransport, FLAG_CONTINUATION, STATUS_ERROR,
+};
 use gnitz_core::{
-    hello_handshake, parse_response, send_message, wire_flags_set_conflict_mode, ClientTransport, ColData, ColumnDef,
-    GnitzClient, PkColumn, PkTuple, Schema, TypeCode, WireConflictMode, ZSetBatch, FLAG_CONTINUATION, FLAG_PUSH,
-    STATUS_ERROR,
+    wire_flags_set_conflict_mode, ColData, ColumnDef, GnitzClient, PkColumn, PkTuple, Schema, TypeCode,
+    WireConflictMode, ZSetBatch, FLAG_PUSH,
 };
 use gnitz_test_harness::ServerHandle;
 
@@ -31,7 +33,7 @@ fn unique_schema() -> String {
 
 /// `(client, schema_name, table_id, schema)` for a fresh `(pk BIGINT, a
 /// BIGINT, b BIGINT)` table reachable via `target`.
-fn client_with_table(target: &str) -> (GnitzClient, String, u64, Schema) {
+fn client_with_table(target: &str) -> (GnitzClient, String, u64, std::sync::Arc<Schema>) {
     let mut client = GnitzClient::connect(target).expect("connect");
     let sn = unique_schema();
     client.create_schema(&sn).unwrap();

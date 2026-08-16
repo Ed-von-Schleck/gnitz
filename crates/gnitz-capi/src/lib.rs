@@ -528,7 +528,7 @@ pub unsafe extern "C" fn gnitz_batch_get_pk_bytes(
         set_error("buffer too small for PK stride");
         return -1;
     }
-    let t = b.batch.pks.get_tuple(row, pk_stride as u8);
+    let t = b.batch.pks.get_tuple(row);
     unsafe {
         std::ptr::copy_nonoverlapping(t.buf.as_ptr(), buf, pk_stride);
     }
@@ -556,26 +556,19 @@ pub unsafe extern "C" fn gnitz_batch_get_i64(batch: *const GnitzBatch, col_idx: 
         set_error("column index out of range");
         return 0;
     }
-    match b.batch.columns.get(col_idx) {
-        Some(ColData::Fixed(buf)) => {
-            let tc = b.schema.columns[col_idx].type_code;
-            let stride = tc.wire_stride();
-            let start = row * stride;
-            if start + stride > buf.len() {
-                set_error("row out of range");
-                return 0;
-            }
-            let slice = &buf[start..start + stride];
-            match gnitz_core::FixedInt::from_type_code(tc) {
-                Some(fi) => fi.decode_le_i64(slice),
-                None => {
-                    set_error("unsupported integer column type");
-                    0
-                }
-            }
-        }
-        _ => {
-            set_error("column is not a Fixed integer column");
+    let tc = b.schema.columns[col_idx].type_code;
+    let Some(slice) = b.batch.columns[col_idx].cell(row, tc.wire_stride()) else {
+        set_error(if row < b.batch.len() {
+            "column is not a Fixed integer column"
+        } else {
+            "row out of range"
+        });
+        return 0;
+    };
+    match gnitz_core::FixedInt::from_type_code(tc) {
+        Some(fi) => fi.decode_le_i64(slice),
+        None => {
+            set_error("unsupported integer column type");
             0
         }
     }

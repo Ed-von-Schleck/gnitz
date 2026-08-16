@@ -66,7 +66,7 @@ pub fn schema_from_block(block: &[u8]) -> Result<Schema, ProtocolError> {
         columns.push(col);
     }
     let pk_cols: Vec<usize> = sb.pk_indices().iter().map(|&i| i as usize).collect();
-    Schema::from_parts(columns, pk_cols).map_err(|e| ProtocolError::DecodeError(e.into()))
+    Schema::from_parts(columns, pk_cols).map_err(ProtocolError::DecodeError)
 }
 
 #[cfg(test)]

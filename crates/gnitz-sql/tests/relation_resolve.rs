@@ -598,7 +598,7 @@ fn a_second_client_pushes_after_a_column_alter() {
     assert_eq!(tid2, tid);
     assert!(schema2.columns[1].is_nullable, "B sees the relaxed column");
     let mut batch = ZSetBatch::new(&schema2);
-    BatchAppender::new(&mut batch, &schema2).add_row(2, 1).u64_null();
+    BatchAppender::new(&mut batch, &schema2).add_row(2, 1).null();
     b.push(tid2, &schema2, &batch).unwrap();
 
     assert_eq!(read_sql(&mut a, &sn, "SELECT id, v FROM t").1.len(), 2);

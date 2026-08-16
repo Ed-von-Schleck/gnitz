@@ -28,6 +28,7 @@ use chain::{EmitPieces, ViewChain};
 use gnitz_core::{ColumnDef, GnitzClient, RangeRel, Schema, TypeCode};
 use sqlparser::ast::SetExpr;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// The one shared compiler core: bind a query body to `RelExpr`, decorrelate its
 /// subqueries, classify join predicates, and lower to circuit pieces for the
@@ -248,7 +249,7 @@ pub(crate) struct ProjEntry {
 pub(crate) enum RelExpr {
     Get {
         tid: u64,
-        schema: Rc<Schema>,
+        schema: Arc<Schema>,
         cols: Vec<HirCol>,
         from_catalog: bool,
     },
@@ -492,7 +493,7 @@ impl RelExpr {
     /// A base table or committed/hidden-view source: one fresh `ColId` per
     /// registered schema column, in schema order (so a `ColId`'s env position is
     /// its schema position).
-    pub(crate) fn get(ids: &ColIdGen, tid: u64, schema: Rc<Schema>, from_catalog: bool) -> Rc<RelExpr> {
+    pub(crate) fn get(ids: &ColIdGen, tid: u64, schema: Arc<Schema>, from_catalog: bool) -> Rc<RelExpr> {
         let cols = schema
             .columns
             .iter()

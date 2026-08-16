@@ -775,12 +775,12 @@ mod tests {
                     .u64_val(1)
                     .u64_val(0)
                     .u64_val(src)
-                    .bytes_null();
+                    .null();
                 a.add_row((vid as u128) | (2u128 << 64), 1)
                     .u64_val(2)
                     .u64_val(1)
-                    .u64_null()
-                    .bytes_null();
+                    .null()
+                    .null();
             }
             b
         };

@@ -35,6 +35,7 @@ use gnitz_core::{ColumnDef, GnitzClient, Schema};
 use gnitz_wire::ScanBound;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// A resolved combine input: its delta source, registered schema, and the `ColId`
 /// layout (physical column order) against which key / group / projection
@@ -44,7 +45,7 @@ use std::rc::Rc;
 #[derive(Clone)]
 pub(crate) struct SegInput {
     pub tid: u64,
-    pub schema: Rc<Schema>,
+    pub schema: Arc<Schema>,
     pub layout: Vec<ColId>,
     /// Whether `tid` names a catalog relation rather than a chain-minted segment.
     /// Every catalog probe (scan-bound index lookup, replication) is gated on it:
@@ -143,7 +144,7 @@ pub(crate) fn seginput_of_get(rel: &RelExpr) -> Option<SegInput> {
     };
     Some(SegInput {
         tid: *tid,
-        schema: Rc::clone(schema),
+        schema: Arc::clone(schema),
         layout: cols.iter().map(|c| c.id).collect(),
         from_catalog: *from_catalog,
     })

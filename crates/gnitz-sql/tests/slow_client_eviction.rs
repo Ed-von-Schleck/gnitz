@@ -22,9 +22,8 @@
 
 use std::os::fd::RawFd;
 
-use gnitz_core::{
-    hello_handshake, send_message, ClientTransport, ColData, GnitzClient, PkColumn, PkTuple, Schema, ZSetBatch,
-};
+use gnitz_core::protocol::{hello_handshake, send_message, ClientTransport};
+use gnitz_core::{ColData, GnitzClient, PkColumn, PkTuple, Schema, ZSetBatch};
 use gnitz_test_harness::ServerHandle;
 
 mod common;

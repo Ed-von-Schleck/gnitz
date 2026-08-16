@@ -394,12 +394,11 @@ fn client_side_filter_do_nothing(
     schema: &Schema,
     batch: &ZSetBatch,
 ) -> Result<(ZSetBatch, usize), GnitzSqlError> {
-    let stride = schema.pk_stride() as u8;
     let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::new();
     let mut surviving_indices: Vec<usize> = Vec::with_capacity(batch.pks.len());
 
     for i in 0..batch.pks.len() {
-        let pk = batch.pks.get_tuple(i, stride);
+        let pk = batch.pks.get_tuple(i);
         // Intra-batch duplicate: drop everything after the first.
         if !seen_pks.insert(pk) {
             continue;
@@ -444,7 +443,6 @@ fn client_side_merge_do_update(
         asn_by_col[*ci] = Some(rhs);
     }
 
-    let stride = schema.pk_stride() as u8;
     let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::new();
     let mut out = ZSetBatch::with_capacity(schema, batch.pks.len());
     let gather = RowGather::new(schema);
@@ -459,7 +457,7 @@ fn client_side_merge_do_update(
     let excluded_view = bufs_excluded.view(batch, schema);
 
     for i in 0..batch.pks.len() {
-        let pk = batch.pks.get_tuple(i, stride);
+        let pk = batch.pks.get_tuple(i);
         if !seen_pks.insert(pk) {
             return Err(GnitzSqlError::Bind(
                 "ON CONFLICT DO UPDATE cannot affect row a second time \

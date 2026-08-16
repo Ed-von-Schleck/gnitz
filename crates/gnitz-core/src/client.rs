@@ -21,34 +21,18 @@ use gnitz_wire::{
 // --- Module-private helpers ---
 
 fn col_u64(col: &ColData, i: usize) -> Result<u64, ClientError> {
-    match col {
-        ColData::Fixed(bytes) => {
-            let off = i * 8;
-            if off + 8 > bytes.len() {
-                return Err(ClientError::ServerError(format!(
-                    "col_u64: row {} out of bounds (len {})",
-                    i,
-                    bytes.len()
-                )));
-            }
-            Ok(u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()))
-        }
-        _ => Err(ClientError::ServerError("col_u64: expected Fixed column".into())),
-    }
+    let cell = col
+        .cell(i, 8)
+        .ok_or_else(|| ClientError::ServerError(format!("col_u64: no 8-byte cell at row {i}")))?;
+    Ok(gnitz_wire::read_u64_le(cell, 0))
 }
 
 fn col_str(col: &ColData, i: usize) -> Result<Option<&str>, ClientError> {
     match col {
-        ColData::Strings(v) => {
-            if i >= v.len() {
-                return Err(ClientError::ServerError(format!(
-                    "col_str: row {} out of bounds (len {})",
-                    i,
-                    v.len()
-                )));
-            }
-            Ok(v[i].as_deref())
-        }
+        ColData::Strings(v) => v
+            .get(i)
+            .map(Option::as_deref)
+            .ok_or_else(|| ClientError::ServerError(format!("col_str: row {i} out of bounds (len {})", v.len()))),
         _ => Err(ClientError::ServerError("col_str: expected Strings column".into())),
     }
 }
@@ -651,10 +635,10 @@ impl GnitzClient {
 
     /// `(name, indexed columns)` of every live secondary-index IDX_TAB row (name in
     /// canonical lowercase, since `create_index`/`create_table` canonicalize at
-    /// store time). `create_index` checks it for a duplicate name; the planner uses
-    /// it to reject a re-index of an identical column set under the auto base name
-    /// and to disambiguate an auto-generated name against the taken set. Reads the
-    /// same slots `create_index` writes and `drop_index_by_name` reads.
+    /// store time). The planner uses it to reject a re-index of an identical column
+    /// set under the auto base name and to disambiguate an auto-generated name
+    /// against the taken set. Reads the same slots `create_index` writes and
+    /// `drop_index_by_name` reads.
     pub fn index_name_cols(&mut self) -> Result<Vec<(String, gnitz_wire::PkColList)>, ClientError> {
         let (_, idx_batch, _) = self.session.scan(IDX_TAB)?;
         let Some(idx_batch) = idx_batch else {
@@ -739,7 +723,7 @@ impl GnitzClient {
         let fam_refs: Vec<(u64, &Schema, &ZSetBatch, WireConflictMode)> = buf
             .families
             .iter()
-            .map(|(tid, schema, batch, mode)| (*tid, schema, batch, *mode))
+            .map(|f| (f.tid, &f.schema, &f.batch, f.mode))
             .collect();
         // One precondition per read-set tid at the transaction-wide basis. The
         // read-set is deduped and a subset of the buffered-write (family) tids, so
@@ -1315,24 +1299,11 @@ impl GnitzClient {
     ) -> Result<(), ClientError> {
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
-        // One resolve yields the tid and the schema together. The base-table
-        // check is this gateway's own backstop for non-SQL front ends (the SQL
-        // layer rejects a view earlier, with a better error): `alter_col_pair`
-        // writes `owner_kind = OWNER_KIND_TABLE`, so against a stored view row
-        // its `-1` would fail as an opaque CAS conflict.
-        let desc = match self.resolve(&schema_name, &table_name)? {
-            Some(d) if !d.is_view => d,
-            Some(_) => {
-                return Err(ClientError::ServerError(format!(
-                    "'{table_name}' is a view; ALTER COLUMN requires a base table"
-                )))
-            }
-            None => {
-                return Err(ClientError::ServerError(format!(
-                    "Table '{schema_name}.{table_name}' not found"
-                )))
-            }
-        };
+        // One resolve yields the tid and the schema together. `alter_col_pair`
+        // rejects a view.
+        let desc = self
+            .resolve(&schema_name, &table_name)?
+            .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
         let col_idx = desc.schema.visible_column_named(old_col).ok_or_else(|| {
             ClientError::ServerError(format!("column '{old_col}' not found in '{schema_name}.{table_name}'"))
         })?;
@@ -1414,6 +1385,16 @@ impl GnitzClient {
         flip: impl FnOnce(&mut ColumnDef),
     ) -> Result<(), ClientError> {
         let desc = self.descriptor_by_tid(tid)?;
+        // The rows written below carry `owner_kind = OWNER_KIND_TABLE`, so
+        // against a stored view row the `-1` would fail as an opaque CAS
+        // conflict. Reject here, where the assumption is made, rather than in
+        // each of the three entry points. (The SQL layer rejects a view earlier,
+        // with a better error; this is the backstop for non-SQL front ends.)
+        if desc.is_view {
+            return Err(ClientError::ServerError(format!(
+                "relation {tid} is a view; ALTER COLUMN requires a base table"
+            )));
+        }
         let cd = desc
             .schema
             .columns
@@ -1437,10 +1418,10 @@ impl GnitzClient {
     /// Resolve `table_name` under `schema_name` to its id and schema. A view is
     /// reported as absent — callers that need to tell the two apart use
     /// [`Self::resolve_relation`], which returns the kind.
-    pub fn resolve_table_id(&mut self, schema_name: &str, table_name: &str) -> Result<(u64, Schema), ClientError> {
+    pub fn resolve_table_id(&mut self, schema_name: &str, table_name: &str) -> Result<(u64, Arc<Schema>), ClientError> {
         let d = self.resolve(schema_name, table_name)?;
         match d.filter(|d| !d.is_view) {
-            Some(d) => Ok((d.tid, (*d.schema).clone())),
+            Some(d) => Ok((d.tid, Arc::clone(&d.schema))),
             None => Err(ClientError::ServerError(format!(
                 "Table '{}' not found",
                 qualified_name(schema_name, table_name)
@@ -1450,17 +1431,21 @@ impl GnitzClient {
 
     /// Resolve `name` under `schema_name` to `(id, schema, is_view)`; the kind
     /// comes from the same descriptor as the id, so the two can never disagree.
-    pub fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema, bool), ClientError> {
+    pub fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(u64, Arc<Schema>, bool), ClientError> {
         let d = self.resolve(schema_name, name)?.ok_or_else(|| {
             ClientError::ServerError(format!(
                 "Table or view '{}' not found",
                 qualified_name(schema_name, name)
             ))
         })?;
-        Ok((d.tid, (*d.schema).clone(), d.is_view))
+        Ok((d.tid, Arc::clone(&d.schema), d.is_view))
     }
 
-    pub fn resolve_table_or_view_id(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema), ClientError> {
+    pub fn resolve_table_or_view_id(
+        &mut self,
+        schema_name: &str,
+        name: &str,
+    ) -> Result<(u64, Arc<Schema>), ClientError> {
         let (id, schema, _) = self.resolve_relation(schema_name, name)?;
         Ok((id, schema))
     }
@@ -1534,6 +1519,14 @@ impl GnitzClient {
 
 // --- TxnBuffer: the locally-buffered atomic write-batch transaction ---
 
+/// One buffered family: a maximal run of same-mode ops on one relation.
+struct BufferedFamily {
+    tid: u64,
+    schema: Schema,
+    batch: ZSetBatch,
+    mode: WireConflictMode,
+}
+
 /// The write side of an open transaction. `push`/`delete` append to the target
 /// tid's **last** family when its conflict mode matches, else open a new family
 /// (run-splitting), so per-table op order is preserved end to end: buffer call
@@ -1550,9 +1543,10 @@ impl GnitzClient {
 /// it is rollback — nothing was ever sent.
 #[derive(Default)]
 pub struct TxnBuffer {
-    /// (tid, schema, batch, mode) in creation order; per tid, maximal same-mode
-    /// runs of the caller's op sequence.
-    families: Vec<(u64, Schema, ZSetBatch, WireConflictMode)>,
+    /// Creation order; per tid, maximal same-mode runs of the caller's op
+    /// sequence.
+    families: Vec<BufferedFamily>,
+
     /// tid → index in `families` of that tid's most recently opened family, so
     /// a matching-mode append extends it rather than opening a new family.
     last_family_of: HashMap<u64, usize>,
@@ -1614,14 +1608,13 @@ impl TxnBuffer {
         if batch.is_empty() {
             return;
         }
-        let stride = schema.pk_stride() as u8;
         let extend = self
             .last_family_of
             .get(&tid)
-            .is_some_and(|&idx| self.families[idx].3 == mode);
+            .is_some_and(|&idx| self.families[idx].mode == mode);
         let (fam, base) = if extend {
             let idx = self.last_family_of[&tid];
-            (idx, self.families[idx].2.len())
+            (idx, self.families[idx].batch.len())
         } else {
             (self.families.len(), 0)
         };
@@ -1629,14 +1622,19 @@ impl TxnBuffer {
         let index = self.last_op_of.entry(tid).or_default();
         for i in 0..batch.len() {
             if batch.weights[i] != 0 {
-                index.insert(batch.pks.get_tuple(i, stride), (fam, base + i));
+                index.insert(batch.pks.get_tuple(i), (fam, base + i));
             }
         }
 
         if extend {
-            self.families[fam].2.extend_from_owned(batch);
+            self.families[fam].batch.extend_from_owned(batch);
         } else {
-            self.families.push((tid, schema.clone(), batch, mode));
+            self.families.push(BufferedFamily {
+                tid,
+                schema: schema.clone(),
+                batch,
+                mode,
+            });
             self.last_family_of.insert(tid, fam);
         }
     }
@@ -1647,7 +1645,7 @@ impl TxnBuffer {
     /// mirroring the engine's `fold_family`.
     pub fn last_op(&self, tid: u64, pk: &PkTuple) -> Option<(&ZSetBatch, usize)> {
         let &(fam, row) = self.last_op_of.get(&tid)?.get(pk)?;
-        Some((&self.families[fam].2, row))
+        Some((&self.families[fam].batch, row))
     }
 
     /// Every PK the transaction has touched in `tid`, with its last op.
@@ -1656,7 +1654,7 @@ impl TxnBuffer {
             .get(&tid)
             .into_iter()
             .flatten()
-            .map(move |(pk, &(fam, row))| (*pk, &self.families[fam].2, row))
+            .map(move |(pk, &(fam, row))| (*pk, &self.families[fam].batch, row))
     }
 }
 
@@ -1729,11 +1727,11 @@ fn append_circuit_rows(
         // the row bitmap themselves.
         match src_tab {
             Some(t) => nodes_a.u64_val(*t),
-            None => nodes_a.u64_null(),
+            None => nodes_a.null(),
         };
         match expr_blob {
             Some(b) => nodes_a.bytes_val(b),
-            None => nodes_a.bytes_null(),
+            None => nodes_a.null(),
         };
     }
     for (dst_node, dst_port, src_node) in &rows.edges {
@@ -1990,18 +1988,18 @@ mod tests {
         buf.push(tid, &s, &ins(&s, 1, 10));
         buf.push(tid, &s, &ins(&s, 2, 20));
         assert_eq!(buf.families.len(), 1, "same-mode pushes coalesce");
-        assert_eq!(buf.families[0].2.len(), 2);
-        assert_eq!(buf.families[0].3, WireConflictMode::Update);
+        assert_eq!(buf.families[0].batch.len(), 2);
+        assert_eq!(buf.families[0].mode, WireConflictMode::Update);
         buf.push_with_mode(tid, &s, &ins(&s, 3, 30), WireConflictMode::Error);
         assert_eq!(buf.families.len(), 2, "mode change opens a new family");
-        assert_eq!(buf.families[1].3, WireConflictMode::Error);
+        assert_eq!(buf.families[1].mode, WireConflictMode::Error);
         buf.push(tid, &s, &ins(&s, 4, 40));
         assert_eq!(
             buf.families.len(),
             3,
             "back to Update opens a third family in call order"
         );
-        assert_eq!(buf.families[2].3, WireConflictMode::Update);
+        assert_eq!(buf.families[2].mode, WireConflictMode::Update);
     }
 
     #[test]
@@ -2013,10 +2011,10 @@ mod tests {
         buf.delete(tid, &s, PkColumn::from_u128s(8, [7]));
         buf.push_with_mode(tid, &s, &ins(&s, 7, 70), WireConflictMode::Error);
         assert_eq!(buf.families.len(), 2);
-        assert_eq!(buf.families[0].3, WireConflictMode::Update);
-        assert_eq!(buf.families[0].2.weights, vec![-1]);
-        assert_eq!(buf.families[1].3, WireConflictMode::Error);
-        assert_eq!(buf.families[1].2.weights, vec![1]);
+        assert_eq!(buf.families[0].mode, WireConflictMode::Update);
+        assert_eq!(buf.families[0].batch.weights, vec![-1]);
+        assert_eq!(buf.families[1].mode, WireConflictMode::Error);
+        assert_eq!(buf.families[1].batch.weights, vec![1]);
     }
 
     #[test]
@@ -2028,9 +2026,9 @@ mod tests {
         buf.push(17, &s, &ins(&s, 1, 1));
         buf.push(16, &s, &ins(&s, 2, 2));
         assert_eq!(buf.families.len(), 2);
-        assert_eq!(buf.families[0].0, 16);
-        assert_eq!(buf.families[0].2.len(), 2);
-        assert_eq!(buf.families[1].0, 17);
+        assert_eq!(buf.families[0].tid, 16);
+        assert_eq!(buf.families[0].batch.len(), 2);
+        assert_eq!(buf.families[1].tid, 17);
     }
 
     #[test]
@@ -2096,7 +2094,7 @@ mod tests {
         };
         bytes.clear();
         match find_table_record_by_id(&batch, 7) {
-            Err(ClientError::ServerError(s)) => assert!(s.contains("out of bounds"), "got: {s}"),
+            Err(ClientError::ServerError(s)) => assert!(s.contains("no 8-byte cell"), "got: {s}"),
             _ => panic!("expected decode ServerError, got a non-error result"),
         }
     }

@@ -57,11 +57,15 @@ impl ViewBuffers {
     /// region per payload slot in slot order, blob heap last — exactly what
     /// [`gnitz_wire::wal::encode`] frames.
     ///
-    /// Row counts are `ZSetBatch::validate`'s rule and are not restated; what is
-    /// asserted here is the built region's own length and variant, which
-    /// validate cannot state for a batch that never went through it.
+    /// Every region is indexed absolutely — by a kernel (`col_data(pi, sz)[row *
+    /// sz ..]`, `get_pk_bytes`) or by the framer — so a column whose variant or
+    /// length contradicts the schema is an out-of-bounds read one crate away
+    /// from its cause. `check_columns` is the same rule `ZSetBatch::validate`
+    /// applies on the push path; a view can be built for a batch that never went
+    /// through it.
     pub(crate) fn regions<'a>(&'a mut self, batch: &'a ZSetBatch, schema: &Schema) -> Vec<&'a [u8]> {
         let (rows, pk_stride, npc) = (batch.len(), schema.pk_stride(), schema.num_payload_cols());
+        batch.check_columns(schema).expect("ZSetBatch columns match schema");
 
         build_pk_region_into(&mut self.pk_region, &batch.pks, pk_stride, schema);
         self.blob.clear();
@@ -95,34 +99,13 @@ impl ViewBuffers {
         regions.push(&me.pk_region);
         regions.push(as_le_bytes(&batch.weights));
         regions.push(as_le_bytes(&batch.nulls));
-        // One length rule, one place. Every region is indexed absolutely — by a
-        // kernel (`col_data(pi, sz)[row * sz ..]`, `get_pk_bytes`) or by the
-        // framer — so a wrong length is an out-of-bounds read one crate away
-        // from its cause.
         assert_eq!(me.pk_region.len(), rows * pk_stride, "pk region length");
-        for (pi, ci, col) in schema.payload_columns() {
-            let cd = &batch.columns[ci];
-            // The variant is decided by the *declared* type, never by the one
-            // found: a String-typed column carrying `Fixed` has a valid
-            // `rows * 16` length, so the length assert below cannot see it, and
-            // the string kernels would read those bytes as German cells.
-            // `ZSetBatch::validate` states the same rule for the push path; a
-            // view can be built for a batch that never went through it.
-            assert!(
-                cd.matches_type(col.type_code),
-                "ZSetBatch column {ci}: ColData variant contradicts schema type {:?}",
-                col.type_code
-            );
-            let r: &[u8] = match cd {
+        for (pi, ci, _) in schema.payload_columns() {
+            regions.push(match &batch.columns[ci] {
                 ColData::Fixed(v) => v,
+                // The 16-byte German cells this builder just wrote, one per row.
                 ColData::Strings(_) | ColData::Bytes(_) => &me.str_cols[pi],
-            };
-            assert_eq!(
-                r.len(),
-                rows * col.type_code.wire_stride(),
-                "payload region {pi} (column {ci}) length"
-            );
-            regions.push(r);
+            });
         }
         regions.push(&me.blob); // the blob arena is always the last region
         regions

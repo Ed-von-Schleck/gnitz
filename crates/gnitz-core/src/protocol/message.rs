@@ -96,9 +96,51 @@ impl super::transport::FrameSegments for MessageParts {
     }
 }
 
-/// Encode a request/response into its wire blocks (without the 4-byte frame
-/// header): control + optional schema + optional data. Pure function — pass
-/// the parts to `send_framed_iov` / `send_framed_batch` for framing.
+/// The one frame encoder: control block + optional schema block + optional data
+/// block, without the 4-byte frame header. `FLAG_HAS_SCHEMA` / `FLAG_HAS_DATA`
+/// are derived here, so no caller sets them.
+///
+/// `seek_pk` / `seek_col_idx` address a SEEK; `seek_pk_extra` is the control
+/// block's arbitrary-length BLOB cell. `schema_block` is what rides in the
+/// frame; `data` names the schema its rows are encoded against, which a
+/// warm-cache push does not ship.
+#[allow(clippy::too_many_arguments)]
+fn encode_parts(
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    seek_pk: u128,
+    seek_col_idx: u64,
+    seek_pk_extra: &[u8],
+    schema_block: Option<Vec<u8>>,
+    data: Option<(&Schema, &ZSetBatch)>,
+) -> MessageParts {
+    let data = data.filter(|(_, b)| !b.is_empty());
+    let mut flags_out = flags;
+    if schema_block.is_some() {
+        flags_out |= FLAG_HAS_SCHEMA;
+    }
+    if data.is_some() {
+        flags_out |= FLAG_HAS_DATA;
+    }
+    let ctrl_hdr = Header {
+        status: STATUS_OK,
+        target_id,
+        client_id,
+        flags: flags_out,
+        seek_pk,
+        seek_col_idx,
+        request_id: 0,
+    };
+    MessageParts {
+        ctrl: encode_control_block(&ctrl_hdr, "", seek_pk_extra),
+        schema: schema_block,
+        data: data.map_or_else(Vec::new, |(s, b)| encode_wal_block(s, target_id as u32, b)),
+    }
+}
+
+/// Encode a request/response carrying `schema` in the frame. Pass the parts to
+/// `send_framed_iov` / `send_framed_batch` for framing.
 ///
 /// `seek_pk` carries the seek key for `FLAG_SEEK` / `FLAG_SEEK_BY_INDEX` frames;
 /// pass `&PkTuple::EMPTY` for non-seek frames. The wire-level
@@ -113,39 +155,21 @@ pub fn encode_message_parts(
     schema: Option<&Schema>,
     data_batch: Option<&ZSetBatch>,
 ) -> MessageParts {
-    let has_data = data_batch.map(|b| !b.is_empty()).unwrap_or(false);
-    let has_schema = schema.is_some();
-
-    let mut flags_out = flags;
-    if has_schema {
-        flags_out |= FLAG_HAS_SCHEMA;
-    }
-    if has_data {
-        flags_out |= FLAG_HAS_DATA;
-    }
-
+    debug_assert!(
+        data_batch.is_none() || schema.is_some(),
+        "a data block needs the schema it is encoded against",
+    );
     let (seek_pk_lo, seek_pk_extra) = seek_pk.split_wire();
-    let ctrl_hdr = Header {
-        status: STATUS_OK,
+    encode_parts(
         target_id,
         client_id,
-        flags: flags_out,
-        seek_pk: seek_pk_lo,
+        flags,
+        seek_pk_lo,
         seek_col_idx,
-        request_id: 0,
-    };
-    let ctrl = encode_control_block(&ctrl_hdr, "", seek_pk_extra);
-    let schema_block = schema.map(|s| encode_schema_block(s, target_id as u32));
-    let data = if has_data {
-        encode_wal_block(schema.unwrap(), target_id as u32, data_batch.unwrap())
-    } else {
-        Vec::new()
-    };
-    MessageParts {
-        ctrl,
-        schema: schema_block,
-        data,
-    }
+        seek_pk_extra,
+        schema.map(|s| encode_schema_block(s, target_id as u32)),
+        schema.zip(data_batch),
+    )
 }
 
 /// Like [`encode_message_parts`] but omits the schema block from the frame.
@@ -160,31 +184,16 @@ pub fn encode_message_noschema_parts(
     data_schema: &Schema,
     data_batch: &ZSetBatch,
 ) -> MessageParts {
-    let has_data = !data_batch.is_empty();
-    let mut flags_out = flags;
-    if has_data {
-        flags_out |= FLAG_HAS_DATA;
-    }
-    let ctrl_hdr = Header {
-        status: STATUS_OK,
+    encode_parts(
         target_id,
         client_id,
-        flags: flags_out,
-        seek_pk: 0,
-        seek_col_idx: 0,
-        request_id: 0,
-    };
-    let ctrl = encode_control_block(&ctrl_hdr, "", &[]);
-    let data = if has_data {
-        encode_wal_block(data_schema, target_id as u32, data_batch)
-    } else {
-        Vec::new()
-    };
-    MessageParts {
-        ctrl,
-        schema: None,
-        data,
-    }
+        flags,
+        0,
+        0,
+        &[],
+        None,
+        Some((data_schema, data_batch)),
+    )
 }
 
 /// Encode an atomic user-table push transaction frame (`FLAG_PUSH_TXN`) into
@@ -268,17 +277,8 @@ pub fn send_message_with_extra(
     seek_col_idx: u64,
     seek_pk_extra: &[u8],
 ) -> Result<(), ProtocolError> {
-    let ctrl_hdr = Header {
-        status: STATUS_OK,
-        target_id,
-        client_id,
-        flags,
-        seek_pk: 0,
-        seek_col_idx,
-        request_id: 0,
-    };
-    let payload = encode_control_block(&ctrl_hdr, "", seek_pk_extra);
-    t.send_framed(&payload)
+    let parts = encode_parts(target_id, client_id, flags, 0, seek_col_idx, seek_pk_extra, None, None);
+    t.send_framed(&parts.ctrl)
 }
 
 /// Parse a wire payload (without 4-byte frame header) into a `Message`.
@@ -375,17 +375,13 @@ pub fn recv_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::transport::make_transport_pair;
     use crate::protocol::types::{BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, ZSetBatch};
     use crate::protocol::wire_flags_set_schema_version;
     use crate::protocol::WireConflictMode;
     use crate::protocol::{Header, FLAG_PUSH, FLAG_SEEK, STATUS_ERROR};
-    use std::os::unix::io::RawFd;
 
     // ── FLAG_PUSH_TXN family assembly ──────────────────────────────────────
-
-    fn u32_at(buf: &[u8], off: usize) -> usize {
-        u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize
-    }
 
     /// A multi-family `FLAG_PUSH_TXN` frame (both modes, a repeated tid, a
     /// delete family): each family's schema block and data block must be built
@@ -436,27 +432,16 @@ mod tests {
             assert_eq!(fam.tid, exp_tid);
             assert_eq!(WireConflictMode::from_u8(fam.mode), exp_mode);
             // The schema block is this family's, keyed under this family's tid.
-            assert_eq!(u32_at(fam.schema_block, gnitz_wire::WAL_OFF_TID), exp_tid as usize);
+            assert_eq!(
+                gnitz_wire::read_u32_le(fam.schema_block, gnitz_wire::WAL_OFF_TID),
+                exp_tid
+            );
             let block_schema = schema_from_block(fam.schema_block).unwrap();
             assert_eq!(block_schema, schema);
             // ... and the data block decodes against it, with this family's rows.
             let (batch, _) = decode_wal_block(fam.wal_block, &block_schema).unwrap();
             assert_eq!(batch.len(), exp_rows);
         }
-    }
-
-    fn make_socketpair() -> (RawFd, RawFd) {
-        let mut fds = [0i32; 2];
-        unsafe {
-            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
-        }
-        (fds[0], fds[1])
-    }
-
-    /// Both ends of a socketpair as transports; drop closes the fds.
-    fn make_transport_pair() -> (ClientTransport, ClientTransport) {
-        let (a, b) = make_socketpair();
-        (ClientTransport::from_unix_fd(a), ClientTransport::from_unix_fd(b))
     }
 
     // ── control block roundtrip ─────────────────────────────────────────────
@@ -801,12 +786,8 @@ mod tests {
         let pk = PkTuple::from_bytes(&(0..24u8).collect::<Vec<_>>());
         let payload = encode_message_parts(7, 1, FLAG_SEEK, &pk, 0, None, None).to_vec();
 
-        let ctrl_size = u32::from_le_bytes(
-            payload[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let (hdr, _err, extra) = decode_control_block(&payload[..ctrl_size]).unwrap();
+        let ctrl = gnitz_wire::wal::block_slice_at(&payload, 0).unwrap();
+        let (hdr, _err, extra) = decode_control_block(ctrl).unwrap();
 
         let (want_lo, want_extra) = pk.split_wire();
         assert_eq!(hdr.seek_pk, want_lo);

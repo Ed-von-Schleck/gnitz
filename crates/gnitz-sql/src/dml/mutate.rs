@@ -311,11 +311,10 @@ fn resolve_where_matches(
     let mut eff = ZSetBatch::with_capacity(reply_schema, n);
     let gather = RowGather::new(reply_schema);
     if let Some(b) = &mut committed {
-        let stride = schema.pk_stride() as u8;
         for i in 0..b.len() {
             // A PK the transaction has written is decided by its buffered version
             // below, whatever the committed row said.
-            if !net.contains_key(&b.pks.get_tuple(i, stride)) {
+            if !net.contains_key(&b.pks.get_tuple(i)) {
                 gather.take(b, i, &mut eff);
             }
         }
@@ -641,10 +640,8 @@ mod tests {
         })
         .unwrap();
 
-        let stride = schema.pk_stride() as u8;
-        // PK comes from pk_src (100), NOT carry_src (200).
-        assert_eq!(dst.pks.get_tuple(0, stride), pk_src.pks.get_tuple(0, stride));
-        assert_ne!(dst.pks.get_tuple(0, stride), carry_src.pks.get_tuple(0, stride));
+        assert_eq!(dst.pks.get_tuple(0), pk_src.pks.get_tuple(0));
+        assert_ne!(dst.pks.get_tuple(0), carry_src.pks.get_tuple(0));
         // v's null bit (payload_idx 0) must be SET after the NULL assignment.
         assert_ne!(dst.nulls[0] & 0b01, 0, "v must be null after SET v = NULL");
         // b carried from carry_src ([1,2,3]), not pk_src ([9,9,9]).

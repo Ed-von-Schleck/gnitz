@@ -42,7 +42,7 @@ use crate::SqlResult;
 use gnitz_core::{GnitzClient, ReduceOutKey, Schema, ZSetBatch, MAX_COLUMNS};
 use gnitz_wire::{AggReadItem, AggReadSpec, ReadSink};
 use sqlparser::ast::{Expr, LimitClause, Query, Select, SetExpr};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// The single derivation-rejection: an ad-hoc SELECT reads one relation, but this
 /// query derives a new one (`construct` names what was detected — `JOIN`, `set
@@ -94,7 +94,7 @@ pub(super) struct Target {
     /// The FROM item as written — a pass-through CTE keeps its alias.
     pub(super) name: String,
     pub(super) tid: u64,
-    pub(super) schema: Rc<Schema>,
+    pub(super) schema: Arc<Schema>,
     /// `None` is a chain-minted segment id, which never reaches here: a derived
     /// table in FROM is rejected as a derivation before any resolution.
     pub(super) kind: Option<RelationKind>,
