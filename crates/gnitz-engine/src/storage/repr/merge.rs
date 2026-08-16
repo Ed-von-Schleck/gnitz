@@ -68,6 +68,12 @@ impl ColPtr {
 pub(crate) struct UnifiedSource {
     pub pk: ColPtr,
     pub null_bmp: ColPtr,
+    /// Payload-column null bits this source cannot answer for, OR'd into every
+    /// null word the scatter copies out. Non-zero only for a shard written
+    /// before an `ALTER TABLE … ADD COLUMN` (`MappedShard::null_pad_mask`); an
+    /// in-memory batch always matches its schema, so `mem_batch_to_unified`
+    /// sets `0`.
+    pub null_pad_mask: u64,
     pub cols: [ColPtr; MAX_COLUMNS - 1],
     pub blob_ptr: *const u8,
     pub blob_len: usize,
@@ -101,6 +107,7 @@ pub(crate) fn mem_batch_to_unified(mb: &MemBatch, schema: &SchemaDescriptor) -> 
             base: unsafe { data_ptr.add(mb.offsets[super::batch::REG_NULL_BMP]) },
             stride: super::batch::FIXED_REGION_BYTES,
         },
+        null_pad_mask: 0,
         cols,
         blob_ptr: mb.blob.as_ptr(),
         blob_len: mb.blob.len(),

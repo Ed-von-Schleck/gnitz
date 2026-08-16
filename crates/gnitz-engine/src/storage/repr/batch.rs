@@ -37,6 +37,12 @@ const RELOCATE_CELL_COST_BYTES: usize = 500;
 /// 3 + 64 = 67, rounded up to 68 to keep the array size as a multiple of 4.
 pub(crate) const MAX_BATCH_REGIONS: usize = 68;
 
+/// How many payload columns the region array can hold — the writer's own cap,
+/// enforced by `fill_payload_strides`. Deliberately looser than the semantic cap
+/// a real table hits first (64, from `MAX_COLUMNS` with at least one PK column),
+/// so a change to the PK rules cannot turn a valid shard into `InvalidShard`.
+pub(in crate::storage) const MAX_PAYLOAD_REGIONS: usize = MAX_BATCH_REGIONS - REG_PAYLOAD_START;
+
 /// Max regions **including** the trailing blob region — the bound for the
 /// WAL/wire region-directory arrays (ptrs / sizes / offsets / positions).
 /// Owned by `gnitz_wire::wal` (the framer's directory cap); the engine ties its
@@ -197,8 +203,7 @@ fn fill_payload_strides(schema: &SchemaDescriptor, strides: &mut [u8; MAX_BATCH_
         assert!(
             idx < MAX_BATCH_REGIONS,
             "fill_payload_strides: combined payload column count exceeds the batch \
-             region limit ({MAX_BATCH_REGIONS} = {REG_PAYLOAD_START} + {} payload cols)",
-            MAX_BATCH_REGIONS - REG_PAYLOAD_START,
+             region limit ({MAX_BATCH_REGIONS} = {REG_PAYLOAD_START} + {MAX_PAYLOAD_REGIONS} payload cols)",
         );
         strides[idx] = col.size();
         idx += 1;

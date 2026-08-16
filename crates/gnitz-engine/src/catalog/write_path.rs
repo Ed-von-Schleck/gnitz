@@ -14,7 +14,9 @@ use super::*;
 use crate::schema::make_index_schema;
 use crate::storage::{compare_rows, compare_rows_except};
 use gnitz_wire::{
-    COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME,
+    COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL,
+    COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_NAME,
+    SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME,
 };
 
 /// The only handle the DDL/imperative layer has on catalog state: submit one
@@ -339,7 +341,7 @@ impl CatalogEngine {
         Ok(net_dead)
     }
 
-    /// §3.1: DROP-shape validation for the COL_TAB family, replacing the bare
+    /// Column-ALTER shape validation for the COL_TAB family, replacing the bare
     /// retraction contract. Runs only on the master live-DDL `submit` path (worker
     /// `ddl_sync` and SAL recovery bypass precheck). Enforces, per distinct column
     /// PK on a registered owner:
@@ -352,7 +354,7 @@ impl CatalogEngine {
     ///   `{name, is_hidden, is_nullable}` must match, and `is_hidden` /
     ///   `is_nullable` may change only `0→1` (forward path; compensation replays
     ///   `1→0` through `submit_local`, which bypasses precheck).
-    /// - **Owner guard** — every rewrite pair, RENAME included, requires a
+    /// - **Owner guard** — every transition, RENAME included, requires a
     ///   registered user base table owner (not a view, not system-range).
     /// - **Transition-scoped guards** — scoped to the transition rather than
     ///   blanket, which would reject RENAME: an `is_hidden 0→1` (DROP COLUMN) or
@@ -361,16 +363,18 @@ impl CatalogEngine {
     ///   pair (RENAME COLUMN) is accepted with neither (views bind columns by
     ///   ordinal, and renaming a PK column is legal).
     /// - **Unpaired `-1`** on a registered owner is rejected (physical column
-    ///   removal does not exist); **unpaired `+1`** is rejected (no column-append
-    ///   feature). An unregistered owner is a live CREATE TABLE COL append (the
-    ///   owner table registers later in the bundle), so `+1`-only rows pass.
+    ///   removal does not exist). **Unpaired `+1`** on a registered owner is
+    ///   ADD COLUMN — see [`precheck_column_append`](Self::precheck_column_append).
+    ///   An unregistered owner is a live CREATE TABLE COL append (the owner table
+    ///   registers later in the bundle), so its `+1`-only rows pass untouched.
     fn precheck_column_family(&mut self, batch: &Batch) -> Result<(), String> {
         let schema = SysFamily::Column.schema();
         // The payload fields a rewrite pair may change; everything else must match.
         let pair_mask: u64 = (1 << COLTAB_PAY_NAME) | (1 << COLTAB_PAY_IS_HIDDEN) | (1 << COLTAB_PAY_IS_NULLABLE);
         for sig in pk_signatures(batch) {
             let pk = sig.pk;
-            let owner_id = gnitz_wire::unpack_col_id(pk as u64).0 as i64;
+            let (owner_id, col_idx) = gnitz_wire::unpack_col_id(pk as u64);
+            let owner_id = owner_id as i64;
 
             // A live ALTER is exactly one rewrite pair; nothing legitimate
             // repeats a sign on one column PK.
@@ -399,6 +403,13 @@ impl CatalogEngine {
 
             self.check_cas_and_net(SysFamily::Column, batch, &sig, "system-catalog column")?;
 
+            // Every column transition — RENAME, DROP, ADD — needs a user base
+            // table owner. A view registers as `RelationKind::View` and a system
+            // family as `SystemCatalog`, so both fail here.
+            if !is_base {
+                return Err(format!("cannot ALTER a column of {owner_id}: not a user base table"));
+            }
+
             match (sig.neg, sig.pos) {
                 (Some(nj), Some(pj)) => {
                     // (3) Pair-field delta: every payload field outside
@@ -421,29 +432,12 @@ impl CatalogEngine {
                         return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
                     }
 
-                    // Every rewrite pair — RENAME included — needs a user base
-                    // table owner. A view registers as `RelationKind::View` and
-                    // a system family as `SystemCatalog`, so both fail here.
-                    if !is_base {
-                        return Err(format!("cannot ALTER a column of {owner_id}: not a user base table"));
-                    }
-
                     let is_drop = (hid_old == 0 && hid_new == 1) || (null_old == 0 && null_new == 1);
                     if is_drop {
-                        let col_idx = gnitz_wire::unpack_col_id(pk as u64).1 as u32;
-                        if owner_schema.pk_indices().contains(&col_idx) {
+                        if owner_schema.pk_indices().contains(&(col_idx as u32)) {
                             return Err("cannot DROP COLUMN / DROP NOT NULL on a primary-key column".into());
                         }
-                        // Dependent-view RESTRICT (defense-in-depth; the friendly
-                        // client-side reject is in `plan/alter.rs`). A DROP COLUMN
-                        // / DROP NOT NULL must not proceed while a view scans the
-                        // base table: its operator traces hold re-keyed base rows
-                        // under the pre-ALTER comparator.
-                        if self.dag.get_dep_map().get(&owner_id).is_some_and(|v| !v.is_empty()) {
-                            return Err(format!(
-                                "cannot DROP COLUMN / DROP NOT NULL on table {owner_id}: it has dependent views (drop them first)"
-                            ));
-                        }
+                        self.reject_if_dependent_views(owner_id, "DROP COLUMN / DROP NOT NULL")?;
                     }
                 }
                 (Some(_), None) => {
@@ -452,13 +446,89 @@ impl CatalogEngine {
                             .into(),
                     );
                 }
-                (None, Some(_)) => {
-                    return Err(
-                        "cannot append a column to a registered table (ALTER TABLE ADD COLUMN is not supported)".into(),
-                    );
-                }
+                (None, Some(pj)) => self.precheck_column_append(batch, pj, owner_id, col_idx, &owner_schema)?,
                 (None, None) => {}
             }
+        }
+        Ok(())
+    }
+
+    /// Reject a column transition on `owner_id` while any view scans it: a
+    /// compiled circuit's `ScanDelta` register schema is baked from the base
+    /// descriptor and its operator traces hold re-keyed base rows at the old
+    /// shape. Defense-in-depth; the friendly client-side reject is in
+    /// `plan/alter.rs`.
+    fn reject_if_dependent_views(&mut self, owner_id: i64, op: &str) -> Result<(), String> {
+        if self.dag.get_dep_map().get(&owner_id).is_some_and(|v| !v.is_empty()) {
+            return Err(format!(
+                "cannot {op} on table {owner_id}: it has dependent views (drop them first)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// ADD COLUMN: one unpaired `+1` appending a trailing nullable payload
+    /// column to registered base table `owner_id`.
+    ///
+    /// The caller's `check_cas_and_net` already closed the concurrent-append
+    /// race with no second probe — `pack_col_id` is a pure function of the
+    /// client-read physical column count, so two connections racing pick the
+    /// *same* `column_id`, and the second's `+1` lands on a now-live row where
+    /// `live_weight + Σ = 2` fails the per-PK net bound.
+    fn precheck_column_append(
+        &mut self,
+        batch: &Batch,
+        pj: usize,
+        owner_id: i64,
+        col_idx: u64,
+        owner_schema: &SchemaDescriptor,
+    ) -> Result<(), String> {
+        self.reject_if_dependent_views(owner_id, "ADD COLUMN")?;
+        // The append must be *trailing*, and this is the only check that makes
+        // it so: the rebuild path reads the owner's defs with contiguity
+        // checking off and maps them positionally, so a gap would silently shift
+        // every column past it rather than fail. (A duplicate index is a
+        // duplicate COL_TAB PK, which the net bound already rejects.)
+        if !self.is_trailing_col_append(owner_id, col_idx) {
+            return Err(format!(
+                "cannot ADD COLUMN at index {col_idx} on table {owner_id}: \
+                 columns must be appended at index {}",
+                owner_schema.num_columns()
+            ));
+        }
+        // What `check_col_defs` would find on the prospective set, read off the
+        // descriptor already in hand rather than by re-scanning COL_TAB. A rule
+        // added there does not reach here. `validate_pk_cols` is not re-run: a
+        // trailing non-PK append cannot invalidate an already-valid PK list.
+        if owner_schema.num_columns() >= crate::schema::MAX_COLUMNS {
+            return Err(format!(
+                "cannot ADD COLUMN on table {owner_id}: it already has {} columns (max {})",
+                owner_schema.num_columns(),
+                crate::schema::MAX_COLUMNS
+            ));
+        }
+        let type_code = batch.read_payload_u64(pj, COLTAB_PAY_TYPE_CODE) as u8;
+        if !gnitz_wire::is_valid_type_code(type_code) {
+            return Err(format!("cannot ADD COLUMN with invalid type code {type_code}"));
+        }
+        // A new column over existing rows is unconditionally nullable, carries
+        // no SERIAL/FK, and is visible.
+        if batch.read_payload_u64(pj, COLTAB_PAY_IS_NULLABLE) != 1 {
+            return Err("ADD COLUMN must append a nullable column".into());
+        }
+        if batch.read_payload_u64(pj, COLTAB_PAY_IS_SERIAL) != 0
+            || batch.read_payload_u64(pj, COLTAB_PAY_IS_HIDDEN) != 0
+            || batch.read_payload_u64(pj, COLTAB_PAY_FK_TABLE_ID) != 0
+        {
+            return Err("ADD COLUMN must not append a SERIAL, hidden, or foreign-key column".into());
+        }
+        // Nothing else anchors these three on an unpaired row, and they are what
+        // clients read back.
+        if batch.read_payload_u64(pj, COLTAB_PAY_OWNER_KIND) as i64 != OWNER_KIND_TABLE
+            || batch.read_payload_u64(pj, COLTAB_PAY_OWNER_ID) as i64 != owner_id
+            || batch.read_payload_u64(pj, COLTAB_PAY_COL_IDX) != col_idx
+        {
+            return Err("an appended column's owner/index fields must match its packed id".into());
         }
         Ok(())
     }

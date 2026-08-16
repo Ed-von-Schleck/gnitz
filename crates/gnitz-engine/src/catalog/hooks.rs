@@ -437,28 +437,61 @@ impl CatalogEngine {
         })
     }
 
-    /// ALTER … DROP NOT NULL side effect: when a COL_TAB rewrite pair flips a
-    /// base table's column `is_nullable 0→1`, the whole-schema payload comparator
-    /// moves `FixedIntNonnull → Generic`. Rebuild the descriptor from the
-    /// (freshly invalidated) column defs and publish it into the store in place,
-    /// so no path can sort a now-nullable column under the null-blind fast
-    /// comparator and let a NULL consolidate against a real `0` (§5).
+    /// True if `col_idx` appends a *trailing* column to registered relation
+    /// `owner_id`. `precheck_column_append` admits exactly this shape and
+    /// `hook_column_alter` recognizes an append by the same test, so the worker
+    /// `ddl_sync` and SAL-replay paths — which bypass precheck entirely — act on
+    /// exactly what the master admitted.
+    pub(super) fn is_trailing_col_append(&self, owner_id: i64, col_idx: u64) -> bool {
+        self.dag
+            .tables
+            .get(&owner_id)
+            .is_some_and(|e| col_idx as usize == e.schema.num_columns())
+    }
+
+    /// Column-ALTER side effect: rebuild the owner's descriptor from the
+    /// (freshly invalidated) column defs and publish it into the store in place.
+    ///
+    /// Two shapes reach it. A **rewrite pair** flipping `is_nullable 0→1` (DROP
+    /// NOT NULL) moves the whole-schema payload comparator
+    /// `FixedIntNonnull → Generic`, so no path can sort a now-nullable column
+    /// under the null-blind fast comparator and let a NULL consolidate against a
+    /// real `0`. A **trailing append** (ADD COLUMN) grows the region count, which
+    /// widens the resident runs and re-opens every shard.
     ///
     /// Trigger is **batch-shape-derived, never context-derived**: this hook fires
     /// on live apply, worker sync, and boot replay alike, with no cascade flag, so
-    /// the shape is the only reliable signal. It acts only on a **rewrite pair** —
-    /// a column PK carrying both a `-1` and a `+1` row — whose owner is a
-    /// registered base table. Only a live column ALTER (or its rollback
-    /// compensation) produces one: CREATE TABLE bundles and boot replay are
-    /// all-`+1`, DROP TABLE/VIEW cascades all-`-1` — both skipped wholesale.
-    /// RENAME COLUMN, DROP COLUMN, and an already-nullable DROP NOT NULL pairs
+    /// the shape is the only reliable signal. It acts only on a rewrite pair — a
+    /// column PK carrying both a `-1` and a `+1` row — or on a trailing append
+    /// (an unpaired `+1` at its registered owner's current column count).
+    /// Everything else is skipped: a DROP TABLE/VIEW cascade is all-`-1`; a live
+    /// CREATE TABLE bundle's `+1`s name an owner that registers later in the same
+    /// bundle; and `replay_catalog`'s boot full-scan hands over **every** live
+    /// COL_TAB row of every relation at `+1`, whose row `i` has
+    /// `col_idx = i < num_columns()`. Naming the append shape rather than merely
+    /// "carries a `+1`" is what keeps that boot scan from walking every base
+    /// table's column defs and rebuilding its descriptor.
+    ///
+    /// Re-applying an already-applied ADD COLUMN fails the same test and no-ops:
+    /// this hook is what widens the descriptor, so `col_idx` no longer equals
+    /// `num_columns()`. An append's rollback compensation is an unpaired `-1`,
+    /// which is likewise ignored — safe because compensation can only run before
+    /// the swap committed (a prepare failure mutates nothing).
+    ///
+    /// RENAME COLUMN, DROP COLUMN, and an already-nullable DROP NOT NULL pair
     /// reach the rebuild and no-op there (`SchemaDescriptor::eq`): none change a
     /// descriptor field.
     fn hook_column_alter(&mut self, batch: &Batch) -> Result<(), String> {
-        // Distinct owner tids with a `-1`/`+1` pair (COL_TAB PK = pack_col_id).
+        // Distinct owner tids carrying a `-1`/`+1` pair or a trailing append
+        // (COL_TAB PK = pack_col_id).
         let mut owners: Vec<i64> = Vec::new();
-        for sig in pk_signatures(batch).iter().filter(|s| s.is_pair()) {
-            let owner = gnitz_wire::unpack_col_id(sig.pk as u64).0 as i64;
+        for sig in pk_signatures(batch).iter() {
+            let (owner, col_idx) = gnitz_wire::unpack_col_id(sig.pk as u64);
+            let owner = owner as i64;
+            let is_append = sig.pos.is_some() && sig.neg.is_none() && self.is_trailing_col_append(owner, col_idx);
+            if !(sig.is_pair() || is_append) {
+                continue;
+            }
             if !owners.contains(&owner) {
                 owners.push(owner);
             }
@@ -472,14 +505,13 @@ impl CatalogEngine {
             }
             let cur = entry.schema;
             // Rebuild from the post-invalidate col defs, carrying the placement
-            // `eq` ignores. Only an is_nullable 0→1 flip changes the descriptor;
-            // when it does, publish infallibly in place (equal-region descriptor
-            // swap).
+            // `eq` ignores. Only an is_nullable 0→1 flip or a trailing append
+            // changes the descriptor; when it does, publish it into the store.
             let col_defs = self.read_column_defs(owner);
             let rebuilt = build_schema_from_col_defs(&col_defs, cur.pk_indices(), cur.placement())
                 .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
             if rebuilt != cur {
-                self.dag.swap_table_schema(owner, rebuilt);
+                self.dag.swap_table_schema(owner, rebuilt)?;
             }
         }
         Ok(())

@@ -1,13 +1,17 @@
-//! `ALTER TABLE` operation dispatch: rename table/view/column, ADD/DROP
-//! CONSTRAINT (mapped to the CREATE/DROP INDEX paths), and clean rejections for
-//! every operation not yet supported. `ALTER VIEW … AS` lives in
+//! `ALTER TABLE` operation dispatch: rename table/view/column, ADD/DROP COLUMN,
+//! DROP NOT NULL, ADD/DROP CONSTRAINT (mapped to the CREATE/DROP INDEX paths),
+//! and clean rejections for every operation not yet supported. `ALTER VIEW … AS` lives in
 //! `crate::hir::create` (it recompiles a query). Every supported op is one
 //! catalog-only `push_ddl` through the `gnitz-core` client.
 
 use crate::ast_util::extract_name;
 use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
-use crate::validate::{reject_unhonored_unique_fields, validate_user_index_name, validate_user_name};
+use crate::types::{serial_underlying, sql_type_to_typecode};
+use crate::validate::{
+    reject_unhonored_column_options, reject_unhonored_unique_fields, validate_user_index_name, validate_user_name,
+    ColumnOptionSite,
+};
 use crate::SqlResult;
 use gnitz_core::GnitzClient;
 use sqlparser::ast::{
@@ -77,11 +81,21 @@ pub(crate) fn execute_alter_table(
             column_names,
             *drop_behavior,
         ),
-        // ADD COLUMN is plan 2's; reject here (its if_not_exists / column_position
-        // FIRST/AFTER included).
-        AlterTableOperation::AddColumn { .. } => Err(GnitzSqlError::Unsupported(
-            "ALTER TABLE ADD COLUMN is not supported".to_string(),
-        )),
+        AlterTableOperation::AddColumn {
+            // Inert: `ADD c INT` and `ADD COLUMN c INT` mean the same thing.
+            column_keyword: _,
+            if_not_exists,
+            column_def,
+            column_position,
+        } => add_column(
+            client,
+            schema_name,
+            &alter.name,
+            alter.if_exists,
+            *if_not_exists,
+            column_def,
+            column_position.as_ref(),
+        ),
         // Destructured per-variant so a newly supported operation is an additive
         // arm split, and with no plan path in any message.
         AlterTableOperation::AlterColumn { column_name, op } => {
@@ -162,6 +176,61 @@ fn rename_column(
         .alter_rename_column(schema_name, &source_name, old_col, new_col)
         .map_err(GnitzSqlError::Exec)?;
     Ok(altered("column", new_col.to_string()))
+}
+
+/// `ALTER TABLE <t> ADD [COLUMN] <c> <type>` — appends one **nullable** payload
+/// column at the end of `t`'s physical layout (columns hidden by a previous DROP
+/// COLUMN included). Existing rows read it as NULL. `t` must be a base table;
+/// the dependent-view RESTRICT and the trailing-position, `MAX_COLUMNS` and
+/// field-shape checks are enforced engine-side.
+///
+/// Everything that would need a value for the existing rows, a second catalog
+/// object, or a physical move is rejected: NOT NULL (it would need a full-table
+/// validation scan), SERIAL, the options `execute_create_table` already rejects
+/// (DEFAULT, CHECK, GENERATED, IDENTITY, COLLATE, …), inline PRIMARY KEY /
+/// UNIQUE / REFERENCES, and the MySQL FIRST/AFTER placement.
+fn add_column(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    source: &ObjectName,
+    tbl_if_exists: bool,
+    if_not_exists: bool,
+    column_def: &sqlparser::ast::ColumnDef,
+    column_position: Option<&sqlparser::ast::MySQLColumnPosition>,
+) -> Result<SqlResult, GnitzSqlError> {
+    if if_not_exists {
+        return Err(GnitzSqlError::Unsupported(
+            "ALTER TABLE ADD COLUMN IF NOT EXISTS is not supported".to_string(),
+        ));
+    }
+    if column_position.is_some() {
+        return Err(GnitzSqlError::Unsupported(
+            "ALTER TABLE ADD COLUMN … FIRST/AFTER is not supported (a column is always appended last)".to_string(),
+        ));
+    }
+    reject_unhonored_column_options(column_def, "ADD COLUMN", ColumnOptionSite::AddColumn)?;
+    // A SERIAL column's generator is seeded from the table's live rows, which an
+    // append has none of; named here so it does not fall out as "unsupported type".
+    if serial_underlying(&column_def.data_type).is_some() {
+        return Err(GnitzSqlError::Unsupported(
+            "ALTER TABLE ADD COLUMN … SERIAL is not supported".to_string(),
+        ));
+    }
+
+    let col_name = &column_def.name.value;
+    let source_name = extract_name(source, "ALTER TABLE")?;
+    // No identifier validation: `validate_user_name` guards *relation* names
+    // only, and neither CREATE TABLE nor RENAME COLUMN validates a column one.
+    let Some((tid, _)) =
+        resolve_alter_base_table_with_schema(client, schema_name, &source_name, tbl_if_exists, "ADD COLUMN")?
+    else {
+        return Ok(altered("column", col_name.clone()));
+    };
+
+    let type_code = sql_type_to_typecode(&column_def.data_type)?;
+    let def = gnitz_core::ColumnDef::new(col_name, type_code, /* is_nullable */ true);
+    client.alter_add_column(tid, &def).map_err(GnitzSqlError::Exec)?;
+    Ok(altered("column", col_name.clone()))
 }
 
 /// `ALTER TABLE <t> DROP [COLUMN] [IF EXISTS] <c> [CASCADE]` — a **logical** drop:

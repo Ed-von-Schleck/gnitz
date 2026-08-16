@@ -126,6 +126,33 @@ impl RunSet {
         self.bloom.take();
     }
 
+    /// Widen every run narrower than `out_schema` to it, filling the appended
+    /// trailing columns with NULL (`ALTER TABLE … ADD COLUMN`). `in_schema` is
+    /// this set's still-live pre-ALTER descriptor, which a `Batch` cannot supply
+    /// on its own (it carries only region strides).
+    ///
+    /// Each widened run is a **new** `Rc`, never a mutation through the existing
+    /// one — a live `ReadCursor` may still hold it. Deliberately not `push`:
+    /// that folds at `FOLD_THRESHOLD`, which would collapse the set's runs as a
+    /// side effect of a schema swap.
+    pub(super) fn widen_runs(&mut self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) {
+        let out_npc = out_schema.num_payload_cols();
+        if in_schema.num_payload_cols() == out_npc {
+            return;
+        }
+        let mut bytes = 0;
+        for run in &mut self.runs {
+            if run.num_payload_cols() < out_npc {
+                let widened = run.widened_with_null_tail(in_schema, out_schema);
+                *run = Rc::new(widened);
+            }
+            bytes += run.total_bytes();
+        }
+        self.bytes = bytes;
+        // The bloom hashes PK bytes alone (`bloom_add_batch`), which the widen
+        // copies verbatim, so it stays valid.
+    }
+
     /// Fold every run into one consolidated run, dropping net-zero
     /// (PK, payload) rows. The bloom is dropped rather than rebuilt: the next
     /// probe rebuilds it from the survivors alone, so a set that is folded and

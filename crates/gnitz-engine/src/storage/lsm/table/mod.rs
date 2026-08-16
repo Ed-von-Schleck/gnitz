@@ -17,7 +17,7 @@ use super::manifest::PreparedManifest;
 use super::read_cursor::{self, ReadCursor};
 use super::run::{pk_match_rows_from, Run, StoredRow};
 use super::run_set::RunSet;
-use super::shard_index::ShardIndex;
+use super::shard_index::{ShardEntry, ShardIndex};
 #[cfg(test)]
 use super::shard_reader::MappedShard;
 use crate::schema::SchemaDescriptor;
@@ -270,15 +270,28 @@ impl Table {
         super::manifest::path(&self.directory)
     }
 
-    /// Replace the payload comparator schema in place (ALTER … DROP NOT NULL).
-    /// The run sets read `&self.schema` at call time, so only the shard index
-    /// (compaction comparator) holds a second copy to update. The region layout
-    /// is unchanged, so on-disk shards and resident runs stay valid; only
-    /// `cached_full_scan` must be dropped, as it was materialized under the old
-    /// null interpretation.
-    pub fn swap_schema(&mut self, schema: SchemaDescriptor) {
+    /// Fallible half of a column-ALTER schema swap: re-open every registered
+    /// shard under `schema`, mutating nothing. Empty for an equal-region ALTER
+    /// (RENAME COLUMN, DROP COLUMN, DROP NOT NULL); one entry per shard for the
+    /// region-count growth of ADD COLUMN. The caller runs this over every
+    /// partition of a store before committing any of them, so a failure on one
+    /// partition cannot leave an earlier one already widened.
+    pub(super) fn prepare_swap_schema(&self, schema: &SchemaDescriptor) -> Result<Vec<ShardEntry>, StorageError> {
+        self.shard_index.reopen_all(schema)
+    }
+
+    /// Infallible half: publish `schema` across this partition, installing the
+    /// shard handles [`prepare_swap_schema`](Self::prepare_swap_schema) staged.
+    ///
+    /// Widening the resident tiers reads `self.schema` as the runs' input
+    /// schema, so it must precede the reassignment. `cached_full_scan` is
+    /// dropped either way: it was materialized under the old column set / null
+    /// interpretation.
+    pub(super) fn commit_swap_schema(&mut self, schema: SchemaDescriptor, staged: Vec<ShardEntry>) {
+        self.memtable.widen_runs(&self.schema, &schema);
+        self.ram_tier.widen_runs(&self.schema, &schema);
+        self.shard_index.install_reopened(staged, schema);
         self.schema = schema;
-        self.shard_index.swap_schema(schema);
         self.cached_full_scan = None;
     }
 

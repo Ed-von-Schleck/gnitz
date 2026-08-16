@@ -242,6 +242,16 @@ impl Schema {
         self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
     }
 
+    /// Physical index of the visible column named `name` (ASCII-case-insensitive),
+    /// or `None`. Hidden (DROP COLUMN'd) slots never match: their names are
+    /// excluded from resolution, so a new column may reuse one.
+    #[inline]
+    pub fn visible_column_named(&self, name: &str) -> Option<usize> {
+        self.visible_columns()
+            .find(|(_, c)| c.name.eq_ignore_ascii_case(name))
+            .map(|(i, _)| i)
+    }
+
     /// True iff any **non-PK** column is hidden — i.e. the schema carries a
     /// DROP COLUMN'd slot (a logical drop: physically present, zero-filled NOT
     /// NULL, flagged hidden). A view's synthetic hidden key slots

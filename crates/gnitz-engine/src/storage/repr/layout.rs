@@ -4,21 +4,21 @@
 use crate::foundation::xxh;
 
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
-/// Shard file format version. A shard records no schema — the reader derives
-/// its regions from the live `SchemaDescriptor` — so a column-shape change to a
-/// system family needs a bump here too, not just a header/region layout change.
-/// The reader's region count and exact region sizes come from that schema, so
-/// they reject most shards written under a different one; a Constant-encoded
-/// region is one element wide under either schema, and only this word rejects
-/// that.
-pub(crate) const SHARD_VERSION: u64 = 11;
+/// Shard file format version. A shard records only its payload-column count
+/// (`OFF_FILE_NPC`) — every other aspect of a region is derived from the live
+/// `SchemaDescriptor` — so a column-shape change to a system family needs a bump
+/// here too, not just a header/region layout change. The reader's exact region
+/// sizes come from that schema, so they reject most shards written under a
+/// different one; a Constant-encoded region is one element wide under either
+/// schema, and only this word rejects that.
+pub(crate) const SHARD_VERSION: u64 = 12;
 
 /// Pin the system-family column shapes to the version word above, the way
 /// `gnitz_wire::wal` pins them to `WAL_FORMAT_VERSION`. Nothing else notices a
 /// shape change. If this fails, bump `SHARD_VERSION` and paste the reported
 /// digest here.
 const _: () = assert!(
-    gnitz_wire::SYS_SCHEMA_DIGEST == 5353188239287564337 && SHARD_VERSION == 11,
+    gnitz_wire::SYS_SCHEMA_DIGEST == 5353188239287564337 && SHARD_VERSION == 12,
     "system-family column shapes changed: bump SHARD_VERSION"
 );
 pub(crate) const HEADER_SIZE: usize = 64;
@@ -29,7 +29,11 @@ pub(crate) const OFF_MAGIC: usize = 0;
 pub(crate) const OFF_VERSION: usize = 8;
 pub(crate) const OFF_ROW_COUNT: usize = 16;
 pub(crate) const OFF_DESC_CHECKSUM: usize = 24;
-// Bytes [32,40) unused; the writer leaves them zero and the digest covers them.
+/// The writer's `schema.num_payload_cols()` (u64 LE) — the file's own arity,
+/// which fixes its region count and blob-region index. A reader whose schema is
+/// wider (post-`ALTER TABLE … ADD COLUMN`) walks the directory by this count and
+/// pads the columns past it to NULL.
+pub(crate) const OFF_FILE_NPC: usize = 32;
 pub(crate) const OFF_XOR8_OFFSET: usize = 40;
 pub(crate) const OFF_XOR8_SIZE: usize = 48;
 pub(crate) const OFF_XOR8_CHECKSUM: usize = 56;

@@ -391,7 +391,12 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
         unsafe {
             std::ptr::copy_nonoverlapping(pk_ptr, pk_dst.add(dst_row * pks), pks);
             std::ptr::copy_nonoverlapping(wb.as_ptr(), wt_dst.add(dst_row * FB), FB);
-            std::ptr::copy_nonoverlapping(nbm_ptr, nbm_dst.add(dst_row * FB), FB);
+            // Unaligned read/OR/write rather than a straight copy: a shard
+            // written before an `ALTER … ADD COLUMN` carries no bits for the
+            // appended columns, and `null_pad_mask` forces them to NULL. The
+            // mask is 0 for every in-memory source and every full-width shard.
+            let nbm = (nbm_ptr as *const u64).read_unaligned() | src.null_pad_mask;
+            (nbm_dst.add(dst_row * FB) as *mut u64).write_unaligned(nbm);
         }
     }
 }
@@ -658,6 +663,7 @@ mod tests {
                 base: nbm_base,
                 stride: 8,
             },
+            null_pad_mask: 0,
             cols,
             blob_ptr: mb.blob.as_ptr(),
             blob_len: mb.blob.len(),
@@ -847,6 +853,7 @@ mod tests {
                 base: nbm_base,
                 stride: 8,
             },
+            null_pad_mask: 0,
             cols,
             blob_ptr: mb.blob.as_ptr(),
             blob_len: mb.blob.len(),
@@ -912,6 +919,7 @@ mod tests {
                 base: nbm_base,
                 stride: 8,
             },
+            null_pad_mask: 0,
             cols,
             blob_ptr: mb.blob.as_ptr(),
             blob_len: mb.blob.len(),

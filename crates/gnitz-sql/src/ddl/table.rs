@@ -8,7 +8,7 @@ use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type
 use crate::validate::{
     default_index_name, disambiguate_index_name, non_key_eligible_error, reject_duplicate_names,
     reject_non_key_eligible, reject_unhonored_column_options, reject_unhonored_table_constraints,
-    validate_user_index_name, validate_user_name,
+    validate_user_index_name, validate_user_name, ColumnOptionSite,
 };
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TypeCode};
@@ -245,7 +245,7 @@ pub(crate) fn execute_create_table(
     // than being silently dropped or masked by the "requires at least one
     // PRIMARY KEY column" admission error below.
     for col in sql_cols {
-        reject_unhonored_column_options(col, "column definition")?;
+        reject_unhonored_column_options(col, "column definition", ColumnOptionSite::CreateTable)?;
     }
     reject_unhonored_table_constraints(&create.constraints, "table constraint")?;
 

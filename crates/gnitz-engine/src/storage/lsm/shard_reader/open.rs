@@ -13,7 +13,7 @@
 use std::ffi::CStr;
 
 use super::super::batch::{
-    strides_from_schema, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
+    strides_from_schema, FIXED_REGION_BYTES, MAX_PAYLOAD_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
 };
 use super::super::error::StorageError;
 use super::super::layout::*;
@@ -48,14 +48,26 @@ impl MappedShard {
         let pk_stride = schema.pk_stride();
         // Writer↔reader region-layout contract, shared with
         // `write_shard_streaming`: `strides` holds each fixed-width region's
-        // per-element width, `nr` is the trailing blob region's index.
-        let (strides, nr) = strides_from_schema(schema);
-        let nr = nr as usize;
-        let num_regions = nr + 1;
+        // per-element width. The file's own arity below drives the walk, so only
+        // the reader's strides are wanted here, not its region count.
+        let (strides, _) = strides_from_schema(schema);
+
+        // The file's own payload-column count, bounded before any arithmetic on
+        // it: `desc_len` is `HEADER_SIZE + n · DIR_ENTRY_SIZE` and overflows on a
+        // forged u64.
+        let file_npc = read_u64_le(data, OFF_FILE_NPC) as usize;
+        if file_npc > MAX_PAYLOAD_REGIONS {
+            return Err(StorageError::InvalidShard);
+        }
+        // The file's blob-region index, and with it the directory length the
+        // digest covers.
+        let file_nr = REG_PAYLOAD_START + file_npc;
+        let num_regions = file_nr + 1;
 
         // Ahead of every structural check, so no forged byte reaches unchecked
-        // arithmetic. The span's length comes from the schema, so a file written
-        // at another arity fails here rather than being re-chunked.
+        // arithmetic. The span's length comes from the file's own arity, so a
+        // forged `file_npc` moves the digest span *and* sits inside it: it fails
+        // the digest exactly as any other forged descriptive byte does.
         if desc_len(num_regions) > file_size {
             return Err(StorageError::Truncated);
         }
@@ -183,8 +195,27 @@ impl MappedShard {
         let weight = build_weight_region(&entries[REG_WEIGHT])?;
         let null_bmp = direct_region(&entries[REG_NULL_BMP], FIXED_REGION_BYTES)?;
 
-        let mut col_regions = Vec::with_capacity(nr - REG_PAYLOAD_START);
+        // `min` in both directions, and neither side is optional. A column the
+        // *file* does not carry has no directory entry; a column the *schema*
+        // does not describe cannot be built at all, since `build_payload_region`
+        // needs `elem_width` and `type_code` from the schema to validate a FoR
+        // region. The wider-file direction is reachable from a correct crash —
+        // a checkpoint publishes base manifests before making the catalog
+        // durable — so it is narrowed, not rejected; rejecting it would make the
+        // database unbootable. Reusing the current schema's strides for the
+        // file's own columns is sound because no ALTER changes an existing
+        // column's `type_code` or payload position.
+        let schema_npc = schema.num_payload_cols();
+        let mapped = file_npc.min(schema_npc);
+        // One region per payload column of the *reader's* schema, so every
+        // reader indexes it directly. Indices `[mapped, schema_npc)` name columns
+        // this file predates and become `Absent`.
+        let mut col_regions = Vec::with_capacity(schema_npc);
         for (pi, col) in schema.payload_columns() {
+            if pi >= mapped {
+                col_regions.push(PayloadRegion::Absent);
+                continue;
+            }
             let reg_idx = REG_PAYLOAD_START + pi;
             col_regions.push(build_payload_region(
                 &entries[reg_idx],
@@ -192,13 +223,17 @@ impl MappedShard {
                 col.type_code,
             )?);
         }
+        // Old rows wrote `0` in an `Absent` column's null bit, which reads as
+        // "non-null"; this forces them to `1`. The naive `(1 << schema_npc) - 1`
+        // is UB at 64.
+        let null_pad_mask = gnitz_wire::all_payload_null_mask(schema_npc) & !gnitz_wire::all_payload_null_mask(mapped);
 
         // The blob region is always Raw; reject any other (forged) encoding.
-        if entries[nr].encoding != ENCODING_RAW {
+        if entries[file_nr].encoding != ENCODING_RAW {
             return Err(StorageError::InvalidShard);
         }
-        let blob_off = entries[nr].offset;
-        let blob_len = entries[nr].size;
+        let blob_off = entries[file_nr].offset;
+        let blob_len = entries[file_nr].size;
 
         let xor8_off = read_u64_le(data, OFF_XOR8_OFFSET) as usize;
         let xor8_sz = read_u64_le(data, OFF_XOR8_SIZE) as usize;
@@ -222,6 +257,7 @@ impl MappedShard {
             weight,
             null_bmp,
             col_regions,
+            null_pad_mask,
             blob_off,
             blob_len,
             xor8_filter,

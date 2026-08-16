@@ -271,7 +271,6 @@ fn unsupported_alter_operations_rejected() {
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
     );
 
-    reject_contains(&mut c, &sn, "ALTER TABLE t ADD COLUMN x BIGINT", "ADD COLUMN");
     reject_contains(&mut c, &sn, "ALTER TABLE t ALTER COLUMN a SET NOT NULL", "SET NOT NULL");
     reject_contains(
         &mut c,

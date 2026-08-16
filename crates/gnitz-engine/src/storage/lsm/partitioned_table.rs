@@ -12,6 +12,7 @@ use super::child_dir::ChildAddr;
 use super::error::StorageError;
 use super::read_cursor::{self, ReadCursor};
 use super::run::StoredRow;
+use super::shard_index::ShardEntry;
 use super::table::{self, RecoverySource, Table};
 #[cfg(test)]
 use super::{
@@ -186,15 +187,24 @@ impl PartitionedTable {
         self.routing
     }
 
-    /// Replace the comparator schema in place across the store and every child
-    /// partition (ALTER … DROP NOT NULL). Routing is unaffected — DROP NOT NULL
-    /// never touches PK columns — but the swap must reach every partition
-    /// atomically so no child keeps the stale `FixedIntNonnull` comparator.
-    pub fn swap_schema(&mut self, schema: SchemaDescriptor) {
-        self.schema = schema;
-        for t in &mut self.tables {
-            t.swap_schema(schema);
+    /// Publish `schema` across the store and every child partition (any column
+    /// ALTER). Routing is unaffected — no column ALTER touches a PK column.
+    ///
+    /// Every child is staged first and committed only once they all succeeded,
+    /// so a re-open failure on partition 3 cannot leave partitions 0–2 already
+    /// widened — the sole route to a persistent half-swap where a NULL could
+    /// consolidate against a real `0`. The commit half is infallible.
+    pub fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
+        let staged: Vec<Vec<ShardEntry>> = self
+            .tables
+            .iter()
+            .map(|t| t.prepare_swap_schema(&schema))
+            .collect::<Result<_, _>>()?;
+        for (t, child_staged) in self.tables.iter_mut().zip(staged) {
+            t.commit_swap_schema(schema, child_staged);
         }
+        self.schema = schema;
+        Ok(())
     }
 
     /// True for an unhashed store — one child holding the whole local dataset,

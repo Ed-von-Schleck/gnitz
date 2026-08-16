@@ -768,6 +768,35 @@ mod tests {
         assert_eq!(out_null, in_null, "no right cols → output null word equals input");
     }
 
+    #[test]
+    fn test_op_null_extend_mask_guard_64_appended_cols() {
+        // The mirror of the shift guard above: in_npc == 0 and 64 columns
+        // appended, so the tail mask is `all_payload_null_mask(64)` — the arm
+        // that must return `u64::MAX` outright rather than evaluate `1u64 << 64`.
+        // Reached by widening a PK-only relation to the 65-column maximum.
+        let in_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+        assert_eq!(in_schema.num_payload_cols(), 0);
+
+        let mut right_cols = vec![SchemaColumn::new(type_code::U64, 0)];
+        for _ in 0..64 {
+            right_cols.push(SchemaColumn::new(type_code::I64, 1));
+        }
+        let right_schema = SchemaDescriptor::new(&right_cols, &[0]);
+        assert_eq!(right_schema.num_payload_cols(), 64);
+
+        let mut b = Batch::with_capacity(in_schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.count += 1;
+
+        // Must not panic, and every appended column must read NULL.
+        let out = op_null_extend(&b, &in_schema, &null_extend_out_schema(&in_schema, &right_schema));
+        assert_eq!(out.count, 1);
+        let out_null = u64::from_le_bytes(out.null_bmp_data()[0..8].try_into().unwrap());
+        assert_eq!(out_null, u64::MAX, "all 64 appended columns are NULL");
+    }
+
     // -----------------------------------------------------------------------
     // op_negate i64::MIN (item 46)
     // -----------------------------------------------------------------------

@@ -1180,7 +1180,17 @@ fn reject_index_constraint_extras(
     Ok(())
 }
 
-/// Reject every column option `execute_create_table` does not honor. Honored: NULL/NOT NULL
+/// Which site is walking a column definition, and so which constraint-bearing
+/// options are actually acted on. CREATE TABLE consumes NOT NULL / PRIMARY KEY /
+/// UNIQUE / REFERENCES; ADD COLUMN consumes none of them, so it must reject them
+/// rather than silently drop them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColumnOptionSite {
+    CreateTable,
+    AddColumn,
+}
+
+/// Reject every column option `site` does not honor. Honored by CREATE TABLE: NULL/NOT NULL
 /// (nullability), PRIMARY KEY, UNIQUE, FOREIGN KEY target — the honored constraint variants are
 /// descended into (`reject_unhonored_{pk,unique,fk}_fields`) so an unimplemented field inside them
 /// (a referential action, DEFERRABLE, NULLS NOT DISTINCT, …) is rejected too. Every
@@ -1190,18 +1200,37 @@ fn reject_index_constraint_extras(
 pub(crate) fn reject_unhonored_column_options(
     col: &sqlparser::ast::ColumnDef,
     context: &str,
+    site: ColumnOptionSite,
 ) -> Result<(), GnitzSqlError> {
     use sqlparser::ast::ColumnOption as O;
     let reject = |clause: &str| unsupported_clause(context, clause);
+    // Consumed at CREATE TABLE, unhonored at ADD COLUMN.
+    let honored = |clause: &str| match site {
+        ColumnOptionSite::CreateTable => Ok(()),
+        ColumnOptionSite::AddColumn => Err(reject(clause)),
+    };
     for opt in &col.options {
         match &opt.option {
-            O::Null | O::NotNull => {} // consumed
+            // A new column over existing rows is nullable either way, so bare
+            // NULL is consumed at both sites.
+            O::Null => {}
+            O::NotNull => honored("NOT NULL (a new column over existing rows is nullable)")?,
             // Consumed, but only the column list / constraint name — descend into
             // the wrapped constraint so an unimplemented field is rejected, not
             // silently dropped.
-            O::Unique(u) => reject_unhonored_unique_fields(u, context)?,
-            O::PrimaryKey(pk) => reject_unhonored_pk_fields(pk, context)?,
-            O::ForeignKey(fk) => reject_unhonored_fk_fields(fk, context)?, // target consumed; the rest rejected
+            O::Unique(u) => {
+                honored("UNIQUE (add the column, then CREATE UNIQUE INDEX)")?;
+                reject_unhonored_unique_fields(u, context)?
+            }
+            O::PrimaryKey(pk) => {
+                honored("PRIMARY KEY (a new column cannot join the primary key)")?;
+                reject_unhonored_pk_fields(pk, context)?
+            }
+            // Target consumed; the rest rejected.
+            O::ForeignKey(fk) => {
+                honored("REFERENCES (add the column, then ALTER TABLE … ADD CONSTRAINT)")?;
+                reject_unhonored_fk_fields(fk, context)?
+            }
             O::Comment(_) | O::Options(_) | O::Policy(_) | O::Tags(_) => {} // inert metadata
             O::Default(_) => return Err(reject("DEFAULT")),
             O::Check(_) => return Err(reject("CHECK")),

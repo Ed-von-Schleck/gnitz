@@ -454,10 +454,26 @@ fn recover_from_sal(
                         msg.base, msg.lsn, msg.target_id
                     )
                 })?;
-                let batch = match decoded.data_batch {
+                let mut batch = match decoded.data_batch {
                     Some(b) if b.count > 0 => b,
                     _ => return Ok(false),
                 };
+                // The one place an old-width batch enters the engine. A pre-ALTER
+                // `FLAG_PUSH` frame decodes against its own embedded schema
+                // block, but the catalog is already at its final width here (the
+                // master applied every catalog SAL entry pre-fork, and workers
+                // replay pushes only). Widen ahead of the reslice, which rebuilds
+                // through `Batch::from_indexed_rows(&mb, …, &schema)` and would
+                // read `schema`'s payload columns past the narrower source's
+                // regions; the non-reslice arm's `enforce_unique_pk` accumulator
+                // is already shaped by the table schema. One site covers both.
+                let in_schema = decoded
+                    .schema
+                    .as_ref()
+                    .ok_or_else(|| format!("SAL replay: push frame carries no schema (lsn={})", msg.lsn))?;
+                if in_schema.num_payload_cols() < schema.num_payload_cols() {
+                    batch = batch.widened_with_null_tail(in_schema, &schema);
+                }
                 let owned = if reslice && !replicated {
                     // Re-cut with the write path's own router, so what survives is exactly
                     // what the master would have written to this rank's slot: same

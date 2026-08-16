@@ -173,13 +173,43 @@ impl ShardIndex {
         }
     }
 
-    /// Replace the compaction comparator schema in place (ALTER … DROP NOT
-    /// NULL). Shard files are layout-identical across the swap (only a
-    /// column's nullability changes), and `compact_shards` / `ShardEntry::open`
-    /// read `&self.schema` per call, so every subsequent compaction uses the
-    /// new (null-aware) comparator.
-    pub fn swap_schema(&mut self, schema: SchemaDescriptor) {
-        self.schema = schema;
+    /// Fallible half of a schema swap: re-open every registered shard under
+    /// `new_schema` without touching `self`, so a failure on any one file leaves
+    /// the index exactly as it was.
+    ///
+    /// Empty at an unchanged payload arity: the equal-region ALTERs (RENAME
+    /// COLUMN, DROP COLUMN, DROP NOT NULL) change only how existing bytes are
+    /// compared. Only a widen (ADD COLUMN) re-opens, because `MappedShard` is
+    /// `Rc`-shared with no interior mutability, so its `col_regions` and
+    /// `null_pad_mask` cannot be retrofitted. Old `Rc`s held by in-flight
+    /// consumers stay valid and drop naturally.
+    ///
+    /// Re-opening re-reads each shard's XOR8 filter, so this costs one extra
+    /// filter allocation per shard until the commit drops the old handles.
+    pub(super) fn reopen_all(&self, new_schema: &SchemaDescriptor) -> Result<Vec<ShardEntry>, StorageError> {
+        if new_schema.num_payload_cols() == self.schema.num_payload_cols() {
+            return Ok(Vec::new());
+        }
+        self.all_entries()
+            .map(|e| ShardEntry::open(&e.filename, new_schema, e.max_lsn))
+            .collect()
+    }
+
+    /// Infallible half: install the entries [`reopen_all`](Self::reopen_all)
+    /// staged, in the same (deterministic) `all_entries` order, and publish
+    /// `new_schema`. `staged` is empty for an equal-region swap, in which case
+    /// only the comparator schema moves — `compact_shards` / `ShardEntry::open`
+    /// read `&self.schema` per call, so every subsequent compaction uses the new
+    /// comparator.
+    pub(super) fn install_reopened(&mut self, staged: Vec<ShardEntry>, new_schema: SchemaDescriptor) {
+        debug_assert!(
+            staged.is_empty() || staged.len() == self.all_entries().count(),
+            "install_reopened: staged count must match the index it was prepared from",
+        );
+        for (slot, entry) in self.all_entries_mut().zip(staged) {
+            *slot = entry;
+        }
+        self.schema = new_schema;
     }
 }
 

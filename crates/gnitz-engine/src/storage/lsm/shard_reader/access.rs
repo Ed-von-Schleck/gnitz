@@ -8,7 +8,7 @@ use super::super::batch::{
 };
 use super::super::merge::{prorated_blob_cap, relocate_german_string_vec, BlobCacheGuard, ColPtr, UnifiedSource};
 use super::super::xor8;
-use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion};
+use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion, ZERO_CELL};
 use crate::schema::key::PkBuf;
 use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
 use gnitz_wire::{read_i64_le, read_u64_le};
@@ -104,9 +104,12 @@ impl MappedShard {
         }
     }
 
+    /// The row's null word under the *reader's* schema: the file's raw word with
+    /// every payload column the file predates forced to NULL (`null_pad_mask`,
+    /// `0` for a full-width shard).
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
-        read_u64_le(self.data(), self.null_bmp.row_off(row))
+        read_u64_le(self.data(), self.null_bmp.row_off(row)) | self.null_pad_mask
     }
 
     #[inline]
@@ -116,6 +119,7 @@ impl MappedShard {
             // `col_size == elem_width`; the decoded image serves the same
             // `row * col_size` slice a direct region would.
             PayloadRegion::Packed(p) => &self.packed_bytes(p)[row * col_size..][..col_size],
+            PayloadRegion::Absent => &ZERO_CELL[..col_size],
         }
     }
 
@@ -272,6 +276,9 @@ impl MappedShard {
                 let bytes = self.packed_bytes(p);
                 dst.copy_from_slice(&bytes[start * stride..(start + row_count) * stride]);
             }
+            // No bytes to expand, but the destination arena is uninitialised, so
+            // the cells must be written rather than skipped. A NULL cell is zero.
+            PayloadRegion::Absent => dst.fill(0),
         };
         let expand_weight = |region: &WeightRegion, dst: &mut [u8]| match region {
             WeightRegion::Direct(v) => expand_view(v, FIXED_REGION_BYTES, dst),
@@ -299,11 +306,16 @@ impl MappedShard {
             &mut data[offsets[REG_PK]..][..row_count * pk_stride],
         );
         expand_weight(&self.weight, &mut data[offsets[REG_WEIGHT]..][..sz8]);
-        expand_view(
-            &self.null_bmp,
-            FIXED_REGION_BYTES,
-            &mut data[offsets[REG_NULL_BMP]..][..sz8],
-        );
+        let null_dst = &mut data[offsets[REG_NULL_BMP]..][..sz8];
+        expand_view(&self.null_bmp, FIXED_REGION_BYTES, null_dst);
+        // Force every payload column this file predates to NULL, the same way
+        // `get_null_word` does for the per-row path. No-op for a full-width shard.
+        if self.null_pad_mask != 0 {
+            for word in null_dst.chunks_exact_mut(8) {
+                let padded = read_u64_le(word, 0) | self.null_pad_mask;
+                word.copy_from_slice(&padded.to_le_bytes());
+            }
+        }
 
         for (pi, col) in schema.payload_columns() {
             // A relocated string column is written cell-by-cell below; filling it
@@ -387,6 +399,14 @@ impl MappedShard {
                     base: self.packed_bytes(p).as_ptr(),
                     stride: cs,
                 },
+                // Every row reads the same `'static` zero cell, the shape a
+                // `stride == 0` constant region already uses, so the gather has
+                // no per-row branch. The scatter gathers every schema payload
+                // column regardless of the null bit, so the pointer must be real.
+                PayloadRegion::Absent => ColPtr {
+                    base: ZERO_CELL.as_ptr(),
+                    stride: 0,
+                },
             };
         }
 
@@ -394,6 +414,7 @@ impl MappedShard {
         UnifiedSource {
             pk,
             null_bmp,
+            null_pad_mask: self.null_pad_mask,
             cols,
             blob_ptr: blob.as_ptr(),
             blob_len: blob.len(),

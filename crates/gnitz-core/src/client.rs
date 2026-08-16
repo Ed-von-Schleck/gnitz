@@ -1344,18 +1344,10 @@ impl GnitzClient {
                 )))
             }
         };
-        let columns = &desc.schema.columns;
-        let col_idx = columns
-            .iter()
-            .position(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(old_col))
-            .ok_or_else(|| {
-                ClientError::ServerError(format!("column '{old_col}' not found in '{schema_name}.{table_name}'"))
-            })?;
-        if columns
-            .iter()
-            .enumerate()
-            .any(|(i, c)| i != col_idx && !c.is_hidden && c.name.eq_ignore_ascii_case(new_col))
-        {
+        let col_idx = desc.schema.visible_column_named(old_col).ok_or_else(|| {
+            ClientError::ServerError(format!("column '{old_col}' not found in '{schema_name}.{table_name}'"))
+        })?;
+        if desc.schema.visible_column_named(new_col).is_some_and(|i| i != col_idx) {
             return Err(ClientError::ServerError(format!(
                 "column '{new_col}' already exists in '{schema_name}.{table_name}'"
             )));
@@ -1380,6 +1372,40 @@ impl GnitzClient {
     /// `FixedIntNonnull → Generic` (if the table was all-non-null-fixed-int).
     pub fn alter_drop_not_null(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
         self.alter_col_pair(tid, col_idx, |cd| cd.is_nullable = true)
+    }
+
+    /// `ALTER TABLE … ADD COLUMN`: a single COL_TAB `+1` row appending `def` at
+    /// `col_idx = <current physical column count>` — the physical layout, which
+    /// **includes** columns hidden by a previous DROP COLUMN. Existing rows read
+    /// the new column as NULL, so it must be nullable; the engine precheck
+    /// enforces that along with the trailing position, the dependent-view
+    /// RESTRICT and the `MAX_COLUMNS` bound.
+    ///
+    /// Deliberately not through [`Self::alter_col_pair`], whose whole job is
+    /// reproducing a live row at `-1`; an append has no live row.
+    ///
+    /// The visible-name collision check lives here rather than in the SQL layer
+    /// because `gnitz-core` is also the C and Python entry point, and the engine
+    /// precheck does not scan COL_TAB for names — a duplicate would otherwise
+    /// reach storage and only surface later as "column reference is ambiguous".
+    pub fn alter_add_column(&mut self, tid: u64, def: &ColumnDef) -> Result<(), ClientError> {
+        let desc = self.descriptor_by_tid(tid)?;
+        if desc.schema.visible_column_named(&def.name).is_some() {
+            return Err(ClientError::ServerError(format!(
+                "column '{}' already exists on table {tid}",
+                def.name
+            )));
+        }
+        let col_idx = desc.schema.num_columns();
+
+        let col_s = col_tab_schema();
+        let mut cb = ZSetBatch::new(col_s);
+        {
+            let mut a = BatchAppender::new(&mut cb, col_s);
+            append_col_row(&mut a, tid, OWNER_KIND_TABLE, col_idx, &def.name, def, 1)?;
+        }
+        self.push_ddl(&[(COL_TAB, col_s, cb)])?;
+        Ok(())
     }
 
     /// Build and push a COL_TAB `(-1, +1)` rewrite pair for column `col_idx` of

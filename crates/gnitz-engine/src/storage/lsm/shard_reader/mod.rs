@@ -59,7 +59,18 @@ impl RegionView {
 pub(crate) enum PayloadRegion {
     Direct(RegionView),
     Packed(PackedRegion),
+    /// A column the file predates (written before an `ALTER TABLE … ADD
+    /// COLUMN`), so it has no directory entry. Reads as `ZERO_CELL`; its null
+    /// bit is always set by `null_pad_mask`, so the bytes are never a value.
+    Absent,
 }
+
+/// The cell an [`Absent`](PayloadRegion::Absent) column reads. The readers need
+/// a valid, correctly-sized `'static` address, which no in-file offset can
+/// supply (a shard holds no guaranteed-zero 16-byte span). 16 bytes covers every
+/// payload cell — `gnitz_wire::wire_stride` tops out there (U128/UUID/I128 and
+/// the German-string struct).
+static ZERO_CELL: [u8; 16] = [0; 16];
 
 /// FoR + byte-width-truncated integer payload region (`ENCODING_FOR`).
 /// `decoded` lazily holds the full `count × elem_width` little-endian image,
@@ -93,8 +104,14 @@ pub struct MappedShard {
     pub(crate) pk: RegionView,
     pub(crate) weight: WeightRegion,
     pub(crate) null_bmp: RegionView,
-    /// Non-PK column regions indexed by payload position.
+    /// Non-PK column regions indexed by payload position, always one per payload
+    /// column of the reader's schema. Columns the file predates are
+    /// [`PayloadRegion::Absent`].
     pub(crate) col_regions: Vec<PayloadRegion>,
+    /// Null-word bits for this shard's `Absent` columns. OR'd into every null
+    /// word the three readers hand out, so a column the file has no bytes for
+    /// reads NULL rather than as a non-null zero. `0` for a full-width shard.
+    pub(crate) null_pad_mask: u64,
     pub(crate) blob_off: usize,
     pub(crate) blob_len: usize,
     /// XOR8 membership filter (loaded from embedded header data).
@@ -260,6 +277,236 @@ mod tests {
         assert_eq!(u64::from_be_bytes(shard.get_pk_bytes(0).try_into().unwrap()), 1);
         assert_eq!(read_i64_le(shard.get_col_ptr(0, 0, 8), 0), 42);
         assert_eq!(read_i64_le(shard.get_col_ptr(1, 0, 8), 0), 84);
+    }
+
+    // --- ALTER TABLE ADD COLUMN: reading pre-ALTER bytes -------------------
+
+    /// `(U64 PK, I64, <tail>)` where `tail` is nullable — the shape an
+    /// `ADD COLUMN` leaves behind. `make_schema_u64_i64` is its narrow twin.
+    fn schema_with_appended(tail: u8) -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(tail, 1),
+            ],
+            &[0],
+        )
+    }
+
+    /// Open a narrow shard (one I64 payload column) under a schema that has
+    /// since grown a trailing nullable column.
+    fn open_widened(dir: &std::path::Path, name: &str, rows: &[(u64, i64)], tail: u8) -> MappedShard {
+        let pks: Vec<u64> = rows.iter().map(|&(pk, _)| pk).collect();
+        let wts: Vec<i64> = rows.iter().map(|_| 1i64).collect();
+        let vals: Vec<i64> = rows.iter().map(|&(_, v)| v).collect();
+        let path = build_test_shard_weights(dir, name, &pks, &wts, &vals, false);
+        let cpath = std::ffi::CString::new(path).unwrap();
+        MappedShard::open(&cpath, &schema_with_appended(tail), false).unwrap()
+    }
+
+    #[test]
+    fn file_npc_header_roundtrip() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_test_shard(dir.path(), &[(1u64, 10i64)]);
+        let data = std::fs::read(&path).unwrap();
+        // The writer stamps its own descriptor's payload arity.
+        assert_eq!(read_u64_le(&data, OFF_FILE_NPC), 1);
+
+        // A shard read back at the width it was written pays nothing.
+        let schema = make_schema_u64_i64();
+        let shard = MappedShard::open(&std::ffi::CString::new(path).unwrap(), &schema, false).unwrap();
+        assert_eq!(shard.null_pad_mask, 0);
+        assert_eq!(shard.col_regions.len(), 1);
+    }
+
+    #[test]
+    fn padded_shard_pads_the_appended_column() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = (1..=5).map(|i| (i, i as i64 * 100)).collect();
+        let shard = open_widened(dir.path(), "pad.db", &rows, type_code::I64);
+
+        // The walk is driven by the file's own arity: one mapped column, and the
+        // appended one is `Absent` rather than a mis-read directory entry.
+        assert_eq!(shard.col_regions.len(), 2);
+        assert!(matches!(shard.col_regions[1], PayloadRegion::Absent));
+        assert_eq!(shard.null_pad_mask, 1 << 1);
+        assert_eq!(shard.count, 5);
+
+        for row in 0..5 {
+            // Reader 1: the per-row null word. Column 0 stays non-null, the
+            // appended column 1 reads NULL.
+            let w = shard.get_null_word(row);
+            assert!(!gnitz_wire::null_word_get(w, 0), "row {row} col 0");
+            assert!(gnitz_wire::null_word_get(w, 1), "row {row} col 1");
+            // The file's own column still reads its value…
+            assert_eq!(read_i64_le(shard.get_col_ptr(row, 0, 8), 0), (row as i64 + 1) * 100);
+            // …and the absent one hands back zeros, not mmap bytes.
+            assert_eq!(shard.get_col_ptr(row, 1, 8), [0u8; 8].as_slice());
+        }
+    }
+
+    #[test]
+    fn padded_shard_slice_to_owned_batch_pads() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
+        let shard = open_widened(dir.path(), "pad_slice.db", &rows, type_code::I64);
+        let schema = schema_with_appended(type_code::I64);
+
+        // Reader 2: the bulk materializer.
+        let batch = shard.slice_to_owned_batch(0, 4, &schema);
+        assert_eq!(batch.count, 4);
+        for row in 0..4 {
+            let w = batch.get_null_word(row);
+            assert!(!gnitz_wire::null_word_get(w, 0));
+            assert!(gnitz_wire::null_word_get(w, 1), "row {row} appended col not NULL");
+        }
+        // The appended column's cells are written (the arena is uninitialised),
+        // and written as zero.
+        assert_eq!(batch.col_data(1), [0u8; 32].as_slice());
+    }
+
+    #[test]
+    fn padded_shard_to_unified_pads() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = (1..=3).map(|i| (i, i as i64)).collect();
+        let shard = open_widened(dir.path(), "pad_unified.db", &rows, type_code::I64);
+        let schema = schema_with_appended(type_code::I64);
+
+        // Reader 3: the shared column-first scatter reads `null_pad_mask` off the
+        // view rather than the shard, so the view must carry it.
+        let unified = shard.to_unified(&schema);
+        assert_eq!(unified.null_pad_mask, 1 << 1);
+        // The absent column reads one shared `'static` zero cell for every row —
+        // the same `stride == 0` shape a Constant region uses, so the gather has
+        // no per-row branch and never dereferences a null base.
+        assert_eq!(unified.cols[1].stride, 0);
+        assert!(!unified.cols[1].base.is_null());
+        assert_eq!(unsafe { unified.cols[1].row(2, 8) }, [0u8; 8].as_slice());
+    }
+
+    #[test]
+    fn padded_shard_with_appended_string_column() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
+        let shard = open_widened(dir.path(), "pad_str.db", &rows, type_code::STRING);
+        let schema = schema_with_appended(type_code::STRING);
+
+        // Both blob arms: the relocating one walks *schema* payload columns and
+        // reaches the appended STRING with the zero cell, which decodes as length
+        // 0 and never touches the heap; the whole-region arm copies a heap the
+        // file does have (empty here).
+        for relocate in [true, false] {
+            let batch = shard.slice_to_owned_batch_with(0, 4, &schema, relocate);
+            assert_eq!(batch.count, 4, "relocate={relocate}");
+            for row in 0..4 {
+                assert!(
+                    gnitz_wire::null_word_get(batch.get_null_word(row), 1),
+                    "relocate={relocate} row={row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shard_wider_than_reader_schema_opens() {
+        raise_fd_limit_for_tests();
+        // Reachable from a correct crash: a checkpoint publishes base manifests
+        // before it makes the catalog durable, so a boot can read the catalog
+        // back at width N and find a shard written at N+1. Rejecting it would
+        // make the database unbootable, so the reader narrows instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.db");
+        let wide = schema_with_appended(type_code::I64);
+        let pk_bytes: Vec<u8> = (1u64..=3).flat_map(|p| p.to_be_bytes()).collect();
+        let wts: Vec<i64> = vec![1; 3];
+        let null_bm: Vec<u64> = vec![0; 3];
+        let col0: Vec<i64> = vec![10, 20, 30];
+        let col1: Vec<i64> = vec![11, 22, 33];
+        let blob: Vec<u8> = Vec::new();
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&wts),
+            as_le_bytes(&null_bm),
+            as_le_bytes(&col0),
+            as_le_bytes(&col1),
+            &blob,
+        ];
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        super::super::shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            3,
+            &regions,
+            &wide,
+            ShardWriteOpts { pack_ints: false },
+        )
+        .unwrap();
+
+        let narrow = make_schema_u64_i64();
+        let shard = MappedShard::open(&cpath, &narrow, false).unwrap();
+        // Every column the reader's schema names is served; the surplus directory
+        // entry is left unmapped and needs no pad.
+        assert_eq!(shard.col_regions.len(), 1);
+        assert_eq!(shard.null_pad_mask, 0);
+        for row in 0..3 {
+            assert_eq!(read_i64_le(shard.get_col_ptr(row, 0, 8), 0), (row as i64 + 1) * 10);
+        }
+        // The blob region came from the *file's* index, not the reader's.
+        assert_eq!(shard.blob_len, 0);
+    }
+
+    #[test]
+    fn forged_file_npc_is_rejected() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_test_shard(dir.path(), &[(1u64, 10i64)]);
+        let schema = make_schema_u64_i64();
+        let base = std::fs::read(&path).unwrap();
+
+        // Out of range: rejected before any arithmetic on it, because `desc_len`
+        // would overflow on a forged u64.
+        assert_eq!(
+            open_patched(&path, &schema, &base, |d| write_u64_le(d, OFF_FILE_NPC, u64::MAX)).err(),
+            Some(StorageError::InvalidShard)
+        );
+        assert_eq!(
+            open_patched(&path, &schema, &base, |d| write_u64_le(d, OFF_FILE_NPC, 66)).err(),
+            Some(StorageError::InvalidShard)
+        );
+
+        // In range but wrong: it moves the digest span *and* sits inside it, so it
+        // fails the digest like any other forged descriptive byte. (The restamp
+        // helper re-stamps over the reader schema's span, which is what the file
+        // truthfully has.)
+        assert_eq!(
+            open_patched_restamped(&path, &schema, &base, |d| write_u64_le(d, OFF_FILE_NPC, 2)).err(),
+            Some(StorageError::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn previous_format_version_is_rejected() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_test_shard(dir.path(), &[(1u64, 10i64)]);
+        let schema = make_schema_u64_i64();
+        let base = std::fs::read(&path).unwrap();
+        // A v11 file carries a zero `file_npc`; the version word is what rejects
+        // it, ahead of every structural read.
+        assert_eq!(
+            open_patched_restamped(&path, &schema, &base, |d| {
+                write_u64_le(d, OFF_VERSION, SHARD_VERSION - 1);
+                write_u64_le(d, OFF_FILE_NPC, 0);
+            })
+            .err(),
+            Some(StorageError::InvalidVersion)
+        );
     }
 
     #[test]
@@ -1476,14 +1723,22 @@ mod tests {
         ]
     }
 
-    /// The verdict a corruption at `off` inside the prefix must produce. Magic and
-    /// version are checked ahead of the digest so a wrong-format or wrong-build
-    /// file names its actual defect; every other byte is the digest's.
-    fn prefix_verdict(off: usize) -> StorageError {
+    /// The verdicts a corruption at `off` inside the prefix may produce. Magic
+    /// and version are checked ahead of the digest so a wrong-format or
+    /// wrong-build file names its actual defect. `file_npc` is read ahead of it
+    /// too — it sizes the digest span itself — so a flip that raises it is
+    /// caught by the bound or the length check first. Every other byte is the
+    /// digest's alone.
+    fn prefix_verdicts(off: usize) -> &'static [StorageError] {
         match off {
-            o if o < OFF_VERSION => StorageError::InvalidMagic,
-            o if o < OFF_ROW_COUNT => StorageError::InvalidVersion,
-            _ => StorageError::ChecksumMismatch,
+            o if o < OFF_VERSION => &[StorageError::InvalidMagic],
+            o if o < OFF_ROW_COUNT => &[StorageError::InvalidVersion],
+            o if (OFF_FILE_NPC..OFF_FILE_NPC + 8).contains(&o) => &[
+                StorageError::InvalidShard,
+                StorageError::Truncated,
+                StorageError::ChecksumMismatch,
+            ],
+            _ => &[StorageError::ChecksumMismatch],
         }
     }
 
@@ -1499,10 +1754,11 @@ mod tests {
             assert!(n_desc <= base.len());
             for off in 0..n_desc {
                 for bit in 0..8u32 {
-                    assert_eq!(
-                        open_patched(&path, &schema, &base, |d| d[off] ^= 1 << bit).err(),
-                        Some(prefix_verdict(off)),
-                        "{label}: byte {off} bit {bit}",
+                    let got = open_patched(&path, &schema, &base, |d| d[off] ^= 1 << bit).err();
+                    let want = prefix_verdicts(off);
+                    assert!(
+                        got.is_some_and(|e| want.contains(&e)),
+                        "{label}: byte {off} bit {bit}: got {got:?}, want one of {want:?}",
                     );
                 }
             }

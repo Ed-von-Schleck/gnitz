@@ -42,11 +42,13 @@ pub struct IndexCircuitEntry {
     pub index_id: i64,
     pub index_table: UnsafeCell<Box<Table>>,
     pub index_schema: SchemaDescriptor,
-    /// Full-arity span-encode plan, precomputed at registration (owner and
-    /// index schemas are immutable post-registration — no ALTER exists) so the
-    /// per-push consumers do no per-call spec rebuild. Deliberately does NOT
-    /// bake in `is_unique` (live promotion/demotion via
-    /// `set_index_circuit_uniqueness`); consumers filter on the live flag.
+    /// Full-arity span-encode plan, precomputed at registration so the per-push
+    /// consumers do no per-call spec rebuild. It survives every column ALTER of
+    /// the owner: an index schema folds all its columns into the PK, so it has
+    /// no payload columns, and a trailing append moves no existing column's OPK
+    /// offset or payload slot. Deliberately does NOT bake in `is_unique` (live
+    /// promotion/demotion via `set_index_circuit_uniqueness`); consumers filter
+    /// on the live flag.
     pub key_spec: crate::schema::IndexKeySpec,
     pub is_unique: bool,
 }
@@ -321,31 +323,30 @@ impl DagEngine {
         }
     }
 
-    /// Publish a new comparator schema for a registered base table in place
-    /// (ALTER … DROP NOT NULL). Equal-region by construction — the region count,
-    /// PK columns and column widths are unchanged; only a column's nullability
-    /// flips, which downgrades the whole-schema payload comparator
-    /// `FixedIntNonnull → Generic`. Infallible: a pure descriptor replacement is
-    /// the only safe shape (a fallible partial swap is the sole route to a
-    /// persistent half-swap where a NULL could consolidate against a real `0`).
+    /// Publish a new column schema for a registered base table in place (any
+    /// column ALTER). Three of the four are equal-region — RENAME COLUMN, DROP
+    /// COLUMN and DROP NOT NULL change only a column's name, `is_hidden` or
+    /// `is_nullable`, the last of which downgrades the whole-schema payload
+    /// comparator `FixedIntNonnull → Generic` — and move no bytes at all. ADD
+    /// COLUMN grows the region count: resident runs are widened with a NULL tail
+    /// and every registered shard is re-opened so it can pad the appended
+    /// columns (`MappedShard::null_pad_mask`).
     ///
     /// Updates the registry copy (`TableEntry.schema`) and pushes the same value
-    /// down through the store's owned copies —
-    /// `PartitionedTable` → each partition `Table` (table/memtable/shard-index) —
-    /// plus dropping `Table::cached_full_scan`. All copies are `Copy`, so each
-    /// assignment is a byte copy. No run rebuild, no shard reopen, no data
-    /// motion: existing (never-null) rows stay correctly sorted (§2).
-    pub(crate) fn swap_table_schema(&mut self, table_id: i64, schema: SchemaDescriptor) {
+    /// down through the store's owned copies — `PartitionedTable` → each
+    /// partition `Table` (table/memtable/shard-index) — plus dropping
+    /// `Table::cached_full_scan`.
+    pub(crate) fn swap_table_schema(&mut self, table_id: i64, schema: SchemaDescriptor) -> Result<(), String> {
         let entry = self
             .tables
             .get_mut(&table_id)
             .expect("swap_table_schema: table must be registered");
-        // Post-fork the master holds no user partitions, so `as_partitioned_mut`
-        // returns a store with an empty partition set and the swap is the
-        // descriptor-only `TableEntry.schema` update; on every worker the store
-        // has live partitions and the swap fans out to each.
+        // Post-fork the master holds no user partitions, so the store's partition
+        // set is empty and the swap is the descriptor-only `TableEntry.schema`
+        // update. On every worker the store has live partitions and it fans out.
         if let Some(pt) = entry.handle.as_partitioned_mut() {
-            pt.swap_schema(schema);
+            pt.swap_schema(schema)
+                .map_err(|e| format!("ALTER on table {table_id}: reopening shards failed: {e}"))?;
         }
         entry.schema = schema;
         // §1 RESTRICT invariant, made load-bearing: no compiled circuit scans an
@@ -358,6 +359,7 @@ impl DagEngine {
             },
             "swap_table_schema: table {table_id} has dependent views; RESTRICT should have rejected the ALTER",
         );
+        Ok(())
     }
 
     // ── Cache management ────────────────────────────────────────────────

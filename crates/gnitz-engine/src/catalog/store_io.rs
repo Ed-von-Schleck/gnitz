@@ -40,6 +40,24 @@ impl CatalogEngine {
         if table_id < FIRST_USER_TABLE_ID {
             return Err("ingest_returning_effective not supported for system tables".to_string());
         }
+        // Width guard, ahead of `enforce_unique_pk`. A worker parked mid-epoch
+        // stashes an incoming `DdlSync` and replays it at the next top-level
+        // drain while still serving pushes inline, so its `TableEntry.schema` can
+        // lag a frame the master already framed from its own widened catalog —
+        // and the worker decodes with no hint, so nothing else compares the two.
+        // Without this the wider batch reaches `append_mem_batch_ranges`, whose
+        // column loop is driven by the *destination's* region count: the appended
+        // column would be dropped and the push ACKed as success. A real check,
+        // not a `debug_assert` — a release build must not silently truncate a row.
+        if let Some(schema) = self.get_schema_desc(table_id) {
+            if batch.num_payload_cols() != schema.num_payload_cols() {
+                return Err(format!(
+                    "push for table_id={table_id} carries {} payload columns, table schema has {}",
+                    batch.num_payload_cols(),
+                    schema.num_payload_cols()
+                ));
+            }
+        }
         self.dag
             .ingest_returning_effective(table_id, batch)
             .ok_or_else(|| format!("ingest failed for table_id={table_id}: not registered"))

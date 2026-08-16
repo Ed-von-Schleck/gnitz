@@ -24,6 +24,17 @@ impl ShardIndex {
         )
     }
 
+    /// Mutable twin of [`all_entries`](Self::all_entries), in the same order, so
+    /// the schema swap's commit half can assign re-opened entries back into the
+    /// slots its prepare half walked.
+    pub(super) fn all_entries_mut(&mut self) -> impl Iterator<Item = &mut ShardEntry> {
+        self.l0.iter_mut().chain(
+            self.levels
+                .iter_mut()
+                .flat_map(|l| l.guards.iter_mut().flat_map(|g| g.entries.iter_mut())),
+        )
+    }
+
     pub(super) fn level_num(level_idx: usize) -> usize {
         level_idx + 1
     }

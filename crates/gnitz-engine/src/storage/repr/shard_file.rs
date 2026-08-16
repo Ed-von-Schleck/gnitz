@@ -514,6 +514,10 @@ fn write_shard_streaming_inner(
     write_u64_le(&mut hdr_buf, OFF_MAGIC, SHARD_MAGIC);
     write_u64_le(&mut hdr_buf, OFF_VERSION, SHARD_VERSION);
     write_u64_le(&mut hdr_buf, OFF_ROW_COUNT, row_count as u64);
+    // The file's own arity. `check_region_shape` above already tied
+    // `regions.len()` to `strides_from_schema(schema)`, so the count stamped
+    // here and the directory written below come from the same descriptor.
+    write_u64_le(&mut hdr_buf, OFF_FILE_NPC, schema.num_payload_cols() as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_SIZE, xor8_size as u64);
     // A filterless shard carries 0 here and `xor8_offset == 0`, which is the
