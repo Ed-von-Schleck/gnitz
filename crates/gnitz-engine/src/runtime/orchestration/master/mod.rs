@@ -18,7 +18,7 @@ use crate::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repa
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
 use crate::runtime::sal::{
-    pack_gather_cols, unique_preflight_wire_schema, SalWriter, BACKFILL_DECISION_CHECKPOINT,
+    pack_gather_cols, unique_preflight_wire_schema, DirectGroup, SalFit, SalWriter, BACKFILL_DECISION_CHECKPOINT,
     BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, FLAG_BACKFILL, FLAG_DDL_SYNC, FLAG_EXCHANGE,
     FLAG_EXCHANGE_RELAY, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK,
     FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN, FLAG_TICK, FLAG_UNIQUE_PREFLIGHT,
@@ -47,6 +47,8 @@ pub(crate) struct RelayPrepared {
     source_id: i64,
     dest: RelayDest,
     schema: SchemaDescriptor,
+    /// SAL bytes the emission will write, sized from `dest` while it was built.
+    pub(crate) footprint: usize,
 }
 
 /// The relay's destination payloads: one batch per worker (scatter), or a
@@ -93,7 +95,7 @@ mod preflight;
 mod train;
 mod unique_filter;
 
-pub(crate) use dispatch::{scan_spec_route, TxnFit};
+pub(crate) use dispatch::scan_spec_route;
 #[cfg(test)]
 pub(crate) use preflight::PreflightAccumulator;
 pub(crate) use preflight::TxnFamily;

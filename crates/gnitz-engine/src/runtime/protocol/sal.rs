@@ -59,6 +59,61 @@ pub(crate) const fn group_header_size(slots: usize) -> usize {
     OFF_DIRECTORY + 2 * slots * 4
 }
 
+/// One group's worth of per-worker wire messages, as
+/// [`SalWriter::write_group_direct`] emits them. Named rather than threaded
+/// positionally: `target_id` and `client_id` are among several adjacent integer
+/// scalars, and a transposed pair there would encode cleanly and misroute the
+/// frame.
+///
+/// [`SalWriter::group_footprint_direct`] sizes the same value, so a caller that
+/// checks fit and then writes measures one group, not two.
+pub(crate) struct DirectGroup<'a> {
+    pub target_id: u32,
+    pub wire_flags: u64,
+    /// One entry per worker; a slot past the end, or `None`, carries no rows.
+    pub worker_batches: &'a [Option<&'a Batch>],
+    pub schema: Option<&'a SchemaDescriptor>,
+    pub seek_pk: u128,
+    pub seek_col_idx: u64,
+    pub req_ids: &'a [u64],
+    /// `>= 0` restricts the group to that one worker's slot; `-1` fills all.
+    pub unicast_worker: i32,
+    pub client_id: u64,
+    pub prebuilt_schema_block: Option<&'a [u8]>,
+    pub seek_pk_extra: &'a [u8],
+}
+
+impl<'a> DirectGroup<'a> {
+    /// Worker `w`'s message. The one definition — sizing and encoding both go
+    /// through it, so a slot's size and its bytes cannot disagree.
+    fn msg(&self, w: usize) -> WireMsg<'a> {
+        WireMsg {
+            target_id: self.target_id as u64,
+            client_id: self.client_id,
+            flags: self.wire_flags,
+            seek_pk: self.seek_pk,
+            seek_col_idx: self.seek_col_idx,
+            request_id: self.req_ids[w],
+            schema: self.schema,
+            data: WireData::Whole(self.worker_batches.get(w).and_then(|opt| *opt)),
+            prebuilt_schema_block: self.prebuilt_schema_block,
+            seek_pk_extra: self.seek_pk_extra,
+            ..Default::default()
+        }
+    }
+
+    fn slot_sizes(&self, nw: usize) -> [u32; MAX_WORKERS] {
+        let mut sizes = [0u32; MAX_WORKERS];
+        for (w, size) in sizes.iter_mut().enumerate().take(nw) {
+            if self.unicast_worker >= 0 && w != self.unicast_worker as usize {
+                continue;
+            }
+            *size = self.msg(w).size() as u32;
+        }
+        sizes
+    }
+}
+
 /// XXH3-64 over a SAL group header — its own eight bytes excluded — seeded with
 /// the group's byte offset in the ring, so a header only verifies where it was
 /// published. The epoch is not a seed: it sits in the hashed span, so verifying a
@@ -126,6 +181,19 @@ pub(crate) fn effective_max(flags: u32, mmap_size: usize) -> usize {
     } else {
         mmap_size.saturating_sub(SENTINEL_SIZE + CHECKPOINT_RESERVE)
     }
+}
+
+/// Whether a group of a given size can be written, and if not, whether a
+/// checkpoint would change that.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SalFit {
+    /// Fits the remaining space — emit it.
+    Fits,
+    /// Fits an empty SAL but not the current remainder: a checkpoint reclaims
+    /// enough space, so a retry can succeed.
+    Transient,
+    /// Exceeds the SAL outright — no checkpoint can help; retrying is futile.
+    Terminal,
 }
 
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
@@ -887,11 +955,24 @@ impl SalWriter {
 
     /// SAL bytes an ordinary group may occupy: the mapping minus the headroom
     /// `sal_begin_group` reserves for the zone-closing sentinel and minus the
-    /// band held back for the checkpoint and shutdown groups. A transaction whose
-    /// footprint exceeds this can never be written on any cursor, so `txn_fit`
-    /// must call it `Terminal` rather than loop on `Transient`.
+    /// band held back for the checkpoint and shutdown groups.
     pub(crate) fn effective_capacity(&self) -> usize {
         effective_max(0, self.mmap_size as usize)
+    }
+
+    /// Classify `need` bytes against the capacity and the live cursor. The one
+    /// verdict: the committer's per-transaction check and the exchange relay's
+    /// pre-write check both read it, so neither can drift from the rule
+    /// `sal_begin_group` enforces.
+    pub(crate) fn fit(&self, need: usize) -> SalFit {
+        let capacity = self.effective_capacity();
+        if need > capacity {
+            SalFit::Terminal
+        } else if need > capacity.saturating_sub(self.write_cursor.get() as usize) {
+            SalFit::Transient
+        } else {
+            SalFit::Fits
+        }
     }
 
     /// Reserve a group for `worker_sizes.len()` workers at the write cursor and
@@ -954,72 +1035,42 @@ impl SalWriter {
     /// stamps `Batch.schema` on the worker side, and `decode_wire` hard-errors on
     /// FLAG_HAS_DATA without FLAG_HAS_SCHEMA, so the reply's request_id would fall
     /// back to 0 and the master's `ReplyFuture` would never resolve.
-    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-    pub fn write_group_direct(
-        &self,
-        target_id: u32,
-        lsn: u64,
-        sal_flags: u32,
-        wire_flags: u64,
-        worker_batches: &[Option<&Batch>],
-        schema: Option<&SchemaDescriptor>,
-        seek_pk: u128,
-        seek_col_idx: u64,
-        req_ids: &[u64],
-        unicast_worker: i32,
-        client_id: u64,
-        prebuilt_schema_block: Option<&[u8]>,
-        seek_pk_extra: &[u8],
-    ) -> Result<(), String> {
+    pub fn write_group_direct(&self, g: &DirectGroup, lsn: u64, sal_flags: u32) -> Result<(), String> {
         let nw = self.m2w_efds.len();
         assert_eq!(
-            req_ids.len(),
+            g.req_ids.len(),
             nw,
             "write_group_direct: req_ids.len()={} != num_workers={}",
-            req_ids.len(),
+            g.req_ids.len(),
             nw
         );
         debug_assert!(
-            schema.is_some() || prebuilt_schema_block.is_some() || worker_batches.iter().all(|b| b.is_none()),
+            g.schema.is_some() || g.prebuilt_schema_block.is_some() || g.worker_batches.iter().all(|b| b.is_none()),
             "write_group_direct: data without a schema — `decode_wire` rejects FLAG_HAS_DATA \
              without FLAG_HAS_SCHEMA",
         );
 
-        // One message per worker slot — the slot's size and its bytes come from
-        // the same value, so they cannot disagree.
-        let msg_for = |w: usize| WireMsg {
-            target_id: target_id as u64,
-            client_id,
-            flags: wire_flags,
-            seek_pk,
-            seek_col_idx,
-            request_id: req_ids[w],
-            schema,
-            data: WireData::Whole(worker_batches.get(w).and_then(|opt| *opt)),
-            prebuilt_schema_block,
-            seek_pk_extra,
-            ..Default::default()
-        };
-
-        let mut worker_sizes = [0u32; MAX_WORKERS];
-        for w in 0..nw {
-            if unicast_worker >= 0 && w != unicast_worker as usize {
-                continue;
-            }
-            worker_sizes[w] = msg_for(w).size() as u32;
-        }
-
-        let group = self.begin("write_group_direct", target_id, lsn, sal_flags, &worker_sizes[..nw])?;
+        let worker_sizes = g.slot_sizes(nw);
+        let group = self.begin("write_group_direct", g.target_id, lsn, sal_flags, &worker_sizes[..nw])?;
 
         unsafe {
             group.for_each_slot(&worker_sizes[..nw], |w, slot| {
-                let written = msg_for(w).encode(slot, 0);
+                let written = g.msg(w).encode(slot, 0);
                 debug_assert_eq!(written, slot.len());
             });
         }
 
         self.finish(group);
         Ok(())
+    }
+
+    /// The exact number of SAL bytes `write_group_direct` will consume for `g`.
+    /// Neither the sentinel nor the checkpoint band is included; both are held
+    /// back globally by `effective_capacity`.
+    pub(crate) fn group_footprint_direct(&self, g: &DirectGroup) -> usize {
+        let nw = self.m2w_efds.len();
+        let sizes = g.slot_sizes(nw);
+        8 + group_header_size(nw) + sizes[..nw].iter().map(|s| align8(*s as usize)).sum::<usize>()
     }
 
     /// The exact number of SAL bytes a `scatter_wire_group` (or its
@@ -1125,19 +1176,21 @@ impl SalWriter {
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
             return self.write_group_direct(
-                target_id,
+                &DirectGroup {
+                    target_id,
+                    wire_flags,
+                    worker_batches: &refs,
+                    schema: Some(schema),
+                    seek_pk: 0,
+                    seek_col_idx,
+                    req_ids,
+                    unicast_worker: -1,
+                    client_id: 0,
+                    prebuilt_schema_block,
+                    seek_pk_extra: &[],
+                },
                 lsn,
                 sal_flags,
-                wire_flags,
-                &refs,
-                Some(schema),
-                0,
-                seek_col_idx,
-                req_ids,
-                -1,
-                0,
-                prebuilt_schema_block,
-                &[],
             );
         }
 

@@ -21,17 +21,6 @@ impl Iterator for BitIter {
     }
 }
 
-/// The verdict of `MasterDispatcher::txn_fit`.
-pub(crate) enum TxnFit {
-    /// The zone fits the SAL's remaining space — emit it.
-    Fits,
-    /// It fits an empty SAL but not the current remainder: a checkpoint reclaims
-    /// enough space, so the client's retry can succeed.
-    Transient,
-    /// It exceeds the SAL outright — no checkpoint can help; retrying is futile.
-    Terminal,
-}
-
 /// Route a ScanSpec read, as the [`Fanout`] every fan-out helper speaks.
 ///
 /// A replicated relation is a full identical copy on every worker, so worker 0
@@ -187,32 +176,59 @@ impl MasterDispatcher {
         seek_pk_extra: &[u8],
     ) -> Result<(), String> {
         self.sal.write_group_direct(
-            target_id as u32,
+            &DirectGroup {
+                target_id: target_id as u32,
+                wire_flags,
+                worker_batches: &[],
+                schema: None,
+                seek_pk,
+                seek_col_idx,
+                req_ids,
+                unicast_worker: unicast_worker.sal_slot(),
+                client_id,
+                prebuilt_schema_block: None,
+                seek_pk_extra,
+            },
             lsn,
             sal_flags,
-            wire_flags,
-            &[],
-            None,
-            seek_pk,
-            seek_col_idx,
-            req_ids,
-            unicast_worker.sal_slot(),
-            client_id,
-            None,
-            seek_pk_extra,
         )
     }
 
-    /// Write one group carrying rows, with per-worker request ids. The two
+    /// One group carrying rows, broadcast with per-worker request ids. The two
     /// data-bearing fan-outs: the exchange relay (whose schema block is what
     /// stamps `Batch.schema` on the worker side) and the `FLAG_HAS_PK` unique
-    /// check. LSN 0 — both are command-scoped; durable writers
-    /// (`scatter_wire_group`, `write_broadcast_direct`, the commit sentinel)
-    /// carry caller-supplied LSNs on their own paths.
+    /// check.
     ///
     /// The schema block carries no column names: `decode_schema_block` parses
     /// only the col_idx / type / flags regions, and these groups never leave the
     /// master→worker SAL.
+    fn data_group<'a>(
+        target_id: i64,
+        worker_batches: &'a [Option<&'a Batch>],
+        schema: &'a SchemaDescriptor,
+        seek_pk: u128,
+        seek_col_idx: u64,
+        req_ids: &'a [u64],
+    ) -> DirectGroup<'a> {
+        DirectGroup {
+            target_id: target_id as u32,
+            wire_flags: 0,
+            worker_batches,
+            schema: Some(schema),
+            seek_pk,
+            seek_col_idx,
+            req_ids,
+            unicast_worker: Fanout::Broadcast.sal_slot(),
+            client_id: 0,
+            prebuilt_schema_block: None,
+            seek_pk_extra: &[],
+        }
+    }
+
+    /// Emit a [`data_group`](Self::data_group). LSN 0 — both verbs are
+    /// command-scoped; durable writers (`scatter_wire_group`,
+    /// `write_broadcast_direct`, the commit sentinel) carry caller-supplied LSNs
+    /// on their own paths.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn write_data_group(
         &self,
@@ -224,21 +240,8 @@ impl MasterDispatcher {
         seek_col_idx: u64,
         req_ids: &[u64],
     ) -> Result<(), String> {
-        self.sal.write_group_direct(
-            target_id as u32,
-            0,
-            sal_flags,
-            0,
-            worker_batches,
-            Some(schema),
-            seek_pk,
-            seek_col_idx,
-            req_ids,
-            Fanout::Broadcast.sal_slot(),
-            0,
-            None,
-            &[],
-        )
+        let group = Self::data_group(target_id, worker_batches, schema, seek_pk, seek_col_idx, req_ids);
+        self.sal.write_group_direct(&group, 0, sal_flags)
     }
 
     /// Write one group whose rows are PK-partitioned across the workers: each
@@ -372,7 +375,8 @@ impl MasterDispatcher {
     ///
     /// Two callers, matching `collect_acks_and_relay`: boot, before the reactor
     /// is up, and the reactor-parked stop-the-world CREATE VIEW window (a
-    /// backfill whose `maybe_checkpoint` fires reaches this post-handoff).
+    /// backfill whose `checkpoint_before_backfill` fires reaches this
+    /// post-handoff).
     pub fn collect_acks(&self) -> Result<(), String> {
         for w in 0..self.num_workers {
             loop {
@@ -452,23 +456,26 @@ impl MasterDispatcher {
                         // Decide this round's collective verdict, stamped onto
                         // its relay. Stop takes precedence: an all-pad round ends
                         // the backfill and its leftover SAL is reclaimed by the
-                        // normal post-backfill checkpoint. Otherwise, when SAL
-                        // space is low, stamp CHECKPOINT (continue + tell workers
-                        // to re-epoch inline) and arm the reset for the next round
-                        // barrier; this round's relay is still written at the high
-                        // cursor (a single round fits the 1/8 reserve).
-                        let decision = if relay.all_pad {
+                        // normal post-backfill checkpoint. Otherwise, when space
+                        // runs short against this round's own size, stamp
+                        // CHECKPOINT (continue + tell workers to re-epoch inline)
+                        // and arm the reset for the next round barrier. That
+                        // cannot rescue this round — the reset only lands at the
+                        // next barrier, so this round is written at the current
+                        // cursor either way.
+                        let all_pad = relay.all_pad;
+                        let prep = self.prepare_relay(relay)?;
+                        let decision = if all_pad {
                             BACKFILL_DECISION_STOP
                         } else if checkpoint_allowed
-                            && (!self.sal_relay_space_ok_raw() || BACKFILL_RELAY_SPACE_LOW.armed())
+                            && (!self.sal_has_room_for(prep.footprint) || BACKFILL_RELAY_SPACE_LOW.armed())
                         {
                             pending_reset = true;
                             BACKFILL_DECISION_CHECKPOINT
                         } else {
                             BACKFILL_DECISION_CONTINUE
                         };
-                        let prep = self.prepare_relay(relay)?;
-                        self.emit_relay_with_decision(prep, decision)?;
+                        self.emit_relay_with_decision(&prep, decision)?;
                     }
                 } else {
                     if let Some(e) = worker_error(w, "backfill relay", &decoded.control) {
@@ -500,6 +507,19 @@ impl MasterDispatcher {
     // SAL Checkpoint
     // -----------------------------------------------------------------------
 
+    /// Reclaim before a backfill whose first round could be arbitrarily large.
+    /// A backfill round cannot reclaim mid-flight — the reset must reach the
+    /// workers stamped on the *previous* round's relay, so round one gets
+    /// whatever the cursor happens to leave, and starting from a reclaimed SAL
+    /// is the only lever there is. An idle server past neither line pays
+    /// nothing.
+    fn checkpoint_before_backfill(&self) -> Result<(), String> {
+        if self.sal.cursor() > self.relay_margin() || self.sal.needs_checkpoint() {
+            return self.do_checkpoint();
+        }
+        Ok(())
+    }
+
     /// Invariant: callers must live on a path that owns SAL checkpoint
     /// exclusivity. Today that is the bootstrap backfill, the committer task,
     /// and the reactor-parked stop-the-world CREATE-VIEW backfill
@@ -509,13 +529,6 @@ impl MasterDispatcher {
     /// DDL paths must NOT call this — a concurrent FLAG_FLUSH races the
     /// committer's own and orphans SAL writes straddling `sal.checkpoint_reset`.
     /// See async-invariants.md §III.3a.
-    fn maybe_checkpoint(&self) -> Result<(), String> {
-        if !self.sal.needs_checkpoint() {
-            return Ok(());
-        }
-        self.do_checkpoint()
-    }
-
     fn do_checkpoint(&self) -> Result<(), String> {
         self.sync_flush_round(0, FLAG_FLUSH)?;
         self.checkpoint_post_ack()
@@ -548,14 +561,72 @@ impl MasterDispatcher {
     /// honouring the seam would checkpoint the armed epoch away before
     /// `relay_loop` reached its low-space branch.
     pub(crate) fn sal_relay_space_ok_raw(&self) -> bool {
-        self.sal.mmap_size() - self.sal.cursor() >= (self.sal.mmap_size() >> 3)
+        self.sal_has_room_for(0)
     }
 
-    /// True when enough SAL space remains for a relay write (>= 1/8 of the
-    /// mmap). Checked *before* consuming a relay so a low-space condition
-    /// can be resolved (checkpoint) rather than silently discarding the
-    /// relay and deadlocking blocked workers. While the debug seam is armed,
-    /// reports low until the next checkpoint bumps the SAL epoch.
+    /// The proactive reclaim watermark: 1/8 of the mapping. A relay is refused
+    /// below it even when it would fit, so the reclaim happens on the relay that
+    /// still has room to spare rather than on the one that has run out.
+    fn relay_margin(&self) -> u64 {
+        self.sal.mmap_size() >> 3
+    }
+
+    /// Free SAL bytes, against both the reclaim watermark and a caller's own
+    /// requirement. `need` 0 asks about the watermark alone.
+    fn sal_has_room_for(&self, need: usize) -> bool {
+        let free = self.sal.mmap_size() - self.sal.cursor();
+        free >= std::cmp::max(self.relay_margin(), need as u64)
+    }
+
+    /// The per-worker slots a relay emits.
+    fn relay_refs<'a>(&self, dest: &'a RelayDest) -> Vec<Option<&'a Batch>> {
+        match dest {
+            RelayDest::PerWorker(batches) => batches
+                .iter()
+                .map(|b| if b.count > 0 { Some(b) } else { None })
+                .collect(),
+            RelayDest::Broadcast(b) => vec![if b.count > 0 { Some(&**b) } else { None }; self.num_workers],
+        }
+    }
+
+    /// The SAL group an exchange relay writes. `prepare_relay` sizes it and
+    /// `emit_relay_with_decision` emits it, so the bytes checked are the bytes
+    /// written — `decision` is the only field that differs between the two, and
+    /// `WireMsg::size` does not read it.
+    ///
+    /// `seek_pk` echoes `source_id` back so the worker's `do_exchange_wait` can
+    /// match on (view_id, source_id). Without it, a multi-source view (join over
+    /// 2+ tables) can deliver the wrong source's relay to a waiting exchange and
+    /// the worker demuxes against the wrong sharding columns.
+    fn relay_group<'a>(
+        &self,
+        view_id: i64,
+        source_id: i64,
+        schema: &'a SchemaDescriptor,
+        refs: &'a [Option<&'a Batch>],
+        decision: u64,
+    ) -> DirectGroup<'a> {
+        Self::data_group(
+            view_id,
+            refs,
+            schema,
+            source_id as u128,
+            decision,
+            &SYNC_COLLECT_REQ_IDS[..self.num_workers],
+        )
+    }
+
+    /// Whether a group of `need` bytes fits the SAL, and if not, whether a
+    /// checkpoint could make it fit.
+    pub(crate) fn sal_fit(&self, need: usize) -> SalFit {
+        self.sal.fit(need)
+    }
+
+    /// True when the SAL is above the reclaim watermark. Checked *before*
+    /// consuming a relay so a low-space condition can be resolved (checkpoint)
+    /// rather than silently discarding the relay and deadlocking blocked
+    /// workers. While the debug seam is armed, reports low until the next
+    /// checkpoint bumps the SAL epoch.
     pub(crate) fn sal_has_relay_space(&self) -> bool {
         if RELAY_SPACE_LOW.armed()
             && Self::seam_armed_epoch().load(std::sync::atomic::Ordering::Relaxed) == self.sal.epoch()
@@ -690,11 +761,25 @@ impl MasterDispatcher {
             })
         };
 
+        // Size the group here, outside `sal_writer_excl`: the batches are in
+        // hand, so the fit check under the lock is a comparison rather than a
+        // sizing pass.
+        let refs = self.relay_refs(&dest);
+        let footprint = self.sal.group_footprint_direct(&self.relay_group(
+            view_id,
+            source_id,
+            &schema,
+            &refs,
+            BACKFILL_DECISION_CONTINUE,
+        ));
+        drop(refs);
+
         Ok(RelayPrepared {
             view_id,
             source_id,
             dest,
             schema,
+            footprint,
         })
     }
 
@@ -708,41 +793,10 @@ impl MasterDispatcher {
     /// stamper (it terminates a backfill's chunked exchange on an all-pad round);
     /// the reactor's `relay_loop` serves only steady-state tick exchanges and
     /// always passes CONTINUE.
-    pub(crate) fn emit_relay_with_decision(&self, prep: RelayPrepared, decision: u64) -> Result<(), String> {
-        let RelayPrepared {
-            view_id,
-            source_id,
-            dest,
-            schema,
-        } = prep;
-        let refs: Vec<Option<&Batch>> = match &dest {
-            RelayDest::PerWorker(batches) => batches
-                .iter()
-                .map(|b| if b.count > 0 { Some(b) } else { None })
-                .collect(),
-            // One shared batch, referenced by every worker slot — the SAL
-            // group write re-encodes per slot regardless.
-            RelayDest::Broadcast(b) => vec![if b.count > 0 { Some(b) } else { None }; self.num_workers],
-        };
-        // Echo `source_id` back via `seek_pk` so the worker's `do_exchange_wait`
-        // can match on (view_id, source_id). Without this, a multi-source view
-        // (join over 2+ tables) can deliver the wrong source's relay to a
-        // waiting exchange and the worker demuxes against the wrong sharding
-        // columns. `seek_col_idx` carries the backfill round `decision`
-        // (BACKFILL_DECISION_*); CONTINUE == 0 is the steady-state value, so a
-        // non-backfill relay is byte-identical to before. The synchronous
-        // collect reads W2M rings directly and never routes by req_id, so the
-        // relay carries request_id 0 on every worker slot.
-        let req_ids = SYNC_COLLECT_REQ_IDS;
-        self.write_data_group(
-            view_id,
-            FLAG_EXCHANGE_RELAY,
-            &refs,
-            &schema,
-            source_id as u128,
-            decision,
-            &req_ids[..self.num_workers],
-        )?;
+    pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), String> {
+        let refs = self.relay_refs(&prep.dest);
+        let group = self.relay_group(prep.view_id, prep.source_id, &prep.schema, &refs, decision);
+        self.sal.write_group_direct(&group, 0, FLAG_EXCHANGE_RELAY)?;
         self.signal_all();
         Ok(())
     }
@@ -757,12 +811,12 @@ impl MasterDispatcher {
     /// rebuild next to resumed siblings) that a closure re-drive would
     /// double-count.
     ///
-    /// May `maybe_checkpoint` to reclaim SAL space before a large source; the
-    /// collect loop may further CHECKPOINT mid-stream. Both are safe on the
-    /// SAL-exclusive, no-concurrent-relay paths this runs on (boot; the
-    /// reactor-parked DDL window).
+    /// Reclaims SAL space before a large source; the collect loop may further
+    /// CHECKPOINT mid-stream. Both are safe on the SAL-exclusive,
+    /// no-concurrent-relay paths this runs on (boot; the reactor-parked DDL
+    /// window).
     pub fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), String> {
-        self.maybe_checkpoint()?;
+        self.checkpoint_before_backfill()?;
         let schema = self.schema_desc_for(source_id);
         self.send_broadcast(source_id, 0, FLAG_BACKFILL, Some(&schema), view_id as u128)?;
         self.collect_acks_and_relay(true)
@@ -1168,16 +1222,8 @@ impl MasterDispatcher {
     /// Whether a transaction's family groups fit the SAL, and if not, whether a
     /// checkpoint could make them fit. The committer's whole space question in
     /// one call — it never sees the cursor or the capacity rule itself.
-    pub(crate) fn txn_fit(&self, families: &[(i64, &Batch)]) -> TxnFit {
-        let footprint = self.txn_zone_footprint(families);
-        let capacity = self.sal.effective_capacity();
-        if footprint > capacity {
-            return TxnFit::Terminal;
-        }
-        if footprint > capacity.saturating_sub(self.sal.cursor() as usize) {
-            return TxnFit::Transient;
-        }
-        TxnFit::Fits
+    pub(crate) fn txn_fit(&self, families: &[(i64, &Batch)]) -> SalFit {
+        self.sal.fit(self.txn_zone_footprint(families))
     }
 
     /// The exact SAL footprint (bytes) of a transaction's family groups — the sum

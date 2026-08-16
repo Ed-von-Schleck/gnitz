@@ -27,9 +27,9 @@ use super::executor::{TickTrigger, TICK_COALESCE_ROWS};
 use super::guard_panic;
 use crate::foundation::fault::Seam;
 use crate::runtime::lsn::ZoneLsnAllocator;
-use crate::runtime::master::{first_worker_error_opt, MasterDispatcher, TxnFamily, TxnFit};
+use crate::runtime::master::{first_worker_error_opt, MasterDispatcher, TxnFamily};
 use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, AsyncMutex, Either, Reactor, ReplyFuture};
-use crate::runtime::sal::{FLAG_FLUSH, FLAG_FLUSH_EPH};
+use crate::runtime::sal::{SalFit, FLAG_FLUSH, FLAG_FLUSH_EPH};
 use crate::runtime::wire::{DecodedWire, WireConflictMode};
 use crate::storage::Batch;
 use rustc_hash::FxHashMap;
@@ -78,11 +78,15 @@ pub struct PendingTxn {
 /// services it while a checkpoint sequence is in flight.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BarrierKind {
-    /// Relay-space barrier from `relay_loop`: serviced mid-sequence by a
-    /// reclaim-only base round (no gen re-bump) and signaled right after
-    /// step 1, so `relay_loop` unparks before the drain and can refill space
-    /// during it.
-    Reclaim,
+    /// Relay-space barrier: serviced mid-sequence by a reclaim-only base round
+    /// (no gen re-bump) and signaled right after step 1, so `relay_loop` unparks
+    /// before the drain and can refill space during it.
+    ///
+    /// `forced` means the requester has a concrete byte requirement the
+    /// committer's own space test cannot see — `relay_loop` sends it when the
+    /// relay it holds does not fit. The watchdog sends `false`: it fires on a
+    /// timer off the ambient watermark, which the committer re-reads itself.
+    Reclaim { forced: bool },
     /// DDL drain from `handle_ddl_txn`: deferred to the end of a checkpoint
     /// sequence (servicing it mid-sequence would interleave a CREATE VIEW's
     /// reactor-parked backfill).
@@ -204,14 +208,18 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // AFTER FLAG_FLUSH in the same epoch would be silently skipped by
         // workers.
         let has_barriers = !barriers.is_empty();
-        let forced = barriers.iter().any(|(k, _)| *k == BarrierKind::Shutdown);
+        // A Shutdown barrier, or a relay that reported its own group does not
+        // fit — neither is decidable from the ambient space test below.
+        let forced = barriers
+            .iter()
+            .any(|(k, _)| matches!(k, BarrierKind::Shutdown | BarrierKind::Reclaim { forced: true }));
         // No checkpoint round inside a DDL window: `run_checkpoint_sequence`'s
         // drain would never complete against the parked tick loop, and the DDL's
         // own W2M collectors would eat the round's ACKs (see `TickGate`).
         // Refusing rather than waiting is safe — `relay_loop` cannot be mid-retry
         // once the Quiesce is acked (a worker ACKs its tick only after its relay
         // was written), the watchdog's barrier re-fires in 100 ms, and the
-        // backfill reclaims through its own `maybe_checkpoint`.
+        // backfill reclaims through its own `checkpoint_before_backfill`.
         let ddl_window = shared.ddl_window.get() != 0;
         // Consume the one-shot force_checkpoint (a transaction that didn't fit
         // the SAL's remaining space set it), so the retry finds a reclaimed SAL
@@ -244,7 +252,7 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // per-(tid, mode) merge batches. A Reclaim barrier cannot, and the
         // watchdog fires those on a timer, so clearing on those too would drop
         // the pool every 100 ms while the SAL sits above its line.
-        if barriers.iter().any(|(k, _)| *k != BarrierKind::Reclaim) {
+        if barriers.iter().any(|(k, _)| !matches!(k, BarrierKind::Reclaim { .. })) {
             merge_pool.clear();
         }
         for (_, b) in barriers {
@@ -389,7 +397,9 @@ async fn run_checkpoint_sequence(
     // own relays refill space, and relay_loop must be live to service them).
     // Deferring them past the drain would deadlock it. DDL/Shutdown barriers
     // stay deferred to sequence end.
-    let (reclaim, mut deferred): (Vec<_>, Vec<_>) = barriers.into_iter().partition(|(k, _)| *k == BarrierKind::Reclaim);
+    let (reclaim, mut deferred): (Vec<_>, Vec<_>) = barriers
+        .into_iter()
+        .partition(|(k, _)| matches!(k, BarrierKind::Reclaim { .. }));
     for (_, b) in reclaim {
         let _ = b.send(());
     }
@@ -485,7 +495,7 @@ async fn await_servicing<T>(
             Either::A(v) => return v.ok(),
             Either::B(None) => return None,
             Either::B(Some(CommitRequest::Barrier {
-                kind: BarrierKind::Reclaim,
+                kind: BarrierKind::Reclaim { forced },
                 done,
             })) => {
                 // Reclaim-only base round: no gen re-bump, no re-staleing of
@@ -494,7 +504,9 @@ async fn await_servicing<T>(
                 // watchdog fires these on a timer without waiting for the last
                 // one, so an ungated round here would repeat a full
                 // broadcast + per-worker-ACK + system-table flush for nothing.
-                if !shared.disp().sal_has_relay_space() {
+                // A `forced` request states a requirement that predicate cannot
+                // see, so it runs the round regardless.
+                if forced || !shared.disp().sal_has_relay_space() {
                     if let Err(e) = flush_round(shared, None, fut_slots, ack_slots).await {
                         crate::gnitz_fatal_abort!("reclaim checkpoint failed, cluster epoch-desynced: {}", e);
                     }
@@ -702,14 +714,14 @@ async fn commit_pushes(
             // yet) fails the transaction cleanly.
             let families: Vec<(i64, &Batch)> = groups[span.clone()].iter().map(|g| (g.tid, &g.merged)).collect();
             let fail = match shared.disp().txn_fit(&families) {
-                TxnFit::Terminal => Some("transaction exceeds SAL capacity".to_string()),
-                TxnFit::Transient => {
+                SalFit::Terminal => Some("transaction exceeds SAL capacity".to_string()),
+                SalFit::Transient => {
                     // Force a checkpoint before the next batch so the client's
                     // retry finds a reclaimed SAL.
                     shared.force_checkpoint.set(true);
                     Some("transaction exceeds SAL space".to_string())
                 }
-                TxnFit::Fits => {
+                SalFit::Fits => {
                     let mut committed_a_family = false;
                     let mut first_fail = None;
                     for gi in span.clone() {

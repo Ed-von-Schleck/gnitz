@@ -43,7 +43,7 @@ use crate::runtime::reactor::{
     join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard,
     ReplyFuture, WriteGuard,
 };
-use crate::runtime::sal::{BACKFILL_DECISION_CONTINUE, FLAG_SCAN_SPEC};
+use crate::runtime::sal::{SalFit, BACKFILL_DECISION_CONTINUE, FLAG_SCAN_SPEC};
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, FLAG_RESOLVE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
@@ -686,7 +686,7 @@ async fn watchdog(shared: Rc<Shared>) {
         if shared.ddl_window.get() == 0 && !shared.disp().sal_relay_space_ok_raw() {
             let (tx, done) = oneshot::channel();
             shared.committer_tx.send(CommitRequest::Barrier {
-                kind: BarrierKind::Reclaim,
+                kind: BarrierKind::Reclaim { forced: false },
                 done: tx,
             });
             // Fire-and-forget: dropping the receiver is the whole point, not an
@@ -954,21 +954,27 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
         // margin in between. The barrier await MUST happen with the lock
         // dropped: the committer's checkpoint takes sal_writer_excl, so
         // holding it across the barrier deadlocks master-side.
-        let mut prep = Some(prep);
         let mut reclaimed = false;
         loop {
             {
                 let _sal = shared.sal_writer_excl.lock().await;
-                if shared.disp().sal_has_relay_space_arming() {
+                let fit = shared.disp().sal_fit(prep.footprint);
+                // The relay is written whole — there is no chunked form — so a
+                // group over capacity is one no checkpoint can deliver.
+                if fit == SalFit::Terminal {
+                    gnitz_fatal_abort!("exchange relay exceeds the SAL outright; no checkpoint can deliver it");
+                }
+                // Both conditions: the group must fit at this cursor, and the
+                // SAL must be above the proactive reclaim watermark.
+                if fit == SalFit::Fits && shared.disp().sal_has_relay_space_arming() {
                     // Always CONTINUE: only steady-state tick exchanges reach this
                     // loop (both chunked-backfill drivers collect their relays
                     // synchronously in `collect_acks_and_relay`, the sole
                     // STOP/CHECKPOINT stamper), and a tick round never pads.
                     if let Err(e) = guard_panic("emit_relay", || {
-                        shared.disp().emit_relay_with_decision(
-                            prep.take().expect("relay emitted once"),
-                            BACKFILL_DECISION_CONTINUE,
-                        )
+                        shared
+                            .disp()
+                            .emit_relay_with_decision(&prep, BACKFILL_DECISION_CONTINUE)
                     }) {
                         gnitz_fatal_abort!(
                             "emit_relay failed; a lost relay wedges workers \
@@ -987,7 +993,9 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
                 }
             }
             gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
-            await_barrier(&shared, BarrierKind::Reclaim).await;
+            // `forced`: this relay's own byte count says it does not fit, which
+            // the committer's ambient space test cannot see.
+            await_barrier(&shared, BarrierKind::Reclaim { forced: true }).await;
             reclaimed = true;
         }
     }

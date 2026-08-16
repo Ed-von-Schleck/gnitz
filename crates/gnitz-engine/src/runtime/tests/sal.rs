@@ -832,6 +832,59 @@ fn test_wire_group_footprint_non_wire_safe_shared_span_dedup() {
     unsafe { assert_footprint_exact(&schema, &batch, true, 3) };
 }
 
+/// `group_footprint_direct` must equal what `write_group_direct` consumes: the
+/// exchange relay sizes its group before taking the SAL lock and writes it
+/// after, and a prediction below the truth turns a reclaim-and-retry into a
+/// fatal `SAL full` on a relay no worker can go without.
+///
+/// Both an empty slot (no rows → control block only) and a populated one are
+/// covered, since only a populated slot pays the schema block and the data.
+#[test]
+fn test_group_footprint_direct_equals_emitted_bytes() {
+    use crate::runtime::sal::DirectGroup;
+    use crate::runtime::sal::FLAG_EXCHANGE_RELAY;
+    use crate::test_support::{make_batch, make_schema_u64_i64};
+
+    let nw = 4;
+    let schema = make_schema_u64_i64();
+    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+
+    let size = 1 << 20;
+    let region = SharedRegion::new(size);
+    let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
+    let writer = SalWriter::new(region.ptr(), -1, size as u64, efds.clone());
+    writer.reset(0, 1); // epoch >= 1 for sal_begin_group's debug_assert
+
+    // Slot 2 stays empty: `relay_refs` passes `None` for a zero-row worker.
+    let req_ids = [0u64; 4];
+    let refs: Vec<Option<&crate::storage::Batch>> = vec![Some(&batch), Some(&batch), None, Some(&batch)];
+    let group = DirectGroup {
+        target_id: 16,
+        wire_flags: 0,
+        worker_batches: &refs,
+        schema: Some(&schema),
+        seek_pk: 7,
+        seek_col_idx: 1,
+        req_ids: &req_ids,
+        unicast_worker: -1,
+        client_id: 0,
+        prebuilt_schema_block: None,
+        seek_pk_extra: &[],
+    };
+
+    let predicted = writer.group_footprint_direct(&group);
+    let before = writer.cursor();
+    writer
+        .write_group_direct(&group, 0, FLAG_EXCHANGE_RELAY)
+        .expect("group fits");
+    let actual = (writer.cursor() - before) as usize;
+    assert_eq!(predicted, actual, "group_footprint_direct must equal emitted bytes");
+
+    for &e in &efds {
+        unsafe { libc::close(e) };
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The group header's own integrity: a digest over the header, seeded with the
 // group's byte offset. Every one of the fields swept below is a routing or
