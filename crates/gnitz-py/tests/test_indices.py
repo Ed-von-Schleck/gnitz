@@ -2963,3 +2963,48 @@ class TestUniqueHolderFromProbe:
             assert rows[1] == 99 and rows[999983] == 42
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_a"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint resume
+# ---------------------------------------------------------------------------
+
+
+def test_index_resumes_across_clean_restart(own_server):
+    """A secondary index is derived state that the checkpoint persists, so a
+    restart after a graceful stop must reload it — not re-derive it from a full
+    scan of the owner's slice on every worker. Correctness alone cannot show
+    that: a silent rebuild produces the same holders. So this asserts the seeks
+    AND that no worker rebuilt anything."""
+    sock_path = own_server.sock_path
+
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("idxres")
+    conn.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)",
+        schema_name="idxres",
+    )
+    values = ", ".join(f"({i}, {i * 10})" for i in range(64))
+    conn.execute_sql(f"INSERT INTO t VALUES {values}", schema_name="idxres")
+    conn.execute_sql("CREATE INDEX ON t(g)", schema_name="idxres")
+    conn.close()
+
+    # Graceful: the shutdown barrier runs a full checkpoint sequence, whose
+    # ephemeral round publishes every worker's index at the committed generation.
+    own_server.restart(graceful=True)
+
+    conn = gnitz.connect(sock_path)
+    tid, _ = conn.resolve_table("idxres", "t")
+    for i in range(0, 64, 8):
+        res = conn.seek_by_index(tid, [1], [i * 10])
+        assert res.schema is not None and sorted(res.pks) == [i], (
+            f"g={i * 10} must still resolve to its source PK after the restart"
+        )
+    conn.close()
+
+    counts = own_server.rebuilt_index_counts()
+    assert counts == [0] * own_server.workers, (
+        f"a clean restart must resume every index from its checkpoint, "
+        f"but workers rebuilt {counts}"
+    )

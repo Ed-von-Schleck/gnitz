@@ -122,7 +122,7 @@ impl ManifestEntryRaw {
 pub struct ManifestHeader {
     pub compact_seq: u64,
     /// The checkpoint generation the ephemeral round published at. Read by the
-    /// conditional reload (`RederiveCheckpointed`) and the boot resume verdict.
+    /// conditional reload (`Rederive`) and the boot resume verdict.
     /// A base publish stamps 0; nothing reads it back from a base table.
     pub checkpoint_gen: u64,
     /// The layout sequence of the `w{k}of{n}` child set this manifest belongs

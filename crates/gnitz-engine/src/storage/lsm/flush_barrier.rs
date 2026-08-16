@@ -32,7 +32,7 @@ pub enum FlushRound {
 
 impl FlushRound {
     /// The checkpoint generation to stamp a published manifest with. The base
-    /// round stamps 0: only a `RederiveCheckpointed` open reads this field back,
+    /// round stamps 0: only a `Rederive` open reads this field back,
     /// and such a table publishes nothing on the base round.
     pub(super) fn checkpoint_gen(self) -> u64 {
         match self {

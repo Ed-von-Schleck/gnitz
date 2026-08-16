@@ -240,6 +240,19 @@ class ServerProc:
         matches = re.findall(r"recovery: rebuilding (\d+) invalid view", self.log_text())
         return int(matches[-1]) if matches else None
 
+    def rebuilt_index_counts(self):
+        """The sibling index marker, per launched worker. Worker-side because the
+        boot index rebuild runs after the child redirected fd 1 to its own log,
+        so the master log never sees it. Worker logs are truncated per boot, so
+        the last marker in each is this boot's."""
+        counts = []
+        for w in range(self.workers):
+            with open(os.path.join(self.data_dir, f"worker_{w}.log")) as f:
+                markers = re.findall(r"recovery: rebuilding (\d+) index\(es\)", f.read())
+            assert markers, f"worker {w} printed no index-rebuild marker"
+            counts.append(int(markers[-1]))
+        return counts
+
 
 # Deadlock ceilings for concurrent-thread tests, NOT performance budgets. The
 # guarded regression is a thread blocked forever (e.g. on `sal_writer_excl`); a

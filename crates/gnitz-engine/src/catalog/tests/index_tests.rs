@@ -2587,12 +2587,18 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
         &idx_schema,
     );
 
-    let mut base = Table::new(&format!("{dir}/base"), schema, tid as u32, RecoverySource::Rederive).unwrap();
+    let mut base = Table::new(
+        &format!("{dir}/base"),
+        schema,
+        tid as u32,
+        RecoverySource::Rederive { resume_at: None },
+    )
+    .unwrap();
     let mut idx = Table::new(
         &format!("{dir}/idx"),
         idx_schema,
         tid as u32 + 1,
-        RecoverySource::Rederive,
+        RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
     base.ingest_owned_batch(bb).unwrap();

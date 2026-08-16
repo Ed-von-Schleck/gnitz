@@ -122,7 +122,7 @@ fn time_upsert(
             schema,
             base_id + i,
             arena(),
-            RecoverySource::Rederive,
+            RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
         let start = Instant::now();
@@ -199,7 +199,7 @@ fn secondary_index_bench_avi_decomposition() {
             avi_schema,
             id,
             arena(),
-            RecoverySource::Rederive,
+            RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
         id += 1;

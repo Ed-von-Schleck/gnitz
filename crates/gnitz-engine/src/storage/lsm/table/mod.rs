@@ -2,9 +2,8 @@
 //!
 //! Ingest lands in the `memtable` run set and folds into the `ram_tier` at 3/4
 //! of the arena; the RAM tier spills to a shard past [`INMEM_CEILING`], and the
-//! checkpoint barrier folds it into one durable shard for `SalReplay` tables.
-//! `Rederive` tables never publish a manifest — they are erased at open and
-//! rebuilt from their sources.
+//! checkpoint barrier folds it into one durable shard — on the base round for
+//! `SalReplay` tables, on the ephemeral round for `Rederive` ones.
 
 use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
@@ -66,33 +65,28 @@ pub enum RecoverySource {
     /// The tail is recovered by replaying the fsynced SAL over the shards loaded
     /// from the manifest at open. Base tables and master system tables.
     SalReplay,
-    /// Storage is erased at open and the relation is rebuilt (rederived) from
-    /// its sources. Index circuits and non-checkpointed operator scratch.
-    Rederive,
-    /// Rederived like `Rederive`, but the ephemeral checkpoint round
-    /// force-persists this table with a generation-stamped manifest (view
-    /// operator-trace tables and output stores), and the open conditionally
-    /// reloads it: the checkpointed shards load iff the manifest's generation
-    /// equals `committed` (the caller's committed checkpoint generation);
-    /// otherwise the state is erased and rebuilt. Compaction cleanup defers to
-    /// the next publish like `SalReplay` — an immediate drain would unlink a
-    /// compacted-away shard the last-published manifest still references
-    /// (stranded at reload).
-    RederiveCheckpointed {
-        /// The committed checkpoint generation the reload gate compares against.
-        committed: u64,
+    /// The relation is rebuilt from its sources, and the ephemeral checkpoint
+    /// round force-persists it with a generation-stamped manifest: view
+    /// operator-trace tables, view output stores, secondary indexes.
+    Rederive {
+        /// The generation a manifest must carry for the open to resume from it
+        /// instead of erasing it. `None` is how a caller whose verdict has more
+        /// to it than the generation — a topology change invalidates every
+        /// rederived relation — says "never resume" without inventing a
+        /// generation no manifest can hold.
+        resume_at: Option<u64>,
     },
 }
 
 impl RecoverySource {
-    /// The checkpointed-rederive policy sampled at the current committed
-    /// checkpoint generation — the one constructor for a view's output store
-    /// and its operator-trace tables, so the reload gate's `committed` sample
-    /// can never drift between the two.
+    /// The rederive policy sampled at the current committed checkpoint
+    /// generation — the one constructor for a view's output store and its
+    /// operator-trace tables, so the reload gate's sample can never drift
+    /// between the two.
     #[inline]
     pub fn rederive_checkpointed_now() -> RecoverySource {
-        RecoverySource::RederiveCheckpointed {
-            committed: crate::foundation::worker_ctx::committed_generation(),
+        RecoverySource::Rederive {
+            resume_at: Some(crate::foundation::worker_ctx::committed_generation()),
         }
     }
 }
@@ -189,6 +183,13 @@ pub struct Table {
     /// complete sets survive a crash.
     layout_seq: u64,
 
+    /// True when this open reloaded a generation-matching checkpointed manifest
+    /// instead of starting empty. The boot index rebuild skips a table that
+    /// reports true. Emptiness is not a substitute: a row with NULL in an
+    /// indexed column is not indexed at all, so an all-NULL slice yields a
+    /// legitimately empty index over a large owner.
+    resumed_from_checkpoint: bool,
+
     /// Reused candidate pool for `retract_pk_bytes`' grouping pass; cleared per
     /// call (dropping its `Rc`s) with capacity retained, so the path stops
     /// allocating once warmed up.
@@ -203,8 +204,8 @@ mod flush;
 mod bench_flush;
 
 impl Table {
-    /// Create a new table.  `RecoverySource::SalReplay` loads the manifest at
-    /// open; `RecoverySource::Rederive` erases stale storage and starts empty.
+    /// Create a new table. The `RecoverySource` decides what the open does with
+    /// whatever is already on disk.
     pub fn new(
         dir: &str,
         schema: SchemaDescriptor,
@@ -224,51 +225,23 @@ impl Table {
         arena_size: u64,
         recovery_source: RecoverySource,
     ) -> Result<Self, StorageError> {
-        // Decide the open action per recovery source:
-        //   SalReplay            → always load the manifest.
-        //   Rederive             → always erase stale shards and start empty.
-        //     DIRLESS: the directory is not created here. A Rederive table
-        //     starts empty, its steady-state flushes land in the RAM tier, and
-        //     it never publishes a manifest — so in the common case its dir
-        //     would hold nothing, ever. `open_dirfd` (the single choke point
-        //     every file write goes through) creates it lazily on the first
-        //     spill, making a Rederive open free of filesystem work (this is
-        //     what keeps an index circuit's per-worker scratch tables
-        //     syscall-free). A dir left by a previous boot still gets
-        //     its stale shards erased (a missing dir erases nothing).
-        //   RederiveCheckpointed → load only when the manifest's checkpoint
-        //     generation equals the caller's committed generation; otherwise
-        //     erase the shards *and* unlink the manifest so a later re-open
-        //     cannot re-peek a stale `== g` manifest.
-        //
-        // NOTE for future tests: a `RederiveCheckpointed` table force-flushed at
-        // generation 0, then re-opened with `committed: 0`, will *load* (peek
-        // `Some(0)` == committed `0`). Table unit tests that want a
-        // guaranteed-empty open use `Rederive`, not `RederiveCheckpointed`.
+        // The directory is created before either arm decides anything, so an
+        // unusable one fails here — a client-visible rejection on the master's
+        // CREATE VIEW pre-flight, where a first-flush failure would instead be a
+        // worker abort with no client left to tell.
+        set_nocow_dir(&ensure_dir(dir)?); // NOCOW is btrfs-only, ignored elsewhere
         let load_shards = match recovery_source {
-            RecoverySource::SalReplay => {
-                // Try to set NOCOW (btrfs; silently ignored on other fs).
-                set_nocow_dir(&ensure_dir(dir)?);
-                true
-            }
-            RecoverySource::Rederive => {
-                erase_stale_shards(dir, table_id);
-                false
-            }
-            RecoverySource::RederiveCheckpointed { committed } => {
-                // Eager, unlike the DIRLESS `Rederive` arm: creating the dir here
-                // is what makes an unusable view directory fail the compile rather
-                // than the first flush — a client-visible rejection on the master's
-                // CREATE VIEW pre-flight, where a first-flush failure would be a
-                // worker abort with no client left to tell.
-                set_nocow_dir(&ensure_dir(dir)?);
+            RecoverySource::SalReplay => true,
+            // Resume only from the generation the caller named; otherwise erase
+            // the shards *and* the manifest, so a later re-open cannot re-peek it.
+            RecoverySource::Rederive { resume_at } => {
                 let cpath = super::super::cstr(super::manifest::path(dir))?;
-                let generation_matches =
-                    super::manifest::peek_header(&cpath)?.map(|h| h.checkpoint_gen) == Some(committed);
-                if !generation_matches {
+                let resumes =
+                    resume_at.is_some() && super::manifest::peek_header(&cpath)?.map(|h| h.checkpoint_gen) == resume_at;
+                if !resumes {
                     erase_stale_shards(dir, table_id);
                 }
-                generation_matches
+                resumes
             }
         };
 
@@ -283,6 +256,7 @@ impl Table {
             recovery_source,
             current_lsn: 1,
             layout_seq: 0,
+            resumed_from_checkpoint: load_shards && matches!(recovery_source, RecoverySource::Rederive { .. }),
             retract_scratch: Vec::new(),
             cached_full_scan: None,
         };
@@ -305,11 +279,40 @@ impl Table {
         &self.directory
     }
 
-    /// Full path of this table's manifest — a pure function of the directory.
-    /// Only `SalReplay` tables publish one (`Rederive` state is erased at open),
-    /// but the path itself carries no state worth caching.
+    /// Full path of this table's manifest — a pure function of the directory,
+    /// carrying no state worth caching.
     fn manifest_full_path(&self) -> String {
         super::manifest::path(&self.directory)
+    }
+
+    /// True when this store is rebuilt from its sources at open. It is the whole
+    /// difference between the two checkpoint rounds: the base round publishes
+    /// the others and folds these to RAM, the ephemeral round publishes exactly
+    /// these.
+    pub(crate) fn is_rederived(&self) -> bool {
+        matches!(self.recovery_source, RecoverySource::Rederive { .. })
+    }
+
+    /// True when the base round would publish this store at a cut newer than its
+    /// last manifest: that round publishes it at all, and it holds rows in a heap
+    /// tier or shards a spill wrote that no manifest references yet. False right
+    /// after a publish, which folds both tiers into one synced shard and
+    /// re-stamps the manifest over them.
+    pub(crate) fn base_round_advances_publish(&self) -> bool {
+        !self.is_rederived()
+            && (self.ram_tiers().iter().any(|s| s.row_count() > 0) || !self.shard_index.unsynced_paths().is_empty())
+    }
+
+    /// Whether this open reloaded checkpointed state rather than starting empty.
+    pub(crate) fn resumed_from_checkpoint(&self) -> bool {
+        self.resumed_from_checkpoint
+    }
+
+    /// Unlink this store's manifest, so the next `Rederive` open
+    /// peeks `None` and erases the shards instead of reloading them — how a
+    /// caller rejects state it must not resume from.
+    pub(crate) fn unlink_manifest(&self) {
+        let _ = std::fs::remove_file(self.manifest_full_path());
     }
 
     /// Publish `schema` across this store (any column ALTER): re-open every
@@ -374,12 +377,6 @@ impl Table {
     // ------------------------------------------------------------------
     // Flush
     // ------------------------------------------------------------------
-
-    /// How this table's tail is recovered. Base and master system tables are
-    /// `SalReplay`; view child tables and index circuits are `Rederive`.
-    pub fn recovery_source(&self) -> RecoverySource {
-        self.recovery_source
-    }
 
     /// The next-shard LSN counter. Seeded `max_lsn + 1` at open, bumped on every
     /// ingest; feeds spill/barrier shard naming and the master's zone-LSN
@@ -611,30 +608,20 @@ impl Table {
     /// references. Compaction only swaps the in-memory index and appends the
     /// superseded inputs to `pending_deletions`.
     ///
-    /// Cleanup timing splits on recovery source. A `Rederive` table publishes
-    /// no manifest referencing the superseded inputs, so it drains them
-    /// immediately — deferring would leak them until boot-time
-    /// `erase_stale_shards`. A `SalReplay` or `RederiveCheckpointed` table
-    /// defers both publish and cleanup to the next barrier, which republishes
-    /// over the compacted index before unlinking the inputs; unlinking
-    /// mid-epoch would strand the last-published manifest over deleted files
-    /// on the next boot.
+    /// The superseded inputs are not unlinked here: every store publishes a
+    /// manifest, and unlinking mid-epoch would strand the last-published one
+    /// over deleted files. `flush_barrier` drains them once it has republished
+    /// over the compacted index.
     pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         if !self.shard_index.should_compact() {
             return Ok(());
         }
-        self.shard_index.run_compact()?;
-        if self.recovery_source == RecoverySource::Rederive {
-            self.drain_deletions();
-        }
-        Ok(())
+        self.shard_index.run_compact()
     }
 
     /// Unlink compaction-superseded shard files, once no surviving manifest can
-    /// reference them: post-publish for `SalReplay` tables (the worker barrier
-    /// per family, the synchronous `flush()` inline), immediately after
-    /// `run_compact` for `Rederive` tables. Best-effort — a still-present file
-    /// is retried on the next drain.
+    /// reference them — post-publish. Best-effort: a still-present file is
+    /// retried on the next drain.
     pub(in crate::storage) fn drain_deletions(&mut self) {
         self.shard_index.try_cleanup();
     }
@@ -663,8 +650,6 @@ fn set_nocow_dir(dir_c: &CStr) {
 /// grammar includes `table_id`, so a shared directory keeps its other tables)
 /// and its manifest. The manifest goes too, or a later open could accept a
 /// generation whose shards are gone.
-///
-/// Creates nothing, which is what keeps a `Rederive` open dirless.
 fn erase_stale_shards(dir: &str, table_id: u32) {
     super::naming::remove_shard_files(dir, table_id, &std::collections::HashSet::new());
     let _ = std::fs::remove_file(super::manifest::path(dir));
@@ -767,7 +752,13 @@ mod tests {
         let tdir = dir.path().join("eph_test");
         let schema = make_schema_u64_i64();
 
-        let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            100,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         assert!(t.memtable_is_empty());
 
@@ -811,7 +802,13 @@ mod tests {
         let tdir = dir.path().join("cursor_test");
         let schema = make_schema_u64_i64();
 
-        let mut t = new_table(&tdir, schema, 300, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            300,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         t.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200)]))
             .unwrap();
@@ -828,7 +825,13 @@ mod tests {
         let tdir = dir.path().join("retract_test");
         let schema = make_schema_u64_i64();
 
-        let mut t = new_table(&tdir, schema, 400, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            400,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
@@ -881,7 +884,13 @@ mod tests {
         let tdir = dir.path().join("retract_update_test");
         let schema = make_schema_u64_i64();
 
-        let mut t = new_table(&tdir, schema, 600, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            600,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         // Batch 1: INSERT (PK=10, weight=+1, val=100)
         t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
@@ -913,7 +922,13 @@ mod tests {
         let tdir = dir.path().join("ingest_owned_unsorted_test");
         let schema = make_schema_u64_i64();
 
-        let mut t = new_table(&tdir, schema, 700, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            700,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         // Build a reverse-sorted batch (PK order: 30, 20, 10).
         let batch = make_batch(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
@@ -944,7 +959,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Very small arena: 40 bytes. A 3-row batch (~120 bytes) will exceed it.
-        let mut t = new_table(&tdir, schema, 900, 40, RecoverySource::Rederive);
+        let mut t = new_table(&tdir, schema, 900, 40, RecoverySource::Rederive { resume_at: None });
 
         // Directly fill memtable past max_bytes using memtable_upsert_sorted_batch
         // (bypasses auto-flush so runs_bytes exceeds max_bytes).
@@ -982,7 +997,7 @@ mod tests {
         // Each row is 32 bytes (PK 8 + weight 8 + null_bmp 8 + col 8).
         // First call: 2 rows = 64 bytes, below threshold → no flush.
         // Second call: pre-check 64 < 96 → no pre-flush; upsert → 128 > 96 → post-flush.
-        let mut t = new_table(&tdir, schema, 1200, 128, RecoverySource::Rederive);
+        let mut t = new_table(&tdir, schema, 1200, 128, RecoverySource::Rederive { resume_at: None });
 
         t.ingest_owned_batch(make_batch(&[(1, 1, 10), (2, 1, 20)])).unwrap();
         assert!(!t.memtable_is_empty(), "two rows must not yet trigger overflow");
@@ -1162,7 +1177,13 @@ mod tests {
         let tdir = dir.path().join("done_inline_test");
         let schema = make_schema_u64_i64();
 
-        let mut t = new_table(&tdir, schema, 1200, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            1200,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
         match t.flush_prepare(FlushRound::Base).unwrap() {
@@ -1328,24 +1349,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("no_file_test");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            100,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]))
             .unwrap();
         assert!(matches!(t.flush_prepare(FlushRound::Base).unwrap(), FlushOutcome::Done));
 
-        // A Rederive table opens dirless (created lazily on first spill), so a
-        // sub-ceiling flush leaves not even the directory behind — the
-        // strongest form of "no file".
-        let shard_files: Vec<String> = match std::fs::read_dir(&tdir) {
-            Err(_) => Vec::new(),
-            Ok(rd) => rd
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with("shard_"))
-                .collect(),
-        };
-        assert!(shard_files.is_empty(), "non-durable flush wrote files: {shard_files:?}");
+        assert!(
+            shard_db_files(&tdir, 100).is_empty(),
+            "a sub-ceiling base-round flush must write no shard file"
+        );
         assert!(t.all_shard_arcs().is_empty());
         assert!(t.ram_run_count() > 0);
 
@@ -1363,7 +1382,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cross_fold_test");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            100,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         // 6 alternating +1 / -1 flushes on (k=7, v=70): each lands in its own
         // run until the threshold folds them. Net weight is 0.
@@ -1389,7 +1414,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("run_bound_test");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            100,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         let n = FOLD_THRESHOLD as u64 + 4;
         for k in 0..n {
@@ -1413,7 +1444,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("ceiling_spill_test");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            100,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
         t.set_inmem_ceiling_for_test(100); // < one flush (~10 rows × 32 B)
 
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
@@ -1432,15 +1469,17 @@ mod tests {
         }
     }
 
-    /// Repeated over-ceiling flushes keep the on-disk shard count bounded
-    /// (the spill path's `compact_if_needed` folds L0→L1 and cleans up), and all
-    /// rows across rounds stay correct.
+    /// Repeated over-ceiling flushes keep the on-disk shard count bounded: the
+    /// spill path's `compact_if_needed` folds L0→L1 and the publish that follows
+    /// unlinks the consumed inputs. `SalReplay`, because that is the source
+    /// `flush()`'s base round publishes — a `Rederive` table's inputs wait for
+    /// the ephemeral round instead.
     #[test]
-    fn nondurable_repeated_spill_stays_bounded() {
+    fn repeated_spill_stays_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("repeated_spill_test");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::SalReplay);
         t.set_inmem_ceiling_for_test(100);
 
         const ROUNDS: u64 = 20;
@@ -1473,7 +1512,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("has_pk_inmem_test");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            100,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         t.ingest_owned_batch(make_batch(&[(5, 1, 50)])).unwrap();
         t.flush().unwrap();
@@ -1493,7 +1538,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("mixed_read_test");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            100,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         // Force keys 0..10 to disk.
         t.set_inmem_ceiling_for_test(100);
@@ -1545,7 +1596,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("inmem_retract_payloads");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 5001, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            5001,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         // Run 1: INSERT (PK=10, +1, val=100).
         t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
@@ -1578,7 +1635,13 @@ mod tests {
         let tdir = dir.path().join("inmem_retract_wide_pk");
         let schema = wide_pk_3xu64_schema();
         assert_eq!(schema.pk_stride(), 24);
-        let mut t = new_table(&tdir, schema, 5002, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            5002,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         let pk3 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
         let wide_batch = |rows: &[(Vec<u8>, i64, i64)]| -> Batch {
@@ -1641,7 +1704,13 @@ mod tests {
             &[0, 1, 2],
         );
         assert_eq!(schema.pk_stride(), 24);
-        let mut t = new_table(&tdir, schema, 5003, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            5003,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         let key = |a: i64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
         // Payload marker == the signed leading value, read back in scan order.
@@ -1689,7 +1758,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("inmem_cross_tier");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 5004, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            5004,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         // RAM run: two payloads for PK=5 (val=50, val=60), each +1.
         t.ingest_owned_batch(make_batch(&[(5, 1, 50), (5, 1, 60)])).unwrap();
@@ -1760,7 +1835,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("inmem_fold_bloom");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 5005, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            5005,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         // One key per flush past the fold threshold; the folded run's bloom is
         // rebuilt over the merged batch.
@@ -1946,7 +2027,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("lsn_bump_rederive");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 7400, 1 << 20, RecoverySource::Rederive);
+        let mut t = new_table(
+            &tdir,
+            schema,
+            7400,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        );
 
         assert_eq!(t.current_lsn, 1, "fresh Rederive table starts at LSN 1");
         t.ingest_owned_batch(make_batch(&[(1, 1, 10)])).unwrap();
@@ -2137,7 +2224,7 @@ mod tests {
         );
     }
 
-    /// `Table::new`'s `RederiveCheckpointed` open decision: a manifest whose
+    /// `Table::new`'s `Rederive` open decision: a manifest whose
     /// generation matches the caller's `committed` loads its shards; a mismatch
     /// (or absence) erases the shards and unlinks the manifest.
     #[test]
@@ -2162,7 +2249,7 @@ mod tests {
                 schema,
                 7910,
                 128,
-                RecoverySource::RederiveCheckpointed { committed: 7 },
+                RecoverySource::Rederive { resume_at: Some(7) },
             );
             assert!(
                 t.has_pk_bytes(&1u64.to_be_bytes()) && t.has_pk_bytes(&2u64.to_be_bytes()),
@@ -2178,7 +2265,7 @@ mod tests {
                 schema,
                 7910,
                 128,
-                RecoverySource::RederiveCheckpointed { committed: 8 },
+                RecoverySource::Rederive { resume_at: Some(8) },
             );
             assert!(
                 !t.has_pk_bytes(&1u64.to_be_bytes()) && !t.has_pk_bytes(&2u64.to_be_bytes()),
@@ -2192,7 +2279,7 @@ mod tests {
     }
 
     /// A damaged manifest names no checkpoint generation, so the
-    /// `RederiveCheckpointed` arm rebuilds rather than failing the boot. A failed
+    /// `Rederive` arm rebuilds rather than failing the boot. A failed
     /// read is not evidence of staleness: it propagates and erases nothing.
     #[test]
     fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
@@ -2217,7 +2304,7 @@ mod tests {
                 schema,
                 table_id,
                 128,
-                RecoverySource::RederiveCheckpointed { committed: 7 },
+                RecoverySource::Rederive { resume_at: Some(7) },
             )
         };
 
@@ -2355,15 +2442,16 @@ mod tests {
         }
     }
 
-    /// F5. A `Rederive` table that spills and compacts drains the superseded
-    /// inputs inline in `compact_if_needed` (it publishes no manifest that could
-    /// strand them), so raw spill shards stay bounded and nothing leaks.
+    /// F5. A `Rederive` table publishes on the **ephemeral** round, so that is
+    /// what drains its superseded compaction inputs — the base round leaves them,
+    /// since a manifest could still reference them. Nothing leaks across a
+    /// checkpoint.
     #[test]
-    fn rederive_compaction_drains_deletions_immediately() {
+    fn rederive_ephemeral_flush_drains_deferred_compaction() {
         let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("rederive_immediate_drain");
+        let tdir = dir.path().join("rederive_eph_drain");
         let schema = make_schema_u64_i64();
-        let mut t = new_table(&tdir, schema, 8000, 128, RecoverySource::Rederive);
+        let mut t = new_table(&tdir, schema, 8000, 128, RecoverySource::Rederive { resume_at: None });
         t.set_inmem_ceiling_for_test(100);
 
         for r in 0..8u64 {
@@ -2372,11 +2460,26 @@ mod tests {
             assert_eq!(t.ram_bytes(), 0, "round {r} spilled");
         }
         assert!(compaction_output_count(&tdir, 8000) > 0, "compaction must have run");
-        assert!(
-            shard_db_files(&tdir, 8000).len() <= 5,
-            "compacted inputs drained inline: {} raw spills remain",
-            shard_db_files(&tdir, 8000).len(),
+
+        let files_before = all_shard_file_count(&tdir, 8000);
+        t.flush().unwrap();
+        assert_eq!(
+            all_shard_file_count(&tdir, 8000),
+            files_before,
+            "the base round must publish nothing for a Rederive table, so nothing drains"
         );
+
+        let g = 1;
+        super::super::flush_barrier::flush_barrier(
+            [&mut t as *mut Table],
+            super::super::flush_barrier::FlushRound::Ephemeral(g),
+        )
+        .unwrap();
+        assert!(
+            all_shard_file_count(&tdir, 8000) < files_before,
+            "the ephemeral round republishes over the compacted index and drains the inputs"
+        );
+
         for r in 0..8u64 {
             for k in 0..10u64 {
                 assert!(t.has_pk((r * 100 + k) as u128), "row survives compaction");

@@ -444,9 +444,10 @@ impl WorkerProcess {
         // The ephemeral flush round carries the checkpoint generation in the
         // group header's `lsn` field. Latch it into `worker_ctx` before dispatch
         // so `manifest_header` stamps every view manifest this round publishes
-        // with it.
+        // with it — and so a later CREATE INDEX in this process gates its resume
+        // on the same value.
         if msg.kind == SalMessageKind::FlushEph {
-            crate::foundation::worker_ctx::set_committed_generation(msg.lsn);
+            self.cat().set_resume_generation(msg.lsn);
         }
         Some((msg.kind, msg.target_id as i64, msg.wire_data))
     }
@@ -1271,9 +1272,31 @@ impl WorkerProcess {
         self.master_pid != 0 && unsafe { libc::getppid() } != self.master_pid
     }
 
+    /// Publish and exit. The publish is not optional — a mid-backfill
+    /// `checkpoint_reset` can have discarded the SAL entries that are these rows'
+    /// only other durable copy — but there may be no master left to bump the
+    /// generation ahead of it, since the watchdog's crashed-worker path
+    /// broadcasts `FLAG_SHUTDOWN` with no barrier behind it. So the worker
+    /// invalidates its own derived state instead, and unlinks before publishing
+    /// so a crash between the two errs toward a rebuild.
+    ///
+    /// A graceful stop already ran a full sequence, so the base cut has not
+    /// advanced and only the flush runs — which is what lets it still resume.
     fn shutdown(&mut self) -> ! {
+        if self.cat().dag.base_advanced_since_publish() {
+            self.unlink_derived_manifests();
+        }
         let _ = self.handle_flush_all();
         unsafe { libc::_exit(0) }
+    }
+
+    /// Unlink the manifest of every store the ephemeral round persists, so the
+    /// next open peeks `None` and erases those shards instead of resuming them.
+    fn unlink_derived_manifests(&mut self) {
+        let (traces, outputs) = self.cat().dag.collect_ephemeral_flush_tables();
+        for t in traces.into_iter().chain(outputs) {
+            unsafe { &*t }.unlink_manifest();
+        }
     }
 
     /// Unrecoverable worker fault: log, flush, `_exit`. The master's

@@ -178,7 +178,7 @@ fn test_recover_checkpoint_gen_and_topology() {
     let expected_topology = crate::storage::topology_word(4);
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        assert_eq!(engine.committed_generation, 0, "fresh DB starts at generation 0");
+        assert_eq!(engine.durable_generation, 0, "fresh DB starts at generation 0");
         assert_eq!(engine.recorded_topology, 0, "fresh DB has no topology row");
         // Boot order: the topology row is written first and its durability
         // rides the following gen bump's system-table flush.
@@ -190,7 +190,7 @@ fn test_recover_checkpoint_gen_and_topology() {
     }
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
-        engine.committed_generation, 2,
+        engine.durable_generation, 2,
         "recovered checkpoint generation survives a reopen",
     );
     assert_eq!(
@@ -219,20 +219,21 @@ fn test_recovery_start_generation_bump_monotonic() {
     {
         // Recovery start: bump G=2 → 3 durably; the field advances.
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        assert_eq!(engine.committed_generation, 2, "recovered G");
+        assert_eq!(engine.durable_generation, 2, "recovered G");
         engine.recovery_start_generation_bump().unwrap();
         assert_eq!(
-            engine.committed_generation, 3,
+            engine.durable_generation, 3,
             "recovery-start bump advances the field to G+1"
         );
-        // boot_checkpoint's bump then retracts G+1 and inserts G+2.
+        // The boot checkpoint's single bump (inside `do_checkpoint`, which owns it
+        // for every base round) then retracts G+1 and inserts G+2.
         assert_eq!(engine.bump_checkpoint_generation(), 4, "boot_checkpoint goes G+1 → G+2");
         engine.close();
     }
     // The final durable generation survives a reopen monotonically.
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
-        engine.committed_generation, 4,
+        engine.durable_generation, 4,
         "recovery-start + boot_checkpoint bumps recovered monotonically",
     );
     engine.close();

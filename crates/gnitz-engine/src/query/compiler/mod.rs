@@ -1450,7 +1450,7 @@ mod tests {
             nodes_schema,
             0,
             256 * 1024,
-            RecoverySource::Rederive,
+            RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
         {
@@ -1468,7 +1468,7 @@ mod tests {
             edges_schema,
             0,
             256 * 1024,
-            RecoverySource::Rederive,
+            RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
         let _ = &mut edges_tab; // empty
@@ -1477,7 +1477,7 @@ mod tests {
             cols_schema,
             0,
             256 * 1024,
-            RecoverySource::Rederive,
+            RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
         let _ = &mut cols_tab; // empty
@@ -1515,7 +1515,7 @@ mod tests {
             nodes_schema,
             0,
             256 * 1024,
-            RecoverySource::Rederive,
+            RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
         {
@@ -1541,7 +1541,7 @@ mod tests {
             edges_schema,
             0,
             256 * 1024,
-            RecoverySource::Rederive,
+            RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
         {
@@ -1559,7 +1559,7 @@ mod tests {
             cols_schema,
             0,
             256 * 1024,
-            RecoverySource::Rederive,
+            RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
         let _ = &mut cols_tab;

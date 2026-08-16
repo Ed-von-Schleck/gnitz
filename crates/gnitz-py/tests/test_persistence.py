@@ -1573,6 +1573,88 @@ def test_recovery_reset_injection_forces_correct_rebuild(own_server):
     conn.close()
 
 
+# The SAL floor (16 MiB): `checkpoint_before_backfill` reclaims once the write
+# cursor passes 1/8 of it (2 MiB), while the committer's own checkpoint waits for
+# 3/4 (12 MiB). The phase-2 push below is sized into that gap — past the backfill
+# reclaim, short of any checkpoint that would re-stamp the view.
+# `GNITZ_LOG_LEVEL=normal` puts the "SAL checkpoint epoch=" line in the log,
+# which is how the test proves the reclaim it depends on actually fired.
+_BACKFILL_RECLAIM_ENV = {
+    "GNITZ_SAL_BYTES": str(16 * 1024 * 1024),
+    "GNITZ_LOG_LEVEL": "normal",
+}
+
+# Only the SAL byte volume matters, so buy it with wide rows rather than many:
+# ~830 B/row puts ~3.3 MiB through the SAL, inside the (2, 12) MiB gap, while
+# keeping view maintenance and the phase-3 scan five times cheaper.
+_RECLAIM_ROWS = 4_000
+_RECLAIM_PAD = "x" * 800
+
+
+def _sal_checkpoints(srv):
+    """How many SAL checkpoint resets this boot has logged."""
+    return srv.log_text().count("SAL checkpoint epoch=")
+
+
+def test_view_is_not_stale_after_backfill_checkpoint(own_server):
+    """A CREATE VIEW whose pre-backfill reclaim fires publishes every base table's
+    shards and then resets the SAL — so the rows it made durable exist in the base
+    and nowhere else. The first view's checkpoint still names the older cut, and
+    its manifests must not stay generation-valid across that: a restart would
+    resume a view that is silently short, with no SAL tail left to close the gap.
+
+    Fails without the generation bump inside `do_checkpoint`."""
+    sock_path = own_server.sock_path
+
+    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("val", gnitz.TypeCode.I64),
+            gnitz.ColumnDef("pad", gnitz.TypeCode.STRING)]
+    schema = gnitz.Schema(cols)
+
+    # --- Phase 1: table + view, then a graceful stop so `v` is checkpointed. ---
+    own_server.start(extra_env=_BACKFILL_RECLAIM_ENV)
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("stale")
+    tid = conn.create_table("stale", "t", cols)
+    conn.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name="stale")
+    conn.close()
+    rc = own_server.stop_graceful()
+    assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}"
+
+    # --- Phase 2: push past the reclaim watermark, then CREATE a second view.
+    #     Its backfill reclaims: base shards advance, the SAL is discarded. ---
+    own_server.start(extra_env=_BACKFILL_RECLAIM_ENV)
+    conn = gnitz.connect(sock_path)
+    for lo in range(0, _RECLAIM_ROWS, 2000):
+        batch = gnitz.ZSetBatch(schema)
+        for i in range(lo, lo + 2000):
+            batch.append(pk=i, val=i * 10, pad=_RECLAIM_PAD)
+        conn.push(tid, batch)
+
+    before = _sal_checkpoints(own_server)
+    conn.execute_sql("CREATE VIEW v2 AS SELECT pk FROM t", schema_name="stale")
+    conn.close()
+    assert _sal_checkpoints(own_server) > before, (
+        "the CREATE VIEW backfill must have reclaimed the SAL — otherwise the "
+        "un-checkpointed tail survives and this test proves nothing"
+    )
+
+    # --- Phase 3: SIGKILL, restart. `v` must hold every pushed row: either it
+    #     was re-stamped at the bumped generation, or the verdict rejected it and
+    #     rebuilt it from base. A resume at the stale cut shows nothing. ---
+    own_server.stop()
+    own_server.start(extra_env=_BACKFILL_RECLAIM_ENV)
+    conn = gnitz.connect(sock_path)
+    vid, _ = conn.resolve_table("stale", "v")
+    rows = conn.scan(vid)
+    assert len(rows) == _RECLAIM_ROWS, (
+        f"view must reflect every base row after the backfill reclaim, "
+        f"got {len(rows)} of {_RECLAIM_ROWS}"
+    )
+    assert sum(r["val"] for r in rows) == sum(i * 10 for i in range(_RECLAIM_ROWS))
+    conn.close()
+
+
 def _create_replicated_join(conn, schema):
     """A replicated `dim`, a partitioned `fact`, and a view joining them.
 

@@ -45,12 +45,20 @@ fn setup_wide_unique(
     let schema = wide_unique_schema();
     let idx_schema = make_index_schema(&[3], &schema).unwrap();
 
-    let mut base = Box::new(Table::new(&format!("{dir}/base"), schema, tid as u32, RecoverySource::Rederive).unwrap());
+    let mut base = Box::new(
+        Table::new(
+            &format!("{dir}/base"),
+            schema,
+            tid as u32,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap(),
+    );
     let mut idx = Table::new(
         &format!("{dir}/idx"),
         idx_schema,
         tid as u32 + 1,
-        RecoverySource::Rederive,
+        RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
 
@@ -126,7 +134,7 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
         &format!("{dir}/p_base"),
         parent_schema,
         parent_tid as u32,
-        RecoverySource::Rederive,
+        RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
     pbase.ingest_owned_batch(pb).unwrap();

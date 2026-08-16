@@ -202,15 +202,21 @@ impl DagEngine {
         }
     }
 
-    /// Collect the tables the base checkpoint round (`FLAG_FLUSH`) flushes:
-    /// every registered user relation's store plus its index-circuit tables.
-    /// System tables (`StoreHandle::Borrowed`) are skipped — workers never
-    /// barrier-flush their inherited `_sys` copies. `SalReplay` stores publish
-    /// (`Pending`); rederived stores and index tables fold to RAM
-    /// (`FlushOutcome::Done`), which the generic flush loop consumes.
+    /// Every store this process owns: each relation's own handle plus its
+    /// index-circuit tables. System tables hold `Borrowed` handles and drop out
+    /// here — workers never barrier-flush their inherited `_sys` copies.
     ///
-    /// Same `*mut Table` validity argument as `collect_ephemeral_flush_tables`
-    /// below.
+    /// Both checkpoint rounds start from this one set and let `Table` decide:
+    /// the base round is handed it whole (`flush_prepare` publishes the durable
+    /// stores and folds the rederived ones to RAM), the ephemeral round takes
+    /// the rederived half. Neither re-derives "which stores does this round
+    /// touch" from the relation kind, so the two cannot drift apart.
+    ///
+    /// Returned as raw `*mut Table` — the engine already passes `*mut Table`,
+    /// and owned trace tables are not in `self.tables` so they cannot be keyed
+    /// by `tid`. Valid because the worker flush handler is a synchronous `fn` on
+    /// a single-threaded process: no reactor yield and no concurrent
+    /// `cache`/`tables` mutation, so the table set is frozen for the flush.
     pub(crate) fn collect_base_flush_tables(&mut self) -> Vec<*mut Table> {
         let mut out: Vec<*mut Table> = Vec::new();
         for entry in self.tables.values_mut() {
@@ -224,28 +230,29 @@ impl DagEngine {
         out
     }
 
-    /// Collect the tables the ephemeral checkpoint round force-persists, in two
-    /// disjoint sets: (1) every compiled view plan's operator-trace tables, and
-    /// (2) every view's output store. The worker flushes set 1 fully
-    /// durable before set 2 (the flush-ordering invariant: any output manifest at
-    /// generation G implies that view's traces are durable at G).
+    /// True when a base round would publish a cut newer than the last one.
+    /// Asked of the same table set the round flushes, so the two cannot drift
+    /// on which stores publish.
+    pub(crate) fn base_advanced_since_publish(&mut self) -> bool {
+        self.collect_base_flush_tables()
+            .into_iter()
+            .any(|t| unsafe { &*t }.base_round_advances_publish())
+    }
+
+    /// The tables the ephemeral checkpoint round force-persists, split into the
+    /// two sets the worker flushes in order: every compiled view plan's
+    /// operator-trace tables, then every rederived store (view outputs and
+    /// secondary indexes). Set 1 goes fully durable before set 2, so any output
+    /// manifest at generation G implies that view's traces are durable at G.
     ///
-    /// Returned as raw `*mut Table` — owned trace tables are not in `self.tables`
-    /// so they cannot be keyed by `tid`, and the engine already passes
-    /// `*mut Table`. Valid because the worker flush handler is a synchronous `fn`
-    /// on a single-threaded process: no reactor yield and no concurrent
-    /// `cache`/`tables` mutation, so the table set is frozen for the flush.
-    /// `cache` and `tables` are separate fields (clean disjoint borrow) and the
-    /// two sets are disjoint allocations (scratch dirs vs the view dir). Index
-    /// tables are excluded: they live in `TableEntry::index_circuits`, not the
-    /// plan cache, and stay erase-at-boot.
+    /// The sets are disjoint allocations — scratch dirs versus the relation dir
+    /// — and `cache` and `tables` are separate fields, so the borrows are clean.
+    /// Same `*mut Table` validity argument as `collect_base_flush_tables`.
     pub(crate) fn collect_ephemeral_flush_tables(&mut self) -> (Vec<*mut Table>, Vec<*mut Table>) {
-        // Trace half: only a view's owned operator traces are persisted this
-        // round. Iterate the (smaller) plan cache and consult `tables` — a
-        // disjoint sibling field — for each plan's `kind`. Every `cache` entry
-        // has a matching `tables` entry (`ensure_compiled` requires
-        // `tables.get(view_id)` first; `unregister_table` removes both together),
-        // so this misses no view trace.
+        // Iterate the (smaller) plan cache and consult `tables` — a disjoint
+        // sibling field — for each plan's kind. Every `cache` entry has a
+        // matching `tables` entry (`ensure_compiled` requires `tables.get`
+        // first; `unregister_table` removes both), so this misses no view trace.
         let mut traces: Vec<*mut Table> = Vec::new();
         for (tid, plan) in self.cache.iter_mut() {
             if !self.tables.get(tid).is_some_and(|e| e.kind.is_view()) {
@@ -260,16 +267,11 @@ impl DagEngine {
             }
         }
 
-        let mut outputs: Vec<*mut Table> = Vec::new();
-        for entry in self.tables.values() {
-            // Only a view's output store is persisted this round.
-            if !entry.kind.is_view() {
-                continue;
-            }
-            if let Some(t) = entry.handle.as_owned_mut() {
-                outputs.push(t as *mut Table);
-            }
-        }
+        let outputs = self
+            .collect_base_flush_tables()
+            .into_iter()
+            .filter(|&t| unsafe { &*t }.is_rederived())
+            .collect();
         (traces, outputs)
     }
 

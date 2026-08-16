@@ -78,7 +78,7 @@ pub(crate) fn worker_rank() -> u32 {
 }
 
 /// The committed checkpoint generation this process last latched — the value
-/// the ephemeral flush round stamps into manifests and `RederiveCheckpointed`
+/// the ephemeral flush round stamps into manifests and `Rederive`
 /// opens gate on.
 ///
 /// Read here rather than off the catalog because the two deliberately diverge

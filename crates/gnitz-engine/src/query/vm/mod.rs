@@ -401,7 +401,7 @@ mod tests {
                 schema,
                 0,
                 1 << 20,
-                crate::storage::RecoverySource::Rederive,
+                crate::storage::RecoverySource::Rederive { resume_at: None },
             )
             .unwrap(),
         );
@@ -1020,7 +1020,7 @@ mod tests {
             schema,
             0,
             1 << 20,
-            crate::storage::RecoverySource::Rederive,
+            crate::storage::RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
 

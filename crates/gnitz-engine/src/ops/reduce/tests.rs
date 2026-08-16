@@ -4714,7 +4714,7 @@ fn avi_read_extreme(
         avi_schema,
         0,
         1 << 20,
-        crate::storage::RecoverySource::Rederive,
+        crate::storage::RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
     let agg = AggDescriptor {
@@ -6663,7 +6663,7 @@ fn build_combined_avi(
         avi_schema,
         0,
         1 << 20,
-        crate::storage::RecoverySource::Rederive,
+        crate::storage::RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
     // The value-indexed (MIN/MAX) subset, in descriptor order — exactly what the
@@ -7370,7 +7370,7 @@ fn run_reduce_trace_epochs(
         *out_schema,
         0,
         1 << 20,
-        crate::storage::RecoverySource::Rederive,
+        crate::storage::RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
     let mut max_sources = 0usize;
@@ -7743,11 +7743,35 @@ fn run_minmax_epochs(
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
 
-    let mut trace_out = Table::with_arena(dir, *out_schema, 0, 1 << 20, RecoverySource::Rederive).unwrap();
-    let mut trace_in =
-        (!use_avi).then(|| Table::with_arena(dir, *in_schema, 1, 1 << 20, RecoverySource::Rederive).unwrap());
+    let mut trace_out = Table::with_arena(
+        dir,
+        *out_schema,
+        0,
+        1 << 20,
+        RecoverySource::Rederive { resume_at: None },
+    )
+    .unwrap();
+    let mut trace_in = (!use_avi).then(|| {
+        Table::with_arena(
+            dir,
+            *in_schema,
+            1,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap()
+    });
     let avi_schema = make_avi_schema(in_schema, group_by);
-    let mut avi_t = use_avi.then(|| Table::with_arena(dir, avi_schema, 2, 1 << 20, RecoverySource::Rederive).unwrap());
+    let mut avi_t = use_avi.then(|| {
+        Table::with_arena(
+            dir,
+            avi_schema,
+            2,
+            1 << 20,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap()
+    });
 
     // Value-indexed (MIN/MAX) subset in descriptor order — exactly what the
     // compiler feeds the integrate instruction and the reduce read side.

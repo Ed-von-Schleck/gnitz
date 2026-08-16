@@ -203,7 +203,7 @@ fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> 
     let p = if durable {
         RecoverySource::SalReplay
     } else {
-        RecoverySource::Rederive
+        RecoverySource::Rederive { resume_at: None }
     };
     Table::with_arena(dir.to_str().unwrap(), schema, 1, 1 << 20, p).unwrap()
 }

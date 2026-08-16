@@ -978,12 +978,16 @@ impl CatalogEngine {
         let live_tables: rustc_hash::FxHashSet<&str> = self.dag.tables.values().map(|e| e.directory.as_str()).collect();
 
         // Full on-disk path of every live index: `<owner_dir>/idx_<idx_id>`.
+        // Named from each circuit's `index_id` — the id the directory was
+        // created under — and not from `caches.indices_by_owner`, which holds
+        // every IDX_TAB id. The two diverge when a second index registers on a
+        // column list already covered and the first is then dropped: the circuit
+        // and its directory survive under the first registrant's id, so a cache
+        // read would find no live entry and remove a live index tree.
         let mut live_indices: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-        for (owner_id, idx_ids) in &self.caches.indices_by_owner {
-            if let Some(owner) = self.dag.tables.get(owner_id) {
-                for idx_id in idx_ids {
-                    live_indices.insert(index_dir(&owner.directory, *idx_id));
-                }
+        for entry in self.dag.tables.values() {
+            for ic in &entry.index_circuits {
+                live_indices.insert(index_dir(&entry.directory, ic.index_id));
             }
         }
 
@@ -1010,7 +1014,8 @@ impl CatalogEngine {
                         }
                         let idx_full = format!("{full}/{idx_name}");
                         if live_indices.contains(&idx_full) {
-                            remove_stale_index_rank_dirs(&idx_full);
+                            // Its per-worker children are `reconcile_child_dirs`'
+                            // job — the sweep descends into an index dir.
                             continue;
                         }
                         match std::fs::remove_dir_all(&idx_full) {

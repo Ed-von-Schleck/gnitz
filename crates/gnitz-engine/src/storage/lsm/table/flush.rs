@@ -20,8 +20,8 @@ use super::{FlushOutcome, FlushWork, RecoverySource, Table};
 use crate::foundation::posix_io::open_owned;
 
 impl Table {
-    /// Synchronous flush of this one table through the shared barrier:
-    /// `Rederive` tables fold into the RAM tier and publish nothing; a
+    /// Synchronous flush of this one table through the shared barrier. It runs a
+    /// **base** round, so a `Rederive` table only folds into the RAM tier; a
     /// `SalReplay` table folds memtable + L0 into one shard, syncs it and the
     /// staged manifest, renames the manifest into place, fsyncs the directory,
     /// and drains its deferred compaction cleanup. Used by manual FLUSH and the
@@ -36,10 +36,9 @@ impl Table {
     /// The caller owns the returned `OwnedFd`, which closes it on drop — so an
     /// error `?` anywhere downstream releases it with no manual close.
     ///
-    /// An absent directory is created here: a `Rederive` table opens dirless
-    /// (`Table::new` defers the create because in steady state such a table
-    /// never writes a file), and this is the single choke point every file
-    /// write goes through. NOCOW (btrfs; silently ignored elsewhere) is applied
+    /// An absent directory is created here — this is the single choke point
+    /// every file write goes through, so nothing downstream has to check.
+    /// NOCOW (btrfs; silently ignored elsewhere) is applied
     /// to every opened fd — a cheap idempotent ioctl, and the one place that
     /// covers dirs created lazily here as well as dirs pre-created by the
     /// catalog's layout staging (index dirs), so files written into either
@@ -94,7 +93,7 @@ impl Table {
     /// A rederived table on the **base** round publishes nothing — it is rebuilt
     /// from its sources at open — and just folds to RAM inline. The base round
     /// stamps generation 0, so a manifest published here would be the one a
-    /// `RederiveCheckpointed` open accepts while the committed generation is
+    /// `Rederive` open accepts while the committed generation is
     /// still 0: the view would resume from a base-round snapshot its operator
     /// traces never matched, and the replayed delta would land twice.
     ///
@@ -212,9 +211,9 @@ impl Table {
     /// Spills are written **unsynced** and marked in the index's `unsynced` set.
     /// For `SalReplay` the next barrier fdatasyncs them by path before publishing
     /// (every barrier publishes, so the checkpoint's global SAL reset never drops
-    /// an acknowledged spill). Rederive spills publish no manifest and are
-    /// erased+rebuilt at open, so their `unsynced` marks are pruned by disk
-    /// compaction and never swept.
+    /// an acknowledged spill). A `Rederive` table's spills wait for the
+    /// ephemeral round instead, and are erased+rebuilt at open if none reaches
+    /// them.
     ///
     /// After a spill the table carries disk runs + future heap runs; cross-tier
     /// churn does NOT fold (the RAM-tier fold is heap-only and `run_compact` is

@@ -140,6 +140,22 @@ impl Drop for TickGate {
     }
 }
 
+/// Run `body` inside a DDL window: the tick loop is parked before it starts and
+/// released once it finishes, with the depth raised for exactly that span.
+///
+/// A scope rather than a guard the caller binds, because the depth is not a lock
+/// this DDL holds — it is the count of DDLs in flight that the committer reads to
+/// decide whether a checkpoint sequence may run. Lowering it early does not
+/// "release" anything: it reports that no DDL is running while this one still is,
+/// and the sequence that then starts collides with whatever the handler does
+/// next. Owning the gate here leaves no binding for a caller to drop, so that
+/// cannot be written. `body` is a future, which is inert until awaited, so it
+/// cannot run ahead of the gate either.
+async fn with_ddl_window<T>(shared: &Rc<Shared>, body: impl std::future::Future<Output = T>) -> T {
+    let _gate = TickGate::enter(shared).await;
+    body.await
+}
+
 /// Send a committer barrier of `kind` and wait for it to resolve.
 async fn await_barrier(shared: &Shared, kind: BarrierKind) {
     let (tx, rx) = oneshot::channel::<()>();
@@ -184,6 +200,10 @@ pub struct Shared {
     /// `TickGate`. Read by the committer (no checkpoint round while non-zero)
     /// and by the watchdog (a SIGTERM waits the window out).
     ddl_window: Rc<Cell<usize>>,
+    /// The committer's one-shot checkpoint request. Raising it is how a path
+    /// that owes the cluster a checkpoint asks for one without awaiting a
+    /// barrier — see `committer::Shared::force_checkpoint`.
+    force_checkpoint: Rc<Cell<bool>>,
     /// OCC per-table commit-LSN map: `tid → zone LSN of its last committed
     /// write this boot`. Bumped under the writer's table-lock guard immediately
     /// after a successful commit ACK (push arm and `push_txn_body`, `Ok` path
@@ -380,13 +400,16 @@ impl ServerExecutor {
         let draining = Rc::new(Cell::new(false));
         // Nesting depth of the quiescing-DDL windows (reactor-thread-only).
         let ddl_window = Rc::new(Cell::new(0usize));
+        // One-shot checkpoint request, raised by the executor and consumed by the
+        // committer (reactor-thread-only).
+        let force_checkpoint = Rc::new(Cell::new(false));
 
         let committer_shared = Rc::new(committer::Shared {
             reactor: Rc::clone(&reactor),
             disp: Rc::clone(&dispatcher),
             sal_writer_excl: Rc::clone(&sal_writer_excl),
             lsn_alloc: Rc::clone(&lsn_alloc),
-            force_checkpoint: Cell::new(false),
+            force_checkpoint: Rc::clone(&force_checkpoint),
             tick_rows: Rc::clone(&tick_rows),
             tick_tx: tick_tx.clone(),
             ddl_window: Rc::clone(&ddl_window),
@@ -405,6 +428,7 @@ impl ServerExecutor {
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Rc::clone(&draining),
             ddl_window: Rc::clone(&ddl_window),
+            force_checkpoint: Rc::clone(&force_checkpoint),
             table_commit_lsn: RefCell::new(FxHashMap::default()),
             boot_seed: initial_lsn,
         });
@@ -2316,205 +2340,222 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // its own Drain then Quiesce, and a DDL Quiesce queued ahead of that Drain
     // parks the tick loop on a release this handler only sends once the barrier
     // returns — which needs the sequence to finish.
-    let _tick_gate = TickGate::enter(shared).await;
+    with_ddl_window(shared, async {
+        let _write = shared.catalog_rwlock.write().await;
 
-    let _write = shared.catalog_rwlock.write().await;
+        if view_create {
+            // Lock-held committer barrier: a push could have committed between the
+            // pre-lock barrier and the write lock; flush it so every straggler is
+            // resident in pending_deltas before the in-loop source drain. The
+            // committer stays idle for the rest of the handler (the write lock blocks
+            // new pushes).
+            await_barrier(shared, BarrierKind::Ddl).await;
+        }
 
-    if view_create {
-        // Lock-held committer barrier: a push could have committed between the
-        // pre-lock barrier and the write lock; flush it so every straggler is
-        // resident in pending_deltas before the in-loop source drain. The
-        // committer stays idle for the rest of the handler (the write lock blocks
-        // new pushes).
-        await_barrier(shared, BarrierKind::Ddl).await;
-    }
+        let cat_ptr_raw = shared.catalog;
+        // Discard any stale queue entries from a prior failed DDL so they don't
+        // piggyback on this one. (pending_dir_deletions is NOT discarded here: a
+        // failed DDL already clears it on the error path, and recovery legitimately
+        // queues drops here that must be drained — not discarded — by the post-fsync
+        // drain.)
+        let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
 
-    let cat_ptr_raw = shared.catalog;
-    // Discard any stale queue entries from a prior failed DDL so they don't
-    // piggyback on this one. (pending_dir_deletions is NOT discarded here: a
-    // failed DDL already clears it on the error path, and recovery legitimately
-    // queues drops here that must be drained — not discarded — by the post-fsync
-    // drain.)
-    let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
-
-    // Pre-flight global uniqueness for every unique secondary index in this
-    // bundle BEFORE reserving the zone LSN or mutating the catalog, so a
-    // violation needs no rollback — it just surfaces to the client. This runs
-    // before the ingest loop, so for a table created in the same bundle the owner
-    // is not yet in `dag.tables` and `validate_unique_index_create`
-    // short-circuits to an empty filter (sound: the new table is empty, and
-    // hook_index_register's own owner-check still succeeds later in the loop). The
-    // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
-    // `create_index` and read identically by `hook_index_register`.
-    let mut filter_seeds: Vec<(i64, u64, UniqueFilter)> = Vec::new();
-    for (owner_id, packed, cols) in bundle_family(&families, SysFamily::Index)
-        .map(idx_tab_unique_creates)
-        .unwrap_or_default()
-    {
-        match MasterDispatcher::validate_unique_index_create(
-            shared.disp(),
-            &shared.reactor,
-            &shared.sal_writer_excl,
-            owner_id,
-            cols.as_slice(),
-        )
-        .await
+        // Pre-flight global uniqueness for every unique secondary index in this
+        // bundle BEFORE reserving the zone LSN or mutating the catalog, so a
+        // violation needs no rollback — it just surfaces to the client. This runs
+        // before the ingest loop, so for a table created in the same bundle the owner
+        // is not yet in `dag.tables` and `validate_unique_index_create`
+        // short-circuits to an empty filter (sound: the new table is empty, and
+        // hook_index_register's own owner-check still succeeds later in the loop). The
+        // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
+        // `create_index` and read identically by `hook_index_register`.
+        let mut filter_seeds: Vec<(i64, u64, UniqueFilter)> = Vec::new();
+        for (owner_id, packed, cols) in bundle_family(&families, SysFamily::Index)
+            .map(idx_tab_unique_creates)
+            .unwrap_or_default()
         {
-            // No zone LSN reserved, no catalog mutation yet: just surface
-            // the violation to the client. The write lock drops on return.
-            Err(e) => {
-                send_error(peer, 0, client_id, e.as_bytes()).await;
-                return;
-            }
-            // Hold the pre-flight's filter to publish post-commit, keyed by
-            // the packed column list (the filter-map key).
-            Ok(filter) => filter_seeds.push((owner_id, packed, filter)),
-        }
-    }
-
-    // Reserve the zone LSN but do NOT publish it until fsync confirms
-    // durability. A DDL bundle writes arbitrary system families, so the floor is
-    // `max_table_current_lsn` — the zone must dominate EVERY family's counter
-    // (see `ZoneLsnAllocator::reserve` for why a drifted counter would dedup-drop
-    // the zone on recovery).
-    let zone_lsn = shared
-        .lsn_alloc
-        .reserve(unsafe { (*cat_ptr_raw).max_table_current_lsn() });
-    let zone_lsn_nz = NonZeroU64::new(zone_lsn).expect("zone LSN allocator starts above 0");
-    unsafe {
-        (*cat_ptr_raw).ctx.open_ddl_zone(zone_lsn_nz);
-    }
-
-    // The post-fsync unique-filter maintenance needs the durably-dropped tids and
-    // (owner, packed-cols) pairs (the -1 rows); the ingest loop consumes
-    // `families`, so extract those minimal lists now instead of cloning the whole
-    // TABLE_TAB / IDX_TAB batches. A bundle is one DDL, so at most one family
-    // carries -1 rows; a CREATE bundle yields empty lists.
-    let dropped_tids: Vec<i64> =
-        bundle_family(&families, SysFamily::Table).map_or_else(Vec::new, |b| family_pks_by_sign(b, false));
-    let dropped_indices: Vec<(i64, u64)> = bundle_family(&families, SysFamily::Index)
-        .map(idx_tab_drops)
-        .unwrap_or_default();
-
-    // Ingest the families in ascending topo order so every register/index hook
-    // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
-    // new view's base sources once the circuit families are in the memtable
-    // (so get_source_ids resolves) but before VIEW_TAB registers the view — after
-    // registration the view is a dependent of those bases, so an undrained pending
-    // delta would tick it through `evaluate_dag` over rows the backfill below also
-    // scans, counting them twice. VIEW_TAB is the first family at or past view
-    // priority.
-    // The between-precheck-and-apply marker holds the single family that was
-    // applied but not yet enqueued (a hook/panic failure), which compensation must
-    // negate; a precheck failure leaves the marker None, so no ghost -1 is written.
-    // The ingest loop writes nothing to the SAL (broadcasts are queued and emitted
-    // only in the tail below), so the in-loop drain's tick precedes the zone's
-    // broadcasts in SAL order exactly as before.
-    families.sort_by_key(|(f, _)| f.topo_priority());
-    let view_prio = SysFamily::View.topo_priority();
-    let mut applied_not_enqueued: Option<(i64, Batch)> = None;
-    let mut drained_sources = false;
-    let ingest_res = guard_panic("DDL", || {
-        let cat = unsafe { &mut *cat_ptr_raw };
-        for (family, fbatch) in families {
-            if view_create && !drained_sources && family.topo_priority() >= view_prio {
-                for src in cat.dag.base_tables_reachable_from(new_view_ids.clone()) {
-                    shared.disp().drain_tick_blocking(src)?;
+            match MasterDispatcher::validate_unique_index_create(
+                shared.disp(),
+                &shared.reactor,
+                &shared.sal_writer_excl,
+                owner_id,
+                cols.as_slice(),
+            )
+            .await
+            {
+                // No zone LSN reserved, no catalog mutation yet: just surface
+                // the violation to the client. The write lock drops on return.
+                Err(e) => {
+                    send_error(peer, 0, client_id, e.as_bytes()).await;
+                    return;
                 }
-                drained_sources = true;
+                // Hold the pre-flight's filter to publish post-commit, keyed by
+                // the packed column list (the filter-map key).
+                Ok(filter) => filter_seeds.push((owner_id, packed, filter)),
             }
-            cat.precheck_family(family, &fbatch)?;
-            applied_not_enqueued = Some((family.id(), fbatch.clone()));
-            cat.apply_and_enqueue_family(family, fbatch)?;
-            applied_not_enqueued = None;
         }
-        // Compile every new view's circuit here, on the master, while the bundle
-        // is still undoable. VIEW_TAB has been applied, so each view is registered
-        // and every source resolves — and nothing has reached the SAL yet, so a
-        // rejection leaves through the arm below with the view uncreated.
-        // Compiling only on the workers, as the backfill does, puts the verdict
-        // after the DDL is durable, where it can be nothing but a log line and a
-        // view that returns no rows forever.
-        for &vid in &new_view_ids {
-            cat.preflight_view_compile(vid)?;
+
+        // Reserve the zone LSN but do NOT publish it until fsync confirms
+        // durability. A DDL bundle writes arbitrary system families, so the floor is
+        // `max_table_current_lsn` — the zone must dominate EVERY family's counter
+        // (see `ZoneLsnAllocator::reserve` for why a drifted counter would dedup-drop
+        // the zone on recovery).
+        let zone_lsn = shared
+            .lsn_alloc
+            .reserve(unsafe { (*cat_ptr_raw).max_table_current_lsn() });
+        let zone_lsn_nz = NonZeroU64::new(zone_lsn).expect("zone LSN allocator starts above 0");
+        unsafe {
+            (*cat_ptr_raw).ctx.open_ddl_zone(zone_lsn_nz);
         }
-        Ok(())
-    });
-    if let Err(e) = ingest_res {
-        guard_panic("DDL-compensate", || {
-            unsafe {
-                (*cat_ptr_raw).compensate_stage_a(applied_not_enqueued.take());
+
+        // The post-fsync unique-filter maintenance needs the durably-dropped tids and
+        // (owner, packed-cols) pairs (the -1 rows); the ingest loop consumes
+        // `families`, so extract those minimal lists now instead of cloning the whole
+        // TABLE_TAB / IDX_TAB batches. A bundle is one DDL, so at most one family
+        // carries -1 rows; a CREATE bundle yields empty lists.
+        let dropped_tids: Vec<i64> =
+            bundle_family(&families, SysFamily::Table).map_or_else(Vec::new, |b| family_pks_by_sign(b, false));
+        let dropped_indices: Vec<(i64, u64)> = bundle_family(&families, SysFamily::Index)
+            .map(idx_tab_drops)
+            .unwrap_or_default();
+
+        // Ingest the families in ascending topo order so every register/index hook
+        // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
+        // new view's base sources once the circuit families are in the memtable
+        // (so get_source_ids resolves) but before VIEW_TAB registers the view — after
+        // registration the view is a dependent of those bases, so an undrained pending
+        // delta would tick it through `evaluate_dag` over rows the backfill below also
+        // scans, counting them twice. VIEW_TAB is the first family at or past view
+        // priority.
+        // The between-precheck-and-apply marker holds the single family that was
+        // applied but not yet enqueued (a hook/panic failure), which compensation must
+        // negate; a precheck failure leaves the marker None, so no ghost -1 is written.
+        // The ingest loop writes nothing to the SAL (broadcasts are queued and emitted
+        // only in the tail below), so the in-loop drain's tick precedes the zone's
+        // broadcasts in SAL order exactly as before.
+        families.sort_by_key(|(f, _)| f.topo_priority());
+        let view_prio = SysFamily::View.topo_priority();
+        let mut applied_not_enqueued: Option<(i64, Batch)> = None;
+        let mut drained_sources = false;
+        let ingest_res = guard_panic("DDL", || {
+            let cat = unsafe { &mut *cat_ptr_raw };
+            for (family, fbatch) in families {
+                if view_create && !drained_sources && family.topo_priority() >= view_prio {
+                    for src in cat.dag.base_tables_reachable_from(new_view_ids.clone()) {
+                        shared.disp().drain_tick_blocking(src)?;
+                    }
+                    drained_sources = true;
+                }
+                cat.precheck_family(family, &fbatch)?;
+                applied_not_enqueued = Some((family.id(), fbatch.clone()));
+                cat.apply_and_enqueue_family(family, fbatch)?;
+                applied_not_enqueued = None;
             }
-            Ok::<(), String>(())
-        })
-        .unwrap_or_else(|ce| {
-            gnitz_fatal_abort!("Stage-A DDL compensation panicked after DDL error '{}': {}", e, ce);
+            // Compile every new view's circuit here, on the master, while the bundle
+            // is still undoable. VIEW_TAB has been applied, so each view is registered
+            // and every source resolves — and nothing has reached the SAL yet, so a
+            // rejection leaves through the arm below with the view uncreated.
+            // Compiling only on the workers, as the backfill does, puts the verdict
+            // after the DDL is durable, where it can be nothing but a log line and a
+            // view that returns no rows forever.
+            for &vid in &new_view_ids {
+                cat.preflight_view_compile(vid)?;
+            }
+            Ok(())
         });
+        if let Err(e) = ingest_res {
+            guard_panic("DDL-compensate", || {
+                unsafe {
+                    (*cat_ptr_raw).compensate_stage_a(applied_not_enqueued.take());
+                }
+                Ok::<(), String>(())
+            })
+            .unwrap_or_else(|ce| {
+                gnitz_fatal_abort!("Stage-A DDL compensation panicked after DDL error '{}': {}", e, ce);
+            });
+            unsafe {
+                (*cat_ptr_raw).ctx.close_ddl_zone();
+            }
+            send_error(peer, 0, client_id, e.as_bytes()).await;
+            return;
+        }
+
+        // SAL emission window (byte-identical to the single-family DDL): broadcast
+        // each drained family under the shared zone_lsn, close the zone with the
+        // commit sentinel, then fsync. A failure here is unrecoverable — workers
+        // already applied the FLAG_DDL_SYNC groups in real time — so abort.
+        let drained = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
+        let fsync_fut = {
+            let _sal_excl = shared.sal_writer_excl.lock().await;
+            emit_zone_to_sal(shared, "DDL", &drained, zone_lsn)
+        };
+        let fsync_rc = fsync_fut.await;
+        if fsync_rc < 0 {
+            gnitz_fatal_abort!("SAL fdatasync (DDL) failed rc={}", fsync_rc);
+        }
+
+        // Publish only after fsync, then close the zone and defer dir removals to the
+        // next checkpoint (whose worker-ACK barrier proves every worker consumed past
+        // this DROP; removing here races a lagging worker's child-dir create).
+        shared.lsn_alloc.publish(zone_lsn);
         unsafe {
             (*cat_ptr_raw).ctx.close_ddl_zone();
+            (*cat_ptr_raw).defer_pending_dir_deletions();
         }
-        send_error(peer, 0, client_id, e.as_bytes()).await;
-        return;
-    }
 
-    // SAL emission window (byte-identical to the single-family DDL): broadcast
-    // each drained family under the shared zone_lsn, close the zone with the
-    // commit sentinel, then fsync. A failure here is unrecoverable — workers
-    // already applied the FLAG_DDL_SYNC groups in real time — so abort.
-    let drained = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
-    let fsync_fut = {
-        let _sal_excl = shared.sal_writer_excl.lock().await;
-        emit_zone_to_sal(shared, "DDL", &drained, zone_lsn)
-    };
-    let fsync_rc = fsync_fut.await;
-    if fsync_rc < 0 {
-        gnitz_fatal_abort!("SAL fdatasync (DDL) failed rc={}", fsync_rc);
-    }
+        // Invalidate unique-filter state for durably-dropped tables/indices so a
+        // recreated table with the same ID does not inherit stale filter entries.
+        for &tid in &dropped_tids {
+            shared.disp().unique_filter_invalidate_table(tid);
+        }
+        // Keying by the whole packed list means dropping `(a, b)` never clears a
+        // distinct single-column filter on `a`.
+        for &(owner_id, packed) in &dropped_indices {
+            shared.disp().unique_filter_remove(owner_id, packed);
+        }
 
-    // Publish only after fsync, then close the zone and defer dir removals to the
-    // next checkpoint (whose worker-ACK barrier proves every worker consumed past
-    // this DROP; removing here races a lagging worker's child-dir create).
-    shared.lsn_alloc.publish(zone_lsn);
-    unsafe {
-        (*cat_ptr_raw).ctx.close_ddl_zone();
-        (*cat_ptr_raw).defer_pending_dir_deletions();
-    }
+        // Publish the pre-flight's filters so the first INSERT skips a redundant
+        // full-cluster warmup scan. Post-fsync only: a broadcast/fsync failure
+        // aborts the process before this point, so no filter is published for an
+        // index that never committed.
+        for (owner_id, packed, filter) in filter_seeds {
+            shared.disp().unique_filter_seed(owner_id, packed, filter);
+        }
 
-    // Invalidate unique-filter state for durably-dropped tables/indices so a
-    // recreated table with the same ID does not inherit stale filter entries.
-    for &tid in &dropped_tids {
-        shared.disp().unique_filter_invalidate_table(tid);
-    }
-    // Keying by the whole packed list means dropping `(a, b)` never clears a
-    // distinct single-column filter on `a`.
-    for &(owner_id, packed) in &dropped_indices {
-        shared.disp().unique_filter_remove(owner_id, packed);
-    }
+        // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE
+        // is durable), so abort — restart's boot rebuild refills it.
+        let gen_before = unsafe { (*cat_ptr_raw).durable_generation };
+        guard_panic("view-backfill", || {
+            shared.disp().backfill_views_in_dep_order(&new_view_ids)
+        })
+        .unwrap_or_else(|e| {
+            gnitz_fatal_abort!(
+                "live CREATE VIEW backfill failed after the CREATE was made durable: {}",
+                e
+            );
+        });
+        // `checkpoint_before_backfill` is the only thing above that bumps, so this
+        // is exactly "did MY backfill reclaim". It must stay a per-call fact: a
+        // standing "derived state is unstamped" would also fire on a DDL that
+        // reclaimed nothing, forcing a barrier concurrent with someone else's
+        // in-flight reclaim — which is a wedge, not a repair.
+        let reclaimed = unsafe { (*cat_ptr_raw).durable_generation } != gen_before;
 
-    // Publish the pre-flight's filters so the first INSERT skips a redundant
-    // full-cluster warmup scan. Post-fsync only: a broadcast/fsync failure
-    // aborts the process before this point, so no filter is published for an
-    // index that never committed.
-    for (owner_id, packed, filter) in filter_seeds {
-        shared.disp().unique_filter_seed(owner_id, packed, filter);
-    }
+        send_ok_response(shared, peer, 0, None, client_id, zone_lsn as u128, client_version).await;
+        let total = t_ddl_start.elapsed();
+        if total > Duration::from_millis(20) {
+            gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
+        }
 
-    // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE
-    // is durable), so abort — restart's boot rebuild refills it.
-    if let Err(e) = guard_panic("view-backfill", || {
-        shared.disp().backfill_views_in_dep_order(&new_view_ids)
-    }) {
-        gnitz_fatal_abort!(
-            "live CREATE VIEW backfill failed after the CREATE was made durable: {}",
-            e
-        );
-    }
-
-    send_ok_response(shared, peer, 0, None, client_id, zone_lsn as u128, client_version).await;
-    let total = t_ddl_start.elapsed();
-    if total > Duration::from_millis(20) {
-        gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
-    }
+        // The reclaim bumped the generation and reset the SAL, so every checkpointed
+        // view and index is invalid and nothing else will trigger a checkpoint soon
+        // on a quiet server. Arm the committer's one-shot; it is honoured on the
+        // first pass after this window closes, which is why nothing is awaited here.
+        if reclaimed {
+            shared.force_checkpoint.set(true);
+        }
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------

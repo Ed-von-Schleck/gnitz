@@ -293,13 +293,13 @@ impl CatalogEngine {
     /// interleaving. From this instant every existing Rederive manifest is stale;
     /// a crash below rebuilds views instead of silently staleifying them.
     pub fn bump_checkpoint_generation(&mut self) -> u64 {
-        let new = self.committed_generation + 1;
+        let new = self.durable_generation + 1;
         // Retract the old high-water, insert the new. On the first bump the
         // retract of a non-existent (4, 0) row nets to zero (seed-on-first-use).
         // `advance_sequence` fatal-aborts on ingest failure.
-        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, self.committed_generation as i64, new as i64);
-        self.committed_generation = new;
-        crate::foundation::worker_ctx::set_committed_generation(new);
+        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, self.durable_generation as i64, new as i64);
+        self.durable_generation = new;
+        self.set_resume_generation(new);
         // The row must be shard-durable before the SAL reset that follows
         // discards the memtable copy. A flush failure here is fatal: resetting
         // the SAL on a swallowed failure destroys the only durable copy.
@@ -324,21 +324,69 @@ impl CatalogEngine {
     ///
     /// `worker_ctx::committed_generation()` is left at `G` on purpose: the resume
     /// load (`Table::new`) and the boot verdict both compare view manifests
-    /// against `G`, so a clean restart still resumes. `self.committed_generation`
-    /// IS advanced to `G+1` so `boot_checkpoint`'s `bump_checkpoint_generation`
-    /// retracts `G+1` (not `G`) and stamps the resumed+rebuilt views at `G+2`,
-    /// keeping `_sequences` clean (each generation row nets to zero but the latest).
+    /// against `G`, so a clean restart still resumes. `self.durable_generation`
+    /// IS advanced to `G+1` so the next bump retracts `G+1` (not `G`), keeping
+    /// `_sequences` clean (each generation row nets to zero but the latest), and
+    /// the boot ends at `G+2` or higher.
     ///
     /// Monotonic, so recovery reads it back through `recover_sequences`' `.max()`
     /// arm — no toggle, no stuck-dirty residue in the no-unique-PK `_sequences`.
     pub fn recovery_start_generation_bump(&mut self) -> Result<(), String> {
-        let g = self.committed_generation;
+        let g = self.durable_generation;
         // On a fresh DB `g == 0` and the retract of a non-existent `(4, 0)` row
         // nets to zero (seed-on-first-use), leaving exactly `(4, 1)`.
         self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, g as i64, (g + 1) as i64);
-        self.committed_generation = g + 1;
+        self.durable_generation = g + 1;
         // Durable before the SAL reset that follows discards the memtable copy.
         self.flush_all_system_tables()
+    }
+
+    /// The one writer of the resume generation: the field and the process-global
+    /// mirror every no-catalog `Table::new` caller reads always move together.
+    pub(crate) fn set_resume_generation(&mut self, g: u64) {
+        self.resume_generation = g;
+        crate::foundation::worker_ctx::set_committed_generation(g);
+    }
+
+    /// True when this boot's `(worker count, STATE_FORMAT)` is the one the
+    /// persisted derived state was written under. Half of every resume verdict:
+    /// a change on either axis invalidates every rederived relation regardless
+    /// of what generation its manifest carries.
+    pub(crate) fn topology_matches(&self) -> bool {
+        self.recorded_topology == crate::storage::topology_word(self.num_workers)
+    }
+
+    /// The recovery policy for a secondary-index table: resume from a manifest
+    /// at the resume generation, and only while the topology still matches —
+    /// the same two-part verdict `compute_invalid_views` reaches for a view, in
+    /// the form `Table::new` reads.
+    pub(crate) fn index_recovery_source(&self) -> RecoverySource {
+        RecoverySource::Rederive {
+            resume_at: self.topology_matches().then_some(self.resume_generation),
+        }
+    }
+
+    /// Open this process's copy of a secondary-index table under `idx_dir` — the
+    /// one recipe for the live CREATE INDEX hook and the worker-boot rebuild, so
+    /// the two cannot diverge on where it is homed or on its resume gate.
+    ///
+    /// A forked worker homes at its own `w{rank}of{n}` child, like every other
+    /// relation store. The master and standalone home at `idx_dir` itself: the
+    /// master's copy stays permanently empty, and homing it at `w0of{n}` would
+    /// put it on the directory worker 0's inherited handle already holds.
+    pub(crate) fn new_index_table(
+        &self,
+        idx_dir: &str,
+        index_id: i64,
+        idx_schema: SchemaDescriptor,
+    ) -> Result<Table, String> {
+        let table_dir = if crate::foundation::worker_ctx::is_worker() {
+            ChildAddr::this_worker(self.num_workers).dir(idx_dir)
+        } else {
+            idx_dir.to_string()
+        };
+        Table::new(&table_dir, idx_schema, index_id as u32, self.index_recovery_source())
+            .map_err(|e| format!("Failed to create index table {index_id}: error {e}"))
     }
 
     /// Record the cluster topology (`worker_count << 32 | STATE_FORMAT`) in

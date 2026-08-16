@@ -4,7 +4,7 @@
 
 pub(crate) mod scatter;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -87,6 +87,12 @@ pub struct MasterDispatcher {
     /// probe on the same slot reuses it via `clear` + reload. Schema staleness
     /// (DDL between bursts) is still checked at pop time.
     check_batch_pool: RefCell<FxHashMap<preflight::PoolSlot, Vec<Batch>>>,
+
+    /// The generation the last ephemeral round stamped. Read by
+    /// `note_flush_round`, which holds the rule every base publish must obey: a
+    /// durable base advance is always preceded by a generation bump with no
+    /// ephemeral round in between.
+    last_ephemeral_gen: Cell<u64>,
 }
 
 mod dispatch;

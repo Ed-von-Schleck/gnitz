@@ -708,17 +708,20 @@ impl CatalogEngine {
                 // directory is in pending_dir_deletions for cleanup; the stage
                 // clears only after ALL fallible steps succeed.
                 self.with_staged_dir(idx_dir.clone(), |s| {
-                    // Homed at THIS process's per-rank dir (workers) or the index
-                    // dir itself (master/standalone). The parent `idx_dir` is what
-                    // stays staged in pending_dir_deletions — recursive removal
-                    // reclaims the rank subdirs too on a failed create or a DROP.
-                    let mut idx_table_box = Box::new(new_index_table(&idx_dir, idx_id, idx_schema)?);
+                    // The parent `idx_dir` is what stays staged in
+                    // pending_dir_deletions — recursive removal reclaims the child
+                    // subdirs too on a failed create or a DROP.
+                    let mut idx_table_box = Box::new(s.new_index_table(&idx_dir, idx_id, idx_schema)?);
                     let idx_table_ptr = &mut *idx_table_box as *mut Table;
                     // The master never populates its index copies (they stay
                     // permanently empty; distributed HAS_PK/seek probes union the
                     // workers' slice-local copies). Workers and standalone backfill
-                    // from their local base slice.
-                    if !s.ctx.in_rollback() && !crate::foundation::worker_ctx::is_master() {
+                    // from their local base slice — unless the table just resumed
+                    // from a checkpointed manifest, which already holds those rows.
+                    if !s.ctx.in_rollback()
+                        && !crate::foundation::worker_ctx::is_master()
+                        && !idx_table_box.resumed_from_checkpoint()
+                    {
                         s.backfill_index(
                             owner_id,
                             cols.as_slice(),

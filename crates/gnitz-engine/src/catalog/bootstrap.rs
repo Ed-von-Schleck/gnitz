@@ -46,7 +46,8 @@ impl CatalogEngine {
             user_sequences: std::collections::HashMap::new(),
             num_workers,
             owns_stores: true,
-            committed_generation: 0,
+            durable_generation: 0,
+            resume_generation: 0,
             recorded_topology: 0,
             invalid_views: rustc_hash::FxHashSet::default(),
             sys_stores,
@@ -74,10 +75,10 @@ impl CatalogEngine {
         // Phase 1: Recover sequence counters
         engine.recover_sequences();
 
-        // Publish the recovered checkpoint generation so it is COW-inherited by
-        // forked workers and stamped into any manifest the master publishes
-        // before the first checkpoint bump.
-        crate::foundation::worker_ctx::set_committed_generation(engine.committed_generation);
+        // Before `replay_catalog`, whose index hook reads it.
+        // `recovery_start_generation_bump` leaves this where it is, so a clean
+        // restart resumes from the last completed checkpoint.
+        engine.set_resume_generation(engine.durable_generation);
 
         // Register system table families
         engine.register_system_table_families();
@@ -188,7 +189,7 @@ impl CatalogEngine {
                     // latest-wins value. Both fall in the 4..16 gap
                     // `observe_user_sequence` ignores, so they never leak into
                     // `user_sequences`.
-                    SEQ_ID_CHECKPOINT_GEN => self.committed_generation = self.committed_generation.max(val as u64),
+                    SEQ_ID_CHECKPOINT_GEN => self.durable_generation = self.durable_generation.max(val as u64),
                     SEQ_ID_TOPOLOGY => self.recorded_topology = val as u64,
                     // User-table SERIAL sequence (seq_id == table_id ≥
                     // FIRST_USER_TABLE_ID). Store the high-water; next id =

@@ -106,6 +106,15 @@ impl MasterDispatcher {
             catalog,
             unique_filters: RefCell::new(FxHashMap::default()),
             check_batch_pool: RefCell::new(FxHashMap::default()),
+            // Seeded from the recovered generation: `recovery_start_generation_bump`
+            // has already pushed the durable one past whatever the last completed
+            // checkpoint stamped, so every base round below must bump again first.
+            // The unit tests that construct a null catalog never emit a round.
+            last_ephemeral_gen: Cell::new(if catalog.is_null() {
+                0
+            } else {
+                unsafe { (*catalog).durable_generation }
+            }),
         }
     }
 
@@ -512,7 +521,7 @@ impl MasterDispatcher {
     /// nothing.
     fn checkpoint_before_backfill(&self) -> Result<(), String> {
         if self.sal.cursor() > self.relay_margin() || self.sal.needs_checkpoint() {
-            return self.do_checkpoint();
+            self.do_checkpoint()?;
         }
         Ok(())
     }
@@ -526,9 +535,25 @@ impl MasterDispatcher {
     /// DDL paths must NOT call this — a concurrent FLAG_FLUSH races the
     /// committer's own and orphans SAL writes straddling `sal.checkpoint_reset`.
     /// See async-invariants.md §III.3a.
-    fn do_checkpoint(&self) -> Result<(), String> {
+    ///
+    /// Publish every base table's shards and reset the SAL, invalidating
+    /// checkpointed derived state first. The bump is not optional: this path
+    /// makes a newer base cut durable and then discards the SAL entries that
+    /// carried the difference, while every checkpointed view and index manifest
+    /// still names the older cut — left generation-valid, the next boot would
+    /// resume derived state behind its base with no tail left to close the gap.
+    /// Durable *before* the flush round (`bump_checkpoint_generation` flushes the
+    /// system tables), so a crash below leaves that state invalid rather than
+    /// silently stale — the same ordering step 0 of `run_checkpoint_sequence`
+    /// uses.
+    ///
+    /// Returns the generation it bumped to, which the caller stamps onto the
+    /// ephemeral round that re-validates the derived state.
+    fn do_checkpoint(&self) -> Result<u64, String> {
+        let gen = self.bump_checkpoint_generation();
         self.sync_flush_round(0, FLAG_FLUSH)?;
-        self.checkpoint_post_ack()
+        self.checkpoint_post_ack()?;
+        Ok(gen)
     }
 
     /// One synchronous flush round (pre-reactor W2M path): broadcast the flush
@@ -536,9 +561,37 @@ impl MasterDispatcher {
     /// A `FLAG_FLUSH_EPH` round's `lsn` IS the checkpoint generation (workers
     /// latch it via `set_committed_generation`); the base round passes 0.
     fn sync_flush_round(&self, lsn: u64, flags: u32) -> Result<(), String> {
+        self.note_flush_round(lsn, flags);
         // No schema block: `handle_flush_all` takes neither a schema nor a batch.
         self.send_broadcast(0, lsn, flags, None, 0)?;
         self.collect_acks()
+    }
+
+    /// Check one emitted round against the ordering every base publish depends
+    /// on: **no durable base-shard advance without a prior durable generation
+    /// bump**, and no second base round once an ephemeral round has re-stamped
+    /// derived state at the current generation.
+    ///
+    /// Both master-side emitters funnel through here (`sync_flush_round` and
+    /// `write_checkpoint_group`), so the rule is checked in one place rather
+    /// than left as an obligation on each call site. The committer's
+    /// reclaim-only base round inside `await_servicing` rides step 0's bump
+    /// without one of its own — that is the "no intervening ephemeral round"
+    /// clause, encoded rather than excepted.
+    fn note_flush_round(&self, lsn: u64, flags: u32) {
+        let durable = self.cat().durable_generation;
+        if flags & FLAG_FLUSH_EPH != 0 {
+            debug_assert_eq!(lsn, durable, "ephemeral round must stamp the durable generation");
+            self.last_ephemeral_gen.set(lsn);
+        } else {
+            debug_assert!(
+                durable > self.last_ephemeral_gen.get(),
+                "base round at generation {} publishes past the last ephemeral round ({}): \
+                 derived state would resume from a cut older than its base",
+                durable,
+                self.last_ephemeral_gen.get(),
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -811,7 +864,9 @@ impl MasterDispatcher {
     /// Reclaims SAL space before a large source; the collect loop may further
     /// CHECKPOINT mid-stream. Both are safe on the SAL-exclusive,
     /// no-concurrent-relay paths this runs on (boot; the reactor-parked DDL
-    /// window).
+    /// window). A reclaim here bumps the generation, leaving every checkpointed
+    /// view and index invalid until an ephemeral round re-stamps them — so a
+    /// caller that observes the bump owes the cluster a full checkpoint sequence.
     pub fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), String> {
         self.checkpoint_before_backfill()?;
         let schema = self.schema_desc_for(source_id);
@@ -1293,6 +1348,7 @@ impl MasterDispatcher {
     /// schema nor a batch, and reads the generation from
     /// `worker_ctx::committed_generation()`.
     pub(crate) fn write_checkpoint_group(&self, lsn: u64, flags: u32, req_ids: &[u64]) -> Result<(), String> {
+        self.note_flush_round(lsn, flags);
         self.write_command_group(0, lsn, flags, 0, 0, 0, req_ids, Fanout::Broadcast, 0, &[])
     }
 
@@ -1336,17 +1392,20 @@ impl MasterDispatcher {
     }
 
     /// Synchronous boot-end checkpoint (pre-reactor W2M path): record the
-    /// launched topology, bump the generation, then run the base + ephemeral
-    /// flush rounds. No drain — recovery already drained everything and no pushes
-    /// are admitted yet (the socket is not open), so `pending_deltas` is empty.
-    /// Freshly backfilled views are durably checkpointed before the socket opens.
+    /// launched topology, then run the base + ephemeral flush rounds. No drain —
+    /// recovery already drained everything and no pushes are admitted yet (the
+    /// socket is not open), so `pending_deltas` is empty. Freshly backfilled
+    /// views are durably checkpointed before the socket opens.
     pub(crate) fn boot_checkpoint(&self, worker_count: u32) -> Result<(), String> {
         // The topology row's durability rides the gen bump's system-table flush
-        // (both are `_sequences` rows).
+        // (both are `_sequences` rows), which happens inside `do_checkpoint` —
+        // so a manifest stamped at a generation still implies the topology row
+        // for that layout is durable.
         self.cat().record_topology(worker_count);
-        let gen = self.bump_checkpoint_generation();
-        // Base round (FLAG_FLUSH → ACKs → flush system tables + reset).
-        self.do_checkpoint()?;
+        // Base round (bump → FLAG_FLUSH → ACKs → flush system tables + reset).
+        // Its bump is the boot's only one, so the ephemeral round below stamps
+        // exactly the generation the base round invalidated everything at.
+        let gen = self.do_checkpoint()?;
         // Ephemeral round: workers persist view trace/output state stamped `gen`,
         // then the same finalize as the base round (flush system tables + reset).
         // A guaranteed no-op flush here — no writes since `do_checkpoint` and no
@@ -1586,6 +1645,52 @@ mod checkpoint_finalize_tests {
             Some(64),
             "sys_sequences high-water must survive a crash right after the checkpoint finalize"
         );
+        engine.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `do_checkpoint` owns the generation bump that invalidates every
+    /// checkpointed view and index before it publishes a newer base cut: exactly
+    /// one per call, and `boot_checkpoint` consumes that one rather than adding
+    /// its own.
+    ///
+    /// Zero workers: every round's ACK collection is an empty loop, so the two
+    /// rounds and the finalizer run for real without a forked cluster.
+    #[test]
+    fn do_checkpoint_bumps_once_and_boot_checkpoint_consumes_it() {
+        let dir = finalize_temp_dir("do_checkpoint_bumps");
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+        assert_eq!(engine.durable_generation, 0, "fresh DB starts at generation 0");
+
+        let sal_region = SharedRegion::new(SAL_SIZE);
+        let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, Vec::new());
+        let catalog_ptr = &mut engine as *mut CatalogEngine;
+        let disp = MasterDispatcher::new(
+            0,
+            Vec::new(),
+            catalog_ptr,
+            sal_writer,
+            Rc::new(W2mReceiver::new(Vec::new())),
+        );
+
+        // Epoch 0 is the empty-slot sentinel, so the region needs a boot reset
+        // before any group is written — what `server_main` does after worker ACKs.
+        disp.reset_sal(1);
+
+        assert_eq!(disp.do_checkpoint().unwrap(), 1, "the base round bumps G → G+1");
+        assert_eq!(disp.cat().durable_generation, 1);
+        assert_eq!(disp.do_checkpoint().unwrap(), 2, "and exactly once per call");
+
+        // The boot checkpoint's base round bumps 2 → 3; its ephemeral round stamps
+        // 3 (`note_flush_round`'s `debug_assert_eq!` is what pins that here).
+        disp.boot_checkpoint(1).unwrap();
+        assert_eq!(
+            disp.cat().durable_generation,
+            3,
+            "boot_checkpoint advances by exactly one",
+        );
+
+        drop(disp);
         engine.close();
         let _ = std::fs::remove_dir_all(&dir);
     }

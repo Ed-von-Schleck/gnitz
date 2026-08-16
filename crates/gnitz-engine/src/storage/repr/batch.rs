@@ -2685,7 +2685,7 @@ mod tests {
             tdir.to_str().unwrap(),
             schema,
             100,
-            crate::storage::RecoverySource::Rederive,
+            crate::storage::RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
 

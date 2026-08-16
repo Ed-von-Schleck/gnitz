@@ -353,12 +353,13 @@ impl CatalogEngine {
         idx_schema: &SchemaDescriptor,
         check_dups: bool,
     ) -> Result<(), String> {
-        // The relation rebuilt here is the *index table* (`owner_id` is the
-        // indexed relation, a durable base table). Backfilling into durable
-        // storage would double-count its loaded shards on the next open.
+        // The relation filled here is the *index table* (`owner_id` is the
+        // indexed relation, a durable base table). It must be empty: an index
+        // that resumed from its checkpoint already holds these rows, and
+        // projecting them again would double every weight.
         debug_assert!(
-            unsafe { &*idx_table }.recovery_source() == RecoverySource::Rederive,
-            "backfill_index into durable storage (owner {owner_id}): would double-count",
+            unsafe { &*idx_table }.estimated_rows() == 0,
+            "backfill_index into a non-empty index (owner {owner_id}): would double-count",
         );
         let Some(owner_schema) = self.dag.tables.get(&owner_id).map(|e| e.schema) else {
             return Ok(());
@@ -374,11 +375,12 @@ impl CatalogEngine {
         self.stream_index_projection(owner_id, &[target], check_dups)
     }
 
-    /// Worker-boot index rebuild: for every registered index circuit, re-create
-    /// its Table at THIS process's `index_table_dir` (replacing the
-    /// fork-inherited parent-dir table) and backfill it from the trimmed/rehomed
-    /// base slice — one scan per owner table, each chunk projected into all of
-    /// its index tables. Must run after trim/rehome and BEFORE SAL replay —
+    /// Worker-boot index rebuild: re-open every registered index circuit's Table
+    /// at this worker's own child (replacing the fork-inherited parent-dir one)
+    /// and, for each that did NOT resume from its checkpoint, backfill it from
+    /// the trimmed/rehomed base slice — one scan per owner table, each chunk
+    /// projected into the index tables that need filling. Must run after
+    /// trim/rehome and BEFORE SAL replay —
     /// replay projects the unflushed committed tail into the index exactly once
     /// through `ingest_store_and_indices`, so a rebuild *after* replay would
     /// double-count every replayed row. Boot data was validated at original
@@ -387,9 +389,12 @@ impl CatalogEngine {
     /// check entirely. Fail-fast: an error aborts worker boot via the startup
     /// ACK.
     ///
+    /// Returns how many indexes were rebuilt rather than resumed — 0 on a clean
+    /// restart at the same topology.
+    ///
     /// In a Standalone process this is a legal idempotent re-create-and-rebuild
     /// at the parent dir — unit-testable without touching the global role.
-    pub fn backfill_all_indexes(&mut self) -> Result<(), String> {
+    pub fn backfill_all_indexes(&mut self) -> Result<usize, String> {
         // Snapshot the worklist first: each owner's rebuild mutably borrows
         // self.dag (`replace_index_table`), so no borrow of `dag.tables` may be
         // held across the loop. Only base tables carry index circuits, so
@@ -420,27 +425,33 @@ impl CatalogEngine {
             })
             .collect();
 
+        let mut rebuilt = 0usize;
         for (owner_id, owner_dir, works) in worklist {
             // Re-create and install every index table before opening the scan;
-            // one base-slice scan then feeds all of the owner's indexes.
-            let mut targets: Vec<IndexProjectionTarget> = Vec::with_capacity(works.len());
+            // one base-slice scan then feeds the ones that must be re-derived.
+            let mut targets: Vec<IndexProjectionTarget> = Vec::new();
             for w in &works {
-                let table = new_index_table(&index_dir(&owner_dir, w.index_id), w.index_id, w.idx_schema)
+                let table = self
+                    .new_index_table(&index_dir(&owner_dir, w.index_id), w.index_id, w.idx_schema)
                     .map_err(|e| format!("index table re-create failed (owner {owner_id}): {e}"))?;
+                let resumed = table.resumed_from_checkpoint();
                 let ptr = self
                     .dag
                     .replace_index_table(owner_id, w.cols.as_slice(), Box::new(table))
                     .ok_or_else(|| format!("index circuit vanished during rebuild (owner {owner_id})"))?;
-                targets.push(IndexProjectionTarget {
-                    cols: w.cols,
-                    spec: w.key_spec,
-                    idx_schema: w.idx_schema,
-                    table: Some(ptr),
-                });
+                if !resumed {
+                    targets.push(IndexProjectionTarget {
+                        cols: w.cols,
+                        spec: w.key_spec,
+                        idx_schema: w.idx_schema,
+                        table: Some(ptr),
+                    });
+                }
             }
+            rebuilt += targets.len();
             self.stream_index_projection(owner_id, &targets, false)?;
         }
-        Ok(())
+        Ok(rebuilt)
     }
 
     /// Shared streaming pass for `backfill_index`, `promote_index_to_unique`,
@@ -470,7 +481,7 @@ impl CatalogEngine {
         targets: &[IndexProjectionTarget],
         check_dups: bool,
     ) -> Result<(), String> {
-        if !self.dag.tables.contains_key(&owner_id) {
+        if targets.is_empty() || !self.dag.tables.contains_key(&owner_id) {
             return Ok(());
         }
         let chunk_rows = self.ddl_scan_chunk_rows;

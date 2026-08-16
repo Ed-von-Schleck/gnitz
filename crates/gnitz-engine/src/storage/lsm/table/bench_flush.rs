@@ -107,7 +107,7 @@ fn flush_cadence_amplification_bench() {
             dir.path().join("warmup").to_str().unwrap(),
             schema,
             1,
-            RecoverySource::Rederive,
+            RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
         for batch in gen_distinct(&schema, 4, 50) {
@@ -137,7 +137,7 @@ fn flush_cadence_amplification_bench() {
             dir.path().join(label).to_str().unwrap(),
             schema,
             100 + id as u32,
-            RecoverySource::Rederive,
+            RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
 

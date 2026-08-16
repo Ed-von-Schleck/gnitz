@@ -103,9 +103,8 @@ pub enum RelationKind {
 
 impl RelationKind {
     /// How this relation's tail is recovered. `SalReplay` kinds load shards from
-    /// the manifest and replay the SAL tail; view output stores are
-    /// `RederiveCheckpointed` — erased on open and rebuilt today, but persisted
-    /// with generation-stamped manifests by the ephemeral checkpoint round.
+    /// the manifest and replay the SAL tail; a view output store resumes from
+    /// the manifest the ephemeral checkpoint round stamped, or is rebuilt.
     #[inline]
     pub fn recovery_source(self) -> RecoverySource {
         match self {
@@ -535,7 +534,7 @@ mod tests {
         let schema = SchemaDescriptor::default();
         let dir = dag_test_dir(name);
         let _ = std::fs::remove_dir_all(&dir);
-        Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive).unwrap())
+        Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive { resume_at: None }).unwrap())
     }
 
     #[test]
@@ -777,7 +776,13 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_signed");
-        let mut pt = Table::new(tdir.to_str().unwrap(), schema, 1234, RecoverySource::Rederive).unwrap();
+        let mut pt = Table::new(
+            tdir.to_str().unwrap(),
+            schema,
+            1234,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap();
 
         // Seed the store with a negative-PK row (PK=-5, payload=100).
         let mut seed = Batch::with_capacity(schema, 1);
@@ -838,7 +843,13 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_weight_norm");
-        let mut pt = Table::new(tdir.to_str().unwrap(), schema, 1234, RecoverySource::Rederive).unwrap();
+        let mut pt = Table::new(
+            tdir.to_str().unwrap(),
+            schema,
+            1234,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap();
 
         let row_pk1 = |payload: i64, weight: i64| {
             let mut b = Batch::with_capacity(schema, 1);
@@ -899,7 +910,13 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_absent");
-        let mut pt = Table::new(tdir.to_str().unwrap(), schema, 1234, RecoverySource::Rederive).unwrap();
+        let mut pt = Table::new(
+            tdir.to_str().unwrap(),
+            schema,
+            1234,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap();
 
         // Seed an unrelated row (PK=-5) so the store is non-empty.
         let mut seed = Batch::with_capacity(schema, 1);
@@ -959,7 +976,13 @@ mod tests {
         let schema = wide_pk_3xu64_schema();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_wide");
-        let mut pt = Table::new(tdir.to_str().unwrap(), schema, 555, RecoverySource::Rederive).unwrap();
+        let mut pt = Table::new(
+            tdir.to_str().unwrap(),
+            schema,
+            555,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap();
 
         let pk24 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
 
@@ -1025,7 +1048,7 @@ mod tests {
         let schema = crate::schema::SchemaDescriptor::minimal_u64();
         let dir = dag_test_dir("seam_abort");
         let _ = std::fs::remove_dir_all(&dir);
-        let mut tbl = Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive).unwrap());
+        let mut tbl = Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive { resume_at: None }).unwrap());
         dag.register_table(
             70,
             StoreHandle::Borrowed(&mut *tbl as *mut Table),

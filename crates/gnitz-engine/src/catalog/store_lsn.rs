@@ -110,7 +110,7 @@ impl CatalogEngine {
     /// per worker on its own store before the view is rebuilt.
     ///
     /// Unlinks this worker's child manifest first, so the empty rebuild below (a
-    /// `RederiveCheckpointed` open) peeks `None` and *erases* the stale
+    /// `Rederive` open) peeks `None` and *erases* the stale
     /// generation-`g` shards rather than reloading them — without which a
     /// transitively-invalid view whose own manifests are still at `g` would reload
     /// them. Then rebuilds the handle empty via `build_relation_store`,
@@ -130,7 +130,7 @@ impl CatalogEngine {
         let _ = std::fs::remove_file(ChildAddr::this_worker(self.num_workers).manifest(&dir));
 
         // Rebuild empty. `Table::new` erases the stale shards (manifest now
-        // absent → `RederiveCheckpointed` peek `None`).
+        // absent → `Rederive` peek `None`).
         self.rebuild_relation_store(vid, "reset view output")?;
 
         // Remove this worker's per-view operator scratch dirs (rank-stamped).
@@ -218,8 +218,7 @@ impl CatalogEngine {
         self.assert_pre_fork("compute_invalid_views");
         let launched_workers = self.num_workers;
         let g = crate::foundation::worker_ctx::committed_generation();
-        let topo_value = crate::storage::topology_word(launched_workers);
-        let topo_valid = self.recorded_topology == topo_value;
+        let topo_valid = self.topology_matches();
 
         let view_ids = self.dag.view_ids();
 

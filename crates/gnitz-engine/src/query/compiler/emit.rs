@@ -189,10 +189,12 @@ impl EmitCtx<'_> {
         // created directory if Table::new fails.
         self.scratch.track(child_dir.clone());
         // Only views compile plans, so a view's recovery policy applies: its
-        // operator-trace tables are `RederiveCheckpointed` (the ephemeral
+        // operator-trace tables are `Rederive` (the ephemeral
         // checkpoint round force-persists them with generation-stamped
-        // manifests). Never reached from index-circuit compilation (index tables
-        // stay plain `Rederive`).
+        // manifests). Never reached from index-circuit compilation, which builds
+        // its one table through `CatalogEngine::new_index_table` — also
+        // checkpointed, but against a verdict the catalog computes rather than
+        // this ambient read.
         let recovery = RecoverySource::rederive_checkpointed_now();
         Table::new(&child_dir, schema, self.view_id as u32, recovery)
             .map_err(|_| CompileError::Rejected("child table create failed"))

@@ -86,9 +86,8 @@ pub(in crate::catalog) use sys_tables::{PUBLIC_SCHEMA_ID, SYSTEM_SCHEMA_ID};
 pub(in crate::catalog) use crate::storage::{subdir_names, ChildAddr};
 pub(in crate::catalog) use utils::{
     cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, index_dir, is_index_dir_name, is_table_dir_name,
-    make_fk_index_name, new_index_table, preflight_dir, reclaim_retired_children, relation_dir,
-    remove_stale_index_rank_dirs, retract_key_range, retract_single_row, schema_dir, sys_catalog_dir, sys_family_dir,
-    sys_opk,
+    make_fk_index_name, preflight_dir, reclaim_retired_children, relation_dir, retract_key_range, retract_single_row,
+    schema_dir, sys_catalog_dir, sys_family_dir, sys_opk,
 };
 #[cfg(test)]
 pub(in crate::catalog) use utils::{make_secondary_index_name, parse_qualified_name};
@@ -137,11 +136,16 @@ pub struct CatalogEngine {
     /// base data must check this first.
     pub(crate) owns_stores: bool,
 
-    /// The committed checkpoint generation. Recovered from `SEQ_ID_CHECKPOINT_GEN`
-    /// at boot (0 on a fresh DB), bumped once per checkpoint via
-    /// `bump_checkpoint_generation`. Fork-inherited by workers as the generation
-    /// their scratch tables gate reload on (commit 3).
-    pub(crate) committed_generation: u64,
+    /// The checkpoint generation durably recorded in `SEQ_ID_CHECKPOINT_GEN` —
+    /// what the next `advance_sequence` must retract, and the floor the next
+    /// bump raises. Recovered at boot (0 on a fresh DB).
+    pub(crate) durable_generation: u64,
+    /// The generation a manifest must carry to be resumed from. Equal to
+    /// `durable_generation` except across `recovery_start_generation_bump`,
+    /// which pushes that one to `G+1` while what a boot may resume from stays
+    /// the recovered `G`. Written only by `set_resume_generation`, which mirrors
+    /// it into `worker_ctx` for the `Table::new` callers holding no catalog.
+    pub(crate) resume_generation: u64,
     /// The topology row last recorded: `(worker_count as u64) << 32 | STATE_FORMAT`.
     /// Recovered from `SEQ_ID_TOPOLOGY` at boot (0 on a fresh DB); commit 3
     /// compares it against the launched worker count + `STATE_FORMAT` to decide

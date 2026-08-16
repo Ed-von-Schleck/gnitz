@@ -89,70 +89,21 @@ pub(crate) fn is_index_dir_name(name: &str) -> bool {
     matches!(ChildAddr::parse(name), Some(ChildAddr::Index { .. }))
 }
 
-/// The directory holding THIS process's copy of an index table: the index dir
-/// itself for master/standalone, `{idx_dir}/w{rank}` for a forked worker
-/// (single-writer isolation for spills and compaction, so sibling workers never
-/// collide on same-name `.tmp`/compaction files under the shared tree).
-/// A pure path function; `new_index_table` creates the path recursively.
-pub(crate) fn index_table_dir(idx_dir: &str) -> String {
-    if crate::foundation::worker_ctx::is_worker() {
-        format!("{idx_dir}/w{}", crate::foundation::worker_ctx::worker_rank())
-    } else {
-        idx_dir.to_string()
-    }
-}
-
-/// Open this process's copy of an ephemeral secondary-index table under
-/// `idx_dir` (homed by `index_table_dir`). The one recipe for the live CREATE
-/// INDEX hook and the worker-boot rebuild: the arena size and
-/// `RecoverySource::Rederive` must never diverge — a durable source would
-/// double-count its loaded shards on the next open.
-pub(crate) fn new_index_table(idx_dir: &str, index_id: i64, idx_schema: SchemaDescriptor) -> Result<Table, String> {
-    let table_dir = index_table_dir(idx_dir);
-    // An index dir is a catalog-owned LAYOUT node — staged into
-    // `pending_dir_deletions`, enumerated by `gc_orphan_directories`, reaped by
-    // name on DROP — so it is materialized at DDL time. (A `Rederive`
-    // `Table::new` itself opens dirless and would create the path only on its
-    // first spill.)
-    std::fs::create_dir_all(&table_dir).map_err(|e| format!("Failed to create index dir {table_dir}: {e}"))?;
-    Table::new(&table_dir, idx_schema, index_id as u32, RecoverySource::Rederive)
-        .map_err(|e| format!("Failed to create index table {index_id}: error {e}"))
-}
-
-/// True if `name` is a per-rank index subdir (`w<digits>`), as written by
-/// `index_table_dir` for a forked worker.
-pub(crate) fn is_index_rank_dir_name(name: &str) -> bool {
-    name.strip_prefix('w').is_some_and(has_numeric_id)
-}
-
-/// Remove a live index dir's per-rank `w{k}` subdirs. They must never survive
-/// a boot (each worker rebuilds its own slice-local copy afterwards, and a
-/// smaller worker count would otherwise strand `w{k}` dirs forever). Runs once
-/// per boot on the master, pre-fork — no worker exists yet.
-pub(crate) fn remove_stale_index_rank_dirs(idx_dir: &str) {
-    for rank_name in subdir_names(idx_dir) {
-        if !is_index_rank_dir_name(&rank_name) {
-            continue;
-        }
-        let rank_full = format!("{idx_dir}/{rank_name}");
-        match fs::remove_dir_all(&rank_full) {
-            Ok(()) => gnitz_debug!("recovery: removed stale index rank dir {}", rank_full),
-            Err(e) => gnitz_debug!("recovery: failed to remove index rank dir {}: {}", rank_full, e),
-        }
-    }
-}
-
 /// Remove a relation's child directories that this boot's worker count no longer
 /// owns — `ChildAddr::is_owned_by` holds the rule. Names in neither child
-/// grammar (an `idx_{id}` dir, say) are left alone. Runs after the boot
-/// repartition, which has already consumed any previous-layout set it needed.
+/// grammar are left alone. An index dir is owned at every count, but its own
+/// children are per-worker stores under the same grammar, so the sweep descends
+/// into it. Runs after the boot repartition, which has already consumed any
+/// previous-layout set it needed.
 pub(crate) fn reclaim_retired_children(dir: &str, num_workers: u32) {
     for name in subdir_names(dir) {
         let Some(child) = ChildAddr::parse(&name) else { continue };
+        let full = format!("{dir}/{name}");
         if !child.is_owned_by(num_workers) {
-            let full = format!("{dir}/{name}");
             gnitz_debug!("recovery: removing retired child dir {}", full);
             crate::storage::remove_child(&full);
+        } else if matches!(child, ChildAddr::Index { .. }) {
+            reclaim_retired_children(&full, num_workers);
         }
     }
 }

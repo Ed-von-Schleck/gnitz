@@ -516,10 +516,11 @@ fn recover_from_sal(
 
 /// Worker-boot catalog recovery. The order below is required:
 ///
-/// 1. Rebuild every secondary index slice-local, replacing the fork-inherited
-///    full parent-dir copy, BEFORE SAL replay — replay projects the committed
-///    unflushed tail into each index exactly once (`ingest_store_and_indices`),
-///    so a rebuild afterwards would double-count every replayed row.
+/// 1. Re-home every secondary index slice-local, replacing the fork-inherited
+///    full parent-dir copy, and rebuild the ones that did not resume from their
+///    checkpoint — BEFORE SAL replay, which projects the committed unflushed tail
+///    into each index exactly once (`ingest_store_and_indices`), so a rebuild
+///    afterwards would double-count every replayed row.
 /// 2. Replay unflushed push data from the SAL.
 /// 3. Flush the replayed rows to shards before accepting requests: reset_sal()
 ///    resets the write cursor to 0, so a second crash before a checkpoint would
@@ -536,13 +537,23 @@ fn worker_boot_recovery(
     num_workers: u32,
     walk_epoch: u32,
 ) -> Result<HashMap<i64, Batch>, String> {
-    catalog
+    let rebuilt = catalog
         .backfill_all_indexes()
         .map_err(|e| format!("boot index backfill failed: {e}"))?;
+    // Resume-vs-rebuild marker, the index sibling of the invalid-view line: 0 ⇒
+    // every index resumed from its checkpoint. `boot_log`, not `gnitz_info!` —
+    // the level static defaults to QUIET, which would swallow the marker.
+    boot_log(&format!("recovery: rebuilding {rebuilt} index(es)\n"));
     let pending_deltas = recover_from_sal(sal_ptr, rank, num_workers, walk_epoch, catalog)?;
     // Keep the boot flush: the non-windowed recovery resets the SAL before the
     // master-driven tick sweep, so the replayed base rows must be shard-durable
-    // first — else the reset would drop acknowledged tail data.
+    // first — else the reset would drop acknowledged tail data. The recovery-start
+    // bump is what lets it publish: it is durable pre-fork, so nothing on disk
+    // resumes across it.
+    debug_assert!(
+        catalog.durable_generation > crate::foundation::worker_ctx::committed_generation(),
+        "boot base flush without the recovery-start generation bump ahead of it",
+    );
     for tid in catalog.iter_user_table_ids() {
         catalog
             .flush_family(tid)
@@ -585,6 +596,9 @@ fn rebuild_invalid_views(catalog: &mut CatalogEngine, dispatcher: &MasterDispatc
     // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
     // E2E): 0 ⇒ every view resumed from its checkpoint.
     boot_log(&format!("recovery: rebuilding {} invalid view(s)\n", invalid.len()));
+    // A reclaim here bumps the generation, but `boot_checkpoint` follows
+    // immediately and re-stamps everything, so this path needs no forced barrier
+    // of its own.
     dispatcher.backfill_views_in_dep_order(&invalid)
 }
 

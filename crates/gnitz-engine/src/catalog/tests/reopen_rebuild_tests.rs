@@ -1,12 +1,12 @@
-//! Reopen-rebuild idempotency for ephemeral relations.
+//! Reopen-rebuild idempotency for derived relations.
 //!
-//! Secondary indices are repopulated from their sources exactly once when the
-//! engine reopens: their storage is erased at open (`RecoverySource::Rederive`)
-//! so the backfill is the *sole* population — if that storage were durable, the
-//! loaded shards plus the backfill recompute would sum and every weight would
-//! double. These tests are the regression guard for that invariant, which is
-//! structural since `RelationKind` derives durability and the rebuild decision
-//! from one value.
+//! A secondary index is populated exactly once when the engine reopens, by
+//! whichever of the two paths applies: its shards reload when the manifest
+//! carries the committed checkpoint generation, and otherwise they are erased and
+//! the backfill re-derives them from the owner. Doing both would sum the loaded
+//! shards and the recompute, doubling every weight — so these tests read net
+//! weights, and the resume tests at the end read the rebuild *count* too, since
+//! a silent rebuild produces the same rows.
 //!
 //! Views are *not* rebuilt at catalog open. `hook_view_register` registers a
 //! view empty and never fills it, so a `CatalogEngine::open` in isolation
@@ -18,6 +18,9 @@
 
 use super::*;
 
+/// Rows in every fixture that does not need a specific size.
+const N: i64 = 7;
+
 /// Net weight summed over every (PK, payload) the cursor yields. Row *counts*
 /// would hide a double-materialisation: rebuilding the same rows twice leaves
 /// the row set identical and only the weights doubled.
@@ -28,6 +31,32 @@ fn sum_weights(mut c: ReadCursor) -> i64 {
         c.advance();
     }
     sum
+}
+
+/// `public.base` with `N` rows (`val = id * 10`) flushed to shards, plus one
+/// non-unique secondary index on `val` that the live CREATE backfills. Returns
+/// the table id.
+fn base_with_index(engine: &mut CatalogEngine) -> i64 {
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
+    let schema = engine.get_schema_desc(tid).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    for i in 0..N as u64 {
+        bb.begin_row(i as u128, 1);
+        bb.put_u64(i * 10);
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+    engine.create_index("public.base", &["val"], false).unwrap();
+    tid
+}
+
+/// Net weight of `tid`'s single index circuit.
+fn index_weight(engine: &mut CatalogEngine, tid: i64) -> i64 {
+    let entry = engine.dag.tables.get_mut(&tid).unwrap();
+    assert_eq!(entry.index_circuits.len(), 1, "index circuit replayed");
+    sum_weights(entry.index_circuits[0].table_mut().open_cursor())
 }
 
 // ── index_rebuilds_once_view_defers_on_reopen ───────────────────────────
@@ -46,7 +75,6 @@ fn sum_weights(mut c: ReadCursor) -> i64 {
 
 #[test]
 fn index_rebuilds_once_view_defers_on_reopen() {
-    const N: i64 = 7;
     let dir = temp_dir("reopen_rebuild_once");
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -197,24 +225,9 @@ fn index_rebuilds_across_chunk_boundary() {
 // call is a legal idempotent re-create-and-rebuild.
 #[test]
 fn backfill_all_indexes_rebuilds_exactly_once() {
-    const N: i64 = 7;
     let dir = temp_dir("backfill_all_indexes_once");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
-    let mut bb = BatchBuilder::new(schema);
-    for i in 0..N as u64 {
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(i * 10);
-        bb.end_row();
-    }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.flush_family(tid).unwrap();
-
-    // Non-unique secondary index on `val`; the live CREATE backfills once.
-    engine.create_index("public.base", &["val"], false).unwrap();
+    let tid = base_with_index(&mut engine);
 
     // Reference invariant: every key resolves to its PK, total index weight == N
     // (a doubled rebuild would sum to 2N with an identical row set).
@@ -225,10 +238,8 @@ fn backfill_all_indexes_rebuilds_exactly_once() {
             assert_eq!(row.count, 1, "one source row per distinct val");
             assert_eq!(row.get_pk(0), i as u128, "val {} must resolve to PK {}", i * 10, i);
         }
-        let entry = engine.dag.tables.get_mut(&tid).unwrap();
-        assert_eq!(entry.index_circuits.len(), 1);
         assert_eq!(
-            sum_weights(entry.index_circuits[0].table_mut().open_cursor()),
+            index_weight(engine, tid),
             N,
             "index must hold exactly one materialisation, not an additive rebuild"
         );
@@ -243,6 +254,99 @@ fn backfill_all_indexes_rebuilds_exactly_once() {
     // Idempotent across repeated calls.
     engine.backfill_all_indexes().unwrap();
     assert_index_intact(&mut engine);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── Index checkpoint resume ─────────────────────────────────────────────
+// An index is derived state like a view's output store: the checkpoint's
+// ephemeral round publishes it with a generation-stamped manifest, and the next
+// open reloads it instead of re-deriving it from a full scan of the owner. The
+// verdict has two halves — the generation AND the topology — and both are pinned
+// below, by the rebuild *count* rather than the row set (see
+// `Table::resumed_from_checkpoint`).
+
+/// `base_with_index`, plus the state a completed checkpoint leaves behind:
+/// the recorded topology and generation the resume gate compares against, and
+/// the index published through an ephemeral round stamped at that generation.
+/// Returns `(table id, generation)`.
+fn checkpointed_table_with_index(dir: &str) -> (i64, u64) {
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
+    let tid = base_with_index(&mut engine);
+
+    // The two halves of the verdict, written the way a boot writes them.
+    engine.record_topology(1);
+    let g = engine.bump_checkpoint_generation();
+
+    let entry = engine.dag.tables.get_mut(&tid).unwrap();
+    let idx: *mut crate::storage::Table = entry.index_circuits[0].table_mut();
+    crate::storage::flush_barrier([idx], crate::storage::FlushRound::Ephemeral(g)).unwrap();
+
+    engine.close();
+    (tid, g)
+}
+
+// ── index_rebuild_is_skipped_after_resume ───────────────────────────────
+// An index whose manifest carries the committed generation reloads its shards,
+// so neither the registration hook nor the boot rebuild may re-derive it — the
+// full-slice scan this mechanism exists to remove. A rebuild that ran anyway
+// would show up twice over: in the returned count, and (had the hook backfilled
+// on top of the loaded shards) in doubled weights.
+#[test]
+fn index_rebuild_is_skipped_after_resume() {
+    let dir = temp_dir("index_resume_skips_rebuild");
+    let (tid, g) = checkpointed_table_with_index(&dir);
+
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    assert_eq!(
+        engine.index_recovery_source(),
+        RecoverySource::Rederive { resume_at: Some(g) },
+        "a matching topology leaves the recovered generation as the whole verdict"
+    );
+    assert_eq!(
+        engine.backfill_all_indexes().unwrap(),
+        0,
+        "a generation-valid index must resume from its checkpoint, not rebuild"
+    );
+    assert_eq!(
+        index_weight(&mut engine, tid),
+        N,
+        "the resumed index holds exactly one materialisation"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── index_rebuild_forced_by_topology_change ─────────────────────────────
+// The other half of the verdict. A `STATE_FORMAT` bump — the project's lever for
+// "every rederived relation must be rebuilt" — changes the topology word at an
+// unchanged worker count, which no other path exercises. The generation still
+// matches the manifest, so a gate that read it alone would silently resume.
+#[test]
+fn index_rebuild_forced_by_topology_change() {
+    let dir = temp_dir("index_resume_topology_change");
+    let (tid, _g) = checkpointed_table_with_index(&dir);
+
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    // Simulate the format bump: the recorded word no longer matches this boot's.
+    engine.recorded_topology = crate::storage::topology_word(1) + 1;
+    assert_eq!(
+        engine.index_recovery_source(),
+        RecoverySource::Rederive { resume_at: None },
+        "a foreign topology must refuse every manifest"
+    );
+    assert_eq!(
+        engine.backfill_all_indexes().unwrap(),
+        1,
+        "a topology change must rebuild the index despite a matching generation"
+    );
+    assert_eq!(
+        index_weight(&mut engine, tid),
+        N,
+        "the rebuild replaces the erased state, never adds to it"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
