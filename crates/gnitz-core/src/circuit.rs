@@ -169,20 +169,19 @@ impl CircuitBuilder {
     }
 
     pub fn filter(&mut self, input: NodeId, expr: Option<ExprProgram>) -> NodeId {
-        let nid = self.alloc_node(OpNode::Filter(expr.map(|e| e.encode())));
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(OpNode::Filter(expr.map(|e| e.encode())), input)
     }
 
     pub fn map_expr(&mut self, input: NodeId, program: ExprProgram) -> NodeId {
         let blob = program.encode();
-        let nid = self.alloc_node(OpNode::Map(MapKind::Expression {
-            program: blob,
-            reindex_cols: Vec::new(),
-            reindex_target_tcs: Vec::new(),
-        }));
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(
+            OpNode::Map(MapKind::Expression {
+                program: blob,
+                reindex_cols: Vec::new(),
+                reindex_target_tcs: Vec::new(),
+            }),
+            input,
+        )
     }
 
     /// Map with PK reindexing (equijoin pre-indexing). The new synthetic PK is built
@@ -208,13 +207,14 @@ impl CircuitBuilder {
         program: ExprProgram,
     ) -> NodeId {
         let blob = program.encode();
-        let nid = self.alloc_node(OpNode::Map(MapKind::Expression {
-            program: blob,
-            reindex_cols: reindex_cols.iter().map(|&c| c as u16).collect(),
-            reindex_target_tcs: target_tcs.to_vec(),
-        }));
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(
+            OpNode::Map(MapKind::Expression {
+                program: blob,
+                reindex_cols: reindex_cols.iter().map(|&c| c as u16).collect(),
+                reindex_target_tcs: target_tcs.to_vec(),
+            }),
+            input,
+        )
     }
 
     /// Full-row-identity reindex: keep the listed columns as payload (in order)
@@ -233,23 +233,20 @@ impl CircuitBuilder {
     /// to both sides of deduplicating set-ops.
     pub fn map_hash_row(&mut self, input: NodeId, projection: &[usize], target_tcs: &[u8], branch_id: u8) -> NodeId {
         let cols: Vec<u16> = projection.iter().map(|&c| c as u16).collect();
-        let nid = self.alloc_node(OpNode::Map(MapKind::HashRow(cols, target_tcs.to_vec(), branch_id)));
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(
+            OpNode::Map(MapKind::HashRow(cols, target_tcs.to_vec(), branch_id)),
+            input,
+        )
     }
 
     /// Pure projection: keep only the listed payload columns, in order.
     pub fn map(&mut self, input: NodeId, projection: &[usize]) -> NodeId {
         let cols: Vec<u16> = projection.iter().map(|&c| c as u16).collect();
-        let nid = self.alloc_node(OpNode::Map(MapKind::Projection(cols)));
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(OpNode::Map(MapKind::Projection(cols)), input)
     }
 
     pub fn negate(&mut self, input: NodeId) -> NodeId {
-        let nid = self.alloc_node(OpNode::Negate);
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(OpNode::Negate, input)
     }
 
     pub fn union(&mut self, a: NodeId, b: NodeId) -> NodeId {
@@ -260,9 +257,7 @@ impl CircuitBuilder {
     }
 
     pub fn distinct(&mut self, input: NodeId) -> NodeId {
-        let nid = self.alloc_node(OpNode::Distinct);
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(OpNode::Distinct, input)
     }
 
     /// The weight-exact Z-set difference `positive_part(minuend − subtrahend)` as
@@ -280,8 +275,13 @@ impl CircuitBuilder {
     pub fn positive_diff(&mut self, minuend: NodeId, subtrahend: NodeId) -> NodeId {
         let neg = self.negate(subtrahend);
         let diff = self.union(neg, minuend);
-        let nid = self.alloc_node(OpNode::PositivePart);
-        self.connect(diff, nid, gnitz_wire::PORT_IN);
+        self.alloc_unary(OpNode::PositivePart, diff)
+    }
+
+    /// Allocate a single-input node and wire `input` to its `PORT_IN`.
+    fn alloc_unary(&mut self, op: OpNode, input: NodeId) -> NodeId {
+        let nid = self.alloc_node(op);
+        self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }
 
@@ -311,9 +311,7 @@ impl CircuitBuilder {
     /// eq-prefix-partitioned). Worker identity is baked in at compile time, so the
     /// node carries no payload; single-process compiles emit `(0, 1)` = keep-all.
     pub fn partition_filter(&mut self, input: NodeId) -> NodeId {
-        let nid = self.alloc_node(OpNode::PartitionFilter);
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(OpNode::PartitionFilter, input)
     }
 
     /// Shared `Reduce`-node construction: map the group cols + agg specs, alloc
@@ -340,14 +338,15 @@ impl CircuitBuilder {
                 )
             })
             .collect();
-        let nid = self.alloc_node(OpNode::Reduce {
-            group_cols: group,
-            agg: specs,
-            global_ground,
-            out_key,
-        });
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(
+            OpNode::Reduce {
+                group_cols: group,
+                agg: specs,
+                global_ground,
+                out_key,
+            },
+            input,
+        )
     }
 
     /// Reduce with automatic shard insertion (required for multi-worker correctness).
@@ -416,16 +415,12 @@ impl CircuitBuilder {
     /// Exchange shard: routes rows to workers by hashing the given columns.
     pub fn shard(&mut self, input: NodeId, shard_cols: &[usize]) -> NodeId {
         let cols: Vec<u16> = shard_cols.iter().map(|&c| c as u16).collect();
-        let nid = self.alloc_node(OpNode::ExchangeShard { shard_cols: cols });
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(OpNode::ExchangeShard { shard_cols: cols }, input)
     }
 
     /// Intermediate trace integration (equijoin accumulator).
     pub fn integrate_trace(&mut self, input: NodeId) -> NodeId {
-        let nid = self.alloc_node(OpNode::IntegrateTrace);
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(OpNode::IntegrateTrace, input)
     }
 
     /// Null-extend: appends N null payload columns to each row.
@@ -433,16 +428,12 @@ impl CircuitBuilder {
     /// null column to append.
     pub fn null_extend(&mut self, input: NodeId, right_col_type_codes: &[u64]) -> NodeId {
         let codes: Vec<u8> = right_col_type_codes.iter().map(|&t| t as u8).collect();
-        let nid = self.alloc_node(OpNode::NullExtend { type_codes: codes });
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(OpNode::NullExtend { type_codes: codes }, input)
     }
 
     /// Sink — primary INTEGRATE that writes to view storage.
     pub fn sink(&mut self, input: NodeId) -> NodeId {
-        let nid = self.alloc_node(OpNode::IntegrateSink);
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
+        self.alloc_unary(OpNode::IntegrateSink, input)
     }
 
     /// Finalises the circuit.
