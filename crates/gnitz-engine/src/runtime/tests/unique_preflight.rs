@@ -8,8 +8,6 @@
 //! Every key is the OPK leading-key span (`PkBuf`) — equality-correct and
 //! byte-orderable at any width.
 
-use rustc_hash::FxHashSet;
-
 use crate::runtime::master::PreflightAccumulator;
 use crate::runtime::sal::{unique_preflight_wire_schema, SalMessageKind, FLAG_UNIQUE_PREFLIGHT};
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
@@ -615,10 +613,12 @@ fn accumulator_distinct_keys_no_duplicate() {
     let keys: Vec<PkBuf> = [1u128, 2, 3, 100, u128::MAX].into_iter().map(span_u128).collect();
     assert!(offer_all(&mut acc, &keys));
     assert!(!acc.duplicate);
-    let expected: FxHashSet<PkBuf> = keys.iter().copied().collect();
-    let (seed, capped) = acc.into_seed();
-    assert_eq!(seed, expected, "seed under cap is the complete distinct set");
-    assert!(!capped, "under-cap seed must not report capped");
+    let seed = acc.into_seed();
+    assert!(!seed.capped(), "under-cap seed must not report capped");
+    for k in &keys {
+        assert!(seed.may_contain(k.pk_bytes()), "seed under cap holds every span");
+    }
+    assert!(!seed.may_contain(span_u128(999).pk_bytes()), "and nothing else");
 }
 
 /// Crossing the cap clears the partial seed whole and never repopulates it:
@@ -631,11 +631,14 @@ fn accumulator_seed_over_cap_is_empty_never_truncated() {
     assert!(acc.offer(span_u128(40)), "cap overflow is not a duplicate");
     assert!(acc.offer(span_u128(50)));
     assert!(!acc.duplicate);
-    let (seed, capped) = acc.into_seed();
-    assert!(seed.is_empty(), "seed must be cleared whole on cap overflow");
+    let seed = acc.into_seed();
     assert!(
-        capped,
-        "overflow must report capped so the seed publishes a capped filter"
+        seed.capped(),
+        "overflow must drop the seed whole so it publishes a capped filter"
+    );
+    assert!(
+        seed.may_contain(span_u128(10).pk_bytes()),
+        "a capped seed proves nothing absent"
     );
 }
 
@@ -643,9 +646,9 @@ fn accumulator_seed_over_cap_is_empty_never_truncated() {
 fn accumulator_seed_at_exactly_cap_is_complete() {
     let mut acc = PreflightAccumulator::new(3);
     assert!(offer_all(&mut acc, &[span_u128(10), span_u128(20), span_u128(30)]));
-    let (seed, capped) = acc.into_seed();
+    let seed = acc.into_seed();
+    assert!(!seed.capped(), "exactly cap spans must not report capped");
     assert_eq!(seed.len(), 3, "exactly cap spans must keep the full seed");
-    assert!(!capped, "exactly cap spans must not report capped");
 }
 
 /// A duplicate found after the cap has been crossed is still detected — the
@@ -659,8 +662,7 @@ fn accumulator_duplicate_after_cap_crossing() {
     ));
     assert!(!acc.offer(span_u128(4)));
     assert!(acc.duplicate);
-    let (seed, _capped) = acc.into_seed();
-    assert!(seed.is_empty());
+    assert!(acc.into_seed().capped());
 }
 
 /// `PkBuf` byte order is a valid merge order: byte-lexicographic comparison of

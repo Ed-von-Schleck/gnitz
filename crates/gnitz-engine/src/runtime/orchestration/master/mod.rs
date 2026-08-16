@@ -99,7 +99,7 @@ pub(crate) use dispatch::scan_spec_route;
 pub(crate) use preflight::PreflightAccumulator;
 pub(crate) use preflight::TxnFamily;
 use train::{drain_index_scan, expect_single_frame, forward_scan_slots, parse_train_header, scan_decode_err};
-use unique_filter::UniqueFilter;
+pub(crate) use unique_filter::UniqueFilter;
 
 // ---------------------------------------------------------------------------
 // Helpers

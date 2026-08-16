@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::storage::batch_pool::PooledSendBuf;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use super::guard_panic;
 use crate::foundation::fault::Seam;
@@ -36,7 +36,7 @@ use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
     dispatch_scan_multi_fanout, first_worker_error_opt, replicated_unicast, scan_spec_route, Fanout, MasterDispatcher,
-    TxnFamily,
+    TxnFamily, UniqueFilter,
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
@@ -2342,11 +2342,11 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // violation needs no rollback — it just surfaces to the client. This runs
     // before the ingest loop, so for a table created in the same bundle the owner
     // is not yet in `dag.tables` and `validate_unique_index_create`
-    // short-circuits to an empty set (sound: the new table is empty, and
+    // short-circuits to an empty filter (sound: the new table is empty, and
     // hook_index_register's own owner-check still succeeds later in the loop). The
     // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
     // `create_index` and read identically by `hook_index_register`.
-    let mut filter_seeds: Vec<(i64, u64, FxHashSet<crate::schema::key::PkBuf>, bool)> = Vec::new();
+    let mut filter_seeds: Vec<(i64, u64, UniqueFilter)> = Vec::new();
     for (owner_id, packed, cols) in bundle_family(&families, SysFamily::Index)
         .map(idx_tab_unique_creates)
         .unwrap_or_default()
@@ -2366,9 +2366,9 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
                 send_error(peer, 0, client_id, e.as_bytes()).await;
                 return;
             }
-            // Hold the distinct span set to seed the filter post-commit,
-            // keyed by the packed column list (the filter-map key).
-            Ok((seen, capped)) => filter_seeds.push((owner_id, packed, seen, capped)),
+            // Hold the pre-flight's filter to publish post-commit, keyed by
+            // the packed column list (the filter-map key).
+            Ok(filter) => filter_seeds.push((owner_id, packed, filter)),
         }
     }
 
@@ -2491,12 +2491,12 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         shared.disp().unique_filter_remove(owner_id, packed);
     }
 
-    // Seed the unique filters from the pre-flight's distinct key sets so the first
-    // INSERT skips a redundant full-cluster warmup scan. Post-fsync only: a
-    // broadcast/fsync failure aborts the process before this point, so no filter
-    // is published for an index that never committed.
-    for (owner_id, packed, seen, capped) in filter_seeds {
-        shared.disp().unique_filter_seed(owner_id, packed, seen, capped);
+    // Publish the pre-flight's filters so the first INSERT skips a redundant
+    // full-cluster warmup scan. Post-fsync only: a broadcast/fsync failure
+    // aborts the process before this point, so no filter is published for an
+    // index that never committed.
+    for (owner_id, packed, filter) in filter_seeds {
+        shared.disp().unique_filter_seed(owner_id, packed, filter);
     }
 
     // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE

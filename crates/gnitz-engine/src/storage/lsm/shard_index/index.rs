@@ -117,7 +117,7 @@ impl ShardIndex {
     #[cfg(test)]
     pub(crate) fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
         let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
-        let xor8_key = super::super::xor8::probe_key(opk.pk_bytes());
+        let xor8_key = crate::schema::key::probe_key(opk.pk_bytes());
         self.find_pk_bytes(opk.pk_bytes(), xor8_key, visitor);
     }
 

@@ -16,6 +16,7 @@ use std::cmp::Ordering;
 use gnitz_expr::RowSource;
 use gnitz_wire::{Cut, RangeDescriptor, NARROW_PK_MAX_BYTES};
 
+use crate::foundation::xxh;
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
 
 // ---------------------------------------------------------------------------
@@ -348,6 +349,28 @@ impl PkSortKey for [u128; 2] {
             [hi, u128::from_be_bytes(lo)]
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// OPK span fingerprint
+// ---------------------------------------------------------------------------
+
+/// The 64-bit fingerprint of an OPK byte span — a row's whole PK region, or an
+/// index's leading-key span. Every approximate-membership structure over OPK
+/// keys derives its key here, so a probe key always equals the key inserted.
+///
+/// A narrow span right-aligns its big-endian bytes into a `u128`; a wider one
+/// collapses to the xxh3 checksum of the whole span. Either way the full span
+/// is hashed to 64 bits, keeping its entropy — this is deliberately not
+/// `worker_for_pk_bytes`, which reduces the same two images to a worker index.
+#[inline]
+pub(crate) fn probe_key(opk: &[u8]) -> u64 {
+    let fingerprint = if opk.len() > NARROW_PK_MAX_BYTES {
+        xxh::checksum(opk) as u128
+    } else {
+        gnitz_wire::widen_pk_be(opk, opk.len())
+    };
+    xxh::hash_u128(fingerprint)
 }
 
 // ---------------------------------------------------------------------------

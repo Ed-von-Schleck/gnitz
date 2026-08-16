@@ -4,6 +4,7 @@
 //! packed_cols)` filters (the preflight seed path shares the types).
 
 use super::*;
+use crate::schema::key::probe_key;
 
 #[cfg(test)]
 use super::preflight::build_check_batch_pk_bytes;
@@ -24,31 +25,30 @@ use super::preflight::build_check_batch_pk_bytes;
 //      that cause harmless fall-through broadcasts. Accumulation is bounded by
 //      `UNIQUE_FILTER_CAP`: past it the filter caps and disables itself until
 //      invalidated.
-//   5. The master event loop is single-threaded, so query, warmup, and ingest
-//      cannot race.
+//   5. Query, warmup and ingest may interleave freely. A cold filter still
+//      accepts ingestion, so a span committed during the warmup scan is never
+//      lost, and a second warmup of the same key finds the entry already
+//      present and returns without building a rival filter. The one forbidden
+//      state is a span missing from a filter marked warm.
 
 /// Maximum number of spans tracked per `(table_id, packed_cols)` filter; a
-/// filter that would exceed it disables itself. At the cap a `PkBuf` key
-/// (81 bytes) costs ≈170 MB per maxed filter — bounded, and only reached by a
-/// table holding 1M distinct unique values. Lowering the cap shrinks the
-/// broadcast-skip reach (every unique index past it reverts to
-/// always-broadcast on the insert hot path), so it is the lever for a
-/// memory-constrained deployment.
-pub(super) const UNIQUE_FILTER_CAP: usize = 1_000_000;
+/// filter that would exceed it disables itself. This is the largest count that
+/// fits `FxHashSet<u64>`'s 2^23-bucket table at its 7/8 load factor, so the set
+/// never grows to the next power of two: ≈72 MiB per maxed filter, against
+/// ≈144 MiB (and a transient 216 MiB across the rehash) one entry higher.
+/// Lowering it shrinks the broadcast-skip reach — every unique index past the
+/// cap reverts to always-broadcast on the insert hot path.
+pub(super) const UNIQUE_FILTER_CAP: usize = 7_340_032;
 
-pub(super) struct UniqueFilter {
-    /// The OPK leading-key spans known present in the index. A `PkBuf` holds the
-    /// full composite span at any width, so a `UNIQUE (a, b)` whose span exceeds
-    /// 16 bytes is tracked without truncation (a truncating `u128` could prove a
-    /// present key absent and wrongly skip the broadcast).
-    pub(super) values: FxHashSet<PkBuf>,
+pub(crate) struct UniqueFilter {
+    /// `probe_key` fingerprints of the OPK leading-key spans known present in
+    /// the index, or `None` once the filter exceeded `cap` — dropped whole,
+    /// never truncated, after which every query falls through to the
+    /// broadcast.
+    pub(super) values: Option<FxHashSet<u64>>,
     /// Maximum distinct values tracked: `UNIQUE_FILTER_CAP` in production,
     /// parameterizable so tests exercise the cap discipline cheaply.
     pub(super) cap: usize,
-    /// True once the filter has exceeded `cap`. In that
-    /// state `values` is cleared and the filter always reports
-    /// "possibly present" (falls through to broadcast).
-    pub(super) capped: bool,
     /// False until the warmup scan has fully populated `values`. While
     /// false the filter still accepts ingestion (so keys committed during
     /// the scan window are not lost) but `unique_filter_all_absent`
@@ -64,24 +64,43 @@ impl UniqueFilter {
 
     pub(super) fn with_cap(cap: usize) -> Self {
         UniqueFilter {
-            values: FxHashSet::default(),
+            values: Some(FxHashSet::default()),
             cap,
-            capped: false,
             warm: false,
         }
     }
 
-    /// On overflow the set is cleared WHOLE, never truncated: a partial set
+    /// True once the filter has exceeded `cap` and disabled itself.
+    pub(crate) fn capped(&self) -> bool {
+        self.values.is_none()
+    }
+
+    /// On overflow the set is dropped WHOLE, never truncated: a partial set
     /// would prove "absent" for a present key — a uniqueness hole.
-    pub(super) fn insert(&mut self, key: PkBuf) {
-        if self.capped {
+    pub(super) fn insert(&mut self, span: &[u8]) {
+        let Some(values) = self.values.as_mut() else {
             return;
+        };
+        values.insert(probe_key(span));
+        if values.len() > self.cap {
+            self.values = None;
         }
-        self.values.insert(key);
-        if self.values.len() > self.cap {
-            self.values = FxHashSet::default();
-            self.capped = true;
-        }
+    }
+
+    /// False iff `span` is definitely absent — the only answer this filter
+    /// owes. A fingerprint collision, and every span once the filter caps,
+    /// reports true: one spurious broadcast, exactly what a true hit costs.
+    /// There is no false negative, so a present span is never proven absent.
+    pub(crate) fn may_contain(&self, span: &[u8]) -> bool {
+        self.values
+            .as_ref()
+            .is_none_or(|values| values.contains(&probe_key(span)))
+    }
+
+    /// Distinct spans tracked — zero once capped.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.values.as_ref().map_or(0, |values| values.len())
     }
 }
 
@@ -118,15 +137,20 @@ pub(super) struct UniqueIndexDesc {
 }
 
 /// Walk every positive-weight, non-null row of `batch` and insert the indexed
-/// columns' OPK leading-key span into `filter`. Respects the filter's capped
-/// state by stopping the walk once the filter caps. A row with a NULL in any
+/// columns' OPK leading-key span into `filter`. A row with a NULL in any
 /// indexed column is skipped (`key_bytes` → false), sharing the NULL-distinct
 /// key contract with the CREATE-time validator and the projection.
+///
+/// Owns the capped check for every caller: a capped filter takes no rows, so
+/// the walk neither starts nor continues past the row that caps it.
 pub(super) fn extract_into_filter(
     filter: &mut UniqueFilter,
     batch: &crate::storage::MemBatch<'_>,
     spec: &IndexKeySpec,
 ) {
+    if filter.capped() {
+        return;
+    }
     let mut keybuf = PkBuf::zeroed(0);
     for row in 0..batch.count {
         if batch.get_weight(row) <= 0 {
@@ -135,10 +159,10 @@ pub(super) fn extract_into_filter(
         if !spec.key_bytes(batch, row, &mut keybuf) {
             continue;
         }
-        filter.insert(keybuf);
-        if filter.capped {
+        filter.insert(keybuf.pk_bytes());
+        if filter.capped() {
             return;
-        } // stop walking once the filter caps
+        }
     }
 }
 
@@ -168,25 +192,23 @@ impl MasterDispatcher {
             .collect()
     }
 
-    /// True if every key in `keys` is definitely absent from the filter
-    /// for `(table_id, packed)`. Returns false if the filter is capped,
-    /// not warm (caller is expected to warm it first), or contains any
-    /// key. On false, caller must fall through to the occupancy broadcast.
-    pub(super) fn unique_filter_all_absent(
+    /// True if every span in `spans` is definitely absent from the filter for
+    /// `(table_id, packed)`. Returns false if the filter is not warm (caller is
+    /// expected to warm it first) or may contain any span — which a capped
+    /// filter always does. On false, caller must fall through to the occupancy
+    /// broadcast.
+    pub(super) fn unique_filter_all_absent<'k>(
         &self,
         table_id: i64,
         packed: u64,
-        mut keys: impl Iterator<Item = PkBuf>,
+        mut spans: impl Iterator<Item = &'k [u8]>,
     ) -> bool {
         let filters = self.unique_filters.borrow();
         let filter = match filters.get(&(table_id, packed)) {
             Some(f) => f,
             None => return false,
         };
-        if !filter.warm || filter.capped {
-            return false;
-        }
-        keys.all(|k| !filter.values.contains(&k))
+        filter.warm && spans.all(|s| !filter.may_contain(s))
     }
 
     /// Record every unique-index value from a successfully-flushed
@@ -204,9 +226,6 @@ impl MasterDispatcher {
             let Some(filter) = filters.get_mut(&(table_id, d.packed)) else {
                 continue; // not warm — warmup will pick this up
             };
-            if filter.capped {
-                continue;
-            }
             extract_into_filter(filter, &mb, &d.spec);
         }
     }
@@ -291,9 +310,7 @@ impl MasterDispatcher {
             let mut filters = disp.unique_filters.borrow_mut();
             for d in &missing {
                 if let Some(filter) = filters.get_mut(&(table_id, d.packed)) {
-                    if !filter.capped {
-                        extract_into_filter(filter, mb, &d.spec);
-                    }
+                    extract_into_filter(filter, mb, &d.spec);
                 }
             }
             Ok(())
@@ -312,22 +329,15 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    /// Seed the `(table_id, col_idx)` filter from the CREATE-time pre-flight,
-    /// captured under the catalog write lock. Marks it warm so the first
-    /// INSERT skips `ensure_unique_filters_warm`. `capped = true` (the
-    /// accumulator overflowed and cleared its set whole — `seen` arrives
-    /// empty) publishes a warm+capped filter: `unique_filter_all_absent` then
-    /// always falls through to the broadcast — the same steady state the lazy
-    /// warmup converges to, without paying a redundant full-cluster scan on
-    /// the first INSERT. Symmetric counterpart of `unique_filter_remove`.
-    pub(crate) fn unique_filter_seed(&self, table_id: i64, packed: u64, seen: FxHashSet<PkBuf>, capped: bool) {
-        let mut filter = UniqueFilter::new();
+    /// Publish the `(table_id, packed)` filter the CREATE-time pre-flight
+    /// built under the catalog write lock, marking it warm so the first INSERT
+    /// skips `ensure_unique_filters_warm`. A pre-flight that overflowed hands
+    /// over an already-capped filter, so `unique_filter_all_absent` always
+    /// falls through to the broadcast — the same steady state the lazy warmup
+    /// converges to, without a redundant full-cluster scan on the first
+    /// INSERT. Symmetric counterpart of `unique_filter_remove`.
+    pub(crate) fn unique_filter_seed(&self, table_id: i64, packed: u64, mut filter: UniqueFilter) {
         filter.warm = true; // pre-flight scanned every worker under the write lock
-        if capped {
-            filter.capped = true;
-        } else {
-            filter.values = seen; // exact distinct set; same type, move not re-hash
-        }
         self.unique_filters.borrow_mut().insert((table_id, packed), filter);
     }
 }
@@ -355,29 +365,31 @@ mod unique_filter_tests {
     #[test]
     fn filter_insert_basic() {
         let mut f = UniqueFilter::new();
-        f.insert(span_u64(1));
-        f.insert(span_u64(2));
-        assert!(f.values.contains(&span_u64(1)));
-        assert!(f.values.contains(&span_u64(2)));
-        assert!(!f.capped);
+        f.insert(span_u64(1).pk_bytes());
+        f.insert(span_u64(2).pk_bytes());
+        assert!(f.may_contain(span_u64(1).pk_bytes()));
+        assert!(f.may_contain(span_u64(2).pk_bytes()));
+        assert!(!f.capped());
+        assert!(!f.may_contain(span_u64(3).pk_bytes()));
     }
 
     #[test]
-    fn filter_cap_clears_values() {
-        // Exceed a small parameterized cap, verify the filter flips to
-        // capped and its values HashSet is cleared whole.
+    fn filter_cap_drops_values() {
+        // Exceed a small parameterized cap and verify the filter disables
+        // itself: the set is dropped whole, and it then proves nothing absent.
         let mut f = UniqueFilter::with_cap(8);
         for k in 0..10u64 {
-            f.insert(span_u64(k));
-            if f.capped {
+            f.insert(span_u64(k).pk_bytes());
+            if f.capped() {
                 break;
             }
         }
-        assert!(f.capped, "filter should be capped after exceeding the limit");
-        assert!(f.values.is_empty(), "values cleared once capped");
-        // Further inserts are no-ops.
-        f.insert(span_u64(99999999));
-        assert!(f.values.is_empty());
+        assert!(f.capped(), "filter should cap after exceeding the limit");
+        assert_eq!(f.len(), 0, "the set is dropped whole, never truncated");
+        // Further inserts are no-ops, and every span reads as possibly present.
+        f.insert(span_u64(99999999).pk_bytes());
+        assert_eq!(f.len(), 0);
+        assert!(f.may_contain(span_u64(12345).pk_bytes()));
     }
 
     #[test]
@@ -394,9 +406,9 @@ mod unique_filter_tests {
         );
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
-        assert!(filter.values.contains(&span_u64(10)));
-        assert!(filter.values.contains(&span_u64(20)));
-        assert!(!filter.values.contains(&span_u64(30)), "negative weight skipped");
+        assert!(filter.may_contain(span_u64(10).pk_bytes()));
+        assert!(filter.may_contain(span_u64(20).pk_bytes()));
+        assert!(!filter.may_contain(span_u64(30).pk_bytes()), "negative weight skipped");
     }
 
     #[test]
@@ -430,11 +442,11 @@ mod unique_filter_tests {
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
         assert!(
-            filter.values.contains(&promoted_span),
+            filter.may_contain(promoted_span.pk_bytes()),
             "filter holds the I64-promoted native span"
         );
         assert!(
-            !filter.values.contains(&unsigned_span),
+            !filter.may_contain(unsigned_span.pk_bytes()),
             "must not hold the non-order-preserving unsigned image"
         );
     }
@@ -454,20 +466,21 @@ mod unique_filter_tests {
         let mut filter = UniqueFilter::new();
         // Single payload column promoted to a U64 index column (8-byte span).
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[1], &schema));
-        assert!(filter.values.contains(&span_u64(100)));
-        assert!(!filter.values.contains(&span_u64(200)), "null values skipped");
-        assert!(filter.values.contains(&span_u64(300)));
-        assert_eq!(filter.values.len(), 2);
+        assert!(filter.may_contain(span_u64(100).pk_bytes()));
+        assert!(!filter.may_contain(span_u64(200).pk_bytes()), "null values skipped");
+        assert!(filter.may_contain(span_u64(300).pk_bytes()));
+        assert_eq!(filter.len(), 2);
     }
 
     #[test]
-    fn extract_into_filter_respects_capped() {
+    fn extract_into_filter_stops_at_the_cap() {
         let schema = u64_schema();
         let batch = make_row_batch(schema, &[(10, 1, 0, 0), (20, 1, 0, 0)]);
-        let mut filter = UniqueFilter::new();
-        filter.capped = true;
+        // Cap of zero: the first row overflows, so the walk caps and stops.
+        let mut filter = UniqueFilter::with_cap(0);
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
-        assert!(filter.values.is_empty(), "no-op on capped filter");
+        assert!(filter.capped());
+        assert_eq!(filter.len(), 0, "a capped filter holds nothing");
     }
 
     /// Zero workers, null catalog, dummy SAL: the unique-filter methods
@@ -492,12 +505,12 @@ mod unique_filter_tests {
         for k in [10u64, 20, 30, 40] {
             assert!(acc.offer(span_u64(k)), "distinct keys never flip the verdict");
         }
-        let (seed, capped) = acc.into_seed();
-        assert!(capped, "cap + 1 distinct keys must report capped");
+        let seed = acc.into_seed();
+        assert!(seed.capped(), "cap + 1 distinct keys must cap the seed");
         let disp = filter_dispatcher();
-        disp.unique_filter_seed(7, 0, seed, capped);
+        disp.unique_filter_seed(7, 0, seed);
         assert!(
-            !disp.unique_filter_all_absent(7, 0, [span_u64(10)].into_iter()),
+            !disp.unique_filter_all_absent(7, 0, [span_u64(10).pk_bytes()].into_iter()),
             "a capped pre-flight seed must fall through to the broadcast",
         );
     }
@@ -511,16 +524,16 @@ mod unique_filter_tests {
         for k in [10u64, 20, 30] {
             assert!(acc.offer(span_u64(k)));
         }
-        let (seed, capped) = acc.into_seed();
-        assert!(!capped, "exactly cap distinct keys must keep the full seed");
+        let seed = acc.into_seed();
+        assert!(!seed.capped(), "exactly cap distinct keys must keep the full seed");
         let disp = filter_dispatcher();
-        disp.unique_filter_seed(7, 0, seed, capped);
+        disp.unique_filter_seed(7, 0, seed);
         assert!(
-            disp.unique_filter_all_absent(7, 0, [span_u64(40)].into_iter()),
+            disp.unique_filter_all_absent(7, 0, [span_u64(40).pk_bytes()].into_iter()),
             "fresh key is provably absent"
         );
         assert!(
-            !disp.unique_filter_all_absent(7, 0, [span_u64(20)].into_iter()),
+            !disp.unique_filter_all_absent(7, 0, [span_u64(20).pk_bytes()].into_iter()),
             "seeded key falls through"
         );
     }
@@ -530,14 +543,18 @@ mod unique_filter_tests {
     /// `contains_key` skip applies and no key is ever proven absent.
     #[test]
     fn unique_filter_seed_capped_publishes_warm_capped_entry() {
+        let mut seed = UniqueFilter::with_cap(0);
+        seed.insert(span_u64(1).pk_bytes());
+        assert!(seed.capped());
         let disp = filter_dispatcher();
-        disp.unique_filter_seed(7, 0, FxHashSet::default(), true);
-        let filters = disp.unique_filters.borrow();
-        let filter = filters.get(&(7, 0)).expect("entry must exist");
-        assert!(filter.warm);
-        assert!(filter.capped);
-        assert!(filter.values.is_empty());
-        assert!(!disp.unique_filter_all_absent(7, 0, [span_u64(12345)].into_iter()));
+        disp.unique_filter_seed(7, 0, seed);
+        {
+            let filters = disp.unique_filters.borrow();
+            let filter = filters.get(&(7, 0)).expect("entry must exist");
+            assert!(filter.warm);
+            assert!(filter.capped());
+        }
+        assert!(!disp.unique_filter_all_absent(7, 0, [span_u64(12345).pk_bytes()].into_iter()));
     }
 
     #[test]
@@ -563,8 +580,11 @@ mod unique_filter_tests {
         let mut filter = UniqueFilter::new();
         // Index on a U32 column promotes to a U64 (8-byte) index column.
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
-        assert!(filter.values.contains(&span_u64(5)), "filter holds column A's value");
-        assert_eq!(filter.values.len(), 1, "the shared A=5 collapses to one entry");
+        assert!(
+            filter.may_contain(span_u64(5).pk_bytes()),
+            "filter holds column A's value"
+        );
+        assert_eq!(filter.len(), 1, "the shared A=5 collapses to one entry");
     }
 
     #[test]
@@ -586,8 +606,36 @@ mod unique_filter_tests {
         let batch = build_check_batch_pk_bytes(&schema, keys.iter().map(|k| k.pk_bytes()), None);
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[1], &schema));
-        assert!(filter.values.contains(&span_u64(11)));
-        assert!(filter.values.contains(&span_u64(22)));
-        assert_eq!(filter.values.len(), 2);
+        assert!(filter.may_contain(span_u64(11).pk_bytes()));
+        assert!(filter.may_contain(span_u64(22).pk_bytes()));
+        assert_eq!(filter.len(), 2);
+    }
+
+    /// A composite index whose span exceeds 16 bytes takes `probe_key`'s xxh3
+    /// branch — the width no `u128` image could hold. Two spans sharing a
+    /// 16-byte prefix must stay distinct entries.
+    #[test]
+    fn extract_into_filter_wide_composite_span() {
+        // (U128, U64) both PK, indexed together: a 24-byte span.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(schema.pk_stride(), 24);
+        // Only the trailing column differs, so the two spans share 16 bytes.
+        let keys = [
+            compound_pk_bytes(&[&7u128.to_be_bytes(), &3u64.to_be_bytes()]),
+            compound_pk_bytes(&[&7u128.to_be_bytes(), &4u64.to_be_bytes()]),
+        ];
+        assert_eq!(keys[0].pk_bytes()[..16], keys[1].pk_bytes()[..16]);
+        let batch = build_check_batch_pk_bytes(&schema, keys.iter().map(|k| k.pk_bytes()), None);
+        let mut filter = UniqueFilter::new();
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0, 1], &schema));
+        assert!(filter.may_contain(keys[0].pk_bytes()));
+        assert!(filter.may_contain(keys[1].pk_bytes()));
+        assert_eq!(filter.len(), 2, "a shared prefix must not merge two spans");
     }
 }

@@ -140,10 +140,10 @@ pub(super) fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) 
 /// panic on column writes. When `pooled.schema != Some(schema)`, the
 /// pooled allocation is dropped and a fresh batch is allocated instead.
 ///
-/// `push_pk` writes the per-row PK region (the only step that differs
-/// between the `u128` and `PkBuf` key forms). Keys arrive as an iterator so a
-/// caller that already holds them in a map or a tuple list need not materialize
-/// a second vector to probe them.
+/// `push_pk` writes the per-row PK region (the only step that differs between
+/// the `u128` and byte-span key forms). Keys arrive as an iterator so a caller
+/// that already holds them in a map or a tuple list need not materialize a
+/// second vector to probe them.
 fn build_check_batch_with<K>(
     schema: &SchemaDescriptor,
     keys: impl ExactSizeIterator<Item = K>,
@@ -198,11 +198,10 @@ pub(super) fn build_check_batch(
     })
 }
 
-/// Build the committed-PK-existence check batch from `keys`, the distinct PK
-/// byte spans collected by the preflight aggregation. Writes each span's OPK
-/// bytes verbatim into the PK region: the spans are already main-table PKs, so
-/// unlike the index builder `build_check_batch` no column-0 re-encoding is
-/// applied. The sole PK (rather than index) check-batch builder.
+/// Build a check batch from `keys`, OPK byte spans already in the target
+/// schema's key layout — the distinct PKs the preflight aggregation collected,
+/// or a unique index's leading-key spans. Writes each span verbatim into the PK
+/// region, so unlike `build_check_batch` no column-0 re-encoding is applied.
 pub(super) fn build_check_batch_pk_bytes<'k>(
     schema: &SchemaDescriptor,
     keys: impl ExactSizeIterator<Item = &'k [u8]>,
@@ -344,13 +343,13 @@ impl PreflightKeyStream {
 pub(crate) struct PreflightAccumulator {
     prev: Option<PkBuf>,
     pub(crate) duplicate: bool,
-    /// Seed collection reuses `UniqueFilter`'s cap discipline: on overflow
-    /// `insert` clears the set WHOLE and disables itself, so the seed is
-    /// complete-or-empty, never truncated — a truncated seed would publish a
-    /// warm but incomplete filter whose "proven absent" answers would let a
-    /// genuine duplicate skip the INSERT broadcast. Every span reaching
-    /// `insert` is distinct (spans arrive sorted, so duplicates are adjacent
-    /// and stop at the `prev` check).
+    /// The filter this pre-flight will publish. `insert` owns the cap
+    /// discipline: on overflow it drops the set whole and disables itself, so
+    /// the seed is never truncated — a truncated seed would publish a warm but
+    /// incomplete filter whose "proven absent" answers would let a genuine
+    /// duplicate skip the INSERT broadcast. Every span reaching `insert` is
+    /// distinct (spans arrive sorted, so duplicates are adjacent and stop at
+    /// the `prev` check).
     filter: UniqueFilter,
 }
 
@@ -376,15 +375,14 @@ impl PreflightAccumulator {
             return false;
         }
         self.prev = Some(key);
-        self.filter.insert(key);
+        self.filter.insert(key.pk_bytes());
         true
     }
 
-    /// The complete distinct span set plus the capped verdict. `capped = true`
-    /// means the set overflowed and was cleared whole — the caller must
-    /// publish a capped (always-broadcast) filter, never a warm-empty one.
-    pub(crate) fn into_seed(self) -> (FxHashSet<PkBuf>, bool) {
-        (self.filter.values, self.filter.capped)
+    /// The filter holding every distinct span this pre-flight saw, ready to
+    /// publish.
+    pub(crate) fn into_seed(self) -> UniqueFilter {
+        self.filter
     }
 }
 
@@ -713,9 +711,11 @@ struct UniquePlan<'a> {
     tid: i64,
     col_indices: PkColList,
     spec: IndexKeySpec,
-    /// The distinct surviving spans and who claims each. Claimant PKs borrow the
-    /// family batch's PK region, like the overlay keys.
-    by_span: FxHashMap<PkBuf, &'a [u8]>,
+    /// The distinct surviving spans and who claims each, sorted by span — the
+    /// order the check batch is emitted in, so a reply is looked up by binary
+    /// search. Claimant PKs borrow the family batch's PK region, like the
+    /// overlay keys.
+    by_span: Vec<(PkBuf, &'a [u8])>,
 }
 
 /// Encode a native value `v` (from a column of type `src_type`) into the OPK
@@ -929,21 +929,27 @@ impl MasterDispatcher {
                 let cols = col_indices.as_slice();
                 let stride = idx_schema.pk_stride() as usize;
 
-                // Surviving span → holder PK. `surviving` yields each PK once, so
-                // a span already present always comes from a different row — an
-                // in-bundle duplicate.
-                let mut by_span: FxHashMap<PkBuf, &'a [u8]> = FxHashMap::default();
+                // Surviving span → holder PK. `surviving` yields each PK once,
+                // so once sorted an adjacent-equal pair always comes from two
+                // different rows — an in-bundle duplicate. The sort also fixes
+                // the order the check batch is emitted in: the worker probes it
+                // with one cursor, and `advance_to` gallops in place only on a
+                // strictly greater key, so an unsorted batch forfeits the
+                // gallop and repositions every source on each backward step.
+                let mut by_span: Vec<(PkBuf, &'a [u8])> = Vec::with_capacity(b.overlay(tid).len());
                 let mut keybuf = PkBuf::zeroed(0);
                 for (pk, fam, row) in b.surviving(tid) {
                     if !spec.key_bytes(b.mem(fam), row as usize, &mut keybuf) {
                         continue; // NULL in an indexed column ⇒ unindexed
                     }
-                    if by_span.insert(keybuf, pk).is_some() {
-                        return Err(disp.cat().unique_violation_err(tid, cols, true));
-                    }
+                    by_span.push((keybuf, pk));
                 }
                 if by_span.is_empty() {
                     continue;
+                }
+                by_span.sort_unstable_by_key(|&(span, _)| span);
+                if by_span.windows(2).any(|w| w[0].0 == w[1].0) {
+                    return Err(disp.cat().unique_violation_err(tid, cols, true));
                 }
 
                 // Every planned span provably absent from the committed index ⇒
@@ -951,13 +957,12 @@ impl MasterDispatcher {
                 // verify. Skipping the whole plan is what keeps a fresh-key INSERT
                 // stream a one-burst operation.
                 let packed = gnitz_wire::pack_pk_cols(cols);
-                if disp.unique_filter_all_absent(tid, packed, by_span.keys().copied()) {
+                if disp.unique_filter_all_absent(tid, packed, by_span.iter().map(|(s, _)| s.pk_bytes())) {
                     continue;
                 }
                 let pooled = disp.pool_pop_batch((tid, packed));
-                let chk = build_check_batch_with(&idx_schema, by_span.keys(), pooled, |bat, k| {
-                    bat.extend_pk_bytes(k.padded(stride))
-                });
+                let chk =
+                    build_check_batch_pk_bytes(&idx_schema, by_span.iter().map(|(s, _)| s.padded(stride)), pooled);
                 checks.push(PipelinedCheck {
                     target_id: tid,
                     // The reply must name the committed holder of each occupied
@@ -989,9 +994,13 @@ impl MasterDispatcher {
                 let (span, holder) = plan.spec.split_entry(entry.pk_bytes());
                 // Every entry answers a span this plan probed, so the claimer is
                 // always present.
-                let Some(&claimer) = plan.by_span.get(span) else {
+                let Ok(i) = plan
+                    .by_span
+                    .binary_search_by(|(s, _)| crate::schema::key::compare_pk_bytes(s.pk_bytes(), span))
+                else {
                     continue;
                 };
+                let claimer = plan.by_span[i].1;
                 // The holder IS the surviving row claiming the span — nothing to
                 // vacate.
                 if holder == claimer {
@@ -1401,7 +1410,7 @@ impl MasterDispatcher {
     /// represent.
     ///
     /// On success the index is safe to commit and broadcast and the returned
-    /// distinct span set seeds the master's unique filter; on failure the
+    /// filter seeds the master's unique-filter cache; on failure the
     /// caller returns a client error and never broadcasts, so no worker
     /// reaches the fatal `DdlSync` backfill path.
     ///
@@ -1418,12 +1427,12 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex>,
         owner_id: i64,
         col_indices: &[u32],
-    ) -> Result<(FxHashSet<PkBuf>, bool), String> {
+    ) -> Result<UniqueFilter, String> {
         let (idx_schema, packed) = {
             let cat = disp.cat();
             let owner_schema = match cat.get_schema_desc(owner_id) {
                 Some(s) => s,
-                None => return Ok((FxHashSet::default(), false)),
+                None => return Ok(UniqueFilter::new()),
             };
             // Trivial-uniqueness short-circuit, generalised to the compound PK:
             // a composite index whose columns equal the table's enforced-unique
@@ -1435,7 +1444,7 @@ impl MasterDispatcher {
             // collision would be a PK collision, and `enforce_unique_pk` already
             // makes those impossible.
             if owner_schema.group_cols_eq_pk(col_indices) {
-                return Ok((FxHashSet::default(), false));
+                return Ok(UniqueFilter::new());
             }
             // Build the index schema (the circuit is not registered until this
             // pre-flight succeeds) for the merge's reply-frame layout and the

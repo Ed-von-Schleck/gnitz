@@ -1,31 +1,10 @@
-use crate::foundation::xxh;
 use xorf::{Filter, Xor8};
 
 const MAGIC: &[u8; 4] = b"GXF1";
 const HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + seed + block_length + fp_count
 
-/// The XOR8 filter key for one PK's OPK byte region — the single derivation both
-/// the build side (`build_xor8_from_pk_region`) and the probe side
-/// (`ShardEntry::probe_pk_bytes`) call, so a probe key is always identical to the
-/// one inserted at build time.
-///
-/// Narrow keys (`≤ 16` OPK bytes) right-align their order-preserving big-endian
-/// bytes into a `u128` via `widen_pk_be`; wide keys (`> 16` bytes — a compound
-/// PK past `u128`) collapse to the full 64-bit xxh3 checksum, zero-extended. The
-/// filter is keyed by the full logical PK, so this keeps the entire entropy —
-/// it is deliberately *not* `worker_for_pk_bytes`, which reduces the same two
-/// hashes to one worker index.
-#[inline]
-pub(crate) fn probe_key(opk: &[u8]) -> u64 {
-    let fingerprint = if opk.len() > 16 {
-        xxh::checksum(opk) as u128
-    } else {
-        gnitz_wire::widen_pk_be(opk, opk.len())
-    };
-    xxh::hash_u128(fingerprint)
-}
-
-/// Build an Xor8 filter from [`probe_key`] keys. Returns None if the input is empty.
+/// Build an Xor8 filter from [`crate::schema::key::probe_key`] keys. Returns
+/// None if the input is empty.
 ///
 /// The XOR filter's hypergraph peeling fails (hang/panic) on duplicate keys,
 /// so the keys are sorted and deduplicated first — this also collapses
@@ -40,7 +19,7 @@ pub(crate) fn build(mut keys: Vec<u64>) -> Option<Xor8> {
     Some(Xor8::from(keys.as_slice()))
 }
 
-/// Check whether a [`probe_key`] may be present in the filter.
+/// Check whether a [`crate::schema::key::probe_key`] may be present in the filter.
 pub(crate) fn may_contain(filter: &Xor8, probe_key: u64) -> bool {
     filter.contains(&probe_key)
 }
@@ -98,9 +77,10 @@ pub(crate) fn serialized_size(filter: &Xor8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foundation::xxh;
 
     /// Drives the raw-fingerprint half of the key derivation directly;
-    /// `probe_key` covers the OPK-bytes half.
+    /// `crate::schema::key::probe_key` covers the OPK-bytes half.
     fn key_u128(k: u128) -> u64 {
         xxh::hash_u128(k)
     }

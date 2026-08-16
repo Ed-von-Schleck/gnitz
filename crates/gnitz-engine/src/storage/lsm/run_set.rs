@@ -12,7 +12,7 @@ use std::rc::Rc;
 use super::batch::{write_to_batch, Batch, Layout};
 use super::bloom::BloomFilter;
 use super::merge::{self, SortedMemBatch};
-use super::xor8;
+use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
 
 /// Runs to accumulate before folding them into one. Bounds the cost of cursor
@@ -186,7 +186,7 @@ impl RunSet {
         self.runs.first().map(Rc::clone)
     }
 
-    /// Bloom probe for a PK by its [`xor8::probe_key`] — derived by the caller,
+    /// Bloom probe for a PK by its [`probe_key`] — derived by the caller,
     /// which probes both RAM tiers and every shard with the same key. The first
     /// probe builds the filter from all live runs.
     pub(super) fn may_contain(&self, probe_key: u64) -> bool {
@@ -204,12 +204,12 @@ impl RunSet {
     }
 }
 
-/// Insert every row's PK into `bloom`, keyed by [`xor8::probe_key`] — the same
+/// Insert every row's PK into `bloom`, keyed by [`probe_key`] — the same
 /// derivation the shard filter and this set's probe side use, so one PK maps to
 /// one key everywhere and no width or signedness produces a false negative.
 fn bloom_add_batch(bloom: &mut BloomFilter, batch: &Batch) {
     for i in 0..batch.count {
-        bloom.add(xor8::probe_key(batch.get_pk_bytes(i)));
+        bloom.add(probe_key(batch.get_pk_bytes(i)));
     }
 }
 
@@ -251,7 +251,7 @@ mod tests {
     /// Probe by a narrow PK, deriving the filter key the way the production walk
     /// does so no assertion spells a second version of it.
     fn probes(set: &RunSet, pk: u64) -> bool {
-        set.may_contain(xor8::probe_key(&pk.to_be_bytes()))
+        set.may_contain(probe_key(&pk.to_be_bytes()))
     }
 
     #[test]

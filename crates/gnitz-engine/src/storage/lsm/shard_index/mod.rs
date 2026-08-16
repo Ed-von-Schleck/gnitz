@@ -71,7 +71,7 @@ impl ShardEntry {
     }
 
     /// Probe this shard for a PK by its OPK `key` bytes (exactly `pk_stride`
-    /// wide). `xor8_key` is `xor8::probe_key(key)` — the caller hoists it because
+    /// wide). `xor8_key` is `probe_key(key)` — the caller hoists it because
     /// it is the same value for every shard in one sweep.
     fn probe_pk_bytes(&self, key: &[u8], xor8_key: u64) -> Option<(Rc<MappedShard>, usize)> {
         if self.is_empty() {
@@ -218,6 +218,7 @@ mod tests {
     use super::super::shard_file;
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
+    use crate::schema::key::probe_key;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::make_schema_u64_i64;
     use gnitz_wire::as_le_bytes;
@@ -225,7 +226,7 @@ mod tests {
     /// Derives the filter key the way the production sweep does, so no assertion
     /// hand-spells a second version of it.
     fn probe(e: &ShardEntry, key: &[u8]) -> Option<(Rc<MappedShard>, usize)> {
-        e.probe_pk_bytes(key, super::super::xor8::probe_key(key))
+        e.probe_pk_bytes(key, probe_key(key))
     }
 
     /// Synthetic 2-column compound PK schema: (U64, U64) PK + I64

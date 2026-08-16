@@ -2,7 +2,7 @@ const BITS_PER_KEY: usize = 10;
 const NUM_PROBES: usize = 7;
 
 /// The bit positions `key` probes. `key` is already a well-mixed 64-bit
-/// fingerprint (`xor8::probe_key`), so no further hashing happens here; the two
+/// fingerprint (`probe_key`), so no further hashing happens here; the two
 /// derived hashes are the standard double-hashing pair.
 #[inline]
 fn probes(key: u64, num_bits: u64) -> impl Iterator<Item = u64> {
@@ -47,7 +47,7 @@ impl BloomFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::repr::xor8::probe_key;
+    use crate::schema::key::probe_key;
 
     /// Keys are derived exactly as production derives them — from a PK's OPK
     /// bytes — so these exercise the real fingerprint, not raw counters.

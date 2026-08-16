@@ -20,6 +20,7 @@ use super::run_set::RunSet;
 use super::shard_index::ShardIndex;
 #[cfg(test)]
 use super::shard_reader::MappedShard;
+use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
 
 /// Hard per-`Table` (= per relation per worker) heap ceiling for the RAM tier. A
@@ -528,9 +529,9 @@ impl Table {
     fn for_each_pk_candidate(&self, key: &[u8], mut f: impl FnMut(StoredRow)) {
         // One derivation for every filter this walk consults — both RAM-tier
         // blooms and each shard's XOR8.
-        let probe_key = super::xor8::probe_key(key);
+        let fingerprint = probe_key(key);
         for set in self.ram_tiers() {
-            if !set.may_contain(probe_key) {
+            if !set.may_contain(fingerprint) {
                 continue;
             }
             for batch in set.runs() {
@@ -542,7 +543,7 @@ impl Table {
         }
         // The shard index's gated binary search already lands on the first
         // match, so the scan resumes from there rather than re-searching.
-        self.shard_index.find_pk_bytes(key, probe_key, &mut |shard, start| {
+        self.shard_index.find_pk_bytes(key, fingerprint, &mut |shard, start| {
             let count = shard.count;
             for row in pk_match_rows_from(&*shard, count, start, key) {
                 f(StoredRow {
@@ -1917,7 +1918,7 @@ mod tests {
             assert_eq!(shards.len(), 1, "barrier folds memtable + L0 into one shard");
             assert!(shards[0].has_xor8(), "barrier shard must carry the XOR8 filter");
             assert!(
-                shards[0].xor8_may_contain(super::super::xor8::probe_key(&100u64.to_be_bytes())),
+                shards[0].xor8_may_contain(probe_key(&100u64.to_be_bytes())),
                 "XOR8 must contain a folded memtable PK"
             );
         }
