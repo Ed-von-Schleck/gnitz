@@ -116,7 +116,7 @@ fn scan_spec_sinks_bench() {
     // Compute-bearing projection, fragmented — where compacting the survivors
     // before the morsel kernel is meant to earn its keep.
     let compute_proj = {
-        let mut eb = gnitz_core::ExprBuilder::new();
+        let mut eb = gnitz_expr::ExprBuilder::new();
         let (a, b) = (eb.load_col_int(3), eb.load_col_int(4));
         let sum = eb.add(a, b);
         eb.emit_col(sum, 0);

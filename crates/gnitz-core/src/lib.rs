@@ -5,7 +5,6 @@ pub mod circuit;
 pub mod client;
 pub mod connection;
 pub mod error;
-pub mod expr;
 pub mod protocol;
 pub mod types;
 
@@ -22,7 +21,10 @@ pub use connection::{
     VIEW_TAB,
 };
 pub use error::ClientError;
-pub use expr::{ExprBuilder, ExprProgram};
+// The expression emitter lives in `gnitz-expr`, beside the decoder it must
+// agree with. Re-exported here because `gnitz-capi` exposes 18 `gnitz_expr_*` C
+// symbols over it without depending on that crate.
+pub use gnitz_expr::{ExprBuilder, ExprProgram};
 pub use gnitz_wire::{
     index_key_types, pack_table_flags, table_flags_dist_prefix, validate_dist_prefix, validate_user_identifier, Cut,
     PkColList, RangeDescriptor, FK_INDEX_INFIX,

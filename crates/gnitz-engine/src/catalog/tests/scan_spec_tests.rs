@@ -649,7 +649,7 @@ fn compute_projection_writes_at_keeper_tail_across_chunks() {
         &[0],
     );
     let projection = {
-        let mut eb = gnitz_core::ExprBuilder::new();
+        let mut eb = gnitz_expr::ExprBuilder::new();
         let (v, two) = (eb.load_col_int(1), eb.load_const(2));
         let doubled = eb.mul(v, two);
         eb.emit_col(doubled, 0);

@@ -1,4 +1,4 @@
-use crate::expr::ExprProgram;
+use gnitz_expr::ExprProgram;
 
 pub use gnitz_wire::{
     agg_output_type, AggFunc, JoinKind, MapKind, NodeColumnPayload, NodeFields, OpNode, RangeRel, ReduceOutKey,

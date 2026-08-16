@@ -66,7 +66,7 @@ fn count_records(table: &mut Table) -> usize {
 /// `WHERE` conjunct compiles to. Built through the client's own `ExprBuilder`,
 /// so the test blobs are byte-identical to what the planner ships.
 fn pred_lt_blob(col: usize, lit: i64) -> Vec<u8> {
-    let mut eb = gnitz_core::ExprBuilder::new();
+    let mut eb = gnitz_expr::ExprBuilder::new();
     let (a, b) = (eb.load_col_int(col), eb.load_const(lit));
     let r = eb.cmp_lt(a, b);
     eb.build(r).encode()
@@ -75,7 +75,7 @@ fn pred_lt_blob(col: usize, lit: i64) -> Vec<u8> {
 /// A pure-gather projection blob: `(src_col, out_payload_slot)` CopyCols and
 /// nothing else.
 fn proj_blob(copies: &[(u32, u32)]) -> Vec<u8> {
-    let mut eb = gnitz_core::ExprBuilder::new();
+    let mut eb = gnitz_expr::ExprBuilder::new();
     for &(src, out) in copies {
         eb.copy_col(src, out);
     }

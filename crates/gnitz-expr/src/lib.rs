@@ -11,11 +11,16 @@
 //! the crate root (`gnitz_expr::FOO`), matching `gnitz-wire`'s leaf-crate shape.
 //!
 //! What lives here is the whole path from a wire expression blob to evaluated
-//! values: [`LogicalProgram`] (the wire-mirroring form), its resolution against a
-//! schema, and the morsel-oriented vectorized kernels that evaluate the resolved
-//! form — plus the two contracts they read through, [`ColumnLocator`] /
-//! [`RowSource`] / [`BatchView`] for *where a value physically sits* and
-//! [`SchemaFacts`] for *what the schema says about it*.
+//! values: [`ExprBuilder`] (which emits the blob), [`LogicalProgram`] (the
+//! wire-mirroring form it decodes back to), its resolution against a schema, and
+//! the morsel-oriented vectorized kernels that evaluate the resolved form — plus
+//! the two contracts they read through, [`ColumnLocator`] / [`RowSource`] /
+//! [`BatchView`] for *where a value physically sits* and [`SchemaFacts`] for
+//! *what the schema says about it*.
+//!
+//! The emitter and the decoder are two tables over the same opcode space, so
+//! they belong in one crate: `builder.rs`'s drift test is the only thing that
+//! checks them against each other, and it is only writable here.
 //!
 //! # Inlining
 //!
@@ -32,6 +37,7 @@
 //! development machines swing far wider than the effects being measured.
 
 mod batch;
+mod builder;
 mod eval;
 mod like;
 mod locator;
@@ -39,6 +45,7 @@ mod program;
 mod schema_facts;
 mod view;
 
+pub use builder::*;
 pub use eval::*;
 pub use like::*;
 pub use locator::*;

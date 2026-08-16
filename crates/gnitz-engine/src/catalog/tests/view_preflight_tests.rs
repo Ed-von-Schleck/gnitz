@@ -15,7 +15,7 @@ use super::*;
 /// `LogicalProgram::from_wire` rejects it. Built through the client's own
 /// `ExprBuilder`, so it is byte-identical in shape to what the planner ships.
 fn over_cap_pred_blob() -> Vec<u8> {
-    let mut eb = gnitz_core::ExprBuilder::new();
+    let mut eb = gnitz_expr::ExprBuilder::new();
     let col = eb.load_col_int(0);
     // Every `load_const` claims a fresh register; the cap is `MAX_REGS`.
     let last = (0..gnitz_expr::MAX_REGS as i64)

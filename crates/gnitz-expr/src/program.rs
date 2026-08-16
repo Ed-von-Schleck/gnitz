@@ -1059,6 +1059,14 @@ impl LogicalProgram {
         Self::assembled(instrs, num_regs, result_reg, const_strings)
     }
 
+    /// The decoded instruction list. Test-only: production consumers go through
+    /// `resolve`, which consumes it — this exists so `builder.rs`'s drift test
+    /// can compare what `ExprBuilder` emitted against what `from_wire` read back.
+    #[cfg(test)]
+    pub(crate) fn instrs(&self) -> &[LogicalInstr] {
+        &self.instrs
+    }
+
     /// If every instruction is `CopyCol` writing dense payload outputs
     /// `out = [0, 1, 2, …]` (in instruction order), return the copies' source
     /// columns — the program's payload copy list, from which a caller derives a
