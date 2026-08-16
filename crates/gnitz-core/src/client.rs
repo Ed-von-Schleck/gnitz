@@ -1694,12 +1694,10 @@ fn decode_table_record(batch: &ZSetBatch, i: usize) -> Result<TableRecord, Clien
 /// `Err` = a decode error on a corrupt batch, which must surface rather than be
 /// masked as a miss.
 fn find_table_record_by_id(batch: &ZSetBatch, tid: u64) -> Result<Option<TableRecord>, ClientError> {
-    for i in batch.live_rows() {
-        if batch.pks.get(i) as u64 == tid {
-            return Ok(Some(decode_table_record(batch, i)?));
-        }
-    }
-    Ok(None)
+    batch
+        .live_row_with_pk(tid)
+        .map(|i| decode_table_record(batch, i))
+        .transpose()
 }
 
 /// Decode row `i` of a `VIEW_TAB` batch into a `ViewRecord` — the single home
@@ -1821,12 +1819,10 @@ fn decode_index_record(batch: &ZSetBatch, i: usize) -> Result<IndexRecord, Clien
 /// The VIEW_TAB record with PK `vid` — the VIEW_TAB peer of
 /// [`find_table_record_by_id`].
 fn find_view_record_by_id(batch: &ZSetBatch, vid: u64) -> Result<Option<ViewRecord>, ClientError> {
-    for i in batch.live_rows() {
-        if batch.pks.get(i) as u64 == vid {
-            return Ok(Some(decode_view_record(batch, i)?));
-        }
-    }
-    Ok(None)
+    batch
+        .live_row_with_pk(vid)
+        .map(|i| decode_view_record(batch, i))
+        .transpose()
 }
 
 /// Collect the full `ViewRecord`s of every live `VIEW_TAB` row whose `schema_id`

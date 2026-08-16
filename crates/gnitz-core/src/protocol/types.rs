@@ -856,6 +856,12 @@ impl ZSetBatch {
         (0..self.len()).filter(move |&i| self.weights[i] > 0)
     }
 
+    /// The index of the live row whose PK is `pk`, for a batch keyed by a single
+    /// integer column (the catalog tables). `None` = no such live row.
+    pub fn live_row_with_pk(&self, pk: u64) -> Option<usize> {
+        self.live_rows().find(|&i| self.pks.get(i) as u64 == pk)
+    }
+
     /// Append all rows from `other` into `self`, consuming it and moving its
     /// String/Bytes buffers instead of deep-cloning each value. O(n) pointer
     /// copies, zero heap allocation for string/bytes content. Panics if column
