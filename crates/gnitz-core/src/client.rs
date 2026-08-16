@@ -185,15 +185,15 @@ pub fn hidden_view_name(owner_vid: u64, idx: usize) -> String {
     format!("{}{idx}", hidden_view_prefix(owner_vid))
 }
 
-/// The name prefix every hidden segment of `owner_vid` carries. The separator
-/// terminator is load-bearing: `__h5_` must not match `__h51_0`.
-pub fn hidden_view_prefix(owner_vid: u64) -> String {
+/// The name prefix every hidden segment of `owner_vid` carries. The trailing
+/// separator keeps `__h5_` from matching `__h51_0`.
+fn hidden_view_prefix(owner_vid: u64) -> String {
     format!("__h{owner_vid}_")
 }
 
 /// Whether `name` is a synthesized hidden segment view (any owner). Sound
 /// because user identifiers cannot start with `_` (`validate_user_identifier`).
-pub fn is_hidden_view_name(name: &str) -> bool {
+fn is_hidden_view_name(name: &str) -> bool {
     name.starts_with("__h")
 }
 
@@ -377,9 +377,9 @@ impl GnitzClient {
         Ok(base)
     }
 
-    pub fn close(self) {
-        self.session.close();
-    }
+    /// Close the connection. Takes `self` by value, so the session — and with it
+    /// the transport — is dropped here; the C ABI calls this to close explicitly.
+    pub fn close(self) {}
 
     // --- Raw ops ---
 
@@ -389,10 +389,6 @@ impl GnitzClient {
 
     pub fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
         self.session.alloc_schema_id()
-    }
-
-    pub fn alloc_index_id(&mut self) -> Result<u64, ClientError> {
-        self.session.alloc_index_id()
     }
 
     pub fn push(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
@@ -602,7 +598,7 @@ impl GnitzClient {
         // written and the "undroppable orphan" a client probe would guard against
         // is unreachable. A rejected bundle burns this index_id; ids are monotonic
         // and never reused, so that costs nothing.
-        let index_id = self.alloc_index_id()?;
+        let index_id = self.session.alloc_index_id()?;
 
         let idx_schema = idx_tab_schema();
         let mut batch = ZSetBatch::new(idx_schema);

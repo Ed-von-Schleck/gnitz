@@ -266,29 +266,24 @@ impl CircuitBuilder {
         nid
     }
 
-    /// Multiplicity-preserving sibling of [`distinct`](Self::distinct): clamps each
-    /// consolidated (PK, payload)'s net weight to `[0, i64::MAX]` instead of
-    /// `[-1, 1]`, so output weights stay ≥ 0 but are not collapsed to set
-    /// membership. `EXCEPT ALL = positive_part(A − B)` and
-    /// `INTERSECT ALL = A − positive_part(A − B)` build on it.
-    pub fn positive_part(&mut self, input: NodeId) -> NodeId {
-        let nid = self.alloc_node(OpNode::PositivePart);
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
-    }
-
     /// The weight-exact Z-set difference `positive_part(minuend − subtrahend)` as
-    /// one node triple (`negate` → `union` → `positive_part`). Used by EXCEPT /
+    /// one node triple (`negate` → `union` → `PositivePart`). Used by EXCEPT /
     /// INTERSECT set-ops and by the LEFT/RIGHT/FULL outer-join null-fills
-    /// (`ν = positive_part(P − π_P(inner))`). Centralizes the operand-order rule:
-    /// the `minuend` rides the non-destructive `PORT_IN_B` operand because
-    /// `op_union` empties `PORT_IN_A`, and the minuend may be a shared node (e.g. a
-    /// null-fill's `a_all` aliasing the join's `reindex_a`); `negate(subtrahend)` is
-    /// freshly allocated, so `PORT_IN_A` is safe for it.
+    /// (`ν = positive_part(P − π_P(inner))`). `PositivePart` clamps each
+    /// consolidated (PK, payload)'s net weight to `[0, i64::MAX]`, so output
+    /// weights stay ≥ 0 without collapsing to set membership.
+    ///
+    /// Centralizes the operand-order rule: the `minuend` rides the
+    /// non-destructive `PORT_IN_B` operand because `op_union` empties
+    /// `PORT_IN_A`, and the minuend may be a shared node (e.g. a null-fill's
+    /// `a_all` aliasing the join's `reindex_a`); `negate(subtrahend)` is freshly
+    /// allocated, so `PORT_IN_A` is safe for it.
     pub fn positive_diff(&mut self, minuend: NodeId, subtrahend: NodeId) -> NodeId {
         let neg = self.negate(subtrahend);
         let diff = self.union(neg, minuend);
-        self.positive_part(diff)
+        let nid = self.alloc_node(OpNode::PositivePart);
+        self.connect(diff, nid, gnitz_wire::PORT_IN);
+        nid
     }
 
     fn binary_join(&mut self, op: OpNode, delta: NodeId, trace_node: NodeId) -> NodeId {

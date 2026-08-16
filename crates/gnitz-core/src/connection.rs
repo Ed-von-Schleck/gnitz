@@ -40,11 +40,7 @@ pub type MultiScanResult = Result<Vec<(Option<Arc<Schema>>, Option<ZSetBatch>, u
 /// Combines PID (top 32 bits) with a per-process monotonic sequence (bottom 32 bits).
 /// This guarantees uniqueness across all connections from the same process, and makes
 /// cross-process collisions practically impossible even with PID reuse.
-///
-/// Public because a binding that builds a bare [`Session`] rather than a
-/// `GnitzClient` (the gnitz-py async transport) must draw its id from this same
-/// counter — a second counter alongside it would hand out duplicates.
-pub fn new_client_id() -> u64 {
+fn new_client_id() -> u64 {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u64;
     (std::process::id() as u64) << 32 | seq
@@ -55,7 +51,7 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
         return Err(ClientError::SchemaMismatch);
     }
     if msg.status == STATUS_NO_INDEX {
-        return Err(ClientError::NoIndex);
+        return Err(ClientError::ServerError("no index on requested column".into()));
     }
     if msg.status == STATUS_TXN_CONFLICT {
         // Control-only frame: the fresh basis rides in `seek_pk`. Left as a
@@ -127,10 +123,6 @@ impl Session {
         Ok((session, published_lsn))
     }
 
-    pub fn close(self) {
-        // The transport is dropped here, which closes the connection.
-    }
-
     /// Request frames this session has written since it connected. Counted in
     /// the transport, so it covers every verb without a per-path bump. Tests
     /// assert on it to pin the per-statement round-trip count.
@@ -167,12 +159,6 @@ impl Session {
     pub fn alloc_serial_range(&mut self, seq_table_id: u64, count: u64) -> Result<u64, ClientError> {
         let msg = self.roundtrip(seq_table_id, FLAG_ALLOCATE_SERIAL_RANGE, count, None, None)?;
         Ok(msg.target_id) // base of [base, base + count)
-    }
-
-    /// Default push: silent-upsert (`WireConflictMode::Update`).
-    /// Callers that need SQL-standard rejection use `push_with_mode`.
-    pub fn push(&mut self, target_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
-        self.push_with_mode(target_id, schema, batch, WireConflictMode::Update)
     }
 
     pub fn push_with_mode(

@@ -1165,17 +1165,6 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
-    /// Override the null mask for the current row (must be called after `add_row`).
-    pub fn null_mask(&mut self, mask: u64) -> &mut Self {
-        // `last_mut()` instead of `len() - 1`: a call before any `add_row` would
-        // otherwise wrap to usize::MAX and OOB-panic in release.
-        match self.batch.nulls.last_mut() {
-            Some(last) => *last = mask,
-            None => panic!("BatchAppender: null_mask called before add_row"),
-        }
-        self
-    }
-
     /// Append a u64 value to the next Fixed column.
     pub fn u64_val(&mut self, v: u64) -> &mut Self {
         let ci = self.col_index();
@@ -1202,7 +1191,9 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
-    /// Append an i64 value to the next Fixed column.
+    /// Append an i64 value to the next Fixed column. Same eight bytes as
+    /// [`Self::u64_val`]; the separate name keeps a signed column's writer
+    /// honest at the call site.
     pub fn i64_val(&mut self, v: i64) -> &mut Self {
         let ci = self.col_index();
         match &mut self.batch.columns[ci] {
@@ -1938,23 +1929,6 @@ mod tests {
         } else {
             panic!("expected Strings");
         }
-    }
-
-    #[test]
-    fn test_appender_null_mask() {
-        let schema = Schema {
-            columns: vec![
-                ColumnDef::new("pk", TypeCode::U64, false),
-                ColumnDef::new("v", TypeCode::U64, true),
-            ],
-            pk_cols: vec![0],
-        };
-        let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema)
-            .add_row(1u128, 1)
-            .null_mask(0x02)
-            .u64_val(0);
-        assert_eq!(batch.nulls[0], 0x02);
     }
 
     #[test]

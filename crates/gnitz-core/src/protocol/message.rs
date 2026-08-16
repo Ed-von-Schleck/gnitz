@@ -96,7 +96,9 @@ impl MessageParts {
         [&self.ctrl, self.schema.as_deref().unwrap_or(&[]), &self.data]
     }
 
-    /// Flatten into one contiguous payload, for callers that need owned bytes.
+    /// Flatten into one contiguous payload. Tests use this to inspect a frame
+    /// the send path would hand to a vectored write unflattened.
+    #[cfg(test)]
     pub fn to_vec(&self) -> Vec<u8> {
         let [a, b, c] = self.segments();
         let mut out = Vec::with_capacity(a.len() + b.len() + c.len());

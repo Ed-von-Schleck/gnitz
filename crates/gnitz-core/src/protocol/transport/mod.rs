@@ -211,18 +211,23 @@ pub trait FrameSegments {
     fn segments(&self) -> [&[u8]; FRAME_SEGMENTS];
 }
 
+// The single-segment and by-reference impls exist for the batch-send tests
+// below; the one production caller passes `&[MessageParts]`.
+#[cfg(test)]
 impl FrameSegments for Vec<u8> {
     fn segments(&self) -> [&[u8]; FRAME_SEGMENTS] {
         [self, &[], &[]]
     }
 }
 
+#[cfg(test)]
 impl FrameSegments for &[u8] {
     fn segments(&self) -> [&[u8]; FRAME_SEGMENTS] {
         [self, &[], &[]]
     }
 }
 
+#[cfg(test)]
 impl<T: FrameSegments> FrameSegments for &T {
     fn segments(&self) -> [&[u8]; FRAME_SEGMENTS] {
         (**self).segments()
