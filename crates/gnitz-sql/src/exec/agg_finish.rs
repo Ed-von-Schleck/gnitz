@@ -327,7 +327,6 @@ fn group_key(partial: &ZSetBatch, schema: &Schema, n_group: usize, row: usize, k
             }
             ColData::Strings(v) => put(v[row].as_deref().unwrap_or("").as_bytes()),
             ColData::Bytes(v) => put(v[row].as_deref().unwrap_or(&[])),
-            ColData::U128s(v) => put(&v[row].to_le_bytes()),
         }
     }
 }

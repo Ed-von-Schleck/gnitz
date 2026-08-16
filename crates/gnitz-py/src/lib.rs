@@ -626,8 +626,8 @@ fn push_column_value(batch: &mut ZSetBatch, ci: usize, tc: TypeCode, val: &Bound
             v.push(Some(val.extract::<Vec<u8>>()?));
         }
         tc if tc.is_wide_int() => {
-            let ColData::U128s(v) = col else { variant_mismatch() };
-            v.push(extract_wide_int(tc, val)?);
+            let ColData::Fixed(buf) = col else { variant_mismatch() };
+            buf.extend_from_slice(&extract_wide_int(tc, val)?.to_le_bytes());
         }
         tc => {
             let ColData::Fixed(buf) = col else { variant_mismatch() };
@@ -1195,10 +1195,11 @@ fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, batch: &ZSetBatch) -> Py
     Ok(PyList::new(py, items)?.unbind())
 }
 
-/// Decode one PK column's native-LE bytes into a Python value. The 16-byte
-/// integer types route through [`u128_value_to_py`] so a PK renders exactly as
-/// the same column would in a payload; everything else is a fixed-width read.
-fn pk_value_to_py(py: Python<'_>, tc: TypeCode, bytes: &[u8]) -> PyResult<Py<PyAny>> {
+/// Decode one fixed-width column's native-LE bytes into a Python value —
+/// serving PK and payload alike, so a column renders the same wherever it is
+/// read. The 16-byte integer types route through [`u128_value_to_py`];
+/// everything else is a fixed-width read.
+fn fixed_value_to_py(py: Python<'_>, tc: TypeCode, bytes: &[u8]) -> PyResult<Py<PyAny>> {
     // `is_wide_int`, not a hand-listed set: the write path keys off the same
     // predicate, so a newly added 16-byte type cannot fall through to the
     // fixed-width arm on one side only.
@@ -1226,7 +1227,7 @@ fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> Py<PyAny> {
     }
 }
 
-/// Surface one `ColData::U128s` element as the Python object its column type
+/// Surface one 16-byte integer as the Python object its column type
 /// dictates. The three 16-byte integer types share u128 storage but differ at
 /// the surface: UUID → canonical string, I128 → signed int, everything else
 /// (U128) → unsigned int. Single source of truth for that decision across every
@@ -1241,10 +1242,10 @@ fn u128_value_to_py(py: Python<'_>, x: u128, tc: TypeCode) -> PyResult<Py<PyAny>
 
 /// Decode one payload cell into a Python object, null bit first: a set bit is
 /// `None` regardless of the stored value. Per-`ColData` decode — Fixed →
-/// [`read_fixed_le`], Strings → str, Bytes → bytes, U128s → [`u128_value_to_py`]
-/// — shared by the row build and the `scalars` column loop. `tc` and `stride`
-/// are the column's type code and wire stride, precomputed by the caller
-/// (`stride` is read only for the Fixed arm).
+/// [`fixed_value_to_py`], Strings → str, Bytes → bytes — shared by the row
+/// build and the `scalars` column loop. `tc` and `stride` are the column's type
+/// code and wire stride, precomputed by the caller (`stride` is read only for
+/// the Fixed arm).
 fn cell_to_py(
     py: Python<'_>,
     col: &ColData,
@@ -1257,7 +1258,7 @@ fn cell_to_py(
         return Ok(py.None());
     }
     Ok(match col {
-        ColData::Fixed(buf) => read_fixed_le(py, tc, &buf[row * stride..(row + 1) * stride]),
+        ColData::Fixed(buf) => fixed_value_to_py(py, tc, &buf[row * stride..(row + 1) * stride])?,
         ColData::Strings(v) => match &v[row] {
             Some(s) => s.into_pyobject(py)?.into_any().unbind(),
             None => py.None(),
@@ -1266,7 +1267,6 @@ fn cell_to_py(
             Some(b) => pyo3::types::PyBytes::new(py, b).into_any().unbind(),
             None => py.None(),
         },
-        ColData::U128s(v) => u128_value_to_py(py, v[row], tc)?,
     })
 }
 
@@ -1329,7 +1329,7 @@ fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, ro
     match loc {
         ColumnLocator::Pk { byte_off, size, .. } => {
             let w = batch.pks.col_window(row, byte_off as usize, size as usize);
-            pk_value_to_py(py, tc, w.as_slice())
+            fixed_value_to_py(py, tc, w.as_slice())
         }
         ColumnLocator::Payload { slot, size, .. } => {
             let is_null = null_word_get(batch.nulls[row], slot as usize);

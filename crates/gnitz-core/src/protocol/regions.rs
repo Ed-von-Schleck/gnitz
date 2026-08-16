@@ -18,8 +18,7 @@ use gnitz_wire::{as_le_bytes, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK};
 /// The buffers a `ZSetBatch` does **not** already hold in §6 region form: the
 /// OPK PK region (a [`PkColumn`] holds native LE values or on-wire LE bytes,
 /// never OPK) and the 16-byte German-string cells plus the blob arena they
-/// point into. `Fixed` and `U128s` columns *are* regions and are borrowed in
-/// place.
+/// point into. A `Fixed` column *is* a region and is borrowed in place.
 ///
 /// Hoist one above a loop over batches: these buffers keep their capacity
 /// across views. The region *list* itself is rebuilt per view.
@@ -85,7 +84,7 @@ impl ViewBuffers {
                     v.iter().map(|o| o.as_deref()),
                     &mut self.blob,
                 ),
-                ColData::Fixed(_) | ColData::U128s(_) => {}
+                ColData::Fixed(_) => {}
             }
         }
 
@@ -116,7 +115,6 @@ impl ViewBuffers {
             );
             let r: &[u8] = match cd {
                 ColData::Fixed(v) => v,
-                ColData::U128s(v) => as_le_bytes(v),
                 ColData::Strings(_) | ColData::Bytes(_) => &me.str_cols[pi],
             };
             assert_eq!(
@@ -375,7 +373,7 @@ mod tests {
                 ColData::Fixed(vec![]), // ci3: PK placeholder
                 ColData::Strings(vec![Some(C4[0].to_string()), Some(C4[1].to_string()), None]),
                 ColData::Bytes(vec![Some(C5[0].to_vec()), Some(C5[1].to_vec()), None]),
-                ColData::U128s(C6.to_vec()),
+                ColData::Fixed(C6.iter().flat_map(|v| v.to_le_bytes()).collect()),
             ],
         }
     }

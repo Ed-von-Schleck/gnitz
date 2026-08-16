@@ -58,7 +58,6 @@ fn assert_no_payload(reply: &ZSetBatch, reply_schema: &Schema) {
             ColData::Fixed(v) => v.is_empty(),
             ColData::Strings(v) => v.is_empty(),
             ColData::Bytes(v) => v.is_empty(),
-            ColData::U128s(v) => v.is_empty(),
         };
         assert!(empty, "PK slot {i} of a PK-only reply must stay an empty placeholder");
     }

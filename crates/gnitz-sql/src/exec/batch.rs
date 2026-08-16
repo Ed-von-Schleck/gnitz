@@ -302,7 +302,6 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
             (ColData::Fixed(s), ColData::Fixed(d)) => *d = s,
             (ColData::Strings(s), ColData::Strings(d)) => *d = s,
             (ColData::Bytes(s), ColData::Bytes(d)) => *d = s,
-            (ColData::U128s(s), ColData::U128s(d)) => *d = s,
             _ => unreachable!("mismatched ColData variants for column {new_ci}"),
         }
     }

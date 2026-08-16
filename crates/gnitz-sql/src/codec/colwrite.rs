@@ -74,12 +74,12 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
                                         .map_err(|_| GnitzSqlError::Bind(format!("invalid f64: {n}")))?;
                                     buf.extend_from_slice(&v.to_le_bytes());
                                 }
-                                // Integer columns (U8..I64); the sign is already folded into `n`,
-                                // so negated = false. Route through the single source of truth for
-                                // narrow-int literal acceptance (`pk_codec`) so the INSERT-value path
-                                // and PK-seek routing accept/reject identically. F32/F64 are handled
-                                // above; U128/UUID/I128 never back a `ColData::Fixed` column, so this
-                                // arm only ever sees a narrow int (`width() == wire_stride()`).
+                                // Every integer column, narrow (U8..I64) and wide
+                                // (U128/UUID/I128) alike: the sign is already folded into `n`, so
+                                // negated = false. Route through the single source of truth for
+                                // literal acceptance (`pk_codec`) so the INSERT-value path and
+                                // PK-seek routing accept/reject identically. The packed u128's low
+                                // `wire_stride()` bytes are the column's LE image at every width.
                                 _ => {
                                     let packed = parse_pk_literal_packed(tc, n, false).ok_or_else(|| {
                                         GnitzSqlError::Bind(format!("{tc:?} value out of range: {n}"))
@@ -87,13 +87,6 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
                                     buf.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
                                 }
                             }
-                            Ok(())
-                        }
-                        ColData::U128s(v) => {
-                            let val = n
-                                .parse::<u128>()
-                                .map_err(|_| GnitzSqlError::Bind(format!("invalid u128: {n}")))?;
-                            v.push(val);
                             Ok(())
                         }
                         ColData::Strings(_) => Err(GnitzSqlError::Bind("number literal for string column".to_string())),
@@ -105,8 +98,8 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
                         v.push(Some(s.clone()));
                         Ok(())
                     }
-                    ColData::U128s(v) if tc == TypeCode::UUID => {
-                        v.push(parse_uuid_str(s)?);
+                    ColData::Fixed(buf) if tc == TypeCode::UUID => {
+                        buf.extend_from_slice(&parse_uuid_str(s)?.to_le_bytes());
                         Ok(())
                     }
                     _ => Err(GnitzSqlError::Bind("string literal for non-string column".to_string())),
@@ -183,6 +176,14 @@ mod tests {
     use super::*;
     use crate::test_support::{num_expr, uuid_schema_payload, uuid_str_expr};
 
+    /// The lone UUID cell of a `Fixed` column, from its 16 LE bytes.
+    fn uuid_cell(col: &ColData) -> u128 {
+        let ColData::Fixed(b) = col else {
+            panic!("expected Fixed")
+        };
+        u128::from_le_bytes(b[..16].try_into().unwrap())
+    }
+
     #[test]
     fn test_null_append_insert_update_identical_all_variants() {
         let null_expr = Expr::value(Value::Null);
@@ -195,7 +196,11 @@ mod tests {
                 ColData::Strings(vec![None]),
             ),
             (ColData::Bytes(Vec::new()), TypeCode::Blob, ColData::Bytes(vec![None])),
-            (ColData::U128s(Vec::new()), TypeCode::UUID, ColData::U128s(vec![0u128])),
+            (
+                ColData::Fixed(Vec::new()),
+                TypeCode::UUID,
+                ColData::Fixed(vec![0u8; 16]),
+            ),
         ];
         for (empty, tc, expected) in cases {
             let mut via_insert = empty.clone();
@@ -293,11 +298,10 @@ mod tests {
             &uuid_str_expr("550e8400-e29b-41d4-a716-446655440000"),
         )
         .unwrap();
-        if let ColData::U128s(v) = &batch.columns[1] {
-            assert_eq!(v[0], 0x550e8400_e29b_41d4_a716_446655440000_u128);
-        } else {
-            panic!("expected U128s");
-        }
+        assert_eq!(
+            uuid_cell(&batch.columns[1]),
+            0x550e8400_e29b_41d4_a716_446655440000_u128
+        );
     }
 
     #[test]
@@ -306,10 +310,6 @@ mod tests {
         let mut batch = gnitz_core::ZSetBatch::new(&schema);
         let big_val: u128 = 0x550e8400_e29b_41d4_a716_446655440000_u128;
         append_value_to_col(&mut batch.columns[1], TypeCode::UUID, &num_expr(&big_val.to_string())).unwrap();
-        if let ColData::U128s(v) = &batch.columns[1] {
-            assert_eq!(v[0], big_val);
-        } else {
-            panic!("expected U128s");
-        }
+        assert_eq!(uuid_cell(&batch.columns[1]), big_val);
     }
 }

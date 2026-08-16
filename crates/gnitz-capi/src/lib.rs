@@ -421,13 +421,6 @@ fn append_row_inner(
                     "col {ci} is a BLOB column; not yet supported in C API row writer"
                 ));
             }
-            ColData::U128s(v) => {
-                if offset + 16 > col_data.len() {
-                    return Err(format!("col_data too short for U128 at col {ci}"));
-                }
-                v.push(u128::from_le_bytes(col_data[offset..offset + 16].try_into().unwrap()));
-                offset += 16;
-            }
         }
     }
     Ok(())

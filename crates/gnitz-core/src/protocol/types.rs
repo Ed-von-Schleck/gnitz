@@ -740,14 +740,15 @@ impl std::fmt::Debug for PkTuple {
 /// Per-column payload data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColData {
-    /// Raw little-endian bytes; length = count * wire_stride (for all non-String, non-U128, non-Blob).
+    /// Raw little-endian bytes; length = count * wire_stride. Covers every
+    /// fixed-width type, the 16-byte ones (U128/UUID/I128) included — a u128's
+    /// native LE bytes are exactly its wire region.
     Fixed(Vec<u8>),
     Strings(Vec<Option<std::string::String>>),
     /// Variable-length raw byte payloads. Same on-wire encoding as `Strings`
     /// (16-byte German-string struct + blob arena spill) but the bytes are
     /// not constrained to be valid UTF-8.
     Bytes(Vec<Option<Vec<u8>>>),
-    U128s(Vec<u128>),
 }
 
 impl ColData {
@@ -775,10 +776,6 @@ impl ColData {
                 let ColData::Bytes(d) = dst else { variant_mismatch() };
                 d.push(s[idx].clone());
             }
-            ColData::U128s(s) => {
-                let ColData::U128s(d) = dst else { variant_mismatch() };
-                d.push(s[idx]);
-            }
         }
     }
 
@@ -797,12 +794,12 @@ impl ColData {
                 let ColData::Bytes(d) = dst else { variant_mismatch() };
                 d.push(s[idx].take());
             }
-            ColData::Fixed(_) | ColData::U128s(_) => self.push_row_from(idx, fixed_stride, dst),
+            ColData::Fixed(_) => self.push_row_from(idx, fixed_stride, dst),
         }
     }
 
     /// Append a SQL NULL cell for a column of wire type `tc`. The single NULL
-    /// encoding across all four variants: fixed-width columns get zero filler
+    /// encoding across all three variants: fixed-width columns get zero filler
     /// (the null bitmap is the NULL source of truth, §6), German strings a
     /// `None` cell.
     pub fn push_null(&mut self, tc: TypeCode) {
@@ -810,21 +807,18 @@ impl ColData {
             ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
             ColData::Strings(v) => v.push(None),
             ColData::Bytes(v) => v.push(None),
-            ColData::U128s(v) => v.push(0u128),
         }
     }
 
     /// The empty column of the canonical variant for wire type `tc` — the single
     /// TypeCode→variant choice ([`ZSetBatch::filler_columns`], the appenders and
-    /// [`Self::matches_type`] all build on it). The wide arm goes through
-    /// `is_wide_int` rather than listing the three codes, so a newly added
-    /// 16-byte type cannot fall into the `Fixed` catch-all unnoticed.
+    /// [`Self::matches_type`] all build on it). The only question is whether the
+    /// type uses the German-string layout; everything else is raw LE bytes.
     #[inline(always)]
     pub fn empty_for(tc: TypeCode) -> Self {
         match tc {
             TypeCode::String => ColData::Strings(vec![]),
             TypeCode::Blob => ColData::Bytes(vec![]),
-            _ if tc.is_wide_int() => ColData::U128s(vec![]),
             _ => ColData::Fixed(vec![]),
         }
     }
@@ -839,7 +833,7 @@ impl ColData {
 
     /// Append one zero-filled **non-null** cell for a column of wire type `tc` —
     /// the single filler-cell encoding: a fixed column gets zero bytes, a German
-    /// string/blob an empty `Some` cell, a U128 a `0`. Used per-row for the
+    /// string/blob an empty `Some` cell. Used per-row for the
     /// `ALTER … DROP COLUMN` hidden slot (§6) and in bulk by
     /// [`ZSetBatch::filler_columns`]. Differs from [`Self::push_null`] only for
     /// Strings/Bytes (`Some("")` vs `None`): the null bit stays **unset**, so the
@@ -850,7 +844,6 @@ impl ColData {
             ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
             ColData::Strings(v) => v.push(Some(std::string::String::new())),
             ColData::Bytes(v) => v.push(Some(Vec::new())),
-            ColData::U128s(v) => v.push(0u128),
         }
     }
 }
@@ -929,7 +922,6 @@ impl ZSetBatch {
                 ColData::Fixed(v) => v.reserve(n * col.type_code.wire_stride()),
                 ColData::Strings(v) => v.reserve(n),
                 ColData::Bytes(v) => v.reserve(n),
-                ColData::U128s(v) => v.reserve(n),
             }
         }
         b
@@ -985,7 +977,6 @@ impl ZSetBatch {
                 (ColData::Fixed(a), ColData::Fixed(b)) => a.append(b),
                 (ColData::Strings(a), ColData::Strings(b)) => a.append(b),
                 (ColData::Bytes(a), ColData::Bytes(b)) => a.append(b),
-                (ColData::U128s(a), ColData::U128s(b)) => a.append(b),
                 _ => panic!("extend_from_owned: column type mismatch"),
             }
         }
@@ -1009,7 +1000,6 @@ impl ZSetBatch {
                 }
                 ColData::Strings(v) => v.truncate(n),
                 ColData::Bytes(v) => v.truncate(n),
-                ColData::U128s(v) => v.truncate(n),
             }
         }
     }
@@ -1079,7 +1069,6 @@ impl ZSetBatch {
                 ColData::Fixed(b) => (b.len(), n * col_def.type_code.wire_stride()),
                 ColData::Strings(v) => (v.len(), n),
                 ColData::Bytes(v) => (v.len(), n),
-                ColData::U128s(v) => (v.len(), n),
             };
             if got != want {
                 return Err(format!("column {ci}: length {got} != expected {want}"));
@@ -1265,12 +1254,13 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
-    /// Append a u128 value to the next U128s column.
+    /// Append a u128 value to the next Fixed column: its 16 native LE bytes,
+    /// which are the column's wire region (U128/UUID/I128).
     pub fn u128_val(&mut self, v: u128) -> &mut Self {
         let ci = self.col_index();
         match &mut self.batch.columns[ci] {
-            ColData::U128s(vec) => vec.push(v),
-            _ => panic!("BatchAppender: u128_val called on non-U128s column at schema index {ci}"),
+            ColData::Fixed(buf) => buf.extend_from_slice(&v.to_le_bytes()),
+            _ => panic!("BatchAppender: u128_val called on non-Fixed column at schema index {ci}"),
         }
         self.cursor += 1;
         self
@@ -1944,11 +1934,10 @@ mod tests {
         BatchAppender::new(&mut batch, &schema)
             .add_row(1u128, 1)
             .u128_val(((0xBEEF_u128) << 64) | 0xDEAD);
-        if let ColData::U128s(v) = &batch.columns[1] {
-            assert_eq!(v[0], ((0xBEEF_u128) << 64) | 0xDEAD);
-        } else {
-            panic!("expected U128s");
-        }
+        let ColData::Fixed(b) = &batch.columns[1] else {
+            panic!("expected Fixed");
+        };
+        assert_eq!(b, &(((0xBEEF_u128) << 64) | 0xDEAD).to_le_bytes());
     }
 
     #[test]
@@ -2095,8 +2084,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "u128_val called on non-U128s")]
-    fn test_appender_type_mismatch_u128_on_fixed() {
+    #[should_panic(expected = "u128_val called on non-Fixed")]
+    fn test_appender_type_mismatch_u128_on_strings() {
+        let schema = Schema {
+            columns: vec![
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("s", TypeCode::String, false),
+            ],
+            pk_cols: vec![0],
+        };
+        let mut batch = ZSetBatch::new(&schema);
+        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u128_val(1);
+    }
+
+    /// A 16-byte write into an 8-byte column shares the `Fixed` variant, so the
+    /// appender cannot see it; the region length is what disagrees, and
+    /// `validate` is where that surfaces.
+    #[test]
+    fn test_appender_wide_value_in_narrow_column_fails_validate() {
         let schema = Schema {
             columns: vec![
                 ColumnDef::new("pk", TypeCode::U64, false),
@@ -2106,6 +2111,8 @@ mod tests {
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).u128_val(1);
+        let err = batch.validate(&schema).expect_err("16 bytes in an 8-byte column");
+        assert!(err.contains("length 16 != expected 8"), "unexpected error: {err}");
     }
 
     #[test]

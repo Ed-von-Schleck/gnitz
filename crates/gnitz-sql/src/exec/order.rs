@@ -73,7 +73,7 @@ impl SortKey {
 
 /// Whether the key's column is SQL NULL at row `i` (a PK column's mask is `0`).
 /// The bitmap is the single NULL source across every `ColData` variant — a
-/// `Fixed`/`U128s` NULL is zero-filled filler with no per-value sentinel.
+/// a `Fixed` NULL is zero-filled filler with no per-value sentinel.
 fn col_is_null(batch: &ZSetBatch, key: &SortKey, i: usize) -> bool {
     batch.nulls[i] & key.null_mask != 0
 }
@@ -99,7 +99,6 @@ fn cmp_col_value(batch: &ZSetBatch, key: &SortKey, ra: usize, rb: usize) -> Orde
             let s = key.stride;
             cmp_typed_le(&buf[ra * s..ra * s + s], &buf[rb * s..rb * s + s], key.tc as u8)
         }
-        ColData::U128s(v) => cmp_typed_le(&v[ra].to_le_bytes(), &v[rb].to_le_bytes(), key.tc as u8),
         ColData::Strings(v) => v[ra]
             .as_deref()
             .unwrap_or("")
@@ -809,8 +808,8 @@ mod tests {
             b.pks.push_u128(pk);
             b.weights.push(1);
             b.nulls.push(if u.is_none() { 1 } else { 0 });
-            if let ColData::U128s(v) = &mut b.columns[1] {
-                v.push(u.unwrap_or(0));
+            if let ColData::Fixed(v) = &mut b.columns[1] {
+                v.extend_from_slice(&u.unwrap_or(0).to_le_bytes());
             }
         };
         push(1, Some(5));

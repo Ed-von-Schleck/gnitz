@@ -256,19 +256,6 @@ fn decode_wal_block_impl(
                 ColData::Strings(vals)
             }
             TypeCode::Blob => ColData::Bytes(decode_german_col(data, reg_off, blob, &nulls, pi, count)?),
-            _ if col.type_code.is_wide_int() => {
-                // Native u128 LE layout is byte-identical to the region; the
-                // extent is dominated by the size + directory checks, so bulk-
-                // copy the whole region rather than reading each row.
-                let mut vals: Vec<u128> = vec![0u128; count];
-                // SAFETY: `reg_off + count*16 <= total_size <= data.len()`
-                // (region-size check + directory bound); `vals` has room for
-                // `count*16` bytes. Distinct, non-overlapping regions.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data[reg_off..].as_ptr(), vals.as_mut_ptr() as *mut u8, count * 16);
-                }
-                ColData::U128s(vals)
-            }
             _ => ColData::Fixed(data[reg_off..reg_off + reg_sz].to_vec()),
         };
     }
@@ -318,6 +305,22 @@ mod tests {
             ],
             pk_cols: vec![0],
         }
+    }
+
+    /// A 16-byte-int payload column from its values — the LE image the region
+    /// holds, which is what `ColData::Fixed` stores at any width.
+    fn wide_col(vals: &[u128]) -> ColData {
+        ColData::Fixed(vals.iter().flat_map(|v| v.to_le_bytes()).collect())
+    }
+
+    /// Read a 16-byte-int payload column back out as values.
+    fn wide_vals(col: &ColData) -> Vec<u128> {
+        let ColData::Fixed(b) = col else {
+            panic!("expected Fixed")
+        };
+        b.chunks_exact(16)
+            .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
+            .collect()
     }
 
     fn u128_schema() -> Schema {
@@ -508,7 +511,7 @@ mod tests {
             pks: PkColumn::U128s(vals.clone()),
             weights: vec![1; n],
             nulls: vec![0; n],
-            columns: vec![ColData::Fixed(vec![]), ColData::U128s(vals.clone())],
+            columns: vec![ColData::Fixed(vec![]), wide_col(&vals)],
         };
 
         let encoded = encode_wal_block(&schema, 1, &batch);
@@ -518,10 +521,7 @@ mod tests {
             matches!(decoded.pks, PkColumn::U128s(_)),
             "U128 schema must decode to PkColumn::U128s (no variant drift)"
         );
-        match &decoded.columns[1] {
-            ColData::U128s(got) => assert_eq!(got, &vals),
-            _ => panic!("expected U128s"),
-        }
+        assert_eq!(wide_vals(&decoded.columns[1]), vals);
     }
 
     /// A schema whose lone PK column is the signed-128 join-key type `I128`,
@@ -567,7 +567,7 @@ mod tests {
             pks: PkColumn::U128s(bits.clone()),
             weights: vec![1; n],
             nulls: vec![0; n],
-            columns: vec![ColData::Fixed(vec![]), ColData::U128s(bits.clone())],
+            columns: vec![ColData::Fixed(vec![]), wide_col(&bits)],
         };
 
         let encoded = encode_wal_block(&schema, 3, &batch);
@@ -583,14 +583,9 @@ mod tests {
         let got_pk: Vec<i128> = pk_bits.iter().map(|&x| x as i128).collect();
         assert_eq!(got_pk, signed, "I128 PK sign-flip must round-trip");
 
-        // The I128 payload arm must decode to U128s with the exact native bits.
-        match &decoded.columns[1] {
-            ColData::U128s(got) => {
-                let got_signed: Vec<i128> = got.iter().map(|&x| x as i128).collect();
-                assert_eq!(got_signed, signed, "I128 payload must round-trip");
-            }
-            other => panic!("I128 payload must decode to U128s, got {other:?}"),
-        }
+        // The I128 payload must decode with the exact native bits.
+        let got_signed: Vec<i128> = wide_vals(&decoded.columns[1]).into_iter().map(|x| x as i128).collect();
+        assert_eq!(got_signed, signed, "I128 payload must round-trip");
     }
 
     #[test]
@@ -681,7 +676,7 @@ mod tests {
             pks: PkColumn::U128s(pks.clone()),
             weights: vec![1; n],
             nulls: vec![0; n],
-            columns: vec![ColData::Fixed(vec![]), ColData::U128s(pks.clone())],
+            columns: vec![ColData::Fixed(vec![]), wide_col(&pks)],
         };
         let encoded = encode_wal_block(&schema, 0, &batch);
 
