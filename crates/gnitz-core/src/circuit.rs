@@ -106,10 +106,9 @@ impl Circuit {
 /// Fluent builder for DBSP circuit graphs, producing a typed [`Circuit`]
 /// for `GnitzClient::create_view_with_circuit`.
 ///
-/// Sequential `node_id`s start at 1 (mirroring the legacy slot encoding's
-/// 40-bit cap). `primary_source_id` is the table_id passed to the first
-/// `input_delta()` call so legacy callers don't have to thread it through
-/// every method invocation.
+/// Sequential `node_id`s start at 1. `primary_source_id` is fixed at
+/// construction and becomes the source of every `input_delta()` node, so it is
+/// not threaded through each call; `input_delta_tagged` names its own source.
 #[derive(Clone)]
 pub struct CircuitBuilder {
     view_id: u64,

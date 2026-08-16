@@ -578,8 +578,8 @@ mod tests {
     fn region_builder_rejects_a_batch_whose_coldata_contradicts_the_schema() {
         let schema = fixture_a_schema();
         let mut batch = fixture_a_batch();
-        // The one fault `ZSetBatch::validate` structurally cannot see: it
-        // matches on the variant it finds, never against the declared type.
+        // The region builder's own guard, for a batch that never went through
+        // `ZSetBatch::validate` — which states the same rule for the push path.
         batch.columns[4] = ColData::Fixed(vec![0u8; 3 * 16]);
         let mut bufs = ViewBuffers::default();
         let _ = bufs.view(&batch, &schema);

@@ -162,11 +162,12 @@ impl Schema {
             .sum()
     }
 
-    /// The single PK column index. Use only at boundaries that have not yet
-    /// been generalized (format encoders, catalog serialization, SQL parser
-    /// path, wire/client BatchAppender). Hard-asserts length-1: a
-    /// `debug_assert!` would compile out in release and let the silent
-    /// truncation to the first PK column ship to production.
+    /// The single PK column index. Use only where a compound PK has already
+    /// been ruled out by the caller — the remaining production callers are in
+    /// the SQL planner (`ddl::table`'s lone-PK foreign-key check, `dml::insert`'s
+    /// conflict-target name lookup). Hard-asserts length-1: a `debug_assert!`
+    /// would compile out in release and let the silent truncation to the first
+    /// PK column ship to production.
     #[inline]
     #[track_caller]
     pub fn pk_index_single(&self) -> usize {
