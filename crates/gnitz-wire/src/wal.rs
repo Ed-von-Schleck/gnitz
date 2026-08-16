@@ -255,6 +255,24 @@ pub fn encode(
     Ok(out_offset + total_size)
 }
 
+/// The WAL block starting at `off`, sized by its own `SIZE` field.
+///
+/// Every framed decoder walks a run of concatenated blocks this way — control,
+/// then schema, then data — so the bounds rule lives here rather than at each
+/// step. A declared size below the header length is rejected here, where the
+/// cause is legible, instead of reaching [`validate_and_parse`] as a truncated
+/// block or a caller as a short slice.
+pub fn block_slice_at(data: &[u8], off: usize) -> Result<&[u8], WalError> {
+    if off + WAL_HEADER_SIZE > data.len() {
+        return Err(WalError::Truncated);
+    }
+    let size = read_u32_le(data, off + WAL_OFF_SIZE) as usize;
+    if size < WAL_HEADER_SIZE || off + size > data.len() {
+        return Err(WalError::Truncated);
+    }
+    Ok(&data[off..off + size])
+}
+
 /// Validate a WAL block and extract its header + directory entries.
 ///
 /// On success: the returned [`WalBlockHeader`] carries the header fields, the

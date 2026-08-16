@@ -28,15 +28,28 @@ pub enum WalError {
     InvalidShard,
 }
 
-impl fmt::Display for WalError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
+impl WalError {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
             WalError::Truncated => "truncated",
             WalError::InvalidVersion => "invalid version",
             WalError::ChecksumMismatch => "checksum mismatch",
             WalError::BufferTooSmall => "buffer too small",
             WalError::InvalidShard => "invalid shard layout",
-        };
-        f.write_str(s)
+        }
+    }
+}
+
+impl fmt::Display for WalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Lets the engine's `Result<_, &'static str>` decoders take a `WalError`
+/// through `?` without a per-call-site `map_err`.
+impl From<WalError> for &'static str {
+    fn from(e: WalError) -> Self {
+        e.as_str()
     }
 }

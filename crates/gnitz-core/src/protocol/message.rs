@@ -346,12 +346,9 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         return Err(ProtocolError::DecodeError("message too small".into()));
     }
 
-    let ctrl_size = gnitz_wire::read_u32_le(buf, gnitz_wire::WAL_OFF_SIZE) as usize;
-    if ctrl_size > buf.len() {
-        return Err(ProtocolError::DecodeError("control block truncated".into()));
-    }
-
-    let (ctrl_header, error_msg, seek_pk_extra) = decode_control_block(&buf[..ctrl_size])?;
+    let ctrl = gnitz_wire::wal::block_slice_at(buf, 0)?;
+    let ctrl_size = ctrl.len();
+    let (ctrl_header, error_msg, seek_pk_extra) = decode_control_block(ctrl)?;
 
     let flags = ctrl_header.flags;
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
@@ -361,17 +358,10 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
     let mut wire_schema: Option<Schema> = None;
 
     if has_schema {
-        if off + WAL_BLOCK_HEADER_SIZE > buf.len() {
-            return Err(ProtocolError::DecodeError("schema block header truncated".into()));
-        }
-        let sz = gnitz_wire::read_u32_le(buf, off + gnitz_wire::WAL_OFF_SIZE) as usize;
-        if off + sz > buf.len() {
-            return Err(ProtocolError::DecodeError("schema block truncated".into()));
-        }
-        let ms = meta_schema();
-        let (sbatch, _) = decode_wal_block(&buf[off..off + sz], ms)?;
+        let block = gnitz_wire::wal::block_slice_at(buf, off)?;
+        off += block.len();
+        let (sbatch, _) = decode_wal_block(block, meta_schema())?;
         wire_schema = Some(batch_to_schema(&sbatch)?);
-        off += sz;
     } else if has_data {
         match schema_hint {
             None => {
@@ -398,14 +388,7 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
                 .map(|(s, _)| s)
                 .ok_or_else(|| ProtocolError::DecodeError("no schema for data block".into()))?,
         };
-        if off + WAL_BLOCK_HEADER_SIZE > buf.len() {
-            return Err(ProtocolError::DecodeError("data block header truncated".into()));
-        }
-        let sz = gnitz_wire::read_u32_le(buf, off + gnitz_wire::WAL_OFF_SIZE) as usize;
-        if off + sz > buf.len() {
-            return Err(ProtocolError::DecodeError("data block truncated".into()));
-        }
-        let (batch, _) = decode_wal_block(&buf[off..off + sz], eff)?;
+        let (batch, _) = decode_wal_block(gnitz_wire::wal::block_slice_at(buf, off)?, eff)?;
         Some(batch)
     } else {
         None

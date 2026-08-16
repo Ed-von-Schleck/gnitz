@@ -59,8 +59,6 @@ pub(crate) fn layout_from_wire_flags(flags: u64) -> crate::storage::Layout {
     }
 }
 
-// WAL block header field offsets, shared with storage/lsm/wal.rs.
-pub(crate) use gnitz_wire::WAL_OFF_SIZE;
 use gnitz_wire::WAL_OFF_TID;
 
 // ---------------------------------------------------------------------------
@@ -623,7 +621,7 @@ pub(crate) fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<
 /// malicious client cannot forge a directory that points the auth check at
 /// one offset and the decoder at another).
 pub fn peek_client_control(data: &[u8]) -> Result<DecodedControl, &'static str> {
-    let ctrl = wal_block_slice_at(data, 0)?;
+    let ctrl = gnitz_wire::wal::block_slice_at(data, 0)?;
     peek_control_block(ctrl)
 }
 
@@ -644,31 +642,13 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
     decode_wire_impl(data, None, true)
 }
 
-/// Read the length-prefixed WAL block at `off` in `data`: confirm the header is
-/// present, read the block's total size (`WAL_OFF_SIZE`), confirm the block fits,
-/// and return its slice. Every framed decoder walks concatenated blocks this way
-/// — the schema block, the data block, each DDL_TXN family — so the bounds check
-/// lives in one place; callers advance `off` by the returned slice's `len()`. The
-/// header-present check precedes the size read, so the 4-byte field access is
-/// always in range.
-fn wal_block_slice_at(data: &[u8], off: usize) -> Result<&[u8], &'static str> {
-    if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
-        return Err("WAL block header truncated");
-    }
-    let size = gnitz_wire::read_u32_le(data, off + WAL_OFF_SIZE) as usize;
-    if size < gnitz_wire::WAL_HEADER_SIZE || off + size > data.len() {
-        return Err("WAL block truncated");
-    }
-    Ok(&data[off..off + size])
-}
-
 /// Walk a transaction frame's shared prologue — control block, then the `u32`
 /// family count — returning `(count, offset of the first family, capacity hint)`.
 /// The hint bounds `count` by what the remaining bytes can physically hold
 /// (`min_family_bytes` is the least a single family can encode to), so a hostile
 /// count cannot force a giant pre-allocation on an ingress-capped frame.
 fn txn_frame_prologue(data: &[u8], min_family_bytes: usize) -> Result<(usize, usize, usize), &'static str> {
-    let ctrl = wal_block_slice_at(data, 0)?;
+    let ctrl = gnitz_wire::wal::block_slice_at(data, 0)?;
     peek_control_block(ctrl)?;
     let off = ctrl.len();
     if off + 4 > data.len() {
@@ -692,7 +672,7 @@ pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(i64, &[u8])>, &'static str> {
     let (count, mut off, cap) = txn_frame_prologue(data, gnitz_wire::WAL_HEADER_SIZE)?;
     let mut families = Vec::with_capacity(cap);
     for _ in 0..count {
-        let block = wal_block_slice_at(data, off)?;
+        let block = gnitz_wire::wal::block_slice_at(data, off)?;
         let tid = gnitz_wire::read_u32_le(block, WAL_OFF_TID) as i64;
         families.push((tid, block));
         off += block.len();
@@ -737,9 +717,9 @@ pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, &'static str> 
         }
         let mode = data[off];
         off += 1;
-        let schema_block = wal_block_slice_at(data, off)?;
+        let schema_block = gnitz_wire::wal::block_slice_at(data, off)?;
         off += schema_block.len();
-        let wal_block = wal_block_slice_at(data, off)?;
+        let wal_block = gnitz_wire::wal::block_slice_at(data, off)?;
         let tid = gnitz_wire::read_u32_le(wal_block, WAL_OFF_TID) as i64;
         off += wal_block.len();
         families.push(TxnFamilyWire {
@@ -813,7 +793,7 @@ fn decode_wire_impl(
     schema_hint: Option<SchemaWithVersion<'_>>,
     verify_checksum: bool,
 ) -> Result<DecodedWire, &'static str> {
-    let ctrl = wal_block_slice_at(data, 0)?;
+    let ctrl = gnitz_wire::wal::block_slice_at(data, 0)?;
     let control = if verify_checksum {
         peek_control_block(ctrl)?
     } else {
@@ -880,7 +860,7 @@ fn decode_wire_body(
     }
 
     if has_schema {
-        let sblock = wal_block_slice_at(data, off)?;
+        let sblock = gnitz_wire::wal::block_slice_at(data, off)?;
         let parsed = decode_schema_block(sblock, verify_checksum)?;
         // Integrity cross-check against hint even when versions match.
         if let Some(ref hint) = schema_hint {
@@ -896,7 +876,7 @@ fn decode_wire_body(
 
     let data_batch = if has_data {
         let eff_schema = wire_schema.as_ref().ok_or("no schema for data block")?;
-        let dblock = wal_block_slice_at(data, off)?;
+        let dblock = gnitz_wire::wal::block_slice_at(data, off)?;
         let (mut batch, _) = Batch::decode_from_wal_block(dblock, eff_schema, verify_checksum)?;
         // The constructor defaults `Raw`; raise to the wire's claim, debug-verifying
         // the decoded data against it (the backstop against a lying frame).
@@ -939,14 +919,14 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     }
 
     if has_schema {
-        let sblock = wal_block_slice_at(data, off)?;
+        let sblock = gnitz_wire::wal::block_slice_at(data, off)?;
         wire_schema = Some(decode_schema_block(sblock, false)?);
         off += sblock.len();
     }
 
     let data_batch = if has_data {
         let eff_schema = wire_schema.as_ref().ok_or("no schema for data block")?;
-        let dblock = wal_block_slice_at(data, off)?;
+        let dblock = gnitz_wire::wal::block_slice_at(data, off)?;
         let mb = crate::storage::decode_mem_batch_from_wal_block(dblock, eff_schema)?;
         Some(mb)
     } else {
