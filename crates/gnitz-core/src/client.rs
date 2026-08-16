@@ -1164,10 +1164,9 @@ impl GnitzClient {
                 // 2–4. Materialise the typed circuit into the three-table bundle.
                 //
                 // Every circuit PK in `append_circuit_rows` is `(view_id, sub)`
-                // with view_id in the LOW u128 half: the multi-column
-                // `PkColumn::Bytes` arm OPK-encodes each 8-byte column
-                // independently, low bytes first, so view_id lands in the
-                // leading at-rest bytes. The engine prefix-seeks a view's rows
+                // with view_id in the LOW u128 half: the PK region OPK-encodes
+                // each 8-byte column independently, low bytes first, so view_id
+                // lands in the leading at-rest bytes. The engine prefix-seeks a view's rows
                 // on `view_id.to_be_bytes()`; packing `(vid << 64) | sub`
                 // instead puts `sub` there and breaks every view load.
                 let rows = pv.circuit.into_rows();
@@ -2002,7 +2001,7 @@ mod tests {
         let s = kv_schema();
         let mut buf = TxnBuffer::default();
         let tid = 16u64;
-        buf.delete(tid, &s, PkColumn::U64s(vec![7]));
+        buf.delete(tid, &s, PkColumn::from_u128s(8, [7]));
         buf.push_with_mode(tid, &s, &ins(&s, 7, 70), WireConflictMode::Error);
         assert_eq!(buf.families.len(), 2);
         assert_eq!(buf.families[0].3, WireConflictMode::Update);
@@ -2035,7 +2034,7 @@ mod tests {
         buf.push(tid, &s, &ins(&s, 1, 10)); // new family 0, row 0
         buf.push(tid, &s, &ins(&s, 2, 20)); // extends family 0, row 1
         buf.push_with_mode(tid, &s, &ins(&s, 3, 30), WireConflictMode::Error); // family 1, row 0
-        buf.delete(tid, &s, PkColumn::U64s(vec![1])); // family 2, row 0 — supersedes pk=1
+        buf.delete(tid, &s, PkColumn::from_u128s(8, [1])); // family 2, row 0 — supersedes pk=1
 
         let val = |pk: u64| {
             let (b, row) = buf.last_op(tid, &PkTuple::from_u128(8, pk as u128)).unwrap();

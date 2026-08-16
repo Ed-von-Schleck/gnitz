@@ -99,7 +99,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{meta_schema, ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
+    use crate::protocol::types::{meta_schema, ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
     use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
 
     // ── type_code_from_u64 error paths ──────────────────────────────────────
@@ -138,6 +138,13 @@ mod tests {
     /// Routes through the real `schema_to_batch` encoder so the META_SCHEMA layout
     /// is defined in exactly one place; the error-path tests then corrupt the
     /// returned batch to exercise `batch_to_schema`'s validation.
+    /// Overwrite row `row`'s PK in place — the error-path tests corrupt the
+    /// col_idx key to exercise `batch_to_schema`'s validation.
+    fn set_pk(batch: &mut ZSetBatch, row: usize, v: u64) {
+        let s = batch.pks.stride as usize;
+        batch.pks.buf[row * s..(row + 1) * s].copy_from_slice(&v.to_le_bytes()[..s]);
+    }
+
     fn make_meta_batch(ncols: usize) -> ZSetBatch {
         let schema = Schema {
             columns: (0..ncols)
@@ -166,9 +173,8 @@ mod tests {
     fn test_batch_to_schema_col_idx_out_of_order() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        if let PkColumn::U64s(v) = &mut batch.pks {
-            v.swap(0, 1); // [1, 0] instead of [0, 1]
-        }
+        set_pk(&mut batch, 0, 1); // [1, 0] instead of [0, 1]
+        set_pk(&mut batch, 1, 0);
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
@@ -177,9 +183,7 @@ mod tests {
     fn test_batch_to_schema_col_idx_gap() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        if let PkColumn::U64s(v) = &mut batch.pks {
-            v[1] = 5; // gap: [0, 5]
-        }
+        set_pk(&mut batch, 1, 5); // gap: [0, 5]
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }
@@ -188,9 +192,7 @@ mod tests {
     fn test_batch_to_schema_col_idx_duplicate() {
         use crate::protocol::error::ProtocolError;
         let mut batch = make_meta_batch(2);
-        if let PkColumn::U64s(v) = &mut batch.pks {
-            v[1] = 0; // duplicate: [0, 0]
-        }
+        set_pk(&mut batch, 1, 0); // duplicate: [0, 0]
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
     }

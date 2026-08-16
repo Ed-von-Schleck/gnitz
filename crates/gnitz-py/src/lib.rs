@@ -1172,14 +1172,16 @@ fn write_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> P
 }
 
 /// Materialize a `PkColumn` as a Python list. A single-column key surfaces as
-/// that column's own Python type — decoded through [`pk_value_from_tuple`], the
-/// same decoder the row path uses, so `batch.pks[i]` and `row[pk_col]` can never
-/// disagree about sign or UUID rendering. A compound (`Bytes`) key surfaces as
-/// `bytes`: one packed PK region per row.
+/// that column's own Python type — decoded through the same address the row
+/// path uses, so `batch.pks[i]` and `row[pk_col]` can never disagree about sign
+/// or UUID rendering. A compound key surfaces as `bytes`: one packed PK region
+/// per row.
 fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, batch: &ZSetBatch) -> PyResult<Py<PyList>> {
-    if let PkColumn::Bytes { stride, buf } = &batch.pks {
-        let items: Vec<Py<PyAny>> = buf
-            .chunks_exact(*stride as usize)
+    if schema.pk_count() >= 2 {
+        let items: Vec<Py<PyAny>> = batch
+            .pks
+            .buf
+            .chunks_exact(batch.pks.stride as usize)
             .map(|c| pyo3::types::PyBytes::new(py, c).into_any().unbind())
             .collect();
         return Ok(PyList::new(py, items)?.unbind());
@@ -1329,7 +1331,7 @@ fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, ro
     match loc {
         ColumnLocator::Pk { byte_off, size, .. } => {
             let w = batch.pks.col_window(row, byte_off as usize, size as usize);
-            fixed_value_to_py(py, tc, w.as_slice())
+            fixed_value_to_py(py, tc, w)
         }
         ColumnLocator::Payload { slot, size, .. } => {
             let is_null = null_word_get(batch.nulls[row], slot as usize);

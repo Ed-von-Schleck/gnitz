@@ -634,7 +634,7 @@ mod tests {
         // Slot 0 = g, slot 1 = MIN(sm), slot 2 = COUNT. Group 1 nulls g and MIN.
         assert_eq!(got.nulls, vec![0, 0b011]);
         // `_group_pk` is the dense group ordinal.
-        assert_eq!(got.pks, PkColumn::U128s(vec![0, 1]));
+        assert_eq!(got.pks, PkColumn::from_u128s(16, [0, 1]));
         // g: the copied value, then `push_null`'s zero filler.
         assert_eq!(
             fixed(&got.columns[1]),

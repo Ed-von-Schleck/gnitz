@@ -4,7 +4,7 @@ use crate::ast_util::{
 };
 use crate::bind::find_unique_column;
 use crate::error::GnitzSqlError;
-use gnitz_core::{null_word_get, null_word_set, ColData, PkColumn, Schema, ZSetBatch};
+use gnitz_core::{null_word_get, null_word_set, ColData, Schema, ZSetBatch};
 use sqlparser::ast::SelectItem;
 
 /// One schema's payload copy plan: each payload column's index and wire stride,
@@ -218,36 +218,13 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
             })
             .collect();
 
-        match &mut new_batch.pks {
-            PkColumn::Bytes { buf, .. } => {
-                buf.reserve(row_count * new_schema.pk_stride());
-                for i in 0..row_count {
-                    let row = src_pks.get_tuple(i, src_stride as u8);
-                    for &(col_off, stride) in &pk_mappings {
-                        buf.extend_from_slice(&row.buf[col_off..col_off + stride]);
-                    }
-                }
-            }
-            PkColumn::U64s(v) => {
-                // Destination is single-PK → exactly one mapping.
-                let (col_off, stride) = pk_mappings[0];
-                v.reserve(row_count);
-                for i in 0..row_count {
-                    let row = src_pks.get_tuple(i, src_stride as u8);
-                    let mut b = [0u8; 8];
-                    b[..stride].copy_from_slice(&row.buf[col_off..col_off + stride]);
-                    v.push(u64::from_le_bytes(b));
-                }
-            }
-            PkColumn::U128s(v) => {
-                let (col_off, stride) = pk_mappings[0];
-                v.reserve(row_count);
-                for i in 0..row_count {
-                    let row = src_pks.get_tuple(i, src_stride as u8);
-                    let mut b = [0u8; 16];
-                    b[..stride].copy_from_slice(&row.buf[col_off..col_off + stride]);
-                    v.push(u128::from_le_bytes(b));
-                }
+        // Every arity is the same walk: for each destination PK column, copy its
+        // bytes out of the source tuple at that column's offset.
+        new_batch.pks.buf.reserve(row_count * new_schema.pk_stride());
+        for i in 0..row_count {
+            let row = src_pks.get_tuple(i, src_stride as u8);
+            for &(col_off, stride) in &pk_mappings {
+                new_batch.pks.buf.extend_from_slice(&row.buf[col_off..col_off + stride]);
             }
         }
     }
@@ -331,11 +308,7 @@ mod tests {
         let mut dst = ZSetBatch::new(&schema);
         RowGather::new(&schema).copy(&src, 0, &mut dst);
         assert_eq!(dst.pks.len(), 1);
-        match &dst.pks {
-            PkColumn::Bytes { stride: 16, buf } => {
-                assert_eq!(buf, &pk_bytes.to_vec());
-            }
-            _ => panic!("expected Bytes variant after copy"),
-        }
+        assert_eq!(dst.pks.stride, 16);
+        assert_eq!(dst.pks.buf, pk_bytes.to_vec());
     }
 }

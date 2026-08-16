@@ -158,24 +158,27 @@ fn decode_wal_block_impl(
             "pk region size mismatch: expected {expected_pk_sz}, got {pk_sz}"
         )));
     }
-    // Gate on PK column count, not stride: single-PK stays on the existing
-    // numeric fast arms (byte-for-byte unchanged); a compound key never
-    // decodes to a numeric variant.
-    // The PK region at rest is OPK (order-preserving big-endian). Decode each
-    // variant back to the native LE values the in-memory `PkColumn` holds, so
-    // re-encoding the batch (which OPK-encodes assuming LE input) does not
-    // double-encode.
-    let pks: PkColumn = if schema.pk_count() >= 2 {
-        // `stride` is a u8: reject (rather than silently truncate) any wire
-        // schema whose packed PK region exceeds the field width.
-        if pk_stride > u8::MAX as usize {
-            return Err(ProtocolError::DecodeError(format!(
-                "compound pk_stride {pk_stride} exceeds 255"
-            )));
-        }
+    // The PK region at rest is OPK (order-preserving big-endian). Walk it back
+    // to the native LE bytes the in-memory `PkColumn` holds, so re-encoding the
+    // batch (which OPK-encodes assuming LE input) does not double-encode. A
+    // scalar key is the one-column case of the same walk.
+    //
+    // `le_row` is the per-row scratch, so a stride past it would index out of
+    // bounds — reject at the boundary rather than panic. This also keeps the
+    // `as u8` below lossless, since MAX_PK_BYTES is well under 255.
+    if pk_stride > gnitz_wire::MAX_PK_BYTES {
+        return Err(ProtocolError::DecodeError(format!(
+            "pk_stride {pk_stride} exceeds MAX_PK_BYTES {}",
+            gnitz_wire::MAX_PK_BYTES
+        )));
+    }
+    let pks: PkColumn = {
         let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
         let mut decoded = Vec::with_capacity(pk_sz);
         let mut le_row = [0u8; gnitz_wire::MAX_PK_BYTES];
+        // Per-row extent is dominated by the `pk_sz == count * pk_stride` check
+        // above plus the directory's `pk_off + pk_sz <= total_size`, so no
+        // per-row bounds check is needed.
         for row in 0..count {
             let base = pk_off + row * pk_stride;
             let src = &data[base..base + pk_stride];
@@ -186,32 +189,10 @@ fn decode_wal_block_impl(
             }
             decoded.extend_from_slice(&le_row[..pk_stride]);
         }
-        PkColumn::Bytes {
+        PkColumn {
             stride: pk_stride as u8,
             buf: decoded,
         }
-    } else if pk_stride <= 8 {
-        // Narrow single-column PK: OPK → native LE via decode_pk_column. The
-        // per-row extent is dominated by the `pk_sz == count * pk_stride` check
-        // above plus the directory's `pk_off + pk_sz <= total_size`, so no
-        // per-row bounds check is needed.
-        let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
-        let mut v = Vec::with_capacity(count);
-        for i in 0..count {
-            v.push(gnitz_wire::pk_native_key(data, pk_off + i * pk_stride, pk_stride, pk_tc) as u64);
-        }
-        PkColumn::U64s(v)
-    } else {
-        // Lone 16-byte PK: U128/UUID (unsigned) or I128 (signed). decode_pk_column
-        // reverses both — a plain byte-swap for the unsigned types (identical to the
-        // prior from_be_bytes) and a byte-swap plus sign-flip for I128. Per-row
-        // extent dominated by the region-size + directory checks (as above).
-        let pk_tc = schema.columns[schema.pk_indices()[0]].type_code as u8;
-        let mut v = Vec::with_capacity(count);
-        for i in 0..count {
-            v.push(gnitz_wire::pk_native_key(data, pk_off + i * 16, 16, pk_tc));
-        }
-        PkColumn::U128s(v)
     };
     let weights: Vec<i64> = read_64bit_region(data, wt_off, wt_sz, count, "weights")?;
     let nulls: Vec<u64> = read_64bit_region(data, null_off, null_sz, count, "nulls")?;
@@ -447,7 +428,7 @@ mod tests {
         }
 
         let batch = ZSetBatch {
-            pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
+            pks: PkColumn::from_u128s(8, pks.iter().copied()),
             weights: weights.clone(),
             nulls: nulls.clone(),
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes.clone())],
@@ -458,10 +439,7 @@ mod tests {
 
         assert_eq!(tid, 42);
         assert_eq!(decoded.pks.to_vec_u128(), pks);
-        assert!(
-            matches!(decoded.pks, PkColumn::U64s(_)),
-            "U64 schema must decode to PkColumn::U64s (no variant drift)"
-        );
+        assert!(decoded.pks.stride == 8, "U64 schema must decode to an 8-byte PK stride");
         assert_eq!(decoded.weights, weights);
         assert_eq!(decoded.nulls, nulls);
         match &decoded.columns[1] {
@@ -485,7 +463,7 @@ mod tests {
         ];
 
         let batch = ZSetBatch {
-            pks: PkColumn::U64s((0..n as u64).collect()),
+            pks: PkColumn::from_u128s(8, 0..n as u128),
             weights: vec![1; n],
             nulls: nulls.clone(),
             columns: vec![ColData::Fixed(vec![]), ColData::Strings(vals.clone())],
@@ -508,7 +486,7 @@ mod tests {
         let n = vals.len();
 
         let batch = ZSetBatch {
-            pks: PkColumn::U128s(vals.clone()),
+            pks: PkColumn::from_u128s(16, vals.iter().copied()),
             weights: vec![1; n],
             nulls: vec![0; n],
             columns: vec![ColData::Fixed(vec![]), wide_col(&vals)],
@@ -518,8 +496,8 @@ mod tests {
         let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 1);
         assert!(
-            matches!(decoded.pks, PkColumn::U128s(_)),
-            "U128 schema must decode to PkColumn::U128s (no variant drift)"
+            decoded.pks.stride == 16,
+            "U128 schema must decode to a 16-byte PK stride"
         );
         assert_eq!(wide_vals(&decoded.columns[1]), vals);
     }
@@ -543,11 +521,10 @@ mod tests {
     /// exact signed bits across the sign and 2^63/2^64 width boundaries.
     #[test]
     fn test_encode_decode_i128_signed_roundtrip() {
-        // for_type must pick U128s (16-byte storage), not the U64s truncation that
-        // produced "weights length != row count".
-        assert!(matches!(PkColumn::for_type(TypeCode::I128), PkColumn::U128s(_)));
-
         let schema = i128_schema();
+        // A lone I128 key is 16 bytes wide, not the 8-byte truncation that once
+        // produced "weights length != row count".
+        assert_eq!(schema.pk_stride(), 16);
         let signed: Vec<i128> = vec![
             i128::MIN,
             -1,
@@ -559,12 +536,12 @@ mod tests {
             1i128 << 64,
             (1i128 << 64) - 1,
         ];
-        // PkColumn / ColData::U128s hold the native bits as u128.
+        // PK and payload both hold the native bits.
         let bits: Vec<u128> = signed.iter().map(|&x| x as u128).collect();
         let n = bits.len();
 
         let batch = ZSetBatch {
-            pks: PkColumn::U128s(bits.clone()),
+            pks: PkColumn::from_u128s(16, bits.iter().copied()),
             weights: vec![1; n],
             nulls: vec![0; n],
             columns: vec![ColData::Fixed(vec![]), wide_col(&bits)],
@@ -574,13 +551,10 @@ mod tests {
         let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 3);
 
-        // (a) No PK-variant drift: a lone 16-byte PK stays U128s.
-        let pk_bits = match &decoded.pks {
-            PkColumn::U128s(v) => v,
-            other => panic!("I128 PK must decode to U128s, got {other:?}"),
-        };
+        // (a) A lone 16-byte PK keeps its full width.
+        assert_eq!(decoded.pks.stride, 16, "I128 PK must decode 16 bytes wide");
         // (b) Each signed value survives — reinterpret the recovered bits as i128.
-        let got_pk: Vec<i128> = pk_bits.iter().map(|&x| x as i128).collect();
+        let got_pk: Vec<i128> = (0..decoded.pks.len()).map(|i| decoded.pks.get(i) as i128).collect();
         assert_eq!(got_pk, signed, "I128 PK sign-flip must round-trip");
 
         // The I128 payload must decode with the exact native bits.
@@ -592,7 +566,7 @@ mod tests {
     fn test_encode_decode_empty() {
         let schema = u64_schema();
         let empty = ZSetBatch {
-            pks: PkColumn::U64s(vec![]),
+            pks: PkColumn::new(8),
             weights: vec![],
             nulls: vec![],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
@@ -607,7 +581,7 @@ mod tests {
     fn test_bad_checksum() {
         let schema = u64_schema();
         let batch = ZSetBatch {
-            pks: PkColumn::U64s(vec![1u64]),
+            pks: PkColumn::from_u128s(8, [1]),
             weights: vec![1],
             nulls: vec![0],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(8u64.to_le_bytes().to_vec())],
@@ -623,7 +597,7 @@ mod tests {
     fn test_bad_version() {
         let schema = u64_schema();
         let batch = ZSetBatch {
-            pks: PkColumn::U64s(vec![1u64]),
+            pks: PkColumn::from_u128s(8, [1]),
             weights: vec![1],
             nulls: vec![0],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(8u64.to_le_bytes().to_vec())],
@@ -644,7 +618,7 @@ mod tests {
         let pks = vec![1u128, 2, 3];
         let n = pks.len();
         let batch = ZSetBatch {
-            pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
+            pks: PkColumn::from_u128s(8, pks.iter().copied()),
             weights: vec![1; n],
             nulls: vec![0; n],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![0u8; n * 8])],
@@ -661,10 +635,7 @@ mod tests {
 
         let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(decoded.pks.to_vec_u128(), pks);
-        assert!(
-            matches!(decoded.pks, PkColumn::U64s(_)),
-            "U64 schema must decode to PkColumn::U64s (no variant drift)"
-        );
+        assert!(decoded.pks.stride == 8, "U64 schema must decode to an 8-byte PK stride");
     }
 
     #[test]
@@ -673,7 +644,7 @@ mod tests {
         let pks = vec![1u128, 2, 3];
         let n = pks.len();
         let batch = ZSetBatch {
-            pks: PkColumn::U128s(pks.clone()),
+            pks: PkColumn::from_u128s(16, pks.iter().copied()),
             weights: vec![1; n],
             nulls: vec![0; n],
             columns: vec![ColData::Fixed(vec![]), wide_col(&pks)],
@@ -686,8 +657,8 @@ mod tests {
         let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(decoded.pks.to_vec_u128(), pks);
         assert!(
-            matches!(decoded.pks, PkColumn::U128s(_)),
-            "U128 schema must decode to PkColumn::U128s (no variant drift)"
+            decoded.pks.stride == 16,
+            "U128 schema must decode to a 16-byte PK stride"
         );
     }
 
@@ -698,7 +669,7 @@ mod tests {
         let weights = vec![1i64, -1, 3];
         let n = pks.len();
         let batch = ZSetBatch {
-            pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
+            pks: PkColumn::from_u128s(8, pks.iter().copied()),
             weights: weights.clone(),
             nulls: vec![0; n],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![0u8; n * 8])],
@@ -728,10 +699,7 @@ mod tests {
         assert_eq!(decoded.pks.get(0), 1u128);
         assert_eq!(decoded.pks.get(1), 100u128);
         assert_eq!(decoded.pks.get(2), (u32::MAX as u128) + 1);
-        assert!(
-            matches!(decoded.pks, PkColumn::U64s(_)),
-            "U64 schema must decode to PkColumn::U64s"
-        );
+        assert!(decoded.pks.stride == 8, "U64 schema must decode to an 8-byte PK stride");
     }
 
     #[test]
@@ -754,8 +722,8 @@ mod tests {
             assert_eq!(decoded.pks.get(i), expected);
         }
         assert!(
-            matches!(decoded.pks, PkColumn::U128s(_)),
-            "U128 schema must decode to PkColumn::U128s"
+            decoded.pks.stride == 16,
+            "U128 schema must decode to a 16-byte PK stride"
         );
     }
 
@@ -832,7 +800,7 @@ mod tests {
         }
 
         let batch = ZSetBatch {
-            pks: PkColumn::Bytes {
+            pks: PkColumn {
                 stride: 24,
                 buf: pk_buf.clone(),
             },
@@ -855,14 +823,9 @@ mod tests {
         assert_eq!(tid, 77);
         assert_eq!(decoded.weights, weights);
         assert_eq!(decoded.nulls, nulls);
-        match &decoded.pks {
-            PkColumn::Bytes { stride, buf } => {
-                assert_eq!(*stride, 24);
-                assert_eq!(buf, &pk_buf, "wide PK bytes must roundtrip exactly");
-                assert_eq!(decoded.pks.len(), n);
-            }
-            _ => panic!("compound PK must decode to PkColumn::Bytes"),
-        }
+        assert_eq!(decoded.pks.stride, 24);
+        assert_eq!(decoded.pks.buf, pk_buf, "wide PK bytes must roundtrip exactly");
+        assert_eq!(decoded.pks.len(), n);
         match &decoded.columns[2] {
             ColData::Fixed(got) => assert_eq!(got, &payload_bytes),
             _ => panic!("expected Fixed payload"),
@@ -903,7 +866,7 @@ mod tests {
         }
 
         let batch = ZSetBatch {
-            pks: PkColumn::Bytes {
+            pks: PkColumn {
                 stride: 64,
                 buf: pk_buf.clone(),
             },
@@ -924,13 +887,8 @@ mod tests {
 
         let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
         assert_eq!(tid, 3);
-        match &decoded.pks {
-            PkColumn::Bytes { stride, buf } => {
-                assert_eq!(*stride, 64);
-                assert_eq!(buf, &pk_buf);
-            }
-            _ => panic!("compound PK must decode to PkColumn::Bytes"),
-        }
+        assert_eq!(decoded.pks.stride, 64);
+        assert_eq!(&decoded.pks.buf, &pk_buf);
         match &decoded.columns[4] {
             ColData::Fixed(got) => assert_eq!(got, &payload_bytes),
             _ => panic!("expected Fixed payload"),
@@ -943,7 +901,7 @@ mod tests {
             let mut buf = Vec::new();
             buf.extend_from_slice(&pk24(a, b));
             ZSetBatch {
-                pks: PkColumn::Bytes { stride: 24, buf },
+                pks: PkColumn { stride: 24, buf },
                 weights: vec![1],
                 nulls: vec![0],
                 columns: vec![
@@ -961,13 +919,8 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&pk24(1, 11));
         expected.extend_from_slice(&pk24(2, 22));
-        match &a.pks {
-            PkColumn::Bytes { stride, buf } => {
-                assert_eq!(*stride, 24);
-                assert_eq!(buf, &expected);
-            }
-            _ => panic!("expected Bytes"),
-        }
+        assert_eq!(a.pks.stride, 24);
+        assert_eq!(&a.pks.buf, &expected);
         assert_eq!(a.weights, vec![1, 1]);
         match &a.columns[2] {
             ColData::Fixed(got) => assert_eq!(got.len(), 16),

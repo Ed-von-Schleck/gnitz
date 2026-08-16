@@ -53,7 +53,7 @@ fn push_block(client: &mut GnitzClient, table_id: u64, schema: &Schema, start: u
         })
         .collect();
     let batch = ZSetBatch {
-        pks: PkColumn::U64s(pks),
+        pks: PkColumn::from_u128s(8, pks.into_iter().map(u128::from)),
         weights: vec![1i64; count],
         nulls: vec![0u64; count],
         columns,

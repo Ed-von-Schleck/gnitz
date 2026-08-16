@@ -136,45 +136,17 @@ impl ViewBuffers {
 /// sign-flipping. The framer places the region at its aligned offset, so this
 /// writes just the tightly-packed region bytes.
 fn build_pk_region_into(dst: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize, schema: &Schema) {
-    // A scalar PK is one column, so its type code decides the whole encoding:
-    // unsigned → plain big-endian, signed (including a lone 16-byte I128 join
-    // key) → big-endian with the leading sign bit flipped.
-    let scalar_tc = || schema.columns[schema.pk_indices()[0]].type_code as u8;
-    match pks {
-        PkColumn::U64s(v) => {
-            debug_assert!(pk_stride <= 8, "U64s pk_stride must be <= 8");
-            encode_scalar_pks(dst, v.iter().map(|x| x.to_le_bytes()), pk_stride, scalar_tc());
-        }
-        PkColumn::U128s(v) => {
-            debug_assert_eq!(pk_stride, 16, "U128s requires pk_stride == 16");
-            encode_scalar_pks(dst, v.iter().map(|x| x.to_le_bytes()), 16, scalar_tc());
-        }
-        // Wide compound PK: encode each column of each row to OPK in pk-list order.
-        PkColumn::Bytes { buf: pk_buf, stride } => {
-            let row_stride = *stride as usize;
-            let row_count = pk_buf.len().checked_div(row_stride).unwrap_or(0);
-            resize_zeroed(dst, pk_buf.len());
-            // Collect (col_size, type_code) once; avoids schema re-iteration per row.
-            let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
-            for row in 0..row_count {
-                let (lo, hi) = (row * row_stride, (row + 1) * row_stride);
-                gnitz_wire::encode_pk_tuple(col_info.iter().copied(), &pk_buf[lo..hi], &mut dst[lo..hi]);
-            }
-        }
-    }
-}
-
-/// OPK-encode one scalar PK column's native-LE values, `width` bytes per row.
-/// Both scalar `PkColumn` variants are this loop; only the value width differs.
-fn encode_scalar_pks<const N: usize>(
-    dst: &mut Vec<u8>,
-    vals: impl ExactSizeIterator<Item = [u8; N]>,
-    width: usize,
-    tc: u8,
-) {
-    resize_zeroed(dst, vals.len() * width);
-    for (i, le) in vals.enumerate() {
-        gnitz_wire::encode_pk_column(&le[..width], tc, &mut dst[i * width..(i + 1) * width]);
+    debug_assert_eq!(pks.stride as usize, pk_stride, "PK column stride != schema stride");
+    let row_count = pks.buf.len().checked_div(pk_stride).unwrap_or(0);
+    resize_zeroed(dst, pks.buf.len());
+    // Collect (col_size, type_code) once; avoids schema re-iteration per row. A
+    // scalar PK is the one-column case of the same walk: unsigned → plain
+    // big-endian, signed (including a lone 16-byte I128 join key) → big-endian
+    // with the leading sign bit flipped.
+    let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
+    for row in 0..row_count {
+        let (lo, hi) = (row * pk_stride, (row + 1) * pk_stride);
+        gnitz_wire::encode_pk_tuple(col_info.iter().copied(), &pks.buf[lo..hi], &mut dst[lo..hi]);
     }
 }
 
@@ -347,7 +319,7 @@ mod tests {
     }
 
     fn fixture_a_batch() -> ZSetBatch {
-        let mut pks = PkColumn::Bytes {
+        let mut pks = PkColumn {
             stride: 12,
             buf: Vec::new(),
         };
@@ -402,7 +374,7 @@ mod tests {
             v.extend_from_slice(&x.to_le_bytes());
         }
         ZSetBatch {
-            pks: PkColumn::U64s(B_PK.to_vec()),
+            pks: PkColumn::from_u128s(4, B_PK.iter().map(|&x| x as u128)),
             weights: vec![1; 3],
             nulls: vec![0; 3],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(v)],

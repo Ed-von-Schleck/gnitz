@@ -92,7 +92,7 @@ fn cmp_col_value(batch: &ZSetBatch, key: &SortKey, ra: usize, rb: usize) -> Orde
     if let Some(off) = key.pk_offset {
         let wa = batch.pks.col_window(ra, off, key.stride);
         let wb = batch.pks.col_window(rb, off, key.stride);
-        return cmp_typed_le(wa.as_slice(), wb.as_slice(), key.tc as u8);
+        return cmp_typed_le(wa, wb, key.tc as u8);
     }
     match &batch.columns[key.ci] {
         ColData::Fixed(buf) => {
@@ -872,7 +872,7 @@ mod tests {
         let bs: Vec<i16> = (0..out.len())
             .map(|i| {
                 let w = out.pks.col_window(i, key.pk_offset.unwrap(), key.stride);
-                i16::from_le_bytes(w.as_slice().try_into().unwrap())
+                i16::from_le_bytes(w.try_into().unwrap())
             })
             .collect();
         assert_eq!(bs, vec![-5, 1, 256]);

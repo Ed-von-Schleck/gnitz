@@ -403,218 +403,126 @@ pub fn meta_schema() -> &'static Schema {
         .get_or_init(|| crate::types::schema_from_wire_cols(gnitz_wire::META_SCHEMA_COLS, gnitz_wire::META_SCHEMA_PK))
 }
 
+/// A batch's PK region in memory: `stride` bytes per row, **native
+/// little-endian**, columns packed in PK-list order. Not the engine's OPK — a
+/// client `ZSetBatch` holds PK values as the wire delivered them, so a signed
+/// column reads as two's complement; `build_pk_region_into` is the one place
+/// that converts to OPK.
+///
+/// One representation at every arity: a lone U32 key is 4 bytes per row, a lone
+/// UUID 16, a compound `(u64, u32)` 12. The stride comes from the schema
+/// (`Schema::pk_stride`), so it is never independent data to keep in sync.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PkColumn {
-    U64s(Vec<u64>),
-    U128s(Vec<u128>),
-    /// Wide compound PK (pk_count >= 2): a flat `stride`-byte-per-row buffer
-    /// in on-wire LE layout. Has no scalar u128 projection, so the numeric
-    /// accessors panic. These panics are a real precondition (not dead code):
-    /// the numeric path is reachable from SQL/binding callers, but the SQL
-    /// planner still rejects compound PRIMARY KEY, so no such batch reaches
-    /// them today.
-    Bytes {
-        stride: u8,
-        buf: Vec<u8>,
-    },
-}
-
-/// One PK column's bytes for one row, in **native little-endian** — borrowed
-/// from a compound (`Bytes`) PK buffer, or re-imaged from a widened scalar PK.
-/// Not the engine's OPK: a client `ZSetBatch` holds `PkColumn` values as the
-/// wire delivered them, so a signed column reads as two's complement.
-pub enum PkWindow<'a> {
-    Borrowed(&'a [u8]),
-    Inline { buf: [u8; 16], len: usize },
-}
-
-impl PkWindow<'_> {
-    pub fn as_slice(&self) -> &[u8] {
-        match self {
-            PkWindow::Borrowed(s) => s,
-            PkWindow::Inline { buf, len } => &buf[..*len],
-        }
-    }
+pub struct PkColumn {
+    pub stride: u8,
+    pub buf: Vec<u8>,
 }
 
 impl PkColumn {
-    /// The `size` bytes of the PK column at PK-region byte offset `off` for row
-    /// `i`. The per-column PK read: unlike [`PkColumn::get_tuple`] it never
-    /// materializes the whole `MAX_PK_BYTES`-wide tuple, so a per-row loop that
-    /// wants one column pays 16 bytes at most instead of the full stride.
-    pub fn col_window(&self, i: usize, off: usize, size: usize) -> PkWindow<'_> {
-        match self {
-            PkColumn::Bytes { stride, buf } => {
-                let s = *stride as usize;
-                PkWindow::Borrowed(&buf[i * s + off..i * s + off + size])
-            }
-            // A scalar PK is a single column at offset 0; `get` widens
-            // `U64s`/`U128s` to u128, whose low `size` bytes are the column's
-            // native LE image (e.g. `I32(-1)` is `FF FF FF FF`).
-            _ => PkWindow::Inline {
-                buf: self.get(i).to_le_bytes(),
-                len: size,
-            },
-        }
+    /// An empty column of `stride` bytes per row.
+    pub fn new(stride: u8) -> Self {
+        PkColumn { stride, buf: vec![] }
     }
 
-    pub fn for_type(tc: TypeCode) -> Self {
-        // I128 (a cross-sign `_join_pk`) is a 16-byte key: store its native bits
-        // as u128 like U128/UUID; the signed interpretation happens only at the
-        // value-surfacing boundary (gnitz-py).
-        if tc == TypeCode::U128 || tc == TypeCode::UUID || tc == TypeCode::I128 {
-            PkColumn::U128s(vec![])
-        } else {
-            PkColumn::U64s(vec![])
-        }
-    }
-    pub fn len(&self) -> usize {
-        match self {
-            PkColumn::U64s(v) => v.len(),
-            PkColumn::U128s(v) => v.len(),
-            PkColumn::Bytes { stride, buf } => buf.len() / *stride as usize,
-        }
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    pub fn get(&self, i: usize) -> u128 {
-        match self {
-            PkColumn::U64s(v) => v[i] as u128,
-            PkColumn::U128s(v) => v[i],
-            PkColumn::Bytes { .. } => panic!("wide PK has no u128 projection"),
-        }
-    }
-    /// Append one raw PK tuple (already in on-wire LE layout). Wide-PK only.
-    pub fn push_bytes(&mut self, b: &[u8]) {
-        match self {
-            PkColumn::Bytes { stride, buf } => {
-                debug_assert_eq!(b.len(), *stride as usize);
-                buf.extend_from_slice(b);
-            }
-            _ => unreachable!("push_bytes on non-wide PK column"),
-        }
-    }
-    /// Borrow the raw `stride`-byte tuple at row `i`. Wide-PK only.
-    pub fn get_bytes(&self, i: usize) -> &[u8] {
-        match self {
-            PkColumn::Bytes { stride, buf } => {
-                let s = *stride as usize;
-                &buf[i * s..(i + 1) * s]
-            }
-            _ => unreachable!("get_bytes on non-wide PK column"),
-        }
-    }
-    pub fn push_u128(&mut self, pk: u128) {
-        match self {
-            PkColumn::U64s(v) => v.push(pk as u64),
-            PkColumn::U128s(v) => v.push(pk),
-            // Compound PK ≤16 bytes packed into a u128 (low `stride` bytes hold
-            // the LE-packed PK columns in order). Used by the catalog circuit
-            // tables whose PK is (view_id, sub).
-            PkColumn::Bytes { stride, buf } => {
-                let s = *stride as usize;
-                // Promoted from debug_assert to a full assert: in release the
-                // slice `pk.to_le_bytes()[..s]` would otherwise OOB-panic with an
-                // opaque "index out of range" message. This Bytes arm is reached
-                // only by cold catalog circuit-table writes, so the branch cost is
-                // irrelevant; a clear, attributable failure is worth it.
-                assert!(s <= 16, "push_u128: stride {s} > 16 cannot come from a u128");
-                buf.extend_from_slice(&pk.to_le_bytes()[..s]);
-            }
-        }
-    }
-    pub fn clear(&mut self) {
-        match self {
-            PkColumn::U64s(v) => v.clear(),
-            PkColumn::U128s(v) => v.clear(),
-            PkColumn::Bytes { buf, .. } => buf.clear(),
-        }
-    }
-    pub fn truncate(&mut self, len: usize) {
-        match self {
-            PkColumn::U64s(v) => v.truncate(len),
-            PkColumn::U128s(v) => v.truncate(len),
-            PkColumn::Bytes { stride, buf } => buf.truncate(len * *stride as usize),
-        }
-    }
-    /// Project the PK column to a `Vec<u128>` (widening U64s). Panics for a
-    /// wide compound PK, which has no scalar projection. Test-only: the sole
-    /// surviving comparison form for `assert_eq!(pks.to_vec_u128(), expected)`.
-    #[cfg(test)]
-    pub fn to_vec_u128(&self) -> Vec<u128> {
-        match self {
-            PkColumn::U64s(v) => v.iter().map(|&x| x as u128).collect(),
-            PkColumn::U128s(v) => v.clone(),
-            PkColumn::Bytes { .. } => panic!("wide PK has no u128 projection"),
-        }
-    }
-
-    /// Empty `PkColumn` matching `schema`'s PK layout. Single source of
-    /// truth for the variant choice; `ZSetBatch::new`, `GnitzClient::delete`,
-    /// and the SQL DML helpers all route through this.
+    /// Empty `PkColumn` matching `schema`'s PK layout. `ZSetBatch::new`,
+    /// `GnitzClient::delete`, and the SQL DML helpers all route through this.
     pub fn empty_for_schema(schema: &Schema) -> Self {
-        if schema.pk_count() >= 2 {
-            PkColumn::Bytes {
-                stride: schema.pk_stride() as u8,
-                buf: vec![],
-            }
-        } else {
-            PkColumn::for_type(schema.columns[schema.pk_indices()[0]].type_code)
+        Self::new(schema.pk_stride() as u8)
+    }
+
+    /// A column of `stride`-byte keys from their packed u128 values — each
+    /// value's low `stride` bytes. The counterpart of [`Self::get`].
+    pub fn from_u128s(stride: u8, vals: impl IntoIterator<Item = u128>) -> Self {
+        let mut c = Self::new(stride);
+        for v in vals {
+            c.push_u128(v);
         }
+        c
+    }
+
+    fn width(&self) -> usize {
+        self.stride as usize
+    }
+
+    /// The `size` bytes of the PK column at PK-region byte offset `off` for row
+    /// `i`.
+    pub fn col_window(&self, i: usize, off: usize, size: usize) -> &[u8] {
+        let base = i * self.width() + off;
+        &self.buf[base..base + size]
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len() / self.width()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Row `i` widened to a u128 — the low `stride` bytes are the key. Only
+    /// meaningful for a key that fits in 16 bytes; a wider compound key has no
+    /// scalar projection and callers read [`Self::get_bytes`] instead.
+    pub fn get(&self, i: usize) -> u128 {
+        let mut b = [0u8; 16];
+        let s = self.width().min(16);
+        b[..s].copy_from_slice(&self.buf[i * self.width()..i * self.width() + s]);
+        u128::from_le_bytes(b)
+    }
+
+    /// Append one raw PK tuple, already in on-wire LE layout.
+    pub fn push_bytes(&mut self, b: &[u8]) {
+        debug_assert_eq!(b.len(), self.width());
+        self.buf.extend_from_slice(b);
+    }
+
+    /// Borrow the raw `stride`-byte tuple at row `i`.
+    pub fn get_bytes(&self, i: usize) -> &[u8] {
+        let s = self.width();
+        &self.buf[i * s..(i + 1) * s]
+    }
+
+    /// Append a key whose low `stride` bytes carry the LE-packed columns.
+    pub fn push_u128(&mut self, pk: u128) {
+        let s = self.width();
+        // A hard assert, not debug-only: in release the slice below would
+        // otherwise OOB-panic with an opaque "index out of range".
+        assert!(s <= 16, "push_u128: stride {s} > 16 cannot come from a u128");
+        self.buf.extend_from_slice(&pk.to_le_bytes()[..s]);
+    }
+
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.buf.truncate(len * self.width());
     }
 
     /// Read row `i` into a `PkTuple`.
     pub fn get_tuple(&self, i: usize, stride: u8) -> PkTuple {
+        debug_assert_eq!(stride, self.stride);
         let mut t = PkTuple::new(stride);
-        match self {
-            PkColumn::U64s(v) => t.buf[..8].copy_from_slice(&v[i].to_le_bytes()),
-            PkColumn::U128s(v) => t.buf[..16].copy_from_slice(&v[i].to_le_bytes()),
-            PkColumn::Bytes { stride: s, buf } => {
-                let s = *s as usize;
-                debug_assert_eq!(s, stride as usize);
-                t.buf[..s].copy_from_slice(&buf[i * s..(i + 1) * s]);
-            }
-        }
+        let s = self.width();
+        t.buf[..s].copy_from_slice(&self.buf[i * s..(i + 1) * s]);
         t
     }
 
-    /// Append the row at `src[i]` to `self`. Variants must match.
+    /// Append the row at `src[i]` to `self`. Strides must match.
     pub fn push_from(&mut self, src: &PkColumn, i: usize) {
-        match (self, src) {
-            (PkColumn::U64s(d), PkColumn::U64s(s)) => d.push(s[i]),
-            (PkColumn::U128s(d), PkColumn::U128s(s)) => d.push(s[i]),
-            (PkColumn::Bytes { stride: sd, buf: d }, PkColumn::Bytes { stride: ss, buf: s }) => {
-                debug_assert_eq!(*sd, *ss);
-                let w = *sd as usize;
-                d.extend_from_slice(&s[i * w..(i + 1) * w]);
-            }
-            _ => unreachable!("push_from: pk variant mismatch"),
-        }
+        debug_assert_eq!(self.stride, src.stride);
+        self.buf.extend_from_slice(src.get_bytes(i));
     }
 
-    /// Append `pk`'s bytes to `self`, dispatching on variant. Hides the
-    /// `Bytes`-vs-scalar choice from DML callers.
+    /// Append `pk`'s bytes to `self`.
     pub fn push_tuple(&mut self, pk: &PkTuple) {
-        let s = pk.stride as usize;
-        match self {
-            PkColumn::U64s(v) => {
-                debug_assert!(s <= 8);
-                let mut b = [0u8; 8];
-                b[..s].copy_from_slice(&pk.buf[..s]);
-                v.push(u64::from_le_bytes(b));
-            }
-            PkColumn::U128s(v) => {
-                debug_assert!(s <= 16);
-                let mut b = [0u8; 16];
-                b[..s].copy_from_slice(&pk.buf[..s]);
-                v.push(u128::from_le_bytes(b));
-            }
-            PkColumn::Bytes { stride, buf } => {
-                debug_assert_eq!(*stride as usize, s);
-                buf.extend_from_slice(&pk.buf[..s]);
-            }
-        }
+        debug_assert_eq!(pk.stride, self.stride);
+        self.buf.extend_from_slice(&pk.buf[..self.width()]);
+    }
+
+    /// Every key widened to u128, for `assert_eq!(pks.to_vec_u128(), expected)`.
+    #[cfg(test)]
+    pub fn to_vec_u128(&self) -> Vec<u128> {
+        (0..self.len()).map(|i| self.get(i)).collect()
     }
 }
 
@@ -910,11 +818,7 @@ impl ZSetBatch {
     /// column-at-a-time fill reallocates its way up from zero.
     pub fn with_capacity(schema: &Schema, n: usize) -> Self {
         let mut b = Self::new(schema);
-        match &mut b.pks {
-            PkColumn::U64s(v) => v.reserve(n),
-            PkColumn::U128s(v) => v.reserve(n),
-            PkColumn::Bytes { buf, .. } => buf.reserve(n * schema.pk_stride()),
-        }
+        b.pks.buf.reserve(n * schema.pk_stride());
         b.weights.reserve(n);
         b.nulls.reserve(n);
         for (_pi, ci, col) in schema.payload_columns() {
@@ -961,15 +865,11 @@ impl ZSetBatch {
             other.columns.len(),
             "extend_from_owned: column count mismatch",
         );
-        match (&mut self.pks, &mut other.pks) {
-            (PkColumn::U64s(a), PkColumn::U64s(b)) => a.append(b),
-            (PkColumn::U128s(a), PkColumn::U128s(b)) => a.append(b),
-            (PkColumn::Bytes { stride: sa, buf: a }, PkColumn::Bytes { stride: sb, buf: b }) => {
-                assert_eq!(sa, sb, "extend_from_owned: wide PK stride mismatch");
-                a.append(b);
-            }
-            _ => panic!("extend_from_owned: pk column type mismatch"),
-        }
+        assert_eq!(
+            self.pks.stride, other.pks.stride,
+            "extend_from_owned: PK stride mismatch",
+        );
+        self.pks.buf.append(&mut other.pks.buf);
         self.weights.append(&mut other.weights);
         self.nulls.append(&mut other.nulls);
         for (a, b) in self.columns.iter_mut().zip(other.columns.iter_mut()) {
@@ -1006,37 +906,25 @@ impl ZSetBatch {
 
     /// Validate that all vectors are consistently sized for the given schema.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
-        // Front-line agreement check, derived from the canonical schema→variant
-        // chooser rather than restating it: a wide buffer under a scalar PK, a
-        // scalar buffer under a compound PK, *and* a `U64s` buffer under a
-        // 16-byte PK column, which the region encoder would silently truncate.
-        // Without it a mismatch passes the stride check below and only surfaces
-        // as a deep panic in sort-merge/consolidation.
-        if std::mem::discriminant(&self.pks) != std::mem::discriminant(&PkColumn::empty_for_schema(schema)) {
+        // The PK buffer's own shape, checked before `len()` divides by the
+        // stride. A stride that disagrees with the schema would make the region
+        // encoder read every row at the wrong offset.
+        if self.pks.stride == 0 {
+            return Err("PK stride must be non-zero".into());
+        }
+        if self.pks.stride as usize != schema.pk_stride() {
             return Err(format!(
-                "PK buffer variant contradicts the schema's PK layout ({} PK column(s), stride {})",
-                schema.pk_count(),
-                schema.pk_stride()
+                "mismatched PK stride: expected {}, got {}",
+                schema.pk_stride(),
+                self.pks.stride
             ));
         }
-        if let PkColumn::Bytes { stride, buf } = &self.pks {
-            if *stride == 0 {
-                return Err("wide PK stride must be non-zero".into());
-            }
-            if *stride as usize != schema.pk_stride() {
-                return Err(format!(
-                    "mismatched PK stride: expected {}, got {}",
-                    schema.pk_stride(),
-                    stride
-                ));
-            }
-            if buf.len() % (*stride as usize) != 0 {
-                return Err(format!(
-                    "wide PK buffer length {} is not a multiple of stride {}",
-                    buf.len(),
-                    stride
-                ));
-            }
+        if !self.pks.buf.len().is_multiple_of(self.pks.stride as usize) {
+            return Err(format!(
+                "PK buffer length {} is not a multiple of stride {}",
+                self.pks.buf.len(),
+                self.pks.stride
+            ));
         }
         let n = self.pks.len();
         if self.weights.len() != n {
@@ -1377,7 +1265,7 @@ mod tests {
         };
         let count = 2;
         let batch = ZSetBatch {
-            pks: PkColumn::U64s(vec![10, 20]),
+            pks: PkColumn::from_u128s(8, [10, 20]),
             weights: vec![-1; count],
             nulls: vec![0; count],
             columns: ZSetBatch::filler_columns(&schema, count),
@@ -1725,7 +1613,7 @@ mod tests {
         // Keep weights/nulls consistent with the truncated row count (1) so
         // only the stride-divisibility check can trip.
         let batch = ZSetBatch {
-            pks: PkColumn::Bytes {
+            pks: PkColumn {
                 stride: 16,
                 buf: vec![0u8; 20],
             },
@@ -1743,7 +1631,7 @@ mod tests {
         // A zero stride would panic the `len()`/modulo divides; validate must
         // reject it as the malformed-input gate.
         let batch = ZSetBatch {
-            pks: PkColumn::Bytes {
+            pks: PkColumn {
                 stride: 0,
                 buf: vec![0u8; 16],
             },

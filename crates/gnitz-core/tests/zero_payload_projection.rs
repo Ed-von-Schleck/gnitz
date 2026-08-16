@@ -13,7 +13,7 @@
 //! permuted, non-adjacent compound PK whose OPK sign flip must survive.
 
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
-use gnitz_core::{BatchAppender, ColData, ExprBuilder, GnitzClient, PkColumn, ZSetBatch};
+use gnitz_core::{BatchAppender, ColData, ExprBuilder, GnitzClient, ZSetBatch};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 
@@ -118,10 +118,8 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
 
     // Weights reach the client unsummed: no top-k gate, one row per key.
     assert!(reply.weights.iter().all(|&w| w == 1), "per-row weights preserved");
-    let PkColumn::U64s(keys) = &reply.pks else {
-        panic!("a lone U64 PK column decodes as U64s, got {:?}", reply.pks);
-    };
-    let mut got: Vec<u64> = keys.clone();
+    assert_eq!(reply.pks.stride, 8, "a lone U64 PK column decodes 8 bytes wide");
+    let mut got: Vec<u64> = (0..reply.pks.len()).map(|i| reply.pks.get(i) as u64).collect();
     got.sort_unstable();
     assert_eq!(got, (151u64..=200).collect::<Vec<_>>());
 

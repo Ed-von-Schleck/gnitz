@@ -271,16 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn compound_pk_zset_batch_new_uses_bytes_variant() {
+    fn compound_pk_zset_batch_new_uses_packed_stride() {
         let schema = compound_schema_u64_u64();
         let batch = ZSetBatch::new(&schema);
-        match &batch.pks {
-            gnitz_core::PkColumn::Bytes { stride, buf } => {
-                assert_eq!(*stride, 16);
-                assert!(buf.is_empty());
-            }
-            other => panic!("expected PkColumn::Bytes, got {other:?}"),
-        }
+        assert_eq!(batch.pks.stride, 16);
+        assert!(batch.pks.buf.is_empty());
     }
 
     #[test]

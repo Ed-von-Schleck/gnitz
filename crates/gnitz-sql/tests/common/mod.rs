@@ -7,7 +7,7 @@
 //! server: schema names only need to be unique within one server. A single
 //! shared `make_planner` therefore serves every test file.
 
-use gnitz_core::{ColData, GnitzClient, PkColumn, Schema, ZSetBatch};
+use gnitz_core::{ColData, GnitzClient, Schema, ZSetBatch};
 use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{CIRCUIT_NODES_TAB, OPCODE_FILTER};
@@ -123,16 +123,15 @@ pub fn view_value_weight(client: &mut GnitzClient, sn: &str, view: &str, col: &s
 /// Read a PK-region integer column's value (as i64) at `row`. The client decodes
 /// the OPK PK region back to native little-endian on receive, so a fixed-width
 /// integer PK column reads exactly like a payload column. `ci` must be a PK
-/// column index. Single-column PKs arrive as the numeric `U64s`/`U128s` variants;
-/// compound PKs arrive as `Bytes` (native-LE, tightly packed in pk-column order).
+/// column index. The PK region is native-LE, tightly packed in pk-column order,
+/// at every arity.
 pub fn pk_i64_at(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i64 {
-    match &batch.pks {
-        PkColumn::U64s(v) => v[row] as i64,
-        PkColumn::U128s(v) => v[row] as i64,
-        PkColumn::Bytes { stride, buf } => {
-            let off = row * *stride as usize + schema.pk_byte_offset(ci);
-            i64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
-        }
+    let tc = schema.columns[ci].type_code;
+    let bytes = batch.pks.col_window(row, schema.pk_byte_offset(ci), tc.wire_stride());
+    if gnitz_wire::is_signed_int(tc as u8) {
+        gnitz_wire::read_signed_exact(bytes)
+    } else {
+        gnitz_wire::read_unsigned_exact(bytes) as i64
     }
 }
 

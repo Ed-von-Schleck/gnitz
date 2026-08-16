@@ -69,7 +69,7 @@ fn make_batch(schema: &Schema, start: u64, count: usize) -> ZSetBatch {
         })
         .collect();
     ZSetBatch {
-        pks: PkColumn::U64s(pks),
+        pks: PkColumn::from_u128s(8, pks.into_iter().map(u128::from)),
         weights: vec![1i64; count],
         nulls: vec![0u64; count],
         columns,

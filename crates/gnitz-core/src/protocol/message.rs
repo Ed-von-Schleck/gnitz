@@ -500,7 +500,7 @@ mod tests {
         let mut b1 = ZSetBatch::new(&schema);
         BatchAppender::new(&mut b1, &schema).add_row(3, 1).i64_val(30);
         let b2 = ZSetBatch {
-            pks: PkColumn::U64s(vec![4]),
+            pks: PkColumn::from_u128s(8, [4]),
             weights: vec![-1],
             nulls: vec![0],
             columns: ZSetBatch::filler_columns(&schema, 1),
@@ -752,7 +752,7 @@ mod tests {
         }
 
         let batch = ZSetBatch {
-            pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
+            pks: PkColumn::from_u128s(8, pks.iter().copied()),
             weights: weights.clone(),
             nulls: nulls.clone(),
             columns: vec![
@@ -809,7 +809,7 @@ mod tests {
         let col2: Vec<Option<String>> = (0..n).map(|i| Some(format!("nonnull_{i}"))).collect();
 
         let batch = ZSetBatch {
-            pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
+            pks: PkColumn::from_u128s(8, pks.iter().copied()),
             weights: weights.clone(),
             nulls: nulls.clone(),
             columns: vec![
@@ -923,7 +923,7 @@ mod tests {
             val_bytes.extend_from_slice(&v.to_le_bytes());
         }
         let batch = ZSetBatch {
-            pks: PkColumn::U64s(vec![1u64, 2u64, 3u64]),
+            pks: PkColumn::from_u128s(8, [1, 2, 3]),
             weights: vec![1, 1, 1],
             nulls: vec![0, 0, 0],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],
@@ -991,7 +991,7 @@ mod tests {
         let mut val_bytes = Vec::new();
         val_bytes.extend_from_slice(&42i64.to_le_bytes());
         let batch = ZSetBatch {
-            pks: PkColumn::U64s(vec![1u64]),
+            pks: PkColumn::from_u128s(8, [1]),
             weights: vec![1],
             nulls: vec![0],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],

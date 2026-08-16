@@ -182,7 +182,7 @@ mod tests {
         // Update pk=1 → v=11 [Update family].
         buf.push(tid, &schema, &batch(&schema, &[(1, 11, 1)]));
         // Delete pk=2 [coalesces with the Update family above].
-        buf.delete(tid, &schema, PkColumn::U64s(vec![2]));
+        buf.delete(tid, &schema, PkColumn::from_u128s(8, [2]));
 
         let net = net_of(&buf, tid);
         assert_eq!(net.len(), 2);
@@ -196,7 +196,7 @@ mod tests {
         let tid = 7;
         let mut buf = TxnBuffer::default();
         buf.push_with_mode(tid, &schema, &batch(&schema, &[(5, 50, 1)]), WireConflictMode::Error);
-        buf.delete(tid, &schema, PkColumn::U64s(vec![5]));
+        buf.delete(tid, &schema, PkColumn::from_u128s(8, [5]));
         buf.push_with_mode(tid, &schema, &batch(&schema, &[(5, 99, 1)]), WireConflictMode::Error);
         let net = net_of(&buf, tid);
         assert_eq!(
@@ -234,7 +234,7 @@ mod tests {
         let tid = 7;
         let mut buf = TxnBuffer::default();
         buf.push(tid, &schema, &batch(&schema, &[(1, 99, 1)])); // override committed 1
-        buf.delete(tid, &schema, PkColumn::U64s(vec![2])); // delete committed 2
+        buf.delete(tid, &schema, PkColumn::from_u128s(8, [2])); // delete committed 2
         buf.push(tid, &schema, &batch(&schema, &[(5, 50, 1)])); // transaction-born
 
         let present = present_rows(&net_of(&buf, tid), &schema);
