@@ -713,8 +713,10 @@ mod tests {
         let emitted: BTreeSet<u32> = every_variant().iter().map(|i| i.to_wire()[0]).collect();
         // An opcode is "accepted" iff `decode_quad` maps it; every arm reads its
         // operands without inspecting them, so an all-zero instruction probes the
-        // opcode table alone.
-        let accepted: BTreeSet<u32> = (0..=256u32)
+        // opcode table alone. Swept over the whole `u16` rather than a range that
+        // merely covers today's opcodes: a decoder arm added above the sweep would
+        // be invisible here, which is the one drift this test exists to catch.
+        let accepted: BTreeSet<u32> = (0..=u32::from(u16::MAX))
             .filter(|&op| LogicalProgram::decode_quad(&[op, 0, 0, 0]).is_ok())
             .collect();
         assert_eq!(emitted, accepted, "encoded opcodes vs. opcodes the decoder accepts");

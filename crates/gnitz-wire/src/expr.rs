@@ -205,7 +205,9 @@ pub const EXPR_STR_ILIKE: u32 = 77;
 // Blob framing constants and operand packing
 // ---------------------------------------------------------------------------
 
-/// Wire-format magic for serialised expr blobs: ASCII "EXPR".
+/// Wire-format magic for serialised expr blobs. Written little-endian, so the
+/// bytes on disk read `EPXR` — the constant's nibbles are not in ASCII order.
+/// Spelled out because a reader hexdumping a blob will not find "EXPR".
 const EXPR_BLOB_MAGIC: u32 = 0x5258_5045;
 /// Current wire-format version for expr blobs.
 const EXPR_BLOB_VERSION: u8 = 1;
