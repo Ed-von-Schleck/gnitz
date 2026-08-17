@@ -100,9 +100,15 @@ fn test_preflight_compile_verdict_and_no_residue() {
     // view that never persists its differential state.
     let root = format!("{dir}/public/_preflight_{ok_vid}");
     fs::write(&root, b"").unwrap();
+    let io_msg = engine
+        .preflight_view_compile(ok_vid)
+        .expect_err("an unusable compile directory must fail the pre-flight");
+    // `create_dir_all` hits a plain file where a directory belongs (ENOTDIR);
+    // the errno must reach the client's string, not flatten to "io error".
+    let want = crate::storage::StorageError::Io(libc::ENOTDIR).to_string();
     assert!(
-        engine.preflight_view_compile(ok_vid).is_err(),
-        "an unusable compile directory must fail the pre-flight"
+        io_msg.contains("child table create failed") && io_msg.contains(&want),
+        "the rejection must name the failing step and its errno, got: {io_msg}"
     );
     fs::remove_file(&root).unwrap();
 

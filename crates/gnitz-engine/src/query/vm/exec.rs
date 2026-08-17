@@ -422,7 +422,7 @@ mod fail_stop_tests {
         if !crate::test_support::in_abort_child() {
             return;
         }
-        fatal_on_tick_ingest_err("integrate", 7, Err(StorageError::Io));
+        fatal_on_tick_ingest_err("integrate", 7, Err(StorageError::Io(libc::ENOSPC)));
         unreachable!("fatal_on_tick_ingest_err must not return on Err");
     }
 }

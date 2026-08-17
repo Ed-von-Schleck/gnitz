@@ -30,7 +30,12 @@ impl MappedShard {
     ) -> Result<Self, StorageError> {
         // `Mmap`'s Drop unmaps the file on any early `?` return below — no
         // manual cleanup needed in the validation path.
-        let mmap = Mmap::open_ro(path).map_err(|_| StorageError::Io)?;
+        let mmap = Mmap::open_ro(path).map_err(|e| match e.raw_os_error() {
+            Some(n) => StorageError::Io(n),
+            // `open_ro` reports a zero-length file with no errno; that is the
+            // same "shorter than the header" verdict as the check below.
+            None => StorageError::Truncated,
+        })?;
         let file_size = mmap.len();
         if file_size < HEADER_SIZE {
             return Err(StorageError::Truncated);

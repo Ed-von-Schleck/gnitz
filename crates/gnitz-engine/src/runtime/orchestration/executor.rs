@@ -220,6 +220,10 @@ pub struct Shared {
     /// and every commit's zone strictly exceeds it, so a miss reading boot_seed can
     /// never false-pass.
     boot_seed: u64,
+    /// Set by the watchdog when it tears the node down over a dead worker. The
+    /// watchdog is detached and its `Output` discarded, so this is how the
+    /// verdict reaches `ServerExecutor::run`.
+    worker_crashed: Cell<bool>,
 }
 
 impl Shared {
@@ -431,6 +435,7 @@ impl ServerExecutor {
             ddl_window: Rc::clone(&ddl_window),
             table_commit_lsn: RefCell::new(FxHashMap::default()),
             boot_seed: initial_lsn,
+            worker_crashed: Cell::new(false),
         });
 
         // Catch SIGTERM/SIGINT so the watchdog can drive a final checkpoint
@@ -444,7 +449,13 @@ impl ServerExecutor {
         reactor.spawn(watchdog(Rc::clone(&shared)));
 
         reactor.block_until_shutdown();
-        0
+        // `2` separates a dead worker from the `1` above (a failure before or
+        // instead of the event loop) and from `gnitz_fatal_abort!`'s `134`.
+        if shared.worker_crashed.get() {
+            2
+        } else {
+            0
+        }
     }
 }
 
@@ -680,10 +691,8 @@ async fn watchdog(shared: Rc<Shared>) {
             //    the sequence's drain is what gets it into the views.
             await_barrier(&shared, BarrierKind::Shutdown).await;
 
-            // 3. Workers flush + _exit, then stop the reactor
-            //    (block_until_shutdown returns and server_main exits 0). The
-            //    reactor/W2M receiver stays live throughout, so no `w2m()`
-            //    handle dangles.
+            // 3. Workers flush + _exit, then stop the reactor. The reactor/W2M
+            //    receiver stays live throughout, so no `w2m()` handle dangles.
             shared.disp().shutdown_workers();
             shared.reactor.request_shutdown();
             return;
@@ -693,6 +702,7 @@ async fn watchdog(shared: Rc<Shared>) {
         if crashed >= 0 {
             let base_dir = shared.cat().base_dir.clone();
             gnitz_error!("Worker {crashed} crashed (log: {base_dir}/worker_{crashed}.log), shutting down");
+            shared.worker_crashed.set(true);
             shared.disp().shutdown_workers();
             shared.reactor.request_shutdown();
             return;

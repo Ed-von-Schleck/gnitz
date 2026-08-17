@@ -660,13 +660,13 @@ pub(crate) fn ensure_dir(dir: &str) -> Result<CString, StorageError> {
     let dir_c = super::super::cstr(dir)?;
     // Recursive: a table may home into a nested dir whose parents don't exist
     // yet (a worker's per-rank index subdir under a fresh index dir).
-    std::fs::create_dir_all(dir).map_err(|_| StorageError::Io)?;
+    std::fs::create_dir_all(dir)?;
     Ok(dir_c)
 }
 
 fn set_nocow_dir(dir_c: &CStr) {
     use std::os::fd::AsRawFd;
-    if let Some(fd) = crate::foundation::posix_io::open_owned(dir_c, libc::O_RDONLY) {
+    if let Ok(fd) = crate::foundation::posix_io::open_owned(dir_c, libc::O_RDONLY) {
         crate::foundation::posix_io::try_set_nocow(fd.as_raw_fd());
     }
 }
@@ -2363,7 +2363,11 @@ mod tests {
         let (tdir, manifest) = checkpointed("io_err");
         std::fs::remove_file(&manifest).unwrap();
         std::fs::create_dir(&manifest).unwrap();
-        assert_eq!(reopen(&tdir).err(), Some(StorageError::Io));
+        assert_eq!(
+            reopen(&tdir).err(),
+            Some(StorageError::Io(libc::EISDIR)),
+            "reading a manifest that is a directory must surface the errno"
+        );
         assert_eq!(
             shard_db_files(&tdir, table_id).len(),
             1,

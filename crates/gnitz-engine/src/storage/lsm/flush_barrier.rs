@@ -90,7 +90,7 @@ pub(super) fn sync_by_path(ring: &mut LazyRing, paths: &[&CStr]) -> Result<(), S
     for sub in paths.chunks(FD_CHUNK_THRESHOLD) {
         let owned: Vec<OwnedFd> = sub
             .iter()
-            .map(|p| open_owned(p, libc::O_RDONLY).ok_or(StorageError::Io))
+            .map(|p| open_owned(p, libc::O_RDONLY).map_err(StorageError::from))
             .collect::<Result<_, _>>()?;
         let raw: Vec<libc::c_int> = owned.iter().map(|f| f.as_raw_fd()).collect();
         ring.batch_sync(&raw, DATASYNC)?;
@@ -162,7 +162,7 @@ impl LazyRing {
             Some(ref mut r) => r,
             None => self.0.insert(io_uring::IoUring::new(256).map_err(|e| {
                 gnitz_warn!("io_uring::new failed: {}", e);
-                StorageError::Io
+                StorageError::from(e)
             })?),
         };
         let sq_capacity = ring.params().sq_entries() as usize;
@@ -177,7 +177,8 @@ impl LazyRing {
                     .flags(flags)
                     .build();
                 unsafe {
-                    ring.submission().push(&sqe).map_err(|_| StorageError::Io)?;
+                    // A full submission queue, not a syscall failure: no errno.
+                    ring.submission().push(&sqe).map_err(|_| StorageError::Io(0))?;
                 }
                 pushed += 1;
             }
@@ -190,7 +191,7 @@ impl LazyRing {
                 }
                 Err(e) => {
                     gnitz_warn!("uring submit_and_wait: {}", e);
-                    return Err(StorageError::Io);
+                    return Err(StorageError::from(e));
                 }
             }
             completed += drain(ring)?;
@@ -206,7 +207,8 @@ fn drain(ring: &mut io_uring::IoUring) -> Result<usize, StorageError> {
     for cqe in ring.completion() {
         if cqe.result() < 0 {
             gnitz_warn!("fsync via uring failed: {}", cqe.result());
-            return Err(StorageError::Io);
+            // A CQE reports failure as `-errno`.
+            return Err(StorageError::Io(-cqe.result()));
         }
         n += 1;
     }

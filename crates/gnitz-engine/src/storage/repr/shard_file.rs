@@ -12,6 +12,7 @@ use super::super::error::StorageError;
 use super::batch::{strides_from_schema, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
 use super::xor8;
+use crate::foundation::posix_io;
 use crate::foundation::xxh;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
@@ -372,11 +373,9 @@ pub fn write_shard_streaming(
 ) -> Result<(), StorageError> {
     let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, row_count, regions, schema, opts)?;
     drop(fd); // Close before the rename, matching the batched two-phase path.
-    unsafe {
-        if libc::renameat(dirfd, tmp_name.as_ptr(), dirfd, basename.as_ptr()) < 0 {
-            libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
-            return Err(StorageError::Io);
-        }
+    if let Err(e) = posix_io::renameat(dirfd, &tmp_name, dirfd, basename) {
+        unsafe { libc::unlinkat(dirfd, tmp_name.as_ptr(), 0) };
+        return Err(e.into());
     }
     // Both the file's contents and the renamed directory entry are made durable
     // by the flush barrier: it fdatasyncs every registered-unsynced file and then
@@ -566,33 +565,29 @@ fn write_shard_streaming_inner(
 
     // The `OwnedFd` is the sole closer, so every error return below closes
     // it — `abort` only unlinks.
-    let fd =
-        crate::foundation::posix_io::openat_owned(dirfd, &tmp_name, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)
-            .ok_or(StorageError::Io)?;
+    let fd = posix_io::openat_owned(dirfd, &tmp_name, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
 
     unsafe {
-        let abort = || -> StorageError {
+        let abort = |e: std::io::Error| -> StorageError {
             libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
-            StorageError::Io
+            e.into()
         };
 
-        crate::foundation::posix_io::ftruncate(fd.as_raw_fd(), total_size as i64).map_err(|_| abort())?;
+        posix_io::ftruncate(fd.as_raw_fd(), total_size as i64).map_err(abort)?;
 
-        crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), &hdr_buf, 0).map_err(|_| abort())?;
+        posix_io::pwrite_all_fd(fd.as_raw_fd(), &hdr_buf, 0).map_err(abort)?;
 
         for i in 0..num_regions {
             let src = regions[i];
             let r_off = region_offsets[i] as libc::off_t;
             // Same empty short-circuit as the checksum pass.
             if actual_sizes[i] > 0 && !src.is_empty() {
-                crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), encodings[i].encoded_bytes(src), r_off)
-                    .map_err(|_| abort())?;
+                posix_io::pwrite_all_fd(fd.as_raw_fd(), encodings[i].encoded_bytes(src), r_off).map_err(abort)?;
             }
         }
 
         if let Some(ref data) = xor8_data {
-            crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), data, xor8_offset as libc::off_t)
-                .map_err(|_| abort())?;
+            posix_io::pwrite_all_fd(fd.as_raw_fd(), data, xor8_offset as libc::off_t).map_err(abort)?;
         }
 
         Ok((fd, tmp_name))

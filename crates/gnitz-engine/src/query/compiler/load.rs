@@ -126,16 +126,10 @@ pub(crate) fn load_circuit(
         } else {
             Some(ch.read_i64(NODES_COL_SOURCE_TABLE) as u64)
         };
-        let expr_blob: Option<Vec<u8>> = if ch.col_is_null(NODES_COL_EXPR_PROGRAM) {
-            None
-        } else {
-            let b = ch.read_german_bytes(NODES_COL_EXPR_PROGRAM);
-            if b.is_empty() {
-                None
-            } else {
-                Some(b)
-            }
-        };
+        // `None` is a NULL cell only. An empty cell is a damaged blob, and each
+        // opcode already judges one: Filter rejects, a ScanDelta bound degrades.
+        let expr_blob: Option<Vec<u8>> =
+            (!ch.col_is_null(NODES_COL_EXPR_PROGRAM)).then(|| ch.read_german_bytes(NODES_COL_EXPR_PROGRAM));
 
         let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
         match gnitz_wire::decode_op_node(opcode, src_tab, expr_blob, cols) {

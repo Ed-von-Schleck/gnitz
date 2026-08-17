@@ -860,11 +860,11 @@ def test_ingest_apply_error_aborts_and_replays(inject, with_index, own_server):
         conn.close()
     except Exception:
         pass
-    # The seam aborts the owning worker; the watchdog detects the dead
-    # worker, reports it, and fans it into a graceful cluster shutdown (the
-    # master then exits 0). The proof the abort fired: the process terminated
-    # (not hung) and the master reported the crash.
-    own_server.wait_for_exit()
+    # The seam aborts the owning worker; the watchdog reports it and tears the
+    # cluster down with exit 2, which a clean shutdown (0) and a boot failure
+    # (1) cannot produce. So the status alone proves the abort fired.
+    rc = own_server.wait_for_exit()
+    assert rc == 2, f"a worker crash must exit 2, got {rc}"
     log = own_server.log_text()
     assert "crashed" in log, (
         f"master must report the aborted worker, got log tail: {log[-500:]}"

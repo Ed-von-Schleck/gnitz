@@ -513,14 +513,13 @@ impl DagEngine {
 
     /// Compile a view by reading system tables and calling `compiler::compile_view`.
     ///
-    /// `None` means only "not a registered relation". A registered view's circuit
-    /// already compiled on the master under `preflight_compile` before the CREATE
-    /// was made durable, and no DDL can change that verdict afterwards: DROP COLUMN
-    /// and DROP NOT NULL on a table with dependent views are RESTRICTed, and no DDL
-    /// widens or re-types a registered column. So a rejection here is this process
-    /// failing to build the view's operator state — out of disk or file
-    /// descriptors — or an engine bug. Both are unrecoverable: the only alternative
-    /// to aborting is serving a view that is silently and permanently empty.
+    /// `None` means only "not a registered relation". Nothing re-pre-flights the
+    /// circuit here — replay, fork inheritance, checkpoint resume, rebuild and
+    /// relayout all reach this with no pre-flight in the process, and this compile
+    /// additionally opens resumed operator state the master's throwaway root never
+    /// had. An `Err` is therefore unrecoverable: the alternative to aborting is a
+    /// view that has stopped integrating while still answering reads with stale
+    /// rows. The abort message names the causes.
     fn compile_view_internal(&self, view_id: i64) -> Option<CompileOutput> {
         let entry = self.tables.get(&view_id)?;
         match self.compile_circuit(view_id, &entry.directory, &entry.schema) {
@@ -530,9 +529,9 @@ impl DagEngine {
             }
             Err(err) => {
                 gnitz_fatal_abort!(
-                    "view_id={} compiled on the master at CREATE VIEW but not here — \
-                     its operator state cannot be built on this node (out of disk or \
-                     file descriptors?), or this is an engine bug: {}",
+                    "view_id={} does not compile from its durable circuit — this build no \
+                     longer accepts that circuit or its expr blobs, its derived state is \
+                     corrupt or unreadable, or resources are exhausted: {}",
                     view_id,
                     err
                 );

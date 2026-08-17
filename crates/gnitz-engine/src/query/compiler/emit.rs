@@ -197,7 +197,7 @@ impl EmitCtx<'_> {
         // this ambient read.
         let recovery = RecoverySource::rederive_checkpointed_now();
         Table::new(&child_dir, schema, self.view_id as u32, recovery)
-            .map_err(|_| CompileError::Rejected("child table create failed"))
+            .map_err(|e| CompileError::StorageFailed("child table create failed", e))
     }
 
     /// Create a child table, keep it alive in `owned_tables`, and return a raw

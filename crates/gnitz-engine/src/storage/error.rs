@@ -15,9 +15,10 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageError {
     /// Underlying libc I/O error (open, fstat, mmap, pwrite, fdatasync,
-    /// rename, unlink, …).  `errno` is *not* captured today — callers that
-    /// need it should convert at the syscall site.
-    Io,
+    /// rename, unlink, …), carrying the `errno` so a fatal report can separate
+    /// a full disk from an exhausted fd table. `0` when the failure was
+    /// synthesized rather than reported by a syscall.
+    Io(i32),
     /// File or buffer is shorter than the on-disk header / payload requires.
     Truncated,
     /// File magic number didn't match (wrong file type or corruption).
@@ -34,18 +35,27 @@ pub enum StorageError {
     InvalidPath,
 }
 
+impl From<std::io::Error> for StorageError {
+    /// The one place an `io::Error` becomes a `StorageError`, so no call site
+    /// has to remember to keep the errno.
+    fn from(e: std::io::Error) -> Self {
+        StorageError::Io(e.raw_os_error().unwrap_or(0))
+    }
+}
+
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            StorageError::Io => "io error",
-            StorageError::Truncated => "truncated",
-            StorageError::InvalidMagic => "invalid magic",
-            StorageError::InvalidVersion => "invalid version",
-            StorageError::ChecksumMismatch => "checksum mismatch",
-            StorageError::BufferTooSmall => "buffer too small",
-            StorageError::InvalidShard => "invalid shard layout",
-            StorageError::InvalidPath => "invalid path",
-        };
-        f.write_str(s)
+        match self {
+            // Not `from_raw_os_error(0)`: that renders "Success".
+            StorageError::Io(0) => f.write_str("io error"),
+            StorageError::Io(e) => write!(f, "io error: {}", std::io::Error::from_raw_os_error(*e)),
+            StorageError::Truncated => f.write_str("truncated"),
+            StorageError::InvalidMagic => f.write_str("invalid magic"),
+            StorageError::InvalidVersion => f.write_str("invalid version"),
+            StorageError::ChecksumMismatch => f.write_str("checksum mismatch"),
+            StorageError::BufferTooSmall => f.write_str("buffer too small"),
+            StorageError::InvalidShard => f.write_str("invalid shard layout"),
+            StorageError::InvalidPath => f.write_str("invalid path"),
+        }
     }
 }

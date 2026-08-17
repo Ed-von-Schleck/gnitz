@@ -46,10 +46,10 @@ impl Table {
     pub(super) fn open_dirfd(&self) -> Result<OwnedFd, StorageError> {
         let dir_c = super::super::cstr(self.directory.as_str())?;
         let fd = match open_owned(&dir_c, libc::O_RDONLY | libc::O_DIRECTORY) {
-            Some(fd) => fd,
-            None => {
+            Ok(fd) => fd,
+            Err(_) => {
                 let dir_c = super::ensure_dir(&self.directory)?;
-                open_owned(&dir_c, libc::O_RDONLY | libc::O_DIRECTORY).ok_or(StorageError::Io)?
+                open_owned(&dir_c, libc::O_RDONLY | libc::O_DIRECTORY)?
             }
         };
         crate::foundation::posix_io::try_set_nocow(fd.as_raw_fd());

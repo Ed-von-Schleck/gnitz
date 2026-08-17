@@ -18,7 +18,7 @@ fn inject_ingest_apply_error(
     r: Result<(), crate::storage::StorageError>,
 ) -> Result<(), crate::storage::StorageError> {
     if INGEST_APPLY_ERROR.at(which) {
-        return Err(crate::storage::StorageError::Io);
+        return Err(crate::storage::StorageError::Io(libc::EIO));
     }
     r
 }

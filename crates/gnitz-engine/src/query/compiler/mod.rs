@@ -9,7 +9,7 @@ use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{build_reduce_output_schema, AggDescriptor};
 use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{type_code, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{ReadCursor, RecoverySource, Table};
+use crate::storage::{ReadCursor, RecoverySource, StorageError, Table};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
 use gnitz_wire::is_fixed_int;
 use gnitz_wire::AggFunc;
@@ -56,6 +56,9 @@ pub(crate) enum CompileError {
     /// guard and carries the validator's own reason, so the rejection can state
     /// *which* limit the program exceeded and not only which guard fired.
     RejectedExpr(&'static str, ExprValidateErr),
+    /// The machine failed, not the circuit: a storage step the compile needs
+    /// returned an error. The payload names the step and carries the errno.
+    StorageFailed(&'static str, StorageError),
 }
 
 impl fmt::Display for CompileError {
@@ -68,6 +71,7 @@ impl fmt::Display for CompileError {
             CompileError::TooManyExchanges => f.write_str("more than two exchange nodes"),
             CompileError::Rejected(guard) => f.write_str(guard),
             CompileError::RejectedExpr(guard, e) => write!(f, "{guard}: {e}"),
+            CompileError::StorageFailed(step, e) => write!(f, "{step}: {e}"),
         }
     }
 }
@@ -1238,23 +1242,27 @@ mod tests {
 
     #[test]
     fn test_build_plan_corrupt_filter_blob_aborts() {
-        // ScanDelta(99) → Filter(corrupt blob) → IntegrateSink. A present blob
-        // that fails to decode must abort, not silently degrade to WHERE TRUE.
-        let corrupt = vec![0xFFu8; 16]; // valid length, invalid magic
-        let mut nodes = HashMap::new();
-        nodes.insert(0, scan_delta(99));
-        nodes.insert(1, gnitz_wire::OpNode::Filter(Some(corrupt)));
-        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
-        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
-        let mut loaded = make_loaded(nodes, edges);
-        let in_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-        // Match out_schema to the sink so the item-32 column-count check passes;
-        // the only thing that can fail this compile is the corrupt-blob abort.
-        loaded.out_schema = in_schema;
-        let ext: ExtTables = HashMap::from([(99, in_schema)]);
-        let ordered = loaded.ordered.clone();
-        let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
-        assert!(result.is_err(), "corrupt Filter blob must abort compilation");
+        // ScanDelta(99) → Filter(blob) → IntegrateSink. A present blob that
+        // fails to decode must abort, not silently degrade to WHERE TRUE —
+        // whether it is garbled or empty (a damaged catalog cell reads back
+        // empty, and `load_circuit` hands it on as present).
+        for blob in [vec![0xFFu8; 16], Vec::new()] {
+            let what = if blob.is_empty() { "empty" } else { "garbled" };
+            let mut nodes = HashMap::new();
+            nodes.insert(0, scan_delta(99));
+            nodes.insert(1, gnitz_wire::OpNode::Filter(Some(blob)));
+            nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
+            let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+            let mut loaded = make_loaded(nodes, edges);
+            let in_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+            // Match out_schema to the sink so the item-32 column-count check
+            // passes; the only thing that can fail this compile is the blob.
+            loaded.out_schema = in_schema;
+            let ext: ExtTables = HashMap::from([(99, in_schema)]);
+            let ordered = loaded.ordered.clone();
+            let result = build_plan(&loaded, &no_skips(), &ordered, &ext, "", 99, None, &[]);
+            assert!(result.is_err(), "a {what} Filter blob must abort compilation");
+        }
     }
 
     #[test]
@@ -1642,157 +1650,150 @@ mod tests {
 
     // ── Items 16 & 28: load_circuit robustness (real system tables) ─────────
 
-    fn wire_sys_schema(cols: &[gnitz_wire::WireSysCol]) -> SchemaDescriptor {
-        crate::schema::from_wire_cols(cols, gnitz_wire::CIRCUIT_FAMILY_PK)
+    /// The three circuit system tables `load_circuit` reads, on one tempdir.
+    /// All three must be live: `load_circuit` opens a cursor over each up front
+    /// and returns `None` on a null one, which would pass these assertions
+    /// vacuously. Their schemas differ (6/5/7 columns), so one cannot stand in
+    /// for another.
+    struct CircuitTables {
+        _tmp: tempfile::TempDir,
+        nodes: Table,
+        edges: Table,
+        cols: Table,
+    }
+
+    impl CircuitTables {
+        const VIEW_ID: u64 = 1;
+
+        /// Match `pack_view_pk`: view_id in the high half, so its at-rest OPK
+        /// (big-endian) image leads the PK region where `load_circuit` seeks.
+        fn pk(sub: u64) -> u128 {
+            ((Self::VIEW_ID as u128) << 64) | (sub as u128)
+        }
+
+        fn schema(cols: &[gnitz_wire::WireSysCol]) -> SchemaDescriptor {
+            crate::schema::from_wire_cols(cols, gnitz_wire::CIRCUIT_FAMILY_PK)
+        }
+
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let open = |name: &str, cols: &[gnitz_wire::WireSysCol]| {
+                // The `TempDir` outlives these: each `ShardIndex` holds the path.
+                Table::new(
+                    &format!("{}/{name}", tmp.path().to_str().unwrap()),
+                    Self::schema(cols),
+                    0,
+                    RecoverySource::Rederive { resume_at: None },
+                )
+                .unwrap()
+            };
+            let nodes = open("nodes", gnitz_wire::CIRCUIT_NODES_COLS);
+            let edges = open("edges", gnitz_wire::CIRCUIT_EDGES_COLS);
+            let cols = open("cols", gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS);
+            Self {
+                _tmp: tmp,
+                nodes,
+                edges,
+                cols,
+            }
+        }
+
+        fn fill(tab: &mut Table, cols: &[gnitz_wire::WireSysCol], f: impl FnOnce(&mut crate::storage::BatchBuilder)) {
+            let mut bb = crate::storage::BatchBuilder::new(Self::schema(cols));
+            f(&mut bb);
+            tab.ingest_owned_batch(bb.finish()).unwrap();
+        }
+
+        fn put_nodes(&mut self, f: impl FnOnce(&mut crate::storage::BatchBuilder)) -> &mut Self {
+            Self::fill(&mut self.nodes, gnitz_wire::CIRCUIT_NODES_COLS, f);
+            self
+        }
+
+        fn put_edges(&mut self, f: impl FnOnce(&mut crate::storage::BatchBuilder)) -> &mut Self {
+            Self::fill(&mut self.edges, gnitz_wire::CIRCUIT_EDGES_COLS, f);
+            self
+        }
+
+        fn load(&mut self) -> Option<LoadedCircuit> {
+            load_circuit(
+                &mut self.nodes,
+                &mut self.edges,
+                &mut self.cols,
+                Self::VIEW_ID,
+                SchemaDescriptor::default(),
+            )
+        }
     }
 
     #[test]
     fn test_load_circuit_aborts_on_undecodable_node() {
-        // A single CircuitNodes row with an opcode decode_op_node rejects (item
-        // 16). Previously the node was silently skipped; load_circuit must now
-        // return None rather than emit a partial circuit.
-        use crate::storage::BatchBuilder;
-        // The `TempDir` guard must outlive the `Table`s built below it: each
-        // one's `ShardIndex` holds the path.
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().to_str().unwrap();
-        let nodes_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODES_COLS);
-        let edges_schema = wire_sys_schema(gnitz_wire::CIRCUIT_EDGES_COLS);
-        let cols_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS);
-
-        let view_id: u64 = 1;
-        // Match pack_view_pk: view_id in the high half so its at-rest OPK
-        // (big-endian) image leads the PK region (where load_circuit seeks).
-        let pk = |sub: u64| -> u128 { ((view_id as u128) << 64) | (sub as u128) };
-
-        let mut nodes_tab = Table::with_arena(
-            &format!("{dir}/nodes"),
-            nodes_schema,
-            0,
-            256 * 1024,
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap();
-        {
-            let mut bb = BatchBuilder::new(nodes_schema);
-            bb.begin_row(pk(1), 1);
+        // An opcode `decode_op_node` rejects must abort the whole load, not be
+        // skipped into a partial circuit.
+        let mut c = CircuitTables::new();
+        c.put_nodes(|bb| {
+            bb.begin_row(CircuitTables::pk(1), 1);
             bb.put_u64(1); // node_id
             bb.put_u64(9999); // opcode — unknown → decode_op_node Err
             bb.put_null(); // source_table
             bb.put_null(); // expr_program
             bb.end_row();
-            nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
-        }
-        let mut edges_tab = Table::with_arena(
-            &format!("{dir}/edges"),
-            edges_schema,
-            0,
-            256 * 1024,
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap();
-        let _ = &mut edges_tab; // empty
-        let mut cols_tab = Table::with_arena(
-            &format!("{dir}/cols"),
-            cols_schema,
-            0,
-            256 * 1024,
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap();
-        let _ = &mut cols_tab; // empty
+        });
+        assert!(c.load().is_none(), "an undecodable node must abort load_circuit");
+    }
 
-        let result = load_circuit(
-            &mut nodes_tab,
-            &mut edges_tab,
-            &mut cols_tab,
-            view_id,
-            SchemaDescriptor::default(),
+    #[test]
+    fn test_load_circuit_keeps_empty_expr_blob_present() {
+        // A non-NULL expr_program that reads back empty is a damaged blob. The
+        // load must hand it on as `Some`, since `None` is how an absent program
+        // is spelled and would turn this Filter into `WHERE TRUE`; rejecting the
+        // undecodable blob is the compile's job (see the corrupt-blob tests).
+        let mut c = CircuitTables::new();
+        c.put_nodes(|bb| {
+            bb.begin_row(CircuitTables::pk(0), 1);
+            bb.put_u64(0); // node_id
+            bb.put_u64(gnitz_wire::OPCODE_FILTER);
+            bb.put_null(); // source_table
+            bb.put_blob(&[]); // expr_program — non-NULL, zero length
+            bb.end_row();
+        });
+        let loaded = c.load().expect("a damaged blob is not a load failure");
+        assert!(
+            matches!(loaded.nodes.get(&0), Some(gnitz_wire::OpNode::Filter(Some(b))) if b.is_empty()),
+            "an empty blob must stay present, not collapse to a pass-all filter"
         );
-        assert!(result.is_none(), "an undecodable node must abort load_circuit");
     }
 
     #[test]
     fn test_load_circuit_aborts_on_orphan_edge() {
-        // Two valid nodes plus an edge whose dst (node 7) does not exist (item
-        // 28). load_circuit must return None rather than create a phantom node.
-        use crate::storage::BatchBuilder;
-        // The `TempDir` guard must outlive the `Table`s built below it: each
-        // one's `ShardIndex` holds the path.
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().to_str().unwrap();
-        let nodes_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODES_COLS);
-        let edges_schema = wire_sys_schema(gnitz_wire::CIRCUIT_EDGES_COLS);
-        let cols_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS);
-
-        let view_id: u64 = 1;
-        // Match pack_view_pk: view_id in the high half so its at-rest OPK
-        // (big-endian) image leads the PK region (where load_circuit seeks).
-        let pk = |sub: u64| -> u128 { ((view_id as u128) << 64) | (sub as u128) };
-
-        let mut nodes_tab = Table::with_arena(
-            &format!("{dir}/nodes"),
-            nodes_schema,
-            0,
-            256 * 1024,
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap();
-        {
-            let mut bb = BatchBuilder::new(nodes_schema);
+        // An edge whose dst does not exist must abort rather than create a
+        // phantom node.
+        let mut c = CircuitTables::new();
+        c.put_nodes(|bb| {
             // node 0: ScanDelta(source 99)
-            bb.begin_row(pk(0), 1);
+            bb.begin_row(CircuitTables::pk(0), 1);
             bb.put_u64(0);
             bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
             bb.put_u64(99); // source_table
             bb.put_null(); // expr_program
             bb.end_row();
             // node 1: IntegrateSink
-            bb.begin_row(pk(1), 1);
+            bb.begin_row(CircuitTables::pk(1), 1);
             bb.put_u64(1);
             bb.put_u64(gnitz_wire::OPCODE_INTEGRATE);
             bb.put_null(); // source_table
             bb.put_null(); // expr_program
             bb.end_row();
-            nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
-        }
-        let mut edges_tab = Table::with_arena(
-            &format!("{dir}/edges"),
-            edges_schema,
-            0,
-            256 * 1024,
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap();
-        {
-            let mut bb = BatchBuilder::new(edges_schema);
+        })
+        .put_edges(|bb| {
             // Edge 0 → 7, but node 7 does not exist.
-            bb.begin_row(pk(0), 1);
+            bb.begin_row(CircuitTables::pk(0), 1);
             bb.put_u64(7); // dst_node (orphan)
             bb.put_u64(PORT_IN as u64);
             bb.put_u64(0); // src_node
             bb.end_row();
-            edges_tab.ingest_owned_batch(bb.finish()).unwrap();
-        }
-        let mut cols_tab = Table::with_arena(
-            &format!("{dir}/cols"),
-            cols_schema,
-            0,
-            256 * 1024,
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap();
-        let _ = &mut cols_tab;
-
-        let result = load_circuit(
-            &mut nodes_tab,
-            &mut edges_tab,
-            &mut cols_tab,
-            view_id,
-            SchemaDescriptor::default(),
-        );
+        });
         assert!(
-            result.is_none(),
+            c.load().is_none(),
             "an edge to a non-existent node must abort load_circuit"
         );
     }

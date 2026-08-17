@@ -155,8 +155,7 @@ pub(super) fn link_child(
         fs::hard_link(
             format!("{source}/{}", e.filename_str()),
             format!("{target}/{}", e.filename_str()),
-        )
-        .map_err(|_| StorageError::Io)?;
+        )?;
     }
     manifest::publish_sync(
         target,
@@ -184,7 +183,7 @@ pub fn remove_child(dir: &str) {
 pub(super) fn fsync_dir(dir: &str) -> Result<(), StorageError> {
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
-        .map_err(|_| StorageError::Io)
+        .map_err(StorageError::from)
 }
 
 #[cfg(test)]

@@ -1,10 +1,10 @@
 //! POSIX I/O and Linux syscall wrappers, in two documented tiers:
 //!
-//! - **File-I/O tier** — safe functions returning `io::Result` (or
-//!   `Option<OwnedFd>` where callers use absence semantically): fd read/write
-//!   with EINTR/partial-write handling, fdatasync/fsync, fallocate, ftruncate,
-//!   O_TMPFILE, NOCOW, madvise, `map_shared_sized`, the Unix server socket,
-//!   fd-limit, `Mmap`.
+//! - **File-I/O tier** — safe functions returning `io::Result`, so the errno is
+//!   captured at the syscall and never re-read from ambient state: fd
+//!   read/write with EINTR/partial-write handling, open, rename, fdatasync,
+//!   fallocate, ftruncate, O_TMPFILE, NOCOW, madvise, `map_shared_sized`, the
+//!   Unix server socket, fd-limit, `Mmap`.
 //! - **IPC tier** — eventfd, futex, memfd. `eventfd_wait` and the `futex_*`
 //!   calls keep their raw return codes: their callers inspect errno
 //!   (EAGAIN/ETIMEDOUT) and re-read the rings rather than trust the return.
@@ -62,19 +62,48 @@ pub(crate) fn pwrite_all_fd(fd: c_int, buf: &[u8], offset: libc::off_t) -> std::
     })
 }
 
-/// `libc::openat` returning an `OwnedFd`, or `None` on failure (errno untouched).
-pub(crate) fn openat_owned(dirfd: c_int, name: &std::ffi::CStr, flags: c_int) -> Option<OwnedFd> {
+/// `libc::openat` returning an `OwnedFd`. The errno is captured here, at the
+/// syscall, so no caller has to read it back out of ambient state.
+pub(crate) fn openat_owned(dirfd: c_int, name: &std::ffi::CStr, flags: c_int) -> std::io::Result<OwnedFd> {
     let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, 0o644 as libc::mode_t) };
     if fd < 0 {
-        return None;
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: fresh descriptor from `openat`; the `OwnedFd` is the sole closer.
-    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// `libc::open` returning an `OwnedFd`, or `None` on failure (errno untouched).
-pub(crate) fn open_owned(path: &std::ffi::CStr, flags: c_int) -> Option<OwnedFd> {
+/// `libc::open` returning an `OwnedFd`, the `AT_FDCWD` case of [`openat_owned`].
+pub(crate) fn open_owned(path: &std::ffi::CStr, flags: c_int) -> std::io::Result<OwnedFd> {
     openat_owned(libc::AT_FDCWD, path, flags)
+}
+
+/// `libc::renameat`, with the errno captured before any cleanup the caller
+/// runs on the failure path can overwrite it.
+pub(crate) fn renameat(
+    olddirfd: c_int,
+    old: &std::ffi::CStr,
+    newdirfd: c_int,
+    new: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    let rc = unsafe { libc::renameat(olddirfd, old.as_ptr(), newdirfd, new.as_ptr()) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `libc::rename`, the `AT_FDCWD` case of [`renameat`].
+pub(crate) fn rename(old: &std::ffi::CStr, new: &std::ffi::CStr) -> std::io::Result<()> {
+    renameat(libc::AT_FDCWD, old, libc::AT_FDCWD, new)
+}
+
+/// `libc::fdatasync` — flush `fd`'s data (not its metadata) to the device.
+pub(crate) fn fdatasync(fd: c_int) -> std::io::Result<()> {
+    if unsafe { libc::fdatasync(fd) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Retry a raw syscall until it succeeds (`>= 0`) or fails with an error other
@@ -443,7 +472,7 @@ impl Mmap {
     /// Open `path` read-only, mmap the whole (non-empty) file, and apply
     /// huge-page + sequential madvise hints.
     pub(crate) fn open_ro(path: &std::ffi::CStr) -> std::io::Result<Self> {
-        let fd = open_owned(path, libc::O_RDONLY).ok_or_else(std::io::Error::last_os_error)?;
+        let fd = open_owned(path, libc::O_RDONLY)?;
         let len = fd_size(std::os::fd::AsRawFd::as_raw_fd(&fd))?;
         if len == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));

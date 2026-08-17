@@ -1,7 +1,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::error::StorageError;
-use crate::foundation::posix_io::open_owned;
+use crate::foundation::posix_io::{self, open_owned};
 use crate::foundation::xxh;
 use gnitz_wire::{read_u64_le, write_u64_le};
 
@@ -253,7 +253,7 @@ fn read_bytes(path: &std::ffi::CStr) -> Result<Option<Vec<u8>>, StorageError> {
     match std::fs::read(std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()))) {
         Ok(buf) => Ok(Some(buf)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(StorageError::Io),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -289,11 +289,8 @@ impl PreparedManifest {
     /// sole owner of the rename + Drop-suppression transition: a failure leaves
     /// `committed` unset, so Drop unlinks the `.tmp`.
     pub fn commit(mut self) -> Result<(), StorageError> {
-        let rc = unsafe { libc::rename(self.tmp_path.as_ptr(), self.final_path.as_ptr()) };
-        if rc < 0 {
-            // `self` drops here: Drop unlinks the .tmp.
-            return Err(StorageError::Io);
-        }
+        // `self` drops on the error path: Drop unlinks the .tmp.
+        posix_io::rename(&self.tmp_path, &self.final_path)?;
         self.committed = true; // renamed; suppress the .tmp unlink in Drop
         Ok(())
     }
@@ -323,13 +320,13 @@ pub fn prepare_file(
     let tmp_path = super::cstr_with_tmp_suffix(path)?;
     let final_path = super::cstr(path.to_bytes())?;
 
-    let fd = open_owned(&tmp_path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC).ok_or(StorageError::Io)?;
+    let fd = open_owned(&tmp_path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
 
-    if crate::foundation::posix_io::write_all_fd(fd.as_raw_fd(), &buf[..written]).is_err() {
+    if let Err(e) = posix_io::write_all_fd(fd.as_raw_fd(), &buf[..written]) {
         unsafe {
             libc::unlink(tmp_path.as_ptr());
         }
-        return Err(StorageError::Io);
+        return Err(e.into());
     }
 
     Ok(PreparedManifest {
@@ -378,9 +375,7 @@ pub(super) fn publish_sync(
     header: ManifestHeader,
 ) -> Result<(), StorageError> {
     let staged = prepare_file(&super::cstr(path(dir))?, entries, header)?;
-    if unsafe { libc::fdatasync(staged.fd()) } < 0 {
-        return Err(StorageError::Io);
-    }
+    posix_io::fdatasync(staged.fd())?;
     super::child_dir::fsync_dir(dir)?;
     staged.commit()?;
     super::child_dir::fsync_dir(dir)
