@@ -157,10 +157,78 @@ pub(crate) fn lower(
     chain: &mut ViewChain,
     rel: Rc<RelExpr>,
     view_id: u64,
+    bounded: bool,
 ) -> Result<EmitPieces, GnitzSqlError> {
+    if bounded {
+        reject_ineligible_capacity_body(&rel)?;
+    }
     let mut memo = CutMemo::new();
     let (pieces, _layout) = lower_body(client, chain, &mut memo, &rel, view_id)?;
     Ok(pieces)
+}
+
+/// Reject a body a capacity-bounded view cannot have. Eligibility is a **positive
+/// list** of exactly the two shapes per-key hydration can replay: a
+/// filter/projection over one relation, and a plain inner equi-join. Anything else
+/// falls through to a rejection, so a new body shape does not silently inherit
+/// eligibility.
+///
+/// One classifier over the bound tree, asked once before lowering, rather than a
+/// rule restated in each `lower_body` arm: a per-arm rule is one a new arm can
+/// forget, and it reads as a whitelist while behaving as a blacklist. The arm
+/// structure here mirrors `lower_body`'s deliberately — same order, same fusion
+/// question first — so the shape named in the error is the shape that would have
+/// been lowered. `build_query_segments` supplies the other half of the rule (the
+/// body must not have cut into hidden segments), which no single-tree walk can
+/// see.
+fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
+    let shape = match rel {
+        RelExpr::Project { input, items } => {
+            let (_, source) = split_filter(input);
+            match source.as_ref() {
+                // The cut materializes the whole pre-WHERE combine output at full
+                // width in a hidden, unbounded segment, so a capacity here would
+                // bound a small projection sitting on an unbounded copy of the
+                // same rows.
+                _ if projection_is_computed(items) && !fuses_computed_projection(source) => {
+                    "a computed projection over a combine"
+                }
+                // Eligible: filter/projection over one relation.
+                RelExpr::Get { .. } => return Ok(()),
+                RelExpr::Join {
+                    kind: JoinType::Inner,
+                    on,
+                    ..
+                } => match on.class()?.range.is_some() {
+                    // A range/band join's null-fill threshold pipeline is not
+                    // replayable per key.
+                    true => "a range or band join",
+                    // Eligible: plain inner equi-join.
+                    false => return Ok(()),
+                },
+                RelExpr::Join {
+                    kind: JoinType::Left | JoinType::Right | JoinType::Full,
+                    ..
+                } => "an outer join",
+                RelExpr::Join {
+                    kind: JoinType::Semi | JoinType::Anti,
+                    ..
+                } => "EXISTS / NOT EXISTS / IN",
+                RelExpr::Join {
+                    kind: JoinType::Mark, ..
+                } => "a mark join (IN / ANY over a subquery)",
+                RelExpr::Reduce { .. } => "GROUP BY / an aggregate",
+                _ => "a derived table / DISTINCT / set-operation subquery",
+            }
+        }
+        RelExpr::Distinct { .. } => "a root DISTINCT",
+        RelExpr::SetOp { .. } => "a root set operation",
+        _ => "this body",
+    };
+    Err(GnitzSqlError::Unsupported(format!(
+        "CREATE VIEW WITH (capacity …): {shape} is not supported; \
+         only a filter/projection over one relation and an inner equi-join are"
+    )))
 }
 
 /// Lower a complete view body — linear or combine-class — returning the circuit

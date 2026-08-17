@@ -1815,8 +1815,17 @@ fn build_resolve_reply(
             is_unique: ic.is_unique,
         })
         .collect();
+    // A capacity-bounded view: the client's leaf rule refuses to bind it inside
+    // a view body, and `ALTER VIEW … AS` refuses to retarget it.
+    let is_bounded = shared
+        .cat()
+        .dag
+        .tables
+        .get(&tid)
+        .is_some_and(|e| e.capacity_bytes.is_some());
     let blob = gnitz_wire::RelDescriptorBlob {
         is_view: kind.is_view(),
+        is_bounded,
         replicated,
         fks,
         indexes,

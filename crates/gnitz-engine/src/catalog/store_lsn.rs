@@ -70,16 +70,16 @@ impl CatalogEngine {
     /// child, so the rebuilt handle is homed wherever the caller now runs. The
     /// caller does whatever on-disk preparation its case needs first.
     fn rebuild_relation_store(&mut self, tid: i64, what: &str) -> Result<(), String> {
-        let (dir, schema, kind) = {
+        let (dir, schema, kind, capacity_bytes) = {
             let e = self
                 .dag
                 .tables
                 .get(&tid)
                 .ok_or_else(|| format!("{what}: relation {tid} not registered"))?;
-            (e.directory.clone(), e.schema, e.kind)
+            (e.directory.clone(), e.schema, e.kind, e.capacity_bytes)
         };
         let handle = self
-            .build_relation_store(kind, &dir, tid, schema)
+            .build_relation_store(kind, &dir, tid, schema, capacity_bytes)
             .map_err(|e| format!("{what} tid={tid}: {e}"))?;
         self.dag.tables.get_mut(&tid).expect("entry read above").handle = handle;
         Ok(())

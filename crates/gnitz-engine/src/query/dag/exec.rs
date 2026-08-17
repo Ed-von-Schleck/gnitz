@@ -121,7 +121,8 @@ impl DagEngine {
     /// state.
     fn execute_sub_plan_multi(sub: &mut SubPlan, inputs: impl IntoIterator<Item = (u16, Batch)>) -> Option<Batch> {
         let SubPlan { vm, out_reg, .. } = sub;
-        vm.refresh_owned_cursors();
+        vm.compact_owned_traces();
+        vm.bind_trace_cursors();
         vm::execute_epoch_multi(&vm.program, &mut vm.regfile, inputs, *out_reg)
     }
 

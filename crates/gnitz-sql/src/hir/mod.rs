@@ -42,12 +42,13 @@ pub(crate) fn bind_and_lower(
     chain: &mut ViewChain,
     body: &SetExpr,
     view_id: u64,
+    bounded: bool,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let ids = ColIdGen::new();
     let rel = bind::bind_body(client, binder, &ids, body)?;
     let rel = rewrite::decorrelate(rel, &ids)?;
     let rel = rewrite::classify(rel)?;
-    lower::lower(client, chain, rel, view_id)
+    lower::lower(client, chain, rel, view_id, bounded)
 }
 
 /// Opaque column identity, unique within one `bind_and_lower` invocation, never

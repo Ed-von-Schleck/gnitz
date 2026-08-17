@@ -13,8 +13,8 @@ use crate::validate::{
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TypeCode};
 use sqlparser::ast::{
-    ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, SqlOption,
-    TableConstraint, UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
+    ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
+    UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
 };
 
 /// FK child/parent type compatibility: an integer child widens to an integer
@@ -192,35 +192,25 @@ fn resolve_fk_target(
 /// `WITH` option is rejected so a typo cannot be silently ignored (gnitz has no
 /// other table-level `WITH` options today).
 fn parse_replicated_option(table_options: &CreateTableOptions) -> Result<bool, GnitzSqlError> {
-    // Only the `WITH (...)` form carries gnitz options. `OPTIONS(...)`,
-    // space-separated, and `TBLPROPERTIES` are vendor metadata accepted as no-ops
-    // (matching the pre-0.62 handling of the separate `options`/`table_properties`
-    // fields), and `None` is the common no-options case.
-    let with_options: &[SqlOption] = match table_options {
-        CreateTableOptions::With(opts) => opts,
-        _ => &[],
-    };
     let mut replicated = false;
-    for opt in with_options {
-        match opt {
-            SqlOption::KeyValue { key, value } if key.value.eq_ignore_ascii_case("replicated") => {
-                let Expr::Value(ValueWithSpan {
-                    value: Value::Boolean(b),
-                    ..
-                }) = value
-                else {
-                    return Err(GnitzSqlError::Plan(
-                        "WITH (replicated = …) expects a boolean (true/false)".into(),
-                    ));
-                };
-                replicated = *b;
-            }
-            other => {
-                return Err(GnitzSqlError::Plan(format!(
-                    "unsupported CREATE TABLE option in WITH (…): {other:?}"
-                )))
-            }
+    for opt in crate::validate::with_options(table_options) {
+        let (key, value) = crate::validate::require_kv_option(opt, "CREATE TABLE")?;
+        if !key.value.eq_ignore_ascii_case("replicated") {
+            return Err(GnitzSqlError::Plan(format!(
+                "unknown CREATE TABLE option '{}'; the only supported option is `replicated`",
+                key.value
+            )));
         }
+        let Expr::Value(ValueWithSpan {
+            value: Value::Boolean(b),
+            ..
+        }) = value
+        else {
+            return Err(GnitzSqlError::Plan(
+                "WITH (replicated = …) expects a boolean (true/false)".into(),
+            ));
+        };
+        replicated = *b;
     }
     Ok(replicated)
 }

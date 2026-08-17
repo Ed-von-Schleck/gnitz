@@ -14,8 +14,8 @@ use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::{
     CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_NAME,
     IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME,
-    TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX, TABTAB_COL_SCHEMA_ID, VIEWTAB_COL_NAME,
-    VIEWTAB_COL_PK_COL_IDX, VIEWTAB_COL_SCHEMA_ID, VIEWTAB_COL_SQL,
+    TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX, TABTAB_COL_SCHEMA_ID, VIEWTAB_COL_CAPACITY,
+    VIEWTAB_COL_NAME, VIEWTAB_COL_PK_COL_IDX, VIEWTAB_COL_SCHEMA_ID, VIEWTAB_COL_SQL,
 };
 
 // --- Module-private helpers ---
@@ -103,6 +103,9 @@ struct ViewRecord {
     name: String,
     sql_definition: String,
     pk_col_idx: u64,
+    /// `WITH (capacity = …)` in bytes; `0` is unbounded. Round-trips a RENAME by
+    /// construction — `alter_rename_relation` re-emits `ViewRecord { name, ..vr }`.
+    capacity_bytes: u64,
 }
 
 /// `is_unique` stays the stored word rather than a `bool`, so a DROP echoes
@@ -166,13 +169,36 @@ pub fn hidden_view_name(owner_vid: u64, idx: usize) -> String {
 /// The name prefix every hidden segment of `owner_vid` carries. The trailing
 /// separator keeps `__h5_` from matching `__h51_0`.
 fn hidden_view_prefix(owner_vid: u64) -> String {
-    format!("__h{owner_vid}_")
+    format!("{}{owner_vid}_", gnitz_wire::HIDDEN_VIEW_PREFIX)
 }
 
 /// Whether `name` is a synthesized hidden segment view (any owner). Sound
 /// because user identifiers cannot start with `_` (`validate_user_identifier`).
 fn is_hidden_view_name(name: &str) -> bool {
-    name.starts_with("__h")
+    name.starts_with(gnitz_wire::HIDDEN_VIEW_PREFIX)
+}
+
+/// What a relation *is*, resolved together with its id so the two cannot
+/// disagree. Named fields rather than a tuple: every caller reads one or two of
+/// them, and the next per-relation attribute lands here instead of widening a
+/// tuple at every callsite.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RelKind {
+    pub tid: u64,
+    pub is_view: bool,
+    /// A view created `WITH (capacity = …)`. Views may not be created over one
+    /// (the leaf rule) and `ALTER VIEW … AS` may not retarget one.
+    pub is_bounded: bool,
+}
+
+impl RelKind {
+    fn of(d: &RelDescriptor) -> Self {
+        RelKind {
+            tid: d.tid,
+            is_view: d.is_view,
+            is_bounded: d.is_bounded,
+        }
+    }
 }
 
 /// One view in a [`GnitzClient::create_view_chain`] bundle. The `circuit`'s
@@ -185,6 +211,9 @@ pub struct PlannedView {
     pub circuit: Circuit,
     pub output_columns: Vec<ColumnDef>,
     pub pk_cols: Vec<u32>,
+    /// `WITH (capacity = …)` in bytes, set on the chain's **final** segment only;
+    /// `None` is unbounded. Hidden chain segments never carry one.
+    pub capacity_bytes: Option<u64>,
 }
 
 /// Everything a statement needs to know about one relation. Statement-scoped:
@@ -194,6 +223,9 @@ pub struct PlannedView {
 struct RelDescriptor {
     tid: u64,
     is_view: bool,
+    /// A view created `WITH (capacity = …)`. Views may not be created over one
+    /// (the leaf rule) and `ALTER VIEW … AS` may not retarget one.
+    is_bounded: bool,
     replicated: bool,
     schema: Arc<Schema>,
     indexes: Arc<Vec<IndexMeta>>,
@@ -1022,6 +1054,8 @@ impl GnitzClient {
                 circuit,
                 output_columns: output_columns.to_vec(),
                 pk_cols: pk_cols.to_vec(),
+                // The circuit-builder API has no capacity surface.
+                capacity_bytes: None,
             }],
             None,
         )?;
@@ -1163,6 +1197,7 @@ impl GnitzClient {
                         name: canon_name(&pv.name),
                         sql_definition: pv.sql_text,
                         pk_col_idx: pk_packed,
+                        capacity_bytes: pv.capacity_bytes.unwrap_or(0),
                     },
                 );
             }
@@ -1429,16 +1464,16 @@ impl GnitzClient {
         }
     }
 
-    /// Resolve `name` under `schema_name` to `(id, schema, is_view)`; the kind
-    /// comes from the same descriptor as the id, so the two can never disagree.
-    pub fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(u64, Arc<Schema>, bool), ClientError> {
+    /// Resolve `name` under `schema_name` to its id and kind; both come from the
+    /// same descriptor, so they can never disagree.
+    pub fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(Arc<Schema>, RelKind), ClientError> {
         let d = self.resolve(schema_name, name)?.ok_or_else(|| {
             ClientError::ServerError(format!(
                 "Table or view '{}' not found",
                 qualified_name(schema_name, name)
             ))
         })?;
-        Ok((d.tid, Arc::clone(&d.schema), d.is_view))
+        Ok((Arc::clone(&d.schema), RelKind::of(&d)))
     }
 
     pub fn resolve_table_or_view_id(
@@ -1446,17 +1481,17 @@ impl GnitzClient {
         schema_name: &str,
         name: &str,
     ) -> Result<(u64, Arc<Schema>), ClientError> {
-        let (id, schema, _) = self.resolve_relation(schema_name, name)?;
-        Ok((id, schema))
+        let (schema, kind) = self.resolve_relation(schema_name, name)?;
+        Ok((kind.tid, schema))
     }
 
-    /// Resolve `name` under `schema_name` to `(id, is_view)` — the kind probe.
-    /// Every table-vs-view disambiguation (the binder's writable-target check,
-    /// ALTER's target resolution) routes through here rather than re-spelling
-    /// it. `Ok(None)` = no such relation; `Err` = a missing schema or a decode
-    /// error, which must surface rather than be masked as a miss.
-    pub fn resolve_relation_kind(&mut self, schema_name: &str, name: &str) -> Result<Option<(u64, bool)>, ClientError> {
-        Ok(self.resolve(schema_name, name)?.map(|d| (d.tid, d.is_view)))
+    /// The kind probe, without the schema. Every table-vs-view disambiguation
+    /// (the binder's writable-target check, ALTER's target resolution) routes
+    /// through here rather than re-spelling it. `Ok(None)` = no such relation;
+    /// `Err` = a missing schema or a decode error, which must surface rather than
+    /// be masked as a miss.
+    pub fn resolve_relation_kind(&mut self, schema_name: &str, name: &str) -> Result<Option<RelKind>, ClientError> {
+        Ok(self.resolve(schema_name, name)?.map(|d| RelKind::of(&d)))
     }
 
     // --- Relation resolution ---
@@ -1485,6 +1520,7 @@ impl GnitzClient {
         Ok(Some(Arc::new(RelDescriptor {
             tid,
             is_view: blob.is_view,
+            is_bounded: blob.is_bounded,
             replicated: blob.replicated,
             schema,
             indexes: Arc::new(blob.indexes),
@@ -1703,6 +1739,7 @@ fn decode_view_record(batch: &ZSetBatch, i: usize) -> Result<ViewRecord, ClientE
         name: col_str(&batch.columns[VIEWTAB_COL_NAME], i)?.unwrap_or("").to_string(),
         sql_definition: col_str(&batch.columns[VIEWTAB_COL_SQL], i)?.unwrap_or("").to_string(),
         pk_col_idx: col_u64(&batch.columns[VIEWTAB_COL_PK_COL_IDX], i)?,
+        capacity_bytes: col_u64(&batch.columns[VIEWTAB_COL_CAPACITY], i)?,
     })
 }
 
@@ -1774,6 +1811,7 @@ fn append_view_row(a: &mut BatchAppender<'_>, weight: i64, rec: &ViewRecord) {
             name: &rec.name,
             sql_definition: &rec.sql_definition,
             pk_col_idx: rec.pk_col_idx,
+            capacity_bytes: rec.capacity_bytes,
         },
         weight,
     );
@@ -2134,6 +2172,7 @@ mod tests {
             name: "v".into(),
             sql_definition: "SELECT id FROM t".into(),
             pk_col_idx: gnitz_wire::pack_pk_cols(&[2]),
+            capacity_bytes: 4 << 20,
         };
         let mut batch = ZSetBatch::new(schema);
         append_view_row(&mut BatchAppender::new(&mut batch, schema), 1, &rec);
@@ -2144,6 +2183,7 @@ mod tests {
         assert_eq!(back.name, rec.name);
         assert_eq!(back.sql_definition, rec.sql_definition);
         assert_eq!(back.pk_col_idx, rec.pk_col_idx);
+        assert_eq!(back.capacity_bytes, rec.capacity_bytes);
     }
 
     #[test]

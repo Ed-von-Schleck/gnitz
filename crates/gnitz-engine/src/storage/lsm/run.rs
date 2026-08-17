@@ -164,4 +164,11 @@ impl ColumnarSource for Run {
     fn row_count(&self) -> usize {
         Run::count(self)
     }
+    #[inline(always)]
+    fn is_skeleton(&self) -> bool {
+        match self {
+            Run::Mem(_) => false,
+            Run::Shard(s) => s.is_skeleton(),
+        }
+    }
 }

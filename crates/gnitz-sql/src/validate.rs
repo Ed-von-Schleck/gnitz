@@ -972,12 +972,39 @@ pub(crate) fn reject_unhonored_create_table_clauses(
     Ok(())
 }
 
-/// Reject every `CREATE VIEW` clause `execute_create_view` does not consume (`name`, `query`).
+/// The `WITH (…)` options of a `CREATE` statement — the only option form gnitz
+/// reads. `OPTIONS(…)`, space-separated, and `TBLPROPERTIES` are vendor metadata
+/// accepted as no-ops, and `None` is the common no-options case. One spelling for
+/// every statement, so a vendor form cannot be a no-op on one and an error on
+/// another.
+pub(crate) fn with_options(options: &sqlparser::ast::CreateTableOptions) -> &[sqlparser::ast::SqlOption] {
+    match options {
+        sqlparser::ast::CreateTableOptions::With(opts) => opts,
+        _ => &[],
+    }
+}
+
+/// One `WITH (…)` entry as its `key = value` pair, or the shared rejection for
+/// every other option form. `context` names the statement.
+pub(crate) fn require_kv_option<'a>(
+    opt: &'a sqlparser::ast::SqlOption,
+    context: &str,
+) -> Result<(&'a sqlparser::ast::Ident, &'a sqlparser::ast::Expr), GnitzSqlError> {
+    match opt {
+        sqlparser::ast::SqlOption::KeyValue { key, value } => Ok((key, value)),
+        other => Err(GnitzSqlError::Plan(format!(
+            "unsupported {context} option in WITH (…), which takes `key = value` entries: {other:?}"
+        ))),
+    }
+}
+
+/// Reject every `CREATE VIEW` clause `execute_create_view` does not consume
+/// (`name`, `query`, and `options` — see `hir::create::decode_capacity`).
 /// `materialized` is accepted — a gnitz view is already incrementally materialized. `temporary`
 /// (silent permanent view), `to` (silently ignored target), and `columns` (output aliases dropped →
 /// wrong view schema) are rejected. `or_alter`/`or_replace`/`if_not_exists` drop loudly; implement
 /// later. `with_no_schema_binding` parses but is a no-op optimizer hint; the rest cannot populate
-/// under `GenericDialect`.
+/// under `GenericDialect`. `options` is consumed, not rejected.
 pub(crate) fn reject_unhonored_create_view_clauses(
     cv: &sqlparser::ast::CreateView,
     context: &str,

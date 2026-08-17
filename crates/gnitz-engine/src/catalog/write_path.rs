@@ -705,7 +705,8 @@ impl CatalogEngine {
                 let (sid, name, pk, _flags) = read_table_tab_row(batch, i);
                 (sid, name, pk)
             } else {
-                read_view_tab_row(batch, i)
+                let (sid, name, pk, _capacity) = read_view_tab_row(batch, i);
+                (sid, name, pk)
             };
             validate_relation_defs(kind, id, &name, &col_defs, &pk)?;
 

@@ -234,6 +234,7 @@ fn push_view_tab_row(bb: &mut BatchBuilder, weight: i64, vid: i64, view_name: &s
     bb.put_string(view_name);
     bb.put_string(sql);
     bb.put_u64(0); // pk_col_idx
+    bb.put_u64(0); // capacity_bytes: unbounded
     bb.end_row();
 }
 

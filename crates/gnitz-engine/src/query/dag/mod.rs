@@ -14,6 +14,7 @@ use crate::storage::{Batch, RecoverySource, StorageError, Table};
 use gnitz_wire::PkColList;
 
 mod exec;
+mod hydrate;
 mod ingest;
 mod meta;
 mod store_handle;
@@ -143,9 +144,36 @@ pub struct TableEntry {
     pub depth: i32,
     pub directory: String,
     pub index_circuits: Vec<IndexCircuitEntry>,
+    /// `CREATE VIEW … WITH (capacity = …)` in bytes; `None` for every other
+    /// relation. The registry's copy: the resolve reply's bounded flag and the
+    /// engine-side leaf rule run on the post-fork master, where every user
+    /// relation is `StoreHandle::Detached` and there is no `Table` to ask.
+    /// `build_relation_store` stamps it onto each store it opens.
+    pub capacity_bytes: Option<u64>,
 }
 
 impl TableEntry {
+    /// A registry entry for an unbounded relation, with no index circuits yet —
+    /// what every relation but a capacity-bounded view registers as. The bounded
+    /// case sets `capacity_bytes` on top of this.
+    pub fn new(
+        handle: StoreHandle,
+        schema: SchemaDescriptor,
+        kind: RelationKind,
+        depth: i32,
+        directory: String,
+    ) -> Self {
+        TableEntry {
+            handle,
+            schema,
+            kind,
+            depth,
+            directory,
+            index_circuits: Vec::new(),
+            capacity_bytes: None,
+        }
+    }
+
     /// Non-compacting cursor over this relation's store. The entry's own schema
     /// is what a detached handle opens empty in, so reading through here is what
     /// keeps that answer in the relation's shape without the handle holding a
@@ -157,6 +185,16 @@ impl TableEntry {
     /// Materialize every positive-weight row of this relation's store.
     pub fn full_scan(&self) -> std::rc::Rc<Batch> {
         self.handle.full_scan(&self.schema)
+    }
+
+    /// Whether reads of this relation must go through hydration — i.e. whether its
+    /// store actually holds a skeleton row. This, not `capacity_bytes`, is what
+    /// every read path branches on: a bounded view under its cap has dehydrated
+    /// nothing and reads exactly like an unbounded one, so it keeps the ordinary
+    /// cached/bulk read paths, and the branch cannot disagree with what the
+    /// capacity sweep did.
+    pub fn needs_hydration(&self) -> bool {
+        self.handle.has_skeleton_rows()
     }
 
     /// The index circuit covering exactly `cols`, if one exists. The circuit
@@ -248,26 +286,13 @@ impl DagEngine {
 
     // ── Table registry ──────────────────────────────────────────────────
 
-    pub fn register_table(
-        &mut self,
-        table_id: i64,
-        handle: StoreHandle,
-        schema: SchemaDescriptor,
-        kind: RelationKind,
-        depth: i32,
-        directory: String,
-    ) {
-        self.tables.insert(
-            table_id,
-            TableEntry {
-                handle,
-                schema,
-                kind,
-                depth,
-                directory,
-                index_circuits: Vec::new(),
-            },
-        );
+    /// Enter a relation in the registry. Takes the entry itself rather than one
+    /// argument per field: `TableEntry` is all-public and every field but
+    /// `index_circuits` (which starts empty, filled by `add_index_circuit`) is
+    /// caller-supplied, so a new per-relation attribute lands on the struct and
+    /// nothing here changes.
+    pub fn register_table(&mut self, table_id: i64, entry: TableEntry) {
+        self.tables.insert(table_id, entry);
     }
 
     pub fn unregister_table(&mut self, table_id: i64) {
@@ -430,12 +455,17 @@ impl DagEngine {
     /// Read `view_id`'s circuit out of the system tables and compile it, homing
     /// every scratch child under `view_dir`. The directory is a parameter and not
     /// read off the entry because the pre-flight compiles into a throwaway root.
+    /// Whether the view is capacity-bounded is read off the registry here rather
+    /// than passed in: the compiler layer sees only the circuit system tables,
+    /// never `VIEW_TAB`, so it cannot derive it — but both callers would derive it
+    /// from this same entry.
     fn compile_circuit(
         &self,
         view_id: i64,
         view_dir: &str,
         view_schema: &SchemaDescriptor,
     ) -> Result<CompileOutput, compiler::CompileError> {
+        let bounded = self.tables.get(&view_id).is_some_and(|e| e.capacity_bytes.is_some());
         let ext_tables = self.ext_tables();
         unsafe {
             compiler::compile_view(
@@ -446,6 +476,7 @@ impl DagEngine {
                 view_dir,
                 view_schema,
                 &ext_tables,
+                bounded,
             )
         }
     }
@@ -461,8 +492,11 @@ impl DagEngine {
     ///
     /// The verdict is worker-independent: worker context reaches the compile only
     /// as the scratch path component (which `root` overrides), as `WorkerFilter`
-    /// and `ReducePlan` operands baked into instructions nothing here executes, and
-    /// as the committed generation a manifest-less directory makes moot.
+    /// and `ReducePlan` operands baked into instructions nothing here executes, as
+    /// the committed generation a manifest-less directory makes moot, and — since a
+    /// `WorkerFilter` emits no instruction at `W == 1` — as instruction *offsets*,
+    /// which only a bounded view's hydration plan reads and no rejection depends
+    /// on.
     pub(crate) fn preflight_compile(&self, view_id: i64, root: &str) -> Result<(), compiler::CompileError> {
         // `hook_view_register` ran earlier in this bundle's ingest loop, so a
         // registered `+1` VIEW_TAB row is always in `tables`; a miss is an engine
@@ -552,11 +586,13 @@ mod tests {
         let mut tbl = make_test_table("reg_unreg");
         dag.register_table(
             100,
-            StoreHandle::Borrowed(&mut *tbl as *mut Table),
-            schema,
-            RelationKind::BaseTable,
-            0,
-            String::new(),
+            TableEntry::new(
+                StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                schema,
+                RelationKind::BaseTable,
+                0,
+                String::new(),
+            ),
         );
         assert!(dag.tables.contains_key(&100));
 
@@ -631,11 +667,13 @@ mod tests {
         let mut tbl = make_test_table("idx_parent");
         dag.register_table(
             50,
-            StoreHandle::Borrowed(&mut *tbl as *mut Table),
-            schema,
-            RelationKind::BaseTable,
-            0,
-            String::new(),
+            TableEntry::new(
+                StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                schema,
+                RelationKind::BaseTable,
+                0,
+                String::new(),
+            ),
         );
         let idx_tbl = make_test_table("idx_child");
         dag.add_index_circuit(50, &[2], 999, idx_tbl, schema, false);
@@ -717,11 +755,13 @@ mod tests {
         let mut tbl = make_test_table("flush_ic_parent");
         dag.register_table(
             70,
-            StoreHandle::Borrowed(&mut *tbl as *mut Table),
-            parent_schema,
-            RelationKind::BaseTable,
-            0,
-            String::new(),
+            TableEntry::new(
+                StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                parent_schema,
+                RelationKind::BaseTable,
+                0,
+                String::new(),
+            ),
         );
 
         // Durable index table: flush writes shard_*.db only if called.
@@ -1051,11 +1091,13 @@ mod tests {
         let mut tbl = Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive { resume_at: None }).unwrap());
         dag.register_table(
             70,
-            StoreHandle::Borrowed(&mut *tbl as *mut Table),
-            schema,
-            RelationKind::View,
-            0,
-            String::new(),
+            TableEntry::new(
+                StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                schema,
+                RelationKind::View,
+                0,
+                String::new(),
+            ),
         );
         let mut batch = Batch::with_capacity(schema, 1);
         batch.extend_pk(1u128);

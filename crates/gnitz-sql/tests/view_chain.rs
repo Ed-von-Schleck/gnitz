@@ -87,6 +87,7 @@ fn plan_chain_with(
         circuit: circuit_of(h_vid, base_tid),
         output_columns: cols.to_vec(),
         pk_cols: vec![0],
+        capacity_bytes: None,
     };
     let f = PlannedView {
         name: f_name.to_string(),
@@ -94,6 +95,7 @@ fn plan_chain_with(
         circuit: circuit_of(f_vid, h_vid),
         output_columns: cols.to_vec(),
         pk_cols: vec![0],
+        capacity_bytes: None,
     };
     [h, f]
 }
@@ -321,6 +323,7 @@ fn chain_rejects_over_length() {
             circuit: identity_exchange_circuit(0, base_tid),
             output_columns: cols.clone(),
             pk_cols: vec![0],
+            capacity_bytes: None,
         })
         .collect();
     let res = client.create_view_chain(&sn, planned, None);

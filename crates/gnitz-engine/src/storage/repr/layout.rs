@@ -11,14 +11,14 @@ pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// sizes come from that schema, so they reject most shards written under a
 /// different one; a Constant-encoded region is one element wide under either
 /// schema, and only this word rejects that.
-pub(crate) const SHARD_VERSION: u64 = 12;
+pub(crate) const SHARD_VERSION: u64 = 13;
 
 /// Pin the system-family column shapes to the version word above, the way
 /// `gnitz_wire::wal` pins them to `WAL_FORMAT_VERSION`. Nothing else notices a
 /// shape change. If this fails, bump `SHARD_VERSION` and paste the reported
 /// digest here.
 const _: () = assert!(
-    gnitz_wire::SYS_SCHEMA_DIGEST == 5353188239287564337 && SHARD_VERSION == 12,
+    gnitz_wire::SYS_SCHEMA_DIGEST == 4260079152260924933 && SHARD_VERSION == 13,
     "system-family column shapes changed: bump SHARD_VERSION"
 );
 pub(crate) const HEADER_SIZE: usize = 64;
@@ -34,6 +34,20 @@ pub(crate) const OFF_DESC_CHECKSUM: usize = 24;
 /// wider (post-`ALTER TABLE … ADD COLUMN`) walks the directory by this count and
 /// pads the columns past it to NULL.
 pub(crate) const OFF_FILE_NPC: usize = 32;
+
+/// High bit of [`OFF_FILE_NPC`]: the file's payload columns are absent *by
+/// design* — it is a capacity-bounded view's skeleton shard, whose rows are one
+/// (PK, coarse weight) pair each. The low bits stay the writer's payload-column
+/// count (0 for a skeleton), which the reader bounds against
+/// `MAX_PAYLOAD_REGIONS`; this bit is masked off before that check.
+///
+/// A bare `file_npc == 0` would not say this: an all-PK base table widened by
+/// `ALTER TABLE … ADD COLUMN` produces the identical region shape with genuine
+/// NULL semantics, and the read path's coarsening comparators must not treat
+/// that table's cross-tier retract/insert pairs as one key. Bits 8..63 of the
+/// word are otherwise unused and already inside [`desc_digest`]'s span, so the
+/// bit is as unforgeable as any other descriptive byte.
+pub(crate) const SHARD_FLAG_SKELETON: u64 = 1 << 63;
 pub(crate) const OFF_XOR8_OFFSET: usize = 40;
 pub(crate) const OFF_XOR8_SIZE: usize = 48;
 pub(crate) const OFF_XOR8_CHECKSUM: usize = 56;

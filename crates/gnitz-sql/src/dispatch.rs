@@ -92,6 +92,9 @@ pub(crate) fn execute_statement(
         }
         Statement::CreateView(cv) => {
             reject_unhonored_create_view_clauses(cv, "CREATE VIEW")?;
+            // Everything this binder resolves becomes a source of the new view,
+            // so the bounded-view leaf rule applies to all of it.
+            let mut binder = binder.for_view_body();
             crate::hir::execute_create_view(client, schema_name, cv, &mut binder)
         }
         Statement::Insert(insert) => {
@@ -142,6 +145,7 @@ pub(crate) fn execute_statement(
             with_options,
         } => {
             reject_unhonored_alter_view_clauses(columns, with_options, "ALTER VIEW")?;
+            let mut binder = binder.for_view_body();
             crate::hir::execute_alter_view(client, schema_name, name, query, &mut binder)
         }
         _ => Err(GnitzSqlError::Unsupported(format!(

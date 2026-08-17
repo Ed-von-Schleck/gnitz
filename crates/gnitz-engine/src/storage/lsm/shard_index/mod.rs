@@ -23,6 +23,9 @@ mod persist;
 const MAX_LEVELS: usize = 3;
 /// Guarded levels below L0 — L1 and L2.
 const FLSM_LEVELS: usize = MAX_LEVELS - 1;
+/// Index of the deepest guarded level (L2). The one level whose guards fold to a
+/// single file, and the only one whose guards may be dehydrated.
+const TERMINAL_LEVEL_IDX: usize = FLSM_LEVELS - 1;
 const L0_COMPACT_THRESHOLD: usize = 4;
 const GUARD_FILE_THRESHOLD: usize = 4;
 const LMAX_FILE_THRESHOLD: usize = 1;
@@ -103,6 +106,41 @@ impl LevelGuard {
             entries: Vec::new(),
         }
     }
+
+    /// Whether this guard holds only skeleton shards — the state a capacity
+    /// sweep leaves behind. Derived from the shard headers rather than persisted,
+    /// so it survives any manifest reload with no new manifest field to keep in
+    /// step. An empty guard is not dehydrated: there is nothing to say it of, and
+    /// answering `true` would make the next fold into it skeletonize data the
+    /// sweep never chose to evict.
+    ///
+    /// Only terminal-level guards are ever dehydrated (L0 and L1 always hold
+    /// full-width shards), and a terminal guard holds exactly one entry
+    /// (`LMAX_FILE_THRESHOLD == 1`), so "uniformly skeleton or uniformly
+    /// hydrated" holds by construction.
+    fn dehydrated(&self) -> bool {
+        !self.entries.is_empty() && self.entries.iter().all(|e| e.shard.is_skeleton())
+    }
+
+    /// When this guard was last written, as the newest LSN over its entries —
+    /// `None` for an empty guard, which was never written. The only recency signal
+    /// the tree carries; the capacity sweep orders its victims by it.
+    fn newest_lsn(&self) -> Option<u64> {
+        self.entries.iter().map(|e| e.max_lsn).max()
+    }
+
+    /// The `pack_pk_be` key span this guard's entries actually cover, or `None` for
+    /// a guard holding no rows. The guard *key* is only the span's lower fence, so
+    /// a fold out of this guard must route by this instead — see
+    /// [`ShardIndex::vertical_fold`].
+    fn key_extent(&self) -> Option<(u128, u128)> {
+        let live = || self.entries.iter().filter(|e| !e.is_empty());
+        let opk = |k: &crate::schema::key::PkBuf| crate::schema::key::pack_pk_be(k.pk_bytes());
+        Some((
+            live().map(|e| opk(&e.pk_min)).min()?,
+            live().map(|e| opk(&e.pk_max)).max()?,
+        ))
+    }
 }
 
 struct FLSMLevel {
@@ -157,6 +195,10 @@ pub struct ShardIndex {
     /// `clear_unsynced` empties it; a compaction prunes the inputs it consumed.
     /// Files from prior barriers are already durable and never re-synced.
     unsynced: Vec<String>,
+    /// Ceiling on this store's **registered on-disk shard bytes**, from
+    /// `CREATE VIEW … WITH (capacity = …)`. `None` for every store but a
+    /// capacity-bounded view's output store, which pays nothing.
+    capacity_bytes: Option<u64>,
 }
 
 impl ShardIndex {
@@ -170,7 +212,13 @@ impl ShardIndex {
             compact_seq: 0,
             pending_deletions: Vec::new(),
             unsynced: Vec::new(),
+            capacity_bytes: None,
         }
+    }
+
+    /// Bound this store's registered shard bytes, once, at construction.
+    pub fn set_capacity(&mut self, capacity_bytes: Option<u64>) {
+        self.capacity_bytes = capacity_bytes;
     }
 
     /// Fallible half of a schema swap: re-open every registered shard under
@@ -1154,5 +1202,250 @@ mod tests {
         assert_eq!(schema.pk_stride(), 24);
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
         assert_eq!(idx.l1_guard_keys(), vec![0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Capacity sweep
+    // -----------------------------------------------------------------------
+
+    /// A `(U64 PK | I64)` shard of `pks`, all weight 1, payload = pk.
+    fn write_u64_shard(dir: &std::path::Path, name: &str, pks: &[u64]) -> String {
+        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
+        let weights = vec![1i64; pks.len()];
+        let nulls = vec![0u64; pks.len()];
+        let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+        let blob: Vec<u8> = Vec::new();
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&weights),
+            as_le_bytes(&nulls),
+            as_le_bytes(&vals),
+            &blob,
+        ];
+        let path = dir.join(name);
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            pks.len() as u32,
+            &regions,
+            &make_schema_u64_i64(),
+            shard_file::ShardWriteOpts::default(),
+        )
+        .unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    /// An index holding `n` L0 shards of 40 distinct keys each, spill-stamped
+    /// with ascending LSNs so write-recency victim ordering is observable.
+    fn index_with_l0(dir: &std::path::Path, n: u64) -> ShardIndex {
+        let mut idx = ShardIndex::new(1, dir.to_str().unwrap(), make_schema_u64_i64());
+        for s in 0..n {
+            let pks: Vec<u64> = (0..40).map(|i| s * 1000 + i + 1).collect();
+            let p = write_u64_shard(dir, &format!("l0_{s}.db"), &pks);
+            idx.add_unsynced_shard(&p, s + 1).unwrap();
+        }
+        idx
+    }
+
+    /// Guard indices of the terminal level, split by representation.
+    fn terminal_split(idx: &ShardIndex) -> (Vec<usize>, Vec<usize>) {
+        let mut dehy = Vec::new();
+        let mut hyd = Vec::new();
+        let Some(l) = idx.levels.get(TERMINAL_LEVEL_IDX) else {
+            return (dehy, hyd);
+        };
+        for (gi, g) in l.guards.iter().enumerate() {
+            if g.entries.is_empty() {
+            } else if g.dehydrated() {
+                dehy.push(gi);
+            } else {
+                hyd.push(gi);
+            }
+        }
+        (dehy, hyd)
+    }
+
+    /// A capacity above the store's size never dehydrates anything and never
+    /// pushes data down: the sweep's first test fails and it returns at once.
+    #[test]
+    fn a_slack_capacity_leaves_the_store_untouched() {
+        raise_fd_limit_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut idx = index_with_l0(tmp.path(), 3);
+        let before = idx.resident_bytes();
+        assert!(before > 0);
+
+        idx.set_capacity(Some(before * 4));
+        idx.enforce_capacity().unwrap();
+
+        assert_eq!(idx.resident_bytes(), before, "no compaction ran");
+        assert_eq!(idx.l0.len(), 3, "L0 was not pushed down");
+        assert!(idx.levels.is_empty(), "no level was created");
+        assert!(idx.all_entries().all(|e| !e.shard.is_skeleton()));
+    }
+
+    /// A capacity under the skeleton floor converges across calls rather than
+    /// running the whole level down inside one trigger: each call pushes at most
+    /// once, and dehydration itself is unbudgeted. It stops at the floor —
+    /// everything terminal, everything skeleton — with the cap still unmet.
+    #[test]
+    fn the_sweep_converges_to_the_skeleton_floor_one_push_down_per_call() {
+        raise_fd_limit_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut idx = index_with_l0(tmp.path(), 4);
+
+        // Call 1: nothing terminal to dehydrate, so one push-down (L0 → L1) and
+        // then stop — L1 data cannot be dehydrated where it sits.
+        idx.set_capacity(Some(1));
+        idx.enforce_capacity().unwrap();
+        assert!(idx.l0.is_empty(), "L0 folded into L1");
+        assert!(terminal_split(&idx).0.is_empty(), "nothing dehydrated yet");
+
+        // Further calls: one vertical each, then unbudgeted dehydration of every
+        // terminal guard it exposed. Bounded — the loop below would not
+        // terminate if a call could make no progress.
+        for _ in 0..8 {
+            idx.enforce_capacity().unwrap();
+        }
+        let (dehy, hyd) = terminal_split(&idx);
+        assert!(idx.l0.is_empty() && idx.levels[0].guards.is_empty(), "everything sank");
+        assert!(!dehy.is_empty() && hyd.is_empty(), "the floor is fully dehydrated");
+        assert!(idx.all_entries().all(|e| e.shard.is_skeleton()));
+
+        // At the floor the sweep is a no-op even though the cap is still unmet.
+        let floor = idx.resident_bytes();
+        assert!(floor > 1);
+        idx.enforce_capacity().unwrap();
+        assert_eq!(idx.resident_bytes(), floor, "the floor is the fixpoint");
+    }
+
+    /// Dehydration picks its victim by **write recency**: the terminal guard
+    /// whose newest entry carries the smallest `max_lsn` goes first. The row
+    /// content survives — a skeleton row keeps its key and its summed weight.
+    #[test]
+    fn dehydration_takes_the_oldest_written_terminal_guard_first() {
+        raise_fd_limit_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut idx = index_with_l0(tmp.path(), 3);
+        // Sink everything to the terminal level, still hydrated.
+        idx.run_compact().unwrap();
+        for gi in (0..idx.levels[0].guards.len()).rev() {
+            idx.vertical_fold(gi).unwrap();
+        }
+        let (dehy, hyd) = terminal_split(&idx);
+        assert!(dehy.is_empty() && hyd.len() >= 2, "several hydrated terminal guards");
+
+        let lsn_of = |idx: &ShardIndex, gi: usize| {
+            idx.levels[TERMINAL_LEVEL_IDX].guards[gi]
+                .entries
+                .iter()
+                .map(|e| e.max_lsn)
+                .max()
+                .unwrap()
+        };
+        let oldest = *hyd.iter().min_by_key(|&&gi| lsn_of(&idx, gi)).unwrap();
+        let oldest_key = idx.levels[TERMINAL_LEVEL_IDX].guards[oldest].guard_key;
+        let live_before: Vec<(u128, i64)> = {
+            let g = &idx.levels[TERMINAL_LEVEL_IDX].guards[oldest];
+            let s = &g.entries[0].shard;
+            (0..s.count).map(|i| (s.get_pk(i), s.get_weight(i))).collect()
+        };
+
+        // A capacity just under the current size dehydrates exactly one guard,
+        // and it is that one.
+        idx.set_capacity(Some(idx.resident_bytes() - 1));
+        idx.enforce_capacity().unwrap();
+        let (dehy, _) = terminal_split(&idx);
+        assert_eq!(dehy.len(), 1, "dehydration stops as soon as the cap is met");
+        assert_eq!(
+            idx.levels[TERMINAL_LEVEL_IDX].guards[dehy[0]].guard_key, oldest_key,
+            "write-recency victim",
+        );
+        let g = &idx.levels[TERMINAL_LEVEL_IDX].guards[dehy[0]];
+        let s = &g.entries[0].shard;
+        let live_after: Vec<(u128, i64)> = (0..s.count).map(|i| (s.get_pk(i), s.get_weight(i))).collect();
+        assert_eq!(live_after, live_before, "keys and coarse weights survive dehydration");
+    }
+
+    /// Ordinary compaction never re-hydrates: a vertical folding hydrated L1 data
+    /// into an already-dehydrated terminal guard emits skeleton, so the sweep's
+    /// work is not undone.
+    #[test]
+    fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
+        raise_fd_limit_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64());
+        // One key band, so every later fold routes back into the same guard.
+        for s in 0..2u64 {
+            let pks: Vec<u64> = (0..20).map(|i| i + 1).collect();
+            let p = write_u64_shard(tmp.path(), &format!("a{s}.db"), &pks);
+            idx.add_unsynced_shard(&p, s + 1).unwrap();
+        }
+        idx.run_compact().unwrap();
+        idx.vertical_fold(0).unwrap();
+        idx.set_capacity(Some(1));
+        idx.enforce_capacity().unwrap();
+        assert!(terminal_split(&idx).0.contains(&0), "guard 0 is dehydrated");
+
+        // New hydrated data over the same keys, folded down by the ordinary path.
+        let p = write_u64_shard(tmp.path(), "b.db", &(0..20).map(|i| i + 1).collect::<Vec<_>>());
+        idx.add_unsynced_shard(&p, 99).unwrap();
+        idx.run_compact().unwrap();
+        idx.vertical_fold(0).unwrap();
+
+        let (dehy, hyd) = terminal_split(&idx);
+        assert!(hyd.is_empty() && !dehy.is_empty(), "the derived rule kept it skeleton");
+        assert!(idx.all_entries().all(|e| !e.shard.is_skeleton() || e.shard.count > 0));
+    }
+
+    /// `vertical_fold` bounds its destination range by the source guard's true
+    /// key extent, not by the gap to the next L1 guard key — which is
+    /// `u128::MAX` for the last (or only) guard and would rewrite the whole
+    /// terminal level on every spill. `compact_guard_vertical` declines a
+    /// single-entry L1 guard; `vertical_fold` does not, which is what lets the
+    /// sweep drain L1 at all.
+    #[test]
+    fn vertical_fold_touches_only_the_guards_its_extent_overlaps() {
+        raise_fd_limit_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64());
+        // Three well-separated key bands → three terminal guards.
+        for (s, base) in [(0u64, 1u64), (1, 10_000), (2, 20_000)] {
+            let pks: Vec<u64> = (0..10).map(|i| base + i).collect();
+            let p = write_u64_shard(tmp.path(), &format!("s{s}.db"), &pks);
+            idx.add_unsynced_shard(&p, s + 1).unwrap();
+        }
+        idx.run_compact().unwrap();
+        for gi in (0..idx.levels[0].guards.len()).rev() {
+            idx.vertical_fold(gi).unwrap();
+        }
+        assert_eq!(idx.levels[TERMINAL_LEVEL_IDX].guards.len(), 3);
+        let names: Vec<String> = idx.levels[TERMINAL_LEVEL_IDX]
+            .guards
+            .iter()
+            .map(|g| g.entries[0].filename.clone())
+            .collect();
+
+        // A new lowest-band spill: the only L1 guard, so the old spelling would
+        // route into every terminal guard at or above its key — all three.
+        let p = write_u64_shard(tmp.path(), "late.db", &[2, 3]);
+        idx.add_unsynced_shard(&p, 50).unwrap();
+        idx.run_compact().unwrap();
+        assert_eq!(idx.levels[0].guards.len(), 1, "one L1 guard");
+        assert!(
+            idx.compact_guard_vertical().is_ok() && idx.levels[0].guards.len() == 1,
+            "compact_guard_vertical declines a single-entry L1 guard",
+        );
+        idx.vertical_fold(0).unwrap();
+
+        let after: Vec<String> = idx.levels[TERMINAL_LEVEL_IDX]
+            .guards
+            .iter()
+            .map(|g| g.entries[0].filename.clone())
+            .collect();
+        assert_eq!(after.len(), 3);
+        assert_ne!(after[0], names[0], "the overlapped guard was rewritten");
+        assert_eq!(&after[1..], &names[1..], "the untouched guards kept their files");
     }
 }

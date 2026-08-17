@@ -20,6 +20,9 @@ struct RelationRegistration<'a> {
     pk: &'a PkColList,
     placement: Placement,
     depth: i32,
+    /// `WITH (capacity = …)` in bytes; `None` for a base table and for an
+    /// unbounded view.
+    capacity_bytes: Option<u64>,
 }
 
 impl CatalogEngine {
@@ -214,6 +217,7 @@ impl CatalogEngine {
         directory: &str,
         id: i64,
         schema: SchemaDescriptor,
+        capacity_bytes: Option<u64>,
     ) -> Result<StoreHandle, String> {
         ensure_dir(directory)?;
         if !self.owns_stores {
@@ -230,8 +234,11 @@ impl CatalogEngine {
         }
 
         let child = ChildAddr::this_worker(self.num_workers);
-        let table = Table::new(&child.dir(directory), schema, id as u32, kind.recovery_source())
+        let mut table = Table::new(&child.dir(directory), schema, id as u32, kind.recovery_source())
             .map_err(|e| format!("Failed to open relation {id}: error {e} (dir={directory})"))?;
+        // Every store this worker opens for a relation comes through here, so a
+        // bounded view cannot come back unbounded from a rehome or a rebuild.
+        table.set_capacity(capacity_bytes);
         Ok(StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(table))))
     }
 
@@ -244,9 +251,12 @@ impl CatalogEngine {
         directory: &str,
         id: i64,
         schema: SchemaDescriptor,
+        capacity_bytes: Option<u64>,
     ) -> Result<StoreHandle, String> {
         let staged = directory.to_string();
-        self.with_staged_dir(staged, |s| s.build_relation_store(kind, directory, id, schema))
+        self.with_staged_dir(staged, |s| {
+            s.build_relation_store(kind, directory, id, schema, capacity_bytes)
+        })
     }
 
     /// A boot replay's store, on the pre-fork master. The directory already holds
@@ -265,11 +275,12 @@ impl CatalogEngine {
         directory: &str,
         id: i64,
         schema: SchemaDescriptor,
+        capacity_bytes: Option<u64>,
     ) -> Result<StoreHandle, String> {
         if kind.is_base_table() {
             crate::storage::repartition_relation(directory, &schema, id as u32, self.num_workers)?;
         }
-        self.build_relation_store(kind, directory, id, schema)
+        self.build_relation_store(kind, directory, id, schema, capacity_bytes)
     }
 
     /// Build a relation's store and enter it in the registry — the shared `+1`
@@ -287,6 +298,7 @@ impl CatalogEngine {
             pk,
             placement,
             depth,
+            capacity_bytes,
         } = reg;
         let kind_str = if kind.is_view() { "view" } else { "table" };
         let col_defs = self.read_column_defs(id);
@@ -304,13 +316,18 @@ impl CatalogEngine {
             self.num_workers
         );
         let handle = if self.ctx.is_live() {
-            self.create_relation_store(kind, &directory, id, schema)?
+            self.create_relation_store(kind, &directory, id, schema, capacity_bytes)?
         } else {
-            self.reopen_relation_store(kind, &directory, id, schema)?
+            self.reopen_relation_store(kind, &directory, id, schema, capacity_bytes)?
         };
-
         fsync_dir(&schema_dir(&self.base_dir, &schema_name));
-        self.dag.register_table(id, handle, schema, kind, depth, directory);
+        self.dag.register_table(
+            id,
+            crate::query::TableEntry {
+                capacity_bytes,
+                ..crate::query::TableEntry::new(handle, schema, kind, depth, directory)
+            },
+        );
         raise_id_counter(&mut self.next_table_id, id);
         Ok(())
     }
@@ -371,6 +388,7 @@ impl CatalogEngine {
                     pk: &pk,
                     placement,
                     depth: 0,
+                    capacity_bytes: None,
                 })?;
             } else if !net_live {
                 // A genuine drop (net-dead): run the teardown cascade. A rename
@@ -583,10 +601,37 @@ impl CatalogEngine {
                 // genuinely reachable here: compound-PK plain projection
                 // prepends the k source PK columns, so SELECT * over a wide
                 // compound-PK table can cross MAX_COLUMNS.
-                let (sid, name, pk) = read_view_tab_row(batch, i);
+                let (sid, name, pk, capacity) = read_view_tab_row(batch, i);
+                let capacity_bytes = (capacity != 0).then_some(capacity);
+                // Trust-boundary re-check, in the style of the placement
+                // rejection below: a hidden chain segment is an internal
+                // relation the planner mints, never something a capacity clause
+                // may name.
+                if capacity_bytes.is_some() && name.starts_with(gnitz_wire::HIDDEN_VIEW_PREFIX) {
+                    return Err(format!(
+                        "catalog invariant violated: hidden segment '{name}' (vid={vid}) carries a capacity."
+                    ));
+                }
                 // The circuit's `circuit_nodes` are persisted before this VIEW_TAB
                 // row, so `get_source_ids` resolves here.
                 let source_ids = self.dag.get_source_ids(vid);
+                // Leaf rule: a bounded view's store is skeletonized, so it is not
+                // a fidelity-preserving source for anything downstream — and its
+                // own hydration replays *sources*, which must therefore be
+                // unbounded. `ScanDelta` is the only external-source opcode in the
+                // wire vocabulary, so this covers every source of every circuit,
+                // a hand-built circuit-builder-API view included. Within-bundle
+                // hidden segments are unresolvable here and never carry a
+                // capacity.
+                if let Some(src) = source_ids
+                    .iter()
+                    .find(|id| self.dag.tables.get(id).is_some_and(|e| e.capacity_bytes.is_some()))
+                {
+                    return Err(format!(
+                        "view '{name}' (vid={vid}) reads relation {src}, which is a capacity-bounded view; \
+                         views cannot be created over one"
+                    ));
+                }
                 // Where this view's rows live, folded from its sources' own
                 // stamped placements. Stamping the fold is what makes the property
                 // transitive — `view_row_order` registers this view after its
@@ -608,6 +653,7 @@ impl CatalogEngine {
                     pk: &pk,
                     placement,
                     depth,
+                    capacity_bytes,
                 })?;
 
                 // Registration leaves the view EMPTY. Filling it is the runtime

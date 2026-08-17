@@ -322,7 +322,7 @@ mod tests {
             let mb = make_batch(mi);
             let want = strip(&naive_intersection(&delta, &mb));
 
-            let mut ch = ReadCursor::from_owned(std::slice::from_ref(&mb), s);
+            let mut ch = ReadCursor::over_batches(std::slice::from_ref(&mb), s);
             let got_rc = strip(&run_intersection(&delta, &mut ch));
             assert_eq!(got_rc, want, "ReadCursor delta={di:?} match={mi:?}");
         }
@@ -347,7 +347,7 @@ mod tests {
             let mb = make_batch(mi);
             let want = strip(&naive_left(&delta, &mb));
 
-            let mut ch = ReadCursor::from_owned(std::slice::from_ref(&mb), s);
+            let mut ch = ReadCursor::over_batches(std::slice::from_ref(&mb), s);
             let got_rc = strip(&run_left(&delta, &mut ch));
             assert_eq!(got_rc, want, "ReadCursor delta={di:?} match={mi:?}");
         }
@@ -369,7 +369,7 @@ mod tests {
         let live = make_batch(&[(1, 1, 10), (5, 1, 50)]);
         let want = strip(&naive_intersection(&delta, &live));
 
-        let mut ch = ReadCursor::from_owned(&[Rc::clone(&src_a), Rc::clone(&src_b)], s);
+        let mut ch = ReadCursor::over_batches(&[Rc::clone(&src_a), Rc::clone(&src_b)], s);
         let got = strip(&run_intersection(&delta, &mut ch));
         assert_eq!(got, want, "ghost group pk=3 must be skipped");
     }
@@ -385,7 +385,7 @@ mod tests {
         let delta = make_batch(&[(1, 1, 1), (3, 1, 3), (5, 1, 5)]);
         let want = strip(&naive_intersection(&delta, &mb));
 
-        let mut ch = ReadCursor::from_owned(std::slice::from_ref(&mb), s);
+        let mut ch = ReadCursor::over_batches(std::slice::from_ref(&mb), s);
         // Stale-advance the cursor past several keys before co-grouping.
         ch.advance_to(&(4u128).to_be_bytes()[8..]);
         assert!(ch.valid && ch.current_key_narrow() == 4, "precondition: stale at pk=4");

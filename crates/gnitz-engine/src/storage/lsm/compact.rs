@@ -16,7 +16,7 @@ use super::merge::{run_merge, UnifiedSource};
 use super::scatter::scatter_unified_sources_with_weights;
 use super::shard_file::ShardWriteOpts;
 use super::shard_reader::MappedShard;
-use crate::schema::key::pack_pk_be;
+use crate::schema::key::{pack_pk_be, pk_bytes_eq};
 use crate::schema::SchemaDescriptor;
 
 /// Open the input shards into owned `MappedShard`s, validating checksums. File
@@ -35,10 +35,51 @@ pub(super) fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
     crate::storage::lsm::guard_slot(guard_keys, key, |&g| g)
 }
 
-/// Compact `input_files` across `guard_keys`: run the N-way (PK, payload) merge
+/// The PK-only projection of `schema`: the same PK columns in the same PK-list
+/// order — hence the same `pk_stride` and the same OPK bytes — and no payload.
+/// A skeleton shard is serialized under this, so its regions are
+/// `[pk, weight, null, blob]`.
+pub(super) fn skeleton_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
+    crate::schema::project_schema(schema, &[])
+}
+
+/// Fold `bucket` — one guard's (PK, payload)-sorted survivor slice — into one
+/// `(PK, Σweight)` row per key, dropping net-zero keys. The per-PK fold is what
+/// makes the output one row per key even on a guard's *first* dehydration, whose
+/// survivors are still (PK, payload) groups; it also strips the payload
+/// breakdown of hydrated groups sinking into an already-dehydrated guard.
+///
+/// A fold's per-PK sum is the PK-projection of the view integral over a
+/// per-key time prefix of the store's history (fold totality: L0 is consumed
+/// whole, a guard fold takes all of the guard's entries, a vertical takes the
+/// whole source guard plus every overlapping destination guard), and the
+/// integral is positive — so a retraction's balancing insertion is always inside
+/// the prefix and the sum is never negative. `debug_assert!(w > 0)` is the
+/// tripwire: a future *partial* compaction that broke fold totality would trip
+/// it instead of silently corrupting bounded views.
+fn fold_bucket_per_pk(shards: &[MappedShard], bucket: &[(u32, u32, i64)]) -> Vec<(u32, u32, i64)> {
+    let pk_of = |&(src, row, _): &(u32, u32, i64)| shards[src as usize].get_pk_bytes(row as usize);
+    bucket
+        .chunk_by(|a, b| pk_bytes_eq(pk_of(a), pk_of(b)))
+        .filter_map(|group| {
+            let sum: i64 = group.iter().map(|&(_, _, w)| w).sum();
+            (sum != 0).then(|| {
+                debug_assert!(sum > 0, "skeleton fold produced a negative coarse weight");
+                (group[0].0, group[0].1, sum)
+            })
+        })
+        .collect()
+}
+
+/// Compact `input_files` across `guards`: run the N-way (PK, payload) merge
 /// into a survivor buffer, route each survivor to its guard, and write one
 /// column-first output shard per non-empty guard into `output_dir`, named by the
 /// compaction grammar (`naming::compact_shard_name`).
+///
+/// Each destination is a `(guard_key, skeleton)` pair: a set flag writes that
+/// guard's slice as a payload-free skeleton shard (one `(PK, Σweight)` row per
+/// key) under [`skeleton_schema`] instead of the full-width form. A guard whose
+/// keys all cancel writes no shard, skeleton or not.
 ///
 /// Returns `(guard_key, path)` per written shard in increasing guard-index order.
 /// On a write error every shard already written this call is removed before
@@ -46,7 +87,7 @@ pub(super) fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
 pub fn merge_and_route(
     input_files: &[&CStr],
     output_dir: &str,
-    guard_keys: &[u128],
+    guards: &[(u128, bool)],
     schema: &SchemaDescriptor,
     table_id: u32,
     level_num: u32,
@@ -54,7 +95,7 @@ pub fn merge_and_route(
 ) -> Result<Vec<(u128, String)>, StorageError> {
     // An empty guard list would drop every survivor on the floor while the caller
     // went on to clear the source tier — silent data loss, so reject it.
-    assert!(!guard_keys.is_empty(), "merge_and_route requires at least one guard");
+    assert!(!guards.is_empty(), "merge_and_route requires at least one guard");
 
     let shards = open_shards(input_files, schema)?;
     let total_rows: usize = shards.iter().map(|s| s.count).sum(); // survivor upper bound
@@ -62,7 +103,7 @@ pub fn merge_and_route(
 
     // Phase 1 — merge into survivors, sorted (PK, payload). The emit stays a bare
     // push: `pack_pk_be` preserves the merge order, so each guard's survivors are
-    // one contiguous run and the split points are `guard_keys.len()` binary
+    // one contiguous run and the split points are `guards.len()` binary
     // searches over the finished buffer rather than a guard lookup per row.
     let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total_rows);
     run_merge(&shards, schema, |src, row, w| {
@@ -70,10 +111,10 @@ pub fn merge_and_route(
     });
 
     // `bounds[g]..bounds[g + 1]` is guard `g`'s slice. Guard 0 also owns anything
-    // below `guard_keys[0]`, matching the read router's saturating guard slot.
+    // below `guards[0]`'s key, matching the read router's saturating guard slot.
     let prefix_at = |&(src, row, _): &(u32, u32, i64)| pack_pk_be(shards[src as usize].get_pk_bytes(row as usize));
     let bounds: Vec<usize> = std::iter::once(0)
-        .chain((1..guard_keys.len()).map(|g| survivors.partition_point(|s| prefix_at(s) < guard_keys[g])))
+        .chain((1..guards.len()).map(|g| survivors.partition_point(|s| prefix_at(s) < guards[g].0)))
         .chain(std::iter::once(survivors.len()))
         .collect();
 
@@ -83,23 +124,57 @@ pub fn merge_and_route(
     // scatter, all within this call.
     let unified: Vec<UnifiedSource> = shards.iter().map(|s| s.to_unified(schema)).collect();
     let nsurv = survivors.len();
-    let mut out: Vec<(u128, String)> = Vec::with_capacity(guard_keys.len());
+    let mut out: Vec<(u128, String)> = Vec::with_capacity(guards.len());
 
-    for (g, &guard_key) in guard_keys.iter().enumerate() {
+    // Only built when some destination guard is dehydrated; a hydrated store
+    // never derives it.
+    let skel_schema = guards.iter().any(|&(_, s)| s).then(|| skeleton_schema(schema));
+
+    for (g, &(guard_key, skeleton)) in guards.iter().enumerate() {
         let bucket = &survivors[bounds[g]..bounds[g + 1]];
         if bucket.is_empty() {
+            continue;
+        }
+        // Per-PK fold first, so a guard whose keys all cancel writes nothing.
+        let folded = skeleton.then(|| fold_bucket_per_pk(&shards, bucket));
+        if folded.as_ref().is_some_and(|f| f.is_empty()) {
             continue;
         }
         let path = format!(
             "{output_dir}/{}",
             super::naming::compact_shard_name(table_id, compact_seq, level_num as usize, guard_key)
         );
-        let blob_cap = prorated_blob_cap(total_blob, nsurv, bucket.len());
-        let batch = write_to_batch(schema, bucket.len(), blob_cap, |writer| {
-            scatter_unified_sources_with_weights(&unified, bucket, writer);
+        // A skeleton guard writes its folded rows under the PK-only schema; a
+        // hydrated one writes the bucket at full width. The writer's schema drives
+        // the payload loop, so under a zero-payload schema `write_to_batch` carves
+        // no payload buffer and the scatter iterates zero payload columns while the
+        // fused pass still writes PK and weight.
+        let (wschema, rows, blob_cap, opts) = match &folded {
+            Some(rows) => (
+                skel_schema
+                    .as_ref()
+                    .expect("a skeleton guard derived a skeleton schema"),
+                rows.as_slice(),
+                0,
+                ShardWriteOpts::SKELETON,
+            ),
+            None => (
+                schema,
+                bucket,
+                prorated_blob_cap(total_blob, nsurv, bucket.len()),
+                ShardWriteOpts::COMPACTION,
+            ),
+        };
+        let mut batch = write_to_batch(wschema, rows.len(), blob_cap, |writer| {
+            scatter_unified_sources_with_weights(&unified, rows, writer);
         });
-        let written = super::cstr(path.as_str())
-            .and_then(|cpath| batch.write_as_shard(&cpath, schema, ShardWriteOpts::COMPACTION));
+        if folded.is_some() {
+            // The fused pass copied the *source's* payload null bits, which mean
+            // nothing without a payload. Zeroing collapses the region to
+            // `ENCODING_CONSTANT` — 8 bytes for the whole file.
+            batch.null_bmp_data_mut().fill(0);
+        }
+        let written = super::cstr(path.as_str()).and_then(|cpath| batch.write_as_shard(&cpath, wschema, opts));
         if let Err(e) = written {
             // Roll back this call's shards so a compaction that cannot finalize
             // leaves the source tier intact.
@@ -172,7 +247,7 @@ mod tests {
         schema: &SchemaDescriptor,
         seq: u64,
     ) -> Option<std::ffi::CString> {
-        let outs = merge_and_route(inputs, dir.to_str().unwrap(), &[0], schema, 0, 1, seq).unwrap();
+        let outs = merge_and_route(inputs, dir.to_str().unwrap(), &[(0, false)], schema, 0, 1, seq).unwrap();
         outs.first().map(|(_, p)| std::ffi::CString::new(p.as_str()).unwrap())
     }
 
@@ -391,7 +466,7 @@ mod tests {
         // merge loop; a caller passing one has violated the contract — fail
         // loudly up front.
         let schema = make_schema_u64_i64();
-        let guards: [u128; 0] = [];
+        let guards: [(u128, bool); 0] = [];
         let _ = merge_and_route(&[], "/tmp", &guards, &schema, 0, 1, 0);
     }
 
@@ -412,7 +487,10 @@ mod tests {
         // Two guards: [0, 100)  and [100, ∞). Guard keys live in the same
         // order-preserving pack_pk_be space as the router's sort key, so derive
         // them from the OPK bytes of the boundary values (not native u128s).
-        let guards: [u128; 2] = [pack_pk_be(&0u64.to_be_bytes()), pack_pk_be(&100u64.to_be_bytes())];
+        let guards = [
+            (pack_pk_be(&0u64.to_be_bytes()), false),
+            (pack_pk_be(&100u64.to_be_bytes()), false),
+        ];
         let guard_outputs = merge_and_route(&inputs, dir.to_str().unwrap(), &guards, &schema, 0, 1, 99).unwrap();
         assert_eq!(guard_outputs.len(), 2); // both guards should have rows
 
@@ -446,7 +524,7 @@ mod tests {
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        let guards: [u128; 2] = [0, 100];
+        let guards: [(u128, bool); 2] = [(0, false), (100, false)];
 
         // table_id=0, level_num=1, compact_seq=99, guard keys {0,100} → the second
         // output is shard_0_99_L1_G100.db (named by guard key, not loop index).
@@ -784,8 +862,8 @@ mod tests {
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
 
-        let guard_keys: Vec<u128> = vec![0]; // single guard
-        let guard_outputs = merge_and_route(&inputs, dir.to_str().unwrap(), &guard_keys, &schema, 99, 1, 1).unwrap();
+        let guards = [(0u128, false)]; // single guard
+        let guard_outputs = merge_and_route(&inputs, dir.to_str().unwrap(), &guards, &schema, 99, 1, 1).unwrap();
         assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
 
         let rows = read_3col_shard(&guard_outputs[0].1, &schema);
@@ -868,8 +946,8 @@ mod tests {
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let inputs = [cs1.as_c_str()];
 
-        let guard_keys: Vec<u128> = vec![200]; // single guard at key 200
-        let guard_outputs = merge_and_route(&inputs, dir.to_str().unwrap(), &guard_keys, &schema, 42, 2, 1).unwrap();
+        let guards = [(200u128, false)]; // single guard at key 200
+        let guard_outputs = merge_and_route(&inputs, dir.to_str().unwrap(), &guards, &schema, 42, 2, 1).unwrap();
         assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
 
         let cpath = std::ffi::CString::new(guard_outputs[0].1.as_str()).unwrap();
@@ -1363,7 +1441,8 @@ mod tests {
 
         // table_id=7, level_num=1, compact_seq=42 → routed shards are named by the
         // destination guard *key*: shard_7_42_L1_G{guard_keys[g]}.db.
-        let routed = merge_and_route(&inputs, dir.to_str().unwrap(), &guard_keys, &schema, 7, 1, 42).unwrap();
+        let dests: Vec<(u128, bool)> = guard_keys.iter().map(|&k| (k, false)).collect();
+        let routed = merge_and_route(&inputs, dir.to_str().unwrap(), &dests, &schema, 7, 1, 42).unwrap();
         let oracle = oracle_merge_and_route_row_at_a_time(&inputs, &dir, &guard_keys, &schema);
 
         // Only the populated guards (0 and 3) produce output, in increasing-g order.
@@ -1405,5 +1484,144 @@ mod tests {
         let g3_name = format!("shard_7_42_L1_G{}.db", guard_keys[3]);
         let g3_rows = decode_diff_shard(dir.join(&g3_name).to_str().unwrap(), &schema);
         assert_eq!(g3_rows.len(), 3, "guard 3: pk=310,320,330, got {g3_rows:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Skeleton (dehydrated) destination guards
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod skeleton_tests {
+    use super::super::batch::{Batch, REG_NULL_BMP};
+    use super::super::layout::{ENCODING_CONSTANT, OFF_FILE_NPC, SHARD_FLAG_SKELETON};
+    use super::super::shard_file::{region_dir, ShardWriteOpts};
+    use super::super::shard_reader::MappedShard;
+    use super::*;
+    use crate::test_support::make_schema_u64_i64;
+    use gnitz_wire::{read_i64_le, read_u64_le};
+
+    /// A `(PK, weight, payload)` shard, so one PK can carry several payloads.
+    fn write_shard(path: &std::path::Path, rows: &[(u64, i64, i64)], schema: &SchemaDescriptor) -> std::ffi::CString {
+        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+        for &(pk, w, v) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &v.to_le_bytes());
+            b.count += 1;
+        }
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        b.into_consolidated(schema)
+            .write_as_shard(&cpath, schema, ShardWriteOpts::default())
+            .unwrap();
+        cpath
+    }
+
+    /// `(pk, weight)` of every row of an output shard, read under the view schema.
+    fn read_rows(path: &str, schema: &SchemaDescriptor) -> Vec<(u128, i64)> {
+        let s = MappedShard::open(&std::ffi::CString::new(path).unwrap(), schema, false).unwrap();
+        (0..s.count).map(|i| (s.get_pk(i), s.get_weight(i))).collect()
+    }
+
+    /// A guard's *first* dehydration: survivors still hold several payloads per
+    /// PK, and the output is exactly one `(PK, Σweight)` row per key. Its null
+    /// region collapses to `ENCODING_CONSTANT` (8 bytes for the whole file), and
+    /// the file declares itself skeleton with a zero payload arity.
+    #[test]
+    fn first_dehydration_folds_a_guard_to_one_row_per_pk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let schema = make_schema_u64_i64();
+
+        // PK 1: three payloads summing to 6. PK 2: one row. PK 3: cancels.
+        let a = write_shard(
+            &dir.join("a.db"),
+            &[(1, 1, 10), (1, 2, 20), (2, 5, 30), (3, 4, 40)],
+            &schema,
+        );
+        let b = write_shard(&dir.join("b.db"), &[(1, 3, 50), (3, -4, 40)], &schema);
+
+        let outs = merge_and_route(
+            &[a.as_c_str(), b.as_c_str()],
+            dir.to_str().unwrap(),
+            &[(0, true)],
+            &schema,
+            0,
+            2,
+            1,
+        )
+        .unwrap();
+        assert_eq!(outs.len(), 1);
+        let path = &outs[0].1;
+
+        assert_eq!(read_rows(path, &schema), vec![(1, 6), (2, 5)], "PK 3 cancelled exactly");
+
+        let raw = std::fs::read(path).unwrap();
+        assert_eq!(
+            read_u64_le(&raw, OFF_FILE_NPC),
+            SHARD_FLAG_SKELETON,
+            "declared skeleton, zero payload arity"
+        );
+        assert_eq!(region_dir(&raw, REG_NULL_BMP).1, ENCODING_CONSTANT);
+        assert_eq!(region_dir(&raw, REG_NULL_BMP).0, 8, "one element for the whole file");
+    }
+
+    /// A fold routing into a mixed destination set writes each guard in its own
+    /// representation, and the hydrated guard's output is byte-identical to the
+    /// same fold with no dehydrated sibling.
+    #[test]
+    fn a_mixed_destination_set_writes_each_guard_in_its_own_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let schema = make_schema_u64_i64();
+        let src = write_shard(&dir.join("src.db"), &[(1, 1, 10), (1, 2, 11), (100, 3, 30)], &schema);
+        // Guard 0 owns [.., 100), guard 1 owns [100, ..).
+        let g1 = crate::schema::key::pack_pk_be(&100u64.to_be_bytes());
+
+        let mixed = merge_and_route(
+            &[src.as_c_str()],
+            dir.to_str().unwrap(),
+            &[(0, true), (g1, false)],
+            &schema,
+            0,
+            2,
+            1,
+        )
+        .unwrap();
+        let all_hydrated = merge_and_route(
+            &[src.as_c_str()],
+            dir.to_str().unwrap(),
+            &[(0, false), (g1, false)],
+            &schema,
+            0,
+            2,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(mixed.len(), 2);
+        // Guard 0 dehydrated: its two payloads for PK 1 fold to one coarse row.
+        assert_eq!(read_rows(&mixed[0].1, &schema), vec![(1, 3)]);
+        assert!(
+            MappedShard::open(&super::super::cstr(mixed[0].1.as_str()).unwrap(), &schema, false)
+                .unwrap()
+                .is_skeleton()
+        );
+        // Guard 1 hydrated: identical bytes to the all-hydrated run, modulo the
+        // compaction sequence in the filename.
+        let hy = std::fs::read(&mixed[1].1).unwrap();
+        let ref_ = std::fs::read(&all_hydrated[1].1).unwrap();
+        assert_eq!(hy.len(), ref_.len());
+        assert_eq!(
+            read_i64_le(
+                MappedShard::open(&super::super::cstr(mixed[1].1.as_str()).unwrap(), &schema, false)
+                    .unwrap()
+                    .get_col_ptr(0, 0, 8),
+                0
+            ),
+            30,
+            "the hydrated guard keeps its payload"
+        );
     }
 }

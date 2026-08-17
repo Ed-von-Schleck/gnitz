@@ -751,14 +751,26 @@ impl<S, F> RowComparator<S> for F where F: Fn(&SchemaDescriptor, &S, usize, &S, 
 /// `merge_less` is the full heap order: `compare_pk_ordering` on each player's
 /// full OPK bytes (exact at every width — no cached key, no stride dispatch),
 /// then the payload `row_cmp`.
+///
+/// `coarsen` collapses the payload axis for a cursor that holds a skeleton run: a
+/// skeleton row sorts *before* every hydrated row of its PK (two skeleton rows
+/// tie), which makes it the group exemplar `drive_merge` compares against, and
+/// [`merge_eq_payload`] then folds the whole PK group into it. The tiebreak is
+/// tested ahead of `row_cmp`, so the payload comparator never reads a skeleton
+/// row's columns. It is constant for a cursor's whole life (a cursor's source set
+/// never changes) and reached only once two players tie on PK, so it stays a
+/// runtime flag rather than a second monomorphisation axis over this kernel.
+/// `false` at the flush/compaction seat and at every cursor whose runs are all
+/// hydrated.
 #[inline]
 pub(crate) fn merge_less<'a, S, RowCmp>(
     schema: &'a SchemaDescriptor,
     sources: &'a [S],
     row_cmp: RowCmp,
+    coarsen: bool,
 ) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a
 where
-    S: RowSource,
+    S: ColumnarSource,
     RowCmp: RowComparator<S> + 'a,
 {
     move |a, b| {
@@ -767,7 +779,15 @@ where
         match compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
             Ordering::Less => true,
             Ordering::Greater => false,
-            Ordering::Equal => row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less,
+            Ordering::Equal => {
+                if coarsen {
+                    let (sa, sb) = (sources[a_src].is_skeleton(), sources[b_src].is_skeleton());
+                    if sa || sb {
+                        return sa && !sb;
+                    }
+                }
+                row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less
+            }
         }
     }
 }
@@ -787,16 +807,29 @@ pub(crate) fn merge_same_pk<S: RowSource>(sources: &[S]) -> impl Fn(usize, usize
 
 /// The payload-equality term of the trio (`row_cmp == Equal`; the PK term is
 /// [`merge_same_pk`]).
+///
+/// Under `coarsen` a pair where either row is skeleton groups unconditionally: a
+/// skeleton row carries the PK's whole coarse weight, so its PK group folds to
+/// one row rather than to (PK, payload) groups. Tested ahead of `row_cmp`, so a
+/// skeleton row's (absent) columns are never read. See [`merge_less`] for why
+/// the ordering half is what makes the skeleton row the group's exemplar.
 #[inline]
 pub(crate) fn merge_eq_payload<'a, S, RowCmp>(
     schema: &'a SchemaDescriptor,
     sources: &'a [S],
     row_cmp: RowCmp,
+    coarsen: bool,
 ) -> impl Fn(usize, usize, usize, usize) -> bool + Copy + 'a
 where
+    S: ColumnarSource,
     RowCmp: RowComparator<S> + 'a,
 {
-    move |a_src, a_row, b_src, b_row| row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
+    move |a_src, a_row, b_src, b_row| {
+        if coarsen && (sources[a_src].is_skeleton() || sources[b_src].is_skeleton()) {
+            return true;
+        }
+        row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
+    }
 }
 
 /// N-way merge closure builder + driver. The keyless heap reads each player's
@@ -820,9 +853,13 @@ fn run_merge_body<S, RowCmp>(
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
     // by `advance`.  `source_idx` doubles as the source index here.
-    let less = merge_less(schema, sources, row_cmp);
+    // No coarsening: skeleton folding is a read-path concern. Compaction
+    // re-materializes a dehydrated destination guard per PK anyway (see
+    // `compact::merge_and_route`), which subsumes any grouping a comparator
+    // could do here.
+    let less = merge_less(schema, sources, row_cmp, false);
     let same_pk = merge_same_pk(sources);
-    let eq_payload = merge_eq_payload(schema, sources, row_cmp);
+    let eq_payload = merge_eq_payload(schema, sources, row_cmp, false);
     let mut tree = LoserTree::build(
         cursors.len(),
         |i| cursors[i].is_valid().then(|| cursors[i].position as u32),

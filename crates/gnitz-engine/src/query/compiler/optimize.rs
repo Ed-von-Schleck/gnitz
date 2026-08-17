@@ -9,6 +9,17 @@ pub(super) fn first_input(loaded: &LoadedCircuit, nid: i32) -> Option<i32> {
     loaded.incoming.get(&nid).and_then(|v| v.first()).map(|&(src, _)| src)
 }
 
+/// The node feeding `nid` on `port`, or `None` if there is no such input edge (a
+/// malformed circuit). The port-aware sibling of [`first_input`] — every
+/// "who produces this operand" question resolves through one of the two.
+pub(super) fn input_on_port(loaded: &LoadedCircuit, nid: i32, port: i32) -> Option<i32> {
+    loaded
+        .incoming
+        .get(&nid)
+        .and_then(|ins| ins.iter().find(|&&(_, p)| p == port))
+        .map(|&(src, _)| src)
+}
+
 pub(crate) fn compute_join_shard_map(loaded: &LoadedCircuit) -> JoinShardMap {
     let mut join_shard_map = HashMap::new();
     for (&nid, op) in &loaded.nodes {

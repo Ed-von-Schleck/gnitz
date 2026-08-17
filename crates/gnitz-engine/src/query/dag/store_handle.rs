@@ -89,6 +89,16 @@ impl StoreHandle {
         }
     }
 
+    /// Whether a read of this store can meet a skeleton row it has to hydrate.
+    /// A detached relation reads empty, so it never can.
+    pub(super) fn has_skeleton_rows(&self) -> bool {
+        match self {
+            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.has_skeleton_rows(),
+            StoreHandle::Owned(cell) => unsafe { (**cell.get()).has_skeleton_rows() },
+            StoreHandle::Detached => false,
+        }
+    }
+
     /// Materialize every positive-weight row. `Owned` and `Borrowed` delegate to
     /// `Table::full_scan`, preserving its `Rc` snapshot cache; a detached
     /// relation materializes an empty batch. Reached through

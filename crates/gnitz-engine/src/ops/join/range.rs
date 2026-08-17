@@ -836,7 +836,7 @@ mod tests {
 
     fn trace_cursor(batch: Batch, schema: SchemaDescriptor) -> crate::storage::ReadCursor {
         use std::rc::Rc;
-        crate::storage::ReadCursor::from_owned(&[Rc::new(batch)], schema)
+        ReadCursor::over_batches(&[Rc::new(batch)], schema)
     }
 
     /// Schema with `n_eq` U64 equality columns + 1 U64 range column (all PK) and

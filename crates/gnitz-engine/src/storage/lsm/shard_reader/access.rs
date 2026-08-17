@@ -231,6 +231,16 @@ impl MappedShard {
     ) -> super::super::batch::Batch {
         use super::super::batch::{compute_offsets, strides_from_schema, Batch, Layout};
 
+        // A skeleton shard has no payload bytes to materialize: this path
+        // force-NULLs every absent column, dereferences every German-string cell,
+        // and certifies the result against `schema`'s NOT NULL bits. A bounded
+        // view's store must be read row-at-a-time through the cursor instead, so
+        // its skeleton keys can be hydrated rather than handed out as NULL rows.
+        debug_assert!(
+            !self.skeleton,
+            "slice_to_owned_batch_with on a skeleton shard: a bounded view's store must be read row-at-a-time",
+        );
+
         if row_count == 0 {
             return Batch::empty_with_schema(schema);
         }
@@ -452,5 +462,9 @@ impl super::super::columnar::ColumnarSource for MappedShard {
     #[inline(always)]
     fn row_count(&self) -> usize {
         self.count
+    }
+    #[inline(always)]
+    fn is_skeleton(&self) -> bool {
+        MappedShard::is_skeleton(self)
     }
 }

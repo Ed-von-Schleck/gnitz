@@ -7,6 +7,14 @@ use super::*;
 use crate::schema::project_schema;
 use crate::storage::BoundedIndexCursor;
 
+/// What part of a capacity-bounded view's store one read wants. `Keys` carries
+/// the flat concatenation of the OPK images, ascending.
+pub(crate) enum BoundedRead<'a> {
+    All,
+    Range(&'a [u8], Option<&'a [u8]>),
+    Keys(&'a [u8]),
+}
+
 impl CatalogEngine {
     /// The registry entry for `table_id`, or the shared "Unknown table_id"
     /// error every hard-resolving store path reports.
@@ -57,7 +65,107 @@ impl CatalogEngine {
     /// re-copies) the descriptor.
     pub fn scan_family(&mut self, table_id: i64) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
         let entry = self.table_entry(table_id)?;
+        if entry.needs_hydration() {
+            let schema = entry.schema;
+            // `Table::full_scan`'s `Rc` snapshot cache is bypassed and no second
+            // cache replaces it: it is invalidated on every ingest, so on a view
+            // under live churn it would hold at most one scan and cost a full
+            // hydrated copy of the store to do so. The whole walk runs inside the
+            // single Scan dispatch on the single-threaded worker, so the snapshot
+            // the chunked wire train slices is as atomic as any other relation's.
+            return Ok((
+                Rc::new(self.materialize_bounded_store(table_id, BoundedRead::All)?),
+                schema,
+            ));
+        }
         Ok((entry.full_scan(), entry.schema))
+    }
+
+    /// Every live row of a capacity-bounded view's store over `read`, with each
+    /// skeleton key recomputed. One consolidated batch in the view's own schema.
+    ///
+    /// Walks the store cursor once, copying each hydrated row verbatim and pushing
+    /// each skeleton `(PK, coarse weight)` onto a key list, then hydrates that list
+    /// and merges the two. Both halves are ascending and disjoint by PK — a key is
+    /// skeleton or it is not, and the read cursor's coarsening emits a mixed PK
+    /// group as exactly one skeleton row — so the merge is exact and no sort is
+    /// needed.
+    ///
+    /// The walk is row-at-a-time on purpose: `drain_chunk` / `materialize` go
+    /// through `slice_to_owned_batch_with`, which force-NULLs every absent column,
+    /// dereferences every German-string cell, and certifies the result against
+    /// the view schema's NOT NULL bits — none of which a skeleton shard can
+    /// survive.
+    pub(crate) fn materialize_bounded_store(&mut self, view_id: i64, read: BoundedRead<'_>) -> Result<Batch, String> {
+        let entry = self.table_entry(view_id)?;
+        let schema = entry.schema;
+        let stride = schema.pk_stride() as usize;
+        // Flat OPK images, ascending — every walk below visits keys in that
+        // order, so the list is sorted by construction.
+        let mut skeleton_keys: Vec<u8> = Vec::new();
+        let mut coarse: Vec<i64> = Vec::new();
+
+        // Tested *before* any copy: `copy_current_row_into` reads every payload
+        // column of the row and relocates its German-string blobs, which a
+        // skeleton shard has no bytes for.
+        let mut visit = |c: &ReadCursor, out: &mut Batch| {
+            if c.current_weight <= 0 {
+                return;
+            }
+            if c.current_is_skeleton() {
+                skeleton_keys.extend_from_slice(c.current_pk_bytes());
+                coarse.push(c.current_weight);
+            } else {
+                c.copy_current_row_into(out, c.current_weight);
+            }
+        };
+
+        let mut cursor = entry.open_cursor();
+        // Position first, then size the output off the walk's own upper bound, so
+        // the appends below never re-grow (each growth re-copies every live byte).
+        // A key list is bounded by its own length instead — it names at most one
+        // group per key, and the cursor still spans the whole store.
+        let cap = match read {
+            BoundedRead::Keys(keys) => keys.len() / stride,
+            BoundedRead::Range(start, end) => {
+                cursor.seek_range_bytes(start, end);
+                cursor.estimated_length()
+            }
+            BoundedRead::All => {
+                cursor.rewind();
+                cursor.estimated_length()
+            }
+        };
+        let mut out = Batch::with_capacity(schema, cap);
+        match read {
+            // A listed key set walks group by group; a whole store or a range is
+            // one sweep from wherever the bound above left the cursor.
+            BoundedRead::Keys(keys) => {
+                for key in keys.chunks_exact(stride) {
+                    cursor.seek_pk_group(key);
+                    cursor.for_each_pk_group_row(key, |c| visit(c, &mut out));
+                }
+            }
+            BoundedRead::All | BoundedRead::Range(..) => {
+                while cursor.valid {
+                    visit(&cursor, &mut out);
+                    cursor.advance();
+                }
+            }
+        }
+        drop(cursor);
+
+        // The cursor emits strictly ascending (PK, payload) with net weights and
+        // drops ghosts, and `visit` keeps only positive ones — so the walk's output
+        // is consolidated as built, and saying so is what lets the union below take
+        // its O(n) merge instead of a full sort of the hydrated relation.
+        out.certify_layout(crate::storage::Layout::Consolidated, &schema);
+        if coarse.is_empty() {
+            return Ok(out);
+        }
+        let chunk_rows = self.ddl_scan_chunk_rows.max(1);
+        let hydrated = self.dag.hydrate_keys(view_id, skeleton_keys, &coarse, chunk_rows)?;
+        Ok(crate::ops::op_union(out, &hydrated, &schema).into_consolidated(&schema))
     }
 
     /// Point lookup by the wire seek pair. Decodes `(seek_pk, seek_pk_extra)` to
@@ -72,17 +180,23 @@ impl CatalogEngine {
         seek_pk_extra: &[u8],
     ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
         let entry = self.table_entry(table_id)?;
-        let opk = crate::schema::key::seek_opk_bytes(&entry.schema, seek_pk, seek_pk_extra)?;
-        Ok((Self::seek_entry_bytes(entry, opk.pk_bytes()), entry.schema))
+        let schema = entry.schema;
+        let opk = crate::schema::key::seek_opk_bytes(&schema, seek_pk, seek_pk_extra)?;
+        Ok((self.seek_family_bytes(table_id, opk.pk_bytes())?, schema))
     }
 
-    /// Byte-keyed sibling of [`seek_family`] for callers that already hold the
-    /// OPK bytes — only the wide-PK tests seek through it directly.
-    /// Registry-uniform: system tables are pre-registered `Borrowed` handles,
-    /// so one lookup serves every id.
-    #[cfg(test)]
+    /// Byte-keyed [`seek_family`] — the primitive both spellings resolve to, for
+    /// callers that already hold the OPK bytes. Registry-uniform: system tables
+    /// are pre-registered `Borrowed` handles, so one lookup serves every id.
     pub(crate) fn seek_family_bytes(&mut self, table_id: i64, pk: &[u8]) -> Result<Option<Batch>, String> {
         let entry = self.table_entry(table_id)?;
+        if entry.needs_hydration() {
+            // One key is a one-element key list, so the hydrating read is the same
+            // walk every other one takes — it just hydrates at most one key rather
+            // than the store.
+            let b = self.materialize_bounded_store(table_id, BoundedRead::Keys(pk))?;
+            return Ok((b.count > 0).then_some(b));
+        }
         Ok(Self::seek_entry_bytes(entry, pk))
     }
 

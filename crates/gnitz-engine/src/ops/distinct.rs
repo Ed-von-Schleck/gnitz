@@ -116,7 +116,7 @@ mod tests {
 
         // Empty trace → all positive deltas emit +1
         let empty = Rc::new(Batch::empty_with_schema(&schema));
-        let mut ch = ReadCursor::from_owned(std::slice::from_ref(&empty), schema);
+        let mut ch = ReadCursor::over_batches(std::slice::from_ref(&empty), schema);
 
         // Delta: pk=1 w=+3, pk=2 w=+1
         let delta = make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]);
@@ -129,7 +129,7 @@ mod tests {
         // Now trace has pk=1 w=3 and pk=2 w=1
         // Delta: pk=1 w=-2 (3→1, still positive, no output), pk=2 w=-1 (1→0, emit -1)
         let trace_batch = Rc::new(make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]));
-        let mut ch2 = ReadCursor::from_owned(&[trace_batch], schema);
+        let mut ch2 = ReadCursor::over_batches(&[trace_batch], schema);
         let delta2 = make_batch(&schema, &[(1, -2, 10), (2, -1, 20)]);
         let (out2, _) = op_distinct(delta2, &mut ch2, &schema);
         // pk=1: 3→1, positive→positive, no change
@@ -154,14 +154,14 @@ mod tests {
 
         // Tick 1: integral 5, delta +3 → w_new 8 → emit max(0,8)−max(0,5)=+3.
         let trace1 = Rc::new(make_batch(&schema, &[(1, 5, 10)]));
-        let mut ch1 = ReadCursor::from_owned(&[trace1], schema);
+        let mut ch1 = ReadCursor::over_batches(&[trace1], schema);
         let (out1, _) = op_weight_clamp(make_batch(&schema, &[(1, 3, 10)]), &mut ch1, &schema, 0, i64::MAX);
         assert_eq!(out1.count, 1);
         assert_eq!(out1.get_weight(0), 3, "max(0,8) - max(0,5) = +3");
 
         // Tick 2: integral 8, delta −10 → w_new −2 → emit max(0,−2)−max(0,8)=−8.
         let trace2 = Rc::new(make_batch(&schema, &[(1, 8, 10)]));
-        let mut ch2 = ReadCursor::from_owned(&[trace2], schema);
+        let mut ch2 = ReadCursor::over_batches(&[trace2], schema);
         let (out2, _) = op_weight_clamp(make_batch(&schema, &[(1, -10, 10)]), &mut ch2, &schema, 0, i64::MAX);
         assert_eq!(out2.count, 1);
         assert_eq!(out2.get_weight(0), -8, "max(0,-2) - max(0,8) = -8");
@@ -170,7 +170,7 @@ mod tests {
         // max(0,2)−max(0,−2)=+2. A negative pre-image clamps to 0, so the row
         // re-enters the bag at exactly its positive part.
         let trace3 = Rc::new(make_batch(&schema, &[(1, -2, 10)]));
-        let mut ch3 = ReadCursor::from_owned(&[trace3], schema);
+        let mut ch3 = ReadCursor::over_batches(&[trace3], schema);
         let (out3, _) = op_weight_clamp(make_batch(&schema, &[(1, 4, 10)]), &mut ch3, &schema, 0, i64::MAX);
         assert_eq!(out3.count, 1);
         assert_eq!(out3.get_weight(0), 2, "max(0,2) - max(0,-2) = +2");
@@ -188,7 +188,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         // Trace PK=1 carries payloads 10, 20, 30 (each weight 1).
         let trace = Rc::new(make_batch(&schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]));
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
 
         // Delta at PK=1: retract 10 (1→0 ⇒ -1), bump 20 (1→2 ⇒ no change),
         // add new 40 (0→1 ⇒ +1). Payload 30 is untouched.
@@ -257,7 +257,7 @@ mod tests {
 
         let schema = make_schema_u64_i32();
         let trace = Rc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]));
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
 
         // Delta: same (PK=1, val=42) → stays +1 → no output
         let delta = make_batch_narrow::<4>(&schema, &[(1, 1, 42)]);
@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(out.count, 0, "I32: matching (PK,payload) should produce no output");
 
         // New (PK=1, val=99) → new element → +1 output
-        let mut ch2 = ReadCursor::from_owned(&[Rc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]))], schema);
+        let mut ch2 = ReadCursor::over_batches(&[Rc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]))], schema);
         let delta2 = make_batch_narrow::<4>(&schema, &[(1, 1, 99)]);
         let (out2, _) = op_distinct(delta2, &mut ch2, &schema);
         assert_eq!(out2.count, 1, "I32: new (PK,payload) should produce +1");
@@ -278,7 +278,7 @@ mod tests {
 
         let schema = make_schema_u64_i16();
         let trace = Rc::new(make_batch_narrow::<2>(&schema, &[(5, 1, -100)]));
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
 
         let delta = make_batch_narrow::<2>(&schema, &[(5, 1, -100)]);
         let (out, _) = op_distinct(delta, &mut ch, &schema);
@@ -292,7 +292,7 @@ mod tests {
 
         let schema = make_schema_u64_i8();
         let trace = Rc::new(make_batch_narrow::<1>(&schema, &[(7, 1, -1)]));
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
 
         let delta = make_batch_narrow::<1>(&schema, &[(7, 1, -1)]);
         let (out, _) = op_distinct(delta, &mut ch, &schema);
@@ -338,14 +338,14 @@ mod tests {
 
         // Equal (PK=1, "hi") on both sides → compare returns Equal → no output.
         let trace = Rc::new(make_batch_blob(&schema, &[(1, 1, b"hi")]));
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
         let delta = make_batch_blob(&schema, &[(1, 1, b"hi")]);
         let (out, _) = op_distinct(delta, &mut ch, &schema);
         assert_eq!(out.count, 0, "BLOB: matching (PK,payload) should produce no output");
 
         // A different blob at the same PK is a distinct element → +1.
         let trace2 = Rc::new(make_batch_blob(&schema, &[(1, 1, b"hi")]));
-        let mut ch2 = ReadCursor::from_owned(&[trace2], schema);
+        let mut ch2 = ReadCursor::over_batches(&[trace2], schema);
         let delta2 = make_batch_blob(&schema, &[(1, 1, b"bye")]);
         let (out2, _) = op_distinct(delta2, &mut ch2, &schema);
         assert_eq!(out2.count, 1, "BLOB: a new payload at an existing PK emits +1");
@@ -386,7 +386,7 @@ mod tests {
         let schema = make_schema_compound();
         // Trace in storage order: (1,5) then (2,3).
         let trace = Rc::new(make_compound_batch(&schema, &[(1, 5, 1, 100), (2, 3, 1, 200)]));
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
 
         // Re-add (2,3) with the same payload → already present → no output.
         let delta = make_compound_batch(&schema, &[(2, 3, 1, 200)]);
@@ -398,7 +398,7 @@ mod tests {
 
         // Adding a genuinely new (2,3) payload IS a new element → +1.
         let trace2 = Rc::new(make_compound_batch(&schema, &[(1, 5, 1, 100), (2, 3, 1, 200)]));
-        let mut ch2 = ReadCursor::from_owned(&[trace2], schema);
+        let mut ch2 = ReadCursor::over_batches(&[trace2], schema);
         let delta2 = make_compound_batch(&schema, &[(2, 3, 1, 999)]);
         let (out2, _) = op_distinct(delta2, &mut ch2, &schema);
         assert_eq!(out2.count, 1, "compound: a new payload at an existing PK emits +1");
@@ -416,7 +416,7 @@ mod tests {
         let schema = make_schema_signed();
         // Storage (signed) order: -3, -1, 2.
         let trace = Rc::new(make_signed_batch(&schema, &[(-3, 1, 30), (-1, 1, 10), (2, 1, 20)]));
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
 
         // Re-add (-1) with the same payload → already present → no output.
         let delta = make_signed_batch(&schema, &[(-1, 1, 10)]);
@@ -428,7 +428,7 @@ mod tests {
 
         // Retract (-1) fully → element leaves the set → -1.
         let trace2 = Rc::new(make_signed_batch(&schema, &[(-3, 1, 30), (-1, 1, 10), (2, 1, 20)]));
-        let mut ch2 = ReadCursor::from_owned(&[trace2], schema);
+        let mut ch2 = ReadCursor::over_batches(&[trace2], schema);
         let delta2 = make_signed_batch(&schema, &[(-1, -1, 10)]);
         let (out2, _) = op_distinct(delta2, &mut ch2, &schema);
         assert_eq!(out2.count, 1, "signed: fully retracting an element emits -1");
@@ -443,7 +443,7 @@ mod tests {
 
         let schema = make_schema_u64_i64();
         let empty = Rc::new(Batch::empty_with_schema(&schema));
-        let mut ch = ReadCursor::from_owned(&[empty], schema);
+        let mut ch = ReadCursor::over_batches(&[empty], schema);
 
         let delta = make_batch(&schema, &[(1, 1, 10)]);
         let (out, consolidated) = op_distinct(delta, &mut ch, &schema);
@@ -467,7 +467,7 @@ mod tests {
         // All three must emit +1.
         let schema = wide_pk_3xu64_schema();
         let empty = Rc::new(Batch::empty_with_schema(&schema));
-        let mut ch = ReadCursor::from_owned(&[empty], schema);
+        let mut ch = ReadCursor::over_batches(&[empty], schema);
 
         let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (2, 0, 0, 1, 20), (3, 0, 0, 1, 30)]);
         let (out, _) = op_distinct(delta, &mut ch, &schema);
@@ -485,7 +485,7 @@ mod tests {
         // Already in set → output must be empty.
         let schema = wide_pk_3xu64_schema();
         let trace = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 99)]));
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
 
         let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 99)]);
         let (out, _) = op_distinct(delta, &mut ch, &schema);
@@ -506,7 +506,7 @@ mod tests {
         let schema = wide_pk_3xu64_schema();
         // (1,1,0) is already in the trace
         let trace = Rc::new(make_wide_batch(&schema, &[(1, 1, 0, 1, 50)]));
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
 
         // Delta has the NEW key (1,1, 1<<56) which shares 16 OPK bytes with (1,1,0)
         let c2_new = 1u64 << 56;
@@ -542,7 +542,7 @@ mod tests {
         trace_b.certify_layout(Layout::Consolidated, &schema);
 
         let trace = Rc::new(trace_b);
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
 
         let mut delta = Batch::with_capacity(schema, 1);
         delta.extend_pk(max_pk);

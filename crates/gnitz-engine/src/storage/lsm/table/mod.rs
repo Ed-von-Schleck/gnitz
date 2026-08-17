@@ -42,6 +42,18 @@ use crate::schema::SchemaDescriptor;
 /// ordinary ingest stops reaching it, not a promise that nothing will.
 const INMEM_CEILING: usize = 32 * 1024 * 1024;
 
+/// [`INMEM_CEILING`] with its `GNITZ_RAM_TIER_BYTES` override applied, read once
+/// per process rather than per store — `Table::new` runs for every system table,
+/// every user relation, and every view's per-node scratch. Shrinking it is how an
+/// E2E test reaches the disk regime (spills, compaction, the capacity sweep) on
+/// small data. Being process-wide is why the per-table
+/// `set_inmem_ceiling_for_test` stays: the Rust units share one process and must
+/// not fight over a global.
+fn inmem_ceiling() -> usize {
+    static CEILING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CEILING.get_or_init(|| crate::foundation::env::env_usize("GNITZ_RAM_TIER_BYTES", INMEM_CEILING))
+}
+
 /// Memtable arena of every store [`Table::new`] opens — every system table,
 /// every user relation, every view's operator scratch. Measured on btrfs, W=4,
 /// 4 views, 200k rows, interleaved ×3: 256 KiB and 1 MiB are indistinguishable
@@ -248,7 +260,7 @@ impl Table {
         let mut table = Table {
             // Fold at 3/4 of the arena so the next ingest batch always fits.
             memtable: RunSet::new(arena_size as usize * 3 / 4),
-            ram_tier: RunSet::new(INMEM_CEILING),
+            ram_tier: RunSet::new(inmem_ceiling()),
             shard_index: ShardIndex::new(table_id, dir, schema),
             schema,
             table_id,
@@ -277,6 +289,19 @@ impl Table {
     /// The directory this store's shards live in — the child it is homed at.
     pub fn directory(&self) -> &str {
         &self.directory
+    }
+
+    /// Bound this store's registered shard bytes — the sweep itself lives on the
+    /// shard index, which owns every quantity it touches. Called once, by
+    /// `build_relation_store`, so a store is bounded from birth.
+    pub fn set_capacity(&mut self, capacity_bytes: Option<u64>) {
+        self.shard_index.set_capacity(capacity_bytes);
+    }
+
+    /// Whether a read of this store can meet a skeleton row it has to hydrate.
+    /// See [`ShardIndex::has_skeleton_shard`].
+    pub fn has_skeleton_rows(&self) -> bool {
+        self.shard_index.has_skeleton_shard()
     }
 
     /// Full path of this table's manifest — a pure function of the directory,

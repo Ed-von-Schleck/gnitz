@@ -18,8 +18,8 @@ use crate::{
     COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND,
     COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID,
     IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX,
-    TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_SQL,
-    VIEW_TAB_COLS,
+    TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
+    VIEWTAB_PAY_SQL, VIEW_TAB_COLS,
 };
 
 /// True iff `pay` lists **every** payload column of a family whose column list
@@ -164,6 +164,8 @@ pub struct ViewTabRow<'a> {
     pub name: &'a str,
     pub sql_definition: &'a str,
     pub pk_col_idx: u64,
+    /// `WITH (capacity = …)` in bytes; `0` is unbounded.
+    pub capacity_bytes: u64,
 }
 
 const _: () = assert!(
@@ -173,6 +175,7 @@ const _: () = assert!(
             VIEWTAB_PAY_NAME,
             VIEWTAB_PAY_SQL,
             VIEWTAB_PAY_PK_COL_IDX,
+            VIEWTAB_PAY_CAPACITY,
         ],
         VIEW_TAB_COLS.len()
     ),
@@ -185,6 +188,7 @@ pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i6
     sink.put_string(r.name);
     sink.put_string(r.sql_definition);
     sink.put_u64(r.pk_col_idx);
+    sink.put_u64(r.capacity_bytes);
     sink.end_row();
 }
 
@@ -313,6 +317,7 @@ mod tests {
                 name: "v",
                 sql_definition: "SELECT 1",
                 pk_col_idx: 0,
+                capacity_bytes: 0,
             },
             1,
         );

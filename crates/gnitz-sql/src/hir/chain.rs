@@ -159,6 +159,9 @@ impl ViewChain {
             circuit,
             output_columns: cols,
             pk_cols: pk,
+            // A hidden segment is never bounded — it is the unbounded
+            // materialization a bounded view may not sit on.
+            capacity_bytes: None,
         });
         Ok(())
     }

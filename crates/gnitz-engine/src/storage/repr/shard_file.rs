@@ -327,19 +327,36 @@ fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
 /// `pack_ints` enables FoR (`ENCODING_FOR`) on eligible integer payload
 /// regions — set only by compaction; L0 spill/checkpoint writers stay raw.
 ///
+/// `skeleton` stamps [`SHARD_FLAG_SKELETON`] for a capacity-bounded view's
+/// payload-free shard, whose `schema` must be the PK-only projection of the
+/// relation's schema; set only by compaction's per-guard dehydration. It is a
+/// separate field rather than an alternative to `pack_ints` because the two are
+/// independent policies over one write — as the filter build, which a skeleton
+/// shard gets like any other, already shows. They merely never co-occur today,
+/// since a skeleton's schema has no payload region to pack.
+///
 /// Durability is not a per-write choice: the flush barrier fdatasyncs every
 /// registered-unsynced shard in one batched io_uring submission, then fsyncs the
 /// table directory the renames landed in.
 #[derive(Clone, Copy, Default)]
 pub struct ShardWriteOpts {
     pub pack_ints: bool,
+    pub skeleton: bool,
 }
 
 impl ShardWriteOpts {
     /// The compaction write policy: FoR-packed integer payload regions. The
     /// differential-test oracles reuse it so they cannot drift from the
     /// production write.
-    pub const COMPACTION: Self = Self { pack_ints: true };
+    pub const COMPACTION: Self = ShardWriteOpts {
+        pack_ints: true,
+        skeleton: false,
+    };
+    /// A dehydrated guard's write: payload-free, so nothing to pack.
+    pub const SKELETON: Self = ShardWriteOpts {
+        pack_ints: false,
+        skeleton: true,
+    };
 }
 
 /// Write the .tmp shard, close, and rename to `basename`. The sole shard writer.
@@ -518,7 +535,16 @@ fn write_shard_streaming_inner(
     // The file's own arity. `check_region_shape` above already tied
     // `regions.len()` to `strides_from_schema(schema)`, so the count stamped
     // here and the directory written below come from the same descriptor.
-    write_u64_le(&mut hdr_buf, OFF_FILE_NPC, schema.num_payload_cols() as u64);
+    let skeleton = opts.skeleton;
+    debug_assert!(
+        !skeleton || schema.num_payload_cols() == 0,
+        "a skeleton shard must be written under the PK-only projection of its relation's schema",
+    );
+    write_u64_le(
+        &mut hdr_buf,
+        OFF_FILE_NPC,
+        schema.num_payload_cols() as u64 | if skeleton { SHARD_FLAG_SKELETON } else { 0 },
+    );
     write_u64_le(&mut hdr_buf, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_SIZE, xor8_size as u64);
     // A filterless shard carries 0 here and `xor8_offset == 0`, which is the

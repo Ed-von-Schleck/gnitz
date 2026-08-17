@@ -79,6 +79,9 @@ pub(crate) type Resolved = (u64, Arc<Schema>, Option<RelationKind>);
 pub(crate) struct Binder<'a> {
     schema_name: &'a str,
     cache: HashMap<String, CachedRelation>,
+    /// This binder is binding a view *body* (CREATE VIEW / ALTER VIEW), where
+    /// the leaf rule applies: a capacity-bounded view may not be a source.
+    view_body: bool,
 }
 
 impl<'a> Binder<'a> {
@@ -86,7 +89,16 @@ impl<'a> Binder<'a> {
         Binder {
             schema_name,
             cache: HashMap::new(),
+            view_body: false,
         }
+    }
+
+    /// Bind in view-body mode: every relation this binder resolves becomes a
+    /// source of a new view, so the leaf rule in [`Self::resolve`] applies. Set by
+    /// `dispatch::execute_statement` for CREATE VIEW / ALTER VIEW.
+    pub(crate) fn for_view_body(mut self) -> Self {
+        self.view_body = true;
+        self
     }
 
     /// Cache a `name → relation` entry, keyed by the canonical ASCII-lowercase
@@ -121,16 +133,28 @@ impl<'a> Binder<'a> {
         // on insert (`cache_alias` validates; `cache_relation` is fed from these
         // already-validated probes), never a raw `__h…` catalog name.
         crate::validate::validate_user_name(name)?;
-        let (tid, schema, is_view) = client
+        let (schema, rel) = client
             .resolve_relation(self.schema_name, name)
             .map_err(GnitzSqlError::Exec)?;
-        let kind = Some(if is_view {
+        // Leaf rule. A bounded view's store keeps only skeleton rows past its
+        // capacity, and hydrating them replays *sources* — so a view over one
+        // would have to hydrate through it, and its own store would be a second
+        // derived copy of already-lossy state. One funnel, one check: this covers
+        // direct FROM, join sides, subquery inners, set-op sides and CTE bodies
+        // alike. A chain-minted segment id never reaches here (it is served from
+        // the alias cache) and a hidden segment never carries a capacity.
+        if self.view_body && rel.is_bounded {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "'{name}' is a capacity-bounded view; views cannot be created over it"
+            )));
+        }
+        let kind = Some(if rel.is_view {
             RelationKind::View
         } else {
             RelationKind::Table
         });
-        self.cache_relation(name, tid, Arc::clone(&schema), kind);
-        Ok((tid, schema, kind))
+        self.cache_relation(name, rel.tid, Arc::clone(&schema), kind);
+        Ok((rel.tid, schema, kind))
     }
 
     /// Resolve a write/index target that must be a base table. INSERT, UPDATE,
@@ -153,17 +177,17 @@ impl<'a> Binder<'a> {
         crate::validate::validate_user_name(name)?;
         // One resolve answers id, schema and kind together, so "is a view" and
         // "does not exist" are distinguished without a second probe.
-        let (tid, schema, is_view) = client
+        let (schema, rel) = client
             .resolve_relation(self.schema_name, name)
             .map_err(GnitzSqlError::Exec)?;
-        if is_view {
+        if rel.is_view {
             return Err(GnitzSqlError::Unsupported(format!(
                 "'{name}' is a view; INSERT, UPDATE, DELETE and CREATE INDEX \
                  require a base table"
             )));
         }
-        self.cache_relation(name, tid, Arc::clone(&schema), Some(RelationKind::Table));
-        Ok((tid, schema))
+        self.cache_relation(name, rel.tid, Arc::clone(&schema), Some(RelationKind::Table));
+        Ok((rel.tid, schema))
     }
 
     /// Cache a CTE / derived-table alias as resolving to the given

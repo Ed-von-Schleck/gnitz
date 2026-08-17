@@ -499,6 +499,7 @@ Note that when piping `make e2e` or any other command through `| tail ...`, do n
 | `GNITZ_CHECKPOINT_BYTES` | SAL checkpoint threshold (default 75% of SAL) |
 | `GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES` | CREATE UNIQUE INDEX pre-flight in-RAM sort budget before spilling to disk (default 128 MiB) |
 | `GNITZ_CLIENT_SEND_TIMEOUT_MS` | Per-frame deadline on ring-slot client egress before a stalled client is evicted (default 30 s) |
+| `GNITZ_RAM_TIER_BYTES` | Per-store RAM-tier ceiling before it spills to a shard (default 32 MiB); shrink it to reach the disk regime on small data |
 
 ## Debug logging
 
@@ -553,6 +554,45 @@ run, so save copies before re-running if you need them.
 6. **Test logs survive the session**, code state does NOT — if you want
    to attach a log to a bug report, copy it out of `<repo>/tmp/`
    before the next test run overwrites it.
+
+## Capacity-bounded views
+
+```sql
+CREATE VIEW recent WITH (capacity = '4 MB') AS SELECT id, body FROM messages WHERE kind = 3;
+```
+
+The view is maintained exactly as any other — correctness is never a function of
+what is resident — but past the capacity the sweep rewrites whole terminal-level
+guards of its output store as **skeleton rows**: the PK and one coarse weight, no
+payload. A read touching such a key recomputes it from the view's operator traces
+(join) or source store (linear), which stay full-fidelity. Only evicted guards
+are skeleton; L0, L1 and un-evicted guards stay full width, and an all-skeleton
+store is the *floor* the sweep converges to across spills, not a steady state.
+
+Capacity bounds the **registered on-disk shard bytes of that one store on one
+worker**, at guard granularity, victim-ordered by *write* recency — nothing
+records that a row was read. Not the traces, not per-row residency, not cluster-
+wide, and not a bound on read peak: a read over hydrated keys materializes them,
+so peak is higher than the unbounded twin's, not lower. Eligible bodies are
+exactly two: filter/projection over one relation, and plain inner equi-join.
+Bounded views are **leaf** views: nothing may be created over one, and
+`ALTER VIEW … AS` cannot retarget one.
+
+Read paths branch on whether a store *holds* a skeleton row, never on whether it
+has a capacity — so a bounded view under its cap reads exactly like any other
+relation, and the branch cannot disagree with what the sweep did.
+
+This is the one deliberate local exception to the (PK, payload) element identity
+of §1/§2: when a cursor holds a skeleton run, its merge comparators fold a whole
+PK group to the skeleton row regardless of payload, because that row already
+carries the key's summed weight. Every other cursor, and every compaction merge,
+keeps (PK, payload).
+
+**Fold totality** — every merge that can see a skeleton row folds a per-key
+*time-prefix* of the store's history, cut at an ingest boundary — becomes a
+precondition of storage correctness here: it plus base-table positivity is what
+makes a skeleton row's single summed weight per key exact. A future *partial*
+compaction that broke it would corrupt bounded views.
 
 ## SAL durability contract
 

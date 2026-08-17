@@ -171,7 +171,7 @@ pub fn op_reduce(
         //     is `worker_for_key(V₀)`. `i_am_owner` is always true
         //     for a replicated reduce (single-source-read from worker 0).
         //   * Only if `trace_out` has no row at V₀ yet — the reduce integrates its
-        //     own output within the epoch and `refresh_owned_cursors` rebuilds the
+        //     own output within the epoch and `bind_trace_cursors` rebuilds the
         //     cursor each epoch, so a prior pad's seed is visible here and never
         //     re-seeded → no weight-2 ground is constructible.
         if global_ground && plan.i_am_owner {
@@ -610,9 +610,10 @@ pub fn op_reduce(
                 if let Some(ti_cursor) = trace_in.as_deref_mut() {
                     if group_by_pk {
                         // MIN/MAX history read; group_by_pk visits groups in
-                        // ascending output-PK order, so the probe is monotone →
-                        // galloping `advance_to`.
-                        ti_cursor.advance_to(group_pk_bytes);
+                        // ascending output-PK order, so the seek is a monotone
+                        // gallop — and a no-op whenever the previous group's walk
+                        // already left the cursor on this one.
+                        ti_cursor.seek_pk_group(group_pk_bytes);
                         ti_cursor.for_each_pk_group_row(group_pk_bytes, |c| {
                             if c.current_weight != 0 {
                                 trace_rows.push(c.current_row_loc());

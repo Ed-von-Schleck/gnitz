@@ -66,7 +66,7 @@ mod tests {
         trace.count += 1;
         trace.certify_layout(Layout::Consolidated, &right_schema);
         let trace = Rc::new(trace);
-        let mut ch = ReadCursor::from_owned(&[trace], right_schema);
+        let mut ch = ReadCursor::over_batches(&[trace], right_schema);
         let cursor = &mut ch;
         cursor.seek_bytes(&1u64.to_be_bytes());
 

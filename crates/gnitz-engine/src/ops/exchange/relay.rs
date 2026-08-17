@@ -1075,7 +1075,7 @@ mod tests {
 
         // Trace: (PK=1, val=100, w=+1) — a row inserted in a previous tick.
         let trace_batch = Rc::new(make_batch(&schema, &[(1, 1, 100)]));
-        let mut cursor_handle = ReadCursor::from_owned(&[trace_batch], schema);
+        let mut cursor_handle = ReadCursor::over_batches(&[trace_batch], schema);
 
         // Delta: UPDATE PK=1 sets val=100 → 200.
         // _enforce_unique_pk emits (PK=1, val=100, w=-1) and (PK=1, val=200, w=+1).

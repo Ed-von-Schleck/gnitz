@@ -96,7 +96,7 @@ mod tests {
         let right_schema = make_schema_i32();
         // Trace (right): keys 1 and 2, both present.
         let trace = Rc::new(make_i32_batch(&right_schema, &[(1, 1, 100), (2, 1, 200)]));
-        let mut ch = ReadCursor::from_owned(&[trace], right_schema);
+        let mut ch = ReadCursor::over_batches(&[trace], right_schema);
         // Delta (left): keys 1 and 2.
         let delta = make_i32_batch(&left_schema, &[(1, 1, 10), (2, 1, 20)]);
 
@@ -123,7 +123,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         // Trace: PK=1 with two right payloads (100, 200).
         let trace = Rc::new(make_batch(&schema, &[(1, 1, 100), (1, 1, 200)]));
-        let mut ch = ReadCursor::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::over_batches(&[trace], schema);
         // Delta: PK=1 with three left payloads.
         let delta = make_batch(&schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]);
 
@@ -156,7 +156,7 @@ mod tests {
         // once, producted against the once-walked trace group (no re-seek).
         let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]));
-        let mut ch = ReadCursor::from_owned(&[trace_batch], schema);
+        let mut ch = ReadCursor::over_batches(&[trace_batch], schema);
 
         let mut delta = Batch::with_capacity(schema, 2);
         // Row 0: pk=(1,0,0) payload=10 w=+1
@@ -196,7 +196,7 @@ mod tests {
         // Large delta (2 rows) vs 1-row trace.
         let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 2, 1, 100)]));
-        let mut ch = ReadCursor::from_owned(&[trace_batch], schema);
+        let mut ch = ReadCursor::over_batches(&[trace_batch], schema);
 
         let delta = make_wide_batch(
             &schema,

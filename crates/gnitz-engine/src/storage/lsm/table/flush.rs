@@ -177,7 +177,20 @@ impl Table {
         // The only path that grows L0, so the only place its fan-in can cross
         // `L0_COMPACT_THRESHOLD`. Publishes no manifest, so a barrier caller
         // stages one describing the already-compacted index.
-        self.compact_if_needed()
+        self.compact_if_needed()?;
+
+        // The one capacity trigger. Not inside `compact_if_needed`, whose
+        // `should_compact` early return would skip the check on exactly the
+        // spills that did not also cross the file-count threshold. One trigger
+        // suffices because this is the only place a store's shard bytes can
+        // grow — a tick that merely fills the memtable or the RAM tier changes no
+        // disk byte — so a view that goes over budget and then never spills again
+        // was enforced on its last spill.
+        //
+        // Its outputs register as unsynced and its superseded inputs go to
+        // `pending_deletions`, so it inherits the barrier plumbing
+        // `compact_if_needed` already uses here unchanged.
+        self.shard_index.enforce_capacity()
     }
 
     /// Phase 2: rename the manifest `.tmp` into place and return the per-flush

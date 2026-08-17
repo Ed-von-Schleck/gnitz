@@ -142,13 +142,13 @@ fn rename_relation(
     let resolved = client
         .resolve_relation_kind(schema_name, &source_name)
         .map_err(GnitzSqlError::Exec)?;
-    let Some((id, is_view)) = resolved else {
+    let Some(rel) = resolved else {
         if if_exists {
             return Ok(altered("table", extract_name(target, "ALTER TABLE")?));
         }
         return Err(missing("relation", schema_name, &source_name));
     };
-    reject_system_relation(id)?;
+    reject_system_relation(rel.tid)?;
 
     let new_name = rename_target_name(target, schema_name)?;
     validate_user_name(&new_name)?;
@@ -156,7 +156,7 @@ fn rename_relation(
     client
         .alter_rename_relation(schema_name, &source_name, &new_name)
         .map_err(GnitzSqlError::Exec)?;
-    Ok(altered(relation_kind(is_view), new_name))
+    Ok(altered(relation_kind(rel.is_view), new_name))
 }
 
 /// `ALTER TABLE <t> RENAME COLUMN <a> TO <b>` — `t` must be a base table (a view
@@ -427,9 +427,9 @@ fn alter_base_table_exists(
     {
         None if if_exists => Ok(false),
         None => Err(missing("Table", schema_name, source_name)),
-        Some((_, true)) => Err(require_base_table(source_name, op)),
-        Some((id, false)) => {
-            reject_system_relation(id)?;
+        Some(rel) if rel.is_view => Err(require_base_table(source_name, op)),
+        Some(rel) => {
+            reject_system_relation(rel.tid)?;
             Ok(true)
         }
     }

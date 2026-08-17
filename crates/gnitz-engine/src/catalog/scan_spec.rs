@@ -19,13 +19,13 @@ use std::cmp::Ordering;
 
 use gnitz_wire::{AggReadSpec, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec};
 
-use super::store_io::SourceCursor;
+use super::store_io::{BoundedRead, SourceCursor};
 use super::*;
 use crate::expr::ScalarFunc;
 use crate::ops::AdhocFold;
 use crate::schema::key::{compare_pk_bytes, opk_key, PkBuf};
 use crate::schema::ColumnLocator;
-use crate::storage::{cmp_col_window, compare_rows};
+use crate::storage::{cmp_col_window, compare_rows, PkSetGather};
 use gnitz_expr::{LogicalProgram, RowSource};
 
 /// `limit_k` above which the worker materializes instead of running the bounded
@@ -138,6 +138,41 @@ impl CatalogEngine {
         bound: &ReadBound,
         src_schema: &SchemaDescriptor,
     ) -> Result<ScanSpecCursor, String> {
+        // A store holding skeleton rows is hydrated over the bound into one
+        // in-memory run first, so the predicate, projection, ORDER BY / LIMIT and
+        // aggregate sinks below run unchanged over source-schema rows and never see
+        // a skeleton row.
+        //
+        // Capacity buys disk, not read peak: an *unbounded* `SELECT … WHERE …` here
+        // gives up `scan_spec`'s otherwise-fully-streaming property and
+        // materializes the hydrated relation, as a plain `Scan` of the unbounded
+        // twin already does. A bounded one materializes only its bound.
+        if self.table_entry(source)?.needs_hydration() {
+            let rows = match bound {
+                ReadBound::None => self.materialize_bounded_store(source, BoundedRead::All)?,
+                ReadBound::PkRange(desc) => match pk_range_keys(src_schema, desc)? {
+                    None => Batch::empty_with_schema(src_schema),
+                    Some((start, end)) => self.materialize_bounded_store(
+                        source,
+                        BoundedRead::Range(start.pk_bytes(), end.as_ref().map(|k| k.pk_bytes())),
+                    )?,
+                },
+                ReadBound::PkSet(keys) => {
+                    let opk = pk_set_opk_keys(source, keys, src_schema)?;
+                    self.materialize_bounded_store(source, BoundedRead::Keys(&opk))?
+                }
+                // Only base tables own index circuits, so an index bound cannot
+                // name a view — the only relation kind that can hold skeletons.
+                ReadBound::IndexRange { .. } => {
+                    return Err(format!(
+                        "scan_spec: an index bound cannot name view {source} — only base tables own index circuits"
+                    ))
+                }
+            };
+            return Ok(ScanSpecCursor::Source(SourceCursor::Full(Box::new(
+                ReadCursor::over_batches(&[Rc::new(rows)], *src_schema),
+            ))));
+        }
         match bound {
             ReadBound::None => Ok(ScanSpecCursor::Source(SourceCursor::Full(Box::new(
                 self.table_entry(source)?.open_cursor(),
@@ -201,68 +236,70 @@ impl CatalogEngine {
         }
     }
 
-    /// A `pk IN (…)` gather. Two trust-boundary rejections land here because the
-    /// decoder has no schema: the PK must be a single column, and no two wire
-    /// keys may share an OPK image (`opk_key` truncates to `pk_stride`, so `5`
-    /// and `5 + 2^64` are the same U64 PK — left in, the pair would emit its row
-    /// twice). Both are hard rejects; release builds must not clamp.
+    /// A `pk IN (…)` gather over an unbounded relation.
     fn open_pk_set_gather(
         &mut self,
         source: i64,
         keys: &[u128],
         src_schema: &SchemaDescriptor,
     ) -> Result<ScanSpecCursor, String> {
-        if src_schema.pk_indices().len() != 1 {
-            return Err(format!(
-                "scan_spec: PkSet gather requires a single-column PK (table {source})"
-            ));
-        }
+        let opk = pk_set_opk_keys(source, keys, src_schema)?;
         let entry = self.table_entry(source)?;
-        let stride = src_schema.pk_stride() as usize;
-        // OPK order IS typed PK order, so sorting the images byte-wise makes the
-        // gather one monotone forward sweep regardless of wire key order. A
-        // single PK column is at most 16 bytes, so the images are flat
-        // fixed-size arrays (zero tail bytes never affect the order).
-        let mut opk_keys: Vec<[u8; 16]> = keys
-            .iter()
-            .map(|&k| {
-                let opk = opk_key(src_schema, &k.to_le_bytes());
-                debug_assert_eq!(opk.len as usize, stride);
-                let mut key = [0u8; 16];
-                key[..stride].copy_from_slice(opk.pk_bytes());
-                key
-            })
-            .collect();
-        opk_keys.sort_unstable();
-        // The sort makes a colliding pair adjacent. Checked before the ownership
-        // filter so every worker returns the same verdict.
-        if let Some(w) = opk_keys.windows(2).find(|w| w[0] == w[1]) {
-            return Err(format!(
-                "scan_spec: PkSet duplicate key {:?} (table {source})",
-                &w[0][..stride]
-            ));
-        }
         // A key this worker holds no row for copies nothing — the request is
         // broadcast, so at W workers most of the list belongs elsewhere.
-        Ok(ScanSpecCursor::PkSet(Box::new(PkSetGather {
-            cursor: entry.open_cursor(),
-            keys: opk_keys,
-            stride,
-            next: 0,
-            src_schema: *src_schema,
-        })))
+        Ok(ScanSpecCursor::PkSet(Box::new(PkSetGather::new(
+            entry.open_cursor(),
+            opk,
+            *src_schema,
+        ))))
     }
 }
 
-/// A `pk IN (…)` gather: every live row of each key's PK group, in ascending
-/// OPK order.
-struct PkSetGather {
-    cursor: ReadCursor,
-    /// OPK images of the keys, sorted; the leading `stride` bytes are the key.
-    keys: Vec<[u8; 16]>,
-    stride: usize,
-    next: usize,
-    src_schema: SchemaDescriptor,
+/// The OPK images of a `pk IN (…)` key list, sorted ascending and concatenated —
+/// the walk order `PkSetGather` and `BoundedRead::Keys` both require. OPK order
+/// IS typed PK order, so sorting the images byte-wise makes the gather one
+/// monotone forward sweep regardless of wire key order.
+///
+/// Two trust-boundary rejections land here because the decoder has no schema:
+/// the PK must be a single column, and no two wire keys may share an OPK image
+/// (`opk_key` truncates to `pk_stride`, so `5` and `5 + 2^64` are the same U64
+/// PK — left in, the pair would emit its row twice). Both are hard rejects;
+/// release builds must not clamp.
+fn pk_set_opk_keys(source: i64, keys: &[u128], src_schema: &SchemaDescriptor) -> Result<Vec<u8>, String> {
+    if src_schema.pk_indices().len() != 1 {
+        return Err(format!(
+            "scan_spec: PkSet gather requires a single-column PK (table {source})"
+        ));
+    }
+    let stride = src_schema.pk_stride() as usize;
+    // A single PK column is at most 16 bytes, so the images sort as inline
+    // fixed-size arrays — one allocation for the list and register-width
+    // comparisons, at a key count that reaches `MAX_PK_SET_KEYS` per request.
+    // Trailing zero bytes are identical across keys and never affect the order.
+    let mut opk_keys: Vec<[u8; 16]> = keys
+        .iter()
+        .map(|&k| {
+            let opk = opk_key(src_schema, &k.to_le_bytes());
+            debug_assert_eq!(opk.len as usize, stride);
+            let mut key = [0u8; 16];
+            key[..stride].copy_from_slice(opk.pk_bytes());
+            key
+        })
+        .collect();
+    opk_keys.sort_unstable();
+    // The sort makes a colliding pair adjacent. Checked before the ownership
+    // filter so every worker returns the same verdict.
+    if let Some(w) = opk_keys.windows(2).find(|w| w[0] == w[1]) {
+        return Err(format!(
+            "scan_spec: PkSet duplicate key {:?} (table {source})",
+            &w[0][..stride]
+        ));
+    }
+    let mut flat = Vec::with_capacity(opk_keys.len() * stride);
+    for k in &opk_keys {
+        flat.extend_from_slice(&k[..stride]);
+    }
+    Ok(flat)
 }
 
 /// The per-bound chunk producer feeding the sink. Each variant yields
@@ -289,23 +326,7 @@ impl ScanSpecCursor {
     fn next_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         match self {
             ScanSpecCursor::Source(source) => source.drain_chunk(max_rows),
-            ScanSpecCursor::PkSet(g) => {
-                if g.next >= g.keys.len() {
-                    return None;
-                }
-                let cap = (g.keys.len() - g.next).min(max_rows);
-                let mut out = Batch::with_capacity(g.src_schema, cap);
-                while g.next < g.keys.len() && out.count < max_rows {
-                    let key = &g.keys[g.next][..g.stride];
-                    g.next += 1;
-                    // An absent key, or one this worker holds no row for, copies
-                    // nothing: the discard the broadcast list needs.
-                    g.cursor.copy_live_pk_group_into(key, &mut out);
-                }
-                // An all-miss window returns an empty batch only when the key list
-                // is exhausted; otherwise it advanced `next` and there is more.
-                (out.count > 0 || g.next < g.keys.len()).then_some(out)
-            }
+            ScanSpecCursor::PkSet(g) => g.next_chunk(max_rows),
         }
     }
 }

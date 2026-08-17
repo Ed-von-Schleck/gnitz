@@ -72,9 +72,10 @@ fn a_view_resolves_as_a_view_and_fails_the_base_table_probe() {
     );
     exec(&mut client, &sn, "CREATE VIEW v AS SELECT id, v FROM t");
 
-    let (vid, _, is_view) = client.resolve_relation(&sn, "v").unwrap();
-    assert!(is_view, "a view must report kind = view");
-    assert_eq!(client.resolve_relation_kind(&sn, "v").unwrap(), Some((vid, true)));
+    let (_, rel) = client.resolve_relation(&sn, "v").unwrap();
+    assert!(!rel.is_bounded, "a plain CREATE VIEW is unbounded");
+    assert!(rel.is_view, "a view must report kind = view");
+    assert_eq!(client.resolve_relation_kind(&sn, "v").unwrap(), Some(rel));
 
     let err = client.resolve_table_id(&sn, "v").unwrap_err().to_string();
     assert!(err.contains("Table") && err.contains("not found"), "got: {err}");
@@ -256,7 +257,7 @@ fn only_a_base_table_reports_its_replication() {
 
     let (r_tid, _) = client.resolve_table_id(&sn, "r").unwrap();
     let (plain_tid, _) = client.resolve_table_id(&sn, "plain").unwrap();
-    let (rv_tid, _, _) = client.resolve_relation(&sn, "rv").unwrap();
+    let rv_tid = client.resolve_relation(&sn, "rv").unwrap().1.tid;
 
     assert!(client.table_replicated(r_tid).unwrap(), "a REPLICATED base table");
     assert!(!client.table_replicated(plain_tid).unwrap(), "a plain base table");

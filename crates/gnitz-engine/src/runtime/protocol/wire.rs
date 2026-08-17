@@ -816,6 +816,7 @@ mod tests {
                 .u64_val(3)
                 .str_val("v")
                 .str_val("")
+                .u64_val(0)
                 .u64_val(0);
             b
         };

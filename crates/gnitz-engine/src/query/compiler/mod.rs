@@ -7,7 +7,7 @@ use std::fmt;
 use crate::expr::ScalarFunc;
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{build_reduce_output_schema, AggDescriptor};
-use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
+use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{type_code, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{ReadCursor, RecoverySource, Table};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
@@ -198,6 +198,31 @@ pub(crate) struct CompileOutput {
     /// access hint**: `None` means "full-scan", which is always correct, and the
     /// circuit's `Filter` carries the full predicate either way.
     pub source_bound: Option<(i64, gnitz_wire::ScanBound)>,
+    /// How a capacity-bounded view recomputes one key's output rows. `None` for
+    /// every unbounded view — the walk runs only under a capacity, and any
+    /// structural mismatch there is a `Rejected` rather than a silent `None`: a
+    /// bounded view must never reach its store with no way to hydrate it.
+    pub hydration: Option<Hydration>,
+}
+
+/// Where a bounded view's per-key replay seeds. Both variants name a register to
+/// feed and a store to feed it from; they differ only in where that store lives
+/// and, for the join, in entering the program past its own prologue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hydration {
+    /// Linear (`ScanDelta → Filter? → Map? → IntegrateSink`): seed the
+    /// `ScanDelta`'s register `in_reg` from relation `source`'s store and replay
+    /// the whole program.
+    Relation { in_reg: u16, source: i64 },
+    /// Inner equi-join: seed `in_reg` from `owned_tables[seed_table]`'s store and
+    /// dispatch from `start_pc`. The seed must enter mid-program because the join
+    /// key is not the source PK, so a key-restricted feed at the `ScanDelta`
+    /// register would mean scanning the whole source.
+    Join {
+        start_pc: usize,
+        in_reg: u16,
+        seed_table: u16,
+    },
 }
 
 impl CompileOutput {
@@ -230,6 +255,14 @@ pub(super) struct PlanBuildResult {
     // plan, an `Err` return from `compile_view`) removes them; `into_sub_plan`
     // defuses the guard — from then on the VM's owned tables keep them alive.
     scratch: emit::ScratchGuard,
+    // Program offset just past each node's own instructions — where a hydration
+    // replay that seeds that node's register resumes. See [`Hydration`].
+    instr_end: HashMap<i32, usize>,
+    // The emitter's resolved node → output register map, after every aliasing
+    // rewrite (an elided identity `Map`, a `Filter(None)` pass-through, a skipped
+    // `Distinct`). Reading it is how `derive_hydration` sees through elision
+    // rather than re-deriving a register from graph position.
+    out_reg_of: HashMap<i32, i32>,
 }
 
 impl PlanBuildResult {
@@ -298,6 +331,176 @@ fn finalize_side(
     Ok(schema)
 }
 
+/// The graph half of a bounded view's hydration plan: which relation a linear
+/// body replays over, or which delta/trace node pair a join body seeds from.
+///
+/// The walk is over `loaded`, not the emitted instruction list, for the same
+/// reason the five sibling `CompileOutput` annotations are: the instruction
+/// stream elides nodes (`Filter(None)` aliases its input register, an identity
+/// `Map` vanishes, `ScanDelta` and `IntegrateSink` emit nothing) and drops
+/// `WorkerFilter` at `num_workers <= 1`, so it is worker-count dependent. Split
+/// from [`derive_hydration`] because this half is the drift-prone one and needs
+/// nothing but the circuit, so its rejections are directly testable.
+fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileError> {
+    use gnitz_wire::{JoinKind, OpNode};
+
+    // 1. From the sink's input, walk back through single-input Filter/Map nodes.
+    let sink = loaded
+        .ordered
+        .iter()
+        .copied()
+        .find(|nid| matches!(loaded.nodes.get(nid), Some(OpNode::IntegrateSink)))
+        .ok_or(CompileError::Rejected("bounded view: circuit has no IntegrateSink"))?;
+    let mut cur = first_input(loaded, sink).ok_or(CompileError::Rejected("bounded view: sink has no input"))?;
+    loop {
+        match loaded.nodes.get(&cur) {
+            Some(OpNode::Filter(_)) | Some(OpNode::Map(_)) => {
+                cur =
+                    first_input(loaded, cur).ok_or(CompileError::Rejected("bounded view: filter/map has no input"))?;
+            }
+            // The linear shape: the whole program replays over the source store,
+            // seeded at this `ScanDelta`'s own register.
+            Some(OpNode::ScanDelta { source, .. }) => {
+                return Ok(HydrationNodes::Relation {
+                    nid: cur,
+                    source: *source as i64,
+                })
+            }
+            Some(OpNode::Union) => break,
+            _ => return Err(CompileError::Rejected("bounded view: unsupported circuit shape")),
+        }
+    }
+    let union = cur;
+
+    // 2. Both `Union` inputs must be `Join(DeltaTrace)`, optionally behind one
+    //    `Map` (`normalize_to_ab`'s per-branch projection, emitted for both
+    //    branches but elidable as an identity).
+    let ins = loaded
+        .incoming
+        .get(&union)
+        .filter(|v| v.len() == 2)
+        .ok_or(CompileError::Rejected("bounded view: union does not have two inputs"))?;
+    let through_map = |mut nid: i32| -> Option<i32> {
+        if matches!(loaded.nodes.get(&nid), Some(OpNode::Map(_))) {
+            nid = first_input(loaded, nid)?;
+        }
+        matches!(loaded.nodes.get(&nid), Some(OpNode::Join(JoinKind::DeltaTrace))).then_some(nid)
+    };
+    let j_a = through_map(ins[0].0).ok_or(CompileError::Rejected(
+        "bounded view: union input is not an inner delta/trace join",
+    ))?;
+
+    // 3. Seed check, stated directly on the graph rather than through a
+    //    register-identity or schema-equality proxy: the trace `J_a` joins
+    //    against must be the integral of `J_a`'s *own* delta port. Either branch
+    //    computes the same product and each carries its own normalization map
+    //    back to canonical `[A, B]` order, so taking `J_a` needs no left/right
+    //    inference. The unchosen branch stays inert: the dispatch clears every
+    //    delta register on entry, so `D_b` is empty and `J_b` unions in nothing.
+    // Each join's trace port, checked to be an integral. Two calls, two messages,
+    // so a rejection names the branch it came from.
+    let trace_of = |j: i32, whose: &'static str| -> Result<i32, CompileError> {
+        let t = input_on_port(loaded, j, PORT_TRACE).ok_or(CompileError::Rejected(whose))?;
+        matches!(loaded.nodes.get(&t), Some(OpNode::IntegrateTrace))
+            .then_some(t)
+            .ok_or(CompileError::Rejected(whose))
+    };
+    let d_a =
+        input_on_port(loaded, j_a, PORT_IN_A).ok_or(CompileError::Rejected("bounded view: join has no delta input"))?;
+    trace_of(j_a, "bounded view: the seeded join's trace port is not an integral")?;
+    // `T_b` integrates the *other* branch's delta, so the seed is the trace whose
+    // input node is `D_a` — found on the sibling join.
+    let j_b = through_map(ins[1].0).ok_or(CompileError::Rejected(
+        "bounded view: union input is not an inner delta/trace join",
+    ))?;
+    let t_a = trace_of(j_b, "bounded view: the sibling join's trace port is not an integral")?;
+    if first_input(loaded, t_a) != Some(d_a) {
+        return Err(CompileError::Rejected(
+            "bounded view: the join's trace port is not the other branch's delta integral",
+        ));
+    }
+
+    Ok(HydrationNodes::Join { d_a, t_a })
+}
+
+/// What [`hydration_nodes`] resolved out of the graph, before any program
+/// lookup: the seeding `ScanDelta` and its relation for a linear body, or the
+/// delta and trace nodes of the join branch a replay seeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HydrationNodes {
+    Relation { nid: i32, source: i64 },
+    Join { d_a: i32, t_a: i32 },
+}
+
+/// Resolve those nodes against the plan the emitter just produced.
+///
+/// Registers and offsets come from the emitter's own node-keyed maps, never from a
+/// node's index in `ordered`: the two agree only for a node that emitted —
+/// `Filter(None)` aliases its input's register, an identity `Map` vanishes, a
+/// skipped `Distinct` aliases, and `Reduce` redirects.
+fn derive_hydration(loaded: &LoadedCircuit, plan: &PlanBuildResult) -> Result<Hydration, CompileError> {
+    let reg_of = |nid: i32| {
+        plan.out_reg_of
+            .get(&nid)
+            .map(|&r| r as u16)
+            .ok_or(CompileError::Rejected(
+                "bounded view: a hydration node is not in the plan",
+            ))
+    };
+
+    let (d_a, t_a) = match hydration_nodes(loaded)? {
+        HydrationNodes::Relation { nid, source } => {
+            let in_reg = reg_of(nid)?;
+            reject_state_writers(plan, 0)?;
+            return Ok(Hydration::Relation { in_reg, source });
+        }
+        HydrationNodes::Join { d_a, t_a } => (d_a, t_a),
+    };
+
+    // Registers and the start offset, off the emitter's own bookkeeping.
+    let in_reg = reg_of(d_a)?;
+    let seed_table = plan
+        .vm
+        .program
+        .reg_meta
+        .get(reg_of(t_a)? as usize)
+        .and_then(|m| m.owned_table)
+        .ok_or(CompileError::Rejected(
+            "bounded view: trace register has no owned table",
+        ))?;
+    // The replay enters past the seeded node's own instructions.
+    let start_pc = plan
+        .instr_end
+        .get(&d_a)
+        .copied()
+        .ok_or(CompileError::Rejected("bounded view: delta node is not in the plan"))?;
+    reject_state_writers(plan, start_pc)?;
+
+    Ok(Hydration::Join {
+        start_pc,
+        in_reg,
+        seed_table,
+    })
+}
+
+/// Trust boundary on the program the read-only dispatch will run from `start_pc`:
+/// that dispatch suppresses `Integrate`, so any *other* state writer would make a
+/// read mutate the state it reads. None is reachable from an eligible shape, so
+/// this turns a planner that under-rejects into a loud DDL failure rather than a
+/// silently-mutating read. `writes_state` is exhaustive over `Instr`, so a new
+/// state-writing opcode cannot slip past this.
+fn reject_state_writers(plan: &PlanBuildResult, start_pc: usize) -> Result<(), CompileError> {
+    if plan.vm.program.instructions[start_pc..]
+        .iter()
+        .any(|i| !matches!(i, Instr::Integrate { .. }) && crate::query::vm::writes_state(i))
+    {
+        return Err(CompileError::Rejected(
+            "bounded view: the replayed program writes operator state",
+        ));
+    }
+    Ok(())
+}
+
 /// Compile a circuit for a single view: read the circuit from the system
 /// tables, then `topo_sort` → annotate → optimize → `build_plan`.
 ///
@@ -312,6 +515,7 @@ pub(crate) unsafe fn compile_view(
     view_dir: &str,
     view_schema: &SchemaDescriptor,
     ext_tables: &ExtTables,
+    bounded: bool,
 ) -> Result<CompileOutput, CompileError> {
     let mut loaded =
         load_circuit(sys_nodes, sys_edges, sys_node_cols, view_id, *view_schema).ok_or(CompileError::LoadFailed)?;
@@ -330,13 +534,14 @@ pub(crate) unsafe fn compile_view(
     // a cross-sub-plan merge.
     let source_bound = circuit_source_bound(&loaded);
 
-    let annotated = |shape: PlanShape| CompileOutput {
+    let annotated = |shape: PlanShape, hydration: Option<Hydration>| CompileOutput {
         shape,
         co_partitioned,
         join_shard_map,
         range_join_n_eq,
         skips_exchange,
         source_bound,
+        hydration,
     };
 
     let exchange_nids: Vec<i32> = loaded
@@ -353,7 +558,11 @@ pub(crate) unsafe fn compile_view(
         0 => {
             let ordered = loaded.ordered.clone();
             let plan = build_plan(&loaded, &skip_nodes, &ordered, ext_tables, view_dir, view_id, None, &[])?;
-            Ok(annotated(PlanShape::Single(plan.into_sub_plan())))
+            // Only `PlanShape::Single` — which both eligible shapes are — can be
+            // hydrated; a bounded view compiling to any other shape is rejected
+            // in the arms below.
+            let hydration = bounded.then(|| derive_hydration(&loaded, &plan)).transpose()?;
+            Ok(annotated(PlanShape::Single(plan.into_sub_plan()), hydration))
         }
         // One or two exchange boundaries: carve each side out by the ancestors
         // of its exchange input (a binary set-op's two independent
@@ -362,6 +571,14 @@ pub(crate) unsafe fn compile_view(
         // exactly the nodes before the exchange in topo order). Everything else
         // (the combine + sink, reading the relayed batches) is the post phase.
         n @ (1 | 2) => {
+            // An exchanged plan splits the circuit across a repartition, so
+            // neither eligible shape can produce one — and a per-key replay of
+            // one would need the exchange to run too.
+            if bounded {
+                return Err(CompileError::Rejected(
+                    "bounded view: only a linear body and an inner equi-join are supported",
+                ));
+            }
             let mut side_sets: Vec<HashSet<i32>> = Vec::with_capacity(n);
             for &ex_nid in &exchange_nids {
                 let ex_in = exchange_input_node(&loaded, ex_nid).ok_or(CompileError::MissingExchangeInput)?;
@@ -415,10 +632,13 @@ pub(crate) unsafe fn compile_view(
                 })
                 .collect();
 
-            Ok(annotated(PlanShape::Exchanged {
-                sides,
-                post: post.into_sub_plan(),
-            }))
+            Ok(annotated(
+                PlanShape::Exchanged {
+                    sides,
+                    post: post.into_sub_plan(),
+                },
+                None,
+            ))
         }
         _ => {
             // More than two exchange boundaries is not produced by any current
@@ -2634,9 +2854,162 @@ mod tests {
         let unioned = op_union(single(g0), &single(g1), &merged);
         assert_eq!(unioned.count, 2, "Z-Set + keeps both rows before consolidation");
         let empty = Rc::new(Batch::empty_with_schema(&merged));
-        let mut ch = ReadCursor::from_owned(std::slice::from_ref(&empty), merged);
+        let mut ch = ReadCursor::over_batches(std::slice::from_ref(&empty), merged);
         let (out, _) = op_distinct(unioned, &mut ch, &merged);
         assert_eq!(out.count, 1, "null-aware comparator coalesces the two NULL rows");
         assert_eq!(out.get_weight(0), 1, "distinct clamps the coalesced weight 2 → 1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded-view hydration: the graph walk
+    // -----------------------------------------------------------------------
+
+    use gnitz_wire::{JoinKind, MapKind, OpNode};
+
+    /// The inner-equi-join shape `emit_equi_join_terms` produces, as node ids:
+    /// two `ScanDelta`s, a reindex `Map` and an `IntegrateTrace` per side, the
+    /// two cross-wired `Join(DeltaTrace)` terms behind their normalization maps,
+    /// a `Union`, a residual `Filter`, a projection `Map`, and the sink.
+    ///
+    /// ```text
+    ///   0 scanA → 2 reindexA ─┬─→ 4 traceA ──────────┐
+    ///                         └─────────────┐        │
+    ///   1 scanB → 3 reindexB ─┬─→ 5 traceB ─┼→ 6 J_ab│ (delta=2, trace=5)
+    ///                         └─────────────┴────────┴→ 7 J_ba (delta=3, trace=4)
+    ///   6 → 8 map → 10 union ← 9 map ← 7;  10 → 11 filter → 12 map → 13 sink
+    /// ```
+    fn equi_join_circuit() -> LoadedCircuit {
+        let m = |cols: Vec<u16>| OpNode::Map(MapKind::Projection(cols));
+        let nodes = HashMap::from([
+            (0, scan_delta(100)),
+            (1, scan_delta(200)),
+            (2, m(vec![0])),
+            (3, m(vec![0])),
+            (4, OpNode::IntegrateTrace),
+            (5, OpNode::IntegrateTrace),
+            (6, OpNode::Join(JoinKind::DeltaTrace)),
+            (7, OpNode::Join(JoinKind::DeltaTrace)),
+            (8, m(vec![0])),
+            (9, m(vec![0])),
+            (10, OpNode::Union),
+            (11, OpNode::Filter(None)),
+            (12, m(vec![0])),
+            (13, OpNode::IntegrateSink),
+        ]);
+        let edges = vec![
+            (0, 2, PORT_IN),
+            (1, 3, PORT_IN),
+            (2, 4, PORT_IN),
+            (3, 5, PORT_IN),
+            (2, 6, PORT_IN_A),
+            (5, 6, PORT_TRACE),
+            (3, 7, PORT_IN_A),
+            (4, 7, PORT_TRACE),
+            (6, 8, PORT_IN),
+            (7, 9, PORT_IN),
+            (8, 10, PORT_IN_A),
+            (9, 10, PORT_IN_B),
+            (10, 11, PORT_IN),
+            (11, 12, PORT_IN),
+            (12, 13, PORT_IN),
+        ];
+        loaded_for_test(nodes, edges)
+    }
+
+    /// The seed is resolved by the *cross-wiring*, not by position: `J_a`'s trace
+    /// port is the other branch's integral, so the trace whose input is `J_a`'s
+    /// own delta port lives on the sibling join. Getting that backwards would
+    /// seed the replay from the wrong side and silently compute a different
+    /// product.
+    #[test]
+    fn hydration_seeds_from_the_cross_wired_trace() {
+        let lc = equi_join_circuit();
+        // `d_a` is the reindex feeding `J_ab`'s delta port (node 2); `t_a` is the
+        // trace that integrates *it* (node 4), which hangs off `J_ba`.
+        assert_eq!(hydration_nodes(&lc).unwrap(), HydrationNodes::Join { d_a: 2, t_a: 4 },);
+    }
+
+    /// The linear shape resolves to its source relation, through any number of
+    /// filter/map nodes.
+    #[test]
+    fn hydration_of_a_linear_circuit_names_its_source() {
+        let lc = loaded_for_test(
+            HashMap::from([
+                (0, scan_delta(77)),
+                (1, OpNode::Filter(None)),
+                (2, OpNode::Map(MapKind::Projection(vec![0]))),
+                (3, OpNode::IntegrateSink),
+            ]),
+            vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN)],
+        );
+        assert_eq!(
+            hydration_nodes(&lc).unwrap(),
+            HydrationNodes::Relation { nid: 0, source: 77 }
+        );
+    }
+
+    /// Every structural mismatch is a `Rejected`, never a silent `None`: a
+    /// bounded view must not reach its store with no way to hydrate it. These are
+    /// the trust boundary behind the planner's own eligibility gate — no SQL
+    /// reaches them, which is exactly why they are asserted here.
+    #[test]
+    fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
+        let rejected = |lc: LoadedCircuit, what: &str| match hydration_nodes(&lc) {
+            Err(CompileError::Rejected(_)) => {}
+            other => panic!("{what}: expected Rejected, got {:?}", other.map(|h| format!("{h:?}"))),
+        };
+
+        // No sink at all.
+        rejected(
+            loaded_for_test(HashMap::from([(0, scan_delta(1))]), vec![]),
+            "sinkless circuit",
+        );
+        // A shape the walk cannot replay (a Reduce under the sink).
+        rejected(
+            loaded_for_test(
+                HashMap::from([
+                    (0, scan_delta(1)),
+                    (
+                        1,
+                        OpNode::Reduce {
+                            group_cols: vec![0],
+                            agg: vec![(gnitz_wire::AggFunc::Count, 0)],
+                            global_ground: false,
+                            out_key: gnitz_wire::ReduceOutKey::SyntheticFold,
+                        },
+                    ),
+                    (2, OpNode::IntegrateSink),
+                ]),
+                vec![(0, 1, PORT_IN), (1, 2, PORT_IN)],
+            ),
+            "reduce under the sink",
+        );
+        // A union whose inputs are not delta/trace joins.
+        rejected(
+            loaded_for_test(
+                HashMap::from([
+                    (0, scan_delta(1)),
+                    (1, scan_delta(2)),
+                    (2, OpNode::Union),
+                    (3, OpNode::IntegrateSink),
+                ]),
+                vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B), (2, 3, PORT_IN)],
+            ),
+            "union of two scans",
+        );
+
+        // The cross-wiring broken: both joins trace against the SAME integral, so
+        // no trace integrates `J_a`'s own delta port.
+        let mut lc = equi_join_circuit();
+        lc.edges.retain(|&(s, d, p)| !(s == 4 && d == 7 && p == PORT_TRACE));
+        lc.edges.push((5, 7, PORT_TRACE));
+        topo_sort(&mut lc).unwrap();
+        rejected(lc, "trace port is not the other branch's delta integral");
+
+        // A join whose trace port is not an integral at all.
+        let mut lc = equi_join_circuit();
+        lc.nodes.insert(4, OpNode::Filter(None));
+        topo_sort(&mut lc).unwrap();
+        rejected(lc, "trace port is not an integral");
     }
 }

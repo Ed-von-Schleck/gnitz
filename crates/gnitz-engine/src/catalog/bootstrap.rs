@@ -219,11 +219,13 @@ impl CatalogEngine {
                 .insert(info.id(), ("_system".into(), info.wire.name.into()));
             self.dag.register_table(
                 info.id(),
-                StoreHandle::Borrowed(&mut **store),
-                sys_tab_schema(info.id()),
-                RelationKind::SystemCatalog,
-                0,
-                dir,
+                crate::query::TableEntry::new(
+                    StoreHandle::Borrowed(&mut **store),
+                    sys_tab_schema(info.id()),
+                    RelationKind::SystemCatalog,
+                    0,
+                    dir,
+                ),
             );
         }
     }

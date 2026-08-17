@@ -10,6 +10,7 @@ mod exec;
 pub(crate) use builder::ProgramBuilder;
 #[cfg(test)]
 pub(crate) use exec::execute_epoch;
+pub(crate) use exec::execute_epoch_from;
 pub(crate) use exec::execute_epoch_multi;
 
 // ---------------------------------------------------------------------------
@@ -125,6 +126,28 @@ pub(crate) fn reads_reg(instr: &Instr, r: u16) -> bool {
     }
 }
 
+/// True iff executing `instr` writes operator state (a table). The instruction
+/// set's own write-set knowledge, matched exhaustively so a new state-writing
+/// opcode is a compile error here rather than something a read-only replay
+/// silently accepts. Consumed by the bounded-view hydration gate, which must not
+/// mutate the state it reads.
+pub(crate) fn writes_state(instr: &Instr) -> bool {
+    match instr {
+        // `Integrate` writes its trace, `WeightClamp` its history table, `Reduce`
+        // its output trace and optional value index.
+        Instr::Integrate { .. } | Instr::WeightClamp { .. } | Instr::Reduce { .. } => true,
+        Instr::Filter { .. }
+        | Instr::Map { .. }
+        | Instr::Negate { .. }
+        | Instr::WorkerFilter { .. }
+        | Instr::NullExtend { .. }
+        | Instr::Union { .. }
+        | Instr::JoinDT { .. }
+        | Instr::JoinDTRange { .. }
+        | Instr::Halt => false,
+    }
+}
+
 /// Combined-AVI descriptor embedded in an Integrate instruction. One table
 /// serves every MIN/MAX aggregate of the reduce; the baked resources — the
 /// composite index schema, the group-key gatherer, and the value-indexed
@@ -180,13 +203,25 @@ const _: () =
     assert!(std::mem::offset_of!(VmHandle, owned_cursor_handles) < std::mem::offset_of!(VmHandle, owned_tables));
 
 impl VmHandle {
-    /// Compact owned tables and create fresh cursors for the trace registers.
-    /// Must be called before `execute_epoch`: the dispatch loop dereferences
-    /// every trace register's cursor without a null check.
-    /// The cursor handles are stored in `owned_cursor_handles` and their
-    /// raw pointers bound into the register file.
-    pub fn refresh_owned_cursors(&mut self) {
-        gnitz_debug!("vm: refresh_owned_cursors, {} trace regs", self.trace_regs.len());
+    /// Compact every owned trace table, keeping its L0 fan-in bounded — there is
+    /// no background compactor. The epoch path's job, not a read's: a compaction
+    /// mutates shard state. An `Err` leaves the shard index unchanged, so a
+    /// cursor opened afterwards still sees a consistent snapshot.
+    pub fn compact_owned_traces(&mut self) {
+        for &(_, table_idx) in &self.trace_regs {
+            // SAFETY: as in `bind_trace_cursors` — `table_idx` is set during
+            // compilation, and `trace_regs` is not modified here.
+            let table: &mut Table = unsafe { &mut *(&mut *self.owned_tables[table_idx] as *mut Table) };
+            let _ = table.compact_if_needed();
+        }
+    }
+
+    /// Create fresh cursors for the trace registers. Must be called before
+    /// `execute_epoch`: the dispatch loop dereferences every trace register's
+    /// cursor without a null check. The cursor handles are stored in
+    /// `owned_cursor_handles` and their raw pointers bound into the register file.
+    pub fn bind_trace_cursors(&mut self) {
+        gnitz_debug!("vm: bind_trace_cursors, {} trace regs", self.trace_regs.len());
         // Drop previous cursors before creating new ones (releases shard refs
         // etc.), then size the slot storage back to full length.
         self.null_owned_cursors();
@@ -197,11 +232,6 @@ impl VmHandle {
             // because trace_regs is not modified here, and the table is
             // accessed through owned_tables which is a separate field.
             let table: &mut Table = unsafe { &mut *(&mut *self.owned_tables[table_idx] as *mut Table) };
-            // Operator-state read path: compact first so L0 on owned trace
-            // tables stays bounded (no background compactor yet). A compaction
-            // Err leaves the shard index unchanged, so the cursor still opens
-            // on a consistent snapshot.
-            let _ = table.compact_if_needed();
             // Store the Box into its slot first, then derive the
             // pointer from the slot — taking the pointer before the
             // move raises Stacked Borrows aliasing questions even
@@ -219,13 +249,13 @@ impl VmHandle {
     }
 
     /// Drop every owned-trace cursor and null its register `cursor_ptr` — the
-    /// first half of `refresh_owned_cursors`, minus the compaction + cursor
+    /// first half of `bind_trace_cursors`, minus the cursor
     /// re-creation. Called before the ephemeral checkpoint round folds each owned
     /// trace table's RAM tier into a shard, so no live cursor holds a stale
     /// snapshot of it. Defensive tidiness, not a safety requirement: held cursors
     /// keep their own `Rc<Batch>` / shard `Arc` clones (a fold produces a
     /// stale-not-dangling snapshot) and the next epoch calls
-    /// `refresh_owned_cursors` before any deref — but nulling here keeps the
+    /// `bind_trace_cursors` before any deref — but nulling here keeps the
     /// flush's safety local and obvious. Only `trace_regs` are handled
     /// (`_int_`/`_hist_`/`_reduce_`/`_reduce_in_`, all cross-epoch); the epoch-local
     /// `_avidx_` cursor is created and dropped inside the `Reduce` instruction.
@@ -247,7 +277,7 @@ pub(crate) struct RegisterMeta {
     pub schema: SchemaDescriptor,
     /// A trace register's backing table, as an index into
     /// `VmHandle::owned_tables`; `None` for a delta register. Naming the table
-    /// here rather than in a side list is what lets `refresh_owned_cursors`
+    /// here rather than in a side list is what lets `bind_trace_cursors`
     /// guarantee every trace register holds a live cursor at dispatch.
     pub owned_table: Option<u16>,
 }
@@ -890,12 +920,12 @@ mod tests {
         ];
 
         // The history register is backed by the plan's owned table, so each tick
-        // opens its cursor through `refresh_owned_cursors` — the production path.
+        // opens its cursor through `bind_trace_cursors` — the production path.
         let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![table], Vec::new());
 
         // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
         let input1 = make_batch(schema, &[(1u128, 3, 42)]);
-        vm.refresh_owned_cursors();
+        vm.bind_trace_cursors();
         let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2).unwrap();
 
         let rows1 = extract_rows(&r1);
@@ -905,14 +935,14 @@ mod tests {
         // Tick 2: delta w=-1, integral before tick = +3, after = +2 (still positive).
         // No boundary crossing → output should be empty.
         let input2 = make_batch(schema, &[(1u128, -1, 42)]);
-        vm.refresh_owned_cursors();
+        vm.bind_trace_cursors();
         let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2);
         assert!(r2.is_none(), "no boundary crossing: output should be empty");
 
         // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
         // Positive→non-positive boundary crossed → retraction: output pk=1 w=-1.
         let input3 = make_batch(schema, &[(1u128, -2, 42)]);
-        vm.refresh_owned_cursors();
+        vm.bind_trace_cursors();
         let r3 = execute_epoch(&vm.program, &mut vm.regfile, input3, 0, 2).unwrap();
         let rows3 = extract_rows(&r3);
         assert_eq!(rows3.len(), 1);
@@ -951,7 +981,7 @@ mod tests {
         ];
 
         let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![table], Vec::new());
-        vm.refresh_owned_cursors();
+        vm.bind_trace_cursors();
 
         let input = make_batch(left_schema, &[(10u128, 1, 100)]);
         let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2).unwrap();
@@ -994,7 +1024,7 @@ mod tests {
             RegisterMeta::delta(join_schema),
         ];
         let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![table], Vec::new());
-        vm.refresh_owned_cursors();
+        vm.bind_trace_cursors();
 
         let input = make_batch(left_schema, &[(10u128, 2, 50)]); // weight=2
         let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2).unwrap();
@@ -1157,7 +1187,7 @@ mod tests {
             ],
         );
 
-        vm.refresh_owned_cursors();
+        vm.bind_trace_cursors();
         let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2).unwrap();
 
         // SUM of group=1: 10+20 = 30. Output should be one row with sum=30.
@@ -1342,7 +1372,7 @@ mod tests {
         // Input: 3 rows all with pk=1, vals 10, 20, 30
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
 
-        vm.refresh_owned_cursors();
+        vm.bind_trace_cursors();
         let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2).unwrap();
 
         // Should produce 1 row: pk=1, count=3, sum=60
@@ -1410,7 +1440,7 @@ mod tests {
         // Three rows all in the same group (same pk), values 10, 20, 30 → SUM=60
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
 
-        vm.refresh_owned_cursors();
+        vm.bind_trace_cursors();
         let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 3).expect("SUM reduce must produce output");
 
         assert_eq!(result.count, 1, "one group → one output row");

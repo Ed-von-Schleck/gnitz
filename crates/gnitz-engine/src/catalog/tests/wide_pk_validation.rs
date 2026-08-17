@@ -75,11 +75,13 @@ fn setup_wide_unique(
 
     engine.dag.register_table(
         tid,
-        StoreHandle::Borrowed(&mut *base as *mut Table),
-        schema,
-        RelationKind::BaseTable,
-        0,
-        dir.to_string(),
+        crate::query::TableEntry::new(
+            StoreHandle::Borrowed(&mut *base as *mut Table),
+            schema,
+            RelationKind::BaseTable,
+            0,
+            dir.to_string(),
+        ),
     );
     engine
         .dag
@@ -141,11 +143,13 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
     pbase.flush().unwrap();
     engine.dag.register_table(
         parent_tid,
-        StoreHandle::Borrowed(&mut pbase as *mut Table),
-        parent_schema,
-        RelationKind::BaseTable,
-        0,
-        dir.clone(),
+        crate::query::TableEntry::new(
+            StoreHandle::Borrowed(&mut pbase as *mut Table),
+            parent_schema,
+            RelationKind::BaseTable,
+            0,
+            dir.clone(),
+        ),
     );
 
     // seek_family_bytes must resolve the committed parent row by full PK bytes.

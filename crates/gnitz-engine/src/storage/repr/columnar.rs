@@ -31,6 +31,14 @@ pub(crate) trait ColumnarSource: RowSource {
     /// implementor already exposes it, so the merge reads it here rather than
     /// taking a parallel `counts` slice each caller has to keep in step.
     fn row_count(&self) -> usize;
+
+    /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
+    /// a capacity-bounded view's skeleton shard. `false` for every in-memory
+    /// source, which always carries its payload.
+    #[inline(always)]
+    fn is_skeleton(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

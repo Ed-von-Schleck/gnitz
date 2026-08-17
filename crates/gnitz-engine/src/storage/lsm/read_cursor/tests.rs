@@ -1187,3 +1187,224 @@ fn bounded_string_read_carries_only_its_own_rows() {
     }
     assert!(!c.valid, "the window is fully drained");
 }
+
+// ---------------------------------------------------------------------------
+// Skeleton shards: read-path coarsening
+// ---------------------------------------------------------------------------
+
+/// Write a payload-free skeleton shard: the PK-only projection of `schema`,
+/// `SHARD_FLAG_SKELETON` stamped, one `(PK, coarse weight)` row per entry —
+/// exactly what `compact::merge_and_route` emits for a dehydrated guard.
+fn write_skeleton_shard(
+    dir: &std::path::Path,
+    name: &str,
+    schema: &SchemaDescriptor,
+    rows: &[(u64, i64)],
+) -> MappedShard {
+    let skel = crate::storage::lsm::compact::skeleton_schema(schema);
+    let mut b = Batch::with_capacity(skel, rows.len().max(1));
+    for &(pk, w) in rows {
+        b.extend_pk(pk as u128);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.count += 1;
+    }
+    let cpath = std::ffi::CString::new(dir.join(name).to_str().unwrap()).unwrap();
+    b.write_as_shard(&cpath, &skel, super::super::shard_file::ShardWriteOpts::SKELETON)
+        .unwrap();
+    // Opened under the *view* schema, which is how every reader sees it.
+    MappedShard::open(&cpath, schema, false).unwrap()
+}
+
+/// `(U64 PK | nullable STRING)` — a `PayloadCmpKind::Generic` schema whose
+/// payload can be NULL, so an all-NULL hydrated row is representable.
+fn nullable_string_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::STRING, 1),
+        ],
+        &[0],
+    )
+}
+
+/// `(pk, weight)` of every group a full walk emits, plus whether it came out of
+/// a skeleton source.
+fn walk_groups(c: &mut ReadCursor) -> Vec<(u64, i64, bool)> {
+    let mut out = Vec::new();
+    while c.valid {
+        out.push((c.current_key_narrow() as u64, c.current_weight, c.current_is_skeleton()));
+        c.advance();
+    }
+    out
+}
+
+/// A skeleton shard opens under the full view schema: its payload columns read
+/// `Absent`, its null word is the full pad mask, and its file is small enough to
+/// be worth the trade.
+#[test]
+fn skeleton_shard_opens_under_the_view_schema() {
+    raise_fd_limit_for_tests();
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64();
+    let rows: Vec<(u64, i64)> = (1..=8).map(|i| (i, i as i64)).collect();
+    let shard = write_skeleton_shard(dir.path(), "sk.db", &schema, &rows);
+
+    assert!(shard.is_skeleton());
+    // The low bits are the writer's own arity — zero — so the ALTER-widening
+    // decode maps every schema payload column to `Absent` and pads it NULL.
+    let raw = std::fs::read(dir.path().join("sk.db")).unwrap();
+    assert_eq!(
+        gnitz_wire::read_u64_le(&raw, super::super::layout::OFF_FILE_NPC),
+        super::super::layout::SHARD_FLAG_SKELETON,
+    );
+    assert_eq!(shard.null_pad_mask, 1);
+    for (r, &(_, w)) in rows.iter().enumerate() {
+        assert!(
+            gnitz_wire::null_word_get(shard.get_null_word(r), 0),
+            "row {r} pads NULL"
+        );
+        assert_eq!(shard.get_weight(r), w);
+    }
+    assert!(
+        shard.file_len() > 0 && shard.file_len() < 1024,
+        "skeleton files are tiny"
+    );
+}
+
+/// Forging the flag bit onto a hydrated shard fails the descriptive digest — the
+/// bit sits inside `desc_digest`'s span, so it is as unforgeable as any other
+/// descriptive byte. Re-stamping the digest instead lets the forged word reach
+/// the structural check, where an arity above `MAX_PAYLOAD_REGIONS` is still
+/// rejected with the flag masked off.
+#[test]
+fn skeleton_flag_is_covered_by_the_digest_and_masked_before_the_bound() {
+    use super::super::layout::{OFF_DESC_CHECKSUM, OFF_FILE_NPC, SHARD_FLAG_SKELETON};
+    raise_fd_limit_for_tests();
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64();
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1);
+    bb.put_i64(42);
+    bb.end_row();
+    let path = dir.path().join("h.db");
+    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    bb.finish()
+        .write_as_shard(&cpath, &schema, super::super::shard_file::ShardWriteOpts::default())
+        .unwrap();
+    let base = std::fs::read(&path).unwrap();
+
+    let patched = |patch: &dyn Fn(&mut Vec<u8>), restamp: bool| {
+        let mut d = base.clone();
+        patch(&mut d);
+        if restamp {
+            let nr = crate::storage::lsm::batch::strides_from_schema(&schema).1 as usize + 1;
+            let cs = super::super::layout::desc_digest(super::super::layout::shard_basename(cpath.to_bytes()), &d, nr);
+            gnitz_wire::write_u64_le(&mut d, OFF_DESC_CHECKSUM, cs);
+        }
+        std::fs::write(&path, &d).unwrap();
+        MappedShard::open(&cpath, &schema, false)
+    };
+
+    // Bare forgery: the digest rejects it.
+    assert_eq!(
+        patched(
+            &|d| gnitz_wire::write_u64_le(d, OFF_FILE_NPC, SHARD_FLAG_SKELETON | 1),
+            false
+        )
+        .err(),
+        Some(super::super::error::StorageError::ChecksumMismatch),
+    );
+    // Re-stamped, with an out-of-range arity under the flag: the bound still
+    // fires, so the flag cannot smuggle a count past it.
+    assert_eq!(
+        patched(
+            &|d| gnitz_wire::write_u64_le(d, OFF_FILE_NPC, SHARD_FLAG_SKELETON | 66),
+            true
+        )
+        .err(),
+        Some(super::super::error::StorageError::InvalidShard),
+    );
+}
+
+/// A PK group holding a skeleton row anywhere collapses to exactly one coarse
+/// row, whatever hydrated rows sit above it — under **both** payload comparator
+/// arms. `FixedIntNonnull` reads no null bitmap and gets `ZERO_CELL` back for an
+/// absent column, so an all-zero hydrated row compares `Equal` to a skeleton one;
+/// `Generic` tests the null bits first, so an all-NULL hydrated row does. The
+/// skeleton-ness tiebreak is what makes the skeleton row the group exemplar in
+/// either case.
+#[test]
+fn a_skeleton_row_coarsens_its_whole_pk_group() {
+    raise_fd_limit_for_tests();
+    let dir = tempfile::tempdir().unwrap();
+
+    for (name, schema, zero_row) in [
+        ("fixedint", make_schema_u64(), true),
+        ("generic", nullable_string_schema(), false),
+    ] {
+        // PK 1: skeleton (coarse +3) plus two newer hydrated rows.
+        // PK 2: hydrated only. PK 3: skeleton whose coarse weight cancels.
+        let sk = Rc::new(write_skeleton_shard(
+            dir.path(),
+            &format!("{name}_sk.db"),
+            &schema,
+            &[(1, 3), (3, 2)],
+        ));
+        let mut bb = BatchBuilder::new(schema);
+        // A row that compares `Equal` to a skeleton row under this arm.
+        bb.begin_row(1u128, 5);
+        if zero_row {
+            bb.put_i64(0);
+        } else {
+            bb.put_null();
+        }
+        bb.end_row();
+        bb.begin_row(1u128, 7);
+        if zero_row {
+            bb.put_i64(9);
+        } else {
+            bb.put_string("nine");
+        }
+        bb.end_row();
+        bb.begin_row(2u128, 4);
+        if zero_row {
+            bb.put_i64(1);
+        } else {
+            bb.put_string("one");
+        }
+        bb.end_row();
+        bb.begin_row(3u128, -2);
+        if zero_row {
+            bb.put_i64(0);
+        } else {
+            bb.put_null();
+        }
+        bb.end_row();
+        let mem = Rc::new(bb.finish().into_consolidated(&schema));
+
+        let mut c = create_read_cursor(&[mem], &[sk], schema);
+        assert_eq!(
+            walk_groups(&mut c),
+            vec![(1, 15, true), (2, 4, false)],
+            "{name}: PK 1 folds to one coarse row (3+5+7), PK 3 ghosts at 2-2",
+        );
+    }
+}
+
+/// A cursor whose runs are all hydrated takes the `SKEL == false` path: element
+/// identity stays (PK, payload), so two rows of one PK with different payloads
+/// stay two groups.
+#[test]
+fn a_hydrated_only_cursor_is_unaffected() {
+    let schema = make_schema_u128_i64();
+    let b = make_batch(&[(1, 1, 10), (1, 1, 20), (2, 1, 30)]);
+    let mut c = create_read_cursor(&[b], &[], schema);
+    let mut n = 0;
+    while c.valid {
+        assert!(!c.current_is_skeleton());
+        n += 1;
+        c.advance();
+    }
+    assert_eq!(n, 3, "(PK, payload) identity is untouched without a skeleton run");
+}

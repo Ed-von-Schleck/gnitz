@@ -49,7 +49,7 @@ pub(crate) use lsm::index_gather::BoundedIndexCursor;
 pub(crate) use lsm::manifest::{peek_header, topology_word};
 #[cfg(test)]
 pub(crate) use lsm::read_cursor::REWIND_CALLS;
-pub(crate) use lsm::read_cursor::{empty as empty_cursor, DrainGuard, ReadCursor};
+pub(crate) use lsm::read_cursor::{empty as empty_cursor, DrainGuard, PkSetGather, ReadCursor};
 pub(crate) use lsm::repartition::repartition_relation;
 pub(crate) use lsm::spill::{KeyProducer, SpillSort};
 pub(crate) use merge::{

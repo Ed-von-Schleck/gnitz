@@ -202,7 +202,7 @@ impl EmitCtx<'_> {
 
     /// Create a child table, keep it alive in `owned_tables`, and return a raw
     /// pointer into the box. When `trace_reg` is given, mark it a trace register
-    /// backed by the new table (`refresh_owned_cursors` opens a cursor on it
+    /// backed by the new table (`bind_trace_cursors` opens a cursor on it
     /// each epoch).
     fn add_owned_trace_table(
         &mut self,
@@ -962,6 +962,14 @@ pub(super) fn build_plan(
         scratch: ScratchGuard::new(),
     };
 
+    // Instruction count after each node has emitted — the node → program offset
+    // map, keyed by node id like `out_reg_of` so the two are read the same way.
+    // Recorded in the loop rather than reconstructed afterwards, so a node that
+    // emits nothing (an aliasing `Filter(None)`, an elided identity `Map`, a
+    // skipped `Distinct`, a `ScanDelta`, an `IntegrateSink`) simply leaves the
+    // running length unchanged and the offsets stay correct with no one reasoning
+    // about which nodes emit.
+    let mut instr_end: HashMap<i32, usize> = HashMap::with_capacity(ordered.len());
     for &nid in ordered {
         // `compile_view` excises every `ExchangeShard` from the `ordered` slice
         // (its `emit_node` arm is `unreachable!`). A node that fails to emit
@@ -971,6 +979,7 @@ pub(super) fn build_plan(
         // kept alive by the VM's tables).
         let reg_id = *ctx.out_reg_of.get(&nid).unwrap();
         emit_node(&mut ctx, nid, reg_id)?;
+        instr_end.insert(nid, ctx.builder.instructions().len());
     }
 
     ctx.builder.push(Instr::Halt);
@@ -1051,6 +1060,7 @@ pub(super) fn build_plan(
         source_reg_map,
         can_emit_on_empty,
         scratch,
+        out_reg_of,
         ..
     } = ctx;
     let vm = builder.build_with_owned(reg_meta, owned_tables, owned_funcs);
@@ -1063,6 +1073,8 @@ pub(super) fn build_plan(
         can_emit_on_empty,
         exchange_input_regs,
         scratch,
+        instr_end,
+        out_reg_of,
     })
 }
 
@@ -1092,9 +1104,5 @@ pub(super) fn ancestors_inclusive(loaded: &LoadedCircuit, start: i32) -> HashSet
 /// The node feeding an `ExchangeShard` on `PORT_IN` (the value to repartition),
 /// or `None` if the exchange has no such input edge (a malformed circuit).
 pub(super) fn exchange_input_node(loaded: &LoadedCircuit, ex_nid: i32) -> Option<i32> {
-    loaded
-        .incoming
-        .get(&ex_nid)
-        .and_then(|ins| ins.iter().find(|&&(_, port)| port == PORT_IN))
-        .map(|&(src, _)| src)
+    super::optimize::input_on_port(loaded, ex_nid, PORT_IN)
 }

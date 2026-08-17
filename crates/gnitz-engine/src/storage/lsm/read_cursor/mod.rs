@@ -18,9 +18,11 @@ use super::shard_reader::MappedShard;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
 use crate::schema::SchemaDescriptor;
 
+mod gather;
 mod output;
 
 use super::run::Run;
+pub(crate) use gather::PkSetGather;
 use gnitz_expr::RowSource;
 pub(crate) use output::DrainGuard;
 
@@ -61,6 +63,12 @@ pub struct ReadCursor {
     tree: LoserTree,
     mode: SourceMode,
     schema: SchemaDescriptor,
+    /// At least one source is a capacity-bounded view's skeleton shard, so the
+    /// merge runs with payload coarsening on (see [`merge::merge_less`]). Derived
+    /// once at open — the source set never changes — and it is the whole cost
+    /// every other relation pays for this feature: one enum-discriminant test per
+    /// run beside the empty-run filter `from_runs` already runs.
+    any_skeleton: bool,
     // Current row state
     pub valid: bool,
     pub current_weight: i64,
@@ -83,12 +91,11 @@ impl ReadCursor {
         &self.schema
     }
 
-    /// Build a ReadCursor from owned in-memory batches (no shards) — a test-only
-    /// helper for reading a batch directly without a backing `Table` (no scratch
-    /// dir / `mkdir`).
-    #[cfg(test)]
-    pub(crate) fn from_owned(snapshots: &[std::rc::Rc<Batch>], schema: SchemaDescriptor) -> ReadCursor {
-        create_read_cursor(snapshots, &[], schema)
+    /// A cursor over already-materialized batches, skipping empty ones — what a
+    /// caller with rows in hand uses when it needs the cursor interface, with no
+    /// backing `Table` and no scratch dir. Keeps [`Run`] inside the LSM layer.
+    pub(crate) fn over_batches(batches: &[std::rc::Rc<Batch>], schema: SchemaDescriptor) -> ReadCursor {
+        from_runs(batches.iter().map(|b| Run::Mem(std::rc::Rc::clone(b))), schema)
     }
 
     /// Re-play the tournament at the sources' current positions. Keyless leaf:
@@ -111,11 +118,12 @@ impl ReadCursor {
             sources,
             states,
             schema,
+            any_skeleton,
             ..
         } = self;
         tree.rebuild(
             |i| states[i].is_valid().then(|| states[i].position as u32),
-            merge::merge_less(schema, sources, row_cmp),
+            merge::merge_less(schema, sources, row_cmp, *any_skeleton),
         );
     }
 
@@ -147,10 +155,12 @@ impl ReadCursor {
 
     fn new(sources: Vec<Run>, states: Vec<PosCursor>, schema: SchemaDescriptor) -> Self {
         debug_assert_eq!(sources.len(), states.len());
+        let any_skeleton = sources.iter().any(ColumnarSource::is_skeleton);
         let mut cursor = ReadCursor {
             // Sized for the source count; `rebuild_and_drive` plays it.
             tree: LoserTree::empty(sources.len()),
             sources,
+            any_skeleton,
             states,
             unified_sources: OnceCell::new(),
             mode: SourceMode::Empty,
@@ -258,11 +268,12 @@ impl ReadCursor {
             sources,
             states,
             schema,
+            any_skeleton,
             ..
         } = &mut *self;
-        let less = merge::merge_less(schema, sources, row_cmp);
+        let less = merge::merge_less(schema, sources, row_cmp, *any_skeleton);
         Self::seek_phase(tree, sources, states, key, &less);
-        self.drive_with_inner(row_cmp);
+        self.drive_multi_with(row_cmp);
     }
 
     /// Advance every laggard head (OPK `< key`) to its own `lower_bound(key)`,
@@ -315,6 +326,19 @@ impl ReadCursor {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }
 
+    /// Whether the current row came out of a capacity-bounded view's skeleton
+    /// shard — a (PK, coarse weight) pair whose payload columns do not exist on
+    /// disk. Its caller must hydrate that key from the view's own traces or
+    /// source store instead of copying the row. Gate on `valid` first.
+    ///
+    /// One indexed load: `commit_emitted` records the emitted row's source in
+    /// every drive mode, single-source bypass included.
+    #[inline]
+    pub(crate) fn current_is_skeleton(&self) -> bool {
+        debug_assert!(self.valid, "current_is_skeleton on an invalid cursor");
+        self.sources[self.current_entry_idx].is_skeleton()
+    }
+
     /// The current row as a `(source, row)` pair for the shared [`RowSource`]
     /// kernels. The source is the row's own entry, so its blob arena backs the
     /// row's German strings. The bound is `RowSource`, not `ColumnarSource`,
@@ -345,12 +369,33 @@ impl ReadCursor {
         pk_bytes_eq(self.current_pk_bytes(), key_bytes)
     }
 
-    /// Walk the equal-`key` PK group, invoking `f(&*self)` at each emitted row;
-    /// the callback reads the row through the committed `current_*` state and
-    /// must not re-enter the cursor. On return the cursor sits at the first row
-    /// past the group, or is invalid at end of source.
+    /// Seek to the start of `key`'s PK group, unless the cursor already sits in
+    /// it. The reposition every keyed reader needs before [`for_each_pk_group_row`]
+    /// when it does not already know where the cursor stands.
+    ///
+    /// The seek is skipped at `Equal` because every walk and every seek leaves the
+    /// cursor on a group's first unconsumed row, and `advance_to` is *not*
+    /// idempotent there: at `key == current_pk` the lower bound can be a row
+    /// already consumed (an earlier payload at the same PK), which a forward
+    /// gallop cannot reach. `Greater` does not mean the group is absent, only
+    /// that an earlier consumer left the cursor ahead.
+    pub(crate) fn seek_pk_group(&mut self, key: &[u8]) {
+        if !self.valid || self.current_pk_cmp_bytes(key) != Ordering::Equal {
+            self.advance_to(key);
+        }
+    }
+
+    /// Walk the equal-`key` PK group from wherever the cursor stands, invoking
+    /// `f(&*self)` at each emitted row; the callback reads the row through the
+    /// committed `current_*` state and must not re-enter the cursor. On return the
+    /// cursor sits at the first row past the group, or is invalid at end of
+    /// source.
+    ///
+    /// Seek-free: a caller that has just located `key` through the merge (a
+    /// cogroup's `Equal` arm) would pay a discarded comparison for a reposition it
+    /// knows is unnecessary. Everyone else calls [`Self::seek_pk_group`] first.
     pub(crate) fn for_each_pk_group_row<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], f: F) {
-        with_payload_cmp!(self.schema, Self::for_each_pk_group_row_with, self, key, f);
+        with_payload_cmp!(self.schema, Self::for_each_pk_group_row_with::<_, _>, self, key, f);
     }
 
     /// Threads the monomorphized `row_cmp` through each drive, so the per-row
@@ -368,7 +413,7 @@ impl ReadCursor {
         }
     }
 
-    /// Position on `key`'s PK group and append every live row of it to `out`; an
+    /// Seek to `key`'s PK group and append every live row of it to `out`; an
     /// absent key appends nothing. The keyed-read primitive for a store whose PK
     /// can repeat — a view output store runs no `enforce_unique_pk`, so its
     /// synthetic key names one row per row the join produced.
@@ -377,14 +422,8 @@ impl ReadCursor {
     /// member an uncompacted source still holds sorts within its PK by payload,
     /// so it can head the group, and rejecting the key on it would drop the live
     /// rows behind it.
-    ///
-    /// The seek is skipped at `Equal` because this walk and every seek leave the
-    /// cursor on a group's first unconsumed row. `Greater` does not mean the
-    /// group is absent, only that an earlier consumer left the cursor ahead.
     pub(crate) fn copy_live_pk_group_into(&mut self, key: &[u8], out: &mut Batch) {
-        if !self.valid || self.current_pk_cmp_bytes(key) != Ordering::Equal {
-            self.advance_to(key);
-        }
+        self.seek_pk_group(key);
         self.for_each_pk_group_row(key, |c| {
             if c.current_weight > 0 {
                 c.copy_current_row_into(out, c.current_weight);
@@ -454,9 +493,16 @@ impl ReadCursor {
         self.drive();
     }
 
+    /// Step the drive one group. The mode is settled *before* the payload
+    /// comparator is selected, so the `Single` bypass and the exhausted case run
+    /// without the `with_payload_cmp!` dispatch they never use.
     #[inline]
     fn drive(&mut self) {
-        with_payload_cmp!(self.schema, Self::drive_with, self);
+        match self.mode {
+            SourceMode::Empty => self.valid = false,
+            SourceMode::Single(i) => self.drive_single(i),
+            SourceMode::Multi => with_payload_cmp!(self.schema, Self::drive_multi_with, self),
+        }
     }
 
     /// Commit (or invalidate from) the `(net_weight, source_idx, row)` a drive
@@ -491,45 +537,47 @@ impl ReadCursor {
         self.commit_emitted(emitted);
     }
 
-    /// Drive to the next live group with the selected `row_cmp`: `Empty`
-    /// invalidates, `Single` takes its bypass, `Multi` folds the loser tree.
-    ///
-    /// `drive_merge` folds tied rows for us; `emit` returns `Break` on the first
-    /// non-ghost group to return immediately. Ghost groups (net weight = 0) skip
-    /// emit and open the next group, so the walk passes over them.
+    /// Drive to the next live group with the payload comparator already selected —
+    /// the form a walk that selected it once reuses per row.
     #[inline]
     fn drive_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         match self.mode {
             SourceMode::Empty => self.valid = false,
             SourceMode::Single(i) => self.drive_single(i),
-            SourceMode::Multi => self.drive_with_inner(row_cmp),
+            SourceMode::Multi => self.drive_multi_with(row_cmp),
         }
     }
 
     /// `Multi` drive, monomorphized on payload (`row_cmp`).
     /// Precondition: `matches!(self.mode, SourceMode::Multi)`.
+    ///
+    /// `drive_merge` folds tied rows for us; `emit` returns `Break` on the first
+    /// non-ghost group to return immediately. Ghost groups (net weight = 0) skip
+    /// emit and open the next group, so the walk passes over them.
     #[inline]
-    fn drive_with_inner<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
+    fn drive_multi_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         let ReadCursor {
             tree,
             sources,
             states,
             schema,
+            any_skeleton,
             ..
         } = &mut *self;
+        let coarsen = *any_skeleton;
         // The emitted group comes back as a tuple rather than being written to
         // `self.current_*` in place: the closures below already reborrow
         // `&sources` + `&mut states`, so capturing `&mut self` too would conflict.
         let mut emitted: Option<(i64, usize, usize)> = None;
         drive_merge(
             tree,
-            merge::merge_less(schema, sources, row_cmp),
+            merge::merge_less(schema, sources, row_cmp, coarsen),
             |src| {
                 states[src].advance();
                 states[src].is_valid().then(|| states[src].position as u32)
             },
             merge::merge_same_pk(sources),
-            merge::merge_eq_payload(schema, sources, row_cmp),
+            merge::merge_eq_payload(schema, sources, row_cmp, coarsen),
             |src, row| sources[src].get_weight(row),
             |gs, gr, nw| {
                 emitted = Some((nw, gs, gr));
@@ -540,7 +588,8 @@ impl ReadCursor {
     }
 
     /// Approximate the number of rows remaining in this cursor (upper bound).
-    #[cfg(test)]
+    /// Counted off the per-source windows, so a range seek's clamp is already in
+    /// it — which makes it the right pre-size for a batch a walk fills.
     pub fn estimated_length(&self) -> usize {
         self.states.iter().map(|s| s.count.saturating_sub(s.position)).sum()
     }

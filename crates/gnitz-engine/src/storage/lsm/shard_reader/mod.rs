@@ -118,6 +118,26 @@ pub struct MappedShard {
     xor8_filter: Option<Xor8>,
     /// Encoded OPK width per row: the sum of the PK columns' widths.
     pub(crate) pk_stride: u8,
+    /// `SHARD_FLAG_SKELETON`: this file's rows are (PK, coarse weight) pairs
+    /// with no payload — a capacity-bounded view's dehydrated shard. Every
+    /// payload column is `Absent`, and the read path folds a PK group holding one
+    /// of these rows to a single coarse row rather than to (PK, payload) groups.
+    skeleton: bool,
+}
+
+impl MappedShard {
+    /// Whether this file is a bounded view's skeleton shard.
+    #[inline(always)]
+    pub(crate) fn is_skeleton(&self) -> bool {
+        self.skeleton
+    }
+
+    /// Bytes this shard occupies on disk — the mapped file's length, which is the
+    /// quantity a capacity-bounded store sums to decide whether it is over budget.
+    #[inline]
+    pub(crate) fn file_len(&self) -> u64 {
+        self.mmap.len() as u64
+    }
 }
 
 // MappedShard does not implement Drop — the owned `mmap: Mmap` field handles
@@ -175,7 +195,10 @@ mod tests {
             count,
             &regions,
             &make_schema_u64_i64(),
-            ShardWriteOpts { pack_ints: pack },
+            ShardWriteOpts {
+                pack_ints: pack,
+                ..Default::default()
+            },
         )
         .unwrap();
         path.to_str().unwrap().to_string()
@@ -444,7 +467,7 @@ mod tests {
             3,
             &regions,
             &wide,
-            ShardWriteOpts { pack_ints: false },
+            ShardWriteOpts::default(),
         )
         .unwrap();
 
@@ -1300,7 +1323,7 @@ mod tests {
                 n,
                 &regions,
                 &schema,
-                ShardWriteOpts { pack_ints: true },
+                ShardWriteOpts::COMPACTION,
             )
             .unwrap();
             path.to_str().unwrap().to_string()

@@ -73,7 +73,7 @@ pub(crate) fn bind_ctes(
         // Compiled path: a hidden HIR segment, with the CTE's positional column
         // aliases applied to the emitted visible columns.
         let (seg_vid, seg_schema, ()) = chain.add_segment(client, |client, chain, vid| {
-            let (circuit, mut cols, pk) = bind_and_lower(client, binder, chain, body, vid)?;
+            let (circuit, mut cols, pk) = bind_and_lower(client, binder, chain, body, vid, false)?;
             apply_positional_aliases(&cte.alias.columns, cols.iter_mut().collect(), &ctx)?;
             Ok(((circuit, cols, pk), ()))
         })?;

@@ -59,6 +59,23 @@ pub(crate) fn execute_epoch_multi(
     inputs: impl IntoIterator<Item = (u16, Batch)>,
     output_reg: u16,
 ) -> Option<Batch> {
+    execute_epoch_from(program, regfile, inputs, output_reg, 0, false)
+}
+
+/// [`execute_epoch_multi`] with the two knobs a bounded view's per-key hydration
+/// replay needs: `start_pc` skips the prologue whose output the caller seeds
+/// directly, and `read_only` suppresses every `Instr::Integrate` so a *read*
+/// leaves no operator-state write behind. Both stay runtime arguments — a program
+/// executes 1-3 `Integrate`s, so monomorphising the whole dispatch loop over the
+/// flag would duplicate it to elide a perfectly-predicted branch.
+pub(crate) fn execute_epoch_from(
+    program: &Program,
+    regfile: &mut RegisterFile,
+    inputs: impl IntoIterator<Item = (u16, Batch)>,
+    output_reg: u16,
+    start_pc: usize,
+    read_only: bool,
+) -> Option<Batch> {
     gnitz_debug!(
         "vm: execute_epoch output_reg={} instrs={}",
         output_reg,
@@ -66,7 +83,7 @@ pub(crate) fn execute_epoch_multi(
     );
 
     // 1. Clear delta batches. Every trace register is backed by one of the
-    // plan's owned tables, and `VmHandle::refresh_owned_cursors` has already
+    // plan's owned tables, and `VmHandle::bind_trace_cursors` has already
     // pointed it at a fresh cursor.
     regfile.clear_deltas(&program.reg_meta);
 
@@ -121,14 +138,14 @@ pub(crate) fn execute_epoch_multi(
         }};
     }
     // Every trace register names its backing table in `reg_meta`, and
-    // `refresh_owned_cursors` opens a cursor on each one before dispatch, so a
+    // `bind_trace_cursors` opens a cursor on each one before dispatch, so a
     // null here is a VM bug rather than a state the circuit can reach.
     macro_rules! cursor_mut {
         ($i:expr) => {{
             let r = reg_mut!($i);
             assert!(
                 !r.cursor_ptr.is_null(),
-                "register {} has no trace cursor; refresh_owned_cursors must run before dispatch",
+                "register {} has no trace cursor; bind_trace_cursors must run before dispatch",
                 $i
             );
             unsafe { &mut *r.cursor_ptr }
@@ -136,7 +153,7 @@ pub(crate) fn execute_epoch_multi(
     }
 
     // 3. Dispatch loop
-    for instr in &program.instructions {
+    for instr in &program.instructions[start_pc..] {
         match instr {
             Instr::Halt => break,
 
@@ -285,6 +302,9 @@ pub(crate) fn execute_epoch_multi(
             }
 
             Instr::Integrate { in_reg, table_idx, avi } => {
+                if read_only {
+                    continue;
+                }
                 let target_ptr = if *table_idx >= 0 {
                     program.tables[*table_idx as usize]
                 } else {
@@ -333,7 +353,7 @@ pub(crate) fn execute_epoch_multi(
                 // Combined AVI cursor — created fresh from the value-index table
                 // (not a register). Must be created AFTER INTEGRATE populates the
                 // table, so the prefix seek returns the post-delta extreme.
-                // Operator-state read; compact first (see refresh_owned_cursors).
+                // Operator-state read; compact first (see compact_owned_traces).
                 let mut avi_cursor_handle: Option<Box<ReadCursor>> = if let Some(idx) = avi_table_idx {
                     let avi_ptr = program.tables[*idx as usize];
                     let avi_table = unsafe { &mut *avi_ptr };

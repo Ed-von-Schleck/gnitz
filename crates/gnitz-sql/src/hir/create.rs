@@ -8,7 +8,68 @@ use crate::hir::chain::{debug_assert_exchange_topology, ViewChain};
 use crate::validate::{reject_unhonored_query_clauses, validate_user_name, HonoredQueryClauses};
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, PlannedView};
-use sqlparser::ast::{ObjectName, Query};
+use sqlparser::ast::{CreateTableOptions, ObjectName, Query, Value, ValueWithSpan};
+
+/// Binary units accepted by `WITH (capacity = '<uint><unit>')`.
+const CAPACITY_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
+
+/// Decode the `WITH (...)` clause of a `CREATE VIEW` into a byte capacity.
+///
+/// `sqlparser::parse_create_view` fills `options` from `parse_options(WITH)` with
+/// no dialect gate, so no grammar of ours is involved — only the meaning of the
+/// one key we honour. Presence of a capacity *is* the bounded classification;
+/// there is no second word to keep consistent with it.
+fn decode_capacity(options: &CreateTableOptions) -> Result<Option<u64>, GnitzSqlError> {
+    let mut capacity = None;
+    for opt in crate::validate::with_options(options) {
+        let (key, value) = crate::validate::require_kv_option(opt, "CREATE VIEW")?;
+        if !key.value.eq_ignore_ascii_case("capacity") {
+            return Err(GnitzSqlError::Plan(format!(
+                "unknown CREATE VIEW option '{}'; the only supported option is `capacity`",
+                key.value
+            )));
+        }
+        let sqlparser::ast::Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(text),
+            ..
+        }) = value
+        else {
+            return Err(GnitzSqlError::Plan(
+                "CREATE VIEW option `capacity` takes a single-quoted size string, e.g. '256 MB'".to_string(),
+            ));
+        };
+        capacity = Some(parse_capacity(text)?);
+    }
+    Ok(capacity)
+}
+
+/// `<uint><unit>` with an optional space, unit in {KB, MB, GB}, binary
+/// (KB = 2^10). Zero and a `u64`-overflowing product are rejected: a zero
+/// capacity names a store that cannot hold its own skeleton.
+fn parse_capacity(text: &str) -> Result<u64, GnitzSqlError> {
+    let bad = || {
+        GnitzSqlError::Plan(format!(
+            "CREATE VIEW option `capacity`: '{text}' is not a size like '256 MB' \
+             (a positive integer followed by KB, MB or GB)"
+        ))
+    };
+    let trimmed = text.trim();
+    let digits = trimmed.len() - trimmed.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let (num, unit) = trimmed.split_at(digits);
+    let num: u64 = num.parse().map_err(|_| bad())?;
+    let unit = unit.trim();
+    let mult = CAPACITY_UNITS
+        .iter()
+        .find(|(u, _)| unit.eq_ignore_ascii_case(u))
+        .map(|&(_, m)| m)
+        .ok_or_else(bad)?;
+    match num.checked_mul(mult) {
+        Some(0) | None => Err(GnitzSqlError::Plan(format!(
+            "CREATE VIEW option `capacity`: '{text}' is out of range (must be positive and fit a u64)"
+        ))),
+        Some(bytes) => Ok(bytes),
+    }
+}
 
 pub(crate) fn execute_create_view(
     client: &mut GnitzClient,
@@ -40,8 +101,10 @@ pub(crate) fn execute_create_view(
     // Compile the body into a durable chain (real `alloc_table_id` ids), then
     // commit it atomically. `build_query_segments` owns every shape rule; CREATE
     // VIEW adds only the durable id origin and the `create_view_chain` commit.
+    let capacity = decode_capacity(&cv.options)?;
+
     let mut chain = ViewChain::new();
-    let final_vid = build_query_segments(client, query, binder, &mut chain, view_name, sql_text)?;
+    let final_vid = build_query_segments(client, query, binder, &mut chain, view_name, sql_text, capacity)?;
     client
         .create_view_chain(schema_name, chain.segments, None)
         .map_err(GnitzSqlError::Exec)?;
@@ -85,7 +148,7 @@ pub(crate) fn execute_alter_view(
     // Compile + validate the new plan (fresh vids) BEFORE issuing the zone, so a
     // planner error leaves the old view fully intact.
     let mut chain = ViewChain::new();
-    build_query_segments(client, query, binder, &mut chain, view_name.clone(), sql_text)?;
+    build_query_segments(client, query, binder, &mut chain, view_name.clone(), sql_text, None)?;
 
     // Reject self-reference: `FROM v` in the new query resolves to the still-live
     // old vid, which would appear as a source of the new plan — the bundle
@@ -121,8 +184,14 @@ fn resolve_view_id(client: &mut GnitzClient, schema_name: &str, name: &str) -> R
         .resolve_relation_kind(schema_name, name)
         .map_err(GnitzSqlError::Exec)?
     {
-        Some((vid, true)) => Ok(vid),
-        Some((_, false)) => Err(GnitzSqlError::Unsupported(format!(
+        // `ALTER VIEW … AS` re-renders its body as a bare `CREATE VIEW … AS …`,
+        // dropping any option clause — so retargeting a bounded view would
+        // silently convert it into an unbounded one.
+        Some(rel) if rel.is_view && rel.is_bounded => Err(GnitzSqlError::Unsupported(format!(
+            "ALTER VIEW cannot retarget a capacity-bounded view; DROP and CREATE '{name}' instead"
+        ))),
+        Some(rel) if rel.is_view => Ok(rel.tid),
+        Some(_) => Err(GnitzSqlError::Unsupported(format!(
             "'{name}' is a table; ALTER VIEW requires a view (use ALTER TABLE)"
         ))),
         None => Err(GnitzSqlError::Bind(format!(
@@ -143,6 +212,7 @@ fn build_query_segments(
     chain: &mut ViewChain,
     final_name: String,
     sql_text: String,
+    capacity: Option<u64>,
 ) -> Result<u64, GnitzSqlError> {
     // The CTE phase compiles each CTE body (a pass-through alias into the binder
     // cache, or a hidden segment on `chain`) and registers it, so the body below
@@ -157,8 +227,30 @@ fn build_query_segments(
     // subqueries into `Join`/`Reduce` structure, classify predicates, then lower to
     // circuit(s) — nested combine segments / self-collision pass-through wrappers
     // land on `chain`, and the final step is emitted with `final_vid`.
-    let (circuit, out_cols, pk_cols) =
-        crate::hir::bind_and_lower(client, binder, chain, query.body.as_ref(), final_vid)?;
+    let (circuit, out_cols, pk_cols) = crate::hir::bind_and_lower(
+        client,
+        binder,
+        chain,
+        query.body.as_ref(),
+        final_vid,
+        capacity.is_some(),
+    )?;
+
+    // Structural eligibility, over what the body actually compiled to rather than
+    // over the shapes it was written in: both bounded shapes are a single segment,
+    // and anything that cut — a derived table, EXISTS, a nested join, a
+    // non-trivial CTE — left a hidden unbounded segment holding the same rows at
+    // full width, so a capacity above it would bound nothing. `lower_body`'s
+    // per-arm rejections name the shape and come first; this catches the shapes
+    // that reach an eligible arm through a cut input, which no arm can see.
+    if capacity.is_some() && !chain.segments.is_empty() {
+        return Err(GnitzSqlError::Unsupported(
+            "CREATE VIEW WITH (capacity …): this body compiles to more than one view, whose \
+             intermediate results are unbounded; only a filter/projection over one relation \
+             and an inner equi-join are supported"
+                .to_string(),
+        ));
+    }
 
     // The final segment: the hidden segments already sit on the chain in
     // dependency order; append the (user-named or synthetic) final view. The
@@ -171,6 +263,7 @@ fn build_query_segments(
         circuit,
         output_columns: out_cols,
         pk_cols,
+        capacity_bytes: capacity,
     });
     Ok(final_vid)
 }

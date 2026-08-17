@@ -54,8 +54,12 @@ impl MappedShard {
 
         // The file's own payload-column count, bounded before any arithmetic on
         // it: `desc_len` is `HEADER_SIZE + n · DIR_ENTRY_SIZE` and overflows on a
-        // forged u64.
-        let file_npc = read_u64_le(data, OFF_FILE_NPC) as usize;
+        // forged u64. The skeleton flag rides the same word's high bit and is
+        // masked off before that bound, so a forged high bit cannot smuggle a
+        // count past it.
+        let npc_word = read_u64_le(data, OFF_FILE_NPC);
+        let skeleton = npc_word & SHARD_FLAG_SKELETON != 0;
+        let file_npc = (npc_word & !SHARD_FLAG_SKELETON) as usize;
         if file_npc > MAX_PAYLOAD_REGIONS {
             return Err(StorageError::InvalidShard);
         }
@@ -262,6 +266,7 @@ impl MappedShard {
             blob_len,
             xor8_filter,
             pk_stride,
+            skeleton,
         })
     }
 }
