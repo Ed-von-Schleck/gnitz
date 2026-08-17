@@ -49,8 +49,8 @@ impl LogicalProgram {
     /// own a result register. Resolved with `result_reg` eligible for the
     /// bit_only path, which [`Evaluator::filter`] reads as packed bits.
     pub fn resolve_filter(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
-        self.validate_predicate(schema)?;
-        Ok(self.into_evaluator(schema, /* is_filter = */ true))
+        let str_class = self.validate_predicate(schema)?;
+        Ok(self.into_evaluator(schema, /* is_filter = */ true, str_class))
     }
 
     /// A map: checked against both the schema it reads and the one it writes,
@@ -60,8 +60,8 @@ impl LogicalProgram {
         in_schema: &dyn SchemaFacts,
         out_schema: &dyn SchemaFacts,
     ) -> Result<Evaluator, ExprValidateErr> {
-        self.validate(Some(in_schema), Some(out_schema))?;
-        Ok(self.into_evaluator(in_schema, /* is_filter = */ false))
+        let str_class = self.validate(Some(in_schema), Some(out_schema))?;
+        Ok(self.into_evaluator(in_schema, /* is_filter = */ false, str_class))
     }
 
     /// A scalar expression evaluated row at a time through
@@ -75,12 +75,12 @@ impl LogicalProgram {
     /// nothing demotes `result_reg` out of bit_only, but `bool_pack_mask` covers
     /// every bit_only register, so `read_reg_row0` finds the packed bit.
     pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
-        self.validate(Some(schema), None)?;
-        Ok(self.into_evaluator(schema, /* is_filter = */ false))
+        let str_class = self.validate(Some(schema), None)?;
+        Ok(self.into_evaluator(schema, /* is_filter = */ false, str_class))
     }
 
-    fn into_evaluator(self, schema: &dyn SchemaFacts, is_filter: bool) -> Evaluator {
-        let prog = self.resolve_program(schema, is_filter);
+    fn into_evaluator(self, schema: &dyn SchemaFacts, is_filter: bool, str_class: u64) -> Evaluator {
+        let prog = self.resolve_program(schema, is_filter, str_class);
         let scratch = RefCell::new(EvalScratch::new(&prog));
         Evaluator { prog, scratch }
     }
@@ -216,13 +216,12 @@ impl Evaluator {
     /// slot, is_str)` — the computed columns a map writes out of the register
     /// file, and which register class each reads.
     ///
-    /// The `Instr::EmitStr` arm is mandatory rather than convenient: this is a
-    /// `filter_map` with a `_ => None` fallthrough, so a missing arm silently
-    /// drops a string column's writer and ships its region uninitialized.
+    /// The class rides the instruction rather than splitting it in two, so this
+    /// `filter_map`'s `_ => None` fallthrough cannot silently drop a string
+    /// column's writer and ship its region uninitialized.
     pub fn emit_targets(&self) -> impl Iterator<Item = (u16, u32, bool)> + '_ {
         self.prog.instrs.iter().filter_map(|i| match *i {
-            Instr::Emit { src, out } => Some((src, out, false)),
-            Instr::EmitStr { src, out } => Some((src, out, true)),
+            Instr::Emit { src, out, is_str } => Some((src, out, is_str)),
             _ => None,
         })
     }
@@ -278,9 +277,11 @@ impl MorselOut<'_> {
         self.m
     }
 
-    /// Register `reg`'s values for this morsel's rows, in row order.
+    /// Register `reg`'s values for this morsel's rows, in row order. Crate-local:
+    /// consumers outside this crate read the same lanes as bytes, through
+    /// [`Self::reg_bytes`], which is what an 8-byte EMIT slot stores.
     #[inline(always)]
-    pub fn reg_values(&self, reg: usize) -> &[i64] {
+    pub(crate) fn reg_values(&self, reg: usize) -> &[i64] {
         let base = reg * MORSEL;
         &self.regs[base..base + self.m]
     }
@@ -323,7 +324,7 @@ impl MorselOut<'_> {
 /// Read register `r`'s value after an m=1 [`eval_batch`]. On the nullable arm a
 /// bit_only register is never unpacked into `regs`, so its truth value lives at
 /// bit 0 of `bool_bits` instead.
-pub(crate) fn read_reg_row0(prog: &ResolvedProgram, scratch: &EvalScratch, r: usize) -> i64 {
+fn read_reg_row0(prog: &ResolvedProgram, scratch: &EvalScratch, r: usize) -> i64 {
     if !prog.no_nulls && prog.is_bit_only(r) {
         i64::from((scratch.bool_bits[r * NULL_WORDS_PER_REG] & 1) != 0)
     } else {

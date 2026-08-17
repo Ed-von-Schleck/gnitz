@@ -122,15 +122,11 @@ impl EvalScratch {
 
     /// Ensure the scratch buffer can hold `prog`'s registers and `(n+63)/64`
     /// filter words (`n = 0` for a driver that reads no filter bitmap). Does not
-    /// shrink.
+    /// shrink. A zero `null_cap`/`str_cap` is how those buffers stay unallocated
+    /// for a program that never touches them.
     ///
-    /// Takes the program rather than its register count and nullability arm:
-    /// the cached `no_nulls` decides which buffers exist *and* which arm every
-    /// kernel takes, so reading it from anywhere but the program that is about
-    /// to run would size the scratch for one arm and evaluate on the other.
-    ///
-    /// A zero `null_cap`/`str_cap` is how the null and string buffers stay
-    /// unallocated for programs that never touch them.
+    /// Caching `prog.no_nulls` here is what pairs the scratch to one program:
+    /// `eval_batch` asserts the two still agree.
     pub(crate) fn ensure_capacity(&mut self, prog: &ResolvedProgram, n: usize) {
         let num_regs = prog.num_regs as usize;
         self.no_nulls = prog.no_nulls;
@@ -140,7 +136,7 @@ impl EvalScratch {
         } else {
             num_regs * NULL_WORDS_PER_REG
         };
-        let str_cap = if prog.has_strings { reg_cap } else { 0 };
+        let str_cap = prog.str_lanes as usize * MORSEL;
         let filter_words = n.div_ceil(64);
         if self.regs.len() < reg_cap
             || self.null_bits.len() < null_cap
@@ -1129,6 +1125,14 @@ pub(crate) fn eval_batch<B: BatchView>(
     m: usize,
     scratch: &mut EvalScratch,
 ) {
+    // The scratch caches `no_nulls` so the helpers that only take `&mut
+    // EvalScratch` can branch on it. Sizing it for one arm and evaluating on the
+    // other reads null buffers that were never allocated, so the two copies are
+    // checked rather than assumed to agree.
+    debug_assert_eq!(
+        scratch.no_nulls, prog.no_nulls,
+        "scratch was sized for a different program's nullability arm",
+    );
     // Declared before the macros below so their bodies can name it: a macro can
     // only capture bindings that already exist where it is defined.
     let mo = Morsel {
@@ -1322,7 +1326,7 @@ pub(crate) fn eval_batch<B: BatchView>(
             // ----------------------------------------------------------------
             // Output instructions — materialized at batch level, not here
             // ----------------------------------------------------------------
-            Instr::CopyCol { .. } | Instr::Emit { .. } | Instr::EmitStr { .. } => {}
+            Instr::CopyCol { .. } | Instr::Emit { .. } => {}
 
             // ----------------------------------------------------------------
             // Load operations
@@ -1646,14 +1650,7 @@ pub(crate) fn eval_batch<B: BatchView>(
             // ----------------------------------------------------------------
             // IS NULL / IS NOT NULL
             // ----------------------------------------------------------------
-            // The two opcodes carry identical fields and differ only in whether
-            // the bit is inverted, so they share one kernel.
-            Instr::IsNull { dst, pi } => {
-                eval_is_null(scratch, &mo, dst as usize, pi as usize, /* invert = */ false)
-            }
-            Instr::IsNotNull { dst, pi } => {
-                eval_is_null(scratch, &mo, dst as usize, pi as usize, /* invert = */ true)
-            }
+            Instr::IsNull { dst, pi, invert } => eval_is_null(scratch, &mo, dst as usize, pi as usize, invert),
 
             // ----------------------------------------------------------------
             // Type cast. `signed: false` reinterprets the register as u64 first

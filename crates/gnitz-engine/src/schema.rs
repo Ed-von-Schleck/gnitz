@@ -20,7 +20,17 @@ pub(crate) use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 /// with the engine. Re-exported here because it *is* a schema fact —
 /// `SchemaDescriptor::locate` produces one.
 pub(crate) use gnitz_expr::ColumnLocator;
-use gnitz_expr::PAYLOAD_MAPPING_PK_SENTINEL;
+
+/// The dense payload-slot byte that means "this column has no payload slot" —
+/// it is a PK column. `u8::MAX`, not 0, so it is unambiguous against a real
+/// payload index of 0, and out of range for every schema, so addressing a
+/// column with it trips a bounds check rather than reading slot 0.
+///
+/// Private to this module because it describes [`SchemaDescriptor`]'s own
+/// `payload_mapping` / `payload_to_ci` tables and nothing else. It is never
+/// handed out as a *value*: callers read through `payload_slot`, which is
+/// `Option`-shaped.
+const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
 
 /// Order-preserving primary-key (OPK) primitives — every native→OPK encoder
 /// (whole PK, seek wire pair, index leading span), compare/pack, and the

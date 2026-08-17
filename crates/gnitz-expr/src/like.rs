@@ -21,8 +21,11 @@ use crate::batch::char_offset;
 ///
 /// The specializations answer no question `Generic` could not. `Suffix` and
 /// `Contains` skip its per-offset retry; `Exact` and `Prefix` skip only its fixed
-/// cost, which is still worth a measured +46 (`'ab%'`) to +67 (`'abc'`) retired
-/// instructions per row on the `WHERE s LIKE …` scan-filter path.
+/// cost, which is still worth +46 (`'ab%'`) to +67 (`'abc'`) retired instructions
+/// per row on the `WHERE s LIKE …` scan-filter path, measured with
+/// `perf stat -e instructions:u` against a build with `specialize` forced to
+/// return `Generic`. There is no in-tree bench for it — refreshing the number
+/// means rebuilding that comparison by hand.
 pub(crate) struct LikeMatcher {
     kind: LikeKind,
     /// ASCII-only case folding. The `Lit` bytes below are already lowercased, so

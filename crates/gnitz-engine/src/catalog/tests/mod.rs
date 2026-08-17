@@ -68,7 +68,7 @@ fn count_records(table: &mut Table) -> usize {
 fn pred_lt_blob(col: usize, lit: i64) -> Vec<u8> {
     let mut eb = gnitz_expr::ExprBuilder::new();
     let (a, b) = (eb.load_col_int(col), eb.load_const(lit));
-    let r = eb.cmp_lt(a, b);
+    let r = eb.cmp(gnitz_expr::CmpOp::Lt, a, b);
     eb.build(r).encode()
 }
 

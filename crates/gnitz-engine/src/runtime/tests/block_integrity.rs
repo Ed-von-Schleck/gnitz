@@ -101,8 +101,9 @@ fn empty_data_block_still_decodes() {
 
 /// A forged lower `COUNT` on a schema block passes the col_idx monotonicity
 /// check on the truncated prefix `[0, 1, …]`, so only the exact region size
-/// rejects it — and the descriptor it would yield is what every later block for
-/// that table is decoded against.
+/// rejects it — every fixed-stride region must be exactly `count` rows wide, and
+/// a lowered `count` leaves each one too long. The descriptor it would otherwise
+/// yield is what every later block for that table is decoded against.
 #[test]
 fn schema_block_count_forgeries_are_rejected() {
     let clean = schema_block_4col();
@@ -117,7 +118,7 @@ fn schema_block_count_forgeries_are_rejected() {
         set_u32(&mut buf, WAL_OFF_COUNT, forged_count);
         assert_eq!(
             decode_schema_block(&buf, true).err(),
-            Some("schema col_idx region OOB"),
+            Some("schema block region size mismatch"),
             "schema COUNT 4 -> {forged_count} must be rejected"
         );
     }

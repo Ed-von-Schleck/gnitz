@@ -22,7 +22,7 @@ fn over_cap_pred_blob() -> Vec<u8> {
         .map(|i| eb.load_const(i))
         .last()
         .unwrap();
-    let r = eb.cmp_lt(col, last);
+    let r = eb.cmp(gnitz_expr::CmpOp::Lt, col, last);
     eb.build(r).encode()
 }
 

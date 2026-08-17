@@ -22,7 +22,7 @@ pub use error::ClientError;
 // The expression emitter lives in `gnitz-expr`, beside the decoder it must
 // agree with. Re-exported here because `gnitz-capi` exposes 18 `gnitz_expr_*` C
 // symbols over it without depending on that crate.
-pub use gnitz_expr::{ExprBuilder, ExprProgram};
+pub use gnitz_expr::{CmpOp, ExprBuilder, ExprProgram, StrOp};
 pub use gnitz_wire::{
     index_key_types, validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, FK_INDEX_INFIX,
 };

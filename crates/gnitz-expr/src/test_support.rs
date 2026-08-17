@@ -416,3 +416,19 @@ pub fn locator_fixture() -> TestView {
     }
     v
 }
+
+/// `IS NULL` / `IS NOT NULL` over column `col` into register `dst`. The two read
+/// one null-bitmap bit at opposite polarity and share one instruction, so a
+/// fixture names the polarity rather than spelling the struct literal — which
+/// rustfmt would break across five lines at every call site.
+pub fn is_null_op(dst: u16, col: u32) -> LogicalInstr {
+    LogicalInstr::IsNull {
+        dst,
+        col,
+        invert: false,
+    }
+}
+
+pub fn is_not_null_op(dst: u16, col: u32) -> LogicalInstr {
+    LogicalInstr::IsNull { dst, col, invert: true }
+}

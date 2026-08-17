@@ -22,8 +22,8 @@ pub trait SchemaFacts {
     /// [`Self::locate`], never separately implemented — the locator variant *is*
     /// the PK marker, so the two cannot disagree — and `Option`-shaped so "this
     /// column has no payload slot" must be handled at each site rather than
-    /// carried around as [`crate::PAYLOAD_MAPPING_PK_SENTINEL`], which an
-    /// implementor would then have to synthesise.
+    /// carried around as an in-band sentinel, which an implementor would then
+    /// have to synthesise.
     fn payload_slot(&self, ci: usize) -> Option<u8> {
         match self.locate(ci) {
             ColumnLocator::Payload { slot, .. } => Some(slot),

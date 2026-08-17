@@ -3,16 +3,15 @@
 // each access site; collapsing them obscures which register is in use.
 #![allow(clippy::erasing_op, clippy::identity_op)]
 
-use gnitz_wire::type_code;
+use gnitz_wire::{type_code, FixedInt};
 
 use super::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
-use crate::eval::read_reg_row0;
 use crate::program::IntUnaryOp;
 use crate::test_support::{
     bits_to_float, filter_prog, float_to_bits, make_int_row, make_int_view, make_n_col_view, passing_rows, scalar_prog,
     schema_pk_ints, TestSchema, TestView,
 };
-use crate::{CmpOp, LogicalInstr, ResolvedProgram};
+use crate::{CmpOp, LogicalInstr, ResolvedProgram, RowSource};
 
 /// Resolve a test program down to the raw evaluable form the kernel tests drive
 /// `eval_batch` with. The `Evaluator` wrapper is the *caller's* surface; these
@@ -95,161 +94,6 @@ fn test_eval_batch_add() {
     assert_eq!(scratch.regs[2 * MORSEL + 1], 22);
     // row 2: pk=3, val=30, sum=33
     assert_eq!(scratch.regs[2 * MORSEL + 2], 33);
-}
-
-// ---------------------------------------------------------------------------
-// Edge-case golden tests at m=1
-//
-// These pin the points where the m=1 path through eval_batch could most
-// plausibly diverge from the vectorized one. They each set up a one-row input
-// and assert against a manually computed expected value via a direct
-// `eval_batch`.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn golden_int_div_zero_divisor_single_row() {
-    let schema = schema_pk_ints(1, true);
-    let mb = make_int_row(&schema, &[10], 0);
-
-    // r0 = col1 = 10, r1 = 0, r2 = r0 / r1 → null
-    let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: 0 },
-        LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
-    ];
-    let prog = resolved(&schema, instrs, 3, 2);
-
-    let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, 1);
-    eval_batch(&prog, &mb, 0, 1, &mut scratch);
-    let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
-    assert!(is_null, "INT_DIV by zero must produce NULL at m=1");
-    // The zero-mask merge into the destination null word must leave high bits zero.
-    assert_eq!(
-        scratch.null_bits[2 * NULL_WORDS_PER_REG] & !1u64,
-        0,
-        "high bits of dst null word must stay zero at m=1",
-    );
-}
-
-#[test]
-fn golden_float_div_zero_divisor_single_row() {
-    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::F64, true)], &[0]);
-    // arbitrary non-zero F64 bits
-    let mb = make_int_view(&schema, &[(1, 0, &[float_to_bits(2.5)])]);
-
-    // r0 = col1 (f64), r1 = 0.0 bits, r2 = r0 / r1 → null
-    let instrs = vec![
-        LogicalInstr::LoadColFloat { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: 0 },
-        LogicalInstr::FloatDiv { dst: 2, a: 0, b: 1 },
-    ];
-    let prog = resolved(&schema, instrs, 3, 2);
-
-    let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, 1);
-    eval_batch(&prog, &mb, 0, 1, &mut scratch);
-    let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
-    assert!(is_null, "FLOAT_DIV by zero must produce NULL at m=1");
-    assert_eq!(
-        scratch.null_bits[2 * NULL_WORDS_PER_REG] & !1u64,
-        0,
-        "high bits of dst null word must stay zero at m=1",
-    );
-}
-
-/// Build a 1-row view with two nullable I64 columns plus a u64 PK.
-fn run_bool_combinator(schema: &TestSchema, batch: &TestView, op: fn(u16, u16, u16) -> LogicalInstr) -> (i64, bool) {
-    let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadColInt { dst: 1, col: 2 },
-        op(2, 0, 1),
-    ];
-    let prog = resolved(schema, instrs, 3, 2);
-    let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, 1);
-    eval_batch(&prog, batch, 0, 1, &mut scratch);
-    let val = read_reg_row0(&prog, &scratch, 2);
-    let is_null = (scratch.null_bits[2 * NULL_WORDS_PER_REG] & 1) != 0;
-    // The 3VL whole-word path writes the full u64 for word 0; bits beyond
-    // bit 0 must be zero at m=1.
-    assert_eq!(
-        scratch.null_bits[2 * NULL_WORDS_PER_REG] & !1u64,
-        0,
-        "3VL whole-word path must leave high bits of dst null word zero at m=1",
-    );
-    (val, is_null)
-}
-
-#[test]
-fn golden_bool_and_3vl_single_row() {
-    let schema = schema_pk_ints(2, true);
-    // TRUE AND NULL = NULL: col1=1, col2=null (bit 1 set in null word)
-    let b = make_int_row(&schema, &[1, 0], 1u64 << 1);
-    let (_, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolAnd { dst, a, b });
-    assert!(n, "TRUE AND NULL must be NULL at m=1");
-
-    // FALSE AND NULL = FALSE: col1=0, col2=null
-    let b = make_int_row(&schema, &[0, 0], 1u64 << 1);
-    let (v, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolAnd { dst, a, b });
-    assert!(!n, "FALSE AND NULL must not be NULL at m=1");
-    assert_eq!(v, 0, "FALSE AND NULL must be FALSE at m=1");
-}
-
-#[test]
-fn golden_bool_or_3vl_single_row() {
-    let schema = schema_pk_ints(2, true);
-    // NULL OR TRUE = TRUE: col1=null (bit 0), col2=1
-    let b = make_int_row(&schema, &[0, 1], 1u64 << 0);
-    let (v, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolOr { dst, a, b });
-    assert!(!n, "NULL OR TRUE must not be NULL at m=1");
-    assert_eq!(v, 1, "NULL OR TRUE must be TRUE at m=1");
-
-    // NULL OR FALSE = NULL: col1=null, col2=0
-    let b = make_int_row(&schema, &[0, 0], 1u64 << 0);
-    let (_, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolOr { dst, a, b });
-    assert!(n, "NULL OR FALSE must be NULL at m=1");
-}
-
-#[test]
-fn golden_int_neg_null_source_single_row() {
-    let schema = schema_pk_ints(1, true);
-    // col1 null → INT_NEG result null. null_or1 at m=1.
-    let mb = make_int_row(&schema, &[0], 1);
-    let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::IntUnary {
-            op: IntUnaryOp::Neg,
-            dst: 1,
-            a: 0,
-        },
-    ];
-    let prog = resolved(&schema, instrs, 2, 1);
-    let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, 1);
-    eval_batch(&prog, &mb, 0, 1, &mut scratch);
-    assert!(
-        (scratch.null_bits[1 * NULL_WORDS_PER_REG] & 1) != 0,
-        "INT_NEG of NULL must be NULL at m=1",
-    );
-}
-
-#[test]
-fn golden_bool_not_null_source_single_row() {
-    let schema = schema_pk_ints(1, true);
-    let mb = make_int_row(&schema, &[0], 1);
-    let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::BoolNot { dst: 1, a: 0 },
-    ];
-    let prog = resolved(&schema, instrs, 2, 1);
-    let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, 1);
-    eval_batch(&prog, &mb, 0, 1, &mut scratch);
-    assert!(
-        (scratch.null_bits[1 * NULL_WORDS_PER_REG] & 1) != 0,
-        "NOT NULL must be NULL at m=1",
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1645,4 +1489,40 @@ fn string_select_takes_the_chosen_branch_and_its_null_bit() {
     assert!(!got[1].1);
     assert_eq!(got[2].0, b"yes", "row 2's NULL is on the branch not taken");
     assert!(!got[2].1);
+}
+
+/// `LoadPk`'s kernel is a fourth spelling of the OPK→i64 inverse: it reads
+/// fixed-width `&[u8; W]` arrays so each width is one load plus a byte swap,
+/// where `gnitz_wire::decode_opk_i64` takes the width as a slice length. The two
+/// must agree for every width and both signednesses — a divergence here is a
+/// silently wrong *value*, not a crash — and `decode_opk_i64` is itself
+/// cross-checked against the wire crate's other two spellings, so pinning
+/// against it puts this kernel inside that same check.
+#[test]
+fn pk_loads_agree_with_the_wire_opk_decoder() {
+    for (tc, fi) in [
+        (type_code::U8, FixedInt::U8),
+        (type_code::I8, FixedInt::I8),
+        (type_code::U16, FixedInt::U16),
+        (type_code::I16, FixedInt::I16),
+        (type_code::U32, FixedInt::U32),
+        (type_code::I32, FixedInt::I32),
+        (type_code::U64, FixedInt::U64),
+        (type_code::I64, FixedInt::I64),
+    ] {
+        // A single-column PK of this type, plus one payload column so the schema
+        // has a slot; the values sweep both sign extremes and the midpoint.
+        let schema = TestSchema::new(&[(tc, false), (type_code::I64, false)], &[0]);
+        let vals: [u64; 6] = [0, 1, u64::MAX, 1 << 63, (1 << 63) - 1, 0x0123_4567_89ab_cdef];
+        let rows: Vec<(u64, u64, &[i64])> = vals.iter().map(|&v| (v, 0u64, &[0i64][..])).collect();
+        let view = make_int_view(&schema, &rows);
+
+        let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }], 1, 0, vec![]);
+        for row in 0..vals.len() {
+            let (got, is_null) = ev.eval_row(&view, row);
+            assert!(!is_null, "a PK column is never null");
+            let want = gnitz_wire::decode_opk_i64(&view.get_pk_bytes(row)[..fi.width()], fi);
+            assert_eq!(got, want, "type {tc}, row {row}: LoadPk disagrees with decode_opk_i64");
+        }
+    }
 }

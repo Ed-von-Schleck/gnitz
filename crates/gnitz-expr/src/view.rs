@@ -31,26 +31,17 @@ pub trait RowSource {
 /// (or an adapter that materializes one) can satisfy.
 ///
 /// Region accessors return the WHOLE column/region, never a morsel slice: the
-/// kernels index them absolutely. Implementor preconditions:
-/// `col_data(pi, sz).len() == rows * sz`, `null_bmp().len() == rows * 8`.
-///
-/// The per-row accessors [`RowSource`] requires are **not** derived from these,
-/// so an implementor that can compute a cell address directly does not pay to
-/// slice the whole region first. Deriving `get_col_ptr(row, c, s)` as
-/// `&col_data(c, s)[row * s..][..s]` costs a row-count load, a second multiply
-/// and a second range check per read — free once LICM hoists them, but the
-/// debug build has no LICM and is what the whole E2E suite runs (see the
-/// crate-root inlining rule for why that build decides these questions).
+/// kernels index them absolutely.
 ///
 /// CONTRACT binding the two shapes, checked by [`assert_batchview_consistent`]:
 ///   `get_col_ptr(row, pi, sz) == &col_data(pi, sz)[row*sz .. row*sz + sz]`
 ///   `get_null_word(row)       == gnitz_wire::read_u64_le(null_bmp(), row*8)`
 ///   `get_pk_bytes(row)        == &pk_region().0[row*s .. row*s + s]`, `s = .1`
 ///
-/// There are deliberately **no default bodies** for the per-row half. Defaulting
-/// it off the region accessors would make direct addressing opt-in: delete an
-/// override and everything still compiles, every test passes, and the slow path
-/// is taken in every build.
+/// [`RowSource`]'s per-row half deliberately has **no default bodies** off these:
+/// a default would make direct cell addressing opt-in, so deleting an override
+/// would still compile and still pass, silently costing a second multiply and
+/// range check per read in the debug build the E2E suite runs.
 pub trait BatchView: RowSource {
     /// Payload column `payload_col` in full (`rows * col_size` bytes, native LE).
     fn col_data(&self, payload_col: usize, col_size: usize) -> &[u8];

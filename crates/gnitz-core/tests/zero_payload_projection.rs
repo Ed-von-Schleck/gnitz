@@ -43,7 +43,7 @@ fn gt_predicate(col: usize, threshold: i64) -> Vec<u8> {
     let mut b = ExprBuilder::new();
     let c = b.load_col_int(col);
     let k = b.load_const(threshold);
-    let cond = b.cmp_gt(c, k);
+    let cond = b.cmp(gnitz_core::CmpOp::Gt, c, k);
     b.build(cond).encode()
 }
 

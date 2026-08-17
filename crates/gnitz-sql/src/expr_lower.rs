@@ -8,7 +8,7 @@
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, NumFunc, StrFunc, TrimMode, UnaryOp};
 use gnitz_core::{ColumnDef, ExprBuilder, Schema, TypeCode};
-use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
+use gnitz_expr::{CmpOp, Evaluator, ExprValidateErr, FloatUnaryOp, IntUnaryOp, LogicalProgram, StrOp};
 
 /// An IN-list item folds to an integer constant iff it is an integer literal or
 /// the unary negation of one (`-1` binds to `UnaryOp(Neg, LitInt(1))` — sqlparser
@@ -38,14 +38,6 @@ fn in_list_or_chain(inner: &BoundExpr, items: &[BoundExpr]) -> BoundExpr {
     chain
 }
 
-/// The three string comparison primitives every SQL comparison reduces to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum StrPrim {
-    Eq,
-    Lt,
-    Le,
-}
-
 /// How one of the six SQL comparisons rides the three string primitives: which
 /// primitive to emit, whether to exchange its operands, and whether to negate
 /// its result. The one place that mapping is written; `None` is "not a
@@ -57,16 +49,16 @@ enum StrPrim {
 /// `bool_not` and the register that holds its input. Negation is 3VL-correct
 /// because `bool_not` propagates the null bit, which is what `!=` already
 /// relies on at every site.
-fn str_cmp_reduction(op: BinOp, can_swap: bool) -> Option<(StrPrim, bool, bool)> {
+fn str_cmp_reduction(op: BinOp, can_swap: bool) -> Option<(StrOp, bool, bool)> {
     Some(match op {
-        BinOp::Eq => (StrPrim::Eq, false, false),
-        BinOp::Ne => (StrPrim::Eq, false, true),
-        BinOp::Lt => (StrPrim::Lt, false, false),
-        BinOp::Le => (StrPrim::Le, false, false),
-        BinOp::Gt if can_swap => (StrPrim::Lt, true, false),
-        BinOp::Ge if can_swap => (StrPrim::Le, true, false),
-        BinOp::Gt => (StrPrim::Le, false, true),
-        BinOp::Ge => (StrPrim::Lt, false, true),
+        BinOp::Eq => (StrOp::Eq, false, false),
+        BinOp::Ne => (StrOp::Eq, false, true),
+        BinOp::Lt => (StrOp::Lt, false, false),
+        BinOp::Le => (StrOp::Le, false, false),
+        BinOp::Gt if can_swap => (StrOp::Lt, true, false),
+        BinOp::Ge if can_swap => (StrOp::Le, true, false),
+        BinOp::Gt => (StrOp::Le, false, true),
+        BinOp::Ge => (StrOp::Lt, false, true),
         _ => return None,
     })
 }
@@ -108,11 +100,7 @@ fn try_compile_string_cmp(
         // integer path (which would read the descriptor bytes as a garbage int).
         if cols[idx].type_code.is_german_string() {
             let const_idx = eb.add_const_string(s.clone());
-            let reg = match prim {
-                StrPrim::Eq => eb.str_col_eq_const(idx, const_idx),
-                StrPrim::Lt => eb.str_col_lt_const(idx, const_idx),
-                StrPrim::Le => eb.str_col_le_const(idx, const_idx),
-            };
+            let reg = eb.str_col_const(prim, idx, const_idx);
             return Some(if negate { eb.bool_not(reg) } else { reg });
         }
     }
@@ -122,11 +110,7 @@ fn try_compile_string_cmp(
         if cols[*a].type_code.is_german_string() && cols[*b].type_code.is_german_string() {
             let (prim, swap, negate) = str_cmp_reduction(*op, true)?;
             let (l, r) = if swap { (*b, *a) } else { (*a, *b) };
-            let reg = match prim {
-                StrPrim::Eq => eb.str_col_eq_col(l, r),
-                StrPrim::Lt => eb.str_col_lt_col(l, r),
-                StrPrim::Le => eb.str_col_le_col(l, r),
-            };
+            let reg = eb.str_col_col(prim, l, r);
             return Some(if negate { eb.bool_not(reg) } else { reg });
         }
     }
@@ -194,8 +178,8 @@ impl OpcodeBackend<'_> {
             BoundExpr::LitNull => Ok(self.lit_null()),
             BoundExpr::BinOp(l, op, r) => self.binop(l, *op, r),
             BoundExpr::UnaryOp(op, inner) => self.unop(*op, inner),
-            BoundExpr::IsNull(c) => Ok((self.eb.is_null(*c), ExprKind::Int)),
-            BoundExpr::IsNotNull(c) => Ok((self.eb.is_not_null(*c), ExprKind::Int)),
+            BoundExpr::IsNull(c) => Ok((self.eb.is_null(*c, /* invert = */ false), ExprKind::Int)),
+            BoundExpr::IsNotNull(c) => Ok((self.eb.is_null(*c, /* invert = */ true), ExprKind::Int)),
             BoundExpr::AggCall { .. } => Err(GnitzSqlError::Unsupported(
                 "aggregate function not allowed in expression context".to_string(),
             )),
@@ -296,13 +280,20 @@ impl OpcodeBackend<'_> {
             // Every transform is the identity on an integer register, and ABS of
             // an unsigned one likewise — the value is non-negative by definition.
             let needs_abs = f == NumFunc::Abs && arg.infer_type(self.cols).is_signed_int();
-            return Ok((if needs_abs { self.eb.int_abs(r) } else { r }, ExprKind::Int));
+            return Ok((
+                if needs_abs {
+                    self.eb.int_unary(IntUnaryOp::Abs, r)
+                } else {
+                    r
+                },
+                ExprKind::Int,
+            ));
         }
         let reg = match f {
-            NumFunc::Abs => self.eb.float_abs(r),
-            NumFunc::Floor => self.eb.float_floor(r),
-            NumFunc::Ceil => self.eb.float_ceil(r),
-            NumFunc::Trunc => self.eb.float_trunc(r),
+            NumFunc::Abs => self.eb.float_unary(FloatUnaryOp::Abs, r),
+            NumFunc::Floor => self.eb.float_unary(FloatUnaryOp::Floor, r),
+            NumFunc::Ceil => self.eb.float_unary(FloatUnaryOp::Ceil, r),
+            NumFunc::Trunc => self.eb.float_unary(FloatUnaryOp::Trunc, r),
             NumFunc::Round(_) => unreachable!("routed to `round` above"),
         };
         Ok((reg, ExprKind::Float))
@@ -311,10 +302,10 @@ impl OpcodeBackend<'_> {
     fn str_call(&mut self, f: StrFunc, arg: &BoundExpr) -> Result<(u32, ExprKind), GnitzSqlError> {
         let a = self.str_operand(arg, /* coerce_numeric = */ false)?;
         let reg = match f {
-            StrFunc::Upper => self.eb.str_upper(a),
-            StrFunc::Lower => self.eb.str_lower(a),
-            StrFunc::LenChars => self.eb.str_len_chars(a),
-            StrFunc::LenBytes => self.eb.str_len_bytes(a),
+            StrFunc::Upper => self.eb.str_case(a, /* upper = */ true),
+            StrFunc::Lower => self.eb.str_case(a, /* upper = */ false),
+            StrFunc::LenChars => self.eb.str_len(a, /* chars = */ true),
+            StrFunc::LenBytes => self.eb.str_len(a, /* chars = */ false),
         };
         // Class taken from the one result-type statement, not restated here.
         let kind = if f.result_type() == TypeCode::String {
@@ -369,7 +360,7 @@ impl OpcodeBackend<'_> {
         let mut acc = self.eb.load_const_str(empty);
         for a in args {
             let r = self.str_operand(a, /* coerce_numeric = */ true)?;
-            acc = self.eb.str_concat_nn(acc, r);
+            acc = self.eb.str_concat(acc, r, /* skip_null = */ true);
         }
         Ok((acc, ExprKind::Str))
     }
@@ -386,7 +377,7 @@ impl OpcodeBackend<'_> {
         }
         let mut v = self.lower_as(arg, true)?;
         if n == 0 {
-            return Ok((self.eb.float_round(v), ExprKind::Float));
+            return Ok((self.eb.float_unary(FloatUnaryOp::Round, v), ExprKind::Float));
         }
         let scale = self.eb.load_const(10f64.powi(n.unsigned_abs() as i32).to_bits() as i64);
         // Multiply first for n > 0, divide first for n < 0; then undo.
@@ -396,7 +387,7 @@ impl OpcodeBackend<'_> {
         } else {
             self.eb.float_div(v, scale)
         };
-        v = self.eb.float_round(v);
+        v = self.eb.float_unary(FloatUnaryOp::Round, v);
         Ok((
             if up {
                 self.eb.float_div(v, scale)
@@ -431,10 +422,8 @@ impl OpcodeBackend<'_> {
             }
             let r = self.lower_as(a, any_float)?;
             acc = match (any_float, is_max) {
-                (true, true) => self.eb.float_max2(acc, r),
-                (true, false) => self.eb.float_min2(acc, r),
-                (false, true) => self.eb.int_max2(acc, r),
-                (false, false) => self.eb.int_min2(acc, r),
+                (true, is_max) => self.eb.float_minmax2(is_max, acc, r),
+                (false, is_max) => self.eb.int_minmax2(is_max, acc, r),
             };
         }
         Ok((acc, ExprKind::num(any_float)))
@@ -667,7 +656,7 @@ impl OpcodeBackend<'_> {
         if matches!(op, BinOp::Concat) {
             let l = self.str_operand(left, false)?;
             let r = self.str_operand(right, false)?;
-            return Ok((self.eb.str_concat(l, r), ExprKind::Str));
+            return Ok((self.eb.str_concat(l, r, /* skip_null = */ false), ExprKind::Str));
         }
 
         let (mut l, l_kind) = self.lower(left)?;
@@ -699,19 +688,25 @@ impl OpcodeBackend<'_> {
             (BinOp::Div, true) => Ok((self.eb.float_div(l, r), ExprKind::Float)),
             (BinOp::Mod, false) => Ok((self.eb.modulo(l, r), ExprKind::Int)),
             (BinOp::Mod, true) => Err(GnitzSqlError::Unsupported("float modulo not supported".to_string())),
-            // Comparisons — result is always int (0/1)
-            (BinOp::Eq, false) => Ok((self.eb.cmp_eq(l, r), ExprKind::Int)),
-            (BinOp::Eq, true) => Ok((self.eb.fcmp_eq(l, r), ExprKind::Int)),
-            (BinOp::Ne, false) => Ok((self.eb.cmp_ne(l, r), ExprKind::Int)),
-            (BinOp::Ne, true) => Ok((self.eb.fcmp_ne(l, r), ExprKind::Int)),
-            (BinOp::Gt, false) => Ok((self.eb.cmp_gt(l, r), ExprKind::Int)),
-            (BinOp::Gt, true) => Ok((self.eb.fcmp_gt(l, r), ExprKind::Int)),
-            (BinOp::Ge, false) => Ok((self.eb.cmp_ge(l, r), ExprKind::Int)),
-            (BinOp::Ge, true) => Ok((self.eb.fcmp_ge(l, r), ExprKind::Int)),
-            (BinOp::Lt, false) => Ok((self.eb.cmp_lt(l, r), ExprKind::Int)),
-            (BinOp::Lt, true) => Ok((self.eb.fcmp_lt(l, r), ExprKind::Int)),
-            (BinOp::Le, false) => Ok((self.eb.cmp_le(l, r), ExprKind::Int)),
-            (BinOp::Le, true) => Ok((self.eb.fcmp_le(l, r), ExprKind::Int)),
+            // Comparisons — result is always int (0/1). The operator travels as
+            // data all the way to the opcode, so the float/int choice is the only
+            // thing left to branch on.
+            (BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Ge | BinOp::Lt | BinOp::Le, is_float) => {
+                let cmp = match op {
+                    BinOp::Eq => CmpOp::Eq,
+                    BinOp::Ne => CmpOp::Ne,
+                    BinOp::Gt => CmpOp::Gt,
+                    BinOp::Ge => CmpOp::Ge,
+                    BinOp::Lt => CmpOp::Lt,
+                    _ => CmpOp::Le,
+                };
+                let reg = if is_float {
+                    self.eb.fcmp(cmp, l, r)
+                } else {
+                    self.eb.cmp(cmp, l, r)
+                };
+                Ok((reg, ExprKind::Int))
+            }
             // Handled above, before the operands were lowered.
             (BinOp::And, _) | (BinOp::Or, _) | (BinOp::Concat, _) => unreachable!(),
         }
@@ -741,11 +736,7 @@ impl OpcodeBackend<'_> {
             )));
         }
         let (l, r) = if swap { (r, l) } else { (l, r) };
-        let reg = match prim {
-            StrPrim::Eq => self.eb.str_cmp_eq(l, r),
-            StrPrim::Lt => self.eb.str_cmp_lt(l, r),
-            StrPrim::Le => self.eb.str_cmp_le(l, r),
-        };
+        let reg = self.eb.str_cmp(prim, l, r);
         Ok((if negate { self.eb.bool_not(reg) } else { reg }, ExprKind::Int))
     }
 
@@ -754,9 +745,9 @@ impl OpcodeBackend<'_> {
         match op {
             UnaryOp::Neg => {
                 if a_float {
-                    Ok((self.eb.float_neg(a), ExprKind::Float))
+                    Ok((self.eb.float_unary(FloatUnaryOp::Neg, a), ExprKind::Float))
                 } else {
-                    Ok((self.eb.neg_int(a), ExprKind::Int))
+                    Ok((self.eb.int_unary(IntUnaryOp::Neg, a), ExprKind::Int))
                 }
             }
             UnaryOp::Not => Ok((self.eb.bool_not(a), ExprKind::Int)),
@@ -817,7 +808,7 @@ pub(crate) fn compile_wire_predicate(pred: &BoundExpr, cols: &[ColumnDef]) -> Re
         return Ok(Vec::new());
     };
     let blob = p.encode();
-    to_logical(p)?;
+    LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings).map_err(expr_unsupported)?;
     Ok(blob)
 }
 
@@ -829,10 +820,14 @@ pub(crate) fn compile_wire_predicate(pred: &BoundExpr, cols: &[ColumnDef]) -> Re
 /// Picks `resolve_filter`, so a bare non-boolean predicate (`HAVING COUNT(*)`)
 /// still gets the `bool_bits` bit [`Evaluator::filter`] reads.
 pub(crate) fn compile_filter_evaluator(pred: &BoundExpr, schema: &Schema) -> Result<Option<Evaluator>, GnitzSqlError> {
-    let Some(p) = compile_filter_program(pred, &schema.columns)? else {
+    // The statically-true verdict, as `compile_filter_program` decides it.
+    if matches!(pred, BoundExpr::LitInt(v) if *v != 0) {
         return Ok(None);
-    };
-    Ok(Some(to_logical(p)?.resolve_filter(schema).map_err(expr_unsupported)?))
+    }
+    let mut eb = ExprBuilder::new();
+    let reg = compile_bound_expr(pred, &schema.columns, &mut eb)?;
+    let prog = eb.build_logical(reg).map_err(expr_unsupported)?;
+    Ok(Some(prog.resolve_filter(schema).map_err(expr_unsupported)?))
 }
 
 /// Compile a scalar (non-predicate) RHS — a SET / `DO UPDATE SET` value — into
@@ -867,17 +862,10 @@ pub(crate) fn compile_scalar_evaluator(expr: &BoundExpr, schema: &Schema) -> Res
             "SET from a floating-point expression is not supported".to_string(),
         ));
     }
-    to_logical(eb.build(reg))?
+    eb.build_logical(reg)
+        .map_err(expr_unsupported)?
         .resolve_scalar(schema)
         .map_err(expr_unsupported)
-}
-
-/// The one place `ExprProgram`'s fields meet [`LogicalProgram::from_wire`]'s
-/// parameters. They are byte-for-byte its arguments, so this is a hand-off, not
-/// a round trip; the caller then picks the resolver that matches how it will
-/// drive the program.
-fn to_logical(p: gnitz_core::ExprProgram) -> Result<LogicalProgram, GnitzSqlError> {
-    LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings).map_err(expr_unsupported)
 }
 
 /// A shared-evaluator rejection as a SQL-layer `Unsupported`. The wording is
@@ -891,6 +879,13 @@ fn expr_unsupported(e: ExprValidateErr) -> GnitzSqlError {
 mod tests {
     use super::*;
     use gnitz_core::{ColumnDef, ExprProgram, Schema, TypeCode};
+
+    /// Decode a built program the way the engine will. Production no longer
+    /// round-trips through the wire form to resolve locally, but these tests are
+    /// about what the *engine* accepts, so they go through the decoder.
+    fn to_logical(p: ExprProgram) -> Result<LogicalProgram, GnitzSqlError> {
+        LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings).map_err(expr_unsupported)
+    }
 
     fn col(name: &str, tc: TypeCode) -> ColumnDef {
         ColumnDef::new(name, tc, true)
@@ -1300,7 +1295,7 @@ mod tests {
         let b = BoundExpr::ColRef(2);
         let got = compile(&a, BinOp::Lt, &b, &schema);
         let mut eb = ExprBuilder::new();
-        let reg = eb.str_col_lt_col(1, 2);
+        let reg = eb.str_col_col(StrOp::Lt, 1, 2);
         assert_eq!(got, eb.build(reg), "a < b must stay str_col_lt_col(a, b)");
     }
 

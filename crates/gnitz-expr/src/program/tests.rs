@@ -4,11 +4,11 @@
 
 use gnitz_wire::type_code;
 
-use super::{register_roles, RegisterRoles};
+use super::{analyze, ProgramFacts};
 use crate::program::IntUnaryOp;
 use crate::test_support::{
-    bits_to_float, filter_prog, float_to_bits, make_int_view, make_string_view, scalar_prog, schema_pk_ints,
-    schema_pk_strings, TestSchema, TestView,
+    bits_to_float, filter_prog, float_to_bits, is_not_null_op, is_null_op, make_int_view, make_string_view,
+    scalar_prog, schema_pk_ints, schema_pk_strings, TestSchema, TestView,
 };
 use crate::{CmpOp, ColKind, Evaluator, ExprValidateErr, Instr, LogicalInstr, LogicalProgram, StrOp};
 
@@ -206,21 +206,21 @@ fn test_is_null_is_not_null() {
     let mb = make_int_view(&schema, &[(1, 1, &[0, 5])]);
 
     // IS_NULL(col1) → 1 (always non-null result)
-    let instrs = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
+    let instrs = vec![is_null_op(0, 1)];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
     let (val, is_null) = prog.eval_row(&mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
     // IS_NOT_NULL(col1) → 0
-    let instrs = vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }];
+    let instrs = vec![is_not_null_op(0, 1)];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
     let (val, is_null) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
     assert!(!is_null);
 
     // IS_NULL(col2) → 0
-    let instrs = vec![LogicalInstr::IsNull { dst: 0, col: 2 }];
+    let instrs = vec![is_null_op(0, 2)];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
     let (val, _) = prog.eval_row(&mb, 0);
     assert_eq!(val, 0);
@@ -1422,7 +1422,9 @@ fn test_select_classification() {
         LogicalInstr::LoadColInt { dst: 4, col: 4 }, // other bool
         LogicalInstr::BoolAnd { dst: 5, a: 3, b: 4 },
     ];
-    let RegisterRoles { bit_only, bool_input } = register_roles(&instrs, 5, true);
+    let ProgramFacts {
+        bit_only, bool_input, ..
+    } = analyze(&instrs, &schema, 5, true);
     // The same program must also be a legal filter.
     filter_prog(&schema, instrs, 6, 5, vec![]);
     assert_ne!(bool_input & (1 << 0), 0, "cond is read as a bool_input");
@@ -1661,7 +1663,7 @@ fn test_validate_rejects_wide_column_register_load() {
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
             type_code: type_code::U128,
-            want: ColKind::FixedInt,
+            want: ColKind::FIXED_INT,
         })
     );
 }
@@ -1680,7 +1682,7 @@ fn test_validate_load_col_int_requires_fixed_int() {
             Err(ExprValidateErr::ColKindMismatch {
                 col: 1,
                 type_code: tc,
-                want: ColKind::FixedInt,
+                want: ColKind::FIXED_INT,
             }),
             "LOAD_COL_INT must reject type code {tc}"
         );
@@ -1719,7 +1721,7 @@ fn test_validate_load_col_float_requires_float() {
             Err(ExprValidateErr::ColKindMismatch {
                 col: 1,
                 type_code: tc,
-                want: ColKind::Float,
+                want: ColKind::FLOAT,
             }),
             "LOAD_COL_FLOAT must reject type code {tc}"
         );
@@ -1744,7 +1746,7 @@ fn test_validate_str_opcodes_require_german_string() {
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
             type_code: type_code::U64,
-            want: ColKind::GermanString,
+            want: ColKind::GERMAN_STRING,
         })
     );
     assert_eq!(vs_const(type_code::STRING), Ok(0));
@@ -1761,7 +1763,7 @@ fn test_validate_str_opcodes_require_german_string() {
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
             type_code: type_code::U64,
-            want: ColKind::GermanString,
+            want: ColKind::GERMAN_STRING,
         })
     );
     assert_eq!(
@@ -1769,7 +1771,7 @@ fn test_validate_str_opcodes_require_german_string() {
         Err(ExprValidateErr::ColKindMismatch {
             col: 2,
             type_code: type_code::U64,
-            want: ColKind::GermanString,
+            want: ColKind::GERMAN_STRING,
         })
     );
     assert_eq!(vs_col(type_code::STRING, type_code::BLOB), Ok(0));
@@ -1850,8 +1852,9 @@ fn test_validate_emit_slot_must_be_eight_bytes() {
     // out: [U64 PK, <slot>] — one payload slot, written by the single EMIT.
     let case = |tc: u8| {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
+        // LOAD_CONST (3) into reg 0 — EMIT's source must have a writer — then
         // EMIT (32) src=0 out=0.
-        LogicalProgram::from_wire(&[32, 0, 0, 0], 1, 0, vec![])
+        LogicalProgram::from_wire(&[3, 0, 0, 0, 32, 0, 0, 0], 1, 0, vec![])
             .unwrap()
             .validate(Some(&schema), Some(&schema))
     };
@@ -2111,7 +2114,9 @@ fn test_int_in_set_validate_rejects_out_of_range_set_idx() {
 fn classifier_pure_conjunction_filter() {
     let schema = schema_pk_ints(2, true);
     let instrs = conjunction_over_two_cols();
-    let RegisterRoles { bit_only, bool_input } = register_roles(&instrs, 5, true);
+    let ProgramFacts {
+        bit_only, bool_input, ..
+    } = analyze(&instrs, &schema, 5, true);
     // The same program must also be a legal filter.
     filter_prog(&schema, instrs, 6, 5, vec![]);
     // Bool producers: r2 (CMP_GT), r4 (CMP_GT), r5 (BOOL_AND).
@@ -2277,10 +2282,7 @@ fn a_null_test_alone_keeps_no_nulls_but_a_load_of_the_column_does_not() {
         scalar_prog(&schema, instrs, num_regs, result, vec![]).prog.no_nulls
     };
 
-    for instr in [
-        LogicalInstr::IsNull { dst: 0, col: 1 },
-        LogicalInstr::IsNotNull { dst: 0, col: 1 },
-    ] {
+    for instr in [is_null_op(0, 1), is_not_null_op(0, 1)] {
         assert!(
             no_nulls(vec![instr], 1, 0),
             "a null test over a nullable column is definite"
@@ -2291,10 +2293,7 @@ fn a_null_test_alone_keeps_no_nulls_but_a_load_of_the_column_does_not() {
     // NULL into a register, so the program belongs on the nullable arm.
     assert!(
         !no_nulls(
-            vec![
-                LogicalInstr::IsNull { dst: 0, col: 1 },
-                LogicalInstr::LoadColInt { dst: 1, col: 1 },
-            ],
+            vec![is_null_op(0, 1), LogicalInstr::LoadColInt { dst: 1, col: 1 },],
             2,
             0
         ),
@@ -2504,15 +2503,14 @@ fn operand_class_is_enforced_in_both_directions() {
     );
 }
 
-/// Reading a string register *before* its writer is the case that matters: a
-/// stale lane would resolve against a refilled arena and hand back another row's
-/// bytes. It is caught by the same clear bit, which only works because the mask
-/// is maintained in program order by the walk that checks it.
+/// Reading a register *before* its writer is refused outright: a stale lane
+/// holds whatever the previous morsel left, and for a string lane that resolves
+/// against a refilled arena and hands back another row's bytes.
 #[test]
 fn string_operand_read_before_its_writer_is_refused() {
     // UPPER of reg 1 at instruction 0; reg 1's only writer is instruction 1.
     let code = [EXPR_STR_UPPER, 0, 1, 0, EXPR_LOAD_COL_STR, 1, 1, 0];
-    assert_eq!(from_wire(&code, 2), Err(ExprValidateErr::RegClassMismatch { reg: 1 }));
+    assert_eq!(from_wire(&code, 2), Err(ExprValidateErr::RegReadBeforeWrite { reg: 1 }));
     // The same two instructions in the other order are legal, so the rejection
     // above is about ordering and not about the instructions themselves.
     let ordered = [EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_STR_UPPER, 1, 0, 0];
@@ -2643,7 +2641,7 @@ fn load_col_str_requires_a_german_string_column() {
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
             type_code: type_code::I64,
-            want: ColKind::GermanString,
+            want: ColKind::GERMAN_STRING,
         })
     );
 }

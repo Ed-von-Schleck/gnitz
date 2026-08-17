@@ -7,27 +7,15 @@
 
 use crate::RowSource;
 
-/// The dense payload-slot byte that means "this column has no payload slot" —
-/// it is a PK column. `u8::MAX`, not 0, so it is unambiguous against a real
-/// payload index of 0, and out of range for every schema, so addressing a
-/// column with it trips a bounds check rather than reading slot 0.
-///
-/// Stored by the engine schema's `payload_mapping[ci]` table. It is never
-/// handed on as a *value*: reads go through
-/// [`SchemaFacts::payload_slot`](crate::SchemaFacts::payload_slot), which is
-/// `Option`-shaped.
-pub const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
-
 /// Where a logical column's value physically lives in a row, resolved once from
 /// the schema. The only sanctioned way to read a column whose index is not
 /// statically known to be a payload column: it cannot silently treat a PK
-/// column as payload (the corruption `payload_idx`'s sentinel return invited).
+/// column as payload.
 /// A 4-byte `Copy` value (three `u8` fields + a 1-byte tag). The coordinates
-/// match the schema's own widths — a PK byte offset is `u8` (PK stride ≤
-/// `MAX_PK_BYTES` = 80), payload slots are `u8` (< `MAX_COLUMNS` = 65, so ≤ 63
-/// with at least one PK column), and every fixed-width column is ≤ 16 bytes —
-/// so `locate` stores them without widening and a `Vec<ColumnLocator>`
-/// (group-key / emit columns) stays dense.
+/// match the schema's own widths — a PK byte offset and a payload slot both fit
+/// a `u8`, and every fixed-width column is ≤ 16 bytes — so `locate` stores them
+/// without widening and a `Vec<ColumnLocator>` (group-key / emit columns) stays
+/// dense. The two width claims are enforced below rather than asserted here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColumnLocator {
     /// PK column: value is OPK-at-rest in the PK region at `byte_off`, width
@@ -41,6 +29,17 @@ pub enum ColumnLocator {
 const _: () = assert!(
     std::mem::size_of::<ColumnLocator>() <= 8,
     "ColumnLocator must stay packed; a usize coordinate would balloon it to 24 bytes",
+);
+// The `u8` coordinates above only address the whole schema while these hold.
+// `MAX_PK_BYTES` is derived (`MAX_PK_COLUMNS * 16`), so it can move without
+// anyone editing this file.
+const _: () = assert!(
+    gnitz_wire::MAX_PK_BYTES <= u8::MAX as usize,
+    "ColumnLocator::Pk::byte_off is u8; the PK region no longer fits it",
+);
+const _: () = assert!(
+    gnitz_wire::MAX_COLUMNS <= u8::MAX as usize,
+    "ColumnLocator::Payload::slot is u8; the payload slot space no longer fits it",
 );
 
 impl ColumnLocator {

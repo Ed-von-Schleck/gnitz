@@ -24,7 +24,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
 use gnitz_core::protocol::types::type_code_from_u64;
-use gnitz_core::{CircuitBuilder, ExprBuilder, GnitzClient};
+use gnitz_core::{CircuitBuilder, CmpOp, ExprBuilder, GnitzClient};
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 
@@ -959,32 +959,32 @@ pub unsafe extern "C" fn gnitz_expr_sub(b: *mut GnitzExprBuilder, a: u32, r: u32
 
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_expr_cmp_eq(b: *mut GnitzExprBuilder, a: u32, r: u32) -> u32 {
-    check_ptr_mut!(b, u32::MAX).0.cmp_eq(a, r)
+    check_ptr_mut!(b, u32::MAX).0.cmp(CmpOp::Eq, a, r)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_expr_cmp_ne(b: *mut GnitzExprBuilder, a: u32, r: u32) -> u32 {
-    check_ptr_mut!(b, u32::MAX).0.cmp_ne(a, r)
+    check_ptr_mut!(b, u32::MAX).0.cmp(CmpOp::Ne, a, r)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_expr_cmp_gt(b: *mut GnitzExprBuilder, a: u32, r: u32) -> u32 {
-    check_ptr_mut!(b, u32::MAX).0.cmp_gt(a, r)
+    check_ptr_mut!(b, u32::MAX).0.cmp(CmpOp::Gt, a, r)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_expr_cmp_ge(b: *mut GnitzExprBuilder, a: u32, r: u32) -> u32 {
-    check_ptr_mut!(b, u32::MAX).0.cmp_ge(a, r)
+    check_ptr_mut!(b, u32::MAX).0.cmp(CmpOp::Ge, a, r)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_expr_cmp_lt(b: *mut GnitzExprBuilder, a: u32, r: u32) -> u32 {
-    check_ptr_mut!(b, u32::MAX).0.cmp_lt(a, r)
+    check_ptr_mut!(b, u32::MAX).0.cmp(CmpOp::Lt, a, r)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_expr_cmp_le(b: *mut GnitzExprBuilder, a: u32, r: u32) -> u32 {
-    check_ptr_mut!(b, u32::MAX).0.cmp_le(a, r)
+    check_ptr_mut!(b, u32::MAX).0.cmp(CmpOp::Le, a, r)
 }
 
 #[no_mangle]
@@ -1004,12 +1004,16 @@ pub unsafe extern "C" fn gnitz_expr_bool_not(b: *mut GnitzExprBuilder, a: u32) -
 
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_expr_is_null(b: *mut GnitzExprBuilder, col_idx: u32) -> u32 {
-    check_ptr_mut!(b, u32::MAX).0.is_null(col_idx as usize)
+    check_ptr_mut!(b, u32::MAX)
+        .0
+        .is_null(col_idx as usize, /* invert = */ false)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_expr_is_not_null(b: *mut GnitzExprBuilder, col_idx: u32) -> u32 {
-    check_ptr_mut!(b, u32::MAX).0.is_not_null(col_idx as usize)
+    check_ptr_mut!(b, u32::MAX)
+        .0
+        .is_null(col_idx as usize, /* invert = */ true)
 }
 
 /// Consume the builder and return a compiled ExprProgram.

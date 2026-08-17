@@ -11,8 +11,8 @@ use gnitz_wire::type_code;
 
 use crate::batch::MORSEL;
 use crate::test_support::{
-    both_arms, filter_prog, make_int_row, make_int_view, make_n_col_view, map_prog, passing_ranges, passing_rows,
-    push_payload_cols, scalar_prog, schema_pk_ints, set_row_pk, TestSchema, TestView,
+    both_arms, filter_prog, is_not_null_op, is_null_op, make_int_row, make_int_view, make_n_col_view, map_prog,
+    passing_ranges, passing_rows, push_payload_cols, scalar_prog, schema_pk_ints, set_row_pk, TestSchema, TestView,
 };
 use crate::{CmpOp, Evaluator, LogicalInstr, StrOp};
 
@@ -208,19 +208,19 @@ fn golden_is_null_and_is_not_null_single_row() {
 
     // Null row: IS NULL → true, IS NOT NULL → false.
     let mb = make_int_row(&schema, &[0], 1);
-    let instrs_is_null = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
+    let instrs_is_null = vec![is_null_op(0, 1)];
     let kind = filter_prog(&schema, instrs_is_null, 1, 0, vec![]);
     assert!(passes(&kind, &mb, 0));
-    let instrs_is_not_null = vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }];
+    let instrs_is_not_null = vec![is_not_null_op(0, 1)];
     let kind = filter_prog(&schema, instrs_is_not_null, 1, 0, vec![]);
     assert!(!passes(&kind, &mb, 0));
 
     // Non-null row: opposite.
     let mb = make_int_row(&schema, &[7], 0);
-    let instrs_is_null = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
+    let instrs_is_null = vec![is_null_op(0, 1)];
     let kind = filter_prog(&schema, instrs_is_null, 1, 0, vec![]);
     assert!(!passes(&kind, &mb, 0));
-    let instrs_is_not_null = vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }];
+    let instrs_is_not_null = vec![is_not_null_op(0, 1)];
     let kind = filter_prog(&schema, instrs_is_not_null, 1, 0, vec![]);
     assert!(passes(&kind, &mb, 0));
 }
@@ -437,8 +437,8 @@ fn is_not_null_and_over_partial_word() {
 
     // WHERE col1 IS NOT NULL AND col2 IS NOT NULL
     let instrs = vec![
-        LogicalInstr::IsNotNull { dst: 0, col: 1 },
-        LogicalInstr::IsNotNull { dst: 1, col: 2 },
+        is_not_null_op(0, 1),
+        is_not_null_op(1, 2),
         LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
     ];
     let kind = filter_prog(&schema, instrs, 3, 2, vec![]);
@@ -533,14 +533,14 @@ const ARM_SWEEP_NULLS: [NullArrangement; 4] = [
 /// Against `schema_pk_ints(3, true)`.
 fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
     vec![
-        ("is_null", (vec![LogicalInstr::IsNull { dst: 0, col: 1 }], 1, 0)),
-        ("is_not_null", (vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }], 1, 0)),
+        ("is_null", (vec![is_null_op(0, 1)], 1, 0)),
+        ("is_not_null", (vec![is_not_null_op(0, 1)], 1, 0)),
         (
             "and",
             (
                 vec![
-                    LogicalInstr::IsNull { dst: 0, col: 1 },
-                    LogicalInstr::IsNotNull { dst: 1, col: 2 },
+                    is_null_op(0, 1),
+                    is_not_null_op(1, 2),
                     LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
                 ],
                 3,
@@ -551,8 +551,8 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
             "or",
             (
                 vec![
-                    LogicalInstr::IsNull { dst: 0, col: 1 },
-                    LogicalInstr::IsNull { dst: 1, col: 2 },
+                    is_null_op(0, 1),
+                    is_null_op(1, 2),
                     LogicalInstr::BoolOr { dst: 2, a: 0, b: 1 },
                 ],
                 3,
@@ -561,14 +561,7 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
         ),
         (
             "not",
-            (
-                vec![
-                    LogicalInstr::IsNull { dst: 0, col: 1 },
-                    LogicalInstr::BoolNot { dst: 1, a: 0 },
-                ],
-                2,
-                1,
-            ),
+            (vec![is_null_op(0, 1), LogicalInstr::BoolNot { dst: 1, a: 0 }], 2, 1),
         ),
         // Three conjuncts: the deepest chain in the set, so the accumulator
         // spine is two ANDs long and a null test feeds another AND rather than
@@ -577,10 +570,10 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
             "and_chain",
             (
                 vec![
-                    LogicalInstr::IsNull { dst: 0, col: 1 },
-                    LogicalInstr::IsNull { dst: 1, col: 2 },
+                    is_null_op(0, 1),
+                    is_null_op(1, 2),
                     LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
-                    LogicalInstr::IsNull { dst: 3, col: 3 },
+                    is_null_op(3, 3),
                     LogicalInstr::BoolAnd { dst: 4, a: 2, b: 3 },
                 ],
                 5,
@@ -594,7 +587,7 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
             "case_cond",
             (
                 vec![
-                    LogicalInstr::IsNull { dst: 0, col: 1 },
+                    is_null_op(0, 1),
                     LogicalInstr::LoadConst { dst: 1, val: 1 },
                     LogicalInstr::LoadConst { dst: 2, val: 0 },
                     LogicalInstr::Select {
@@ -653,10 +646,7 @@ fn is_null_arms_agree() {
 fn is_null_map_arms_agree() {
     let in_schema = schema_pk_ints(1, true);
     let out_schema = schema_pk_ints(1, false);
-    let instrs = vec![
-        LogicalInstr::IsNull { dst: 0, col: 1 },
-        LogicalInstr::Emit { src: 0, out: 0 },
-    ];
+    let instrs = vec![is_null_op(0, 1), LogicalInstr::Emit { src: 0, out: 0 }];
     let (fast, nullable) = both_arms("map", || {
         map_prog(&in_schema, &out_schema, instrs.clone(), 1, 0, vec![])
     });
@@ -1001,8 +991,8 @@ fn is_null_and_is_not_null_are_complementary() {
     let n = 300;
     let mb = make_n_col_view(&schema, n, |row, _| row as i64, |row, _| null_row(row));
     let run = |instr| passing_rows(&filter_prog(&schema, vec![instr], 1, 0, vec![]), &mb, n);
-    let is_null = run(LogicalInstr::IsNull { dst: 0, col: 1 });
-    let is_not_null = run(LogicalInstr::IsNotNull { dst: 0, col: 1 });
+    let is_null = run(is_null_op(0, 1));
+    let is_not_null = run(is_not_null_op(0, 1));
     for row in 0..n {
         assert_eq!(is_null[row], null_row(row), "row {row}: IS NULL");
         assert_ne!(is_null[row], is_not_null[row], "row {row}: not complementary");
@@ -1418,7 +1408,7 @@ fn filter_kernel_bench() {
 /// still resolves `no_nulls`. `n_cmp` sets the chain depth, which is what scales
 /// the per-conjunct cost the arms are being compared on.
 fn is_null_chain(k: i64, n_cmp: u16) -> FilterShape {
-    let mut instrs = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
+    let mut instrs = vec![is_null_op(0, 1)];
     if n_cmp == 0 {
         // No compare, so no constant to load — an unread `LoadConst` would still
         // cost a register write per morsel and blunt the bare shape's figure.
@@ -1561,10 +1551,7 @@ fn is_null_arm_bench() {
 
     // The map drive, which leaves through EMIT's register rather than a bitmap.
     let out_schema = schema_pk_ints(1, false);
-    let map_instrs = vec![
-        LogicalInstr::IsNull { dst: 0, col: 1 },
-        LogicalInstr::Emit { src: 0, out: 0 },
-    ];
+    let map_instrs = vec![is_null_op(0, 1), LogicalInstr::Emit { src: 0, out: 0 }];
     let (fast, nullable) = both_arms("map", || {
         map_prog(&schema, &out_schema, map_instrs.clone(), 1, 0, vec![])
     });
