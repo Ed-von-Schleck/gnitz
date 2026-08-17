@@ -1277,7 +1277,10 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
 
     // ---------- User-table INSERT ----------
     if target_id >= FIRST_USER_TABLE_ID && has_batch && batch_count > 0 {
-        let mode = ipc::wire_flags_get_conflict_mode(flags);
+        let Some(mode) = ipc::wire_flags_get_conflict_mode(flags) else {
+            send_error(peer, target_id, client_id, b"push: unknown conflict mode").await;
+            return;
+        };
         let batch = decoded.data_batch.unwrap();
 
         let _cat = shared.catalog_rwlock.read().await;
@@ -1492,11 +1495,9 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         if batch.count == 0 {
             return Err(format!("TXN: empty batch for table {tid}"));
         }
-        families.push(TxnFamily {
-            tid,
-            mode: ipc::WireConflictMode::from_u8(fam.mode),
-            batch,
-        });
+        let mode = ipc::WireConflictMode::from_u8(fam.mode)
+            .ok_or_else(|| format!("TXN family {tid}: unknown conflict mode {}", fam.mode))?;
+        families.push(TxnFamily { tid, mode, batch });
     }
     // Capture the family tids BEFORE `families` is moved into the commit request,
     // for the precondition-membership check and the post-commit map bump.

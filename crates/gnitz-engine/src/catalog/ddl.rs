@@ -1,6 +1,8 @@
 use super::*;
 use crate::schema::key::PkBuf;
 use crate::schema::make_index_schema;
+#[cfg(test)]
+use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
 
 impl CatalogEngine {
     /// Locally retract an index registration whose +1 was applied but never
@@ -36,9 +38,14 @@ impl CatalogEngine {
         // Write schema record
         let schema = SysFamily::Schema.schema();
         let mut bb = BatchBuilder::new(schema);
-        bb.begin_row(sid as u128, 1);
-        bb.put_string(name);
-        bb.end_row();
+        write_schema_tab_row(
+            &mut bb,
+            &SchemaTabRow {
+                schema_id: sid as u64,
+                name,
+            },
+            1,
+        );
         let batch = bb.finish();
 
         // Submit the schemas-family delta (triggers hook).
@@ -73,9 +80,14 @@ impl CatalogEngine {
         //    delta exactly as before.
         let schema = SysFamily::Schema.schema();
         let mut bb = BatchBuilder::new(schema);
-        bb.begin_row(sid as u128, -1);
-        bb.put_string(name);
-        bb.end_row();
+        write_schema_tab_row(
+            &mut bb,
+            &SchemaTabRow {
+                schema_id: sid as u64,
+                name,
+            },
+            -1,
+        );
         let batch = bb.finish();
 
         self.submit(SysFamily::Schema, batch)?;

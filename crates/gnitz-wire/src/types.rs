@@ -141,7 +141,7 @@ impl TypeCode {
     /// (un-gated). The SQL layer reads this when deciding which conjuncts it may
     /// strip; it then ships the verdict as the `exact` bit on the bound.
     pub const fn is_wide_int(&self) -> bool {
-        matches!(self, TypeCode::U128 | TypeCode::UUID | TypeCode::I128)
+        is_wide_int(*self as u8)
     }
 
     /// Whether this type uses the 16-byte "German string" layout (a 4-byte
@@ -287,7 +287,7 @@ pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
 /// Whether a raw wire type code may be a PRIMARY KEY column. u8-based
 /// counterpart to [`TypeCode::is_pk_eligible`] for callers holding a raw
 /// `type_code` (mirrors the free `wire_stride`). Unknown codes are ineligible.
-#[inline]
+#[inline(always)]
 pub const fn is_pk_eligible(tc: u8) -> bool {
     match TypeCode::try_from_u8(tc) {
         Some(t) => t.is_pk_eligible(),
@@ -465,16 +465,23 @@ pub fn validate_pk_tuple(pk_cols: &[u32], ncols: usize, col: impl Fn(u32) -> (u8
 /// counterpart to [`TypeCode::is_german_string`] for callers holding a raw
 /// `type_code` (mirrors the free `wire_stride`/`is_pk_eligible`). Unknown codes
 /// are not german strings.
-#[inline]
+#[inline(always)]
 pub const fn is_german_string(tc: u8) -> bool {
     tc == type_code::STRING || tc == type_code::BLOB
 }
 
 /// True iff `tc` is one of the two IEEE-754 column types. The `u8` counterpart
 /// of [`TypeCode::is_float`], for the raw-type-code paths.
-#[inline]
+#[inline(always)]
 pub const fn is_float(tc: u8) -> bool {
     matches!(tc, type_code::F32 | type_code::F64)
+}
+
+/// True iff `tc` is a 16-byte integer type (U128/UUID/I128). The `u8`
+/// counterpart of [`TypeCode::is_wide_int`], for the raw-type-code paths.
+#[inline(always)]
+pub const fn is_wide_int(tc: u8) -> bool {
+    matches!(tc, type_code::U128 | type_code::UUID | type_code::I128)
 }
 
 /// True iff `tc` decodes to a known [`TypeCode`]. The one predicate every
@@ -482,7 +489,7 @@ pub const fn is_float(tc: u8) -> bool {
 /// asks: an unknown code is not inert — [`wire_stride`] reports 8 for it (so a
 /// width test passes it through) and [`TypeCode::from_validated_u8`] panics on
 /// it at every downstream consumer.
-#[inline]
+#[inline(always)]
 pub const fn is_valid_type_code(tc: u8) -> bool {
     TypeCode::try_from_u8(tc).is_some()
 }
@@ -534,6 +541,7 @@ pub fn is_widening_promotion(src: u8, target: u8) -> bool {
 /// (I8/I16/I32/I64/I128). The order-preserving encoders/comparators flip the
 /// sign bit for these so two's-complement negatives sort below non-negatives.
 /// Unsigned, float, string, and unknown codes are not signed.
+#[inline(always)]
 pub const fn is_signed_int(tc: u8) -> bool {
     matches!(
         tc,
@@ -788,11 +796,27 @@ pub const fn wire_stride(tc: u8) -> usize {
 const _: () = {
     let mut v: u16 = 0; // u16 so `v += 1` cannot overflow at 255
     while v <= 255 {
+        // `ALL` is the one enumeration of the type table — the Python `TypeCode`
+        // IntEnum is built from it — so it must agree with `try_from_u8` on
+        // membership in *both* directions. A code `try_from_u8` accepts but
+        // `ALL` omits is invisible to a client-side list of names.
+        let mut in_all = false;
+        let mut k = 0;
+        while k < TypeCode::ALL.len() {
+            if TypeCode::ALL[k] as u8 == v as u8 {
+                assert!(!in_all, "duplicate code in TypeCode::ALL");
+                in_all = true;
+            }
+            k += 1;
+        }
         if let Some(t) = TypeCode::try_from_u8(v as u8) {
             assert!(
                 t as u8 == v as u8,
                 "TypeCode discriminant must round-trip through try_from_u8"
             );
+            assert!(in_all, "try_from_u8 accepts a code TypeCode::ALL omits");
+        } else {
+            assert!(!in_all, "TypeCode::ALL carries a code try_from_u8 rejects");
         }
         // `is_fixed_int` is the domain of `read_{signed,unsigned}_exact` AND the
         // admission test for the engine's fixed-int fast-path row comparator,
@@ -884,29 +908,10 @@ mod tests {
         assert_eq!(reached, 10, "the reachable source→index pair set changed");
     }
 
-    /// `TypeCode::ALL` is the one enumeration of the wire type table — the
-    /// Python `TypeCode` IntEnum is built from it — so the table is pinned in
-    /// the crate that owns it rather than re-typed by each client. Swept over
-    /// the whole `u8` domain: `ALL` and `try_from_u8` must agree on membership
-    /// in *both* directions, which also catches a code `try_from_u8` accepts
-    /// but `ALL` omits — invisible to a client-side list of names.
+    /// Membership, discriminant round-trip and duplicate codes are pinned by the
+    /// const sweep above; only the names need a runtime string compare.
     #[test]
-    fn type_code_all_is_closed_over_the_wire_domain() {
-        for raw in 0u8..=u8::MAX {
-            let in_all = TypeCode::ALL.iter().any(|&tc| tc as u8 == raw);
-            assert_eq!(
-                TypeCode::try_from_u8(raw).is_some(),
-                in_all,
-                "code {raw}: try_from_u8 and ALL disagree on membership",
-            );
-        }
-        for &tc in &TypeCode::ALL {
-            assert_eq!(TypeCode::try_from_u8(tc as u8), Some(tc));
-        }
-        let mut codes: Vec<u8> = TypeCode::ALL.iter().map(|&tc| tc as u8).collect();
-        codes.sort_unstable();
-        codes.dedup();
-        assert_eq!(codes.len(), TypeCode::ALL.len(), "duplicate code in ALL");
+    fn type_code_wire_names_are_distinct() {
         let mut names: Vec<&str> = TypeCode::ALL.iter().map(|&tc| tc.wire_name()).collect();
         names.sort_unstable();
         names.dedup();

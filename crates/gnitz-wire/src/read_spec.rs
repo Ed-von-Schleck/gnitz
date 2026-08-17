@@ -213,14 +213,10 @@ fn read_range_descriptor(r: &mut Reader) -> Result<RangeDescriptor, String> {
 }
 
 impl ReadSpec {
-    /// Serialise to a version-prefixed LE byte sequence (§ layout below).
-    pub fn encode(&self) -> Vec<u8> {
-        Self::encode_parts(&self.bound, &self.predicate, &self.sink)
-    }
-
-    /// [`Self::encode`] over borrowed parts — the form a caller that re-sends one
-    /// spec under several bounds uses, so the predicate and sink are encoded in
-    /// place instead of cloned per request.
+    /// Serialise to a version-prefixed LE byte sequence (§ layout below), from
+    /// borrowed parts: the planner holds the bound, predicate and sink
+    /// separately and re-sends one spec under several bounds, so nothing is
+    /// cloned per request.
     pub fn encode_parts(bound: &ReadBound, predicate: &[u8], sink: &ReadSink) -> Vec<u8> {
         // Header: version | bound_kind | sink_tag | reserved. One up-front
         // reservation covering every section (64 covers the fixed header,
@@ -419,6 +415,12 @@ mod tests {
     use super::*;
     use crate::range::Cut::{After, Before};
 
+    /// Encode through the production entry point; the struct is a decode-side
+    /// shape, so nothing but tests ever holds one to re-encode.
+    fn enc(spec: &ReadSpec) -> Vec<u8> {
+        ReadSpec::encode_parts(&spec.bound, &spec.predicate, &spec.sink)
+    }
+
     fn sample_order() -> Vec<OrderKey> {
         vec![
             OrderKey {
@@ -494,7 +496,7 @@ mod tests {
             },
         ];
         for spec in specs {
-            let bytes = spec.encode();
+            let bytes = enc(&spec);
             assert!(bytes.len() <= MAX_READ_SPEC_BYTES);
             assert_eq!(ReadSpec::decode(&bytes), Ok(spec.clone()), "{spec:?}");
         }
@@ -510,7 +512,7 @@ mod tests {
             predicate: vec![],
             sink: ReadSink::all_rows(),
         };
-        let bytes = spec.encode();
+        let bytes = enc(&spec);
         assert_eq!(ReadSpec::decode(&bytes), Ok(spec));
     }
 
@@ -524,21 +526,21 @@ mod tests {
 
     #[test]
     fn decode_rejects_bad_version() {
-        let mut bytes = empty_spec().encode();
+        let mut bytes = enc(&empty_spec());
         bytes[0] = 99;
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("version"));
     }
 
     #[test]
     fn decode_rejects_unknown_kind() {
-        let mut bytes = empty_spec().encode();
+        let mut bytes = enc(&empty_spec());
         bytes[1] = 9;
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("bound kind"));
     }
 
     #[test]
     fn decode_rejects_unknown_sink_tag() {
-        let mut bytes = empty_spec().encode();
+        let mut bytes = enc(&empty_spec());
         bytes[2] = 9;
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("sink tag"));
     }
@@ -547,7 +549,7 @@ mod tests {
     fn decode_rejects_order_key_over_cap() {
         // Layout of the empty Rows spec: 4-byte header | u32 predicate len |
         // n_order at offset 8.
-        let mut bytes = empty_spec().encode();
+        let mut bytes = enc(&empty_spec());
         bytes[8] = (MAX_ORDER_KEYS + 1) as u8;
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("order keys exceeds cap"));
     }
@@ -570,24 +572,23 @@ mod tests {
             predicate: vec![],
             sink: ReadSink::all_rows(),
         };
-        assert_eq!(ReadSpec::decode(&spec.encode()).unwrap(), spec);
+        assert_eq!(ReadSpec::decode(&enc(&spec)).unwrap(), spec);
     }
 
     #[test]
     fn decode_rejects_trailing_bytes() {
-        let mut bytes = empty_spec().encode();
+        let mut bytes = enc(&empty_spec());
         bytes.push(0);
         assert!(ReadSpec::decode(&bytes).unwrap_err().contains("trailing"));
     }
 
     #[test]
     fn decode_rejects_truncation() {
-        let bytes = ReadSpec {
+        let bytes = enc(&ReadSpec {
             bound: ReadBound::PkSet(vec![1, 2, 3]),
             predicate: vec![],
             sink: ReadSink::all_rows(),
-        }
-        .encode();
+        });
         // Chop the last key's bytes off.
         assert!(ReadSpec::decode(&bytes[..bytes.len() - 4]).is_err());
     }
@@ -670,7 +671,7 @@ mod tests {
             },
         ];
         for spec in specs {
-            let bytes = spec.encode();
+            let bytes = enc(&spec);
             assert!(bytes.len() <= MAX_READ_SPEC_BYTES);
             assert_eq!(ReadSpec::decode(&bytes), Ok(spec.clone()), "{spec:?}");
         }

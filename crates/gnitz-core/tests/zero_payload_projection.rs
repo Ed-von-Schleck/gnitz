@@ -105,12 +105,7 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
     assert_eq!(reply_schema.num_payload_cols(), 0, "the reply is nothing but the key");
     assert_eq!(reply_schema.pk_stride(), schema.pk_stride());
 
-    let spec = ReadSpec {
-        bound: ReadBound::None,
-        predicate: gt_predicate(1, 150),
-        sink: keys_only_sink(),
-    }
-    .encode();
+    let spec = ReadSpec::encode_parts(&ReadBound::None, &gt_predicate(1, 150), &keys_only_sink());
     let reply = client
         .scan_spec(tid, &spec, &reply_schema)
         .expect("a PK-only reply must not be rejected")
@@ -163,12 +158,8 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     assert_eq!(reply_schema.pk_stride(), schema.pk_stride());
     assert_eq!(reply_schema.num_payload_cols(), 0);
 
-    let spec = ReadSpec {
-        bound: ReadBound::None,
-        predicate: gt_predicate(2, 15), // c2 > 15 → every row but the first
-        sink: keys_only_sink(),
-    }
-    .encode();
+    // c2 > 15 → every row but the first
+    let spec = ReadSpec::encode_parts(&ReadBound::None, &gt_predicate(2, 15), &keys_only_sink());
     let reply = client
         .scan_spec(tid, &spec, &reply_schema)
         .expect("a compound PK-only reply must not be rejected")
@@ -196,12 +187,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     let full = client
         .scan_spec(
             tid,
-            &ReadSpec {
-                bound: ReadBound::None,
-                predicate: Vec::new(),
-                sink: ReadSink::all_rows(),
-            }
-            .encode(),
+            &ReadSpec::encode_parts(&ReadBound::None, &Vec::new(), &ReadSink::all_rows()),
             &schema,
         )
         .unwrap()

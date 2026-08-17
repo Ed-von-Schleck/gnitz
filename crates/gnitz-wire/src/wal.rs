@@ -69,7 +69,7 @@ pub const WAL_OFF_VERSION: usize = 12;
 pub const WAL_OFF_CHECKSUM: usize = 16;
 pub const WAL_OFF_NUM_REGIONS: usize = 24;
 
-pub const IPC_CONTROL_TID: u32 = 0xFFFF_FFFF;
+pub(crate) const IPC_CONTROL_TID: u32 = 0xFFFF_FFFF;
 
 /// Maximum region count a block directory may name, including the trailing blob
 /// region. A legitimate schema has ≤ 65 columns (1 PK), so ≤ 68 regions
@@ -130,10 +130,10 @@ pub fn write_header_and_directory(
     let mut positions = [0usize; MAX_WIRE_REGIONS];
     let mut pos = WAL_HEADER_SIZE + num_regions * 8;
     for (i, &sz) in region_sizes.iter().enumerate() {
+        // At most 7 bytes by construction, so this stays a handful of stores
+        // rather than a `memset` call per region.
         let aligned = align8(pos);
-        // At most 7 bytes: bounding the count keeps this a handful of stores
-        // instead of a `memset` call per region.
-        for b in block[pos..aligned].iter_mut().take(7) {
+        for b in block[pos..aligned].iter_mut() {
             *b = 0;
         }
         pos = aligned;
@@ -162,10 +162,8 @@ pub fn stamp_checksum(block: &mut [u8], total_size: usize) {
 /// Read the `(offset, size)` directory entry for region `r`, both relative to
 /// block start. Unchecked — panics on a slice error, so the caller must already
 /// know the block covers its full directory: production decoders reach the
-/// directory through [`validate_and_parse`] (which bounds every entry), and the
-/// remaining callers are the 1-row control-block reader (each region size-guarded
-/// on use) and the malformed-block tests that patch a directory byte. The entry's
-/// position comes from [`dir_entry_offset`]; the size follows the offset.
+/// directory through [`validate_and_parse`], which bounds every entry. The
+/// entry's position comes from [`dir_entry_offset`]; the size follows the offset.
 #[inline]
 pub fn dir_entry(block: &[u8], r: usize) -> (usize, usize) {
     let base = dir_entry_offset(r);

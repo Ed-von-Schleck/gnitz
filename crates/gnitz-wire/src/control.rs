@@ -23,10 +23,11 @@
 //!   other      -- master-allocated, monotonic per request
 
 use crate::catalog::col;
+use crate::wal::IPC_CONTROL_TID;
 use crate::{
     checksum, encode_german_string, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireSysCol,
-    IPC_CONTROL_TID, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION,
-    WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
+    REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION, WAL_HEADER_SIZE,
+    WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
 const CONTROL_COLS: &[WireSysCol] = &[
@@ -54,7 +55,7 @@ const NUM_REGIONS: usize = crate::wal::num_regions(NUM_COLUMNS - 1);
 /// themselves (`REG_PK` / `REG_WEIGHT` / `REG_NULL_BMP`) come straight from
 /// `wal`. A column's null bit is its payload index, i.e. `reg - REG_PAYLOAD_START`.
 const fn reg(name: &str) -> usize {
-    REG_PAYLOAD_START + crate::pay_index_in(CONTROL_COLS, name)
+    crate::payload_region_in(CONTROL_COLS, name)
 }
 
 const REG_STATUS: usize = reg("status");
@@ -135,7 +136,7 @@ const OFF_SEEK_PK_EXTRA: usize = ctrl_region_offset(REG_SEEK_PK_EXTRA);
 
 /// Blob bytes a German string of length `len` spills into the shared blob
 /// region: 0 when it fits the 12-byte inline form, its full length otherwise.
-pub const fn german_spill_len(len: usize) -> usize {
+pub(crate) const fn german_spill_len(len: usize) -> usize {
     if len > SHORT_STRING_THRESHOLD {
         len
     } else {
@@ -200,7 +201,6 @@ const CTRL_BLOCK_TEMPLATE: [u8; CTRL_BLOCK_SIZE_NO_BLOB] = {
 /// The checksum header field is left 0; callers that checksum their frames
 /// (durable WAL writes, TCP responses) stamp it over `[WAL_HEADER_SIZE, n)`
 /// after encoding.
-#[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn encode_ctrl_block(
     out: &mut [u8],
@@ -284,42 +284,20 @@ pub struct DecodedControl {
     pub block_size: usize,
 }
 
-/// The first `width` bytes of directory region `r`, or `Err(err)` if the entry
-/// declares fewer bytes than that or its extent escapes the block. The single
-/// bounds check behind every fixed-width control-block field read — the extent
-/// rule itself is `blob_extent`, shared with the German-string heap.
-#[inline(always)]
-fn region_bytes<'a>(data: &'a [u8], r: usize, width: usize, err: &'static str) -> Result<&'a [u8], &'static str> {
-    let (off, sz) = crate::wal::dir_entry(data, r);
-    if sz < width {
-        return Err(err);
-    }
-    match crate::blob_extent(data.len(), off as u64, width) {
-        Some(extent) => Ok(&data[extent]),
-        None => Err(err),
-    }
-}
+/// The directory prefix a canonical control block shares byte-for-byte with
+/// [`CTRL_BLOCK_TEMPLATE`]: every fixed region's offset and size, plus the blob
+/// region's offset. Only the blob region's *size* varies, which is why the
+/// compared span stops just after the blob entry's offset field.
+const DIR_FIXED_END: usize = crate::wal::dir_entry_offset(REG_BLOB) + 4;
 
-/// Bounds-checked read of a u64 from a fixed-width u64 region of a 1-row
-/// control block (exactly 8 bytes for 1 row).
-#[inline(always)]
-fn read_u64_region(data: &[u8], r: usize) -> Result<u64, &'static str> {
-    let bytes = region_bytes(data, r, 8, "control block region out of bounds")?;
-    Ok(read_u64_le(bytes, 0))
-}
-
-/// Bounds-checked read of a u128 from a fixed-width u128 region of a 1-row
-/// control block (exactly 16 bytes for 1 row).
-#[inline(always)]
-fn read_u128_region(data: &[u8], r: usize) -> Result<u128, &'static str> {
-    let bytes = region_bytes(data, r, 16, "control block u128 region out of bounds")?;
-    Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
-}
-
-/// Decode all control fields directly from the WAL block's directory without
-/// materializing a batch. Each directory entry stores (data_offset: u32,
-/// data_size: u32) at `WAL_HEADER_SIZE + region * 8`. For a 1-row control
-/// block every u64 region is exactly 8 bytes, so the fields index directly.
+/// Decode all control fields without materializing a batch.
+///
+/// The block's directory is a compile-time constant — `encode_ctrl_block` copies
+/// [`CTRL_BLOCK_TEMPLATE`] and patches only the blob size — so this checks the
+/// directory against that template once and then reads every field at the same
+/// `OFF_*` constant the encoder wrote it at. A directory that disagrees with the
+/// template is rejected rather than followed: honouring one would let a peer
+/// point a scalar field at the blob heap.
 ///
 /// Verifies the block's checksum, like the schema and data blocks beside it —
 /// use this on frames that crossed a durability or trust boundary (SAL replay,
@@ -354,10 +332,18 @@ fn peek_control_block_impl(data: &[u8], verify_checksum: bool) -> Result<Decoded
         return Err("control block wrong region count");
     }
 
+    // The directory is fixed by the format; only the blob size varies. Checking
+    // it against the template is what lets every field below read at its
+    // compile-time offset instead of re-deriving one per field.
+    if data[WAL_HEADER_SIZE..DIR_FIXED_END] != CTRL_BLOCK_TEMPLATE[WAL_HEADER_SIZE..DIR_FIXED_END] {
+        return Err("control block directory is not the canonical layout");
+    }
+
     // `SIZE` frames the rest of the slot and sits outside the block's own
     // checksum, so the exact blob relation is what constrains it.
+    let blob_len = read_u32_le(data, DIR_FIXED_END) as usize;
     let block_size = read_u32_le(data, WAL_OFF_SIZE) as usize;
-    if block_size != CTRL_BLOCK_SIZE_NO_BLOB + crate::wal::dir_entry(data, REG_BLOB).1 {
+    if block_size != CTRL_BLOCK_SIZE_NO_BLOB + blob_len {
         return Err("control block size disagrees with its blob region");
     }
     if block_size > data.len() {
@@ -368,53 +354,39 @@ fn peek_control_block_impl(data: &[u8], verify_checksum: bool) -> Result<Decoded
         return Err("control block checksum mismatch");
     }
 
-    let null_bmp = read_u64_region(data, REG_NULL_BMP)?;
-    let status = read_u64_region(data, REG_STATUS)? as u32;
-    let client_id = read_u64_region(data, REG_CLIENT_ID)?;
-    let target_id = read_u64_region(data, REG_TARGET_ID)?;
-    let flags = read_u64_region(data, REG_FLAGS)?;
-    let seek_pk = read_u128_region(data, REG_SEEK_PK)?;
-    let seek_col_idx = read_u64_region(data, REG_SEEK_COL_IDX)?;
-    let request_id = read_u64_region(data, REG_REQUEST_ID)?;
+    // `block_size <= data.len()` and every fixed region lies within
+    // `CTRL_BLOCK_SIZE_NO_BLOB <= block_size`, so each read below is in bounds.
+    let null_bmp = read_u64_le(data, OFF_NULL_BMP);
+    let status = read_u64_le(data, OFF_STATUS) as u32;
+    let client_id = read_u64_le(data, OFF_CLIENT_ID);
+    let target_id = read_u64_le(data, OFF_TARGET_ID);
+    let flags = read_u64_le(data, OFF_FLAGS);
+    let seek_pk = u128::from_le_bytes(data[OFF_SEEK_PK..OFF_SEEK_PK + 16].try_into().unwrap());
+    let seek_col_idx = read_u64_le(data, OFF_SEEK_COL_IDX);
+    let request_id = read_u64_le(data, OFF_REQUEST_ID);
 
     let error_is_null = (null_bmp & NULL_BIT_ERROR_MSG) != 0;
     let seek_extra_is_null = (null_bmp & NULL_BIT_SEEK_PK_EXTRA) != 0;
 
     // error_msg and seek_pk_extra each own a 16-byte German-string struct in
     // their own fixed region but spill overflow (>12B) into the shared blob
-    // region. Resolve that directory entry once, and only if at least one is
-    // non-null. When both are null (the universal case) skip the lookup
-    // entirely, preserving the hot-path fast case.
-    let blob: &[u8] = if !error_is_null || !seek_extra_is_null {
-        let (blob_off, blob_sz) = crate::wal::dir_entry(data, REG_BLOB);
-        crate::blob_extent(data.len(), blob_off as u64, blob_sz).map_or(&[][..], |extent| &data[extent])
-    } else {
-        &[]
-    };
+    // region, which starts where the no-blob image ends.
+    let blob = &data[CTRL_BLOCK_SIZE_NO_BLOB..block_size];
 
-    let read_german = |region: usize, err: &'static str, oob: &'static str| -> Result<Vec<u8>, &'static str> {
-        let cell: &[u8; 16] = region_bytes(data, region, 16, err)?.try_into().unwrap();
-        try_decode_german_string(cell, blob).ok_or(oob)
+    let read_german = |off: usize, oob: &'static str| -> Result<Vec<u8>, &'static str> {
+        try_decode_german_string(&data[off..off + 16], blob).ok_or(oob)
     };
 
     let error_msg = if error_is_null {
         Vec::new()
     } else {
-        read_german(
-            REG_ERROR_MSG,
-            "error_msg region out of bounds",
-            "error_msg string offset out of bounds",
-        )?
+        read_german(OFF_ERROR_MSG, "error_msg string offset out of bounds")?
     };
 
     let seek_pk_extra = if seek_extra_is_null {
         Vec::new()
     } else {
-        read_german(
-            REG_SEEK_PK_EXTRA,
-            "seek_pk_extra region out of bounds",
-            "seek_pk_extra string offset out of bounds",
-        )?
+        read_german(OFF_SEEK_PK_EXTRA, "seek_pk_extra string offset out of bounds")?
     };
 
     Ok(DecodedControl {
@@ -506,6 +478,36 @@ mod tests {
         assert_eq!(dec.error_msg, err);
         assert_eq!(dec.seek_pk_extra, extra);
         assert_eq!(dec.block_size, n);
+    }
+
+    /// The directory is part of the format, not something a sender gets to
+    /// choose. Re-pointing a scalar field's region at the blob heap — which the
+    /// old per-field extent check honoured, since the extent stayed in-block —
+    /// must be rejected outright.
+    #[test]
+    fn peek_rejects_a_directory_that_disagrees_with_the_template() {
+        let mut buf = vec![0u8; ctrl_block_size(0, 0)];
+        let n = encode_ctrl_block(&mut buf, 0, &probe_header(), b"", b"");
+        buf.truncate(n);
+
+        // Aim `status` at `client_id`'s bytes: a well-formed, in-block extent.
+        let mut forged = buf.clone();
+        crate::write_u32_le(
+            &mut forged,
+            crate::wal::dir_entry_offset(REG_STATUS),
+            OFF_CLIENT_ID as u32,
+        );
+        crate::wal::stamp_checksum(&mut forged, n);
+        assert_eq!(
+            peek_control_block(&forged).err(),
+            Some("control block directory is not the canonical layout")
+        );
+
+        // The blob region's *size* is the one entry a sender legitimately varies.
+        let long = b"an error message well past the twelve-byte inline threshold";
+        let mut ok = vec![0u8; ctrl_block_size(long.len(), 0)];
+        let n = encode_ctrl_block(&mut ok, 0, &probe_header(), long, b"");
+        assert_eq!(peek_control_block_ipc(&ok[..n]).unwrap().error_msg, long);
     }
 
     /// A corrupted long-string blob offset must surface an error, not panic.

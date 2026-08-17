@@ -57,7 +57,7 @@ impl AggShape {
 /// and the output column type it produces. `out_type` is computed once at spec
 /// creation by `push_agg_specs` (the spec-layout authority), so the reduce
 /// schema builder reads it directly instead of reconstructing it from `op`. The
-/// circuit builder consumes only `(op.as_u64(), col)`.
+/// circuit builder consumes only `(op.as_wire(), col)`.
 pub(crate) struct AggSpec {
     pub(crate) op: WireAggFunc,
     pub(crate) col: usize,
@@ -309,7 +309,7 @@ pub(crate) fn emit_reduce(
     };
     // The circuit builder needs only (op, col) per spec; out_type is the
     // planner's concern and already shaped the reduce schema above.
-    let circuit_specs: Vec<(u64, usize)> = agg_specs.iter().map(|s| (s.op.as_u64(), s.col)).collect();
+    let circuit_specs: Vec<(u64, usize)> = agg_specs.iter().map(|s| (s.op.as_wire(), s.col)).collect();
     let all_linear = agg_specs
         .iter()
         .all(|s| matches!(s.op, WireAggFunc::Count | WireAggFunc::Sum | WireAggFunc::CountNonNull));
@@ -349,9 +349,9 @@ pub(crate) fn emit_reduce(
         let mut combine_specs: Vec<(u64, usize)> = agg_specs
             .iter()
             .enumerate()
-            .map(|(i, s)| (s.op.merge_func().as_u64(), 1 + i))
+            .map(|(i, s)| (s.op.merge_func().as_wire(), 1 + i))
             .collect();
-        combine_specs.push((WireAggFunc::Count.as_u64(), 0)); // COUNT-of-partials existence gate
+        combine_specs.push((WireAggFunc::Count.as_wire(), 0)); // COUNT-of-partials existence gate
         cb.reduce_multi(local, &[], &combine_specs, true, ReduceOutKey::SyntheticFold)
     } else if sh.source_replicated {
         // Shard-free: every worker reduces its full local copy to the same global

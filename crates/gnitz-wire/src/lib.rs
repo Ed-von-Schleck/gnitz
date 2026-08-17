@@ -3,17 +3,74 @@
 //! Single source of truth for constants and codecs that both the client
 //! (gnitz-core) and server (gnitz-engine) must agree on.
 //!
-//! The crate is organized into topic modules, but every item is re-exported
+//! The crate is organized into topic modules, and most items are re-exported
 //! flat at the crate root (`gnitz_wire::FOO`) so callers need not track which
-//! module a symbol lives in. `control`, `schema_block`, `sys_rows`, `txn_frame`,
-//! `type_code` and `wal` are the exceptions: they remain named modules because callers
-//! reference their functions by path (`gnitz_wire::wal::encode`) — the generic
-//! names would collide at the crate root. `wal`'s *constants* (`WAL_*`, `MAX_WIRE_REGIONS`,
-//! the `REG_*` region-convention indices) are still flat-exported, since they are
-//! referenced pervasively.
+//! module a symbol lives in. `control`, `schema_block`, `sys_rows`, `txn_frame`
+//! and `wal` stay named modules and are referenced by path
+//! (`gnitz_wire::wal::encode`). Only `wal::encode` and `schema_block::encode`
+//! actually collide at the root; the other three are namespaced for consistency
+//! with them rather than by necessity. `wal`'s *constants* (`WAL_*`,
+//! `MAX_WIRE_REGIONS`, the `REG_*` region-convention indices) are flat-exported,
+//! since they are referenced pervasively.
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
+
+/// Declare a **wire enum**: a closed set of values crossing the wire, with the
+/// total encode and partial decode every such set needs.
+///
+/// `ALL`, `as_wire` and `from_wire` are all generated from the one variant list,
+/// so a decode table cannot disagree with the discriminants it mirrors and a new
+/// variant is covered without a second edit. Hand-written `from_wire` tables
+/// needed a round-trip test to catch that drift; here it cannot happen.
+///
+/// `TypeCode` is deliberately not declared through this macro: it carries extra
+/// per-variant data (`wire_name`) and its 15-arm `try_from_u8` is a jump table
+/// on a hot path, which a linear `ALL` scan would replace with a walk.
+macro_rules! wire_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident: $repr:ident {
+            $($(#[$vmeta:meta])* $variant:ident = $value:expr),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[repr($repr)]
+        $vis enum $name {
+            $($(#[$vmeta])* $variant = $value),+
+        }
+
+        impl $name {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [$name] = &[$($name::$variant),+];
+
+            /// This variant's wire value.
+            #[inline]
+            pub const fn as_wire(self) -> $repr {
+                self as $repr
+            }
+
+            /// The variant `v` names, or `None` for a value outside the set.
+            ///
+            /// Resolved against the discriminants themselves rather than a
+            /// second table of arms, which is what makes a decode/declaration
+            /// disagreement unrepresentable. These sets are a handful of
+            /// variants wide; a scan is not a table lookup worth writing twice.
+            #[inline]
+            pub const fn from_wire(v: $repr) -> Option<Self> {
+                let mut i = 0;
+                while i < Self::ALL.len() {
+                    if Self::ALL[i] as $repr == v {
+                        return Some(Self::ALL[i]);
+                    }
+                    i += 1;
+                }
+                None
+            }
+        }
+    };
+}
 
 mod catalog;
 mod circuit;
@@ -52,8 +109,8 @@ pub use uuid::*;
 // Flat-export `wal`'s constants (referenced everywhere) but not its framer
 // functions (`encode`/`block_size`/… stay `gnitz_wire::wal::`-qualified).
 pub use wal::{
-    IPC_CONTROL_TID, MAX_WIRE_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, WAL_FORMAT_VERSION,
-    WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
+    MAX_WIRE_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, WAL_FORMAT_VERSION, WAL_HEADER_SIZE,
+    WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,6 +122,12 @@ pub use wal::{
 // the column. A caller holding a tail sub-slices it itself — at `opt-level=0`
 // the `bytes[..size]` bound is an out-of-line `Range::index` call, so the
 // comparators over already-exact windows must not pay it.
+//
+// **Inlining policy for this crate's per-row primitives:** they carry
+// `#[inline(always)]`, not `#[inline]`. The E2E suite runs the debug binary, and
+// at `opt-level=0` LLVM runs only the always-inline pass — a plain hint leaves a
+// real call frame around a body that is often a single load or shift. Individual
+// items below do not restate this.
 // ---------------------------------------------------------------------------
 
 /// Align `n` up to an 8-byte boundary.
@@ -80,7 +143,7 @@ pub fn checksum(b: &[u8]) -> u64 {
 }
 
 #[inline]
-pub fn read_u16_le(buf: &[u8], off: usize) -> u16 {
+pub(crate) fn read_u16_le(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
 }
 
@@ -124,9 +187,6 @@ pub fn as_le_bytes<T: LeScalar>(v: &[T]) -> &[u8] {
 /// i64 — the native-LE payload/decoded-PK read. `bytes.len()` IS the column
 /// width. Sibling of [`read_unsigned_exact`]; the two are the one pair every
 /// fixed-int value read goes through.
-///
-/// `#[inline(always)]`, like the other per-row primitives: at `opt-level=0` a
-/// plain hint is a no-op, and these sit inside per-row comparator and load loops.
 #[inline(always)]
 pub fn read_signed_exact(bytes: &[u8]) -> i64 {
     match bytes.len() {
@@ -161,9 +221,6 @@ pub fn read_unsigned_exact(bytes: &[u8]) -> u64 {
 /// index this crate already owns). These two accessors are the **one** read/write
 /// convention for the bitmap, shared by the client (`gnitz-core`), the evaluator
 /// (`gnitz-expr`) and the engine — it was previously spelled out in each.
-///
-/// `#[inline(always)]`, like the other per-row primitives: at `opt-level=0` a
-/// plain hint is a no-op, and these run once per payload column per row.
 #[inline(always)]
 pub fn null_word_get(word: u64, pi: usize) -> bool {
     (word >> pi) & 1 == 1

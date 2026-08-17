@@ -34,7 +34,7 @@ pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
             name: col.name.as_bytes(),
         })
         .collect();
-    gnitz_wire::schema_block::encode(tid, &cols, true)
+    gnitz_wire::schema_block::encode(tid, &cols)
 }
 
 /// Reconstruct a `Schema` from meta-schema block bytes.
@@ -138,7 +138,7 @@ mod tests {
                 name: b"k",
             })
             .collect();
-        let block = gnitz_wire::schema_block::encode(1, &cols, true);
+        let block = gnitz_wire::schema_block::encode(1, &cols);
         assert!(matches!(schema_from_block(&block), Err(ProtocolError::DecodeError(_))));
     }
 

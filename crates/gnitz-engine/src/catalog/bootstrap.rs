@@ -1,5 +1,6 @@
 use super::*;
 use crate::foundation::env::env_usize;
+use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
 use gnitz_wire::SEQTAB_COL_VALUE;
 
 impl CatalogEngine {
@@ -101,14 +102,16 @@ impl CatalogEngine {
         // 1. Core schema records
         {
             let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
-            // _system schema
-            bb.begin_row(SYSTEM_SCHEMA_ID as u128, 1);
-            bb.put_string("_system");
-            bb.end_row();
-            // public schema
-            bb.begin_row(PUBLIC_SCHEMA_ID as u128, 1);
-            bb.put_string("public");
-            bb.end_row();
+            for (schema_id, name) in [(SYSTEM_SCHEMA_ID, "_system"), (PUBLIC_SCHEMA_ID, "public")] {
+                write_schema_tab_row(
+                    &mut bb,
+                    &SchemaTabRow {
+                        schema_id: schema_id as u64,
+                        name,
+                    },
+                    1,
+                );
+            }
             let batch = bb.finish();
             self.sys_store_mut(SysFamily::Schema)
                 .ingest_borrowed_batch(&batch)

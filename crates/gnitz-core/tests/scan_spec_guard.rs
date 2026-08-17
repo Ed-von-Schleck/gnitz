@@ -18,12 +18,7 @@ fn scan_spec_at_a_system_tid_is_rejected_and_the_connection_survives() {
     };
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
 
-    let spec = ReadSpec {
-        bound: ReadBound::None,
-        predicate: Vec::new(),
-        sink: ReadSink::all_rows(),
-    }
-    .encode();
+    let spec = ReadSpec::encode_parts(&ReadBound::None, &[], &ReadSink::all_rows());
 
     // `handle_scan_spec` rejects the system tid at the verb, before a single
     // worker is dispatched — so the reply schema below is never consulted.

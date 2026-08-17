@@ -398,7 +398,7 @@ mod tests {
         let mut buf = vec![0u8; sz];
         b.encode_to_wire(1, &mut buf, 0, false);
         // Corrupt the REG_PK (region 0) size directory entry: claim 24 bytes.
-        let size_off = gnitz_wire::WAL_HEADER_SIZE + REG_PK * 8 + 4;
+        let size_off = gnitz_wire::wal::dir_entry_offset(REG_PK) + 4;
         buf[size_off..size_off + 4].copy_from_slice(&24u32.to_le_bytes());
         let r = Batch::decode_from_wal_block(&buf, &schema, false);
         assert_eq!(r.err(), Some("data WAL region size mismatch"));
@@ -418,7 +418,7 @@ mod tests {
         let mut buf = vec![0u8; sz];
         b.encode_to_wire(1, &mut buf, 0, false);
         // Corrupt the REG_WEIGHT (region 1) size: claim 4 bytes instead of 8.
-        let size_off = gnitz_wire::WAL_HEADER_SIZE + REG_WEIGHT * 8 + 4;
+        let size_off = gnitz_wire::wal::dir_entry_offset(REG_WEIGHT) + 4;
         buf[size_off..size_off + 4].copy_from_slice(&4u32.to_le_bytes());
         let r = Batch::decode_from_wal_block(&buf, &schema, false);
         assert_eq!(r.err(), Some("data WAL region size mismatch"));
@@ -442,7 +442,7 @@ mod tests {
         // [off, off + sz) now overruns the block, so `validate_and_parse` rejects
         // it instead of the decoder silently zero-filling the PK column.
         let block_end = buf.len() as u32;
-        let off_off = gnitz_wire::WAL_HEADER_SIZE + REG_PK * 8;
+        let off_off = gnitz_wire::wal::dir_entry_offset(REG_PK);
         buf[off_off..off_off + 4].copy_from_slice(&block_end.to_le_bytes());
         // verify_checksum = false: the unverified IPC path is the one this guards.
         let r = Batch::decode_from_wal_block(&buf, &schema, false);
@@ -467,7 +467,7 @@ mod tests {
         // block: offset = block end, size = 8. `validate_and_parse` rejects the
         // OOB extent, so the decoder never resolves strings against an empty heap.
         let blob_r = REG_PAYLOAD_START + schema.num_payload_cols();
-        let entry = gnitz_wire::WAL_HEADER_SIZE + blob_r * 8;
+        let entry = gnitz_wire::wal::dir_entry_offset(blob_r);
         let block_end = buf.len() as u32;
         buf[entry..entry + 4].copy_from_slice(&block_end.to_le_bytes()); // offset
         buf[entry + 4..entry + 8].copy_from_slice(&8u32.to_le_bytes()); // size

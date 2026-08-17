@@ -552,7 +552,7 @@ mod tests {
             .filter(|(_, kind, ..)| *kind == NODE_COL_KIND_RANGE_JOIN)
             .map(|&(_, _, pos, v1, v2)| (pos, v1, v2))
             .collect();
-        assert_eq!(rj, vec![(0, 1, RangeRel::Le.as_u64())]);
+        assert_eq!(rj, vec![(0, 1, RangeRel::Le.as_wire())]);
 
         let decoded = Circuit::from_rows(9, rows).expect("from_rows");
         assert!(decoded.nodes.values().any(|n| matches!(n, OpNode::WorkerFilter)));

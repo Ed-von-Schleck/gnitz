@@ -115,14 +115,14 @@ fn schema_block_cols<'a>(schema: &SchemaDescriptor, defs: Option<&'a [ColumnDef]
 /// as `prebuilt_schema_block` to `wire_size` / `encode_wire_into` to skip
 /// rebuilding it on every SEEK/SCAN response.
 pub fn build_schema_wire_block(schema: &SchemaDescriptor, target_tid: u32) -> Vec<u8> {
-    gnitz_wire::schema_block::encode(target_tid, &schema_block_cols(schema, None), true)
+    gnitz_wire::schema_block::encode(target_tid, &schema_block_cols(schema, None))
 }
 
 /// [`build_schema_wire_block`] plus the per-column catalog facts the descriptor
 /// does not carry — name, `is_hidden`, `is_serial`. The block a *client* decodes
 /// into a `Schema`, so it is the one that must be named.
 pub(crate) fn build_named_schema_wire_block(schema: &SchemaDescriptor, defs: &[ColumnDef], target_tid: u32) -> Vec<u8> {
-    gnitz_wire::schema_block::encode(target_tid, &schema_block_cols(schema, Some(defs)), true)
+    gnitz_wire::schema_block::encode(target_tid, &schema_block_cols(schema, Some(defs)))
 }
 
 /// Get-or-build the cached schema wire block for `tid`, returning the full

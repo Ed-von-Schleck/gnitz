@@ -798,9 +798,14 @@ impl GnitzClient {
         let new_sid = self.session.alloc_schema_id()?;
         let schema = sys_schema(SCHEMA_TAB);
         let mut batch = ZSetBatch::new(schema);
-        BatchAppender::new(&mut batch, schema)
-            .add_row(new_sid as u128, 1)
-            .str_val(&name);
+        gnitz_wire::sys_rows::write_schema_tab_row(
+            &mut BatchAppender::new(&mut batch, schema),
+            &gnitz_wire::sys_rows::SchemaTabRow {
+                schema_id: new_sid,
+                name: &name,
+            },
+            1,
+        );
         self.push_ddl(&[(SCHEMA_TAB, batch)])?;
         Ok(new_sid)
     }

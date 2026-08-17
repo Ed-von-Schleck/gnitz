@@ -439,7 +439,7 @@ impl ExprBuilder {
         self.emit(
             EXPR_STR_TRIM,
             dst,
-            gnitz_wire::pack_operand_pair(src, mode.to_wire()),
+            gnitz_wire::pack_operand_pair(src, mode.as_wire()),
             set_idx,
         );
         dst
@@ -947,7 +947,7 @@ mod tests {
                 |dst| LI::StrTrim {
                     dst,
                     a: s0 as u16,
-                    mode: mode.to_wire(),
+                    mode: mode.as_wire(),
                     set_idx: trim_set,
                 },
             );

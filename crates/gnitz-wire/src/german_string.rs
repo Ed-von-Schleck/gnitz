@@ -66,7 +66,7 @@ pub fn blob_extent(blob_len: usize, heap_offset: u64, length: usize) -> Option<s
 /// The short arm is one contiguous slice because the layout is contiguous:
 /// `[4..8]` holds content bytes `[0..4)` and `[8..]` continues at content byte
 /// 4, so `st[4..4 + len]` is the whole value.
-pub fn try_decode_german_string(st: &[u8; 16], blob: &[u8]) -> Option<Vec<u8>> {
+pub fn try_decode_german_string(st: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
     let length = read_u32_le(st, 0) as usize;
     if length <= SHORT_STRING_THRESHOLD {
         return Some(st[4..4 + length].to_vec());

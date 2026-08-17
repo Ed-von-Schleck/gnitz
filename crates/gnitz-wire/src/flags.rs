@@ -260,8 +260,10 @@ const _: () = {
 pub fn wire_flags_set_conflict_mode(flags: u64, mode: WireConflictMode) -> u64 {
     (flags & !WIRE_CONFLICT_MODE_MASK) | ((mode as u64) << WIRE_CONFLICT_MODE_SHIFT)
 }
+/// The conflict mode packed into `flags`, or `None` when those bits name no
+/// mode — the caller is a trust boundary and must reject rather than default.
 #[inline]
-pub fn wire_flags_get_conflict_mode(flags: u64) -> WireConflictMode {
+pub fn wire_flags_get_conflict_mode(flags: u64) -> Option<WireConflictMode> {
     WireConflictMode::from_u8(((flags & WIRE_CONFLICT_MODE_MASK) >> WIRE_CONFLICT_MODE_SHIFT) as u8)
 }
 #[inline]
@@ -323,13 +325,15 @@ impl WireConflictMode {
         self as u8
     }
 
-    /// Unknown bytes decode as `Update` so forward-compatible decoders
-    /// still see last-write-wins semantics.
+    /// `None` for a byte naming no mode, like every other wire enum's decode.
+    /// Coercing an unknown byte to a default would turn a mode the server does
+    /// not implement into a silent upsert.
     #[inline]
-    pub const fn from_u8(v: u8) -> Self {
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
-            1 => WireConflictMode::Error,
-            _ => WireConflictMode::Update,
+            0 => Some(WireConflictMode::Update),
+            1 => Some(WireConflictMode::Error),
+            _ => None,
         }
     }
 }
@@ -352,7 +356,7 @@ pub const STATUS_NO_INDEX: u32 = 3;
 pub const STATUS_TXN_CONFLICT: u32 = 4;
 
 pub const META_FLAG_NULLABLE: u64 = 1;
-pub const META_FLAG_IS_PK: u64 = 2;
+pub(crate) const META_FLAG_IS_PK: u64 = 2;
 /// The column is a hidden key slot: a physical schema column (it holds a real
 /// PK/routing value) that no presentation surface exposes — excluded from
 /// wildcard expansion, name resolution, duplicate-name checks, and client rows.
@@ -418,7 +422,7 @@ pub fn col_meta_serial(flags: u64) -> bool {
 /// not a PK column. Decoders sort their PK columns by this to rebuild the
 /// declared PK order.
 #[inline]
-pub fn col_meta_pk_pos(flags: u64) -> Option<u8> {
+pub(crate) fn col_meta_pk_pos(flags: u64) -> Option<u8> {
     (flags & META_FLAG_IS_PK != 0).then_some(((flags & META_FLAG_PK_POS_MASK) >> META_FLAG_PK_POS_SHIFT) as u8)
 }
 
@@ -448,6 +452,23 @@ mod tests {
         // position byte.
         assert_eq!(pack_col_meta_flags(false, false, false, Some(0)), META_FLAG_IS_PK);
         assert_eq!(pack_col_meta_flags(true, false, false, None), META_FLAG_NULLABLE);
+    }
+
+    /// The conflict mode round-trips through its flag bits, and a byte naming no
+    /// mode is rejected rather than coerced. Coercing would turn a mode the
+    /// server does not implement into a silent upsert on a client's push.
+    #[test]
+    fn conflict_mode_roundtrips_and_rejects_unknown() {
+        for mode in [WireConflictMode::Update, WireConflictMode::Error] {
+            let flags = wire_flags_set_conflict_mode(FLAG_PUSH, mode);
+            assert_eq!(wire_flags_get_conflict_mode(flags), Some(mode));
+            assert_eq!(flags & FLAG_PUSH, FLAG_PUSH, "the mode must not disturb other bits");
+        }
+        for raw in 2u8..=u8::MAX {
+            assert_eq!(WireConflictMode::from_u8(raw), None, "byte {raw} names no mode");
+            let flags = (raw as u64) << 16;
+            assert_eq!(wire_flags_get_conflict_mode(flags), None);
+        }
     }
 
     #[test]

@@ -107,11 +107,8 @@ pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
 /// which must be ≤ 16). For callers that want an owned scratch buffer rather
 /// than threading one through; slice the result with `&buf[..src.len()]`.
 ///
-/// `#[inline(always)]` for the same reason as [`promote_opk_column`]: it is a
-/// pure forwarder reached per row through `ColumnLocator::native_le_bytes` (SUM
-/// / MIN / MAX accumulation, index-span writes, reindex promotion), and at
-/// `opt-level=0` — the profile the E2E suite runs — a plain hint is a no-op, so
-/// the locator inlines away and lands on a real call.
+/// Reached per row through `ColumnLocator::native_le_bytes` (SUM / MIN / MAX
+/// accumulation, index-span writes, reindex promotion).
 #[inline(always)]
 pub fn decode_pk_column_owned(src: &[u8], tc: u8) -> [u8; 16] {
     // `src.len()` is a schema-derived column stride and never exceeds 16; the
@@ -361,35 +358,39 @@ pub fn pk_route_key(pk_bytes: &[u8], offset: usize, col_size: usize) -> u128 {
     widen_pk_be(cell(pk_bytes, offset, col_size), col_size)
 }
 
+/// The OPK↔native sign flip for a `col_size`-byte column of type `tc`: the top
+/// bit of the column's own width for a signed type, zero otherwise.
+///
+/// This is the whole difference between the two key spaces. `encode_pk_column`
+/// XORs exactly this bit before the byte swap, and the swap itself cancels once
+/// both sides are read as integers — so a route key is a native key XOR this,
+/// with no encode/decode round trip and no scratch buffer.
+#[inline(always)]
+fn opk_flip(tc: u8, col_size: usize) -> u128 {
+    (crate::is_signed_int(tc) as u128) << (col_size * 8 - 1)
+}
+
 /// ROUTING key for one native little-endian payload column (canonical). Integer
-/// columns are OPK-encoded (signed sign-flip) then widened, so a payload FK
-/// column routes to the same partition as the same value stored as a PK column.
-/// U128/UUID are unsigned (OPK == native). Float/String/Blob have no PK
-/// counterpart; they keep a zero-extended low-8-byte key.
+/// columns carry the OPK sign flip, so a payload FK column routes to the same
+/// partition as the same value stored as a PK column. U128/UUID are unsigned
+/// (OPK == native). Float/String/Blob have no PK counterpart; they keep a
+/// zero-extended low-8-byte key.
 #[inline]
 pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
+    // Every schema this reaches passed a decode boundary that rejects an unknown
+    // code, so classifying by predicate rather than by decoded enum keeps the
+    // tripwire where the tests run without a per-row branch on the release path.
+    debug_assert!(
+        crate::is_valid_type_code(type_code_val),
+        "payload_route_key: unknown type code"
+    );
     let src = cell(col_data, offset, col_size);
-    match crate::TypeCode::from_validated_u8(type_code_val) {
-        crate::TypeCode::U128 | crate::TypeCode::UUID => u128::from_le_bytes(src.try_into().unwrap()),
-        crate::TypeCode::U8
-        | crate::TypeCode::I8
-        | crate::TypeCode::U16
-        | crate::TypeCode::I16
-        | crate::TypeCode::U32
-        | crate::TypeCode::I32
-        | crate::TypeCode::U64
-        | crate::TypeCode::I64
-        | crate::TypeCode::I128 => {
-            // Encode straight into the right-aligned (zero-extended) slot the
-            // widened key wants, rather than encoding left-aligned and copying
-            // the result into a second buffer to widen it.
-            let mut opk = [0u8; 16];
-            encode_pk_column(src, type_code_val, &mut opk[16 - col_size..]);
-            u128::from_be_bytes(opk)
-        }
-        crate::TypeCode::F32 | crate::TypeCode::F64 | crate::TypeCode::String | crate::TypeCode::Blob => {
-            crate::read_unsigned_exact(&src[..col_size.min(8)]) as u128
-        }
+    if crate::is_wide_int(type_code_val) {
+        u128::from_le_bytes(src.try_into().unwrap()) ^ opk_flip(type_code_val, col_size)
+    } else if crate::is_float(type_code_val) || crate::is_german_string(type_code_val) {
+        crate::read_unsigned_exact(&src[..col_size.min(8)]) as u128
+    } else {
+        crate::read_unsigned_exact(src) as u128 ^ opk_flip(type_code_val, col_size)
     }
 }
 
@@ -400,9 +401,7 @@ pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_c
 /// mismatched `col_size` slices past the column and panics.
 #[inline]
 pub fn pk_native_key(pk_bytes: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    let mut le = [0u8; 16];
-    decode_pk_column(cell(pk_bytes, offset, col_size), type_code_val, &mut le[..col_size]);
-    u128::from_le_bytes(le)
+    widen_pk_be(cell(pk_bytes, offset, col_size), col_size) ^ opk_flip(type_code_val, col_size)
 }
 
 /// INDEX key for one native little-endian payload column: the native value,
@@ -410,12 +409,15 @@ pub fn pk_native_key(pk_bytes: &[u8], offset: usize, col_size: usize, type_code_
 /// low ≤8 bytes. Float/String/Blob keep the same zero-extended low-8-byte key.
 #[inline]
 pub fn payload_native_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
+    debug_assert!(
+        crate::is_valid_type_code(type_code_val),
+        "payload_native_key: unknown type code"
+    );
     let src = cell(col_data, offset, col_size);
-    match crate::TypeCode::from_validated_u8(type_code_val) {
-        crate::TypeCode::U128 | crate::TypeCode::UUID | crate::TypeCode::I128 => {
-            u128::from_le_bytes(src.try_into().unwrap())
-        }
-        _ => crate::read_unsigned_exact(&src[..col_size.min(8)]) as u128,
+    if crate::is_wide_int(type_code_val) {
+        u128::from_le_bytes(src.try_into().unwrap())
+    } else {
+        crate::read_unsigned_exact(&src[..col_size.min(8)]) as u128
     }
 }
 
@@ -454,6 +456,75 @@ mod tests {
         assert_eq!(payload_native_key(&(-1i32).to_le_bytes(), 0, 4, tc::I32), 0xFFFF_FFFF);
         assert_eq!(payload_native_key(&(-1i16).to_le_bytes(), 0, 2, tc::I16), 0xFFFF);
         assert_eq!(payload_native_key(&[0xFFu8], 0, 1, tc::I8), 0xFF);
+    }
+
+    /// The three key readers compute the OPK↔native flip arithmetically instead
+    /// of round-tripping through `encode_pk_column` / `decode_pk_column`. Pin
+    /// each against the primitive it replaced — `pk_route_key` (unchanged) is an
+    /// independent oracle for the route space, but both *native* readers were
+    /// rewritten, so their mutual cross-check alone would no longer catch a
+    /// wrong flip. Swept over every PK-eligible type and the non-PK types the
+    /// payload readers must pass through unflipped.
+    #[test]
+    fn key_readers_match_the_encode_decode_forms_they_replace() {
+        use crate::type_code as tc;
+        let cases: &[(u8, usize)] = &[
+            (tc::U8, 1),
+            (tc::I8, 1),
+            (tc::U16, 2),
+            (tc::I16, 2),
+            (tc::U32, 4),
+            (tc::I32, 4),
+            (tc::U64, 8),
+            (tc::I64, 8),
+            (tc::U128, 16),
+            (tc::UUID, 16),
+            (tc::I128, 16),
+            (tc::F32, 4),
+            (tc::F64, 8),
+            (tc::STRING, 16),
+            (tc::BLOB, 16),
+        ];
+        for &(t, sz) in cases {
+            for &v in &[0i128, 1, -1, 127, -128, 255, i64::MIN as i128, i64::MAX as i128] {
+                let le = (v as u128).to_le_bytes();
+                let native = &le[..sz];
+
+                // payload_native_key: the old form decoded U128/UUID/I128 whole
+                // and zero-extended everything else.
+                let want_native = if crate::is_wide_int(t) {
+                    u128::from_le_bytes(native.try_into().unwrap())
+                } else {
+                    crate::read_unsigned_exact(&native[..sz.min(8)]) as u128
+                };
+                assert_eq!(payload_native_key(native, 0, sz, t), want_native, "tc={t} v={v}");
+
+                // payload_route_key: the old form OPK-encoded integers into a
+                // right-aligned scratch buffer; floats and strings went unflipped.
+                let want_route = if crate::is_float(t) || crate::is_german_string(t) {
+                    crate::read_unsigned_exact(&native[..sz.min(8)]) as u128
+                } else {
+                    let mut opk = [0u8; 16];
+                    encode_pk_column(native, t, &mut opk[16 - sz..]);
+                    u128::from_be_bytes(opk)
+                };
+                assert_eq!(payload_route_key(native, 0, sz, t), want_route, "tc={t} v={v}");
+
+                // pk_native_key: the old form ran `decode_pk_column` into a
+                // zeroed 16-byte buffer. Only PK-eligible types reach it.
+                if crate::is_pk_eligible(t) {
+                    let mut opk = [0u8; 16];
+                    encode_pk_column(native, t, &mut opk[..sz]);
+                    let mut want = [0u8; 16];
+                    decode_pk_column(&opk[..sz], t, &mut want[..sz]);
+                    assert_eq!(
+                        pk_native_key(&opk[..sz], 0, sz, t),
+                        u128::from_le_bytes(want),
+                        "tc={t} v={v}"
+                    );
+                }
+            }
+        }
     }
 
     /// `promote_opk_column`'s identity arm must equal the general

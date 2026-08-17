@@ -25,20 +25,19 @@
 use crate::wal;
 use crate::{
     blob_extent, col_meta_nullable, col_meta_pk_pos, encode_german_string, german_string_content, is_pk_eligible,
-    is_valid_type_code, read_u64_le, write_u64_le, MAX_COLUMNS, MAX_PK_COLUMNS, METASCHEMA_PAY_FLAGS,
-    METASCHEMA_PAY_NAME, METASCHEMA_PAY_TYPE_CODE, META_SCHEMA_COLS, META_SCHEMA_PK, REG_NULL_BMP, REG_PAYLOAD_START,
-    REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD,
+    is_valid_type_code, payload_region_in, read_u64_le, write_u64_le, LEADING_COL_PK, MAX_COLUMNS, MAX_PK_COLUMNS,
+    META_SCHEMA_COLS, REG_NULL_BMP, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD,
 };
 
-const REG_TYPE_CODE: usize = REG_PAYLOAD_START + METASCHEMA_PAY_TYPE_CODE;
-const REG_FLAGS: usize = REG_PAYLOAD_START + METASCHEMA_PAY_FLAGS;
-const REG_NAME: usize = REG_PAYLOAD_START + METASCHEMA_PAY_NAME;
+const REG_TYPE_CODE: usize = payload_region_in(META_SCHEMA_COLS, "type_code");
+const REG_FLAGS: usize = payload_region_in(META_SCHEMA_COLS, "flags");
+const REG_NAME: usize = payload_region_in(META_SCHEMA_COLS, "name");
 
 /// Exactly how many regions a meta-schema block has: the fixed three, one per
 /// META_SCHEMA payload column, and the blob heap. A block naming any other count
 /// is not this block, so the decoder rejects it rather than reading whichever
 /// regions happen to be present.
-pub const SCHEMA_BLOCK_REGIONS: usize = wal::num_regions(META_SCHEMA_COLS.len() - 1);
+pub(crate) const SCHEMA_BLOCK_REGIONS: usize = wal::num_regions(META_SCHEMA_COLS.len() - 1);
 const REG_BLOB: usize = SCHEMA_BLOCK_REGIONS - 1;
 
 /// `col_idx` is a `U64` primary key, so its OPK image is 8 big-endian bytes.
@@ -47,7 +46,7 @@ const PK_STRIDE: usize = 8;
 // The codec writes one 8-byte big-endian `col_idx` per row into region 0, which
 // is only the block's key if `col_idx` is the whole key and is that column.
 const _: () = {
-    assert!(META_SCHEMA_PK.len() == 1 && META_SCHEMA_PK[0] == 0);
+    assert!(LEADING_COL_PK.len() == 1 && LEADING_COL_PK[0] == 0);
     assert!(META_SCHEMA_COLS[0].type_code as u8 == crate::type_code::U64);
 };
 
@@ -72,26 +71,45 @@ fn blob_bytes(name: &[u8]) -> usize {
     }
 }
 
-/// Per-row bytes of the six fixed-stride regions, in region order: the 8-byte
-/// `col_idx` key, weight, null word, type_code and flags, then the 16-byte
-/// German-string name cell.
-const FIXED_ROW_BYTES: usize = PK_STRIDE + 8 + 8 + 8 + 8 + 16;
+/// Per-row bytes of each region, indexed by region: the `col_idx` key, weight,
+/// null word, type_code, flags, the 16-byte German-string name cell, and the
+/// blob heap (which is not per-row). Encode sizing, the scratch-buffer split and
+/// the decode-side shape check all read this one table, so a stride change
+/// cannot land in two of the three.
+const ROW_BYTES: [usize; SCHEMA_BLOCK_REGIONS] = {
+    let mut t = [0usize; SCHEMA_BLOCK_REGIONS];
+    t[REG_PK] = PK_STRIDE;
+    t[REG_WEIGHT] = 8;
+    t[REG_NULL_BMP] = 8;
+    t[REG_TYPE_CODE] = 8;
+    t[REG_FLAGS] = 8;
+    t[REG_NAME] = 16;
+    t[REG_BLOB] = 0; // sized by the spill, not by the row count
+    t
+};
+
+/// Per-row bytes of the six fixed-stride regions.
+const FIXED_ROW_BYTES: usize = {
+    let (mut sum, mut r) = (0usize, 0);
+    while r < REG_BLOB {
+        sum += ROW_BYTES[r];
+        r += 1;
+    }
+    sum
+};
 
 /// Block size for `n` columns spilling `blob` bytes of long names.
 fn block_len(n: usize, blob: usize) -> usize {
     let mut sizes = [0u32; SCHEMA_BLOCK_REGIONS];
-    sizes[REG_PK] = (n * PK_STRIDE) as u32;
-    sizes[REG_WEIGHT] = (n * 8) as u32;
-    sizes[REG_NULL_BMP] = (n * 8) as u32;
-    sizes[REG_TYPE_CODE] = (n * 8) as u32;
-    sizes[REG_FLAGS] = (n * 8) as u32;
-    sizes[REG_NAME] = (n * 16) as u32;
+    for (r, sz) in sizes.iter_mut().enumerate() {
+        *sz = (n * ROW_BYTES[r]) as u32;
+    }
     sizes[REG_BLOB] = blob as u32;
     wal::block_size(&sizes)
 }
 
 /// Encoded size of the block for `cols` — what [`encode_into`] writes.
-pub fn encoded_len(cols: &[SchemaBlockCol]) -> usize {
+pub(crate) fn encoded_len(cols: &[SchemaBlockCol]) -> usize {
     block_len(cols.len(), cols.iter().map(|c| blob_bytes(c.name)).sum())
 }
 
@@ -139,10 +157,11 @@ pub fn encode_into(out: &mut [u8], offset: usize, tid: u32, cols: &[SchemaBlockC
     end - offset
 }
 
-/// [`encode_into`] into a fresh `Vec`.
-pub fn encode(tid: u32, cols: &[SchemaBlockCol], checksum: bool) -> Vec<u8> {
+/// [`encode_into`] into a fresh `Vec`. Always checksummed — the in-place form
+/// is the one whose caller varies that.
+pub fn encode(tid: u32, cols: &[SchemaBlockCol]) -> Vec<u8> {
     let mut out = vec![0u8; encoded_len(cols)];
-    encode_into(&mut out, 0, tid, cols, checksum);
+    encode_into(&mut out, 0, tid, cols, true);
     out
 }
 
@@ -153,7 +172,6 @@ pub fn encode(tid: u32, cols: &[SchemaBlockCol], checksum: bool) -> Vec<u8> {
 /// `Schema` / `SchemaDescriptor` from it cannot fail on wire grounds.
 pub struct SchemaBlock<'a> {
     block: &'a [u8],
-    table_id: u32,
     count: usize,
     tc_off: usize,
     fl_off: usize,
@@ -207,26 +225,18 @@ impl<'a> SchemaBlock<'a> {
 
         let reg = |r: usize| (offs[r] as usize, sizes[r] as usize);
         let (pk_off, pk_sz) = reg(REG_PK);
-        let (null_off, null_sz) = reg(REG_NULL_BMP);
-        let (tc_off, tc_sz) = reg(REG_TYPE_CODE);
-        let (fl_off, fl_sz) = reg(REG_FLAGS);
-        let (name_off, name_sz) = reg(REG_NAME);
+        let (null_off, _) = reg(REG_NULL_BMP);
+        let (tc_off, _) = reg(REG_TYPE_CODE);
+        let (fl_off, _) = reg(REG_FLAGS);
+        let (name_off, _) = reg(REG_NAME);
         let (blob_off, blob_sz) = reg(REG_BLOB);
 
-        if pk_sz != count * PK_STRIDE {
-            return Err("schema col_idx region OOB");
-        }
-        if null_sz != count * 8 {
-            return Err("schema null region OOB");
-        }
-        if tc_sz != count * 8 {
-            return Err("schema type_code region OOB");
-        }
-        if fl_sz != count * 8 {
-            return Err("schema flags region OOB");
-        }
-        if name_sz != count * 16 {
-            return Err("schema name region OOB");
+        // Every fixed-stride region must be exactly `count` rows wide, against
+        // the same table `block_len` sizes them with.
+        for (r, &per_row) in ROW_BYTES.iter().enumerate().take(REG_BLOB) {
+            if sizes[r] as usize != count * per_row {
+                return Err("schema block region size mismatch");
+            }
         }
 
         // No meta-schema column is nullable, so the encoder writes an all-zero
@@ -306,7 +316,6 @@ impl<'a> SchemaBlock<'a> {
 
         Ok(SchemaBlock {
             block,
-            table_id: header.table_id,
             count,
             tc_off,
             fl_off,
@@ -315,12 +324,6 @@ impl<'a> SchemaBlock<'a> {
             pk_indices,
             pk_count,
         })
-    }
-
-    /// The relation id the block was encoded under.
-    #[inline]
-    pub fn table_id(&self) -> u32 {
-        self.table_id
     }
 
     #[inline]
@@ -378,7 +381,7 @@ mod tests {
             col(TypeCode::U64, "id", Some(0), false),
             col(TypeCode::String, "a_rather_long_column_name", None, true),
         ];
-        encode(7, &cols, true)
+        encode(7, &cols)
     }
 
     #[test]
@@ -388,9 +391,8 @@ mod tests {
             col(TypeCode::I32, "a", Some(0), false),
             col(TypeCode::String, "payload_name_over_twelve", None, true),
         ];
-        let block = encode(42, &cols, true);
+        let block = encode(42, &cols);
         let sb = SchemaBlock::decode(&block, true, MAX_PK_COLUMNS).unwrap();
-        assert_eq!(sb.table_id(), 42);
         assert_eq!(sb.num_columns(), 3);
         assert_eq!(sb.columns().collect::<Vec<_>>(), cols.to_vec());
         // Declared order `(a, b)`, not column order `(b, a)`.
@@ -403,7 +405,7 @@ mod tests {
             col(TypeCode::U64, "id", Some(0), false),
             col(TypeCode::String, "spills_into_the_blob_heap", None, false),
         ];
-        assert_eq!(encode(1, &cols, true).len(), encoded_len(&cols));
+        assert_eq!(encode(1, &cols).len(), encoded_len(&cols));
     }
 
     /// The count-only sizing path must agree with the general one, or a caller
@@ -415,7 +417,7 @@ mod tests {
                 .map(|i| col(TypeCode::U64, "", (i == 0).then_some(0), false))
                 .collect();
             assert_eq!(anonymous_encoded_len(n), encoded_len(&cols), "n = {n}");
-            assert_eq!(anonymous_encoded_len(n), encode(1, &cols, true).len(), "n = {n}");
+            assert_eq!(anonymous_encoded_len(n), encode(1, &cols).len(), "n = {n}");
         }
     }
 
@@ -460,7 +462,7 @@ mod tests {
                 name: b"k",
             })
             .collect();
-        let block = encode(1, &cols, true);
+        let block = encode(1, &cols);
         assert_eq!(
             SchemaBlock::decode(&block, true, MAX_PK_COLUMNS)
                 .unwrap()
@@ -509,12 +511,12 @@ mod tests {
     fn rejects_a_nullable_or_ineligible_pk_column() {
         let nullable = [col(TypeCode::U64, "id", Some(0), true)];
         assert_eq!(
-            decode_err(&encode(1, &nullable, true), MAX_PK_COLUMNS),
+            decode_err(&encode(1, &nullable), MAX_PK_COLUMNS),
             "PK column must be non-nullable"
         );
         let float = [col(TypeCode::F64, "id", Some(0), false)];
         assert_eq!(
-            decode_err(&encode(1, &float, true), MAX_PK_COLUMNS),
+            decode_err(&encode(1, &float), MAX_PK_COLUMNS),
             "PK column type not PK-eligible"
         );
     }
@@ -522,7 +524,7 @@ mod tests {
     #[test]
     fn rejects_a_block_with_no_pk_column() {
         let cols = [col(TypeCode::U64, "a", None, false)];
-        assert_eq!(decode_err(&encode(1, &cols, true), MAX_PK_COLUMNS), "no PK column");
+        assert_eq!(decode_err(&encode(1, &cols), MAX_PK_COLUMNS), "no PK column");
     }
 
     #[test]

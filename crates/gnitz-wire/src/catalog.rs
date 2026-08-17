@@ -72,29 +72,30 @@ pub(crate) const fn pay_index_in(cols: &[WireSysCol], name: &str) -> usize {
     ci - 1
 }
 
-// Every system table's column shape is defined once, here, and derived by both
-// sides: the engine builds its `SchemaDescriptor`s and the COL_TAB
-// self-description rows from these slices, the client builds its `Schema`s. Each
-// table's `*_PK` names the columns that key it — the client and the engine must
-// agree on both halves, and a disagreement on the key is a `pk_stride` mismatch
-// the wire decode rejects, so neither half is left for a consumer to restate.
+/// Region index of the payload column named `name` (§6): the fixed regions,
+/// then the payload columns in schema order. Same leading-PK restriction as
+/// [`pay_index_in`].
+pub(crate) const fn payload_region_in(cols: &[WireSysCol], name: &str) -> usize {
+    crate::REG_PAYLOAD_START + pay_index_in(cols, name)
+}
+
+// Every system table's column shape is defined once, here, and reached through
+// `SYS_FAMILIES` / `sys_family(id)`, which pairs each shape with the key that
+// goes with it: the engine builds its `SchemaDescriptor`s and the COL_TAB
+// self-description rows from a family, the client builds its `Schema`s. The two
+// must agree on both halves, and a disagreement on the key is a `pk_stride`
+// mismatch the wire decode rejects — so neither half is offered separately for a
+// consumer to pair up itself.
 
 /// The primary key of every system table whose key is its single leading column.
 pub(crate) const LEADING_COL_PK: &[u32] = &[0];
 
-pub const SCHEMA_TAB_PK: &[u32] = LEADING_COL_PK;
-pub const TABLE_TAB_PK: &[u32] = LEADING_COL_PK;
-pub const VIEW_TAB_PK: &[u32] = LEADING_COL_PK;
-pub const COL_TAB_PK: &[u32] = LEADING_COL_PK;
-pub const IDX_TAB_PK: &[u32] = LEADING_COL_PK;
-pub const SEQ_TAB_PK: &[u32] = LEADING_COL_PK;
-
-pub const SCHEMA_TAB_COLS: &[WireSysCol] = &[
+pub(crate) const SCHEMA_TAB_COLS: &[WireSysCol] = &[
     col("schema_id", TypeCode::U64, false),
     col("name", TypeCode::String, false),
 ];
 
-pub const TABLE_TAB_COLS: &[WireSysCol] = &[
+pub(crate) const TABLE_TAB_COLS: &[WireSysCol] = &[
     col("table_id", TypeCode::U64, false),
     col("schema_id", TypeCode::U64, false),
     col("name", TypeCode::String, false),
@@ -105,7 +106,7 @@ pub const TABLE_TAB_COLS: &[WireSysCol] = &[
     col("flags", TypeCode::U64, false),
 ];
 
-pub const VIEW_TAB_COLS: &[WireSysCol] = &[
+pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
     col("view_id", TypeCode::U64, false),
     col("schema_id", TypeCode::U64, false),
     col("name", TypeCode::String, false),
@@ -121,7 +122,7 @@ pub const VIEW_TAB_COLS: &[WireSysCol] = &[
     col("capacity_bytes", TypeCode::U64, false),
 ];
 
-pub const COL_TAB_COLS: &[WireSysCol] = &[
+pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
     col("column_id", TypeCode::U64, false),
     col("owner_id", TypeCode::U64, false),
     col("owner_kind", TypeCode::U64, false),
@@ -141,7 +142,7 @@ pub const COL_TAB_COLS: &[WireSysCol] = &[
     col("is_hidden", TypeCode::U64, false),
 ];
 
-pub const IDX_TAB_COLS: &[WireSysCol] = &[
+pub(crate) const IDX_TAB_COLS: &[WireSysCol] = &[
     col("index_id", TypeCode::U64, false),
     col("owner_id", TypeCode::U64, false),
     // Holds `pack_pk_cols(&col_indices)` for every row (single- and
@@ -156,15 +157,14 @@ pub const IDX_TAB_COLS: &[WireSysCol] = &[
 /// ends exchange, so it belongs with them. Its codec is
 /// [`crate::schema_block`], which is what both ends actually run; the `flags`
 /// word is packed by [`crate::pack_col_meta_flags`].
-pub const META_SCHEMA_COLS: &[WireSysCol] = &[
+pub(crate) const META_SCHEMA_COLS: &[WireSysCol] = &[
     col("col_idx", TypeCode::U64, false),
     col("type_code", TypeCode::U64, false),
     col("flags", TypeCode::U64, false),
     col("name", TypeCode::String, false),
 ];
-pub const META_SCHEMA_PK: &[u32] = LEADING_COL_PK;
 
-pub const SEQ_TAB_COLS: &[WireSysCol] = &[
+pub(crate) const SEQ_TAB_COLS: &[WireSysCol] = &[
     col("seq_id", TypeCode::U64, false),
     col("next_val", TypeCode::U64, false),
 ];
@@ -311,26 +311,19 @@ const fn fold_family(mut h: u64, cols: &[WireSysCol], pk: &[u32]) -> u64 {
 /// decoded against the *live* schema, so a shape change silently reinterprets
 /// an existing data directory unless a format word rejects it first — see the
 /// pin in [`crate::wal::WAL_FORMAT_VERSION`]'s test.
+///
+/// Folded straight over [`SYS_FAMILIES`], so a family added there is covered
+/// here without a second edit. A hand-chained list would keep hashing the old
+/// set and report an unchanged digest for a changed catalog.
 pub const SYS_SCHEMA_DIGEST: u64 = {
     let mut h = 0xcbf2_9ce4_8422_2325;
-    h = fold_family(h, SCHEMA_TAB_COLS, SCHEMA_TAB_PK);
-    h = fold_family(h, TABLE_TAB_COLS, TABLE_TAB_PK);
-    h = fold_family(h, VIEW_TAB_COLS, VIEW_TAB_PK);
-    h = fold_family(h, COL_TAB_COLS, COL_TAB_PK);
-    h = fold_family(h, IDX_TAB_COLS, IDX_TAB_PK);
-    h = fold_family(h, SEQ_TAB_COLS, SEQ_TAB_PK);
-    h = fold_family(h, CIRCUIT_NODES_COLS, CIRCUIT_FAMILY_PK);
-    h = fold_family(h, CIRCUIT_EDGES_COLS, CIRCUIT_FAMILY_PK);
-    h = fold_family(h, CIRCUIT_NODE_COLUMNS_COLS, CIRCUIT_FAMILY_PK);
+    let mut i = 0;
+    while i < SYS_FAMILIES.len() {
+        h = fold_family(h, SYS_FAMILIES[i].cols, SYS_FAMILIES[i].pk_cols);
+        i += 1;
+    }
     h
 };
-
-// The one reply block that is a wire schema rather than a system table. Only
-// the payload slots are named: `schema_block` is its sole codec, and a region
-// walk addresses payload columns.
-pub const METASCHEMA_PAY_TYPE_CODE: usize = pay_index_in(META_SCHEMA_COLS, "type_code");
-pub const METASCHEMA_PAY_FLAGS: usize = pay_index_in(META_SCHEMA_COLS, "flags");
-pub const METASCHEMA_PAY_NAME: usize = pay_index_in(META_SCHEMA_COLS, "name");
 
 // ---------------------------------------------------------------------------
 // System table IDs
@@ -373,12 +366,12 @@ const fn fam(id: u64, name: &'static str, cols: &'static [WireSysCol], pk_cols: 
 
 /// Every system family, in the order both sides index them by.
 pub const SYS_FAMILIES: &[WireSysFamily] = &[
-    fam(SCHEMA_TAB, "_schemas", SCHEMA_TAB_COLS, SCHEMA_TAB_PK),
-    fam(TABLE_TAB, "_tables", TABLE_TAB_COLS, TABLE_TAB_PK),
-    fam(VIEW_TAB, "_views", VIEW_TAB_COLS, VIEW_TAB_PK),
-    fam(COL_TAB, "_columns", COL_TAB_COLS, COL_TAB_PK),
-    fam(IDX_TAB, "_indices", IDX_TAB_COLS, IDX_TAB_PK),
-    fam(SEQ_TAB, "_sequences", SEQ_TAB_COLS, SEQ_TAB_PK),
+    fam(SCHEMA_TAB, "_schemas", SCHEMA_TAB_COLS, LEADING_COL_PK),
+    fam(TABLE_TAB, "_tables", TABLE_TAB_COLS, LEADING_COL_PK),
+    fam(VIEW_TAB, "_views", VIEW_TAB_COLS, LEADING_COL_PK),
+    fam(COL_TAB, "_columns", COL_TAB_COLS, LEADING_COL_PK),
+    fam(IDX_TAB, "_indices", IDX_TAB_COLS, LEADING_COL_PK),
+    fam(SEQ_TAB, "_sequences", SEQ_TAB_COLS, LEADING_COL_PK),
     fam(
         CIRCUIT_NODES_TAB,
         "_circuit_nodes",
@@ -882,22 +875,17 @@ mod tests {
 
     /// Every system table's key must be admissible for its own column list. The
     /// pair is the thing both crates build from, so it is validated here rather
-    /// than trusted at each derivation site.
+    /// than trusted at each derivation site. Swept over `SYS_FAMILIES` (plus the
+    /// meta-schema block, which is not a family), so a newly added family is
+    /// covered without editing this test.
     #[test]
     fn system_table_keys_are_valid_for_their_columns() {
-        let families: &[(&str, &[WireSysCol], &[u32])] = &[
-            ("_schemas", SCHEMA_TAB_COLS, SCHEMA_TAB_PK),
-            ("_tables", TABLE_TAB_COLS, TABLE_TAB_PK),
-            ("_views", VIEW_TAB_COLS, VIEW_TAB_PK),
-            ("_columns", COL_TAB_COLS, COL_TAB_PK),
-            ("_indices", IDX_TAB_COLS, IDX_TAB_PK),
-            ("_sequences", SEQ_TAB_COLS, SEQ_TAB_PK),
-            ("_circuit_nodes", CIRCUIT_NODES_COLS, CIRCUIT_FAMILY_PK),
-            ("_circuit_edges", CIRCUIT_EDGES_COLS, CIRCUIT_FAMILY_PK),
-            ("_circuit_node_columns", CIRCUIT_NODE_COLUMNS_COLS, CIRCUIT_FAMILY_PK),
-            ("meta_schema", META_SCHEMA_COLS, META_SCHEMA_PK),
-        ];
-        for &(name, cols, pk) in families {
+        let meta = ("meta_schema", META_SCHEMA_COLS, LEADING_COL_PK);
+        let families = SYS_FAMILIES
+            .iter()
+            .map(|f| (f.name, f.cols, f.pk_cols))
+            .chain(std::iter::once(meta));
+        for (name, cols, pk) in families {
             assert!(cols.len() <= MAX_COLUMNS, "{name}: too many columns");
             crate::validate_pk_tuple(pk, cols.len(), |c| {
                 let col = &cols[c as usize];

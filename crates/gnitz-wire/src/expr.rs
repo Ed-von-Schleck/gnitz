@@ -149,33 +149,17 @@ pub const STR_SUBSTR_NO_LEN: u32 = 0xFFFF;
 /// [`TrimMode`]. The const-pool entry is the raw byte set to strip.
 pub const EXPR_STR_TRIM: u32 = 69;
 
-/// Which end(s) `EXPR_STR_TRIM` strips. The one definition of the mode word both
-/// the planner and the engine encode against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrimMode {
-    Both = 0,
-    Leading = 1,
-    Trailing = 2,
+wire_enum! {
+    /// Which end(s) `EXPR_STR_TRIM` strips. The one definition of the mode word
+    /// both the planner and the engine encode against.
+    pub enum TrimMode: u32 {
+        Both = 0,
+        Leading = 1,
+        Trailing = 2,
+    }
 }
 
 impl TrimMode {
-    /// The mode word to pack beside the source register.
-    #[inline]
-    pub const fn to_wire(self) -> u32 {
-        self as u32
-    }
-
-    /// The mode a wire word names, or `None` for an out-of-range one.
-    #[inline]
-    pub const fn from_wire(mode: u32) -> Option<Self> {
-        match mode {
-            0 => Some(TrimMode::Both),
-            1 => Some(TrimMode::Leading),
-            2 => Some(TrimMode::Trailing),
-            _ => None,
-        }
-    }
-
     #[inline]
     pub fn trims_start(self) -> bool {
         matches!(self, TrimMode::Both | TrimMode::Leading)

@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(decoded.len(), expected.len());
         for (fam, (exp_tid, exp_mode, exp_rows)) in decoded.iter().zip(expected) {
             assert_eq!(fam.tid, exp_tid);
-            assert_eq!(WireConflictMode::from_u8(fam.mode), exp_mode);
+            assert_eq!(WireConflictMode::from_u8(fam.mode), Some(exp_mode));
             // The schema block is this family's, keyed under this family's tid.
             assert_eq!(
                 gnitz_wire::read_u32_le(fam.schema_block, gnitz_wire::WAL_OFF_TID),

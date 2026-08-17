@@ -92,34 +92,19 @@ pub const AGG_SUM_ZERO: u64 = 6;
 // Typed circuit-node representation (shared between gnitz-core and gnitz-engine)
 // ---------------------------------------------------------------------------
 
-/// Aggregate function discriminant. Values match the `AGG_*` wire constants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u64)]
-pub enum AggFunc {
-    Count = AGG_COUNT,
-    Sum = AGG_SUM,
-    Min = AGG_MIN,
-    Max = AGG_MAX,
-    CountNonNull = AGG_COUNT_NON_NULL,
-    SumZero = AGG_SUM_ZERO,
+wire_enum! {
+    /// Aggregate function discriminant. Values match the `AGG_*` wire constants.
+    pub enum AggFunc: u64 {
+        Count = AGG_COUNT,
+        Sum = AGG_SUM,
+        Min = AGG_MIN,
+        Max = AGG_MAX,
+        CountNonNull = AGG_COUNT_NON_NULL,
+        SumZero = AGG_SUM_ZERO,
+    }
 }
 
 impl AggFunc {
-    pub fn from_wire(v: u64) -> Option<Self> {
-        match v {
-            AGG_COUNT => Some(AggFunc::Count),
-            AGG_SUM => Some(AggFunc::Sum),
-            AGG_MIN => Some(AggFunc::Min),
-            AGG_MAX => Some(AggFunc::Max),
-            AGG_COUNT_NON_NULL => Some(AggFunc::CountNonNull),
-            AGG_SUM_ZERO => Some(AggFunc::SumZero),
-            _ => None,
-        }
-    }
-    pub fn as_u64(self) -> u64 {
-        self as u64
-    }
-
     /// True iff `Agg(A + B) == Agg(A) + Agg(B)` — the aggregate is linear, so a
     /// delta's contribution folds into the running accumulator with no history
     /// replay. MIN/MAX are not: retracting the current extremum needs the next
@@ -231,59 +216,46 @@ pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> u8 {
     }
 }
 
-/// The relation a **trace** slot must satisfy versus the **delta** slot in a
-/// range-join probe (`{ trace_slot REL delta_slot }`). Canonicalized from the ON
-/// clause's `L.x OP R.y`: term AB's rel is the converse of OP, term BA's rel is
-/// OP itself. Wire values are stable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u64)]
-pub enum RangeRel {
-    Lt = 0,
-    Le = 1,
-    Gt = 2,
-    Ge = 3,
-}
-
-impl RangeRel {
-    pub fn from_wire(v: u64) -> Option<Self> {
-        match v {
-            0 => Some(RangeRel::Lt),
-            1 => Some(RangeRel::Le),
-            2 => Some(RangeRel::Gt),
-            3 => Some(RangeRel::Ge),
-            _ => None,
-        }
-    }
-    pub fn as_u64(self) -> u64 {
-        self as u64
+wire_enum! {
+    /// The relation a **trace** slot must satisfy versus the **delta** slot in a
+    /// range-join probe (`{ trace_slot REL delta_slot }`). Canonicalized from the
+    /// ON clause's `L.x OP R.y`: term AB's rel is the converse of OP, term BA's
+    /// rel is OP itself. Wire values are stable.
+    pub enum RangeRel: u64 {
+        Lt = 0,
+        Le = 1,
+        Gt = 2,
+        Ge = 3,
     }
 }
 
-/// How a `Reduce` node keys its output. **Decided once, by the circuit author**
-/// (the SQL planner, which tracks schemas) via [`ReduceOutKey::decide`], shipped
-/// on the wire, and *validated* — never re-decided — by the engine compiler: a
-/// shipped kind that differs from what the input schema warrants under the same
-/// `decide` chain is a hard compile rejection, so the output column layout can
-/// never silently scramble. Everything downstream of that validation (output
-/// schema construction, runtime row keying) obeys the kind rather than
-/// re-deriving it.
-///
-/// On the wire the kind rides as one param row (`NODE_COL_KIND_REDUCE_OUT_KEY`),
-/// present iff not `SyntheticFold` — the sparse-default param-row idiom
-/// (`NODE_COL_KIND_GLOBAL_GROUND` works the same way).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u64)]
-pub enum ReduceOutKey {
-    /// Leading synthetic `_group_pk` U128 = null-distinct group fold; the group
-    /// columns ride as payload. What every group set that is neither natural
-    /// kind gets — including the empty (global) group set and the schema-blind
-    /// low-level `CircuitBuilder::reduce` surface.
-    SyntheticFold = 0,
-    /// The group set is a permutation of the source PK; the output PK is the
-    /// source PK columns in pk-list order, verbatim.
-    PkPermutation = 1,
-    /// A single non-nullable U64/U128/UUID group column is the output PK directly.
-    SingleNaturalCol = 2,
+wire_enum! {
+    /// How a `Reduce` node keys its output. **Decided once, by the circuit
+    /// author** (the SQL planner, which tracks schemas) via
+    /// [`ReduceOutKey::decide`], shipped on the wire, and *validated* — never
+    /// re-decided — by the engine compiler: a shipped kind that differs from what
+    /// the input schema warrants under the same `decide` chain is a hard compile
+    /// rejection, so the output column layout can never silently scramble.
+    /// Everything downstream of that validation (output schema construction,
+    /// runtime row keying) obeys the kind rather than re-deriving it.
+    ///
+    /// On the wire the kind rides as one param row
+    /// (`NODE_COL_KIND_REDUCE_OUT_KEY`), present iff not `SyntheticFold` — the
+    /// sparse-default param-row idiom (`NODE_COL_KIND_GLOBAL_GROUND` works the
+    /// same way).
+    pub enum ReduceOutKey: u64 {
+        /// Leading synthetic `_group_pk` U128 = null-distinct group fold; the
+        /// group columns ride as payload. What every group set that is neither
+        /// natural kind gets — including the empty (global) group set and the
+        /// schema-blind low-level `CircuitBuilder::reduce` surface.
+        SyntheticFold = 0,
+        /// The group set is a permutation of the source PK; the output PK is the
+        /// source PK columns in pk-list order, verbatim.
+        PkPermutation = 1,
+        /// A single non-nullable U64/U128/UUID group column is the output PK
+        /// directly.
+        SingleNaturalCol = 2,
+    }
 }
 
 impl ReduceOutKey {
@@ -324,18 +296,6 @@ impl ReduceOutKey {
         } else {
             ReduceOutKey::SyntheticFold
         }
-    }
-
-    pub fn from_wire(v: u64) -> Option<Self> {
-        match v {
-            0 => Some(ReduceOutKey::SyntheticFold),
-            1 => Some(ReduceOutKey::PkPermutation),
-            2 => Some(ReduceOutKey::SingleNaturalCol),
-            _ => None,
-        }
-    }
-    pub fn as_u64(self) -> u64 {
-        self as u64
     }
 }
 
@@ -592,7 +552,7 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             let mut kind_rows = encode_col_list(NODE_COL_KIND_GROUP, group_cols);
             kind_rows.reserve(agg.len() + 2);
             for (i, (func, col)) in agg.into_iter().enumerate() {
-                kind_rows.push((NODE_COL_KIND_AGG_SPEC, i as u16, func.as_u64(), col as u64));
+                kind_rows.push((NODE_COL_KIND_AGG_SPEC, i as u16, func.as_wire(), col as u64));
             }
             // Only the user's global scalar aggregate carries the row; an
             // ordinary grouped / range-join reduce omits it and decodes to `false`.
@@ -602,14 +562,14 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             // Sparse-default param row (the GLOBAL_GROUND idiom above): present
             // iff not `SyntheticFold`; an absent row decodes to the default.
             if out_key != ReduceOutKey::SyntheticFold {
-                kind_rows.push((NODE_COL_KIND_REDUCE_OUT_KEY, 0, out_key.as_u64(), 0));
+                kind_rows.push((NODE_COL_KIND_REDUCE_OUT_KEY, 0, out_key.as_wire(), 0));
             }
             ((OPCODE_REDUCE, None, None), kind_rows)
         }
         OpNode::Join(JoinKind::DeltaTrace) => ((OPCODE_JOIN_DELTA_TRACE, None, None), Vec::new()),
         OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }) => (
             (OPCODE_JOIN_DELTA_TRACE_RANGE, None, None),
-            vec![(NODE_COL_KIND_RANGE_JOIN, 0, n_eq as u64, rel.as_u64())],
+            vec![(NODE_COL_KIND_RANGE_JOIN, 0, n_eq as u64, rel.as_wire())],
         ),
         OpNode::IntegrateSink => ((OPCODE_INTEGRATE, None, None), Vec::new()),
         OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None), Vec::new()),
@@ -883,7 +843,7 @@ mod tests {
             kind: NODE_COL_KIND_RANGE_JOIN,
             position: 0,
             value1: 2,
-            value2: RangeRel::Gt.as_u64(),
+            value2: RangeRel::Gt.as_wire(),
         }];
         let node = decode_op_node(OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, &cols).unwrap();
         assert_eq!(
@@ -1042,35 +1002,6 @@ mod tests {
         ];
         for node in nodes {
             assert_eq!(roundtrip(node.clone()).unwrap(), node, "round-trip failed for {node:?}");
-        }
-    }
-
-    /// Each wire enum's `as_u64`/`from_wire` pair must be mutually inverse, and
-    /// `from_wire` must reject everything outside the set — the closure property
-    /// `TypeCode` already pins for the type table.
-    #[test]
-    fn wire_enums_round_trip_and_reject_unknown() {
-        let aggs = [
-            AggFunc::Count,
-            AggFunc::Sum,
-            AggFunc::Min,
-            AggFunc::Max,
-            AggFunc::CountNonNull,
-            AggFunc::SumZero,
-        ];
-        let rels = [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge];
-        let keys = [
-            ReduceOutKey::SyntheticFold,
-            ReduceOutKey::PkPermutation,
-            ReduceOutKey::SingleNaturalCol,
-        ];
-        for v in 0u64..64 {
-            assert_eq!(AggFunc::from_wire(v), aggs.iter().copied().find(|a| a.as_u64() == v));
-            assert_eq!(RangeRel::from_wire(v), rels.iter().copied().find(|r| r.as_u64() == v));
-            assert_eq!(
-                ReduceOutKey::from_wire(v),
-                keys.iter().copied().find(|k| k.as_u64() == v)
-            );
         }
     }
 

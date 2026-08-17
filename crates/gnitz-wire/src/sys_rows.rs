@@ -5,41 +5,16 @@
 //! engine — and both writers were positional while both readers were
 //! name-resolved. Reordering a family's column list therefore kept every reader
 //! correct and silently transposed both writers, in two crates. Here each row is
-//! a struct with named fields, there is one writer per family, and the order it
-//! emits payload values in is pinned to the `*_PAY_*` constants at compile time.
+//! a struct with named fields and there is one writer per family, checked by
+//! `values_land_in_their_named_payload_slots` — which sees both the column list
+//! and the emit sequence, so it catches a reorder of either.
 //!
 //! A `-1` row must reproduce its `+1`'s payload byte-for-byte — the engine's
 //! retraction CAS rejects a mismatch, and only byte-equal `(PK, payload)` rows
 //! cancel in the Z-set — which is the other reason each family has exactly one
 //! writer: a drop and its create cannot diverge if they are the same code.
 
-use crate::{
-    pack_col_id, COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
-    COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND,
-    COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID,
-    IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX,
-    TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
-    VIEWTAB_PAY_SQL, VIEW_TAB_COLS,
-};
-
-/// True iff `pay` lists **every** payload column of a family whose column list
-/// is `n_cols` long (the leading column being its key), in ascending payload
-/// order. Applied below to each writer's emit sequence, so a reordered or
-/// resized column list fails the build here instead of transposing rows that
-/// still decode without error.
-const fn emits_every_payload_column(pay: &[usize], n_cols: usize) -> bool {
-    if pay.len() + 1 != n_cols {
-        return false;
-    }
-    let mut i = 0;
-    while i < pay.len() {
-        if pay[i] != i {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
+use crate::pack_col_id;
 
 /// Where a row codec writes. Both sides already build batches this way — begin a
 /// row with its key and weight, push one value per payload column in schema
@@ -53,6 +28,22 @@ pub trait SysRowSink {
     fn put_u64(&mut self, v: u64);
     fn put_string(&mut self, s: &str);
     fn end_row(&mut self);
+}
+
+// ---------------------------------------------------------------------------
+// SCHEMA_TAB
+// ---------------------------------------------------------------------------
+
+/// One `SCHEMA_TAB` row: the schema `schema_id`, named `name`.
+pub struct SchemaTabRow<'a> {
+    pub schema_id: u64,
+    pub name: &'a str,
+}
+
+pub fn write_schema_tab_row(sink: &mut impl SysRowSink, r: &SchemaTabRow, weight: i64) {
+    sink.begin_row(r.schema_id as u128, weight);
+    sink.put_string(r.name);
+    sink.end_row();
 }
 
 // ---------------------------------------------------------------------------
@@ -76,25 +67,6 @@ pub struct ColTabRow<'a> {
     pub is_serial: bool,
     pub is_hidden: bool,
 }
-
-const _: () = assert!(
-    emits_every_payload_column(
-        &[
-            COLTAB_PAY_OWNER_ID,
-            COLTAB_PAY_OWNER_KIND,
-            COLTAB_PAY_COL_IDX,
-            COLTAB_PAY_NAME,
-            COLTAB_PAY_TYPE_CODE,
-            COLTAB_PAY_IS_NULLABLE,
-            COLTAB_PAY_FK_TABLE_ID,
-            COLTAB_PAY_FK_COL_IDX,
-            COLTAB_PAY_IS_SERIAL,
-            COLTAB_PAY_IS_HIDDEN,
-        ],
-        COL_TAB_COLS.len()
-    ),
-    "the COL_TAB writer's emit order must match the payload layout"
-);
 
 /// Write one `COL_TAB` row. The key is `pack_col_id(owner_id, col_idx)`, which
 /// rejects an out-of-range owner or column index rather than aliasing another
@@ -130,19 +102,6 @@ pub struct TableTabRow<'a> {
     pub flags: u64,
 }
 
-const _: () = assert!(
-    emits_every_payload_column(
-        &[
-            TABTAB_PAY_SCHEMA_ID,
-            TABTAB_PAY_NAME,
-            TABTAB_PAY_PK_COL_IDX,
-            TABTAB_PAY_FLAGS,
-        ],
-        TABLE_TAB_COLS.len()
-    ),
-    "the TABLE_TAB writer's emit order must match the payload layout"
-);
-
 pub fn write_table_tab_row(sink: &mut impl SysRowSink, r: &TableTabRow, weight: i64) {
     sink.begin_row(r.table_id as u128, weight);
     sink.put_u64(r.schema_id);
@@ -167,20 +126,6 @@ pub struct ViewTabRow<'a> {
     /// `WITH (capacity = …)` in bytes; `0` is unbounded.
     pub capacity_bytes: u64,
 }
-
-const _: () = assert!(
-    emits_every_payload_column(
-        &[
-            VIEWTAB_PAY_SCHEMA_ID,
-            VIEWTAB_PAY_NAME,
-            VIEWTAB_PAY_SQL,
-            VIEWTAB_PAY_PK_COL_IDX,
-            VIEWTAB_PAY_CAPACITY,
-        ],
-        VIEW_TAB_COLS.len()
-    ),
-    "the VIEW_TAB writer's emit order must match the payload layout"
-);
 
 pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i64) {
     sink.begin_row(r.view_id as u128, weight);
@@ -209,19 +154,6 @@ pub struct IdxTabRow<'a> {
     pub is_unique: u64,
 }
 
-const _: () = assert!(
-    emits_every_payload_column(
-        &[
-            IDXTAB_PAY_OWNER_ID,
-            IDXTAB_PAY_SOURCE_COLS,
-            IDXTAB_PAY_NAME,
-            IDXTAB_PAY_IS_UNIQUE,
-        ],
-        IDX_TAB_COLS.len()
-    ),
-    "the IDX_TAB writer's emit order must match the payload layout"
-);
-
 pub fn write_idx_tab_row(sink: &mut impl SysRowSink, r: &IdxTabRow, weight: i64) {
     sink.begin_row(r.index_id as u128, weight);
     sink.put_u64(r.owner_id);
@@ -234,6 +166,14 @@ pub fn write_idx_tab_row(sink: &mut impl SysRowSink, r: &IdxTabRow, weight: i64)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
+        COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND,
+        COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID,
+        IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, SCHEMA_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME,
+        TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX,
+        VIEWTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_SQL, VIEW_TAB_COLS,
+    };
 
     /// A sink that records what a writer emitted, so the tests below read the
     /// row back as a sequence rather than through either side's batch type.
@@ -391,6 +331,60 @@ mod tests {
         assert_eq!(r.vals[IDXTAB_PAY_SOURCE_COLS], Val::U64(9));
         assert_eq!(r.vals[IDXTAB_PAY_NAME], Val::Str("idx_t_b".into()));
         assert_eq!(r.vals[IDXTAB_PAY_IS_UNIQUE], Val::U64(1));
+
+        // Distinct values per field, so a transposed pair in the writer body
+        // fails here rather than round-tripping unnoticed.
+        let mut r = Recorder::default();
+        write_table_tab_row(
+            &mut r,
+            &TableTabRow {
+                table_id: 16,
+                schema_id: 3,
+                name: "t",
+                pk_col_idx: 5,
+                flags: 9,
+            },
+            1,
+        );
+        assert_eq!(r.pk, 16);
+        assert_eq!(r.vals[TABTAB_PAY_SCHEMA_ID], Val::U64(3));
+        assert_eq!(r.vals[TABTAB_PAY_NAME], Val::Str("t".into()));
+        assert_eq!(r.vals[TABTAB_PAY_PK_COL_IDX], Val::U64(5));
+        assert_eq!(r.vals[TABTAB_PAY_FLAGS], Val::U64(9));
+
+        let mut r = Recorder::default();
+        write_view_tab_row(
+            &mut r,
+            &ViewTabRow {
+                view_id: 20,
+                schema_id: 4,
+                name: "v",
+                sql_definition: "SELECT 1",
+                pk_col_idx: 6,
+                capacity_bytes: 4096,
+            },
+            1,
+        );
+        assert_eq!(r.pk, 20);
+        assert_eq!(r.vals[VIEWTAB_PAY_SCHEMA_ID], Val::U64(4));
+        assert_eq!(r.vals[VIEWTAB_PAY_NAME], Val::Str("v".into()));
+        assert_eq!(r.vals[VIEWTAB_PAY_SQL], Val::Str("SELECT 1".into()));
+        assert_eq!(r.vals[VIEWTAB_PAY_PK_COL_IDX], Val::U64(6));
+        assert_eq!(r.vals[VIEWTAB_PAY_CAPACITY], Val::U64(4096));
+
+        let mut r = Recorder::default();
+        write_schema_tab_row(
+            &mut r,
+            &SchemaTabRow {
+                schema_id: 3,
+                name: "public",
+            },
+            1,
+        );
+        assert_eq!(r.pk, 3);
+        assert_eq!(r.vals.len(), SCHEMA_TAB_COLS.len() - 1);
+        assert_eq!(r.vals[0], Val::Str("public".into()));
+        assert!(r.closed);
     }
 
     /// A column index past the packed key's 9-bit field would alias another

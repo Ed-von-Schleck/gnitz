@@ -28,9 +28,8 @@ fn decode_german_col(
             continue;
         }
         let struct_start = reg_off + row * 16;
-        let mut st = [0u8; 16];
-        st.copy_from_slice(&data[struct_start..struct_start + 16]);
-        vals.push(Some(gnitz_wire::try_decode_german_string(&st, blob).ok_or_else(
+        let cell = &data[struct_start..struct_start + 16];
+        vals.push(Some(gnitz_wire::try_decode_german_string(cell, blob).ok_or_else(
             || ProtocolError::DecodeError("German String blob arena out of bounds".into()),
         )?));
     }

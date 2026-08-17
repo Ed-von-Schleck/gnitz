@@ -29,10 +29,10 @@ use crate::{read_u32_le, FLAG_DDL_TXN, FLAG_PUSH_TXN, FLAG_SCAN_MULTI, STATUS_OK
 /// Bytes one `SCAN_MULTI` relation record occupies: a `u64` tid and the client's
 /// `u16` cached schema version (`0` = none, so the server sends that relation's
 /// schema block).
-pub const RELATION_BYTES: usize = 8 + 2;
+pub(crate) const RELATION_BYTES: usize = 8 + 2;
 
 /// Bytes one OCC precondition occupies: `[u64 tid][u64 basis_lsn]`.
-pub const PRECONDITION_BYTES: usize = 8 + 8;
+pub(crate) const PRECONDITION_BYTES: usize = 8 + 8;
 
 /// The least a `PUSH_TXN` family can encode to: its mode byte plus the two WAL
 /// blocks' headers. Bounds a hostile family count against the bytes that
@@ -143,14 +143,15 @@ pub fn encode_scan_multi(client_id: u64, relations: &[(u64, u16)]) -> Vec<u8> {
 // Decode
 // ---------------------------------------------------------------------------
 
-/// Walk the shared prologue, returning `(count, offset of the first item,
-/// capacity hint)`. The hint bounds `count` by what the remaining bytes can
-/// physically hold, so a hostile count cannot force a giant pre-allocation on an
-/// ingress-capped frame.
+/// Walk the shared prologue, returning `(count, offset of the first item)`.
+///
+/// A count past what the remaining bytes can physically hold is rejected here,
+/// so every caller may `Vec::with_capacity(count)` directly and a hostile count
+/// cannot force a giant pre-allocation on an ingress-capped frame.
 ///
 /// The control block is validated (version, region count, checksum) but not
 /// returned — a caller that needs the routing header already peeked it.
-fn decode_prologue(data: &[u8], ctx: &'static str, min_item_bytes: usize) -> Result<(usize, usize, usize), String> {
+fn decode_prologue(data: &[u8], ctx: &'static str, min_item_bytes: usize) -> Result<(usize, usize), String> {
     let ctrl = wal::block_slice_at(data, 0).map_err(|e| format!("{ctx}: control block: {e}"))?;
     peek_control_block(ctrl).map_err(|e| format!("{ctx}: {e}"))?;
     let off = ctrl.len();
@@ -160,7 +161,10 @@ fn decode_prologue(data: &[u8], ctx: &'static str, min_item_bytes: usize) -> Res
     let count = read_u32_le(data, off) as usize;
     let off = off + 4;
     let max_items = data.len().saturating_sub(off) / min_item_bytes + 1;
-    Ok((count, off, count.min(max_items)))
+    if count > max_items {
+        return Err(format!("{ctx}: item count {count} exceeds what the frame holds"));
+    }
+    Ok((count, off))
 }
 
 /// Decode a `FLAG_DDL_TXN` frame into its per-family `(table_id, wal-block
@@ -170,8 +174,8 @@ fn decode_prologue(data: &[u8], ctx: &'static str, min_item_bytes: usize) -> Res
 /// itself.
 pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(u32, &[u8])>, String> {
     const CTX: &str = "DDL_TXN";
-    let (count, mut off, cap) = decode_prologue(data, CTX, WAL_HEADER_SIZE)?;
-    let mut families = Vec::with_capacity(cap);
+    let (count, mut off) = decode_prologue(data, CTX, WAL_HEADER_SIZE)?;
+    let mut families = Vec::with_capacity(count);
     for _ in 0..count {
         let block = wal::block_slice_at(data, off).map_err(|e| format!("{CTX}: family block: {e}"))?;
         families.push((read_u32_le(block, WAL_OFF_TID), block));
@@ -206,8 +210,8 @@ pub type DecodedPushTxn<'a> = (Vec<TxnFamily<'a>>, Vec<(u64, u64)>);
 /// count, which is what lets the prologue and [`decode_ddl_txn`] stay identical.
 pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, String> {
     const CTX: &str = "PUSH_TXN";
-    let (count, mut off, cap) = decode_prologue(data, CTX, MIN_PUSH_FAMILY_BYTES)?;
-    let mut families = Vec::with_capacity(cap);
+    let (count, mut off) = decode_prologue(data, CTX, MIN_PUSH_FAMILY_BYTES)?;
+    let mut families = Vec::with_capacity(count);
     for _ in 0..count {
         if off + 1 > data.len() {
             return Err(format!("{CTX}: family mode truncated"));
@@ -248,11 +252,8 @@ pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, String> {
 /// handler's.
 pub fn decode_scan_multi(data: &[u8]) -> Result<Vec<(u64, u16)>, String> {
     const CTX: &str = "SCAN_MULTI";
-    let (count, off, _cap) = decode_prologue(data, CTX, RELATION_BYTES)?;
+    let (count, off) = decode_prologue(data, CTX, RELATION_BYTES)?;
     let mut r = Reader::new(&data[off..], CTX);
-    if count > r.remaining() / RELATION_BYTES {
-        return Err(format!("{CTX}: relation section truncated"));
-    }
     let mut relations = Vec::with_capacity(count);
     for _ in 0..count {
         relations.push((r.u64()?, r.u16()?));
