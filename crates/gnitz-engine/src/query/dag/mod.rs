@@ -100,17 +100,46 @@ pub enum RelationKind {
     /// Materialised view: ephemeral, partitioned, rebuilt from its sources via
     /// the compiled circuit at open and on live CREATE.
     View,
+    /// Ingestion point: storeless, partitioned, append-only. Pushed rows exist
+    /// only as the deltas they produce; nothing is retained, so there is nothing
+    /// to recover and no store to read.
+    Stream,
 }
 
 impl RelationKind {
-    /// How this relation's tail is recovered. `SalReplay` kinds load shards from
-    /// the manifest and replay the SAL tail; a view output store resumes from
-    /// the manifest the ephemeral checkpoint round stamped, or is rebuilt.
+    /// Which kind a `TABLE_TAB.flags` word describes — the one read of the `stream`
+    /// bit, beside `Placement::from_table_flags` over the same word. VIEW_TAB rows
+    /// do not come through here.
     #[inline]
-    pub fn recovery_source(self) -> RecoverySource {
+    pub fn from_table_flags(flags: u64) -> RelationKind {
+        if gnitz_wire::TableProps::from_flags(flags).stream {
+            RelationKind::Stream
+        } else {
+            RelationKind::BaseTable
+        }
+    }
+
+    /// What to call this relation in a message to the user.
+    #[inline]
+    pub fn noun(self) -> &'static str {
         match self {
-            RelationKind::SystemCatalog | RelationKind::BaseTable => RecoverySource::SalReplay,
-            RelationKind::View => RecoverySource::rederive_checkpointed_now(),
+            RelationKind::SystemCatalog | RelationKind::BaseTable => "table",
+            RelationKind::View => "view",
+            RelationKind::Stream => "stream",
+        }
+    }
+
+    /// How this kind's tail is recovered, or `None` for a kind that owns no store
+    /// and so has no directory and nothing to recover. `SalReplay` kinds load
+    /// shards from the manifest and replay the SAL tail; a view output store
+    /// resumes from the manifest the ephemeral checkpoint round stamped, or is
+    /// rebuilt.
+    #[inline]
+    pub fn recovery_source(self) -> Option<RecoverySource> {
+        match self {
+            RelationKind::SystemCatalog | RelationKind::BaseTable => Some(RecoverySource::SalReplay),
+            RelationKind::View => Some(RecoverySource::rederive_checkpointed_now()),
+            RelationKind::Stream => None,
         }
     }
 
@@ -120,6 +149,13 @@ impl RelationKind {
     #[inline]
     pub fn is_base_table(self) -> bool {
         matches!(self, RelationKind::BaseTable)
+    }
+
+    /// True iff this relation's rows arrive from a client push rather than being
+    /// derived by a circuit.
+    #[inline]
+    pub fn is_ingestion_point(self) -> bool {
+        matches!(self, RelationKind::BaseTable | RelationKind::Stream)
     }
 
     /// True iff this is a materialised view. Gates the read-your-writes drain (a
@@ -171,6 +207,21 @@ impl TableEntry {
             directory,
             index_circuits: Vec::new(),
             capacity_bytes: None,
+        }
+    }
+
+    /// What the client is told this relation is. Lives beside the two fields that
+    /// decide it, so a new [`RelationKind`] is a compile error here rather than a
+    /// silent `Table` at the wire boundary. A bounded view is its own wire class:
+    /// the client's leaf rule refuses to bind one inside a view body, and
+    /// `ALTER VIEW … AS` refuses to retarget it.
+    pub fn class(&self) -> gnitz_wire::RelClass {
+        use gnitz_wire::RelClass;
+        match self.kind {
+            RelationKind::Stream => RelClass::Stream,
+            RelationKind::View if self.capacity_bytes.is_some() => RelClass::BoundedView,
+            RelationKind::View => RelClass::View,
+            RelationKind::BaseTable | RelationKind::SystemCatalog => RelClass::Table,
         }
     }
 

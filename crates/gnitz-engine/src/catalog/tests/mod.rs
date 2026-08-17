@@ -10,6 +10,7 @@ mod reopen_rebuild_tests;
 mod scan_spec_bench;
 mod scan_spec_tests;
 mod source_cursor_tests;
+mod stream_tests;
 mod sys_retraction_tests;
 mod uuid_tests;
 mod view_preflight_tests;
@@ -172,6 +173,33 @@ fn create_flagged_table(
     tid
 }
 
+/// The three non-default `TABLE_TAB.flags` words the fixtures use, so a test reads
+/// as the property under test rather than as a bit pattern.
+fn replicated_flags() -> u64 {
+    gnitz_wire::TableProps {
+        replicated: true,
+        ..Default::default()
+    }
+    .pack()
+}
+
+/// CLUSTER BY the PK's leading `k` columns.
+fn clustered_flags(k: usize) -> u64 {
+    gnitz_wire::TableProps {
+        dist_prefix_len: k,
+        ..Default::default()
+    }
+    .pack()
+}
+
+fn stream_flags() -> u64 {
+    gnitz_wire::TableProps {
+        stream: true,
+        ..Default::default()
+    }
+    .pack()
+}
+
 /// One circuit node for `write_circuit_chain`: opcode, source table, and the
 /// optional expr/param blob.
 type CircuitNode<'a> = (u64, Option<i64>, Option<&'a [u8]>);
@@ -226,35 +254,48 @@ fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, s
 /// Append one raw VIEW_TAB row at `weight`. `sql` is stored verbatim. The bare
 /// `0` pk_col_idx decodes back to a single-column PK `[0]`. A `-1` reproduces
 /// exactly what a `+1` wrote, which is what the retraction CAS compares.
-fn push_view_tab_row(bb: &mut BatchBuilder, weight: i64, vid: i64, view_name: &str, sql: &str) {
+fn push_view_tab_row(bb: &mut BatchBuilder, weight: i64, vid: i64, view_name: &str, sql: &str, capacity_bytes: u64) {
     bb.begin_row(vid as u128, weight);
     bb.put_u64(PUBLIC_SCHEMA_ID as u64);
     bb.put_string(view_name);
     bb.put_string(sql);
     bb.put_u64(0); // pk_col_idx
-    bb.put_u64(0); // capacity_bytes: unbounded
+    bb.put_u64(capacity_bytes); // 0 = unbounded
     bb.end_row();
 }
 
-/// A single-row VIEW_TAB batch for tests that register a view via the raw
-/// system-table path.
+/// A single-row unbounded-VIEW_TAB batch for tests that register a view via the
+/// raw system-table path. A test that needs a capacity calls `push_view_tab_row`.
 fn build_view_tab_row(vid: i64, view_name: &str, sql: &str) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, vid, view_name, sql);
+    push_view_tab_row(&mut bb, 1, vid, view_name, sql, 0);
     bb.finish()
 }
 
 /// Register an identity view over `base_tid` through the raw system-table path,
 /// returning its vid. The circuit and column records precede the VIEW_TAB row —
-/// the order `hook_view_register` needs to resolve the view's sources and
-/// schema.
-fn register_identity_view(engine: &mut CatalogEngine, base_tid: i64, name: &str, cols: &[ColumnDef]) -> i64 {
+/// the order `hook_view_register` needs to resolve the view's sources and schema.
+/// `capacity_bytes` of `0` is unbounded. Returns the registration's own error so a
+/// test can assert on a rejected one.
+fn try_register_identity_view(
+    engine: &mut CatalogEngine,
+    base_tid: i64,
+    name: &str,
+    cols: &[ColumnDef],
+    capacity_bytes: u64,
+) -> Result<i64, String> {
     let vid = engine.allocate_table_id();
     write_identity_circuit(engine, vid, base_tid, None);
     engine.write_column_records(vid, OWNER_KIND_VIEW, cols).unwrap();
-    let batch = build_view_tab_row(vid, name, "");
-    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
-    vid
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
+    push_view_tab_row(&mut bb, 1, vid, name, "", capacity_bytes);
+    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish())?;
+    Ok(vid)
+}
+
+/// [`try_register_identity_view`] for an unbounded view that must succeed.
+fn register_identity_view(engine: &mut CatalogEngine, base_tid: i64, name: &str, cols: &[ColumnDef]) -> i64 {
+    try_register_identity_view(engine, base_tid, name, cols, 0).unwrap()
 }
 
 /// A COL_TAB rewrite pair on column `col_idx` of `owner_id`: `mutate` produces

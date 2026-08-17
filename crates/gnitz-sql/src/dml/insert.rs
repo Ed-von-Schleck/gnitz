@@ -16,7 +16,7 @@ use crate::exec::batch::{project, resolve_projection, RowGather};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::null_word_set;
-use gnitz_core::{FixedInt, GnitzClient, PkTuple, Schema, ViewBuffers, WireConflictMode, ZSetBatch};
+use gnitz_core::{FixedInt, GnitzClient, PkTuple, RelClass, Schema, ViewBuffers, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
     Assignment, ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
     SelectItem, SetExpr, TableObject, Values,
@@ -106,7 +106,8 @@ pub(crate) fn execute_insert(
     // Extract table name, row source, ON CONFLICT action, and RETURNING clause.
     let (table_name_str, rows, columns, on_insert, returning) = extract_insert_parts(insert)?;
 
-    let (tid, schema) = binder.resolve_base_table(client, &table_name_str)?;
+    let (tid, schema, class) = binder.resolve_push_target(client, &table_name_str)?;
+    let is_stream = class == RelClass::Stream;
 
     // INSERT is positional; reject any column list that isn't every non-SERIAL
     // column in schema order (it would otherwise silently misplace values).
@@ -135,6 +136,13 @@ pub(crate) fn execute_insert(
             conflict_target,
             action,
         })) => {
+            // Both actions resolve the incoming row against existing rows with a
+            // client-side seek before pushing, and a stream has no store to seek.
+            if is_stream {
+                return Err(GnitzSqlError::Unsupported(format!(
+                    "'{table_name_str}' is a stream; ON CONFLICT needs stored rows to resolve against"
+                )));
+            }
             validate_conflict_target(conflict_target, &schema)?;
 
             match action {
@@ -262,7 +270,15 @@ pub(crate) fn execute_insert(
             // commit the row and then fail); `project` afterwards is infallible and
             // consumes the batch, so nothing is copied.
             let proj = returning.map(|items| resolve_projection(items, &schema)).transpose()?;
-            client.push_with_mode(tid, &schema, &batch, WireConflictMode::Error)?;
+            // A stream has no PK conflict to reject: the engine refuses `Error` on
+            // one and leaves `Update` unread, so the push appends. INSERTing the
+            // same row twice therefore yields one element at weight 2.
+            let mode = if is_stream {
+                WireConflictMode::Update
+            } else {
+                WireConflictMode::Error
+            };
+            client.push_with_mode(tid, &schema, &batch, mode)?;
             match proj {
                 Some(proj) => {
                     let (proj_schema, proj_batch) = project(proj, &schema, Some(batch));

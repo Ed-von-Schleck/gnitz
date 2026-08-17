@@ -720,6 +720,16 @@ impl Batch {
             .map(|w| i64::from_le_bytes(w.try_into().unwrap()))
             .sum()
     }
+    /// True iff every row's weight is `> 0` — vacuously true for an empty batch.
+    /// Branch-free over the same contiguous region [`Self::sum_weights`] reads, so
+    /// the conforming case is one pass with no early exit to serialize it.
+    #[inline]
+    pub fn all_weights_positive(&self) -> bool {
+        !self
+            .weight_data()
+            .chunks_exact(8)
+            .fold(false, |bad, w| bad | (i64::from_le_bytes(w.try_into().unwrap()) <= 0))
+    }
     #[inline(always)]
     pub fn get_null_word(&self, row: usize) -> u64 {
         read_u64_le(&self.data[self.offsets[REG_NULL_BMP]..], row * 8)

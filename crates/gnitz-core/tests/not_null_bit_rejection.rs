@@ -14,6 +14,7 @@
 //! would never build.
 
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
+use gnitz_core::TableProps;
 use gnitz_core::{
     encode_message_parts, BatchAppender, GnitzClient, PkTuple, Session, WireConflictMode, ZSetBatch, FLAG_PUSH,
 };
@@ -60,7 +61,9 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
         ColumnDef::new("v", TypeCode::I64, false),
         ColumnDef::new("w", TypeCode::I64, true),
     ];
-    client.create_table(&sn, "t", &cols, &[0], false, 0, &[]).unwrap();
+    client
+        .create_table(&sn, "t", &cols, &[0], TableProps::default(), &[])
+        .unwrap();
     let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
 
     let build = || {

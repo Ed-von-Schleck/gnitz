@@ -283,7 +283,7 @@ impl DagEngine {
         debug_assert!(
             self.tables
                 .get(&view_id)
-                .is_none_or(|e| e.kind.recovery_source() != RecoverySource::SalReplay),
+                .is_none_or(|e| e.kind.recovery_source() != Some(RecoverySource::SalReplay)),
             "distributed backfill into durable relation {view_id}: \
              would double-count loaded shards",
         );

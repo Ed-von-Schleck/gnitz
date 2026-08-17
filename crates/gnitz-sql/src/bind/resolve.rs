@@ -1,6 +1,6 @@
 use crate::ast_util::{classify_from, extract_table_factor_name, is_bare_wildcard_projection, FromShape};
 use crate::error::GnitzSqlError;
-use gnitz_core::{ColumnDef, GnitzClient, Schema};
+use gnitz_core::{ColumnDef, GnitzClient, RelClass, Schema};
 use sqlparser::ast::{Expr, Select, SelectItem, TableAliasColumnDef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,14 +46,6 @@ pub(crate) fn find_unique_column<'a>(
     Ok(found)
 }
 
-/// What the catalog issued an id as. `None` wherever this appears means the id
-/// was not catalog-issued at all — see [`CachedRelation::catalog_kind`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum RelationKind {
-    Table,
-    View,
-}
-
 /// One Binder cache entry: a name's resolved id and schema, plus how that id was
 /// issued.
 ///
@@ -69,12 +61,12 @@ pub(crate) enum RelationKind {
 struct CachedRelation {
     table_id: u64,
     schema: Arc<Schema>,
-    catalog_kind: Option<RelationKind>,
+    catalog_kind: Option<RelClass>,
 }
 
 /// A resolved relation: its id, its schema, and `None` if the id was chain-minted
 /// rather than catalog-issued.
-pub(crate) type Resolved = (u64, Arc<Schema>, Option<RelationKind>);
+pub(crate) type Resolved = (u64, Arc<Schema>, Option<RelClass>);
 
 pub(crate) struct Binder<'a> {
     schema_name: &'a str,
@@ -105,7 +97,7 @@ impl<'a> Binder<'a> {
     /// form — the single fold site, so a case-varying reference (`WITH Cc … FROM
     /// cc`) hits regardless of which caller inserted (SQL identifiers are
     /// case-insensitive).
-    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Arc<Schema>, catalog_kind: Option<RelationKind>) {
+    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Arc<Schema>, catalog_kind: Option<RelClass>) {
         self.cache.insert(
             name.to_ascii_lowercase(),
             CachedRelation {
@@ -143,51 +135,74 @@ impl<'a> Binder<'a> {
         // direct FROM, join sides, subquery inners, set-op sides and CTE bodies
         // alike. A chain-minted segment id never reaches here (it is served from
         // the alias cache) and a hidden segment never carries a capacity.
-        if self.view_body && rel.is_bounded {
+        if self.view_body && rel.class == RelClass::BoundedView {
             return Err(GnitzSqlError::Unsupported(format!(
                 "'{name}' is a capacity-bounded view; views cannot be created over it"
             )));
         }
-        let kind = Some(if rel.is_view {
-            RelationKind::View
-        } else {
-            RelationKind::Table
-        });
+        // The opposite polarity to the leaf rule above, through the same funnel: a
+        // view body is exactly where reading a stream is the point.
+        if !self.view_body && rel.class == RelClass::Stream {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "'{name}' is a stream; it holds no rows and can only be read inside a view body"
+            )));
+        }
+        let kind = Some(rel.class);
         self.cache_relation(name, rel.tid, Arc::clone(&schema), kind);
         Ok((rel.tid, schema, kind))
     }
 
-    /// Resolve a write/index target that must be a base table. INSERT, UPDATE,
-    /// DELETE and CREATE INDEX may only act on base tables: a view is a read-only
-    /// derived relation whose store is maintained solely by its circuit, so
-    /// writing to it or indexing it corrupts that state. `resolve` (used by
-    /// SELECT and view definitions) still accepts views; this is the
-    /// writable-target variant.
+    /// Resolve a write/index target that must be a base table: UPDATE, DELETE and
+    /// CREATE INDEX all read stored rows back before writing, and a view's store is
+    /// maintained solely by its circuit while a stream has none at all. `resolve`
+    /// (used by SELECT and view definitions) still accepts views.
+    ///
+    /// Same reserved-prefix rule as the read funnel, for the same reason: a write
+    /// target naming a leading-`_` relation can only be a user reaching for system
+    /// plumbing (a hidden segment). Rejecting before the catalog probe also closes
+    /// the existence side-channel a two-probe fallback would open — one resolve
+    /// answers id, schema and class together, so "is a view" and "does not exist" are
+    /// distinguished without a second probe.
     pub(crate) fn resolve_base_table(
         &mut self,
         client: &mut GnitzClient,
         name: &str,
     ) -> Result<(u64, Arc<Schema>), GnitzSqlError> {
-        // Same reserved-prefix rule as the read funnel: a write/index target
-        // naming a leading-`_` relation can only be a user reaching for system
-        // plumbing (a hidden segment). Rejecting here — before the catalog probe —
-        // also closes the existence side-channel the two-probe fallback below
-        // would otherwise open (a hidden segment returns "is a view", a missing
-        // name returns "not found").
         crate::validate::validate_user_name(name)?;
-        // One resolve answers id, schema and kind together, so "is a view" and
-        // "does not exist" are distinguished without a second probe.
         let (schema, rel) = client
             .resolve_relation(self.schema_name, name)
             .map_err(GnitzSqlError::Exec)?;
-        if rel.is_view {
+        if rel.class != RelClass::Table {
             return Err(GnitzSqlError::Unsupported(format!(
-                "'{name}' is a view; INSERT, UPDATE, DELETE and CREATE INDEX \
-                 require a base table"
+                "'{name}' is a {}; UPDATE, DELETE and CREATE INDEX require a base table",
+                rel.class.noun()
             )));
         }
-        self.cache_relation(name, rel.tid, Arc::clone(&schema), Some(RelationKind::Table));
+        self.cache_relation(name, rel.tid, Arc::clone(&schema), Some(RelClass::Table));
         Ok((rel.tid, schema))
+    }
+
+    /// Resolve an INSERT target, which may be a base table or a stream — the one
+    /// writable-target caller that admits a stream. Same name rule as
+    /// [`Self::resolve_base_table`]. Deliberately does not cache: [`Self::resolve`]
+    /// returns on a cache hit before its class rules run, so a cached stream would
+    /// let a later reference to the name pass as an ordinary readable relation.
+    pub(crate) fn resolve_push_target(
+        &mut self,
+        client: &mut GnitzClient,
+        name: &str,
+    ) -> Result<(u64, Arc<Schema>, RelClass), GnitzSqlError> {
+        crate::validate::validate_user_name(name)?;
+        let (schema, rel) = client
+            .resolve_relation(self.schema_name, name)
+            .map_err(GnitzSqlError::Exec)?;
+        if rel.class.is_view() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "'{name}' is a {}; INSERT requires a base table or a stream",
+                rel.class.noun()
+            )));
+        }
+        Ok((rel.tid, schema, rel.class))
     }
 
     /// Cache a CTE / derived-table alias as resolving to the given
@@ -318,9 +333,9 @@ mod tests {
         let kind = |b: &Binder<'_>, n: &str| b.cache.get(&n.to_ascii_lowercase()).map(|e| e.catalog_kind);
         let mut b = Binder::new("public");
         b.cache_alias("minted", (1, Arc::clone(&schema), None)).unwrap();
-        b.cache_alias("real", (16, Arc::clone(&schema), Some(RelationKind::Table)))
+        b.cache_alias("real", (16, Arc::clone(&schema), Some(RelClass::Table)))
             .unwrap();
-        b.cache_alias("aview", (17, Arc::clone(&schema), Some(RelationKind::View)))
+        b.cache_alias("aview", (17, Arc::clone(&schema), Some(RelClass::View)))
             .unwrap();
 
         assert_eq!(
@@ -328,11 +343,11 @@ mod tests {
             Some(None),
             "a chain-minted id is not catalog-issued"
         );
-        assert_eq!(kind(&b, "real"), Some(Some(RelationKind::Table)));
-        assert_eq!(kind(&b, "aview"), Some(Some(RelationKind::View)));
+        assert_eq!(kind(&b, "real"), Some(Some(RelClass::Table)));
+        assert_eq!(kind(&b, "aview"), Some(Some(RelClass::View)));
         assert_eq!(kind(&b, "unseen"), None);
         // Provenance keys on the same lowercased string as the resolution.
-        assert_eq!(kind(&b, "REAL"), Some(Some(RelationKind::Table)));
+        assert_eq!(kind(&b, "REAL"), Some(Some(RelClass::Table)));
         assert_eq!(kind(&b, "MINTED"), Some(None));
 
         // Shadowing: a minted alias overwriting a catalog resolution must drop

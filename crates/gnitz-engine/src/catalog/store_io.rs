@@ -223,11 +223,11 @@ impl CatalogEngine {
     /// single-key `None` — so a removed PK with no committed row contributes
     /// nothing. `project` lists the parent column indices to return (all
     /// non-PK scalar columns); an empty `project` returns PK-only rows.
-    /// Each PK resolves to its group's FIRST live row, which is also its only
-    /// one: an FK parent is always a base table (`gnitz-sql` resolves
-    /// `fk_table_id` through TABLE_TAB), whose PK `enforce_unique_pk` keeps
-    /// unique. The consumer requires that — it indexes the result by PK, so a
-    /// second row of a group would overwrite the first rather than join it.
+    /// Each PK resolves to its group's FIRST live row, which is also its only one:
+    /// `validate_fk_column` admits only a base table as an FK parent, and a base
+    /// table's PK is kept unique by `enforce_unique_pk`. The consumer requires that —
+    /// it indexes the result by PK, so a second row of a group would overwrite the
+    /// first rather than join it.
     /// The seek and `pk IN (…)` readers, whose consumers take whole groups, walk
     /// instead.
     ///

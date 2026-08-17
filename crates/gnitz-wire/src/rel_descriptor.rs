@@ -13,7 +13,8 @@
 //!
 //! ```text
 //! u8   version
-//! u8   flags         bit 0 = replicated, bit 1 = view, bit 2 = capacity-bounded
+//! u8   flags         bit 0 = replicated; bits 1..4 = the relation's class
+//!                    (bit 1 = view, bit 2 = capacity-bounded, bit 3 = stream)
 //! u16  fk_count
 //! u16  index_count
 //!      fk_count    × { u32 col_idx, u32 fk_col_idx, u64 fk_table_id }
@@ -38,13 +39,65 @@ const VERSION: u8 = 1;
 
 /// Descriptor `flags` bit 0: the relation's rows are a full copy on every worker.
 const DESC_FLAG_REPLICATED: u8 = 1 << 0;
-/// Descriptor `flags` bit 1: the relation is a view, not a base table.
+/// Descriptor `flags` bits 1..4: the [`RelClass`] encoding. Spare bits of the
+/// existing byte, so no field offset moves and `VERSION` stays put.
 const DESC_FLAG_VIEW: u8 = 1 << 1;
-/// Descriptor `flags` bit 2: the relation is a capacity-bounded view. Views
-/// cannot be created over one (the leaf rule), and `ALTER VIEW … AS` cannot
-/// retarget it. A spare bit of the existing byte, so no field offset moves and
-/// `VERSION` stays put.
 const DESC_FLAG_BOUNDED: u8 = 1 << 2;
+const DESC_FLAG_STREAM: u8 = 1 << 3;
+const DESC_FLAG_CLASS: u8 = DESC_FLAG_VIEW | DESC_FLAG_BOUNDED | DESC_FLAG_STREAM;
+
+/// What a relation *is* — the one vocabulary the client and the engine share for
+/// this. A single value rather than three independent booleans, so the impossible
+/// combinations (a bounded non-view, a view that is also a stream) cannot be built
+/// on either side or arrive off the wire.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum RelClass {
+    #[default]
+    Table,
+    /// A storeless, append-only ingestion point. It holds no rows, so it may be
+    /// written but not read — except inside a view body, which is what it is for.
+    Stream,
+    View,
+    /// A view created `WITH (capacity = …)`. Views may not be created over one (the
+    /// leaf rule) and `ALTER VIEW … AS` may not retarget one.
+    BoundedView,
+}
+
+impl RelClass {
+    /// What to call this relation in a message to the user. Both view classes are
+    /// "view": the rules that turn on the capacity carry their own wording.
+    pub fn noun(self) -> &'static str {
+        match self {
+            RelClass::Table => "table",
+            RelClass::Stream => "stream",
+            RelClass::View | RelClass::BoundedView => "view",
+        }
+    }
+
+    /// True for both view classes.
+    pub fn is_view(self) -> bool {
+        matches!(self, RelClass::View | RelClass::BoundedView)
+    }
+
+    fn to_flags(self) -> u8 {
+        match self {
+            RelClass::Table => 0,
+            RelClass::Stream => DESC_FLAG_STREAM,
+            RelClass::View => DESC_FLAG_VIEW,
+            RelClass::BoundedView => DESC_FLAG_VIEW | DESC_FLAG_BOUNDED,
+        }
+    }
+
+    fn from_flags(flags: u8) -> Result<RelClass, String> {
+        match flags & DESC_FLAG_CLASS {
+            0 => Ok(RelClass::Table),
+            DESC_FLAG_STREAM => Ok(RelClass::Stream),
+            DESC_FLAG_VIEW => Ok(RelClass::View),
+            f if f == DESC_FLAG_VIEW | DESC_FLAG_BOUNDED => Ok(RelClass::BoundedView),
+            f => Err(format!("rel descriptor: no relation class for flag bits {f:#04x}")),
+        }
+    }
+}
 
 /// Bit 0 of an index entry's `flags` word.
 const INDEX_FLAG_UNIQUE: u64 = 1;
@@ -72,9 +125,7 @@ pub struct RelIndex {
 /// The decoded descriptor blob.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct RelDescriptorBlob {
-    pub is_view: bool,
-    /// The relation is a view created `WITH (capacity = …)`.
-    pub is_bounded: bool,
+    pub class: RelClass,
     /// The relation's rows are a full copy on every worker.
     pub replicated: bool,
     pub fks: Vec<RelFk>,
@@ -92,9 +143,7 @@ impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
         debug_assert!(self.fks.len() <= u16::MAX as usize && self.indexes.len() <= u16::MAX as usize);
         let mut w = Writer::with_capacity(HEADER_LEN + 16 * (self.fks.len() + self.indexes.len()));
-        let flags = if self.replicated { DESC_FLAG_REPLICATED } else { 0 }
-            | if self.is_view { DESC_FLAG_VIEW } else { 0 }
-            | if self.is_bounded { DESC_FLAG_BOUNDED } else { 0 };
+        let flags = self.class.to_flags() | if self.replicated { DESC_FLAG_REPLICATED } else { 0 };
         w.u8(VERSION)
             .u8(flags)
             .u16(self.fks.len() as u16)
@@ -132,9 +181,10 @@ impl RelDescriptorBlob {
             return Err(format!("rel descriptor: unknown version {version}"));
         }
         let flags = r.u8()?;
-        if flags & !(DESC_FLAG_REPLICATED | DESC_FLAG_VIEW | DESC_FLAG_BOUNDED) != 0 {
+        if flags & !(DESC_FLAG_REPLICATED | DESC_FLAG_CLASS) != 0 {
             return Err(format!("rel descriptor: unknown flag bits {flags:#04x}"));
         }
+        let class = RelClass::from_flags(flags)?;
         let fk_count = r.u16()? as usize;
         let index_count = r.u16()? as usize;
 
@@ -177,8 +227,7 @@ impl RelDescriptorBlob {
 
         r.expect_consumed()?;
         Ok(Some(RelDescriptorBlob {
-            is_view: flags & DESC_FLAG_VIEW != 0,
-            is_bounded: flags & DESC_FLAG_BOUNDED != 0,
+            class,
             replicated: flags & DESC_FLAG_REPLICATED != 0,
             fks,
             indexes,
@@ -216,8 +265,7 @@ mod tests {
     #[test]
     fn multi_column_index_and_multi_fk_roundtrip() {
         let d = RelDescriptorBlob {
-            is_view: true,
-            is_bounded: true,
+            class: RelClass::BoundedView,
             replicated: true,
             fks: vec![
                 RelFk {
@@ -243,6 +291,37 @@ mod tests {
             ],
         };
         assert_eq!(roundtrip(&d, 3), d);
+    }
+
+    /// Every class survives a roundtrip alongside `replicated`, which is orthogonal
+    /// to all of them: reading `replicated` back as false on a replicated stream
+    /// would make every worker hold a full copy while the client still folded
+    /// per-worker partials.
+    #[test]
+    fn every_class_roundtrips_with_replicated() {
+        for class in [RelClass::Table, RelClass::Stream, RelClass::View, RelClass::BoundedView] {
+            for &replicated in &[false, true] {
+                let d = RelDescriptorBlob {
+                    class,
+                    replicated,
+                    ..Default::default()
+                };
+                let back = roundtrip(&d, 2);
+                assert_eq!(back, d, "{class:?} replicated={replicated}");
+            }
+        }
+    }
+
+    /// The class bits are a closed set: a word naming no class is rejected rather
+    /// than silently read as one of them.
+    #[test]
+    fn a_flag_word_naming_no_class_is_rejected() {
+        let mut bytes = RelDescriptorBlob::default().encode();
+        for bad in [DESC_FLAG_BOUNDED, DESC_FLAG_VIEW | DESC_FLAG_STREAM, DESC_FLAG_CLASS] {
+            bytes[1] = bad;
+            let err = RelDescriptorBlob::decode(&bytes, 4).unwrap_err();
+            assert!(err.contains("no relation class"), "flags {bad:#04x} gave: {err}");
+        }
     }
 
     /// Every non-empty prefix short of the whole must be an error — only the

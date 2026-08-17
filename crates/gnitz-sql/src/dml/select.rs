@@ -25,7 +25,7 @@ use crate::ast_util::{
     is_bare_wildcard_projection, FromShape,
 };
 use crate::bind::cte_passthrough;
-use crate::bind::{bind_single_table, Binder, RelationKind};
+use crate::bind::{bind_single_table, Binder};
 use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::group_by::{analyze_group_by, bind_having_expr, resolve_set_projection, HavingCtx};
 use crate::dml::plan::{bound_and_predicate, extract_limit, extract_offset, fetch_bound, AccessPlan, ReadBudget};
@@ -39,7 +39,7 @@ use crate::validate::{
     HonoredClauses, HonoredQueryClauses,
 };
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, ReduceOutKey, Schema, ZSetBatch, MAX_COLUMNS};
+use gnitz_core::{GnitzClient, ReduceOutKey, RelClass, Schema, ZSetBatch, MAX_COLUMNS};
 use gnitz_wire::{AggReadItem, AggReadSpec, ReadSink};
 use sqlparser::ast::{Expr, LimitClause, Query, Select, SetExpr};
 use std::sync::Arc;
@@ -97,7 +97,7 @@ pub(super) struct Target {
     pub(super) schema: Arc<Schema>,
     /// `None` is a chain-minted segment id, which never reaches here: a derived
     /// table in FROM is rejected as a derivation before any resolution.
-    pub(super) kind: Option<RelationKind>,
+    pub(super) kind: Option<RelClass>,
 }
 
 /// Which sink a validated ad-hoc SELECT lands on.

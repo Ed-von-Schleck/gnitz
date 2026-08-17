@@ -33,6 +33,16 @@ impl CatalogEngine {
                 .tables
                 .get(&col.fk_table_id)
                 .ok_or_else(|| format!("FK references unknown table_id {}", col.fk_table_id))?;
+            // Not covered by the PK/UNIQUE tests below, which read only the schema:
+            // a stream and a view both have a PK that looks exactly like a base
+            // table's without being the unique, stored key the parent probe reads.
+            if !entry.kind.is_base_table() {
+                return Err(format!(
+                    "FK references relation {}, which is a {}; a FOREIGN KEY must reference a base table",
+                    col.fk_table_id,
+                    entry.kind.noun()
+                ));
+            }
             let pk = entry.schema.pk_indices();
             let is_lone_pk = pk.len() == 1 && pk[0] == col.fk_col_idx;
             if !is_lone_pk {

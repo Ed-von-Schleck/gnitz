@@ -206,6 +206,9 @@ impl CatalogEngine {
     /// owns no store at all: it registers the relation `Detached` so it and
     /// worker 0 do not both hold a live `Table` on `w0of{W}`.
     ///
+    /// Both storeless cases are decided here rather than at the callers, so a new
+    /// caller cannot build a `Table` for one of them.
+    ///
     /// Crash-cleanup of the directory is the caller's: this takes `&self` and is
     /// pure construction.
     pub(crate) fn build_relation_store(
@@ -216,6 +219,11 @@ impl CatalogEngine {
         schema: SchemaDescriptor,
         capacity_bytes: Option<u64>,
     ) -> Result<StoreHandle, String> {
+        // Above `ensure_dir`: a kind with no recovery source owns no store in any
+        // process, so no directory is created for one.
+        let Some(recovery) = kind.recovery_source() else {
+            return Ok(StoreHandle::Detached);
+        };
         ensure_dir(directory)?;
         if !self.owns_stores {
             return Ok(StoreHandle::Detached);
@@ -231,7 +239,7 @@ impl CatalogEngine {
         }
 
         let child = ChildAddr::this_worker(self.num_workers);
-        let mut table = Table::new(&child.dir(directory), schema, id as u32, kind.recovery_source())
+        let mut table = Table::new(&child.dir(directory), schema, id as u32, recovery)
             .map_err(|e| format!("Failed to open relation {id}: error {e} (dir={directory})"))?;
         // Every store this worker opens for a relation comes through here, so a
         // bounded view cannot come back unbounded from a rehome or a rebuild.
@@ -297,16 +305,15 @@ impl CatalogEngine {
             depth,
             capacity_bytes,
         } = reg;
-        let kind_str = if kind.is_view() { "view" } else { "table" };
         let col_defs = self.read_column_defs(id);
-        validate_relation_defs(kind_str, id, name, &col_defs, pk)?;
+        validate_relation_defs(kind, id, name, &col_defs, pk)?;
 
         let schema_name = self.caches.schema_by_id.get(&schema_id).cloned().unwrap_or_default();
         let directory = relation_dir(&self.base_dir, &schema_name, kind, id);
         let schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), placement)?;
         gnitz_debug!(
             "catalog: creating {} dir={} name={} id={} workers={}",
-            kind_str,
+            kind.noun(),
             directory,
             name,
             id,
@@ -317,7 +324,11 @@ impl CatalogEngine {
         } else {
             self.reopen_relation_store(kind, &directory, id, schema, capacity_bytes)?
         };
-        fsync_dir(&schema_dir(&self.base_dir, &schema_name));
+        // A storeless kind created no directory, so the schema dir gained no entry to
+        // make durable; its definition rides on the system tables like any other row.
+        if kind.recovery_source().is_some() {
+            fsync_dir(&schema_dir(&self.base_dir, &schema_name));
+        }
         self.dag.register_table(
             id,
             crate::query::TableEntry {
@@ -378,7 +389,7 @@ impl CatalogEngine {
                 let placement = Placement::from_table_flags(flags)
                     .map_err(|e| format!("catalog invariant violated: table '{name}' (tid={tid}) is {e}."))?;
                 self.register_relation(RelationRegistration {
-                    kind: RelationKind::BaseTable,
+                    kind: RelationKind::from_table_flags(flags),
                     id: tid,
                     schema_id: sid,
                     name: &name,
@@ -612,22 +623,27 @@ impl CatalogEngine {
                 // The circuit's `circuit_nodes` are persisted before this VIEW_TAB
                 // row, so `get_source_ids` resolves here.
                 let source_ids = self.dag.get_source_ids(vid);
-                // Leaf rule: a bounded view's store is skeletonized, so it is not
-                // a fidelity-preserving source for anything downstream — and its
-                // own hydration replays *sources*, which must therefore be
-                // unbounded. `ScanDelta` is the only external-source opcode in the
-                // wire vocabulary, so this covers every source of every circuit,
+                // What a view may not read. Both rules trace to skeleton rows being
+                // recomputed from the *source* store: a bounded view's own store is
+                // skeletonized, and a stream's holds nothing to recompute from.
+                // `ScanDelta` is the only external-source opcode in the wire
+                // vocabulary, so `source_ids` covers every source of every circuit,
                 // a hand-built circuit-builder-API view included. Within-bundle
-                // hidden segments are unresolvable here and never carry a
-                // capacity.
-                if let Some(src) = source_ids
-                    .iter()
-                    .find(|id| self.dag.tables.get(id).is_some_and(|e| e.capacity_bytes.is_some()))
-                {
-                    return Err(format!(
-                        "view '{name}' (vid={vid}) reads relation {src}, which is a capacity-bounded view; \
-                         views cannot be created over one"
-                    ));
+                // hidden segments are unresolvable here and never carry a capacity.
+                for &src in &source_ids {
+                    let Some(e) = self.dag.tables.get(&src) else { continue };
+                    if e.capacity_bytes.is_some() {
+                        return Err(format!(
+                            "view '{name}' (vid={vid}) reads relation {src}, which is a \
+                             capacity-bounded view; views cannot be created over one"
+                        ));
+                    }
+                    if capacity_bytes.is_some() && e.kind == RelationKind::Stream {
+                        return Err(format!(
+                            "view '{name}' (vid={vid}) reads relation {src}, which is a stream; \
+                             a capacity-bounded view cannot be created over one"
+                        ));
+                    }
                 }
                 // Where this view's rows live, folded from its sources' own
                 // stamped placements. Stamping the fold is what makes the property

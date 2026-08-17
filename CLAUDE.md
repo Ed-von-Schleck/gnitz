@@ -594,9 +594,68 @@ precondition of storage correctness here: it plus base-table positivity is what
 makes a skeleton row's single summed weight per key exact. A future *partial*
 compaction that broke it would corrupt bounded views.
 
+## Streams
+
+```sql
+CREATE TABLE events (id BIGINT PRIMARY KEY, kind BIGINT, amount BIGINT)
+    WITH (stream = true);
+CREATE VIEW hot AS SELECT kind, SUM(amount) AS total FROM events GROUP BY kind;
+-- push rows into `events`, or INSERT into it; read `hot`.
+-- SELECT * FROM events  → error: a stream holds no rows.
+```
+
+A **stream** is a relation with a schema and a primary key that holds no rows.
+Views over it are maintained exactly as views over a table are, but nothing it
+ingests is ever *recovered*: pushed rows exist only as the deltas they produce, and
+every view reaching a stream is reset and rebuilt at boot. The stream's
+*definition* is ordinary durable catalog state. Target: log-structured ingestion,
+where the raw log lives upstream and only the derived view state is worth keeping.
+
+A stream push skips the `fdatasync` before the ACK, the store write, and the LSM
+point probe per distinct PK. Removing the pre-ACK sync is a **latency** win, so it
+concentrates at small batch sizes and amortizes away as the batch grows. It accrues
+to *stream-only* commit batches — a stream push the committer coalesces with a
+base-table push rides that batch's zone and its sync, so those rows do reach the
+disk, and are discarded on replay.
+
+**A stream is append-only.** Pushed weights must be `>= 1`; the engine rejects a
+batch containing any weight `<= 0`, which is what keeps §1's positivity invariant
+engine-enforced (nothing clamps a stream's weights the way `enforce_unique_pk`
+clamps a base table's). CDC input carrying a before-image retraction is therefore
+not expressible against a stream.
+
+Its PK is a routing, sort and identity key and is **not unique**: duplicate PKs
+with different payloads are legal, exactly as for intermediate batches inside a
+circuit. So `INSERT INTO events VALUES (1, …)` twice yields one element at weight
+2, where the same statement against a table raises a duplicate-key error.
+
+`WITH (replicated = true)` and `CLUSTER BY` mean what they mean for a table.
+Rejected: reading a stream anywhere outside a view body (SQL or wire), `UPDATE`,
+`DELETE`, `CREATE INDEX`, `ALTER TABLE` column ops, `INSERT … ON CONFLICT`,
+`SERIAL`, a `FOREIGN KEY` to or from one, a write inside a transaction, and
+`WITH (capacity = …)` on a view over one. `DROP TABLE` and `ALTER TABLE … RENAME
+TO` work.
+
+At boot, a view reaching a stream **returns to the value it would have if the
+stream had never received a row** — zero rows for `stream ⋈ table`, fully
+null-filled for `table LEFT JOIN stream`, and *grown* for
+`SELECT id FROM t EXCEPT SELECT id FROM s`. Non-monotone, and correct.
+
+Backpressure: pushed batches sit in the worker's `pending_deltas` in RAM until a
+tick drains them, bounded by the tick trigger; the client is bounded by waiting on
+the push ACK. A stream's rows occupy the SAL exactly as a table's do, so it is
+reclaimed by the same byte-based checkpoint test and at the same rate — except
+inside a DDL window, where no checkpoint runs, and where a stream is the most likely
+thing to reach the ceiling.
+
+Every read of a stream-fed view drains pending ticks: freshness is measured against
+`published()`, which a stream push never advances. A cost, not a correctness defect
+— when nothing is pending the drain takes `run_tick`'s empty fast path.
+
 ## SAL durability contract
 
-**Rule: an ACK to a client implies fdatasync iff the operation upserted data.**
+**Rule: an ACK to a client implies fdatasync iff the operation wrote something a
+restart must recover.**
 
 The SAL (Shared Append-Only Log) carries both data writes and ephemeral
 commands on the same mmap'd fd. Workers see all SAL entries immediately
@@ -605,10 +664,11 @@ for cross-process visibility. It exists solely for crash recovery.
 
 Durable operations are atomic: crash recovery applies an operation in full
 or not at all, so a crash never leaves a half-written DDL or push behind.
-Operations that upsert table data fdatasync before the ACK; command-only
-operations — view ticks, scans, seeks, backfills, validation queries —
-wake the workers without it, since a lost command needs no recovery
-(base-table data is intact and views are re-derived).
+They fdatasync before the ACK, publish their zone LSN, and reply with it.
+Everything else wakes the workers without a sync and replies LSN `0`: the
+command-only operations — view ticks, scans, seeks, backfills, validation
+queries — plus a push to a **stream**, which upserts nothing that survives a
+restart. The dichotomy is what must be recovered, not what carries rows.
 
 The **checkpoint** is the sole shard-durability point: between checkpoints no
 table publishes a manifest on the ingest path, so the fsynced SAL alone carries

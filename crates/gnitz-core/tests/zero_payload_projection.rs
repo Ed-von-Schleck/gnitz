@@ -13,7 +13,7 @@
 //! permuted, non-adjacent compound PK whose OPK sign flip must survive.
 
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
-use gnitz_core::{BatchAppender, ColData, ExprBuilder, GnitzClient, ZSetBatch};
+use gnitz_core::{BatchAppender, ColData, ExprBuilder, GnitzClient, TableProps, ZSetBatch};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 
@@ -91,7 +91,9 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
         ColumnDef::new("v", TypeCode::I64, false),
         ColumnDef::new("s", TypeCode::String, false),
     ];
-    client.create_table(&sn, "t", &cols, &[0], false, 0, &[]).unwrap();
+    client
+        .create_table(&sn, "t", &cols, &[0], TableProps::default(), &[])
+        .unwrap();
     let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
 
     let mut batch = ZSetBatch::new(&schema);
@@ -140,7 +142,9 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
         ColumnDef::new("c2", TypeCode::I64, false),
         ColumnDef::new("c3", TypeCode::I64, false),
     ];
-    client.create_table(&sn, "t", &cols, &[3, 0], false, 0, &[]).unwrap();
+    client
+        .create_table(&sn, "t", &cols, &[3, 0], TableProps::default(), &[])
+        .unwrap();
     let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
     assert_eq!(schema.pk_stride(), 12, "I64 then U32, tightly packed");
 

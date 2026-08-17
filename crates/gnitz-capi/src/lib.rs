@@ -701,12 +701,11 @@ pub unsafe extern "C" fn gnitz_create_table(
     match c.0.create_table(
         cstr(schema_name),
         cstr(table_name),
-        // `false`/`0` = partitioned, default full-PK distribution; the C API has
-        // no REPLICATED or CLUSTER BY surface (those ride on SQL DDL).
         &s.0.columns,
         &pk_slice,
-        false,
-        0,
+        // The C API has no REPLICATED, STREAM or CLUSTER BY surface (those ride on
+        // SQL DDL), so a partitioned base table with the default full-PK distribution.
+        gnitz_core::TableProps::default(),
         // No inline UNIQUE constraint surface in the C API (those ride on SQL DDL).
         &[],
     ) {

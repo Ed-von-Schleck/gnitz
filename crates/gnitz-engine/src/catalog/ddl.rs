@@ -140,7 +140,7 @@ impl CatalogEngine {
         let pk = unpack_pk_cols(raw_pk_cols);
 
         let tid = self.allocate_table_id();
-        validate_relation_defs("table", tid, table_name, col_defs, &pk)?;
+        validate_relation_defs(RelationKind::BaseTable, tid, table_name, col_defs, &pk)?;
         let sid = self.get_schema_id(schema_name);
         // Index the validated copy, not the raw `pk_cols` argument:
         // `validate_pk_cols` ran against `pk`, so `pk.as_slice()[0]` is
@@ -156,7 +156,7 @@ impl CatalogEngine {
         // This in-process test shortcut always builds a keyed, full-PK-distributed
         // tables (`replicated = false`, `k = 0` = default). REPLICATED and CLUSTER BY
         // routing are exercised through the catalog hook / SQL planner, not here.
-        let flags = gnitz_wire::pack_table_flags(false, 0);
+        let flags = gnitz_wire::TableProps::default().pack();
 
         // Write columns first (table hook reads them via sys_columns)
         self.write_column_records(tid, OWNER_KIND_TABLE, col_defs)?;

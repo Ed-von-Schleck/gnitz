@@ -973,15 +973,24 @@ pub(crate) fn reject_unhonored_create_table_clauses(
 }
 
 /// The `WITH (…)` options of a `CREATE` statement — the only option form gnitz
-/// reads. `OPTIONS(…)`, space-separated, and `TBLPROPERTIES` are vendor metadata
-/// accepted as no-ops, and `None` is the common no-options case. One spelling for
-/// every statement, so a vendor form cannot be a no-op on one and an error on
-/// another.
-pub(crate) fn with_options(options: &sqlparser::ast::CreateTableOptions) -> &[sqlparser::ast::SqlOption] {
-    match options {
-        sqlparser::ast::CreateTableOptions::With(opts) => opts,
-        _ => &[],
-    }
+/// reads; `None` is the common no-options case. Every other form is rejected rather
+/// than accepted as a vendor no-op, because gnitz's `WITH` keys decide what the
+/// relation *is*: silently ignoring `OPTIONS(stream = true)` or
+/// `OPTIONS(capacity = '4 MB')` would yield an ordinary durable table or an
+/// unbounded view with no error anywhere. One spelling for every statement.
+pub(crate) fn with_options(
+    options: &sqlparser::ast::CreateTableOptions,
+) -> Result<&[sqlparser::ast::SqlOption], GnitzSqlError> {
+    let form = match options {
+        sqlparser::ast::CreateTableOptions::With(opts) => return Ok(opts),
+        sqlparser::ast::CreateTableOptions::None => return Ok(&[]),
+        sqlparser::ast::CreateTableOptions::Options(_) => "OPTIONS (…)",
+        sqlparser::ast::CreateTableOptions::Plain(_) => "space-separated options",
+        sqlparser::ast::CreateTableOptions::TableProperties(_) => "TBLPROPERTIES (…)",
+    };
+    Err(GnitzSqlError::Plan(format!(
+        "{form} is not supported; options must be given as WITH (…)"
+    )))
 }
 
 /// One `WITH (…)` entry as its `key = value` pair, or the shared rejection for

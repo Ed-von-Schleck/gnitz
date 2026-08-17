@@ -683,8 +683,8 @@ fn test_dep_map_drops_a_retired_views_edges() {
     write_identity_circuit(&mut engine, v2, tid, None);
     engine.write_column_records(v2, OWNER_KIND_VIEW, &cols).unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, -1, v1, "v1", "");
-    push_view_tab_row(&mut bb, 1, v2, "v1", "");
+    push_view_tab_row(&mut bb, -1, v1, "v1", "", 0);
+    push_view_tab_row(&mut bb, 1, v2, "v1", "", 0);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
     assert_eq!(
         engine.dag.get_dep_map().get(&tid),

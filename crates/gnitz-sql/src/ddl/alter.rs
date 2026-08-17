@@ -13,7 +13,7 @@ use crate::validate::{
     ColumnOptionSite,
 };
 use crate::SqlResult;
-use gnitz_core::GnitzClient;
+use gnitz_core::{GnitzClient, RelClass};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, Ident, ObjectName, RenameTableNameKind,
     TableConstraint,
@@ -156,7 +156,7 @@ fn rename_relation(
     client
         .alter_rename_relation(schema_name, &source_name, &new_name)
         .map_err(GnitzSqlError::Exec)?;
-    Ok(altered(relation_kind(rel.is_view), new_name))
+    Ok(altered(rel.class.noun(), new_name))
 }
 
 /// `ALTER TABLE <t> RENAME COLUMN <a> TO <b>` — `t` must be a base table (a view
@@ -427,7 +427,15 @@ fn alter_base_table_exists(
     {
         None if if_exists => Ok(false),
         None => Err(missing("Table", schema_name, source_name)),
-        Some(rel) if rel.is_view => Err(require_base_table(source_name, op)),
+        // No class but a base table has a column shape to ALTER: a view is
+        // column-bound by ordinal, and a stream holds no rows (it is RESTRICTed while
+        // dependent views exist, so DROP + CREATE is equivalent). The engine precheck
+        // refuses both too, before any DDL is written; this is here for the message.
+        // RENAME TO is a separate path.
+        Some(rel) if rel.class != RelClass::Table => Err(GnitzSqlError::Unsupported(format!(
+            "'{source_name}' is a {}; ALTER TABLE {op} requires a base table",
+            rel.class.noun()
+        ))),
         Some(rel) => {
             reject_system_relation(rel.tid)?;
             Ok(true)
@@ -491,14 +499,6 @@ fn rename_target_name(target: &ObjectName, source_schema: &str) -> Result<String
     }
 }
 
-fn relation_kind(is_view: bool) -> &'static str {
-    if is_view {
-        "view"
-    } else {
-        "table"
-    }
-}
-
 /// The `Altered` result — also the IF-EXISTS no-op success (nothing to alter,
 /// but the statement succeeds), carrying the intended name.
 fn altered(object: &str, name: String) -> SqlResult {
@@ -510,8 +510,4 @@ fn altered(object: &str, name: String) -> SqlResult {
 
 fn missing(what: &str, schema: &str, name: &str) -> GnitzSqlError {
     GnitzSqlError::Bind(format!("{what} '{schema}.{name}' does not exist"))
-}
-
-fn require_base_table(name: &str, op: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!("'{name}' is a view; ALTER TABLE {op} requires a base table"))
 }

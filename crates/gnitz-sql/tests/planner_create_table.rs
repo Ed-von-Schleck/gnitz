@@ -1,6 +1,6 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::{GnitzClient, TypeCode};
+use gnitz_core::{GnitzClient, TableProps, TypeCode};
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
@@ -541,7 +541,9 @@ fn test_create_view_with_nullable_first_column_rejected() {
         ColumnDef::new("id", TypeCode::U64, false),
         ColumnDef::new("v", TypeCode::I64, true),
     ];
-    let src_tid = client.create_table(&sn, "src", &cols, &[0u32], false, 0, &[]).unwrap();
+    let src_tid = client
+        .create_table(&sn, "src", &cols, &[0u32], TableProps::default(), &[])
+        .unwrap();
 
     // Manually construct a SCAN→SINK circuit and try to register a view whose
     // first output column is nullable.

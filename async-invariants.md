@@ -172,7 +172,8 @@ otherwise the scan sees stale DAG state.
 
 **Unique-filter ordering** — `unique_filter_ingest_batch` must run only
 after commit fsync succeeds. On any commit error call
-`unique_filter_invalidate_table`.
+`unique_filter_invalidate_table`. A non-durable batch (below) has no fsync to wait
+for; the call is a map miss there, since a stream owns no unique index.
 
 **DDL durability** — `broadcast_ddl` must `fdatasync` before ACKing the
 client; workers have no ACK path for DDL.
@@ -184,9 +185,16 @@ client; workers have no ACK path for DDL.
 `signal_all` ONCE. Multiple signals serialise a concurrent broadcast.
 
 **Commit visibility vs. durability** — `signal_all` is pipelined before
-fsync; concurrent SCANs can observe in-flight rows. `done` fires only after
-joining `fsync_fut` with `reply_futs` — the inserting client sees `Ok(lsn)` only
-after fsync. Never send `done` before fsync.
+fsync; concurrent SCANs can observe in-flight rows. On a **durable** batch — one
+where some non-stream group reached the SAL, so a zone was opened and a sentinel
+written — `done` fires only after joining `fsync_fut` with `reply_futs`, and the
+inserting client sees `Ok(lsn)` only after fsync. Never send `done` before fsync on
+such a batch.
+
+A batch of stream groups alone is **non-durable**: it opens no zone, writes no
+sentinel, submits no fsync, publishes nothing, and replies LSN `0`. Nothing it
+carries must survive a restart, so there is no fsync to join and `done` fires
+without one.
 
 ---
 

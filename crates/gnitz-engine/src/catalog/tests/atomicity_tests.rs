@@ -340,7 +340,7 @@ fn test_idx_tab_view_owner_rejected() {
         .ingest_to_family(IDX_TAB_ID, &batch)
         .expect_err("IDX_TAB row naming a view owner must be rejected");
     assert!(
-        err.contains("not a base table"),
+        err.contains("is a view") && err.contains("only a base table can be indexed"),
         "expected the owner-kind guard message, got: {err}"
     );
 
@@ -724,7 +724,12 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     engine.apply_and_enqueue_family(SysFamily::Column, col_batch).unwrap();
 
     // REPLICATED + dist_prefix = 1: passes precheck, rejected by hook_table_register.
-    let flags = gnitz_wire::pack_table_flags(true, 1);
+    let flags = gnitz_wire::TableProps {
+        replicated: true,
+        dist_prefix_len: 1,
+        ..Default::default()
+    }
+    .pack();
     let table_batch = build_table_tab_row_flags(new_tid, pack_pk_cols(&[0]), "hooktbl", flags);
     engine
         .precheck_family(SysFamily::Table, &table_batch)

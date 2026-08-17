@@ -432,6 +432,17 @@ fn recover_from_sal(
                     return Ok(false);
                 }
                 let tid = msg.target_id as i64;
+                // Nothing a stream ingested is ever recovered. A stream-only commit
+                // batch opens no zone and so never reaches replay at all, but a stream
+                // group the committer coalesced with a base-table push sits inside a
+                // committed zone and does. Returning here rather than below the decode
+                // avoids two costs: the O(rows) decode and reslice of a group whose rows
+                // the detached store would drop anyway, and — the reason it must be here
+                // — a damaged such group failing the whole boot over rows no restart
+                // must recover.
+                if cat.dag.relation_kind(tid) == Some(crate::query::RelationKind::Stream) {
+                    return Ok(false);
+                }
                 // The catalog's schema, not the wire's: only the catalog stamps the
                 // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`,
                 // so this holds no borrow on `cat` across the `&mut cat` ingest.
@@ -1445,6 +1456,28 @@ mod walk_tests {
         log.damage_header(torn);
 
         assert_eq!(committed(&log.reader()).unwrap(), vec![1]);
+    }
+
+    /// A stream-only commit batch writes its `FLAG_PUSH` groups with no zone start
+    /// and no sentinel, so damage in one costs nothing however many precede a
+    /// committed zone. This is why a stream batch opens no zone at all: pass 1 is
+    /// built to a budget of at most one un-fsynced zone, and a run of them could
+    /// refuse a boot over damage to a zone no client was ever promised.
+    #[test]
+    fn damage_in_zone_less_stream_batches_costs_nothing() {
+        let region = SharedRegion::new(SIZE);
+        let log = Log::new(&region, 1);
+        let first = log.group(41, 7, FLAG_PUSH);
+        let second = log.group(42, 8, FLAG_PUSH);
+        log.zone(9, &[11]);
+        log.damage_header(first);
+        log.damage_header(second);
+
+        assert_eq!(
+            committed(&log.reader()).unwrap(),
+            vec![9],
+            "only the closed zone commits, and the damaged stream groups do not fail the boot"
+        );
     }
 
     /// (e) A sentinel arriving with no zone open lost that zone's first group;

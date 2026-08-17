@@ -151,20 +151,21 @@ pub(super) fn check_col_defs(col_defs: &[ColumnDef]) -> Result<(), String> {
 /// COL_TAB-before-TABLE/VIEW ordering contract), then [`check_col_defs`], then
 /// [`validate_pk_cols`].
 pub(super) fn validate_relation_defs(
-    kind: &str,
+    kind: crate::query::RelationKind,
     id: i64,
     name: &str,
     col_defs: &[ColumnDef],
     pk: &PkColList,
 ) -> Result<(), String> {
+    let noun = kind.noun();
     if col_defs.is_empty() {
         return Err(format!(
-            "catalog invariant violated: {kind} '{name}' (id={id}) registered \
+            "catalog invariant violated: {noun} '{name}' (id={id}) registered \
              before its column records. COL_TAB writes must precede \
              TABLE_TAB/VIEW_TAB writes (see hooks.rs dispatch doc)."
         ));
     }
-    check_col_defs(col_defs).map_err(|e| format!("{kind} '{name}' (id={id}) {e}"))?;
+    check_col_defs(col_defs).map_err(|e| format!("{noun} '{name}' (id={id}) {e}"))?;
     validate_pk_cols(col_defs, pk)
 }
 

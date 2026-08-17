@@ -22,7 +22,9 @@ impl CatalogEngine {
                 &sys_family_dir(base_dir, info.wire.name),
                 sys_tab_schema(info.id()),
                 info.id() as u32,
-                RelationKind::SystemCatalog.recovery_source(),
+                RelationKind::SystemCatalog
+                    .recovery_source()
+                    .expect("a system catalog family owns a store"),
             )
             .map(Box::new)
             .map_err(|e| format!("Failed to create system table '{}': error {}", info.wire.name, e))?;

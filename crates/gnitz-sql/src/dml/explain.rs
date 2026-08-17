@@ -9,7 +9,7 @@
 //! (`binder.resolve` and the `plan_where` index probe) and never scans.
 
 use crate::access::pk_point_tuple;
-use crate::bind::{Binder, RelationKind};
+use crate::bind::Binder;
 use crate::dml::plan::AccessPlan;
 use crate::dml::select::{
     bind_where, build_fold_shape, build_rows_shape, plan_where, route_select, FoldShape, Route, Sink, Target,
@@ -105,8 +105,8 @@ fn order_limit_facts(route: &Route<'_>, has_order: bool) -> Vec<String> {
 /// condition, not a verdict.
 fn read_line(target: &Target) -> String {
     match target.kind {
-        Some(RelationKind::View) => format!("read view {} (drains pending ticks when stale)", target.name),
-        Some(RelationKind::Table) => format!("read table {}", target.name),
+        Some(c) if c.is_view() => format!("read view {} (drains pending ticks when stale)", target.name),
+        Some(c) => format!("read {} {}", c.noun(), target.name),
         None => format!("read {}", target.name),
     }
 }

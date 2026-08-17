@@ -58,9 +58,8 @@ fn resolve_reports_found_absent_and_missing_schema() {
     assert!(err.contains("Schema 'no_such_schema' not found"), "got: {err}");
 }
 
-/// A view resolves through the same path as a table and reports its kind, and
-/// `resolve_table_id` must still *fail* on it — that failure is what lets
-/// `resolve_base_table`'s second probe raise the "is a view" error.
+/// A view resolves through the same path as a table and reports its class, while
+/// `resolve_table_id` — which answers only for a base table — must still miss on it.
 #[test]
 fn a_view_resolves_as_a_view_and_fails_the_base_table_probe() {
     let Some(srv) = ServerHandle::start() else { return };
@@ -73,8 +72,11 @@ fn a_view_resolves_as_a_view_and_fails_the_base_table_probe() {
     exec(&mut client, &sn, "CREATE VIEW v AS SELECT id, v FROM t");
 
     let (_, rel) = client.resolve_relation(&sn, "v").unwrap();
-    assert!(!rel.is_bounded, "a plain CREATE VIEW is unbounded");
-    assert!(rel.is_view, "a view must report kind = view");
+    assert_eq!(
+        rel.class,
+        gnitz_core::RelClass::View,
+        "a plain CREATE VIEW resolves as an unbounded view"
+    );
     assert_eq!(client.resolve_relation_kind(&sn, "v").unwrap(), Some(rel));
 
     let err = client.resolve_table_id(&sn, "v").unwrap_err().to_string();

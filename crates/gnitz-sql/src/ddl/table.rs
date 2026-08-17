@@ -11,7 +11,7 @@ use crate::validate::{
     validate_user_index_name, validate_user_name, ColumnOptionSite,
 };
 use crate::SqlResult;
-use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TypeCode};
+use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TableProps, TypeCode};
 use sqlparser::ast::{
     ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
@@ -131,9 +131,19 @@ fn resolve_fk_target(
     // The one relation-name catalog probe outside the Binder funnels: hold the
     // FK target to the same reserved-prefix rule they enforce.
     validate_user_name(&ref_table)?;
-    let (ref_tid, ref_schema) = client
-        .resolve_table_id(schema_name, &ref_table)
+    let (ref_schema, ref_rel) = client
+        .resolve_relation(schema_name, &ref_table)
         .map_err(|e| GnitzSqlError::Bind(format!("FK target '{ref_table}': {e}")))?;
+    // The PK/UNIQUE tests below read only the schema, and both a view's and a
+    // stream's PK look exactly like a base table's without being the unique, stored
+    // key the parent probe reads.
+    if ref_rel.class != gnitz_core::RelClass::Table {
+        return Err(GnitzSqlError::Bind(format!(
+            "FK target '{ref_table}' is a {}; a FOREIGN KEY must reference a base table",
+            ref_rel.class.noun()
+        )));
+    }
+    let ref_tid = ref_rel.tid;
 
     if referred_columns.len() > 1 {
         return Err(GnitzSqlError::Unsupported(
@@ -185,34 +195,36 @@ fn resolve_fk_target(
     Ok((ref_tid, ref_col_idx as u64, parent_col_type))
 }
 
-/// Extract the `REPLICATED` table property from a `CREATE TABLE … WITH (…)`
-/// option list. Surface: `CREATE TABLE t (…) WITH (replicated = true)`. A
-/// replicated table keeps a full copy on every worker (broadcast writes,
-/// single-source reads). Only the `replicated` key is recognized; any other
-/// `WITH` option is rejected so a typo cannot be silently ignored (gnitz has no
-/// other table-level `WITH` options today).
-fn parse_replicated_option(table_options: &CreateTableOptions) -> Result<bool, GnitzSqlError> {
-    let mut replicated = false;
-    for opt in crate::validate::with_options(table_options) {
+/// The boolean properties of `CREATE TABLE … WITH (…)`. `dist_prefix_len` is left
+/// at its default; the CLUSTER BY phase fills it. An unknown key is rejected so a
+/// typo cannot be silently ignored.
+fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps, GnitzSqlError> {
+    let mut props = TableProps::default();
+    for opt in crate::validate::with_options(table_options)? {
         let (key, value) = crate::validate::require_kv_option(opt, "CREATE TABLE")?;
-        if !key.value.eq_ignore_ascii_case("replicated") {
+        let slot = if key.value.eq_ignore_ascii_case("replicated") {
+            &mut props.replicated
+        } else if key.value.eq_ignore_ascii_case("stream") {
+            &mut props.stream
+        } else {
             return Err(GnitzSqlError::Plan(format!(
-                "unknown CREATE TABLE option '{}'; the only supported option is `replicated`",
+                "unknown CREATE TABLE option '{}'; the supported options are `replicated` and `stream`",
                 key.value
             )));
-        }
+        };
         let Expr::Value(ValueWithSpan {
             value: Value::Boolean(b),
             ..
         }) = value
         else {
-            return Err(GnitzSqlError::Plan(
-                "WITH (replicated = …) expects a boolean (true/false)".into(),
-            ));
+            return Err(GnitzSqlError::Plan(format!(
+                "WITH ({} = …) expects a boolean (true/false)",
+                key.value
+            )));
         };
-        replicated = *b;
+        *slot = *b;
     }
-    Ok(replicated)
+    Ok(props)
 }
 
 pub(crate) fn execute_create_table(
@@ -513,13 +525,14 @@ pub(crate) fn execute_create_table(
         0
     };
 
-    // Phase 7 — REPLICATED (full copy on every worker), via `WITH (replicated = true)`.
-    // Mutually exclusive with CLUSTER BY: a hash-distribution prefix is meaningless
-    // when every worker already holds the whole table. The flags packing cannot make
-    // the conflict unrepresentable (replicated is a boolean bit, k a byte), so reject
-    // it here.
-    let replicated = parse_replicated_option(&create.table_options)?;
-    if replicated && dist_prefix_len != 0 {
+    // Phase 7 — the boolean `WITH (…)` properties. REPLICATED is mutually exclusive
+    // with CLUSTER BY: a hash-distribution prefix is meaningless when every worker
+    // already holds the whole table. The flags packing cannot make the conflict
+    // unrepresentable (replicated is a boolean bit, k a byte), so reject it here.
+    // STREAM composes freely with both.
+    let mut props = parse_table_options(&create.table_options)?;
+    props.dist_prefix_len = dist_prefix_len;
+    if props.replicated && dist_prefix_len != 0 {
         return Err(GnitzSqlError::Plan(
             "REPLICATED and CLUSTER BY are mutually exclusive: a replicated table keeps \
              a full copy on every worker, so a hash-distribution prefix is meaningless"
@@ -579,15 +592,7 @@ pub(crate) fn execute_create_table(
         .collect();
 
     let tid = client
-        .create_table(
-            schema_name,
-            &table_name,
-            &cols,
-            &pk_indices,
-            replicated,
-            dist_prefix_len,
-            &unique_indexes,
-        )
+        .create_table(schema_name, &table_name, &cols, &pk_indices, props, &unique_indexes)
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::TableCreated { table_id: tid })
@@ -753,6 +758,55 @@ pub(crate) fn create_index_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `table_options` of a parsed `CREATE TABLE`, so the option tests below
+    /// exercise the same AST shape `execute_create_table` receives.
+    fn table_options_of(sql: &str) -> CreateTableOptions {
+        let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql).expect("parses");
+        match stmts.into_iter().next().expect("one statement") {
+            sqlparser::ast::Statement::CreateTable(c) => c.table_options,
+            other => panic!("not a CREATE TABLE: {other}"),
+        }
+    }
+
+    #[test]
+    fn with_options_carry_replicated_and_stream_independently() {
+        let t = "CREATE TABLE t (id BIGINT PRIMARY KEY)";
+        let props = |replicated, stream| TableProps {
+            replicated,
+            stream,
+            dist_prefix_len: 0,
+        };
+        for (tail, want) in [
+            ("", props(false, false)),
+            (" WITH (replicated = true)", props(true, false)),
+            (" WITH (stream = true)", props(false, true)),
+            (" WITH (stream = true, replicated = true)", props(true, true)),
+            (" WITH (STREAM = false)", props(false, false)),
+        ] {
+            let sql = format!("{t}{tail}");
+            assert_eq!(parse_table_options(&table_options_of(&sql)).unwrap(), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn unknown_with_key_and_non_boolean_value_are_rejected() {
+        let t = "CREATE TABLE t (id BIGINT PRIMARY KEY)";
+        let e = parse_table_options(&table_options_of(&format!("{t} WITH (streem = true)"))).unwrap_err();
+        assert!(format!("{e:?}").contains("streem"), "must name the typo'd key: {e:?}");
+        let e = parse_table_options(&table_options_of(&format!("{t} WITH (stream = 1)"))).unwrap_err();
+        assert!(format!("{e:?}").contains("stream"), "must name the key: {e:?}");
+    }
+
+    /// A non-`WITH` option form carries keys nothing reads, so accepting it would
+    /// turn `OPTIONS(stream = true)` into an ordinary durable table with the opposite
+    /// `INSERT` semantics and no error anywhere.
+    #[test]
+    fn a_non_with_option_form_is_rejected_by_form() {
+        let sql = "CREATE TABLE t (id BIGINT PRIMARY KEY) OPTIONS(stream = true)";
+        let e = parse_table_options(&table_options_of(sql)).unwrap_err();
+        assert!(format!("{e:?}").contains("OPTIONS"), "must name the form: {e:?}");
+    }
 
     #[test]
     fn fk_widening_and_identity_accepted() {

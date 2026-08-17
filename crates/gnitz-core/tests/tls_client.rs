@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use gnitz_core::protocol::{
     hello_handshake, parse_response, send_message, ClientTransport, FLAG_CONTINUATION, STATUS_ERROR,
 };
+use gnitz_core::TableProps;
 use gnitz_core::{
     wire_flags_set_conflict_mode, ColData, ColumnDef, GnitzClient, PkColumn, PkTuple, Schema, TypeCode,
     WireConflictMode, ZSetBatch, FLAG_PUSH,
@@ -42,7 +43,9 @@ fn client_with_table(target: &str) -> (GnitzClient, String, u64, std::sync::Arc<
         ColumnDef::new("a", TypeCode::I64, false),
         ColumnDef::new("b", TypeCode::I64, false),
     ];
-    client.create_table(&sn, "t", &cols, &[0], false, 0, &[]).unwrap();
+    client
+        .create_table(&sn, "t", &cols, &[0], TableProps::default(), &[])
+        .unwrap();
     let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
     (client, sn, tid, schema)
 }

@@ -7,7 +7,7 @@ use crate::error::GnitzSqlError;
 use crate::hir::chain::{debug_assert_exchange_topology, ViewChain};
 use crate::validate::{reject_unhonored_query_clauses, validate_user_name, HonoredQueryClauses};
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, PlannedView};
+use gnitz_core::{GnitzClient, PlannedView, RelClass};
 use sqlparser::ast::{CreateTableOptions, ObjectName, Query, Value, ValueWithSpan};
 
 /// Binary units accepted by `WITH (capacity = '<uint><unit>')`.
@@ -21,7 +21,7 @@ const CAPACITY_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB
 /// there is no second word to keep consistent with it.
 fn decode_capacity(options: &CreateTableOptions) -> Result<Option<u64>, GnitzSqlError> {
     let mut capacity = None;
-    for opt in crate::validate::with_options(options) {
+    for opt in crate::validate::with_options(options)? {
         let (key, value) = crate::validate::require_kv_option(opt, "CREATE VIEW")?;
         if !key.value.eq_ignore_ascii_case("capacity") {
             return Err(GnitzSqlError::Plan(format!(
@@ -187,12 +187,13 @@ fn resolve_view_id(client: &mut GnitzClient, schema_name: &str, name: &str) -> R
         // `ALTER VIEW … AS` re-renders its body as a bare `CREATE VIEW … AS …`,
         // dropping any option clause — so retargeting a bounded view would
         // silently convert it into an unbounded one.
-        Some(rel) if rel.is_view && rel.is_bounded => Err(GnitzSqlError::Unsupported(format!(
+        Some(rel) if rel.class == RelClass::BoundedView => Err(GnitzSqlError::Unsupported(format!(
             "ALTER VIEW cannot retarget a capacity-bounded view; DROP and CREATE '{name}' instead"
         ))),
-        Some(rel) if rel.is_view => Ok(rel.tid),
-        Some(_) => Err(GnitzSqlError::Unsupported(format!(
-            "'{name}' is a table; ALTER VIEW requires a view (use ALTER TABLE)"
+        Some(rel) if rel.class.is_view() => Ok(rel.tid),
+        Some(rel) => Err(GnitzSqlError::Unsupported(format!(
+            "'{name}' is a {}; ALTER VIEW requires a view (use ALTER TABLE)",
+            rel.class.noun()
         ))),
         None => Err(GnitzSqlError::Bind(format!(
             "View '{schema_name}.{name}' does not exist"

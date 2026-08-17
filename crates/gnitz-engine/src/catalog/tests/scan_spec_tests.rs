@@ -158,7 +158,7 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
     let dir = temp_dir("ss_replicated");
     let mut e = CatalogEngine::open(&dir, 1).unwrap();
     let cols = id_val_cols();
-    let tid = create_flagged_table(&mut e, "rep", &cols, &[0], gnitz_wire::pack_table_flags(true, 0));
+    let tid = create_flagged_table(&mut e, "rep", &cols, &[0], replicated_flags());
     assert!(
         e.get_schema_desc(tid).unwrap().placement().is_replicated(),
         "REPLICATED must stamp a replicated placement"
@@ -315,7 +315,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
         col_def("val", type_code::I64),
     ];
     // CLUSTER BY a: distribution prefix = the first of the two PK columns.
-    let tid = create_flagged_table(&mut e, "clus", &cols, &[0, 1], gnitz_wire::pack_table_flags(false, 1));
+    let tid = create_flagged_table(&mut e, "clus", &cols, &[0, 1], clustered_flags(1));
     let schema = e.get_schema_desc(tid).unwrap();
     assert_eq!(schema.dist_stride(), 8, "CLUSTER BY one U64 column ⇒ an 8-byte prefix");
 

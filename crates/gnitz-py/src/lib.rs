@@ -10,8 +10,8 @@ use pyo3::Borrowed;
 use gnitz_core::protocol::types::type_code_from_u64;
 use gnitz_core::GnitzClient;
 use gnitz_core::{
-    null_word_get, null_word_set, ClientError, ColData, ColumnDef, PkColumn, Schema, TypeCode, WireConflictMode,
-    ZSetBatch,
+    null_word_get, null_word_set, ClientError, ColData, ColumnDef, PkColumn, Schema, TableProps, TypeCode,
+    WireConflictMode, ZSetBatch,
 };
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_sql::{SqlPlanner, SqlResult};
@@ -1679,7 +1679,14 @@ impl PyGnitzClient {
         let schema = Arc::clone(&resolve_py_schema(py, &columns)?.borrow().rust);
         let pk: Vec<u32> = schema.pk_indices().iter().map(|&i| i as u32).collect();
         self.call(py, move |c| {
-            c.create_table(schema_name, table_name, &schema.columns, &pk, false, 0, &[])
+            c.create_table(
+                schema_name,
+                table_name,
+                &schema.columns,
+                &pk,
+                TableProps::default(),
+                &[],
+            )
         })
     }
 

@@ -14,11 +14,12 @@ pub mod types;
 // shortening".
 pub use circuit::{agg_output_type, Circuit, CircuitBuilder, CircuitRows, NodeId, OpNode, RangeRel, ReduceOutKey};
 pub use client::{
-    hidden_view_name, retraction_batch, GnitzClient, IndexMeta, InlineUniqueIndex, PlannedView, TxnBuffer,
+    hidden_view_name, retraction_batch, GnitzClient, IndexMeta, InlineUniqueIndex, PlannedView, RelKind, TxnBuffer,
     MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{Session, FIRST_USER_TABLE_ID, TABLE_TAB};
 pub use error::ClientError;
+pub use gnitz_wire::{RelClass, TableProps};
 // The expression emitter lives in `gnitz-expr`, beside the decoder it must
 // agree with. Re-exported here because `gnitz-capi` exposes 18 `gnitz_expr_*` C
 // symbols over it without depending on that crate.

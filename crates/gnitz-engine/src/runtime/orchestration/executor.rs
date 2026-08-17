@@ -32,7 +32,7 @@ use crate::catalog::{
     SEQ_TAB_ID,
 };
 use crate::query::RelationKind;
-use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingTxn};
+use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
     dispatch_scan_multi_fanout, first_worker_error_opt, replicated_unicast, scan_spec_route, Fanout, MasterDispatcher,
@@ -200,8 +200,10 @@ pub struct Shared {
     /// `TickGate`. Read by the committer (no checkpoint round while non-zero)
     /// and by the watchdog (a SIGTERM waits the window out).
     ddl_window: Rc<Cell<usize>>,
-    /// OCC per-table commit-LSN map: `tid → zone LSN of its last committed
-    /// write this boot`. Bumped under the writer's table-lock guard immediately
+    /// OCC per-table commit-LSN map: `tid → the zone LSN its last accepted write
+    /// this boot rode`. That LSN is published for a durable write; for a stream it is
+    /// a reservation the batch never published, which is what makes
+    /// `read_is_fresh` answer false and drain. Bumped under the writer's table-lock guard immediately
     /// after a successful commit ACK (push arm and `push_txn_body`, `Ok` path
     /// only), and read by `push_txn_body`'s precondition check under the *write*
     /// guard on that lock, which excludes every bumper. A missing entry reads as
@@ -1257,7 +1259,10 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         // being masked by a no-op ACK.
         {
             let _cat = shared.catalog_rwlock.read().await;
-            if push_target_rejected(shared, peer, target_id, client_id).await {
+            if target_kind_or_reject(shared, peer, client_id, target_id, Access::Write)
+                .await
+                .is_none()
+            {
                 return;
             }
         }
@@ -1294,8 +1299,16 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         let batch = decoded.data_batch.unwrap();
 
         let _cat = shared.catalog_rwlock.read().await;
-        if push_target_rejected(shared, peer, target_id, client_id).await {
+        let Some(kind) = target_kind_or_reject(shared, peer, client_id, target_id, Access::Write).await else {
             return;
+        };
+        // Not at the decode boundary: `reject_not_null_bits` runs there without a
+        // relation kind, and must keep admitting a base table's retractions.
+        if kind == RelationKind::Stream {
+            if let Some(e) = stream_push_error(target_id, &batch, mode) {
+                send_error(peer, target_id, client_id, e.as_bytes()).await;
+                return;
+            }
         }
         // The validator's own predicate decides the guard: a push that reads no
         // committed state cannot be invalidated by a concurrent one, so it may
@@ -1344,23 +1357,44 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
 
         // Route through the committer and wait for commit ACK.
         let (tx, rx) = oneshot::channel::<Result<u64, String>>();
-        shared.committer_tx.send(CommitRequest::Push {
+        let is_stream = kind == RelationKind::Stream;
+        shared.committer_tx.send(CommitRequest::Push(PendingPush {
             tid: target_id,
             batch,
             mode,
+            recoverable: !is_stream,
             done: tx,
-        });
+        }));
         let commit_result = rx.await;
         match commit_result {
-            Ok(Ok(lsn)) => {
+            Ok(Ok(zone_lsn)) => {
                 // Record the commit LSN for OCC while the table-lock guard is
                 // still held (a concurrent precondition check reads it under the
                 // write guard on the same lock, which excludes this one, so the
                 // bump lands before any conflicting txn can pass).
                 // Bump on the `Ok` path only: an `Err` reply is pre-SAL or
                 // fail-stop, so no live-visible durable change to record.
-                shared.record_commit_lsn([target_id], lsn);
-                send_ok_response(shared, peer, target_id, None, client_id, lsn as u128, client_version).await;
+                //
+                // Always the real LSN, stream included: clamping the watermark too
+                // would leave `commit_lsn_of` at its boot seed, so `read_is_fresh`
+                // would answer `true` forever and the batch would sit un-ticked.
+                shared.record_commit_lsn([target_id], zone_lsn);
+                // A stream replies `0` — what `push_with_mode` already returns for a
+                // buffered transactional write, and what keeps the client's basis
+                // `≤ published()`. Keyed on the target rather than on whether this
+                // batch happened to open a zone, so a stream push the committer
+                // coalesced with a base-table push still answers `0`.
+                let reply_lsn = if is_stream { 0 } else { zone_lsn };
+                send_ok_response(
+                    shared,
+                    peer,
+                    target_id,
+                    None,
+                    client_id,
+                    reply_lsn as u128,
+                    client_version,
+                )
+                .await;
             }
             Ok(Err(e)) => {
                 send_error(peer, target_id, client_id, e.as_bytes()).await;
@@ -1489,9 +1523,12 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
             return Err(format!("TXN: {tid} is not a user table"));
         }
         // Same existence + writability gate the plain-push arm applies, so a view
-        // target is rejected identically.
-        if let Some(e) = push_target_error(shared, tid) {
-            return Err(e);
+        // target is rejected identically. Refusing a stream keeps every transaction
+        // family `recoverable`, so a transaction always opens a zone.
+        if target_kind(shared, tid, Access::Write)? == RelationKind::Stream {
+            return Err(format!(
+                "table {tid} is a stream: a stream cannot be written inside a transaction"
+            ));
         }
         let catalog_schema = shared.get_schema_desc(tid);
         // The schema block is always present; validate it against the catalog
@@ -1634,16 +1671,55 @@ fn reject_not_null_bits(b: &Batch, schema: &SchemaDescriptor) -> Result<(), &'st
     Ok(())
 }
 
-/// Resolve a read target's relation kind, rejecting an unknown table id.
-/// Returns `None` when the error reply was sent and the caller must return.
-/// The caller holds the catalog read lock.
-async fn resolve_read_target(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64) -> Option<RelationKind> {
-    let kind = shared.cat().dag.relation_kind(target_id);
-    if kind.is_none() {
-        let msg = format!("table {target_id} not found");
-        send_error(peer, target_id, client_id, msg.as_bytes()).await;
+/// Which end of a relation a request wants — the discriminator of [`target_kind`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+}
+
+/// Resolve `target_id`'s kind, rejecting one that cannot serve `access`.
+///
+/// A stream holds no rows, so it may be written but not read. A view registers into
+/// the same id space as base tables (shared `next_table_id`), so it may be read but
+/// not written — a raw client push addressed to a view tid would otherwise commit
+/// rows into the view's output store that its circuit never produced, permanently
+/// divergent derived state.
+///
+/// Enforced here even though the SQL binder refuses both: the C and Python bindings
+/// reach the engine directly. Every caller addresses a relation by id and owns its
+/// own reply path.
+fn target_kind(shared: &Shared, target_id: i64, access: Access) -> Result<RelationKind, String> {
+    let Some(kind) = shared.cat().dag.relation_kind(target_id) else {
+        return Err(format!("table {target_id} not found"));
+    };
+    match access {
+        Access::Read if kind == RelationKind::Stream => Err(format!(
+            "table {target_id} is a stream: a stream holds no rows and cannot be read"
+        )),
+        Access::Write if !kind.is_ingestion_point() => Err(format!(
+            "table {target_id} is not writable: pushes must target a base table or a stream"
+        )),
+        _ => Ok(kind),
     }
-    kind
+}
+
+/// [`target_kind`] with the frame reply path. `None` means the error reply was sent
+/// and the caller must return. The caller holds the catalog read lock.
+async fn target_kind_or_reject(
+    shared: &Shared,
+    peer: &Peer,
+    client_id: u64,
+    target_id: i64,
+    access: Access,
+) -> Option<RelationKind> {
+    match target_kind(shared, target_id, access) {
+        Ok(kind) => Some(kind),
+        Err(msg) => {
+            send_error(peer, target_id, client_id, msg.as_bytes()).await;
+            None
+        }
+    }
 }
 
 /// Decode `seek_col_idx` (`pack_pk_cols(col_indices)` — the packed flag at bit
@@ -1799,12 +1875,14 @@ fn build_resolve_reply(
         }));
     };
 
-    // Only a base table reports its placement. A view and a system family are
-    // both *stamped* `Replicated`, but this bit is a planner hint for a reduce
-    // built directly over a source, and a view's locality is settled by the
-    // compiler from the new view's own stamped placement instead. Reporting the
-    // stamp here would re-plan an aggregate over a view on a second authority.
-    let replicated = kind.is_base_table() && shared.cat().dag.relation_is_replicated(tid);
+    // Only an ingestion point reports its placement. A view and a system family are
+    // both *stamped* `Replicated`, but this bit is a planner hint for a reduce built
+    // directly over a source, and a view's locality is settled by the compiler from
+    // the view's own stamped placement instead — reporting the stamp here would
+    // re-plan an aggregate over a view on a second authority. A misreport either way
+    // is a silent W-fold overcount: a replicated relation read as non-replicated has
+    // every worker holding a full copy *and* its partials summed.
+    let replicated = kind.is_ingestion_point() && shared.cat().dag.relation_is_replicated(tid);
 
     let defs = shared.cat().read_column_defs(tid);
     let fks: Vec<gnitz_wire::RelFk> = defs
@@ -1826,17 +1904,15 @@ fn build_resolve_reply(
             is_unique: ic.is_unique,
         })
         .collect();
-    // A capacity-bounded view: the client's leaf rule refuses to bind it inside
-    // a view body, and `ALTER VIEW … AS` refuses to retarget it.
-    let is_bounded = shared
+    let class = shared
         .cat()
         .dag
         .tables
         .get(&tid)
-        .is_some_and(|e| e.capacity_bytes.is_some());
+        .expect("registered: the kind probe above already answered for this tid")
+        .class();
     let blob = gnitz_wire::RelDescriptorBlob {
-        is_view: kind.is_view(),
-        is_bounded,
+        class,
         replicated,
         fks,
         indexes,
@@ -1863,11 +1939,16 @@ fn build_resolve_reply(
 /// stale view must first flush the pending — possibly in-flight — tick carrying
 /// its sources' deltas.
 ///
-/// One pass suffices for every commit the caller can have observed. A commit at
-/// zone LSN `L` is published before its ACK, so `published() >= L` by the time
-/// the drain is requested; `run_tick` snapshots `published()` at tick start,
-/// later still, and stores it in `last_tick_lsn` on success. Whatever the tid set
-/// was, the completed tick therefore leaves `last_tick_lsn >= L`.
+/// One pass suffices for every commit the caller can have observed. A *durable*
+/// commit at zone LSN `L` is published before its ACK, so `published() >= L` by
+/// the time the drain is requested; `run_tick` snapshots `published()` at tick
+/// start, later still, and stores it in `last_tick_lsn` on success. Whatever the
+/// tid set was, the completed tick therefore leaves `last_tick_lsn >= L`.
+///
+/// A stream-only batch opens no zone and so publishes nothing, which lifts no
+/// watermark — so a read of a stream-fed view drains, and the drain is what absorbs
+/// the delta. The argument above still covers the case where the committer coalesced
+/// that stream group with a base-table push: that batch does publish.
 ///
 /// The trigger is sent even when nothing looks pending: the tick loop processes
 /// triggers serially, so awaiting `done` also serializes behind a concurrent
@@ -1898,12 +1979,20 @@ async fn drain_pending_ticks(shared: &Rc<Shared>) -> Result<(), String> {
 /// LSN `L` that was ACKed to a client. `record_commit_lsn` precedes that ACK on
 /// both commit paths and records a `max`, so `commit_lsn_of(S) >= L`. If the test
 /// passes then `L <= last_tick_lsn`, which some completed tick `T` took from its
-/// `published()` snapshot. The committer marks `S` in `tick_rows` before it
-/// publishes `L`, and only after the workers ACKed the write; `T`'s dequeue and
-/// its snapshot are one await-free span on the single-threaded reactor, so the
-/// mark preceded the dequeue and `S` was in `T`'s tid set. `T` therefore emitted
-/// `S`'s tick group, whose `handle_tick` took the `pending_deltas` holding `C`
-/// and fanned it along the same `dep` edges this closure mirrors.
+/// `published()` snapshot. The committer marks `S` in `tick_rows` after the
+/// workers ACKed the write and before it publishes `L`; `T`'s dequeue and its
+/// snapshot are one await-free span on the single-threaded reactor, so the mark
+/// preceded the dequeue and `S` was in `T`'s tid set. `T` therefore emitted `S`'s
+/// tick group, whose `handle_tick` took the `pending_deltas` holding `C` and
+/// fanned it along the same `dep` edges this closure mirrors.
+///
+/// A stream's recorded LSN is a reservation its own batch never published, so the
+/// "before it publishes `L`" step above is vacuous for one. The argument still holds
+/// on the serialization instead: the committer services one batch to completion
+/// before the next, so a stream's Phase-C mark precedes any *later* batch reserving
+/// an LSN, let alone publishing one — and a tick whose snapshot reached the stream's
+/// reserved `L` therefore had it in its tid set. Until some later batch publishes
+/// that far the test simply answers false and the view drains, which is safe.
 ///
 /// Under-reporting (one extra drain) is possible and harmless: the test is stated
 /// over ACKed commits, so a commit published but whose connection task died
@@ -1946,7 +2035,7 @@ async fn read_lock(
 ) -> Option<(ReadGuard, RelationKind)> {
     {
         let g = shared.catalog_rwlock.read().await;
-        let kind = resolve_read_target(shared, peer, client_id, target_id).await?;
+        let kind = target_kind_or_reject(shared, peer, client_id, target_id, Access::Read).await?;
         if read_is_fresh(shared, target_id) {
             return Some((g, kind));
         }
@@ -1958,7 +2047,7 @@ async fn read_lock(
         return None;
     }
     let g = shared.catalog_rwlock.read().await;
-    let kind = resolve_read_target(shared, peer, client_id, target_id).await?;
+    let kind = target_kind_or_reject(shared, peer, client_id, target_id, Access::Read).await?;
     Some((g, kind))
 }
 
@@ -2178,10 +2267,8 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             let tid = tid_u as i64;
             // Base tables AND views are legal; a catalog family stays on the
             // plain path, which serves it master-locally.
-            match shared.cat().dag.relation_kind(tid) {
-                None => return Err(format!("table {tid} not found")),
-                Some(RelationKind::SystemCatalog) => return Err(format!("SCAN_MULTI: {tid} is not a user relation")),
-                Some(_) => {}
+            if target_kind(shared, tid, Access::Read)? == RelationKind::SystemCatalog {
+                return Err(format!("SCAN_MULTI: {tid} is not a user relation"));
             }
             // `0` (worker-0 unicast) for a replicated relation, `-1` (broadcast)
             // otherwise — the same policy `handle_scan` applies per relation.
@@ -2446,7 +2533,9 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         // registration the view is a dependent of those bases, so an undrained pending
         // delta would tick it through `evaluate_dag` over rows the backfill below also
         // scans, counting them twice. VIEW_TAB is the first family at or past view
-        // priority.
+        // priority. A stream source is not drained (see `base_tables_reachable_from`):
+        // the backfill scans its empty store, so a still-pending stream row can only
+        // reach the new view through the tick, and so reaches it at most once.
         // The between-precheck-and-apply marker holds the single family that was
         // applied but not yet enqueued (a hook/panic failure), which compensation must
         // negate; a precheck failure leaves the marker None, so no ghost -1 is written.
@@ -2665,36 +2754,29 @@ async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8
     peer.send_buffer_or_close(buf).await;
 }
 
-/// Existence + writability gate shared by the empty-push and INSERT arms.
-/// A view registers into the same id space as base tables (shared
-/// `next_table_id`), so a raw client push addressed to a view tid would
-/// otherwise commit rows into the view's output store that its circuit
-/// never produced — permanently divergent derived state. Only base tables
-/// are push targets. Caller holds the catalog read lock. Returns `true` iff
-/// an error frame was sent and the caller must return.
-async fn push_target_rejected(shared: &Shared, peer: &Peer, target_id: i64, client_id: u64) -> bool {
-    match push_target_error(shared, target_id) {
-        Some(msg) => {
-            send_error(peer, target_id, client_id, msg.as_bytes()).await;
-            true
-        }
-        None => false,
+/// Why a stream cannot accept this push, or `None` if it can. Both rules restate
+/// what a stream lacks — a unique primary key, and any retraction at all — and
+/// rejecting `Error` mode is what keeps `push_reads_committed_state` false, and
+/// with it the shared table lock and the unread mode field.
+fn stream_push_error(target_id: i64, batch: &Batch, mode: ipc::WireConflictMode) -> Option<String> {
+    if mode == ipc::WireConflictMode::Error {
+        return Some(format!(
+            "table {target_id} is a stream: conflict mode 'error' asserts a primary-key \
+             uniqueness a stream does not have"
+        ));
     }
-}
-
-/// The reason `target_id` cannot receive a push (absent, or not a base table),
-/// or `None` if it can. The shared existence + writability gate behind the
-/// plain-push arms (via `push_target_rejected`), the per-family check in
-/// `push_txn_body`, and the SERIAL range reservation — all of which address a
-/// base table by id and own their own reply path.
-fn push_target_error(shared: &Shared, target_id: i64) -> Option<String> {
-    match shared.cat().dag.relation_kind(target_id) {
-        None => Some(format!("table {target_id} not found")),
-        Some(kind) if !kind.is_base_table() => Some(format!(
-            "table {target_id} is not writable: pushes must target a base table"
-        )),
-        _ => None,
+    if batch.all_weights_positive() {
+        return None;
     }
+    // Located again only to name it in the message.
+    let i = (0..batch.count)
+        .find(|&i| batch.get_weight(i) <= 0)
+        .expect("just found one");
+    Some(format!(
+        "table {target_id} is a stream: a stream is append-only, but row {i} of this push carries \
+         weight {}",
+        batch.get_weight(i)
+    ))
 }
 
 /// Emit a closed catalog zone to the SAL: broadcast each drained family batch
@@ -2768,13 +2850,20 @@ async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i6
         // catalog.write cannot deadlock. Both guards drop at the end of this block.
         let _write = shared.catalog_rwlock.write().await;
 
-        // A SERIAL sequence id IS the owning table's id, so the push-writability
-        // gate answers here too. Checked under the write lock that guards the
+        // A SERIAL sequence id IS the owning table's id, and only a base table may
+        // own a SERIAL column. Checked under the write lock that guards the
         // reservation: an unvalidated id would durably write a `sys_sequences`
         // row that `recover_sequences` replays straight into the catalog's own
-        // id counters at the next open.
-        if let Some(e) = push_target_error(shared, seq_id) {
-            return Err(e);
+        // id counters at the next open. Not through `target_kind`: this reserves a
+        // range rather than reading or writing rows, so neither `Access` fits and
+        // both its rejections would name a push.
+        if !shared
+            .cat()
+            .dag
+            .relation_kind(seq_id)
+            .is_some_and(|k| k.is_base_table())
+        {
+            return Err(format!("sequence {seq_id} is not a base table"));
         }
 
         let _sal_excl = shared.sal_writer_excl.lock().await;
@@ -2822,4 +2911,40 @@ async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i6
     // sys_sequences delta is not yet on disk.
     shared.lsn_alloc.publish(zone_lsn);
     Ok(base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{make_batch_raw, make_schema_u64_i64};
+
+    /// A batch whose rows carry `weights`, one distinct PK each.
+    fn weighted(weights: &[i64]) -> Batch {
+        let rows: Vec<(u64, i64, i64)> = weights.iter().enumerate().map(|(i, &w)| (i as u64, w, 0)).collect();
+        make_batch_raw(&make_schema_u64_i64(), &rows)
+    }
+
+    /// A stream is append-only, and nothing clamps its weights the way
+    /// `enforce_unique_pk` clamps a base table's. Bag multiplicity above 1 is the
+    /// legal case, so a `> 1` check would be wrong in the other direction.
+    #[test]
+    fn stream_push_rejects_only_non_positive_weights() {
+        let ok = ipc::WireConflictMode::Update;
+        assert_eq!(stream_push_error(7, &weighted(&[1, 5, 1]), ok), None);
+        assert_eq!(stream_push_error(7, &weighted(&[]), ok), None);
+        for bad in [vec![0], vec![-1], vec![1, 1, -3], vec![2, 0]] {
+            let e = stream_push_error(7, &weighted(&bad), ok).expect("must be rejected");
+            assert!(e.contains("append-only"), "got: {e}");
+            assert!(e.contains("table 7"), "must name the relation: {e}");
+        }
+    }
+
+    /// `Error` mode asserts a primary-key uniqueness a stream does not have, and
+    /// rejecting it is what keeps `push_reads_committed_state` false. It is refused
+    /// even when every weight is legal.
+    #[test]
+    fn stream_push_rejects_error_conflict_mode() {
+        let e = stream_push_error(7, &weighted(&[1]), ipc::WireConflictMode::Error).expect("must be rejected");
+        assert!(e.contains("conflict mode 'error'"), "got: {e}");
+    }
 }

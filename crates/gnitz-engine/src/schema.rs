@@ -246,8 +246,9 @@ impl Placement {
     /// (`replicated` is a bit, `k` a byte), so the conflict is rejected here at
     /// the catalog trust boundary rather than silently resolved in favour of one.
     pub(crate) fn from_table_flags(flags: u64) -> Result<Placement, String> {
-        let prefix_len = gnitz_wire::table_flags_dist_prefix(flags);
-        if gnitz_wire::table_flags_replicated(flags) {
+        let props = gnitz_wire::TableProps::from_flags(flags);
+        let prefix_len = props.dist_prefix_len;
+        if props.replicated {
             if prefix_len != 0 {
                 return Err(format!(
                     "replicated and carries a non-default distribution prefix (k={prefix_len}); \

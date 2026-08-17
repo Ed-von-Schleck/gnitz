@@ -810,7 +810,8 @@ impl PkKeyVals {
 // writer and the gnitz-engine reader, so the bit packing cannot drift.
 //
 //   bit 0        replicated (TABLE_FLAG_REPLICATED) — full copy on every worker
-//   bits [1..8)  reserved for future boolean flags
+//   bit 1        stream (TABLE_FLAG_STREAM) — storeless append-only ingestion point
+//   bits [2..8)  reserved for future boolean flags
 //   bits [8..16) distribution prefix length k (0 = default = full PK)
 //
 // `k` is byte-aligned so the boolean flag bits stay free for future flags
@@ -824,6 +825,9 @@ impl PkKeyVals {
 /// copy (writes broadcast, reads single-source). Mutually exclusive with a
 /// non-default `dist_prefix_len` (enforced at DDL, not by this packing).
 const TABLE_FLAG_REPLICATED: u64 = 1;
+/// Bit 1: the table is a **stream** — a storeless, append-only ingestion point.
+/// Independent of every other bit: a stream may be replicated or CLUSTER BY'd.
+const TABLE_FLAG_STREAM: u64 = 1 << 1;
 /// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`.
 const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 /// Mask for the distribution-prefix-length byte (one byte: 0..=255). An
@@ -831,24 +835,44 @@ const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 /// byte is deliberate headroom.
 const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
 
-/// Pack the persisted `TABLE_TAB.flags` u64 from its logical fields.
-#[inline]
-pub fn pack_table_flags(replicated: bool, dist_prefix_len: usize) -> u64 {
-    (((dist_prefix_len as u64) & TABLE_FLAG_DIST_MASK) << TABLE_FLAG_DIST_SHIFT)
-        | if replicated { TABLE_FLAG_REPLICATED } else { 0 }
+/// The logical content of `TABLE_TAB.flags` — equivalently, the non-column
+/// properties of a `CREATE TABLE`. A struct rather than positional arguments
+/// because `replicated` and `stream` are independent booleans that a transposed
+/// call would silently swap, and swapping them turns a durable table into one
+/// whose rows a restart discards.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub struct TableProps {
+    /// Keep a full copy on every worker: writes broadcast, reads single-source.
+    pub replicated: bool,
+    /// A storeless, append-only ingestion point rather than a table: it holds no
+    /// rows and nothing it ingests survives a restart.
+    pub stream: bool,
+    /// Hash-distribution prefix length `k`: rows are partitioned by the first `k`
+    /// PK columns (`CLUSTER BY` the PK's leading prefix). `0` — the default —
+    /// partitions by the full PK, and the schema constructor normalizes it to
+    /// `k = |PK|`. The SQL planner validates `k` against the PK before packing.
+    pub dist_prefix_len: usize,
 }
 
-/// Decode the `replicated` bit from `TABLE_TAB.flags`.
-#[inline]
-pub fn table_flags_replicated(flags: u64) -> bool {
-    flags & TABLE_FLAG_REPLICATED != 0
-}
+impl TableProps {
+    /// Pack the persisted `TABLE_TAB.flags` u64. Inverse of [`Self::from_flags`].
+    #[inline]
+    pub fn pack(self) -> u64 {
+        (((self.dist_prefix_len as u64) & TABLE_FLAG_DIST_MASK) << TABLE_FLAG_DIST_SHIFT)
+            | if self.replicated { TABLE_FLAG_REPLICATED } else { 0 }
+            | if self.stream { TABLE_FLAG_STREAM } else { 0 }
+    }
 
-/// Decode the distribution prefix length `k` from `TABLE_TAB.flags`. `0` means
-/// "default = full PK"; the schema constructor normalizes that to `k = |PK|`.
-#[inline]
-pub fn table_flags_dist_prefix(flags: u64) -> usize {
-    ((flags >> TABLE_FLAG_DIST_SHIFT) & TABLE_FLAG_DIST_MASK) as usize
+    /// Decode a persisted `TABLE_TAB.flags` u64. Reserved bits are ignored, so a
+    /// word a later version widened still decodes the fields defined here.
+    #[inline]
+    pub fn from_flags(flags: u64) -> TableProps {
+        TableProps {
+            replicated: flags & TABLE_FLAG_REPLICATED != 0,
+            stream: flags & TABLE_FLAG_STREAM != 0,
+            dist_prefix_len: ((flags >> TABLE_FLAG_DIST_SHIFT) & TABLE_FLAG_DIST_MASK) as usize,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -948,21 +972,43 @@ mod tests {
 
     #[test]
     fn table_flags_roundtrip() {
-        // Default (not replicated, k = 0 = full PK) is the all-clear word.
-        assert_eq!(pack_table_flags(false, 0), 0);
-        // k rides in byte 1; the replicated bit is untouched.
-        for &repl in &[false, true] {
-            for k in 0..=PK_LIST_MAX_COLS {
-                let f = pack_table_flags(repl, k);
-                assert_eq!(table_flags_dist_prefix(f), k);
-                assert_eq!(table_flags_replicated(f), repl);
+        // Default (not replicated, not a stream, k = 0 = full PK) is all-clear.
+        assert_eq!(TableProps::default().pack(), 0);
+        // Every field combination survives, and k rides in byte 1 clear of the bits.
+        for &replicated in &[false, true] {
+            for &stream in &[false, true] {
+                for dist_prefix_len in 0..=PK_LIST_MAX_COLS {
+                    let p = TableProps {
+                        replicated,
+                        stream,
+                        dist_prefix_len,
+                    };
+                    assert_eq!(TableProps::from_flags(p.pack()), p);
+                }
             }
         }
-        // `replicated` is bit 0; the reserved bits [1..8) stay clear of the k byte.
-        assert_eq!(pack_table_flags(true, 0) & 0xFF, TABLE_FLAG_REPLICATED);
-        assert_eq!(pack_table_flags(true, 2) >> TABLE_FLAG_DIST_SHIFT, 2);
+        let repl = TableProps {
+            replicated: true,
+            ..Default::default()
+        };
+        let stream = TableProps {
+            stream: true,
+            ..Default::default()
+        };
+        // The two booleans occupy distinct bits, so a transposed pair disagrees.
+        assert_ne!(repl.pack(), stream.pack());
+        // `replicated` is bit 0, `stream` bit 1; the reserved bits [2..8) stay
+        // clear of the k byte.
+        assert_eq!(repl.pack() & 0xFF, TABLE_FLAG_REPLICATED);
+        assert_eq!(stream.pack() & 0xFF, TABLE_FLAG_STREAM);
+        let both_k2 = TableProps {
+            replicated: true,
+            stream: true,
+            dist_prefix_len: 2,
+        };
+        assert_eq!(both_k2.pack() >> TABLE_FLAG_DIST_SHIFT, 2);
         assert_eq!(
-            pack_table_flags(true, 2) & 0xFF & !TABLE_FLAG_REPLICATED,
+            both_k2.pack() & 0xFF & !TABLE_FLAG_REPLICATED & !TABLE_FLAG_STREAM,
             0,
             "reserved bits are free"
         );

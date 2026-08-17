@@ -12,10 +12,10 @@ use crate::circuit::Circuit;
 use crate::types::sys_schema;
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::{
-    CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_NAME,
-    IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME,
-    TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX, TABTAB_COL_SCHEMA_ID, VIEWTAB_COL_CAPACITY,
-    VIEWTAB_COL_NAME, VIEWTAB_COL_PK_COL_IDX, VIEWTAB_COL_SCHEMA_ID, VIEWTAB_COL_SQL,
+    RelClass, TableProps, CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, IDXTAB_COL_IS_UNIQUE,
+    IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE, OWNER_KIND_VIEW,
+    SCHEMATAB_COL_NAME, TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX, TABTAB_COL_SCHEMA_ID,
+    VIEWTAB_COL_CAPACITY, VIEWTAB_COL_NAME, VIEWTAB_COL_PK_COL_IDX, VIEWTAB_COL_SCHEMA_ID, VIEWTAB_COL_SQL,
 };
 
 // --- Module-private helpers ---
@@ -178,25 +178,18 @@ fn is_hidden_view_name(name: &str) -> bool {
     name.starts_with(gnitz_wire::HIDDEN_VIEW_PREFIX)
 }
 
-/// What a relation *is*, resolved together with its id so the two cannot
-/// disagree. Named fields rather than a tuple: every caller reads one or two of
-/// them, and the next per-relation attribute lands here instead of widening a
-/// tuple at every callsite.
+/// A relation's class resolved together with its id, so the two cannot disagree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RelKind {
     pub tid: u64,
-    pub is_view: bool,
-    /// A view created `WITH (capacity = …)`. Views may not be created over one
-    /// (the leaf rule) and `ALTER VIEW … AS` may not retarget one.
-    pub is_bounded: bool,
+    pub class: RelClass,
 }
 
 impl RelKind {
     fn of(d: &RelDescriptor) -> Self {
         RelKind {
             tid: d.tid,
-            is_view: d.is_view,
-            is_bounded: d.is_bounded,
+            class: d.class,
         }
     }
 }
@@ -222,10 +215,7 @@ pub struct PlannedView {
 /// there is nothing retained to go stale, so nothing to invalidate.
 struct RelDescriptor {
     tid: u64,
-    is_view: bool,
-    /// A view created `WITH (capacity = …)`. Views may not be created over one
-    /// (the leaf rule) and `ALTER VIEW … AS` may not retarget one.
-    is_bounded: bool,
+    class: RelClass,
     replicated: bool,
     schema: Arc<Schema>,
     indexes: Arc<Vec<IndexMeta>>,
@@ -888,25 +878,18 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// `dist_prefix_len` is the hash-distribution prefix length `k`: rows are
-    /// partitioned by the first `k` PK columns (`CLUSTER BY` the PK's leading
-    /// prefix). `0` means the default — distribute by the full PK, byte-identical
-    /// to the pre-distribution-key behavior. The SQL planner validates `k` against
-    /// the PK before calling this; the single-PK Python/test surfaces pass `0`.
-    ///
     /// `unique_indexes` are the table's inline `UNIQUE` constraints, folded into
     /// the same atomic DDL bundle as `[COL_TAB, TABLE_TAB, IDX_TAB]` so a failure
     /// rolls the whole `CREATE` back — never a table left missing its unique
-    /// constraint. Pass an empty slice for a table with no inline UNIQUE.
-    #[allow(clippy::too_many_arguments)]
+    /// constraint. Pass an empty slice for a table with no inline UNIQUE — and always
+    /// for a stream, which only a base table's index owner check would admit.
     pub fn create_table(
         &mut self,
         schema_name: &str,
         table_name: &str,
         columns: &[ColumnDef],
         pk_cols: &[u32],
-        replicated: bool,
-        dist_prefix_len: usize,
+        props: TableProps,
         unique_indexes: &[InlineUniqueIndex],
     ) -> Result<u64, ClientError> {
         // Gateway backstop for non-SQL front ends (capi): enforce the ASCII
@@ -928,9 +911,10 @@ impl GnitzClient {
         // `dist_prefix_len` is a leading-PK-prefix length (0 = default = full PK);
         // a value past the PK count is meaningless and the engine would silently
         // clamp it, so reject it here to catch the caller's mistake.
-        if dist_prefix_len > pk_cols.len() {
+        if props.dist_prefix_len > pk_cols.len() {
             return Err(ClientError::ServerError(format!(
-                "create_table: distribution prefix length {dist_prefix_len} exceeds PK column count {}",
+                "create_table: distribution prefix length {} exceeds PK column count {}",
+                props.dist_prefix_len,
                 pk_cols.len()
             )));
         }
@@ -958,7 +942,7 @@ impl GnitzClient {
                 tid: new_tid,
                 schema_id,
                 pk_col_idx: pk_packed,
-                flags: gnitz_wire::pack_table_flags(replicated, dist_prefix_len),
+                flags: props.pack(),
             },
             &table_name,
         );
@@ -1298,7 +1282,7 @@ impl GnitzClient {
         // than on `(schema_id, name)`, which would need a SCHEMA_TAB probe first.
         let desc = self.resolve(&schema_name, &current_name)?.ok_or_else(not_found)?;
 
-        if desc.is_view {
+        if desc.class.is_view() {
             let view_batch = self.scan_catalog(VIEW_TAB)?.ok_or_else(not_found)?;
             let vr = find_view_record_by_id(&view_batch, desc.tid)?.ok_or_else(not_found)?;
             let view_s = sys_schema(VIEW_TAB);
@@ -1431,9 +1415,10 @@ impl GnitzClient {
         // conflict. Reject here, where the assumption is made, rather than in
         // each of the three entry points. (The SQL layer rejects a view earlier,
         // with a better error; this is the backstop for non-SQL front ends.)
-        if desc.is_view {
+        if desc.class != RelClass::Table {
             return Err(ClientError::ServerError(format!(
-                "relation {tid} is a view; ALTER COLUMN requires a base table"
+                "relation {tid} is a {}; ALTER COLUMN requires a base table",
+                desc.class.noun()
             )));
         }
         let cd = desc
@@ -1456,12 +1441,12 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// Resolve `table_name` under `schema_name` to its id and schema. A view is
-    /// reported as absent — callers that need to tell the two apart use
-    /// [`Self::resolve_relation`], which returns the kind.
+    /// Resolve `table_name` under `schema_name` to its id and schema. Anything that
+    /// is not a base table is reported as absent — callers that need to tell the
+    /// classes apart use [`Self::resolve_relation`], which returns the class.
     pub fn resolve_table_id(&mut self, schema_name: &str, table_name: &str) -> Result<(u64, Arc<Schema>), ClientError> {
         let d = self.resolve(schema_name, table_name)?;
-        match d.filter(|d| !d.is_view) {
+        match d.filter(|d| d.class == RelClass::Table) {
             Some(d) => Ok((d.tid, Arc::clone(&d.schema))),
             None => Err(ClientError::ServerError(format!(
                 "Table '{}' not found",
@@ -1491,7 +1476,7 @@ impl GnitzClient {
         Ok((kind.tid, schema))
     }
 
-    /// The kind probe, without the schema. Every table-vs-view disambiguation
+    /// The class probe, without the schema. Every relation-class disambiguation
     /// (the binder's writable-target check, ALTER's target resolution) routes
     /// through here rather than re-spelling it. `Ok(None)` = no such relation;
     /// `Err` = a missing schema or a decode error, which must surface rather than
@@ -1525,8 +1510,7 @@ impl GnitzClient {
         };
         Ok(Some(Arc::new(RelDescriptor {
             tid,
-            is_view: blob.is_view,
-            is_bounded: blob.is_bounded,
+            class: blob.class,
             replicated: blob.replicated,
             schema,
             indexes: Arc::new(blob.indexes),
@@ -2153,7 +2137,11 @@ mod tests {
             tid: 7,
             schema_id: 3,
             pk_col_idx: gnitz_wire::pack_pk_cols(&[1, 0]),
-            flags: gnitz_wire::pack_table_flags(true, 0),
+            flags: gnitz_wire::TableProps {
+                replicated: true,
+                ..Default::default()
+            }
+            .pack(),
         };
         let mut batch = ZSetBatch::new(schema);
         append_table_tab_row(&mut BatchAppender::new(&mut batch, schema), 1, &rec, "t");

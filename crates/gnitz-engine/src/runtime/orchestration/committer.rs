@@ -45,14 +45,8 @@ static PUSH_ABORT: Seam = Seam::new("GNITZ_INJECT_PUSH_ABORT");
 /// One request to the committer.
 #[allow(clippy::large_enum_variant)]
 pub enum CommitRequest {
-    /// Buffer the batch for group commit. On completion, `done` resolves
-    /// to `Ok(lsn)` or `Err(error_message)`.
-    Push {
-        tid: i64,
-        batch: Batch,
-        mode: WireConflictMode,
-        done: oneshot::Sender<Result<u64, String>>,
-    },
+    /// Buffer one batch for group commit.
+    Push(PendingPush),
     /// An atomic user-table transaction: N families emitted as N `FLAG_PUSH`
     /// groups inside one zone under one sentinel, with a single `done` for the
     /// whole bundle. Validated and lock-guarded by the executor before it
@@ -67,8 +61,9 @@ pub enum CommitRequest {
 }
 
 /// One buffered atomic transaction awaiting commit: its families in frame order
-/// and one `done` resolving `Ok(zone_lsn)` for the whole bundle (or the first
-/// family error on a pre-sentinel abort).
+/// and one `done` resolving `Ok(zone_lsn)` for the whole bundle (or the first family
+/// error on a pre-sentinel abort). Every family is `recoverable` — the executor
+/// refuses a stream target — so a transaction always opens a zone.
 pub struct PendingTxn {
     pub families: Vec<TxnFamily>,
     pub done: oneshot::Sender<Result<u64, String>>,
@@ -98,12 +93,18 @@ pub enum BarrierKind {
     Shutdown,
 }
 
-/// Pending entry within the committer's current batch.
-struct PendingPush {
-    tid: i64,
-    batch: Batch,
-    mode: WireConflictMode,
-    done: oneshot::Sender<Result<u64, String>>,
+/// One buffered single push awaiting commit. `done` resolves to `Ok(zone_lsn)` or
+/// `Err(error_message)`.
+pub struct PendingPush {
+    pub tid: i64,
+    pub batch: Batch,
+    pub mode: WireConflictMode,
+    /// Whether these rows are something a restart must recover, i.e. whether this
+    /// group may open the zone the sentinel and fdatasync close. False only for a
+    /// stream. Decided by the executor, which has already resolved the target's kind,
+    /// so the committer never asks the catalog what a relation *is*.
+    pub recoverable: bool,
+    pub done: oneshot::Sender<Result<u64, String>>,
 }
 
 /// Shared state between the committer task and the executor.
@@ -285,9 +286,9 @@ fn drain_ready_batch(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitReques
     let mut barriers = Vec::new();
     let mut row_count: usize = 0;
     match first {
-        CommitRequest::Push { tid, batch, mode, done } => {
-            row_count = batch.count;
-            pushes.push(PendingPush { tid, batch, mode, done });
+        CommitRequest::Push(p) => {
+            row_count = p.batch.count;
+            pushes.push(p);
         }
         // A transaction is one indivisible entry — its whole family set rides
         // this batch; its row count is the sum of every family's rows.
@@ -299,9 +300,9 @@ fn drain_ready_batch(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitReques
     }
     while row_count < MAX_PENDING_ROWS {
         match rx.try_recv() {
-            Some(CommitRequest::Push { tid, batch, mode, done }) => {
-                row_count += batch.count;
-                pushes.push(PendingPush { tid, batch, mode, done });
+            Some(CommitRequest::Push(p)) => {
+                row_count += p.batch.count;
+                pushes.push(p);
             }
             Some(CommitRequest::Txn(txn)) => {
                 row_count += txn.families.iter().map(|f| f.batch.count).sum::<usize>();
@@ -517,9 +518,7 @@ async fn await_servicing<T>(
                 let _ = done.send(());
             }
             Either::B(Some(CommitRequest::Barrier { kind, done })) => deferred.push((kind, done)),
-            Either::B(Some(CommitRequest::Push { tid, batch, mode, done })) => {
-                held_pushes.push(PendingPush { tid, batch, mode, done });
-            }
+            Either::B(Some(CommitRequest::Push(p))) => held_pushes.push(p),
             Either::B(Some(CommitRequest::Txn(txn))) => held_txns.push(txn),
         }
     }
@@ -530,6 +529,9 @@ async fn await_servicing<T>(
 struct GroupInfo {
     tid: i64,
     mode: WireConflictMode,
+    /// See `CommitRequest::Push::recoverable`. A merged run is homogeneous in
+    /// `(tid, mode)`, so one flag per group is exact.
+    recoverable: bool,
     req_ids: Vec<u64>,
     merged: Batch,
     write_err: Option<String>,
@@ -601,6 +603,7 @@ async fn commit_pushes(
             groups.push(GroupInfo {
                 tid: fam.tid,
                 mode: fam.mode,
+                recoverable: true,
                 req_ids: alloc_req_ids(),
                 merged: fam.batch,
                 write_err: None,
@@ -617,7 +620,7 @@ async fn commit_pushes(
     // run into one merged group.
     let mut remaining = pushes.into_iter().peekable();
     while let Some(first) = remaining.next() {
-        let (tid, mode) = (first.tid, first.mode);
+        let (tid, mode, recoverable) = (first.tid, first.mode, first.recoverable);
         // Split the run into its two independent halves as it is drained: the
         // batches the merge consumes, and the `done` senders the unit resolves.
         let mut batches: Vec<Batch> = vec![first.batch];
@@ -664,6 +667,7 @@ async fn commit_pushes(
         groups.push(GroupInfo {
             tid,
             mode,
+            recoverable,
             req_ids: alloc_req_ids(),
             merged,
             write_err,
@@ -680,10 +684,11 @@ async fn commit_pushes(
     // Lock dropped immediately after; ACKs and fsync CQE are awaited
     // outside so tick/relay/DDL tasks can make progress.
     //
-    // All groups in this batch share one zone_lsn. The commit sentinel
-    // written after all groups lets recovery treat the batch atomically:
-    // either every group applies or none do. The zone LSN is published once,
-    // after fsync (Phase D), so clients only see durable LSNs.
+    // All groups in this batch share one zone_lsn. A batch with a recoverable group
+    // opens a zone and closes it with the commit sentinel after all groups, which
+    // lets recovery treat it atomically: either every group applies or none do. Its
+    // zone LSN is published once, after fsync (Phase D), so clients only see durable
+    // LSNs. A batch of nothing but stream groups writes no zone at all.
     // ------------------------------------------------------------------
     let (zone_lsn, fsync_fut) = {
         let _sal_excl = shared.sal_writer_excl.lock().await;
@@ -693,8 +698,8 @@ async fn commit_pushes(
         // user-table push pins no system-family counter, so the floor is 0.
         let zone_lsn = shared.lsn_alloc.reserve(0);
 
-        // Claimed by the first group that actually reaches the SAL.
-        let mut needs_zone_start = true;
+        // Opened by the first recoverable group that reaches the SAL.
+        let mut zone_opened = false;
 
         // Emit every unit into the zone, in unit order (transactions first).
         for unit in &units {
@@ -704,7 +709,7 @@ async fn commit_pushes(
                 // `sal_begin_group` writes zero bytes and simply skips it.
                 let g = &mut groups[span.start];
                 if g.write_err.is_none() {
-                    g.write_err = write_group(shared, g, zone_lsn, &mut needs_zone_start);
+                    g.write_err = write_group(shared, g, zone_lsn, &mut zone_opened);
                 }
                 continue;
             }
@@ -729,7 +734,7 @@ async fn commit_pushes(
                     let mut first_fail = None;
                     for gi in span.clone() {
                         let g = &mut groups[gi];
-                        match write_group(shared, g, zone_lsn, &mut needs_zone_start) {
+                        match write_group(shared, g, zone_lsn, &mut zone_opened) {
                             None => committed_a_family = true,
                             Some(e) if committed_a_family => crate::gnitz_fatal_abort!(
                                 "txn family emission failed after an earlier family committed to the SAL: {}",
@@ -776,17 +781,22 @@ async fn commit_pushes(
         // drop all groups in the zone — that is unrecoverable data loss
         // after a restart while the client already received Ok.  Abort.
         // `commit_zone` signals the workers itself once the sentinel is published.
-        let commit_zone_err = shared.disp().commit_zone(zone_lsn).err();
-        if let Some(e) = commit_zone_err {
-            crate::gnitz_fatal_abort!("commit_zone failed, durability lost: {}", e);
-        }
-
-        // Submit fsync SQE (synchronous — returns a future). The
-        // ReplyFutures are built into `fut_slots` outside the lock scope:
-        // await_reply only borrows reactor state, never the SAL writer,
-        // so populating the slots after dropping the lock is correct
-        // and lets concurrent tick/relay tasks make progress sooner.
-        (zone_lsn, shared.reactor.fsync(shared.disp().sal_fd()))
+        let fsync_fut = if zone_opened {
+            if let Some(e) = shared.disp().commit_zone(zone_lsn).err() {
+                crate::gnitz_fatal_abort!("commit_zone failed, durability lost: {}", e);
+            }
+            // Submit fsync SQE (synchronous — returns a future). The
+            // ReplyFutures are built into `fut_slots` outside the lock scope:
+            // await_reply only borrows reactor state, never the SAL writer,
+            // so populating the slots after dropping the lock is correct
+            // and lets concurrent tick/relay tasks make progress sooner.
+            Some(shared.reactor.fsync(shared.disp().sal_fd()))
+        } else {
+            // The signal `commit_zone` would have sent. Phase C awaits its ACKs.
+            shared.disp().signal_all();
+            None
+        };
+        (zone_lsn, fsync_fut)
     };
 
     // Build per-worker reply futures into the caller-supplied scratch
@@ -870,20 +880,21 @@ async fn commit_pushes(
 
     // ------------------------------------------------------------------
     // Phase D (no lock): await fsync CQE.  Client response is held until
-    // after fsync so the client sees only durable data.
+    // after fsync so the client sees only durable data. A batch of nothing but
+    // stream groups opened no zone: no fsync to await, and no LSN to publish.
     // ------------------------------------------------------------------
-    {
+    if let Some(fsync_fut) = fsync_fut {
         let fsync_rc = fsync_fut.await;
         if fsync_rc < 0 {
             crate::gnitz_fatal_abort!("SAL fdatasync (committer) failed rc={}", fsync_rc);
         }
-    }
-
-    // Publish the zone LSN exactly once, after fsync confirms durability.
-    // Pipelined pushes batched together share one zone_lsn, so clients
-    // may see duplicate LSNs — only non-decreasing monotonicity is guaranteed.
-    if groups.iter().any(|g| g.write_err.is_none()) {
-        shared.lsn_alloc.publish(zone_lsn);
+        // Publish the zone LSN exactly once, after fsync confirms durability.
+        // Pipelined pushes batched together share one zone_lsn, so clients may see
+        // duplicate LSNs — only non-decreasing monotonicity is guaranteed.
+        // `write_err` can still be set in Phase C.
+        if groups.iter().any(|g| g.write_err.is_none()) {
+            shared.lsn_alloc.publish(zone_lsn);
+        }
     }
 
     // Update unique-index filters now that fsync confirms durability.
@@ -929,19 +940,19 @@ fn invalidate_filters(shared: &Rc<Shared>, tid: i64) {
 /// Emit one group into the open zone, returning the write error if any. Wrapped
 /// in `guard_panic` so a malformed batch fails the group instead of the node.
 ///
-/// Clears `needs_zone_start` on a group that actually reached the SAL: the zone's
-/// span must start at the first group recovery can see, not the first attempted —
-/// a group whose `sal_begin_group` was refused writes no bytes at all.
-fn write_group(shared: &Rc<Shared>, g: &GroupInfo, zone_lsn: u64, needs_zone_start: &mut bool) -> Option<String> {
+/// The zone is opened by the first `recoverable` group that actually writes bytes —
+/// a refused `sal_begin_group` writes none.
+fn write_group(shared: &Rc<Shared>, g: &GroupInfo, zone_lsn: u64, zone_opened: &mut bool) -> Option<String> {
+    let zone_start = !*zone_opened && g.recoverable;
     let err = guard_panic("commit_write", || {
         Ok(shared
             .disp()
-            .write_commit_group(g.tid, zone_lsn, &g.merged, g.mode, &g.req_ids, *needs_zone_start)
+            .write_commit_group(g.tid, zone_lsn, &g.merged, g.mode, &g.req_ids, zone_start)
             .err())
     })
     .unwrap_or_else(Some);
-    if err.is_none() {
-        *needs_zone_start = false;
+    if zone_start && err.is_none() {
+        *zone_opened = true;
     }
     err
 }

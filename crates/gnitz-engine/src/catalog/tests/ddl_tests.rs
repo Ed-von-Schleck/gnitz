@@ -777,7 +777,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
 
     // A REPLICATED base table.
-    let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], gnitz_wire::pack_table_flags(true, 0));
+    let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
 
     // A partitioned base table, for the negative direction.
     let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();
@@ -806,7 +806,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
         (r_producer, "rv"),
         (p_producer, "pv"),
     ] {
-        push_view_tab_row(&mut bb, 1, vid, name, "SELECT id, x FROM src");
+        push_view_tab_row(&mut bb, 1, vid, name, "SELECT id, x FROM src", 0);
     }
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
 

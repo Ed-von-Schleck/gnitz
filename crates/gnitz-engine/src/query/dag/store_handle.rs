@@ -16,10 +16,10 @@ pub enum StoreHandle {
     /// `&mut` through a shared `&self` without violating Stacked Borrows (a raw
     /// pointer derived from a shared reference may not be used to mutate).
     Owned(UnsafeCell<Box<Table>>),
-    /// Registered but storeless: the post-fork master, which moves every user
-    /// relation here so master and worker 0 do not both hold a live `Table` on
-    /// `w0of{W}` — two processes writing one directory is the hazard `naming.rs`
-    /// exists to prevent. Every read through it is empty and every write a no-op.
+    /// Registered, but this process holds no store for this relation: every read
+    /// through it is empty and every write a no-op. Either the post-fork master,
+    /// which moves every user relation here so master and worker 0 do not both hold
+    /// a live `Table` on `w0of{W}`, or a stream, which holds no store anywhere.
     Detached,
     /// Non-owning pointer to a `Table` owned elsewhere (system tables).
     Borrowed(*mut Table),
@@ -60,7 +60,7 @@ impl StoreHandle {
         }
     }
 
-    /// True for the post-fork master's storeless handle.
+    /// True for a storeless handle — the post-fork master's, or a stream's.
     pub fn is_detached(&self) -> bool {
         matches!(self, StoreHandle::Detached)
     }
@@ -107,8 +107,8 @@ impl StoreHandle {
         match self {
             StoreHandle::Borrowed(ptr) => unsafe { (**ptr).ingest_borrowed_batch(batch) },
             StoreHandle::Owned(cell) => unsafe { (**cell.get()).ingest_borrowed_batch(batch) },
-            // The post-fork master routes every user write to a worker and
-            // ingests none itself, so there is nothing here to drop.
+            // Nothing to drop: the master routes every user write to a worker, and a
+            // stream's batch is buffered as a delta by the caller before it lands here.
             StoreHandle::Detached => Ok(()),
         }
     }

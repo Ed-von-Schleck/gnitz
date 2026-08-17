@@ -101,6 +101,8 @@ impl CatalogEngine {
             if matches!(entry.handle, StoreHandle::Borrowed(_)) {
                 continue;
             }
+            // A storeless relation's `directory` names a path that was never created;
+            // `reclaim_retired_children` reads it as having no children and returns.
             reclaim_retired_children(&entry.directory, self.num_workers);
         }
     }
@@ -198,16 +200,19 @@ impl CatalogEngine {
     ///   * the recorded topology matches the launched `(worker_count, STATE_FORMAT)`
     ///     — a different worker count re-shapes every keyed store's row placement;
     ///   * every one of its output-store child manifests is stamped with the
-    ///     committed checkpoint generation — `worker_ctx::committed_generation()`,
-    ///     the in-memory recovered `G`, NOT the recovery-start-bumped durable
-    ///     `G+1` — matching what `Table::new`'s conditional load peeks; and
+    ///     committed checkpoint generation — `resume_generation`, the in-memory
+    ///     recovered `G`, NOT the recovery-start-bumped durable `G+1` — matching
+    ///     what `Table::new`'s conditional load peeks; and
     ///   * every VIEW it scans is itself valid — else it could read a rebuilt
-    ///     sibling's freshly-emptied output store.
+    ///     sibling's freshly-emptied output store; and
+    ///   * none of its sources is a STREAM — a stream-fed view's manifests are
+    ///     published normally, so without this it would resume at the committed
+    ///     generation onto state whose stream inputs are gone.
     ///
-    /// Two phases. Phase 1 decides each view's **local** validity (topology +
-    /// output manifests). Phase 2 propagates invalidity to any view scanning an
-    /// invalid source, walking the views in dependency order so one pass reaches
-    /// the whole cascade.
+    /// The topology word is decided once for the whole set. Then phase 1 decides
+    /// each view's **local** validity (direct sources + output manifests), and
+    /// phase 2 propagates invalidity to any view scanning an invalid source,
+    /// walking the views in dependency order so one pass reaches the whole cascade.
     ///
     /// Output manifests are enumerated as `w{k}of{launched}` for every launched
     /// rank — exactly the set the checkpoint's ephemeral round stamps, so the two
@@ -217,36 +222,52 @@ impl CatalogEngine {
     pub fn compute_invalid_views(&mut self) -> FxHashSet<i64> {
         self.assert_pre_fork("compute_invalid_views");
         let launched_workers = self.num_workers;
-        let g = crate::foundation::worker_ctx::committed_generation();
+        // The engine's own copy, which `index_recovery_source` reads for the index
+        // half of the same verdict — not the `worker_ctx` global it is mirrored into,
+        // so both halves answer from one field.
+        let g = self.resume_generation;
         let topo_valid = self.topology_matches();
 
         let view_ids = self.dag.view_ids();
+        // A worker-count or STATE_FORMAT change re-shapes every keyed store, so no
+        // view resumes and nothing below need be read.
+        if !topo_valid {
+            return view_ids.into_iter().collect();
+        }
 
-        // Phase 1: local validity (topology + every output child's manifest at g).
+        // Phase 1: local validity (no direct stream source + every output child's
+        // manifest at g). A *transitive* stream source needs no walk here: phase 2
+        // propagates invalidity down every dependency chain. The source test comes
+        // first, so it short-circuits the per-child manifest reads.
         let mut invalid: FxHashSet<i64> = FxHashSet::default();
         for &vid in &view_ids {
-            let local_ok = topo_valid && {
-                let entry = self.dag.tables.get(&vid).expect("vid taken from tables iter");
-                let dir = &entry.directory;
-                let at_g = |child: ChildAddr| match std::ffi::CString::new(child.manifest(dir)) {
-                    Ok(c) => matches!(crate::storage::peek_header(&c), Ok(Some(h)) if h.checkpoint_gen == g),
-                    Err(_) => false,
-                };
-                // The whole cluster's children, not just this process's.
-                crate::storage::cluster_children(launched_workers).all(at_g)
+            let stream_fed = self
+                .dag
+                .get_source_ids(vid)
+                .iter()
+                .any(|s| self.dag.relation_kind(*s) == Some(RelationKind::Stream));
+            if stream_fed {
+                invalid.insert(vid);
+                continue;
+            }
+            let dir = &self.dag.tables.get(&vid).expect("vid taken from tables iter").directory;
+            let at_g = |child: ChildAddr| match std::ffi::CString::new(child.manifest(dir)) {
+                Ok(c) => matches!(crate::storage::peek_header(&c), Ok(Some(h)) if h.checkpoint_gen == g),
+                Err(_) => false,
             };
-            if !local_ok {
+            // The whole cluster's children, not just this process's.
+            if !crate::storage::cluster_children(launched_workers).all(at_g) {
                 invalid.insert(vid);
             }
         }
         if invalid.is_empty() {
-            // Clean same-topology restart: nothing to propagate, skip the
-            // dependency-map reads below.
+            // Clean restart: nothing to propagate, so skip the ordering walk below.
             return invalid;
         }
 
         // Phase 2: propagate invalidity to any still-valid view that scans an
-        // invalid source. Base sources never enter `invalid`, so they pass. A
+        // invalid source. Base and stream sources never enter `invalid`, so they
+        // pass — a stream's own dependents were caught in phase 1 instead. A
         // source view precedes every view scanning it in `order_by_view_deps`,
         // so a single pass carries invalidity down the whole chain.
         for vid in self.dag.order_by_view_deps(&view_ids) {

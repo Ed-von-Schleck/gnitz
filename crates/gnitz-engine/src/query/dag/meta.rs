@@ -196,6 +196,11 @@ impl DagEngine {
     /// before the new view backfills); boot's recovery tick sweep drives every
     /// base reachable from *all* views through `drain_tick_blocking`. Sorted for a
     /// reproducible drive order.
+    ///
+    /// The `is_base_table` filter excludes a stream, so a new view over one is not
+    /// preceded by a drain: it backfills from the stream's empty store and starts
+    /// accumulating from its own registration. Whether a row pushed just before the
+    /// CREATE lands in it therefore depends on whether its tick had already fired.
     pub fn base_tables_reachable_from(&mut self, seeds: Vec<i64>) -> Vec<i64> {
         let mut bases: Vec<i64> = self
             .source_closure(seeds)

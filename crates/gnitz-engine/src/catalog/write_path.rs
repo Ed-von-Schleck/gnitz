@@ -394,8 +394,7 @@ impl CatalogEngine {
             self.check_cas_and_net(SysFamily::Column, batch, &sig, "system-catalog column")?;
 
             // Every column transition — RENAME, DROP, ADD — needs a user base
-            // table owner. A view registers as `RelationKind::View` and a system
-            // family as `SystemCatalog`, so both fail here.
+            // table owner, so every other `RelationKind` fails here.
             if !is_base {
                 return Err(format!("cannot ALTER a column of {owner_id}: not a user base table"));
             }
@@ -573,7 +572,10 @@ impl CatalogEngine {
             .get(&owner_id)
             .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
         if !entry.kind.is_base_table() {
-            return Err(format!("Index: owner {owner_id} is not a base table"));
+            return Err(format!(
+                "Index: owner {owner_id} is a {}; only a base table can be indexed",
+                entry.kind.noun()
+            ));
         }
         Ok(entry)
     }
@@ -659,7 +661,6 @@ impl CatalogEngine {
     /// "referenced by FK" / "View dependency".
     fn precheck_relation_family(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         let is_table = family == SysFamily::Table;
-        let kind = if is_table { "table" } else { "view" };
         let net_dead = self.precheck_relation_signatures(family, batch)?;
 
         for i in 0..batch.count {
@@ -689,16 +690,27 @@ impl CatalogEngine {
             // register hooks re-run the same validator for the paths that skip
             // precheck (boot replay, worker ddl_sync).
             let col_defs = self.scan_column_defs(id, true)?;
-            let (sid, name, pk) = if is_table {
-                let (sid, name, pk, _flags) = read_table_tab_row(batch, i);
-                (sid, name, pk)
+            let (sid, name, pk, kind) = if is_table {
+                let (sid, name, pk, flags) = read_table_tab_row(batch, i);
+                (sid, name, pk, RelationKind::from_table_flags(flags))
             } else {
                 let (sid, name, pk, _capacity) = read_view_tab_row(batch, i);
-                (sid, name, pk)
+                (sid, name, pk, RelationKind::View)
             };
             validate_relation_defs(kind, id, &name, &col_defs, &pk)?;
 
             if is_table {
+                // A stream push must stay a pure append: SERIAL would draw from a
+                // durable sequence and an FK would probe a parent store, putting a
+                // catalog write or a store read on every one.
+                if kind == RelationKind::Stream {
+                    if let Some(cd) = col_defs.iter().find(|cd| cd.is_serial || cd.fk_table_id != 0) {
+                        return Err(format!(
+                            "relation {id} is a stream: column '{}' may not be SERIAL or carry a FOREIGN KEY",
+                            cd.name
+                        ));
+                    }
+                }
                 let self_pk_type = col_defs[pk.as_slice()[0] as usize].type_code;
                 for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
                     self.validate_fk_column(cd, id, pk.as_slice(), self_pk_type)?;

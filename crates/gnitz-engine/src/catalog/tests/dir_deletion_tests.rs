@@ -362,7 +362,7 @@ fn gc_recreated_schema_survives_drain() {
 /// `(tid, relation_directory)`.
 fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (i64, String) {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
-    let rt = create_flagged_table(engine, "rt", &cols, &[0], gnitz_wire::pack_table_flags(true, 0));
+    let rt = create_flagged_table(engine, "rt", &cols, &[0], replicated_flags());
 
     let rel_dir = engine.dag.tables[&rt].directory.clone();
     let mut bb = BatchBuilder::new(engine.get_schema_desc(rt).unwrap());
@@ -599,13 +599,7 @@ fn repartition_handles_a_relation_with_empty_children() {
     ];
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     // CLUSTER BY (a): every row shares `a = 1`, so all of them hash alike.
-    let tid = create_flagged_table(
-        &mut engine,
-        "cb",
-        &cols,
-        &[0, 1],
-        gnitz_wire::pack_table_flags(false, 1),
-    );
+    let tid = create_flagged_table(&mut engine, "cb", &cols, &[0, 1], clustered_flags(1));
     let rel = engine.dag.tables[&tid].directory.clone();
     let schema = engine.get_schema_desc(tid).unwrap();
     engine.close();
