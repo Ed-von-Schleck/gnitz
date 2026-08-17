@@ -200,10 +200,6 @@ pub struct Shared {
     /// `TickGate`. Read by the committer (no checkpoint round while non-zero)
     /// and by the watchdog (a SIGTERM waits the window out).
     ddl_window: Rc<Cell<usize>>,
-    /// The committer's one-shot checkpoint request. Raising it is how a path
-    /// that owes the cluster a checkpoint asks for one without awaiting a
-    /// barrier — see `committer::Shared::force_checkpoint`.
-    force_checkpoint: Rc<Cell<bool>>,
     /// OCC per-table commit-LSN map: `tid → zone LSN of its last committed
     /// write this boot`. Bumped under the writer's table-lock guard immediately
     /// after a successful commit ACK (push arm and `push_txn_body`, `Ok` path
@@ -409,16 +405,12 @@ impl ServerExecutor {
         let draining = Rc::new(Cell::new(false));
         // Nesting depth of the quiescing-DDL windows (reactor-thread-only).
         let ddl_window = Rc::new(Cell::new(0usize));
-        // One-shot checkpoint request, raised by the executor and consumed by the
-        // committer (reactor-thread-only).
-        let force_checkpoint = Rc::new(Cell::new(false));
-
         let committer_shared = Rc::new(committer::Shared {
             reactor: Rc::clone(&reactor),
             disp: Rc::clone(&dispatcher),
             sal_writer_excl: Rc::clone(&sal_writer_excl),
             lsn_alloc: Rc::clone(&lsn_alloc),
-            force_checkpoint: Rc::clone(&force_checkpoint),
+            force_checkpoint: Cell::new(false),
             tick_rows: Rc::clone(&tick_rows),
             tick_tx: tick_tx.clone(),
             ddl_window: Rc::clone(&ddl_window),
@@ -437,7 +429,6 @@ impl ServerExecutor {
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Rc::clone(&draining),
             ddl_window: Rc::clone(&ddl_window),
-            force_checkpoint: Rc::clone(&force_checkpoint),
             table_commit_lsn: RefCell::new(FxHashMap::default()),
             boot_seed: initial_lsn,
         });
@@ -2549,25 +2540,27 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
                 e
             );
         });
-        // `checkpoint_before_backfill` is the only thing above that bumps, so this
-        // is exactly "did MY backfill reclaim". It must stay a per-call fact: a
-        // standing "derived state is unstamped" would also fire on a DDL that
-        // reclaimed nothing, forcing a barrier concurrent with someone else's
-        // in-flight reclaim — which is a wedge, not a repair.
-        let reclaimed = unsafe { (*cat_ptr_raw).durable_generation } != gen_before;
+
+        // `checkpoint_before_backfill` is the only thing above that bumps. If it
+        // fired, every view and index is invalid on disk right now; finish the
+        // checkpoint here, while the reactor is still parked and the tick loop
+        // still quiesced, rather than leaving the database rebuild-on-boot until
+        // something wakes the committer.
+        if unsafe { (*cat_ptr_raw).durable_generation } != gen_before {
+            let mut pending = Vec::new();
+            shared.drain_tick_rows_into(&mut pending);
+            // Mirrors the tick loop's own filter: a tid this very DDL dropped is
+            // not ticked.
+            pending.retain(|&tid| shared.cat().has_id(tid));
+            guard_panic("view-restamp", || shared.disp().restamp_derived(&pending)).unwrap_or_else(|e| {
+                gnitz_fatal_abort!("re-stamping derived state after a CREATE VIEW reclaim failed: {}", e);
+            });
+        }
 
         send_ok_response(shared, peer, 0, None, client_id, zone_lsn as u128, client_version).await;
         let total = t_ddl_start.elapsed();
         if total > Duration::from_millis(20) {
             gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
-        }
-
-        // The reclaim bumped the generation and reset the SAL, so every checkpointed
-        // view and index is invalid and nothing else will trigger a checkpoint soon
-        // on a quiet server. Arm the committer's one-shot; it is honoured on the
-        // first pass after this window closes, which is why nothing is awaited here.
-        if reclaimed {
-            shared.force_checkpoint.set(true);
         }
     })
     .await;

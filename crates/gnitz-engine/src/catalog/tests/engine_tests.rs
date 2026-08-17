@@ -225,7 +225,7 @@ fn test_recovery_start_generation_bump_monotonic() {
             engine.durable_generation, 3,
             "recovery-start bump advances the field to G+1"
         );
-        // The boot checkpoint's single bump (inside `do_checkpoint`, which owns it
+        // The boot checkpoint's single bump (inside `reclaim_base`, which owns it
         // for every base round) then retracts G+1 and inserts G+2.
         assert_eq!(engine.bump_checkpoint_generation(), 4, "boot_checkpoint goes G+1 → G+2");
         engine.close();

@@ -277,7 +277,7 @@ fn sal_begin_group_rejects_cursor_overflow() {
 }
 
 /// The worst-case footprint of a terminal group: a `MAX_WORKERS` broadcast whose
-/// every slot is a bare control block. All three emitters — `sync_flush_round`,
+/// every slot is a bare control block. All three emitters — `sync_round`,
 /// `shutdown_workers` and `write_checkpoint_group` — carry neither a schema block
 /// nor data.
 fn worst_case_terminal_group() -> usize {

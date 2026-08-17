@@ -1603,7 +1603,7 @@ def test_view_is_not_stale_after_backfill_checkpoint(own_server):
     its manifests must not stay generation-valid across that: a restart would
     resume a view that is silently short, with no SAL tail left to close the gap.
 
-    Fails without the generation bump inside `do_checkpoint`."""
+    Fails without the generation bump inside `reclaim_base`."""
     sock_path = own_server.sock_path
 
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
@@ -1652,6 +1652,76 @@ def test_view_is_not_stale_after_backfill_checkpoint(own_server):
         f"got {len(rows)} of {_RECLAIM_ROWS}"
     )
     assert sum(r["val"] for r in rows) == sum(i * 10 for i in range(_RECLAIM_ROWS))
+    conn.close()
+
+
+def test_create_view_reclaim_leaves_no_rebuild_on_idle_server(own_server):
+    """The reclaim inside a CREATE VIEW window bumps the generation, invalidating
+    every checkpointed view and index — and the window must finish that checkpoint
+    itself, re-stamping the derived state before it returns.
+
+    Deferring the re-stamp to the committer needs something to wake it, and on a
+    server that goes idle after the CREATE nothing does: the watchdog's reclaim
+    barrier is gated on low SAL space, which the reclaim just freed. So the test
+    does *nothing* after the CREATE — no push, no scan, either of which would mask
+    the bug — before the SIGKILL. Without the inline finish the restart rebuilds
+    every view and index from base."""
+    sock_path = own_server.sock_path
+
+    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("val", gnitz.TypeCode.I64),
+            gnitz.ColumnDef("pad", gnitz.TypeCode.STRING)]
+    schema = gnitz.Schema(cols)
+
+    own_server.start(extra_env=_BACKFILL_RECLAIM_ENV)
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("idle")
+    tid = conn.create_table("idle", "t", cols)
+    conn.execute_sql("CREATE INDEX ON t(val)", schema_name="idle")
+    conn.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name="idle")
+
+    # Push into the (2, 12) MiB gap: past the backfill reclaim's watermark, short
+    # of any committer checkpoint that would re-stamp on its own.
+    for lo in range(0, _RECLAIM_ROWS, 2000):
+        batch = gnitz.ZSetBatch(schema)
+        for i in range(lo, lo + 2000):
+            batch.append(pk=i, val=i * 10, pad=_RECLAIM_PAD)
+        conn.push(tid, batch)
+
+    before = _sal_checkpoints(own_server)
+    conn.execute_sql("CREATE VIEW v2 AS SELECT pk FROM t", schema_name="idle")
+    conn.close()
+    # Only the two finalizers log this line (the relay's mid-backfill reset does
+    # not), so the count is the window's own round count: the reclaim's base
+    # round plus the ephemeral round that repairs it. A lone base round leaves
+    # the database rebuild-on-boot, which is what the restart below reads.
+    assert _sal_checkpoints(own_server) >= before + 2, (
+        "the CREATE VIEW window must run both halves of its checkpoint — a base "
+        "round alone bumps the generation and re-stamps nothing"
+    )
+
+    # No further work: the CREATE VIEW window is the last thing this server did.
+    own_server.stop()
+    own_server.start(extra_env=_BACKFILL_RECLAIM_ENV)
+
+    assert own_server.rebuilt_view_count() == 0, (
+        "the CREATE VIEW window must re-stamp the derived state it invalidated, "
+        "so every view resumes from its checkpoint"
+    )
+    assert own_server.rebuilt_index_counts() == [0] * own_server.workers, (
+        "the index the same reclaim invalidated must resume too"
+    )
+
+    conn = gnitz.connect(sock_path)
+    vid, _ = conn.resolve_table("idle", "v")
+    rows = conn.scan(vid)
+    # Weights, not row count: a resume that also replays the tail it already
+    # absorbed double-counts every row, which consolidates back to the same
+    # 4000 PKs at weight 2.
+    assert _weights_by(rows, "pk") == {i: 1 for i in range(_RECLAIM_ROWS)}, (
+        "the resumed view must hold every base row exactly once"
+    )
+    assert {r["pk"]: r["val"] for r in rows} == {i: i * 10 for i in range(_RECLAIM_ROWS)}
     conn.close()
 
 

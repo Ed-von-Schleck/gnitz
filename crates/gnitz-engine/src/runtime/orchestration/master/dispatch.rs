@@ -521,20 +521,19 @@ impl MasterDispatcher {
     /// nothing.
     fn checkpoint_before_backfill(&self) -> Result<(), String> {
         if self.sal.cursor() > self.relay_margin() || self.sal.needs_checkpoint() {
-            self.do_checkpoint()?;
+            self.reclaim_base()?;
         }
         Ok(())
     }
 
     /// Invariant: callers must live on a path that owns SAL checkpoint
-    /// exclusivity. Today that is the bootstrap backfill, the committer task,
-    /// and the reactor-parked stop-the-world CREATE-VIEW backfill
-    /// (`handle_ddl_txn` holds the catalog write lock with the committer
-    /// proven idle and the reactor parked, so no other SAL writer exists —
-    /// the same exclusivity boot has). The *async* fan-out / tick / steady-state
-    /// DDL paths must NOT call this — a concurrent FLAG_FLUSH races the
-    /// committer's own and orphans SAL writes straddling `sal.checkpoint_reset`.
-    /// See async-invariants.md §III.3a.
+    /// exclusivity. Today that is the bootstrap backfill and boot checkpoint, and
+    /// the reactor-parked stop-the-world CREATE-VIEW window (`handle_ddl_txn`
+    /// holds the catalog write lock with the committer proven idle and the
+    /// reactor parked, so no other SAL writer exists — the same exclusivity boot
+    /// has). The *async* fan-out / tick / steady-state DDL paths must NOT call
+    /// this — a concurrent FLAG_FLUSH races the committer's own and orphans SAL
+    /// writes straddling `sal.checkpoint_reset`. See async-invariants.md §III.3a.
     ///
     /// Publish every base table's shards and reset the SAL, invalidating
     /// checkpointed derived state first. The bump is not optional: this path
@@ -547,24 +546,43 @@ impl MasterDispatcher {
     /// silently stale — the same ordering step 0 of `run_checkpoint_sequence`
     /// uses.
     ///
-    /// Returns the generation it bumped to, which the caller stamps onto the
-    /// ephemeral round that re-validates the derived state.
-    fn do_checkpoint(&self) -> Result<u64, String> {
+    /// Half a checkpoint on its own. Both callers pair it with `restamp_derived`
+    /// in the same reactor-parked span.
+    fn reclaim_base(&self) -> Result<u64, String> {
         let gen = self.bump_checkpoint_generation();
-        self.sync_flush_round(0, FLAG_FLUSH)?;
-        self.checkpoint_post_ack()?;
+        self.sync_round(0, FLAG_FLUSH)?;
         Ok(gen)
     }
 
-    /// One synchronous flush round (pre-reactor W2M path): broadcast the flush
-    /// group, await every worker's ACK. The caller runs the matching reset.
+    /// Re-stamp the derived state a `reclaim_base` invalidated, inside the
+    /// caller's reactor-parked window: tick every source carrying buffered deltas
+    /// up to the published base cut, then persist every view trace, view output
+    /// and index at the durable generation.
+    ///
+    /// The tick is not optional — a base round leaves `pending_deltas` in worker
+    /// RAM (`handle_flush_all`), and the reclaim reset the SAL out from under
+    /// them, so stamping first would mark views durable at a cut their input has
+    /// not reached.
+    ///
+    /// `pending` is the master's set of tables with un-ticked deltas — what the
+    /// committer's `Drain` covers.
+    pub(crate) fn restamp_derived(&self, pending: &[i64]) -> Result<(), String> {
+        for &tid in pending {
+            self.drain_tick_blocking(tid)?;
+        }
+        self.sync_round(self.cat().durable_generation, FLAG_FLUSH_EPH)
+    }
+
+    /// One synchronous round (pre-reactor W2M path, or a reactor-parked window):
+    /// emit the flush group, block for every worker's ACK, finalize.
     /// A `FLAG_FLUSH_EPH` round's `lsn` IS the checkpoint generation (workers
     /// latch it via `set_committed_generation`); the base round passes 0.
-    fn sync_flush_round(&self, lsn: u64, flags: u32) -> Result<(), String> {
+    fn sync_round(&self, lsn: u64, flags: u32) -> Result<(), String> {
         self.note_flush_round(lsn, flags);
         // No schema block: `handle_flush_all` takes neither a schema nor a batch.
         self.send_broadcast(0, lsn, flags, None, 0)?;
-        self.collect_acks()
+        self.collect_acks()?;
+        self.checkpoint_post_ack()
     }
 
     /// Check one emitted round against the ordering every base publish depends
@@ -572,7 +590,7 @@ impl MasterDispatcher {
     /// bump**, and no second base round once an ephemeral round has re-stamped
     /// derived state at the current generation.
     ///
-    /// Both master-side emitters funnel through here (`sync_flush_round` and
+    /// Both master-side emitters funnel through here (`sync_round` and
     /// `write_checkpoint_group`), so the rule is checked in one place rather
     /// than left as an obligation on each call site. The committer's
     /// reclaim-only base round inside `await_servicing` rides step 0's bump
@@ -866,7 +884,8 @@ impl MasterDispatcher {
     /// no-concurrent-relay paths this runs on (boot; the reactor-parked DDL
     /// window). A reclaim here bumps the generation, leaving every checkpointed
     /// view and index invalid until an ephemeral round re-stamps them — so a
-    /// caller that observes the bump owes the cluster a full checkpoint sequence.
+    /// caller that observes the bump must run `restamp_derived` before its window
+    /// closes.
     pub fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), String> {
         self.checkpoint_before_backfill()?;
         let schema = self.schema_desc_for(source_id);
@@ -1354,9 +1373,8 @@ impl MasterDispatcher {
 
     /// Post-ACK checkpoint cleanup: flush system tables before resetting
     /// the SAL cursor (their data lives in SAL entries about to be
-    /// discarded), then advance the epoch. Called by both the bootstrap
-    /// sync path (`do_checkpoint`) and the async committer after it
-    /// collects FLAG_FLUSH ACKs.
+    /// discarded), then advance the epoch. Called by both the synchronous
+    /// `sync_round` and the async committer after it collects FLAG_FLUSH ACKs.
     ///
     /// Finalizes **both** checkpoint rounds — base and ephemeral. The ephemeral
     /// round must flush too: a `commit_serial_range_durable` advance can land in
@@ -1372,7 +1390,7 @@ impl MasterDispatcher {
     /// durable copy, so resetting on a swallowed failure destroys it — the same
     /// hazard the boot path guards via `flush_all_system_tables`. Callers leave
     /// the SAL intact and retry on a later checkpoint (committer) or abort boot
-    /// (`do_checkpoint`).
+    /// (`sync_round`).
     pub(crate) fn checkpoint_post_ack(&self) -> Result<(), String> {
         let cat = self.cat();
         cat.flush_all_system_tables()?;
@@ -1392,26 +1410,17 @@ impl MasterDispatcher {
     }
 
     /// Synchronous boot-end checkpoint (pre-reactor W2M path): record the
-    /// launched topology, then run the base + ephemeral flush rounds. No drain —
+    /// launched topology, then reclaim and re-stamp. The drain set is empty —
     /// recovery already drained everything and no pushes are admitted yet (the
     /// socket is not open), so `pending_deltas` is empty. Freshly backfilled
     /// views are durably checkpointed before the socket opens.
     pub(crate) fn boot_checkpoint(&self, worker_count: u32) -> Result<(), String> {
         // The topology row's durability rides the gen bump's system-table flush
-        // (both are `_sequences` rows), which happens inside `do_checkpoint` —
-        // so a manifest stamped at a generation still implies the topology row
-        // for that layout is durable.
+        // (both are `_sequences` rows), so a manifest stamped at a generation
+        // implies the topology row for that layout is durable.
         self.cat().record_topology(worker_count);
-        // Base round (bump → FLAG_FLUSH → ACKs → flush system tables + reset).
-        // Its bump is the boot's only one, so the ephemeral round below stamps
-        // exactly the generation the base round invalidated everything at.
-        let gen = self.do_checkpoint()?;
-        // Ephemeral round: workers persist view trace/output state stamped `gen`,
-        // then the same finalize as the base round (flush system tables + reset).
-        // A guaranteed no-op flush here — no writes since `do_checkpoint` and no
-        // socket open — but it keeps a single reset-with-flush finalizer.
-        self.sync_flush_round(gen, FLAG_FLUSH_EPH)?;
-        self.checkpoint_post_ack()
+        self.reclaim_base()?;
+        self.restamp_derived(&[])
     }
 
     /// Accessor for the committer. True when the SAL write cursor has
@@ -1649,7 +1658,7 @@ mod checkpoint_finalize_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `do_checkpoint` owns the generation bump that invalidates every
+    /// `reclaim_base` owns the generation bump that invalidates every
     /// checkpointed view and index before it publishes a newer base cut: exactly
     /// one per call, and `boot_checkpoint` consumes that one rather than adding
     /// its own.
@@ -1657,8 +1666,8 @@ mod checkpoint_finalize_tests {
     /// Zero workers: every round's ACK collection is an empty loop, so the two
     /// rounds and the finalizer run for real without a forked cluster.
     #[test]
-    fn do_checkpoint_bumps_once_and_boot_checkpoint_consumes_it() {
-        let dir = finalize_temp_dir("do_checkpoint_bumps");
+    fn reclaim_base_bumps_once_and_boot_checkpoint_consumes_it() {
+        let dir = finalize_temp_dir("reclaim_base_bumps");
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(engine.durable_generation, 0, "fresh DB starts at generation 0");
 
@@ -1677,9 +1686,9 @@ mod checkpoint_finalize_tests {
         // before any group is written — what `server_main` does after worker ACKs.
         disp.reset_sal(1);
 
-        assert_eq!(disp.do_checkpoint().unwrap(), 1, "the base round bumps G → G+1");
+        assert_eq!(disp.reclaim_base().unwrap(), 1, "the base round bumps G → G+1");
         assert_eq!(disp.cat().durable_generation, 1);
-        assert_eq!(disp.do_checkpoint().unwrap(), 2, "and exactly once per call");
+        assert_eq!(disp.reclaim_base().unwrap(), 2, "and exactly once per call");
 
         // The boot checkpoint's base round bumps 2 → 3; its ephemeral round stamps
         // 3 (`note_flush_round`'s `debug_assert_eq!` is what pins that here).
@@ -1688,6 +1697,46 @@ mod checkpoint_finalize_tests {
             disp.cat().durable_generation,
             3,
             "boot_checkpoint advances by exactly one",
+        );
+
+        drop(disp);
+        engine.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pair `reclaim_base` + `restamp_derived` is a whole checkpoint: the
+    /// ephemeral round re-stamps at exactly the generation the base round
+    /// invalidated everything at, so nothing is left rebuild-on-boot.
+    #[test]
+    fn restamp_derived_stamps_the_durable_generation() {
+        let dir = finalize_temp_dir("restamp_stamps_durable_gen");
+        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+
+        let sal_region = SharedRegion::new(SAL_SIZE);
+        let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, Vec::new());
+        let catalog_ptr = &mut engine as *mut CatalogEngine;
+        let disp = MasterDispatcher::new(
+            0,
+            Vec::new(),
+            catalog_ptr,
+            sal_writer,
+            Rc::new(W2mReceiver::new(Vec::new())),
+        );
+        disp.reset_sal(1);
+
+        let gen = disp.reclaim_base().unwrap();
+        assert_ne!(
+            disp.last_ephemeral_gen.get(),
+            gen,
+            "the base round alone leaves every derived manifest behind the new generation"
+        );
+
+        // Empty drain set: zero workers hold no pending deltas.
+        disp.restamp_derived(&[]).unwrap();
+        assert_eq!(
+            disp.last_ephemeral_gen.get(),
+            disp.cat().durable_generation,
+            "the ephemeral round re-validates the derived state at the durable generation"
         );
 
         drop(disp);

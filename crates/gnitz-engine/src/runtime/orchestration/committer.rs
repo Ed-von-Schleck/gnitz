@@ -117,20 +117,16 @@ pub struct Shared {
     /// Zone-LSN allocation high-water + durability watermark, shared with the
     /// executor so SCAN/SEEK responses report the same LSN commits publish.
     pub lsn_alloc: Rc<ZoneLsnAllocator>,
-    /// One-shot "checkpoint before the next batch" request, for the paths that
-    /// need a checkpoint on an otherwise-idle server, where
+    /// One-shot "checkpoint before the next batch" request, for the one path that
+    /// needs a checkpoint on an otherwise-idle server where
     /// `sal_needs_checkpoint()` would stay false: `commit_pushes` when a
-    /// transaction is rejected for transient SAL overflow (so the client's retry
-    /// finds a reclaimed SAL), and a CREATE VIEW whose backfill reclaimed (so the
-    /// derived state it invalidated gets re-stamped).
+    /// transaction is rejected for transient SAL overflow, so the client's retry
+    /// finds a reclaimed SAL.
     ///
     /// Consumed with `take()` in `run`'s checkpoint decision, which only reaches
     /// it outside a DDL window — so a request raised inside one survives until
-    /// the window closes. That is what lets the DDL path arm it without dropping
-    /// its tick gate to await a barrier it could not be granted anyway.
-    ///
-    /// Shared with the executor, like `ddl_window`.
-    pub force_checkpoint: Rc<Cell<bool>>,
+    /// the window closes.
+    pub force_checkpoint: Cell<bool>,
     pub tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
     /// Tick-trigger sender: fires the auto-tick after large commits, and drives
     /// the checkpoint sequence's drain (`Drain`) and quiesce (`Quiesce`)
