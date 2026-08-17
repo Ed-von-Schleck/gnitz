@@ -54,30 +54,44 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Drop a schema and every table, view, and index it contains
-    /// (PostgreSQL's `DROP SCHEMA ... CASCADE` semantics).
+    /// Drop every member of a schema, then the schema row — views before
+    /// tables, since a view may read a member table.
+    ///
+    /// The engine has no `DROP SCHEMA CASCADE`; `precheck_schema_family` rejects
+    /// a non-empty drop. Cascade is a client-side composition of ordinary drops
+    /// (`gnitz-core`'s `Client::drop_schema`), and so is this fixture. It does
+    /// not reproduce that client's retry-until-stable drain or hidden-segment
+    /// filter, which resolve view-on-view and FK chains — the client's algorithm
+    /// to get right, covered end-to-end, not the guard these tests are about.
     #[cfg(test)]
     pub(crate) fn drop_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
         if !self.has_schema(name) {
             return Err("Schema does not exist".into());
         }
-        if name == "_system" {
-            return Err("Forbidden: cannot drop system schema".into());
-        }
         let sid = self.get_schema_id(name);
 
-        // 1. Cascade: collect every view and table in the schema, then
-        //    drop them in dependency-aware order. Views first (they may
-        //    depend on tables + other views), retrying until stable to
-        //    handle view-on-view chains. Then tables (retry for FK
-        //    chains).
-        let (view_names, table_names) = self.collect_schema_members(sid);
-        self.drain_drop_targets(view_names, |catalog, q| catalog.drop_view(q))?;
-        self.drain_drop_targets(table_names, |catalog, q| catalog.drop_table(q))?;
+        let members: Vec<i64> = self
+            .caches
+            .members_by_schema
+            .get(&sid)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let (views, tables): (Vec<i64>, Vec<i64>) = members
+            .into_iter()
+            .partition(|id| self.dag.tables.get(id).is_some_and(|e| e.kind.is_view()));
+        for vid in views {
+            // Clears the plan caches only — the view stays registered, so the
+            // drop cascade's `dag.tables` guard still resolves it.
+            self.dag.invalidate(vid);
+            self.submit_retraction(SysFamily::View, vid as u128)?;
+        }
+        for tid in tables {
+            self.submit_retraction(SysFamily::Table, tid as u128)?;
+        }
 
-        // 2. Now the schema is guaranteed empty; emit the schema-drop
-        //    delta exactly as before.
+        // The schema is empty now, so the engine's member-count guard accepts
+        // this row.
         let schema = SysFamily::Schema.schema();
         let mut bb = BatchBuilder::new(schema);
         write_schema_tab_row(
@@ -92,62 +106,6 @@ impl CatalogEngine {
 
         self.submit(SysFamily::Schema, batch)?;
         Ok(())
-    }
-
-    /// Collect qualified names of every view and table in schema `sid`
-    /// from in-memory caches. Views and tables are returned separately
-    /// because drop_schema drops views first (to handle view-on-view deps)
-    /// and tables second (to handle FK chains).
-    #[cfg(test)]
-    fn collect_schema_members(&mut self, sid: i64) -> (Vec<String>, Vec<String>) {
-        let members: Vec<i64> = self
-            .caches
-            .members_by_schema
-            .get(&sid)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default();
-        let (view_ids, table_ids): (Vec<i64>, Vec<i64>) = members
-            .into_iter()
-            .partition(|id| self.dag.tables.get(id).is_some_and(|e| e.kind.is_view()));
-        let qname = |ids: Vec<i64>| -> Vec<String> {
-            ids.iter()
-                .filter_map(|id| self.caches.entity_by_id.get(id).map(|(sn, en)| format!("{sn}.{en}")))
-                .collect()
-        };
-        (qname(view_ids), qname(table_ids))
-    }
-
-    /// Repeatedly attempt to drop each target; on dependency-related
-    /// errors, move the target to the back of the queue and retry.
-    /// Finishes when the queue is empty or no progress was made in a
-    /// full pass (then returns the last error).
-    #[cfg(test)]
-    fn drain_drop_targets<F>(&mut self, targets: Vec<String>, mut drop_fn: F) -> Result<(), String>
-    where
-        F: FnMut(&mut Self, &str) -> Result<(), String>,
-    {
-        let mut pending: Vec<String> = targets;
-        loop {
-            if pending.is_empty() {
-                return Ok(());
-            }
-            let before = pending.len();
-            let mut retry: Vec<String> = Vec::new();
-            let mut last_err: Option<String> = None;
-            for q in pending.drain(..) {
-                match drop_fn(self, &q) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        last_err = Some(e);
-                        retry.push(q);
-                    }
-                }
-            }
-            if retry.len() == before {
-                return Err(last_err.unwrap_or_else(|| "unknown cascade failure".into()));
-            }
-            pending = retry;
-        }
     }
 
     // -- DDL: CREATE/DROP TABLE --------------------------------------------

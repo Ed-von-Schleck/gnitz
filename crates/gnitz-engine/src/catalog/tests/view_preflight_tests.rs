@@ -163,7 +163,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
 
     // The same `+1` preceded by the incumbent's `-1` — one ALTER VIEW bundle —
     // is admitted. The `-1` reproduces the live row's full payload, which the
-    // §3.3 CAS requires.
+    // the retraction CAS requires.
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, old_vid, "vw", "SELECT id, v FROM base");
     push_view_tab_row(&mut bb, 1, new_vid, "vw", "SELECT id, v FROM base");

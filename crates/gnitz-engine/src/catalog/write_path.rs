@@ -14,9 +14,9 @@ use super::*;
 use crate::schema::make_index_schema;
 use crate::storage::{compare_rows, compare_rows_except};
 use gnitz_wire::{
-    COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL,
-    COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_NAME,
-    SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME,
+    COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
+    COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE,
+    IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME,
 };
 
 /// The only handle the DDL/imperative layer has on catalog state: submit one
@@ -63,12 +63,6 @@ impl CatalogDeltaSink for CatalogEngine {
         self.apply_local(family, &mut batch, None)
         // Deliberately no push to pending_broadcasts.
     }
-}
-
-/// Topological creation priority for a `pending_broadcasts` tid; 99 (the
-/// order-neutral default) for a non-family id.
-fn sys_topo_priority(tid: i64) -> u8 {
-    SysFamily::from_id(tid).map_or(99, SysFamily::topo_priority)
 }
 
 /// Reject a mutation of a bootstrap-owned id in one of the catalog's id spaces
@@ -176,7 +170,7 @@ impl CatalogEngine {
     pub(crate) fn apply_and_enqueue_family(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
         self.apply_local(family, &mut batch, self.ctx.ddl_zone_lsn())?;
         if batch.count > 0 {
-            self.pending_broadcasts.push((family.id(), batch));
+            self.pending_broadcasts.push((family, batch));
         }
         Ok(())
     }
@@ -244,7 +238,7 @@ impl CatalogEngine {
         Some((b, w))
     }
 
-    /// §3.3(A): the post-image retraction contract for a rewrite-pair-capable
+    /// The post-image retraction contract for a rewrite-pair-capable
     /// family (TABLE_TAB / VIEW_TAB / COL_TAB), per distinct PK:
     ///
     /// 1. **CAS** — every `-1` row must content-equal the current live row (you
@@ -299,22 +293,18 @@ impl CatalogEngine {
         Ok((live.map(|(b, _)| b), net))
     }
 
-    /// §3.3: the TABLE_TAB / VIEW_TAB precheck — the shared CAS + net contract
-    /// plus the two relation-only guards: no mutation of a system-range id
-    /// passes, whatever its sign, and a rewrite pair's `+1` may differ from the
-    /// live row only in `name` (`name_pay`). `compare_rows_except` routes
+    /// The TABLE_TAB / VIEW_TAB precheck — the shared CAS + net contract plus
+    /// the two relation-only guards: no mutation of a system-range id passes,
+    /// whatever its sign, and a rewrite pair's `+1` may differ from the live row
+    /// only in `name`. TABLE_TAB and VIEW_TAB agree on the name slot (asserted
+    /// in gnitz-wire), so one constant serves both. `compare_rows_except` routes
     /// STRING/BLOB through each side's own blob heap, so a name > 12 bytes is
     /// compared by content.
     ///
     /// Returns the PKs whose net is dead (`≤ 0`) — the genuine drops — so the
     /// relation drop guards re-key on net-liveness (a rename's net-live `-1` is
     /// excluded) rather than raw batch weights.
-    fn precheck_relation_signatures(
-        &self,
-        family: SysFamily,
-        batch: &Batch,
-        name_pay: usize,
-    ) -> Result<Vec<i64>, String> {
+    fn precheck_relation_signatures(&self, family: SysFamily, batch: &Batch) -> Result<Vec<i64>, String> {
         let schema = family.schema();
         let mut net_dead: Vec<i64> = Vec::new();
         for sig in pk_signatures(batch) {
@@ -327,7 +317,7 @@ impl CatalogEngine {
                 for j in 0..batch.count {
                     if batch.get_pk(j) == sig.pk
                         && batch.get_weight(j) > 0
-                        && compare_rows_except(&schema, lb, 0, batch, j, 1 << name_pay) != Ordering::Equal
+                        && compare_rows_except(&schema, lb, 0, batch, j, 1 << TABTAB_PAY_NAME) != Ordering::Equal
                     {
                         return Err("a system-catalog rewrite pair may only change the name".into());
                     }
@@ -496,30 +486,29 @@ impl CatalogEngine {
                 owner_schema.num_columns()
             ));
         }
-        // What `check_col_defs` would find on the prospective set, read off the
-        // descriptor already in hand rather than by re-scanning COL_TAB. A rule
-        // added there does not reach here. `validate_pk_cols` is not re-run: a
-        // trailing non-PK append cannot invalidate an already-valid PK list.
-        if owner_schema.num_columns() >= crate::schema::MAX_COLUMNS {
-            return Err(format!(
-                "cannot ADD COLUMN on table {owner_id}: it already has {} columns (max {})",
-                owner_schema.num_columns(),
-                crate::schema::MAX_COLUMNS
-            ));
-        }
-        let type_code = batch.read_payload_u64(pj, COLTAB_PAY_TYPE_CODE) as u8;
-        if !gnitz_wire::is_valid_type_code(type_code) {
-            return Err(format!("cannot ADD COLUMN with invalid type code {type_code}"));
-        }
+        // Decode the appended row once; every rule below reads the decoded def.
+        let appended = ColumnDef {
+            name: batch.read_payload_string(pj, COLTAB_PAY_NAME),
+            type_code: batch.read_payload_u64(pj, COLTAB_PAY_TYPE_CODE) as u8,
+            is_nullable: batch.read_payload_u64(pj, COLTAB_PAY_IS_NULLABLE) != 0,
+            fk_table_id: batch.read_payload_u64(pj, COLTAB_PAY_FK_TABLE_ID) as i64,
+            fk_col_idx: batch.read_payload_u64(pj, COLTAB_PAY_FK_COL_IDX) as u32,
+            is_serial: batch.read_payload_u64(pj, COLTAB_PAY_IS_SERIAL) != 0,
+            is_hidden: batch.read_payload_u64(pj, COLTAB_PAY_IS_HIDDEN) != 0,
+        };
+        // Run the prospective column set through `check_col_defs` — the sole home
+        // of the column-record rules — so a rule added there reaches ADD COLUMN
+        // too. `validate_pk_cols` is not re-run: a trailing non-PK append cannot
+        // invalidate an already-valid PK list.
+        let mut prospective = (*self.read_column_defs(owner_id)).clone();
+        prospective.push(appended.clone());
+        check_col_defs(&prospective).map_err(|e| format!("cannot ADD COLUMN on table {owner_id}: {e}"))?;
         // A new column over existing rows is unconditionally nullable, carries
         // no SERIAL/FK, and is visible.
-        if batch.read_payload_u64(pj, COLTAB_PAY_IS_NULLABLE) != 1 {
+        if !appended.is_nullable {
             return Err("ADD COLUMN must append a nullable column".into());
         }
-        if batch.read_payload_u64(pj, COLTAB_PAY_IS_SERIAL) != 0
-            || batch.read_payload_u64(pj, COLTAB_PAY_IS_HIDDEN) != 0
-            || batch.read_payload_u64(pj, COLTAB_PAY_FK_TABLE_ID) != 0
-        {
+        if appended.is_serial || appended.is_hidden || appended.fk_table_id != 0 {
             return Err("ADD COLUMN must not append a SERIAL, hidden, or foreign-key column".into());
         }
         // Nothing else anchors these three on an unpaired row, and they are what
@@ -660,19 +649,18 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// TABLE_TAB / VIEW_TAB: the §3.3(A) retraction contract, then the CREATE
+    /// TABLE_TAB / VIEW_TAB: the retraction contract, then the CREATE
     /// guards (relation-id ceiling, column-record admissibility, FK column
     /// types, qualified-name uniqueness) and the DROP guards (FK children, view
     /// dependents).
     ///
-    /// §3.3(B): the drop guards key on PKs whose bundle net is DEAD, not raw
+    /// The drop guards key on PKs whose bundle net is DEAD, not raw
     /// `weight < 0` — so a rename pair's net-live `-1` is never rejected as
     /// "referenced by FK" / "View dependency".
     fn precheck_relation_family(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         let is_table = family == SysFamily::Table;
         let kind = if is_table { "table" } else { "view" };
-        // TABLE_TAB and VIEW_TAB agree on the name slot (asserted in gnitz-wire).
-        let net_dead = self.precheck_relation_signatures(family, batch, TABTAB_PAY_NAME)?;
+        let net_dead = self.precheck_relation_signatures(family, batch)?;
 
         for i in 0..batch.count {
             if batch.get_weight(i) <= 0 {
@@ -883,7 +871,7 @@ impl CatalogEngine {
     /// top-level DDL and forwards each entry to `broadcast_ddl`. Workers
     /// receive system-table changes via FLAG_DDL_SYNC → `ddl_sync`, which
     /// bypasses `ingest_to_family` entirely, so the queue stays empty there.
-    pub fn drain_pending_broadcasts(&mut self) -> Vec<(i64, Batch)> {
+    pub fn drain_pending_broadcasts(&mut self) -> Vec<(SysFamily, Batch)> {
         std::mem::take(&mut self.pending_broadcasts)
     }
 
@@ -1083,12 +1071,12 @@ impl CatalogEngine {
     /// the handler passes `None`: nothing was applied for that family, so nothing
     /// is reconstructed and **no ghost `-1` is written**. At most one family is
     /// ever applied-not-enqueued, so `Option` is the exact type.
-    pub(crate) fn compensate_stage_a(&mut self, applied_not_enqueued: Option<(i64, Batch)>) {
+    pub(crate) fn compensate_stage_a(&mut self, applied_not_enqueued: Option<(SysFamily, Batch)>) {
         let mut rollback_list = self.drain_pending_broadcasts();
 
-        if let Some((tid, mut batch)) = applied_not_enqueued {
-            batch.set_schema(sys_tab_schema(tid));
-            rollback_list.push((tid, batch));
+        if let Some((family, mut batch)) = applied_not_enqueued {
+            batch.set_schema(family.schema());
+            rollback_list.push((family, batch));
         }
 
         // Precheck-failed first family: nothing applied, trivial no-op.
@@ -1103,7 +1091,7 @@ impl CatalogEngine {
         // different thing: residue of a creation that never committed.
         self.discard_pending_dir_deletions();
 
-        // §3.4: undo each PK by what the bundle did to *it*, not by what the
+        // Undo each PK by what the bundle did to *it*, not by what the
         // bundle did overall — one family can do both. An ALTER VIEW retires the
         // old vid and registers the new chain in a single VIEW_TAB batch, so the
         // rollback has to tear one down and restore the other, and the two need
@@ -1114,9 +1102,9 @@ impl CatalogEngine {
         // across the two phases they would drop the entity's net weight to zero
         // mid-rollback, firing the teardown hook and queueing the live entity's
         // directory for removal.
-        let mut undo_create: Vec<(i64, Batch)> = Vec::new();
-        let mut undo_drop: Vec<(i64, Batch)> = Vec::new();
-        for (tid, batch) in rollback_list {
+        let mut undo_create: Vec<(SysFamily, Batch)> = Vec::new();
+        let mut undo_drop: Vec<(SysFamily, Batch)> = Vec::new();
+        for (family, batch) in rollback_list {
             let mut net: FxHashMap<u128, i64> = FxHashMap::default();
             for i in 0..batch.count {
                 *net.entry(batch.get_pk(i)).or_default() += batch.get_weight(i);
@@ -1124,26 +1112,26 @@ impl CatalogEngine {
             let (created, dropped): (Vec<u32>, Vec<u32>) =
                 (0..batch.count as u32).partition(|&i| net[&batch.get_pk(i as usize)] >= 0);
             if dropped.is_empty() {
-                undo_create.push((tid, batch));
+                undo_create.push((family, batch));
             } else if created.is_empty() {
-                undo_drop.push((tid, batch));
+                undo_drop.push((family, batch));
             } else {
-                let schema = sys_tab_schema(tid);
+                let schema = family.schema();
                 let mem = batch.as_mem_batch();
-                undo_create.push((tid, Batch::from_indexed_rows(&mem, &created, &[], &schema)));
-                undo_drop.push((tid, Batch::from_indexed_rows(&mem, &dropped, &[], &schema)));
+                undo_create.push((family, Batch::from_indexed_rows(&mem, &created, &[], &schema)));
+                undo_drop.push((family, Batch::from_indexed_rows(&mem, &dropped, &[], &schema)));
             }
         }
 
         // Tear down what the bundle created — dependents before dependencies,
         // DESCENDING…
-        undo_create.sort_by_key(|(tid, _)| std::cmp::Reverse(sys_topo_priority(*tid)));
+        undo_create.sort_by_key(|(f, _)| std::cmp::Reverse(f.topo_priority()));
         // …then restore what it dropped — dependencies before dependents,
         // ASCENDING, so a restored view finds its columns, deps, and circuit rows
         // already back when its own VIEW_TAB row re-registers it. Creations first,
         // so a name the bundle moved from one id to another is free again by the
         // time the incumbent reclaims it.
-        undo_drop.sort_by_key(|(tid, _)| sys_topo_priority(*tid));
+        undo_drop.sort_by_key(|(f, _)| f.topo_priority());
         undo_create.append(&mut undo_drop);
 
         // Replay each with negated weight through the no-broadcast path.
@@ -1151,9 +1139,8 @@ impl CatalogEngine {
         // are updated. The rollback gate in `submit` ensures any cascade that
         // calls back into `submit` also bypasses broadcasts.
         let result = self.with_rollback_compensation(|s| -> Result<(), String> {
-            for (tid, mut batch) in undo_create {
+            for (family, mut batch) in undo_create {
                 batch.map_weights(i64::wrapping_neg);
-                let family = SysFamily::from_id(tid).ok_or_else(|| format!("rollback: unknown system family {tid}"))?;
                 s.submit_local(family, batch)?;
             }
             Ok(())

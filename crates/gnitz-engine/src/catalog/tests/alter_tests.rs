@@ -1,6 +1,6 @@
 //! ALTER (rename) catalog mechanics driven directly at the `CatalogEngine`
 //! layer: the reconciling register hooks (a rename pair fires no cascade / no
-//! dir deletion), the §3.3 post-image retraction contract (CAS, per-PK net,
+//! dir deletion), the post-image retraction contract (CAS, per-PK net,
 //! system-range rewrite guard) exercised with names longer than 12 bytes so the
 //! German-string blob heap is on the CAS path, and the id-only directory resume
 //! (§4) across a reopen. The end-to-end SQL surface is in
@@ -142,7 +142,7 @@ fn rename_then_reopen_resolves_flushed_data() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── §3.3(A): the retraction contract, exercised with > 12-byte names ────────
+// ── The retraction contract, exercised with > 12-byte names ────────────────
 
 #[test]
 fn valid_long_name_rename_accepted() {
@@ -291,7 +291,7 @@ fn system_range_schema_mutations_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── §3.3(A) for COL_TAB: the column retraction contract ─────────────────────
+// ── COL_TAB: the column retraction contract ─────────────────────────────────
 
 #[test]
 fn stale_column_rename_rejected_and_drop_cascade_passes() {

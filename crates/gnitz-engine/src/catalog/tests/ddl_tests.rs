@@ -260,22 +260,12 @@ fn test_edge_cases() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_drop_schema_cascade_with_view ──────────────────────────────────
-// Exercises views_by_schema cache and the cache-based collect_schema_members:
-// schema_is_empty must return false when a view (not just a table) exists,
-// and drop_schema must collect and drop the view before the table.
-
-// `test_drop_schema_cascade_with_view` and `test_schema_is_empty_view_only`
-// previously relied on `engine.create_view(qname, &CircuitGraph, sql)` —
-// removed alongside the circuit-graph schema redesign. Equivalent end-to-end
-// coverage runs through the wire path in the Python E2E suite.
-
 // ── test_nonempty_schema_drop_rejected ───────────────────────────────────
 // The engine-side guard in precheck_family rejects a raw SCHEMA_TAB -1 on a
-// non-empty schema BEFORE any WAL write, so a member is never orphaned. Both the
-// production client cascade and the #[cfg(test)] engine cascade empty a schema
-// first, so this bare guard is reachable only by a direct retraction — driven
-// here to prove the rejection is loud and leaves nothing orphaned.
+// non-empty schema BEFORE any WAL write, so a member is never orphaned. Every
+// DROP SCHEMA empties the schema first — the client's cascade in production, the
+// fixture's member loop here — so this bare guard is reachable only by a direct
+// retraction, driven here to prove the rejection is loud and orphans nothing.
 
 #[test]
 fn test_nonempty_schema_drop_rejected() {
@@ -697,7 +687,7 @@ fn drop_cascade_broadcasts_children_before_parents() {
     engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
 
     // Collect the broadcast family-id sequence.
-    let tids: Vec<i64> = engine.drain_pending_broadcasts().iter().map(|(tab, _)| *tab).collect();
+    let tids: Vec<i64> = engine.drain_pending_broadcasts().iter().map(|(f, _)| f.id()).collect();
 
     let pos = |id: i64| tids.iter().position(|&t| t == id);
     let idx_pos = pos(IDX_TAB_ID).unwrap_or_else(|| panic!("IDX_TAB retraction must be broadcast; seq={tids:?}"));

@@ -317,7 +317,7 @@ fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngin
                 Some(b) if b.count > 0 => b,
                 _ => return Ok(false),
             };
-            // §3.2: route through `ddl_sync` (→ `apply_local`), NOT `ingest_to_family`
+            // Route through `ddl_sync` (→ `apply_local`), NOT `ingest_to_family`
             // (→ `submit` → `precheck_family`). These rows are master-validated by
             // definition, and the Column precheck arm would false-reject a replayed
             // DROP TABLE cascade's independent COL `-1` groups (unpaired on a

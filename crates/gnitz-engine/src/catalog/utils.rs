@@ -70,9 +70,9 @@ pub(crate) fn relation_dir(base_dir: &str, schema_name: &str, kind: RelationKind
 /// CREATE VIEW pre-flight compiles into. Not the view's own directory:
 /// `child_scratch_dir` stamps the rank into each scratch child's name and the
 /// master is rank 0, so compiling in place would write worker 0's real paths.
-/// Sits under a schema dir and ends in `_<digits>` so `is_table_dir_name`
-/// classifies it, which is what lets the boot orphan sweep reclaim one left by a
-/// crash mid-compile; a root elsewhere would leak a directory per crash.
+/// Sits under a schema dir and ends in `_<digits>`, which is what lets the boot
+/// orphan sweep reclaim one left by a crash mid-compile; a root elsewhere would
+/// leak a directory per crash.
 pub(crate) fn preflight_dir(base_dir: &str, schema_name: &str, vid: i64) -> String {
     format!("{base_dir}/{schema_name}/_preflight_{vid}")
 }
@@ -108,8 +108,14 @@ pub(crate) fn reclaim_retired_children(dir: &str, num_workers: u32) {
     }
 }
 
-/// True if `name` is shaped like a table or view directory — both end in
-/// `_<digits>` (`<name>_<tid>` and `view_<name>_<vid>` respectively).
+/// True if `name` could be a relation directory. The three writers directly
+/// under a schema dir are `relation_dir` (`t_<id>` / `v_<id>`) and
+/// `preflight_dir` (`_preflight_<id>`), all of which end in `_<digits>`.
+///
+/// Deliberately looser than those builders: it is the eligibility gate on
+/// `gc_orphan_directories`' `remove_dir_all`, and matching the exact shapes
+/// would strand a directory written under an older naming scheme instead of
+/// reclaiming it. Anything not ending in `_<digits>` is left untouched.
 pub(crate) fn is_table_dir_name(name: &str) -> bool {
     name.rsplit_once('_').is_some_and(|(_, id)| has_numeric_id(id))
 }
@@ -162,9 +168,11 @@ pub(crate) fn fsync_dir(path: &str) {
 /// prefix — all produced through `schema::key`, so no call site re-derives the
 /// OPK layout.
 pub(crate) fn retract_key_range(table: &Table, schema: &SchemaDescriptor, start: &[u8], end: Option<&[u8]>) -> Batch {
-    let mut batch = Batch::with_capacity(*schema, 8);
     let mut cursor = table.open_cursor();
     cursor.seek_range_bytes(start, end);
+    // Sized off the positioned walk's own upper bound, so the appends never
+    // re-grow (each growth re-copies every live byte).
+    let mut batch = Batch::with_capacity(*schema, cursor.estimated_length());
     while cursor.valid {
         if cursor.current_weight > 0 {
             cursor.copy_current_row_into(&mut batch, -1);

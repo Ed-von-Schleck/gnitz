@@ -65,17 +65,6 @@ impl StoreHandle {
         matches!(self, StoreHandle::Detached)
     }
 
-    /// Dispatched `has_pk` that works for every variant. Takes a **native**
-    /// `u128`; routes via `opk_key` internally.
-    #[cfg(test)] // sole caller is the test-only inline FK check (validate_fk_inline)
-    pub fn has_pk(&self, key: u128) -> bool {
-        match self {
-            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).has_pk(key) },
-            StoreHandle::Owned(cell) => unsafe { (**cell.get()).has_pk(key) },
-            StoreHandle::Detached => false,
-        }
-    }
-
     /// Dispatched non-compacting `open_cursor` across all variants. A detached
     /// relation opens an empty cursor of `schema` — the same answer a store
     /// holding none of the requested rows gives. Infallible, non-mutating.

@@ -336,8 +336,8 @@ impl DagEngine {
     /// subdir): drop the fork-inherited parent-dir table and install `t`.
     /// Returns the new table pointer for the backfill; `None` if no circuit on
     /// `col_indices` matches. Dropping the old `Box` closes the inherited table.
-    /// Sound: pointer consumers (`get_index_store_handle`, cursors) are fetched
-    /// per request, and the swap runs before the worker serves anything.
+    /// Sound: consumers resolve the circuit (and open their cursors) per
+    /// request, and the swap runs before the worker serves anything.
     pub fn replace_index_table(&mut self, table_id: i64, col_indices: &[u32], t: Box<Table>) -> Option<*mut Table> {
         let ic = self.tables.get_mut(&table_id)?.index_circuit_on_mut(col_indices)?;
         ic.index_table = UnsafeCell::new(t);

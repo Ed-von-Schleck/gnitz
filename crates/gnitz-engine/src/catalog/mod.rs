@@ -14,7 +14,7 @@
 //! which dispatches two categories of handler per sys_table_id:
 //!
 //! * `apply_*` — pure cache-delta appliers, run over a sign-partitioned view of
-//!   the batch (all retractions before all insertions, §3.1) so a rewrite pair
+//!   the batch (all retractions before all insertions) so a rewrite pair
 //!   (a rename's -1,+1 on one PK) applies its retraction before its insertion.
 //! * `hook_*` — side-effectful handlers that create directories, allocate store
 //!   stores, register DAG entries, or backfill derived state. Storage is
@@ -62,10 +62,9 @@ pub(crate) use types::{ColumnDef, FkEdge};
 pub(crate) use cache::SchemaWireEntry;
 // The master's ScanSpec confinement test.
 pub(crate) use scan_spec::scan_spec_worker;
-// The fixed system-table schema for a family tid. The production DDL decode
-// reaches it through the `CatalogEngine::sys_family_schema` instance method
-// (preserving the layering); the crate-wide handle exists for the cross-crate
-// wire roundtrip test, which decodes a client-encoded bundle against it.
+// The fixed system-table schema for a family tid, for callers holding a raw
+// id. Anything holding an untrusted id resolves it through `SysFamily::from_id`
+// and reads `SysFamily::schema` instead — this panics on a non-family id.
 pub(crate) use sys_tables::sys_tab_schema;
 
 // Import everything from sys_tables for internal use.
@@ -171,11 +170,11 @@ pub struct CatalogEngine {
     // System-table DDL goes through `ingest_to_family` → `fire_hooks`. Hooks
     // may recursively call `ingest_to_family` to cascade retractions (indices,
     // columns, circuit graph, view deps). Each nested call appends its
-    // (table_id, batch) AFTER its own hooks fire, so this queue ends up in
+    // (family, batch) AFTER its own hooks fire, so this queue ends up in
     // dependency-safe order: children before parents. The executor drains it
     // once per top-level DDL and relays each entry to workers. Workers never
     // drain this (no broadcast channel), so it stays empty there.
-    pub(crate) pending_broadcasts: Vec<(i64, Batch)>,
+    pub(crate) pending_broadcasts: Vec<(SysFamily, Batch)>,
 
     // --- Deferred physical directory deletions ---
     //

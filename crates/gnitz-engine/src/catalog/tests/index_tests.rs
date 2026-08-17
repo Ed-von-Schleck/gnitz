@@ -164,8 +164,8 @@ fn test_unique_index_failure_no_broadcast_poisoning() {
 
     // No IDX_TAB broadcast may carry a negative weight for the failed index.
     let broadcasts = engine.drain_pending_broadcasts();
-    for (tab, batch) in &broadcasts {
-        if *tab == IDX_TAB_ID {
+    for (family, batch) in &broadcasts {
+        if *family == SysFamily::Index {
             for i in 0..batch.count {
                 assert!(
                     batch.get_weight(i) >= 0,
@@ -779,12 +779,12 @@ fn test_seek_by_index_orphan_entry_terminates() {
     b.extend_null_bmp(&0u64.to_le_bytes());
     b.count += 1;
 
-    let handle = engine.get_index_store_handle(tid, &[1]) as *mut Table;
-    assert!(!handle.is_null());
-    unsafe {
-        (*handle).ingest_owned_batch(b).unwrap();
-        (*handle).flush().unwrap();
-    }
+    let idx_table = engine
+        .index_circuit_for_cols(tid, &[1])
+        .expect("index circuit on col 1")
+        .table_mut();
+    idx_table.ingest_owned_batch(b).unwrap();
+    idx_table.flush().unwrap();
 
     // The indexed value resolves to an orphan whose source row is missing.
     // Must return None and, crucially, must not hang.

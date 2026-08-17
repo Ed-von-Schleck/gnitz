@@ -551,9 +551,8 @@ fn test_fk_index_metadata_queries() {
     let (ic_cols, _is_unique) = engine.get_index_circuit_info(tid, 0).unwrap();
     assert_eq!(ic_cols.as_slice(), [1]); // val is column 1
 
-    // Index store handle should be non-null
-    let idx_ptr = engine.get_index_store_handle(tid, &[1]);
-    assert!(!idx_ptr.is_null());
+    // The index circuit resolves, so its store is reachable.
+    assert!(engine.index_circuit_for_cols(tid, &[1]).is_some());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

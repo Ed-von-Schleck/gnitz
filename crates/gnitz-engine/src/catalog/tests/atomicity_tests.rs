@@ -730,7 +730,7 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
         .precheck_family(SysFamily::Table, &table_batch)
         .expect("replicated + dist_prefix passes precheck (it is a hook-layer check)");
     // Marker set BEFORE apply; apply fails in the hook, so it stays Some.
-    let mut marker: Option<(i64, Batch)> = Some((TABLE_TAB_ID, table_batch.clone()));
+    let mut marker: Option<(SysFamily, Batch)> = Some((SysFamily::Table, table_batch.clone()));
     let applied = engine.apply_and_enqueue_family(SysFamily::Table, table_batch);
     assert!(
         applied.is_err(),

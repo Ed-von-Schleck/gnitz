@@ -37,14 +37,6 @@ impl CatalogEngine {
         Some((ic.col_indices, ic.is_unique))
     }
 
-    /// Get index store handle for an exact column list (for worker has_pk via
-    /// a secondary index, single- or multi-column, unique or not).
-    pub(crate) fn get_index_store_handle(&self, table_id: i64, cols: &[u32]) -> *const Table {
-        self.index_circuit_for_cols(table_id, cols)
-            .map(|ic| ic.table_mut() as *const Table)
-            .unwrap_or(std::ptr::null())
-    }
-
     /// The secondary index circuit on `cols` of `table_id`, if one exists. The
     /// SEEK_BY_INDEX handler matches the `Option` once — `None` answers
     /// STATUS_NO_INDEX (so the SQL planner falls back to a scan or a CREATE INDEX

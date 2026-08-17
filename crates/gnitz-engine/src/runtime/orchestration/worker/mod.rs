@@ -1138,29 +1138,22 @@ impl WorkerProcess {
         // the single exit below frames both the same way.
         let (result, schema, one_off) = match lookup {
             HasPkLookup::SecondaryIndex { cols, want_holder } => {
-                let index_handle = self.cat().get_index_store_handle(target_id, cols.as_slice());
-                if index_handle.is_null() {
-                    return Err(format!(
-                        "No index on columns {:?} for table {}",
-                        cols.as_slice(),
-                        target_id
-                    ));
-                }
+                // One resolution of `(target_id, cols)`: the circuit carries both
+                // the index table and its schema.
+                let ic = self
+                    .cat()
+                    .index_circuit_for_cols(target_id, cols.as_slice())
+                    .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), target_id))?;
                 // The check target is the unique INDEX table, whose schema is
                 // `(indexed_col, src_pk…)` — NOT the owner table's schema.
                 // `idx_key_size` and the PK-byte reads below come from it, so an
                 // owner-table schema would compute the wrong prefix width.
-                let schema = batch
-                    .as_ref()
-                    .and_then(|b| b.schema)
-                    .or_else(|| self.cat().get_index_schema_by_cols(target_id, cols.as_slice()))
-                    .ok_or_else(|| format!("no index schema for tid={} cols={:?}", target_id, cols.as_slice()))?;
+                let schema = batch.as_ref().and_then(|b| b.schema).unwrap_or(ic.index_schema);
                 // Index layout: PK = (indexed-key field, src_pk_cols). Any
                 // positive-weight match means the value is already in the index.
                 // `open_cursor` keeps a compaction Io/InvalidShard failure from
                 // silently turning a present key into "absent".
-                let table = unsafe { &*index_handle };
-                let mut cursor = table.open_cursor();
+                let mut cursor = ic.table_mut().open_cursor();
                 // The check batch's PK is the OPK index composite
                 // `(indexed-value…, src_pk_cols)`; the leading `idx_key_size`
                 // bytes are the OPK-encoded indexed value(s). Prefix-match that

@@ -27,11 +27,9 @@ fn temp_dir(name: &str) -> String {
     scratch_dir("catalog", name)
 }
 
-// Arbitrary fixed 128-bit values for UUID columns; distinct from each other,
-// the actual bit pattern is irrelevant. `UUID_A` is the value a parent stores
-// and a valid child references, `UUID_B` a value no parent holds.
+// An arbitrary fixed 128-bit value for UUID columns; the bit pattern is
+// irrelevant, only that it round-trips through a U128/UUID column.
 const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
-const UUID_B: u128 = 0x0000_0000_0000_BEEF_0000_0000_0000_DEAD;
 
 /// A non-nullable U64 schema column — the building block of the compound-PK
 /// fixtures below.
@@ -227,7 +225,7 @@ fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, s
 
 /// Append one raw VIEW_TAB row at `weight`. `sql` is stored verbatim. The bare
 /// `0` pk_col_idx decodes back to a single-column PK `[0]`. A `-1` reproduces
-/// exactly what a `+1` wrote, which is what the §3.3 retraction CAS compares.
+/// exactly what a `+1` wrote, which is what the retraction CAS compares.
 fn push_view_tab_row(bb: &mut BatchBuilder, weight: i64, vid: i64, view_name: &str, sql: &str) {
     bb.begin_row(vid as u128, weight);
     bb.put_u64(PUBLIC_SCHEMA_ID as u64);

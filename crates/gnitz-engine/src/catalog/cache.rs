@@ -58,9 +58,9 @@ pub(crate) struct CatalogCacheSet {
     /// Tables whose writes need the push lock, each with its materialized lock
     /// set: the table itself plus all FK parents and children, sorted ascending
     /// and deduped for deadlock-free acquisition. Recomputed by
-    /// `recompute_needs_lock` on every trigger (`apply_needs_lock` fires on
-    /// TABLE_TAB and FK-carrying COL_TAB deltas), so `fk_lock_set` is a plain
-    /// borrow on the push path.
+    /// `recompute_needs_lock` on every trigger (`relock_from_table_delta` /
+    /// `relock_from_column_delta`), so `fk_lock_set` is a plain borrow on the
+    /// push path.
     pub(crate) needs_lock: FxHashMap<i64, Vec<i64>>,
 }
 
@@ -130,7 +130,7 @@ impl CatalogCacheSet {
 impl CatalogEngine {
     /// Maintain `schema_by_name` and `schema_by_id` from one pass over a
     /// SCHEMA_TAB delta — the two caches share their lifecycle and key data.
-    pub(crate) fn apply_schema_caches(&mut self, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn apply_schema_caches(&mut self, batch: &Batch) {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let sid = batch.get_pk(i) as i64;
@@ -150,13 +150,12 @@ impl CatalogEngine {
                 self.caches.schema_by_id.remove(&sid);
             }
         }
-        Ok(())
     }
 
     /// Maintain `entity_by_qname` and `entity_by_id` from one pass over a
     /// TABLE_TAB or VIEW_TAB delta (the two families share the leading
     /// `(schema_id, name)` payload prefix).
-    pub(crate) fn apply_entity_caches(&mut self, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn apply_entity_caches(&mut self, batch: &Batch) {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
@@ -190,13 +189,12 @@ impl CatalogEngine {
                 self.caches.entity_by_id.remove(&tid);
             }
         }
-        Ok(())
     }
 
     /// Maintain `members_by_schema` from a TABLE_TAB or VIEW_TAB delta. The set
     /// drops once it empties, so `schema_member_count` returns 0 exactly when
     /// no member remains.
-    pub(crate) fn apply_schema_members(&mut self, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn apply_schema_members(&mut self, batch: &Batch) {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
@@ -211,7 +209,6 @@ impl CatalogEngine {
                 }
             }
         }
-        Ok(())
     }
 
     /// Drop the cached column defs of every owner the COL_TAB delta touches.
@@ -219,7 +216,7 @@ impl CatalogEngine {
     /// `pack_column_id(owner, col)`), so skipping a repeat of the previous owner
     /// collapses the run to one invalidation. Correct for any row order — an
     /// interleaved batch just invalidates an owner more than once.
-    pub(crate) fn apply_col_names_invalidate(&mut self, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn apply_col_names_invalidate(&mut self, batch: &Batch) {
         let mut last: Option<i64> = None;
         for i in 0..batch.count {
             let owner_id = batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64;
@@ -228,13 +225,12 @@ impl CatalogEngine {
                 last = Some(owner_id);
             }
         }
-        Ok(())
     }
 
     /// Maintain `index_by_name`, `index_by_id` and `indices_by_owner` from one
     /// pass over an IDX_TAB delta — all three key off the same row and share
     /// their lifecycle.
-    pub(crate) fn apply_index_caches(&mut self, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn apply_index_caches(&mut self, batch: &Batch) {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
@@ -251,7 +247,6 @@ impl CatalogEngine {
                 remove_where(&mut self.caches.indices_by_owner, owner_id, |&id| id == idx_id);
             }
         }
-        Ok(())
     }
 
     /// Maintain `fk_by_child` and `fk_by_parent` from a single pass over a
@@ -260,7 +255,7 @@ impl CatalogEngine {
     /// it once matters.
     ///
     /// Only base-table rows carry a constraint (`coltab_row_declares_fk`).
-    pub(crate) fn apply_fk_constraints(&mut self, batch: &Batch) -> Result<(), String> {
+    pub(crate) fn apply_fk_constraints(&mut self, batch: &Batch) {
         for i in 0..batch.count {
             if !coltab_row_declares_fk(batch, i) {
                 continue;
@@ -288,50 +283,43 @@ impl CatalogEngine {
                 remove_where(&mut self.caches.fk_by_parent, edge.parent_tid, same);
             }
         }
-        Ok(())
     }
 
-    pub(crate) fn apply_needs_lock(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
-        if batch.count == 0 {
-            return Ok(());
+    /// A TABLE_TAB delta relocks every relation it names: the lock rule reads
+    /// `dag.tables[tid].kind`, which the register/teardown hooks just changed.
+    pub(crate) fn relock_from_table_delta(&mut self, batch: &Batch) {
+        let mut tids = Vec::with_capacity(batch.count);
+        for i in 0..batch.count {
+            tids.push(batch.get_pk(i) as i64);
         }
+        self.relock_all(tids);
+    }
 
-        let mut to_recompute = Vec::new();
-
-        match family {
-            SysFamily::Table => {
-                to_recompute.reserve_exact(batch.count);
-                for i in 0..batch.count {
-                    to_recompute.push(batch.get_pk(i) as i64);
-                }
+    /// An FK-carrying COL_TAB delta relocks both ends of each edge it declares:
+    /// the lock set of either end names the other.
+    pub(crate) fn relock_from_column_delta(&mut self, batch: &Batch) {
+        let mut tids = Vec::with_capacity(batch.count * 2);
+        for i in 0..batch.count {
+            if !coltab_row_declares_fk(batch, i) {
+                continue;
             }
-            SysFamily::Column => {
-                to_recompute.reserve(batch.count * 2);
-                for i in 0..batch.count {
-                    if !coltab_row_declares_fk(batch, i) {
-                        continue;
-                    }
-                    let fk_table_id = batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64;
-                    to_recompute.push(batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64);
-                    if self.dag.tables.contains_key(&fk_table_id) {
-                        to_recompute.push(fk_table_id);
-                    }
-                }
-            }
-            _ => return Ok(()),
-        }
-
-        if !to_recompute.is_empty() {
-            // Deduplication guarantees expensive cache lookups run exactly once per ID
-            to_recompute.sort_unstable();
-            to_recompute.dedup();
-
-            for tid in to_recompute {
-                self.recompute_needs_lock(tid);
+            let fk_table_id = batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64;
+            tids.push(batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64);
+            if self.dag.tables.contains_key(&fk_table_id) {
+                tids.push(fk_table_id);
             }
         }
+        self.relock_all(tids);
+    }
 
-        Ok(())
+    /// Recompute the lock set of each id exactly once (sort + dedup first: an
+    /// id may be named by several rows of one delta).
+    fn relock_all(&mut self, mut tids: Vec<i64>) {
+        tids.sort_unstable();
+        tids.dedup();
+        for tid in tids {
+            self.recompute_needs_lock(tid);
+        }
     }
 
     /// Recompute needs_lock for `tid` from current cache + dag state, and

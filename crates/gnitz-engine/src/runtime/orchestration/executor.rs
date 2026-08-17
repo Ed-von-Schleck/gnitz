@@ -2274,7 +2274,7 @@ fn bundle_family(families: &[(SysFamily, Batch)], family: SysFamily) -> Option<&
 
 /// Resolve `tid`'s system-family schema and decode a client wal-block slice
 /// against it — the master's OWN registered layout, so a client cannot dictate
-/// how its bytes are read. `sys_family_schema` rejects a bogus family tid
+/// how its bytes are read. `SysFamily::from_id` rejects a bogus family tid
 /// without the panic `sys_tab_schema` would hit on an unknown id in the system
 /// range. Used by the DDL_TXN bundle decode.
 fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), String> {
@@ -2293,9 +2293,7 @@ fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), Strin
 /// *or* a precheck failure can never strand an orphan catalog row.
 async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8], client_version: u16) {
     // Decode the bundle and materialise each family's wal-block slice into an
-    // owned Batch up front (before any lock), resolving its system schema from
-    // the catalog. `sys_family_schema` rejects a bogus family tid without the
-    // panic `sys_tab_schema` would hit on an unknown id in the system range.
+    // owned Batch up front (before any lock) — see `decode_sys_family`.
     let raw_families = match ipc::decode_ddl_txn(data) {
         Ok(d) => d,
         Err(e) => {
@@ -2447,7 +2445,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         // broadcasts in SAL order exactly as before.
         families.sort_by_key(|(f, _)| f.topo_priority());
         let view_prio = SysFamily::View.topo_priority();
-        let mut applied_not_enqueued: Option<(i64, Batch)> = None;
+        let mut applied_not_enqueued: Option<(SysFamily, Batch)> = None;
         let mut drained_sources = false;
         let ingest_res = guard_panic("DDL", || {
             let cat = unsafe { &mut *cat_ptr_raw };
@@ -2459,7 +2457,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
                     drained_sources = true;
                 }
                 cat.precheck_family(family, &fbatch)?;
-                applied_not_enqueued = Some((family.id(), fbatch.clone()));
+                applied_not_enqueued = Some((family, fbatch.clone()));
                 cat.apply_and_enqueue_family(family, fbatch)?;
                 applied_not_enqueued = None;
             }
@@ -2696,13 +2694,15 @@ fn push_target_error(shared: &Shared, target_id: i64) -> Option<String> {
 /// == SAL write order. A failure here comes after the in-memory catalog
 /// mutation and would permanently diverge master/worker state — unrecoverable,
 /// so abort.
-fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)], zone_lsn: u64) -> FsyncFuture {
+fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(SysFamily, Batch)], zone_lsn: u64) -> FsyncFuture {
     let disp = shared.disp();
     if let Err(e) = guard_panic(op, || unsafe {
         // The first family opens the zone; a failure here aborts the loop, so no
         // later family can become the first one recovery sees.
-        for (i, (tid, bat)) in drained.iter().enumerate() {
-            disp.broadcast_ddl(*tid, bat, zone_lsn, i == 0)?;
+        // The wire carries the family as its tid; this is the one place the
+        // typed family narrows.
+        for (i, (family, bat)) in drained.iter().enumerate() {
+            disp.broadcast_ddl(family.id(), bat, zone_lsn, i == 0)?;
         }
         // Abort after broadcasts but BEFORE the commit sentinel — exercises the
         // recovery skip of a half-written zone.

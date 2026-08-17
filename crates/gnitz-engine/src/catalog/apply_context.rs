@@ -120,28 +120,18 @@ impl CatalogEngine {
         r
     }
 
-    /// Run `f` with `dir` staged for cleanup: on `Ok` the stage is dropped (the
-    /// directory is live), on `Err` whatever `f` created on disk is removed here.
-    /// Removing it here keeps `pending_dir_deletions` to one meaning —
-    /// directories of *dropped* entities, which a rollback must therefore keep.
-    /// A queue holding both could not be drained or discarded as a whole.
+    /// Run `f` with `dir` staged for cleanup: on `Err` whatever `f` created on
+    /// disk is removed here, on `Ok` the directory is live and nothing happens.
+    /// The stage is a local, not an entry in `pending_dir_deletions`, so that
+    /// queue keeps one meaning — directories of *dropped* entities, which a
+    /// rollback must therefore keep. A queue holding both could not be drained
+    /// or discarded as a whole.
     pub(super) fn with_staged_dir<T>(
         &mut self,
         dir: String,
         f: impl FnOnce(&mut Self) -> Result<T, String>,
     ) -> Result<T, String> {
-        let cleanup_idx = self.pending_dir_deletions.len();
-        self.pending_dir_deletions.push(dir);
-        match f(self) {
-            Ok(v) => {
-                self.pending_dir_deletions.truncate(cleanup_idx);
-                Ok(v)
-            }
-            Err(e) => {
-                Self::remove_queued_dirs(self.pending_dir_deletions.split_off(cleanup_idx));
-                Err(e)
-            }
-        }
+        f(self).inspect_err(|_| Self::remove_queued_dirs(vec![dir]))
     }
 
     /// Run `f` as part of an owner-drop index-retraction cascade: precheck's

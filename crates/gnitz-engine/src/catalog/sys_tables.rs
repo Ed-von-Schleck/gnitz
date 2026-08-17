@@ -251,7 +251,8 @@ pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, u64)> {
 
 /// What one delta does to one PK: where its `-1` and `+1` rows are, and the
 /// summed weight. A PK carrying both signs is a **rewrite pair** (a rename) —
-/// the shape §3.1/§3.2 key on. This is the one decoding of that shape; every
+/// the shape the sign-partition and the net-live gates key on. This is the
+/// one decoding of that shape; every
 /// precheck guard and pair-sensitive hook reads it instead of rescanning.
 pub(super) struct PkSignature {
     pub(super) pk: u128,
@@ -282,30 +283,33 @@ impl PkSignature {
 }
 
 /// One [`PkSignature`] per distinct PK, in first-appearance order. Zero-weight
-/// rows are skipped. Quadratic in the batch, which is bounded by one DDL bundle
-/// (`MAX_COLUMNS` rows for COL_TAB, a handful of relations otherwise).
+/// rows are skipped.
+///
+/// Linear in the batch: the boot replay hands `fire_hooks` a full-family scan
+/// (`replay_system_table`), so the input is every live row of COL_TAB or
+/// TABLE_TAB, not one DDL bundle — a scan over accumulated signatures would make
+/// boot quadratic in the total column count.
 pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     let mut sigs: Vec<PkSignature> = Vec::new();
+    let mut by_pk: rustc_hash::FxHashMap<u128, usize> = rustc_hash::FxHashMap::default();
     for i in 0..batch.count {
         let pk = batch.get_pk(i);
         let w = batch.get_weight(i);
         if w == 0 {
             continue;
         }
-        let sig = match sigs.iter_mut().find(|s| s.pk == pk) {
-            Some(s) => s,
-            None => {
-                sigs.push(PkSignature {
-                    pk,
-                    row: i,
-                    neg: None,
-                    pos: None,
-                    repeats_a_sign: false,
-                    sum: 0,
-                });
-                sigs.last_mut().expect("just pushed")
-            }
-        };
+        let slot = *by_pk.entry(pk).or_insert_with(|| {
+            sigs.push(PkSignature {
+                pk,
+                row: i,
+                neg: None,
+                pos: None,
+                repeats_a_sign: false,
+                sum: 0,
+            });
+            sigs.len() - 1
+        });
+        let sig = &mut sigs[slot];
         sig.sum += w;
         // Keep the FIRST row of each sign; a later one only sets the flag.
         match (w < 0, if w < 0 { sig.neg } else { sig.pos }) {
@@ -536,7 +540,7 @@ const _: () = {
 };
 
 /// The fixed schema for system-family `id`. Panics on a non-family id; callers
-/// holding an untrusted id go through `sys_family_schema` / `SysFamily::from_id`.
+/// holding an untrusted id go through `SysFamily::from_id` and `SysFamily::schema`.
 pub(crate) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
     SysFamily::from_id(id)
         .unwrap_or_else(|| panic!("Unknown system table ID: {id}"))

@@ -813,7 +813,8 @@ impl GnitzClient {
     /// Retry-until-stable drain: each pass attempts every remaining target,
     /// requeues any that fail, and stops when the queue empties (success) or a
     /// full pass makes no progress (return the last error). The client-side
-    /// analog of the engine's `drain_drop_targets`. It requeues on **any** `Err`,
+    /// This retry pass is the client's alone — the engine has no `DROP SCHEMA
+    /// CASCADE` to mirror it. It requeues on **any** `Err`,
     /// not just a dependency error: `ClientError` collapses every engine precheck
     /// rejection into `ServerError(String)` with no structured dependency
     /// variant, so progress — not error-string matching — is the robust

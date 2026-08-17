@@ -51,7 +51,7 @@ impl CatalogEngine {
     //     directly (loaded at open time), not the cache, so the ordering
     //     holds.
     pub(crate) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
-        // §3.1: dispatch every handler over a sign-partitioned view (retractions
+        // Dispatch every handler over a sign-partitioned view (retractions
         // before insertions) so a rewrite pair applies in retract-then-insert
         // order for every fold, on the forward and the (negated) compensation
         // path alike. A weight-homogeneous CREATE/DROP bundle is single-sign, so
@@ -66,39 +66,37 @@ impl CatalogEngine {
         // (Sequence/Circuit*) are named, not swallowed by a wildcard.
         match family {
             SysFamily::Schema => {
-                self.apply_schema_caches(batch)?;
+                self.apply_schema_caches(batch);
                 self.hook_schema_dir(batch)?;
             }
             SysFamily::Table => {
-                self.apply_entity_caches(batch)?;
-                self.apply_schema_members(batch)?;
+                self.apply_entity_caches(batch);
+                self.apply_schema_members(batch);
                 self.hook_table_register(batch)?;
-                self.apply_needs_lock(SysFamily::Table, batch)?;
+                self.relock_from_table_delta(batch);
                 self.hook_cascade_fk(batch)?;
             }
             SysFamily::View => {
-                self.apply_entity_caches(batch)?;
-                self.apply_schema_members(batch)?;
+                self.apply_entity_caches(batch);
+                self.apply_schema_members(batch);
                 self.hook_view_register(batch)?;
             }
             SysFamily::Column => {
-                self.apply_col_names_invalidate(batch)?;
-                self.apply_fk_constraints(batch)?;
-                self.apply_needs_lock(SysFamily::Column, batch)?;
+                self.apply_col_names_invalidate(batch);
+                self.apply_fk_constraints(batch);
+                self.relock_from_column_delta(batch);
                 // MUST be last — after `apply_col_names_invalidate` evicts the
                 // cached col defs — so the DROP NOT NULL descriptor rebuild reads
-                // the post-ALTER column defs (§5).
+                // the post-ALTER column defs.
                 self.hook_column_alter(batch)?;
             }
             SysFamily::Index => {
-                self.apply_index_caches(batch)?;
+                self.apply_index_caches(batch);
                 self.hook_index_register(batch)?;
             }
             // Restore the user-sequence high-water from a durably-committed or
             // SAL-replayed advance so a committed SERIAL id is never re-issued.
-            SysFamily::Sequence => {
-                self.hook_sequence_register(batch)?;
-            }
+            SysFamily::Sequence => self.hook_sequence_register(batch),
             // The dependency map is derived from the `ScanDelta` nodes, so a
             // circuit-node write restates the graph. Edges and node columns
             // carry no dependency and the circuit itself is loaded by
@@ -142,7 +140,7 @@ impl CatalogEngine {
     /// store — net positive weight through the merged cursor. Storage is applied
     /// before hooks fire, so a rename pair's shared PK reads net-live (its `-1`
     /// and `+1` are both present) while a genuine drop reads net-dead. The gate
-    /// for the reconciling register hooks (§3.2): a different question than
+    /// for the reconciling register hooks: a different question than
     /// batch-local pair detection, and robust even to the consolidated sys tables
     /// at boot replay (where a rename pair has folded to net `+1`, no `-1`
     /// surviving) and to a multi-op recovery batch on one id.
@@ -155,7 +153,7 @@ impl CatalogEngine {
     /// recovery). Catalog sequences (`seq_id < FIRST_USER_TABLE_ID`) recover via
     /// the object-id hooks instead, so they are skipped — the guard is defensive
     /// since `advance_sequence` bypasses `submit` and never reaches here.
-    fn hook_sequence_register(&mut self, batch: &Batch) -> Result<(), String> {
+    fn hook_sequence_register(&mut self, batch: &Batch) {
         for i in 0..batch.count {
             if batch.get_weight(i) <= 0 {
                 continue;
@@ -164,7 +162,6 @@ impl CatalogEngine {
             let hw = batch.read_payload_u64(i, SEQTAB_PAY_VALUE) as i64;
             self.observe_user_sequence(seq_id, hw);
         }
-        Ok(())
     }
 
     // -- Hook handlers ---------------------------------------------------------
@@ -355,7 +352,7 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
-            // §3.2: gate side effects on the row's NET live state (storage is
+            // Gate side effects on the row's NET live state (storage is
             // already applied), not its own sign. A rename pair (net-live before
             // and after) fires neither the `+1` registration nor the `-1`
             // teardown, in any row order and on every application path.
@@ -580,7 +577,7 @@ impl CatalogEngine {
         for i in self.view_row_order(batch) {
             let weight = batch.get_weight(i);
             let vid = batch.get_pk(i) as i64;
-            // §3.2: gate on NET live state, so a rename pair (net-live before and
+            // Gate on NET live state, so a rename pair (net-live before and
             // after) fires neither registration nor teardown.
             let net_live = self.sys_pk_is_live(SysFamily::View, batch.get_pk_bytes(i));
 
@@ -822,7 +819,7 @@ impl CatalogEngine {
         if self.ctx.in_rollback() {
             return Ok(());
         }
-        // §3.2: a rename pair's `+1` must NOT re-mint this table's FK
+        // A rename pair's `+1` must NOT re-mint this table's FK
         // auto-indices — the auto-index name embeds the *current* (new) table
         // name, so its by-name dedup cannot suppress the duplicate a rename
         // would produce for a non-PK FK column. `family_pks_by_sign` excludes

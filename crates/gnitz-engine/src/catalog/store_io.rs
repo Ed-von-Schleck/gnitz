@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::schema::project_schema;
-use crate::storage::BoundedIndexCursor;
+use crate::storage::{BoundedIndexCursor, PkSetGather};
 
 /// What part of a capacity-bounded view's store one read wants. `Keys` carries
 /// the flat concatenation of the OPK images, ascending.
@@ -546,16 +546,19 @@ impl CatalogEngine {
 /// Use the index only when its range covers at most 1/16 of the local base slice.
 const INDEX_SCAN_RATIO: usize = 16;
 
-/// The source cursor a circuit backfill drives, in the two shapes the drive can
-/// take plus the provably-empty one. Interchangeable by construction: the
-/// circuit's `Filter` decides what the view contains, so which variant is chosen
-/// only decides how many rows the scan reads.
+/// A chunked source of `Batch`es over one relation, in every shape a bound can
+/// take. Interchangeable by construction for the circuit backfill: the circuit's
+/// `Filter` decides what the view contains, so which variant is chosen only
+/// decides how many rows the scan reads. The ad-hoc `ReadSpec` scan adds the
+/// `PkSet` shape and drives the same enum.
 ///
-/// Both cursor variants are boxed (a `ReadCursor` is ~560 bytes; clippy's
-/// `large_enum_variant`) — one allocation per backfill, never per chunk.
+/// Every variant is boxed (a `ReadCursor` is ~560 bytes; clippy's
+/// `large_enum_variant`) — one allocation per scan, never per chunk.
 pub(crate) enum SourceCursor {
     Full(Box<ReadCursor>),
     Bounded(Box<BoundedIndexCursor>),
+    /// `pk IN (…)` gather over a listed key set.
+    PkSet(Box<PkSetGather>),
     /// A provably-empty index range. Distinct from `Full` so nothing is scanned,
     /// and distinct from `open_source_cursor -> None` so the source still feeds
     /// one empty epoch (which is what mints a global aggregate's ground row).
@@ -563,11 +566,18 @@ pub(crate) enum SourceCursor {
 }
 
 impl SourceCursor {
-    /// The next up-to-`max_rows` source rows.
+    /// The next source rows, or `None` once the source is exhausted. A returned
+    /// batch may be empty (a window of `PkSet` keys this worker holds no row
+    /// for); `None` strictly means "no further rows".
+    ///
+    /// `max_rows` bounds every variant exactly except `PkSet`, which tests it
+    /// before each key and then drains that key's whole group, so it can
+    /// overshoot to `max_rows - 1 + |largest group|`. Callers read `chunk.count`.
     pub(crate) fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         match self {
             SourceCursor::Full(c) => c.drain_chunk(max_rows),
             SourceCursor::Bounded(c) => c.drain_chunk(max_rows),
+            SourceCursor::PkSet(g) => g.next_chunk(max_rows),
             SourceCursor::Empty => None,
         }
     }

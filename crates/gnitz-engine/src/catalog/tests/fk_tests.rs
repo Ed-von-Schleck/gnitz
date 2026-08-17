@@ -55,95 +55,6 @@ fn test_fk_lock_set() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_fk_referential_integrity ────────────────────────────────────
-
-#[test]
-fn test_fk_referential_integrity() {
-    let dir = temp_dir("fk_integrity");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    // Parent table
-    let parent_tid = engine
-        .create_table("public.parents", &[col_def("pid", type_code::U64)], &[0])
-        .unwrap();
-
-    // Child table with FK
-    let child_cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("pid_fk", type_code::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.children", &child_cols, &[0]).unwrap();
-
-    // Insert valid parent
-    let parent_schema = engine.get_schema_desc(parent_tid).unwrap();
-    let mut pbb = BatchBuilder::new(parent_schema);
-    pbb.begin_row(10u128, 1);
-    pbb.end_row();
-    let pbatch = pbb.finish();
-    engine.dag.ingest_relation(parent_tid, pbatch);
-    let _ = engine.dag.flush(parent_tid);
-
-    // Insert valid child (FK=10 exists in parent)
-    let child_schema = engine.get_schema_desc(child_tid).unwrap();
-    let mut cbb = BatchBuilder::new(child_schema);
-    cbb.begin_row(1u128, 1);
-    cbb.put_u64(10); // valid FK
-    cbb.end_row();
-    let cbatch = cbb.finish();
-    assert!(engine.validate_fk_inline(child_tid, &cbatch).is_ok());
-
-    // Insert invalid child (FK=99, not in parent)
-    let mut cbb2 = BatchBuilder::new(child_schema);
-    cbb2.begin_row(2u128, 1);
-    cbb2.put_u64(99); // invalid FK
-    cbb2.end_row();
-    let cbatch2 = cbb2.finish();
-    assert!(engine.validate_fk_inline(child_tid, &cbatch2).is_err());
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── test_fk_nullability_and_retractions ──────────────────────────────
-
-#[test]
-fn test_fk_nullability_and_retractions() {
-    let dir = temp_dir("fk_null");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let parent_tid = engine
-        .create_table("public.p", &[col_def("id", type_code::U64)], &[0])
-        .unwrap();
-    let child_cols = vec![
-        col_def("id", type_code::U64),
-        ColumnDef {
-            is_nullable: true,
-            ..fk_def("pid_fk", type_code::U64, parent_tid, 0)
-        },
-    ];
-    let child_tid = engine.create_table("public.c", &child_cols, &[0]).unwrap();
-
-    // NULL FK should be allowed even if parent is empty
-    let child_schema = engine.get_schema_desc(child_tid).unwrap();
-    let mut bb = BatchBuilder::new(child_schema);
-    bb.begin_row(1u128, 1);
-    bb.put_null();
-    bb.end_row();
-    let batch = bb.finish();
-    assert!(engine.validate_fk_inline(child_tid, &batch).is_ok());
-
-    // Retraction (weight -1) should not trigger FK check
-    let mut bb2 = BatchBuilder::new(child_schema);
-    bb2.begin_row(2u128, -1);
-    bb2.put_u64(999); // non-existent, but weight is negative
-    bb2.end_row();
-    let batch2 = bb2.finish();
-    assert!(engine.validate_fk_inline(child_tid, &batch2).is_ok());
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 // ── test_fk_protections ──────────────────────────────────────────────
 
 #[test]
@@ -398,52 +309,6 @@ fn test_fk_multiple_children_same_parent() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_fk_referential_integrity (U128 extension) ──────────────────
-
-#[test]
-fn test_fk_u128() {
-    let dir = temp_dir("fk_u128");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    // U128 parent
-    let parent_tid = engine
-        .create_table("public.uparents", &[col_def("uuid", type_code::U128)], &[0])
-        .unwrap();
-
-    // U128 FK child
-    let child_cols = vec![
-        col_def("id", type_code::U64),
-        fk_def("ufk", type_code::U128, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.uchildren", &child_cols, &[0]).unwrap();
-
-    // Insert parent with U128 PK (lo=0xBBBB, hi=0xAAAA)
-    let parent_schema = engine.get_schema_desc(parent_tid).unwrap();
-    let mut pbb = BatchBuilder::new(parent_schema);
-    pbb.begin_row(UUID_A, 1);
-    pbb.end_row();
-    engine.dag.ingest_relation(parent_tid, pbb.finish());
-    let _ = engine.dag.flush(parent_tid);
-
-    // Valid child FK (matches parent)
-    let child_schema = engine.get_schema_desc(child_tid).unwrap();
-    let mut cbb = BatchBuilder::new(child_schema);
-    cbb.begin_row(1u128, 1);
-    cbb.put_u128(UUID_A);
-    cbb.end_row();
-    assert!(engine.validate_fk_inline(child_tid, &cbb.finish()).is_ok());
-
-    // Invalid child FK (no such parent)
-    let mut cbb2 = BatchBuilder::new(child_schema);
-    cbb2.begin_row(2u128, 1);
-    cbb2.put_u128(UUID_B);
-    cbb2.end_row();
-    assert!(engine.validate_fk_inline(child_tid, &cbb2.finish()).is_err());
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
 // ── test_fk_auto_index_skips_non_leading_pk_column ───────────────────
 // The auto-index skip reads the owner's FULL PK column list: on a compound PK an
 // FK sitting at a non-leading PK position is already stored in the PK region and
@@ -479,57 +344,6 @@ fn test_fk_auto_index_skips_non_leading_pk_column() {
             .index_by_name
             .contains_key(&make_fk_index_name("public", "child", "plain_fk")),
         "an FK on a non-PK column must still get its auto-index",
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── test_fk_inline_child_pk_column_is_fk ─────────────────────────────
-// A child whose LONE PK column is itself the FK into the parent (a junction
-// table keyed by its FK). The FK value lives in the PK region — there is no
-// payload slot — so `validate_fk_inline` must read it from the PK, not via
-// `payload_idx` (which returns the PK sentinel and reads out of bounds). The
-// present-key case panics on the sentinel without the PK-column fix.
-
-#[test]
-fn test_fk_inline_child_pk_column_is_fk() {
-    let dir = temp_dir("fk_pk_col_is_fk");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
-        .unwrap();
-
-    let child_cols = vec![fk_def("pid_fk", type_code::U64, parent_tid, 0)];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
-
-    // Insert a parent row with pid = 10.
-    let parent_schema = engine.get_schema_desc(parent_tid).unwrap();
-    let mut pbb = BatchBuilder::new(parent_schema);
-    pbb.begin_row(10u128, 1);
-    pbb.end_row();
-    engine.dag.ingest_relation(parent_tid, pbb.finish());
-    let _ = engine.dag.flush(parent_tid);
-
-    let child_schema = engine.get_schema_desc(child_tid).unwrap();
-
-    // Present parent key: child PK = 10 references the existing parent row.
-    let mut ok = BatchBuilder::new(child_schema);
-    ok.begin_row(10u128, 1);
-    ok.end_row();
-    assert!(
-        engine.validate_fk_inline(child_tid, &ok.finish()).is_ok(),
-        "child PK=10 must validate against the present parent key"
-    );
-
-    // Absent parent key: child PK = 99 has no parent row → violation.
-    let mut bad = BatchBuilder::new(child_schema);
-    bad.begin_row(99u128, 1);
-    bad.end_row();
-    assert!(
-        engine.validate_fk_inline(child_tid, &bad.finish()).is_err(),
-        "child PK=99 must be rejected (no matching parent key)"
     );
 
     engine.close();
