@@ -12,13 +12,15 @@
 //! Partial reply layout (the batch this module consumes) is the shared
 //! SyntheticFold layout (`crate::agg::synthetic_fold_cols`):
 //! `[_group_pk U128 (hidden PK) | group cols (source types) | one partial
-//! column per physical agg spec]`. The `_group_pk` hash is ignored — grouping
-//! is by value, so no collision handling is needed.
+//! column per physical agg spec]`. Grouping is by *value*, so the key is never
+//! consulted to form a group and no collision handling is needed — but it is
+//! not discarded either: it is carried through to the output PK, which is what
+//! makes a tied ORDER BY / LIMIT a function of the data alone.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use gnitz_core::{null_word_get, null_word_set, ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{null_word_get, null_word_set, ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::Evaluator;
 use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc};
 
@@ -56,12 +58,15 @@ enum ColAcc {
     /// `sum_f64` divides at: `agg_output_type(Sum, U64)` is U64, so past 2^63 a
     /// signed read of `bits` would be negative.
     IntSum { bits: i64, seen: bool, tc: TypeCode },
-    /// Float SUM — Σ (w as f64)·partial. Deliberately worker-count-
-    /// nondeterministic: IEEE-754 addition is non-associative and the partials
-    /// arrive in worker order, whereas a float-SUM *view* keeps the
-    /// deterministic single-worker funnel (its two-phase combine excludes
-    /// float SUM). The whole point of the fold is not shipping rows, so the
-    /// per-worker split is inherent here.
+    /// Float SUM — Σ (w as f64)·partial. IEEE-754 addition is non-associative,
+    /// so the value follows the summation order, and this fold reassociates it
+    /// two ways a view does not: the partials arrive in worker order, and each
+    /// worker's own partial follows the order its access path visited rows in.
+    /// A float-SUM *view* keeps the deterministic single-worker funnel (its
+    /// two-phase combine excludes float SUM for exactly this reason), so only
+    /// the ad-hoc path varies with worker count. The whole point of the fold is
+    /// not shipping rows, so the per-worker split is inherent here. Use an
+    /// integer type where exactness matters.
     FloatSum { val: f64, seen: bool },
     /// MIN / MAX — the winning cell's raw LE bytes (first `wire_stride(tc)` of
     /// `best`), ordered by the shared `cmp_typed_le` — the same typed order the
@@ -151,7 +156,18 @@ pub(crate) fn agg_finish(spec: &AggFinish, partial: &ZSetBatch) -> ZSetBatch {
         }
         group_key(partial, spec.partial_schema, n_group, row, &mut key_scratch);
         let g = match by_key.get(key_scratch.as_slice()) {
-            Some(&g) => g,
+            Some(&g) => {
+                // Equal group values imply an equal engine `_group_pk`. Checked
+                // here because this is the only point where a non-representative
+                // row of the group is still in scope to compare against; every
+                // `reps` entry is `Some` until step 2 pushes the ground group.
+                debug_assert_eq!(
+                    partial.pks.get_bytes(row),
+                    partial.pks.get_bytes(reps[g].unwrap()),
+                    "partial rows of one group disagree on _group_pk"
+                );
+                g
+            }
             None => {
                 let g = reps.len();
                 by_key.insert(key_scratch.clone(), g);
@@ -234,11 +250,10 @@ fn fill_group_batch(spec: &AggFinish, partial: &ZSetBatch, reps: &[Option<usize>
     let n = reps.len();
 
     let mut dst = ZSetBatch::with_capacity(schema, n);
-    // `_group_pk` is the dense group ordinal: present, unreferenceable. Pushed
-    // rather than assigned as a `PkColumn` variant, so the variant stays the one
-    // `empty_for_schema` derived from the schema.
-    for g in 0..n {
-        dst.pks.push_u128(g as u128);
+    // Pushed rather than assigned as a `PkColumn` variant, so the variant stays
+    // the one `empty_for_schema` derived from the schema.
+    for &rep in reps {
+        push_group_key(&mut dst.pks, partial, rep);
     }
     dst.weights.resize(n, 1);
     // One word per row, one bit per payload slot: materialized at its final
@@ -458,8 +473,26 @@ pub(crate) fn build_agg_out_schema(layout: &GroupByLayout, source_schema: &Schem
         .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate output schema is invalid: {e}")))
 }
 
-/// Project one group into `out`. The synthetic PK is the row's own ordinal, so
-/// it is read off `out` rather than threaded in.
+/// Append group `rep`'s key — the one answer in this module to "what is a
+/// group's key". It is the engine's `_group_pk`, a pure function of the group's
+/// column values, and must never be invented from emission order: `_agg_pk` is
+/// the *leading* key of the ordering sink's identity tiebreak, so an ordinal
+/// would decide every tie by worker count and reply arrival order, and the
+/// payload keys behind it would never be reached.
+///
+/// The copy is a byte move, not a re-encode — the partial's `_group_pk` and both
+/// destination keys are the same U128 stride.
+fn push_group_key(dst: &mut PkColumn, partial: &ZSetBatch, rep: Option<usize>) {
+    match rep {
+        Some(row) => dst.push_from(&partial.pks, row),
+        // The synthesized global ground row has no partial to copy from, so it
+        // takes V₀ directly — the same key the engine's own ground row carries
+        // when a worker did contribute one.
+        None => dst.push_u128(gnitz_wire::global_group_key()),
+    }
+}
+
+/// Project one group into `out`, keyed by the group's `_group_pk`.
 fn emit_row(
     spec: &AggFinish,
     partial: &ZSetBatch,
@@ -468,8 +501,7 @@ fn emit_row(
     rep: Option<usize>,
     accs: &[ColAcc],
 ) {
-    let out_pk = out.len() as u128;
-    out.pks.push_u128(out_pk);
+    push_group_key(&mut out.pks, partial, rep);
     out.weights.push(1);
     let mut null_word: u64 = 0;
     for item in out_items {
@@ -543,9 +575,14 @@ mod tests {
         ]
     }
 
-    fn partial_schema(src: &Schema, specs: &[AggSpec]) -> Schema {
-        Schema::from_parts(synthetic_fold_cols(src, &[1], specs, None), vec![0])
+    fn partial_schema(src: &Schema, group_cols: &[usize], specs: &[AggSpec]) -> Schema {
+        Schema::from_parts(synthetic_fold_cols(src, group_cols, specs, None), vec![0])
             .expect("the SyntheticFold layout is a valid client schema")
+    }
+
+    /// The concatenated LE images of `vs` — what a `Fixed` i64 column holds.
+    fn le(vs: &[i64]) -> Vec<u8> {
+        vs.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
     /// A combined COUNT accumulator, in the shape `ColAcc::new` builds for a
@@ -573,7 +610,7 @@ mod tests {
     fn fill_group_batch_lays_out_values_and_null_bits() {
         let src = source_schema();
         let specs = agg_specs();
-        let partial_s = partial_schema(&src, &specs);
+        let partial_s = partial_schema(&src, &[1], &specs);
         // `fill_group_batch` never reads the output schema; it only has to exist.
         let out_s = Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap();
         let layout = GroupByLayout {
@@ -584,10 +621,12 @@ mod tests {
         };
 
         // Two representative partial rows: group 0 has g = 10, group 1 has g NULL
-        // (payload slot 0). The agg columns are never read from `partial`.
+        // (payload slot 0). The agg columns are never read from `partial`. The
+        // keys are deliberately not `0, 1`, so a staging batch that stamped the
+        // group ordinal instead of copying the key would not coincide.
         let mut partial = ZSetBatch::new(&partial_s);
-        for (row, g) in [10i64, 0].into_iter().enumerate() {
-            partial.pks.push_u128(row as u128);
+        for (row, (key, g)) in [(0x77u128, 10i64), (0x33, 0)].into_iter().enumerate() {
+            partial.pks.push_u128(key);
             partial.weights.push(1);
             partial.nulls.push(if row == 1 { 0b1 } else { 0 });
             push_fixed_bits(&mut partial.columns[1], g as u64, 8);
@@ -625,8 +664,8 @@ mod tests {
         assert_eq!(got.weights, vec![1, 1]);
         // Slot 0 = g, slot 1 = MIN(sm), slot 2 = COUNT. Group 1 nulls g and MIN.
         assert_eq!(got.nulls, vec![0, 0b011]);
-        // `_group_pk` is the dense group ordinal.
-        assert_eq!(got.pks, PkColumn::from_u128s(16, [0, 1]));
+        // `_group_pk` is the representative row's key, copied.
+        assert_eq!(got.pks, PkColumn::from_u128s(16, [0x77, 0x33]));
         // g: the copied value, then `push_null`'s zero filler.
         assert_eq!(
             fixed(&got.columns[1]),
@@ -651,7 +690,7 @@ mod tests {
     fn fill_group_batch_handles_the_global_ground_row() {
         let src = source_schema();
         let specs = agg_specs();
-        let partial_s = Schema::from_parts(synthetic_fold_cols(&src, &[], &specs, None), vec![0]).unwrap();
+        let partial_s = partial_schema(&src, &[], &specs);
         let out_s = Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap();
         let layout = GroupByLayout {
             group_col_indices: vec![],
@@ -679,6 +718,98 @@ mod tests {
         // Slot 0 = MIN (NULL), slot 1 = COUNT (0, never NULL).
         assert_eq!(got.nulls, vec![0b01]);
         assert_eq!(fixed(&got.columns[2]), &0i64.to_le_bytes());
+    }
+
+    /// The layout the fold path builds for one direct COUNT — `SELECT g,
+    /// COUNT(*) … GROUP BY g` at `group_cols = [1]`, `SELECT COUNT(*)` at `[]`.
+    fn count_layout(group_cols: Vec<usize>) -> GroupByLayout {
+        let grouped = !group_cols.is_empty();
+        GroupByLayout {
+            group_col_indices: group_cols,
+            agg_specs: vec![AggSpec {
+                op: WireAggFunc::Count,
+                col: 0,
+                out_type: TypeCode::I64,
+            }],
+            agg_mappings: vec![AggMapping {
+                specs_start: 0,
+                shape: AggShape::Direct,
+                output_name: "c".to_string(),
+                output_type: TypeCode::I64,
+                output_nullable: false,
+                agg_func: AggFunc::Count,
+                arg_col: None,
+            }],
+            select_items: grouped
+                .then(|| GroupBySelectItem::GroupCol {
+                    src_col: 1,
+                    name: "g".to_string(),
+                })
+                .into_iter()
+                .chain([GroupBySelectItem::Aggregate { agg_idx: 0 }])
+                .collect(),
+        }
+    }
+
+    /// The partial mirrors what `fetch_bound` concatenates: replies in worker
+    /// order, so a group's rows split across two workers and the keys arrive
+    /// descending — the emission ordinal and the group key then disagree on both
+    /// order and value, and only the key is a function of the data.
+    #[test]
+    fn emit_row_copies_the_engine_group_key() {
+        let src = source_schema();
+        let layout = count_layout(vec![1]);
+        let partial_s = partial_schema(&src, &[1], &layout.agg_specs);
+        let out_s = build_agg_out_schema(&layout, &src).unwrap();
+
+        // (group key, g, this worker's COUNT partial). Worker 0 emits groups
+        // 0x2222 then 0x1111; worker 1 emits the rest of 0x1111.
+        let mut partial = ZSetBatch::new(&partial_s);
+        for (key, g, n) in [(0x2222u128, 20i64, 1i64), (0x1111, 10, 2), (0x1111, 10, 3)] {
+            partial.pks.push_u128(key);
+            partial.weights.push(1);
+            partial.nulls.push(0);
+            push_fixed_bits(&mut partial.columns[1], g as u64, 8);
+            push_fixed_bits(&mut partial.columns[2], n as u64, 8);
+        }
+
+        let spec = AggFinish {
+            layout: &layout,
+            partial_schema: &partial_s,
+            out_schema: &out_s,
+            having: None,
+        };
+        let got = agg_finish(&spec, &partial);
+
+        assert_eq!(got.len(), 2);
+        // First-encounter ordinals would be `[0, 1]`; the group keys are not.
+        assert_eq!(got.pks, PkColumn::from_u128s(16, [0x2222, 0x1111]));
+        // The values stay paired with their keys: 0x2222 is g = 20 / COUNT 1,
+        // 0x1111 is g = 10 / COUNT 2 + 3.
+        assert_eq!(fixed(&got.columns[1]), le(&[20, 10]));
+        assert_eq!(fixed(&got.columns[2]), le(&[1, 5]));
+    }
+
+    /// The synthesized global ground row has no partial to copy a key from, so
+    /// it takes V₀ — the same key the engine stamps on the ground row it emits
+    /// when a worker did contribute one, so one logical row has one key either
+    /// way.
+    #[test]
+    fn emit_row_grounds_the_global_row_at_v0() {
+        let src = source_schema();
+        let layout = count_layout(vec![]);
+        let partial_s = partial_schema(&src, &[], &layout.agg_specs);
+        let out_s = build_agg_out_schema(&layout, &src).unwrap();
+        let spec = AggFinish {
+            layout: &layout,
+            partial_schema: &partial_s,
+            out_schema: &out_s,
+            having: None,
+        };
+        let got = agg_finish(&spec, &ZSetBatch::new(&partial_s));
+
+        assert_eq!(got.pks, PkColumn::from_u128s(16, [gnitz_wire::global_group_key()]));
+        assert_eq!(fixed(&got.columns[1]), le(&[0]));
     }
 
     /// One AVG mapping over `[Sum, CountNonNull]` — the only layout `finish_agg`

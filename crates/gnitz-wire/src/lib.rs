@@ -142,6 +142,15 @@ pub fn checksum(b: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(b)
 }
 
+/// `V₀` — the group key of the ungrouped (global) aggregate: the XXH3-128
+/// digest over no group columns at all. The single definition both ends share,
+/// so the engine's emitted ground row and the client's synthesized one carry the
+/// same key with no literal embedded on either side.
+#[inline]
+pub fn global_group_key() -> u128 {
+    xxhash_rust::xxh3::xxh3_128(b"")
+}
+
 #[inline]
 pub(crate) fn read_u16_le(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())

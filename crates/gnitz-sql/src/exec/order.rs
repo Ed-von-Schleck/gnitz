@@ -326,6 +326,11 @@ pub(crate) fn resolve_read_spec_order(
 /// distinct logical rows tied on the ORDER BY keys order consistently across
 /// worker counts and a cut is a function of the data. Matches the worker's
 /// OPK-then-payload tiebreak.
+///
+/// **Precondition on the caller's schema: `pk_cols` must be data-derived** — a
+/// base-table key, or a synthetic key that is a pure function of row content
+/// (`_group_pk`, `_join_pk`, `_set_pk`). They lead the tiebreak, so a PK carrying
+/// anything else decides every tie before a payload column is ever reached.
 fn push_identity_tiebreak(keys: &mut Vec<SortKey>, schema: &Schema) {
     for &ci in &schema.pk_cols {
         keys.push(SortKey::new(schema, ci, true, true));

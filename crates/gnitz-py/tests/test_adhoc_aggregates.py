@@ -3,13 +3,17 @@ aggregate / HAVING / DISTINCT) served by the ReadSpec aggregate hash-fold sink +
 client finishing, versus a `CREATE VIEW` of the same statement.
 
 The load-bearing assertion is **parity**: for a query with no ORDER BY / LIMIT,
-the ad-hoc result equals a scan of `CREATE VIEW v AS <same query>` — exact for
-integer data, approximate for float SUM/AVG (cross-worker addition order).
+the ad-hoc result equals a scan of `CREATE VIEW v AS <same query>`, exactly —
+every fixture here aggregates an integer source, so both paths agree bit for bit.
+A float SUM/AVG instead follows the summation order (the contract in
+`agg_finish.rs`); the tests at the bottom pin what that does and does not promise.
+
+`_parity_ordered` is the ordered sibling: it also pins which of a set of *tied*
+rows a cut returns, which `_parity` cannot see.
 
 Run with GNITZ_WORKERS=4 (the fold is per-worker; the client merges partials):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_adhoc_aggregates.py -v --tb=short
 """
-import math
 import random
 
 import pytest
@@ -25,18 +29,19 @@ def _rows(client, sn, q):
     return list(res["rows"])
 
 
-def _norm(rows, approx=False):
-    """Canonicalize rows to a sorted list of sorted (name, value) tuples, so two
-    result sets compare order-independently. Floats are rounded under `approx`."""
-    out = []
-    for r in rows:
-        items = []
-        for k, v in sorted(r._asdict().items()):
-            if approx and isinstance(v, float):
-                v = None if math.isnan(v) else round(v, 6)
-            items.append((k, v))
-        out.append(tuple(items))
-    return sorted(out, key=repr)
+def _items(rows):
+    """Each row as a sorted tuple of (name, value) pairs."""
+    return [tuple(sorted(r._asdict().items())) for r in rows]
+
+
+def _norm(rows):
+    """`_items`, ordered, so two result sets compare order-independently.
+
+    Exact, floats included: every `_parity` fixture aggregates an integer source,
+    so both paths divide an exact sum by an exact count and agree bit for bit. A
+    tolerance would only hide a real arithmetic bug. The float sources live in the
+    tests below, which compare bit patterns directly."""
+    return sorted(_items(rows), key=repr)
 
 
 def _cleanup(client, sn, *names):
@@ -52,9 +57,13 @@ def _cleanup(client, sn, *names):
         pass
 
 
-def _parity(client, sn, query, approx=False):
+def _parity(client, sn, query):
     """Assert the ad-hoc result of `query` (no ORDER BY / LIMIT) equals a scan of
-    a view built from the identical statement."""
+    a view built from the identical statement.
+
+    Order-*insensitive* by construction — `CREATE VIEW` rejects ORDER BY, so the
+    view is built from the whole statement and `_norm` sorts both sides. Use
+    `_parity_ordered` to compare which rows a cut returns."""
     adhoc = _rows(client, sn, query)
     vn = "pv_" + _uid()
     client.execute_sql(f"CREATE VIEW {vn} AS {query}", schema_name=sn)
@@ -62,14 +71,46 @@ def _parity(client, sn, query, approx=False):
     view = list(client.scan(vid))
     client.execute_sql(f"DROP VIEW {vn}", schema_name=sn)
 
-    a, v = _norm(adhoc, approx), _norm(view, approx)
-    assert a == v, f"ad-hoc != view for `{query}`\n  ad-hoc: {a}\n  view:   {v}"
+    a, v = _norm(adhoc), _norm(view)
+    assert a == v, f"ad-hoc != view for `{query}`"
     # Column-name parity (visible output columns).
     if adhoc and view:
         assert set(adhoc[0]._asdict().keys()) == set(view[0]._asdict().keys()), (
             f"column names differ for `{query}`"
         )
     return adhoc
+
+
+def _parity_ordered(client, sn, body, *tails):
+    """Assert the ad-hoc result of `body tail` equals reading a view of `body`
+    with the same `tail` applied — row for row, in order, for each of `tails`
+    against one shared view.
+
+    A separate helper rather than an option on `_parity`: `CREATE VIEW` rejects
+    ORDER BY, so `_parity` has to build the view from the whole statement and
+    sort both sides, which is precisely what makes it blind to tie order. Here
+    the view carries only the body and the cut runs as a second read over it, so
+    the two sinks' tiebreaks are what is being compared — the client's identity
+    tiebreak over `_agg_pk` against the worker's over whichever key the view's
+    reduce chose.
+
+    GROUP BY only. An ad-hoc `SELECT DISTINCT` keys its ties off the reduce group
+    key and a view's DISTINCT off `reindex_hash_row`, so each is deterministic but
+    they do not agree; for DISTINCT the guarantee is cross-worker-count
+    determinism alone.
+    """
+    vn = "po_" + _uid()
+    client.execute_sql(f"CREATE VIEW {vn} AS {body}", schema_name=sn)
+    try:
+        out = []
+        for tail in tails:
+            adhoc = _rows(client, sn, f"{body} {tail}")
+            view = _rows(client, sn, f"SELECT * FROM {vn} {tail}")
+            assert _items(adhoc) == _items(view), f"ordered ad-hoc != view for `{body} {tail}`"
+            out.append(adhoc)
+    finally:
+        client.execute_sql(f"DROP VIEW {vn}", schema_name=sn)
+    return out[0]
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +153,12 @@ def test_grouped_parity(client, agg):
     client.create_schema(sn)
     try:
         _setup_orders(client, sn)
-        approx = "AVG" in agg
-        _parity(client, sn, f"SELECT category, {agg} FROM orders GROUP BY category", approx=approx)
+        _parity(client, sn, f"SELECT category, {agg} FROM orders GROUP BY category")
         # With a WHERE (bounded PK range + residual).
         _parity(
             client,
             sn,
             f"SELECT category, {agg} FROM orders WHERE pk > 5 AND amount < 80 GROUP BY category",
-            approx=approx,
         )
     finally:
         _cleanup(client, sn, "orders")
@@ -141,9 +180,8 @@ def test_global_parity(client, agg):
     client.create_schema(sn)
     try:
         _setup_orders(client, sn)
-        approx = "AVG" in agg
-        _parity(client, sn, f"SELECT {agg} FROM orders", approx=approx)
-        _parity(client, sn, f"SELECT {agg} FROM orders WHERE category = 2", approx=approx)
+        _parity(client, sn, f"SELECT {agg} FROM orders")
+        _parity(client, sn, f"SELECT {agg} FROM orders WHERE category = 2")
     finally:
         _cleanup(client, sn, "orders")
 
@@ -171,7 +209,7 @@ def test_having_parity(client):
         # HAVING over a projected aggregate, and over an aggregate only in HAVING.
         _parity(client, sn, "SELECT category, COUNT(*) AS c FROM orders GROUP BY category HAVING COUNT(*) > 7")
         _parity(client, sn, "SELECT category FROM orders GROUP BY category HAVING SUM(amount) > 300")
-        _parity(client, sn, "SELECT category, AVG(amount) AS a FROM orders GROUP BY category HAVING AVG(amount) > 40", approx=True)
+        _parity(client, sn, "SELECT category, AVG(amount) AS a FROM orders GROUP BY category HAVING AVG(amount) > 40")
         # An aggregate that is NULL for some groups (COUNT(note)=0 → HAVING drops it, 3VL).
         _parity(client, sn, "SELECT category, MIN(note) AS mn FROM orders GROUP BY category HAVING MIN(note) > 10")
         # Global HAVING (grounds then filters).
@@ -357,15 +395,15 @@ def test_unsigned_avg_parity(client, hg):
     """AVG over a U64 source whose group sum passes 2^63, against the view."""
     # cat = 3 sums two 2^64-1 cells: the high bit is set, so a signed read of the
     # accumulator renders the average negative.
-    got = _parity(client, hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat", approx=True)
+    got = _parity(client, hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat")
     # 2^64-2 has no exact f64 image; it rounds to 2^64, so the average is 2^63.
     assert {r.cat: r.a for r in got}[3] == 9.223372036854776e18, got
     # The same accumulator with no group columns at all.
-    got = _parity(client, hg, "SELECT AVG(u) AS a FROM hg WHERE cat = 3", approx=True)
+    got = _parity(client, hg, "SELECT AVG(u) AS a FROM hg WHERE cat = 3")
     assert [r.a for r in got] == [9.223372036854776e18], got
     # HAVING and the render read one accumulator: the predicate keeps cat = 3 on
     # a correctly-computed average, so a mis-signed render disagrees with itself.
-    got = _parity(client, hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat HAVING AVG(u) > 1.0", approx=True)
+    got = _parity(client, hg, "SELECT cat, AVG(u) AS a FROM hg GROUP BY cat HAVING AVG(u) > 1.0")
     assert _keys(got, "cat") == [2, 3], got
     # The raw-bits render is unchanged: SUM(u) still wraps to the same u64.
     got = _parity(client, hg, "SELECT cat, SUM(u) AS t FROM hg WHERE cat = 3 GROUP BY cat")
@@ -383,7 +421,7 @@ def test_unsigned_avg_arithmetic_truth(client):
             schema_name=sn,
         )
         client.execute_sql("INSERT INTO ua VALUES (1, 1, 18446744073709551615)", schema_name=sn)
-        got = _parity(client, sn, "SELECT cat, AVG(u) AS a FROM ua GROUP BY cat", approx=True)
+        got = _parity(client, sn, "SELECT cat, AVG(u) AS a FROM ua GROUP BY cat")
         assert [r.a for r in got] == [1.8446744073709552e19], got
     finally:
         _cleanup(client, sn, "ua")
@@ -393,12 +431,12 @@ def test_signed_and_null_avg_parity(client, hg):
     """The AVG paths the unsigned read must not disturb: a signed source, an
     all-NULL group, and the global ground row. Every non-U64 integer source
     widens to the same signed accumulator, so one signed case covers them."""
-    _parity(client, hg, "SELECT cat, AVG(sm) AS a FROM hg GROUP BY cat", approx=True)
+    _parity(client, hg, "SELECT cat, AVG(sm) AS a FROM hg GROUP BY cat")
     # cat = 3 has v NULL throughout, so its count is 0 and the average is NULL.
-    got = _parity(client, hg, "SELECT cat, AVG(v) AS a FROM hg GROUP BY cat", approx=True)
+    got = _parity(client, hg, "SELECT cat, AVG(v) AS a FROM hg GROUP BY cat")
     assert {r.cat: r.a for r in got}[3] is None, got
     # No surviving partial: the synthesized global ground row averages to NULL.
-    got = _parity(client, hg, "SELECT AVG(v) AS a FROM hg WHERE cat = 99", approx=True)
+    got = _parity(client, hg, "SELECT AVG(v) AS a FROM hg WHERE cat = 99")
     assert [r.a for r in got] == [None], got
 
 
@@ -531,6 +569,10 @@ def test_order_by_alias_and_position(client):
         counts = [r["c"] for r in rows]
         assert len(rows) == 3
         assert counts == sorted(counts, reverse=True)
+        # Every category holds 8 rows, so the LIMIT cuts a fully tied set and the
+        # identity tiebreak alone decides it — ascending by category, ASC even
+        # under `ORDER BY c DESC`. See the tied-cut tests at the bottom.
+        assert [r["category"] for r in rows] == [0, 1, 2]
         # Positional ORDER BY over the visible output columns.
         rows2 = _rows(client, sn, "SELECT category, COUNT(*) AS c FROM orders GROUP BY category ORDER BY 1")
         assert [r["category"] for r in rows2] == sorted(r["category"] for r in rows2)
@@ -604,3 +646,167 @@ def test_group_cap_aborts(adhoc_group_cap_server):
         assert rows[0]["c"] == 100
     finally:
         _cleanup(client, sn, "t")
+
+
+# ---------------------------------------------------------------------------
+# Which rows a tied cut returns is a function of (data, query) alone
+#
+# The ad-hoc output's hidden `_agg_pk` leads the ordering sink's identity
+# tiebreak, so it fully decides every tie the ORDER BY keys leave open. It is the
+# engine's `_group_pk` for the group — a pure function of the group's column
+# values — carried out of the representative partial reply.
+# ---------------------------------------------------------------------------
+
+
+def _tied_groups(client, sn):
+    """16 groups of 3 rows each: every COUNT is tied, so an ORDER BY over the
+    count leaves the whole result set for the tiebreak to order. `h` gives the
+    DISTINCT case a tied non-key column to order by."""
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, h BIGINT NOT NULL)",
+        schema_name=sn,
+    )
+    vals = ", ".join(f"({i}, {i % 16}, {i % 2})" for i in range(1, 49))
+    client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+
+
+def test_tied_cut_is_worker_count_independent(seamed_server):
+    """16 fully-tied groups and a `LIMIT 4`: the cut is entirely the tiebreak's
+    to decide, so the same four groups must come back at every worker count."""
+    queries = {
+        "asc": "SELECT g, COUNT(*) AS c FROM t GROUP BY g ORDER BY c LIMIT 4",
+        "desc": "SELECT g, COUNT(*) AS c FROM t GROUP BY g ORDER BY c DESC LIMIT 4",
+        "distinct": "SELECT DISTINCT g, h FROM t ORDER BY h LIMIT 4",
+    }
+    per_count = {}
+    for workers in ("2", "4"):
+        client = seamed_server({"GNITZ_WORKERS": workers})
+        sn = "wc" + _uid()
+        client.create_schema(sn)
+        _tied_groups(client, sn)
+        per_count[workers] = {k: [tuple(r) for r in _rows(client, sn, q)] for k, q in queries.items()}
+
+    for k in queries:
+        assert per_count["2"][k] == per_count["4"][k], (
+            f"`{queries[k]}` differs across worker counts:\n"
+            f"  W=2: {per_count['2'][k]}\n  W=4: {per_count['4'][k]}"
+        )
+    # Pin the GROUP BY answer outright, so the test still catches a regression if
+    # two worker counts ever happen to agree on a wrong one. A single
+    # non-nullable integer group column keys on the order-preserving route key,
+    # so the tie breaks ascending by `g` — ASC in both directions, because
+    # tiebreak keys are always ASC. (DISTINCT over two columns keys on a digest:
+    # deterministic, but arbitrary with respect to the data, so only the
+    # cross-worker-count equality above is asserted for it.)
+    for k in ("asc", "desc"):
+        assert [r[0] for r in per_count["4"][k]] == [0, 1, 2, 3], per_count["4"][k]
+
+
+def test_ordered_tie_parity_with_a_view(client):
+    """The ad-hoc cut and a view's cut return the *same* tied rows. The two keys
+    are not the same bytes — a view over a single non-nullable integer group
+    column keys on that column's 8-byte OPK, not on a U128 `_group_pk` — but
+    `route_key` is order-preserving, so the fold's U128 key induces the identical
+    order, and the client's identity tiebreak reproduces the worker's."""
+    sn = "op" + _uid()
+    client.create_schema(sn)
+    try:
+        _tied_groups(client, sn)
+        # A single natural group column: the key is the plain route key.
+        body = "SELECT g, COUNT(*) AS c FROM t GROUP BY g"
+        first = _parity_ordered(
+            client, sn, body, "ORDER BY c LIMIT 4", "ORDER BY c DESC LIMIT 4", "ORDER BY c OFFSET 5 LIMIT 6"
+        )
+        assert [r["g"] for r in first] == [0, 1, 2, 3]
+        # A two-column group key: both sides key on the digest, so this is where
+        # a divergence between the fold's stamp and the view's would show.
+        _parity_ordered(
+            client,
+            sn,
+            "SELECT g, h, COUNT(*) AS c FROM t GROUP BY g, h",
+            "ORDER BY c LIMIT 5",
+        )
+    finally:
+        _cleanup(client, sn, "t")
+
+
+# ---------------------------------------------------------------------------
+# The float aggregate value contract
+#
+# A float SUM / AVG is a function of the summation order, so of (query, data,
+# worker count, access path, scan chunk size). It is stable for a fixed
+# deployment and a fixed plan — which is the guarantee, and is what these pin.
+# ---------------------------------------------------------------------------
+
+
+# 2000 rows over 500 categories. The category count is what makes the range
+# `cat >= 5 AND cat < 13` about 1.6% of the table — selective enough to clear the
+# index cost gate, and wide enough that the range spans several scan chunks.
+_FLOAT_ROWS = 2000
+_FLOAT_CATS = 500
+
+
+def _float_rows():
+    rnd = random.Random(11)
+    out = []
+    for i in range(1, _FLOAT_ROWS + 1):
+        # Alternating +/-1e15 and 1e-8 magnitudes: the sums cancel
+        # catastrophically, so any reassociation moves the low bits.
+        mag = 1e15 if i % 4 == 0 else (-1e15 if i % 4 == 1 else 1e-8)
+        out.append(f"({i}, {(i * 37) % _FLOAT_CATS}, {mag * (1 + rnd.random())!r})")
+    return out
+
+
+def _float_table(client, sn):
+    client.execute_sql(
+        "CREATE TABLE f (pk BIGINT NOT NULL PRIMARY KEY, cat BIGINT NOT NULL, x DOUBLE NOT NULL)",
+        schema_name=sn,
+    )
+    client.execute_sql("INSERT INTO f VALUES " + ",".join(_float_rows()), schema_name=sn)
+
+
+def _bits(rows):
+    """Each `s` as its exact bit pattern — `float.hex()` round-trips losslessly,
+    so two sums compare equal only if they are the same double."""
+    return [r.s.hex() for r in rows]
+
+
+def test_float_sum_is_stable_for_a_fixed_plan(client):
+    """Same query, same data, same worker count, same access path → bit-identical.
+    The one reproducibility guarantee the float contract does make."""
+    sn = "fs" + _uid()
+    client.create_schema(sn)
+    try:
+        _float_table(client, sn)
+        for q in (
+            "SELECT SUM(x) AS s FROM f",
+            "SELECT cat, SUM(x) AS s FROM f GROUP BY cat",
+            "SELECT cat, AVG(x) AS s FROM f GROUP BY cat",
+        ):
+            first = _bits(_rows(client, sn, q))
+            assert first == _bits(_rows(client, sn, q)), f"`{q}` is not repeatable"
+    finally:
+        _cleanup(client, sn, "f")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="a float SUM is a function of the access path: an index-bounded scan "
+    "sorts and dedups PKs per chunk, so once the range spans more than one chunk "
+    "it visits rows in a different order than a PK scan and the low bits move",
+)
+def test_float_sum_is_independent_of_the_access_path(seamed_server):
+    """`CREATE INDEX` alone moves a float SUM. Reachable at the default chunk of
+    65536 rows only for an index range that big on one worker; the server here
+    shrinks the chunk so a small fixture reaches the same code."""
+    client = seamed_server({"GNITZ_WORKERS": "4", "GNITZ_DDL_SCAN_CHUNK_ROWS": "3"})
+    sn = "fa" + _uid()
+    client.create_schema(sn)
+    _float_table(client, sn)
+    # Selective enough to clear the engine's 1/16-of-the-slice index cost gate,
+    # and spanning 8 index groups, so the range needs several chunks.
+    q = "SELECT SUM(x) AS s FROM f WHERE cat >= 5 AND cat < 13"
+    full_scan = _bits(_rows(client, sn, q))
+    client.execute_sql("CREATE INDEX fi ON f (cat)", schema_name=sn)
+    assert "index range" in _rows(client, sn, "EXPLAIN " + q)[1][0]
+    assert _bits(_rows(client, sn, q)) == full_scan

@@ -137,14 +137,16 @@ pub(super) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &
 /// zero-column fold reads no row content), but without touching a batch, so it is
 /// callable at emit time (no batch exists) and over an empty delta — where
 /// `extract_group_key`'s unconditional `null_word()` read would index an empty
-/// slice and panic (a safe slice index, so it panics in release too). The single
-/// seam where `V₀` is defined: the owner-bake's `worker_for_key`, the seed's
+/// slice and panic (a safe slice index, so it panics in release too). The engine's
+/// seam onto `V₀`: the owner-bake's `worker_for_key`, the seed's
 /// `emit_global_ground` PK and `trace_out` probe all route through this, while the
 /// runtime router and PK-stamp use the equal `extract_group_key` over a real row —
-/// so every site agrees byte-for-byte with no embedded literal.
+/// so every site agrees byte-for-byte with no embedded literal. `V₀` itself is
+/// defined in `gnitz-wire`, so the SQL side's synthesized ground row shares the
+/// constant rather than restating it.
 #[inline]
 pub(crate) fn global_group_key() -> u128 {
-    RowHasher::new().digest128()
+    gnitz_wire::global_group_key()
 }
 
 /// Whether the group key of `group_by_cols` can be emitted through the
