@@ -173,10 +173,7 @@ fn resolve_fk_target(
     // `pk_index_single()` is never reached for a compound parent.
     let is_lone_pk = ref_schema.pk_count() == 1 && ref_col_idx == ref_schema.pk_index_single();
     if !is_lone_pk {
-        match client
-            .index_for_column(ref_tid, ref_col_idx)
-            .map_err(GnitzSqlError::Exec)?
-        {
+        match client.index_for_column(ref_tid, ref_col_idx)? {
             Some(IndexMeta { is_unique: true, .. }) => {}
             _ => {
                 return Err(GnitzSqlError::Unsupported(format!(
@@ -591,9 +588,7 @@ pub(crate) fn execute_create_table(
         })
         .collect();
 
-    let tid = client
-        .create_table(schema_name, &table_name, &cols, &pk_indices, props, &unique_indexes)
-        .map_err(GnitzSqlError::Exec)?;
+    let tid = client.create_table(schema_name, &table_name, &cols, &pk_indices, props, &unique_indexes)?;
 
     Ok(SqlResult::TableCreated { table_id: tid })
 }
@@ -614,11 +609,11 @@ pub(crate) fn execute_drop(
                 // synthesized hidden views (`__h…`) undroppable by name — they
                 // are only removed by the owning view's cascade.
                 validate_user_name(&name)?;
-                client.drop_table(schema_name, &name).map_err(GnitzSqlError::Exec)?;
+                client.drop_table(schema_name, &name)?;
             }
             ObjectType::View => {
                 validate_user_name(&name)?;
-                client.drop_view(schema_name, &name).map_err(GnitzSqlError::Exec)?;
+                client.drop_view(schema_name, &name)?;
             }
             ObjectType::Index => {
                 // Mirror CREATE INDEX's name rule (reserved prefix + `__fk_`
@@ -627,7 +622,7 @@ pub(crate) fn execute_drop(
                 validate_user_index_name(&name)?;
                 // Plain DROP INDEX drops loudly (like DROP TABLE/VIEW); only
                 // ALTER TABLE ... DROP CONSTRAINT IF EXISTS passes `true`.
-                client.drop_index_by_name(&name, false).map_err(GnitzSqlError::Exec)?;
+                client.drop_index_by_name(&name, false)?;
             }
             _ => {
                 return Err(GnitzSqlError::Unsupported(format!(
@@ -729,7 +724,7 @@ pub(crate) fn create_index_core(
         None => {
             let names: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
             let base = default_index_name(schema_name, table_name, &names);
-            let existing = client.index_name_cols().map_err(GnitzSqlError::Exec)?;
+            let existing = client.index_name_cols()?;
             // A prior *auto-named* index on this exact column set is the same index:
             // reject it, preserving the pre-disambiguation duplicate rejection (name
             // collision was the only guard before). An FK-backing or explicitly-named
@@ -748,9 +743,7 @@ pub(crate) fn create_index_core(
         }
     };
 
-    let index_id = client
-        .create_index(table_id, &col_indices, &col_types, &index_name, is_unique)
-        .map_err(GnitzSqlError::Exec)?;
+    let index_id = client.create_index(table_id, &col_indices, &col_types, &index_name, is_unique)?;
 
     Ok(SqlResult::IndexCreated { index_id })
 }

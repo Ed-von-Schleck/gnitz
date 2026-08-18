@@ -32,10 +32,10 @@ pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema) -> Result<BoundExp
 // so a new operator or fold lands on every context at the same time and cannot
 // silently drift between hand-copied walks.
 
-/// The three schema-aware leaves of `bind_structural`, generic over the leaf
-/// reference type `R` (the `ColRef`/`IsNull`/`IsNotNull` payload). `R` defaults
-/// to `usize`, so the four runtime leaf impls resolve to `LeafBinder<usize>`
-/// unannotated; a future view-side leaf will instantiate a column-identity `R`.
+/// The schema-aware leaves of `bind_structural`, generic over the leaf reference
+/// type `R` (the `ColRef`/`IsNull`/`IsNotNull` payload). `R` defaults to `usize`,
+/// which is what the two ad-hoc read-path leaves resolve to unannotated; the four
+/// view-path leaves in `hir::bind` instantiate the column-identity `HirRef`.
 pub(crate) trait LeafBinder<R = usize> {
     /// An `Identifier` / `CompoundIdentifier` column reference.
     fn bind_column(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError>;
@@ -185,8 +185,11 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             };
             Ok(maybe_negate(node, *negated))
         }
-        Expr::IsNull(i) => leaf.bind_null_test(i, true),
-        Expr::IsNotNull(i) => leaf.bind_null_test(i, false),
+        // Peel here, not in each leaf: every other operand reaches the leaves
+        // through the `Nested` arm below, so `(c) IS NULL` would otherwise bind
+        // only under the leaves that happened to peel for themselves.
+        Expr::IsNull(i) => leaf.bind_null_test(crate::ast_util::peel_nested(i), true),
+        Expr::IsNotNull(i) => leaf.bind_null_test(crate::ast_util::peel_nested(i), false),
         Expr::Nested(i) => bind_structural(i, leaf),
         Expr::Value(vws) => bind_literal(&vws.value),
         // Searched CASE binds each `(condition, result)`; the simple-operand form

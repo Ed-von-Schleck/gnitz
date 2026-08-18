@@ -1,7 +1,7 @@
-//! JOIN key-pair primitives shared by the join and EXISTS/IN emission
-//! (`join.rs`, `exists.rs`) and the predicate-classification rewrite: the
-//! equi/range key-pair type validators, the reindex / null-filter program
-//! builders, the range-relation converse, and the key-arity guard.
+//! Circuit-emission primitives shared by the join and EXISTS/IN lowering
+//! (`join.rs`, `exists.rs`): the null-filter and reindex program builders, the
+//! source-PK rekey, and the small schema helpers they emit against. The
+//! pass-neutral key-pair validators live in `hir::guards`.
 
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr_to_program;

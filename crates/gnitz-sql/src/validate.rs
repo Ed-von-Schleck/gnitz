@@ -146,6 +146,17 @@ fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
     GnitzSqlError::Unsupported(format!("{context}: {clause} is not supported"))
 }
 
+/// Reject `clause` when `present`. The clause guards below are a *table* of
+/// "which clauses does this statement not honor" — written as a run of these so
+/// the table reads as one, and so each entry keeps the short-circuit that makes
+/// the first present clause the one named.
+fn reject_if(present: bool, context: &str, clause: &str) -> Result<(), GnitzSqlError> {
+    if present {
+        return Err(unsupported_clause(context, clause));
+    }
+    Ok(())
+}
+
 /// Reject a circuit whose widest intermediate batch exceeds the engine's
 /// column limit, before the server's hard schema-build assertion. `what` names
 /// the view kind and stage ("JOIN view output", "EXISTS view intermediate", …).
@@ -253,53 +264,29 @@ pub(crate) fn reject_unhonored_select_clauses(
         select_modifiers: _,
     } = select;
 
-    let reject = |clause: &str| unsupported_clause(context, clause);
-
-    if matches!(distinct, Some(Distinct::On(_))) {
-        return Err(reject("DISTINCT ON"));
-    }
-    if !honored.distinct && matches!(distinct, Some(Distinct::Distinct)) {
-        return Err(reject("DISTINCT"));
-    }
-    if !honored.grouping && crate::ast_util::group_by_is_present(group_by) {
-        return Err(reject("GROUP BY"));
-    }
-    if !honored.grouping && having.is_some() {
-        return Err(reject("HAVING"));
-    }
-    if top.is_some() {
-        return Err(reject("TOP"));
-    }
-    if prewhere.is_some() {
-        return Err(reject("PREWHERE"));
-    }
-    if into.is_some() {
-        return Err(reject("SELECT INTO"));
-    }
-    if qualify.is_some() {
-        return Err(reject("QUALIFY"));
-    }
-    if !connect_by.is_empty() {
-        return Err(reject("CONNECT BY"));
-    }
-    if exclude.is_some() {
-        return Err(reject("SELECT * EXCLUDE"));
-    }
-    if !lateral_views.is_empty() {
-        return Err(reject("LATERAL VIEW"));
-    }
-    if !cluster_by.is_empty() {
-        return Err(reject("CLUSTER BY"));
-    }
-    if !distribute_by.is_empty() {
-        return Err(reject("DISTRIBUTE BY"));
-    }
-    if !sort_by.is_empty() {
-        return Err(reject("SORT BY"));
-    }
-    if !named_window.is_empty() {
-        return Err(reject("WINDOW"));
-    }
+    reject_if(matches!(distinct, Some(Distinct::On(_))), context, "DISTINCT ON")?;
+    reject_if(
+        !honored.distinct && matches!(distinct, Some(Distinct::Distinct)),
+        context,
+        "DISTINCT",
+    )?;
+    reject_if(
+        !honored.grouping && crate::ast_util::group_by_is_present(group_by),
+        context,
+        "GROUP BY",
+    )?;
+    reject_if(!honored.grouping && having.is_some(), context, "HAVING")?;
+    reject_if(top.is_some(), context, "TOP")?;
+    reject_if(prewhere.is_some(), context, "PREWHERE")?;
+    reject_if(into.is_some(), context, "SELECT INTO")?;
+    reject_if(qualify.is_some(), context, "QUALIFY")?;
+    reject_if(!connect_by.is_empty(), context, "CONNECT BY")?;
+    reject_if(exclude.is_some(), context, "SELECT * EXCLUDE")?;
+    reject_if(!lateral_views.is_empty(), context, "LATERAL VIEW")?;
+    reject_if(!cluster_by.is_empty(), context, "CLUSTER BY")?;
+    reject_if(!distribute_by.is_empty(), context, "DISTRIBUTE BY")?;
+    reject_if(!sort_by.is_empty(), context, "SORT BY")?;
+    reject_if(!named_window.is_empty(), context, "WINDOW")?;
     Ok(())
 }
 
@@ -361,35 +348,19 @@ pub(crate) fn reject_unhonored_query_clauses(
         pipe_operators,
     } = query;
 
-    let reject = |clause: &str| unsupported_clause(context, clause);
-
-    if !honored.with && with.is_some() {
-        return Err(reject("WITH (CTE)"));
-    }
-    if !honored.ordering_sink && limit_clause.is_some() {
-        return Err(reject("LIMIT/OFFSET"));
-    }
-    if !honored.ordering_sink && order_by.is_some() {
-        return Err(reject("ORDER BY"));
-    }
-    if fetch.is_some() {
-        return Err(reject("FETCH"));
-    }
-    if !locks.is_empty() {
-        return Err(reject("FOR UPDATE/SHARE"));
-    }
-    if for_clause.is_some() {
-        return Err(reject("FOR XML/JSON/BROWSE"));
-    }
-    if settings.is_some() {
-        return Err(reject("SETTINGS"));
-    }
-    if format_clause.is_some() {
-        return Err(reject("FORMAT"));
-    }
-    if !pipe_operators.is_empty() {
-        return Err(reject("pipe operators (|>)"));
-    }
+    reject_if(!honored.with && with.is_some(), context, "WITH (CTE)")?;
+    reject_if(
+        !honored.ordering_sink && limit_clause.is_some(),
+        context,
+        "LIMIT/OFFSET",
+    )?;
+    reject_if(!honored.ordering_sink && order_by.is_some(), context, "ORDER BY")?;
+    reject_if(fetch.is_some(), context, "FETCH")?;
+    reject_if(!locks.is_empty(), context, "FOR UPDATE/SHARE")?;
+    reject_if(for_clause.is_some(), context, "FOR XML/JSON/BROWSE")?;
+    reject_if(settings.is_some(), context, "SETTINGS")?;
+    reject_if(format_clause.is_some(), context, "FORMAT")?;
+    reject_if(!pipe_operators.is_empty(), context, "pipe operators (|>)")?;
     Ok(())
 }
 
@@ -529,52 +500,29 @@ pub(crate) fn reject_unhonored_insert_clauses(
         multi_table_else_clause,
     } = insert;
 
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if or.is_some() {
-        return Err(reject("OR (conflict clause)"));
-    }
-    if *ignore {
-        return Err(reject("IGNORE"));
-    }
-    if *overwrite {
-        return Err(reject("OVERWRITE"));
-    }
-    if *replace_into {
-        return Err(reject("REPLACE INTO"));
-    }
-    if partitioned.is_some() {
-        return Err(reject("PARTITION"));
-    }
-    if priority.is_some() {
-        return Err(reject("priority (LOW_PRIORITY/HIGH_PRIORITY/DELAYED)"));
-    }
-    if insert_alias.is_some() {
-        return Err(reject("row alias (AS alias)"));
-    }
-    if table_alias.is_some() {
-        return Err(reject("table alias"));
-    }
-    if !assignments.is_empty() {
-        return Err(reject("SET"));
-    }
-    if !after_columns.is_empty() {
-        return Err(reject("AFTER columns"));
-    }
-    if settings.is_some() {
-        return Err(reject("SETTINGS"));
-    }
-    if format_clause.is_some() {
-        return Err(reject("FORMAT"));
-    }
-    if output.is_some() {
-        return Err(reject("OUTPUT"));
-    }
+    reject_if(or.is_some(), context, "OR (conflict clause)")?;
+    reject_if(*ignore, context, "IGNORE")?;
+    reject_if(*overwrite, context, "OVERWRITE")?;
+    reject_if(*replace_into, context, "REPLACE INTO")?;
+    reject_if(partitioned.is_some(), context, "PARTITION")?;
+    reject_if(
+        priority.is_some(),
+        context,
+        "priority (LOW_PRIORITY/HIGH_PRIORITY/DELAYED)",
+    )?;
+    reject_if(insert_alias.is_some(), context, "row alias (AS alias)")?;
+    reject_if(table_alias.is_some(), context, "table alias")?;
+    reject_if(!assignments.is_empty(), context, "SET")?;
+    reject_if(!after_columns.is_empty(), context, "AFTER columns")?;
+    reject_if(settings.is_some(), context, "SETTINGS")?;
+    reject_if(format_clause.is_some(), context, "FORMAT")?;
+    reject_if(output.is_some(), context, "OUTPUT")?;
     if multi_table_insert_type.is_some()
         || !multi_table_into_clauses.is_empty()
         || !multi_table_when_clauses.is_empty()
         || multi_table_else_clause.is_some()
     {
-        return Err(reject("multi-table INSERT (ALL/FIRST)"));
+        return Err(unsupported_clause(context, "multi-table INSERT (ALL/FIRST)"));
     }
     // The `source` is a full `Query`; an INSERT honors no envelope clause on it (LIMIT/OFFSET,
     // ORDER BY, FETCH, FOR UPDATE/SHARE, SETTINGS, FORMAT, a `WITH`). Route it through the shared
@@ -609,25 +557,12 @@ pub(crate) fn reject_unhonored_update_clauses(
         order_by,
         limit,
     } = update;
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if from.is_some() {
-        return Err(reject("FROM (join-update)"));
-    }
-    if returning.is_some() {
-        return Err(reject("RETURNING"));
-    }
-    if output.is_some() {
-        return Err(reject("OUTPUT"));
-    }
-    if or.is_some() {
-        return Err(reject("OR (conflict clause)"));
-    }
-    if !order_by.is_empty() {
-        return Err(reject("ORDER BY"));
-    }
-    if limit.is_some() {
-        return Err(reject("LIMIT"));
-    }
+    reject_if(from.is_some(), context, "FROM (join-update)")?;
+    reject_if(returning.is_some(), context, "RETURNING")?;
+    reject_if(output.is_some(), context, "OUTPUT")?;
+    reject_if(or.is_some(), context, "OR (conflict clause)")?;
+    reject_if(!order_by.is_empty(), context, "ORDER BY")?;
+    reject_if(limit.is_some(), context, "LIMIT")?;
     Ok(())
 }
 
@@ -652,25 +587,12 @@ pub(crate) fn reject_unhonored_delete_clauses(
         order_by,
         limit,
     } = del;
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if !tables.is_empty() {
-        return Err(reject("multi-table delete"));
-    }
-    if using.is_some() {
-        return Err(reject("USING (join-delete)"));
-    }
-    if returning.is_some() {
-        return Err(reject("RETURNING"));
-    }
-    if output.is_some() {
-        return Err(reject("OUTPUT"));
-    }
-    if !order_by.is_empty() {
-        return Err(reject("ORDER BY"));
-    }
-    if limit.is_some() {
-        return Err(reject("LIMIT"));
-    }
+    reject_if(!tables.is_empty(), context, "multi-table delete")?;
+    reject_if(using.is_some(), context, "USING (join-delete)")?;
+    reject_if(returning.is_some(), context, "RETURNING")?;
+    reject_if(output.is_some(), context, "OUTPUT")?;
+    reject_if(!order_by.is_empty(), context, "ORDER BY")?;
+    reject_if(limit.is_some(), context, "LIMIT")?;
     Ok(())
 }
 
@@ -698,22 +620,11 @@ pub(crate) fn reject_unhonored_drop_clauses(
     else {
         return Err(GnitzSqlError::Bind("not a DROP statement".to_string()));
     };
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if *cascade {
-        return Err(reject("CASCADE"));
-    }
-    if *restrict {
-        return Err(reject("RESTRICT"));
-    }
-    if *purge {
-        return Err(reject("PURGE"));
-    }
-    if *temporary {
-        return Err(reject("TEMPORARY"));
-    }
-    if table.is_some() {
-        return Err(reject("ON <table> (MySQL DROP INDEX target)"));
-    }
+    reject_if(*cascade, context, "CASCADE")?;
+    reject_if(*restrict, context, "RESTRICT")?;
+    reject_if(*purge, context, "PURGE")?;
+    reject_if(*temporary, context, "TEMPORARY")?;
+    reject_if(table.is_some(), context, "ON <table> (MySQL DROP INDEX target)")?;
     Ok(())
 }
 
@@ -743,27 +654,14 @@ pub(crate) fn reject_unhonored_explain_clauses(
     else {
         return Err(GnitzSqlError::Bind("not an EXPLAIN statement".to_string()));
     };
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if *analyze {
-        return Err(reject("ANALYZE"));
-    }
-    if *verbose {
-        return Err(reject("VERBOSE"));
-    }
-    if *query_plan {
-        return Err(reject("QUERY PLAN"));
-    }
-    if *estimate {
-        return Err(reject("ESTIMATE"));
-    }
-    if format.is_some() {
-        return Err(reject("FORMAT"));
-    }
+    reject_if(*analyze, context, "ANALYZE")?;
+    reject_if(*verbose, context, "VERBOSE")?;
+    reject_if(*query_plan, context, "QUERY PLAN")?;
+    reject_if(*estimate, context, "ESTIMATE")?;
+    reject_if(format.is_some(), context, "FORMAT")?;
     // `GenericDialect` sets `supports_explain_with_utility_options`, so the
     // parenthesized Postgres form parses into `options` rather than failing here.
-    if options.is_some() {
-        return Err(reject("the parenthesized option list"));
-    }
+    reject_if(options.is_some(), context, "the parenthesized option list")?;
     Ok(())
 }
 
@@ -794,19 +692,14 @@ pub(crate) fn reject_unhonored_start_transaction_clauses(
     else {
         return Err(GnitzSqlError::Bind("not a START TRANSACTION statement".to_string()));
     };
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if !modes.is_empty() {
-        return Err(reject("transaction modes (READ ONLY / ISOLATION LEVEL)"));
-    }
-    if modifier.is_some() {
-        return Err(reject("a BEGIN modifier (DEFERRED / TRY / CATCH)"));
-    }
-    if !statements.is_empty() {
-        return Err(reject("a BEGIN ... END block"));
-    }
-    if exception.is_some() {
-        return Err(reject("an EXCEPTION clause"));
-    }
+    reject_if(
+        !modes.is_empty(),
+        context,
+        "transaction modes (READ ONLY / ISOLATION LEVEL)",
+    )?;
+    reject_if(modifier.is_some(), context, "a BEGIN modifier (DEFERRED / TRY / CATCH)")?;
+    reject_if(!statements.is_empty(), context, "a BEGIN ... END block")?;
+    reject_if(exception.is_some(), context, "an EXCEPTION clause")?;
     Ok(())
 }
 
@@ -828,13 +721,8 @@ pub(crate) fn reject_unhonored_commit_clauses(
     else {
         return Err(GnitzSqlError::Bind("not a COMMIT statement".to_string()));
     };
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if *chain {
-        return Err(reject("AND CHAIN"));
-    }
-    if modifier.is_some() {
-        return Err(reject("a COMMIT modifier (TRY / CATCH)"));
-    }
+    reject_if(*chain, context, "AND CHAIN")?;
+    reject_if(modifier.is_some(), context, "a COMMIT modifier (TRY / CATCH)")?;
     Ok(())
 }
 
@@ -850,13 +738,8 @@ pub(crate) fn reject_unhonored_rollback_clauses(
     let sqlparser::ast::Statement::Rollback { chain, savepoint } = stmt else {
         return Err(GnitzSqlError::Bind("not a ROLLBACK statement".to_string()));
     };
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if *chain {
-        return Err(reject("AND CHAIN"));
-    }
-    if savepoint.is_some() {
-        return Err(reject("TO SAVEPOINT"));
-    }
+    reject_if(*chain, context, "AND CHAIN")?;
+    reject_if(savepoint.is_some(), context, "TO SAVEPOINT")?;
     Ok(())
 }
 
@@ -944,31 +827,14 @@ pub(crate) fn reject_unhonored_create_table_clauses(
         backup: _,
     } = create;
 
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if query.is_some() {
-        return Err(reject("AS SELECT (CTAS)"));
-    }
-    if *temporary {
-        return Err(reject("TEMPORARY"));
-    }
-    if global.is_some() {
-        return Err(reject("GLOBAL/LOCAL"));
-    }
-    if like.is_some() {
-        return Err(reject("LIKE"));
-    }
-    if clone.is_some() {
-        return Err(reject("CLONE"));
-    }
-    if on_commit.is_some() {
-        return Err(reject("ON COMMIT"));
-    }
-    if primary_key.is_some() {
-        return Err(reject("PRIMARY KEY expression"));
-    }
-    if partition_of.is_some() || for_values.is_some() {
-        return Err(reject("PARTITION OF"));
-    }
+    reject_if(query.is_some(), context, "AS SELECT (CTAS)")?;
+    reject_if(*temporary, context, "TEMPORARY")?;
+    reject_if(global.is_some(), context, "GLOBAL/LOCAL")?;
+    reject_if(like.is_some(), context, "LIKE")?;
+    reject_if(clone.is_some(), context, "CLONE")?;
+    reject_if(on_commit.is_some(), context, "ON COMMIT")?;
+    reject_if(primary_key.is_some(), context, "PRIMARY KEY expression")?;
+    reject_if(partition_of.is_some() || for_values.is_some(), context, "PARTITION OF")?;
     Ok(())
 }
 
@@ -1037,16 +903,9 @@ pub(crate) fn reject_unhonored_create_view_clauses(
         temporary,
         to, // rejected
     } = cv;
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if !columns.is_empty() {
-        return Err(reject("output column aliases"));
-    }
-    if *temporary {
-        return Err(reject("TEMPORARY"));
-    }
-    if to.is_some() {
-        return Err(reject("TO (target table)"));
-    }
+    reject_if(!columns.is_empty(), context, "output column aliases")?;
+    reject_if(*temporary, context, "TEMPORARY")?;
+    reject_if(to.is_some(), context, "TO (target table)")?;
     Ok(())
 }
 
@@ -1075,33 +934,20 @@ pub(crate) fn reject_unhonored_create_index_clauses(
         index_options,
         alter_options,
     } = ci;
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if predicate.is_some() {
-        return Err(reject("WHERE (partial index)"));
-    }
-    if !index_options.is_empty() {
-        return Err(reject("index options"));
-    }
-    if !alter_options.is_empty() {
-        return Err(reject("ALTER options (ALGORITHM / LOCK)"));
-    }
+    reject_if(predicate.is_some(), context, "WHERE (partial index)")?;
+    reject_if(!index_options.is_empty(), context, "index options")?;
+    reject_if(!alter_options.is_empty(), context, "ALTER options (ALGORITHM / LOCK)")?;
     if let Some(t) = using {
-        if !matches!(t, IndexType::BTree) {
-            return Err(reject("USING (non-default index type)"));
-        }
+        reject_if(
+            !matches!(t, IndexType::BTree),
+            context,
+            "USING (non-default index type)",
+        )?;
     }
-    if *concurrently {
-        return Err(reject("CONCURRENTLY"));
-    }
-    if !include.is_empty() {
-        return Err(reject("INCLUDE (covering columns)"));
-    }
-    if nulls_distinct.is_some() {
-        return Err(reject("NULLS [NOT] DISTINCT"));
-    }
-    if !with.is_empty() {
-        return Err(reject("WITH (storage parameters)"));
-    }
+    reject_if(*concurrently, context, "CONCURRENTLY")?;
+    reject_if(!include.is_empty(), context, "INCLUDE (covering columns)")?;
+    reject_if(nulls_distinct.is_some(), context, "NULLS [NOT] DISTINCT")?;
+    reject_if(!with.is_empty(), context, "WITH (storage parameters)")?;
     Ok(())
 }
 
@@ -1239,11 +1085,10 @@ pub(crate) fn reject_unhonored_column_options(
     site: ColumnOptionSite,
 ) -> Result<(), GnitzSqlError> {
     use sqlparser::ast::ColumnOption as O;
-    let reject = |clause: &str| unsupported_clause(context, clause);
     // Consumed at CREATE TABLE, unhonored at ADD COLUMN.
     let honored = |clause: &str| match site {
         ColumnOptionSite::CreateTable => Ok(()),
-        ColumnOptionSite::AddColumn => Err(reject(clause)),
+        ColumnOptionSite::AddColumn => Err(unsupported_clause(context, clause)),
     };
     for opt in &col.options {
         match &opt.option {
@@ -1268,20 +1113,20 @@ pub(crate) fn reject_unhonored_column_options(
                 reject_unhonored_fk_fields(fk, context)?
             }
             O::Comment(_) | O::Options(_) | O::Policy(_) | O::Tags(_) => {} // inert metadata
-            O::Default(_) => return Err(reject("DEFAULT")),
-            O::Check(_) => return Err(reject("CHECK")),
-            O::Generated { .. } => return Err(reject("GENERATED")),
-            O::Identity(_) => return Err(reject("IDENTITY / AUTO_INCREMENT")),
-            O::OnUpdate(_) => return Err(reject("ON UPDATE")),
-            O::OnConflict(_) => return Err(reject("ON CONFLICT")),
-            O::Collation(_) => return Err(reject("COLLATE")),
-            O::CharacterSet(_) => return Err(reject("CHARACTER SET")),
-            O::Materialized(_) => return Err(reject("MATERIALIZED column")),
-            O::Ephemeral(_) => return Err(reject("EPHEMERAL column")),
-            O::Alias(_) => return Err(reject("ALIAS column")),
-            O::Srid(_) => return Err(reject("SRID")),
-            O::Invisible => return Err(reject("INVISIBLE column")),
-            O::DialectSpecific(_) => return Err(reject("dialect-specific column option")),
+            O::Default(_) => return Err(unsupported_clause(context, "DEFAULT")),
+            O::Check(_) => return Err(unsupported_clause(context, "CHECK")),
+            O::Generated { .. } => return Err(unsupported_clause(context, "GENERATED")),
+            O::Identity(_) => return Err(unsupported_clause(context, "IDENTITY / AUTO_INCREMENT")),
+            O::OnUpdate(_) => return Err(unsupported_clause(context, "ON UPDATE")),
+            O::OnConflict(_) => return Err(unsupported_clause(context, "ON CONFLICT")),
+            O::Collation(_) => return Err(unsupported_clause(context, "COLLATE")),
+            O::CharacterSet(_) => return Err(unsupported_clause(context, "CHARACTER SET")),
+            O::Materialized(_) => return Err(unsupported_clause(context, "MATERIALIZED column")),
+            O::Ephemeral(_) => return Err(unsupported_clause(context, "EPHEMERAL column")),
+            O::Alias(_) => return Err(unsupported_clause(context, "ALIAS column")),
+            O::Srid(_) => return Err(unsupported_clause(context, "SRID")),
+            O::Invisible => return Err(unsupported_clause(context, "INVISIBLE column")),
+            O::DialectSpecific(_) => return Err(unsupported_clause(context, "dialect-specific column option")),
         }
     }
     Ok(())
@@ -1299,7 +1144,6 @@ pub(crate) fn reject_unhonored_table_constraints(
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     use sqlparser::ast::TableConstraint as C;
-    let reject = |clause: &str| unsupported_clause(context, clause);
     for c in constraints {
         match c {
             // Consumed, but only the column list / constraint name — descend so an
@@ -1307,11 +1151,11 @@ pub(crate) fn reject_unhonored_table_constraints(
             C::PrimaryKey(pk) => reject_unhonored_pk_fields(pk, context)?,
             C::Unique(u) => reject_unhonored_unique_fields(u, context)?,
             C::ForeignKey(fk) => reject_unhonored_fk_fields(fk, context)?,
-            C::Check(_) => return Err(reject("CHECK constraint")),
-            C::Index(_) => return Err(reject("INDEX in table definition")),
-            C::FulltextOrSpatial(_) => return Err(reject("FULLTEXT/SPATIAL index")),
-            C::PrimaryKeyUsingIndex(_) => return Err(reject("PRIMARY KEY USING INDEX")),
-            C::UniqueUsingIndex(_) => return Err(reject("UNIQUE USING INDEX")),
+            C::Check(_) => return Err(unsupported_clause(context, "CHECK constraint")),
+            C::Index(_) => return Err(unsupported_clause(context, "INDEX in table definition")),
+            C::FulltextOrSpatial(_) => return Err(unsupported_clause(context, "FULLTEXT/SPATIAL index")),
+            C::PrimaryKeyUsingIndex(_) => return Err(unsupported_clause(context, "PRIMARY KEY USING INDEX")),
+            C::UniqueUsingIndex(_) => return Err(unsupported_clause(context, "UNIQUE USING INDEX")),
         }
     }
     Ok(())
@@ -1340,19 +1184,14 @@ pub(crate) fn reject_unhonored_alter_table_clauses(
         on_cluster,
         table_type,
     } = alter;
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if *only {
-        return Err(reject("ONLY"));
-    }
-    if location.is_some() {
-        return Err(reject("SET LOCATION"));
-    }
-    if on_cluster.is_some() {
-        return Err(reject("ON CLUSTER"));
-    }
-    if table_type.is_some() {
-        return Err(reject("a non-default table type (Iceberg/Dynamic/External)"));
-    }
+    reject_if(*only, context, "ONLY")?;
+    reject_if(location.is_some(), context, "SET LOCATION")?;
+    reject_if(on_cluster.is_some(), context, "ON CLUSTER")?;
+    reject_if(
+        table_type.is_some(),
+        context,
+        "a non-default table type (Iceberg/Dynamic/External)",
+    )?;
     Ok(())
 }
 
@@ -1365,13 +1204,8 @@ pub(crate) fn reject_unhonored_alter_view_clauses(
     with_options: &[sqlparser::ast::SqlOption],
     context: &str,
 ) -> Result<(), GnitzSqlError> {
-    let reject = |clause: &str| unsupported_clause(context, clause);
-    if !columns.is_empty() {
-        return Err(reject("output column aliases"));
-    }
-    if !with_options.is_empty() {
-        return Err(reject("WITH options"));
-    }
+    reject_if(!columns.is_empty(), context, "output column aliases")?;
+    reject_if(!with_options.is_empty(), context, "WITH options")?;
     Ok(())
 }
 

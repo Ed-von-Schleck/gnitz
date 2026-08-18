@@ -1,12 +1,11 @@
 //! Binding: AST → `BoundExpr`, and name → relation resolution.
 //!
 //! `resolve` (the catalog cache, column lookup, alias maps) and `structural`
-//! (the one `Expr → BoundExpr` recursion + its leaves) are a mutually-recursive
-//! pair: `structural` calls down into `resolve` for column lookup, and
-//! `bind_single_table` — defined in `structural` — drives the recursion using
-//! `resolve`'s column lookup through the `SingleTable` leaf. The dependency is one-directional
-//! (`structural → resolve`, never the reverse); were `bind/` ever promoted to
-//! its own crate the two files would move together.
+//! (the one `Expr → BoundExpr` recursion + its leaves) are one unit: the
+//! dependency runs `structural → resolve` and never the reverse — `structural`
+//! calls down for column lookup, and `bind_single_table` drives the recursion
+//! through the `SingleTable` leaf. Were `bind/` ever promoted to its own crate
+//! the two files would move together.
 
 mod resolve;
 pub(crate) mod structural;

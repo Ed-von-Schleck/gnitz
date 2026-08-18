@@ -139,9 +139,7 @@ fn rename_relation(
     let source_name = extract_name(source, "ALTER TABLE")?;
     validate_user_name(&source_name)?;
 
-    let resolved = client
-        .resolve_relation_kind(schema_name, &source_name)
-        .map_err(GnitzSqlError::Exec)?;
+    let resolved = client.resolve_relation_kind(schema_name, &source_name)?;
     let Some(rel) = resolved else {
         if if_exists {
             return Ok(altered("table", extract_name(target, "ALTER TABLE")?));
@@ -153,9 +151,7 @@ fn rename_relation(
     let new_name = rename_target_name(target, schema_name)?;
     validate_user_name(&new_name)?;
 
-    client
-        .alter_rename_relation(schema_name, &source_name, &new_name)
-        .map_err(GnitzSqlError::Exec)?;
+    client.alter_rename_relation(schema_name, &source_name, &new_name)?;
     Ok(altered(rel.class.noun(), new_name))
 }
 
@@ -173,9 +169,7 @@ fn rename_column(
     if !alter_base_table_exists(client, schema_name, &source_name, if_exists, "RENAME COLUMN")? {
         return Ok(altered("column", new_col.to_string()));
     }
-    client
-        .alter_rename_column(schema_name, &source_name, old_col, new_col)
-        .map_err(GnitzSqlError::Exec)?;
+    client.alter_rename_column(schema_name, &source_name, old_col, new_col)?;
     Ok(altered("column", new_col.to_string()))
 }
 
@@ -230,7 +224,7 @@ fn add_column(
 
     let type_code = sql_type_to_typecode(&column_def.data_type)?;
     let def = gnitz_core::ColumnDef::new(col_name, type_code, /* is_nullable */ true);
-    client.alter_add_column(tid, &def).map_err(GnitzSqlError::Exec)?;
+    client.alter_add_column(tid, &def)?;
     Ok(altered("column", col_name.clone()))
 }
 
@@ -297,14 +291,14 @@ fn drop_column(
     // dormant). Served from the statement's resolved descriptor; `cols` are
     // physical indices in the same space as `col_idx`, so a composite-index
     // member is caught.
-    let indexes = client.table_indexes(tid).map_err(GnitzSqlError::Exec)?;
+    let indexes = client.table_indexes(tid)?;
     if indexes.iter().any(|im| im.cols.as_slice().contains(&(col_idx as u32))) {
         return Err(GnitzSqlError::Unsupported(format!(
             "cannot DROP COLUMN '{col_name}': it is covered by a secondary index; DROP the index first"
         )));
     }
 
-    client.alter_drop_column(tid, col_idx).map_err(GnitzSqlError::Exec)?;
+    client.alter_drop_column(tid, col_idx)?;
     Ok(altered("column", col_name.clone()))
 }
 
@@ -334,7 +328,7 @@ fn drop_not_null(
             "cannot DROP NOT NULL on '{col_name}': a primary-key column is non-nullable"
         )));
     }
-    client.alter_drop_not_null(tid, col_idx).map_err(GnitzSqlError::Exec)?;
+    client.alter_drop_not_null(tid, col_idx)?;
     Ok(altered("column", col_name.to_string()))
 }
 
@@ -402,9 +396,7 @@ fn drop_constraint(
     if !alter_base_table_exists(client, schema_name, &source_name, tbl_if_exists, "DROP CONSTRAINT")? {
         return Ok(altered("constraint", name.to_string()));
     }
-    client
-        .drop_index_by_name(name, constraint_if_exists)
-        .map_err(GnitzSqlError::Exec)?;
+    client.drop_index_by_name(name, constraint_if_exists)?;
     Ok(altered("constraint", name.to_string()))
 }
 
@@ -421,10 +413,7 @@ fn alter_base_table_exists(
     op: &str,
 ) -> Result<bool, GnitzSqlError> {
     validate_user_name(source_name)?;
-    match client
-        .resolve_relation_kind(schema_name, source_name)
-        .map_err(GnitzSqlError::Exec)?
-    {
+    match client.resolve_relation_kind(schema_name, source_name)? {
         None if if_exists => Ok(false),
         None => Err(missing("Table", schema_name, source_name)),
         // No class but a base table has a column shape to ALTER: a view is
@@ -458,9 +447,7 @@ fn resolve_alter_base_table_with_schema(
         return Ok(None);
     }
     // Second call, but a memo hit inside the statement bracket: no round trip.
-    let (tid, schema) = client
-        .resolve_table_id(schema_name, source_name)
-        .map_err(GnitzSqlError::Exec)?;
+    let (tid, schema) = client.resolve_table_id(schema_name, source_name)?;
     Ok(Some((tid, schema)))
 }
 

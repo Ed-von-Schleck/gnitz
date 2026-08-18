@@ -276,7 +276,6 @@ impl LeafBinder for Having<'_> {
         // of them at bind time and no key column is ever referenced by a null
         // test — which a PK operand could not express anyway.
         match inner {
-            Expr::Nested(i) => self.bind_null_test(i, want_null),
             Expr::Function(func) => {
                 let m = resolve_having_mapping(func, self.ctx)?;
                 let val_col = self.ctx.agg_col_offset + m.specs_start;

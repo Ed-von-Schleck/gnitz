@@ -9,7 +9,7 @@ use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
 use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::overlay::{buffered_net, present_rows};
-use crate::dml::plan::{bound_and_predicate, fetch_bound, AccessPlan, ReadBudget};
+use crate::dml::plan::{bind_where, fetch_bound, plan_where, AccessPlan, ReadBudget};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
@@ -19,7 +19,8 @@ use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::null_word_set;
 use gnitz_core::{
-    retraction_batch, ColData, GnitzClient, Schema, TypeCode, ViewBuffers, WireConflictMode, ZSetBatch, ZSetBatchView,
+    retraction_batch, ColData, ColumnDef, GnitzClient, Schema, TypeCode, ViewBuffers, WireConflictMode, ZSetBatch,
+    ZSetBatchView,
 };
 use gnitz_expr::Evaluator;
 use gnitz_wire::ReadSink;
@@ -168,12 +169,16 @@ pub(crate) fn resolve_set_target(
 /// set/clear its null bit) or `None` to carry the column through unchanged from
 /// `carry_src`. Shared by UPDATE SET (pk_src == carry_src) and ON CONFLICT DO
 /// UPDATE (PK from the incoming row, carry/null-seed from the existing row).
+///
+/// `payload` is `Schema::payload_columns` collected once by the caller: it
+/// re-scans `pk_cols` per column, which over a large matched set costs more than
+/// the merge itself — the same reason [`RowGather`] resolves its plan up front.
 pub(crate) fn build_merged_row<F>(
     pk_src: &ZSetBatch,
     pk_idx: usize,
     carry_src: &ZSetBatch,
     carry_idx: usize,
-    schema: &Schema,
+    payload: &[(usize, usize, &ColumnDef)],
     dst: &mut ZSetBatch,
     mut resolve: F,
 ) -> Result<(), GnitzSqlError>
@@ -185,7 +190,7 @@ where
     // Seed from the carry source's null word; each assignment flips only its own
     // payload bit (set on a NULL result, clear on non-NULL), unassigned bits ride.
     let mut null_bits = carry_src.nulls[carry_idx];
-    for (payload_idx, ci, col_def) in schema.payload_columns() {
+    for &(payload_idx, ci, col_def) in payload {
         match resolve(ci) {
             Some(cv) => {
                 // The NULL a SET produces at *run* time — an explicit `= NULL`, or
@@ -229,8 +234,9 @@ fn write_set_rows(
     // PK-region rebuild per row.
     let mut bufs = ViewBuffers::default();
     let view = bufs.view(current, schema);
+    let payload: Vec<_> = schema.payload_columns().collect();
     for row_idx in 0..current.len() {
-        build_merged_row(current, row_idx, current, row_idx, schema, dst, |ci| {
+        build_merged_row(current, row_idx, current, row_idx, &payload, dst, |ci| {
             asn_by_col[ci].map(|p| eval_set_program(p, &view, row_idx))
         })?;
     }
@@ -240,23 +246,6 @@ fn write_set_rows(
 // ---------------------------------------------------------------------------
 // WHERE resolution — one read for both verbs, under the sink each one needs
 // ---------------------------------------------------------------------------
-
-/// Bind a single-table UPDATE/DELETE `WHERE` (or its absence) and plan it through
-/// the shared access-path ladder.
-///
-/// Planned once per statement, ahead of the read: the plan depends only on the
-/// schema and the index list, both fixed within this statement's catalog
-/// snapshot, so an RMW retry re-reads but never re-plans. The DML verbs may chunk
-/// a long `pk IN (…)` gather across requests because their RMW driver
-/// preconditions the whole statement on the table being unwritten since the basis.
-fn plan_where<'e>(
-    client: &mut GnitzClient,
-    tid: u64,
-    schema: &Schema,
-    where_expr: Option<&'e BoundExpr>,
-) -> Result<AccessPlan<'e>, GnitzSqlError> {
-    bound_and_predicate(schema, where_expr, ReadBudget::MayChunk, || client.table_indexes(tid))
-}
 
 /// DELETE's read shape: the source PK columns and nothing else. `build_read_projection`
 /// over an empty SELECT list is exactly that — the PK is always prepended, and
@@ -297,26 +286,24 @@ fn resolve_where_matches(
     // can be megabytes of `PkTuple` for a large `pk IN (…)` — so ask only when a
     // transaction is open, which is the condition its doc already states.
     if client.txn_buffer().is_none() {
-        return Ok(committed.unwrap_or_else(|| ZSetBatch::new(reply_schema)));
+        return Ok(committed);
     }
     let (keys, preds) = plan.buffered_scope(schema);
     let net = buffered_net(client, tid, keys.as_deref());
     if net.is_empty() {
-        return Ok(committed.unwrap_or_else(|| ZSetBatch::new(reply_schema)));
+        return Ok(committed);
     }
     let mut present = present_rows(&net, schema);
     let matched = matching_indices(preds, &present, schema)?;
 
-    let n = committed.as_ref().map_or(0, ZSetBatch::len) + matched.len();
+    let n = committed.len() + matched.len();
     let mut eff = ZSetBatch::with_capacity(reply_schema, n);
     let gather = RowGather::new(reply_schema);
-    if let Some(b) = &mut committed {
-        for i in 0..b.len() {
-            // A PK the transaction has written is decided by its buffered version
-            // below, whatever the committed row said.
-            if !net.contains_key(&b.pks.get_tuple(i)) {
-                gather.take(b, i, &mut eff);
-            }
+    for i in 0..committed.len() {
+        // A PK the transaction has written is decided by its buffered version
+        // below, whatever the committed row said.
+        if !net.contains_key(&committed.pks.get_tuple(i)) {
+            gather.take(&mut committed, i, &mut eff);
         }
     }
     for i in matched {
@@ -362,22 +349,21 @@ pub(crate) fn execute_update(
         .map(|(ci, e)| Ok((*ci, classify_set_rhs(e, *ci, &schema)?)))
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
 
-    let where_expr = selection.as_ref().map(|s| bind_single_table(s, &schema)).transpose()?;
-    let plan = plan_where(client, table_id, &schema, where_expr.as_ref())?;
+    let where_expr = bind_where(&schema, selection.as_ref())?;
+    let plan = plan_where(client, table_id, &schema, where_expr.as_ref(), ReadBudget::MayChunk)?;
     let sink = ReadSink::all_rows();
 
     // Read the target rows and build the SET batch under the RMW driver: an
     // autocommit UPDATE commits it lose-update-free via a one-precondition TXN
     // frame with bounded retry; inside a transaction it buffers and records the
     // read-set. The build re-runs per retry so a conflict re-reads fresh state.
-    let count = commit_rmw_or_buffer(client, &table_name, table_id, |client| {
+    let count = commit_rmw_or_buffer(client, &table_name, table_id, &schema, |client| {
         let matched = resolve_where_matches(client, table_id, &schema, &plan, &sink, &schema)?;
         let count = matched.len();
         let write = if count > 0 {
             let mut updates = ZSetBatch::with_capacity(&schema, count);
             write_set_rows(&matched, &programs, &schema, &mut updates)?;
             Some(RmwWrite {
-                schema: (*schema).clone(),
                 batch: updates,
                 mode: WireConflictMode::Update,
             })
@@ -411,12 +397,8 @@ pub(crate) fn execute_delete(
 
     let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
 
-    let where_expr = del
-        .selection
-        .as_ref()
-        .map(|s| bind_single_table(s, &schema))
-        .transpose()?;
-    let plan = plan_where(client, table_id, &schema, where_expr.as_ref())?;
+    let where_expr = bind_where(&schema, del.selection.as_ref())?;
+    let plan = plan_where(client, table_id, &schema, where_expr.as_ref(), ReadBudget::MayChunk)?;
     let (reply_schema, sink) = pk_only_reply(&schema)?;
 
     // Resolve the target PKs and build the retraction batch under the RMW driver
@@ -427,12 +409,11 @@ pub(crate) fn execute_delete(
     // `retraction_batch` fills, so an in-transaction DELETE buffers under the same
     // schema INSERT does (`TxnBuffer` extends a tid's later batches into the first
     // family's schema).
-    let count = commit_rmw_or_buffer(client, &table_name, table_id, |client| {
+    let count = commit_rmw_or_buffer(client, &table_name, table_id, &schema, |client| {
         let matched = resolve_where_matches(client, table_id, &schema, &plan, &sink, &reply_schema)?;
         let pks = matched.pks;
         let count = pks.len();
         let write = (count > 0).then(|| RmwWrite {
-            schema: (*schema).clone(),
             batch: retraction_batch(&schema, pks),
             mode: WireConflictMode::Update,
         });
@@ -631,7 +612,8 @@ mod tests {
 
         // Resolver: assign v = NULL (must SET its null bit); leave b unassigned (carry).
         let mut dst = ZSetBatch::new(&schema);
-        build_merged_row(&pk_src, 0, &carry_src, 0, &schema, &mut dst, |ci| {
+        let payload: Vec<_> = schema.payload_columns().collect();
+        build_merged_row(&pk_src, 0, &carry_src, 0, &payload, &mut dst, |ci| {
             if ci == 1 {
                 Some(ColumnValue::Null)
             } else {

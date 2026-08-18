@@ -105,9 +105,7 @@ pub(crate) fn execute_create_view(
 
     let mut chain = ViewChain::new();
     let final_vid = build_query_segments(client, query, binder, &mut chain, view_name, sql_text, capacity)?;
-    client
-        .create_view_chain(schema_name, chain.segments, None)
-        .map_err(GnitzSqlError::Exec)?;
+    client.create_view_chain(schema_name, chain.segments, None)?;
     Ok(SqlResult::ViewCreated { view_id: final_vid })
 }
 
@@ -167,9 +165,7 @@ pub(crate) fn execute_alter_view(
     // view-dependency guard (re-evaluated under the catalog write lock) still
     // rejects the retraction if dependents exist — RESTRICT, and nothing is torn
     // down when it fires.
-    client
-        .create_view_chain(schema_name, chain.segments, Some(&view_name))
-        .map_err(GnitzSqlError::Exec)?;
+    client.create_view_chain(schema_name, chain.segments, Some(&view_name))?;
 
     Ok(SqlResult::Altered {
         object: "view".to_string(),
@@ -180,10 +176,7 @@ pub(crate) fn execute_alter_view(
 /// Resolve `name` to a VIEW id, rejecting `ALTER VIEW <table>` and a missing
 /// relation.
 fn resolve_view_id(client: &mut GnitzClient, schema_name: &str, name: &str) -> Result<u64, GnitzSqlError> {
-    match client
-        .resolve_relation_kind(schema_name, name)
-        .map_err(GnitzSqlError::Exec)?
-    {
+    match client.resolve_relation_kind(schema_name, name)? {
         // `ALTER VIEW … AS` re-renders its body as a bare `CREATE VIEW … AS …`,
         // dropping any option clause — so retargeting a bounded view would
         // silently convert it into an unbounded one.

@@ -9,7 +9,7 @@ use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::codec::pk_codec::{extract_pk_value_mapped, is_null_expr};
 use crate::dml::mutate::{build_merged_row, classify_set_rhs, eval_set_program, resolve_set_target, SetProgram};
-use crate::dml::overlay::effective_row;
+use crate::dml::overlay::effective_rows;
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::{project, resolve_projection, RowGather};
@@ -198,6 +198,11 @@ pub(crate) fn execute_insert(
         }
     }
     let stride = schema.pk_stride() as u8;
+    // The row count is known here, so the whole statement's ids come from one
+    // durable advance rather than one per 64 rows.
+    if is_serial {
+        client.reserve_serial_ids(tid, n as u64)?;
+    }
 
     for row in rows {
         // Standard SQL rejects a VALUES row whose arity differs from the expected
@@ -292,23 +297,20 @@ pub(crate) fn execute_insert(
         }
         ConflictPlan::DoNothingPk => {
             // Client-side filter: drop any row whose PK already exists — buffered
-            // or committed (see `effective_row`). Resolving against the buffer is
+            // or committed (see `effective_rows`). Resolving against the buffer is
             // what stops two DO NOTHING inserts of one new PK from buffering two
             // `+1` Error rows and tripping the commit-time per-family duplicate
             // check. De-duplicate intra-batch (first-wins) before pushing. The
             // filter re-runs per RMW retry against fresh committed state; the
             // incoming VALUES batch (already built, ids drawn) is reused as-is.
-            let count = commit_rmw_or_buffer(client, &table_name_str, tid, |client| {
-                let (filtered, surviving_count) = client_side_filter_do_nothing(client, tid, &schema, &batch)?;
-                let write = (surviving_count > 0).then(|| RmwWrite {
-                    schema: (*schema).clone(),
+            let count = commit_rmw_or_buffer(client, &table_name_str, tid, &schema, |client| {
+                let filtered = client_side_filter_do_nothing(client, tid, &schema, &batch)?;
+                let count = filtered.len();
+                let write = (count > 0).then_some(RmwWrite {
                     batch: filtered,
                     mode: WireConflictMode::Error,
                 });
-                Ok(RmwBuild {
-                    count: surviving_count,
-                    write,
-                })
+                Ok(RmwBuild { count, write })
             })?;
             Ok(SqlResult::RowsAffected { count })
         }
@@ -318,10 +320,9 @@ pub(crate) fn execute_insert(
             // freshest `x`. Update mode: the merged batch carries both +1 merged
             // rows (which may UPSERT) and untouched +1 rows for non-conflicting
             // inserts; workers do the retract-and-insert via enforce_unique_pk.
-            let count = commit_rmw_or_buffer(client, &table_name_str, tid, |client| {
+            let count = commit_rmw_or_buffer(client, &table_name_str, tid, &schema, |client| {
                 let merged = client_side_merge_do_update(client, tid, &schema, &batch, &assignments)?;
-                let write = (!merged.pks.is_empty()).then(|| RmwWrite {
-                    schema: (*schema).clone(),
+                let write = (!merged.pks.is_empty()).then_some(RmwWrite {
                     batch: merged,
                     mode: WireConflictMode::Update,
                 });
@@ -409,31 +410,31 @@ fn client_side_filter_do_nothing(
     tid: u64,
     schema: &Schema,
     batch: &ZSetBatch,
-) -> Result<(ZSetBatch, usize), GnitzSqlError> {
+) -> Result<ZSetBatch, GnitzSqlError> {
+    let keys: Vec<PkTuple> = (0..batch.pks.len()).map(|i| batch.pks.get_tuple(i)).collect();
+    // A PK the transaction buffered as live conflicts; one it buffered as deleted
+    // does not; an untouched PK falls through to the committed store.
+    let (_, existing) = effective_rows(client, tid, schema, &keys)?;
+
     let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::new();
     let mut surviving_indices: Vec<usize> = Vec::with_capacity(batch.pks.len());
-
-    for i in 0..batch.pks.len() {
-        let pk = batch.pks.get_tuple(i);
+    for (i, pk) in keys.iter().enumerate() {
         // Intra-batch duplicate: drop everything after the first.
-        if !seen_pks.insert(pk) {
+        if !seen_pks.insert(*pk) {
             continue;
         }
-        // A PK the transaction buffered as live conflicts; one it buffered as
-        // deleted does not; an untouched PK falls through to the committed store.
-        if effective_row(client, tid, schema, &pk)?.is_some() {
+        if existing.contains_key(pk) {
             continue;
         }
         surviving_indices.push(i);
     }
 
-    let n = surviving_indices.len();
-    let mut out = ZSetBatch::with_capacity(schema, n);
+    let mut out = ZSetBatch::with_capacity(schema, surviving_indices.len());
     let gather = RowGather::new(schema);
     for &i in &surviving_indices {
         gather.copy(batch, i, &mut out);
     }
-    Ok((out, n))
+    Ok(out)
 }
 
 /// Build a merged batch for ON CONFLICT DO UPDATE:
@@ -459,22 +460,28 @@ fn client_side_merge_do_update(
         asn_by_col[*ci] = Some(rhs);
     }
 
+    let keys: Vec<PkTuple> = (0..batch.pks.len()).map(|i| batch.pks.get_tuple(i)).collect();
+    // The effective existing rows — a row the transaction buffered is both the
+    // merge's carry source AND the `Existing` scope's evaluation base, so
+    // `SET x = x + 1` reads the buffered `x`; a buffered delete is no conflict,
+    // and an untouched PK falls through to the committed store.
+    let (rows, existing) = effective_rows(client, tid, schema, &keys)?;
+
     let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::new();
     let mut out = ZSetBatch::with_capacity(schema, batch.pks.len());
     let gather = RowGather::new(schema);
 
-    // Two buffer sets, not one: the `excluded` view holds `&mut bufs_excluded`
-    // for the whole loop, so a second concurrent view over the same buffers would
-    // be `&mut` against a live `&mut`. The `existing` view is rebuilt per
-    // iteration over an owned ≤1-row batch, which NLL re-borrows cleanly and
-    // which is dwarfed by `effective_row`'s per-row seek round trip.
+    // Two buffer sets, not one: each view holds its `&mut` for the whole loop, so
+    // a single set could not carry both. Both are built once — the resolved rows
+    // are one batch, so the `existing` view no longer has to be rebuilt per row.
     let mut bufs_excluded = ViewBuffers::default();
     let mut bufs_existing = ViewBuffers::default();
     let excluded_view = bufs_excluded.view(batch, schema);
+    let existing_view = bufs_existing.view(&rows, schema);
+    let payload: Vec<_> = schema.payload_columns().collect();
 
-    for i in 0..batch.pks.len() {
-        let pk = batch.pks.get_tuple(i);
-        if !seen_pks.insert(pk) {
+    for (i, pk) in keys.iter().enumerate() {
+        if !seen_pks.insert(*pk) {
             return Err(GnitzSqlError::Bind(
                 "ON CONFLICT DO UPDATE cannot affect row a second time \
                  (duplicate PK in the same batch)"
@@ -482,23 +489,16 @@ fn client_side_merge_do_update(
             ));
         }
 
-        // The effective existing row — a row the transaction buffered is both the
-        // merge's carry source AND the `Existing` scope's evaluation base, so
-        // `SET x = x + 1` reads the buffered `x`; a buffered delete is no
-        // conflict, and an untouched PK falls through to the committed store.
-        let existing = effective_row(client, tid, schema, &pk)?;
-
-        match &existing {
+        match existing.get(pk) {
             None => {
                 gather.copy(batch, i, &mut out);
             }
-            Some(ex) => {
-                // The stored row is always row 0 of the ≤1-row `effective_row`
-                // batch; the incoming row is row `i` of the VALUES batch.
-                let existing_view = bufs_existing.view(ex, schema);
-                build_merged_row(batch, i, ex, 0, schema, &mut out, |ci| {
+            Some(&row) => {
+                // The stored row is `row` of the resolved batch; the incoming row
+                // is row `i` of the VALUES batch.
+                build_merged_row(batch, i, &rows, row, &payload, &mut out, |ci| {
                     asn_by_col[ci].map(|rhs| match rhs {
-                        BoundUpdateExpr::Existing(p) => eval_set_program(p, &existing_view, 0),
+                        BoundUpdateExpr::Existing(p) => eval_set_program(p, &existing_view, row),
                         BoundUpdateExpr::Excluded(p) => eval_set_program(p, &excluded_view, i),
                     })
                 })?;

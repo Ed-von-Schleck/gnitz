@@ -33,13 +33,16 @@ fn encode_numeric(buf: &mut Vec<u8>, fi: FixedInt, value: i64) {
 }
 
 pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Expr) -> Result<(), GnitzSqlError> {
-    // sqlparser parses negative number literals as UnaryOp(Minus, Number(...)).
-    // Unwrap here so the rest of the function sees a plain Value::Number.
+    // sqlparser lexes a literal's sign as a separate unary operator, so `+5` and
+    // `-5` are both `UnaryOp`, never a bare `Value::Number`. Both signs unwrap
+    // here for the same reason `pk_codec::extract_sql_literal` accepts both: the
+    // PK slot and the payload slot of one INSERT row must agree on what a signed
+    // literal is.
     let (val_expr, negated) = match val_expr {
         Expr::UnaryOp {
-            op: UnaryOperator::Minus,
+            op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
             expr,
-        } => (expr.as_ref(), true),
+        } => (expr.as_ref(), matches!(op, UnaryOperator::Minus)),
         e => (e, false),
     };
 
@@ -311,5 +314,22 @@ mod tests {
         let big_val: u128 = 0x550e8400_e29b_41d4_a716_446655440000_u128;
         append_value_to_col(&mut batch.columns[1], TypeCode::UUID, &num_expr(&big_val.to_string())).unwrap();
         assert_eq!(uuid_cell(&batch.columns[1]), big_val);
+    }
+
+    /// A leading `+` reaches the payload slot the same way it reaches the PK
+    /// slot: `pk_codec::extract_sql_literal` accepts both signs, so one INSERT
+    /// row must not take `+1` for its key and refuse `+2` for its payload.
+    #[test]
+    fn a_unary_plus_literal_is_accepted_like_the_pk_slot_accepts_it() {
+        let plus = Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr: Box::new(num_expr("2")),
+        };
+        let mut col = ColData::Fixed(Vec::new());
+        append_value_to_col(&mut col, TypeCode::U32, &plus).expect("`+2` must bind");
+        let ColData::Fixed(b) = &col else {
+            panic!("expected Fixed")
+        };
+        assert_eq!(b.as_slice(), 2u32.to_le_bytes());
     }
 }

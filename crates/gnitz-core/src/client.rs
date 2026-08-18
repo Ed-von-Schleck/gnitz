@@ -354,6 +354,31 @@ impl GnitzClient {
         Ok(batch)
     }
 
+    /// Reserve at least `count` SERIAL ids for `table_id` in **one** master round
+    /// trip, so a multi-row INSERT that knows its row count up front pays one
+    /// fsynced durable advance instead of `ceil(count / SERIAL_RANGE_SIZE)` of
+    /// them. Any tail left in the previous range is abandoned — the same
+    /// intentional, PostgreSQL-style gap a refill already leaves.
+    pub fn reserve_serial_ids(&mut self, table_id: u64, count: u64) -> Result<(), ClientError> {
+        let held = self
+            .serial_cache
+            .get(&table_id)
+            .map_or(0, |r| r.end.saturating_sub(r.next));
+        if held >= count {
+            return Ok(());
+        }
+        let want = count.max(SERIAL_RANGE_SIZE);
+        let base = self.session.alloc_serial_range(table_id, want)?;
+        self.serial_cache.insert(
+            table_id,
+            SerialRange {
+                next: base,
+                end: base + want,
+            },
+        );
+        Ok(())
+    }
+
     /// Draw the next SERIAL id for `table_id` from the per-connection range
     /// cache, refilling from the master's durable sequence when the range is
     /// exhausted. Ids are contiguous within a range; a refill may leave a gap
@@ -662,8 +687,7 @@ impl GnitzClient {
     /// against the taken set. Reads the same slots `create_index` writes and
     /// `drop_index_by_name` reads.
     pub fn index_name_cols(&mut self) -> Result<Vec<(String, gnitz_wire::PkColList)>, ClientError> {
-        let (_, idx_batch, _) = self.session.scan(IDX_TAB)?;
-        let Some(idx_batch) = idx_batch else {
+        let Some(idx_batch) = self.scan_catalog(IDX_TAB)? else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();

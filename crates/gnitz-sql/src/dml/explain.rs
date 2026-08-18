@@ -10,10 +10,8 @@
 
 use crate::access::pk_point_tuple;
 use crate::bind::Binder;
-use crate::dml::plan::AccessPlan;
-use crate::dml::select::{
-    bind_where, build_fold_shape, build_rows_shape, plan_where, route_select, FoldShape, Route, Sink, Target,
-};
+use crate::dml::plan::{bind_where, plan_where, AccessPlan, ReadBudget};
+use crate::dml::select::{build_fold_shape, build_rows_shape, route_select, FoldShape, Route, Sink, Target};
 use crate::error::GnitzSqlError;
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TypeCode, ZSetBatch};
@@ -33,7 +31,7 @@ pub(crate) fn execute_explain(
     // The same WHERE → plan the tails build. A route with no WHERE short-circuits
     // inside `bound_and_predicate` without an index probe, so this stays free.
     let bound_where = bind_where(schema, select.selection.as_ref())?;
-    let plan = plan_where(client, target.tid, schema, bound_where.as_ref())?;
+    let plan = plan_where(client, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
 
     // Line 4 is the sink's own shape: what the fold accumulates, or how wide the
     // projected reply is.

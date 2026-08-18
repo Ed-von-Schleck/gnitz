@@ -1958,7 +1958,7 @@ fn test_residual_mixed_string_int_rejected() {
 /// The join `AliasMap` is keyed by lowercased aliases, but the case-preserving
 /// dialect hands the ON clause the raw spelling. An uppercase `A` referencing
 /// alias `a` must still resolve (SQL identifiers are case-insensitive). Bug path:
-/// `ON A.x` routes through resolve_join_col_ref -> resolve_qualified_column("A", ...).
+/// `ON A.x` resolves through the join scope's qualified-reference lookup.
 #[test]
 fn test_join_uppercase_alias_in_on_clause() {
     let srv = match ServerHandle::start() {

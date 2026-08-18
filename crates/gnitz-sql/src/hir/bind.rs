@@ -19,7 +19,7 @@ use crate::ast_util::{
     flatten_conjuncts, for_each_agg_call, group_by_exprs, has_exists_in_subquery, has_scalar_subquery, is_agg_call,
     is_name_preserving_wildcard_projection, peel_nested, projection_item_expr, reject_computed_grouped_item,
     reject_ungrouped_column, reject_unsupported_fn_qualifiers, scalar_projection_item, single_relation_col_name,
-    FromShape,
+    unknown_function, FromShape,
 };
 use crate::bind::{apply_positional_aliases, cte_passthrough};
 use crate::bind::{bind_structural, find_unique_column, fold_null_test, single_relation_col_idx, Binder, LeafBinder};
@@ -309,10 +309,10 @@ fn expand_wildcard(
 }
 
 /// Resolve every SELECT item into a `ProjEntry` in SELECT order, expanding a bare
-/// `*` via [`expand_wildcard`]. This is `resolve_projection_items` over the HIR
-/// leaf; the pass-through-vs-computed split, `_expr{idx}` naming,
-/// hardcoded-`true` computed nullability, and `infer_type` typing are the same
-/// rules `resolve_proj_col` fixes.
+/// `*` via [`expand_wildcard`]. The HIR-leaf counterpart of the ad-hoc read
+/// path's `resolve_proj_col`: the pass-through-vs-computed split, `_expr{idx}`
+/// naming, hardcoded-`true` computed nullability, and `infer_type` typing are
+/// the same rules, so a view and a SELECT name and type a projection alike.
 fn bind_projection<L: LeafBinder<HirRef>>(
     projection: &[SelectItem],
     env: &[HirCol],
@@ -323,9 +323,8 @@ fn bind_projection<L: LeafBinder<HirRef>>(
     let mut items = Vec::new();
     for (idx, item) in projection.iter().enumerate() {
         match item {
-            // Only a *bare* `*` expands (a `tbl.*` QualifiedWildcard is not a
-            // single-table projection item — it falls to the `_` reject arm, as in
-            // `resolve_projection_items`).
+            // Only a *bare* `*` expands: a `tbl.*` QualifiedWildcard is not a
+            // single-table projection item, so it falls to the `_` reject arm.
             SelectItem::Wildcard(_) => items.extend(expand_wildcard(item, env, ctx, ids)?),
             _ => {
                 let (expr, alias) = scalar_projection_item(item, ctx)?;
@@ -402,20 +401,14 @@ impl LeafBinder<HirRef> for HirSingleTable<'_> {
         Ok(BExpr::ColRef(HirRef::Col(self.resolve(e)?.id)))
     }
     fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
-        // A Simple body has no aggregates (they route to GroupBy). Reject a
-        // function with the standard message: qualifiers first,
-        // then an aggregate (`SUM(x)` in a WHERE fails downstream at compile with
-        // exactly this message), then any other name.
-        reject_unsupported_fn_qualifiers(f, "aggregates")?;
-        if is_agg_call(f) {
-            return Err(GnitzSqlError::Unsupported(
-                "aggregate function not allowed in expression context".to_string(),
-            ));
-        }
-        Err(GnitzSqlError::Unsupported(format!(
-            "function '{}' not supported",
-            f.name.to_string().to_ascii_lowercase()
-        )))
+        // A Simple body has no aggregates (they route to GroupBy), so every call
+        // is a rejection. `classify_agg_call` already rejects an unsupported
+        // qualifier and an unknown name; reaching past it means the name *is* an
+        // aggregate, which this context does not admit.
+        classify_agg_call(f)?;
+        Err(GnitzSqlError::Unsupported(
+            "aggregate function not allowed in expression context".to_string(),
+        ))
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
         let c = self.resolve(inner)?;
@@ -487,11 +480,10 @@ impl LeafBinder<HirRef> for SubqueryLeaf<'_, '_, '_> {
         self.inner.bind_function(f)
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
-        let peeled = peel_nested(inner);
-        if !is_subquery_expr(peeled) {
+        if !is_subquery_expr(inner) {
             return self.inner.bind_null_test(inner, want_null);
         }
-        let value = self.bind_sub(peeled)?;
+        let value = self.bind_sub(inner)?;
         if value_never_null(&value) {
             // COUNT / EXISTS / IN — never NULL, so the test folds to a constant.
             return Ok(BExpr::LitInt(i64::from(!want_null)));
@@ -978,8 +970,8 @@ fn bind_join_select(
 
 /// The name-resolution scope of a FROM-join body: all in-scope (null-widened)
 /// `HirCol`s in relation order, plus each relation's lowercased alias and span.
-/// Resolves a qualified/unqualified reference to a `ColId`, mirroring
-/// `resolve_qualified_column` / `resolve_unqualified_column` (same messages).
+/// Resolves a qualified or unqualified reference to a `ColId`, raising the same
+/// not-found and ambiguity messages the single-relation binder does.
 struct JoinScope {
     combined: Vec<HirCol>,
     relations: Vec<(String, Range<usize>)>,
@@ -1077,8 +1069,7 @@ fn join_leaf(scope: &JoinScope) -> JoinLeaf<'_> {
 }
 
 impl JoinLeaf<'_> {
-    /// A qualified / unqualified / parenthesized column reference → its `ColId`
-    /// (mirrors `resolve_join_col_ref`, which unwraps `Nested`).
+    /// A qualified / unqualified / parenthesized column reference → its `ColId`.
     fn col_id(&self, e: &Expr) -> Result<ColId, GnitzSqlError> {
         match e {
             Expr::Identifier(id) => self.scope.resolve_unqualified(&id.value),
@@ -1097,7 +1088,10 @@ impl LeafBinder<HirRef> for JoinLeaf<'_> {
     fn bind_column(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         Ok(BExpr::ColRef(HirRef::Col(self.col_id(e)?)))
     }
-    fn bind_function(&self, _f: &Function) -> Result<HirExpr, GnitzSqlError> {
+    fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
+        // Classify first, so an unknown or malformed call is named as such —
+        // reaching past it means the name really is an aggregate.
+        classify_agg_call(f)?;
         Err(GnitzSqlError::Unsupported(
             "JOIN ON: aggregate functions are not allowed".into(),
         ))
@@ -1369,14 +1363,10 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
         // so HAVING states it rather than delegating to the FROM leaf — a join
         // leaf's wording names its own clause and would report "JOIN ON".
         reject_unsupported_fn_qualifiers(f, "aggregates")?;
-        Err(GnitzSqlError::Unsupported(format!(
-            "function '{}' not supported",
-            f.name.to_string().to_ascii_lowercase()
-        )))
+        Err(unknown_function(f))
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
-        let peeled = peel_nested(inner);
-        if let Expr::Function(f) = peeled {
+        if let Expr::Function(f) = inner {
             if is_agg_call(f) {
                 let ga = self.find_agg(f)?;
                 return Ok(finalize_agg_null_test(
@@ -1388,13 +1378,13 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
             }
         }
         // A bare group-column reference; anything else (an arithmetic expression)
-        // gets the old aggregate-or-group-column rejection.
-        if single_relation_col_name(peeled).is_none() {
+        // is neither an aggregate nor a group column, and is rejected as such.
+        if single_relation_col_name(inner).is_none() {
             return Err(GnitzSqlError::Unsupported(
                 "HAVING: IS [NOT] NULL is only supported on an aggregate or a group column".into(),
             ));
         }
-        let (id, nullable) = self.resolve_group(peeled)?;
+        let (id, nullable) = self.resolve_group(inner)?;
         Ok(fold_null_test(nullable, HirRef::Col(id), want_null))
     }
 }

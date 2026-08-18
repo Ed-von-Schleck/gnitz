@@ -17,10 +17,11 @@ pub(crate) enum AggFunc {
 
 /// The bound-expression IR, generic over its leaf reference type `R`. The three
 /// leaf positions (`ColRef`, `IsNull`, `IsNotNull`) carry an `R`; every other
-/// variant is structural and leaf-agnostic. The runtime IR pins `R = usize`
-/// (the [`BoundExpr`] alias) — a resolved column index into a batch schema — and
-/// every existing consumer names that alias. A future view-side leaf type will
-/// instantiate `R` as a column-identity reference without touching the enum.
+/// variant is structural and leaf-agnostic. Two instantiations are live: the
+/// ad-hoc read path pins `R = usize` (the [`BoundExpr`] alias) — a resolved
+/// column index into a batch schema — and the view path pins `R = HirRef`, a
+/// column identity that survives the structural rewrites. Neither needed a
+/// change to this enum.
 #[derive(Clone, Debug)]
 pub(crate) enum BExpr<R> {
     ColRef(R),
@@ -199,7 +200,7 @@ impl<R> BExpr<R> {
                 let rt = r.infer_type_with(leaf_ty);
                 match op {
                     // Comparisons and the connectives are boolean.
-                    o if o.is_comparison() => TypeCode::I64,
+                    o if o.as_cmp().is_some() => TypeCode::I64,
                     BinOp::And | BinOp::Or => TypeCode::I64,
                     BinOp::Concat => TypeCode::String,
                     // Arithmetic preserves U64 (and floats), mirroring the engine's
@@ -281,8 +282,10 @@ enum Leaf<'a, R> {
 
 impl<R> BExpr<R> {
     /// Rebuild the expression structurally, handing each leaf-bearing position to
-    /// `leaf`. The **one** structural walk: every other arm just recurses, so a
+    /// `leaf`. The one **rebuilding** walk: every other arm just recurses, so a
     /// new `BExpr` variant is added here once rather than to each caller below.
+    /// (`for_each_ref` is the read-only twin, and `infer_type_with` the typing
+    /// one; a new variant fails to compile in all three.)
     ///
     /// `leaf` returns a whole `BExpr<S>`, not a reference, which is what lets the
     /// two instantiations differ in kind — one keeps a leaf a leaf, the other
@@ -484,13 +487,21 @@ pub(crate) enum BinOp {
 
 impl BinOp {
     /// The six ordering/equality operators — the ones defined on every scalar
-    /// domain, and the only ones defined on strings. The single spelling of that
-    /// set.
-    fn is_comparison(self) -> bool {
-        matches!(
-            self,
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-        )
+    /// domain, and the only ones defined on strings — mapped to the opcode that
+    /// computes them. The single spelling of that set: returning the `CmpOp`
+    /// rather than a `bool` means the lowerer reads the mapping off this one
+    /// match instead of re-enumerating the six with a catch-all arm.
+    pub(crate) fn as_cmp(self) -> Option<gnitz_expr::CmpOp> {
+        use gnitz_expr::CmpOp;
+        match self {
+            BinOp::Eq => Some(CmpOp::Eq),
+            BinOp::Ne => Some(CmpOp::Ne),
+            BinOp::Lt => Some(CmpOp::Lt),
+            BinOp::Le => Some(CmpOp::Le),
+            BinOp::Gt => Some(CmpOp::Gt),
+            BinOp::Ge => Some(CmpOp::Ge),
+            _ => None,
+        }
     }
 
     /// The order-reversing converse: `x OP y` ⟺ `y OP.converse() x`. Only the

@@ -17,11 +17,10 @@
 use crate::error::GnitzSqlError;
 use gnitz_core::{ClientError, GnitzClient, Schema, WireConflictMode, ZSetBatch};
 
-/// The write an RMW statement produces after reading: the schema to push against
-/// (the wire reply's schema when it overrode the catalog's, else the catalog's),
-/// the batch, and the conflict mode.
+/// The write an RMW statement produces after reading: the batch and the conflict
+/// mode. It is always pushed against the table's catalog schema, which
+/// [`commit_rmw_or_buffer`] takes once rather than each build attempt cloning it.
 pub(crate) struct RmwWrite {
-    pub schema: Schema,
     pub batch: ZSetBatch,
     pub mode: WireConflictMode,
 }
@@ -48,6 +47,7 @@ pub(crate) fn commit_rmw_or_buffer<F>(
     client: &mut GnitzClient,
     table_name: &str,
     tid: u64,
+    schema: &Schema,
     mut build: F,
 ) -> Result<usize, GnitzSqlError>
 where
@@ -59,7 +59,7 @@ where
     if client.txn_active() {
         let RmwBuild { count, write } = build(client)?;
         if let Some(w) = write {
-            client.txn_push_rmw(tid, &w.schema, &w.batch, w.mode);
+            client.txn_push_rmw(tid, schema, &w.batch, w.mode);
         }
         return Ok(count);
     }
@@ -73,7 +73,7 @@ where
         let Some(w) = write else {
             return Ok(count);
         };
-        match client.commit_rmw(tid, &w.schema, &w.batch, w.mode, basis) {
+        match client.commit_rmw(tid, schema, &w.batch, w.mode, basis) {
             Ok(_lsn) => return Ok(count),
             Err(ClientError::TxnConflict { fresh_basis }) => basis = fresh_basis,
             Err(e) => return Err(GnitzSqlError::Exec(e)),

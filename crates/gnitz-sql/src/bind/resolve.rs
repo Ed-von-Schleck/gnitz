@@ -125,9 +125,7 @@ impl<'a> Binder<'a> {
         // on insert (`cache_alias` validates; `cache_relation` is fed from these
         // already-validated probes), never a raw `__h…` catalog name.
         crate::validate::validate_user_name(name)?;
-        let (schema, rel) = client
-            .resolve_relation(self.schema_name, name)
-            .map_err(GnitzSqlError::Exec)?;
+        let (schema, rel) = client.resolve_relation(self.schema_name, name)?;
         // Leaf rule. A bounded view's store keeps only skeleton rows past its
         // capacity, and hydrating them replays *sources* — so a view over one
         // would have to hydrate through it, and its own store would be a second
@@ -169,9 +167,7 @@ impl<'a> Binder<'a> {
         name: &str,
     ) -> Result<(u64, Arc<Schema>), GnitzSqlError> {
         crate::validate::validate_user_name(name)?;
-        let (schema, rel) = client
-            .resolve_relation(self.schema_name, name)
-            .map_err(GnitzSqlError::Exec)?;
+        let (schema, rel) = client.resolve_relation(self.schema_name, name)?;
         if rel.class != RelClass::Table {
             return Err(GnitzSqlError::Unsupported(format!(
                 "'{name}' is a {}; UPDATE, DELETE and CREATE INDEX require a base table",
@@ -193,9 +189,7 @@ impl<'a> Binder<'a> {
         name: &str,
     ) -> Result<(u64, Arc<Schema>, RelClass), GnitzSqlError> {
         crate::validate::validate_user_name(name)?;
-        let (schema, rel) = client
-            .resolve_relation(self.schema_name, name)
-            .map_err(GnitzSqlError::Exec)?;
+        let (schema, rel) = client.resolve_relation(self.schema_name, name)?;
         if rel.class.is_view() {
             return Err(GnitzSqlError::Unsupported(format!(
                 "'{name}' is a {}; INSERT requires a base table or a stream",

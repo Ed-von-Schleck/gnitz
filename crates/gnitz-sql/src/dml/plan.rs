@@ -6,10 +6,7 @@
 //! and recognition itself lives in the `access` leaf. `select` and `mutate` sink
 //! into this module; it never references either.
 
-use crate::access::{
-    best_index_bound, pk_bound_is_preemptible, pk_point_tuple, try_extract_pk_in, try_extract_pk_range,
-    IndexRangeCandidate,
-};
+use crate::access::{best_index_bound, pk_point_tuple, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate};
 use crate::ast_util::expr_usize_literal;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_predicate;
@@ -83,6 +80,20 @@ impl<'e> AccessPlan<'e> {
         }
     }
 
+    /// A plan that gathers exactly `keys`. There is no WHERE behind it, so no
+    /// predicate ships and nothing stays residual — the gather *is* the whole
+    /// selection. INSERT's ON CONFLICT paths need the committed rows for a key
+    /// set they already hold, which is this bound with the recognizer ladder
+    /// skipped rather than re-derived from a synthetic `pk IN (…)`.
+    pub(super) fn for_pk_set(keys: Vec<u128>) -> Self {
+        AccessPlan {
+            bound: ReadBound::PkSet(keys),
+            predicate: Vec::new(),
+            where_expr: None,
+            residual: Vec::new(),
+        }
+    }
+
     /// The walk this plan pushes down. Read-only: running still needs the private
     /// compiled predicate, so [`fetch_bound`] stays the only way to execute a plan.
     pub(super) fn bound(&self) -> &ReadBound {
@@ -94,6 +105,31 @@ impl<'e> AccessPlan<'e> {
     pub(super) fn has_predicate(&self) -> bool {
         !self.predicate.is_empty()
     }
+}
+
+/// Plan `where_expr` against `tid`'s indexes under `budget`. The one wrapper over
+/// [`bound_and_predicate`] that owns the index-probe closure, so every read verb
+/// states only the budget it needs — the single axis they disagree on.
+///
+/// The caller owns the bound WHERE, because the plan borrows its conjuncts.
+pub(crate) fn plan_where<'e>(
+    client: &mut GnitzClient,
+    tid: u64,
+    schema: &Schema,
+    where_expr: Option<&'e BoundExpr>,
+    budget: ReadBudget,
+) -> Result<AccessPlan<'e>, GnitzSqlError> {
+    bound_and_predicate(schema, where_expr, budget, || client.table_indexes(tid))
+}
+
+/// Bind a single-table `WHERE` (or its absence) for [`plan_where`].
+pub(crate) fn bind_where(
+    schema: &Schema,
+    where_expr: Option<&sqlparser::ast::Expr>,
+) -> Result<Option<BoundExpr>, GnitzSqlError> {
+    where_expr
+        .map(|we| crate::bind::bind_single_table(we, schema))
+        .transpose()
 }
 
 /// Bind-once WHERE → the access plan that serves it. The one way any statement
@@ -110,7 +146,7 @@ impl<'e> AccessPlan<'e> {
 /// `fetch_indexes` is the index-list probe, injected so the ladder stays
 /// client-free; it is called at most once per statement (`best_index_bound`
 /// memoizes across its two collectors, and the ladder reaches it once).
-pub(crate) fn bound_and_predicate<'e, F>(
+fn bound_and_predicate<'e, F>(
     schema: &Schema,
     where_expr: Option<&'e BoundExpr>,
     budget: ReadBudget,
@@ -150,7 +186,12 @@ where
     // every column of a UNIQUE index is available: that admits one row where an
     // unpinned PK range admits the table.
     if let Some((desc, residual)) = try_extract_pk_range(bound_where, schema) {
-        if pk_bound_is_preemptible(&desc, bound_where, schema) {
+        // Only a descriptor that pins nothing is worth giving up: one that pins a
+        // leading PK column can share the distribution prefix and unicast to one
+        // worker (an `IndexRange` never does), and a full-PK point already admits
+        // one row. Whether an index can actually beat it is the `is_unique_point`
+        // filter below — the one place that question is answered.
+        if desc.eq_vals().is_empty() && !desc.is_point() {
             // The index arm re-imposes more of the WHERE than the PK arm's
             // residual, so it can need a conjunct the VM refuses (a wide literal,
             // a U128 column) that the PK walk consumes byte-exactly. Keep the PK
@@ -261,25 +302,20 @@ fn compile_read_spec_predicate(exprs: &[&BoundExpr], schema: &Schema) -> Result<
 /// A `PkSet` is chunked at `MAX_PK_SET_KEYS` — the decoder's per-gather cap —
 /// which is what lets a [`ReadBudget::MayChunk`] caller plan a gather of any
 /// length; every other bound is one request. Absent keys contribute no rows, so
-/// a count taken off the reply reports rows actually touched.
+/// a count taken off the reply reports rows actually touched. An empty result is
+/// an empty batch, not an absent one — no caller distinguishes the two.
 pub(crate) fn fetch_bound(
     client: &mut GnitzClient,
     table_id: u64,
     plan: &AccessPlan<'_>,
     sink: &ReadSink,
     reply_schema: &Schema,
-) -> Result<Option<ZSetBatch>, GnitzSqlError> {
-    let mut out: Option<ZSetBatch> = None;
+) -> Result<ZSetBatch, GnitzSqlError> {
+    let mut out = ZSetBatch::new(reply_schema);
     let mut send = |client: &mut GnitzClient, bound: &ReadBound| -> Result<(), GnitzSqlError> {
         let blob = ReadSpec::encode_parts(bound, &plan.predicate, sink);
-        if let Some(batch) = client
-            .scan_spec(table_id, &blob, reply_schema)
-            .map_err(GnitzSqlError::Exec)?
-        {
-            match &mut out {
-                None => out = Some(batch),
-                Some(acc) => acc.extend_from_owned(batch),
-            }
+        if let Some(batch) = client.scan_spec(table_id, &blob, reply_schema)? {
+            out.extend_from_owned(batch);
         }
         Ok(())
     };
@@ -441,6 +477,66 @@ mod tests {
         let (gathered, _) = plan_of(Some(&where_expr), &schema, &[], ReadBudget::MayChunk);
         assert_eq!(shape(&gathered.bound), "PkSet");
         assert_eq!(gathered.buffered_scope(&schema).0.map_or(0, |k| k.len()), n);
+    }
+
+    /// When a PK bound yields to a unique index point, and when it keeps the PK
+    /// walk instead. Asserted on the resulting bound rather than on a predicate,
+    /// so it states the plan the rule exists to produce.
+    #[test]
+    fn a_pk_bound_yields_only_to_a_unique_index_point() {
+        // `(id U64 pk, v I64)`, with `v` indexed — unique or not per case.
+        let schema = pk_schema(TypeCode::U64);
+        let uniq: &[(&[u32], bool)] = &[(&[1], true)];
+        let non_uniq: &[(&[u32], bool)] = &[(&[1], false)];
+        for (sql, idx, want, why) in [
+            // Nothing pinned on the PK and a unique point available: the point
+            // admits one row where the open PK range admits the table.
+            ("id > 0 AND v = 42", uniq, "IndexRange", "unpinned PK range yields"),
+            // A degenerate range IS a point, so it yields on the same rule — the
+            // shape of the conjuncts that produced it does not matter.
+            (
+                "id > 0 AND v >= 5 AND v <= 5",
+                uniq,
+                "IndexRange",
+                "a degenerate range is a point",
+            ),
+            // A non-unique index point admits many rows, so it does not beat the
+            // PK walk.
+            ("id > 0 AND v = 42", non_uniq, "PkRange", "a non-unique point does not"),
+            // No index point to build at all.
+            ("id > 5 AND v > 1", uniq, "PkRange", "no point available"),
+            // A pinned PK point already admits one row.
+            ("id = 7 AND v = 42", uniq, "PkRange", "a PK point is never given up"),
+        ] {
+            let where_expr = bind_where(sql, &schema);
+            let (plan, _) = plan_of(Some(&where_expr), &schema, idx, ReadBudget::OneRequest);
+            assert_eq!(shape(&plan.bound), want, "{sql}: {why}");
+        }
+
+        // A pinned *leading* PK column can share the distribution prefix and
+        // unicast to one worker (`PRIMARY KEY (tenant, id) CLUSTER BY (tenant)`),
+        // which an `IndexRange` never does — so it keeps the PK walk even with a
+        // unique point on offer. True regardless of `dist_prefix_len`, which the
+        // client cannot see.
+        let compound = Schema {
+            columns: vec![
+                col_def("tenant", TypeCode::U64, false),
+                col_def("id", TypeCode::U64, false),
+                col_def("email", TypeCode::U64, false),
+            ],
+            pk_cols: vec![0, 1],
+        };
+        let email_uniq: &[(&[u32], bool)] = &[(&[2], true)];
+        for (sql, why) in [
+            ("tenant = 7 AND id > 0 AND email = 42", "an equality prefix is pinned"),
+            // The bare prefix lowers to a point over `tenant` with nothing pinned
+            // before it — still one worker's rows, not one row.
+            ("tenant = 7 AND email = 42", "a bare prefix lowers to a pinned point"),
+        ] {
+            let where_expr = bind_where(sql, &compound);
+            let (plan, _) = plan_of(Some(&where_expr), &compound, email_uniq, ReadBudget::OneRequest);
+            assert_eq!(shape(&plan.bound), "PkRange", "{sql}: {why}");
+        }
     }
 
     /// The index walk is marked exact — and its conjunct stripped from the

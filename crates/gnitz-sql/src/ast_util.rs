@@ -120,12 +120,9 @@ pub(crate) fn classify_agg_call(
 ) -> Result<(AggFunc, Option<&sqlparser::ast::Expr>), GnitzSqlError> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
     reject_unsupported_fn_qualifiers(f, "aggregates")?;
-    let base = single_fn_name(f).and_then(agg_func_from_name).ok_or_else(|| {
-        GnitzSqlError::Unsupported(format!(
-            "function '{}' not supported",
-            f.name.to_string().to_ascii_lowercase()
-        ))
-    })?;
+    let base = single_fn_name(f)
+        .and_then(agg_func_from_name)
+        .ok_or_else(|| unknown_function(f))?;
     match base {
         AggFunc::Count => {
             if let FunctionArguments::List(list) = &f.args {
@@ -194,6 +191,15 @@ fn expr_any(e: &sqlparser::ast::Expr, p: &impl Fn(&sqlparser::ast::Expr) -> bool
 /// still a grouped shape) — any of its operands.
 fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
     expr_any(e, &|e| matches!(e, sqlparser::ast::Expr::Function(f) if is_agg_call(f)))
+}
+
+/// The rejection for a call whose name is not one this crate implements. Shared
+/// so every binder that turns a function away spells it the same way.
+pub(crate) fn unknown_function(f: &sqlparser::ast::Function) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!(
+        "function '{}' not supported",
+        f.name.to_string().to_ascii_lowercase()
+    ))
 }
 
 /// Whether a function call names one of the aggregates.
@@ -573,9 +579,8 @@ pub(crate) fn reject_unsupported_fn_qualifiers(func: &sqlparser::ast::Function, 
 
 /// Plain positional argument exprs of a function call, or a clean `Unsupported`
 /// for `*`, named args, DISTINCT, or any qualifier (FILTER/OVER/…) — the shared
-/// qualifier inventory (`reject_unsupported_fn_qualifiers`). Backs the
-/// COALESCE/NULLIF structural desugar and the scalar-subquery rewriters, which
-/// need bare operand exprs.
+/// qualifier inventory (`reject_unsupported_fn_qualifiers`). Backs the scalar
+/// function binder, which needs bare operand exprs.
 pub(crate) fn function_positional_args<'f>(
     f: &'f sqlparser::ast::Function,
     name: &str,

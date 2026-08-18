@@ -18,11 +18,11 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use gnitz_core::{null_word_get, null_word_set, ColData, ColumnDef, ReduceOutKey, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{null_word_get, null_word_set, ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::Evaluator;
 use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc};
 
-use crate::agg::{group_col_reduce_pos, AggShape, AggSpec, GroupByLayout, GroupBySelectItem};
+use crate::agg::{synthetic_group_col_pos, AggShape, AggSpec, GroupByLayout, GroupBySelectItem};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::filter_batch;
 use crate::validate::reject_duplicate_column_names;
@@ -32,7 +32,6 @@ use crate::validate::reject_duplicate_column_names;
 /// `partial_schema` — `None` when the query has no HAVING or it folded to a
 /// statically-true constant.
 pub(crate) struct AggFinish<'a> {
-    pub source_schema: &'a Schema,
     /// The shared aggregate layout (group columns, specs, mappings, SELECT
     /// order) — identical to what the view path would compile.
     pub layout: &'a GroupByLayout,
@@ -183,12 +182,7 @@ pub(crate) fn agg_finish(spec: &AggFinish, partial: &ZSetBatch) -> ZSetBatch {
         .map(|(si, item)| OutItem {
             src: match item {
                 GroupBySelectItem::GroupCol { src_col, .. } => ItemSrc::Group {
-                    partial_ci: group_col_reduce_pos(
-                        *src_col,
-                        ReduceOutKey::SyntheticFold,
-                        spec.source_schema,
-                        &layout.group_col_indices,
-                    ),
+                    partial_ci: synthetic_group_col_pos(*src_col, &layout.group_col_indices),
                 },
                 GroupBySelectItem::Aggregate { agg_idx } => ItemSrc::Agg { agg_idx: *agg_idx },
             },
@@ -550,7 +544,7 @@ mod tests {
     }
 
     fn partial_schema(src: &Schema, specs: &[AggSpec]) -> Schema {
-        Schema::from_parts(synthetic_fold_cols(src, &[1], specs, &|_| true), vec![0])
+        Schema::from_parts(synthetic_fold_cols(src, &[1], specs, None), vec![0])
             .expect("the SyntheticFold layout is a valid client schema")
     }
 
@@ -620,7 +614,6 @@ mod tests {
         ];
 
         let spec = AggFinish {
-            source_schema: &src,
             layout: &layout,
             partial_schema: &partial_s,
             out_schema: &out_s,
@@ -658,7 +651,7 @@ mod tests {
     fn fill_group_batch_handles_the_global_ground_row() {
         let src = source_schema();
         let specs = agg_specs();
-        let partial_s = Schema::from_parts(synthetic_fold_cols(&src, &[], &specs, &|_| true), vec![0]).unwrap();
+        let partial_s = Schema::from_parts(synthetic_fold_cols(&src, &[], &specs, None), vec![0]).unwrap();
         let out_s = Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap();
         let layout = GroupByLayout {
             group_col_indices: vec![],
@@ -667,7 +660,6 @@ mod tests {
             select_items: vec![],
         };
         let spec = AggFinish {
-            source_schema: &src,
             layout: &layout,
             partial_schema: &partial_s,
             out_schema: &out_s,
@@ -712,7 +704,6 @@ mod tests {
         let src = source_schema();
         let out_s = Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap();
         let spec = AggFinish {
-            source_schema: &src,
             layout,
             partial_schema: &src,
             out_schema: &out_s,

@@ -122,14 +122,6 @@ impl ExprBuilder {
         self.bin(|dst, a, b| L::IntMod { dst, a, b }, a, b)
     }
 
-    pub fn neg_int(&mut self, a: u32) -> u32 {
-        self.int_unary(crate::IntUnaryOp::Neg, a)
-    }
-
-    pub fn int_abs(&mut self, a: u32) -> u32 {
-        self.int_unary(crate::IntUnaryOp::Abs, a)
-    }
-
     /// Both pure integer unary transforms, the operator carried as data — the
     /// shape [`LogicalInstr::IntUnary`] already stores it in.
     pub fn int_unary(&mut self, op: crate::IntUnaryOp, a: u32) -> u32 {

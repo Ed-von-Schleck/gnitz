@@ -8,7 +8,7 @@
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, NumFunc, StrFunc, TrimMode, UnaryOp};
 use gnitz_core::{ColumnDef, ExprBuilder, Schema, TypeCode};
-use gnitz_expr::{CmpOp, Evaluator, ExprValidateErr, FloatUnaryOp, IntUnaryOp, LogicalProgram, StrOp};
+use gnitz_expr::{Evaluator, ExprValidateErr, FloatUnaryOp, IntUnaryOp, LogicalProgram, StrOp};
 
 /// An IN-list item folds to an integer constant iff it is an integer literal or
 /// the unary negation of one (`-1` binds to `UnaryOp(Neg, LitInt(1))` — sqlparser
@@ -692,14 +692,7 @@ impl OpcodeBackend<'_> {
             // data all the way to the opcode, so the float/int choice is the only
             // thing left to branch on.
             (BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Ge | BinOp::Lt | BinOp::Le, is_float) => {
-                let cmp = match op {
-                    BinOp::Eq => CmpOp::Eq,
-                    BinOp::Ne => CmpOp::Ne,
-                    BinOp::Gt => CmpOp::Gt,
-                    BinOp::Ge => CmpOp::Ge,
-                    BinOp::Lt => CmpOp::Lt,
-                    _ => CmpOp::Le,
-                };
+                let cmp = op.as_cmp().expect("this arm lists exactly `as_cmp`'s `Some` set");
                 let reg = if is_float {
                     self.eb.fcmp(cmp, l, r)
                 } else {
@@ -1299,12 +1292,11 @@ mod tests {
         assert_eq!(got, eb.build(reg), "a < b must stay str_col_lt_col(a, b)");
     }
 
-    /// An unsupported operator reports the original op in the error message.
-    #[test]
     /// The column/literal interception *declines* a non-comparison operator
     /// rather than erroring, so `strcol || 'lit'` reaches the register channel;
     /// the rejection of a genuinely undefined operator moves there and still
     /// names it.
+    #[test]
     fn string_cmp_interception_declines_non_comparisons() {
         let schema = str_schema();
         let s = BoundExpr::ColRef(1);

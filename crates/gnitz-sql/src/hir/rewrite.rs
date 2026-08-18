@@ -155,9 +155,9 @@ fn classify_on(on: &[HirExpr], left_cols: &[HirCol], right_cols: &[HirCol]) -> R
     Ok(JoinClass { eq, range, residual })
 }
 
-/// Canonicalize a cross-table pair to `(left ColId, right ColId, swapped)` — the
-/// HIR analogue of `cross_table_pair`, using `ColId` membership instead of the
-/// combined-offset comparison. `swapped` = the right-table column was the
+/// Canonicalize a cross-table pair to `(left ColId, right ColId, swapped)`,
+/// deciding each side by `ColId` membership in the two column lists rather than
+/// by a combined-offset comparison. `swapped` = the right-table column was the
 /// syntactically-left operand (`b.y OP a.x`), which drives `converse_rel`.
 fn cross_table(l: ColId, r: ColId, left_cols: &[HirCol], right_cols: &[HirCol]) -> Option<(ColId, ColId, bool)> {
     let in_left = |id: ColId| col_by_id(left_cols, id).is_some();

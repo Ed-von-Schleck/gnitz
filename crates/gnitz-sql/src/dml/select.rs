@@ -25,15 +25,14 @@ use crate::ast_util::{
     is_bare_wildcard_projection, FromShape,
 };
 use crate::bind::cte_passthrough;
-use crate::bind::{bind_single_table, Binder};
+use crate::bind::Binder;
 use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::group_by::{analyze_group_by, bind_having_expr, resolve_set_projection, HavingCtx};
-use crate::dml::plan::{bound_and_predicate, extract_limit, extract_offset, fetch_bound, AccessPlan, ReadBudget};
+use crate::dml::plan::{bind_where, extract_limit, extract_offset, fetch_bound, plan_where, ReadBudget};
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, AggFinish};
 use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
 use crate::expr_lower::compile_filter_evaluator;
-use crate::ir::BoundExpr;
 use crate::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
     HonoredClauses, HonoredQueryClauses,
@@ -41,7 +40,7 @@ use crate::validate::{
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, ReduceOutKey, RelClass, Schema, ZSetBatch, MAX_COLUMNS};
 use gnitz_wire::{AggReadItem, AggReadSpec, ReadSink};
-use sqlparser::ast::{Expr, LimitClause, Query, Select, SetExpr};
+use sqlparser::ast::{LimitClause, Query, Select, SetExpr};
 use std::sync::Arc;
 
 /// The single derivation-rejection: an ad-hoc SELECT reads one relation, but this
@@ -62,27 +61,6 @@ fn reject_derivation<T>(construct: &str) -> Result<T, GnitzSqlError> {
 fn empty_rows(schema: Schema) -> SqlResult {
     let batch = ZSetBatch::new(&schema);
     SqlResult::Rows { schema, batch }
-}
-
-/// WHERE → the access plan that serves it, the shared front half of both sinks.
-/// `SELECT` reads under [`ReadBudget::OneRequest`] so the whole statement is one
-/// server-side cut; a `pk IN (…)` list past the wire's per-gather key cap then
-/// declines to an ordinary predicate scan. The plan's residual serves the DML
-/// verbs only.
-///
-/// The caller owns the bound WHERE because the plan borrows its conjuncts.
-pub(super) fn plan_where<'e>(
-    client: &mut GnitzClient,
-    tid: u64,
-    schema: &Schema,
-    where_expr: Option<&'e BoundExpr>,
-) -> Result<AccessPlan<'e>, GnitzSqlError> {
-    bound_and_predicate(schema, where_expr, ReadBudget::OneRequest, || client.table_indexes(tid))
-}
-
-/// Bind a single-table `WHERE` (or its absence) for [`plan_where`].
-pub(super) fn bind_where(schema: &Schema, where_expr: Option<&Expr>) -> Result<Option<BoundExpr>, GnitzSqlError> {
-    where_expr.map(|we| bind_single_table(we, schema)).transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +353,7 @@ fn plan_read_spec(client: &mut GnitzClient, query: &Query, route: &Route<'_>) ->
     let schema = &*target.schema;
     // WHERE → bound + compiled server-side predicate, then the reply shape.
     let bound_where = bind_where(schema, select.selection.as_ref())?;
-    let plan = plan_where(client, target.tid, schema, bound_where.as_ref())?;
+    let plan = plan_where(client, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
     let shape = build_rows_shape(select, query, schema)?;
 
     // `LIMIT 0` short-circuits to an empty result — no request dispatched.
@@ -394,7 +372,6 @@ fn plan_read_spec(client: &mut GnitzClient, query: &Query, route: &Route<'_>) ->
     let batch = fetch_bound(client, target.tid, &plan, &sink, &shape.reply_schema)?;
 
     // Client finish: sort the concatenation by the wire keys, window, present.
-    let batch = batch.unwrap_or_else(|| ZSetBatch::new(&shape.reply_schema));
     let (schema, batch) = read_spec_finish(shape.reply_schema, batch, &shape.order, offset, limit);
     Ok(SqlResult::Rows { schema, batch })
 }
@@ -456,7 +433,7 @@ pub(super) fn build_fold_shape(select: &Select, schema: &Schema) -> Result<FoldS
         // Blanket-nullable: this schema decodes the worker partials and is also
         // what the HAVING predicate resolves against, so over-declaring only
         // forces the evaluator's null-carrying arm.
-        synthetic_fold_cols(schema, &layout.group_col_indices, &layout.agg_specs, &|_| true),
+        synthetic_fold_cols(schema, &layout.group_col_indices, &layout.agg_specs, None),
         vec![0],
     )
     .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate reply schema is invalid: {e}")))?;
@@ -506,7 +483,7 @@ fn execute_aggregate_select(
     // grouped view applies WHERE via the identical compiler, so a WHERE the direct
     // path cannot compile also fails the view — no works→error regression).
     let bound_where = bind_where(schema, select.selection.as_ref())?;
-    let plan = plan_where(client, target.tid, schema, bound_where.as_ref())?;
+    let plan = plan_where(client, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
 
     // `LIMIT 0` short-circuits to an empty result — no request dispatched
     // (parity with the rows path).
@@ -528,13 +505,11 @@ fn execute_aggregate_select(
     });
     // Dispatch. A wire error (including the runtime per-worker group cap) is HARD —
     // by now the fold is mid-flight on the workers and cannot fall back.
-    let batch = fetch_bound(client, target.tid, &plan, &sink, &shape.partial_schema)?;
-    let partial = batch.unwrap_or_else(|| ZSetBatch::new(&shape.partial_schema));
+    let partial = fetch_bound(client, target.tid, &plan, &sink, &shape.partial_schema)?;
 
     // Client finishing (combine by group value, ground row, AVG/NullfillSum,
     // HAVING, projection), then the shared ORDER BY / OFFSET / LIMIT sink.
     let finish = AggFinish {
-        source_schema: schema,
         layout: &shape.layout,
         partial_schema: &shape.partial_schema,
         out_schema: &shape.out_schema,

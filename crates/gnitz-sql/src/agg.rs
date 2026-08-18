@@ -12,7 +12,7 @@ use crate::ast_util::agg_func_name;
 use crate::bind::fold_null_test;
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr};
-use crate::types::{has_scalar_register, is_integer_type};
+use crate::types::has_scalar_register;
 use gnitz_core::{ColumnDef, ReduceOutKey, Schema, TypeCode};
 use gnitz_wire::AggFunc as WireAggFunc;
 
@@ -148,26 +148,39 @@ pub(crate) fn group_col_reduce_pos(
             .position(|&pi| pi == src_col)
             .expect("PkPermutation: every group col is a source PK col"),
         ReduceOutKey::SingleNaturalCol => 0,
-        ReduceOutKey::SyntheticFold => 1 + group_col_indices.iter().position(|&gi| gi == src_col).unwrap(),
+        ReduceOutKey::SyntheticFold => synthetic_group_col_pos(src_col, group_col_indices),
     }
+}
+
+/// The `SyntheticFold` position of group column `src_col`: the fold's synthetic
+/// `_group_pk` occupies slot 0, so the group columns follow in their declared
+/// order. Split out because the ad-hoc finish knows its key is a synthetic fold
+/// and so has no schema to hand [`group_col_reduce_pos`].
+pub(crate) fn synthetic_group_col_pos(src_col: usize, group_col_indices: &[usize]) -> usize {
+    1 + group_col_indices
+        .iter()
+        .position(|&gi| gi == src_col)
+        .expect("SyntheticFold: every group col is in the group list")
 }
 
 /// The SyntheticFold reduce-output column layout: the hidden U128 group-key PK,
 /// the group columns (source definitions), then one column per physical agg
 /// spec (at the spec's `out_type`). The single home of the layout the view
 /// path's virtual reduce schema, the ad-hoc partial reply schema, and the
-/// HAVING binder's `agg_col_offset = 1 + n_group` all assume. `aggs_nullable`
-/// is the one divergence: the view path passes the exact per-spec rule
-/// (`agg_raw_nullable`, matching the engine's physical reduce schema), while the
-/// ad-hoc partial reply schema passes a blanket `true`. That is conservative
-/// rather than cosmetic — the ad-hoc schema is also what the HAVING predicate
-/// resolves against, so over-declaring nullable only forces the evaluator's
-/// null-carrying arm, never a wrong answer.
+/// HAVING binder's `agg_col_offset = 1 + n_group` all assume.
+///
+/// `exact_nullability` is the one divergence. `Some(is_global)` asks for the
+/// exact per-spec rule (`agg_raw_nullable`, matching the engine's physical
+/// reduce schema), which the view path needs; `None` declares every aggregate
+/// column nullable, which the ad-hoc partial reply schema uses. The blanket form
+/// is conservative rather than cosmetic — that schema is also what the HAVING
+/// predicate resolves against, so over-declaring nullable only forces the
+/// evaluator's null-carrying arm, never a wrong answer.
 pub(crate) fn synthetic_fold_cols(
     source_schema: &Schema,
     group_col_indices: &[usize],
     agg_specs: &[AggSpec],
-    aggs_nullable: &dyn Fn(&AggSpec) -> bool,
+    exact_nullability: Option<bool>,
 ) -> Vec<ColumnDef> {
     let mut cols = Vec::with_capacity(1 + group_col_indices.len() + agg_specs.len());
     // Hidden: the synthetic group key is a physical PK column but not a
@@ -178,7 +191,11 @@ pub(crate) fn synthetic_fold_cols(
         cols.push(source_schema.columns[gi].clone());
     }
     for spec in agg_specs {
-        cols.push(ColumnDef::new("_agg", spec.out_type, aggs_nullable(spec)));
+        let nullable = match exact_nullability {
+            Some(is_global) => agg_raw_nullable(source_schema, spec, is_global),
+            None => true,
+        };
+        cols.push(ColumnDef::new("_agg", spec.out_type, nullable));
     }
     cols
 }
@@ -267,9 +284,7 @@ pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
         }
         // The shared SyntheticFold layout (also the ad-hoc partial schema).
         ReduceOutKey::SyntheticFold => (
-            synthetic_fold_cols(source_schema, sh.group_cols, agg_specs, &|s| {
-                agg_raw_nullable(source_schema, s, is_global)
-            }),
+            synthetic_fold_cols(source_schema, sh.group_cols, agg_specs, Some(is_global)),
             vec![0],
         ),
     };
@@ -542,30 +557,21 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
             "{agg_func:?} requires an argument column; only COUNT(*) accepts a wildcard"
         )));
     }
-    // Reject argument column types the engine cannot evaluate. Single validated
-    // gate for both the SELECT-list and HAVING callers. Both bind their aggregate
-    // call through the leaf binder, which already rejects unorderable MIN/MAX —
-    // that arm here is the backstop; the SUM/AVG arm is the sole gate.
+    // Reject argument column types the engine cannot evaluate: every value-reading
+    // aggregate needs its argument in a scalar register, which excludes the wide
+    // integer-ish types and the german-string pair alike. Single validated gate for
+    // both the SELECT-list and HAVING callers; the leaf binder's MIN/MAX check runs
+    // earlier only to raise `Unsupported` rather than `Bind`.
     if let Some(c) = arg {
-        let tc = c.type_code;
-        match agg_func {
-            AggFunc::Sum | AggFunc::Avg => {
-                if !(is_integer_type(tc) || tc.is_float()) || tc.is_wide_int() {
-                    return Err(GnitzSqlError::Bind(format!(
-                        "{agg_func:?} is not supported on column type {tc:?} ('{}')",
-                        c.name,
-                    )));
-                }
-            }
-            AggFunc::Min | AggFunc::Max => {
-                if !has_scalar_register(tc) {
-                    return Err(GnitzSqlError::Bind(format!(
-                        "{agg_func:?} is not supported on column type {tc:?} ('{}')",
-                        c.name,
-                    )));
-                }
-            }
-            AggFunc::Count | AggFunc::CountNonNull => {}
+        let needs_value = match agg_func {
+            AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => true,
+            AggFunc::Count | AggFunc::CountNonNull => false,
+        };
+        if needs_value && !has_scalar_register(c.type_code) {
+            return Err(GnitzSqlError::Bind(format!(
+                "{agg_func:?} is not supported on column type {:?} ('{}')",
+                c.type_code, c.name,
+            )));
         }
     }
     // An op's output type comes straight from the shared wire typing rule over

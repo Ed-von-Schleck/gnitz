@@ -117,7 +117,7 @@ impl ViewChain {
         if let Some(v) = self.owner_vid {
             return Ok(v);
         }
-        let v = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
+        let v = client.alloc_table_id()?;
         self.owner_vid = Some(v);
         Ok(v)
     }
@@ -135,7 +135,7 @@ impl ViewChain {
         client: &mut GnitzClient,
         emit: impl FnOnce(&mut GnitzClient, &mut ViewChain, u64) -> Result<(EmitPieces, T), GnitzSqlError>,
     ) -> Result<(u64, Arc<Schema>, T), GnitzSqlError> {
-        let vid = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
+        let vid = client.alloc_table_id()?;
         let ((circuit, cols, pk), extra) = emit(client, self, vid)?;
         debug_assert_exchange_topology(&circuit);
         let schema = schema_of(&cols, &pk);

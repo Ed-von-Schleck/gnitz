@@ -142,7 +142,7 @@ fn test_create_view_ambiguous_having() {
 }
 
 /// Qualified reference within a dup-named source of a join — `b.val` resolves to
-/// both of the join view's `val` columns via `resolve_qualified_column` (§5.1).
+/// both of the join view's `val` columns by their table qualifier (§5.1).
 /// The qualifier names the relation, not left-vs-right within it, so it is still
 /// ambiguous. The join is keyed on the *unique visible* `id` (the synthetic
 /// `_join_pk` is hidden and not name-resolvable).

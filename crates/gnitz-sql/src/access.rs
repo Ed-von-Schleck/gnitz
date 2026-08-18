@@ -253,31 +253,6 @@ pub(crate) fn try_extract_pk_range<'e>(
     ))
 }
 
-/// True iff `desc` is a PK bound loose enough to give up for a one-row index
-/// point. Requires both:
-///
-/// * **No PK column pinned at all.** A descriptor that pins a leading PK column
-///   — an equality prefix, or the point `try_extract_pk_range` lowers a bare
-///   prefix to — can share the distribution prefix and unicast to one worker,
-///   which an `IndexRange` bound never does; and when the point covers the whole
-///   PK it already admits one row. [`Schema`] carries no `dist_prefix_len`, so
-///   "nothing pinned" is the only test available here.
-/// * **An index-eligible equality exists.** A PK bound is only worth abandoning
-///   when there is something to build a unique point *from*; with no
-///   index-eligible equality among the conjuncts, no index seek can cover a
-///   whole UNIQUE key, so giving up the PK bound would trade a real bound for
-///   nothing.
-pub(crate) fn pk_bound_is_preemptible(desc: &RangeDescriptor, where_expr: &BoundExpr, schema: &Schema) -> bool {
-    if !desc.eq_vals().is_empty() || desc.is_point() {
-        return false;
-    }
-    let mut conjuncts = Vec::new();
-    flatten_bound_conjuncts(where_expr, &mut conjuncts);
-    conjuncts
-        .iter()
-        .any(|c| try_col_eq_literal(c, schema).is_some_and(|(col, _)| index_eligible_col(schema, col)))
-}
-
 // ---------------------------------------------------------------------------
 // Shared collectors
 // ---------------------------------------------------------------------------
@@ -689,10 +664,8 @@ where
     F: FnMut() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
 {
     let mut memo = IndexListMemo::default();
-    let ranges =
-        collect_index_range_candidates(where_expr, schema, || memo.get(&mut fetch)).map_err(GnitzSqlError::Exec)?;
-    let seeks =
-        collect_index_seek_candidates(where_expr, schema, || memo.get(&mut fetch)).map_err(GnitzSqlError::Exec)?;
+    let ranges = collect_index_range_candidates(where_expr, schema, || memo.get(&mut fetch))?;
+    let seeks = collect_index_seek_candidates(where_expr, schema, || memo.get(&mut fetch))?;
 
     let cands = ranges.into_iter().chain(seeks.into_iter().map(|c| {
         let n = c.vals.len();
@@ -1590,51 +1563,5 @@ mod tests {
             .unwrap()
             .expect("the WHERE must bound some index");
         assert!(c.is_unique_point());
-    }
-
-    /// Whether the PK bound `where_sql` extracts would yield to a one-row index
-    /// point. Panics when the WHERE bounds no PK range at all.
-    fn preemptible(where_sql: &str, sch: &Schema) -> bool {
-        let bound = bind_where(where_sql, sch);
-        let (desc, _) = try_extract_pk_range(&bound, sch).expect("the WHERE must bound the PK");
-        pk_bound_is_preemptible(&desc, &bound, sch)
-    }
-
-    #[test]
-    fn an_unpinned_pk_range_is_preemptible() {
-        assert!(preemptible("pk > 0 AND val = 42", &two_col(TypeCode::U64)));
-    }
-
-    /// A pinned leading PK column can share the distribution prefix and unicast to
-    /// one worker (`PRIMARY KEY (tenant, id) CLUSTER BY (tenant)`), which an
-    /// `IndexRange` bound never does. False regardless of `dist_prefix_len`, which
-    /// the client cannot see.
-    #[test]
-    fn a_pinned_prefix_is_not_preemptible() {
-        let sch = Schema {
-            columns: vec![
-                col_def("tenant", TypeCode::U64, false),
-                col_def("id", TypeCode::U64, false),
-                col_def("email", TypeCode::U64, false),
-            ],
-            pk_cols: vec![0, 1],
-        };
-        assert!(!preemptible("tenant = 7 AND id > 0 AND email = 42", &sch));
-        // The bare prefix lowers to a point over `tenant` with nothing pinned
-        // before it — still one worker's rows, not one row.
-        assert!(!preemptible("tenant = 7 AND email = 42", &sch));
-    }
-
-    #[test]
-    fn a_pk_point_is_not_preemptible() {
-        assert!(!preemptible("pk = 0 AND val = 42", &two_col(TypeCode::U64)));
-    }
-
-    /// No index-eligible equality: nothing a unique point could be built from, so
-    /// the PK bound stands rather than being traded for an index seek that could
-    /// not cover a whole UNIQUE key.
-    #[test]
-    fn no_index_eligible_equality_is_not_preemptible() {
-        assert!(!preemptible("pk > 5 AND val > 1", &two_col(TypeCode::U64)));
     }
 }
