@@ -133,6 +133,14 @@ pub(super) fn argsort_delta(batch: &Batch, packed: Option<(u8, TypeCode)>, descs
         }
     }
 
+    // No group columns: one group, so the comparator calls every pair equal and
+    // any order folds to the same aggregate. Visiting the batch as it lies keeps
+    // the fold on the canonical (PK, payload) order the epoch driver
+    // consolidated it into.
+    if descs.is_empty() {
+        return (0..n as u32).collect();
+    }
+
     let mut indices: Vec<u32> = (0..n as u32).collect();
     indices.sort_unstable_by(|&a, &b| compare_by_group_cols(&mb, a as usize, &mb, b as usize, descs));
     indices
