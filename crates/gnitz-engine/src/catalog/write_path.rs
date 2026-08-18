@@ -1,12 +1,10 @@
-//! Catalog write-path spine — the single ingest/apply pipeline every
-//! system-table mutation flows through: `submit` → `precheck_family`
-//! → `apply_local` → `fire_hooks`, plus the broadcast queue, the
-//! directory-deletion queues, and Stage-A (DDL rollback) compensation.
-//! `fire_hooks` lives in `hooks.rs`; `SysFamily` / `ApplyContext` in
-//! `sys_tables.rs` / `apply_context.rs`. No second ingest entry point may
-//! skip this precheck/hooks path.
+//! Catalog write-path spine — the ingest/apply pipeline every system-table
+//! mutation flows through: `submit` → `precheck_family` → `apply_local` →
+//! `fire_hooks`, plus the broadcast queue, the directory-deletion queues, and
+//! Stage-A (DDL rollback) compensation. `fire_hooks` lives in `hooks.rs`;
+//! `SysFamily` / `ApplyContext` in `sys_tables.rs` / `apply_context.rs`.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::num::NonZeroU64;
 
@@ -14,79 +12,69 @@ use super::*;
 use crate::schema::make_index_schema;
 use crate::storage::{compare_rows, compare_rows_except};
 use gnitz_wire::{
-    COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
-    COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE,
-    IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME,
+    COLTAB_PAY_COL_IDX, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID,
+    COLTAB_PAY_OWNER_KIND, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME,
 };
 
-/// The only handle the DDL/imperative layer has on catalog state: submit one
-/// system-family delta. It cannot name a `sys_*` table, so DDL code physically
-/// cannot mutate a dependent family except by emitting a delta that flows
-/// through the single precheck → persist → `fire_hooks` → broadcast path —
-/// identical on live apply, WAL replay, and worker sync. The cascades that drop
-/// columns/indices/circuit rows are the applier's declared reaction to a
-/// retraction, fired from inside `fire_hooks`, not the emitter's concern.
-pub(crate) trait CatalogDeltaSink {
-    /// Apply one system-family delta and enqueue it for broadcast: precheck →
-    /// storage write → `fire_hooks` → enqueue. The batch is taken by value so
-    /// the applier moves it straight into `pending_broadcasts` (one storage
-    /// clone, no hooks clone).
-    fn submit(&mut self, family: SysFamily, batch: Batch) -> Result<(), String>;
-
-    /// Apply locally without enqueuing a broadcast. ONLY for rows the workers
-    /// already produce themselves (FK indices auto-created from the same
-    /// `TABLE_TAB` delta) and for rollback compensation. Re-broadcasting these
-    /// would deliver phantom deltas. Documented and audited; not a general escape.
-    fn submit_local(&mut self, family: SysFamily, batch: Batch) -> Result<(), String>;
-}
-
-impl CatalogDeltaSink for CatalogEngine {
-    fn submit(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
-        if self.ctx.in_rollback() {
-            // During rollback all cascade writes must bypass pending_broadcasts
-            // so no compensating row is re-broadcast to workers.
-            return self.submit_local(family, batch);
-        }
-        // `submit` is the composition of the two steps the DDL_TXN handler drives
-        // separately per bundle family: precheck (no mutation) then
-        // apply-and-enqueue. Cascade callers (hooks) keep the atomic composition.
-        self.precheck_family(family, &batch)?;
-        self.apply_and_enqueue_family(family, batch)
-    }
-
-    fn submit_local(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
-        // No LSN pin: local applies are rollback compensation or rows the
-        // workers already produce, neither of which owns this zone's durability.
-        // `None` is deliberate even while a DDL zone is active — these rows are
-        // not in the SAL, so pinning their family's current_lsn would advance the
-        // recovery dedup watermark with no matching SAL group.
-        self.apply_local(family, &mut batch, None)
-        // Deliberately no push to pending_broadcasts.
-    }
-}
-
 /// Reject a mutation of a bootstrap-owned id in one of the catalog's id spaces
-/// (`what` names it, `first_user` is its floor). The reject is a property of
-/// the id space, not of the mutation's shape, so it covers every sign: a `-1`
-/// drops a bootstrap row, a bare `+1` aliases a bootstrap id into the caches,
-/// and a pair renames one. Runs before the CAS, so it fires whether or not the
-/// family holds a live row at that id.
-fn reject_system_id(sig: &PkSignature, what: &str, first_user: i64) -> Result<(), String> {
+/// (`first_user` is its floor). The reject is a property of the id space, not of
+/// the mutation's shape, so it covers every sign: a `-1` drops a bootstrap row, a
+/// bare `+1` aliases a bootstrap id into the caches, and a pair renames one. Runs
+/// before the CAS, so it fires whether or not the family holds a live row at that
+/// id.
+fn reject_system_id(sig: &PkSignature, family: SysFamily, first_user: i64) -> Result<(), String> {
     let id = sig.pk as i64;
     if id < first_user {
         return Err(format!(
-            "cannot {} a system {what} (id {id} < {first_user})",
-            sig.verb()
+            "cannot {} a system {} (id {id} < {first_user})",
+            sig.verb(),
+            family.row_noun()
         ));
     }
     Ok(())
 }
 
 impl CatalogEngine {
+    // -- The applied-delta entry points ----------------------------------------
+
+    /// Apply one system-family delta and enqueue it for broadcast: precheck →
+    /// storage write → `fire_hooks` → enqueue. This is how DDL code mutates a
+    /// system family; the cascades that drop columns/indices/circuit rows are the
+    /// applier's declared reaction to a retraction, fired from inside
+    /// `fire_hooks`, not the emitter's concern. The batch is taken by value so
+    /// the applier moves it straight into `pending_broadcasts` (one storage
+    /// clone, no hooks clone).
+    ///
+    /// Two paths deliberately write without it: `bootstrap_ingest` seeds a fresh
+    /// database before the DAG exists (and `replay_catalog` fires the hooks over
+    /// those rows immediately after), and `advance_sequence` writes the
+    /// memtable-only object-id high-water. The DDL_TXN handler drives the same
+    /// two steps itself so it can tell a precheck rejection from a post-apply
+    /// failure.
+    pub(crate) fn submit(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
+        if self.ctx.in_rollback() {
+            // During rollback all cascade writes must bypass pending_broadcasts
+            // so no compensating row is re-broadcast to workers.
+            return self.submit_local(family, batch);
+        }
+        self.precheck_family(family, &batch)?;
+        self.apply_and_enqueue_family(family, batch)
+    }
+
+    /// Apply locally without enqueuing a broadcast. ONLY for rows the workers
+    /// already produce themselves (FK indices auto-created from the same
+    /// `TABLE_TAB` delta) and for rollback compensation. Re-broadcasting these
+    /// would deliver phantom deltas.
+    ///
+    /// No LSN pin: local applies own no zone's durability. `None` is deliberate
+    /// even while a DDL zone is active — these rows are not in the SAL, so
+    /// pinning their family's `current_lsn` would advance the recovery dedup
+    /// watermark with no matching SAL group.
+    pub(crate) fn submit_local(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
+        self.apply_local(family, &mut batch, None)
+    }
+
     // -- System table accessors ------------------------------------------------
-    //
-    // Ids are non-contiguous, so every id-keyed access routes through
-    // `SysFamily::from_id`; the by-family accessors are infallible.
 
     /// This family's owned store.
     pub(crate) fn sys_store(&self, family: SysFamily) -> &Table {
@@ -103,12 +91,8 @@ impl CatalogEngine {
         &mut *self.sys_stores[family.index()]
     }
 
-    pub(crate) fn sys_table_mut(&mut self, table_id: i64) -> Option<&mut Table> {
-        SysFamily::from_id(table_id).map(|f| &mut *self.sys_stores[f.index()])
-    }
-
     /// Apply one delta to its family's storage and fire the reaction hooks —
-    /// the shared tail of [`CatalogDeltaSink::submit`] / `submit_local`. When
+    /// the shared tail of [`Self::submit`] / [`Self::submit_local`]. When
     /// `pin_lsn` is `Some(lsn)` it pins the family's `current_lsn` to `lsn.get()`
     /// (the DDL zone LSN) so recovery's dedup check (`msg.lsn <= flushed`) matches
     /// the SAL group LSN. Pins never regress the counter: every zone is reserved
@@ -139,13 +123,11 @@ impl CatalogEngine {
 
     // -- System ingestion entry + precheck / broadcast / dir-deletion -------
 
-    /// Ingest a batch into a table family (PK enforcement + store + index
-    /// projection + hooks).
-    /// System tables go through the [`CatalogDeltaSink::submit`] applied-delta
-    /// path (precheck → ingest → hooks → broadcast-queue). User tables delegate
-    /// to `DagEngine::ingest_by_ref`. This `&Batch` entry serves external/wire
-    /// callers that hold a borrow; the DDL emitters call `submit` directly with
-    /// an owned batch to skip the clone.
+    /// Ingest a batch into any relation, system or user: a system family goes
+    /// through [`Self::submit`] (precheck → ingest → hooks → broadcast-queue), a
+    /// user table through `DagEngine::ingest_by_ref` (PK enforcement, store,
+    /// index projection). The `&Batch` entry serves callers that hold a borrow;
+    /// an emitter with an owned batch calls `submit` directly to skip the clone.
     pub fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
             let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
@@ -161,7 +143,7 @@ impl CatalogEngine {
     }
 
     /// Apply one system-family delta to storage, fire its hooks, and enqueue it
-    /// for broadcast — the mutating half of [`CatalogDeltaSink::submit`], pinned
+    /// for broadcast — the mutating half of [`Self::submit`], pinned
     /// to the open DDL zone LSN. Takes the batch by value so it moves straight
     /// into `pending_broadcasts` (one storage clone, no hooks clone). Enqueue
     /// happens after hooks so nested cascade pushes land first and the executor
@@ -175,25 +157,84 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Emit the single retraction delta for `pk` in `family`: seek the live row,
-    /// copy it with weight −1, and submit it through the one applied-delta path.
-    /// The drop cascade is the applier's reaction to that −1 (fired from
-    /// `fire_hooks`), not the caller's concern. Uses the immutable `sys_table`
-    /// accessor because `retract_single_row` only reads; the `submit` move comes
-    /// after. `retract_single_row` returns an empty batch when the PK is absent
-    /// or already retracted; emitters resolve the friendly "does not exist"
-    /// message from the caches before calling, so the `count == 0` arm only
-    /// fires on cache/storage divergence.
-    /// Only the test-only direct DDL drop paths (`ddl.rs`) retract engine-side;
-    /// production retractions arrive as wire deltas.
-    #[cfg(test)]
-    pub(crate) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
-        let schema = family.schema();
-        let batch = retract_single_row(self.sys_store(family), &schema, pk);
-        if batch.count == 0 {
-            return Err("Entity does not exist in catalog".into());
+    /// Check every FK-carrying column of a relation about to be registered.
+    /// `pk` must already have passed `validate_relation_defs`, which is what
+    /// makes `pk[0]` an in-bounds, PK-eligible column index.
+    pub(crate) fn validate_fk_columns(&self, tid: i64, col_defs: &[ColumnDef], pk: &[u32]) -> Result<(), String> {
+        let self_pk_type = col_defs[pk[0] as usize].type_code;
+        for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
+            self.validate_fk_column(cd, tid, pk, self_pk_type)?;
         }
-        self.submit(family, batch)
+        Ok(())
+    }
+
+    fn validate_fk_column(
+        &self,
+        col: &ColumnDef,
+        self_table_id: i64,
+        self_pk: &[u32],
+        self_pk_type: u8,
+    ) -> Result<(), String> {
+        // `col.fk_col_idx` here is the PARENT's referenced column index (the
+        // planner sets the child column's fk_col_idx to it). The target is a
+        // legal reference iff it is the parent's lone PK column, or it carries
+        // its own UNIQUE index. Mirrors the production planner gate.
+        let target_type = if col.fk_table_id == self_table_id {
+            // Self-referential FK: the table has no UNIQUE index yet, so the
+            // target must be its lone PK column. The downstream probe reads the
+            // referenced value out of the packed PK region, which is the whole
+            // key only when the PK is a single column.
+            if self_pk != [col.fk_col_idx] {
+                return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
+            }
+            self_pk_type
+        } else {
+            let entry = self
+                .dag
+                .tables
+                .get(&col.fk_table_id)
+                .ok_or_else(|| format!("FK references unknown table_id {}", col.fk_table_id))?;
+            // Not covered by the PK/UNIQUE tests below, which read only the schema:
+            // a stream and a view both have a PK that looks exactly like a base
+            // table's without being the unique, stored key the parent probe reads.
+            if !entry.kind.is_base_table() {
+                return Err(format!(
+                    "FK references relation {}, which is a {}; a FOREIGN KEY must reference a base table",
+                    col.fk_table_id,
+                    entry.kind.noun()
+                ));
+            }
+            let pk = entry.schema.pk_indices();
+            let is_lone_pk = pk.len() == 1 && pk[0] == col.fk_col_idx;
+            if !is_lone_pk {
+                // A composite index does not satisfy a single-column FK: a
+                // unique (a, b) does not guarantee uniqueness of `a` alone, so
+                // match only a single-column unique index on the referenced col.
+                let has_unique = entry
+                    .index_circuits
+                    .iter()
+                    .any(|ic| ic.unique_cols() == Some(&[col.fk_col_idx][..]));
+                if !has_unique {
+                    return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
+                }
+            }
+            entry.schema.columns[col.fk_col_idx as usize].type_code
+        };
+
+        // Promote BOTH sides before comparing. `index_key_type` maps each
+        // ≤8-byte int to its index-key code (signed I8..I64 → I64, unsigned
+        // U8..U64 → U64) and is idempotent on the already-promoted widths.
+        // Comparing the promoted child against the parent's raw type_code would
+        // wrongly reject identical-type FKs once a narrower signed column
+        // promotes to I64.
+        let promoted = gnitz_wire::index_key_type(col.type_code)?;
+        let target_promoted = gnitz_wire::index_key_type(target_type)?;
+        if promoted != target_promoted {
+            return Err(format!(
+                "FK type mismatch: promoted code {promoted} vs target {target_promoted}"
+            ));
+        }
+        Ok(())
     }
 
     /// Reject a CREATE whose qualified `schema.name` collides with an existing
@@ -206,8 +247,20 @@ impl CatalogEngine {
     /// that. Precheck reads the caches *before* apply, so they still map the name
     /// to the outgoing id.
     ///
-    /// Also resolves `sid`, erroring if the schema does not exist.
-    fn precheck_qname_unique(&self, sid: i64, name: &str, self_id: i64, net_dead: &[i64]) -> Result<(), String> {
+    /// Also resolves `sid`, erroring if the schema does not exist. `claimed`
+    /// collects the qualified names this same batch has already registered, so
+    /// two `+1` rows naming one relation under different ids are rejected too —
+    /// unchecked, both would register and the second would overwrite
+    /// `entity_by_qname`, stranding the first's store under a name nothing
+    /// resolves.
+    fn precheck_qname_unique(
+        &self,
+        sid: i64,
+        name: &str,
+        self_id: i64,
+        net_dead: &[i64],
+        claimed: &mut FxHashSet<String>,
+    ) -> Result<(), String> {
         let schema_name = self
             .caches
             .schema_by_id
@@ -218,6 +271,9 @@ impl CatalogEngine {
             if existing != self_id && !net_dead.contains(&existing) {
                 return Err(format!("Table or view already exists: {qualified}"));
             }
+        }
+        if !claimed.insert(qualified.clone()) {
+            return Err(format!("Table or view already exists: {qualified}"));
         }
         Ok(())
     }
@@ -251,17 +307,16 @@ impl CatalogEngine {
     ///    stores run no `enforce_unique_pk`, so nothing else stops a duplicate
     ///    live head or a persistent negative ghost).
     ///
-    /// `noun` names the row kind in the messages. Returns the live row (for the
-    /// caller's pair-field comparison) and the net weight; the per-family guards
-    /// on top of this live in `precheck_relation_family` /
-    /// `precheck_column_family`.
+    /// Returns the live row (for the caller's pair-field comparison) and the net
+    /// weight; the per-family guards on top of this live in
+    /// `precheck_relation_family` / `precheck_column_family`.
     fn check_cas_and_net(
         &self,
         family: SysFamily,
         batch: &Batch,
         sig: &PkSignature,
-        noun: &str,
     ) -> Result<(Option<Batch>, i64), String> {
+        let noun = family.row_noun();
         let live = self.seek_live_sys_row(family, batch.get_pk_bytes(sig.row));
 
         if sig.neg.is_some() {
@@ -308,9 +363,9 @@ impl CatalogEngine {
         let schema = family.schema();
         let mut net_dead: Vec<i64> = Vec::new();
         for sig in pk_signatures(batch) {
-            reject_system_id(&sig, "relation", FIRST_USER_TABLE_ID)?;
+            reject_system_id(&sig, family, FIRST_USER_TABLE_ID)?;
 
-            let (live, net) = self.check_cas_and_net(family, batch, &sig, "system-catalog row")?;
+            let (live, net) = self.check_cas_and_net(family, batch, &sig)?;
 
             if sig.is_pair() {
                 let lb = live.as_ref().expect("a pair's -1 CAS already required a live row");
@@ -338,8 +393,7 @@ impl CatalogEngine {
     ///
     /// - **At most one row per sign** — a live ALTER is exactly one rewrite pair;
     ///   nothing legitimate repeats a sign on one column PK.
-    /// - **CAS + net** (kept from the contract): the `-1` byte-equals the live
-    ///   row; per-PK `net ∈ {0,1}`.
+    /// - **CAS + net**: the `-1` byte-equals the live row; per-PK `net ∈ {0,1}`.
     /// - **Rewrite pair** (`-1` + `+1`, same id): every payload field other than
     ///   `{name, is_hidden, is_nullable}` must match, and `is_hidden` /
     ///   `is_nullable` may change only `0→1` (forward path; compensation replays
@@ -391,7 +445,7 @@ impl CatalogEngine {
                 continue;
             };
 
-            self.check_cas_and_net(SysFamily::Column, batch, &sig, "system-catalog column")?;
+            self.check_cas_and_net(SysFamily::Column, batch, &sig)?;
 
             // Every column transition — RENAME, DROP, ADD — needs a user base
             // table owner, so every other `RelationKind` fails here.
@@ -459,11 +513,11 @@ impl CatalogEngine {
     /// ADD COLUMN: one unpaired `+1` appending a trailing nullable payload
     /// column to registered base table `owner_id`.
     ///
-    /// The caller's `check_cas_and_net` already closed the concurrent-append
-    /// race with no second probe — `pack_col_id` is a pure function of the
-    /// client-read physical column count, so two connections racing pick the
-    /// *same* `column_id`, and the second's `+1` lands on a now-live row where
-    /// `live_weight + Σ = 2` fails the per-PK net bound.
+    /// The caller's `check_cas_and_net` already closes the concurrent-append
+    /// race: `pack_col_id` is a pure function of the client-read physical column
+    /// count, so two connections racing pick the *same* `column_id`, and the
+    /// second's `+1` lands on a now-live row where `live_weight + Σ = 2` fails
+    /// the per-PK net bound.
     fn precheck_column_append(
         &mut self,
         batch: &Batch,
@@ -486,15 +540,7 @@ impl CatalogEngine {
             ));
         }
         // Decode the appended row once; every rule below reads the decoded def.
-        let appended = ColumnDef {
-            name: batch.read_payload_string(pj, COLTAB_PAY_NAME),
-            type_code: batch.read_payload_u64(pj, COLTAB_PAY_TYPE_CODE) as u8,
-            is_nullable: batch.read_payload_u64(pj, COLTAB_PAY_IS_NULLABLE) != 0,
-            fk_table_id: batch.read_payload_u64(pj, COLTAB_PAY_FK_TABLE_ID) as i64,
-            fk_col_idx: batch.read_payload_u64(pj, COLTAB_PAY_FK_COL_IDX) as u32,
-            is_serial: batch.read_payload_u64(pj, COLTAB_PAY_IS_SERIAL) != 0,
-            is_hidden: batch.read_payload_u64(pj, COLTAB_PAY_IS_HIDDEN) != 0,
-        };
+        let appended = read_col_tab_row(batch, pj);
         // Run the prospective column set through `check_col_defs` — the sole home
         // of the column-record rules — so a rule added there reaches ADD COLUMN
         // too. `validate_pk_cols` is not re-run: a trailing non-PK append cannot
@@ -530,7 +576,7 @@ impl CatalogEngine {
     /// form), so decode it via `unpack_pk_cols` and compare ordered lists — a
     /// bare compare would never match a packed row. Rows that have already netted
     /// to zero weight are skipped by the cursor.
-    pub(crate) fn for_each_index_on_cols(&self, owner_id: i64, cols: &[u32], mut f: impl FnMut(i64, bool)) {
+    pub(super) fn for_each_index_on_cols(&self, owner_id: i64, cols: &[u32], mut f: impl FnMut(i64, bool)) {
         let mut cursor = self.sys_store(SysFamily::Index).open_cursor();
         while cursor.valid {
             if cursor.current_weight > 0 {
@@ -581,7 +627,7 @@ impl CatalogEngine {
     }
 
     /// Validate a system-table write before any mutation (memtable or hooks) —
-    /// the read-only half of [`CatalogDeltaSink::submit`]. Covers both
+    /// the read-only half of [`Self::submit`]. Covers both
     /// positive-weight (CREATE) invariants and negative-weight (DROP) integrity
     /// guards so that no invalid state is ever written. Also called directly by
     /// the `DDL_TXN` handler, which prechecks a family, sets its rollback
@@ -632,8 +678,8 @@ impl CatalogEngine {
     /// the whole guard.
     fn precheck_schema_family(&mut self, batch: &Batch) -> Result<(), String> {
         for sig in pk_signatures(batch) {
-            reject_system_id(&sig, "schema", FIRST_USER_SCHEMA_ID)?;
-            self.check_cas_and_net(SysFamily::Schema, batch, &sig, "system-catalog schema")?;
+            reject_system_id(&sig, SysFamily::Schema, FIRST_USER_SCHEMA_ID)?;
+            self.check_cas_and_net(SysFamily::Schema, batch, &sig)?;
         }
         for i in 0..batch.count {
             if batch.get_weight(i) > 0 {
@@ -662,6 +708,7 @@ impl CatalogEngine {
     fn precheck_relation_family(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         let is_table = family == SysFamily::Table;
         let net_dead = self.precheck_relation_signatures(family, batch)?;
+        let mut claimed: FxHashSet<String> = FxHashSet::default();
 
         for i in 0..batch.count {
             if batch.get_weight(i) <= 0 {
@@ -711,13 +758,13 @@ impl CatalogEngine {
                         ));
                     }
                 }
-                let self_pk_type = col_defs[pk.as_slice()[0] as usize].type_code;
-                for cd in col_defs.iter().filter(|cd| cd.fk_table_id != 0) {
-                    self.validate_fk_column(cd, id, pk.as_slice(), self_pk_type)?;
-                }
+                // `validate_relation_defs` above proved the PK list non-empty
+                // and in range, which is what makes the self-reference type
+                // lookup inside sound.
+                self.validate_fk_columns(id, &col_defs, pk.as_slice())?;
             }
 
-            self.precheck_qname_unique(sid, &name, id, &net_dead)?;
+            self.precheck_qname_unique(sid, &name, id, &net_dead, &mut claimed)?;
         }
 
         let mut drop_ids = net_dead;
@@ -807,7 +854,7 @@ impl CatalogEngine {
         // `retract_single_row` copy of the very row the CAS re-reads, so the
         // contract could reject nothing there.
         for sig in pk_signatures(batch) {
-            self.check_cas_and_net(SysFamily::Index, batch, &sig, "system-catalog index")?;
+            self.check_cas_and_net(SysFamily::Index, batch, &sig)?;
         }
         let mut drop_ids: Vec<i64> = (0..batch.count)
             .filter(|&i| batch.get_weight(i) < 0)
@@ -821,24 +868,20 @@ impl CatalogEngine {
 
         let schema = SysFamily::Index.schema();
         for &idx_id in &drop_ids {
-            // An internal `__fk_` index backs the RESTRICT seek; dropping one
-            // would silently disarm FK enforcement.
-            if self
-                .caches
-                .index_by_id
-                .get(&idx_id)
-                .is_some_and(|n| n.contains(FK_INDEX_INFIX))
-            {
-                return Err("Integrity violation: cannot drop an internal FK index".into());
-            }
-            let (owner_id, cols) = {
+            // The CAS above already proved a live row exists at every dropped id.
+            let (owner_id, cols, name) = {
                 let mut cursor = self.sys_store(SysFamily::Index).open_cursor();
                 if !cursor.advance_to_exact_live(sys_opk(&schema, idx_id as u128).pk_bytes()) {
                     continue;
                 }
                 let (owner_id, cols, _) = read_idx_tab_cursor_row(&cursor);
-                (owner_id, cols)
+                (owner_id, cols, cursor_read_string(&cursor, gnitz_wire::IDXTAB_COL_NAME))
             };
+            // An internal `__fk_` index backs the RESTRICT seek; dropping one
+            // would silently disarm FK enforcement.
+            if name.contains(FK_INDEX_INFIX) {
+                return Err("Integrity violation: cannot drop an internal FK index".into());
+            }
             // FK backing is single-column: a composite index never satisfies a
             // single-column FK/uniqueness requirement, so dropping one is never
             // blocked by the FK-target guard.
@@ -885,6 +928,20 @@ impl CatalogEngine {
     /// bypasses `ingest_to_family` entirely, so the queue stays empty there.
     pub fn drain_pending_broadcasts(&mut self) -> Vec<(SysFamily, Batch)> {
         std::mem::take(&mut self.pending_broadcasts)
+    }
+
+    /// Run `f` with `dir` staged for cleanup: on `Err` whatever `f` created on
+    /// disk is removed here, on `Ok` the directory is live and nothing happens.
+    /// The stage is a local, not an entry in `pending_dir_deletions`, so that
+    /// queue keeps one meaning — directories of *dropped* entities, which a
+    /// rollback must therefore keep. A queue holding both could not be drained
+    /// or discarded as a whole.
+    pub(super) fn with_staged_dir<T>(
+        &mut self,
+        dir: String,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        f(self).inspect_err(|_| Self::remove_queued_dirs(vec![dir]))
     }
 
     /// Physically remove a batch of queued directory paths. An existence guard
@@ -956,24 +1013,19 @@ impl CatalogEngine {
     /// a crash before the next checkpoint drained it. Best-effort: a failure to
     /// remove one orphan is logged and never aborts recovery.
     ///
-    /// Two reclamation mechanisms run here:
-    /// - A schema-scoped path scan removes orphan table/view/index dirs under
-    ///   every live schema (the drop-flushed-but-gating-checkpoint-missed window,
-    ///   where the entity is absent from both the shard scan and the SAL, so
-    ///   nothing re-queues its dir).
-    /// - A `drain_pending_dir_deletions` removes every dir that SAL replay
-    ///   re-queued (the drop-committed-to-SAL-but-unflushed window), including a
-    ///   dropped schema subtree the path scan cannot reach because the schema is
-    ///   gone from `schema_by_id`.
+    /// Two reclamation mechanisms run here: a schema-scoped path scan for orphans
+    /// under every live schema, and a `drain_pending_dir_deletions` for every dir
+    /// SAL replay re-queued — including a dropped *schema*'s subtree, which the
+    /// path scan cannot reach because the schema is gone from `schema_by_id`.
     ///
     /// Must run only after BOTH shard replay (`replay_catalog`) and SAL replay
     /// (`recover_system_tables_from_sal`) have populated `dag.tables`; otherwise a
     /// table whose CREATE committed to the SAL but was not yet flushed would be
     /// absent from `dag.tables` and its live directory wrongly deleted.
     ///
-    /// Requires the `cancel_gated_deletion` fix that also clears
-    /// `pending_dir_deletions`; without it the drain could remove a recreated
-    /// same-name schema whose live path SAL replay left in the queue.
+    /// Sound only because `cancel_gated_deletion` filters `pending_dir_deletions`
+    /// too: otherwise the drain could remove a recreated same-name schema whose
+    /// live path SAL replay left in the queue.
     pub(crate) fn gc_orphan_directories(&mut self) {
         // Full on-disk path of every live table/view (user + system).
         let live_tables: rustc_hash::FxHashSet<&str> = self.dag.tables.values().map(|e| e.directory.as_str()).collect();
@@ -1010,7 +1062,7 @@ impl CatalogEngine {
                     // a standalone DROP INDEX whose gated deletion was lost to a
                     // crash.
                     for idx_name in subdir_names(&full) {
-                        if !is_index_dir_name(&idx_name) {
+                        if !matches!(ChildAddr::parse(&idx_name), Some(ChildAddr::Index { .. })) {
                             continue;
                         }
                         let idx_full = format!("{full}/{idx_name}");
@@ -1049,9 +1101,9 @@ impl CatalogEngine {
         // schemas, but a dropped *schema*'s subtree is unreachable by that scan
         // (the schema is gone from `schema_by_id`). Physically remove everything
         // the replay re-queued so those dirs are reclaimed and no recovery residue
-        // is carried into the first DDL/checkpoint. Safe because the
-        // `cancel_gated_deletion` fix guarantees no recreated same-name (live)
-        // schema path survives in the queue.
+        // is carried into the first DDL/checkpoint. Safe because
+        // `cancel_gated_deletion` filters this queue too, so no recreated
+        // same-name (live) schema path survives in it.
         self.drain_pending_dir_deletions();
     }
 
@@ -1086,9 +1138,8 @@ impl CatalogEngine {
     pub(crate) fn compensate_stage_a(&mut self, applied_not_enqueued: Option<(SysFamily, Batch)>) {
         let mut rollback_list = self.drain_pending_broadcasts();
 
-        if let Some((family, mut batch)) = applied_not_enqueued {
-            batch.set_schema(family.schema());
-            rollback_list.push((family, batch));
+        if let Some(entry) = applied_not_enqueued {
+            rollback_list.push(entry);
         }
 
         // Precheck-failed first family: nothing applied, trivial no-op.

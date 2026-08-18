@@ -1,6 +1,8 @@
 mod alter_tests;
 mod atomicity_tests;
 mod compound_pk_smoke;
+mod ddl_fixture;
+use ddl_fixture::{make_secondary_index_name, parse_qualified_name};
 mod ddl_tests;
 mod dir_deletion_tests;
 mod engine_tests;
@@ -47,6 +49,21 @@ fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
     p[8..16].copy_from_slice(&b.to_be_bytes());
     p[16..24].copy_from_slice(&c.to_be_bytes());
     p
+}
+
+/// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
+/// (system families included) must hold none. A `-1` that retracts a row nothing
+/// ever inserted never cancels, so it sits here forever.
+fn count_negative_records(table: &mut Table) -> usize {
+    let mut count = 0;
+    let mut c = table.open_cursor();
+    while c.valid {
+        if c.current_weight < 0 {
+            count += 1;
+        }
+        c.advance();
+    }
+    count
 }
 
 fn count_records(table: &mut Table) -> usize {
@@ -145,7 +162,7 @@ fn build_table_tab_row(tid: i64, raw_pk_cols: u64, table_name: &str) -> Batch {
 }
 
 /// Like `build_table_tab_row` but with an explicit packed `flags` word (so a test
-/// can build a row that passes precheck yet fails `hook_table_register`, e.g. a
+/// can build a row that passes precheck yet fails `hook_relation_register`, e.g. a
 /// REPLICATED table with a non-default distribution prefix). Writes through the
 /// production row builder, so a fixture cannot drift from the layout the engine
 /// registers tables with.
@@ -209,7 +226,7 @@ type CircuitNode<'a> = (u64, Option<i64>, Option<&'a [u8]>);
 /// `gnitz_wire::CIRCUIT_NODES_COLS` / `CIRCUIT_EDGES_COLS`; the compound PK
 /// `(view_id, sub)` is packed by `pack_view_pk`.
 fn write_circuit_chain(engine: &mut CatalogEngine, vid: i64, nodes: &[CircuitNode<'_>]) {
-    let mut bb = BatchBuilder::new(sys_tab_schema(CIRCUIT_NODES_TAB_ID));
+    let mut bb = BatchBuilder::new(SysFamily::CircuitNodes.schema());
     for (i, &(opcode, source, blob)) in nodes.iter().enumerate() {
         bb.begin_row(pack_view_pk(vid, i as u64), 1);
         bb.put_u64(i as u64); // node_id
@@ -226,7 +243,7 @@ fn write_circuit_chain(engine: &mut CatalogEngine, vid: i64, nodes: &[CircuitNod
     }
     engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();
 
-    let mut bb = BatchBuilder::new(sys_tab_schema(CIRCUIT_EDGES_TAB_ID));
+    let mut bb = BatchBuilder::new(SysFamily::CircuitEdges.schema());
     for src in 0..nodes.len().saturating_sub(1) as u64 {
         bb.begin_row(pack_view_pk(vid, src), 1);
         bb.put_u64(src + 1); // dst_node
@@ -274,7 +291,7 @@ fn build_view_tab_row(vid: i64, view_name: &str, sql: &str) -> Batch {
 
 /// Register an identity view over `base_tid` through the raw system-table path,
 /// returning its vid. The circuit and column records precede the VIEW_TAB row —
-/// the order `hook_view_register` needs to resolve the view's sources and schema.
+/// the order `hook_relation_register` needs to resolve the view's sources and schema.
 /// `capacity_bytes` of `0` is unbounded. Returns the registration's own error so a
 /// test can assert on a rejected one.
 fn try_register_identity_view(

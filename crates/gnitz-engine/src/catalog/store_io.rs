@@ -36,12 +36,11 @@ impl CatalogEngine {
         // Width guard, ahead of `enforce_unique_pk`. A worker parked mid-epoch
         // stashes an incoming `DdlSync` and replays it at the next top-level
         // drain while still serving pushes inline, so its `TableEntry.schema` can
-        // lag a frame the master already framed from its own widened catalog —
-        // and the worker decodes with no hint, so nothing else compares the two.
-        // Without this the wider batch reaches `append_mem_batch_ranges`, whose
-        // column loop is driven by the *destination's* region count: the appended
-        // column would be dropped and the push ACKed as success. A real check,
-        // not a `debug_assert` — a release build must not silently truncate a row.
+        // lag a frame the master framed from its own widened catalog — and the
+        // worker decodes with no hint, so nothing else compares the two. A real
+        // check, not a `debug_assert`: the append path is driven by the
+        // destination's region count, so a release build would silently drop the
+        // extra column and ACK the push as success.
         if let Some(schema) = self.get_schema_desc(table_id) {
             if batch.num_payload_cols() != schema.num_payload_cols() {
                 return Err(format!(
@@ -56,23 +55,18 @@ impl CatalogEngine {
             .ok_or_else(|| format!("ingest failed for table_id={table_id}: not registered"))
     }
 
-    /// Scan all positive-weight rows from a table. Registry-uniform: system
-    /// tables are pre-registered `Borrowed` handles (whose `full_scan`
-    /// preserves the `Rc` snapshot cache), so one lookup serves every id —
-    /// the CIRCUIT_* tables are SQL-introspectable through it like any other.
-    /// Returns the scan plus the table's schema descriptor — the entry is
-    /// already resolved here, so the reply path never re-resolves (and
-    /// re-copies) the descriptor.
+    /// Scan all positive-weight rows from a relation. One registry lookup serves
+    /// every id — a system family's `Borrowed` handle preserves `full_scan`'s
+    /// `Rc` snapshot cache, so the CIRCUIT_* tables are SQL-introspectable like
+    /// any other relation. Returns the scan plus the schema descriptor, which the
+    /// entry already holds, so the reply path never re-resolves it.
     pub fn scan_family(&mut self, table_id: i64) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
         let entry = self.table_entry(table_id)?;
         if entry.needs_hydration() {
             let schema = entry.schema;
-            // `Table::full_scan`'s `Rc` snapshot cache is bypassed and no second
-            // cache replaces it: it is invalidated on every ingest, so on a view
-            // under live churn it would hold at most one scan and cost a full
-            // hydrated copy of the store to do so. The whole walk runs inside the
-            // single Scan dispatch on the single-threaded worker, so the snapshot
-            // the chunked wire train slices is as atomic as any other relation's.
+            // The hydrated scan is not cached: `full_scan`'s snapshot is
+            // invalidated on every ingest, so under live churn it would hold at
+            // most one scan and cost a full hydrated copy of the store to do so.
             return Ok((
                 Rc::new(self.materialize_bounded_store(table_id, BoundedRead::All)?),
                 schema,
@@ -121,10 +115,10 @@ impl CatalogEngine {
         };
 
         let mut cursor = entry.open_cursor();
-        // Position first, then size the output off the walk's own upper bound, so
-        // the appends below never re-grow (each growth re-copies every live byte).
-        // A key list is bounded by its own length instead — it names at most one
-        // group per key, and the cursor still spans the whole store.
+        // Position first, then size the output off the walk's own upper bound so
+        // the appends below re-grow as little as possible (each growth re-copies
+        // every live byte). For a key list that bound is the key count, which a
+        // view's synthetic PK can exceed — one key names a whole group there.
         let cap = match read {
             BoundedRead::Keys(keys) => keys.len() / stride,
             BoundedRead::Range(start, end) => {
@@ -186,8 +180,7 @@ impl CatalogEngine {
     }
 
     /// Byte-keyed [`seek_family`] — the primitive both spellings resolve to, for
-    /// callers that already hold the OPK bytes. Registry-uniform: system tables
-    /// are pre-registered `Borrowed` handles, so one lookup serves every id.
+    /// callers that already hold the OPK bytes.
     pub(crate) fn seek_family_bytes(&mut self, table_id: i64, pk: &[u8]) -> Result<Option<Batch>, String> {
         let entry = self.table_entry(table_id)?;
         if entry.needs_hydration() {
@@ -214,28 +207,19 @@ impl CatalogEngine {
         (batch.count > 0).then_some(batch)
     }
 
-    /// Batched point lookup. Seek each PK in `pks` (verbatim OPK bytes) in this
-    /// worker's store, appending the stored row (weight 1) for every present,
-    /// live key into a result batch projected to `project`. Order is not required
-    /// for correctness; passing `pks` ascending keeps the cursor's binary-search
-    /// probes monotonic for better cache locality.
-    /// Absent / retracted keys are skipped — identical to `seek_family`'s
-    /// single-key `None` — so a removed PK with no committed row contributes
-    /// nothing. `project` lists the parent column indices to return (all
-    /// non-PK scalar columns); an empty `project` returns PK-only rows.
-    /// Each PK resolves to its group's FIRST live row, which is also its only one:
-    /// `validate_fk_column` admits only a base table as an FK parent, and a base
-    /// table's PK is kept unique by `enforce_unique_pk`. The consumer requires that —
-    /// it indexes the result by PK, so a second row of a group would overwrite the
-    /// first rather than join it.
-    /// The seek and `pk IN (…)` readers, whose consumers take whole groups, walk
-    /// instead.
+    /// Batched point lookup for the FK parent probe. Seek each PK in `pks`
+    /// (verbatim OPK bytes) in this worker's store, appending the stored row at
+    /// weight 1 for every present, live key into a result batch projected to
+    /// `project` (parent column indices, all non-PK scalar). Absent / retracted
+    /// keys contribute nothing, and passing `pks` ascending keeps the cursor's
+    /// probes monotonic.
     ///
-    /// Reuses one cursor across all keys (cheaper than N `seek_family` calls,
-    /// each of which re-opens one). Projection keeps the result scalar-only —
-    /// FK-referenced columns are never STRING/BLOB — so the blob arena is never
-    /// touched. Works for both narrow and wide PKs: the OPK bytes are seeked
-    /// verbatim, with no native→OPK re-encode.
+    /// Each PK resolves to its group's FIRST live row, which is also its only
+    /// one: `validate_fk_column` admits only a base table as an FK parent, and a
+    /// base table's PK is kept unique by `enforce_unique_pk`. The consumer
+    /// requires that — it indexes the result by PK, so a second row of a group
+    /// would overwrite the first rather than join it. The seek and `pk IN (…)`
+    /// readers, whose consumers take whole groups, walk instead.
     pub fn gather_family_bytes<'k>(
         &mut self,
         table_id: i64,
@@ -339,7 +323,7 @@ impl CatalogEngine {
         // the opener is a provably-empty range (a `+∞` start, or an inverted /
         // zero-width interval); the `.filter` maps the cursor's `Some(empty)`
         // ("in-range entries, none resolved") back to this API's `None`.
-        let Some(mut cur) = self.open_index_range_cursor(table_id, col_indices, range)? else {
+        let Some(mut cur) = self.open_index_range_cursor(table_id, col_indices, range, 0)? else {
             return Ok((None, src_schema));
         };
         Ok((cur.drain_chunk(usize::MAX).filter(|b| b.count > 0), src_schema))
@@ -353,21 +337,23 @@ impl CatalogEngine {
     /// yields exactly the in-range source rows, so callers needing every match
     /// (the point/range seek, an `exact` ScanSpec index bound) drive this directly.
     ///
-    /// Preserves the write-ordering guarantee of the non-atomic base-then-index
-    /// write path: the index cursor snapshots first and the base cursor after, so
+    /// `pk_capacity` sizes the walk's per-chunk PK scratch; `0` lets it grow.
+    ///
+    /// The one place an index-bounded cursor is built, so the write-ordering
+    /// guarantee of the non-atomic base-then-index write path lives here alone:
+    /// the index cursor snapshots first and the base cursor after, which means
     /// every entry the walk yields already had its base row written.
     pub(crate) fn open_index_range_cursor(
         &mut self,
         table_id: i64,
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
+        pk_capacity: usize,
     ) -> Result<Option<BoundedIndexCursor>, String> {
         let (entry, ic) = self.table_and_index(table_id, col_indices)?;
         let Some((start, end)) = index_range_keys(ic, range)? else {
             return Ok(None);
         };
-        // Index cursor first, base cursor after — the write-ordering guarantee
-        // above.
         let idx = ic.table_mut().open_cursor();
         let src = entry.open_cursor();
         Ok(Some(BoundedIndexCursor::new(
@@ -376,26 +362,20 @@ impl CatalogEngine {
             start,
             end,
             ic.key_spec,
-            // No measured range size on this path; the PK scratch grows.
-            0,
+            pk_capacity,
         )))
     }
 
-    /// Flush a table's WAL.
+    /// Flush one relation's memtable and its index tables. The flush compacts
+    /// too: publishing a shard is what makes compaction due, so L0 cannot
+    /// accumulate across a DDL-heavy session without the flush that grew it also
+    /// bounding it. Registry-uniform — a system family's `Borrowed` handle
+    /// reaches the same `Table` its `sys_stores` box holds. Production flushes
+    /// the whole catalog at once through `flush_all_system_tables`.
     pub fn flush_family(&mut self, table_id: i64) -> Result<(), String> {
-        if table_id < FIRST_USER_TABLE_ID {
-            if let Some(table) = self.sys_table_mut(table_id) {
-                // The flush compacts too: publishing a shard is what makes
-                // compaction due, so L0 cannot accumulate across a DDL-heavy
-                // session without the flush that grew it also bounding it.
-                table.flush().map_err(|e| format!("flush error: {e}"))?;
-            }
-            Ok(())
-        } else {
-            self.dag
-                .flush(table_id)
-                .map_err(|e| format!("flush failed for table_id={table_id}: {e}"))
-        }
+        self.dag
+            .flush(table_id)
+            .map_err(|e| format!("flush failed for table_id={table_id}: {e}"))
     }
 
     /// Worker DDL sync: apply a master-broadcast system-table delta. Workers
@@ -435,18 +415,15 @@ impl CatalogEngine {
     }
 
     /// The source cursor for driving `source` through `view_id`'s circuit: an
-    /// index-bounded cursor when the compiled plan pushed a bound down, the index
-    /// circuit resolves, and the range measures selective; else the full-scan
-    /// cursor. Every fallback is a **performance** choice, never a correctness one
-    /// — the circuit's `Filter` is authoritative and unchanged, so `Full` and
-    /// `Bounded` yield the same view. Note the open may COMPILE the view (see the
-    /// `ensure_compiled` below) — plan-cache side effects included.
+    /// index-bounded cursor when the compiled plan pushed a bound down and
+    /// [`Self::open_bounded_source`] takes it, else the full-scan cursor. The
+    /// circuit's `Filter` is authoritative either way, so the choice only decides
+    /// how many rows are read. The open may COMPILE the view.
     ///
-    /// `None` iff the source table is **unregistered** — byte-identical to
-    /// `open_store_cursor`'s contract, which callers treat as "skip this source".
-    /// A registered-but-empty table yields `Some`, and a *provably empty* range
-    /// yields `Some(SourceCursor::Empty)`: collapsing that into `None` would make a
-    /// driver skip the source entirely rather than feed it one empty epoch.
+    /// `None` iff the source table is unregistered, which callers treat as "skip
+    /// this source". A registered-but-empty table yields `Some`, and a provably
+    /// empty range yields `Some(SourceCursor::Empty)` — collapsing that into
+    /// `None` would skip the source rather than feed it one empty epoch.
     pub(crate) fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Option<SourceCursor> {
         // Must precede `source_scan_bound`: `handle_backfill` reaches here before
         // anything compiles the view, and an uncached plan would silently report
@@ -475,76 +452,84 @@ impl CatalogEngine {
     }
 
     /// The index-bounded source cursor for the range `desc` on `idx_cols` of
-    /// `source`, gated by selectivity: a `BoundedIndexCursor` when the range
-    /// covers at most 1/`INDEX_SCAN_RATIO` of the local base slice, else the
-    /// full-scan cursor — built only on that verdict, never speculatively — plus
-    /// `SourceCursor::Empty` for a provably-empty range. Every non-`Bounded`
-    /// outcome is a PERFORMANCE choice,
-    /// never a correctness one — a caller's authoritative filter (a circuit's
-    /// `Filter`, a ScanSpec's residual predicate) re-imposes the range — so the
-    /// non-`exact` ScanSpec index bound and the circuit backfill share this one gate.
+    /// `source`, gated by [`Self::index_scan_verdict`]; the full-scan cursor
+    /// when the gate declines, and `SourceCursor::Empty` for a provably-empty
+    /// range. Every non-`Bounded` outcome is a performance choice, never a
+    /// correctness one — the caller's authoritative filter (a circuit's `Filter`,
+    /// a ScanSpec's residual predicate) re-imposes the range — so the non-`exact`
+    /// ScanSpec index bound and the circuit backfill share this one gate.
     ///
-    /// `None` iff `source` is unregistered (byte-identical to
-    /// `open_store_cursor`'s contract, which callers treat as "skip this source").
+    /// `None` iff `source` is unregistered, which callers treat as "skip this
+    /// source".
     pub(crate) fn open_bounded_source(
         &mut self,
         source: i64,
         idx_cols: &[u32],
         desc: &gnitz_wire::RangeDescriptor,
     ) -> Option<SourceCursor> {
-        let Ok((entry, ic)) = self.table_and_index(source, idx_cols) else {
-            // The index was dropped since the plan compiled.
-            return self.full_source(source);
+        let m = match self.index_scan_verdict(source, idx_cols, desc) {
+            IndexScan::Use(m) => m.min(self.ddl_scan_chunk_rows),
+            IndexScan::Empty => return Some(SourceCursor::Empty),
+            IndexScan::Decline => return self.full_source(source),
         };
-        let (start, end) = match index_range_keys(ic, desc) {
-            // Provably empty — decided before any cursor is built.
-            Ok(Some(keys)) => keys,
-            Ok(None) => return Some(SourceCursor::Empty),
-            // Malformed: `n_eq` pins every column with no range column left.
-            Err(_) => return self.full_source(source),
-        };
-
-        // Only user base tables own index circuits, so a resolved index implies an
-        // owned base store; a borrowed system table degrades to the full scan like
-        // every other non-`Bounded` outcome here.
-        let Some(store) = entry.handle.as_owned_mut() else {
-            return self.full_source(source);
-        };
-        // `ingest_store_and_indices` writes base-then-index non-atomically, so the
-        // index must be snapshotted no later than the base: this opens the index
-        // cursor now and the base cursor after, which is the safe order (every
-        // entry the walk yields had its base row written first).
-        let idx = ic.table_mut().open_cursor();
-        // The only cost model. A bounded scan is not unconditionally cheaper: for a
-        // range matching M of N rows it costs an index walk of M, an M log M sort,
-        // and M galloping base probes, where a full scan is one sequential columnar
-        // drain of N — so it loses badly as M → N (`WHERE indexed > 0` matches
-        // everything). M is not estimated: it is measured exactly in O(log N)
-        // before the first row is read (`count_range_raw` is `&self` and
-        // repositions nothing). N comes from `estimated_rows` — arithmetic over
-        // the children's run and shard counts — rather than a cursor's
-        // `estimated_length`, so the base cursor is opened only once the gate
-        // passes, instead of speculatively on every open.
-        let m = idx.count_range_raw(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
-        if m > store.estimated_rows() / INDEX_SCAN_RATIO {
-            return self.full_source(source);
+        match self.open_index_range_cursor(source, idx_cols, desc, m) {
+            Ok(Some(c)) => Some(SourceCursor::Bounded(Box::new(c))),
+            Ok(None) => Some(SourceCursor::Empty),
+            Err(_) => self.full_source(source),
         }
-        let src = store.open_cursor();
-        Some(SourceCursor::Bounded(Box::new(BoundedIndexCursor::new(
-            idx,
-            src,
-            start,
-            end,
-            ic.key_spec,
-            // The PK scratch's exact per-chunk bound: the measured range size,
-            // capped at the drivers' chunk size.
-            m.min(self.ddl_scan_chunk_rows),
-        ))))
+    }
+
+    /// The only cost model. A bounded scan is not unconditionally cheaper: for a
+    /// range matching M of N rows it costs an index walk of M, an M log M sort,
+    /// and M galloping base probes, where a full scan is one sequential columnar
+    /// drain of N — so it loses badly as M → N (`WHERE indexed > 0` matches
+    /// everything). M is not estimated: it is measured exactly in O(log N) before
+    /// the first row is read (`count_range_raw` is `&self` and repositions
+    /// nothing). N comes from `estimated_rows` — arithmetic over the children's
+    /// run and shard counts — rather than a cursor's `estimated_length`, so the
+    /// base cursor is never opened speculatively.
+    fn index_scan_verdict(&self, source: i64, idx_cols: &[u32], desc: &gnitz_wire::RangeDescriptor) -> IndexScan {
+        // The index was dropped since the plan compiled, or `n_eq` pins every
+        // column with no range column left.
+        let Ok((entry, ic)) = self.table_and_index(source, idx_cols) else {
+            return IndexScan::Decline;
+        };
+        let keys = match index_range_keys(ic, desc) {
+            Ok(Some(keys)) => keys,
+            Ok(None) => return IndexScan::Empty,
+            Err(_) => return IndexScan::Decline,
+        };
+        // Only user base tables own index circuits, so a resolved index implies an
+        // owned base store; a borrowed system table degrades to the full scan.
+        let Some(store) = entry.handle.as_owned_mut() else {
+            return IndexScan::Decline;
+        };
+        let (start, end) = keys;
+        let m = ic
+            .table_mut()
+            .open_cursor()
+            .count_range_raw(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
+        if m > store.estimated_rows() / INDEX_SCAN_RATIO {
+            return IndexScan::Decline;
+        }
+        IndexScan::Use(m)
     }
 }
 
-/// Use the index only when its range covers at most 1/16 of the local base slice.
+/// Use the index only when its range covers at most `1/INDEX_SCAN_RATIO` of the
+/// local base slice.
 const INDEX_SCAN_RATIO: usize = 16;
+
+/// What the cost model says about an index-bounded scan of one range.
+enum IndexScan {
+    /// Walk the index; the value is the exactly measured range size.
+    Use(usize),
+    /// The range is provably empty — there is nothing to read either way.
+    Empty,
+    /// Full-scan instead: no usable index, no owned base store, or the range is
+    /// not selective enough to pay for the walk.
+    Decline,
+}
 
 /// A chunked source of `Batch`es over one relation, in every shape a bound can
 /// take. Interchangeable by construction for the circuit backfill: the circuit's
@@ -567,8 +552,8 @@ pub(crate) enum SourceCursor {
 
 impl SourceCursor {
     /// The next source rows, or `None` once the source is exhausted. A returned
-    /// batch may be empty (a window of `PkSet` keys this worker holds no row
-    /// for); `None` strictly means "no further rows".
+    /// batch may be empty — `Bounded` yields one for a window of index entries
+    /// whose base rows all resolved away — so only `None` means exhausted.
     ///
     /// `max_rows` bounds every variant exactly except `PkSet`, which tests it
     /// before each key and then drains that key's whole group, so it can

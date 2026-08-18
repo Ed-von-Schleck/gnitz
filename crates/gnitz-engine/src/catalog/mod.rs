@@ -1,36 +1,29 @@
-//! Catalog engine: DDL operations, system table management, hook processing,
-//! and entity registry.
-//!
-//! The CatalogEngine wraps DagEngine and adds:
-//! - EntityRegistry (name → ID mapping, FK constraints, index tracking)
-//! - System table definitions and bootstrap
-//! - DDL intent (CREATE/DROP SCHEMA/TABLE/VIEW/INDEX)
-//! - Hook processing (schema, table, view, index, dep effects)
-//! - Catalog persistence and recovery
+//! Catalog engine: the entity registry, the system tables and their bootstrap,
+//! DDL application, hook processing, and catalog recovery — all wrapped around
+//! `DagEngine`.
 //!
 //! # Hook model
 //!
-//! System-table writes flow through [`fire_hooks`](CatalogEngine::fire_hooks),
-//! which dispatches two categories of handler per sys_table_id:
+//! Every system-table write flows through
+//! [`fire_hooks`](CatalogEngine::fire_hooks), which dispatches a static
+//! per-family sequence of two kinds of handler over a sign-partitioned view of
+//! the batch (all retractions before all insertions, so a rename's `-1,+1` pair
+//! on one PK applies in that order):
 //!
-//! * `apply_*` — pure cache-delta appliers, run over a sign-partitioned view of
-//!   the batch (all retractions before all insertions) so a rewrite pair
-//!   (a rename's -1,+1 on one PK) applies its retraction before its insertion.
-//! * `hook_*` — side-effectful handlers that create directories, allocate store
-//!   stores, register DAG entries, or backfill derived state. Storage is
-//!   applied before hooks fire, so the register/cascade hooks reconcile against
-//!   the row's *net* live state (`advance_to_exact_live`) rather than its own sign — a
-//!   rename pair (net-live before and after) fires neither teardown nor
-//!   re-registration, in any row order, on every application path.
+//! * `apply_*` — pure cache-delta appliers.
+//! * `hook_*` — side effects: directories, stores, DAG registrations, derived
+//!   state. Storage is applied before hooks fire, so these reconcile against the
+//!   row's *net* live state rather than its own sign; a rename pair is net-live
+//!   before and after, so it fires neither teardown nor re-registration.
 //!
-//! See `hooks.rs` for the cross-sys-table ordering contract and where it's
+//! See `hooks.rs` for the cross-family ordering contract and where it is
 //! enforced.
 
 mod apply_context;
 mod bootstrap;
 mod cache;
-mod ddl;
 mod hooks;
+mod index_backfill;
 mod metadata;
 mod registry;
 mod scan_spec;
@@ -39,7 +32,6 @@ mod store_lsn;
 mod sys_tables;
 mod types;
 mod utils;
-mod validation;
 mod write_path;
 
 #[cfg(test)]
@@ -62,10 +54,6 @@ pub(crate) use types::{ColumnDef, FkEdge};
 pub(crate) use cache::SchemaWireEntry;
 // The master's ScanSpec confinement test.
 pub(crate) use scan_spec::scan_spec_worker;
-// The fixed system-table schema for a family tid, for callers holding a raw
-// id. Anything holding an untrusted id resolves it through `SysFamily::from_id`
-// and reads `SysFamily::schema` instead — this panics on a non-family id.
-pub(crate) use sys_tables::sys_tab_schema;
 
 // Import everything from sys_tables for internal use.
 use registry::build_schema_from_col_defs;
@@ -81,26 +69,23 @@ pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use registry::raise_id_counter;
 pub(in crate::catalog) use sys_tables::{PUBLIC_SCHEMA_ID, SYSTEM_SCHEMA_ID};
-// The child-directory grammar is owned by storage; the catalog only consumes it.
-pub(in crate::catalog) use crate::storage::{subdir_names, ChildAddr};
+// The child-directory grammar and the directory primitives are storage's; the
+// catalog only consumes them.
+pub(in crate::catalog) use crate::storage::{fsync_dir, reclaim_retired_children, subdir_names, ChildAddr};
 pub(in crate::catalog) use utils::{
-    cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, index_dir, is_index_dir_name, is_table_dir_name,
-    make_fk_index_name, preflight_dir, reclaim_retired_children, relation_dir, retract_key_range, retract_single_row,
-    schema_dir, sys_catalog_dir, sys_family_dir, sys_opk,
+    cursor_read_string, cursor_read_u64, ensure_dir, index_dir, is_table_dir_name, make_fk_index_name, preflight_dir,
+    relation_dir, retract_key_range, retract_single_row, schema_dir, sys_catalog_dir, sys_family_dir, sys_opk,
 };
-#[cfg(test)]
-pub(in crate::catalog) use utils::{make_secondary_index_name, parse_qualified_name};
-pub(in crate::catalog) use write_path::CatalogDeltaSink;
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
-// for catalog's ddl/bootstrap/store callers.
+// for the catalog's row builders.
 pub(crate) use crate::storage::BatchBuilder;
 
 // ---------------------------------------------------------------------------
 // CatalogEngine
 // ---------------------------------------------------------------------------
 
-/// Rows per `drain_chunk` call on a DDL scan (index/view backfill, unique
-/// pre-flight). Bounds peak backfill memory at O(chunk × row_width).
+/// Default rows per `drain_chunk` call on a chunked scan. Bounds peak scan
+/// memory at O(chunk × row_width).
 pub(crate) const DDL_SCAN_CHUNK_ROWS: usize = 65_536;
 
 /// The catalog engine wraps DagEngine and manages the entity registry,
@@ -127,8 +112,8 @@ pub struct CatalogEngine {
     /// The launched worker count. Threaded in from `run_server` rather than read
     /// off `worker_ctx`, which is 1 in the master process (`set_worker_rank` runs
     /// only post-fork): a store built from the ambient value would be named
-    /// `w0of1` while the boot repartition wrote `w0of{W}..`, the child-dir sweep
-    /// would delete it as unowned, and worker 0 would inherit a deleted directory.
+    /// `w0of1` while the boot repartition wrote `w0of{W}…`, and the child-dir
+    /// sweep would delete it as unowned.
     pub(crate) num_workers: u32,
     /// True while this process owns its relations' stores. The post-fork master
     /// detaches every user relation and stays inert, so anything reading local
@@ -146,7 +131,7 @@ pub struct CatalogEngine {
     /// it into `worker_ctx` for the `Table::new` callers holding no catalog.
     pub(crate) resume_generation: u64,
     /// The topology row last recorded: `(worker_count as u64) << 32 | STATE_FORMAT`.
-    /// Recovered from `SEQ_ID_TOPOLOGY` at boot (0 on a fresh DB); commit 3
+    /// Recovered from `SEQ_ID_TOPOLOGY` at boot (0 on a fresh DB). `topology_matches`
     /// compares it against the launched worker count + `STATE_FORMAT` to decide
     /// whether persisted view state is reloadable.
     pub(crate) recorded_topology: u64,
@@ -167,13 +152,17 @@ pub struct CatalogEngine {
 
     // --- Pending broadcasts (ordered innermost → outermost) ---
     //
-    // System-table DDL goes through `ingest_to_family` → `fire_hooks`. Hooks
-    // may recursively call `ingest_to_family` to cascade retractions (indices,
-    // columns, circuit graph, view deps). Each nested call appends its
-    // (family, batch) AFTER its own hooks fire, so this queue ends up in
-    // dependency-safe order: children before parents. The executor drains it
-    // once per top-level DDL and relays each entry to workers. Workers never
-    // drain this (no broadcast channel), so it stays empty there.
+    // Every family the master applies is queued here for relay to the workers.
+    // A hook may recursively `submit` a cascade retraction (indices, columns,
+    // circuit graph); each nested call appends its (family, batch) AFTER its own
+    // hooks fire, so the queue ends up in dependency-safe order — children
+    // before parents. The executor drains it once per top-level DDL.
+    //
+    // A worker reaches the same enqueue through `ddl_sync` → cascade → `submit`,
+    // and never drains. It stays empty there only because the master broadcasts
+    // children before parents: by the time a worker applies the parent `-1`, its
+    // own cascade finds nothing live and produces an empty batch, which
+    // `apply_and_enqueue_family` drops.
     pub(crate) pending_broadcasts: Vec<(SysFamily, Batch)>,
 
     // --- Deferred physical directory deletions ---
@@ -201,11 +190,12 @@ pub struct CatalogEngine {
     // DDL-zone LSN. See `ApplyContext`.
     pub(crate) ctx: ApplyContext,
 
-    /// Rows per `drain_chunk` call in DDL backfills and the unique pre-flight
-    /// scan. Defaults to [`DDL_SCAN_CHUNK_ROWS`]; lives on the engine rather
-    /// than being a parameter because the backfills are invoked from hooks,
-    /// which tests can only reach through `submit` — they shrink this field
-    /// instead to exercise chunk boundaries.
+    /// Rows per `drain_chunk` call on every chunked scan the engine drives:
+    /// index and view backfill, the bounded-view hydration merge, the ad-hoc
+    /// `ReadSpec` scan. Defaults to [`DDL_SCAN_CHUNK_ROWS`], overridden by
+    /// `GNITZ_DDL_SCAN_CHUNK_ROWS`. A field rather than a parameter because the
+    /// backfills are invoked from hooks, which tests can only reach through
+    /// `submit` — they shrink this instead to exercise chunk boundaries.
     pub(crate) ddl_scan_chunk_rows: usize,
 
     /// Per-worker distinct-group cap for the ad-hoc aggregate fold

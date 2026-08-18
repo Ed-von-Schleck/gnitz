@@ -239,22 +239,22 @@ fn system_range_mutations_rejected() {
     let view_create = build_view_tab_row(IDX_TAB_ID, "v", "SELECT 1");
 
     let members_before = engine.schema_member_count(PUBLIC_SCHEMA_ID);
-    for (family, batch, verb) in [
-        (SysFamily::Table, &table_drop, "DROP"),
-        (SysFamily::Table, &table_rename, "ALTER"),
-        (SysFamily::View, &view_rename, "ALTER"),
-        (SysFamily::View, &view_create, "CREATE"),
+    for (family, batch, verb, noun) in [
+        (SysFamily::Table, &table_drop, "DROP", "table"),
+        (SysFamily::Table, &table_rename, "ALTER", "table"),
+        (SysFamily::View, &view_rename, "ALTER", "view"),
+        (SysFamily::View, &view_create, "CREATE", "view"),
     ] {
-        let err = engine.ingest_to_family(family.info().id(), batch).unwrap_err();
-        assert!(err.contains(&format!("cannot {verb} a system relation")), "{err}");
+        let err = engine.ingest_to_family(family.id(), batch).unwrap_err();
+        assert!(err.contains(&format!("cannot {verb} a system {noun}")), "{err}");
     }
 
     // Nothing was torn down or aliased on the way to the reject.
-    for info in &SYS_FAMILIES {
+    for family in SysFamily::ALL {
         assert!(
-            engine.dag.tables.contains_key(&info.id()),
+            engine.dag.tables.contains_key(&family.id()),
             "{} unregistered",
-            info.wire.name
+            family.name()
         );
     }
     assert!(engine.pending_dir_deletions.is_empty());

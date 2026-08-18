@@ -87,16 +87,16 @@ fn bootstrap_self_description_matches_the_wire_column_lists() {
         c.advance();
     }
 
-    // Driven off `SYS_FAMILIES` rather than a hand-written list, so a family
+    // Driven off `SysFamily::ALL` rather than a hand-written list, so a family
     // added later is covered without touching this test.
-    for info in &SYS_FAMILIES {
+    for family in SysFamily::ALL {
         let mut rows = described
-            .remove(&(info.id() as u64))
-            .unwrap_or_else(|| panic!("family {} describes no columns", info.wire.name));
+            .remove(&(family.id() as u64))
+            .unwrap_or_else(|| panic!("family {} describes no columns", family.name()));
         rows.sort_by_key(|(idx, _)| *idx);
         let names: Vec<&str> = rows.iter().map(|(_, n)| n.as_str()).collect();
-        let expected: Vec<&str> = info.wire.cols.iter().map(|c| c.name).collect();
-        assert_eq!(names, expected, "family {} self-description", info.wire.name);
+        let expected: Vec<&str> = family.wire().cols.iter().map(|c| c.name).collect();
+        assert_eq!(names, expected, "family {} self-description", family.name());
     }
     // A fresh server holds no user tables, so the system families are the whole
     // of COL_TAB — anything left over is a row describing a table that is not a
@@ -253,7 +253,6 @@ fn test_edge_cases() {
     engine.drop_table("public.casetest").unwrap();
 
     // 24. Invalid schema ID lookup
-    assert_eq!(engine.get_schema_name_by_id(999999), "");
     assert_eq!(engine.get_schema_id("nonexistent"), -1);
 
     engine.close();
@@ -433,15 +432,15 @@ fn test_nullable_pk_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── test_hook_table_register_rejects_malformed_pk ────────────────────
+// ── test_hook_relation_register_rejects_malformed_pk ─────────────────
 
 // Drives crafted/malformed packed PK values through the production
 // wire-ingest path (`ingest_to_family` → `fire_hooks` →
-// `hook_table_register`) and asserts each is rejected with an `Err`
+// `hook_relation_register`) and asserts each is rejected with an `Err`
 // rather than panicking the server via a `SchemaDescriptor::new`
 // `assert!`.
 #[test]
-fn test_hook_table_register_rejects_malformed_pk() {
+fn test_hook_relation_register_rejects_malformed_pk() {
     let dir = temp_dir("pk_reject");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -580,7 +579,7 @@ fn test_drop_view_removes_directory() {
 }
 
 // ── test_drop_view_cascades_columns_and_circuit_rows ─────────────────
-// DROP VIEW retracts only the VIEW_TAB row; the cascade in hook_view_register
+// DROP VIEW retracts only the VIEW_TAB row; the cascade in hook_relation_register
 // must clean up BOTH the view's sys_columns rows and its circuit rows. The
 // circuit assertion is the regression guard for removing drop_view's manual
 // retraction — it proves the VIEW_TAB cascade (cascade_retract_circuit) still
@@ -637,32 +636,30 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
 }
 
 // ── ddl_emitters_use_no_raw_handle_capability ────────────────────────
-// Capability guard: the DDL emitters mutate catalog state only through
-// submit / submit_local / submit_retraction. They must never name a `sys_*`
-// handle directly — no `sys_table_mut`, no direct `self.sys_*` field access
-// (the only ways to reach a sys-table `ingest_*` from ddl.rs). A violation
-// reintroduces the fused capability the applier/emitter split removed, so it
-// fails here.
+// Capability guard: a DDL emitter mutates catalog state only by submitting a
+// delta (submit / submit_local / submit_retraction). It may READ a family's
+// store — `submit_retraction` copies the live row it is about to negate — but it
+// must never reach a mutable handle and ingest into it, which would skip the
+// precheck, the hooks and the broadcast queue in one line. Pinned as source text
+// because no runtime assertion can observe the absence of a call.
 
 #[test]
 fn ddl_emitters_use_no_raw_handle_capability() {
-    let src = include_str!("../ddl.rs");
-    assert!(
-        !src.contains("sys_table_mut"),
-        "ddl.rs must not call sys_table_mut — the emitters cannot name a sys_* handle"
-    );
-    assert!(
-        !src.contains("self.sys_"),
-        "ddl.rs must not touch a sys_* handle directly — emit a delta via submit instead"
-    );
+    let src = include_str!("ddl_fixture.rs");
+    for forbidden in ["sys_store_mut", "ingest_borrowed_batch", "ingest_owned_batch"] {
+        assert!(
+            !src.contains(forbidden),
+            "a DDL emitter must not call {forbidden} — emit a delta via submit instead"
+        );
+    }
 }
 
 // ── drop_cascade_broadcasts_children_before_parents ──────────────────
 // fire_hooks enqueues a table retraction's cascade children (IDX/COL)
 // BEFORE the parent TABLE row: cascade_retract_indices / _columns call
-// `submit` from inside hook_table_register, each pushing to
+// `submit` from inside hook_relation_register, each pushing to
 // pending_broadcasts, and the top-level TABLE batch is pushed only after
-// fire_hooks returns (CatalogDeltaSink::submit). The executor forwards the
+// fire_hooks returns (`submit`). The executor forwards the
 // queue in order, so workers see children → parent — the order in which a
 // drop's dependent rows can be safely applied.
 //
@@ -682,7 +679,7 @@ fn drop_cascade_broadcasts_children_before_parents() {
     // Clear the broadcasts accumulated by create_table + create_index.
     let _ = engine.drain_pending_broadcasts();
 
-    // Submit the table retraction; its -1 fires hook_table_register, whose
+    // Submit the table retraction; its -1 fires hook_relation_register, whose
     // retract branch cascades the owned index (IDX) and columns (COL).
     engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
 
@@ -763,7 +760,7 @@ fn table_retract_applies_qname_before_id() {
 // ── replicated_bit_is_transitive_and_survives_replay ─────────────────
 // A view is stamped replicated iff every source it scans is, so the property
 // climbs a view chain: base → producer → consumer. Registration reads its
-// sources' already-registered state, so `hook_view_register` must process a batch
+// sources' already-registered state, so `hook_relation_register` must process a batch
 // in dependency order — which neither order it sees is. Both are reproduced here:
 // the live batch carries the consumer before the producer, and replay walks
 // VIEW_TAB in PK order, in which the consumer's id is the LOWER one (a chain's

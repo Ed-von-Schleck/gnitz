@@ -17,17 +17,17 @@ impl CatalogEngine {
         // Create system tables (one `Table` each; durability derived from the
         // kind they are later registered under).
         let mut stores = Vec::with_capacity(SysFamily::COUNT);
-        for info in &SYS_FAMILIES {
+        for family in SysFamily::ALL {
             let table = Table::new(
-                &sys_family_dir(base_dir, info.wire.name),
-                sys_tab_schema(info.id()),
-                info.id() as u32,
+                &sys_family_dir(base_dir, family.name()),
+                family.schema(),
+                family.id() as u32,
                 RelationKind::SystemCatalog
                     .recovery_source()
                     .expect("a system catalog family owns a store"),
             )
             .map(Box::new)
-            .map_err(|e| format!("Failed to create system table '{}': error {}", info.wire.name, e))?;
+            .map_err(|e| format!("Failed to create system table '{}': error {}", family.name(), e))?;
             stores.push(table);
         }
         let sys_stores: [Box<Table>; SysFamily::COUNT] = stores
@@ -78,9 +78,10 @@ impl CatalogEngine {
         // Phase 1: Recover sequence counters
         engine.recover_sequences();
 
-        // Before `replay_catalog`, whose index hook reads it.
-        // `recovery_start_generation_bump` leaves this where it is, so a clean
-        // restart resumes from the last completed checkpoint.
+        // Before `replay_catalog`, whose view and index register hooks read it
+        // (through `RelationKind::recovery_source`). `recovery_start_generation_bump`
+        // leaves this where it is, so a clean restart resumes from the last
+        // completed checkpoint.
         engine.set_resume_generation(engine.durable_generation);
 
         // Register system table families
@@ -100,6 +101,16 @@ impl CatalogEngine {
 
     // -- Bootstrap (fresh database) ----------------------------------------
 
+    /// Write one family's seed rows straight to its store. The one path that
+    /// skips `submit`'s precheck and hooks: the DAG is not wired up yet, and
+    /// `replay_catalog` fires the hooks over these very rows a few lines later.
+    fn bootstrap_ingest(&mut self, family: SysFamily, bb: BatchBuilder) -> Result<(), String> {
+        let batch = bb.finish();
+        self.sys_store_mut(family)
+            .ingest_borrowed_batch(&batch)
+            .map_err(|e| format!("bootstrap: {} ingest failed: {e}", family.name()))
+    }
+
     fn bootstrap_system_tables(&mut self) -> Result<(), String> {
         // 1. Core schema records
         {
@@ -114,22 +125,16 @@ impl CatalogEngine {
                     1,
                 );
             }
-            let batch = bb.finish();
-            self.sys_store_mut(SysFamily::Schema)
-                .ingest_borrowed_batch(&batch)
-                .map_err(|e| format!("bootstrap: sys_schemas ingest failed: {e}"))?;
+            self.bootstrap_ingest(SysFamily::Schema, bb)?;
         }
 
         // 2. Table records (self-registration of system tables)
         {
             let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-            for info in &SYS_FAMILIES {
-                push_table_tab_row(&mut bb, info.id(), SYSTEM_SCHEMA_ID, info.wire.name, 0, 0, 1);
+            for family in SysFamily::ALL {
+                push_table_tab_row(&mut bb, family.id(), SYSTEM_SCHEMA_ID, family.name(), 0, 0, 1);
             }
-            let batch = bb.finish();
-            self.sys_store_mut(SysFamily::Table)
-                .ingest_borrowed_batch(&batch)
-                .map_err(|e| format!("bootstrap: sys_tables ingest failed: {e}"))?;
+            self.bootstrap_ingest(SysFamily::Table, bb)?;
         }
 
         // 3. Column records for all system tables — the COL_TAB self-description,
@@ -137,39 +142,18 @@ impl CatalogEngine {
         // the introspectable shape can never drift from the physical one.
         {
             let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-            for info in &SYS_FAMILIES {
-                for (i, c) in info.wire.cols.iter().enumerate() {
+            for family in SysFamily::ALL {
+                for (i, c) in family.wire().cols.iter().enumerate() {
                     let cd = ColumnDef {
                         name: c.name.to_string(),
                         type_code: c.type_code as u8,
                         is_nullable: c.nullable,
                         ..Default::default()
                     };
-                    push_col_tab_row(&mut bb, info.id(), OWNER_KIND_TABLE, i as i64, &cd, 1);
+                    push_col_tab_row(&mut bb, family.id(), OWNER_KIND_TABLE, i as i64, &cd, 1);
                 }
             }
-            let batch = bb.finish();
-            self.sys_store_mut(SysFamily::Column)
-                .ingest_borrowed_batch(&batch)
-                .map_err(|e| format!("bootstrap: sys_columns ingest failed: {e}"))?;
-        }
-
-        // 4. Sequence high-water marks
-        {
-            let mut bb = BatchBuilder::new(SysFamily::Sequence.schema());
-            bb.begin_row(SEQ_ID_SCHEMAS as u128, 1);
-            bb.put_u64((FIRST_USER_SCHEMA_ID - 1) as u64);
-            bb.end_row();
-            bb.begin_row(SEQ_ID_TABLES as u128, 1);
-            bb.put_u64((FIRST_USER_TABLE_ID - 1) as u64);
-            bb.end_row();
-            bb.begin_row(SEQ_ID_INDICES as u128, 1);
-            bb.put_u64((FIRST_USER_INDEX_ID - 1) as u64);
-            bb.end_row();
-            let batch = bb.finish();
-            self.sys_store_mut(SysFamily::Sequence)
-                .ingest_borrowed_batch(&batch)
-                .map_err(|e| format!("bootstrap: sys_sequences ingest failed: {e}"))?;
+            self.bootstrap_ingest(SysFamily::Column, bb)?;
         }
 
         // Publish the foundational metadata. The families bootstrap did not
@@ -210,26 +194,27 @@ impl CatalogEngine {
 
     // -- Register system table families ------------------------------------
 
+    /// Enter each system family in the DAG registry as a `Borrowed` handle on
+    /// its `sys_stores` box, so every store path resolves a system table through
+    /// the same registry lookup as a user relation. Their name/id caches are not
+    /// seeded here: `replay_catalog` (next) replays SCHEMA_TAB and TABLE_TAB
+    /// through the appliers, which fill them from the persisted rows. The
+    /// registration itself must precede that replay — `hook_relation_register`
+    /// skips an already-registered id, which is what keeps a system family from
+    /// being re-registered as a user relation.
     fn register_system_table_families(&mut self) {
-        self.caches.schema_by_name.insert("_system".into(), SYSTEM_SCHEMA_ID);
-        self.caches.schema_by_id.insert(SYSTEM_SCHEMA_ID, "_system".into());
-
         let base_dir = self.base_dir.clone();
-        for (info, store) in SYS_FAMILIES.iter().zip(self.sys_stores.iter_mut()) {
-            let dir = sys_family_dir(&base_dir, info.wire.name);
-            let qualified = format!("_system.{}", info.wire.name);
-            self.caches.entity_by_qname.insert(qualified, info.id());
-            self.caches
-                .entity_by_id
-                .insert(info.id(), ("_system".into(), info.wire.name.into()));
+        for (family, store) in SysFamily::ALL.into_iter().zip(self.sys_stores.iter_mut()) {
+            let dir = sys_family_dir(&base_dir, family.name());
             self.dag.register_table(
-                info.id(),
+                family.id(),
                 crate::query::TableEntry::new(
                     StoreHandle::Borrowed(&mut **store),
-                    sys_tab_schema(info.id()),
+                    family.schema(),
                     RelationKind::SystemCatalog,
                     0,
                     dir,
+                    None,
                 ),
             );
         }
@@ -250,9 +235,13 @@ impl CatalogEngine {
     // -- Replay catalog (recovery) -----------------------------------------
 
     fn replay_catalog(&mut self) -> Result<(), String> {
-        // Only these five families need hook-driven replay — Circuit* and
-        // sys_sequences are loaded directly by other open-time paths — and
-        // their ORDER is the dependency order (see the hooks.rs dispatch doc).
+        // Only these five families need hook-driven replay; Circuit* and
+        // sys_sequences are loaded directly by other open-time paths. Schema
+        // must precede the two relation families (their qualified names need it),
+        // and Index must follow them. COL_TAB replaying last does NOT violate the
+        // COL-before-relation contract: the register hooks read sys_columns
+        // storage directly, which is already loaded (see the hooks.rs dispatch
+        // doc).
         self.replay_system_table(SysFamily::Schema)?;
         self.replay_system_table(SysFamily::Table)?;
         self.replay_system_table(SysFamily::View)?;

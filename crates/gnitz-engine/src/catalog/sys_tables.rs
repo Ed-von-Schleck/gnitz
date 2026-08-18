@@ -10,9 +10,12 @@ use crate::storage::{Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
 
 use gnitz_wire::{
-    IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID,
-    IDXTAB_PAY_SOURCE_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID,
-    VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
+    COLTAB_COL_FK_COL_IDX, COLTAB_COL_FK_TABLE_ID, COLTAB_COL_IS_HIDDEN, COLTAB_COL_IS_NULLABLE, COLTAB_COL_IS_SERIAL,
+    COLTAB_COL_NAME, COLTAB_COL_TYPE_CODE, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
+    COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_TYPE_CODE, IDXTAB_COL_IS_UNIQUE,
+    IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
+    TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY,
+    VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,8 +81,8 @@ pub(crate) use gnitz_wire::PkColList;
 pub(super) use gnitz_wire::{pack_pk_cols, PK_LIST_MAX_COLS, PK_LIST_PACKED_FLAG};
 
 /// Hard-validate a decoded PK list against the table's columns. Shared by
-/// the production wire path (`hook_table_register`) and the test-only
-/// `ddl.rs::create_table` so both reject identically rather than falling
+/// the production wire path (`hook_relation_register`) and the test-only
+/// `create_table` fixture so both reject identically rather than falling
 /// through to a `SchemaDescriptor::new` `assert!`. `pk.decoded_count()`
 /// (the raw decoded count, not the clamped slice length) is what gates
 /// `1..=PK_LIST_MAX_COLS`, so a crafted over-range count is rejected rather
@@ -146,7 +149,7 @@ pub(super) fn check_col_defs(col_defs: &[ColumnDef]) -> Result<(), String> {
 /// One admissibility check for a relation's column records + PK list, shared
 /// by the TABLE/VIEW precheck arms, both register hooks (the deliberate
 /// precheck/hook double-run — boot replay and worker ddl_sync skip precheck),
-/// and the test-only `ddl.rs::create_table`, so every layer rejects
+/// and the test-only `create_table` fixture, so every layer rejects
 /// identically. Non-empty col-defs first (the cross-family
 /// COL_TAB-before-TABLE/VIEW ordering contract), then [`check_col_defs`], then
 /// [`validate_pk_cols`].
@@ -208,6 +211,32 @@ pub(super) fn read_idx_tab_row(batch: &Batch, i: usize) -> (i64, PkColList, bool
         unpack_pk_cols(batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS)),
         batch.read_payload_u64(i, IDXTAB_PAY_IS_UNIQUE) != 0,
     )
+}
+
+/// Decode COL_TAB row `i` into the `ColumnDef` the schema builder consumes.
+pub(super) fn read_col_tab_row(batch: &Batch, i: usize) -> ColumnDef {
+    ColumnDef {
+        name: batch.read_payload_string(i, COLTAB_PAY_NAME),
+        type_code: batch.read_payload_u64(i, COLTAB_PAY_TYPE_CODE) as u8,
+        is_nullable: batch.read_payload_u64(i, COLTAB_PAY_IS_NULLABLE) != 0,
+        fk_table_id: batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64,
+        fk_col_idx: batch.read_payload_u64(i, COLTAB_PAY_FK_COL_IDX) as u32,
+        is_serial: batch.read_payload_u64(i, COLTAB_PAY_IS_SERIAL) != 0,
+        is_hidden: batch.read_payload_u64(i, COLTAB_PAY_IS_HIDDEN) != 0,
+    }
+}
+
+/// Cursor sibling of [`read_col_tab_row`].
+pub(super) fn read_col_tab_cursor_row(cursor: &crate::storage::ReadCursor) -> ColumnDef {
+    ColumnDef {
+        name: super::cursor_read_string(cursor, COLTAB_COL_NAME),
+        type_code: super::cursor_read_u64(cursor, COLTAB_COL_TYPE_CODE) as u8,
+        is_nullable: super::cursor_read_u64(cursor, COLTAB_COL_IS_NULLABLE) != 0,
+        fk_table_id: super::cursor_read_u64(cursor, COLTAB_COL_FK_TABLE_ID) as i64,
+        fk_col_idx: super::cursor_read_u64(cursor, COLTAB_COL_FK_COL_IDX) as u32,
+        is_serial: super::cursor_read_u64(cursor, COLTAB_COL_IS_SERIAL) != 0,
+        is_hidden: super::cursor_read_u64(cursor, COLTAB_COL_IS_HIDDEN) != 0,
+    }
 }
 
 /// Cursor sibling of [`read_idx_tab_row`]: `(owner_id, source_cols, is_unique)`
@@ -438,10 +467,11 @@ use crate::schema::from_wire_cols;
 // places every family `Replicated`, so a reader single-sources one copy instead of
 // gathering N (`DagEngine::relation_is_replicated`).
 static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
-    let mut arr = [from_wire_cols(SYS_FAMILIES[0].wire.cols, SYS_FAMILIES[0].wire.pk_cols); SysFamily::COUNT];
+    let w = gnitz_wire::SYS_FAMILIES;
+    let mut arr = [from_wire_cols(w[0].cols, w[0].pk_cols); SysFamily::COUNT];
     let mut i = 1;
     while i < SysFamily::COUNT {
-        arr[i] = from_wire_cols(SYS_FAMILIES[i].wire.cols, SYS_FAMILIES[i].wire.pk_cols);
+        arr[i] = from_wire_cols(w[i].cols, w[i].pk_cols);
         i += 1;
     }
     arr
@@ -456,6 +486,13 @@ static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
 /// corruption — abort rather than alias another column's record.
 pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
     gnitz_wire::pack_col_id(owner_id as u64, col_idx as u64).expect("catalog col-id packing out of range")
+}
+
+/// The half-open COL_TAB key band `[pack(owner, 0), pack(owner + 1, 0))` holding
+/// exactly `owner_id`'s column records — stated once so the read scan and the
+/// drop cascade cannot disagree on the upper bound.
+pub(super) fn column_id_band(owner_id: i64) -> (u64, u64) {
+    (pack_column_id(owner_id, 0), pack_column_id(owner_id + 1, 0))
 }
 
 /// Pack a circuit compound PK `(view_id, sub)` into the `u128` whose
@@ -473,90 +510,33 @@ pub(super) fn pack_view_pk(view_id: i64, sub: u64) -> u128 {
 }
 
 // ---------------------------------------------------------------------------
-// Per-family descriptor table
-// ---------------------------------------------------------------------------
-
-pub(crate) struct SysFamilyInfo {
-    /// The family's shared wire identity: its table id, its name (which is also
-    /// its subdirectory under `_system_catalog/`), and the column shape the
-    /// schema, the COL_TAB self-description rows, and the client's `Schema` all
-    /// derive from. Held by reference so the engine restates none of it.
-    pub(crate) wire: &'static gnitz_wire::WireSysFamily,
-    /// Topological creation priority. Lower = earlier in the dependency chain
-    /// (created first, destroyed last). Orders the `DDL_TXN` handler's
-    /// ascending forward ingest (so every register/index hook sees its
-    /// dependencies already in the memtable) and rollback's descending negate.
-    /// Distinct for Table and View so their relative order is stable; 99 =
-    /// order-neutral (Sequence, matching the non-family default).
-    pub(crate) topo_priority: u8,
-}
-
-impl SysFamilyInfo {
-    /// This family's table id, narrowed to the `i64` the catalog storage edge
-    /// and every `sys_*` signature use.
-    #[inline]
-    pub(crate) const fn id(&self) -> i64 {
-        self.wire.id as i64
-    }
-}
-
-/// Bind a family's shared wire descriptor to its engine-only topological
-/// priority. Const-panics on an id `gnitz-wire` does not know, so the table
-/// below cannot name a family that does not exist.
-const fn fam(id: u64, topo_priority: u8) -> SysFamilyInfo {
-    match gnitz_wire::sys_family(id) {
-        Some(wire) => SysFamilyInfo { wire, topo_priority },
-        None => panic!("not a wire system family"),
-    }
-}
-
-/// One descriptor per system family, indexed by `SysFamily` discriminant
-/// (asserted below).
-pub(crate) const SYS_FAMILIES: [SysFamilyInfo; SysFamily::COUNT] = [
-    fam(gnitz_wire::SCHEMA_TAB, 0),
-    fam(gnitz_wire::TABLE_TAB, 5),
-    fam(gnitz_wire::VIEW_TAB, 6),
-    fam(gnitz_wire::COL_TAB, 1),
-    fam(gnitz_wire::IDX_TAB, 7),
-    fam(gnitz_wire::SEQ_TAB, 99),
-    fam(gnitz_wire::CIRCUIT_NODES_TAB, 2),
-    fam(gnitz_wire::CIRCUIT_EDGES_TAB, 3),
-    fam(gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB, 4),
-];
-
-// `SYS_FAMILIES[f.index()]` must describe family `f`: verify the array order
-// against `from_id` (the ground-truth id mapping) at compile time.
-const _: () = {
-    let mut i = 0;
-    while i < SysFamily::COUNT {
-        match SysFamily::from_id(SYS_FAMILIES[i].id()) {
-            Some(f) => assert!(
-                f as usize == i,
-                "SYS_FAMILIES order must match SysFamily discriminant order"
-            ),
-            None => panic!("SYS_FAMILIES entry id is not a system family"),
-        }
-        i += 1;
-    }
-};
-
-/// The fixed schema for system-family `id`. Panics on a non-family id; callers
-/// holding an untrusted id go through `SysFamily::from_id` and `SysFamily::schema`.
-pub(crate) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
-    SysFamily::from_id(id)
-        .unwrap_or_else(|| panic!("Unknown system table ID: {id}"))
-        .schema()
-}
-
-// ---------------------------------------------------------------------------
 // Typed system family
 // ---------------------------------------------------------------------------
+
+/// Topological creation priority per family, indexed by discriminant. Lower =
+/// earlier in the dependency chain (created first, destroyed last). Orders the
+/// `DDL_TXN` handler's ascending forward ingest — so every register/index hook
+/// sees its dependencies already in the memtable — and rollback's descending
+/// negate. Table and View differ so their relative order is stable; 99 is
+/// order-neutral.
+const TOPO_PRIORITY: [u8; SysFamily::COUNT] = [
+    0,  // Schema
+    5,  // Table
+    6,  // View
+    1,  // Column
+    7,  // Index
+    99, // Sequence
+    2,  // CircuitNodes
+    3,  // CircuitEdges
+    4,  // CircuitNodeColumns
+];
 
 /// A catalog system-table family (every id below `FIRST_USER_TABLE_ID`). Used
 /// at the applier's mutation API in place of a bare `i64`, so the `fire_hooks`
 /// dispatch is an exhaustive `match` a newly-added family cannot silently skip.
 /// Convert to/from `i64` only at the storage edge. The discriminant indexes
-/// `SYS_FAMILIES`, `SCHEMAS`, and `CatalogEngine::sys_stores`.
+/// `gnitz_wire::SYS_FAMILIES`, `TOPO_PRIORITY`, `SCHEMAS`, and
+/// `CatalogEngine::sys_stores`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SysFamily {
     Schema,
@@ -573,22 +553,45 @@ pub(crate) enum SysFamily {
 impl SysFamily {
     pub(crate) const COUNT: usize = 9;
 
+    /// Every family in discriminant order, for the open/bootstrap/flush walks.
+    pub(crate) const ALL: [SysFamily; Self::COUNT] = [
+        SysFamily::Schema,
+        SysFamily::Table,
+        SysFamily::View,
+        SysFamily::Column,
+        SysFamily::Index,
+        SysFamily::Sequence,
+        SysFamily::CircuitNodes,
+        SysFamily::CircuitEdges,
+        SysFamily::CircuitNodeColumns,
+    ];
+
     /// Discriminant index into the per-family arrays.
     #[inline]
     pub(crate) const fn index(self) -> usize {
         self as usize
     }
 
-    /// The `*_TAB_ID` constant for this family.
+    /// This family's shared wire identity: its table id, its name (which is also
+    /// its subdirectory under `_system_catalog/`), and the column shape the
+    /// schema, the COL_TAB self-description rows, and the client's `Schema` all
+    /// derive from. Held in `gnitz-wire`, so the engine restates none of it.
     #[inline]
-    pub(crate) const fn id(self) -> i64 {
-        SYS_FAMILIES[self.index()].id()
+    pub(crate) fn wire(self) -> &'static gnitz_wire::WireSysFamily {
+        &gnitz_wire::SYS_FAMILIES[self.index()]
     }
 
-    /// This family's descriptor entry.
+    /// The `*_TAB_ID` constant for this family, narrowed to the `i64` the
+    /// catalog storage edge and every `sys_*` signature use.
     #[inline]
-    pub(crate) fn info(self) -> &'static SysFamilyInfo {
-        &SYS_FAMILIES[self.index()]
+    pub(crate) fn id(self) -> i64 {
+        self.wire().id as i64
+    }
+
+    /// This family's store subdirectory name.
+    #[inline]
+    pub(crate) fn name(self) -> &'static str {
+        self.wire().name
     }
 
     /// This family's fixed schema.
@@ -597,10 +600,23 @@ impl SysFamily {
         SCHEMAS[self.index()]
     }
 
-    /// Topological creation priority (see [`SysFamilyInfo::topo_priority`]).
+    /// Topological creation priority (see [`TOPO_PRIORITY`]).
     #[inline]
     pub(crate) fn topo_priority(self) -> u8 {
-        self.info().topo_priority
+        TOPO_PRIORITY[self.index()]
+    }
+
+    /// What one of this family's rows is called in a guard message.
+    pub(crate) fn row_noun(self) -> &'static str {
+        match self {
+            SysFamily::Schema => "schema",
+            SysFamily::Table => "table",
+            SysFamily::View => "view",
+            SysFamily::Column => "column",
+            SysFamily::Index => "index",
+            SysFamily::Sequence => "sequence",
+            SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => "circuit row",
+        }
     }
 
     /// Inverse of [`Self::id`]; `None` for any id that is not a system family.
@@ -619,6 +635,28 @@ impl SysFamily {
         }
     }
 }
+
+// The discriminant must index `gnitz_wire::SYS_FAMILIES`, and `ALL` must list
+// the families in that same order — checked against `from_id`, the ground-truth
+// id mapping, at compile time.
+const _: () = {
+    assert!(SysFamily::COUNT == gnitz_wire::SYS_FAMILIES.len());
+    let mut i = 0;
+    while i < SysFamily::COUNT {
+        assert!(
+            SysFamily::ALL[i] as usize == i,
+            "SysFamily::ALL must be in discriminant order"
+        );
+        match SysFamily::from_id(gnitz_wire::SYS_FAMILIES[i].id as i64) {
+            Some(f) => assert!(
+                f as usize == i,
+                "gnitz_wire::SYS_FAMILIES order must match SysFamily discriminant order"
+            ),
+            None => panic!("gnitz_wire::SYS_FAMILIES entry is not a known system family"),
+        }
+        i += 1;
+    }
+};
 
 #[cfg(test)]
 mod tests {

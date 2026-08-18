@@ -920,9 +920,9 @@ fn run_server(
     {
         let catalog = unsafe { &mut *catalog_ptr };
         // Per-view resume-vs-rebuild verdict against the checkpointed manifests
-        // (generation + topology + transitive source validity). Reads
-        // `worker_ctx::committed_generation()` (the recovered G), so it runs BEFORE
-        // the recovery-start bump advances the durable generation.
+        // (generation + topology + transitive source validity). Reads the
+        // catalog's `resume_generation` (the recovered G), so it runs BEFORE the
+        // recovery-start bump advances the durable generation.
         let invalid = catalog.compute_invalid_views();
         catalog.invalid_views = invalid;
 

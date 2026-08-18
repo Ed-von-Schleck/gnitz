@@ -157,33 +157,18 @@ impl CatalogEngine {
     /// from `collect_all_flushed_lsns`; this single-table form is test-only.
     #[cfg(test)]
     pub(crate) fn get_max_flushed_lsn(&self, table_id: i64) -> u64 {
-        if let Some(family) = SysFamily::from_id(table_id) {
-            return self.sys_store(family).current_lsn();
-        }
-        let entry = match self.dag.tables.get(&table_id) {
-            Some(e) => e,
-            None => return 0,
-        };
-        entry.handle.current_lsn()
+        self.dag.tables.get(&table_id).map_or(0, |e| e.handle.current_lsn())
     }
 
-    /// Every known store's `(table id, current_lsn)` — each system family, then
-    /// each user relation. The registry's own system entries are `Borrowed`
-    /// re-exports of `sys_stores`, so they are skipped and each id appears once.
-    /// The one walk behind both the recovery dedup map and the zone-allocator
-    /// floor.
+    /// Every registered relation's `(table id, current_lsn)` — the one walk
+    /// behind both the recovery dedup map and the zone-allocator floor. A system
+    /// family's registry handle is a `Borrowed` re-export of its `sys_stores`
+    /// box, so this reads the same counter its own store would report.
     fn all_store_lsns(&self) -> impl Iterator<Item = (i64, u64)> + '_ {
-        let sys = SYS_FAMILIES
-            .iter()
-            .zip(&self.sys_stores)
-            .map(|(info, table)| (info.id(), table.current_lsn()));
-        let user = self
-            .dag
+        self.dag
             .tables
             .iter()
-            .filter(|(&tid, _)| tid >= FIRST_USER_TABLE_ID)
-            .map(|(&tid, entry)| (tid, entry.handle.current_lsn()));
-        sys.chain(user)
+            .map(|(&tid, entry)| (tid, entry.handle.current_lsn()))
     }
 
     /// Build a map of every known table id → max flushed LSN, covering

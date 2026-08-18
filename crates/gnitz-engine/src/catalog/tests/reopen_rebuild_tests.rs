@@ -8,7 +8,7 @@
 //! weights, and the resume tests at the end read the rebuild *count* too, since
 //! a silent rebuild produces the same rows.
 //!
-//! Views are *not* rebuilt at catalog open. `hook_view_register` registers a
+//! Views are *not* rebuilt at catalog open. `hook_relation_register` registers a
 //! view empty and never fills it, so a `CatalogEngine::open` in isolation
 //! reopens views **empty**; boot view state lives in the runtime layer —
 //! checkpoint resume for generation-valid views, the master-driven invalid-view
@@ -104,7 +104,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     assert_eq!(
         sum_weights(view_entry.open_cursor()),
         0,
-        "hook_view_register must leave the view empty"
+        "hook_relation_register must leave the view empty"
     );
     let base_entry = engine.dag.tables.get_mut(&tid).unwrap();
     assert_eq!(base_entry.index_circuits.len(), 1);

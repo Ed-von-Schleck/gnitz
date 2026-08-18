@@ -35,23 +35,26 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) schema_by_id: FxHashMap<i64, String>,
     pub(crate) entity_by_qname: FxHashMap<String, i64>,
     pub(crate) entity_by_id: FxHashMap<i64, (String, String)>,
-    /// Live member relations (tables and views alike) per schema id. Production
-    /// reads only the count — the non-empty-schema DROP guard — and the two
-    /// kinds are told apart through `dag.tables[id].kind` where it matters.
+    /// Live member relations (tables and views alike) per schema id. Only the
+    /// count is read — the non-empty-schema DROP guard — but the members are
+    /// held as a set so a re-applied `+1` on one id stays idempotent.
     pub(crate) members_by_schema: FxHashMap<i64, FxHashSet<i64>>,
-    /// Full decoded column definitions per table (`fill_column_caches`). The
-    /// one COL_TAB read every name / hidden-flag consumer goes through.
+    /// Full decoded column definitions per table, filled on demand by
+    /// `read_column_defs` — the one COL_TAB read every name / hidden-flag
+    /// consumer goes through.
     pub(crate) col_defs: FxHashMap<i64, Rc<Vec<ColumnDef>>>,
     /// Cached schema wire data per table. Built from (SchemaDescriptor,
     /// col_defs) and reused across SEEK/SCAN responses. Invalidated alongside
     /// col_defs when DDL modifies the table schema.
     pub(crate) schema_wire_cache: FxHashMap<i64, SchemaWireEntry>,
-    /// Monotonically increasing schema version per table (wraps 65535→1, never 0).
-    /// Absent entries implicitly resolve to version 1 (base version).
-    /// Version 0 is reserved as "client has no cached schema".
+    /// Per-table schema version — the token a client's cached schema block is
+    /// validated against. Bumped on every applied COL_TAB delta, wrapping
+    /// 65535 → 1; absent means 1, and 0 is reserved for "client has no cached
+    /// schema". Not durable: it restarts from 1 and the boot COL_TAB replay
+    /// leaves every table at 2. Clients cache it per connection, and a restart
+    /// drops every connection, so the reset cannot alias.
     pub(crate) schema_version: FxHashMap<i64, u16>,
     pub(crate) index_by_name: FxHashMap<String, i64>,
-    pub(crate) index_by_id: FxHashMap<i64, String>,
     pub(crate) indices_by_owner: FxHashMap<i64, Vec<i64>>,
     pub(crate) fk_by_child: FxHashMap<i64, Vec<FkEdge>>,
     pub(crate) fk_by_parent: FxHashMap<i64, Vec<FkEdge>>,
@@ -100,10 +103,7 @@ impl CatalogCacheSet {
 
     pub(crate) fn invalidate_col_names(&mut self, id: i64) {
         self.clear_col_cache_no_bump(id);
-        // Absent entries implicitly resolve to version 1 (the base sentinel);
-        // first invalidation produces 2, so a client holding version 1 always
-        // sees a mismatch. Version 0 is reserved for "client has no cached
-        // schema". The bump wraps 65535 → 1, never 0.
+        // Wraps 65535 → 1: 0 is reserved for "client has no cached schema".
         let v = self.schema_version.entry(id).or_insert(1);
         *v = if *v == u16::MAX { 1 } else { *v + 1 };
     }
@@ -142,8 +142,7 @@ impl CatalogEngine {
                 // Re-derive next_schema_id from the durable SCHEMA_TAB row so a
                 // crash-before-checkpoint never re-issues it (advance_sequence is
                 // memtable-only; this row is fsync'd at CREATE). The Schema family
-                // has no hook_schema_register, so this applier is its re-derive
-                // site — the role hook_{table,index}_register play for their ids.
+                // has no register hook, so this applier is its re-derive site.
                 raise_id_counter(&mut self.next_schema_id, sid);
             } else {
                 self.caches.schema_by_name.remove(&name);
@@ -182,7 +181,7 @@ impl CatalogEngine {
                 // `cascade_retract_columns` is skipped.
                 // The schema_version counter is NOT removed here: the column
                 // cascade fires AFTER this applier (it runs before
-                // hook_table_register) and would `or_insert` it straight back.
+                // hook_relation_register) and would `or_insert` it straight back.
                 // It is purged post-cascade by `purge_schema_version` at the
                 // tail of the drop hook.
                 self.caches.clear_col_cache_no_bump(tid);
@@ -227,9 +226,8 @@ impl CatalogEngine {
         }
     }
 
-    /// Maintain `index_by_name`, `index_by_id` and `indices_by_owner` from one
-    /// pass over an IDX_TAB delta — all three key off the same row and share
-    /// their lifecycle.
+    /// Maintain `index_by_name` and `indices_by_owner` from one pass over an
+    /// IDX_TAB delta — both key off the same row and share their lifecycle.
     pub(crate) fn apply_index_caches(&mut self, batch: &Batch) {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
@@ -238,12 +236,10 @@ impl CatalogEngine {
             let name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
 
             if weight > 0 {
-                self.caches.index_by_name.insert(name.clone(), idx_id);
-                self.caches.index_by_id.insert(idx_id, name);
+                self.caches.index_by_name.insert(name, idx_id);
                 self.caches.indices_by_owner.entry(owner_id).or_default().push(idx_id);
             } else {
                 self.caches.index_by_name.remove(&name);
-                self.caches.index_by_id.remove(&idx_id);
                 remove_where(&mut self.caches.indices_by_owner, owner_id, |&id| id == idx_id);
             }
         }

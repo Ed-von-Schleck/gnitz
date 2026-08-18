@@ -224,7 +224,7 @@ impl CatalogEngine {
             return Err(format!("scan_spec: malformed index column list for table {source}"));
         }
         if exact {
-            Ok(match self.open_index_range_cursor(source, cols.as_slice(), desc)? {
+            Ok(match self.open_index_range_cursor(source, cols.as_slice(), desc, 0)? {
                 None => SourceCursor::Empty,
                 Some(c) => SourceCursor::Bounded(Box::new(c)),
             })
@@ -358,6 +358,11 @@ fn run_scan_rows_sink(
     order: &[OrderKey],
     limit_k: u64,
 ) -> Batch {
+    // The client's `limit_k` is a `u64` (`OFFSET + LIMIT`, `0` = unbounded) and
+    // every test below is against a summed i64 weight, so saturate once here: an
+    // unsaturated `limit_k as i64` wraps negative past `i64::MAX` and makes the
+    // first survivor range satisfy the window, truncating the answer.
+    let window = limit_k.min(i64::MAX as u64) as i64;
     // Bounded top-k: an ORDER BY with a small window. Everything else materializes
     // (an ORDER-BY early-stop would truncate in cursor order, not sort order).
     let topk = !order.is_empty() && limit_k > 0 && limit_k <= MAX_WORKER_TOPK;
@@ -409,7 +414,7 @@ fn run_scan_rows_sink(
         } else if early_stop {
             for (i, &(s, e)) in ranges.iter().enumerate() {
                 summed += chunk.sum_weights(s, e);
-                if summed >= limit_k as i64 {
+                if summed >= window {
                     ranges.truncate(i + 1);
                     break;
                 }
@@ -420,16 +425,16 @@ fn run_scan_rows_sink(
             Some(p) => p.append_map_ranges(&chunk, &mut keeper, &ranges),
         }
 
-        if topk && summed > 2 * limit_k as i64 {
+        if topk && summed > 2 * window {
             (keeper, summed) = topk_keep(keeper, &order_locs, reply_schema, limit_k);
         }
-        if early_stop && summed >= limit_k as i64 {
+        if early_stop && summed >= window {
             break;
         }
     }
 
-    // A final total ≤ `limit_k` provably cuts nothing — skip the sort outright.
-    if topk && summed > limit_k as i64 {
+    // A final total ≤ the window provably cuts nothing — skip the sort outright.
+    if topk && summed > window {
         (keeper, _) = topk_keep(keeper, &order_locs, reply_schema, limit_k);
     }
     keeper

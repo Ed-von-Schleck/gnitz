@@ -468,6 +468,24 @@ fn no_order_limit_early_stops_on_summed_weight() {
     );
 }
 
+#[test]
+fn huge_limit_does_not_truncate_the_early_stop() {
+    // `limit_k` is a client `u64` (`OFFSET + LIMIT`), so `SELECT … LIMIT
+    // 9223372036854775808` ships a value past `i64::MAX`. Compared as a raw
+    // `limit_k as i64` it wraps negative, the first survivor range satisfies the
+    // window, and the scan returns one chunk instead of the relation — a silently
+    // wrong answer at a trust boundary.
+    let (mut e, tid) = fixture("ss_huge_limit", 40, |i| i as i64);
+    // Five chunks, so a wrapped window cuts the scan after the first one.
+    e.ddl_scan_chunk_rows = 8;
+    for limit_k in [1u64 << 63, u64::MAX] {
+        let mut got = run(&mut e, tid, &identity_spec(ReadBound::None, vec![], limit_k));
+        got.sort();
+        let want: Vec<_> = (0..40u128).map(|i| (i, i as i64, 1)).collect();
+        assert_eq!(got, want, "limit_k={limit_k} must not cut the result");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Projections: survivor ranges driven straight onto the keeper
 // ---------------------------------------------------------------------------

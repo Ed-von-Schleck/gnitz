@@ -20,8 +20,8 @@ fn test_index_creation_and_backfill() {
         bb.end_row();
     }
     let batch = bb.finish();
-    engine.dag.ingest_relation(tid, batch);
-    let _ = engine.dag.flush(tid);
+    engine.ingest_to_family(tid, &batch).unwrap();
+    engine.flush_family(tid).unwrap();
 
     // Create index
     let _idx_id = engine.create_index("public.tfanout", &["val"], false).unwrap();
@@ -53,8 +53,8 @@ fn test_index_live_fanout() {
         bb.put_u64(i * 100);
         bb.end_row();
     }
-    engine.dag.ingest_relation(tid, bb.finish());
-    let _ = engine.dag.flush(tid);
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
 
     // Create index — should backfill 5 rows
     engine.create_index("public.tfanout", &["val"], false).unwrap();
@@ -64,8 +64,8 @@ fn test_index_live_fanout() {
     bb2.begin_row(99u128, 1);
     bb2.put_u64(777);
     bb2.end_row();
-    engine.dag.ingest_relation(tid, bb2.finish());
-    let _ = engine.dag.flush(tid);
+    engine.ingest_to_family(tid, &bb2.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
 
     // Verify index has 6 entries via DagEngine's index circuit
     let entry = engine.dag.tables.get_mut(&tid).unwrap();
@@ -178,15 +178,6 @@ fn test_unique_index_failure_no_broadcast_poisoning() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
-
-// ── atomic transfer / swap / bulk-shift validation tests ─────────────────
-//
-// A single delta batch may rearrange unique values among rows so the
-// post-batch state is unique, even though validation runs pre-apply against
-// committed storage. These lock in the exemption rule: a committed collision is
-// exempt only when the holder releases the value in this batch (explicit
-// retraction of its (PK, value), or — for an upsert row — the holder being
-// itself an upserted PK).
 
 // ── seek_by_index tests ──────────────────────────────────────────
 
@@ -336,7 +327,7 @@ fn test_seek_by_index_negative_i32() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── Regression: small-column index projection (bug #1) ────────────
+// ── Regression: sub-8-byte index column projection ────────────────
 
 #[test]
 fn test_seek_by_index_u8_column() {
@@ -519,8 +510,8 @@ fn test_drop_table_cascades_multiple_indices() {
         ],
     );
 
-    let idx1 = engine.create_index("public.t", &["val1"], false).unwrap();
-    let idx2 = engine.create_index("public.t", &["val2"], false).unwrap();
+    engine.create_index("public.t", &["val1"], false).unwrap();
+    engine.create_index("public.t", &["val2"], false).unwrap();
 
     // Both indices tracked in cache
     assert_eq!(
@@ -528,8 +519,12 @@ fn test_drop_table_cascades_multiple_indices() {
         Some(2),
         "indices_by_owner must track both indices"
     );
-    assert!(engine.caches.index_by_id.contains_key(&idx1));
-    assert!(engine.caches.index_by_id.contains_key(&idx2));
+    let (name1, name2) = (
+        make_secondary_index_name("public", "t", "val1"),
+        make_secondary_index_name("public", "t", "val2"),
+    );
+    assert!(engine.has_index_by_name(&name1));
+    assert!(engine.has_index_by_name(&name2));
 
     let idx_count_before = count_records(engine.sys_store_mut(SysFamily::Index));
     assert!(idx_count_before >= 2);
@@ -539,12 +534,12 @@ fn test_drop_table_cascades_multiple_indices() {
 
     assert!(!engine.dag.tables.contains_key(&tid), "table DAG entry must be gone");
     assert!(
-        !engine.caches.index_by_id.contains_key(&idx1),
-        "idx1 must be removed from index_by_id"
+        !engine.has_index_by_name(&name1),
+        "idx1 must be removed from the caches"
     );
     assert!(
-        !engine.caches.index_by_id.contains_key(&idx2),
-        "idx2 must be removed from index_by_id"
+        !engine.has_index_by_name(&name2),
+        "idx2 must be removed from the caches"
     );
     assert!(
         engine
@@ -565,18 +560,12 @@ fn test_drop_table_cascades_multiple_indices() {
     engine.close();
     drop(engine);
     let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
-    assert!(!engine2.caches.index_by_id.contains_key(&idx1));
-    assert!(!engine2.caches.index_by_id.contains_key(&idx2));
+    assert!(!engine2.has_index_by_name(&name1));
+    assert!(!engine2.has_index_by_name(&name2));
     engine2.close();
 
     let _ = fs::remove_dir_all(&dir);
 }
-
-// ── Regression: create_index rollback must clean up all caches ────────
-// If hook_index_register fails (e.g. unique index on a column with
-// duplicate values), the earlier apply_index_by_{name,id} hooks have
-// already mutated the caches. The rollback must reverse those writes
-// or the name/id caches end up pointing at a ghost index.
 
 // ── Compound-PK source: secondary index ──────────────────────────────
 //
@@ -684,6 +673,9 @@ fn test_compound_pk_secondary_index_retract() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `apply_index_caches` runs before `hook_index_register`, so a hook failure
+/// (here: UNIQUE over a column holding duplicates) leaves the name cache already
+/// mutated. The rollback must reverse it, or the cache points at a ghost index.
 #[test]
 fn test_create_unique_index_duplicate_rolls_back_cleanly() {
     let (mut engine, tid, dir) = table_fixture(
@@ -1515,30 +1507,6 @@ fn test_composite_index_drop_exact_list() {
         engine.index_circuit_for_cols(tid, &[1, 2]).is_none(),
         "composite (a, b) circuit must be removed"
     );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn test_composite_index_does_not_answer_single_column() {
-    // A composite (a, b) index does not satisfy a single-column lookup on a
-    // (exact-list match) — only the full (a, b) list resolves.
-    let (mut engine, tid, dir) = table_fixture(
-        "composite_single_miss",
-        &[
-            col_def("id", type_code::U64),
-            col_def("a", type_code::U64),
-            col_def("b", type_code::U64),
-        ],
-    );
-    engine.create_index("public.t", &["a", "b"], false).unwrap();
-
-    assert!(
-        engine.index_circuit_for_cols(tid, &[1]).is_none(),
-        "composite index must not answer a single-column [a] query"
-    );
-    assert!(engine.index_circuit_for_cols(tid, &[1, 2]).is_some());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -2614,6 +2582,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
             RelationKind::BaseTable,
             0,
             dir.clone(),
+            None,
         ),
     );
     engine

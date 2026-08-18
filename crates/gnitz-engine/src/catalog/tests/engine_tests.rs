@@ -109,17 +109,32 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let seq_id = FIRST_USER_TABLE_ID;
 
-    // Seed-on-first-use: absent sequence ⇒ base 1, high-water 64.
+    // Seed-on-first-use: absent sequence ⇒ base 1, high-water 64. Nothing is
+    // live at this seq_id, so the delta is the bare `+1` insert — a retraction
+    // of a row that does not exist would never cancel and would leave a
+    // permanent net −1 ghost in the no-unique-PK `_sequences`.
     let (base1, delta1, _) = engine.reserve_user_sequence(seq_id, 64);
     assert_eq!(base1, 1);
     assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(64));
-    // The delta is a retract(old)+insert(new) pair.
-    assert_eq!(delta1.count, 2);
+    assert_eq!(delta1.count, 1, "first use inserts, retracts nothing");
+    assert_eq!(delta1.get_weight(0), 1);
+    engine.ingest_to_family(SEQ_TAB_ID, &delta1).unwrap();
 
-    // The next range is contiguous: base 65, high-water 128.
-    let (base2, _delta2, _) = engine.reserve_user_sequence(seq_id, 64);
+    // The next range is contiguous: base 65, high-water 128. Now that a row is
+    // live, the delta retracts it and inserts the new high-water — and the `-1`
+    // reproduces the stored value, so the pair cancels.
+    let (base2, delta2, _) = engine.reserve_user_sequence(seq_id, 64);
     assert_eq!(base2, 65);
     assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(128));
+    assert_eq!(delta2.count, 2);
+    assert_eq!(delta2.get_weight(0), -1);
+    assert_eq!(
+        delta2.read_payload_u64(0, 0),
+        64,
+        "the -1 must carry the live high-water"
+    );
+    assert_eq!(delta2.get_weight(1), 1);
+    assert_eq!(delta2.read_payload_u64(1, 0), 128);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -144,8 +159,8 @@ fn test_reserve_user_sequence_saturates() {
 
 /// End-to-end durable round-trip: reserve → ingest the delta through the real
 /// family path (firing `hook_sequence_register`) → flush → reopen. Recovery must
-/// restore the high-water (the phantom retract of `(seq_id, 0)` on first use is
-/// weight-filtered), and the next reservation continues at `high_water + 1`.
+/// restore the high-water, and the next reservation continues at
+/// `high_water + 1`.
 #[test]
 fn test_user_sequence_durable_roundtrip() {
     let dir = temp_dir("user_seq_roundtrip");
@@ -357,10 +372,9 @@ fn test_ingest_scan_seek_family() {
 /// After the FLAG_SEEK collapse there is no system-table fast path: a
 /// `table_id < FIRST_USER_TABLE_ID` seek flows through the same
 /// `seek_family → seek_opk_bytes → seek_family_bytes` chain as user tables,
-/// resolving its schema via `sys_tab_schema`. `create_table` writes a TABLE_TAB
+/// resolving its schema through the registry entry. `create_table` writes a TABLE_TAB
 /// row keyed by the new table-id — a single narrow U64 PK, stride 8 — so seeking
-/// TABLE_TAB by that id drives the empty-`extra` narrow path end to end through
-/// the system-table schema resolver.
+/// TABLE_TAB by that id drives the empty-`extra` narrow path end to end.
 #[test]
 fn seek_family_resolves_system_table_row() {
     let dir = temp_dir("catalog_seek_system_table");
@@ -414,6 +428,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     let scan = engine.scan_family(tid).unwrap().0;
     assert_eq!(scan.count, 1);
     assert_eq!(scan.get_pk(0), 1);
+    assert_eq!(scan.read_payload_u64(0, 0), 200, "the later write must win the PK");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -561,7 +576,7 @@ fn test_fk_index_metadata_queries() {
 // ── test_iter_user_table_ids_and_lsn ────────────────────────────────
 
 #[test]
-fn test_iter_user_table_ids_and_lsn() {
+fn test_iter_user_table_ids() {
     let dir = temp_dir("catalog_iter_lsn");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -572,9 +587,6 @@ fn test_iter_user_table_ids_and_lsn() {
     let ids = engine.iter_user_table_ids();
     assert!(ids.contains(&tid1));
     assert!(ids.contains(&tid2));
-
-    // LSN should be accessible without panicking
-    let _ = engine.get_max_flushed_lsn(tid1);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -656,7 +668,7 @@ fn test_dep_map_view_on_view_chain() {
     assert_eq!(dep_map.get(&7), Some(&vec![8]), "view 7 feeds view 8");
     assert_eq!(engine.dag.get_source_ids(7), vec![100]);
     assert_eq!(engine.dag.get_source_ids(8), vec![7]);
-    // The dependency order every cascade walks — `hook_view_register`'s
+    // The dependency order every cascade walks — `hook_relation_register`'s
     // registration order and `compute_invalid_views`' invalidity propagation.
     assert_eq!(engine.dag.order_by_view_deps(&[8, 7]), vec![7, 8]);
 

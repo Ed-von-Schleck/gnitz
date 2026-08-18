@@ -4,7 +4,7 @@
 use super::*;
 
 /// A `WITH (stream = true)` TABLE_TAB row must register as a stream with no store
-/// and no directory. Driven through `hook_table_register` rather than a hand-built
+/// and no directory. Driven through `hook_relation_register` rather than a hand-built
 /// `RelationKind`, so the flag-to-kind dispatch is what is under test.
 #[test]
 fn stream_flag_registers_storeless_with_no_directory() {

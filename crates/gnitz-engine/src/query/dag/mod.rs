@@ -189,15 +189,15 @@ pub struct TableEntry {
 }
 
 impl TableEntry {
-    /// A registry entry for an unbounded relation, with no index circuits yet —
-    /// what every relation but a capacity-bounded view registers as. The bounded
-    /// case sets `capacity_bytes` on top of this.
+    /// A registry entry with no index circuits yet. `capacity_bytes` is `None`
+    /// for everything but a capacity-bounded view.
     pub fn new(
         handle: StoreHandle,
         schema: SchemaDescriptor,
         kind: RelationKind,
         depth: i32,
         directory: String,
+        capacity_bytes: Option<u64>,
     ) -> Self {
         TableEntry {
             handle,
@@ -206,7 +206,7 @@ impl TableEntry {
             depth,
             directory,
             index_circuits: Vec::new(),
-            capacity_bytes: None,
+            capacity_bytes,
         }
     }
 
@@ -642,6 +642,7 @@ mod tests {
                 RelationKind::BaseTable,
                 0,
                 String::new(),
+                None,
             ),
         );
         assert!(dag.tables.contains_key(&100));
@@ -723,6 +724,7 @@ mod tests {
                 RelationKind::BaseTable,
                 0,
                 String::new(),
+                None,
             ),
         );
         let idx_tbl = make_test_table("idx_child");
@@ -811,6 +813,7 @@ mod tests {
                 RelationKind::BaseTable,
                 0,
                 String::new(),
+                None,
             ),
         );
 
@@ -1147,6 +1150,7 @@ mod tests {
                 RelationKind::View,
                 0,
                 String::new(),
+                None,
             ),
         );
         let mut batch = Batch::with_capacity(schema, 1);

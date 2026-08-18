@@ -657,7 +657,7 @@ mod tests {
     use proptest::test_runner::TestCaseError;
 
     /// Client `encode_ddl_txn` → server `decode_ddl_txn` → `Batch::decode_from_wal_block`
-    /// against the server `sys_tab_schema`, for 1-, 2-, 3-, and 5-family bundles.
+    /// against each family's own schema, for 1-, 2-, 3-, and 5-family bundles.
     /// This is the one place a cross-crate sys-schema drift or a silent misframe
     /// can hide, so it encodes with the *client* schemas and decodes with the
     /// *server* schemas — the two crates hand-keep those identical.
@@ -724,7 +724,9 @@ mod tests {
             assert_eq!(decoded.len(), families.len(), "family count");
             for (fi, ((exp_tid, exp_batch), (got_tid, slice))) in families.iter().zip(&decoded).enumerate() {
                 assert_eq!(*got_tid, *exp_tid as u32, "family {fi} tid/order");
-                let schema = crate::catalog::sys_tab_schema(*got_tid as i64);
+                let schema = crate::catalog::SysFamily::from_id(*got_tid as i64)
+                    .expect("bundle family id must be a system family")
+                    .schema();
                 let (batch, _) = Batch::decode_from_wal_block(slice, &schema, false).expect("decode family batch");
                 assert_eq!(batch.count, exp_batch.len(), "row count tid {got_tid}");
                 for i in 0..batch.count {

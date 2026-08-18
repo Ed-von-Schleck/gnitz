@@ -1,7 +1,7 @@
 //! The catalog applier's execution context.
 //!
 //! `ApplyContext` lives in its own module so its fields are invisible to the
-//! sibling modules (`store`, `hooks`, `ddl`, …) that consume it: the transient
+//! sibling modules (`hooks`, `write_path`, …) that consume it: the transient
 //! sub-states can only be entered through the scope helpers below, making
 //! their enter/exit balance a compile-time guarantee rather than a convention.
 
@@ -34,13 +34,12 @@ pub(crate) struct ApplyContext {
     /// side effect (backfill_index, cascade_retract_columns, hook_cascade_fk)
     /// re-runs. Never nested.
     rollback: bool,
-    /// True while an owner-drop index-retraction cascade is in flight:
-    /// suppresses the IDX_TAB FK-target guard in precheck on the live
-    /// (non-rollback) DROP path — those retractions are legitimate (the
-    /// owner drop already passed its own FK/view-dep precheck), and the
-    /// guard only protects against a standalone user `DROP INDEX`. During
-    /// rollback precheck is already bypassed by the `submit` →
-    /// `submit_local` redirect, so the flag is moot there.
+    /// True while an owner-drop cascade is in flight: suppresses the precheck
+    /// guards that exist to police a standalone user DROP — the IDX_TAB
+    /// FK-target rule and the COL_TAB unpaired-`-1` reject. The owner drop
+    /// already passed its own FK/view-dep precheck. During rollback precheck is
+    /// bypassed by the `submit` → `submit_local` redirect, so the flag is moot
+    /// there.
     cascade_drop: bool,
     /// LSN every write in the current DDL zone is pinned to; `None` outside
     /// a zone. Owned by the executor's DDL-zone lifecycle — `open_ddl_zone`
@@ -107,37 +106,22 @@ impl ApplyContext {
 impl CatalogEngine {
     /// Run `f` as Stage-A rollback compensation: `submit` is redirected to
     /// the no-broadcast path and backfill/cascade re-issue is skipped for its
-    /// duration. The flag is cleared even on an `Err` return (the closure
-    /// returns its value before the clear); a panic inside `f` leaves it set
-    /// until `close_ddl_zone`'s transient reset (release builds abort on
-    /// panic). Closure form, not a `Drop` guard: the body needs `&mut self`
-    /// for the `submit_local` calls inside, which a guard borrowing the
-    /// context would block.
+    /// duration. Restored even on an `Err` return; a panic inside `f` leaves
+    /// the flag set until `close_ddl_zone`'s transient reset (release builds
+    /// abort on panic). Closure form, not a `Drop` guard: the body needs
+    /// `&mut self` for the `submit_local` calls inside, which a guard
+    /// borrowing the context would block.
     pub(super) fn with_rollback_compensation<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.ctx.rollback;
         self.ctx.rollback = true;
         let r = f(self);
-        self.ctx.rollback = false;
+        self.ctx.rollback = prev;
         r
     }
 
-    /// Run `f` with `dir` staged for cleanup: on `Err` whatever `f` created on
-    /// disk is removed here, on `Ok` the directory is live and nothing happens.
-    /// The stage is a local, not an entry in `pending_dir_deletions`, so that
-    /// queue keeps one meaning — directories of *dropped* entities, which a
-    /// rollback must therefore keep. A queue holding both could not be drained
-    /// or discarded as a whole.
-    pub(super) fn with_staged_dir<T>(
-        &mut self,
-        dir: String,
-        f: impl FnOnce(&mut Self) -> Result<T, String>,
-    ) -> Result<T, String> {
-        f(self).inspect_err(|_| Self::remove_queued_dirs(vec![dir]))
-    }
-
-    /// Run `f` as part of an owner-drop index-retraction cascade: precheck's
-    /// IDX_TAB FK-target guard is suppressed for its duration. Save/restore
-    /// rather than blind reset so a nested cascade cannot re-enable the guard
-    /// mid-cascade. Closure form for the same reason as
+    /// Run `f` as part of an owner-drop cascade: precheck's IDX_TAB FK-target
+    /// guard and its unpaired-`-1` COL_TAB reject are suppressed for its
+    /// duration. Closure form for the same reason as
     /// `with_rollback_compensation`.
     pub(super) fn with_cascade_drop<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let prev = self.ctx.cascade_drop;

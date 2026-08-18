@@ -2371,9 +2371,8 @@ fn bundle_family(families: &[(SysFamily, Batch)], family: SysFamily) -> Option<&
 
 /// Resolve `tid`'s system-family schema and decode a client wal-block slice
 /// against it — the master's OWN registered layout, so a client cannot dictate
-/// how its bytes are read. `SysFamily::from_id` rejects a bogus family tid
-/// without the panic `sys_tab_schema` would hit on an unknown id in the system
-/// range. Used by the DDL_TXN bundle decode.
+/// how its bytes are read. `SysFamily::from_id` rejects a bogus family tid.
+/// Used by the DDL_TXN bundle decode.
 fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), String> {
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
     let batch = decode_client_batch(slice, &family.schema()).map_err(|e| format!("family {tid} decode error: {e}"))?;

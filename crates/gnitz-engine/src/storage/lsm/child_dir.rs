@@ -180,10 +180,29 @@ pub fn remove_child(dir: &str) {
 }
 
 /// `fsync` a directory so its entries are durable.
-pub(super) fn fsync_dir(dir: &str) -> Result<(), StorageError> {
+pub fn fsync_dir(dir: &str) -> Result<(), StorageError> {
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(StorageError::from)
+}
+
+/// Remove `dir`'s child directories that a cluster of `num_workers` no longer
+/// owns — [`ChildAddr::is_owned_by`] holds the rule. Names in neither child
+/// grammar are left alone. An index dir is owned at every count, but its own
+/// children are per-worker stores under the same grammar, so the sweep descends
+/// into it. Runs after the boot repartition, which has already consumed any
+/// previous-layout set it needed.
+pub fn reclaim_retired_children(dir: &str, num_workers: u32) {
+    for name in subdir_names(dir) {
+        let Some(child) = ChildAddr::parse(&name) else { continue };
+        let full = format!("{dir}/{name}");
+        if !child.is_owned_by(num_workers) {
+            crate::gnitz_debug!("recovery: removing retired child dir {}", full);
+            remove_child(&full);
+        } else if matches!(child, ChildAddr::Index { .. }) {
+            reclaim_retired_children(&full, num_workers);
+        }
+    }
 }
 
 #[cfg(test)]

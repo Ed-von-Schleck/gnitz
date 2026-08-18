@@ -591,8 +591,7 @@ fn restrict_verb(retired: &FxHashMap<u128, RetireVerb>, v: u128) -> &'static str
 /// predicate panics on the missing entry rather than silently seeing an empty
 /// fold.
 fn reads_overlay(disp: &MasterDispatcher, tid: i64) -> bool {
-    let cat = disp.cat();
-    cat.has_any_unique_index(tid) || !cat.fk_children_of(tid).is_empty() || !cat.fk_constraints_of(tid).is_empty()
+    disp.cat().has_row_constraints(tid)
 }
 
 /// A decoded transaction bundle plus everything its rules share: the per-table
@@ -1142,7 +1141,8 @@ impl MasterDispatcher {
             } else {
                 let idx_schema = disp
                     .cat()
-                    .get_index_schema_by_cols(parent_tid, &[parent_col as u32])
+                    .index_circuit_for_cols(parent_tid, &[parent_col as u32])
+                    .map(|ic| ic.index_schema)
                     .ok_or_else(|| format!("FK check: no unique index on parent {parent_tid} col {parent_col}"))?;
                 (idx_schema, gnitz_wire::pack_pk_cols(&[parent_col as u32]), true)
             };
@@ -1211,7 +1211,8 @@ impl MasterDispatcher {
             }
             let idx_schema = disp
                 .cat()
-                .get_index_schema_by_cols(child_tid, &[fk_col as u32])
+                .index_circuit_for_cols(child_tid, &[fk_col as u32])
+                .map(|ic| ic.index_schema)
                 .ok_or_else(|| format!("FK RESTRICT: no index on child {child_tid} col {fk_col}"))?;
             let src_type = b.schema(parent_tid).columns[parent_col].type_code;
             let col_hint = gnitz_wire::pack_pk_cols(&[fk_col as u32]);

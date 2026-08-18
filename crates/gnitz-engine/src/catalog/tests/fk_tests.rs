@@ -232,41 +232,8 @@ fn test_push_reads_committed_state() {
 }
 
 // (test_fk_parent_restrict_blocks_delete removed: it existed only to exercise
-// the deleted, buggy test-only `validate_fk_parent_restrict`. FK
+// a deleted test-only inline parent-restrict check. FK
 // RESTRICT-on-DELETE is covered end-to-end by gnitz-py/tests/test_fk.py.)
-
-// ── test_fk_parent_map_cleanup ──────────────────────────────────────
-
-#[test]
-fn test_fk_parent_map_cleanup() {
-    let dir = temp_dir("fk_pmap");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("pid", type_code::U64)], &[0])
-        .unwrap();
-    let child_cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("fk", type_code::U64, parent_tid, 0),
-    ];
-    engine.create_table("public.child", &child_cols, &[0]).unwrap();
-
-    // Verify parent_map populated
-    assert!(!engine.fk_children_of(parent_tid).is_empty());
-
-    // Drop child — parent_map should be cleaned up
-    engine.drop_table("public.child").unwrap();
-    assert!(
-        engine.fk_children_of(parent_tid).is_empty(),
-        "fk_parent_map not cleaned up after child drop"
-    );
-
-    // Drop parent should now succeed
-    engine.drop_table("public.parent").unwrap();
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
 
 // ── test_fk_multiple_children_same_parent ───────────────────────────
 

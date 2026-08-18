@@ -1,32 +1,9 @@
 use super::*;
 
-// ---------------------------------------------------------------------------
-// Identifier validation
-//
-// `FK_INDEX_INFIX` and `validate_user_identifier` live in `gnitz-wire` (shared
-// with the SQL planner) and are re-bound in `catalog/mod.rs`.
-// ---------------------------------------------------------------------------
-
-/// Only the test-only direct DDL entry points (`ddl.rs`) take qualified-name
-/// strings; the wire path ships schema and entity ids separately.
-#[cfg(test)]
-pub(crate) fn parse_qualified_name<'a>(name: &'a str, default_schema: &'a str) -> (&'a str, &'a str) {
-    if let Some(dot_pos) = name.find('.') {
-        (&name[..dot_pos], &name[dot_pos + 1..])
-    } else {
-        (default_schema, name)
-    }
-}
-
+/// The name an FK auto-index is created under. `FK_INDEX_INFIX` lives in
+/// `gnitz-wire`, shared with the SQL planner.
 pub(crate) fn make_fk_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
     format!("{schema_name}__{table_name}{FK_INDEX_INFIX}{col_name}")
-}
-
-/// Production index names arrive pre-built over the wire; only the test-only
-/// `ddl.rs::create_index` path names them engine-side.
-#[cfg(test)]
-pub(crate) fn make_secondary_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
-    format!("{schema_name}__{table_name}__idx_{col_name}")
 }
 
 // ---------------------------------------------------------------------------
@@ -84,30 +61,6 @@ pub(crate) fn index_dir(owner_dir: &str, idx_id: i64) -> String {
     ChildAddr::Index { id: idx_id }.dir(owner_dir)
 }
 
-/// True if `name` is shaped like an index directory (`idx_<digits>`).
-pub(crate) fn is_index_dir_name(name: &str) -> bool {
-    matches!(ChildAddr::parse(name), Some(ChildAddr::Index { .. }))
-}
-
-/// Remove a relation's child directories that this boot's worker count no longer
-/// owns — `ChildAddr::is_owned_by` holds the rule. Names in neither child
-/// grammar are left alone. An index dir is owned at every count, but its own
-/// children are per-worker stores under the same grammar, so the sweep descends
-/// into it. Runs after the boot repartition, which has already consumed any
-/// previous-layout set it needed.
-pub(crate) fn reclaim_retired_children(dir: &str, num_workers: u32) {
-    for name in subdir_names(dir) {
-        let Some(child) = ChildAddr::parse(&name) else { continue };
-        let full = format!("{dir}/{name}");
-        if !child.is_owned_by(num_workers) {
-            gnitz_debug!("recovery: removing retired child dir {}", full);
-            crate::storage::remove_child(&full);
-        } else if matches!(child, ChildAddr::Index { .. }) {
-            reclaim_retired_children(&full, num_workers);
-        }
-    }
-}
-
 /// True if `name` could be a relation directory. The three writers directly
 /// under a schema dir are `relation_dir` (`t_<id>` / `v_<id>`) and
 /// `preflight_dir` (`_preflight_<id>`), all of which end in `_<digits>`.
@@ -149,12 +102,6 @@ pub(crate) fn ensure_dir(path: &str) -> Result<(), String> {
     // `AlreadyExists` it reports is a non-directory blocking the path, which is
     // a genuine failure.
     fs::create_dir_all(path).map_err(|e| format!("Failed to create directory '{path}': {e}"))
-}
-
-pub(crate) fn fsync_dir(path: &str) {
-    if let Ok(dir) = fs::File::open(path) {
-        let _ = dir.sync_all();
-    }
 }
 
 // ---------------------------------------------------------------------------

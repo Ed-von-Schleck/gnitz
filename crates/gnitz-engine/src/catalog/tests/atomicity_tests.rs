@@ -13,6 +13,31 @@ fn build_schema_tab_row(sid: i64, name: &str) -> Batch {
     bb.finish()
 }
 
+/// A rejected relation CREATE must leave the catalog exactly as it was: no
+/// name/id cache entry, no DAG registration, and no orphaned row in the
+/// family's memtable. `init_rows` is the family's row count taken before the
+/// attempt.
+fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id: i64, qname: &str, init_rows: usize) {
+    let noun = family.row_noun();
+    assert!(
+        !engine.caches.entity_by_qname.contains_key(qname),
+        "entity_by_qname holds the rejected {noun} {qname}"
+    );
+    assert!(
+        !engine.caches.entity_by_id.contains_key(&id),
+        "entity_by_id holds the rejected {noun} {id}"
+    );
+    assert!(
+        !engine.dag.tables.contains_key(&id),
+        "dag.tables holds the rejected {noun} {id}"
+    );
+    assert_eq!(
+        count_records(engine.sys_store_mut(family)),
+        init_rows,
+        "the {noun} family memtable holds an orphaned row"
+    );
+}
+
 /// Write one column record at an arbitrary `col_idx` — the gap and
 /// out-of-order shapes `build_col_batch`, which numbers columns by position,
 /// cannot produce.
@@ -44,24 +69,7 @@ fn test_table_tab_no_cols_leaves_clean_state() {
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
     assert!(result.is_err(), "expected error for TABLE_TAB with no column records");
 
-    // All catalog state must be exactly as before the failed DDL.
-    assert!(
-        !engine.caches.entity_by_qname.contains_key("public.badtable"),
-        "entity_by_qname must not contain bad table after rejected DDL (dirty before fix)"
-    );
-    assert!(
-        !engine.caches.entity_by_id.contains_key(&tid),
-        "entity_by_id must not contain bad table after rejected DDL"
-    );
-    assert!(
-        !engine.dag.tables.contains_key(&tid),
-        "dag.tables must not contain bad table after rejected DDL"
-    );
-    assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Table)),
-        init_rows,
-        "sys_tables memtable must have no orphaned row (dirty before fix)"
-    );
+    assert_no_relation_residue(&mut engine, SysFamily::Table, tid, "public.badtable", init_rows);
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -70,8 +78,9 @@ fn test_table_tab_no_cols_leaves_clean_state() {
 
 #[test]
 fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
-    // validate_pk_cols runs inside hook_table_register *after*
-    // apply_entity_by_qname has already dirtied the cache (pre-fix).
+    // validate_pk_cols runs inside hook_relation_register *after*
+    // `apply_entity_caches` runs before the register hook, so a hook rejection
+    // must leave no cache entry behind.
     let dir = temp_dir("atomicity_bad_pk_type");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
@@ -88,23 +97,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
         "expected error for TABLE_TAB with non-pk-eligible PK column"
     );
 
-    assert!(
-        !engine.caches.entity_by_qname.contains_key("public.badpktable"),
-        "entity_by_qname must not contain bad table after rejected DDL (dirty before fix)"
-    );
-    assert!(
-        !engine.caches.entity_by_id.contains_key(&tid),
-        "entity_by_id must not contain bad table after rejected DDL"
-    );
-    assert!(
-        !engine.dag.tables.contains_key(&tid),
-        "dag.tables must not contain bad table after rejected DDL"
-    );
-    assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Table)),
-        init_rows,
-        "sys_tables memtable must have no orphaned row (dirty before fix)"
-    );
+    assert_no_relation_residue(&mut engine, SysFamily::Table, tid, "public.badpktable", init_rows);
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -114,7 +107,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
 #[test]
 fn test_table_tab_dup_name_leaves_clean_state() {
     // A raw ingest_to_family with a duplicate qualified name should be
-    // rejected.  Pre-fix: apply_entity_by_qname overwrites the cache entry
+    // rejected. `apply_entity_caches` would otherwise overwrite the cache entry
     // with the new tid.
     let dir = temp_dir("atomicity_dup_name");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -145,7 +138,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
     assert_eq!(
         count_records(engine.sys_store_mut(SysFamily::Table)),
         init_rows,
-        "sys_tables must have no extra orphaned row (dirty before fix)"
+        "sys_tables must have no extra orphaned row"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -172,22 +165,10 @@ fn test_table_tab_col_contiguity_gap_rejected() {
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
     assert!(
         result.is_err(),
-        "expected error for TABLE_TAB with non-contiguous column indices (no error before fix)"
+        "expected error for TABLE_TAB with non-contiguous column indices"
     );
 
-    assert!(
-        !engine.caches.entity_by_qname.contains_key("public.gaptable"),
-        "entity_by_qname must not contain bad table after rejected DDL"
-    );
-    assert!(
-        !engine.dag.tables.contains_key(&tid),
-        "dag.tables must not contain bad table after rejected DDL"
-    );
-    assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Table)),
-        init_rows,
-        "sys_tables memtable must have no orphaned row"
-    );
+    assert_no_relation_residue(&mut engine, SysFamily::Table, tid, "public.gaptable", init_rows);
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -196,8 +177,8 @@ fn test_table_tab_col_contiguity_gap_rejected() {
 
 #[test]
 fn test_view_tab_no_cols_leaves_clean_state() {
-    // hook_view_register fires col_defs.is_empty() after apply_entity_by_qname
-    // (pre-fix), leaving entity_by_qname dirty.
+    // hook_relation_register fires its col_defs.is_empty() rejection after
+    // apply_entity_caches has already written entity_by_qname.
     let dir = temp_dir("atomicity_view_no_cols");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::View));
@@ -208,23 +189,7 @@ fn test_view_tab_no_cols_leaves_clean_state() {
     let result = engine.ingest_to_family(VIEW_TAB_ID, &batch);
     assert!(result.is_err(), "expected error for VIEW_TAB with no column records");
 
-    assert!(
-        !engine.caches.entity_by_qname.contains_key("public.badview"),
-        "entity_by_qname must not contain bad view after rejected DDL (dirty before fix)"
-    );
-    assert!(
-        !engine.caches.entity_by_id.contains_key(&vid),
-        "entity_by_id must not contain bad view after rejected DDL"
-    );
-    assert!(
-        !engine.dag.tables.contains_key(&vid),
-        "dag.tables must not contain bad view after rejected DDL"
-    );
-    assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::View)),
-        init_rows,
-        "sys_views memtable must have no orphaned row (dirty before fix)"
-    );
+    assert_no_relation_residue(&mut engine, SysFamily::View, vid, "public.badview", init_rows);
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -235,8 +200,8 @@ fn test_view_tab_no_cols_leaves_clean_state() {
 fn test_view_tab_too_many_cols_rejected() {
     // An over-wide view must be rejected with a clean catalog error that leaves no
     // orphaned cache/memtable state — mirroring the TABLE_TAB path, where the
-    // precheck rejects before apply_entity_by_qname mutates the caches.
-    // hook_view_register carries the same guard as the build_schema_from_col_defs
+    // precheck rejects before `apply_entity_caches` mutates the caches.
+    // hook_relation_register carries the same guard as the build_schema_from_col_defs
     // assert backstop. This is the engine-side counterpart to the client guard in
     // create_view_chain.
     let dir = temp_dir("atomicity_view_too_many_cols");
@@ -257,19 +222,7 @@ fn test_view_tab_too_many_cols_rejected() {
         "expected the column-count guard message, got: {err}"
     );
 
-    assert!(
-        !engine.caches.entity_by_qname.contains_key("public.wideview"),
-        "entity_by_qname must not contain the rejected view"
-    );
-    assert!(
-        !engine.dag.tables.contains_key(&vid),
-        "dag.tables must not contain the rejected view"
-    );
-    assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::View)),
-        init_rows,
-        "sys_views memtable must have no orphaned row"
-    );
+    assert_no_relation_residue(&mut engine, SysFamily::View, vid, "public.wideview", init_rows);
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -278,7 +231,7 @@ fn test_view_tab_too_many_cols_rejected() {
 
 #[test]
 fn test_idx_tab_bad_owner_leaves_clean_state() {
-    // Pre-fix: apply_index_by_name runs before hook_index_register, so the
+    // `apply_index_caches` runs before hook_index_register, so the
     // cache entry is inserted before the hook returns Err for missing owner.
     let dir = temp_dir("atomicity_idx_bad_owner");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -292,16 +245,12 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
 
     assert!(
         !engine.caches.index_by_name.contains_key("bad_owner_idx"),
-        "index_by_name must not contain bad index after rejected DDL (dirty before fix)"
-    );
-    assert!(
-        !engine.caches.index_by_id.contains_key(&idx_id),
-        "index_by_id must not contain bad index after rejected DDL"
+        "index_by_name must not contain the rejected index"
     );
     assert_eq!(
         count_records(engine.sys_store_mut(SysFamily::Index)),
         init_rows,
-        "sys_indices memtable must have no orphaned row (dirty before fix)"
+        "sys_indices memtable must have no orphaned row"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -348,10 +297,6 @@ fn test_idx_tab_view_owner_rejected() {
         !engine.caches.index_by_name.contains_key("idx_on_view"),
         "index_by_name must not contain the rejected index"
     );
-    assert!(
-        !engine.caches.index_by_id.contains_key(&idx_id),
-        "index_by_id must not contain the rejected index"
-    );
     assert_eq!(
         count_records(engine.sys_store_mut(SysFamily::Index)),
         init_rows,
@@ -369,7 +314,7 @@ fn test_idx_tab_view_owner_rejected() {
 
 #[test]
 fn test_idx_tab_dup_name_leaves_clean_state() {
-    // Pre-fix: apply_index_by_name overwrites the cache entry with new_idx_id
+    // `apply_index_caches` would otherwise overwrite the cache entry with new_idx_id
     // when two IDX_TAB rows carry the same name string.
     let dir = temp_dir("atomicity_idx_dup");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -396,16 +341,16 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     assert_eq!(
         engine.caches.index_by_name.get(orig_name).copied(),
         Some(orig_idx_id),
-        "index_by_name must still point to original index (overwritten before fix)"
+        "index_by_name must still point to the original index"
     );
     assert!(
-        !engine.caches.index_by_id.contains_key(&new_idx_id),
-        "new_idx_id must not appear in index_by_id"
+        !engine.caches.indices_by_owner.values().any(|v| v.contains(&new_idx_id)),
+        "the rejected index id must not appear under any owner"
     );
     assert_eq!(
         count_records(engine.sys_store_mut(SysFamily::Index)),
         init_rows,
-        "sys_indices must have no extra orphaned row (dirty before fix)"
+        "sys_indices must have no extra orphaned row"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -436,8 +381,8 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     bb.begin_row(2u128, 1);
     bb.put_u64(42u64);
     bb.end_row();
-    engine.dag.ingest_relation(tid, bb.finish());
-    let _ = engine.dag.flush(tid);
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
 
     // Capture the expected index directory before create_index allocates the id.
     let expected_idx_id = engine.next_index_id;
@@ -496,7 +441,7 @@ fn test_next_index_id_advances_on_index_register() {
     assert!(
         engine.next_index_id > large_idx_id,
         "next_index_id ({}) must exceed the registered idx_id ({}) after \
-         hook_index_register (not advanced before fix)",
+         hook_index_register",
         engine.next_index_id,
         large_idx_id
     );
@@ -524,7 +469,7 @@ fn test_next_schema_id_advances_on_schema_register() {
     assert!(
         engine.next_schema_id > large_sid,
         "next_schema_id ({}) must exceed the registered sid ({}) so \
-         allocate_schema_id never re-issues it (not advanced before fix)",
+         allocate_schema_id never re-issues it",
         engine.next_schema_id,
         large_sid,
     );
@@ -707,7 +652,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 /// and negate the applied-not-enqueued TABLE_TAB row (net-zero sys_tables) and
 /// negate the drained COL_TAB exactly once (no double-retraction ghost). A
 /// REPLICATED table with a non-default distribution prefix is the trigger:
-/// precheck does not check the pair, but `hook_table_register` rejects it after
+/// precheck does not check the pair, but `hook_relation_register` rejects it after
 /// the row is applied.
 #[test]
 fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
@@ -723,7 +668,7 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     engine.precheck_family(SysFamily::Column, &col_batch).unwrap();
     engine.apply_and_enqueue_family(SysFamily::Column, col_batch).unwrap();
 
-    // REPLICATED + dist_prefix = 1: passes precheck, rejected by hook_table_register.
+    // REPLICATED + dist_prefix = 1: passes precheck, rejected by hook_relation_register.
     let flags = gnitz_wire::TableProps {
         replicated: true,
         dist_prefix_len: 1,
@@ -739,7 +684,7 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     let applied = engine.apply_and_enqueue_family(SysFamily::Table, table_batch);
     assert!(
         applied.is_err(),
-        "hook_table_register must reject a REPLICATED table with a distribution prefix"
+        "hook_relation_register must reject a REPLICATED table with a distribution prefix"
     );
     engine.compensate_stage_a(marker.take());
 
@@ -759,4 +704,109 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+// ── Two `+1` relation rows may not claim one qualified name ──────────────────
+// The name collision test reads `entity_by_qname`, which the batch has not been
+// applied to yet — so a bundle carrying two CREATEs of the same `schema.name`
+// under different ids passes it twice. Both would register, the second would
+// overwrite the cache entry, and the first's store would be stranded under a
+// name nothing resolves.
+
+#[test]
+fn two_creates_of_one_name_in_one_batch_rejected() {
+    let dir = temp_dir("atomicity_dup_name_in_batch");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
+
+    let cols = vec![col_def("id", type_code::U64)];
+    let (a, b) = (engine.allocate_table_id(), engine.allocate_table_id());
+    engine.write_column_records(a, OWNER_KIND_TABLE, &cols).unwrap();
+    engine.write_column_records(b, OWNER_KIND_TABLE, &cols).unwrap();
+
+    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    for tid in [a, b] {
+        push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "twins", pack_pk_cols(&[0]), 0, 1);
+    }
+    let err = engine
+        .ingest_to_family(TABLE_TAB_ID, &bb.finish())
+        .expect_err("two rows claiming public.twins must be rejected");
+    assert!(err.contains("already exists"), "{err}");
+
+    assert!(!engine.dag.tables.contains_key(&a));
+    assert!(!engine.dag.tables.contains_key(&b));
+    assert_eq!(
+        count_records(engine.sys_store_mut(SysFamily::Table)),
+        init_rows,
+        "the rejected batch must leave no TABLE_TAB row"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── `_sequences` never accumulates an unmatched retraction ───────────────────
+// A sequence advance retracts the row that is actually live, not a value the
+// caller guessed. `_sequences` runs no `enforce_unique_pk`, so a `-1` against a
+// row that was never inserted would never cancel — a permanent net −1 ghost, in
+// violation of §1 base-table positivity.
+
+#[test]
+fn sequence_advances_leave_no_negative_ghost() {
+    let dir = temp_dir("atomicity_seq_no_ghost");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+
+    // First use of every catalog sequence: object ids, the checkpoint generation
+    // (seq 4) and the topology word (seq 5) are all seeded on demand.
+    engine.create_schema("s").unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
+    engine.create_table("s.t", &cols, &[0]).unwrap();
+    engine.create_index("s.t", &["val"], false).unwrap();
+    engine.record_topology(1);
+    engine.bump_checkpoint_generation();
+    // …and a second round, where each retraction now has a live row to cancel.
+    engine.create_table("s.t2", &cols, &[0]).unwrap();
+    engine.record_topology(4);
+    engine.bump_checkpoint_generation();
+
+    assert_eq!(
+        count_negative_records(engine.sys_store_mut(SysFamily::Sequence)),
+        0,
+        "_sequences must hold no net-negative row"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── A rejected CREATE INDEX writes no compensating retraction ────────────────
+// `create_index` prechecks and applies as two steps: a precheck rejection wrote
+// nothing, so submitting the `-1` undo would leave a permanent net −1 ghost in
+// sys_indices (which runs no `enforce_unique_pk`).
+
+#[test]
+fn precheck_rejected_create_index_writes_no_ghost() {
+    let dir = temp_dir("atomicity_idx_precheck_ghost");
+    let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
+    let (mut engine, _tid, _d) = table_fixture("atomicity_idx_precheck_ghost", &cols);
+    let _ = dir;
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
+
+    // A STRING column has no index key type — rejected inside `precheck_family`,
+    // before anything is applied.
+    engine
+        .create_index("public.t", &["name"], false)
+        .expect_err("an index on a STRING column must be rejected");
+
+    assert_eq!(
+        count_negative_records(engine.sys_store_mut(SysFamily::Index)),
+        0,
+        "a precheck rejection must write no compensating -1"
+    );
+    assert_eq!(
+        count_records(engine.sys_store_mut(SysFamily::Index)),
+        init_rows,
+        "and no +1 either"
+    );
+
+    engine.close();
 }

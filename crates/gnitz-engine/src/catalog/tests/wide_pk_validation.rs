@@ -81,6 +81,7 @@ fn setup_wide_unique(
             RelationKind::BaseTable,
             0,
             dir.to_string(),
+            None,
         ),
     );
     engine
@@ -149,6 +150,7 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
             RelationKind::BaseTable,
             0,
             dir.clone(),
+            None,
         ),
     );
 
@@ -191,16 +193,16 @@ fn seek_family_bytes_matches_seek_family_narrow() {
         bb.put_u64(i * 10);
         bb.end_row();
     }
-    engine.dag.ingest_relation(tid, bb.finish());
-    let _ = engine.dag.flush(tid);
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
 
     // Retract key 2 so it is present-but-dead.
     let mut del = BatchBuilder::new(schema);
     del.begin_row(2u128, -1);
     del.put_u64(20);
     del.end_row();
-    engine.dag.ingest_relation(tid, del.finish());
-    let _ = engine.dag.flush(tid);
+    engine.ingest_to_family(tid, &del.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
 
     // Present (1, 3), retracted (2), and absent (99) must agree across forms.
     for key in [1u64, 2, 3, 99] {

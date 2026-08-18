@@ -3,10 +3,6 @@
 //! and sequence advancement.
 
 use super::*;
-use gnitz_wire::{
-    COLTAB_COL_FK_COL_IDX, COLTAB_COL_FK_TABLE_ID, COLTAB_COL_IS_HIDDEN, COLTAB_COL_IS_NULLABLE, COLTAB_COL_IS_SERIAL,
-    COLTAB_COL_NAME, COLTAB_COL_TYPE_CODE,
-};
 
 /// The one place COL_TAB column records become a `SchemaDescriptor`, so it is
 /// where their admissibility is enforced — not at the callers.
@@ -52,8 +48,7 @@ impl CatalogEngine {
     /// `build_schema_from_col_defs`, so the create-precheck path rejects it.
     /// The non-checking form is infallible by construction.
     pub(crate) fn scan_column_defs(&self, owner_id: i64, check_contiguity: bool) -> Result<Vec<ColumnDef>, String> {
-        let start_pk = pack_column_id(owner_id, 0);
-        let end_pk = pack_column_id(owner_id + 1, 0);
+        let (start_pk, end_pk) = column_id_band(owner_id);
         let mut cursor = self.sys_store(SysFamily::Column).open_cursor();
         // sys_columns has a single U64 PK; OPK == big-endian. The range clamp
         // exhausts the cursor at `end_pk`, so the walk needs no bound test.
@@ -74,15 +69,7 @@ impl CatalogEngine {
                     }
                     expected += 1;
                 }
-                defs.push(ColumnDef {
-                    name: cursor_read_string(&cursor, COLTAB_COL_NAME),
-                    type_code: cursor_read_u64(&cursor, COLTAB_COL_TYPE_CODE) as u8,
-                    is_nullable: cursor_read_u64(&cursor, COLTAB_COL_IS_NULLABLE) != 0,
-                    fk_table_id: cursor_read_u64(&cursor, COLTAB_COL_FK_TABLE_ID) as i64,
-                    fk_col_idx: cursor_read_u64(&cursor, COLTAB_COL_FK_COL_IDX) as u32,
-                    is_serial: cursor_read_u64(&cursor, COLTAB_COL_IS_SERIAL) != 0,
-                    is_hidden: cursor_read_u64(&cursor, COLTAB_COL_IS_HIDDEN) != 0,
-                });
+                defs.push(read_col_tab_cursor_row(&cursor));
             }
             cursor.advance();
         }
@@ -108,17 +95,6 @@ impl CatalogEngine {
 
     pub fn has_id(&self, table_id: i64) -> bool {
         self.dag.tables.contains_key(&table_id)
-    }
-
-    // The following registry getters are exercised only by the catalog tests;
-    // production code reads the caches/DAG entries directly.
-    #[cfg(test)]
-    pub(crate) fn get_schema_name_by_id(&self, schema_id: i64) -> &str {
-        self.caches
-            .schema_by_id
-            .get(&schema_id)
-            .map(|s| s.as_str())
-            .unwrap_or("")
     }
 
     pub(crate) fn has_schema(&self, name: &str) -> bool {
@@ -150,14 +126,12 @@ impl CatalogEngine {
     // Each object-id allocation owns its durability half: the id is handed to
     // memory AND durably advanced in `sys_sequences` as one operation, so no
     // caller can take an id without the advance. A create that later fails
-    // burns the id (harmless — recovery maxes over positive rows; gaps are
-    // fine), and the unconditional advance keeps every retract matched: a
-    // skipped advance would leave the NEXT advance's retract unmatched — a
-    // net −1 ghost row violating base-table positivity.
+    // burns the id — harmless, since recovery maxes over positive rows and gaps
+    // are fine.
     pub fn allocate_schema_id(&mut self) -> i64 {
         let sid = self.next_schema_id;
         self.next_schema_id += 1;
-        self.advance_sequence(SEQ_ID_SCHEMAS, sid - 1, sid);
+        self.advance_sequence(SEQ_ID_SCHEMAS, sid);
         sid
     }
 
@@ -177,14 +151,14 @@ impl CatalogEngine {
             "durable relation ids exhausted: {tid} would reach the relation-id ceiling"
         );
         self.next_table_id += 1;
-        self.advance_sequence(SEQ_ID_TABLES, tid - 1, tid);
+        self.advance_sequence(SEQ_ID_TABLES, tid);
         tid
     }
 
     pub fn allocate_index_id(&mut self) -> i64 {
         let iid = self.next_index_id;
         self.next_index_id += 1;
-        self.advance_sequence(SEQ_ID_INDICES, iid - 1, iid);
+        self.advance_sequence(SEQ_ID_INDICES, iid);
         iid
     }
 
@@ -219,8 +193,8 @@ impl CatalogEngine {
 
     // -- Sequence management -----------------------------------------------
 
-    pub(crate) fn advance_sequence(&mut self, seq_id: i64, old_val: i64, new_val: i64) {
-        let batch = build_seq_delta(seq_id, old_val, new_val);
+    pub(crate) fn advance_sequence(&mut self, seq_id: i64, new_val: i64) {
+        let batch = self.build_seq_delta(seq_id, new_val);
         // The caller has already handed the allocated id to memory; un-allocating
         // is impossible, and replying an error while keeping the bump would
         // re-issue the id after restart. Fail-stop — same as the serial-range
@@ -253,20 +227,15 @@ impl CatalogEngine {
     /// (`msg.lsn <= flushed[target]`). Computed here so that fact lives beside
     /// the code that builds the delta.
     ///
-    /// On an absent sequence `hw = 0`: the retract of a non-existent `(seq_id, 0)`
-    /// row nets to zero under consolidation, leaving exactly the `+1` insert —
-    /// the catalog's seed-on-first-use pattern. `saturating_add` avoids an i64
-    /// debug-panic at the (unreachable) ~2^63 boundary; the client overflow guard
-    /// rejects the id long before then.
+    /// On an absent sequence `hw = 0` and the delta is the bare `+1` insert.
+    /// `saturating_add` avoids an i64 debug-panic at the (unreachable) ~2^63
+    /// boundary; the client overflow guard rejects the id long before then.
     pub fn reserve_user_sequence(&mut self, seq_id: i64, count: i64) -> (i64, Batch, u64) {
         let hw = self.user_sequences.get(&seq_id).copied().unwrap_or(0);
         let new_hw = hw.saturating_add(count);
+        let delta = self.build_seq_delta(seq_id, new_hw);
         self.user_sequences.insert(seq_id, new_hw);
-        (
-            hw + 1,
-            build_seq_delta(seq_id, hw, new_hw),
-            self.sys_store(SysFamily::Sequence).current_lsn(),
-        )
+        (hw + 1, delta, self.sys_store(SysFamily::Sequence).current_lsn())
     }
 
     /// Fold an observed `sys_sequences` high-water into `user_sequences`,
@@ -294,10 +263,8 @@ impl CatalogEngine {
     /// a crash below rebuilds views instead of silently staleifying them.
     pub fn bump_checkpoint_generation(&mut self) -> u64 {
         let new = self.durable_generation + 1;
-        // Retract the old high-water, insert the new. On the first bump the
-        // retract of a non-existent (4, 0) row nets to zero (seed-on-first-use).
         // `advance_sequence` fatal-aborts on ingest failure.
-        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, self.durable_generation as i64, new as i64);
+        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, new as i64);
         self.durable_generation = new;
         self.set_resume_generation(new);
         // The row must be shard-durable before the SAL reset that follows
@@ -310,32 +277,20 @@ impl CatalogEngine {
     }
 
     /// Durably advance the checkpoint generation by one **at recovery start**,
-    /// WITHOUT publishing it to `worker_ctx`. The non-windowed recovery resets the
-    /// SAL before its master-driven tick sweep, so a crash after the child boot
-    /// flush + reset but before `boot_checkpoint`'s own gen bump would otherwise
-    /// leave base = `G + tail` durable while every un-checkpointed view is cleanly
-    /// stamped `G` (→ silently resumed as stale) with the SAL already consumed.
-    /// Advancing the durable `_sequences` generation from the recovered `G` to
-    /// `G+1` here means any crash from now until `boot_checkpoint` leaves durable
-    /// gen ≥ `G+1` while those views are stamped `G`, so the per-child
-    /// generation verdict forces a full rebuild. Every crash window is covered:
-    /// windows inside `boot_checkpoint` by its own gen bump before the ephemeral
-    /// stamp, the reset→boot_checkpoint gap by this one.
+    /// WITHOUT publishing it to `worker_ctx`. This closes the
+    /// reset→`boot_checkpoint` crash window: recovery resets the SAL before its
+    /// master-driven tick sweep, so a crash in that gap would otherwise leave the
+    /// base durable at `G + tail` while every un-checkpointed view is cleanly
+    /// stamped `G` and would silently resume as stale. With the durable
+    /// generation at `G+1`, the per-child verdict forces a rebuild instead.
     ///
-    /// `worker_ctx::committed_generation()` is left at `G` on purpose: the resume
-    /// load (`Table::new`) and the boot verdict both compare view manifests
-    /// against `G`, so a clean restart still resumes. `self.durable_generation`
-    /// IS advanced to `G+1` so the next bump retracts `G+1` (not `G`), keeping
-    /// `_sequences` clean (each generation row nets to zero but the latest), and
-    /// the boot ends at `G+2` or higher.
-    ///
-    /// Monotonic, so recovery reads it back through `recover_sequences`' `.max()`
-    /// arm — no toggle, no stuck-dirty residue in the no-unique-PK `_sequences`.
+    /// `worker_ctx::committed_generation()` stays at `G` on purpose: the resume
+    /// load and the boot verdict both compare view manifests against it, so a
+    /// clean restart still resumes. `self.durable_generation` IS advanced, so the
+    /// next bump retracts `G+1` rather than `G`.
     pub fn recovery_start_generation_bump(&mut self) -> Result<(), String> {
         let g = self.durable_generation;
-        // On a fresh DB `g == 0` and the retract of a non-existent `(4, 0)` row
-        // nets to zero (seed-on-first-use), leaving exactly `(4, 1)`.
-        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, g as i64, (g + 1) as i64);
+        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, (g + 1) as i64);
         self.durable_generation = g + 1;
         // Durable before the SAL reset that follows discards the memtable copy.
         self.flush_all_system_tables()
@@ -389,6 +344,26 @@ impl CatalogEngine {
             .map_err(|e| format!("Failed to create index table {index_id}: error {e}"))
     }
 
+    /// Build the `sys_sequences` delta that moves one sequence to `new_val`: a
+    /// `-1` copy of whatever row is live at `seq_id` (nothing, on first use)
+    /// followed by the `+1` insert. Retracting the *live* row rather than a
+    /// caller-guessed previous value is what keeps `_sequences` free of net `-1`
+    /// ghosts — it has no `enforce_unique_pk`, so an unmatched retraction would
+    /// persist forever and violate base-table positivity. Shared by
+    /// `advance_sequence` (ingests to the memtable) and `reserve_user_sequence`
+    /// (returns it for the durable commit).
+    fn build_seq_delta(&self, seq_id: i64, new_val: i64) -> Batch {
+        let schema = SysFamily::Sequence.schema();
+        let mut batch = retract_single_row(self.sys_store(SysFamily::Sequence), &schema, seq_id as u128);
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(seq_id as u128, 1);
+        bb.put_u64(new_val as u64);
+        bb.end_row();
+        let insert = bb.finish();
+        batch.append_batch(&insert, 0, insert.count);
+        batch
+    }
+
     /// Record the cluster topology (`worker_count << 32 | STATE_FORMAT`) in
     /// `_sequences` (seq id 5). Idempotent: a same-topology restart already
     /// holds the current value, so the write is skipped. Does not flush — the
@@ -399,40 +374,21 @@ impl CatalogEngine {
         if self.recorded_topology == value {
             return;
         }
-        self.advance_sequence(SEQ_ID_TOPOLOGY, self.recorded_topology as i64, value as i64);
+        self.advance_sequence(SEQ_ID_TOPOLOGY, value as i64);
         self.recorded_topology = value;
     }
 }
 
 /// Raise a monotonic catalog id counter so the next allocation lands strictly
-/// past `allocated` (the largest id known to be in use). Monotone and
-/// idempotent — never lowers the counter, so a retract+reinsert replay is a
-/// no-op. Scalar-counter analog of `observe_user_sequence`: single-sources the
-/// "never re-issue a durably registered id after a crash lost the memtable-only
-/// `advance_sequence`" invariant shared by the object-register replay paths
-/// (`hook_{table,view,index}_register` and `apply_schema_by_id`, from the
-/// fsync'd TABLE_TAB / VIEW_TAB / IDX_TAB / SCHEMA_TAB row) and
-/// `recover_sequences` (the flushed `sys_sequences` scan). A free fn rather than
-/// a method so callers can pass `&mut self.next_*_id` while `self` is otherwise
-/// borrowed.
+/// past `allocated`, the largest id known to be in use. Monotone and idempotent,
+/// so a retract+reinsert replay is a no-op.
+///
+/// This is what stops a durably registered id from being re-issued after a crash
+/// lost the memtable-only `advance_sequence`: every path that observes an id in
+/// use — the register hooks, `apply_schema_caches`, and `recover_sequences`'
+/// flushed-shard scan — raises the counter through here. A free fn so callers can
+/// pass `&mut self.next_*_id` while `self` is otherwise borrowed.
 #[inline]
 pub(super) fn raise_id_counter(counter: &mut i64, allocated: i64) {
     *counter = (*counter).max(allocated + 1);
-}
-
-/// Build the `sys_sequences` retract-old + insert-new delta for one sequence.
-/// Shared by `advance_sequence` (ingests to the memtable) and
-/// `reserve_user_sequence` (returns it for the durable commit).
-fn build_seq_delta(seq_id: i64, old_val: i64, new_val: i64) -> Batch {
-    let schema = SysFamily::Sequence.schema();
-    let mut bb = BatchBuilder::new(schema);
-    // Retract old
-    bb.begin_row(seq_id as u128, -1);
-    bb.put_u64(old_val as u64);
-    bb.end_row();
-    // Insert new
-    bb.begin_row(seq_id as u128, 1);
-    bb.put_u64(new_val as u64);
-    bb.end_row();
-    bb.finish()
 }

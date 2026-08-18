@@ -22,7 +22,7 @@ fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid
     );
 
     if let Some(b) = &bound {
-        let mut bb = BatchBuilder::new(sys_tab_schema(CIRCUIT_NODE_COLUMNS_TAB_ID));
+        let mut bb = BatchBuilder::new(SysFamily::CircuitNodeColumns.schema());
         for (i, &c) in b.idx_cols.as_slice().iter().enumerate() {
             bb.begin_row(pack_view_pk(vid, i as u64), 1);
             bb.put_u64(0); // node_id
