@@ -1196,7 +1196,7 @@ impl GnitzClient {
                 // on `view_id.to_be_bytes()`; packing `(vid << 64) | sub`
                 // instead puts `sub` there and breaks every view load.
                 let rows = pv.circuit.into_rows();
-                append_circuit_rows(&mut nodes_a, &mut edges_a, &mut ncol_a, vid, &rows);
+                append_circuit_rows(&mut nodes_a, &mut edges_a, &mut ncol_a, vid, &rows)?;
 
                 // 5. View record — the VIEW_TAB register hook triggers server-side
                 // compilation. Encode the view PK with the shared wire packer so the
@@ -1769,48 +1769,54 @@ fn append_circuit_rows(
     ncol_a: &mut BatchAppender<'_>,
     vid: u64,
     rows: &crate::circuit::CircuitRows,
-) {
+) -> Result<(), ClientError> {
+    use gnitz_wire::sys_rows::{
+        write_circuit_edge_row, write_circuit_node_column_row, write_circuit_node_row, CircuitEdgeRow,
+        CircuitNodeColumnRow, CircuitNodeRow,
+    };
     for (node_id, opcode, src_tab, expr_blob) in &rows.nodes {
-        // Compound PK (view_id, sub=node_id): low 8 bytes = view_id.
-        let pk = (vid as u128) | ((*node_id as u128) << 64);
-        nodes_a.add_row(pk, 1).u64_val(*node_id).u64_val(*opcode);
-        // source_table and expr_program are nullable; the `*_null` writers set
-        // the row bitmap themselves.
-        match src_tab {
-            Some(t) => nodes_a.u64_val(*t),
-            None => nodes_a.null(),
-        };
-        match expr_blob {
-            Some(b) => nodes_a.bytes_val(b),
-            None => nodes_a.null(),
-        };
+        write_circuit_node_row(
+            nodes_a,
+            &CircuitNodeRow {
+                view_id: vid,
+                node_id: *node_id,
+                opcode: *opcode,
+                source_table: *src_tab,
+                expr_program: expr_blob.as_deref(),
+            },
+            1,
+        )
+        .map_err(ClientError::ServerError)?;
     }
     for (dst_node, dst_port, src_node) in &rows.edges {
-        debug_assert!(*dst_node < (1u64 << 40), "dst_node {dst_node} exceeds 40-bit cap");
-        // Compound PK (view_id, sub): sub packs (dst_node, dst_port).
-        let sub = ((*dst_node as u128) << 8) | (*dst_port as u128);
-        let pk = (vid as u128) | (sub << 64);
-        edges_a
-            .add_row(pk, 1)
-            .u64_val(*dst_node)
-            .u64_val(*dst_port as u64)
-            .u64_val(*src_node);
+        write_circuit_edge_row(
+            edges_a,
+            &CircuitEdgeRow {
+                view_id: vid,
+                dst_node: *dst_node,
+                dst_port: *dst_port as u64,
+                src_node: *src_node,
+            },
+            1,
+        )
+        .map_err(ClientError::ServerError)?;
     }
     for (node_id, kind, position, v1, v2) in &rows.node_columns {
-        debug_assert!((*position as u64) <= 0xFFFF);
-        debug_assert!((*kind) <= 0xFF);
-        debug_assert!((*node_id) <= 0x00FF_FFFF_FFFF);
-        // Compound PK (view_id, sub): sub packs (node_id, kind, position).
-        let sub = ((*node_id as u128) << 24) | ((*kind as u128) << 16) | (*position as u128);
-        let pk = (vid as u128) | (sub << 64);
-        ncol_a
-            .add_row(pk, 1)
-            .u64_val(*node_id)
-            .u64_val(*kind)
-            .u64_val(*position as u64)
-            .u64_val(*v1)
-            .u64_val(*v2);
+        write_circuit_node_column_row(
+            ncol_a,
+            &CircuitNodeColumnRow {
+                view_id: vid,
+                node_id: *node_id,
+                kind: *kind,
+                position: *position as u64,
+                value1: *v1,
+                value2: *v2,
+            },
+            1,
+        )
+        .map_err(ClientError::ServerError)?;
     }
+    Ok(())
 }
 
 /// Append one `VIEW_TAB` row through the shared codec. A drop's `-1` row must

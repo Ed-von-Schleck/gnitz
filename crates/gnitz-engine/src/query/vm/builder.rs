@@ -13,10 +13,7 @@ pub(crate) struct ProgramBuilder {
     instructions: Vec<Instr>,
     funcs: Vec<*const ScalarFunc>,
     tables: Vec<*mut Table>,
-    reindex_cols: Vec<u32>,
-    /// Parallel to `reindex_cols`: per-column carried promotion target tc
-    /// (`0` = derive from source). Sliced alongside `reindex_cols` for `op_map`.
-    reindex_target_tcs: Vec<u8>,
+    reindex_packers: Vec<crate::ops::ReindexPacker>,
     reduce_plans: Vec<crate::ops::ReducePlan>,
     avi_bakes: Vec<crate::ops::AviBake>,
 }
@@ -30,8 +27,7 @@ impl ProgramBuilder {
             instructions: Vec::with_capacity(16),
             funcs: Vec::new(),
             tables: Vec::new(),
-            reindex_cols: Vec::new(),
-            reindex_target_tcs: Vec::new(),
+            reindex_packers: Vec::new(),
             reduce_plans: Vec::new(),
             avi_bakes: Vec::new(),
         }
@@ -60,16 +56,17 @@ impl ProgramBuilder {
         idx
     }
 
-    pub fn table_idx(&mut self, ptr: *mut Table) -> i32 {
-        if ptr.is_null() {
-            return -1;
-        }
+    /// Intern `ptr` into `Program::tables` and return its instruction operand.
+    /// The `u16` bound holds because each node contributes at most three owned
+    /// tables and `build_plan` bounds the node count well below `u16::MAX / 3`.
+    pub fn table_idx(&mut self, ptr: *mut Table) -> u16 {
         for (i, &t) in self.tables.iter().enumerate() {
             if t == ptr {
-                return i as i32;
+                return i as u16;
             }
         }
-        let idx = self.tables.len() as i32;
+        debug_assert!(self.tables.len() < u16::MAX as usize);
+        let idx = self.tables.len() as u16;
         self.tables.push(ptr);
         idx
     }
@@ -89,21 +86,11 @@ impl ProgramBuilder {
         idx
     }
 
-    pub fn add_reindex_cols(&mut self, cols: &[u32], target_tcs: &[u8]) -> (u32, u16) {
-        let offset = self.reindex_cols.len() as u32;
-        // This is the only mutator of either pool, so they enter in lockstep.
-        debug_assert_eq!(
-            self.reindex_target_tcs.len(),
-            offset as usize,
-            "reindex pools must stay in lockstep"
-        );
-        self.reindex_cols.extend_from_slice(cols);
-        // Keep the target-tc pool in lockstep with reindex_cols (same offset and
-        // count): a shorter or empty `target_tcs` zero-fills (= derive from source),
-        // so the `Instr::Map` slice always has one tc per reindex column.
-        self.reindex_target_tcs.extend_from_slice(target_tcs);
-        self.reindex_target_tcs.resize(self.reindex_cols.len(), 0);
-        (offset, cols.len() as u16)
+    /// Store a baked reindex packer, returning its `ReindexOperand::Pack` index.
+    pub fn add_reindex_packer(&mut self, packer: crate::ops::ReindexPacker) -> u16 {
+        let idx = self.reindex_packers.len() as u16;
+        self.reindex_packers.push(packer);
+        idx
     }
 
     // ── Build ────────────────────────────────────────────────────────────
@@ -139,8 +126,7 @@ impl ProgramBuilder {
             reg_meta,
             funcs: self.funcs,
             tables: self.tables,
-            reindex_cols: self.reindex_cols,
-            reindex_target_tcs: self.reindex_target_tcs,
+            reindex_packers: self.reindex_packers,
             reduce_plans: self.reduce_plans,
             avi_bakes: self.avi_bakes,
         };

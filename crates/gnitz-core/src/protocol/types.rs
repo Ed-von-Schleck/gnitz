@@ -1016,6 +1016,12 @@ impl gnitz_wire::sys_rows::SysRowSink for BatchAppender<'_> {
     fn put_string(&mut self, s: &str) {
         self.str_val(s);
     }
+    fn put_bytes(&mut self, b: &[u8]) {
+        self.bytes_val(b);
+    }
+    fn put_null(&mut self) {
+        self.null();
+    }
     fn end_row(&mut self) {}
 }
 

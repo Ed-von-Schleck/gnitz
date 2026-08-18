@@ -67,9 +67,17 @@ pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
 /// `assert!` rejects the PK column itself, and `col_index_in`'s own const-eval
 /// panic covers a renamed column — both at compile time.
 pub(crate) const fn pay_index_in(cols: &[WireSysCol], name: &str) -> usize {
+    pay_index_in_keyed(cols, name, LEADING_COL_PK)
+}
+
+/// [`pay_index_in`] for a family whose key is its leading `pk_cols` columns —
+/// the payload index is the column index less the key arity, so a compound key
+/// shifts every payload slot by more than one. Takes the family's own `pk_cols`
+/// rather than a count so the two cannot be stated apart.
+pub(crate) const fn pay_index_in_keyed(cols: &[WireSysCol], name: &str, pk_cols: &[u32]) -> usize {
     let ci = col_index_in(cols, name);
-    assert!(ci != 0, "the leading PK column has no payload index");
-    ci - 1
+    assert!(ci >= pk_cols.len(), "a PK column has no payload index");
+    ci - pk_cols.len()
 }
 
 /// Region index of the payload column named `name` (§6): the fixed regions,
@@ -266,6 +274,33 @@ pub const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in(COL_TAB_COLS, "fk_table_i
 pub const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in(COL_TAB_COLS, "fk_col_idx");
 pub const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in(COL_TAB_COLS, "is_nullable");
 pub const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in(COL_TAB_COLS, "is_hidden");
+
+pub const CIRCNODES_COL_NODE_ID: usize = col_index_in(CIRCUIT_NODES_COLS, "node_id");
+pub const CIRCNODES_COL_OPCODE: usize = col_index_in(CIRCUIT_NODES_COLS, "opcode");
+pub const CIRCNODES_COL_SOURCE_TABLE: usize = col_index_in(CIRCUIT_NODES_COLS, "source_table");
+pub const CIRCNODES_COL_EXPR_PROGRAM: usize = col_index_in(CIRCUIT_NODES_COLS, "expr_program");
+pub const CIRCNODES_PAY_NODE_ID: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "node_id", CIRCUIT_FAMILY_PK);
+pub const CIRCNODES_PAY_OPCODE: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "opcode", CIRCUIT_FAMILY_PK);
+pub const CIRCNODES_PAY_SOURCE_TABLE: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "source_table", CIRCUIT_FAMILY_PK);
+pub const CIRCNODES_PAY_EXPR_PROGRAM: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "expr_program", CIRCUIT_FAMILY_PK);
+
+pub const CIRCEDGES_COL_DST_NODE: usize = col_index_in(CIRCUIT_EDGES_COLS, "dst_node");
+pub const CIRCEDGES_COL_DST_PORT: usize = col_index_in(CIRCUIT_EDGES_COLS, "dst_port");
+pub const CIRCEDGES_COL_SRC_NODE: usize = col_index_in(CIRCUIT_EDGES_COLS, "src_node");
+pub const CIRCEDGES_PAY_DST_NODE: usize = pay_index_in_keyed(CIRCUIT_EDGES_COLS, "dst_node", CIRCUIT_FAMILY_PK);
+pub const CIRCEDGES_PAY_DST_PORT: usize = pay_index_in_keyed(CIRCUIT_EDGES_COLS, "dst_port", CIRCUIT_FAMILY_PK);
+pub const CIRCEDGES_PAY_SRC_NODE: usize = pay_index_in_keyed(CIRCUIT_EDGES_COLS, "src_node", CIRCUIT_FAMILY_PK);
+
+pub const CIRCNCOL_COL_NODE_ID: usize = col_index_in(CIRCUIT_NODE_COLUMNS_COLS, "node_id");
+pub const CIRCNCOL_COL_KIND: usize = col_index_in(CIRCUIT_NODE_COLUMNS_COLS, "kind");
+pub const CIRCNCOL_COL_POSITION: usize = col_index_in(CIRCUIT_NODE_COLUMNS_COLS, "position");
+pub const CIRCNCOL_COL_VALUE1: usize = col_index_in(CIRCUIT_NODE_COLUMNS_COLS, "value1");
+pub const CIRCNCOL_COL_VALUE2: usize = col_index_in(CIRCUIT_NODE_COLUMNS_COLS, "value2");
+pub const CIRCNCOL_PAY_NODE_ID: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "node_id", CIRCUIT_FAMILY_PK);
+pub const CIRCNCOL_PAY_KIND: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "kind", CIRCUIT_FAMILY_PK);
+pub const CIRCNCOL_PAY_POSITION: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "position", CIRCUIT_FAMILY_PK);
+pub const CIRCNCOL_PAY_VALUE1: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "value1", CIRCUIT_FAMILY_PK);
+pub const CIRCNCOL_PAY_VALUE2: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "value2", CIRCUIT_FAMILY_PK);
 
 pub const IDXTAB_COL_OWNER_ID: usize = col_index_in(IDX_TAB_COLS, "owner_id");
 pub const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(IDX_TAB_COLS, "source_col_idx");

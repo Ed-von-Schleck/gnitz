@@ -72,6 +72,7 @@ pub const NODE_COL_KIND_RANGE_JOIN: u64 = 7; // JOIN_DELTA_TRACE_RANGE params (v
 pub const NODE_COL_KIND_GLOBAL_GROUND: u64 = 8; // REDUCE global-aggregate ground discriminator (value1=bool)
 pub const NODE_COL_KIND_REDUCE_OUT_KEY: u64 = 9; // REDUCE output-key kind (value1=ReduceOutKey); absent ⇒ SyntheticFold
 pub const NODE_COL_KIND_SCAN_BOUND: u64 = 10; // SCAN_DELTA backfill-scan index column list (value1=col_idx, position=key order)
+pub const NODE_COL_KIND_ROUTE_KEY: u64 = 11; // MAP_EXPR reindex role (value1 = ReindexRole)
 
 // ---------------------------------------------------------------------------
 // Aggregate function IDs
@@ -307,6 +308,36 @@ pub enum JoinKind {
     DeltaTraceRange { n_eq: u8, rel: RangeRel },
 }
 
+/// What a reindex `Map` re-keys *for*. One scan can fan out into several reindex
+/// Maps (`t JOIN t1 ON t.a = t1.x JOIN t2 ON t.b = t2.y`) and can also carry
+/// re-keys that only move already-routed rows, so the two cannot be told apart by
+/// graph shape — the planner states which is which at the call site, where it knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReindexRole {
+    /// The join/group key of this Map's source relation — the key the exchange
+    /// scatters that source's delta by.
+    ///
+    /// Not "an exchange is needed": a replicated or co-partitioned source is a
+    /// `ScatterKey` too, and whether the exchange runs stays the engine's call
+    /// (`compute_co_partitioned`). Naming only the scattered sides would move that
+    /// decision into the planner.
+    ScatterKey,
+    /// A re-key of rows a `ScatterKey` already placed — an outer join's null-fill
+    /// putting its preserved side back on that side's own PK so the set difference
+    /// stays partition-local, or any re-key of an operator's output.
+    Auxiliary,
+}
+
+impl ReindexRole {
+    fn from_wire(v: u64) -> ReindexRole {
+        if v == 0 {
+            ReindexRole::Auxiliary
+        } else {
+            ReindexRole::ScatterKey
+        }
+    }
+}
+
 /// MAP sub-variant discriminant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MapKind {
@@ -323,10 +354,16 @@ pub enum MapKind {
     /// equijoin key, or `0` meaning "derive the slot type from the source column"
     /// (the same-type path, byte-identical to non-promoted circuits). Both are
     /// empty for a plain compute map.
+    ///
+    /// `role` is [`ReindexRole`]. With `reindex_cols` empty this is a plain
+    /// computed projection, which by contract is the circuit's **final**
+    /// projection: the engine has no dense copy list to derive a schema from
+    /// there, so it types the node with the view's output schema.
     Expression {
         program: Vec<u8>,
         reindex_cols: Vec<u16>,
         reindex_target_tcs: Vec<u8>,
+        role: ReindexRole,
     },
     /// Full-row-identity reindex. Like `Projection` (keep the listed columns as
     /// payload, in order), but the synthetic PK is set to a hash of the kept
@@ -528,8 +565,14 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             program,
             reindex_cols,
             reindex_target_tcs,
+            role,
         }) => {
-            let kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_REINDEX, &reindex_cols, &reindex_target_tcs);
+            let mut kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_REINDEX, &reindex_cols, &reindex_target_tcs);
+            // Written for both roles, unlike the sparse GLOBAL_GROUND /
+            // REDUCE_OUT_KEY rows, so an absent row stays decodable as "this
+            // circuit predates the role" — which the decode rejects.
+            let v = matches!(role, ReindexRole::ScatterKey) as u64;
+            kind_rows.push((NODE_COL_KIND_ROUTE_KEY, 0, v, 0));
             ((OPCODE_MAP_EXPR, None, Some(program)), kind_rows)
         }
         OpNode::Map(MapKind::HashRow(cols, target_tcs, branch_id)) => {
@@ -658,10 +701,23 @@ pub fn decode_op_node(
                 collect_cols_with_tcs(cols, NODE_COL_KIND_REINDEX, crate::is_pk_eligible, |tc| {
                     format!("MAP_EXPR reindex target type code {tc} is not PK-eligible")
                 })?;
+            // An `Err` rather than a default, unlike SCAN_BOUND above: that bound
+            // decides scan speed and never correctness, so one corrupt hint row
+            // must not make a stored view unloadable. The role decides which
+            // worker a row lands on.
+            let role = cols
+                .iter()
+                .find(|c| c.kind == NODE_COL_KIND_ROUTE_KEY)
+                .map(|c| ReindexRole::from_wire(c.value1))
+                .ok_or_else(|| "MAP_EXPR missing its route-key row".to_string())?;
+            if role == ReindexRole::ScatterKey && reindex_cols.is_empty() {
+                return Err("MAP_EXPR is a scatter key but reindexes no columns".to_string());
+            }
             OpNode::Map(MapKind::Expression {
                 program,
                 reindex_cols,
                 reindex_target_tcs,
+                role,
             })
         }
         OPCODE_MAP_HASH_ROW => {
@@ -778,6 +834,12 @@ mod tests {
                 value1: 9,
                 value2: 0,
             },
+            CircuitNodeColumn {
+                kind: NODE_COL_KIND_ROUTE_KEY,
+                position: 0,
+                value1: 1,
+                value2: 0,
+            },
         ];
         let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1, 2, 3]), &cols).unwrap();
         assert_eq!(reindex_cols_of(node), vec![3, 9]);
@@ -800,6 +862,12 @@ mod tests {
                 value1: 3,
                 value2: crate::type_code::I64 as u64,
             }, // T = I64
+            CircuitNodeColumn {
+                kind: NODE_COL_KIND_ROUTE_KEY,
+                position: 0,
+                value1: 1,
+                value2: 0,
+            },
         ];
         let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1, 2, 3]), &cols).unwrap();
         assert_eq!(reindex_of(node), (vec![3, 3], vec![0, crate::type_code::I64]));
@@ -944,6 +1012,30 @@ mod tests {
 
     /// Every `OpNode` shape survives `encode_op_node` → `decode_op_node`. This is
     /// the crate's largest codec and the only one whose bugs land in a persisted
+    /// A `MAP_EXPR` whose role cannot be read decides nothing about routing, so it
+    /// must fail the decode rather than default. (Contrast `SCAN_BOUND`, which
+    /// decides only scan speed and therefore degrades instead of erroring.)
+    /// Missing row = a circuit stored before the role existed; a `ScatterKey` over
+    /// no columns would funnel a whole source onto one worker.
+    #[test]
+    fn a_map_expr_whose_role_is_unreadable_is_rejected() {
+        let row = |kind, value1| {
+            [CircuitNodeColumn {
+                kind,
+                position: 0,
+                value1,
+                value2: 0,
+            }]
+        };
+        let decode = |cols: &[CircuitNodeColumn]| decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1]), cols);
+        assert!(decode(&row(NODE_COL_KIND_REINDEX, 3))
+            .unwrap_err()
+            .contains("route-key"));
+        assert!(decode(&row(NODE_COL_KIND_ROUTE_KEY, 1))
+            .unwrap_err()
+            .contains("reindexes no columns"));
+    }
+
     /// circuit, so the variant set is swept rather than sampled.
     #[test]
     fn every_op_node_variant_roundtrips() {
@@ -957,11 +1049,19 @@ mod tests {
                 program: vec![9, 9],
                 reindex_cols: vec![],
                 reindex_target_tcs: vec![],
+                role: ReindexRole::Auxiliary,
             }),
             OpNode::Map(MapKind::Expression {
                 program: vec![1],
                 reindex_cols: vec![2, 5],
                 reindex_target_tcs: vec![0, crate::type_code::I64],
+                role: ReindexRole::ScatterKey,
+            }),
+            OpNode::Map(MapKind::Expression {
+                program: vec![1],
+                reindex_cols: vec![2, 5],
+                reindex_target_tcs: vec![0, crate::type_code::I64],
+                role: ReindexRole::Auxiliary,
             }),
             OpNode::Map(MapKind::HashRow(vec![1, 2], vec![0, crate::type_code::I32], 0)),
             OpNode::Map(MapKind::HashRow(vec![3], vec![0], 1)),

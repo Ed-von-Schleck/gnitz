@@ -697,8 +697,7 @@ impl SchemaDescriptor {
     /// A reindex/shard key equal to the distribution prefix means a derived
     /// operator co-partitions with this relation (the exchange router hashes the
     /// same leading `dist_stride` OPK bytes), so its network exchange can be
-    /// skipped. The DAG/compiler co-partition analyzers carry shard columns as
-    /// `i32`; PK indices are small and non-negative, so the compare is exact.
+    /// skipped.
     ///
     /// False for any placement that is not `Keyed`: such a relation's rows are
     /// not placed by `worker_for_pk` at all, so no shard key names the worker
@@ -712,13 +711,12 @@ impl SchemaDescriptor {
     /// matches. A side whose join-key length ≠ its own `k` instead exchanges and
     /// repartitions to the full key, reconverging with the other side. The
     /// `cluster_by_super_prefix_join_safety` E2E test exercises this.
-    pub(crate) fn shard_cols_match_dist_key(&self, cols: &[i32]) -> bool {
+    pub(crate) fn shard_cols_match_dist_key(&self, cols: &[u32]) -> bool {
         let Placement::Keyed { prefix_len } = self.placement else {
             return false;
         };
         let k = prefix_len as usize;
-        let pk = self.pk_indices();
-        cols.len() == k && cols.iter().zip(&pk[..k]).all(|(&c, &p)| c == p as i32)
+        cols.len() == k && cols == &self.pk_indices()[..k]
     }
 
     /// Byte offset of `col_idx` within the row's PK region. Walks
@@ -991,9 +989,341 @@ pub(crate) fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> Schem
     b.finish()
 }
 
+// ---------------------------------------------------------------------------
+// Derived operator-output schemas
+// ---------------------------------------------------------------------------
+//
+// The output schema of each circuit operator whose shape is a function of its
+// input schema(s) and a column list. They live here, below both `ops` and
+// `query`, so the compiler and the `ops` tests build them from one definition —
+// a second implementation would have to agree byte-for-byte with this one.
+//
+// Every one returns `None` rather than aborting when its output would overflow
+// `DerivedSchema`'s fixed column array or its `MAX_PK_COLUMNS` key slots. Their
+// inputs are client-supplied catalog data, so an overflow must fail the compile;
+// keeping the bound inside the builder is what stops each caller re-deriving it
+// for itself — differently, and PK-exclusively.
+
+/// `left`'s PK, then both sides' payloads. (An outer join's null-fill columns are
+/// appended by [`null_extend_output_schema`], not here.)
+pub(crate) fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(left)?;
+    for (_, c) in left.payload_columns().chain(right.payload_columns()) {
+        b.push(*c)?;
+    }
+    Some(b.finish())
+}
+
+/// The input's PK columns, then the non-PK sources in `src_indices` order.
+/// `src_indices` may repeat an index, so its length bounds neither the payload
+/// count nor the total.
+pub(crate) fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[u32]) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(input)?;
+    for &idx in src_indices {
+        let i = idx as usize;
+        if !input.is_pk_col(i) {
+            b.push(input.columns[i])?;
+        }
+    }
+    Some(b.finish())
+}
+
+/// Output schema of a HashRow (set-op full-row identity) Map: a synthetic U128
+/// PK at slot 0, then the projected payload columns. `target_tcs[j] != 0`
+/// promotes payload column `j` to that ≤8-byte integer type (cross-width
+/// set-op coercion) — `new` re-derives size/signedness for the promoted type —
+/// keeping THIS SIDE's nullability. Per-side, not the operator-merged view
+/// nullability: an INTERSECT/EXCEPT leaf is `distinct`-ed on its own before
+/// the tuple-tightening combine, so its row comparator must classify by what
+/// this side can actually emit.
+pub(crate) fn hashrow_output_schema(
+    in_schema: &SchemaDescriptor,
+    proj_cols: &[u32],
+    target_tcs: &[u8],
+) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk(SchemaColumn::new(type_code::U128, 0))?;
+    for (j, &c) in proj_cols.iter().enumerate() {
+        let src = in_schema.columns[c as usize];
+        let tgt = target_tcs.get(j).copied().unwrap_or(0);
+        let out_tc = if tgt != 0 { tgt } else { src.type_code };
+        b.push(SchemaColumn::new(out_tc, src.nullable))?;
+    }
+    Some(b.finish())
+}
+
+/// Output schema of an outer-join NULL_EXTEND: the input schema verbatim (PK
+/// region unchanged), then one nullable column per null-fill `type_codes` entry.
+/// `decode_op_node` rejects an undecodable type code, so every entry is a real
+/// column type.
+pub(crate) fn null_extend_output_schema(in_schema: &SchemaDescriptor, type_codes: &[u8]) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(in_schema)?;
+    for (_, c) in in_schema.payload_columns() {
+        b.push(*c)?;
+    }
+    for &tc in type_codes {
+        b.push(SchemaColumn::new(tc, 1))?;
+    }
+    Some(b.finish())
+}
+
+/// Build the full output schema of a reindex Map: the synthetic PK column(s)
+/// derived from `reindex_cols` (in key order), followed by the kept payload
+/// columns. Each PK slot's width is `gnitz_wire::resolve_reindex_type` — the
+/// carried cross-width promotion target `T_i` when non-zero, else the per-column
+/// default policy (a ≤8-byte integer key keeps its native width; everything else —
+/// U128/UUID, the STRING/BLOB content hash, PK-ineligible floats — becomes U128).
+/// This is the same carried-or-derive rule the planner's `_join_pk` stamp uses,
+/// so the engine and catalog strides stay in lockstep. Narrowing is safe for
+/// every view: reindex traces are non-durable and re-derived from the source.
+///
+/// `payload_cols` places exactly `in_schema.columns[payload_cols[i]]` at payload
+/// slot `i` — the source columns the reindex program copies, derived from the
+/// program (and range-checked) by `emit_node`. A join side whose program skips a
+/// dead source column thus stops persisting it in the trace.
+///
+/// The `None` bound also covers the packed key *width*, so no caller owes a
+/// `MAX_PK_BYTES` check: each slot is at most 16 bytes and at most
+/// `MAX_PK_COLUMNS` (5) fit — 5 × 16 = 80 = `MAX_PK_BYTES`, `ReindexPacker::new`'s
+/// assert.
+pub(crate) fn reindex_output_schema(
+    in_schema: &SchemaDescriptor,
+    reindex_cols: &[u32],
+    target_tcs: &[u8],
+    payload_cols: &[u32],
+) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    for (i, &c) in reindex_cols.iter().enumerate() {
+        let out_tc = gnitz_wire::resolve_reindex_type(
+            in_schema.columns[c as usize].type_code,
+            target_tcs.get(i).copied().unwrap_or(0),
+        );
+        // decode (the catalog trust boundary) already rejects a non-PK-eligible
+        // carried tc; this is the engine-internal backstop that a planner/compiler
+        // bug cannot stamp a float or other ineligible type into the PK region.
+        debug_assert!(
+            gnitz_wire::is_pk_eligible(out_tc),
+            "reindex output type code {out_tc} is not PK-eligible"
+        );
+        b.push_pk(SchemaColumn::new(out_tc, 0))?; // PK region: nullable = 0
+    }
+    for &c in payload_cols {
+        b.push(in_schema.columns[c as usize])?;
+    }
+    Some(b.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Derived operator-output schemas ─────────────────────────────────────
+
+    #[test]
+    fn test_merge_schemas_for_join() {
+        let left = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let right = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        );
+        let joined = merge_schemas_for_join(&left, &right).unwrap();
+        assert_eq!(joined.num_columns(), 3); // PK + left_I64 + right_STRING
+        assert_eq!(joined.columns[0].type_code, type_code::U128);
+        assert_eq!(joined.columns[1].type_code, type_code::I64);
+        assert_eq!(joined.columns[2].type_code, type_code::STRING);
+    }
+
+    #[test]
+    fn test_merge_schemas_for_join_compound_pk() {
+        // Compound-PK left: 4 columns [U64, U64, U64, U64], PK = (col1, col2).
+        let left = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[1, 2],
+        );
+        let right = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let joined = merge_schemas_for_join(&left, &right).unwrap();
+        // Two PK columns up front, then left payload (2), then right payload (1) = 5.
+        assert_eq!(joined.num_columns(), 5);
+        assert_eq!(joined.pk_indices(), &[0, 1]);
+        assert_eq!(joined.columns[0].type_code, type_code::U64);
+        assert_eq!(joined.columns[1].type_code, type_code::U64);
+
+        // Single-PK left collapses back to pk_indices = [0].
+        let left_single = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let joined_single = merge_schemas_for_join(&left_single, &right).unwrap();
+        assert_eq!(joined_single.pk_indices(), &[0]);
+    }
+
+    #[test]
+    fn test_build_map_output_schema_compound_pk() {
+        // Compound-PK input: 4 columns, PK = (col1, col2). Project [0, 3].
+        let input = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[1, 2],
+        );
+        let out = build_map_output_schema(&input, &[0, 3]).unwrap();
+        // Two PK columns + two non-PK projected columns = 4 total.
+        assert_eq!(out.num_columns(), 4);
+        assert_eq!(out.pk_indices(), &[0, 1]);
+
+        // Single-PK input collapses back to pk_indices = [0].
+        let input_single = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let out_single = build_map_output_schema(&input_single, &[1]).unwrap();
+        assert_eq!(out_single.pk_indices(), &[0]);
+
+        // The bound is PK-inclusive: a payload count that alone fits still
+        // overflows once the PK columns are prepended.
+        let wide: Vec<u32> = vec![1; crate::schema::MAX_COLUMNS];
+        assert_eq!(build_map_output_schema(&input_single, &wide), None);
+    }
+
+    #[test]
+    fn test_reindex_output_pk_width_policy() {
+        // (key column type, expected output PK type, expected pk_stride)
+        let cases = [
+            (type_code::U64, type_code::U64, 8u8),
+            (type_code::I32, type_code::I32, 4),
+            (type_code::U16, type_code::U16, 2),
+            (type_code::STRING, type_code::U128, 16),
+            (type_code::BLOB, type_code::U128, 16),
+            (type_code::U128, type_code::U128, 16),
+            (type_code::UUID, type_code::U128, 16),
+            (type_code::F64, type_code::U128, 16),
+        ];
+        for (key_tc, want_tc, want_stride) in cases {
+            // in_schema: [U64 PK, <key col>]; reindex on the payload col so the
+            // PK-ineligible key types (STRING/BLOB/float) are exercisable as keys.
+            let in_schema = SchemaDescriptor::new(
+                &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(key_tc, 0)],
+                &[0],
+            );
+            let node_schema = reindex_output_schema(&in_schema, &[1], &[], &[0, 1]).unwrap();
+            assert_eq!(node_schema.columns[0].type_code, want_tc, "key {key_tc} → PK type");
+            assert_eq!(node_schema.pk_stride(), want_stride, "key {key_tc} → pk_stride");
+        }
+    }
+
+    #[test]
+    fn test_reindex_output_schema_compound() {
+        // in_schema: [U64 pk, I32, U128]; reindex on (col1 I32, col2 U128).
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::U128, 0),
+            ],
+            &[0],
+        );
+        let out = reindex_output_schema(&in_schema, &[1, 2], &[], &[0, 1, 2]).unwrap();
+        assert_eq!(out.pk_indices(), &[0, 1], "2-slot compound PK");
+        assert_eq!(out.columns[0].type_code, type_code::I32, "slot0 keeps I32 native width");
+        assert_eq!(out.columns[1].type_code, type_code::U128, "slot1 U128");
+        assert_eq!(out.pk_stride(), 4 + 16, "compound stride = Σ slot widths");
+        // Input columns follow the synthetic PK slots.
+        assert_eq!(out.num_columns(), 2 + 3);
+        assert_eq!(out.columns[2].type_code, type_code::U64);
+        assert_eq!(out.columns[3].type_code, type_code::I32);
+        assert_eq!(out.columns[4].type_code, type_code::U128);
+    }
+
+    #[test]
+    fn test_reindex_output_schema_cross_width_promotes() {
+        // in_schema: [U64 pk, I32, I64]; reindex on (col1 I32, col2 I64) with
+        // slot 0 promoted to I64 (carried) and slot 1 self-deriving.
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let out = reindex_output_schema(&in_schema, &[1, 2], &[type_code::I64, 0], &[0, 1, 2]).unwrap();
+        assert_eq!(out.columns[0].type_code, type_code::I64, "slot0 carried T = I64");
+        assert_eq!(out.columns[1].type_code, type_code::I64, "slot1 self-derives I64");
+        assert_eq!(out.pk_stride(), 8 + 8, "both slots 8 bytes after promotion");
+    }
+
+    #[test]
+    fn test_reindex_output_schema_payload_prune() {
+        // in_schema: [U64 pk, I32, U128, I16]; reindex on col1; keep payload {0, 3}.
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I16, 0),
+            ],
+            &[0],
+        );
+        let out = reindex_output_schema(&in_schema, &[1], &[], &[0, 3]).unwrap();
+        assert_eq!(out.pk_indices(), &[0], "single synthetic PK slot");
+        assert_eq!(out.columns[0].type_code, type_code::I32, "PK slot = reindex col1 (I32)");
+        // Only the two kept payload columns follow — not all four input columns.
+        assert_eq!(out.num_columns(), 1 + 2, "1 PK + 2 kept payload");
+        assert_eq!(out.columns[1].type_code, type_code::U64, "kept payload col 0");
+        assert_eq!(out.columns[2].type_code, type_code::I16, "kept payload col 3");
+    }
+
+    #[test]
+    fn test_merge_schemas_for_join_column_overflow() {
+        // A merged column count over MAX_COLUMNS returns None (compile rejected),
+        // rather than aborting on the old assert.
+        use crate::schema::MAX_COLUMNS;
+        let half = MAX_COLUMNS / 2 + 2;
+        let make = |n: usize| {
+            let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
+            cols[0] = SchemaColumn::new(type_code::U128, 0);
+            for col in cols.iter_mut().take(n).skip(1) {
+                *col = SchemaColumn::new(type_code::I64, 0);
+            }
+            SchemaDescriptor::new(&cols[..n], &[0])
+        };
+        assert!(
+            merge_schemas_for_join(&make(half), &make(half)).is_none(),
+            "an over-wide join output must be rejected (None), not aborted"
+        );
+    }
 
     // ── Reduce output key ────────────────────────────────────────────────────
 

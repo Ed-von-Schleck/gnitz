@@ -7,7 +7,7 @@ use std::cell::UnsafeCell;
 use std::rc::Rc;
 
 use crate::ops;
-use crate::query::compiler::{self, CompileOutput, SubPlan};
+use crate::query::compiler::{self, CompileOutput, SubPlan, SysTableRefs};
 use crate::query::vm;
 use crate::schema::{Placement, SchemaDescriptor};
 use crate::storage::{Batch, RecoverySource, StorageError, Table};
@@ -263,33 +263,6 @@ impl TableEntry {
 }
 
 // ---------------------------------------------------------------------------
-// System table references
-// ---------------------------------------------------------------------------
-
-/// Handles for the three circuit system tables the compiler reads. No schemas
-/// are threaded — the compiler's cursor readers source each table's schema from
-/// the cursor itself (`ReadCursor::schema`).
-pub struct SysTableRefs {
-    // Table handles (DagEngine borrows them).
-    pub nodes: *mut Table,
-    pub edges: *mut Table,
-    pub node_columns: *mut Table,
-}
-
-// SAFETY: same single-thread guarantee.
-unsafe impl Send for SysTableRefs {}
-
-impl SysTableRefs {
-    fn null() -> Self {
-        SysTableRefs {
-            nodes: std::ptr::null_mut(),
-            edges: std::ptr::null_mut(),
-            node_columns: std::ptr::null_mut(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ExchangeCallback — trait for multi-worker exchange IPC
 // ---------------------------------------------------------------------------
 
@@ -518,18 +491,7 @@ impl DagEngine {
     ) -> Result<CompileOutput, compiler::CompileError> {
         let bounded = self.tables.get(&view_id).is_some_and(|e| e.capacity_bytes.is_some());
         let ext_tables = self.ext_tables();
-        unsafe {
-            compiler::compile_view(
-                view_id as u64,
-                self.sys.nodes,
-                self.sys.edges,
-                self.sys.node_columns,
-                view_dir,
-                view_schema,
-                &ext_tables,
-                bounded,
-            )
-        }
+        unsafe { compiler::compile_view(view_id as u64, self.sys, view_dir, view_schema, &ext_tables, bounded) }
     }
 
     /// Decide whether a just-registered view's circuit compiles, keeping nothing.
@@ -654,8 +616,14 @@ mod tests {
 
     /// A `ViewMeta` fixture whose join-shard map names `src` as a source.
     fn meta_with_source(src: i64) -> Rc<ViewMeta> {
-        let mut jm: FxHashMap<i64, Rc<[(i32, u8)]>> = FxHashMap::default();
-        jm.insert(src, Rc::from([]));
+        let mut jm: FxHashMap<i64, meta::JoinScatterKey> = FxHashMap::default();
+        jm.insert(
+            src,
+            meta::JoinScatterKey {
+                cols: Rc::from([]),
+                target_tcs: Rc::from([]),
+            },
+        );
         Rc::new(ViewMeta {
             shard_cols: None,
             join_shard_map: jm,

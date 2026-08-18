@@ -14,7 +14,7 @@ use crate::storage::{Batch, ReadCursor};
 /// view/history state has diverged from its durable inputs and there is no
 /// sound continue (dropping the delta permanently desyncs the integral).
 /// Recovery is restart + SAL replay.
-fn fatal_on_tick_ingest_err(op: &str, table_idx: i32, r: Result<(), crate::storage::StorageError>) {
+fn fatal_on_tick_ingest_err(op: &str, table_idx: u16, r: Result<(), crate::storage::StorageError>) {
     if let Err(e) = r {
         crate::gnitz_fatal_abort!(
             "vm: {} ingest failed (table_idx={}): {} — tick state diverged \
@@ -185,19 +185,14 @@ pub(crate) fn execute_epoch_from(
                 // every emitted Map carries a func.
                 debug_assert!(!func_ptr.is_null(), "Map: identity map must be elided at emit");
                 let func = unsafe { &*func_ptr };
-                let in_schema = &program.reg_meta[*in_reg as usize].schema;
                 let reindex = match *reindex {
                     ReindexOperand::None => ops::ReindexSpec::None,
                     ReindexOperand::HashRow { branch_id } => ops::ReindexSpec::HashRow { branch_id },
-                    ReindexOperand::Pack { off, cnt } => {
-                        let (off, cnt) = (off as usize, cnt as usize);
-                        ops::ReindexSpec::Pack {
-                            cols: &program.reindex_cols[off..off + cnt],
-                            target_tcs: &program.reindex_target_tcs[off..off + cnt],
-                        }
+                    ReindexOperand::Pack { packer_idx } => {
+                        ops::ReindexSpec::Pack(&program.reindex_packers[packer_idx as usize])
                     }
                 };
-                let result = ops::op_map(&reg!(*in_reg).batch, func, in_schema, reindex);
+                let result = ops::op_map(&reg!(*in_reg).batch, func, reindex);
                 reg_mut!(*out_reg).batch = result;
             }
 
@@ -243,7 +238,7 @@ pub(crate) fn execute_epoch_from(
                 let ptr = program.tables[*hist_table_idx as usize];
                 let table = unsafe { &mut *ptr };
                 let res = table.ingest_owned_batch(consolidated);
-                fatal_on_tick_ingest_err("weight-clamp history", *hist_table_idx as i32, res);
+                fatal_on_tick_ingest_err("weight-clamp history", *hist_table_idx, res);
             }
 
             Instr::JoinDT {
@@ -301,34 +296,33 @@ pub(crate) fn execute_epoch_from(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::Integrate { in_reg, table_idx, avi } => {
+            Instr::Integrate { in_reg, target } => {
                 if read_only {
                     continue;
                 }
-                let target_ptr = if *table_idx >= 0 {
-                    program.tables[*table_idx as usize]
-                } else {
-                    std::ptr::null_mut()
+                let (table_idx, trace, avi_desc) = match target {
+                    IntegrateTarget::Trace(idx) => {
+                        let ptr = program.tables[*idx as usize];
+                        (*idx, Some(unsafe { &mut *ptr }), None)
+                    }
+                    IntegrateTarget::Avi(a) => (
+                        a.table_idx,
+                        None,
+                        Some(AviDesc {
+                            table: program.tables[a.table_idx as usize],
+                            bake: &program.avi_bakes[a.bake_idx as usize],
+                        }),
+                    ),
                 };
-                let target = if !target_ptr.is_null() {
-                    Some(unsafe { &mut *target_ptr })
-                } else {
-                    None
-                };
-
-                let avi_desc = avi.as_ref().map(|a| AviDesc {
-                    table: program.tables[a.table_idx as usize],
-                    bake: &program.avi_bakes[a.bake_idx as usize],
-                });
 
                 gnitz_debug!(
-                    "vm: INTEGRATE in_count={} target={} avi={}",
+                    "vm: INTEGRATE in_count={} trace={} avi={}",
                     reg!(*in_reg).batch.count,
-                    target.is_some(),
+                    trace.is_some(),
                     avi_desc.is_some()
                 );
-                let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, target, avi_desc.as_ref());
-                fatal_on_tick_ingest_err("integrate", *table_idx, res);
+                let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, trace, avi_desc.as_ref());
+                fatal_on_tick_ingest_err("integrate", table_idx, res);
             }
 
             Instr::Reduce {

@@ -136,9 +136,11 @@ impl CatalogEngine {
         self.rebuild_relation_store(vid, "reset view output")?;
 
         // Remove this worker's per-view operator scratch dirs (rank-stamped).
+        // Through `remove_child` so a crash mid-removal cannot leave a manifest
+        // behind whose shards are gone — `remove_dir_all` deletes in readdir order.
         for name in subdir_names(&dir) {
             if matches!(ChildAddr::parse(&name), Some(ChildAddr::Scratch { rank: r, .. }) if r == rank) {
-                let _ = std::fs::remove_dir_all(format!("{dir}/{name}"));
+                crate::storage::remove_child(&format!("{dir}/{name}"));
             }
         }
 

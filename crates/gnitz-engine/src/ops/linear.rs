@@ -51,15 +51,17 @@ pub enum ReindexSpec<'a> {
     /// Set each PK to a hash of the full output row (all payload columns) for
     /// EXCEPT/INTERSECT/DISTINCT full-row set identity.
     HashRow { branch_id: u8 },
-    /// Pack the listed source columns' OPK bytes contiguously into the output
-    /// PK (the `_join_pk` for an equijoin / GROUP BY repartition).
-    Pack { cols: &'a [u32], target_tcs: &'a [u8] },
+    /// Pack the reindex columns' OPK bytes contiguously into the output PK (the
+    /// `_join_pk` for an equijoin / GROUP BY repartition). The packer is baked at
+    /// compile time — its per-column promoters are a function of the input schema
+    /// and the key, neither of which changes between batches.
+    Pack(&'a ReindexPacker),
 }
 
 /// Map: transform batch via scalar function, then stamp the output PK region
 /// per `reindex` (see [`ReindexSpec`]). The output schema lives in the func
-/// (`ScalarFunc::Map.out_schema`); `in_schema` feeds the reindex packer.
-pub fn op_map(batch: &Batch, func: &ScalarFunc, in_schema: &SchemaDescriptor, reindex: ReindexSpec<'_>) -> Batch {
+/// (`ScalarFunc::Map.out_schema`).
+pub fn op_map(batch: &Batch, func: &ScalarFunc, reindex: ReindexSpec<'_>) -> Batch {
     // A reindex-free MAP inherits the input PK region verbatim; the reindex arms
     // below overwrite every row of it, so the map must not write it at all
     // (their output stride legitimately differs from the input's).
@@ -83,9 +85,7 @@ pub fn op_map(batch: &Batch, func: &ScalarFunc, in_schema: &SchemaDescriptor, re
         // Pack each reindex column's OPK bytes contiguously into the output PK.
         // The SAME packer routes the exchange scatter (via `ScatterKey`), so the
         // reindexed `_join_pk` and the delta scatter co-partition byte-for-byte.
-        ReindexSpec::Pack { cols, target_tcs } => {
-            ReindexPacker::new(in_schema, cols, target_tcs).promote_into(&batch.as_mem_batch(), &mut output)
-        }
+        ReindexSpec::Pack(packer) => packer.promote_into(&batch.as_mem_batch(), &mut output),
         ReindexSpec::None => {}
     }
 
@@ -526,7 +526,7 @@ mod tests {
         let empty_batch = Batch::empty_with_schema(&schema);
 
         let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).unwrap();
-        let out = op_map(&empty_batch, &func, &schema, ReindexSpec::None);
+        let out = op_map(&empty_batch, &func, ReindexSpec::None);
         assert_eq!(out.count, 0);
     }
 
@@ -620,17 +620,12 @@ mod tests {
     // op_null_extend blob propagation
     // -----------------------------------------------------------------------
 
-    /// The compiler-built null-extend output schema (`reg_meta`): input columns
-    /// followed by the right side's payload columns marked nullable, keyed by
-    /// the input PK — what `emit.rs` bakes and `exec.rs` passes to the op.
+    /// The null-extend output schema `reg_meta` carries and `exec.rs` hands the
+    /// op — the compiler's own builder, not a look-alike, so a change to the
+    /// layout reaches these tests instead of silently passing against a stale copy.
     fn null_extend_out_schema(in_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> SchemaDescriptor {
-        let mut cols: Vec<SchemaColumn> = (0..in_schema.num_columns()).map(|ci| in_schema.columns[ci]).collect();
-        for (_, col) in right_schema.payload_columns() {
-            let mut c = *col;
-            c.nullable = 1;
-            cols.push(c);
-        }
-        SchemaDescriptor::new(&cols, in_schema.pk_indices())
+        let fill: Vec<u8> = right_schema.payload_columns().map(|(_, c)| c.type_code).collect();
+        crate::schema::null_extend_output_schema(in_schema, &fill).expect("test schema exceeds MAX_COLUMNS")
     }
 
     #[test]
@@ -842,15 +837,8 @@ mod tests {
         // Projection plan: output keeps the same single payload column.
         let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).unwrap();
 
-        let out = op_map(
-            &batch,
-            &func,
-            &schema,
-            ReindexSpec::Pack {
-                cols: &[1],
-                target_tcs: &[],
-            },
-        );
+        let packer = ReindexPacker::new(&schema, &[1], &[]);
+        let out = op_map(&batch, &func, ReindexSpec::Pack(&packer));
         assert_eq!(out.count, 3);
         // Each output row's PK is the sign-aware OPK image of its source payload
         // value (col 1 is I64): `widen_pk_be(encode_pk_column(v))`, i.e. the value

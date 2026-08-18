@@ -6,7 +6,7 @@
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr_to_program;
 use crate::ir::{BinOp, BoundExpr};
-use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, NodeId, Schema, TypeCode};
+use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, NodeId, ReindexRole, Schema, TypeCode};
 
 /// Multi-column NULL predicate for a Filter over a composite equijoin key,
 /// reusing the WHERE-clause bound-expr → ExprProgram path so each column index
@@ -118,6 +118,7 @@ pub(crate) fn build_reindex_program_keep(keep: &[usize]) -> gnitz_core::ExprProg
 /// columns already carry their own types, so the re-key is width- and sign-exact.
 /// One home, so every null-fill's preserved side is keyed identically to the
 /// `π_P(inner)` it is subtracted from — a drift there would be a silent weight bug.
+///
 pub(crate) fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema) -> NodeId {
     let zero = vec![0u8; schema.pk_cols.len()];
     cb.map_reindex(
@@ -125,6 +126,7 @@ pub(crate) fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: 
         &schema.pk_cols,
         &zero,
         build_reindex_program(schema.columns.len()),
+        ReindexRole::Auxiliary,
     )
 }
 

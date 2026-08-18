@@ -760,27 +760,19 @@ impl MasterDispatcher {
         // reindex key so a row lands on the worker that owns its `_join_pk`
         // partition; a GROUP BY / set-op exchange scatter routes by the group
         // key (consistent with op_reduce's output PK). See `RouteMode`.
-        // A join-shard scatter carries (reindex col, carried promotion target tc)
-        // pairs; a GROUP BY / set-op scatter carries plain shard cols (no
-        // promotion). Split the pairs into a column list + a parallel target-tc
-        // list for the scatter packer.
+        // A join-shard scatter carries a per-slot promotion target; a GROUP BY /
+        // set-op scatter has none, and only the join arm ever consults one.
         let meta = cat.dag.view_meta(view_id);
-        let join_pairs = (source_id > 0)
+        let join_key = (source_id > 0)
             .then(|| meta.join_shard_map.get(&source_id))
             .flatten()
-            .filter(|p| !p.is_empty());
-        let is_join = join_pairs.is_some();
-        let (shard_cols, target_tcs): (std::rc::Rc<[i32]>, Vec<u8>) = match join_pairs {
-            Some(pairs) => (
-                pairs.iter().map(|&(c, _)| c).collect(),
-                pairs.iter().map(|&(_, t)| t).collect(),
-            ),
+            .filter(|k| !k.cols.is_empty());
+        let is_join = join_key.is_some();
+        let shard_cols: &[u32] = match join_key {
+            Some(k) => &k.cols,
             // A view with no `ExchangeShard` shards on `∅` — every row to
             // partition 0's owner — the same route a global aggregate takes.
-            None => (
-                meta.shard_cols.clone().unwrap_or_else(|| std::rc::Rc::from([])),
-                Vec::new(),
-            ),
+            None => meta.shard_cols.as_deref().unwrap_or(&[]),
         };
 
         // A range-join INPUT relay (source_id > 0, is_join over a DeltaTraceRange
@@ -808,11 +800,13 @@ impl MasterDispatcher {
                 range_n_eq.is_none_or(|n_eq| shard_cols.len() == n_eq as usize + 1),
                 "range-join reindex key = [eq…, range]: len must be n_eq + 1"
             );
-            let col_indices: Vec<u32> = shard_cols[..route_len].iter().map(|&c| c as u32).collect();
-            // target_tcs is EMPTY for a GroupKey scatter (no promotion) and has
-            // length shard_cols.len() for any join; slice it to the routing prefix
-            // when promoting, empty otherwise.
-            let route_tcs: &[u8] = if is_join { &target_tcs[..route_len] } else { &[] };
+            let col_indices = &shard_cols[..route_len];
+            // A GroupKey scatter promotes nothing; a join's target list is as long
+            // as its key, so slice it to the routing prefix.
+            let route_tcs: &[u8] = match join_key {
+                Some(k) => &k.target_tcs[..route_len],
+                None => &[],
+            };
             let mode = if is_join {
                 RouteMode::JoinPromote
             } else {
@@ -823,9 +817,9 @@ impl MasterDispatcher {
             // the re-sorting repartition. The scatter
             // (`op_relay_scatter_consolidated_mode`) debug-verifies each.
             RelayDest::PerWorker(if sources.iter().flatten().all(|b| b.is_consolidated()) {
-                op_relay_scatter_consolidated_mode(&sources, &col_indices, route_tcs, &schema, self.num_workers, mode)
+                op_relay_scatter_consolidated_mode(&sources, col_indices, route_tcs, &schema, self.num_workers, mode)
             } else {
-                op_repartition_batches_mode(&sources, &col_indices, route_tcs, &schema, self.num_workers, mode)
+                op_repartition_batches_mode(&sources, col_indices, route_tcs, &schema, self.num_workers, mode)
             })
         };
 

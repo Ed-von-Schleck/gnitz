@@ -9,16 +9,11 @@ pub(super) use crate::test_support::{
     make_batch, make_batch_i64pk as make_signed_batch, make_schema_i64pk_i64 as make_schema_signed, make_schema_u64_i64,
 };
 
-/// The compiler-built join output schema (`reg_meta`): left columns followed by
-/// the right side's payload columns, keyed by the left PK — what `emit.rs`'s
-/// `merge_schemas_for_join` bakes and `exec.rs` passes to the join ops. Test
-/// schemas are PK-leading, so the plain concatenation matches.
+/// The join output schema `reg_meta` carries and `exec.rs` hands the join ops —
+/// the compiler's own builder, not a look-alike, so a change to the layout
+/// reaches these tests instead of silently passing against a stale copy.
 pub(super) fn join_out_schema(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = (0..left.num_columns()).map(|ci| left.columns[ci]).collect();
-    for (_, col) in right.payload_columns() {
-        cols.push(*col);
-    }
-    SchemaDescriptor::new(&cols, left.pk_indices())
+    crate::schema::merge_schemas_for_join(left, right).expect("test join schema exceeds MAX_COLUMNS")
 }
 
 pub(super) fn make_schema_compound() -> SchemaDescriptor {

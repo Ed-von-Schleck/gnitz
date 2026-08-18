@@ -12,7 +12,9 @@ pub mod types;
 // module is `pub`, so anything omitted here is still reachable by its own path —
 // this list carries no meaning beyond "spelled often enough to be worth
 // shortening".
-pub use circuit::{agg_output_type, Circuit, CircuitBuilder, CircuitRows, NodeId, OpNode, RangeRel, ReduceOutKey};
+pub use circuit::{
+    agg_output_type, Circuit, CircuitBuilder, CircuitRows, NodeId, OpNode, RangeRel, ReduceOutKey, ReindexRole,
+};
 pub use client::{
     hidden_view_name, retraction_batch, GnitzClient, IndexMeta, InlineUniqueIndex, PlannedView, RelKind, TxnBuffer,
     MAX_CHAIN_SEGMENTS,

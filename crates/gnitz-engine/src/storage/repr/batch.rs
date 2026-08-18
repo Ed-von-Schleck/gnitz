@@ -2047,6 +2047,12 @@ impl gnitz_wire::sys_rows::SysRowSink for BatchBuilder {
     fn put_string(&mut self, s: &str) {
         BatchBuilder::put_string(self, s);
     }
+    fn put_bytes(&mut self, b: &[u8]) {
+        BatchBuilder::put_blob(self, b);
+    }
+    fn put_null(&mut self) {
+        BatchBuilder::put_null(self);
+    }
     fn end_row(&mut self) {
         BatchBuilder::end_row(self);
     }
@@ -2156,7 +2162,6 @@ impl BatchBuilder {
     }
 
     /// Put a NULL value for the current payload column.
-    #[cfg(test)]
     pub(crate) fn put_null(&mut self) {
         let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
         self.batch.fill_col_zero(self.curr_col, col_size);
@@ -2192,7 +2197,6 @@ impl BatchBuilder {
             .expect("BatchBuilder batch always carries a schema")
     }
 
-    #[cfg(test)]
     fn physical_col_idx(&self) -> usize {
         self.schema().payload_col_idx(self.curr_col)
     }

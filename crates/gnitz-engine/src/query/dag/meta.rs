@@ -18,11 +18,9 @@ pub(crate) struct ViewMeta {
     /// routing key — and `None` when the circuit carries no `ExchangeShard` at
     /// all. The two states are distinct: an ungrouped global aggregate shards on
     /// `∅`, a real exchange that funnels every row onto `worker_for_key(V₀)`.
-    pub shard_cols: Option<Rc<[i32]>>,
-    /// source table id → join/group reindex `(column, carried promotion tc)`
-    /// pairs — the scatter key per source, mirroring the trace-side reindex
-    /// Map slot-for-slot.
-    pub join_shard_map: FxHashMap<i64, Rc<[(i32, u8)]>>,
+    pub shard_cols: Option<Rc<[u32]>>,
+    /// source table id → its join/group reindex scatter key.
+    pub join_shard_map: FxHashMap<i64, JoinScatterKey>,
     /// `Some(n_eq)` iff the view is a non-equi (range / band) join. Drives the
     /// master relay's eq-prefix scatter (`n_eq ≥ 1`) vs broadcast (`n_eq == 0`).
     pub range_join_n_eq: Option<u8>,
@@ -30,17 +28,44 @@ pub(crate) struct ViewMeta {
     pub has_join: bool,
 }
 
+/// One source's join/group reindex scatter key: the columns the relay routes by
+/// and the per-slot carried promotion targets, mirroring the trace-side reindex
+/// Map slot-for-slot. Held pre-split because the relay reads the two halves
+/// separately, once per relay round.
+pub(crate) struct JoinScatterKey {
+    pub cols: Rc<[u32]>,
+    pub target_tcs: Rc<[u8]>,
+}
+
+impl JoinScatterKey {
+    fn from_pairs(pairs: Vec<(u32, u8)>) -> JoinScatterKey {
+        JoinScatterKey {
+            cols: pairs.iter().map(|&(c, _)| c).collect(),
+            target_tcs: pairs.iter().map(|&(_, t)| t).collect(),
+        }
+    }
+}
+
 impl ViewMeta {
+    /// The answer for a circuit that could not be read or is cyclic: no exchange
+    /// skip, no shard or join columns, no range join. Every metadata query then
+    /// takes its conservative branch instead of walking a graph that is not there.
+    pub(super) fn nothing_special() -> ViewMeta {
+        ViewMeta {
+            shard_cols: None,
+            join_shard_map: FxHashMap::default(),
+            range_join_n_eq: None,
+            has_join: false,
+        }
+    }
+
     /// Derive the metadata from an already-loaded circuit. The body behind
     /// `view_meta`'s memo miss.
-    ///
-    /// `loaded` MUST already be `topo_sort`ed: `compute_join_shard_map` and
-    /// `output_exchange_shard` both walk order that only `topo_sort` populates.
     pub(super) fn from_loaded(loaded: &compiler::LoadedCircuit) -> ViewMeta {
-        let shard_cols: Option<Rc<[i32]>> = compiler::output_exchange_shard(loaded).map(|(_, cols)| cols.into());
-        let join_shard_map: FxHashMap<i64, Rc<[(i32, u8)]>> = compiler::compute_join_shard_map(loaded)
+        let shard_cols: Option<Rc<[u32]>> = compiler::output_exchange_shard(loaded).map(|(_, cols)| cols.into());
+        let join_shard_map: FxHashMap<i64, JoinScatterKey> = compiler::compute_join_shard_map(loaded)
             .into_iter()
-            .map(|(tid, cols)| (tid, cols.into()))
+            .map(|(tid, pairs)| (tid, JoinScatterKey::from_pairs(pairs)))
             .collect();
         ViewMeta {
             shard_cols,
@@ -318,28 +343,11 @@ impl DagEngine {
     // ── ViewMeta (plan-free circuit metadata) ───────────────────────────
 
     /// Load typed circuit nodes/edges for metadata queries. Cheaper than full
-    /// compilation: no optimization passes, no code emission.
-    pub(super) fn load_meta_circuit(&self, view_id: i64) -> compiler::LoadedCircuit {
-        let mut loaded = compiler::load_circuit(
-            self.sys.nodes,
-            self.sys.edges,
-            self.sys.node_columns,
-            view_id as u64,
-            SchemaDescriptor::default(),
-        )
-        .unwrap_or_default();
-        // Populate `outgoing`/`incoming` adjacency so annotation helpers like
-        // `reindex_cols_through_filters` can traverse the graph. (`load_circuit`
-        // returns a circuit with empty adjacency maps; only `compile_view` runs
-        // topo_sort itself.) A malformed cyclic circuit cannot compile or execute
-        // (`compile_view` rejects it the same way), so present it as empty here, just
-        // like a failed load above — every metadata query then reads the conservative
-        // "nothing special" answer (no exchange skip, no shard/join cols, no range
-        // join) off an empty circuit instead of walking a cyclic adjacency.
-        if compiler::topo_sort(&mut loaded).is_err() {
-            return compiler::LoadedCircuit::default();
-        }
-        loaded
+    /// compilation: no optimization passes, no code emission. `None` for a
+    /// circuit that cannot be read or is cyclic — one that cannot compile or
+    /// execute either (`compile_view` rejects it the same way).
+    pub(super) fn load_meta_circuit(&self, view_id: i64) -> Option<compiler::LoadedCircuit> {
+        compiler::load_circuit(self.sys, view_id as u64, SchemaDescriptor::default()).ok()
     }
 
     /// The memoized per-view circuit metadata, computed from ONE
@@ -350,9 +358,11 @@ impl DagEngine {
         if let Some(m) = self.meta.get(&view_id) {
             return m.clone();
         }
-        // `load_meta_circuit` topo-sorts (falling back to an empty circuit on a
-        // malformed one), satisfying `from_loaded`'s precondition.
-        let meta = Rc::new(ViewMeta::from_loaded(&self.load_meta_circuit(view_id)));
+        let meta = Rc::new(
+            self.load_meta_circuit(view_id)
+                .as_ref()
+                .map_or_else(ViewMeta::nothing_special, ViewMeta::from_loaded),
+        );
         self.meta.insert(view_id, meta.clone());
         meta
     }

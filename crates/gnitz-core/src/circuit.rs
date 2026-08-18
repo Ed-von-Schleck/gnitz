@@ -2,6 +2,7 @@ use gnitz_expr::ExprProgram;
 
 pub use gnitz_wire::{
     agg_output_type, AggFunc, JoinKind, MapKind, NodeColumnPayload, NodeFields, OpNode, RangeRel, ReduceOutKey,
+    ReindexRole,
 };
 
 pub type NodeId = u64;
@@ -172,6 +173,12 @@ impl CircuitBuilder {
         self.alloc_unary(OpNode::Filter(expr.map(|e| e.encode())), input)
     }
 
+    /// A computed projection. It carries no reindex columns, so it re-keys nothing
+    /// — and the engine therefore types its output with the **view's own output
+    /// schema**, having no dense copy list to derive one from (`SELECT a + b` is
+    /// not a copy). Every caller must emit the circuit's final projection. A
+    /// reindex-free map that projected something narrower would be typed with the
+    /// view's width and mis-read downstream.
     pub fn map_expr(&mut self, input: NodeId, program: ExprProgram) -> NodeId {
         let blob = program.encode();
         self.alloc_unary(
@@ -179,6 +186,7 @@ impl CircuitBuilder {
                 program: blob,
                 reindex_cols: Vec::new(),
                 reindex_target_tcs: Vec::new(),
+                role: ReindexRole::Auxiliary,
             }),
             input,
         )
@@ -197,14 +205,15 @@ impl CircuitBuilder {
     /// The engine derives the node's output payload schema from `program`'s copy
     /// list: a program that is one COPY_COL per payload column with dense outputs
     /// `0..n` places exactly its source columns behind the key slots (so copying a
-    /// column subset prunes the payload); any other program shape gets all input
-    /// columns.
+    /// column subset prunes the payload). Only this arm derives it; a
+    /// *reindex-free* `map_expr` is typed by the view's own output schema.
     pub fn map_reindex(
         &mut self,
         input: NodeId,
         reindex_cols: &[usize],
         target_tcs: &[u8],
         program: ExprProgram,
+        role: ReindexRole,
     ) -> NodeId {
         let blob = program.encode();
         self.alloc_unary(
@@ -212,6 +221,7 @@ impl CircuitBuilder {
                 program: blob,
                 reindex_cols: reindex_cols.iter().map(|&c| c as u16).collect(),
                 reindex_target_tcs: target_tcs.to_vec(),
+                role,
             }),
             input,
         )
@@ -468,7 +478,7 @@ mod tests {
         let (c1, c2) = (2usize, 5usize);
         let mut cb = CircuitBuilder::new(7, 100);
         let input = cb.input_delta();
-        let map_nid = cb.map_reindex(input, &[c1, c2], &[], empty_prog());
+        let map_nid = cb.map_reindex(input, &[c1, c2], &[], empty_prog(), ReindexRole::ScatterKey);
         let circuit = cb.build();
 
         let rows = circuit.into_rows();
@@ -503,7 +513,13 @@ mod tests {
         let input = cb.input_delta();
         // Overlapping key [x, x] with distinct per-slot targets: slot 0 derives,
         // slot 1 promotes to I64.
-        let map_nid = cb.map_reindex(input, &[3, 3], &[0, type_code::I64], empty_prog());
+        let map_nid = cb.map_reindex(
+            input,
+            &[3, 3],
+            &[0, type_code::I64],
+            empty_prog(),
+            ReindexRole::ScatterKey,
+        );
         let rows = cb.build().into_rows();
 
         let mut reindex_rows: Vec<_> = rows
@@ -538,7 +554,7 @@ mod tests {
         let mut cb = CircuitBuilder::new(9, 100);
         let a = cb.input_delta_tagged(100);
         let b = cb.input_delta_tagged(200);
-        let reindex_b = cb.map_reindex(b, &[0], &[], empty_prog());
+        let reindex_b = cb.map_reindex(b, &[0], &[], empty_prog(), ReindexRole::ScatterKey);
         let filt_b = cb.worker_filter(reindex_b);
         let trace_b = cb.integrate_trace(filt_b);
         let join = cb.join_with_trace_range_node(a, trace_b, 1, RangeRel::Le);

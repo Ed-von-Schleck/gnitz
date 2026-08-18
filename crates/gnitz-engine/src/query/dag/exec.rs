@@ -226,9 +226,7 @@ impl DagEngine {
             PlanShape::Single(_) => 0,
         };
         let skip_output_exchange = sides == 1 && !is_range_join && plan.skips_exchange;
-        let join_scatter = sides == 0
-            && plan.join_shard_map.get(&src_id).is_some_and(|c| !c.is_empty())
-            && !plan.co_partitioned.contains(&src_id);
+        let join_scatter = sides == 0 && plan.scatter_sources.contains(&src_id);
 
         if is_range_join {
             // Arm 2 — relay the input delta first, then the exchanged pipeline.

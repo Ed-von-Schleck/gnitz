@@ -76,8 +76,7 @@ pub(crate) enum Instr {
     },
     Integrate {
         in_reg: u16,
-        table_idx: i32, // index into Program::tables, -1 = no target (sink)
-        avi: Option<IntegrateAvi>,
+        target: IntegrateTarget,
     },
     Reduce {
         in_reg: u16,
@@ -95,14 +94,15 @@ pub(crate) enum Instr {
 }
 
 /// Stored form of [`crate::ops::ReindexSpec`] — the `Instr::Map` PK-restamp
-/// operand. `Pack` keeps a side-table range into `Program::reindex_cols` /
-/// `reindex_target_tcs` (no inline Vecs); the exec dispatch resolves it to the
-/// borrowed ops enum.
+/// operand. `Pack` indexes `Program::reindex_packers` rather than inlining the
+/// packer: a `ReindexPacker` is an order of magnitude wider than an `Instr`, and
+/// inlining it would grow every instruction and wreck the dispatch loop's
+/// locality. The exec dispatch resolves the index to the borrowed ops enum.
 #[derive(Clone, Copy)]
 pub(crate) enum ReindexOperand {
     None,
     HashRow { branch_id: u8 },
-    Pack { off: u32, cnt: u16 },
+    Pack { packer_idx: u16 },
 }
 
 /// True iff `instr` reads the batch of register `r`. The instruction set's own
@@ -157,10 +157,23 @@ pub(crate) fn writes_state(instr: &Instr) -> bool {
 /// Reduce read side needs only the table — `avi_table_idx` — to open a cursor
 /// against; it reads per-aggregate `for_max`/type from its own `agg_descs` by
 /// ordinal.)
+#[derive(Clone, Copy)]
 pub(crate) struct IntegrateAvi {
     pub table_idx: u16,
     /// Index into `Program::avi_bakes`.
     pub bake_idx: u16,
+}
+
+/// What an `Instr::Integrate` accumulates into. The two are exclusive by
+/// construction — `emit_reduce` gates its trace-in table on `!use_avi` — so an
+/// enum is what the emitter can actually express, where a pair of `Option`s
+/// would admit two states nothing produces.
+#[derive(Clone, Copy)]
+pub(crate) enum IntegrateTarget {
+    /// A trace table: index into `Program::tables`.
+    Trace(u16),
+    /// The combined aggregate value index; the delta lands nowhere else.
+    Avi(IntegrateAvi),
 }
 
 /// Opaque handle owning a compiled program and its register file.
@@ -304,10 +317,8 @@ pub(crate) struct Program {
     /// Shared resource arrays — referenced by index from instructions.
     pub funcs: Vec<*const ScalarFunc>,
     pub tables: Vec<*mut Table>,
-    pub reindex_cols: Vec<u32>,
-    /// Parallel to `reindex_cols` (same offsets): per-column carried promotion
-    /// target tc (`0` = derive from source).
-    pub reindex_target_tcs: Vec<u8>,
+    /// Baked per-`Instr::Map` reindex packers (see `ReindexOperand::Pack`).
+    pub reindex_packers: Vec<crate::ops::ReindexPacker>,
     /// Baked per-`Instr::Reduce` plans (see `ops::ReducePlan`).
     pub reduce_plans: Vec<crate::ops::ReducePlan>,
     /// Baked AVI write-side resources, indexed by `IntegrateAvi::bake_idx`.
@@ -445,8 +456,7 @@ mod tests {
         let table_idx = b.table_idx(table);
         b.push(Instr::Integrate {
             in_reg,
-            table_idx,
-            avi: None,
+            target: IntegrateTarget::Trace(table_idx),
         });
     }
 
@@ -902,7 +912,7 @@ mod tests {
         let (table, table_ptr) = owned_table(dir.path(), "dist_test", schema);
         let mut builder = ProgramBuilder::new();
         // reg 0 = input delta, reg 1 = history trace, reg 2 = output delta
-        let hist_table_idx = builder.table_idx(table_ptr) as u16;
+        let hist_table_idx = builder.table_idx(table_ptr);
         builder.push(Instr::WeightClamp {
             in_reg: 0,
             hist_reg: 1,
