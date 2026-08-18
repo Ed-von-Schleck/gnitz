@@ -47,8 +47,9 @@ equality would be wrong two ways: ``nan != nan`` (a bit-stable MIN/MAX NaN outpu
 would never match itself) and ``-0.0 == 0.0`` (two distinct bit patterns would
 merge). Integer/string/NULL values are left untouched, so an all-integer view
 compares exactly as before. A **float-column** ``SUM``/``AVG`` is non-deterministic
-between live tick-order and rebuild chunk-order (IEEE addition is non-associative)
-and must still be omitted from ``project`` by the test author; canonicalization only
+between live tick-order and a rebuild's own scan order (its chunking, and which
+access path the rebuild's cost gate picked) and must still be omitted from
+``project`` by the test author; canonicalization only
 makes the *deterministic* float columns (``MIN``/``MAX`` copy verbatim bits, integer
 ``AVG`` is one exact division) compare bit-exactly.
 """

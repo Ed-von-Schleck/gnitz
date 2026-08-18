@@ -61,14 +61,14 @@ enum ColAcc {
     /// `sum_f64` divides at: `agg_output_type(Sum, U64)` is U64, so past 2^63 a
     /// signed read of `bits` would be negative.
     IntSum { bits: i64, seen: bool, tc: TypeCode },
-    /// Float SUM — Σ (w as f64)·partial. IEEE-754 addition is non-associative,
-    /// so the value follows the summation order, and this fold reassociates it
-    /// two ways a view does not: the partials arrive in worker order, and each
-    /// worker's own partial follows the order its access path visited rows in.
-    /// A float-SUM *view* keeps the deterministic single-worker funnel (its
-    /// two-phase combine excludes float SUM for exactly this reason), so only
-    /// the ad-hoc path varies with worker count. The whole point of the fold is
-    /// not shipping rows, so the per-worker split is inherent here. Use an
+    /// Float SUM — Σ (w as f64)·partial. IEEE-754 addition is non-associative, so
+    /// the value follows the summation order: the order each worker's access path
+    /// visited rows in, and — only here — the reply order the partials arrive in.
+    /// A float-SUM *view* keeps the single-worker funnel (its two-phase combine
+    /// excludes float SUM for exactly this reason), so the worker-count term is
+    /// the ad-hoc path's alone; the access-path term is common to both, an
+    /// index-bounded walk sorting PKs a chunk at a time. The whole point of the
+    /// fold is not shipping rows, so the per-worker split is inherent here. Use an
     /// integer type where exactness matters.
     FloatSum { val: f64, seen: bool },
     /// MIN / MAX — the winning cell's raw LE bytes (first `wire_stride(tc)` of

@@ -771,6 +771,16 @@ def _bits(rows):
     return [r.s.hex() for r in rows]
 
 
+def _access(client, sn, q):
+    """EXPLAIN's `access:` line for `q` — which walk the plan chose. Found by
+    prefix rather than by row position, so adding a plan line cannot silently
+    make this read a different fact."""
+    lines = [r[0] for r in _rows(client, sn, "EXPLAIN " + q)]
+    got = [ln for ln in lines if ln.startswith("access: ")]
+    assert len(got) == 1, lines
+    return got[0]
+
+
 def test_float_sum_is_stable_for_a_fixed_plan(client):
     """Same query, same data, same worker count, same access path → bit-identical.
     The one reproducibility guarantee the float contract does make."""
@@ -789,24 +799,59 @@ def test_float_sum_is_stable_for_a_fixed_plan(client):
         _cleanup(client, sn, "f")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a float SUM is a function of the access path: an index-bounded scan "
-    "sorts and dedups PKs per chunk, so once the range spans more than one chunk "
-    "it visits rows in a different order than a PK scan and the low bits move",
-)
-def test_float_sum_is_independent_of_the_access_path(seamed_server):
-    """`CREATE INDEX` alone moves a float SUM. Reachable at the default chunk of
-    65536 rows only for an index range that big on one worker; the server here
-    shrinks the chunk so a small fixture reaches the same code."""
-    client = seamed_server({"GNITZ_WORKERS": "4", "GNITZ_DDL_SCAN_CHUNK_ROWS": "3"})
-    sn = "fa" + _uid()
+def test_index_plan_keeps_the_exact_answer_and_a_repeatable_float_sum(tiny_ddl_chunk_server):
+    """`CREATE INDEX` re-plans these reads onto an index-bounded walk, which sorts
+    and dedups PKs one chunk at a time. What that owes the caller is pinned here:
+    the same rows, and the same aggregates that are exact over them, chunk
+    boundaries and all — plus a float SUM that still repeats under the new plan.
+
+    What it does not owe is the full scan's float bits. A float SUM follows the
+    summation order and the access path is part of that order, so the indexed and
+    unindexed float sums are deliberately never compared: they may legitimately
+    agree, and requiring either answer would pin an access-path detail as a promise.
+
+    The 3-row chunk is the point. `test_indices.py::TestIndexBoundPushdown` covers
+    the same invariant for integer aggregates at the 65 536-row default, where any
+    test range is one chunk and the per-chunk sort is the global one; here each
+    worker's share spans several chunks, the only regime in which the walk visits
+    rows in an order a PK scan never would."""
+    client = tiny_ddl_chunk_server
+    sn = "ix" + _uid()
     client.create_schema(sn)
-    _float_table(client, sn)
-    # Selective enough to clear the engine's 1/16-of-the-slice index cost gate,
-    # and spanning 8 index groups, so the range needs several chunks.
-    q = "SELECT SUM(x) AS s FROM f WHERE cat >= 5 AND cat < 13"
-    full_scan = _bits(_rows(client, sn, q))
-    client.execute_sql("CREATE INDEX fi ON f (cat)", schema_name=sn)
-    assert "index range" in _rows(client, sn, "EXPLAIN " + q)[1][0]
-    assert _bits(_rows(client, sn, q)) == full_scan
+    try:
+        _float_table(client, sn)
+        src = "FROM f WHERE cat >= 5 AND cat < 13"
+        # A strict subset of the columns, so this cannot route as the
+        # unprojected plain scan and its access line is unambiguous.
+        rows_q = f"SELECT pk, x {src}"
+        exact_q = f"SELECT COUNT(*) AS c, SUM(pk) AS sp, MIN(x) AS mn, MAX(x) AS mx {src}"
+        float_q = f"SELECT SUM(x) AS s {src}"
+
+        # The control: with no index to bound on these are full scans, so the
+        # assertion after CREATE INDEX reads the plan and not a constant.
+        for q in (rows_q, exact_q, float_q):
+            assert _access(client, sn, q).startswith("access: full scan"), q
+        before_rows = _norm(_rows(client, sn, rows_q))
+        before_exact = _items(_rows(client, sn, exact_q))
+        # 8 of `_FLOAT_CATS` categories at 4 rows each — coupled to that fixture.
+        # 1.6% of the table, a 4x margin inside the worker's 1/16-of-the-slice
+        # cost gate, and 8 rows per worker at 4 workers: three 3-row chunks each.
+        assert len(before_rows) == 32, before_rows
+
+        client.execute_sql("CREATE INDEX fi ON f (cat)", schema_name=sn)
+        # The plan-time choice, which is sink-independent: one access planner
+        # serves the rows sink and the fold sink alike, so all three re-plan.
+        for q in (rows_q, exact_q, float_q):
+            assert _access(client, sn, q).startswith("access: index range on (cat)"), q
+
+        # The walk's own claim: a chunked drain and an unchunked one yield
+        # identical multisets. The rows, then the aggregates exact over them —
+        # COUNT and an integer SUM fold associatively, and MIN/MAX copy a cell's
+        # bits rather than combining them.
+        assert _norm(_rows(client, sn, rows_q)) == before_rows
+        assert _items(_rows(client, sn, exact_q)) == before_exact
+
+        # The float SUM under the index plan: repeatable, and that alone.
+        assert _bits(_rows(client, sn, float_q)) == _bits(_rows(client, sn, float_q))
+    finally:
+        _cleanup(client, sn, "f")

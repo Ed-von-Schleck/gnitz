@@ -280,12 +280,15 @@ weight -1, new at +1.
 - **MIN, MAX are non-linear:** retraction of current min/max requires
   the next value from history. Uses optional AggValueIndex for
   O(log N + 1) lookup instead of full trace scan.
-- **Float SUM/AVG follows the summation order**, addition being non-associative.
-  A *view* keeps a deterministic order — the two-phase combine excludes float SUM
-  so a global one stays on the single-worker funnel, and a grouped one lands each
-  group on one worker. The **ad-hoc fold** reassociates instead: it sums per-worker
-  partials in reply order, so its value moves with the worker count. Use an
-  integer type where exactness matters.
+- **Float SUM/AVG follows the summation order**, addition being non-associative, so
+  the value is a function of (query, data, worker count, access path, chunk size)
+  and repeats only while all of those hold. A *view* is worker-count-stable once it
+  is being maintained — the two-phase combine excludes float SUM so a global one
+  keeps the single-worker funnel, and a grouped one lands each group on one worker
+  — but its backfill takes whatever cursor the cost gate picks and chunks it per
+  worker, so `CREATE INDEX`, more data, or a different worker count each move the
+  low bits. The **ad-hoc fold** reassociates once more, summing per-worker partials
+  in reply order. Use an integer type where exactness matters.
 
 *Set operations (UNION/INTERSECT/EXCEPT, both DISTINCT and ALL):* **join-free** —
 every one is a linear combination of `{union, negate}` plus the non-linear
