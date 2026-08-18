@@ -1848,7 +1848,7 @@ fn resolve_request_target(
         }
     };
     // A qname hit is not evidence of registration: `apply_entity_caches` inserts
-    // on the raw row sign while `hook_table_register` registers only on net-live,
+    // on the raw row sign while `hook_relation_register` registers only on net-live,
     // so the two maps are not maintained on one liveness rule.
     Ok(shared.cat().dag.relation_kind(candidate).map(|kind| (candidate, kind)))
 }

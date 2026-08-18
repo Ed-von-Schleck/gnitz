@@ -155,14 +155,14 @@ impl CatalogEngine {
     /// falling back to `"?"` when the catalog has no entry. The `columns` field
     /// joins every named column with `, ` (a composite `UNIQUE (a, b)` renders
     /// `"a, b"`). The fallback is defensive: the entity always exists on the
-    /// constraint-violation paths that format these names. Reads the storage
-    /// scan rather than the `col_defs` cache so every message formatter stays
-    /// `&self` — they run once per rejected write, never on a hot path.
-    fn qualified_col_names(&self, table_id: i64, col_indices: &[u32]) -> (&str, &str, String) {
-        let defs = self.scan_column_defs(table_id, false).unwrap_or_default();
+    /// constraint-violation paths that format these names. Goes through
+    /// `read_column_defs` so these messages read the same cached column defs as
+    /// every other name consumer, instead of opening a second COL_TAB scan.
+    fn qualified_col_names(&mut self, table_id: i64, col_indices: &[u32]) -> (&str, &str, String) {
+        let defs = self.read_column_defs(table_id);
         let col = col_indices
             .iter()
-            .map(|&ci| defs.get(ci as usize).map_or("?", |d| d.name.as_str()).to_string())
+            .map(|&ci| defs.get(ci as usize).map_or("?", |d| d.name.as_str()))
             .collect::<Vec<_>>()
             .join(", ");
         let (sn, tn) = self.qualified_name_or_unknown(table_id);
@@ -175,7 +175,7 @@ impl CatalogEngine {
     /// already-committed data. Single source of truth for this message — the
     /// distributed path (`MasterDispatcher`) delegates here. A composite index
     /// passes its full `col_indices`, joined as `(a, b)`.
-    pub(crate) fn unique_violation_err(&self, table_id: i64, col_indices: &[u32], in_batch: bool) -> String {
+    pub(crate) fn unique_violation_err(&mut self, table_id: i64, col_indices: &[u32], in_batch: bool) -> String {
         let (sn, tn, col) = self.qualified_col_names(table_id, col_indices);
         if in_batch {
             format!("Unique index violation on '{sn}.{tn}' column '{col}': duplicate in batch")
@@ -187,7 +187,7 @@ impl CatalogEngine {
     /// Format the `CREATE UNIQUE INDEX` rejection raised when the target
     /// column(s) already hold duplicate values. Same single-source-of-truth
     /// contract as [`Self::unique_violation_err`].
-    pub(crate) fn unique_create_dup_err(&self, table_id: i64, col_indices: &[u32]) -> String {
+    pub(crate) fn unique_create_dup_err(&mut self, table_id: i64, col_indices: &[u32]) -> String {
         let (sn, tn, col) = self.qualified_col_names(table_id, col_indices);
         format!("cannot create unique index on '{sn}.{tn}' column '{col}': column contains duplicate values")
     }
@@ -195,7 +195,13 @@ impl CatalogEngine {
     /// Format the PK-uniqueness rejection, PG-style. `key_str` is the
     /// already-rendered offending key. `in_batch` distinguishes two rows of one
     /// ingest batch sharing a PK from a collision with committed data.
-    pub(crate) fn pk_violation_err(&self, table_id: i64, pk_indices: &[u32], key_str: &str, in_batch: bool) -> String {
+    pub(crate) fn pk_violation_err(
+        &mut self,
+        table_id: i64,
+        pk_indices: &[u32],
+        key_str: &str,
+        in_batch: bool,
+    ) -> String {
         let (sn, tn, cols) = self.qualified_col_names(table_id, pk_indices);
         let what = if in_batch {
             format!("Batch contains multiple rows with key ({cols})=({key_str})")

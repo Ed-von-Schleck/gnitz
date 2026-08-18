@@ -785,10 +785,8 @@ fn sequence_advances_leave_no_negative_ghost() {
 
 #[test]
 fn precheck_rejected_create_index_writes_no_ghost() {
-    let dir = temp_dir("atomicity_idx_precheck_ghost");
     let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
-    let (mut engine, _tid, _d) = table_fixture("atomicity_idx_precheck_ghost", &cols);
-    let _ = dir;
+    let (mut engine, _tid, dir) = table_fixture("atomicity_idx_precheck_ghost", &cols);
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
 
     // A STRING column has no index key type — rejected inside `precheck_family`,
@@ -809,4 +807,5 @@ fn precheck_rejected_create_index_writes_no_ghost() {
     );
 
     engine.close();
+    let _ = fs::remove_dir_all(&dir);
 }

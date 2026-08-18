@@ -248,7 +248,7 @@ impl DagEngine {
     ///
     /// Reading the sources' stamped placement rather than re-deriving "has a
     /// replicated source" from the direct sources is what makes the property
-    /// transitive: `hook_view_register` registers a view after every view it
+    /// transitive: `hook_relation_register` registers a view after every view it
     /// scans, so each source's answer is already stamped when this runs.
     ///
     /// The `Local` arm is deliberately conservative — a view whose source is

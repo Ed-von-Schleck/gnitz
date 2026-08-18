@@ -831,18 +831,18 @@ fn test_create_unique_index_on_string_blob_rejected() {
     ];
     engine.create_table("public.t", &cols, &[0]).unwrap();
 
-    // UNIQUE on STRING/BLOB hits the dedicated unique-index guard first, which
-    // has its own specific message (distinct from the non-unique gate below).
-    let e_str = engine.create_index("public.t", &["name"], true).unwrap_err();
-    assert!(e_str.contains("UNIQUE index on STRING or BLOB"), "got: {e_str}");
-    let e_blob = engine.create_index("public.t", &["data"], true).unwrap_err();
-    assert!(e_blob.contains("UNIQUE index on STRING or BLOB"), "got: {e_blob}");
-
-    // Non-unique secondary indexes on STRING/BLOB are also rejected, by the
-    // pre-existing get_index_key_type gate (these column types have no
-    // collision-free u128 key representation for ordered index seeks).
-    assert!(engine.create_index("public.t", &["name"], false).is_err());
-    assert!(engine.create_index("public.t", &["data"], false).is_err());
+    // Unique or not, the rejection is the same one: STRING and BLOB have no
+    // order-preserving fixed-width index key, so `index_key_types` refuses to
+    // promote them and `precheck_family` never reaches the registration.
+    for unique in [true, false] {
+        for col in ["name", "data"] {
+            let e = engine.create_index("public.t", &[col], unique).unwrap_err();
+            assert!(
+                e.contains("Secondary index on column type"),
+                "unique={unique} col={col} got: {e}"
+            );
+        }
+    }
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

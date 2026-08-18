@@ -549,7 +549,7 @@ impl DagEngine {
     /// which only a bounded view's hydration plan reads and no rejection depends
     /// on.
     pub(crate) fn preflight_compile(&self, view_id: i64, root: &str) -> Result<(), compiler::CompileError> {
-        // `hook_view_register` ran earlier in this bundle's ingest loop, so a
+        // `hook_relation_register` ran earlier in this bundle's ingest loop, so a
         // registered `+1` VIEW_TAB row is always in `tables`; a miss is an engine
         // bug, surfaced as a DDL rejection rather than an unchecked compile.
         let Some(entry) = self.tables.get(&view_id) else {

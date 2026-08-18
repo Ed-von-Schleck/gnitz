@@ -665,9 +665,8 @@ impl Batch {
     }
 
     /// Owned-`Batch` sibling of `MemBatch::get_pk_bytes`. Returns exactly
-    /// `pk_stride` bytes; the wide-PK (`pk_stride > 16`) catalog constraint
-    /// checks in the catalog's FK column validation key on it where a `u128` cannot
-    /// encode the PK.
+    /// `pk_stride` bytes, so a wide PK (`pk_stride > 16`) survives where a
+    /// `u128` would truncate it.
     #[inline(always)]
     pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
         let stride = self.strides[REG_PK] as usize;

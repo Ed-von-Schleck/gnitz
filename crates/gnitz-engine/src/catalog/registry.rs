@@ -1,6 +1,7 @@
-//! Catalog id-registry — table / schema / index id allocation and lookup,
-//! the `sys_columns` → `ColumnDef` / schema readers, batch field decoders,
-//! and sequence advancement.
+//! Catalog id-registry — table / schema / index id allocation and lookup, the
+//! `sys_columns` → `ColumnDef` readers, and the `sys_sequences` writes: user
+//! SERIAL ranges, the object-id high-waters, and the checkpoint-generation and
+//! topology records that ride the same family.
 
 use super::*;
 
@@ -309,39 +310,6 @@ impl CatalogEngine {
     /// of what generation its manifest carries.
     pub(crate) fn topology_matches(&self) -> bool {
         self.recorded_topology == crate::storage::topology_word(self.num_workers)
-    }
-
-    /// The recovery policy for a secondary-index table: resume from a manifest
-    /// at the resume generation, and only while the topology still matches —
-    /// the same two-part verdict `compute_invalid_views` reaches for a view, in
-    /// the form `Table::new` reads.
-    pub(crate) fn index_recovery_source(&self) -> RecoverySource {
-        RecoverySource::Rederive {
-            resume_at: self.topology_matches().then_some(self.resume_generation),
-        }
-    }
-
-    /// Open this process's copy of a secondary-index table under `idx_dir` — the
-    /// one recipe for the live CREATE INDEX hook and the worker-boot rebuild, so
-    /// the two cannot diverge on where it is homed or on its resume gate.
-    ///
-    /// A forked worker homes at its own `w{rank}of{n}` child, like every other
-    /// relation store. The master and standalone home at `idx_dir` itself: the
-    /// master's copy stays permanently empty, and homing it at `w0of{n}` would
-    /// put it on the directory worker 0's inherited handle already holds.
-    pub(crate) fn new_index_table(
-        &self,
-        idx_dir: &str,
-        index_id: i64,
-        idx_schema: SchemaDescriptor,
-    ) -> Result<Table, String> {
-        let table_dir = if crate::foundation::worker_ctx::is_worker() {
-            ChildAddr::this_worker(self.num_workers).dir(idx_dir)
-        } else {
-            idx_dir.to_string()
-        };
-        Table::new(&table_dir, idx_schema, index_id as u32, self.index_recovery_source())
-            .map_err(|e| format!("Failed to create index table {index_id}: error {e}"))
     }
 
     /// Build the `sys_sequences` delta that moves one sequence to `new_val`: a

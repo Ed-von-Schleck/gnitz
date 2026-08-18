@@ -47,8 +47,6 @@ impl CatalogEngine {
         self.submit(family, batch)
     }
 
-    // -- FK column validation (pre-create) -------------------------------------
-
     // -- DDL: CREATE/DROP SCHEMA -------------------------------------------
 
     pub(crate) fn create_schema(&mut self, name: &str) -> Result<(), String> {
@@ -251,25 +249,7 @@ impl CatalogEngine {
             })
             .collect::<Result<_, _>>()?;
 
-        // STRING and BLOB values cannot be reduced to a comparable u128 key
-        // without collision; the distributed uniqueness-check pipeline would
-        // silently bypass or falsely reject rows. (Non-unique FK indices don't
-        // run this uniqueness-check pipeline, so they are unaffected.)
-        if is_unique
-            && col_indices
-                .iter()
-                .any(|&c| gnitz_wire::is_german_string(col_defs[c as usize].type_code))
-        {
-            return Err("UNIQUE index on STRING or BLOB columns is not supported".into());
-        }
-
         let index_name = make_secondary_index_name(schema_name, table_name, &col_names.join("_"));
-        // Reject a duplicate before allocating an index_id. Otherwise
-        // `apply_index_caches` silently overwrites the cache entry and orphans
-        // the previous index circuit.
-        if self.caches.index_by_name.contains_key(&index_name) {
-            return Err(format!("Index already exists: {index_name}"));
-        }
         let index_id = self.allocate_index_id();
 
         // Precheck and apply as two steps, exactly as the DDL_TXN handler does:

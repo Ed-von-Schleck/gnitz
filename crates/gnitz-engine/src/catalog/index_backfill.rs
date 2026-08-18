@@ -1,6 +1,6 @@
-//! Secondary-index construction: the chunked base-table scan that projects into
-//! an index table, its two entry points (a fresh CREATE INDEX and the worker's
-//! boot rebuild), the UNIQUE promote, and FK auto-index creation.
+//! Secondary-index construction: opening an index table, the chunked base-table
+//! scan that projects into it, its two entry points (a fresh CREATE INDEX and
+//! the worker's boot rebuild), the UNIQUE promote, and FK auto-index creation.
 
 use super::*;
 use crate::schema::key::PkBuf;
@@ -21,6 +21,39 @@ impl CatalogEngine {
                 undo_err,
             );
         }
+    }
+
+    /// The recovery policy for a secondary-index table: resume from a manifest
+    /// at the resume generation, and only while the topology still matches —
+    /// the same two-part verdict `compute_invalid_views` reaches for a view, in
+    /// the form `Table::new` reads.
+    pub(crate) fn index_recovery_source(&self) -> RecoverySource {
+        RecoverySource::Rederive {
+            resume_at: self.topology_matches().then_some(self.resume_generation),
+        }
+    }
+
+    /// Open this process's copy of a secondary-index table under `idx_dir` — the
+    /// one recipe for the live CREATE INDEX hook and the worker-boot rebuild, so
+    /// the two cannot diverge on where it is homed or on its resume gate.
+    ///
+    /// A forked worker homes at its own `w{rank}of{n}` child, like every other
+    /// relation store. The master and standalone home at `idx_dir` itself: the
+    /// master's copy stays permanently empty, and homing it at `w0of{n}` would
+    /// put it on the directory worker 0's inherited handle already holds.
+    pub(crate) fn new_index_table(
+        &self,
+        idx_dir: &str,
+        index_id: i64,
+        idx_schema: SchemaDescriptor,
+    ) -> Result<Table, String> {
+        let table_dir = if crate::foundation::worker_ctx::is_worker() {
+            ChildAddr::this_worker(self.num_workers).dir(idx_dir)
+        } else {
+            idx_dir.to_string()
+        };
+        Table::new(&table_dir, idx_schema, index_id as u32, self.index_recovery_source())
+            .map_err(|e| format!("Failed to create index table {index_id}: error {e}"))
     }
 
     // -- Index backfill (scan source, project into index table) ------------
@@ -138,14 +171,14 @@ impl CatalogEngine {
     /// duplicate keys when `check_dups`, and ingest each projected chunk into
     /// the target's table when one is supplied. Peak memory is
     /// O(chunk × row_width) plus, when checking, the per-target cross-chunk
-    /// `seen` set (32 B per scanned key).
+    /// `seen` set (one `PkBuf` per scanned key).
     ///
     /// `check_dups` is a caller policy (hoisted out of this function): the live
     /// CREATE-INDEX/promote paths pass `is_unique && ctx.is_live()` / `true`; the
     /// worker/standalone boot rebuild passes `false`. A boot-replayed IDX_TAB
     /// `+1` was validated at original write time and every later INSERT went
     /// through the unique filter, so skipping the check at boot cannot admit a
-    /// duplicate; it only avoids an O(rows × 32 B) `seen` set. A slice-local
+    /// duplicate; it only avoids carrying a `seen` set over every row. A slice-local
     /// rebuild also cannot false-positive (a global duplicate may legitimately
     /// straddle two workers' slices), so the boot skip is doubly justified. The
     /// ingest is unconditional — it IS the ephemeral index rebuild/backfill.
