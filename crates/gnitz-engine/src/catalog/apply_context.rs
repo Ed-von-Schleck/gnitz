@@ -9,14 +9,13 @@ use std::num::NonZeroU64;
 
 use super::CatalogEngine;
 
-/// The catalog applier's current execution context: the engine phase, the
-/// re-entrant sub-operation (if any) the in-flight submission is part of, and
-/// the DDL-zone LSN — one inspectable place that answers "what is the applier
-/// doing right now".
+/// The catalog applier's current execution context: the engine phase, whether
+/// the in-flight submission is rollback compensation, and the DDL-zone LSN —
+/// one inspectable place that answers "what is the applier doing right now".
 ///
-/// Not `Copy`: every access goes through an accessor or a scope helper, no
-/// call site needs the whole context by value, and a stray by-value copy
-/// could silently desync the transient sub-states.
+/// Not `Copy`: every access goes through an accessor or the scope helper below,
+/// no call site needs the whole context by value, and a stray by-value copy
+/// could silently desync the rollback flag.
 pub(crate) struct ApplyContext {
     /// True iff this catalog row is being applied for the FIRST time, rather
     /// than replayed from already-validated persisted state: false only while
@@ -34,17 +33,10 @@ pub(crate) struct ApplyContext {
     /// side effect (backfill_index, cascade_retract_columns, hook_cascade_fk)
     /// re-runs. Never nested.
     rollback: bool,
-    /// True while an owner-drop cascade is in flight: suppresses the precheck
-    /// guards that exist to police a standalone user DROP — the IDX_TAB
-    /// FK-target rule and the COL_TAB unpaired-`-1` reject. The owner drop
-    /// already passed its own FK/view-dep precheck. During rollback precheck is
-    /// bypassed by the `submit` → `submit_local` redirect, so the flag is moot
-    /// there.
-    cascade_drop: bool,
     /// LSN every write in the current DDL zone is pinned to; `None` outside
     /// a zone. Owned by the executor's DDL-zone lifecycle — `open_ddl_zone`
     /// before the mutate phase, `close_ddl_zone` on every surviving exit —
-    /// so unlike the two transient flags it needs no scope balancing. See
+    /// so unlike the rollback flag it needs no scope balancing. See
     /// `apply_local` for how the pin drives recovery's dedup watermark.
     ddl_zone_lsn: Option<NonZeroU64>,
 }
@@ -54,7 +46,6 @@ impl ApplyContext {
         Self {
             live: false,
             rollback: false,
-            cascade_drop: false,
             ddl_zone_lsn: None,
         }
     }
@@ -71,10 +62,6 @@ impl ApplyContext {
         self.rollback
     }
     #[inline]
-    pub(super) fn in_cascade_drop(&self) -> bool {
-        self.cascade_drop
-    }
-    #[inline]
     pub(super) fn ddl_zone_lsn(&self) -> Option<NonZeroU64> {
         self.ddl_zone_lsn
     }
@@ -89,16 +76,14 @@ impl ApplyContext {
     }
 
     /// Close the DDL zone after it is durably committed (or rolled back) and
-    /// reset the transient sub-states. On the non-panic path both transients
-    /// are already false, so the reset is a no-op; after a caught
-    /// forward-DDL panic (dev/test unwind builds) it restores the invariant
-    /// before the next DDL — the zone close is the single point every DDL
-    /// (success or compensated failure) passes through. Subsequent non-DDL
-    /// ingest paths use the auto-bump.
+    /// reset the rollback flag. On the non-panic path it is already false, so
+    /// the reset is a no-op; after a caught forward-DDL panic (dev/test unwind
+    /// builds) it restores the invariant before the next DDL — the zone close is
+    /// the single point every DDL (success or compensated failure) passes
+    /// through. Subsequent non-DDL ingest paths use the auto-bump.
     #[inline]
     pub(crate) fn close_ddl_zone(&mut self) {
         self.ddl_zone_lsn = None;
-        self.cascade_drop = false;
         self.rollback = false;
     }
 }
@@ -116,18 +101,6 @@ impl CatalogEngine {
         self.ctx.rollback = true;
         let r = f(self);
         self.ctx.rollback = prev;
-        r
-    }
-
-    /// Run `f` as part of an owner-drop cascade: precheck's IDX_TAB FK-target
-    /// guard and its unpaired-`-1` COL_TAB reject are suppressed for its
-    /// duration. Closure form for the same reason as
-    /// `with_rollback_compensation`.
-    pub(super) fn with_cascade_drop<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let prev = self.ctx.cascade_drop;
-        self.ctx.cascade_drop = true;
-        let r = f(self);
-        self.ctx.cascade_drop = prev;
         r
     }
 }

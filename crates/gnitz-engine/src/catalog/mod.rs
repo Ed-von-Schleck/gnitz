@@ -25,6 +25,7 @@ mod cache;
 mod hooks;
 mod index_backfill;
 mod metadata;
+mod precheck;
 mod registry;
 mod scan_spec;
 mod store_io;
@@ -68,7 +69,6 @@ pub(in crate::catalog) use cache::CatalogCacheSet;
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use registry::raise_id_counter;
-pub(in crate::catalog) use sys_tables::{PUBLIC_SCHEMA_ID, SYSTEM_SCHEMA_ID};
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.
 pub(in crate::catalog) use crate::storage::{fsync_dir, reclaim_retired_children, subdir_names, ChildAddr};

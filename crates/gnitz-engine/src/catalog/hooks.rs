@@ -180,6 +180,10 @@ impl CatalogEngine {
                 // row negated, and the else-arm below queues the path for the
                 // compensation's own drain — so the directory needs no staging.
                 ensure_dir(&path)?;
+                // Best-effort, here and at every other catalog `fsync_dir`: the
+                // schema's own row is in the fsynced SAL, and the boot replay
+                // re-creates whatever directory it names, so a lost directory
+                // entry costs a re-`mkdir` and never a row.
                 let _ = fsync_dir(&path);
                 let _ = fsync_dir(&self.base_dir);
             } else {
@@ -247,47 +251,6 @@ impl CatalogEngine {
         Ok(StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(table))))
     }
 
-    /// A live CREATE's store. This call is what creates the relation directory,
-    /// so it is staged for crash-cleanup: if the rest of Stage-A fails,
-    /// `compensate_stage_a`'s drain removes what was made here.
-    fn create_relation_store(
-        &mut self,
-        kind: RelationKind,
-        directory: &str,
-        id: i64,
-        schema: SchemaDescriptor,
-        capacity_bytes: Option<u64>,
-    ) -> Result<StoreHandle, String> {
-        let staged = directory.to_string();
-        self.with_staged_dir(staged, |s| {
-            s.build_relation_store(kind, directory, id, schema, capacity_bytes)
-        })
-    }
-
-    /// A boot replay's store, on the pre-fork master. The directory already holds
-    /// the relation's rows, so — unlike a live CREATE — it is never staged for
-    /// cleanup: an error here leaves them for the next boot to retry.
-    ///
-    /// The relayout is bound to this open rather than run as its own pass because
-    /// it needs the previous child set, which opening the store would shadow and
-    /// `reconcile_child_dirs` deletes right afterwards. Views are exempt: a
-    /// worker-count change invalidates every one of them, so
-    /// `rebuild_invalid_views` refills them from base and relaying their state
-    /// would be waste.
-    fn reopen_relation_store(
-        &self,
-        kind: RelationKind,
-        directory: &str,
-        id: i64,
-        schema: SchemaDescriptor,
-        capacity_bytes: Option<u64>,
-    ) -> Result<StoreHandle, String> {
-        if kind.is_base_table() {
-            crate::storage::repartition_relation(directory, &schema, id as u32, self.num_workers)?;
-        }
-        self.build_relation_store(kind, directory, id, schema, capacity_bytes)
-    }
-
     /// Build a relation's store and enter it in the registry — the `+1` half of
     /// [`hook_relation_register`](Self::hook_relation_register), over the values
     /// its per-family builder decoded.
@@ -317,13 +280,32 @@ impl CatalogEngine {
             self.num_workers
         );
         let handle = if self.ctx.is_live() {
-            self.create_relation_store(kind, &directory, id, schema, capacity_bytes)?
+            // A live CREATE is what creates the relation directory, so it is
+            // staged for crash-cleanup: if the rest of Stage-A fails,
+            // `compensate_stage_a`'s drain removes what was made here.
+            let staged = directory.clone();
+            self.with_staged_dir(staged, |s| {
+                s.build_relation_store(kind, &directory, id, schema, capacity_bytes)
+            })?
         } else {
-            self.reopen_relation_store(kind, &directory, id, schema, capacity_bytes)?
+            // A boot replay: the directory already holds the relation's rows, so
+            // it is never staged — an error here leaves them for the next boot to
+            // retry. The relayout is bound to this open rather than run as its own
+            // pass because it needs the previous child set, which opening the
+            // store would shadow and `reconcile_child_dirs` deletes right
+            // afterwards. Views are exempt: a worker-count change invalidates
+            // every one of them, so `rebuild_invalid_views` refills them from base
+            // and relaying their state would be waste.
+            if kind.is_base_table() {
+                crate::storage::repartition_relation(&directory, &schema, id as u32, self.num_workers)?;
+            }
+            self.build_relation_store(kind, &directory, id, schema, capacity_bytes)?
         };
-        // A storeless kind created no directory, so the schema dir gained no entry to
-        // make durable; its definition rides on the system tables like any other row.
-        if kind.recovery_source().is_some() {
+        // Only a live CREATE adds an entry to the schema dir, and only a kind that
+        // owns a store creates one at all — a boot replay reopens a directory that
+        // is already there, so there is nothing new to make durable. A storeless
+        // kind's definition rides on the system tables like any other row.
+        if self.ctx.is_live() && kind.recovery_source().is_some() {
             let _ = fsync_dir(&schema_dir(&self.base_dir, &schema_name));
         }
         self.dag.register_table(
@@ -377,7 +359,11 @@ impl CatalogEngine {
                 }
                 let reg = match family {
                     SysFamily::Table => Self::table_registration(batch, i, id)?,
-                    _ => self.view_registration(batch, i, id)?,
+                    SysFamily::View => self.view_registration(batch, i, id)?,
+                    // Named rather than folded into the view arm: decoding any
+                    // other family's row against the VIEW_TAB layout would
+                    // register a relation out of unrelated bytes.
+                    other => return Err(format!("{} is not a relation family", other.name())),
                 };
                 self.register_relation(reg)?;
                 // Registration leaves a view EMPTY. Filling it is the runtime
@@ -554,17 +540,13 @@ impl CatalogEngine {
             _ => return Ok(()),
         };
         let schema = SysFamily::Index.schema();
-        // These retractions are part of the owner's drop, not a standalone
-        // DROP INDEX, so the IDX_TAB integrity guard must not block them.
-        self.with_cascade_drop(|s| {
-            for idx_id in idx_ids {
-                let batch = retract_single_row(s.sys_store(SysFamily::Index), &schema, idx_id as u128);
-                if batch.count > 0 {
-                    s.submit(SysFamily::Index, batch)?;
-                }
+        for idx_id in idx_ids {
+            let batch = retract_single_row(self.sys_store(SysFamily::Index), &schema, idx_id as u128);
+            if batch.count > 0 {
+                self.submit_cascade(SysFamily::Index, batch)?;
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     fn cascade_retract_columns(&mut self, owner_id: i64) -> Result<(), String> {
@@ -576,18 +558,12 @@ impl CatalogEngine {
             self.sys_store(SysFamily::Column),
             &schema,
             start.pk_bytes(),
-            Some(end.pk_bytes()),
+            end.pk_bytes(),
         );
-        // These whole-table COL retractions are part of the owner's drop and run
-        // while the owner is still registered (before `unregister_table`), so the
-        // Column precheck arm's unpaired-`-1` reject must be bypassed — mirror
-        // `cascade_retract_indices`' `with_cascade_drop` guard.
-        self.with_cascade_drop(|s| {
-            if batch.count > 0 {
-                s.submit(SysFamily::Column, batch)?;
-            }
-            Ok(())
-        })
+        if batch.count > 0 {
+            self.submit_cascade(SysFamily::Column, batch)?;
+        }
+        Ok(())
     }
 
     /// True if `col_idx` appends a *trailing* column to registered relation
@@ -666,7 +642,7 @@ impl CatalogEngine {
             // `(vid << 64) | sub` image `Batch::extend_pk` writes.
             let start = sys_opk(&schema, vid as u64 as u128);
             let end = sys_opk(&schema, vid as u64 as u128 + 1);
-            let batch = retract_key_range(self.sys_store(family), &schema, start.pk_bytes(), Some(end.pk_bytes()));
+            let batch = retract_key_range(self.sys_store(family), &schema, start.pk_bytes(), end.pk_bytes());
             if batch.count > 0 {
                 self.submit(family, batch)?;
             }
@@ -674,110 +650,121 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// The IDX_TAB register hook: a sign dispatch over the batch, mirroring
+    /// `hook_relation_register`. The index name lives in the row's
+    /// `IDXTAB_PAY_NAME` slot and `apply_index_caches` has already populated the
+    /// name-indexed caches from it, so neither half below reads the string — it
+    /// would just be a wasted allocation.
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
-        // Index name lives in the batch's `IDXTAB_PAY_NAME` slot; `apply_index_caches`
-        // already populated the name-indexed caches from there, so we don't
-        // read the string here — it would just be a wasted allocation.
         for i in 0..batch.count {
-            let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
             let (owner_id, cols, is_unique) = read_idx_tab_row(batch, i);
-
-            if weight > 0 {
-                // Keep worker next_index_id in sync with master-assigned IDs so that
-                // create_fk_indices → allocate_index_id never collides with an explicit
-                // user index that was broadcast via IDX_TAB +1.
-                raise_id_counter(&mut self.next_index_id, idx_id);
-
-                // Boot replay and worker ddl_sync reach this hook without
-                // precheck_family, so re-run the shared registration guards
-                // here (see `validate_index_registration`). Resolve the owner
-                // entry once for everything below.
-                let entry = self.validate_index_registration(owner_id, &cols)?;
-                let owner_schema = entry.schema;
-                let owner_dir = entry.directory.clone();
-
-                // One circuit per column list (dedup by ordered list). If an
-                // incumbent exists, don't build a second table — but a UNIQUE
-                // newcomer over a non-unique incumbent must promote it. Promotion
-                // is order-independent (the circuit is unique iff ANY index on the
-                // column list is unique), so replay reconstructs an identical
-                // result regardless of index_id ordering.
-                let incumbent_unique = entry.index_circuit_on(cols.as_slice()).map(|ic| ic.is_unique);
-                if let Some(was_unique) = incumbent_unique {
-                    if is_unique && !was_unique {
-                        self.promote_index_to_unique(owner_id, &owner_schema, cols.as_slice())?;
-                    }
-                    continue;
-                }
-
-                // make_index_schema bounds-checks and promotes every column
-                // (defence in depth at the catalog trust boundary; a crafted wire
-                // row could name an out-of-range or ineligible column).
-                let idx_schema = make_index_schema(cols.as_slice(), &owner_schema)?;
-
-                let idx_dir = index_dir(&owner_dir, idx_id);
-
-                // Staged before Table::new: if any step below fails, the stage
-                // removes `idx_dir` recursively — child subdirs included — so a
-                // failed CREATE INDEX leaves nothing on disk.
-                self.with_staged_dir(idx_dir.clone(), |s| {
-                    let mut idx_table_box = Box::new(s.new_index_table(&idx_dir, idx_id, idx_schema)?);
-                    let idx_table_ptr = &mut *idx_table_box as *mut Table;
-                    // The master never populates its index copies (they stay
-                    // permanently empty; distributed HAS_PK/seek probes union the
-                    // workers' slice-local copies). Workers and standalone backfill
-                    // from their local base slice — unless the table just resumed
-                    // from a checkpointed manifest, which already holds those rows.
-                    if !s.ctx.in_rollback()
-                        && !crate::foundation::worker_ctx::is_master()
-                        && !idx_table_box.resumed_from_checkpoint()
-                    {
-                        s.backfill_index(
-                            owner_id,
-                            &owner_schema,
-                            cols.as_slice(),
-                            idx_table_ptr,
-                            &idx_schema,
-                            // Duplicates are only re-checked on a first apply;
-                            // a replayed index's data passed the check when it
-                            // was originally written.
-                            is_unique && s.ctx.is_live(),
-                        )?;
-                    }
-                    s.dag
-                        .add_index_circuit(owner_id, cols.as_slice(), idx_id, idx_table_box, idx_schema, is_unique);
-                    Ok(())
-                })?;
+            if batch.get_weight(i) > 0 {
+                self.register_index(idx_id, owner_id, &cols, is_unique)?;
             } else {
-                // DROP INDEX: determine what remains for this column list in
-                // sys_indices (the -1 row has already been applied to sys_indices
-                // before fire_hooks runs, so its net weight is 0 and the scan
-                // skips it).
-                let (mut has_any, mut remains_unique) = (false, false);
-                self.for_each_index_on_cols(owner_id, cols.as_slice(), |_row_id, is_uniq| {
-                    has_any = true;
-                    remains_unique |= is_uniq;
-                });
-                if has_any {
-                    // Another index (e.g. the FK auto-index) still covers this
-                    // column list. Demote the circuit rather than destroying it.
-                    self.dag
-                        .set_index_circuit_uniqueness(owner_id, cols.as_slice(), remains_unique);
-                } else if let Some((owner_dir, creating_idx_id)) = self.dag.tables.get(&owner_id).and_then(|e| {
-                    e.index_circuit_on(cols.as_slice())
-                        .map(|ic| (e.directory.clone(), ic.index_id))
-                }) {
-                    // No index remains on the column list — drop the circuit. Use
-                    // the creating index_id for the directory path, not the dropped
-                    // index_id: when a second index promoted an incumbent circuit,
-                    // the real directory on disk carries the first registrant's id.
-                    self.dag.remove_index_circuit(owner_id, cols.as_slice());
-                    self.pending_dir_deletions.push(index_dir(&owner_dir, creating_idx_id));
-                }
+                self.unregister_index(owner_id, cols.as_slice());
             }
         }
         Ok(())
+    }
+
+    /// Build an index table for a `+1` IDX_TAB row, fill it, and enter its
+    /// circuit — the `+1` half of [`Self::hook_index_register`].
+    ///
+    /// One circuit per column list (dedup by ordered list). An incumbent circuit
+    /// means no second table is built, but a UNIQUE newcomer over a non-unique
+    /// incumbent promotes it. Promotion is order-independent — the circuit is
+    /// unique iff ANY index on the column list is unique — so replay reconstructs
+    /// an identical result whatever order the index ids arrive in.
+    fn register_index(&mut self, idx_id: i64, owner_id: i64, cols: &PkColList, is_unique: bool) -> Result<(), String> {
+        // Keep worker next_index_id in sync with master-assigned IDs so that
+        // create_fk_indices → allocate_index_id never collides with an explicit
+        // user index that was broadcast via IDX_TAB +1.
+        raise_id_counter(&mut self.next_index_id, idx_id);
+
+        // Boot replay and worker ddl_sync reach this hook without
+        // `precheck_family`, so re-run the shared registration guards here (see
+        // `validate_index_registration`). Resolve the owner entry once for
+        // everything below.
+        let entry = self.validate_index_registration(owner_id, cols)?;
+        let owner_schema = entry.schema;
+        let owner_dir = entry.directory.clone();
+
+        if let Some(was_unique) = entry.index_circuit_on(cols.as_slice()).map(|ic| ic.is_unique) {
+            if is_unique && !was_unique {
+                self.promote_index_to_unique(owner_id, &owner_schema, cols.as_slice())?;
+            }
+            return Ok(());
+        }
+
+        // make_index_schema bounds-checks and promotes every column (defence in
+        // depth at the catalog trust boundary; a crafted wire row could name an
+        // out-of-range or ineligible column).
+        let idx_schema = make_index_schema(cols.as_slice(), &owner_schema)?;
+        let idx_dir = index_dir(&owner_dir, idx_id);
+        let cols = *cols;
+
+        // Staged before Table::new: if any step below fails, the stage removes
+        // `idx_dir` recursively — child subdirs included — so a failed CREATE
+        // INDEX leaves nothing on disk.
+        self.with_staged_dir(idx_dir.clone(), |s| {
+            let mut idx_table_box = Box::new(s.new_index_table(&idx_dir, idx_id, idx_schema)?);
+            let idx_table_ptr = &mut *idx_table_box as *mut Table;
+            // The master never populates its index copies (they stay permanently
+            // empty; distributed HAS_PK/seek probes union the workers' slice-local
+            // copies). Workers and standalone backfill from their local base slice
+            // — unless the table just resumed from a checkpointed manifest, which
+            // already holds those rows.
+            if !s.ctx.in_rollback()
+                && !crate::foundation::worker_ctx::is_master()
+                && !idx_table_box.resumed_from_checkpoint()
+            {
+                s.backfill_index(
+                    owner_id,
+                    &owner_schema,
+                    cols.as_slice(),
+                    idx_table_ptr,
+                    &idx_schema,
+                    // Duplicates are only re-checked on a first apply; a replayed
+                    // index's data passed the check when it was originally written.
+                    is_unique && s.ctx.is_live(),
+                )?;
+            }
+            s.dag
+                .add_index_circuit(owner_id, cols.as_slice(), idx_id, idx_table_box, idx_schema, is_unique);
+            Ok(())
+        })
+    }
+
+    /// Demote or destroy `owner_id`'s circuit on `cols` after a `-1` IDX_TAB row
+    /// — the `-1` half of [`Self::hook_index_register`]. The retraction is
+    /// already applied to sys_indices when hooks fire, so its net weight is 0 and
+    /// the scan below sees only what survives it.
+    fn unregister_index(&mut self, owner_id: i64, cols: &[u32]) {
+        let (mut has_any, mut remains_unique) = (false, false);
+        self.for_each_index_on_cols(owner_id, cols, |_row_id, is_uniq| {
+            has_any = true;
+            remains_unique |= is_uniq;
+        });
+        if has_any {
+            // Another index (e.g. the FK auto-index) still covers this column
+            // list. Demote the circuit rather than destroying it.
+            self.dag.set_index_circuit_uniqueness(owner_id, cols, remains_unique);
+            return;
+        }
+        // No index remains on the column list — drop the circuit. The directory
+        // path uses the *creating* index_id, not the dropped one: when a second
+        // index promoted an incumbent circuit, the real directory on disk carries
+        // the first registrant's id.
+        let creating = self
+            .dag
+            .tables
+            .get(&owner_id)
+            .and_then(|e| e.index_circuit_on(cols).map(|ic| (e.directory.clone(), ic.index_id)));
+        if let Some((owner_dir, creating_idx_id)) = creating {
+            self.dag.remove_index_circuit(owner_id, cols);
+            self.pending_dir_deletions.push(index_dir(&owner_dir, creating_idx_id));
+        }
     }
 
     fn hook_cascade_fk(&mut self, batch: &Batch) -> Result<(), String> {

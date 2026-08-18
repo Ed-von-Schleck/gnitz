@@ -9,10 +9,10 @@ pub(crate) fn make_fk_index_name(schema_name: &str, table_name: &str, col_name: 
 // ---------------------------------------------------------------------------
 // On-disk directory naming conventions
 //
-// Every entity directory is *built* and *parsed back* here, so the creation
-// hooks and the boot-time orphan sweep (`gc_orphan_directories`) can never
-// disagree on the shape. Each `*_dir` builder has a matching `is_*_dir_name`
-// recognizer where the sweep needs to classify an on-disk name.
+// Every directory the catalog itself names is *built* and *parsed back* here, so
+// the creation hooks and the boot-time orphan sweep (`gc_orphan_directories`)
+// can never disagree on the shape. Below a relation directory the names are
+// storage's `ChildAddr` grammar, and the sweep classifies them through it.
 // ---------------------------------------------------------------------------
 
 /// `<base_dir>/<schema_name>` — a schema's directory. Name-based (no id): a
@@ -114,9 +114,9 @@ pub(crate) fn ensure_dir(path: &str) -> Result<(), String> {
 /// point range, one owner's packed-column band, or one view's `(view_id, sub)`
 /// prefix — all produced through `schema::key`, so no call site re-derives the
 /// OPK layout.
-pub(crate) fn retract_key_range(table: &Table, schema: &SchemaDescriptor, start: &[u8], end: Option<&[u8]>) -> Batch {
+pub(crate) fn retract_key_range(table: &Table, schema: &SchemaDescriptor, start: &[u8], end: &[u8]) -> Batch {
     let mut cursor = table.open_cursor();
-    cursor.seek_range_bytes(start, end);
+    cursor.seek_range_bytes(start, Some(end));
     // Sized off the positioned walk's own upper bound, so the appends never
     // re-grow (each growth re-copies every live byte).
     let mut batch = Batch::with_capacity(*schema, cursor.estimated_length());
