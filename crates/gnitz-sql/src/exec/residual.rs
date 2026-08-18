@@ -1,6 +1,6 @@
 use crate::error::GnitzSqlError;
 use crate::exec::batch::filter_batch;
-use crate::expr_lower::compile_filter_evaluator;
+use crate::expr_lower::compile_conjuncts_evaluator;
 use crate::ir::BoundExpr;
 use gnitz_core::{Schema, ZSetBatch};
 
@@ -44,10 +44,7 @@ pub(crate) fn matching_indices(
     // `WHERE nonnull_col IS NOT NULL` arrives as `LitInt(1)` and must keep every
     // row. The mirror needs nothing — `LitInt(0)` compiles to a real
     // `LoadConst 0` and drops every row.
-    let Some(pred) = crate::ir::and_fold(preds.iter().map(|p| (*p).clone())) else {
-        return Ok((0..n).collect());
-    };
-    let Some(ev) = compile_filter_evaluator(&pred, schema)? else {
+    let Some(ev) = compile_conjuncts_evaluator(preds, schema)? else {
         return Ok((0..n).collect());
     };
     let mut matched = Vec::with_capacity(n);

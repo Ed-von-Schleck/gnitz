@@ -12,7 +12,7 @@ use super::join::{
     normalize_to_ab, pure_range_unmatched, range_prologue, resolve_eq_cols, side_target_tcs, EquiKeys, EquiSide,
     RangePrologue,
 };
-use super::prims::{build_reindex_program, rekey_on_source_pk};
+use super::prims::rekey_on_source_pk;
 use super::{
     apply_projection, collect_live_cols, emit_filter, key_region_layout, resolve_collisions, resolve_input,
     resolve_projection, seginput_of_get, split_filter, CutMemo, SegInput,
@@ -102,7 +102,7 @@ fn emit_exists_circuit(
     let left_in = resolve_input(client, chain, memo, left, &live)?;
     let (inner_preds, inner_src) = split_filter(right);
     let right_in = seginput_of_get(inner_src)
-        .ok_or_else(|| GnitzSqlError::Plan("internal: EXISTS/IN inner relation is not a base Get".into()))?;
+        .ok_or_else(|| GnitzSqlError::Internal("EXISTS/IN inner relation is not a base Get".into()))?;
 
     // Self-collision: EXISTS/IN over the outer's own relation must read the inner
     // as a distinct source (single-source-per-epoch) — wrap the colliding inner
@@ -222,42 +222,31 @@ impl ExistsCore<'_> {
         let keep_a: Vec<usize> = (0..a_n).collect();
         let keep_b: Vec<usize> = (0..b_n).collect();
 
-        let terms = emit_equi_join_terms(
-            cb,
-            EquiSide {
-                input: a_local,
-                cols: &left_cols,
-                target_tcs: &left_target_tcs,
-                coldefs: &left_in.schema.columns,
-                keep: &keep_a,
-            },
-            EquiSide {
-                input: b_local,
-                cols: &right_cols,
-                target_tcs: &right_target_tcs,
-                coldefs: &right_in.schema.columns,
-                keep: &keep_b,
-            },
-        )?;
+        let side_a = EquiSide {
+            input: a_local,
+            cols: &left_cols,
+            target_tcs: &left_target_tcs,
+            coldefs: &left_in.schema.columns,
+            keep: &keep_a,
+        };
+        let side_b = EquiSide {
+            input: b_local,
+            cols: &right_cols,
+            target_tcs: &right_target_tcs,
+            coldefs: &right_in.schema.columns,
+            keep: &keep_b,
+        };
+        let terms = emit_equi_join_terms(cb, side_a, side_b)?;
 
         // π_A(inner): project each term straight to [_join_pk × k, A].
         let pa_ab = cb.map(terms.join_ab, &(k..k + a_n).collect::<Vec<_>>());
         let pa_ba = cb.map(terms.join_ba, &(k + b_n..k + b_n + a_n).collect::<Vec<_>>());
         let pi_a = cb.union(pa_ab, pa_ba);
 
-        // a_all re-keys the full (locally filtered, NULL keys included) outer input,
-        // reusing reindex_a on a NOT NULL key (the NULL gate was a no-op there).
-        let a_all = if terms.a_nullable {
-            cb.map_reindex(
-                a_local,
-                &left_cols,
-                &left_target_tcs,
-                build_reindex_program(left_in.schema.columns.len()),
-            )
-        } else {
-            terms.reindex_a
-        };
-
+        // A_all: the full (locally filtered, NULL keys included) outer input,
+        // re-keyed — reusing `reindex_a` on a NOT NULL key, where the gate was a
+        // no-op.
+        let a_all = terms.a_all(cb, side_a);
         let (primary, unmatched) = exists_branches(cb, a_all, pi_a, kind);
         Ok((primary, unmatched, join_pk_coldefs(&target_tcs)))
     }

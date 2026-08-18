@@ -387,6 +387,11 @@ fn explain_returns_the_selects_own_rejection() {
         "SELECT v FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
         "SELECT v FROM t WHERE CAST(v AS CHAR) LIKE CAST(w AS CHAR)",
         "SELECT v FROM t ORDER BY v + 1",
+        // Unsupported on both axes at once — a computed DISTINCT item and a
+        // non-literal LIKE pattern. Which one is named is decided by the order
+        // the sink shape and the WHERE are planned in, so this pins that the
+        // fold sink plans them in the same order the rows sink does.
+        "SELECT DISTINCT v + 1 FROM t WHERE CAST(v AS CHAR) LIKE CAST(w AS CHAR)",
     ] {
         let direct = try_exec(&mut client, &sn, sql).expect_err(&format!("`{sql}` must be rejected"));
         let explained = try_exec(&mut client, &sn, &format!("EXPLAIN {sql}"))

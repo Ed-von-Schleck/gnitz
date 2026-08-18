@@ -116,7 +116,7 @@ pub(crate) fn slot_of(layout: &[ColId], id: ColId) -> Result<usize, GnitzSqlErro
     layout
         .iter()
         .position(|c| *c == id)
-        .ok_or_else(|| GnitzSqlError::Plan("internal: HIR column reference has no layout slot".into()))
+        .ok_or_else(|| GnitzSqlError::Internal("HIR column reference has no layout slot".into()))
 }
 
 /// The physical position of a bare `ColRef` leaf in a layout. Every projection
@@ -126,8 +126,8 @@ pub(crate) fn slot_of(layout: &[ColId], id: ColId) -> Result<usize, GnitzSqlErro
 pub(crate) fn slot_of_expr(e: &HirExpr, layout: &[ColId]) -> Result<usize, GnitzSqlError> {
     match as_col(e) {
         Some(id) => slot_of(layout, id),
-        None => Err(GnitzSqlError::Plan(
-            "internal: a combine projection item is not a column reference".into(),
+        None => Err(GnitzSqlError::Internal(
+            "a combine projection item is not a column reference".into(),
         )),
     }
 }
@@ -224,8 +224,8 @@ impl SubqueryRef {
     pub(crate) fn scalar_agg(&self) -> Result<&HirAgg, GnitzSqlError> {
         match self.rel.as_ref() {
             RelExpr::Reduce { aggs, .. } if !aggs.is_empty() => Ok(&aggs[0]),
-            _ => Err(GnitzSqlError::Plan(
-                "internal: a scalar subquery's rel is not a one-aggregate Reduce".into(),
+            _ => Err(GnitzSqlError::Internal(
+                "a scalar subquery's rel is not a one-aggregate Reduce".into(),
             )),
         }
     }
@@ -483,9 +483,7 @@ impl JoinOn {
     pub(crate) fn class(&self) -> Result<&JoinClass, GnitzSqlError> {
         match self {
             JoinOn::Class(c) => Ok(c),
-            JoinOn::Raw(_) => Err(GnitzSqlError::Plan(
-                "internal: join reached lowering unclassified".into(),
-            )),
+            JoinOn::Raw(_) => Err(GnitzSqlError::Internal("join reached lowering unclassified".into())),
         }
     }
 }

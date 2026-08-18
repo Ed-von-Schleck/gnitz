@@ -436,8 +436,7 @@ impl<R> BExpr<R> {
 
 impl BExpr<usize> {
     /// The runtime entry point: type a `ColRef(idx)` leaf as the schema column's
-    /// declared type (`cols[idx].type_code`, panicking on an
-    /// out-of-bounds index — unchanged from the original body).
+    /// declared type (`cols[idx].type_code`, panicking on an out-of-bounds index).
     pub(crate) fn infer_type(&self, cols: &[ColumnDef]) -> TypeCode {
         self.infer_type_with(&|idx: &usize| cols[*idx].type_code)
     }
@@ -654,10 +653,9 @@ mod tests {
         assert_eq!(BoundExpr::LitNull.infer_type(&s.columns), TypeCode::I64);
     }
 
-    /// Pins every `infer_type` arm the pre-existing tests do not reach (the
-    /// literal/unary/null-test/agg/InList arms), so the verbatim move into the
-    /// generic `infer_type_with` core is locally verified behavior-identical
-    /// rather than relying on `make e2e`.
+    /// Pins the `infer_type` arms the tests above do not reach — the
+    /// literal/unary/null-test/agg/InList ones — so the generic
+    /// `infer_type_with` core is covered locally rather than only by `make e2e`.
     #[test]
     fn infer_type_covers_remaining_arms() {
         // pk U64, c1 U64, c2 String.

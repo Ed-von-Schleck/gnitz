@@ -540,3 +540,27 @@ fn reads_reflect_writes_between_runs() {
         "the next read must see the newly committed row"
     );
 }
+
+/// Two output columns under one name is rejected wherever an output schema is
+/// built — the view compilers already do it, so the ad-hoc rows sink and
+/// `INSERT … RETURNING` must too, or the same projection is legal on one surface
+/// and not on another. The `DISTINCT` spelling routes through the fold sink and
+/// is the reference wording.
+#[test]
+fn a_duplicate_output_name_is_rejected_on_every_read_surface() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT UNSIGNED PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+    );
+
+    for sql in [
+        "SELECT a AS x, b AS x FROM t",
+        "SELECT DISTINCT a AS x, b AS x FROM t",
+        "INSERT INTO t (id, a, b) VALUES (1, 1, 1) RETURNING id, a AS x, b AS x",
+    ] {
+        assert_rejects_variant(&mut client, &sn, sql, "Plan", "duplicate column name 'x'");
+    }
+}

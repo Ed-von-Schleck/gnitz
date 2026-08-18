@@ -6,11 +6,14 @@
 //! `hir::physical::physicalize_projection`; `build_read_projection` is the ad-hoc
 //! read path's variant (PK hidden-prepended, user column order preserved).
 
-use crate::ast_util::{aliased_def, expand_wildcard_item, scalar_projection_item};
+use crate::ast_util::{
+    aliased_def, expand_wildcard_item, is_name_preserving_wildcard_projection, scalar_projection_item,
+};
 use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr;
 use crate::ir::BoundExpr;
+use crate::validate::reject_duplicate_column_names;
 use gnitz_core::{ColumnDef, ExprBuilder, ExprProgram, Schema};
 use sqlparser::ast::SelectItem;
 
@@ -126,8 +129,8 @@ pub(crate) fn place_pk_front(
             None => {
                 // Auto-prepended: the source PK column the user did not project.
                 // It must ride the view (the physical key), but the user never
-                // named it, so it is hidden — `SELECT b FROM t` no longer leaks
-                // the PK `a`. (A source PK that is itself already hidden, e.g. a
+                // named it, so it is hidden — `SELECT b FROM t` does not leak the
+                // PK `a`. (A source PK that is itself already hidden, e.g. a
                 // synthetic `_join_pk`, stays hidden — `.hidden()` is idempotent.)
                 items.insert(target, ProjItem::PassThrough { src_col: pk });
                 out_cols.insert(target, source_schema.columns[pk].clone().hidden());
@@ -169,6 +172,14 @@ pub(crate) fn build_read_projection(
             items.push(it);
             out_cols.push(col);
         }
+    }
+
+    // Before the hidden PK prepend below, which may reuse a name the projection
+    // already carries. A projection that names nothing of its own (`*`,
+    // `* EXCEPT/EXCLUDE`) is skipped on the same rule the view compilers use: its
+    // names are the source's, so a duplicate there rides through positionally.
+    if !is_name_preserving_wildcard_projection(projection) {
+        reject_duplicate_column_names(&out_cols, "SELECT projection")?;
     }
 
     // The full source PK, hidden-prepended to slots `0..k`.

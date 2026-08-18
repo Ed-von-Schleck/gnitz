@@ -447,9 +447,7 @@ pub(crate) fn cte_body<'a>(
         materialized: _,
         closing_paren_token: _,
     } = cte;
-    if from.is_some() {
-        return Err(unsupported_clause(ctx, "a trailing FROM"));
-    }
+    reject_if(from.is_some(), ctx, "a trailing FROM")?;
     reject_query_envelope_body(query, ctx)
 }
 
@@ -517,13 +515,14 @@ pub(crate) fn reject_unhonored_insert_clauses(
     reject_if(settings.is_some(), context, "SETTINGS")?;
     reject_if(format_clause.is_some(), context, "FORMAT")?;
     reject_if(output.is_some(), context, "OUTPUT")?;
-    if multi_table_insert_type.is_some()
-        || !multi_table_into_clauses.is_empty()
-        || !multi_table_when_clauses.is_empty()
-        || multi_table_else_clause.is_some()
-    {
-        return Err(unsupported_clause(context, "multi-table INSERT (ALL/FIRST)"));
-    }
+    reject_if(
+        multi_table_insert_type.is_some()
+            || !multi_table_into_clauses.is_empty()
+            || !multi_table_when_clauses.is_empty()
+            || multi_table_else_clause.is_some(),
+        context,
+        "multi-table INSERT (ALL/FIRST)",
+    )?;
     // The `source` is a full `Query`; an INSERT honors no envelope clause on it (LIMIT/OFFSET,
     // ORDER BY, FETCH, FOR UPDATE/SHARE, SETTINGS, FORMAT, a `WITH`). Route it through the shared
     // `Query` guard so a dropped envelope clause is a clean error, not a silent full-table insert.
@@ -918,7 +917,6 @@ pub(crate) fn reject_unhonored_create_index_clauses(
     ci: &sqlparser::ast::CreateIndex,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
-    use sqlparser::ast::IndexType;
     let sqlparser::ast::CreateIndex {
         name: _,
         table_name: _,
@@ -935,15 +933,8 @@ pub(crate) fn reject_unhonored_create_index_clauses(
         alter_options,
     } = ci;
     reject_if(predicate.is_some(), context, "WHERE (partial index)")?;
-    reject_if(!index_options.is_empty(), context, "index options")?;
     reject_if(!alter_options.is_empty(), context, "ALTER options (ALGORITHM / LOCK)")?;
-    if let Some(t) = using {
-        reject_if(
-            !matches!(t, IndexType::BTree),
-            context,
-            "USING (non-default index type)",
-        )?;
-    }
+    reject_index_type_and_options(using, index_options, context)?;
     reject_if(*concurrently, context, "CONCURRENTLY")?;
     reject_if(!include.is_empty(), context, "INCLUDE (covering columns)")?;
     reject_if(nulls_distinct.is_some(), context, "NULLS [NOT] DISTINCT")?;
@@ -972,16 +963,17 @@ fn reject_unhonored_fk_fields(fk: &sqlparser::ast::ForeignKeyConstraint, context
         match_kind,
         characteristics,
     } = fk;
-    if on_delete.is_some() || on_update.is_some() {
-        return Err(unsupported_clause(context, "FOREIGN KEY ON DELETE/ON UPDATE action"));
-    }
-    if match_kind.is_some() {
-        return Err(unsupported_clause(context, "FOREIGN KEY MATCH"));
-    }
-    if characteristics.is_some() {
-        return Err(unsupported_clause(context, "constraint characteristics (DEFERRABLE …)"));
-    }
-    Ok(())
+    reject_if(
+        on_delete.is_some() || on_update.is_some(),
+        context,
+        "FOREIGN KEY ON DELETE/ON UPDATE action",
+    )?;
+    reject_if(match_kind.is_some(), context, "FOREIGN KEY MATCH")?;
+    reject_if(
+        characteristics.is_some(),
+        context,
+        "constraint characteristics (DEFERRABLE …)",
+    )
 }
 
 /// Reject every PRIMARY KEY constraint field beyond the column list and the
@@ -1028,38 +1020,52 @@ pub(crate) fn reject_unhonored_unique_fields(
         characteristics,
         nulls_distinct,
     } = u;
-    if index_name.is_some() {
-        return Err(unsupported_clause(
-            context,
-            "a UNIQUE index name (use CONSTRAINT <name>)",
-        ));
-    }
-    if !matches!(nulls_distinct, sqlparser::ast::NullsDistinctOption::None) {
-        return Err(unsupported_clause(context, "NULLS [NOT] DISTINCT"));
-    }
+    reject_if(
+        index_name.is_some(),
+        context,
+        "a UNIQUE index name (use CONSTRAINT <name>)",
+    )?;
+    reject_if(
+        !matches!(nulls_distinct, sqlparser::ast::NullsDistinctOption::None),
+        context,
+        "NULLS [NOT] DISTINCT",
+    )?;
     reject_index_constraint_extras(index_type, index_options, characteristics, context)
 }
 
-/// The PK/UNIQUE-shared tail: accept only the BTree default `USING`, no index
-/// options, no constraint characteristics (DEFERRABLE …).
+/// The index-shape tail every index-creating surface shares: accept only the
+/// BTree default `USING` (it names gnitz's real ordered index), and no index
+/// options. CREATE INDEX, PRIMARY KEY and UNIQUE all spell the same two
+/// rejections, so they read from one place and cannot drift apart.
+fn reject_index_type_and_options(
+    index_type: &Option<sqlparser::ast::IndexType>,
+    index_options: &[sqlparser::ast::IndexOption],
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    reject_if(
+        index_type
+            .as_ref()
+            .is_some_and(|t| !matches!(t, sqlparser::ast::IndexType::BTree)),
+        context,
+        "USING (non-default index type)",
+    )?;
+    reject_if(!index_options.is_empty(), context, "index options")
+}
+
+/// The PK/UNIQUE-shared tail: the index shape above, plus no constraint
+/// characteristics (DEFERRABLE …), which a CREATE INDEX cannot carry.
 fn reject_index_constraint_extras(
     index_type: &Option<sqlparser::ast::IndexType>,
     index_options: &[sqlparser::ast::IndexOption],
     characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
-    if let Some(t) = index_type {
-        if !matches!(t, sqlparser::ast::IndexType::BTree) {
-            return Err(unsupported_clause(context, "USING (non-default index type)"));
-        }
-    }
-    if !index_options.is_empty() {
-        return Err(unsupported_clause(context, "index options"));
-    }
-    if characteristics.is_some() {
-        return Err(unsupported_clause(context, "constraint characteristics (DEFERRABLE …)"));
-    }
-    Ok(())
+    reject_index_type_and_options(index_type, index_options, context)?;
+    reject_if(
+        characteristics.is_some(),
+        context,
+        "constraint characteristics (DEFERRABLE …)",
+    )
 }
 
 /// Which site is walking a column definition, and so which constraint-bearing
@@ -1165,7 +1171,7 @@ pub(crate) fn reject_unhonored_table_constraints(
 /// (silently scopes out partition children), a Hive `SET LOCATION`, `ON CLUSTER`,
 /// and a non-`None` `table_type` (Iceberg/Dynamic — a different storage engine).
 /// The single operation (comma-count enforced by the caller) is dispatched in
-/// `plan/alter.rs`. Exhaustive destructure (no `..`): a future sqlparser field
+/// `ddl::alter`. Exhaustive destructure (no `..`): a future sqlparser field
 /// stops the build until it is classified.
 pub(crate) fn reject_unhonored_alter_table_clauses(
     alter: &sqlparser::ast::AlterTable,

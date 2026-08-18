@@ -1,9 +1,10 @@
 //! `EXPLAIN <select>`: the access decisions the ad-hoc read path makes, rendered
-//! as rows. It runs the *identical* planning `dml::select` runs — the shared
-//! `route_select` and the same two shape builders — and diverges only at the tail:
-//! `execute_select` dispatches, this formats. So a query EXPLAIN describes is a
-//! query the direct path can serve, and a query the planner rejects returns that
-//! query's own rejection.
+//! as rows. It runs the same planning `dml::select` runs, in the same order —
+//! `route_select`, then the WHERE, then the sink's shape builder — and diverges
+//! only at the tail: `execute_select` dispatches, this formats. The order matters
+//! as much as the steps: it decides which rejection a query unsupported on two
+//! axes reports. So a query the planner rejects returns that query's own
+//! rejection.
 //!
 //! Metadata lookups only: planning reaches the wire where it always does
 //! (`binder.resolve` and the `plan_where` index probe) and never scans.
@@ -11,8 +12,9 @@
 use crate::access::pk_point_tuple;
 use crate::bind::Binder;
 use crate::dml::plan::{bind_where, plan_where, AccessPlan, ReadBudget};
-use crate::dml::select::{build_fold_shape, build_rows_shape, route_select, FoldShape, Route, Sink, Target};
+use crate::dml::select::{build_fold_shape, build_rows_shape, route_select, Route, Sink, Target};
 use crate::error::GnitzSqlError;
+use crate::exec::agg_finish::FoldShape;
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::{AggFunc, ReadBound};
@@ -37,7 +39,10 @@ pub(crate) fn execute_explain(
     // projected reply is.
     let shape_line = match route.sink {
         Sink::Fold => fold_line(&build_fold_shape(select, schema)?, schema, select.distinct.is_some()),
-        _ => {
+        // The bare-`*` scan projects nothing and orders by nothing, so the reply is
+        // the source's own visible width — no shape to build.
+        Sink::PlainScan => projection_line(schema.visible_columns().count(), 0),
+        Sink::Rows => {
             let reply = build_rows_shape(select, query, schema)?.reply_schema;
             // The hidden columns `resolve_read_spec_order` appended to order by a
             // non-projected source column. The prepended source PK is hidden too,

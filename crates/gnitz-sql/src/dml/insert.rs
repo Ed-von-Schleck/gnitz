@@ -44,7 +44,7 @@ enum ConflictPlan {
 ///
 /// Both compile at bind time, against the catalog schema, which is the schema
 /// `insert.rs` reads every row through: the VALUES batch is built from it, and
-/// `effective_row`'s buffered branch copies into a batch built from it. Its
+/// `effective_rows`'s buffered branch copies into a batch built from it. Its
 /// committed branch returns the seek reply verbatim and drops the reply schema,
 /// so a row read back from the store is *assumed* to match — the same assumption
 /// `build_merged_row`'s carry path has always made here, not one this compilation
@@ -174,9 +174,9 @@ pub(crate) fn execute_insert(
     // stamped, and each VALUES element indexes the payload columns directly. The
     // dense `payload_idx` equals the position in the SERIAL-omitted row precisely
     // because the omitted column is the single PK (the single-PK closed form).
-    // `serial_max` is the underlying int type's max positive value (the canonical
-    // `FixedInt::range`), against which an exhausted sequence is rejected per row;
-    // `is_serial` gates the PK source and the payload-index shape.
+    // `serial_max` is the underlying int type's max positive value
+    // (`FixedInt::range`); its presence *is* the SERIAL test, so it both selects the
+    // per-row PK source and bounds the sequence. `is_serial` names that presence.
     let serial_max: Option<i128> = schema.columns.iter().find(|c| c.is_serial).map(|c| {
         FixedInt::from_type_code(c.type_code)
             .expect("SERIAL underlying is a fixed int")
@@ -198,6 +198,9 @@ pub(crate) fn execute_insert(
         }
     }
     let stride = schema.pk_stride() as u8;
+    // Built once: `payload_columns` filters on `is_pk_col`, itself a PK-list scan,
+    // so leaving it in the row loop pays that scan per row per column.
+    let payload: Vec<_> = schema.payload_columns().collect();
     // The row count is known here, so the whole statement's ids come from one
     // durable advance rather than one per 64 rows.
     if is_serial {
@@ -206,9 +209,8 @@ pub(crate) fn execute_insert(
 
     for row in rows {
         // Standard SQL rejects a VALUES row whose arity differs from the expected
-        // count: too few values, or excess trailing values that were previously
-        // discarded silently. This guard makes every per-column index below
-        // in-bounds.
+        // count, in either direction — too few values, or excess trailing ones.
+        // This guard makes every per-column index below in-bounds.
         if row.len() != expected {
             let hint = if is_serial {
                 " (its SERIAL primary key is auto-assigned)"
@@ -241,7 +243,7 @@ pub(crate) fn execute_insert(
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
-        for (payload_idx, ci, col_def) in schema.payload_columns() {
+        for &(payload_idx, ci, col_def) in &payload {
             if col_def.is_hidden {
                 // Logical-dropped column: a zero-filled NOT-NULL filler cell (null
                 // bit left unset), keeping the batch rectangular and the table on
@@ -271,9 +273,9 @@ pub(crate) fn execute_insert(
             // RETURNING (plain-INSERT path only): the assigned SERIAL ids are
             // already stamped into the batch's PK region, so the reply is a
             // projection of the batch we just built — no round-trip. `resolve` runs
-            // BEFORE the write, so a bad RETURNING list writes nothing (it used to
-            // commit the row and then fail); `project` afterwards is infallible and
-            // consumes the batch, so nothing is copied.
+            // BEFORE the write, so a bad RETURNING list writes nothing rather than
+            // committing the row and then failing; `project` afterwards is
+            // infallible and consumes the batch, so nothing is copied.
             let proj = returning.map(|items| resolve_projection(items, &schema)).transpose()?;
             // A stream has no PK conflict to reject: the engine refuses `Error` on
             // one and leaves `Update` unread, so the push appends. INSERTing the
@@ -472,8 +474,8 @@ fn client_side_merge_do_update(
     let gather = RowGather::new(schema);
 
     // Two buffer sets, not one: each view holds its `&mut` for the whole loop, so
-    // a single set could not carry both. Both are built once — the resolved rows
-    // are one batch, so the `existing` view no longer has to be rebuilt per row.
+    // a single set could not carry both. Both are built once: the resolved rows are
+    // one batch, so the `existing` view need not be rebuilt per row.
     let mut bufs_excluded = ViewBuffers::default();
     let mut bufs_existing = ViewBuffers::default();
     let excluded_view = bufs_excluded.view(batch, schema);
@@ -609,7 +611,7 @@ fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::two_col;
+    use crate::test_support::{parse_expr_sql, two_col};
     use gnitz_core::TypeCode;
 
     // `two_col` has columns ["pk", "val"] in schema order.
@@ -649,16 +651,6 @@ mod tests {
         assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got {err:?}");
     }
 
-    fn parse(src: &str) -> Expr {
-        use sqlparser::dialect::GenericDialect;
-        use sqlparser::parser::Parser;
-        Parser::new(&GenericDialect {})
-            .try_with_sql(src)
-            .unwrap()
-            .parse_expr()
-            .unwrap()
-    }
-
     /// An `EXCLUDED.col` reference anywhere the binder can reach — inside CASE,
     /// BETWEEN, function arguments, IN lists — must be detected, so the compound
     /// RHS is rejected rather than the qualifier being silently dropped and the
@@ -686,10 +678,13 @@ mod tests {
             "EXCLUDED.s LIKE 'a%'",
             "s ILIKE EXCLUDED.s",
         ] {
-            assert!(expr_contains_excluded(&parse(src)), "must detect EXCLUDED in {src}");
+            assert!(
+                expr_contains_excluded(&parse_expr_sql(src)),
+                "must detect EXCLUDED in {src}"
+            );
         }
         for src in ["val + 1", "COALESCE(val, 0)", "t.a", "CASE WHEN val > 0 THEN 1 END"] {
-            assert!(!expr_contains_excluded(&parse(src)), "false positive on {src}");
+            assert!(!expr_contains_excluded(&parse_expr_sql(src)), "false positive on {src}");
         }
     }
 }

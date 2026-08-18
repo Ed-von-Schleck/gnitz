@@ -1,9 +1,11 @@
 use crate::ast_util::{
-    aliased_def, is_bare_wildcard_projection, scalar_projection_item, single_relation_col_name,
-    wildcard_name_is_visible, WildcardRewrite,
+    aliased_def, expand_wildcard_item, is_bare_wildcard_projection, is_name_preserving_wildcard_projection,
+    scalar_projection_item,
 };
-use crate::bind::find_unique_column;
+use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
+use crate::ir::BoundExpr;
+use crate::validate::reject_duplicate_column_names;
 use gnitz_core::{null_word_get, null_word_set, ColData, Schema, ZSetBatch};
 use sqlparser::ast::SelectItem;
 
@@ -81,53 +83,42 @@ pub(crate) type Projection = Option<(Schema, Vec<usize>)>;
 pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> Result<Projection, GnitzSqlError> {
     // Only a *bare* `*` on a schema with no hidden payload column is the no-op
     // passthrough; a `* EXCEPT/EXCLUDE/RENAME` (or a rejected `* REPLACE/ILIKE`),
-    // or a DROP COLUMN'd base table, falls through to the expansion arm below so
-    // the dropped slot is filtered out (§6). A view's hidden *key* slots don't
-    // force the fall-through — the expansion arm keeps them anyway.
+    // or a DROP COLUMN'd base table, falls through to the expansion arm so the
+    // dropped slot is filtered out (§6).
     if is_bare_wildcard_projection(projection) && !schema.has_hidden_payload() {
         return Ok(None);
     }
 
     // One output column per projection item (`SELECT a, a` yields two columns —
     // the convention every other surface follows): the source column index and
-    // its output `ColumnDef` (alias applied). A reference is bare or qualified
-    // (`t.a`), the crate-wide single-relation convention; a mixed-in wildcard
-    // expands to every source column.
+    // its output `ColumnDef` (alias applied).
     let mut col_indices: Vec<usize> = Vec::new();
     let mut out_defs: Vec<gnitz_core::ColumnDef> = Vec::new();
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
-                // `SELECT *` excludes a hidden *non-PK* slot — a DROP COLUMN'd base
-                // column (§6) — but KEEPS a hidden PK/key column (a view's synthetic
-                // `_group_pk`/`_join_pk`, an unprojected passthrough PK): it carries
-                // the physical output key and is filtered only at presentation, and
-                // dropping it here would strip the batch of its key and trip the
-                // no-PK-projected guard below. `EXCEPT`/`EXCLUDE`/`RENAME` rewrite by
-                // visible name; `REPLACE`/`ILIKE` are rejected inside `for_item`.
-                let rw = WildcardRewrite::for_item(item, |n| wildcard_name_is_visible(&schema.columns, n), "SELECT")?;
-                for (i, c) in schema.columns.iter().enumerate() {
-                    if schema.is_hidden_payload(i) {
-                        continue;
-                    }
-                    let Some(def) = rw.rewrite_column(c) else { continue };
+                for (i, def) in expand_wildcard_item(item, &schema.columns, "SELECT")? {
                     col_indices.push(i);
                     out_defs.push(def);
                 }
             }
             _ => {
                 let (e, alias) = scalar_projection_item(item, "SELECT projection")?;
-                let name = single_relation_col_name(e).ok_or_else(|| {
-                    GnitzSqlError::Unsupported(
+                let BoundExpr::ColRef(idx) = bind_single_table(e, schema)? else {
+                    return Err(GnitzSqlError::Unsupported(
                         "only simple column references supported in SELECT projection".to_string(),
-                    )
-                })?;
-                let idx = find_unique_column(&schema.columns, name)?
-                    .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in projection")))?;
+                    ));
+                };
                 col_indices.push(idx);
                 out_defs.push(aliased_def(&schema.columns[idx], alias));
             }
         }
+    }
+
+    // Skipped for a projection that names nothing of its own, as the view
+    // compilers skip it: those names are the source's.
+    if !is_name_preserving_wildcard_projection(projection) {
+        reject_duplicate_column_names(&out_defs, "RETURNING")?;
     }
 
     // Identity fast-path: every source column projected once, in source order,
@@ -142,7 +133,7 @@ pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> 
         return Ok(None);
     }
 
-    // 1. Build new PK column set; every projected source-PK becomes a new PK.
+    // Build the new PK column set; every projected source-PK becomes a new PK.
     let new_pk_cols: Vec<usize> = col_indices
         .iter()
         .enumerate()
@@ -184,10 +175,9 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
     let mut new_batch = ZSetBatch::new(&new_schema);
     new_batch.weights = weights;
 
-    // 3. PK region: move when layout is byte-identical; else rebuild from
-    //    the packed source bytes. `pk_preserved` covers compound→compound
-    //    when columns and order match; the single-PK source can only land
-    //    here (see invariants above).
+    // PK region: move when the layout is byte-identical; else rebuild from the
+    // packed source bytes. `pk_preserved` covers compound→compound when columns
+    // and order match; a single-PK source reaches it the same way.
     let pk_preserved = new_schema.pk_cols.len() == schema.pk_cols.len()
         && new_schema
             .pk_cols
@@ -228,8 +218,8 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
         }
     }
 
-    // 4. Null bitmap: move when payload layout matches the source's;
-    //    else rebuild bit-by-bit using a hoisted (new_pi, old_pi) mapping.
+    // Null bitmap: move when the payload layout matches the source's; else
+    // rebuild bit-by-bit using a hoisted (new_pi, old_pi) mapping.
     let payload_preserved = new_schema.num_payload_cols() == schema.num_payload_cols()
         && new_schema
             .payload_columns()
@@ -258,11 +248,11 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
         }
     }
 
-    // 5. Payload columns: strictly payload→payload. `src_columns` is owned,
-    //    so swap whole vectors instead of cloning per element — avoids
-    //    per-row Option<String>/Option<Vec<u8>> allocations on string/blob
-    //    result sets. A source column projected more than once is cloned for
-    //    every occurrence but its last, which still takes the move.
+    // Payload columns: strictly payload→payload. `src_columns` is owned, so swap
+    // whole vectors instead of cloning per element — avoids per-row
+    // Option<String>/Option<Vec<u8>> allocations on string/blob result sets. A
+    // source column projected more than once is cloned for every occurrence but
+    // its last, which still takes the move.
     let payload_maps: Vec<(usize, usize)> = new_schema
         .payload_columns()
         .map(|(_, new_ci, _)| (new_ci, col_indices[new_ci]))

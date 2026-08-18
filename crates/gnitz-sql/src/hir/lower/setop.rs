@@ -241,8 +241,8 @@ fn emit_side(
                 .iter()
                 .map(|e| match physical::resolve_refs(&e.expr, &seg.layout)? {
                     BoundExpr::ColRef(s) => Ok(s),
-                    _ => Err(GnitzSqlError::Plan(
-                        "internal: pass-through side item is not a column ref".into(),
+                    _ => Err(GnitzSqlError::Internal(
+                        "pass-through side item is not a column ref".into(),
                     )),
                 })
                 .collect::<Result<_, _>>()?;

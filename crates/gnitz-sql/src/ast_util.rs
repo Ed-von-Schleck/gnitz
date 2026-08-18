@@ -308,7 +308,7 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
         // CASE operands: the optional operand, every WHEN condition + result, and
         // the optional ELSE — the node set `bind_structural`'s Case arm recurses
         // through, so a subquery or column ref inside a branch stays visible to
-        // `expr_has_aggregate` / `collect_column_refs` / the mark rewrite.
+        // `expr_has_aggregate`, `expr_contains_excluded`, and the mark rewrite.
         Expr::Case {
             operand,
             conditions,
@@ -640,11 +640,12 @@ pub(crate) fn index_column_ident<'a>(
 
 /// Bare column name of a single-relation reference: a plain `Identifier`, or a
 /// two-part `CompoundIdentifier` whose qualifier adds no disambiguation over a
-/// single grouped/base relation. `None` for any other shape, so each caller
-/// raises its own context-specific error.
+/// single grouped/base relation. Redundant parentheses are peeled — `(a)` is `a`
+/// at every surface. `None` for any other shape, so each caller raises its own
+/// context-specific error.
 pub(crate) fn single_relation_col_name(e: &sqlparser::ast::Expr) -> Option<&str> {
     use sqlparser::ast::Expr;
-    match e {
+    match peel_nested(e) {
         Expr::Identifier(id) => Some(&id.value),
         Expr::CompoundIdentifier(p) if p.len() == 2 => Some(&p[1].value),
         _ => None,
@@ -768,10 +769,10 @@ impl<'a> WildcardRewrite<'a> {
         Ok(me)
     }
 
-    /// The no-op rewrite — used where a wildcard is expanded internally (not the
-    /// user's final projection), e.g. the scalar-subquery H-materialization,
-    /// which must carry every outer column un-renamed.
-    pub(crate) fn empty() -> Self {
+    /// The no-op rewrite: what [`WildcardRewrite::for_item`] returns for a plain
+    /// `*` carrying no modifier, so every expansion loop runs the same
+    /// drop-then-rename transform whether or not the item had one.
+    fn empty() -> Self {
         Self {
             drop: Vec::new(),
             rename: Vec::new(),
@@ -779,13 +780,13 @@ impl<'a> WildcardRewrite<'a> {
     }
 
     /// Whether an expanded column named `name` is dropped (`EXCEPT`/`EXCLUDE`).
-    pub(crate) fn excludes(&self, name: &str) -> bool {
+    fn excludes(&self, name: &str) -> bool {
         self.drop.iter().any(|d| d.eq_ignore_ascii_case(name))
     }
 
     /// The renamed output name for an expanded column named `name`, or `None`
     /// when it keeps its original name.
-    pub(crate) fn output_name(&self, name: &str) -> Option<&'a str> {
+    fn output_name(&self, name: &str) -> Option<&'a str> {
         self.rename
             .iter()
             .find(|(f, _)| f.eq_ignore_ascii_case(name))
@@ -857,16 +858,7 @@ pub(crate) fn is_bare_wildcard_projection(projection: &[SelectItem]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-
-    fn parse(src: &str) -> sqlparser::ast::Expr {
-        Parser::new(&GenericDialect {})
-            .try_with_sql(src)
-            .unwrap()
-            .parse_expr()
-            .unwrap()
-    }
+    use crate::test_support::parse_expr_sql;
 
     /// CEIL/FLOOR/CAST reach the binder as dedicated AST nodes rather than as
     /// function calls, so [`expr_operands`] has to name their operand. Falling
@@ -882,9 +874,9 @@ mod tests {
             "FLOOR(SUM(x))",
             "ABS(CAST(SUM(x) AS INT))",
         ] {
-            assert!(expr_has_aggregate(&parse(src)), "{src}");
+            assert!(expr_has_aggregate(&parse_expr_sql(src)), "{src}");
             let mut seen = 0usize;
-            for_each_agg_call::<()>(&parse(src), &mut |_| {
+            for_each_agg_call::<()>(&parse_expr_sql(src), &mut |_| {
                 seen += 1;
                 Ok(())
             })
@@ -897,7 +889,13 @@ mod tests {
     /// route the view to the subquery-bearing builder.
     #[test]
     fn expr_operands_exposes_a_subquery_under_a_cast() {
-        assert!(expr_any(&parse("CAST((SELECT 1) AS INT)"), &is_scalar_subquery));
-        assert!(expr_any(&parse("CAST(x AS INT) IN (SELECT y FROM t)"), &is_exists_in));
+        assert!(expr_any(
+            &parse_expr_sql("CAST((SELECT 1) AS INT)"),
+            &is_scalar_subquery
+        ));
+        assert!(expr_any(
+            &parse_expr_sql("CAST(x AS INT) IN (SELECT y FROM t)"),
+            &is_exists_in
+        ));
     }
 }

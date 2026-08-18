@@ -755,9 +755,8 @@ impl LeafBinder for SingleTable<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::parse_expr_sql;
     use gnitz_core::{ColumnDef, Schema, TypeCode};
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
 
     fn col(name: &str, tc: TypeCode) -> ColumnDef {
         ColumnDef::new(name, tc, false)
@@ -768,11 +767,6 @@ mod tests {
             columns: vec![col("pk", TypeCode::U64), col("c", val_tc)],
             pk_cols: vec![0],
         }
-    }
-
-    fn parse(src: &str) -> Expr {
-        let dialect = GenericDialect {};
-        Parser::new(&dialect).try_with_sql(src).unwrap().parse_expr().unwrap()
     }
 
     fn assert_unsupported(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
@@ -822,11 +816,11 @@ mod tests {
     fn null_test_on_pk_column_folds_to_a_literal() {
         let schema = schema_with_val(TypeCode::I64); // pk is NOT NULL
         assert!(matches!(
-            bind_single_table(&parse("pk IS NULL"), &schema).unwrap(),
+            bind_single_table(&parse_expr_sql("pk IS NULL"), &schema).unwrap(),
             BoundExpr::LitInt(0)
         ));
         assert!(matches!(
-            bind_single_table(&parse("pk IS NOT NULL"), &schema).unwrap(),
+            bind_single_table(&parse_expr_sql("pk IS NOT NULL"), &schema).unwrap(),
             BoundExpr::LitInt(1)
         ));
     }
@@ -836,7 +830,7 @@ mod tests {
         let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
                                                      // `c BETWEEN 1 AND 9` ≡ `c >= 1 AND c <= 9` — a residual BETWEEN now binds
                                                      // (regression guard for the new Expr::Between arm) instead of Unsupported.
-        match bind_single_table(&parse("c BETWEEN 1 AND 9"), &schema).unwrap() {
+        match bind_single_table(&parse_expr_sql("c BETWEEN 1 AND 9"), &schema).unwrap() {
             BoundExpr::BinOp(l, BinOp::And, r) => {
                 assert!(matches!(*l, BoundExpr::BinOp(_, BinOp::Ge, _)));
                 assert!(matches!(*r, BoundExpr::BinOp(_, BinOp::Le, _)));
@@ -844,7 +838,7 @@ mod tests {
             other => panic!("expected And(Ge, Le), got {other:?}"),
         }
         // `c NOT BETWEEN 1 AND 9` ≡ NOT(c >= 1 AND c <= 9).
-        match bind_single_table(&parse("c NOT BETWEEN 1 AND 9"), &schema).unwrap() {
+        match bind_single_table(&parse_expr_sql("c NOT BETWEEN 1 AND 9"), &schema).unwrap() {
             BoundExpr::UnaryOp(UnaryOp::Not, inner) => {
                 assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::And, _)))
             }
@@ -863,7 +857,7 @@ mod tests {
         ] {
             let schema = schema_with_val(tc);
             for fname in &["MIN", "MAX"] {
-                let expr = parse(&format!("{fname}(c)"));
+                let expr = parse_expr_sql(&format!("{fname}(c)"));
                 let r = bind_single_table(&expr, &schema);
                 assert_unsupported(r, fname);
             }
@@ -890,27 +884,27 @@ mod tests {
         for &tc in &accepted {
             let schema = schema_with_val(tc);
             for fname in &["MIN", "MAX"] {
-                let expr = parse(&format!("{fname}(c)"));
+                let expr = parse_expr_sql(&format!("{fname}(c)"));
                 let r = bind_single_table(&expr, &schema);
                 assert!(r.is_ok(), "expected {}({:?}) to bind, got {:?}", fname, tc, r.err());
             }
         }
     }
 
-    /// `t.x IS [NOT] NULL` on a *qualified* (CompoundIdentifier) column now binds
-    /// like the unqualified form in every `bind_expr` context — the unified core
-    /// reaches the shared null-test leaf, which the old bare-`Identifier`-only arm
-    /// rejected with "IS NULL on non-column expression".
+    /// `t.x IS [NOT] NULL` on a *qualified* (CompoundIdentifier) column binds
+    /// like the unqualified form on every `bind_structural` surface — the unified
+    /// core reaches the shared null-test leaf, which a bare-`Identifier`-only arm
+    /// would reject with "IS NULL on non-column expression".
     #[test]
     fn test_compound_identifier_null_test_binds() {
         // Non-nullable column: folds to the constant (0 for IS NULL, 1 for IS NOT NULL).
         let nn = schema_with_val(TypeCode::I64); // (pk U64 NOT NULL, c I64 NOT NULL)
         assert!(matches!(
-            bind_single_table(&parse("t.c IS NULL"), &nn).unwrap(),
+            bind_single_table(&parse_expr_sql("t.c IS NULL"), &nn).unwrap(),
             BoundExpr::LitInt(0)
         ));
         assert!(matches!(
-            bind_single_table(&parse("t.c IS NOT NULL"), &nn).unwrap(),
+            bind_single_table(&parse_expr_sql("t.c IS NOT NULL"), &nn).unwrap(),
             BoundExpr::LitInt(1)
         ));
         // Nullable column: binds to the IsNull / IsNotNull opcode at the column index.
@@ -919,11 +913,11 @@ mod tests {
             pk_cols: vec![0],
         };
         assert!(matches!(
-            bind_single_table(&parse("t.c IS NULL"), &nullable).unwrap(),
+            bind_single_table(&parse_expr_sql("t.c IS NULL"), &nullable).unwrap(),
             BoundExpr::IsNull(1)
         ));
         assert!(matches!(
-            bind_single_table(&parse("t.c IS NOT NULL"), &nullable).unwrap(),
+            bind_single_table(&parse_expr_sql("t.c IS NOT NULL"), &nullable).unwrap(),
             BoundExpr::IsNotNull(1)
         ));
     }
@@ -942,7 +936,7 @@ mod tests {
             ("SUM(c) FILTER (WHERE c > 0)", "FILTER"),
             ("SUM(c) OVER (PARTITION BY pk)", "OVER"),
         ] {
-            assert_unsupported(bind_single_table(&parse(src), &schema), want);
+            assert_unsupported(bind_single_table(&parse_expr_sql(src), &schema), want);
         }
     }
 
@@ -954,7 +948,7 @@ mod tests {
     #[test]
     fn test_bind_in_list_folds_one_item_else_binds_faithful() {
         let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
-        match bind_single_table(&parse("c IN (1, 2)"), &schema).unwrap() {
+        match bind_single_table(&parse_expr_sql("c IN (1, 2)"), &schema).unwrap() {
             BoundExpr::InList { inner, items } => {
                 assert!(matches!(*inner, BoundExpr::ColRef(1)));
                 assert_eq!(items.len(), 2);
@@ -965,7 +959,7 @@ mod tests {
         }
         // A single element folds to the equality it spells — the shape the `access`
         // recognizers match on, identical to what `c = 7` binds to.
-        match bind_single_table(&parse("c IN (7)"), &schema).unwrap() {
+        match bind_single_table(&parse_expr_sql("c IN (7)"), &schema).unwrap() {
             BoundExpr::BinOp(inner, BinOp::Eq, item) => {
                 assert!(matches!(*inner, BoundExpr::ColRef(1)));
                 assert!(matches!(*item, BoundExpr::LitInt(7)));
@@ -974,7 +968,7 @@ mod tests {
         }
         // NOT IN wraps whichever node the arity picked.
         for (src, folded) in [("c NOT IN (7)", true), ("c NOT IN (1, 2)", false)] {
-            match bind_single_table(&parse(src), &schema).unwrap() {
+            match bind_single_table(&parse_expr_sql(src), &schema).unwrap() {
                 BoundExpr::UnaryOp(UnaryOp::Not, inner) => {
                     assert_eq!(matches!(*inner, BoundExpr::BinOp(_, BinOp::Eq, _)), folded, "{src}")
                 }
@@ -983,7 +977,7 @@ mod tests {
         }
         // Negative-literal items bind as `UnaryOp(Neg, LitInt)` (sqlparser lexes
         // the minus separately) — the INT_IN_SET lowering unwraps them.
-        match bind_single_table(&parse("c IN (-1, -2)"), &schema).unwrap() {
+        match bind_single_table(&parse_expr_sql("c IN (-1, -2)"), &schema).unwrap() {
             BoundExpr::InList { items, .. } => {
                 assert_eq!(items.len(), 2);
                 assert!(matches!(items[0], BoundExpr::UnaryOp(UnaryOp::Neg, _)));
@@ -998,11 +992,11 @@ mod tests {
     #[test]
     fn test_bind_in_list_string_float_and_empty() {
         let s = schema_with_val(TypeCode::String);
-        assert!(bind_single_table(&parse("c IN ('a', 'b')"), &s).is_ok());
+        assert!(bind_single_table(&parse_expr_sql("c IN ('a', 'b')"), &s).is_ok());
         let f = schema_with_val(TypeCode::F64);
-        assert!(bind_single_table(&parse("c IN (1.5, 2.5)"), &f).is_ok());
+        assert!(bind_single_table(&parse_expr_sql("c IN (1.5, 2.5)"), &f).is_ok());
         let empty = Expr::InList {
-            expr: Box::new(parse("c")),
+            expr: Box::new(parse_expr_sql("c")),
             list: vec![],
             negated: false,
         };
@@ -1023,20 +1017,20 @@ mod tests {
             "c = 1 OR EXISTS (SELECT c FROM t)",
         ] {
             assert_unsupported(
-                bind_single_table(&parse(src), &schema),
+                bind_single_table(&parse_expr_sql(src), &schema),
                 "only supported in a single-table CREATE VIEW",
             );
         }
         assert_unsupported(
-            bind_single_table(&parse("c = ANY (SELECT c FROM t)"), &schema),
+            bind_single_table(&parse_expr_sql("c = ANY (SELECT c FROM t)"), &schema),
             "ANY/SOME/ALL",
         );
         assert_unsupported(
-            bind_single_table(&parse("c > ALL (SELECT c FROM t)"), &schema),
+            bind_single_table(&parse_expr_sql("c > ALL (SELECT c FROM t)"), &schema),
             "ANY/SOME/ALL",
         );
         assert_unsupported(
-            bind_single_table(&parse("(SELECT c FROM t) = 1"), &schema),
+            bind_single_table(&parse_expr_sql("(SELECT c FROM t) = 1"), &schema),
             "scalar subqueries",
         );
     }
@@ -1053,7 +1047,12 @@ mod tests {
     #[test]
     fn test_bind_searched_case() {
         let s = nullable_schema(TypeCode::I64);
-        match bind_single_table(&parse("CASE WHEN c > 0 THEN 1 WHEN c < 0 THEN 2 ELSE 3 END"), &s).unwrap() {
+        match bind_single_table(
+            &parse_expr_sql("CASE WHEN c > 0 THEN 1 WHEN c < 0 THEN 2 ELSE 3 END"),
+            &s,
+        )
+        .unwrap()
+        {
             BoundExpr::Case { branches, else_ } => {
                 assert_eq!(branches.len(), 2);
                 assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Gt, _)));
@@ -1064,7 +1063,7 @@ mod tests {
             other => panic!("expected Case, got {other:?}"),
         }
         // Missing ELSE → else_ = None.
-        match bind_single_table(&parse("CASE WHEN c > 0 THEN 1 END"), &s).unwrap() {
+        match bind_single_table(&parse_expr_sql("CASE WHEN c > 0 THEN 1 END"), &s).unwrap() {
             BoundExpr::Case { else_, .. } => assert!(else_.is_none(), "missing ELSE → None"),
             other => panic!("expected Case, got {other:?}"),
         }
@@ -1074,7 +1073,7 @@ mod tests {
     #[test]
     fn test_bind_simple_case_desugars_to_operand_eq() {
         let s = nullable_schema(TypeCode::I64);
-        match bind_single_table(&parse("CASE c WHEN 1 THEN 10 WHEN 2 THEN 20 END"), &s).unwrap() {
+        match bind_single_table(&parse_expr_sql("CASE c WHEN 1 THEN 10 WHEN 2 THEN 20 END"), &s).unwrap() {
             BoundExpr::Case { branches, else_ } => {
                 assert_eq!(branches.len(), 2);
                 assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Eq, _)));
@@ -1091,16 +1090,16 @@ mod tests {
         let s = nullable_schema(TypeCode::I64);
         // COALESCE(c) → c.
         assert!(matches!(
-            bind_single_table(&parse("COALESCE(c)"), &s).unwrap(),
+            bind_single_table(&parse_expr_sql("COALESCE(c)"), &s).unwrap(),
             BoundExpr::ColRef(1)
         ));
         // COALESCE(NULL, c) → c (a NULL literal contributes nothing).
         assert!(matches!(
-            bind_single_table(&parse("COALESCE(NULL, c)"), &s).unwrap(),
+            bind_single_table(&parse_expr_sql("COALESCE(NULL, c)"), &s).unwrap(),
             BoundExpr::ColRef(1)
         ));
         // COALESCE(c, 0) → Case{[(IsNotNull(c), c)], else: 0}.
-        match bind_single_table(&parse("COALESCE(c, 0)"), &s).unwrap() {
+        match bind_single_table(&parse_expr_sql("COALESCE(c, 0)"), &s).unwrap() {
             BoundExpr::Case { branches, else_ } => {
                 assert_eq!(branches.len(), 1);
                 assert!(matches!(branches[0].0, BoundExpr::IsNotNull(1)));
@@ -1112,7 +1111,7 @@ mod tests {
         // A NOT NULL column folds COALESCE(c, 0) to c directly (provably non-null).
         let nn = schema_with_val(TypeCode::I64);
         assert!(matches!(
-            bind_single_table(&parse("COALESCE(c, 0)"), &nn).unwrap(),
+            bind_single_table(&parse_expr_sql("COALESCE(c, 0)"), &nn).unwrap(),
             BoundExpr::ColRef(1)
         ));
     }
@@ -1128,7 +1127,7 @@ mod tests {
             ],
             pk_cols: vec![0],
         };
-        match bind_single_table(&parse("COALESCE(a, b, 0)"), &s).unwrap() {
+        match bind_single_table(&parse_expr_sql("COALESCE(a, b, 0)"), &s).unwrap() {
             BoundExpr::Case { branches, else_ } => {
                 assert!(matches!(branches[0].0, BoundExpr::IsNotNull(1)));
                 match else_.as_deref() {
@@ -1153,7 +1152,7 @@ mod tests {
     fn test_bind_coalesce_computed_operand_rejected() {
         let s = nullable_schema(TypeCode::I64);
         assert_unsupported(
-            bind_single_table(&parse("COALESCE(c + 1, 0)"), &s),
+            bind_single_table(&parse_expr_sql("COALESCE(c + 1, 0)"), &s),
             "expected a column reference",
         );
     }
@@ -1162,7 +1161,7 @@ mod tests {
     #[test]
     fn test_bind_nullif() {
         let s = nullable_schema(TypeCode::I64);
-        match bind_single_table(&parse("NULLIF(c, 0)"), &s).unwrap() {
+        match bind_single_table(&parse_expr_sql("NULLIF(c, 0)"), &s).unwrap() {
             BoundExpr::Case { branches, else_ } => {
                 assert_eq!(branches.len(), 1);
                 assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Eq, _)));
@@ -1172,9 +1171,9 @@ mod tests {
             other => panic!("expected Case, got {other:?}"),
         }
         // Both operands bind through bind_structural, so a computed operand is fine.
-        assert!(bind_single_table(&parse("NULLIF(c + 1, 0)"), &s).is_ok());
+        assert!(bind_single_table(&parse_expr_sql("NULLIF(c + 1, 0)"), &s).is_ok());
         // Wrong arity rejected.
-        assert_unsupported(bind_single_table(&parse("NULLIF(c)"), &s), "exactly two");
+        assert_unsupported(bind_single_table(&parse_expr_sql("NULLIF(c)"), &s), "exactly two");
     }
 
     /// The accepted qualifier (`ALL`, the SQL default — `COUNT(ALL c)` ≡
@@ -1192,7 +1191,7 @@ mod tests {
             "AVG(c)",
         ] {
             assert!(
-                bind_single_table(&parse(src), &schema).is_ok(),
+                bind_single_table(&parse_expr_sql(src), &schema).is_ok(),
                 "expected {src} to bind"
             );
         }
@@ -1203,7 +1202,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn bind_num(src: &str) -> Result<BoundExpr, GnitzSqlError> {
-        bind_single_table(&parse(src), &schema_with_val(TypeCode::I64))
+        bind_single_table(&parse_expr_sql(src), &schema_with_val(TypeCode::I64))
     }
 
     fn assert_bind_err(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
@@ -1383,9 +1382,12 @@ mod tests {
     fn scalar_functions_wrap_an_aggregate_argument() {
         let s = schema_with_val(TypeCode::I64);
         for src in ["ABS(SUM(c))", "CAST(SUM(c) AS INT)", "GREATEST(SUM(c), COUNT(*))"] {
-            assert!(bind_single_table(&parse(src), &s).is_ok(), "expected {src} to bind");
+            assert!(
+                bind_single_table(&parse_expr_sql(src), &s).is_ok(),
+                "expected {src} to bind"
+            );
         }
-        match bind_single_table(&parse("ABS(SUM(c))"), &s).unwrap() {
+        match bind_single_table(&parse_expr_sql("ABS(SUM(c))"), &s).unwrap() {
             BoundExpr::Func { f: NumFunc::Abs, arg } => {
                 assert!(matches!(*arg, BoundExpr::AggCall { func: AggFunc::Sum, .. }))
             }
@@ -1404,7 +1406,7 @@ mod tests {
 
     /// Bind against a schema whose `c` is a STRING, for the string surface.
     fn bind_str(src: &str) -> Result<BoundExpr, GnitzSqlError> {
-        bind_single_table(&parse(src), &schema_with_val(TypeCode::String))
+        bind_single_table(&parse_expr_sql(src), &schema_with_val(TypeCode::String))
     }
 
     /// The `(pattern, escape, ci)` a LIKE bound to, unwrapping a `NOT` if one is
@@ -1592,7 +1594,7 @@ mod tests {
             "TRIM(EXCLUDED.c)",
             "TRIM('x' FROM EXCLUDED.c)",
         ] {
-            let e = parse(src);
+            let e = parse_expr_sql(src);
             let found = expr_operands(&e).iter().any(|o| format!("{o}").contains("EXCLUDED"));
             assert!(found, "{src}: the walker must reach the EXCLUDED reference");
         }

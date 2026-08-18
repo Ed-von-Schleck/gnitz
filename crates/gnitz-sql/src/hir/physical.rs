@@ -17,8 +17,8 @@ use gnitz_core::{ColumnDef, Schema};
 pub(crate) fn resolve_refs(expr: &HirExpr, layout: &[ColId]) -> Result<BoundExpr, GnitzSqlError> {
     expr.try_map_refs(&|r| match r {
         HirRef::Col(id) => slot_of(layout, *id),
-        HirRef::Subquery(_) => Err(GnitzSqlError::Plan(
-            "internal: subquery leaf survived to physicalization".into(),
+        HirRef::Subquery(_) => Err(GnitzSqlError::Internal(
+            "subquery leaf survived to physicalization".into(),
         )),
     })
 }

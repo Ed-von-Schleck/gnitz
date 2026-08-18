@@ -152,7 +152,7 @@ impl ExprKind {
 /// to think about the other class. Bare `lower` survives only where the arm
 /// itself dispatches on the kind: `binop`, `cast`, and `case`'s string-ness
 /// decision.
-pub(crate) struct OpcodeBackend<'a> {
+struct OpcodeBackend<'a> {
     cols: &'a [ColumnDef],
     eb: &'a mut ExprBuilder,
 }
@@ -788,18 +788,51 @@ pub(crate) fn compile_filter_program(
     }
 }
 
-/// [`compile_filter_program`] encoded as the wire predicate blob a `ReadSpec`
-/// carries; empty for the statically-true verdict (the bound is exact).
-///
-/// The program is validated here even though nothing client-side runs it: the
-/// worker's `LogicalProgram::from_wire` applies the identical schema-free checks
-/// (register cap, opcodes, operand bounds), so doing it locally turns a
-/// round-trip `STATUS_ERROR` naming an internal enum into a plan-time
-/// `Unsupported`.
-pub(crate) fn compile_wire_predicate(pred: &BoundExpr, cols: &[ColumnDef]) -> Result<Vec<u8>, GnitzSqlError> {
-    let Some(p) = compile_filter_program(pred, cols)? else {
-        return Ok(Vec::new());
+/// Lower the AND of `exprs` into `eb`, returning the result register. Each
+/// conjunct lowers into its own register and the result is a `bool_and` fold over
+/// them, which is byte-for-byte what `and_fold`'s left-associated tree lowers to
+/// — without cloning a conjunct to build that tree. `None` is the statically-true
+/// verdict (nothing to test, or a single true-constant conjunct), on which the
+/// caller keeps every row rather than compiling a program.
+pub(crate) fn lower_conjuncts(
+    exprs: &[&BoundExpr],
+    cols: &[ColumnDef],
+    eb: &mut ExprBuilder,
+) -> Result<Option<u32>, GnitzSqlError> {
+    // Only a lone conjunct escapes the fold, so it is the only one that can still
+    // be a bare true constant by the time it gets here.
+    if exprs.is_empty() || matches!(exprs, [BoundExpr::LitInt(v)] if *v != 0) {
+        return Ok(None);
+    }
+    let mut backend = OpcodeBackend { cols, eb };
+    let mut acc = if exprs.len() == 1 {
+        backend.lower(exprs[0])?.0
+    } else {
+        backend.lower_num(exprs[0])?.0
     };
+    for e in &exprs[1..] {
+        let (r, _) = backend.lower_num(e)?;
+        acc = backend.eb.bool_and(acc, r);
+    }
+    Ok(Some(acc))
+}
+
+/// The wire predicate blob for the AND of `exprs` — the conjunct-list form of
+/// [`compile_wire_predicate`]. An empty blob is the statically-true verdict (the
+/// caller's bound is exact).
+pub(crate) fn compile_wire_conjuncts(exprs: &[&BoundExpr], cols: &[ColumnDef]) -> Result<Vec<u8>, GnitzSqlError> {
+    let mut eb = ExprBuilder::new();
+    match lower_conjuncts(exprs, cols, &mut eb)? {
+        Some(reg) => encode_validated(eb.build(reg)),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Encode a compiled program as the wire blob, validating it the way the worker's
+/// `LogicalProgram::from_wire` will. Nothing client-side runs it; validating here
+/// turns a round-trip `STATUS_ERROR` naming an internal enum into a plan-time
+/// `Unsupported`.
+fn encode_validated(p: gnitz_core::ExprProgram) -> Result<Vec<u8>, GnitzSqlError> {
     let blob = p.encode();
     LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings).map_err(expr_unsupported)?;
     Ok(blob)
@@ -813,12 +846,20 @@ pub(crate) fn compile_wire_predicate(pred: &BoundExpr, cols: &[ColumnDef]) -> Re
 /// Picks `resolve_filter`, so a bare non-boolean predicate (`HAVING COUNT(*)`)
 /// still gets the `bool_bits` bit [`Evaluator::filter`] reads.
 pub(crate) fn compile_filter_evaluator(pred: &BoundExpr, schema: &Schema) -> Result<Option<Evaluator>, GnitzSqlError> {
-    // The statically-true verdict, as `compile_filter_program` decides it.
-    if matches!(pred, BoundExpr::LitInt(v) if *v != 0) {
-        return Ok(None);
-    }
+    compile_conjuncts_evaluator(&[pred], schema)
+}
+
+/// [`compile_filter_evaluator`] over a conjunct list, AND-combined by
+/// [`lower_conjuncts`]. `None` when there is nothing to test — no conjuncts, or a
+/// statically-true one — and the caller keeps every row.
+pub(crate) fn compile_conjuncts_evaluator(
+    preds: &[&BoundExpr],
+    schema: &Schema,
+) -> Result<Option<Evaluator>, GnitzSqlError> {
     let mut eb = ExprBuilder::new();
-    let reg = compile_bound_expr(pred, &schema.columns, &mut eb)?;
+    let Some(reg) = lower_conjuncts(preds, &schema.columns, &mut eb)? else {
+        return Ok(None);
+    };
     let prog = eb.build_logical(reg).map_err(expr_unsupported)?;
     Ok(Some(prog.resolve_filter(schema).map_err(expr_unsupported)?))
 }
@@ -873,9 +914,9 @@ mod tests {
     use super::*;
     use gnitz_core::{ColumnDef, ExprProgram, Schema, TypeCode};
 
-    /// Decode a built program the way the engine will. Production no longer
-    /// round-trips through the wire form to resolve locally, but these tests are
-    /// about what the *engine* accepts, so they go through the decoder.
+    /// Decode a built program the way the engine will. Production resolves locally
+    /// without a wire round-trip, but these tests are about what the *engine*
+    /// accepts, so they go through the decoder.
     fn to_logical(p: ExprProgram) -> Result<LogicalProgram, GnitzSqlError> {
         LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings).map_err(expr_unsupported)
     }

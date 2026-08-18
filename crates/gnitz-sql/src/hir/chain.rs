@@ -99,11 +99,11 @@ fn schema_of(cols: &[ColumnDef], pk: &[u32]) -> Arc<Schema> {
 /// Ends as one atomic `create_view_chain` bundle (hiddens then final).
 pub(crate) struct ViewChain {
     owner_vid: Option<u64>,
-    pub segments: Vec<PlannedView>,
+    pub(crate) segments: Vec<PlannedView>,
 }
 
 impl ViewChain {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         ViewChain {
             owner_vid: None,
             segments: Vec::new(),
@@ -113,7 +113,7 @@ impl ViewChain {
     /// The final view's id — a durable `alloc_table_id` server round trip,
     /// allocated on first use so a view with no hidden segments never pays the
     /// allocation before its own emit.
-    pub fn owner_vid(&mut self, client: &mut GnitzClient) -> Result<u64, GnitzSqlError> {
+    pub(crate) fn owner_vid(&mut self, client: &mut GnitzClient) -> Result<u64, GnitzSqlError> {
         if let Some(v) = self.owner_vid {
             return Ok(v);
         }
@@ -130,7 +130,7 @@ impl ViewChain {
     /// The single home for the mint sequence's invariants: the id is allocated
     /// before the circuit is built (so downstream circuits can reference it) and
     /// segments land on the chain in dependency order.
-    pub fn add_segment<T>(
+    pub(crate) fn add_segment<T>(
         &mut self,
         client: &mut GnitzClient,
         emit: impl FnOnce(&mut GnitzClient, &mut ViewChain, u64) -> Result<(EmitPieces, T), GnitzSqlError>,

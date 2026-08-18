@@ -37,6 +37,81 @@ fn check_fk_type_compat(fk_col_type: TypeCode, parent_col_type: TypeCode) -> Res
     Ok(())
 }
 
+/// Reject a UNIQUE constraint whose backing index the engine could not build.
+/// A secondary index's record key is the indexed columns *plus the source PK*, so
+/// the two rules are the indexed columns' own key-eligibility and the combined
+/// key's arity and stride — the `index_key_types` gate `create_index_core` runs,
+/// so the UNIQUE and CREATE INDEX surfaces cannot disagree.
+fn reject_unbuildable_unique_index(
+    unique_cols: &[(Vec<u32>, Option<String>)],
+    cols: &[ColumnDef],
+    pk_indices: &[u32],
+) -> Result<(), GnitzSqlError> {
+    let src_pk_stride: usize = pk_indices
+        .iter()
+        .map(|&c| cols[c as usize].type_code.wire_stride())
+        .sum();
+    for (col_indices, _) in unique_cols {
+        for &c in col_indices {
+            reject_non_key_eligible(&cols[c as usize].name, cols[c as usize].type_code, "UNIQUE")?;
+        }
+        let raw_types: Vec<u8> = col_indices.iter().map(|&c| cols[c as usize].type_code as u8).collect();
+        gnitz_core::index_key_types(&raw_types, pk_indices.len(), src_pk_stride).map_err(GnitzSqlError::Unsupported)?;
+    }
+    Ok(())
+}
+
+/// Resolve a PRIMARY KEY / UNIQUE / CREATE INDEX column list against `cols`, in
+/// declared order — order drives the composite index's leading-key span and its
+/// prefix seeks. `ctx` names the surface in both messages.
+fn resolve_index_columns<'c>(
+    columns: &'c [sqlparser::ast::IndexColumn],
+    cols: &[ColumnDef],
+    ctx: &str,
+) -> Result<(Vec<&'c str>, Vec<u32>), GnitzSqlError> {
+    let mut names: Vec<&str> = Vec::with_capacity(columns.len());
+    let mut indices: Vec<u32> = Vec::with_capacity(columns.len());
+    for c in columns {
+        let name = index_column_ident(c, ctx)?;
+        let idx = find_unique_column(cols, name)?
+            .ok_or_else(|| GnitzSqlError::Bind(format!("{ctx} column '{name}' not found")))? as u32;
+        if indices.contains(&idx) {
+            return Err(GnitzSqlError::Plan(format!("{ctx}: duplicate column '{name}'")));
+        }
+        names.push(name);
+        indices.push(idx);
+    }
+    Ok((names, indices))
+}
+
+/// Resolve a `REFERENCES` clause's column list to the parent column it names.
+/// `pk_single` is the parent's lone PK column when its PK is single-column — an
+/// omitted column list defaults to it, and is undefined otherwise.
+fn resolve_referred_column(
+    referred_columns: &[sqlparser::ast::Ident],
+    ref_table: &str,
+    cols: &[ColumnDef],
+    pk_single: Option<usize>,
+) -> Result<usize, GnitzSqlError> {
+    if referred_columns.len() > 1 {
+        return Err(GnitzSqlError::Unsupported(
+            "multi-column FOREIGN KEY references are not supported".into(),
+        ));
+    }
+    match (referred_columns.first(), pk_single) {
+        (Some(ident), _) => find_unique_column(cols, &ident.value)?.ok_or_else(|| {
+            GnitzSqlError::Bind(format!(
+                "FK references column '{}' not found in table '{}'",
+                ident.value, ref_table,
+            ))
+        }),
+        (None, Some(pk)) => Ok(pk),
+        (None, None) => Err(GnitzSqlError::Bind(format!(
+            "FK against '{ref_table}' must name the referenced column (its primary key is not a single column)",
+        ))),
+    }
+}
+
 /// Resolve a self-referencing FK against the in-flight column list (the table
 /// is not yet registered in the catalog). The referenced column must be the
 /// table's lone PK column, and may not be `fk_col_idx` itself. Returns
@@ -49,29 +124,11 @@ fn resolve_fk_target_inline(
     ref_table: &str,
     referred_columns: &[sqlparser::ast::Ident],
     fk_col_idx: usize,
-    fk_col_type: TypeCode,
 ) -> Result<(u64, u64, TypeCode), GnitzSqlError> {
-    if referred_columns.len() > 1 {
-        return Err(GnitzSqlError::Unsupported(
-            "multi-column FOREIGN KEY references are not supported".into(),
-        ));
-    }
-    let ref_col_idx: usize = if let Some(ident) = referred_columns.first() {
-        find_unique_column(current_cols, &ident.value)?.ok_or_else(|| {
-            GnitzSqlError::Bind(format!(
-                "FK references column '{}' not found in table '{}'",
-                ident.value, ref_table,
-            ))
-        })?
-    } else if current_pk_cols.len() == 1 {
-        current_pk_cols[0] as usize
-    } else {
-        return Err(GnitzSqlError::Bind(format!(
-            "self-referencing FK against '{ref_table}' must name the referenced column",
-        )));
-    };
+    let pk_single = (current_pk_cols.len() == 1).then(|| current_pk_cols[0] as usize);
+    let ref_col_idx = resolve_referred_column(referred_columns, ref_table, current_cols, pk_single)?;
 
-    if !(current_pk_cols.len() == 1 && current_pk_cols[0] as usize == ref_col_idx) {
+    if pk_single != Some(ref_col_idx) {
         return Err(GnitzSqlError::Unsupported(format!(
             "self-referencing FK must reference the primary key of '{}'; \
              column '{}' is not the lone PK",
@@ -92,7 +149,7 @@ fn resolve_fk_target_inline(
     }
 
     let parent_col_type = current_cols[ref_col_idx].type_code;
-    check_fk_type_compat(fk_col_type, parent_col_type)?;
+    check_fk_type_compat(current_cols[fk_col_idx].type_code, parent_col_type)?;
     Ok((ColumnDef::SELF_FK_TABLE_ID, ref_col_idx as u64, parent_col_type))
 }
 
@@ -108,7 +165,6 @@ fn resolve_fk_target(
     foreign_table: &sqlparser::ast::ObjectName,
     referred_columns: &[sqlparser::ast::Ident],
     fk_col_idx: usize,
-    fk_col_type: TypeCode,
     current_table_name: &str,
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
@@ -118,14 +174,7 @@ fn resolve_fk_target(
     // Self-referencing FK: the table being created is not yet in the catalog,
     // so resolve the referenced column against the in-flight column list.
     if ref_table.eq_ignore_ascii_case(current_table_name) {
-        return resolve_fk_target_inline(
-            current_cols,
-            current_pk_cols,
-            &ref_table,
-            referred_columns,
-            fk_col_idx,
-            fk_col_type,
-        );
+        return resolve_fk_target_inline(current_cols, current_pk_cols, &ref_table, referred_columns, fk_col_idx);
     }
 
     // The one relation-name catalog probe outside the Binder funnels: hold the
@@ -145,34 +194,12 @@ fn resolve_fk_target(
     }
     let ref_tid = ref_rel.tid;
 
-    if referred_columns.len() > 1 {
-        return Err(GnitzSqlError::Unsupported(
-            "multi-column FOREIGN KEY references are not supported".into(),
-        ));
-    }
-
-    // Referenced parent column. An omitted column list defaults to the PK and
-    // is only well-defined for a single-column PK.
-    let ref_col_idx: usize = if let Some(ident) = referred_columns.first() {
-        find_unique_column(&ref_schema.columns, &ident.value)?.ok_or_else(|| {
-            GnitzSqlError::Bind(format!(
-                "FK references column '{}' not found in table '{}'",
-                ident.value, ref_table,
-            ))
-        })?
-    } else if ref_schema.pk_count() == 1 {
-        ref_schema.pk_index_single()
-    } else {
-        return Err(GnitzSqlError::Bind(format!(
-            "FK against compound-PK table '{ref_table}' must name the referenced column",
-        )));
-    };
+    let pk_single = (ref_schema.pk_count() == 1).then(|| ref_schema.pk_index_single());
+    let ref_col_idx = resolve_referred_column(referred_columns, &ref_table, &ref_schema.columns, pk_single)?;
 
     // Legal target iff the referenced column is the parent's lone PK, or it
-    // carries an active UNIQUE index. The `&&` short-circuits, so
-    // `pk_index_single()` is never reached for a compound parent.
-    let is_lone_pk = ref_schema.pk_count() == 1 && ref_col_idx == ref_schema.pk_index_single();
-    if !is_lone_pk {
+    // carries an active UNIQUE index.
+    if pk_single != Some(ref_col_idx) {
         match client.index_for_column(ref_tid, ref_col_idx)? {
             Some(IndexMeta { is_unique: true, .. }) => {}
             _ => {
@@ -187,7 +214,7 @@ fn resolve_fk_target(
 
     // Child column widens to the referenced parent column's type.
     let parent_col_type = ref_schema.columns[ref_col_idx].type_code;
-    check_fk_type_compat(fk_col_type, parent_col_type)?;
+    check_fk_type_compat(current_cols[fk_col_idx].type_code, parent_col_type)?;
 
     Ok((ref_tid, ref_col_idx as u64, parent_col_type))
 }
@@ -289,17 +316,7 @@ pub(crate) fn execute_create_table(
                 return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
             }
             pk_decl_seen = true;
-            for col in pk_cols {
-                let col_name = index_column_ident(col, "PRIMARY KEY")?;
-                let idx = find_unique_column(&cols, col_name)?
-                    .ok_or_else(|| GnitzSqlError::Bind(format!("PRIMARY KEY column '{col_name}' not found")))?;
-                if pk_indices.contains(&(idx as u32)) {
-                    return Err(GnitzSqlError::Plan(format!(
-                        "Duplicate column '{col_name}' in PRIMARY KEY"
-                    )));
-                }
-                pk_indices.push(idx as u32);
-            }
+            pk_indices = resolve_index_columns(pk_cols, &cols, "PRIMARY KEY")?.1;
         }
     }
 
@@ -319,7 +336,11 @@ pub(crate) fn execute_create_table(
         }
     }
 
-    // Phase 3b — resolve inline FOREIGN KEYs and collect column-level UNIQUE.
+    // Phase 3b — gather the FOREIGN KEY sites and collect column-level UNIQUE.
+    // Order is load-bearing: `resolve_fk_target` REWRITES the child column's type
+    // to the parent's and a later resolution reads `&cols`, so inline sites must
+    // stay ahead of table-level ones.
+    let mut fk_sites: Vec<(usize, &sqlparser::ast::ObjectName, &[sqlparser::ast::Ident])> = Vec::new();
     for (i, col) in sql_cols.iter().enumerate() {
         for opt in &col.options {
             match &opt.option {
@@ -327,22 +348,7 @@ pub(crate) fn execute_create_table(
                     foreign_table,
                     referred_columns,
                     ..
-                }) => {
-                    let (tid, idx, parent_pk_type) = resolve_fk_target(
-                        client,
-                        schema_name,
-                        foreign_table,
-                        referred_columns,
-                        i,
-                        cols[i].type_code,
-                        &table_name,
-                        &cols,
-                        &pk_indices,
-                    )?;
-                    cols[i].fk_table_id = tid;
-                    cols[i].fk_col_idx = idx;
-                    cols[i].type_code = parent_pk_type;
-                }
+                }) => fk_sites.push((i, foreign_table, referred_columns)),
                 ColumnOption::Unique(_) if !unique_cols.iter().any(|(c, _)| c.as_slice() == [i as u32]) => {
                     unique_cols.push((vec![i as u32], None));
                 }
@@ -351,7 +357,8 @@ pub(crate) fn execute_create_table(
         }
     }
 
-    // Phase 4 — table-level FOREIGN KEY constraints.
+    // Phase 4 — table-level FOREIGN KEY constraints. Same sites, child column
+    // named rather than positional.
     for constraint in &create.constraints {
         if let TableConstraint::ForeignKey(ForeignKeyConstraint {
             columns,
@@ -371,21 +378,24 @@ pub(crate) fn execute_create_table(
                     "FOREIGN KEY column '{local_col_name}' not found in table definition"
                 ))
             })?;
-            let (tid, idx, parent_pk_type) = resolve_fk_target(
-                client,
-                schema_name,
-                foreign_table,
-                referred_columns,
-                col_idx,
-                cols[col_idx].type_code,
-                &table_name,
-                &cols,
-                &pk_indices,
-            )?;
-            cols[col_idx].fk_table_id = tid;
-            cols[col_idx].fk_col_idx = idx;
-            cols[col_idx].type_code = parent_pk_type;
+            fk_sites.push((col_idx, foreign_table, referred_columns));
         }
+    }
+
+    for (col_idx, foreign_table, referred_columns) in fk_sites {
+        let (tid, idx, parent_pk_type) = resolve_fk_target(
+            client,
+            schema_name,
+            foreign_table,
+            referred_columns,
+            col_idx,
+            &table_name,
+            &cols,
+            &pk_indices,
+        )?;
+        cols[col_idx].fk_table_id = tid;
+        cols[col_idx].fk_col_idx = idx;
+        cols[col_idx].type_code = parent_pk_type;
     }
 
     // Phase 5 — table-level UNIQUE constraints, single- or multi-column. Each
@@ -402,21 +412,7 @@ pub(crate) fn execute_create_table(
             if columns.is_empty() {
                 return Err(GnitzSqlError::Plan("UNIQUE constraint cannot be empty".into()));
             }
-            let mut col_names: Vec<&str> = Vec::with_capacity(columns.len());
-            let mut col_indices: Vec<u32> = Vec::with_capacity(columns.len());
-            for c in columns {
-                let col_name = index_column_ident(c, "UNIQUE")?;
-                let idx = find_unique_column(&cols, col_name)?.ok_or_else(|| {
-                    GnitzSqlError::Bind(format!("UNIQUE column '{col_name}' not found in table definition"))
-                })?;
-                if col_indices.contains(&(idx as u32)) {
-                    return Err(GnitzSqlError::Plan(format!(
-                        "duplicate column '{col_name}' in UNIQUE constraint"
-                    )));
-                }
-                col_names.push(col_name);
-                col_indices.push(idx as u32);
-            }
+            let (col_names, col_indices) = resolve_index_columns(columns, &cols, "UNIQUE")?;
             if unique_cols.iter().any(|(c, _)| c.as_slice() == col_indices.as_slice()) {
                 return Err(GnitzSqlError::Plan(format!(
                     "duplicate UNIQUE constraint on column(s) ({})",
@@ -491,17 +487,9 @@ pub(crate) fn execute_create_table(
     let lone_pk: &[u32] = if pk_indices.len() == 1 { &pk_indices } else { &[] };
     unique_cols.retain(|(c, _)| c.as_slice() != lone_pk);
 
-    // Pre-validate index-eligibility BEFORE create_table: DDL is not
-    // transactional, so a type error after the table is created would leave an
-    // orphan table. `is_pk_eligible` is the exact index-eligible allow-list, so
-    // this one gate covers every rejected type. A UNIQUE+FK column always
-    // passes — its type was rewritten to the parent's (integer) PK type above.
-    for (col_indices, _) in &unique_cols {
-        for &c in col_indices {
-            let tc = cols[c as usize].type_code;
-            reject_non_key_eligible(&cols[c as usize].name, tc, "UNIQUE")?;
-        }
-    }
+    // Before `create_table`, since DDL is not transactional: a rejection after the
+    // table exists would leave an orphan.
+    reject_unbuildable_unique_index(&unique_cols, &cols, &pk_indices)?;
 
     // Phase 6 — CLUSTER BY (hash distribution key). The named columns must be the
     // PK's leading prefix in PK order; the prefix length `k` is persisted in
@@ -556,9 +544,8 @@ pub(crate) fn execute_create_table(
             taken.insert(n.to_ascii_lowercase());
         }
     }
-    // Column sets auto-named so far: an identical set is a true duplicate
-    // (reject); a distinct set rendering the same base disambiguates.
-    let mut auto: Vec<&[u32]> = Vec::new();
+    // Both `unique_cols` push sites reject a set already present, so an auto-name
+    // collision here is always between *distinct* sets rendering the same base.
     let mut index_names: Vec<String> = Vec::with_capacity(unique_cols.len());
     for (col_indices, constraint_name) in &unique_cols {
         let name = match constraint_name {
@@ -566,12 +553,6 @@ pub(crate) fn execute_create_table(
             None => {
                 let col_names: Vec<&str> = col_indices.iter().map(|&c| cols[c as usize].name.as_str()).collect();
                 let base = default_index_name(schema_name, &table_name, &col_names);
-                if auto.contains(&col_indices.as_slice()) {
-                    return Err(GnitzSqlError::Plan(format!(
-                        "duplicate UNIQUE constraint on the same columns ('{base}')"
-                    )));
-                }
-                auto.push(col_indices.as_slice());
                 let name = disambiguate_index_name(base, &taken);
                 taken.insert(name.clone());
                 name
@@ -689,22 +670,7 @@ pub(crate) fn create_index_core(
     // already-resolved (table_id, col_indices), so the name is resolved once.
     let (table_id, schema) = binder.resolve_base_table(client, table_name)?;
 
-    // Resolve each indexed column to its index, in declared order; each must be a
-    // simple identifier. Reject duplicate columns.
-    let mut col_names: Vec<String> = Vec::with_capacity(columns.len());
-    let mut col_indices: Vec<u32> = Vec::with_capacity(columns.len());
-    for c in columns {
-        let col_name = index_column_ident(c, ctx)?.to_string();
-        let col_idx = find_unique_column(&schema.columns, &col_name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found")))?;
-        if col_indices.contains(&(col_idx as u32)) {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "{ctx}: duplicate column '{col_name}' in index list"
-            )));
-        }
-        col_names.push(col_name);
-        col_indices.push(col_idx as u32);
-    }
+    let (col_names, col_indices) = resolve_index_columns(columns, &schema.columns, ctx)?;
 
     // Limit pre-check — runs before the client push so an over-limit index
     // raises a clean planner error here, not after the IDX_TAB row already
@@ -722,14 +688,11 @@ pub(crate) fn create_index_core(
     let index_name = match explicit_name {
         Some(name) => name, // explicit: an exact-name collision still errors in `create_index`
         None => {
-            let names: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-            let base = default_index_name(schema_name, table_name, &names);
+            let base = default_index_name(schema_name, table_name, &col_names);
             let existing = client.index_name_cols()?;
-            // A prior *auto-named* index on this exact column set is the same index:
-            // reject it, preserving the pre-disambiguation duplicate rejection (name
-            // collision was the only guard before). An FK-backing or explicitly-named
-            // index on these columns carries a different name, so it never blocks a
-            // distinct auto-name.
+            // A prior *auto-named* index on this exact column set is the same index.
+            // An FK-backing or explicitly-named index on these columns carries a
+            // different name, so it never blocks a distinct auto-name.
             if existing
                 .iter()
                 .any(|(name, cols)| name == &base && cols.as_slice() == col_indices.as_slice())
@@ -846,8 +809,7 @@ mod tests {
         // `parent_id BIGINT REFERENCES tree(id)`. The table has no id yet, so
         // the planner marks the column; `append_col_row` substitutes the owner
         // id. `0` would collide with the engine's "no FK" encoding.
-        let (tid, ref_col, parent_type) =
-            resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 1, TypeCode::I64).unwrap();
+        let (tid, ref_col, parent_type) = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 1).unwrap();
         assert_eq!(tid, ColumnDef::SELF_FK_TABLE_ID);
         assert_ne!(tid, 0);
         assert_eq!(ref_col, 0);
@@ -857,7 +819,7 @@ mod tests {
     #[test]
     fn self_fk_omitted_column_list_defaults_to_the_lone_pk() {
         let cols = tree_cols();
-        let (tid, ref_col, _) = resolve_fk_target_inline(&cols, &[0], "tree", &[], 1, TypeCode::I64).unwrap();
+        let (tid, ref_col, _) = resolve_fk_target_inline(&cols, &[0], "tree", &[], 1).unwrap();
         assert_eq!(tid, ColumnDef::SELF_FK_TABLE_ID);
         assert_eq!(ref_col, 0);
     }
@@ -867,7 +829,7 @@ mod tests {
         let cols = tree_cols();
         // `id BIGINT PRIMARY KEY REFERENCES tree(id)` — a tautology, and its
         // child column would be a PK column, which the auto `__fk_` index skips.
-        let err = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 0, TypeCode::I64).unwrap_err();
+        let err = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 0).unwrap_err();
         match err {
             GnitzSqlError::Bind(m) => assert!(m.contains("must not be the referenced column itself"), "got: {m}"),
             e => panic!("expected Bind, got {e:?}"),
@@ -877,7 +839,7 @@ mod tests {
     #[test]
     fn self_fk_against_non_pk_column_rejected() {
         let cols = tree_cols();
-        let err = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("tag")], 1, TypeCode::I64).unwrap_err();
+        let err = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("tag")], 1).unwrap_err();
         assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got: {err:?}");
     }
 
@@ -885,10 +847,10 @@ mod tests {
     fn self_fk_against_compound_pk_rejected() {
         let cols = tree_cols();
         // Named column: it is a PK member, but not the *lone* PK.
-        let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &[ident("id")], 2, TypeCode::I64).unwrap_err();
+        let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &[ident("id")], 2).unwrap_err();
         assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got: {err:?}");
         // Omitted column list: there is no single default target.
-        let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &[], 2, TypeCode::I64).unwrap_err();
+        let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &[], 2).unwrap_err();
         assert!(matches!(err, GnitzSqlError::Bind(_)), "got: {err:?}");
     }
 }

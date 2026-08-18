@@ -30,7 +30,7 @@ use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::group_by::{analyze_group_by, bind_having_expr, resolve_set_projection, HavingCtx};
 use crate::dml::plan::{bind_where, extract_limit, extract_offset, fetch_bound, plan_where, ReadBudget};
 use crate::error::GnitzSqlError;
-use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, AggFinish};
+use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, FoldShape};
 use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
 use crate::expr_lower::compile_filter_evaluator;
 use crate::validate::{
@@ -380,17 +380,6 @@ fn plan_read_spec(client: &mut GnitzClient, query: &Query, route: &Route<'_>) ->
 // execute_aggregate_select — the ad-hoc aggregate / DISTINCT fold
 // ---------------------------------------------------------------------------
 
-/// The fold sink's shape: what the worker folds and what the client finish needs.
-pub(super) struct FoldShape {
-    pub(super) layout: GroupByLayout,
-    /// The per-worker SyntheticFold reduce-output layout.
-    pub(super) partial_schema: Schema,
-    /// The final client-facing schema.
-    pub(super) out_schema: Schema,
-    /// The HAVING filter, compiled against `partial_schema`.
-    pub(super) having: Option<gnitz_expr::Evaluator>,
-}
-
 /// The physical layout and reply schemas a GROUP BY / global aggregate / HAVING /
 /// DISTINCT read folds under — a pure function of the AST and the source schema. A
 /// shape the fold cannot express (a partial reply wider than the column limit, a
@@ -477,13 +466,15 @@ fn execute_aggregate_select(
 ) -> Result<SqlResult, GnitzSqlError> {
     let (target, select, limit, offset) = (&route.target, route.select, route.limit, route.offset);
     let schema = &*target.schema;
-    let shape = build_fold_shape(select, schema)?;
 
     // WHERE → bound + residual predicate, exactly as the plain read path (the
     // grouped view applies WHERE via the identical compiler, so a WHERE the direct
-    // path cannot compile also fails the view — no works→error regression).
+    // path cannot compile also fails the view). It precedes the sink shape as it
+    // does in `plan_read_spec`: a query unsupported on both axes must name the
+    // same one whichever sink it routes to.
     let bound_where = bind_where(schema, select.selection.as_ref())?;
     let plan = plan_where(client, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
+    let shape = build_fold_shape(select, schema)?;
 
     // `LIMIT 0` short-circuits to an empty result — no request dispatched
     // (parity with the rows path).
@@ -509,13 +500,7 @@ fn execute_aggregate_select(
 
     // Client finishing (combine by group value, ground row, AVG/NullfillSum,
     // HAVING, projection), then the shared ORDER BY / OFFSET / LIMIT sink.
-    let finish = AggFinish {
-        layout: &shape.layout,
-        partial_schema: &shape.partial_schema,
-        out_schema: &shape.out_schema,
-        having: shape.having.as_ref(),
-    };
-    let out_batch = agg_finish(&finish, &partial);
+    let out_batch = agg_finish(&shape, &partial);
 
     let (schema_out, batch_out) =
         order_limit_passthrough(shape.out_schema, out_batch, query.order_by.as_ref(), offset, limit)?;

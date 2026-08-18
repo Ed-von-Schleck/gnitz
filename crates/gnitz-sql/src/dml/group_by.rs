@@ -131,10 +131,11 @@ fn having_agg_func(
 }
 
 /// True iff `m` is the reduce mapping for the aggregate `(agg_func, arg_col)`.
-/// COUNT(*) ignores arg_col (it has none); every other form matches the source
-/// column too, so `MAX(c2)` never binds to `SUM(c1)`.
+/// The source column is part of the identity, so `MAX(c2)` never binds to
+/// `SUM(c1)`. `Count` needs no carve-out: `classify_agg_call` yields it only
+/// from the `Wildcard` arm, so both sides are `None` there.
 fn agg_mapping_matches(m: &AggMapping, agg_func: AggFunc, arg_col: Option<usize>) -> bool {
-    m.agg_func == agg_func && (matches!(agg_func, AggFunc::Count) || m.arg_col == arg_col)
+    m.agg_func == agg_func && m.arg_col == arg_col
 }
 
 /// Collect the aggregate calls a HAVING expression references, appending any not
@@ -185,7 +186,7 @@ pub(crate) struct HavingCtx<'a> {
 
 /// Resolve a HAVING aggregate function reference to its reduce `AggMapping`, or a
 /// Bind error naming the unresolved aggregate. Shared by the value-position binder
-/// (`bind_having_expr`) and the IS [NOT] NULL binder (`bind_having_null_test`) so
+/// (`bind_having_expr`) and the IS [NOT] NULL leaf (`Having::bind_null_test`) so
 /// the lookup and its error message stay in one place.
 fn resolve_having_mapping<'a>(
     func: &sqlparser::ast::Function,

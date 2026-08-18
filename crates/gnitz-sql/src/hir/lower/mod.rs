@@ -329,7 +329,7 @@ fn lower_computed_over_combine(
 /// covered, so this is an internal invariant break, not a user-facing limit —
 /// phrase it as one rather than as an engine restriction.
 fn unsupported_body() -> GnitzSqlError {
-    GnitzSqlError::Plan("internal: HIR lowering has no body arm for this node".into())
+    GnitzSqlError::Internal("HIR lowering has no body arm for this node".into())
 }
 
 /// Resolve one input of a combine node to a `SegInput` — **the** segment-cut
@@ -431,8 +431,8 @@ pub(crate) fn resolve_collisions(
         // Only a bare `Get` can collide — a cut segment carries a fresh vid.
         let get = base_get(sources[i]);
         if !matches!(get.as_ref(), RelExpr::Get { .. }) {
-            return Err(GnitzSqlError::Plan(
-                "internal: HIR source collision on a non-Get input".into(),
+            return Err(GnitzSqlError::Internal(
+                "HIR source collision on a non-Get input".into(),
             ));
         }
         *input = wrap_passthrough_segment(client, chain, get)?;
@@ -512,7 +512,7 @@ pub(crate) fn split_filter(input: &Rc<RelExpr>) -> (&[HirExpr], &Rc<RelExpr>) {
 /// a combine subtree already cut to a hidden segment): resolve the WHERE against
 /// the source layout, extract the scan bound, physicalize the projection, and hand
 /// the physical inputs to `linear::emit_linear`.
-pub(crate) fn lower_linear(
+fn lower_linear(
     client: &mut GnitzClient,
     src: &SegInput,
     filter_preds: &[HirExpr],

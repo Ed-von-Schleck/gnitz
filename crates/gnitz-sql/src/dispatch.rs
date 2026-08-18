@@ -1,6 +1,6 @@
 //! Statement dispatch — the one module that reaches both the compile side
-//! (`plan`) and the execute side (`dml`). Builds the per-statement `Binder` and
-//! routes a `Statement` to the matching handler.
+//! (`ddl` and the `hir` view compiler) and the execute side (`dml`). Builds the
+//! per-statement `Binder` and routes a `Statement` to the matching handler.
 
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;

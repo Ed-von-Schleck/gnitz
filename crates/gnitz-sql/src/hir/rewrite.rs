@@ -524,7 +524,7 @@ fn substitute(e: &HirExpr, subst: &HashMap<*const RelExpr, HirExpr>) -> Result<H
             HirRef::Subquery(s) => subst
                 .get(&Rc::as_ptr(&s.rel))
                 .cloned()
-                .ok_or_else(|| GnitzSqlError::Plan("internal: subquery leaf without a substitution".into())),
+                .ok_or_else(|| GnitzSqlError::Internal("subquery leaf without a substitution".into())),
             HirRef::Col(_) => Ok(BExpr::ColRef(r.clone())),
         },
         &|r, want_null| match r {

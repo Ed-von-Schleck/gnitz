@@ -15,21 +15,19 @@ pub(crate) fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
 }
 
 /// Parse a numeric SQL literal as `i128`, applying `negated` (the literal sat
-/// under `Expr::UnaryOp(Minus, _)`) by prepending `-` to the digit string
-/// before parsing — that rule accepts a type minimum's own digit string
-/// (e.g. `i64::MIN`'s), which a parse-then-negate would overflow. `i128`
-/// covers every ≤8-byte type with room to spare, so an out-of-type-range
-/// literal is *representable* — callers classify it against
+/// under `Expr::UnaryOp(Minus, _)`). The magnitude parses as `u128` so a type
+/// minimum's own digit string is accepted — up to `2^127`, whose `as i128` is
+/// `i128::MIN` and whose `wrapping_neg` is itself; parse-as-`i128`-then-negate
+/// would reject it. `i128` covers every ≤8-byte type with room to spare, so an
+/// out-of-type-range literal is *representable* — callers classify it against
 /// `FixedInt::range` and decline or saturate, never wrap.
 pub(crate) fn parse_literal_i128(n_str: &str, negated: bool) -> Option<i128> {
-    let s_owned;
-    let s: &str = if negated {
-        s_owned = format!("-{n_str}");
-        &s_owned
+    let m = n_str.parse::<u128>().ok()?;
+    if negated {
+        (m <= i128::MAX as u128 + 1).then(|| (m as i128).wrapping_neg())
     } else {
-        n_str
-    };
-    s.parse::<i128>().ok()
+        (m <= i128::MAX as u128).then_some(m as i128)
+    }
 }
 
 /// Parse a numeric SQL literal into its packed-u128 PK form: the low

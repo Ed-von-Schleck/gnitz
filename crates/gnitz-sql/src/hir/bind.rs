@@ -649,8 +649,8 @@ fn bind_one_subquery(cx: &mut SubCtx<'_, '_, '_>, e: &Expr) -> Result<HirExpr, G
             compare_op,
             right,
         } => bind_quantifier_sub(cx, left, compare_op, right, false),
-        other => Err(GnitzSqlError::Plan(format!(
-            "internal: bind_one_subquery on a non-subquery node: {other:?}"
+        other => Err(GnitzSqlError::Internal(format!(
+            "bind_one_subquery on a non-subquery node: {other:?}"
         ))),
     }
 }
@@ -1070,13 +1070,14 @@ fn join_leaf(scope: &JoinScope) -> JoinLeaf<'_> {
 
 impl JoinLeaf<'_> {
     /// A qualified / unqualified / parenthesized column reference → its `ColId`.
+    /// Peels like `single_relation_col_name` does; this leaf cannot share that
+    /// helper because a qualified reference needs both of its parts.
     fn col_id(&self, e: &Expr) -> Result<ColId, GnitzSqlError> {
-        match e {
+        match peel_nested(e) {
             Expr::Identifier(id) => self.scope.resolve_unqualified(&id.value),
             Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
                 self.scope.resolve_qualified(&parts[0].value, &parts[1].value)
             }
-            Expr::Nested(inner) => self.col_id(inner),
             _ => Err(GnitzSqlError::Unsupported(
                 "JOIN ON: only column references supported".into(),
             )),
@@ -1120,12 +1121,9 @@ struct GroupAgg {
     output_nullable: bool,
 }
 
-/// Extract the `ColId` of a bound bare column reference.
-fn col_of(e: HirExpr) -> Result<ColId, GnitzSqlError> {
-    match e {
-        BExpr::ColRef(HirRef::Col(id)) => Ok(id),
-        _ => Err(GnitzSqlError::Plan("internal: expected a column reference".into())),
-    }
+/// Extract the `ColId` of a bound bare column reference, naming the failure.
+fn col_of(e: &HirExpr) -> Result<ColId, GnitzSqlError> {
+    as_col(e).ok_or_else(|| GnitzSqlError::Internal("expected a column reference".into()))
 }
 
 /// The AVG / nullable-SUM / Direct finalize composite over the raw reduce output
@@ -1148,12 +1146,13 @@ fn resolve_group_cols<L: LeafBinder<HirRef>>(
     let group_exprs = group_by_exprs(select)?;
     let mut cols = Vec::new();
     for ge in group_exprs {
-        if !matches!(peel_nested(ge), Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+        let ge = peel_nested(ge);
+        if !matches!(ge, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
             return Err(GnitzSqlError::Unsupported(
                 "GROUP BY: only simple column references supported".into(),
             ));
         }
-        let id = col_of(leaf.bind_column(ge)?)?;
+        let id = col_of(&leaf.bind_column(ge)?)?;
         let hc = col_by_id(env, id).expect("group col in env");
         reject_float_key(&hc.def, "GROUP BY")?;
         cols.push(id);
@@ -1180,7 +1179,7 @@ fn collect_aggs<L: LeafBinder<HirRef>>(
     let is_top = for_each_agg_call(expr, &mut |f| -> Result<(), GnitzSqlError> {
         let (func, arg_expr) = classify_agg_call(f)?;
         let arg = match arg_expr {
-            Some(e) => Some(col_of(leaf.bind_column(e)?)?),
+            Some(e) => Some(col_of(&leaf.bind_column(e)?)?),
             None => None,
         };
         // MIN/MAX orderability — checked here (Unsupported) so the message and error
@@ -1292,7 +1291,7 @@ fn bind_finalize_projection<L: LeafBinder<HirRef>>(
         }
         let peeled = peel_nested(expr);
         if matches!(peeled, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
-            let id = col_of(leaf.bind_column(peeled)?)?;
+            let id = col_of(&leaf.bind_column(peeled)?)?;
             if !group_cols.contains(&id) {
                 let name = col_by_id(env, id).map(|c| c.def.name.clone()).unwrap_or_default();
                 return Err(reject_ungrouped_column(&name));
@@ -1340,7 +1339,7 @@ impl<L: LeafBinder<HirRef>> GroupedLeaf<'_, L> {
     fn find_agg(&self, f: &Function) -> Result<&GroupAgg, GnitzSqlError> {
         let (func, arg_expr) = classify_agg_call(f)?;
         let arg = match arg_expr {
-            Some(e) => Some(col_of(self.leaf.bind_column(e)?)?),
+            Some(e) => Some(col_of(&self.leaf.bind_column(e)?)?),
             None => None,
         };
         self.aggs

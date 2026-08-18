@@ -184,7 +184,7 @@ fn test_compound_pk_duplicate_column_rejected() {
         .execute("CREATE TABLE dup_pk (a BIGINT UNSIGNED, b BIGINT UNSIGNED, PRIMARY KEY (a, a))")
         .unwrap_err();
     match err {
-        GnitzSqlError::Plan(s) => assert!(s.contains("Duplicate"), "got: {}", s),
+        GnitzSqlError::Plan(s) => assert!(s.contains("duplicate column"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
     }
 }
@@ -1197,5 +1197,31 @@ fn inline_duplicate_unique_rejected() {
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("duplicate UNIQUE"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
+    }
+}
+
+/// An inline `UNIQUE` builds a secondary index whose record key is the indexed
+/// columns *plus the source PK*, so it is bounded by the same arity and stride
+/// limits `CREATE INDEX` is checked against. `UNIQUE(e, f)` on a 4-column PK is
+/// `2 + 4 = 6` key columns, past `MAX_PK_COLUMNS`. The engine backstops with the
+/// same message, so what pins the planner-side gate is the error *variant*: a
+/// pre-dispatch `Unsupported`, not the `Exec` a surfaced server rejection gives.
+#[test]
+fn inline_unique_over_the_index_arity_limit_is_rejected_before_dispatch() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let err = try_exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (a BIGINT, b BIGINT, c BIGINT, d BIGINT, e BIGINT, f BIGINT, \
+         UNIQUE(e, f), PRIMARY KEY (a, b, c, d))",
+    )
+    .unwrap_err();
+    match err {
+        GnitzSqlError::Unsupported(s) => assert!(s.contains("index arity"), "got: {s}"),
+        e => panic!("expected Unsupported, got {e:?}"),
     }
 }

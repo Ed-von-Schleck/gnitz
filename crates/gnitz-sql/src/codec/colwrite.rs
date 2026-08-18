@@ -54,38 +54,34 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
                     Ok(())
                 }
                 Value::Number(n, _) => {
-                    // Build the effective numeric string with optional leading minus.
-                    let neg_buf;
-                    let n: &str = if negated {
-                        neg_buf = format!("-{n}");
-                        &neg_buf
-                    } else {
-                        n.as_str()
-                    };
+                    // A `Value::Number` is bare digits; the sign is the `UnaryOp`
+                    // peeled above. `sign` re-attaches it for the messages only.
+                    let sign = if negated { "-" } else { "" };
                     match col {
                         ColData::Fixed(buf) => {
                             match tc {
+                                // IEEE negation of the parsed magnitude is exact at
+                                // every value, `-0.0` and `-inf` included.
                                 TypeCode::F32 => {
                                     let v = n
                                         .parse::<f32>()
-                                        .map_err(|_| GnitzSqlError::Bind(format!("invalid f32: {n}")))?;
-                                    buf.extend_from_slice(&v.to_le_bytes());
+                                        .map_err(|_| GnitzSqlError::Bind(format!("invalid f32: {sign}{n}")))?;
+                                    buf.extend_from_slice(&(if negated { -v } else { v }).to_le_bytes());
                                 }
                                 TypeCode::F64 => {
                                     let v = n
                                         .parse::<f64>()
-                                        .map_err(|_| GnitzSqlError::Bind(format!("invalid f64: {n}")))?;
-                                    buf.extend_from_slice(&v.to_le_bytes());
+                                        .map_err(|_| GnitzSqlError::Bind(format!("invalid f64: {sign}{n}")))?;
+                                    buf.extend_from_slice(&(if negated { -v } else { v }).to_le_bytes());
                                 }
                                 // Every integer column, narrow (U8..I64) and wide
-                                // (U128/UUID/I128) alike: the sign is already folded into `n`, so
-                                // negated = false. Route through the single source of truth for
-                                // literal acceptance (`pk_codec`) so the INSERT-value path and
+                                // (U128/UUID/I128) alike. Route through the single source of truth
+                                // for literal acceptance (`pk_codec`) so the INSERT-value path and
                                 // PK-seek routing accept/reject identically. The packed u128's low
                                 // `wire_stride()` bytes are the column's LE image at every width.
                                 _ => {
-                                    let packed = parse_pk_literal_packed(tc, n, false).ok_or_else(|| {
-                                        GnitzSqlError::Bind(format!("{tc:?} value out of range: {n}"))
+                                    let packed = parse_pk_literal_packed(tc, n, negated).ok_or_else(|| {
+                                        GnitzSqlError::Bind(format!("{tc:?} value out of range: {sign}{n}"))
                                     })?;
                                     buf.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
                                 }

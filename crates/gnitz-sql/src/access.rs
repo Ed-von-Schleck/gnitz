@@ -4,12 +4,11 @@
 //! bound IR, never re-matched on the AST.
 //!
 //! This is a genuine **AST-free leaf**: it imports strictly `ir`, `codec::pk_codec`,
-//! `error`, and `gnitz-core` — no `ast_util`, `bind`, `plan`, or `dml`. Column
+//! `error`, and `gnitz-core` — no `ast_util`, `bind`, `hir`, or `dml`. Column
 //! identity keys off the resolved `ColRef(idx)`; literals come back through the one
 //! seam [`bound_num_literal`] and pack **byte-exactly** via `pk_codec`
-//! (`pack_pk_value` / `parse_pk_literal_packed` / `parse_uuid_str`), so a bound is
-//! bit-identical to the retired AST recognizer's — the packing depends only on the
-//! parsed value and sign, never the literal's spelling.
+//! (`pack_pk_value` / `parse_pk_literal_packed` / `parse_uuid_str`) — so the packed
+//! key depends only on the parsed value and sign, never on the literal's spelling.
 //!
 //! Residual conjuncts are returned as **borrows** of the caller's bound WHERE:
 //! candidates are collected per index but at most one is ever used, so the caller
@@ -544,7 +543,7 @@ impl IndexRangeCandidate<'_> {
     /// The range column: the index column immediately after the equality prefix —
     /// the one layout invariant of the descriptor, kept here so consumers never
     /// re-derive it from the candidate's internals.
-    pub(crate) fn range_col(&self) -> usize {
+    fn range_col(&self) -> usize {
         self.idx_cols.as_slice()[self.desc.eq_vals().len()] as usize
     }
 

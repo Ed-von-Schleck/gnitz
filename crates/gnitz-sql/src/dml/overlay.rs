@@ -32,13 +32,13 @@ use std::collections::{HashMap, HashSet};
 
 /// A PK's net effect within the transaction so far. `Present` borrows the
 /// buffered row in place (its batch + row index); `Deleted` is a tombstone.
-pub(crate) enum Buffered<'a> {
+pub(super) enum Buffered<'a> {
     Present(&'a ZSetBatch, usize),
     Deleted,
 }
 
 /// PK → net effect, borrowing the buffer's rows. Empty in autocommit.
-pub(crate) type Net<'a> = HashMap<PkTuple, Buffered<'a>>;
+pub(super) type Net<'a> = HashMap<PkTuple, Buffered<'a>>;
 
 /// The rows `keys` currently resolve to, as one owned batch plus a `PK → row`
 /// index; a key that resolves to nothing is absent from the index. Per key the

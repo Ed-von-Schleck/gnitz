@@ -546,12 +546,13 @@ fn test_direct_select_qualified_alias_and_duplicate_items() {
     let (s, _) = read_sql(&mut client, &sn, "SELECT id, a AS x FROM t");
     assert_eq!(visible_names(&s), vec!["id", "x"]);
 
-    // One output column per projection item: `a, a` yields two `a` columns
-    // carrying identical data.
-    let (s, b) = read_sql(&mut client, &sn, "SELECT id, a, a FROM t");
-    assert_eq!(visible_names(&s), vec!["id", "a", "a"]);
+    // One output column per projection item: `a` twice yields two columns carrying
+    // identical data. They need distinct aliases — a repeated *name* is rejected
+    // here exactly as it is in a view projection.
+    let (s, b) = read_sql(&mut client, &sn, "SELECT id, a AS a1, a AS a2 FROM t");
+    assert_eq!(visible_names(&s), vec!["id", "a1", "a2"]);
     assert_eq!(b.len(), 2);
-    // Physical columns: [id(hidden PK), id, a, a] — the two `a` copies are the
+    // Physical columns: [id(hidden PK), id, a1, a2] — the two `a` copies are the
     // last two, and must carry identical data.
     for r in 0..b.len() {
         assert_eq!(
@@ -560,6 +561,13 @@ fn test_direct_select_qualified_alias_and_duplicate_items() {
             "duplicated projection items carry identical data"
         );
     }
+    assert_rejects_variant(
+        &mut client,
+        &sn,
+        "SELECT id, a, a FROM t",
+        "Plan",
+        "duplicate column name 'a'",
+    );
 
     // A qualified PK equality takes the point-seek path (was a hard error).
     let (_, b) = read_sql(&mut client, &sn, "SELECT * FROM t WHERE t.id = 1");

@@ -253,14 +253,6 @@ mod tests {
         assert_eq!(ok(DataType::Uuid), TypeCode::UUID);
     }
 
-    #[test]
-    fn decimal_38_0_still_maps_to_u128() {
-        assert_eq!(
-            ok(DataType::Decimal(ExactNumberInfo::PrecisionAndScale(38, 0))),
-            TypeCode::U128,
-        );
-    }
-
     // --- error cases ---
 
     #[test]

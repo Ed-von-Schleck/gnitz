@@ -14,9 +14,6 @@ use std::sync::Arc;
 ///   is ambiguous (standard SQL) and must be rejected, not silently bound to the
 ///   first match.
 ///
-/// Single home for the name→index lookup that was previously
-/// `columns.iter().position(...)` (first-match) at every call site.
-///
 /// Hidden columns (`is_hidden`) are skipped as match candidates but keep their
 /// physical position, so the returned index is always the real offset into
 /// `columns` (every caller adds a physical `col_offset` to it). Every

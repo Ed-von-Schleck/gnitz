@@ -615,6 +615,20 @@ pub(crate) struct EquiTerms {
     pub(crate) join_ba: gnitz_core::NodeId,
 }
 
+impl EquiTerms {
+    /// `A_all` / `B_all` — that side's unfiltered input re-keyed onto the join
+    /// key. The `(nullable, reindex)` pair is taken from the terms actually
+    /// emitted rather than supplied by the caller: mispairing one side's NULL gate
+    /// with the other's reindex would be a silent weight bug in the null-fill.
+    pub(crate) fn a_all(&self, cb: &mut CircuitBuilder, a: EquiSide<'_>) -> gnitz_core::NodeId {
+        a.all(cb, self.a_nullable, self.reindex_a)
+    }
+
+    pub(crate) fn b_all(&self, cb: &mut CircuitBuilder, b: EquiSide<'_>) -> gnitz_core::NodeId {
+        b.all(cb, self.b_nullable, self.reindex_b)
+    }
+}
+
 /// The leading output PK columns of a range/band join: A's then B's source-PK
 /// column types (the re-key self-derive output type), non-nullable and
 /// `_pair_pk_{slot}`-numbered across both sides. Hidden — the synthetic pair-PK
@@ -764,14 +778,15 @@ fn emit_equi_null_fill(cb: &mut CircuitBuilder, nf: EquiNullFill<'_>) -> gnitz_c
     let mut merged = inner_merged;
     // Each preserved side P: `p0` locates its kept payload in the merged layout
     // (`k` for A, `k + pl` for B) and the other side supplies the NULL region.
-    for (preserved_is_left, side, other, nullable, reindex, p0, p_n) in [
-        (true, left, right, terms.a_nullable, terms.reindex_a, k, pl),
-        (false, right, left, terms.b_nullable, terms.reindex_b, k + pl, pr),
-    ] {
+    for (preserved_is_left, side, other, p0, p_n) in [(true, left, right, k, pl), (false, right, left, k + pl, pr)] {
         if !kind.preserves(preserved_is_left) {
             continue;
         }
-        let p_all = side.all(cb, nullable, reindex);
+        let p_all = if preserved_is_left {
+            terms.a_all(cb, side)
+        } else {
+            terms.b_all(cb, side)
+        };
         let proj_p = cb.map(inner_merged, &(p0..p0 + p_n).collect::<Vec<_>>()); // π_P(inner) = [_join_pk, P]
         let nu_p = cb.positive_diff(p_all, proj_p); // max(0, P − π_P(inner))
         let ext = cb.null_extend(nu_p, &other.kept_type_codes());

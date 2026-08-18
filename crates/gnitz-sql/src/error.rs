@@ -7,6 +7,11 @@ pub enum GnitzSqlError {
     Plan(String),
     Exec(gnitz_core::ClientError),
     Unsupported(String),
+    /// A planner invariant broke: a shape an earlier guard was supposed to have
+    /// rejected reached a stage that cannot represent it. Never raisable by any
+    /// SQL a user can write, which is what makes it worth its own variant — a
+    /// `Plan` string prefix cannot be asserted on.
+    Internal(String),
     /// An OCC precondition failed (a read table was written concurrently) and the
     /// statement could not commit lose-update-free. `table` names the conflicting
     /// table for an autocommit RMW statement; `None` for a `BEGIN`/`COMMIT`
@@ -39,6 +44,7 @@ impl fmt::Display for GnitzSqlError {
             GnitzSqlError::Plan(s) => write!(f, "plan error: {s}"),
             GnitzSqlError::Exec(e) => write!(f, "exec error: {e}"),
             GnitzSqlError::Unsupported(s) => write!(f, "unsupported: {s}"),
+            GnitzSqlError::Internal(s) => write!(f, "internal error: {s}"),
             GnitzSqlError::Conflict { table: Some(t) } => {
                 write!(f, "transaction conflict on table '{t}'; retry the statement")
             }
@@ -60,6 +66,7 @@ impl std::error::Error for GnitzSqlError {
             GnitzSqlError::Bind(_)
             | GnitzSqlError::Plan(_)
             | GnitzSqlError::Unsupported(_)
+            | GnitzSqlError::Internal(_)
             | GnitzSqlError::Conflict { .. } => None,
         }
     }

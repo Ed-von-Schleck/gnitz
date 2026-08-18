@@ -6,7 +6,8 @@
 //! materialises and their output types), the per-aggregate finishing metadata
 //! (`AggMapping`/`AggShape`), and the SyntheticFold reduce-output column layout
 //! (`synthetic_fold_cols`). A sibling of `ir` so `exec` keeps its documented
-//! shape (it sinks only into shared lower layers, never up into `plan`).
+//! shape (it sinks only into shared lower layers, never up into `dml` or the
+//! `hir` view compiler).
 
 use crate::ast_util::agg_func_name;
 use crate::bind::fold_null_test;
@@ -221,10 +222,10 @@ pub(crate) struct ReduceShape<'a> {
     pub(crate) source_schema: &'a Schema,
     pub(crate) group_cols: &'a [usize],
     pub(crate) specs: &'a [AggSpec],
-    /// `source_schema.reduce_out_key(group_cols)` — derived, never passed in.
+    /// `source_schema.reduce_out_key(group_cols)`, a field rather than a method
+    /// because `reduce_out_key` allocates two `Vec<u32>` per call and every read
+    /// path reads it repeatedly.
     pub(crate) out_key: ReduceOutKey,
-    /// An empty group set: the ungrouped global aggregate that grounds to one row.
-    pub(crate) global_ground: bool,
     pub(crate) source_replicated: bool,
 }
 
@@ -237,12 +238,16 @@ impl<'a> ReduceShape<'a> {
     ) -> Self {
         ReduceShape {
             out_key: source_schema.reduce_out_key(group_cols),
-            global_ground: group_cols.is_empty(),
             source_schema,
             group_cols,
             specs,
             source_replicated,
         }
+    }
+
+    /// An empty group set: the ungrouped global aggregate that grounds to one row.
+    pub(crate) fn global_ground(&self) -> bool {
+        self.group_cols.is_empty()
     }
 }
 
@@ -256,7 +261,7 @@ impl<'a> ReduceShape<'a> {
 /// per-op reconstruction. One home for the view path and the HIR reduce shell.
 pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
     let (source_schema, agg_specs) = (sh.source_schema, sh.specs);
-    let is_global = sh.global_ground;
+    let is_global = sh.global_ground();
     // Every layout ends with one `_agg` column per physical spec, at the spec's
     // own type and the shared per-spec nullability rule.
     let agg_cols = |cols: &mut Vec<ColumnDef>| {
@@ -337,7 +342,7 @@ pub(crate) fn emit_reduce(
     // the result depend on the worker count — those keep the deterministic funnel.
     // `two_phase ⊆ global_ground`: it is the distributable refinement of the
     // ungrouped (empty group set) case, so it reuses that predicate.
-    let two_phase = sh.global_ground
+    let two_phase = sh.global_ground()
         && !sh.source_replicated
         && all_linear
         && !agg_specs
@@ -375,7 +380,7 @@ pub(crate) fn emit_reduce(
             filtered,
             &reduce_group_cols,
             &circuit_specs,
-            sh.global_ground,
+            sh.global_ground(),
             sh.out_key,
         )
     } else {
@@ -383,7 +388,7 @@ pub(crate) fn emit_reduce(
             filtered,
             &reduce_group_cols,
             &circuit_specs,
-            sh.global_ground,
+            sh.global_ground(),
             sh.out_key,
         )
     }

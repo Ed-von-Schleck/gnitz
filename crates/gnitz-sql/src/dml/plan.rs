@@ -9,7 +9,7 @@
 use crate::access::{best_index_bound, pk_point_tuple, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate};
 use crate::ast_util::expr_usize_literal;
 use crate::error::GnitzSqlError;
-use crate::expr_lower::compile_wire_predicate;
+use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
 use gnitz_core::{ClientError, GnitzClient, IndexMeta, PkTuple, Schema, ZSetBatch};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
@@ -52,6 +52,23 @@ pub(crate) struct AccessPlan<'e> {
 }
 
 impl<'e> AccessPlan<'e> {
+    /// The plan for `bound`, its predicate compiled from `residual`. The one
+    /// constructor that pairs them, so a plan cannot carry a predicate that is not
+    /// its own residual's — the invariant every rung of the ladder below relies on.
+    fn new(
+        bound: ReadBound,
+        where_expr: Option<&'e BoundExpr>,
+        residual: Vec<&'e BoundExpr>,
+        schema: &Schema,
+    ) -> Result<Self, GnitzSqlError> {
+        Ok(AccessPlan {
+            predicate: compile_wire_conjuncts(&residual, &schema.columns)?,
+            bound,
+            where_expr,
+            residual,
+        })
+    }
+
     /// What a DML verb must do about the transaction's own buffered rows, which
     /// no server-side walk ever saw: the key set to restrict them to (`None` =
     /// every PK the transaction touched), and the conjuncts to re-impose on them.
@@ -67,7 +84,7 @@ impl<'e> AccessPlan<'e> {
     /// The keys are derived here rather than at plan time: only a DML statement
     /// inside an open transaction asks, and a max-size gather is megabytes of
     /// `PkTuple`.
-    pub fn buffered_scope(&self, schema: &Schema) -> (Option<Vec<PkTuple>>, &[&'e BoundExpr]) {
+    pub(crate) fn buffered_scope(&self, schema: &Schema) -> (Option<Vec<PkTuple>>, &[&'e BoundExpr]) {
         let stride = schema.pk_stride() as u8;
         let keys = match &self.bound {
             ReadBound::PkSet(keys) => Some(keys.iter().map(|&k| PkTuple::from_u128(stride, k)).collect()),
@@ -85,6 +102,9 @@ impl<'e> AccessPlan<'e> {
     /// selection. INSERT's ON CONFLICT paths need the committed rows for a key
     /// set they already hold, which is this bound with the recognizer ladder
     /// skipped rather than re-derived from a synthetic `pk IN (…)`.
+    ///
+    /// A literal rather than [`AccessPlan::new`]: with no residual there is
+    /// nothing to compile, so demanding a `schema` here would be for nothing.
     pub(super) fn for_pk_set(keys: Vec<u128>) -> Self {
         AccessPlan {
             bound: ReadBound::PkSet(keys),
@@ -156,12 +176,7 @@ where
     F: FnMut() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
 {
     let Some(bound_where) = where_expr else {
-        return Ok(AccessPlan {
-            bound: ReadBound::None,
-            predicate: Vec::new(),
-            where_expr: None,
-            residual: Vec::new(),
-        });
+        return AccessPlan::new(ReadBound::None, None, Vec::new(), schema);
     };
 
     // `pk IN (…)` → an exact gather of those keys, with the remaining conjuncts as
@@ -170,13 +185,7 @@ where
     let gather = try_extract_pk_in(bound_where, schema)
         .filter(|(keys, _)| budget == ReadBudget::MayChunk || keys.len() <= gnitz_wire::MAX_PK_SET_KEYS);
     if let Some((keys, residual)) = gather {
-        let predicate = compile_read_spec_predicate(&residual, schema)?;
-        return Ok(AccessPlan {
-            bound: ReadBound::PkSet(keys),
-            predicate,
-            where_expr,
-            residual,
-        });
+        return AccessPlan::new(ReadBound::PkSet(keys), where_expr, residual, schema);
     }
 
     // A PK equality / range → a byte-exact bounded PK walk; the residual (the WHERE
@@ -204,13 +213,7 @@ where
                 }
             }
         }
-        let predicate = compile_read_spec_predicate(&residual, schema)?;
-        return Ok(AccessPlan {
-            bound: ReadBound::PkRange(desc),
-            predicate,
-            where_expr,
-            residual,
-        });
+        return AccessPlan::new(ReadBound::PkRange(desc), where_expr, residual, schema);
     }
 
     // The best secondary-index bound, keeping its residual.
@@ -218,13 +221,7 @@ where
         return index_plan(c, bound_where, schema);
     }
 
-    let predicate = compile_read_spec_predicate(&[bound_where], schema)?;
-    Ok(AccessPlan {
-        bound: ReadBound::None,
-        predicate,
-        where_expr,
-        residual: vec![bound_where],
-    })
+    AccessPlan::new(ReadBound::None, where_expr, vec![bound_where], schema)
 }
 
 /// `Ok(None)` for the one error a ladder rung may be abandoned on — `Unsupported`
@@ -254,42 +251,23 @@ fn index_plan<'e>(
     schema: &Schema,
 ) -> Result<AccessPlan<'e>, GnitzSqlError> {
     let idx_cols = gnitz_wire::pack_pk_cols(c.idx_cols.as_slice());
-    if let Some(predicate) = if_supported(compile_read_spec_predicate(&[bound_where], schema))? {
-        return Ok(AccessPlan {
-            bound: ReadBound::IndexRange {
-                idx_cols,
-                exact: false,
-                desc: c.desc,
-            },
-            predicate,
-            where_expr: Some(bound_where),
-            residual: vec![bound_where],
-        });
+    let inexact = ReadBound::IndexRange {
+        idx_cols,
+        exact: false,
+        desc: c.desc,
+    };
+    if let Some(p) = if_supported(AccessPlan::new(inexact, Some(bound_where), vec![bound_where], schema))? {
+        return Ok(p);
     }
     // Something in the WHERE has no compiled form. The exact walk applies the
     // bounded conjuncts byte-exactly; if what is left over still cannot compile,
     // that error is the real one.
-    let predicate = compile_read_spec_predicate(&c.residual, schema)?;
-    Ok(AccessPlan {
-        bound: ReadBound::IndexRange {
-            idx_cols,
-            exact: true,
-            desc: c.desc,
-        },
-        predicate,
-        where_expr: Some(bound_where),
-        residual: c.residual,
-    })
-}
-
-/// AND-combine the bound residual conjuncts and compile to the wire predicate
-/// blob. Empty input or a statically-true predicate → an empty blob (the bound is
-/// exact).
-fn compile_read_spec_predicate(exprs: &[&BoundExpr], schema: &Schema) -> Result<Vec<u8>, GnitzSqlError> {
-    let Some(pred) = crate::ir::and_fold(exprs.iter().map(|e| (*e).clone())) else {
-        return Ok(Vec::new());
+    let exact = ReadBound::IndexRange {
+        idx_cols,
+        exact: true,
+        desc: c.desc,
     };
-    compile_wire_predicate(&pred, &schema.columns)
+    AccessPlan::new(exact, Some(bound_where), c.residual, schema)
 }
 
 // ---------------------------------------------------------------------------

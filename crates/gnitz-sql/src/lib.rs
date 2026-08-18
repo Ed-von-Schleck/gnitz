@@ -1,3 +1,5 @@
+#![warn(unreachable_pub)]
+
 mod access;
 mod agg;
 mod ast_util;
