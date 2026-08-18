@@ -224,9 +224,9 @@ impl CatalogEngine {
             return Err(format!("scan_spec: malformed index column list for table {source}"));
         }
         if exact {
-            Ok(match self.open_index_range_cursor(source, cols.as_slice(), desc, 0)? {
+            Ok(match self.open_index_range_cursor(source, cols.as_slice(), desc)? {
                 None => SourceCursor::Empty,
-                Some(c) => SourceCursor::Bounded(Box::new(c)),
+                Some(c) => SourceCursor::Bounded(c),
             })
         } else {
             self.open_bounded_source(source, cols.as_slice(), desc)

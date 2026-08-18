@@ -323,7 +323,7 @@ impl CatalogEngine {
         // the opener is a provably-empty range (a `+∞` start, or an inverted /
         // zero-width interval); the `.filter` maps the cursor's `Some(empty)`
         // ("in-range entries, none resolved") back to this API's `None`.
-        let Some(mut cur) = self.open_index_range_cursor(table_id, col_indices, range, 0)? else {
+        let Some(mut cur) = self.open_index_range_cursor(table_id, col_indices, range)? else {
             return Ok((None, src_schema));
         };
         Ok((cur.drain_chunk(usize::MAX).filter(|b| b.count > 0), src_schema))
@@ -331,39 +331,22 @@ impl CatalogEngine {
 
     /// Open an un-gated streaming cursor over the secondary-index range `range`
     /// on `col_indices` of `table_id`. `Ok(None)` = the range is provably empty
-    /// (a `+∞` start, or an inverted / zero-width interval); `Err` = the
-    /// descriptor pins every column with no range column left (a trust-boundary
-    /// rejection). No selectivity gate and no residual — the byte-exact OPK walk
+    /// (a `+∞` start, or an inverted / zero-width interval); `Err` = no such
+    /// table or index, or a descriptor that pins every column with no range
+    /// column left. No selectivity gate and no residual — the byte-exact OPK walk
     /// yields exactly the in-range source rows, so callers needing every match
     /// (the point/range seek, an `exact` ScanSpec index bound) drive this directly.
-    ///
-    /// `pk_capacity` sizes the walk's per-chunk PK scratch; `0` lets it grow.
-    ///
-    /// The one place an index-bounded cursor is built, so the write-ordering
-    /// guarantee of the non-atomic base-then-index write path lives here alone:
-    /// the index cursor snapshots first and the base cursor after, which means
-    /// every entry the walk yields already had its base row written.
     pub(crate) fn open_index_range_cursor(
-        &mut self,
+        &self,
         table_id: i64,
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
-        pk_capacity: usize,
-    ) -> Result<Option<BoundedIndexCursor>, String> {
-        let (entry, ic) = self.table_and_index(table_id, col_indices)?;
-        let Some((start, end)) = index_range_keys(ic, range)? else {
-            return Ok(None);
-        };
-        let idx = ic.table_mut().open_cursor();
-        let src = entry.open_cursor();
-        Ok(Some(BoundedIndexCursor::new(
-            idx,
-            src,
-            start,
-            end,
-            ic.key_spec,
-            pk_capacity,
-        )))
+    ) -> Result<Option<Box<BoundedIndexCursor>>, String> {
+        match self.open_index_range(table_id, col_indices, range, false) {
+            IndexScan::Cursor(c) => Ok(Some(c)),
+            IndexScan::Empty => Ok(None),
+            IndexScan::Decline(e) => Err(e),
+        }
     }
 
     /// Flush one relation's memtable and its index tables. The flush compacts
@@ -452,67 +435,89 @@ impl CatalogEngine {
     }
 
     /// The index-bounded source cursor for the range `desc` on `idx_cols` of
-    /// `source`, gated by [`Self::index_scan_verdict`]; the full-scan cursor
-    /// when the gate declines, and `SourceCursor::Empty` for a provably-empty
-    /// range. Every non-`Bounded` outcome is a performance choice, never a
-    /// correctness one — the caller's authoritative filter (a circuit's `Filter`,
-    /// a ScanSpec's residual predicate) re-imposes the range — so the non-`exact`
-    /// ScanSpec index bound and the circuit backfill share this one gate.
+    /// `source`, gated by the cost model on [`Self::open_index_range`]; the
+    /// full-scan cursor when the gate declines, and `SourceCursor::Empty` for a
+    /// provably-empty range. Every non-`Bounded` outcome is a performance choice,
+    /// never a correctness one — the caller's authoritative filter (a circuit's
+    /// `Filter`, a ScanSpec's residual predicate) re-imposes the range — so the
+    /// non-`exact` ScanSpec index bound and the circuit backfill share this one
+    /// gate.
     ///
     /// `None` iff `source` is unregistered, which callers treat as "skip this
     /// source".
     pub(crate) fn open_bounded_source(
-        &mut self,
+        &self,
         source: i64,
         idx_cols: &[u32],
         desc: &gnitz_wire::RangeDescriptor,
     ) -> Option<SourceCursor> {
-        let m = match self.index_scan_verdict(source, idx_cols, desc) {
-            IndexScan::Use(m) => m.min(self.ddl_scan_chunk_rows),
-            IndexScan::Empty => return Some(SourceCursor::Empty),
-            IndexScan::Decline => return self.full_source(source),
-        };
-        match self.open_index_range_cursor(source, idx_cols, desc, m) {
-            Ok(Some(c)) => Some(SourceCursor::Bounded(Box::new(c))),
-            Ok(None) => Some(SourceCursor::Empty),
-            Err(_) => self.full_source(source),
+        match self.open_index_range(source, idx_cols, desc, true) {
+            IndexScan::Cursor(c) => Some(SourceCursor::Bounded(c)),
+            IndexScan::Empty => Some(SourceCursor::Empty),
+            IndexScan::Decline(_) => self.full_source(source),
         }
     }
 
-    /// The only cost model. A bounded scan is not unconditionally cheaper: for a
-    /// range matching M of N rows it costs an index walk of M, an M log M sort,
-    /// and M galloping base probes, where a full scan is one sequential columnar
-    /// drain of N — so it loses badly as M → N (`WHERE indexed > 0` matches
-    /// everything). M is not estimated: it is measured exactly in O(log N) before
-    /// the first row is read (`count_range_raw` is `&self` and repositions
-    /// nothing). N comes from `estimated_rows` — arithmetic over the children's
-    /// run and shard counts — rather than a cursor's `estimated_length`, so the
-    /// base cursor is never opened speculatively.
-    fn index_scan_verdict(&self, source: i64, idx_cols: &[u32], desc: &gnitz_wire::RangeDescriptor) -> IndexScan {
-        // The index was dropped since the plan compiled, or `n_eq` pins every
-        // column with no range column left.
-        let Ok((entry, ic)) = self.table_and_index(source, idx_cols) else {
-            return IndexScan::Decline;
+    /// The one place an index-bounded walk is opened: resolve the circuit, encode
+    /// the range bounds, open the index cursor and measure the range — each
+    /// exactly once. `gate` additionally applies the cost model below, declining
+    /// an unselective range before the base cursor is opened.
+    ///
+    /// Index cursor before base cursor: `ingest_store_and_indices` writes
+    /// base-then-index non-atomically, so snapshotting the index no later than
+    /// the base is what makes every entry the walk yields already have its base
+    /// row written.
+    ///
+    /// The cost model, and the only one: a bounded scan is not unconditionally
+    /// cheaper. For a range matching M of N rows it costs an index walk of M, an
+    /// M log M sort, and M galloping base probes, where a full scan is one
+    /// sequential columnar drain of N — so it loses badly as M → N
+    /// (`WHERE indexed > 0` matches everything). M is not estimated:
+    /// `count_range_raw` measures it exactly in O(log N) off the index cursor
+    /// already open, and repositions nothing. N comes from `estimated_rows` —
+    /// arithmetic over the children's run and shard counts — rather than a
+    /// cursor's `estimated_length`, so the base cursor is never opened
+    /// speculatively. M also sizes the walk's per-chunk PK scratch exactly,
+    /// gated or not.
+    fn open_index_range(
+        &self,
+        table_id: i64,
+        col_indices: &[u32],
+        range: &gnitz_wire::RangeDescriptor,
+        gate: bool,
+    ) -> IndexScan {
+        let (entry, ic) = match self.table_and_index(table_id, col_indices) {
+            Ok(pair) => pair,
+            // Unknown table, or the index was dropped since the plan compiled.
+            Err(e) => return IndexScan::Decline(e),
         };
-        let keys = match index_range_keys(ic, desc) {
+        let (start, end) = match index_range_keys(ic, range) {
             Ok(Some(keys)) => keys,
             Ok(None) => return IndexScan::Empty,
-            Err(_) => return IndexScan::Decline,
+            // Malformed: `n_eq` pins every column with no range column left.
+            Err(e) => return IndexScan::Decline(e),
         };
-        // Only user base tables own index circuits, so a resolved index implies an
-        // owned base store; a borrowed system table degrades to the full scan.
-        let Some(store) = entry.handle.as_owned_mut() else {
-            return IndexScan::Decline;
-        };
-        let (start, end) = keys;
-        let m = ic
-            .table_mut()
-            .open_cursor()
-            .count_range_raw(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
-        if m > store.estimated_rows() / INDEX_SCAN_RATIO {
-            return IndexScan::Decline;
+        let idx = ic.table_mut().open_cursor();
+        let matches = idx.count_range_raw(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
+        if gate {
+            // Only user base tables own index circuits, so a resolved index
+            // implies an owned base store; a borrowed system table degrades to
+            // the full scan like any other decline.
+            let Some(store) = entry.handle.as_owned_mut() else {
+                return IndexScan::Decline("index owner holds no local base store".into());
+            };
+            if matches > store.estimated_rows() / INDEX_SCAN_RATIO {
+                return IndexScan::Decline("index range is not selective enough to pay for the walk".into());
+            }
         }
-        IndexScan::Use(m)
+        IndexScan::Cursor(Box::new(BoundedIndexCursor::new(
+            idx,
+            entry.open_cursor(),
+            start,
+            end,
+            ic.key_spec,
+            matches.min(self.ddl_scan_chunk_rows),
+        )))
     }
 }
 
@@ -520,15 +525,17 @@ impl CatalogEngine {
 /// local base slice.
 const INDEX_SCAN_RATIO: usize = 16;
 
-/// What the cost model says about an index-bounded scan of one range.
+/// The outcome of [`CatalogEngine::open_index_range`]. The cursor is boxed
+/// where it is built, so it reaches `SourceCursor::Bounded` without a second
+/// allocation.
 enum IndexScan {
-    /// Walk the index; the value is the exactly measured range size.
-    Use(usize),
+    Cursor(Box<BoundedIndexCursor>),
     /// The range is provably empty — there is nothing to read either way.
     Empty,
-    /// Full-scan instead: no usable index, no owned base store, or the range is
-    /// not selective enough to pay for the walk.
-    Decline,
+    /// No walk: no such table or index, a malformed descriptor, or — only under
+    /// `gate` — an unselective range or an unowned base store. The gated caller
+    /// answers this with a full scan; the ungated ones surface the message.
+    Decline(String),
 }
 
 /// A chunked source of `Batch`es over one relation, in every shape a bound can
