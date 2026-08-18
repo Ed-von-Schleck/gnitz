@@ -406,6 +406,13 @@ impl Session {
     /// master's terminal frame, so a flags-only check would silently drop it.
     /// Returns `(schema, data, terminal seek_pk)` — the scan paths read the
     /// terminal frame's `seek_pk` as the last-committed LSN.
+    ///
+    /// The concatenated batch is the Z-set **sum** of the replies, unconsolidated:
+    /// `extend_from_owned` never folds two entries sharing a `(PK, payload)`, and a
+    /// non-injective server-side projection can collide two within one reply — so
+    /// consumers must not assume unique `(PK, payload)`. The sum is correct because
+    /// the replies partition the relation: each entry lives in one worker's store,
+    /// and a replicated relation's read goes to worker 0 alone.
     #[allow(clippy::type_complexity)] // the (schema, data, terminal seek_pk) reply tuple
     fn drain_reply_train(
         &mut self,

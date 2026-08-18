@@ -1,8 +1,10 @@
 //! Ad-hoc SELECT ordering & pagination sink: ORDER BY / OFFSET / LIMIT applied
 //! as a single client-side pass over the fetched batch (base tables and views).
 //!
-//! The batch arrives as a client `ZSetBatch` — one entry per `(PK, payload)` with
-//! an integer **weight**, decoded to native little-endian (not the engine's OPK).
+//! The batch arrives as a client `ZSetBatch`: entries carrying an integer
+//! **weight**, decoded to native little-endian (not the engine's OPK). Entries
+//! are *not* unique by `(PK, payload)` — a reply train is concatenated and never
+//! folded — and the sink does not need them to be, only `weight >= 1`.
 //! So ordering is a per-type, per-column typed compare (the shared
 //! `gnitz_wire::cmp_typed_le`); there is no client `memcmp`/OPK trick. The sink
 //! sorts **before** projection so an ORDER BY key absent from the projected
@@ -343,16 +345,11 @@ fn push_identity_tiebreak(keys: &mut Vec<SortKey>, schema: &Schema) {
 /// `[Cᵢ, Cᵢ + wᵢ)` (cumulative weight before it); its surviving weight is
 /// `max(0, min(Cᵢ+wᵢ, hi) − max(Cᵢ, offset))`. This one overlap formula handles
 /// OFFSET mid-entry, LIMIT mid-entry, and both cuts inside the same entry. The
-/// walk requires `wᵢ ≥ 1` (the DBSP bag positivity invariant — base tables
-/// positive, UNION ALL sums positives, EXCEPT ALL clamps via `positive_diff`).
+/// walk requires `wᵢ ≥ 1`, which its one caller checks over the whole batch.
 fn paginate(weights: &[i64], offset: u64, hi: u64) -> Vec<(usize, i64)> {
     let mut cum: u64 = 0;
     let mut out = Vec::new();
     for (i, &w) in weights.iter().enumerate() {
-        debug_assert!(
-            w > 0,
-            "ordering sink: non-positive weight {w} violates the bag invariant"
-        );
         let lo_i = cum;
         let hi_i = cum.saturating_add(w as u64);
         let surviving = hi_i.min(hi).saturating_sub(lo_i.max(offset));
@@ -395,29 +392,6 @@ pub(crate) fn order_limit_passthrough(
     Ok(finish_window(schema, batch, sort_keys, offset, limit))
 }
 
-/// Apply the resolved sort keys and the OFFSET/LIMIT cut — the shared tail of
-/// both sinks. Zero-copy when there is nothing to reorder, skip, or bound.
-///
-/// A cut over a non-total order would pick an arbitrary member of each tie
-/// group, so a cut always gets the identity tiebreak appended.
-fn finish_window(
-    schema: Schema,
-    batch: ZSetBatch,
-    mut sort_keys: Vec<SortKey>,
-    offset: usize,
-    limit: Option<usize>,
-) -> (Schema, ZSetBatch) {
-    let has_cut = limit.is_some() || offset > 0;
-    if sort_keys.is_empty() && !has_cut {
-        return (schema, batch);
-    }
-    if has_cut && !sort_keys.is_empty() {
-        push_identity_tiebreak(&mut sort_keys, &schema);
-    }
-    let out = sort_window(&schema, batch, &sort_keys, offset, limit);
-    (schema, out)
-}
-
 /// Sort + window an already-server-projected ScanSpec reply by its wire
 /// `OrderKey`s (whose `col` is a full reply-schema column index — fed straight to
 /// `SortKey::new`, NOT resolved by name, so a projected-column / alias ORDER BY
@@ -439,41 +413,55 @@ pub(crate) fn read_spec_finish(
     finish_window(schema, batch, sort_keys, offset, limit)
 }
 
-/// Sort + multiplicity-window `full` by `sort_keys` (already tiebreak-extended
-/// when a LIMIT/OFFSET cut is present — the callers' job). Builds the row
-/// permutation — under a cut the appended identity tiebreak makes the
-/// comparator a total order (a consolidated batch has unique (PK, payload)),
-/// so stability is vacuous and an unstable partial selection is exact: every
-/// entry carries weight ≥ 1, so the first `offset + limit` entries always
-/// cover the whole logical window; without a cut, a stable sort so ties keep
-/// their fetch order. Then walks the logical window and gathers the survivors,
-/// moving each row's String/Blob cells out of the owned `full` (every source
-/// row survives at most once; `full` is dropped right after). A boundary entry
+/// Apply the resolved sort keys and the OFFSET/LIMIT cut — the shared tail of
+/// both sinks, returning the schema unchanged. Zero-copy when there is nothing
+/// to reorder, skip, or bound.
+///
+/// A cut over a non-total order would pick an arbitrary member of each tie
+/// group, so a cut appends the identity tiebreak; every tie is then between
+/// *identical* rows, and an unstable partial selection is exact however it
+/// splits a tie group. Without a cut, a stable sort so ties keep their fetch
+/// order. Then the logical window is walked and the survivors gathered, moving
+/// each row's String/Blob cells out of the owned `full` (every source row
+/// survives at most once; `full` is dropped right after). A boundary entry
 /// keeps its window-clipped multiplicity.
-fn sort_window(
-    schema: &Schema,
+fn finish_window(
+    schema: Schema,
     mut full: ZSetBatch,
-    sort_keys: &[SortKey],
+    mut sort_keys: Vec<SortKey>,
     offset: usize,
     limit: Option<usize>,
-) -> ZSetBatch {
+) -> (Schema, ZSetBatch) {
     let has_cut = limit.is_some() || offset > 0;
+    if sort_keys.is_empty() && !has_cut {
+        return (schema, full);
+    }
+    // Bag positivity, the precondition of both steps below: the cut keeps
+    // `offset + limit` entries because each covers at least one logical row, and
+    // `paginate` sums weights into a running position. Checked over the whole
+    // batch, before the cut can discard the violator unseen.
+    debug_assert!(
+        full.weights.iter().all(|&w| w > 0),
+        "ordering sink: non-positive weight violates the bag invariant"
+    );
+
     let n = full.len();
     let mut perm: Vec<usize> = (0..n).collect();
     if !sort_keys.is_empty() {
         if has_cut {
+            push_identity_tiebreak(&mut sort_keys, &schema);
             if let Some(l) = limit {
                 let k = offset.saturating_add(l).min(n);
                 if k == 0 {
                     perm.clear();
                 } else if k < n {
-                    perm.select_nth_unstable_by(k - 1, |&ra, &rb| cmp_rows(&full, sort_keys, ra, rb));
+                    perm.select_nth_unstable_by(k - 1, |&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
                     perm.truncate(k);
                 }
             }
-            perm.sort_unstable_by(|&ra, &rb| cmp_rows(&full, sort_keys, ra, rb));
+            perm.sort_unstable_by(|&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
         } else {
-            perm.sort_by(|&ra, &rb| cmp_rows(&full, sort_keys, ra, rb));
+            perm.sort_by(|&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
         }
     }
 
@@ -481,15 +469,15 @@ fn sort_window(
     let hi = limit.map_or(u64::MAX, |l| off.saturating_add(l as u64));
     let ordered_weights: Vec<i64> = perm.iter().map(|&r| full.weights[r]).collect();
     let surviving_rows = paginate(&ordered_weights, off, hi);
-    let gather = RowGather::new(schema);
-    let mut gathered = ZSetBatch::with_capacity(schema, surviving_rows.len());
+    let gather = RowGather::new(&schema);
+    let mut gathered = ZSetBatch::with_capacity(&schema, surviving_rows.len());
     for (pos, surviving) in surviving_rows {
         gather.take(&mut full, perm[pos], &mut gathered);
         // The gather copied the weight verbatim; overwrite with the
         // window-clipped multiplicity (a boundary entry keeps a reduced one).
         *gathered.weights.last_mut().unwrap() = surviving;
     }
-    gathered
+    (schema, gathered)
 }
 
 #[cfg(test)]
@@ -744,6 +732,69 @@ mod tests {
         assert_eq!(out.len(), 1, "one entry survives");
         assert_eq!(out.weights[0], 2, "clipped to weight 2");
         let _ = out_schema;
+    }
+
+    /// Expand a windowed `kv_schema` batch into its logical rows — each entry
+    /// repeated by its weight. The bag is the only thing a cut is a function of;
+    /// *which* of several entries sharing an identity survives is not.
+    fn expand_kv(schema: &Schema, out: &ZSetBatch) -> Vec<(u64, Option<i64>)> {
+        let v_ci = schema.columns.iter().position(|c| c.name == "v").unwrap();
+        let mut rows = Vec::new();
+        for i in 0..out.len() {
+            let v = if null_word_get(out.nulls[i], schema.payload_idx(v_ci)) {
+                None
+            } else if let ColData::Fixed(buf) = &out.columns[v_ci] {
+                Some(i64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
+            } else {
+                None
+            };
+            for _ in 0..out.weights[i] {
+                rows.push((out.pks.get(i) as u64, v));
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn cut_splitting_a_tie_group_matches_the_consolidated_input() {
+        // Three entries share one identity (weights 1, 1, 3) plus one larger row:
+        // n = 4, k = 2, so the partial selection keeps two of the three tied
+        // entries and splits the tie group. The result must be the same bag the
+        // consolidated batch (one weight-5 entry) yields — duplicate
+        // (PK, payload) is not a precondition the cut may assume.
+        let schema = kv_schema();
+        let q = parse_query("SELECT id, v FROM t ORDER BY v LIMIT 2");
+
+        let mut dup = ZSetBatch::new(&schema);
+        for w in [1i64, 1, 3] {
+            push_kv(&mut dup, 1, Some(10), None, w);
+        }
+        push_kv(&mut dup, 2, Some(20), None, 1);
+
+        let mut folded = ZSetBatch::new(&schema);
+        push_kv(&mut folded, 1, Some(10), None, 5);
+        push_kv(&mut folded, 2, Some(20), None, 1);
+
+        let (s_dup, out_dup) = order_limit_passthrough(schema.clone(), dup, q.order_by.as_ref(), 0, Some(2)).unwrap();
+        let (s_folded, out_folded) = order_limit_passthrough(schema, folded, q.order_by.as_ref(), 0, Some(2)).unwrap();
+
+        assert_eq!(expand_kv(&s_dup, &out_dup), vec![(1, Some(10)); 2]);
+        assert_eq!(expand_kv(&s_dup, &out_dup), expand_kv(&s_folded, &out_folded));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "non-positive weight violates the bag invariant")]
+    fn cut_names_a_ghost_it_would_discard_unseen() {
+        // n = 3, k = 2 — the ghost sorts last, so the truncation drops it and the
+        // multiplicity walk never reaches it. Only the whole-batch check sees it.
+        let schema = kv_schema();
+        let q = parse_query("SELECT id, v FROM t ORDER BY v LIMIT 2");
+        let mut b = ZSetBatch::new(&schema);
+        push_kv(&mut b, 1, Some(10), None, 1);
+        push_kv(&mut b, 2, Some(20), None, 1);
+        push_kv(&mut b, 3, Some(30), None, 0);
+        let _ = order_limit_passthrough(schema, b, q.order_by.as_ref(), 0, Some(2));
     }
 
     #[test]
