@@ -21,7 +21,7 @@ use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le};
 mod access;
 mod open;
 
-pub(super) use crate::foundation::posix_io::Mmap;
+pub(super) use crate::foundation::posix_io::{Advice, Mmap};
 
 // ---------------------------------------------------------------------------
 // Region views — every fixed-width region as one (offset, stride) pair

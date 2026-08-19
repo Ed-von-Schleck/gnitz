@@ -18,7 +18,7 @@ use super::super::batch::{
 use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::xor8;
-use super::{MappedShard, Mmap, PackedRegion, PayloadRegion, RegionView, WeightRegion};
+use super::{Advice, MappedShard, Mmap, PackedRegion, PayloadRegion, RegionView, WeightRegion};
 use crate::foundation::xxh;
 use gnitz_wire::{read_i64_le, read_u64_le};
 
@@ -30,7 +30,15 @@ impl MappedShard {
     ) -> Result<Self, StorageError> {
         // `Mmap`'s Drop unmaps the file on any early `?` return below — no
         // manual cleanup needed in the validation path.
-        let mmap = Mmap::open_ro(path).map_err(|e| match e.raw_os_error() {
+        // `validate_checksums` means "xxh3 every region now" — the only open
+        // that reads the file front to back. The rest binary-search payload
+        // regions left demand-paged, where readahead is I/O never used.
+        let advice = if validate_checksums {
+            Advice::Sequential
+        } else {
+            Advice::Default
+        };
+        let mmap = Mmap::open_ro(path, advice).map_err(|e| match e.raw_os_error() {
             Some(n) => StorageError::Io(n),
             // `open_ro` reports a zero-length file with no errno; that is the
             // same "shorter than the header" verdict as the check below.

@@ -18,10 +18,11 @@ fn next_blob_id() -> u64 {
     BLOB_ID_CTR.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Minimum allocation size to request transparent hugepage backing.
-/// Below this, hugepage promotion is impossible (no full 2MB PMD region).
-/// Also the pool's recycle ceiling (`batch_pool::MAX_RECYCLE_CAPACITY`).
-pub(super) const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
+/// The one boundary between "serve from the buffer pool" and "allocate fresh".
+/// `batch_pool::MAX_RECYCLE_CAPACITY` aliases it, so it is also the pool's only
+/// bound on bytes (`MAX_POOLED` bounds its count) — what stops one outsized
+/// buffer from trapping memory for the process's lifetime.
+pub(super) const POOL_BYPASS_BYTES: usize = 2 * 1024 * 1024;
 
 /// Cost of relocating one German-string cell, in bytes of whole-heap memcpy — the
 /// unit that lets [`Batch::should_relocate_blob`] weigh the two arms with one
@@ -113,9 +114,10 @@ pub(in crate::storage) fn debug_poison(bytes: &mut [u8]) {
 
 /// The one arena-provisioning path for batch data/blob buffers.
 ///
-/// Sizes `>= HUGEPAGE_THRESHOLD` bypass the pool entirely: a fresh allocation
-/// plus `madvise(MADV_HUGEPAGE)` so the kernel backs first-touch with 2MB pages
-/// instead of 4KB ones. A pooled buffer would carry no hugepage advice.
+/// Sizes `>= POOL_BYPASS_BYTES` allocate fresh: the pool retains nothing above
+/// that size, so probing it would pop the LIFO head, find it undersized, and
+/// discard a hot buffer for nothing. (Exactly at the boundary a pooled buffer
+/// could have served; the bypass gives up that one size to stay one compare.)
 ///
 /// Below the threshold the pool is tried first; an undersized pooled buffer is
 /// evicted rather than grown in place — `Vec::reserve` on a too-small buffer
@@ -138,10 +140,8 @@ pub(in crate::storage) fn acquire_arena(size: usize, fill: Fill) -> Vec<u8> {
         }
     }
 
-    if size >= HUGEPAGE_THRESHOLD {
-        let mut v = fresh(size, &fill);
-        crate::foundation::posix_io::madvise_hugepage(v.as_mut_ptr(), v.capacity());
-        return v;
+    if size >= POOL_BYPASS_BYTES {
+        return fresh(size, &fill);
     }
     let mut buf = super::batch_pool::acquire_buf();
     if buf.capacity() < size {
@@ -435,8 +435,9 @@ impl Batch {
     /// uninitialized memory from that row on regardless.
     ///
     /// Skipping the memset is worth 11–14% of scatter time
-    /// (`write_to_batch_arena_provision_bench`), and a real one above
-    /// `HUGEPAGE_THRESHOLD`.
+    /// (`write_to_batch_arena_provision_bench`), and more above
+    /// `POOL_BYPASS_BYTES`, where every arena is a fresh allocation whose pages
+    /// the memset would fault in.
     ///
     /// Publishing `count` before filling is fine (`capacity_writer` does it);
     /// leaving a counted cell unwritten is not — it holds recycled bytes,

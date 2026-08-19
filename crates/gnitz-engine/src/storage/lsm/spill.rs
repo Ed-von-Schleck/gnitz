@@ -35,7 +35,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::heap::{HeapNode, LoserTree};
 use crate::foundation::posix_io;
-use crate::foundation::posix_io::Mmap;
+use crate::foundation::posix_io::{Advice, Mmap};
 use crate::schema::key::compare_pk_bytes;
 
 /// Sort `idx` (rebuilt as `0..flat.len()/stride`) by the byte-lexicographic
@@ -167,8 +167,8 @@ impl SpillSort {
         let stride = self.stride;
         let total: usize = self.runs.iter().sum();
         let fd = self.spill.as_ref().expect("spill fd after >= 1 run").as_raw_fd();
-        let map =
-            Mmap::from_fd(fd, total * stride).map_err(|e| format!("external sort: mmap spill file failed: {e}"))?;
+        let map = Mmap::from_fd(fd, total * stride, Advice::Sequential)
+            .map_err(|e| format!("external sort: mmap spill file failed: {e}"))?;
 
         // Per-run geometry: byte offset of each run's first record and its
         // record count. Runs are non-empty, so every source primes at row 0.

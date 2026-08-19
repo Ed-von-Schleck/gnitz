@@ -254,8 +254,8 @@ impl MappedShard {
 
         // One allocation for all fixed-stride columnar data. Materializing a
         // whole shard is among the largest single allocations the engine makes,
-        // so it goes through the shared arena path for its hugepage bypass (and
-        // its undersized-buffer eviction and debug poison).
+        // so it goes through the shared arena path for its pool bypass (and its
+        // undersized-buffer eviction and debug poison).
         let mut data = acquire_arena(total_size, Fill::Uninit);
 
         // Write each region directly into its final slice — no intermediate

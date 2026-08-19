@@ -38,11 +38,12 @@ impl Table {
     ///
     /// An absent directory is created here — this is the single choke point
     /// every file write goes through, so nothing downstream has to check.
-    /// NOCOW (btrfs; silently ignored elsewhere) is applied
-    /// to every opened fd — a cheap idempotent ioctl, and the one place that
-    /// covers dirs created lazily here as well as dirs pre-created by the
-    /// catalog's layout staging (index dirs), so files written into either
-    /// inherit the flag.
+    /// NOCOW (btrfs; silently ignored elsewhere) is applied to every opened fd
+    /// — the one place that covers dirs created lazily here as well as dirs
+    /// pre-created by the catalog's layout staging (index dirs), so files
+    /// written into either inherit the flag. It is cheap only because
+    /// `try_set_nocow` skips the write when the flag is already set; the
+    /// re-application itself is a btrfs transaction commit.
     pub(super) fn open_dirfd(&self) -> Result<OwnedFd, StorageError> {
         let dir_c = super::super::cstr(self.directory.as_str())?;
         let fd = match open_owned(&dir_c, libc::O_RDONLY | libc::O_DIRECTORY) {

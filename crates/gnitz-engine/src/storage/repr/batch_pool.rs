@@ -47,11 +47,11 @@ pub(crate) mod tls_pool {
 }
 
 /// Buffers larger than this are dropped on recycle rather than pooled. Data
-/// buffers already bypass the pool on allocation at this size (they want
-/// `MADV_HUGEPAGE`, which a pooled buffer would not carry); blob buffers have no
-/// such bypass, so this cap prevents a large-string outlier from trapping memory
+/// buffers already bypass the pool on allocation at this size, so the cap only
+/// ever fires for them redundantly; blob buffers have no such bypass, and for
+/// those it is what prevents a large-string outlier from trapping memory
 /// permanently.
-const MAX_RECYCLE_CAPACITY: usize = super::batch::HUGEPAGE_THRESHOLD;
+const MAX_RECYCLE_CAPACITY: usize = super::batch::POOL_BYPASS_BYTES;
 
 thread_local! {
     static BUF_POOL: Cell<Vec<Vec<u8>>> = const { Cell::new(Vec::new()) };
