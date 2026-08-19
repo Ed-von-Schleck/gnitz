@@ -7,8 +7,10 @@
 //! they stay `#[inline]` and monomorphic so producer and consumer keys agree.
 
 use crate::foundation::xxh::{self, RowHasher};
-use crate::schema::{ColumnLocator, SchemaDescriptor};
+use crate::schema::{ColumnLocator, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, MemBatch};
+
+use super::util::{hash_group_col, ieee_order_bits, ieee_order_bits_f32};
 
 /// Set every row's PK to a hash of its full payload content. Identical row
 /// content (including null pattern and string/blob bytes) yields an identical
@@ -114,6 +116,16 @@ enum PromoteKind {
     /// STRING/BLOB payload: sign-agnostic XXH3 hash key. The only source that is
     /// not a scalar cell the OPK encoders can consume.
     String { pi: usize },
+    /// Group-key presence bitmap (one leading `U8` slot): bit *i* is set iff
+    /// packed column *i* is NULL. Reads the packer's `group` extras.
+    Bitmap,
+    /// Group-key float slot: the `ieee_order_bits` image, big-endian in a `U64`
+    /// slot. Order-preserving where the raw bits are not, and matching the
+    /// `total_cmp` order the group comparator uses.
+    Float(ColumnLocator),
+    /// Group-key overflow fold (one trailing `U128` slot): the 128-bit hash of
+    /// every group column past the packed prefix.
+    Fold,
 }
 
 /// Per-column classifier for "read a source column, project it to OPK PK
@@ -162,6 +174,11 @@ struct ColPromoter {
     out_off: usize,
     out_size: usize,
     out_tc: u8,
+    /// Group-key mode: the source column is nullable, so a NULL zeroes the slot
+    /// and the presence bitmap carries the NULL-ness instead. A stale or
+    /// arbitrary cell under a NULL would otherwise split one group in two.
+    /// Never set on a join key — those are NULL-gated upstream.
+    nullable: bool,
     kind: PromoteKind,
 }
 
@@ -170,6 +187,7 @@ impl ColPromoter {
         out_off: 0,
         out_size: 0,
         out_tc: 0,
+        nullable: false,
         kind: PromoteKind::String { pi: 0 },
     };
 
@@ -181,7 +199,13 @@ impl ColPromoter {
     /// to `encode_pk_column` when the slot type equals the source type, so an
     /// unpromoted column costs no decode/re-encode round trip.
     #[inline]
-    fn write_into(&self, dst: &mut [u8], batch: &MemBatch, row: usize) {
+    fn write_into(&self, dst: &mut [u8], batch: &MemBatch, row: usize, packer: &ReindexPacker) {
+        if self.nullable
+            && matches!(self.kind, PromoteKind::Col(loc) | PromoteKind::Float(loc) if loc.is_null(batch, row))
+        {
+            dst.fill(0);
+            return;
+        }
         match self.kind {
             PromoteKind::Col(loc) => {
                 let src = loc.bytes(batch, row);
@@ -203,6 +227,41 @@ impl ColPromoter {
             }
             // Synthetic XXH3 content hash (unsigned U128): OPK == big-endian.
             PromoteKind::String { pi } => dst.copy_from_slice(&read_string(batch, pi, row).to_be_bytes()),
+            PromoteKind::Bitmap => {
+                let g = packer
+                    .group
+                    .as_ref()
+                    .expect("bitmap slot only exists in group-key mode");
+                let null_word = batch.get_null_word(row);
+                let mut bits = 0u8;
+                for (i, loc) in g.packed.iter().enumerate() {
+                    if let ColumnLocator::Payload { slot, .. } = *loc {
+                        bits |= u8::from(gnitz_wire::null_word_get(null_word, slot as usize)) << i;
+                    }
+                }
+                dst[0] = bits;
+            }
+            // The order-encoded image, big-endian: an ascending float is an
+            // ascending unsigned slot, so the packed key stays OPK.
+            PromoteKind::Float(loc) => {
+                let mut scratch = [0u8; 16];
+                let src = loc.native_le_bytes(batch, row, &mut scratch);
+                let enc = if loc.type_code() == crate::schema::type_code::F32 {
+                    ieee_order_bits_f32(u32::from_le_bytes(src[..4].try_into().unwrap()))
+                } else {
+                    ieee_order_bits(u64::from_le_bytes(src[..8].try_into().unwrap()))
+                };
+                dst.copy_from_slice(&enc.to_be_bytes());
+            }
+            PromoteKind::Fold => {
+                let g = packer.group.as_ref().expect("fold slot only exists in group-key mode");
+                let null_word = batch.get_null_word(row);
+                let mut hasher = RowHasher::new();
+                for &loc in &g.folded {
+                    hash_group_col(&mut hasher, batch, row, null_word, loc);
+                }
+                dst.copy_from_slice(&hasher.digest128().to_be_bytes());
+            }
         }
     }
 }
@@ -216,6 +275,17 @@ pub(crate) struct ReindexPacker {
     cols: [ColPromoter; crate::schema::MAX_PK_COLUMNS], // first `num_cols` valid
     num_cols: usize,
     pub(crate) out_stride: usize,
+    /// Present iff this packer was built by [`ReindexPacker::new_group_key`] —
+    /// the source columns the presence-bitmap and overflow-fold slots read.
+    group: Option<GroupKeyExtras>,
+}
+
+/// The two group-key slots that read source columns other than their own: the
+/// presence bitmap (over the packed prefix) and the overflow fold (over the
+/// columns behind it).
+struct GroupKeyExtras {
+    packed: Vec<ColumnLocator>,
+    folded: Vec<ColumnLocator>,
 }
 
 impl ReindexPacker {
@@ -268,6 +338,7 @@ impl ReindexPacker {
                 out_off,
                 out_size,
                 out_tc,
+                nullable: false,
                 kind,
             };
             out_off += out_size;
@@ -280,6 +351,99 @@ impl ReindexPacker {
             cols,
             num_cols: reindex_cols.len(),
             out_stride: out_off,
+            group: None,
+        }
+    }
+
+    /// Build the packer for a **group** key over `group_cols`, following
+    /// [`gnitz_wire::group_key_layout`] — the one rule the AVI schema, the
+    /// reindex output schema and this packer all read, so a group key's slots
+    /// and its bytes cannot disagree.
+    ///
+    /// Unlike a join key this is total: every group set of every arity over
+    /// every column type has a layout, because columns past the budget fold into
+    /// one trailing hash slot. That totality is what lets the reduce index every
+    /// group set instead of falling back to a per-epoch trace rescan.
+    pub(crate) fn new_group_key(schema: &SchemaDescriptor, group_cols: &[u32]) -> Self {
+        let descs: Vec<(u8, bool)> = group_cols
+            .iter()
+            .map(|&c| {
+                let col = &schema.columns[c as usize];
+                (col.type_code, col.nullable != 0)
+            })
+            .collect();
+        let layout = gnitz_wire::group_key_layout(&descs);
+        let packed: Vec<ColumnLocator> = group_cols[..layout.n_packed]
+            .iter()
+            .map(|&c| schema.locate(c as usize))
+            .collect();
+        let folded: Vec<ColumnLocator> = group_cols[layout.n_packed..]
+            .iter()
+            .map(|&c| schema.locate(c as usize))
+            .collect();
+
+        let mut cols = [ColPromoter::PLACEHOLDER; crate::schema::MAX_PK_COLUMNS];
+        let mut out_off = 0usize;
+        let mut slot = 0usize;
+        let push = |cols: &mut [ColPromoter; crate::schema::MAX_PK_COLUMNS],
+                    slot: &mut usize,
+                    out_off: &mut usize,
+                    out_tc: u8,
+                    nullable: bool,
+                    kind: PromoteKind| {
+            let out_size = gnitz_wire::wire_stride(out_tc);
+            cols[*slot] = ColPromoter {
+                out_off: *out_off,
+                out_size,
+                out_tc,
+                nullable,
+                kind,
+            };
+            *slot += 1;
+            *out_off += out_size;
+        };
+        if layout.has_bitmap {
+            push(
+                &mut cols,
+                &mut slot,
+                &mut out_off,
+                crate::schema::type_code::U8,
+                false,
+                PromoteKind::Bitmap,
+            );
+        }
+        for (i, &(tc, nullable)) in descs[..layout.n_packed].iter().enumerate() {
+            let loc = packed[i];
+            let kind = if TypeCode::from_validated_u8(tc).is_float() {
+                PromoteKind::Float(loc)
+            } else {
+                classify_promote(schema, group_cols[i] as usize)
+            };
+            push(
+                &mut cols,
+                &mut slot,
+                &mut out_off,
+                gnitz_wire::group_key_slot_type(tc),
+                nullable,
+                kind,
+            );
+        }
+        if layout.has_fold {
+            push(
+                &mut cols,
+                &mut slot,
+                &mut out_off,
+                crate::schema::type_code::U128,
+                false,
+                PromoteKind::Fold,
+            );
+        }
+        debug_assert_eq!(out_off, layout.stride());
+        ReindexPacker {
+            cols,
+            num_cols: slot,
+            out_stride: out_off,
+            group: Some(GroupKeyExtras { packed, folded }),
         }
     }
 
@@ -287,7 +451,7 @@ impl ReindexPacker {
     #[inline]
     pub(crate) fn pack_into(&self, dst: &mut [u8], batch: &MemBatch, row: usize) {
         for cp in &self.cols[..self.num_cols] {
-            cp.write_into(&mut dst[cp.out_off..cp.out_off + cp.out_size], batch, row);
+            cp.write_into(&mut dst[cp.out_off..cp.out_off + cp.out_size], batch, row, self);
         }
     }
 
@@ -357,6 +521,11 @@ mod tests {
                     }
                 }
                 PromoteKind::String { pi } => read_string(batch, pi, row),
+                // The oracle covers arity-1 *join* keys; the group-key-only
+                // slots have no single-column u128 image to compare against.
+                PromoteKind::Bitmap | PromoteKind::Float(_) | PromoteKind::Fold => {
+                    unreachable!("the arity-1 join-key oracle sees no group-key slot")
+                }
             }
         }
 
@@ -421,6 +590,11 @@ mod tests {
                         output.set_pk_at(row, h);
                     }
                 }
+                // The oracle covers arity-1 *join* keys; the group-key-only
+                // slots have no single-column image to compare against.
+                PromoteKind::Bitmap | PromoteKind::Float(_) | PromoteKind::Fold => {
+                    unreachable!("the arity-1 join-key oracle sees no group-key slot")
+                }
             }
         }
     }
@@ -459,58 +633,6 @@ mod tests {
             b.count += 1;
         }
         b
-    }
-
-    fn build_batch_uuid_payload(schema: &SchemaDescriptor, rows: &[(u64, u128)]) -> Batch {
-        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
-        for &(pk, val) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&1i64.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b
-    }
-
-    #[test]
-    fn test_promote_col_to_pk_u32_all_rows_correct() {
-        // U32 payload columns have stride 4. Passing col_size=8 to get_col_ptr gives
-        // wrong offsets for row > 0. Verify all three rows return the right value.
-        let schema = make_schema_pk_u64_payload_u32();
-        let batch = build_batch_u32_payload(&schema, &[(1, 100), (2, 200), (3, 300)]);
-        let mb = batch.as_mem_batch();
-        let promoter = PkPromoter::new(&schema, 1);
-
-        assert_eq!(promoter.promote(&mb, 0), 100u128, "row 0 U32 promote");
-        assert_eq!(
-            promoter.promote(&mb, 1),
-            200u128,
-            "row 1 U32 promote — wrong col_size corrupts this"
-        );
-        assert_eq!(promoter.promote(&mb, 2), 300u128, "row 2 U32 promote");
-    }
-
-    #[test]
-    fn test_promote_col_to_pk_uuid_preserves_high_bits() {
-        // UUID has stride 16. Passing col_size=8 truncates the high 64 bits.
-        let schema = make_schema_pk_u64_payload_uuid();
-        let uuid_a: u128 = 0x550e8400_e29b_41d4_a716_446655440000u128;
-        let uuid_b: u128 = 0xdeadbeef_cafe_1234_5678_000000000001u128;
-        let batch = build_batch_uuid_payload(&schema, &[(1, uuid_a), (2, uuid_b)]);
-        let mb = batch.as_mem_batch();
-        let promoter = PkPromoter::new(&schema, 1);
-
-        assert_eq!(
-            promoter.promote(&mb, 0),
-            uuid_a,
-            "row 0 UUID promote must keep all 128 bits"
-        );
-        assert_eq!(
-            promoter.promote(&mb, 1),
-            uuid_b,
-            "row 1 UUID promote must keep all 128 bits"
-        );
     }
 
     // -----------------------------------------------------------------------

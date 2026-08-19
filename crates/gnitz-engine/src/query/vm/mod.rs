@@ -80,16 +80,15 @@ pub(crate) enum Instr {
     },
     Reduce {
         in_reg: u16,
-        trace_in_reg: Option<u16>,
         trace_out_reg: u16,
         out_reg: u16,
         /// Index into `Program::reduce_plans` — the baked `ops::ReducePlan`
         /// carrying the schemas, group columns, aggregate descriptors, and every
         /// derived gate (linearity, key kind, emission roles, ground flags).
         plan_idx: u16,
-        // The combined AVI cursor is created fresh from its table each tick;
-        // `None` means the operator has no value index (all-linear or fallback).
-        avi_table_idx: Option<u16>,
+        /// The MIN/MAX history. The cursor is created fresh from the table each
+        /// tick; `None` means every aggregate is linear.
+        avi: Option<ReduceAvi>,
     },
 }
 
@@ -153,10 +152,7 @@ pub(crate) fn writes_state(instr: &Instr) -> bool {
 /// composite index schema, the group-key gatherer, and the value-indexed
 /// subset of the reduce's descriptors (ordinal = position) with their resolved
 /// column locators — live in `Program::avi_bakes`. The population derives
-/// `for_max`/type from each baked descriptor, matching the read side. (The
-/// Reduce read side needs only the table — `avi_table_idx` — to open a cursor
-/// against; it reads per-aggregate `for_max`/type from its own `agg_descs` by
-/// ordinal.)
+/// `for_max`/type from each baked descriptor, matching the read side.
 #[derive(Clone, Copy)]
 pub(crate) struct IntegrateAvi {
     pub table_idx: u16,
@@ -164,10 +160,20 @@ pub(crate) struct IntegrateAvi {
     pub bake_idx: u16,
 }
 
+/// The value index an `Instr::Reduce` reads: the table to open a cursor against
+/// and the bake whose `key_packer` spells the seek prefix. The two travel
+/// together so the operator's history argument cannot be half-formed — a cursor
+/// with no packer is a state the emitter cannot express.
+#[derive(Clone, Copy)]
+pub(crate) struct ReduceAvi {
+    pub table_idx: u16,
+    /// Index into `Program::avi_bakes`.
+    pub bake_idx: u16,
+}
+
 /// What an `Instr::Integrate` accumulates into. The two are exclusive by
-/// construction — `emit_reduce` gates its trace-in table on `!use_avi` — so an
-/// enum is what the emitter can actually express, where a pair of `Option`s
-/// would admit two states nothing produces.
+/// construction, so an enum is what the emitter can actually express, where a
+/// pair of `Option`s would admit two states nothing produces.
 #[derive(Clone, Copy)]
 pub(crate) enum IntegrateTarget {
     /// A trace table: index into `Program::tables`.
@@ -387,7 +393,7 @@ impl RegisterFile {
 mod tests {
     use super::*;
     use crate::ops::AggDescriptor;
-    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Layout;
     use gnitz_wire::AggFunc;
 
@@ -465,7 +471,6 @@ mod tests {
     fn push_reduce(
         b: &mut ProgramBuilder,
         in_reg: u16,
-        trace_in_reg: Option<u16>,
         trace_out_reg: u16,
         out_reg: u16,
         aggs: &[AggDescriptor],
@@ -486,11 +491,10 @@ mod tests {
         ));
         b.push(Instr::Reduce {
             in_reg,
-            trace_in_reg,
             trace_out_reg,
             out_reg,
             plan_idx,
-            avi_table_idx: None,
+            avi: None,
         });
     }
 
@@ -1108,8 +1112,8 @@ mod tests {
 
     #[test]
     fn test_reduce_sum_multi_tick() {
-        // REDUCE with SUM aggregation over a group column.
-        // Uses real tables for trace_out and trace_in.
+        // REDUCE with SUM aggregation over a group column, over a real trace_out
+        // table.
         let in_schema = make_schema(&[
             type_code::I64, // group col (payload col 0)
             type_code::I64, // agg col (payload col 1)
@@ -1122,20 +1126,16 @@ mod tests {
 
         // trace_out table
         let (trace_out_table, trace_out_ptr) = owned_table(dir.path(), "tr_out", out_schema);
-        // trace_in table (for non-linear agg, but SUM is linear — still test the path)
-        let (trace_in_table, trace_in_ptr) = owned_table(dir.path(), "tr_in", in_schema);
         // Agg descriptors: SUM of payload col 1 (schema col 2), plus the trailing
         // Count cardinality companion every all-linear reduce carries.
         let agg_descs = [
             AggDescriptor {
                 col_idx: 2,
                 agg_op: AggFunc::Sum,
-                col_type_code: TypeCode::I64,
             },
             AggDescriptor {
                 col_idx: 0,
                 agg_op: AggFunc::Count,
-                col_type_code: TypeCode::I64,
             },
         ];
         let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
@@ -1144,14 +1144,11 @@ mod tests {
         // reg 0 = input delta
         // reg 1 = trace_out (trace register for output)
         // reg 2 = raw_delta output
-        // reg 3 = trace_in (trace register for input history)
-        // reg 4 unused
 
-        // REDUCE: reads from reg 0, trace_in=reg 3, trace_out=reg 1, output=reg 2
+        // REDUCE: reads from reg 0, trace_out=reg 1, output=reg 2
         push_reduce(
             &mut builder,
             0,
-            Some(3),
             1,
             2,
             &agg_descs,
@@ -1168,25 +1165,16 @@ mod tests {
             trace_out_ptr,
         );
 
-        // INTEGRATE input → trace_in
-        push_integrate(
-            &mut builder,
-            0, // in_reg
-            trace_in_ptr,
-        );
-
         builder.push(Instr::Halt);
 
         let reg_meta = [
             RegisterMeta::delta(in_schema),
             RegisterMeta::trace(out_schema, 0),
             RegisterMeta::delta(out_schema),
-            RegisterMeta::trace(in_schema, 1),
-            RegisterMeta::delta(in_schema),
         ];
 
-        // reg 1 = trace_out (owned table 0), reg 3 = trace_in (owned table 1)
-        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table, trace_in_table], Vec::new());
+        // reg 1 = trace_out (owned table 0)
+        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table], Vec::new());
 
         // Tick 1: Insert group=1 with values 10, 20
         let input1 = make_batch_2col(
@@ -1334,30 +1322,25 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let (trace_out_table, trace_out_ptr) = owned_table(dir.path(), "ma_tr_out", out_schema);
-        let (trace_in_table, trace_in_ptr) = owned_table(dir.path(), "ma_tr_in", in_schema);
         // Two agg descriptors: COUNT(col=1) and SUM(col=1)
         let agg_descs = [
             AggDescriptor {
                 col_idx: 1, // schema col index for the val column
                 agg_op: AggFunc::Count,
-                col_type_code: TypeCode::I64,
             },
             AggDescriptor {
                 col_idx: 1, // schema col index for the val column
                 agg_op: AggFunc::Sum,
-                col_type_code: TypeCode::I64,
             },
         ];
         // GROUP BY col 0 (= pk, schema col index 0)
         let group_cols = [0u32];
 
         let mut builder = ProgramBuilder::new();
-        // reg 0 = input delta, reg 1 = trace_out, reg 2 = output,
-        // reg 3 = trace_in, reg 4 = unused
+        // reg 0 = input delta, reg 1 = trace_out, reg 2 = output
         push_reduce(
             &mut builder,
             0,
-            Some(3),
             1,
             2,
             &agg_descs,
@@ -1367,17 +1350,14 @@ mod tests {
             in_schema.reduce_out_key(&group_cols),
         );
         push_integrate(&mut builder, 2, trace_out_ptr);
-        push_integrate(&mut builder, 0, trace_in_ptr);
         builder.push(Instr::Halt);
 
         let reg_meta = [
             RegisterMeta::delta(in_schema),
             RegisterMeta::trace(out_schema, 0),
             RegisterMeta::delta(out_schema),
-            RegisterMeta::trace(in_schema, 1),
-            RegisterMeta::delta(in_schema),
         ];
-        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table, trace_in_table], Vec::new());
+        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table], Vec::new());
 
         // Input: 3 rows all with pk=1, vals 10, 20, 30
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
@@ -1403,19 +1383,16 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let (trace_out_table, trace_out_ptr) = owned_table(dir.path(), "sv_tr_out", out_schema);
-        let (trace_in_table, trace_in_ptr) = owned_table(dir.path(), "sv_tr_in", in_schema);
         // SUM of col 1 (agg_op=2 = AGG_SUM, not AGG_COUNT) plus the trailing Count
         // cardinality companion every all-linear reduce carries.
         let agg_descs = [
             AggDescriptor {
                 col_idx: 1,
                 agg_op: AggFunc::Sum,
-                col_type_code: TypeCode::I64,
             },
             AggDescriptor {
                 col_idx: 0,
                 agg_op: AggFunc::Count,
-                col_type_code: TypeCode::I64,
             },
         ];
         // GROUP BY col 0 (pk)
@@ -1425,7 +1402,6 @@ mod tests {
         push_reduce(
             &mut builder,
             0,
-            Some(2),
             1,
             3,
             &agg_descs,
@@ -1435,17 +1411,16 @@ mod tests {
             in_schema.reduce_out_key(&group_cols),
         );
         push_integrate(&mut builder, 3, trace_out_ptr);
-        push_integrate(&mut builder, 0, trace_in_ptr);
         builder.push(Instr::Halt);
 
         let reg_meta = [
             RegisterMeta::delta(in_schema),
             RegisterMeta::trace(out_schema, 0),
-            RegisterMeta::trace(in_schema, 1),
+            RegisterMeta::delta(out_schema),
             RegisterMeta::delta(out_schema),
         ];
-        // reg 1 = trace_out (owned table 0), reg 2 = trace_in (owned table 1)
-        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table, trace_in_table], Vec::new());
+        // reg 1 = trace_out (owned table 0)
+        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table], Vec::new());
 
         // Three rows all in the same group (same pk), values 10, 20, 30 → SUM=60
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);

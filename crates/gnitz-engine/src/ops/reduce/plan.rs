@@ -6,10 +6,8 @@
 
 use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode};
 
-use super::super::reindex::ReindexPacker;
 use super::super::util::GroupKeyCols;
 use super::agg::AggDescriptor;
-use super::sort::packed_sort_spec;
 use gnitz_wire::AggFunc;
 
 /// The shared typing rule (`gnitz_wire::agg_output_type`), taking the typed
@@ -62,7 +60,10 @@ pub(crate) fn build_reduce_output_schema(
             .agg_op
             .raw_output_nullable(input.columns[ad.col_idx as usize].nullable != 0, ungrouped);
         b.push(SchemaColumn::new(
-            agg_output_type(ad.agg_op, ad.col_type_code),
+            agg_output_type(
+                ad.agg_op,
+                TypeCode::from_validated_u8(input.columns[ad.col_idx as usize].type_code),
+            ),
             nullable as u8,
         ))?;
     }
@@ -75,7 +76,6 @@ pub(crate) fn build_reduce_output_schema(
 pub struct ReducePlan {
     pub(crate) input_schema: SchemaDescriptor,
     pub(crate) output_schema: SchemaDescriptor,
-    pub(crate) group_by_cols: Vec<u32>,
     pub(crate) agg_descs: Vec<AggDescriptor>,
     /// The planner's SQL-intent discriminator for the global-aggregate ground
     /// row, and the per-worker ownership of its seed (see `op_reduce`).
@@ -84,8 +84,17 @@ pub struct ReducePlan {
     // ── Derived (single home: `new`) ────────────────────────────────────────
     /// Every aggregate is linear (COUNT/SUM family): no history replay.
     pub(crate) all_linear: bool,
-    /// GROUP BY is a permutation of the source PK columns.
-    pub(crate) group_by_pk: bool,
+    /// The input PK region **is** the group key: group membership is one
+    /// `pk_bytes_eq` over the full PK window, and canonical PK order is group
+    /// order. Distinct from [`Self::out_pk_is_in_pk`] — one is about how the
+    /// *input* is keyed, the other about what the *output* row is keyed by, and
+    /// deriving both from one boolean is what made a re-keyed input
+    /// unrepresentable.
+    pub(crate) pk_is_group_key: bool,
+    /// The output PK region is the input's, laid out by `push_pk_of` and copied
+    /// verbatim — exact at every width and arity, where re-encoding a `get_pk`
+    /// u128 would be lossy past 16 bytes.
+    pub(crate) out_pk_is_in_pk: bool,
     /// Groups are visited in ascending output-PK order. Read only by the
     /// debug-only strict-ascent assertion in the group walk — the retraction
     /// probe galloping from its live position needs no flag, because
@@ -106,17 +115,12 @@ pub struct ReducePlan {
     /// Group-column comparator locators; empty on the natural-PK path
     /// (membership is the full PK byte window there).
     pub(crate) sort_descs: Vec<ColumnLocator>,
-    /// `argsort_delta`'s packed-sort fast-path spec (see `packed_sort_spec`).
-    pub(super) packed_sort: Option<(u8, TypeCode)>,
     /// Per-aggregate source-column locator, parallel to `agg_descs` — the
     /// accumulators are rebuilt per epoch, but the `locate()` walk is not.
     pub(super) agg_locs: Vec<ColumnLocator>,
-    /// AVI group-key gatherer for the combined-index read path; `Some` iff the
-    /// instruction carries a value-index table.
-    pub(super) avi_key_packer: Option<ReindexPacker>,
-    /// Baked group-key hasher for the non-linear no-index fallback's
-    /// per-trace-row routing; `Some` exactly on that path.
-    pub(super) fallback_keys: Option<GroupKeyCols>,
+    /// Baked group-key hasher — the emitted row's synthetic PK when the output
+    /// is not keyed by the input's. Unread on the `out_pk_is_in_pk` paths.
+    pub(super) group_key: GroupKeyCols,
     /// Output width of each trailing agg column — the trace read-back stride.
     pub(crate) agg_col_widths: Vec<usize>,
     /// First aggregate column's logical index (aggregates are the trailing
@@ -147,16 +151,22 @@ impl ReducePlan {
         let cbase = num_out_cols - num_aggs;
 
         let all_linear = agg_descs.iter().all(|d| d.agg_op.is_linear());
-        let group_by_pk = out_key == ReduceOutKey::PkPermutation;
+        let pk_is_group_key = out_key == ReduceOutKey::PkPermutation;
+        let out_pk_is_in_pk = out_key == ReduceOutKey::PkPermutation;
+        debug_assert!(
+            !out_pk_is_in_pk || output_schema.pk_stride() == input_schema.pk_stride(),
+            "a PK-permutation reduce copies its input PK region verbatim",
+        );
         let monotone_out_pk =
-            group_by_pk || super::super::util::single_col_canonical_group_key(input_schema, group_by_cols);
+            pk_is_group_key || super::super::util::single_col_canonical_group_key(input_schema, group_by_cols);
         // Either natural kind keys the emitted row by the group value itself, so
         // the output schema carries no group-exemplar columns.
         let use_natural_pk = out_key != ReduceOutKey::SyntheticFold;
         let track_nonlinear = has_avi
-            && agg_descs
-                .iter()
-                .any(|d| d.agg_op.uses_value_index() && !d.col_type_code.is_float());
+            && agg_descs.iter().any(|d| {
+                d.agg_op.uses_value_index()
+                    && !TypeCode::from_validated_u8(input_schema.columns[d.col_idx as usize].type_code).is_float()
+            });
 
         // A group exists iff its net cardinality (row weight) is positive; the
         // unique NULL-blind COUNT carries that signal. The disjunction spells the
@@ -167,19 +177,16 @@ impl ReducePlan {
             .flatten()
             .map(|i| i as u8);
 
-        let sort_descs: Vec<ColumnLocator> = if group_by_pk {
+        let sort_descs: Vec<ColumnLocator> = if pk_is_group_key {
             Vec::new()
         } else {
             group_by_cols.iter().map(|&c| input_schema.locate(c as usize)).collect()
         };
-        let packed_sort = packed_sort_spec(input_schema, group_by_cols);
         let agg_locs: Vec<ColumnLocator> = agg_descs
             .iter()
             .map(|d| input_schema.locate(d.col_idx as usize))
             .collect();
-        let avi_key_packer = has_avi.then(|| super::super::index::avi_key_packer(input_schema, group_by_cols));
-        let fallback_keys =
-            (!all_linear && !has_avi && !group_by_pk).then(|| GroupKeyCols::new(input_schema, group_by_cols));
+        let group_key = GroupKeyCols::new(input_schema, group_by_cols);
 
         let agg_col_widths: Vec<usize> = (0..num_aggs)
             .map(|k| output_schema.columns[cbase + k].size() as usize)
@@ -225,20 +232,18 @@ impl ReducePlan {
         ReducePlan {
             input_schema: *input_schema,
             output_schema: *output_schema,
-            group_by_cols: group_by_cols.to_vec(),
             agg_descs: agg_descs.to_vec(),
             global_ground,
             i_am_owner,
             all_linear,
-            group_by_pk,
+            pk_is_group_key,
+            out_pk_is_in_pk,
             monotone_out_pk,
             track_nonlinear,
             cardinality_idx,
             sort_descs,
-            packed_sort,
             agg_locs,
-            avi_key_packer,
-            fallback_keys,
+            group_key,
             agg_col_widths,
             cbase,
             synthetic_key: !use_natural_pk,

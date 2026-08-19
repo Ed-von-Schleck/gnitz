@@ -4,7 +4,7 @@
 //! co-group on the join key. Output schema: `[left_PK, left_payload…, right_payload…]`.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ReadCursor};
+use crate::storage::{Batch, BlobCacheGuard, ReadCursor};
 
 use super::super::cogroup::cogroup_intersection;
 use super::rowwrite::write_join_row;
@@ -52,6 +52,10 @@ pub fn op_join_delta_trace(
     // Seed at the delta size: exact for a 1:1 key match and a reasonable floor
     // otherwise. Growing from empty re-copies the whole output about twice over.
     let mut output = Batch::with_capacity(*out_schema, n);
+    // One dedup cache for the whole join: the emission is trace-major, so a
+    // `D×T` key group re-appends each side's long strings once per row of the
+    // other side.
+    let mut cache = BlobCacheGuard::acquire(out_schema, n);
 
     cogroup_intersection(consolidated, cursor, |key, range, m| {
         m.for_each_pk_group_row(key, |c| {
@@ -59,7 +63,16 @@ pub fn op_join_delta_trace(
             for i in range.clone() {
                 let w_out = consolidated.get_weight(i).wrapping_mul(w_trace);
                 if w_out != 0 {
-                    write_join_row(&mut output, &delta_mb, i, c, w_out, left_schema, right_schema);
+                    write_join_row(
+                        &mut output,
+                        &delta_mb,
+                        i,
+                        c,
+                        w_out,
+                        left_schema,
+                        right_schema,
+                        &mut cache,
+                    );
                 }
             }
         });
@@ -85,8 +98,9 @@ mod tests {
     use gnitz_wire::read_i64_le;
 
     /// Inner join delta×trace on a narrow (I32, 4-byte) signed PK. Every delta
-    /// key has a trace match; all must be found, including the smallest key
-    /// (regression guard for the byte-seek path at sub-8-byte stride).
+    /// key has a trace match; all must be found, including the smallest and a
+    /// negative one (regression guard for the byte-seek path at sub-8-byte
+    /// stride, and for the OPK sign flip a narrow signed PK carries).
     #[test]
     fn test_join_dt_i32_key_all_match() {
         use crate::storage::ReadCursor;
@@ -95,10 +109,10 @@ mod tests {
         let left_schema = make_schema_i32();
         let right_schema = make_schema_i32();
         // Trace (right): keys 1 and 2, both present.
-        let trace = Rc::new(make_i32_batch(&right_schema, &[(1, 1, 100), (2, 1, 200)]));
+        let trace = Rc::new(make_i32_batch(&right_schema, &[(-7, 1, 50), (1, 1, 100), (2, 1, 200)]));
         let mut ch = ReadCursor::over_batches(&[trace], right_schema);
-        // Delta (left): keys 1 and 2.
-        let delta = make_i32_batch(&left_schema, &[(1, 1, 10), (2, 1, 20)]);
+        // Delta (left): keys -7, 1 and 2.
+        let delta = make_i32_batch(&left_schema, &[(-7, 1, 5), (1, 1, 10), (2, 1, 20)]);
 
         let out = op_join_delta_trace(
             &delta,
@@ -107,9 +121,15 @@ mod tests {
             &right_schema,
             &join_out_schema(&left_schema, &right_schema),
         );
-        assert_eq!(out.count, 2, "both I32 keys must join (smallest key not dropped)");
-        assert_eq!(out.get_pk(0) as i32, 1);
-        assert_eq!(out.get_pk(1) as i32, 2);
+        assert_eq!(out.count, 3, "every I32 key must join (smallest key not dropped)");
+        let keys: Vec<i32> = (0..out.count)
+            .map(|i| {
+                let mut le = [0u8; 4];
+                gnitz_wire::decode_pk_column(out.get_pk_bytes(i), type_code::I32, &mut le);
+                i32::from_le_bytes(le)
+            })
+            .collect();
+        assert_eq!(keys, vec![-7, 1, 2]);
     }
 
     #[test]
@@ -226,7 +246,7 @@ mod tests {
     fn make_i32_batch(schema: &SchemaDescriptor, rows: &[(i32, i64, i64)]) -> Batch {
         let mut b = Batch::with_capacity(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
-            b.extend_pk((pk as u32) as u128);
+            b.extend_pk_bytes(&crate::test_support::opk_pk(schema, &[(pk as i64) as u128]));
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());

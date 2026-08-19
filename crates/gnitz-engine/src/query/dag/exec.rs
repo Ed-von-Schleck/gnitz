@@ -94,9 +94,15 @@ impl DagEngine {
                 // Same empty-epoch skip as `execute_sub_plan`: a pad round
                 // whose every side produced nothing runs the post VM only if
                 // it can emit from empty input (global-ground reduce).
-                if !post.can_emit_on_empty && seeds.iter().all(|(_, b)| b.count == 0) {
-                    post.vm.clear_deltas();
-                    return None;
+                if seeds.iter().all(|(_, b)| b.count == 0) {
+                    if !post.can_emit_on_empty.get() {
+                        post.vm.clear_deltas();
+                        return None;
+                    }
+                    // The ground row is minted at most once; after this pass
+                    // `trace_out` holds V₀ whether this epoch wrote it or a
+                    // previous one did.
+                    post.can_emit_on_empty.set(false);
                 }
                 Self::execute_sub_plan_multi(post, seeds)
             }
@@ -135,9 +141,13 @@ impl DagEngine {
         // empty input, skip the whole VM pass — cursor refresh + compaction
         // checks + dispatch. Clearing the deltas releases the previous real
         // epoch's batches, which the skipped epoch-start clear would have.
-        if input.count == 0 && !sub.can_emit_on_empty {
-            sub.vm.clear_deltas();
-            return None;
+        if input.count == 0 {
+            if !sub.can_emit_on_empty.get() {
+                sub.vm.clear_deltas();
+                return None;
+            }
+            // See the field doc: one pass is all the seed can ever need.
+            sub.can_emit_on_empty.set(false);
         }
         let in_reg = if source_id > 0 {
             sub.source_reg_map.get(&source_id).copied().unwrap_or(sub.in_reg)
@@ -219,14 +229,19 @@ impl DagEngine {
             return self.execute_epoch(view_id, input, src_id);
         }
 
+        // Routing comes off the one memoized `ViewMeta` the master relay also
+        // reads; the plan supplies only its executable shape. Taken before the
+        // plan borrow so the `&mut self` memo lookup and the `&self` cache read
+        // do not overlap.
+        let meta = self.view_meta(view_id);
         let plan = self.cache.get(&view_id).unwrap();
-        let is_range_join = plan.range_join_n_eq.is_some();
+        let is_range_join = meta.range_join_n_eq.is_some();
         let sides = match &plan.shape {
             PlanShape::Exchanged { sides, .. } => sides.len(),
             PlanShape::Single(_) => 0,
         };
-        let skip_output_exchange = sides == 1 && !is_range_join && plan.skips_exchange;
-        let join_scatter = sides == 0 && plan.scatter_sources.contains(&src_id);
+        let skip_output_exchange = sides == 1 && !is_range_join && meta.skips_exchange;
+        let join_scatter = sides == 0 && meta.scatter_sources.contains(&src_id);
 
         if is_range_join {
             // Arm 2 — relay the input delta first, then the exchanged pipeline.

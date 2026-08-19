@@ -15,17 +15,39 @@ pub(super) fn input_on_port(loaded: &LoadedCircuit, nid: i32, port: i32) -> Opti
         .map(|&(src, _)| src)
 }
 
+/// Source table id → its concatenated `ScatterKey` sequences. Feeds the
+/// co-partition prefix test only; the relay's pack key is
+/// [`compute_scatter_keys`], which refuses a multi-sequence scan rather than
+/// concatenating one.
 pub(crate) fn compute_join_shard_map(loaded: &LoadedCircuit) -> JoinShardMap {
     let mut join_shard_map = HashMap::new();
     for (&nid, op) in &loaded.nodes {
         if let gnitz_wire::OpNode::ScanDelta { source, .. } = op {
-            let rcs = reindex_cols_through_filters(loaded, nid);
+            let rcs = co_partition_keys(loaded, nid);
             if !rcs.is_empty() {
                 join_shard_map.insert(*source as i64, rcs);
             }
         }
     }
     join_shard_map
+}
+
+/// Source table id → the one key the master relay may pack and route that
+/// source's delta by, or `None` when the scan feeds several distinct keys and no
+/// single pack key co-partitions with the trace sides (see
+/// `compiler::load::scatter_key`). The relay must refuse a `None`, not fall back
+/// to the view's `ExchangeShard` columns: those route by a different key again.
+pub(crate) fn compute_scatter_keys(loaded: &LoadedCircuit) -> HashMap<i64, Option<Vec<(u32, u8)>>> {
+    let mut keys = HashMap::new();
+    for (&nid, op) in &loaded.nodes {
+        if let gnitz_wire::OpNode::ScanDelta { source, .. } = op {
+            if co_partition_keys(loaded, nid).is_empty() {
+                continue;
+            }
+            keys.insert(*source as i64, scatter_key(loaded, nid));
+        }
+    }
+    keys
 }
 
 pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: &ExtTables) -> HashSet<i64> {
@@ -83,7 +105,7 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
 /// source carrying a join/group reindex key, less those whose native
 /// distribution already aligns with that key (or whose partner is replicated,
 /// making the exchange unnecessary either way).
-pub(super) fn compute_scatter_sources(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> FxHashSet<i64> {
+pub(crate) fn compute_scatter_sources(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> FxHashSet<i64> {
     let join_shard_map = compute_join_shard_map(loaded);
     let co_partitioned = compute_co_partitioned(&join_shard_map, ext_tables);
     join_shard_map
@@ -118,7 +140,7 @@ pub(super) fn compute_scatter_sources(loaded: &LoadedCircuit, ext_tables: &ExtTa
 /// shard key *is* the group key (`reduce_multi` hands one column slice to both),
 /// and `ReduceOutKey` alone would be the wrong discriminator anyway — a signed or
 /// narrow single prefix column keys `SyntheticFold` and is nonetheless correct.
-pub(super) fn compute_skips_exchange(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> bool {
+pub(crate) fn compute_skips_exchange(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> bool {
     let Some((enid, shard_cols)) = super::output_exchange_shard(loaded) else {
         return false;
     };
@@ -228,38 +250,4 @@ pub(super) fn agg_value_idx_eligible(tc: TypeCode) -> bool {
     // *form* of this predicate freely, but never widen its accepted set without
     // updating those arms.
     is_fixed_int(tc as u8) || tc.is_float()
-}
-
-/// The combined AVI stores its key as a fixed-width byte prefix
-/// `group_cols ‖ ordinal(u8) ‖ av_encoded`. A group key is byte-form-eligible
-/// iff every group column is a non-nullable, fixed-width, non-float scalar (a
-/// valid PK-column type) and the composite key — group stride **plus the
-/// 1-byte ordinal plus the av value** — fits the composite PK budget
-/// (`MAX_PK_COLUMNS` columns, `MAX_PK_BYTES` bytes). The byte-form cursor
-/// (drive, seek, consolidation) orders by `compare_pk_bytes`, so any stride up
-/// to the engine PK limit is wide-safe; only column type/count and the byte
-/// budget gate eligibility. The empty global key (`gcols = []`) stays eligible
-/// (`0 + 2 ≤ MAX_PK_COLUMNS`), so a global MIN/MAX always resolves via the index.
-pub(super) fn avi_group_key_eligible(schema: &SchemaDescriptor, gcols: &[u32]) -> bool {
-    // group cols + ordinal column + av column must fit the PK-column budget.
-    if gcols.len() + 2 > crate::schema::MAX_PK_COLUMNS {
-        return false;
-    }
-    let mut stride = 0usize;
-    for &c in gcols {
-        let col = &schema.columns[c as usize];
-        if col.nullable != 0 {
-            return false;
-        }
-        // A byte-prefix group key is exactly a valid PK-column type: fixed-width,
-        // non-float, byte-comparable. Reuse the single PK-eligibility predicate
-        // rather than re-listing the variants here.
-        if !TypeCode::from_validated_u8(col.type_code).is_pk_eligible() {
-            return false; // STRING / BLOB / F32 / F64 — fall back to trace scan
-        }
-        stride += col.size() as usize;
-    }
-    // + 1 ordinal byte + the order-encoded value.
-    let key_bytes = stride + 1 + crate::ops::AVI_AV_BYTES;
-    key_bytes <= crate::schema::MAX_PK_BYTES
 }

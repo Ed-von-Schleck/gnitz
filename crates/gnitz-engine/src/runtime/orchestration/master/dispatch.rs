@@ -763,9 +763,20 @@ impl MasterDispatcher {
         // A join-shard scatter carries a per-slot promotion target; a GROUP BY /
         // set-op scatter has none, and only the join arm ever consults one.
         let meta = cat.dag.view_meta(view_id);
+        // A source whose scan feeds several distinct reindex keys has no single
+        // pack key: routing by any one of them, or by the view's `shard_cols`,
+        // would put the delta on a worker the trace side never stored under, and
+        // the join would silently drop matches. Refuse the round instead.
+        if let Some(None) = meta.join_shard_map.get(&source_id) {
+            return Err(format!(
+                "view {view_id}: source {source_id} feeds several distinct reindex keys; no single \
+                 scatter key co-partitions it"
+            ));
+        }
         let join_key = (source_id > 0)
             .then(|| meta.join_shard_map.get(&source_id))
             .flatten()
+            .and_then(|k| k.as_ref())
             .filter(|k| !k.cols.is_empty());
         let is_join = join_key.is_some();
         let shard_cols: &[u32] = match join_key {

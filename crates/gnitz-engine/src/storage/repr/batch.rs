@@ -633,28 +633,6 @@ impl Batch {
         (&mut hi[..c_end - c_off], &mut lo[n_off..n_end], &mut self.blob)
     }
 
-    /// Return a `DirectWriter` over this batch's data buffer, sized for
-    /// `capacity` rows (not `count`). Used to re-fill a batch whose allocation
-    /// is already live but whose row count has been reset (`clear()`, then
-    /// `reserve_rows`).
-    ///
-    /// The recycled data buffer is **not** re-zeroed by `clear()`, so writers
-    /// must use the unconditional-copy `scatter_*` variants — a nullable-skip
-    /// would leak stale bytes through. Caller must update `self.count` after
-    /// the writer is dropped.
-    pub(crate) fn capacity_writer(&mut self) -> merge::DirectWriter<'_> {
-        let cap = self.capacity as usize;
-        let nr = self.num_regions as usize;
-        let schema = self.schema.as_ref().expect("capacity_writer requires schema");
-        // `carve_at`, not `carve_writer_slices`: `self.offsets` was computed by
-        // `reserve_rows` for exactly `self.capacity` rows, so re-deriving it would
-        // re-walk the schema to reproduce values already in hand — and would let
-        // writer and reader disagree on region starts if the two derivations ever
-        // drifted, instead of sharing one array by construction.
-        let (pk, weight, null_bmp, col_slices) = carve_at(&mut self.data, &self.strides, nr, &self.offsets, cap);
-        merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut self.blob, schema, cap)
-    }
-
     // ── Row accessors ───────────────────────────────────────────────────
 
     #[inline(always)]
@@ -858,6 +836,11 @@ impl Batch {
     /// sign-flipped here and must use `extend_pk_opk` / `extend_pk_bytes`.
     #[inline]
     pub fn extend_pk(&mut self, pk: u128) {
+        debug_assert!(
+            self.schema.is_none_or(|s| !s.pk_has_signed_col()),
+            "extend_pk writes an unflipped right-aligned big-endian key: a PK with a signed column \
+             must use extend_pk_opk / extend_pk_bytes",
+        );
         let key = NarrowPkOpk::new(pk, self.strides[REG_PK] as usize);
         self.extend_pk_bytes(key.bytes());
     }
@@ -972,13 +955,32 @@ impl Batch {
         src: &MemBatch<'_>,
         ranges: &[(usize, usize)],
         fill: WeightFill,
+        cache: Option<&mut BlobCache>,
+    ) {
+        let mut session = AppendSession::open(self, range_rows(ranges));
+        session.push_ranges_with(src, ranges, fill, cache);
+    }
+
+    /// Open an [`AppendSession`] over this batch: the per-append setup —
+    /// the payload string-column map and the pooled blob dedup cache — resolved
+    /// once for a caller that appends many times.
+    pub(crate) fn append_session(&mut self, hint_rows: usize) -> AppendSession<'_> {
+        AppendSession::open_owning_cache(self, hint_rows)
+    }
+
+    fn append_ranges_inner(
+        &mut self,
+        src: &MemBatch<'_>,
+        ranges: &[(usize, usize)],
+        fill: WeightFill,
+        is_string_at: &[bool; MAX_BATCH_REGIONS],
         mut cache: Option<&mut BlobCache>,
     ) {
         for &(start, end) in ranges {
-            assert!(start <= end, "append_mem_batch_ranges: start ({start}) > end ({end})");
+            assert!(start <= end, "append_ranges_inner: start ({start}) > end ({end})");
             assert!(
                 end <= src.count,
-                "append_mem_batch_ranges: end ({end}) > src.count ({})",
+                "append_ranges_inner: end ({end}) > src.count ({})",
                 src.count
             );
         }
@@ -988,7 +990,6 @@ impl Batch {
         }
         self.reserve_rows(total);
         let npc = self.num_payload_cols();
-        let mut is_string_at = [false; MAX_BATCH_REGIONS];
         // A shared blob needs no per-cell relocation, so it needs no string map
         // either — every column takes the bulk region copy below.
         //
@@ -999,19 +1000,13 @@ impl Batch {
         // German-string ingress that skips `validate_string_heap_extents`.
         debug_assert!(
             self.blob_id != 0,
-            "append_mem_batch_ranges: a Batch must never carry the wire blob_id 0"
+            "append_ranges_inner: a Batch must never carry the wire blob_id 0"
         );
         let shares_blob = self.blob_id == src.blob_id && self.blob.len() == src.blob.len();
-        if let (false, Some(s)) = (shares_blob, self.schema.as_ref()) {
-            if !src.blob.is_empty() {
-                self.blob.reserve(src.blob.len());
-            }
-            for (pi, col) in s.payload_columns() {
-                if pi >= npc {
-                    break;
-                }
-                is_string_at[pi] = gnitz_wire::is_german_string(col.type_code);
-            }
+        let no_strings = [false; MAX_BATCH_REGIONS];
+        let is_string_at = if shares_blob { &no_strings } else { is_string_at };
+        if !shares_blob && !src.blob.is_empty() {
+            self.blob.reserve(src.blob.len());
         }
         for &(start, end) in ranges {
             let n = end - start;
@@ -1054,7 +1049,109 @@ impl Batch {
         }
         self.downgrade();
     }
+}
 
+/// An open append into one destination batch.
+///
+/// The per-append setup — the payload string-column map and the pooled blob
+/// dedup cache — is resolved once and reused by every push. `append_ranges`
+/// already did that for a filter's whole survivor list; a session makes it
+/// available to the callers that append a *run* at a time and were repaying it
+/// per call. `op_union`'s merge is the extreme: for a set operation the branches
+/// carry `reindex_hash_row` synthetic PKs, so two sorted streams of uniform
+/// 128-bit keys have an expected run length of 2 and the setup dominated the copy
+/// it was setting up.
+///
+/// Downgrades the destination's layout on drop-free use, exactly as a direct
+/// append does: every push goes through the same body.
+pub(crate) struct AppendSession<'d> {
+    dst: &'d mut Batch,
+    /// Payload slot → is a German string. Read only when the source's blob is not
+    /// already the destination's (a shared blob copies the 16-byte structs
+    /// verbatim), which each push re-decides per source.
+    is_string_at: [bool; MAX_BATCH_REGIONS],
+    guard: BlobCacheGuard,
+}
+
+impl<'d> AppendSession<'d> {
+    fn string_map(dst: &Batch) -> [bool; MAX_BATCH_REGIONS] {
+        let mut is_string_at = [false; MAX_BATCH_REGIONS];
+        if let Some(s) = dst.schema.as_ref() {
+            let npc = dst.num_payload_cols();
+            for (pi, col) in s.payload_columns() {
+                if pi >= npc {
+                    break;
+                }
+                is_string_at[pi] = gnitz_wire::is_german_string(col.type_code);
+            }
+        }
+        is_string_at
+    }
+
+    /// One-shot session for a single push: no pooled cache (see
+    /// `append_ranges_inner`'s doc on why acquiring one is only worth it for a
+    /// caller that copies many rows).
+    fn open(dst: &'d mut Batch, _hint_rows: usize) -> Self {
+        let is_string_at = Self::string_map(dst);
+        AppendSession {
+            dst,
+            is_string_at,
+            guard: BlobCacheGuard::empty(),
+        }
+    }
+
+    /// Session that also holds a pooled blob dedup cache for its whole life, so
+    /// repeated long-string spans are appended once across every push.
+    fn open_owning_cache(dst: &'d mut Batch, hint_rows: usize) -> Self {
+        let is_string_at = Self::string_map(dst);
+        let guard = match dst.schema {
+            Some(s) => BlobCacheGuard::acquire(&s, hint_rows),
+            None => BlobCacheGuard::empty(),
+        };
+        AppendSession {
+            dst,
+            is_string_at,
+            guard,
+        }
+    }
+
+    fn push_ranges_with(
+        &mut self,
+        src: &MemBatch<'_>,
+        ranges: &[(usize, usize)],
+        fill: WeightFill,
+        cache: Option<&mut BlobCache>,
+    ) {
+        let is_string_at = self.is_string_at;
+        self.dst.append_ranges_inner(src, ranges, fill, &is_string_at, cache);
+    }
+
+    /// Append rows `[start, end)` of `src`.
+    pub(crate) fn push_range(&mut self, src: &MemBatch<'_>, start: usize, end: usize) {
+        let is_string_at = self.is_string_at;
+        self.dst.append_ranges_inner(
+            src,
+            &[(start, end)],
+            WeightFill::Copy,
+            &is_string_at,
+            self.guard.get_mut(),
+        );
+    }
+
+    /// Append every listed range of `src`, in list order.
+    pub(crate) fn push_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
+        let is_string_at = self.is_string_at;
+        self.dst
+            .append_ranges_inner(src, ranges, WeightFill::Copy, &is_string_at, self.guard.get_mut());
+    }
+
+    /// The destination, for a caller that also writes rows directly.
+    pub(crate) fn batch(&mut self) -> &mut Batch {
+        self.dst
+    }
+}
+
+impl Batch {
     // ── Lifecycle ───────────────────────────────────────────────────────
 
     /// Create a borrowed `MemBatch` view over this batch's data.
@@ -1456,11 +1553,8 @@ impl Batch {
     /// (see `append_mem_batch_ranges`); it is a pure optimization, correct either
     /// way.
     pub fn append_ranges(&mut self, src: &Batch, ranges: &[(usize, usize)]) {
-        let mut guard = match self.schema {
-            Some(s) => BlobCacheGuard::acquire(&s, range_rows(ranges)),
-            None => BlobCacheGuard::empty(),
-        };
-        self.append_mem_batch_ranges(&src.as_mem_batch(), ranges, WeightFill::Copy, guard.get_mut());
+        self.append_session(range_rows(ranges))
+            .push_ranges(&src.as_mem_batch(), ranges);
     }
 
     /// Whether copying `row_count` rows out of a `src_count`-row source whose heap
@@ -1526,13 +1620,6 @@ impl Batch {
         col_sizes: &[u32],
         blob_src: &[u8],
     ) {
-        // extend_pk writes right-aligned BE (correct OPK only for unsigned PKs).
-        // A signed single-col PK needs the sign flip — use extend_pk_opk.
-        debug_assert!(
-            self.schema.is_none_or(|s| !s.pk_is_signed_single_col()),
-            "append_row: signed single-col PK requires extend_pk_bytes (extend_pk \
-             writes right-aligned BE without the sign flip)",
-        );
         self.ensure_row_capacity();
         self.extend_pk(pk);
         self.extend_weight(&weight.to_le_bytes());
@@ -2272,21 +2359,19 @@ mod tests {
     fn extend_pk_narrow_strides_round_trip() {
         // For each narrow stride, extend_pk writes the low `stride` bytes of
         // the u128 argument verbatim; get_pk reads them back via widen_pk_be.
-        // The (type, value, expected u128) triples mirror what
-        // extract_pk_value writes for the corresponding PK type.
+        // Unsigned types only: for them OPK *is* right-aligned big-endian, which
+        // is what `extend_pk` writes — a signed PK column carries the sign flip
+        // and must go through `extend_pk_opk` (`extend_pk` debug-asserts it).
+        // Every narrow stride is still covered.
         let cases: &[(u8, u128)] = &[
-            // I8 PK = -1: extract_pk_value writes (-1i8 as u8) as u128 = 0xFF
-            (type_code::I8, 0xFFu128),
-            // U8 PK = 200
+            // 1-byte stride
             (type_code::U8, 200u128),
-            // I16 PK = -1: low 2 bytes = 0xFFFF
-            (type_code::I16, 0xFFFFu128),
-            // U16 PK = u16::MAX
+            // 2-byte stride
             (type_code::U16, u16::MAX as u128),
-            // I32 PK = -1: low 4 bytes = 0xFFFF_FFFF
-            (type_code::I32, 0xFFFF_FFFFu128),
-            // U32 PK = u32::MAX
+            // 4-byte stride
             (type_code::U32, u32::MAX as u128),
+            // 8-byte stride
+            (type_code::U64, u64::MAX as u128),
         ];
         for &(tc, pk) in cases {
             let schema = crate::test_support::pk_i64_schema(tc);
@@ -2965,7 +3050,7 @@ mod tests {
 
         let mb = batch.as_mem_batch();
         assert_eq!(mb.count, 2);
-        assert_eq!(mb.get_pk(0), 10);
+        assert_eq!(gnitz_wire::widen_pk_be(mb.get_pk_bytes(0), mb.pk_stride as usize), 10);
         assert_eq!(mb.get_weight(1), 1);
     }
 

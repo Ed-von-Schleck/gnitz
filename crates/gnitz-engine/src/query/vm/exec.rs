@@ -3,7 +3,7 @@
 //! match arms would break monomorphization of the dispatch loop.
 
 use super::*;
-use crate::ops::{self, AviDesc};
+use crate::ops::{self, OpsIntegrateTarget};
 use crate::storage::{Batch, ReadCursor};
 
 // ---------------------------------------------------------------------------
@@ -300,76 +300,72 @@ pub(crate) fn execute_epoch_from(
                 if read_only {
                     continue;
                 }
-                let (table_idx, trace, avi_desc) = match target {
+                // The pointer pool lives here, so the `unsafe` deref does too;
+                // the operator takes a borrow.
+                let (table_idx, op_target) = match target {
                     IntegrateTarget::Trace(idx) => {
                         let ptr = program.tables[*idx as usize];
-                        (*idx, Some(unsafe { &mut *ptr }), None)
+                        (*idx, OpsIntegrateTarget::Trace(unsafe { &mut *ptr }))
                     }
-                    IntegrateTarget::Avi(a) => (
-                        a.table_idx,
-                        None,
-                        Some(AviDesc {
-                            table: program.tables[a.table_idx as usize],
-                            bake: &program.avi_bakes[a.bake_idx as usize],
-                        }),
-                    ),
+                    IntegrateTarget::Avi(a) => {
+                        let ptr = program.tables[a.table_idx as usize];
+                        (
+                            a.table_idx,
+                            OpsIntegrateTarget::Avi(unsafe { &mut *ptr }, &program.avi_bakes[a.bake_idx as usize]),
+                        )
+                    }
                 };
 
                 gnitz_debug!(
-                    "vm: INTEGRATE in_count={} trace={} avi={}",
+                    "vm: INTEGRATE in_count={} avi={}",
                     reg!(*in_reg).batch.count,
-                    trace.is_some(),
-                    avi_desc.is_some()
+                    matches!(op_target, OpsIntegrateTarget::Avi(..)),
                 );
-                let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, trace, avi_desc.as_ref());
+                let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, op_target);
                 fatal_on_tick_ingest_err("integrate", table_idx, res);
             }
 
             Instr::Reduce {
                 in_reg,
-                trace_in_reg,
                 trace_out_reg,
                 out_reg,
                 plan_idx,
-                avi_table_idx,
+                avi,
             } => {
                 let plan = &program.reduce_plans[*plan_idx as usize];
-
-                // trace_in cursor (from register file) — present only for a
-                // non-linear aggregate, which needs the input history to
-                // recompute an extreme on retraction.
-                let ti_opt: Option<&mut ReadCursor> = match trace_in_reg {
-                    Some(tr) => Some(cursor_mut!(*tr)),
-                    None => None,
-                };
                 let to_cursor = cursor_mut!(*trace_out_reg);
 
                 // Combined AVI cursor — created fresh from the value-index table
                 // (not a register). Must be created AFTER INTEGRATE populates the
                 // table, so the prefix seek returns the post-delta extreme.
                 // Operator-state read; compact first (see compact_owned_traces).
-                let mut avi_cursor_handle: Option<Box<ReadCursor>> = if let Some(idx) = avi_table_idx {
-                    let avi_ptr = program.tables[*idx as usize];
-                    let avi_table = unsafe { &mut *avi_ptr };
-                    let _ = avi_table.compact_if_needed();
-                    Some(Box::new(avi_table.open_cursor()))
-                } else {
-                    None
+                let mut avi_handle: Option<(ReduceAvi, Box<ReadCursor>)> = match avi {
+                    Some(a) => {
+                        let ptr = program.tables[a.table_idx as usize];
+                        let avi_table = unsafe { &mut *ptr };
+                        let _ = avi_table.compact_if_needed();
+                        Some((*a, Box::new(avi_table.open_cursor())))
+                    }
+                    None => None,
                 };
 
                 gnitz_debug!(
-                    "vm: REDUCE in_count={} trace_in={} avi={} aggs={}",
+                    "vm: REDUCE in_count={} avi={} aggs={}",
                     reg!(*in_reg).batch.count,
-                    ti_opt.is_some(),
-                    avi_cursor_handle.is_some(),
+                    avi_handle.is_some(),
                     plan.agg_descs.len()
                 );
 
-                let avi_opt: Option<&mut ReadCursor> = avi_cursor_handle.as_deref_mut();
-                let raw_out = ops::op_reduce(&reg!(*in_reg).batch, ti_opt, to_cursor, avi_opt, plan);
+                // The cursor and the packer that keys it arrive as one value, so
+                // the operator never re-derives which mode it is in.
+                let history = avi_handle.as_mut().map(|(a, cursor)| ops::AviHistory {
+                    cursor: cursor.as_mut(),
+                    packer: &program.avi_bakes[a.bake_idx as usize].key_packer,
+                });
+                let raw_out = ops::op_reduce(&reg!(*in_reg).batch, to_cursor, history, plan);
 
                 // Drop temporary cursor handle (returned to pool)
-                drop(avi_cursor_handle);
+                drop(avi_handle);
 
                 reg_mut!(*out_reg).batch = raw_out;
             }

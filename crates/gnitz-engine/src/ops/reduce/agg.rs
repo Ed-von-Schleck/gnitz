@@ -21,13 +21,18 @@ use gnitz_wire::{AggFunc, FixedInt};
 // there is worth nothing, and the schema stays a pure function of the
 // schema-level facts.
 
-/// Descriptor for one aggregate function. Plain data — never transmuted or
-/// serialized (the wire ships `(AggFunc, u16)` specs; consumers are field reads).
+/// Descriptor for one aggregate function — exactly the `(AggFunc, u16)` spec the
+/// wire ships. Plain data, never transmuted or serialized.
+///
+/// It carries no column *type*: the type is `schema.columns[col_idx]`, and every
+/// consumer already holds either that schema or the column's resolved
+/// [`ColumnLocator`]. A stored copy was a second spelling nothing validated —
+/// hand-built descriptors wrote the type literally, and a mismatch mis-decoded
+/// silently in [`readback_agg_bits`] rather than failing.
 #[derive(Clone, Copy)]
 pub struct AggDescriptor {
     pub col_idx: u32,
     pub agg_op: AggFunc,
-    pub col_type_code: TypeCode,
 }
 
 /// Accumulator: internal state for one aggregate column. Rebuilt per epoch, then
@@ -138,6 +143,11 @@ impl Accumulator {
 
     pub(super) fn is_linear(&self) -> bool {
         self.linear
+    }
+
+    /// The aggregated column's source type, resolved from its locator at `new`.
+    pub(super) fn type_code(&self) -> TypeCode {
+        self.tc
     }
 
     /// Delegates to [`AggFunc::empty_renders_zero`] (the agg-op rationale lives
@@ -353,7 +363,7 @@ impl Accumulator {
 ///
 /// Width-gating (not a source-type dispatch) is load-bearing: a float MIN/MAX
 /// stores `F64` bits under an `F32` source type, and COUNT can carry a
-/// non-integer source `col_type_code` (e.g. `COUNT(uuid_col)` → `UUID`) — either
+/// non-integer source type (e.g. `COUNT(uuid_col)` → `UUID`) — either
 /// would mis-decode or trip the `expect` below if dispatched on the source type.
 /// The narrow branch is reached only for narrow integers, where the widening is
 /// exactly right.
@@ -384,22 +394,19 @@ pub(super) fn readback_agg_bits(bytes: &[u8], src_tc: TypeCode) -> u64 {
 /// read + fold per non-linear aggregate, and documents that the AVI —
 /// never the fold — owns the non-linear value. The all-linear caller never
 /// skips (every accumulator is linear).
-pub(super) fn fold_old_aggs(
-    accs: &mut [Accumulator],
-    cursor: &ReadCursor,
-    agg_descs: &[AggDescriptor],
-    agg_col_widths: &[usize],
-    cbase: usize,
-) {
+pub(super) fn fold_old_aggs(accs: &mut [Accumulator], cursor: &ReadCursor, agg_col_widths: &[usize], cbase: usize) {
     for (k, acc) in accs.iter_mut().enumerate() {
-        if !agg_descs[k].agg_op.is_linear() {
+        // Linearity and the source type are already resolved on the
+        // accumulator; re-reading them off the descriptor would be a second
+        // derivation of the same two facts, per aggregate per group.
+        if !acc.is_linear() {
             continue;
         }
         if cursor.col_is_null(cbase + k) {
             continue;
         }
         if let Some(bytes) = cursor.col_bytes(cbase + k, agg_col_widths[k]) {
-            acc.merge_accumulated(readback_agg_bits(bytes, agg_descs[k].col_type_code));
+            acc.merge_accumulated(readback_agg_bits(bytes, acc.type_code()));
         }
     }
 }
@@ -447,7 +454,7 @@ pub(super) fn apply_agg_from_value_index(
     use super::super::util::AVI_AV_BYTES;
     if avi_cursor.seek_first_positive_with_prefix(group_key) {
         let k = avi_cursor.current_pk_bytes();
-        // current_pk_bytes() is the full AVI PK region; make_avi_schema lays it
+        // current_pk_bytes() is the full AVI PK region; `avi_schema` lays it
         // out as `group ‖ ordinal ‖ av_encoded`, so the trailing av bytes are
         // always in bounds for a seek prefix `group_key` of length
         // `group_stride + 1` (group plus the ordinal byte).
@@ -500,11 +507,7 @@ mod tests {
             ],
             &[0],
         );
-        let desc = AggDescriptor {
-            col_idx: 1,
-            agg_op,
-            col_type_code: TypeCode::F64,
-        };
+        let desc = AggDescriptor { col_idx: 1, agg_op };
         Accumulator::new(&desc, schema.locate(1))
     }
 

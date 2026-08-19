@@ -3,7 +3,6 @@
 use crate::foundation::xxh::RowHasher;
 
 use crate::schema::{ColumnLocator, SchemaDescriptor, TypeCode};
-use crate::storage::ReadCursor;
 use gnitz_expr::RowSource;
 
 // ---------------------------------------------------------------------------
@@ -22,7 +21,7 @@ use gnitz_expr::RowSource;
 pub(crate) const AVI_AV_BYTES: usize = 8;
 
 #[inline]
-fn ieee_order_bits(raw_bits: u64) -> u64 {
+pub(super) fn ieee_order_bits(raw_bits: u64) -> u64 {
     if raw_bits >> 63 != 0 {
         !raw_bits
     } else {
@@ -121,32 +120,19 @@ pub(super) fn decode_ordered(e: u64, col_type_code: TypeCode) -> u64 {
 /// Feed a German-string column's content into `hasher` as a length-prefixed
 /// byte run: a 4-byte LE length, then the content (following the heap pointer
 /// for long strings). The length prefix keeps "ab"+"c" from aliasing "a"+"bc"
-/// across adjacent columns. Shared by the group-key fold below and the set-op
-/// row-identity hash (`reindex_hash_row`); the two MUST agree byte-for-byte so a
-/// string key routes to — and dedups against — the partition it belongs to.
+/// across adjacent columns.
+///
+/// Shared by the group-key fold below and the set-op row-identity hash
+/// (`reindex_hash_row`) so a string column contributes the same bytes to both.
+/// The two *digests* still differ by construction and are meant to: the group
+/// fold streams each column's canonical `route_key` under a `1`/`0` null marker,
+/// the row hash streams raw native cell bytes under the inverted marker and a
+/// leading branch discriminator. Only this per-column body is shared.
 #[inline]
 pub(super) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &[u8], blob: &[u8]) {
     let content = gnitz_wire::german_string_content(struct_bytes, blob);
     hasher.update(&(content.len() as u32).to_le_bytes());
     hasher.update(content);
-}
-
-/// The 128-bit group key of the **empty** group-column set — the constant `V₀` a
-/// global (ungrouped) aggregate folds to. Batch-free: identical to the XXH3 empty
-/// digest `extract_group_key(.., &[])` produces over any populated row (the
-/// zero-column fold reads no row content), but without touching a batch, so it is
-/// callable at emit time (no batch exists) and over an empty delta — where
-/// `extract_group_key`'s unconditional `null_word()` read would index an empty
-/// slice and panic (a safe slice index, so it panics in release too). The engine's
-/// seam onto `V₀`: the owner-bake's `worker_for_key`, the seed's
-/// `emit_global_ground` PK and `trace_out` probe all route through this, while the
-/// runtime router and PK-stamp use the equal `extract_group_key` over a real row —
-/// so every site agrees byte-for-byte with no embedded literal. `V₀` itself is
-/// defined in `gnitz-wire`, so the SQL side's synthesized ground row shares the
-/// constant rather than restating it.
-#[inline]
-pub(crate) fn global_group_key() -> u128 {
-    gnitz_wire::global_group_key()
 }
 
 /// Whether the group key of `group_by_cols` can be emitted through the
@@ -180,13 +166,19 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
 /// Hash one group column into the fold-path digest. The single per-column
 /// body shared by the schema-walking [`extract_group_key`] and the baked
 /// [`GroupKeyCols::key_row`] — a divergence would silently merge or split
-/// groups in the non-linear REDUCE fallback (wrong MIN/MAX).
+/// groups (a wrong output PK, and a wrong AVI bucket).
 ///
 /// Reads the null bit unconditionally, like the sibling `compare_by_group_cols`:
 /// a NOT NULL column never carries one, so masking it off would cost a per-row
 /// AND to change nothing.
 #[inline]
-fn hash_group_col<R: RowSource>(hasher: &mut RowHasher, src: &R, row: usize, null_word: u64, loc: ColumnLocator) {
+pub(super) fn hash_group_col<R: RowSource>(
+    hasher: &mut RowHasher,
+    src: &R,
+    row: usize,
+    null_word: u64,
+    loc: ColumnLocator,
+) {
     match loc {
         ColumnLocator::Pk { .. } => {
             // PK columns are non-nullable; canonical OPK-derived route key, so
@@ -221,49 +213,13 @@ fn hash_group_col<R: RowSource>(hasher: &mut RowHasher, src: &R, row: usize, nul
     }
 }
 
-/// Extract the 128-bit group key of one row — the one group-key hash body,
-/// generic over any [`RowSource`] row: a `MemBatch` row and a `ReadCursor`'s
-/// current row hash byte-identically, so a trace row routes to the delta group
-/// it belongs to.
-#[inline]
-pub(super) fn extract_group_key<R: RowSource>(
-    src: &R,
-    row: usize,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-) -> u128 {
-    // Canonical single-column fast path, dispatched by the shared
-    // `single_col_canonical_group_key` classifier (see its doc). Nullable
-    // columns (the hash loop handles NULL distinctly) and STRING/BLOB/F32/F64
-    // fall through to the hash loop — a zero-extended content prefix is not a
-    // valid routing key for them.
-    if single_col_canonical_group_key(schema, group_by_cols) {
-        return schema.locate(group_by_cols[0] as usize).route_key(src, row);
-    }
-
-    // Fold path: multi-column GROUP BY, a single STRING/BLOB column, or a single
-    // nullable int/U128/UUID column. Stream the same canonical per-column
-    // material into a true 128-bit Xxh3 digest, gaining full 128-bit entropy
-    // (matching reindex_hash_row). Order-sensitivity comes from the stream
-    // itself: every column emits exactly one null marker before its content, so
-    // (a, b) ≠ (b, a) and (NULL, v) ≠ (v, NULL) without an explicit index byte,
-    // and STRING content is length-prefixed so "ab"+"c" can't alias "a"+"bc".
-    let null_word = src.get_null_word(row);
-    // Function-local streaming hasher: `RowHasher::new()` only copies the
-    // initial accumulator (the 256-byte buffer is `MaybeUninit`), so it is as
-    // cheap as `reset()` — no thread-local or per-row reuse needed.
-    let mut hasher = RowHasher::new();
-    for &c_idx_u32 in group_by_cols {
-        hash_group_col(&mut hasher, src, row, null_word, schema.locate(c_idx_u32 as usize));
-    }
-    hasher.digest128()
-}
-
-/// The baked form of [`extract_group_key`]: per-column locators resolved once at
-/// plan-bake time, for per-row hot loops (the non-linear REDUCE fallback's
-/// per-trace-row routing). Consumes the same bodies
-/// (`ColumnLocator::route_key` / `hash_group_col`) as the schema-walking form,
-/// so a baked key and an ad-hoc key are byte-identical by construction.
+/// The 128-bit group key of a row: the canonical single-column route key where
+/// the group set has one, else an XXH3 fold of the per-column canonical
+/// material. Per-column locators are resolved once at bake time, so the per-row
+/// body is the fold alone.
+///
+/// The one implementation. It used to have a schema-walking twin whose only job
+/// was to be byte-identical to this one, policed by a test; the twin is gone.
 pub(super) struct GroupKeyCols {
     canonical: bool,
     cols: Vec<ColumnLocator>,
@@ -277,8 +233,7 @@ impl GroupKeyCols {
         }
     }
 
-    /// The 128-bit group key of `row` — equals `extract_group_key` over the
-    /// same (schema, group_by_cols) this was baked from.
+    /// The 128-bit group key of `row`.
     #[inline]
     pub(super) fn key_row<R: RowSource>(&self, src: &R, row: usize) -> u128 {
         if self.canonical {
@@ -291,51 +246,11 @@ impl GroupKeyCols {
         }
         hasher.digest128()
     }
-
-    /// [`Self::key_row`] over a `ReadCursor`'s current row.
-    #[inline]
-    pub(super) fn key_cursor(&self, cursor: &ReadCursor) -> u128 {
-        let (src, row) = cursor.current_row_source();
-        self.key_row(src, row)
-    }
 }
 
 #[cfg(test)]
 mod group_key_tests {
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::Batch;
-
-    // The batch-free `global_group_key()` (used at emit time and over an empty
-    // delta) must equal the runtime `extract_group_key(.., &[])` over a real,
-    // arbitrarily-populated row — they are the SAME V₀, so routing, PK-stamp,
-    // owner-bake and seed all agree byte-for-byte. Row content must not perturb
-    // it (the empty-column fold reads nothing).
-    #[test]
-    fn global_group_key_matches_runtime_empty_cols() {
-        use super::{extract_group_key, global_group_key};
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 1),
-            ],
-            &[0],
-        );
-        let v0 = global_group_key();
-        for (pk, payload, null) in [(1u128, 42i64, false), (999, -7, false), (0, 0, true)] {
-            let mut b = Batch::with_capacity(schema, 1);
-            b.extend_pk(pk);
-            b.extend_weight(&1i64.to_le_bytes());
-            b.extend_null_bmp(&(null as u64).to_le_bytes());
-            b.extend_col(0, &payload.to_le_bytes());
-            b.count += 1;
-            let mb = b.as_mem_batch();
-            assert_eq!(
-                extract_group_key(&mb, 0, &schema, &[]),
-                v0,
-                "extract_group_key over empty group cols must equal global_group_key regardless of row content",
-            );
-        }
-    }
 
     // Co-partition invariant (bug #2 regression): a single narrow-int
     // routing/group column must yield the canonical OPK key — the value an
@@ -344,8 +259,8 @@ mod group_key_tests {
     // native value; after the flip the PK side is sign-flipped, so a signed
     // payload FK must match it or a distributed join silently drops rows.
     #[test]
-    fn extract_group_key_single_narrow_int_canonical_widen() {
-        use super::extract_group_key;
+    fn group_key_single_narrow_int_canonical_widen() {
+        use super::GroupKeyCols;
         use crate::storage::Batch as B;
 
         // Group key for `le` (native LE bytes) stored as a payload column at
@@ -359,7 +274,7 @@ mod group_key_tests {
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(pi, le);
             b.count += 1;
-            extract_group_key(&b.as_mem_batch(), 0, &schema, &[1])
+            GroupKeyCols::new(&schema, &[1]).key_row(&b.as_mem_batch(), 0)
         };
 
         // Signed I32: canonical key is the sign-flipped value (top bit toggled

@@ -616,19 +616,21 @@ mod tests {
 
     /// A `ViewMeta` fixture whose join-shard map names `src` as a source.
     fn meta_with_source(src: i64) -> Rc<ViewMeta> {
-        let mut jm: FxHashMap<i64, meta::JoinScatterKey> = FxHashMap::default();
+        let mut jm: FxHashMap<i64, Option<meta::JoinScatterKey>> = FxHashMap::default();
         jm.insert(
             src,
-            meta::JoinScatterKey {
+            Some(meta::JoinScatterKey {
                 cols: Rc::from([]),
                 target_tcs: Rc::from([]),
-            },
+            }),
         );
         Rc::new(ViewMeta {
             shard_cols: None,
             join_shard_map: jm,
             range_join_n_eq: None,
             has_join: false,
+            scatter_sources: FxHashSet::default(),
+            skips_exchange: false,
         })
     }
 
@@ -1158,7 +1160,7 @@ mod tests {
 
         let loaded = compiler::loaded_for_test(nodes, edges);
 
-        let meta = ViewMeta::from_loaded(&loaded);
+        let meta = ViewMeta::from_loaded(&loaded, &compiler::ExtTables::default());
         assert_eq!(
             meta.range_join_n_eq,
             Some(0),

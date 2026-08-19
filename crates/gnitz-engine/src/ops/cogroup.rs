@@ -157,6 +157,12 @@ pub(crate) fn cogroup_union(
     out: &mut Batch,
     mut on_shared: impl FnMut(&mut Batch, Range<usize>, Range<usize>),
 ) {
+    // One append session for the whole merge. Every single-source run below is
+    // one push, and for a set operation the runs are ~1 row (the branches carry
+    // uniform 128-bit `reindex_hash_row` PKs), so re-deriving the string map and
+    // re-acquiring a blob cache per run would cost more than the copy.
+    let (mb_a, mb_b) = (a.batch.as_mem_batch(), b.batch.as_mem_batch());
+    let mut sink = out.append_session(mb_a.count + mb_b.count);
     loop {
         match (a.key().is_some(), b.key().is_some()) {
             (true, true) => {
@@ -168,29 +174,29 @@ pub(crate) fn cogroup_union(
                         let s = a.pos;
                         let k = b.key().unwrap();
                         a.advance_to(k);
-                        out.append_batch(a.batch, s, a.pos);
+                        sink.push_range(&mb_a, s, a.pos);
                     }
                     Ordering::Greater => {
                         let s = b.pos;
                         let k = a.key().unwrap();
                         b.advance_to(k);
-                        out.append_batch(b.batch, s, b.pos);
+                        sink.push_range(&mb_b, s, b.pos);
                     }
                     Ordering::Equal => {
                         let ga = a.group_end();
                         let gb = b.group_end();
-                        on_shared(out, a.pos..ga, b.pos..gb);
+                        on_shared(sink.batch(), a.pos..ga, b.pos..gb);
                         a.seek(ga);
                         b.seek(gb);
                     }
                 }
             }
             (true, false) => {
-                out.append_batch(a.batch, a.pos, a.batch.count);
+                sink.push_range(&mb_a, a.pos, mb_a.count);
                 return;
             }
             (false, true) => {
-                out.append_batch(b.batch, b.pos, b.batch.count);
+                sink.push_range(&mb_b, b.pos, mb_b.count);
                 return;
             }
             (false, false) => return,

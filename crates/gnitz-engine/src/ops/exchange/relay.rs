@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use crate::schema::key::{compare_pk_ordering, pack_pk_be};
 use crate::schema::SchemaDescriptor;
 use crate::storage::{prorated_blob_cap, scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
+use gnitz_wire::MAX_WORKERS;
 
 use super::router::{RouteMode, ScatterKey};
 // Reached only from the `#[cfg(test)]` co-partition tests; production relay
@@ -158,9 +159,9 @@ pub(crate) fn op_repartition_batches_mode(
 fn relay_walk_inner<'a, Route>(
     mem_batches: &[Option<MemBatch<'a>>],
     worker_rows: &mut [Vec<(u8, u32)>],
-    order_cache: &mut [u128; 256],
-    mut cursors: [u32; 256],
-    mut active_sources: [u8; 256],
+    order_cache: &mut [u128; MAX_WORKERS],
+    mut cursors: [u32; MAX_WORKERS],
+    mut active_sources: [u8; MAX_WORKERS],
     mut num_active: usize,
     mut route: Route,
 ) where
@@ -240,13 +241,13 @@ fn relay_scatter_merge_walk(
     mode: RouteMode,
 ) {
     assert!(
-        mem_batches.len() <= 256,
-        "source index must fit in u8 (got {})",
+        mem_batches.len() <= MAX_WORKERS,
+        "one source per worker: {} sources exceeds MAX_WORKERS",
         mem_batches.len()
     );
-    let cursors = [0u32; 256];
-    let mut order_cache = [0u128; 256];
-    let mut active_sources = [0u8; 256];
+    let cursors = [0u32; MAX_WORKERS];
+    let mut order_cache = [0u128; MAX_WORKERS];
+    let mut active_sources = [0u8; MAX_WORKERS];
     let mut num_active: usize = 0;
 
     if worker_rows.len() < num_workers {
@@ -975,32 +976,6 @@ mod tests {
     }
 
     #[test]
-    fn test_repartition_pk_flag_propagation() {
-        let schema = make_schema_u64_i64();
-        let num_workers = 4;
-        let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-        assert!(b.is_sorted() && b.is_consolidated());
-
-        // PK spec: sub-batches must inherit sorted + consolidated
-        for sb in &op_repartition_batches_mode(&[Some(&b)], &[0u32], &[], &schema, num_workers, RouteMode::GroupKey) {
-            if sb.count > 0 {
-                assert!(sb.is_sorted(), "PK spec sub-batch must inherit sorted");
-                assert!(sb.is_consolidated(), "PK spec sub-batch must inherit consolidated");
-            }
-        }
-        // Non-PK spec: must NOT inherit
-        for sb in &op_repartition_batches_mode(&[Some(&b)], &[1u32], &[], &schema, num_workers, RouteMode::GroupKey) {
-            if sb.count > 0 {
-                assert!(!sb.is_sorted(), "non-PK spec sub-batch must not inherit sorted");
-                assert!(
-                    !sb.is_consolidated(),
-                    "non-PK spec sub-batch must not inherit consolidated"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn test_repartition_row_count() {
         let schema = make_schema_u64_i64();
         let rows: Vec<(u64, i64, i64)> = (1u64..=100).map(|i| (i, 1, i as i64 * 10)).collect();
@@ -1064,41 +1039,6 @@ mod tests {
                 assert!(!sb.is_consolidated(), "merged path must not claim consolidated");
             }
         }
-    }
-
-    #[test]
-    fn test_distinct_update_same_pk() {
-        use crate::storage::ReadCursor;
-        use std::rc::Rc;
-
-        let schema = make_schema_u64_i64();
-
-        // Trace: (PK=1, val=100, w=+1) — a row inserted in a previous tick.
-        let trace_batch = Rc::new(make_batch(&schema, &[(1, 1, 100)]));
-        let mut cursor_handle = ReadCursor::over_batches(&[trace_batch], schema);
-
-        // Delta: UPDATE PK=1 sets val=100 → 200.
-        // _enforce_unique_pk emits (PK=1, val=100, w=-1) and (PK=1, val=200, w=+1).
-        // Both rows have the same PK but different payloads; sorted by payload ascending.
-        let delta = make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]);
-
-        let (out, _consolidated) = crate::ops::op_distinct(delta, &mut cursor_handle, &schema);
-
-        assert_eq!(
-            out.count, 2,
-            "expected 2 output rows after same-PK update, got {}",
-            out.count
-        );
-
-        assert_eq!((out.get_pk(0) as u64), 1);
-        let val0 = i64::from_le_bytes(out.col_data(0)[0..8].try_into().unwrap());
-        assert_eq!(val0, 100);
-        assert_eq!(out.get_weight(0), -1);
-
-        assert_eq!((out.get_pk(1) as u64), 1);
-        let val1 = i64::from_le_bytes(out.col_data(0)[8..16].try_into().unwrap());
-        assert_eq!(val1, 200);
-        assert_eq!(out.get_weight(1), 1);
     }
 
     #[test]
@@ -1419,210 +1359,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Regression-guard microbench for the retained `order_cache`
-    // -----------------------------------------------------------------------
-
-    /// The cache-FREE merge walk: the alternative the relay would collapse to if
-    /// `order_cache` were dropped — one body, but the winner scan calls the
-    /// canonical `compare_pk_ordering` on live OPK bytes every comparison (exactly
-    /// what the sibling loser-tree merges in `repr/merge.rs` / `repr/heap.rs` /
-    /// `read_cursor` do), instead of a register compare of a precomputed key.
-    /// Byte-for-byte the same output as `relay_walk_inner`; it exists only so
-    /// `relay_scatter_merge_walk_bench` can measure what the cache buys on the
-    /// relay's O(K) linear winner-scan.
-    fn relay_walk_cachefree(
-        mem_batches: &[Option<MemBatch<'_>>],
-        num_workers: usize,
-        worker_rows: &mut [Vec<(u8, u32)>],
-        mut cursors: [u32; 256],
-        mut active_sources: [u8; 256],
-        mut num_active: usize,
-    ) {
-        while num_active > 0 {
-            if num_active == 1 {
-                let si = active_sources[0] as usize;
-                let mb = mem_batches[si].as_ref().unwrap();
-                for row in cursors[si] as usize..mb.count {
-                    worker_rows[worker_for_pk_bytes(mb.get_pk_bytes(row), num_workers)].push((si as u8, row as u32));
-                }
-                return;
-            }
-            let mut best_pos = 0usize;
-            let mut best_si = active_sources[0];
-            let mut best_bytes = mem_batches[best_si as usize]
-                .as_ref()
-                .unwrap()
-                .get_pk_bytes(cursors[best_si as usize] as usize);
-            #[allow(clippy::needless_range_loop)]
-            for pos in 1..num_active {
-                let si = active_sources[pos];
-                let bytes = mem_batches[si as usize]
-                    .as_ref()
-                    .unwrap()
-                    .get_pk_bytes(cursors[si as usize] as usize);
-                let ord = compare_pk_ordering(bytes, best_bytes);
-                if ord == Ordering::Less || (ord == Ordering::Equal && si < best_si) {
-                    best_pos = pos;
-                    best_si = si;
-                    best_bytes = bytes;
-                }
-            }
-            let best_si = best_si as usize;
-            let row = cursors[best_si] as usize;
-            cursors[best_si] += 1;
-            let mb = mem_batches[best_si].as_ref().unwrap();
-            worker_rows[worker_for_pk_bytes(mb.get_pk_bytes(row), num_workers)].push((best_si as u8, row as u32));
-            let new_cur = cursors[best_si] as usize;
-            if new_cur == mb.count {
-                num_active -= 1;
-                active_sources[best_pos] = active_sources[num_active];
-            }
-        }
-    }
-
-    /// Isolated merge-walk bench: K=8 interleaved pre-consolidated sources, timing
-    /// ONLY the winner-scan + route + index push (no `write_to_batch` /
-    /// `scatter_multi_source` row copy, which otherwise dominates and masks the
-    /// walk). Reports cached (`relay_walk_inner`) vs cache-free
-    /// (`relay_walk_cachefree`) rows/s per stride. This is what justifies keeping
-    /// `order_cache`: the cached register-compare must beat re-packing the OPK key
-    /// every comparison. Last measured ~1.6x at stride 8/16 and ~3.3x at stride 24
-    /// (where cache-free pays the full 16-byte prefix pack on every pairwise
-    /// compare), so dropping the cache to match the loser-tree siblings would
-    /// regress this O(K) linear winner-scan substantially.
-    /// `cd crates && cargo test -p gnitz-engine --release relay_scatter_merge_walk_bench -- --ignored --nocapture --test-threads=1`
-    #[test]
-    #[ignore]
-    fn relay_scatter_merge_walk_bench() {
-        use std::hint::black_box;
-        use std::time::{Duration, Instant};
-
-        const K: usize = 8;
-        const N: usize = 100_016; // divisible by K
-        const ITERS: usize = 40;
-        let num_workers = 4;
-        let per_src = N / K;
-
-        // Run both walk variants over the same K sources, assert identical output,
-        // and time each. `build` keeps the three stride builders' batches alive.
-        let bench = |label: &str, cbs: &[Batch]| {
-            let mem_batches: Vec<Option<MemBatch>> = cbs.iter().map(|cb| Some(cb.as_mem_batch())).collect();
-            let total: usize = mem_batches.iter().flatten().map(|m| m.count).sum();
-            let cursors = [0u32; 256];
-            let mut active_sources = [0u8; 256];
-            let mut num_active = 0usize;
-            for (si, mb) in mem_batches.iter().enumerate() {
-                if mb.as_ref().is_some_and(|m| m.count > 0) {
-                    active_sources[num_active] = si as u8;
-                    num_active += 1;
-                }
-            }
-            let route_pk = |mb: &MemBatch, row: usize| worker_for_pk_bytes(mb.get_pk_bytes(row), num_workers);
-            let mut order_cache = [0u128; 256];
-            let reset_cache = |oc: &mut [u128; 256]| {
-                for &s8 in active_sources.iter().take(num_active) {
-                    let s = s8 as usize;
-                    oc[s] = pack_pk_be(mem_batches[s].as_ref().unwrap().get_pk_bytes(0));
-                }
-            };
-            let mut wr_a: Vec<Vec<(u8, u32)>> = (0..num_workers).map(|_| Vec::with_capacity(total)).collect();
-            let mut wr_b: Vec<Vec<(u8, u32)>> = (0..num_workers).map(|_| Vec::with_capacity(total)).collect();
-
-            // Correctness: cached and cache-free must agree byte-for-byte.
-            reset_cache(&mut order_cache);
-            relay_walk_inner(
-                &mem_batches,
-                &mut wr_a,
-                &mut order_cache,
-                cursors,
-                active_sources,
-                num_active,
-                route_pk,
-            );
-            relay_walk_cachefree(
-                &mem_batches,
-                num_workers,
-                &mut wr_b,
-                cursors,
-                active_sources,
-                num_active,
-            );
-            assert_eq!(wr_a, wr_b, "{label}: cached vs cache-free walk diverged");
-
-            let mut dur_a = Duration::ZERO;
-            let mut dur_b = Duration::ZERO;
-            for _ in 0..ITERS {
-                wr_a.iter_mut().for_each(Vec::clear);
-                reset_cache(&mut order_cache);
-                let t = Instant::now();
-                relay_walk_inner(
-                    &mem_batches,
-                    &mut wr_a,
-                    &mut order_cache,
-                    cursors,
-                    active_sources,
-                    num_active,
-                    route_pk,
-                );
-                dur_a += t.elapsed();
-                black_box(&wr_a);
-
-                wr_b.iter_mut().for_each(Vec::clear);
-                let t = Instant::now();
-                relay_walk_cachefree(
-                    &mem_batches,
-                    num_workers,
-                    &mut wr_b,
-                    cursors,
-                    active_sources,
-                    num_active,
-                );
-                dur_b += t.elapsed();
-                black_box(&wr_b);
-            }
-            let rps = |d: Duration| (total * ITERS) as f64 / d.as_secs_f64() / 1e6;
-            println!(
-                "{label:>10}: cached {:6.1} Mrows/s   cache-free {:6.1} Mrows/s   cached/cache-free {:.2}x",
-                rps(dur_a),
-                rps(dur_b),
-                rps(dur_a) / rps(dur_b),
-            );
-        };
-
-        // stride 8 — single U64 PK.
-        let s8 = make_schema_u64_i64();
-        let b8: Vec<Batch> = (0..K)
-            .map(|s| {
-                let rows: Vec<(u64, i64, i64)> = (0..per_src).map(|j| ((s + K * j) as u64, 1, j as i64)).collect();
-                make_batch(&s8, &rows)
-            })
-            .collect();
-        bench("stride 8", &b8);
-
-        // stride 16 — (U64, U64) compound PK. c0 = global index (ascending), c1 = 0;
-        // `make_narrow_compound_batch` reads the low 64 bits as c0 (see `mk_compound_pk`).
-        let s16 = make_narrow_compound_schema();
-        let b16: Vec<Batch> = (0..K)
-            .map(|s| {
-                let rows: Vec<(u128, i64, i64)> = (0..per_src).map(|j| ((s + K * j) as u128, 1, j as i64)).collect();
-                make_narrow_compound_batch(&s16, &rows)
-            })
-            .collect();
-        bench("stride 16", &b16);
-
-        // stride 24 — (U64, U64, U64) wide PK. c0 = global index (ascending), c1=c2=0.
-        let s24 = wide_pk_3xu64_schema();
-        let b24: Vec<Batch> = (0..K)
-            .map(|s| {
-                let rows: Vec<(u64, u64, u64, i64, i64)> =
-                    (0..per_src).map(|j| ((s + K * j) as u64, 0, 0, 1, j as i64)).collect();
-                make_wide_batch(&s24, &rows)
-            })
-            .collect();
-        bench("stride 24", &b24);
     }
 
     /// Release-only microbench pinning the single-column `JoinPromote` scatter

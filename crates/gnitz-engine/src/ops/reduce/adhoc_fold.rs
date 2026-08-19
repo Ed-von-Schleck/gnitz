@@ -27,13 +27,13 @@ use rustc_hash::FxHashMap;
 
 use gnitz_wire::AggReadSpec;
 
-use super::super::util::{global_group_key, GroupKeyCols};
+use super::super::util::GroupKeyCols;
 use super::agg::{Accumulator, AggDescriptor};
 use super::emit::emit_reduce_row;
 use super::plan::{build_reduce_output_schema, ReducePlan};
 use super::sort::compare_by_group_cols;
 use crate::schema::key::NarrowPkOpk;
-use crate::schema::{ReduceOutKey, SchemaDescriptor, TypeCode};
+use crate::schema::{ReduceOutKey, SchemaDescriptor};
 use crate::storage::Batch;
 
 /// The request-scoped fold state. `pub(crate)` so `catalog::scan_spec` can drive
@@ -101,7 +101,6 @@ impl AdhocFold {
             agg_descs.push(AggDescriptor {
                 col_idx: c as u32,
                 agg_op: item.op,
-                col_type_code: TypeCode::from_validated_u8(src_schema.columns[c].type_code),
             });
         }
 
@@ -195,7 +194,7 @@ impl AdhocFold {
             // (ghosts excluded). MIN/MAX correctness depends on stepping only
             // positive weights (its arm never reads `weight`, and there is no
             // weight-sign assert in the kernel); guard defensively — exactly as
-            // `op_reduce`'s replay loop guards with `if w > 0`.
+            // `op_reduce`'s group walk guards with `if w > 0`.
             debug_assert!(w > 0, "adhoc fold: scan cursor must deliver positive weights");
             if w <= 0 {
                 continue;
@@ -260,7 +259,7 @@ impl AdhocFold {
             // bytes `op_reduce` writes.
             let key = match &self.keyer {
                 Some(k) => k.key_row(&rep_mb, ord),
-                None => global_group_key(),
+                None => gnitz_wire::global_group_key(),
             };
             let pk = NarrowPkOpk::new(key, stride);
             emit_reduce_row(

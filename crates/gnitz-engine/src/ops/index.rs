@@ -1,7 +1,7 @@
-//! Secondary index integration: AviBake/AviDesc, op_integrate_with_indexes.
+//! Secondary index integration: AviBake, IntegrateTarget, op_integrate_with_indexes.
 
 use crate::ops::AggDescriptor;
-use crate::schema::{type_code, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor};
+use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::Batch;
 use gnitz_wire::AggFunc;
 
@@ -33,70 +33,33 @@ pub struct AviBake {
 }
 
 impl AviBake {
-    pub(crate) fn new(src: &SchemaDescriptor, group_by_cols: &[u32], aggs: &[AggDescriptor]) -> Self {
-        AviBake {
-            key_packer: avi_key_packer(src, group_by_cols),
-            schema: make_avi_schema(src, group_by_cols),
+    /// `None` only if the composite key overflows the schema builder's bounds,
+    /// which the group-key layout's reserved suffix rules out for a well-formed
+    /// input schema.
+    pub(crate) fn new(src: &SchemaDescriptor, group_by_cols: &[u32], aggs: &[AggDescriptor]) -> Option<Self> {
+        Some(AviBake {
+            key_packer: ReindexPacker::new_group_key(src, group_by_cols),
+            schema: crate::schema::avi_schema(src, group_by_cols)?,
             aggs: aggs.iter().map(|d| (*d, src.locate(d.col_idx as usize))).collect(),
-        }
+        })
     }
 }
 
-/// Combined AggValueIndex descriptor for `op_integrate_with_indexes`. One
-/// descriptor (and one index table) serves *every* MIN/MAX aggregate of a
-/// reduce; everything but the table lives in the baked [`AviBake`].
+/// What [`op_integrate_with_indexes`] accumulates a delta into. The two are
+/// exclusive by construction — the emitter produces one or the other, never both
+/// and never neither — so a pair of `Option`s would admit two states nothing
+/// produces. The VM states the same rule one layer up in its own
+/// `Instr::Integrate` operand; this is that rule at the operator's own boundary.
 ///
-/// The `table` raw pointer is `pub(crate)` rather than `pub`: it is a bare
-/// `*mut Table` whose access is constrained to crate-internal call sites
-/// (the compiler emits the desc in `vm`, `op_integrate_with_indexes` consumes
-/// it) — never a cross-boundary handle. `bake` borrows from the compiled
-/// program, so building a desc per tick allocates nothing.
-pub struct AviDesc<'a> {
-    pub(crate) table: *mut crate::storage::Table,
-    pub(crate) bake: &'a AviBake,
-}
-
-/// AVI index schema: the group-by columns (native fixed-width types, in GROUP
-/// BY order), then a `u8` ordinal selecting which non-linear aggregate the
-/// entry belongs to, then the order-encoded aggregate value (U64). All columns
-/// are PK; there is no payload. Built only for byte-form-eligible group keys
-/// (see `query::compiler::avi_group_key_eligible`).
-///
-/// The ordinal sits **between** the group key and the value so the byte-ordered
-/// key sorts by `(group, ordinal, av)`: a group's ordinal-0 entries precede its
-/// ordinal-1 entries, and within an ordinal the per-aggregate `for_max`
-/// encoding sorts the extreme first. So `MIN(a)` (ordinal 0) and `MAX(a)`
-/// (ordinal 1) coexist with no collision and no `for_max` clash, and one
-/// schema shape serves single- and multi-aggregate reduces alike. The empty
-/// global key reduces the prefix to just `ordinal`.
-pub(crate) fn make_avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescriptor {
-    // All-PK, no payload, PK dense in declared order — `DerivedSchema`'s shape.
-    // Its bounds (and `SchemaDescriptor::new`'s MAX_PK_BYTES assert) are the
-    // backstop should the `avi_group_key_eligible` gate ever be relaxed past the
-    // engine's PK limit.
-    let mut b = DerivedSchema::new();
-    let over = || panic!("make_avi_schema: composite key exceeds the PK column limit");
-    for &c in group_by_cols {
-        // Force non-nullable: eligibility guarantees the value is always present.
-        b.push_pk(SchemaColumn::new(src.columns[c as usize].type_code, 0))
-            .unwrap_or_else(over);
-    }
-    b.push_pk(SchemaColumn::new(type_code::U8, 0)).unwrap_or_else(over); // ordinal
-    b.push_pk(SchemaColumn::new(type_code::U64, 0)).unwrap_or_else(over); // av_encoded
-    b.finish()
-}
-
-/// The packer that fills an AVI key's group prefix. Each column carries its own
-/// source type as the promotion target, so a slot is the plain OPK image of the
-/// column at the width [`make_avi_schema`] declares for it. `avi_group_key_eligible`
-/// has already excluded nullable and non-PK-eligible group columns, so every slot
-/// reads a present, fixed-width value.
-pub(crate) fn avi_key_packer(src: &SchemaDescriptor, group_by_cols: &[u32]) -> ReindexPacker {
-    let tcs: Vec<u8> = group_by_cols
-        .iter()
-        .map(|&c| src.columns[c as usize].type_code)
-        .collect();
-    ReindexPacker::new(src, group_by_cols, &tcs)
+/// The `unsafe` deref does not disappear, it *moves*: `Program::tables` is a
+/// `Vec<*mut Table>`, so the VM resolves each pointer at its own seat where the
+/// pool lives, and `ops` stops carrying one.
+pub enum IntegrateTarget<'a> {
+    /// A trace table: the delta accumulates as rows.
+    Trace(&'a mut crate::storage::Table),
+    /// The combined aggregate value index: one table serves *every* MIN/MAX
+    /// aggregate of a reduce, keyed by the baked schema and key packer.
+    Avi(&'a mut crate::storage::Table, &'a AviBake),
 }
 
 // ---------------------------------------------------------------------------
@@ -109,8 +72,7 @@ pub(crate) fn avi_key_packer(src: &SchemaDescriptor, group_by_cols: &[u32]) -> R
 /// The Rust Table handles memtable capacity internally (flush-on-overflow).
 pub fn op_integrate_with_indexes(
     batch: &Batch,
-    target_table: Option<&mut crate::storage::Table>,
-    avi: Option<&AviDesc<'_>>,
+    target: IntegrateTarget<'_>,
 ) -> Result<(), crate::storage::StorageError> {
     if batch.count == 0 {
         return Ok(());
@@ -120,9 +82,10 @@ pub fn op_integrate_with_indexes(
     // delta (sorted = consolidated = false); the borrowed ingest consolidates it
     // straight into the memtable's owned copy — one copy per tick, and `batch`
     // stays readable for the AVI population below.
-    if let Some(table) = target_table {
-        table.ingest_borrowed_batch(batch)?;
-    }
+    let (avi_table, bake) = match target {
+        IntegrateTarget::Trace(table) => return table.ingest_borrowed_batch(batch),
+        IntegrateTarget::Avi(table, bake) => (table, bake),
+    };
 
     let mb = batch.as_mem_batch();
 
@@ -133,8 +96,7 @@ pub fn op_integrate_with_indexes(
     // and no collision. One entry per (row, value-indexed aggregate) is written
     // into the one table with one ingest. `for_max`/type are derived from each
     // baked aggregate descriptor exactly as the reduce read side does.
-    if let Some(avi_desc) = avi {
-        let bake = avi_desc.bake;
+    {
         let num_aggs = bake.aggs.len();
         // `Raw` from `with_capacity`; the `extend_*` population below never
         // raises it. Capacity is one entry per (row × value-indexed aggregate).
@@ -146,6 +108,13 @@ pub fn op_integrate_with_indexes(
         let mut pk_scratch = [0u8; 16];
         for row in 0..batch.count {
             let weight = mb.get_weight(row);
+            // A weight-0 row contributes nothing: consolidation drops the entry
+            // it would write and `seek_first_positive_with_prefix` skips it, so
+            // writing one is waste, not corruption. The sibling projections
+            // (`batch_project_index`, `route_rows_by_pk`) drop it too.
+            if weight == 0 {
+                continue;
+            }
             packer.pack_into(&mut key[..n], &mb, row);
             for (j, (d, loc)) in bake.aggs.iter().enumerate() {
                 // PK is never null; a NULL payload aggregate is skipped for this
@@ -163,7 +132,7 @@ pub fn op_integrate_with_indexes(
                 // through the same accessor).
                 let av_u64 = super::util::encode_ordered(
                     loc.native_le_bytes(&mb, row, &mut pk_scratch),
-                    d.col_type_code,
+                    crate::schema::TypeCode::from_validated_u8(loc.type_code()),
                     d.agg_op == AggFunc::Max,
                 );
                 // Serialise the order-encoded value big-endian: the index orders
@@ -179,11 +148,9 @@ pub fn op_integrate_with_indexes(
         }
 
         if avi_batch.count > 0 {
-            let avi_table = unsafe { &mut *avi_desc.table };
-            // Propagate like the base-table ingest at the top of this fn: `ops`
-            // is a Result-returning library layer (its test/bench callers
-            // `.unwrap()`); the runtime consumer (the VM Integrate instruction)
-            // is what fail-stops.
+            // Propagate like the trace ingest above: `ops` is a Result-returning
+            // library layer (its test/bench callers `.unwrap()`); the runtime
+            // consumer (the VM Integrate instruction) is what fail-stops.
             avi_table.ingest_owned_batch(avi_batch)?;
         }
     }
@@ -228,14 +195,23 @@ mod avi_encode_tests {
     }
 
     #[test]
-    fn f32_encoding_is_order_preserving() {
-        let vals: [f32; 4] = [-2.5, -0.5, 0.5, 2.5];
+    fn f32_encoding_is_order_preserving_and_round_trips() {
+        let vals: [f32; 5] = [-2.5, -0.5, 0.0, 0.5, 2.5];
         let enc: Vec<u64> = vals
             .iter()
             .map(|v| encode_ordered(&v.to_bits().to_le_bytes(), TypeCode::F32, false))
             .collect();
         for w in enc.windows(2) {
             assert!(w[0] < w[1], "ascending f32 must encode to ascending u64");
+        }
+        // The decode widens to F64 bits (the accumulator's slot type), so compare
+        // against the promoted value rather than the F32 pattern.
+        for (v, &e) in vals.iter().zip(enc.iter()) {
+            assert_eq!(
+                decode_ordered(e, TypeCode::F32),
+                f64::to_bits(*v as f64),
+                "round-trip {v}"
+            );
         }
     }
 

@@ -6,7 +6,7 @@
 //! ```
 //!
 //! Lives inside `ops` (not the crate root) so it can call the real internal
-//! key-composition helpers (`avi_key_packer`, `encode_ordered`) and decompose
+//! key-composition helpers (`ReindexPacker::new_group_key`, `encode_ordered`) and decompose
 //! the per-row population cost into four cleanly-attributed layers:
 //!
 //!   compose : build the index key into a stack buffer, discard
@@ -21,8 +21,8 @@
 
 use std::time::{Duration, Instant};
 
-use super::index::avi_key_packer;
-use super::index::{make_avi_schema, op_integrate_with_indexes, AviBake, AviDesc};
+use super::index::{op_integrate_with_indexes, AviBake, IntegrateTarget};
+use super::reindex::ReindexPacker;
 use super::util::{encode_ordered, AVI_AV_BYTES};
 use super::AggDescriptor;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
@@ -140,11 +140,11 @@ fn time_upsert(
 fn secondary_index_bench_avi_decomposition() {
     let schema = src_schema();
     let group_by_cols = vec![1u32];
-    let avi_schema = make_avi_schema(&schema, &group_by_cols);
+    let avi_schema = crate::schema::avi_schema(&schema, &group_by_cols).unwrap();
     let input = build_input(&schema);
     let mb = input.as_mem_batch();
     let tmp = tempfile::tempdir().unwrap();
-    let packer = avi_key_packer(&schema, &group_by_cols);
+    let packer = ReindexPacker::new_group_key(&schema, &group_by_cols);
     let n = packer.out_stride;
     let avi_pi = schema
         .try_payload_idx(2)
@@ -209,14 +209,11 @@ fn secondary_index_bench_avi_decomposition() {
             &[AggDescriptor {
                 col_idx: 2,
                 agg_op: AggFunc::Min,
-                col_type_code: TypeCode::I64,
             }],
-        );
-        let avi = AviDesc {
-            table: &mut t as *mut Table,
-            bake: &bake,
-        };
-        op_integrate_with_indexes(&input, None, Some(&avi)).unwrap();
+        )
+        .unwrap();
+        let avi = IntegrateTarget::Avi(&mut t, &bake);
+        op_integrate_with_indexes(&input, avi).unwrap();
         std::hint::black_box(&t);
     });
 

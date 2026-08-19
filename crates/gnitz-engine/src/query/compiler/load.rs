@@ -238,7 +238,7 @@ pub(super) fn topo_sorted(
 /// The second return is the shape a planner call site that forgot its role
 /// produces; `compile_view` rejects on it, which turns the likelier of the two
 /// possible mistakes into a failed compile instead of silently-unscattered rows.
-fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec<(u32, u8)>, bool) {
+fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec<Vec<(u32, u8)>>, bool) {
     let mut queue = VecDeque::from([scan_nid]);
     // `visited` bounds the walk to O(nodes): without it a Filter diamond (two
     // edge paths reaching the same Filter) would re-push and re-expand nodes.
@@ -285,12 +285,40 @@ fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec<(u32, u8)>
         }
     }
     let orphaned = seqs.is_empty() && saw_auxiliary;
-    (seqs.into_iter().flatten().collect(), orphaned)
+    (seqs, orphaned)
 }
 
-/// [`scatter_key_of_scan`] without the diagnostic half.
-pub(super) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32) -> Vec<(u32, u8)> {
-    scatter_key_of_scan(loaded, scan_nid).0
+/// Every `ScatterKey` sequence this scan feeds, concatenated — the input to the
+/// **co-partition prefix test**, which wants a conservative refusal when a scan
+/// carries more than one key (the concatenation matches no source's distribution
+/// prefix, so the source correctly goes through the exchange).
+///
+/// Deliberately NOT the relay's pack key: see [`scatter_key`].
+pub(super) fn co_partition_keys(loaded: &LoadedCircuit, scan_nid: i32) -> Vec<(u32, u8)> {
+    scatter_key_of_scan(loaded, scan_nid).0.into_iter().flatten().collect()
+}
+
+/// The single key the relay may **pack and route by**, or `None` when the scan
+/// feeds more than one distinct `ScatterKey` sequence.
+///
+/// The concatenation [`co_partition_keys`] returns is right for a prefix test and
+/// wrong as a pack key: with sequences `a` and `b` the delta would scatter by
+/// `pack(a ‖ b)` while each trace side is keyed by `pack(a)` or `pack(b)`, so the
+/// two would never co-partition and matches would be dropped silently. Refusing is
+/// the only safe answer, and it is the caller's to report.
+///
+/// The `feeds_trace_or_join` filter and the identical-sequence dedup above appear
+/// to hold every live circuit to one sequence, so this is a guard rather than a
+/// fix — hence the debug tripwire: if it ever fires, the shape became
+/// constructible and wants a real plan, not a silent refusal.
+pub(super) fn scatter_key(loaded: &LoadedCircuit, scan_nid: i32) -> Option<Vec<(u32, u8)>> {
+    let mut seqs = scatter_key_of_scan(loaded, scan_nid).0;
+    debug_assert!(
+        seqs.len() <= 1,
+        "scan {scan_nid} feeds {} distinct scatter keys; no single pack key routes it",
+        seqs.len(),
+    );
+    (seqs.len() == 1).then(|| seqs.pop().expect("len == 1"))
 }
 
 /// True iff some scan reaches reindex `Map`s and none of them is a `ScatterKey`.

@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::key::{compare_pk_bytes, pk_width_dispatch};
-use crate::schema::{key::PkSortKey, ColumnLocator, SchemaDescriptor, TypeCode};
+use crate::schema::{key::PkSortKey, ColumnLocator};
 use crate::storage::{cmp_col_window, Batch, MemBatch};
 use gnitz_expr::RowSource;
 
@@ -72,65 +72,27 @@ pub(super) fn compare_by_group_cols<A: RowSource, B: RowSource>(
     Ordering::Equal
 }
 
-/// The packed-sort fast-path spec for [`argsort_delta`]: `Some((payload slot,
-/// tc))` iff the group key is a single non-nullable, non-PK column of a
-/// packable int type. NULL stores as zero bytes — it would interleave with
-/// integer 0 — so a nullable column falls through to the comparator path.
-/// Baked once into the reduce plan (`ReducePlan::packed_sort`).
-pub(super) fn packed_sort_spec(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Option<(u8, TypeCode)> {
-    let [c] = group_by_cols else {
-        return None;
-    };
-    let ci = *c as usize;
-    let tc = TypeCode::from_validated_u8(schema.columns[ci].type_code);
-    match schema.locate(ci) {
-        ColumnLocator::Payload { slot, .. }
-            if schema.columns[ci].nullable == 0
-                && matches!(tc, TypeCode::I64 | TypeCode::U64 | TypeCode::I32 | TypeCode::U32) =>
-        {
-            Some((slot, tc))
-        }
-        _ => None,
-    }
-}
-
-/// Argsort `0..n` by a per-row key, materialised ONCE into a dense `Vec` and
-/// compared by reference — never re-invoking `key` (or re-copying a 32-byte
-/// `[u128; 2]` key, as `sort_unstable_by_key` would) per comparison.
+/// Argsort `0..n` by a per-row key, materialised ONCE — `key` is never
+/// re-invoked per comparison (nor a 32-byte `[u128; 2]` key re-copied, as
+/// `sort_unstable_by_key` would).
+///
+/// Sorts `(key, index)` pairs rather than sorting indices against a side table:
+/// the side table costs two random loads per comparison, where the pair carries
+/// its key inline. Rows with equal keys keep an arbitrary relative order either
+/// way.
 fn argsort_by_key<K: Ord>(n: usize, key: impl Fn(usize) -> K) -> Vec<u32> {
-    let keys: Vec<K> = (0..n).map(key).collect();
-    let mut indices: Vec<u32> = (0..n as u32).collect();
-    indices.sort_unstable_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
-    indices
+    let mut pairs: Vec<(K, u32)> = (0..n).map(|i| (key(i), i as u32)).collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    pairs.into_iter().map(|(_, i)| i).collect()
 }
 
-/// Argsort delta batch by group columns. `packed` is the plan's baked
-/// [`packed_sort_spec`] (dense typed keys, no per-row comparator dispatch);
-/// `descs` the pre-resolved locator slice for the comparator path (the reduce
-/// plan's baked `sort_descs`).
-pub(super) fn argsort_delta(batch: &Batch, packed: Option<(u8, TypeCode)>, descs: &[ColumnLocator]) -> Vec<u32> {
+/// Argsort delta batch by group columns, through the pre-resolved locator slice
+/// the reduce plan baked (`sort_descs`).
+pub(super) fn argsort_delta(batch: &Batch, descs: &[ColumnLocator]) -> Vec<u32> {
     let mb = batch.as_mem_batch();
     let n = batch.count;
     if n <= 1 {
         return (0..n as u32).collect();
-    }
-
-    if let Some((pi, tc)) = packed {
-        let pi = pi as usize;
-        macro_rules! packed_sort {
-            ($T:ty, $stride:expr) => {
-                return argsort_by_key(n, |i| {
-                    <$T>::from_le_bytes(mb.get_col_ptr(i, pi, $stride).try_into().unwrap())
-                })
-            };
-        }
-        match tc {
-            TypeCode::I64 => packed_sort!(i64, 8),
-            TypeCode::U64 => packed_sort!(u64, 8),
-            TypeCode::I32 => packed_sort!(i32, 4),
-            TypeCode::U32 => packed_sort!(u32, 4),
-            _ => unreachable!("packed_sort_spec admits only packable int types"),
-        }
     }
 
     // No group columns: one group, so the comparator calls every pair equal and

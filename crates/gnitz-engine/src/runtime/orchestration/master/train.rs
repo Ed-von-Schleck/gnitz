@@ -515,7 +515,10 @@ mod tests {
             |mb, frame_len| {
                 assert!(frame_len > 0, "sink receives the raw frame byte length");
                 for i in 0..mb.count {
-                    rows.push((mb.get_pk(i), mb.get_weight(i)));
+                    rows.push((
+                        gnitz_wire::widen_pk_be(mb.get_pk_bytes(i), mb.pk_stride as usize),
+                        mb.get_weight(i),
+                    ));
                 }
                 Ok(())
             },

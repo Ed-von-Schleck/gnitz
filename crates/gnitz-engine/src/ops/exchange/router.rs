@@ -69,7 +69,7 @@ pub(crate) enum RouteMode {
 ///   prefix it reads, so no inter-row clear is needed.
 /// - `Fold`: a `GroupKey` (GROUP BY / set-op) scatter routes by the
 ///   null-distinct group fold — the baked [`GroupKeyCols`], byte-identical to
-///   `extract_group_key`, which `op_reduce` also uses for the group's output
+///   the group-key fold, which `op_reduce` also uses for the group's output
 ///   PK — the two must agree or the result is mis-gathered. The fold keeps
 ///   NULL distinct because a NULL group and a 0 group must not collide on one
 ///   output PK; scatter routing has no such requirement, but local grouping
@@ -168,7 +168,7 @@ pub(super) fn scatter_is_pk_routed(col_indices: &[u32], target_tcs: &[u8], schem
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::util::extract_group_key;
+    use crate::ops::util::GroupKeyCols;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::{make_batch, make_schema_u64_i64};
 
@@ -333,7 +333,7 @@ mod tests {
             b.count += 1;
             let mb = b.as_mem_batch();
             for col in [0u32, 1u32] {
-                let legacy = worker_for_key(extract_group_key(&mb, 0, &schema, &[col]), NW);
+                let legacy = worker_for_key(GroupKeyCols::new(&schema, &[col]).key_row(&mb, 0), NW);
                 assert_eq!(
                     packed(&schema, &[col], &[], &mb, 0),
                     legacy,

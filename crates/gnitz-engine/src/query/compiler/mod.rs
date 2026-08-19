@@ -30,9 +30,12 @@ pub(crate) use load::{circuit_range_join_n_eq, for_each_scan_edge, load_circuit,
 // Compiler-internal: `pub(crate)` on these would publish them to the whole
 // `query` layer, which reaches the compiler only through the exports above.
 use load::{
-    circuit_source_bound, reindex_cols_through_filters, scan_reaches_only_unflagged_reindexes, scan_tid_through_filters,
+    circuit_source_bound, co_partition_keys, scan_reaches_only_unflagged_reindexes, scan_tid_through_filters,
+    scatter_key,
 };
+#[cfg(test)]
 pub(crate) use optimize::compute_join_shard_map;
+pub(crate) use optimize::{compute_scatter_keys, compute_scatter_sources, compute_skips_exchange};
 
 // Engine-only port aliases (all equal to wire constants).
 const PORT_IN: i32 = gnitz_wire::PORT_IN as i32;
@@ -150,12 +153,26 @@ pub(crate) struct SubPlan {
     pub vm: Box<VmHandle>,
     pub in_reg: u16,
     pub out_reg: u16,
-    /// True iff the program can emit output from an empty input epoch: it
-    /// carries a global-ground `Reduce` — the empty pad round is the ONLY place
-    /// the SQL-required ground row over an empty/fully-retracted source is
-    /// minted (`op_reduce`'s `n == 0` branch). Every other opcode is inert on an
-    /// empty input, so an empty epoch skips the VM machinery entirely.
-    pub can_emit_on_empty: bool,
+    /// True iff the program can *still* emit output from an empty input epoch: it
+    /// carries a global-ground `Reduce` and its ground row has not been minted
+    /// yet. The empty pad round is the ONLY place the SQL-required ground row over
+    /// an empty/fully-retracted source is minted (`op_reduce`'s `n == 0` branch).
+    /// Every other opcode is inert on an empty input, so an empty epoch skips the
+    /// VM machinery entirely.
+    ///
+    /// A latch, not a constant: the row is minted at most once — after the first
+    /// empty epoch `trace_out` holds V₀ either way — so every later empty tick
+    /// would pay `bind_trace_cursors`, `compact_owned_traces` and a dispatch to
+    /// perform one seek that finds the row. Clearing it makes that cost finite.
+    /// The other `global_ground` emission ("cardinality hit zero, emit the ground
+    /// in place of the shed row") needs a *non-empty* delta carrying the
+    /// retraction, so it is unaffected.
+    ///
+    /// Plan-lifetime state guarding a store fact: every path that empties a
+    /// view's stores must drop the cached plan with them
+    /// (`reset_view_output_for_rebuild` → `DagEngine::invalidate`; a worker-count
+    /// relayout runs before any store opens, so no plan exists yet).
+    pub can_emit_on_empty: std::cell::Cell<bool>,
     /// Maps a source table id to the input register that receives its delta.
     /// Empty for the post-combine phase (which has no source-level routing).
     pub source_reg_map: HashMap<i64, u16>,
@@ -210,25 +227,15 @@ pub(super) enum PlanTarget<'a> {
 }
 
 /// Output from `compile_view`, consumed directly by DagEngine as the cached
-/// plan. Besides the executable shape it carries the compile-time routing
-/// annotations the multi-worker dispatch reads — derived from the same loaded
-/// circuit the plan was emitted from, so they cannot drift from it.
+/// plan.
+///
+/// It carries no **routing** annotations. Routing is a placement fact, the same
+/// one the master relay needs and must derive without ever compiling; it lives
+/// once on the memoized `ViewMeta`, which both the worker dispatch and the relay
+/// read. Producing a second copy here would be two producers of one fact — the
+/// defect one level up from a badly typed one.
 pub(crate) struct CompileOutput {
     pub shape: PlanShape,
-    /// The sources whose deltas must go through the join scatter: those carrying
-    /// a join/group reindex key, minus those whose native distribution already
-    /// matches it (or whose partner is replicated). Probed once per epoch on the
-    /// multi-worker dispatch path, which is why it is `Fx`-hashed. (The master
-    /// relay derives its own plan-free copy — `ViewMeta` — since it must never
-    /// compile.)
-    pub scatter_sources: FxHashSet<i64>,
-    /// `Some(n_eq)` iff the view is a non-equi (range / band) join — the
-    /// dispatch arm that relays its *input* delta (eq-prefix scatter or
-    /// broadcast) before the pre phase.
-    pub range_join_n_eq: Option<u8>,
-    /// The unary output `ExchangeShard` is a proven no-op (every row already on
-    /// the worker owning its distribution key) — the output IPC is elided.
-    pub skips_exchange: bool,
     /// The `(source table id, secondary-index range)` the planner pushed onto the
     /// primary source's `ScanDelta`, consulted only by the two circuit backfill
     /// drivers (a steady-state delta never opens the source cursor). A **physical
@@ -309,7 +316,7 @@ impl PlanBuildResult {
         SubPlan {
             in_reg: self.in_reg,
             out_reg: self.out_reg,
-            can_emit_on_empty: self.can_emit_on_empty,
+            can_emit_on_empty: std::cell::Cell::new(self.can_emit_on_empty),
             source_reg_map: self.source_reg_map,
             vm: self.vm,
         }
@@ -561,10 +568,7 @@ pub(crate) unsafe fn compile_view(
         ));
     }
 
-    let scatter_sources = compute_scatter_sources(&loaded, ext_tables);
     let skip_nodes = compute_skip_nodes(&loaded);
-    let range_join_n_eq = circuit_range_join_n_eq(&loaded);
-    let skips_exchange = compute_skips_exchange(&loaded, ext_tables);
     // Swept from `loaded`, not threaded out of `emit_node`: `EmitCtx` flows into
     // `SubPlan`, never into `CompileOutput`, and an `Exchanged` shape runs
     // `build_plan` once per side plus post — so an emit-sourced value would need
@@ -573,9 +577,6 @@ pub(crate) unsafe fn compile_view(
 
     let annotated = |shape: PlanShape, hydration: Option<Hydration>| CompileOutput {
         shape,
-        scatter_sources,
-        range_join_n_eq,
-        skips_exchange,
         source_bound,
         hydration,
     };
@@ -2100,7 +2101,7 @@ mod tests {
 
         // Shared helper used by both compute_join_shard_map and
         // DagEngine::get_join_shard_cols.
-        assert_eq!(reindex_cols_through_filters(&loaded, 0), vec![(1, 0)]);
+        assert_eq!(co_partition_keys(&loaded, 0), vec![(1, 0)]);
 
         let map = compute_join_shard_map(&loaded);
         assert_eq!(
@@ -2176,7 +2177,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reindex_cols_through_filters_with_worker_filter_after_map() {
+    fn test_co_partition_keys_with_worker_filter_after_map() {
         use gnitz_wire::{MapKind, OpNode};
         // A route-key Map followed by a WorkerFilter: the walk reaches the Map and
         // returns its cols, then stops — a WorkerFilter is not a Filter, so it is
@@ -2202,7 +2203,7 @@ mod tests {
         ];
         let loaded = loaded_for_test(nodes, edges);
         assert_eq!(
-            reindex_cols_through_filters(&loaded, 0),
+            co_partition_keys(&loaded, 0),
             vec![(2, 0)],
             "WorkerFilter after the reindex Map must not change the walk result"
         );
@@ -2215,7 +2216,7 @@ mod tests {
     /// keeps the join-shard map non-empty for a pure range join (hence
     /// `prepare_relay`'s `is_join` / `range_n_eq` and the broadcast routing).
     #[test]
-    fn test_reindex_cols_through_filters_range_join_feeds_join_directly() {
+    fn test_co_partition_keys_range_join_feeds_join_directly() {
         use gnitz_wire::{JoinKind, MapKind, OpNode};
         let dummy_blob = dummy_expr_blob();
         // ScanDelta(99) ─► Map(reindex=[2]) ─┬─► Join(DeltaTraceRange)  [delta, PORT_IN_A]
@@ -2249,7 +2250,7 @@ mod tests {
         ];
         let loaded = loaded_for_test(nodes, edges);
         assert_eq!(
-            reindex_cols_through_filters(&loaded, 0),
+            co_partition_keys(&loaded, 0),
             vec![(2, 0)],
             "the reindex feeds the Join directly, so feeds_trace_or_join is true \
              even with a WorkerFilter toward the trace"
@@ -2273,7 +2274,7 @@ mod tests {
             }),
         );
         let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN)]);
-        assert_eq!(reindex_cols_through_filters(&loaded, 0), vec![(3, 0)]);
+        assert_eq!(co_partition_keys(&loaded, 0), vec![(3, 0)]);
 
         // Absent: ScanDelta → Map with no reindex columns.
         let mut nodes2 = HashMap::new();
@@ -2288,13 +2289,13 @@ mod tests {
             }),
         );
         let loaded2 = loaded_for_test(nodes2, vec![(0, 1, PORT_IN)]);
-        assert!(reindex_cols_through_filters(&loaded2, 0).is_empty());
+        assert!(co_partition_keys(&loaded2, 0).is_empty());
     }
 
     /// Multi-join: a single ScanDelta fans out through two reindex Maps on
     /// different columns. Both column IDs must be collected, not just the first.
     #[test]
-    fn test_reindex_cols_through_filters_multi_join() {
+    fn test_co_partition_keys_multi_join() {
         use gnitz_wire::{MapKind, OpNode};
         let dummy_blob = dummy_expr_blob();
         // ScanDelta(0) ──► Map(reindex_col=2)
@@ -2322,7 +2323,7 @@ mod tests {
         );
         let edges = vec![(0, 1, PORT_IN), (0, 2, PORT_IN), (2, 3, PORT_IN)];
         let loaded = loaded_for_test(nodes, edges);
-        let mut got = reindex_cols_through_filters(&loaded, 0);
+        let mut got = co_partition_keys(&loaded, 0);
         got.sort_unstable();
         assert_eq!(got, vec![(2, 0), (5, 0)], "both reindex columns must be collected");
     }
@@ -2332,7 +2333,7 @@ mod tests {
     /// VERBATIM — duplicates and all — so the scatter packer mirrors the trace-side
     /// ReindexPacker slot-for-slot; column-level dedup would collapse it to one.
     #[test]
-    fn test_reindex_cols_through_filters_overlapping_key_verbatim() {
+    fn test_co_partition_keys_overlapping_key_verbatim() {
         use gnitz_wire::{MapKind, OpNode};
         let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
@@ -2348,7 +2349,7 @@ mod tests {
         );
         let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN)]);
         assert_eq!(
-            reindex_cols_through_filters(&loaded, 0),
+            co_partition_keys(&loaded, 0),
             vec![(3, 0), (3, type_code::I64)],
             "overlapping key sequence must survive verbatim, not be deduplicated"
         );
@@ -2359,7 +2360,7 @@ mod tests {
     /// They must collapse to ONE copy, never be concatenated (which would double
     /// the key columns and diverge from the trace).
     #[test]
-    fn test_reindex_cols_through_filters_sibling_maps_collapse() {
+    fn test_co_partition_keys_sibling_maps_collapse() {
         use gnitz_wire::{MapKind, OpNode};
         let dummy_blob = dummy_expr_blob();
         // ScanDelta(7) ──► Filter(not-null) ──► Map(reindex [2])
@@ -2389,7 +2390,7 @@ mod tests {
         let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (0, 3, PORT_IN), (3, 4, PORT_IN)];
         let loaded = loaded_for_test(nodes, edges);
         assert_eq!(
-            reindex_cols_through_filters(&loaded, 0),
+            co_partition_keys(&loaded, 0),
             vec![(2, 0)],
             "identical sibling sequences must collapse to one, not concatenate"
         );
@@ -2400,7 +2401,7 @@ mod tests {
     /// the input scatter key, and the planner says so by flagging one and not the
     /// other — concatenating both would corrupt the eq-prefix scatter.
     #[test]
-    fn test_reindex_cols_through_filters_ignores_aux_rekey_in_join_view() {
+    fn test_co_partition_keys_ignores_aux_rekey_in_join_view() {
         use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel};
         let dummy_blob = dummy_expr_blob();
         // ScanDelta(10) ──► Map(reindex [1,2]) ──► Join(DeltaTraceRange)
@@ -2446,7 +2447,7 @@ mod tests {
         ];
         let loaded = loaded_for_test(nodes, edges);
         assert_eq!(
-            reindex_cols_through_filters(&loaded, 0),
+            co_partition_keys(&loaded, 0),
             vec![(1, 0), (2, 0)],
             "only the trace/probe-feeding reindex defines the scatter key; the a.pk re-key is ignored"
         );

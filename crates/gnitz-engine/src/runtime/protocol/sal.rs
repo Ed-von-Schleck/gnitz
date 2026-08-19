@@ -19,7 +19,7 @@ use gnitz_wire::align8;
 // Constants
 // ---------------------------------------------------------------------------
 
-pub const MAX_WORKERS: usize = 64;
+pub use gnitz_wire::MAX_WORKERS;
 
 /// Leading marker of every out-of-space refusal from `SalWriter::begin`, and
 /// the whole contract a caller may match on. The condition is transient by

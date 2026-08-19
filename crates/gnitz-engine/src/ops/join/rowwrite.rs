@@ -3,7 +3,7 @@
 //! cross-file call boundary" guarantee.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, MemBatch, ReadCursor};
+use crate::storage::{Batch, BlobCacheGuard, MemBatch, ReadCursor};
 
 use gnitz_wire::merge_null_words;
 
@@ -12,7 +12,14 @@ use gnitz_wire::merge_null_words;
 /// Left columns come from the delta MemBatch. Right columns come from the
 /// cursor's current row — both halves through the shared, monomorphic
 /// `Batch::append_payload_cols` body (German-string blob relocation included).
+///
+/// `cache` dedups repeated long-string spans across the whole join, which is
+/// exactly the join's shape: both drivers are trace-major with this call at
+/// nesting depth 3, so a `D×T` key group re-appends each left payload `T` times
+/// and each right payload `D` times. The caller holds one guard per call rather
+/// than per row.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_join_row(
     output: &mut Batch,
     left_batch: &MemBatch,
@@ -21,6 +28,7 @@ pub(super) fn write_join_row(
     weight: i64,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
+    cache: &mut BlobCacheGuard,
 ) {
     let left_null = left_batch.get_null_word(left_row);
     let right_null = right_cursor.current_null_word;
@@ -32,9 +40,16 @@ pub(super) fn write_join_row(
     output.extend_weight(&weight.to_le_bytes());
     output.extend_null_bmp(&null_word.to_le_bytes());
 
-    output.append_payload_cols(0, left_schema, left_batch, left_row, left_null, None);
+    output.append_payload_cols(0, left_schema, left_batch, left_row, left_null, cache.get_mut());
     let (right_src, right_row) = right_cursor.current_row_source();
-    output.append_payload_cols(left_npc, right_schema, right_src, right_row, right_null, None);
+    output.append_payload_cols(
+        left_npc,
+        right_schema,
+        right_src,
+        right_row,
+        right_null,
+        cache.get_mut(),
+    );
 
     output.count += 1;
 }
@@ -79,6 +94,7 @@ mod tests {
             1,
             &left_schema,
             &right_schema,
+            &mut BlobCacheGuard::empty(),
         );
         assert_eq!(output.count, 1);
     }

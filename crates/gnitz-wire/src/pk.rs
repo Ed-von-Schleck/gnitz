@@ -286,6 +286,12 @@ fn bucket(h: u64, num_workers: usize) -> usize {
     ((h as u128 * num_workers as u128) >> 64) as usize
 }
 
+/// Upper bound on a cluster's worker count. Every routing surface derives from
+/// it: the SAL's per-worker slot arrays, and the relay's per-source scratch. It
+/// lives beside the routing functions rather than in the engine's SAL module so
+/// the operator layer can size an array by it without an up-edge into L7.
+pub const MAX_WORKERS: usize = 64;
+
 /// Which worker owns `key`.
 ///
 /// Multiplicative hash: two Fibonacci multipliers XOR'd together, then

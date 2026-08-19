@@ -1,7 +1,7 @@
 //! DBSP distinct operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{compare_rows, Batch, Layout, ReadCursor};
+use crate::storage::{Batch, Layout, ReadCursor};
 
 use super::cogroup::cogroup_left;
 
@@ -50,10 +50,17 @@ pub fn op_weight_clamp(
     //    walks the delta sub-range and the trace PK group in lockstep, both
     //    being (PK, payload)-sorted, so the per-element trace probe is the
     //    monotone forward walk the old per-row `seek_bytes` open-coded.
-    let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
-    let mut emit_weights: Vec<i64> = Vec::with_capacity(n);
+    // Grown on first emit, not up front: a tick where nothing transitions —
+    // the common shape once a set op has settled — then allocates nothing.
+    let mut emit_indices: Vec<u32> = Vec::new();
+    let mut emit_weights: Vec<i64> = Vec::new();
 
     let consolidated_mb = consolidated.as_mem_batch();
+    // The payload comparator, dispatched once for the whole scan. This is the
+    // inner loop of every set operation and every equi/band outer-join
+    // null-fill, so a per-comparison dispatch here would run the generic
+    // per-column body even where the schema selects the branch-free one.
+    let row_cmp = cursor.payload_cmp_vs_mem();
 
     cogroup_left(&consolidated, cursor, |key, range, m| {
         for i in range {
@@ -61,8 +68,7 @@ pub fn op_weight_clamp(
                 if !m.valid || !m.current_pk_eq(key) {
                     break 0;
                 }
-                let (src, row) = m.current_row_source();
-                match compare_rows(schema, src, row, &consolidated_mb, i) {
+                match row_cmp(m, schema, &consolidated_mb, i) {
                     std::cmp::Ordering::Less => {
                         m.advance();
                     }
@@ -75,9 +81,13 @@ pub fn op_weight_clamp(
                 }
             };
 
-            let w_new = w_old.wrapping_add(consolidated.get_weight(i));
+            let w_new = w_old.wrapping_add(consolidated_mb.get_weight(i));
             let out_w = w_new.clamp(lo, hi) - w_old.clamp(lo, hi);
             if out_w != 0 {
+                if emit_indices.is_empty() {
+                    emit_indices.reserve(n - i);
+                    emit_weights.reserve(n - i);
+                }
                 emit_indices.push(i as u32);
                 emit_weights.push(out_w);
             }
@@ -85,7 +95,7 @@ pub fn op_weight_clamp(
     });
 
     // 3. Scatter-copy emitting rows
-    let mut output = Batch::from_indexed_rows(&consolidated.as_mem_batch(), &emit_indices, &emit_weights, schema);
+    let mut output = Batch::from_indexed_rows(&consolidated_mb, &emit_indices, &emit_weights, schema);
     // Emitting rows are scattered in consolidated-delta order (ascending indices),
     // one per transitioning element ⇒ (PK, payload)-sorted and ghost-free.
     output.certify_layout(Layout::Consolidated, schema);
@@ -106,6 +116,40 @@ mod tests {
         make_batch, make_batch_i64pk as make_signed_batch, make_schema_i64pk_i64 as make_schema_signed,
         make_schema_u64_i64, make_wide_batch, opk_pk, opk_pk_i64, wide_pk_3xu64_schema,
     };
+
+    #[test]
+    fn test_distinct_update_same_pk() {
+        use std::rc::Rc;
+
+        let schema = make_schema_u64_i64();
+
+        // Trace: (PK=1, val=100, w=+1) — a row inserted in a previous tick.
+        let trace_batch = Rc::new(make_batch(&schema, &[(1, 1, 100)]));
+        let mut cursor_handle = ReadCursor::over_batches(&[trace_batch], schema);
+
+        // Delta: UPDATE PK=1 sets val=100 → 200.
+        // _enforce_unique_pk emits (PK=1, val=100, w=-1) and (PK=1, val=200, w=+1).
+        // Both rows have the same PK but different payloads; sorted by payload ascending.
+        let delta = make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]);
+
+        let (out, _consolidated) = op_distinct(delta, &mut cursor_handle, &schema);
+
+        assert_eq!(
+            out.count, 2,
+            "expected 2 output rows after same-PK update, got {}",
+            out.count
+        );
+
+        assert_eq!((out.get_pk(0) as u64), 1);
+        let val0 = i64::from_le_bytes(out.col_data(0)[0..8].try_into().unwrap());
+        assert_eq!(val0, 100);
+        assert_eq!(out.get_weight(0), -1);
+
+        assert_eq!((out.get_pk(1) as u64), 1);
+        let val1 = i64::from_le_bytes(out.col_data(0)[8..16].try_into().unwrap());
+        assert_eq!(val1, 200);
+        assert_eq!(out.get_weight(1), 1);
+    }
 
     #[test]
     fn test_op_distinct_boundary() {

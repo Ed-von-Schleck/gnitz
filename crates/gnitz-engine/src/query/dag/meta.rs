@@ -19,13 +19,27 @@ pub(crate) struct ViewMeta {
     /// all. The two states are distinct: an ungrouped global aggregate shards on
     /// `∅`, a real exchange that funnels every row onto `worker_for_key(V₀)`.
     pub shard_cols: Option<Rc<[u32]>>,
-    /// source table id → its join/group reindex scatter key.
-    pub join_shard_map: FxHashMap<i64, JoinScatterKey>,
+    /// source table id → the one key the relay packs and routes that source's
+    /// delta by. `None` for a source whose scan feeds several distinct reindex
+    /// keys: no single pack key co-partitions with the trace sides, so the relay
+    /// must refuse the round rather than route by a key nothing was stored under
+    /// (see `compiler::load::scatter_key`). Absent = the source carries no
+    /// reindex key at all, and the view's own `shard_cols` route it.
+    pub join_shard_map: FxHashMap<i64, Option<JoinScatterKey>>,
     /// `Some(n_eq)` iff the view is a non-equi (range / band) join. Drives the
-    /// master relay's eq-prefix scatter (`n_eq ≥ 1`) vs broadcast (`n_eq == 0`).
+    /// master relay's eq-prefix scatter (`n_eq ≥ 1`) vs broadcast (`n_eq == 0`),
+    /// and the worker dispatch's input-relay arm.
     pub range_join_n_eq: Option<u8>,
     /// The circuit carries a `Join` node.
     pub has_join: bool,
+    /// The sources whose deltas must go through the join scatter: those carrying
+    /// a join/group reindex key, minus those whose native distribution already
+    /// matches it (or whose partner is replicated). Probed once per epoch on the
+    /// multi-worker dispatch path, which is why it is `Fx`-hashed.
+    pub scatter_sources: FxHashSet<i64>,
+    /// The unary output `ExchangeShard` is a proven no-op (every row already on
+    /// the worker owning its distribution key) — the output IPC is elided.
+    pub skips_exchange: bool,
 }
 
 /// One source's join/group reindex scatter key: the columns the relay routes by
@@ -56,16 +70,21 @@ impl ViewMeta {
             join_shard_map: FxHashMap::default(),
             range_join_n_eq: None,
             has_join: false,
+            scatter_sources: FxHashSet::default(),
+            skips_exchange: false,
         }
     }
 
     /// Derive the metadata from an already-loaded circuit. The body behind
     /// `view_meta`'s memo miss.
-    pub(super) fn from_loaded(loaded: &compiler::LoadedCircuit) -> ViewMeta {
+    /// `ext_tables` is what the routing half needs and the circuit alone cannot
+    /// supply: co-partitioning and the output-shard elision both test a shard key
+    /// against a *source relation's* distribution prefix.
+    pub(super) fn from_loaded(loaded: &compiler::LoadedCircuit, ext_tables: &compiler::ExtTables) -> ViewMeta {
         let shard_cols: Option<Rc<[u32]>> = compiler::output_exchange_shard(loaded).map(|(_, cols)| cols.into());
-        let join_shard_map: FxHashMap<i64, JoinScatterKey> = compiler::compute_join_shard_map(loaded)
+        let join_shard_map: FxHashMap<i64, Option<JoinScatterKey>> = compiler::compute_scatter_keys(loaded)
             .into_iter()
-            .map(|(tid, pairs)| (tid, JoinScatterKey::from_pairs(pairs)))
+            .map(|(tid, key)| (tid, key.map(JoinScatterKey::from_pairs)))
             .collect();
         ViewMeta {
             shard_cols,
@@ -75,6 +94,8 @@ impl ViewMeta {
                 .nodes
                 .values()
                 .any(|op| matches!(op, gnitz_wire::OpNode::Join(_))),
+            scatter_sources: compiler::compute_scatter_sources(loaded, ext_tables),
+            skips_exchange: compiler::compute_skips_exchange(loaded, ext_tables),
         }
     }
 }
@@ -358,10 +379,11 @@ impl DagEngine {
         if let Some(m) = self.meta.get(&view_id) {
             return m.clone();
         }
+        let ext = self.ext_tables();
         let meta = Rc::new(
             self.load_meta_circuit(view_id)
                 .as_ref()
-                .map_or_else(ViewMeta::nothing_special, ViewMeta::from_loaded),
+                .map_or_else(ViewMeta::nothing_special, |l| ViewMeta::from_loaded(l, &ext)),
         );
         self.meta.insert(view_id, meta.clone());
         meta

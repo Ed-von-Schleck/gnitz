@@ -2,7 +2,7 @@
 //! constructors, and `build_plan` (one plan, pre or post exchange).
 
 use super::*;
-use crate::query::vm::{reads_reg, Instr, IntegrateAvi, IntegrateTarget, ReindexOperand};
+use crate::query::vm::{reads_reg, Instr, IntegrateAvi, IntegrateTarget, ReduceAvi, ReindexOperand};
 
 // ---------------------------------------------------------------------------
 // Expression + scalar function construction helpers
@@ -681,7 +681,6 @@ pub(super) fn emit_reduce(
         .map(|&(func, col_idx)| AggDescriptor {
             col_idx: col_idx as u32,
             agg_op: func,
-            col_type_code: TypeCode::from_validated_u8(in_reg_schema.columns[col_idx as usize].type_code),
         })
         .collect();
 
@@ -696,7 +695,9 @@ pub(super) fn emit_reduce(
     // rather than panicking a worker at execution.
     if agg_descs.iter().any(|ad| {
         matches!(ad.agg_op, AggFunc::Sum | AggFunc::SumZero | AggFunc::Min | AggFunc::Max)
-            && !agg_value_idx_eligible(ad.col_type_code)
+            && !agg_value_idx_eligible(TypeCode::from_validated_u8(
+                in_reg_schema.columns[ad.col_idx as usize].type_code,
+            ))
     }) {
         return Err(CompileError::Rejected(
             "reduce: aggregate column is not order-encodable",
@@ -727,23 +728,21 @@ pub(super) fn emit_reduce(
     let raw_delta_id = ctx.push_delta_reg(reduce_out_schema);
     ctx.out_reg_of.insert(nid, raw_delta_id);
 
-    let all_linear = agg_descs.iter().all(|a| a.agg_op.is_linear());
-    let has_value_indexed = agg_descs.iter().any(|a| a.agg_op.uses_value_index());
     // Serve every MIN/MAX aggregate (grouped or global) from one combined value
-    // index, keyed `group_cols ‖ ordinal ‖ av_encoded`, when the group key is
-    // byte-form-eligible (the ordinal column is accounted for in
-    // `avi_group_key_eligible`'s budget). Every value-indexed aggregate is already
-    // order-encodable — the combined value-decode guard above rejected any that
-    // were not — so AVI use turns only on the group key. The empty global key is
-    // eligible, so a global MIN/MAX always resolves via the index; nothing
-    // value-indexed is left on the trace-scan fallback below.
+    // index, keyed `group_cols ‖ ordinal ‖ av_encoded`. Every group set has a
+    // packed group key (`gnitz_wire::group_key_layout` reserves the ordinal and
+    // value slots out of the PK budget and folds an over-long key into a trailing
+    // hash slot), and every value-indexed aggregate is order-encodable — the
+    // combined value-decode guard above rejected any that were not. So a reduce
+    // carries a value index iff it has a non-linear aggregate, with no eligibility
+    // gate and no trace-replay history to fall back to.
     //
     // No nullable check on the aggregate columns: NULL aggregate values never
     // reach the AVI. The reduce accumulator skips NULL inputs (ops/reduce/agg.rs)
     // and AVI population skips a NULL aggregate value before encoding the index
     // key (ops/index.rs), whose value column is a non-nullable PK. Moving either
     // filter without revisiting this would write a zeroed key and corrupt MIN/MAX.
-    let use_avi = has_value_indexed && avi_group_key_eligible(&in_reg_schema, &gcols_u32);
+    let use_avi = agg_descs.iter().any(|a| a.agg_op.uses_value_index());
 
     // A reduce owns its trace-in: `reduce_node` wires PORT_IN only, and PORT_TRACE
     // is written solely by `binary_join`. An externally supplied trace edge would
@@ -753,18 +752,6 @@ pub(super) fn emit_reduce(
     // reject it like the ~30 neighbouring guards rather than honouring the edge.
     if input_on_port(loaded, nid, PORT_TRACE).is_some() {
         return Err(CompileError::Rejected("reduce: unexpected trace input port"));
-    }
-    // The trace-in history and the value index are alternatives, not companions:
-    // one replays the input to recompute a retracted extreme, the other seeks it.
-    let mut tr_in_reg_id: Option<u16> = None;
-    let mut tr_in_table_ptr: Option<*mut Table> = None;
-
-    if !all_linear && !use_avi {
-        let reg = ctx.reg_meta.len() as u16;
-        ctx.reg_meta.push(RegisterMeta::delta(in_reg_schema)); // overwritten to trace below
-        tr_in_table_ptr =
-            Some(ctx.add_owned_trace_table(&format!("_reduce_in_{}_{nid}", ctx.view_id), in_reg_schema, Some(reg))?);
-        tr_in_reg_id = Some(reg);
     }
 
     // One combined value index per reduce: a single table keyed
@@ -776,27 +763,27 @@ pub(super) fn emit_reduce(
     //
     // It integrates BEFORE the reduce reads it, so a prefix seek returns the
     // post-delta extreme directly. (The trace-in integrate below runs after.)
-    let avi_table_idx = if use_avi {
+    let avi = if use_avi {
         let avi_aggs: Vec<AggDescriptor> = agg_descs
             .iter()
             .filter(|d| d.agg_op.uses_value_index())
             .copied()
             .collect();
-        let avi_schema = crate::ops::make_avi_schema(&in_reg_schema, &gcols_u32);
-        // Not optional: `use_avi` suppressed the `_reduce_in` trace table, so a
-        // swallowed failure would leave the non-linear reduce with neither an index
-        // nor a history to replay — MIN/MAX computed from the delta alone, with the
-        // old row still retracted.
-        let avi_table_ptr = ctx.add_owned_trace_table(&format!("_avidx_{}_{nid}", ctx.view_id), avi_schema, None)?;
-        let bake_idx = ctx
-            .builder
-            .add_avi_bake(crate::ops::AviBake::new(&in_reg_schema, &gcols_u32, &avi_aggs));
+        // Build the bake first and take the index schema off it, rather than
+        // deriving the same schema a second time for the table.
+        let bake = crate::ops::AviBake::new(&in_reg_schema, &gcols_u32, &avi_aggs)
+            .ok_or(CompileError::Rejected("reduce: value-index key exceeds the PK budget"))?;
+        // Not optional: a non-linear reduce has no history other than this index,
+        // so a swallowed failure would leave MIN/MAX computed from the delta alone
+        // with the old row still retracted.
+        let avi_table_ptr = ctx.add_owned_trace_table(&format!("_avidx_{}_{nid}", ctx.view_id), bake.schema, None)?;
+        let bake_idx = ctx.builder.add_avi_bake(bake);
         let table_idx = ctx.builder.table_idx(avi_table_ptr);
         ctx.builder.push(Instr::Integrate {
             in_reg: in_reg_id,
             target: IntegrateTarget::Avi(IntegrateAvi { table_idx, bake_idx }),
         });
-        Some(table_idx)
+        Some(ReduceAvi { table_idx, bake_idx })
     } else {
         None
     };
@@ -822,7 +809,7 @@ pub(super) fn emit_reduce(
         && (ctx.replicated()
             || unsharded
             || worker_rank() as usize
-                == gnitz_wire::worker_for_key(crate::ops::global_group_key(), num_workers() as usize));
+                == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), num_workers() as usize));
 
     // Bake the reduce plan — the one construction site for everything the
     // operator would otherwise re-derive per epoch from the instruction operands.
@@ -832,23 +819,18 @@ pub(super) fn emit_reduce(
         &gcols_u32,
         &agg_descs,
         out_key,
-        avi_table_idx.is_some(),
+        avi.is_some(),
         global_ground,
         i_am_owner,
     ));
 
     ctx.builder.push(Instr::Reduce {
         in_reg: in_reg_id,
-        trace_in_reg: tr_in_reg_id,
         trace_out_reg: reg_id,
         out_reg: raw_delta_id,
         plan_idx,
-        avi_table_idx,
+        avi,
     });
-
-    if let Some(ptr) = tr_in_table_ptr {
-        ctx.push_integrate(in_reg_id, ptr);
-    }
 
     ctx.push_integrate(raw_delta_id, trace_table_ptr);
     Ok(())

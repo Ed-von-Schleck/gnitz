@@ -12,6 +12,7 @@ use super::batch::Batch;
 use super::columnar::with_payload_cmp;
 use super::columnar::ColumnarSource;
 use super::heap::{drive_merge, HeapNode, LoserTree};
+use super::merge::MemBatch;
 use super::merge::{self, PosCursor, UnifiedSource};
 #[cfg(test)]
 use super::shard_reader::MappedShard;
@@ -24,12 +25,9 @@ mod output;
 use super::run::Run;
 pub(crate) use gather::PkSetGather;
 use gnitz_expr::RowSource;
-pub(crate) use output::DrainGuard;
 
-#[cfg(test)]
-thread_local! {
-    pub(crate) static REWIND_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
+/// See [`ReadCursor::payload_cmp_vs_mem`].
+pub(crate) type PayloadCmpVsMem = fn(&ReadCursor, &SchemaDescriptor, &MemBatch, usize) -> Ordering;
 
 // ---------------------------------------------------------------------------
 // ReadCursor
@@ -209,8 +207,6 @@ impl ReadCursor {
     /// all-zero key is what makes this correct for a signed PK, whose minimum is
     /// a negative value that sorts below the zero key.
     pub fn rewind(&mut self) {
-        #[cfg(test)]
-        REWIND_CALLS.with(|c| c.set(c.get() + 1));
         for state in self.states.iter_mut() {
             state.position = 0;
         }
@@ -348,6 +344,26 @@ impl ReadCursor {
     pub(crate) fn current_row_source(&self) -> (&impl RowSource, usize) {
         debug_assert!(self.valid, "current_row_source on an invalid cursor");
         (&self.sources[self.current_entry_idx], self.current_row)
+    }
+
+    /// The schema-selected payload comparator for "this cursor's current row
+    /// versus a `MemBatch` row", resolved **once** so a caller's inner loop makes
+    /// the dispatch zero times rather than once per comparison. The same two
+    /// comparators `with_payload_cmp!` picks between at every merge seat; this is
+    /// the seat whose other operand is an in-memory batch rather than a second
+    /// cursor source, which is why it cannot go through the macro directly. Gate
+    /// each call on `valid`.
+    pub(crate) fn payload_cmp_vs_mem(&self) -> PayloadCmpVsMem {
+        match self.schema.payload_cmp {
+            crate::schema::PayloadCmpKind::FixedIntNonnull => |c, s, mb, i| {
+                let (src, row) = c.current_row_source();
+                crate::storage::compare_rows_fixedint_nonnull(s, src, row, mb, i)
+            },
+            crate::schema::PayloadCmpKind::Generic => |c, s, mb, i| {
+                let (src, row) = c.current_row_source();
+                crate::storage::compare_rows(s, src, row, mb, i)
+            },
+        }
     }
 
     /// The current row's PK as its native scalar value. Only narrow

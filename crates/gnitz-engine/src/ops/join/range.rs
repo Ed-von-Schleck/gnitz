@@ -4,7 +4,7 @@ use crate::schema::key::pk_bytes_eq;
 use crate::schema::key::{increment_key_in_place, PkBuf};
 use crate::schema::SchemaDescriptor;
 use crate::schema::MAX_PK_BYTES;
-use crate::storage::{Batch, MemBatch, ReadCursor};
+use crate::storage::{Batch, BlobCacheGuard, MemBatch, ReadCursor};
 use gnitz_wire::RangeRel;
 
 /// Half-open `[start, end)` cut points over the trace PK space for one delta
@@ -163,6 +163,8 @@ fn range_per_row_seek(
 
     let delta_mb = consolidated.as_mem_batch();
     let mut output = Batch::with_capacity(*out_schema, n);
+    // One dedup cache for the whole join (see `op_join_delta_trace`).
+    let mut cache = BlobCacheGuard::acquire(out_schema, n);
 
     for i in 0..n {
         let pk_i = consolidated.get_pk_bytes(i);
@@ -185,7 +187,16 @@ fn range_per_row_seek(
         {
             let w_out = w_delta.wrapping_mul(cursor.current_weight);
             if w_out != 0 {
-                write_join_row(&mut output, &delta_mb, i, cursor, w_out, left_schema, right_schema);
+                write_join_row(
+                    &mut output,
+                    &delta_mb,
+                    i,
+                    cursor,
+                    w_out,
+                    left_schema,
+                    right_schema,
+                    &mut cache,
+                );
             }
             cursor.advance();
         }
@@ -225,6 +236,8 @@ fn range_merge_walk(
     // Seed at the delta size (see `op_join_delta_trace`) rather than doubling
     // from empty.
     let mut output = Batch::with_capacity(*out_schema, m);
+    // One dedup cache for the whole join (see `op_join_delta_trace`).
+    let mut cache = BlobCacheGuard::acquire(out_schema, m);
 
     let mut lo = 0; // start of the current delta eq group
     while lo < m {
@@ -294,7 +307,16 @@ fn range_merge_walk(
             for k in rs..re {
                 let w_out = delta_mb.get_weight(k).wrapping_mul(w_t);
                 if w_out != 0 {
-                    write_join_row(&mut output, &delta_mb, k, cursor, w_out, left_schema, right_schema);
+                    write_join_row(
+                        &mut output,
+                        &delta_mb,
+                        k,
+                        cursor,
+                        w_out,
+                        left_schema,
+                        right_schema,
+                        &mut cache,
+                    );
                 }
             }
             cursor.advance();
@@ -703,14 +725,13 @@ mod tests {
         }
     }
 
-    /// Empty trace with a non-empty delta: the merge (which the `n > trace_len`
-    /// selector picks when `trace_len == 0`) walks zero trace rows and emits
-    /// nothing — same as the per-row path landing every seek on an invalid cursor.
+    /// Empty trace with a non-empty delta: the merge walks zero trace rows and
+    /// emits nothing — same as the per-row path landing every seek on an invalid
+    /// cursor.
     #[test]
     fn test_range_dt_merge_empty_trace() {
         let schema = make_schema_u64_i64();
         let delta = make_batch(&schema, &[(10, 1, 1), (20, 1, 2)]);
-        // Through the public selector: n=2 > trace_len=0 → merge path, empty out.
         let mut ch = trace_cursor(make_batch(&schema, &[]), schema);
         let out = op_join_delta_trace_range(
             &delta,
@@ -735,54 +756,6 @@ mod tests {
         for rel in [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge] {
             let trace = make_band_batch(&schema, &[(1, 5, 1, 15), (3, 5, 1, 35), (3, 9, 1, 39)]);
             assert_merge_eq_per_row(schema, 1, rel, &delta, trace);
-        }
-    }
-
-    /// The public selector routes by size: an oversized delta (`n > trace_len`)
-    /// takes the merge, a small delta the per-row path — both equal the per-row
-    /// oracle. Pins the `n > trace_len` boundary end to end.
-    #[test]
-    fn test_range_dt_selector_routes_by_size() {
-        let schema = make_schema_u64_i64();
-        let trace_rows: Vec<(u64, i64, i64)> = (0..4u64).map(|y| (y * 10, 1, 100 + y as i64)).collect();
-        // Oversized delta (8 > 4) → merge; small delta (2 ≤ 4) → per-row.
-        for delta_rows in [
-            vec![
-                (5u64, 1i64, 0i64),
-                (6, 1, 0),
-                (7, 1, 0),
-                (8, 1, 0),
-                (9, 1, 0),
-                (11, 1, 0),
-                (12, 1, 0),
-                (13, 1, 0),
-            ],
-            vec![(15, 1, 0), (25, 1, 0)],
-        ] {
-            let delta = make_batch(&schema, &delta_rows);
-            // Oracle: force the per-row path directly.
-            let mut ch_oracle = trace_cursor(make_batch(&schema, &trace_rows), schema);
-            let oracle = range_per_row_seek(
-                &delta,
-                &mut ch_oracle,
-                &schema,
-                &schema,
-                &join_out_schema(&schema, &schema),
-                0,
-                RangeRel::Lt,
-            );
-            // Subject: the public selector.
-            let mut ch = trace_cursor(make_batch(&schema, &trace_rows), schema);
-            let out = op_join_delta_trace_range(
-                &delta,
-                &mut ch,
-                &schema,
-                &schema,
-                &join_out_schema(&schema, &schema),
-                0,
-                RangeRel::Lt,
-            );
-            assert_eq!(range_multiset(&oracle), range_multiset(&out));
         }
     }
 

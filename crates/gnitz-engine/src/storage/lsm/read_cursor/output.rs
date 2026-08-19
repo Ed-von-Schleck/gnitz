@@ -252,17 +252,6 @@ impl ReadCursor {
         self.sources.iter().map(|s| s.blob().len()).sum()
     }
 
-    /// Current row's `(entry_idx, row, weight)` — the coordinate
-    /// `scatter_drained_into` resolves. Applies no validity or zero-weight
-    /// filter; the caller scans under a `valid` guard and filters itself.
-    pub(crate) fn current_row_loc(&self) -> (u32, u32, i64) {
-        (
-            self.current_entry_idx as u32,
-            self.current_row as u32,
-            self.current_weight,
-        )
-    }
-
     /// Walk the merge order and fill `out` with `(entry_idx, row_idx, weight)`
     /// for every row whose net consolidated weight is non-zero.  Drains up to
     /// `limit` rows (`limit == 0` means unlimited).  Clears `out` first.

@@ -410,13 +410,6 @@ impl<'a> MemBatch<'a> {
     }
 
     #[inline(always)]
-    pub fn get_pk(&self, row: usize) -> u128 {
-        let stride = self.pk_stride as usize;
-        let off = self.offsets[super::batch::REG_PK] + row * stride;
-        gnitz_wire::widen_pk_be(&self.data[off..off + stride], stride)
-    }
-
-    #[inline(always)]
     pub fn get_pk_bytes(&self, row: usize) -> &'a [u8] {
         let stride = self.pk_stride as usize;
         let off = self.offsets[super::batch::REG_PK] + row * stride;
@@ -1976,12 +1969,16 @@ mod tests {
             assert_eq!(bytes.len(), 16, "row {i} stride");
             // PK region is OPK (order-preserving big-endian) at rest.
             assert_eq!(bytes, &pk.to_be_bytes(), "row {i} opk bytes");
-            assert_eq!(mb.get_pk(i), pk, "row {i} u128");
+            assert_eq!(
+                gnitz_wire::widen_pk_be(bytes, mb.pk_stride as usize),
+                pk,
+                "row {i} u128"
+            );
         }
     }
 
     #[test]
-    fn mem_batch_get_pk_bytes_matches_get_pk_u64() {
+    fn mem_batch_get_pk_bytes_widen_u64() {
         let schema = crate::test_support::make_schema_u64_i64();
         let pks: &[u64] = &[0, 1, 1 << 32, u64::MAX];
         let mut b = Batch::empty_with_schema(&schema);
@@ -2000,7 +1997,11 @@ mod tests {
             assert_eq!(bytes.len(), 8, "row {i} stride");
             // PK region is OPK (order-preserving big-endian) at rest.
             assert_eq!(bytes, &pk.to_be_bytes(), "row {i} opk bytes");
-            assert_eq!(mb.get_pk(i), pk as u128, "row {i} u128");
+            assert_eq!(
+                gnitz_wire::widen_pk_be(bytes, mb.pk_stride as usize),
+                pk as u128,
+                "row {i} u128"
+            );
         }
     }
 

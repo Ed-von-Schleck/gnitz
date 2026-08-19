@@ -79,6 +79,7 @@ pub(crate) struct DerivedSchema {
     cols: [SchemaColumn; MAX_COLUMNS],
     n: usize,
     pk_len: usize,
+    pk_bytes: usize,
 }
 
 impl DerivedSchema {
@@ -87,6 +88,7 @@ impl DerivedSchema {
             cols: [SchemaColumn::EMPTY; MAX_COLUMNS],
             n: 0,
             pk_len: 0,
+            pk_bytes: 0,
         }
     }
 
@@ -99,13 +101,19 @@ impl DerivedSchema {
 
     /// Append one PK column. Must precede every [`Self::push`]: the PK occupies
     /// the leading slots.
+    ///
+    /// Bounds the PK **stride** as well as the column count: `SchemaDescriptor::new`
+    /// asserts `stride <= MAX_PK_BYTES`, so a builder that checked only the count
+    /// would turn an over-wide composite key into a panic inside `finish()`
+    /// instead of a `None` its caller can reject the circuit on.
     pub(crate) fn push_pk(&mut self, col: SchemaColumn) -> Option<()> {
         debug_assert_eq!(self.pk_len, self.n, "PK columns must precede payload columns");
-        if self.pk_len == MAX_PK_COLUMNS {
+        if self.pk_len == MAX_PK_COLUMNS || self.pk_bytes + col.size() as usize > MAX_PK_BYTES {
             return None;
         }
         self.push(col)?;
         self.pk_len += 1;
+        self.pk_bytes += col.size() as usize;
         Some(())
     }
 
@@ -347,6 +355,11 @@ pub(crate) struct SchemaDescriptor {
     /// `new()`; read by every merge/sort/join dispatch (via `with_payload_cmp!`)
     /// in place of calling `schema_is_fixedint_nonnull` at each site.
     pub(crate) payload_cmp: PayloadCmpKind,
+    /// Whether any payload column is a German string. Cached for the same reason
+    /// `payload_cmp` is: every blob-cache acquisition and every append path asks,
+    /// and the answer is a walk of the payload columns. Free in the struct's tail
+    /// padding — a per-slot mask would not be, and would break the size pin.
+    has_german_string: bool,
     pub(crate) columns: [SchemaColumn; MAX_COLUMNS],
 }
 
@@ -473,6 +486,18 @@ impl SchemaDescriptor {
         let pk_stride = stride_acc as u8;
         let (payload_mapping, payload_to_ci) = compute_mappings(cols.len(), pk_indices);
         let payload_cmp = compute_payload_cmp(cols, &payload_mapping);
+        let has_german_string = {
+            let mut i = 0;
+            let mut found = false;
+            while i < cols.len() {
+                if payload_mapping[i] != PAYLOAD_MAPPING_PK_SENTINEL && gnitz_wire::is_german_string(cols[i].type_code)
+                {
+                    found = true;
+                }
+                i += 1;
+            }
+            found
+        };
         SchemaDescriptor {
             num_columns: cols.len() as u32,
             pk_count: pk_indices.len() as u32,
@@ -483,6 +508,7 @@ impl SchemaDescriptor {
             payload_mapping,
             payload_to_ci,
             payload_cmp,
+            has_german_string,
             columns,
         }
     }
@@ -594,20 +620,19 @@ impl SchemaDescriptor {
         self.placement
     }
 
-    /// True iff the PK is a single signed column (I8/I16/I32/I64). Its OPK
-    /// encoding flips the sign bit of the leading byte, so the `extend_pk` /
-    /// `set_pk_at` u128 fast paths — which write right-aligned big-endian bytes
-    /// with no sign flip — are wrong for it. Such callers must use
-    /// `extend_pk_bytes`. Only test-build callers need it, so it is gated to
-    /// test builds to keep the production API minimal.
-    #[cfg(test)]
+    /// True iff any PK column is a signed integer.
+    ///
+    /// The `extend_pk` / `set_pk_at` `u128` fast paths write the value's
+    /// right-aligned big-endian bytes with **no sign flip**, which is the OPK
+    /// encoding for unsigned columns only — an all-unsigned compound PK is fine
+    /// (its OPK is the big-endian concatenation, which is what a correctly packed
+    /// `u128` already spells), a signed column anywhere is not. Those callers must
+    /// go through `extend_pk_opk` / `extend_pk_bytes`. `extend_pk` debug-asserts
+    /// this, so the rule is machine-checked at every one of its ~150 call sites
+    /// rather than carried as prose beside them.
     #[inline]
-    pub(crate) const fn pk_is_signed_single_col(&self) -> bool {
-        if self.pk_count != 1 {
-            return false;
-        }
-        let tc = self.columns[self.pk_indices[0] as usize].type_code;
-        is_signed_int(tc)
+    pub(crate) fn pk_has_signed_col(&self) -> bool {
+        self.pk_columns().any(|(_, c)| c.is_signed())
     }
 
     /// Number of non-PK ("payload") columns.
@@ -629,12 +654,12 @@ impl SchemaDescriptor {
     }
 
     /// Whether the schema carries a STRING/BLOB (German-string) column. Those
-    /// can never be PK columns, so scanning the payload columns is exhaustive.
-    /// Callers use this to decide whether a batch's blob region is live.
+    /// can never be PK columns, so the `new()` walk over payload columns is
+    /// exhaustive. Callers use this to decide whether a batch's blob region is
+    /// live.
     #[inline]
     pub(crate) fn has_german_string(&self) -> bool {
-        self.payload_columns()
-            .any(|(_, col)| gnitz_wire::is_german_string(col.type_code))
+        self.has_german_string
     }
 
     /// Dense payload slot (batch payload region + null-bitmap bit position) for a
@@ -1085,10 +1110,44 @@ pub(crate) fn null_extend_output_schema(in_schema: &SchemaDescriptor, type_codes
 /// program (and range-checked) by `emit_node`. A join side whose program skips a
 /// dead source column thus stops persisting it in the trace.
 ///
-/// The `None` bound also covers the packed key *width*, so no caller owes a
-/// `MAX_PK_BYTES` check: each slot is at most 16 bytes and at most
-/// `MAX_PK_COLUMNS` (5) fit — 5 × 16 = 80 = `MAX_PK_BYTES`, `ReindexPacker::new`'s
-/// assert.
+/// The `None` bound also covers the packed key *width*: `DerivedSchema::push_pk`
+/// tracks the PK stride, so no caller owes a `MAX_PK_BYTES` check.
+/// AVI index schema: the packed **group key** ([`gnitz_wire::group_key_layout`]),
+/// then a `u8` ordinal selecting which non-linear aggregate the entry belongs to,
+/// then the order-encoded aggregate value (U64). All columns are PK; there is no
+/// payload.
+///
+/// The ordinal sits **between** the group key and the value so the byte-ordered
+/// key sorts by `(group, ordinal, av)`: a group's ordinal-0 entries precede its
+/// ordinal-1 entries, and within an ordinal the per-aggregate `for_max`
+/// encoding sorts the extreme first. So `MIN(a)` (ordinal 0) and `MAX(a)`
+/// (ordinal 1) coexist with no collision and no `for_max` clash, and one
+/// schema shape serves single- and multi-aggregate reduces alike. The empty
+/// global key reduces the prefix to just `ordinal`.
+///
+/// Total: the group-key layout reserves the ordinal and value slots out of the
+/// PK budget, so **every** group set has an index and no reduce is left on a
+/// per-epoch trace rescan. `None` is therefore unreachable for a well-formed
+/// input schema and stays only because the builder owns the bound.
+pub(crate) fn avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> Option<SchemaDescriptor> {
+    let descs: Vec<(u8, bool)> = group_by_cols
+        .iter()
+        .map(|&c| {
+            let col = &src.columns[c as usize];
+            (col.type_code, col.nullable != 0)
+        })
+        .collect();
+    let mut b = DerivedSchema::new();
+    // Force non-nullable: the packed key spells a NULL into its presence bitmap,
+    // so every slot always carries a present value.
+    for slot in gnitz_wire::group_key_layout(&descs).slots {
+        b.push_pk(SchemaColumn::new(slot, 0))?;
+    }
+    b.push_pk(SchemaColumn::new(type_code::U8, 0))?; // ordinal
+    b.push_pk(SchemaColumn::new(type_code::U64, 0))?; // av_encoded
+    Some(b.finish())
+}
+
 pub(crate) fn reindex_output_schema(
     in_schema: &SchemaDescriptor,
     reindex_cols: &[u32],
