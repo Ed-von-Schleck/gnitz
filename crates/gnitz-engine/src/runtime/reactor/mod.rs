@@ -327,7 +327,7 @@ fn resolve_inbound_cap() -> usize {
         (crate::foundation::posix_io::available_memory_bytes() / 4).clamp(io::INBOUND_CAP_FLOOR, io::INBOUND_CAP_CEIL);
     // The operator override wins, floored so it can never bar a single
     // max-size frame (the default is already within the floor).
-    crate::foundation::env::env_usize("GNITZ_INBOUND_MEM_BYTES", default).max(io::INBOUND_CAP_FLOOR)
+    crate::foundation::env::env_num("GNITZ_INBOUND_MEM_BYTES", default).max(io::INBOUND_CAP_FLOOR)
 }
 
 impl Reactor {

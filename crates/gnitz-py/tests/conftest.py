@@ -314,14 +314,15 @@ def dedicated_server(monkeypatch, tmp_path_factory, _sock_path):
     reverts the env vars at teardown; it is a dependency of this fixture, so it
     does so only after the server is dead.
 
-    `debug_only` skips the test on a release build, for env vars that name a
-    `#[cfg(debug_assertions)]` injection seam: without the seam the test would
-    silently assert against an ordinary healthy run.
+    A `GNITZ_INJECT_*` var names a `#[cfg(debug_assertions)]` seam that a release
+    build folds away, leaving the test asserting against an ordinary healthy
+    run, so such a request skips on a release build. Read off the prefix, not
+    passed in, so it cannot be forgotten at a call site.
     """
     started = []
 
-    def make(env: dict[str, str], debug_only: bool = False):
-        if debug_only and not is_debug_build():
+    def make(env: dict[str, str]):
+        if not is_debug_build() and any(k.startswith("GNITZ_INJECT_") for k in env):
             pytest.skip(f"injection seam requires a debug build: {', '.join(env)}")
         for k, v in env.items():
             monkeypatch.setenv(k, v)
@@ -344,9 +345,8 @@ def seamed_server(dedicated_server):
     """`dedicated_server`, returning a connected client instead of
     `(target, proc)`, for a test that only reads and writes."""
     with contextlib.ExitStack() as stack:
-        def make(env: dict[str, str], debug_only: bool = False):
-            srv = dedicated_server(env, debug_only=debug_only)
-            return stack.enter_context(gnitz.connect(srv.target))
+        def make(env: dict[str, str]):
+            return stack.enter_context(gnitz.connect(dedicated_server(env).target))
 
         yield make
 
@@ -400,9 +400,9 @@ def unique_preflight_frame_server(seamed_server):
 
 @pytest.fixture
 def reply_frame_budget_server(seamed_server):
-    """Server whose workers chunk reply trains past a tiny 16 KiB frame budget
-    (debug-only seam), so modest tables already produce multi-frame seek /
-    range / gather / scan reply trains per worker. Any reply size is safe: the
+    """Server whose workers chunk reply trains past a tiny 16 KiB frame budget, so
+    modest tables already produce multi-frame seek / range / gather / scan reply
+    trains per worker. Any reply size is safe: the
     master parks a full train per ring while draining another worker, but
     `InFlightState` grows to track it, so the ring back-pressures by bytes, not
     a frame count."""
@@ -437,7 +437,7 @@ def relay_lowspace_server(dedicated_server):
 
     No GNITZ_CHECKPOINT_BYTES override — the only checkpoint in the green run is
     the injected one, keeping the view results reliable."""
-    srv = dedicated_server({"GNITZ_INJECT_RELAY_SPACE_LOW": "1"}, debug_only=True)
+    srv = dedicated_server({"GNITZ_INJECT_RELAY_SPACE_LOW": "1"})
     return srv.target, srv.proc
 
 
@@ -447,7 +447,7 @@ def tick_emit_fault_server(seamed_server):
     `tickfault` fails, reproducing what a full SAL does to a tick. Name-scoped so
     a CREATE's own ticks cannot spend it, and one-shot so the follow-up read
     observes the re-queued tid ticking and the view converging."""
-    return seamed_server({"GNITZ_INJECT_TICK_EMIT_ERROR": "tickfault"}, debug_only=True)
+    return seamed_server({"GNITZ_INJECT_TICK_EMIT_ERROR": "tickfault"})
 
 
 @pytest.fixture
@@ -457,7 +457,7 @@ def relay_hold_server(seamed_server):
     guaranteed to arrive while every worker is parked inside its exchange wait
     with a mid-epoch catalog. Ordering, not timing — nothing here depends on
     machine speed."""
-    return seamed_server({"GNITZ_INJECT_RELAY_HOLD_FOR_DDL": "1"}, debug_only=True)
+    return seamed_server({"GNITZ_INJECT_RELAY_HOLD_FOR_DDL": "1"})
 
 
 @pytest.fixture

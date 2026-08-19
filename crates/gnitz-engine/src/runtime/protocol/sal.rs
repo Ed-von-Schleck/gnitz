@@ -217,7 +217,7 @@ pub fn sal_mmap_size() -> usize {
     use std::sync::OnceLock;
     static SIZE: OnceLock<usize> = OnceLock::new();
     *SIZE.get_or_init(|| {
-        crate::foundation::env::env_usize("GNITZ_SAL_BYTES", SAL_MMAP_SIZE).clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE)
+        crate::foundation::env::env_num("GNITZ_SAL_BYTES", SAL_MMAP_SIZE).clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE)
     })
 }
 
@@ -941,7 +941,7 @@ unsafe impl Send for SalWriter {}
 
 impl SalWriter {
     pub fn new(ptr: *mut u8, fd: i32, mmap_size: u64, m2w_efds: Vec<i32>) -> Self {
-        let checkpoint_threshold = crate::foundation::env::env_u64("GNITZ_CHECKPOINT_BYTES", (mmap_size * 3) >> 2);
+        let checkpoint_threshold = crate::foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (mmap_size * 3) >> 2);
         SalWriter {
             ptr,
             fd,

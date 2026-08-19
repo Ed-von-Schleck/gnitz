@@ -205,13 +205,13 @@ pub struct WorkerProcess {
     pending_streams: VecDeque<PendingScan>,
     /// Per-frame wire budget for chunked reply trains (`send_scan_response`,
     /// `stream_batch_response`, `emit_pending_scan_chunk`): [`ipc::FRAME_CAP`]
-    /// in production, since every chunk reaches the client as one frame. Debug
-    /// builds may shrink it via `GNITZ_REPLY_FRAME_BUDGET` (read once at
-    /// construction) so e2e tests exercise multi-frame trains with small tables;
-    /// a larger value is ignored. The master parks a full train per ring while
-    /// draining another worker, but `InFlightState` grows to track it, so the
-    /// train length an override produces is bounded only by the ring's byte
-    /// capacity — there is no per-train frame-count ceiling.
+    /// in production, since every chunk reaches the client as one frame.
+    /// `GNITZ_REPLY_FRAME_BUDGET` (read once at construction) shrinks it so e2e
+    /// tests exercise multi-frame trains with small tables; a larger value is
+    /// ignored. The master parks a full train per ring while draining another
+    /// worker, but `InFlightState` grows to track it, so the train length an
+    /// override produces is bounded only by the ring's byte capacity — there is
+    /// no per-train frame-count ceiling.
     ///
     /// This budgets only the chunk split point; single-frame paths that cannot
     /// chunk (non-wire-safe STRING replies) check `FRAME_CAP` directly.
@@ -230,11 +230,6 @@ use reply::PendingScanKind;
 /// tests can assert the master surfaces the fault, drains the fan-out, and
 /// leaves the catalog and unique-filter state untouched.
 static UNIQUE_PREFLIGHT_ERROR: Seam = Seam::new("GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR");
-
-/// Debug-only size knobs: shrink a worker's reply frame / pre-flight frame so a
-/// small table still exercises the multi-frame paths.
-static REPLY_FRAME_BUDGET: Seam = Seam::new("GNITZ_REPLY_FRAME_BUDGET");
-static PREFLIGHT_KEYS_PER_FRAME: Seam = Seam::new("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME");
 
 /// Append-or-insert one base table's effective delta into a `pending_deltas`
 /// map — the single buffering shape shared by the live push path
@@ -340,11 +335,8 @@ impl WorkerProcess {
             },
             pending_deltas,
             pending_streams: VecDeque::new(),
-            reply_frame_budget: REPLY_FRAME_BUDGET
-                .count()
-                .map(|n| n as usize)
-                .filter(|&n| n <= ipc::FRAME_CAP)
-                .unwrap_or(ipc::FRAME_CAP),
+            reply_frame_budget: crate::foundation::env::env_num("GNITZ_REPLY_FRAME_BUDGET", ipc::FRAME_CAP)
+                .min(ipc::FRAME_CAP),
         }
     }
 
@@ -1317,14 +1309,12 @@ impl WorkerProcess {
 /// size is safe.
 const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 20;
 
-/// Frame size for the unique pre-flight stream. Debug builds may shrink it via
-/// GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME so tests exercise multi-frame trains
+/// Frame size for the unique pre-flight stream, overridable via
+/// `GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME` so tests exercise multi-frame trains
 /// with small tables; any value is safe now that `InFlightState` grows with the
-/// parked depth (see UNIQUE_PREFLIGHT_KEYS_PER_FRAME).
+/// parked depth (see [`UNIQUE_PREFLIGHT_KEYS_PER_FRAME`]).
 fn unique_preflight_keys_per_frame() -> usize {
-    PREFLIGHT_KEYS_PER_FRAME
-        .count()
-        .map_or(UNIQUE_PREFLIGHT_KEYS_PER_FRAME, |n| n as usize)
+    crate::foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME", UNIQUE_PREFLIGHT_KEYS_PER_FRAME)
 }
 
 /// Default in-RAM key-byte budget before the pre-flight sort spills a run (128 MiB).
@@ -1336,7 +1326,7 @@ const UNIQUE_PREFLIGHT_SPILL_BYTES: usize = 128 * 1024 * 1024;
 /// worker RAM during the pre-flight is roughly this budget plus the sort index
 /// and one reorder buffer — bounded regardless of partition size.
 fn unique_preflight_spill_bytes() -> usize {
-    crate::foundation::env::env_usize("GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES", UNIQUE_PREFLIGHT_SPILL_BYTES)
+    crate::foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES", UNIQUE_PREFLIGHT_SPILL_BYTES)
 }
 
 #[cfg(test)]

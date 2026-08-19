@@ -51,7 +51,7 @@ const INMEM_CEILING: usize = 32 * 1024 * 1024;
 /// not fight over a global.
 fn inmem_ceiling() -> usize {
     static CEILING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CEILING.get_or_init(|| crate::foundation::env::env_usize("GNITZ_RAM_TIER_BYTES", INMEM_CEILING))
+    *CEILING.get_or_init(|| crate::foundation::env::env_num("GNITZ_RAM_TIER_BYTES", INMEM_CEILING))
 }
 
 /// Memtable arena of every store [`Table::new`] opens — every system table,

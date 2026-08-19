@@ -18,7 +18,7 @@ pub(crate) fn client_send_timeout() -> std::time::Duration {
     use std::sync::atomic::Ordering::Relaxed;
     let mut ms = CLIENT_SEND_TIMEOUT_MS.load(Relaxed);
     if ms == 0 {
-        ms = crate::foundation::env::env_u64("GNITZ_CLIENT_SEND_TIMEOUT_MS", 30_000);
+        ms = crate::foundation::env::env_num("GNITZ_CLIENT_SEND_TIMEOUT_MS", 30_000);
         CLIENT_SEND_TIMEOUT_MS.store(ms, Relaxed);
     }
     std::time::Duration::from_millis(ms)

@@ -1790,10 +1790,9 @@ class TestUniqueIndexCreatePreflight:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
 
     def test_multi_frame_key_train(self, unique_preflight_frame_server):
-        """With the debug seam shrinking frames to 7 keys, every worker streams
-        a multi-frame continuation train; the merge must stay exact across
-        frame boundaries — both verdicts. No-op against a release server (the
-        seam compiles out), where this degenerates to single-frame trains."""
+        """With frames shrunk to 7 keys, every worker streams a multi-frame
+        continuation train; the merge must stay exact across frame boundaries —
+        both verdicts."""
         client = unique_preflight_frame_server
         sn = _sn()
         client.create_schema(sn)
@@ -1818,34 +1817,29 @@ class TestUniqueIndexCreatePreflight:
         """An injected worker fault during the pre-flight scan must surface as
         a client error with no index created, no filter seeded, and every
         worker drained (not wedged): the table stays fully usable, and the
-        PK short-circuit — which never fans out — still succeeds. No-op
-        against a release server (the seam compiles out)."""
+        PK short-circuit — which never fans out — still succeeds."""
         client = unique_preflight_fault_server
         sn = _sn()
         client.create_schema(sn)
         try:
             self._bigint_table(client, sn)
             _insert_rows(client, sn, [(pk, pk) for pk in range(1, 33)])
-            try:
+            with pytest.raises(gnitz.GnitzError):
                 client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
-                seam_active = False  # release server: seam compiled out
-            except gnitz.GnitzError:
-                seam_active = True
-            if seam_active:
-                assert not _table_has_index(client, sn, "t")
-                # No filter was seeded and no index exists: a duplicate
-                # value must be accepted, proving no partial constraint
-                # leaked out of the failed DDL.
-                client.execute_sql("INSERT INTO t VALUES (100, 1)", schema_name=sn)
-                # All workers answer a full scan: nobody is wedged on a
-                # half-drained pre-flight train.
-                tid, _ = client.resolve_table(sn, "t")
-                rows = list(client.scan(tid))
-                assert len(rows) == 33
-                # The PK short-circuit returns before any fan-out, so it
-                # succeeds even while every worker's scan path is faulted.
-                client.execute_sql("CREATE UNIQUE INDEX ON t(pk)", schema_name=sn)
-                assert _table_has_index(client, sn, "t")
+            assert not _table_has_index(client, sn, "t")
+            # No filter was seeded and no index exists: a duplicate value must
+            # be accepted, proving no partial constraint leaked out of the
+            # failed DDL.
+            client.execute_sql("INSERT INTO t VALUES (100, 1)", schema_name=sn)
+            # All workers answer a full scan: nobody is wedged on a
+            # half-drained pre-flight train.
+            tid, _ = client.resolve_table(sn, "t")
+            rows = list(client.scan(tid))
+            assert len(rows) == 33
+            # The PK short-circuit returns before any fan-out, so it succeeds
+            # even while every worker's scan path is faulted.
+            client.execute_sql("CREATE UNIQUE INDEX ON t(pk)", schema_name=sn)
+            assert _table_has_index(client, sn, "t")
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_pk", f"{sn}__t__idx_val"],
@@ -2524,9 +2518,8 @@ class TestIndexCollectMerge:
 
 # ---------------------------------------------------------------------------
 # TestChunkedReplyTrains — multi-frame worker reply trains for non-unique
-# seeks and ordered range scans, forced small via the GNITZ_REPLY_FRAME_BUDGET
-# debug seam (16 KiB per frame). Against a release server the seam is a no-op
-# and this degrades to a normal single-frame merge test.
+# seeks and ordered range scans, forced small via GNITZ_REPLY_FRAME_BUDGET
+# (16 KiB per frame).
 # ---------------------------------------------------------------------------
 
 class TestChunkedReplyTrains:

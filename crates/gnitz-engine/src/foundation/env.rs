@@ -4,22 +4,12 @@
 //! requires a positive value. Call-site-specific clamps and `OnceLock`
 //! caching stay local to the consumer.
 
-/// A positive-`usize` env override: a 0 or unparseable value falls back to
+/// A positive-integer env override: a 0 or unparseable value falls back to
 /// `default`.
-pub(crate) fn env_usize(name: &str, default: usize) -> usize {
+pub(crate) fn env_num<T: std::str::FromStr + Default + PartialOrd>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(default)
-}
-
-/// A positive-`u64` env override: a 0 or unparseable value falls back to
-/// `default`.
-pub(crate) fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&n| n > 0)
+        .and_then(|v| v.parse::<T>().ok())
+        .filter(|n| *n > T::default())
         .unwrap_or(default)
 }
