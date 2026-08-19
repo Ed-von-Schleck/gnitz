@@ -168,10 +168,10 @@ const EXPECTED_02: &str = r#"seg 0:
 #2 UNION <- (#3@0,#10@1)
 #3 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0)] <- (#4@0)
 #4 JOIN_DELTA_TRACE <- (#5@0,#7@1)
-#5 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#6@0)
+#5 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#6@0)
 #6 SCAN_DELTA src:base:ers_a
 #7 INTEGRATE_TRACE <- (#8@0)
-#8 MAP_EXPR params:[(REINDEX,0,0,0)] <- (#9@0)
+#8 MAP_EXPR params:[(REINDEX,0,0,0);(ROUTE_KEY,0,1,0)] <- (#9@0)
 #9 SCAN_DELTA src:base:ers_b
 #10 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,1,0)] <- (#11@0)
 #11 JOIN_DELTA_TRACE <- (#8@0,#12@1)
@@ -215,10 +215,10 @@ const EXPECTED_03: &str = r#"seg 0:
 #7 UNION <- (#8@0,#15@1)
 #8 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0);(PROJ,3,4,0)] <- (#9@0)
 #9 JOIN_DELTA_TRACE <- (#10@0,#12@1)
-#10 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#11@0)
+#10 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#11@0)
 #11 SCAN_DELTA src:base:l
 #12 INTEGRATE_TRACE <- (#13@0)
-#13 MAP_EXPR params:[(REINDEX,0,0,0)] <- (#14@0)
+#13 MAP_EXPR params:[(REINDEX,0,0,0);(ROUTE_KEY,0,1,0)] <- (#14@0)
 #14 SCAN_DELTA src:base:r
 #15 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,1,0);(PROJ,3,2,0)] <- (#16@0)
 #16 JOIN_DELTA_TRACE <- (#13@0,#17@1)
@@ -258,27 +258,27 @@ const EXPECTED_04: &str = r#"seg 0:
 #2 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,5,0)] <- (#3@0)
 #3 UNION <- (#4@0,#24@1)
 #4 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,3,0);(PROJ,2,4,0);(PROJ,3,5,0);(PROJ,4,6,0);(PROJ,5,7,0)] <- (#5@0)
-#5 MAP_EXPR params:[(REINDEX,0,0,0);(REINDEX,1,4,0)] <- (#6@0)
+#5 MAP_EXPR params:[(REINDEX,0,0,0);(REINDEX,1,4,0);(ROUTE_KEY,0,0,0)] <- (#6@0)
 #6 NULL_EXTEND params:[(NULL_EXT,0,9,0);(NULL_EXT,1,9,0);(NULL_EXT,2,9,0)] <- (#7@0)
 #7 POSITIVE_PART <- (#8@0)
 #8 UNION <- (#9@0,#23@1)
 #9 NEGATE <- (#10@0)
 #10 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0)] <- (#11@0)
-#11 MAP_EXPR params:[(REINDEX,0,2,0)] <- (#12@0)
+#11 MAP_EXPR params:[(REINDEX,0,2,0);(ROUTE_KEY,0,0,0)] <- (#12@0)
 #12 UNION <- (#13@0,#20@1)
 #13 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,3,0);(PROJ,2,4,0);(PROJ,3,5,0);(PROJ,4,6,0);(PROJ,5,7,0)] <- (#14@0)
 #14 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,1,3)] <- (#15@0,#17@1)
-#15 MAP_EXPR params:[(REINDEX,0,1,0);(REINDEX,1,2,0)] <- (#16@0)
+#15 MAP_EXPR params:[(REINDEX,0,1,0);(REINDEX,1,2,0);(ROUTE_KEY,0,1,0)] <- (#16@0)
 #16 SCAN_DELTA src:base:bls_a
 #17 INTEGRATE_TRACE <- (#18@0)
-#18 MAP_EXPR params:[(REINDEX,0,1,0);(REINDEX,1,2,0)] <- (#19@0)
+#18 MAP_EXPR params:[(REINDEX,0,1,0);(REINDEX,1,2,0);(ROUTE_KEY,0,1,0)] <- (#19@0)
 #19 SCAN_DELTA src:base:bls_b
 #20 MAP_PROJ params:[(PROJ,0,5,0);(PROJ,1,6,0);(PROJ,2,7,0);(PROJ,3,2,0);(PROJ,4,3,0);(PROJ,5,4,0)] <- (#21@0)
 #21 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,1,1)] <- (#18@0,#22@1)
 #22 INTEGRATE_TRACE <- (#15@0)
-#23 MAP_EXPR params:[(REINDEX,0,0,0)] <- (#16@0)
+#23 MAP_EXPR params:[(REINDEX,0,0,0);(ROUTE_KEY,0,0,0)] <- (#16@0)
 #24 MAP_PROJ params:[(PROJ,0,4,0);(PROJ,1,5,0);(PROJ,2,6,0);(PROJ,3,7,0);(PROJ,4,8,0);(PROJ,5,9,0)] <- (#25@0)
-#25 MAP_EXPR params:[(REINDEX,0,2,0);(REINDEX,1,5,0)] <- (#12@0)
+#25 MAP_EXPR params:[(REINDEX,0,2,0);(REINDEX,1,5,0);(ROUTE_KEY,0,0,0)] <- (#12@0)
 "#;
 
 // #5 — pure-range LEFT: `build_pure_range_threshold` ν (the only shape using it).
@@ -314,31 +314,31 @@ const EXPECTED_05: &str = r#"seg 0:
 #2 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,4,0)] <- (#3@0)
 #3 UNION <- (#4@0,#28@1)
 #4 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,3,0);(PROJ,2,4,0);(PROJ,3,5,0)] <- (#5@0)
-#5 MAP_EXPR params:[(REINDEX,0,0,0);(REINDEX,1,3,0)] <- (#6@0)
+#5 MAP_EXPR params:[(REINDEX,0,0,0);(REINDEX,1,3,0);(ROUTE_KEY,0,0,0)] <- (#6@0)
 #6 NULL_EXTEND params:[(NULL_EXT,0,9,0);(NULL_EXT,1,9,0)] <- (#7@0)
 #7 UNION <- (#8@0,#13@1)
 #8 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,3,0)] <- (#9@0)
-#9 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#10@0)
+#9 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,0,0)] <- (#10@0)
 #10 WORKER_FILTER <- (#11@0)
-#11 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#12@0)
+#11 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#12@0)
 #12 SCAN_DELTA src:base:pls_a
 #13 NEGATE <- (#14@0)
 #14 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,3,0)] <- (#15@0)
-#15 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#16@0)
+#15 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,0,0)] <- (#16@0)
 #16 UNION <- (#17@0,#25@1)
 #17 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0)] <- (#18@0)
 #18 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,2)] <- (#10@0,#19@1)
 #19 INTEGRATE_TRACE <- (#20@0)
-#20 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#21@0)
+#20 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,0,0)] <- (#21@0)
 #21 REDUCE params:[(AGG_SPEC,0,4,1)] <- (#22@0)
 #22 MAP_HASH_ROW params:[(PROJ,0,0,0);(BRANCH_ID,0,0,0)] <- (#23@0)
-#23 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#24@0)
+#23 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#24@0)
 #24 SCAN_DELTA src:base:pls_b
 #25 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0)] <- (#26@0)
 #26 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,0)] <- (#20@0,#27@1)
 #27 INTEGRATE_TRACE <- (#10@0)
 #28 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0);(PROJ,3,6,0)] <- (#29@0)
-#29 MAP_EXPR params:[(REINDEX,0,1,0);(REINDEX,1,3,0)] <- (#30@0)
+#29 MAP_EXPR params:[(REINDEX,0,1,0);(REINDEX,1,3,0);(ROUTE_KEY,0,0,0)] <- (#30@0)
 #30 UNION <- (#31@0,#35@1)
 #31 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0);(PROJ,3,4,0)] <- (#32@0)
 #32 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,2)] <- (#11@0,#33@1)
@@ -385,10 +385,10 @@ const EXPECTED_06A: &str = r#"seg 0:
 #7 UNION <- (#8@0,#15@1)
 #8 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0)] <- (#9@0)
 #9 JOIN_DELTA_TRACE <- (#10@0,#12@1)
-#10 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#11@0)
+#10 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#11@0)
 #11 SCAN_DELTA src:base:eq_a
 #12 INTEGRATE_TRACE <- (#13@0)
-#13 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#14@0)
+#13 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#14@0)
 #14 SCAN_DELTA src:base:eq_b
 #15 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0)] <- (#16@0)
 #16 JOIN_DELTA_TRACE <- (#13@0,#17@1)
@@ -430,10 +430,10 @@ const EXPECTED_06B: &str = r#"seg 0:
 #5 UNION <- (#6@0,#13@1)
 #6 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0)] <- (#7@0)
 #7 JOIN_DELTA_TRACE <- (#8@0,#10@1)
-#8 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#9@0)
+#8 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#9@0)
 #9 SCAN_DELTA src:base:eq_a
 #10 INTEGRATE_TRACE <- (#11@0)
-#11 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#12@0)
+#11 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#12@0)
 #12 SCAN_DELTA src:base:eq_b
 #13 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0)] <- (#14@0)
 #14 JOIN_DELTA_TRACE <- (#11@0,#15@1)
@@ -472,7 +472,7 @@ fn sentinel_07_mark() {
 const EXPECTED_07: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
 #1 UNION <- (#2@0,#19@1)
-#2 MAP_EXPR <- (#3@0)
+#2 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#3@0)
 #3 UNION <- (#4@0,#11@1)
 #4 NEGATE <- (#5@0)
 #5 POSITIVE_PART <- (#6@0)
@@ -481,15 +481,15 @@ const EXPECTED_07: &str = r#"seg 0:
 #8 UNION <- (#9@0,#16@1)
 #9 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0)] <- (#10@0)
 #10 JOIN_DELTA_TRACE <- (#11@0,#13@1)
-#11 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#12@0)
+#11 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#12@0)
 #12 SCAN_DELTA src:base:a
 #13 INTEGRATE_TRACE <- (#14@0)
-#14 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#15@0)
+#14 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#15@0)
 #15 SCAN_DELTA src:base:b
 #16 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0)] <- (#17@0)
 #17 JOIN_DELTA_TRACE <- (#14@0,#18@1)
 #18 INTEGRATE_TRACE <- (#11@0)
-#19 MAP_EXPR <- (#5@0)
+#19 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#5@0)
 "#;
 
 // #8 — GROUP BY grouped: the reduce grouped arm.
@@ -518,7 +518,7 @@ fn sentinel_08_group_by_grouped() {
 // against the grouped weight pins (existing e2e).
 const EXPECTED_08: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR <- (#2@0)
+#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
 #2 REDUCE params:[(GROUP,0,0,0);(GROUP,1,1,0);(AGG_SPEC,0,1,0);(AGG_SPEC,1,2,2);(REDUCE_OUT_KEY,0,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD params:[(SHARD,0,0,0);(SHARD,1,1,0)] <- (#4@0)
 #4 SCAN_DELTA src:base:t
@@ -548,7 +548,7 @@ fn sentinel_09_global_funnel() {
 }
 const EXPECTED_09: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR <- (#2@0)
+#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
 #2 REDUCE params:[(AGG_SPEC,0,2,2);(AGG_SPEC,1,3,2);(AGG_SPEC,2,4,2);(AGG_SPEC,3,1,0);(GLOBAL_GROUND,0,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD <- (#4@0)
 #4 SCAN_DELTA src:base:nn_t
@@ -581,7 +581,7 @@ fn sentinel_10_two_phase_global() {
 // func (SUM_ZERO=6 for the COUNT partial) plus the COUNT-of-partials gate.
 const EXPECTED_10: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR <- (#2@0)
+#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
 #2 REDUCE params:[(AGG_SPEC,0,2,1);(AGG_SPEC,1,6,2);(AGG_SPEC,2,1,0);(GLOBAL_GROUND,0,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD <- (#4@0)
 #4 REDUCE params:[(AGG_SPEC,0,2,1);(AGG_SPEC,1,1,0)] <- (#5@0)
@@ -614,7 +614,7 @@ fn sentinel_11_replicated_reduce() {
 // N-fold-multiply hazard this arm avoids is weight-pinned at W>1 (Part B.4).
 const EXPECTED_11: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR <- (#2@0)
+#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
 #2 REDUCE params:[(GROUP,0,1,0);(AGG_SPEC,0,2,2);(AGG_SPEC,1,1,0)] <- (#3@0)
 #3 SCAN_DELTA src:base:rt
 "#;
@@ -764,7 +764,7 @@ fn sentinel_14a_scalar_correlated() {
 // existing test_scalar_subquery.py — not captured here (expr excluded).
 const EXPECTED_14A: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR <- (#2@0)
+#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
 #2 SCAN_DELTA src:seg:1
 
 seg 1:
@@ -778,10 +778,10 @@ seg 1:
 #7 UNION <- (#8@0,#15@1)
 #8 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0)] <- (#9@0)
 #9 JOIN_DELTA_TRACE <- (#10@0,#12@1)
-#10 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#11@0)
+#10 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#11@0)
 #11 SCAN_DELTA src:base:a
 #12 INTEGRATE_TRACE <- (#13@0)
-#13 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#14@0)
+#13 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#14@0)
 #14 SCAN_DELTA src:seg:2
 #15 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,1,0)] <- (#16@0)
 #16 JOIN_DELTA_TRACE <- (#13@0,#17@1)
@@ -789,7 +789,7 @@ seg 1:
 
 seg 2:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR <- (#2@0)
+#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
 #2 REDUCE params:[(GROUP,0,1,0);(AGG_SPEC,0,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD params:[(SHARD,0,1,0)] <- (#4@0)
 #4 SCAN_DELTA src:base:b
@@ -832,15 +832,15 @@ const EXPECTED_14B: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
 #1 EXCHANGE_SHARD params:[(SHARD,0,0,0);(SHARD,1,1,0)] <- (#2@0)
 #2 MAP_PROJ params:[(PROJ,0,3,0)] <- (#3@0)
-#3 MAP_EXPR params:[(REINDEX,0,1,0);(REINDEX,1,4,0)] <- (#4@0)
+#3 MAP_EXPR params:[(REINDEX,0,1,0);(REINDEX,1,4,0);(ROUTE_KEY,0,0,0)] <- (#4@0)
 #4 UNION <- (#5@0,#14@1)
 #5 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0);(PROJ,2,3,0);(PROJ,3,4,0);(PROJ,4,5,0)] <- (#6@0)
 #6 JOIN_DELTA_TRACE_RANGE params:[(RANGE_JOIN,0,0,2)] <- (#7@0,#9@1)
-#7 MAP_EXPR params:[(REINDEX,0,2,0)] <- (#8@0)
+#7 MAP_EXPR params:[(REINDEX,0,2,0);(ROUTE_KEY,0,1,0)] <- (#8@0)
 #8 SCAN_DELTA src:base:a
 #9 INTEGRATE_TRACE <- (#10@0)
 #10 WORKER_FILTER <- (#11@0)
-#11 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#12@0)
+#11 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#12@0)
 #12 FILTER <- (#13@0)
 #13 SCAN_DELTA src:seg:1
 #14 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0);(PROJ,3,1,0);(PROJ,4,2,0)] <- (#15@0)
@@ -850,7 +850,7 @@ const EXPECTED_14B: &str = r#"seg 0:
 
 seg 1:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR <- (#2@0)
+#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
 #2 REDUCE params:[(AGG_SPEC,0,4,2);(AGG_SPEC,1,1,0);(GLOBAL_GROUND,0,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD <- (#4@0)
 #4 SCAN_DELTA src:base:b
@@ -898,10 +898,10 @@ const EXPECTED_15: &str = r#"seg 0:
 #2 UNION <- (#3@0,#10@1)
 #3 MAP_PROJ params:[(PROJ,0,1,0);(PROJ,1,2,0)] <- (#4@0)
 #4 JOIN_DELTA_TRACE <- (#5@0,#7@1)
-#5 MAP_EXPR params:[(REINDEX,0,1,0)] <- (#6@0)
+#5 MAP_EXPR params:[(REINDEX,0,1,0);(ROUTE_KEY,0,1,0)] <- (#6@0)
 #6 SCAN_DELTA src:seg:1
 #7 INTEGRATE_TRACE <- (#8@0)
-#8 MAP_EXPR params:[(REINDEX,0,0,0)] <- (#9@0)
+#8 MAP_EXPR params:[(REINDEX,0,0,0);(ROUTE_KEY,0,1,0)] <- (#9@0)
 #9 SCAN_DELTA src:base:customers
 #10 MAP_PROJ params:[(PROJ,0,2,0);(PROJ,1,1,0)] <- (#11@0)
 #11 JOIN_DELTA_TRACE <- (#8@0,#12@1)
@@ -909,7 +909,7 @@ const EXPECTED_15: &str = r#"seg 0:
 
 seg 1:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR <- (#2@0)
+#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
 #2 REDUCE params:[(GROUP,0,1,0);(AGG_SPEC,0,2,2);(AGG_SPEC,1,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD params:[(SHARD,0,1,0)] <- (#4@0)
 #4 SCAN_DELTA src:base:orders
