@@ -110,8 +110,8 @@ pub struct CatalogEngine {
     pub(crate) user_sequences: std::collections::HashMap<i64, i64>,
 
     /// The launched worker count. Threaded in from `run_server` rather than read
-    /// off `worker_ctx`, which is 1 in the master process (`set_worker_rank` runs
-    /// only post-fork): a store built from the ambient value would be named
+    /// off `worker_ctx`, which is 1 in the master process (`set_worker_identity`
+    /// runs only post-fork): a store built from the ambient value would be named
     /// `w0of1` while the boot repartition wrote `w0of{W}…`, and the child-dir
     /// sweep would delete it as unowned.
     pub(crate) num_workers: u32,

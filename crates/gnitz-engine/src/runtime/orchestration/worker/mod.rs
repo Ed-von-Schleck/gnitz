@@ -434,10 +434,10 @@ impl WorkerProcess {
     fn next_sal_message(&mut self) -> Option<(SalMessageKind, i64, Option<&'static [u8]>)> {
         let msg = self.sal_reader.next()?;
         // The ephemeral flush round carries the checkpoint generation in the
-        // group header's `lsn` field. Latch it into `worker_ctx` before dispatch
-        // so `manifest_header` stamps every view manifest this round publishes
-        // with it — and so a later CREATE INDEX in this process gates its resume
-        // on the same value.
+        // group header's `lsn` field. Latch it before dispatch so
+        // `manifest_header` stamps every view manifest this round publishes with
+        // it — and so a later CREATE INDEX in this process gates its resume on
+        // the same value.
         if msg.kind == SalMessageKind::FlushEph {
             self.cat().set_resume_generation(msg.lsn);
         }
@@ -1225,8 +1225,8 @@ impl WorkerProcess {
     fn handle_flush_all_ephemeral(&mut self) -> Result<(), String> {
         let (traces, outputs) = self.cat().dag.collect_ephemeral_flush_tables();
         // Stamp every manifest with the generation latched at the classify site
-        // (`set_committed_generation` on the FlushEph message).
-        let generation = crate::foundation::worker_ctx::committed_generation();
+        // (`set_resume_generation` off the FlushEph message).
+        let generation = self.cat().resume_generation;
         let pass = |tables: Vec<*mut Table>, what: &str| {
             flush_barrier(tables, FlushRound::Ephemeral(generation)).map_err(|e| format!("ephemeral {what} flush: {e}"))
         };

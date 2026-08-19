@@ -562,7 +562,7 @@ fn worker_boot_recovery(
     // bump is what lets it publish: it is durable pre-fork, so nothing on disk
     // resumes across it.
     debug_assert!(
-        catalog.durable_generation > crate::foundation::worker_ctx::committed_generation(),
+        catalog.durable_generation > catalog.resume_generation,
         "boot base flush without the recovery-start generation bump ahead of it",
     );
     for tid in catalog.iter_user_table_ids() {
@@ -756,7 +756,8 @@ fn run_worker_child(
     // plan compiled during boot must see this process's real (rank,
     // num_workers) and its index tables must home into the per-rank subdir.
     // Single owner of the rank — no longer set in WorkerProcess::new.
-    crate::foundation::worker_ctx::set_worker_rank(w as u32, num_workers);
+    crate::foundation::worker_ctx::set_worker_identity(w as u32, num_workers);
+    crate::foundation::worker_ctx::set_worker_role();
 
     // Redirect stdout/stderr to worker log file
     {
