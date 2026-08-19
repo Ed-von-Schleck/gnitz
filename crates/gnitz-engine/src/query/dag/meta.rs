@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 /// Per-view circuit metadata derived from one `load_meta_circuit` pass.
 /// Everything a plan-free caller needs; eviction is one map `remove`.
+#[derive(Default)]
 pub(crate) struct ViewMeta {
     /// The sink-nearest `ExchangeShard`'s shard columns — the master relay's
     /// routing key — and `None` when the circuit carries no `ExchangeShard` at
@@ -64,15 +65,10 @@ impl ViewMeta {
     /// The answer for a circuit that could not be read or is cyclic: no exchange
     /// skip, no shard or join columns, no range join. Every metadata query then
     /// takes its conservative branch instead of walking a graph that is not there.
+    /// Field-for-field the `Default`, and named so the call site reads as that
+    /// decision rather than as an accident.
     pub(super) fn nothing_special() -> ViewMeta {
-        ViewMeta {
-            shard_cols: None,
-            join_shard_map: FxHashMap::default(),
-            range_join_n_eq: None,
-            has_join: false,
-            scatter_sources: FxHashSet::default(),
-            skips_exchange: false,
-        }
+        ViewMeta::default()
     }
 
     /// Derive the metadata from an already-loaded circuit. The body behind
@@ -81,20 +77,19 @@ impl ViewMeta {
     /// supply: co-partitioning and the output-shard elision both test a shard key
     /// against a *source relation's* distribution prefix.
     pub(super) fn from_loaded(loaded: &compiler::LoadedCircuit, ext_tables: &compiler::ExtTables) -> ViewMeta {
-        let shard_cols: Option<Rc<[u32]>> = compiler::output_exchange_shard(loaded).map(|(_, cols)| cols.into());
-        let join_shard_map: FxHashMap<i64, Option<JoinScatterKey>> = compiler::compute_scatter_keys(loaded)
-            .into_iter()
-            .map(|(tid, key)| (tid, key.map(JoinScatterKey::from_pairs)))
-            .collect();
+        let compiler::ScatterRouting { keys, scatter_sources } = compiler::compute_scatter_routing(loaded, ext_tables);
         ViewMeta {
-            shard_cols,
-            join_shard_map,
+            shard_cols: compiler::output_exchange_shard(loaded).map(|(_, cols)| cols.into()),
+            join_shard_map: keys
+                .into_iter()
+                .map(|(tid, key)| (tid, key.map(JoinScatterKey::from_pairs)))
+                .collect(),
             range_join_n_eq: compiler::circuit_range_join_n_eq(loaded),
             has_join: loaded
                 .nodes
                 .values()
                 .any(|op| matches!(op, gnitz_wire::OpNode::Join(_))),
-            scatter_sources: compiler::compute_scatter_sources(loaded, ext_tables),
+            scatter_sources,
             skips_exchange: compiler::compute_skips_exchange(loaded, ext_tables),
         }
     }
@@ -207,23 +202,20 @@ impl DagEngine {
         if ids.len() <= 1 {
             return ids;
         }
-        let mut in_deps: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
-        for &vid in &ids {
-            let deps: Vec<i64> = self
-                .get_source_ids(vid)
-                .into_iter()
-                .filter(|s| *s != vid && bundle.contains(s))
-                .collect();
-            in_deps.insert(vid, deps);
-        }
+        self.get_dep_map();
+        let reverse = &self.dep.reverse;
         let mut emitted: FxHashSet<i64> = FxHashSet::default();
         let mut order: Vec<i64> = Vec::with_capacity(ids.len());
         while order.len() < ids.len() {
             let before = order.len();
             for &vid in &ids {
-                if !emitted.contains(&vid) && in_deps[&vid].iter().all(|d| emitted.contains(d)) {
+                let ready = reverse
+                    .get(&vid)
+                    .into_iter()
+                    .flatten()
+                    .all(|s| *s == vid || !bundle.contains(s) || emitted.contains(s));
+                if ready && emitted.insert(vid) {
                     order.push(vid);
-                    emitted.insert(vid);
                 }
             }
             if order.len() == before {
@@ -372,9 +364,7 @@ impl DagEngine {
     }
 
     /// The memoized per-view circuit metadata, computed from ONE
-    /// `load_meta_circuit` pass on first touch. (The former per-property memo
-    /// caches each paid their own circuit load — up to five per view — and the
-    /// join-shard map an extra load per *(view, source)*.)
+    /// `load_meta_circuit` pass on first touch.
     pub(crate) fn view_meta(&mut self, view_id: i64) -> Rc<ViewMeta> {
         if let Some(m) = self.meta.get(&view_id) {
             return m.clone();

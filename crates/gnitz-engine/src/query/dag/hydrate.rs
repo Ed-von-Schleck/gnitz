@@ -37,16 +37,15 @@ impl DagEngine {
         coarse: &[i64],
         chunk_rows: usize,
     ) -> Result<Batch, String> {
+        let Some(view_schema) = self.tables.get(&view_id).map(|e| e.schema) else {
+            return Err(format!("hydrate: view {view_id} is not a registered relation"));
+        };
         // The plan cache is lazy and is dropped on every rebuild, so a read
         // arriving before the view's first tick would otherwise find nothing.
-        if !self.ensure_compiled(view_id) {
-            return Err(format!("hydrate: view {view_id} is not a registered relation"));
-        }
-        let view_schema = self
-            .tables
-            .get(&view_id)
-            .map(|e| e.schema)
-            .ok_or_else(|| format!("hydrate: view {view_id} is not registered"))?;
+        // `ensure_compiled` fails only on that same registry lookup (a real
+        // compile failure aborts), so above it cannot fail here.
+        let compiled = self.ensure_compiled(view_id);
+        debug_assert!(compiled, "ensure_compiled false for a registered view");
         let hydration = self.cache[&view_id]
             .hydration
             .ok_or_else(|| format!("hydrate: view {view_id} was not compiled as capacity-bounded"))?;

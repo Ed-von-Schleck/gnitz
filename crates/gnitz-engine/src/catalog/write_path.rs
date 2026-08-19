@@ -124,12 +124,8 @@ impl CatalogEngine {
             let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
             self.submit(family, batch.clone())
         } else {
-            let rc = self.dag.ingest_by_ref(table_id, batch);
-            if rc < 0 {
-                Err(format!("ingest_to_family failed for table_id={table_id} rc={rc}"))
-            } else {
-                Ok(())
-            }
+            self.dag.ingest_by_ref(table_id, batch);
+            Ok(())
         }
     }
 

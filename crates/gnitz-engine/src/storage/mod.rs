@@ -24,6 +24,7 @@ pub use batch::{range_rows, write_to_batch, Batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
 pub use lsm::flush_barrier::{flush_barrier, FlushRound};
+pub(crate) use lsm::table::enforce_unique_pk;
 pub use lsm::table::{RecoverySource, Table};
 pub use merge::MemBatch;
 pub(crate) use scatter::route_rows_by_pk;

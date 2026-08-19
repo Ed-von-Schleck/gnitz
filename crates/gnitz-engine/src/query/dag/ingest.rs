@@ -23,68 +23,36 @@ fn inject_ingest_apply_error(
     r
 }
 
-/// The per-PK batch state of the unique-PK enforcement walk. `store_probed`
-/// must stay sticky across a delete of the same PK (only the insert fact is
-/// cleared): losing it would re-emit the stored-row retraction on a later
-/// re-insert of the PK and drive base-table weights negative.
-#[derive(Default, Clone, Copy)]
-struct UniquePkRowState {
-    /// Batch row index of the last `+1` insertion of this PK, if still live.
-    /// A batch index (not an effective index): `append_batch_negated` reads
-    /// from `batch`, and the effective batch carries extra store-retraction
-    /// rows that break any 1:1 correspondence.
-    last_insert: Option<usize>,
-    /// The store was already probed (and any stored row retracted) for this PK.
-    /// `retract_pk_bytes` is a pure lookup (it only arms the `found_*`
-    /// accessors) and the store cannot change mid-batch, so one probe per PK is
-    /// exact — and the stored-row retraction must be emitted at most once, or
-    /// downstream weights go negative.
-    store_probed: bool,
-}
-
 impl DagEngine {
     // ── Ingestion ───────────────────────────────────────────────────────
 
-    /// Ingest a batch into a relation's store + index projections, discarding
-    /// the effective delta. Named apart from `CatalogEngine::ingest_to_family`
-    /// (which routes a *system* family through the precheck/hooks path) — the
-    /// two are different operations that were one keystroke apart.
-    ///
-    /// Stages:
-    /// 1. PK enforcement (retract existing, dedup intra-batch)
-    /// 2. store.ingest_batch
-    /// 3. index projection
-    pub fn ingest_relation(&mut self, table_id: i64, batch: Batch) {
-        self.ingest_returning_effective(table_id, batch);
-    }
-
     /// Ingest a borrowed batch (no clone) for relations that run no PK
     /// enforcement. A base table falls back to cloning +
-    /// `ingest_returning_effective`.
-    pub fn ingest_by_ref(&mut self, table_id: i64, batch: &Batch) -> i32 {
+    /// [`Self::ingest_returning_effective`].
+    pub fn ingest_by_ref(&mut self, table_id: i64, batch: &Batch) {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
-            None => return -1,
+            None => {
+                gnitz_warn!("dag: ingest_by_ref — table_id={} not registered", table_id);
+                return;
+            }
         };
 
         if entry.kind.is_base_table() {
-            self.ingest_relation(table_id, batch.clone_batch());
-            return 0;
+            self.ingest_returning_effective(table_id, batch.clone_batch());
+        } else if batch.count > 0 {
+            Self::ingest_store_and_indices(table_id, entry, batch);
         }
-
-        if batch.count == 0 {
-            return 0;
-        }
-
-        Self::ingest_store_and_indices(table_id, entry, batch);
-
-        0
     }
 
-    /// Ingest a batch and return the effective batch (after PK
-    /// enforcement) — what downstream views need to see. `None` means exactly
-    /// "table not registered"; a storage-apply failure never returns
-    /// (`ingest_store_and_indices` aborts).
+    /// Ingest a batch into a relation's store + index projections and return the
+    /// effective batch (after PK enforcement) — what downstream views need to
+    /// see. `None` means exactly "table not registered"; a storage-apply failure
+    /// never returns (`ingest_store_and_indices` aborts).
+    ///
+    /// Named apart from `CatalogEngine::ingest_to_family` (which routes a
+    /// *system* family through the precheck/hooks path) — the two are different
+    /// operations that were one keystroke apart.
     pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> Option<Batch> {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
@@ -94,33 +62,15 @@ impl DagEngine {
             }
         };
 
-        let schema = entry.schema;
-        // BaseTable ⟹ Owned, except on the post-fork master, whose relations are
-        // all `Detached` and which ingests no user data. The debug_assert catches
-        // a stray Borrowed base-table registration.
         let effective_batch = if entry.kind.is_base_table() {
-            match entry.handle.as_owned_mut() {
-                Some(store) => Self::enforce_unique_pk(store, &schema, batch),
-                None => {
-                    debug_assert!(
-                        entry.handle.is_detached(),
-                        "base table {table_id} must own its store or be detached"
-                    );
-                    batch
-                }
-            }
+            entry.handle.enforce_unique_pk(&entry.schema, batch)
         } else {
             batch
         };
 
-        if effective_batch.count == 0 {
-            return Some(effective_batch);
+        if effective_batch.count > 0 {
+            Self::ingest_store_and_indices(table_id, entry, &effective_batch);
         }
-
-        let entry = self.tables.get_mut(&table_id).unwrap();
-
-        Self::ingest_store_and_indices(table_id, entry, &effective_batch);
-
         Some(effective_batch)
     }
 
@@ -185,16 +135,17 @@ impl DagEngine {
         Ok(())
     }
 
-    /// Flush `view_id`'s trace, aborting the process on a storage fault: the
-    /// callers flush a view they just ingested or backfilled, so a failure is
-    /// a RAM-tier spill fault — the trace can no longer be bounded, and
-    /// continuing would grow memory unchecked under a sustained fault.
-    /// Restart re-derives the view from its base tables (the same disk fault
-    /// would already abort the base ingest via `ingest_store_and_indices`).
+    /// Flush `view_id`'s output store (and index circuits) — NOT its operator
+    /// traces, which are checkpoint-only. Aborts the process on a storage fault:
+    /// the callers flush a view they just ingested or backfilled, so a failure is
+    /// a RAM-tier spill fault — the store can no longer be bounded, and
+    /// continuing would grow memory unchecked under a sustained fault. Restart
+    /// re-derives the view from its base tables (the same disk fault would
+    /// already abort the base ingest via `ingest_store_and_indices`).
     pub fn flush_view_or_abort(&mut self, view_id: i64) {
         if let Err(e) = self.flush(view_id) {
             gnitz_fatal_abort!(
-                "dag: view trace flush failed (view_id={}): {} — view state \
+                "dag: view store flush failed (view_id={}): {} — view state \
                  cannot be bounded; aborting for restart+re-derive",
                 view_id,
                 e,
@@ -202,9 +153,9 @@ impl DagEngine {
         }
     }
 
-    /// Every store this process owns: each relation's own handle plus its
-    /// index-circuit tables. System tables hold `Borrowed` handles and drop out
-    /// here — workers never barrier-flush their inherited `_sys` copies.
+    /// Every store this process **owns**: each relation's `Owned` handle plus its
+    /// index-circuit tables. `Borrowed` and `Detached` handles drop out — that is
+    /// what keeps workers from barrier-flushing their inherited `_sys` copies.
     ///
     /// Both checkpoint rounds start from this one set and let `Table` decide:
     /// the base round is handed it whole (`flush_prepare` publishes the durable
@@ -273,89 +224,6 @@ impl DagEngine {
             .filter(|&t| unsafe { &*t }.is_rederived())
             .collect();
         (traces, outputs)
-    }
-
-    // ── unique-PK enforcement ───────────────────────────────────────────
-
-    /// Enforce unique-PK semantics on an ingest batch: retract any stored row
-    /// with the same PK before inserting the new one, and resolve duplicate PKs
-    /// within the batch so each surviving PK nets to a single live row.
-    ///
-    /// Emits the stored-row retraction (`-1`, old payload) into the effective
-    /// batch so downstream views see the old payload removed before the new one
-    /// lands. Keys on `get_pk_bytes` (verbatim OPK) and dedups on `&[u8]` slices
-    /// borrowed from the batch's PK region — correct for every PK width. Never
-    /// round-trips through a native `u128`
-    /// (which `opk_key` would re-encode, double-flipping a signed PK's sign bit,
-    /// so the probe would match no stored row and the retraction would be
-    /// silently dropped).
-    pub(super) fn enforce_unique_pk(store: &mut Table, schema: &SchemaDescriptor, mut batch: Batch) -> Batch {
-        // Empty-batch guard: empty batches reach the engine via the
-        // `CatalogStore` ingest wrappers, which — unlike the worker loop — do
-        // not pre-filter `count == 0`.
-        if batch.count == 0 {
-            return batch;
-        }
-        // Base-table contract: per-PK accumulated weight ∈ {0, 1}. A pushed row
-        // at |w| > 1 is the row repeated; retract-before-insert collapses
-        // repeats to one live instance (and a delete removes at most one), so
-        // normalize weights to ±1 before the enforcement walk. Must run on the
-        // input batch, not at append time: `append_batch_negated` re-reads the
-        // original row, so clamping only the appended copy would emit `+1` then
-        // `-w` for the same element and drive intra-batch dedup net-negative.
-        batch.map_weights(|w| w.clamp(-1, 1));
-
-        let mut effective = Batch::with_capacity(*schema, batch.count * 2);
-        let mut state: FxHashMap<&[u8], UniquePkRowState> =
-            FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
-
-        for row in 0..batch.count {
-            let w = batch.get_weight(row);
-            if w == 0 {
-                continue;
-            }
-            let pkb = batch.get_pk_bytes(row);
-            let st = state.entry(pkb).or_default();
-
-            // Stored-row retraction — shared by insert and delete. Probe the
-            // store the first time this PK is seen and, if found, emit a
-            // retraction of the stored (PK, payload) so downstream views drop
-            // the old payload. Gating on `store_probed` skips the repeated LSM
-            // point lookup for a PK the batch touches again.
-            if !st.store_probed {
-                st.store_probed = true;
-                let (_existing_w, stored_row) = store.retract_pk_bytes(pkb);
-                if let Some(stored_row) = stored_row {
-                    // The located stored row is an owned `ColumnarSource` view;
-                    // copy it in at weight -1 via the canonical source-append.
-                    effective.append_row_from_source_bytes(pkb, -1, &stored_row.run, stored_row.row, None);
-                }
-            }
-
-            if w > 0 {
-                // Insert. If this PK was already inserted in this batch, retract
-                // that earlier insertion (intra-batch upsert: last value wins).
-                if let Some(prev_pos) = st.last_insert {
-                    effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
-                }
-                st.last_insert = Some(row);
-                effective.append_batch(&batch, row, row + 1);
-            } else {
-                // Delete (w < 0). The stored-row retraction above already emitted
-                // the removal; here only cancel a prior intra-batch insertion and
-                // clear the insert fact so a later re-insert of this PK is not
-                // re-negated (`store_retracted` stays sticky — see its doc).
-                // A retraction of a key that is neither stored nor seen has
-                // nothing to cancel — passing it through would store a
-                // negative-weight phantom row (violating base-table positivity),
-                // and dropping it is idempotent under delete replay.
-                if let Some(prev_pos) = st.last_insert.take() {
-                    effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
-                }
-            }
-        }
-
-        effective
     }
 
     /// Batch-level index projection.

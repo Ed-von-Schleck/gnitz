@@ -25,33 +25,51 @@ pub enum StoreHandle {
     Borrowed(*mut Table),
 }
 
-// SAFETY: Borrowed wraps a raw pointer that is only accessed on the
-// thread that owns the DagEngine. The DagEngine itself is never shared
-// across threads.
-unsafe impl Send for StoreHandle {}
-
 impl StoreHandle {
     // ------------------------------------------------------------------
     // Interior-mutable accessors
     //
     // DagEngine/CatalogEngine are single-threaded (!Sync) and the
-    // HashMap<id, TableEntry> stores owning Boxes whose heap allocations
-    // have stable addresses, so the mutation is race-free. But the
-    // registry HashMap is read via immutable get(), which would normally
-    // prevent handing out &mut to the owned Table.
-    // These accessors encapsulate the raw-pointer re-borrow that
-    // reconciles the lookup API with the mutation need, so call sites
-    // stop reimplementing it inline.
+    // HashMap<id, TableEntry> stores owning Boxes whose heap allocations have
+    // stable addresses, so the mutation is race-free. But the registry HashMap
+    // is read via immutable get(), which would normally prevent handing out
+    // &mut to the owned Table. These three encapsulate the raw-pointer re-borrow
+    // that reconciles the lookup API with the mutation need. The &mut is handed
+    // out under the contract below, not derived from &self by reborrow — so
+    // clippy's mut_from_ref does not apply.
     //
-    // SAFETY contract for every method below: no aliasing &mut into the
-    // same storage may be live across the call.
+    // SAFETY contract for every method below: no aliasing &mut into the same
+    // storage may be live across the call. `table` is the shared reborrow and
+    // `table_mut` the unique one; routing a read through the latter would widen
+    // that contract to "no reference at all live", silently.
     // ------------------------------------------------------------------
 
-    /// This relation's owned `Table`, or `None` for a borrowed system table or a
-    /// detached relation.
-    // Interior mutability through UnsafeCell: the `&mut` is handed out under the
-    // SAFETY contract documented above (no live aliasing &mut), not derived from
-    // `&self` by reborrow — so clippy's mut_from_ref does not apply.
+    /// Every variant's `Table`, or `None` when this process holds no store.
+    fn table(&self) -> Option<&Table> {
+        match self {
+            StoreHandle::Owned(cell) => Some(unsafe { &**cell.get() }),
+            StoreHandle::Borrowed(ptr) => Some(unsafe { &**ptr }),
+            StoreHandle::Detached => None,
+        }
+    }
+
+    /// [`Self::table`] as `&mut`.
+    #[allow(clippy::mut_from_ref)]
+    fn table_mut(&self) -> Option<&mut Table> {
+        match self {
+            StoreHandle::Owned(cell) => Some(unsafe { &mut **cell.get() }),
+            StoreHandle::Borrowed(ptr) => Some(unsafe { &mut **ptr }),
+            StoreHandle::Detached => None,
+        }
+    }
+
+    /// The `Table` this process owns **outright** — `None` for a borrowed system
+    /// table as well as for a detached relation. A different question from
+    /// [`Self::table_mut`], and the reason its callers cannot move to it: a
+    /// worker must not barrier-flush the `_sys` copy it inherited
+    /// (`collect_base_flush_tables`), and a column ALTER must not publish its new
+    /// descriptor into a `Table` whose real owner publishes too
+    /// (`swap_table_schema`).
     #[allow(clippy::mut_from_ref)]
     pub fn as_owned_mut(&self) -> Option<&mut Table> {
         match self {
@@ -61,6 +79,9 @@ impl StoreHandle {
     }
 
     /// True for a storeless handle — the post-fork master's, or a stream's.
+    /// Test-only: production asks a total accessor what it can reach instead of
+    /// branching on the variant.
+    #[cfg(test)]
     pub fn is_detached(&self) -> bool {
         matches!(self, StoreHandle::Detached)
     }
@@ -71,32 +92,25 @@ impl StoreHandle {
     /// Callers reach this through [`TableEntry::open_cursor`], which supplies
     /// the registry's own schema.
     pub(super) fn open_cursor(&self, schema: &SchemaDescriptor) -> ReadCursor {
-        match self {
-            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).open_cursor() },
-            StoreHandle::Owned(cell) => unsafe { (**cell.get()).open_cursor() },
-            StoreHandle::Detached => crate::storage::empty_cursor(*schema),
+        match self.table() {
+            Some(t) => t.open_cursor(),
+            None => crate::storage::empty_cursor(*schema),
         }
     }
 
     /// Whether a read of this store can meet a skeleton row it has to hydrate.
     /// A detached relation reads empty, so it never can.
     pub(super) fn has_skeleton_rows(&self) -> bool {
-        match self {
-            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.has_skeleton_rows(),
-            StoreHandle::Owned(cell) => unsafe { (**cell.get()).has_skeleton_rows() },
-            StoreHandle::Detached => false,
-        }
+        self.table().is_some_and(Table::has_skeleton_rows)
     }
 
-    /// Materialize every positive-weight row. `Owned` and `Borrowed` delegate to
-    /// `Table::full_scan`, preserving its `Rc` snapshot cache; a detached
-    /// relation materializes an empty batch. Reached through
-    /// [`TableEntry::full_scan`].
+    /// Materialize every positive-weight row, delegating to `Table::full_scan`
+    /// so its `Rc` snapshot cache is preserved; a detached relation materializes
+    /// an empty batch. Reached through [`TableEntry::full_scan`].
     pub(super) fn full_scan(&self, schema: &SchemaDescriptor) -> std::rc::Rc<Batch> {
-        match self {
-            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.full_scan(),
-            StoreHandle::Owned(cell) => unsafe { &mut *cell.get() }.full_scan(),
-            StoreHandle::Detached => self.open_cursor(schema).materialize(),
+        match self.table_mut() {
+            Some(t) => t.full_scan(),
+            None => self.open_cursor(schema).materialize(),
         }
     }
 
@@ -104,16 +118,30 @@ impl StoreHandle {
     /// for callers that keep reading the batch (see
     /// `Table::ingest_borrowed_batch`).
     pub fn ingest_borrowed_batch(&self, batch: &Batch) -> Result<(), StorageError> {
-        match self {
-            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).ingest_borrowed_batch(batch) },
-            StoreHandle::Owned(cell) => unsafe { (**cell.get()).ingest_borrowed_batch(batch) },
+        match self.table_mut() {
+            Some(t) => t.ingest_borrowed_batch(batch),
             // Nothing to drop: the master routes every user write to a worker, and a
             // stream's batch is buffered as a delta by the caller before it lands here.
-            StoreHandle::Detached => Ok(()),
+            None => Ok(()),
         }
     }
 
-    /// Dispatched flush across all variants.
+    /// Enforce unique-PK semantics on an ingest batch against this relation's
+    /// store. A relation this process holds no store for enforces nothing: it has
+    /// no stored row to retract against, and the worker that does own the store
+    /// runs the same walk on the same batch.
+    pub fn enforce_unique_pk(&self, schema: &SchemaDescriptor, batch: Batch) -> Batch {
+        // Not `map_or`: `batch` would have to move into both arms.
+        match self.table_mut() {
+            Some(t) => crate::storage::enforce_unique_pk(t, schema, batch),
+            None => batch,
+        }
+    }
+
+    /// Dispatched flush across all variants. Deliberately `&mut self` and NOT
+    /// routed through [`Self::table_mut`]: `cell.get_mut()` is the one
+    /// statically-checked mutation in this file, and keeping it costs the single
+    /// caller nothing (it already holds `&mut self`).
     pub fn flush(&mut self) -> Result<(), StorageError> {
         match self {
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush(),
@@ -129,10 +157,6 @@ impl StoreHandle {
     /// repartition stamps is a different quantity, taken by the master across a
     /// relation's per-worker children.
     pub fn current_lsn(&self) -> u64 {
-        match self {
-            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn(),
-            StoreHandle::Owned(cell) => unsafe { (**cell.get()).current_lsn() },
-            StoreHandle::Detached => 0,
-        }
+        self.table().map_or(0, Table::current_lsn)
     }
 }

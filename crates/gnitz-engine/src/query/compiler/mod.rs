@@ -29,13 +29,10 @@ use optimize::*;
 pub(crate) use load::{circuit_range_join_n_eq, for_each_scan_edge, load_circuit, output_exchange_shard};
 // Compiler-internal: `pub(crate)` on these would publish them to the whole
 // `query` layer, which reaches the compiler only through the exports above.
-use load::{
-    circuit_source_bound, co_partition_keys, scan_reaches_only_unflagged_reindexes, scan_tid_through_filters,
-    scatter_key,
-};
 #[cfg(test)]
-pub(crate) use optimize::compute_join_shard_map;
-pub(crate) use optimize::{compute_scatter_keys, compute_scatter_sources, compute_skips_exchange};
+use load::co_partition_keys;
+use load::{circuit_source_bound, scan_reaches_only_unflagged_reindexes, scan_tid_through_filters};
+pub(crate) use optimize::{compute_scatter_routing, compute_skips_exchange, ScatterRouting};
 
 // Engine-only port aliases (all equal to wire constants).
 const PORT_IN: i32 = gnitz_wire::PORT_IN as i32;
@@ -2013,11 +2010,11 @@ mod tests {
         );
     }
 
-    // ── compute_join_shard_map covers ScanDelta (SQL-planner join pattern) ──
+    // ── compute_scatter_routing covers ScanDelta (SQL-planner join pattern) ──
 
-    /// compute_join_shard_map must find ScanDelta → Map(reindex) chains.
+    /// The routing walk must find ScanDelta → Map(reindex) chains.
     #[test]
-    fn test_compute_join_shard_map_scan_delta() {
+    fn test_scatter_routing_scan_delta() {
         use gnitz_wire::{MapKind, OpNode};
 
         // Minimal two-sided SQL join circuit skeleton:
@@ -2056,22 +2053,22 @@ mod tests {
         ];
         let loaded = loaded_for_test(nodes, edges);
 
-        let map = compute_join_shard_map(&loaded);
+        let keys = compute_scatter_routing(&loaded, &ExtTables::default()).keys;
 
         assert_eq!(
-            map.get(&10).cloned().unwrap_or_default(),
-            vec![(1, 0)],
+            keys.get(&10),
+            Some(&Some(vec![(1, 0)])),
             "left side (source 10) must map to reindex_col=1"
         );
         assert_eq!(
-            map.get(&20).cloned().unwrap_or_default(),
-            vec![(0, 0)],
+            keys.get(&20),
+            Some(&Some(vec![(0, 0)])),
             "right side (source 20) must map to reindex_col=0"
         );
     }
 
     #[test]
-    fn test_compute_join_shard_map_through_filter() {
+    fn test_scatter_routing_through_filter() {
         use gnitz_wire::{MapKind, OpNode};
         // ScanDelta(42) → Filter → Map(reindex_col=1) → Join → IntegrateSink.
         // The reindex Map is two hops from the scan (a Filter sits between),
@@ -2099,15 +2096,96 @@ mod tests {
         ];
         let loaded = loaded_for_test(nodes, edges);
 
-        // Shared helper used by both compute_join_shard_map and
-        // DagEngine::get_join_shard_cols.
-        assert_eq!(co_partition_keys(&loaded, 0), vec![(1, 0)]);
-
-        let map = compute_join_shard_map(&loaded);
+        let keys = compute_scatter_routing(&loaded, &ExtTables::default()).keys;
         assert_eq!(
-            map.get(&42).cloned().unwrap_or_default(),
-            vec![(1, 0)],
+            keys.get(&42),
+            Some(&Some(vec![(1, 0)])),
             "ScanDelta → Filter → Map(reindex) must map source 42 to col 1"
+        );
+    }
+
+    /// Two `ScanDelta` nodes on ONE source with DIFFERENT scatter keys. Under the
+    /// old `loaded.nodes` walk, last-writer-wins over a per-process `RandomState`
+    /// order picked one of the two at random — and the master and the worker
+    /// derive their halves of the routing in separate processes. Accumulating
+    /// over `loaded.ordered` makes the answer the same everywhere: two sequences,
+    /// so no single pack key routes the source and the relay refuses.
+    #[test]
+    fn test_scatter_routing_two_keys_one_source_is_deterministic() {
+        use gnitz_wire::{MapKind, OpNode};
+
+        let dummy_blob = dummy_expr_blob();
+        let reindex = |col: u32, blob| {
+            OpNode::Map(MapKind::Expression {
+                program: blob,
+                reindex_cols: vec![col as u16],
+                reindex_target_tcs: vec![],
+                role: gnitz_wire::ReindexRole::ScatterKey,
+            })
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(0, scan_delta(10));
+        nodes.insert(1, reindex(1, dummy_blob.clone()));
+        nodes.insert(2, scan_delta(10));
+        nodes.insert(3, reindex(2, dummy_blob));
+        nodes.insert(4, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(5, OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 1, PORT_IN),
+            (2, 3, PORT_IN),
+            (1, 4, PORT_IN_A),
+            (3, 4, PORT_TRACE),
+            (4, 5, PORT_IN),
+        ];
+        let loaded = loaded_for_test(nodes, edges);
+
+        let keys = compute_scatter_routing(&loaded, &ExtTables::default()).keys;
+        assert_eq!(
+            keys.get(&10),
+            Some(&None),
+            "two distinct keys on one source must refuse, not pick one at random"
+        );
+    }
+
+    /// The same shape with the SAME key on both scans must still route. Today's
+    /// last-writer-wins resolves it to the one correct sequence, so a naive
+    /// accumulation that skipped the cross-node dedup would newly produce two
+    /// sequences and refuse a round that works — a regression the rewrite must
+    /// not introduce.
+    #[test]
+    fn test_scatter_routing_repeated_key_one_source_still_routes() {
+        use gnitz_wire::{MapKind, OpNode};
+
+        let dummy_blob = dummy_expr_blob();
+        let reindex = |blob| {
+            OpNode::Map(MapKind::Expression {
+                program: blob,
+                reindex_cols: vec![1],
+                reindex_target_tcs: vec![],
+                role: gnitz_wire::ReindexRole::ScatterKey,
+            })
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(0, scan_delta(10));
+        nodes.insert(1, reindex(dummy_blob.clone()));
+        nodes.insert(2, scan_delta(10));
+        nodes.insert(3, reindex(dummy_blob));
+        nodes.insert(4, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(5, OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 1, PORT_IN),
+            (2, 3, PORT_IN),
+            (1, 4, PORT_IN_A),
+            (3, 4, PORT_TRACE),
+            (4, 5, PORT_IN),
+        ];
+        let loaded = loaded_for_test(nodes, edges);
+
+        let keys = compute_scatter_routing(&loaded, &ExtTables::default()).keys;
+        assert_eq!(
+            keys.get(&10),
+            Some(&Some(vec![(1, 0)])),
+            "one key reached twice is still one key"
         );
     }
 
@@ -2455,7 +2533,7 @@ mod tests {
 
     /// A source whose path to the join carries no reindex Map stays out of the map.
     #[test]
-    fn test_compute_join_shard_map_unreindexed_trace_side_absent() {
+    fn test_scatter_routing_unreindexed_trace_side_absent() {
         use gnitz_wire::{MapKind, OpNode};
 
         let dummy_blob = dummy_expr_blob();
@@ -2483,13 +2561,13 @@ mod tests {
         ];
         let loaded = loaded_for_test(nodes, edges);
 
-        let map = compute_join_shard_map(&loaded);
+        let map = compute_scatter_routing(&loaded, &ExtTables::default()).keys;
 
         // ScanDelta(10) → Map(reindex_col=2) must be found.
         assert_eq!(
-            map.get(&10).cloned().unwrap_or_default(),
-            vec![(2, 0)],
-            "ScanDelta source must be in join_shard_map"
+            map.get(&10),
+            Some(&Some(vec![(2, 0)])),
+            "ScanDelta source must be in the routing map"
         );
         // Source 20 has no downstream reindex Map — must NOT appear.
         assert!(

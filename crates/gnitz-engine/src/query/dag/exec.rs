@@ -3,20 +3,23 @@
 
 use super::*;
 use crate::query::compiler::PlanShape;
+use std::collections::BTreeMap;
 
-pub(super) struct PendingEntry {
-    pub depth: i32,
-    pub view_id: i64,
-    pub source_id: i64,
-    pub batch: Batch,
-}
+/// The DAG traversal's work queue: `(depth, view_id, source_id) → batch`.
+/// Ordered by depth, so `pop_first` is the shallowest pending edge; keyed by the
+/// edge, so merge-on-collision is one `get_mut`.
+type Pending = BTreeMap<(i32, i64, i64), Batch>;
 
 impl DagEngine {
     // ── Epoch execution ─────────────────────────────────────────────────
 
-    /// Execute one view's epoch with no exchange IPC — the single-worker and
-    /// backfill path, where one owner sees every shard (relay = identity).
-    pub fn execute_epoch(&mut self, view_id: i64, input: Batch, source_id: i64) -> Option<Batch> {
+    /// Execute one view's epoch with no exchange IPC: every `Single`-shape
+    /// dispatch (arms 5 and 6 of `execute_multi_worker_step`, which never invoke
+    /// the relay at all — `PlanShape::Single` does not call it), and a replicated
+    /// view of any shape (arm 1), where the identity relay does run because the
+    /// shape is still `Exchanged` but every worker already holds every source in
+    /// full.
+    fn execute_epoch(&mut self, view_id: i64, input: Batch, source_id: i64) -> Option<Batch> {
         self.run_view_epoch(view_id, input, source_id, |pre, _| pre)
     }
 
@@ -27,11 +30,12 @@ impl DagEngine {
     ///   each side, hand its output through `relay`, consolidate, and seed the
     ///   post combine with every side's batch.
     ///
-    /// `relay(pre, key)` is the repartition step: multi-worker passes the
+    /// `relay(pre, key)` is the repartition step: an exchanged view passes the
     /// exchange IPC (`key` is the side's round key — a two-sided set-op keys by
     /// the side's source so the two rounds don't collide in the master
-    /// accumulator; a unary side keys 0), single-worker passes identity (one
-    /// worker owns all shards). A side that takes the delta always runs its
+    /// accumulator; a unary side keys 0), a replicated view passes identity
+    /// (every worker holds every source in full, so there is nothing to
+    /// repartition). A side that takes the delta always runs its
     /// relay — even on an empty pre output — so collective exchange rounds stay
     /// balanced across workers; an inactive side (no delta this epoch) skips its
     /// VM pass, its relay, and its consolidate, and seeds an empty placeholder
@@ -61,10 +65,17 @@ impl DagEngine {
                 // scans the delta's source (`a UNION a` — both sides scan one
                 // relation — clones so each side gets it).
                 let unary = sides.len() == 1;
-                debug_assert!(
-                    unary || sides.iter().any(|s| s.source_id == src_id),
-                    "run_view_epoch view {view_id}: delta source {src_id} matches no side",
-                );
+                // Nothing takes the delta: every seed comes up empty and the rows
+                // are dropped. The epoch still runs — the post phase can still
+                // mint the global-ground row — so this line is the only trace.
+                if !unary && !sides.iter().any(|s| s.source_id == src_id) {
+                    gnitz_warn!(
+                        "dag: view {} — delta source {} matches no side; rows dropped",
+                        view_id,
+                        src_id
+                    );
+                    debug_assert!(false, "view {view_id}: delta source {src_id} matches no side");
+                }
                 let mut remaining = sides.iter().filter(|s| unary || s.source_id == src_id).count();
                 let mut input = Some(input);
                 let mut seeds: Vec<(u16, Batch)> = Vec::with_capacity(sides.len());
@@ -91,18 +102,9 @@ impl DagEngine {
                     };
                     seeds.push((side.seed_reg, consolidated));
                 }
-                // Same empty-epoch skip as `execute_sub_plan`: a pad round
-                // whose every side produced nothing runs the post VM only if
-                // it can emit from empty input (global-ground reduce).
-                if seeds.iter().all(|(_, b)| b.count == 0) {
-                    if !post.can_emit_on_empty.get() {
-                        post.vm.clear_deltas();
-                        return None;
-                    }
-                    // The ground row is minted at most once; after this pass
-                    // `trace_out` holds V₀ whether this epoch wrote it or a
-                    // previous one did.
-                    post.can_emit_on_empty.set(false);
+                // A pad round whose every side produced nothing.
+                if Self::latch_empty_epoch(post, seeds.iter().all(|(_, b)| b.count == 0)) {
+                    return None;
                 }
                 Self::execute_sub_plan_multi(post, seeds)
             }
@@ -132,22 +134,33 @@ impl DagEngine {
         vm::execute_epoch_multi(&vm.program, &mut vm.regfile, inputs, *out_reg)
     }
 
+    /// True ⇒ the caller must return `None`: an empty epoch this program cannot
+    /// emit from. Skips the whole VM pass — cursor refresh, compaction checks,
+    /// dispatch — for the empty placeholders multi-worker lockstep fans to every
+    /// dependent edge every tick; the `clear_deltas` releases the previous real
+    /// epoch's batches, which the skipped epoch-start clear would have.
+    ///
+    /// The latch is cleared BEFORE the program runs: a global-ground reduce mints
+    /// its V₀ row at most once, and after this pass `trace_out` holds it whether
+    /// this epoch wrote it or a previous one did.
+    fn latch_empty_epoch(sub: &mut SubPlan, input_is_empty: bool) -> bool {
+        if !input_is_empty {
+            return false;
+        }
+        if !sub.can_emit_on_empty.get() {
+            sub.vm.clear_deltas();
+            return true;
+        }
+        sub.can_emit_on_empty.set(false);
+        false
+    }
+
     /// Single-input sub-pipeline epoch. `source_id > 0` selects the input
     /// register from the sub-plan's `source_reg_map`; pass `0` when the
     /// sub-plan has a single unambiguous input.
     fn execute_sub_plan(sub: &mut SubPlan, input: Batch, source_id: i64) -> Option<Batch> {
-        // Empty placeholder epoch (multi-worker lockstep fans one to every
-        // dependent edge every tick): unless the program can emit from an
-        // empty input, skip the whole VM pass — cursor refresh + compaction
-        // checks + dispatch. Clearing the deltas releases the previous real
-        // epoch's batches, which the skipped epoch-start clear would have.
-        if input.count == 0 {
-            if !sub.can_emit_on_empty.get() {
-                sub.vm.clear_deltas();
-                return None;
-            }
-            // See the field doc: one pass is all the seed can ever need.
-            sub.can_emit_on_empty.set(false);
+        if Self::latch_empty_epoch(sub, input.count == 0) {
+            return None;
         }
         let in_reg = if source_id > 0 {
             sub.source_reg_map.get(&source_id).copied().unwrap_or(sub.in_reg)
@@ -302,7 +315,7 @@ impl DagEngine {
         );
         match self.execute_multi_worker_step(view_id, delta, source_id, exchange) {
             Some(out) if out.count > 0 => {
-                self.ingest_relation(view_id, out);
+                self.ingest_returning_effective(view_id, out);
                 true
             }
             _ => false,
@@ -312,181 +325,142 @@ impl DagEngine {
     // ── DAG traversal driver ────────────────────────────────────────────
 
     /// Multi-worker DAG evaluation with exchange IPC. Seeds the pending queue
-    /// from `source_id`'s direct dependents, then repeatedly pops the
-    /// shallowest pending edge, runs its view's multi-worker step, ingests the
-    /// output, and fans that output — or, for a view that produced nothing, an
-    /// empty placeholder so collective exchange rounds stay in lockstep across
-    /// workers — onto each downstream edge, until the queue drains. Every
-    /// modified view trace is flushed exactly once after the DAG settles.
+    /// from `source_id`'s direct dependents, then repeatedly pops the shallowest
+    /// pending edge, runs its view's multi-worker step, ingests the output, and
+    /// fans that output — or, for a view that produced nothing, an empty
+    /// placeholder so collective exchange rounds stay in lockstep across workers
+    /// — onto each downstream edge, until the queue drains. Every modified view's
+    /// output store is flushed exactly once after the DAG settles.
     pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(&mut self, source_id: i64, delta: Batch, exchange: &mut E) {
         self.get_dep_map();
-        let view_ids: Vec<i64> = self.dep.forward.get(&source_id).cloned().unwrap_or_default();
-        if view_ids.is_empty() {
+        let Some(view_ids) = self.dep.forward.get(&source_id).filter(|v| !v.is_empty()) else {
             return;
-        }
+        };
 
-        let (mut pending, mut pending_pos) = self.build_pending(&view_ids, source_id, delta);
+        let mut pending = self.build_pending(view_ids, source_id, delta);
         let mut dirty_views: FxHashSet<i64> = FxHashSet::default();
+        let mut popped_depth = i32::MIN;
 
-        while let Some(entry) = pending.pop() {
-            let view_id = entry.view_id;
-            let src_id = entry.source_id;
-            let input = entry.batch;
-            pending_pos.remove(&(view_id, src_id));
+        while let Some(((depth, view_id, src_id), input)) = pending.pop_first() {
+            // Registration stamps `depth = max(source depth) + 1`, so depth
+            // strictly increases along every edge: a producer at depth d fans only
+            // onto depth > d, and no edge can re-enter a depth already popped.
+            // That is what makes ordering by depth alone a valid schedule.
+            debug_assert!(
+                depth >= popped_depth,
+                "pending popped depth {depth} after {popped_depth}"
+            );
+            popped_depth = depth;
 
             // The table may have been dropped between queueing and now.
             if !self.tables.contains_key(&view_id) {
                 continue;
             }
 
-            let out_delta = self.execute_multi_worker_step(view_id, input, src_id, exchange);
-            let has_output = out_delta.as_ref().is_some_and(|b| b.count > 0);
+            let out_delta = self
+                .execute_multi_worker_step(view_id, input, src_id, exchange)
+                .filter(|b| b.count > 0);
 
-            if has_output {
+            if let Some(out) = out_delta.as_ref() {
                 dirty_views.insert(view_id);
-                if self.dep.forward.get(&view_id).is_none_or(|d| d.is_empty()) {
-                    // Terminal view: move the batch into its family — there is
-                    // nothing downstream to fan onto.
-                    self.ingest_relation(view_id, out_delta.unwrap());
-                    continue;
-                }
-                self.ingest_by_ref(view_id, out_delta.as_ref().unwrap());
+                self.ingest_by_ref(view_id, out);
             }
 
-            // Fan the output — or, for a view that produced nothing, an empty
-            // placeholder — onto each dependent edge. Borrow the dep list (disjoint
-            // from `&self.tables`) rather than cloning; `map_or` yields an empty
-            // slice for a view with no dependents, which queue_dependents no-ops.
+            // Fan the output onto each dependent edge. Both borrows are shared
+            // and disjoint from each other; `map_or` yields an empty slice for a
+            // terminal view, which `queue_dependents` no-ops on.
             let src_schema = self.tables[&view_id].schema;
-            let delta = if has_output { out_delta.as_ref() } else { None };
             let dep_view_ids = self.dep.forward.get(&view_id).map_or(&[][..], Vec::as_slice);
-            Self::queue_dependents(
-                &mut pending,
-                &mut pending_pos,
-                &self.tables,
-                dep_view_ids,
-                view_id,
-                src_schema,
-                delta,
-            );
+            Self::queue_dependents(&mut pending, &self.tables, dep_view_ids, view_id, src_schema, out_delta);
         }
 
-        // Flush each modified view trace exactly once after the full DAG settles.
         for vid in dirty_views {
             self.flush_view_or_abort(vid);
         }
     }
 
-    /// Seed the initial pending list for a DAG traversal.
-    /// Returns entries sorted descending by depth (shallowest at tail for
-    /// O(1) pop) plus a position index for merge-on-collision lookups.
-    fn build_pending(
-        &self,
-        view_ids: &[i64],
-        source_id: i64,
-        delta: Batch,
-    ) -> (Vec<PendingEntry>, FxHashMap<(i64, i64), usize>) {
-        let last_valid_idx = view_ids.iter().rposition(|&vid| self.tables.contains_key(&vid));
-        let mut delta_opt = Some(delta);
-        let mut pending: Vec<PendingEntry> = Vec::new();
-        if let Some(last_idx) = last_valid_idx {
-            for (i, &vid) in view_ids.iter().enumerate() {
-                let depth = match self.tables.get(&vid) {
-                    Some(e) => e.depth,
-                    None => continue,
-                };
-                let b = if i == last_idx {
-                    delta_opt.take().unwrap()
-                } else {
-                    delta_opt.as_ref().unwrap().clone_batch()
-                };
-                pending.push(PendingEntry {
-                    depth,
-                    view_id: vid,
-                    source_id,
-                    batch: b,
-                });
-            }
+    /// Seed the pending queue from `source_id`'s direct dependents. The last live
+    /// one takes ownership of `delta`; the rest get clones.
+    fn build_pending(&self, view_ids: &[i64], source_id: i64, delta: Batch) -> Pending {
+        let mut pending = Pending::new();
+        let Some(last_idx) = view_ids.iter().rposition(|&vid| self.tables.contains_key(&vid)) else {
+            return pending;
+        };
+        let mut delta = Some(delta);
+        for (i, &vid) in view_ids.iter().enumerate() {
+            let Some(depth) = self.tables.get(&vid).map(|e| e.depth) else {
+                continue;
+            };
+            let batch = if i == last_idx {
+                delta.take().unwrap()
+            } else {
+                delta.as_ref().unwrap().clone_batch()
+            };
+            pending.insert((depth, vid, source_id), batch);
         }
-        let mut pending_pos: FxHashMap<(i64, i64), usize> = FxHashMap::default();
-        Self::resort_pending(&mut pending, &mut pending_pos);
-        (pending, pending_pos)
-    }
-
-    /// Restore the pending queue's descending-depth order and rebuild the
-    /// `(view_id, source_id) → index` lookup, after new entries were pushed.
-    fn resort_pending(pending: &mut [PendingEntry], pending_pos: &mut FxHashMap<(i64, i64), usize>) {
-        pending.sort_by_key(|n| std::cmp::Reverse(n.depth));
-        pending_pos.clear();
-        for (i, pe) in pending.iter().enumerate() {
-            pending_pos.insert((pe.view_id, pe.source_id), i);
-        }
+        pending
     }
 
     /// Queue `view_id`'s output onto each dependent's pending edge.
     ///
-    /// `delta` is the producer's output, or `None` when the producer fired with
-    /// no output (empty placeholders are queued so exchange-dependent views
-    /// still run and collective rounds stay in lockstep). When present it is
-    /// merged into an existing pending entry, or cloned into a new one; when
-    /// absent a new entry gets a zero-allocation empty placeholder and existing
-    /// entries are left untouched.
+    /// `delta` is the producer's output, or `None` when it fired with none —
+    /// empty placeholders are still queued so exchange-dependent views run and
+    /// collective rounds stay in lockstep.
     ///
     /// Every queued batch is labelled with `src_schema` — the PRODUCER's output
     /// schema, never the consumer's. A JOIN consumer's combine-widened final
     /// schema is a different width than the operand batch on this edge; tagging
-    /// the operand with it would trip the vm seed guard. `src_schema` must be
-    /// `self.tables[&view_id].schema`; `tables` is read only for dependents'
-    /// depth, so the immutable borrow does not conflict with the snapshot.
+    /// the operand with it would trip the vm seed guard.
     fn queue_dependents(
-        pending: &mut Vec<PendingEntry>,
-        pending_pos: &mut FxHashMap<(i64, i64), usize>,
+        pending: &mut Pending,
         tables: &FxHashMap<i64, TableEntry>,
         dep_view_ids: &[i64],
         view_id: i64,
         src_schema: SchemaDescriptor,
-        delta: Option<&Batch>,
+        mut delta: Option<Batch>,
     ) {
-        let mut pushed = false;
-        for &dep_id in dep_view_ids {
-            let dep_depth = match tables.get(&dep_id) {
-                Some(e) => e.depth,
-                None => continue,
-            };
+        let depth_of = |dep_id: i64| tables.get(&dep_id).map(|e| e.depth);
+        // A dependent already holding rows takes a merge; one holding an empty
+        // placeholder takes a fill, because `op_union` against an empty operand
+        // clones the other one whole — the copy this split exists to avoid.
+        let takes_fill = |pending: &Pending, dep_id: i64, depth: i32| {
+            pending.get(&(depth, dep_id, view_id)).is_none_or(|b| b.count == 0)
+        };
 
-            if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
-                if let Some(d) = delta {
-                    let existing = pending[existing_idx].batch.take();
-                    let schema = existing.schema.unwrap_or(src_schema);
-                    let merged = ops::op_union(existing, d, &schema);
-                    pending[existing_idx].batch = merged;
-                }
-            } else {
-                let batch = match delta {
-                    Some(d) => d.clone_batch(),
-                    None => Batch::empty_with_schema(&src_schema),
+        // Merges first, so the fill pass below can MOVE the producer's batch into
+        // the last dependent that needs one instead of cloning it for every one.
+        if let Some(d) = delta.as_ref() {
+            for &dep_id in dep_view_ids {
+                let Some(depth) = depth_of(dep_id) else { continue };
+                let Some(slot) = pending.get_mut(&(depth, dep_id, view_id)) else {
+                    continue;
                 };
-                pending.push(PendingEntry {
-                    depth: dep_depth,
-                    view_id: dep_id,
-                    source_id: view_id,
-                    batch,
-                });
-                pushed = true;
+                if slot.count == 0 {
+                    continue;
+                }
+                let existing = slot.take();
+                let schema = existing.schema.unwrap_or(src_schema);
+                *slot = ops::op_union(existing, d, &schema);
             }
         }
-        // New entries are not recorded in `pending_pos` here: the end-of-loop
-        // `resort_pending` rebuilds it wholesale, and nothing reads a new entry's
-        // slot before then — `dep_view_ids` is deduped (get_dep_map), so no later
-        // iteration probes a `(dep_id, view_id)` key an earlier one pushed. The
-        // pre-existing slots the merge branch *does* probe stay valid because
-        // `pending` is only appended to here (the merge mutates a batch in place,
-        // never moves an entry). One stable resort at the end restores descending
-        // depth order while preserving per-depth insertion order. A resort is
-        // needed iff at least one edge was pushed; pure merges change neither
-        // membership nor depth.
-        if pushed {
-            Self::resort_pending(pending, pending_pos);
+
+        let Some(last_fill) = dep_view_ids
+            .iter()
+            .rposition(|&dep_id| depth_of(dep_id).is_some_and(|d| takes_fill(pending, dep_id, d)))
+        else {
+            return;
+        };
+        for (i, &dep_id) in dep_view_ids.iter().enumerate() {
+            let Some(depth) = depth_of(dep_id) else { continue };
+            if !takes_fill(pending, dep_id, depth) {
+                continue;
+            }
+            let batch = match delta.as_ref() {
+                None => Batch::empty_with_schema(&src_schema),
+                Some(_) if i == last_fill => delta.take().expect("moved at most once"),
+                Some(d) => d.clone_batch(),
+            };
+            pending.insert((depth, dep_id, view_id), batch);
         }
     }
 }

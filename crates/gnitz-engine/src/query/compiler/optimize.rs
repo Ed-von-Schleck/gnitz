@@ -15,39 +15,91 @@ pub(super) fn input_on_port(loaded: &LoadedCircuit, nid: i32, port: i32) -> Opti
         .map(|&(src, _)| src)
 }
 
-/// Source table id → its concatenated `ScatterKey` sequences. Feeds the
-/// co-partition prefix test only; the relay's pack key is
-/// [`compute_scatter_keys`], which refuses a multi-sequence scan rather than
-/// concatenating one.
-pub(crate) fn compute_join_shard_map(loaded: &LoadedCircuit) -> JoinShardMap {
-    let mut join_shard_map = HashMap::new();
-    for (&nid, op) in &loaded.nodes {
-        if let gnitz_wire::OpNode::ScanDelta { source, .. } = op {
-            let rcs = co_partition_keys(loaded, nid);
-            if !rcs.is_empty() {
-                join_shard_map.insert(*source as i64, rcs);
-            }
-        }
-    }
-    join_shard_map
+/// A view's join/group scatter routing: both projections of ONE walk over the
+/// circuit's `ScanDelta` nodes. They answer different questions about the same
+/// fact — the distinct `ScatterKey` sequences each source's scans feed — and
+/// deriving them apart let them disagree.
+pub(crate) struct ScatterRouting {
+    /// source table id → the one key the master relay may pack and route that
+    /// source's delta by, or `None` when its scans feed several distinct keys:
+    /// no single pack key then co-partitions with the trace sides, and the relay
+    /// must refuse the round rather than fall back to the view's
+    /// `ExchangeShard` columns, which route by a different key again.
+    pub keys: HashMap<i64, Option<Vec<(u32, u8)>>>,
+    /// The `keys` sources whose deltas must actually go through the scatter:
+    /// less those whose native distribution already aligns with the key (or
+    /// whose partner is replicated, making the exchange unnecessary either way).
+    pub scatter_sources: FxHashSet<i64>,
 }
 
-/// Source table id → the one key the master relay may pack and route that
-/// source's delta by, or `None` when the scan feeds several distinct keys and no
-/// single pack key co-partitions with the trace sides (see
-/// `compiler::load::scatter_key`). The relay must refuse a `None`, not fall back
-/// to the view's `ExchangeShard` columns: those route by a different key again.
-pub(crate) fn compute_scatter_keys(loaded: &LoadedCircuit) -> HashMap<i64, Option<Vec<(u32, u8)>>> {
-    let mut keys = HashMap::new();
-    for (&nid, op) in &loaded.nodes {
-        if let gnitz_wire::OpNode::ScanDelta { source, .. } = op {
-            if co_partition_keys(loaded, nid).is_empty() {
-                continue;
+/// Derive a view's [`ScatterRouting`].
+///
+/// Walks `loaded.ordered` — total over `nodes`, else `topo_sorted` would have
+/// returned `Cycle` — and NOT `loaded.nodes`, whose `RandomState` iteration order
+/// differs per process: the master derives `keys` in its process while the worker
+/// derives `scatter_sources` in its own, so a per-process order could route the
+/// two differently.
+pub(crate) fn compute_scatter_routing(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> ScatterRouting {
+    // source → the distinct sequences its scans feed. Deduping ACROSS scan nodes
+    // mirrors the within-node dedup in `scatter_key_of_scan`: two scans on one
+    // source carrying the same key must still resolve to one sequence, or the
+    // pack-key gate below would newly refuse a round that routes fine today.
+    let mut seqs: HashMap<i64, Vec<Vec<(u32, u8)>>> = HashMap::new();
+    for &nid in &loaded.ordered {
+        let Some(gnitz_wire::OpNode::ScanDelta { source, .. }) = loaded.nodes.get(&nid) else {
+            continue;
+        };
+        let node_seqs = load::scatter_key_of_scan(loaded, nid).0;
+        // WITHIN one scan the `ScatterKey` role filter and the identical-sequence
+        // dedup appear to hold every live circuit to one sequence, so a second one
+        // means the shape became constructible and wants a real plan, not a silent
+        // refusal. Across scan nodes it is only a tripwire, not a rule — see the
+        // pack-key projection below.
+        debug_assert!(
+            node_seqs.len() <= 1,
+            "scan {nid} feeds {} distinct scatter keys; no single pack key routes it",
+            node_seqs.len(),
+        );
+        let acc = seqs.entry(*source as i64).or_default();
+        for seq in node_seqs {
+            if !acc.contains(&seq) {
+                acc.push(seq);
             }
-            keys.insert(*source as i64, scatter_key(loaded, nid));
         }
     }
-    keys
+    seqs.retain(|_, s| !s.is_empty());
+
+    // The co-partition prefix test wants the sequences CONCATENATED, and wants a
+    // conservative refusal when a source carries more than one key: the
+    // concatenation matches no source's distribution prefix, so that source
+    // correctly goes through the exchange.
+    let concatenated: JoinShardMap = seqs
+        .iter()
+        .map(|(&tid, s)| (tid, s.iter().flatten().copied().collect()))
+        .collect();
+    let co_partitioned = compute_co_partitioned(&concatenated, ext_tables);
+    let scatter_sources = concatenated
+        .into_keys()
+        .filter(|tid| !co_partitioned.contains(tid))
+        .collect();
+
+    // The relay's pack key wants ONE sequence or a refusal, never the
+    // concatenation: with sequences `a` and `b` the delta would scatter by
+    // `pack(a ‖ b)` while each trace side is keyed by `pack(a)` or `pack(b)`, so
+    // the two would never co-partition and matches would drop silently. Refusing
+    // is the only safe answer, and it is the relay's to report.
+    //
+    // Two scans of one source carrying DIFFERENT keys is not SQL-reachable — the
+    // planner wraps a repeated tid in a pass-through segment before lowering a
+    // join — but a hand-built wire circuit can express it, and refusing is what
+    // this walk owes it. Deliberately NOT a `debug_assert`, unlike the per-scan
+    // tripwire above.
+    let keys = seqs
+        .into_iter()
+        .map(|(tid, mut s)| (tid, (s.len() == 1).then(|| s.pop().expect("len == 1"))))
+        .collect();
+
+    ScatterRouting { keys, scatter_sources }
 }
 
 pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: &ExtTables) -> HashSet<i64> {
@@ -99,19 +151,6 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
         }
     }
     co_partitioned
-}
-
-/// The sources whose deltas must actually go through the join scatter: every
-/// source carrying a join/group reindex key, less those whose native
-/// distribution already aligns with that key (or whose partner is replicated,
-/// making the exchange unnecessary either way).
-pub(crate) fn compute_scatter_sources(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> FxHashSet<i64> {
-    let join_shard_map = compute_join_shard_map(loaded);
-    let co_partitioned = compute_co_partitioned(&join_shard_map, ext_tables);
-    join_shard_map
-        .into_keys()
-        .filter(|tid| !co_partitioned.contains(tid))
-        .collect()
 }
 
 /// True iff the view's output `ExchangeShard` is a no-op (every row already on

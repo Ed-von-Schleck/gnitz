@@ -211,6 +211,9 @@ pub struct Table {
 }
 
 mod flush;
+mod unique_pk;
+
+pub(crate) use unique_pk::enforce_unique_pk;
 
 #[cfg(test)]
 mod bench_flush;
@@ -597,7 +600,7 @@ impl Table {
     /// single row's own weight is what makes the answer right: a candidate whose
     /// weight is positive but whose full group nets ≤ 0 has been retracted by a
     /// later tier and must not be returned.
-    pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, Option<StoredRow>) {
+    pub(in crate::storage) fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, Option<StoredRow>) {
         let mut pool = std::mem::take(&mut self.retract_scratch);
         debug_assert!(pool.is_empty());
 
