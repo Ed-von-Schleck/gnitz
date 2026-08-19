@@ -16,20 +16,10 @@ thread_local! {
     static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Reset `out` to `num_workers` empty slots, keeping the pooled allocations.
-fn prepare_slots(out: &mut Vec<Vec<u32>>, num_workers: usize) -> &mut [Vec<u32>] {
-    if out.len() < num_workers {
-        out.resize_with(num_workers, Vec::new);
-    }
-    let slots = &mut out[..num_workers];
-    slots.iter_mut().for_each(Vec::clear);
-    slots
-}
-
 /// Route each row to its owning worker, through the shared placement rule the
 /// boot relayout also drives.
 fn fill_scatter(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, out: &mut Vec<Vec<u32>>) {
-    let slots = prepare_slots(out, num_workers);
+    let slots = crate::ops::reset_slots(out, num_workers);
     crate::storage::route_rows_by_pk(&batch.as_mem_batch(), schema, slots);
 }
 
@@ -37,7 +27,7 @@ fn fill_scatter(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, ou
 /// they are not Z-set elements, and a client is free to send one.
 fn fill_broadcast(batch: &Batch, num_workers: usize, out: &mut Vec<Vec<u32>>) {
     let mb = batch.as_mem_batch();
-    let slots = prepare_slots(out, num_workers);
+    let slots = crate::ops::reset_slots(out, num_workers);
     for i in 0..batch.count {
         if mb.get_weight(i) == 0 {
             continue;

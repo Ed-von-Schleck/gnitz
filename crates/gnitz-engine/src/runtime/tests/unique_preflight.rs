@@ -113,7 +113,9 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
             descriptor: s,
             version: *v,
         });
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, hint).expect("frame decodes");
+        let mut offsets = [0usize; crate::storage::MAX_BATCH_REGIONS];
+        let zc =
+            wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, hint, &mut offsets).expect("frame decodes");
         if saved_schema.is_none() {
             let s = zc.schema.expect("first frame schema");
             // The reply schema's PK region IS the OPK leading-key span; every

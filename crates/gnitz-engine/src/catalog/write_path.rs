@@ -403,8 +403,8 @@ impl CatalogEngine {
             } else {
                 let schema = family.schema();
                 let mem = batch.as_mem_batch();
-                undo_create.push((family, Batch::from_indexed_rows(&mem, &created, &[], &schema)));
-                undo_drop.push((family, Batch::from_indexed_rows(&mem, &dropped, &[], &schema)));
+                undo_create.push((family, Batch::from_indexed_rows(&mem, &created, &schema)));
+                undo_drop.push((family, Batch::from_indexed_rows(&mem, &dropped, &schema)));
             }
         }
 

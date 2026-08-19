@@ -13,7 +13,7 @@ use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::schema::key::pk_bytes_eq;
-use crate::storage::{Batch, ReadCursor};
+use crate::storage::{AppendSession, Batch, MemBatch, ReadCursor};
 
 /// First row index past the equal-PK group beginning at `start`. Requires
 /// `start < batch.count`.
@@ -149,13 +149,15 @@ pub(crate) fn cogroup_left(
 /// equal-PK groups and hands them to `on_shared` to interleave by payload. Both
 /// sides are random-access batches, so the skeleton owns every advance: it
 /// bulk-appends each single-source run into `out` itself (the trivial part), and
-/// the callback only emits the payload-merged shared groups.
+/// the callback only emits the payload-merged shared groups — through the same
+/// session and the same two `MemBatch` views, so the shared groups cost no more
+/// per-call setup than the runs around them.
 #[inline]
 pub(crate) fn cogroup_union(
     a: &mut BatchCursor,
     b: &mut BatchCursor,
     out: &mut Batch,
-    mut on_shared: impl FnMut(&mut Batch, Range<usize>, Range<usize>),
+    mut on_shared: impl FnMut(&mut AppendSession, &MemBatch, &MemBatch, Range<usize>, Range<usize>),
 ) {
     // One append session for the whole merge. Every single-source run below is
     // one push, and for a set operation the runs are ~1 row (the branches carry
@@ -185,7 +187,7 @@ pub(crate) fn cogroup_union(
                     Ordering::Equal => {
                         let ga = a.group_end();
                         let gb = b.group_end();
-                        on_shared(sink.batch(), a.pos..ga, b.pos..gb);
+                        on_shared(&mut sink, &mb_a, &mb_b, a.pos..ga, b.pos..gb);
                         a.seek(ga);
                         b.seek(gb);
                     }
@@ -207,7 +209,6 @@ pub(crate) fn cogroup_union(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Batch, ReadCursor};
     use crate::test_support::make_schema_u64_i64;
     use std::rc::Rc;
 
@@ -427,9 +428,9 @@ mod tests {
             // Emit into a real output batch; the skeleton bulk-appends the
             // single-source runs, the callback appends both shared groups.
             let mut out = Batch::with_capacity(make_schema_u64_i64(), (a.count + b.count).max(1));
-            cogroup_union(&mut ac, &mut bc, &mut out, |o, ra, rb| {
-                o.append_batch(&a, ra.start, ra.end);
-                o.append_batch(&b, rb.start, rb.end);
+            cogroup_union(&mut ac, &mut bc, &mut out, |sink, mb_a, mb_b, ra, rb| {
+                sink.push_range(mb_a, ra.start, ra.end);
+                sink.push_range(mb_b, rb.start, rb.end);
             });
 
             let mut emitted: Vec<u64> = (0..out.count).map(|i| pk_of(out.get_pk_bytes(i))).collect();

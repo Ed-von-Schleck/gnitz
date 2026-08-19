@@ -171,9 +171,6 @@ where
     let n_b = batch_b.count;
     let mut output = Batch::with_capacity(*out_schema, n_a + n_b);
 
-    let mb_a = batch_a.as_mem_batch();
-    let mb_b = batch_b.as_mem_batch();
-
     let mut a = BatchCursor::new(batch_a);
     let mut b = BatchCursor::new(batch_b);
 
@@ -182,12 +179,12 @@ where
     // groups need the payload merge below, which coalesces contiguous
     // single-source runs into one append each (the row count per group is often
     // single-digit and `append_batch` has fixed per-call offset overhead).
-    cogroup_union(&mut a, &mut b, &mut output, |out, ra, rb| {
+    cogroup_union(&mut a, &mut b, &mut output, |sink, mb_a, mb_b, ra, rb| {
         let (i, i_end) = (ra.start, ra.end);
         let (j, j_end) = (rb.start, rb.end);
         let (mut ia, mut jb) = (i, j);
         if ia < i_end && jb < j_end {
-            let mut prev_a = row_cmp(out_schema, &mb_a, ia, &mb_b, jb) != Ordering::Greater;
+            let mut prev_a = row_cmp(out_schema, mb_a, ia, mb_b, jb) != Ordering::Greater;
             let mut run_start = if prev_a { ia } else { jb };
             if prev_a {
                 ia += 1;
@@ -195,13 +192,13 @@ where
                 jb += 1;
             }
             while ia < i_end && jb < j_end {
-                let pick_a = row_cmp(out_schema, &mb_a, ia, &mb_b, jb) != Ordering::Greater;
+                let pick_a = row_cmp(out_schema, mb_a, ia, mb_b, jb) != Ordering::Greater;
                 if pick_a != prev_a {
                     if prev_a {
-                        out.append_batch(batch_a, run_start, ia);
+                        sink.push_range(mb_a, run_start, ia);
                         run_start = jb;
                     } else {
-                        out.append_batch(batch_b, run_start, jb);
+                        sink.push_range(mb_b, run_start, jb);
                         run_start = ia;
                     }
                     prev_a = pick_a;
@@ -217,22 +214,22 @@ where
             // exhausted first) into the same append. The opposite side then
             // drains as a separate run.
             if prev_a {
-                out.append_batch(batch_a, run_start, i_end);
+                sink.push_range(mb_a, run_start, i_end);
                 if jb < j_end {
-                    out.append_batch(batch_b, jb, j_end);
+                    sink.push_range(mb_b, jb, j_end);
                 }
             } else {
-                out.append_batch(batch_b, run_start, j_end);
+                sink.push_range(mb_b, run_start, j_end);
                 if ia < i_end {
-                    out.append_batch(batch_a, ia, i_end);
+                    sink.push_range(mb_a, ia, i_end);
                 }
             }
         } else {
             if ia < i_end {
-                out.append_batch(batch_a, ia, i_end);
+                sink.push_range(mb_a, ia, i_end);
             }
             if jb < j_end {
-                out.append_batch(batch_b, jb, j_end);
+                sink.push_range(mb_b, jb, j_end);
             }
         }
     });

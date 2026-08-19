@@ -114,8 +114,8 @@ impl CatalogEngine {
     /// key) for every `apply_*` fold at once, on the forward path and on the
     /// compensation path (where in-place negation flips a client's `-1`-first
     /// pair to `+1`-first, which this re-canonicalizes by the batch's *current*
-    /// signs). Catalog bundles are ±1, so the `from_indexed_rows` no-weights
-    /// gather (which asserts nonzero weights) is sound.
+    /// signs). Catalog bundles are ±1, so the `from_indexed_rows` gather (which
+    /// asserts nonzero weights) is sound.
     fn sign_partition_batch(batch: &Batch, schema: &SchemaDescriptor) -> Option<Batch> {
         let (mut has_neg, mut has_pos) = (false, false);
         for i in 0..batch.count {
@@ -132,7 +132,7 @@ impl CatalogEngine {
         let mut indices: Vec<u32> = Vec::with_capacity(batch.count);
         indices.extend((0..batch.count).filter(|&i| batch.get_weight(i) < 0).map(|i| i as u32));
         indices.extend((0..batch.count).filter(|&i| batch.get_weight(i) > 0).map(|i| i as u32));
-        Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &indices, &[], schema))
+        Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &indices, schema))
     }
 
     /// Whether `pk_bytes` (the OPK key) names a *net-live* row in `family`'s

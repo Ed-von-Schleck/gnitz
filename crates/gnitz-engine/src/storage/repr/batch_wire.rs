@@ -217,7 +217,8 @@ impl Batch {
         schema: &SchemaDescriptor,
         verify_checksum: bool,
     ) -> Result<(Self, usize), &'static str> {
-        let (mb, bytes_consumed) = decode_mem_batch_inner(data, schema, verify_checksum)?;
+        let mut wire_offsets = [0usize; MAX_BATCH_REGIONS];
+        let (mb, bytes_consumed) = decode_mem_batch_inner(data, schema, verify_checksum, &mut wire_offsets)?;
         // Zero-row block: use the schema-correct empty batch so callers never
         // observe a stale stride (e.g. empty transaction boundaries in the SAL).
         if mb.count == 0 {
@@ -240,7 +241,7 @@ impl Batch {
         unsafe {
             copy_regions(
                 mb.data,
-                &mb.offsets,
+                mb.offsets,
                 &mut data_buf,
                 &offsets,
                 &strides,
@@ -286,10 +287,10 @@ fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) ->
     Ok(())
 }
 
-/// Decode a WAL data block into a `MemBatch<'a>` that borrows the buffer
-/// directly. No allocation; caller must keep `data` live for as long as the
-/// returned `MemBatch` is used. Checksum verification is skipped (IPC trusted
-/// path).
+/// Decode a WAL data block into a `MemBatch<'a>` borrowing `data`, with the
+/// block's region offsets written into the caller's `offsets` (which the view
+/// then borrows). No allocation; the caller keeps both live. Checksum
+/// verification is skipped (IPC trusted path).
 ///
 /// **Contract — this decode skips `validate_string_heap_extents`.** It is for
 /// the W2M ring only: worker-written shared memory, unreachable from a client
@@ -303,8 +304,9 @@ fn validate_string_heap_extents(mb: &MemBatch<'_>, schema: &SchemaDescriptor) ->
 pub fn decode_mem_batch_from_wal_block<'a>(
     data: &'a [u8],
     schema: &SchemaDescriptor,
+    offsets: &'a mut [usize; MAX_BATCH_REGIONS],
 ) -> Result<MemBatch<'a>, &'static str> {
-    decode_mem_batch_inner(data, schema, false).map(|(mb, _)| mb)
+    decode_mem_batch_inner(data, schema, false, offsets).map(|(mb, _)| mb)
 }
 
 /// The one WAL-block parser: validate the block, check every fixed region's
@@ -316,6 +318,7 @@ fn decode_mem_batch_inner<'a>(
     data: &'a [u8],
     schema: &SchemaDescriptor,
     verify_checksum: bool,
+    offsets: &'a mut [usize; MAX_BATCH_REGIONS],
 ) -> Result<(MemBatch<'a>, usize), &'static str> {
     // The writer↔reader region contract: `strides` is each fixed region's
     // per-row width, `nr` the trailing blob region's index — the same
@@ -334,8 +337,6 @@ fn decode_mem_batch_inner<'a>(
     }
 
     let n = header.entry_count as usize;
-
-    let mut offsets = [0usize; MAX_BATCH_REGIONS];
 
     // Each fixed region must be exactly `n` rows at its schema stride —
     // every producer writes exact sizes, and stride-deriving consumers divide
@@ -471,7 +472,8 @@ mod tests {
         let block_end = buf.len() as u32;
         buf[entry..entry + 4].copy_from_slice(&block_end.to_le_bytes()); // offset
         buf[entry + 4..entry + 8].copy_from_slice(&8u32.to_le_bytes()); // size
-        let r = decode_mem_batch_from_wal_block(&buf, &schema);
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
+        let r = decode_mem_batch_from_wal_block(&buf, &schema, &mut offsets);
         assert_eq!(r.err(), Some("data WAL block invalid"));
     }
 

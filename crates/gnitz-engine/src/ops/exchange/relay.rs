@@ -6,7 +6,9 @@ use std::cmp::Ordering;
 
 use crate::schema::key::{compare_pk_ordering, pack_pk_be};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{prorated_blob_cap, scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
+use crate::storage::{
+    mem_batch_to_unified, prorated_blob_cap, scatter_unified_sources, write_to_batch, Batch, Layout, MemBatch,
+};
 use gnitz_wire::MAX_WORKERS;
 
 use super::router::{RouteMode, ScatterKey};
@@ -21,9 +23,9 @@ use crate::schema::key::compare_pk_bytes;
 #[cfg(test)]
 use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 
-// Thread-local pool: reuse Vec<Vec<(u8,u32)>> worker-row scratch across calls.
+// Thread-local pool: reuse the per-worker (source, row, weight) scratch across calls.
 thread_local! {
-    static WORKER_ROWS: RefCell<Vec<Vec<(u8, u32)>>> = const { RefCell::new(Vec::new()) };
+    static WORKER_ROWS: RefCell<Vec<Vec<(u32, u32, i64)>>> = const { RefCell::new(Vec::new()) };
 }
 
 fn mem_batch_blob_cap(mem_batches: &[Option<MemBatch>]) -> usize {
@@ -35,19 +37,30 @@ fn mem_batch_blob_cap(mem_batches: &[Option<MemBatch>]) -> usize {
         .max(1)
 }
 
-/// Materialize per-worker `(source, row)` index lists into per-worker batches:
+/// Materialize per-worker `(source, row, weight)` lists into per-worker batches:
 /// blob capacity prorated by each worker's row share of `total_blob`, rows
-/// copied via `scatter_multi_source`. Outputs are left `Raw` — each caller owns
-/// its layout gate. The two production gates differ in both condition and
+/// copied via the shared column-first scatter. Outputs are left `Raw` — each caller
+/// owns its layout gate. The two production gates differ in both condition and
 /// operation (`is_pk_routing && single source → inherit_layout(src)` vs
 /// `single_source → certify_layout(Consolidated)`); merging them would falsely
 /// certify Consolidated and silently corrupt non-linear reduce weights.
 fn worker_rows_to_batches(
     schema: &SchemaDescriptor,
     mem_batches: &[Option<MemBatch>],
-    worker_rows: &[Vec<(u8, u32)>],
+    worker_rows: &[Vec<(u32, u32, i64)>],
     total_blob: usize,
 ) -> Vec<Batch> {
+    // One view per source slot, built once and shared by every worker's scatter.
+    // An absent slot views one live empty batch rather than being skipped: that
+    // keeps `si` a direct index into `unified`, and no emitted row names it
+    // anyway (the walks above only visit `Some` sources).
+    let empty = Batch::empty_with_schema(schema);
+    let empty_mb = empty.as_mem_batch();
+    let mut cols = Vec::new();
+    let unified: Vec<_> = mem_batches
+        .iter()
+        .map(|o| mem_batch_to_unified(o.as_ref().unwrap_or(&empty_mb), schema, &mut cols))
+        .collect();
     let total_rows: usize = worker_rows.iter().map(|v| v.len()).sum();
     worker_rows
         .iter()
@@ -57,7 +70,7 @@ fn worker_rows_to_batches(
             }
             let blob_cap = prorated_blob_cap(total_blob, total_rows, rows.len());
             write_to_batch(schema, rows.len(), blob_cap, |writer| {
-                scatter_multi_source(mem_batches, rows, writer);
+                scatter_unified_sources(&unified, &cols, rows, writer);
             })
         })
         .collect()
@@ -76,11 +89,6 @@ pub(crate) fn op_repartition_batches_mode(
         sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
         mode,
     );
-    assert!(
-        sources.len() <= 256,
-        "source index must fit in u8 (got {})",
-        sources.len()
-    );
     let mem_batches: Vec<Option<MemBatch>> = sources
         .iter()
         .map(|opt| match opt {
@@ -93,12 +101,7 @@ pub(crate) fn op_repartition_batches_mode(
 
     WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
-        if worker_rows.len() < num_workers {
-            worker_rows.resize_with(num_workers, Vec::new);
-        }
-        for w in 0..num_workers {
-            worker_rows[w].clear();
-        }
+        super::reset_slots(&mut worker_rows, num_workers);
 
         // One `ScatterKey` per scatter, built out of the row loop: native PK
         // bytes when the key is exactly the PK (so the owner matches the one the
@@ -112,7 +115,7 @@ pub(crate) fn op_repartition_batches_mode(
                 None => continue,
             };
             for i in 0..mb.count {
-                worker_rows[scatter_key.worker(mb, i)].push((si as u8, i as u32));
+                worker_rows[scatter_key.worker(mb, i)].push((si as u32, i as u32, mb.get_weight(i)));
             }
         }
 
@@ -158,7 +161,7 @@ pub(crate) fn op_repartition_batches_mode(
 #[allow(clippy::too_many_arguments)]
 fn relay_walk_inner<'a, Route>(
     mem_batches: &[Option<MemBatch<'a>>],
-    worker_rows: &mut [Vec<(u8, u32)>],
+    worker_rows: &mut [Vec<(u32, u32, i64)>],
     order_cache: &mut [u128; MAX_WORKERS],
     mut cursors: [u32; MAX_WORKERS],
     mut active_sources: [u8; MAX_WORKERS],
@@ -173,7 +176,7 @@ fn relay_walk_inner<'a, Route>(
             let si = active_sources[0] as usize;
             let mb = mem_batches[si].as_ref().unwrap();
             for row in cursors[si] as usize..mb.count {
-                worker_rows[route(mb, row)].push((si as u8, row as u32));
+                worker_rows[route(mb, row)].push((si as u32, row as u32, mb.get_weight(row)));
             }
             return;
         }
@@ -215,7 +218,7 @@ fn relay_walk_inner<'a, Route>(
         let row = cursors[best_si] as usize;
         cursors[best_si] += 1;
         let mb = mem_batches[best_si].as_ref().unwrap();
-        worker_rows[route(mb, row)].push((best_si as u8, row as u32));
+        worker_rows[route(mb, row)].push((best_si as u32, row as u32, mb.get_weight(row)));
 
         let new_cur = cursors[best_si] as usize;
         if new_cur == mb.count {
@@ -237,7 +240,7 @@ fn relay_scatter_merge_walk(
     target_tcs: &[u8],
     schema: &SchemaDescriptor,
     num_workers: usize,
-    worker_rows: &mut Vec<Vec<(u8, u32)>>,
+    worker_rows: &mut Vec<Vec<(u32, u32, i64)>>,
     mode: RouteMode,
 ) {
     assert!(
@@ -250,10 +253,7 @@ fn relay_scatter_merge_walk(
     let mut active_sources = [0u8; MAX_WORKERS];
     let mut num_active: usize = 0;
 
-    if worker_rows.len() < num_workers {
-        worker_rows.resize_with(num_workers, Vec::new);
-    }
-    worker_rows[..num_workers].iter_mut().for_each(Vec::clear);
+    super::reset_slots(worker_rows, num_workers);
 
     // One order-preserving winner key per active source, valid at every PK width:
     // `pack_pk_be` packs the leading ≤16 OPK bytes big-endian — the whole key for
@@ -401,16 +401,6 @@ mod tests {
     use crate::test_support::{
         make_batch, make_schema_u128_i64, make_schema_u64_i64, make_wide_batch, opk_pk, wide_pk_3xu64_schema,
     };
-
-    #[test]
-    #[should_panic(expected = "source index must fit in u8")]
-    fn test_op_repartition_batches_rejects_over_256_sources() {
-        // The source index is stored in a u8; > 256 sources would truncate it
-        // silently in release builds. The guard must be a hard assert.
-        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-        let sources: Vec<Option<&Batch>> = vec![None; 257];
-        let _ = op_repartition_batches_mode(&sources, &[0], &[], &schema, 4, RouteMode::GroupKey);
-    }
 
     fn make_schema_u64_string() -> SchemaDescriptor {
         SchemaDescriptor::new(

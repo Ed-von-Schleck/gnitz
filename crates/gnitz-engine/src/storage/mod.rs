@@ -24,6 +24,7 @@ use repr::{batch, batch_wire, columnar, merge, scatter};
 mod data_roundtrip_proptest;
 
 // ── Public API ──────────────────────────────────────────────────────────────
+pub(crate) use batch::MAX_BATCH_REGIONS;
 pub use batch::{range_rows, write_to_batch, Batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
@@ -32,11 +33,12 @@ pub(crate) use lsm::table::enforce_unique_pk;
 pub use lsm::table::{RecoverySource, Table};
 pub use merge::MemBatch;
 pub(crate) use scatter::route_rows_by_pk;
-pub use scatter::{scatter_copy, scatter_multi_source};
+pub use scatter::scatter_copy;
+pub(crate) use scatter::scatter_unified_sources;
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use batch::carve_writer_slices;
-pub(crate) use batch::{BatchBuilder, Layout};
+pub(crate) use batch::{AppendSession, BatchBuilder, Layout};
 pub(crate) use batch_wire::{compute_wire_props, schema_wire_safe, wire_header_dir_size, wire_region_sizes};
 // `ColumnarSource` is deliberately NOT re-exported: it adds only the Z-set
 // weight, and every out-of-storage consumer (the comparators, the group-key
@@ -57,7 +59,8 @@ pub(crate) use lsm::manifest::{peek_header, topology_word};
 pub(crate) use lsm::read_cursor::{empty as empty_cursor, PkSetGather, ReadCursor};
 pub(crate) use lsm::repartition::repartition_relation;
 pub(crate) use merge::{
-    prorated_blob_cap, relocate_german_string_vec, BlobCache, BlobCacheGuard, DirectWriter, RowComparator,
+    mem_batch_to_unified, prorated_blob_cap, relocate_german_string_vec, BlobCache, BlobCacheGuard, DirectWriter,
+    RowComparator,
 };
 pub(crate) use spill::{KeyProducer, SpillSort};
 

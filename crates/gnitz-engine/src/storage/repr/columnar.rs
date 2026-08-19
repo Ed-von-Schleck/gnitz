@@ -218,7 +218,7 @@ fn gallop_lower_bound_bytes<'a>(count: usize, key: &[u8], hint: usize, get: impl
 // (`compare_pk_bytes`), so a register search returns the identical lower bound as
 // the byte search above — pinned by `lower_bound_opk_matches_byte_search`. The key
 // is `PkSortKey::from_opk`, the same register key the merge/sort drive uses, and
-// the stride→width dispatch mirrors `reduce::sort::sort_indices_by_pk`. Every
+// the stride→width dispatch is the shared `pk_width_dispatch!`. Every
 // `from_opk` arm is a full order-preserving key (the `[u128; 2]` arm's low limb
 // settles a leading-16-byte tie), so the dispatch is exact through 32-byte strides;
 // wider PKs fall back to the byte search.

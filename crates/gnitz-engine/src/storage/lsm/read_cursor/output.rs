@@ -15,7 +15,7 @@ use super::super::batch::{write_to_batch, Batch, Layout};
 use super::super::columnar::with_payload_cmp;
 use super::super::merge::DirectWriter;
 use super::super::run::Run;
-use super::super::scatter::scatter_unified_sources_with_weights;
+use super::super::scatter::scatter_unified_sources;
 use super::{ReadCursor, RowComparator, SourceMode};
 use gnitz_expr::RowSource;
 
@@ -298,9 +298,15 @@ impl ReadCursor {
         if rows.is_empty() {
             return;
         }
-        let unified = self
-            .unified_sources
-            .get_or_init(|| self.sources.iter().map(|s| s.to_unified(&self.schema)).collect());
-        scatter_unified_sources_with_weights(unified, rows, writer);
+        let (unified, cols) = self.unified_sources.get_or_init(|| {
+            let mut cols = Vec::new();
+            let views = self
+                .sources
+                .iter()
+                .map(|s| s.to_unified(&self.schema, &mut cols))
+                .collect();
+            (views, cols)
+        });
+        scatter_unified_sources(unified, cols, rows, writer);
     }
 }

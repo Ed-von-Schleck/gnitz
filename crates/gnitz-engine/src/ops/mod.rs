@@ -15,7 +15,8 @@ mod bench_secondary_index;
 pub(crate) use distinct::op_distinct;
 pub(crate) use distinct::op_weight_clamp;
 pub(crate) use exchange::{
-    op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, op_worker_filter, RouteMode,
+    op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, op_worker_filter, reset_slots,
+    RouteMode,
 };
 pub(crate) use index::{op_integrate_with_indexes, AviBake, IntegrateTarget as OpsIntegrateTarget};
 pub(crate) use join::{op_join_delta_trace, op_join_delta_trace_range};

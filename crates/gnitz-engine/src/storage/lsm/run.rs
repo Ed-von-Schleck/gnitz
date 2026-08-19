@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use super::batch::Batch;
 use super::columnar::ColumnarSource;
-use super::merge::UnifiedSource;
+use super::merge::{ColPtr, UnifiedSource};
 use super::shard_reader::MappedShard;
 use crate::schema::key::{pk_bytes_eq, pk_in_range};
 use crate::schema::SchemaDescriptor;
@@ -61,10 +61,10 @@ impl Run {
     ///
     /// Infallible: `MappedShard::open` validates all encoding constraints and
     /// region sizes at open time, so no arm here can fail.
-    pub(crate) fn to_unified(&self, schema: &SchemaDescriptor) -> UnifiedSource {
+    pub(crate) fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource {
         match self {
-            Run::Mem(b) => super::merge::mem_batch_to_unified(&b.as_mem_batch(), schema),
-            Run::Shard(s) => s.to_unified(schema),
+            Run::Mem(b) => super::merge::mem_batch_to_unified(&b.as_mem_batch(), schema, cols),
+            Run::Shard(s) => s.to_unified(schema, cols),
         }
     }
 

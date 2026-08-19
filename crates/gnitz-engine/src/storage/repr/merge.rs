@@ -17,7 +17,7 @@ use super::columnar::{schema_is_fixedint_nonnull, with_payload_cmp, ColumnarSour
 use super::columnar;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, pk_width_dispatch, PkSortKey};
-use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
+use crate::schema::SchemaDescriptor;
 use gnitz_expr::{BatchView, RowSource};
 use gnitz_wire::{is_german_string, read_u64_le};
 use rustc_hash::FxHashMap;
@@ -74,7 +74,11 @@ pub(crate) struct UnifiedSource {
     /// in-memory batch always matches its schema, so `mem_batch_to_unified`
     /// sets `0`.
     pub null_pad_mask: u64,
-    pub cols: [ColPtr; MAX_COLUMNS - 1],
+    /// Index of this source's first payload `ColPtr` in the caller-owned table
+    /// the scatter reads through: column `pi` is `cols[cols_off + pi]`. Out of
+    /// line because a by-value `[ColPtr; MAX_COLUMNS]` is 1 KiB zeroed per source
+    /// per call, whatever the schema's real column count.
+    pub cols_off: usize,
     pub blob_ptr: *const u8,
     pub blob_len: usize,
 }
@@ -82,21 +86,20 @@ pub(crate) struct UnifiedSource {
 /// Derive a `UnifiedSource` view over an in-memory `MemBatch`: every region
 /// becomes a `(base, stride)` `ColPtr` into the batch's `data`, and the blob
 /// arena is carried by pointer+len. Pure pointer arithmetic — no allocation,
-/// no scan. Shared by the read-cursor drain (shard-vs-MemBatch polymorphism)
-/// and `scatter_survivors` (the flush phase-2 scatter, which has only `MemBatch`
-/// runs).
-pub(crate) fn mem_batch_to_unified(mb: &MemBatch, schema: &SchemaDescriptor) -> UnifiedSource {
+/// no scan. The payload `ColPtr`s are appended to `cols`, the flat table the
+/// scatter indexes through `UnifiedSource::cols_off`.
+///
+/// Shared by the read-cursor drain (shard-vs-MemBatch polymorphism) and the
+/// flush phase-2 scatter, which has only `MemBatch` runs.
+pub(crate) fn mem_batch_to_unified(mb: &MemBatch, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource {
     let data_ptr = mb.data.as_ptr();
-    let mut cols = [ColPtr {
-        base: std::ptr::null(),
-        stride: 0,
-    }; MAX_COLUMNS - 1];
+    let cols_off = cols.len();
     for (pi, col) in schema.payload_columns() {
         let off = mb.offsets[super::batch::REG_PAYLOAD_START + pi];
-        cols[pi] = ColPtr {
+        cols.push(ColPtr {
             base: unsafe { data_ptr.add(off) },
             stride: col.size() as usize,
-        };
+        });
     }
     UnifiedSource {
         pk: ColPtr {
@@ -108,7 +111,7 @@ pub(crate) fn mem_batch_to_unified(mb: &MemBatch, schema: &SchemaDescriptor) -> 
             stride: super::batch::FIXED_REGION_BYTES,
         },
         null_pad_mask: 0,
-        cols,
+        cols_off,
         blob_ptr: mb.blob.as_ptr(),
         blob_len: mb.blob.len(),
     }
@@ -297,67 +300,6 @@ impl Drop for BlobCacheGuard {
 // MemBatch: a view over flat columnar buffers (one batch / sorted run)
 // ---------------------------------------------------------------------------
 
-/// A `MemBatch` that has been certified sorted by (PK, payload).
-///
-/// The only ways to obtain one are:
-/// - `Batch::as_sorted_mem_batch()` — runtime check on the `sorted` flag
-/// - `SortedMemBatch::new_unchecked()` — caller asserts the invariant
-///
-/// The flush merge (`merge_survivors`) requires `&[SortedMemBatch]` so the
-/// compiler enforces that only certified-sorted inputs reach the N-way merge.
-#[repr(transparent)]
-pub(crate) struct SortedMemBatch<'a>(MemBatch<'a>);
-
-impl<'a> SortedMemBatch<'a> {
-    /// Wrap `mb` asserting it is already sorted by (PK, payload).
-    /// Use `Batch::as_sorted_mem_batch()` for the checked variant.
-    pub(crate) fn new_unchecked(mb: MemBatch<'a>) -> Self {
-        SortedMemBatch(mb)
-    }
-}
-
-impl<'a> std::ops::Deref for SortedMemBatch<'a> {
-    type Target = MemBatch<'a>;
-    fn deref(&self) -> &MemBatch<'a> {
-        &self.0
-    }
-}
-
-/// `run_merge` is generic over `S: ColumnarSource`, and inside a generic body
-/// method resolution goes through the trait bound (Deref does not apply to an
-/// opaque type parameter), so the flush input must impl `ColumnarSource`
-/// directly. Forward each accessor to the inner `MemBatch`; `#[repr(transparent)]`
-/// makes every forward zero-cost.
-impl<'a> RowSource for SortedMemBatch<'a> {
-    #[inline(always)]
-    fn get_pk_bytes(&self, row: usize) -> &[u8] {
-        self.0.get_pk_bytes(row)
-    }
-    #[inline(always)]
-    fn get_null_word(&self, row: usize) -> u64 {
-        self.0.get_null_word(row)
-    }
-    #[inline(always)]
-    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
-        self.0.get_col_ptr(row, payload_col, col_size)
-    }
-    #[inline(always)]
-    fn blob(&self) -> &[u8] {
-        self.0.blob
-    }
-    #[inline(always)]
-    fn row_count(&self) -> usize {
-        self.0.count
-    }
-}
-
-impl<'a> ColumnarSource for SortedMemBatch<'a> {
-    #[inline(always)]
-    fn get_weight(&self, row: usize) -> i64 {
-        self.0.get_weight(row)
-    }
-}
-
 /// Borrowed slice-view of a `Batch`.
 ///
 /// The full data buffer is referenced as `data: &[u8]`, with `offsets` recording
@@ -370,9 +312,12 @@ impl<'a> ColumnarSource for SortedMemBatch<'a> {
 #[derive(Clone)]
 pub struct MemBatch<'a> {
     pub data: &'a [u8],
-    // `usize` to match `Batch::offsets`: a large batch's cumulative offset can
-    // exceed 4 GB. `as_mem_batch` copies the array verbatim.
-    pub offsets: [usize; super::batch::MAX_BATCH_REGIONS],
+    /// Borrowed, not owned: `usize` × `MAX_BATCH_REGIONS` is ~½ KiB, and this
+    /// view exists to be derived per range, per chunk and per operator call.
+    /// `Batch` already holds the array inline, so `as_mem_batch` lends it; the
+    /// one view with no owning `Batch` (a borrowed wire frame) has its decoder's
+    /// caller hold the array beside the view.
+    pub offsets: &'a [usize; super::batch::MAX_BATCH_REGIONS],
     pub pk_stride: u8, // byte width of the PK region per row
     pub blob: &'a [u8],
     pub count: usize,
@@ -500,8 +445,8 @@ impl<'a> ColumnarSource for MemBatch<'a> {
 // ---------------------------------------------------------------------------
 
 /// One source's merge position: `position` walks `[0, count)`. Sources are
-/// ghost-free by construction (shards are verified at open; `SortedMemBatch`
-/// runs are consolidated), so advancing is a bare `position + 1` and
+/// ghost-free by construction (shards are verified at open; RAM-tier runs are
+/// consolidated), so advancing is a bare `position + 1` and
 /// `drive_merge`'s net-weight fold drops any cross-source zero.
 ///
 /// `count` is the walk's upper bound, which need not be the source's row count:
@@ -618,11 +563,9 @@ impl<'a> DirectWriter<'a> {
         }
     }
 
-    // `#[inline]`: the only hot caller is `scatter_copy`'s explicit-weight loop,
-    // in the sibling `repr::scatter` module. Release builds have no LTO and use
-    // default codegen-units, so the hint is what carries the inline across the
-    // module boundary.
-    #[inline]
+    // The row-at-a-time twin of the column-first `repr::scatter` kernels, kept for
+    // the one path that streams: `fold_sorted` walks an already-sorted batch and
+    // emits as it goes, with no survivor list to scatter from.
     pub fn write_row(&mut self, batch: &MemBatch, row: usize, weight: i64) {
         if weight == 0 {
             return;
@@ -693,7 +636,7 @@ impl<'a> DirectWriter<'a> {
 // ---------------------------------------------------------------------------
 
 /// N-way (PK, payload) merge + consolidation over any sorted columnar sources —
-/// the single owner of the merge that flush ([`merge_survivors`]) and shard
+/// the single owner of the merge that flush (`RunSet::fold`) and shard
 /// compaction (`compact::merge_and_route`) share.
 ///
 /// Rows with the same (PK, payload) have their weights summed; zero-weight
@@ -707,8 +650,8 @@ impl<'a> DirectWriter<'a> {
 /// [`PosCursor`] per source, and drives `drive_merge`; the PK axis is
 /// settled by `compare_pk_ordering` (one byte comparator at every width).
 /// Sources are ghost-free by construction (shards are verified at open;
-/// `SortedMemBatch` runs are consolidated); `drive_merge`'s net-weight fold
-/// drops cross-source zeros. Each source's walk bound is its own
+/// RAM-tier runs are consolidated); `drive_merge`'s net-weight fold drops
+/// cross-source zeros. Each source's walk bound is its own
 /// [`ColumnarSource::row_count`].
 /// `emit(group_src, group_row, net_weight)` fires once per surviving (net ≠ 0)
 /// group; the caller turns `(src, row)` into its output (a `DirectWriter` row for
@@ -848,6 +791,20 @@ fn run_merge_body<S, RowCmp>(
     S: ColumnarSource,
     RowCmp: RowComparator<S>,
 {
+    // §2's one silent failure: a merge reads each source linearly, so an
+    // out-of-order input makes the heap deliver duplicates non-adjacently and
+    // the fold sums weights against the wrong element — no error, no assertion.
+    // Checked here rather than in a wrapper type at one seat, so flush,
+    // compaction and shard sources are all covered.
+    #[cfg(debug_assertions)]
+    for (si, src) in sources.iter().enumerate() {
+        for r in 1..src.row_count() {
+            let ord = compare_pk_ordering(src.get_pk_bytes(r - 1), src.get_pk_bytes(r))
+                .then_with(|| row_cmp(schema, src, r - 1, src, r));
+            debug_assert_ne!(ord, Ordering::Greater, "run_merge: source {si} unsorted at row {r}");
+        }
+    }
+
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
     // by `advance`.  `source_idx` doubles as the source index here.
@@ -885,58 +842,23 @@ fn run_merge_body<S, RowCmp>(
 // merge_batches: the flush-path entry point (run-set consolidation)
 // ---------------------------------------------------------------------------
 
-/// Phase 1 of the flush/compaction merge: run the [`run_merge`] N-way
-/// (PK, payload) consolidation over the **sorted** `MemBatch` slices and collect
-/// the surviving `(src, row, net_weight)` tuples. `drive_merge` emits only
-/// net-nonzero groups, so the buffer never carries a zero weight (the scatter's
-/// no-zero-weight precondition).
-///
-/// Split from the scatter so the caller can size the output arena to the
-/// **survivor count** rather than the Σ-input upper bound: cross-run cancellation
-/// (a retract folding an earlier insert — pervasive in aggregation trace folds)
-/// makes survivors far fewer than inputs, so the arena allocation and its
-/// first-touch page faults cost the output size, not the pre-cancellation one.
-pub(crate) fn merge_survivors(batches: &[SortedMemBatch], schema: &SchemaDescriptor) -> Vec<(u32, u32, i64)> {
-    // Reserve the survivor upper bound (Σ input counts) so the push loop never reallocates.
-    let mut survivors = Vec::with_capacity(batches.iter().map(|b| b.count).sum());
-    // `src`/`row` originate as `u32` fields of `HeapNode` in `drive_merge`, so the
-    // casts are lossless.
+/// Full flush merge into a caller-provided writer, against an arena already
+/// sized to the Σ-input upper bound. The production fold path runs the two
+/// kernels itself so it can size the arena to the survivor count instead; this
+/// one-shot form is retained for the merge tests and microbench that pre-size
+/// their writer.
+#[cfg(test)]
+pub(crate) fn merge_batches(batches: &[MemBatch], schema: &SchemaDescriptor, writer: &mut DirectWriter) {
+    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batches.iter().map(|b| b.count).sum());
     run_merge(batches, schema, |src, row, w| {
         survivors.push((src as u32, row as u32, w))
     });
-    survivors
-}
-
-/// Phase 2: materialize the `merge_survivors` output **column-at-a-time** through
-/// the shared column-first scatter, fed one `UnifiedSource` view per run — each
-/// per-column decision (null test, German-string type test, cell-width dispatch)
-/// is made once per column instead of once per (row, column), versus the
-/// row-at-a-time `DirectWriter::write_row`. `survivors` must come from
-/// [`merge_survivors`] over the same `batches`/`schema`.
-pub(crate) fn scatter_survivors(
-    batches: &[SortedMemBatch],
-    schema: &SchemaDescriptor,
-    survivors: &[(u32, u32, i64)],
-    writer: &mut DirectWriter,
-) {
-    if survivors.is_empty() {
-        return; // fully cancelled merge: nothing to materialize
-    }
-    // One UnifiedSource view per run (pure pointer derivation). `&SortedMemBatch`
-    // deref-coerces to the `&MemBatch` `mem_batch_to_unified` expects.
-    let unified: Vec<UnifiedSource> = batches.iter().map(|b| mem_batch_to_unified(b, schema)).collect();
-    super::scatter::scatter_unified_sources_with_weights(&unified, survivors, writer);
-}
-
-/// Full flush merge into a caller-provided writer (phase 1 + phase 2), against an
-/// arena already sized to the Σ-input upper bound. The production fold path splits
-/// the phases so it can size the arena to the survivor count (see
-/// [`merge_survivors`]); this one-shot form is retained for the merge tests and
-/// microbench that pre-size their writer.
-#[cfg(test)]
-pub(crate) fn merge_batches(batches: &[SortedMemBatch], schema: &SchemaDescriptor, writer: &mut DirectWriter) {
-    let survivors = merge_survivors(batches, schema);
-    scatter_survivors(batches, schema, &survivors, writer);
+    let mut cols = Vec::new();
+    let unified: Vec<UnifiedSource> = batches
+        .iter()
+        .map(|b| mem_batch_to_unified(b, schema, &mut cols))
+        .collect();
+    super::scatter::scatter_unified_sources(&unified, &cols, &survivors, writer);
 }
 
 // ---------------------------------------------------------------------------
@@ -996,7 +918,7 @@ fn sort_consolidate_inner<RowCmp>(
                 let (x, y) = (a.idx as usize, b.idx as usize);
                 a.key.cmp(&b.key).then_with(|| row_cmp(schema, batch, x, batch, y))
             });
-            drain_groups_into(n, batch, schema, writer, row_cmp, |pos| entries[pos].idx as usize);
+            scatter_groups(n, batch, schema, writer, row_cmp, |pos| entries[pos].idx as usize);
         },
         {
             let mut order: Vec<u32> = (0..n as u32).collect();
@@ -1005,9 +927,41 @@ fn sort_consolidate_inner<RowCmp>(
                 compare_pk_bytes(batch.get_pk_bytes(x), batch.get_pk_bytes(y))
                     .then_with(|| row_cmp(schema, batch, x, batch, y))
             });
-            drain_groups_into(n, batch, schema, writer, row_cmp, |pos| order[pos] as usize);
+            scatter_groups(n, batch, schema, writer, row_cmp, |pos| order[pos] as usize);
         }
     )
+}
+
+/// [`drain_groups`] materialized **column-at-a-time**: collect the surviving
+/// `(row, net weight)` groups, then hand them to the shared column-first scatter,
+/// which makes each per-column decision (null test, German-string type test,
+/// cell-width dispatch) once per column instead of once per (row, column).
+///
+/// Only for the sorting caller: it already allocates an n-element index array to
+/// sort, so the survivor list is a second allocation of the same order, and
+/// nothing about the walk streams. `fold_sorted` genuinely streams and stays
+/// row-at-a-time.
+#[inline]
+fn scatter_groups<RowCmp>(
+    n: usize,
+    batch: &MemBatch,
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+    row_cmp: RowCmp,
+    resolve: impl Fn(usize) -> usize,
+) where
+    RowCmp: for<'x> RowComparator<MemBatch<'x>>,
+{
+    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(n);
+    drain_groups(n, batch, schema, row_cmp, resolve, |row, w| {
+        survivors.push((0, row as u32, w))
+    });
+    if survivors.is_empty() {
+        return;
+    }
+    let mut cols = Vec::new();
+    let unified = [mem_batch_to_unified(batch, schema, &mut cols)];
+    super::scatter::scatter_unified_sources(&unified, &cols, &survivors, writer);
 }
 
 /// Weight-fold an already-sorted batch: sum weights for identical (PK, payload)
@@ -1031,10 +985,18 @@ where
     RowCmp: for<'x> RowComparator<MemBatch<'x>>,
 {
     // Input is already sorted, so the iteration position is the batch row index.
-    drain_groups_into(n, batch, schema, writer, row_cmp, |pos| pos);
+    drain_groups(
+        n,
+        batch,
+        schema,
+        row_cmp,
+        |pos| pos,
+        |row, w| writer.write_row(batch, row, w),
+    );
 }
 
-/// Shared pending-group drain loop used by `sort_and_consolidate` and `fold_sorted`.
+/// Shared pending-group drain loop: fires `emit(batch_row, net_weight)` once per
+/// surviving (net ≠ 0) (PK, payload) group.
 ///
 /// `resolve(pos)` maps an iteration position to the batch row index. For
 /// `sort_and_consolidate` this is an indirection through a sorted index array;
@@ -1045,13 +1007,13 @@ where
 /// its PK axis on, and for the same reason a register compare rather than a
 /// raw byte `==` (see [`merge_same_pk`]).
 #[inline]
-fn drain_groups_into<RowCmp>(
+fn drain_groups<RowCmp>(
     n: usize,
     batch: &MemBatch,
     schema: &SchemaDescriptor,
-    writer: &mut DirectWriter,
     row_cmp: RowCmp,
     resolve: impl Fn(usize) -> usize,
+    mut emit: impl FnMut(usize, i64),
 ) where
     RowCmp: for<'x> RowComparator<MemBatch<'x>>,
 {
@@ -1068,14 +1030,14 @@ fn drain_groups_into<RowCmp>(
             pending_weight += batch.get_weight(cur_idx);
         } else {
             if pending_weight != 0 {
-                writer.write_row(batch, pending_idx, pending_weight);
+                emit(pending_idx, pending_weight);
             }
             pending_idx = cur_idx;
             pending_weight = batch.get_weight(cur_idx);
         }
     }
     if pending_weight != 0 {
-        writer.write_row(batch, pending_idx, pending_weight);
+        emit(pending_idx, pending_weight);
     }
 }
 
@@ -1262,7 +1224,7 @@ mod tests {
         for (label, schema) in [("stride8", s8), ("stride16", make_schema_u128_i64())] {
             let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
             let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-            let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
+            let sorted: Vec<MemBatch> = mem.to_vec();
             let mut sink = 0i64;
             let t = Instant::now();
             for _ in 0..ITERS {
@@ -1327,7 +1289,7 @@ mod tests {
     #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
     fn materialize_row_vs_column_bench() {
         use super::super::batch::write_to_batch;
-        use super::super::scatter::scatter_unified_sources_with_weights;
+        use super::super::scatter::scatter_unified_sources;
         use std::hint::black_box;
         use std::time::Instant;
 
@@ -1370,23 +1332,24 @@ mod tests {
         ] {
             let batches: Vec<Batch> = (0..K).map(|k| build_mat_batch(schema, N, k, kind)).collect();
             let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-            let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
+            let sorted: Vec<MemBatch> = mem.to_vec();
 
             let total_rows: usize = sorted.iter().map(|b| b.count).sum();
             let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total_rows);
             run_merge(&sorted, schema, |s, r, w| survivors.push((s as u32, r as u32, w)));
             let total_blob: usize = mem.iter().map(|m| m.blob.len()).sum();
-            let unified: Vec<UnifiedSource> = mem.iter().map(|m| mem_batch_to_unified(m, schema)).collect();
+            let mut cols = Vec::new();
+            let unified: Vec<UnifiedSource> = mem.iter().map(|m| mem_batch_to_unified(m, schema, &mut cols)).collect();
 
             // Warm up both paths once (allocator, page-in).
             black_box(write_to_batch(schema, survivors.len(), total_blob, |w| {
-                scatter_unified_sources_with_weights(&unified, &survivors, w);
+                scatter_unified_sources(&unified, &cols, &survivors, w);
             }));
 
             let t = Instant::now();
             for _ in 0..ITERS {
                 let b = write_to_batch(schema, survivors.len(), total_blob, |w| {
-                    scatter_unified_sources_with_weights(&unified, &survivors, w);
+                    scatter_unified_sources(&unified, &cols, &survivors, w);
                 });
                 black_box(&b);
             }
@@ -1446,7 +1409,7 @@ mod tests {
 
     /// One RAM-tier fold unit of work at its real skewed run shape: the
     /// full `consolidate_batches` composition (`write_to_batch` arena +
-    /// `run_merge` + `scatter_unified_sources_with_weights`) over **1 big run +
+    /// `run_merge` + `scatter_unified_sources`) over **1 big run +
     /// 4 small runs**. Existing merge benches use balanced K=4 only; this is the
     /// per-delta-row price the tick-cadence amplification factor multiplies. Big
     /// run = `N` even keys; each small run = `d` odd keys uniformly interleaved
@@ -1477,7 +1440,7 @@ mod tests {
             }
 
             let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-            let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
+            let sorted: Vec<MemBatch> = mem.to_vec();
             let total_rows: usize = sorted.iter().map(|b| b.count).sum();
 
             // Warm up the path once (allocator, batch pool, page-in); untimed.
@@ -1510,7 +1473,7 @@ mod tests {
     #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
     fn write_to_batch_arena_provision_bench() {
         use super::super::batch::write_to_batch;
-        use super::super::scatter::scatter_unified_sources_with_weights;
+        use super::super::scatter::scatter_unified_sources;
         use std::hint::black_box;
         use std::time::Instant;
 
@@ -1520,7 +1483,8 @@ mod tests {
         for (max_rows, iters) in [(6_553usize, 2000usize), (26_214, 500), (104_857, 120)] {
             let src = bench_flush_batch(&schema, max_rows, |i| i as u64);
             let mem = src.as_mem_batch();
-            let unified = vec![mem_batch_to_unified(&mem, &schema)];
+            let mut cols = Vec::new();
+            let unified = vec![mem_batch_to_unified(&mem, &schema, &mut cols)];
             let full: Vec<(u32, u32, i64)> = (0..max_rows).map(|r| (0u32, r as u32, 1i64)).collect();
             let sparse: Vec<(u32, u32, i64)> = (0..max_rows).step_by(64).map(|r| (0u32, r as u32, 1i64)).collect();
 
@@ -1535,12 +1499,12 @@ mod tests {
 
             // (b) full scatter of every survivor.
             black_box(write_to_batch(&schema, max_rows, 0, |w| {
-                scatter_unified_sources_with_weights(&unified, &full, w);
+                scatter_unified_sources(&unified, &cols, &full, w);
             }));
             let t = Instant::now();
             for _ in 0..iters {
                 let b = write_to_batch(&schema, max_rows, 0, |w| {
-                    scatter_unified_sources_with_weights(&unified, &full, w);
+                    scatter_unified_sources(&unified, &cols, &full, w);
                 });
                 black_box(&b);
             }
@@ -1548,12 +1512,12 @@ mod tests {
 
             // (c) sparse scatter: same arena, 1/64th the rows written.
             black_box(write_to_batch(&schema, max_rows, 0, |w| {
-                scatter_unified_sources_with_weights(&unified, &sparse, w);
+                scatter_unified_sources(&unified, &cols, &sparse, w);
             }));
             let t = Instant::now();
             for _ in 0..iters {
                 let b = write_to_batch(&schema, max_rows, 0, |w| {
-                    scatter_unified_sources_with_weights(&unified, &sparse, w);
+                    scatter_unified_sources(&unified, &cols, &sparse, w);
                 });
                 black_box(&b);
             }
@@ -1583,7 +1547,6 @@ mod tests {
             .collect()
     }
 
-    // Takes &[Batch] so test call sites don't need to construct SortedMemBatch.
     fn merge_to_rows(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
         narrow(merge_to_rows_wide(batches, schema), schema.pk_stride() as usize)
     }
@@ -2355,7 +2318,7 @@ mod tests {
 
     fn merge_to_rows_wide(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
         let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-        let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
+        let sorted: Vec<MemBatch> = mem.to_vec();
         let total: usize = sorted.iter().map(|b| b.count).sum();
         writer_run(schema, total, |w| {
             merge_batches(&sorted, schema, w);
@@ -2581,7 +2544,7 @@ mod tests {
     // Columnar materialization differential
     //
     // The flush merge materializes survivors column-at-a-time through
-    // `scatter_unified_sources_with_weights`, where `write_row` goes
+    // `scatter_unified_sources`, where `write_row` goes
     // row-at-a-time. These tests pin the two materializations value-identical —
     // same decoded PK / payload / weight / null bit / row count — over an
     // adversarial schema (two German-string columns + a nullable int) with
@@ -2763,7 +2726,7 @@ mod tests {
         /// the decoded survivors for caller-specific assertions.
         fn assert_paths_agree(schema: &SchemaDescriptor, runs: Vec<Batch>) -> Vec<(Vec<u8>, i64, u64, Vec<CellVal>)> {
             let mem: Vec<MemBatch<'_>> = runs.iter().map(|b| b.as_mem_batch()).collect();
-            let sorted: Vec<SortedMemBatch> = mem.iter().map(|m| SortedMemBatch::new_unchecked(m.clone())).collect();
+            let sorted: Vec<MemBatch> = mem.to_vec();
             let total_rows: usize = sorted.iter().map(|b| b.count).sum();
             let total_blob: usize = sorted.iter().map(|b| b.blob.len()).sum();
 

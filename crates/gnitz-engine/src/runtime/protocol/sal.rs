@@ -914,7 +914,7 @@ fn write_scattered_data_block(
     // arena, so hand it a 0-cap stack-local that scatter_copy must not grow.
     let mut empty_blob: Vec<u8> = Vec::new();
     let mut writer = DirectWriter::new(pk, weight, null_bmp, col_slices, &mut empty_blob, schema, 0);
-    scatter_copy(batch, indices, &[], &mut writer);
+    scatter_copy(batch, indices, &mut writer);
     debug_assert!(
         empty_blob.is_empty(),
         "non-string SAL fast path must not write blob bytes"
@@ -1109,7 +1109,7 @@ impl SalWriter {
                 let slot = if wi.is_empty() {
                     CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len
                 } else {
-                    let sub = Batch::from_indexed_rows(&mb, wi, &[], schema);
+                    let sub = Batch::from_indexed_rows(&mb, wi, schema);
                     CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len + sub.wire_byte_size()
                 };
                 total += align8(slot);
@@ -1165,7 +1165,7 @@ impl SalWriter {
                 .iter()
                 .map(|indices| {
                     if !indices.is_empty() {
-                        Batch::from_indexed_rows(&mb, indices, &[], schema)
+                        Batch::from_indexed_rows(&mb, indices, schema)
                     } else {
                         Batch::empty_with_schema(schema)
                     }

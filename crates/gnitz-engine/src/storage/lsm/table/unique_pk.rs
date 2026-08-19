@@ -10,7 +10,13 @@ use rustc_hash::FxHashMap;
 
 use super::Table;
 use crate::schema::SchemaDescriptor;
-use crate::storage::Batch;
+use crate::storage::{Batch, BlobCacheGuard, MemBatch};
+
+/// Retract input row `prev_pos`. The literal `-1` is exact because the ±1 clamp
+/// below runs before the walk, so a live `last_insert` row weighs exactly `+1`.
+fn retract(effective: &mut Batch, src: &MemBatch, prev_pos: usize, guard: &mut BlobCacheGuard) {
+    effective.append_row_from_source_bytes(src.get_pk_bytes(prev_pos), -1, src, prev_pos, guard.get_mut());
+}
 
 /// The per-PK batch state of the enforcement walk. `store_probed` must stay
 /// sticky across a delete of the same PK (only the insert fact is cleared):
@@ -19,7 +25,7 @@ use crate::storage::Batch;
 #[derive(Default, Clone, Copy)]
 struct UniquePkRowState {
     /// Batch row index of the last `+1` insertion of this PK, if still live.
-    /// A batch index (not an effective index): `append_batch_negated` reads
+    /// A batch index (not an effective index): the retraction re-reads the row
     /// from `batch`, and the effective batch carries extra store-retraction
     /// rows that break any 1:1 correspondence.
     last_insert: Option<usize>,
@@ -58,15 +64,26 @@ pub(crate) fn enforce_unique_pk(store: &mut Table, schema: &SchemaDescriptor, mu
     // at |w| > 1 is the row repeated; retract-before-insert collapses
     // repeats to one live instance (and a delete removes at most one), so
     // normalize weights to ±1 before the enforcement walk. Must run on the
-    // input batch, not at append time: `append_batch_negated` re-reads the
+    // input batch, not at append time: the intra-batch retraction re-reads the
     // original row, so clamping only the appended copy would emit `+1` then
-    // `-w` for the same element and drive intra-batch dedup net-negative.
+    // `-w` for the same element and drive intra-batch dedup net-negative — and
+    // it is what makes `retract`'s literal `-1` exact.
     batch.map_weights(|w| w.clamp(-1, 1));
 
-    let mut effective = Batch::with_capacity(*schema, batch.count * 2);
-    let mut state: FxHashMap<&[u8], UniquePkRowState> =
-        FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
+    // `batch.count` rows, not 2×: the stored-row retraction that could double a
+    // row is one per *distinct* PK already present, and the arena grows on
+    // demand. Provisioning 2× puts a bulk push over `POOL_BYPASS_BYTES`, so it
+    // mmaps and munmaps its arena per push instead of taking a pooled one.
+    let mut effective = Batch::with_capacity(*schema, batch.count);
+    // One relocation cache for the whole walk, as every other multi-row append
+    // holds; `acquire` clamps the sizing hint and no-ops on a string-free schema.
+    let mut guard = BlobCacheGuard::acquire(schema, batch.count);
+    // Grown on demand rather than reserved for `batch.count`: the map holds one
+    // entry per *distinct* PK, and a bulk push reserving per row asks for
+    // megabytes it never fills.
+    let mut state: FxHashMap<&[u8], UniquePkRowState> = FxHashMap::default();
 
+    let mb = batch.as_mem_batch();
     for row in 0..batch.count {
         let w = batch.get_weight(row);
         if w == 0 {
@@ -86,7 +103,7 @@ pub(crate) fn enforce_unique_pk(store: &mut Table, schema: &SchemaDescriptor, mu
             if let Some(stored_row) = stored_row {
                 // The located stored row is an owned `ColumnarSource` view;
                 // copy it in at weight -1 via the canonical source-append.
-                effective.append_row_from_source_bytes(pkb, -1, &stored_row.run, stored_row.row, None);
+                effective.append_row_from_source_bytes(pkb, -1, &stored_row.run, stored_row.row, guard.get_mut());
             }
         }
 
@@ -94,10 +111,10 @@ pub(crate) fn enforce_unique_pk(store: &mut Table, schema: &SchemaDescriptor, mu
             // Insert. If this PK was already inserted in this batch, retract
             // that earlier insertion (intra-batch upsert: last value wins).
             if let Some(prev_pos) = st.last_insert {
-                effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
+                retract(&mut effective, &mb, prev_pos, &mut guard);
             }
             st.last_insert = Some(row);
-            effective.append_batch(&batch, row, row + 1);
+            effective.append_row_from_source_bytes(pkb, w, &mb, row, guard.get_mut());
         } else {
             // Delete (w < 0). The stored-row retraction above already emitted
             // the removal; here only cancel a prior intra-batch insertion and
@@ -108,7 +125,7 @@ pub(crate) fn enforce_unique_pk(store: &mut Table, schema: &SchemaDescriptor, mu
             // negative-weight phantom row (violating base-table positivity),
             // and dropping it is idempotent under delete replay.
             if let Some(prev_pos) = st.last_insert.take() {
-                effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
+                retract(&mut effective, &mb, prev_pos, &mut guard);
             }
         }
     }

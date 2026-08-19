@@ -94,8 +94,13 @@ pub fn op_weight_clamp(
         }
     });
 
-    // 3. Scatter-copy emitting rows
-    let mut output = Batch::from_indexed_rows(&consolidated_mb, &emit_indices, &emit_weights, schema);
+    // 3. Scatter-copy emitting rows, column-first, then blit the *clamp's* net
+    //    weights over the finished region — one sequential `n·8` write against a
+    //    per-(row, column) dispatch loop through the row-at-a-time writer.
+    let mut output = Batch::from_indexed_rows(&consolidated_mb, &emit_indices, schema);
+    for (dst, w) in output.weight_data_mut().chunks_exact_mut(8).zip(&emit_weights) {
+        dst.copy_from_slice(&w.to_le_bytes());
+    }
     // Emitting rows are scattered in consolidated-delta order (ascending indices),
     // one per transitioning element ⇒ (PK, payload)-sorted and ghost-free.
     output.certify_layout(Layout::Consolidated, schema);

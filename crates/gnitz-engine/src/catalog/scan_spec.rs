@@ -478,7 +478,7 @@ fn topk_keep(
         }
     }
     (
-        Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm[..cut], &[], reply_schema),
+        Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm[..cut], reply_schema),
         acc,
     )
 }

@@ -107,17 +107,17 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
         }
         match &mut second {
             None => {
-                let mut buf = vec![0u8; 16 + n.div_ceil(8)];
+                let mut buf = vec![0u8; two_value_image_len(n)];
                 buf[..8].copy_from_slice(&first.to_le_bytes());
-                buf[8..16].copy_from_slice(&v.to_le_bytes());
-                buf[16 + i / 8] |= 1 << (i % 8);
+                buf[8..TWO_VALUE_HEADER].copy_from_slice(&v.to_le_bytes());
+                two_value_set_bit(&mut buf[TWO_VALUE_HEADER..], i);
                 second = Some((v, buf));
             }
             Some((b, buf)) => {
                 if v != *b {
                     return RegionEncoding::Raw; // 3+ distinct values
                 }
-                buf[16 + i / 8] |= 1 << (i % 8);
+                two_value_set_bit(&mut buf[TWO_VALUE_HEADER..], i);
             }
         }
     }
@@ -291,13 +291,13 @@ pub(crate) fn decode_for_region(encoded: &[u8], n: usize, elem_width: usize) -> 
     out
 }
 
-/// Directory entry `(size, encoding_byte)` for region `i` of a shard image.
-/// Shared by the shard-format tests here and in the compaction / shard-reader
-/// test modules.
+/// The `(size, encoding)` projection of a region's [`DirEntry`], for the
+/// shard-format assertions here and in the compaction / shard-reader test
+/// modules. The entry shape itself lives in `layout`.
 #[cfg(test)]
 pub(crate) fn region_dir(image: &[u8], i: usize) -> (usize, u8) {
-    let d = dir_entry_off(i);
-    (read_u64_le(image, d + 8) as usize, image[d + 24])
+    let e = DirEntry::read(image, i);
+    (e.size, e.encoding)
 }
 
 fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
@@ -368,10 +368,11 @@ impl ShardWriteOpts {
     };
 }
 
-/// The one test-side shard writer: build a `Batch` through the typed row API and
-/// hand it to the production [`Batch::write_as_shard`], so region *order* has a
-/// single owner. Rows are `(opk_bytes, weight, i64_payload)` — callers keep their
-/// own PK encoding, which is where the shapes genuinely differ.
+/// The single-payload-column test shard writer: build a `Batch` through the typed
+/// row API and hand it to the production [`Batch::write_as_shard`], so region
+/// *order* has a single owner. Rows are `(opk_bytes, weight, i64_payload)`.
+/// Compaction's `write_test_shard` is the N-payload-column twin — a different row
+/// shape, not a second spelling of this one.
 #[cfg(test)]
 pub(in crate::storage) fn write_test_shard(
     path: &std::path::Path,
@@ -555,17 +556,18 @@ fn write_shard_streaming_inner(
             0
         };
 
-        let d = dir_entry_off(i);
-        write_u64_le(&mut hdr_buf, d, region_offsets[i] as u64);
-        write_u64_le(&mut hdr_buf, d + 8, actual_sizes[i] as u64);
-        write_u64_le(&mut hdr_buf, d + 16, cs);
-        let encoding_byte = match &encodings[i] {
-            RegionEncoding::Raw => ENCODING_RAW,
-            RegionEncoding::Constant { .. } => ENCODING_CONSTANT,
-            RegionEncoding::TwoValue { .. } => ENCODING_TWO_VALUE,
-            RegionEncoding::For { .. } => ENCODING_FOR,
-        };
-        hdr_buf[d + 24] = encoding_byte;
+        DirEntry {
+            offset: region_offsets[i],
+            size: actual_sizes[i],
+            checksum: cs,
+            encoding: match &encodings[i] {
+                RegionEncoding::Raw => ENCODING_RAW,
+                RegionEncoding::Constant { .. } => ENCODING_CONSTANT,
+                RegionEncoding::TwoValue { .. } => ENCODING_TWO_VALUE,
+                RegionEncoding::For { .. } => ENCODING_FOR,
+            },
+        }
+        .write(&mut hdr_buf, i);
     }
 
     write_u64_le(&mut hdr_buf, OFF_MAGIC, SHARD_MAGIC);
@@ -638,9 +640,9 @@ fn write_shard_streaming_inner(
 
 #[cfg(test)]
 mod tests {
+    use super::super::shard_reader::MappedShard;
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::lsm::shard_reader::MappedShard;
     use crate::test_support::{make_schema_u64_i64, pk_only_schema};
     use gnitz_wire::as_le_bytes;
 
@@ -961,7 +963,7 @@ mod tests {
         assert_eq!(region_dir(&img_b, 0), (n_b * 8, ENCODING_RAW), "B pk distinct → raw");
         assert_eq!(
             region_dir(&img_b, 1),
-            (16 + n_b.div_ceil(8), ENCODING_TWO_VALUE),
+            (two_value_image_len(n_b), ENCODING_TWO_VALUE),
             "B weight two-value"
         );
         assert_eq!(region_dir(&img_b, 2), (n_b * 8, ENCODING_RAW), "B null mixed → raw");

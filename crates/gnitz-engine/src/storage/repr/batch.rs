@@ -70,14 +70,6 @@ pub(in crate::storage) use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK,
 const FIXED_REGION_STRIDE: u8 = 8;
 pub(in crate::storage) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 
-/// How `append_mem_batch_ranges` writes the weight column (region[1]).
-enum WeightFill {
-    /// Copy per-row weights verbatim from `src`.
-    Copy,
-    /// Write `-src` weight per row.
-    Negate,
-}
-
 /// Total rows in a `[start, end)` row-range list — the shape every range-driven
 /// path (`append_ranges`, `Batch::from_ranges`, `ScalarFunc::append_map_ranges`)
 /// sizes its destination by.
@@ -866,9 +858,13 @@ impl Batch {
     /// bytes are written. `native_col_vals` holds one native value per PK
     /// column in `pk_columns()` order. Use for signed or compound PK test
     /// tables where `extend_pk` (no sign flip) writes incorrect OPK bytes.
+    ///
+    /// Encodes through the production `schema::key` encoder — a layer *below*
+    /// storage — so this stays a downward edge even though only tests call it.
     #[cfg(test)]
     pub(crate) fn extend_pk_opk(&mut self, schema: &SchemaDescriptor, native_col_vals: &[u128]) {
-        self.extend_pk_bytes(&crate::test_support::opk_pk(schema, native_col_vals));
+        let cols = schema.pk_columns().map(|(_, col)| (col.type_code, *col));
+        self.extend_pk_bytes(crate::schema::key::encode_leading_opk(cols, native_col_vals).pk_bytes());
     }
 
     /// Overwrite the narrow PK at `row` with a `u128` — the [`NarrowPkOpk`] image
@@ -923,25 +919,22 @@ impl Batch {
         self.data[dst_off..dst_off + n * stride].copy_from_slice(&src_region_data[src_off..src_off + n * stride]);
     }
 
-    /// Bulk-copy every `[start, end)` row range of `src`, in list order, onto
-    /// `self`'s tail — the survivor list of one filter pass over one chunk.
-    ///
-    /// `fill` selects how the weight column is written (see [`WeightFill`]).
+    /// Open an [`AppendSession`] over this batch. Every bulk append runs through
+    /// one; `hint_rows` sizes its blob dedup cache.
+    pub(crate) fn append_session(&mut self, hint_rows: usize) -> AppendSession<'_> {
+        AppendSession::open(self, hint_rows)
+    }
+
+    /// The one bulk-append body: copy every `[start, end)` row range of `src`, in
+    /// list order, onto `self`'s tail. `start <= end <= src.count` per range, and
+    /// `self` must share `src`'s schema (column count and strides).
     ///
     /// Non-STRING payload columns: one `copy_from_slice` per region per range.
-    /// STRING payload columns: per-cell blob relocation — unless `self` already
-    /// holds `src`'s blob (see [`Self::shares_blob_with`]), in which case the
-    /// 16-byte structs copy verbatim with every other column, their heap offsets
-    /// still valid. The destination knows whether it owns the source's bytes, so
-    /// no caller has to say.
-    ///
-    /// `cache` dedups repeated long-string spans across the whole call. It is the
-    /// caller's to supply because acquiring one is only worth it for a call that
-    /// copies a whole survivor list: the run-at-a-time appenders
-    /// ([`Self::append_batch`] under `cogroup_union`, one call per contiguous run
-    /// and in one path per *row*) would each pay a pooled-cache take, reserve and
-    /// `clear` — the `clear` being O(bucket count) of whatever a previous large
-    /// merge inflated the pooled cache to — to dedup within a handful of rows.
+    /// STRING payload columns: per-cell blob relocation under `cache` — unless
+    /// `self` already holds `src`'s blob (see [`Self::shares_blob_with`]), in
+    /// which case the 16-byte structs copy verbatim with every other column,
+    /// their heap offsets still valid. The destination knows whether it owns the
+    /// source's bytes, so no caller has to say.
     ///
     /// Taking the whole list rather than one range hoists the fixed per-call
     /// setup — the capacity reserve, the blob reserve, and the payload
@@ -952,33 +945,10 @@ impl Batch {
     /// Downgrades the layout to `Raw`: any append can break (PK, payload) order or
     /// introduce a duplicate/ghost, so no prior claim survives. This closes the
     /// W2M-decode trap where a stale strong claim could outlive an appender.
-    ///
-    /// Preconditions, per range:
-    /// - `start <= end <= src.count`
-    /// - `self` has the same schema (column count and strides) as `src`
-    fn append_mem_batch_ranges(
-        &mut self,
-        src: &MemBatch<'_>,
-        ranges: &[(usize, usize)],
-        fill: WeightFill,
-        cache: Option<&mut BlobCache>,
-    ) {
-        let mut session = AppendSession::open(self, range_rows(ranges));
-        session.push_ranges_with(src, ranges, fill, cache);
-    }
-
-    /// Open an [`AppendSession`] over this batch: the per-append setup —
-    /// the payload string-column map and the pooled blob dedup cache — resolved
-    /// once for a caller that appends many times.
-    pub(crate) fn append_session(&mut self, hint_rows: usize) -> AppendSession<'_> {
-        AppendSession::open_owning_cache(self, hint_rows)
-    }
-
     fn append_ranges_inner(
         &mut self,
         src: &MemBatch<'_>,
         ranges: &[(usize, usize)],
-        fill: WeightFill,
         is_string_at: &[bool; MAX_BATCH_REGIONS],
         mut cache: Option<&mut BlobCache>,
     ) {
@@ -1020,18 +990,7 @@ impl Batch {
                 continue;
             }
             self.bulk_copy_region(REG_PK, src.pk(), start, end);
-            match fill {
-                WeightFill::Copy => {
-                    self.bulk_copy_region(REG_WEIGHT, src.weight(), start, end);
-                }
-                WeightFill::Negate => {
-                    let dst_off = self.offsets[REG_WEIGHT] + self.count * 8;
-                    let dest = &mut self.data[dst_off..dst_off + n * 8];
-                    for (i, chunk) in dest.chunks_exact_mut(8).enumerate() {
-                        chunk.copy_from_slice(&(-src.get_weight(start + i)).to_le_bytes());
-                    }
-                }
-            }
+            self.bulk_copy_region(REG_WEIGHT, src.weight(), start, end);
             self.bulk_copy_region(REG_NULL_BMP, src.null_bmp(), start, end);
             for (pi, &is_str) in is_string_at[..npc].iter().enumerate() {
                 let cs = self.strides[REG_PAYLOAD_START + pi] as usize;
@@ -1057,19 +1016,15 @@ impl Batch {
     }
 }
 
-/// An open append into one destination batch.
+/// An open append into one destination batch — the only way to reach
+/// [`Batch::append_ranges_inner`], so no caller can skip its setup or repay it.
 ///
-/// The per-append setup — the payload string-column map and the pooled blob
-/// dedup cache — is resolved once and reused by every push. `append_ranges`
-/// already did that for a filter's whole survivor list; a session makes it
-/// available to the callers that append a *run* at a time and were repaying it
-/// per call. `op_union`'s merge is the extreme: for a set operation the branches
-/// carry `reindex_hash_row` synthetic PKs, so two sorted streams of uniform
-/// 128-bit keys have an expected run length of 2 and the setup dominated the copy
-/// it was setting up.
-///
-/// Downgrades the destination's layout on drop-free use, exactly as a direct
-/// append does: every push goes through the same body.
+/// That setup — the payload string-column map and one pooled blob dedup cache —
+/// is resolved once and reused by every push, which is what makes a *run*-at-a-
+/// time appender viable. `op_union`'s merge is the extreme: for a set operation
+/// the branches carry `reindex_hash_row` synthetic PKs, so two sorted streams of
+/// uniform 128-bit keys have an expected run length of 2 and the setup dominated
+/// the copy it was setting up.
 pub(crate) struct AppendSession<'d> {
     dst: &'d mut Batch,
     /// Payload slot → is a German string. Read only when the source's blob is not
@@ -1094,21 +1049,9 @@ impl<'d> AppendSession<'d> {
         is_string_at
     }
 
-    /// One-shot session for a single push: no pooled cache (see
-    /// `append_ranges_inner`'s doc on why acquiring one is only worth it for a
-    /// caller that copies many rows).
-    fn open(dst: &'d mut Batch, _hint_rows: usize) -> Self {
-        let is_string_at = Self::string_map(dst);
-        AppendSession {
-            dst,
-            is_string_at,
-            guard: BlobCacheGuard::empty(),
-        }
-    }
-
-    /// Session that also holds a pooled blob dedup cache for its whole life, so
+    /// The session holds a pooled blob dedup cache for its whole life, so
     /// repeated long-string spans are appended once across every push.
-    fn open_owning_cache(dst: &'d mut Batch, hint_rows: usize) -> Self {
+    fn open(dst: &'d mut Batch, hint_rows: usize) -> Self {
         let is_string_at = Self::string_map(dst);
         let guard = match dst.schema {
             Some(s) => BlobCacheGuard::acquire(&s, hint_rows),
@@ -1121,39 +1064,16 @@ impl<'d> AppendSession<'d> {
         }
     }
 
-    fn push_ranges_with(
-        &mut self,
-        src: &MemBatch<'_>,
-        ranges: &[(usize, usize)],
-        fill: WeightFill,
-        cache: Option<&mut BlobCache>,
-    ) {
-        let is_string_at = self.is_string_at;
-        self.dst.append_ranges_inner(src, ranges, fill, &is_string_at, cache);
-    }
-
     /// Append rows `[start, end)` of `src`.
     pub(crate) fn push_range(&mut self, src: &MemBatch<'_>, start: usize, end: usize) {
-        let is_string_at = self.is_string_at;
-        self.dst.append_ranges_inner(
-            src,
-            &[(start, end)],
-            WeightFill::Copy,
-            &is_string_at,
-            self.guard.get_mut(),
-        );
+        self.push_ranges(src, &[(start, end)]);
     }
 
     /// Append every listed range of `src`, in list order.
     pub(crate) fn push_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
         let is_string_at = self.is_string_at;
         self.dst
-            .append_ranges_inner(src, ranges, WeightFill::Copy, &is_string_at, self.guard.get_mut());
-    }
-
-    /// The destination, for a caller that also writes rows directly.
-    pub(crate) fn batch(&mut self) -> &mut Batch {
-        self.dst
+            .append_ranges_inner(src, ranges, &is_string_at, self.guard.get_mut());
     }
 }
 
@@ -1162,12 +1082,18 @@ impl Batch {
 
     /// Create a borrowed `MemBatch` view over this batch's data.
     ///
-    /// Zero-allocation: copies the by-value `offsets` array and forwards
-    /// references to `data` and `blob`.
+    /// Zero-allocation and near-free: every field is a pointer or a scalar, the
+    /// region offsets included (lent from this batch's own array).
+    ///
+    /// `#[inline]`: derived per range and per chunk on paths whose whole body is
+    /// a few reads through it, and release builds have no LTO and use default
+    /// codegen-units, so the hint is what carries the inline across the module
+    /// boundary.
+    #[inline]
     pub fn as_mem_batch(&self) -> MemBatch<'_> {
         MemBatch {
             data: &self.data,
-            offsets: self.offsets,
+            offsets: &self.offsets,
             pk_stride: self.strides[REG_PK],
             blob: &self.blob,
             count: self.count,
@@ -1195,18 +1121,6 @@ impl Batch {
     #[inline]
     pub(crate) fn is_consolidated(&self) -> bool {
         self.count == 0 || self.layout == Layout::Consolidated
-    }
-
-    /// Returns `None` for unsorted batches; `count <= 1` is always sorted.
-    pub(in crate::storage) fn as_sorted_mem_batch(
-        &self,
-        schema: &SchemaDescriptor,
-    ) -> Option<merge::SortedMemBatch<'_>> {
-        if self.sorted_verified(schema) || self.count <= 1 {
-            Some(merge::SortedMemBatch::new_unchecked(self.as_mem_batch()))
-        } else {
-            None
-        }
     }
 
     /// `is_sorted()`, additionally asserting in debug builds that the data really
@@ -1370,17 +1284,17 @@ impl Batch {
         total
     }
 
-    /// Scatter-copy selected rows from a MemBatch into a new Batch. An empty
-    /// `weights` keeps each source row's own weight; otherwise `weights[i]` is
-    /// written for `indices[i]` (and a zero one drops the row) — `scatter_copy`'s
-    /// contract.
-    pub fn from_indexed_rows(batch: &MemBatch, indices: &[u32], weights: &[i64], schema: &SchemaDescriptor) -> Self {
+    /// Scatter-copy selected rows from a MemBatch into a new Batch, each carrying
+    /// its own weight. A caller emitting *different* weights writes them over
+    /// [`weight_data_mut`](Self::weight_data_mut) afterwards — one sequential
+    /// blit, against a per-(row, column) dispatch in the scatter.
+    pub fn from_indexed_rows(batch: &MemBatch, indices: &[u32], schema: &SchemaDescriptor) -> Self {
         if indices.is_empty() {
             return Self::empty_with_schema(schema);
         }
         let blob_cap = merge::prorated_blob_cap(batch.blob.len(), batch.count, indices.len());
         write_to_batch(schema, indices.len(), blob_cap, |writer| {
-            super::scatter::scatter_copy(batch, indices, weights, writer);
+            super::scatter::scatter_copy(batch, indices, writer);
         })
     }
 
@@ -1394,7 +1308,7 @@ impl Batch {
             indices.windows(2).all(|w| w[0] < w[1]),
             "ascending_subset requires a strictly ascending index list",
         );
-        let mut out = Self::from_indexed_rows(&self.as_mem_batch(), indices, &[], schema);
+        let mut out = Self::from_indexed_rows(&self.as_mem_batch(), indices, schema);
         out.inherit_layout(self);
         out
     }
@@ -1527,7 +1441,7 @@ impl Batch {
     /// heap. The full-range decode/accumulate entry point (W2M ingest, the
     /// master's index-scan merge).
     pub fn append_mem_batch(&mut self, src: &MemBatch<'_>) {
-        self.append_mem_batch_ranges(src, &[(0, src.count)], WeightFill::Copy, None);
+        self.append_session(src.count).push_range(src, 0, src.count);
     }
 
     /// Bulk-copy rows [start, end) from another Batch (same schema).
@@ -1538,16 +1452,8 @@ impl Batch {
         if start >= end {
             return;
         }
-        self.append_mem_batch_ranges(&src.as_mem_batch(), &[(start, end)], WeightFill::Copy, None);
-    }
-
-    /// Bulk-copy rows with negated weights.
-    pub fn append_batch_negated(&mut self, src: &Batch, start: usize, end: usize) {
-        let end = end.min(src.count);
-        if start >= end {
-            return;
-        }
-        self.append_mem_batch_ranges(&src.as_mem_batch(), &[(start, end)], WeightFill::Negate, None);
+        self.append_session(end - start)
+            .push_range(&src.as_mem_batch(), start, end);
     }
 
     /// Bulk-copy every `[start, end)` range of `src`, in list order, onto this
@@ -2959,13 +2865,13 @@ mod tests {
         let _ = b.into_consolidated(&schema);
     }
 
-    // C: as_sorted_mem_batch certifies a SortedMemBatch from `sorted`.
+    // C: consolidate_if_needed's re-sort skip trusts `sorted`.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "flagged sorted")]
-    fn as_sorted_mem_batch_panics_on_lying_sorted() {
+    fn consolidate_if_needed_panics_on_lying_sorted() {
         let (b, schema) = flagged_batch(&[(2, 1, 0), (1, 1, 0)], true, false);
-        let _ = b.as_sorted_mem_batch(&schema);
+        let _ = Batch::consolidate_if_needed(&b, &schema);
     }
 
     // A: into_consolidated's consolidated short-circuit trusts `consolidated`.
@@ -3001,12 +2907,8 @@ mod tests {
     fn honest_sorted_consolidated_batch_passes_verifiers() {
         let (b, schema) = flagged_batch(&[(1, 1, 0), (2, 1, 0), (3, 1, 0)], true, true);
         assert!(
-            b.as_sorted_mem_batch(&schema).is_some(),
-            "C: honest sorted batch certifies"
-        );
-        assert!(
             Batch::consolidate_if_needed(&b, &schema).is_none(),
-            "D: honest consolidated batch borrows original"
+            "C+D: honest sorted/consolidated batch borrows original"
         );
         let cb = b.into_consolidated(&schema);
         assert_eq!(cb.count, 3, "A: honest consolidated batch passes through");
@@ -3091,19 +2993,6 @@ mod tests {
         dst.append_batch(&src, 1, 2);
         assert_eq!(dst.count, 1);
         assert_eq!(dst.get_pk(0), 20);
-    }
-
-    #[test]
-    fn batch_append_batch_negated() {
-        let schema = crate::test_support::make_schema_u64_i64();
-        let src = crate::test_support::make_batch(&schema, &[(10, 1, 100), (20, 2, 200)]);
-        let mut dst = Batch::with_capacity(schema, 8);
-
-        dst.append_batch_negated(&src, 0, 2);
-        assert_eq!(dst.count, 2);
-        assert_eq!(dst.get_weight(0), -1);
-        assert_eq!(dst.get_weight(1), -2);
-        assert_eq!(dst.get_pk(0), 10);
     }
 
     /// Regression: bulk append into an `empty_with_schema()` batch must not spin

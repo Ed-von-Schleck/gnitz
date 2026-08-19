@@ -507,9 +507,9 @@ impl MapPlan {
     /// already vectorize — compacting those would be a wasted copy of the whole
     /// chunk. The break-even is [`COMPACT_RUN_LEN`], not `MORSEL`: compaction
     /// buys a full extra copy of every survivor (~1.5–15 ns/row) to save the
-    /// *per-range* setup — one morsel eval prologue, one `MemBatch` (~½ KiB by
-    /// value), one scratch borrow — a few hundred cycles. Runs longer than that
-    /// already amortize it, whatever the morsel width.
+    /// *per-range* setup — one morsel eval prologue, one scratch borrow — a few
+    /// hundred cycles. Runs longer than that already amortize it, whatever the
+    /// morsel width.
     fn map_ranges_into(&self, src: &Batch, out: &mut Batch, ranges: &[(usize, usize)], pk: PkFill) {
         let total = crate::storage::range_rows(ranges);
         if total == 0 {

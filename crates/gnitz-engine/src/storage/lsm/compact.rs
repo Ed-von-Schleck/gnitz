@@ -12,8 +12,8 @@ use std::ffi::CStr;
 use super::batch::write_to_batch;
 use super::error::StorageError;
 use super::merge::prorated_blob_cap;
-use super::merge::{run_merge, UnifiedSource};
-use super::scatter::scatter_unified_sources_with_weights;
+use super::merge::{run_merge, ColPtr, UnifiedSource};
+use super::scatter::scatter_unified_sources;
 use super::shard_file::ShardWriteOpts;
 use super::shard_reader::MappedShard;
 use crate::schema::key::{pack_pk_be, pk_bytes_eq};
@@ -130,7 +130,8 @@ pub fn merge_and_route(
     // contiguous survivor slice. The `UnifiedSource` views hold raw pointers into
     // each shard's mmap (no lifetime tie); `shards` outlives them and every
     // scatter, all within this call.
-    let unified: Vec<UnifiedSource> = shards.iter().map(|s| s.to_unified(schema)).collect();
+    let mut cols: Vec<ColPtr> = Vec::new();
+    let unified: Vec<UnifiedSource> = shards.iter().map(|s| s.to_unified(schema, &mut cols)).collect();
     let nsurv = survivors.len();
     let mut out: Vec<(u128, String)> = Vec::with_capacity(guards.len());
 
@@ -181,7 +182,7 @@ pub fn merge_and_route(
             ),
         };
         let mut batch = write_to_batch(wschema, rows.len(), blob_cap, |writer| {
-            scatter_unified_sources_with_weights(&unified, rows, writer);
+            scatter_unified_sources(&unified, &cols, rows, writer);
         });
         if folded.is_some() {
             // The fused pass copied the *source's* payload null bits, which mean

@@ -59,6 +59,58 @@ pub(crate) const fn dir_entry_off(i: usize) -> usize {
     HEADER_SIZE + i * DIR_ENTRY_SIZE
 }
 
+/// One region's directory entry: `offset` ‖ `size` ‖ `checksum` (u64 LE each),
+/// the encoding byte at +24, the rest reserved (and covered by [`desc_digest`]).
+/// The writer, the open-time validation and the format tests all go through this
+/// pair, so neither side can drift on the field order.
+pub(crate) struct DirEntry {
+    pub offset: usize,
+    pub size: usize,
+    pub checksum: u64,
+    pub encoding: u8,
+}
+
+impl DirEntry {
+    pub(crate) fn read(image: &[u8], i: usize) -> Self {
+        let d = dir_entry_off(i);
+        DirEntry {
+            offset: gnitz_wire::read_u64_le(image, d) as usize,
+            size: gnitz_wire::read_u64_le(image, d + 8) as usize,
+            checksum: gnitz_wire::read_u64_le(image, d + 16),
+            encoding: image[d + 24],
+        }
+    }
+
+    pub(crate) fn write(&self, image: &mut [u8], i: usize) {
+        let d = dir_entry_off(i);
+        gnitz_wire::write_u64_le(image, d, self.offset as u64);
+        gnitz_wire::write_u64_le(image, d + 8, self.size as u64);
+        gnitz_wire::write_u64_le(image, d + 16, self.checksum);
+        image[d + 24] = self.encoding;
+    }
+}
+
+/// A `TwoValue` region's image: `value_a` LE ‖ `value_b` LE ‖ a `count`-bit
+/// vector, bit *i* set ⇔ row *i* holds `value_b`. Encoder, open-time size check
+/// and both read paths state the geometry only through these three.
+pub(crate) const TWO_VALUE_HEADER: usize = 16;
+
+pub(crate) const fn two_value_image_len(count: usize) -> usize {
+    TWO_VALUE_HEADER + count.div_ceil(8)
+}
+
+/// True when `row` holds `value_b`. `bitvec` starts at the image's
+/// [`TWO_VALUE_HEADER`] offset.
+#[inline]
+pub(crate) fn two_value_bit(bitvec: &[u8], row: usize) -> bool {
+    (bitvec[row / 8] >> (row % 8)) & 1 != 0
+}
+
+#[inline]
+pub(crate) fn two_value_set_bit(bitvec: &mut [u8], row: usize) {
+    bitvec[row / 8] |= 1 << (row % 8);
+}
+
 /// Length of the descriptive prefix — header plus one directory entry per
 /// region — which is exactly the span [`desc_digest`] covers.
 pub(crate) const fn desc_len(num_regions: usize) -> usize {

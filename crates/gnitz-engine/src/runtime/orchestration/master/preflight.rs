@@ -288,7 +288,8 @@ impl PreflightKeyStream {
             version: 0,
         });
         let bytes = slot.bytes();
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, schema_hint)
+        let mut offsets = [0usize; crate::storage::MAX_BATCH_REGIONS];
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, schema_hint, &mut offsets)
             .map_err(|e| scan_decode_err(self.w, e))?;
         if let Some(mb) = zc.data_batch.as_ref() {
             let pk = mb.pk();

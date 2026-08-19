@@ -3,8 +3,10 @@
 //!
 //! The merge half of `merge.rs` consolidates sorted runs in place; this half
 //! *scatters* arbitrary row selections during exchange repartition, joins,
-//! distinct, and reduce. The three public entry points
-//! (`scatter_copy`, `scatter_multi_source`, `scatter_unified_sources_with_weights`)
+//! distinct, and reduce. Two kernels, split on the source axis alone:
+//! [`scatter_copy`] for one hoisted source addressed by `&[u32]`, and
+//! [`scatter_unified_sources`] for reordered `(src, row, weight)`
+//! triples over any mix of `MemBatch` and shard backings. Both
 //! share one shape: a fused PK + weight + null_bmp pass dispatched on `pk_stride`
 //! to a const-width (`PKS`) helper, then one sequential pass per payload column
 //! (column widths dispatched to a const-`N` gather). Those const-generic arms and
@@ -14,7 +16,7 @@
 //! `pub(super)`.
 
 use super::batch::FIXED_REGION_BYTES;
-use super::merge::{DirectWriter, MemBatch, UnifiedSource};
+use super::merge::{ColPtr, DirectWriter, MemBatch, UnifiedSource};
 use gnitz_wire::is_german_string;
 
 /// Instantiate `$f` at the const PK width matching `$stride`. The literal width
@@ -73,27 +75,19 @@ pub(crate) fn route_rows_by_pk(mb: &MemBatch, schema: &crate::schema::SchemaDesc
     }
 }
 
-/// Scatter-copy rows from a batch at the given indices.
-/// Indices are NOT sorted — rows are written in the order given.
-/// If `weights` is non-empty, uses weights[i] for row i; otherwise reads
-/// the weight from the source batch at indices[i].
-pub fn scatter_copy(batch: &MemBatch, indices: &[u32], weights: &[i64], writer: &mut DirectWriter) {
+/// Scatter-copy rows from a batch at the given indices, carrying each row's own
+/// weight. Indices are NOT sorted — rows are written in the order given.
+///
+/// The single-source kernel: `&[u32]` indices, source hoisted out of every loop.
+/// A caller that reorders rows across *several* sources, or overrides their
+/// weights, uses [`scatter_unified_sources`] — whose
+/// `(src, row, weight)` triples are 4× the index memory this one needs, on the
+/// per-worker SAL ingest scatter and the boot relayout.
+pub fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut DirectWriter) {
     if indices.is_empty() {
         return;
     }
 
-    if !weights.is_empty() {
-        // Explicit-weight path (consolidation merge): row-by-row with zero-weight skip.
-        for (i, &idx) in indices.iter().enumerate() {
-            let w = weights[i];
-            if w != 0 {
-                writer.write_row(batch, idx as usize, w);
-            }
-        }
-        return;
-    }
-
-    // Column-first scatter (repartition / join hot path).
     // Input must not contain zero-weight rows — callers guarantee this.
     #[cfg(debug_assertions)]
     for &idx in indices {
@@ -227,117 +221,18 @@ fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
     }
 }
 
-/// Column-first scatter from multiple sources in a pre-determined (src_idx, row_idx) order.
-///
-/// `sources[i]` holds the MemBatch for source `i`; entries in `rows` are `(src_idx, row_idx)`
-/// in emission order. Destination writes are sequential per column; source reads are scattered.
-/// No zero-weight check — callers must filter before calling.
-///
-/// **Precondition: no entry of `rows` may name a `None` source, and every
-/// `row_idx` must be `< sources[src_idx].count`.** The per-column gathers reach
-/// the source through `get_unchecked(..).unwrap_unchecked()`, so naming an absent
-/// source is undefined behaviour, not a panic. Callers build `rows` by walking the
-/// `Some` sources (`ops::exchange::relay`), which upholds it by construction.
-pub fn scatter_multi_source(sources: &[Option<MemBatch<'_>>], rows: &[(u8, u32)], writer: &mut DirectWriter<'_>) {
-    if rows.is_empty() {
-        return;
-    }
-    #[cfg(debug_assertions)]
-    for &(si, ri) in rows {
-        let src = sources[si as usize].as_ref().unwrap();
-        debug_assert_ne!(
-            src.get_weight(ri as usize),
-            0,
-            "scatter_multi_source: zero-weight row at source={si} index={ri}",
-        );
-    }
-    let n = rows.len();
-    let base = writer.count;
-
-    pk_stride_dispatch!(writer.pk_stride, scatter_mb_pk_wt_nbm, sources, rows, base, writer);
-
-    // One pass per column keeps destination writes sequential.
-    let schema = writer.schema;
-    for (pi, col) in schema.payload_columns() {
-        let cs = col.size() as usize;
-        if is_german_string(col.type_code) {
-            for (out, &(si, ri)) in rows.iter().enumerate() {
-                let src = sources[si as usize].as_ref().unwrap();
-                let row = ri as usize;
-                let src_struct = src.get_col_ptr(row, pi, 16);
-                writer.write_string_cell(pi, src_struct, src.blob, base + out);
-            }
-        } else {
-            let dst = &mut writer.col_bufs[pi][base * cs..];
-            gather_mb_col_dispatch(sources, rows, pi, cs, dst);
-        }
-    }
-
-    writer.count += n;
-}
-
-// PK stride is the literal `PKS` (1/2/4/8/16) or, for the `PKS = 0` sentinel,
-// `writer.pk_stride` read at runtime (compound widths outside the const
-// dispatch); weight and null_bmp are always 8. Hoisting the PK stride out of
-// the row loop is what unlocks fixed-width loads/stores instead of memcpy in
-// the inner loop. All sources share the writer schema, so
-// `src.pk_stride == writer.pk_stride` per `debug_assert_eq!`.
-#[inline(always)]
-fn scatter_mb_pk_wt_nbm<const PKS: usize>(
-    sources: &[Option<MemBatch<'_>>],
-    rows: &[(u8, u32)],
-    base: usize,
-    writer: &mut DirectWriter<'_>,
-) {
-    const FB: usize = FIXED_REGION_BYTES;
-    let pks = if PKS == 0 { writer.pk_stride as usize } else { PKS };
-    for (out, &(si, ri)) in rows.iter().enumerate() {
-        let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
-        debug_assert_eq!(src.pk_stride as usize, pks);
-        let row = ri as usize;
-        let dst_row = base + out;
-        let pk_off = src.offsets[super::batch::REG_PK] + row * pks;
-        writer.pk[dst_row * pks..][..pks].copy_from_slice(&src.data[pk_off..pk_off + pks]);
-        let w_off = src.offsets[super::batch::REG_WEIGHT] + row * FB;
-        writer.weight[dst_row * FB..][..FB].copy_from_slice(&src.data[w_off..w_off + FB]);
-        let n_off = src.offsets[super::batch::REG_NULL_BMP] + row * FB;
-        writer.null_bmp[dst_row * FB..][..FB].copy_from_slice(&src.data[n_off..n_off + FB]);
-    }
-}
-
-// Dispatches column-size to a const-N gather; falls back to a runtime-sized
-// copy for unusual column widths.
-#[inline(always)]
-fn gather_mb_col_dispatch(sources: &[Option<MemBatch<'_>>], rows: &[(u8, u32)], pi: usize, cs: usize, dst: &mut [u8]) {
-    col_width_dispatch!(cs, gather_mb_col, (sources, rows, pi, dst), {
-        for (out, &(si, ri)) in rows.iter().enumerate() {
-            let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
-            let row = ri as usize;
-            let src_off = src.offsets[super::batch::REG_PAYLOAD_START + pi] + row * cs;
-            dst[out * cs..][..cs].copy_from_slice(&src.data[src_off..src_off + cs]);
-        }
-    });
-}
-
-#[inline(always)]
-fn gather_mb_col<const N: usize>(sources: &[Option<MemBatch<'_>>], rows: &[(u8, u32)], pi: usize, dst: &mut [u8]) {
-    for (out, &(si, ri)) in rows.iter().enumerate() {
-        let src = unsafe { sources.get_unchecked(si as usize).as_ref().unwrap_unchecked() };
-        let off = src.offsets[super::batch::REG_PAYLOAD_START + pi] + ri as usize * N;
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.data.as_ptr().add(off), dst.as_mut_ptr().add(out * N), N);
-        }
-    }
-}
-
 /// Column-first scatter from multiple `UnifiedSource`s with explicit per-row
 /// weights from the merge walk.
 ///
-/// Used by the read-cursor drain (`ReadCursor::scatter_drained_into`) and the
-/// flush-path `merge_survivors` + `scatter_survivors`. Callers must pass only net-nonzero weights; both
-/// the drain walk and `drive_merge`'s group fold emit only net-nonzero groups.
-pub(crate) fn scatter_unified_sources_with_weights(
+/// `cols` is the flat payload-`ColPtr` table the sources were built against;
+/// source `si`'s column `pi` is `cols[sources[si].cols_off + pi]`.
+///
+/// Used by the read-cursor drain, shard compaction and the flush-path merge.
+/// Callers must pass only net-nonzero weights; both the drain walk and
+/// `drive_merge`'s group fold emit only net-nonzero groups.
+pub(crate) fn scatter_unified_sources(
     sources: &[UnifiedSource],
+    cols: &[ColPtr],
     rows: &[(u32, u32, i64)],
     writer: &mut DirectWriter<'_>,
 ) {
@@ -346,10 +241,7 @@ pub(crate) fn scatter_unified_sources_with_weights(
     }
     #[cfg(debug_assertions)]
     for &(_si, _ri, w) in rows {
-        debug_assert_ne!(
-            w, 0,
-            "scatter_unified_sources_with_weights: zero-weight row in drain buffer",
-        );
+        debug_assert_ne!(w, 0, "scatter_unified_sources: zero-weight row in drain buffer",);
     }
     let n = rows.len();
     let base = writer.count;
@@ -364,7 +256,7 @@ pub(crate) fn scatter_unified_sources_with_weights(
             // Blob relocation is per-row regardless; no way to batch.
             for (out, &(si, ri, _)) in rows.iter().enumerate() {
                 let src = unsafe { sources.get_unchecked(si as usize) };
-                let src_struct = unsafe { src.cols[pi].row(ri as usize, 16) };
+                let src_struct = unsafe { cols.get_unchecked(src.cols_off + pi).row(ri as usize, 16) };
                 // Guard against null blob_ptr (source with no string data):
                 // from_raw_parts on a null pointer is UB even when len==0.
                 let src_blob: &[u8] = if src.blob_ptr.is_null() {
@@ -376,7 +268,7 @@ pub(crate) fn scatter_unified_sources_with_weights(
             }
         } else {
             let dst = &mut writer.col_bufs[pi][base * cs..];
-            gather_unified_col_dispatch(sources, rows, pi, cs, dst);
+            gather_unified_col_dispatch(sources, cols, rows, pi, cs, dst);
         }
     }
 
@@ -424,15 +316,17 @@ fn scatter_unified_pk_wt_nbm<const PKS: usize>(
 #[inline(always)]
 fn gather_unified_col_dispatch(
     sources: &[UnifiedSource],
+    cols: &[ColPtr],
     rows: &[(u32, u32, i64)],
     pi: usize,
     cs: usize,
     dst: &mut [u8],
 ) {
-    col_width_dispatch!(cs, gather_unified_col, (sources, rows, pi, dst), {
+    col_width_dispatch!(cs, gather_unified_col, (sources, cols, rows, pi, dst), {
         for (out, &(si, ri, _)) in rows.iter().enumerate() {
             let src = unsafe { sources.get_unchecked(si as usize) };
-            dst[out * cs..][..cs].copy_from_slice(unsafe { src.cols[pi].row(ri as usize, cs) });
+            let cp = unsafe { cols.get_unchecked(src.cols_off + pi) };
+            dst[out * cs..][..cs].copy_from_slice(unsafe { cp.row(ri as usize, cs) });
         }
     });
 }
@@ -441,10 +335,16 @@ fn gather_unified_col_dispatch(
 // `dst` is taken as a raw slice (rather than indexing through `writer.col_bufs`)
 // so the bounds check stays out of the hot inner loop.
 #[inline(always)]
-fn gather_unified_col<const N: usize>(sources: &[UnifiedSource], rows: &[(u32, u32, i64)], pi: usize, dst: &mut [u8]) {
+fn gather_unified_col<const N: usize>(
+    sources: &[UnifiedSource],
+    cols: &[ColPtr],
+    rows: &[(u32, u32, i64)],
+    pi: usize,
+    dst: &mut [u8],
+) {
     for (out, &(si, ri, _)) in rows.iter().enumerate() {
         let src = unsafe { sources.get_unchecked(si as usize) };
-        let ptr = unsafe { src.cols[pi].row_ptr(ri as usize) };
+        let ptr = unsafe { cols.get_unchecked(src.cols_off + pi).row_ptr(ri as usize) };
         unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr().add(out * N), N) };
     }
 }
@@ -456,9 +356,9 @@ fn gather_unified_col<const N: usize>(sources: &[UnifiedSource], rows: &[(u32, u
 #[cfg(test)]
 mod tests {
     use super::super::batch::Batch;
-    use super::super::merge::ColPtr;
+    use super::super::merge::mem_batch_to_unified;
     use super::*;
-    use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
+    use crate::schema::SchemaDescriptor;
     use crate::test_support::{make_schema_u128_i64, wide_pk_3xu64_schema};
 
     fn make_batch_i64(rows: &[(u128, i64, i64)]) -> Batch {
@@ -469,12 +369,7 @@ mod tests {
     // scatter_copy tests
     // -----------------------------------------------------------------------
 
-    fn run_scatter(
-        b: &Batch,
-        indices: &[u32],
-        weights: &[i64],
-        schema: &SchemaDescriptor,
-    ) -> Vec<(u64, u64, i64, i64)> {
+    fn run_scatter(b: &Batch, indices: &[u32], schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
         let batch = b.as_mem_batch();
         let n = indices.len();
         let total_blob = batch.blob.len();
@@ -497,7 +392,7 @@ mod tests {
                 schema,
                 0,
             );
-            scatter_copy(&batch, indices, weights, &mut writer);
+            scatter_copy(&batch, indices, &mut writer);
             count = writer.row_count();
         }
 
@@ -519,7 +414,7 @@ mod tests {
         let b = make_batch_i64(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
 
         // Pick rows 2 and 0 (out of order)
-        let result = run_scatter(&b, &[2, 0], &[], &schema);
+        let result = run_scatter(&b, &[2, 0], &schema);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (3, 0, 1, 30));
         assert_eq!(result[1], (1, 0, 1, 10));
@@ -530,20 +425,10 @@ mod tests {
         let schema = make_schema_u128_i64();
         let b = make_batch_i64(&[(1, 1, 10)]);
 
-        let result = run_scatter(&b, &[], &[], &schema);
+        let result = run_scatter(&b, &[], &schema);
         assert_eq!(result.len(), 0);
     }
 
-    #[test]
-    fn test_scatter_with_explicit_weights() {
-        let schema = make_schema_u128_i64();
-        let b = make_batch_i64(&[(1, 1, 10), (2, 1, 20)]);
-
-        // Override weights: row 1 gets w=5, row 0 gets w=-1
-        let result = run_scatter(&b, &[1, 0], &[5, -1], &schema);
-        assert_eq!(result[0], (2, 0, 5, 20));
-        assert_eq!(result[1], (1, 0, -1, 10));
-    }
     // -----------------------------------------------------------------------
     // Wide-stride scatter tests (compound PK, pk_stride = 24)
     //
@@ -594,7 +479,7 @@ mod tests {
                 writer.pk_stride != 8 && writer.pk_stride != 16,
                 "test must exercise the PKS = 0 sentinel arm",
             );
-            scatter_copy(&mb, indices, &[], &mut writer);
+            scatter_copy(&mb, indices, &mut writer);
             assert_eq!(writer.row_count(), 2);
         }
         assert_eq!(&pk[0..24], &pk_c);
@@ -606,44 +491,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scatter_multi_source_sentinel_wide_pk() {
-        let schema = wide_pk_3xu64_schema();
-        let pk_a = [0xaau8; 24];
-        let pk_b = [0xbbu8; 24];
-        let pk_c = [0xccu8; 24];
-        let pk_d = [0xddu8; 24];
-        let s0 = make_batch_compound_pk_24(&[(pk_a, 1, 10), (pk_b, 1, 20)]);
-        let s1 = make_batch_compound_pk_24(&[(pk_c, 1, 30), (pk_d, 1, 40)]);
-        let mb0 = s0.as_mem_batch();
-        let mb1 = s1.as_mem_batch();
-        let sources: Vec<Option<MemBatch<'_>>> = vec![Some(mb0.clone()), Some(mb1.clone())];
-        // Drive an interleaved emission order.
-        let rows: &[(u8, u32)] = &[(1, 0), (0, 1), (0, 0), (1, 1)];
-
-        let n = rows.len();
-        let mut pk = vec![0u8; n * 24];
-        let mut wt = vec![0u8; n * 8];
-        let mut nb = vec![0u8; n * 8];
-        let mut col0 = vec![0u8; n * 8];
-        let mut blob: Vec<u8> = Vec::with_capacity(1);
-        {
-            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
-            assert!(
-                writer.pk_stride != 8 && writer.pk_stride != 16,
-                "test must exercise the PKS = 0 sentinel arm",
-            );
-            scatter_multi_source(&sources, rows, &mut writer);
-            assert_eq!(writer.row_count(), 4);
-        }
-        assert_eq!(&pk[0..24], &pk_c);
-        assert_eq!(&pk[24..48], &pk_b);
-        assert_eq!(&pk[48..72], &pk_a);
-        assert_eq!(&pk[72..96], &pk_d);
-        let vals: Vec<i64> = (0..4).map(|i| gnitz_wire::read_i64_le(&col0, i * 8)).collect();
-        assert_eq!(vals, vec![30, 20, 10, 40]);
-    }
-
-    #[test]
     fn test_scatter_unified_sources_sentinel_wide_pk() {
         let schema = wide_pk_3xu64_schema();
         let pk_a = [0x11u8; 24];
@@ -652,43 +499,8 @@ mod tests {
         let s = make_batch_compound_pk_24(&[(pk_a, 1, 7), (pk_b, 1, 8), (pk_c, 1, 9)]);
         let mb = s.as_mem_batch();
 
-        // Build a UnifiedSource that points into `mb`. Only the PK,
-        // null_bmp, and one payload column are exercised; remaining `cols`
-        // entries are zero-stride placeholders so any accidental read
-        // returns deterministic bytes.
-        let pk_base = mb.data.as_ptr().wrapping_add(mb.offsets[super::super::batch::REG_PK]);
-        let nbm_base = mb
-            .data
-            .as_ptr()
-            .wrapping_add(mb.offsets[super::super::batch::REG_NULL_BMP]);
-        let col0_base = mb
-            .data
-            .as_ptr()
-            .wrapping_add(mb.offsets[super::super::batch::REG_PAYLOAD_START]);
-        let zero: u8 = 0;
-        let mut cols = [ColPtr {
-            base: &zero as *const u8,
-            stride: 0,
-        }; MAX_COLUMNS - 1];
-        cols[0] = ColPtr {
-            base: col0_base,
-            stride: 8,
-        };
-        let src = UnifiedSource {
-            pk: ColPtr {
-                base: pk_base,
-                stride: 24,
-            },
-            null_bmp: ColPtr {
-                base: nbm_base,
-                stride: 8,
-            },
-            null_pad_mask: 0,
-            cols,
-            blob_ptr: mb.blob.as_ptr(),
-            blob_len: mb.blob.len(),
-        };
-        let sources = vec![src];
+        let mut cols = Vec::new();
+        let sources = vec![mem_batch_to_unified(&mb, &schema, &mut cols)];
         // (src_idx, row_idx, weight) — explicit weights override the
         // batch-resident ones.
         let rows: &[(u32, u32, i64)] = &[(0, 2, 5), (0, 0, -1), (0, 1, 3)];
@@ -705,7 +517,7 @@ mod tests {
                 writer.pk_stride != 8 && writer.pk_stride != 16,
                 "test must exercise the PKS = 0 sentinel arm",
             );
-            scatter_unified_sources_with_weights(&sources, rows, &mut writer);
+            scatter_unified_sources(&sources, &cols, rows, &mut writer);
             assert_eq!(writer.row_count(), 3);
         }
         assert_eq!(&pk[0..24], &pk_c);
@@ -722,8 +534,8 @@ mod tests {
     //
     // The wide-PK tests above force the *dynamic* arm (stride 24). All other
     // set-op/union/scatter tests use a U128 PK (stride 16) only transitively;
-    // none exercise the literal `PKS=8` arm, and none pin `scatter_multi_source`
-    // / `scatter_unified_sources_with_weights` to a *specific* const width. These
+    // none exercise the literal `PKS=8` arm, and none pin the scatter kernels to
+    // a *specific* const width. These
     // build PKs as distinguishable byte patterns (via `extend_pk_bytes`, which is
     // byte-transparent — scatter copies PK bytes verbatim) and assert the exact
     // PK bytes, weights, and payloads land per output row. If a const arm
@@ -764,8 +576,10 @@ mod tests {
         b
     }
 
+    /// Two `MemBatch` sources interleaved through the shared kernel: the
+    /// per-source `cols_off` must address each source's own payload column.
     #[test]
-    fn test_scatter_multi_source_const_pk8() {
+    fn test_scatter_two_mem_sources_const_pk8() {
         let schema = crate::test_support::make_schema_u64_i64(); // stride 8
         let pk_a = [0x11u8; 8];
         let pk_b = [0x22u8; 8];
@@ -773,10 +587,13 @@ mod tests {
         let pk_d = [0x44u8; 8];
         let s0 = make_batch_pk8(&[(pk_a, 1, 10), (pk_b, 1, 20)]);
         let s1 = make_batch_pk8(&[(pk_c, 1, 30), (pk_d, 1, 40)]);
-        let mb0 = s0.as_mem_batch();
-        let mb1 = s1.as_mem_batch();
-        let sources: Vec<Option<MemBatch<'_>>> = vec![Some(mb0.clone()), Some(mb1.clone())];
-        let rows: &[(u8, u32)] = &[(1, 0), (0, 1), (0, 0), (1, 1)];
+        let (mb0, mb1) = (s0.as_mem_batch(), s1.as_mem_batch());
+        let mut cols = Vec::new();
+        let sources = vec![
+            mem_batch_to_unified(&mb0, &schema, &mut cols),
+            mem_batch_to_unified(&mb1, &schema, &mut cols),
+        ];
+        let rows: &[(u32, u32, i64)] = &[(1, 0, 1), (0, 1, 1), (0, 0, 1), (1, 1, 1)];
 
         let n = rows.len();
         let mut pk = vec![0u8; n * 8];
@@ -787,7 +604,7 @@ mod tests {
         {
             let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
             assert_eq!(writer.pk_stride, 8, "test must exercise the const PKS=8 arm");
-            scatter_multi_source(&sources, rows, &mut writer);
+            scatter_unified_sources(&sources, &cols, rows, &mut writer);
             assert_eq!(writer.row_count(), 4);
         }
         // Emission order (1,0),(0,1),(0,0),(1,1) ⇒ pk_c, pk_b, pk_a, pk_d.
@@ -795,42 +612,6 @@ mod tests {
         assert_eq!(&pk[8..16], &pk_b);
         assert_eq!(&pk[16..24], &pk_a);
         assert_eq!(&pk[24..32], &pk_d);
-        let vals: Vec<i64> = (0..4).map(|i| gnitz_wire::read_i64_le(&col0, i * 8)).collect();
-        assert_eq!(vals, vec![30, 20, 10, 40]);
-        let weights: Vec<i64> = (0..4).map(|i| gnitz_wire::read_i64_le(&wt, i * 8)).collect();
-        assert_eq!(weights, vec![1, 1, 1, 1]);
-    }
-
-    #[test]
-    fn test_scatter_multi_source_const_pk16() {
-        let schema = make_schema_u128_i64(); // U128 pk → stride 16
-        let pk_a = [0xa1u8; 16];
-        let pk_b = [0xb2u8; 16];
-        let pk_c = [0xc3u8; 16];
-        let pk_d = [0xd4u8; 16];
-        let s0 = make_batch_pk16(&[(pk_a, 1, 10), (pk_b, 1, 20)]);
-        let s1 = make_batch_pk16(&[(pk_c, 1, 30), (pk_d, 1, 40)]);
-        let mb0 = s0.as_mem_batch();
-        let mb1 = s1.as_mem_batch();
-        let sources: Vec<Option<MemBatch<'_>>> = vec![Some(mb0.clone()), Some(mb1.clone())];
-        let rows: &[(u8, u32)] = &[(1, 0), (0, 1), (0, 0), (1, 1)];
-
-        let n = rows.len();
-        let mut pk = vec![0u8; n * 16];
-        let mut wt = vec![0u8; n * 8];
-        let mut nb = vec![0u8; n * 8];
-        let mut col0 = vec![0u8; n * 8];
-        let mut blob: Vec<u8> = Vec::with_capacity(1);
-        {
-            let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
-            assert_eq!(writer.pk_stride, 16, "test must exercise the const PKS=16 arm");
-            scatter_multi_source(&sources, rows, &mut writer);
-            assert_eq!(writer.row_count(), 4);
-        }
-        assert_eq!(&pk[0..16], &pk_c);
-        assert_eq!(&pk[16..32], &pk_b);
-        assert_eq!(&pk[32..48], &pk_a);
-        assert_eq!(&pk[48..64], &pk_d);
         let vals: Vec<i64> = (0..4).map(|i| gnitz_wire::read_i64_le(&col0, i * 8)).collect();
         assert_eq!(vals, vec![30, 20, 10, 40]);
     }
@@ -844,41 +625,8 @@ mod tests {
         let s = make_batch_pk8(&[(pk_a, 1, 7), (pk_b, 1, 8), (pk_c, 1, 9)]);
         let mb = s.as_mem_batch();
 
-        // Build a UnifiedSource pointing into `mb`. Only PK, null_bmp, and one
-        // payload column are read; the rest are zero-stride placeholders.
-        let pk_base = mb.data.as_ptr().wrapping_add(mb.offsets[super::super::batch::REG_PK]);
-        let nbm_base = mb
-            .data
-            .as_ptr()
-            .wrapping_add(mb.offsets[super::super::batch::REG_NULL_BMP]);
-        let col0_base = mb
-            .data
-            .as_ptr()
-            .wrapping_add(mb.offsets[super::super::batch::REG_PAYLOAD_START]);
-        let zero: u8 = 0;
-        let mut cols = [ColPtr {
-            base: &zero as *const u8,
-            stride: 0,
-        }; MAX_COLUMNS - 1];
-        cols[0] = ColPtr {
-            base: col0_base,
-            stride: 8,
-        };
-        let src = UnifiedSource {
-            pk: ColPtr {
-                base: pk_base,
-                stride: 8,
-            },
-            null_bmp: ColPtr {
-                base: nbm_base,
-                stride: 8,
-            },
-            null_pad_mask: 0,
-            cols,
-            blob_ptr: mb.blob.as_ptr(),
-            blob_len: mb.blob.len(),
-        };
-        let sources = vec![src];
+        let mut cols = Vec::new();
+        let sources = vec![mem_batch_to_unified(&mb, &schema, &mut cols)];
         let rows: &[(u32, u32, i64)] = &[(0, 2, 5), (0, 0, -1), (0, 1, 3)];
 
         let n = rows.len();
@@ -890,7 +638,7 @@ mod tests {
         {
             let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
             assert_eq!(writer.pk_stride, 8, "test must exercise the const PKS=8 arm");
-            scatter_unified_sources_with_weights(&sources, rows, &mut writer);
+            scatter_unified_sources(&sources, &cols, rows, &mut writer);
             assert_eq!(writer.row_count(), 3);
         }
         // Emission order rows[2],rows[0],rows[1] ⇒ pk_c, pk_a, pk_b.
@@ -912,39 +660,8 @@ mod tests {
         let s = make_batch_pk16(&[(pk_a, 1, 7), (pk_b, 1, 8), (pk_c, 1, 9)]);
         let mb = s.as_mem_batch();
 
-        let pk_base = mb.data.as_ptr().wrapping_add(mb.offsets[super::super::batch::REG_PK]);
-        let nbm_base = mb
-            .data
-            .as_ptr()
-            .wrapping_add(mb.offsets[super::super::batch::REG_NULL_BMP]);
-        let col0_base = mb
-            .data
-            .as_ptr()
-            .wrapping_add(mb.offsets[super::super::batch::REG_PAYLOAD_START]);
-        let zero: u8 = 0;
-        let mut cols = [ColPtr {
-            base: &zero as *const u8,
-            stride: 0,
-        }; MAX_COLUMNS - 1];
-        cols[0] = ColPtr {
-            base: col0_base,
-            stride: 8,
-        };
-        let src = UnifiedSource {
-            pk: ColPtr {
-                base: pk_base,
-                stride: 16,
-            },
-            null_bmp: ColPtr {
-                base: nbm_base,
-                stride: 8,
-            },
-            null_pad_mask: 0,
-            cols,
-            blob_ptr: mb.blob.as_ptr(),
-            blob_len: mb.blob.len(),
-        };
-        let sources = vec![src];
+        let mut cols = Vec::new();
+        let sources = vec![mem_batch_to_unified(&mb, &schema, &mut cols)];
         let rows: &[(u32, u32, i64)] = &[(0, 2, 5), (0, 0, -1), (0, 1, 3)];
 
         let n = rows.len();
@@ -956,7 +673,7 @@ mod tests {
         {
             let mut writer = DirectWriter::new(&mut pk, &mut wt, &mut nb, vec![&mut col0], &mut blob, &schema, 0);
             assert_eq!(writer.pk_stride, 16, "test must exercise the const PKS=16 arm");
-            scatter_unified_sources_with_weights(&sources, rows, &mut writer);
+            scatter_unified_sources(&sources, &cols, rows, &mut writer);
             assert_eq!(writer.row_count(), 3);
         }
         assert_eq!(&pk[0..16], &pk_c);

@@ -99,7 +99,8 @@ pub(super) async fn drain_index_scan(
                 descriptor: s,
                 version: *v,
             });
-            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, schema_hint)
+            let mut offsets = [0usize; crate::storage::MAX_BATCH_REGIONS];
+            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, schema_hint, &mut offsets)
                 .map_err(|e| scan_decode_err(w, e))?;
             if saved_schema.is_none() {
                 if let Some(ref s) = zc.schema {

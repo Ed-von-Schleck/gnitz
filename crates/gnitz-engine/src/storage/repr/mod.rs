@@ -8,13 +8,15 @@
 //! WAL-block framer lives in `gnitz_wire::wal` (the one definition client and
 //! engine share); `batch_wire` and the SAL scatter writer call it.
 //!
+//! The shard *image* has one owner at this layer: `shard_file` encodes it,
+//! `shard_reader` mmaps and validates it, and `layout` holds the format rules
+//! both call. L3 reaches down for `MappedShard`; nothing here reaches up.
+//!
 //! `repr/` has **no outward facade of its own** — `storage/mod.rs` curates the
 //! single combined storage surface and reaches into these submodules, re-exporting
 //! each leaf's items and aliasing the submodules so the L3/LSM siblings keep their
 //! `super::<mod>` / `crate::storage::<mod>` paths. Every production edge points
-//! downward (schema/foundation) or sideways within this layer; `shard_file`'s
-//! test module is the one exception, reaching up to `lsm::shard_reader` to read
-//! back what it wrote.
+//! downward (schema/foundation) or sideways within this layer.
 
 pub(super) mod batch;
 pub(crate) mod batch_pool;
@@ -26,4 +28,9 @@ pub(super) mod layout;
 pub(super) mod merge;
 pub(super) mod scatter;
 pub(super) mod shard_file;
+pub(in crate::storage) mod shard_reader;
 pub(super) mod xor8;
+
+// The one storage-level helper the shard reader names (`StorageError`), aliased
+// so its files keep their `super::super::<mod>` paths.
+use super::error;

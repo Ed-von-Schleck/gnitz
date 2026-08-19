@@ -491,7 +491,7 @@ fn recover_from_sal(
                     // distribution-prefix hash, same key→worker map.
                     let mb = batch.as_mem_batch();
                     crate::runtime::master::scatter::with_worker_indices(&batch, &schema, num_workers as usize, |wi| {
-                        Batch::from_indexed_rows(&mb, &wi[rank as usize], &[], &schema)
+                        Batch::from_indexed_rows(&mb, &wi[rank as usize], &schema)
                     })
                 } else {
                     batch

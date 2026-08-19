@@ -143,10 +143,9 @@ impl AdhocFold {
     /// no survivor batch is materialized. `Err` on exceeding the per-worker group
     /// cap.
     ///
-    /// The whole list rather than one range: `MemBatch` carries its region
-    /// offsets by value (~½ KiB), so building the chunk's and the
-    /// representative-rows' views once per *range* would cost more than the fold
-    /// itself over a fragmented survivor list.
+    /// The whole list rather than one range: a fragmented survivor list would
+    /// otherwise repay the per-call setup — the state destructure, the keyer and
+    /// the two batch views — once per range instead of once per chunk.
     pub(crate) fn fold_ranges(&mut self, chunk: &Batch, ranges: &[(usize, usize)]) -> Result<(), String> {
         let Self {
             plan,

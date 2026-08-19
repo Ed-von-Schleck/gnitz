@@ -13,7 +13,7 @@ use super::columnar::with_payload_cmp;
 use super::columnar::ColumnarSource;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::MemBatch;
-use super::merge::{self, PosCursor, UnifiedSource};
+use super::merge::{self, ColPtr, PosCursor, UnifiedSource};
 #[cfg(test)]
 use super::shard_reader::MappedShard;
 use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
@@ -52,9 +52,10 @@ enum SourceMode {
 pub struct ReadCursor {
     sources: Vec<Run>,
     states: Vec<PosCursor>,
-    /// Many cursor consumers (point lookups, seeks) never call
-    /// `scatter_drained_into`; build on first use.
-    unified_sources: OnceCell<Vec<UnifiedSource>>,
+    /// The scatter's source views and the flat payload-`ColPtr` table they index
+    /// into (see `mem_batch_to_unified`). Many cursor consumers (point lookups,
+    /// seeks) never call `scatter_drained_into`; built on first use.
+    unified_sources: OnceCell<(Vec<UnifiedSource>, Vec<ColPtr>)>,
     /// The N-way merge tournament, sized once from `sources.len()` — which never
     /// changes — and re-played in place by each reposition. Idle under
     /// `Empty`/`Single`.

@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::catalog::ColumnDef;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, MemBatch};
+use crate::storage::{Batch, MemBatch, MAX_BATCH_REGIONS};
 use gnitz_wire::schema_block::SchemaBlockCol;
 
 // ---------------------------------------------------------------------------
@@ -604,11 +604,13 @@ fn decode_wire_body(
 ///
 /// Takes a pre-parsed `control` block (from `peek_control_block`) so the
 /// caller can inspect flags before choosing a decode path without
-/// triggering a redundant parse.
+/// triggering a redundant parse, and the region-offset array the returned
+/// `MemBatch` borrows (see [`MemBatch::offsets`]).
 pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     data: &'a [u8],
     control: DecodedControl,
     schema_hint: Option<SchemaWithVersion<'_>>,
+    offsets: &'a mut [usize; MAX_BATCH_REGIONS],
 ) -> Result<DecodedWireZeroCopy<'a>, &'static str> {
     let ctrl_size = control.block_size;
     let flags = control.flags;
@@ -631,7 +633,7 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     let data_batch = if has_data {
         let eff_schema = wire_schema.as_ref().ok_or("no schema for data block")?;
         let dblock = gnitz_wire::wal::block_slice_at(data, off)?;
-        let mb = crate::storage::decode_mem_batch_from_wal_block(dblock, eff_schema)?;
+        let mb = crate::storage::decode_mem_batch_from_wal_block(dblock, eff_schema, offsets)?;
         Some(mb)
     } else {
         None

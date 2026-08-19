@@ -273,7 +273,7 @@ mod tests {
     /// where they land.
     #[test]
     fn linked_child_shard_opens_under_its_linked_name() {
-        use crate::storage::lsm::shard_reader::MappedShard;
+        use crate::storage::repr::shard_reader::MappedShard;
         use crate::test_support::{make_batch, make_schema_u64_i64};
 
         let tmp = tempfile::tempdir().unwrap();

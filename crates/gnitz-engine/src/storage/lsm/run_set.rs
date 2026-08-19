@@ -11,7 +11,8 @@ use std::rc::Rc;
 
 use super::batch::{write_to_batch, Batch, Layout};
 use super::bloom::BloomFilter;
-use super::merge::{self, SortedMemBatch};
+use super::merge::{self, MemBatch};
+use super::scatter::scatter_unified_sources;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
 
@@ -161,11 +162,7 @@ impl RunSet {
         if self.runs.len() <= 1 {
             return;
         }
-        let sorted: Vec<SortedMemBatch> = self
-            .runs
-            .iter()
-            .map(|r| r.as_sorted_mem_batch(schema).expect("runs are always sorted"))
-            .collect();
+        let sorted: Vec<MemBatch> = self.runs.iter().map(|r| r.as_mem_batch()).collect();
         let merged = consolidate_batches(&sorted, schema);
         drop(sorted); // borrows self.runs; release before the mutable reborrow
         self.runs.clear();
@@ -214,7 +211,7 @@ fn bloom_add_batch(bloom: &mut BloomFilter, batch: &Batch) {
 }
 
 /// Merge N sorted MemBatch views into a single consolidated Batch.
-fn consolidate_batches(batches: &[SortedMemBatch], schema: &SchemaDescriptor) -> Batch {
+fn consolidate_batches(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch {
     if batches.is_empty() {
         return Batch::empty_with_schema(schema);
     }
@@ -228,12 +225,21 @@ fn consolidate_batches(batches: &[SortedMemBatch], schema: &SchemaDescriptor) ->
     // `survivors.len()` is routinely a fraction of the input row count. The blob
     // bound stays `total_blob` (survivors' blobs are a subset; blob is reserved,
     // not zeroed, so an over-estimate costs nothing).
-    let survivors = merge::merge_survivors(batches, schema);
+    // `src`/`row` originate as `u32` fields of `HeapNode`, so the casts are lossless.
+    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batches.iter().map(|b| b.count).sum());
+    merge::run_merge(batches, schema, |src, row, w| {
+        survivors.push((src as u32, row as u32, w))
+    });
     if survivors.is_empty() {
         return Batch::empty_with_schema(schema);
     }
+    let mut cols = Vec::new();
+    let unified: Vec<_> = batches
+        .iter()
+        .map(|b| merge::mem_batch_to_unified(b, schema, &mut cols))
+        .collect();
     let mut result = write_to_batch(schema, survivors.len(), total_blob, |writer| {
-        merge::scatter_survivors(batches, schema, &survivors, writer);
+        scatter_unified_sources(&unified, &cols, &survivors, writer);
     });
     result.certify_layout(Layout::Consolidated, schema);
     result

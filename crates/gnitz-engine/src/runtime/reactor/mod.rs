@@ -714,7 +714,8 @@ impl Reactor {
     /// drops the slot so `consume_cursor` advances before any awaiter wakes.
     fn decode_slot_owned(&self, slot: W2mSlot, ctrl: wire::DecodedControl) -> DecodedWire {
         let bytes = slot.bytes();
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, None)
+        let mut offsets = [0usize; crate::storage::MAX_BATCH_REGIONS];
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, None, &mut offsets)
             .expect("W2M zero-copy decode failed — ring corrupt");
         let flags = zc.control.flags;
         let control = zc.control;

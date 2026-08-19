@@ -379,14 +379,16 @@ mod tests {
 
         // Reader 3: the shared column-first scatter reads `null_pad_mask` off the
         // view rather than the shard, so the view must carry it.
-        let unified = shard.to_unified(&schema);
+        let mut cols = Vec::new();
+        let unified = shard.to_unified(&schema, &mut cols);
         assert_eq!(unified.null_pad_mask, 1 << 1);
         // The absent column reads one shared `'static` zero cell for every row —
         // the same `stride == 0` shape a Constant region uses, so the gather has
         // no per-row branch and never dereferences a null base.
-        assert_eq!(unified.cols[1].stride, 0);
-        assert!(!unified.cols[1].base.is_null());
-        assert_eq!(unsafe { unified.cols[1].row(2, 8) }, [0u8; 8].as_slice());
+        let absent = cols[unified.cols_off + 1];
+        assert_eq!(absent.stride, 0);
+        assert!(!absent.base.is_null());
+        assert_eq!(unsafe { absent.row(2, 8) }, [0u8; 8].as_slice());
     }
 
     #[test]
@@ -1144,10 +1146,11 @@ mod tests {
         assert_eq!(pbytes, rbytes, "whole-shard slice payload region byte-identical");
 
         // Surface 4 (to_unified): read the payload ColPtr per row.
-        let pu = packed.to_unified(&schema);
+        let mut cols = Vec::new();
+        let pu = packed.to_unified(&schema, &mut cols);
         for (r, &want) in vals.iter().enumerate() {
-            let base = pu.cols[0].base;
-            let v = unsafe { *(base.add(r * pu.cols[0].stride) as *const i64) };
+            let cp = cols[pu.cols_off];
+            let v = unsafe { *(cp.base.add(r * cp.stride) as *const i64) };
             assert_eq!(v, want, "to_unified row {r}");
         }
     }

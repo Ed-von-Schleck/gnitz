@@ -1,16 +1,15 @@
 //! Per-row accessors for [`MappedShard`] — the region reads, the XOR8 probe and
 //! the OPK binary searches — plus the bulk `*_owned_batch` materializers.
 
-use std::ptr;
-
 use super::super::batch::{
     acquire_arena, Fill, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
 };
+use super::super::layout::two_value_bit;
 use super::super::merge::{prorated_blob_cap, relocate_german_string_vec, BlobCacheGuard, ColPtr, UnifiedSource};
 use super::super::xor8;
 use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion, ZERO_CELL};
 use crate::schema::key::PkBuf;
-use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
+use crate::schema::SchemaDescriptor;
 use gnitz_wire::{read_i64_le, read_u64_le};
 
 impl RegionView {
@@ -94,11 +93,10 @@ impl MappedShard {
                 value_b,
                 bitvec_off,
             } => {
-                let byte = self.data()[bitvec_off + row / 8];
-                if (byte >> (row % 8)) & 1 == 0 {
-                    *value_a
-                } else {
+                if two_value_bit(&self.data()[*bitvec_off..], row) {
                     *value_b
+                } else {
+                    *value_a
                 }
             }
         }
@@ -299,10 +297,13 @@ impl MappedShard {
             } => {
                 let a_bytes = value_a.to_le_bytes();
                 let b_bytes = value_b.to_le_bytes();
+                let bitvec = &shard[*bitvec_off..];
                 for i in 0..row_count {
-                    let row = start + i;
-                    let bit = (shard[bitvec_off + row / 8] >> (row % 8)) & 1;
-                    let src = if bit == 0 { &a_bytes[..] } else { &b_bytes[..] };
+                    let src = if two_value_bit(bitvec, start + i) {
+                        &b_bytes[..]
+                    } else {
+                        &a_bytes[..]
+                    };
                     dst[i * 8..(i + 1) * 8].copy_from_slice(src);
                 }
             }
@@ -386,22 +387,19 @@ impl MappedShard {
     /// returned `ColPtr`s alias the mapped memory, so the caller must keep `self`
     /// alive for as long as the view is read.
     ///
-    /// The shard-side counterpart of `repr::merge::mem_batch_to_unified`; shared
-    /// by the read-cursor drain (shard-vs-`MemBatch` polymorphism) and shard
-    /// compaction.
-    pub(crate) fn to_unified(&self, schema: &SchemaDescriptor) -> UnifiedSource {
+    /// The shard-side counterpart of `repr::merge::mem_batch_to_unified` (which
+    /// documents the `cols` table); shared by the read-cursor drain
+    /// (shard-vs-`MemBatch` polymorphism) and shard compaction.
+    pub(crate) fn to_unified(&self, schema: &SchemaDescriptor, cols: &mut Vec<ColPtr>) -> UnifiedSource {
         let data_ptr = self.data().as_ptr();
 
         let pk = self.pk.to_col_ptr(data_ptr);
         let null_bmp = self.null_bmp.to_col_ptr(data_ptr);
 
-        let mut cols = [ColPtr {
-            base: ptr::null(),
-            stride: 0,
-        }; MAX_COLUMNS - 1];
+        let cols_off = cols.len();
         for (pi, col) in schema.payload_columns() {
             let cs = col.size() as usize;
-            cols[pi] = match &self.col_regions[pi] {
+            cols.push(match &self.col_regions[pi] {
                 PayloadRegion::Direct(v) => v.to_col_ptr(data_ptr),
                 // Decoded image (`cs == elem_width`), stable for the shard's
                 // lifetime; the caller already keeps `self` alive for the view.
@@ -417,7 +415,7 @@ impl MappedShard {
                     base: ZERO_CELL.as_ptr(),
                     stride: 0,
                 },
-            };
+            });
         }
 
         let blob = self.blob_slice();
@@ -425,7 +423,7 @@ impl MappedShard {
             pk,
             null_bmp,
             null_pad_mask: self.null_pad_mask,
-            cols,
+            cols_off,
             blob_ptr: blob.as_ptr(),
             blob_len: blob.len(),
         }

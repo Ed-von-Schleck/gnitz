@@ -94,39 +94,20 @@ impl MappedShard {
 
         let count = read_u64_le(data, OFF_ROW_COUNT) as usize;
 
-        // Parse directory entries
-        struct DirEntry {
-            offset: usize,
-            size: usize,
-            checksum: u64,
-            encoding: u8,
-        }
-
+        // Parse directory entries. Each entry's encoding byte is validated per
+        // role by the region builders below — each role accepts exactly its legal
+        // encoding set, so an unknown or misplaced byte is rejected at its decode
+        // site. The reserved bytes [25,32) get no check of their own: the digest
+        // above already covers them.
         let mut entries: Vec<DirEntry> = Vec::with_capacity(num_regions);
         for i in 0..num_regions {
-            let entry_off = dir_entry_off(i);
-            let r_off = read_u64_le(data, entry_off) as usize;
-            let r_sz = read_u64_le(data, entry_off + 8) as usize;
-            let r_cs = read_u64_le(data, entry_off + 16);
-
-            // The encoding byte is validated per role by the region builders
-            // below — each role accepts exactly its legal encoding set, so an
-            // unknown or misplaced byte is rejected at its decode site. The
-            // entry's reserved bytes [25,32) get no check of their own: the
-            // digest above already covers them.
-            let encoding = data[entry_off + 24];
-
+            let e = DirEntry::read(data, i);
             // Keeps the region slice inside the mapping — a file truncated below
             // an intact prefix would slice past its end.
-            if r_off.saturating_add(r_sz) > file_size {
+            if e.offset.saturating_add(e.size) > file_size {
                 return Err(StorageError::InvalidShard);
             }
-            entries.push(DirEntry {
-                offset: r_off,
-                size: r_sz,
-                checksum: r_cs,
-                encoding,
-            });
+            entries.push(e);
         }
 
         // Validate checksums
@@ -196,13 +177,13 @@ impl MappedShard {
             };
         let build_weight_region = |e: &DirEntry| -> Result<WeightRegion, StorageError> {
             if e.encoding == ENCODING_TWO_VALUE {
-                if e.size != 16 + count.div_ceil(8) {
+                if e.size != two_value_image_len(count) {
                     return Err(StorageError::InvalidShard);
                 }
                 return Ok(WeightRegion::TwoValue {
                     value_a: read_i64_le(data, e.offset),
                     value_b: read_i64_le(data, e.offset + 8),
-                    bitvec_off: e.offset + 16,
+                    bitvec_off: e.offset + TWO_VALUE_HEADER,
                 });
             }
             direct_region(e, FIXED_REGION_BYTES).map(WeightRegion::Direct)
