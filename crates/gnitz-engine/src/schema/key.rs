@@ -370,7 +370,7 @@ pub(crate) fn probe_key(opk: &[u8]) -> u64 {
     } else {
         gnitz_wire::widen_pk_be(opk, opk.len())
     };
-    xxh::hash_u128(fingerprint)
+    xxh::checksum(&fingerprint.to_le_bytes())
 }
 
 // ---------------------------------------------------------------------------

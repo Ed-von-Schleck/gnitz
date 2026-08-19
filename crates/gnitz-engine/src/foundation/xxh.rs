@@ -1,9 +1,13 @@
-use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
+//! XXH3 hashing: the WAL/shard body checksum, the header digest that must skip
+//! its own field, and the 128-bit hashes used where a 64-bit birthday bound
+//! would silently coalesce distinct rows.
+
+use xxhash_rust::xxh3::xxh3_128;
 
 /// XXH3-64 body checksum. Owned by `gnitz_wire` (the crate that defines the WAL
 /// format and computes its checksum); re-exported here so the engine's many
 /// non-WAL callers keep `xxh::checksum` without a second identical wrapper.
-pub use gnitz_wire::checksum;
+pub(crate) use gnitz_wire::checksum;
 
 /// XXH3-64 over `seed` followed by `buf` with the eight bytes at `hole`
 /// excluded — the shape a self-describing file header needs, since the field
@@ -13,7 +17,7 @@ pub use gnitz_wire::checksum;
 /// Writer and reader call this identically, so neither can restate the hashed
 /// span differently from the other.
 #[inline]
-pub fn digest_with_hole(seed: &[u8], buf: &[u8], hole: usize) -> u64 {
+pub(crate) fn digest_with_hole(seed: &[u8], buf: &[u8], hole: usize) -> u64 {
     let mut h = xxhash_rust::xxh3::Xxh3Default::default();
     h.update(seed);
     h.update(&buf[..hole]);
@@ -21,50 +25,24 @@ pub fn digest_with_hole(seed: &[u8], buf: &[u8], hole: usize) -> u64 {
     h.digest()
 }
 
-/// Hash a 128-bit key to a 64-bit hash via XXH3-64.
-#[inline]
-pub fn hash_u128(pk: u128) -> u64 {
-    xxh3_64(&pk.to_le_bytes())
-}
-
 /// Streaming XXH3-128 hasher for row and group identity, built column by
 /// column. Row and group identity hash to 128 bits for the same reason
 /// [`checksum_128`] does: a 64-bit birthday bound would silently coalesce
 /// distinct rows.
-pub use xxhash_rust::xxh3::Xxh3Default as RowHasher;
+pub(crate) use xxhash_rust::xxh3::Xxh3Default as RowHasher;
 
 /// XXH3-128 over arbitrary bytes (no seed). Full 128-bit image — use where a
 /// 64-bit birthday bound is too low, e.g. a string content join key (a 64-bit
 /// hash widened to 128 bits has a ~2^32-row collision window that would silently
 /// equijoin distinct strings).
 #[inline]
-pub fn checksum_128(data: &[u8]) -> u128 {
+pub(crate) fn checksum_128(data: &[u8]) -> u128 {
     xxh3_128(data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pk(lo: u64, hi: u64) -> u128 {
-        ((hi as u128) << 64) | (lo as u128)
-    }
-
-    #[test]
-    fn hash_u128_zero_extension_invariant() {
-        assert_eq!(hash_u128(42u64 as u128), hash_u128(42u128));
-    }
-
-    #[test]
-    fn deterministic() {
-        assert_eq!(hash_u128(pk(42, 99)), hash_u128(pk(42, 99)));
-    }
-
-    #[test]
-    fn different_keys_differ() {
-        assert_ne!(hash_u128(pk(1, 2)), hash_u128(pk(2, 1)));
-        assert_ne!(hash_u128(pk(0, 0)), hash_u128(pk(0, 1)));
-    }
 
     #[test]
     fn checksum_128_full_image_deterministic_and_distinct() {
@@ -109,22 +87,5 @@ mod tests {
         buf[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(digest_with_hole(b"a.db", &buf, 24), base, "the hole is excluded");
         assert_ne!(digest_with_hole(b"b.db", &buf, 24), base, "the seed is included");
-    }
-
-    #[test]
-    fn checksum_matches_c_xxh3_64bits() {
-        // Same 208-byte test vector from gnitz-core's test_xxh3_matches_python_server.
-        // Python/C computes checksum 0x741C9E0BA1D8A9FD using XXH3_64bits.
-        let body_hex = "9800000008000000a000000008000000a800000008000000b000000008000000b800000008000000c000000008000000c800000008000000d000000008000000d800000008000000e000000008000000e800000008000000f00000001000000000010000000000000000000000000000000000000000000001000000000000008000000000000000000000000000000001000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-        let body: Vec<u8> = (0..body_hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&body_hex[i..i + 2], 16).unwrap())
-            .collect();
-        assert_eq!(body.len(), 208);
-        let computed = checksum(&body);
-        assert_eq!(
-            computed, 0x741C9E0BA1D8A9FD_u64,
-            "xxhash-rust and C XXH3_64bits disagree: got 0x{computed:016X}"
-        );
     }
 }

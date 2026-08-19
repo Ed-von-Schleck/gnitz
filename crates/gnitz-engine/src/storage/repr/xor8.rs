@@ -77,12 +77,10 @@ pub(crate) fn serialized_size(filter: &Xor8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foundation::xxh;
 
-    /// Drives the raw-fingerprint half of the key derivation directly;
-    /// `crate::schema::key::probe_key` covers the OPK-bytes half.
+    /// A `u128` PK through the real key derivation, as its OPK bytes.
     fn key_u128(k: u128) -> u64 {
-        xxh::hash_u128(k)
+        crate::schema::key::probe_key(&k.to_be_bytes())
     }
 
     fn build_u128(pks: &[u128]) -> Option<Xor8> {
