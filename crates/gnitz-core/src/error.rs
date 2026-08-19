@@ -16,12 +16,17 @@ pub enum ClientError {
     },
 }
 
-impl ClientError {
-    /// Whether this failure is a retryable OCC conflict rather than a hard
-    /// error. The bindings surface conflicts as a dedicated, catchable type
-    /// (Python `GnitzConflictError`, C `GNITZ_ERR_TXN_CONFLICT`), so the
-    /// classification belongs to the enum — not to each binding's error mapper.
-    pub fn is_conflict(&self) -> bool {
+/// Whether a failure is a retryable OCC conflict rather than a hard error. The
+/// bindings surface conflicts as a dedicated, catchable type (Python
+/// `GnitzConflictError`, C `GNITZ_ERR_TXN_CONFLICT`); a binding's error mapper
+/// is generic over this trait, so one mapper covers every classified error type
+/// and no binding re-derives the rule from a `match` of its own.
+pub trait ConflictClass {
+    fn is_conflict(&self) -> bool;
+}
+
+impl ConflictClass for ClientError {
+    fn is_conflict(&self) -> bool {
         matches!(self, ClientError::TxnConflict { .. })
     }
 }

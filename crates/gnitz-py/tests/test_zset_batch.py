@@ -280,8 +280,9 @@ class TestAppendKeywordPlan:
 
     def test_reentrant_append_raises_instead_of_aborting(self):
         """`extract` runs `__index__`, which can call back into the same batch.
-        The raw method slot has no unwind guard, so this must come back as a
-        Python exception — a Rust panic here would abort the interpreter."""
+        The raw method slot's `try_borrow_mut` is what catches that, as a
+        `RuntimeError` — not a panic, which under `panic = "abort"` would take the
+        interpreter down instead of failing the call."""
         schema = Schema([
             ColumnDef("pk",  TypeCode.U64, primary_key=True),
             ColumnDef("val", TypeCode.I64),
@@ -477,6 +478,41 @@ class TestValueCoercion:
         batch = ZSetBatch(self._uuid_pk_schema())
         with pytest.raises(ValueError):
             batch.append(id="not-a-uuid-string", v=1)
+
+    def test_uuid_accepts_both_text_forms(self):
+        """Canonical hyphenated and bare 32-hex are the two renderings of one
+        UUID; both must reach a UUID column, and land on the same value."""
+        bare = self._UUID_STR.replace("-", "")
+        a = ZSetBatch(self._uuid_pk_schema()).append(id=self._UUID_STR, v=1)
+        b = ZSetBatch(self._uuid_pk_schema()).append(id=bare, v=1)
+        assert a.pks == b.pks == [self._UUID_STR]
+
+    def test_u128_column_rejects_text(self):
+        """A string spells a value only for the types that admit one, and U128 is
+        not among them — SQL reads a string literal into a U128 column as an
+        error, so `append` must too, rather than accepting bare hex here alone.
+        The same rule excludes a `uuid.UUID` object, which is a UUID, not a
+        number."""
+        for pk_type in (True, False):
+            cols = [ColumnDef("k", TypeCode.U128, primary_key=True),
+                    ColumnDef("v", TypeCode.U128, is_nullable=True)]
+            schema = Schema(cols)
+            bad = "ffffffffffffffffffffffffffffffff"
+            with pytest.raises(TypeError):
+                ZSetBatch(schema).append(**({"k": bad, "v": 1} if pk_type else {"k": 1, "v": bad}))
+            with pytest.raises(TypeError):
+                ZSetBatch(schema).append(
+                    **({"k": uuid.uuid4(), "v": 1} if pk_type else {"k": 1, "v": uuid.uuid4()}))
+
+    def test_u128_keeps_its_full_unsigned_range(self):
+        """A U128 value above `i128::MAX` is legal and must not be rejected as a
+        signed overflow."""
+        u128_max = (1 << 128) - 1
+        schema = Schema([ColumnDef("k", TypeCode.U128, primary_key=True),
+                         ColumnDef("v", TypeCode.U128)])
+        batch = ZSetBatch(schema).append(k=u128_max, v=u128_max)
+        assert batch.pks == [u128_max]
+        assert batch.columns[1] == [u128_max]
 
     def test_blob_payload_round_trip(self):
         schema = Schema([

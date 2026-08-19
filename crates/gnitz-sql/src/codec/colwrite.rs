@@ -97,7 +97,13 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
                         v.push(Some(s.clone()));
                         Ok(())
                     }
-                    ColData::Fixed(buf) if tc == TypeCode::UUID => {
+                    // UUID: the one non-STRING type a text literal spells a value
+                    // of. Both write paths gate on the same `admits_text_literal`
+                    // predicate, so neither can start accepting text for a type
+                    // the other rejects — the divergence class this replaces was
+                    // bare hex reaching a U128 column through the Python binding
+                    // alone.
+                    ColData::Fixed(buf) if tc.admits_text_literal() => {
                         buf.extend_from_slice(&parse_uuid_str(s)?.to_le_bytes());
                         Ok(())
                     }

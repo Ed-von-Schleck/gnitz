@@ -20,12 +20,13 @@ pub use client::{
     MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{Session, FIRST_USER_TABLE_ID, TABLE_TAB};
-pub use error::ClientError;
+pub use error::{ClientError, ConflictClass};
 pub use gnitz_wire::{RelClass, TableProps};
-// The expression emitter lives in `gnitz-expr`, beside the decoder it must
-// agree with. Re-exported here because `gnitz-capi` exposes 18 `gnitz_expr_*` C
-// symbols over it without depending on that crate.
-pub use gnitz_expr::{CmpOp, ExprBuilder, ExprProgram, StrOp};
+// The expression emitter and the resolved column addressing it reads through
+// live in `gnitz-expr`, beside the decoder they must agree with. Re-exported
+// here because `gnitz-capi` exposes 18 `gnitz_expr_*` C symbols over the former
+// and reads batch cells through the latter, without depending on that crate.
+pub use gnitz_expr::{CmpOp, ColumnLocator, ExprBuilder, ExprProgram, SchemaFacts, StrOp};
 pub use gnitz_wire::{
     index_key_types, validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, FK_INDEX_INFIX,
 };

@@ -15,8 +15,10 @@ an AF_UNIX socket path.
 
 Known limitation: connect + HELLO run synchronously on the calling
 (asyncio-loop) thread, so a ``tls://`` connect to a slow or unreachable
-remote host blocks the loop for up to the 10 s connect timeout. Harmless
-for loopback.
+remote host blocks the loop for the duration of connect and the TLS
+handshake. The 10 s connect timeout is per resolved address, and the
+handshake arms a further read timeout after it, so the block is not
+bounded by one 10 s wait. Harmless for loopback.
 
 Every method submits when called and returns its future, so pipelining is
 just not awaiting yet — several operations ride one round-trip when they are
@@ -25,10 +27,10 @@ started together and gathered::
     lsns = await asyncio.gather(conn.push(table_id, batch1),
                                 conn.push(table_id, batch2))
 
-**FIFO ordering caveat:** the transport correlates replies positionally, so
-concurrent operations are safe when homogeneous (all pushes to one table, or
-all reads). Mixing pushes and reads in one in-flight group may produce
-incorrect result ordering in multi-worker mode.
+Any mix of operations may be pipelined. The server handles one request per
+connection at a time and replies in request order, so positional correlation
+is always correct — pushes, scans, seeks and ``scan_many`` may be gathered
+together, and each future resolves to its own operation's result.
 """
 
 import asyncio
@@ -38,16 +40,21 @@ from gnitz._native import AsyncTransport
 
 # Passed to the Rust I/O thread, which resolves a whole batch of futures through
 # one ``call_soon_threadsafe`` — that call allocates a handle, takes the loop
-# lock and writes the self-pipe, so paying it per future cost ~40x more than
-# paying it per batch and blocked the loop while the I/O thread held the GIL.
-def _resolve_batch(items):
-    for future, value, is_exception in items:
-        if future.done():
-            continue
-        if is_exception:
-            future.set_exception(value)
-        else:
+# lock and writes the self-pipe, so paying it per future costs far more than
+# paying it per batch and blocks the loop while the I/O thread holds the GIL.
+#
+# Successes and failures arrive as two separate pairs of positionally-aligned
+# lists, so the common loop carries no per-item discriminator: an ``isinstance``
+# test on the value would cost more per future than the flag it replaced, and a
+# single interleaved list would silently drop a trailing element on an odd
+# length, leaving a coroutine awaiting a future nobody resolves.
+def _resolve_batch(ok_futures, ok_values, err_futures, err_excs):
+    for future, value in zip(ok_futures, ok_values):
+        if not future.done():
             future.set_result(value)
+    for future, exc in zip(err_futures, err_excs):      # usually empty
+        if not future.done():
+            future.set_exception(exc)
 
 
 def connect(socket_path):
@@ -82,8 +89,11 @@ class AsyncConnection:
         self._transport = AsyncTransport(socket_path, loop, _resolve_batch)
 
     def __await__(self):
-        # Yield once so asyncio recognises `await connect(path)` as awaiting a
-        # coroutine, then hand back this same connection.
+        # `connect()` must serve both `await connect(p)` and
+        # `async with connect(p)`, so it returns the connection itself rather
+        # than a coroutine; this is what makes the object awaitable. Connecting
+        # already happened in `__init__`, so there is nothing to wait for — the
+        # delegated coroutine returns without ever reaching the event loop.
         return _immediate_return(self).__await__()
 
     # Each of these submits the operation and hands back its future, rather

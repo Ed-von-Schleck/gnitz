@@ -36,7 +36,7 @@ def _select_pks(client, sql, sn):
     b = res[0]["rows"]
     if b.schema is None:
         return []
-    return sorted(b.pks[i] for i in range(len(b.pks)) if b.weights[i] > 0)
+    return sorted(pk for pk, w in zip(b.pks, b.weights) if w > 0)
 
 
 # ---------------------------------------------------------------------------

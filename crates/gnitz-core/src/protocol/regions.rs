@@ -200,6 +200,11 @@ impl<'a> ZSetBatchView<'a> {
     }
 }
 
+/// **This source is not OPK.** A client-side `ZSetBatch` holds its PK region in
+/// native little-endian; the order-preserving encoding is applied server-side. So
+/// the OPK-inverting readers on [`gnitz_expr::ColumnLocator`] (`native_le_bytes`,
+/// `decode_i64`, `native_key`, `route_key`) must not be pointed at a
+/// `ZSetBatchView` — on a PK column they would byte-swap an already-native value.
 impl gnitz_expr::RowSource for ZSetBatchView<'_> {
     #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {

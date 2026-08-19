@@ -260,6 +260,54 @@ async def test_pipeline_empty_push_interleaved(aconn, table):
 
 
 # ---------------------------------------------------------------------------
+# Mixed-kind pipelining
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pipeline_mixes_operation_kinds(sync, aconn):
+    """Push, scan, seek and scan_many gathered as one in-flight group. The server
+    handles one request per connection at a time and replies in request order, so
+    each future must resolve to *its own* operation's result — a swap between two
+    kinds would hand a scan's rows to a push's future, or one relation's rows to
+    another's. Run at W>1: replies leave the workers out of order and only the
+    master's serialisation puts them back."""
+    sn = "amix" + _uid()
+    a = _make_table(sync, sn, "ta", PK_VAL_COLS)
+    b = sync.create_table(sn, "tb", PK_VAL_COLS)
+    try:
+        # Distinct per-relation payloads, so a mis-correlated reply is visible.
+        await aconn.push(a, _batch(PK_VAL_COLS, [{"pk": i, "val": 100 + i} for i in range(1, 6)]))
+        await aconn.push(b, _batch(PK_VAL_COLS, [{"pk": i, "val": 900 + i} for i in range(1, 4)]))
+
+        push_lsn, scan_a, scan_b, seek_a, seek_b, many = await asyncio.gather(
+            aconn.push(a, _batch(PK_VAL_COLS, [{"pk": 42, "val": 4242}])),
+            aconn.scan(a),
+            aconn.scan(b),
+            aconn.seek(a, 3),
+            aconn.seek(b, 2),
+            aconn.scan_many([b, a]),
+        )
+
+        rows_a = {i: 100 + i for i in range(1, 6)}
+        rows_b = {i: 900 + i for i in range(1, 4)}
+        assert isinstance(push_lsn, int) and push_lsn > 0
+        # The push was submitted first, so every read behind it in the batch sees
+        # its row: request order is honoured, not just reply order.
+        assert {r.pk: r.val for r in scan_a} == {**rows_a, 42: 4242}
+        assert {r.pk: r.val for r in scan_b} == rows_b
+        assert [(r.pk, r.val) for r in seek_a] == [(3, 103)]
+        assert [(r.pk, r.val) for r in seek_b] == [(2, 902)]
+        # scan_many keeps request order, which is the reverse of the two scans above.
+        assert [{r.pk: r.val for r in res} for res in many] == [rows_b, {**rows_a, 42: 4242}]
+    finally:
+        try:
+            sync.drop_table(sn, "tb")
+        except Exception:
+            pass
+        _drop_table(sync, sn, "ta")
+
+
+# ---------------------------------------------------------------------------
 # Connection lifecycle
 # ---------------------------------------------------------------------------
 

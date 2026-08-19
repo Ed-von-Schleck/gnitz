@@ -213,6 +213,60 @@ class TestScannedRow:
             assert (row[0], row[1]) == (7, 42)
             assert row._asdict() == {"pk": 7, "val": 42}
             assert row.weight == 1
+            assert row._weight == 1
             assert row == Row(("pk", "val"), (7, 42), weight=99)
+            # The result presents its rows as a synthesised `Row` subclass, so a
+            # column resolves as a type attribute rather than through a fallback.
+            # It is still a `Row` — `isinstance` is what callers branch on.
+            assert isinstance(row, Row)
+            assert type(row) is not Row
+            # A computed name resolves exactly like a literal one.
+            assert getattr(row, "".join("val")) == 42
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_a_column_named_weight_wins_over_the_zset_weight(self, client):
+        """The schema is the authority on what a name means — the rule the write
+        surface already states by spelling the row weight `_weight`. So a column
+        named `weight` *is* `row.weight`, and `row._weight` is the Z-set weight,
+        which no column can ever be named."""
+        cols = [ColumnDef("pk", TypeCode.U64, primary_key=True),
+                ColumnDef("weight", TypeCode.I64)]
+        sn = "sr" + _uid()
+        client.create_schema(sn)
+        try:
+            tid = client.create_table(sn, "t", cols)
+            batch = ZSetBatch(Schema(cols))
+            batch.append(pk=1, weight=77)
+            client.push(tid, batch)
+            row = client.scan(tid).first()
+            assert row.weight == 77          # the column
+            assert row["weight"] == 77
+            assert row._weight == 1          # the Z-set weight, which is not 77
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_an_underscore_column_is_reachable_only_by_subscript(self, client):
+        """The underscore namespace belongs to the row object itself (`_fields`,
+        `_asdict`, `_weight`), so a column whose name starts with `_` gets no
+        attribute of its own — but it is still a presented column, addressable
+        by name and by position."""
+        cols = [ColumnDef("pk", TypeCode.U64, primary_key=True),
+                ColumnDef("_x", TypeCode.I64)]
+        sn = "sr" + _uid()
+        client.create_schema(sn)
+        try:
+            tid = client.create_table(sn, "t", cols)
+            batch = ZSetBatch(Schema(cols))
+            batch.append(pk=1, _x=5)
+            client.push(tid, batch)
+            row = client.scan(tid).first()
+            assert row["_x"] == 5
+            assert row[1] == 5
+            assert row._asdict() == {"pk": 1, "_x": 5}
+            assert row._fields == ("pk", "_x")
+            # `_x` names no column-shaped attribute, so the fallback answers it.
+            assert row._x == 5
+            assert row._weight == 1
         finally:
             _cleanup(client, sn, "t")

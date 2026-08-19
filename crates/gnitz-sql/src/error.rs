@@ -1,3 +1,4 @@
+use gnitz_core::ConflictClass;
 use std::fmt;
 
 #[derive(Debug)]
@@ -23,11 +24,10 @@ pub enum GnitzSqlError {
     },
 }
 
-impl GnitzSqlError {
-    /// Whether this failure is a retryable OCC conflict. `Exec` delegates to the
-    /// client error it wraps, so a conflict stays classified as one however deep
-    /// it surfaced. Counterpart of `ClientError::is_conflict`.
-    pub fn is_conflict(&self) -> bool {
+/// `Exec` delegates to the client error it wraps, so a conflict stays classified
+/// as one however deep it surfaced.
+impl ConflictClass for GnitzSqlError {
+    fn is_conflict(&self) -> bool {
         match self {
             GnitzSqlError::Conflict { .. } => true,
             GnitzSqlError::Exec(e) => e.is_conflict(),

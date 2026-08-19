@@ -10,7 +10,7 @@ use crate::protocol::{
     wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError, Schema, WireConflictMode,
     ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
     FLAG_CONTINUATION, FLAG_PUSH, FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_ERROR,
-    STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use gnitz_wire::RelDescriptorBlob;
 use lru::LruCache;
@@ -533,9 +533,21 @@ impl Session {
         ))
     }
 
-    /// Receive one framed message, using the LRU cache to decode continuation
-    /// frames that arrive without a schema block, and caching any schema block
-    /// the frame does carry.
+    /// Receive one framed message *correlated to `target_id`*, using the LRU
+    /// cache to decode continuation frames that arrive without a schema block,
+    /// and caching any schema block the frame does carry.
+    ///
+    /// Every recv reaching here — scan, seek, push ACK — awaits a reply for one
+    /// known relation, and the server replies to a connection strictly in request
+    /// order, so the frame's own `target_id` must be that relation. Checking it
+    /// makes a violation loud: the schema hint is keyed by `target_id`, so an
+    /// out-of-order frame would otherwise decode under the *wrong schema* and
+    /// return a wrong answer silently. The check precedes the cache absorb, so a
+    /// mis-correlated block is not installed either.
+    ///
+    /// `STATUS_OK` only — an error frame names no relation (`target_id = 0`). The
+    /// replies whose answer *is* a target id (id allocation, RESOLVE, transaction
+    /// ACKs) are received uncorrelated, outside this function.
     fn recv_cached(&mut self, target_id: u64) -> Result<Message, ClientError> {
         let msg = {
             // `get` (not `peek`) so a frequently-accessed schema refreshes its
@@ -543,6 +555,12 @@ impl Session {
             let hint = self.schema_cache.get(&target_id).map(|(s, v)| (s.as_ref(), *v));
             recv_message(&mut self.transport, hint, self.max_payload_len)?
         };
+        if msg.status == STATUS_OK && msg.target_id != target_id {
+            return Err(ClientError::Protocol(ProtocolError::DecodeError(format!(
+                "reply out of order: expected target {target_id}, got {}",
+                msg.target_id
+            ))));
+        }
         // `msg.schema` is `Some` exactly when the schema block was physically
         // in the frame. Absorb it as an `Arc` clone (refcount bump, no deep
         // copy) — this is the authoritative schema with the server's real

@@ -16,7 +16,13 @@
 /// All lifetimes are tied to `&self`, NOT decoupled — a client adapter owns the
 /// buffers it materializes and can only lend them for `&self`.
 pub trait RowSource {
-    /// The row's packed OPK PK-region bytes (`pk_stride` wide).
+    /// The row's packed PK-region bytes (`pk_stride` wide).
+    ///
+    /// **The implementor decides the encoding.** Every engine-side source is
+    /// order-preserving at-rest (OPK), which is what the OPK-inverting readers —
+    /// [`crate::ColumnLocator::native_le_bytes`], `decode_i64`, `native_key` —
+    /// assume. A client-side `ZSetBatch` is native-LE instead, so those readers
+    /// would byte-swap its values; such a source must say so on its own `impl`.
     fn get_pk_bytes(&self, row: usize) -> &[u8];
     /// The row's null-bitmap word (bit N = payload slot N is NULL).
     fn get_null_word(&self, row: usize) -> u64;

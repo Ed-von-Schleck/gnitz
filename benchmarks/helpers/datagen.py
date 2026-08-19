@@ -227,24 +227,31 @@ def bulk_load(
     """
     tid, schema = conn.resolve_table(schema_name, table_name)
     rng = random.Random(seed)
-    # Hoisted: every ColumnDef attribute read crosses into Rust and builds a
-    # fresh str, which at ~20 reads per row dominates the loop below.
+    # Hoisted: `c.type_code` crosses into Rust on every read, and the tuple
+    # unpack below is one bytecode where the attribute walk is three.
     spec = [(c.name, getattr(c, "is_nullable", False), c) for c in columns if c.name != "pk"]
     pks = []
     i = 1
-    while i <= num_rows:
-        batch = gnitz.ZSetBatch(schema)
-        end = min(i + chunk, num_rows + 1)
-        for k in range(i, end):
+
+    def rows(lo, hi):
+        # A generator, not a list: `extend` iterates it, so one row dict is alive
+        # at a time where a materialized list would hold the whole chunk.
+        for k in range(lo, hi):
             row = {"pk": k}
             for name, nullable, col in spec:
                 if nullable and rng.random() < null_rate:
                     row[name] = None
                 else:
                     row[name] = gen_value(rng, col, k, pools, skew)
-            batch.append(**row)
-            pks.append(k)
-        conn.push(tid, batch)
+            yield row
+
+    while i <= num_rows:
+        end = min(i + chunk, num_rows + 1)
+        # `extend`, not a per-row `append(**row)`: a `**` splat makes CPython
+        # build a fresh keyword tuple per call, and `extend` consumes the dict
+        # this loop already builds directly.
+        conn.push(tid, gnitz.ZSetBatch(schema).extend(rows(i, end)))
+        pks.extend(range(i, end))
         i = end
     return pks
 

@@ -34,17 +34,15 @@ def _drop_all(client, sn, tables=(), views=(), indices=()):
 
 def _table_has_index(client, sn, table):
     """True if any live IdxTab row names `table` as its owner."""
-    from gnitz import IDX_TAB, IDXTAB_COL_OWNER_ID
+    from gnitz._native import IDX_TAB
     batch_obj = client.scan(IDX_TAB)
     if batch_obj.schema is None:
         return False
     tid, _ = client.resolve_table(sn, table)
-    for i in range(len(batch_obj.pks)):
-        if batch_obj.weights[i] <= 0:
-            continue
-        if batch_obj.columns[IDXTAB_COL_OWNER_ID][i] == tid:
-            return True
-    return False
+    # Hoisted: every `.scalars`/`.weights` read rebuilds the whole list, so
+    # reading one inside the row loop is quadratic in the catalog size.
+    owners = batch_obj.scalars("owner_id")
+    return any(w > 0 and o == tid for w, o in zip(batch_obj.weights, owners))
 
 
 def _insert_rows(client, sn, rows, chunk=500):
@@ -80,19 +78,14 @@ class TestIndexDdl:
 
             # Verify IdxTab row exists with correct owner_id and source_cols
             # (the packed column-list u64, decoded via the shared codec).
-            from gnitz import IDX_TAB, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, unpack_pk_cols
+            from gnitz._native import IDX_TAB, unpack_pk_cols
             batch_obj = client.scan(IDX_TAB)
             assert batch_obj.schema is not None
-            found = False
             tid, _ = client.resolve_table(sn, "t")
-            for i in range(len(batch_obj.pks)):
-                if batch_obj.weights[i] <= 0:
-                    continue
-                owner_id = batch_obj.columns[IDXTAB_COL_OWNER_ID][i] if batch_obj.columns[IDXTAB_COL_OWNER_ID] else None
-                src_col  = batch_obj.columns[IDXTAB_COL_SOURCE_COLS][i] if batch_obj.columns[IDXTAB_COL_SOURCE_COLS] else None
-                if owner_id == tid and unpack_pk_cols(src_col) == [1]:
-                    found = True
-                    break
+            owners = batch_obj.scalars("owner_id")
+            srcs = batch_obj.scalars("source_col_idx")
+            found = any(w > 0 and o == tid and unpack_pk_cols(sc) == [1]
+                        for w, o, sc in zip(batch_obj.weights, owners, srcs))
             assert found, "IdxTab row not found"
         finally:
             _drop_all(client, sn,
@@ -113,18 +106,15 @@ class TestIndexDdl:
             )
             assert results[0]["type"] == "IndexCreated"
             # is_unique flag should be 1 in IdxTab
-            from gnitz import IDX_TAB, IDXTAB_COL_OWNER_ID, IDXTAB_COL_IS_UNIQUE
+            from gnitz._native import IDX_TAB
             batch_obj = client.scan(IDX_TAB)
             assert batch_obj.schema is not None
             tid, _ = client.resolve_table(sn, "t")
-            for i in range(len(batch_obj.pks)):
-                if batch_obj.weights[i] <= 0:
-                    continue
-                owner_id = batch_obj.columns[IDXTAB_COL_OWNER_ID][i]
-                if owner_id == tid:
-                    is_unique = batch_obj.columns[IDXTAB_COL_IS_UNIQUE][i]
-                    assert is_unique == 1
-                    break
+            uniques = [u for w, o, u in zip(batch_obj.weights,
+                                            batch_obj.scalars("owner_id"),
+                                            batch_obj.scalars("is_unique"))
+                       if w > 0 and o == tid]
+            assert uniques and uniques[0] == 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],
@@ -144,14 +134,12 @@ class TestIndexDdl:
             assert results[0]["type"] == "Dropped"
 
             # Verify row is gone from IdxTab
-            from gnitz import IDX_TAB, IDXTAB_COL_OWNER_ID
+            from gnitz._native import IDX_TAB
             batch_obj = client.scan(IDX_TAB)
             if batch_obj is not None:
                 tid, _ = client.resolve_table(sn, "t")
-                for i in range(len(batch_obj.pks)):
-                    if batch_obj.weights[i] <= 0:
-                        continue
-                    assert batch_obj.columns[IDXTAB_COL_OWNER_ID][i] != tid, "IdxTab row should be gone"
+                live = [o for w, o in zip(batch_obj.weights, batch_obj.scalars("owner_id")) if w > 0]
+                assert tid not in live, "IdxTab row should be gone"
         finally:
             _drop_all(client, sn, tables=["t"])
 
@@ -2784,7 +2772,7 @@ class TestUniqueHolderFromProbe:
         res = client.seek_by_index(tid, [1], [value])
         if res.schema is None:
             return []
-        return sorted(res.pks[i] for i in range(len(res.pks)) if res.weights[i] > 0)
+        return sorted(pk for pk, w in zip(res.pks, res.weights) if w > 0)
 
     # -- A NULL indexed cell must not claim the all-zero key image -------------
 

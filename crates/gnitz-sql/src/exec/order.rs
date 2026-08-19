@@ -53,8 +53,10 @@ impl SortKey {
     /// record, [`ColumnLocator`] — not from four independent `is_pk_col` /
     /// `pk_byte_offset` / `payload_idx` / `wire_stride` lookups that could
     /// disagree. It is the same record the engine's worker-side ORDER BY
-    /// comparator resolves through, which is what keeps the two byte-for-byte
-    /// equivalent as the schema layout evolves.
+    /// comparator resolves through, which is what keeps the two *coordinate*-
+    /// equivalent as the schema layout evolves. Only the coordinates: the bytes
+    /// at them differ, because a client-side PK region is native-LE where the
+    /// engine's is OPK, so each comparator decodes its own side.
     fn new(schema: &Schema, ci: usize, asc: bool, nulls_first: bool) -> Self {
         let loc = SchemaFacts::locate(schema, ci);
         let (pk_offset, null_mask) = match loc {

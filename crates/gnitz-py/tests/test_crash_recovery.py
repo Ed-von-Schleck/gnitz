@@ -300,18 +300,15 @@ def test_ddl_crash_unique_index_foldin_rolls_back(own_server):
 
 def _index_on_col(conn, owner_tid, col_idx):
     """True if a live IdxTab row indexes column `col_idx` of table `owner_tid`."""
-    from gnitz import IDX_TAB, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, unpack_pk_cols
+    from gnitz._native import IDX_TAB, unpack_pk_cols
 
     batch_obj = conn.scan(IDX_TAB)
     if batch_obj.schema is None:
         return False
-    for i in range(len(batch_obj.pks)):
-        if batch_obj.weights[i] <= 0:
-            continue
-        if (batch_obj.columns[IDXTAB_COL_OWNER_ID][i] == owner_tid
-                and unpack_pk_cols(batch_obj.columns[IDXTAB_COL_SOURCE_COLS][i]) == [col_idx]):
-            return True
-    return False
+    return any(w > 0 and o == owner_tid and unpack_pk_cols(sc) == [col_idx]
+               for w, o, sc in zip(batch_obj.weights,
+                                   batch_obj.scalars("owner_id"),
+                                   batch_obj.scalars("source_col_idx")))
 
 
 def test_create_index_after_fk_tables_survives_crash(own_server):

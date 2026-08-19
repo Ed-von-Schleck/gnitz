@@ -146,6 +146,32 @@ impl TypeCode {
         is_wide_int(*self as u8)
     }
 
+    /// Whether a **text literal** spells a value of this type, on every write
+    /// path — a SQL `INSERT` string literal and a Python `str` passed to
+    /// `ZSetBatch.append` alike. STRING is text by definition; UUID has no other
+    /// rendering. Everything else takes a number or bytes, so a string reaching
+    /// one is a type error rather than a second encoding for both paths to agree
+    /// on. Exhaustive, no `_` arm: a new variant is a compile error until someone
+    /// decides which side of that line it falls on.
+    pub const fn admits_text_literal(self) -> bool {
+        match self {
+            TypeCode::String | TypeCode::UUID => true,
+            TypeCode::U8
+            | TypeCode::I8
+            | TypeCode::U16
+            | TypeCode::I16
+            | TypeCode::U32
+            | TypeCode::I32
+            | TypeCode::F32
+            | TypeCode::U64
+            | TypeCode::I64
+            | TypeCode::F64
+            | TypeCode::U128
+            | TypeCode::Blob
+            | TypeCode::I128 => false,
+        }
+    }
+
     /// Whether this type uses the 16-byte "German string" layout (a 4-byte
     /// length, a 4-byte inline prefix, and an inline-or-out-of-line tail).
     /// STRING and BLOB share this representation; both must compare, relocate,

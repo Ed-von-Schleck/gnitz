@@ -1587,3 +1587,58 @@ class TestMixedTypeTable:
             assert r.big128 == big_val
         finally:
             _cleanup(client, sn, "t")
+
+
+# ---------------------------------------------------------------------------
+# The two write paths must encode a value identically
+# ---------------------------------------------------------------------------
+
+# (SQL column type, TypeCode, boundary values). One entry per fixed-width type
+# the binding's own encoder has an arm for, at the extremes of its range — the
+# values where a width- or sign-generic pack would differ from a per-type one.
+_ENCODING_TYPES = [
+    ("TINYINT",           gnitz.TypeCode.I8,  [I8_MIN, -1, 0, I8_MAX]),
+    ("TINYINT UNSIGNED",  gnitz.TypeCode.U8,  [0, 1, U8_MAX]),
+    ("SMALLINT",          gnitz.TypeCode.I16, [I16_MIN, -1, 0, I16_MAX]),
+    ("SMALLINT UNSIGNED", gnitz.TypeCode.U16, [0, 1, U16_MAX]),
+    ("INT",               gnitz.TypeCode.I32, [I32_MIN, -1, 0, I32_MAX]),
+    ("INT UNSIGNED",      gnitz.TypeCode.U32, [0, 1, U32_MAX]),
+    ("BIGINT",            gnitz.TypeCode.I64, [I64_MIN, -1, 0, I64_MAX]),
+    ("BIGINT UNSIGNED",   gnitz.TypeCode.U64, [0, 1, U64_MAX]),
+    ("FLOAT",             gnitz.TypeCode.F32, [0.0, -1.5, 1.5]),
+    ("DOUBLE",            gnitz.TypeCode.F64, [0.0, -1.5, 1.5]),
+]
+
+
+@pytest.mark.parametrize("col_sql,tc,values", _ENCODING_TYPES, ids=[t[0] for t in _ENCODING_TYPES])
+def test_append_and_insert_encode_a_value_identically(client, col_sql, tc, values):
+    """`batch.append(v=x)` and `INSERT INTO t VALUES (.., x)` are two independent
+    encoders for the same column. They must agree at every range boundary — a
+    width-generic or sign-blind pack on either side shows up here as a value that
+    reads back differently, which is the failure a shared encoder would prevent
+    and which nothing else in the suite would catch."""
+    sn = "s" + _uid()
+    client.create_schema(sn)
+    try:
+        ddl = (f"CREATE TABLE {{}} (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, "
+               f"v {col_sql} NOT NULL)")
+        client.execute_sql(ddl.format("ta"), schema_name=sn)
+        client.execute_sql(ddl.format("tb"), schema_name=sn)
+        tid_a, schema = client.resolve_table(sn, "ta")
+        tid_b, _ = client.resolve_table(sn, "tb")
+        assert schema.columns[1].type_code == tc
+
+        batch = gnitz.ZSetBatch(schema)
+        for pk, v in enumerate(values, start=1):
+            batch.append(pk=pk, v=v)
+        client.push(tid_a, batch)
+
+        literals = ", ".join(f"({pk}, {v!r})" for pk, v in enumerate(values, start=1))
+        client.execute_sql(f"INSERT INTO tb VALUES {literals}", schema_name=sn)
+
+        by_append = client.scan(tid_a)
+        by_insert = client.scan(tid_b)
+        assert dict(zip(by_append.pks, by_append.scalars("v"))) == \
+               dict(zip(by_insert.pks, by_insert.scalars("v")))
+    finally:
+        _cleanup(client, sn, "ta", "tb")

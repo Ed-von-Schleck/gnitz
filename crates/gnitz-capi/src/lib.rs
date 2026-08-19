@@ -24,9 +24,9 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
 use gnitz_core::protocol::types::type_code_from_u64;
-use gnitz_core::{CircuitBuilder, CmpOp, ExprBuilder, GnitzClient};
+use gnitz_core::{CircuitBuilder, CmpOp, ColumnLocator, ConflictClass, ExprBuilder, GnitzClient, SchemaFacts};
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
-use gnitz_sql::{GnitzSqlError, SqlPlanner};
+use gnitz_sql::SqlPlanner;
 
 // ---------------------------------------------------------------------------
 // Error codes
@@ -55,24 +55,40 @@ pub const GNITZ_TYPE_STRING: u32 = 11;
 pub const GNITZ_TYPE_U128: u32 = 12;
 pub const GNITZ_TYPE_UUID: u32 = 13;
 pub const GNITZ_TYPE_BLOB: u32 = 14;
+pub const GNITZ_TYPE_I128: u32 = 15;
 
-// cbindgen needs literal values, so the constants above duplicate the wire
-// type codes; this pin makes any drift a compile error.
+// cbindgen needs literal values, so the constants above duplicate the wire type
+// codes. Exhaustive with no `_` arm, so a variant added in gnitz-wire fails to
+// compile here until it is given a C constant *by name* — asserting the count
+// would only report that the table moved, leaving a variant with no constant at
+// all invisible, which is how `I128` never reached C. Python needs no such pin:
+// it builds its table from `type_codes()`.
+const fn c_type_code(tc: TypeCode) -> u32 {
+    match tc {
+        TypeCode::U8 => GNITZ_TYPE_U8,
+        TypeCode::I8 => GNITZ_TYPE_I8,
+        TypeCode::U16 => GNITZ_TYPE_U16,
+        TypeCode::I16 => GNITZ_TYPE_I16,
+        TypeCode::U32 => GNITZ_TYPE_U32,
+        TypeCode::I32 => GNITZ_TYPE_I32,
+        TypeCode::F32 => GNITZ_TYPE_F32,
+        TypeCode::U64 => GNITZ_TYPE_U64,
+        TypeCode::I64 => GNITZ_TYPE_I64,
+        TypeCode::F64 => GNITZ_TYPE_F64,
+        TypeCode::String => GNITZ_TYPE_STRING,
+        TypeCode::U128 => GNITZ_TYPE_U128,
+        TypeCode::UUID => GNITZ_TYPE_UUID,
+        TypeCode::Blob => GNITZ_TYPE_BLOB,
+        TypeCode::I128 => GNITZ_TYPE_I128,
+    }
+}
+
 const _: () = {
-    assert!(GNITZ_TYPE_U8 == TypeCode::U8 as u32);
-    assert!(GNITZ_TYPE_I8 == TypeCode::I8 as u32);
-    assert!(GNITZ_TYPE_U16 == TypeCode::U16 as u32);
-    assert!(GNITZ_TYPE_I16 == TypeCode::I16 as u32);
-    assert!(GNITZ_TYPE_U32 == TypeCode::U32 as u32);
-    assert!(GNITZ_TYPE_I32 == TypeCode::I32 as u32);
-    assert!(GNITZ_TYPE_F32 == TypeCode::F32 as u32);
-    assert!(GNITZ_TYPE_U64 == TypeCode::U64 as u32);
-    assert!(GNITZ_TYPE_I64 == TypeCode::I64 as u32);
-    assert!(GNITZ_TYPE_F64 == TypeCode::F64 as u32);
-    assert!(GNITZ_TYPE_STRING == TypeCode::String as u32);
-    assert!(GNITZ_TYPE_U128 == TypeCode::U128 as u32);
-    assert!(GNITZ_TYPE_UUID == TypeCode::UUID as u32);
-    assert!(GNITZ_TYPE_BLOB == TypeCode::Blob as u32);
+    let mut i = 0;
+    while i < TypeCode::ALL.len() {
+        assert!(c_type_code(TypeCode::ALL[i]) == TypeCode::ALL[i] as u32);
+        i += 1;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -124,6 +140,21 @@ fn set_error(e: impl std::fmt::Display) {
     LAST_ERROR.with(|cell| {
         *cell.borrow_mut() = CString::new(e.to_string()).ok();
     });
+}
+
+/// Record a classified failure and return the C code that names it: a retryable
+/// OCC conflict gets the dedicated [`GNITZ_ERR_TXN_CONFLICT`], everything else
+/// the generic `-1`. `set_error` alone discards that verdict, so every
+/// `c_int`-returning entry point returns through here and a conflict is
+/// detectable on *every* write, not only through `gnitz_execute_sql`. The entry
+/// points reporting failure as a null pointer or a `0` id have no code to carry.
+fn set_classified_error(e: &(impl std::fmt::Display + ConflictClass)) -> c_int {
+    set_error(e);
+    if e.is_conflict() {
+        GNITZ_ERR_TXN_CONFLICT
+    } else {
+        -1
+    }
 }
 
 fn clear_error() {
@@ -375,6 +406,7 @@ pub unsafe extern "C" fn gnitz_batch_append_row(
     match append_row_inner(b, t, weight, null_mask, col_data_slice) {
         Ok(()) => 0,
         Err(e) => {
+            // A local encode rejection, not a server verdict — nothing to classify.
             set_error(e);
             -1
         }
@@ -549,6 +581,11 @@ pub unsafe extern "C" fn gnitz_batch_get_weight(batch: *const GnitzBatch, row: u
 /// full range (a U8 of 200 returns 200, not -56). A U64 column is returned as its
 /// bit pattern — a value at or above 2^63 reads negative here and needs the
 /// caller to cast to `uint64_t`.
+///
+/// Reads through the column's resolved address, so a **PK** column answers from
+/// the PK region. `ZSetBatch::new` leaves an empty `ColData::Fixed` placeholder in
+/// every PK slot, so consulting `columns[col_idx]` alone reports "not a Fixed
+/// integer column" for exactly the columns that always are one.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_batch_get_i64(batch: *const GnitzBatch, col_idx: usize, row: usize) -> i64 {
     let b = check_ptr!(batch, 0);
@@ -556,21 +593,29 @@ pub unsafe extern "C" fn gnitz_batch_get_i64(batch: *const GnitzBatch, col_idx: 
         set_error("column index out of range");
         return 0;
     }
+    if row >= b.batch.len() {
+        set_error("row out of range");
+        return 0;
+    }
     let tc = b.schema.columns[col_idx].type_code;
-    let Some(slice) = b.batch.columns[col_idx].cell(row, tc.wire_stride()) else {
-        set_error(if row < b.batch.len() {
-            "column is not a Fixed integer column"
-        } else {
-            "row out of range"
-        });
+    let Some(fi) = gnitz_core::FixedInt::from_type_code(tc) else {
+        set_error("unsupported integer column type");
         return 0;
     };
-    match gnitz_core::FixedInt::from_type_code(tc) {
-        Some(fi) => fi.decode_le_i64(slice),
-        None => {
-            set_error("unsupported integer column type");
-            0
+    match SchemaFacts::locate(&b.schema, col_idx) {
+        // A client-side PK region holds native-LE values, not the at-rest OPK
+        // form the server stores — so this is the same little-endian decode the
+        // payload arm does, over a window of the packed key.
+        ColumnLocator::Pk { byte_off, size, .. } => {
+            fi.decode_le_i64(b.batch.pks.col_window(row, byte_off as usize, size as usize))
         }
+        ColumnLocator::Payload { .. } => match b.batch.columns[col_idx].cell(row, tc.wire_stride()) {
+            Some(slice) => fi.decode_le_i64(slice),
+            None => {
+                set_error("column is not a Fixed integer column");
+                0
+            }
+        },
     }
 }
 
@@ -678,10 +723,7 @@ pub unsafe extern "C" fn gnitz_drop_schema(conn: *mut GnitzConn, name: *const c_
     let c = check_ptr_mut!(conn, -1);
     match c.0.drop_schema(cstr(name)) {
         Ok(()) => 0,
-        Err(e) => {
-            set_error(e);
-            -1
-        }
+        Err(e) => set_classified_error(&e),
     }
 }
 
@@ -729,10 +771,7 @@ pub unsafe extern "C" fn gnitz_drop_table(
     let c = check_ptr_mut!(conn, -1);
     match c.0.drop_table(cstr(schema_name), cstr(table_name)) {
         Ok(()) => 0,
-        Err(e) => {
-            set_error(e);
-            -1
-        }
+        Err(e) => set_classified_error(&e),
     }
 }
 
@@ -754,10 +793,7 @@ pub unsafe extern "C" fn gnitz_push(
     let b = check_ptr!(batch, -1);
     match c.0.push(table_id, &s.0, &b.batch) {
         Ok(_) => 0,
-        Err(e) => {
-            set_error(e);
-            -1
-        }
+        Err(e) => set_classified_error(&e),
     }
 }
 
@@ -836,10 +872,7 @@ pub unsafe extern "C" fn gnitz_delete(
     }
     match c.0.delete(table_id, &s.0, pk_col) {
         Ok(()) => 0,
-        Err(e) => {
-            set_error(e);
-            -1
-        }
+        Err(e) => set_classified_error(&e),
     }
 }
 
@@ -914,10 +947,7 @@ pub unsafe extern "C" fn gnitz_drop_view(
     let c = check_ptr_mut!(conn, -1);
     match c.0.drop_view(cstr(schema_name), cstr(view_name)) {
         Ok(()) => 0,
-        Err(e) => {
-            set_error(e);
-            -1
-        }
+        Err(e) => set_classified_error(&e),
     }
 }
 
@@ -1244,10 +1274,7 @@ pub unsafe extern "C" fn gnitz_seek(
             }
             0
         }
-        Err(e) => {
-            set_error(e);
-            -1
-        }
+        Err(e) => set_classified_error(&e),
     }
 }
 
@@ -1295,10 +1322,7 @@ pub unsafe extern "C" fn gnitz_seek_by_index(
             }
             0
         }
-        Err(e) => {
-            set_error(e);
-            -1
-        }
+        Err(e) => set_classified_error(&e),
     }
 }
 
@@ -1351,24 +1375,7 @@ pub unsafe extern "C" fn gnitz_execute_sql(
             }
             0
         }
-        // An OCC conflict returns the dedicated GNITZ_ERR_TXN_CONFLICT so a C
-        // caller can retry; every other error keeps the generic -1. The message
-        // (which names the table for an autocommit conflict) is in gnitz_last_error.
-        Err(e) => {
-            let code = sql_error_code(&e);
-            set_error(e);
-            code
-        }
-    }
-}
-
-/// C return code for a SQL execution error: a retryable OCC conflict gets the
-/// dedicated `GNITZ_ERR_TXN_CONFLICT`; every other error keeps the generic `-1`.
-fn sql_error_code(e: &GnitzSqlError) -> c_int {
-    if e.is_conflict() {
-        GNITZ_ERR_TXN_CONFLICT
-    } else {
-        -1
+        Err(e) => set_classified_error(&e),
     }
 }
 
@@ -1396,6 +1403,11 @@ pub unsafe extern "C" fn gnitz_batch_is_null(batch: *const GnitzBatch, col_idx: 
 /// Read a float/double column value as f64.
 /// F32 columns are widened to f64. Returns 0.0 and sets last_error on type
 /// mismatch or out-of-bounds.
+///
+/// A PK column is rejected by type, not by layout: floats are not PK-eligible
+/// (IEEE-754 breaks the byte-equal key contract), so a PK column here is always
+/// the type error — reading its empty `ColData` placeholder instead reported
+/// "row out of range", which is the wrong diagnosis for every row.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_batch_get_f64(batch: *const GnitzBatch, col_idx: usize, row: usize) -> f64 {
     let b = check_ptr!(batch, 0.0);
@@ -1403,29 +1415,25 @@ pub unsafe extern "C" fn gnitz_batch_get_f64(batch: *const GnitzBatch, col_idx: 
         set_error("column index out of range");
         return 0.0;
     }
-    match b.batch.columns.get(col_idx) {
-        Some(ColData::Fixed(buf)) => {
-            let tc = b.schema.columns[col_idx].type_code;
-            let stride = tc.wire_stride();
-            let start = row * stride;
-            if start + stride > buf.len() {
-                set_error("row out of range");
-                return 0.0;
-            }
-            let slice = &buf[start..start + stride];
-            match tc {
-                TypeCode::F32 => f32::from_le_bytes(slice.try_into().unwrap()) as f64,
-                TypeCode::F64 => f64::from_le_bytes(slice.try_into().unwrap()),
-                _ => {
-                    set_error("column is not a float column");
-                    0.0
-                }
-            }
-        }
-        _ => {
-            set_error("column is not a Fixed float column");
-            0.0
-        }
+    let tc = b.schema.columns[col_idx].type_code;
+    if !matches!(tc, TypeCode::F32 | TypeCode::F64) {
+        set_error("column is not a float column");
+        return 0.0;
+    }
+    let Some(ColData::Fixed(buf)) = b.batch.columns.get(col_idx) else {
+        set_error("column is not a Fixed float column");
+        return 0.0;
+    };
+    let stride = tc.wire_stride();
+    let start = row * stride;
+    if start + stride > buf.len() {
+        set_error("row out of range");
+        return 0.0;
+    }
+    let slice = &buf[start..start + stride];
+    match tc {
+        TypeCode::F32 => f32::from_le_bytes(slice.try_into().unwrap()) as f64,
+        _ => f64::from_le_bytes(slice.try_into().unwrap()),
     }
 }
 
@@ -1472,20 +1480,42 @@ mod tests {
 
     #[test]
     fn conflict_maps_to_dedicated_return_code() {
-        // An OCC conflict (either autocommit-with-table or transaction) maps to
-        // GNITZ_ERR_TXN_CONFLICT; every other SQL error keeps the generic -1.
+        // An OCC conflict maps to GNITZ_ERR_TXN_CONFLICT whichever classified
+        // error type reports it — the SQL path (autocommit-with-table or
+        // transaction) and the non-SQL writes alike; every other error keeps the
+        // generic -1.
+        use gnitz_sql::GnitzSqlError;
         assert_eq!(
-            sql_error_code(&GnitzSqlError::Conflict {
+            set_classified_error(&GnitzSqlError::Conflict {
                 table: Some("t".into())
             }),
             GNITZ_ERR_TXN_CONFLICT
         );
         assert_eq!(
-            sql_error_code(&GnitzSqlError::Conflict { table: None }),
+            set_classified_error(&GnitzSqlError::Conflict { table: None }),
             GNITZ_ERR_TXN_CONFLICT
         );
-        assert_eq!(sql_error_code(&GnitzSqlError::Bind("nope".into())), -1);
+        assert_eq!(set_classified_error(&GnitzSqlError::Bind("nope".into())), -1);
+        assert_eq!(
+            set_classified_error(&gnitz_core::ClientError::TxnConflict { fresh_basis: 7 }),
+            GNITZ_ERR_TXN_CONFLICT
+        );
+        assert_eq!(
+            set_classified_error(&gnitz_core::ClientError::ServerError("nope".into())),
+            -1
+        );
         assert_eq!(GNITZ_ERR_TXN_CONFLICT, -2);
+    }
+
+    /// Every wire type code has a C constant. `c_type_code` is exhaustive, so
+    /// this is really a pin on the *values*; the missing-variant case is a
+    /// compile error there rather than a failure here.
+    #[test]
+    fn every_type_code_has_a_c_constant() {
+        for tc in TypeCode::ALL {
+            assert_eq!(c_type_code(tc), tc as u32, "{}", tc.wire_name());
+        }
+        assert_eq!(GNITZ_TYPE_I128, TypeCode::I128 as u32);
     }
 
     #[test]

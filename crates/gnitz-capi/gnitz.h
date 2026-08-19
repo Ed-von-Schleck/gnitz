@@ -45,6 +45,8 @@ typedef struct GnitzCircuit        GnitzCircuit;
 
 #define GNITZ_TYPE_BLOB 14
 
+#define GNITZ_TYPE_I128 15
+
 const char *gnitz_last_error(void);
 
 GnitzConn *gnitz_connect(const char *socket_path);
