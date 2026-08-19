@@ -21,14 +21,12 @@ use libc::c_int;
 // File-I/O tier
 // ---------------------------------------------------------------------------
 
-/// Drive `syscall(ptr, len)` until all of `data` is written, retrying EINTR.
-/// `syscall` takes the remaining slice's start and length and returns the raw
-/// libc return value; the `done` running total is passed so a positional
-/// variant can derive its offset.
-fn write_all_with(data: &[u8], mut syscall: impl FnMut(*const u8, usize, usize) -> isize) -> std::io::Result<()> {
+/// Write all bytes to a raw `fd`, handling partial writes and EINTR — the
+/// `File::write_all` of a descriptor nobody owns (stdout, a socketpair end).
+pub(crate) fn write_all_fd(fd: c_int, data: &[u8]) -> std::io::Result<()> {
     let mut done: usize = 0;
     while done < data.len() {
-        let ret = unsafe { syscall(data.as_ptr().add(done), data.len() - done, done) };
+        let ret = unsafe { libc::write(fd, data.as_ptr().add(done) as *const libc::c_void, data.len() - done) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -45,21 +43,6 @@ fn write_all_with(data: &[u8], mut syscall: impl FnMut(*const u8, usize, usize) 
         done += ret as usize;
     }
     Ok(())
-}
-
-/// Write all bytes to `fd`, handling partial writes and EINTR.
-pub(crate) fn write_all_fd(fd: c_int, data: &[u8]) -> std::io::Result<()> {
-    write_all_with(data, |p, len, _| unsafe {
-        libc::write(fd, p as *const libc::c_void, len)
-    })
-}
-
-/// pwrite all bytes to `fd` at `offset`, handling short writes and EINTR —
-/// the positional twin of [`write_all_fd`].
-pub(crate) fn pwrite_all_fd(fd: c_int, buf: &[u8], offset: libc::off_t) -> std::io::Result<()> {
-    write_all_with(buf, |p, len, done| unsafe {
-        libc::pwrite(fd, p as *const libc::c_void, len, offset + done as libc::off_t)
-    })
 }
 
 /// `libc::openat` returning an `OwnedFd`. The errno is captured here, at the
@@ -93,19 +76,6 @@ pub(crate) fn renameat(
     Ok(())
 }
 
-/// `libc::rename`, the `AT_FDCWD` case of [`renameat`].
-pub(crate) fn rename(old: &std::ffi::CStr, new: &std::ffi::CStr) -> std::io::Result<()> {
-    renameat(libc::AT_FDCWD, old, libc::AT_FDCWD, new)
-}
-
-/// `libc::fdatasync` — flush `fd`'s data (not its metadata) to the device.
-pub(crate) fn fdatasync(fd: c_int) -> std::io::Result<()> {
-    if unsafe { libc::fdatasync(fd) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 /// Retry a raw syscall until it succeeds (`>= 0`) or fails with an error other
 /// than EINTR.
 fn retry_eintr(mut f: impl FnMut() -> c_int) -> std::io::Result<()> {
@@ -118,16 +88,6 @@ fn retry_eintr(mut f: impl FnMut() -> c_int) -> std::io::Result<()> {
             return Err(err);
         }
     }
-}
-
-/// Pre-allocate blocks for fd.
-pub fn fallocate(fd: c_int, length: i64) -> std::io::Result<()> {
-    retry_eintr(|| unsafe { libc::fallocate(fd, 0, 0, length as libc::off_t) })
-}
-
-/// Set file size via ftruncate.
-pub fn ftruncate(fd: c_int, size: i64) -> std::io::Result<()> {
-    retry_eintr(|| unsafe { libc::ftruncate(fd, size as libc::off_t) })
 }
 
 /// Create an anonymous temporary file (`O_TMPFILE`) on the filesystem backing
@@ -632,28 +592,13 @@ pub fn futex_wake_u32(ptr: *const AtomicU32, n_waiters: u32) -> i32 {
     }
 }
 
-/// Kernel ABI `struct futex_waitv` (`futex_waitv(2)`, Linux 5.16+).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct FutexWaitvRaw {
-    val: u64,
-    uaddr: u64,
-    flags: u32,
-    __reserved: u32,
-}
-
-/// Kernel `FUTEX_WAITV_MAX` — the hard cap on words per `futex_waitv` call.
-/// `foundation` (L0) may not name `runtime::sal::MAX_WORKERS` (layering), so the
-/// wrapper carries its own bound; `w2m.rs` statically asserts `MAX_WORKERS <=`
-/// this, which is the only call site that builds the word list.
-pub(crate) const MAX_FUTEX_WAITV: usize = 128;
-
 /// Synchronously wait on MULTIPLE futex words at once (`SYS_futex_waitv`),
 /// returning when ANY differs from its expected value or is woken — the
-/// synchronous analogue of the reactor's `IORING_OP_FUTEX_WAITV`. The master
-/// must wait on every still-pending worker's `reader_seq`, since a publish by
-/// ANY worker wakes only that worker's word and a single-word `futex_wait` would
-/// miss it. `ptrs[i]` pairs with `expected[i]`.
+/// synchronous analogue of the reactor's `IORING_OP_FUTEX_WAITV`, and built from
+/// the same [`io_uring::types::FutexWaitV`] so there is one declaration of the
+/// kernel struct rather than two that can drift. The master must wait on every
+/// still-pending worker's `reader_seq`, since a publish by ANY worker wakes only
+/// that worker's word and a single-word `futex_wait` would miss it.
 ///
 /// `timeout_ms` becomes an ABSOLUTE `CLOCK_MONOTONIC` deadline — `futex_waitv`
 /// requires absolute timeouts, unlike the relative `futex_wait_u32` above; do
@@ -661,25 +606,9 @@ pub(crate) const MAX_FUTEX_WAITV: usize = 128;
 /// (`>= 0`), or `-1` on timeout/error; callers re-read the rings rather than
 /// trust the return (the ring data is authoritative, as in `futex_wait_u32`), so
 /// any failed syscall degrades to one extra poll rather than a hang.
-pub fn futex_waitv_u32(ptrs: &[*const AtomicU32], expected: &[u32], timeout_ms: i32) -> i32 {
-    let n = ptrs.len();
-    debug_assert_eq!(n, expected.len());
-    if n == 0 || n > MAX_FUTEX_WAITV {
-        return -1; // unreachable given the w2m.rs assert; defensive.
-    }
-    let mut waiters = [FutexWaitvRaw {
-        val: 0,
-        uaddr: 0,
-        flags: 0,
-        __reserved: 0,
-    }; MAX_FUTEX_WAITV];
-    for i in 0..n {
-        waiters[i] = FutexWaitvRaw {
-            val: expected[i] as u64,
-            uaddr: ptrs[i] as u64,
-            flags: FUTEX2_SIZE_U32,
-            __reserved: 0,
-        };
+pub(crate) fn futex_waitv_u32(waiters: &[io_uring::types::FutexWaitV], timeout_ms: i32) -> i32 {
+    if waiters.is_empty() {
+        return -1;
     }
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     let ts_ptr: *const libc::timespec = if timeout_ms < 0 {
@@ -700,7 +629,7 @@ pub fn futex_waitv_u32(ptrs: &[*const AtomicU32], expected: &[u32], timeout_ms: 
         libc::syscall(
             libc::SYS_futex_waitv,
             waiters.as_ptr(),
-            n as libc::c_uint,
+            waiters.len() as libc::c_uint,
             0u32, // flags
             ts_ptr,
             libc::CLOCK_MONOTONIC,
@@ -709,8 +638,8 @@ pub fn futex_waitv_u32(ptrs: &[*const AtomicU32], expected: &[u32], timeout_ms: 
 }
 
 /// How [`map_shared_sized`] grows the backing object before mapping it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Backing {
+#[derive(Clone, Copy)]
+pub(crate) enum Backing {
     /// `fallocate` — reserves the blocks, so a later store cannot fail for
     /// want of space. For a real file, where the space is on disk.
     Reserved,
@@ -727,11 +656,12 @@ pub enum Backing {
 /// first store into the resulting hole raises `SIGBUS`, for which the server
 /// installs no handler. Failing to size the object has to abort here, where the
 /// errno still says why, rather than at an arbitrary later write.
-pub fn map_shared_sized(fd: c_int, size: usize, how: Backing) -> std::io::Result<*mut u8> {
+pub(crate) fn map_shared_sized(fd: c_int, size: usize, how: Backing) -> std::io::Result<*mut u8> {
     if fd_size(fd)? < size {
+        let len = size as libc::off_t;
         match how {
-            Backing::Reserved => fallocate(fd, size as i64)?,
-            Backing::Sized => ftruncate(fd, size as i64)?,
+            Backing::Reserved => retry_eintr(|| unsafe { libc::fallocate(fd, 0, 0, len) })?,
+            Backing::Sized => retry_eintr(|| unsafe { libc::ftruncate(fd, len) })?,
         }
     }
     let ptr = unsafe {

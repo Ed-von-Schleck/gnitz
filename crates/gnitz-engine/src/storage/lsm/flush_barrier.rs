@@ -235,21 +235,11 @@ mod tests {
         }
     }
 
-    fn open_written(dir: &std::path::Path, name: &str) -> libc::c_int {
-        let path = dir.join(name);
-        let path_c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let fd = unsafe {
-            libc::open(
-                path_c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-                0o644 as libc::mode_t,
-            )
-        };
-        assert!(fd >= 0, "open failed: {}", std::io::Error::last_os_error());
-        let buf = b"hello";
-        let rc = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
-        assert_eq!(rc as usize, buf.len());
-        fd
+    fn open_written(dir: &std::path::Path, name: &str) -> std::fs::File {
+        use std::io::Write;
+        let mut f = std::fs::File::create(dir.join(name)).expect("create");
+        f.write_all(b"hello").expect("write");
+        f
     }
 
     /// One CQE per submitted fd, including when the fd count exceeds the ring's
@@ -259,15 +249,12 @@ mod tests {
         // Tiny ring forces multiple submit_and_wait rounds for >4 fds.
         let Some(mut ring) = try_lazy_ring(4) else { return };
         let dir = tempfile::tempdir().unwrap();
-        let fds: Vec<libc::c_int> = (0..10)
+        let files: Vec<std::fs::File> = (0..10)
             .map(|i| open_written(dir.path(), &format!("f_{i}.bin")))
             .collect();
+        let fds: Vec<libc::c_int> = files.iter().map(|f| f.as_raw_fd()).collect();
 
         ring.batch_sync(&fds, DATASYNC).expect("batch fdatasync");
-
-        for fd in fds {
-            unsafe { libc::close(fd) };
-        }
     }
 
     #[test]
@@ -283,9 +270,10 @@ mod tests {
     fn batch_sync_retries_after_eintr() {
         let Some(mut ring) = try_lazy_ring(8) else { return };
         let dir = tempfile::tempdir().unwrap();
-        let fds: Vec<libc::c_int> = (0..3)
+        let files: Vec<std::fs::File> = (0..3)
             .map(|i| open_written(dir.path(), &format!("eintr_{i}.bin")))
             .collect();
+        let fds: Vec<libc::c_int> = files.iter().map(|f| f.as_raw_fd()).collect();
 
         let mut call_count = 0usize;
         let result = ring.batch_sync_with(&fds, DATASYNC, |r, want| {
@@ -301,9 +289,5 @@ mod tests {
 
         assert!(result.is_ok(), "EINTR should be retried, got: {result:?}");
         assert_eq!(call_count, 2, "exactly one EINTR then one successful submit expected");
-
-        for fd in fds {
-            unsafe { libc::close(fd) };
-        }
     }
 }

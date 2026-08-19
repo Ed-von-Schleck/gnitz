@@ -4,7 +4,8 @@
 //! checkpoint path (`lsm::table::flush`).
 
 use std::ffi::CStr;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 
 use libc::c_int;
 
@@ -371,8 +372,7 @@ pub fn write_shard_streaming(
     schema: &SchemaDescriptor,
     opts: ShardWriteOpts,
 ) -> Result<(), StorageError> {
-    let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, row_count, regions, schema, opts)?;
-    drop(fd); // Close before the rename, matching the batched two-phase path.
+    let tmp_name = write_shard_streaming_inner(dirfd, basename, row_count, regions, schema, opts)?;
     if let Err(e) = posix_io::renameat(dirfd, &tmp_name, dirfd, basename) {
         unsafe { libc::unlinkat(dirfd, tmp_name.as_ptr(), 0) };
         return Err(e.into());
@@ -404,9 +404,9 @@ fn check_region_shape(regions: &[&[u8]], n: usize, strides: &[u8], nr: usize) ->
     Ok(())
 }
 
-/// Open .tmp shard, write header+regions+xor8, leave fd open and unsynced.
-/// Caller is responsible for close and rename. On error the fd is closed and
-/// the .tmp is unlinked.
+/// Open the .tmp shard, write header+regions+xor8, and close it — unsynced,
+/// since the flush barrier fdatasyncs every registered file later. Returns the
+/// .tmp's name for the caller to rename. On error the .tmp is unlinked.
 #[allow(clippy::needless_range_loop)]
 fn write_shard_streaming_inner(
     dirfd: c_int,
@@ -415,7 +415,7 @@ fn write_shard_streaming_inner(
     regions: &[&[u8]],
     schema: &SchemaDescriptor,
     opts: ShardWriteOpts,
-) -> Result<(OwnedFd, std::ffi::CString), StorageError> {
+) -> Result<std::ffi::CString, StorageError> {
     let num_regions = regions.len();
     let n = row_count as usize;
     // Writer↔reader region-layout contract, shared with `MappedShard::open`:
@@ -563,35 +563,37 @@ fn write_shard_streaming_inner(
 
     let tmp_name = super::super::cstr_with_tmp_suffix(basename)?;
 
-    // The `OwnedFd` is the sole closer, so every error return below closes
-    // it — `abort` only unlinks.
-    let fd = posix_io::openat_owned(dirfd, &tmp_name, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
+    // The `File` is the sole closer, so every error return below closes it —
+    // `abort` only unlinks.
+    let file = File::from(posix_io::openat_owned(
+        dirfd,
+        &tmp_name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+    )?);
 
-    unsafe {
-        let abort = |e: std::io::Error| -> StorageError {
-            libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
-            e.into()
-        };
+    let abort = |e: std::io::Error| -> StorageError {
+        unsafe { libc::unlinkat(dirfd, tmp_name.as_ptr(), 0) };
+        e.into()
+    };
 
-        posix_io::ftruncate(fd.as_raw_fd(), total_size as i64).map_err(abort)?;
+    file.set_len(total_size as u64).map_err(abort)?;
+    file.write_all_at(&hdr_buf, 0).map_err(abort)?;
 
-        posix_io::pwrite_all_fd(fd.as_raw_fd(), &hdr_buf, 0).map_err(abort)?;
-
-        for i in 0..num_regions {
-            let src = regions[i];
-            let r_off = region_offsets[i] as libc::off_t;
-            // Same empty short-circuit as the checksum pass.
-            if actual_sizes[i] > 0 && !src.is_empty() {
-                posix_io::pwrite_all_fd(fd.as_raw_fd(), encodings[i].encoded_bytes(src), r_off).map_err(abort)?;
-            }
+    for i in 0..num_regions {
+        let src = regions[i];
+        // Same empty short-circuit as the checksum pass.
+        if actual_sizes[i] > 0 && !src.is_empty() {
+            file.write_all_at(encodings[i].encoded_bytes(src), region_offsets[i] as u64)
+                .map_err(abort)?;
         }
-
-        if let Some(ref data) = xor8_data {
-            posix_io::pwrite_all_fd(fd.as_raw_fd(), data, xor8_offset as libc::off_t).map_err(abort)?;
-        }
-
-        Ok((fd, tmp_name))
     }
+
+    if let Some(ref data) = xor8_data {
+        file.write_all_at(data, xor8_offset as u64).map_err(abort)?;
+    }
+
+    drop(file); // Closed before the caller renames, matching the manifest path.
+    Ok(tmp_name)
 }
 
 #[cfg(test)]

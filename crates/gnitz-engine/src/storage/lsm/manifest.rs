@@ -1,4 +1,6 @@
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::AsRawFd;
 
 use super::error::StorageError;
 use crate::foundation::posix_io::{self, open_owned};
@@ -268,21 +270,29 @@ pub fn read_file(path: &std::ffi::CStr) -> Result<Option<(Vec<ManifestEntryRaw>,
 /// the open fd plus owned path buffers. Does NOT fdatasync, close, or rename.
 /// On any internal write error closes the fd and unlinks the .tmp.
 pub struct PreparedManifest {
-    fd: OwnedFd,
+    file: File,
     tmp_path: std::ffi::CString,
     final_path: std::ffi::CString,
     /// Set true once the `.tmp` has been renamed into place (`commit`). Until
     /// then, Drop unlinks the `.tmp` so a panic or early return between
-    /// `prepare_file` and the rename never leaks the temporary file. The fd
-    /// closes via `OwnedFd`.
+    /// `prepare_file` and the rename never leaks the temporary file. The
+    /// descriptor closes with the `File`.
     committed: bool,
 }
 
 impl PreparedManifest {
-    /// The staged `.tmp`'s fd, open from `prepare_file` until the value drops
-    /// (after `commit`'s rename, or on the abandon path).
+    /// The staged `.tmp`'s raw fd, open from `prepare_file` until the value
+    /// drops (after `commit`'s rename, or on the abandon path). Raw because the
+    /// flush barrier hands whole chunks of these to `IORING_OP_FSYNC` at once;
+    /// a blocking `sync_data` per file would undo that batching.
     pub fn fd(&self) -> libc::c_int {
-        self.fd.as_raw_fd()
+        self.file.as_raw_fd()
+    }
+
+    /// Make the staged bytes durable. The one-directory-at-a-time counterpart
+    /// of the barrier's batched fsync.
+    pub fn sync(&self) -> std::io::Result<()> {
+        self.file.sync_data()
     }
 
     /// Rename the staged `.tmp` into place, consuming the staging value. The
@@ -290,7 +300,7 @@ impl PreparedManifest {
     /// `committed` unset, so Drop unlinks the `.tmp`.
     pub fn commit(mut self) -> Result<(), StorageError> {
         // `self` drops on the error path: Drop unlinks the .tmp.
-        posix_io::rename(&self.tmp_path, &self.final_path)?;
+        posix_io::renameat(libc::AT_FDCWD, &self.tmp_path, libc::AT_FDCWD, &self.final_path)?;
         self.committed = true; // renamed; suppress the .tmp unlink in Drop
         Ok(())
     }
@@ -320,9 +330,9 @@ pub fn prepare_file(
     let tmp_path = super::cstr_with_tmp_suffix(path)?;
     let final_path = super::cstr(path.to_bytes())?;
 
-    let fd = open_owned(&tmp_path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?;
+    let mut file = File::from(open_owned(&tmp_path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)?);
 
-    if let Err(e) = posix_io::write_all_fd(fd.as_raw_fd(), &buf[..written]) {
+    if let Err(e) = file.write_all(&buf[..written]) {
         unsafe {
             libc::unlink(tmp_path.as_ptr());
         }
@@ -330,7 +340,7 @@ pub fn prepare_file(
     }
 
     Ok(PreparedManifest {
-        fd,
+        file,
         tmp_path,
         final_path,
         committed: false,
@@ -375,7 +385,7 @@ pub(super) fn publish_sync(
     header: ManifestHeader,
 ) -> Result<(), StorageError> {
     let staged = prepare_file(&super::cstr(path(dir))?, entries, header)?;
-    posix_io::fdatasync(staged.fd())?;
+    staged.sync()?;
     super::child_dir::fsync_dir(dir)?;
     staged.commit()?;
     super::child_dir::fsync_dir(dir)

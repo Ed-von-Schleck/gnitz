@@ -4,15 +4,17 @@ use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use io_uring::types::FutexWaitV;
+
 use crate::foundation::posix_io;
 use crate::runtime::w2m_ring::{self, TryReserve, W2mRingHeader, FLAG_MASTER_PARKED, FLAG_WRITER_PARKED};
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg};
 
-// `wait_any` builds a `futex_waitv` word list of at most `num_workers` entries,
-// and `num_workers <= MAX_WORKERS`. Pin `MAX_WORKERS <= MAX_FUTEX_WAITV` here —
-// the one site that names both constants — so a future `MAX_WORKERS` bump that
-// outgrows the syscall cap is a build error, not a silent truncation.
-const _: () = assert!(crate::runtime::sal::MAX_WORKERS <= crate::foundation::posix_io::MAX_FUTEX_WAITV);
+// `wait_any` builds a `futex_waitv` word list of at most `num_workers` entries.
+// The kernel's `FUTEX_WAITV_MAX` is 128; past it the syscall returns EINVAL,
+// which the caller absorbs as a timeout, silently degenerating the relay to
+// polling. Make a `MAX_WORKERS` bump that outgrows it a build error.
+const _: () = assert!(crate::runtime::sal::MAX_WORKERS <= 128);
 
 /// Worker's write side of a single W2M ring.
 pub struct W2mWriter {
@@ -403,8 +405,7 @@ impl W2mReceiver {
     /// words; once the reactor resumes it re-establishes the flag via
     /// `refresh_futex_waitv_vals`, so there is nothing to restore.
     pub fn wait_any(&self, workers: &[usize], timeout_ms: i32) -> i32 {
-        let mut ptrs = [std::ptr::null::<AtomicU32>(); crate::runtime::sal::MAX_WORKERS];
-        let mut expected = [0u32; crate::runtime::sal::MAX_WORKERS];
+        let mut waiters = [FutexWaitV::new(); crate::runtime::sal::MAX_WORKERS];
         let mut n = 0;
         for &w in workers {
             let hdr = unsafe { self.header(w) };
@@ -413,14 +414,16 @@ impl W2mReceiver {
             if has_unread {
                 return 0;
             }
-            ptrs[n] = hdr.reader_seq() as *const AtomicU32;
-            expected[n] = exp;
+            waiters[n] = FutexWaitV::new()
+                .val(exp as u64)
+                .uaddr(hdr.reader_seq() as *const AtomicU32 as u64)
+                .flags(posix_io::FUTEX2_SIZE_U32);
             n += 1;
         }
         if n == 0 {
             return 0;
         }
-        posix_io::futex_waitv_u32(&ptrs[..n], &expected[..n], timeout_ms)
+        posix_io::futex_waitv_u32(&waiters[..n], timeout_ms)
     }
 
     pub fn num_workers(&self) -> usize {
