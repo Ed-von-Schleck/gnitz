@@ -525,24 +525,24 @@ impl Drop for Mmap {
 
 /// Return the errno of the most recent failed syscall.
 #[inline]
-pub fn errno() -> i32 {
+pub(crate) fn errno() -> i32 {
     unsafe { *libc::__errno_location() }
 }
 
 /// `futex2(2)` flags byte for a 32-bit atomic. Matches the kernel constant
 /// `FUTEX2_SIZE_U32` (=2). No `FUTEX2_PRIVATE` bit — W2M is `MAP_SHARED`
 /// across `fork()`.
-pub const FUTEX2_SIZE_U32: u32 = 2;
+pub(crate) const FUTEX2_SIZE_U32: u32 = 2;
 
 /// Create a non-blocking, close-on-exec eventfd. Returns fd or -1 on error.
-pub fn eventfd_create() -> i32 {
+pub(crate) fn eventfd_create() -> i32 {
     unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) }
 }
 
 /// Signal an eventfd (increment counter by 1), retrying EINTR. A failure needs
 /// no reporting: the counter is a wake hint whose loss the reader recovers from
 /// by re-reading its ring, so no caller inspects the outcome.
-pub fn eventfd_signal(efd: i32) {
+pub(crate) fn eventfd_signal(efd: i32) {
     let v: u64 = 1;
     loop {
         let n = unsafe { libc::write(efd, &v as *const u64 as *const libc::c_void, 8) };
@@ -555,7 +555,7 @@ pub fn eventfd_signal(efd: i32) {
 
 /// Wait for an eventfd to become readable.
 /// Returns >0 if ready (counter drained), 0 on timeout, <0 on error.
-pub fn eventfd_wait(efd: i32, timeout_ms: i32) -> i32 {
+pub(crate) fn eventfd_wait(efd: i32, timeout_ms: i32) -> i32 {
     let mut pfd = libc::pollfd {
         fd: efd,
         events: libc::POLLIN,
