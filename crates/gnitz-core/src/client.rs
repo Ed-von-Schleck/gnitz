@@ -223,16 +223,11 @@ struct RelDescriptor {
 
 /// What one statement has already read, dropped whole at `end_statement`.
 ///
-/// `relations` holds one entry per resolved canonical `"schema.name"`, absent
-/// verdicts included, so a two-probe error ladder costs one round trip rather
-/// than two. `catalog` holds one scan batch per system table for the reads that
-/// still go through the wire (`lookup_schema_id`, the DDL `-1` payload reads);
-/// a family this statement also *writes* must bypass it, or the write's own
-/// retraction reads back as still live.
+/// One entry per resolved canonical `"schema.name"`, absent verdicts included,
+/// so a two-probe error ladder costs one round trip rather than two.
 #[derive(Default)]
 struct StatementScope {
     relations: HashMap<String, Option<Arc<RelDescriptor>>>,
-    catalog: HashMap<u64, Option<Arc<ZSetBatch>>>,
 }
 
 pub struct GnitzClient {
@@ -325,7 +320,7 @@ impl GnitzClient {
         r
     }
 
-    /// Open a statement scope: everything this statement resolves or scans is
+    /// Open a statement scope: every relation this statement resolves is
     /// remembered in it and dropped at [`Self::end_statement`], so nothing
     /// survives a catalog write and there is no cross-statement state to
     /// invalidate. The SQL planner brackets each statement with begin/end.
@@ -337,21 +332,6 @@ impl GnitzClient {
     /// write in this statement is visible to the next.
     pub fn end_statement(&mut self) {
         self.scope = None;
-    }
-
-    /// Scan a system table, served from the statement scope when one is active
-    /// (caching the batch on the first read). The batch is shared via `Arc`, so
-    /// a scope hit is a refcount bump, never a batch copy.
-    fn scan_catalog(&mut self, tab: u64) -> Result<Option<Arc<ZSetBatch>>, ClientError> {
-        if let Some(cached) = self.scope.as_ref().and_then(|s| s.catalog.get(&tab)) {
-            return Ok(cached.clone());
-        }
-        let (_, batch, _) = self.session.scan(tab)?;
-        let batch = batch.map(Arc::new);
-        if let Some(s) = &mut self.scope {
-            s.catalog.insert(tab, batch.clone());
-        }
-        Ok(batch)
     }
 
     /// Reserve at least `count` SERIAL ids for `table_id` in **one** master round
@@ -687,7 +667,8 @@ impl GnitzClient {
     /// against the taken set. Reads the same slots `create_index` writes and
     /// `drop_index_by_name` reads.
     pub fn index_name_cols(&mut self) -> Result<Vec<(String, gnitz_wire::PkColList)>, ClientError> {
-        let Some(idx_batch) = self.scan_catalog(IDX_TAB)? else {
+        let (_, idx_batch, _) = self.session.scan(IDX_TAB)?;
+        let Some(idx_batch) = idx_batch else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
@@ -826,9 +807,9 @@ impl GnitzClient {
 
     /// Retry-until-stable drain: each pass attempts every remaining target,
     /// requeues any that fail, and stops when the queue empties (success) or a
-    /// full pass makes no progress (return the last error). The client-side
-    /// This retry pass is the client's alone — the engine has no `DROP SCHEMA
-    /// CASCADE` to mirror it. It requeues on **any** `Err`,
+    /// full pass makes no progress (return the last error). This retry pass is
+    /// the client's alone — the engine has no `DROP SCHEMA CASCADE` to mirror
+    /// it. It requeues on **any** `Err`,
     /// not just a dependency error: `ClientError` collapses every engine precheck
     /// rejection into `ServerError(String)` with no structured dependency
     /// variant, so progress — not error-string matching — is the robust
@@ -1307,7 +1288,8 @@ impl GnitzClient {
         let desc = self.resolve(&schema_name, &current_name)?.ok_or_else(not_found)?;
 
         if desc.class.is_view() {
-            let view_batch = self.scan_catalog(VIEW_TAB)?.ok_or_else(not_found)?;
+            let (_, view_batch, _) = self.session.scan(VIEW_TAB)?;
+            let view_batch = view_batch.ok_or_else(not_found)?;
             let vr = find_view_record_by_id(&view_batch, desc.tid)?.ok_or_else(not_found)?;
             let view_s = sys_schema(VIEW_TAB);
             let mut vb = ZSetBatch::new(view_s);
@@ -1319,7 +1301,8 @@ impl GnitzClient {
             }
             self.push_ddl(&[(VIEW_TAB, vb)])?;
         } else {
-            let tbl_batch = self.scan_catalog(TABLE_TAB)?.ok_or_else(not_found)?;
+            let (_, tbl_batch, _) = self.session.scan(TABLE_TAB)?;
+            let tbl_batch = tbl_batch.ok_or_else(not_found)?;
             let record = find_table_record_by_id(&tbl_batch, desc.tid)?.ok_or_else(not_found)?;
             let tbl_s = sys_schema(TABLE_TAB);
             let mut tb = ZSetBatch::new(tbl_s);
@@ -1547,7 +1530,7 @@ impl GnitzClient {
     /// missing row — or an entirely empty SCHEMA_TAB — is the one
     /// schema-qualified "not found" error every DDL/resolve path reports.
     fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
-        let batch = self.scan_catalog(SCHEMA_TAB)?;
+        let (_, batch, _) = self.session.scan(SCHEMA_TAB)?;
         match &batch {
             Some(b) => find_schema_id(b, schema_name)?,
             None => None,
@@ -1562,7 +1545,8 @@ impl GnitzClient {
     fn table_record(&mut self, schema_name: &str, table_name: &str) -> Result<TableRecord, ClientError> {
         let not_found = || ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found"));
         let tid = self.resolve(schema_name, table_name)?.ok_or_else(not_found)?.tid;
-        let batch = self.scan_catalog(TABLE_TAB)?.ok_or_else(not_found)?;
+        let (_, batch, _) = self.session.scan(TABLE_TAB)?;
+        let batch = batch.ok_or_else(not_found)?;
         find_table_record_by_id(&batch, tid)?.ok_or_else(not_found)
     }
 }
@@ -1629,16 +1613,11 @@ impl TxnBuffer {
     }
 
     /// Buffer a delete of `pks` from `tid` — `-1` rows with inert filler
-    /// payload, exactly as `GnitzClient::delete` builds them. Deletes buffer
-    /// into the tid's Update family (mode `Update`), so the "delete k; insert k"
-    /// replace idiom emits an Update family `[D(k)]` then an Error family
-    /// `[I(k)]` in order.
+    /// payload. Deletes buffer into the tid's Update family, so the
+    /// "delete k; insert k" replace idiom emits an Update family `[D(k)]` then
+    /// an Error family `[I(k)]` in order.
     pub fn delete(&mut self, tid: u64, schema: &Schema, pks: PkColumn) {
-        if pks.is_empty() {
-            return;
-        }
-        let batch = retraction_batch(schema, pks);
-        self.append(tid, schema, batch, WireConflictMode::Update);
+        self.append(tid, schema, retraction_batch(schema, pks), WireConflictMode::Update);
     }
 
     /// Record `tid` in the read-set (deduped). Called only when an RMW statement
@@ -2043,15 +2022,15 @@ mod tests {
         let s = kv_schema();
         let mut buf = TxnBuffer::default();
         let tid = 16u64;
-        buf.push(tid, &s, &ins(&s, 1, 10));
-        buf.push(tid, &s, &ins(&s, 2, 20));
+        buf.push_with_mode(tid, &s, &ins(&s, 1, 10), WireConflictMode::Update);
+        buf.push_with_mode(tid, &s, &ins(&s, 2, 20), WireConflictMode::Update);
         assert_eq!(buf.families.len(), 1, "same-mode pushes coalesce");
         assert_eq!(buf.families[0].batch.len(), 2);
         assert_eq!(buf.families[0].mode, WireConflictMode::Update);
         buf.push_with_mode(tid, &s, &ins(&s, 3, 30), WireConflictMode::Error);
         assert_eq!(buf.families.len(), 2, "mode change opens a new family");
         assert_eq!(buf.families[1].mode, WireConflictMode::Error);
-        buf.push(tid, &s, &ins(&s, 4, 40));
+        buf.push_with_mode(tid, &s, &ins(&s, 4, 40), WireConflictMode::Update);
         assert_eq!(
             buf.families.len(),
             3,
@@ -2066,7 +2045,12 @@ mod tests {
         let s = kv_schema();
         let mut buf = TxnBuffer::default();
         let tid = 16u64;
-        buf.delete(tid, &s, PkColumn::from_u128s(8, [7]));
+        buf.push_with_mode(
+            tid,
+            &s,
+            &retraction_batch(&s, PkColumn::from_u128s(8, [7])),
+            WireConflictMode::Update,
+        );
         buf.push_with_mode(tid, &s, &ins(&s, 7, 70), WireConflictMode::Error);
         assert_eq!(buf.families.len(), 2);
         assert_eq!(buf.families[0].mode, WireConflictMode::Update);
@@ -2080,9 +2064,9 @@ mod tests {
         // push(A), push(B), push(A) → A one family (2 rows), B one family.
         let s = kv_schema();
         let mut buf = TxnBuffer::default();
-        buf.push(16, &s, &ins(&s, 1, 1));
-        buf.push(17, &s, &ins(&s, 1, 1));
-        buf.push(16, &s, &ins(&s, 2, 2));
+        buf.push_with_mode(16, &s, &ins(&s, 1, 1), WireConflictMode::Update);
+        buf.push_with_mode(17, &s, &ins(&s, 1, 1), WireConflictMode::Update);
+        buf.push_with_mode(16, &s, &ins(&s, 2, 2), WireConflictMode::Update);
         assert_eq!(buf.families.len(), 2);
         assert_eq!(buf.families[0].tid, 16);
         assert_eq!(buf.families[0].batch.len(), 2);
@@ -2096,10 +2080,15 @@ mod tests {
         let s = kv_schema();
         let mut buf = TxnBuffer::default();
         let tid = 16u64;
-        buf.push(tid, &s, &ins(&s, 1, 10)); // new family 0, row 0
-        buf.push(tid, &s, &ins(&s, 2, 20)); // extends family 0, row 1
+        buf.push_with_mode(tid, &s, &ins(&s, 1, 10), WireConflictMode::Update); // new family 0, row 0
+        buf.push_with_mode(tid, &s, &ins(&s, 2, 20), WireConflictMode::Update); // extends family 0, row 1
         buf.push_with_mode(tid, &s, &ins(&s, 3, 30), WireConflictMode::Error); // family 1, row 0
-        buf.delete(tid, &s, PkColumn::from_u128s(8, [1])); // family 2, row 0 — supersedes pk=1
+        buf.push_with_mode(
+            tid,
+            &s,
+            &retraction_batch(&s, PkColumn::from_u128s(8, [1])),
+            WireConflictMode::Update,
+        ); // family 2, row 0 — supersedes pk=1
 
         let val = |pk: u64| {
             let (b, row) = buf.last_op(tid, &PkTuple::from_u128(8, pk as u128)).unwrap();

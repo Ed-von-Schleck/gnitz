@@ -15,7 +15,8 @@ use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
 use gnitz_core::protocol::{
-    hello_handshake, parse_response, send_message, ClientTransport, FLAG_CONTINUATION, STATUS_ERROR,
+    encode_message_parts, hello_handshake, parse_response, send_control, ClientTransport, FLAG_CONTINUATION,
+    STATUS_ERROR,
 };
 use gnitz_core::TableProps;
 use gnitz_core::{
@@ -48,6 +49,20 @@ fn client_with_table(target: &str) -> (GnitzClient, String, u64, std::sync::Arc<
         .unwrap();
     let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
     (client, sn, tid, schema)
+}
+
+/// Ship one cold PUSH frame over a raw transport, bypassing `Session`'s schema
+/// cache — these tests drive the wire, not the client's fast paths.
+fn send_push(
+    t: &mut ClientTransport,
+    tid: u64,
+    client_id: u64,
+    flags: u64,
+    schema: &Schema,
+    batch: &ZSetBatch,
+) -> Result<(), gnitz_core::protocol::ProtocolError> {
+    let parts = encode_message_parts(tid, client_id, flags, &PkTuple::EMPTY, 0, Some((schema, batch)));
+    t.send_framed_iov(&parts.segments())
 }
 
 /// Rows `(start + i, (start + i) * 3, 7)` for `count` rows.
@@ -358,20 +373,10 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         let n_pushes = 30usize;
         for i in 0..n_pushes {
             let batch = make_batch(&schema, (i * 25_000) as u64, 25_000);
-            send_message(
-                &mut t,
-                tid,
-                0xF00D,
-                push_flags,
-                &PkTuple::EMPTY,
-                0,
-                Some(&schema),
-                Some(&batch),
-            )
-            .unwrap();
+            send_push(&mut t, tid, 0xF00D, push_flags, &schema, &batch).unwrap();
         }
         // The scan whose response (~18 MB) exceeds the shrunken buffers.
-        send_message(&mut t, tid, 0xF00D, 0, &PkTuple::EMPTY, 0, None, None).unwrap();
+        send_control(&mut t, tid, 0xF00D, 0, 0, 0, &[]).unwrap();
 
         // Now read everything: n ACKs, then the scan train.
         for _ in 0..n_pushes {
@@ -444,7 +449,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
         hello_handshake(&mut t).unwrap();
         // Ask for the scan, then never read: the train stalls, pinning
         // connection_loop in its guarded send.
-        send_message(&mut t, tid, 0xB0BA, 0, &PkTuple::EMPTY, 0, None, None).unwrap();
+        send_control(&mut t, tid, 0xB0BA, 0, 0, 0, &[]).unwrap();
 
         // Pipeline ~80 MB of pushes; the pump queues them until the 64 MiB
         // cap trips and the recv side tears the connection down. The rows
@@ -455,18 +460,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
         let batch = make_batch(&schema, 0, 25_000); // ~1 MB/frame
         let mut sent = 0usize;
         for _ in 0..140 {
-            if send_message(
-                &mut t,
-                tid,
-                0xB0BA,
-                push_flags,
-                &PkTuple::EMPTY,
-                0,
-                Some(&schema),
-                Some(&batch),
-            )
-            .is_err()
-            {
+            if send_push(&mut t, tid, 0xB0BA, push_flags, &schema, &batch).is_err() {
                 break; // server already shut us down mid-burst — success path
             }
             sent += 1;
@@ -513,7 +507,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
         let mut t = ClientTransport::connect(&target).unwrap();
         set_small_bufs(t.as_raw_fd());
         hello_handshake(&mut t).unwrap();
-        send_message(&mut t, tid, 0xB0BA, 0, &PkTuple::EMPTY, 0, None, None).unwrap();
+        send_control(&mut t, tid, 0xB0BA, 0, 0, 0, &[]).unwrap();
         // Never read. Allow a few deadlines of slack.
         assert!(
             eviction_observed_within(&mut t, 8_000),

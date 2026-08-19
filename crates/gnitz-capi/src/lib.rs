@@ -177,6 +177,21 @@ macro_rules! check_ptr {
     }};
 }
 
+/// Deref a `*const GnitzSchema`, rejecting one whose columns are not yet added:
+/// `gnitz_schema_new` defers that check because columns arrive after it returns.
+/// Indexing `columns` by a PK index panics — for `gnitz_push` and `gnitz_scan` a
+/// whole crate away — and `panic = "abort"` makes that a dead host process.
+macro_rules! check_schema {
+    ($ptr:expr, $ret:expr) => {{
+        let s = &check_ptr!($ptr, $ret).0;
+        if let Err(e) = Schema::validate_parts(&s.pk_cols, &s.columns) {
+            set_error(e);
+            return $ret;
+        }
+        s
+    }};
+}
+
 macro_rules! check_ptr_mut {
     ($ptr:expr, $ret:expr) => {{
         if $ptr.is_null() {
@@ -280,13 +295,11 @@ pub unsafe extern "C" fn gnitz_schema_new(pk_count: u32, pk_cols: *const u32) ->
 }
 
 /// Returns the packed PK stride of the schema in bytes (sum of each PK
-/// column's wire stride). Returns 0 if `schema` is null.
+/// column's wire stride). Returns 0 if `schema` is null or its columns have not
+/// yet been added; `gnitz_last_error` says which.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_schema_pk_stride(schema: *const GnitzSchema) -> usize {
-    if schema.is_null() {
-        return 0;
-    }
-    unsafe { (*schema).0.pk_stride() }
+    check_schema!(schema, 0).pk_stride()
 }
 
 /// Append a column to the schema. type_code must be a GNITZ_TYPE_* constant.
@@ -339,15 +352,9 @@ pub unsafe extern "C" fn gnitz_schema_free(schema: *mut GnitzSchema) {
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_batch_new(schema: *const GnitzSchema) -> *mut GnitzBatch {
     clear_error();
-    let s = check_ptr!(schema, std::ptr::null_mut());
-    // Full schema admissibility (column cap, PK rules) — the first point where
-    // the complete column list exists. Implies PK stride ≤ MAX_PK_BYTES: at most
-    // PK_LIST_MAX_COLS eligible columns of wire stride ≤ 16 each.
-    if let Err(e) = Schema::validate_parts(&s.0.pk_cols, &s.0.columns) {
-        set_error(format!("gnitz_batch_new: {e}"));
-        return std::ptr::null_mut();
-    }
-    let schema_clone = s.0.clone();
+    // Admissibility implies PK stride ≤ MAX_PK_BYTES: at most PK_LIST_MAX_COLS
+    // eligible columns of wire stride ≤ 16 each.
+    let schema_clone = check_schema!(schema, std::ptr::null_mut()).clone();
     let batch = ZSetBatch::new(&schema_clone);
     Box::into_raw(Box::new(GnitzBatch::from_parts(schema_clone, batch)))
 }
@@ -420,39 +427,44 @@ fn append_row_inner(
     null_mask: u64,
     col_data: &[u8],
 ) -> Result<(), String> {
+    // Both rejections happen before the first push: mid-loop, they would leave a
+    // PK, a weight and a null word behind for a row whose columns are only
+    // partly written. A longer `col_data` is accepted and its tail ignored.
+    let mut need = 0usize;
+    for (_, ci, col) in b.schema.payload_columns() {
+        match col.type_code {
+            TypeCode::Blob => return Err(format!("col {ci} is a BLOB column; not supported by the C row writer")),
+            TypeCode::String => {}
+            tc => need += tc.wire_stride(),
+        }
+    }
+    if col_data.len() < need {
+        return Err(format!(
+            "col_data too short: need {need} bytes, have {}",
+            col_data.len()
+        ));
+    }
+
     b.batch.pks.push_tuple(&pk);
     b.batch.weights.push(weight);
     b.batch.nulls.push(null_mask);
 
     let mut offset = 0usize;
-
-    for ci in 0..b.batch.columns.len() {
-        if b.schema.is_pk_col(ci) {
-            continue;
-        }
-        let tc = b.schema.columns[ci].type_code;
-        let stride = tc.wire_stride();
+    for (pi, ci, col) in b.schema.payload_columns() {
+        let stride = col.type_code.wire_stride();
         match &mut b.batch.columns[ci] {
             ColData::Fixed(buf) => {
-                if offset + stride > col_data.len() {
-                    return Err(format!(
-                        "col_data too short at col {}: need {} bytes, have {}",
-                        ci,
-                        stride,
-                        col_data.len().saturating_sub(offset)
-                    ));
-                }
                 buf.extend_from_slice(&col_data[offset..offset + stride]);
                 offset += stride;
             }
-            ColData::Strings(v) => {
-                v.push(None); // placeholder; caller fills via gnitz_batch_set_string
-            }
-            ColData::Bytes(_) => {
-                return Err(format!(
-                    "col {ci} is a BLOB column; not yet supported in C API row writer"
-                ));
-            }
+            // Until `gnitz_batch_set_string` rewrites both, the caller's mask is
+            // what says whether this cell holds a value.
+            ColData::Strings(v) => v.push(if gnitz_core::null_word_get(null_mask, pi) {
+                None
+            } else {
+                Some(String::new())
+            }),
+            ColData::Bytes(_) => unreachable!("BLOB columns are rejected by the pre-scan above"),
         }
     }
     Ok(())
@@ -501,12 +513,18 @@ pub unsafe extern "C" fn gnitz_batch_set_string(batch: *mut GnitzBatch, col_idx:
     match &mut b.batch.columns[col_idx] {
         ColData::Strings(v) => {
             let n_rows = b.batch.pks.len();
+            let Some(row) = n_rows.checked_sub(1) else {
+                set_error("no row to set: call gnitz_batch_append_row first");
+                return -1;
+            };
             if v.len() == n_rows {
-                // Overwrite the None placeholder left by append_row_inner.
-                // Invalidate any cached CString so subsequent get_string returns
-                // the new value, not the pre-overwrite one.
-                *v.last_mut().expect("v non-empty: v.len() == n_rows >= 1") = s;
-                b.cstring_cache.borrow_mut().remove(&(col_idx, n_rows - 1));
+                // The cell and its null bit are one fact, and the bitmap is the
+                // half the wire encoder reads: writing either alone lets the two
+                // NULL channels disagree.
+                gnitz_core::null_word_set(&mut b.batch.nulls[row], b.schema.payload_idx(col_idx), s.is_none());
+                v[row] = s;
+                // The placeholder is gone; so must any CString cached against it.
+                b.cstring_cache.borrow_mut().remove(&(col_idx, row));
                 0
             } else {
                 set_error(format!(
@@ -790,9 +808,9 @@ pub unsafe extern "C" fn gnitz_push(
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
-    let s = check_ptr!(schema, -1);
+    let sch = check_schema!(schema, -1);
     let b = check_ptr!(batch, -1);
-    match c.0.push(table_id, &s.0, &b.batch) {
+    match c.0.push(table_id, sch, &b.batch) {
         Ok(_) => 0,
         Err(e) => set_classified_error(&e),
     }
@@ -814,8 +832,10 @@ pub unsafe extern "C" fn gnitz_scan(
     let c = check_ptr_mut!(conn, std::ptr::null_mut());
     match c.0.scan(table_id) {
         Ok((server_schema, data, _)) => {
+            // A NULL `schema` is a documented, legitimate input meaning "use the
+            // server's"; only a supplied one is checked.
             let used_schema = if !schema.is_null() {
-                unsafe { (*schema).0.clone() }
+                check_schema!(schema, std::ptr::null_mut()).clone()
             } else if let Some(ss) = server_schema {
                 (*ss).clone()
             } else {
@@ -848,12 +868,8 @@ pub unsafe extern "C" fn gnitz_delete(
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
-    let s = check_ptr!(schema, -1);
-    let stride = s.0.pk_stride();
-    if stride == 0 {
-        set_error("gnitz_delete: schema has no primary-key columns or zero-stride PK");
-        return -1;
-    }
+    let sch = check_schema!(schema, -1);
+    let stride = sch.pk_stride();
     if n_rows > 0 && pks_bytes.is_null() {
         set_error("pks_bytes is null");
         return -1;
@@ -867,11 +883,11 @@ pub unsafe extern "C" fn gnitz_delete(
     } else {
         &[]
     };
-    let mut pk_col = gnitz_core::PkColumn::empty_for_schema(&s.0);
+    let mut pk_col = gnitz_core::PkColumn::empty_for_schema(sch);
     for chunk in flat.chunks_exact(stride) {
         pk_col.push_tuple(&gnitz_core::PkTuple::from_bytes(chunk));
     }
-    match c.0.delete(table_id, &s.0, pk_col) {
+    match c.0.delete(table_id, sch, pk_col) {
         Ok(()) => 0,
         Err(e) => set_classified_error(&e),
     }
@@ -2202,6 +2218,119 @@ mod tests {
 
             gnitz_batch_free(b);
             gnitz_schema_free(sch);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // NULL-channel agreement: the bitmap and the stored cell are one fact
+    // -----------------------------------------------------------------
+
+    /// Build a batch over `cols` (PK = column 0), run `f`, free both handles.
+    unsafe fn with_batch(cols: &[(&str, u32, bool)], f: impl FnOnce(*mut GnitzBatch)) {
+        let sch = build_schema(&[0], cols);
+        let b = gnitz_batch_new(sch);
+        assert!(!b.is_null());
+        f(b);
+        gnitz_batch_free(b);
+        gnitz_schema_free(sch);
+    }
+
+    const ID_AND_NAME: [(&str, u32, bool); 2] = [("id", GNITZ_TYPE_U64, false), ("name", GNITZ_TYPE_STRING, true)];
+
+    /// A capi-built batch exposes NULL twice — `gnitz_batch_is_null` reads the
+    /// bitmap, `gnitz_batch_get_string` reads the cell — and the wire encoder
+    /// follows the bitmap. They must agree however the caller writes the column.
+    #[test]
+    fn string_null_bitmap_and_cell_agree() {
+        // (null_mask, set_string called?, its argument, expected cell)
+        let cases = [
+            (0, true, None, None),           // mask non-null, set_string writes NULL
+            (0, false, None, Some("")),      // mask non-null, never set: empty, not NULL
+            (1, true, Some("x"), Some("x")), // mask null, set_string writes a value
+            (1, false, None, None),          // mask null, never set
+        ];
+        unsafe {
+            let pk: u64 = 1;
+            for (mask, call_set, arg, want) in cases {
+                let ctx = format!("mask={mask} call_set={call_set} arg={arg:?}");
+                with_batch(&ID_AND_NAME, |b| {
+                    let rc = gnitz_batch_append_row(b, &pk as *const u64 as *const u8, 1, mask, std::ptr::null(), 0);
+                    assert_eq!(rc, 0, "{ctx}");
+                    if call_set {
+                        let cs = arg.map(|s| CString::new(s).unwrap());
+                        let ptr = cs.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+                        assert_eq!(gnitz_batch_set_string(b, 1, ptr), 0, "{ctx}");
+                    }
+                    let got = gnitz_batch_get_string(b, 1, 0);
+                    assert_eq!(got.is_null(), want.is_none(), "cell: {ctx}");
+                    if let Some(w) = want {
+                        assert_eq!(CStr::from_ptr(got).to_str().unwrap(), w);
+                    }
+                    assert_eq!(gnitz_batch_is_null(b, 1, 0), i32::from(want.is_none()), "bitmap: {ctx}");
+                });
+            }
+        }
+    }
+
+    /// `gnitz_batch_set_string` with no row appended has no cell to write. It
+    /// must say so, not abort the host process.
+    #[test]
+    fn set_string_on_empty_batch_errors() {
+        unsafe {
+            with_batch(&ID_AND_NAME, |b| {
+                let val = CString::new("x").unwrap();
+                assert_eq!(gnitz_batch_set_string(b, 1, val.as_ptr()), -1);
+                assert_eq!(gnitz_batch_len(b), 0);
+            });
+        }
+    }
+
+    /// A schema may legitimately name PK column 0 before any column is added —
+    /// `gnitz_schema_new` defers that check. Indexing `columns` by a PK index
+    /// then panics, and `panic = "abort"` makes that a dead host process. These
+    /// two entry points are the ones reachable without a live connection;
+    /// `gnitz_push`, `gnitz_scan` and `gnitz_delete` share their `check_schema!`.
+    #[test]
+    fn incomplete_schema_is_rejected_not_panicked() {
+        unsafe {
+            let pk_cols: [u32; 1] = [0];
+            let sch = gnitz_schema_new(1, pk_cols.as_ptr());
+            assert!(!sch.is_null());
+            assert_eq!(gnitz_schema_pk_stride(sch), 0, "no column can satisfy PK index 0");
+            assert!(gnitz_batch_new(sch).is_null());
+
+            // Adding the column it names makes the same schema admissible.
+            let cname = CString::new("id").unwrap();
+            assert_eq!(gnitz_schema_add_col(sch, cname.as_ptr(), GNITZ_TYPE_U64 as c_int, 0), 0);
+            assert_eq!(gnitz_schema_pk_stride(sch), 8);
+            gnitz_schema_free(sch);
+        }
+    }
+
+    /// A rejected row must leave the batch exactly as it was — no PK, no weight,
+    /// no null word, no column bytes for a row whose columns were never written.
+    #[test]
+    fn append_row_rejection_leaves_no_torn_row() {
+        unsafe {
+            let (pk, a): (u64, u64) = (1, 7);
+            // `col_data` covers "a" only: too short for a third Fixed column, and
+            // unusable for a BLOB the C row writer cannot serve at all.
+            for third in [("b", GNITZ_TYPE_U64, false), ("body", GNITZ_TYPE_BLOB, true)] {
+                let cols = [("id", GNITZ_TYPE_U64, false), ("a", GNITZ_TYPE_U64, false), third];
+                with_batch(&cols, |b| {
+                    let pk_ptr = &pk as *const u64 as *const u8;
+                    let rc = gnitz_batch_append_row(b, pk_ptr, 1, 0, &a as *const u64 as *const c_void, 8);
+                    assert_eq!(rc, -1, "{third:?}");
+                    assert_eq!(gnitz_batch_len(b), 0);
+                    let br = &*b;
+                    assert_eq!(br.batch.weights.len(), 0);
+                    assert_eq!(br.batch.nulls.len(), 0);
+                    let ColData::Fixed(buf) = &br.batch.columns[1] else {
+                        panic!("col 1 should be Fixed");
+                    };
+                    assert_eq!(buf.len(), 0, "no column may be written when the row is rejected");
+                });
+            }
         }
     }
 }

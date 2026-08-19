@@ -68,7 +68,7 @@ fn read_64bit_region<T: Copy>(
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Frame the batch's §6 region list ([`ViewBuffers::regions`]) into a WAL block.
-pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
+pub(crate) fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
     let mut bufs = ViewBuffers::default();
     let regions = bufs.regions(batch, schema);
     // Size the output to exactly one block, then frame in place, so encode never
@@ -87,7 +87,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
 /// runs over a trusted stream (OS-delivered Unix socket bytes or a TLS
 /// record layer) where transport integrity is already guaranteed. Use
 /// [`decode_wal_block_verified`] where the checksum itself is under test.
-pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
+pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
     decode_wal_block_impl(data, schema, false)
 }
 
@@ -641,21 +641,20 @@ mod tests {
     }
 
     // ── wide compound-PK roundtrips ────────────────────────────────────────
-    //
-    // The SQL planner still rejects compound PRIMARY KEY, so these schemas are
-    // hand-built via the pk_cols field. The wide-PK ZSetBatch is a struct
-    // literal (ZSetBatch::new debug-asserts pk_count == 1).
 
     /// `(U64, U128)` compound PK + one I64 payload column. pk_stride == 24.
+    /// Through `from_parts`, so the fixture also witnesses that the client
+    /// admits this schema.
     fn wide24_schema() -> Schema {
-        Schema {
-            columns: vec![
+        Schema::from_parts(
+            vec![
                 ColumnDef::new("pk0", TypeCode::U64, false),
                 ColumnDef::new("pk1", TypeCode::U128, false),
                 ColumnDef::new("v", TypeCode::I64, true),
             ],
-            pk_cols: vec![0, 1],
-        }
+            vec![0, 1],
+        )
+        .expect("arity-2 compound PK of non-nullable integer columns")
     }
 
     /// Pack one `(u64, u128)` PK tuple into 24 on-wire LE bytes.
@@ -728,17 +727,20 @@ mod tests {
 
     #[test]
     fn pk_stride_wal_roundtrip_bytes_64() {
-        // Maximum user pk_stride: four U128 PK columns = 64 bytes/row.
-        let schema = Schema {
-            columns: vec![
+        // Maximum user pk_stride: four U128 PK columns = 64 bytes/row. Through
+        // `from_parts`, so the fixture proves the client admits that schema
+        // rather than only asserting the stride it produces.
+        let schema = Schema::from_parts(
+            vec![
                 ColumnDef::new("a", TypeCode::U128, false),
                 ColumnDef::new("b", TypeCode::U128, false),
                 ColumnDef::new("c", TypeCode::U128, false),
                 ColumnDef::new("d", TypeCode::U128, false),
                 ColumnDef::new("v", TypeCode::I64, false),
             ],
-            pk_cols: vec![0, 1, 2, 3],
-        };
+            vec![0, 1, 2, 3],
+        )
+        .expect("PK_LIST_MAX_COLS U128 columns is the widest admissible user PK");
         assert_eq!(schema.pk_stride(), 64);
 
         let rows: [[u128; 4]; 3] = [

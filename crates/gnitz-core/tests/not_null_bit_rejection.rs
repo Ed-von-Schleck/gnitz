@@ -32,15 +32,7 @@ fn unique_schema() -> String {
 /// `Session::push_with_mode`'s client-side `ZSetBatch::validate`.
 fn hostile_push(session: &mut Session, tid: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, String> {
     let flags = gnitz_core::protocol::wire_flags_set_conflict_mode(FLAG_PUSH, WireConflictMode::Update);
-    let parts = encode_message_parts(
-        tid,
-        session.client_id,
-        flags,
-        &PkTuple::EMPTY,
-        0,
-        Some(schema),
-        Some(batch),
-    );
+    let parts = encode_message_parts(tid, session.client_id, flags, &PkTuple::EMPTY, 0, Some((schema, batch)));
     session.send_batch(&[parts]).map_err(|e| e.to_string())?;
     session.recv_push_ack(tid).map_err(|e| e.to_string())
 }

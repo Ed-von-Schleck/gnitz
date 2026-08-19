@@ -101,7 +101,7 @@ impl ClientTransport {
     /// of up to [`FRAME_SEGMENTS`] byte segments (one length prefix over their
     /// concatenation), so callers can ship pre-split message blocks without
     /// flattening.
-    pub fn send_framed_batch<F: FrameSegments>(&mut self, frames: &[F]) -> Result<(), ProtocolError> {
+    pub(crate) fn send_framed_batch<F: FrameSegments>(&mut self, frames: &[F]) -> Result<(), ProtocolError> {
         self.frames_sent += frames.len() as u64;
         match &mut self.inner {
             Inner::Unix(fd) => send_framed_batch(fd.as_raw_fd(), frames),
@@ -202,12 +202,12 @@ fn recv_exact(sock_fd: RawFd, buf: &mut [u8]) -> Result<(), ProtocolError> {
 
 /// Maximum number of byte segments one `send_framed_batch` frame may carry:
 /// control + schema + data blocks.
-pub const FRAME_SEGMENTS: usize = 3;
+pub(crate) const FRAME_SEGMENTS: usize = 3;
 
 /// A frame for [`ClientTransport::send_framed_batch`]: up to
 /// [`FRAME_SEGMENTS`] byte segments sent under ONE length prefix (computed
 /// over their concatenation). Zero-length segments are skipped.
-pub trait FrameSegments {
+pub(crate) trait FrameSegments {
     fn segments(&self) -> [&[u8]; FRAME_SEGMENTS];
 }
 

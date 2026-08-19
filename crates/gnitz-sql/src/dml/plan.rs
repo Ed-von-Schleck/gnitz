@@ -289,11 +289,14 @@ pub(crate) fn fetch_bound(
     sink: &ReadSink,
     reply_schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let mut out = ZSetBatch::new(reply_schema);
+    let mut out: Option<ZSetBatch> = None;
     let mut send = |client: &mut GnitzClient, bound: &ReadBound| -> Result<(), GnitzSqlError> {
         let blob = ReadSpec::encode_parts(bound, &plan.predicate, sink);
         if let Some(batch) = client.scan_spec(table_id, &blob, reply_schema)? {
-            out.extend_from_owned(batch);
+            match out.as_mut() {
+                Some(acc) => acc.extend_from_owned(batch),
+                None => out = Some(batch),
+            }
         }
         Ok(())
     };
@@ -305,7 +308,7 @@ pub(crate) fn fetch_bound(
         }
         bound => send(client, bound)?,
     }
-    Ok(out)
+    Ok(out.unwrap_or_else(|| ZSetBatch::new(reply_schema)))
 }
 
 // ---------------------------------------------------------------------------

@@ -5,12 +5,12 @@ use crate::error::ClientError;
 use crate::protocol::codec::encode_schema_block;
 use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
 use crate::protocol::{
-    encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, recv_message, send_message,
-    send_message_with_extra, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
-    wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError, Schema, WireConflictMode,
-    ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
-    FLAG_CONTINUATION, FLAG_PUSH, FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_ERROR,
-    STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, recv_message, send_control,
+    wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version, ClientTransport,
+    Message, PkTuple, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
+    FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_PUSH,
+    FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK,
+    STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use gnitz_wire::RelDescriptorBlob;
 use lru::LruCache;
@@ -23,16 +23,18 @@ pub use gnitz_wire::{
 /// working set of tables/views without unbounded growth.
 const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
 
-/// `(schema, data_batch, lsn)` returned by a `scan`/`seek`/`seek_by_index`:
-/// the (cached) `Schema`, the materialised `ZSetBatch` if any rows came back,
-/// and the server LSN at which the read was served.
-pub type ScanResult = Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError>;
+/// One relation's reply to a `scan`/`seek`/`seek_by_index`: the (cached)
+/// `Schema`, the materialised `ZSetBatch` if any rows came back, and the server
+/// LSN at which the read was served.
+pub type ScanReply = (Option<Arc<Schema>>, Option<ZSetBatch>, u64);
 
-/// The N per-relation results of a `scan_multi`, in request order. Each tuple is
-/// shaped exactly like a single [`ScanResult`]'s inner triple `(schema,
-/// data_batch, lsn)`. Every relation was snapshotted at the same server-side SAL
-/// cut, so an atomic multi-table commit is never torn across the result set.
-pub type MultiScanResult = Result<Vec<(Option<Arc<Schema>>, Option<ZSetBatch>, u64)>, ClientError>;
+/// The single-relation read result.
+pub type ScanResult = Result<ScanReply, ClientError>;
+
+/// The N per-relation results of a `scan_multi`, in request order. Every
+/// relation was snapshotted at the same server-side SAL cut, so an atomic
+/// multi-table commit is never torn across the result set.
+pub type MultiScanResult = Result<Vec<ScanReply>, ClientError>;
 
 /// Generate a session-unique client ID.
 ///
@@ -111,7 +113,7 @@ impl Session {
         let mut transport = ClientTransport::connect(target)?;
         // Run the HELLO handshake before any data flows. The server
         // accepts the first frame at an 8-byte limit, so this must
-        // happen before `send_message` would emit a control block.
+        // happen before a control block would be emitted.
         let (limit, published_lsn) = hello_handshake(&mut transport)?;
         let session = Session {
             transport,
@@ -136,17 +138,17 @@ impl Session {
     }
 
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
-        let msg = self.roundtrip(0, FLAG_ALLOCATE_TABLE_ID, 0, None, None)?;
+        let msg = self.roundtrip(0, FLAG_ALLOCATE_TABLE_ID, 0)?;
         Ok(msg.target_id)
     }
 
     pub fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
-        let msg = self.roundtrip(0, FLAG_ALLOCATE_SCHEMA_ID, 0, None, None)?;
+        let msg = self.roundtrip(0, FLAG_ALLOCATE_SCHEMA_ID, 0)?;
         Ok(msg.target_id)
     }
 
     pub fn alloc_index_id(&mut self) -> Result<u64, ClientError> {
-        let msg = self.roundtrip(0, FLAG_ALLOCATE_INDEX_ID, 0, None, None)?;
+        let msg = self.roundtrip(0, FLAG_ALLOCATE_INDEX_ID, 0)?;
         Ok(msg.target_id)
     }
 
@@ -156,7 +158,7 @@ impl Session {
     /// `target_id = seq_table_id ≠ 0` steers the master to the durable
     /// range-advance branch.
     pub fn alloc_serial_range(&mut self, seq_table_id: u64, count: u64) -> Result<u64, ClientError> {
-        let msg = self.roundtrip(seq_table_id, FLAG_ALLOCATE_SERIAL_RANGE, count, None, None)?;
+        let msg = self.roundtrip(seq_table_id, FLAG_ALLOCATE_SERIAL_RANGE, count)?;
         Ok(msg.target_id) // base of [base, base + count)
     }
 
@@ -272,15 +274,15 @@ impl Session {
     /// on a warm-cache hit (matching push/scan).
     fn seek_roundtrip(&mut self, target_id: u64, base_flag: u64, pk: &PkTuple, seek_col_idx: u64) -> ScanResult {
         let flags = self.versioned_flags(target_id, base_flag);
-        send_message(
+        let (seek_pk, seek_pk_extra) = pk.split_wire();
+        send_control(
             &mut self.transport,
             target_id,
             self.client_id,
             flags,
-            pk,
+            seek_pk,
             seek_col_idx,
-            None,
-            None,
+            seek_pk_extra,
         )?;
         let msg = self.recv_checked(target_id)?;
         self.recover_schema(target_id, msg)
@@ -291,7 +293,7 @@ impl Session {
     }
 
     pub fn seek_by_index(&mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128]) -> ScanResult {
-        // `send_message`'s `split_wire` routes slot 0 → seek_pk and slots 1..K →
+        // `seek_roundtrip`'s `split_wire` routes slot 0 → seek_pk and slots 1..K →
         // seek_pk_extra, where the worker reassembles them with
         // `unpack_index_key_slots`. Arity is validated upstream in
         // `GnitzClient::seek_by_index` (the one choke point for every binding).
@@ -323,13 +325,14 @@ impl Session {
             RelTarget::Name(q) => (0, q),
             RelTarget::Id(tid) => (tid, ""),
         };
-        // The name rides an explicit extra blob: `send_message` would derive one
-        // from `PkTuple::split_wire` and silently truncate past `MAX_PK_BYTES`.
-        send_message_with_extra(
+        // The name rides an explicit extra blob rather than a `PkTuple`, whose
+        // `split_wire` would silently truncate it past `MAX_PK_BYTES`.
+        send_control(
             &mut self.transport,
             target_id,
             self.client_id,
             FLAG_RESOLVE,
+            0,
             0,
             qname.as_bytes(),
         )?;
@@ -371,13 +374,13 @@ impl Session {
     /// owns, so no hint is threaded back.
     pub fn pack_scan(&self, target_id: u64) -> MessageParts {
         let flags = self.versioned_flags(target_id, 0);
-        encode_message_parts(target_id, self.client_id, flags, &PkTuple::EMPTY, 0, None, None)
+        encode_message_parts(target_id, self.client_id, flags, &PkTuple::EMPTY, 0, None)
     }
 
     /// Pack a point-seek request with the cached schema version.
     pub fn pack_seek(&self, target_id: u64, pk: &PkTuple) -> MessageParts {
         let flags = self.versioned_flags(target_id, FLAG_SEEK);
-        encode_message_parts(target_id, self.client_id, flags, pk, 0, None, None)
+        encode_message_parts(target_id, self.client_id, flags, pk, 0, None)
     }
 
     /// Pack a SCAN_MULTI request (control-only), stamping each relation with its
@@ -413,11 +416,10 @@ impl Session {
     /// consumers must not assume unique `(PK, payload)`. The sum is correct because
     /// the replies partition the relation: each entry lives in one worker's store,
     /// and a replicated relation's read goes to worker 0 alone.
-    #[allow(clippy::type_complexity)] // the (schema, data, terminal seek_pk) reply tuple
     fn drain_reply_train(
         &mut self,
         mut recv_one: impl FnMut(&mut Self) -> Result<Message, ClientError>,
-    ) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>, u64), ClientError> {
+    ) -> Result<ScanReply, ClientError> {
         let mut schema: Option<Arc<Schema>> = None;
         let mut data: Option<ZSetBatch> = None;
         let lsn: u64 = loop {
@@ -462,11 +464,12 @@ impl Session {
     ) -> Result<Option<ZSetBatch>, ClientError> {
         let block = encode_schema_block(reply_schema, target_id as u32);
         let extra = gnitz_wire::pack_scan_spec_extra(spec, &block);
-        send_message_with_extra(
+        send_control(
             &mut self.transport,
             target_id,
             self.client_id,
             FLAG_SCAN_SPEC,
+            0,
             0,
             &extra,
         )?;
@@ -579,23 +582,15 @@ impl Session {
         check_response(msg)
     }
 
-    fn roundtrip(
-        &mut self,
-        target_id: u64,
-        flags: u64,
-        seek_col_idx: u64,
-        schema: Option<&Schema>,
-        data: Option<&ZSetBatch>,
-    ) -> Result<Message, ClientError> {
-        send_message(
+    fn roundtrip(&mut self, target_id: u64, flags: u64, seek_col_idx: u64) -> Result<Message, ClientError> {
+        send_control(
             &mut self.transport,
             target_id,
             self.client_id,
             flags,
-            &PkTuple::EMPTY,
+            0,
             seek_col_idx,
-            schema,
-            data,
+            &[],
         )?;
         // Alloc roundtrips carry no schema blocks; recv_message without a hint is sufficient.
         let msg = recv_message(&mut self.transport, None, self.max_payload_len)?;
@@ -638,8 +633,7 @@ impl Session {
                 base_flags,
                 &PkTuple::EMPTY,
                 0,
-                Some(schema),
-                Some(batch),
+                Some((schema, batch)),
             )
         };
         let warm_version: Option<u16> = match self.schema_cache.peek(&target_id) {
@@ -707,7 +701,6 @@ mod tests {
             target_id: 0,
             flags: 0,
             seek_pk: 0,
-            seek_col_idx: 0,
             schema: None,
             data_batch: None,
             error_text,

@@ -281,6 +281,9 @@ impl Schema {
     /// secondary-index schema that uses the extra `MAX_PK_COLUMNS` slot, so a
     /// PK they accept must round-trip through the codec.
     pub fn validate_pk_cols(pk_cols: &[usize], ncols: usize) -> Result<(), String> {
+        // Saturate rather than cast: the narrowing happens *before*
+        // `validate_pk_indices` compares against `ncols`, so a plain `as u32`
+        // would wrap an index of exactly 2^32 to 0 and let it pass.
         let idx: Vec<u32> = pk_cols.iter().map(|&c| c.min(u32::MAX as usize) as u32).collect();
         gnitz_wire::validate_pk_indices(&idx, ncols).map_err(|r| r.to_string())
     }
@@ -747,6 +750,18 @@ impl ColData {
             ColData::Bytes(v) => v.push(Some(Vec::new())),
         }
     }
+
+    /// `count` filler cells in one allocation — the bulk [`Self::push_filler`],
+    /// dispatched through [`Self::empty_for`] so the TypeCode→variant table stays
+    /// defined once. `vec!`'s `SpecFromElem` reaches `alloc_zeroed`, a library
+    /// specialisation that holds at `opt-level=0` where a fill loop would not.
+    pub(crate) fn filled(tc: TypeCode, count: usize) -> Self {
+        match Self::empty_for(tc) {
+            ColData::Fixed(_) => ColData::Fixed(vec![0u8; count * tc.wire_stride()]),
+            ColData::Strings(_) => ColData::Strings(vec![Some(std::string::String::new()); count]),
+            ColData::Bytes(_) => ColData::Bytes(vec![Some(Vec::new()); count]),
+        }
+    }
 }
 
 /// The single read/write convention for the payload null bitmap (bit `pi` = the
@@ -757,8 +772,9 @@ pub use gnitz_wire::{null_word_get, null_word_set};
 
 #[cold]
 #[inline(never)]
+#[track_caller]
 fn variant_mismatch() -> ! {
-    panic!("ColData::push_row_from: source and destination column variants differ");
+    panic!("ColData: source and destination column variants differ");
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -786,23 +802,14 @@ impl ZSetBatch {
     /// `delete` uses `count > 0` as inert payload filler for retraction rows
     /// (the server's `retract_pk` matches by PK alone, so an empty `Some` value
     /// encoding to zero bytes under the all-present null bitmap is fine).
-    pub fn filler_columns(schema: &Schema, count: usize) -> Vec<ColData> {
+    pub(crate) fn filler_columns(schema: &Schema, count: usize) -> Vec<ColData> {
         schema
             .columns
             .iter()
             .enumerate()
-            .map(|(ci, col)| {
-                if schema.is_pk_col(ci) {
-                    ColData::Fixed(vec![])
-                } else {
-                    let mut cd = ColData::empty_for(col.type_code);
-                    cd.reserve(col.type_code, count);
-                    for _ in 0..count {
-                        cd.push_filler(col.type_code);
-                    }
-                    cd
-                }
-            })
+            // A PK column's payload slot is an empty placeholder whatever `count`
+            // is: its values live in the OPK region.
+            .map(|(ci, col)| ColData::filled(col.type_code, if schema.is_pk_col(ci) { 0 } else { count }))
             .collect()
     }
 
@@ -831,8 +838,8 @@ impl ZSetBatch {
 
     /// Whether column `ci` is SQL NULL at `row`: a PK column is never NULL;
     /// a payload column reads its bit from the null bitmap — the single NULL
-    /// source across every `ColData` variant (a `Fixed`/`U128s` NULL is
-    /// zero-filled filler with no per-value sentinel).
+    /// source across every `ColData` variant (a `Fixed` NULL is zero-filled
+    /// filler with no per-value sentinel).
     #[inline]
     pub fn is_null(&self, schema: &Schema, row: usize, ci: usize) -> bool {
         !schema.is_pk_col(ci) && null_word_get(self.nulls[row], schema.payload_idx(ci))
@@ -1252,7 +1259,7 @@ mod tests {
             columns: ZSetBatch::filler_columns(&schema, count),
         };
         batch.validate(&schema).expect("filler batch must validate");
-        let _ = crate::protocol::encode_wal_block(&schema, 7, &batch);
+        let _ = crate::protocol::wal_block::encode_wal_block(&schema, 7, &batch);
     }
 
     #[test]

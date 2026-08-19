@@ -92,9 +92,9 @@ fn a_view_resolves_as_a_view_and_fails_the_base_table_probe() {
     );
 }
 
-/// A name longer than the 16-byte `PkTuple` head must survive the request. This
-/// is the `send_message_with_extra` guard: the `send_message` path derives the
-/// blob from `PkTuple::split_wire`, which would truncate it.
+/// A name longer than the 16-byte `PkTuple` head must survive the request: it
+/// rides `send_control`'s explicit extra blob, because deriving one from
+/// `PkTuple::split_wire` would truncate it past that type's 64-byte cap.
 #[test]
 fn a_long_relation_name_round_trips() {
     let Some(srv) = ServerHandle::start() else { return };

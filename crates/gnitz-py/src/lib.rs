@@ -2248,8 +2248,7 @@ impl PyAsyncTransport {
                 gnitz_core::FLAG_PUSH,
                 &gnitz_core::PkTuple::EMPTY,
                 0,
-                Some(schema),
-                Some(b),
+                Some((schema, b)),
             )
         });
         self.enqueue(py, IoOp::Push { parts, target_id }, false)

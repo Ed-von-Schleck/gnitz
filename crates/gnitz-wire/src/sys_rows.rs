@@ -401,39 +401,55 @@ mod tests {
         assert!(r.closed);
     }
 
+    /// Every `ColTabRow` field landed in its named payload slot. The expectation
+    /// is read off the struct, so the check cannot itself transpose a pair.
+    fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
+        let mut rec = Recorder::default();
+        write_col_tab_row(&mut rec, r, weight).unwrap();
+        assert_eq!(rec.pk, pack_col_id(r.owner_id, r.col_idx).unwrap() as u128);
+        assert_eq!(rec.weight, weight);
+        assert_eq!(rec.vals[COLTAB_PAY_OWNER_ID], Val::U64(r.owner_id));
+        assert_eq!(rec.vals[COLTAB_PAY_OWNER_KIND], Val::U64(r.owner_kind));
+        assert_eq!(rec.vals[COLTAB_PAY_COL_IDX], Val::U64(r.col_idx));
+        assert_eq!(rec.vals[COLTAB_PAY_NAME], Val::Str(r.name.into()));
+        assert_eq!(rec.vals[COLTAB_PAY_TYPE_CODE], Val::U64(r.type_code));
+        assert_eq!(rec.vals[COLTAB_PAY_IS_NULLABLE], Val::U64(r.is_nullable as u64));
+        assert_eq!(rec.vals[COLTAB_PAY_FK_TABLE_ID], Val::U64(r.fk_table_id));
+        assert_eq!(rec.vals[COLTAB_PAY_FK_COL_IDX], Val::U64(r.fk_col_idx));
+        assert_eq!(rec.vals[COLTAB_PAY_IS_SERIAL], Val::U64(r.is_serial as u64));
+        assert_eq!(rec.vals[COLTAB_PAY_IS_HIDDEN], Val::U64(r.is_hidden as u64));
+    }
+
     /// Each value must land in the payload slot the readers look for it in.
     #[test]
     fn values_land_in_their_named_payload_slots() {
-        let mut r = Recorder::default();
-        write_col_tab_row(
-            &mut r,
+        // Distinct values per u64 field, and `owner_kind` a sentinel no boolean
+        // can take — it reaches the writer as a plain u64.
+        let witness = ColTabRow {
+            owner_id: 16,
+            owner_kind: 7,
+            col_idx: 2,
+            name: "score",
+            type_code: 10,
+            is_nullable: true,
+            fk_table_id: 17,
+            fk_col_idx: 3,
+            is_serial: true,
+            is_hidden: false,
+        };
+        assert_col_tab_slots(&witness, -1);
+        // A second row for the booleans alone: one row cannot separate three
+        // fields drawn from {0,1}. These codes are pairwise distinct —
+        // is_nullable (1,0), is_serial (1,1), is_hidden (0,1) — where the
+        // tempting complementary row would leave the first and last sharing (1,0).
+        assert_col_tab_slots(
             &ColTabRow {
-                owner_id: 16,
-                owner_kind: 1,
-                col_idx: 2,
-                name: "score",
-                type_code: 10,
-                is_nullable: true,
-                fk_table_id: 17,
-                fk_col_idx: 3,
-                is_serial: false,
+                is_nullable: false,
                 is_hidden: true,
+                ..witness
             },
-            -1,
-        )
-        .unwrap();
-        assert_eq!(r.pk, pack_col_id(16, 2).unwrap() as u128);
-        assert_eq!(r.weight, -1);
-        assert_eq!(r.vals[COLTAB_PAY_OWNER_ID], Val::U64(16));
-        assert_eq!(r.vals[COLTAB_PAY_OWNER_KIND], Val::U64(1));
-        assert_eq!(r.vals[COLTAB_PAY_COL_IDX], Val::U64(2));
-        assert_eq!(r.vals[COLTAB_PAY_NAME], Val::Str("score".into()));
-        assert_eq!(r.vals[COLTAB_PAY_TYPE_CODE], Val::U64(10));
-        assert_eq!(r.vals[COLTAB_PAY_IS_NULLABLE], Val::U64(1));
-        assert_eq!(r.vals[COLTAB_PAY_FK_TABLE_ID], Val::U64(17));
-        assert_eq!(r.vals[COLTAB_PAY_FK_COL_IDX], Val::U64(3));
-        assert_eq!(r.vals[COLTAB_PAY_IS_SERIAL], Val::U64(0));
-        assert_eq!(r.vals[COLTAB_PAY_IS_HIDDEN], Val::U64(1));
+            1,
+        );
 
         let mut r = Recorder::default();
         write_idx_tab_row(

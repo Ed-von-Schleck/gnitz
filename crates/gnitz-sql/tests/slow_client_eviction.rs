@@ -22,8 +22,8 @@
 
 use std::os::fd::RawFd;
 
-use gnitz_core::protocol::{hello_handshake, send_message, ClientTransport};
-use gnitz_core::{ColData, GnitzClient, PkColumn, PkTuple, Schema, ZSetBatch};
+use gnitz_core::protocol::{hello_handshake, send_control, ClientTransport};
+use gnitz_core::{ColData, GnitzClient, PkColumn, Schema, ZSetBatch};
 use gnitz_test_harness::ServerHandle;
 
 mod common;
@@ -117,15 +117,14 @@ fn slow_scan_client_is_evicted_after_deadline() {
     set_tiny_rcvbuf(slow.as_raw_fd());
     hello_handshake(&mut slow).expect("hello");
     // The scan request is just an empty control frame addressed to the table id.
-    send_message(
+    send_control(
         &mut slow,
         table_id,
         /*client_id*/ 0xB0BA,
         /*flags*/ 0,
-        &PkTuple::EMPTY,
         0,
-        None,
-        None,
+        0,
+        &[],
     )
     .expect("send scan");
 

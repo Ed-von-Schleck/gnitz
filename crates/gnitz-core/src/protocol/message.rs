@@ -5,8 +5,7 @@ use super::types::{PkTuple, Schema, ZSetBatch};
 use super::wal_block::{decode_wal_block, encode_wal_block};
 use super::WAL_BLOCK_HEADER_SIZE;
 use super::{
-    wire_flags_get_schema_version, Header, WireConflictMode, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_ERROR,
-    STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
+    wire_flags_get_schema_version, Header, WireConflictMode, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_ERROR, STATUS_OK,
 };
 use crate::types::sys_schema;
 
@@ -15,7 +14,6 @@ pub struct Message {
     pub target_id: u64,
     pub flags: u64,
     pub seek_pk: u128,
-    pub seek_col_idx: u64,
     /// The schema, `Some` iff a schema block was physically in the frame (an
     /// `Arc` so a cache absorb is a refcount bump, not a deep copy). On a
     /// hint-only continuation frame it is `None` — the caller supplied the
@@ -40,7 +38,7 @@ pub struct Message {
 /// Encode a `Header` + optional error message + optional wide-PK extra bytes
 /// into a control WAL block. When `error_msg` is empty the error_msg column
 /// is NULL; when `seek_pk_extra` is empty the seek_pk_extra column is NULL.
-pub fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u8]) -> Vec<u8> {
     let total = gnitz_wire::control::ctrl_block_size(error_msg.len(), seek_pk_extra.len());
     let mut buf = vec![0u8; total];
     gnitz_wire::control::encode_ctrl_block(&mut buf, 0, header, error_msg.as_bytes(), seek_pk_extra);
@@ -146,19 +144,18 @@ fn encode_parts(
 /// pass `&PkTuple::EMPTY` for non-seek frames. The wire-level
 /// `(seek_pk: u128, seek_pk_extra: BLOB)` split is performed here via
 /// `PkTuple::split_wire`, so callers never handle it.
+///
+/// `data` pairs the rows with the schema they were encoded against, so a data
+/// block without its schema is unrepresentable. The schema block is derived
+/// before the empty-batch filter, so an empty Z-set delta still ships one.
 pub fn encode_message_parts(
     target_id: u64,
     client_id: u64,
     flags: u64,
     seek_pk: &PkTuple,
     seek_col_idx: u64,
-    schema: Option<&Schema>,
-    data_batch: Option<&ZSetBatch>,
+    data: Option<(&Schema, &ZSetBatch)>,
 ) -> MessageParts {
-    debug_assert!(
-        data_batch.is_none() || schema.is_some(),
-        "a data block needs the schema it is encoded against",
-    );
     let (seek_pk_lo, seek_pk_extra) = seek_pk.split_wire();
     encode_parts(
         target_id,
@@ -167,8 +164,8 @@ pub fn encode_message_parts(
         seek_pk_lo,
         seek_col_idx,
         seek_pk_extra,
-        schema.map(|s| encode_schema_block(s, target_id as u32)),
-        schema.zip(data_batch),
+        data.map(|(s, _)| encode_schema_block(s, target_id as u32)),
+        data,
     )
 }
 
@@ -246,38 +243,31 @@ pub fn encode_ddl_txn(client_id: u64, families: &[(u64, ZSetBatch)]) -> Vec<u8> 
     gnitz_wire::txn_frame::encode_ddl_txn(client_id, &refs)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn send_message(
+/// Send one control-only frame: no schema block, no data block.
+///
+/// The seek key arrives as its two raw wire halves, not as a `PkTuple`, because
+/// `PkTuple::split_wire` caps the extra region at 64 bytes (`MAX_PK_BYTES - 16`)
+/// and this channel also carries the SEEK_BY_INDEX_RANGE `RangeDescriptor`, up
+/// to 82 bytes at max arity. The control block's BLOB column has no such cap.
+pub fn send_control(
     t: &mut ClientTransport,
     target_id: u64,
     client_id: u64,
     flags: u64,
-    seek_pk: &PkTuple,
-    seek_col_idx: u64,
-    schema: Option<&Schema>,
-    data_batch: Option<&ZSetBatch>,
-) -> Result<(), ProtocolError> {
-    let parts = encode_message_parts(target_id, client_id, flags, seek_pk, seek_col_idx, schema, data_batch);
-    t.send_framed_iov(&parts.segments())
-}
-
-/// Control-only frame carrying an **explicit, arbitrary-length** `seek_pk_extra`
-/// blob, the channel for the SEEK_BY_INDEX_RANGE `RangeDescriptor`.
-/// `encode_message_parts` derives
-/// `seek_pk_extra` from `seek_pk.split_wire()`, which a `PkTuple` caps at 64
-/// bytes (`MAX_PK_BYTES - 16`); a max-arity range descriptor is up to 82 bytes,
-/// so it cannot ride a `PkTuple`. This passes the blob straight to
-/// `encode_control_block`, whose BLOB column is already arbitrary-length.
-/// `seek_pk` is fixed at 0 (unused by the range seek). No schema/data block.
-pub fn send_message_with_extra(
-    t: &mut ClientTransport,
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
+    seek_pk: u128,
     seek_col_idx: u64,
     seek_pk_extra: &[u8],
 ) -> Result<(), ProtocolError> {
-    let parts = encode_parts(target_id, client_id, flags, 0, seek_col_idx, seek_pk_extra, None, None);
+    let parts = encode_parts(
+        target_id,
+        client_id,
+        flags,
+        seek_pk,
+        seek_col_idx,
+        seek_pk_extra,
+        None,
+        None,
+    );
     t.send_framed(&parts.ctrl)
 }
 
@@ -341,29 +331,23 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         None
     };
 
-    let (schema, data_batch, error_text) = if ctrl_header.status == STATUS_ERROR {
-        (None, None, Some(error_msg))
-    } else if ctrl_header.status == STATUS_SCHEMA_MISMATCH || ctrl_header.status == STATUS_NO_INDEX {
-        // Control-only frame: no schema, no data, no error text.
-        (None, None, None)
-    } else {
-        (wire_schema.map(std::sync::Arc::new), data_batch, None)
-    };
+    // Every non-OK status the server emits rides a control-only frame, so both
+    // blocks are already absent and there is nothing to suppress.
+    let error_text = (ctrl_header.status == STATUS_ERROR).then_some(error_msg);
 
     Ok(Message {
         status: ctrl_header.status,
         target_id: ctrl_header.target_id,
         flags: ctrl_header.flags,
         seek_pk: ctrl_header.seek_pk,
-        seek_col_idx: ctrl_header.seek_col_idx,
-        schema,
+        schema: wire_schema.map(std::sync::Arc::new),
         data_batch,
         error_text,
         seek_pk_extra,
     })
 }
 
-pub fn recv_message(
+pub(crate) fn recv_message(
     t: &mut ClientTransport,
     schema_hint: Option<(&Schema, u16)>,
     max_payload_len: usize,
@@ -516,6 +500,12 @@ mod tests {
 
     // ── send/recv message roundtrips ────────────────────────────────────────
 
+    /// Ship one cold PUSH frame, the shape `Session::roundtrip_push` builds.
+    fn send_push(t: &mut ClientTransport, schema: &Schema, batch: &ZSetBatch) {
+        let parts = encode_message_parts(0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some((schema, batch)));
+        t.send_framed_iov(&parts.segments()).unwrap();
+    }
+
     #[test]
     fn test_message_roundtrip_empty() {
         // Empty batch → FLAG_HAS_SCHEMA but not FLAG_HAS_DATA
@@ -529,17 +519,7 @@ mod tests {
 
         let empty_batch = ZSetBatch::new(&schema);
         let (mut a, mut b) = make_transport_pair();
-        send_message(
-            &mut a,
-            0,
-            0,
-            FLAG_PUSH,
-            &PkTuple::EMPTY,
-            0,
-            Some(&schema),
-            Some(&empty_batch),
-        )
-        .unwrap();
+        send_push(&mut a, &schema, &empty_batch);
         let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         // Schema was sent, data was not (empty batch)
@@ -587,7 +567,7 @@ mod tests {
         };
 
         let (mut a, mut b) = make_transport_pair();
-        send_message(&mut a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).unwrap();
+        send_push(&mut a, &schema, &batch);
         let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         let data = msg.data_batch.unwrap();
@@ -644,7 +624,7 @@ mod tests {
         };
 
         let (mut a, mut b) = make_transport_pair();
-        send_message(&mut a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).unwrap();
+        send_push(&mut a, &schema, &batch);
         let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         let data = msg.data_batch.unwrap();
@@ -664,34 +644,30 @@ mod tests {
     fn test_message_no_schema_no_data() {
         // Control-only message (scan/alloc style)
         let (mut a, mut b) = make_transport_pair();
-        send_message(&mut a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, None, None).unwrap();
+        send_control(&mut a, 0, 0, FLAG_PUSH, 0, 0, &[]).unwrap();
         let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert!(msg.schema.is_none());
         assert!(msg.data_batch.is_none());
     }
 
+    /// The control scalars a reply is read for must survive the socket.
     #[test]
     fn test_message_recv_control_fields() {
-        // Verify that send_message/recv_message correctly propagates all control
-        // fields into the flat Message struct: target_id, client_id, seek_pk,
-        // seek_col_idx.
         let seek_pk = 0xAAAA_BBBB_CCCC_DDDD_u128 | (0x1111_2222_3333_4444_u128 << 64);
         let (mut a, mut b) = make_transport_pair();
-        send_message(
+        send_control(
             &mut a,
-            0xDEAD_BEEF_1234_5678, // target_id
-            0xCAFE_BABE_0000_0001, // client_id
-            FLAG_PUSH,             // flags
-            &PkTuple::from_u128_narrow(seek_pk),
-            7, // seek_col_idx
-            None,
-            None,
+            0xDEAD_BEEF_1234_5678,
+            0xCAFE_BABE_0000_0001,
+            FLAG_PUSH,
+            seek_pk,
+            7,
+            &[],
         )
         .unwrap();
         let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert_eq!(msg.target_id, 0xDEAD_BEEF_1234_5678);
         assert_eq!(msg.seek_pk, seek_pk);
-        assert_eq!(msg.seek_col_idx, 7);
     }
 
     #[test]
@@ -714,20 +690,11 @@ mod tests {
     #[test]
     fn test_encode_parse_control_only() {
         let seek_pk = 42u128 | (99u128 << 64);
-        let payload = encode_message_parts(
-            0xDEAD,
-            0xBEEF,
-            FLAG_PUSH,
-            &PkTuple::from_u128_narrow(seek_pk),
-            7,
-            None,
-            None,
-        )
-        .to_vec();
+        let payload =
+            encode_message_parts(0xDEAD, 0xBEEF, FLAG_PUSH, &PkTuple::from_u128_narrow(seek_pk), 7, None).to_vec();
         let msg = parse_response(&payload, None).unwrap();
         assert_eq!(msg.target_id, 0xDEAD);
         assert_eq!(msg.seek_pk, seek_pk);
-        assert_eq!(msg.seek_col_idx, 7);
         assert!(msg.schema.is_none());
         assert!(msg.data_batch.is_none());
     }
@@ -753,7 +720,7 @@ mod tests {
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],
         };
 
-        let payload = encode_message_parts(42, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).to_vec();
+        let payload = encode_message_parts(42, 1, 0, &PkTuple::EMPTY, 0, Some((&schema, &batch))).to_vec();
         let msg = parse_response(&payload, None).unwrap();
         assert_eq!(msg.target_id, 42);
         assert!(msg.schema.is_some());
@@ -770,7 +737,7 @@ mod tests {
         };
         let empty = ZSetBatch::new(&schema);
 
-        let payload = encode_message_parts(10, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&empty)).to_vec();
+        let payload = encode_message_parts(10, 1, 0, &PkTuple::EMPTY, 0, Some((&schema, &empty))).to_vec();
         let msg = parse_response(&payload, None).unwrap();
         // Schema sent, but no data (empty batch)
         assert!(msg.schema.is_some());
@@ -784,7 +751,7 @@ mod tests {
     #[test]
     fn encode_message_wide_pk_seek_emits_extra() {
         let pk = PkTuple::from_bytes(&(0..24u8).collect::<Vec<_>>());
-        let payload = encode_message_parts(7, 1, FLAG_SEEK, &pk, 0, None, None).to_vec();
+        let payload = encode_message_parts(7, 1, FLAG_SEEK, &pk, 0, None).to_vec();
 
         let ctrl = gnitz_wire::wal::block_slice_at(&payload, 0).unwrap();
         let (hdr, _err, extra) = decode_control_block(ctrl).unwrap();

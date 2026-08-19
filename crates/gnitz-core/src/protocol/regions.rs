@@ -305,9 +305,9 @@ mod tests {
     }
 
     /// One PK row, laid out in **PK-list order** (I64 at 0..8, U32 at 8..12) —
-    /// the order `build_pk_region_into`'s `Bytes` arm walks. Built with
-    /// `push_bytes`, never `push_u128`, whose `Bytes` arm would sign-extend the
-    /// negative I64 over the U32 column.
+    /// the order `build_pk_region_into`'s column walk reads. Built with
+    /// `push_bytes`, never `push_u128`: that one truncates a single `u128` to the
+    /// stride, so a negative I64 would sign-extend over the U32 column.
     fn pk12(k0: i64, k1: u32) -> [u8; 12] {
         let mut out = [0u8; 12];
         out[0..8].copy_from_slice(&k0.to_le_bytes());

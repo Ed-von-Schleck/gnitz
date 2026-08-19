@@ -77,8 +77,6 @@ impl SortKey {
 }
 
 /// Whether the key's column is SQL NULL at row `i` (a PK column's mask is `0`).
-/// The bitmap is the single NULL source across every `ColData` variant — a
-/// a `Fixed` NULL is zero-filled filler with no per-value sentinel.
 fn col_is_null(batch: &ZSetBatch, key: &SortKey, i: usize) -> bool {
     batch.nulls[i] & key.null_mask != 0
 }
