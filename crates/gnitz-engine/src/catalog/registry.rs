@@ -201,7 +201,7 @@ impl CatalogEngine {
         // re-issue the id after restart. Fail-stop — same as the serial-range
         // sequence ingest in `executor.rs`.
         if let Err(e) = self.sys_store_mut(SysFamily::Sequence).ingest_borrowed_batch(&batch) {
-            crate::gnitz_fatal_abort!(
+            gnitz_fatal_abort!(
                 "sys_sequences ingest (object id advance, seq_id={}) failed: {} \
                  — allocated id would be reissued after restart; aborting",
                 seq_id,
@@ -272,7 +272,7 @@ impl CatalogEngine {
         // discards the memtable copy. A flush failure here is fatal: resetting
         // the SAL on a swallowed failure destroys the only durable copy.
         if let Err(e) = self.flush_all_system_tables() {
-            crate::gnitz_fatal_abort!("checkpoint generation flush failed: {} — aborting before SAL reset", e);
+            gnitz_fatal_abort!("checkpoint generation flush failed: {} — aborting before SAL reset", e);
         }
         new
     }

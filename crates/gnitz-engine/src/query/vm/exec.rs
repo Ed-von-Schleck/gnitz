@@ -16,7 +16,7 @@ use crate::storage::{Batch, ReadCursor};
 /// Recovery is restart + SAL replay.
 fn fatal_on_tick_ingest_err(op: &str, table_idx: u16, r: Result<(), crate::storage::StorageError>) {
     if let Err(e) = r {
-        crate::gnitz_fatal_abort!(
+        gnitz_fatal_abort!(
             "vm: {} ingest failed (table_idx={}): {} — tick state diverged \
              from durable inputs; aborting for restart+SAL replay",
             op,

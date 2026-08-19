@@ -197,7 +197,7 @@ pub fn reclaim_retired_children(dir: &str, num_workers: u32) {
         let Some(child) = ChildAddr::parse(&name) else { continue };
         let full = format!("{dir}/{name}");
         if !child.is_owned_by(num_workers) {
-            crate::gnitz_debug!("recovery: removing retired child dir {}", full);
+            gnitz_debug!("recovery: removing retired child dir {}", full);
             remove_child(&full);
         } else if matches!(child, ChildAddr::Index { .. }) {
             reclaim_retired_children(&full, num_workers);

@@ -57,7 +57,7 @@ pub(crate) async fn guard_client_egress<F: Future<Output = i32>>(
     match select2(fut.as_mut(), reactor.timer(deadline)).await {
         Either::A(rc) => rc,
         Either::B(()) => {
-            crate::gnitz_warn!(
+            gnitz_warn!(
                 "client fd={} stalled {} past {:?}; evicting",
                 fd,
                 what,
@@ -94,7 +94,7 @@ impl Reactor {
         let mut ring = self.inner.ring.borrow_mut();
         arm_accept(&mut ring, listener_fd);
         if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
-            crate::gnitz_fatal_abort!(
+            gnitz_fatal_abort!(
                 "reactor: accept SQE flush failed (errno={}) — no connections can be accepted",
                 e,
             );
@@ -228,7 +228,7 @@ impl Reactor {
         // here means the number was reused while SQEs may still point into the
         // old connection's buffers.
         if conns.contains_key(&fd) {
-            crate::gnitz_fatal_abort!(
+            gnitz_fatal_abort!(
                 "reactor: register_conn: fd={} is already registered — it was reused \
                  before reap_closing_conns retired the previous connection",
                 fd,
@@ -379,7 +379,7 @@ impl Reactor {
                 // by the RecvBuf's `Drop`), refusing before malloc on a cap
                 // breach.
                 let Some(rbuf) = self.alloc_inbound_buf(plen) else {
-                    crate::gnitz_warn!(
+                    gnitz_warn!(
                         "reactor: inbound cap would be exceeded, closing fd={} (held={} B + {} B, cap={} B)",
                         fd,
                         self.inner.total_inbound_bytes.get(),

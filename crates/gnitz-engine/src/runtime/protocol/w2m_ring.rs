@@ -441,7 +441,7 @@ pub struct Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.committed {
-            crate::gnitz_fatal_abort!(
+            gnitz_fatal_abort!(
                 "w2m_ring: Reservation dropped without commit — \
                  size prefix published but write_cursor not advanced; ring is now corrupt"
             );
@@ -528,7 +528,7 @@ pub(crate) unsafe fn try_reserve(
     internal_req_id: u32,
 ) -> TryReserve {
     if (sz as u64) > MAX_W2M_MSG {
-        crate::gnitz_error!("w2m_ring::try_reserve: sz={} exceeds MAX_W2M_MSG", sz);
+        gnitz_error!("w2m_ring::try_reserve: sz={} exceeds MAX_W2M_MSG", sz);
         return TryReserve::Full;
     }
 
@@ -690,7 +690,7 @@ pub unsafe fn try_consume(
         return None;
     }
     if size as u64 > MAX_W2M_MSG {
-        crate::gnitz_fatal_abort!(
+        gnitz_fatal_abort!(
             "w2m_ring::try_consume: size={} at phys={} exceeds MAX_W2M_MSG={} — ring corrupt",
             size,
             phys_rc,

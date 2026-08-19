@@ -28,7 +28,6 @@ use std::rc::Rc;
 fn shard_merge_scan_bench() {
     use super::super::batch::BatchBuilder;
     use std::time::Instant;
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
 
     let schema = SchemaDescriptor::new(
@@ -110,7 +109,6 @@ fn shard_merge_scan_bench() {
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn shard_point_probe_bench() {
     use std::time::Instant;
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64(); // U64 PK | I64 payload
 
@@ -719,7 +717,6 @@ fn adv_time_cursor_stationary(c: &mut ReadCursor, tier: Tier, scratch: &mut [u8]
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn advance_to_leaf_gallop_bench() {
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let mut scratch = vec![0u8; ADV_SCRATCH_BYTES];
 
@@ -781,7 +778,6 @@ fn advance_to_leaf_gallop_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn read_cursor_advance_to_multi_bench() {
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let mut scratch = vec![0u8; ADV_SCRATCH_BYTES];
 
@@ -832,7 +828,6 @@ fn read_cursor_advance_to_multi_bench() {
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn read_cursor_advance_to_rebuild_bench() {
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let mut scratch = vec![0u8; ADV_SCRATCH_BYTES];
 

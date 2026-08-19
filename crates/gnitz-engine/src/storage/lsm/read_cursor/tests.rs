@@ -1,5 +1,4 @@
 use super::*;
-use crate::foundation::posix_io::raise_fd_limit_for_tests;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{BatchBuilder, Layout};
 use crate::test_support::{
@@ -389,7 +388,6 @@ fn test_current_key() {
 /// to the row-major scatter.  Now the column-major path handles it directly.
 #[test]
 fn test_scatter_constant_pk_shard() {
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u128_i64();
 
@@ -894,7 +892,6 @@ pub(super) fn write_test_shard(
 /// two-source coverage above does not reach the shard path.
 #[test]
 fn multi_shard_merge_folds_cross_source_weights() {
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u128_i64();
     let shard_rows: [&[(u128, i64, i64)]; 3] = [
@@ -1000,7 +997,6 @@ fn counted_walk_raw(
 /// and a `end = None` arm that counts to the end of every run.
 #[test]
 fn count_range_raw_equals_counted_walk() {
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u128_i64();
 
@@ -1147,7 +1143,6 @@ fn mode_follows_the_live_source_set() {
 /// index so a drain writing back `states[0]` would be caught.
 #[test]
 fn bounded_string_read_carries_only_its_own_rows() {
-    raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_pk_u64_payload_string();
     const PER_SHARD: u64 = 100;
@@ -1244,7 +1239,6 @@ fn walk_groups(c: &mut ReadCursor) -> Vec<(u64, i64, bool)> {
 /// be worth the trade.
 #[test]
 fn skeleton_shard_opens_under_the_view_schema() {
-    raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64();
     let rows: Vec<(u64, i64)> = (1..=8).map(|i| (i, i as i64)).collect();
@@ -1280,7 +1274,6 @@ fn skeleton_shard_opens_under_the_view_schema() {
 #[test]
 fn skeleton_flag_is_covered_by_the_digest_and_masked_before_the_bound() {
     use super::super::layout::{OFF_DESC_CHECKSUM, OFF_FILE_NPC, SHARD_FLAG_SKELETON};
-    raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64();
     let mut bb = BatchBuilder::new(schema);
@@ -1336,7 +1329,6 @@ fn skeleton_flag_is_covered_by_the_digest_and_masked_before_the_bound() {
 /// either case.
 #[test]
 fn a_skeleton_row_coarsens_its_whole_pk_group() {
-    raise_fd_limit_for_tests();
     let dir = tempfile::tempdir().unwrap();
 
     for (name, schema, zero_row) in [

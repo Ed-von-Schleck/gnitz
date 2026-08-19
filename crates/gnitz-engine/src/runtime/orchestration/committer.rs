@@ -393,7 +393,7 @@ async fn run_checkpoint_sequence(
     // replays the un-reset SAL and re-derives views from the durable base
     // tables.
     if let Err(e) = flush_round(shared, None, fut_slots, ack_slots).await {
-        crate::gnitz_fatal_abort!("checkpoint failed, cluster epoch-desynced: {}", e);
+        gnitz_fatal_abort!("checkpoint failed, cluster epoch-desynced: {}", e);
     }
 
     // Unpark relay_loop now: step 1's reset already reclaimed space, so the
@@ -434,7 +434,7 @@ async fn run_checkpoint_sequence(
     match drained {
         Some(Ok(())) => {}
         Some(Err(e)) => {
-            crate::gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
+            gnitz_warn!("checkpoint drain failed, skipping the ephemeral round: {}", e);
             return (held_pushes, held_txns, deferred);
         }
         // Cancelled, or the request channel closed.
@@ -463,7 +463,7 @@ async fn run_checkpoint_sequence(
     // Step 3 — EPHEMERAL ROUND. Stamp the step-0 generation (no re-bump happens
     // mid-drain, so no re-read is needed).
     if let Err(e) = flush_round(shared, Some(gen), fut_slots, ack_slots).await {
-        crate::gnitz_fatal_abort!("ephemeral checkpoint round failed, cluster epoch-desynced: {}", e);
+        gnitz_fatal_abort!("ephemeral checkpoint round failed, cluster epoch-desynced: {}", e);
     }
     let _ = release_tx.send(()); // resume the tick loop
 
@@ -512,7 +512,7 @@ async fn await_servicing<T>(
                 // see, so it runs the round regardless.
                 if forced || !shared.disp().sal_has_relay_space() {
                     if let Err(e) = flush_round(shared, None, fut_slots, ack_slots).await {
-                        crate::gnitz_fatal_abort!("reclaim checkpoint failed, cluster epoch-desynced: {}", e);
+                        gnitz_fatal_abort!("reclaim checkpoint failed, cluster epoch-desynced: {}", e);
                     }
                 }
                 let _ = done.send(());
@@ -736,7 +736,7 @@ async fn commit_pushes(
                         let g = &mut groups[gi];
                         match write_group(shared, g, zone_lsn, &mut zone_opened) {
                             None => committed_a_family = true,
-                            Some(e) if committed_a_family => crate::gnitz_fatal_abort!(
+                            Some(e) if committed_a_family => gnitz_fatal_abort!(
                                 "txn family emission failed after an earlier family committed to the SAL: {}",
                                 e
                             ),
@@ -783,7 +783,7 @@ async fn commit_pushes(
         // `commit_zone` signals the workers itself once the sentinel is published.
         let fsync_fut = if zone_opened {
             if let Some(e) = shared.disp().commit_zone(zone_lsn).err() {
-                crate::gnitz_fatal_abort!("commit_zone failed, durability lost: {}", e);
+                gnitz_fatal_abort!("commit_zone failed, durability lost: {}", e);
             }
             // Submit fsync SQE (synchronous — returns a future). The
             // ReplyFutures are built into `fut_slots` outside the lock scope:
@@ -886,7 +886,7 @@ async fn commit_pushes(
     if let Some(fsync_fut) = fsync_fut {
         let fsync_rc = fsync_fut.await;
         if fsync_rc < 0 {
-            crate::gnitz_fatal_abort!("SAL fdatasync (committer) failed rc={}", fsync_rc);
+            gnitz_fatal_abort!("SAL fdatasync (committer) failed rc={}", fsync_rc);
         }
         // Publish the zone LSN exactly once, after fsync confirms durability.
         // Pipelined pushes batched together share one zone_lsn, so clients may see
@@ -907,7 +907,7 @@ async fn commit_pushes(
             Ok(())
         }) {
             invalidate_filters(shared, g.tid);
-            crate::gnitz_warn!("{}", e);
+            gnitz_warn!("{}", e);
         }
     }
 

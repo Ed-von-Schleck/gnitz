@@ -143,7 +143,7 @@ impl DagEngine {
             .collect();
 
         if let Err(e) = inject_ingest_apply_error("store", entry.handle.ingest_borrowed_batch(source)) {
-            crate::gnitz_fatal_abort!(
+            gnitz_fatal_abort!(
                 "dag: base-table ingest failed (table_id={}): {} — committed data \
                  not applied, state diverged from durable SAL; aborting for \
                  restart+replay",
@@ -156,7 +156,7 @@ impl DagEngine {
             if idx_batch.count > 0 {
                 let index_id = ic.index_id;
                 if let Err(e) = inject_ingest_apply_error("index", ic.table_mut().ingest_owned_batch(idx_batch)) {
-                    crate::gnitz_fatal_abort!(
+                    gnitz_fatal_abort!(
                         "dag: secondary-index ingest failed (table_id={}, index_id={}): {} \
                          — index diverged from base table; aborting for restart+replay",
                         table_id,
@@ -193,7 +193,7 @@ impl DagEngine {
     /// would already abort the base ingest via `ingest_store_and_indices`).
     pub fn flush_view_or_abort(&mut self, view_id: i64) {
         if let Err(e) = self.flush(view_id) {
-            crate::gnitz_fatal_abort!(
+            gnitz_fatal_abort!(
                 "dag: view trace flush failed (view_id={}): {} — view state \
                  cannot be bounded; aborting for restart+re-derive",
                 view_id,

@@ -1,16 +1,15 @@
-//! POSIX I/O and Linux syscall wrappers, in two documented tiers:
+//! POSIX I/O and Linux syscall wrappers, in three labelled sections. Two rules
+//! no signature states on its own:
 //!
-//! - **File-I/O tier** — safe functions returning `io::Result`, so the errno is
-//!   captured at the syscall and never re-read from ambient state: fd
-//!   read/write with EINTR/partial-write handling, open, rename, fdatasync,
-//!   fallocate, ftruncate, O_TMPFILE, NOCOW, madvise, `map_shared_sized`, the
-//!   Unix server socket, fd-limit, `Mmap`.
-//! - **IPC tier** — eventfd, futex, memfd. `eventfd_wait` and the `futex_*`
-//!   calls keep their raw return codes: their callers inspect errno
-//!   (EAGAIN/ETIMEDOUT) and re-read the rings rather than trust the return.
-//!   `eventfd_create`/`memfd_create` return a raw fd because their callers hold
-//!   the descriptor across `fork()` and close it by hand, which an `OwnedFd`
-//!   would fight.
+//! - The **file-I/O tier** returns `io::Result`, so the errno is captured at the
+//!   syscall and no caller has to read it back out of ambient state.
+//! - The **IPC tier** returns raw codes instead: its callers inspect errno
+//!   (EAGAIN/ETIMEDOUT) and re-read the rings rather than trust the return, and
+//!   `eventfd_create`/`memfd_create` hand back a raw fd because their callers
+//!   hold the descriptor across `fork()` and close it by hand, which an
+//!   `OwnedFd` would fight.
+//!
+//! The third section is the unaligned `*_raw` accessors, documented there.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::AtomicU32;
@@ -104,7 +103,7 @@ fn retry_eintr(mut f: impl FnMut() -> c_int) -> std::io::Result<()> {
 /// `O_TMPFILE` (ext4 / xfs / btrfs / tmpfs — every filesystem gnitz stores data
 /// on). `O_TMPFILE` already implies `O_DIRECTORY`, so the path is validated as a
 /// directory by the kernel.
-pub fn open_tmpfile(dir: &str) -> std::io::Result<OwnedFd> {
+pub(crate) fn open_tmpfile(dir: &str) -> std::io::Result<OwnedFd> {
     let dir_c = std::ffi::CString::new(dir).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let fd = unsafe { libc::open(dir_c.as_ptr(), libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC, 0o600) };
     if fd < 0 {
@@ -148,7 +147,7 @@ pub(crate) fn try_set_nocow(fd: i32) {
 /// For anonymous private memory: requires `enabled` = `madvise` or `always`.
 /// For memfd/shmem: requires `shmem_enabled` = `advise` or `within_size`.
 /// For writable file-backed mmap: silently ignored by the kernel.
-pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
+pub(crate) fn madvise_hugepage(ptr: *mut u8, size: usize) {
     if ptr.is_null() || size == 0 {
         return;
     }
@@ -182,7 +181,7 @@ fn listen_nonblock(fd: c_int) -> std::io::Result<()> {
 /// Create a Unix domain SOCK_STREAM server socket: socket + bind + listen.
 /// Sets the listen socket to non-blocking.
 /// Unlinks any existing socket at `path` before binding.
-pub fn server_create(path: &str) -> std::io::Result<OwnedFd> {
+pub(crate) fn server_create(path: &str) -> std::io::Result<OwnedFd> {
     unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         if fd < 0 {
@@ -229,7 +228,7 @@ pub fn server_create(path: &str) -> std::io::Result<OwnedFd> {
 /// a peer that is already gone (`ENOTCONN`) is the goal state, not an error.
 /// Does NOT close the fd — the caller still reaps it through the normal close
 /// path.
-pub fn shutdown(fd: i32) {
+pub(crate) fn shutdown(fd: i32) {
     while unsafe { libc::shutdown(fd, libc::SHUT_RDWR) } < 0 {
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
             return;
@@ -239,7 +238,7 @@ pub fn shutdown(fd: i32) {
 
 /// Create a TCP SOCK_STREAM listen socket on `addr`: socket + SO_REUSEADDR +
 /// bind + listen(1024) (same backlog as `server_create`) + O_NONBLOCK.
-pub fn tcp_bind(addr: &std::net::SocketAddr) -> std::io::Result<i32> {
+pub(crate) fn tcp_bind(addr: &std::net::SocketAddr) -> std::io::Result<i32> {
     let family = match addr {
         std::net::SocketAddr::V4(_) => libc::AF_INET,
         std::net::SocketAddr::V6(_) => libc::AF_INET6,
@@ -262,7 +261,7 @@ pub fn tcp_bind(addr: &std::net::SocketAddr) -> std::io::Result<i32> {
 }
 
 /// The socket's bound local address (getsockname) — port-0 discovery.
-pub fn tcp_local_addr(fd: i32) -> Option<std::net::SocketAddr> {
+pub(crate) fn tcp_local_addr(fd: i32) -> Option<std::net::SocketAddr> {
     let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let rc = unsafe { libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) };
@@ -273,7 +272,7 @@ pub fn tcp_local_addr(fd: i32) -> Option<std::net::SocketAddr> {
 }
 
 /// `setsockopt` of a single `int` option. Returns the raw return code.
-pub(crate) fn setsockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) -> c_int {
+fn setsockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) -> c_int {
     unsafe {
         libc::setsockopt(
             fd,
@@ -288,13 +287,13 @@ pub(crate) fn setsockopt_int(fd: c_int, level: c_int, opt: c_int, val: c_int) ->
 /// Bare `SO_KEEPALIVE` (no interval tuning): a silently half-open TCP
 /// connection is reaped by the kernel default probing (~2 h) instead of
 /// parking a recv forever.
-pub fn set_keepalive(fd: i32) {
+pub(crate) fn set_keepalive(fd: i32) {
     setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
 }
 
 /// `TCP_NODELAY`: small control frames must not pay Nagle's 40 ms batching
 /// delay (AF_UNIX has no Nagle, so this restores latency parity).
-pub fn set_nodelay(fd: i32) {
+pub(crate) fn set_nodelay(fd: i32) {
     setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
 }
 
@@ -356,7 +355,7 @@ fn addr_from_sockaddr(ss: &libc::sockaddr_storage) -> Option<std::net::SocketAdd
 /// limit. Best-effort: the engine opens far fewer descriptors than `target` on
 /// a small database, so a refusal only matters once the partition count grows,
 /// and then it surfaces as `EMFILE` at the open that could not be served.
-pub fn raise_fd_limit(target: u64) {
+pub(crate) fn raise_fd_limit(target: u64) {
     unsafe {
         let mut rl: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 || rl.rlim_cur >= target as libc::rlim_t {
@@ -367,27 +366,16 @@ pub fn raise_fd_limit(target: u64) {
     }
 }
 
-/// Best-effort memory budget for the process, in bytes.
-///
-/// Reads cgroup v2 `/sys/fs/cgroup/memory.max` — the real container limit —
-/// and parses it when finite; falls back to total physical RAM
-/// (`_SC_PHYS_PAGES × _SC_PAGE_SIZE`) when the file is absent or reads the
-/// literal `"max"` (no limit). This is the technique the JVM and Go use to
-/// avoid the sysconf-reports-host-RAM pitfall inside a container.
+/// Best-effort memory budget for the process, in bytes: the cgroup v2 limit
+/// when there is one, else total physical RAM (`_SC_PHYS_PAGES × _SC_PAGE_SIZE`).
 ///
 /// Cached in a `OnceLock`: the value is invariant for the process's lifetime.
 /// Returns 0 only if every source fails, which callers clamp up to a floor.
-pub fn available_memory_bytes() -> usize {
+pub(crate) fn available_memory_bytes() -> usize {
     use std::sync::OnceLock;
     static CACHED: OnceLock<usize> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        // cgroup v2 `memory.max` when finite. The literal `"max"` (no limit)
-        // fails the integer parse and falls through, as does an absent file.
-        if let Some(v) = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&v| v > 0)
-        {
+        if let Some(v) = cgroup_v2_memory_max() {
             return v;
         }
         let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
@@ -400,8 +388,32 @@ pub fn available_memory_bytes() -> usize {
     })
 }
 
+/// The tightest finite cgroup v2 `memory.max` from this process's own cgroup up
+/// to the root; `None` when nothing on the path sets one.
+///
+/// The path has to come from `/proc/self/cgroup`: a bare `/sys/fs/cgroup/`
+/// prefix names the *root* cgroup, which on an ordinary systemd host has no
+/// `memory.max` at all, so a `MemoryMax=`d unit would read as host RAM. **v2
+/// only** — a v1/hybrid host writes one line per controller instead of the
+/// unified `0::<path>`, matches nothing, and falls back to physical RAM.
+fn cgroup_v2_memory_max() -> Option<usize> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    // The v2 path is absolute; `join` would discard the mount point.
+    let rel = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    std::path::Path::new("/sys/fs/cgroup")
+        .join(rel.trim_start_matches('/'))
+        .ancestors()
+        .take_while(|d| d.starts_with("/sys/fs/cgroup"))
+        // The literal `"max"` (unlimited at this level) fails the parse, as
+        // does an absent file; both are skipped.
+        .filter_map(|d| std::fs::read_to_string(d.join("memory.max")).ok())
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .min()
+}
+
 /// Size of the file behind `fd` (fstat), in bytes.
-pub(crate) fn fd_size(fd: c_int) -> std::io::Result<usize> {
+fn fd_size(fd: c_int) -> std::io::Result<usize> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } < 0 {
         return Err(std::io::Error::last_os_error());
@@ -539,7 +551,7 @@ pub(crate) fn eventfd_wait(efd: i32, timeout_ms: i32) -> i32 {
 
 /// Create an anonymous memory-backed fd with MFD_CLOEXEC.
 /// Returns fd on success, -1 on error.
-pub fn memfd_create(name: &[u8]) -> i32 {
+pub(crate) fn memfd_create(name: &[u8]) -> i32 {
     // name must be null-terminated for the syscall
     let mut buf = [0u8; 64];
     let len = name.len().min(62);
@@ -556,7 +568,7 @@ pub fn memfd_create(name: &[u8]) -> i32 {
 /// Returns the syscall return value: 0 on successful wake,
 /// -1 on error (inspect `errno` — EAGAIN means value already differed,
 /// ETIMEDOUT means the timespec elapsed).
-pub fn futex_wait_u32(ptr: *const AtomicU32, expected: u32, timeout_ms: i32) -> i32 {
+pub(crate) fn futex_wait_u32(ptr: *const AtomicU32, expected: u32, timeout_ms: i32) -> i32 {
     let ts = libc::timespec {
         tv_sec: (timeout_ms as i64) / 1000,
         tv_nsec: ((timeout_ms as i64) % 1000) * 1_000_000,
@@ -578,7 +590,7 @@ pub fn futex_wait_u32(ptr: *const AtomicU32, expected: u32, timeout_ms: i32) -> 
 /// Wake up at most `n_waiters` futex waiters parked on `ptr` via v1
 /// `FUTEX_WAKE` (no `FUTEX_PRIVATE_FLAG` — W2M is shared). Returns
 /// the number of waiters woken, or -1 on error.
-pub fn futex_wake_u32(ptr: *const AtomicU32, n_waiters: u32) -> i32 {
+pub(crate) fn futex_wake_u32(ptr: *const AtomicU32, n_waiters: u32) -> i32 {
     unsafe {
         libc::syscall(
             libc::SYS_futex,
@@ -680,16 +692,6 @@ pub(crate) fn map_shared_sized(fd: c_int, size: usize, how: Backing) -> std::io:
     Ok(ptr as *mut u8)
 }
 
-/// Raise RLIMIT_NOFILE soft limit to the hard limit (`raise_fd_limit` clamps
-/// the target down to it). Called once per process via `std::sync::Once`; safe
-/// to invoke from any test.
-#[cfg(test)]
-pub(crate) fn raise_fd_limit_for_tests() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| raise_fd_limit(u64::MAX));
-}
-
 // ---------------------------------------------------------------------------
 // Unaligned raw accessors
 // ---------------------------------------------------------------------------
@@ -748,41 +750,26 @@ mod tests {
         assert_eq!(&buf, data);
     }
 
-    #[test]
-    fn test_fallocate() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let raw_fd = tmp.as_file().as_raw_fd();
-        fallocate(raw_fd, 1048576).expect("fallocate failed");
-        assert_eq!(fd_size(raw_fd).unwrap(), 1048576);
-    }
-
-    #[test]
-    fn test_try_set_nocow() {
-        // Rejected on every non-btrfs filesystem; must not crash.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        try_set_nocow(tmp.as_file().as_raw_fd());
-    }
-
+    /// In a forked child, because lowering the soft limit is process-wide and
+    /// would break every concurrently running test. In the parent the limit is
+    /// already above 1024, so `raise_fd_limit` early-returns and asserts nothing.
     #[test]
     fn test_raise_fd_limit() {
-        raise_fd_limit(1024);
-        let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) }, 0);
-        assert!(
-            rl.rlim_cur >= 1024.min(rl.rlim_max),
-            "soft limit not raised: {}",
-            rl.rlim_cur
-        );
-    }
-
-    #[test]
-    fn test_server_create() {
-        let path = "/tmp/gnitz_test_sys_server_create.sock";
-        let fd = server_create(path).expect("server_create failed");
-        drop(fd);
-        unsafe {
-            libc::unlink(format!("{path}\0").as_ptr() as *const libc::c_char);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+            rl.rlim_cur = 64;
+            let lowered = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) };
+            raise_fd_limit(1024);
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+            let raised = rl.rlim_cur >= 1024.min(rl.rlim_max);
+            unsafe { libc::_exit(i32::from(lowered != 0 || !raised)) };
         }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(libc::WEXITSTATUS(status), 0, "soft limit not raised from 64 to 1024");
     }
 
     #[test]
@@ -878,27 +865,20 @@ mod tests {
 
     #[test]
     fn test_server_create_is_nonblocking() {
-        let path = "/tmp/gnitz_test_sys_server_nonblocking.sock";
-        let fd = server_create(path).expect("server_create failed");
+        // Under a private tempdir, not a fixed `/tmp` name: `/tmp` is shared and
+        // sticky, so a socket another user (or a panicked run) left at the bare
+        // path is unlinkable and every later run fails to bind. The `TempDir`
+        // guard removes the socket with the directory.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("server.sock");
+        let fd = server_create(path.to_str().expect("utf8 path")).expect("server_create failed");
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL, 0) };
         drop(fd);
-        unsafe {
-            libc::unlink(format!("{path}\0").as_ptr() as *const libc::c_char);
-        }
         assert!(flags >= 0, "F_GETFL failed: {flags}");
         assert!(
             flags & libc::O_NONBLOCK != 0,
             "socket is not non-blocking, flags={flags:#o}"
         );
-    }
-
-    #[test]
-    fn test_eventfd_create_close() {
-        let fd = eventfd_create();
-        assert!(fd >= 0, "eventfd_create failed: {fd}");
-        unsafe {
-            libc::close(fd);
-        }
     }
 
     #[test]
@@ -1015,91 +995,17 @@ mod tests {
         }
     }
 
-    /// Submit a `FutexWaitV` SQE on a local io_uring, fork a child that
-    /// updates the atomic and wakes it via raw FUTEX_WAKE, drain the CQE
-    /// in the parent. Smoke test for the reactor's FUTEX_WAITV wiring.
-    #[test]
-    fn test_futex_waitv_via_io_uring() {
-        use io_uring::{opcode, types, IoUring};
-        use std::sync::atomic::Ordering;
-
-        let fd = memfd_create(b"test_futex_waitv");
-        assert!(fd >= 0);
-        let ptr = map_shared_sized(fd, 4096, Backing::Sized).unwrap();
-
-        let atomic_ptr = ptr as *mut AtomicU32;
-        unsafe {
-            (*atomic_ptr).store(0, Ordering::Release);
-        }
-
-        let mut ring = match IoUring::new(8) {
-            Ok(r) => r,
-            Err(e) => panic!("IoUring::new: {e}"),
-        };
-
-        // One-entry FutexWaitV array (heap-stable), waiting for value 0.
-        let futexv: Box<[types::FutexWaitV; 1]> = Box::new([types::FutexWaitV::new()
-            .val(0)
-            .uaddr(atomic_ptr as u64)
-            .flags(FUTEX2_SIZE_U32)]);
-
-        let entry = opcode::FutexWaitV::new(futexv.as_ptr(), 1)
-            .build()
-            .user_data(0xAABBCCDD);
-        unsafe {
-            ring.submission().push(&entry).expect("sqe push");
-        }
-        // Flush the SQE to the kernel without blocking for a CQE.
-        ring.submit().expect("submit");
-
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            // Child: brief delay so the parent has time to park, then wake.
-            unsafe {
-                libc::usleep(50_000);
-            }
-            unsafe {
-                (*atomic_ptr).store(1, Ordering::Release);
-            }
-            let _ = futex_wake_u32(atomic_ptr as *const AtomicU32, 1);
-            unsafe {
-                libc::_exit(0);
-            }
-        }
-
-        // Parent: block until at least one CQE arrives.
-        ring.submitter().submit_and_wait(1).expect("submit_and_wait");
-        let cqe = ring.completion().next().expect("cqe");
-        assert_eq!(
-            cqe.user_data(),
-            0xAABBCCDD,
-            "user_data must round-trip; got 0x{:X}",
-            cqe.user_data(),
-        );
-        // Unsupported opcode → -EINVAL or -ENOSYS. Success → 0 or >0.
-        // Val mismatch → -EAGAIN (would happen if the child raced ahead).
-        let res = cqe.result();
-        assert!(
-            res == 0 || res == -libc::EAGAIN,
-            "unexpected FutexWaitV result: {} (ENOSYS={} EINVAL={}) — kernel may not support FUTEX_WAITV (Linux 6.7+ required)",
-            res, -libc::ENOSYS, -libc::EINVAL,
-        );
-
-        let mut status: i32 = 0;
-        unsafe {
-            libc::waitpid(pid, &mut status, 0);
-            libc::munmap(ptr as *mut libc::c_void, 4096);
-            libc::close(fd);
-        }
-        drop(futexv);
-    }
-
-    /// The raw multi-word wrapper, mirroring `test_futex_waitv_via_io_uring`:
-    /// a wake on a NON-FIRST word wakes the multi-word wait; no-wake times out
-    /// to -1; a value mismatch fast-returns. Timing assertions, robust to the
-    /// return-code convention.
+    /// The raw multi-word wrapper: a value mismatch fast-returns EAGAIN, no wake
+    /// times out, and a wake on a NON-FIRST word wakes the multi-word wait.
+    ///
+    /// Each case asserts the errno, not just `-1`: the wrapper returns `-1` for
+    /// both a mismatch (EAGAIN) and a timeout (ETIMEDOUT), so a broken wake path
+    /// would satisfy a bare `-1` after sleeping out the deadline. Only the
+    /// timeout case bounds wall-clock, and only from below — an upper bound
+    /// would be asserting the machine is idle.
     #[test]
     fn test_futex_waitv_u32_wakes_on_any_word() {
+        use io_uring::types::FutexWaitV;
         use std::sync::atomic::Ordering;
         use std::time::Instant;
         let fd = memfd_create(b"test_waitv_u32");
@@ -1110,14 +1016,15 @@ mod tests {
             (*w0).store(0, Ordering::Release);
             (*w1).store(0, Ordering::Release);
         }
+        let word = |w: *const AtomicU32, val: u64| FutexWaitV::new().val(val).uaddr(w as u64).flags(FUTEX2_SIZE_U32);
 
-        let t = Instant::now(); // value mismatch → must not block
-        let _ = futex_waitv_u32(&[w0, w1], &[0, 999], 2000);
-        assert!(t.elapsed().as_millis() < 500);
+        let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 999)], 2000);
+        assert_eq!((rc, errno()), (-1, libc::EAGAIN), "value mismatch must fast-return");
 
-        let t = Instant::now(); // no wake → -1 near the 200 ms deadline
-        assert_eq!(futex_waitv_u32(&[w0, w1], &[0, 0], 200), -1);
-        assert!((150..1000).contains(&t.elapsed().as_millis()));
+        let t = Instant::now();
+        let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 0)], 200);
+        assert_eq!((rc, errno()), (-1, libc::ETIMEDOUT), "no wake must time out");
+        assert!(t.elapsed().as_millis() >= 150, "timed out before the deadline");
 
         let pid = unsafe { libc::fork() }; // wake on the NON-FIRST word
         if pid == 0 {
@@ -1128,9 +1035,14 @@ mod tests {
             let _ = futex_wake_u32(w1, 1);
             unsafe { libc::_exit(0) };
         }
-        let t = Instant::now();
-        let _ = futex_waitv_u32(&[w0, w1], &[0, 0], 5000);
-        assert!(t.elapsed().as_millis() < 2000, "non-first-word wake must wake promptly");
+        let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 0)], 5000);
+        // EAGAIN = the child got ahead of us, an equally good proof. ETIMEDOUT
+        // is the failure this asserts against.
+        assert!(
+            rc >= 0 || (rc == -1 && errno() == libc::EAGAIN),
+            "non-first-word wake must not time out (rc={rc} errno={})",
+            errno()
+        );
         unsafe {
             let mut s = 0;
             libc::waitpid(pid, &mut s, 0);
@@ -1139,19 +1051,26 @@ mod tests {
         }
     }
 
+    /// Both growth arms: whichever one runs, the object reaches `size` before
+    /// the mapping exists, so the store lands on a real page instead of raising
+    /// SIGBUS. Production maps the W2M rings `Sized` (memfd) and the SAL
+    /// `Reserved` (a real file).
     #[test]
     fn test_map_shared_sized() {
-        // `Backing::Sized` grows the memfd via ftruncate before mapping, so the
-        // store below lands on a real page instead of raising SIGBUS.
-        let fd = memfd_create(b"test_mmap");
-        assert!(fd >= 0);
-        let ptr = map_shared_sized(fd, 8192, Backing::Sized).unwrap();
-        assert_eq!(fd_size(fd).unwrap(), 8192);
-        unsafe {
-            *ptr = 42;
-            assert_eq!(*ptr, 42);
-            libc::munmap(ptr as *mut libc::c_void, 8192);
-            libc::close(fd);
+        let memfd = unsafe { OwnedFd::from_raw_fd(memfd_create(b"test_mmap")) };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        for (how, fd) in [
+            (Backing::Sized, memfd.as_raw_fd()),
+            (Backing::Reserved, tmp.as_file().as_raw_fd()),
+        ] {
+            assert!(fd >= 0);
+            let ptr = map_shared_sized(fd, 8192, how).unwrap();
+            assert_eq!(fd_size(fd).unwrap(), 8192);
+            unsafe {
+                *ptr = 42;
+                assert_eq!(*ptr, 42);
+                libc::munmap(ptr as *mut libc::c_void, 8192);
+            }
         }
     }
 }

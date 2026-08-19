@@ -2770,7 +2770,6 @@ mod tests {
         // a found-row ColumnarSource view. The byte-typed PK path must preserve
         // byte-for-byte equivalence with the old extend_pk(pk) path: the stored
         // PK region bytes are the same LE bytes extend_pk would have written.
-        crate::foundation::posix_io::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("appendrow_byte_test");
         let schema = SchemaDescriptor::new(

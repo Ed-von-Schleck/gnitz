@@ -150,7 +150,6 @@ mod tests {
     use super::super::layout::*;
     use super::super::shard_file::{region_dir, ShardWriteOpts};
     use super::*;
-    use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::foundation::xxh;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, read_german_string};
@@ -248,7 +247,6 @@ mod tests {
 
     #[test]
     fn open_and_read() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
         let path = build_test_shard(dir.path(), &rows);
@@ -264,7 +262,6 @@ mod tests {
 
     #[test]
     fn binary_search() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=100).map(|i| (i * 2, i as i64)).collect();
         let path = build_test_shard(dir.path(), &rows);
@@ -287,7 +284,6 @@ mod tests {
 
     #[test]
     fn pk_and_payload_addressing() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows = vec![(1u64, 42i64), (2, 84)];
         let path = build_test_shard(dir.path(), &rows);
@@ -330,7 +326,6 @@ mod tests {
 
     #[test]
     fn file_npc_header_roundtrip() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = build_test_shard(dir.path(), &[(1u64, 10i64)]);
         let data = std::fs::read(&path).unwrap();
@@ -346,7 +341,6 @@ mod tests {
 
     #[test]
     fn padded_shard_pads_the_appended_column() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=5).map(|i| (i, i as i64 * 100)).collect();
         let shard = open_widened(dir.path(), "pad.db", &rows, type_code::I64);
@@ -373,7 +367,6 @@ mod tests {
 
     #[test]
     fn padded_shard_slice_to_owned_batch_pads() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
         let shard = open_widened(dir.path(), "pad_slice.db", &rows, type_code::I64);
@@ -394,7 +387,6 @@ mod tests {
 
     #[test]
     fn padded_shard_to_unified_pads() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=3).map(|i| (i, i as i64)).collect();
         let shard = open_widened(dir.path(), "pad_unified.db", &rows, type_code::I64);
@@ -414,7 +406,6 @@ mod tests {
 
     #[test]
     fn padded_shard_with_appended_string_column() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
         let shard = open_widened(dir.path(), "pad_str.db", &rows, type_code::STRING);
@@ -438,7 +429,6 @@ mod tests {
 
     #[test]
     fn shard_wider_than_reader_schema_opens() {
-        raise_fd_limit_for_tests();
         // Reachable from a correct crash: a checkpoint publishes base manifests
         // before it makes the catalog durable, so a boot can read the catalog
         // back at width N and find a shard written at N+1. Rejecting it would
@@ -486,7 +476,6 @@ mod tests {
 
     #[test]
     fn forged_file_npc_is_rejected() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = build_test_shard(dir.path(), &[(1u64, 10i64)]);
         let schema = make_schema_u64_i64();
@@ -515,7 +504,6 @@ mod tests {
 
     #[test]
     fn previous_format_version_is_rejected() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let path = build_test_shard(dir.path(), &[(1u64, 10i64)]);
         let schema = make_schema_u64_i64();
@@ -534,7 +522,6 @@ mod tests {
 
     #[test]
     fn checksum_validation() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows = vec![(1u64, 10i64)];
         let path = build_test_shard(dir.path(), &rows);
@@ -556,7 +543,6 @@ mod tests {
 
     #[test]
     fn empty_shard() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = vec![];
         let path = build_test_shard(dir.path(), &rows);
@@ -573,7 +559,6 @@ mod tests {
 
     #[test]
     fn constant_weight_roundtrip() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 100;
         let pks: Vec<u64> = (1..=n).collect();
@@ -598,7 +583,6 @@ mod tests {
 
     #[test]
     fn two_value_weight_roundtrip() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 64usize;
         let pks: Vec<u64> = (1..=n as u64).collect();
@@ -618,7 +602,6 @@ mod tests {
 
     #[test]
     fn three_value_weight_raw() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let pks: Vec<u64> = vec![1, 2, 3];
         let wts: Vec<i64> = vec![1, -1, 2];
@@ -635,7 +618,6 @@ mod tests {
 
     #[test]
     fn constant_pk_roundtrip() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 128;
         let rows: Vec<(u64, i64)> = (1..=n).map(|i| (i, i as i64)).collect();
@@ -656,7 +638,6 @@ mod tests {
 
     #[test]
     fn constant_null_bmp() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64)).collect();
         let path = build_test_shard(dir.path(), &rows);
@@ -671,7 +652,6 @@ mod tests {
 
     #[test]
     fn constant_payload_column() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 10;
         let pks: Vec<u64> = (1..=n).collect();
@@ -690,7 +670,6 @@ mod tests {
 
     #[test]
     fn unknown_encoding_rejected() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = vec![(1, 10)];
         let path = build_test_shard(dir.path(), &rows);
@@ -709,7 +688,6 @@ mod tests {
     fn two_value_truncated_bitvec_rejected() {
         // Build a shard with TwoValue weight encoding, then corrupt it so the
         // region size is shorter than the required bitvec (< 16 + ceil(n/8)).
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 64usize;
         let pks: Vec<u64> = (1..=n as u64).collect();
@@ -749,7 +727,6 @@ mod tests {
         // TwoValue is valid only for the weight region. Forge it onto the pk
         // region (dir entry 0) and confirm open rejects the shard — `RegionView`
         // has no TwoValue variant, so `build_scalar_region` returns InvalidShard.
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 8usize;
         let pks: Vec<u64> = (1..=n as u64).collect();
@@ -772,7 +749,6 @@ mod tests {
 
     #[test]
     fn single_row_shard() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = vec![(42, 999)];
         let path = build_test_shard(dir.path(), &rows);
@@ -790,7 +766,6 @@ mod tests {
 
     #[test]
     fn whole_shard_slice_roundtrip() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
         let path = build_test_shard(dir.path(), &rows);
@@ -815,7 +790,6 @@ mod tests {
     #[test]
     fn whole_shard_slice_constant_regions() {
         // All weights = 1 (Constant), all null = 0 (Constant), all vals = 42 (Constant)
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 20;
         let pks: Vec<u64> = (1..=n).collect();
@@ -838,7 +812,6 @@ mod tests {
 
     #[test]
     fn whole_shard_slice_two_value_weight() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let n = 16usize;
         let pks: Vec<u64> = (1..=n as u64).collect();
@@ -861,7 +834,6 @@ mod tests {
 
     #[test]
     fn slice_to_owned_batch_with_offset() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 100)).collect();
         let path = build_test_shard(dir.path(), &rows);
@@ -881,7 +853,6 @@ mod tests {
 
     #[test]
     fn slice_to_owned_batch_empty() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=5).map(|i| (i, i as i64)).collect();
         let path = build_test_shard(dir.path(), &rows);
@@ -895,7 +866,6 @@ mod tests {
 
     #[test]
     fn u64_pk_open_and_read() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = vec![(10, 100), (20, 200), (30, 300)];
         let path = build_test_shard(dir.path(), &rows);
@@ -915,7 +885,6 @@ mod tests {
 
     #[test]
     fn u64_pk_slice_to_owned_batch() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1u64..=8).map(|i| (i * 10, i as i64 * 100)).collect();
         let path = build_test_shard(dir.path(), &rows);
@@ -975,7 +944,6 @@ mod tests {
 
     #[test]
     fn shard_reader_get_pk_bytes_raw_region_u64() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = (1..=8).map(|i| (i * 3, i as i64)).collect();
         let path = build_test_shard(dir.path(), &rows);
@@ -995,7 +963,6 @@ mod tests {
 
     #[test]
     fn shard_reader_get_pk_bytes_raw_region_u128() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let pks: Vec<u128> = vec![1, (u64::MAX as u128) + 1, (u64::MAX as u128) * 2 + 3, u128::MAX];
         let vals: Vec<i64> = (0..pks.len() as i64).collect();
@@ -1016,7 +983,6 @@ mod tests {
 
     #[test]
     fn shard_reader_get_pk_bytes_constant_region() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         // All PKs identical -> encoding detection picks Constant.
         let pk_value: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
@@ -1039,7 +1005,6 @@ mod tests {
 
     #[test]
     fn find_lower_bound_bytes_narrow_matches_find_lower_bound() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let rows: Vec<(u64, i64)> = vec![(10, 100), (20, 200), (30, 300), (40, 400)];
         let path = build_test_shard(dir.path(), &rows);
@@ -1063,7 +1028,6 @@ mod tests {
         // writer↔reader contract 3 + num_payload_cols + 1 = 4:
         // [pk, weight, null_bmp, blob]. open() reads exactly that many directory
         // entries.
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = SchemaDescriptor::new(
             &[
@@ -1151,7 +1115,6 @@ mod tests {
 
     #[test]
     fn packed_roundtrip_all_surfaces() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         // Small, narrow-range payload → FoR-eligible; distinct so not Constant.
@@ -1206,7 +1169,6 @@ mod tests {
 
     #[test]
     fn packed_bytes_stable_and_aligned() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let pks: Vec<u64> = (0..300).collect();
@@ -1224,7 +1186,6 @@ mod tests {
 
     #[test]
     fn forged_for_on_non_payload_rejected() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let pks: Vec<u64> = (0..8).collect();
         let vals: Vec<i64> = (0..8).map(|i| 1000 + i).collect();
@@ -1249,7 +1210,6 @@ mod tests {
 
     #[test]
     fn forged_for_payload_bad_size_rejected() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let pks: Vec<u64> = (0..16).collect();
         let vals: Vec<i64> = (0..16).map(|i| 2000 + (i % 5)).collect();
@@ -1291,7 +1251,6 @@ mod tests {
 
     #[test]
     fn writer_packs_by_aligned_footprint() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         // (U64 PK | U32 payload). 10 rows: raw 40 B vs packed 28 B both align to
         // 64 → stays Raw. 100 rows: packs.
@@ -1340,7 +1299,6 @@ mod tests {
 
     #[test]
     fn checksum_catches_corrupted_packed_region() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let pks: Vec<u64> = (0..200).collect();
@@ -1430,7 +1388,6 @@ mod tests {
     /// back to the original strings.
     #[test]
     fn slice_relocates_only_its_own_strings() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         const N: usize = 128;
         const W: usize = 64;
@@ -1482,7 +1439,6 @@ mod tests {
     #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
     fn slice_blob_relocate_bench() {
         use std::time::Instant;
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_pk_u64_payload_string();
         const N: usize = 20_000;
@@ -1544,7 +1500,6 @@ mod tests {
     /// leaves a self-consistent file that passes every structural check.
     #[test]
     fn permuted_directory_entries_rejected() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         // Distinct PKs (Raw), all-1 weights (Constant), all-0 nulls (Constant),
@@ -1598,7 +1553,6 @@ mod tests {
     /// mismatch — the prefix-length check runs ahead of the digest.
     #[test]
     fn truncated_directory_reports_truncated() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
@@ -1615,7 +1569,6 @@ mod tests {
     /// shard holds, so rejecting it is not optional.
     #[test]
     fn forged_xor8_rejected() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64)).collect();
@@ -1651,7 +1604,6 @@ mod tests {
 
     #[test]
     fn empty_shard_carries_no_filter_and_a_zero_checksum() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let path = build_test_shard(dir.path(), &[]);
@@ -1668,7 +1620,6 @@ mod tests {
     /// what `link_child` relies on when it seeds a sibling child.
     #[test]
     fn the_digest_seed_separates_names_not_directories() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let rows: Vec<(u64, i64)> = (1..=4).map(|i| (i, i as i64)).collect();
@@ -1769,7 +1720,6 @@ mod tests {
     /// is inside the digest: no single-bit change to it opens.
     #[test]
     fn every_single_bit_flip_in_the_prefix_is_rejected() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         for (label, path, schema) in sweep_shapes(dir.path()) {
             let base = std::fs::read(&path).unwrap();
@@ -1793,7 +1743,6 @@ mod tests {
     /// check's rather than the digest's.
     #[test]
     fn off_by_one_region_sizes_rejected() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 3)).collect();
@@ -1822,7 +1771,6 @@ mod tests {
     /// `two_value_truncated_bitvec_rejected`.
     #[test]
     fn two_value_long_bitvec_rejected() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let n = 64usize;

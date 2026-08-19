@@ -1006,7 +1006,7 @@ impl SalWriter {
             )
         }
         .ok_or_else(|| {
-            crate::gnitz_debug!(
+            gnitz_debug!(
                 "SAL {} refused: cursor={} mmap={} epoch={}",
                 what,
                 self.write_cursor.get(),
@@ -1473,7 +1473,7 @@ impl SalReader {
                 Some(msg)
             }
             SalStep::Corrupt => {
-                crate::gnitz_fatal_abort!("SAL group header failed its digest at offset={cursor} — the log is damaged")
+                gnitz_fatal_abort!("SAL group header failed its digest at offset={cursor} — the log is damaged")
             }
             SalStep::Absent | SalStep::OtherEpoch => None,
         }

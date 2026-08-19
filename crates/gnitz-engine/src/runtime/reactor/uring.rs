@@ -124,7 +124,7 @@ impl IoUringRing {
     /// continue; `what` names the operation for the log line.
     pub(super) fn flush_sqes(&mut self, what: &str) {
         if let Err(e) = self.submit_and_wait_timeout(0, 0) {
-            crate::gnitz_error!(
+            gnitz_error!(
                 "reactor: {} SQE flush failed (errno={}); SQE queued — will submit on next tick",
                 what,
                 e,

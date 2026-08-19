@@ -14,7 +14,7 @@ impl CatalogEngine {
     /// fail-stops, matching `compensate_stage_a`'s rollback abort.
     pub(super) fn rollback_index_registration(&mut self, undo: Batch, index_id: i64) {
         if let Err(undo_err) = self.submit_local(SysFamily::Index, undo) {
-            crate::gnitz_fatal_abort!(
+            gnitz_fatal_abort!(
                 "catalog: index registration rollback failed (index_id={}): {} \
                  — catalog state permanently diverged; aborting",
                 index_id,

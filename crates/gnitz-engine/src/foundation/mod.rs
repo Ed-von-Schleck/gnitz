@@ -7,7 +7,8 @@
 //!   - `xxh`        — XXH3 hashing
 //!   - `posix_io`   — POSIX I/O and Linux syscall wrappers (file I/O, sockets,
 //!     mmap + its unaligned `*_raw` accessors, eventfd/futex/memfd IPC)
-//!   - `worker_ctx` — per-process worker rank / count
+//!   - `worker_ctx` — per-process worker rank / count, fork role, and the
+//!     checkpoint generation a manifest must carry to be resumed from
 
 #[macro_use]
 pub(crate) mod log;

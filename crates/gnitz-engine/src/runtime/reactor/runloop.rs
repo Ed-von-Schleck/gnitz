@@ -98,10 +98,10 @@ impl Reactor {
             // Block indefinitely — outstanding timer SQEs guarantee a CQE
             // will arrive when the soonest timer fires.
             if let Err(e) = self.inner.ring.borrow_mut().submit_and_wait_timeout(1, -1) {
-                crate::gnitz_error!("reactor: tick blocking submit failed (errno={})", e);
+                gnitz_error!("reactor: tick blocking submit failed (errno={})", e);
             }
         } else if let Err(e) = self.inner.ring.borrow_mut().submit_and_wait_timeout(0, 0) {
-            crate::gnitz_error!("reactor: tick non-blocking submit failed (errno={})", e);
+            gnitz_error!("reactor: tick non-blocking submit failed (errno={})", e);
         }
     }
 

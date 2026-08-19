@@ -325,7 +325,6 @@ pub(crate) fn sweep_bit_flips(
 /// forever — the start-of-test `remove_dir_all` cannot delete it (sticky bit)
 /// and `CatalogEngine::open` then fails EACCES creating subdirs under it.
 pub(crate) fn scratch_dir(scope: &str, name: &str) -> String {
-    crate::foundation::posix_io::raise_fd_limit_for_tests();
     let owner = std::env::var("USER").unwrap_or_else(|_| std::process::id().to_string());
     let path = std::env::temp_dir()
         .join(format!("gnitz_{scope}_test_{owner}_{name}"))

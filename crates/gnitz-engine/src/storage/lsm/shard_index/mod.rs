@@ -265,7 +265,6 @@ impl ShardIndex {
 mod tests {
     use super::super::shard_file;
     use super::*;
-    use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::key::probe_key;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::make_schema_u64_i64;
@@ -399,7 +398,6 @@ mod tests {
 
     #[test]
     fn test_add_unsynced_shard_and_find_pk() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -427,7 +425,6 @@ mod tests {
 
     #[test]
     fn test_manifest_roundtrip_with_levels() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -470,7 +467,6 @@ mod tests {
 
     #[test]
     fn test_run_compact_l0_to_l1() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -504,7 +500,6 @@ mod tests {
 
     #[test]
     fn test_compact_guards_if_needed() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -538,7 +533,6 @@ mod tests {
 
     #[test]
     fn test_compact_guard_vertical_failure_leaves_index_unchanged() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -590,7 +584,6 @@ mod tests {
         // Regression for the find_guard_idx/find_guard_for_key mismatch: a key
         // inserted below L1's first guard key (100) must remain findable after
         // an L0→L1 compaction.
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -649,7 +642,6 @@ mod tests {
 
     #[test]
     fn test_try_cleanup() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -679,7 +671,6 @@ mod tests {
     /// compaction consumed drop out (they move to `pending_deletions`).
     #[test]
     fn test_unsynced_tracking_register_prune_clear() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -717,7 +708,6 @@ mod tests {
 
     #[test]
     fn test_max_lsn() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -742,7 +732,6 @@ mod tests {
     /// the next trigger retries against intact inputs.
     #[test]
     fn test_run_compact_failure_leaves_l0_intact() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
 
@@ -783,7 +772,6 @@ mod tests {
     /// become unfindable.
     #[test]
     fn test_compact_guard_vertical_routing_gap() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -840,7 +828,6 @@ mod tests {
     /// guard's key range.
     #[test]
     fn test_vertical_disjoint_guards_no_name_collision() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -916,7 +903,6 @@ mod tests {
     /// outputs distinct, so only the genuinely-superseded input is deleted.
     #[test]
     fn test_vertical_same_guard_recompaction_try_cleanup_keeps_live() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -977,7 +963,6 @@ mod tests {
 
     #[test]
     fn test_gc_orphans_removes_stale_shard() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -998,7 +983,6 @@ mod tests {
 
     #[test]
     fn test_gc_orphans_ignores_other_table_id() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1020,7 +1004,6 @@ mod tests {
 
     #[test]
     fn test_gc_orphans_removes_manifest_tmp() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1035,7 +1018,6 @@ mod tests {
 
     #[test]
     fn test_gc_orphans_removes_tmp_suffix_orphans() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1053,7 +1035,6 @@ mod tests {
 
     #[test]
     fn test_gc_orphans_empty_index_removes_stray() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         // Empty index — no load_manifest call.
@@ -1070,7 +1051,6 @@ mod tests {
     /// Golden values for the single-PK probe range gate and the L0 sort order.
     #[test]
     fn test_single_pk_probe_and_sort_golden() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
 
@@ -1108,7 +1088,6 @@ mod tests {
     /// get_pk_bytes on a count == 0 shard.
     #[test]
     fn test_empty_shard_sentinel() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
 
         let single = make_schema_u64_i64();
@@ -1168,7 +1147,6 @@ mod tests {
         // probe_pk_bytes's compound arm prunes an out-of-range key (exercises
         // the stride assert + pk_in_range wiring).
         let dir = tempfile::tempdir().unwrap();
-        raise_fd_limit_for_tests();
         let p = write_compound_shard(dir.path(), "compound.db", &[(1, 5), (1, 9), (2, 3)], &[10, 20, 30]);
         let entry = ShardEntry::open(&p, &schema, 1).unwrap();
         assert_eq!(entry.pk_min.pk_bytes(), &opk2(1, 5));
@@ -1196,7 +1174,6 @@ mod tests {
     /// anchor guard `vec![0]` for every PK width, wide included.
     #[test]
     fn test_l1_guard_keys_wide_bypass() {
-        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = wide_schema();
         assert_eq!(schema.pk_stride(), 24);
@@ -1270,7 +1247,6 @@ mod tests {
     /// pushes data down: the sweep's first test fails and it returns at once.
     #[test]
     fn a_slack_capacity_leaves_the_store_untouched() {
-        raise_fd_limit_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let mut idx = index_with_l0(tmp.path(), 3);
         let before = idx.resident_bytes();
@@ -1291,7 +1267,6 @@ mod tests {
     /// everything terminal, everything skeleton — with the cap still unmet.
     #[test]
     fn the_sweep_converges_to_the_skeleton_floor_one_push_down_per_call() {
-        raise_fd_limit_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let mut idx = index_with_l0(tmp.path(), 4);
 
@@ -1325,7 +1300,6 @@ mod tests {
     /// content survives — a skeleton row keeps its key and its summed weight.
     #[test]
     fn dehydration_takes_the_oldest_written_terminal_guard_first() {
-        raise_fd_limit_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let mut idx = index_with_l0(tmp.path(), 3);
         // Sink everything to the terminal level, still hydrated.
@@ -1373,7 +1347,6 @@ mod tests {
     /// work is not undone.
     #[test]
     fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
-        raise_fd_limit_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64());
         // One key band, so every later fold routes back into the same guard.
@@ -1407,7 +1380,6 @@ mod tests {
     /// sweep drain L1 at all.
     #[test]
     fn vertical_fold_touches_only_the_guards_its_extent_overlaps() {
-        raise_fd_limit_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64());
         // Three well-separated key bands → three terminal guards.

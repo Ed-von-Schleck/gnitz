@@ -293,19 +293,19 @@ fn probe_futex_waitv_support() {
 
         let mut ring = match IoUringRing::new(8) {
             Ok(r) => r,
-            Err(e) => crate::gnitz_fatal_abort!("reactor: probe io_uring init failed: {}", e,),
+            Err(e) => gnitz_fatal_abort!("reactor: probe io_uring init failed: {}", e,),
         };
         // SAFETY: `futexv` and `atomic` outlive the CQE drained below.
         unsafe { ring.prep_futex_waitv(futexv.as_ptr(), 1, 0xFEED) };
         if let Err(e) = ring.submit_and_wait_timeout(1, -1) {
-            crate::gnitz_fatal_abort!("reactor: probe submit_and_wait failed (errno={})", e);
+            gnitz_fatal_abort!("reactor: probe submit_and_wait failed (errno={})", e);
         }
         let mut out = [Cqe::default(); 1];
         if ring.drain_cqes(&mut out) != 1 {
-            crate::gnitz_fatal_abort!("reactor: probe produced no CQE");
+            gnitz_fatal_abort!("reactor: probe produced no CQE");
         }
         if out[0].res == -libc::ENOSYS || out[0].res == -libc::EINVAL {
-            crate::gnitz_fatal_abort!(
+            gnitz_fatal_abort!(
                 "reactor: io_uring IORING_OP_FUTEX_WAITV not supported (res={}); \
                  Linux 6.7+ required for the W2M tail-chasing-ring transport.",
                 out[0].res,
@@ -421,7 +421,7 @@ impl Reactor {
             let _ = self.inner.ring.borrow_mut().submit_and_wait_timeout(1, 100);
         }
         if self.inner.futex_waitv_armed.get() {
-            crate::gnitz_fatal_abort!(
+            gnitz_fatal_abort!(
                 "reactor: FUTEX_WAITV cancel did not complete within 2s — \
                  freeing storage now would be a UAF"
             );
@@ -757,7 +757,7 @@ impl Reactor {
                 if let Some(tx) = self.inner.relay_tx.borrow().as_ref() {
                     tx.send(relay);
                 } else {
-                    crate::gnitz_warn!(
+                    gnitz_warn!(
                         "reactor: FLAG_EXCHANGE relay produced before relay_tx attached (view_id={})",
                         relay.view_id,
                     );
@@ -772,7 +772,7 @@ impl Reactor {
         );
         let req_id = prefix as u64;
         if !self.inner.replies.complete(req_id, decoded) {
-            crate::gnitz_warn!("reactor: unrouted W2M reply worker={} req_id={}", w, req_id,);
+            gnitz_warn!("reactor: unrouted W2M reply worker={} req_id={}", w, req_id,);
         }
     }
 

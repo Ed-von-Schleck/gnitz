@@ -91,7 +91,7 @@ impl W2mWriter {
                         if rc < 0 {
                             let errno = posix_io::errno();
                             if errno != libc::EINTR && errno != libc::EAGAIN {
-                                crate::gnitz_fatal_abort!(
+                                gnitz_fatal_abort!(
                                     "W2mWriter::send_encoded: futex_wait_u32 failed: \
                                      rc={} errno={}",
                                     rc,
@@ -134,7 +134,7 @@ fn bump_and_wake(seq: &AtomicU32, flags: &AtomicU32, parked_bit: u32, site: &str
     }
     let rc = posix_io::futex_wake_u32(seq as *const AtomicU32, 1);
     if rc < 0 {
-        crate::gnitz_fatal_abort!("{}: futex_wake_u32 failed: rc={} errno={}", site, rc, posix_io::errno());
+        gnitz_fatal_abort!("{}: futex_wake_u32 failed: rc={} errno={}", site, rc, posix_io::errno());
     }
 }
 
@@ -191,7 +191,7 @@ impl InFlightState {
         self.queue.push_back((new_vrc, false));
         if !self.warned && self.queue.len() > W2M_MAX_IN_FLIGHT {
             self.warned = true;
-            crate::gnitz_warn!(
+            gnitz_warn!(
                 "w2m: {} reply slots simultaneously in-flight on one ring (soft \
                  threshold {}); a slow client is parking frames — backpressure is \
                  the ring's {} MiB byte capacity",
@@ -365,7 +365,7 @@ impl W2mReceiver {
         let slot = self.try_read_slot(worker)?;
         match decode_wire_ipc(slot.bytes()) {
             Ok(decoded) => Some(decoded),
-            Err(e) => crate::gnitz_fatal_abort!(
+            Err(e) => gnitz_fatal_abort!(
                 "W2mReceiver::try_read: worker={} decode failed: {:?} — ring corrupt",
                 worker,
                 e,

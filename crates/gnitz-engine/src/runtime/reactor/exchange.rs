@@ -101,7 +101,7 @@ impl ExchangeAccumulator {
             let schema = match round.schema {
                 Some(s) => s,
                 None => {
-                    crate::gnitz_warn!(
+                    gnitz_warn!(
                         "exchange: no schema received for (view_id={}, source_id={})",
                         vid,
                         source_id

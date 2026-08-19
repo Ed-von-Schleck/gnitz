@@ -570,7 +570,6 @@ impl DagEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foundation::posix_io::raise_fd_limit_for_tests;
 
     fn dag_test_dir(name: &str) -> String {
         crate::test_support::scratch_dir("dag", name)
@@ -828,7 +827,6 @@ mod tests {
     #[test]
     fn test_enforce_unique_pk_signed_negative_retraction() {
         use crate::schema::{type_code, SchemaColumn};
-        raise_fd_limit_for_tests();
 
         let schema = SchemaDescriptor::new(
             &[
@@ -895,7 +893,6 @@ mod tests {
     #[test]
     fn test_enforce_unique_pk_weight_normalized() {
         use crate::schema::{type_code, SchemaColumn};
-        raise_fd_limit_for_tests();
 
         let schema = SchemaDescriptor::new(
             &[
@@ -962,7 +959,6 @@ mod tests {
     #[test]
     fn test_enforce_unique_pk_absent_key_drops_phantom() {
         use crate::schema::{type_code, SchemaColumn};
-        raise_fd_limit_for_tests();
 
         let schema = SchemaDescriptor::new(
             &[
@@ -1034,7 +1030,6 @@ mod tests {
     #[test]
     fn test_enforce_unique_pk_wide_pk() {
         use crate::test_support::{opk_pk, wide_pk_3xu64_schema, wide_row};
-        raise_fd_limit_for_tests();
 
         let schema = wide_pk_3xu64_schema();
         let dir = tempfile::tempdir().unwrap();
