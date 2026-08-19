@@ -161,6 +161,10 @@ impl RowSource for Run {
             Run::Shard(s) => s.blob_slice(),
         }
     }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        Run::count(self)
+    }
 }
 
 impl ColumnarSource for Run {
@@ -170,10 +174,6 @@ impl ColumnarSource for Run {
             Run::Mem(b) => b.get_weight(row),
             Run::Shard(s) => s.get_weight(row),
         }
-    }
-    #[inline(always)]
-    fn row_count(&self) -> usize {
-        Run::count(self)
     }
     #[inline(always)]
     fn is_skeleton(&self) -> bool {

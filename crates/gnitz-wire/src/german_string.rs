@@ -58,20 +58,40 @@ pub fn blob_extent(blob_len: usize, heap_offset: u64, length: usize) -> Option<s
     Some(heap_offset as usize..end as usize)
 }
 
+/// `Some` iff `cell` is short — its inline content, borrowed from the cell.
+/// The one place the length field's position, the short/long test and the
+/// inline content base are spelled; every reader of the layout branches here.
+///
+/// The inline arm is one contiguous slice because the layout is contiguous:
+/// `[4..8]` holds content bytes `[0..4)` and `[8..]` continues at content byte
+/// 4, so `cell[4..4 + len]` is the whole value.
+///
+/// `#[inline(always)]`, not `#[inline]`: cross-crate inlining needs the
+/// attribute, and a plain hint is not honoured at opt-level 0 — where
+/// `german_string_content` is already a real call on gnitz-engine's per-row
+/// comparator, so an unannotated callee would add a second call layer.
+#[inline(always)]
+pub fn german_string_inline(cell: &[u8]) -> Option<&[u8]> {
+    let length = read_u32_le(cell, 0) as usize;
+    (length <= SHORT_STRING_THRESHOLD).then(|| &cell[4..4 + length])
+}
+
+/// A **long** cell's clamped heap range, or `None` for a corrupt header. Only
+/// meaningful once [`german_string_inline`] has answered `None`.
+#[inline(always)]
+pub fn german_string_heap(cell: &[u8], blob_len: usize) -> Option<std::ops::Range<usize>> {
+    blob_extent(blob_len, read_u64_le(cell, 8), read_u32_le(cell, 0) as usize)
+}
+
 /// Decode a 16-byte German String struct into raw bytes, or `None` if a
 /// long string's blob offset/length overruns `blob`. The owned, fallible
 /// counterpart of [`german_string_content`] — for the trust boundaries that
 /// must reject a corrupt cell rather than degrade it to empty.
-///
-/// The short arm is one contiguous slice because the layout is contiguous:
-/// `[4..8]` holds content bytes `[0..4)` and `[8..]` continues at content byte
-/// 4, so `st[4..4 + len]` is the whole value.
 pub fn try_decode_german_string(st: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
-    let length = read_u32_le(st, 0) as usize;
-    if length <= SHORT_STRING_THRESHOLD {
-        return Some(st[4..4 + length].to_vec());
+    match german_string_inline(st) {
+        Some(inline) => Some(inline.to_vec()),
+        None => Some(blob[german_string_heap(st, blob.len())?].to_vec()),
     }
-    Some(blob[blob_extent(blob.len(), read_u64_le(st, 8), length)?].to_vec())
 }
 
 /// True iff `cell` is in **canonical form** against `blob` — i.e. a cell
@@ -87,8 +107,7 @@ pub fn try_decode_german_string(st: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
 /// - **Long**: the heap extent must fit, *and* the inline prefix `[4..8)` must
 ///   match the first four heap bytes, for the same reason.
 pub fn german_string_cell_ok(cell: &[u8], blob: &[u8]) -> bool {
-    let length = read_u32_le(cell, 0) as usize;
-    if length <= SHORT_STRING_THRESHOLD {
+    if german_string_inline(cell).is_some() {
         // Asked as "is this already what the canonicalizer would produce" —
         // which is what the short arm means. Two masked word compares instead of
         // a byte-at-a-time pad scan LLVM cannot vectorize (the start index is
@@ -98,7 +117,7 @@ pub fn german_string_cell_ok(cell: &[u8], blob: &[u8]) -> bool {
         return *c == canonical_short_cell(c);
     }
     // `length > 4`, so the resolved range always holds the four prefix bytes.
-    match blob_extent(blob.len(), read_u64_le(cell, 8), length) {
+    match german_string_heap(cell, blob.len()) {
         Some(r) => cell[4..8] == blob[r.start..r.start + 4],
         None => false,
     }
@@ -135,23 +154,23 @@ pub fn canonical_short_cell(src: &[u8; 16]) -> [u8; 16] {
     dest
 }
 
-/// Full logical content bytes of a German string struct `s` (16-byte layout:
-/// `[0..4]` = length, then inline-or-heap content). Short strings
-/// (len ≤ SHORT_STRING_THRESHOLD) store content inline at `[4..4 + length]`;
-/// long strings live in `blob` at the heap offset.
+/// Full logical content bytes of a German string struct `s`, degrading a
+/// corrupt long header to `&[]`.
 ///
-/// This is the **single** content accessor: ordering, hashing and relocation
-/// all read a cell through it, so a corrupt long header degrades to `&[]` the
-/// same way everywhere instead of each path inventing its own overrun rule.
+/// The one **degrading** content accessor: ordering, hashing and the evaluator's
+/// cell decode all read through it, so an overrun means empty everywhere instead
+/// of each path inventing its own rule. The layout itself has other readers —
+/// [`german_string_cell_ok`]'s extent check, [`canonical_short_cell`], and the
+/// compaction relocator — which is why the *layout* lives in
+/// [`german_string_inline`] / [`german_string_heap`] rather than here.
 #[inline]
 pub fn german_string_content<'a>(s: &'a [u8], blob: &'a [u8]) -> &'a [u8] {
-    let length = read_u32_le(s, 0) as usize;
-    if length <= SHORT_STRING_THRESHOLD {
-        return &s[4..4 + length];
-    }
-    match blob_extent(blob.len(), read_u64_le(s, 8), length) {
-        Some(r) => &blob[r],
-        None => &[],
+    match german_string_inline(s) {
+        Some(inline) => inline,
+        None => match german_string_heap(s, blob.len()) {
+            Some(r) => &blob[r],
+            None => &[],
+        },
     }
 }
 

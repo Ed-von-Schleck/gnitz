@@ -157,10 +157,10 @@ impl EmitCtx<'_> {
     /// predicate `ScalarFunc`.
     fn create_expr_predicate(
         &mut self,
-        dep: gnitz_wire::ExprBlob,
+        blob: &[u8],
         schema: &SchemaDescriptor,
     ) -> Result<*const ScalarFunc, CompileError> {
-        let func = LogicalProgram::from_wire(&dep.code, dep.num_regs, dep.result_reg, dep.const_strings)
+        let func = LogicalProgram::from_blob(blob, "filter")
             .and_then(|p| ScalarFunc::from_predicate(p, schema))
             .map_err(expr_reject("filter: invalid predicate program"))?;
         Ok(self.push_func(func))
@@ -289,8 +289,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
             // A present-but-corrupt blob, or a rejected program, is catalog
             // corruption. Falling back to pass-all would silently turn a WHERE
             // into WHERE TRUE; fail the compile instead.
-            let dep = gnitz_wire::decode_expr_blob(blob).ok_or(CompileError::Rejected("filter: corrupt expr blob"))?;
-            let func_ptr = ctx.create_expr_predicate(dep, &in_schema)?;
+            let func_ptr = ctx.create_expr_predicate(blob, &in_schema)?;
             let func_idx = ctx.builder.func_idx(func_ptr);
             ctx.builder.push(Instr::Filter {
                 in_reg,
@@ -489,9 +488,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
 /// are client-supplied catalog data, and skipping a corrupt blob would leave the
 /// output register at the default empty schema — silently wrong results downstream.
 fn decode_map_program(program: &[u8]) -> Result<LogicalProgram, CompileError> {
-    let dep = gnitz_wire::decode_expr_blob(program).ok_or(CompileError::Rejected("map: corrupt expr blob"))?;
-    LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, dep.const_strings)
-        .map_err(expr_reject("map: invalid program"))
+    LogicalProgram::from_map_blob(program, "map").map_err(expr_reject("map: invalid program"))
 }
 
 /// True iff `prog` reproduces its input row unchanged under `out_schema`: same

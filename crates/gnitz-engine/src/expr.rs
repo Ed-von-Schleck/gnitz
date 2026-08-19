@@ -419,7 +419,7 @@ impl ScalarFunc {
             unreachable!("filter_ranges on a Map ScalarFunc (the VM dispatch is per-node)");
         };
         out.clear();
-        ev.filter(&batch.as_mem_batch(), batch.count, |start, end| out.push((start, end)));
+        ev.filter(&batch.as_mem_batch(), |start, end| out.push((start, end)));
     }
 
     /// Map every `[start, end)` range of `src`, in list order, onto `keeper`'s
@@ -929,16 +929,17 @@ mod tests {
 
     /// An empty wire program decodes to `num_regs = 0, result_reg = 0` — framing
     /// accepts it, and `validate` cannot reject it outright because that is exactly
-    /// the shape every `copy_cols` map has. As a *filter* it has no result to read,
-    /// so `from_predicate` rejects it rather than letting it masquerade as a filter
-    /// that passes nothing (which a client would read as an empty table).
+    /// the shape every `copy_cols` map has. The *filter* and *scalar* roles are the
+    /// ones that read a result register back, so each rejects it rather than letting
+    /// it masquerade as a filter that passes nothing (which a client would read as
+    /// an empty table).
     #[test]
     fn test_register_free_predicate_is_rejected() {
         let schema = make_schema(0, &[8, 9]);
         let prog = LogicalProgram::from_wire(&[], 0, 0, vec![]).unwrap();
         assert_eq!(
             ScalarFunc::from_predicate(prog, &schema).err(),
-            Some(ExprValidateErr::PredicateWithoutResultReg)
+            Some(ExprValidateErr::ResultRegRequired)
         );
         // The same shape is legitimate as a map: `copy_cols` builds it.
         assert!(ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).is_ok());

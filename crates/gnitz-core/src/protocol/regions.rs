@@ -50,6 +50,7 @@ impl ViewBuffers {
             blob,
             batch,
             pk_stride,
+            rows: batch.len(),
         }
     }
 
@@ -191,6 +192,10 @@ pub struct ZSetBatchView<'a> {
     blob: &'a [u8],
     batch: &'a ZSetBatch,
     pk_stride: usize,
+    /// Cached rather than re-derived: `ZSetBatch::len` divides the PK buffer
+    /// length by a runtime stride, and `row_count` is read once per morsel and
+    /// once per `eval_row` — which the DML row loop drives with `m = 1` per row.
+    rows: usize,
 }
 
 impl<'a> ZSetBatchView<'a> {
@@ -200,11 +205,6 @@ impl<'a> ZSetBatchView<'a> {
     }
 }
 
-/// **This source is not OPK.** A client-side `ZSetBatch` holds its PK region in
-/// native little-endian; the order-preserving encoding is applied server-side. So
-/// the OPK-inverting readers on [`gnitz_expr::ColumnLocator`] (`native_le_bytes`,
-/// `decode_i64`, `native_key`, `route_key`) must not be pointed at a
-/// `ZSetBatchView` — on a PK column they would byte-swap an already-native value.
 impl gnitz_expr::RowSource for ZSetBatchView<'_> {
     #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
@@ -226,6 +226,11 @@ impl gnitz_expr::RowSource for ZSetBatchView<'_> {
     fn blob(&self) -> &[u8] {
         self.blob
     }
+
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.rows
+    }
 }
 
 impl gnitz_expr::BatchView for ZSetBatchView<'_> {
@@ -235,7 +240,11 @@ impl gnitz_expr::BatchView for ZSetBatchView<'_> {
     #[inline(always)]
     fn col_data(&self, pi: usize, col_size: usize) -> &[u8] {
         let region = self.regions[REG_PAYLOAD_START + pi];
-        debug_assert_eq!(region.len() % col_size, 0, "col_data({pi}, {col_size}) width mismatch");
+        debug_assert_eq!(
+            region.len(),
+            self.rows * col_size,
+            "col_data({pi}, {col_size}) width mismatch",
+        );
         region
     }
 
@@ -371,6 +380,15 @@ mod tests {
 
     // ── The region/per-row contract ──────────────────────────────────────────
 
+    /// Fixture A's PK columns as the harness wants them, at their PK-list
+    /// offsets: ci3 (I64) first, ci0 (U32) second.
+    fn a_pk_expect() -> [(Vec<u128>, u8, usize); 2] {
+        [
+            (PK3.iter().map(|&v| v as u128).collect(), TypeCode::I64 as u8, 0),
+            (PK0.iter().map(|&v| v as u128).collect(), TypeCode::U32 as u8, 8),
+        ]
+    }
+
     #[test]
     fn zsetbatchview_satisfies_the_region_per_row_contract() {
         let schema = fixture_a_schema();
@@ -378,62 +396,55 @@ mod tests {
         let mut bufs = ViewBuffers::default();
         {
             let view = bufs.view(&batch, &schema);
-            gnitz_expr::assert_batchview_consistent(&view, 3, &A_SLOTS);
+            let pk = a_pk_expect();
+            gnitz_expr::assert_batchview_consistent(
+                &view,
+                3,
+                &A_SLOTS,
+                &[(pk[0].1, pk[0].2, &pk[0].0), (pk[1].1, pk[1].2, &pk[1].0)],
+            );
         }
         // A residual can legitimately get an empty batch: every region length
         // must degrade to 0.
         let empty = ZSetBatch::new(&schema);
         let view = bufs.view(&empty, &schema);
-        gnitz_expr::assert_batchview_consistent(&view, 0, &A_SLOTS);
+        gnitz_expr::assert_batchview_consistent(&view, 0, &A_SLOTS, &[]);
     }
 
     #[test]
     fn locate_addresses_the_pk_region_the_builder_hands_out() {
-        // Take the address from `locate`, never from the test's own arithmetic.
-        let check = |schema: &Schema, batch: &ZSetBatch, ci: usize, want: &[&[u8]]| {
-            let mut bufs = ViewBuffers::default();
-            let view = bufs.view(batch, schema);
-            let (byte_off, size, tc) = match SchemaFacts::locate(schema, ci) {
-                gnitz_expr::ColumnLocator::Pk {
-                    byte_off,
-                    size,
-                    type_code,
-                } => (byte_off as usize, size as usize, type_code),
-                other => panic!("column {ci} must locate to the PK region, got {other:?}"),
+        // Take the address from `locate`, never from the test's own arithmetic:
+        // the harness pins an offset absolutely, this pins it to what the
+        // *schema* answers, so a `locate` that drifted from the builder's own
+        // PK-list walk fails here rather than reading a neighbouring column.
+        let check =
+            |schema: &Schema, batch: &ZSetBatch, rows: usize, cols: &[(usize, usize)], want: &[(usize, &[u128])]| {
+                let mut bufs = ViewBuffers::default();
+                let view = bufs.view(batch, schema);
+                let pk: Vec<gnitz_expr::PkColExpect<'_>> = want
+                    .iter()
+                    .map(|&(ci, vals)| match SchemaFacts::locate(schema, ci) {
+                        gnitz_expr::ColumnLocator::Pk {
+                            byte_off, type_code, ..
+                        } => (type_code, byte_off as usize, vals),
+                        other => panic!("column {ci} must locate to the PK region, got {other:?}"),
+                    })
+                    .collect();
+                gnitz_expr::assert_batchview_consistent(&view, rows, cols, &pk);
             };
-            for (row, want_row) in want.iter().enumerate() {
-                let opk = &view.get_pk_bytes(row)[byte_off..byte_off + size];
-                let native = gnitz_wire::decode_pk_column_owned(opk, tc);
-                assert_eq!(&native[..size], *want_row, "column {ci}, row {row}");
-            }
-        };
 
-        let a_schema = fixture_a_schema();
-        let a_batch = fixture_a_batch();
-        let k0: Vec<[u8; 8]> = PK3.iter().map(|v| v.to_le_bytes()).collect();
-        let k1: Vec<[u8; 4]> = PK0.iter().map(|v| v.to_le_bytes()).collect();
+        let a_k0: Vec<u128> = PK3.iter().map(|&v| v as u128).collect();
+        let a_k1: Vec<u128> = PK0.iter().map(|&v| v as u128).collect();
         check(
-            &a_schema,
-            &a_batch,
+            &fixture_a_schema(),
+            &fixture_a_batch(),
             3,
-            &k0.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
-        );
-        check(
-            &a_schema,
-            &a_batch,
-            0,
-            &k1.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+            &A_SLOTS,
+            &[(3, &a_k0), (0, &a_k1)],
         );
 
-        let b_schema = fixture_b_schema();
-        let b_batch = fixture_b_batch();
-        let bk: Vec<[u8; 4]> = B_PK.iter().map(|v| (*v as u32).to_le_bytes()).collect();
-        check(
-            &b_schema,
-            &b_batch,
-            0,
-            &bk.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
-        );
+        let b_k: Vec<u128> = B_PK.iter().map(|&v| v as u128).collect();
+        check(&fixture_b_schema(), &fixture_b_batch(), 3, &[(0, 8)], &[(0, &b_k)]);
     }
 
     // ── The shared evaluator over a client batch ─────────────────────────────
@@ -445,7 +456,7 @@ mod tests {
         let mut bufs = ViewBuffers::default();
         let view = bufs.view(&batch, &schema);
 
-        // ci3 is a PK column: `LoadColInt` accepts one (`ColKind::FixedInt` is
+        // ci3 is a PK column: `LoadColInt` accepts one (`ColKind::FIXED_INT` is
         // not payload-only) and lowers to `Instr::LoadPk`, so this exercises
         // `locate`'s PK arm, its payload arm and the region addressing together.
         let ev = LogicalProgram::new(
@@ -462,10 +473,9 @@ mod tests {
         .expect("program resolves against the client schema");
 
         for row in 0..3 {
-            let (v, is_null) = ev.eval_row(&view, row);
+            let v = ev.eval_row(&view, row).expect("row {row} must not be null");
             assert_eq!(v, PK3[row] + C1[row] as i64, "row {row}");
             // The program names only non-nullable slots, so `no_nulls` is on.
-            assert!(!is_null, "row {row} must not be null");
         }
     }
 
@@ -476,8 +486,8 @@ mod tests {
         let mut bufs = ViewBuffers::default();
         let view = bufs.view(&batch, &schema);
 
-        // A different program from the one above: `is_strictly_non_nullable`
-        // tests only the slots the instructions name, so naming ci2 (payload
+        // A different program from the one above: `analyze` tests only the
+        // slots the instructions name, so naming ci2 (payload
         // slot 1, nullable) is what forces `no_nulls` off.
         let ev = LogicalProgram::new(
             vec![
@@ -492,9 +502,9 @@ mod tests {
         .resolve_scalar(&schema)
         .expect("program resolves against the client schema");
 
-        assert_eq!(ev.eval_row(&view, 0), (PK3[0] + C2[0], false));
-        assert!(ev.eval_row(&view, 1).1, "row 1 nulls the nullable column");
-        assert_eq!(ev.eval_row(&view, 2), (PK3[2] + C2[2], false));
+        assert_eq!(ev.eval_row(&view, 0), Some(PK3[0] + C2[0]));
+        assert!(ev.eval_row(&view, 1).is_none(), "row 1 nulls the nullable column");
+        assert_eq!(ev.eval_row(&view, 2), Some(PK3[2] + C2[2]));
     }
 
     #[test]
@@ -525,7 +535,7 @@ mod tests {
         .expect("predicate resolves against the client schema");
 
         let mut ranges: Vec<(usize, usize)> = Vec::new();
-        ev.filter(&view, 3, |s, e| ranges.push((s, e)));
+        ev.filter(&view, |s, e| ranges.push((s, e)));
         assert_eq!(ranges, vec![(0, 1)]);
     }
 
@@ -556,9 +566,9 @@ mod tests {
         // bytes (and come out equal, not less-than).
         for row in 0..2 {
             let want = (C4[row].as_bytes() < C5[row]) as i64;
-            assert_eq!(ev.eval_row(&view, row), (want, false), "row {row}");
+            assert_eq!(ev.eval_row(&view, row), Some(want), "row {row}");
         }
-        assert!(ev.eval_row(&view, 2).1, "row 2 nulls both string columns");
+        assert!(ev.eval_row(&view, 2).is_none(), "row 2 nulls both string columns");
     }
 
     #[test]

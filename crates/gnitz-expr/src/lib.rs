@@ -18,19 +18,26 @@
 //! [`BatchView`] for *where a value physically sits* and [`SchemaFacts`] for
 //! *what the schema says about it*.
 //!
-//! The emitter and the decoder are two tables over the same opcode space, so
-//! they belong in one crate: `builder.rs`'s drift test is the only thing that
-//! checks them against each other, and it is only writable here.
+//! `LogicalInstr::to_wire` and `LogicalProgram::decode_quad` are two tables over
+//! `gnitz_wire::ExprOp`; both live in `program.rs`, and `program/tests.rs`'s
+//! drift tests are what check them against each other.
 //!
 //! # Inlining
 //!
 //! This crate builds at `opt-level = 1` even in dev (`[profile.dev.package]` in
-//! the workspace manifest), so its own helpers inline without being annotated.
+//! the workspace manifest), but that profile follows the **codegen unit**, not
+//! the source file:
 //!
-//! The two types reached from *other* crates per row — [`ColumnLocator`] and
-//! [`MorselOut`] — are the exception: gnitz-engine calls them at opt-level 0,
-//! where only the always-inline pass runs, so their methods keep
-//! `#[inline(always)]`.
+//! > A non-generic item is codegen'd in this crate's rlib, at opt-level 1. A
+//! > generic one is re-instantiated in the *consuming* crate, at that crate's
+//! > opt-level — 0 for gnitz-engine in dev.
+//!
+//! `nm` on the debug server shows `eval_batch<B: BatchView>` there as a local
+//! (`t`) symbol, ~80 KB — the opt-0 copy, not the rlib's. So moving a body out
+//! of a generic function into a non-generic one *improves* the debug build, and
+//! the reverse costs. Anything reached from another crate per row is annotated
+//! `#[inline(always)]` regardless, since its caller is an opt-0 codegen unit:
+//! [`ColumnLocator`]'s methods, [`MorselOut`]'s, `RowSource::row_count`.
 //!
 //! Judge an inlining or kernel change on retired instructions
 //! (`perf stat -e instructions:u`), never on wall-clock: timings on the
@@ -38,6 +45,7 @@
 
 mod batch;
 mod builder;
+mod chars;
 mod eval;
 mod like;
 mod locator;
@@ -45,6 +53,7 @@ mod program;
 mod schema_facts;
 mod view;
 
+pub use batch::MorselOut;
 pub use builder::*;
 pub use eval::*;
 pub use like::*;

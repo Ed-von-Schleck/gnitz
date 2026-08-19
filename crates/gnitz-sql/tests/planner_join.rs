@@ -1,5 +1,6 @@
 #![cfg(feature = "integration")]
 
+use gnitz_core::SchemaFacts;
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{
@@ -585,8 +586,11 @@ fn test_join_compound_pk_source_left_outer() {
     let k2_ci = col_idx(&schema, "k2");
     let av_ci = col_idx(&schema, "av");
     let bv_ci = col_idx(&schema, "bv");
-    // bv_payload_idx: schema [_join_pk(pk), k1, k2, av, bv]; 1 PK col; bv payload = bv_ci - 1
-    let bv_payload_idx = bv_ci - schema.pk_cols.len();
+    // Through `payload_slot`, not `ci - pk_cols.len()`: the closed form only
+    // holds while every PK column precedes every payload one, which this
+    // fixture's `_join_pk`-at-0 schema happens to satisfy and a compound PK
+    // would not.
+    let bv_payload_idx = SchemaFacts::payload_slot(&schema, bv_ci).expect("bv is a payload column") as usize;
 
     let (r_matched, r_unmatched) = if i64_at(&batch, k1_ci, 0) == 1 { (0, 1) } else { (1, 0) };
 

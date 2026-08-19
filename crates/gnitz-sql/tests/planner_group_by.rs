@@ -1,5 +1,6 @@
 #![cfg(feature = "integration")]
 
+use gnitz_core::SchemaFacts;
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
@@ -809,29 +810,25 @@ fn test_aggregate_all_null_group_emits_null() {
     }
     let (schema, batch) = read_view(&mut client, &sn, "an_v");
     assert_eq!(batch.len(), 1, "the group is kept alive by COUNT(*)");
-    let pk = schema.pk_cols.len();
+    // Through `payload_slot`, not `ci - pk_cols.len()`: the closed form only
+    // holds while every PK column precedes every payload one, which this
+    // fixture's `_group_pk`-at-0 schema happens to satisfy and a compound PK
+    // would not.
+    let slot =
+        |name: &str| SchemaFacts::payload_slot(&schema, col_idx(&schema, name)).expect("payload column") as usize;
     let cx = col_idx(&schema, "cx");
     let ca = col_idx(&schema, "ca");
     // SUM/MIN/MAX over an all-NULL group read as NULL — the schema marks these
     // columns nullable, so a decoder surfaces NULL rather than zero bytes.
-    assert!(
-        is_null_at(&batch, col_idx(&schema, "sx") - pk, 0),
-        "SUM of all-NULL group must be NULL"
-    );
-    assert!(
-        is_null_at(&batch, col_idx(&schema, "mnx") - pk, 0),
-        "MIN of all-NULL group must be NULL"
-    );
-    assert!(
-        is_null_at(&batch, col_idx(&schema, "mxx") - pk, 0),
-        "MAX of all-NULL group must be NULL"
-    );
+    assert!(is_null_at(&batch, slot("sx"), 0), "SUM of all-NULL group must be NULL");
+    assert!(is_null_at(&batch, slot("mnx"), 0), "MIN of all-NULL group must be NULL");
+    assert!(is_null_at(&batch, slot("mxx"), 0), "MAX of all-NULL group must be NULL");
     // COUNT columns decode to integers: COUNT(x)=0, COUNT(*)=2. emit.rs renders an
     // untouched COUNT_NON_NULL as a concrete 0 with the null bit CLEAR (its
     // empty_renders_zero family), so COUNT(x) of an all-NULL group is 0, never the
     // forbidden NULL on this non-nullable column.
     assert!(
-        !is_null_at(&batch, cx - pk, 0),
+        !is_null_at(&batch, slot("cx"), 0),
         "COUNT(x) of all-NULL group is 0, not NULL"
     );
     assert_eq!(i64_at(&batch, cx, 0), 0, "COUNT(x) of all-NULL group must decode to 0");

@@ -1,13 +1,25 @@
 //! The [`BatchView`] region/per-row contract, checked against a batch the
 //! kernels were not written for — the shape a client-side adapter must satisfy.
 
+use gnitz_wire::type_code as tc;
+
 use crate::test_support::{locator_fixture as fixture, TestView};
 use crate::{assert_batchview_consistent, BatchView, RowSource};
 
 #[test]
 fn test_view_satisfies_the_region_per_row_contract() {
     let v = fixture();
-    assert_batchview_consistent(&v, 3, &[(0, 4), (1, 16), (2, 8)]);
+    // The fixture's two PK columns, at their PK-list offsets, with the native
+    // values it wrote — sign-extended, so the signed column's expectation is
+    // spelled the same way as the unsigned one's.
+    let k0: [u128; 3] = [7, 0, u32::MAX as u128];
+    let k1: [u128; 3] = [-1i64 as u128, 0, i64::MIN as u128];
+    assert_batchview_consistent(
+        &v,
+        3,
+        &[(0, 4), (1, 16), (2, 8)],
+        &[(tc::U32, 0, &k0), (tc::I64, 4, &k1)],
+    );
 }
 
 /// A view whose per-row accessor addresses a different payload slot than its
@@ -33,6 +45,9 @@ impl RowSource for MisMappedSlot {
     fn blob(&self) -> &[u8] {
         self.0.blob()
     }
+    fn row_count(&self) -> usize {
+        self.0.row_count()
+    }
 }
 
 impl BatchView for MisMappedSlot {
@@ -57,5 +72,5 @@ fn contract_harness_rejects_a_mismapped_payload_slot() {
         v.set_payload(row, 0, &(row as u64).to_le_bytes());
         v.set_payload(row, 1, &(100 + row as u64).to_le_bytes());
     }
-    assert_batchview_consistent(&MisMappedSlot(v), 2, &[(0, 8), (1, 8)]);
+    assert_batchview_consistent(&MisMappedSlot(v), 2, &[(0, 8), (1, 8)], &[]);
 }

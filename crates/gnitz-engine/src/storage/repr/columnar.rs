@@ -22,15 +22,12 @@ use gnitz_wire::{compare_german_strings, null_word_get, read_unsigned_exact};
 /// It cannot be folded into `BatchView` in the other direction: `MappedShard`,
 /// `RowRef` and `CursorSource` can address a cell but have no contiguous
 /// `rows * col_size` region to hand out (a shard column may be a scalar
-/// constant), so the split is at the per-row/region seam, not at this one.
+/// constant), so the split is at the per-row/region seam, not at this one. The
+/// N-way merge's per-source walk bound is `RowSource::row_count`, one level
+/// down: every row source is a whole batch, weight-bearing or not.
 pub(crate) trait ColumnarSource: RowSource {
     /// The row's signed Z-set weight / multiplicity (region[1]).
     fn get_weight(&self, row: usize) -> i64;
-
-    /// Rows in this source — the N-way merge's per-source walk bound. Every
-    /// implementor already exposes it, so the merge reads it here rather than
-    /// taking a parallel `counts` slice each caller has to keep in step.
-    fn row_count(&self) -> usize;
 
     /// Whether this source's rows are (PK, coarse weight) pairs with no payload —
     /// a capacity-bounded view's skeleton shard. `false` for every in-memory
@@ -426,14 +423,14 @@ mod tests {
         fn blob(&self) -> &[u8] {
             &self.blob
         }
+        fn row_count(&self) -> usize {
+            self.null_bmp.len() / 8
+        }
     }
 
     impl ColumnarSource for TestBatch {
         fn get_weight(&self, _row: usize) -> i64 {
             1
-        }
-        fn row_count(&self) -> usize {
-            self.null_bmp.len() / 8
         }
     }
 

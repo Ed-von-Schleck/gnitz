@@ -2,21 +2,22 @@
 // of PI meant to be replaced with std::f64::consts::PI.
 #![allow(clippy::approx_constant)]
 
-use gnitz_wire::type_code;
+use gnitz_wire::{type_code, ExprOp, TrimMode, TypeCode};
+use std::collections::BTreeSet;
 
-use super::{analyze, ProgramFacts};
+use super::{analyze, FloatUnaryOp, ProgramFacts};
 use crate::program::IntUnaryOp;
 use crate::test_support::{
-    bits_to_float, filter_prog, float_to_bits, is_not_null_op, is_null_op, make_int_view, make_string_view,
-    scalar_prog, schema_pk_ints, schema_pk_strings, TestSchema, TestView,
+    decode_f64, encode_f64, filter_prog, is_not_null_op, is_null_op, make_int_view, make_string_view, scalar_prog,
+    schema_pk_ints, schema_pk_strings, TestSchema, TestView,
 };
 use crate::{CmpOp, ColKind, Evaluator, ExprValidateErr, Instr, LogicalInstr, LogicalProgram, StrOp};
 
 /// Run `ev` at m=1 over `(mb, row)` and report
-/// `(predicate value, predicate is_null, EMIT null mask, EMIT values)` — the
-/// map-side read, where each EMIT'd register lands in an output payload slot
-/// and a NULL register stores 0 with its output bit set.
-fn eval_with_emit(ev: &Evaluator, mb: &TestView, row: usize) -> (i64, bool, u64, Vec<i64>) {
+/// `(result value or NULL, EMIT null mask, EMIT values)` — the map-side read,
+/// where each EMIT'd register lands in an output payload slot and a NULL
+/// register stores 0 with its output bit set.
+fn eval_with_emit(ev: &Evaluator, mb: &TestView, row: usize) -> (Option<i64>, u64, Vec<i64>) {
     let mut emit_vals: Vec<i64> = Vec::new();
     let mut emit_null_mask: u64 = 0;
     ev.eval_morsels(mb, row, 1, |_, out| {
@@ -31,8 +32,7 @@ fn eval_with_emit(ev: &Evaluator, mb: &TestView, row: usize) -> (i64, bool, u64,
             }
         }
     });
-    let (val, is_null) = ev.eval_row(mb, row);
-    (val, is_null, emit_null_mask, emit_vals)
+    (ev.eval_row(mb, row), emit_null_mask, emit_vals)
 }
 
 #[test]
@@ -53,9 +53,8 @@ fn test_int_comparisons() {
         }, // r2 = (r0 == r1)
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, is_null) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
-    assert!(!is_null);
 
     // Test NE
     let instrs = vec![
@@ -69,7 +68,7 @@ fn test_int_comparisons() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 
     // Test GT
@@ -84,7 +83,7 @@ fn test_int_comparisons() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 }
 
@@ -100,7 +99,7 @@ fn test_int_arithmetic() {
         LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 13);
 
     // DIV by zero → NULL
@@ -110,7 +109,7 @@ fn test_int_arithmetic() {
         LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = prog.eval_row(&mb, 0);
+    let is_null = prog.eval_row(&mb, 0).is_none();
     assert!(is_null);
 
     // MOD by zero → NULL
@@ -120,7 +119,7 @@ fn test_int_arithmetic() {
         LogicalInstr::IntMod { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = prog.eval_row(&mb, 0);
+    let is_null = prog.eval_row(&mb, 0).is_none();
     assert!(is_null);
 
     // NEG: -10
@@ -133,7 +132,7 @@ fn test_int_arithmetic() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, -10);
 }
 
@@ -141,8 +140,8 @@ fn test_int_arithmetic() {
 fn test_float_arithmetic_and_comparison() {
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::F64, type_code::F64]);
     // Store floats as i64 bits
-    let a_bits = float_to_bits(3.14);
-    let b_bits = float_to_bits(2.0);
+    let a_bits = encode_f64(3.14);
+    let b_bits = encode_f64(2.0);
     let mb = make_int_view(&schema, &[(1, 0, &[a_bits, b_bits])]);
 
     // FLOAT_ADD: 3.14 + 2.0
@@ -152,8 +151,8 @@ fn test_float_arithmetic_and_comparison() {
         LogicalInstr::FloatAdd { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
-    let result = bits_to_float(val);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
+    let result = decode_f64(val);
     assert!((result - 5.14).abs() < 1e-10);
 
     // FLOAT_DIV by zero → NULL
@@ -163,7 +162,7 @@ fn test_float_arithmetic_and_comparison() {
         LogicalInstr::FloatDiv { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = prog.eval_row(&mb, 0);
+    let is_null = prog.eval_row(&mb, 0).is_none();
     assert!(is_null);
 
     // FCMP_GT: 3.14 > 2.0
@@ -178,7 +177,7 @@ fn test_float_arithmetic_and_comparison() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 }
 
@@ -195,7 +194,7 @@ fn test_null_propagation() {
         LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = prog.eval_row(&mb, 0);
+    let is_null = prog.eval_row(&mb, 0).is_none();
     assert!(is_null);
 }
 
@@ -208,21 +207,19 @@ fn test_is_null_is_not_null() {
     // IS_NULL(col1) → 1 (always non-null result)
     let instrs = vec![is_null_op(0, 1)];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, is_null) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
-    assert!(!is_null);
 
     // IS_NOT_NULL(col1) → 0
     let instrs = vec![is_not_null_op(0, 1)];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, is_null) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
-    assert!(!is_null);
 
     // IS_NULL(col2) → 0
     let instrs = vec![is_null_op(0, 2)];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 }
 
@@ -238,7 +235,7 @@ fn test_boolean_combinators() {
         LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 
     // OR(1, 0) → 1
@@ -248,7 +245,7 @@ fn test_boolean_combinators() {
         LogicalInstr::BoolOr { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // NOT(1) → 0
@@ -257,7 +254,7 @@ fn test_boolean_combinators() {
         LogicalInstr::BoolNot { dst: 1, a: 0 },
     ];
     let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 }
 
@@ -273,15 +270,14 @@ fn test_load_const_encoding() {
         val: ((1i64) << 32) | (2i64 & 0xFFFF_FFFF),
     }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, is_null) = prog.eval_row(&mb, 0);
-    assert!(!is_null);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, (1i64 << 32) | 2);
 
     // Test negative constant: -1 (the wire low/high split is reconstructed by
     // `from_wire`; the typed instruction carries the full i64 value directly).
     let instrs = vec![LogicalInstr::LoadConst { dst: 0, val: -1 }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, -1);
 }
 
@@ -299,8 +295,7 @@ fn test_string_eq_const() {
         const_idx: 0,
     }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
-    let (val, is_null) = prog.eval_row(&mb, 0);
-    assert!(!is_null);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // STR_COL_EQ_CONST(col1, "world") → 0
@@ -311,7 +306,7 @@ fn test_string_eq_const() {
         const_idx: 0,
     }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"world".to_vec()]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 }
 
@@ -325,8 +320,8 @@ fn test_int_to_float() {
         LogicalInstr::IntToFloat { dst: 1, a: 0 },
     ];
     let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
-    assert_eq!(bits_to_float(val), 42.0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
+    assert_eq!(decode_f64(val), 42.0);
 }
 
 #[test]
@@ -371,8 +366,7 @@ fn test_unsigned_opcode_swap_and_eval() {
         ),
         "U64 operand must select unsigned CMP_GT"
     );
-    let (val, is_null) = prog_gt.eval_row(&mb, 0);
-    assert!(!is_null);
+    let val = prog_gt.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(
         val, 1,
         "u64::MAX > 100 is TRUE under unsigned compare; signed (-1 > 100) is false",
@@ -389,8 +383,7 @@ fn test_unsigned_opcode_swap_and_eval() {
         matches!(prog_div.prog.instrs[2], Instr::IntDiv { signed: false, .. }),
         "U64 operand must select unsigned IntDiv"
     );
-    let (val, is_null) = prog_div.eval_row(&mb, 0);
-    assert!(!is_null);
+    let val = prog_div.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(
         val, 9223372036854775807,
         "u64::MAX / 2 == 9223372036854775807 (unsigned); signed -1/2 would be 0",
@@ -407,8 +400,7 @@ fn test_unsigned_opcode_swap_and_eval() {
         matches!(prog_mod.prog.instrs[2], Instr::IntMod { signed: false, .. }),
         "U64 operand must select unsigned IntMod"
     );
-    let (val, is_null) = prog_mod.eval_row(&mb, 0);
-    assert!(!is_null);
+    let val = prog_mod.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1, "u64::MAX % 2 == 1 (unsigned); signed -1 % 2 would be -1",);
 
     // (d) CAST col1 to float  → IntToFloat must resolve to the unsigned form.
@@ -423,9 +415,8 @@ fn test_unsigned_opcode_swap_and_eval() {
         matches!(prog_cast.prog.instrs[1], Instr::IntToFloat { signed: false, .. }),
         "U64 operand must select unsigned IntToFloat"
     );
-    let (val, is_null) = prog_cast.eval_row(&mb, 0);
-    assert!(!is_null);
-    let f = bits_to_float(val);
+    let val = prog_cast.eval_row(&mb, 0).expect("not NULL");
+    let f = decode_f64(val);
     assert_eq!(
         f,
         u64::MAX as f64,
@@ -448,9 +439,8 @@ fn test_emit_with_targets() {
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
 
-    let (val, is_null, mask, emit_vals) = eval_with_emit(&prog, &mb, 0);
-    assert_eq!(val, 30); // 10 + 20
-    assert!(!is_null);
+    let (val, mask, emit_vals) = eval_with_emit(&prog, &mb, 0);
+    assert_eq!(val, Some(30)); // 10 + 20
     assert_eq!(mask, 0);
     assert_eq!(emit_vals[0], 30);
 }
@@ -496,7 +486,7 @@ fn an_emitted_boolean_lands_in_regs() {
         "nullable columns keep the test off the no_nulls arm"
     );
     assert!(!prog.prog.is_bit_only(5), "a register read by EMIT is not bit_only");
-    let (_, _, _, emit_vals) = eval_with_emit(&prog, &mb, 0);
+    let (_, _, emit_vals) = eval_with_emit(&prog, &mb, 0);
     assert_eq!(emit_vals[0], 1, "EMIT must ship the AND value, not a stale lane");
 }
 
@@ -514,7 +504,7 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = prog.eval_row(&mb, 0);
+    let is_null = prog.eval_row(&mb, 0).is_none();
     assert!(is_null);
 
     // 2. INT_MOD by literal 0 → NULL
@@ -524,7 +514,7 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::IntMod { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = prog.eval_row(&mb, 0);
+    let is_null = prog.eval_row(&mb, 0).is_none();
     assert!(is_null);
 
     // 3. FLOAT_DIV by 0.0 bits → NULL
@@ -534,7 +524,7 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::FloatDiv { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = prog.eval_row(&mb, 0);
+    let is_null = prog.eval_row(&mb, 0).is_none();
     assert!(is_null);
 
     // 4. INT_DIV by non-null non-zero → correct quotient, not null
@@ -544,8 +534,7 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, is_null) = prog.eval_row(&mb, 0);
-    assert!(!is_null);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 3); // 10 / 3 = 3
 
     // 5. INT_DIV where divisor column is null → NULL (null propagation)
@@ -560,7 +549,7 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, is_null) = prog.eval_row(&mb_null_div, 0);
+    let is_null = prog.eval_row(&mb_null_div, 0).is_none();
     assert!(is_null);
 
     // 6. EMIT of INT_DIV-by-zero result → emit_null_mask bit set, buffer contains 0
@@ -571,7 +560,7 @@ fn test_div_by_zero_null_semantics() {
         LogicalInstr::Emit { src: 2, out: 0 },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (_, _, mask, emit_vals) = eval_with_emit(&prog, &mb, 0);
+    let (_, mask, emit_vals) = eval_with_emit(&prog, &mb, 0);
     assert_eq!(mask & 1, 1); // bit 0 set → null
     assert_eq!(emit_vals[0], 0);
 }
@@ -593,7 +582,7 @@ fn test_cmp_ge_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // GE: 42 >= 43 → 0
@@ -608,7 +597,7 @@ fn test_cmp_ge_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 
     // LT: 42 < 43 → 1
@@ -623,7 +612,7 @@ fn test_cmp_ge_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // LT: 42 < 42 → 0
@@ -638,7 +627,7 @@ fn test_cmp_ge_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 
     // LE: 42 <= 42 → 1
@@ -653,7 +642,7 @@ fn test_cmp_ge_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // LE: 42 <= 41 → 0
@@ -668,15 +657,15 @@ fn test_cmp_ge_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 }
 
 #[test]
 fn test_fcmp_eq_ne_lt_le() {
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::F64, type_code::F64]);
-    let a_bits = float_to_bits(3.14);
-    let b_bits = float_to_bits(2.0);
+    let a_bits = encode_f64(3.14);
+    let b_bits = encode_f64(2.0);
     let mb = make_int_view(&schema, &[(1, 0, &[a_bits, b_bits])]);
 
     // FCMP_EQ: 3.14 == 3.14 → 1
@@ -691,7 +680,7 @@ fn test_fcmp_eq_ne_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // FCMP_EQ: 3.14 == 2.0 → 0
@@ -706,7 +695,7 @@ fn test_fcmp_eq_ne_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 
     // FCMP_NE: 3.14 != 2.0 → 1
@@ -721,7 +710,7 @@ fn test_fcmp_eq_ne_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // FCMP_LT: 2.0 < 3.14 → 1
@@ -736,7 +725,7 @@ fn test_fcmp_eq_ne_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // FCMP_LE: 2.0 <= 2.0 → 1
@@ -751,7 +740,7 @@ fn test_fcmp_eq_ne_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // FCMP_GE: 2.0 >= 3.14 → 0
@@ -766,7 +755,7 @@ fn test_fcmp_eq_ne_lt_le() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 }
 
@@ -783,7 +772,7 @@ fn test_string_lt_le_const() {
         const_idx: 0,
     }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"world".to_vec()]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // STR_COL_LT_CONST: "hello" < "hello" → 0
@@ -794,7 +783,7 @@ fn test_string_lt_le_const() {
         const_idx: 0,
     }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 
     // STR_COL_LE_CONST: "hello" <= "hello" → 1
@@ -805,7 +794,7 @@ fn test_string_lt_le_const() {
         const_idx: 0,
     }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // STR_COL_LE_CONST: "hello" <= "hella" → 0
@@ -816,7 +805,7 @@ fn test_string_lt_le_const() {
         const_idx: 0,
     }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![b"hella".to_vec()]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 0);
 }
 
@@ -841,11 +830,11 @@ fn test_string_col_eq_col() {
         col_b: 2,
     }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
 
     // Row 1: col1 == col2 → 0
-    let (val, _) = prog.eval_row(&mb, 1);
+    let val = prog.eval_row(&mb, 1).expect("not NULL");
     assert_eq!(val, 0);
 }
 
@@ -888,30 +877,32 @@ fn test_complex_predicate() {
         LogicalInstr::BoolOr { dst: 10, a: 6, b: 9 }, // r10 = (1 OR 1) = 1
     ];
     let prog = scalar_prog(&schema, instrs, 11, 10, vec![]);
-    let (val, is_null) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 1);
-    assert!(!is_null);
 
     // Test with a=5 (a>10 false), b=50, c=99 (c==42 false) → false
     let batch2 = make_int_view(&schema, &[(1, 0, &[5, 50, 99])]);
     let mb2 = batch2;
-    let (val, _) = prog.eval_row(&mb2, 0);
+    let val = prog.eval_row(&mb2, 0).expect("not NULL");
     assert_eq!(val, 0);
 }
 
+/// A register-free program is exactly what `copy_cols` builds — legitimate as a
+/// map, meaningless as a scalar, whose two readers both read a register back.
+/// Both directions, because rejecting it in *either* role would be wrong: the
+/// map is the shape that must keep working, the scalar the one that must not
+/// silently answer NULL.
 #[test]
 fn test_zero_regs_program() {
-    // A program with num_regs=0 (pure COPY_COL) must not crash.
     let schema = schema_pk_ints(1, true);
-    let mb = make_int_view(&schema, &[(1, 0, &[100])]);
-
     // One COPY_COL instruction: copy col 1 → payload 0 (source type derived in resolve)
     let instrs = vec![LogicalInstr::CopyCol { src_col: 1, out: 0 }];
-    let prog = scalar_prog(&schema, instrs, 0, 0, vec![]);
-    let (val, is_null) = prog.eval_row(&mb, 0);
-    // With num_regs=0, result should be (0, true) — sentinel
-    assert_eq!(val, 0);
-    assert!(is_null);
+    let prog = || LogicalProgram::new(instrs.clone(), 0, 0, vec![]);
+    assert_eq!(
+        prog().resolve_scalar(&schema).err(),
+        Some(ExprValidateErr::ResultRegRequired),
+    );
+    assert!(prog().resolve_map(&schema, &schema).is_ok());
 }
 
 #[test]
@@ -924,22 +915,21 @@ fn test_resolve_column_indices_pk_at_col0() {
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }]; // col 0 = pk
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
     assert!(matches!(prog.prog.instrs[0], Instr::LoadPk { .. }));
-    let (val, is_null) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 42);
-    assert!(!is_null);
 
     // LOAD_COL_INT of col1 (logical 1) → LoadPayloadInt, physical 0
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
     assert!(matches!(prog.prog.instrs[0], Instr::LoadPayloadInt { pi: 0, .. }));
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 10);
 
     // LOAD_COL_INT of col2 (logical 2) → LoadPayloadInt, physical 1
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 2 }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
     assert!(matches!(prog.prog.instrs[0], Instr::LoadPayloadInt { pi: 1, .. }));
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 20);
 }
 
@@ -954,26 +944,26 @@ fn test_resolve_column_indices_pk_at_middle() {
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
     assert!(matches!(prog.prog.instrs[0], Instr::LoadPayloadInt { pi: 0, .. }));
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 5);
 
     // col1 (logical 1 = pk) → LoadPk
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
     assert!(matches!(prog.prog.instrs[0], Instr::LoadPk { .. }));
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 99);
 
     // col2 (logical 2, after pk) → LoadPayloadInt, physical 1
     let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 2 }];
     let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
     assert!(matches!(prog.prog.instrs[0], Instr::LoadPayloadInt { pi: 1, .. }));
-    let (val, _) = prog.eval_row(&mb, 0);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 7);
 }
 
 #[test]
-fn test_is_strictly_non_nullable_str_col() {
+fn test_str_col_const_is_classified_never_null() {
     // STR_COL_*_CONST and STR_COL_*_COL must flip no_nulls off when any
     // operand column is nullable; without that, the batch path skips null-bit
     // tracking and null rows leak through string predicates as definite results.
@@ -1078,7 +1068,7 @@ fn test_string_prefix_ordering() {
             const_idx: 0,
         }];
         let prog = scalar_prog(&schema, instrs, 1, 0, vec![const_s.to_vec()]);
-        let (val, _) = prog.eval_row(&mb, 0);
+        let val = prog.eval_row(&mb, 0).expect("not NULL");
         assert_eq!(
             val != 0,
             expected_lt,
@@ -1124,43 +1114,39 @@ fn test_bool_and_or_three_valued_logic() {
     let or_prog = scalar_prog(&schema, or_instrs, 3, 2, vec![]);
 
     // AND cases
-    let (v, n) = and_prog.eval_row(&mb, 0);
+    let v = and_prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(v, 0, "T AND F = F");
-    assert!(!n);
-    let (v, n) = and_prog.eval_row(&mb, 1);
+    let v = and_prog.eval_row(&mb, 1).expect("not NULL");
     assert_eq!(v, 0, "F AND T = F");
-    assert!(!n);
-    let (_, n) = and_prog.eval_row(&mb, 2);
+    let n = and_prog.eval_row(&mb, 2).is_none();
     assert!(n, "T AND NULL = NULL");
-    let (v, n) = and_prog.eval_row(&mb, 3);
+    let v = and_prog
+        .eval_row(&mb, 3)
+        .expect("F AND NULL must not be null (SQL 3VL)");
     assert_eq!(v, 0, "F AND NULL = F");
-    assert!(!n, "F AND NULL must not be null (SQL 3VL)");
-    let (_, n) = and_prog.eval_row(&mb, 4);
+    let n = and_prog.eval_row(&mb, 4).is_none();
     assert!(n, "NULL AND T = NULL");
-    let (v, n) = and_prog.eval_row(&mb, 5);
+    let v = and_prog
+        .eval_row(&mb, 5)
+        .expect("NULL AND F must not be null (SQL 3VL)");
     assert_eq!(v, 0, "NULL AND F = F");
-    assert!(!n, "NULL AND F must not be null (SQL 3VL)");
-    let (_, n) = and_prog.eval_row(&mb, 6);
+    let n = and_prog.eval_row(&mb, 6).is_none();
     assert!(n, "NULL AND NULL = NULL");
 
     // OR cases
-    let (v, n) = or_prog.eval_row(&mb, 0);
+    let v = or_prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(v, 1, "T OR F = T");
-    assert!(!n);
-    let (v, n) = or_prog.eval_row(&mb, 1);
+    let v = or_prog.eval_row(&mb, 1).expect("not NULL");
     assert_eq!(v, 1, "F OR T = T");
-    assert!(!n);
-    let (v, n) = or_prog.eval_row(&mb, 2);
+    let v = or_prog.eval_row(&mb, 2).expect("T OR NULL must not be null (SQL 3VL)");
     assert_eq!(v, 1, "T OR NULL = T");
-    assert!(!n, "T OR NULL must not be null (SQL 3VL)");
-    let (_, n) = or_prog.eval_row(&mb, 3);
+    let n = or_prog.eval_row(&mb, 3).is_none();
     assert!(n, "F OR NULL = NULL");
-    let (v, n) = or_prog.eval_row(&mb, 4);
+    let v = or_prog.eval_row(&mb, 4).expect("NULL OR T must not be null (SQL 3VL)");
     assert_eq!(v, 1, "NULL OR T = T");
-    assert!(!n, "NULL OR T must not be null (SQL 3VL)");
-    let (_, n) = or_prog.eval_row(&mb, 5);
+    let n = or_prog.eval_row(&mb, 5).is_none();
     assert!(n, "NULL OR F = NULL");
-    let (_, n) = or_prog.eval_row(&mb, 6);
+    let n = or_prog.eval_row(&mb, 6).is_none();
     assert!(n, "NULL OR NULL = NULL");
 }
 
@@ -1189,7 +1175,7 @@ fn test_string_prefix_le_ordering() {
             const_idx: 0,
         }];
         let prog = scalar_prog(&schema, instrs, 1, 0, vec![const_s.to_vec()]);
-        let (val, _) = prog.eval_row(&mb, 0);
+        let val = prog.eval_row(&mb, 0).expect("not NULL");
         assert_eq!(
             val != 0,
             expected_le,
@@ -1227,20 +1213,17 @@ fn test_select_truth_table() {
 
     // cond=1 (truthy) → a=100
     let batch = make_int_view(&schema, &[(1, 0, &[1, 100, 200])]);
-    let (v, n) = prog.eval_row(&batch, 0);
-    assert!(!n);
+    let v = prog.eval_row(&batch, 0).expect("not NULL");
     assert_eq!(v, 100, "truthy cond takes a");
 
     // cond=0 (false) → b=200
     let batch = make_int_view(&schema, &[(1, 0, &[0, 100, 200])]);
-    let (v, n) = prog.eval_row(&batch, 0);
-    assert!(!n);
+    let v = prog.eval_row(&batch, 0).expect("not NULL");
     assert_eq!(v, 200, "false cond takes b");
 
     // cond=NULL → b=200 (null_word bit 0 = cond/col1); value 7 is truthy but masked.
     let batch = make_int_view(&schema, &[(1, 1, &[7, 100, 200])]);
-    let (v, n) = prog.eval_row(&batch, 0);
-    assert!(!n);
+    let v = prog.eval_row(&batch, 0).expect("not NULL");
     assert_eq!(v, 200, "NULL cond falls to else (b), not a");
 }
 
@@ -1264,18 +1247,17 @@ fn test_select_null_bit_blend() {
 
     // cond truthy, a NULL (payload bit 1) → result NULL.
     let batch = make_int_view(&schema, &[(1, 0b010, &[1, 0, 200])]);
-    let (_, n) = prog.eval_row(&batch, 0);
+    let n = prog.eval_row(&batch, 0).is_none();
     assert!(n, "truthy cond + NULL a → NULL");
 
     // cond truthy, b NULL (payload bit 2), a non-null → result = a; b's null ignored.
     let batch = make_int_view(&schema, &[(1, 0b100, &[1, 55, 0])]);
-    let (v, n) = prog.eval_row(&batch, 0);
-    assert!(!n, "truthy cond ignores b's null");
+    let v = prog.eval_row(&batch, 0).expect("truthy cond ignores b's null");
     assert_eq!(v, 55);
 
     // cond false, b NULL → result NULL.
     let batch = make_int_view(&schema, &[(1, 0b100, &[0, 55, 0])]);
-    let (_, n) = prog.eval_row(&batch, 0);
+    let n = prog.eval_row(&batch, 0).is_none();
     assert!(n, "false cond + NULL b → NULL");
 }
 
@@ -1299,23 +1281,22 @@ fn test_load_null_else_branch_eval() {
 
     // cond truthy → 42.
     let batch = make_int_view(&schema, &[(1, 0, &[5])]);
-    let (v, n) = prog.eval_row(&batch, 0);
-    assert!(!n);
+    let v = prog.eval_row(&batch, 0).expect("not NULL");
     assert_eq!(v, 42);
 
     // cond false → else NULL.
     let batch = make_int_view(&schema, &[(1, 0, &[0])]);
-    let (_, n) = prog.eval_row(&batch, 0);
+    let n = prog.eval_row(&batch, 0).is_none();
     assert!(n, "false cond → else NULL");
 
     // cond NULL → else NULL.
     let batch = make_int_view(&schema, &[(1, 1, &[9])]);
-    let (_, n) = prog.eval_row(&batch, 0);
+    let n = prog.eval_row(&batch, 0).is_none();
     assert!(n, "NULL cond → else NULL");
 }
 
 /// LoadNull forces the nullable eval path even when every column is NOT NULL:
-/// `is_strictly_non_nullable` must return false whenever a program manufactures
+/// `analyze` must clear `no_nulls` whenever a program manufactures
 /// a NULL.
 #[test]
 fn test_load_null_forces_nullable_path() {
@@ -1455,13 +1436,12 @@ fn a_select_result_reads_back_as_a_value() {
     ];
     let prog = scalar_prog(&schema, instrs, 4, 3, vec![]);
     assert!(!prog.prog.no_nulls, "the nullable load keeps this off the no_nulls arm");
-    let (val, is_null) = prog.eval_row(&mb, 0);
-    assert!(!is_null);
+    let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 5, "SELECT returns the chosen branch value, not a truth bit");
 }
 
 /// `dst` aliasing any of `cond`/`a`/`b` violates the SELECT anti-alias rule that
-/// makes `reg4`'s raw split borrows sound.
+/// makes `regs_split`'s raw split borrows sound.
 #[test]
 #[should_panic(expected = "RegisterAliasing")]
 fn test_select_dst_alias_panics() {
@@ -1507,15 +1487,15 @@ fn test_select_nesting() {
     // payload cols: c1, c2, v1=10, v2=20, v3=30.
     // c1 truthy → v1.
     let batch = make_int_view(&schema, &[(1, 0, &[1, 1, 10, 20, 30])]);
-    let (v, _) = prog.eval_row(&batch, 0);
+    let v = prog.eval_row(&batch, 0).expect("not NULL");
     assert_eq!(v, 10, "c1 truthy → v1");
     // c1 false, c2 truthy → v2.
     let batch = make_int_view(&schema, &[(1, 0, &[0, 1, 10, 20, 30])]);
-    let (v, _) = prog.eval_row(&batch, 0);
+    let v = prog.eval_row(&batch, 0).expect("not NULL");
     assert_eq!(v, 20, "c1 false, c2 truthy → v2");
     // both false → v3.
     let batch = make_int_view(&schema, &[(1, 0, &[0, 0, 10, 20, 30])]);
-    let (v, _) = prog.eval_row(&batch, 0);
+    let v = prog.eval_row(&batch, 0).expect("not NULL");
     assert_eq!(v, 30, "both false → else v3");
 }
 
@@ -1552,9 +1532,10 @@ fn test_from_wire_rejects_unknown_opcode() {
 }
 
 // The rendering the planner's `Unsupported` and the engine's `CREATE VIEW`
-// rejection both print: one wording for both, and the register cap is the one
-// variant a working query can newly hit, so it gets a sentence naming the limit
-// rather than a struct dump.
+// rejection both print: one wording for both. The register cap and the column
+// mismatch are the variants a working query can newly hit, so each gets a
+// sentence rather than a struct dump — `ColKind`'s fields are private, so its
+// `Debug` form would name them to a client who cannot act on either.
 #[test]
 fn test_validate_err_display_names_the_register_limit() {
     assert_eq!(
@@ -1563,6 +1544,25 @@ fn test_validate_err_display_names_the_register_limit() {
             "expression needs 66 registers; the limit is {} — split the predicate",
             crate::MAX_REGS
         )
+    );
+    // Both axes of the requirement: its type, and — since a PK column is exactly
+    // what a client is likely to have named — whether a PK column is admissible.
+    let mismatch = |want| {
+        ExprValidateErr::ColKindMismatch {
+            col: 2,
+            type_code: type_code::U64,
+            want,
+        }
+        .to_string()
+    };
+    assert_eq!(
+        mismatch(ColKind::FIXED_INT),
+        "column 2 (type code 8) cannot be used here; this operator needs a fixed-width integer column"
+    );
+    assert_eq!(
+        mismatch(ColKind::FLOAT),
+        "column 2 (type code 8) cannot be used here; \
+         this operator needs a floating-point column that is not part of the primary key"
     );
     // Everything else is an internal-shape violation with no user action:
     // rendered as its Debug form.
@@ -1600,7 +1600,7 @@ fn test_from_wire_rejects_out_of_range_register() {
 
 #[test]
 fn test_from_wire_rejects_register_aliasing() {
-    // IntAdd dst0 a0 b1: dst aliases a source — breaks reg3's split borrows.
+    // IntAdd dst0 a0 b1: dst aliases a source — breaks `regs_split`'s split borrows.
     assert_eq!(
         wire_err(LogicalProgram::from_wire(&[4, 0, 0, 1], 2, 0, vec![])),
         ExprValidateErr::RegisterAliasing { dst: 0, reg: 0 }
@@ -1632,8 +1632,8 @@ fn test_validate_rejects_out_of_range_column() {
 
 #[test]
 fn test_validate_rejects_pk_column_for_payload_only_opcode() {
-    // Schema with a PK at column 0 (non-nullable) plus a payload string column.
-    let s_pk = TestSchema::new(&[(type_code::U64, false), (type_code::STRING, true)], &[0]);
+    // A PK at column 0 (non-nullable) plus a payload string column.
+    let s_pk = schema_pk_strings(1, true);
     // Each payload-only opcode that routes a PK column to the pi=255 sentinel.
     let cases: &[(&[u32], Vec<Vec<u8>>)] = &[
         (&[2, 0, 0, 0], vec![]),               // LOAD_COL_FLOAT col0
@@ -1953,16 +1953,6 @@ fn test_new_panics_on_aliased_register() {
 // INT_IN_SET — set membership as one opcode (O(1) registers, O(log N) per row)
 // ---------------------------------------------------------------------------
 
-/// Pack an i64 set into the `N × 8-byte LE` pool layout the
-/// const pool carries for `INT_IN_SET`.
-fn pack_i64_set(values: &[i64]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(values.len() * 8);
-    for v in values {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    bytes
-}
-
 /// `r0 = col1; r1 = r0 IN set`, result_reg = 1 — the compiled shape of
 /// `col1 IN (…)`. `col_tc` picks col1's type (I64 / U64 / …).
 fn in_set_prog(col_tc: u8, set: &[i64]) -> (TestSchema, Evaluator) {
@@ -1975,7 +1965,7 @@ fn in_set_prog(col_tc: u8, set: &[i64]) -> (TestSchema, Evaluator) {
             set_idx: 0,
         },
     ];
-    let prog = scalar_prog(&schema, instrs, 2, 1, vec![pack_i64_set(set)]);
+    let prog = scalar_prog(&schema, instrs, 2, 1, vec![gnitz_wire::as_le_bytes(set).to_vec()]);
     (schema, prog)
 }
 
@@ -1985,16 +1975,18 @@ fn test_int_in_set_hit_miss_null() {
 
     // Hit: 42 ∈ {1,3,5,42}.
     let mb = make_int_view(&schema, &[(1, 0, &[42])]);
-    assert_eq!(prog.eval_row(&mb, 0), (1, false));
+    assert_eq!(prog.eval_row(&mb, 0), Some(1));
 
     // Miss: 7 ∉ set.
     let mb = make_int_view(&schema, &[(1, 0, &[7])]);
-    assert_eq!(prog.eval_row(&mb, 0), (0, false));
+    assert_eq!(prog.eval_row(&mb, 0), Some(0));
 
     // NULL operand ⇒ NULL out (col1 is payload index 0 → null_word bit 0).
     let mb = make_int_view(&schema, &[(1, 0b1, &[0])]);
-    let (_v, is_null) = prog.eval_row(&mb, 0);
-    assert!(is_null, "NULL operand must produce a NULL membership result");
+    assert!(
+        prog.eval_row(&mb, 0).is_none(),
+        "NULL operand must produce a NULL membership result"
+    );
 }
 
 #[test]
@@ -2004,10 +1996,10 @@ fn test_int_in_set_u64_neg_one_matches_max() {
     // bit-equal `col = -1`.
     let (schema, prog) = in_set_prog(8 /* U64 */, &[-1]);
     let mb = make_int_view(&schema, &[(1, 0, &[u64::MAX as i64])]);
-    assert_eq!(prog.eval_row(&mb, 0), (1, false));
+    assert_eq!(prog.eval_row(&mb, 0), Some(1));
     // A different u64 value misses.
     let mb = make_int_view(&schema, &[(1, 0, &[7])]);
-    assert_eq!(prog.eval_row(&mb, 0), (0, false));
+    assert_eq!(prog.eval_row(&mb, 0), Some(0));
 }
 
 #[test]
@@ -2016,7 +2008,7 @@ fn test_int_in_set_signed_negatives_by_signed_order() {
     let (schema, prog) = in_set_prog(9 /* I64 */, &[-5, -1, 0, 3]);
     for (v, want) in [(-5i64, 1), (-1, 1), (0, 1), (3, 1), (2, 0), (100, 0)] {
         let mb = make_int_view(&schema, &[(1, 0, &[v])]);
-        assert_eq!(prog.eval_row(&mb, 0), (want, false), "value {v} membership");
+        assert_eq!(prog.eval_row(&mb, 0), Some(want), "value {v} membership");
     }
 }
 
@@ -2031,9 +2023,9 @@ fn test_int_in_set_1000_elements_compiles_and_evals() {
         "membership uses two registers regardless of set size"
     );
     let mb = make_int_view(&schema, &[(1, 0, &[777])]);
-    assert_eq!(prog.eval_row(&mb, 0), (1, false));
+    assert_eq!(prog.eval_row(&mb, 0), Some(1));
     let mb = make_int_view(&schema, &[(1, 0, &[1000])]);
-    assert_eq!(prog.eval_row(&mb, 0), (0, false));
+    assert_eq!(prog.eval_row(&mb, 0), Some(0));
 }
 
 #[test]
@@ -2050,16 +2042,22 @@ fn test_int_not_in_set_null_operand_excluded() {
         },
         LogicalInstr::BoolNot { dst: 2, a: 1 },
     ];
-    let prog = scalar_prog(&schema, instrs, 3, 2, vec![pack_i64_set(&[1, 2, 3])]);
+    let prog = scalar_prog(
+        &schema,
+        instrs,
+        3,
+        2,
+        vec![gnitz_wire::as_le_bytes(&[1i64, 2, 3]).to_vec()],
+    );
     // NULL operand → NOT IN is NULL (excluded).
     let mb = make_int_view(&schema, &[(1, 0b1, &[0])]);
-    assert!(prog.eval_row(&mb, 0).1, "NOT IN NULL must be NULL");
+    assert!(prog.eval_row(&mb, 0).is_none(), "NOT IN NULL must be NULL");
     // A non-member is included by NOT IN.
     let mb = make_int_view(&schema, &[(1, 0, &[9])]);
-    assert_eq!(prog.eval_row(&mb, 0), (1, false));
+    assert_eq!(prog.eval_row(&mb, 0), Some(1));
     // A member is excluded by NOT IN.
     let mb = make_int_view(&schema, &[(1, 0, &[2])]);
-    assert_eq!(prog.eval_row(&mb, 0), (0, false));
+    assert_eq!(prog.eval_row(&mb, 0), Some(0));
 }
 
 #[test]
@@ -2068,7 +2066,7 @@ fn test_int_in_set_empty_pool_always_false() {
     // and `len % 8 == 0` so it validates.
     let (schema, prog) = in_set_prog(9 /* I64 */, &[]);
     let mb = make_int_view(&schema, &[(1, 0, &[42])]);
-    assert_eq!(prog.eval_row(&mb, 0), (0, false));
+    assert_eq!(prog.eval_row(&mb, 0), Some(0));
 }
 
 /// The wire pool order is not trusted: `resolve` sorts it, because the kernel
@@ -2081,10 +2079,10 @@ fn test_int_in_set_unsorted_pool_is_sorted_at_resolve() {
     // past the first probe's `42 > 7` left turn).
     for v in [-1i64, 3, 7, 42] {
         let mb = make_int_view(&schema, &[(1, 0, &[v])]);
-        assert_eq!(prog.eval_row(&mb, 0), (1, false), "value {v} must be found");
+        assert_eq!(prog.eval_row(&mb, 0), Some(1), "value {v} must be found");
     }
     let mb = make_int_view(&schema, &[(1, 0, &[8])]);
-    assert_eq!(prog.eval_row(&mb, 0), (0, false));
+    assert_eq!(prog.eval_row(&mb, 0), Some(0));
 }
 
 #[test]
@@ -2143,7 +2141,7 @@ fn classifier_pure_conjunction_filter() {
 /// that has no arm for it.
 #[test]
 fn test_validate_rejects_a_forged_cast_target() {
-    for op in [gnitz_wire::EXPR_INT_CAST, gnitz_wire::EXPR_FLOAT_TO_INT] {
+    for op in [ExprOp::IntCast.as_wire(), ExprOp::FloatToInt.as_wire()] {
         for tc in [
             0u32,
             type_code::STRING as u32,
@@ -2156,7 +2154,7 @@ fn test_validate_rejects_a_forged_cast_target() {
             0x100u32 | type_code::I64 as u32,
             0x1_0000u32 | type_code::I64 as u32,
         ] {
-            let code = [gnitz_wire::EXPR_LOAD_COL_INT, 0, 1, 0, op, 1, 0, tc];
+            let code = [ExprOp::LoadColInt.as_wire(), 0, 1, 0, op, 1, 0, tc];
             assert_eq!(
                 wire_err(LogicalProgram::from_wire(&code, 2, 1, vec![])),
                 ExprValidateErr::BadCastTarget { tc },
@@ -2174,7 +2172,7 @@ fn test_validate_rejects_a_forged_cast_target() {
             type_code::I64,
             type_code::U64,
         ] {
-            let code = [gnitz_wire::EXPR_LOAD_COL_INT, 0, 1, 0, op, 1, 0, tc as u32];
+            let code = [ExprOp::LoadColInt.as_wire(), 0, 1, 0, op, 1, 0, tc as u32];
             assert!(
                 LogicalProgram::from_wire(&code, 2, 1, vec![]).is_ok(),
                 "op {op} tc {tc} must be accepted"
@@ -2186,13 +2184,13 @@ fn test_validate_rejects_a_forged_cast_target() {
 #[test]
 fn test_validate_bounds_checks_the_new_register_operands() {
     let unary = [
-        gnitz_wire::EXPR_INT_ABS,
-        gnitz_wire::EXPR_FLOAT_ABS,
-        gnitz_wire::EXPR_FLOAT_FLOOR,
-        gnitz_wire::EXPR_FLOAT_CEIL,
-        gnitz_wire::EXPR_FLOAT_ROUND,
-        gnitz_wire::EXPR_FLOAT_TRUNC,
-        gnitz_wire::EXPR_FLOAT_TO_F32,
+        ExprOp::IntAbs.as_wire(),
+        ExprOp::FloatAbs.as_wire(),
+        ExprOp::FloatFloor.as_wire(),
+        ExprOp::FloatCeil.as_wire(),
+        ExprOp::FloatRound.as_wire(),
+        ExprOp::FloatTrunc.as_wire(),
+        ExprOp::FloatToF32.as_wire(),
     ];
     for op in unary {
         // dst out of range, then operand out of range.
@@ -2206,10 +2204,10 @@ fn test_validate_bounds_checks_the_new_register_operands() {
         ));
     }
     for op in [
-        gnitz_wire::EXPR_INT_MAX2,
-        gnitz_wire::EXPR_INT_MIN2,
-        gnitz_wire::EXPR_FLOAT_MAX2,
-        gnitz_wire::EXPR_FLOAT_MIN2,
+        ExprOp::IntMax2.as_wire(),
+        ExprOp::IntMin2.as_wire(),
+        ExprOp::FloatMax2.as_wire(),
+        ExprOp::FloatMin2.as_wire(),
     ] {
         assert!(matches!(
             wire_err(LogicalProgram::from_wire(&[op, 0, 1, 9], 2, 0, vec![])),
@@ -2313,8 +2311,10 @@ fn a_nullable_pk_column_load_keeps_no_nulls() {
 }
 
 /// A float column load inherits its column's null bit, like every other typed
-/// column operand. Both directions, so a table marking every column `FromCol`
-/// would fail too.
+/// column operand. Driven in both directions — a nullable F64 column must force
+/// the nullable arm, a non-nullable one must leave `no_nulls` set — so a
+/// classification that ignored the column's nullability outright fails here
+/// whichever way it defaulted.
 #[test]
 fn a_float_column_load_carries_its_null_bit() {
     let no_nulls_over = |nullable: bool| {
@@ -2442,11 +2442,6 @@ fn test_int_cast_records_the_source_signedness() {
 // Register classes and single-assignment
 // ---------------------------------------------------------------------------
 
-use gnitz_wire::{
-    EXPR_CMP_GT, EXPR_EMIT, EXPR_LOAD_COL_INT, EXPR_LOAD_COL_STR, EXPR_LOAD_CONST, EXPR_STR_CMP_EQ, EXPR_STR_CONCAT,
-    EXPR_STR_ILIKE, EXPR_STR_LIKE, EXPR_STR_SELECT, EXPR_STR_SUBSTR, EXPR_STR_TRIM, EXPR_STR_UPPER,
-};
-
 /// Decode a wire program and keep only the verdict. The class rules are
 /// schema-free, so this is where a forged program meets them — before any schema
 /// is in hand.
@@ -2466,32 +2461,59 @@ fn wire_verdict(code: &[u32], num_regs: u32, result_reg: u32) -> Result<(), Expr
 fn operand_class_is_enforced_in_both_directions() {
     // LOAD_COL_INT into reg 0, then UPPER of it.
     assert_eq!(
-        from_wire(&[EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_STR_UPPER, 1, 0, 0], 2),
+        from_wire(
+            &[
+                ExprOp::LoadColInt.as_wire(),
+                0,
+                1,
+                0,
+                ExprOp::StrUpper.as_wire(),
+                1,
+                0,
+                0
+            ],
+            2
+        ),
         Err(ExprValidateErr::RegClassMismatch { reg: 0 })
     );
     // LOAD_COL_STR into reg 0, then integer ADD of it.
     assert_eq!(
-        from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0, gnitz_wire::EXPR_INT_ADD, 1, 0, 0], 2),
+        from_wire(
+            &[ExprOp::LoadColStr.as_wire(), 0, 1, 0, ExprOp::IntAdd.as_wire(), 1, 0, 0],
+            2
+        ),
         Err(ExprValidateErr::RegClassMismatch { reg: 0 })
     );
     // The mixed-class opcodes police each half separately: SUBSTR's source must
     // be a string and its bounds must not be.
     assert_eq!(
-        from_wire(&[EXPR_LOAD_CONST, 0, 1, 0, EXPR_STR_SUBSTR, 1, 0, 0], 2),
+        from_wire(
+            &[
+                ExprOp::LoadConst.as_wire(),
+                0,
+                1,
+                0,
+                ExprOp::StrSubstr.as_wire(),
+                1,
+                0,
+                0
+            ],
+            2
+        ),
         Err(ExprValidateErr::RegClassMismatch { reg: 0 })
     );
     assert_eq!(
         from_wire(
             &[
-                EXPR_LOAD_COL_STR,
+                ExprOp::LoadColStr.as_wire(),
                 0,
                 1,
                 0, //
-                EXPR_LOAD_COL_STR,
+                ExprOp::LoadColStr.as_wire(),
                 1,
                 1,
                 0, //
-                EXPR_STR_SUBSTR,
+                ExprOp::StrSubstr.as_wire(),
                 2,
                 0,
                 1,
@@ -2509,11 +2531,29 @@ fn operand_class_is_enforced_in_both_directions() {
 #[test]
 fn string_operand_read_before_its_writer_is_refused() {
     // UPPER of reg 1 at instruction 0; reg 1's only writer is instruction 1.
-    let code = [EXPR_STR_UPPER, 0, 1, 0, EXPR_LOAD_COL_STR, 1, 1, 0];
+    let code = [
+        ExprOp::StrUpper.as_wire(),
+        0,
+        1,
+        0,
+        ExprOp::LoadColStr.as_wire(),
+        1,
+        1,
+        0,
+    ];
     assert_eq!(from_wire(&code, 2), Err(ExprValidateErr::RegReadBeforeWrite { reg: 1 }));
     // The same two instructions in the other order are legal, so the rejection
     // above is about ordering and not about the instructions themselves.
-    let ordered = [EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_STR_UPPER, 1, 0, 0];
+    let ordered = [
+        ExprOp::LoadColStr.as_wire(),
+        0,
+        1,
+        0,
+        ExprOp::StrUpper.as_wire(),
+        1,
+        0,
+        0,
+    ];
     assert!(from_wire(&ordered, 2).is_ok());
 }
 
@@ -2522,13 +2562,22 @@ fn string_operand_read_before_its_writer_is_refused() {
 /// `split_windows`' disjointness guard is a `debug_assert` release compiles out.
 #[test]
 fn string_ops_are_anti_aliased_against_their_destination() {
-    let load_two = [EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_LOAD_COL_STR, 1, 2, 0];
+    let load_two = [
+        ExprOp::LoadColStr.as_wire(),
+        0,
+        1,
+        0,
+        ExprOp::LoadColStr.as_wire(),
+        1,
+        2,
+        0,
+    ];
     let alias = |op: u32, dst: u32, a: u32, b: u32| {
         let mut code = load_two.to_vec();
         code.extend_from_slice(&[op, dst, a, b]);
         from_wire(&code, 3)
     };
-    for (op, a, b) in [(EXPR_STR_CMP_EQ, 0, 1), (EXPR_STR_CONCAT, 0, 1)] {
+    for (op, a, b) in [(ExprOp::StrCmpEq.as_wire(), 0, 1), (ExprOp::StrConcat.as_wire(), 0, 1)] {
         assert!(
             matches!(alias(op, 0, a, b), Err(ExprValidateErr::RegisterAliasing { .. })),
             "opcode {op} must not write one of its own sources"
@@ -2537,14 +2586,19 @@ fn string_ops_are_anti_aliased_against_their_destination() {
     // STR_SELECT packs `a | b << 16`, and SUBSTR `start | len << 16`.
     let sel = |dst: u32, cond: u32, a: u32, b: u32| {
         let mut code = load_two.to_vec();
-        code.extend_from_slice(&[EXPR_STR_SELECT, dst, cond, gnitz_wire::pack_operand_pair(a, b)]);
+        code.extend_from_slice(&[
+            ExprOp::StrSelect.as_wire(),
+            dst,
+            cond,
+            gnitz_wire::pack_operand_pair(a, b),
+        ]);
         from_wire(&code, 3)
     };
     assert!(matches!(sel(1, 2, 0, 1), Err(ExprValidateErr::RegisterAliasing { .. })));
     // `dst == a` where the register was never written: only the aliasing arm
     // catches this, since a never-written register also reads as class-clear.
-    let mut code = vec![EXPR_LOAD_COL_STR, 0, 1, 0];
-    code.extend_from_slice(&[EXPR_STR_SUBSTR, 0, 0, 1]);
+    let mut code = vec![ExprOp::LoadColStr.as_wire(), 0, 1, 0];
+    code.extend_from_slice(&[ExprOp::StrSubstr.as_wire(), 0, 0, 1]);
     assert!(matches!(
         from_wire(&code, 2),
         Err(ExprValidateErr::RegisterAliasing { .. })
@@ -2552,23 +2606,50 @@ fn string_ops_are_anti_aliased_against_their_destination() {
 }
 
 /// Single-assignment stops being a client convention and becomes a checked rule.
-/// Every planner-emitted program is already SSA (`alloc_reg` is a monotonic
+/// Every planner-emitted program is already SSA (`ExprBuilder::push` is a monotonic
 /// counter), so nothing legitimate is refused.
 #[test]
 fn a_register_may_have_only_one_writer() {
     // Same class.
     assert_eq!(
-        from_wire(&[EXPR_LOAD_CONST, 0, 1, 0, EXPR_LOAD_CONST, 0, 2, 0], 1),
+        from_wire(
+            &[
+                ExprOp::LoadConst.as_wire(),
+                0,
+                1,
+                0,
+                ExprOp::LoadConst.as_wire(),
+                0,
+                2,
+                0
+            ],
+            1
+        ),
         Err(ExprValidateErr::RegRewrite { reg: 0 })
     );
     // Across classes, which is what makes a register's class well-defined.
     assert_eq!(
-        from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_LOAD_CONST, 0, 2, 0], 1),
+        from_wire(
+            &[
+                ExprOp::LoadColStr.as_wire(),
+                0,
+                1,
+                0,
+                ExprOp::LoadConst.as_wire(),
+                0,
+                2,
+                0
+            ],
+            1
+        ),
         Err(ExprValidateErr::RegRewrite { reg: 0 })
     );
     // The aliasing check keeps precedence, so the more specific diagnosis wins.
     assert!(matches!(
-        from_wire(&[EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_CMP_GT, 0, 0, 0], 1),
+        from_wire(
+            &[ExprOp::LoadColInt.as_wire(), 0, 1, 0, ExprOp::CmpGt.as_wire(), 0, 0, 0],
+            1
+        ),
         Err(ExprValidateErr::RegisterAliasing { .. })
     ));
     // A register-free `CopyCol` program has no `dst` to collide.
@@ -2585,7 +2666,13 @@ fn emit_class_must_match_its_destination_column() {
     let int_out = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
     let in_str = TestSchema::with_pk_at(0, &[type_code::U64, type_code::STRING]);
 
-    let scalar_src = LogicalProgram::from_wire(&[EXPR_LOAD_CONST, 0, 7, 0, EXPR_EMIT, 0, 0, 0], 1, 0, vec![]).unwrap();
+    let scalar_src = LogicalProgram::from_wire(
+        &[ExprOp::LoadConst.as_wire(), 0, 7, 0, ExprOp::Emit.as_wire(), 0, 0, 0],
+        1,
+        0,
+        vec![],
+    )
+    .unwrap();
     assert_eq!(
         scalar_src.validate(Some(&in_str), Some(&str_out)),
         Err(ExprValidateErr::EmitClassMismatch {
@@ -2594,7 +2681,13 @@ fn emit_class_must_match_its_destination_column() {
         })
     );
 
-    let str_src = LogicalProgram::from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_EMIT, 0, 0, 0], 1, 0, vec![]).unwrap();
+    let str_src = LogicalProgram::from_wire(
+        &[ExprOp::LoadColStr.as_wire(), 0, 1, 0, ExprOp::Emit.as_wire(), 0, 0, 0],
+        1,
+        0,
+        vec![],
+    )
+    .unwrap();
     assert_eq!(
         str_src.validate(Some(&in_str), Some(&int_out)),
         Err(ExprValidateErr::EmitClassMismatch {
@@ -2612,7 +2705,7 @@ fn emit_class_must_match_its_destination_column() {
 #[test]
 fn emit_bounds_checks_its_source_register() {
     assert_eq!(
-        from_wire(&[EXPR_EMIT, 0, 5, 0], 2),
+        from_wire(&[ExprOp::Emit.as_wire(), 0, 5, 0], 2),
         Err(ExprValidateErr::RegOutOfRange { reg: 5, num_regs: 2 })
     );
 }
@@ -2623,7 +2716,7 @@ fn emit_bounds_checks_its_source_register() {
 #[test]
 fn a_string_result_register_resolves_as_a_scalar_but_not_as_a_filter() {
     let schema = schema_pk_strings(1, true);
-    let prog = || LogicalProgram::from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0], 1, 0, vec![]).unwrap();
+    let prog = || LogicalProgram::from_wire(&[ExprOp::LoadColStr.as_wire(), 0, 1, 0], 1, 0, vec![]).unwrap();
     assert_eq!(
         prog().resolve_filter(&schema).err(),
         Some(ExprValidateErr::RegClassMismatch { reg: 0 })
@@ -2635,7 +2728,7 @@ fn a_string_result_register_resolves_as_a_scalar_but_not_as_a_filter() {
 fn load_col_str_requires_a_german_string_column() {
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
     assert_eq!(
-        LogicalProgram::from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0], 1, 0, vec![])
+        LogicalProgram::from_wire(&[ExprOp::LoadColStr.as_wire(), 0, 1, 0], 1, 0, vec![])
             .unwrap()
             .validate(Some(&schema), None),
         Err(ExprValidateErr::ColKindMismatch {
@@ -2651,11 +2744,11 @@ fn trim_mode_and_cast_target_are_narrowed_at_decode() {
     let trim = |mode: u32| {
         LogicalProgram::from_wire(
             &[
-                EXPR_LOAD_COL_STR,
+                ExprOp::LoadColStr.as_wire(),
                 0,
                 1,
                 0,
-                EXPR_STR_TRIM,
+                ExprOp::StrTrim.as_wire(),
                 1,
                 gnitz_wire::pack_operand_pair(0, mode),
                 0,
@@ -2673,7 +2766,16 @@ fn trim_mode_and_cast_target_are_narrowed_at_decode() {
 
     assert_eq!(
         wire_verdict(
-            &[EXPR_LOAD_COL_STR, 0, 1, 0, gnitz_wire::EXPR_STR_TO_INT, 1, 0, 999],
+            &[
+                ExprOp::LoadColStr.as_wire(),
+                0,
+                1,
+                0,
+                ExprOp::StrToInt.as_wire(),
+                1,
+                0,
+                999
+            ],
             2,
             1
         ),
@@ -2687,7 +2789,7 @@ fn like_rejects_a_forged_escape_or_operand() {
     // packed above the source register.
     let load_like = |op, escape: u32, pat_idx| {
         [
-            EXPR_LOAD_COL_STR,
+            ExprOp::LoadColStr.as_wire(),
             0,
             1,
             0,
@@ -2700,28 +2802,55 @@ fn like_rejects_a_forged_escape_or_operand() {
     let pool = || vec![b"a%".to_vec()];
     let decode = |code: [u32; 8], pool: Vec<Vec<u8>>| LogicalProgram::from_wire(&code, 2, 1, pool).map(|_| ());
 
-    assert!(decode(load_like(EXPR_STR_LIKE, b'\\' as u32, 0), pool()).is_ok());
+    assert!(decode(load_like(ExprOp::StrLike.as_wire(), b'\\' as u32, 0), pool()).is_ok());
     // Escape 0 disables escaping, and an empty pool entry is the legal `LIKE ''`.
-    assert!(decode(load_like(EXPR_STR_ILIKE, 0, 0), pool()).is_ok());
-    assert!(decode(load_like(EXPR_STR_LIKE, 0, 0), vec![Vec::new()]).is_ok());
+    assert!(decode(load_like(ExprOp::StrIlike.as_wire(), 0, 0), pool()).is_ok());
+    assert!(decode(load_like(ExprOp::StrLike.as_wire(), 0, 0), vec![Vec::new()]).is_ok());
 
     assert_eq!(
-        decode(load_like(EXPR_STR_LIKE, b'\\' as u32, 9), pool()),
+        decode(load_like(ExprOp::StrLike.as_wire(), b'\\' as u32, 9), pool()),
         Err(ExprValidateErr::ConstIdxOutOfRange { const_idx: 9, n: 1 })
     );
     // The escape is one byte, so the half above it must be clear.
     assert_eq!(
-        decode(load_like(EXPR_STR_LIKE, 0x1_5C, 0), pool()),
+        decode(load_like(ExprOp::StrLike.as_wire(), 0x1_5C, 0), pool()),
         Err(ExprValidateErr::BadLikeEscape { escape: 0x1_5C })
     );
     // The source must be a string register …
     assert_eq!(
-        decode([EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_STR_LIKE, 1, 0, 0], pool()),
+        decode(
+            [
+                ExprOp::LoadColInt.as_wire(),
+                0,
+                1,
+                0,
+                ExprOp::StrLike.as_wire(),
+                1,
+                0,
+                0
+            ],
+            pool()
+        ),
         Err(ExprValidateErr::RegClassMismatch { reg: 0 })
     );
     // … and the destination may not alias it.
     assert_eq!(
-        LogicalProgram::from_wire(&[EXPR_LOAD_COL_STR, 0, 1, 0, EXPR_STR_LIKE, 0, 0, 0], 1, 0, pool()).map(|_| ()),
+        LogicalProgram::from_wire(
+            &[
+                ExprOp::LoadColStr.as_wire(),
+                0,
+                1,
+                0,
+                ExprOp::StrLike.as_wire(),
+                0,
+                0,
+                0
+            ],
+            1,
+            0,
+            pool()
+        )
+        .map(|_| ()),
         Err(ExprValidateErr::RegisterAliasing { dst: 0, reg: 0 })
     );
 }
@@ -2752,7 +2881,7 @@ fn two_like_opcodes_over_one_pool_index_get_a_matcher_each() {
     // ILIKE one is read off the same row through `reg_values`. Captured rather
     // than asserted inside the callback, which a non-firing morsel loop would
     // let pass vacuously.
-    assert_eq!(ev.eval_row(&view, 0), (0, false));
+    assert_eq!(ev.eval_row(&view, 0), Some(0));
     let mut ci_verdicts: Vec<i64> = Vec::new();
     ev.eval_morsels(&view, 0, 1, |_, out| ci_verdicts.push(out.reg_values(2)[0]));
     assert_eq!(ci_verdicts, [1]);
@@ -2805,4 +2934,255 @@ fn string_nullability_classification() {
     };
     assert!(substr(None), "no FOR clause writes no fail flag");
     assert!(!substr(Some(2)), "a FOR clause can name a negative length");
+}
+
+// ---------------------------------------------------------------------------
+// Encoder / decoder drift — the two tables over one opcode space
+// ---------------------------------------------------------------------------
+
+/// One instance of every [`LogicalInstr`] variant, with a distinct value in
+/// every field so a swapped pair cannot round-trip by coincidence.
+///
+/// The registers are deliberately small and the programs below are never
+/// resolved: what is under test is the word layout alone, so the list need
+/// not be a type-coherent or even a validatable program.
+fn every_variant() -> Vec<LogicalInstr> {
+    use LogicalInstr as L;
+    let mut v = vec![
+        L::LoadColInt { dst: 1, col: 2 },
+        L::LoadColFloat { dst: 3, col: 4 },
+        L::LoadConst {
+            dst: 5,
+            val: -1_234_567_890_123,
+        },
+        L::IntAdd { dst: 6, a: 7, b: 8 },
+        L::IntSub { dst: 9, a: 10, b: 11 },
+        L::IntMul { dst: 12, a: 13, b: 14 },
+        L::IntDiv { dst: 15, a: 16, b: 17 },
+        L::IntMod { dst: 18, a: 19, b: 20 },
+        L::FloatAdd { dst: 21, a: 22, b: 23 },
+        L::FloatSub { dst: 24, a: 25, b: 26 },
+        L::FloatMul { dst: 27, a: 28, b: 29 },
+        L::FloatDiv { dst: 30, a: 31, b: 32 },
+        L::IntToFloat { dst: 33, a: 34 },
+        L::FloatToF32 { dst: 35, a: 36 },
+        L::FloatToInt {
+            dst: 37,
+            a: 38,
+            tc: TypeCode::I16 as u32,
+        },
+        L::IntCast {
+            dst: 39,
+            a: 40,
+            tc: TypeCode::I32 as u32,
+        },
+        L::Select {
+            dst: 41,
+            cond: 42,
+            a: 43,
+            b: 44,
+        },
+        L::LoadNull { dst: 45 },
+        L::BoolAnd { dst: 46, a: 47, b: 48 },
+        L::BoolOr { dst: 49, a: 50, b: 51 },
+        L::BoolNot { dst: 52, a: 53 },
+        L::IsNull {
+            dst: 54,
+            col: 55,
+            invert: false,
+        },
+        L::IsNull {
+            dst: 56,
+            col: 57,
+            invert: true,
+        },
+        L::IntInSet {
+            dst: 58,
+            value_reg: 59,
+            set_idx: 60,
+        },
+        L::LoadColStr { dst: 61, col: 62 },
+        L::LoadConstStr { dst: 63, const_idx: 64 },
+        L::LoadNullStr { dst: 65 },
+        L::StrSelect {
+            dst: 66,
+            cond: 67,
+            a: 68,
+            b: 69,
+        },
+        // The two packed-pair families sit in *different* operand words —
+        // SELECT/SUBSTR in a2, TRIM/LIKE in a1 — which is the single
+        // per-opcode fact the encoder and decoder can silently disagree on.
+        L::StrSubstr {
+            dst: 70,
+            src: 71,
+            start_reg: 72,
+            len_reg: Some(73),
+        },
+        L::StrSubstr {
+            dst: 74,
+            src: 75,
+            start_reg: 76,
+            len_reg: None,
+        },
+        L::StrTrim {
+            dst: 77,
+            a: 78,
+            mode: TrimMode::Leading.as_wire(),
+            set_idx: 79,
+        },
+        L::StrLike {
+            dst: 80,
+            src: 81,
+            escape: b'!' as u32,
+            pat_idx: 82,
+            ci: false,
+        },
+        L::StrLike {
+            dst: 83,
+            src: 84,
+            escape: 0,
+            pat_idx: 85,
+            ci: true,
+        },
+        L::IntToStr { dst: 86, a: 87 },
+        L::FloatToStr { dst: 88, a: 89 },
+        L::StrToInt {
+            dst: 90,
+            a: 91,
+            tc: TypeCode::I64 as u32,
+        },
+        L::StrToFloat { dst: 92, a: 93 },
+        L::CopyCol { src_col: 94, out: 95 },
+        L::Emit { src: 96, out: 97 },
+    ];
+    // The operator- and flag-parameterized families, every value of each.
+    for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Gt, CmpOp::Ge, CmpOp::Lt, CmpOp::Le] {
+        v.push(L::Cmp {
+            op,
+            dst: 100,
+            a: 101,
+            b: 102,
+        });
+        v.push(L::FCmp {
+            op,
+            dst: 103,
+            a: 104,
+            b: 105,
+        });
+    }
+    for op in [StrOp::Eq, StrOp::Lt, StrOp::Le] {
+        v.push(L::StrColConst {
+            op,
+            dst: 106,
+            col: 107,
+            const_idx: 108,
+        });
+        v.push(L::StrColCol {
+            op,
+            dst: 109,
+            col_a: 110,
+            col_b: 111,
+        });
+        v.push(L::StrCmp {
+            op,
+            dst: 112,
+            a: 113,
+            b: 114,
+        });
+    }
+    for op in [IntUnaryOp::Neg, IntUnaryOp::Abs] {
+        v.push(L::IntUnary { op, dst: 115, a: 116 });
+    }
+    for op in [
+        FloatUnaryOp::Neg,
+        FloatUnaryOp::Abs,
+        FloatUnaryOp::Floor,
+        FloatUnaryOp::Ceil,
+        FloatUnaryOp::Round,
+        FloatUnaryOp::Trunc,
+    ] {
+        v.push(L::FloatUnary { op, dst: 117, a: 118 });
+    }
+    for is_max in [true, false] {
+        v.push(L::IntMinMax2 {
+            dst: 119,
+            a: 120,
+            b: 121,
+            is_max,
+        });
+        v.push(L::FloatMinMax2 {
+            dst: 122,
+            a: 123,
+            b: 124,
+            is_max,
+        });
+    }
+    for chars in [false, true] {
+        v.push(L::StrLen {
+            dst: 125,
+            a: 126,
+            chars,
+        });
+    }
+    for upper in [true, false] {
+        v.push(L::StrCase {
+            dst: 127,
+            a: 128,
+            upper,
+        });
+    }
+    for skip_null in [false, true] {
+        v.push(L::StrConcat {
+            dst: 129,
+            a: 130,
+            b: 131,
+            skip_null,
+        });
+    }
+    v
+}
+
+/// `from_wire ∘ to_wire == id`. The encoder and the decoder are the only two
+/// statements of the wire word layout, and this is what binds them: a swapped
+/// operand pair, a flag encoded into the wrong opcode, or a cast target on
+/// the wrong word all fail here.
+#[test]
+fn every_instruction_round_trips_through_the_wire_form() {
+    let want = every_variant();
+    let code: Vec<u32> = want.iter().copied().flat_map(LogicalInstr::to_wire).collect();
+    // `from_wire` runs the structure-only validation, which this deliberately
+    // ill-formed fixture cannot pass — so decode the quads directly.
+    let got: Vec<LogicalInstr> = code
+        .chunks_exact(4)
+        .map(|q| LogicalProgram::decode_quad(q).expect("to_wire emits a decodable opcode"))
+        .collect();
+    assert_eq!(got, want);
+}
+
+/// Every opcode the decoder accepts must be reachable from the encoder, and
+/// every [`LogicalInstr`] variant must appear in [`every_variant`] so the
+/// round-trip above actually covers its operand layout.
+///
+/// `decode_quad` matches [`ExprOp`] exhaustively, so "accepted" is `ExprOp::ALL`
+/// — an opcode with no decode arm no longer compiles, and one with no *encoder*
+/// arm fails here.
+#[test]
+fn the_encoder_reaches_every_opcode_the_decoder_accepts() {
+    let emitted: BTreeSet<u32> = every_variant().iter().map(|i| i.to_wire()[0]).collect();
+    let accepted: BTreeSet<u32> = ExprOp::ALL.iter().map(|op| op.as_wire()).collect();
+    assert_eq!(emitted, accepted, "encoded opcodes vs. opcodes the decoder accepts");
+
+    // Two opcodes can share a variant (a flag folded into the opcode), so the
+    // opcode sets agreeing does not imply every variant is covered.
+    let seen: BTreeSet<usize> = every_variant().iter().map(LogicalInstr::variant_index).collect();
+    let missing: Vec<usize> = (0..LogicalInstr::VARIANT_COUNT).filter(|i| !seen.contains(i)).collect();
+    assert!(
+        missing.is_empty(),
+        "every_variant() is missing variant indices {missing:?}"
+    );
+    assert!(
+        seen.iter().all(|&i| i < LogicalInstr::VARIANT_COUNT),
+        "VARIANT_COUNT is behind the variant list",
+    );
 }

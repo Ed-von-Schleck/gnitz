@@ -64,7 +64,7 @@ fn str_cmp_reduction(op: BinOp, can_swap: bool) -> Option<(StrOp, bool, bool)> {
 }
 
 /// Try to compile a string comparison (col vs const, const vs col, col vs col)
-/// to the `EXPR_STR_COL_*` opcodes, which read the 16-byte cells directly and
+/// to the `ExprOp::StrCol*` opcodes, which read the 16-byte cells directly and
 /// need no string register. `None` means "not this shape" — including any
 /// operator that is not one of the six comparisons, which then falls through to
 /// the register channel rather than erroring here (`strcol || 'lit'` would
@@ -554,7 +554,7 @@ impl OpcodeBackend<'_> {
             None => (self.lit_null().0, false),
         };
 
-        // Float unification is one GLOBAL decision, not a per-pair fold: EXPR_SELECT
+        // Float unification is one GLOBAL decision, not a per-pair fold: ExprOp::Select
         // blends raw i64 bit patterns and converts nothing, so if any result or the
         // else is float, every int branch is lifted to float up front. A per-pair
         // lift (as in `binop`) would blend int and float bit patterns in one
@@ -611,7 +611,7 @@ impl OpcodeBackend<'_> {
         // against — source schema for a table filter, reduce-output schema for
         // HAVING — so the int gate is correct in both, and a HAVING large-IN
         // compiles here too. Use `is_fixed_int` — the same predicate the VM's
-        // `ColKind::FixedInt` check applies — not `is_pk_eligible`, which wrongly
+        // `ColKind::FIXED_INT` check applies — not `is_pk_eligible`, which wrongly
         // admits U128/UUID/I128.
         if gnitz_wire::is_fixed_int(inner.infer_type(self.cols) as u8) {
             if let Some(mut values) = items.iter().map(fold_int_literal).collect::<Option<Vec<i64>>>() {
@@ -913,6 +913,7 @@ fn expr_unsupported(e: ExprValidateErr) -> GnitzSqlError {
 mod tests {
     use super::*;
     use gnitz_core::{ColumnDef, ExprProgram, Schema, TypeCode};
+    use gnitz_wire::ExprOp;
 
     /// Decode a built program the way the engine will. Production resolves locally
     /// without a wire round-trip, but these tests are about what the *engine*
@@ -1010,12 +1011,12 @@ mod tests {
 
     /// The float opcodes a fold-to-identity must never emit.
     const FLOAT_OPS: [u32; 6] = [
-        gnitz_wire::EXPR_INT_TO_FLOAT,
-        gnitz_wire::EXPR_FLOAT_MUL,
-        gnitz_wire::EXPR_FLOAT_DIV,
-        gnitz_wire::EXPR_FLOAT_ROUND,
-        gnitz_wire::EXPR_FLOAT_FLOOR,
-        gnitz_wire::EXPR_FLOAT_CEIL,
+        ExprOp::IntToFloat.as_wire(),
+        ExprOp::FloatMul.as_wire(),
+        ExprOp::FloatDiv.as_wire(),
+        ExprOp::FloatRound.as_wire(),
+        ExprOp::FloatFloor.as_wire(),
+        ExprOp::FloatCeil.as_wire(),
     ];
 
     fn cast_emits(expr: &BoundExpr, to: TypeCode, schema: &Schema) -> bool {
@@ -1023,7 +1024,7 @@ mod tests {
             expr: Box::new(expr.clone()),
             to,
         };
-        lower_ops(&cast, schema).contains(&gnitz_wire::EXPR_INT_CAST)
+        lower_ops(&cast, schema).contains(&ExprOp::IntCast.as_wire())
     }
 
     /// The elision rule keys on the register IMAGE, not value-domain containment.
@@ -1097,7 +1098,7 @@ mod tests {
         assert!(round_ops(2, &BoundExpr::LitFloat(1.5), &s).1, "float arg stays float");
         let (ops, isf) = round_ops(-2, &icol, &s);
         assert!(isf, "negative scale yields F64");
-        assert!(ops.contains(&gnitz_wire::EXPR_FLOAT_ROUND), "negative scale rounds");
+        assert!(ops.contains(&ExprOp::FloatRound.as_wire()), "negative scale rounds");
     }
 
     /// n == 0 is the bare 1-arg ROUND opcode, not a scale-by-1 round trip.
@@ -1105,9 +1106,9 @@ mod tests {
     fn round_scaled_zero_is_plain_round() {
         let s = cast_schema();
         let (ops, _) = round_ops(0, &BoundExpr::LitFloat(2.5), &s);
-        assert!(ops.contains(&gnitz_wire::EXPR_FLOAT_ROUND));
-        assert!(!ops.contains(&gnitz_wire::EXPR_FLOAT_MUL));
-        assert!(!ops.contains(&gnitz_wire::EXPR_FLOAT_DIV));
+        assert!(ops.contains(&ExprOp::FloatRound.as_wire()));
+        assert!(!ops.contains(&ExprOp::FloatMul.as_wire()));
+        assert!(!ops.contains(&ExprOp::FloatDiv.as_wire()));
     }
 
     /// A positive scale multiplies first and divides back; a negative one does
@@ -1122,9 +1123,9 @@ mod tests {
                 .into_iter()
                 .filter(|op| {
                     [
-                        gnitz_wire::EXPR_FLOAT_MUL,
-                        gnitz_wire::EXPR_FLOAT_DIV,
-                        gnitz_wire::EXPR_FLOAT_ROUND,
+                        ExprOp::FloatMul.as_wire(),
+                        ExprOp::FloatDiv.as_wire(),
+                        ExprOp::FloatRound.as_wire(),
                     ]
                     .contains(op)
                 })
@@ -1133,17 +1134,17 @@ mod tests {
         assert_eq!(
             ops(2),
             vec![
-                gnitz_wire::EXPR_FLOAT_MUL,
-                gnitz_wire::EXPR_FLOAT_ROUND,
-                gnitz_wire::EXPR_FLOAT_DIV
+                ExprOp::FloatMul.as_wire(),
+                ExprOp::FloatRound.as_wire(),
+                ExprOp::FloatDiv.as_wire()
             ]
         );
         assert_eq!(
             ops(-2),
             vec![
-                gnitz_wire::EXPR_FLOAT_DIV,
-                gnitz_wire::EXPR_FLOAT_ROUND,
-                gnitz_wire::EXPR_FLOAT_MUL
+                ExprOp::FloatDiv.as_wire(),
+                ExprOp::FloatRound.as_wire(),
+                ExprOp::FloatMul.as_wire()
             ]
         );
     }
@@ -1165,14 +1166,14 @@ mod tests {
         for c in [2usize, 4] {
             let ops = lower_ops(&func(NumFunc::Abs, BoundExpr::ColRef(c)), &s);
             assert!(
-                !ops.contains(&gnitz_wire::EXPR_INT_ABS),
+                !ops.contains(&ExprOp::IntAbs.as_wire()),
                 "ABS over an unsigned column folds away"
             );
         }
         // A signed integer argument does need the opcode.
-        assert!(lower_ops(&func(NumFunc::Abs, BoundExpr::ColRef(1)), &s).contains(&gnitz_wire::EXPR_INT_ABS));
+        assert!(lower_ops(&func(NumFunc::Abs, BoundExpr::ColRef(1)), &s).contains(&ExprOp::IntAbs.as_wire()));
         // A float argument takes the float opcode in every case.
-        assert!(lower_ops(&func(NumFunc::Floor, BoundExpr::LitFloat(1.5)), &s).contains(&gnitz_wire::EXPR_FLOAT_FLOOR));
+        assert!(lower_ops(&func(NumFunc::Floor, BoundExpr::LitFloat(1.5)), &s).contains(&ExprOp::FloatFloor.as_wire()));
     }
 
     fn min_max(is_max: bool, args: Vec<BoundExpr>) -> BoundExpr {
@@ -1188,19 +1189,19 @@ mod tests {
             let args: Vec<BoundExpr> = (0..n).map(|_| BoundExpr::ColRef(1)).collect();
             let ops = lower_ops(&min_max(true, args), &s);
             assert_eq!(
-                ops.iter().filter(|&&o| o == gnitz_wire::EXPR_INT_MAX2).count(),
+                ops.iter().filter(|&&o| o == ExprOp::IntMax2.as_wire()).count(),
                 n - 1,
                 "arity {n}: n-1 folds"
             );
         }
-        assert!(lower_ops(&min_max(false, vec![BoundExpr::ColRef(1); 2]), &s).contains(&gnitz_wire::EXPR_INT_MIN2));
+        assert!(lower_ops(&min_max(false, vec![BoundExpr::ColRef(1); 2]), &s).contains(&ExprOp::IntMin2.as_wire()));
         // One float argument lifts every integer argument and switches the whole
         // fold to the float opcodes — the same global unification CASE applies.
         let mixed = min_max(true, vec![BoundExpr::ColRef(1), BoundExpr::LitFloat(1.5)]);
         let ops = lower_ops(&mixed, &s);
-        assert!(ops.contains(&gnitz_wire::EXPR_FLOAT_MAX2));
-        assert!(ops.contains(&gnitz_wire::EXPR_INT_TO_FLOAT));
-        assert!(!ops.contains(&gnitz_wire::EXPR_INT_MAX2));
+        assert!(ops.contains(&ExprOp::FloatMax2.as_wire()));
+        assert!(ops.contains(&ExprOp::IntToFloat.as_wire()));
+        assert!(!ops.contains(&ExprOp::IntMax2.as_wire()));
     }
 
     /// With a U64 argument anywhere in the list, one U64 argument is rotated to
@@ -1221,7 +1222,7 @@ mod tests {
             .expect("lowers");
             let prog = eb.build(reg);
             let first = prog.code.chunks_exact(4).next().expect("non-empty");
-            assert_eq!(first[0], gnitz_wire::EXPR_LOAD_COL_INT, "the fold opens with a load");
+            assert_eq!(first[0], ExprOp::LoadColInt.as_wire(), "the fold opens with a load");
             first[2]
         };
         let neg1 = BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(BoundExpr::LitInt(1)));
@@ -1285,17 +1286,17 @@ mod tests {
         let cast = |e: BoundExpr, to| BoundExpr::Cast { expr: Box::new(e), to };
         let f = BoundExpr::LitFloat(2.7);
 
-        assert!(lower_ops(&cast(f.clone(), TypeCode::I32), &s).contains(&gnitz_wire::EXPR_FLOAT_TO_INT));
+        assert!(lower_ops(&cast(f.clone(), TypeCode::I32), &s).contains(&ExprOp::FloatToInt.as_wire()));
         // float -> DOUBLE is a no-op: the register already holds an f64.
         let ops = lower_ops(&cast(f.clone(), TypeCode::F64), &s);
-        assert!(!ops.contains(&gnitz_wire::EXPR_FLOAT_TO_F32) && !ops.contains(&gnitz_wire::EXPR_INT_TO_FLOAT));
-        assert!(lower_ops(&cast(f, TypeCode::F32), &s).contains(&gnitz_wire::EXPR_FLOAT_TO_F32));
+        assert!(!ops.contains(&ExprOp::FloatToF32.as_wire()) && !ops.contains(&ExprOp::IntToFloat.as_wire()));
+        assert!(lower_ops(&cast(f, TypeCode::F32), &s).contains(&ExprOp::FloatToF32.as_wire()));
 
         let ops = lower_ops(&cast(BoundExpr::ColRef(1), TypeCode::F64), &s);
-        assert!(ops.contains(&gnitz_wire::EXPR_INT_TO_FLOAT) && !ops.contains(&gnitz_wire::EXPR_FLOAT_TO_F32));
+        assert!(ops.contains(&ExprOp::IntToFloat.as_wire()) && !ops.contains(&ExprOp::FloatToF32.as_wire()));
         // int -> FLOAT is the two-step lift; the double rounding is committed.
         let ops = lower_ops(&cast(BoundExpr::ColRef(1), TypeCode::F32), &s);
-        assert!(ops.contains(&gnitz_wire::EXPR_INT_TO_FLOAT) && ops.contains(&gnitz_wire::EXPR_FLOAT_TO_F32));
+        assert!(ops.contains(&ExprOp::IntToFloat.as_wire()) && ops.contains(&ExprOp::FloatToF32.as_wire()));
     }
 
     /// `col <op> 'lit'` and the transposed `'lit' <op'> col` must compile to the
@@ -1441,7 +1442,6 @@ mod tests {
     /// branch to float up front (never a per-pair blend of int/float bits).
     #[test]
     fn case_float_unification_lifts_int_branches() {
-        use gnitz_wire::{EXPR_INT_TO_FLOAT, EXPR_SELECT};
         let schema = case_schema();
         let gt0 = || {
             BoundExpr::BinOp(
@@ -1457,8 +1457,11 @@ mod tests {
             else_: Some(Box::new(BoundExpr::LitInt(0))),
         };
         let ops = opcodes(&compile_bound_expr_to_program(&case_int, &schema.columns).unwrap());
-        assert!(ops.contains(&EXPR_SELECT), "CASE must lower to a SELECT");
-        assert!(!ops.contains(&EXPR_INT_TO_FLOAT), "all-int CASE needs no float lift");
+        assert!(ops.contains(&ExprOp::Select.as_wire()), "CASE must lower to a SELECT");
+        assert!(
+            !ops.contains(&ExprOp::IntToFloat.as_wire()),
+            "all-int CASE needs no float lift"
+        );
 
         // Mixed int/float CASE: the int else is lifted to float up front.
         let case_mixed = BoundExpr::Case {
@@ -1466,9 +1469,9 @@ mod tests {
             else_: Some(Box::new(BoundExpr::ColRef(1))),
         };
         let ops = opcodes(&compile_bound_expr_to_program(&case_mixed, &schema.columns).unwrap());
-        assert!(ops.contains(&EXPR_SELECT), "CASE must lower to a SELECT");
+        assert!(ops.contains(&ExprOp::Select.as_wire()), "CASE must lower to a SELECT");
         assert!(
-            ops.contains(&EXPR_INT_TO_FLOAT),
+            ops.contains(&ExprOp::IntToFloat.as_wire()),
             "mixed CASE lifts int branches to float"
         );
     }
@@ -1547,7 +1550,6 @@ mod tests {
     /// both positive and negative-literal lists.
     #[test]
     fn in_list_int_emits_int_in_set() {
-        use gnitz_wire::EXPR_INT_IN_SET;
         let schema = two_int_schema();
         for items in [
             vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2), BoundExpr::LitInt(3)],
@@ -1556,7 +1558,7 @@ mod tests {
             let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema.columns).unwrap();
             let ops = opcodes(&prog);
             assert!(
-                ops.contains(&EXPR_INT_IN_SET),
+                ops.contains(&ExprOp::IntInSet.as_wire()),
                 "int IN must emit INT_IN_SET, ops={ops:?}"
             );
         }
@@ -1604,7 +1606,6 @@ mod tests {
     /// INT_IN_SET.
     #[test]
     fn in_list_float_operand_falls_back_to_or_chain() {
-        use gnitz_wire::{EXPR_FCMP_EQ, EXPR_INT_IN_SET};
         let schema = case_schema(); // col2 = f (F64)
         let prog = compile_bound_expr_to_program(
             &in_list(BoundExpr::ColRef(2), vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2)]),
@@ -1612,14 +1613,19 @@ mod tests {
         )
         .unwrap();
         let ops = opcodes(&prog);
-        assert!(!ops.contains(&EXPR_INT_IN_SET), "float IN must not emit INT_IN_SET");
-        assert!(ops.contains(&EXPR_FCMP_EQ), "float IN lowers to fcmp OR-chain");
+        assert!(
+            !ops.contains(&ExprOp::IntInSet.as_wire()),
+            "float IN must not emit INT_IN_SET"
+        );
+        assert!(
+            ops.contains(&ExprOp::FcmpEq.as_wire()),
+            "float IN lowers to fcmp OR-chain"
+        );
     }
 
     /// A string operand falls back to the OR-chain (str_col_eq_const).
     #[test]
     fn in_list_string_operand_falls_back_to_or_chain() {
-        use gnitz_wire::{EXPR_INT_IN_SET, EXPR_STR_COL_EQ_CONST};
         let schema = str_schema(); // col1 = s (String)
         let prog = compile_bound_expr_to_program(
             &in_list(
@@ -1630,16 +1636,19 @@ mod tests {
         )
         .unwrap();
         let ops = opcodes(&prog);
-        assert!(!ops.contains(&EXPR_INT_IN_SET), "string IN must not emit INT_IN_SET");
         assert!(
-            ops.contains(&EXPR_STR_COL_EQ_CONST),
+            !ops.contains(&ExprOp::IntInSet.as_wire()),
+            "string IN must not emit INT_IN_SET"
+        );
+        assert!(
+            ops.contains(&ExprOp::StrColEqConst.as_wire()),
             "string IN lowers to str_col_eq_const"
         );
     }
 
     /// Why the fused compare cannot be dropped in favour of the register
     /// channel, stated as a budget rather than a speed. A string `IN` list is an
-    /// OR chain, and `alloc_reg` never reuses, so the per-term register cost is
+    /// OR chain, and `ExprBuilder::push` never reuses, so the per-term register cost is
     /// what caps the list: one register per fused compare plus one per OR, over
     /// a `MAX_REGS` of 64. At 22 items that is 43 and compiles; through the
     /// register channel each term would spend three instead of one, putting the
@@ -1659,7 +1668,6 @@ mod tests {
     /// A non-literal item (a column) forces the OR-chain even for an int operand.
     #[test]
     fn in_list_non_literal_item_falls_back_to_or_chain() {
-        use gnitz_wire::{EXPR_CMP_EQ, EXPR_INT_IN_SET};
         let schema = two_int_schema();
         let prog = compile_bound_expr_to_program(
             &in_list(BoundExpr::ColRef(1), vec![BoundExpr::LitInt(1), BoundExpr::ColRef(2)]),
@@ -1668,17 +1676,19 @@ mod tests {
         .unwrap();
         let ops = opcodes(&prog);
         assert!(
-            !ops.contains(&EXPR_INT_IN_SET),
+            !ops.contains(&ExprOp::IntInSet.as_wire()),
             "non-literal item must not emit INT_IN_SET"
         );
-        assert!(ops.contains(&EXPR_CMP_EQ), "non-literal item lowers to cmp OR-chain");
+        assert!(
+            ops.contains(&ExprOp::CmpEq.as_wire()),
+            "non-literal item lowers to cmp OR-chain"
+        );
     }
 
     /// A float-literal item forces the OR-chain even for an int operand
     /// (`a IN (1, 2.5)`).
     #[test]
     fn in_list_float_literal_item_falls_back_to_or_chain() {
-        use gnitz_wire::EXPR_INT_IN_SET;
         let schema = two_int_schema();
         let prog = compile_bound_expr_to_program(
             &in_list(
@@ -1689,7 +1699,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !opcodes(&prog).contains(&EXPR_INT_IN_SET),
+            !opcodes(&prog).contains(&ExprOp::IntInSet.as_wire()),
             "a float-literal item must not emit INT_IN_SET"
         );
     }
@@ -1750,13 +1760,13 @@ mod tests {
     /// the register channel exists for computed operands. Routing this shape
     /// through it would build a string register per row for nothing: the fused
     /// kernel short-circuits on the cell's 4-byte prefix, which a `StrView`
-    /// does not carry. `str_const_filter_bench` in gnitz-expr runs both channels
-    /// over four value domains and prints the ratio; the prefix collision rate
-    /// controls it, and nothing bounds that rate, so there is no one number to
-    /// quote here.
+    /// does not carry. `str_const_filter_bench` in gnitz-expr drives either
+    /// channel over four value domains under `perf`; the prefix collision rate
+    /// controls the gap, and nothing bounds that rate, so there is no one number
+    /// to quote here.
     ///
     /// The register cap is the part that does not depend on speed at all.
-    /// `alloc_reg` never reuses a register and `MAX_REGS` is 64. A string
+    /// `ExprBuilder::push` never reuses a register and `MAX_REGS` is 64. A string
     /// `IN (N)` list lowers to an OR chain; each term intercepted into a fused
     /// compare costs one register, plus one per OR — `2N-1`. Through the
     /// register channel a term is a column load, a const load and a compare,
@@ -1770,12 +1780,12 @@ mod tests {
             &BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Eq, Box::new(lit("x"))),
             &schema,
         );
-        assert_eq!(ops, [gnitz_wire::EXPR_STR_COL_EQ_CONST]);
+        assert_eq!(ops, [ExprOp::StrColEqConst.as_wire()]);
         let cols = lower_ops(
             &BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Lt, Box::new(str_col(2))),
             &schema,
         );
-        assert_eq!(cols, [gnitz_wire::EXPR_STR_COL_LT_COL]);
+        assert_eq!(cols, [ExprOp::StrColLtCol.as_wire()]);
     }
 
     /// A *computed* operand has no specialized form, so it falls through to the
@@ -1793,8 +1803,8 @@ mod tests {
             Box::new(lit("X")),
         );
         let ops = lower_ops(&upper_eq, &schema);
-        assert!(ops.contains(&gnitz_wire::EXPR_STR_CMP_EQ), "{ops:?}");
-        assert!(!ops.contains(&gnitz_wire::EXPR_STR_COL_EQ_CONST), "{ops:?}");
+        assert!(ops.contains(&ExprOp::StrCmpEq.as_wire()), "{ops:?}");
+        assert!(!ops.contains(&ExprOp::StrColEqConst.as_wire()), "{ops:?}");
         // The comparison is a boolean, so it is a legitimate filter predicate.
         let p = compile_bound_expr_to_program(&upper_eq, &schema.columns).expect("lowers");
         assert!(to_logical(p).unwrap().resolve_filter(&schema).is_ok());
@@ -1812,13 +1822,13 @@ mod tests {
         };
         let cmp = |op| lower_ops(&BoundExpr::BinOp(Box::new(up(1)), op, Box::new(up(2))), &schema);
         let tail = |ops: Vec<u32>| ops[ops.len() - 1];
-        assert_eq!(tail(cmp(BinOp::Lt)), gnitz_wire::EXPR_STR_CMP_LT);
-        assert_eq!(tail(cmp(BinOp::Le)), gnitz_wire::EXPR_STR_CMP_LE);
+        assert_eq!(tail(cmp(BinOp::Lt)), ExprOp::StrCmpLt.as_wire());
+        assert_eq!(tail(cmp(BinOp::Le)), ExprOp::StrCmpLe.as_wire());
         // GT/GE swap the operands rather than negating, so no BOOL_NOT appears.
-        assert_eq!(tail(cmp(BinOp::Gt)), gnitz_wire::EXPR_STR_CMP_LT);
-        assert_eq!(tail(cmp(BinOp::Ge)), gnitz_wire::EXPR_STR_CMP_LE);
+        assert_eq!(tail(cmp(BinOp::Gt)), ExprOp::StrCmpLt.as_wire());
+        assert_eq!(tail(cmp(BinOp::Ge)), ExprOp::StrCmpLe.as_wire());
         // NE is the negation of EQ.
-        assert_eq!(tail(cmp(BinOp::Ne)), gnitz_wire::EXPR_BOOL_NOT);
+        assert_eq!(tail(cmp(BinOp::Ne)), ExprOp::BoolNot.as_wire());
     }
 
     #[test]
@@ -1828,17 +1838,17 @@ mod tests {
         // type error — `str_operand` intercepts the literal before recursing.
         let pipe_null = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(BoundExpr::LitNull));
         assert_str_program(&pipe_null, &schema);
-        assert!(lower_ops(&pipe_null, &schema).contains(&gnitz_wire::EXPR_LOAD_NULL_STR));
+        assert!(lower_ops(&pipe_null, &schema).contains(&ExprOp::LoadNullStr.as_wire()));
 
         let pipe = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(lit("x")));
-        assert!(lower_ops(&pipe, &schema).contains(&gnitz_wire::EXPR_STR_CONCAT));
+        assert!(lower_ops(&pipe, &schema).contains(&ExprOp::StrConcat.as_wire()));
 
         // CONCAT folds through the null-as-empty step instead, and seeds the fold
         // so even a single argument is non-NULL.
         let one = BoundExpr::ConcatN { args: vec![str_col(1)] };
         let ops = lower_ops(&one, &schema);
-        assert!(ops.contains(&gnitz_wire::EXPR_STR_CONCAT_NN), "{ops:?}");
-        assert!(!ops.contains(&gnitz_wire::EXPR_STR_CONCAT), "{ops:?}");
+        assert!(ops.contains(&ExprOp::StrConcatNn.as_wire()), "{ops:?}");
+        assert!(!ops.contains(&ExprOp::StrConcat.as_wire()), "{ops:?}");
         assert_str_program(&one, &schema);
     }
 
@@ -1851,8 +1861,8 @@ mod tests {
             args: vec![str_col(1), BoundExpr::LitInt(42), BoundExpr::LitFloat(1.5)],
         };
         let ops = lower_ops(&mixed, &schema);
-        assert!(ops.contains(&gnitz_wire::EXPR_INT_TO_STR), "{ops:?}");
-        assert!(ops.contains(&gnitz_wire::EXPR_FLOAT_TO_STR), "{ops:?}");
+        assert!(ops.contains(&ExprOp::IntToStr.as_wire()), "{ops:?}");
+        assert!(ops.contains(&ExprOp::FloatToStr.as_wire()), "{ops:?}");
         assert_str_program(&mixed, &schema);
 
         let pipe_int = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(BoundExpr::LitInt(1)));
@@ -1955,7 +1965,7 @@ mod tests {
     fn blob_columns_stay_outside_the_string_surface() {
         let schema = blob_schema();
         let cmp = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Eq, Box::new(lit("x")));
-        assert_eq!(lower_ops(&cmp, &schema), [gnitz_wire::EXPR_STR_COL_EQ_CONST]);
+        assert_eq!(lower_ops(&cmp, &schema), [ExprOp::StrColEqConst.as_wire()]);
 
         let upper = BoundExpr::StrCall {
             f: StrFunc::Lower,
@@ -1976,24 +1986,24 @@ mod tests {
         };
         assert_eq!(
             lower_ops(&to(TypeCode::I64), &schema),
-            [gnitz_wire::EXPR_LOAD_COL_STR, gnitz_wire::EXPR_STR_TO_INT]
+            [ExprOp::LoadColStr.as_wire(), ExprOp::StrToInt.as_wire()]
         );
         assert_eq!(
             lower_ops(&to(TypeCode::F64), &schema),
-            [gnitz_wire::EXPR_LOAD_COL_STR, gnitz_wire::EXPR_STR_TO_FLOAT]
+            [ExprOp::LoadColStr.as_wire(), ExprOp::StrToFloat.as_wire()]
         );
         assert_eq!(
             lower_ops(&to(TypeCode::F32), &schema),
             [
-                gnitz_wire::EXPR_LOAD_COL_STR,
-                gnitz_wire::EXPR_STR_TO_FLOAT,
-                gnitz_wire::EXPR_FLOAT_TO_F32
+                ExprOp::LoadColStr.as_wire(),
+                ExprOp::StrToFloat.as_wire(),
+                ExprOp::FloatToF32.as_wire()
             ]
         );
         // STRING → STRING is the identity.
         assert_eq!(
             lower_ops(&to(TypeCode::String), &schema),
-            [gnitz_wire::EXPR_LOAD_COL_STR]
+            [ExprOp::LoadColStr.as_wire()]
         );
     }
 
@@ -2004,12 +2014,12 @@ mod tests {
             expr: Box::new(BoundExpr::ColRef(c)),
             to: TypeCode::String,
         };
-        assert!(lower_ops(&to_text(1), &schema).contains(&gnitz_wire::EXPR_INT_TO_STR));
+        assert!(lower_ops(&to_text(1), &schema).contains(&ExprOp::IntToStr.as_wire()));
         let f = BoundExpr::Cast {
             expr: Box::new(BoundExpr::LitFloat(1.5)),
             to: TypeCode::String,
         };
-        assert!(lower_ops(&f, &schema).contains(&gnitz_wire::EXPR_FLOAT_TO_STR));
+        assert!(lower_ops(&f, &schema).contains(&ExprOp::FloatToStr.as_wire()));
         assert_str_program(&to_text(1), &schema);
     }
 
@@ -2026,7 +2036,7 @@ mod tests {
     /// beside the source register, TRIM's shape.
     #[test]
     fn like_lowers_to_one_opcode_carrying_its_escape() {
-        use gnitz_wire::{unpack_operand_pair, EXPR_LOAD_COL_STR, EXPR_STR_ILIKE, EXPR_STR_LIKE};
+        use gnitz_wire::unpack_operand_pair;
         let schema = str_schema();
         let prog = |escape, ci| {
             compile_bound_expr_to_program(&like_of(str_col(1), "a%", escape, ci), &schema.columns).unwrap()
@@ -2035,11 +2045,14 @@ mod tests {
         let escape_of = |p: &ExprProgram| unpack_operand_pair(p.code[6]).1;
 
         let p = prog(Some(b'\\'), false);
-        assert_eq!(opcodes(&p), [EXPR_LOAD_COL_STR, EXPR_STR_LIKE]);
+        assert_eq!(opcodes(&p), [ExprOp::LoadColStr.as_wire(), ExprOp::StrLike.as_wire()]);
         assert_eq!(p.const_strings[0], b"a%");
         assert_eq!(escape_of(&p), b'\\' as u16);
         // ILIKE is the same shape under the case-insensitive opcode …
-        assert_eq!(opcodes(&prog(Some(b'\\'), true)), [EXPR_LOAD_COL_STR, EXPR_STR_ILIKE]);
+        assert_eq!(
+            opcodes(&prog(Some(b'\\'), true)),
+            [ExprOp::LoadColStr.as_wire(), ExprOp::StrIlike.as_wire()]
+        );
         // … and `ESCAPE ''` rides as byte 0.
         assert_eq!(escape_of(&prog(None, false)), 0);
     }
@@ -2048,7 +2061,6 @@ mod tests {
     /// channel produces, including the bare `NULL` its `LitNull` rule catches.
     #[test]
     fn like_takes_a_computed_subject_and_propagates_a_null_literal() {
-        use gnitz_wire::{EXPR_LOAD_COL_STR, EXPR_LOAD_NULL_STR, EXPR_STR_LIKE, EXPR_STR_UPPER};
         let schema = str_schema();
         let upper = BoundExpr::StrCall {
             f: StrFunc::Upper,
@@ -2056,17 +2068,25 @@ mod tests {
         };
         assert_eq!(
             lower_ops(&like_of(upper, "A%", Some(b'\\'), false), &schema),
-            [EXPR_LOAD_COL_STR, EXPR_STR_UPPER, EXPR_STR_LIKE]
+            [
+                ExprOp::LoadColStr.as_wire(),
+                ExprOp::StrUpper.as_wire(),
+                ExprOp::StrLike.as_wire()
+            ]
         );
         assert_eq!(
             lower_ops(&like_of(BoundExpr::LitNull, "a", Some(b'\\'), false), &schema),
-            [EXPR_LOAD_NULL_STR, EXPR_STR_LIKE]
+            [ExprOp::LoadNullStr.as_wire(), ExprOp::StrLike.as_wire()]
         );
         // The verdict is a boolean, so `NOT LIKE` reads it like any other.
         let negated = BoundExpr::UnaryOp(UnaryOp::Not, Box::new(like_of(str_col(1), "a", Some(b'\\'), false)));
         assert_eq!(
             lower_ops(&negated, &schema),
-            [EXPR_LOAD_COL_STR, EXPR_STR_LIKE, gnitz_wire::EXPR_BOOL_NOT]
+            [
+                ExprOp::LoadColStr.as_wire(),
+                ExprOp::StrLike.as_wire(),
+                ExprOp::BoolNot.as_wire()
+            ]
         );
     }
 

@@ -6,8 +6,10 @@
 /// resolved-addressing types ([`crate::ColumnLocator`]) bind to it, the engine's
 /// `ColumnarSource` extends it with the Z-set weight, and [`BatchView`] extends
 /// it with the region accessors the vectorized kernels need. A source that can
-/// only address cells — a shard mapping whose column is a scalar constant, a
-/// cursor's current row — implements this and nothing more.
+/// address cells but has no contiguous `rows * col_size` region to hand out — a
+/// shard mapping whose column is a scalar constant — implements this and
+/// nothing more. Every source is a whole multi-row batch, which is why
+/// [`Self::row_count`] sits here and not one level up.
 ///
 /// Static dispatch only — never take `&dyn RowSource`; it would put a vtable on
 /// the per-row locator paths. (Convention: the trait is dyn-compatible, nothing
@@ -16,13 +18,12 @@
 /// All lifetimes are tied to `&self`, NOT decoupled — a client adapter owns the
 /// buffers it materializes and can only lend them for `&self`.
 pub trait RowSource {
-    /// The row's packed PK-region bytes (`pk_stride` wide).
-    ///
-    /// **The implementor decides the encoding.** Every engine-side source is
-    /// order-preserving at-rest (OPK), which is what the OPK-inverting readers —
-    /// [`crate::ColumnLocator::native_le_bytes`], `decode_i64`, `native_key` —
-    /// assume. A client-side `ZSetBatch` is native-LE instead, so those readers
-    /// would byte-swap its values; such a source must say so on its own `impl`.
+    /// The row's packed PK-region bytes (`pk_stride` wide), **order-preserving
+    /// at-rest (OPK)** at every source — including client-side, where a
+    /// `ZSetBatch` keeps its keys native-LE but encodes them into the view it
+    /// presents. That is what the OPK-inverting readers on
+    /// [`crate::ColumnLocator`] assume; [`assert_batchview_consistent`] is where
+    /// an implementor proves it.
     fn get_pk_bytes(&self, row: usize) -> &[u8];
     /// The row's null-bitmap word (bit N = payload slot N is NULL).
     fn get_null_word(&self, row: usize) -> u64;
@@ -30,6 +31,12 @@ pub trait RowSource {
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8];
     /// The variable-length string/blob heap the German-string cells point into.
     fn blob(&self) -> &[u8];
+    /// Rows in this source. The bound every whole-source walk reads — the
+    /// evaluator's [`crate::Evaluator::filter`], the engine's N-way merge — so
+    /// that a caller can never drive a view past its own end with a count it
+    /// carried alongside. `#[inline(always)]` on every implementor: the per-row
+    /// and per-morsel callers live in gnitz-engine, at opt-level 0.
+    fn row_count(&self) -> usize;
 }
 
 /// A [`RowSource`] that can additionally hand out whole regions — the shape the
@@ -60,17 +67,28 @@ pub trait BatchView: RowSource {
     fn pk_region(&self) -> (&[u8], usize);
 }
 
-/// Assert the region/per-row contract on [`BatchView`] for `rows` rows and the
-/// given `(payload_col, col_size)` pairs. Every implementor must pass.
+/// One PK-column expectation for [`assert_batchview_consistent`]: type code,
+/// OPK byte offset, and the column's **native** value per row, sign-extended
+/// into a `u128` so one element type states it at any width or signedness.
+pub type PkColExpect<'a> = (u8, usize, &'a [u128]);
+
+/// Assert the region/per-row contract on [`BatchView`] for `rows` rows, the
+/// given `(payload_col, col_size)` pairs and the given PK columns. Every
+/// implementor must pass.
 ///
 /// A normal `pub fn`, not a `#[cfg(test)]` helper, so every crate that adds an
 /// implementor can call it from its own test tree. For a flat-region batch the
-/// property is near-tautological (both accessors derive the same region offset);
-/// for an adapter that materializes columns out of a foreign representation —
-/// mapping payload slots to logical columns, or dispatching on a column-data
-/// enum — it is the only thing standing between a mis-mapped slot and silently
-/// wrong query results.
-pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(usize, usize)]) {
+/// region/per-row property is near-tautological; for an adapter that
+/// materializes columns out of a foreign representation it is the only thing
+/// standing between a mis-mapped slot and silently wrong query results.
+///
+/// `pk` is what makes the PK region's *encoding* checkable rather than merely
+/// self-consistent — the two halves agree under a native-LE implementor just as
+/// readily as under an OPK one. Its offsets are pinned absolutely, and `rows` is
+/// the caller's own expectation, because a harness that read either off the view
+/// would leave exactly what it exists to catch unchecked.
+pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(usize, usize)], pk: &[PkColExpect<'_>]) {
+    assert_eq!(v.row_count(), rows, "row_count()");
     let bmp = v.null_bmp();
     assert_eq!(bmp.len(), rows * 8, "null_bmp() must be rows * 8 bytes");
     for row in 0..rows {
@@ -80,14 +98,34 @@ pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(us
             "get_null_word({row}) disagrees with null_bmp()",
         );
     }
-    let (pk, stride) = v.pk_region();
-    assert_eq!(pk.len(), rows * stride, "pk_region() must be rows * stride bytes");
+    let (pk_region, stride) = v.pk_region();
+    assert_eq!(
+        pk_region.len(),
+        rows * stride,
+        "pk_region() must be rows * stride bytes"
+    );
     for row in 0..rows {
         assert_eq!(
             v.get_pk_bytes(row),
-            &pk[row * stride..row * stride + stride],
+            &pk_region[row * stride..row * stride + stride],
             "get_pk_bytes({row}) disagrees with pk_region()",
         );
+    }
+    for &(type_code, byte_off, vals) in pk {
+        let size = gnitz_wire::wire_stride(type_code);
+        assert_eq!(
+            vals.len(),
+            rows,
+            "PK column at offset {byte_off}: one expected value per row"
+        );
+        for (row, &want) in vals.iter().enumerate() {
+            let native = gnitz_wire::decode_pk_column_owned(&v.get_pk_bytes(row)[byte_off..byte_off + size], type_code);
+            assert_eq!(
+                &native[..size],
+                &want.to_le_bytes()[..size],
+                "PK column at offset {byte_off}, row {row}: the region is not OPK",
+            );
+        }
     }
     for &(pi, sz) in cols {
         let region = v.col_data(pi, sz);

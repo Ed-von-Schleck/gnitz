@@ -618,8 +618,7 @@ pub(crate) fn scan_spec_worker(
 /// predicate `ScalarFunc` — the same path the circuit compiler runs. Any failure
 /// is a corrupt frame (the client pre-compiled the identical program at plan time).
 fn compile_predicate(blob: &[u8], schema: &SchemaDescriptor) -> Result<ScalarFunc, String> {
-    let dep = gnitz_wire::decode_expr_blob(blob).ok_or("scan_spec: corrupt predicate blob")?;
-    LogicalProgram::from_wire(&dep.code, dep.num_regs, dep.result_reg, dep.const_strings)
+    LogicalProgram::from_blob(blob, "scan_spec predicate")
         .and_then(|p| ScalarFunc::from_predicate(p, schema))
         .map_err(|e| format!("scan_spec: invalid predicate program: {e}"))
 }
@@ -634,8 +633,7 @@ fn compile_projection(
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
 ) -> Result<ScalarFunc, String> {
-    let dep = gnitz_wire::decode_expr_blob(blob).ok_or("scan_spec: corrupt projection blob")?;
-    LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, dep.const_strings)
+    LogicalProgram::from_map_blob(blob, "scan_spec projection")
         .and_then(|p| ScalarFunc::from_map(p, in_schema, out_schema))
         .map_err(|e| format!("scan_spec: invalid projection program: {e}"))
 }

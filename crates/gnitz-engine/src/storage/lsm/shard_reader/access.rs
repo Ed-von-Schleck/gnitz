@@ -452,16 +452,16 @@ impl gnitz_expr::RowSource for MappedShard {
     fn blob(&self) -> &[u8] {
         self.blob_slice()
     }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.count
+    }
 }
 
 impl super::super::columnar::ColumnarSource for MappedShard {
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         MappedShard::get_weight(self, row)
-    }
-    #[inline(always)]
-    fn row_count(&self) -> usize {
-        self.count
     }
     #[inline(always)]
     fn is_skeleton(&self) -> bool {

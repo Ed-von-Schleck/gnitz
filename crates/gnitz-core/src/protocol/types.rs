@@ -378,11 +378,16 @@ impl gnitz_expr::SchemaFacts for Schema {
     }
 }
 
-/// A batch's PK region in memory: `stride` bytes per row, **native
-/// little-endian**, columns packed in PK-list order. Not the engine's OPK — a
-/// client `ZSetBatch` holds PK values as the wire delivered them, so a signed
-/// column reads as two's complement; `build_pk_region_into` is the one place
-/// that converts to OPK.
+/// A batch's PK buffer in memory: `stride` bytes per row, **native
+/// little-endian**, columns packed in PK-list order. A client `ZSetBatch` holds
+/// PK values as the wire delivered them, so a signed column reads as two's
+/// complement.
+///
+/// **Not the PK region.** That name belongs to the §4 form —
+/// `gnitz_wire::wal::encode` frames it, a `ZSetBatchView` presents it, and it is
+/// OPK everywhere, client-side included. `build_pk_region_into` is where this
+/// buffer becomes one. Call this the `PkColumn` buffer; a comment that calls it
+/// a PK region is one step from asserting the region is native-LE.
 ///
 /// One representation at every arity: a lone U32 key is 4 bytes per row, a lone
 /// UUID 16, a compound `(u64, u32)` 12. The stride comes from the schema

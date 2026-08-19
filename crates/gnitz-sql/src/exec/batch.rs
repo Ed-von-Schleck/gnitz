@@ -66,7 +66,7 @@ pub(crate) fn filter_batch(
 ) {
     let mut bufs = gnitz_core::ViewBuffers::default();
     let view = bufs.view(batch, schema);
-    ev.filter(&view, batch.len(), emit_range);
+    ev.filter(&view, emit_range);
 }
 
 /// A resolved projection: the output schema and, per output column, its source

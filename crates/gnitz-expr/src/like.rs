@@ -10,7 +10,7 @@
 //! specializations below on a value nothing enforces to be valid UTF-8. On valid
 //! UTF-8 the two granularities are indistinguishable.
 
-use crate::batch::char_offset;
+use crate::chars::char_offset;
 
 /// A LIKE pattern compiled once per program at resolve. Total on any bytes, so a
 /// forged pattern yields a matcher rather than an error.

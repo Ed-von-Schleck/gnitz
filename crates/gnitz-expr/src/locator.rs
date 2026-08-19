@@ -19,13 +19,8 @@ use crate::RowSource;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColumnLocator {
     /// PK column: the value lives in the PK region at `byte_off`, width `size`,
-    /// type `type_code`. PK columns are non-nullable.
-    ///
-    /// Its *encoding* is whatever the [`RowSource`] it is read against supplies
-    /// — see that trait's `get_pk_bytes`. Every engine-side source is
-    /// OPK-at-rest, which is what the OPK-inverting readers here assume; a
-    /// client-side `ZSetBatch` is native-LE, so those readers must not be
-    /// pointed at one. The coordinates below hold either way.
+    /// type `type_code`. PK columns are non-nullable, and the region is OPK at
+    /// every [`RowSource`], which is what the OPK-inverting readers below undo.
     Pk { byte_off: u8, size: u8, type_code: u8 },
     /// Payload column: value is native-LE in dense payload slot `slot` (also its
     /// null-bitmap bit position), width `size`, type `type_code`.
@@ -100,10 +95,6 @@ impl ColumnLocator {
     /// [`Self::bytes`] — every consumer that interprets a column's *value*
     /// (aggregation, order-encoding, exemplar copies) must read through here so
     /// a PK-source column can never be consumed in its at-rest byte order.
-    ///
-    /// The `Pk` arm inverts OPK unconditionally, so `mb` must be an OPK source
-    /// (`RowSource::get_pk_bytes`). Against a native-LE client batch it would
-    /// byte-swap an already-native value.
     #[inline(always)]
     pub fn native_le_bytes<'a, 'b: 'a>(
         &self,

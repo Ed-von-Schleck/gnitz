@@ -211,7 +211,8 @@ pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
 /// [`encode_pk_column`], fused with the widening [`FixedInt`] defines.
 ///
 /// Spelled with byte-array literals rather than composed from `decode_pk_column`
-/// and [`widen_pk_be`]: this runs per row in the evaluator's `LoadPk` opcode, and
+/// and [`widen_pk_be`]: its production caller is `ColumnLocator::decode_i64`,
+/// which the engine's reduce path runs per row, and
 /// at `-O0` (the profile the E2E suite runs) that composition costs an
 /// out-of-line call plus a 16-byte stack materialization the fused form does not
 /// need. `decode_opk_i64_matches_the_two_branches_it_replaces` pins it against

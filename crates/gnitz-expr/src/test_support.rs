@@ -91,6 +91,10 @@ impl RowSource for TestView {
     fn blob(&self) -> &[u8] {
         &self.blob
     }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.rows
+    }
 }
 
 impl BatchView for TestView {
@@ -358,17 +362,17 @@ pub fn map_prog(
 
 /// Run `ev` as a filter and report a per-row verdict — the shape almost every
 /// filter test wants, since `filter` reports runs rather than rows.
-pub fn passing_rows(ev: &Evaluator, mb: &TestView, n: usize) -> Vec<bool> {
-    let mut passed = vec![false; n];
-    ev.filter(mb, n, |s, e| passed[s..e].fill(true));
+pub fn passing_rows(ev: &Evaluator, mb: &TestView) -> Vec<bool> {
+    let mut passed = vec![false; mb.row_count()];
+    ev.filter(mb, |s, e| passed[s..e].fill(true));
     passed
 }
 
 /// The runs `ev` reports, verbatim. For tests whose subject is the range
 /// stitching itself rather than which rows pass.
-pub fn passing_ranges(ev: &Evaluator, mb: &TestView, n: usize) -> Vec<(usize, usize)> {
+pub fn passing_ranges(ev: &Evaluator, mb: &TestView) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
-    ev.filter(mb, n, |s, e| ranges.push((s, e)));
+    ev.filter(mb, |s, e| ranges.push((s, e)));
     ranges
 }
 
@@ -389,16 +393,9 @@ pub fn both_arms(label: &str, build: impl Fn() -> Evaluator) -> (Evaluator, Eval
     (fast, nullable)
 }
 
-/// Reinterpret an `f64`'s bits as the `i64` a float register holds, and back —
-/// spelled exactly as the kernel's own `encode_f64` / `decode_f64`, so a test
-/// cannot disagree with it about the float-register encoding.
-pub fn float_to_bits(f: f64) -> i64 {
-    f64::to_bits(f) as i64
-}
-
-pub fn bits_to_float(bits: i64) -> f64 {
-    f64::from_bits(bits as u64)
-}
+/// The float-register codec, re-exported under its own name so a test reads a
+/// float register through the kernel's own spelling and cannot disagree with it.
+pub(crate) use crate::batch::{decode_f64, encode_f64};
 
 /// A three-row view with a compound `(U32, I64)` PK and payload slots
 /// `0: I32`, `1: U128`, `2: U64`.

@@ -2063,16 +2063,16 @@ impl RowSource for Batch {
     fn blob(&self) -> &[u8] {
         &self.blob
     }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.count
+    }
 }
 
 impl ColumnarSource for Batch {
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         Batch::get_weight(self, row)
-    }
-    #[inline(always)]
-    fn row_count(&self) -> usize {
-        self.count
     }
 }
 

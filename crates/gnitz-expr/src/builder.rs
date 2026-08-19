@@ -2,18 +2,17 @@
 //! expression program, and [`ExprProgram`], the wire blob it produces.
 //!
 //! The builder accumulates typed [`LogicalInstr`]s and serialises them once, in
-//! [`ExprBuilder::build`], through [`LogicalInstr::to_wire`]. It therefore holds
+//! [`ExprBuilder::build`], through `LogicalInstr::to_wire`. It therefore holds
 //! **no** knowledge of the wire word layout: which operand word carries a packed
 //! pair, which opcode a flag selects, and where a cast target rides are stated
-//! once in `to_wire` and read back once in
-//! [`LogicalProgram::from_wire`](crate::LogicalProgram::from_wire). The
-//! round-trip test at the bottom of this file is what holds those two together.
+//! once in `to_wire` and read back once in `LogicalProgram::decode_quad` — both
+//! in `program.rs`, where the drift tests that hold them together also live.
 //!
 //! Everything reachable from here is infallible: a program's *validity* is
 //! decided when it is assembled into a [`LogicalProgram`], so a caller can build
 //! first and be told what is unsupported afterwards.
 
-use crate::{CmpOp, ExprValidateErr, LogicalInstr as L, LogicalProgram, StrOp};
+use crate::{CmpOp, ExprValidateErr, LogicalInstr, LogicalInstr as L, LogicalProgram, StrOp};
 use gnitz_wire::{TrimMode, TypeCode};
 
 /// A compiled expression program: a flat list of 4-word instructions
@@ -45,8 +44,6 @@ pub struct ExprBuilder {
     next_reg: u32,
     const_strings: Vec<Vec<u8>>,
 }
-
-type LogicalInstr = L;
 
 impl ExprBuilder {
     pub fn new() -> Self {
@@ -290,11 +287,7 @@ impl ExprBuilder {
     /// turn a skewed pool into a wrong answer. Callers still sort (and dedup) to
     /// keep the pool small.
     pub fn add_const_int_set(&mut self, values: &[i64]) -> u32 {
-        let mut bytes = Vec::with_capacity(values.len() * 8);
-        for v in values {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        self.add_const_bytes(bytes)
+        self.add_const_bytes(gnitz_wire::as_le_bytes(values).to_vec())
     }
 
     // --- Integer set membership ---
@@ -455,7 +448,7 @@ impl ExprBuilder {
         ExprProgram {
             num_regs: self.next_reg,
             result_reg,
-            code: self.instrs.iter().flat_map(LogicalInstr::to_wire).collect(),
+            code: self.instrs.iter().copied().flat_map(LogicalInstr::to_wire).collect(),
             const_strings: self.const_strings,
         }
     }
@@ -474,245 +467,7 @@ impl ExprBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FloatUnaryOp, IntUnaryOp, LogicalProgram};
-    use std::collections::BTreeSet;
-
-    /// One instance of every [`LogicalInstr`] variant, with a distinct value in
-    /// every field so a swapped pair cannot round-trip by coincidence.
-    ///
-    /// The registers are deliberately small and the programs below are never
-    /// resolved: what is under test is the word layout alone, so the list need
-    /// not be a type-coherent or even a validatable program.
-    fn every_variant() -> Vec<LogicalInstr> {
-        use LogicalInstr as L;
-        let mut v = vec![
-            L::LoadColInt { dst: 1, col: 2 },
-            L::LoadColFloat { dst: 3, col: 4 },
-            L::LoadConst {
-                dst: 5,
-                val: -1_234_567_890_123,
-            },
-            L::IntAdd { dst: 6, a: 7, b: 8 },
-            L::IntSub { dst: 9, a: 10, b: 11 },
-            L::IntMul { dst: 12, a: 13, b: 14 },
-            L::IntDiv { dst: 15, a: 16, b: 17 },
-            L::IntMod { dst: 18, a: 19, b: 20 },
-            L::FloatAdd { dst: 21, a: 22, b: 23 },
-            L::FloatSub { dst: 24, a: 25, b: 26 },
-            L::FloatMul { dst: 27, a: 28, b: 29 },
-            L::FloatDiv { dst: 30, a: 31, b: 32 },
-            L::IntToFloat { dst: 33, a: 34 },
-            L::FloatToF32 { dst: 35, a: 36 },
-            L::FloatToInt {
-                dst: 37,
-                a: 38,
-                tc: TypeCode::I16 as u32,
-            },
-            L::IntCast {
-                dst: 39,
-                a: 40,
-                tc: TypeCode::I32 as u32,
-            },
-            L::Select {
-                dst: 41,
-                cond: 42,
-                a: 43,
-                b: 44,
-            },
-            L::LoadNull { dst: 45 },
-            L::BoolAnd { dst: 46, a: 47, b: 48 },
-            L::BoolOr { dst: 49, a: 50, b: 51 },
-            L::BoolNot { dst: 52, a: 53 },
-            L::IsNull {
-                dst: 54,
-                col: 55,
-                invert: false,
-            },
-            L::IsNull {
-                dst: 56,
-                col: 57,
-                invert: true,
-            },
-            L::IntInSet {
-                dst: 58,
-                value_reg: 59,
-                set_idx: 60,
-            },
-            L::LoadColStr { dst: 61, col: 62 },
-            L::LoadConstStr { dst: 63, const_idx: 64 },
-            L::LoadNullStr { dst: 65 },
-            L::StrSelect {
-                dst: 66,
-                cond: 67,
-                a: 68,
-                b: 69,
-            },
-            // The two packed-pair families sit in *different* operand words —
-            // SELECT/SUBSTR in a2, TRIM/LIKE in a1 — which is the single
-            // per-opcode fact the encoder and decoder can silently disagree on.
-            L::StrSubstr {
-                dst: 70,
-                src: 71,
-                start_reg: 72,
-                len_reg: Some(73),
-            },
-            L::StrSubstr {
-                dst: 74,
-                src: 75,
-                start_reg: 76,
-                len_reg: None,
-            },
-            L::StrTrim {
-                dst: 77,
-                a: 78,
-                mode: TrimMode::Leading.as_wire(),
-                set_idx: 79,
-            },
-            L::StrLike {
-                dst: 80,
-                src: 81,
-                escape: b'!' as u32,
-                pat_idx: 82,
-                ci: false,
-            },
-            L::StrLike {
-                dst: 83,
-                src: 84,
-                escape: 0,
-                pat_idx: 85,
-                ci: true,
-            },
-            L::IntToStr { dst: 86, a: 87 },
-            L::FloatToStr { dst: 88, a: 89 },
-            L::StrToInt {
-                dst: 90,
-                a: 91,
-                tc: TypeCode::I64 as u32,
-            },
-            L::StrToFloat { dst: 92, a: 93 },
-            L::CopyCol { src_col: 94, out: 95 },
-            L::Emit { src: 96, out: 97 },
-        ];
-        // The operator- and flag-parameterized families, every value of each.
-        for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Gt, CmpOp::Ge, CmpOp::Lt, CmpOp::Le] {
-            v.push(L::Cmp {
-                op,
-                dst: 100,
-                a: 101,
-                b: 102,
-            });
-            v.push(L::FCmp {
-                op,
-                dst: 103,
-                a: 104,
-                b: 105,
-            });
-        }
-        for op in [StrOp::Eq, StrOp::Lt, StrOp::Le] {
-            v.push(L::StrColConst {
-                op,
-                dst: 106,
-                col: 107,
-                const_idx: 108,
-            });
-            v.push(L::StrColCol {
-                op,
-                dst: 109,
-                col_a: 110,
-                col_b: 111,
-            });
-            v.push(L::StrCmp {
-                op,
-                dst: 112,
-                a: 113,
-                b: 114,
-            });
-        }
-        for op in [IntUnaryOp::Neg, IntUnaryOp::Abs] {
-            v.push(L::IntUnary { op, dst: 115, a: 116 });
-        }
-        for op in [
-            FloatUnaryOp::Neg,
-            FloatUnaryOp::Abs,
-            FloatUnaryOp::Floor,
-            FloatUnaryOp::Ceil,
-            FloatUnaryOp::Round,
-            FloatUnaryOp::Trunc,
-        ] {
-            v.push(L::FloatUnary { op, dst: 117, a: 118 });
-        }
-        for is_max in [true, false] {
-            v.push(L::IntMinMax2 {
-                dst: 119,
-                a: 120,
-                b: 121,
-                is_max,
-            });
-            v.push(L::FloatMinMax2 {
-                dst: 122,
-                a: 123,
-                b: 124,
-                is_max,
-            });
-        }
-        for chars in [false, true] {
-            v.push(L::StrLen {
-                dst: 125,
-                a: 126,
-                chars,
-            });
-        }
-        for upper in [true, false] {
-            v.push(L::StrCase {
-                dst: 127,
-                a: 128,
-                upper,
-            });
-        }
-        for skip_null in [false, true] {
-            v.push(L::StrConcat {
-                dst: 129,
-                a: 130,
-                b: 131,
-                skip_null,
-            });
-        }
-        v
-    }
-
-    /// `from_wire ∘ to_wire == id`. The encoder and the decoder are the only two
-    /// statements of the wire word layout, and this is what binds them: a swapped
-    /// operand pair, a flag encoded into the wrong opcode, or a cast target on
-    /// the wrong word all fail here.
-    #[test]
-    fn every_instruction_round_trips_through_the_wire_form() {
-        let want = every_variant();
-        let code: Vec<u32> = want.iter().flat_map(LogicalInstr::to_wire).collect();
-        // `from_wire` runs the structure-only validation, which this deliberately
-        // ill-formed fixture cannot pass — so decode the quads directly.
-        let got: Vec<LogicalInstr> = code
-            .chunks_exact(4)
-            .map(|q| LogicalProgram::decode_quad(q).expect("to_wire emits a decodable opcode"))
-            .collect();
-        assert_eq!(got, want);
-    }
-
-    /// Every opcode the decoder accepts must be reachable from the encoder. An
-    /// opcode only one side knows is drift the type system cannot see: the engine
-    /// would accept a program no client can produce, or reject one it can.
-    #[test]
-    fn the_encoder_reaches_every_opcode_the_decoder_accepts() {
-        let emitted: BTreeSet<u32> = every_variant().iter().map(|i| i.to_wire()[0]).collect();
-        // An opcode is "accepted" iff `decode_quad` maps it; every arm reads its
-        // operands without inspecting them, so an all-zero instruction probes the
-        // opcode table alone. Swept over the whole `u16` rather than a range that
-        // merely covers today's opcodes: a decoder arm added above the sweep would
-        // be invisible here, which is the one drift this test exists to catch.
-        let accepted: BTreeSet<u32> = (0..=u32::from(u16::MAX))
-            .filter(|&op| LogicalProgram::decode_quad(&[op, 0, 0, 0]).is_ok())
-            .collect();
-        assert_eq!(emitted, accepted, "encoded opcodes vs. opcodes the decoder accepts");
-    }
+    use crate::{CmpOp, LogicalProgram};
 
     /// The builder's own output must decode back to the instructions it recorded,
     /// which is what makes [`ExprBuilder::build`] and

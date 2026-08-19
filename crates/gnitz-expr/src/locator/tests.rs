@@ -42,6 +42,11 @@ fn pk_locator_reads_decode_the_opk_sign_flip() {
     assert!(signed.route_key(&v, 2) < signed.route_key(&v, 0));
     assert!(signed.route_key(&v, 0) < signed.route_key(&v, 1));
     assert_eq!(unsigned.route_key(&v, 0), 7u128);
+    // `decode_i64` fuses the OPK inverse with the widening, so it must land on
+    // the same value the two-step read does at both signednesses and widths.
+    assert_eq!(signed.decode_i64(&v, 0, gnitz_wire::FixedInt::I64), -1);
+    assert_eq!(signed.decode_i64(&v, 2, gnitz_wire::FixedInt::I64), i64::MIN);
+    assert_eq!(unsigned.decode_i64(&v, 2, gnitz_wire::FixedInt::U32), u32::MAX as i64);
 }
 
 #[test]

@@ -182,6 +182,11 @@ pub(crate) fn relocate_german_string_vec(
 
 /// The out-of-line half of `relocate_german_string_vec` — kept separate so the
 /// short path stays a branchless inline sequence with no call and no frame.
+///
+/// Deliberately reads the cell layout directly rather than through
+/// `gnitz_wire::german_string_inline` / `german_string_heap`: that split is what
+/// keeps the short arm branchless, and this runs per row on every compaction, so
+/// re-routing it needs a retired-instruction measurement.
 fn relocate_long_german_string(
     src: &[u8; 16],
     src_blob: &[u8],
@@ -340,16 +345,16 @@ impl<'a> RowSource for SortedMemBatch<'a> {
     fn blob(&self) -> &[u8] {
         self.0.blob
     }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.0.count
+    }
 }
 
 impl<'a> ColumnarSource for SortedMemBatch<'a> {
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         self.0.get_weight(row)
-    }
-    #[inline(always)]
-    fn row_count(&self) -> usize {
-        self.0.count
     }
 }
 
@@ -459,6 +464,10 @@ impl<'a> RowSource for MemBatch<'a> {
     fn blob(&self) -> &[u8] {
         self.blob
     }
+    #[inline(always)]
+    fn row_count(&self) -> usize {
+        self.count
+    }
 }
 
 /// The region half. The per-row accessors above are **not** derived from these
@@ -483,10 +492,6 @@ impl<'a> ColumnarSource for MemBatch<'a> {
     #[inline(always)]
     fn get_weight(&self, row: usize) -> i64 {
         MemBatch::get_weight(self, row)
-    }
-    #[inline(always)]
-    fn row_count(&self) -> usize {
-        self.count
     }
 }
 
@@ -1208,7 +1213,13 @@ mod tests {
             bb.end_row();
         }
         let b = bb.finish();
-        gnitz_expr::assert_batchview_consistent(&b.as_mem_batch(), ROWS, &[(0, 4), (1, 16), (2, 8)]);
+        let pk_vals: Vec<u128> = (0..ROWS as u128).collect();
+        gnitz_expr::assert_batchview_consistent(
+            &b.as_mem_batch(),
+            ROWS,
+            &[(0, 4), (1, 16), (2, 8)],
+            &[(type_code::U64, 0, &pk_vals)],
+        );
     }
 
     /// Build a large sorted `(PK | I64)` batch with a high duplicate-PK rate:

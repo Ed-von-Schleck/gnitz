@@ -603,9 +603,10 @@ pub unsafe extern "C" fn gnitz_batch_get_i64(batch: *const GnitzBatch, col_idx: 
         return 0;
     };
     match SchemaFacts::locate(&b.schema, col_idx) {
-        // A client-side PK region holds native-LE values, not the at-rest OPK
-        // form the server stores — so this is the same little-endian decode the
-        // payload arm does, over a window of the packed key.
+        // This reads the in-memory `PkColumn` buffer, which holds native-LE
+        // values rather than the OPK region a `ZSetBatchView` presents — so it
+        // is the same little-endian decode the payload arm does, over a window
+        // of the packed key.
         ColumnLocator::Pk { byte_off, size, .. } => {
             fi.decode_le_i64(b.batch.pks.col_window(row, byte_off as usize, size as usize))
         }

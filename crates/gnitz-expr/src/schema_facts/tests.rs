@@ -11,39 +11,19 @@ use gnitz_wire::type_code as tc;
 const TINY: [(u8, bool); 4] = [(tc::U32, false), (tc::F64, true), (tc::I64, false), (tc::STRING, false)];
 const TINY_PK: [usize; 2] = [2, 0];
 
-/// [`TestSchema`] with `payload_col_idx` — the one direction an implementor
-/// writes by hand, independently of `locate` — shifted by one. Everything else
-/// forwards, so the harness sees exactly that fault and nothing else.
-struct OffByOnePayloadColIdx(TestSchema);
-
-impl SchemaFacts for OffByOnePayloadColIdx {
-    fn locate(&self, ci: usize) -> ColumnLocator {
-        self.0.locate(ci)
-    }
-    fn payload_col_idx(&self, pi: usize) -> usize {
-        self.0.payload_col_idx(pi) + 1
-    }
-    fn num_payload_cols(&self) -> usize {
-        self.0.num_payload_cols()
-    }
-    fn num_columns(&self) -> usize {
-        self.0.num_columns()
-    }
-    fn col_type_code(&self, ci: usize) -> u8 {
-        self.0.col_type_code(ci)
-    }
-    fn col_nullable(&self, ci: usize) -> bool {
-        self.0.col_nullable(ci)
-    }
+/// Which faithful answer [`Faulty`] corrupts. The two are the methods an
+/// implementor may write by hand rather than derive: `payload_col_idx` off a
+/// precomputed table, and the nullability masks off a precomputed field.
+enum Fault {
+    PayloadColIdxOffByOne,
+    NullableMaskDrifted,
 }
 
-/// [`TestSchema`] whose `nullable_payload_slots` override has drifted one slot
-/// off its column table. The masks are provided methods, so this is what an
-/// implementor that answers them from a precomputed field can get wrong while
-/// every per-column forwarder still reports the truth.
-struct DriftedNullableMask(TestSchema);
+/// A faithful [`TestSchema`] with exactly one answer perturbed — the fault as
+/// data, so one set of forwarders serves every case.
+struct Faulty(TestSchema, Fault);
 
-impl SchemaFacts for DriftedNullableMask {
+impl SchemaFacts for Faulty {
     fn locate(&self, ci: usize) -> ColumnLocator {
         self.0.locate(ci)
     }
@@ -59,8 +39,11 @@ impl SchemaFacts for DriftedNullableMask {
     fn col_nullable(&self, ci: usize) -> bool {
         self.0.col_nullable(ci)
     }
+    fn payload_col_idx(&self, pi: usize) -> usize {
+        self.0.payload_col_idx(pi) + usize::from(matches!(self.1, Fault::PayloadColIdxOffByOne))
+    }
     fn nullable_payload_slots(&self) -> u64 {
-        self.0.nullable_payload_slots() << 1
+        self.0.nullable_payload_slots() << u32::from(matches!(self.1, Fault::NullableMaskDrifted))
     }
 }
 
@@ -78,11 +61,7 @@ fn schema_facts_harness_accepts_a_faithful_impl() {
 #[test]
 #[should_panic(expected = "payload_col_idx")]
 fn schema_facts_harness_rejects_an_off_by_one_payload_col_idx() {
-    assert_schema_facts_consistent(
-        &OffByOnePayloadColIdx(TestSchema::new(&TINY, &TINY_PK)),
-        &TINY,
-        &TINY_PK,
-    );
+    assert_faulty(Fault::PayloadColIdxOffByOne);
 }
 
 /// The nullability masks decide which null bits a batch may carry, and an
@@ -91,5 +70,9 @@ fn schema_facts_harness_rejects_an_off_by_one_payload_col_idx() {
 #[test]
 #[should_panic(expected = "nullable_payload_slots")]
 fn schema_facts_harness_rejects_a_drifted_nullable_mask() {
-    assert_schema_facts_consistent(&DriftedNullableMask(TestSchema::new(&TINY, &TINY_PK)), &TINY, &TINY_PK);
+    assert_faulty(Fault::NullableMaskDrifted);
+}
+
+fn assert_faulty(fault: Fault) {
+    assert_schema_facts_consistent(&Faulty(TestSchema::new(&TINY, &TINY_PK), fault), &TINY, &TINY_PK);
 }

@@ -12,14 +12,14 @@ use gnitz_wire::type_code;
 use crate::batch::MORSEL;
 use crate::test_support::{
     both_arms, filter_prog, is_not_null_op, is_null_op, make_int_row, make_int_view, make_n_col_view, map_prog,
-    passing_ranges, passing_rows, push_payload_cols, scalar_prog, schema_pk_ints, set_row_pk, TestSchema, TestView,
+    passing_ranges, passing_rows, push_payload_cols, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk,
+    TestSchema, TestView,
 };
 use crate::{CmpOp, Evaluator, LogicalInstr, StrOp};
 
 /// True iff `ev`'s predicate passes for `row`.
 fn passes(ev: &Evaluator, mb: &TestView, row: usize) -> bool {
-    let (val, is_null) = ev.eval_row(mb, row);
-    !is_null && val != 0
+    ev.eval_row(mb, row).is_some_and(|val| val != 0)
 }
 
 /// The batch filter and the m=1 row read are two drives of one program and must
@@ -44,7 +44,7 @@ fn filter_agrees_with_eval_row() {
     let mb = make_int_view(&schema, rows);
 
     let mut passing = vec![false; rows.len()];
-    ev.filter(&mb, rows.len(), |start, end| passing[start..end].fill(true));
+    ev.filter(&mb, |start, end| passing[start..end].fill(true));
 
     for (i, &(_, _, vals)) in rows.iter().enumerate() {
         assert_eq!(passing[i], passes(&ev, &mb, i), "row {i}: val={}", vals[0]);
@@ -52,23 +52,22 @@ fn filter_agrees_with_eval_row() {
     assert_eq!(passing, vec![false, false, true, false]);
 }
 
-/// Regression: `is_strictly_non_nullable` formerly ignored STR_COL_*_CONST,
+/// Regression: `analyze` formerly ignored STR_COL_*_CONST,
 /// so a `WHERE str_col = 'foo'` against a nullable string column would set
 /// `no_nulls=true` on the batch path and let null rows leak through as
 /// definite-true / definite-false results. Verify the batch path is
 /// row-for-row correct on mixed null/non-null inputs.
 #[test]
 fn test_str_col_eq_const_nullable_column_matches_per_row() {
-    // Schema: pk(U64) + nullable STRING.
-    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::STRING, true)], &[0]);
+    let schema = schema_pk_strings(1, true);
 
     // 20 rows: alternating null/non-null, with the non-null rows alternating
     // between "foo" (matches the predicate) and "bar" (does not).
     let n = 20usize;
-    let mut mb = TestView::new(n, 8);
-    mb.push_col(16);
+    let mut mb = TestView::new(n, schema.pk_stride());
+    push_payload_cols(&mut mb, &schema);
     for row in 0..n {
-        mb.set_pk_col(row, 0, &(row as u64 + 1).to_le_bytes(), type_code::U64);
+        set_row_pk(&mut mb, &schema, row, row as u64 + 1);
         mb.set_null_word(row, u64::from(row % 2 == 0)); // bit 0 = col1
         mb.set_string(row, 0, if row % 4 == 1 { b"foo" } else { b"bar" });
     }
@@ -85,7 +84,7 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
     // Drive the (multi-morsel) batch path through the filter and compare to
     // the m=1 read.
     let mut passing = vec![false; n];
-    kind.filter(&mb, n, |start, end| {
+    kind.filter(&mb, |start, end| {
         passing[start..end].fill(true);
     });
     for (row, &batch_pass) in passing.iter().enumerate() {
@@ -140,27 +139,27 @@ fn filter_range_case(schema: TestSchema) {
     ];
     let ev = filter_prog(&schema, instrs, 3, 2, vec![]);
 
-    assert_eq!(passing_ranges(&ev, &mb, n), vec![(1, 3), (4, MORSEL - 1), (MORSEL, n)]);
+    assert_eq!(passing_ranges(&ev, &mb), vec![(1, 3), (4, MORSEL - 1), (MORSEL, n)]);
 
     // An all-pass batch is one range covering everything, not one per morsel.
     let all = make_n_col_view(&schema, n, |_, _| 1, |_, _| false);
-    assert_eq!(passing_ranges(&ev, &all, n), vec![(0, n)]);
+    assert_eq!(passing_ranges(&ev, &all), vec![(0, n)]);
 
     // An all-fail batch calls back zero times.
     let none = make_n_col_view(&schema, n, |_, _| 0, |_, _| false);
     let mut count = 0;
-    ev.filter(&none, n, |_, _| count += 1);
+    ev.filter(&none, |_, _| count += 1);
     assert_eq!(count, 0);
 
     // A run ending exactly on a 64-bit word boundary, with the next word all
     // zero: the run has to be closed at the boundary by the empty word itself,
     // since a bitmap walk driven off the set bits never visits it.
     let boundary = make_n_col_view(&schema, n, |row, _| i64::from(row < 64), |_, _| false);
-    assert_eq!(passing_ranges(&ev, &boundary, n), vec![(0, 64)]);
+    assert_eq!(passing_ranges(&ev, &boundary), vec![(0, 64)]);
 
     // The same, two words on: the gap word is interior rather than trailing.
     let gap = make_n_col_view(&schema, n, |row, _| i64::from(!(64..192).contains(&row)), |_, _| false);
-    assert_eq!(passing_ranges(&ev, &gap, n), vec![(0, 64), (192, n)]);
+    assert_eq!(passing_ranges(&ev, &gap), vec![(0, 64), (192, n)]);
 }
 
 #[test]
@@ -185,10 +184,10 @@ fn golden_load_payload_null_row() {
 
 #[test]
 fn golden_str_col_eq_const_null_row() {
-    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::STRING, true)], &[0]);
-    let mut mb = TestView::new(1, 8);
-    mb.push_col(16);
-    mb.set_pk_col(0, 0, &1u64.to_le_bytes(), type_code::U64);
+    let schema = schema_pk_strings(1, true);
+    let mut mb = TestView::new(1, schema.pk_stride());
+    push_payload_cols(&mut mb, &schema);
+    set_row_pk(&mut mb, &schema, 0, 1);
     mb.set_null_word(0, 1); // payload 0 (the string col) is NULL
     mb.set_string(0, 0, b"foo");
 
@@ -301,7 +300,7 @@ fn three_and_chain_boundary_sweep() {
             let mb = make_n_col_view(&schema, n, value, null_at);
             let ev = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
 
-            for (row, &got) in passing_rows(&ev, &mb, n).iter().enumerate() {
+            for (row, &got) in passing_rows(&ev, &mb).iter().enumerate() {
                 // NULL column → unknown clause; otherwise the compare's verdict.
                 let clause = |col: usize| {
                     let k = if col == 0 { k0 } else { 1 };
@@ -348,7 +347,7 @@ fn bit_only_not_3vl_truth_table() {
         ];
         let kind = filter_prog(&schema, instrs, 4, 3, vec![]);
         let mut passed = false;
-        kind.filter(&mb, 1, |_, _| {
+        kind.filter(&mb, |_, _| {
             passed = true;
         });
         // NOT TRUE=FALSE, NOT FALSE=TRUE, NOT NULL=NULL (filter fails on NULL)
@@ -376,7 +375,7 @@ fn classifier_filter_result_reg_non_bool_falls_back() {
     let mb = make_n_col_view(&schema, rows.len(), |row, _| rows[row].0, |row, _| rows[row].1);
 
     let mut passed = vec![false; 4];
-    kind.filter(&mb, 4, |s, e| {
+    kind.filter(&mb, |s, e| {
         passed[s..e].fill(true);
     });
     // val=1 → pass, val=0 → fail, null → fail, val=-5 → pass.
@@ -418,7 +417,7 @@ fn bit_only_all_null_word_and() {
     ];
     let kind = filter_prog(&schema, instrs, 6, 5, vec![]);
 
-    let passed = passing_rows(&kind, &mb, n);
+    let passed = passing_rows(&kind, &mb);
     assert!(passed.iter().all(|&p| !p), "all-null AND must reject every row");
 }
 
@@ -443,7 +442,7 @@ fn is_not_null_and_over_partial_word() {
     ];
     let kind = filter_prog(&schema, instrs, 3, 2, vec![]);
 
-    for (row, &got) in passing_rows(&kind, &mb, n).iter().enumerate() {
+    for (row, &got) in passing_rows(&kind, &mb).iter().enumerate() {
         let nn1 = row % 2 != 0;
         let nn2 = row % 3 != 0;
         let expected = nn1 && nn2;
@@ -491,7 +490,7 @@ fn bool_not_tail_mask() {
         );
 
         let mut passed = vec![false; n];
-        for (s, e) in passing_ranges(&ev, &mb, n) {
+        for (s, e) in passing_ranges(&ev, &mb) {
             assert!(
                 s < e && e <= n,
                 "n={n}: run ({s}, {e}) is not a non-empty run of 0..{n}"
@@ -529,7 +528,7 @@ const ARM_SWEEP_NULLS: [NullArrangement; 4] = [
 ];
 
 /// Predicates whose only contact with a nullable column is a null test, which is
-/// exactly the set `is_strictly_non_nullable` moved onto the `no_nulls` arm.
+/// exactly the set `analyze` moved onto the `no_nulls` arm.
 /// Against `schema_pk_ints(3, true)`.
 fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
     vec![
@@ -630,8 +629,8 @@ fn is_null_arms_agree() {
             for (arrangement, null_pred) in ARM_SWEEP_NULLS {
                 let mb = make_n_col_view(&schema, n, |row, col| ((row + col) % 5) as i64, null_pred);
                 assert_eq!(
-                    passing_rows(&fast, &mb, n),
-                    passing_rows(&nullable, &mb, n),
+                    passing_rows(&fast, &mb),
+                    passing_rows(&nullable, &mb),
                     "{name}/{arrangement}: arms disagree at n={n}",
                 );
             }
@@ -863,8 +862,8 @@ fn not_null_load_arms_agree_and_report_no_null() {
             for (bitmap, null_word) in [("clean", 0u64), ("forged", 0b1111u64)] {
                 let mb = not_null_load_view(n, null_word);
                 assert_eq!(
-                    passing_rows(&fast_filter, &mb, n),
-                    passing_rows(&nullable_filter, &mb, n),
+                    passing_rows(&fast_filter, &mb),
+                    passing_rows(&nullable_filter, &mb),
                     "{name}/{bitmap}: filter arms disagree at n={n}",
                 );
                 assert_eq!(
@@ -990,7 +989,7 @@ fn is_null_and_is_not_null_are_complementary() {
     let null_row = |row: usize| row % 7 < 3;
     let n = 300;
     let mb = make_n_col_view(&schema, n, |row, _| row as i64, |row, _| null_row(row));
-    let run = |instr| passing_rows(&filter_prog(&schema, vec![instr], 1, 0, vec![]), &mb, n);
+    let run = |instr| passing_rows(&filter_prog(&schema, vec![instr], 1, 0, vec![]), &mb);
     let is_null = run(is_null_op(0, 1));
     let is_not_null = run(is_not_null_op(0, 1));
     for row in 0..n {
@@ -1029,7 +1028,7 @@ fn or_does_not_take_a_null_row_stored_value_as_definite_true() {
     ];
     let ev = filter_prog(&schema, instrs, 6, 5, vec![]);
     assert_eq!(
-        passing_rows(&ev, &mb, n),
+        passing_rows(&ev, &mb),
         vec![false],
         "NULL OR FALSE is NULL, which the filter drops"
     );
@@ -1084,10 +1083,10 @@ fn and_chain_null_and_false_through_eval_row() {
     ];
     let ev = filter_prog(&schema, instrs, 9, 8, vec![]);
 
-    assert_eq!(ev.eval_row(&mb, 0), (0, true), "TRUE AND NULL AND TRUE is NULL");
+    assert_eq!(ev.eval_row(&mb, 0), None, "TRUE AND NULL AND TRUE is NULL");
     assert_eq!(
         ev.eval_row(&mb, 1),
-        (0, false),
+        Some(0),
         "a definite-FALSE chain is FALSE, not the previous drive's NULL"
     );
 }
@@ -1160,7 +1159,7 @@ fn and_chain_survivors_agree_across_arms() {
                 "{label}: wrong arm — the drive proves nothing"
             );
             assert_eq!(
-                passing_rows(&ev, &mb, n),
+                passing_rows(&ev, &mb),
                 (0..n).map(survives).collect::<Vec<_>>(),
                 "{label}: n={n}"
             );
@@ -1177,34 +1176,41 @@ fn ref_and(a: Option<bool>, b: Option<bool>) -> (bool, bool) {
     }
 }
 
-/// Regression guard for the shared German-string comparator on the
-/// `col <op> 'const'` filter loop — ~1M rows, non-nullable STRING. Both channels
-/// for that shape run over the same view: the fused 16-byte-cell opcode, and the
-/// `LOAD_COL_STR` + `LOAD_CONST_STR` + `STR_CMP` register compare. Asserting
-/// their hit counts equal rules out the two channels doing different amounts of
-/// work; the reported figure is still wall-clock on a box whose absolute timings
-/// are noisy, so read the ratio and ignore the milliseconds.
+/// The evidence for keeping the fused `STR_COL_EQ_CONST` opcode over the
+/// register channel on the `col <op> 'const'` filter loop — ~1M rows,
+/// non-nullable STRING. Both channels are built for every domain and their hit
+/// counts asserted equal, which is the only differential correctness check
+/// between them; `GNITZ_BENCH_CHANNEL` and `GNITZ_BENCH_DOMAIN` then cut the
+/// *driven* region down to one, so a `perf stat` over two pass counts
+/// differences to one channel's retired instructions on one domain.
 ///
 /// The controlled pair is `digits-first` against `abcd-shared-prefix`: same
 /// lengths, same content bytes, differing only in whether the 4-byte prefix
 /// collides. Only the cell form can short-circuit on that prefix — a `StrView`
-/// carries none — so the fused time moves between the two and the register time
+/// carries none — so the fused cost moves between the two and the register cost
 /// does not, and the gap remaining at `abcd*` is the register lane's own cost of
 /// materialising each row into a `MORSEL`-wide lane. Matching the lengths is
-/// what makes that attributable: the fall-through compare is a plain byte
-/// compare, so a shorter value would have moved both channels.
+/// what makes that attributable.
 ///
-/// Both channels run in one process, so a `perf stat` over this test measures
-/// their sum — separating retired instructions per kernel would need one process
-/// each, which this test does not do.
-///
-/// `#[ignore]`; run release:
-///   cargo test -p gnitz-expr --release str_const_filter_bench \
-///       -- --ignored --nocapture --test-threads=1
+///   for d in mixed long digits-first abcd-shared-prefix; do
+///     for c in fused registers; do for p in 1 201; do \
+///       GNITZ_BENCH_DOMAIN=$d GNITZ_BENCH_CHANNEL=$c GNITZ_BENCH_PASSES=$p \
+///       perf stat -e instructions:u cargo test -p gnitz-expr --release \
+///         str_const_filter_bench -- --ignored --nocapture --test-threads=1
+///   done; done; done
 #[test]
 #[ignore]
 fn str_const_filter_bench() {
-    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::STRING, false)], &[0]);
+    let passes = bench_passes();
+    let channel = std::env::var("GNITZ_BENCH_CHANNEL").unwrap_or_else(|_| "both".to_string());
+    assert!(
+        matches!(channel.as_str(), "both" | "fused" | "registers"),
+        "GNITZ_BENCH_CHANNEL must be both/fused/registers, got {channel:?}"
+    );
+    let only = std::env::var("GNITZ_BENCH_DOMAIN").unwrap_or_else(|_| "all".to_string());
+    let (run_fused, run_regs) = (channel != "registers", channel != "fused");
+
+    let schema = schema_pk_strings(1, false);
     let n = 1_000_000usize;
     // (domain, constant, value per row). `mixed` is the original fixture:
     // ~1/16 rows match and every 7th row is a long (heap-backed) string.
@@ -1227,13 +1233,13 @@ fn str_const_filter_bench() {
         ("digits-first", "42abcd", |row| format!("{}abcd", row % 97)),
         ("abcd-shared-prefix", "abcd42", |row| format!("abcd{}", row % 97)),
     ];
-    const PASSES: usize = 30;
 
+    let mut selected = 0usize;
     for (domain, constant, value) in domains {
-        let mut mb = TestView::new(n, 8);
-        mb.push_col(16);
+        let mut mb = TestView::new(n, schema.pk_stride());
+        push_payload_cols(&mut mb, &schema);
         for row in 0..n {
-            mb.set_pk_col(row, 0, &(row as u64 + 1).to_le_bytes(), type_code::U64);
+            set_row_pk(&mut mb, &schema, row, row as u64 + 1);
             mb.set_string(row, 0, value(row).as_bytes());
         }
 
@@ -1263,47 +1269,35 @@ fn str_const_filter_bench() {
                 consts,
             );
 
-            // Warm-up (which is also the equality check), then report the
-            // FASTEST of many timed passes — the minimum is robust against
-            // thermal throttling and scheduler noise, unlike a mean over the
-            // whole run.
+            // Also the warm-up, and outside the driven region — so both channels
+            // are still built and compared even when only one is driven.
             let count = |f: &Evaluator| {
                 let mut hits = 0usize;
-                f.filter(&mb, n, |s, e| hits += e - s);
+                f.filter(&mb, |s, e| hits += e - s);
                 hits
             };
             let hits = count(&fused);
             assert_eq!(hits, count(&regs), "{domain}/{name}: the channels disagree");
 
-            let pass = |f: &Evaluator| {
-                let t = std::time::Instant::now();
+            let run = |f: &Evaluator| {
                 let mut h = 0usize;
-                f.filter(&mb, n, |s, e| h += e - s);
+                for _ in 0..passes {
+                    f.filter(&mb, |s, e| h += e - s);
+                }
                 std::hint::black_box(h);
-                t.elapsed()
             };
-            // Alternate which channel is timed first, so a drift over the run
-            // cannot land wholly on whichever one always went second.
-            let (mut bf, mut br) = (std::time::Duration::MAX, std::time::Duration::MAX);
-            for i in 0..PASSES {
-                if i % 2 == 0 {
-                    bf = bf.min(pass(&fused));
-                    br = br.min(pass(&regs));
-                } else {
-                    br = br.min(pass(&regs));
-                    bf = bf.min(pass(&fused));
+            for (want, ev) in [(run_fused, &fused), (run_regs, &regs)] {
+                if want && (only == "all" || only == domain) {
+                    selected += 1;
+                    run(ev);
                 }
             }
-            println!(
-                "str_const_filter {domain}/{name}: {n} rows, best of {PASSES} passes = \
-                 fused {bf:?} ({:.1} M rows/s), registers {br:?} ({:.1} M rows/s), \
-                 ratio {:.2}x (hits={hits})",
-                n as f64 / bf.as_secs_f64() / 1e6,
-                n as f64 / br.as_secs_f64() / 1e6,
-                br.as_secs_f64() / bf.as_secs_f64()
-            );
+            println!("str_const_filter_bench {domain}/{name}: passes={passes} n={n} hits={hits}");
         }
     }
+    // A misspelled domain would otherwise drive nothing and difference to a 0 %
+    // effect instead of failing.
+    assert!(selected > 0, "GNITZ_BENCH_DOMAIN matched no domain: {only:?}");
 }
 
 /// Retired-instruction harness for the filter kernels. Prints nothing useful on
@@ -1311,8 +1305,10 @@ fn str_const_filter_bench() {
 /// process start cancel out. Wall-clock on these machines is far noisier than
 /// the effects being measured, so it is never reported.
 ///
-///   for p in 1 501; do GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
-///     cargo test -p gnitz-expr --release filter_kernel_bench -- --ignored --nocapture; done
+///   for s in pk nullable; do for p in 1 501; do \
+///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
+///     cargo test -p gnitz-expr --release filter_kernel_bench -- --ignored --nocapture
+///   done; done
 /// The pass count the `#[ignore]`d benches loop over, from `GNITZ_BENCH_PASSES`.
 /// Two runs at different counts, differenced, cancel everything that happens
 /// once per process.
@@ -1327,6 +1323,11 @@ fn bench_passes() -> usize {
 #[ignore]
 fn filter_kernel_bench() {
     let passes = bench_passes();
+    // Every shape is still built and checked; only the driven loop is skipped,
+    // so a `perf stat` over the process attributes its pass-count difference to
+    // the one named here rather than to their sum.
+    let only = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "all".to_string());
+    let driven = |name: &str| only == "all" || only == name;
     let n = 200_000usize;
 
     // `pk > n/2` — the PK-region load.
@@ -1393,14 +1394,23 @@ fn filter_kernel_bench() {
     );
 
     let mut hits = 0usize;
-    for _ in 0..passes {
-        pk_filter.filter(&pk_view, n, |s, e| hits += e - s);
-        nn_filter.filter(&nn_view, n, |s, e| hits += e - s);
+    let mut selected = 0usize;
+    for (name, ev, view) in [("pk", &pk_filter, &pk_view), ("nullable", &nn_filter, &nn_view)] {
+        if !driven(name) {
+            continue;
+        }
+        selected += 1;
+        for _ in 0..passes {
+            ev.filter(view, |s, e| hits += e - s);
+        }
     }
     println!(
         "filter_kernel_bench passes={passes} n={n} hits={}",
         std::hint::black_box(hits)
     );
+    // A misspelled shape would otherwise drive nothing and difference to a 0 %
+    // effect instead of failing.
+    assert!(selected > 0, "GNITZ_BENCH_SHAPE matched no shape: {only:?}");
 }
 
 /// `col1 IS NULL AND col2 > k AND ... ` over `is_null_bench_schema`: `n_cmp`
@@ -1529,14 +1539,14 @@ fn is_null_arm_bench() {
             filter_prog(&schema, instrs.clone(), *num_regs, *result_reg, vec![])
         });
         // Also the warm-up, and outside the driven region.
-        let passed = passing_rows(&fast, view, n);
-        assert_eq!(passed, passing_rows(&nullable, view, n), "{name}: the arms disagree");
+        let passed = passing_rows(&fast, view);
+        assert_eq!(passed, passing_rows(&nullable, view), "{name}: the arms disagree");
         let hits = passed.iter().filter(|&&p| p).count();
 
         let run = |ev: &Evaluator| {
             let mut h = 0usize;
             for _ in 0..passes {
-                ev.filter(*view, n, |s, e| h += e - s);
+                ev.filter(*view, |s, e| h += e - s);
             }
             std::hint::black_box(h);
         };

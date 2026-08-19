@@ -8,7 +8,7 @@ use gnitz_wire::{type_code, FixedInt};
 use super::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
 use crate::program::IntUnaryOp;
 use crate::test_support::{
-    bits_to_float, filter_prog, float_to_bits, make_int_row, make_int_view, make_n_col_view, passing_rows, scalar_prog,
+    decode_f64, encode_f64, filter_prog, make_int_row, make_int_view, make_n_col_view, passing_rows, scalar_prog,
     schema_pk_ints, TestSchema, TestView,
 };
 use crate::{CmpOp, LogicalInstr, ResolvedProgram, RowSource};
@@ -170,7 +170,7 @@ fn select_boundary_sweep() {
 }
 
 /// SELECT on the no-nulls fast arm: NOT NULL branches select `no_nulls=true`, so
-/// the value blend runs through `reg4` with no mask tracking. Verify the blend.
+/// the value blend runs through `regs_split` with no mask tracking. Verify the blend.
 #[test]
 fn select_no_nulls_fast_arm() {
     // cond / a / b are all NOT NULL, which selects the no_nulls fast arm.
@@ -468,10 +468,10 @@ fn int_abs_wraps_at_min_and_propagates_null() {
 fn float_unary_ops_match_ieee() {
     let vals: Vec<i64> = [-0.0f64, 2.5, 3.5, -2.5, -1.7, f64::NAN]
         .iter()
-        .map(|&f| float_to_bits(f))
+        .map(|&f| encode_f64(f))
         .collect();
     let nulls = vec![false; vals.len()];
-    let get = |out: &Vec<(i64, bool)>, i: usize| bits_to_float(out[i].0);
+    let get = |out: &Vec<(i64, bool)>, i: usize| decode_f64(out[i].0);
 
     let abs = run_unary_rows(&vals, &nulls, fu(FloatUnaryOp::Abs));
     assert!(get(&abs, 0).is_sign_positive(), "abs(-0.0) is +0.0");
@@ -495,11 +495,11 @@ fn float_unary_ops_match_ieee() {
 fn float_to_f32_nulls_only_on_finite_overflow() {
     let vals: Vec<i64> = [0.1f64, 1e300, 1e-300, f64::INFINITY, f64::NAN, f32::MAX as f64]
         .iter()
-        .map(|&f| float_to_bits(f))
+        .map(|&f| encode_f64(f))
         .collect();
     let nulls = vec![false; vals.len()];
     let out = run_unary_rows(&vals, &nulls, |dst, a| LogicalInstr::FloatToF32 { dst, a });
-    let get = |i: usize| bits_to_float(out[i].0);
+    let get = |i: usize| decode_f64(out[i].0);
 
     assert_eq!(get(0), 0.1f32 as f64, "rounded through f32 precision");
     assert!(out[1].1, "finite value beyond f32 range is NULL");
@@ -512,10 +512,10 @@ fn float_to_f32_nulls_only_on_finite_overflow() {
 
     // The values just above f32::MAX that round DOWN to it must not be NULLed.
     let just_over = f32::MAX as f64 + 2.0f64.powi(102);
-    let v = vec![float_to_bits(just_over)];
+    let v = vec![encode_f64(just_over)];
     let out = run_unary_rows(&v, &[false], |dst, a| LogicalInstr::FloatToF32 { dst, a });
     assert!(!out[0].1, "rounds down to f32::MAX, so not an overflow");
-    assert_eq!(bits_to_float(out[0].0), f32::MAX as f64);
+    assert_eq!(decode_f64(out[0].0), f32::MAX as f64);
 }
 
 #[test]
@@ -583,7 +583,7 @@ fn float_to_int_truncates_and_bounds_exclusively() {
         9223372036854775000.0, // < 2^63: in range
     ]
     .iter()
-    .map(|&f| float_to_bits(f))
+    .map(|&f| encode_f64(f))
     .collect();
     let nulls = vec![false; vals.len()];
     let out = run_unary_rows(&vals, &nulls, |dst, a| LogicalInstr::FloatToInt {
@@ -602,7 +602,7 @@ fn float_to_int_truncates_and_bounds_exclusively() {
     // Narrow target: the same exclusive rule admits exactly -128..=127.
     let vals: Vec<i64> = [127.9f64, 128.0, -128.0, -128.9]
         .iter()
-        .map(|&f| float_to_bits(f))
+        .map(|&f| encode_f64(f))
         .collect();
     let out = run_unary_rows(&vals, &[false; 4], |dst, a| LogicalInstr::FloatToInt {
         dst,
@@ -647,7 +647,7 @@ fn minmax2_skips_nulls_and_is_null_only_when_both_are() {
 
 #[test]
 fn float_minmax2_uses_total_cmp_order() {
-    let f = float_to_bits;
+    let f = encode_f64;
     let a = [f(5.0), f(5.0), f(-0.0), f(f64::INFINITY)];
     let b = [f(f64::NAN), f(2.0), f(0.0), f(f64::NAN)];
     let no = [false; 4];
@@ -658,13 +658,13 @@ fn float_minmax2_uses_total_cmp_order() {
         b,
         is_max: true,
     });
-    assert!(bits_to_float(max[0].0).is_nan(), "NaN is the total-order max");
-    assert_eq!(bits_to_float(max[1].0), 5.0);
+    assert!(decode_f64(max[0].0).is_nan(), "NaN is the total-order max");
+    assert_eq!(decode_f64(max[1].0), 5.0);
     assert!(
-        bits_to_float(max[2].0).is_sign_positive(),
+        decode_f64(max[2].0).is_sign_positive(),
         "+0.0 beats -0.0 under total_cmp"
     );
-    assert!(bits_to_float(max[3].0).is_nan(), "NaN outranks +inf");
+    assert!(decode_f64(max[3].0).is_nan(), "NaN outranks +inf");
 
     let min = run_binary_rows(&a, &b, &no, &no, |dst, a, b| LogicalInstr::FloatMinMax2 {
         dst,
@@ -672,11 +672,8 @@ fn float_minmax2_uses_total_cmp_order() {
         b,
         is_max: false,
     });
-    assert_eq!(bits_to_float(min[0].0), 5.0, "NaN loses MIN");
-    assert!(
-        bits_to_float(min[2].0).is_sign_negative(),
-        "-0.0 wins MIN under total_cmp"
-    );
+    assert_eq!(decode_f64(min[0].0), 5.0, "NaN loses MIN");
+    assert!(decode_f64(min[2].0).is_sign_negative(), "-0.0 wins MIN under total_cmp");
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +714,7 @@ fn run_str_rows(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(u16) -> Vec<LogicalI
 
 /// The same, but reading a *scalar* register — LENGTH, LIKE, the compares, the
 /// text→number parses.
-fn run_str_to_scalar(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(u16) -> Vec<LogicalInstr>) -> Vec<(i64, bool)> {
+fn run_str_to_scalar(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(u16) -> Vec<LogicalInstr>) -> Vec<Option<i64>> {
     let (ev, view) = str_prog(vals, nulls, vec![], mk);
     (0..vals.len()).map(|i| ev.eval_row(&view, i)).collect()
 }
@@ -808,8 +805,8 @@ fn length_counts_characters_and_octets_separately() {
     });
     // The emoji is 5 codepoints (three faces joined by two ZWJs) in 18 bytes —
     // the byte/character distinction OCTET_LENGTH exists to expose.
-    assert_eq!(chars.iter().map(|r| r.0).collect::<Vec<_>>(), [3, 2, 5, 3]);
-    assert_eq!(bytes.iter().map(|r| r.0).collect::<Vec<_>>(), [3, 3, 18, 3]);
+    assert_eq!(chars, [Some(3), Some(2), Some(5), Some(3)]);
+    assert_eq!(bytes, [Some(3), Some(3), Some(18), Some(3)]);
 }
 
 #[test]
@@ -817,7 +814,7 @@ fn length_of_null_is_null() {
     let got = run_str_to_scalar(&[b"abc"], &[true], |a| {
         vec![LogicalInstr::StrLen { dst: 1, a, chars: true }]
     });
-    assert!(got[0].1);
+    assert!(got[0].is_none());
 }
 
 /// The window rule is the totality proof: every endpoint is clamped in i128 to
@@ -951,14 +948,14 @@ fn like_over_inline_and_heap_cells_with_a_null_row() {
         });
         (0..vals.len()).map(|i| ev.eval_row(&view, i)).collect::<Vec<_>>()
     };
-    let null_row = (0, true);
-    assert_eq!(run("abc", false), [(1, false), (0, false), (0, false), null_row]);
+    let null_row = None;
+    assert_eq!(run("abc", false), [Some(1), Some(0), Some(0), null_row]);
     // A heap cell reached through its view, not its inline prefix.
-    assert_eq!(run("%ijklm", false), [(0, false), (1, false), (0, false), null_row]);
-    assert_eq!(run("%", false), [(1, false), (1, false), (1, false), null_row]);
+    assert_eq!(run("%ijklm", false), [Some(0), Some(1), Some(0), null_row]);
+    assert_eq!(run("%", false), [Some(1), Some(1), Some(1), null_row]);
     // ILIKE folds ASCII case; LIKE does not.
-    assert_eq!(run("ABC", true), [(1, false), (0, false), (0, false), null_row]);
-    assert_eq!(run("ABC", false), [(0, false), (0, false), (0, false), null_row]);
+    assert_eq!(run("ABC", true), [Some(1), Some(0), Some(0), null_row]);
+    assert_eq!(run("ABC", false), [Some(0), Some(0), Some(0), null_row]);
 }
 
 /// The two null rules are the whole difference between `||` and `CONCAT`, and
@@ -1083,7 +1080,7 @@ fn register_compare_agrees_with_the_cell_comparator() {
     for (i, a) in corpus.iter().enumerate() {
         for (j, b) in corpus.iter().enumerate() {
             let view = make_string_view(&schema, &[&[a, b]]);
-            let verdicts: Vec<i64> = evs.iter().map(|ev| ev.eval_row(&view, 0).0).collect();
+            let verdicts: Vec<i64> = evs.iter().map(|ev| ev.eval_row(&view, 0).expect("not NULL")).collect();
             let want = gnitz_wire::compare_german_strings(&cells[i], &blob, &cells[j], &blob);
             assert_eq!(
                 verdicts,
@@ -1134,7 +1131,7 @@ fn heap_backed_constants_at_two_arena_offsets() {
         2,
         vec![a.to_vec(), b.to_vec()],
     );
-    assert_eq!(passing_rows(&ev, &view, rows.len()), vec![false, true, false, false]);
+    assert_eq!(passing_rows(&ev, &view), vec![false, true, false, false]);
 }
 
 /// A cell index is not a const-pool index. `resolve` encodes a cell only for
@@ -1181,7 +1178,7 @@ fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
         5,
         vec![set, a.to_vec(), b.to_vec()],
     );
-    assert_eq!(passing_rows(&ev, &view, rows.len()), vec![false, true, false, false]);
+    assert_eq!(passing_rows(&ev, &view), vec![false, true, false, false]);
 }
 
 #[test]
@@ -1237,7 +1234,7 @@ fn float_to_text_is_bounded_and_round_trips() {
     let rows: Vec<(u64, u64, Vec<i64>)> = vals
         .iter()
         .enumerate()
-        .map(|(i, &f)| (i as u64 + 1, 0, vec![float_to_bits(f)]))
+        .map(|(i, &f)| (i as u64 + 1, 0, vec![encode_f64(f)]))
         .collect();
     let row_refs: Vec<(u64, u64, &[i64])> = rows.iter().map(|(p, n, v)| (*p, *n, v.as_slice())).collect();
     let view = make_int_view(&schema, &row_refs);
@@ -1301,8 +1298,8 @@ fn text_to_int_accepts_only_plain_decimal_and_range_checks_the_target() {
     });
     for (i, (s, want)) in cases.iter().enumerate() {
         match want {
-            Some(v) => assert_eq!((got[i].0, got[i].1), (*v, false), "{s:?}"),
-            None => assert!(got[i].1, "{s:?} must be NULL"),
+            Some(v) => assert_eq!(got[i], Some(*v), "{s:?}"),
+            None => assert!(got[i].is_none(), "{s:?} must be NULL"),
         }
     }
 
@@ -1315,7 +1312,7 @@ fn text_to_int_accepts_only_plain_decimal_and_range_checks_the_target() {
         }]
     });
     assert_eq!(
-        narrow.iter().map(|r| r.1).collect::<Vec<_>>(),
+        narrow.iter().map(|r| r.is_none()).collect::<Vec<_>>(),
         [false, true, false, true]
     );
 }
@@ -1350,10 +1347,10 @@ fn text_to_u64_seeds_the_unsigned_tracking() {
         );
         ev.eval_row(&view, 0)
     };
-    assert_eq!(cmp(type_code::U64), (1, false), "u64::MAX > 5 under unsigned order");
+    assert_eq!(cmp(type_code::U64), Some(1), "u64::MAX > 5 under unsigned order");
     // The same text does not fit I64 at all, so the parse itself NULLs the row —
     // there is no signed reading of this value to compare wrongly.
-    assert!(cmp(type_code::I64).1);
+    assert!(cmp(type_code::I64).is_none());
 }
 
 #[test]
@@ -1372,15 +1369,15 @@ fn text_to_float_parses_or_nulls() {
     });
     for (i, (s, want)) in cases.iter().enumerate() {
         match want {
-            Some(f) => assert_eq!((bits_to_float(got[i].0), got[i].1), (*f, false), "{s:?}"),
-            None => assert!(got[i].1, "{s:?} must be NULL"),
+            Some(f) => assert_eq!(got[i].map(decode_f64), Some(*f), "{s:?}"),
+            None => assert!(got[i].is_none(), "{s:?} must be NULL"),
         }
     }
     // Invalid UTF-8 is NULL, not a panic: the engine is byte-transparent.
     let bad = run_str_to_scalar(&[&[0xFF, 0xFE]], &[false], |a| {
         vec![LogicalInstr::StrToFloat { dst: 1, a }]
     });
-    assert!(bad[0].1);
+    assert!(bad[0].is_none());
 }
 
 /// A morsel-crossing run: the arena is truncated back to its constant prefix at
@@ -1491,6 +1488,42 @@ fn string_select_takes_the_chosen_branch_and_its_null_bit() {
     assert!(!got[2].1);
 }
 
+/// The payload twin of [`pk_loads_agree_with_the_wire_opk_decoder`]:
+/// `load_int!` re-spells `FixedInt::decode_le_i64`'s eight-arm widening, and a
+/// divergence is a silently wrong *value*, not a crash.
+#[test]
+fn payload_loads_agree_with_the_wire_le_decoder() {
+    for (tc, fi) in PK_WIDTH_MATRIX {
+        // PK column 0 keeps the schema well-formed; column 1 is the subject.
+        let schema = TestSchema::new(&[(type_code::U64, false), (tc, false)], &[0]);
+        let vals: [i64; 6] = [0, 1, -1, i64::MIN, i64::MAX, 0x0123_4567_89ab_cdef];
+        let rows: Vec<(u64, u64, &[i64])> = vals.iter().map(|v| (0u64, 0u64, std::slice::from_ref(v))).collect();
+        let view = make_int_view(&schema, &rows);
+
+        let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }], 1, 0, vec![]);
+        for row in 0..vals.len() {
+            let got = ev.eval_row(&view, row).expect("a non-nullable column is never null");
+            let want = fi.decode_le_i64(view.get_col_ptr(row, 0, fi.width()));
+            assert_eq!(
+                got, want,
+                "type {tc}, row {row}: load_int! disagrees with decode_le_i64"
+            );
+        }
+    }
+}
+
+/// Every `(type_code, FixedInt)` pair the two load kernels must cover.
+const PK_WIDTH_MATRIX: [(u8, FixedInt); 8] = [
+    (type_code::U8, FixedInt::U8),
+    (type_code::I8, FixedInt::I8),
+    (type_code::U16, FixedInt::U16),
+    (type_code::I16, FixedInt::I16),
+    (type_code::U32, FixedInt::U32),
+    (type_code::I32, FixedInt::I32),
+    (type_code::U64, FixedInt::U64),
+    (type_code::I64, FixedInt::I64),
+];
+
 /// `LoadPk`'s kernel is a fourth spelling of the OPK→i64 inverse: it reads
 /// fixed-width `&[u8; W]` arrays so each width is one load plus a byte swap,
 /// where `gnitz_wire::decode_opk_i64` takes the width as a slice length. The two
@@ -1500,16 +1533,7 @@ fn string_select_takes_the_chosen_branch_and_its_null_bit() {
 /// against it puts this kernel inside that same check.
 #[test]
 fn pk_loads_agree_with_the_wire_opk_decoder() {
-    for (tc, fi) in [
-        (type_code::U8, FixedInt::U8),
-        (type_code::I8, FixedInt::I8),
-        (type_code::U16, FixedInt::U16),
-        (type_code::I16, FixedInt::I16),
-        (type_code::U32, FixedInt::U32),
-        (type_code::I32, FixedInt::I32),
-        (type_code::U64, FixedInt::U64),
-        (type_code::I64, FixedInt::I64),
-    ] {
+    for (tc, fi) in PK_WIDTH_MATRIX {
         // A single-column PK of this type, plus one payload column so the schema
         // has a slot; the values sweep both sign extremes and the midpoint.
         let schema = TestSchema::new(&[(tc, false), (type_code::I64, false)], &[0]);
@@ -1519,8 +1543,7 @@ fn pk_loads_agree_with_the_wire_opk_decoder() {
 
         let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }], 1, 0, vec![]);
         for row in 0..vals.len() {
-            let (got, is_null) = ev.eval_row(&view, row);
-            assert!(!is_null, "a PK column is never null");
+            let got = ev.eval_row(&view, row).expect("a PK column is never null");
             let want = gnitz_wire::decode_opk_i64(&view.get_pk_bytes(row)[..fi.width()], fi);
             assert_eq!(got, want, "type {tc}, row {row}: LoadPk disagrees with decode_opk_i64");
         }

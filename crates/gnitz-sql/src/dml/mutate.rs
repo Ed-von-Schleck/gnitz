@@ -118,9 +118,12 @@ pub(crate) fn eval_set_program(p: &SetProgram, view: &ZSetBatchView<'_>, row: us
             // concatenation of valid inputs.
             String::from_utf8(buf).map_or(ColumnValue::Null, ColumnValue::Str)
         }
+        // A `match` rather than `map_or`: this module builds at opt-level 0,
+        // where `map_or` plus a constructor-as-closure is two out-of-line calls
+        // moving a ~24-byte enum, and the match is free.
         SetProgram::Expr(ev) => match ev.eval_row(view, row) {
-            (_, true) => ColumnValue::Null,
-            (v, false) => ColumnValue::Int(v),
+            None => ColumnValue::Null,
+            Some(v) => ColumnValue::Int(v),
         },
     }
 }
