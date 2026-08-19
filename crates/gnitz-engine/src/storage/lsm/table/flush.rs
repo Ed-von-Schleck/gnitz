@@ -17,7 +17,6 @@ use super::super::error::StorageError;
 use super::super::flush_barrier::FlushRound;
 use super::super::shard_file;
 use super::{FlushOutcome, FlushWork, RecoverySource, Table};
-use crate::foundation::posix_io::open_owned;
 
 impl Table {
     /// Synchronous flush of this one table through the shared barrier. It runs a
@@ -38,23 +37,8 @@ impl Table {
     ///
     /// An absent directory is created here — this is the single choke point
     /// every file write goes through, so nothing downstream has to check.
-    /// NOCOW (btrfs; silently ignored elsewhere) is applied to every opened fd
-    /// — the one place that covers dirs created lazily here as well as dirs
-    /// pre-created by the catalog's layout staging (index dirs), so files
-    /// written into either inherit the flag. It is cheap only because
-    /// `try_set_nocow` skips the write when the flag is already set; the
-    /// re-application itself is a btrfs transaction commit.
     pub(super) fn open_dirfd(&self) -> Result<OwnedFd, StorageError> {
-        let dir_c = super::super::cstr(self.directory.as_str())?;
-        let fd = match open_owned(&dir_c, libc::O_RDONLY | libc::O_DIRECTORY) {
-            Ok(fd) => fd,
-            Err(_) => {
-                let dir_c = super::ensure_dir(&self.directory)?;
-                open_owned(&dir_c, libc::O_RDONLY | libc::O_DIRECTORY)?
-            }
-        };
-        crate::foundation::posix_io::try_set_nocow(fd.as_raw_fd());
-        Ok(fd)
+        super::open_table_dirfd(&self.directory)
     }
 
     // ------------------------------------------------------------------
@@ -158,8 +142,12 @@ impl Table {
             run.count as u32,
             &run.regions(),
             &self.schema,
-            // L0 spill/checkpoint shards stay plain (no FoR packing).
-            shard_file::ShardWriteOpts::default(),
+            // L0 spill/checkpoint shards stay plain (no FoR packing), and carry
+            // a PK filter only where something point-probes this store.
+            shard_file::ShardWriteOpts {
+                skip_pk_filter: self.is_rederived(),
+                ..Default::default()
+            },
         );
         drop(dirfd);
         res?; // Write failed: heap still owns `run`; no on-disk residue.
@@ -205,7 +193,7 @@ impl Table {
     pub(in crate::storage) fn flush_commit(&mut self, work: FlushWork) -> Result<OwnedFd, StorageError> {
         work.manifest.commit()?;
 
-        // The files in `unsynced` were fdatasync'd by the barrier sweep and are
+        // The files the sweep list named were fdatasync'd by the barrier and are
         // now referenced by the renamed manifest; clear so the next barrier does
         // not re-sync already-durable files. No concurrent writer: single-threaded
         // worker, barrier holds sal_writer_excl.
@@ -222,7 +210,7 @@ impl Table {
     /// its shards would accumulate unbounded and every cursor would merge them
     /// all.
     ///
-    /// Spills are written **unsynced** and marked in the index's `unsynced` set.
+    /// Spills are written **unsynced**, and register in the index as owing a sweep.
     /// For `SalReplay` the next barrier fdatasyncs them by path before publishing
     /// (every barrier publishes, so the checkpoint's global SAL reset never drops
     /// an acknowledged spill). A `Rederive` table's spills wait for the

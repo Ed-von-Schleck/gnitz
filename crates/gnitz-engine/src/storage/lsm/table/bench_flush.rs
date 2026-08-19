@@ -148,7 +148,7 @@ fn flush_cadence_amplification_bench() {
             let runs_before = table.ram_run_count();
             table.ingest_owned_batch(batch).unwrap();
             table.flush().unwrap(); // Rederive → flush_prepare → flush_to_ram
-            if runs_before + 1 > FOLD_THRESHOLD {
+            if runs_before + 1 >= FOLD_THRESHOLD {
                 merged_out += table.ram_row_count();
             }
         }

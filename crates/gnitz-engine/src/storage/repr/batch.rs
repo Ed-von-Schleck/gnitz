@@ -22,6 +22,11 @@ fn next_blob_id() -> u64 {
 /// `batch_pool::MAX_RECYCLE_CAPACITY` aliases it, so it is also the pool's only
 /// bound on bytes (`MAX_POOLED` bounds its count) — what stops one outsized
 /// buffer from trapping memory for the process's lifetime.
+///
+/// It is *not* a hugepage threshold, despite the size: `acquire_arena` cannot
+/// `madvise(MADV_HUGEPAGE)` these buffers at all. glibc serves a `Vec` this
+/// large from its own `mmap` and hands back `base + 0x10`, which is not
+/// page-aligned, so the call only ever returned `EINVAL`.
 pub(super) const POOL_BYPASS_BYTES: usize = 2 * 1024 * 1024;
 
 /// Cost of relocating one German-string cell, in bytes of whole-heap memcpy — the
@@ -1601,6 +1606,22 @@ impl Batch {
         let mut out = Batch::with_capacity(*schema, rows);
         out.share_blob_from(src);
         out.append_ranges(src, ranges);
+        out
+    }
+
+    /// Bulk-copy the contiguous row range `[start, start + row_count)` into a
+    /// fresh batch — the in-heap twin of `MappedShard::slice_to_owned_batch`,
+    /// picking the same blob arm via [`should_relocate_blob`](Self::should_relocate_blob).
+    /// A contiguous slice preserves whatever layout the source claimed, so the
+    /// result inherits the tag rather than certifying one.
+    pub(crate) fn slice_to_owned_batch(&self, start: usize, row_count: usize, schema: &SchemaDescriptor) -> Batch {
+        let mut out = Batch::with_capacity(*schema, row_count.max(1));
+        if !Batch::should_relocate_blob(row_count, self.count, self.blob.len()) {
+            out.share_blob_from(self);
+        }
+        out.append_ranges(self, &[(start, start + row_count)]);
+        // `append_ranges` downgraded `out` to `Raw` first.
+        out.inherit_layout(self);
         out
     }
 

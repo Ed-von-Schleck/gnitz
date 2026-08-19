@@ -33,7 +33,7 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 
-use super::heap::{HeapNode, LoserTree};
+use super::repr::heap::{HeapNode, LoserTree};
 use crate::foundation::posix_io;
 use crate::foundation::posix_io::{Advice, Mmap};
 use crate::schema::key::compare_pk_bytes;

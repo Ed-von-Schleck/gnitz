@@ -39,13 +39,12 @@ impl ShardIndex {
         level_idx + 1
     }
 
-    /// Open `path`, insert it into the sorted L0 tier, and record it for the
-    /// barrier's fdatasync sweep.
+    /// Open `path` and insert it into the sorted L0 tier. The entry registers
+    /// unswept, so it is in the next barrier's fdatasync sweep by construction.
     pub fn add_unsynced_shard(&mut self, path: &str, max_lsn: u64) -> Result<(), StorageError> {
-        let entry = ShardEntry::open(path, &self.schema, max_lsn)?;
+        let entry = ShardEntry::open(path, &self.schema, max_lsn, false)?;
         self.l0.push(entry);
         self.sort_l0();
-        self.mark_unsynced(path);
         Ok(())
     }
 
@@ -66,31 +65,18 @@ impl ShardIndex {
         self.l0.len() > L0_COMPACT_THRESHOLD
     }
 
-    /// Hold `path` for the next barrier's fdatasync sweep, which must reach it
-    /// before the manifest referencing it is renamed into place.
-    fn mark_unsynced(&mut self, path: &str) {
-        self.unsynced.push(path.to_string());
+    /// The paths `flush_prepare` hands the barrier as its fdatasync sweep list:
+    /// every live shard an fdatasync has not yet reached.
+    pub fn unsynced_paths(&self) -> impl Iterator<Item = &str> {
+        self.all_entries().filter(|e| !e.synced).map(|e| e.filename.as_str())
     }
 
-    /// The unsynced set, cloned by `flush_prepare` into the barrier's sweep list.
-    pub fn unsynced_paths(&self) -> &[String] {
-        &self.unsynced
-    }
-
-    /// Clear the unsynced set once the barrier has fdatasync'd every path in it
-    /// and renamed the manifest that references them.
+    /// Mark every live shard durable, once the barrier has fdatasync'd the sweep
+    /// list and renamed the manifest that references them.
     pub fn clear_unsynced(&mut self) {
-        self.unsynced.clear();
-    }
-
-    /// Move compaction-superseded input files to `pending_deletions` for the
-    /// (possibly deferred) drain. The sole writer of `pending_deletions`: an
-    /// unpublished spill among the inputs no longer needs a barrier sweep, so
-    /// it is pruned from `unsynced` in the same step — keeping the invariant
-    /// that every `unsynced` path stays openable until swept.
-    fn supersede_files(&mut self, inputs: Vec<String>) {
-        self.unsynced.retain(|p| !inputs.contains(p));
-        self.pending_deletions.extend(inputs);
+        for e in self.all_entries_mut() {
+            e.synced = true;
+        }
     }
 
     /// Every live shard's `Rc`, yielded lazily — callers `extend` without an
@@ -185,7 +171,10 @@ impl ShardIndex {
     fn open_outputs(&self, outputs: &[(u128, String)], max_lsn: u64) -> Result<Vec<(u128, ShardEntry)>, StorageError> {
         let mut opened = Vec::with_capacity(outputs.len());
         for (gk, filename) in outputs {
-            match ShardEntry::open(filename, &self.schema, max_lsn) {
+            // Unswept, like any other new shard: a crash before the sweep leaves
+            // the last-published manifest on the still-present inputs, so an
+            // unswept output is only ever an orphan.
+            match ShardEntry::open(filename, &self.schema, max_lsn, false) {
                 Ok(entry) => opened.push((*gk, entry)),
                 Err(e) => {
                     for (_, f) in outputs {
@@ -262,22 +251,25 @@ impl ShardIndex {
 
         let outputs = compact::merge_and_route(
             &cstrs,
-            &self.output_dir,
             &guards,
             &self.schema,
-            self.table_id,
-            Self::level_num(dest_idx) as u32,
-            compact_seq,
+            compact::Output {
+                dir: &self.output_dir,
+                table_id: self.table_id,
+                level_num: Self::level_num(dest_idx) as u32,
+                compact_seq,
+                skip_pk_filter: self.skip_pk_filter,
+            },
         )?;
         let opened = self.open_outputs(&outputs, max_lsn)?;
 
-        self.supersede_files(inputs);
+        // The superseded inputs are the sole writer of `pending_deletions`. Each
+        // leaves the index carrying its own sweep flag, so an unpublished spill
+        // among them stops being swept with nothing having to prune it.
+        self.pending_deletions.extend(inputs);
         drop_sources(self);
         self.ensure_level(dest_idx);
         for (gk, entry) in opened {
-            // A crash before the sweep leaves the last-published manifest on the
-            // still-present inputs, so an unswept output is only ever an orphan.
-            self.mark_unsynced(&entry.filename);
             self.levels[dest_idx].get_or_create_guard(gk).entries.push(entry);
         }
         Ok(())

@@ -31,10 +31,11 @@ const GUARD_FILE_THRESHOLD: usize = 4;
 const LMAX_FILE_THRESHOLD: usize = 1;
 const L1_TARGET_FILES: usize = 16;
 
-/// Path strings as `CString`s — the compaction input list and the barrier's
-/// by-path fdatasync sweep list take the same conversion.
-pub(super) fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, StorageError> {
-    strings.iter().map(|f| super::super::cstr(f.as_str())).collect()
+/// Path strings as `CString`s — the compaction input list (a `Vec<String>`) and
+/// the barrier's by-path fdatasync sweep list (borrowed `&str`s off the live
+/// entries) take the same conversion.
+pub(super) fn to_cstrings<S: AsRef<str>>(paths: impl IntoIterator<Item = S>) -> Result<Vec<CString>, StorageError> {
+    paths.into_iter().map(|f| super::super::cstr(f.as_ref())).collect()
 }
 
 pub struct ShardEntry {
@@ -43,6 +44,11 @@ pub struct ShardEntry {
     max_lsn: u64,
     pk_min: PkBuf,
     pk_max: PkBuf,
+    /// Has an `fdatasync` reached this file? False for a shard this session
+    /// wrote, true for one a published manifest named. Carried on the entry so a
+    /// superseded shard takes its own flag out of the index with it — nothing
+    /// can be left behind naming a deleted file.
+    synced: bool,
 }
 
 impl ShardEntry {
@@ -54,23 +60,31 @@ impl ShardEntry {
         self.shard.count == 0
     }
 
-    /// Build an entry from an already-mmap'd shard, deriving its PK bounds via
-    /// `MappedShard::pk_bounds`.
-    fn from_mapped(shard: Rc<MappedShard>, filename: String, max_lsn: u64) -> Self {
+    /// The one mapping call: [`open`](Self::open) builds a fresh entry around it,
+    /// [`reopen`](Self::reopen) swaps it into an existing one.
+    fn map(path: &str, schema: &SchemaDescriptor) -> Result<Rc<MappedShard>, StorageError> {
+        Ok(Rc::new(MappedShard::open(&super::super::cstr(path)?, schema, false)?))
+    }
+
+    fn open(path: &str, schema: &SchemaDescriptor, max_lsn: u64, synced: bool) -> Result<Self, StorageError> {
+        let shard = Self::map(path, schema)?;
         let (pk_min, pk_max) = shard.pk_bounds();
-        ShardEntry {
+        Ok(ShardEntry {
             shard,
-            filename,
+            filename: path.to_string(),
             max_lsn,
             pk_min,
             pk_max,
-        }
+            synced,
+        })
     }
 
-    fn open(path: &str, schema: &SchemaDescriptor, max_lsn: u64) -> Result<Self, StorageError> {
-        let cpath = super::super::cstr(path)?;
-        let shard = Rc::new(MappedShard::open(&cpath, schema, false)?);
-        Ok(Self::from_mapped(shard, path.to_string(), max_lsn))
+    /// Re-`mmap` this entry's own file under `schema`, yielding **only** the new
+    /// mapping: a payload widen rewrites `col_regions` and `null_pad_mask` and
+    /// nothing else, so every other field is already right. Exchanging just the
+    /// `Rc` is what keeps a reopen from dropping a field it does not know about.
+    fn reopen(&self, schema: &SchemaDescriptor) -> Result<Rc<MappedShard>, StorageError> {
+        Self::map(&self.filename, schema)
     }
 
     /// Probe this shard for a PK by its OPK `key` bytes (exactly `pk_stride`
@@ -189,20 +203,20 @@ pub struct ShardIndex {
 
     compact_seq: u64,
     pending_deletions: Vec<String>,
-    /// Full paths of every shard written since the last manifest publish: spills,
-    /// the barrier's own folded shard, and compaction outputs. The barrier
-    /// fdatasyncs exactly this set by path before renaming the new manifest, then
-    /// `clear_unsynced` empties it; a compaction prunes the inputs it consumed.
-    /// Files from prior barriers are already durable and never re-synced.
-    unsynced: Vec<String>,
     /// Ceiling on this store's **registered on-disk shard bytes**, from
     /// `CREATE VIEW … WITH (capacity = …)`. `None` for every store but a
     /// capacity-bounded view's output store, which pays nothing.
     capacity_bytes: Option<u64>,
+    /// Passed to every compaction's write. Held rather than derived from the
+    /// input shards: a derivation would let one filterless input turn the filter
+    /// off for this table's whole descendant line, permanently and invisibly.
+    skip_pk_filter: bool,
 }
 
 impl ShardIndex {
-    pub fn new(table_id: u32, output_dir: &str, schema: SchemaDescriptor) -> Self {
+    /// `skip_pk_filter` declares that nothing point-probes this store by PK, so
+    /// its shards need no XOR8 filter.
+    pub fn new(table_id: u32, output_dir: &str, schema: SchemaDescriptor, skip_pk_filter: bool) -> Self {
         ShardIndex {
             table_id,
             output_dir: output_dir.to_string(),
@@ -211,8 +225,8 @@ impl ShardIndex {
             levels: Vec::new(),
             compact_seq: 0,
             pending_deletions: Vec::new(),
-            unsynced: Vec::new(),
             capacity_bytes: None,
+            skip_pk_filter,
         }
     }
 
@@ -234,28 +248,26 @@ impl ShardIndex {
     ///
     /// Re-opening re-reads each shard's XOR8 filter, so this costs one extra
     /// filter allocation per shard until the commit drops the old handles.
-    pub(super) fn reopen_all(&self, new_schema: &SchemaDescriptor) -> Result<Vec<ShardEntry>, StorageError> {
+    pub(super) fn reopen_all(&self, new_schema: &SchemaDescriptor) -> Result<Vec<Rc<MappedShard>>, StorageError> {
         if new_schema.num_payload_cols() == self.schema.num_payload_cols() {
             return Ok(Vec::new());
         }
-        self.all_entries()
-            .map(|e| ShardEntry::open(&e.filename, new_schema, e.max_lsn))
-            .collect()
+        self.all_entries().map(|e| e.reopen(new_schema)).collect()
     }
 
-    /// Infallible half: install the entries [`reopen_all`](Self::reopen_all)
+    /// Infallible half: install the mappings [`reopen_all`](Self::reopen_all)
     /// staged, in the same (deterministic) `all_entries` order, and publish
     /// `new_schema`. `staged` is empty for an equal-region swap, in which case
     /// only the comparator schema moves — `compact_shards` / `ShardEntry::open`
     /// read `&self.schema` per call, so every subsequent compaction uses the new
     /// comparator.
-    pub(super) fn install_reopened(&mut self, staged: Vec<ShardEntry>, new_schema: SchemaDescriptor) {
+    pub(super) fn install_reopened(&mut self, staged: Vec<Rc<MappedShard>>, new_schema: SchemaDescriptor) {
         debug_assert!(
             staged.is_empty() || staged.len() == self.all_entries().count(),
             "install_reopened: staged count must match the index it was prepared from",
         );
-        for (slot, entry) in self.all_entries_mut().zip(staged) {
-            *slot = entry;
+        for (slot, shard) in self.all_entries_mut().zip(staged) {
+            slot.shard = shard;
         }
         self.schema = new_schema;
     }
@@ -268,7 +280,6 @@ mod tests {
     use crate::schema::key::probe_key;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::make_schema_u64_i64;
-    use gnitz_wire::as_le_bytes;
 
     /// Derives the filter key the way the production sweep does, so no assertion
     /// hand-spells a second version of it.
@@ -311,40 +322,17 @@ mod tests {
         buf
     }
 
-    /// Write a shard whose PK region is the OPK concatenation of two
-    /// U64 columns (16 bytes/row), with one I64 payload column. Rows
-    /// must be passed in compound-sorted order.
+    /// Write a shard whose PK region is the OPK concatenation of two U64
+    /// columns (16 bytes/row), with one I64 payload column. Rows must be passed
+    /// in compound-sorted order.
     fn write_compound_shard(dir: &std::path::Path, name: &str, pks: &[(u64, u64)], values: &[i64]) -> String {
-        let n = pks.len();
-        // PK region holds OPK (per-column big-endian) bytes at rest.
-        let mut pk_bytes: Vec<u8> = Vec::with_capacity(n * 16);
-        for &(a, b) in pks {
-            pk_bytes.extend_from_slice(&a.to_be_bytes());
-            pk_bytes.extend_from_slice(&b.to_be_bytes());
-        }
-        let weights = vec![1i64; n];
-        let nulls = vec![0u64; n];
-        let blob: Vec<u8> = Vec::new();
-
-        let regions: Vec<&[u8]> = vec![
-            &pk_bytes,
-            as_le_bytes(&weights),
-            as_le_bytes(&nulls),
-            as_le_bytes(values),
-            &blob,
-        ];
-
+        let rows: Vec<(Vec<u8>, i64, i64)> = pks
+            .iter()
+            .zip(values)
+            .map(|(&(a, b), &v)| ([a.to_be_bytes(), b.to_be_bytes()].concat(), 1, v))
+            .collect();
         let path = dir.join(name);
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        shard_file::write_shard_streaming(
-            libc::AT_FDCWD,
-            &cpath,
-            n as u32,
-            &regions,
-            &compound_schema(),
-            shard_file::ShardWriteOpts::default(),
-        )
-        .unwrap();
+        shard_file::write_test_shard(&path, &compound_schema(), &rows, shard_file::ShardWriteOpts::default());
         path.to_str().unwrap().to_string()
     }
 
@@ -355,34 +343,20 @@ mod tests {
         crate::schema::key::pack_pk_be(&v.to_be_bytes())
     }
 
-    /// Build and write a shard file with the given PK/value pairs.
+    /// Build and write a `(U64 PK | I64 payload)` shard at weight 1.
     fn write_test_shard(dir: &std::path::Path, name: &str, pks: &[u64], values: &[i64]) -> String {
-        let n = pks.len();
-        // PK region holds OPK (order-preserving big-endian) bytes at rest.
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_be_bytes()).collect();
-        let weights = vec![1i64; n];
-        let nulls = vec![0u64; n];
-        let blob: Vec<u8> = Vec::new();
-
-        let regions: Vec<&[u8]> = vec![
-            &pk_bytes,
-            as_le_bytes(&weights),
-            as_le_bytes(&nulls),
-            as_le_bytes(values),
-            &blob,
-        ];
-
+        let rows: Vec<(Vec<u8>, i64, i64)> = pks
+            .iter()
+            .zip(values)
+            .map(|(&p, &v)| (p.to_be_bytes().to_vec(), 1, v))
+            .collect();
         let path = dir.join(name);
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        shard_file::write_shard_streaming(
-            libc::AT_FDCWD,
-            &cpath,
-            n as u32,
-            &regions,
+        shard_file::write_test_shard(
+            &path,
             &make_schema_u64_i64(),
+            &rows,
             shard_file::ShardWriteOpts::default(),
-        )
-        .unwrap();
+        );
         path.to_str().unwrap().to_string()
     }
 
@@ -400,7 +374,7 @@ mod tests {
     fn test_add_unsynced_shard_and_find_pk() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         let path1 = write_test_shard(dir.path(), "s1.db", &[10, 20, 30], &[100, 200, 300]);
         let path2 = write_test_shard(dir.path(), "s2.db", &[25, 35, 40], &[250, 350, 400]);
@@ -427,7 +401,7 @@ mod tests {
     fn test_manifest_roundtrip_with_levels() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         // Add enough shards to trigger compaction to L1
         for i in 0..5u64 {
@@ -443,7 +417,7 @@ mod tests {
         publish_manifest(&idx, &manifest_path);
 
         // Load into a fresh index
-        let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
         idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
 
         // Verify all keys are findable in the new index
@@ -469,7 +443,7 @@ mod tests {
     fn test_run_compact_l0_to_l1() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         // Add > L0_COMPACT_THRESHOLD shards
         let mut all_pks = Vec::new();
@@ -502,7 +476,7 @@ mod tests {
     fn test_compact_guards_if_needed() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         // Manually populate L1 with > GUARD_FILE_THRESHOLD entries in one guard
         idx.ensure_level(0); // L1
@@ -512,7 +486,7 @@ mod tests {
             let name = format!("guard_s{i}.db");
             let pk = i + 1;
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
-            let entry = ShardEntry::open(&path, &schema, 100).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 100, true).unwrap();
             guard.entries.push(entry);
             all_pks.push(pk);
         }
@@ -535,19 +509,19 @@ mod tests {
     fn test_compact_guard_vertical_failure_leaves_index_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
         idx.ensure_level(0); // L1
 
         // Build a guard at key 0 with 3 entries.
         for i in 0..3u64 {
             let path = write_test_shard(dir.path(), &format!("src_{i}.db"), &[i + 1], &[(i as i64 + 1) * 10]);
-            let e = ShardEntry::open(&path, &schema, 100).unwrap();
+            let e = ShardEntry::open(&path, &schema, 100, true).unwrap();
             idx.levels[0].get_or_create_guard(0).entries.push(e);
         }
         // Second guard so worst_count > 1 condition is met in compact_guard_vertical
         {
             let path = write_test_shard(dir.path(), "other.db", &[9999], &[42]);
-            let e = ShardEntry::open(&path, &schema, 50).unwrap();
+            let e = ShardEntry::open(&path, &schema, 50, true).unwrap();
             idx.levels[0].get_or_create_guard(5000).entries.push(e);
         }
 
@@ -586,12 +560,12 @@ mod tests {
         // an L0→L1 compaction.
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         // L1 already has a guard at key 100 (keys 100, 200).
         idx.ensure_level(0); // L1
         let path = write_test_shard(dir.path(), "l1_g100.db", &[100, 200], &[1000, 2000]);
-        let entry = ShardEntry::open(&path, &schema, 1).unwrap();
+        let entry = ShardEntry::open(&path, &schema, 1, true).unwrap();
         idx.levels[0].get_or_create_guard(100).entries.push(entry);
 
         // Insert 5 L0 shards (> L0_COMPACT_THRESHOLD) with keys all below 100.
@@ -644,7 +618,7 @@ mod tests {
     fn test_try_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         // Create real files
         let path1 = write_test_shard(dir.path(), "cleanup1.db", &[1], &[10]);
@@ -673,9 +647,9 @@ mod tests {
     fn test_unsynced_tracking_register_prune_clear() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
-        assert!(idx.unsynced_paths().is_empty());
+        assert!(idx.unsynced_paths().next().is_none());
         let mut spills = Vec::new();
         for i in 0..5u64 {
             let pk = (i + 1) * 10;
@@ -683,7 +657,7 @@ mod tests {
             idx.add_unsynced_shard(&p, i + 1).unwrap();
             spills.push(p);
         }
-        assert_eq!(idx.unsynced_paths().len(), 5, "registration marks, on its own");
+        assert_eq!(idx.unsynced_paths().count(), 5, "registration marks, on its own");
 
         assert!(idx.should_compact());
         idx.run_compact().unwrap();
@@ -693,24 +667,57 @@ mod tests {
         );
         for p in &spills {
             assert!(
-                !idx.unsynced_paths().contains(p),
+                !idx.unsynced_paths().any(|q| q == p),
                 "consumed input {p} must leave the unsynced set"
             );
         }
         assert!(
-            !idx.unsynced_paths().is_empty(),
+            idx.unsynced_paths().next().is_some(),
             "the compaction outputs are themselves unsynced until a barrier sweeps them"
         );
 
         idx.clear_unsynced();
-        assert!(idx.unsynced_paths().is_empty());
+        assert!(idx.unsynced_paths().next().is_none());
+    }
+
+    /// The two ways an entry reaches the index with no write behind it: a
+    /// manifest reload, and the re-`mmap` a widening ALTER stages. Neither owes
+    /// a sweep, and both are questions about how the entry was built.
+    #[test]
+    fn reload_and_widen_owe_no_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
+        for i in 0..3u64 {
+            let p = write_test_shard(dir.path(), &format!("shard_42_{i}.db"), &[i * 10 + 1], &[i as i64]);
+            idx.add_unsynced_shard(&p, i + 1).unwrap();
+        }
+        let manifest_path = dir.path().join("MANIFEST");
+        publish_manifest(&idx, &manifest_path);
+
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
+        idx.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+        assert!(idx.unsynced_paths().next().is_none(), "a manifest names durable files");
+
+        let wide = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let staged = idx.reopen_all(&wide).unwrap();
+        assert_eq!(staged.len(), 3, "a payload widen re-opens every shard");
+        idx.install_reopened(staged, wide);
+        assert!(idx.unsynced_paths().next().is_none(), "a re-mmap moves no durability");
     }
 
     #[test]
     fn test_max_lsn() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         assert_eq!(idx.max_lsn(), 0);
 
@@ -737,7 +744,7 @@ mod tests {
 
         // Output dir that does not exist: the finalizing write fails.
         let missing_out_dir = dir.path().join("no_such_dir");
-        let mut idx = ShardIndex::new(42, missing_out_dir.to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, missing_out_dir.to_str().unwrap(), schema, false);
 
         // Add L0_COMPACT_THRESHOLD + 1 shards (triggers compaction).
         let mut all_pks = Vec::new();
@@ -774,7 +781,7 @@ mod tests {
     fn test_compact_guard_vertical_routing_gap() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         // Build L1 (levels[0]) and L2 (levels[1])
         idx.ensure_level(1); // L2
@@ -784,21 +791,21 @@ mod tests {
         for (i, &pk) in src_pks.iter().enumerate() {
             let name = format!("src_{i}.db");
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
-            let entry = ShardEntry::open(&path, &schema, 100).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 100, true).unwrap();
             idx.levels[0].get_or_create_guard(100).entries.push(entry);
         }
 
         // L1 guard at key=500: 1 shard (so worst_guard picks key=100)
         {
             let path = write_test_shard(dir.path(), "high.db", &[500], &[5000]);
-            let entry = ShardEntry::open(&path, &schema, 50).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 50, true).unwrap();
             idx.levels[0].get_or_create_guard(500).entries.push(entry);
         }
 
         // L2 guard at key=200: 1 shard with key=250
         {
             let path = write_test_shard(dir.path(), "dest.db", &[250], &[2500]);
-            let entry = ShardEntry::open(&path, &schema, 80).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 80, true).unwrap();
             idx.levels[1].get_or_create_guard(200).entries.push(entry);
         }
 
@@ -830,7 +837,7 @@ mod tests {
     fn test_vertical_disjoint_guards_no_name_collision() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
         idx.ensure_level(1); // L2
 
         // Key 250 routes to the gk(100) bucket; 6000 to the gk(5000) bucket.
@@ -840,7 +847,7 @@ mod tests {
             idx.levels[0]
                 .get_or_create_guard(gk(100))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100, true).unwrap());
         }
         // L1 guard gk(5000): two entries (keys 5000, 5010).
         for (i, &k) in [5000u64, 5010].iter().enumerate() {
@@ -848,7 +855,7 @@ mod tests {
             idx.levels[0]
                 .get_or_create_guard(gk(5000))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100, true).unwrap());
         }
         // L2 pre-seed: guard gk(100) (key 250) and guard gk(5000) (key 6000) at the
         // same max_lsn, so both vertical calls compute the identical `vert_max_lsn`
@@ -858,12 +865,12 @@ mod tests {
             idx.levels[1]
                 .get_or_create_guard(gk(100))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100, true).unwrap());
             let p = write_test_shard(dir.path(), "l2b.db", &[6000], &[60000]);
             idx.levels[1]
                 .get_or_create_guard(gk(5000))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100, true).unwrap());
         }
 
         // Call 1 folds L1 guard 100 → L2 guard 100; call 2 folds L1 guard 5000 →
@@ -886,7 +893,7 @@ mod tests {
         // Publish + reload into a fresh index: every key must survive.
         let manifest_path = dir.path().join("MANIFEST");
         publish_manifest(&idx, &manifest_path);
-        let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
         idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
         for k in [100u64, 110, 5000, 5010, 250, 6000] {
             let mut found = false;
@@ -905,7 +912,7 @@ mod tests {
     fn test_vertical_same_guard_recompaction_try_cleanup_keeps_live() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
         idx.ensure_level(1); // L2
 
         // L2 guard gk(100) pre-seeded with key 250.
@@ -914,7 +921,7 @@ mod tests {
             idx.levels[1]
                 .get_or_create_guard(gk(100))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100, true).unwrap());
         }
         // L1 guard gk(100): two entries (keys 100, 110).
         for (i, &k) in [100u64, 110].iter().enumerate() {
@@ -922,7 +929,7 @@ mod tests {
             idx.levels[0]
                 .get_or_create_guard(gk(100))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100, true).unwrap());
         }
         idx.compact_guard_vertical().unwrap();
 
@@ -933,7 +940,7 @@ mod tests {
             idx.levels[0]
                 .get_or_create_guard(gk(100))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100, true).unwrap());
         }
         idx.compact_guard_vertical().unwrap();
 
@@ -949,7 +956,7 @@ mod tests {
         // Publish + reload: every key survives.
         let manifest_path = dir.path().join("MANIFEST");
         publish_manifest(&idx, &manifest_path);
-        let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
         idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
         for k in [100u64, 110, 120, 130, 250] {
             let mut found = false;
@@ -965,7 +972,7 @@ mod tests {
     fn test_gc_orphans_removes_stale_shard() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         // Write a live shard and add it to the index.
         let live_path = write_test_shard(dir.path(), "shard_42_1.db", &[10], &[100]);
@@ -985,7 +992,7 @@ mod tests {
     fn test_gc_orphans_ignores_other_table_id() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         // Files belonging to a different table must not be touched.
         let other_path = dir.path().join("shard_99_1.db");
@@ -1006,7 +1013,7 @@ mod tests {
     fn test_gc_orphans_removes_manifest_tmp() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         let tmp_path = dir.path().join("manifest.bin.tmp");
         std::fs::write(&tmp_path, b"stray").unwrap();
@@ -1020,7 +1027,7 @@ mod tests {
     fn test_gc_orphans_removes_tmp_suffix_orphans() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
-        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         let shard_tmp = dir.path().join("shard_42_5.db.tmp");
         std::fs::write(&shard_tmp, b"half-written").unwrap();
@@ -1038,7 +1045,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         // Empty index — no load_manifest call.
-        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
         let stray = dir.path().join("shard_42_7.db");
         std::fs::write(&stray, b"orphan").unwrap();
@@ -1056,8 +1063,8 @@ mod tests {
 
         let p_lo = write_test_shard(dir.path(), "lo.db", &[10, 20], &[1, 2]);
         let p_hi = write_test_shard(dir.path(), "hi.db", &[30, 40], &[3, 4]);
-        let e_lo = ShardEntry::open(&p_lo, &schema, 1).unwrap();
-        let e_hi = ShardEntry::open(&p_hi, &schema, 1).unwrap();
+        let e_lo = ShardEntry::open(&p_lo, &schema, 1, true).unwrap();
+        let e_hi = ShardEntry::open(&p_hi, &schema, 1, true).unwrap();
 
         // Range gate: in-range key passes (and resolves), out-of-range
         // key is pruned. OPK for a U64 PK is the value's big-endian bytes.
@@ -1067,7 +1074,7 @@ mod tests {
         assert!(probe(&e_hi, &5u64.to_be_bytes()).is_none(), "5 below [30,40]");
 
         // L0 sort orders by pk_min, empty entries last (golden order).
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
         let p_empty = write_test_shard(dir.path(), "empty.db", &[], &[]);
         idx.add_unsynced_shard(&p_hi, 1).unwrap();
         idx.add_unsynced_shard(&p_lo, 1).unwrap();
@@ -1092,14 +1099,14 @@ mod tests {
 
         let single = make_schema_u64_i64();
         let p = write_test_shard(dir.path(), "e_single.db", &[], &[]);
-        let e = ShardEntry::open(&p, &single, 0).unwrap();
+        let e = ShardEntry::open(&p, &single, 0, true).unwrap();
         assert!(e.is_empty());
         assert!(probe(&e, &0u64.to_be_bytes()).is_none());
         assert!(probe(&e, &u64::MAX.to_be_bytes()).is_none());
 
         let compound = compound_schema();
         let pc = write_compound_shard(dir.path(), "e_compound.db", &[], &[]);
-        let ec = ShardEntry::open(&pc, &compound, 0).unwrap();
+        let ec = ShardEntry::open(&pc, &compound, 0, true).unwrap();
         assert!(ec.is_empty());
         assert_eq!(ec.pk_min.len, compound.pk_stride());
         // Short-circuits before the stride assert / pk_in_range.
@@ -1148,7 +1155,7 @@ mod tests {
         // the stride assert + pk_in_range wiring).
         let dir = tempfile::tempdir().unwrap();
         let p = write_compound_shard(dir.path(), "compound.db", &[(1, 5), (1, 9), (2, 3)], &[10, 20, 30]);
-        let entry = ShardEntry::open(&p, &schema, 1).unwrap();
+        let entry = ShardEntry::open(&p, &schema, 1, true).unwrap();
         assert_eq!(entry.pk_min.pk_bytes(), &opk2(1, 5));
         assert_eq!(entry.pk_max.pk_bytes(), &opk2(2, 3));
         assert!(
@@ -1177,7 +1184,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = wide_schema();
         assert_eq!(schema.pk_stride(), 24);
-        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
         assert_eq!(idx.l1_guard_keys(), vec![0]);
     }
 
@@ -1186,40 +1193,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A `(U64 PK | I64)` shard of `pks`, all weight 1, payload = pk.
-    fn write_u64_shard(dir: &std::path::Path, name: &str, pks: &[u64]) -> String {
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
-        let weights = vec![1i64; pks.len()];
-        let nulls = vec![0u64; pks.len()];
-        let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
-        let blob: Vec<u8> = Vec::new();
-        let regions: Vec<&[u8]> = vec![
-            &pk_bytes,
-            as_le_bytes(&weights),
-            as_le_bytes(&nulls),
-            as_le_bytes(&vals),
-            &blob,
-        ];
-        let path = dir.join(name);
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        shard_file::write_shard_streaming(
-            libc::AT_FDCWD,
-            &cpath,
-            pks.len() as u32,
-            &regions,
-            &make_schema_u64_i64(),
-            shard_file::ShardWriteOpts::default(),
-        )
-        .unwrap();
-        path.to_str().unwrap().to_string()
-    }
-
     /// An index holding `n` L0 shards of 40 distinct keys each, spill-stamped
     /// with ascending LSNs so write-recency victim ordering is observable.
     fn index_with_l0(dir: &std::path::Path, n: u64) -> ShardIndex {
-        let mut idx = ShardIndex::new(1, dir.to_str().unwrap(), make_schema_u64_i64());
+        let mut idx = ShardIndex::new(1, dir.to_str().unwrap(), make_schema_u64_i64(), false);
         for s in 0..n {
             let pks: Vec<u64> = (0..40).map(|i| s * 1000 + i + 1).collect();
-            let p = write_u64_shard(dir, &format!("l0_{s}.db"), &pks);
+            let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+            let p = write_test_shard(dir, &format!("l0_{s}.db"), &pks, &vals);
             idx.add_unsynced_shard(&p, s + 1).unwrap();
         }
         idx
@@ -1348,11 +1329,12 @@ mod tests {
     #[test]
     fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64());
+        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64(), false);
         // One key band, so every later fold routes back into the same guard.
         for s in 0..2u64 {
             let pks: Vec<u64> = (0..20).map(|i| i + 1).collect();
-            let p = write_u64_shard(tmp.path(), &format!("a{s}.db"), &pks);
+            let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+            let p = write_test_shard(tmp.path(), &format!("a{s}.db"), &pks, &vals);
             idx.add_unsynced_shard(&p, s + 1).unwrap();
         }
         idx.run_compact().unwrap();
@@ -1362,7 +1344,9 @@ mod tests {
         assert!(terminal_split(&idx).0.contains(&0), "guard 0 is dehydrated");
 
         // New hydrated data over the same keys, folded down by the ordinary path.
-        let p = write_u64_shard(tmp.path(), "b.db", &(0..20).map(|i| i + 1).collect::<Vec<_>>());
+        let pks: Vec<u64> = (0..20).map(|i| i + 1).collect();
+        let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+        let p = write_test_shard(tmp.path(), "b.db", &pks, &vals);
         idx.add_unsynced_shard(&p, 99).unwrap();
         idx.run_compact().unwrap();
         idx.vertical_fold(0).unwrap();
@@ -1381,11 +1365,12 @@ mod tests {
     #[test]
     fn vertical_fold_touches_only_the_guards_its_extent_overlaps() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64());
+        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64(), false);
         // Three well-separated key bands → three terminal guards.
         for (s, base) in [(0u64, 1u64), (1, 10_000), (2, 20_000)] {
             let pks: Vec<u64> = (0..10).map(|i| base + i).collect();
-            let p = write_u64_shard(tmp.path(), &format!("s{s}.db"), &pks);
+            let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+            let p = write_test_shard(tmp.path(), &format!("s{s}.db"), &pks, &vals);
             idx.add_unsynced_shard(&p, s + 1).unwrap();
         }
         idx.run_compact().unwrap();
@@ -1401,7 +1386,7 @@ mod tests {
 
         // A new lowest-band spill: the only L1 guard, so the old spelling would
         // route into every terminal guard at or above its key — all three.
-        let p = write_u64_shard(tmp.path(), "late.db", &[2, 3]);
+        let p = write_test_shard(tmp.path(), "late.db", &[2, 3], &[2, 3]);
         idx.add_unsynced_shard(&p, 50).unwrap();
         idx.run_compact().unwrap();
         assert_eq!(idx.levels[0].guards.len(), 1, "one L1 guard");

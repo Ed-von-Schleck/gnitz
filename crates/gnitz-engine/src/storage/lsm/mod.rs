@@ -22,7 +22,6 @@ pub(super) mod index_gather;
 pub(super) mod manifest;
 pub(super) mod read_cursor;
 pub(super) mod repartition;
-pub(super) mod spill;
 pub(super) mod table;
 
 // LSM-internal only (`shard_reader` is storage-visible: the repr codec tests

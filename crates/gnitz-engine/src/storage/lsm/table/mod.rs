@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
+use std::os::fd::OwnedFd;
 use std::rc::Rc;
 
 use super::batch::Batch;
@@ -31,12 +32,11 @@ use crate::schema::SchemaDescriptor;
 ///
 /// Swept at the **production** checkpoint cadence (`GNITZ_SAL_BYTES` at its 1 GiB
 /// default, threshold 75% of it), 4M rows, W=4, btrfs: at 4 MiB a worker's single
-/// store wrote 98.7 MB of RAM-tier spill per 4M rows (~25 B/row) that the old
-/// 256-child-per-relation layout did not; at 32 MiB that spill is gone and
-/// throughput sits 23–28% above that layout, for +45 MB of cluster RSS. An
-/// earlier sweep found this constant flat from 4 to 128 MiB, but ran at a 4 MiB
-/// checkpoint threshold — 192× more frequent than production — which drains the
-/// tier continuously and is exactly the regime where the ceiling cannot bind.
+/// store wrote 98.7 MB of RAM-tier spill per 4M rows (~25 B/row); at 32 MiB that
+/// spill is gone, for +45 MB of cluster RSS. An earlier sweep found this constant
+/// flat from 4 to 128 MiB, but ran at a 4 MiB checkpoint threshold — 192× more
+/// frequent than production — which drains the tier continuously and is exactly
+/// the regime where the ceiling cannot bind.
 ///
 /// Spilling past the ceiling stays the intended safety valve; 32 MiB is where
 /// ordinary ingest stops reaching it, not a promise that nothing will.
@@ -244,7 +244,8 @@ impl Table {
         // unusable one fails here — a client-visible rejection on the master's
         // CREATE VIEW pre-flight, where a first-flush failure would instead be a
         // worker abort with no client left to tell.
-        set_nocow_dir(&ensure_dir(dir)?); // NOCOW is btrfs-only, ignored elsewhere
+        // The fd is dropped: a relation pins none at rest.
+        open_table_dirfd(dir)?;
         let load_shards = match recovery_source {
             RecoverySource::SalReplay => true,
             // Resume only from the generation the caller named; otherwise erase
@@ -264,7 +265,14 @@ impl Table {
             // Fold at 3/4 of the arena so the next ingest batch always fits.
             memtable: RunSet::new(arena_size as usize * 3 / 4),
             ram_tier: RunSet::new(inmem_ceiling()),
-            shard_index: ShardIndex::new(table_id, dir, schema),
+            // Only a `SalReplay` store is point-probed by PK, so only it needs
+            // the XOR8 filters its shards would otherwise all carry.
+            shard_index: ShardIndex::new(
+                table_id,
+                dir,
+                schema,
+                matches!(recovery_source, RecoverySource::Rederive { .. }),
+            ),
             schema,
             table_id,
             directory: dir.to_string(),
@@ -328,7 +336,8 @@ impl Table {
     /// re-stamps the manifest over them.
     pub(crate) fn base_round_advances_publish(&self) -> bool {
         !self.is_rederived()
-            && (self.ram_tiers().iter().any(|s| s.row_count() > 0) || !self.shard_index.unsynced_paths().is_empty())
+            && (self.ram_tiers().iter().any(|s| s.row_count() > 0)
+                || self.shard_index.unsynced_paths().next().is_some())
     }
 
     /// Whether this open reloaded checkpointed state rather than starting empty.
@@ -667,11 +676,20 @@ pub(crate) fn ensure_dir(dir: &str) -> Result<CString, StorageError> {
     Ok(dir_c)
 }
 
-fn set_nocow_dir(dir_c: &CStr) {
+/// Open a table's directory, creating it if absent — the one way in, for both
+/// the construction check and every file write. NOCOW (btrfs; ignored elsewhere)
+/// is applied to every opened fd, so it also covers directories the catalog's
+/// layout staging pre-created; `try_set_nocow` skips the write when the flag is
+/// already set, and the re-application is a btrfs transaction commit.
+pub(super) fn open_table_dirfd(dir: &str) -> Result<OwnedFd, StorageError> {
     use std::os::fd::AsRawFd;
-    if let Ok(fd) = crate::foundation::posix_io::open_owned(dir_c, libc::O_RDONLY) {
-        crate::foundation::posix_io::try_set_nocow(fd.as_raw_fd());
-    }
+    let open = |c: &CStr| crate::foundation::posix_io::open_owned(c, libc::O_RDONLY | libc::O_DIRECTORY);
+    let fd = match open(&super::super::cstr(dir)?) {
+        Ok(fd) => fd,
+        Err(_) => open(&ensure_dir(dir)?)?,
+    };
+    crate::foundation::posix_io::try_set_nocow(fd.as_raw_fd());
+    Ok(fd)
 }
 
 /// Drop a rederived table's on-disk state: this table's shard files (the
@@ -719,12 +737,14 @@ mod tests {
     /// (`shard_{tid}_{seq}_L{n}_G{guard}.db`, distinguished by the `_L` level
     /// marker).
     fn shard_db_files(dir: &std::path::Path, table_id: u32) -> Vec<String> {
-        let prefix = format!("shard_{table_id}_");
+        let prefix = super::super::naming::shard_prefix(table_id);
         std::fs::read_dir(dir)
             .map(|rd| {
                 rd.flatten()
                     .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with(&prefix) && n.ends_with(".db") && !n.contains("_L"))
+                    .filter(|n| {
+                        n.starts_with(&prefix) && n.ends_with(".db") && !super::super::naming::is_compaction_output(n)
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -741,13 +761,15 @@ mod tests {
     /// `shard_{tid}_{seq}_L{n}_G{gk}.db`; the `_L` marker distinguishes them
     /// from flat spill/barrier shards. Presence proves a compaction ran.
     fn compaction_output_count(dir: &std::path::Path, table_id: u32) -> usize {
-        let shard = format!("shard_{table_id}_");
-        count_files(dir, |n| n.starts_with(&shard) && n.contains("_L"))
+        let shard = super::super::naming::shard_prefix(table_id);
+        count_files(dir, |n| {
+            n.starts_with(&shard) && super::super::naming::is_compaction_output(n)
+        })
     }
 
     /// Count every on-disk shard/compaction-output file for `table_id`.
     fn all_shard_file_count(dir: &std::path::Path, table_id: u32) -> usize {
-        let shard = format!("shard_{table_id}_");
+        let shard = super::super::naming::shard_prefix(table_id);
         count_files(dir, |n| n.starts_with(&shard))
     }
 
@@ -2439,7 +2461,7 @@ mod tests {
             let mut t = new_table(&tdir, schema, 7902, 128, RecoverySource::SalReplay);
             t.set_inmem_ceiling_for_test(100);
             // Five spills put L0 over the threshold, and the fifth registration
-            // compacts — so the last thing to touch `unsynced` is that compaction.
+            // compacts — so the last thing to leave a file unswept is that compaction.
             for r in 0..5u64 {
                 let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
                 t.ingest_owned_batch(make_batch(&rows)).unwrap();
@@ -2460,7 +2482,7 @@ mod tests {
                         .collect();
                     assert!(!swept.is_empty(), "the compaction outputs must be swept");
                     assert!(
-                        swept.iter().all(|p| p.contains("_L")),
+                        swept.iter().all(|p| super::super::naming::is_compaction_output(p)),
                         "the superseded inputs must have left the sweep list, got {swept:?}",
                     );
                 }
@@ -2556,5 +2578,52 @@ mod tests {
                 assert!(t2.has_pk((r * 100 + k) as u128), "row survives flush-drain + reopen");
             }
         }
+    }
+
+    /// Only base-table paths point-probe a store by PK, and they are the only
+    /// readers of a shard's XOR8 filter. Silent both ways: a missing filter
+    /// still answers every probe (just slower), a useless one costs only bytes.
+    #[test]
+    fn pk_filter_follows_whether_the_store_is_probed() {
+        let schema = make_schema_u64_i64();
+        // Five ceiling breaches: each spills an L0 shard, and the fifth crosses
+        // the L0 threshold — so one store drives both shard writers.
+        let build = |dir: &std::path::Path, id: u32, rs: RecoverySource| {
+            let mut t = new_table(dir, schema, id, 128, rs);
+            t.set_inmem_ceiling_for_test(100);
+            for r in 0..5u64 {
+                let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
+                t.ingest_owned_batch(make_batch(&rows)).unwrap();
+            }
+            assert!(compaction_output_count(dir, id) > 0, "the spills drove a compaction");
+            t
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let base = build(&dir.path().join("base"), 8100, RecoverySource::SalReplay);
+        let shards = base.all_shard_arcs();
+        assert!(shards.len() > 1, "spills and compaction outputs both present");
+        assert!(
+            shards.iter().all(|s| s.has_xor8()),
+            "a probed store filters every shard"
+        );
+
+        let reder = build(
+            &dir.path().join("rederive"),
+            8101,
+            RecoverySource::Rederive { resume_at: None },
+        );
+        assert!(
+            reder.all_shard_arcs().iter().all(|s| !s.has_xor8()),
+            "a store nothing probes builds no filter",
+        );
+        assert!(
+            reder.has_pk_bytes(&404u64.to_be_bytes()),
+            "filterless shards still answer"
+        );
+        assert!(
+            !reder.has_pk_bytes(&9999u64.to_be_bytes()),
+            "and still reject absent keys"
+        );
     }
 }

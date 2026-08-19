@@ -8,6 +8,7 @@
 //! helpers.
 
 use std::cell::Cell;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 
 use super::super::batch::{write_to_batch, Batch, Layout};
@@ -85,6 +86,25 @@ impl Drop for DrainGuard {
     }
 }
 
+/// How much of the merge stream one drain takes. Also decides the output blob
+/// arena, which is not separately spellable: `All` reserves every source's heap
+/// (a tight bound), `Rows` grows on demand rather than reserving the whole
+/// relation per chunk.
+#[derive(Clone, Copy)]
+pub(super) enum Drain {
+    All,
+    Rows(NonZeroUsize),
+}
+
+impl Drain {
+    fn max_rows(self) -> usize {
+        match self {
+            Drain::All => usize::MAX,
+            Drain::Rows(n) => n.get(),
+        }
+    }
+}
+
 impl ReadCursor {
     /// Copy the current row into `batch` with an explicit weight, downgrading
     /// `batch`'s layout to `Raw` (the shared appender does this — any append can
@@ -123,12 +143,11 @@ impl ReadCursor {
         );
     }
 
-    /// Drain up to `limit` net rows in merge order into an owned `Batch`
-    /// (sorted + consolidated). `limit == 0` means unbounded. Returns `None`
-    /// once the cursor is exhausted / nothing drained. Single owner of the
-    /// drain → scatter → flag pipeline shared by `materialize` and
-    /// `drain_chunk`.
-    pub(super) fn drain_to_batch(&mut self, limit: usize) -> Option<Batch> {
+    /// Drain net rows in merge order into an owned `Batch` (sorted +
+    /// consolidated), as far as `limit` allows. Returns `None` once the cursor
+    /// is exhausted / nothing drained. Single owner of the drain → scatter →
+    /// flag pipeline shared by `materialize` and `drain_chunk`.
+    pub(super) fn drain_to_batch(&mut self, limit: Drain) -> Option<Batch> {
         if !self.valid {
             return None;
         }
@@ -145,10 +164,11 @@ impl ReadCursor {
         if merge_order.is_empty() {
             return None;
         }
-        // Full drains: `total_blob_len()` is a tight upper bound. Chunked
-        // drains: pass 0 and let `DirectWriter` grow the blob on demand
-        // (reserving the whole relation's blob arena per chunk otherwise).
-        let blob_cap = if limit == 0 { self.total_blob_len() } else { 0 };
+        // After the early-outs, so the sum costs nothing on paths that skip it.
+        let blob_cap = match limit {
+            Drain::All => self.total_blob_len(),
+            Drain::Rows(_) => 0,
+        };
         let mut batch = write_to_batch(&self.schema, merge_order.len(), blob_cap, |writer| {
             self.scatter_drained_into(&merge_order, writer)
         });
@@ -175,7 +195,7 @@ impl ReadCursor {
                 }
             }
         }
-        self.drain_to_batch(0)
+        self.drain_to_batch(Drain::All)
             .map(Rc::new)
             .unwrap_or_else(|| Rc::new(Batch::empty_with_schema(&self.schema)))
     }
@@ -187,9 +207,11 @@ impl ReadCursor {
     ///
     /// DDL backfills and uniqueness scans call this in a loop instead of
     /// `materialize` so peak memory is O(chunk) instead of O(relation).
+    ///
+    /// A zero-row chunk drains nothing, so the count keeps its plain `usize`
+    /// meaning here.
     pub(crate) fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        debug_assert!(max_rows > 0, "drain_chunk: 0 means unlimited in the drain helpers");
-        self.drain_to_batch(max_rows)
+        self.drain_to_batch(Drain::Rows(NonZeroUsize::new(max_rows)?))
     }
 
     /// Bulk-drain a cursor with exactly one live source into a Batch, bypassing
@@ -200,9 +222,7 @@ impl ReadCursor {
     /// sources have an empty `[position, count)` window, so nothing they hold can
     /// fold against the drained rows — which is the precondition this bulk copy
     /// actually needs.
-    ///
-    /// `limit == 0` means drain all remaining rows.
-    pub(super) fn drain_single_source(&mut self, limit: usize) -> Option<Batch> {
+    pub(super) fn drain_single_source(&mut self, limit: Drain) -> Option<Batch> {
         let SourceMode::Single(i) = self.mode else {
             return None;
         };
@@ -213,31 +233,14 @@ impl ReadCursor {
         // emitted it already stepped `position` past it.
         let start = self.current_row;
         let remaining = self.states[i].count - start;
-        let row_count = if limit > 0 { remaining.min(limit) } else { remaining };
+        let row_count = remaining.min(limit.max_rows());
         let schema = &self.schema;
 
-        let batch = match &self.sources[i] {
-            Run::Mem(b) => {
-                // A verbatim slice copy — neither sorts nor consolidates — so it
-                // carries the source's own flags rather than asserting them. (In
-                // practice every cursor-source batch is already consolidated; see
-                // the note in `drain_to_batch`. This helper relies on neither.)
-                //
-                // Both blob arms are available here, so the same predicate the
-                // shard arm below uses picks between them: share the source's heap
-                // verbatim, or relocate only the drained rows' strings.
-                let mut out = Batch::with_capacity(*schema, row_count.max(1));
-                if !Batch::should_relocate_blob(row_count, b.count, b.blob.len()) {
-                    out.share_blob_from(b);
-                }
-                out.append_ranges(b, &[(start, start + row_count)]);
-                // A contiguous slice of a sorted/consolidated source preserves its
-                // layout (faithful); `append_ranges` downgraded `out` to `Raw` first.
-                out.inherit_layout(b);
-                out
-            }
-            Run::Shard(s) => s.slice_to_owned_batch(start, row_count, schema),
-        };
+        // A verbatim slice copy — neither sorts nor consolidates — so it carries
+        // whatever the backing can claim. (In practice every cursor-source batch
+        // is already consolidated; see the note in `drain_to_batch`. This helper
+        // relies on neither.)
+        let batch = self.sources[i].slice_to_owned_batch(start, row_count, schema);
 
         // Advance position past the drained rows
         self.states[i].position = start + row_count;
@@ -253,8 +256,8 @@ impl ReadCursor {
     }
 
     /// Walk the merge order and fill `out` with `(entry_idx, row_idx, weight)`
-    /// for every row whose net consolidated weight is non-zero.  Drains up to
-    /// `limit` rows (`limit == 0` means unlimited).  Clears `out` first.
+    /// for every row whose net consolidated weight is non-zero, as far as
+    /// `limit` allows.  Clears `out` first.
     ///
     /// The buffered weight is the **net** weight produced by the merge —
     /// callers must not read it back from the exemplar source's stored weight,
@@ -262,21 +265,22 @@ impl ReadCursor {
     /// Callers needing custom termination (group-bounded iteration, predicate
     /// filters) collect into a local `Vec` instead — this helper only supports
     /// row-count and full-cursor termination.
-    fn drain_sorted_into(&mut self, limit: usize, out: &mut Vec<(u32, u32, i64)>) {
+    fn drain_sorted_into(&mut self, limit: Drain, out: &mut Vec<(u32, u32, i64)>) {
         with_payload_cmp!(self.schema, Self::drain_sorted_into_with, self, limit, out);
     }
 
     #[inline]
     fn drain_sorted_into_with<RowCmp: RowComparator>(
         &mut self,
-        limit: usize,
+        limit: Drain,
         out: &mut Vec<(u32, u32, i64)>,
         row_cmp: RowCmp,
     ) {
         out.clear();
+        let cap = limit.max_rows();
         let mut count = 0usize;
         while self.valid {
-            if limit > 0 && count >= limit {
+            if count >= cap {
                 break;
             }
             let w = self.current_weight;

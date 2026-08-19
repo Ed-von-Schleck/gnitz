@@ -622,6 +622,16 @@ fn repartition_handles_a_relation_with_empty_children() {
     let engine = CatalogEngine::open(&dir, 2).unwrap();
     let got = set_rows(&rel, 2, schema, tid);
     assert_eq!(got.len(), 20, "every row survives a relayout off a skewed set");
+    // The relayout is a second shard writer, and it writes *base* shards — the
+    // one kind that is point-probed, so its output must carry a PK filter.
+    let relaid: Vec<_> = (0..2)
+        .flat_map(|k| open_child(&rel, k, 2, schema, tid).all_shard_arcs())
+        .collect();
+    assert!(!relaid.is_empty(), "the relayout wrote shards");
+    assert!(
+        relaid.iter().all(|s| s.has_xor8()),
+        "a relayout writes probed base shards",
+    );
     assert!(got.iter().all(|&(_, _, w)| w == 1), "no row may double");
     let mut pks: Vec<u128> = got.iter().map(|&(_, pk, _)| pk).collect();
     pks.sort_unstable();

@@ -28,12 +28,25 @@ pub(super) fn compact_shard_name(table_id: u32, compact_seq: u64, level_num: usi
     name
 }
 
+/// Basename prefix both grammars share; `.tmp` leftovers match it too. The one
+/// way to ask "does this file belong to `table_id`".
+pub(super) fn shard_prefix(table_id: u32) -> String {
+    format!("shard_{table_id}_")
+}
+
+/// Compaction output rather than flat spill? The `_L` level segment separates the
+/// two grammars. Only tests ask — production reads each shard's level off the
+/// manifest.
+#[cfg(test)]
+pub(super) fn is_compaction_output(name: &str) -> bool {
+    name.contains("_L")
+}
+
 /// Remove every one of `table_id`'s shard files in `dir` whose basename is not
-/// in `keep` (both grammars share the `shard_{tid}_` prefix; `.tmp` leftovers
-/// of half-written shards match it too). `keep = ∅` erases them all. Returns
-/// the number of matching files attempted, best-effort per file.
+/// in `keep`. `keep = ∅` erases them all. Returns the number of matching files
+/// attempted, best-effort per file.
 pub(super) fn remove_shard_files(dir: &str, table_id: u32, keep: &HashSet<&str>) -> usize {
-    let prefix = format!("shard_{table_id}_");
+    let prefix = shard_prefix(table_id);
     let mut removed = 0usize;
     if let Ok(rd) = std::fs::read_dir(dir) {
         for entry in rd.flatten() {

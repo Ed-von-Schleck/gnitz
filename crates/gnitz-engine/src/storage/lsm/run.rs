@@ -68,6 +68,17 @@ impl Run {
         }
     }
 
+    /// Bulk-copy `[start, start + row_count)` into an owned batch — one memcpy
+    /// per column. The arms differ only in the layout they may claim, which is a
+    /// property of the backing: `Mem` inherits the source's tag, a shard is
+    /// ghost-free by construction and certifies `Consolidated`.
+    pub(crate) fn slice_to_owned_batch(&self, start: usize, row_count: usize, schema: &SchemaDescriptor) -> Batch {
+        match self {
+            Run::Mem(b) => b.slice_to_owned_batch(start, row_count, schema),
+            Run::Shard(s) => s.slice_to_owned_batch(start, row_count, schema),
+        }
+    }
+
     /// Row indices whose PK equals `key`. Runs are PK-sorted, so exact matches
     /// form one contiguous range; iteration is lazy and stops at the first
     /// non-matching row.

@@ -4,9 +4,13 @@
 //! Engine code imports from `crate::storage::{Type, fn}`.
 
 // Internal — not accessible outside storage/
-// L3 LSM lives under `lsm/`; the `StorageError` leaf stays at storage level.
+// L3 LSM lives under `lsm/`. The leaves that belong to no layer stay at storage
+// level: the `StorageError` type, and `spill` — a bounded external merge sort of
+// fixed-stride byte records that touches no batch, schema or shard, and whose one
+// consumer is the runtime's CREATE UNIQUE INDEX pre-flight.
 mod error;
 mod lsm;
+mod spill;
 
 // L2 representation lives under `repr/`. It has no facade of its own; the leaf
 // items are re-exported below and the submodules aliased here so the LSM siblings
@@ -52,10 +56,10 @@ pub(crate) use lsm::index_gather::BoundedIndexCursor;
 pub(crate) use lsm::manifest::{peek_header, topology_word};
 pub(crate) use lsm::read_cursor::{empty as empty_cursor, PkSetGather, ReadCursor};
 pub(crate) use lsm::repartition::repartition_relation;
-pub(crate) use lsm::spill::{KeyProducer, SpillSort};
 pub(crate) use merge::{
     prorated_blob_cap, relocate_german_string_vec, BlobCache, BlobCacheGuard, DirectWriter, RowComparator,
 };
+pub(crate) use spill::{KeyProducer, SpillSort};
 
 /// Convert a path string to a `CString`, mapping an interior NUL to
 /// `InvalidPath` — the one conversion every storage path takes.

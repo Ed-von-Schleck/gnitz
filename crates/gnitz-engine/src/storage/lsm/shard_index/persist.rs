@@ -56,7 +56,9 @@ impl ShardIndex {
             // The manifest stores the basename; the shard lives in this table's
             // directory (`entry_to_raw`). Re-prepend it to recover the path.
             let filename = format!("{}/{}", self.output_dir, raw.filename_str());
-            let entry = ShardEntry::open(&filename, &self.schema, raw.max_lsn)?;
+            // Published manifest ⇒ the barrier that renamed it fdatasync'd this
+            // file first, so it is durable and owes no sweep.
+            let entry = ShardEntry::open(&filename, &self.schema, raw.max_lsn, true)?;
 
             if raw.level == 0 {
                 self.l0.push(entry);

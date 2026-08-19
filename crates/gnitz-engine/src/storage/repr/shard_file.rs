@@ -333,9 +333,13 @@ fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
 /// payload-free shard, whose `schema` must be the PK-only projection of the
 /// relation's schema; set only by compaction's per-guard dehydration. It is a
 /// separate field rather than an alternative to `pack_ints` because the two are
-/// independent policies over one write — as the filter build, which a skeleton
-/// shard gets like any other, already shows. They merely never co-occur today,
-/// since a skeleton's schema has no payload region to pack.
+/// independent policies over one write. They merely never co-occur today, since
+/// a skeleton's schema has no payload region to pack.
+///
+/// `skip_pk_filter` drops the XOR8 PK filter, for a store nothing point-probes.
+/// Named for what it turns *off* so the derived default keeps building one: a
+/// missing filter changes no answer (`xor8_may_contain` admits everything on a
+/// filterless shard), so the wrong default would be invisible to every test.
 ///
 /// Durability is not a per-write choice: the flush barrier fdatasyncs every
 /// registered-unsynced shard in one batched io_uring submission, then fsyncs the
@@ -344,21 +348,55 @@ fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
 pub struct ShardWriteOpts {
     pub pack_ints: bool,
     pub skeleton: bool,
+    pub skip_pk_filter: bool,
 }
 
 impl ShardWriteOpts {
     /// The compaction write policy: FoR-packed integer payload regions. The
     /// differential-test oracles reuse it so they cannot drift from the
-    /// production write.
+    /// production write; compaction itself overrides `skip_pk_filter` per call.
     pub const COMPACTION: Self = ShardWriteOpts {
         pack_ints: true,
         skeleton: false,
+        skip_pk_filter: false,
     };
     /// A dehydrated guard's write: payload-free, so nothing to pack.
     pub const SKELETON: Self = ShardWriteOpts {
         pack_ints: false,
         skeleton: true,
+        skip_pk_filter: false,
     };
+}
+
+/// The one test-side shard writer: build a `Batch` through the typed row API and
+/// hand it to the production [`Batch::write_as_shard`], so region *order* has a
+/// single owner. Rows are `(opk_bytes, weight, i64_payload)` — callers keep their
+/// own PK encoding, which is where the shapes genuinely differ.
+#[cfg(test)]
+pub(in crate::storage) fn write_test_shard(
+    path: &std::path::Path,
+    schema: &SchemaDescriptor,
+    rows: &[(Vec<u8>, i64, i64)],
+    opts: ShardWriteOpts,
+) -> std::ffi::CString {
+    // One payload column is written, so a wider schema would leave later regions
+    // short of `count` and produce a shard the reader cannot make sense of.
+    debug_assert_eq!(
+        schema.num_payload_cols(),
+        1,
+        "write_test_shard fills exactly one payload column"
+    );
+    let mut b = super::batch::Batch::with_capacity(*schema, rows.len().max(1));
+    for (pk, w, v) in rows {
+        b.extend_pk_bytes(pk);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &v.to_le_bytes());
+        b.count += 1;
+    }
+    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    b.write_as_shard(&cpath, schema, opts).unwrap();
+    cpath
 }
 
 /// Write the .tmp shard, close, and rename to `basename`. The sole shard writer.
@@ -476,7 +514,9 @@ fn write_shard_streaming_inner(
     }
 
     // --- Phase 2: XOR8 filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
-    let xor8_filter = if row_count > 0 {
+    // A store nothing point-probes writes no filter: the build, the file bytes
+    // and the open-time checksum are all work for a reader that does not exist.
+    let xor8_filter = if row_count > 0 && !opts.skip_pk_filter {
         build_xor8_from_pk_region(regions[REG_PK], schema.pk_stride() as usize)
     } else {
         None

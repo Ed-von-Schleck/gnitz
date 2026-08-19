@@ -62,8 +62,8 @@ impl CatalogEngine {
             // `GNITZ_DDL_SCAN_CHUNK_ROWS` overrides the default — chiefly so
             // multi-worker E2E tests can shrink it to force many chunked backfill
             // rounds (lockstep padding, SAL reclaim) over small tables. A 0 or
-            // unparseable value falls back to the default (drain_chunk requires
-            // max_rows > 0).
+            // unparseable value falls back to the default: a zero chunk size
+            // drains nothing, so a backfill would never make progress.
             ddl_scan_chunk_rows: env_num("GNITZ_DDL_SCAN_CHUNK_ROWS", crate::catalog::DDL_SCAN_CHUNK_ROWS),
             // Per-worker distinct-group cap for the ad-hoc aggregate fold.
             // `GNITZ_ADHOC_GROUP_CAP` overrides it (E2E can shrink it to force

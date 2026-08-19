@@ -29,7 +29,7 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 // The manifest records only what `load_manifest` consumes: which shard files
 // are live, their tier placement (level, guard) and LSN watermark, plus the
 // two header counters that must survive a restart. PK bounds are re-derived
-// from each shard's mmap at open (`ShardEntry::from_mapped`), so they are not
+// from each shard's mmap at open (`ShardEntry::open`), so they are not
 // serialized. `guard_key` lives in the order-preserving `pack_pk_be` prefix
 // space — the whole key for narrow PKs, a lossy-but-order-preserving 16-byte
 // prefix for wide (compound) PKs, exactly the routing key the compaction

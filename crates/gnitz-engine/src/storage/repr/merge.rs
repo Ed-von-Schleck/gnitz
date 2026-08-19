@@ -1560,51 +1560,21 @@ mod tests {
         }
     }
 
+    /// `(pk_lo, pk_hi, weight, i64_payload)` per row — the packed-`u128` view of
+    /// [`writer_run`]'s byte-form output, for the single- and double-word PK
+    /// shapes whose tests read a PK as two `u64`s.
+    fn narrow(rows: Vec<(Vec<u8>, i64, i64)>, pk_stride: usize) -> Vec<(u64, u64, i64, i64)> {
+        rows.into_iter()
+            .map(|(pk, w, v)| {
+                let k = crate::test_support::read_pk_opk(&pk, 0, pk_stride);
+                (k as u64, (k >> 64) as u64, w, v)
+            })
+            .collect()
+    }
+
     // Takes &[Batch] so test call sites don't need to construct SortedMemBatch.
     fn merge_to_rows(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
-        let mem_batches: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-        let sorted: Vec<SortedMemBatch> = mem_batches
-            .iter()
-            .map(|mb| SortedMemBatch::new_unchecked(mb.clone()))
-            .collect();
-        let total_rows: usize = sorted.iter().map(|b| b.count).sum();
-        let total_blob: usize = sorted.iter().map(|b| b.blob.len()).sum();
-        let pk_stride = schema.pk_stride() as usize;
-
-        let mut out_pk = vec![0u8; total_rows * pk_stride];
-        let mut out_weight = vec![0u8; total_rows * 8];
-        let mut out_null = vec![0u8; total_rows * 8];
-        let mut out_col0 = vec![0u8; total_rows * 8];
-        let blob_cap = if total_blob > 0 { total_blob } else { 1 };
-        let mut out_blob: Vec<u8> = Vec::with_capacity(blob_cap);
-
-        {
-            let mut writer = DirectWriter {
-                pk: &mut out_pk,
-                pk_stride: pk_stride as u8,
-                weight: &mut out_weight,
-                null_bmp: &mut out_null,
-                col_bufs: vec![&mut out_col0],
-                blob: &mut out_blob,
-                blob_cache: BlobCacheGuard::acquire(schema, 0),
-                count: 0,
-                schema,
-            };
-
-            merge_batches(&sorted, schema, &mut writer);
-
-            let count = writer.row_count();
-            let mut result = Vec::with_capacity(count);
-            for i in 0..count {
-                let pk = crate::test_support::read_pk_opk(&out_pk, i, pk_stride);
-                let lo = pk as u64;
-                let hi = (pk >> 64) as u64;
-                let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
-                let v = gnitz_wire::read_i64_le(&out_col0, i * 8);
-                result.push((lo, hi, w, v));
-            }
-            result
-        }
+        narrow(merge_to_rows_wide(batches, schema), schema.pk_stride() as usize)
     }
 
     #[test]
@@ -1801,45 +1771,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn run_consolidate(b: &Batch, schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
-        let batch = b.as_mem_batch();
-        let n = batch.count;
-        let total_blob = batch.blob.len();
-        let pk_stride = schema.pk_stride() as usize;
-
-        let mut out_pk = vec![0u8; n * pk_stride];
-        let mut out_weight = vec![0u8; n * 8];
-        let mut out_null = vec![0u8; n * 8];
-        let mut out_col0 = vec![0u8; n * 8];
-        let blob_cap = if total_blob > 0 { total_blob } else { 1 };
-        let mut out_blob: Vec<u8> = Vec::with_capacity(blob_cap);
-
-        let count;
-        {
-            let mut writer = DirectWriter {
-                pk: &mut out_pk,
-                pk_stride: pk_stride as u8,
-                weight: &mut out_weight,
-                null_bmp: &mut out_null,
-                col_bufs: vec![&mut out_col0],
-                blob: &mut out_blob,
-                blob_cache: BlobCacheGuard::acquire(schema, 0),
-                count: 0,
-                schema,
-            };
-            sort_and_consolidate(&batch, schema, &mut writer);
-            count = writer.row_count();
-        }
-
-        let mut result = Vec::new();
-        for i in 0..count {
-            let pk = crate::test_support::read_pk_opk(&out_pk, i, pk_stride);
-            let lo = pk as u64;
-            let hi = (pk >> 64) as u64;
-            let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
-            let val = gnitz_wire::read_i64_le(&out_col0, i * 8);
-            result.push((lo, hi, w, val));
-        }
-        result
+        narrow(run_consolidate_bytes(b, schema), schema.pk_stride() as usize)
     }
 
     #[test]
@@ -2041,38 +1973,7 @@ mod tests {
     }
 
     fn run_fold(b: &Batch, schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
-        let batch = b.as_mem_batch();
-        let n = batch.count;
-        let pk_stride = schema.pk_stride() as usize;
-        let mut out_pk = vec![0u8; n * pk_stride];
-        let mut out_weight = vec![0u8; n * 8];
-        let mut out_null = vec![0u8; n * 8];
-        let mut out_col0 = vec![0u8; n * 8];
-        let mut out_blob: Vec<u8> = Vec::with_capacity(1);
-        let count;
-        {
-            let mut writer = DirectWriter {
-                pk: &mut out_pk,
-                pk_stride: pk_stride as u8,
-                weight: &mut out_weight,
-                null_bmp: &mut out_null,
-                col_bufs: vec![&mut out_col0],
-                blob: &mut out_blob,
-                blob_cache: BlobCacheGuard::acquire(schema, 0),
-                count: 0,
-                schema,
-            };
-            fold_sorted(&batch, schema, &mut writer);
-            count = writer.row_count();
-        }
-        let mut result = Vec::new();
-        for i in 0..count {
-            let pk = crate::test_support::read_pk_opk(&out_pk, i, pk_stride);
-            let w = gnitz_wire::read_i64_le(&out_weight, i * 8);
-            let v = gnitz_wire::read_i64_le(&out_col0, i * 8);
-            result.push((pk as u64, (pk >> 64) as u64, w, v));
-        }
-        result
+        narrow(run_fold_wide(b, schema), schema.pk_stride() as usize)
     }
 
     fn packed(r: &(u64, u64, i64, i64)) -> u128 {
@@ -2419,17 +2320,15 @@ mod tests {
         let mut out_b: Vec<u8> = Vec::with_capacity(1);
         let count;
         {
-            let mut writer = DirectWriter {
-                pk: &mut out_pk,
-                pk_stride: stride as u8,
-                weight: &mut out_w,
-                null_bmp: &mut out_n,
-                col_bufs: vec![&mut out_c],
-                blob: &mut out_b,
-                blob_cache: BlobCacheGuard::acquire(schema, 0),
-                count: 0,
+            let mut writer = DirectWriter::new(
+                &mut out_pk,
+                &mut out_w,
+                &mut out_n,
+                vec![&mut out_c],
+                &mut out_b,
                 schema,
-            };
+                0,
+            );
             run(&mut writer);
             count = writer.row_count();
         }

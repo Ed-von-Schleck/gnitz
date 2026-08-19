@@ -71,9 +71,20 @@ fn fold_bucket_per_pk(shards: &[MappedShard], bucket: &[(u32, u32, i64)]) -> Vec
         .collect()
 }
 
+/// Where one compaction's outputs go: the four values `naming::compact_shard_name`
+/// needs, plus whether the store they belong to is ever point-probed by PK. They
+/// travel together and are decided together, by `ShardIndex::compact_into`.
+pub struct Output<'a> {
+    pub dir: &'a str,
+    pub table_id: u32,
+    pub level_num: u32,
+    pub compact_seq: u64,
+    pub skip_pk_filter: bool,
+}
+
 /// Compact `input_files` across `guards`: run the N-way (PK, payload) merge
 /// into a survivor buffer, route each survivor to its guard, and write one
-/// column-first output shard per non-empty guard into `output_dir`, named by the
+/// column-first output shard per non-empty guard into `dest.dir`, named by the
 /// compaction grammar (`naming::compact_shard_name`).
 ///
 /// Each destination is a `(guard_key, skeleton)` pair: a set flag writes that
@@ -86,12 +97,9 @@ fn fold_bucket_per_pk(shards: &[MappedShard], bucket: &[(u32, u32, i64)]) -> Vec
 /// returning `Err` (atomic-or-nothing).
 pub fn merge_and_route(
     input_files: &[&CStr],
-    output_dir: &str,
     guards: &[(u128, bool)],
     schema: &SchemaDescriptor,
-    table_id: u32,
-    level_num: u32,
-    compact_seq: u64,
+    dest: Output<'_>,
 ) -> Result<Vec<(u128, String)>, StorageError> {
     // An empty guard list would drop every survivor on the floor while the caller
     // went on to clear the source tier — silent data loss, so reject it.
@@ -141,8 +149,9 @@ pub fn merge_and_route(
             continue;
         }
         let path = format!(
-            "{output_dir}/{}",
-            super::naming::compact_shard_name(table_id, compact_seq, level_num as usize, guard_key)
+            "{}/{}",
+            dest.dir,
+            super::naming::compact_shard_name(dest.table_id, dest.compact_seq, dest.level_num as usize, guard_key)
         );
         // A skeleton guard writes its folded rows under the PK-only schema; a
         // hydrated one writes the bucket at full width. The writer's schema drives
@@ -156,13 +165,19 @@ pub fn merge_and_route(
                     .expect("a skeleton guard derived a skeleton schema"),
                 rows.as_slice(),
                 0,
-                ShardWriteOpts::SKELETON,
+                ShardWriteOpts {
+                    skip_pk_filter: dest.skip_pk_filter,
+                    ..ShardWriteOpts::SKELETON
+                },
             ),
             None => (
                 schema,
                 bucket,
                 prorated_blob_cap(total_blob, nsurv, bucket.len()),
-                ShardWriteOpts::COMPACTION,
+                ShardWriteOpts {
+                    skip_pk_filter: dest.skip_pk_filter,
+                    ..ShardWriteOpts::COMPACTION
+                },
             ),
         };
         let mut batch = write_to_batch(wschema, rows.len(), blob_cap, |writer| {
@@ -191,6 +206,18 @@ pub fn merge_and_route(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// A probed store's `Output` — the shape every test here compacts into.
+#[cfg(test)]
+fn out(dir: &str, table_id: u32, level_num: u32, compact_seq: u64) -> Output<'_> {
+    Output {
+        dir,
+        table_id,
+        level_num,
+        compact_seq,
+        skip_pk_filter: false,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -247,7 +274,13 @@ mod tests {
         schema: &SchemaDescriptor,
         seq: u64,
     ) -> Option<std::ffi::CString> {
-        let outs = merge_and_route(inputs, dir.to_str().unwrap(), &[(0, false)], schema, 0, 1, seq).unwrap();
+        let outs = merge_and_route(
+            inputs,
+            &[(0, false)],
+            schema,
+            super::out(dir.to_str().unwrap(), 0, 1, seq),
+        )
+        .unwrap();
         outs.first().map(|(_, p)| std::ffi::CString::new(p.as_str()).unwrap())
     }
 
@@ -467,7 +500,7 @@ mod tests {
         // loudly up front.
         let schema = make_schema_u64_i64();
         let guards: [(u128, bool); 0] = [];
-        let _ = merge_and_route(&[], "/tmp", &guards, &schema, 0, 1, 0);
+        let _ = merge_and_route(&[], &guards, &schema, super::out("/tmp", 0, 1, 0));
     }
 
     #[test]
@@ -491,7 +524,8 @@ mod tests {
             (pack_pk_be(&0u64.to_be_bytes()), false),
             (pack_pk_be(&100u64.to_be_bytes()), false),
         ];
-        let guard_outputs = merge_and_route(&inputs, dir.to_str().unwrap(), &guards, &schema, 0, 1, 99).unwrap();
+        let guard_outputs =
+            merge_and_route(&inputs, &guards, &schema, super::out(dir.to_str().unwrap(), 0, 1, 99)).unwrap();
         assert_eq!(guard_outputs.len(), 2); // both guards should have rows
 
         // Guard 0 should have keys 10, 50
@@ -532,7 +566,7 @@ mod tests {
         let blocker = dir.join("shard_0_99_L1_G100.db");
         fs::create_dir_all(&blocker).unwrap();
 
-        let rc = merge_and_route(&inputs, dir.to_str().unwrap(), &guards, &schema, 0, 1, 99);
+        let rc = merge_and_route(&inputs, &guards, &schema, super::out(dir.to_str().unwrap(), 0, 1, 99));
 
         assert!(rc.is_err(), "expected failure, got {rc:?}");
         let guard0_file = dir.join("shard_0_99_L1_G0.db");
@@ -863,7 +897,8 @@ mod tests {
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
 
         let guards = [(0u128, false)]; // single guard
-        let guard_outputs = merge_and_route(&inputs, dir.to_str().unwrap(), &guards, &schema, 99, 1, 1).unwrap();
+        let guard_outputs =
+            merge_and_route(&inputs, &guards, &schema, super::out(dir.to_str().unwrap(), 99, 1, 1)).unwrap();
         assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
 
         let rows = read_3col_shard(&guard_outputs[0].1, &schema);
@@ -947,7 +982,8 @@ mod tests {
         let inputs = [cs1.as_c_str()];
 
         let guards = [(200u128, false)]; // single guard at key 200
-        let guard_outputs = merge_and_route(&inputs, dir.to_str().unwrap(), &guards, &schema, 42, 2, 1).unwrap();
+        let guard_outputs =
+            merge_and_route(&inputs, &guards, &schema, super::out(dir.to_str().unwrap(), 42, 2, 1)).unwrap();
         assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
 
         let cpath = std::ffi::CString::new(guard_outputs[0].1.as_str()).unwrap();
@@ -1442,7 +1478,7 @@ mod tests {
         // table_id=7, level_num=1, compact_seq=42 → routed shards are named by the
         // destination guard *key*: shard_7_42_L1_G{guard_keys[g]}.db.
         let dests: Vec<(u128, bool)> = guard_keys.iter().map(|&k| (k, false)).collect();
-        let routed = merge_and_route(&inputs, dir.to_str().unwrap(), &dests, &schema, 7, 1, 42).unwrap();
+        let routed = merge_and_route(&inputs, &dests, &schema, super::out(dir.to_str().unwrap(), 7, 1, 42)).unwrap();
         let oracle = oracle_merge_and_route_row_at_a_time(&inputs, &dir, &guard_keys, &schema);
 
         // Only the populated guards (0 and 3) produce output, in increasing-g order.
@@ -1451,7 +1487,7 @@ mod tests {
         assert_eq!(routed[1].0, guard_keys[3]);
 
         for (g, oracle_entry) in oracle.iter().enumerate() {
-            let routed_path = dir.join(format!("shard_7_42_L1_G{}.db", guard_keys[g]));
+            let routed_path = dir.join(super::super::naming::compact_shard_name(7, 42, 1, guard_keys[g]));
             match oracle_entry {
                 None => assert!(
                     !routed_path.exists(),
@@ -1467,7 +1503,7 @@ mod tests {
         }
 
         // Concrete per-guard pins beyond oracle agreement.
-        let g0_name = format!("shard_7_42_L1_G{}.db", guard_keys[0]);
+        let g0_name = super::super::naming::compact_shard_name(7, 42, 1, guard_keys[0]);
         let g0_rows = decode_diff_shard(dir.join(&g0_name).to_str().unwrap(), &schema);
         let pk10 = 10u64.to_be_bytes().to_vec();
         let folded = g0_rows
@@ -1481,7 +1517,7 @@ mod tests {
             "guard 0: pk=10 (×2 payloads) + pk=50, got {g0_rows:?}"
         );
 
-        let g3_name = format!("shard_7_42_L1_G{}.db", guard_keys[3]);
+        let g3_name = super::super::naming::compact_shard_name(7, 42, 1, guard_keys[3]);
         let g3_rows = decode_diff_shard(dir.join(&g3_name).to_str().unwrap(), &schema);
         assert_eq!(g3_rows.len(), 3, "guard 3: pk=310,320,330, got {g3_rows:?}");
     }
@@ -1544,12 +1580,9 @@ mod skeleton_tests {
 
         let outs = merge_and_route(
             &[a.as_c_str(), b.as_c_str()],
-            dir.to_str().unwrap(),
             &[(0, true)],
             &schema,
-            0,
-            2,
-            1,
+            super::out(dir.to_str().unwrap(), 0, 2, 1),
         )
         .unwrap();
         assert_eq!(outs.len(), 1);
@@ -1581,22 +1614,16 @@ mod skeleton_tests {
 
         let mixed = merge_and_route(
             &[src.as_c_str()],
-            dir.to_str().unwrap(),
             &[(0, true), (g1, false)],
             &schema,
-            0,
-            2,
-            1,
+            super::out(dir.to_str().unwrap(), 0, 2, 1),
         )
         .unwrap();
         let all_hydrated = merge_and_route(
             &[src.as_c_str()],
-            dir.to_str().unwrap(),
             &[(0, false), (g1, false)],
             &schema,
-            0,
-            2,
-            2,
+            super::out(dir.to_str().unwrap(), 0, 2, 2),
         )
         .unwrap();
 

@@ -8,12 +8,12 @@
 //! cargo test -p gnitz-engine --release _bench -- --ignored --nocapture --test-threads=1
 //! ```
 
-use super::tests::{make_schema_u64, write_test_shard};
+use super::output::Drain;
+use super::tests::write_test_shard;
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::Layout;
-use crate::test_support::{make_schema_u128_i64, wide_pk_3xu64_schema};
-use gnitz_wire::as_le_bytes;
+use crate::test_support::{make_schema_u128_i64, make_schema_u64_i64, wide_pk_3xu64_schema};
 use std::rc::Rc;
 
 /// Baseline: shard-backed merge-scan throughput. Four overlapping-key shards
@@ -80,14 +80,14 @@ fn shard_merge_scan_bench() {
     // warm-up drain faults in the cold PK/payload pages (lazy mmap, no
     // MAP_POPULATE) so the timed region reflects merge/scatter compute.
     let mut c = create_read_cursor(&[], &shards, schema);
-    std::hint::black_box(c.drain_to_batch(0));
+    std::hint::black_box(c.drain_to_batch(Drain::All));
 
     const ITERS: usize = 10;
     let mut sink = 0usize;
     let t = Instant::now();
     for _ in 0..ITERS {
         c.rewind();
-        let out = c.drain_to_batch(0).expect("non-empty drain");
+        let out = c.drain_to_batch(Drain::All).expect("non-empty drain");
         sink = sink.wrapping_add(out.count);
         std::hint::black_box(&out);
     }
@@ -110,7 +110,7 @@ fn shard_merge_scan_bench() {
 fn shard_point_probe_bench() {
     use std::time::Instant;
     let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64(); // U64 PK | I64 payload
+    let schema = make_schema_u64_i64(); // U64 PK | I64 payload
 
     const N: u64 = 1_000_000;
     const PROBES: usize = 100_000;
@@ -259,7 +259,7 @@ fn adv_schema_5xu64() -> SchemaDescriptor {
 /// tiebreak runs `compare_rows_fixedint_nonnull` (the profile's 3.30% child).
 fn adv_bench_schema(stride: usize) -> SchemaDescriptor {
     match stride {
-        8 => make_schema_u64(),       // U64 PK + I64
+        8 => make_schema_u64_i64(),   // U64 PK + I64
         16 => make_schema_u128_i64(), // U128 PK + I64
         24 => wide_pk_3xu64_schema(), // 3×U64 PK + I64
         40 => adv_schema_5xu64(),     // 5×U64 PK + I64
@@ -318,23 +318,19 @@ fn adv_write_shard(
     weights: &[i64],
     vals: &[i64],
 ) -> Rc<MappedShard> {
-    let count = weights.len();
-    debug_assert_eq!(pks.len(), count * schema.pk_stride() as usize);
-    debug_assert_eq!(vals.len(), count);
-    let nulls = vec![0u64; count];
-    let blob: Vec<u8> = Vec::new();
-    let regions: Vec<&[u8]> = vec![pks, as_le_bytes(weights), as_le_bytes(&nulls), as_le_bytes(vals), &blob];
-    let path = dir.path().join(format!("{name}.db"));
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    super::super::shard_file::write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        count as u32,
-        &regions,
+    debug_assert_eq!(pks.len(), weights.len() * schema.pk_stride() as usize);
+    debug_assert_eq!(vals.len(), weights.len());
+    let rows: Vec<(Vec<u8>, i64, i64)> = pks
+        .chunks_exact(schema.pk_stride() as usize)
+        .zip(weights.iter().zip(vals))
+        .map(|(pk, (&w, &v))| (pk.to_vec(), w, v))
+        .collect();
+    let cpath = super::super::shard_file::write_test_shard(
+        &dir.path().join(format!("{name}.db")),
         schema,
+        &rows,
         super::super::shard_file::ShardWriteOpts::default(),
-    )
-    .unwrap();
+    );
     Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
 }
 

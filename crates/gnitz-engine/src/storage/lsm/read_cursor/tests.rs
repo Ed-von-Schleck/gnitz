@@ -1,23 +1,11 @@
+use super::output::Drain;
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{BatchBuilder, Layout};
 use crate::test_support::{
-    make_schema_i64pk_i64, make_schema_pk_u64_payload_string, make_schema_u128_i64, wide_pk_3xu64_schema,
+    make_schema_i64pk_i64, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64,
+    wide_pk_3xu64_schema,
 };
-use gnitz_wire::as_le_bytes;
-
-/// `(U64 PK | I64 payload)` — stride-8, the dominant single-PK table shape. It
-/// exercises `pack_pk_be`'s 8-byte register arm and the u128-vs-u64 compare in
-/// `compare_pk_ordering`.
-pub(super) fn make_schema_u64() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
 
 /// Build an `Rc<Batch>` with i64-payload rows.  Tests pre-sort their
 /// inputs and have at most one row per (PK, payload), so we mark the
@@ -285,7 +273,7 @@ fn test_drain_single_source_full() {
     let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let mut cursor = create_read_cursor(&[batch], &[], schema);
 
-    let result = cursor.drain_single_source(0);
+    let result = cursor.drain_single_source(Drain::All);
     assert!(result.is_some());
     let out = result.unwrap();
     assert_eq!(out.count, 3);
@@ -301,14 +289,14 @@ fn test_drain_single_source_with_limit() {
     let mut cursor = create_read_cursor(&[batch], &[], schema);
 
     // Drain first 2
-    let out1 = cursor.drain_single_source(2).unwrap();
+    let out1 = cursor.drain_single_source(Drain::Rows(2.try_into().unwrap())).unwrap();
     assert_eq!(out1.count, 2);
     assert_eq!(out1.get_pk(0), 1);
     assert_eq!(out1.get_pk(1), 2);
     assert!(cursor.valid);
 
     // Drain remaining 2
-    let out2 = cursor.drain_single_source(0).unwrap();
+    let out2 = cursor.drain_single_source(Drain::All).unwrap();
     assert_eq!(out2.count, 2);
     assert_eq!(out2.get_pk(0), 3);
     assert_eq!(out2.get_pk(1), 4);
@@ -321,7 +309,7 @@ fn test_drain_multi_source_returns_none() {
     let b1 = make_batch(&[(1, 1, 10)]);
     let b2 = make_batch(&[(2, 1, 20)]);
     let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
-    assert!(cursor.drain_single_source(0).is_none());
+    assert!(cursor.drain_single_source(Drain::All).is_none());
 }
 
 #[test]
@@ -857,32 +845,16 @@ pub(super) fn write_test_shard(
     rows: &[(u128, i64, i64)],
 ) -> Rc<MappedShard> {
     let stride = schema.pk_stride() as usize;
-    let pks: Vec<u8> = rows
+    let rows: Vec<(Vec<u8>, i64, i64)> = rows
         .iter()
-        .flat_map(|&(pk, _, _)| pk.to_be_bytes()[16 - stride..].to_vec())
+        .map(|&(pk, w, v)| (pk.to_be_bytes()[16 - stride..].to_vec(), w, v))
         .collect();
-    let weights: Vec<i64> = rows.iter().map(|&(_, w, _)| w).collect();
-    let nulls = vec![0u64; rows.len()];
-    let vals: Vec<i64> = rows.iter().map(|&(_, _, v)| v).collect();
-    let blob: Vec<u8> = Vec::new();
-    let regions: Vec<&[u8]> = vec![
-        &pks,
-        as_le_bytes(&weights),
-        as_le_bytes(&nulls),
-        as_le_bytes(&vals),
-        &blob,
-    ];
-    let path = dir.path().join(format!("rc{stride}_{idx}.db"));
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    super::super::shard_file::write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        rows.len() as u32,
-        &regions,
+    let cpath = super::super::shard_file::write_test_shard(
+        &dir.path().join(format!("rc{stride}_{idx}.db")),
         schema,
+        &rows,
         super::super::shard_file::ShardWriteOpts::default(),
-    )
-    .unwrap();
+    );
     Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
 }
 
@@ -1132,9 +1104,44 @@ fn mode_follows_the_live_source_set() {
     c.seek_range_bytes(&opk(41), Some(&opk(51)));
     assert!(matches!(c.mode, SourceMode::Empty));
     assert!(!c.valid);
-    assert!(c.drain_to_batch(0).is_none());
+    assert!(c.drain_to_batch(Drain::All).is_none());
 
     assert_advance_to_matches_seek_oracle(schema, &b, &[0, 105, 250, 305, 120, 341, 220]);
+}
+
+/// `materialize` reserves every source's heap up front where a chunked drain
+/// grows on demand — both halves of one `Drain` value. Getting it wrong costs
+/// only speed, so nothing else notices. Sizing is load-bearing: the sources must
+/// sum past `POOL_BYPASS_BYTES` (2 MiB) so the reservation allocates fresh at
+/// its exact size, and nearly every row must cancel so the survivor is smaller.
+#[test]
+fn materialize_reserves_the_whole_blob_arena() {
+    let schema = make_schema_pk_u64_payload_string();
+    const ROWS: usize = 4096;
+    let text = |pk: u64| format!("{pk:0>512}");
+    let run = |n: usize, weight: i64| {
+        let mut bb = BatchBuilder::new(schema);
+        for pk in 0..n as u64 {
+            bb.begin_row(pk as u128, weight);
+            bb.put_string(&text(pk));
+            bb.end_row();
+        }
+        Rc::new(bb.finish())
+    };
+    // Same keys and payloads at opposite weights, but for one uncancelled key.
+    let inserts = run(ROWS, 1);
+    let retracts = run(ROWS - 1, -1);
+    let reserved = inserts.blob.len() + retracts.blob.len();
+    assert!(reserved > 2 * 1024 * 1024, "must exceed POOL_BYPASS_BYTES: {reserved}");
+
+    let batch = create_read_cursor(&[inserts, retracts], &[], schema).materialize();
+    assert_eq!(batch.count, 1, "all but the last key cancels");
+    assert_eq!(batch.blob.len(), 512, "one surviving string");
+    assert!(
+        batch.blob.capacity() >= reserved,
+        "a full drain reserves every source's heap: {} < {reserved}",
+        batch.blob.capacity(),
+    );
 }
 
 /// A bounded read over a multi-shard STRING partition that only one shard covers
@@ -1171,7 +1178,7 @@ fn bounded_string_read_carries_only_its_own_rows() {
     c.seek_range_bytes(&10_001u64.to_be_bytes(), Some(&10_004u64.to_be_bytes()));
     assert!(matches!(c.mode, SourceMode::Single(1)));
 
-    let batch = c.drain_to_batch(0).expect("shard 1 window");
+    let batch = c.drain_to_batch(Drain::All).expect("shard 1 window");
     assert_eq!(batch.count, 3);
     assert_eq!(batch.blob.len(), 3 * 40, "only the drained rows' strings");
     for i in 0..3 {
@@ -1240,7 +1247,7 @@ fn walk_groups(c: &mut ReadCursor) -> Vec<(u64, i64, bool)> {
 #[test]
 fn skeleton_shard_opens_under_the_view_schema() {
     let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64();
+    let schema = make_schema_u64_i64();
     let rows: Vec<(u64, i64)> = (1..=8).map(|i| (i, i as i64)).collect();
     let shard = write_skeleton_shard(dir.path(), "sk.db", &schema, &rows);
 
@@ -1275,7 +1282,7 @@ fn skeleton_shard_opens_under_the_view_schema() {
 fn skeleton_flag_is_covered_by_the_digest_and_masked_before_the_bound() {
     use super::super::layout::{OFF_DESC_CHECKSUM, OFF_FILE_NPC, SHARD_FLAG_SKELETON};
     let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64();
+    let schema = make_schema_u64_i64();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_i64(42);
@@ -1332,7 +1339,7 @@ fn a_skeleton_row_coarsens_its_whole_pk_group() {
     let dir = tempfile::tempdir().unwrap();
 
     for (name, schema, zero_row) in [
-        ("fixedint", make_schema_u64(), true),
+        ("fixedint", make_schema_u64_i64(), true),
         ("generic", nullable_string_schema(), false),
     ] {
         // PK 1: skeleton (coarse +3) plus two newer hydrated rows.

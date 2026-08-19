@@ -162,8 +162,8 @@ mod tests {
         build_test_shard_weights(dir, "test.db", &pks, &weights, &vals, false)
     }
 
-    /// Build a `(U64 PK | I64 payload)` shard with custom weights via
-    /// write_shard_streaming; `pack` toggles FoR on the payload region.
+    /// Build a `(U64 PK | I64 payload)` shard with custom weights; `pack`
+    /// toggles FoR on the payload region.
     fn build_test_shard_weights(
         dir: &std::path::Path,
         name: &str,
@@ -172,34 +172,19 @@ mod tests {
         vals: &[i64],
         pack: bool,
     ) -> String {
+        let rows: Vec<(Vec<u8>, i64, i64)> = (0..pks.len())
+            .map(|i| (pks[i].to_be_bytes().to_vec(), wts[i], vals[i]))
+            .collect();
         let path = dir.join(name);
-        let count = pks.len() as u32;
-        // PK region holds OPK (order-preserving big-endian) bytes at rest.
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_be_bytes()).collect();
-        let null_bm: Vec<u64> = vec![0; pks.len()];
-        let blob: Vec<u8> = Vec::new();
-
-        let regions: Vec<&[u8]> = vec![
-            &pk_bytes,
-            as_le_bytes(wts),
-            as_le_bytes(&null_bm),
-            as_le_bytes(vals),
-            &blob,
-        ];
-
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(
-            libc::AT_FDCWD,
-            &cpath,
-            count,
-            &regions,
+        super::super::shard_file::write_test_shard(
+            &path,
             &make_schema_u64_i64(),
+            &rows,
             ShardWriteOpts {
                 pack_ints: pack,
                 ..Default::default()
             },
-        )
-        .unwrap();
+        );
         path.to_str().unwrap().to_string()
     }
 
