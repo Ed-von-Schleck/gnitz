@@ -236,7 +236,13 @@ impl Reactor {
         }
         let conn = conns.entry(fd).or_insert_with(|| Box::new(io::Conn::new()));
         let hdr_ptr = conn.recv_state.hdr_buf_ptr();
-        arm_recv(&mut self.inner.ring.borrow_mut(), conn, fd, hdr_ptr, 4);
+        arm_recv(
+            &mut self.inner.ring.borrow_mut(),
+            conn,
+            fd,
+            hdr_ptr,
+            gnitz_wire::FRAME_LEN_PREFIX_BYTES as u32,
+        );
     }
 
     /// Future resolving to the next complete message on `fd` as an owned
@@ -403,7 +409,13 @@ impl Reactor {
                 // preserved by the queue order — the handler still consumes
                 // messages in arrival order.
                 let hdr = conn.recv_state.hdr_buf_ptr();
-                arm_recv(&mut self.inner.ring.borrow_mut(), conn, fd, hdr, 4);
+                arm_recv(
+                    &mut self.inner.ring.borrow_mut(),
+                    conn,
+                    fd,
+                    hdr,
+                    gnitz_wire::FRAME_LEN_PREFIX_BYTES as u32,
+                );
                 if let Some(w) = conn.recv_waiter.take() {
                     w.wake();
                 }

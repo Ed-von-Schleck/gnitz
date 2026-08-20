@@ -4,11 +4,12 @@
 
 use crate::runtime::wire::{
     build_schema_wire_block, decode_schema_block, encode_ctrl_block_direct, peek_control_block, peek_control_block_ipc,
-    WireData, WireMsg, CTRL_BLOCK_SIZE_NO_BLOB, STATUS_OK,
+    WireData, WireMsg, STATUS_OK,
 };
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips, SharedRegion};
+use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::{WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID};
 
 /// A checksummed data WAL block over `rows` of the standard `(u64 pk, i64 val)`
@@ -313,53 +314,46 @@ fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
     use crate::runtime::sal::{SalReader, SalWriter, FLAG_PUSH};
     use crate::storage::compute_wire_props;
 
-    unsafe {
-        let size = 1 << 20;
-        let region = SharedRegion::new(size);
-        let ptr = region.ptr();
-        let nw = 2usize;
-        let efds: Vec<i32> = (0..nw).map(|_| crate::foundation::posix_io::eventfd_create()).collect();
-        let writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
-        writer.reset(0, 1);
+    let size = 1 << 20;
+    let region = SharedRegion::new(size);
+    let ptr = region.ptr();
+    let nw = 2usize;
+    let writer = SalWriter::new(ptr, -1, size as u64, nw);
+    writer.reset(0, 1);
 
-        let schema = make_schema_u64_i64();
-        let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-        let block = build_schema_wire_block(&schema, 16);
-        let props = compute_wire_props(&schema);
-        let req_ids: Vec<u64> = (0..nw as u64).collect();
-        with_commit_indices(&batch, &schema, nw, |wi| {
-            writer
-                .scatter_wire_group(
-                    &batch,
-                    wi,
-                    &schema,
-                    16,
-                    5,
-                    FLAG_PUSH,
-                    0,
-                    0,
-                    &req_ids,
-                    Some(block.as_slice()),
-                    Some(props),
-                )
-                .expect("group fits")
-        });
+    let schema = make_schema_u64_i64();
+    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
+    let block = build_schema_wire_block(&schema, 16);
+    let props = compute_wire_props(&schema);
+    let req_ids: Vec<u64> = (0..nw as u64).collect();
+    with_commit_indices(&batch, &schema, nw, |wi| {
+        writer
+            .scatter_wire_group(
+                &batch,
+                wi,
+                &schema,
+                16,
+                5,
+                FLAG_PUSH,
+                0,
+                0,
+                &req_ids,
+                Some(block.as_slice()),
+                Some(props),
+            )
+            .expect("group fits")
+    });
 
-        let slot = SalReader::for_walk(ptr as *const u8, 0, size)
-            .slot_at(0, 0)
-            .expect("slot 0 carries bytes");
-        crate::runtime::wire::decode_wire(slot).expect("the fast path's slot must verify");
+    let slot = SalReader::for_walk(ptr as *const u8, 0, size)
+        .slot_at(0, 0)
+        .expect("slot 0 carries bytes");
+    crate::runtime::wire::decode_wire(slot).expect("the fast path's slot must verify");
 
-        // And a flipped control byte in that slot is now detected.
-        let mut forged = slot.to_vec();
-        forged[WAL_HEADER_SIZE] ^= 1;
-        assert!(
-            crate::runtime::wire::decode_wire(&forged).is_err(),
-            "the fast path must stamp a control-block checksum, or nothing verifies it"
-        );
-
-        for &e in &efds {
-            libc::close(e);
-        }
-    }
+    // And a flipped control byte in that slot is now detected.
+    let mut forged = slot.to_vec();
+    forged[WAL_HEADER_SIZE] ^= 1;
+    assert!(
+        crate::runtime::wire::decode_wire(&forged).is_err(),
+        "the fast path must stamp a control-block checksum, or nothing verifies it"
+    );
 }

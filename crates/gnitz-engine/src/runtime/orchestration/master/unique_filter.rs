@@ -490,8 +490,9 @@ mod unique_filter_tests {
             0,
             Vec::new(),
             std::ptr::null_mut(),
-            SalWriter::new(std::ptr::null_mut(), -1, 0, Vec::new()),
+            SalWriter::new(std::ptr::null_mut(), -1, 0, 0),
             Rc::new(W2mReceiver::new(Vec::new())),
+            Vec::new(),
         )
     }
 

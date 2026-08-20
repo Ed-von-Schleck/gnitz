@@ -111,9 +111,9 @@ fn schema_block_cols<'a>(schema: &SchemaDescriptor, defs: Option<&'a [ColumnDef]
 /// the client decodes such a block against a schema it already holds.
 ///
 /// The returned bytes are a self-contained schema block identical to what
-/// `encode_wire_into` would embed. Callers cache this per table and pass it
-/// as `prebuilt_schema_block` to `wire_size` / `encode_wire_into` to skip
-/// rebuilding it on every SEEK/SCAN response.
+/// [`WireMsg::encode`] would embed. Callers cache this per table and pass it as
+/// [`WireMsg::prebuilt_schema_block`] to skip rebuilding it on every SEEK/SCAN
+/// response.
 pub fn build_schema_wire_block(schema: &SchemaDescriptor, target_tid: u32) -> Vec<u8> {
     gnitz_wire::schema_block::encode(target_tid, &schema_block_cols(schema, None))
 }
@@ -167,8 +167,6 @@ pub(crate) fn get_or_build_schema_wire_block(
 // Encode
 // ---------------------------------------------------------------------------
 
-pub(crate) const CTRL_BLOCK_SIZE_NO_BLOB: usize = gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
-
 /// Encode only the ctrl WAL block (no schema, no data) into `out[offset..]`.
 /// Caller pre-computes `wire_flags` (including `FLAG_HAS_SCHEMA`,
 /// `FLAG_HAS_DATA`, sorted/consolidated bits, etc.) so this helper can be
@@ -194,8 +192,8 @@ pub(crate) fn encode_ctrl_block_direct(
 }
 
 /// Encoded size of the schema wire block for `schema`, or the prebuilt block's
-/// length when one is supplied. Shared by `wire_size` and `wire_size_range` so
-/// the two size paths cannot drift.
+/// length when one is supplied. [`WireMsg::size`] is its one caller, so every
+/// shape of message sizes its schema block the same way.
 ///
 /// The no-prebuilt arm sizes an *anonymous* block: a [`WireMsg`] encodes its
 /// block with no defs, so every name is empty and nothing spills into the blob
@@ -211,8 +209,8 @@ fn schema_block_wire_size(schema: Option<&SchemaDescriptor>, prebuilt_schema_blo
 // WireMsg
 // ---------------------------------------------------------------------------
 
-/// The data payload of one wire message: a whole (optional) batch, or a row
-/// range of one — the only axis on which the two encode shapes differ.
+/// The data payload of one wire message: which rows of a batch it carries, and
+/// how they are gathered — the only axis on which the encode shapes differ.
 #[derive(Clone, Copy)]
 pub enum WireData<'a> {
     Whole(Option<&'a Batch>),
@@ -220,6 +218,22 @@ pub enum WireData<'a> {
         batch: &'a Batch,
         start_row: usize,
         count: usize,
+    },
+    /// The rows `indices` selects, in that order, encoded straight into the
+    /// destination — no per-worker sub-`Batch` in between. Valid only for a
+    /// `schema_wire_safe` schema.
+    ///
+    /// The schema rides in the variant rather than being read from
+    /// [`WireMsg::schema`] because both halves of this shape read region strides
+    /// from it: `wire_block_size` sizes the block and `encode_scattered_to_wire`
+    /// carves it. Sizing off the batch's strides while emitting off the schema's
+    /// would put the slot's byte count and its bytes on two sources — and a slot
+    /// is sized to reserve space inside the SAL mmap, so a disagreement writes
+    /// past it.
+    Scattered {
+        batch: &'a Batch,
+        indices: &'a [u32],
+        schema: &'a SchemaDescriptor,
     },
 }
 
@@ -230,17 +244,19 @@ impl Default for WireData<'_> {
 }
 
 impl<'a> WireData<'a> {
-    fn row_count(&self) -> usize {
+    /// Rows this payload carries; `0` means the slot or frame is dataless.
+    pub(crate) fn row_count(&self) -> usize {
         match *self {
             WireData::Whole(b) => b.map(|b| b.count).unwrap_or(0),
             WireData::Range { count, .. } => count,
+            WireData::Scattered { indices, .. } => indices.len(),
         }
     }
 
     fn layout_batch(&self) -> Option<&'a Batch> {
         match *self {
             WireData::Whole(b) => b,
-            WireData::Range { batch, .. } => Some(batch),
+            WireData::Range { batch, .. } | WireData::Scattered { batch, .. } => Some(batch),
         }
     }
 
@@ -248,6 +264,7 @@ impl<'a> WireData<'a> {
         match *self {
             WireData::Whole(b) => b.map(|b| b.wire_byte_size()).unwrap_or(0),
             WireData::Range { batch, count, .. } => batch.wire_byte_size_range(count),
+            WireData::Scattered { indices, schema, .. } => crate::storage::wire_block_size(schema, indices.len(), 0),
         }
     }
 }
@@ -377,6 +394,9 @@ impl<'a> WireMsg<'a> {
                     start_row,
                     count,
                 } => batch.encode_range_to_wire(start_row, count, self.target_id as u32, out, pos, checksum),
+                WireData::Scattered { batch, indices, schema } => {
+                    batch.encode_scattered_to_wire(indices, schema, self.target_id as u32, out, pos, checksum)
+                }
             };
         }
 
@@ -462,7 +482,7 @@ pub fn decode_wire_with_ctrl(
 
 /// Decode a full IPC wire message from raw bytes.
 pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
-    decode_wire_impl(data, None, true)
+    decode_wire_impl(data, true)
 }
 
 /// The three transaction-shaped request frames — `PUSH_TXN`, `DDL_TXN` and
@@ -479,21 +499,17 @@ pub use gnitz_wire::txn_frame::{decode_ddl_txn, decode_push_txn, decode_scan_mul
 /// Like `decode_wire` but skips WAL block checksum verification.  Use for
 /// trusted intra-process IPC (W2M ring).
 pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
-    decode_wire_impl(data, None, false)
+    decode_wire_impl(data, false)
 }
 
-fn decode_wire_impl(
-    data: &[u8],
-    schema_hint: Option<SchemaWithVersion<'_>>,
-    verify_checksum: bool,
-) -> Result<DecodedWire, &'static str> {
+fn decode_wire_impl(data: &[u8], verify_checksum: bool) -> Result<DecodedWire, &'static str> {
     let ctrl = gnitz_wire::wal::block_slice_at(data, 0)?;
     let control = if verify_checksum {
         peek_control_block(ctrl)?
     } else {
         peek_control_block_ipc(ctrl)?
     };
-    let mut decoded = decode_wire_body(data, ctrl.len(), control, schema_hint, verify_checksum)?;
+    let mut decoded = decode_wire_body(data, ctrl.len(), control, None, verify_checksum)?;
     // An engine-authored frame (SAL consumption, W2M, boot replay): its layout
     // claim is real and skipping the re-sort is the point of sending it, so
     // raise the batch off `Raw`. `certify_layout` debug-verifies what it
@@ -505,22 +521,6 @@ fn decode_wire_impl(
         b.certify_layout(layout_from_wire_flags(flags), schema);
     }
     Ok(decoded)
-}
-
-/// Like `decode_wire_ipc` but supplies a versioned schema hint for W2M
-/// continuation frames that carry `FLAG_HAS_DATA` without `FLAG_HAS_SCHEMA`.
-/// Callers must supply the `server_version` that matches what the sender
-/// embedded in `wire_flags` bits 24-39; a version mismatch is a hard error.
-///
-/// Currently only used by tests; the production warmup path now decodes
-/// continuation frames via `decode_wire_ipc_zero_copy_with_ctrl` to avoid
-/// the owned `Batch` allocation.
-#[cfg(test)]
-pub(crate) fn decode_wire_ipc_with_schema<'a>(
-    data: &[u8],
-    hint: SchemaWithVersion<'a>,
-) -> Result<DecodedWire, &'static str> {
-    decode_wire_impl(data, Some(hint), false)
 }
 
 /// Resolve the schema for a continuation frame (`has_data && !has_schema`).
@@ -541,6 +541,64 @@ fn resolve_continuation_schema(
     }
 }
 
+/// Resolve a frame's schema and locate its data block — the prologue both
+/// decoders run. Returns the schema the data block must be read against, and
+/// the data block itself when the frame carries one.
+///
+/// `verify` threads to exactly one call, `decode_schema_block`; it is the trust
+/// level this file already carries as `encode`/`encode_ipc` and
+/// `peek_control_block`/`peek_control_block_ipc`.
+///
+/// When the caller supplies a `hint`, a schema block in the frame is validated
+/// against it and the **hint's** descriptor is what comes back. The
+/// substitution is not cosmetic: the returned descriptor is what the data
+/// block's region sizes are checked against. It is a no-op only because the two
+/// are equal by construction — both ends build the pre-flight frame schema from
+/// `unique_preflight_wire_schema`. What it adds over that check is a type or
+/// nullability difference at equal width; an unequal stride already fails in
+/// `decode_mem_batch_inner`.
+fn split_wire_blocks<'a>(
+    data: &'a [u8],
+    ctrl_size: usize,
+    flags: u64,
+    hint: Option<SchemaWithVersion<'_>>,
+    verify: bool,
+) -> Result<(Option<SchemaDescriptor>, Option<&'a [u8]>), &'static str> {
+    let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
+    let has_data = (flags & FLAG_HAS_DATA) != 0;
+
+    let mut off = ctrl_size;
+    let mut wire_schema: Option<SchemaDescriptor> = None;
+
+    // A continuation frame carries data with no block of its own; without a hint
+    // to decode it against there is nothing to do but reject it.
+    if has_data && !has_schema {
+        wire_schema = Some(resolve_continuation_schema(&hint, flags)?);
+    }
+
+    if has_schema {
+        let sblock = gnitz_wire::wal::block_slice_at(data, off)?;
+        let parsed = decode_schema_block(sblock, verify)?;
+        wire_schema = Some(match hint {
+            Some(ref h) => {
+                if crate::schema::validate_schema_match(&parsed, h.descriptor).is_err() {
+                    return Err("schema mismatch: client schema differs from server schema");
+                }
+                *h.descriptor
+            }
+            None => parsed,
+        });
+        off += sblock.len();
+    }
+
+    let dblock = if has_data {
+        Some(gnitz_wire::wal::block_slice_at(data, off)?)
+    } else {
+        None
+    };
+    Ok((wire_schema, dblock))
+}
+
 /// Leaves the decoded batch `Raw`. Whether the frame's layout claim may be
 /// installed on top depends on who sent it, so that is the caller's call.
 fn decode_wire_body(
@@ -550,49 +608,18 @@ fn decode_wire_body(
     schema_hint: Option<SchemaWithVersion<'_>>,
     verify_checksum: bool,
 ) -> Result<DecodedWire, &'static str> {
-    let flags = control.flags;
-    let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
-    let has_data = (flags & FLAG_HAS_DATA) != 0;
-
-    let mut off = ctrl_size;
-    let mut wire_schema: Option<SchemaDescriptor> = None;
-
-    if has_data && !has_schema {
-        // External client traffic must include the schema block unless the
-        // caller supplies an explicit catalog hint (warm-cache PUSH path).
-        if verify_checksum && schema_hint.is_none() {
-            return Err("FLAG_HAS_DATA without FLAG_HAS_SCHEMA");
+    let (schema, dblock) = split_wire_blocks(data, ctrl_size, control.flags, schema_hint, verify_checksum)?;
+    let data_batch = match dblock {
+        Some(dblock) => {
+            let eff_schema = schema.as_ref().ok_or("no schema for data block")?;
+            Some(Batch::decode_from_wal_block(dblock, eff_schema, verify_checksum)?.0)
         }
-        wire_schema = Some(resolve_continuation_schema(&schema_hint, flags)?);
-    }
-
-    if has_schema {
-        let sblock = gnitz_wire::wal::block_slice_at(data, off)?;
-        let parsed = decode_schema_block(sblock, verify_checksum)?;
-        // Integrity cross-check against hint even when versions match.
-        if let Some(ref hint) = schema_hint {
-            if crate::schema::validate_schema_match(&parsed, hint.descriptor).is_err() {
-                return Err("schema mismatch: client schema differs from server schema");
-            }
-            wire_schema = Some(*hint.descriptor);
-        } else {
-            wire_schema = Some(parsed);
-        }
-        off += sblock.len();
-    }
-
-    let data_batch = if has_data {
-        let eff_schema = wire_schema.as_ref().ok_or("no schema for data block")?;
-        let dblock = gnitz_wire::wal::block_slice_at(data, off)?;
-        let (batch, _) = Batch::decode_from_wal_block(dblock, eff_schema, verify_checksum)?;
-        Some(batch)
-    } else {
-        None
+        None => None,
     };
 
     Ok(DecodedWire {
         control,
-        schema: wire_schema,
+        schema,
         data_batch,
     })
 }
@@ -612,36 +639,20 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     schema_hint: Option<SchemaWithVersion<'_>>,
     offsets: &'a mut [usize; MAX_BATCH_REGIONS],
 ) -> Result<DecodedWireZeroCopy<'a>, &'static str> {
-    let ctrl_size = control.block_size;
-    let flags = control.flags;
-    let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
-    let has_data = (flags & FLAG_HAS_DATA) != 0;
-
-    let mut off = ctrl_size;
-    let mut wire_schema: Option<SchemaDescriptor> = None;
-
-    if has_data && !has_schema {
-        wire_schema = Some(resolve_continuation_schema(&schema_hint, flags)?);
-    }
-
-    if has_schema {
-        let sblock = gnitz_wire::wal::block_slice_at(data, off)?;
-        wire_schema = Some(decode_schema_block(sblock, false)?);
-        off += sblock.len();
-    }
-
-    let data_batch = if has_data {
-        let eff_schema = wire_schema.as_ref().ok_or("no schema for data block")?;
-        let dblock = gnitz_wire::wal::block_slice_at(data, off)?;
-        let mb = crate::storage::decode_mem_batch_from_wal_block(dblock, eff_schema, offsets)?;
-        Some(mb)
-    } else {
-        None
+    let (schema, dblock) = split_wire_blocks(data, control.block_size, control.flags, schema_hint, false)?;
+    let data_batch = match dblock {
+        Some(dblock) => {
+            let eff_schema = schema.as_ref().ok_or("no schema for data block")?;
+            Some(crate::storage::decode_mem_batch_from_wal_block(
+                dblock, eff_schema, offsets,
+            )?)
+        }
+        None => None,
     };
 
     Ok(DecodedWireZeroCopy {
         control,
-        schema: wire_schema,
+        schema,
         data_batch,
     })
 }

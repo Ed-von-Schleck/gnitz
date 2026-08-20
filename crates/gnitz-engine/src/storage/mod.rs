@@ -33,13 +33,11 @@ pub(crate) use lsm::table::enforce_unique_pk;
 pub use lsm::table::{RecoverySource, Table};
 pub use merge::MemBatch;
 pub(crate) use scatter::route_rows_by_pk;
-pub use scatter::scatter_copy;
 pub(crate) use scatter::scatter_unified_sources;
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
-pub(crate) use batch::carve_writer_slices;
 pub(crate) use batch::{AppendSession, BatchBuilder, Layout};
-pub(crate) use batch_wire::{compute_wire_props, schema_wire_safe, wire_header_dir_size, wire_region_sizes};
+pub(crate) use batch_wire::{compute_wire_props, schema_wire_safe, wire_block_size};
 // `ColumnarSource` is deliberately NOT re-exported: it adds only the Z-set
 // weight, and every out-of-storage consumer (the comparators, the group-key
 // extractors, the row appenders) reads rows through `gnitz_expr::RowSource`.
@@ -50,7 +48,6 @@ pub(crate) use columnar::{
 // caller names `crate::schema::key::X`. Re-exporting it split one byte-order
 // rule across two import paths, visibly — `ops/reduce/sort.rs` and
 // `catalog/scan_spec.rs` each imported from both in adjacent lines.
-pub(crate) use gnitz_wire::wal::write_header_and_directory as wal_write_header_and_directory;
 pub(crate) use lsm::child_dir::{
     cluster_children, fsync_dir, reclaim_retired_children, remove_child, subdir_names, ChildAddr,
 };
@@ -59,8 +56,7 @@ pub(crate) use lsm::manifest::{peek_header, topology_word};
 pub(crate) use lsm::read_cursor::{empty as empty_cursor, PkSetGather, ReadCursor};
 pub(crate) use lsm::repartition::repartition_relation;
 pub(crate) use merge::{
-    mem_batch_to_unified, prorated_blob_cap, relocate_german_string_vec, BlobCache, BlobCacheGuard, DirectWriter,
-    RowComparator,
+    mem_batch_to_unified, prorated_blob_cap, relocate_german_string_vec, BlobCache, BlobCacheGuard, RowComparator,
 };
 pub(crate) use spill::{KeyProducer, SpillSort};
 

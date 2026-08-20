@@ -1,9 +1,9 @@
 //! L7 protocol — the IPC wire format, the shared append-only log (SAL), and the
 //! lock-free worker→master ring (`w2m` + its `w2m_ring` backing store).
 //!
-//! Internal grouping, not a facade: `runtime/mod.rs` aliases these submodules so
-//! the historical `crate::runtime::<mod>` paths keep resolving across the
-//! subsystem.
+//! A layer grouping, not a namespace callers name: `runtime/mod.rs` aliases these
+//! submodules, and `crate::runtime::<mod>` is how the whole subsystem reaches
+//! them.
 
 pub(super) mod sal;
 pub(super) mod w2m;

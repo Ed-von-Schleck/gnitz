@@ -2,22 +2,23 @@ use crate::foundation::posix_io;
 use crate::foundation::posix_io::write_u32_raw;
 use crate::runtime::sal::{
     atomic_load_u64, effective_max, group_header_size, sal_begin_group, sal_probe_header, sal_read_group_header,
-    sal_tail_slot_count, sal_write_group, EpochGate, SalRead, SalReadResult, SalReader, SalWriter, CHECKPOINT_RESERVE,
+    sal_tail_slot_count, sal_write_group, EpochGate, SalMessage, SalReader, SalStep, SalWriter, CHECKPOINT_RESERVE,
     FLAG_DDL_SYNC, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_SHUTDOWN, FLAG_TXN_COMMIT, MAX_WORKERS, MIN_SAL_BYTES,
     SENTINEL_SIZE,
 };
-use crate::runtime::wire::CTRL_BLOCK_SIZE_NO_BLOB;
 use crate::test_support::{sweep_bit_flips, SharedRegion};
 use gnitz_wire::align8;
+use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 
 fn make_test_data(val: u8, len: usize) -> Vec<u8> {
     vec![val; len]
 }
 
-/// The group `worker` reads at `base`, or a panic if the bytes are not one.
-unsafe fn group_at(ptr: *const u8, base: u64, worker: u32, size: usize) -> SalReadResult {
+/// The group `worker` reads at `base` and the cursor past it, or a panic if the
+/// bytes are not a group.
+unsafe fn group_at(ptr: *const u8, base: u64, worker: u32, size: usize) -> (SalMessage<'static>, u64) {
     match sal_read_group_header(ptr, base, worker, EpochGate::Any, size as u64) {
-        SalRead::Group(r) => r,
+        SalStep::Group(msg, next) => (msg, next),
         _ => panic!("group present at offset {base}"),
     }
 }
@@ -46,18 +47,16 @@ fn test_sal_round_trip() {
         assert!(new_cursor > 0);
 
         for w in 0..4u32 {
-            let rr = group_at(ptr, 0, w, size);
+            let (rr, next) = group_at(ptr, 0, w, size);
             assert_eq!(rr.lsn, 100);
             assert_eq!(rr.target_id, 42);
             assert_eq!(epoch_at(ptr, 0, size), 1);
-            assert_eq!(rr.advance, new_cursor);
+            assert_eq!(next, new_cursor);
 
             if bufs[w as usize].is_empty() {
-                assert!(rr.data_ptr.is_null(), "no data slot for worker {w}");
+                assert!(rr.wire_data.is_none(), "no data slot for worker {w}");
             } else {
-                assert!(!rr.data_ptr.is_null());
-                let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
-                assert_eq!(data, bufs[w as usize].as_slice());
+                assert_eq!(rr.wire_data.expect("data slot"), bufs[w as usize].as_slice());
             }
         }
     }
@@ -76,14 +75,12 @@ fn test_sal_unicast_isolation() {
         sal_write_group(ptr, 0, 10, 1, 0, 1, size as u64, &payloads).expect("group fits");
 
         for w in [0u32, 1, 3] {
-            let rr = group_at(ptr, 0, w, size);
-            assert!(rr.data_ptr.is_null(), "no data slot for worker {w}");
-            assert!(rr.advance > 0);
+            let (rr, next) = group_at(ptr, 0, w, size);
+            assert!(rr.wire_data.is_none(), "no data slot for worker {w}");
+            assert!(next > 0);
         }
-        let rr = group_at(ptr, 0, 2, size);
-        assert!(!rr.data_ptr.is_null());
-        let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
-        assert_eq!(data, buf.as_slice());
+        let (rr, _) = group_at(ptr, 0, 2, size);
+        assert_eq!(rr.wire_data.expect("data slot"), buf.as_slice());
     }
 }
 
@@ -103,17 +100,15 @@ fn test_sal_multiple_groups() {
 
         let mut rc = 0u64;
         for g in 0..3u64 {
-            let rr = group_at(ptr, rc, 0, size);
-            assert!(!rr.data_ptr.is_null());
+            let (rr, next) = group_at(ptr, rc, 0, size);
             assert_eq!(rr.lsn, g * 10);
             assert_eq!(rr.target_id, g as u32);
-            let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
-            assert_eq!(data, vec![(g + 1) as u8; 64].as_slice());
-            rc += rr.advance;
+            assert_eq!(rr.wire_data.expect("data slot"), vec![(g + 1) as u8; 64].as_slice());
+            rc = next;
         }
         assert!(matches!(
             sal_read_group_header(ptr, rc, 0, EpochGate::Any, size as u64),
-            SalRead::Absent
+            SalStep::Absent
         ));
     }
 }
@@ -172,12 +167,10 @@ fn test_sal_cross_process() {
         let r = posix_io::eventfd_wait(efd, 5000);
         assert!(r > 0, "eventfd timed out");
 
-        let rr = group_at(ptr, 0, 0, size);
-        assert!(!rr.data_ptr.is_null());
+        let (rr, _) = group_at(ptr, 0, 0, size);
         assert_eq!(rr.lsn, 555);
         assert_eq!(rr.target_id, 99);
-        let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
-        assert_eq!(data, vec![0x77u8; 128].as_slice());
+        assert_eq!(rr.wire_data.expect("data slot"), vec![0x77u8; 128].as_slice());
 
         let mut status = 0i32;
         libc::waitpid(pid, &mut status, 0);
@@ -199,10 +192,9 @@ fn test_sal_checkpoint_reset() {
         let buf2 = make_test_data(0x22, 32);
         sal_write_group(ptr, 0, 0, 0, 0, 2, size as u64, &[&buf2]).expect("group fits");
 
-        let rr = group_at(ptr, 0, 0, size);
+        let (rr, _) = group_at(ptr, 0, 0, size);
         assert_eq!(epoch_at(ptr, 0, size), 2);
-        let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
-        assert_eq!(data, vec![0x22u8; 32].as_slice());
+        assert_eq!(rr.wire_data.expect("data slot"), vec![0x22u8; 32].as_slice());
     }
 }
 
@@ -232,13 +224,16 @@ fn a_group_hides_the_slots_of_a_wider_group_at_the_same_offset() {
             "the tail's own count is the narrow one"
         );
         for w in 0..8u32 {
-            let r = group_at(ptr, 0, w, size);
+            let (r, _) = group_at(ptr, 0, w, size);
             assert_eq!(r.slots, 2);
             if w < 2 {
-                assert_eq!(r.data_size, 32, "slot {w} is the narrow group's");
+                assert_eq!(
+                    r.wire_data.expect("narrow slot").len(),
+                    32,
+                    "slot {w} is the narrow group's"
+                );
             } else {
-                assert!(r.data_ptr.is_null(), "slot {w} was never written by this group");
-                assert_eq!(r.data_size, 0);
+                assert!(r.wire_data.is_none(), "slot {w} was never written by this group");
             }
         }
     }
@@ -364,10 +359,10 @@ fn test_sal_epoch_fence() {
         let c1 = sal_write_group(ptr, 0, 0, 0, 0, 5, size as u64, &[&buf]).expect("group fits");
         sal_write_group(ptr, c1, 0, 0, 0, 6, size as u64, &[&buf]).expect("group fits");
 
-        let rr1 = group_at(ptr, 0, 0, size);
+        let (_, next) = group_at(ptr, 0, 0, size);
         assert_eq!(epoch_at(ptr, 0, size), 5);
-        group_at(ptr, rr1.advance, 0, size);
-        assert_eq!(epoch_at(ptr, rr1.advance, size), 6);
+        group_at(ptr, next, 0, size);
+        assert_eq!(epoch_at(ptr, next, size), 6);
     }
 }
 
@@ -387,13 +382,8 @@ fn test_commit_sentinel_round_trip() {
         let c1 = sal_write_group(ptr, 0, 100, 7, 0, 1, size as u64, &payloads).expect("group fits");
         let c2 = sal_write_group(ptr, c1, 101, 7, 0, 1, size as u64, &payloads).expect("group fits");
 
-        // Sentinel via SalWriter at the same LSN. m2w_efds empty so
-        // signal_all is a no-op (we never call it here anyway, but its
-        // presence in SalWriter::new requires the vec).
-        let efd1 = posix_io::eventfd_create();
-        let efd2 = posix_io::eventfd_create();
-        assert!(efd1 >= 0 && efd2 >= 0);
-        let writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2]);
+        // Sentinel via SalWriter at the same LSN.
+        let writer = SalWriter::new(ptr, -1, size as u64, 2);
         writer.reset(c2, 1);
         writer.write_commit_sentinel(7).unwrap();
 
@@ -416,9 +406,6 @@ fn test_commit_sentinel_round_trip() {
         assert_eq!(m3.flags & FLAG_TXN_COMMIT, FLAG_TXN_COMMIT);
         assert_eq!(m3.flags & FLAG_DDL_SYNC, FLAG_DDL_SYNC);
         assert_eq!(m4.flags & FLAG_TXN_COMMIT, 0);
-
-        libc::close(efd1);
-        libc::close(efd2);
     }
 }
 
@@ -426,34 +413,22 @@ fn test_commit_sentinel_round_trip() {
 fn test_commit_sentinel_zero_payload() {
     // The sentinel must produce wire_data=None for every worker — it is
     // a header-only group and must not be misread as a DDL_SYNC batch.
-    unsafe {
-        let size = 1 << 20;
-        let region = SharedRegion::new(size);
-        let ptr = region.ptr();
+    let size = 1 << 20;
+    let region = SharedRegion::new(size);
+    let ptr = region.ptr();
 
-        let efd1 = posix_io::eventfd_create();
-        let efd2 = posix_io::eventfd_create();
-        let efd3 = posix_io::eventfd_create();
-        let efd4 = posix_io::eventfd_create();
-        assert!(efd1 >= 0 && efd2 >= 0 && efd3 >= 0 && efd4 >= 0);
-        let writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2, efd3, efd4]);
-        writer.reset(0, 1);
-        writer.write_commit_sentinel(123).unwrap();
+    let writer = SalWriter::new(ptr, -1, size as u64, 4);
+    writer.reset(0, 1);
+    writer.write_commit_sentinel(123).unwrap();
 
-        for w in 0..4 {
-            let reader = SalReader::for_walk(ptr as *const u8, w, size);
-            let (msg, _) = reader.try_read(0, EpochGate::Any).unwrap();
-            assert_eq!(msg.lsn, 123);
-            assert!(
-                msg.wire_data.is_none(),
-                "sentinel must carry no per-worker payload for worker {w}"
-            );
-        }
-
-        libc::close(efd1);
-        libc::close(efd2);
-        libc::close(efd3);
-        libc::close(efd4);
+    for w in 0..4 {
+        let reader = SalReader::for_walk(ptr as *const u8, w, size);
+        let (msg, _) = reader.try_read(0, EpochGate::Any).unwrap();
+        assert_eq!(msg.lsn, 123);
+        assert!(
+            msg.wire_data.is_none(),
+            "sentinel must carry no per-worker payload for worker {w}"
+        );
     }
 }
 
@@ -477,8 +452,7 @@ fn test_batched_push_shares_zone_lsn() {
         let c2 = sal_write_group(ptr, c1, 1001, zone_lsn, FLAG_PUSH, 1, size as u64, &payloads).expect("group fits");
 
         // Closing sentinel.
-        let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
-        let writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+        let writer = SalWriter::new(ptr, -1, size as u64, nw as usize);
         writer.reset(c2, 1);
         writer.write_commit_sentinel(zone_lsn).unwrap();
 
@@ -510,10 +484,6 @@ fn test_batched_push_shares_zone_lsn() {
             set
         };
         assert!(committed.contains(&zone_lsn), "sentinel must commit the push zone");
-
-        for &e in &efds {
-            libc::close(e);
-        }
     }
 }
 
@@ -542,11 +512,7 @@ fn test_zone_two_groups_one_sentinel() {
         let c2 = sal_write_group(ptr, c1, 201, zone_lsn, 0, 1, size as u64, &payloads_tab).expect("group fits");
 
         // Sentinel.
-        let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
-        for &e in &efds {
-            assert!(e >= 0);
-        }
-        let writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+        let writer = SalWriter::new(ptr, -1, size as u64, nw as usize);
         writer.reset(c2, 1);
         writer.write_commit_sentinel(zone_lsn).unwrap();
 
@@ -565,10 +531,6 @@ fn test_zone_two_groups_one_sentinel() {
             assert!(m1.wire_data.is_some(), "first DDL group has data");
             assert!(m2.wire_data.is_some(), "second DDL group has data");
             assert!(m3.wire_data.is_none(), "sentinel carries no data");
-        }
-
-        for &e in &efds {
-            libc::close(e);
         }
     }
 }
@@ -590,8 +552,8 @@ fn test_two_groups_same_lsn() {
         let buf2 = make_test_data(0x20, 32);
         sal_write_group(ptr, c1, 8, 42, 0, 1, size as u64, &[&buf2]).expect("group fits");
 
-        let rr1 = group_at(ptr, 0, 0, size);
-        let rr2 = group_at(ptr, rr1.advance, 0, size);
+        let (rr1, next) = group_at(ptr, 0, 0, size);
+        let (rr2, _) = group_at(ptr, next, 0, size);
         assert_eq!(rr1.lsn, 42);
         assert_eq!(rr2.lsn, 42);
         assert_eq!(rr1.target_id, 7);
@@ -625,20 +587,19 @@ fn test_sal_cross_process_checkpoint() {
         }
 
         posix_io::eventfd_wait(efd, 5000);
-        let rr1 = group_at(ptr, 0, 0, size);
+        let (rr1, _) = group_at(ptr, 0, 0, size);
         assert_eq!(epoch_at(ptr, 0, size), 1);
         assert_eq!(rr1.lsn, 10);
         posix_io::eventfd_signal(efd2);
 
         posix_io::eventfd_wait(efd, 5000);
-        let rr2 = group_at(ptr, 0, 0, size);
+        let (rr2, _) = group_at(ptr, 0, 0, size);
         assert_eq!(epoch_at(ptr, 0, size), 2);
         assert_eq!(rr2.lsn, 20);
 
         let mut status = 0i32;
         libc::waitpid(pid, &mut status, 0);
         libc::close(efd);
-        libc::close(efd2);
     }
 }
 
@@ -698,10 +659,10 @@ fn test_sal_prefix_packing_boundaries() {
         let word = atomic_load_u64(ptr);
         assert_eq!((word >> 32) as u32, u32::MAX);
         assert_eq!((word & 0xFFFF_FFFF) as usize, group_header_size(1));
-        let rr = group_at(ptr, 0, 0, size);
+        let (_, next) = group_at(ptr, 0, 0, size);
         assert_eq!(epoch_at(ptr, 0, size), u32::MAX);
-        assert_eq!(rr.advance, (8 + group_header_size(1)) as u64);
-        assert_eq!(new_cursor, rr.advance);
+        assert_eq!(next, (8 + group_header_size(1)) as u64);
+        assert_eq!(new_cursor, next);
 
         // Multi-MiB group, epoch 1.
         std::ptr::write_bytes(ptr, 0, size);
@@ -711,21 +672,20 @@ fn test_sal_prefix_packing_boundaries() {
         let word = atomic_load_u64(ptr);
         assert_eq!((word >> 32) as u32, 1);
         assert_eq!((word & 0xFFFF_FFFF) as usize, expected_payload);
-        let rr = group_at(ptr, 0, 0, size);
-        assert!(!rr.data_ptr.is_null());
+        let (rr, next) = group_at(ptr, 0, 0, size);
         assert_eq!(epoch_at(ptr, 0, size), 1);
-        assert_eq!(rr.advance, (8 + expected_payload) as u64);
-        assert_eq!(rr.data_size as usize, 3 << 20);
+        assert_eq!(next, (8 + expected_payload) as u64);
+        assert_eq!(rr.wire_data.expect("data slot").len(), 3 << 20);
     }
 }
 
 // ---------------------------------------------------------------------------
-// wire_group_footprint exactness: the committer's per-transaction fit check and
-// Phase-B fail-stop depend on it equaling the bytes emission actually consumes.
+// scatter_group_footprint exactness: the committer's per-transaction fit check
+// and Phase-B fail-stop depend on it equaling the bytes emission consumes.
 // ---------------------------------------------------------------------------
 
 /// Emit `batch` (partitioned or broadcast) through `scatter_wire_group` and
-/// assert the cursor advance equals `wire_group_footprint`'s prediction.
+/// assert the cursor advance equals `scatter_group_footprint`'s prediction.
 unsafe fn assert_footprint_exact(
     schema: &crate::schema::SchemaDescriptor,
     batch: &crate::storage::Batch,
@@ -750,8 +710,7 @@ unsafe fn assert_footprint_exact(
     let size = 1 << 20;
     let region = SharedRegion::new(size);
     let ptr = region.ptr();
-    let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
-    let writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
+    let writer = SalWriter::new(ptr, -1, size as u64, nw);
     writer.reset(0, 1); // epoch >= 1 for sal_begin_group's debug_assert
 
     let target_id = 16u32;
@@ -760,7 +719,8 @@ unsafe fn assert_footprint_exact(
     let req_ids: Vec<u64> = (0..nw as u64).map(|i| i + 1).collect();
 
     let emit = |wi: &[Vec<u32>]| {
-        let predicted = writer.wire_group_footprint(batch, wi, schema, block.len(), props);
+        let predicted =
+            writer.scatter_group_footprint(batch, wi, schema, target_id, Some(block.as_slice()), Some(props));
         let before = writer.cursor();
         writer
             .scatter_wire_group(
@@ -778,16 +738,13 @@ unsafe fn assert_footprint_exact(
             )
             .expect("group fits");
         let actual = (writer.cursor() - before) as usize;
-        assert_eq!(predicted, actual, "wire_group_footprint must equal emitted bytes");
+        assert_eq!(predicted, actual, "scatter_group_footprint must equal emitted bytes");
     };
     with_commit_indices(batch, schema, nw, emit);
-    for &e in &efds {
-        libc::close(e);
-    }
 }
 
 #[test]
-fn test_wire_group_footprint_wire_safe_partitioned_and_empty_slots() {
+fn test_scatter_group_footprint_wire_safe_partitioned_and_empty_slots() {
     // A small partitioned batch over 4 workers leaves some worker slots empty
     // (schema-only), exercising the count-0 branch of the closed form.
     use crate::test_support::{make_batch, make_schema_u64_i64};
@@ -797,7 +754,7 @@ fn test_wire_group_footprint_wire_safe_partitioned_and_empty_slots() {
 }
 
 #[test]
-fn test_wire_group_footprint_wire_safe_broadcast() {
+fn test_scatter_group_footprint_wire_safe_broadcast() {
     // Broadcast fills every worker slot with all rows (replicated family shape),
     // and the schema block is paid once per worker.
     use crate::test_support::{make_batch, make_schema_u64_i64};
@@ -807,7 +764,7 @@ fn test_wire_group_footprint_wire_safe_broadcast() {
 }
 
 #[test]
-fn test_wire_group_footprint_non_wire_safe_shared_span_dedup() {
+fn test_scatter_group_footprint_non_wire_safe_shared_span_dedup() {
     // A string (non-wire-safe) batch whose two rows reference the SAME source
     // span: the per-worker sub-batch's BlobCache copies the span once, so
     // measuring the materialized sub-batch (not a naive per-row sum) is the only
@@ -843,6 +800,7 @@ fn test_wire_group_footprint_non_wire_safe_shared_span_dedup() {
 fn test_group_footprint_direct_equals_emitted_bytes() {
     use crate::runtime::sal::DirectGroup;
     use crate::runtime::sal::FLAG_EXCHANGE_RELAY;
+    use crate::runtime::wire::{WireData, WireMsg};
     use crate::test_support::{make_batch, make_schema_u64_i64};
 
     let nw = 4;
@@ -851,25 +809,28 @@ fn test_group_footprint_direct_equals_emitted_bytes() {
 
     let size = 1 << 20;
     let region = SharedRegion::new(size);
-    let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
-    let writer = SalWriter::new(region.ptr(), -1, size as u64, efds.clone());
+    let writer = SalWriter::new(region.ptr(), -1, size as u64, nw);
     writer.reset(0, 1); // epoch >= 1 for sal_begin_group's debug_assert
 
-    // Slot 2 stays empty: `relay_refs` passes `None` for a zero-row worker.
+    // Slot 2 stays empty: `relay_data` passes a dataless slot for a zero-row worker.
     let req_ids = [0u64; 4];
-    let refs: Vec<Option<&crate::storage::Batch>> = vec![Some(&batch), Some(&batch), None, Some(&batch)];
+    let worker_data = [
+        WireData::Whole(Some(&batch)),
+        WireData::Whole(Some(&batch)),
+        WireData::Whole(None),
+        WireData::Whole(Some(&batch)),
+    ];
     let group = DirectGroup {
-        target_id: 16,
-        wire_flags: 0,
-        worker_batches: &refs,
-        schema: Some(&schema),
-        seek_pk: 7,
-        seek_col_idx: 1,
+        template: WireMsg {
+            target_id: 16,
+            seek_pk: 7,
+            seek_col_idx: 1,
+            schema: Some(&schema),
+            ..Default::default()
+        },
+        worker_data: &worker_data,
         req_ids: &req_ids,
         unicast_worker: None,
-        client_id: 0,
-        prebuilt_schema_block: None,
-        seek_pk_extra: &[],
     };
 
     let predicted = writer.group_footprint_direct(&group);
@@ -879,10 +840,6 @@ fn test_group_footprint_direct_equals_emitted_bytes() {
         .expect("group fits");
     let actual = (writer.cursor() - before) as usize;
     assert_eq!(predicted, actual, "group_footprint_direct must equal emitted bytes");
-
-    for &e in &efds {
-        unsafe { libc::close(e) };
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,13 +959,13 @@ fn the_derived_stride_equals_the_writers_payload_size_at_every_width() {
 
             let word = atomic_load_u64(ptr);
             let payload_size = (word & 0xFFFF_FFFF) as usize;
-            let rr = group_at(ptr, 0, 0, size);
+            let (_, next) = group_at(ptr, 0, 0, size);
             assert_eq!(
-                rr.advance as usize,
+                next as usize,
                 8 + payload_size,
                 "the derived stride must equal the prefix's payload_size at {slots} slots"
             );
-            assert_eq!(rr.advance, cursor, "and the writer's own cursor advance");
+            assert_eq!(next, cursor, "and the writer's own cursor advance");
 
             // The writer's own header arithmetic, which the committer's fit check
             // rests on, must agree with the layout byte for byte.

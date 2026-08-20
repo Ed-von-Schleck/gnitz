@@ -9,7 +9,7 @@
 //! byte-orderable at any width.
 
 use crate::runtime::master::PreflightAccumulator;
-use crate::runtime::sal::{unique_preflight_wire_schema, SalMessageKind, FLAG_UNIQUE_PREFLIGHT};
+use crate::runtime::sal::{SalMessageKind, FLAG_UNIQUE_PREFLIGHT};
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring;
 use crate::runtime::wire::{
@@ -18,6 +18,7 @@ use crate::runtime::wire::{
 use crate::runtime::worker::send_unique_preflight_keys;
 use crate::schema::key::PkBuf;
 use crate::schema::make_index_schema;
+use crate::schema::unique_preflight_wire_schema;
 use crate::schema::{type_code, IndexKeySpec, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, KeyProducer, SpillSort};
 
@@ -68,7 +69,7 @@ fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
     let region = crate::test_support::SharedRegion::new(CAP);
     let ptr = region.ptr();
     unsafe { w2m_ring::init_region_for_tests(ptr, CAP as u64) };
-    let writer = W2mWriter::new(ptr, CAP as u64);
+    let writer = W2mWriter::new(ptr);
     let receiver = W2mReceiver::new(vec![ptr]);
     f(&writer, &receiver);
 }

@@ -69,18 +69,13 @@ use gnitz_wire::align8;
 /// Order witness for [`W2mRingHeader::arm_master_park`], whose store order is
 /// what keeps the lost-wake window closed. Each call stamps its two sub-steps;
 /// [`park_order::step`] reads back 2 only when the flag publish preceded the
-/// `reader_seq` snapshot. An armed probe additionally lets a test hold the
-/// unread-data check until a helper thread's publish is globally visible,
-/// making that outcome deterministic instead of racy.
+/// `reader_seq` snapshot.
 #[cfg(test)]
 pub(crate) mod park_order {
-    use std::cell::{Cell, RefCell};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::cell::Cell;
 
     thread_local! {
         static STEP: Cell<u8> = const { Cell::new(0) };
-        static HELPER_PUBLISHED: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
     }
 
     pub(crate) fn begin() {
@@ -103,21 +98,6 @@ pub(crate) mod park_order {
     pub(crate) fn step() -> u8 {
         STEP.with(|s| s.get())
     }
-
-    /// Block until an armed probe's helper thread reports it has published.
-    pub(crate) fn await_helper_publish() {
-        let flag = HELPER_PUBLISHED.with(|h| h.borrow().clone());
-        if let Some(flag) = flag {
-            while !flag.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-            }
-        }
-    }
-
-    /// Arm (`Some`) or disarm (`None`) the publish barrier on this thread.
-    pub(crate) fn set_publish_barrier(flag: Option<Arc<AtomicBool>>) {
-        HELPER_PUBLISHED.with(|h| *h.borrow_mut() = flag);
-    }
 }
 
 /// Fixed header size at the start of every W2M mmap region.
@@ -135,11 +115,11 @@ pub const MAX_W2M_MSG: u64 = 1 << 28;
 /// (`sz as u32 LE`), stamped by `try_reserve` in the high half of the packed
 /// prefix so they sit immediately before the payload. The master forwards a slot
 /// to a client zero-copy by extending the payload slice back over these bytes
-/// (`ptr - SLOT_LEN_PREFIX_BYTES` in `W2mReceiver::try_read_slot`). The
-/// pack/unpack shift [`SLOT_LEN_PREFIX_SHIFT`] derives from this width, so this
-/// single constant governs both the producer's bit-packing and the consumer's
-/// byte slice — a prefix-layout change touches only here.
-pub const SLOT_LEN_PREFIX_BYTES: usize = 4;
+/// (`ptr - SLOT_LEN_PREFIX_BYTES` in `W2mReceiver::try_read_slot`) — which is
+/// why this is the client's frame prefix and not a ring-local width. The
+/// pack/unpack shift [`SLOT_LEN_PREFIX_SHIFT`] derives from it, so it governs
+/// both the producer's bit-packing and the consumer's byte slice.
+pub const SLOT_LEN_PREFIX_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
 
 /// Bit shift of the `sz` field within the 8-byte slot prefix: `sz` occupies the
 /// high `SLOT_LEN_PREFIX_BYTES` bytes and `internal_req_id` the low
@@ -159,7 +139,7 @@ pub const FLAG_MASTER_PARKED: u32 = 1 << 1;
 
 /// Size-prefix sentinel for "skip to header, real message is there".
 /// `u64::MAX` is safe because legitimate sizes are capped at `MAX_W2M_MSG`.
-pub const SKIP_MARKER: u64 = u64::MAX;
+const SKIP_MARKER: u64 = u64::MAX;
 
 // ---------------------------------------------------------------------------
 // Header layout (128 bytes, 2 cache lines)
@@ -244,16 +224,16 @@ impl W2mRingHeader {
         &self.consume_cursor
     }
     #[cfg(test)]
-    pub(crate) fn advance_read_cursors(&self, new_rc: u64) {
+    fn advance_read_cursors(&self, new_rc: u64) {
         self.read_cursor().store(new_rc, Ordering::Release);
         self.consume_cursor().store(new_rc, Ordering::Release);
     }
     #[inline]
-    pub fn advance_read_cursor(&self, new_rc: u64) {
+    pub(crate) fn advance_read_cursor(&self, new_rc: u64) {
         self.read_cursor().store(new_rc, Ordering::Release);
     }
     #[inline]
-    pub fn advance_consume_cursor(&self, new_cc: u64) {
+    pub(crate) fn advance_consume_cursor(&self, new_cc: u64) {
         self.consume_cursor().store(new_cc, Ordering::Release);
     }
     #[inline]
@@ -268,11 +248,6 @@ impl W2mRingHeader {
     pub fn waiter_flags(&self) -> &AtomicU32 {
         &self.waiter_flags
     }
-    #[inline]
-    pub fn capacity(&self) -> u64 {
-        self.capacity
-    }
-
     /// Arm the master-park protocol on this ring and snapshot its wait word.
     ///
     /// Returns `(expected_reader_seq, has_unread)`: pass `expected_reader_seq`
@@ -282,13 +257,18 @@ impl W2mRingHeader {
     /// Does NOT clear `FLAG_MASTER_PARKED`; callers that need it cleared (e.g.
     /// `W2mReceiver::wait_for`) do so themselves.
     ///
-    /// Store order is load-bearing: publish `FLAG_MASTER_PARKED` (AcqRel)
-    /// BEFORE snapshotting `reader_seq` (Acquire), and run the unread-data
-    /// check (`write_cursor != read_cursor`) AFTER the snapshot. A worker that
-    /// advances `reader_seq` after our flag publish is guaranteed to observe
-    /// the flag and issue a wake; one that published before the snapshot is
-    /// caught by the unread-data check. Snapshotting before the flag publish,
-    /// or checking unread data before the snapshot, opens a lost-wake window.
+    /// The store order here — publish `FLAG_MASTER_PARKED` (AcqRel), THEN
+    /// snapshot `reader_seq` (Acquire), THEN run the unread-data check
+    /// (`write_cursor != read_cursor`) — is what closes this side's lost-wake
+    /// window. A worker that advances `reader_seq` after our flag publish is
+    /// guaranteed to observe the flag and issue a wake; one that published
+    /// before the snapshot is caught by the unread-data check. Snapshotting
+    /// before the flag publish, or checking unread data before the snapshot,
+    /// reopens it.
+    ///
+    /// This is the master's rule, not a symmetric one: the writer's park
+    /// (`W2mWriter::send_encoded`) snapshots first and publishes its flag
+    /// second, and is correct for its own reason — see the comment there.
     #[inline]
     pub fn arm_master_park(&self) -> (u32, bool) {
         #[cfg(test)]
@@ -299,8 +279,6 @@ impl W2mRingHeader {
         let expected = self.reader_seq().load(Ordering::Acquire);
         #[cfg(test)]
         park_order::reader_seq_snapshotted();
-        #[cfg(test)]
-        park_order::await_helper_publish();
         // `write_cursor` is peer-written (the worker publishes it) and must stay
         // `Acquire`; `read_cursor` is master-owned, so reading back our own last
         // advance is a `Relaxed` load.
@@ -408,16 +386,6 @@ fn room_for(vwc: u64, vrc: u64, total: u64, cap: u64) -> bool {
     }
 }
 
-/// Outcome of `try_publish`.
-#[cfg(test)]
-pub(crate) enum TryPublish {
-    /// Published successfully; the new (virtual) write cursor is returned.
-    Ok(u64),
-    /// No contiguous room before `capacity` and no room to wrap without
-    /// lapping the reader. The caller must park.
-    Full,
-}
-
 /// Outcome of `reserve`: a callable slot the producer fills, plus the
 /// cursor value to commit via `commit`. `reserve` does NOT update
 /// `write_cursor` — the producer must call `commit` after filling the
@@ -483,7 +451,7 @@ pub(crate) unsafe fn try_publish(
     data_base: *mut u8,
     sz: usize,
     encode: impl FnOnce(&mut [u8]),
-) -> TryPublish {
+) -> Option<u64> {
     match try_reserve(hdr, data_base, sz, 0) {
         TryReserve::Ok(r) => {
             if r.slot_len > 0 {
@@ -492,9 +460,11 @@ pub(crate) unsafe fn try_publish(
             }
             let new_wc = r.new_wc;
             commit(hdr, r);
-            TryPublish::Ok(new_wc)
+            Some(new_wc)
         }
-        TryReserve::Full => TryPublish::Full,
+        // No contiguous room before `capacity` and no room to wrap without
+        // lapping the reader: the caller must park.
+        TryReserve::Full => None,
     }
 }
 
@@ -516,7 +486,7 @@ pub(crate) unsafe fn try_publish(
 /// [slot_ptr - 8 .. slot_ptr - 4]  internal_req_id as u32 LE
 /// [slot_ptr - 4 .. slot_ptr    ]  sz as u32 LE   ← client length prefix
 /// ```
-/// Stored as `(internal_req_id as u64) | ((sz as u64) << 32)`.
+/// Stored as `(internal_req_id as u64) | ((sz as u64) << SLOT_LEN_PREFIX_SHIFT)`.
 ///
 /// # Safety
 /// Same preconditions as `try_publish`. The caller must not interleave
@@ -587,6 +557,22 @@ pub(crate) unsafe fn try_reserve(
 pub(crate) unsafe fn init_region_for_tests(ptr: *mut u8, capacity: u64) {
     assert!(capacity >= W2M_HEADER_SIZE as u64 + 16);
     init_region_inner(ptr, capacity);
+}
+
+/// An initialized test ring sized to hold `n_msgs` messages of `msg_sz` bytes
+/// plus `slack` spare bytes. `slack` is what the SKIP-wrap and backpressure
+/// tests actually differ in: it decides whether one more message fits before the
+/// physical end, so it is the knob, not an incidental `+8`.
+///
+/// # Safety
+/// The caller must keep the returned region alive for as long as anything reads
+/// or writes the ring.
+#[cfg(test)]
+pub(crate) unsafe fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> crate::test_support::SharedRegion {
+    let capacity = W2M_HEADER_SIZE as u64 + n_msgs as u64 * (8 + align8(msg_sz) as u64) + slack;
+    let region = crate::test_support::SharedRegion::new(capacity as usize);
+    init_region_for_tests(region.ptr(), capacity);
+    region
 }
 
 /// Read-only predicate: would a `try_reserve` for `sz` bytes succeed
@@ -722,6 +708,10 @@ mod tests {
 
     /// Round-trip helper: consume one message via `hdr.read_cursor` and
     /// return `(ptr, sz)`. Bumps `hdr.read_cursor` on success.
+    /// Consume the next message and advance both read cursors, as the master's
+    /// drain does. The cursor comes from the header, so a caller keeps no `rc` of
+    /// its own — and a writer-side reset between calls is picked up rather than
+    /// read against a stale snapshot.
     unsafe fn consume_one(hdr: &W2mRingHeader, ptr: *const u8) -> Option<(*const u8, u32)> {
         let rc = hdr.read_cursor().load(Ordering::Acquire);
         let (p, sz, new_rc, _req_id) = try_consume(hdr, ptr, rc)?;
@@ -741,12 +731,10 @@ mod tests {
             let hdr = W2mRingHeader::from_raw(ptr);
 
             let payload = [0xAAu8; 128];
-            let published = match try_publish(hdr, ptr, payload.len(), |slot| {
+            let published = try_publish(hdr, ptr, payload.len(), |slot| {
                 slot.copy_from_slice(&payload);
-            }) {
-                TryPublish::Ok(n) => n,
-                TryPublish::Full => panic!("unexpected Full on empty ring"),
-            };
+            })
+            .expect("unexpected Full on empty ring");
             assert_eq!(
                 published,
                 W2M_HEADER_SIZE as u64 + 8 + 128,
@@ -781,23 +769,19 @@ mod tests {
 
             for tag in 0u8..3 {
                 let payload = vec![tag + 1; 64];
-                match try_publish(hdr, ptr, payload.len(), |slot| {
+                try_publish(hdr, ptr, payload.len(), |slot| {
                     slot.copy_from_slice(&payload);
-                }) {
-                    TryPublish::Ok(_) => {}
-                    TryPublish::Full => panic!("unexpected Full"),
-                }
+                })
+                .expect("unexpected Full");
             }
 
-            let mut rc = W2M_HEADER_SIZE as u64;
             for tag in 0u8..3 {
-                let (data_ptr, sz, new_rc, _req_id) = try_consume(hdr, ptr, rc).expect("message must be visible");
+                let (data_ptr, sz) = consume_one(hdr, ptr).expect("message must be visible");
                 assert_eq!(sz, 64);
                 let data = std::slice::from_raw_parts(data_ptr, sz as usize);
                 assert!(data.iter().all(|&b| b == tag + 1));
-                rc = new_rc;
             }
-            assert!(try_consume(hdr, ptr, rc).is_none());
+            assert!(consume_one(hdr, ptr).is_none());
         }
     }
 
@@ -812,103 +796,76 @@ mod tests {
     fn test_w2m_skip_marker_wraparound() {
         unsafe {
             let msg_sz = 1 << 16; // 64 KiB
-            let msg_total = 8 + align8(msg_sz) as u64;
-            // Room for 2 full messages + a bit — so the 3rd publish
-            // can't fit contiguously but wrap_end < rc is satisfied
-            // after a consume.
-            let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 64;
-            let size = capacity as usize;
-            let region = SharedRegion::new(size);
+                                  // Room for 2 full messages + a bit — so the 3rd publish
+                                  // can't fit contiguously but wrap_end < rc is satisfied
+                                  // after a consume.
+            let region = super::make_ring(msg_sz, 2, 64);
             let ptr = region.ptr();
-            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             // Publish 1, consume 1, publish 2, consume 2, publish 3.
-            let mut rc = W2M_HEADER_SIZE as u64;
             for tag in 0u8..2 {
-                match try_publish(hdr, ptr, msg_sz, |slot| {
+                try_publish(hdr, ptr, msg_sz, |slot| {
                     slot[0] = tag;
-                }) {
-                    TryPublish::Ok(_) => {}
-                    TryPublish::Full => panic!("tag {tag} publish"),
-                }
-                let (_data_ptr, sz, new_rc, _req_id) = try_consume(hdr, ptr, rc).expect("tag consume");
+                })
+                .unwrap_or_else(|| panic!("tag {tag} publish"));
+                let (_data_ptr, sz) = consume_one(hdr, ptr).expect("tag consume");
                 assert_eq!(sz, msg_sz as u32);
-                hdr.advance_read_cursors(new_rc);
-                rc = new_rc;
             }
-            // After two publish+consume, wc == rc. Third publish
-            // triggers the wc==rc reset path (no SKIP) OR the wrap path
-            // depending on cap. With cap = HEADER + 2*total + 64, the
-            // third msg (total = msg_total) has wc+total = HEADER +
-            // 2*total + total = HEADER + 3*total > cap, so reset fires.
-            match try_publish(hdr, ptr, msg_sz, |slot| {
+            // After two publish+consume the reader has caught up, so the ring is
+            // empty but the write cursor is not at the start. With
+            // cap = HEADER + 2*total + 64 the third message does not fit before
+            // the physical end, so it SKIP-wraps back to HEADER — `try_reserve`
+            // has only the two branches, and nothing ever rewinds `read_cursor`.
+            try_publish(hdr, ptr, msg_sz, |slot| {
                 slot[0] = 0xCC;
-            }) {
-                TryPublish::Ok(_) => {}
-                TryPublish::Full => panic!("reset-based publish must succeed"),
-            }
-            // Consumer: after reset, rc must be re-loaded from hdr —
-            // the writer's reset invalidated our local snapshot.
-            rc = hdr.read_cursor().load(Ordering::Acquire);
-            let (data_ptr, sz, _new_rc, _req_id) = try_consume(hdr, ptr, rc).expect("message after reset");
+            })
+            .expect("the wrapped publish must succeed against a drained reader");
+            let (data_ptr, sz) = consume_one(hdr, ptr).expect("message after the wrap");
             assert_eq!(sz, msg_sz as u32);
             let d = std::slice::from_raw_parts(data_ptr, 1);
             assert_eq!(d[0], 0xCC);
         }
     }
 
-    /// A pure SKIP-wrap (not empty-reset): cap leaves room for 3 big
-    /// messages + SKIP headroom, and the reader lags by exactly 1.
-    /// Forces SKIP wrap to fire with `wrap_end < rc` strictly.
+    /// A SKIP-wrap with the reader still behind: cap leaves room for 3 big
+    /// messages + SKIP headroom, and the reader lags by exactly 1. Forces the
+    /// wrap to fire with `wrap_end < rc` strictly.
     #[test]
     fn test_w2m_skip_marker_strict_wrap() {
         unsafe {
             let big_sz = 1 << 16; // 64 KiB
-            let big_total = 8 + align8(big_sz) as u64;
-            // Room for 3 bigs + 16 bytes slack (enough for SKIP
-            // marker and a bit more).
-            let capacity = W2M_HEADER_SIZE as u64 + 3 * big_total + 16;
-            let size = capacity as usize;
-            let region = SharedRegion::new(size);
+                                  // Room for 3 bigs + 16 bytes slack (enough for SKIP
+                                  // marker and a bit more).
+            let region = super::make_ring(big_sz, 3, 16);
             let ptr = region.ptr();
-            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             // Publish 3 bigs, consume 2. wc = HEADER + 3*big_total,
             // rc = HEADER + 2*big_total. Reader is 1 big behind.
             for _ in 0..3 {
-                match try_publish(hdr, ptr, big_sz, |_| {}) {
-                    TryPublish::Ok(_) => {}
-                    TryPublish::Full => panic!("initial big publish"),
-                }
+                try_publish(hdr, ptr, big_sz, |_| {}).expect("initial big publish");
             }
-            let mut rc = W2M_HEADER_SIZE as u64;
             for _ in 0..2 {
-                let (_, _, new_rc, _) = try_consume(hdr, ptr, rc).expect("consume");
-                hdr.advance_read_cursors(new_rc);
-                rc = new_rc;
+                consume_one(hdr, ptr).expect("consume");
             }
 
             // Now publish a 4th big. wc + total > cap (would be
             // HEADER + 4*big_total > HEADER + 3*big_total + 16).
             // wrap_end = HEADER + big_total < rc = HEADER + 2*big_total.
             // SKIP wrap must fire.
-            match try_publish(hdr, ptr, big_sz, |slot| {
+            try_publish(hdr, ptr, big_sz, |slot| {
                 slot[0] = 0xDE;
-            }) {
-                TryPublish::Ok(_) => {}
-                TryPublish::Full => panic!("SKIP wrap must succeed"),
-            }
+            })
+            .expect("SKIP wrap must succeed");
             assert_eq!(hdr.writer_wrap_count(), 1, "one SKIP wrap should have happened",);
 
             // Consumer reads the 3rd pre-wrap big, then jumps via
             // SKIP to the wrapped big.
-            let (_, sz_a, new_rc, _) = try_consume(hdr, ptr, rc).expect("pre-SKIP big");
+            let (_, sz_a) = consume_one(hdr, ptr).expect("pre-SKIP big");
             assert_eq!(sz_a, big_sz as u32);
-            hdr.advance_read_cursors(new_rc);
 
-            let (_, sz_b, _, _) = try_consume(hdr, ptr, new_rc).expect("wrapped big via SKIP");
+            let (_, sz_b) = consume_one(hdr, ptr).expect("wrapped big via SKIP");
             assert_eq!(sz_b, big_sz as u32);
         }
     }
@@ -920,27 +877,20 @@ mod tests {
     fn test_w2m_full_blocks_writer() {
         unsafe {
             let msg_sz = 1 << 16; // 64 KiB
-            let msg_total = 8 + align8(msg_sz) as u64;
-            let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 8;
-            let size = capacity as usize;
-            let region = SharedRegion::new(size);
+            let region = super::make_ring(msg_sz, 2, 8);
             let ptr = region.ptr();
-            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             for _ in 0..2 {
-                match try_publish(hdr, ptr, msg_sz, |_| {}) {
-                    TryPublish::Ok(_) => {}
-                    TryPublish::Full => panic!("fill publish"),
-                }
+                try_publish(hdr, ptr, msg_sz, |_| {}).expect("fill publish");
             }
-            // Reader is still at HEADER. Third publish: contiguous
-            // fails (wc + total > cap), wrap fails (wrap_end >= rc),
-            // reset fails (wc != rc, ring is full, not empty). Full.
-            match try_publish(hdr, ptr, msg_sz, |_| {}) {
-                TryPublish::Full => {}
-                TryPublish::Ok(_) => panic!("undrained ring must return Full"),
-            }
+            // Reader is still at HEADER. Third publish: it does not fit before
+            // the physical end, and wrapping would lap the reader
+            // (`wrap_end >= rc`), so `room_for` refuses it.
+            assert!(
+                try_publish(hdr, ptr, msg_sz, |_| {}).is_none(),
+                "undrained ring must refuse the publish"
+            );
         }
     }
 
@@ -954,10 +904,10 @@ mod tests {
             init_region(ptr, size as u64);
             let hdr = W2mRingHeader::from_raw(ptr);
 
-            match try_publish(hdr, ptr, (MAX_W2M_MSG + 1) as usize, |_| {}) {
-                TryPublish::Full => {}
-                TryPublish::Ok(_) => panic!("oversized publish must be rejected"),
-            }
+            assert!(
+                try_publish(hdr, ptr, (MAX_W2M_MSG + 1) as usize, |_| {}).is_none(),
+                "oversized publish must be rejected"
+            );
         }
     }
 
@@ -974,14 +924,12 @@ mod tests {
             let hdr = W2mRingHeader::from_raw(ptr);
 
             let payload = [0xCDu8; 256];
-            match try_publish(hdr, ptr, payload.len(), |slot| {
+            try_publish(hdr, ptr, payload.len(), |slot| {
                 slot.copy_from_slice(&payload);
-            }) {
-                TryPublish::Ok(_) => {}
-                TryPublish::Full => panic!("unexpected Full"),
-            }
+            })
+            .expect("unexpected Full");
 
-            let (data_ptr, _sz, _, _) = try_consume(hdr, ptr, W2M_HEADER_SIZE as u64).expect("message must be visible");
+            let (data_ptr, _sz) = consume_one(hdr, ptr).expect("message must be visible");
             let expected = ptr.add(W2M_HEADER_SIZE + 8) as *const u8;
             assert_eq!(data_ptr, expected, "data_ptr must be mmap-resident (zero copy)");
         }
@@ -994,41 +942,24 @@ mod tests {
     fn test_w2m_repeated_wraps() {
         unsafe {
             let msg_sz = 1 << 16; // 64 KiB
-            let msg_total = 8 + align8(msg_sz) as u64;
-            // Room for 3 messages + SKIP slack.
-            let capacity = W2M_HEADER_SIZE as u64 + 3 * msg_total + 16;
-            let size = capacity as usize;
-            let region = SharedRegion::new(size);
+                                  // Room for 3 messages + SKIP slack.
+            let region = super::make_ring(msg_sz, 3, 16);
             let ptr = region.ptr();
-            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             // Prime with 2 publishes so rc trails wc by 1 thereafter.
             for _ in 0..2 {
-                match try_publish(hdr, ptr, msg_sz, |_| {}) {
-                    TryPublish::Ok(_) => {}
-                    TryPublish::Full => panic!("prime publish"),
-                }
+                try_publish(hdr, ptr, msg_sz, |_| {}).expect("prime publish");
             }
-            let mut rc = W2M_HEADER_SIZE as u64;
-
             // 20 cycles is more than enough to exceed 3 * msg_total
             // of cumulative publish bytes and force at least one wrap.
             for _ in 0..20 {
-                // Consume, then publish, keeping rc 1-behind.
-                let (_, _sz, new_rc, _) = try_consume(hdr, ptr, rc).expect("cycle consume");
-                hdr.advance_read_cursors(new_rc);
-                rc = new_rc;
-                match try_publish(hdr, ptr, msg_sz, |_| {}) {
-                    TryPublish::Ok(_) => {}
-                    TryPublish::Full => panic!("cycle publish"),
-                }
+                // Consume, then publish, keeping the reader 1-behind.
+                consume_one(hdr, ptr).expect("cycle consume");
+                try_publish(hdr, ptr, msg_sz, |_| {}).expect("cycle publish");
             }
             // Drain.
-            while let Some((_, _, new_rc, _)) = try_consume(hdr, ptr, rc) {
-                hdr.advance_read_cursors(new_rc);
-                rc = new_rc;
-            }
+            while consume_one(hdr, ptr).is_some() {}
             assert!(
                 hdr.writer_wrap_count() >= 1,
                 "at least one SKIP wrap must have occurred (got {})",
@@ -1051,22 +982,18 @@ mod tests {
     fn test_writer_does_not_cross_reader_after_wrap() {
         unsafe {
             let msg_sz: usize = 64;
-            let msg_total = (8 + align8(msg_sz)) as u64;
-            let capacity = W2M_HEADER_SIZE as u64 + 5 * msg_total + 16;
-            let size = 4096; // one page is plenty for 600-ish bytes
-            let region = SharedRegion::new(size);
+            let region = super::make_ring(msg_sz, 5, 16);
             let ptr = region.ptr();
-            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
-            let publish = |tag: u8| match try_publish(hdr, ptr, msg_sz, |slot| {
-                slot[0] = tag;
-                for b in &mut slot[1..] {
-                    *b = tag;
-                }
-            }) {
-                TryPublish::Ok(_) => true,
-                TryPublish::Full => false,
+            let publish = |tag: u8| {
+                try_publish(hdr, ptr, msg_sz, |slot| {
+                    slot[0] = tag;
+                    for b in &mut slot[1..] {
+                        *b = tag;
+                    }
+                })
+                .is_some()
             };
 
             // 4 contiguous publishes.
@@ -1075,14 +1002,11 @@ mod tests {
             }
 
             // Consume 3, leaving msg #4 unread at rc = HEADER + 3*total.
-            let mut rc = hdr.read_cursor().load(Ordering::Acquire);
             let mut received = Vec::new();
             for _ in 0..3 {
-                let (data_ptr, sz, new_rc, _) = try_consume(hdr, ptr, rc).expect("consume");
+                let (data_ptr, sz) = consume_one(hdr, ptr).expect("consume");
                 assert_eq!(sz as usize, msg_sz);
                 received.push(*data_ptr);
-                hdr.advance_read_cursors(new_rc);
-                rc = new_rc;
             }
             assert_eq!(received, vec![1, 2, 3]);
 
@@ -1093,21 +1017,17 @@ mod tests {
                 if !publish(tag) {
                     // Acceptable post-fix outcome: the ring correctly
                     // refuses the publish. Drain to make room.
-                    let (data_ptr, sz, new_rc, _) = try_consume(hdr, ptr, rc).expect("drain to make room");
+                    let (data_ptr, sz) = consume_one(hdr, ptr).expect("drain to make room");
                     assert_eq!(sz as usize, msg_sz);
                     received.push(*data_ptr);
-                    hdr.advance_read_cursors(new_rc);
-                    rc = new_rc;
                     assert!(publish(tag), "publish #{tag} after drain");
                 }
             }
 
             // Drain remaining and assert every tag arrived in order.
-            while let Some((data_ptr, sz, new_rc, _)) = try_consume(hdr, ptr, rc) {
+            while let Some((data_ptr, sz)) = consume_one(hdr, ptr) {
                 assert_eq!(sz as usize, msg_sz);
                 received.push(*data_ptr);
-                hdr.advance_read_cursors(new_rc);
-                rc = new_rc;
             }
             assert_eq!(
                 received,
@@ -1145,58 +1065,25 @@ mod tests {
         }
     }
 
-    /// `consume_one` helper — exercises it just to silence dead-code.
-    #[test]
-    fn test_w2m_consume_one_helper() {
-        unsafe {
-            let size = region_size_for_tests();
-            let region = SharedRegion::new(size);
-            let ptr = region.ptr();
-            init_region(ptr, size as u64);
-            let hdr = W2mRingHeader::from_raw(ptr);
-            match try_publish(hdr, ptr, 32, |slot| {
-                slot.fill(0x77);
-            }) {
-                TryPublish::Ok(_) => {}
-                TryPublish::Full => panic!(),
-            }
-            let (p, sz) = consume_one(hdr, ptr).expect("msg");
-            assert_eq!(sz, 32);
-            let data = std::slice::from_raw_parts(p, 32);
-            assert!(data.iter().all(|&b| b == 0x77));
-        }
-    }
-
     /// Verifies that advancing `consume_cursor` unblocks `try_reserve` backpressure.
     #[test]
     fn test_consume_cursor_tracks_read_cursor() {
         unsafe {
             let msg_sz = 1 << 16; // 64 KiB
             let msg_total = (8 + align8(msg_sz)) as u64;
-            let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 8;
-            let size = capacity as usize;
-            let region = SharedRegion::new(size);
+            let region = super::make_ring(msg_sz, 2, 8);
             let ptr = region.ptr();
-            super::init_region_for_tests(ptr, capacity);
             let hdr = W2mRingHeader::from_raw(ptr);
 
             for _ in 0..2 {
-                match try_publish(hdr, ptr, msg_sz, |_| {}) {
-                    TryPublish::Ok(_) => {}
-                    TryPublish::Full => panic!("fill publish"),
-                }
+                try_publish(hdr, ptr, msg_sz, |_| {}).expect("fill publish");
             }
-            match try_publish(hdr, ptr, msg_sz, |_| {}) {
-                TryPublish::Full => {}
-                TryPublish::Ok(_) => panic!("ring must be Full"),
-            }
+            assert!(try_publish(hdr, ptr, msg_sz, |_| {}).is_none(), "the ring must be full");
 
             assert_eq!(hdr.consume_cursor().load(Ordering::Acquire), W2M_HEADER_SIZE as u64);
             assert_eq!(hdr.read_cursor().load(Ordering::Acquire), W2M_HEADER_SIZE as u64);
 
-            let cursor = hdr.read_cursor().load(Ordering::Acquire);
-            let (_, _, new_rc, _) = try_consume(hdr, ptr, cursor).expect("must have message");
-            hdr.advance_read_cursors(new_rc);
+            consume_one(hdr, ptr).expect("must have message");
 
             assert_eq!(
                 hdr.consume_cursor().load(Ordering::Acquire),
@@ -1207,10 +1094,7 @@ mod tests {
                 W2M_HEADER_SIZE as u64 + msg_total
             );
 
-            match try_publish(hdr, ptr, msg_sz, |_| {}) {
-                TryPublish::Ok(_) => {}
-                TryPublish::Full => panic!("must have room after consume_cursor advance"),
-            }
+            try_publish(hdr, ptr, msg_sz, |_| {}).expect("must have room after consume_cursor advance");
         }
     }
 }

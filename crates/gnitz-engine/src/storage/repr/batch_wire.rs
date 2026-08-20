@@ -12,10 +12,10 @@ use std::ffi::CStr;
 
 use super::super::error::StorageError;
 use super::batch::{
-    acquire_arena, compute_offsets, copy_regions, strides_from_schema, Batch, Fill, MAX_BATCH_REGIONS,
-    MAX_WIRE_REGIONS, REG_PK,
+    acquire_arena, carve_writer_slices, compute_offsets, copy_regions, strides_from_schema, Batch, Fill,
+    MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK,
 };
-use super::merge::MemBatch;
+use super::merge::{DirectWriter, MemBatch};
 use super::shard_file;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::wal;
@@ -176,7 +176,7 @@ impl Batch {
         // Wire-safe precondition: a wire-safe schema carries no long strings, so
         // the blob heap is empty and is intentionally dropped below. Callers gate
         // this encoder on `schema_wire_safe`; a STRING/BLOB batch routes to the
-        // full-blob `encode_wire_into` path. Assert it so a future caller that
+        // full-blob `encode_to_wire` path. Assert it so a future caller that
         // mis-routes string data fails loudly here rather than shipping structs
         // whose heap vanished.
         debug_assert!(
@@ -194,6 +194,49 @@ impl Batch {
     /// Encode self into WAL wire format at out[offset..]. Returns bytes written.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize, checksum: bool) -> usize {
         self.encode_regions(0, self.count, &self.blob, table_id, out, offset, checksum)
+    }
+
+    /// Encode the rows `indices` selects, in that order, as one WAL block at
+    /// `out[offset..]`. Returns bytes written. Unlike its two siblings this one
+    /// reads its region strides from `schema` rather than from the batch, so a
+    /// caller must size the destination with [`wire_block_size`] over the same
+    /// schema — those two are the writer↔reader region contract's two faces.
+    ///
+    /// Only valid for a `schema_wire_safe` schema: no German-string columns and
+    /// every stride a multiple of 8, so the block's `align8` padding never fires
+    /// and the row scatter writes no heap bytes.
+    pub fn encode_scattered_to_wire(
+        &self,
+        indices: &[u32],
+        schema: &SchemaDescriptor,
+        table_id: u32,
+        out: &mut [u8],
+        offset: usize,
+        checksum: bool,
+    ) -> usize {
+        let count = indices.len();
+        let total_size = wire_block_size(schema, count, 0);
+        let block = &mut out[offset..offset + total_size];
+
+        // Region sizes in canonical order: pk, weight, null_bmp, payload…, blob(0).
+        let (sizes, nr) = wire_region_sizes(schema, count, 0);
+        wal::write_header_and_directory(block, table_id, count as u32, &sizes[..nr], total_size);
+
+        // The writer carves `rest` (body after header+directory) into per-region
+        // slices: [pk | weight | null | col_0 | ...], each sized for `count` rows.
+        let (_, rest) = block.split_at_mut(wire_header_dir_size(schema));
+        let (pk, weight, null_bmp, col_slices) = carve_writer_slices(rest, schema, count);
+        // No German-string columns on a wire-safe schema; `DirectWriter` still
+        // wants a blob arena, so hand it a 0-cap stack local it must not grow.
+        let mut empty_blob: Vec<u8> = Vec::new();
+        let mut writer = DirectWriter::new(pk, weight, null_bmp, col_slices, &mut empty_blob, schema, 0);
+        super::scatter::scatter_copy(&self.as_mem_batch(), indices, &mut writer);
+        debug_assert!(empty_blob.is_empty(), "a wire-safe schema must not scatter blob bytes");
+
+        if checksum {
+            wal::stamp_checksum(block, total_size);
+        }
+        total_size
     }
 
     /// Decode a WAL block from `data` using `schema` into an owned `Batch`.

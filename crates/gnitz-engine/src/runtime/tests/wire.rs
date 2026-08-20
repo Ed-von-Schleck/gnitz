@@ -1,11 +1,12 @@
 use crate::runtime::wire::{
     build_named_schema_wire_block, build_schema_wire_block, decode_ddl_txn, decode_push_txn, decode_scan_multi,
     decode_schema_block, decode_wire, encode_ctrl_block_direct, peek_client_control, peek_control_block,
-    peek_control_block_ipc, WireData, WireMsg, CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
+    peek_control_block_ipc, WireData, WireMsg, STATUS_ERROR, STATUS_OK,
 };
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_COLUMNS};
 use crate::storage::{Batch, Layout};
 use crate::test_support::named_col_defs;
+use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::{encode_german_string, try_decode_german_string};
 
 fn simple_schema() -> SchemaDescriptor {
@@ -332,7 +333,7 @@ fn wire_size_matches_encode() {
         ..Default::default()
     }
     .encode_to_vec();
-    assert_eq!(sz, wire.len(), "wire_size mismatch (no data)");
+    assert_eq!(sz, wire.len(), "WireMsg::size mismatch (no data)");
 
     let sd = simple_schema();
     let sz = WireMsg {
@@ -346,7 +347,7 @@ fn wire_size_matches_encode() {
         ..Default::default()
     }
     .encode_to_vec();
-    assert_eq!(sz, wire.len(), "wire_size mismatch (schema only)");
+    assert_eq!(sz, wire.len(), "WireMsg::size mismatch (schema only)");
 
     let batch = make_simple_batch(100, 999);
     let sz = WireMsg {
@@ -362,7 +363,7 @@ fn wire_size_matches_encode() {
         ..Default::default()
     }
     .encode_to_vec();
-    assert_eq!(sz, wire.len(), "wire_size mismatch (with data)");
+    assert_eq!(sz, wire.len(), "WireMsg::size mismatch (with data)");
 
     let sz = WireMsg {
         status: STATUS_ERROR,
@@ -376,11 +377,11 @@ fn wire_size_matches_encode() {
         ..Default::default()
     }
     .encode_to_vec();
-    assert_eq!(sz, wire.len(), "wire_size mismatch (error msg)");
+    assert_eq!(sz, wire.len(), "WireMsg::size mismatch (error msg)");
 }
 
 #[test]
-fn encode_wire_into_roundtrip() {
+fn encode_into_buffer_roundtrip() {
     let sd = simple_schema();
     let batch = make_simple_batch(100, 999);
 
@@ -412,7 +413,7 @@ fn encode_wire_into_roundtrip() {
 }
 
 #[test]
-fn encode_wire_into_matches_encode_wire() {
+fn encode_into_buffer_matches_encode_to_vec() {
     let sd = simple_schema();
     let batch = make_simple_batch(42, 123);
 
@@ -447,7 +448,7 @@ fn encode_wire_into_matches_encode_wire() {
     }
     .encode(&mut buf, 0);
     assert_eq!(written, wire.len());
-    assert_eq!(buf, wire, "encode_wire_into should produce identical bytes");
+    assert_eq!(buf, wire, "WireMsg::encode should produce identical bytes");
 }
 
 /// Verify that prebuilt schema bytes produce bit-identical output to the inline path.
@@ -754,8 +755,28 @@ fn encode_ctrl_block_direct_roundtrips() {
 // ---------------------------------------------------------------------------
 
 use crate::runtime::wire::{
-    decode_wire_ipc, decode_wire_ipc_with_schema, wire_flags_set_schema_version, SchemaWithVersion, FLAG_CONTINUATION,
+    decode_wire_ipc, decode_wire_ipc_zero_copy_with_ctrl, wire_flags_set_schema_version, DecodedWireZeroCopy,
+    SchemaWithVersion, FLAG_CONTINUATION,
 };
+use crate::storage::MAX_BATCH_REGIONS;
+
+/// Decode a continuation frame (data, no schema block) against `schema` at
+/// `version`, the way the master's reply-train reader does: the zero-copy
+/// decoder, fed the frame's own control block and a caller-held region-offset
+/// array.
+fn decode_continuation<'a>(
+    bytes: &'a [u8],
+    schema: &SchemaDescriptor,
+    version: u16,
+    offsets: &'a mut [usize; MAX_BATCH_REGIONS],
+) -> Result<DecodedWireZeroCopy<'a>, &'static str> {
+    let ctrl = peek_control_block_ipc(bytes)?;
+    let hint = SchemaWithVersion {
+        descriptor: schema,
+        version,
+    };
+    decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(hint), offsets)
+}
 
 fn make_wire_safe_batch(n: usize) -> Batch {
     let sd = simple_schema();
@@ -770,7 +791,7 @@ fn make_wire_safe_batch(n: usize) -> Batch {
     b
 }
 
-/// `wire_size_range` must match the actual encoded byte count.
+/// A `WireData::Range` message's `size` must match its encoded byte count.
 #[test]
 fn wire_size_range_matches_encoded_size() {
     let sd = simple_schema();
@@ -799,11 +820,12 @@ fn wire_size_range_matches_encoded_size() {
             ..Default::default()
         }
         .encode_ipc(&mut buf, 0);
-        assert_eq!(written, sz, "wire_size_range mismatch for count={count}");
+        assert_eq!(written, sz, "WireData::Range size mismatch for count={count}");
     }
 }
 
-/// `wire_size_range` with count=1 minus count=0 gives positive per-row delta.
+/// A `WireData::Range` message's `size` at count=1 minus count=0 gives a
+/// positive per-row delta.
 #[test]
 fn wire_size_range_positive_per_row_delta() {
     let sd = simple_schema();
@@ -831,7 +853,7 @@ fn wire_size_range_positive_per_row_delta() {
     assert!(sz1 > sz0, "adding 1 row must increase wire size");
 }
 
-/// `encode_wire_into_range` round-trips a sub-range of a batch correctly.
+/// A `WireData::Range` message round-trips a sub-range of a batch correctly.
 #[test]
 fn encode_range_roundtrip() {
     let sd = simple_schema();
@@ -870,8 +892,8 @@ fn encode_range_roundtrip() {
     }
 }
 
-/// A continuation frame (FLAG_HAS_DATA, no FLAG_HAS_SCHEMA) can be decoded
-/// using `decode_wire_ipc_with_schema` with a versioned schema hint.
+/// A continuation frame (FLAG_HAS_DATA, no FLAG_HAS_SCHEMA) decodes against a
+/// versioned schema hint, and only against a matching version.
 #[test]
 fn continuation_frame_decoded_with_schema_hint() {
     let sd = simple_schema();
@@ -909,29 +931,22 @@ fn continuation_frame_decoded_with_schema_hint() {
         "decode_wire_ipc should fail for continuation frame without schema"
     );
 
-    // decode_wire_ipc_with_schema with matching version must succeed.
-    let decoded = decode_wire_ipc_with_schema(
-        &buf,
-        SchemaWithVersion {
-            descriptor: &sd,
-            version: server_version,
-        },
-    )
-    .expect("decode_wire_ipc_with_schema");
-    let b = decoded.data_batch.expect("data_batch");
+    // A hint at the matching version must succeed.
+    let mut offsets = [0usize; MAX_BATCH_REGIONS];
+    let decoded = decode_continuation(&buf, &sd, server_version, &mut offsets).expect("decode with schema hint");
+    let b = decoded.data_batch.as_ref().expect("data_batch");
     assert_eq!(b.count, 4);
     for i in 0..4usize {
-        assert_eq!(b.get_pk(i), i as u128);
+        assert_eq!(
+            gnitz_wire::widen_pk_be(b.get_pk_bytes(i), b.pk_stride as usize),
+            i as u128
+        );
     }
+    drop(decoded);
 
-    // decode_wire_ipc_with_schema with mismatched version must fail.
-    let err = decode_wire_ipc_with_schema(
-        &buf,
-        SchemaWithVersion {
-            descriptor: &sd,
-            version: server_version + 1,
-        },
-    );
+    // A hint at a different version must fail.
+    let mut offsets = [0usize; MAX_BATCH_REGIONS];
+    let err = decode_continuation(&buf, &sd, server_version + 1, &mut offsets);
     assert!(err.is_err(), "version mismatch must return Err");
 }
 

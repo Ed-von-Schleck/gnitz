@@ -7,12 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::foundation::posix_io;
 use crate::foundation::posix_io::{read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw};
-use crate::runtime::wire::{
-    build_schema_wire_block, encode_ctrl_block_direct, layout_to_wire_flags, WireData, WireMsg,
-    CTRL_BLOCK_SIZE_NO_BLOB, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK,
-};
+use crate::runtime::wire::{build_schema_wire_block, WireData, WireMsg};
 use crate::schema::SchemaDescriptor;
-use crate::storage::{carve_writer_slices, scatter_copy, wire_header_dir_size, wire_region_sizes, Batch, DirectWriter};
+use crate::storage::Batch;
 use gnitz_wire::align8;
 
 // ---------------------------------------------------------------------------
@@ -21,8 +18,11 @@ use gnitz_wire::align8;
 
 pub use gnitz_wire::MAX_WORKERS;
 
-/// Leading marker of every out-of-space refusal from `SalWriter::begin`, and
-/// the whole contract a caller may match on. The condition is transient by
+/// Leading marker of every out-of-space refusal from `SalWriter::begin`. It is a
+/// **wire-text** contract, not a Rust one: no Rust caller matches it — they all
+/// read [`SalFit`], which carries every internal decision — and its one consumer
+/// is the E2E reader loop in `gnitz-py/tests/test_sal_read_reclaim.py`, which
+/// sees the refusal only as the error string. The condition is transient by
 /// construction: an ordinary group must leave the sentinel headroom and the
 /// checkpoint band untouched (`effective_capacity`), so it is refused while the
 /// log is near full, and the watchdog's reclaim — a fire-and-forget barrier once
@@ -59,46 +59,51 @@ pub(crate) const fn group_header_size(slots: usize) -> usize {
     OFF_DIRECTORY + 2 * slots * 4
 }
 
+/// A group's payload bytes: header + directory + `align8`-padded slots. The
+/// 8-byte publication prefix in front is NOT included — `SalGroup::payload_size`
+/// is exactly this.
+///
+/// `sal_begin_group` lays a group out by it and `SalWriter::group_footprint_direct`
+/// predicts one by it. A two-site duplication would normally not be worth a
+/// function; this one is, because when the two disagree the committer fail-stops
+/// the node — a transaction family that no longer fits after an earlier family
+/// already wrote to the SAL cannot be unwound.
+fn group_payload_size(worker_sizes: &[u32]) -> usize {
+    group_header_size(worker_sizes.len()) + worker_sizes.iter().map(|&sz| align8(sz as usize)).sum::<usize>()
+}
+
 /// One group's worth of per-worker wire messages, as
-/// [`SalWriter::write_group_direct`] emits them. Named rather than threaded
-/// positionally: `target_id` and `client_id` are among several adjacent integer
-/// scalars, and a transposed pair there would encode cleanly and misroute the
-/// frame.
+/// [`SalWriter::write_group_direct`] emits them: the [`WireMsg`] every slot
+/// shares, plus the two fields that vary by worker.
 ///
 /// [`SalWriter::group_footprint_direct`] sizes the same value, so a caller that
 /// checks fit and then writes measures one group, not two.
+#[derive(Clone, Copy)]
 pub(crate) struct DirectGroup<'a> {
-    pub target_id: u32,
-    pub wire_flags: u64,
-    /// One entry per worker; a slot past the end, or `None`, carries no rows.
-    pub worker_batches: &'a [Option<&'a Batch>],
-    pub schema: Option<&'a SchemaDescriptor>,
-    pub seek_pk: u128,
-    pub seek_col_idx: u64,
+    /// Every slot's message but its `data` and `request_id`, which `msg` fills
+    /// per worker — set either of those here and the per-worker fill overwrites
+    /// it (debug-asserted in `msg`).
+    pub template: WireMsg<'a>,
+    /// Worker `w`'s payload. An empty slice — or any slot past its end — is a
+    /// dataless slot, so a control-only group passes `&[]`.
+    pub worker_data: &'a [WireData<'a>],
     pub req_ids: &'a [u64],
     /// `Some(w)` restricts the group to worker `w`'s slot; `None` fills all.
     pub unicast_worker: Option<usize>,
-    pub client_id: u64,
-    pub prebuilt_schema_block: Option<&'a [u8]>,
-    pub seek_pk_extra: &'a [u8],
 }
 
 impl<'a> DirectGroup<'a> {
     /// Worker `w`'s message. The one definition — sizing and encoding both go
     /// through it, so a slot's size and its bytes cannot disagree.
     fn msg(&self, w: usize) -> WireMsg<'a> {
+        debug_assert!(
+            matches!(self.template.data, WireData::Whole(None)) && self.template.request_id == 0,
+            "DirectGroup template must leave `data` and `request_id` to the per-worker fill"
+        );
         WireMsg {
-            target_id: self.target_id as u64,
-            client_id: self.client_id,
-            flags: self.wire_flags,
-            seek_pk: self.seek_pk,
-            seek_col_idx: self.seek_col_idx,
+            data: self.worker_data.get(w).copied().unwrap_or_default(),
             request_id: self.req_ids[w],
-            schema: self.schema,
-            data: WireData::Whole(self.worker_batches.get(w).and_then(|opt| *opt)),
-            prebuilt_schema_block: self.prebuilt_schema_block,
-            seek_pk_extra: self.seek_pk_extra,
-            ..Default::default()
+            ..self.template
         }
     }
 
@@ -112,6 +117,27 @@ impl<'a> DirectGroup<'a> {
         }
         sizes
     }
+
+    /// Run `f` on this group with its schema block materialized once for the
+    /// whole group. Without it every slot re-encodes the same descriptor, so a
+    /// `nw`-worker group builds `nw` bit-identical blocks; with it each slot
+    /// copies one encoding. Sizing and emission both go through this, so the
+    /// group measured is the group emitted.
+    fn with_group_schema_block<R>(&self, f: impl FnOnce(&DirectGroup) -> R) -> R {
+        match (self.template.schema, self.template.prebuilt_schema_block) {
+            (Some(schema), None) => {
+                let block = build_schema_wire_block(schema, self.template.target_id as u32);
+                f(&DirectGroup {
+                    template: WireMsg {
+                        prebuilt_schema_block: Some(&block),
+                        ..self.template
+                    },
+                    ..*self
+                })
+            }
+            _ => f(self),
+        }
+    }
 }
 
 /// XXH3-64 over a SAL group header — its own eight bytes excluded — seeded with
@@ -122,27 +148,12 @@ fn group_digest(base: u64, hdr: &[u8]) -> u64 {
     crate::foundation::xxh::digest_with_hole(&base.to_le_bytes(), hdr, OFF_DIGEST)
 }
 
-pub(crate) const SAL_MMAP_SIZE: usize = 1 << 30;
+const SAL_MMAP_SIZE: usize = 1 << 30;
 
-/// The SAL slot size for one worker's share of a **wire-safe** group: the
-/// control block, the schema block, and — only if the worker gets rows — the
-/// columnar data block. The single formula behind both `scatter_wire_group`'s
-/// emission and `wire_group_footprint`'s fit check, which must agree
-/// byte-for-byte: the committer fail-stops (aborts the node) if a transaction
-/// family fails to fit after an earlier family already hit the SAL.
-fn wire_safe_slot_size(
-    schema: &SchemaDescriptor,
-    count_w: usize,
-    wire_row_stride: u32,
-    schema_block_len: usize,
-) -> usize {
-    let data_sz = if count_w > 0 {
-        data_wire_block_size_cached(schema, count_w, wire_row_stride)
-    } else {
-        0
-    };
-    CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len + data_sz
-}
+/// All-zero request ids, for a group whose slots answer nobody — what
+/// `scatter_group_footprint` measures with, since a request id never moves a
+/// slot's size.
+const NO_REQ_IDS: [u64; MAX_WORKERS] = [0; MAX_WORKERS];
 
 /// The exact SAL footprint of a zone-closing `FLAG_TXN_COMMIT` sentinel — a
 /// slotless group, header only. `sal_begin_group` reserves this much headroom for
@@ -225,7 +236,6 @@ pub fn sal_mmap_size() -> usize {
 // as `u32` (the SAL group header's flag width).
 pub const FLAG_SHUTDOWN: u32 = gnitz_wire::FLAG_SHUTDOWN as u32;
 pub const FLAG_DDL_SYNC: u32 = gnitz_wire::FLAG_DDL_SYNC as u32;
-pub const FLAG_EXCHANGE: u32 = gnitz_wire::FLAG_EXCHANGE as u32;
 pub const FLAG_PUSH: u32 = gnitz_wire::FLAG_PUSH as u32;
 pub const FLAG_HAS_PK: u32 = gnitz_wire::FLAG_HAS_PK as u32;
 pub const FLAG_SEEK: u32 = gnitz_wire::FLAG_SEEK as u32;
@@ -235,20 +245,13 @@ pub const FLAG_SEEK_BY_INDEX: u32 = gnitz_wire::FLAG_SEEK_BY_INDEX as u32;
 /// header — one allocation, mirrored here as a `u32` (unlike the high client-only
 /// request bits, which need a distinct u32 SAL dispatch flag).
 pub const FLAG_SCAN_SPEC: u32 = gnitz_wire::FLAG_SCAN_SPEC as u32;
-// The next five are engine-internal in meaning but live in the shared 0-15
+// The next four are engine-internal in meaning but live in the shared 0-15
 // block, so `gnitz_wire` owns the bit (and its collision guard) while the
 // meaning stays here.
 pub const FLAG_EXCHANGE_RELAY: u32 = gnitz_wire::FLAG_EXCHANGE_RELAY as u32;
 pub const FLAG_BACKFILL: u32 = gnitz_wire::FLAG_BACKFILL as u32;
 pub const FLAG_TICK: u32 = gnitz_wire::FLAG_TICK as u32;
 pub const FLAG_FLUSH: u32 = gnitz_wire::FLAG_FLUSH as u32;
-/// Ephemeral-state flush round of the checkpoint sequence: flush every view's
-/// operator-trace tables and output stores (traces before outputs), stamping
-/// their manifests with the checkpoint generation carried in the group header's
-/// `lsn` field. Dispatched inline in both worker contexts like `FLAG_FLUSH`, but
-/// distinct so the base round (`FLAG_FLUSH`, `SalReplay` user tables) and the
-/// ephemeral round (`Rederive` view state) stay separate handlers. Bit 19.
-pub const FLAG_FLUSH_EPH: u32 = 1 << 19;
 /// Marks an empty broadcast group as the closing "commit sentinel" of an
 /// atomic zone. All preceding groups at the same LSN belong to the zone;
 /// recovery applies them only when this sentinel is on disk. The flag
@@ -261,27 +264,34 @@ pub const FLAG_TXN_COMMIT: u32 = gnitz_wire::FLAG_TXN_COMMIT as u32;
 /// block's `seek_col_idx`. Distinct from `FLAG_SEEK` (single key) and
 /// `FLAG_HAS_PK` (existence echo of the caller's payload); the gather returns
 /// the *stored* value of a column the caller does not have.
-pub const FLAG_GATHER: u32 = 65536;
+pub const FLAG_GATHER: u32 = 1 << 16;
 /// CREATE UNIQUE INDEX global pre-flight: each worker projects its committed
 /// partition of `target_id` to the OPK leading-key spans of the column list
 /// packed in `seek_col_idx`, sorts them, and streams the SORTED spans back as
 /// continuation frames for the master's k-way merge (see
 /// `validate_unique_index_create`). Unicast-shaped like a Scan: every
 /// worker gets its own req_id slot and answers with a frame train.
-pub const FLAG_UNIQUE_PREFLIGHT: u32 = 131072;
+pub const FLAG_UNIQUE_PREFLIGHT: u32 = 1 << 17;
 /// The first group of an atomic zone. With the closing `FLAG_TXN_COMMIT`
 /// sentinel it delimits the zone's byte span, which is how recovery tells damage
 /// that cost a committed transaction a group from damage in one of the `lsn = 0`
 /// command groups between zones. `KIND_BY_FLAG` does not list it, so it changes
 /// no dispatch.
-pub const FLAG_ZONE_START: u32 = 262144;
+pub const FLAG_ZONE_START: u32 = 1 << 18;
+/// Ephemeral-state flush round of the checkpoint sequence: flush every view's
+/// operator-trace tables and output stores (traces before outputs), stamping
+/// their manifests with the checkpoint generation carried in the group header's
+/// `lsn` field. Dispatched inline in both worker contexts like `FLAG_FLUSH`, but
+/// distinct so the base round (`FLAG_FLUSH`, `SalReplay` user tables) and the
+/// ephemeral round (`Rederive` view state) stay separate handlers.
+pub const FLAG_FLUSH_EPH: u32 = 1 << 19;
 
 // The flags above that `gnitz_wire` does not allocate are the engine's own, and
 // stay strictly above the shared 0-15 block — that separation is what lets the
 // two crates allocate independently. `gnitz_wire`'s guard covers the block
 // itself; this covers the engine's side of the line.
 const _: () = {
-    let engine_only = [FLAG_FLUSH_EPH, FLAG_GATHER, FLAG_UNIQUE_PREFLIGHT, FLAG_ZONE_START];
+    let engine_only = [FLAG_GATHER, FLAG_UNIQUE_PREFLIGHT, FLAG_ZONE_START, FLAG_FLUSH_EPH];
     let mut acc = 0u32;
     let mut i = 0;
     while i < engine_only.len() {
@@ -294,55 +304,6 @@ const _: () = {
         i += 1;
     }
 };
-
-// ---------------------------------------------------------------------------
-// Chunked distributed-backfill exchange coordination
-// ---------------------------------------------------------------------------
-//
-// A distributed CREATE-VIEW backfill streams the source partition through the
-// incremental plan one chunk at a time, issuing one exchange round per chunk
-// per exchanging view. All workers must issue the SAME number of rounds (short
-// partitions pad with empty rounds), so termination and SAL reclamation are
-// decided collectively by the master and stamped back on each relay. Both legs
-// reuse the otherwise-unused `seek_col_idx` control field — no new SAL flag and
-// no wire-format change. The value `0` doubles as "no backfill coordination",
-// so steady-state exchanges (which already pass a literal `0`) are unaffected.
-
-/// Up-leg (worker→master, on `FLAG_EXCHANGE`): the per-chunk PAD bit. Set when
-/// this worker's `drain_chunk` returned `None` — its partition is exhausted and
-/// the chunk it is participating in is an empty pad. The master ANDs this bit
-/// across all workers for a round; an all-pad round is the final round.
-pub const BACKFILL_PAD_BIT: u64 = 1;
-
-/// Down-leg (master→worker, on `FLAG_EXCHANGE_RELAY`): the collective decision
-/// the master stamps onto a round's relay after ANDing the round's pad bits and
-/// checking SAL space. `CONTINUE` keeps the loop going; `STOP` ends every
-/// worker's loop on the same (all-pad) round; `CHECKPOINT` is a continue that
-/// also tells the worker to advance its SAL read epoch + reset its read cursor
-/// inline (the master reclaims the SAL write side at the next round barrier).
-pub const BACKFILL_DECISION_CONTINUE: u64 = 0;
-pub const BACKFILL_DECISION_STOP: u64 = 1;
-pub const BACKFILL_DECISION_CHECKPOINT: u64 = 2;
-
-/// Wire schema of every unique pre-flight reply frame: the leading `n_promoted`
-/// columns of the index schema, all marked PK, schema version 0. Its `pk_stride`
-/// is exactly `idx_key_size`, and the OPK leading-key span fills that PK region
-/// verbatim — there is no single fixed-width column to represent a composite
-/// (e.g. 24-byte) span, so the schema is built per-index from `idx_schema` (the
-/// width is known at pre-flight time). The single-column ≤16-byte case is the
-/// `n_promoted == 1` degenerate, replacing the old fixed `U128` column.
-///
-/// Index columns are always non-nullable (`make_index_schema` builds each with
-/// `nullable = 0`, and a NULL-valued row never enters the index), so
-/// `SchemaDescriptor::new`'s "PK columns must be non-nullable" assertion holds.
-/// The single definition shared by the worker's encoder
-/// (`send_unique_preflight_keys`) and the master's merge decoder, so the frame
-/// layout agrees by construction.
-pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_promoted: usize) -> SchemaDescriptor {
-    let cols = &idx_schema.columns[..n_promoted];
-    let pks: Vec<u32> = (0..n_promoted as u32).collect();
-    SchemaDescriptor::new(cols, &pks)
-}
 
 // ---------------------------------------------------------------------------
 // SalMessageKind — receive-side classification of a SAL group's flag bits.
@@ -446,7 +407,7 @@ pub(crate) unsafe fn atomic_load_u64(ptr: *const u8) -> u64 {
 ///
 /// # Safety
 /// `ptr` must point to a naturally-aligned u64 in shared memory.
-pub(crate) unsafe fn atomic_store_u64(ptr: *mut u8, val: u64) {
+unsafe fn atomic_store_u64(ptr: *mut u8, val: u64) {
     let atomic = &*(ptr as *const AtomicU64);
     atomic.store(val, Ordering::Release);
 }
@@ -456,20 +417,6 @@ unsafe fn sal_write_sentinel(sal_ptr: *mut u8, offset: usize, mmap_size: usize) 
     if offset + 8 <= mmap_size {
         atomic_store_u64(sal_ptr.add(offset), 0);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Scatter-to-wire helpers
-// ---------------------------------------------------------------------------
-
-/// Compute the byte size of the data WAL block for `count` rows on `schema`
-/// with a precomputed `wire_row_fixed_stride` (see
-/// `crate::storage::compute_wire_props`). Only correct when the schema is
-/// `wire_safe` (caller's responsibility) — no alignment padding, so the size
-/// is the fixed header/directory prefix plus `count` linear rows.
-#[inline]
-fn data_wire_block_size_cached(schema: &SchemaDescriptor, count: usize, stride: u32) -> usize {
-    wire_header_dir_size(schema) + count * stride as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +433,12 @@ pub(crate) struct SalGroup {
     /// Header + directory bytes; also the offset of slot 0's payload.
     hdr_size: usize,
     payload_size: usize,
+    /// The slot sizes this group was laid out with. Held rather than re-passed
+    /// so `for_each_slot` walks the directory it wrote: a caller handing over a
+    /// different slice would hand out a `&mut [u8]` at the wrong offset inside a
+    /// live mmap, with nothing to catch it.
+    sizes: [u32; MAX_WORKERS],
+    slots: usize,
     epoch: u32,
     mmap_size: usize,
     committed: bool,
@@ -510,10 +463,11 @@ impl SalGroup {
     /// `align8` directory order `sal_begin_group` laid out.
     ///
     /// # Safety
-    /// `worker_sizes` must be the slice this group was begun with.
-    pub(crate) unsafe fn for_each_slot(&self, worker_sizes: &[u32], mut f: impl FnMut(usize, &mut [u8])) {
+    /// The slots must be unaliased for the duration — nothing else may hold a
+    /// reference into this group's payload span.
+    pub(crate) unsafe fn for_each_slot(&self, mut f: impl FnMut(usize, &mut [u8])) {
         let mut off = self.hdr_size;
-        for (w, &sz) in worker_sizes.iter().enumerate() {
+        for (w, &sz) in self.sizes[..self.slots].iter().enumerate() {
             let sz = sz as usize;
             if sz == 0 {
                 continue;
@@ -568,15 +522,10 @@ pub(crate) unsafe fn sal_begin_group(
         "SAL group epoch must be >= 1 — epoch 0 is indistinguishable from the empty-slot sentinel prefix"
     );
 
-    // payload_size starts as the header size (a multiple of 8) and grows only by
-    // align8(sz) increments, so it is always a multiple of 8.
+    // The header size is a multiple of 8 and every slot contributes align8(sz),
+    // so `payload_size` is always a multiple of 8.
     let hdr_size = group_header_size(worker_sizes.len());
-    let mut payload_size = hdr_size;
-    for &sz in worker_sizes {
-        if sz > 0 {
-            payload_size += align8(sz as usize);
-        }
-    }
+    let payload_size = group_payload_size(worker_sizes);
     let total = 8 + payload_size;
     let cap = effective_max(flags, mmap_size);
     if write_cursor + total > cap {
@@ -604,11 +553,15 @@ pub(crate) unsafe fn sal_begin_group(
         data_offset += align8(sz as usize);
     }
 
+    let mut sizes = [0u32; MAX_WORKERS];
+    sizes[..slots].copy_from_slice(worker_sizes);
     Some(SalGroup {
         sal_ptr,
         base,
         hdr_size,
         payload_size,
+        sizes,
+        slots,
         epoch,
         mmap_size,
         committed: false,
@@ -647,13 +600,7 @@ pub(crate) unsafe fn sal_write_group(
         &sizes[..nw],
     )?;
 
-    let mut off = group_header_size(nw);
-    for p in payloads {
-        if !p.is_empty() {
-            std::ptr::copy_nonoverlapping(p.as_ptr(), group.data_ptr(off), p.len());
-            off += align8(p.len());
-        }
-    }
+    group.for_each_slot(|w, slot| slot.copy_from_slice(payloads[w]));
 
     Some(group.commit())
 }
@@ -662,26 +609,36 @@ pub(crate) unsafe fn sal_write_group(
 // SAL read (worker reads its data from a group)
 // ---------------------------------------------------------------------------
 
-pub(crate) struct SalReadResult {
-    pub advance: u64,
+/// One SAL group as a reader sees it, for the worker slot it asked about.
+pub struct SalMessage<'a> {
     pub lsn: u64,
+    pub kind: SalMessageKind,
     pub flags: u32,
     pub target_id: u32,
-    /// The slot count the group was written with. A reader asking for a slot at
-    /// or past it gets an empty slot.
+    /// The group's byte offset in the ring — what a recovery error names, and
+    /// what the zone-span rule tests damage against.
+    pub base: u64,
+    /// The slot count the group was written with. Recovery validates a zone's
+    /// blocks across all of them, not only the reader's own, so its verdict does
+    /// not depend on which worker asked. A reader asking for a slot at or past
+    /// it gets an empty slot.
     pub slots: u32,
-    /// This worker's payload slot; null/0 when the group carries no data
-    /// for this worker (control broadcast, other-worker unicast).
-    pub data_ptr: *const u8,
-    pub data_size: u32,
+    /// None = no data for this worker in this group.
+    pub wire_data: Option<&'a [u8]>,
 }
 
-impl SalReadResult {
-    /// The requested slot's bytes, or `None` when the group left it empty.
-    fn wire_data(&self) -> Option<&'static [u8]> {
-        (self.data_size > 0 && !self.data_ptr.is_null())
-            .then(|| unsafe { std::slice::from_raw_parts(self.data_ptr, self.data_size as usize) })
-    }
+/// What the bytes at an offset are. `Group` carries the message and the cursor
+/// past it.
+pub enum SalStep {
+    /// Nothing published here, or the group's own stride runs past this mapping
+    /// (the log was written under a larger `GNITZ_SAL_BYTES`). Either way, the
+    /// end of the log.
+    Absent,
+    /// A published header that fails its digest.
+    Corrupt,
+    /// A verified header stamped with another epoch — the ring's leftovers.
+    OtherEpoch,
+    Group(SalMessage<'static>, u64),
 }
 
 /// The `(slot_count, epoch)` of the verified header at `base`, or `None`. A
@@ -727,7 +684,7 @@ pub(crate) unsafe fn sal_probe_header(sal_ptr: *const u8, base: u64, mmap_size: 
 /// # Safety
 /// `sal_ptr` must be a valid mmap pointer with `base + 8 <= mmap_size`.
 #[inline]
-pub(crate) unsafe fn sal_prefix_word(sal_ptr: *const u8, base: u64) -> u64 {
+unsafe fn sal_prefix_word(sal_ptr: *const u8, base: u64) -> u64 {
     atomic_load_u64(sal_ptr.add(base as usize))
 }
 
@@ -757,19 +714,6 @@ impl EpochGate {
     }
 }
 
-/// What the bytes at an offset are.
-pub(crate) enum SalRead {
-    /// Nothing published here, or the group's own stride runs past this mapping
-    /// (the log was written under a larger `GNITZ_SAL_BYTES`). Either way, the
-    /// end of the log.
-    Absent,
-    /// A published header that fails its digest.
-    Corrupt,
-    /// A verified header stamped with another epoch — the ring's leftovers.
-    OtherEpoch,
-    Group(SalReadResult),
-}
-
 /// Read a SAL group header and extract `worker_id`'s data pointer/size.
 ///
 /// The caller decides what a `Corrupt` verdict means: the live drain fail-stops
@@ -783,25 +727,25 @@ pub(crate) unsafe fn sal_read_group_header(
     worker_id: u32,
     gate: EpochGate,
     mmap_size: u64,
-) -> SalRead {
+) -> SalStep {
     let rc = read_cursor as usize;
     let wid = worker_id as usize;
 
     let word = sal_prefix_word(sal_ptr, read_cursor);
     if word == 0 {
-        return SalRead::Absent;
+        return SalStep::Absent;
     }
     if let EpochGate::Live(exp) = gate {
         if (word >> 32) as u32 != exp {
-            return SalRead::OtherEpoch;
+            return SalStep::OtherEpoch;
         }
     }
 
     let Some((slots, epoch)) = sal_probe_header(sal_ptr, read_cursor, mmap_size) else {
-        return SalRead::Corrupt;
+        return SalStep::Corrupt;
     };
     if gate.epoch().is_some_and(|exp| epoch != exp) {
-        return SalRead::OtherEpoch;
+        return SalStep::OtherEpoch;
     }
 
     let slots = slots as usize;
@@ -818,7 +762,7 @@ pub(crate) unsafe fn sal_read_group_header(
         stride += align8(read_u32_raw(sal_ptr, hdr_off + OFF_DIRECTORY + slots * 4 + w * 4) as usize);
     }
     if (rc + 8 + stride) as u64 > mmap_size {
-        return SalRead::Absent;
+        return SalStep::Absent;
     }
     let advance = (8 + stride) as u64;
 
@@ -836,15 +780,18 @@ pub(crate) unsafe fn sal_read_group_header(
     } else {
         (std::ptr::null(), 0)
     };
-    SalRead::Group(SalReadResult {
-        advance,
-        lsn,
-        flags,
-        target_id,
-        slots: slots as u32,
-        data_ptr,
-        data_size,
-    })
+    SalStep::Group(
+        SalMessage {
+            lsn,
+            kind: SalMessageKind::classify(flags),
+            flags,
+            target_id,
+            base: read_cursor,
+            slots: slots as u32,
+            wire_data: (data_size > 0).then(|| std::slice::from_raw_parts(data_ptr, data_size as usize)),
+        },
+        read_cursor + advance,
+    )
 }
 
 /// The slot count the SAL tail at `sal_ptr` was written with, or `None` when the
@@ -862,42 +809,6 @@ pub(crate) unsafe fn sal_tail_slot_count(sal_ptr: *const u8, mmap_size: u64) -> 
     sal_probe_header(sal_ptr, 0, mmap_size).map(|(slots, _)| slots)
 }
 
-/// Write a WAL data block for `count` rows into `data_slot` by scattering
-/// `indices` from `batch`. Assumes `schema_wire_safe` — no German-string columns,
-/// all strides are multiples of 8, so all align8 calls are no-ops.
-fn write_scattered_data_block(
-    batch: &crate::storage::MemBatch<'_>,
-    indices: &[u32],
-    schema: &SchemaDescriptor,
-    count: usize,
-    table_id: u32,
-    data_slot: &mut [u8],
-) {
-    let total_size = data_slot.len();
-
-    // Region sizes in canonical order: pk, weight, null_bmp, payload…, blob(0).
-    // All strides % 8 == 0 (schema_wire_safe), so the shared header/directory
-    // writer's align8 padding never fires and the body is one contiguous run.
-    let (sizes, nr) = wire_region_sizes(schema, count, 0);
-    crate::storage::wal_write_header_and_directory(data_slot, table_id, count as u32, &sizes[..nr], total_size);
-
-    // The writer carves `rest` (body after header+directory) into per-region
-    // slices: [pk | weight | null | col_0 | ...], each sized for `count` rows.
-    let (_, rest) = data_slot.split_at_mut(wire_header_dir_size(schema));
-    let (pk, weight, null_bmp, col_slices) = carve_writer_slices(rest, schema, count);
-    // No German-string columns on this fast path; DirectWriter still wants a blob
-    // arena, so hand it a 0-cap stack-local that scatter_copy must not grow.
-    let mut empty_blob: Vec<u8> = Vec::new();
-    let mut writer = DirectWriter::new(pk, weight, null_bmp, col_slices, &mut empty_blob, schema, 0);
-    scatter_copy(batch, indices, &mut writer);
-    debug_assert!(
-        empty_blob.is_empty(),
-        "non-string SAL fast path must not write blob bytes"
-    );
-
-    gnitz_wire::wal::stamp_checksum(data_slot, total_size);
-}
-
 // ---------------------------------------------------------------------------
 // SalWriter
 // ---------------------------------------------------------------------------
@@ -909,13 +820,16 @@ pub struct SalWriter {
     write_cursor: std::cell::Cell<u64>,
     epoch: std::cell::Cell<u32>,
     checkpoint_threshold: u64,
-    m2w_efds: Vec<i32>,
+    /// Slots per group: the group header's `slot_count`, the directory's length
+    /// and every slot offset are all this. It is the log's framing, so it is the
+    /// log writer's own field — never read off some other per-worker resource.
+    num_workers: usize,
 }
 
 unsafe impl Send for SalWriter {}
 
 impl SalWriter {
-    pub fn new(ptr: *mut u8, fd: i32, mmap_size: u64, m2w_efds: Vec<i32>) -> Self {
+    pub fn new(ptr: *mut u8, fd: i32, mmap_size: u64, num_workers: usize) -> Self {
         let checkpoint_threshold = crate::foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (mmap_size * 3) >> 2);
         SalWriter {
             ptr,
@@ -924,14 +838,14 @@ impl SalWriter {
             write_cursor: std::cell::Cell::new(0),
             epoch: std::cell::Cell::new(0),
             checkpoint_threshold,
-            m2w_efds,
+            num_workers,
         }
     }
 
     /// SAL bytes an ordinary group may occupy: the mapping minus the headroom
     /// `sal_begin_group` reserves for the zone-closing sentinel and minus the
     /// band held back for the checkpoint and shutdown groups.
-    pub(crate) fn effective_capacity(&self) -> usize {
+    fn effective_capacity(&self) -> usize {
         effective_max(0, self.mmap_size as usize)
     }
 
@@ -1011,7 +925,7 @@ impl SalWriter {
     /// FLAG_HAS_DATA without FLAG_HAS_SCHEMA, so the reply's request_id would fall
     /// back to 0 and the master's `ReplyFuture` would never resolve.
     pub fn write_group_direct(&self, g: &DirectGroup, lsn: u64, sal_flags: u32) -> Result<(), String> {
-        let nw = self.m2w_efds.len();
+        let nw = self.num_workers;
         assert_eq!(
             g.req_ids.len(),
             nw,
@@ -1020,93 +934,135 @@ impl SalWriter {
             nw
         );
         debug_assert!(
-            g.schema.is_some() || g.prebuilt_schema_block.is_some() || g.worker_batches.iter().all(|b| b.is_none()),
+            g.template.schema.is_some()
+                || g.template.prebuilt_schema_block.is_some()
+                || g.worker_data.iter().all(|d| d.row_count() == 0),
             "write_group_direct: data without a schema — `decode_wire` rejects FLAG_HAS_DATA \
              without FLAG_HAS_SCHEMA",
         );
 
-        let worker_sizes = g.slot_sizes(nw);
-        let group = self.begin("write_group_direct", g.target_id, lsn, sal_flags, &worker_sizes[..nw])?;
+        g.with_group_schema_block(|g| {
+            let worker_sizes = g.slot_sizes(nw);
+            let group = self.begin(
+                "write_group_direct",
+                g.template.target_id as u32,
+                lsn,
+                sal_flags,
+                &worker_sizes[..nw],
+            )?;
 
-        unsafe {
-            group.for_each_slot(&worker_sizes[..nw], |w, slot| {
-                let written = g.msg(w).encode(slot, 0);
-                debug_assert_eq!(written, slot.len());
-            });
-        }
+            unsafe {
+                group.for_each_slot(|w, slot| {
+                    let written = g.msg(w).encode(slot, 0);
+                    debug_assert_eq!(written, slot.len());
+                });
+            }
 
-        self.finish(group);
-        Ok(())
+            self.finish(group);
+            Ok(())
+        })
     }
 
     /// The exact number of SAL bytes `write_group_direct` will consume for `g`.
     /// Neither the sentinel nor the checkpoint band is included; both are held
     /// back globally by `effective_capacity`.
     pub(crate) fn group_footprint_direct(&self, g: &DirectGroup) -> usize {
-        let nw = self.m2w_efds.len();
-        let sizes = g.slot_sizes(nw);
-        8 + group_header_size(nw) + sizes[..nw].iter().map(|s| align8(*s as usize)).sum::<usize>()
+        let nw = self.num_workers;
+        // Through the same schema-block hoist the emission uses, so the group
+        // measured is the group written rather than one that merely sizes the
+        // same.
+        g.with_group_schema_block(|g| 8 + group_payload_size(&g.slot_sizes(nw)[..nw]))
     }
 
-    /// The exact number of SAL bytes a `scatter_wire_group` (or its
-    /// `write_group_direct` fallback) emission of `input_batch` partitioned by
-    /// `worker_indices` will consume: `8 + GROUP_HEADER_SIZE + Σ_w align8(slot_w)`,
-    /// where every one of the `num_workers` slots is emitted (a zero-row worker
-    /// still gets a schema-only `ctrl + schema_block` slot). Byte-exact by
-    /// construction — each slot is sized through the identical formula the
-    /// matching emission path uses (the wire-safe closed form, or `Batch`'s wire
-    /// size over a materialized per-worker sub-batch for string/blob schemas), so
-    /// the committer's per-transaction fit check cannot drift from what emission
-    /// writes. `schema_block_len` is the prebuilt schema block length (paid per
-    /// slot, hence once per worker for a replicated family); `wire_props` is
-    /// `(wire_safe, wire_row_stride)` as from `cached_schema_block`.
+    /// Build the [`DirectGroup`] a scatter emission of `input_batch` under
+    /// `worker_indices` produces, and hand it to `f`. The one construction:
+    /// `scatter_wire_group` emits it and `scatter_group_footprint` sizes it, so a
+    /// transaction's fit check measures the group that is later written.
     ///
-    /// Neither the sentinel nor the checkpoint band is included — both are
-    /// globally held back (`effective_capacity`), not counted per group.
-    pub(crate) fn wire_group_footprint(
+    /// Rows go into the slots two ways. A `wire_safe` schema — fixed-width
+    /// 8-aligned strides, no German-string columns — scatters straight into the
+    /// SAL slot ([`WireData::Scattered`]), skipping the two-copy path
+    /// (scatter→intermediate `Batch`, then `Batch`→slot). Any other schema
+    /// carries out-of-line string bytes and has no scatter encoder, so its slots
+    /// materialize a per-worker sub-`Batch` first.
+    ///
+    /// `prebuilt_schema_block`: when `Some`, those bytes are the slot's schema
+    /// block; when `None`, `write_group_direct` builds one nameless block for the
+    /// whole group. `wire_props`: `(wire_safe, wire_row_fixed_stride)` as from
+    /// `cached_schema_block`, letting a caller that already has it skip the
+    /// per-column iteration; only `wire_safe` is read.
+    #[allow(clippy::too_many_arguments)]
+    fn with_scatter_group<R>(
         &self,
         input_batch: &Batch,
         worker_indices: &[Vec<u32>],
         schema: &SchemaDescriptor,
-        schema_block_len: usize,
-        wire_props: (bool, u32),
-    ) -> usize {
-        let nw = self.m2w_efds.len();
-        let (wire_safe, wire_row_stride) = wire_props;
-        let mut total = 8 + group_header_size(nw);
-        if wire_safe {
-            for wi in worker_indices.iter().take(nw) {
-                total += align8(wire_safe_slot_size(schema, wi.len(), wire_row_stride, schema_block_len));
-            }
+        target_id: u32,
+        wire_flags: u64,
+        seek_col_idx: u64,
+        req_ids: &[u64],
+        prebuilt_schema_block: Option<&[u8]>,
+        wire_props: Option<(bool, u32)>,
+        f: impl FnOnce(&DirectGroup) -> R,
+    ) -> R {
+        let nw = self.num_workers;
+        let (wire_safe, _) = wire_props.unwrap_or_else(|| crate::storage::compute_wire_props(schema));
+
+        let template = WireMsg {
+            target_id: target_id as u64,
+            flags: wire_flags,
+            seek_col_idx,
+            schema: Some(schema),
+            prebuilt_schema_block,
+            ..Default::default()
+        };
+
+        // The sub-batches must outlive the group that borrows them, so they are
+        // built here rather than inside the `worker_data` map.
+        let mb = input_batch.as_mem_batch();
+        let sub_batches: Vec<Batch> = if wire_safe {
+            Vec::new()
         } else {
-            let mb = input_batch.as_mem_batch();
-            for wi in worker_indices.iter().take(nw) {
-                let slot = if wi.is_empty() {
-                    CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len
-                } else {
-                    let sub = Batch::from_indexed_rows(&mb, wi, schema);
-                    CTRL_BLOCK_SIZE_NO_BLOB + schema_block_len + sub.wire_byte_size()
-                };
-                total += align8(slot);
-            }
-        }
-        total
+            worker_indices
+                .iter()
+                .take(nw)
+                .map(|indices| {
+                    if indices.is_empty() {
+                        Batch::empty_with_schema(schema)
+                    } else {
+                        Batch::from_indexed_rows(&mb, indices, schema)
+                    }
+                })
+                .collect()
+        };
+        let worker_data: Vec<WireData> = if wire_safe {
+            worker_indices
+                .iter()
+                .take(nw)
+                .map(|indices| WireData::Scattered {
+                    batch: input_batch,
+                    indices,
+                    schema,
+                })
+                .collect()
+        } else {
+            sub_batches
+                .iter()
+                .map(|b| WireData::Whole((b.count > 0).then_some(b)))
+                .collect()
+        };
+
+        f(&DirectGroup {
+            template,
+            worker_data: &worker_data,
+            req_ids,
+            unicast_worker: None,
+        })
     }
 
-    /// Scatter rows from `input_batch` directly into per-worker SAL slots using
-    /// pre-computed `worker_indices`. Eliminates the two-copy path
-    /// (scatter→intermediate Batch, then Batch→SAL slot) for schemas where
-    /// every column has a fixed-width 8-aligned stride and no German-string columns.
-    ///
-    /// Falls back to `write_group_direct` (two-copy) for other schemas.
-    /// Does NOT sync/signal. `lsn` is supplied by the caller.
-    ///
-    /// `prebuilt_schema_block`: when `Some`, the bytes are copied into each
-    /// slot's schema region instead of building a nameless one from `schema`.
-    /// `wire_props`: `(wire_safe, wire_row_fixed_stride)` derived from the
-    /// schema. When `Some`, the values are reused directly so the function
-    /// avoids the per-call column iteration; when `None`, they're computed
-    /// inline. `wire_row_fixed_stride` is only meaningful when `wire_safe`.
+    /// Scatter rows from `input_batch` into per-worker SAL slots using
+    /// pre-computed `worker_indices` — see [`Self::with_scatter_group`] for the
+    /// group this emits. Does NOT sync/signal; `lsn` is the caller's.
     #[allow(clippy::too_many_arguments)]
     pub fn scatter_wire_group(
         &self,
@@ -1122,178 +1078,52 @@ impl SalWriter {
         prebuilt_schema_block: Option<&[u8]>,
         wire_props: Option<(bool, u32)>,
     ) -> Result<(), String> {
-        let nw = self.m2w_efds.len();
-        assert_eq!(
-            req_ids.len(),
-            nw,
-            "scatter_wire_group: req_ids.len()={} != num_workers={}",
-            req_ids.len(),
-            nw
-        );
-
-        let (wire_safe, wire_row_stride) = wire_props.unwrap_or_else(|| crate::storage::compute_wire_props(schema));
-
-        if !wire_safe {
-            // Fallback: reconstruct per-worker Batches and use existing path.
-            let mb = input_batch.as_mem_batch();
-            let sub_batches: Vec<Batch> = worker_indices
-                .iter()
-                .map(|indices| {
-                    if !indices.is_empty() {
-                        Batch::from_indexed_rows(&mb, indices, schema)
-                    } else {
-                        Batch::empty_with_schema(schema)
-                    }
-                })
-                .collect();
-            let refs: Vec<Option<&Batch>> = sub_batches
-                .iter()
-                .map(|b| if b.count > 0 { Some(b) } else { None })
-                .collect();
-            return self.write_group_direct(
-                &DirectGroup {
-                    target_id,
-                    wire_flags,
-                    worker_batches: &refs,
-                    schema: Some(schema),
-                    seek_pk: 0,
-                    seek_col_idx,
-                    req_ids,
-                    unicast_worker: None,
-                    client_id: 0,
-                    prebuilt_schema_block,
-                    seek_pk_extra: &[],
-                },
-                lsn,
-                sal_flags,
-            );
-        }
-
-        // Fast path: scatter directly into SAL slots. The schema block is
-        // either supplied prebuilt (cached at the caller) or built once here
-        // (nameless) and reused across all worker slots.
-        let owned_block: Vec<u8>;
-        let schema_block: &[u8] = match prebuilt_schema_block {
-            Some(b) => b,
-            None => {
-                owned_block = build_schema_wire_block(schema, target_id);
-                &owned_block
-            }
-        };
-        let mut worker_sizes = [0u32; MAX_WORKERS];
-        for w in 0..nw {
-            worker_sizes[w] =
-                wire_safe_slot_size(schema, worker_indices[w].len(), wire_row_stride, schema_block.len()) as u32;
-        }
-
-        let group = self.begin("scatter_wire_group", target_id, lsn, sal_flags, &worker_sizes[..nw])?;
-
-        let mb = input_batch.as_mem_batch();
-        // The ctrl block size on the no-error fast path is a compile-time constant.
-        let ctrl_size = CTRL_BLOCK_SIZE_NO_BLOB;
-        unsafe {
-            group.for_each_slot(&worker_sizes[..nw], |w, slot| {
-                let count_w = worker_indices[w].len();
-
-                // a. Schema block immediately after the ctrl slot.
-                slot[ctrl_size..ctrl_size + schema_block.len()].copy_from_slice(schema_block);
-
-                // b. Data block when there are rows for this worker.
-                if count_w > 0 {
-                    let data_start = ctrl_size + schema_block.len();
-                    let data_sz = data_wire_block_size_cached(schema, count_w, wire_row_stride);
-                    let data_slot = &mut slot[data_start..data_start + data_sz];
-                    write_scattered_data_block(&mb, &worker_indices[w], schema, count_w, target_id, data_slot);
-                }
-
-                // c. Ctrl block last (needs full_wire_flags which depends on count_w).
-                let full_wire_flags = wire_flags
-                    | FLAG_HAS_SCHEMA
-                    | if count_w > 0 { FLAG_HAS_DATA } else { 0 }
-                    | layout_to_wire_flags(input_batch.layout());
-                encode_ctrl_block_direct(
-                    slot,
-                    0,
-                    &gnitz_wire::control::ControlHeader {
-                        status: STATUS_OK,
-                        target_id: target_id as u64,
-                        flags: full_wire_flags,
-                        seek_col_idx,
-                        request_id: req_ids[w],
-                        ..Default::default()
-                    },
-                    b"",
-                    &[],
-                    // Checksummed like every other block in the slot: SAL replay
-                    // verifies the control block it decodes, and one XXH3 over it
-                    // is nothing against the transaction's own `fdatasync`.
-                    true,
-                );
-            });
-        }
-
-        self.finish(group);
-        Ok(())
+        self.with_scatter_group(
+            input_batch,
+            worker_indices,
+            schema,
+            target_id,
+            wire_flags,
+            seek_col_idx,
+            req_ids,
+            prebuilt_schema_block,
+            wire_props,
+            |g| self.write_group_direct(g, lsn, sal_flags),
+        )
     }
 
-    /// Encode once into worker 0's slot, memcpy to workers 1..N-1.
-    /// Does NOT sync/signal. `lsn` is supplied by the caller.
+    /// The exact number of SAL bytes [`Self::scatter_wire_group`] will consume
+    /// for this batch and partitioning. Neither the sentinel nor the checkpoint
+    /// band is included; both are held back globally by `effective_capacity`.
     ///
-    /// `prebuilt_schema_block`: when `Some`, the bytes are copied into the
-    /// schema region instead of being built from `schema`.
-    ///
-    /// `schema: None` emits no schema block, as in `write_group_direct` — the
-    /// control-only broadcasts (`FLAG_FLUSH`/`FLAG_FLUSH_EPH`/`FLAG_SHUTDOWN`)
-    /// whose worker arm takes neither a schema nor a batch.
-    #[allow(clippy::too_many_arguments)]
-    pub fn write_broadcast_direct(
+    /// The group is built by the emission's own constructor, so the slot sizes
+    /// are the emitted ones. `wire_flags`, `seek_col_idx` and the request ids
+    /// are left at zero here: a slot's size is its control block (fixed-width
+    /// unless `error_msg` or `seek_pk_extra` is non-empty, and this path sets
+    /// neither), its schema block, and its data block over `schema` — none of
+    /// which those three scalars reach.
+    pub(crate) fn scatter_group_footprint(
         &self,
+        input_batch: &Batch,
+        worker_indices: &[Vec<u32>],
+        schema: &SchemaDescriptor,
         target_id: u32,
-        lsn: u64,
-        sal_flags: u32,
-        batch: Option<&Batch>,
-        schema: Option<&SchemaDescriptor>,
-        seek_pk: u128,
         prebuilt_schema_block: Option<&[u8]>,
-    ) -> Result<(), String> {
-        let nw = self.m2w_efds.len();
-        debug_assert!(
-            schema.is_some() || prebuilt_schema_block.is_some() || batch.is_none(),
-            "write_broadcast_direct: data without a schema — `decode_wire` rejects FLAG_HAS_DATA \
-             without FLAG_HAS_SCHEMA",
-        );
-
-        let msg = WireMsg {
-            target_id: target_id as u64,
-            seek_pk,
+        wire_props: Option<(bool, u32)>,
+    ) -> usize {
+        let nw = self.num_workers;
+        self.with_scatter_group(
+            input_batch,
+            worker_indices,
             schema,
-            data: WireData::Whole(batch),
+            target_id,
+            0,
+            0,
+            &NO_REQ_IDS[..nw],
             prebuilt_schema_block,
-            ..Default::default()
-        };
-        let wsz = msg.size() as u32;
-        let mut worker_sizes = [0u32; MAX_WORKERS];
-        worker_sizes[..nw].fill(wsz);
-
-        let group = self.begin("write_broadcast_direct", target_id, lsn, sal_flags, &worker_sizes[..nw])?;
-
-        if wsz > 0 {
-            let wsz = wsz as usize;
-            let slot0_off = group.hdr_size;
-            let slot0 = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(slot0_off), wsz) };
-            let written = msg.encode(slot0, 0);
-            debug_assert_eq!(written, wsz);
-            let mut off = slot0_off + align8(wsz);
-            for _ in 1..nw {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(group.data_ptr(slot0_off), group.data_ptr(off), wsz);
-                }
-                off += align8(wsz);
-            }
-        }
-
-        self.finish(group);
-        Ok(())
+            wire_props,
+            |g| self.group_footprint_direct(g),
+        )
     }
 
     /// Write an empty commit sentinel for an atomic zone.
@@ -1307,16 +1137,6 @@ impl SalWriter {
         let group = self.begin("write_commit_sentinel", 0, lsn, FLAG_DDL_SYNC | FLAG_TXN_COMMIT, &[])?;
         self.finish(group);
         Ok(())
-    }
-
-    pub fn signal_all(&self) {
-        for w in 0..self.m2w_efds.len() {
-            posix_io::eventfd_signal(self.m2w_efds[w]);
-        }
-    }
-
-    pub fn signal_one(&self, worker: usize) {
-        posix_io::eventfd_signal(self.m2w_efds[worker]);
     }
 
     pub fn needs_checkpoint(&self) -> bool {
@@ -1370,33 +1190,8 @@ impl SalWriter {
 }
 
 // ---------------------------------------------------------------------------
-// SalMessage + SalReader
+// SalReader
 // ---------------------------------------------------------------------------
-
-pub struct SalMessage<'a> {
-    pub lsn: u64,
-    pub kind: SalMessageKind,
-    pub flags: u32,
-    pub target_id: u32,
-    /// The group's byte offset in the ring — what a recovery error names, and
-    /// what the zone-span rule tests damage against.
-    pub base: u64,
-    /// The slot count the group was written with. Recovery validates a zone's
-    /// blocks across all of them, not only the reader's own, so its verdict does
-    /// not depend on which worker asked.
-    pub slots: u32,
-    /// None = no data for this worker in this group.
-    pub wire_data: Option<&'a [u8]>,
-}
-
-/// [`SalRead`] at message level: what a reader found at a cursor, with the next
-/// cursor alongside a readable group.
-pub enum SalStep {
-    Absent,
-    Corrupt,
-    OtherEpoch,
-    Group(SalMessage<'static>, u64),
-}
 
 pub struct SalReader {
     ptr: *const u8,
@@ -1484,23 +1279,7 @@ impl SalReader {
         if cursor + 8 > self.mmap_size {
             return SalStep::Absent;
         }
-        match unsafe { sal_read_group_header(self.ptr, cursor, self.worker_id, gate, self.mmap_size) } {
-            SalRead::Absent => SalStep::Absent,
-            SalRead::Corrupt => SalStep::Corrupt,
-            SalRead::OtherEpoch => SalStep::OtherEpoch,
-            SalRead::Group(r) => SalStep::Group(
-                SalMessage {
-                    lsn: r.lsn,
-                    kind: SalMessageKind::classify(r.flags),
-                    flags: r.flags,
-                    target_id: r.target_id,
-                    base: cursor,
-                    slots: r.slots,
-                    wire_data: r.wire_data(),
-                },
-                cursor + r.advance,
-            ),
-        }
+        unsafe { sal_read_group_header(self.ptr, cursor, self.worker_id, gate, self.mmap_size) }
     }
 
     /// The group at `cursor` and the cursor past it, or `None` when the bytes are
@@ -1553,7 +1332,7 @@ impl SalReader {
     /// validate a zone across every slot its groups declare.
     pub fn slot_at(&self, base: u64, w: u32) -> Option<&'static [u8]> {
         match unsafe { sal_read_group_header(self.ptr, base, w, EpochGate::Any, self.mmap_size) } {
-            SalRead::Group(r) => r.wire_data(),
+            SalStep::Group(msg, _) => msg.wire_data,
             _ => None,
         }
     }

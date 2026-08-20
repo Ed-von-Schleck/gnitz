@@ -30,17 +30,16 @@ pub(super) struct PendingScan {
 /// * `WireSafe` — a fixed-width columnar train (empty blob region) emitted as a
 ///   [`WireData::Range`], chunked across frames when it exceeds
 ///   `reply_frame_budget`. `next_row` tracks emission progress (`0` ⇒ the first
-///   chunk still owes the schema block; non-zero ⇒ a pure-data continuation);
-///   `wire_row_stride` is the constant per-row wire size, computed once at
-///   enqueue so each chunk recomputes only the frame base. This is the only
-///   shape a plain scan or an oversized seek-by-index / gather reply produces.
+///   chunk still owes the schema block; non-zero ⇒ a pure-data continuation).
+///   This is the only shape a plain scan or an oversized seek-by-index / gather
+///   reply produces.
 /// * `NonWireSafe` — a STRING/German-string (blob-bearing) result that cannot
 ///   chunk: exactly one whole-batch frame. Reached only on the multi-scan FIFO
 ///   path (`force_fifo`), where even an immediate-emit-eligible reply must queue
 ///   so ring order equals request order; the plain scan path still emits such a
 ///   reply inline.
 pub(super) enum PendingScanKind {
-    WireSafe { next_row: usize, wire_row_stride: usize },
+    WireSafe { next_row: usize },
     NonWireSafe,
 }
 
@@ -291,10 +290,6 @@ impl WorkerProcess {
         prebuilt_schema: Option<Rc<Vec<u8>>>,
         server_version: u16,
     ) {
-        // Per-row wire stride, computed once for the train (wire-safe schemas
-        // only reach here, so the stride is constant across chunks).
-        let row_span = |rows| Self::chunk_msg(target_id, &batch, client_id, 0, rows, None, server_version, true).size();
-        let wire_row_stride = row_span(1) - row_span(0);
         self.pending_streams.push_back(PendingScan {
             batch,
             request_id,
@@ -302,10 +297,7 @@ impl WorkerProcess {
             target_id,
             prebuilt_schema,
             server_version,
-            kind: PendingScanKind::WireSafe {
-                next_row: 0,
-                wire_row_stride,
-            },
+            kind: PendingScanKind::WireSafe { next_row: 0 },
         });
     }
 
@@ -405,15 +397,11 @@ impl WorkerProcess {
     /// `next_row` or popping it on the terminal chunk.
     fn emit_wire_safe_chunk(&mut self) {
         let budget = self.reply_frame_budget;
-        let (batch, next_row, request_id, client_id, target_id, prebuilt_schema, server_version, per_row) = {
+        let (batch, next_row, request_id, client_id, target_id, prebuilt_schema, server_version) = {
             let Some(p) = self.pending_streams.front() else {
                 return;
             };
-            let PendingScanKind::WireSafe {
-                next_row,
-                wire_row_stride,
-            } = &p.kind
-            else {
+            let PendingScanKind::WireSafe { next_row } = &p.kind else {
                 // `emit_pending_scan_chunk` only routes a WireSafe front here, and
                 // nothing mutates the queue in between — same invariant the
                 // has-more branch below asserts with `unreachable!`.
@@ -427,7 +415,6 @@ impl WorkerProcess {
                 p.target_id,
                 p.prebuilt_schema.clone(),
                 p.server_version,
-                *wire_row_stride,
             )
         };
 
@@ -439,10 +426,14 @@ impl WorkerProcess {
         };
 
         let remaining = batch.count - next_row;
-        // Rows per chunk via linear interpolation: wire-safe schemas have a
-        // constant per-row stride (stored at enqueue), so wire size is linear
-        // in count and only the frame base (schema block on the first chunk)
-        // needs recomputing per chunk.
+        // Rows per chunk, exactly: a chunk costs `base` (ctrl block, plus the
+        // schema block on the first chunk) + the data block, and for a wire-safe
+        // schema the data block is affine in the row count — `hdr` (its own
+        // header and region directory) plus `per_row` per row, with no alignment
+        // padding. `base` is sized with a zero-row range, which carries no data
+        // block at all, so `hdr` must be added back explicitly; differencing two
+        // whole-message sizes across that discontinuity would fold `hdr` into
+        // the slope and charge it once per row.
         let base = Self::chunk_msg(
             target_id,
             &batch,
@@ -454,10 +445,15 @@ impl WorkerProcess {
             false,
         )
         .size();
-        let max_rows = match budget.saturating_sub(base).checked_div(per_row) {
-            Some(rows) => rows.max(1).min(remaining),
-            None => remaining.max(1), // per_row == 0: constant wire size, send all
-        };
+        let hdr = batch.wire_byte_size_range(0);
+        // The weight and null-bitmap regions alone are 8 bytes per row each, so
+        // this is never zero.
+        let per_row = batch.wire_byte_size_range(1) - hdr;
+        // `.max(1)` before the clamp to `remaining`: a chunk always carries at
+        // least one row (a budget too small for even one would otherwise stall
+        // the train), and a zero-row batch — which `force_fifo` can queue —
+        // still emits its one terminal frame rather than a row it does not have.
+        let max_rows = (budget.saturating_sub(base + hdr) / per_row).max(1).min(remaining);
         let has_more = next_row + max_rows < batch.count;
         self.w2m_writer.send_msg(
             request_id,

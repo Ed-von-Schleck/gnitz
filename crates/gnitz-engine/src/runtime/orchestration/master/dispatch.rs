@@ -97,11 +97,14 @@ impl MasterDispatcher {
         catalog: *mut CatalogEngine,
         sal: SalWriter,
         w2m: Rc<W2mReceiver>,
+        m2w_efds: Vec<i32>,
     ) -> Self {
+        debug_assert_eq!(m2w_efds.len(), num_workers, "one wakeup eventfd per worker",);
         MasterDispatcher {
             num_workers,
             worker_pids: RefCell::new(worker_pids),
             sal,
+            m2w_efds,
             w2m,
             catalog,
             unique_filters: RefCell::new(FxHashMap::default()),
@@ -183,20 +186,21 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         self.sal.write_group_direct(
             &DirectGroup {
-                target_id: target_id as u32,
-                wire_flags,
-                worker_batches: &[],
-                schema: None,
-                seek_pk,
-                seek_col_idx,
+                template: wire::WireMsg {
+                    target_id: target_id as u64,
+                    client_id,
+                    flags: wire_flags,
+                    seek_pk,
+                    seek_col_idx,
+                    seek_pk_extra,
+                    ..Default::default()
+                },
+                worker_data: &[],
                 req_ids,
                 unicast_worker: match unicast_worker {
                     Fanout::Broadcast => None,
                     Fanout::One(w) => Some(w),
                 },
-                client_id,
-                prebuilt_schema_block: None,
-                seek_pk_extra,
             },
             lsn,
             sal_flags,
@@ -213,24 +217,23 @@ impl MasterDispatcher {
     /// master→worker SAL.
     fn data_group<'a>(
         target_id: i64,
-        worker_batches: &'a [Option<&'a Batch>],
+        worker_data: &'a [wire::WireData<'a>],
         schema: &'a SchemaDescriptor,
         seek_pk: u128,
         seek_col_idx: u64,
         req_ids: &'a [u64],
     ) -> DirectGroup<'a> {
         DirectGroup {
-            target_id: target_id as u32,
-            wire_flags: 0,
-            worker_batches,
-            schema: Some(schema),
-            seek_pk,
-            seek_col_idx,
+            template: wire::WireMsg {
+                target_id: target_id as u64,
+                seek_pk,
+                seek_col_idx,
+                schema: Some(schema),
+                ..Default::default()
+            },
+            worker_data,
             req_ids,
             unicast_worker: None,
-            client_id: 0,
-            prebuilt_schema_block: None,
-            seek_pk_extra: &[],
         }
     }
 
@@ -249,7 +252,8 @@ impl MasterDispatcher {
         seek_col_idx: u64,
         req_ids: &[u64],
     ) -> Result<(), String> {
-        let group = Self::data_group(target_id, worker_batches, schema, seek_pk, seek_col_idx, req_ids);
+        let worker_data: Vec<wire::WireData> = worker_batches.iter().map(|b| wire::WireData::Whole(*b)).collect();
+        let group = Self::data_group(target_id, &worker_data, schema, seek_pk, seek_col_idx, req_ids);
         self.sal.write_group_direct(&group, 0, sal_flags)
     }
 
@@ -337,17 +341,34 @@ impl MasterDispatcher {
         schema: Option<&SchemaDescriptor>,
         seek_pk: u128,
     ) -> Result<(), String> {
-        self.sal
-            .write_broadcast_direct(target_id as u32, lsn, flags, None, schema, seek_pk, None)?;
+        self.sal.write_group_direct(
+            &DirectGroup {
+                template: wire::WireMsg {
+                    target_id: target_id as u64,
+                    seek_pk,
+                    schema,
+                    ..Default::default()
+                },
+                worker_data: &[],
+                req_ids: &SYNC_COLLECT_REQ_IDS[..self.num_workers],
+                unicast_worker: None,
+            },
+            lsn,
+            flags,
+        )?;
         self.signal_all();
         Ok(())
     }
 
+    /// Wake every worker: they see the SAL entry through the mapping's Acquire
+    /// size prefix regardless, so this only ends a park.
     pub(crate) fn signal_all(&self) {
-        self.sal.signal_all();
+        for &efd in &self.m2w_efds {
+            crate::foundation::posix_io::eventfd_signal(efd);
+        }
     }
     pub(super) fn signal_one(&self, worker: usize) {
-        self.sal.signal_one(worker);
+        crate::foundation::posix_io::eventfd_signal(self.m2w_efds[worker]);
     }
 
     pub(crate) fn sal_fd(&self) -> i32 {
@@ -445,7 +466,7 @@ impl MasterDispatcher {
                     continue;
                 };
                 progressed = true;
-                if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
+                if decoded.control.flags & FLAG_EXCHANGE != 0 {
                     if let Some(relay) = acc.process(w, decoded) {
                         // A round just completed. If a prior round was stamped
                         // CHECKPOINT, every worker has now consumed that relay
@@ -650,13 +671,15 @@ impl MasterDispatcher {
     }
 
     /// The per-worker slots a relay emits.
-    fn relay_refs<'a>(&self, dest: &'a RelayDest) -> Vec<Option<&'a Batch>> {
+    fn relay_data<'a>(&self, dest: &'a RelayDest) -> Vec<wire::WireData<'a>> {
         match dest {
             RelayDest::PerWorker(batches) => batches
                 .iter()
-                .map(|b| if b.count > 0 { Some(b) } else { None })
+                .map(|b| wire::WireData::Whole((b.count > 0).then_some(b)))
                 .collect(),
-            RelayDest::Broadcast(b) => vec![if b.count > 0 { Some(&**b) } else { None }; self.num_workers],
+            RelayDest::Broadcast(b) => {
+                vec![wire::WireData::Whole((b.count > 0).then_some(&**b)); self.num_workers]
+            }
         }
     }
 
@@ -674,12 +697,12 @@ impl MasterDispatcher {
         view_id: i64,
         source_id: i64,
         schema: &'a SchemaDescriptor,
-        refs: &'a [Option<&'a Batch>],
+        worker_data: &'a [wire::WireData<'a>],
         decision: u64,
     ) -> DirectGroup<'a> {
         Self::data_group(
             view_id,
-            refs,
+            worker_data,
             schema,
             source_id as u128,
             decision,
@@ -840,15 +863,15 @@ impl MasterDispatcher {
         // Size the group here, outside `sal_writer_excl`: the batches are in
         // hand, so the fit check under the lock is a comparison rather than a
         // sizing pass.
-        let refs = self.relay_refs(&dest);
+        let worker_data = self.relay_data(&dest);
         let footprint = self.sal.group_footprint_direct(&self.relay_group(
             view_id,
             source_id,
             &schema,
-            &refs,
+            &worker_data,
             BACKFILL_DECISION_CONTINUE,
         ));
-        drop(refs);
+        drop(worker_data);
 
         Ok(RelayPrepared {
             view_id,
@@ -870,8 +893,8 @@ impl MasterDispatcher {
     /// the reactor's `relay_loop` serves only steady-state tick exchanges and
     /// always passes CONTINUE.
     pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), String> {
-        let refs = self.relay_refs(&prep.dest);
-        let group = self.relay_group(prep.view_id, prep.source_id, &prep.schema, &refs, decision);
+        let worker_data = self.relay_data(&prep.dest);
+        let group = self.relay_group(prep.view_id, prep.source_id, &prep.schema, &worker_data, decision);
         self.sal.write_group_direct(&group, 0, FLAG_EXCHANGE_RELAY)?;
         self.signal_all();
         Ok(())
@@ -1158,14 +1181,21 @@ impl MasterDispatcher {
     /// which is what gives the zone a byte span recovery can attribute damage to.
     pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64, zone_start: bool) -> Result<(), String> {
         let (schema, schema_block, _safe, _stride) = self.cached_schema_block(target_id);
-        self.sal.write_broadcast_direct(
-            target_id as u32,
+        let worker_data = vec![wire::WireData::Whole(Some(batch)); self.num_workers];
+        self.sal.write_group_direct(
+            &DirectGroup {
+                template: wire::WireMsg {
+                    target_id: target_id as u64,
+                    schema: Some(&schema),
+                    prebuilt_schema_block: Some(schema_block.as_slice()),
+                    ..Default::default()
+                },
+                worker_data: &worker_data,
+                req_ids: &SYNC_COLLECT_REQ_IDS[..self.num_workers],
+                unicast_worker: None,
+            },
             lsn,
             FLAG_DDL_SYNC | if zone_start { FLAG_ZONE_START } else { 0 },
-            Some(batch),
-            Some(&schema),
-            0,
-            Some(schema_block.as_slice()),
         )?;
         self.signal_all();
         gnitz_debug!("broadcast_ddl tid={} rows={} lsn={}", target_id, batch.count, lsn);
@@ -1305,19 +1335,29 @@ impl MasterDispatcher {
     }
 
     /// The exact SAL footprint (bytes) of a transaction's family groups — the sum
-    /// over families of each family group's `wire_group_footprint`, partitioned
-    /// the way `write_commit_group` will emit it (broadcast for a replicated
-    /// schema, else PK-partitioned).
+    /// over families of each family group, partitioned the way
+    /// `write_commit_group` will emit it (broadcast for a replicated schema, else
+    /// PK-partitioned).
+    ///
+    /// Each family is measured as the [`DirectGroup`] `scatter_wire_group` builds
+    /// for it, so the fit check and the emission read one set of slot sizes. They
+    /// must not drift: the committer fail-stops the node when a family fails to
+    /// fit after an earlier family already wrote to the SAL.
     fn txn_zone_footprint(&self, families: &[(i64, &Batch)]) -> usize {
         let nw = self.num_workers;
         let mut total = 0usize;
         for &(tid, batch) in families {
             let (schema, block, wire_safe, wire_row_stride) = self.cached_schema_block(tid);
-            let props = (wire_safe, wire_row_stride);
-            let block_len = block.len();
             let sal = &self.sal;
             total += with_commit_indices(batch, &schema, nw, |wi| {
-                sal.wire_group_footprint(batch, wi, &schema, block_len, props)
+                sal.scatter_group_footprint(
+                    batch,
+                    wi,
+                    &schema,
+                    tid as u32,
+                    Some(block.as_slice()),
+                    Some((wire_safe, wire_row_stride)),
+                )
             });
         }
         total
@@ -1486,12 +1526,15 @@ mod worker_liveness_tests {
             unsafe { w2m_ring::init_region_for_tests(region.ptr(), RING_CAP as u64) };
             rings.push(region);
         }
+        // `-1` eventfds: nothing parks on them here, and `eventfd_signal`
+        // discards a failed write (the counter is only a wake hint).
         let disp = MasterDispatcher::new(
             nw,
             worker_pids,
             std::ptr::null_mut(),
-            SalWriter::new(std::ptr::null_mut(), -1, 0, Vec::new()),
+            SalWriter::new(std::ptr::null_mut(), -1, 0, nw),
             Rc::new(W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect())),
+            vec![-1; nw],
         );
         (disp, rings)
     }
@@ -1636,7 +1679,7 @@ mod checkpoint_finalize_tests {
             // A fake but real, writable SAL region: checkpoint_reset() stores 0 at
             // the base pointer, so it must not be null.
             let sal_region = SharedRegion::new(SAL_SIZE);
-            let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, Vec::new());
+            let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, 0);
             let catalog_ptr = &mut engine as *mut CatalogEngine;
             let disp = MasterDispatcher::new(
                 0,
@@ -1644,6 +1687,7 @@ mod checkpoint_finalize_tests {
                 catalog_ptr,
                 sal_writer,
                 Rc::new(W2mReceiver::new(Vec::new())),
+                Vec::new(),
             );
 
             // The finalizer under guard: must durably flush sys_sequences before the
@@ -1679,7 +1723,7 @@ mod checkpoint_finalize_tests {
         assert_eq!(engine.durable_generation, 0, "fresh DB starts at generation 0");
 
         let sal_region = SharedRegion::new(SAL_SIZE);
-        let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, Vec::new());
+        let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, 0);
         let catalog_ptr = &mut engine as *mut CatalogEngine;
         let disp = MasterDispatcher::new(
             0,
@@ -1687,6 +1731,7 @@ mod checkpoint_finalize_tests {
             catalog_ptr,
             sal_writer,
             Rc::new(W2mReceiver::new(Vec::new())),
+            Vec::new(),
         );
 
         // Epoch 0 is the empty-slot sentinel, so the region needs a boot reset
@@ -1720,7 +1765,7 @@ mod checkpoint_finalize_tests {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
         let sal_region = SharedRegion::new(SAL_SIZE);
-        let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, Vec::new());
+        let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, 0);
         let catalog_ptr = &mut engine as *mut CatalogEngine;
         let disp = MasterDispatcher::new(
             0,
@@ -1728,6 +1773,7 @@ mod checkpoint_finalize_tests {
             catalog_ptr,
             sal_writer,
             Rc::new(W2mReceiver::new(Vec::new())),
+            Vec::new(),
         );
         disp.reset_sal(1);
 

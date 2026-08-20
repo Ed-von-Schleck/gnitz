@@ -7,9 +7,10 @@
 // private sibling module) but not from any other subsystem.
 //
 // `orchestration` (master/worker/executor/committer) and `protocol`
-// (wire/sal/w2m/w2m_ring) are internal layer groupings, not facades: their
-// submodules are aliased below so the historical `crate::runtime::<mod>` paths
-// keep resolving for siblings (`bootstrap`, `reactor`) and the test dir.
+// (wire/sal/w2m/w2m_ring) group the submodules by layer. The aliases below are
+// the convention, not a compatibility shim: every reference names
+// `crate::runtime::<mod>`, and nothing in the crate spells out the grouping
+// directory — so the aliases are what those paths resolve through.
 mod bootstrap;
 mod orchestration;
 mod protocol;

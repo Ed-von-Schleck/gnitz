@@ -802,7 +802,7 @@ fn run_worker_child(
         ipc.m2w_efds[w],
         boot_epoch,
     );
-    let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w], W2M_REGION_SIZE as u64);
+    let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
 
     // Re-home every inherited store from the pre-fork master's `w0of{W}` to THIS
     // worker's own `w{w}of{W}` dir before any flush — all workers share the data
@@ -984,10 +984,17 @@ fn run_server(
     let catalog = unsafe { &mut *catalog_ptr };
     catalog.detach_user_stores();
 
-    let sal_writer = SalWriter::new(ipc.sal_ptr, ipc.sal_fd, sal_mmap_size() as u64, ipc.m2w_efds.clone());
+    let sal_writer = SalWriter::new(ipc.sal_ptr, ipc.sal_fd, sal_mmap_size() as u64, nw);
     let w2m_receiver = std::rc::Rc::new(W2mReceiver::new(ipc.w2m_ptrs.clone()));
 
-    let dispatcher = MasterDispatcher::new(nw, worker_pids.clone(), catalog_ptr, sal_writer, w2m_receiver);
+    let dispatcher = MasterDispatcher::new(
+        nw,
+        worker_pids.clone(),
+        catalog_ptr,
+        sal_writer,
+        w2m_receiver,
+        ipc.m2w_efds.clone(),
+    );
     let dispatcher_rc = std::rc::Rc::new(dispatcher);
 
     // Wait for all workers to complete recovery and signal readiness
@@ -1139,7 +1146,7 @@ mod walk_tests {
     impl Log {
         fn new(region: &SharedRegion, epoch: u32) -> Log {
             let ptr = region.ptr();
-            let writer = SalWriter::new(ptr, -1, SIZE as u64, vec![-1]);
+            let writer = SalWriter::new(ptr, -1, SIZE as u64, 1);
             writer.reset(0, epoch);
             Log { ptr, writer, epoch }
         }
@@ -1676,7 +1683,7 @@ mod zone_block_tests {
     #[test]
     fn a_row_less_slot_is_not_a_damaged_one() {
         let region = SharedRegion::new(SIZE);
-        let writer = SalWriter::new(region.ptr(), -1, SIZE as u64, vec![-1; NW]);
+        let writer = SalWriter::new(region.ptr(), -1, SIZE as u64, NW);
         writer.reset(0, 1);
         let bases = push_zone(&writer, 5, &[TID]);
 
@@ -1704,7 +1711,7 @@ mod zone_block_tests {
     fn the_demotion_is_global_across_slots() {
         for damage_offset_zero in [false, true] {
             let region = SharedRegion::new(SIZE);
-            let writer = SalWriter::new(region.ptr(), -1, SIZE as u64, vec![-1; NW]);
+            let writer = SalWriter::new(region.ptr(), -1, SIZE as u64, NW);
             writer.reset(0, 1);
             // A leading command group, so offset 0 is not the zone's own head and
             // can be damaged independently: with it gone there is no tail-wide slot
@@ -1740,7 +1747,7 @@ mod zone_block_tests {
     #[test]
     fn a_torn_last_zone_is_skipped_whole() {
         let region = SharedRegion::new(SIZE);
-        let writer = SalWriter::new(region.ptr(), -1, SIZE as u64, vec![-1; NW]);
+        let writer = SalWriter::new(region.ptr(), -1, SIZE as u64, NW);
         writer.reset(0, 1);
         push_zone(&writer, 4, &[TID]);
         let last = push_zone(&writer, 5, &[TID, TID + 1]);

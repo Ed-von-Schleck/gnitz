@@ -10,23 +10,23 @@ use std::rc::Rc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::catalog::CatalogEngine;
-use crate::schema::{IndexKeySpec, SchemaDescriptor};
+use crate::schema::{unique_preflight_wire_schema, IndexKeySpec, SchemaDescriptor};
 use gnitz_wire::PkColList;
 use gnitz_wire::{payload_native_key, pk_native_key};
 
 use crate::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, RouteMode};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
+use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP};
 use crate::runtime::sal::{
-    unique_preflight_wire_schema, DirectGroup, SalFit, SalWriter, BACKFILL_DECISION_CHECKPOINT,
-    BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, FLAG_BACKFILL, FLAG_DDL_SYNC, FLAG_EXCHANGE,
-    FLAG_EXCHANGE_RELAY, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK,
-    FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN, FLAG_TICK, FLAG_UNIQUE_PREFLIGHT,
+    DirectGroup, SalFit, SalWriter, FLAG_BACKFILL, FLAG_DDL_SYNC, FLAG_EXCHANGE_RELAY, FLAG_FLUSH, FLAG_FLUSH_EPH,
+    FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN, FLAG_TICK,
+    FLAG_UNIQUE_PREFLIGHT,
 };
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{
-    self, peek_control_block_ipc, DecodedWire, SchemaWithVersion, WireConflictMode, FLAG_CONTINUATION, FLAG_HAS_DATA,
-    FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
+    self, peek_control_block_ipc, DecodedWire, SchemaWithVersion, WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE,
+    FLAG_HAS_DATA, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
 };
 use crate::schema::key::PkBuf;
 use crate::storage::Batch;
@@ -66,6 +66,10 @@ pub struct MasterDispatcher {
     num_workers: usize,
     worker_pids: RefCell<Vec<i32>>,
     sal: SalWriter,
+    /// Per-worker wakeup eventfds, in worker order. Signalling is not framing:
+    /// the SAL writer decides a group's shape from its own worker count, and this
+    /// only tells the workers to go look.
+    m2w_efds: Vec<i32>,
     /// Shared with the reactor, which is the other reader. Every `W2mReceiver`
     /// method takes `&self` (its cursors live in the shared-memory rings), so
     /// both hold a clone rather than handing ownership across.

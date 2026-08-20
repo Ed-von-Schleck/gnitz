@@ -14,7 +14,7 @@ use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg};
 // The kernel's `FUTEX_WAITV_MAX` is 128; past it the syscall returns EINVAL,
 // which the caller absorbs as a timeout, silently degenerating the relay to
 // polling. Make a `MAX_WORKERS` bump that outgrows it a build error.
-const _: () = assert!(crate::runtime::sal::MAX_WORKERS <= 128);
+const _: () = assert!(gnitz_wire::MAX_WORKERS <= 128);
 
 /// Worker's write side of a single W2M ring.
 pub struct W2mWriter {
@@ -24,13 +24,10 @@ pub struct W2mWriter {
 unsafe impl Send for W2mWriter {}
 
 impl W2mWriter {
-    pub fn new(region_ptr: *mut u8, region_size: u64) -> Self {
-        let hdr = unsafe { W2mRingHeader::from_raw(region_ptr as *const u8) };
-        assert_eq!(
-            hdr.capacity(),
-            region_size,
-            "W2mWriter region_size must match ring header capacity",
-        );
+    /// The ring's capacity is read from the header the region was initialized
+    /// with, so it is not a parameter: every caller derives both from one
+    /// expression, and there is nothing a second copy could catch.
+    pub fn new(region_ptr: *mut u8) -> Self {
         W2mWriter { region_ptr }
     }
 
@@ -80,6 +77,13 @@ impl W2mWriter {
             match r {
                 TryReserve::Ok(r) => break r,
                 TryReserve::Full => {
+                    // Snapshot first, publish the park flag second — the reverse
+                    // of `arm_master_park`, and correct here for a different
+                    // reason: the `has_room` recheck below follows the snapshot,
+                    // and `futex_wait_u32`'s value-compare against `expected`
+                    // returns immediately if the reader bumped `writer_seq` in
+                    // between. The flag only decides whether the reader bothers
+                    // to issue the wake.
                     let expected = hdr.writer_seq().load(Ordering::Acquire);
                     hdr.waiter_flags().fetch_or(FLAG_WRITER_PARKED, Ordering::AcqRel);
                     let room_now = unsafe { w2m_ring::has_room(hdr, sz) };
@@ -149,7 +153,7 @@ fn bump_and_wake(seq: &AtomicU32, flags: &AtomicU32, parked_bit: u32, site: &str
 /// `send_encoded` once the ring fills. Crossing this many simultaneously-parked
 /// slots on one ring means a client is draining unusually slowly — `take` logs
 /// one warning so the condition is observable.
-pub(crate) const W2M_MAX_IN_FLIGHT: usize = 64;
+const W2M_MAX_IN_FLIGHT: usize = 64;
 
 /// Capacity above which a fully-drained queue is shrunk back to hand the heap it
 /// grew for a burst back to the allocator. A stalled client can park a ring's
@@ -339,7 +343,7 @@ impl W2mReceiver {
 
         let bytes = unsafe { std::slice::from_raw_parts(ptr, sz as usize) };
         // The `SLOT_LEN_PREFIX_BYTES` bytes at `ptr - SLOT_LEN_PREFIX_BYTES` hold
-        // `sz as u32 LE` (the client length prefix, the low half of the slot
+        // `sz as u32 LE` (the client length prefix, the high half of the slot
         // prefix `try_reserve` stamped). Together with the payload they form the
         // exact framed buffer `send_buffer` expects, avoiding a re-encode on the
         // scan egress path.
@@ -405,7 +409,7 @@ impl W2mReceiver {
     /// words; once the reactor resumes it re-establishes the flag via
     /// `refresh_futex_waitv_vals`, so there is nothing to restore.
     pub fn wait_any(&self, workers: &[usize], timeout_ms: i32) -> i32 {
-        let mut waiters = [FutexWaitV::new(); crate::runtime::sal::MAX_WORKERS];
+        let mut waiters = [FutexWaitV::new(); gnitz_wire::MAX_WORKERS];
         let mut n = 0;
         for &w in workers {
             let hdr = unsafe { self.header(w) };
@@ -440,25 +444,15 @@ mod tests {
     use super::*;
     use crate::runtime::w2m_ring::{self, W2mRingHeader, W2M_HEADER_SIZE};
     use crate::test_support::SharedRegion;
-    use gnitz_wire::align8;
     use std::sync::atomic::Ordering;
-
-    /// Allocate a ring that holds at most `n_msgs` messages of `msg_sz` bytes.
-    unsafe fn make_ring(msg_sz: usize, n_msgs: usize) -> (SharedRegion, u64) {
-        let msg_total = 8 + align8(msg_sz) as u64;
-        let capacity = W2M_HEADER_SIZE as u64 + n_msgs as u64 * msg_total + 8;
-        let region = SharedRegion::new(capacity as usize);
-        w2m_ring::init_region_for_tests(region.ptr(), capacity);
-        (region, capacity)
-    }
 
     /// Slots released in push order: consume_cursor advances one step at a time.
     #[test]
     fn test_w2m_slot_in_order_release() {
         unsafe {
-            let (region, capacity) = make_ring(64, 4);
+            let region = w2m_ring::make_ring(64, 4, 8);
             let ptr = region.ptr();
-            let writer = W2mWriter::new(ptr, capacity);
+            let writer = W2mWriter::new(ptr);
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
 
@@ -502,9 +496,9 @@ mod tests {
     #[test]
     fn test_w2m_slot_out_of_order_release() {
         unsafe {
-            let (region, capacity) = make_ring(64, 4);
+            let region = w2m_ring::make_ring(64, 4, 8);
             let ptr = region.ptr();
-            let writer = W2mWriter::new(ptr, capacity);
+            let writer = W2mWriter::new(ptr);
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
 
@@ -544,23 +538,18 @@ mod tests {
     fn test_w2m_slot_writer_wakeup() {
         unsafe {
             let msg_sz = 64usize;
-            let msg_total = 8 + align8(msg_sz) as u64;
             // Ring holds exactly 1 message.
-            let capacity = W2M_HEADER_SIZE as u64 + msg_total + 8;
-            let region = SharedRegion::new(capacity as usize);
+            let region = w2m_ring::make_ring(msg_sz, 1, 8);
             let ptr = region.ptr();
-            w2m_ring::init_region_for_tests(ptr, capacity);
 
             // Fill the ring (non-blocking direct call).
             let hdr_raw = W2mRingHeader::from_raw(ptr as *const u8);
-            match w2m_ring::try_publish(hdr_raw, ptr, msg_sz, |s| {
+            w2m_ring::try_publish(hdr_raw, ptr, msg_sz, |s| {
                 s[0] = 1;
-            }) {
-                w2m_ring::TryPublish::Ok(_) => {}
-                w2m_ring::TryPublish::Full => panic!("ring should have room for first message"),
-            }
+            })
+            .expect("ring should have room for first message");
 
-            let writer = W2mWriter::new(ptr, capacity);
+            let writer = W2mWriter::new(ptr);
             let receiver = W2mReceiver::new(vec![ptr]);
 
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -597,9 +586,9 @@ mod tests {
     #[test]
     fn release_retires_full_64_prefix_in_one_drain() {
         unsafe {
-            let (region, capacity) = make_ring(8, 64);
+            let region = w2m_ring::make_ring(8, 64, 8);
             let ptr = region.ptr();
-            let writer = W2mWriter::new(ptr, capacity);
+            let writer = W2mWriter::new(ptr);
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
 
@@ -651,9 +640,9 @@ mod tests {
     fn release_past_64_in_flight_out_of_order() {
         unsafe {
             const N: usize = 200;
-            let (region, capacity) = make_ring(8, N);
+            let region = w2m_ring::make_ring(8, N, 8);
             let ptr = region.ptr();
-            let writer = W2mWriter::new(ptr, capacity);
+            let writer = W2mWriter::new(ptr);
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
 
@@ -715,9 +704,9 @@ mod tests {
     fn release_shrinks_queue_after_burst_drains() {
         unsafe {
             const N: usize = 4096; // comfortably above INFLIGHT_SHRINK_THRESHOLD
-            let (region, capacity) = make_ring(8, N);
+            let region = w2m_ring::make_ring(8, N, 8);
             let ptr = region.ptr();
-            let writer = W2mWriter::new(ptr, capacity);
+            let writer = W2mWriter::new(ptr);
             let receiver = W2mReceiver::new(vec![ptr]);
 
             for i in 0..N {
@@ -750,12 +739,12 @@ mod tests {
     #[test]
     fn test_wait_for_misses_publish_on_other_ring() {
         unsafe {
-            let rings: Vec<(SharedRegion, u64)> = (0..4).map(|_| make_ring(64, 4)).collect();
-            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0.ptr()).collect());
-            let (pub_ptr, pub_cap) = (rings[3].0.ptr() as usize, rings[3].1);
+            let rings: Vec<SharedRegion> = (0..4).map(|_| w2m_ring::make_ring(64, 4, 8)).collect();
+            let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
+            let pub_ptr = rings[3].ptr() as usize;
             let handle = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                W2mWriter::new(pub_ptr as *mut u8, pub_cap).send_encoded(64, 0, |s| s[0] = 7);
+                W2mWriter::new(pub_ptr as *mut u8).send_encoded(64, 0, |s| s[0] = 7);
             });
             let start = std::time::Instant::now();
             let _ = receiver.wait_for(0, 300); // parks on ring 0; ring 3's wake can't reach it
@@ -774,12 +763,12 @@ mod tests {
     #[test]
     fn test_wait_any_woken_by_publish_on_other_ring() {
         unsafe {
-            let rings: Vec<(SharedRegion, u64)> = (0..4).map(|_| make_ring(64, 4)).collect();
-            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0.ptr()).collect());
-            let (pub_ptr, pub_cap) = (rings[3].0.ptr() as usize, rings[3].1);
+            let rings: Vec<SharedRegion> = (0..4).map(|_| w2m_ring::make_ring(64, 4, 8)).collect();
+            let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
+            let pub_ptr = rings[3].ptr() as usize;
             let handle = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                W2mWriter::new(pub_ptr as *mut u8, pub_cap).send_encoded(64, 0, |s| s[0] = 7);
+                W2mWriter::new(pub_ptr as *mut u8).send_encoded(64, 0, |s| s[0] = 7);
             });
             let start = std::time::Instant::now();
             let _ = receiver.wait_any(&[0, 1, 2, 3], 5000); // any ring's wake reaches it
@@ -798,8 +787,8 @@ mod tests {
     #[test]
     fn test_wait_any_times_out_with_no_publisher() {
         unsafe {
-            let rings: Vec<(SharedRegion, u64)> = (0..1).map(|_| make_ring(64, 4)).collect();
-            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0.ptr()).collect());
+            let rings: Vec<SharedRegion> = (0..1).map(|_| w2m_ring::make_ring(64, 4, 8)).collect();
+            let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
             let start = std::time::Instant::now();
             let rc = receiver.wait_any(&[0], 200);
             let elapsed = start.elapsed().as_millis();

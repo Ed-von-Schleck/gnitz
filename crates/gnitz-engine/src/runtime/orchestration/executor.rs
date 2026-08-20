@@ -39,11 +39,12 @@ use crate::runtime::master::{
     TxnFamily, UniqueFilter,
 };
 use crate::runtime::peer::Peer;
+use crate::runtime::reactor::BACKFILL_DECISION_CONTINUE;
 use crate::runtime::reactor::{
     mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard,
     ReplyFuture, WriteGuard,
 };
-use crate::runtime::sal::{SalFit, BACKFILL_DECISION_CONTINUE, FLAG_SCAN_SPEC};
+use crate::runtime::sal::{SalFit, FLAG_SCAN_SPEC};
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, FLAG_RESOLVE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
@@ -2664,21 +2665,22 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
 /// Frame one reply into a pooled send buffer. Callers build the [`ipc::WireMsg`]
 /// with the fields they actually set and leave the rest at `Default`.
 fn encode_response_buffer(msg: ipc::WireMsg<'_>) -> PooledSendBuf {
+    const PFX: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
     let sz = msg.size();
-    let total = 4 + sz;
+    let total = PFX + sz;
     let mut inner = crate::storage::batch_pool::acquire_buf();
     inner.reserve(total.max(8192));
-    // SAFETY: `encode_ipc` writes every byte [0, sz). The 4-byte frame header is
+    // SAFETY: `encode_ipc` writes every byte [0, sz). The frame length prefix is
     // written immediately below. wal::encode zeros inter-region padding (Step 1),
     // so no byte is left uninitialised regardless of column type.
     #[allow(clippy::uninit_vec)]
     unsafe {
         inner.set_len(total);
     }
-    inner[0..4].copy_from_slice(&(sz as u32).to_le_bytes());
-    let written = msg.encode_ipc(&mut inner[4..total], 0);
+    inner[0..PFX].copy_from_slice(&(sz as u32).to_le_bytes());
+    let written = msg.encode_ipc(&mut inner[PFX..total], 0);
     debug_assert_eq!(written, sz);
-    inner.truncate(4 + written);
+    inner.truncate(PFX + written);
     PooledSendBuf(inner)
 }
 

@@ -68,7 +68,10 @@ pub(crate) use futures::{FsyncFuture, ReplyFuture, ScanLease};
 use futures::{ScanRoute, ScanSlotFuture, SendCarry, TimerFuture};
 use park::ParkMap;
 
-pub use exchange::{ExchangeAccumulator, PendingRelay};
+pub use exchange::{
+    ExchangeAccumulator, PendingRelay, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE,
+    BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT,
+};
 pub use io::RecvBuf;
 pub use sync::{
     join_all_unpin, join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard, WriteGuard,
@@ -2550,7 +2553,7 @@ mod tests {
             // possible. The parent's wake protocol must not drop
             // any of them under the resulting drain-refresh-arm
             // race pressure.
-            let writer = W2mWriter::new(ptr, CAPACITY as u64);
+            let writer = W2mWriter::new(ptr);
             for req_id in 1..=n_messages {
                 writer.send_status(0, req_id, STATUS_OK, &[]);
             }
@@ -2628,97 +2631,35 @@ mod tests {
         w2m_cross_process_stress(5_000, 60);
     }
 
-    /// Lost-wake guard for `refresh_futex_waitv_vals` (cluster C6).
-    ///
-    /// The refresh MUST publish `FLAG_MASTER_PARKED` (`fetch_or`) BEFORE
-    /// it snapshots `reader_seq`, so a worker that advances `reader_seq`
-    /// after observing the flag is either caught by the worker's own
-    /// `FUTEX_WAKE` (it sees the flag) or by the refresh's post-snapshot
-    /// `write_cursor != read_cursor` check. If the snapshot is taken
-    /// first, a worker publishing in the window between the snapshot and
-    /// the `fetch_or` neither sees the flag (so it issues no wake) nor is
-    /// reliably reflected in the stale `reader_seq` expected value — the
-    /// classic lost-wake race.
-    ///
     /// This pin ISOLATES the refresh path: it drives
-    /// `refresh_futex_waitv_vals` directly, with NO `tick()` and NO
-    /// safety-net drain, so the store ordering is not masked. A helper
-    /// thread spins until it observes `FLAG_MASTER_PARKED` set, then
-    /// publishes into the ring (advancing `write_cursor` and
-    /// `reader_seq`). The pin then asserts:
-    ///   1. refresh reports "pending" (`true`) — the caller drains rather
-    ///      than arms a doomed wait — i.e. the publish is observed;
-    ///   2. via a `#[cfg(test)]` order-witness probe, the flag publish was
-    ///      stamped strictly before the `reader_seq` snapshot.
+    /// `refresh_futex_waitv_vals` directly, with NO `tick()` and NO safety-net
+    /// drain, so the store ordering is not masked, and asserts via a
+    /// `#[cfg(test)]` order-witness probe that the flag publish was stamped
+    /// strictly before the `reader_seq` snapshot.
     ///
-    /// Teeth: reordering the two operations (snapshot before `fetch_or`)
-    /// flips the order stamps, failing assertion (2).
+    /// Single-threaded on purpose: the property is a store order inside one
+    /// call, and a helper thread racing the refresh only made the *other* half
+    /// of this (the unread-data check) nondeterministic. That half is
+    /// [`refresh_reports_pending_when_data_is_unread`], where the publish
+    /// simply precedes the refresh.
+    ///
+    /// Teeth: reordering the two operations (snapshot before `fetch_or`) flips
+    /// the order stamps and fails the assert.
     #[test]
     fn refresh_publishes_flag_before_snapshotting_reader_seq() {
-        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-        use crate::runtime::w2m_ring::{self, W2mRingHeader, FLAG_MASTER_PARKED};
-        use crate::runtime::wire::STATUS_OK;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
+        use crate::runtime::w2m::W2mReceiver;
+        use crate::runtime::w2m_ring;
 
         const CAPACITY: usize = 64 * 1024;
-        const TIMEOUT: Duration = Duration::from_secs(10);
 
-        // A tiny shared W2M ring (same setup the cross-process stress tests
-        // use, but shared with a thread).
         let region = crate::test_support::SharedRegion::new(CAPACITY);
         let ptr = region.ptr();
         unsafe {
             w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
         }
 
-        // Arm the publish barrier on this (reactor) thread, so the helper's
-        // publish is visible to the refresh's `wc != rc` check deterministically.
-        let helper_published = Arc::new(AtomicBool::new(false));
-        park_order::set_publish_barrier(Some(Arc::clone(&helper_published)));
-
-        // Helper thread: spin until FLAG_MASTER_PARKED is GLOBALLY visible
-        // (Acquire), then publish exactly one message. If the flag became
-        // visible only after the refresh snapshotted reader_seq, the
-        // worker's FUTEX_WAKE would target a not-yet-armed waiter.
-        let ptr_addr = ptr as usize;
-        let helper_published_thread = Arc::clone(&helper_published);
-        let started = Arc::new(AtomicBool::new(false));
-        let started_thread = Arc::clone(&started);
-        let helper = std::thread::spawn(move || {
-            let region = ptr_addr as *mut u8;
-            let hdr = unsafe { W2mRingHeader::from_raw(region as *const u8) };
-            started_thread.store(true, Ordering::Release);
-            // Spin until the master publishes park intent.
-            let spin_deadline = Instant::now() + TIMEOUT;
-            while hdr.waiter_flags().load(Ordering::Acquire) & FLAG_MASTER_PARKED == 0 {
-                if Instant::now() >= spin_deadline {
-                    // Refresh never set the flag — let the main thread's
-                    // join+assert report the failure (helper_published
-                    // stays false → barrier on main thread also times out
-                    // via its own deadline below).
-                    return;
-                }
-                std::hint::spin_loop();
-            }
-            // Flag observed: publish one frame. send_encoded commits the
-            // write_cursor (Release) then bumps reader_seq.
-            let writer = W2mWriter::new(region, CAPACITY as u64);
-            writer.send_status(0, 1u64, STATUS_OK, &[]);
-            helper_published_thread.store(true, Ordering::Release);
-        });
-
-        // Wait for the helper to be live before we drive refresh, so the
-        // flag→publish handshake is the only ordering left to resolve.
-        let start = Instant::now();
-        while !started.load(Ordering::Acquire) {
-            assert!(start.elapsed() < TIMEOUT, "helper thread never started");
-            std::hint::spin_loop();
-        }
-
-        // Build the reactor and wire up ONLY the state refresh needs
-        // (w2m receiver + the FutexWaitV storage slot) — deliberately NOT
-        // calling attach_w2m, so no drain loop, no SQE arm, no tick().
+        // Only the state refresh needs — deliberately NOT `attach_w2m`, so no
+        // drain loop, no SQE arm, no tick().
         let reactor = Reactor::new(16).expect("reactor");
         reactor
             .inner
@@ -2728,38 +2669,50 @@ mod tests {
             .expect("w2m set");
         *reactor.inner.futex_waitv_storage.borrow_mut() = Some(vec![FutexWaitV::new()].into_boxed_slice());
 
-        // Drive the isolated refresh exactly once. Internally it publishes
-        // the flag, the helper observes it and publishes, the refresh's
-        // barrier waits for that publish, then the unread-data check runs.
-        let pending = reactor.refresh_futex_waitv_vals();
+        let _ = reactor.refresh_futex_waitv_vals();
 
-        helper.join().expect("helper thread panicked");
-        park_order::set_publish_barrier(None);
-
-        // The helper did publish (it observed the flag). If it timed out
-        // without seeing the flag, that itself is a lost-wake symptom.
-        assert!(
-            helper_published.load(Ordering::Acquire),
-            "helper never observed FLAG_MASTER_PARKED — flag was not published \
-             before the refresh completed (lost-wake symptom)",
-        );
-
-        // (1) The publish must be observed: refresh reports pending so the
-        // caller drains instead of arming a doomed FUTEX_WAITV.
-        assert!(
-            pending,
-            "refresh did not report pending despite an in-window publish — \
-             the caller would arm a doomed wait (lost wake)",
-        );
-
-        // (2) Order witness: the flag publish ran before the reader_seq
-        // snapshot. This is what distinguishes correct ordering from the
-        // masked reorder — assertion (1) holds under both.
         assert_eq!(
             park_order::step(),
             2,
             "FLAG_MASTER_PARKED must be published BEFORE reader_seq is \
              snapshotted; reordering them opens the lost-wake window",
+        );
+    }
+
+    /// The other half of the park protocol: an unread publish must make
+    /// `refresh_futex_waitv_vals` report pending, so the caller drains instead
+    /// of arming a `FUTEX_WAITV` for a wake that already happened.
+    ///
+    /// The publish lands before the refresh, so there is no race to lose: the
+    /// `write_cursor != read_cursor` check either runs or the code is wrong.
+    #[test]
+    fn refresh_reports_pending_when_data_is_unread() {
+        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
+        use crate::runtime::w2m_ring;
+        use crate::runtime::wire::STATUS_OK;
+
+        const CAPACITY: usize = 64 * 1024;
+
+        let region = crate::test_support::SharedRegion::new(CAPACITY);
+        let ptr = region.ptr();
+        unsafe {
+            w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
+        }
+        W2mWriter::new(ptr).send_status(0, 1u64, STATUS_OK, &[]);
+
+        let reactor = Reactor::new(16).expect("reactor");
+        reactor
+            .inner
+            .w2m
+            .set(Rc::new(W2mReceiver::new(vec![ptr])))
+            .ok()
+            .expect("w2m set");
+        *reactor.inner.futex_waitv_storage.borrow_mut() = Some(vec![FutexWaitV::new()].into_boxed_slice());
+
+        assert!(
+            reactor.refresh_futex_waitv_vals(),
+            "an unread publish must be reported as pending — the caller would \
+             otherwise arm a doomed wait (lost wake)",
         );
     }
 
@@ -3256,7 +3209,7 @@ mod tests {
         let ptr = region.ptr();
         w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
 
-        let writer = W2mWriter::new(ptr, CAPACITY as u64);
+        let writer = W2mWriter::new(ptr);
         let receiver = W2mReceiver::new(vec![ptr]);
         for i in 0..n {
             let wire_req = 100u64 + i as u64;
@@ -3433,7 +3386,7 @@ mod tests {
 
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
-        let writer = W2mWriter::new(ptr, capacity);
+        let writer = W2mWriter::new(ptr);
         let receiver = W2mReceiver::new(vec![ptr]);
 
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();

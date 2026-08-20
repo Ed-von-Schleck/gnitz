@@ -933,6 +933,26 @@ pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDe
 // by the catalog DDL/index paths and the runtime gather/preflight paths.
 // ---------------------------------------------------------------------------
 
+/// Wire schema of every unique pre-flight reply frame: the leading `n_promoted`
+/// columns of the index schema, all marked PK, schema version 0. Its `pk_stride`
+/// is exactly `idx_key_size`, and the OPK leading-key span fills that PK region
+/// verbatim — there is no single fixed-width column to represent a composite
+/// (e.g. 24-byte) span, so the schema is built per-index from `idx_schema` (the
+/// width is known at pre-flight time). The single-column ≤16-byte case is the
+/// `n_promoted == 1` degenerate, replacing the old fixed `U128` column.
+///
+/// Index columns are always non-nullable (`make_index_schema` builds each with
+/// `nullable = 0`, and a NULL-valued row never enters the index), so
+/// `SchemaDescriptor::new`'s "PK columns must be non-nullable" assertion holds.
+/// The single definition shared by the worker's encoder
+/// (`send_unique_preflight_keys`) and the master's merge decoder, so the frame
+/// layout agrees by construction.
+pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_promoted: usize) -> SchemaDescriptor {
+    let cols = &idx_schema.columns[..n_promoted];
+    let pks: Vec<u32> = (0..n_promoted as u32).collect();
+    SchemaDescriptor::new(cols, &pks)
+}
+
 /// Build a compound-PK index schema for a secondary index on `source_cols`
 /// of `source`, validating the column list along the way.
 ///

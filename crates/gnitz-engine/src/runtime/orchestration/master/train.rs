@@ -284,7 +284,10 @@ mod tests {
         req_ids: [u64; crate::runtime::sal::MAX_WORKERS],
     }
 
-    const DRAIN_RING_CAPACITY: usize = 64 * 1024;
+    /// The fixture's rings hold a handful of small reply frames each — every
+    /// message it publishes is a bare control block.
+    const DRAIN_MSG_SZ: usize = 1024;
+    const DRAIN_RING_MSGS: usize = 60;
 
     impl DrainFixture {
         fn new(n_workers: usize) -> (Self, Vec<crate::runtime::w2m::W2mWriter>) {
@@ -293,10 +296,8 @@ mod tests {
             let mut rings = Vec::with_capacity(n_workers);
             let mut writers = Vec::with_capacity(n_workers);
             for _ in 0..n_workers {
-                let region = crate::test_support::SharedRegion::new(DRAIN_RING_CAPACITY);
-                let ptr = region.ptr();
-                unsafe { w2m_ring::init_region_for_tests(ptr, DRAIN_RING_CAPACITY as u64) };
-                writers.push(W2mWriter::new(ptr, DRAIN_RING_CAPACITY as u64));
+                let region = unsafe { w2m_ring::make_ring(DRAIN_MSG_SZ, DRAIN_RING_MSGS, 16) };
+                writers.push(W2mWriter::new(region.ptr()));
                 rings.push(region);
             }
             let reactor = Rc::new(crate::runtime::reactor::Reactor::new(16).expect("reactor"));

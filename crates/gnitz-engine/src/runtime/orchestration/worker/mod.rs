@@ -10,11 +10,10 @@ use std::rc::Rc;
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::foundation::fault::Seam;
 use crate::query::ExchangeCallback;
-use crate::runtime::sal::{
-    SalMessageKind, SalReader, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT, FLAG_EXCHANGE,
-};
+use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT};
+use crate::runtime::sal::{SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
-use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_SCAN_LAST, STATUS_ERROR, STATUS_OK};
+use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_SCAN_LAST, STATUS_ERROR, STATUS_OK};
 use crate::schema::key::PkBuf;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{flush_barrier, BlobCacheGuard, FlushRound, Table};
@@ -1037,7 +1036,7 @@ impl WorkerProcess {
         // promoted per-column types/sizes for the span.
         let idx_schema = crate::schema::make_index_schema(col_indices, &schema)?;
         let spec = crate::schema::IndexKeySpec::new(col_indices, &schema, &idx_schema);
-        let frame_schema = crate::runtime::sal::unique_preflight_wire_schema(&idx_schema, col_indices.len());
+        let frame_schema = crate::schema::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
         // The spill file is an anonymous inode on the owner table's own data
         // disk, so it never leaks and shares the table's filesystem.
@@ -1374,7 +1373,7 @@ mod tests {
             w2m_ring::init_region(region_ptr, region_size as u64);
         }
 
-        let w2m_writer = W2mWriter::new(region_ptr, region_size as u64);
+        let w2m_writer = W2mWriter::new(region_ptr);
 
         let mut wp = make_test_worker(std::ptr::null_mut(), w2m_writer);
 
@@ -1652,7 +1651,7 @@ mod tests {
         unsafe {
             w2m_ring::init_region(ptr, size as u64);
         }
-        let writer = W2mWriter::new(ptr, size as u64);
+        let writer = W2mWriter::new(ptr);
         (region, writer)
     }
 
@@ -1668,14 +1667,31 @@ mod tests {
         b
     }
 
+    /// Decode a continuation frame (data, no schema block) against `schema`, the
+    /// way the master's reply-train reader does: the zero-copy decoder, fed the
+    /// frame's own control block and a caller-held region-offset array.
+    fn decode_continuation<'a>(
+        bytes: &'a [u8],
+        schema: &crate::schema::SchemaDescriptor,
+        offsets: &'a mut [usize; crate::storage::MAX_BATCH_REGIONS],
+    ) -> Result<ipc::DecodedWireZeroCopy<'a>, &'static str> {
+        let ctrl = ipc::peek_control_block_ipc(bytes)?;
+        let hint = ipc::SchemaWithVersion {
+            descriptor: schema,
+            version: 0,
+        };
+        ipc::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(hint), offsets)
+    }
+
+    /// Row `row`'s PK widened from its OPK bytes — `Batch::get_pk` for a
+    /// borrowed `MemBatch`.
+    fn mem_pk(b: &crate::storage::MemBatch<'_>, row: usize) -> u128 {
+        gnitz_wire::widen_pk_be(b.get_pk_bytes(row), b.pk_stride as usize)
+    }
+
     fn consume_one(ptr: *mut u8) -> Vec<u8> {
         let (_, frame) = walk_frames(ptr).into_iter().next().expect("expected one ring message");
         frame
-    }
-
-    /// Per-row wire stride for a test batch, matching `enqueue_stream`.
-    fn row_stride(batch: &Batch) -> usize {
-        range_size(batch, 1, None) - range_size(batch, 0, None)
     }
 
     /// Wire size of a `count`-row range of `batch`, with an optional schema block.
@@ -1692,6 +1708,79 @@ mod tests {
         .size()
     }
 
+    /// The chunk sizing model `emit_wire_safe_chunk` inverts: a chunk's wire size
+    /// is `base + hdr + n * per_row`, affine in the row count with the data
+    /// block's own header charged exactly once. A zero-row chunk carries no data
+    /// block at all (`has_data()` is false), which is the discontinuity the
+    /// intercept must be read across rather than differenced through.
+    #[test]
+    fn test_chunk_wire_size_is_affine_in_the_row_count() {
+        let schema = test_schema();
+        let batch = make_n_row_batch(schema, 32);
+        let block = ipc::build_schema_wire_block(&schema, 1);
+
+        let base = range_size(&batch, 0, Some(block.as_slice()));
+        let hdr = batch.wire_byte_size_range(0);
+        let per_row = batch.wire_byte_size_range(1) - hdr;
+        assert!(hdr > 0 && per_row >= 16, "data block header {hdr}, stride {per_row}");
+
+        for n in [1usize, 2, 17] {
+            assert_eq!(
+                range_size(&batch, n, Some(block.as_slice())),
+                base + hdr + n * per_row,
+                "{n}-row chunk"
+            );
+        }
+        // The zero-row message is the intercept-free one: it omits the data block.
+        assert_eq!(range_size(&batch, 0, Some(block.as_slice())), base);
+    }
+
+    /// Every non-terminal frame of a train fills its budget to within one row:
+    /// one more row would exceed it. Charging the data block's header per row
+    /// (rather than once) shrinks every frame to a fraction of the budget.
+    #[test]
+    fn test_train_frames_fill_the_budget_to_within_one_row() {
+        let schema = test_schema();
+        let batch = make_n_row_batch(schema, 40);
+        let block = Rc::new(ipc::build_schema_wire_block(&schema, 1));
+        let per_row = batch.wire_byte_size_range(1) - batch.wire_byte_size_range(0);
+        // Room for four rows beside the schema block on the first frame.
+        let budget = range_size(&batch, 4, Some(block.as_slice()));
+
+        let (region, writer) = make_ring();
+        let ptr = region.ptr();
+        let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+        wp.reply_frame_budget = budget;
+        wp.pending_streams.push_back(PendingScan {
+            batch: Rc::new(batch),
+            request_id: 5,
+            client_id: 0,
+            target_id: 1,
+            prebuilt_schema: Some(block),
+            server_version: 0,
+            kind: PendingScanKind::WireSafe { next_row: 0 },
+        });
+        let mut passes = 0;
+        while !wp.pending_streams.is_empty() {
+            wp.emit_pending_scan_chunk();
+            passes += 1;
+            assert!(passes < 50, "the train must drain within a bounded pass count");
+        }
+
+        let frames = walk_frames(ptr);
+        assert!(frames.len() >= 2, "40 rows at a 4-row budget must span several frames");
+        for (i, (_, bytes)) in frames.iter().enumerate() {
+            assert!(bytes.len() <= budget, "frame {i} of {} exceeds the budget", bytes.len());
+            if i + 1 < frames.len() {
+                assert!(
+                    bytes.len() + per_row > budget,
+                    "frame {i} is {} bytes of a {budget}-byte budget: another row would have fit",
+                    bytes.len()
+                );
+            }
+        }
+    }
+
     /// First (and only) PendingScan chunk — next_row == 0, so the prebuilt schema
     /// block must appear in the frame and decode_wire_ipc must succeed without a hint.
     #[test]
@@ -1703,7 +1792,6 @@ mod tests {
         let (region, writer) = make_ring();
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-        let wire_row_stride = row_stride(&batch);
         wp.pending_streams.push_back(PendingScan {
             batch: Rc::new(batch),
             request_id: 7,
@@ -1711,10 +1799,7 @@ mod tests {
             target_id: 1,
             prebuilt_schema: Some(schema_block),
             server_version: 0,
-            kind: PendingScanKind::WireSafe {
-                next_row: 0,
-                wire_row_stride,
-            },
+            kind: PendingScanKind::WireSafe { next_row: 0 },
         });
 
         wp.emit_pending_scan_chunk();
@@ -1744,8 +1829,8 @@ mod tests {
     }
 
     /// Continuation chunk — next_row > 0, prebuilt_schema == None. The frame carries
-    /// no schema block; decode_wire_ipc fails but decode_wire_ipc_with_schema succeeds
-    /// and returns only the remaining rows (rows [5, 10)).
+    /// no schema block: it fails to decode standalone, and against a schema hint
+    /// it yields only the remaining rows (rows [5, 10)).
     #[test]
     fn test_pending_scan_continuation_chunk_excludes_schema() {
         let schema = test_schema();
@@ -1754,7 +1839,6 @@ mod tests {
         let (region, writer) = make_ring();
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-        let wire_row_stride = row_stride(&batch);
         wp.pending_streams.push_back(PendingScan {
             batch: Rc::new(batch),
             request_id: 9,
@@ -1762,10 +1846,7 @@ mod tests {
             target_id: 1,
             prebuilt_schema: None,
             server_version: 0,
-            kind: PendingScanKind::WireSafe {
-                next_row: 5,
-                wire_row_stride,
-            },
+            kind: PendingScanKind::WireSafe { next_row: 5 },
         });
 
         wp.emit_pending_scan_chunk();
@@ -1776,16 +1857,13 @@ mod tests {
             ipc::decode_wire_ipc(&data).is_err(),
             "continuation frame without schema must fail decode_wire_ipc"
         );
-        let hint = ipc::SchemaWithVersion {
-            descriptor: &schema,
-            version: 0,
-        };
-        let decoded = ipc::decode_wire_ipc_with_schema(&data, hint)
-            .expect("decode_wire_ipc_with_schema must succeed for continuation frame");
-        let b = decoded.data_batch.expect("continuation chunk must carry data");
+        let mut offsets = [0usize; crate::storage::MAX_BATCH_REGIONS];
+        let decoded =
+            decode_continuation(&data, &schema, &mut offsets).expect("continuation decodes against a schema hint");
+        let b = decoded.data_batch.as_ref().expect("continuation chunk must carry data");
         assert_eq!(b.count, 5);
         for i in 0..5usize {
-            assert_eq!(b.get_pk(i), (i + 5) as u128);
+            assert_eq!(mem_pk(b, i), (i + 5) as u128);
         }
         assert_ne!(
             decoded.control.flags & FLAG_SCAN_LAST,
@@ -1824,15 +1902,12 @@ mod tests {
         );
         assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
 
-        let hint = ipc::SchemaWithVersion {
-            descriptor: &schema,
-            version: 0,
-        };
-        let decoded = ipc::decode_wire_ipc_with_schema(&data, hint).expect("decode with schema hint");
-        let b = decoded.data_batch.expect("data block");
+        let mut offsets = [0usize; crate::storage::MAX_BATCH_REGIONS];
+        let decoded = decode_continuation(&data, &schema, &mut offsets).expect("decode with schema hint");
+        let b = decoded.data_batch.as_ref().expect("data block");
         assert_eq!(b.count, 5);
         for i in 0..5usize {
-            assert_eq!(b.get_pk(i), i as u128);
+            assert_eq!(mem_pk(b, i), i as u128);
         }
     }
 
@@ -1989,16 +2064,13 @@ mod tests {
         let block_a = Rc::new(ipc::build_schema_wire_block(&schema_a, 1));
         let block_b = Rc::new(ipc::build_schema_wire_block(&schema_b, 2));
 
-        // Budget: first chunk (with A's schema block) carries ~4 rows, so
-        // train A spans at least two frames.
-        let sz_0 = range_size(&batch_a, 0, Some(block_a.as_slice()));
-        let sz_1 = range_size(&batch_a, 1, Some(block_a.as_slice()));
-        let budget = sz_0 + (sz_1 - sz_0) * 4;
+        // Budget: exactly the first chunk's size at 4 rows (A's schema block
+        // included), so train A's 10 rows span at least two frames.
+        let budget = range_size(&batch_a, 4, Some(block_a.as_slice()));
 
         let (region, writer) = make_ring();
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-        let stride_a = row_stride(&batch_a);
         wp.pending_streams.push_back(PendingScan {
             batch: Rc::new(batch_a),
             request_id: 11,
@@ -2006,12 +2078,8 @@ mod tests {
             target_id: 1,
             prebuilt_schema: Some(block_a),
             server_version: 0,
-            kind: PendingScanKind::WireSafe {
-                next_row: 0,
-                wire_row_stride: stride_a,
-            },
+            kind: PendingScanKind::WireSafe { next_row: 0 },
         });
-        let stride_b = row_stride(&batch_b);
         wp.pending_streams.push_back(PendingScan {
             batch: Rc::new(batch_b),
             request_id: 22,
@@ -2019,10 +2087,7 @@ mod tests {
             target_id: 2,
             prebuilt_schema: Some(block_b),
             server_version: 0,
-            kind: PendingScanKind::WireSafe {
-                next_row: 0,
-                wire_row_stride: stride_b,
-            },
+            kind: PendingScanKind::WireSafe { next_row: 0 },
         });
 
         // One chunk per pass, as drain_sal drives it.
@@ -2067,11 +2132,8 @@ mod tests {
                     assert_eq!(s.num_columns(), ncols, "the block is this train's schema");
                     rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
                 } else {
-                    let hint = ipc::SchemaWithVersion {
-                        descriptor: schema,
-                        version: 0,
-                    };
-                    let decoded = ipc::decode_wire_ipc_with_schema(bytes, hint)
+                    let mut offsets = [0usize; crate::storage::MAX_BATCH_REGIONS];
+                    let decoded = decode_continuation(bytes, schema, &mut offsets)
                         .expect("continuation decodes against the schema hint");
                     rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
                 }

@@ -176,7 +176,7 @@ impl DagEngine {
     /// flags: the scatter/repartition/broadcast ops certify only what they can
     /// prove (a multi-worker concatenation ships `Raw`), the wire encoders
     /// derive the `FLAG_BATCH_*` bits from the batch's own layout
-    /// (`encode_wire_into_impl`) and the decode re-certifies the claim against
+    /// (`WireMsg::encode_impl`) and the decode re-certifies the claim against
     /// the data (debug-verified), and the identity/skip-exchange legs pass the
     /// VM's own claims through under the same `exchange_schema` descriptor they
     /// were certified with. A `Raw` claim is re-sorted here; a verified

@@ -21,7 +21,7 @@ fn test_w2m_concurrent_publish_consume_ordered() {
     let done = Arc::new(AtomicBool::new(false));
     let done_w = Arc::clone(&done);
     let writer_thread = std::thread::spawn(move || {
-        let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
+        let writer = W2mWriter::new(region_addr as *mut u8);
         for req_id in 1..=N {
             writer.send_status(0, req_id, STATUS_OK, b"");
         }
@@ -74,7 +74,7 @@ fn test_w2m_concurrent_large_messages_ordered() {
     let done_w = Arc::clone(&done);
     let pad_w = pad.clone();
     let writer_thread = std::thread::spawn(move || {
-        let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
+        let writer = W2mWriter::new(region_addr as *mut u8);
         for req_id in 1..=N {
             writer.send_status(0, req_id, STATUS_OK, &pad_w);
         }
@@ -120,7 +120,7 @@ fn test_w2m_writer_rejects_oversized() {
     let region_addr = ptr as usize;
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
     std::thread::spawn(move || {
-        let writer = W2mWriter::new(region_addr as *mut u8, CAP as u64);
+        let writer = W2mWriter::new(region_addr as *mut u8);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             writer.send_encoded((w2m_ring::MAX_W2M_MSG + 1) as usize, 0, |_| {});
         }));
@@ -146,7 +146,7 @@ fn test_w2m_control_only_reply_has_no_backing() {
         w2m_ring::init_region_for_tests(ptr, CAP as u64);
     }
 
-    let writer = W2mWriter::new(ptr, CAP as u64);
+    let writer = W2mWriter::new(ptr);
     writer.send_status(0, 42, STATUS_OK, b"");
 
     let receiver = W2mReceiver::new(vec![ptr]);

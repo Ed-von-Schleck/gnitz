@@ -48,7 +48,7 @@ impl WorkerProcess {
         };
         let msg = ipc::WireMsg {
             target_id: view_id as u64,
-            flags: FLAG_EXCHANGE as u64,
+            flags: FLAG_EXCHANGE,
             seek_pk: source_id as u128,
             seek_col_idx: pad_bit,
             request_id: tick_request_id,

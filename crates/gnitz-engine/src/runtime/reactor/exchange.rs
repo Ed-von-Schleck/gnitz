@@ -1,9 +1,38 @@
 use rustc_hash::FxHashMap;
 
-use crate::runtime::sal::{BACKFILL_PAD_BIT, MAX_WORKERS};
+use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::wire::DecodedWire;
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
+
+// ---------------------------------------------------------------------------
+// Chunked distributed-backfill exchange coordination
+// ---------------------------------------------------------------------------
+//
+// A distributed CREATE-VIEW backfill streams the source partition through the
+// incremental plan one chunk at a time, issuing one exchange round per chunk
+// per exchanging view. All workers must issue the SAME number of rounds (short
+// partitions pad with empty rounds), so termination and SAL reclamation are
+// decided collectively by the master and stamped back on each relay. Both legs
+// reuse the otherwise-unused `seek_col_idx` control field — no new SAL flag and
+// no wire-format change. The value `0` doubles as "no backfill coordination",
+// so steady-state exchanges (which already pass a literal `0`) are unaffected.
+
+/// Up-leg (worker→master, on `FLAG_EXCHANGE`): the per-chunk PAD bit. Set when
+/// this worker's `drain_chunk` returned `None` — its partition is exhausted and
+/// the chunk it is participating in is an empty pad. The master ANDs this bit
+/// across all workers for a round; an all-pad round is the final round.
+pub const BACKFILL_PAD_BIT: u64 = 1;
+
+/// Down-leg (master→worker, on `FLAG_EXCHANGE_RELAY`): the collective decision
+/// the master stamps onto a round's relay after ANDing the round's pad bits and
+/// checking SAL space. `CONTINUE` keeps the loop going; `STOP` ends every
+/// worker's loop on the same (all-pad) round; `CHECKPOINT` is a continue that
+/// also tells the worker to advance its SAL read epoch + reset its read cursor
+/// inline (the master reclaims the SAL write side at the next round barrier).
+pub const BACKFILL_DECISION_CONTINUE: u64 = 0;
+pub const BACKFILL_DECISION_STOP: u64 = 1;
+pub const BACKFILL_DECISION_CHECKPOINT: u64 = 2;
 
 /// Per-view accumulator for FLAG_EXCHANGE replies. When the reactor's
 /// `route_reply` sees a FLAG_EXCHANGE wire on worker `w`, it calls
@@ -125,7 +154,7 @@ impl ExchangeAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::sal::FLAG_EXCHANGE;
+    use crate::runtime::wire::FLAG_EXCHANGE;
     use crate::runtime::wire::{DecodedControl, DecodedWire};
     use crate::schema::SchemaDescriptor;
 
@@ -133,7 +162,7 @@ mod tests {
         DecodedWire {
             control: DecodedControl {
                 target_id: view_id as u64,
-                flags: FLAG_EXCHANGE as u64,
+                flags: FLAG_EXCHANGE,
                 seek_pk: source_id as u128,
                 ..Default::default()
             },
@@ -178,7 +207,6 @@ mod tests {
     }
 
     fn make_wire_pad(view_id: i64, source_id: i64, pad: bool, with_schema: bool) -> DecodedWire {
-        use crate::runtime::sal::BACKFILL_PAD_BIT;
         let mut w = make_wire(view_id, source_id, with_schema);
         w.control.seek_col_idx = if pad { BACKFILL_PAD_BIT } else { 0 };
         w
