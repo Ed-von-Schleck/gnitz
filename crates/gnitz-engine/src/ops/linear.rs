@@ -533,7 +533,7 @@ mod tests {
 
     fn wide_pk_triple(b: &Batch, row: usize) -> (u64, u64, u64) {
         let pk = b.get_pk_bytes(row);
-        // OPK encodes each U64 column big-endian (the §6 at-rest layout), so
+        // OPK encodes each U64 column big-endian (the at-rest layout), so
         // the columns must be read back big-endian.
         (
             u64::from_be_bytes(pk[0..8].try_into().unwrap()),
@@ -834,7 +834,7 @@ mod tests {
         // Projection plan: output keeps the same single payload column.
         let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).unwrap();
 
-        let packer = ReindexPacker::new(&schema, &[1], &[]);
+        let packer = ReindexPacker::new(&schema, &[1], &[]).unwrap();
         let out = op_map(&batch, &func, ReindexSpec::Pack(&packer));
         assert_eq!(out.count, 3);
         // Each output row's PK is the sign-aware OPK image of its source payload

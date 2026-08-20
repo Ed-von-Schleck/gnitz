@@ -9,7 +9,7 @@
 //! neutral per-column facts — `(type_code, flags, name)` plus the ordered PK
 //! list — and each side builds its own type from them.
 //!
-//! The block is a normal WAL block over the [`META_SCHEMA_COLS`] shape (§6):
+//! The block is a normal WAL block over the [`META_SCHEMA_COLS`] shape:
 //! one row per column, keyed by `col_idx`.
 //!
 //! ```text

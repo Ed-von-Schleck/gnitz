@@ -191,7 +191,7 @@ impl TypeCode {
     }
 
     /// Whether this type is a fixed-width **integer scalar** — equivalently,
-    /// whether an order-preserving byte encoding of it exists (§6). That one
+    /// whether an order-preserving byte encoding of it exists. That one
     /// property answers both questions the codebase asks of a type here:
     ///
     /// * **May it be a PRIMARY KEY column?** PK regions are compared as raw

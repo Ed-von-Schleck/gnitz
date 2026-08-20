@@ -110,8 +110,12 @@ impl ScatterKey {
             ScatterKind::PkBytes
         } else {
             match mode {
+                // `.expect`, not `?`: the scatter path has no compile-time
+                // guard, so an invalid key must fail loudly rather than route
+                // rows to the wrong worker.
                 RouteMode::JoinPromote => ScatterKind::Packed {
-                    packer: ReindexPacker::new(schema, cols, tcs),
+                    packer: ReindexPacker::new(schema, cols, tcs)
+                        .expect("ScatterKey: reindex key columns invalid for this schema"),
                     buf: [0u8; crate::schema::MAX_PK_BYTES],
                 },
                 RouteMode::GroupKey => ScatterKind::Fold {

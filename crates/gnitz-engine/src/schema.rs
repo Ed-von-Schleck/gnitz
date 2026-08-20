@@ -21,23 +21,12 @@ pub(crate) use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 /// `SchemaDescriptor::locate` produces one.
 pub(crate) use gnitz_expr::ColumnLocator;
 
-/// The dense payload-slot byte that means "this column has no payload slot" —
-/// it is a PK column. `u8::MAX`, not 0, so it is unambiguous against a real
-/// payload index of 0, and out of range for every schema, so addressing a
-/// column with it trips a bounds check rather than reading slot 0.
-///
-/// Private to this module because it describes [`SchemaDescriptor`]'s own
-/// `payload_mapping` / `payload_to_ci` tables and nothing else. It is never
-/// handed out as a *value*: callers read through `payload_slot`, which is
-/// `Option`-shaped.
-const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
-
 /// Order-preserving primary-key (OPK) primitives — every native→OPK encoder
 /// (whole PK, seek wire pair, index leading span), compare/pack, and the
 /// width-tagged `PkBuf` those encoders return. Sits below both schema and
 /// storage, and is the one import path: `storage` used to re-export the cluster
-/// so its call sites read `crate::storage::X`, which left the §1/§6 byte-order
-/// rule spelled two ways in adjacent lines of the same file.
+/// so its call sites read `crate::storage::X`, which left the byte-order rule
+/// spelled two ways in adjacent lines of the same file.
 pub(crate) mod key;
 
 /// The precomputed per-row read/encode plan for an index's OPK leading-key span.
@@ -102,13 +91,16 @@ impl DerivedSchema {
     /// Append one PK column. Must precede every [`Self::push`]: the PK occupies
     /// the leading slots.
     ///
-    /// Bounds the PK **stride** as well as the column count: `SchemaDescriptor::new`
-    /// asserts `stride <= MAX_PK_BYTES`, so a builder that checked only the count
-    /// would turn an over-wide composite key into a panic inside `finish()`
-    /// instead of a `None` its caller can reject the circuit on.
+    /// Rejects everything `SchemaDescriptor::new` *asserts*, so a caller passing
+    /// an unvetted column type gets a `None` it can reject the circuit on rather
+    /// than an abort inside `finish()`.
     pub(crate) fn push_pk(&mut self, col: SchemaColumn) -> Option<()> {
         debug_assert_eq!(self.pk_len, self.n, "PK columns must precede payload columns");
-        if self.pk_len == MAX_PK_COLUMNS || self.pk_bytes + col.size() as usize > MAX_PK_BYTES {
+        if self.pk_len == MAX_PK_COLUMNS
+            || self.pk_bytes + col.size() as usize > MAX_PK_BYTES
+            || !gnitz_wire::is_pk_eligible(col.type_code)
+            || col.nullable != 0
+        {
             return None;
         }
         self.push(col)?;
@@ -205,16 +197,20 @@ pub(crate) enum PayloadCmpKind {
     Generic,
 }
 
-const fn compute_payload_cmp(cols: &[SchemaColumn], payload_mapping: &[u8; MAX_COLUMNS]) -> PayloadCmpKind {
-    let mut ci = 0;
-    while ci < cols.len() {
-        if payload_mapping[ci] != PAYLOAD_MAPPING_PK_SENTINEL {
-            let col = cols[ci];
-            if !(col.nullable == 0 && is_fixed_int(col.type_code)) {
-                return PayloadCmpKind::Generic;
-            }
+/// Walks payload columns only. PK columns must not be examined: U128/UUID are
+/// PK-eligible but not `is_fixed_int`, so a U128 PK would wrongly force `Generic`.
+const fn compute_payload_cmp(
+    cols: &[SchemaColumn],
+    payload_to_ci: &[u8; MAX_COLUMNS],
+    num_payload: usize,
+) -> PayloadCmpKind {
+    let mut pi = 0;
+    while pi < num_payload {
+        let col = cols[payload_to_ci[pi] as usize];
+        if !(col.nullable == 0 && is_fixed_int(col.type_code)) {
+            return PayloadCmpKind::Generic;
         }
-        ci += 1;
+        pi += 1;
     }
     PayloadCmpKind::FixedIntNonnull
 }
@@ -339,17 +335,9 @@ pub(crate) struct SchemaDescriptor {
     /// caller; every derived/intermediate schema (join/map/reduce/projection
     /// output, built via `new`) gets the full-PK `Keyed` default.
     placement: Placement,
-    /// payload_mapping[ci] = dense payload index, or PAYLOAD_MAPPING_PK_SENTINEL:
-    /// PK columns hold the sentinel, payload columns hold their dense payload
-    /// slot. The sentinel is this table's *encoding* of "no payload slot" and
-    /// stops here — `try_payload_idx` and `is_pk_col` are how the rest of the
-    /// engine reads it, so no call site handles a poisoned byte.
-    payload_mapping: [u8; MAX_COLUMNS],
-    /// payload_to_ci[pi] = logical column index for dense payload slot `pi`.
-    /// Inverse of `payload_mapping` over the non-PK columns; the trailing
-    /// `num_columns - pk_count`..MAX_COLUMNS slots hold the sentinel.
-    /// Lets `payload_columns()` walk a contiguous `0..num_payload` range
-    /// with one byte load per element, no per-row predicate.
+    /// Dense payload slot → logical column index, so `payload_columns()` walks
+    /// `0..num_payload` with one byte load per element and no predicate. Slots
+    /// past `num_payload_cols()` are zero fill nothing reads.
     payload_to_ci: [u8; MAX_COLUMNS],
     /// Pre-computed payload comparator strategy. Derived from column types in
     /// `new()`; read by every merge/sort/join dispatch (via `with_payload_cmp!`)
@@ -368,11 +356,10 @@ pub(crate) struct SchemaDescriptor {
 // so a field added here is paid for at every one of those copies. Pinned rather
 // than merely documented: the three fixed-capacity arrays make the cost
 // invisible at the definition.
-const _: () = assert!(std::mem::size_of::<SchemaDescriptor>() <= 424);
+const _: () = assert!(std::mem::size_of::<SchemaDescriptor>() <= 360);
 
-const fn compute_mappings(num_columns: usize, pk_indices: &[u32]) -> ([u8; MAX_COLUMNS], [u8; MAX_COLUMNS]) {
-    let mut payload_mapping = [PAYLOAD_MAPPING_PK_SENTINEL; MAX_COLUMNS];
-    let mut payload_to_ci = [PAYLOAD_MAPPING_PK_SENTINEL; MAX_COLUMNS];
+const fn compute_payload_to_ci(num_columns: usize, pk_indices: &[u32]) -> [u8; MAX_COLUMNS] {
+    let mut payload_to_ci = [0u8; MAX_COLUMNS];
     let mut pi: u8 = 0;
     let mut ci: usize = 0;
     while ci < num_columns {
@@ -385,13 +372,12 @@ const fn compute_mappings(num_columns: usize, pk_indices: &[u32]) -> ([u8; MAX_C
             k += 1;
         }
         if !is_pk {
-            payload_mapping[ci] = pi;
             payload_to_ci[pi as usize] = ci as u8;
             pi += 1;
         }
         ci += 1;
     }
-    (payload_mapping, payload_to_ci)
+    payload_to_ci
 }
 
 impl SchemaDescriptor {
@@ -484,14 +470,15 @@ impl SchemaDescriptor {
             "new: pk_stride exceeds MAX_PK_BYTES",
         );
         let pk_stride = stride_acc as u8;
-        let (payload_mapping, payload_to_ci) = compute_mappings(cols.len(), pk_indices);
-        let payload_cmp = compute_payload_cmp(cols, &payload_mapping);
+        let payload_to_ci = compute_payload_to_ci(cols.len(), pk_indices);
+        let payload_cmp = compute_payload_cmp(cols, &payload_to_ci, cols.len() - pk_indices.len());
         let has_german_string = {
             let mut i = 0;
             let mut found = false;
             while i < cols.len() {
-                if payload_mapping[i] != PAYLOAD_MAPPING_PK_SENTINEL && gnitz_wire::is_german_string(cols[i].type_code)
-                {
+                // No PK column can be one: `is_pk_eligible`, asserted above on
+                // every PK column, admits only integer scalars.
+                if gnitz_wire::is_german_string(cols[i].type_code) {
                     found = true;
                 }
                 i += 1;
@@ -505,7 +492,6 @@ impl SchemaDescriptor {
             pk_stride,
             dist_stride: dist_stride_acc as u8,
             placement,
-            payload_mapping,
             payload_to_ci,
             payload_cmp,
             has_german_string,
@@ -628,8 +614,8 @@ impl SchemaDescriptor {
     /// (its OPK is the big-endian concatenation, which is what a correctly packed
     /// `u128` already spells), a signed column anywhere is not. Those callers must
     /// go through `extend_pk_opk` / `extend_pk_bytes`. `extend_pk` debug-asserts
-    /// this, so the rule is machine-checked at every one of its ~150 call sites
-    /// rather than carried as prose beside them.
+    /// this, so the rule is machine-checked at every one of its call sites rather
+    /// than carried as prose beside them.
     #[inline]
     pub(crate) fn pk_has_signed_col(&self) -> bool {
         self.pk_columns().any(|(_, c)| c.is_signed())
@@ -653,10 +639,10 @@ impl SchemaDescriptor {
         (0..self.num_payload_cols()).map(move |pi| (pi, &self.columns[self.payload_to_ci[pi] as usize]))
     }
 
-    /// Whether the schema carries a STRING/BLOB (German-string) column. Those
-    /// can never be PK columns, so the `new()` walk over payload columns is
-    /// exhaustive. Callers use this to decide whether a batch's blob region is
-    /// live.
+    /// Whether the schema carries a STRING/BLOB (German-string) column. Such a
+    /// column is always payload — `is_pk_eligible` excludes them — so `new()`
+    /// scans every column without filtering. Callers use this to decide whether
+    /// a batch's blob region is live.
     #[inline]
     pub(crate) fn has_german_string(&self) -> bool {
         self.has_german_string
@@ -664,22 +650,27 @@ impl SchemaDescriptor {
 
     /// Dense payload slot (batch payload region + null-bitmap bit position) for a
     /// payload column. `None` for a PK column — PK columns have no payload slot.
-    /// The only `col_idx -> payload_index` function on `SchemaDescriptor`:
-    /// because it returns `Option`, "this column is a PK and has no payload slot"
-    /// must be handled, not poisoned with a sentinel. Reading a column whose
-    /// index is not statically known to be payload goes through [`Self::locate`].
+    /// The only `col_idx -> payload_index` function on `SchemaDescriptor`, and
+    /// `Option`-shaped so "this column is a PK and has no payload slot" must be
+    /// handled. Reading a column whose index is not statically known to be
+    /// payload goes through [`Self::locate`].
+    /// Out of range is `None` too — `read_cursor::col_bytes` feeds the result
+    /// straight to `get_col_ptr`.
     #[inline]
     pub(crate) fn try_payload_idx(&self, col_idx: usize) -> Option<usize> {
-        match self.payload_mapping[col_idx] {
-            PAYLOAD_MAPPING_PK_SENTINEL => None,
-            slot => Some(slot as usize),
+        if self.is_pk_col(col_idx) {
+            return None;
         }
+        // Count the PK columns below `col_idx`, not `col_idx - pk_count`: the PK
+        // list is in general neither a prefix of the columns nor sorted.
+        Some(col_idx - self.pk_indices().iter().filter(|&&p| (p as usize) < col_idx).count())
     }
 
-    /// True iff column `ci` is a PK column.
+    /// True iff column `ci` is a PK column. Out of range answers `true`, which is
+    /// what makes [`Self::try_payload_idx`] reject it.
     #[inline]
     pub(crate) fn is_pk_col(&self, ci: usize) -> bool {
-        self.payload_mapping[ci] == PAYLOAD_MAPPING_PK_SENTINEL
+        ci >= self.num_columns() || self.pk_indices().contains(&(ci as u32))
     }
 
     /// Inverse of `payload_idx`: dense payload slot → logical column index.
@@ -772,17 +763,15 @@ impl SchemaDescriptor {
     /// for reading a column whose index is not statically a payload column.
     #[inline]
     pub(crate) fn locate(&self, col_idx: usize) -> ColumnLocator {
-        // Release-active bound. An out-of-range `col_idx` otherwise reads a
-        // zeroed padding slot in the fixed-capacity `columns`/`payload_mapping`
-        // arrays, resolves to the PK arm, and dies in `pk_byte_offset`'s
-        // `unreachable!()` with a message naming neither `locate` nor the bad
-        // index. A `debug_assert` would let that ship in release, so this is a
-        // hard `assert!`. It is a last-line guard against an internal bug,
-        // distinct from
-        // untrusted-index rejection (a client-supplied circuit naming an OOB
-        // column). `locate` runs at extractor/program setup and, at worst, once
-        // per group (`extract_group_key`) — never per row — so the check and the
-        // PK arm's `pk_byte_offset` walk are both free.
+        // Release-active bound. An out-of-range `col_idx` otherwise resolves to
+        // the PK arm and dies in `pk_byte_offset`'s `unreachable!()` with a
+        // message naming neither `locate` nor the bad index. A `debug_assert`
+        // would let that ship in release, so this is a hard `assert!`. It is a
+        // last-line guard against an internal bug, distinct from untrusted-index
+        // rejection (a client-supplied circuit naming an OOB column). `locate`
+        // runs at extractor/program setup and, at worst, once per group
+        // (`extract_group_key`) — never per row — so the check and the PK arm's
+        // `pk_byte_offset` walk are both free.
         assert!(
             col_idx < self.num_columns(),
             "locate: col_idx {col_idx} out of bounds (num_columns = {})",
@@ -932,6 +921,8 @@ pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDe
             ));
         }
     }
+    // Unreachable: `PartialEq` compares all four bytes of every column, and
+    // `size`/`is_signed` derive from `type_code`, so the walk above is exhaustive.
     Err("Schema mismatch: descriptors differ".to_string())
 }
 
@@ -979,7 +970,9 @@ pub(crate) fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) 
     // rule and the arity/stride limits can never disagree across the layers.
     let promoted = gnitz_wire::index_key_types(&col_types, src_pk.len(), source.pk_stride() as usize)?;
     let mut b = DerivedSchema::new();
-    let over = || "Index: composite key exceeds the PK column limit".to_string();
+    // Structural backstop: `index_key_types` above already rejects arity, stride
+    // and ineligible types, so this cannot know which rule the builder tripped.
+    let over = || "Index: composite key is not a valid primary key".to_string();
     for &t in &promoted {
         b.push_pk(SchemaColumn::new(t, 0)).ok_or_else(over)?;
     }
@@ -1019,9 +1012,10 @@ pub(crate) fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> Schem
 // ---------------------------------------------------------------------------
 //
 // The output schema of each circuit operator whose shape is a function of its
-// input schema(s) and a column list. They live here, below both `ops` and
-// `query`, so the compiler and the `ops` tests build them from one definition —
-// a second implementation would have to agree byte-for-byte with this one.
+// input schema(s) and a column list, and that has no other home. Where the
+// operator already holds the layout the schema comes off that instead —
+// `ReindexPacker::output_schema`, `build_reduce_output_schema` — because a copy
+// here would be the second derivation.
 //
 // Every one returns `None` rather than aborting when its output would overflow
 // `DerivedSchema`'s fixed column array or its `MAX_PK_COLUMNS` key slots. Their
@@ -1095,23 +1089,6 @@ pub(crate) fn null_extend_output_schema(in_schema: &SchemaDescriptor, type_codes
     Some(b.finish())
 }
 
-/// Build the full output schema of a reindex Map: the synthetic PK column(s)
-/// derived from `reindex_cols` (in key order), followed by the kept payload
-/// columns. Each PK slot's width is `gnitz_wire::resolve_reindex_type` — the
-/// carried cross-width promotion target `T_i` when non-zero, else the per-column
-/// default policy (a ≤8-byte integer key keeps its native width; everything else —
-/// U128/UUID, the STRING/BLOB content hash, PK-ineligible floats — becomes U128).
-/// This is the same carried-or-derive rule the planner's `_join_pk` stamp uses,
-/// so the engine and catalog strides stay in lockstep. Narrowing is safe for
-/// every view: reindex traces are non-durable and re-derived from the source.
-///
-/// `payload_cols` places exactly `in_schema.columns[payload_cols[i]]` at payload
-/// slot `i` — the source columns the reindex program copies, derived from the
-/// program (and range-checked) by `emit_node`. A join side whose program skips a
-/// dead source column thus stops persisting it in the trace.
-///
-/// The `None` bound also covers the packed key *width*: `DerivedSchema::push_pk`
-/// tracks the PK stride, so no caller owes a `MAX_PK_BYTES` check.
 /// AVI index schema: the packed **group key** ([`gnitz_wire::group_key_layout`]),
 /// then a `u8` ordinal selecting which non-linear aggregate the entry belongs to,
 /// then the order-encoded aggregate value (U64). All columns are PK; there is no
@@ -1145,33 +1122,6 @@ pub(crate) fn avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> Optio
     }
     b.push_pk(SchemaColumn::new(type_code::U8, 0))?; // ordinal
     b.push_pk(SchemaColumn::new(type_code::U64, 0))?; // av_encoded
-    Some(b.finish())
-}
-
-pub(crate) fn reindex_output_schema(
-    in_schema: &SchemaDescriptor,
-    reindex_cols: &[u32],
-    target_tcs: &[u8],
-    payload_cols: &[u32],
-) -> Option<SchemaDescriptor> {
-    let mut b = DerivedSchema::new();
-    for (i, &c) in reindex_cols.iter().enumerate() {
-        let out_tc = gnitz_wire::resolve_reindex_type(
-            in_schema.columns[c as usize].type_code,
-            target_tcs.get(i).copied().unwrap_or(0),
-        );
-        // decode (the catalog trust boundary) already rejects a non-PK-eligible
-        // carried tc; this is the engine-internal backstop that a planner/compiler
-        // bug cannot stamp a float or other ineligible type into the PK region.
-        debug_assert!(
-            gnitz_wire::is_pk_eligible(out_tc),
-            "reindex output type code {out_tc} is not PK-eligible"
-        );
-        b.push_pk(SchemaColumn::new(out_tc, 0))?; // PK region: nullable = 0
-    }
-    for &c in payload_cols {
-        b.push(in_schema.columns[c as usize])?;
-    }
     Some(b.finish())
 }
 
@@ -1274,94 +1224,6 @@ mod tests {
         // overflows once the PK columns are prepended.
         let wide: Vec<u32> = vec![1; crate::schema::MAX_COLUMNS];
         assert_eq!(build_map_output_schema(&input_single, &wide), None);
-    }
-
-    #[test]
-    fn test_reindex_output_pk_width_policy() {
-        // (key column type, expected output PK type, expected pk_stride)
-        let cases = [
-            (type_code::U64, type_code::U64, 8u8),
-            (type_code::I32, type_code::I32, 4),
-            (type_code::U16, type_code::U16, 2),
-            (type_code::STRING, type_code::U128, 16),
-            (type_code::BLOB, type_code::U128, 16),
-            (type_code::U128, type_code::U128, 16),
-            (type_code::UUID, type_code::U128, 16),
-            (type_code::F64, type_code::U128, 16),
-        ];
-        for (key_tc, want_tc, want_stride) in cases {
-            // in_schema: [U64 PK, <key col>]; reindex on the payload col so the
-            // PK-ineligible key types (STRING/BLOB/float) are exercisable as keys.
-            let in_schema = SchemaDescriptor::new(
-                &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(key_tc, 0)],
-                &[0],
-            );
-            let node_schema = reindex_output_schema(&in_schema, &[1], &[], &[0, 1]).unwrap();
-            assert_eq!(node_schema.columns[0].type_code, want_tc, "key {key_tc} → PK type");
-            assert_eq!(node_schema.pk_stride(), want_stride, "key {key_tc} → pk_stride");
-        }
-    }
-
-    #[test]
-    fn test_reindex_output_schema_compound() {
-        // in_schema: [U64 pk, I32, U128]; reindex on (col1 I32, col2 U128).
-        let in_schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I32, 0),
-                SchemaColumn::new(type_code::U128, 0),
-            ],
-            &[0],
-        );
-        let out = reindex_output_schema(&in_schema, &[1, 2], &[], &[0, 1, 2]).unwrap();
-        assert_eq!(out.pk_indices(), &[0, 1], "2-slot compound PK");
-        assert_eq!(out.columns[0].type_code, type_code::I32, "slot0 keeps I32 native width");
-        assert_eq!(out.columns[1].type_code, type_code::U128, "slot1 U128");
-        assert_eq!(out.pk_stride(), 4 + 16, "compound stride = Σ slot widths");
-        // Input columns follow the synthetic PK slots.
-        assert_eq!(out.num_columns(), 2 + 3);
-        assert_eq!(out.columns[2].type_code, type_code::U64);
-        assert_eq!(out.columns[3].type_code, type_code::I32);
-        assert_eq!(out.columns[4].type_code, type_code::U128);
-    }
-
-    #[test]
-    fn test_reindex_output_schema_cross_width_promotes() {
-        // in_schema: [U64 pk, I32, I64]; reindex on (col1 I32, col2 I64) with
-        // slot 0 promoted to I64 (carried) and slot 1 self-deriving.
-        let in_schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I32, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        );
-        let out = reindex_output_schema(&in_schema, &[1, 2], &[type_code::I64, 0], &[0, 1, 2]).unwrap();
-        assert_eq!(out.columns[0].type_code, type_code::I64, "slot0 carried T = I64");
-        assert_eq!(out.columns[1].type_code, type_code::I64, "slot1 self-derives I64");
-        assert_eq!(out.pk_stride(), 8 + 8, "both slots 8 bytes after promotion");
-    }
-
-    #[test]
-    fn test_reindex_output_schema_payload_prune() {
-        // in_schema: [U64 pk, I32, U128, I16]; reindex on col1; keep payload {0, 3}.
-        let in_schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I32, 0),
-                SchemaColumn::new(type_code::U128, 0),
-                SchemaColumn::new(type_code::I16, 0),
-            ],
-            &[0],
-        );
-        let out = reindex_output_schema(&in_schema, &[1], &[], &[0, 3]).unwrap();
-        assert_eq!(out.pk_indices(), &[0], "single synthetic PK slot");
-        assert_eq!(out.columns[0].type_code, type_code::I32, "PK slot = reindex col1 (I32)");
-        // Only the two kept payload columns follow — not all four input columns.
-        assert_eq!(out.num_columns(), 1 + 2, "1 PK + 2 kept payload");
-        assert_eq!(out.columns[1].type_code, type_code::U64, "kept payload col 0");
-        assert_eq!(out.columns[2].type_code, type_code::I16, "kept payload col 3");
     }
 
     #[test]
@@ -1545,41 +1407,48 @@ mod tests {
         assert!(validate_schema_match(&sd, &sd).is_ok());
     }
 
+    /// Each mismatch family is rejected, and each names itself distinctly.
+    ///
+    /// `wire == expected` is the verdict; the walk after it only says *which*
+    /// field differed, and the executor and reply-train decoder surface those
+    /// messages. Four `is_err()` assertions would still pass if that whole walk
+    /// collapsed to one constant string — pairwise distinctness is what tests it,
+    /// without pinning the prose.
     #[test]
-    fn validate_schema_match_rejects_column_count_mismatch() {
-        let wire = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-        assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
-    }
-
-    #[test]
-    fn validate_schema_match_rejects_pk_index_mismatch() {
-        let wire = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[1],
-        );
-        assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
-    }
-
-    #[test]
-    fn validate_schema_match_rejects_type_code_mismatch() {
-        let wire = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::F64, 0),
-            ],
-            &[0],
-        );
-        assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
-    }
-
-    #[test]
-    fn validate_schema_match_rejects_nullable_mismatch() {
-        let wire = two_col_schema(0); // col1 not-nullable
-        let expected = two_col_schema(1); // col1 nullable
-        assert!(validate_schema_match(&wire, &expected).is_err());
+    fn validate_schema_match_names_each_mismatch_distinctly() {
+        let col = |tc, n| SchemaColumn::new(tc, n);
+        let expected = two_col_schema(0);
+        let cases = [
+            (
+                "count",
+                SchemaDescriptor::new(&[col(type_code::U64, 0)], &[0]),
+                expected,
+            ),
+            (
+                "pk",
+                SchemaDescriptor::new(&[col(type_code::U64, 0), col(type_code::I64, 0)], &[1]),
+                expected,
+            ),
+            (
+                "type",
+                SchemaDescriptor::new(&[col(type_code::U64, 0), col(type_code::F64, 0)], &[0]),
+                expected,
+            ),
+            ("nullable", two_col_schema(0), two_col_schema(1)),
+        ];
+        let msgs: Vec<String> = cases
+            .iter()
+            .map(|(what, wire, exp)| validate_schema_match(wire, exp).expect_err(what))
+            .collect();
+        for i in 0..msgs.len() {
+            for j in (i + 1)..msgs.len() {
+                assert_ne!(
+                    msgs[i], msgs[j],
+                    "{} vs {} report the same message",
+                    cases[i].0, cases[j].0
+                );
+            }
+        }
     }
 
     #[test]

@@ -533,7 +533,7 @@ impl MasterDispatcher {
     /// reactor parked, so no other SAL writer exists — the same exclusivity boot
     /// has). The *async* fan-out / tick / steady-state DDL paths must NOT call
     /// this — a concurrent FLAG_FLUSH races the committer's own and orphans SAL
-    /// writes straddling `sal.checkpoint_reset`. See async-invariants.md §III.3a.
+    /// writes straddling `sal.checkpoint_reset`. See async-invariants.md.
     ///
     /// Publish every base table's shards and reset the SAL, invalidating
     /// checkpointed derived state first. The bump is not optional: this path

@@ -750,7 +750,7 @@ async fn watchdog(shared: Rc<Shared>) {
 /// `signal_all` fires.  ACKs are awaited via `join_all` through the
 /// reactor's reply routing.
 ///
-/// V.7 liveness: the outer loop body is wrapped so a failure in one
+/// Task liveness: the outer loop body is wrapped so a failure in one
 /// trigger only fails that trigger, not the loop. SAL emission is
 /// further guarded by `guard_panic` inside `run_tick`.
 async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
@@ -846,7 +846,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
 ///
 /// The emit-and-await lock shape: req_ids allocated before any lock,
 /// `catalog_rwlock.read()` (so DDL cannot mutate schemas mid-emission) +
-/// `sal_writer_excl` covering only the contiguous emission window (III.3b), one
+/// `sal_writer_excl` covering only the contiguous emission window, one
 /// `signal_all` inside it, both released before awaiting so other reactor work
 /// proceeds concurrently with worker DAG eval.
 async fn run_tick(
@@ -1287,9 +1287,13 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     // the warm schema-less path the decode hint substituted the catalog's
     // own descriptor, so `decoded.schema` would just validate the catalog
     // schema against itself — pure overhead on every warm INSERT.
+    //
+    // Gated on the relation existing: `get_schema_desc` falls back to
+    // `minimal_u64`, so validating first would report a dropped or stale target
+    // as "expected 1 columns, got 3" instead of "no such table". The existence
+    // gate below produces that error.
     if has_batch && flags & ipc::FLAG_HAS_SCHEMA != 0 {
-        if let Some(ref wire_schema) = decoded.schema {
-            let expected = shared.get_schema_desc(target_id);
+        if let (Some(ref wire_schema), Some(expected)) = (&decoded.schema, shared.cat().get_schema_desc(target_id)) {
             if let Err(e) = validate_schema_match(wire_schema, &expected) {
                 send_error(peer, target_id, client_id, e.as_bytes()).await;
                 return;

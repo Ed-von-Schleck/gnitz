@@ -54,7 +54,7 @@ pub fn encode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
 
 /// OPK-encode a whole PK tuple: [`encode_pk_column`] over `cols` — the PK
 /// columns as `(width, type_code)` in **PK-list order** — tightly packed, no
-/// inter-column padding (§6). `src` and `dst` are both the tuple's `pk_stride`
+/// inter-column padding. `src` and `dst` are both the tuple's `pk_stride`
 /// bytes.
 ///
 /// The one packing walk, so a caller cannot pair the right per-column encoder
@@ -183,9 +183,9 @@ pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mu
 /// mirrors: the general arm's `copy_from_slice` has a runtime length, so it
 /// lowers to a zeroed 16-byte stack buffer plus a `memcpy` call, while a whole-
 /// width arm is one load and one `bswap`. This is the bottom of every PK→u128
-/// conversion — partition routing, XOR8 probes, the merge path. A compound PK
-/// region of an unlisted total width (e.g. `(U32, U64)` = 12) falls to the
-/// general arm, which is why it stays.
+/// conversion — partition routing, XOR8 probes, the merge path. Compound widths
+/// 9..=15 (e.g. `(U32, U64)` = 12) get two overlapping loads for the same reason;
+/// only 3/5/6/7 still reach the buffer.
 /// `widen_pk_be_matches_the_general_form` pins every stride against it.
 #[inline(always)]
 pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
@@ -199,6 +199,22 @@ pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
         4 => u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128,
         2 => u16::from_be_bytes(pk_bytes[..2].try_into().unwrap()) as u128,
         1 => pk_bytes[0] as u128,
+        // 9..=15: two overlapping big-endian loads instead of a runtime-length
+        // `copy_from_slice`, which lowers to an out-of-line `memcpy` per key. With
+        // `m = stride - 8`, the low `m` bytes of the tail load are exactly
+        // `pk_bytes[8..stride]`, since `stride - m == 8`. This is the routing hash
+        // under `worker_for_pk_bytes` — per row on the exchange scatter and the
+        // bloom build — and a compound `(U32, U64)` PK lands here at 12.
+        //
+        // Right-aligned, unlike the engine's left-aligning `pack_pk_be`: this one
+        // recovers a value, that one builds a sort key. Never conflate them.
+        9..=15 => {
+            let m = stride - 8;
+            let hi = u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128;
+            let tail = u64::from_be_bytes(pk_bytes[stride - 8..stride].try_into().unwrap());
+            (hi << (8 * m)) | ((tail & ((1u64 << (8 * m)) - 1)) as u128)
+        }
+        // 3/5/6/7: too narrow for the overlapping-load trick (`stride - 8` underflows).
         _ => {
             let mut buf = [0u8; 16];
             buf[16 - stride..].copy_from_slice(&pk_bytes[..stride]);
@@ -563,9 +579,9 @@ mod tests {
         }
     }
 
-    /// The width-specialized arms must agree with the general right-align form
-    /// at every stride a PK region can have — including the compound widths
-    /// (3, 5, 12, …) that only the general arm serves.
+    /// The width-specialized arms must agree with the general right-align form at
+    /// every stride a PK region can have — the 9..=15 overlapping-load band and
+    /// the 3/5/6/7 widths only the buffer arm serves.
     #[test]
     fn widen_pk_be_matches_the_general_form() {
         let bytes: [u8; 16] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(1));
@@ -578,8 +594,9 @@ mod tests {
                 "stride {stride} diverges from the general form"
             );
         }
-        // All-zero and all-ones edges at the specialized widths.
-        for stride in [1usize, 2, 4, 8, 16] {
+        // All-zero and all-ones edges at every specialized width, the
+        // overlapping-load band included.
+        for stride in [1usize, 2, 4, 8, 9, 12, 13, 15, 16] {
             assert_eq!(widen_pk_be(&[0u8; 16], stride), 0);
             assert_eq!(widen_pk_be(&[0xFFu8; 16], stride), u128::MAX >> (128 - stride * 8));
         }
@@ -870,7 +887,7 @@ mod tests {
         }
     }
 
-    // ── §7 co-partition property: both join sides pack equal values identically.
+    // ── Co-partition property: both join sides pack equal values identically.
 
     /// OPK-encode `v` (held in i128, low `wire_stride(tc)` LE bytes are its image)
     /// as source type `tc` into a `target`-width slot, through the exact promoted

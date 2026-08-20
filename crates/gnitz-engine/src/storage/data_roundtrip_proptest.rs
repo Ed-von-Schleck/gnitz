@@ -11,7 +11,7 @@
 //! column interleaving)` instead of fixing them sweeps every PK-width arm
 //! (narrow `≤ 16`, non-power-of-two narrow `6/10/12`, wide `> 16`), both read
 //! paths (the `full_scan` byte-merge cursor and the direct `slice_to_owned_batch`
-//! shard decode), and the non-prefix `payload_mapping` renumbering in one place.
+//! shard decode), and the non-prefix payload-slot renumbering in one place.
 
 use std::collections::HashMap;
 
@@ -30,7 +30,7 @@ use crate::test_support::{arb_pk_type, arb_type_code};
 /// cap PK_LIST_MAX_COLS == 4 is intentionally exceeded to reach internal
 /// index-shaped schemas). Columns are shuffled so PK columns are not always a
 /// prefix — that exercises `compute_mappings`' payload renumbering around every
-/// PK position (§6), where the closed form `payload_idx = ci - pk_count` breaks.
+/// PK position, where the closed form `payload_idx = ci - pk_count` breaks.
 /// PK columns are non-nullable (SchemaDescriptor::new rejects nullable PKs). The
 /// stride filter is a safety net (currently always true: MAX_PK_COLUMNS * 16 ==
 /// MAX_PK_BYTES) that auto-corrects if either constant changes.

@@ -1,4 +1,4 @@
-//! Order-preserving primary-key (OPK) primitives — the §9 key cluster.
+//! Order-preserving primary-key (OPK) primitives.
 //!
 //! These pure layout/key operations sit *below* both `schema` and `storage`:
 //! they encode a PK region — a whole one, a seek key reassembled from its wire
@@ -28,8 +28,7 @@ use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES}
 /// After the OPK-at-rest flip every PK region at rest holds order-preserving
 /// big-endian bytes, so unsigned lexicographic byte comparison is numerically
 /// identical to the typed comparison of the PK columns for any width. `a.cmp(b)`
-/// compiles to an optimal `memcmp` (vectorised for long slices, a single
-/// instruction for 8/16-byte keys). `a` and `b` are the OPK bytes produced by
+/// compiles to an optimal `memcmp`. `a` and `b` are the OPK bytes produced by
 /// `Batch::get_pk_bytes` / `MappedShard::get_pk_bytes`.
 #[inline(always)]
 pub(crate) fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
@@ -205,8 +204,8 @@ pub(crate) fn index_opk_prefix(native: u128, src_type: u8, idx_key_type: u8) -> 
 /// widths straight into a register, value-equal to the pad-and-copy (a narrow
 /// value occupies the high bits, the low bits zero; `≥16` reads the
 /// order-preserving leading 16 bytes) — pinned by
-/// `pack_pk_be_specialization_matches_naive`. The wildcard arm covers only the
-/// odd narrow widths (1/3/5/6/7/9..=15).
+/// `pack_pk_be_specialization_matches_naive`. Widths 9..=15 get two overlapping
+/// loads for the same reason; only 1/3/5/6/7 reach the pad-and-copy arm.
 ///
 /// NOT a value accessor — for a U64 OPK value 1 (`[0,…,0,1]` at `[..8]`) this
 /// packs as `1·2^64`, not 1. Sibling of `pack_pk_le`, opposite alignment from
@@ -218,8 +217,20 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
         len if len >= 16 => u128::from_be_bytes(pk_bytes[..16].try_into().unwrap()),
         4 => (u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128) << 96,
         2 => (u16::from_be_bytes(pk_bytes[..2].try_into().unwrap()) as u128) << 112,
-        // 1/3/5/6/7/9..=15: odd narrow widths — pad-and-copy (len < 16 here, so
-        // the whole slice is copied and the old `len.min(16)` is unnecessary).
+        // 9..=15: two overlapping big-endian loads instead of a runtime-length
+        // `copy_from_slice`, which lowers to an out-of-line `memcpy` per key. With
+        // `m = len - 8`, the low `m` bytes of the tail load are exactly
+        // `pk_bytes[8..len]`, since `len - m == 8`. Measured ~3x on this band —
+        // the merge and AVI paths sit here (`GROUP BY <INT>` is 13,
+        // `PRIMARY KEY (BIGINT, INT)` is 12).
+        len @ 9..=15 => {
+            let m = len - 8;
+            let hi = u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128;
+            let tail = u64::from_be_bytes(pk_bytes[len - 8..len].try_into().unwrap());
+            let low = (tail & ((1u64 << (8 * m)) - 1)) as u128;
+            (hi << 64) | (low << (64 - 8 * m))
+        }
+        // 1/3/5/6/7: too narrow for the overlapping-load trick (`len - 8` underflows).
         len => {
             let mut buf = [0u8; 16];
             buf[..len].copy_from_slice(pk_bytes);
@@ -247,9 +258,11 @@ pub(crate) struct NarrowPkOpk {
 impl NarrowPkOpk {
     #[inline(always)]
     pub(crate) fn new(pk: u128, stride: usize) -> Self {
+        // Static message: `#[inline(always)]` puts this in every per-row caller,
+        // and an `Arguments` value costs a stack slot even on a cold panic path.
         assert!(
             stride <= NARROW_PK_MAX_BYTES,
-            "narrow PK required, got stride {stride}; use the raw-OPK-bytes setter"
+            "NarrowPkOpk::new: stride exceeds NARROW_PK_MAX_BYTES; use the raw-OPK-bytes setter"
         );
         debug_assert!(
             stride == 16 || (pk >> (stride * 8)) == 0,
@@ -706,10 +719,6 @@ impl IndexKeySpec {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Byte successor / predecessor and cut → key-range derivation
 // ---------------------------------------------------------------------------
 
@@ -1008,10 +1017,11 @@ mod tests {
         assert_opk_equivalence(&s, &a, &b);
     }
 
-    /// The specialized `{8, 16}` register-load arms of `pack_pk_be` must be
-    /// byte-value-identical to the generic pad-and-copy at every width — a
-    /// changed value would silently corrupt every `pack_pk_be` consumer (the
-    /// cached sort keys, the route/guard keys, the bloom probes).
+    /// Every specialized arm of `pack_pk_be` — the `{2,4,8,≥16}` register loads
+    /// and the `9..=15` overlapping pair — must be byte-value-identical to the
+    /// generic pad-and-copy at every width. A changed value would silently
+    /// corrupt every `pack_pk_be` consumer (the cached sort keys, the route/guard
+    /// keys, the bloom probes). Sweeps `1..=16` so no arm boundary is untested.
     #[test]
     fn pack_pk_be_specialization_matches_naive() {
         fn naive(pk: &[u8]) -> u128 {
@@ -1020,7 +1030,7 @@ mod tests {
             buf[..take].copy_from_slice(&pk[..take]);
             u128::from_be_bytes(buf)
         }
-        for width in [1usize, 2, 4, 8, 16, 24, 80] {
+        for width in (1usize..=16).chain([24, 80]) {
             for seed in 0u32..256 {
                 let bytes: Vec<u8> = (0..width)
                     .map(|i| seed.wrapping_mul(31).wrapping_add(i as u32) as u8)

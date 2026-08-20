@@ -835,7 +835,7 @@ impl Batch {
     #[inline]
     pub fn extend_pk(&mut self, pk: u128) {
         debug_assert!(
-            self.schema.is_none_or(|s| !s.pk_has_signed_col()),
+            self.schema.as_ref().is_none_or(|s| !s.pk_has_signed_col()),
             "extend_pk writes an unflipped right-aligned big-endian key: a PK with a signed column \
              must use extend_pk_opk / extend_pk_bytes",
         );
@@ -1196,7 +1196,7 @@ impl Batch {
     }
 
     /// Debug-only (PK, payload) order of adjacent rows `i` and `i + 1` — the total
-    /// order every merge/consolidation path sorts by (§4). Shared by both verifiers.
+    /// order every merge/consolidation path sorts by. Shared by both verifiers.
     #[cfg(debug_assertions)]
     fn adjacent_pair_ord(&self, schema: &SchemaDescriptor, i: usize) -> std::cmp::Ordering {
         use super::columnar::compare_rows;

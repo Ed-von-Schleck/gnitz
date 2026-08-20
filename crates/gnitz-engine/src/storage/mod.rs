@@ -47,8 +47,8 @@ pub(crate) use columnar::{
     cmp_col_window, compare_rows, compare_rows_except, compare_rows_fixedint_nonnull, with_payload_cmp,
 };
 // The OPK key cluster is NOT re-exported here: `schema::key` owns it and every
-// caller names `crate::schema::key::X`. Re-exporting it split one §1/§6 rule
-// across two import paths, visibly — `ops/reduce/sort.rs` and
+// caller names `crate::schema::key::X`. Re-exporting it split one byte-order
+// rule across two import paths, visibly — `ops/reduce/sort.rs` and
 // `catalog/scan_spec.rs` each imported from both in adjacent lines.
 pub(crate) use gnitz_wire::wal::write_header_and_directory as wal_write_header_and_directory;
 pub(crate) use lsm::child_dir::{

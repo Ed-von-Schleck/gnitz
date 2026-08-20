@@ -615,9 +615,11 @@ impl CatalogEngine {
                 continue;
             }
             let cur = entry.schema;
-            // Rebuild from the post-invalidate col defs, carrying the placement
-            // `eq` ignores. Only an is_nullable 0→1 flip or a trailing append
-            // changes the descriptor; when it does, publish it into the store.
+            // Rebuild from the post-invalidate col defs. `cur.placement()` is
+            // construction, not a workaround for `eq` ignoring it: without it the
+            // rebuild is stamped KEYED_DEFAULT and loses CLUSTER BY / REPLICATED.
+            // Only an is_nullable 0→1 flip or a trailing append changes the
+            // descriptor; when it does, publish it into the store.
             let col_defs = self.read_column_defs(owner);
             let rebuilt = build_schema_from_col_defs(&col_defs, cur.pk_indices(), cur.placement())
                 .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;

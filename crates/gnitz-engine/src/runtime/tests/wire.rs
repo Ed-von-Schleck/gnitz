@@ -3,7 +3,7 @@ use crate::runtime::wire::{
     decode_schema_block, decode_wire, encode_ctrl_block_direct, peek_client_control, peek_control_block,
     peek_control_block_ipc, WireData, WireMsg, CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
 };
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_COLUMNS};
 use crate::storage::{Batch, Layout};
 use crate::test_support::named_col_defs;
 use gnitz_wire::{encode_german_string, try_decode_german_string};
@@ -199,7 +199,7 @@ fn test_wire_size_includes_request_id() {
 
 /// The column names a schema block carries, read back through the shared codec.
 fn block_col_names(block: &[u8]) -> Vec<String> {
-    gnitz_wire::schema_block::SchemaBlock::decode(block, true, gnitz_wire::MAX_PK_COLUMNS)
+    gnitz_wire::schema_block::SchemaBlock::decode(block, true, MAX_PK_COLUMNS)
         .unwrap()
         .columns()
         .map(|c| String::from_utf8(c.name.to_vec()).unwrap())

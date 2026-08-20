@@ -85,7 +85,7 @@ pub(crate) fn null_gate(
 
 /// Build a reindex ExprProgram that copies all columns as payload — the unpruned
 /// identity. Arity-independent: it copies every source column to payload offsets
-/// `0..n`, and `reindex_output_schema` places those payload columns at physical
+/// `0..n`, and the engine places those payload columns at physical
 /// indices `k..k+n` regardless of the key arity `k` (the `k` PK slots precede
 /// them), so the payload offsets never shift with the number of key columns.
 pub(crate) fn build_reindex_program(n_cols: usize) -> gnitz_core::ExprProgram {

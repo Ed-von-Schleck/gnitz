@@ -685,7 +685,7 @@ impl<S, F> RowComparator<S> for F where F: Fn(&SchemaDescriptor, &S, usize, &S, 
 
 /// The (PK, payload) merge comparator trio, shared by the flush/compaction
 /// kernel ([`run_merge_body`]) and the read cursor's loser-tree drives so the
-/// two can never diverge on the §4 total order. All three are `#[inline]`
+/// two can never diverge on the (PK, payload) total order. All three are `#[inline]`
 /// closure builders, generic over the concrete source type — no `dyn` — so
 /// each caller monomorphizes its own branch-free copy.
 ///

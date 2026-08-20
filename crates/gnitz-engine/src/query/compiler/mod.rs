@@ -11,8 +11,8 @@ use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{build_reduce_output_schema, AggDescriptor};
 use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{
-    build_map_output_schema, hashrow_output_schema, merge_schemas_for_join, null_extend_output_schema,
-    reindex_output_schema, SchemaColumn, SchemaDescriptor, TypeCode,
+    build_map_output_schema, hashrow_output_schema, merge_schemas_for_join, null_extend_output_schema, SchemaColumn,
+    SchemaDescriptor, TypeCode,
 };
 use crate::storage::{ReadCursor, RecoverySource, StorageError, Table};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
@@ -1253,7 +1253,10 @@ mod tests {
         );
         // The sink validates against the reindex Map's output schema (2 synthetic
         // PK slots [U64, I64] + the two input columns).
-        let out_schema = reindex_output_schema(&in_schema, &[0, 1], &[], &[0, 1]).unwrap();
+        let out_schema = crate::ops::ReindexPacker::new(&in_schema, &[0, 1], &[])
+            .unwrap()
+            .output_schema(&in_schema, &[0, 1])
+            .unwrap();
         let map = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
             program: blob,
             reindex_cols: vec![0, 1],
@@ -1311,7 +1314,10 @@ mod tests {
             ],
             &[0],
         );
-        let out_schema = reindex_output_schema(&in_schema, &[0], &[], &[2]).unwrap();
+        let out_schema = crate::ops::ReindexPacker::new(&in_schema, &[0], &[])
+            .unwrap()
+            .output_schema(&in_schema, &[2])
+            .unwrap();
         let map = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
             program: blob,
             reindex_cols: vec![0],
@@ -1806,8 +1812,8 @@ mod tests {
     /// The two derived map out-schemas are by construction ones `ScalarFunc`
     /// accepts. `HashRow` is the only site that emits a *promoting* `CopyCol`,
     /// so it is what makes `check_copy_types`' widening clause do work; the
-    /// reindex case pins that `payload_copy_srcs` and `reindex_output_schema`
-    /// cannot drift apart into a mixed-type copy.
+    /// reindex case pins that `payload_copy_srcs` and
+    /// `ReindexPacker::output_schema` cannot drift apart into a mixed-type copy.
     #[test]
     fn test_derived_map_schemas_satisfy_copy_types() {
         use crate::expr::ScalarFunc;
@@ -1827,7 +1833,10 @@ mod tests {
         let cols: Vec<u32> = vec![0, 1, 2, 3, 4];
         let prog = || LogicalProgram::copy_cols(&cols);
         let payload_cols = prog().payload_copy_srcs().unwrap().to_vec();
-        let reindexed = reindex_output_schema(&in_schema, &[4], &[type_code::U64], &payload_cols).unwrap();
+        let reindexed = crate::ops::ReindexPacker::new(&in_schema, &[4], &[type_code::U64])
+            .unwrap()
+            .output_schema(&in_schema, &payload_cols)
+            .unwrap();
         assert!(ScalarFunc::from_map(prog(), &in_schema, &reindexed).is_ok());
 
         // A cross-width set-op coercion: the U32 column promoted to I64, every
@@ -1896,7 +1905,7 @@ mod tests {
         HashSet::new()
     }
 
-    // ── §5: destructive-register ordering invariant ─────────────────────────
+    // ── Destructive-register ordering invariant ─────────────────────────────
     //
     // Union/Distinct/PositivePart empty their input register in place.
     // When that register fans out to other consumers, the destructive op must
@@ -2967,7 +2976,7 @@ mod tests {
                             group_cols: vec![0],
                             agg: vec![(gnitz_wire::AggFunc::Count, 0)],
                             global_ground: false,
-                            out_key: gnitz_wire::ReduceOutKey::SyntheticFold,
+                            out_key: crate::schema::ReduceOutKey::SyntheticFold,
                         },
                     ),
                     (2, OpNode::IntegrateSink),

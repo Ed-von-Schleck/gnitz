@@ -582,21 +582,27 @@ impl PkTuple {
     }
 
     /// Split the tuple into the wire form `(seek_pk: u128, seek_pk_extra: &[u8])`.
-    /// For narrow PKs (stride ≤ 16) `extra` is empty and the frame is byte-
-    /// identical to the pre-compound-PK path.
+    /// `extra` is empty for a narrow PK. The engine's `seek_opk_bytes` is the
+    /// exact inverse and must cut at the same constant for every SEEK.
     pub fn split_wire(&self) -> (u128, &[u8]) {
         let bytes = self.as_bytes();
-        let extra: &[u8] = if bytes.len() > 16 { &bytes[16..] } else { &[] };
+        let extra: &[u8] = if bytes.len() > gnitz_wire::NARROW_PK_MAX_BYTES {
+            &bytes[gnitz_wire::NARROW_PK_MAX_BYTES..]
+        } else {
+            &[]
+        };
         (low16_le(bytes), extra)
     }
 }
 
-/// A packed PK's low 16 bytes as a u128 — the scalar projection both
-/// [`PkColumn::get`] and [`PkTuple::split_wire`] hand out. A key wider than 16
-/// bytes has no scalar form; its remaining bytes travel separately.
+/// A packed PK's low `NARROW_PK_MAX_BYTES` bytes as a u128 — the scalar projection
+/// both [`PkColumn::get`] and [`PkTuple::split_wire`] hand out. A wider key has no
+/// scalar form; its remaining bytes travel separately.
+///
+/// Little-endian, so *not* `widen_pk_be`: that recovers a big-endian OPK value.
 fn low16_le(key: &[u8]) -> u128 {
-    let n = key.len().min(16);
-    let mut b = [0u8; 16];
+    let n = key.len().min(gnitz_wire::NARROW_PK_MAX_BYTES);
+    let mut b = [0u8; gnitz_wire::NARROW_PK_MAX_BYTES];
     b[..n].copy_from_slice(&key[..n]);
     u128::from_le_bytes(b)
 }

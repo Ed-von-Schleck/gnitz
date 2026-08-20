@@ -1,5 +1,5 @@
 //! Shared `#[cfg(test)]` test helpers: OPK-encoding batch builders (a canonical
-//! `(U64, U64, U64)`-PK + `I64`-payload schema, so no test re-derives the §6
+//! `(U64, U64, U64)`-PK + `I64`-payload schema, so no test re-derives the
 //! order-preserving key layout by hand) and the crate's arbitrary type-code
 //! proptest strategies (a single source of truth, so PK-eligibility can't drift
 //! from `is_pk_eligible`).
@@ -45,14 +45,15 @@ pub(crate) fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
     // The production leading-span encoder over every PK column: source and
     // target type are equal here, so its promote step is the identity arm and
     // the span is the whole PK. Encoding through it rather than re-packing the
-    // native image by hand keeps the oracle from being a second spelling of §6.
+    // native image by hand keeps the oracle from being a second spelling of the
+    // OPK encoding.
     let cols = schema.pk_columns().map(|(_, col)| (col.type_code, *col));
     encode_leading_opk(cols, vals).pk_bytes().to_vec()
 }
 
 /// Build a consolidated wide-PK batch from native `(c0, c1, c2, weight, payload)`
 /// tuples. The PK is OPK-encoded via [`Batch::extend_pk_opk`] (big-endian per
-/// column — the at-rest §6 layout), so the bytes are byte-identical to an
+/// column — the at-rest region layout), so the bytes are byte-identical to an
 /// ingested row and to what `worker_for_pk_bytes` routes.
 ///
 /// `rows` must be OPK-sorted (non-decreasing PK). The explicit assert below runs

@@ -111,7 +111,7 @@ pub struct PendingPush {
 pub struct Shared {
     pub reactor: Rc<Reactor>,
     pub disp: Rc<MasterDispatcher>,
-    /// SAL-writer exclusivity (III.3b). The committer holds this for
+    /// SAL-writer exclusivity. The committer holds this for
     /// the entire checkpoint + commit emission window so a concurrent
     /// tick task or DDL broadcast cannot interleave a SAL group.
     pub sal_writer_excl: Rc<AsyncMutex>,
@@ -898,7 +898,7 @@ async fn commit_pushes(
     }
 
     // Update unique-index filters now that fsync confirms durability.
-    // Wrap per V.7: a panic in the filter update must not fail the commit —
+    // Wrapped for task liveness: a panic here must not fail the commit —
     // the data is already durable. Invalidate on panic so the next
     // constrained INSERT re-validates from scratch.
     for g in groups.iter().filter(|g| g.write_err.is_none()) {

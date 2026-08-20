@@ -602,7 +602,7 @@ fn test_compound_pk_secondary_index_seek() {
     for &(a, bcol, val) in rows {
         // `extend_pk_bytes` takes the OPK image verbatim, so a compound PK must
         // be built through `extend_pk_opk` — a native-LE concatenation is not the
-        // at-rest form (§6) and would ingest a PK region the engine forbids.
+        // at-rest form and would ingest a PK region the engine forbids.
         b.extend_pk_opk(&schema, &[a as u128, bcol as u128]);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());

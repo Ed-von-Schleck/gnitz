@@ -412,7 +412,7 @@ fn test_edge_cases_extended() {
 }
 
 // ── test_nullable_pk_rejected ─────────────────────────────────────────
-// The PK region has no null bitmap (foundations.md §6); the catalog must
+// The PK region has no null bitmap; the catalog must
 // refuse to record a nullable PK regardless of its type.
 
 #[test]

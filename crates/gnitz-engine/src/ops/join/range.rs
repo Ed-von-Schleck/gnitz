@@ -8,7 +8,7 @@ use crate::storage::{Batch, BlobCacheGuard, MemBatch, ReadCursor};
 use gnitz_wire::RangeRel;
 
 /// Half-open `[start, end)` cut points over the trace PK space for one delta
-/// row's range probe, per the §3 table. `eq` is the equality-prefix OPK bytes
+/// row's range probe. `eq` is the equality-prefix OPK bytes
 /// (`n_eq` slots, possibly empty) and `d` is the range-slot OPK bytes; together
 /// they are the delta row's own PK region `p = eq ‖ d`, so the bounds need no
 /// decode/re-encode.
@@ -87,7 +87,7 @@ use super::rowwrite::write_join_row;
 
 /// Range join delta-trace: like `op_join_delta_trace`, but each consolidated
 /// delta row matches the trace by an ordered half-open `[start, end)` range
-/// (the §3 cut-point table) instead of an equal-key seek. `n_eq` leading PK
+/// (the cut points above) instead of an equal-key seek. `n_eq` leading PK
 /// slots are equality-pinned (the band-join prefix), `rel` is the relation the
 /// trace slot must satisfy versus the delta slot.
 ///

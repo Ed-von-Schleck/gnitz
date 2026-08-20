@@ -741,7 +741,7 @@ impl Reactor {
     /// demuxed into `exchange_acc` so the tick req_id's waker stays
     /// parked until the final (non-FLAG_EXCHANGE) ACK lands. When an
     /// exchange round completes, the resulting `PendingRelay` is
-    /// dispatched on `relay_tx`. See async-invariants.md §III.3b.
+    /// dispatched on `relay_tx`. See SAL-writer exclusivity in async-invariants.md.
     ///
     /// Routes on `prefix` — the ring slot's `internal_req_id` — which is the
     /// key `send_msg` documents as the reply's identity. The payload's

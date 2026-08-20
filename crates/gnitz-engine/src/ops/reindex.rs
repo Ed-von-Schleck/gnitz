@@ -7,7 +7,7 @@
 //! they stay `#[inline]` and monomorphic so producer and consumer keys agree.
 
 use crate::foundation::xxh::{self, RowHasher};
-use crate::schema::{ColumnLocator, SchemaDescriptor, TypeCode};
+use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, MemBatch};
 
 use super::util::{hash_group_col, ieee_order_bits, ieee_order_bits_f32};
@@ -30,9 +30,8 @@ use super::util::{hash_group_col, ieee_order_bits, ieee_order_bits_f32};
 pub(super) fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id: u8) {
     let n = output.count;
     debug_assert!(
-        out_schema.pk_stride() as usize <= 16,
-        "reindex_hash_row: synthetic key stride {} > 16",
-        out_schema.pk_stride()
+        out_schema.pk_stride() as usize <= gnitz_wire::NARROW_PK_MAX_BYTES,
+        "reindex_hash_row: synthetic key stride exceeds NARROW_PK_MAX_BYTES"
     );
     // Hashing borrows the batch immutably and the write-back needs it mutably, so
     // the two cannot interleave per row. Buffering a chunk of keys on the stack
@@ -290,33 +289,31 @@ struct GroupKeyExtras {
 
 impl ReindexPacker {
     /// Build per-column promoters from the reindex column list (key order). Each
-    /// column's slot width is `reindex_output_type_code(tc).wire_stride()` (= `cs`
-    /// for Pk/Narrow ints, 16 for floats/Wide/String) — exactly the widths
-    /// `reindex_output_schema` lays out. Offsets are the running sum (tightly
-    /// packed, no inter-column padding, matching `Schema::pk_stride()`).
-    pub(crate) fn new(schema: &SchemaDescriptor, reindex_cols: &[u32], target_tcs: &[u8]) -> Self {
-        // Hard `assert!` (not `debug_assert!`): the scatter-side construction
-        // (exchange.rs) is not covered by `emit_node`'s compile-time guard, so
-        // these bounds must hold in release too. Each runs once per packer (out
-        // of any row loop) — negligible cost.
-        assert!(
-            reindex_cols.len() <= crate::schema::MAX_PK_COLUMNS,
-            "ReindexPacker: {} reindex columns exceed MAX_PK_COLUMNS",
-            reindex_cols.len()
-        );
+    /// column's slot width is `resolve_reindex_type(tc).wire_stride()` (= `cs`
+    /// for Pk/Narrow ints, 16 for floats/Wide/String). Offsets are the running
+    /// sum (tightly packed, no inter-column padding, matching
+    /// `Schema::pk_stride()`).
+    ///
+    /// The **only** derivation of that layout — [`Self::output_schema`] reads
+    /// these same promoters. Two derivations agreeing only on the total stride
+    /// could disagree per slot, and the failure is silent: equal keys stop
+    /// co-partitioning.
+    ///
+    /// `None` on arity over `MAX_PK_COLUMNS`, an out-of-range column, or a stride
+    /// over `MAX_PK_BYTES`. The column check is not redundant: a `col_idx` in
+    /// `[num_columns, MAX_COLUMNS)` is in-bounds of the fixed `columns` array, so
+    /// without it a hand-assembled circuit packs bytes from a zeroed slot.
+    pub(crate) fn new(schema: &SchemaDescriptor, reindex_cols: &[u32], target_tcs: &[u8]) -> Option<Self> {
+        if reindex_cols.len() > crate::schema::MAX_PK_COLUMNS {
+            return None;
+        }
         let mut cols = [ColPromoter::PLACEHOLDER; crate::schema::MAX_PK_COLUMNS];
         let mut out_off = 0usize;
         for (i, &c) in reindex_cols.iter().enumerate() {
             let col_idx = c as usize;
-            // A `col_idx` in `[num_columns, MAX_COLUMNS)` is *in-bounds* of the
-            // fixed `columns` array, so in release it would silently read a zeroed
-            // schema slot (wrong key bytes) rather than panic. Hard-assert so a
-            // hand-assembled circuit that skips `emit_node`'s guard fails loudly.
-            assert!(
-                col_idx < schema.num_columns(),
-                "ReindexPacker: column index {col_idx} >= num_columns {}",
-                schema.num_columns()
-            );
+            if col_idx >= schema.num_columns() {
+                return None;
+            }
             let kind = classify_promote(schema, col_idx); // carries source tc on Pk/Narrow
             let src_tc = schema.columns[col_idx].type_code;
             // Carried promotion target (`0` = self-derive); the slot type and width
@@ -343,16 +340,35 @@ impl ReindexPacker {
             };
             out_off += out_size;
         }
-        assert!(
-            out_off <= crate::schema::MAX_PK_BYTES,
-            "ReindexPacker: packed stride {out_off} exceeds MAX_PK_BYTES"
-        );
-        ReindexPacker {
+        if out_off > crate::schema::MAX_PK_BYTES {
+            return None;
+        }
+        Some(ReindexPacker {
             cols,
             num_cols: reindex_cols.len(),
             out_stride: out_off,
             group: None,
+        })
+    }
+
+    /// The reindex Map's output schema: one PK column per key slot at the type
+    /// `new` resolved, then `in_schema.columns[payload_cols[i]]` at payload slot
+    /// `i`. Reading `out_tc` off the promoters is what makes this schema's stride
+    /// and `out_stride` equal by construction.
+    ///
+    /// `payload_cols` is the source columns the reindex program copies, so a join
+    /// side whose program skips a dead column stops persisting it in the trace.
+    ///
+    /// `None` iff the result exceeds `MAX_COLUMNS`; the PK-side bounds are `new`'s.
+    pub(crate) fn output_schema(&self, in_schema: &SchemaDescriptor, payload_cols: &[u32]) -> Option<SchemaDescriptor> {
+        let mut b = DerivedSchema::new();
+        for cp in &self.cols[..self.num_cols] {
+            b.push_pk(SchemaColumn::new(cp.out_tc, 0))?; // PK region: nullable = 0
         }
+        for &c in payload_cols {
+            b.push(in_schema.columns[c as usize])?;
+        }
+        Some(b.finish())
     }
 
     /// Build the packer for a **group** key over `group_cols`, following
@@ -542,7 +558,10 @@ mod tests {
             // stride; a stride > 16 would underflow `16 - stride`. The compiler
             // types a narrow (≤8-byte) integer reindex key at its native width and
             // every other key as U128, so the synthetic key is always ≤ 16 bytes.
-            debug_assert!(stride <= 16, "promote_into: synthetic key stride {stride} > 16");
+            debug_assert!(
+                stride <= gnitz_wire::NARROW_PK_MAX_BYTES,
+                "promote_into: synthetic key stride {stride} exceeds NARROW_PK_MAX_BYTES"
+            );
             match self.kind {
                 // Source PK column is already OPK at rest — copy it verbatim,
                 // right-aligned with left zero-pad. widen_pk_be of the result
@@ -869,6 +888,110 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // ReindexPacker::output_schema — the layout the per-row packer writes through
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn packer_output_schema_pk_width_policy() {
+        // (key column type, expected output PK type, expected pk_stride)
+        let cases = [
+            (type_code::U64, type_code::U64, 8u8),
+            (type_code::I32, type_code::I32, 4),
+            (type_code::U16, type_code::U16, 2),
+            (type_code::STRING, type_code::U128, 16),
+            (type_code::BLOB, type_code::U128, 16),
+            (type_code::U128, type_code::U128, 16),
+            (type_code::UUID, type_code::U128, 16),
+            (type_code::F64, type_code::U128, 16),
+        ];
+        for (key_tc, want_tc, want_stride) in cases {
+            // in_schema: [U64 PK, <key col>]; reindex on the payload col so the
+            // PK-ineligible key types (STRING/BLOB/float) are exercisable as keys.
+            let in_schema = SchemaDescriptor::new(
+                &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(key_tc, 0)],
+                &[0],
+            );
+            let node_schema = ReindexPacker::new(&in_schema, &[1], &[])
+                .unwrap()
+                .output_schema(&in_schema, &[0, 1])
+                .unwrap();
+            assert_eq!(node_schema.columns[0].type_code, want_tc, "key {key_tc} → PK type");
+            assert_eq!(node_schema.pk_stride(), want_stride, "key {key_tc} → pk_stride");
+        }
+    }
+
+    #[test]
+    fn packer_output_schema_compound() {
+        // in_schema: [U64 pk, I32, U128]; reindex on (col1 I32, col2 U128).
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::U128, 0),
+            ],
+            &[0],
+        );
+        let out = ReindexPacker::new(&in_schema, &[1, 2], &[])
+            .unwrap()
+            .output_schema(&in_schema, &[0, 1, 2])
+            .unwrap();
+        assert_eq!(out.pk_indices(), &[0, 1], "2-slot compound PK");
+        assert_eq!(out.columns[0].type_code, type_code::I32, "slot0 keeps I32 native width");
+        assert_eq!(out.columns[1].type_code, type_code::U128, "slot1 U128");
+        assert_eq!(out.pk_stride(), 4 + 16, "compound stride = Σ slot widths");
+        // Input columns follow the synthetic PK slots.
+        assert_eq!(out.num_columns(), 2 + 3);
+        assert_eq!(out.columns[2].type_code, type_code::U64);
+        assert_eq!(out.columns[3].type_code, type_code::I32);
+        assert_eq!(out.columns[4].type_code, type_code::U128);
+    }
+
+    #[test]
+    fn packer_output_schema_cross_width_promotes() {
+        // in_schema: [U64 pk, I32, I64]; reindex on (col1 I32, col2 I64) with
+        // slot 0 promoted to I64 (carried) and slot 1 self-deriving.
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let out = ReindexPacker::new(&in_schema, &[1, 2], &[type_code::I64, 0])
+            .unwrap()
+            .output_schema(&in_schema, &[0, 1, 2])
+            .unwrap();
+        assert_eq!(out.columns[0].type_code, type_code::I64, "slot0 carried T = I64");
+        assert_eq!(out.columns[1].type_code, type_code::I64, "slot1 self-derives I64");
+        assert_eq!(out.pk_stride(), 8 + 8, "both slots 8 bytes after promotion");
+    }
+
+    #[test]
+    fn packer_output_schema_payload_prune() {
+        // in_schema: [U64 pk, I32, U128, I16]; reindex on col1; keep payload {0, 3}.
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I16, 0),
+            ],
+            &[0],
+        );
+        let out = ReindexPacker::new(&in_schema, &[1], &[])
+            .unwrap()
+            .output_schema(&in_schema, &[0, 3])
+            .unwrap();
+        assert_eq!(out.pk_indices(), &[0], "single synthetic PK slot");
+        assert_eq!(out.columns[0].type_code, type_code::I32, "PK slot = reindex col1 (I32)");
+        // Only the two kept payload columns follow — not all four input columns.
+        assert_eq!(out.num_columns(), 1 + 2, "1 PK + 2 kept payload");
+        assert_eq!(out.columns[1].type_code, type_code::U64, "kept payload col 0");
+        assert_eq!(out.columns[2].type_code, type_code::I16, "kept payload col 3");
+    }
+
+    // -----------------------------------------------------------------------
     // ReindexPacker — multi-column / compound reindex packing
     // -----------------------------------------------------------------------
 
@@ -925,7 +1048,7 @@ mod tests {
         b.count += 1;
         let mb = b.as_mem_batch();
 
-        let packer = ReindexPacker::new(&schema, &[1, 2, 3, 4], &[]);
+        let packer = ReindexPacker::new(&schema, &[1, 2, 3, 4], &[]).unwrap();
         // out_stride = 8 (Pk U64) + 4 (I32) + 16 (U128) + 16 (F64→U128) = 44.
         assert_eq!(packer.out_stride, 8 + 4 + 16 + 16);
 
@@ -986,7 +1109,7 @@ mod tests {
             let out_tc = gnitz_wire::reindex_output_type_code(schema.columns[*col].type_code);
             let out_schema = SchemaDescriptor::new(&[SchemaColumn::new(out_tc, 0)], &[0]);
 
-            let packer = ReindexPacker::new(schema, &[*col as u32], &[]);
+            let packer = ReindexPacker::new(schema, &[*col as u32], &[]).unwrap();
             let mut packer_out = make_zeroed_batch(&out_schema, 3);
             packer.promote_into(&mb, &mut packer_out);
 
@@ -1025,7 +1148,7 @@ mod tests {
         let mb = b.as_mem_batch();
 
         let out_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0)], &[0]);
-        let packer = ReindexPacker::new(&schema, &[1], &[]);
+        let packer = ReindexPacker::new(&schema, &[1], &[]).unwrap();
         assert_eq!(packer.out_stride, 16);
         let mut packer_out = make_zeroed_batch(&out_schema, 1);
         packer.promote_into(&mb, &mut packer_out);
@@ -1076,7 +1199,7 @@ mod tests {
         }
         let mb = b.as_mem_batch();
 
-        let packer = ReindexPacker::new(&schema, &cols, &[]);
+        let packer = ReindexPacker::new(&schema, &cols, &[]).unwrap();
         let out_schema = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0), // col2 → U64
@@ -1142,7 +1265,7 @@ mod tests {
 
         // Reindex on the three U64 payload columns → a 24-byte (3×U64) OPK key.
         let cols = [1u32, 2u32, 3u32];
-        let packer = ReindexPacker::new(&schema, &cols, &[]);
+        let packer = ReindexPacker::new(&schema, &cols, &[]).unwrap();
         assert_eq!(packer.out_stride, 24, "3×U64 reindex key must be 24 bytes (wide)");
 
         // The reindex output schema = natural 3×U64 PK (what `op_map` stamps and
@@ -1224,7 +1347,7 @@ mod tests {
         }
         let mb = b.as_mem_batch();
 
-        let packer = ReindexPacker::new(&schema, &[1], &[]);
+        let packer = ReindexPacker::new(&schema, &[1], &[]).unwrap();
         assert_eq!(packer.out_stride, 4); // U32 key → 4-byte slot
 
         let mut buf0 = [0u8; crate::schema::MAX_PK_BYTES];
@@ -1270,7 +1393,7 @@ mod tests {
         // Reindex (PK col0 → I64, payload col2 U32 → U64).
         let cols = [0u32, 2u32];
         let targets = [type_code::I64, type_code::U64];
-        let packer = ReindexPacker::new(&schema, &cols, &targets);
+        let packer = ReindexPacker::new(&schema, &cols, &targets).unwrap();
         let out_schema = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::I64, 0),

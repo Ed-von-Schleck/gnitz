@@ -544,18 +544,28 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             }
             // Validated above, so the wire's `u16` spelling ends here.
             let key_cols: Vec<u32> = reindex_cols.iter().map(|&c| c as u32).collect();
-            let node_schema = if key_cols.is_empty() {
+            // The packer is built first because it *is* the layout: its output
+            // schema reads the promoters the per-row pack writes through, so the
+            // reindexed `_join_pk` and the delta scatter co-partition by
+            // construction. Same packer the exchange scatter builds from `ViewMeta`.
+            let packer = match key_cols.is_empty() {
+                true => None,
+                false => Some(
+                    crate::ops::ReindexPacker::new(&in_reg_schema, &key_cols, reindex_target_tcs)
+                        .ok_or(CompileError::Rejected("map: invalid reindex key"))?,
+                ),
+            };
+            let node_schema = match &packer {
                 // A computed projection has no dense copy list to derive from
                 // (`payload_copy_srcs` is `None` for `SELECT a + b`), so it is
                 // typed with the view's output schema — sound because the planner
                 // emits a reindex-free `Expression` map only as the circuit's
                 // final projection. `from_map` below validates the program against
                 // it, which is what catches a violation.
-                loaded.out_schema
-            } else {
-                let payload_cols = dense_copy_srcs(&prog, &in_reg_schema)?;
-                reindex_output_schema(&in_reg_schema, &key_cols, reindex_target_tcs, &payload_cols)
-                    .ok_or(CompileError::Rejected("map: reindex output exceeds MAX_COLUMNS"))?
+                None => loaded.out_schema,
+                Some(p) => p
+                    .output_schema(&in_reg_schema, &dense_copy_srcs(&prog, &in_reg_schema)?)
+                    .ok_or(CompileError::Rejected("map: reindex output exceeds MAX_COLUMNS"))?,
             };
             let func = ScalarFunc::from_map(prog, &in_reg_schema, &node_schema)
                 .map_err(expr_reject("map: program/schema mismatch"))?;
@@ -565,18 +575,11 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
                 return Err(CompileError::Rejected("map: output PK stride differs from the input's"));
             }
             let fp = ctx.push_func(func);
-            let reindex = if key_cols.is_empty() {
-                ReindexOperand::None
-            } else {
-                // The same packer the exchange scatter builds from `ViewMeta`, so
-                // the reindexed `_join_pk` and the delta scatter co-partition
-                // byte-for-byte. Its bounds asserts hold by construction here:
-                // `oob_cols` range-checked the columns and `reindex_output_schema`
-                // already accepted the key slots.
-                let packer = crate::ops::ReindexPacker::new(&in_reg_schema, &key_cols, reindex_target_tcs);
-                ReindexOperand::Pack {
-                    packer_idx: ctx.builder.add_reindex_packer(packer),
-                }
+            let reindex = match packer {
+                None => ReindexOperand::None,
+                Some(p) => ReindexOperand::Pack {
+                    packer_idx: ctx.builder.add_reindex_packer(p),
+                },
             };
             (node_schema, fp, reindex)
         }

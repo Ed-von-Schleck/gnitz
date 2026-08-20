@@ -225,7 +225,11 @@ impl Tier {
 /// The four `opk_width_dispatch!` arms: 8 → `u64`, 16 → `u128`, 24 → `[u128;2]`,
 /// 40 → byte-`memcmp` fallback. Stride 8 is the profiled anchor; the other three
 /// guard against a win that quietly regresses a wider PK another workload uses.
-const ADV_STRIDES: [usize; 4] = [8, 16, 24, 40];
+///
+/// 12 and 13 sit in `pack_pk_be`'s overlapping-load band, which no whole-width
+/// arm covers — the ordinary compound shapes `PRIMARY KEY (BIGINT, INT)` and the
+/// AVI's `GROUP BY <INT>` key land there.
+const ADV_STRIDES: [usize; 6] = [8, 12, 13, 16, 24, 40];
 
 /// Gallop depth sweep: `O(1)` adjacency (per-probe decode dominates) through deep
 /// skips (`O(log gap)` binary search dominates). The profiled workload's ~100–500
@@ -259,12 +263,42 @@ fn adv_schema_5xu64() -> SchemaDescriptor {
 /// tiebreak runs `compare_rows_fixedint_nonnull` (the profile's 3.30% child).
 fn adv_bench_schema(stride: usize) -> SchemaDescriptor {
     match stride {
-        8 => make_schema_u64_i64(),   // U64 PK + I64
-        16 => make_schema_u128_i64(), // U128 PK + I64
-        24 => wide_pk_3xu64_schema(), // 3×U64 PK + I64
-        40 => adv_schema_5xu64(),     // 5×U64 PK + I64
+        8 => make_schema_u64_i64(),    // U64 PK + I64
+        12 => adv_schema_u64_u32(),    // (U64, U32) PK + I64
+        13 => adv_schema_u64_u32_u8(), // (U64, U32, U8) PK + I64
+        16 => make_schema_u128_i64(),  // U128 PK + I64
+        24 => wide_pk_3xu64_schema(),  // 3×U64 PK + I64
+        40 => adv_schema_5xu64(),      // 5×U64 PK + I64
         _ => unreachable!("bench stride must be one of ADV_STRIDES"),
     }
+}
+
+/// Stride-12 compound PK — `PRIMARY KEY (BIGINT, INT)`. All-unsigned, so the
+/// concatenated OPK region reads as one big-endian number and `adv_key` stays
+/// monotone across the column boundary.
+fn adv_schema_u64_u32() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0, 1],
+    )
+}
+
+/// Stride-13 compound PK — the AVI's `GROUP BY <INT>` shape (group slot, ordinal,
+/// value collapse to the same width). Same monotonicity argument as stride 12.
+fn adv_schema_u64_u32_u8() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(type_code::U8, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0, 1, 2],
+    )
 }
 
 /// OPK bytes for bench key `n` at `stride`: `n`'s big-endian image right-aligned

@@ -1169,7 +1169,7 @@ mod tests {
         ];
         let cb = make_join_key_batch(&schema, rows);
 
-        let packer = ReindexPacker::new(&schema, &cols, &[]);
+        let packer = ReindexPacker::new(&schema, &cols, &[]).unwrap();
         let expected_worker = |sb: &Batch, r: usize| -> usize {
             let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
             packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
@@ -1259,7 +1259,7 @@ mod tests {
         let cols = [1u32];
         let targets = [type_code::I64];
 
-        let packer = ReindexPacker::new(&schema, &cols, &targets);
+        let packer = ReindexPacker::new(&schema, &cols, &targets).unwrap();
         let expected_worker = |sb: &Batch, r: usize| -> usize {
             let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
             packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
@@ -1328,7 +1328,7 @@ mod tests {
         let pk_cb = pb;
         let pk_cols = [0u32];
         let pk_targets = [type_code::I64];
-        let pk_packer = ReindexPacker::new(&pk_schema, &pk_cols, &pk_targets);
+        let pk_packer = ReindexPacker::new(&pk_schema, &pk_cols, &pk_targets).unwrap();
         let pk_repart = op_repartition_batches_mode(
             &[Some(&pk_cb)],
             &pk_cols,

@@ -56,7 +56,7 @@ pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
 
 /// Dense **payload** index of the column named `name` in `cols` — its position
 /// among the non-PK columns, which is the slot the null bitmap and the payload
-/// region directory address it by (§6).
+/// region directory address it by.
 ///
 /// Valid only for a column list whose primary key is the single leading column,
 /// where the payload index collapses to `col_index_in(..) - 1`. Every list this
@@ -80,7 +80,7 @@ pub(crate) const fn pay_index_in_keyed(cols: &[WireSysCol], name: &str, pk_cols:
     ci - pk_cols.len()
 }
 
-/// Region index of the payload column named `name` (§6): the fixed regions,
+/// Region index of the payload column named `name`: the fixed regions,
 /// then the payload columns in schema order. Same leading-PK restriction as
 /// [`pay_index_in`].
 pub(crate) const fn payload_region_in(cols: &[WireSysCol], name: &str) -> usize {
@@ -220,7 +220,7 @@ pub const CIRCUIT_NODE_COLUMNS_COLS: &[WireSysCol] = &[
 // here, rather than derived again in each crate.
 //
 // `*_COL_*` index a full schema (`ZSetBatch::columns[..]` / a cursor read, PK
-// included); `*_PAY_*` index the payload region only (§6).
+// included); `*_PAY_*` index the payload region only.
 
 pub const SCHEMATAB_COL_NAME: usize = col_index_in(SCHEMA_TAB_COLS, "name");
 pub const SCHEMATAB_PAY_NAME: usize = pay_index_in(SCHEMA_TAB_COLS, "name");
@@ -528,7 +528,7 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
 
 /// Maximum number of columns (PK + payload) in any table or view schema.
 /// Capped at 65 by the row-major null bitmap: each row stores one u64 word
-/// with one bit per payload column (§6), so payload columns ≤ 64.
+/// with one bit per payload column, so payload columns ≤ 64.
 pub const MAX_COLUMNS: usize = 65;
 
 /// Sizing cap for the compound-PK column list.

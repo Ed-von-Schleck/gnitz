@@ -15,7 +15,7 @@ pub(super) mod worker;
 /// Run `f` under `catch_unwind`. On panic, returns
 /// `Err("internal server error (panic in <op>)")`. Otherwise the closure's
 /// `Result` is returned unchanged. Used in async handlers and the committer
-/// task where a panic must not propagate (per async-invariants V.4 / V.7).
+/// task where a panic must not propagate (async-invariants.md: panic isolation).
 pub(crate) fn guard_panic<T, F>(op: &'static str, f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String>,

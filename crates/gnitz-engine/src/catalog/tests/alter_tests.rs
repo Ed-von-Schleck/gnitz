@@ -3,7 +3,7 @@
 //! dir deletion), the post-image retraction contract (CAS, per-PK net,
 //! system-range rewrite guard) exercised with names longer than 12 bytes so the
 //! German-string blob heap is on the CAS path, and the id-only directory resume
-//! (§4) across a reopen. The end-to-end SQL surface is in
+//! across a reopen. The end-to-end SQL surface is in
 //! `crates/gnitz-sql/tests/planner_alter.rs`.
 
 use super::*;
@@ -101,7 +101,7 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── §4: id-only dirs resume after a rename + reopen ─────────────────────────
+// ── Id-only dirs resume after a rename + reopen ─────────────────────────────
 
 #[test]
 fn rename_then_reopen_resolves_flushed_data() {

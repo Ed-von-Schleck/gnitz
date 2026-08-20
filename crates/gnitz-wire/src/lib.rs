@@ -226,7 +226,7 @@ pub fn read_unsigned_exact(bytes: &[u8]) -> u64 {
 /// True iff payload null-bit `pi` is set in `word` (the column is NULL).
 ///
 /// The null word packs one bit per *payload* column: bit `pi` is the `pi`-th
-/// non-PK column in schema order (the §6 region convention, whose `REG_NULL_BMP`
+/// non-PK column in schema order (the region convention, whose `REG_NULL_BMP`
 /// index this crate already owns). These two accessors are the **one** read/write
 /// convention for the bitmap, shared by the client (`gnitz-core`), the evaluator
 /// (`gnitz-expr`) and the engine — it was previously spelled out in each.

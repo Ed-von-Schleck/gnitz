@@ -21,8 +21,8 @@
 
 use crate::{align8, checksum, read_u32_le, read_u64_le, write_u32_le, write_u64_le, WalError};
 
-/// The fixed regions that precede the payload columns in the region convention
-/// (§6), in order: PK, weight, null bitmap. Payload column `pi` lives at region
+/// The fixed regions that precede the payload columns in the region
+/// convention, in order: PK, weight, null bitmap. Payload column `pi` lives at region
 /// `REG_PAYLOAD_START + pi`, and a batch has `NUM_FIXED_REGIONS + num_payload + 1`
 /// regions in total (the trailing blob heap). One home for a layout the client,
 /// the wire codec, and the engine all encode — the engine's `storage` re-exports
