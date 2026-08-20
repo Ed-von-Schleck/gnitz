@@ -218,6 +218,9 @@ pub(crate) use unique_pk::enforce_unique_pk;
 #[cfg(test)]
 mod bench_flush;
 
+#[cfg(test)]
+mod bench_ingest;
+
 impl Table {
     /// Create a new table. The `RecoverySource` decides what the open does with
     /// whatever is already on disk.
