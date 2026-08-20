@@ -47,14 +47,14 @@ pub(crate) fn find_unique_column<'a>(
 /// issued.
 ///
 /// `catalog_kind` is `None` for a chain-minted CTE/derived-table segment id.
-/// Those ids are minted `1, 2, 3, …` per chain, so they alias real relation ids
-/// (`SCHEMA_TAB = 1`, `TABLE_TAB = 2`, … `FIRST_USER_TABLE_ID = 16`): asking the
-/// catalog for segment 1's indexes probes the system schema table, and at `>= 16`
-/// it would match a *foreign* user table's index column indices against this
-/// segment's schema by pure numeric coincidence — a bogus bound, and a wasted
-/// round-trip per segment. The field lives IN the entry so an alias that shadows
-/// an earlier resolution (`FROM (SELECT * FROM t) t` re-caching `t` as a minted
-/// segment) atomically replaces id and provenance together.
+/// A segment id is issued by the same never-reused monotonic counter as a real
+/// relation's, so it names nothing else — but the segment's catalog rows are not
+/// published until the whole chain is created at statement end, so a catalog
+/// probe for one fails outright (`relation N not found`) rather than merely
+/// wasting a round-trip. Every such probe is therefore gated on this field. It
+/// lives IN the entry so an alias that shadows an earlier resolution
+/// (`FROM (SELECT * FROM t) t` re-caching `t` as a minted segment) atomically
+/// replaces id and provenance together.
 struct CachedRelation {
     table_id: u64,
     schema: Arc<Schema>,
@@ -313,8 +313,8 @@ mod tests {
 
     /// The index-bound gate: a cached alias reports back the provenance it was
     /// cached with, keyed case-insensitively, and an unseen name resolves to
-    /// nothing. A chain-minted id aliases real relation ids, so treating it as
-    /// catalog-issued would bound a scan against a foreign table's index columns.
+    /// nothing. A chain-minted id has no catalog rows yet, so treating it as
+    /// catalog-issued would fail the index probe that bounds a scan.
     #[test]
     fn catalog_provenance_tracks_the_cache_alias_kind() {
         let schema = Arc::new(Schema {
@@ -343,8 +343,8 @@ mod tests {
 
         // Shadowing: a minted alias overwriting a catalog resolution must drop
         // the provenance with it — `FROM (SELECT * FROM t) t` re-caches `t` as a
-        // chain-minted segment, and a stale `Some(_)` here would probe a foreign
-        // table's indexes for the segment's bound.
+        // chain-minted segment, and a stale `Some(_)` here would probe the
+        // catalog for a segment whose rows are not published yet.
         b.cache_alias("real", (2, Arc::clone(&schema), None)).unwrap();
         assert_eq!(
             kind(&b, "real"),

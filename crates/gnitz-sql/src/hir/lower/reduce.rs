@@ -83,8 +83,8 @@ pub(crate) fn lower_reduce(
     ensure_cardinality_count(&source_schema.columns, &mut specs)?;
 
     // Reduce strategy (two-phase global / replicated / sharded). Gated on
-    // catalog provenance: chain-minted segment ids start at 1 and so alias the
-    // system families' ids, and a segment is never replicated anyway.
+    // catalog provenance: a chain-minted segment has no catalog rows yet, and a
+    // segment is never replicated anyway.
     let source_replicated = source.from_catalog && client.table_replicated(source_tid)?;
     let shape = ReduceShape::new(&source_schema, &group_positions, &specs, source_replicated);
     let out_key = shape.out_key;

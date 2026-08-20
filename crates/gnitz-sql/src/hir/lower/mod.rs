@@ -48,9 +48,8 @@ pub(crate) struct SegInput {
     pub schema: Arc<Schema>,
     pub layout: Vec<ColId>,
     /// Whether `tid` names a catalog relation rather than a chain-minted segment.
-    /// Every catalog probe (scan-bound index lookup, replication) is gated on it:
-    /// minted segment ids start at 1 and so alias real relation ids, and probing
-    /// one would describe whichever relation happens to hold that id.
+    /// Every catalog probe (scan-bound index lookup, replication) is gated on it;
+    /// see [`crate::bind::resolve::Resolved`] for why probing a segment id fails.
     pub from_catalog: bool,
 }
 

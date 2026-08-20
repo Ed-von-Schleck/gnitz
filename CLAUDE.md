@@ -331,9 +331,9 @@ it to the engine over `gnitz-wire`; the engine never links the planner.
 | `gnitz-wire` | Wire-protocol constants + codecs — the one definition client and engine must agree on | — |
 | `gnitz-expr` | The one expression evaluator, and the resolved column addressing it reads through | `wire` |
 | `gnitz-core` | Client core: connection, protocol, and the logical type / expression / circuit model | `wire`, `expr` |
-| `gnitz-sql` | SQL front end: parser, binder, query planner | `core` |
+| `gnitz-sql` | SQL front end: parser, binder, query planner | `core`, `expr`, `wire` |
 | `gnitz-capi` | C ABI bindings over the client core + planner | `core`, `sql` |
-| `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `sql` |
+| `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `sql`, `wire` |
 | `gnitz-engine` | The DBSP execution engine and `gnitz-server` binary | `wire`, `expr` |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests | — |
 
