@@ -189,9 +189,9 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
         new_batch.pks = src_pks;
     } else {
         // A subset / reordered / duplicated PK projection re-packs the region
-        // row by row. `get_tuple` reads any source variant into a uniform byte
-        // view (a duplicated lone PK — `SELECT pk, pk` — has a scalar source but
-        // a two-slot Bytes destination), and this path is cold: the common
+        // row by row. `get_bytes` borrows the row's key in place — a duplicated
+        // lone PK (`SELECT pk, pk`) has a scalar source but a two-slot Bytes
+        // destination, and both read the same way. This path is cold: the common
         // full-projection case took `pk_preserved` above.
 
         // Per-PK (col_off, stride) is invariant across rows — hoist.
@@ -211,9 +211,9 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
         // bytes out of the source tuple at that column's offset.
         new_batch.pks.buf.reserve(row_count * new_schema.pk_stride());
         for i in 0..row_count {
-            let row = src_pks.get_tuple(i);
+            let row = src_pks.get_bytes(i);
             for &(col_off, stride) in &pk_mappings {
-                new_batch.pks.buf.extend_from_slice(&row.buf[col_off..col_off + stride]);
+                new_batch.pks.buf.extend_from_slice(&row[col_off..col_off + stride]);
             }
         }
     }

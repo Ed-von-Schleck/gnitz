@@ -217,7 +217,7 @@ fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkCol
                     stride
                 )));
             }
-            t.buf[..stride].copy_from_slice(b);
+            t = gnitz_core::PkTuple::from_bytes(b);
         } else if let [ci] = schema.pk_indices() {
             write_pk_col_into(schema, &mut t, *ci, pk_val)?;
         } else {

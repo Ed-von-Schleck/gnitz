@@ -99,7 +99,7 @@ pub(crate) fn execute_statement(
         }
         Statement::Insert(insert) => {
             reject_unhonored_insert_clauses(insert, "INSERT")?;
-            dml::execute_insert(client, schema_name, insert, &mut binder)
+            dml::execute_insert(client, insert, &mut binder)
         }
         Statement::Query(query) => dml::execute_select(client, query, &mut binder),
         // Bare `DESC t` is `Statement::ExplainTable` — table introspection, a
@@ -119,11 +119,11 @@ pub(crate) fn execute_statement(
         }
         Statement::Update(update) => {
             reject_unhonored_update_clauses(update, "UPDATE")?;
-            dml::execute_update(client, schema_name, update, &mut binder)
+            dml::execute_update(client, update, &mut binder)
         }
         Statement::Delete(del) => {
             reject_unhonored_delete_clauses(del, "DELETE")?;
-            dml::execute_delete(client, schema_name, del, &mut binder)
+            dml::execute_delete(client, del, &mut binder)
         }
         Statement::AlterTable(a) => {
             reject_unhonored_alter_table_clauses(a, "ALTER TABLE")?;

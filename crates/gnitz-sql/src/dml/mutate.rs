@@ -207,6 +207,16 @@ pub(crate) fn resolve_set_target(
     Ok(col_idx)
 }
 
+/// [`build_merged_row`]'s row-invariant plan: each payload column's bitmap slot,
+/// physical index, definition and wire stride, resolved once per statement — the
+/// caller hoists it out of its row loop.
+pub(crate) fn merge_payload_plan(schema: &Schema) -> Vec<(usize, usize, &ColumnDef, usize)> {
+    schema
+        .payload_columns()
+        .map(|(pi, ci, def)| (pi, ci, def, def.type_code.wire_stride()))
+        .collect()
+}
+
 /// Build one merged Z-set row into `dst`: PK from `(pk_src, pk_idx)`; null-bitmap
 /// seed and carried (unassigned) columns from `(carry_src, carry_idx)`. For each
 /// payload column, `resolve(ci)` returns `Some(value)` to write that value (and
@@ -214,15 +224,16 @@ pub(crate) fn resolve_set_target(
 /// `carry_src`. Shared by UPDATE SET (pk_src == carry_src) and ON CONFLICT DO
 /// UPDATE (PK from the incoming row, carry/null-seed from the existing row).
 ///
-/// `payload` is `Schema::payload_columns` collected once by the caller: it
-/// re-scans `pk_cols` per column, which over a large matched set costs more than
-/// the merge itself — the same reason [`RowGather`] resolves its plan up front.
+/// `payload` is [`merge_payload_plan`] collected once by the caller: both the
+/// `pk_cols` re-scan and the per-column wire stride are row-invariant, and over
+/// a large matched set re-deriving them costs more than the merge itself — the
+/// same reason [`RowGather`] resolves its plan up front.
 pub(crate) fn build_merged_row<F>(
     pk_src: &ZSetBatch,
     pk_idx: usize,
     carry_src: &ZSetBatch,
     carry_idx: usize,
-    payload: &[(usize, usize, &ColumnDef)],
+    payload: &[(usize, usize, &ColumnDef, usize)],
     dst: &mut ZSetBatch,
     mut resolve: F,
 ) -> Result<(), GnitzSqlError>
@@ -234,7 +245,7 @@ where
     // Seed from the carry source's null word; each assignment flips only its own
     // payload bit (set on a NULL result, clear on non-NULL), unassigned bits ride.
     let mut null_bits = carry_src.nulls[carry_idx];
-    for &(payload_idx, ci, col_def) in payload {
+    for &(payload_idx, ci, col_def, stride) in payload {
         match resolve(ci) {
             Some(cv) => {
                 // The NULL a SET produces at *run* time — an explicit `= NULL`, or
@@ -245,10 +256,7 @@ where
                 null_word_set(&mut null_bits, payload_idx, is_null);
                 append_column_value(&mut dst.columns[ci], cv, col_def.type_code)?;
             }
-            None => {
-                let stride = col_def.type_code.wire_stride();
-                carry_src.columns[ci].push_row_from(carry_idx, stride, &mut dst.columns[ci]);
-            }
+            None => carry_src.columns[ci].push_row_from(carry_idx, stride, &mut dst.columns[ci]),
         }
     }
     dst.nulls.push(null_bits);
@@ -278,7 +286,7 @@ fn write_set_rows(
     // PK-region rebuild per row.
     let mut bufs = ViewBuffers::default();
     let view = bufs.view(current, schema);
-    let payload: Vec<_> = schema.payload_columns().collect();
+    let payload = merge_payload_plan(schema);
     for row_idx in 0..current.len() {
         build_merged_row(current, row_idx, current, row_idx, &payload, dst, |ci| {
             asn_by_col[ci].map(|p| eval_set_program(p, &view, row_idx))
@@ -362,7 +370,6 @@ fn resolve_where_matches(
 
 pub(crate) fn execute_update(
     client: &mut GnitzClient,
-    _schema_name: &str,
     update: &sqlparser::ast::Update,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
@@ -425,7 +432,6 @@ pub(crate) fn execute_update(
 
 pub(crate) fn execute_delete(
     client: &mut GnitzClient,
-    _schema_name: &str,
     del: &sqlparser::ast::Delete,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
@@ -656,7 +662,7 @@ mod tests {
 
         // Resolver: assign v = NULL (must SET its null bit); leave b unassigned (carry).
         let mut dst = ZSetBatch::new(&schema);
-        let payload: Vec<_> = schema.payload_columns().collect();
+        let payload = merge_payload_plan(&schema);
         build_merged_row(&pk_src, 0, &carry_src, 0, &payload, &mut dst, |ci| {
             if ci == 1 {
                 Some(ColumnValue::Null)

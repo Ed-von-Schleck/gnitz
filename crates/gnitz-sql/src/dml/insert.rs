@@ -8,7 +8,9 @@ use crate::ast_util::{extract_name, object_name_ident};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::codec::pk_codec::{extract_pk_value_mapped, is_null_expr};
-use crate::dml::mutate::{build_merged_row, classify_set_rhs, eval_set_program, resolve_set_target, SetProgram};
+use crate::dml::mutate::{
+    build_merged_row, classify_set_rhs, eval_set_program, merge_payload_plan, resolve_set_target, SetProgram,
+};
 use crate::dml::overlay::effective_rows;
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
@@ -99,7 +101,6 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
 
 pub(crate) fn execute_insert(
     client: &mut GnitzClient,
-    _schema_name: &str,
     insert: &Insert,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
@@ -200,7 +201,7 @@ pub(crate) fn execute_insert(
     let stride = schema.pk_stride() as u8;
     // Built once: `payload_columns` filters on `is_pk_col`, itself a PK-list scan,
     // so leaving it in the row loop pays that scan per row per column.
-    let payload: Vec<_> = schema.payload_columns().collect();
+    let payload = merge_payload_plan(&schema);
     // The row count is known here, so the whole statement's ids come from one
     // durable advance rather than one per 64 rows.
     if is_serial {
@@ -243,7 +244,7 @@ pub(crate) fn execute_insert(
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
-        for &(payload_idx, ci, col_def) in &payload {
+        for &(payload_idx, ci, col_def, _) in &payload {
             if col_def.is_hidden {
                 // Logical-dropped column: a zero-filled NOT-NULL filler cell (null
                 // bit left unset), keeping the batch rectangular and the table on
@@ -418,7 +419,7 @@ fn client_side_filter_do_nothing(
     // does not; an untouched PK falls through to the committed store.
     let (_, existing) = effective_rows(client, tid, schema, &keys)?;
 
-    let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::new();
+    let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::with_capacity(keys.len());
     let mut surviving_indices: Vec<usize> = Vec::with_capacity(batch.pks.len());
     for (i, pk) in keys.iter().enumerate() {
         // Intra-batch duplicate: drop everything after the first.
@@ -469,7 +470,7 @@ fn client_side_merge_do_update(
     // and an untouched PK falls through to the committed store.
     let (rows, existing) = effective_rows(client, tid, schema, &keys)?;
 
-    let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::new();
+    let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::with_capacity(keys.len());
     let mut out = ZSetBatch::with_capacity(schema, batch.pks.len());
     let gather = RowGather::new(schema);
 
@@ -480,7 +481,7 @@ fn client_side_merge_do_update(
     let mut bufs_existing = ViewBuffers::default();
     let excluded_view = bufs_excluded.view(batch, schema);
     let existing_view = bufs_existing.view(&rows, schema);
-    let payload: Vec<_> = schema.payload_columns().collect();
+    let payload = merge_payload_plan(schema);
 
     for (i, pk) in keys.iter().enumerate() {
         if !seen_pks.insert(*pk) {
