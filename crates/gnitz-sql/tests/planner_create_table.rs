@@ -1225,3 +1225,51 @@ fn inline_unique_over_the_index_arity_limit_is_rejected_before_dispatch() {
         e => panic!("expected Unsupported, got {e:?}"),
     }
 }
+
+/// The `__fk_` infix is reserved for internal FK-backing index names, which
+/// `drop_index` identifies by substring. A user identifier carrying it is a trap:
+/// the auto index name interpolates it (`{schema}__{table}__idx_{cols}`) and the
+/// resulting index is undroppable by planner and engine alike. The contract is
+/// enforced on every user identifier, not just an explicit index name.
+#[test]
+fn fk_infix_is_rejected_in_every_user_identifier() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    for sql in [
+        "CREATE TABLE a__fk_b (id BIGINT PRIMARY KEY, x BIGINT)",
+        "CREATE TABLE ok1 (id BIGINT PRIMARY KEY, a__fk_b BIGINT)",
+        "CREATE VIEW v__fk_w AS SELECT 1",
+        // Mixed case: names are canonicalized at store time, so the guard must
+        // read the lowercase form or `x__FK_y` lands as the reserved `x__fk_y`.
+        "CREATE TABLE a__FK_b (id BIGINT PRIMARY KEY, x BIGINT)",
+    ] {
+        let e = try_exec(&mut client, &sn, sql).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("__fk_"),
+            "`{sql}` must be rejected for the reserved infix, got {e:?}"
+        );
+    }
+    // The ALTER surfaces mint column names too.
+    exec(&mut client, &sn, "CREATE TABLE alt (id BIGINT PRIMARY KEY, a BIGINT)");
+    for sql in [
+        "ALTER TABLE alt ADD COLUMN c__fk_d BIGINT",
+        "ALTER TABLE alt RENAME COLUMN a TO c__fk_d",
+    ] {
+        let e = try_exec(&mut client, &sn, sql).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("__fk_"),
+            "`{sql}` must be rejected for the reserved infix, got {e:?}"
+        );
+    }
+    // Names that merely resemble it stay legal.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE fkb (id BIGINT PRIMARY KEY, fk_x BIGINT, x_fk BIGINT)",
+    );
+    exec(&mut client, &sn, "CREATE INDEX ON fkb (x_fk)");
+    exec(&mut client, &sn, &format!("DROP INDEX {sn}__fkb__idx_x_fk"));
+}

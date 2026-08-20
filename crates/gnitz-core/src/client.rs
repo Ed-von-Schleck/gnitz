@@ -906,6 +906,13 @@ impl GnitzClient {
         for spec in unique_indexes {
             crate::validate_user_identifier(spec.name).map_err(ClientError::ServerError)?;
         }
+        // Column names take the reserved-infix half of the rule only: an index
+        // name is interpolated from them, so a `__fk_` column would back an
+        // undroppable index. This is the only enforcement point — the SQL planner
+        // validates relation names, never column ones.
+        for c in columns {
+            crate::reject_reserved_infix(&c.name).map_err(ClientError::ServerError)?;
+        }
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
         // Full schema-admissibility rule set (column cap + PK rules), applied
@@ -1331,6 +1338,7 @@ impl GnitzClient {
         old_col: &str,
         new_col: &str,
     ) -> Result<(), ClientError> {
+        crate::reject_reserved_infix(new_col).map_err(ClientError::ServerError)?;
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
         // One resolve yields the tid and the schema together. `alter_col_pair`
@@ -1383,6 +1391,7 @@ impl GnitzClient {
     /// precheck does not scan COL_TAB for names — a duplicate would otherwise
     /// reach storage and only surface later as "column reference is ambiguous".
     pub fn alter_add_column(&mut self, tid: u64, def: &ColumnDef) -> Result<(), ClientError> {
+        crate::reject_reserved_infix(&def.name).map_err(ClientError::ServerError)?;
         let desc = self.descriptor_by_tid(tid)?;
         if desc.schema.visible_column_named(&def.name).is_some() {
             return Err(ClientError::ServerError(format!(

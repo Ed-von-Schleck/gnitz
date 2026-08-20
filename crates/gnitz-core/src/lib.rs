@@ -28,7 +28,8 @@ pub use gnitz_wire::{RelClass, TableProps};
 // and reads batch cells through the latter, without depending on that crate.
 pub use gnitz_expr::{CmpOp, ColumnLocator, ExprBuilder, ExprProgram, SchemaFacts, StrOp};
 pub use gnitz_wire::{
-    index_key_types, validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, FK_INDEX_INFIX,
+    index_key_types, reject_reserved_infix, validate_dist_prefix, validate_user_identifier, Cut, PkColList,
+    RangeDescriptor, FK_INDEX_INFIX,
 };
 pub use protocol::{
     encode_message_parts, null_word_get, null_word_set, wire_flags_get_schema_version, wire_flags_set_conflict_mode,

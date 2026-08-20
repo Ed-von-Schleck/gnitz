@@ -503,8 +503,32 @@ fn is_valid_ident_char(ch: u8) -> bool {
     ch.is_ascii_alphanumeric() || ch == b'_'
 }
 
+/// Reject a name carrying the reserved [`FK_INDEX_INFIX`].
+///
+/// The rule binds every name an index name is interpolated from
+/// (`{schema}__{table}__idx_{cols}`), not just the index names typed at the
+/// CREATE INDEX surface: `drop_index` identifies an internal FK index by plain
+/// substring, so a table or column carrying `__fk_` yields an index no one can
+/// drop. Matched against the **canonical (lowercase) form**, because the client
+/// canonicalizes at store time — a mixed-case `x__FK_y` would otherwise pass
+/// here yet be stored as the reserved `x__fk_y`.
+///
+/// Split from [`validate_user_identifier`] because a *column* name is bound by
+/// this rule alone: the leading-`_` reservation guards relation names (the
+/// hidden view prefix), and a user column may legitimately start with `_`.
+pub fn reject_reserved_infix(name: &str) -> Result<(), String> {
+    if name.to_ascii_lowercase().contains(FK_INDEX_INFIX) {
+        return Err(format!(
+            "Names cannot contain the reserved '{FK_INDEX_INFIX}' infix: {name}"
+        ));
+    }
+    Ok(())
+}
+
 /// Reject empty names, names starting with `_` (reserved for the system prefix),
-/// and names with characters outside `[A-Za-z0-9_]`.
+/// names with characters outside `[A-Za-z0-9_]`, and — via
+/// [`reject_reserved_infix`] — names carrying [`FK_INDEX_INFIX`]. The rule for a
+/// relation or index name; a column name takes the infix half only.
 pub fn validate_user_identifier(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Identifier cannot be empty".into());
@@ -519,7 +543,7 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
             return Err(format!("Identifier contains invalid characters: {name}"));
         }
     }
-    Ok(())
+    reject_reserved_infix(name)
 }
 
 // ---------------------------------------------------------------------------
