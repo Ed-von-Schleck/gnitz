@@ -449,9 +449,9 @@ impl GnitzClient {
     /// by UPDATE / DELETE / INSERT ... ON CONFLICT, which read `table_id` before
     /// writing. A blind INSERT uses plain `push_with_mode` and records nothing (a
     /// blind write cannot lose an update). No-op outside a transaction.
-    pub fn txn_push_rmw(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch, mode: WireConflictMode) {
+    pub fn txn_push_rmw(&mut self, table_id: u64, schema: &Schema, batch: ZSetBatch, mode: WireConflictMode) {
         if let Some(txn) = &mut self.txn {
-            txn.push_with_mode(table_id, schema, batch, mode);
+            txn.append(table_id, schema, batch, mode);
             txn.record_read(table_id);
         }
     }
@@ -685,9 +685,15 @@ impl GnitzClient {
     }
 
     /// Delete `pks` from `table_id` (retraction rows). Buffered like any other
-    /// write while a transaction is open.
+    /// write while a transaction is open — through `TxnBuffer::delete`, which
+    /// takes the batch by value: routing it through `push_with_mode` instead
+    /// would deep-clone a batch this call owns and drops.
     pub fn delete(&mut self, table_id: u64, schema: &Schema, pks: PkColumn) -> Result<(), ClientError> {
         if pks.is_empty() {
+            return Ok(());
+        }
+        if let Some(txn) = &mut self.txn {
+            txn.delete(table_id, schema, pks);
             return Ok(());
         }
         let batch = retraction_batch(schema, pks);

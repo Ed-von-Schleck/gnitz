@@ -59,7 +59,7 @@ where
     if client.txn_active() {
         let RmwBuild { count, write } = build(client)?;
         if let Some(w) = write {
-            client.txn_push_rmw(tid, schema, &w.batch, w.mode);
+            client.txn_push_rmw(tid, schema, w.batch, w.mode);
         }
         return Ok(count);
     }
