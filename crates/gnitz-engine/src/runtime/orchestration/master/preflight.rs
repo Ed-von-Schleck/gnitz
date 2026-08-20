@@ -1,7 +1,7 @@
 //! Distributed PK / FK / unique-index preflight validation and violation
 //! formatting: the check types (`PipelinedCheck` / `CheckPayload`), the
-//! pipelined executors (`execute_pipeline` / `execute_gather` + `GatherMap`
-//! and the check-batch builders/pool), the gather/merge key streams
+//! pipelined executors (`execute_pipeline` / `execute_gather` and the
+//! check-batch builders/pool), the gather/merge key streams
 //! (`PreflightKeyStream` / `PreflightAccumulator` / `merge_index_scan`), and
 //! the error renderers.
 //!
@@ -60,46 +60,6 @@ impl PipelinedCheck {
 
 /// `(target_id, packed key columns)` — see [`PipelinedCheck::pool_slot`].
 pub(super) type PoolSlot = (i64, u64);
-
-/// `pk → projected committed values` result of `execute_gather`. Rows
-/// live in one flat arena, `stride` values each, instead of one heap `Vec`
-/// per row — a large UPDATE/DELETE validation gathers tens of thousands of
-/// rows, and per-row allocations would dominate the merge.
-#[derive(Default)]
-pub(super) struct GatherMap {
-    stride: usize,
-    index: FxHashMap<PkBuf, u32>,
-    vals: Vec<Option<u128>>,
-}
-
-impl GatherMap {
-    fn new(stride: usize) -> Self {
-        GatherMap {
-            stride,
-            ..Default::default()
-        }
-    }
-
-    fn push_row(&mut self, pk: PkBuf, row: impl Iterator<Item = Option<u128>>) {
-        let idx = (self.vals.len() / self.stride) as u32;
-        self.vals.extend(row);
-        debug_assert!(
-            self.vals.len() == (idx as usize + 1) * self.stride,
-            "gather row arity must equal the projection stride"
-        );
-        self.index.insert(pk, idx);
-    }
-
-    /// The projected values for `pk`'s committed row, aligned to the gather's
-    /// `project` list; `None` when the committed row is absent. Zero-copy
-    /// lookup via `Borrow<[u8]>`.
-    fn get(&self, pk: &[u8]) -> Option<&[Option<u128>]> {
-        self.index.get(pk).map(|&i| {
-            let start = i as usize * self.stride;
-            &self.vals[start..start + self.stride]
-        })
-    }
-}
 
 /// Render a PK from its raw OPK byte form for error messages.
 /// Compound PKs are formatted as comma-separated per-column values in
@@ -567,12 +527,6 @@ fn pk_fold(batch: &Batch) -> FxHashMap<&[u8], PkFold> {
     fold
 }
 
-fn schema_of(disp: &MasterDispatcher, tid: i64) -> Result<SchemaDescriptor, String> {
-    disp.cat()
-        .get_schema_desc(tid)
-        .ok_or_else(|| format!("no schema for table {tid}"))
-}
-
 /// The verb for the RESTRICT rejection on referenced value `v`: how the bundled
 /// parent write removed it. Both removals are a "cannot do this to the row"
 /// rejection, so anything but a surviving row holding a new value reads as a
@@ -632,7 +586,7 @@ impl<'a> TxnBundle<'a> {
         let mut schemas = FxHashMap::default();
         let mut overlays = FxHashMap::default();
         for &tid in &order {
-            schemas.insert(tid, schema_of(disp, tid)?);
+            schemas.insert(tid, disp.cat().schema_or_err(tid, "txn bundle")?);
             if !reads_overlay(disp, tid) {
                 continue;
             }
@@ -1134,7 +1088,7 @@ impl MasterDispatcher {
             // PK fast-path only when the referenced column *is* the parent's lone
             // PK; otherwise probe the parent's UNIQUE index by broadcast, since
             // index entries are distributed independently of the PK.
-            let parent_schema = schema_of(disp, parent_tid)?;
+            let parent_schema = disp.cat().schema_or_err(parent_tid, "fk parent")?;
             let ppk = parent_schema.pk_indices();
             let src_type = loc.type_code();
             let (probe_schema, col_hint, broadcast) = if ppk.len() == 1 && ppk[0] as usize == parent_col {
@@ -1171,10 +1125,10 @@ impl MasterDispatcher {
 
         // A non-bundled parent has no delta (the degenerate plain-push case).
         let no_delta: ParentDelta = (FxHashMap::default(), FxHashSet::default());
-        for (i, plan) in plans.iter().enumerate() {
+        for (plan, probed) in plans.iter().zip(&results) {
             let (retired, added) = deltas.get(&plan.edge.delta_key()).unwrap_or(&no_delta);
             for v in &plan.values {
-                let in_committed = plan.probed_present(&results[i], *v);
+                let in_committed = plan.probed_present(probed, *v);
                 if (in_committed && !retired.contains_key(v)) || added.contains(v) {
                     continue;
                 }
@@ -1239,9 +1193,9 @@ impl MasterDispatcher {
         // which needs the child rows themselves. Collect those fetches first, then
         // fan them out.
         let mut fetches: Vec<(usize, u128)> = Vec::new();
-        for (i, plan) in plans.iter().enumerate() {
+        for (i, (plan, probed)) in plans.iter().zip(&results).enumerate() {
             for v in &plan.values {
-                if !plan.probed_present(&results[i], *v) {
+                if !plan.probed_present(probed, *v) {
                     continue; // no committed children reference v
                 }
                 if !b.has(plan.edge.child_tid) {
@@ -1355,9 +1309,9 @@ impl MasterDispatcher {
         } else {
             let pks: Vec<PkBuf> = touched().map(PkBuf::from_bytes).collect();
             if !pks.is_empty() {
-                let gathered = Self::execute_gather(disp, reactor, sal_excl, parent_tid, pks, &[ref_col as u8]).await?;
+                let gathered = Self::execute_gather(disp, reactor, sal_excl, parent_tid, pks, ref_col as u8).await?;
                 for p in touched() {
-                    if let Some(Some(v)) = gathered.get(p).map(|row| row[0]) {
+                    if let Some(&v) = gathered.get(p) {
                         old_of.insert(p, v);
                     }
                 }
@@ -1604,11 +1558,11 @@ impl MasterDispatcher {
     /// Batched stored-row gather. Scatters `pks` to their owning workers (one
     /// group, partitioned by the parent PK columns so each worker only reads
     /// rows it stores), each worker reads the committed rows for its PKs and
-    /// replies with them projected to `project` (the referenced parent column
-    /// indices). Returns a `pk → projected values` map: each value is the
-    /// promoted index key, or `None` for a NULL referenced value; PKs whose
-    /// committed row is absent are omitted entirely. Each row's values are
-    /// aligned to `project`.
+    /// replies with them projected to `ref_col` (the referenced parent column
+    /// index). Returns a `pk → promoted index key` map. A PK is absent from it
+    /// when its committed row is absent OR when that row holds NULL in
+    /// `ref_col` — the caller indexes referenced values, and a NULL one is
+    /// unindexed either way.
     ///
     /// This is the `O(num_workers)`-round-trip replacement for the per-row
     /// serial single-key seek loop used by FK RESTRICT on non-PK UNIQUE
@@ -1629,32 +1583,28 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
         mut pks: Vec<PkBuf>,
-        project: &[u8],
-    ) -> Result<GatherMap, String> {
+        ref_col: u8,
+    ) -> Result<FxHashMap<PkBuf, u128>, String> {
         if pks.is_empty() {
-            return Ok(GatherMap::default());
+            return Ok(FxHashMap::default());
         }
         // Sort so each worker's sublist reaches `gather_family` ascending:
         // `removed`/updated PKs are extracted from an FxHashMap (arbitrary
         // order) and `scatter_wire_group` preserves per-worker relative order,
         // so a globally sorted input yields per-worker-sorted sublists.
         pks.sort_unstable();
-        let col_mask = pack_gather_cols(project).ok_or("gather: more than 8 projected columns")?;
 
-        let parent_schema = disp
-            .cat()
-            .get_schema_desc(target_id)
-            .ok_or_else(|| format!("gather: no schema for table {target_id}"))?;
+        let parent_schema = disp.cat().schema_or_err(target_id, "gather")?;
         // The exact constructor the worker uses for its reply schema, so a
         // matching reply validates by construction.
-        let expected = crate::schema::project_schema(&parent_schema, project);
+        let expected = crate::schema::project_schema(&parent_schema, &[ref_col]);
 
         // `_lease` held across the full drain below (see `dispatch_scan_fanout`).
         let (slots, req_ids, _lease) =
             dispatch_scan_fanout(disp, reactor, sal_excl, Fanout::Broadcast, |disp, rids, _unicast| {
                 let pooled = disp.pool_pop_batch((target_id, 0));
                 let batch = build_check_batch_pk_bytes(&parent_schema, pks.iter().map(|p| p.pk_bytes()), pooled);
-                disp.write_scatter_group(&batch, &parent_schema, target_id, FLAG_GATHER, col_mask, rids)?;
+                disp.write_scatter_group(&batch, &parent_schema, target_id, FLAG_GATHER, ref_col as u64, rids)?;
                 // The scatter batch is fully consumed by the synchronous
                 // scatter_wire_group above; return it to the pool.
                 recycle_check_batch(disp, (target_id, 0), batch);
@@ -1662,37 +1612,23 @@ impl MasterDispatcher {
             })
             .await?;
 
-        // Precompute (type_code, col_size) per projected column from the parent
-        // schema; the reply's projected payload index k corresponds to project[k].
-        let proj_meta: Vec<(u8, usize)> = project
-            .iter()
-            .map(|&p| {
-                let col = parent_schema.columns[p as usize];
-                (col.type_code, col.size() as usize)
-            })
-            .collect();
+        // The reply projects `ref_col` to payload column 0; read its type and
+        // width off the parent schema once.
+        let col = parent_schema.columns[ref_col as usize];
+        let (col_type, col_size) = (col.type_code, col.size() as usize);
 
-        let mut out = GatherMap::new(proj_meta.len());
+        let mut out: FxHashMap<PkBuf, u128> = FxHashMap::default();
         drain_index_scan(slots, &req_ids, reactor, "gather", &expected, |b, _| {
-            // The column slices are invariant across a frame's rows; derive
-            // each once per frame instead of once per (row × column). The
-            // arity is hard-capped by `pack_gather_cols` (one u8 per u64 byte).
-            let mut col_slices: [&[u8]; 8] = [&[]; 8];
-            for (k, &(_, col_size)) in proj_meta.iter().enumerate() {
-                col_slices[k] = b.col_data(k, col_size);
-            }
+            // The column slice is invariant across a frame's rows; derive it
+            // once per frame rather than once per row.
+            let col_data = b.col_data(0, col_size);
             for j in 0..b.count {
-                let null_word = b.get_null_word(j);
-                out.push_row(
-                    PkBuf::from_bytes(b.get_pk_bytes(j)),
-                    proj_meta.iter().enumerate().map(|(k, &(col_type, col_size))| {
-                        if gnitz_wire::null_word_get(null_word, k) {
-                            None
-                        } else {
-                            Some(payload_native_key(col_slices[k], j * col_size, col_size, col_type))
-                        }
-                    }),
-                );
+                if !gnitz_wire::null_word_get(b.get_null_word(j), 0) {
+                    out.insert(
+                        PkBuf::from_bytes(b.get_pk_bytes(j)),
+                        payload_native_key(col_data, j * col_size, col_size, col_type),
+                    );
+                }
             }
             Ok(())
         })

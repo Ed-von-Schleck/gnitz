@@ -866,7 +866,7 @@ fn test_group_footprint_direct_equals_emitted_bytes() {
         seek_pk: 7,
         seek_col_idx: 1,
         req_ids: &req_ids,
-        unicast_worker: -1,
+        unicast_worker: None,
         client_id: 0,
         prebuilt_schema_block: None,
         seek_pk_extra: &[],

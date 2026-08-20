@@ -76,8 +76,8 @@ pub(crate) struct DirectGroup<'a> {
     pub seek_pk: u128,
     pub seek_col_idx: u64,
     pub req_ids: &'a [u64],
-    /// `>= 0` restricts the group to that one worker's slot; `-1` fills all.
-    pub unicast_worker: i32,
+    /// `Some(w)` restricts the group to worker `w`'s slot; `None` fills all.
+    pub unicast_worker: Option<usize>,
     pub client_id: u64,
     pub prebuilt_schema_block: Option<&'a [u8]>,
     pub seek_pk_extra: &'a [u8],
@@ -105,7 +105,7 @@ impl<'a> DirectGroup<'a> {
     fn slot_sizes(&self, nw: usize) -> [u32; MAX_WORKERS] {
         let mut sizes = [0u32; MAX_WORKERS];
         for (w, size) in sizes.iter_mut().enumerate().take(nw) {
-            if self.unicast_worker >= 0 && w != self.unicast_worker as usize {
+            if self.unicast_worker.is_some_and(|u| w != u) {
                 continue;
             }
             *size = self.msg(w).size() as u32;
@@ -257,10 +257,10 @@ pub const FLAG_FLUSH_EPH: u32 = 1 << 19;
 pub const FLAG_TXN_COMMIT: u32 = gnitz_wire::FLAG_TXN_COMMIT as u32;
 /// Batched stored-row gather: scatter a set of PKs to their owning workers,
 /// each worker reads the committed rows for the PKs it owns and replies with
-/// the rows projected to the columns named in the control block's
-/// `seek_col_idx` mask (see `pack_gather_cols`). Distinct from `FLAG_SEEK`
-/// (single key) and `FLAG_HAS_PK` (existence echo of the caller's payload);
-/// the gather returns the *stored* value of columns the caller does not have.
+/// the rows projected to the single column index carried in the control
+/// block's `seek_col_idx`. Distinct from `FLAG_SEEK` (single key) and
+/// `FLAG_HAS_PK` (existence echo of the caller's payload); the gather returns
+/// the *stored* value of a column the caller does not have.
 pub const FLAG_GATHER: u32 = 65536;
 /// CREATE UNIQUE INDEX global pre-flight: each worker projects its committed
 /// partition of `target_id` to the OPK leading-key spans of the column list
@@ -342,31 +342,6 @@ pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_prom
     let cols = &idx_schema.columns[..n_promoted];
     let pks: Vec<u32> = (0..n_promoted as u32).collect();
     SchemaDescriptor::new(cols, &pks)
-}
-
-/// Pack up to 8 projected column indices into the gather control block's
-/// `seek_col_idx`. Each index is stored as `col_idx + 1` in one byte (valid
-/// because MAX_COLUMNS = 65 ≤ 255); a zero byte terminates the list and
-/// keeps column index 0 representable. Returns `None` if more than 8 distinct
-/// columns must be projected (caller falls back to a wider gather).
-pub(crate) fn pack_gather_cols(cols: &[u8]) -> Option<u64> {
-    if cols.len() > 8 {
-        return None;
-    }
-    let mut packed = 0u64;
-    for (i, &c) in cols.iter().enumerate() {
-        debug_assert!((c as usize) < crate::schema::MAX_COLUMNS);
-        packed |= ((c as u64) + 1) << (8 * i);
-    }
-    Some(packed)
-}
-
-/// Inverse of `pack_gather_cols`: yields the projected column indices.
-pub(crate) fn unpack_gather_cols(packed: u64) -> impl Iterator<Item = u8> {
-    (0..8)
-        .map(move |i| ((packed >> (8 * i)) & 0xff) as u8)
-        .take_while(|&b| b != 0)
-        .map(|b| b - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,7 +1159,7 @@ impl SalWriter {
                     seek_pk: 0,
                     seek_col_idx,
                     req_ids,
-                    unicast_worker: -1,
+                    unicast_worker: None,
                     client_id: 0,
                     prebuilt_schema_block,
                     seek_pk_extra: &[],

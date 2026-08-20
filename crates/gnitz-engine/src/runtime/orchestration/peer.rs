@@ -79,7 +79,7 @@ impl Peer {
     /// `published_lsn` (the durability watermark at connect). The ACK's contents
     /// (status, advertised server frame limit) are protocol policy decided once
     /// here, for every transport. `published_lsn` is a runtime value, so the frame
-    /// is no longer a compile-time `const` shipped by a zero-copy `'static` send:
+    /// cannot be a compile-time `const` shipped by a zero-copy `'static` send:
     /// it is copied into a pooled send buffer and dispatched through the shared
     /// `send_buffer` path (per-connection, so the extra copy is off any hot path).
     pub async fn send_hello_ack(&self, published_lsn: u64) -> i32 {

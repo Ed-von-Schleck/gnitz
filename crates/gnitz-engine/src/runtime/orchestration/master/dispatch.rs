@@ -190,7 +190,10 @@ impl MasterDispatcher {
                 seek_pk,
                 seek_col_idx,
                 req_ids,
-                unicast_worker: unicast_worker.sal_slot(),
+                unicast_worker: match unicast_worker {
+                    Fanout::Broadcast => None,
+                    Fanout::One(w) => Some(w),
+                },
                 client_id,
                 prebuilt_schema_block: None,
                 seek_pk_extra,
@@ -224,7 +227,7 @@ impl MasterDispatcher {
             seek_pk,
             seek_col_idx,
             req_ids,
-            unicast_worker: Fanout::Broadcast.sal_slot(),
+            unicast_worker: None,
             client_id: 0,
             prebuilt_schema_block: None,
             seek_pk_extra: &[],
@@ -1064,14 +1067,11 @@ impl MasterDispatcher {
         Ok(acc)
     }
 
-    /// Fan out a SCAN — to all workers (`unicast == -1`), or to ONE worker for a
-    /// **replicated** relation, whose full copy lives on every worker (an
-    /// all-worker fan-out would concatenate W identical copies; worker 0 always
-    /// exists and every replicated child is a copy of every other, so it holds
-    /// the full copy). Forwards every response frame
-    /// directly to the client, continuation chunks included, and returns
-    /// `Ok(true)` when all drained trains finish, `Ok(false)` if the client
-    /// disconnects mid-stream, `Err` on a worker error.
+    /// Fan out a SCAN to the workers `unicast` names — [`Fanout`] states what
+    /// each shape costs. Forwards every response frame directly to the client, continuation
+    /// chunks included, and returns `Ok(true)` when all drained trains finish,
+    /// `Ok(false)` if the client disconnects mid-stream, `Err` on a worker
+    /// error.
     ///
     /// `sal_flags`/`wire_flags`/`seek_pk_extra` select the read shape, as
     /// `write_scan_group` documents: a plain scan passes the client's schema
@@ -1079,7 +1079,9 @@ impl MasterDispatcher {
     /// block; a ScanSpec read passes `FLAG_SCAN_SPEC` and the client's verbatim
     /// spec blob, and negotiates no version (its reply carries no schema block —
     /// the client decodes against the schema it authored). `unicast` comes from
-    /// [`replicated_unicast`] or [`scan_spec_route`].
+    /// [`replicated_unicast`] or [`scan_spec_route`], which own the routing
+    /// policy (replicated relations to worker 0, confinable ranges to their
+    /// owner).
     ///
     /// `forward_scan_slots` returns on the FIRST worker fault, decode error, or
     /// client disconnect: `_lease` drops on return and `route_scan_slot` discards

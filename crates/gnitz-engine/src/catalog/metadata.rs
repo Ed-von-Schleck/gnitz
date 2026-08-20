@@ -37,6 +37,17 @@ impl CatalogEngine {
         Some((ic.col_indices, ic.is_unique))
     }
 
+    /// Reject a column list that is malformed or names a column outside
+    /// `table_id`'s schema. The one admission test for every frame carrying a
+    /// `pack_pk_cols` word: the master applies it as an early client-facing
+    /// reject, the worker as its trust boundary, and both render the same error.
+    pub fn validate_index_cols(&self, table_id: i64, cols: &PkColList, op: &str) -> Result<(), String> {
+        match self.get_schema_desc(table_id) {
+            Some(s) if s.cols_in_range(cols) => Ok(()),
+            _ => Err(format!("{op}: invalid column list for table {table_id}")),
+        }
+    }
+
     /// The secondary index circuit on `cols` of `table_id`, if one exists. The
     /// SEEK_BY_INDEX handler matches the `Option` once — `None` answers
     /// STATUS_NO_INDEX (so the SQL planner falls back to a scan or a CREATE INDEX
@@ -226,5 +237,14 @@ impl CatalogEngine {
         let (sn, tn) = self.qualified_name_or_unknown(parent_tid);
         let (csn, ctn) = self.qualified_name_or_unknown(child_tid);
         format!("Foreign Key violation: cannot {verb} '{sn}.{tn}', row still referenced by '{csn}.{ctn}'")
+    }
+
+    /// `table_id`'s schema, or the one "the catalog has no schema for a table a
+    /// live request names" error. Every caller is a fail-stop — reaching it
+    /// means the catalog diverged from the request that named the table — so
+    /// `op` labels which path observed the divergence.
+    pub(crate) fn schema_or_err(&self, table_id: i64, op: &str) -> Result<SchemaDescriptor, String> {
+        self.get_schema_desc(table_id)
+            .ok_or_else(|| format!("{op}: no schema for table {table_id}"))
     }
 }

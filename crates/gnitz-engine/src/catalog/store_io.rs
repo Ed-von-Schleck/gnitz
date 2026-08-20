@@ -210,9 +210,10 @@ impl CatalogEngine {
     /// Batched point lookup for the FK parent probe. Seek each PK in `pks`
     /// (verbatim OPK bytes) in this worker's store, appending the stored row at
     /// weight 1 for every present, live key into a result batch projected to
-    /// `project` (parent column indices, all non-PK scalar). Absent / retracted
+    /// `ref_col` (a parent column index, non-PK and scalar). Absent / retracted
     /// keys contribute nothing, and passing `pks` ascending keeps the cursor's
-    /// probes monotonic.
+    /// probes monotonic. The projected schema is returned alongside the batch —
+    /// it is synthetic, so the caller cannot look it up from the catalog.
     ///
     /// Each PK resolves to its group's FIRST live row, which is also its only
     /// one: `validate_fk_column` admits only a base table as an FK parent, and a
@@ -224,35 +225,29 @@ impl CatalogEngine {
         &mut self,
         table_id: i64,
         pks: impl ExactSizeIterator<Item = &'k [u8]>,
-        project: &[u8],
-    ) -> Result<Batch, String> {
+        ref_col: u8,
+    ) -> Result<(Batch, SchemaDescriptor), String> {
         let entry = self.table_entry(table_id)?;
         let schema = entry.schema;
-        let result_schema = project_schema(&schema, project);
-        // Resolve the fixed projection once — `(col_idx, payload_slot, size)`
-        // per projected column — instead of re-deriving payload index and
-        // column size per row per column inside the seek loop. The projection
-        // is master-built and excludes PK columns (the FK rules gather only a
+        let result_schema = project_schema(&schema, &[ref_col]);
+        // Resolve the projection once — payload slot and column size — instead
+        // of re-deriving both per row inside the seek loop. The column is
+        // master-picked and is never a PK column (the FK rules gather only a
         // non-PK referenced column; `project_schema` asserts it one frame up),
-        // so every projected column has a payload slot.
-        let proj: Vec<(usize, usize, usize)> = project
-            .iter()
-            .map(|&p| {
-                let ci = p as usize;
-                let pi = schema.try_payload_idx(ci).expect("FK projection excludes PK columns");
-                (ci, pi, schema.columns[ci].size() as usize)
-            })
-            .collect();
+        // so it has a payload slot.
+        let ci = ref_col as usize;
+        let pi = schema.try_payload_idx(ci).expect("FK projection excludes PK columns");
+        let col_size = schema.columns[ci].size() as usize;
         let mut out = Batch::with_capacity(result_schema, pks.len());
         // The cursor also drops the keys this process holds no row for — the
         // master broadcasts the list, so most of it belongs elsewhere.
         let mut cursor = entry.open_cursor();
         for pk in pks {
             if cursor.advance_to_exact_live(pk) {
-                copy_cursor_cols_to_batch(&cursor, &mut out, &proj);
+                copy_cursor_col_to_batch(&cursor, &mut out, ci, pi, col_size);
             }
         }
-        Ok(out)
+        Ok((out, result_schema))
     }
 
     /// Resolve the `(table entry, index circuit)` pair for an index seek on
@@ -603,13 +598,12 @@ fn index_range_keys(
 }
 
 /// Projecting sibling of `ReadCursor::copy_current_row_into`: append the cursor's
-/// current row to `out` (which has the `project_schema` layout) with weight 1,
-/// copying only the columns in `proj` — the caller-resolved
-/// `(col_idx, payload_slot, size)` triple per projected column. The projected
-/// payload column at position `k` corresponds to `proj[k]`; the projected null
-/// bit `k` mirrors the source row's null bit for that column. Projected
-/// columns are scalar, so no blob relocation is required.
-fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, proj: &[(usize, usize, usize)]) {
+/// current row to `out` (which has the one-column `project_schema` layout) with
+/// weight 1, copying only column `ci` — whose caller-resolved source payload
+/// slot is `pi` and whose width is `col_size`. The projected row's single
+/// payload column and null bit 0 mirror that source column. The column is
+/// scalar, so no blob relocation is required.
+fn copy_cursor_col_to_batch(cursor: &ReadCursor, out: &mut Batch, ci: usize, pi: usize, col_size: usize) {
     // `current_pk_bytes()` is the verbatim OPK PK region for any width, and the
     // read cursor always tracks it regardless of stride. For narrow PKs it
     // equals `widen_pk_be(current_pk_bytes) == current_key_narrow()`; for wide
@@ -617,18 +611,15 @@ fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, proj: &[(usiz
     out.extend_pk_bytes(cursor.current_pk_bytes());
     out.extend_weight(&1i64.to_le_bytes());
 
-    // One pass over the projection: the regions are independent append
-    // buffers, so the null word can be appended after the column data.
-    let src_null = cursor.current_null_word;
+    // The regions are independent append buffers, so the null word can be
+    // appended after the column data.
     let mut proj_null = 0u64;
-    for (k, &(ci, pi, col_size)) in proj.iter().enumerate() {
-        if gnitz_wire::null_word_get(src_null, pi) {
-            gnitz_wire::null_word_set(&mut proj_null, k, true);
-        }
-        match cursor.col_bytes(ci, col_size) {
-            Some(data) => out.extend_col(k, data),
-            None => out.fill_col_zero(k, col_size),
-        }
+    if gnitz_wire::null_word_get(cursor.current_null_word, pi) {
+        gnitz_wire::null_word_set(&mut proj_null, 0, true);
+    }
+    match cursor.col_bytes(ci, col_size) {
+        Some(data) => out.extend_col(0, data),
+        None => out.fill_col_zero(0, col_size),
     }
     out.extend_null_bmp(&proj_null.to_le_bytes());
     out.count += 1;

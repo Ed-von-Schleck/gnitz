@@ -18,7 +18,7 @@ use crate::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repa
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
 use crate::runtime::sal::{
-    pack_gather_cols, unique_preflight_wire_schema, DirectGroup, SalFit, SalWriter, BACKFILL_DECISION_CHECKPOINT,
+    unique_preflight_wire_schema, DirectGroup, SalFit, SalWriter, BACKFILL_DECISION_CHECKPOINT,
     BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, FLAG_BACKFILL, FLAG_DDL_SYNC, FLAG_EXCHANGE,
     FLAG_EXCHANGE_RELAY, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK,
     FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN, FLAG_TICK, FLAG_UNIQUE_PREFLIGHT,
@@ -91,7 +91,10 @@ pub struct MasterDispatcher {
     /// The generation the last ephemeral round stamped. Read by
     /// `note_flush_round`, which holds the rule every base publish must obey: a
     /// durable base advance is always preceded by a generation bump with no
-    /// ephemeral round in between.
+    /// ephemeral round in between. That read is inside a `debug_assert!`, so a
+    /// release build writes this field on every round and never reads it — the
+    /// field stays ungated because two tests pin it, and `#[cfg]`-splitting it
+    /// plus its writes would cost more than the `Cell<u64>` it saves.
     last_ephemeral_gen: Cell<u64>,
 }
 
@@ -131,25 +134,41 @@ pub(crate) fn first_worker_error_opt(op: &str, decoded: &[Option<DecodedWire>]) 
     })
 }
 
-/// Which workers a scan-shaped dispatch goes to.
+/// Await one ACK per id in `ids`, returning the first worker error. Clears
+/// `acks` before returning so the `DecodedWire` heap fields (data batch, error
+/// message) are freed rather than held while the caller parks; the capacity of
+/// both scratch vectors survives for the next round.
+pub(crate) async fn await_worker_acks(
+    reactor: &crate::runtime::reactor::Reactor,
+    ids: &[u64],
+    op: &str,
+    futs: &mut Vec<crate::runtime::reactor::ReplyFuture>,
+    acks: &mut Vec<Option<DecodedWire>>,
+) -> Result<(), String> {
+    futs.clear();
+    futs.extend(ids.iter().map(|&id| reactor.await_reply(id)));
+    crate::runtime::reactor::join_into(futs, acks).await;
+    let err = first_worker_error_opt(op, acks);
+    acks.clear();
+    err.map_or(Ok(()), Err)
+}
+
+/// Which workers a scan-shaped dispatch goes to. This is the one statement of
+/// what each shape costs in request ids and replies; every scan dispatch below
+/// realizes it rather than restating it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fanout {
-    /// Every worker; each answers for the rows it owns.
+    /// Every worker; each answers for the rows it owns. One distinct scan
+    /// request id per worker, and `nw` replies awaited in worker order.
     Broadcast,
-    /// This worker alone.
+    /// This worker alone. ONE scan request id, mirrored across the whole
+    /// `req_ids` array because `write_group_direct` keys replies by worker
+    /// slot — only this worker's slot is written and replies, so exactly one
+    /// reply arrives, on that one id.
     One(usize),
 }
 
 impl Fanout {
-    /// The SAL group's slot selector: `-1` writes every worker's slot, `>= 0`
-    /// only that one's. The single conversion to the wire-side encoding.
-    fn sal_slot(self) -> i32 {
-        match self {
-            Fanout::Broadcast => -1,
-            Fanout::One(w) => w as i32,
-        }
-    }
-
     /// The worker that produced reply `i`. Under `One` every reply is that
     /// worker's, so the index does not name it.
     fn worker_of(self, i: usize) -> usize {
@@ -173,15 +192,13 @@ pub(crate) fn replicated_unicast(disp: &MasterDispatcher, target_id: i64) -> Fan
     }
 }
 
-/// Allocate a scan group's per-worker request ids and register them into a
-/// fresh `ScanLease`, the setup both `dispatch_scan_fanout` and
-/// `dispatch_scan_multi_fanout` need before their SAL write. `Fanout::One`
-/// allocates ONE id mirrored across the array — only that worker's slot is
-/// written and replies; `Fanout::Broadcast` allocates `nw` distinct ids. The lease is registered BEFORE any await, so a cancelled
-/// drain still deregisters the ids and `route_scan_slot` discards late frames.
-/// The returned lease MUST be bound to a named local held to the end of the
-/// caller's drain scope (never a bare `_`, which would drop it immediately and
-/// re-open the wedge).
+/// Allocate a scan group's per-worker request ids per [`Fanout`] and register
+/// them into a fresh `ScanLease`, the setup both `dispatch_scan_fanout` and
+/// `dispatch_scan_multi_fanout` need before their SAL write. The lease is
+/// registered BEFORE any await, so a cancelled drain still deregisters the ids
+/// and `route_scan_slot` discards late frames. The returned lease MUST be bound
+/// to a named local held to the end of the caller's drain scope (never a bare
+/// `_`, which would drop it immediately and re-open the wedge).
 fn alloc_scan_req_ids_and_lease(
     reactor: &crate::runtime::reactor::Reactor,
     nw: usize,
@@ -189,13 +206,10 @@ fn alloc_scan_req_ids_and_lease(
 ) -> ([u64; crate::runtime::sal::MAX_WORKERS], ScanLease) {
     let mut req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
     if unicast != Fanout::Broadcast {
-        // Single-source: one id mirrored across every slot; only that worker's
-        // slot is written and replies, so the lease holds that one id.
         let id = reactor.alloc_scan_request_id();
         req_ids[..nw].fill(id);
         (req_ids, reactor.scan_lease(&[id as u32]))
     } else {
-        // Broadcast: a distinct id per worker, each registered in the lease.
         let mut scan_ids = [0u32; crate::runtime::sal::MAX_WORKERS];
         for (r, s) in req_ids[..nw].iter_mut().zip(&mut scan_ids[..nw]) {
             let id = reactor.alloc_scan_request_id();
@@ -210,19 +224,12 @@ fn alloc_scan_req_ids_and_lease(
 /// raw `W2mSlot` replies, returned so the caller can forward or merge them
 /// without an intermediate decode/copy.
 ///
-/// `unicast` selects the shape and is also passed to `submit` so the group
-/// write's routing can never diverge from it:
-/// - `Broadcast`: allocate `nw` distinct per-worker scan request ids, signal
-///   every worker, and await every slot in worker order — the returned `Vec`
-///   holds `nw` slots. The shape a full fan-out or a PK-scatter needs.
-/// - `One(w)`: allocate ONE scan request id mirrored across the whole `req_ids`
-///   array (`write_group_direct` keys replies by worker slot, and only `w`'s
-///   slot is written and replies — all on this id), signal only `w`, and await
-///   its single slot — the returned `Vec` holds one slot. Used for a REPLICATED
-///   relation (see `replicated_unicast`) and the single-worker seek paths. The
-///   downstream drains (`drain_index_scan` / `merge_index_scan`) are
-///   count-agnostic — they iterate `slots.len()` — so a length-1 `Vec` merges
-///   exactly that worker's stream.
+/// `unicast` selects the shape ([`Fanout`] states what each costs) and is also
+/// passed to `submit` so the group write's routing can never diverge from it.
+/// The returned `Vec` therefore holds `nw` slots under `Broadcast` and one
+/// under `One(w)`; the downstream drains (`drain_index_scan` /
+/// `merge_index_scan`) iterate `slots.len()`, so a length-1 `Vec` merges
+/// exactly that worker's stream.
 ///
 /// `sal_excl` is held only for the synchronous write + signal phase and
 /// released before awaiting replies. This serialises the SAL write against
@@ -298,9 +305,7 @@ pub(crate) async fn dispatch_scan_multi_fanout(
 ) -> Result<Vec<MultiScanDispatch>, String> {
     let nw = disp.num_workers;
     // Allocate ids + register every relation's lease BEFORE the lock (no await
-    // between here and the write). A broadcast relation gets one id per worker;
-    // a unicast one gets a single id mirrored across the array (only its
-    // worker's slot is written and replies).
+    // between here and the write).
     let mut dispatches: Vec<MultiScanDispatch> = Vec::with_capacity(relations.len());
     for &(_tid, unicast, _ver) in relations {
         let (req_ids, lease) = alloc_scan_req_ids_and_lease(reactor, nw, unicast);
@@ -317,14 +322,11 @@ pub(crate) async fn dispatch_scan_multi_fanout(
     // releases at block end, before the caller's first await.
     {
         let _guard = sal_excl.lock().await;
-        {
-            for (&(tid, unicast, eff_ver), d) in relations.iter().zip(&dispatches) {
-                let wire_flags =
-                    gnitz_wire::wire_flags_set_schema_version(0, eff_ver) | gnitz_wire::FLAG_SCAN_FIFO_REPLY;
-                disp.write_scan_group(tid, 0, wire_flags, &d.req_ids[..nw], unicast, client_id, &[])?;
-            }
-            disp.signal_all();
+        for (&(tid, unicast, eff_ver), d) in relations.iter().zip(&dispatches) {
+            let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, eff_ver) | gnitz_wire::FLAG_SCAN_FIFO_REPLY;
+            disp.write_scan_group(tid, 0, wire_flags, &d.req_ids[..nw], unicast, client_id, &[])?;
         }
+        disp.signal_all();
     }
     Ok(dispatches)
 }

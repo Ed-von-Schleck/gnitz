@@ -46,7 +46,7 @@ impl HasPkLookup {
     /// `pack_pk_cols(col_indices)`, whose packed flag (bit 63) is always set, so
     /// a real index check is never 0 and never collides with the PK sentinel.
     /// The column list is validated against the table's schema by
-    /// `validate_index_cols` at the dispatch arm.
+    /// `CatalogEngine::validate_index_cols` at the dispatch arm.
     fn from_wire(seek_col_idx: u64) -> Self {
         match gnitz_wire::pk_cols_word(seek_col_idx) {
             0 => HasPkLookup::PrimaryKey,
@@ -255,13 +255,11 @@ pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, 
 /// those would make the master decode the frames with the table's row stride,
 /// and caching them would poison the table's block. `ClientAuthored` is the
 /// ScanSpec reply schema the client built and shipped in `seek_pk_extra`: the
-/// client decodes the reply against its own copy, so no block is emitted, and
-/// the descriptor answers only `schema_wire_safe` — `ReplySchema::None` would
-/// claim wire-safe unconditionally and send a STRING projection down the
-/// chunking path.
+/// client decodes the reply against its own copy, so no block is emitted, but
+/// the descriptor is still consulted for `schema_wire_safe`, which is what
+/// keeps a STRING projection off the immediate-emit path.
 #[derive(Clone, Copy)]
 enum ReplySchema<'a> {
-    None,
     Table(&'a SchemaDescriptor),
     OneOff(&'a SchemaDescriptor),
     ClientAuthored(&'a SchemaDescriptor),
@@ -342,17 +340,6 @@ impl WorkerProcess {
 
     fn cat(&mut self) -> &mut CatalogEngine {
         unsafe { &mut *self.catalog }
-    }
-
-    /// Reject a column list that is malformed or names a column outside
-    /// `target_id`'s schema, before it reaches the catalog. The worker-side gate
-    /// for every arm carrying a `pack_pk_cols` word; the master applies the same
-    /// rule in `validated_index_cols`.
-    fn validate_index_cols(&mut self, target_id: i64, cols: &gnitz_wire::PkColList, op: &str) -> Result<(), String> {
-        match self.cat().get_schema_desc(target_id) {
-            Some(s) if s.cols_in_range(cols) => Ok(()),
-            _ => Err(format!("{op}: invalid column list for table {target_id}")),
-        }
     }
 
     // ── Main event loop ────────────────────────────────────────────────
@@ -708,42 +695,39 @@ impl WorkerProcess {
             SalMessageKind::HasPk => {
                 let lookup = HasPkLookup::from_wire(seek_col_idx);
                 if let HasPkLookup::SecondaryIndex { cols, .. } = &lookup {
-                    self.validate_index_cols(target_id, cols, "has_pk")?;
+                    self.cat().validate_index_cols(target_id, cols, "has_pk")?;
                 }
                 self.handle_has_pk(target_id, batch, lookup, request_id, client_id, seek_pk)
             }
 
             SalMessageKind::Gather => {
-                // The projected column mask rides in `seek_col_idx`. The PK
+                // The projected column index rides in `seek_col_idx`. The PK
                 // batch arrives in `data_batch` (a worker with an empty
                 // sublist still replies — the master joins one reply per
                 // worker). PKs come pre-sorted from the master's global sort
                 // (scatter preserves per-worker order), aiding the cursor.
-                let project: Vec<u8> = crate::runtime::sal::unpack_gather_cols(seek_col_idx).collect();
+                let ref_col = seek_col_idx as u8;
                 // The batch PK region holds verbatim OPK bytes (the master packs
                 // them via `extend_pk_bytes`), so lend them to the seek directly,
                 // at every PK width. Round-tripping a narrow key back through
                 // `get_pk` → `opk_key` would re-OPK-encode it (double sign-flip
                 // for signed; scrambled compound bytes), probing a key that
                 // matches no stored row.
-                let result = match batch.as_ref() {
+                let (result, schema) = match batch.as_ref() {
                     Some(b) => {
                         let keys = (0..b.count).map(|i| b.get_pk_bytes(i));
-                        self.cat().gather_family_bytes(target_id, keys, &project)?
+                        self.cat().gather_family_bytes(target_id, keys, ref_col)?
                     }
                     // A worker with an empty sublist still replies — the master
                     // joins one reply per worker.
-                    None => self
-                        .cat()
-                        .gather_family_bytes(target_id, std::iter::empty(), &project)?,
+                    None => self.cat().gather_family_bytes(target_id, std::iter::empty(), ref_col)?,
                 };
                 // The projected reply schema is synthetic — never the
                 // table's cached block.
-                let schema = result.schema;
                 self.stream_batch_response(
                     target_id as u64,
                     Some(result),
-                    schema.as_ref().map_or(ReplySchema::None, ReplySchema::OneOff),
+                    ReplySchema::OneOff(&schema),
                     request_id,
                     client_id,
                     0,
@@ -753,7 +737,7 @@ impl WorkerProcess {
             SalMessageKind::Push => {
                 if let Some(batch) = batch {
                     if batch.count > 0 {
-                        self.handle_push(target_id, batch, request_id)?;
+                        self.handle_push(target_id, batch)?;
                     }
                 }
                 self.send_ack(target_id as u64, request_id);
@@ -768,7 +752,7 @@ impl WorkerProcess {
 
             SalMessageKind::SeekByIndex => {
                 let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-                self.validate_index_cols(target_id, &cols, "seek_by_index")?;
+                self.cat().validate_index_cols(target_id, &cols, "seek_by_index")?;
                 // A prefix seek supplies fewer values than the index's arity.
                 let keys = gnitz_wire::unpack_index_key_slots(seek_pk, &seek_pk_extra, cols.as_slice().len())?;
                 let (result, schema) = self.cat().seek_by_index(target_id, cols.as_slice(), keys.as_slice())?;
@@ -849,7 +833,7 @@ impl WorkerProcess {
                 // k-way merge. An error here surfaces as the terminal fault frame
                 // the master's merge expects (send_error in run_via_dispatch_inner).
                 let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-                self.validate_index_cols(target_id, &cols, "unique pre-flight")?;
+                self.cat().validate_index_cols(target_id, &cols, "unique pre-flight")?;
                 self.handle_unique_preflight(target_id, cols.as_slice(), request_id)?;
                 Ok(())
             }
@@ -862,7 +846,7 @@ impl WorkerProcess {
 
     // ── Request handlers ───────────────────────────────────────────────
 
-    fn handle_push(&mut self, target_id: i64, batch: Batch, _request_id: u64) -> Result<(), String> {
+    fn handle_push(&mut self, target_id: i64, batch: Batch) -> Result<(), String> {
         // Master pre-partitions FLAG_PUSH rows in `scatter_wire_group`,
         // so every slot already contains only this worker's rows. A second
         // partition-hash filter here would be pure overhead.
@@ -889,10 +873,7 @@ impl WorkerProcess {
             if !self.cat().has_id(target_id) {
                 return Ok(());
             }
-            let schema = self
-                .cat()
-                .get_schema_desc(target_id)
-                .ok_or_else(|| format!("no schema for tid={target_id}"))?;
+            let schema = self.cat().schema_or_err(target_id, "tick")?;
             Batch::empty_with_schema(&schema)
         };
         self.evaluate_dag(target_id, delta, request_id);
@@ -937,10 +918,7 @@ impl WorkerProcess {
         // Needed to synthesize empty pad chunks. An unregistered source is a
         // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see
         // the source has diverged from the catalog.
-        let schema = self
-            .cat()
-            .get_schema_desc(source_tid)
-            .ok_or_else(|| format!("backfill: no schema for source {source_tid}"))?;
+        let schema = self.cat().schema_or_err(source_tid, "backfill")?;
         let mut handle = self.cat().open_source_cursor(view_id, source_tid);
         let mut produced_any = false;
 
@@ -1050,10 +1028,7 @@ impl WorkerProcess {
         if UNIQUE_PREFLIGHT_ERROR.armed() {
             return Err("injected unique pre-flight fault".to_string());
         }
-        let schema = self
-            .cat()
-            .get_schema_desc(owner_id)
-            .ok_or_else(|| format!("unique pre-flight: no schema for table {owner_id}"))?;
+        let schema = self.cat().schema_or_err(owner_id, "unique pre-flight")?;
         // The index circuit is not registered until this pre-flight succeeds, so
         // build its schema from the owner schema + column list — identical inputs
         // to the master's own build, so the reply frame layout agrees by
@@ -1169,10 +1144,7 @@ impl WorkerProcess {
                 (result, schema, true)
             }
             HasPkLookup::PrimaryKey => {
-                let schema = self
-                    .cat()
-                    .get_schema_desc(target_id)
-                    .ok_or_else(|| format!("no schema for tid={target_id}"))?;
+                let schema = self.cat().schema_or_err(target_id, "has_pk")?;
                 let store = self.cat().get_store_handle(target_id);
                 // Route on verbatim OPK bytes for every PK width: feeding `get_pk`
                 // (OPK-widened) to `has_pk(u128)` would re-OPK-encode it, a double
@@ -1410,10 +1382,11 @@ mod tests {
         let req_resp: u64 = 0xCAFE_BABE_DEAD_BEEF;
         let req_err: u64 = u64::MAX;
         wp.send_ack(7, req_ack);
-        // Pass ReplySchema::None: send_response consults the catalog only
-        // when a schema is present, and this test uses a null catalog pointer.
+        // Pass ReplySchema::ClientAuthored: it emits no block and so consults
+        // no catalog, which this test does not have (null catalog pointer).
         // The id round-trip is the assertion of interest.
-        wp.send_response(8, None, ReplySchema::None, req_resp, 0, 0u128)
+        let schema = test_schema();
+        wp.send_response(8, None, ReplySchema::ClientAuthored(&schema), req_resp, 0, 0u128)
             .unwrap();
         wp.send_error("boom", req_err);
 
@@ -1834,7 +1807,7 @@ mod tests {
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
-        let err = wp.send_scan_response(1, Rc::new(batch), ReplySchema::None, 3, 0, 0, false);
+        let err = wp.send_scan_response(1, Rc::new(batch), ReplySchema::ClientAuthored(&schema), 3, 0, 0, false);
         assert!(err.is_ok(), "small wire-safe batch must not error");
         assert!(
             wp.pending_streams.is_empty(),
@@ -1876,7 +1849,7 @@ mod tests {
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
-        wp.send_scan_response(1, Rc::new(batch), ReplySchema::None, 3, 0, 0, true)
+        wp.send_scan_response(1, Rc::new(batch), ReplySchema::ClientAuthored(&schema), 3, 0, 0, true)
             .unwrap();
         assert_eq!(wp.pending_streams.len(), 1, "force_fifo must enqueue, not emit");
         assert!(
@@ -2127,17 +2100,24 @@ mod tests {
         let client = 7u64;
         let pk = 0xDEAD_BEEF_u128;
         wp_ref
-            .send_response(8, Some(&batch), ReplySchema::None, req, client, pk)
+            .send_response(8, Some(&batch), ReplySchema::ClientAuthored(&schema), req, client, pk)
             .unwrap();
         wp_ref
-            .send_response(8, None, ReplySchema::None, req + 1, client, 0)
+            .send_response(8, None, ReplySchema::ClientAuthored(&schema), req + 1, client, 0)
             .unwrap();
 
         assert!(wp_new
-            .stream_batch_response(8, Some(batch.clone()), ReplySchema::None, req, client, pk)
+            .stream_batch_response(
+                8,
+                Some(batch.clone()),
+                ReplySchema::ClientAuthored(&schema),
+                req,
+                client,
+                pk
+            )
             .is_ok());
         assert!(wp_new
-            .stream_batch_response(8, None, ReplySchema::None, req + 1, client, 0)
+            .stream_batch_response(8, None, ReplySchema::ClientAuthored(&schema), req + 1, client, 0)
             .is_ok());
         assert!(wp_new.pending_streams.is_empty(), "fitting results never enqueue");
 
@@ -2161,7 +2141,7 @@ mod tests {
         let (region, writer) = make_ring();
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-        let err = wp.stream_batch_response(3, Some(batch), ReplySchema::None, 5, 9, 0);
+        let err = wp.stream_batch_response(3, Some(batch), ReplySchema::ClientAuthored(&schema), 5, 9, 0);
         assert!(err.is_ok(), "oversized wire-safe result must chunk, not error");
         assert_eq!(wp.pending_streams.len(), 1);
         let ps = wp.pending_streams.front().unwrap();

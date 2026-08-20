@@ -35,12 +35,12 @@ use crate::query::RelationKind;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
-    dispatch_scan_multi_fanout, first_worker_error_opt, replicated_unicast, scan_spec_route, Fanout, MasterDispatcher,
+    await_worker_acks, dispatch_scan_multi_fanout, replicated_unicast, scan_spec_route, Fanout, MasterDispatcher,
     TxnFamily, UniqueFilter,
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
-    join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard,
+    mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard,
     ReplyFuture, WriteGuard,
 };
 use crate::runtime::sal::{SalFit, BACKFILL_DECISION_CONTINUE, FLAG_SCAN_SPEC};
@@ -248,11 +248,8 @@ impl Shared {
     /// of the table schema — it is invalidated alongside col_names whenever
     /// DDL modifies the table.
     fn get_schema_wire_block(&self, target_id: i64) -> (Rc<Vec<u8>>, u16) {
-        let cat = self.cat();
-        let schema = cat
-            .get_schema_desc(target_id)
-            .unwrap_or_else(SchemaDescriptor::minimal_u64);
-        let e = ipc::get_or_build_schema_wire_block(cat, target_id, &schema);
+        let schema = self.get_schema_desc(target_id);
+        let e = ipc::get_or_build_schema_wire_block(self.cat(), target_id, &schema);
         (e.block, e.version)
     }
 
@@ -912,17 +909,8 @@ async fn run_tick(
     // only produce a no-op tick that then reports success and masks this failure.
     shared.requeue_tick_tids(&tids[n..]);
 
-    fut_slots.clear();
-    fut_slots.extend(
-        req_ids[..n * nw]
-            .iter()
-            .copied()
-            .map(|id| shared.reactor.await_reply(id)),
-    );
-    join_into(fut_slots, ack_slots).await;
-    let worker_err = first_worker_error_opt("tick", ack_slots);
-    ack_slots.clear();
-    if let Some(e) = emit.err().or(worker_err) {
+    let worker_err = await_worker_acks(&shared.reactor, &req_ids[..n * nw], "tick", fut_slots, ack_slots).await;
+    if let Some(e) = emit.err().or(worker_err.err()) {
         return Err(e);
     }
     shared.last_tick_lsn.set(snapshot_lsn);
@@ -1115,33 +1103,35 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     let flags = decoded.control.flags;
     let client_version = ipc::wire_flags_get_schema_version(flags);
 
+    // Routing order. Two rules govern the run of branches below, and every
+    // branch that has no comment of its own obeys them:
+    //  1. A verb named by its own flag bit is matched before the shape-keyed
+    //     tail, which decides by `target_id` range and batch emptiness alone.
+    //  2. The three txn-shaped frames carry `target_id = 0` and no data block,
+    //     so an un-branched one is `< FIRST_USER_TABLE_ID` and would be
+    //     swallowed by the system-table scan branch at the end of this function.
+    // Each of the three also re-decodes its own body from the raw frame: the
+    // generic `decode_wire` above sees no data block and yields control-only,
+    // which those routes do not use.
+
     // ---------- Atomic DDL transaction (the system-write frame) ----------
     // Every system-table write — a CREATE's N family batches or a
     // DROP/CREATE INDEX/CREATE SCHEMA's single batch — arrives as one
-    // FLAG_DDL_TXN frame and is ingested under one durable SAL zone. It shares
-    // the `target_id == 0` sentinel with the alloc RPCs but carries a disjoint
-    // flag, so branch here before the alloc block. `handle_ddl_txn` re-decodes the
-    // bundle from the raw frame (the generic `decode_wire` above sees no data
-    // block and yields control-only, which is unused for this route).
+    // FLAG_DDL_TXN frame and is ingested under one durable SAL zone.
     if flags & gnitz_wire::FLAG_DDL_TXN != 0 {
         handle_ddl_txn(shared, peer, client_id, data, client_version).await;
         return;
     }
 
     // ---------- Atomic user-table transaction ----------
-    // Placed after FLAG_DDL_TXN and before the `target_id == 0` alloc block so it
-    // cannot collide with alloc RPCs or empty-batch scans; it carries
-    // `target_id = 0`. Like DDL_TXN it re-decodes the bundle from the raw frame.
     if flags & gnitz_wire::FLAG_PUSH_TXN != 0 {
         handle_push_txn(shared, peer, client_id, data).await;
         return;
     }
 
     // ---------- Consistent multi-relation scan ----------
-    // Client→master frame naming N relations to snapshot at one SAL cut. Like
-    // DDL_TXN / PUSH_TXN it carries `target_id = 0` and re-decodes its body from
-    // the raw frame (the generic decode above sees no data block); placed in the
-    // same pre-alloc-block run. Never written to the SAL.
+    // Client→master frame naming N relations to snapshot at one SAL cut. Never
+    // written to the SAL.
     if flags & gnitz_wire::FLAG_SCAN_MULTI != 0 {
         handle_scan_multi(shared, peer, client_id, data).await;
         return;
@@ -1419,7 +1409,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
 
     // ---------- System-table DML (catalog + optional DDL broadcast) ----------
     if target_id < FIRST_USER_TABLE_ID {
-        handle_system_scan(shared, peer, client_id, target_id, decoded, client_version).await;
+        handle_system_scan(shared, peer, client_id, target_id, batch_count > 0, client_version).await;
     }
 
     // Fallthrough: ignore (should not happen).
@@ -1484,25 +1474,21 @@ enum PushTxnOutcome {
 /// "nothing committed".
 async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) {
     match push_txn_body(shared, data).await {
-        // Standard single-frame ACK, seek_pk = zone LSN (uncorrelated, as
-        // push_ddl_txn's reply is).
-        Ok(PushTxnOutcome::Committed(lsn)) => {
+        Ok(outcome) => {
+            let (pk, status) = match outcome {
+                // Standard single-frame ACK, seek_pk = zone LSN (uncorrelated,
+                // as push_ddl_txn's reply is).
+                PushTxnOutcome::Committed(lsn) => (lsn, STATUS_OK),
+                // OCC precondition failed: a control-only STATUS_TXN_CONFLICT
+                // frame whose `seek_pk` carries the fresh basis. Empty message —
+                // the client synthesizes any human-readable text from the tid it
+                // sent.
+                PushTxnOutcome::Conflict(fresh_basis) => (fresh_basis, ipc::STATUS_TXN_CONFLICT),
+            };
             let buf = encode_response_buffer(ipc::WireMsg {
                 client_id,
-                seek_pk: lsn as u128,
-                status: STATUS_OK,
-                ..Default::default()
-            });
-            peer.send_buffer_or_close(buf).await;
-        }
-        // OCC precondition failed: a control-only STATUS_TXN_CONFLICT frame whose
-        // `seek_pk` carries the fresh basis. Empty message — the client
-        // synthesizes any human-readable text from the tid it sent.
-        Ok(PushTxnOutcome::Conflict(fresh_basis)) => {
-            let buf = encode_response_buffer(ipc::WireMsg {
-                client_id,
-                seek_pk: fresh_basis as u128,
-                status: ipc::STATUS_TXN_CONFLICT,
+                seek_pk: pk as u128,
+                status,
                 ..Default::default()
             });
             peer.send_buffer_or_close(buf).await;
@@ -1733,23 +1719,6 @@ async fn target_kind_or_reject(
     }
 }
 
-/// Decode `seek_col_idx` (`pack_pk_cols(col_indices)` — the packed flag at bit
-/// 63 is always set, so the old `col_idx as usize >= num_columns` guard would
-/// always trip) and validate the full list against the table's schema before
-/// classifying. Used by the SEEK_BY_INDEX handler.
-fn validated_index_cols(
-    shared: &Rc<Shared>,
-    target_id: i64,
-    seek_col_idx: u64,
-    op: &str,
-) -> Result<gnitz_wire::PkColList, String> {
-    let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-    match shared.cat().get_schema_desc(target_id) {
-        Some(s) if s.cols_in_range(&cols) => Ok(cols),
-        _ => Err(format!("{op}: invalid column list for table {target_id}")),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn handle_seek_by_index(
     shared: &Rc<Shared>,
@@ -1763,13 +1732,17 @@ async fn handle_seek_by_index(
     client_version: u16,
 ) {
     if kind != RelationKind::SystemCatalog {
-        let cols = match validated_index_cols(shared, target_id, seek_col_idx, "seek_by_index") {
-            Ok(cols) => cols,
-            Err(msg) => {
-                send_error(peer, target_id, client_id, msg.as_bytes()).await;
-                return;
-            }
-        };
+        // `seek_col_idx` is `pack_pk_cols(col_indices)`, whose packed flag at
+        // bit 63 is always set — so a bare `col_idx as usize >= num_columns`
+        // guard would always trip; unpack first, then admit the whole list.
+        // Bind the result before testing it: an `if let Err(_)` scrutinee would
+        // hold the `&mut CatalogEngine` temporary across the await below.
+        let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
+        let admitted = shared.cat().validate_index_cols(target_id, &cols, "seek_by_index");
+        if let Err(msg) = admitted {
+            send_error(peer, target_id, client_id, msg.as_bytes()).await;
+            return;
+        }
         // Single catalog scan (exact list match) answers "is there an index for
         // this column list"; the borrow ends with the condition, so none is held
         // across the await below.
@@ -2331,18 +2304,19 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
 }
 
 /// System-table read path: an empty-batch SCAN of a catalog family. Every
-/// catalog WRITE now arrives as a `FLAG_DDL_TXN` frame (`handle_ddl_txn`), so a
-/// non-empty batch on the plain system-table frame is a protocol error.
+/// catalog WRITE now arrives as a `FLAG_DDL_TXN` frame (`handle_ddl_txn`), so
+/// `has_rows` — the router's own count of the frame's batch — being true on a
+/// plain system-table frame is a protocol error. The scanned rows come from the
+/// catalog, never from the frame, so the frame itself is not needed here.
 async fn handle_system_scan(
     shared: &Rc<Shared>,
     peer: &Peer,
     client_id: u64,
     target_id: i64,
-    decoded: ipc::DecodedWire,
+    has_rows: bool,
     client_version: u16,
 ) {
-    let batch = decoded.data_batch;
-    if batch.as_ref().map(|b| b.count > 0).unwrap_or(false) {
+    if has_rows {
         send_error(
             peer,
             target_id,

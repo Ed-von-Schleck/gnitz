@@ -136,12 +136,12 @@ const COALESCE_MAX_BYTES: usize = 32 * 1024;
 
 /// One awaited scan-train head, classified.
 #[derive(Clone, Copy, Default)]
-pub(super) struct TrainHead {
+struct TrainHead {
     /// The frame carries rows or a schema block. A frame with neither holds
     /// nothing the client can observe and nothing a later frame could decode
     /// against, so it is dropped rather than forwarded — on a selective
     /// broadcast read that is W−1 of the W trains.
-    pub(super) observable: bool,
+    observable: bool,
     /// The worker's train continues past this frame.
     has_more: bool,
 }
@@ -149,7 +149,7 @@ pub(super) struct TrainHead {
 /// Parse and classify one scan-train frame. The single definition of which
 /// frames reach the client, shared by the fan-out's coalescing decision and by
 /// the per-worker drain.
-pub(super) fn classify_head(slot: &W2mSlot, worker: usize) -> Result<TrainHead, String> {
+fn classify_head(slot: &W2mSlot, worker: usize) -> Result<TrainHead, String> {
     let (ctrl, has_more) = parse_train_header(slot, worker, "scan")?;
     Ok(TrainHead {
         observable: ctrl.flags & (FLAG_HAS_DATA | FLAG_HAS_SCHEMA) != 0,
@@ -235,7 +235,7 @@ pub(super) async fn forward_scan_slots(
 /// this zero-copy slot is evicted, rc goes negative, and the caller drops the
 /// `ScanLease`, discarding the rest of the train and advancing consume_cursor so
 /// the worker unblocks.
-pub(super) async fn drain_scan_train(
+async fn drain_scan_train(
     reactor: &crate::runtime::reactor::Reactor,
     peer: &Peer,
     mut slot: W2mSlot,

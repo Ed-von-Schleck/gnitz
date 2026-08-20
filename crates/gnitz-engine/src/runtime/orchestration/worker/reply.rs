@@ -59,14 +59,13 @@ impl WorkerProcess {
     /// Reply schema wire block: the table's cached block for `Table`, a
     /// one-off (never cached) block for `OneOff`, and none at all for
     /// `ClientAuthored` — the client wrote that schema and decodes against it.
-    /// Returns the block, the schema version, and the schema's wire-safety
-    /// (`(None, 0, true)` for `ReplySchema::None`) — `Table` reads the cached
-    /// wire-safe bit instead of recomputing it per reply. This is the only
-    /// reader of the descriptor: the encoders take the block, never the
-    /// descriptor, so a variant that emits no block emits no schema.
+    /// Returns the block, the schema version, and the schema's wire-safety —
+    /// `Table` reads the cached wire-safe bit instead of recomputing it per
+    /// reply. This is the only reader of the descriptor: the encoders take the
+    /// block, never the descriptor, so a variant that emits no block emits no
+    /// schema.
     fn reply_schema_block(&mut self, tid_key: i64, schema: ReplySchema<'_>) -> (Option<Rc<Vec<u8>>>, u16, bool) {
         match schema {
-            ReplySchema::None => (None, 0, true),
             // Version 0: the block is a projected/synthetic schema, so the
             // table's version does not describe it — reporting the table's would
             // let a version-suppression path drop a block the reader still needs.
