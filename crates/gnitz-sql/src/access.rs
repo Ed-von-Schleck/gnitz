@@ -569,13 +569,15 @@ fn collect_index_range_candidates<'e>(
     let mut conjuncts = Vec::new();
     flatten_bound_conjuncts(expr, &mut conjuncts);
 
-    let eqs = collect_eq_conjuncts(&conjuncts, schema, |col| index_eligible_col(schema, col));
-    let ends = collect_range_ends(&conjuncts, schema);
     // A range candidate needs at least one range end; a pure-equality WHERE is
-    // handled by collect_index_seek_candidates, so this costs no wire traffic then.
+    // handled by collect_index_seek_candidates, so this costs no wire traffic
+    // then. Tested before `eqs` is built, which parses a literal per conjunct
+    // and would be discarded on the most common index-servable shape.
+    let ends = collect_range_ends(&conjuncts, schema);
     if ends.is_empty() {
         return Ok(Vec::new());
     }
+    let eqs = collect_eq_conjuncts(&conjuncts, schema, |col| index_eligible_col(schema, col));
 
     let indexes = fetch_indexes()?;
     let mut out: Vec<IndexRangeCandidate<'e>> = Vec::new();
