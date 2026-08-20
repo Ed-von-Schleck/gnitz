@@ -153,3 +153,44 @@ fn same_columns_named_index_coexists() {
     exec(&mut client, &sn, "DROP INDEX my_idx");
     exec(&mut client, &sn, &format!("DROP INDEX {sn}__t__idx_a"));
 }
+
+/// An ineligible index column is reported by NAME, not as a bare type code.
+/// `CREATE INDEX` renders the same message the inline-UNIQUE surface does, from
+/// the same authoritative verdict, so the two surfaces cannot drift.
+#[test]
+fn ineligible_index_column_is_named() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, s TEXT, f DOUBLE PRECISION)",
+    );
+    for (sql, col) in [
+        ("CREATE INDEX ON t(s)", "s"),
+        ("CREATE INDEX ON t(f)", "f"),
+        ("CREATE UNIQUE INDEX ON t(s)", "s"),
+    ] {
+        let e = try_exec(&mut client, &sn, sql).unwrap_err();
+        let msg = format!("{e:?}");
+        assert!(
+            msg.contains(&format!("'{col}'")),
+            "`{sql}` must name the ineligible column, got: {msg}"
+        );
+        assert!(
+            !msg.contains("column type"),
+            "`{sql}` must not leak the raw type-code message, got: {msg}"
+        );
+    }
+    // The inline-UNIQUE surface already named it; it still does.
+    let e = try_exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, s TEXT UNIQUE)",
+    )
+    .unwrap_err();
+    assert!(format!("{e:?}").contains("'s'"));
+}

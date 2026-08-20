@@ -42,26 +42,13 @@ pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {
 }
 
 /// Validate a user-supplied name destined to become an index name — a CREATE
-/// INDEX name or a UNIQUE/constraint name that maps to a secondary index.
-/// Beyond the general identifier rules, the reserved `__fk_` infix is rejected:
-/// such a name would collide with internal FK-backing index names and persist as
-/// undroppable (`drop_index` refuses it). The infix check is scoped here rather
-/// than in `validate_user_identifier`, which also guards table/column/schema
-/// names that may legitimately contain `__fk_`.
-///
-/// The infix is matched against the **canonical (lowercase) form**, because the
-/// client canonicalizes index names at store time: a mixed-case `x__FK_y` would
-/// otherwise pass this guard yet be stored as the reserved `x__fk_y`, which the
-/// engine then refuses to drop.
+/// INDEX name or a UNIQUE/constraint name that maps to a secondary index. The
+/// rules are exactly the general identifier rules: `validate_user_identifier`
+/// already rejects the reserved `__fk_` infix, because an index name is
+/// interpolated from table and column names and so the contract has to hold for
+/// all of them, not just for the names typed at this surface.
 pub(crate) fn validate_user_index_name(name: &str) -> Result<(), GnitzSqlError> {
-    validate_user_name(name)?;
-    if name.to_ascii_lowercase().contains(gnitz_core::FK_INDEX_INFIX) {
-        return Err(GnitzSqlError::Plan(format!(
-            "Index/constraint names cannot contain the reserved '{}' infix",
-            gnitz_core::FK_INDEX_INFIX
-        )));
-    }
-    Ok(())
+    validate_user_name(name)
 }
 
 /// Catalog name for an auto-generated (unnamed) secondary index:
@@ -117,12 +104,16 @@ pub(crate) fn reject_float_keys(source_schema: &Schema, indices: &[usize]) -> Re
     Ok(())
 }
 
-/// Reject a column type that cannot back a hashed key (PRIMARY KEY or UNIQUE
-/// index). `role` names the clause for the message. `is_pk_eligible` is the
-/// shared allow-list (fixed-width integer, U128, UUID).
-pub(crate) fn reject_non_key_eligible(name: &str, tc: TypeCode, role: &str) -> Result<(), GnitzSqlError> {
-    if !tc.is_pk_eligible() {
-        return Err(non_key_eligible_error(name, tc, role));
+/// Reject a column that cannot be an index key column, naming it. The verdict is
+/// `gnitz_wire::index_key_type`'s — the authoritative rule, which
+/// `index_key_types` raises as a bare type code. Both index-creating surfaces
+/// (CREATE INDEX and inline UNIQUE) run this first, so neither can report an
+/// ineligible column without saying which one. `role` names the clause.
+pub(crate) fn reject_unindexable_columns(names: &[&str], types: &[TypeCode], role: &str) -> Result<(), GnitzSqlError> {
+    for (name, &tc) in names.iter().zip(types) {
+        if gnitz_wire::index_key_type(tc as u8).is_err() {
+            return Err(non_key_eligible_error(name, tc, role));
+        }
     }
     Ok(())
 }

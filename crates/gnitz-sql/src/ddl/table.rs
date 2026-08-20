@@ -7,7 +7,7 @@ use crate::error::GnitzSqlError;
 use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
 use crate::validate::{
     default_index_name, disambiguate_index_name, non_key_eligible_error, reject_duplicate_names,
-    reject_non_key_eligible, reject_unhonored_column_options, reject_unhonored_table_constraints,
+    reject_unhonored_column_options, reject_unhonored_table_constraints, reject_unindexable_columns,
     validate_user_index_name, validate_user_name, ColumnOptionSite,
 };
 use crate::SqlResult;
@@ -40,8 +40,8 @@ fn check_fk_type_compat(fk_col_type: TypeCode, parent_col_type: TypeCode) -> Res
 /// Reject a UNIQUE constraint whose backing index the engine could not build.
 /// A secondary index's record key is the indexed columns *plus the source PK*, so
 /// the two rules are the indexed columns' own key-eligibility and the combined
-/// key's arity and stride — the `index_key_types` gate `create_index_core` runs,
-/// so the UNIQUE and CREATE INDEX surfaces cannot disagree.
+/// key's arity and stride. Both gates are the ones `create_index_core` runs, in
+/// the same order, so the UNIQUE and CREATE INDEX surfaces cannot disagree.
 fn reject_unbuildable_unique_index(
     unique_cols: &[(Vec<u32>, Option<String>)],
     cols: &[ColumnDef],
@@ -52,10 +52,10 @@ fn reject_unbuildable_unique_index(
         .map(|&c| cols[c as usize].type_code.wire_stride())
         .sum();
     for (col_indices, _) in unique_cols {
-        for &c in col_indices {
-            reject_non_key_eligible(&cols[c as usize].name, cols[c as usize].type_code, "UNIQUE")?;
-        }
-        let raw_types: Vec<u8> = col_indices.iter().map(|&c| cols[c as usize].type_code as u8).collect();
+        let names: Vec<&str> = col_indices.iter().map(|&c| cols[c as usize].name.as_str()).collect();
+        let types: Vec<TypeCode> = col_indices.iter().map(|&c| cols[c as usize].type_code).collect();
+        reject_unindexable_columns(&names, &types, "UNIQUE")?;
+        let raw_types: Vec<u8> = types.iter().map(|&tc| tc as u8).collect();
         gnitz_core::index_key_types(&raw_types, pk_indices.len(), src_pk_stride).map_err(GnitzSqlError::Unsupported)?;
     }
     Ok(())
@@ -681,9 +681,12 @@ pub(crate) fn create_index_core(
         .iter()
         .map(|&c| schema.columns[c as usize].type_code)
         .collect();
+    // Per-column eligibility first, so an ineligible column is named rather than
+    // reaching `index_key_types`, whose verdict is a bare type code.
+    reject_unindexable_columns(&col_names, &col_types, ctx)?;
     let raw_types: Vec<u8> = col_types.iter().map(|&tc| tc as u8).collect();
     gnitz_core::index_key_types(&raw_types, schema.pk_count(), schema.pk_stride())
-        .map_err(GnitzSqlError::Unsupported)?; // also rejects String/Blob/float
+        .map_err(GnitzSqlError::Unsupported)?; // arity + combined-key stride
 
     let index_name = match explicit_name {
         Some(name) => name, // explicit: an exact-name collision still errors in `create_index`

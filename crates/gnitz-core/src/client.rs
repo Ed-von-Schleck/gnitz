@@ -61,9 +61,11 @@ fn qualified_name(schema_name: &str, name: &str) -> String {
 
 /// A secondary index maps the indexed column to the PK of the index table, so
 /// the indexed column must be PK-eligible. Defer to the canonical
-/// `is_pk_eligible` allow-list (the exact set the server's `get_index_key_type`
-/// accepts) rather than a deny-list: any future `TypeCode` is index-ineligible
-/// until explicitly vetted, instead of silently slipping through.
+/// `is_pk_eligible` allow-list rather than a deny-list: any future `TypeCode` is
+/// index-ineligible until explicitly vetted, instead of silently slipping
+/// through. It is a near-superset of what an index key can actually be — the
+/// authoritative rule is `gnitz_wire::index_key_type`, and the two differ only on
+/// `I128`, which this gateway admits and the engine then rejects.
 fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
     if !tc.is_pk_eligible() {
         return Err(ClientError::ServerError(
@@ -2105,7 +2107,7 @@ mod tests {
     #[test]
     fn validate_index_col_type_rejects_non_pk_eligible() {
         // Deny-list misses these no longer: float/string/blob are all rejected
-        // client-side, matching the server's get_index_key_type allow-list.
+        // client-side, as `gnitz_wire::index_key_type` rejects them server-side.
         for tc in [TypeCode::F32, TypeCode::F64, TypeCode::String, TypeCode::Blob] {
             assert!(validate_index_col_type(tc).is_err(), "{tc:?} must be rejected");
         }
