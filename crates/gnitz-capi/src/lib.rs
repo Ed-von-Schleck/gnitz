@@ -24,7 +24,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
 use gnitz_core::protocol::types::type_code_from_u64;
-use gnitz_core::{CircuitBuilder, CmpOp, ColumnLocator, ConflictClass, ExprBuilder, GnitzClient, SchemaFacts};
+use gnitz_core::{CmpOp, ColumnLocator, ConflictClass, ExprBuilder, GnitzClient, SchemaFacts};
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_sql::SqlPlanner;
 
@@ -123,10 +123,6 @@ impl GnitzBatch {
 pub struct GnitzExprBuilder(ExprBuilder);
 
 pub struct GnitzExprProgram(gnitz_core::ExprProgram);
-
-pub struct GnitzCircuitBuilder(CircuitBuilder);
-
-pub struct GnitzCircuit(gnitz_core::Circuit);
 
 // ---------------------------------------------------------------------------
 // Thread-local error buffer
@@ -691,8 +687,7 @@ pub unsafe extern "C" fn gnitz_batch_free(batch: *mut GnitzBatch) {
 // DDL
 // ---------------------------------------------------------------------------
 
-/// Allocate a fresh table ID (needed before calling gnitz_circuit_new).
-/// Returns 0 on error.
+/// Allocate a fresh table ID. Returns 0 on error.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_alloc_table_id(conn: *mut GnitzConn) -> u64 {
     clear_error();
@@ -921,38 +916,6 @@ pub unsafe extern "C" fn gnitz_create_view(
     }
 }
 
-/// Create a view from a pre-built circuit.
-/// CONSUMES circuit — do not free it after this call.
-/// Returns new view ID, or 0 on error.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_create_view_with_circuit(
-    conn: *mut GnitzConn,
-    schema_name: *const c_char,
-    view_name: *const c_char,
-    circuit: *mut GnitzCircuit,
-    output_schema: *const GnitzSchema,
-) -> u64 {
-    clear_error();
-    let c = check_ptr_mut!(conn, 0);
-    let s = check_ptr!(output_schema, 0);
-    if circuit.is_null() {
-        set_error("null circuit");
-        return 0;
-    }
-    let graph = unsafe { Box::from_raw(circuit) }.0;
-    // The C API's hand-built circuits emit a single output PK at slot 0.
-    match c
-        .0
-        .create_view_with_circuit(cstr(schema_name), cstr(view_name), "", graph, &s.0.columns, &[0])
-    {
-        Ok(id) => id,
-        Err(e) => {
-            set_error(e);
-            0
-        }
-    }
-}
-
 /// Drop a view. Returns 0 on success, -1 on error.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_drop_view(
@@ -1084,156 +1047,12 @@ pub unsafe extern "C" fn gnitz_expr_builder_free(b: *mut GnitzExprBuilder) {
     }
 }
 
-/// Free an ExprProgram (only if not consumed by gnitz_circuit_filter).
+/// Free an ExprProgram.
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_expr_program_free(p: *mut GnitzExprProgram) {
     if !p.is_null() {
         unsafe {
-            drop(Box::from_raw(p));
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CircuitBuilder
-// ---------------------------------------------------------------------------
-
-/// Create a new circuit builder. view_id must have been obtained from
-/// gnitz_alloc_table_id. primary_source_id is the source table's ID.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_new(view_id: u64, primary_source_id: u64) -> *mut GnitzCircuitBuilder {
-    Box::into_raw(Box::new(GnitzCircuitBuilder(CircuitBuilder::new(
-        view_id,
-        primary_source_id,
-    ))))
-}
-
-/// Add the primary input delta node. Returns node ID, or 0 on error.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_input_delta(cb: *mut GnitzCircuitBuilder) -> u64 {
-    check_ptr_mut!(cb, 0).0.input_delta()
-}
-
-/// Add a filter node. expr may be NULL (emits PARAM_FUNC_ID=0 only).
-/// If non-NULL, CONSUMES expr — do not free it afterwards.
-/// Returns node ID, or 0 on error.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_filter(
-    cb: *mut GnitzCircuitBuilder,
-    input: u64,
-    expr: *mut GnitzExprProgram,
-) -> u64 {
-    let cb_ref = check_ptr_mut!(cb, 0);
-    let expr_opt = if expr.is_null() {
-        None
-    } else {
-        Some(unsafe { Box::from_raw(expr) }.0)
-    };
-    cb_ref.0.filter(input, expr_opt)
-}
-
-/// Build a slice from a C `ptr`+`len`, treating a NULL pointer or zero length
-/// as empty. Caller guarantees a non-null `ptr` addresses `len` valid `T`s.
-unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
-    if ptr.is_null() || len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(ptr, len) }
-    }
-}
-
-/// Add a map/projection node.
-/// projection: array of output column indices (0-based), n_cols entries; may be NULL.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_map(
-    cb: *mut GnitzCircuitBuilder,
-    input: u64,
-    projection: *const usize,
-    n_cols: usize,
-) -> u64 {
-    let cb_ref = check_ptr_mut!(cb, 0);
-    let cols = unsafe { slice_or_empty(projection, n_cols) };
-    cb_ref.0.map(input, cols)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_negate(cb: *mut GnitzCircuitBuilder, input: u64) -> u64 {
-    check_ptr_mut!(cb, 0).0.negate(input)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_union(cb: *mut GnitzCircuitBuilder, a: u64, b: u64) -> u64 {
-    check_ptr_mut!(cb, 0).0.union(a, b)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_distinct(cb: *mut GnitzCircuitBuilder, input: u64) -> u64 {
-    check_ptr_mut!(cb, 0).0.distinct(input)
-}
-
-/// Reduce with automatic shard insertion.
-/// group_cols: array of column indices, n_group_cols entries; may be NULL/0 for no grouping.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_reduce(
-    cb: *mut GnitzCircuitBuilder,
-    input: u64,
-    group_cols: *const usize,
-    n_group_cols: usize,
-    agg_func_id: u64,
-    agg_col_idx: usize,
-) -> u64 {
-    let cb_ref = check_ptr_mut!(cb, 0);
-    let gcols = unsafe { slice_or_empty(group_cols, n_group_cols) };
-    cb_ref.0.reduce(input, gcols, agg_func_id, agg_col_idx)
-}
-
-/// Exchange shard. shard_cols: array of column indices, n_shard_cols entries.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_shard(
-    cb: *mut GnitzCircuitBuilder,
-    input: u64,
-    shard_cols: *const usize,
-    n_shard_cols: usize,
-) -> u64 {
-    let cb_ref = check_ptr_mut!(cb, 0);
-    let cols = unsafe { slice_or_empty(shard_cols, n_shard_cols) };
-    cb_ref.0.shard(input, cols)
-}
-
-/// Add the integrate (sink) node.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_sink(cb: *mut GnitzCircuitBuilder, input: u64) -> u64 {
-    check_ptr_mut!(cb, 0).0.sink(input)
-}
-
-/// Consume the builder and return a GnitzCircuit for gnitz_create_view_with_circuit.
-/// After this call the builder pointer is INVALID. Do NOT call gnitz_circuit_builder_free.
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_build(cb: *mut GnitzCircuitBuilder) -> *mut GnitzCircuit {
-    if cb.is_null() {
-        set_error("null pointer");
-        return std::ptr::null_mut();
-    }
-    let graph = unsafe { Box::from_raw(cb) }.0.build();
-    Box::into_raw(Box::new(GnitzCircuit(graph)))
-}
-
-/// Free a circuit builder without building (error-path cleanup only).
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_builder_free(cb: *mut GnitzCircuitBuilder) {
-    if !cb.is_null() {
-        unsafe {
-            drop(Box::from_raw(cb));
-        }
-    }
-}
-
-/// Free a GnitzCircuit (only if not consumed by gnitz_create_view_with_circuit).
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_free(c: *mut GnitzCircuit) {
-    if !c.is_null() {
-        unsafe {
-            drop(Box::from_raw(c));
+            drop(Box::from_raw(p).0);
         }
     }
 }

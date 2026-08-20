@@ -124,12 +124,6 @@ uint64_t gnitz_create_view(GnitzConn *conn,
                            uint64_t source_table_id,
                            const GnitzSchema *output_schema);
 
-uint64_t gnitz_create_view_with_circuit(GnitzConn *conn,
-                                        const char *schema_name,
-                                        const char *view_name,
-                                        GnitzCircuit *circuit,
-                                        const GnitzSchema *output_schema);
-
 int gnitz_drop_view(GnitzConn *conn, const char *schema_name, const char *view_name);
 
 GnitzExprBuilder *gnitz_expr_new(void);
@@ -171,43 +165,6 @@ GnitzExprProgram *gnitz_expr_build(GnitzExprBuilder *builder, uint32_t result_re
 void gnitz_expr_builder_free(GnitzExprBuilder *b);
 
 void gnitz_expr_program_free(GnitzExprProgram *p);
-
-GnitzCircuitBuilder *gnitz_circuit_new(uint64_t view_id, uint64_t primary_source_id);
-
-uint64_t gnitz_circuit_input_delta(GnitzCircuitBuilder *cb);
-
-uint64_t gnitz_circuit_filter(GnitzCircuitBuilder *cb, uint64_t input, GnitzExprProgram *expr);
-
-uint64_t gnitz_circuit_map(GnitzCircuitBuilder *cb,
-                           uint64_t input,
-                           const size_t *projection,
-                           size_t n_cols);
-
-uint64_t gnitz_circuit_negate(GnitzCircuitBuilder *cb, uint64_t input);
-
-uint64_t gnitz_circuit_union(GnitzCircuitBuilder *cb, uint64_t a, uint64_t b);
-
-uint64_t gnitz_circuit_distinct(GnitzCircuitBuilder *cb, uint64_t input);
-
-uint64_t gnitz_circuit_reduce(GnitzCircuitBuilder *cb,
-                              uint64_t input,
-                              const size_t *group_cols,
-                              size_t n_group_cols,
-                              uint64_t agg_func_id,
-                              size_t agg_col_idx);
-
-uint64_t gnitz_circuit_shard(GnitzCircuitBuilder *cb,
-                             uint64_t input,
-                             const size_t *shard_cols,
-                             size_t n_shard_cols);
-
-uint64_t gnitz_circuit_sink(GnitzCircuitBuilder *cb, uint64_t input);
-
-GnitzCircuit *gnitz_circuit_build(GnitzCircuitBuilder *cb);
-
-void gnitz_circuit_builder_free(GnitzCircuitBuilder *cb);
-
-void gnitz_circuit_free(GnitzCircuit *c);
 
 int gnitz_seek(GnitzConn *conn,
                uint64_t table_id,

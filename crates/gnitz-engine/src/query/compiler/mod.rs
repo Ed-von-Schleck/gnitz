@@ -1418,7 +1418,7 @@ mod tests {
     /// lands inside that side and reaches `emit_node`. It must reject, not
     /// panic: a panic there is a worker abort, and a worker crash takes the
     /// cluster down. No planner path emits the shape, and the planner asserts
-    /// against it, but the C circuit-builder surface (`gnitz_circuit_shard`)
+    /// against it, but a circuit hand-built through `gnitz_core::CircuitBuilder`
     /// bypasses the planner entirely.
     #[test]
     fn chained_exchange_rejects_instead_of_panicking() {

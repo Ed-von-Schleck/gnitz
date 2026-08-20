@@ -432,9 +432,9 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
             // node list, but each side's list is the ancestors of its own
             // exchange input with no such filter — so an exchange upstream of
             // another exchange's input stays in that side's list and arrives
-            // here. No planner path emits that shape; the C circuit-builder API
-            // (`gnitz_circuit_shard`) can, and rejecting is what keeps it from
-            // aborting a worker.
+            // here. No planner path emits that shape; a circuit hand-built
+            // through `gnitz_core::CircuitBuilder` can, and rejecting is what
+            // keeps it from aborting a worker.
             return Err(CompileError::Rejected("chained exchange nodes"));
         }
 
