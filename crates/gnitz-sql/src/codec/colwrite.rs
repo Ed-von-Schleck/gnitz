@@ -2,34 +2,28 @@
 //!
 //! Two write paths share this module. INSERT appends parsed literals
 //! (`append_value_to_col`); SET / `ON CONFLICT DO UPDATE` append computed
-//! values (`append_column_value`). They differ deliberately in their numeric
-//! policy — INSERT range-checks each literal and rejects out-of-range, while
-//! SET *wraps* (two's-complement cast) — so the shared mechanic
-//! (`encode_numeric`) is the byte emission, not the accept/reject decision.
+//! values (`append_column_value`). Both range-check against the column's type
+//! and reject an out-of-range value, through the same `pk_codec` packer — so
+//! `300` means the same thing whichever verb writes it, and neither path can
+//! land a value the other would refuse.
 
-use crate::codec::pk_codec::{parse_pk_literal_packed, parse_uuid_str};
+use crate::codec::pk_codec::{pack_pk_value, parse_pk_literal_packed, parse_uuid_str};
 use crate::error::GnitzSqlError;
 use gnitz_core::{ColData, ColumnDef, FixedInt, TypeCode};
 use sqlparser::ast::{Expr, UnaryOperator, Value};
 
+/// A computed SET / `DO UPDATE` value.
+///
+/// `Int` is `i128` rather than `i64` because a SET target may be `U64`, whose
+/// upper half no `i64` spells: a literal above `i64::MAX` binds as a wide
+/// literal and is parsed against the target's type code before it gets here.
+/// Every SET-admissible integer type is ≤ 8 bytes ([`set_target_admits`] gates
+/// on `FixedInt`), so `i128` covers the whole domain with room for the sign.
 #[derive(Clone)]
 pub(crate) enum ColumnValue {
-    Int(i64),
+    Int(i128),
     Str(String),
     Null,
-}
-
-/// Append the native little-endian bytes of integer `value`, wrapped
-/// (two's-complement truncated) to `fi`'s width — the SET / `DO UPDATE` cast
-/// policy (`i as u8`, `i as i16`, …). This is `FixedInt::pack` without its
-/// in-range debug-assert: the SET path wraps an out-of-range value rather than
-/// rejecting it, so masking to the width directly preserves that behavior. The
-/// INSERT and PK-literal paths instead range-check (declining out-of-range)
-/// before they reach the wire and never route through here.
-fn encode_numeric(buf: &mut Vec<u8>, fi: FixedInt, value: i64) {
-    let width = fi.width();
-    let packed = (value as u128) & (u128::MAX >> (128 - 8 * width));
-    buf.extend_from_slice(&packed.to_le_bytes()[..width]);
 }
 
 pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Expr) -> Result<(), GnitzSqlError> {
@@ -153,19 +147,23 @@ pub(crate) fn set_target_admits(tc: TypeCode, str_valued: bool) -> bool {
 }
 
 pub(crate) fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Result<(), GnitzSqlError> {
-    let str_valued = matches!(cv, ColumnValue::Str(_));
-    if !matches!(cv, ColumnValue::Null) && !set_target_admits(tc, str_valued) {
-        return Err(GnitzSqlError::Bind(format!(
-            "cannot assign {} value to a {tc:?} column",
-            if str_valued { "string" } else { "integer" }
-        )));
-    }
+    // `classify_set_rhs` settles the kind match per statement, where it can name
+    // the column; this is the same rule restated where the two `unreachable!`s
+    // below rely on it, and is unreachable in a well-formed compile.
+    debug_assert!(
+        matches!(cv, ColumnValue::Null) || set_target_admits(tc, matches!(cv, ColumnValue::Str(_))),
+        "SET value kind must be settled by classify_set_rhs, not here ({tc:?})"
+    );
     match cv {
         ColumnValue::Null => col.push_null(tc),
-        // Wrap-cast to the column's width (`i as u8`/`as i16`/…), the
-        // long-standing SET semantics, via the shared byte emitter.
+        // Range-checked and packed by the same `pk_codec` rule INSERT uses: an
+        // out-of-range value declines rather than wrapping to its low bits.
         ColumnValue::Int(i) => match col {
-            ColData::Fixed(buf) => encode_numeric(buf, FixedInt::from_type_code(tc).expect("admitted above"), i),
+            ColData::Fixed(buf) => {
+                let packed = pack_pk_value(tc, i)
+                    .ok_or_else(|| GnitzSqlError::Bind(format!("{tc:?} value out of range: {i}")))?;
+                buf.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
+            }
             other => unreachable!("a fixed-int type code implies ColData::Fixed, got {other:?}"),
         },
         ColumnValue::Str(s) => match col {
@@ -218,19 +216,43 @@ mod tests {
         }
     }
 
-    /// Every fixed-int width wraps to the byte-identical encoding the per-type
-    /// `i as uN` casts produced before `encode_numeric` collapsed them.
+    /// A SET value out of its column's range is rejected, not truncated to the
+    /// low bits. Each case used to write the wrapped byte pattern in the comment.
     #[test]
-    fn encode_numeric_matches_native_casts() {
-        let cases: [(TypeCode, i64, Vec<u8>); 8] = [
-            (TypeCode::U8, 300, vec![300u16 as u8]),
+    fn set_value_out_of_range_is_rejected() {
+        let cases: [(TypeCode, i128); 7] = [
+            (TypeCode::U8, 300),     // wrapped to 44
+            (TypeCode::U8, -1),      // wrapped to 255
+            (TypeCode::I8, 128),     // wrapped to -128
+            (TypeCode::U16, 70000),  // wrapped to 4464
+            (TypeCode::I16, -32769), // wrapped to 32767
+            (TypeCode::U32, -1),     // wrapped to 4294967295
+            (TypeCode::U64, -1),     // wrapped to u64::MAX
+        ];
+        for (tc, v) in cases {
+            let mut col = ColData::Fixed(Vec::new());
+            let e = append_column_value(&mut col, ColumnValue::Int(v), tc).unwrap_err();
+            assert!(
+                format!("{e:?}").contains("out of range"),
+                "{tc:?} value {v} must be rejected, got {e:?}"
+            );
+        }
+    }
+
+    /// In-range SET values encode to the column's native little-endian image at
+    /// every width and sign — including the upper half of U64, which no `i64`
+    /// spells and which the wrap of `-1` used to be the only route to.
+    #[test]
+    fn set_value_in_range_encodes_natively() {
+        let cases: [(TypeCode, i128, Vec<u8>); 8] = [
+            (TypeCode::U8, 255, vec![255u8]),
             (TypeCode::I8, -5, vec![(-5i8) as u8]),
-            (TypeCode::U16, 70000, (70000u32 as u16).to_le_bytes().to_vec()),
+            (TypeCode::U16, 65535, 65535u16.to_le_bytes().to_vec()),
             (TypeCode::I16, -2, (-2i16).to_le_bytes().to_vec()),
-            (TypeCode::U32, -1, ((-1i64) as u32).to_le_bytes().to_vec()),
+            (TypeCode::U32, 4294967295, 4294967295u32.to_le_bytes().to_vec()),
             (TypeCode::I32, -1, (-1i32).to_le_bytes().to_vec()),
-            (TypeCode::U64, -1, ((-1i64) as u64).to_le_bytes().to_vec()),
-            (TypeCode::I64, i64::MIN, i64::MIN.to_le_bytes().to_vec()),
+            (TypeCode::U64, u64::MAX as i128, u64::MAX.to_le_bytes().to_vec()),
+            (TypeCode::I64, i64::MIN as i128, i64::MIN.to_le_bytes().to_vec()),
         ];
         for (tc, v, expected) in cases {
             let mut col = ColData::Fixed(Vec::new());

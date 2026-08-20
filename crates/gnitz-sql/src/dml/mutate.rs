@@ -7,6 +7,7 @@
 use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
+use crate::codec::pk_codec::pack_pk_value;
 use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::overlay::{buffered_net, present_rows};
 use crate::dml::plan::{bind_where, fetch_bound, plan_where, AccessPlan, ReadBudget};
@@ -15,7 +16,7 @@ use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
 use crate::exec::residual::matching_indices;
 use crate::expr_lower::compile_scalar_evaluator;
-use crate::ir::BoundExpr;
+use crate::ir::{BoundExpr, UnaryOp};
 use crate::SqlResult;
 use gnitz_core::null_word_set;
 use gnitz_core::{
@@ -64,17 +65,24 @@ pub(crate) enum SetProgram {
 /// `append_column_value`, i.e. only once a row matched — so a zero-match WHERE
 /// would report 0 rows updated instead of rejecting.
 pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema) -> Result<SetProgram, GnitzSqlError> {
-    let p = match expr {
-        BoundExpr::LitStr(s) => SetProgram::Const(ColumnValue::Str(s.clone())),
-        BoundExpr::LitInt(v) => SetProgram::Const(ColumnValue::Int(*v)),
-        BoundExpr::LitNull => SetProgram::Const(ColumnValue::Null),
-        // `ColData::empty_for(TypeCode::String)` is the `Strings` variant and
-        // every batch reaching SET is built from a `Schema`, so the declared type
-        // code decides the representation.
-        BoundExpr::ColRef(c) if schema.columns[*c].type_code == TypeCode::String => SetProgram::StrCol(*c),
-        _ => SetProgram::Expr(Box::new(compile_scalar_evaluator(expr, schema)?)),
-    };
     let tc = schema.columns[target].type_code;
+    // Every constant integer shape lands in `Const`, including the negated and
+    // the wide ones the VM cannot lower — so a literal past `i64::MAX` writes
+    // (SET reaches the upper half of U64) and an out-of-range one is caught by
+    // the range check below, before any row is read.
+    let p = if let Some(v) = const_int_literal(expr) {
+        SetProgram::Const(ColumnValue::Int(v))
+    } else {
+        match expr {
+            BoundExpr::LitStr(s) => SetProgram::Const(ColumnValue::Str(s.clone())),
+            BoundExpr::LitNull => SetProgram::Const(ColumnValue::Null),
+            // `ColData::empty_for(TypeCode::String)` is the `Strings` variant and
+            // every batch reaching SET is built from a `Schema`, so the declared
+            // type code decides the representation.
+            BoundExpr::ColRef(c) if schema.columns[*c].type_code == TypeCode::String => SetProgram::StrCol(*c),
+            _ => SetProgram::Expr(Box::new(compile_scalar_evaluator(expr, schema)?)),
+        }
+    };
     let str_valued = match &p {
         SetProgram::Const(ColumnValue::Null) => return Ok(p), // NULL suits every column
         SetProgram::Const(cv) => matches!(cv, ColumnValue::Str(_)),
@@ -88,11 +96,44 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
             schema.columns[target].name,
         )));
     }
+    // A row-independent value is range-checked here, where the column has a name
+    // and no row has been read yet; a computed one can only be checked per row,
+    // in `append_column_value`, against the same `pack_pk_value` rule.
+    if let SetProgram::Const(ColumnValue::Int(v)) = &p {
+        if pack_pk_value(tc, *v).is_none() {
+            return Err(GnitzSqlError::Bind(format!(
+                "{tc:?} value out of range for column '{}': {v}",
+                schema.columns[target].name,
+            )));
+        }
+    }
     Ok(p)
 }
 
-/// Read one SET RHS for `row` of the batch `view` presents. Infallible — every
-/// rejection happened at [`classify_set_rhs`].
+/// A bound integer literal's value, sign applied — `LitInt` or the wide
+/// `LitWide` digit string, each optionally under an outer `Neg`. The SET path's
+/// half of the literal seam `access::bound_num_literal` holds for seeks. Every
+/// SET-admissible column is ≤ 8 bytes wide, so the whole accepted domain fits
+/// `i128`; a magnitude that does not (only a `U128`/`UUID` literal, which no SET
+/// target admits) declines here and is rejected as an un-lowerable RHS.
+fn const_int_literal(e: &BoundExpr) -> Option<i128> {
+    fn magnitude(e: &BoundExpr) -> Option<i128> {
+        match e {
+            BoundExpr::LitInt(v) => Some(*v as i128),
+            BoundExpr::LitWide(s) => s.parse::<i128>().ok(),
+            _ => None,
+        }
+    }
+    match e {
+        BoundExpr::UnaryOp(UnaryOp::Neg, inner) => magnitude(inner).map(|v| -v),
+        e => magnitude(e),
+    }
+}
+
+/// Read one SET RHS for `row` of the batch `view` presents. Infallible: every
+/// *kind* rejection happened at [`classify_set_rhs`]. A computed value's range
+/// is the one verdict that cannot be reached until the value exists, so it is
+/// taken where the value is written (`append_column_value`).
 pub(crate) fn eval_set_program(p: &SetProgram, view: &ZSetBatchView<'_>, row: usize) -> ColumnValue {
     match p {
         SetProgram::Const(cv) => cv.clone(),
@@ -123,7 +164,7 @@ pub(crate) fn eval_set_program(p: &SetProgram, view: &ZSetBatchView<'_>, row: us
         // moving a ~24-byte enum, and the match is free.
         SetProgram::Expr(ev) => match ev.eval_row(view, row) {
             None => ColumnValue::Null,
-            Some(v) => ColumnValue::Int(v),
+            Some(v) => ColumnValue::Int(v as i128),
         },
     }
 }
@@ -345,8 +386,8 @@ pub(crate) fn execute_update(
     // offsets, type codes and the nullability verdict.
     //
     // Ahead of the read, not inside it: an un-compilable RHS (`SET int_col =
-    // float_col`, a wide literal) errors deterministically, never only when at
-    // least one row matched.
+    // float_col`) or an out-of-range constant errors deterministically, never
+    // only when at least one row matched.
     let programs = assignments
         .iter()
         .map(|(ci, e)| Ok((*ci, classify_set_rhs(e, *ci, &schema)?)))

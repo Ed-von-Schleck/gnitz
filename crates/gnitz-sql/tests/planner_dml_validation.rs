@@ -9,6 +9,7 @@
 
 mod common;
 use common::*;
+use gnitz_sql::GnitzSqlError;
 use gnitz_test_harness::ServerHandle;
 
 // ── Bug 6: duplicate column in SET list ──────────────────────────────
@@ -143,4 +144,83 @@ fn insert_partial_column_list_is_rejected() {
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     let result = try_exec(&mut client, &sn, "INSERT INTO t (id) VALUES (1)");
     assert!(result.is_err(), "INSERT with a partial column list must be rejected");
+}
+
+/// `UPDATE … SET` range-checks its value exactly as INSERT does. It used to wrap
+/// two's-complement (`SET tiny = 300` storing 44), so the same value had two
+/// meanings depending on which verb wrote it.
+#[test]
+fn update_set_rejects_out_of_range_value() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, u8c TINYINT UNSIGNED, i16c SMALLINT, u64c BIGINT UNSIGNED)",
+    );
+    exec(&mut client, &sn, "INSERT INTO t VALUES (1, 1, 1, 1)");
+    // The narrow columns are 1 and 2 bytes wide, so the i64 helpers cannot read
+    // them; decode the two cells directly.
+    fn narrow(client: &mut gnitz_core::GnitzClient, sn: &str) -> (i64, i64) {
+        let (s, b) = read_sql(client, sn, "SELECT u8c, i16c FROM t");
+        let fixed = |ci: usize, w: usize| match &b.columns[ci] {
+            gnitz_core::ColData::Fixed(v) => v[..w].to_vec(),
+            other => panic!("expected Fixed, got {other:?}"),
+        };
+        let u8v = fixed(col_idx(&s, "u8c"), 1)[0] as i64;
+        let i16v = i16::from_le_bytes(fixed(col_idx(&s, "i16c"), 2).try_into().unwrap()) as i64;
+        (u8v, i16v)
+    }
+    for sql in [
+        "UPDATE t SET u8c = 300",
+        "UPDATE t SET u8c = -1",
+        "UPDATE t SET i16c = 40000",
+        "UPDATE t SET u64c = -1",
+        // A computed RHS runs through the VM and must range-check the same way.
+        "UPDATE t SET u8c = u8c + 300",
+    ] {
+        let e = try_exec(&mut client, &sn, sql).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("out of range"),
+            "`{sql}` must be rejected as out of range, got {e:?}"
+        );
+    }
+    // Nothing was written by any rejected statement.
+    assert_eq!(narrow(&mut client, &sn), (1i64, 1i64));
+    // In-range values still write, at every width and sign.
+    exec(&mut client, &sn, "UPDATE t SET u8c = 255, i16c = -32768");
+    assert_eq!(narrow(&mut client, &sn), (255i64, -32768i64));
+}
+
+/// Removing SET's wrap must not cost the upper half of U64: an integer literal
+/// above `i64::MAX` binds as a wide literal, which the SET path previously could
+/// not compile at all. `SET u64_col = 18446744073709551615` now writes the value
+/// INSERT would, rather than being reachable only through the `-1` wrap.
+#[test]
+fn update_set_writes_the_full_u64_domain() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, u BIGINT UNSIGNED)",
+    );
+    exec(&mut client, &sn, "INSERT INTO t VALUES (1, 0)");
+    exec(&mut client, &sn, "UPDATE t SET u = 18446744073709551615");
+    let (s, b) = read_sql(&mut client, &sn, "SELECT u FROM t");
+    let ci = col_idx(&s, "u");
+    assert_eq!(
+        cell_i64(&s, &b, ci, 0) as u64,
+        u64::MAX,
+        "SET reaches the full U64 domain, as INSERT does"
+    );
+    // A wide literal that does not fit the target is still rejected.
+    let e = try_exec(&mut client, &sn, "UPDATE t SET u = 99999999999999999999999").unwrap_err();
+    assert!(format!("{e:?}").contains("out of range"), "got {e:?}");
 }

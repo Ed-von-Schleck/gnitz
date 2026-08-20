@@ -1397,29 +1397,47 @@ class TestWideLiteralMutateGuards:
         finally:
             _cleanup(client, sn, "t")
 
-    def test_update_set_wide_literal_errors_on_empty_match(self, client):
-        """UPDATE SET <u64> = <wide> rejects even when the WHERE matches nothing:
-        the SET-value guard fires eagerly at plan time, so there is no silent
-        0-row success."""
+    def test_update_set_reaches_the_full_u64_domain(self, client):
+        """SET parses a wide literal against the target's type, so `v = U64_MAX`
+        writes the value INSERT would. It is the same `pk_codec` seam the seeks
+        use, so the two surfaces accept the same set."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
             client.execute_sql(self._CREATE, schema_name=sn)
             tid, _ = client.resolve_table(sn, "t")
             client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
-            with pytest.raises(gnitz.GnitzError):
-                # WHERE pk = 999 matches nothing; the SET-value guard fires first.
-                client.execute_sql(
-                    f"UPDATE t SET v = {U64_MAX} WHERE pk = 999", schema_name=sn
-                )
+            client.execute_sql(f"UPDATE t SET v = {U64_MAX}", schema_name=sn)
+            rows = _scan_map(client, tid)
+            assert rows[1].v == U64_MAX
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_update_set_out_of_range_errors_on_empty_match(self, client):
+        """A SET value past the column's range rejects eagerly at plan time, even
+        when the WHERE matches nothing — no silent 0-row success, and no
+        two's-complement wrap."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE, schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
+            for value in (f"{U64_MAX + 1}", "-1"):
+                with pytest.raises(gnitz.GnitzError):
+                    # WHERE pk = 999 matches nothing; the guard fires first.
+                    client.execute_sql(
+                        f"UPDATE t SET v = {value} WHERE pk = 999", schema_name=sn
+                    )
             rows = _scan_map(client, tid)
             assert rows[1].v == 100  # untouched
         finally:
             _cleanup(client, sn, "t")
 
-    def test_on_conflict_do_update_wide_literal_errors_on_no_conflict(self, client):
-        """INSERT ... ON CONFLICT DO UPDATE SET <u64> = <wide> rejects at plan
-        time even when the PK does not conflict — no silent insert."""
+    def test_on_conflict_do_update_out_of_range_errors_on_no_conflict(self, client):
+        """INSERT ... ON CONFLICT DO UPDATE SET rejects an out-of-range value at
+        plan time even when the PK does not conflict — no silent insert. The
+        in-range wide literal is accepted on the same surface."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -1430,11 +1448,19 @@ class TestWideLiteralMutateGuards:
                 # pk = 2 does not exist → no conflict; the SET-value guard fires.
                 client.execute_sql(
                     f"INSERT INTO t VALUES (2, 1) "
-                    f"ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX}",
+                    f"ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX + 1}",
                     schema_name=sn,
                 )
             rows = _scan_map(client, tid)
             assert 2 not in rows  # nothing inserted
+            # The same statement with an in-range wide literal is accepted, and
+            # the DO UPDATE applies when the PK does conflict.
+            client.execute_sql(
+                f"INSERT INTO t VALUES (1, 1) "
+                f"ON CONFLICT (pk) DO UPDATE SET v = {U64_MAX}",
+                schema_name=sn,
+            )
+            assert _scan_map(client, tid)[1].v == U64_MAX
         finally:
             _cleanup(client, sn, "t")
 
