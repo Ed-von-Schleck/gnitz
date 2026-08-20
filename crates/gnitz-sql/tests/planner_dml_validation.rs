@@ -224,3 +224,35 @@ fn update_set_writes_the_full_u64_domain() {
     let e = try_exec(&mut client, &sn, "UPDATE t SET u = 99999999999999999999999").unwrap_err();
     assert!(format!("{e:?}").contains("out of range"), "got {e:?}");
 }
+
+/// A long non-integer `IN` list is a clean error, not a stack overflow. The
+/// fallback used to build a left-nested OR tree and descend its spine once per
+/// item before any register existed, so `MAX_REGS` could never reject it first.
+#[test]
+fn long_non_integer_in_list_errors_cleanly() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    // A float operand misses the INT_IN_SET fast path, so the list folds.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, f DOUBLE PRECISION)",
+    );
+    let items: Vec<String> = (0..10_000).map(|i| format!("{i}.5")).collect();
+    let sql = format!("SELECT id FROM t WHERE f IN ({})", items.join(", "));
+    let e = try_exec(&mut client, &sn, &sql).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            GnitzSqlError::Unsupported(_) | GnitzSqlError::Plan(_) | GnitzSqlError::Bind(_)
+        ),
+        "a too-long IN list must be a planner error, got {e:?}"
+    );
+    // A short list of the same shape still compiles and runs.
+    exec(&mut client, &sn, "INSERT INTO t VALUES (1, 2.5)");
+    let (_, b) = read_sql(&mut client, &sn, "SELECT id FROM t WHERE f IN (2.5, 3.5)");
+    assert_eq!(b.len(), 1, "the short float IN list still matches");
+}

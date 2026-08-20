@@ -26,18 +26,6 @@ fn fold_int_literal(e: &BoundExpr) -> Option<i64> {
     }
 }
 
-/// The OR-chain fallback for a non-integer / non-literal `IN`:
-/// `inner = i0 OR inner = i1 OR …`. `items` must be non-empty (the binder rejects
-/// `IN ()`).
-fn in_list_or_chain(inner: &BoundExpr, items: &[BoundExpr]) -> BoundExpr {
-    let eq = |it: &BoundExpr| BoundExpr::BinOp(Box::new(inner.clone()), BinOp::Eq, Box::new(it.clone()));
-    let mut chain = eq(&items[0]);
-    for it in &items[1..] {
-        chain = BoundExpr::BinOp(Box::new(chain), BinOp::Or, Box::new(eq(it)));
-    }
-    chain
-}
-
 /// How one of the six SQL comparisons rides the three string primitives: which
 /// primitive to emit, whether to exchange its operands, and whether to negate
 /// its result. The one place that mapping is written; `None` is "not a
@@ -622,10 +610,19 @@ impl OpcodeBackend<'_> {
                 return Ok((self.eb.int_in_set(reg, idx), ExprKind::Int));
             }
         }
-        // Fallback: OR-chain via the existing binop path (float operand →
-        // int_to_float + fcmp; non-literal item → column compare). Rare,
-        // register-limited as today.
-        self.lower(&in_list_or_chain(inner, items))
+        // Fallback: fold `inner = item` per item through the existing binop path
+        // (float operand → int_to_float + fcmp; non-literal item → column
+        // compare). Folded iteratively rather than built as a left-nested OR
+        // tree: `lower` descends the left spine before allocating any register,
+        // so a long list overflowed the stack before `MAX_REGS` could reject it.
+        // The emitted program is unchanged — `binop`'s `Or` arm lowers its left
+        // operand fully before its right, which is this same order.
+        let (mut acc, _) = self.binop(inner, BinOp::Eq, &items[0])?;
+        for it in &items[1..] {
+            let (r, _) = self.binop(inner, BinOp::Eq, it)?;
+            acc = self.eb.bool_or(acc, r);
+        }
+        Ok((acc, ExprKind::Int))
     }
 
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<(u32, ExprKind), GnitzSqlError> {
