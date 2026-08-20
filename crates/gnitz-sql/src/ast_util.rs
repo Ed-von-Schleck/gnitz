@@ -17,18 +17,16 @@ pub(crate) fn extract_name(name: &sqlparser::ast::ObjectName, context: &str) -> 
         .ok_or_else(|| GnitzSqlError::Bind(format!("empty name in {context}")))
 }
 
-/// True when every projection item is a wildcard that names no output column of
-/// its own: a bare `*`, or `* EXCEPT/EXCLUDE(…)`, which only drop columns. The
-/// output names are then the source's own, so a duplicate among them belongs to
-/// the source (a join surfacing both sides' `val`) and is carried through
-/// positionally rather than rejected.
+/// True when the projection is one unqualified wildcard that names no output
+/// column of its own: a bare `*`, or `* EXCEPT/EXCLUDE(…)`, which only drop
+/// columns. The output names are then the source's own, so a duplicate among
+/// them belongs to the source (a join surfacing both sides' `val`) and is
+/// carried through positionally rather than rejected.
 ///
 /// `RENAME` does name its output and can collide with a column the same wildcard
 /// passes through, so it is excluded here and gets the duplicate check.
 pub(crate) fn is_name_preserving_wildcard_projection(projection: &[sqlparser::ast::SelectItem]) -> bool {
-    projection
-        .iter()
-        .all(|p| matches!(p, sqlparser::ast::SelectItem::Wildcard(o) if o.opt_rename.is_none()))
+    single_wildcard(projection).is_some_and(|o| o.opt_rename.is_none())
 }
 
 /// True when a SELECT carries a GROUP BY — either `GROUP BY ALL` or a non-empty
@@ -844,15 +842,26 @@ pub(crate) fn wildcard_name_is_visible<'a>(cols: impl IntoIterator<Item = &'a Co
         .any(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(name))
 }
 
-/// A plain `*` projection (every item is `Wildcard` with NO modifiers) — a true
+/// The options of the projection's single unqualified wildcard, else `None` —
+/// the structural half both wildcard-projection predicates share. Requiring
+/// *exactly one* item is what keeps `SELECT *, *` out of every wildcard rule: it
+/// names each source column twice, which the named form (`SELECT id, a, a`) is
+/// rejected for, so it must reach the duplicate-name gate rather than the
+/// identity fast paths.
+fn single_wildcard(projection: &[SelectItem]) -> Option<&WildcardAdditionalOptions> {
+    match projection {
+        [SelectItem::Wildcard(o)] => Some(o),
+        _ => None,
+    }
+}
+
+/// A plain `*` projection (one `Wildcard` item with NO modifiers) — a true
 /// identity expansion. A wildcard carrying any option is excluded, so the
 /// identity fast paths guarded by this fall through to real expansion where the
 /// options are honored (`EXCEPT`/`EXCLUDE`/`RENAME`) or rejected
 /// (`REPLACE`/`ILIKE`).
 pub(crate) fn is_bare_wildcard_projection(projection: &[SelectItem]) -> bool {
-    projection
-        .iter()
-        .all(|p| matches!(p, SelectItem::Wildcard(o) if !wildcard_options_present(o)))
+    single_wildcard(projection).is_some_and(|o| !wildcard_options_present(o))
 }
 
 #[cfg(test)]

@@ -632,3 +632,71 @@ fn test_projection_computed_column_raw_index_name() {
         names(&s)
     );
 }
+
+/// `SELECT *, *` names every source column twice, which every equivalent named
+/// projection (`SELECT id, a, a`) is rejected for. It must be rejected on every
+/// surface — plain read, filtered read, DISTINCT and CREATE VIEW — not silently
+/// collapsed to `SELECT *` by an identity fast path on some of them and
+/// committed as a doubled-name relation on others.
+#[test]
+fn test_projection_repeated_wildcard_is_rejected_everywhere() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT)").unwrap();
+    }
+    for sql in [
+        "SELECT *, * FROM t",
+        "SELECT *, * FROM t WHERE a > 0",
+        "SELECT DISTINCT *, * FROM t",
+        "CREATE VIEW v AS SELECT *, * FROM t",
+    ] {
+        let e = try_exec(&mut client, &sn, sql).unwrap_err();
+        let msg = format!("{e:?}");
+        assert!(
+            msg.contains("duplicate column name"),
+            "`{sql}` must be rejected as a duplicate output name, got: {msg}"
+        );
+    }
+    // A repeated qualified wildcard was already rejected; it stays rejected.
+    try_exec(&mut client, &sn, "SELECT t.*, t.* FROM t").unwrap_err();
+}
+
+/// The single-item wildcard fast paths are untouched by the repeat rejection:
+/// `SELECT *` still reads, filters, DISTINCTs, RETURNs and defines a view whose
+/// columns are exactly the source's.
+#[test]
+fn test_projection_single_wildcard_still_takes_every_fast_path() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT)").unwrap();
+        p.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+        p.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+    }
+    for sql in [
+        "SELECT * FROM t",
+        "SELECT * FROM t WHERE a > 0",
+        "SELECT DISTINCT * FROM t",
+    ] {
+        let (s, b) = read_sql(&mut client, &sn, sql);
+        assert_eq!(b.len(), 2, "`{sql}` returns both rows");
+        assert_eq!(visible_names(&s), vec!["id", "a"], "`{sql}` carries each column once");
+    }
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert_eq!(
+        names(&s),
+        vec!["id", "a"],
+        "`SELECT *` view carries the source columns once"
+    );
+    let (_, b) = read_sql(&mut client, &sn, "INSERT INTO t VALUES (3, 30) RETURNING *");
+    assert_eq!(b.len(), 1, "RETURNING * still takes its wildcard path");
+}
