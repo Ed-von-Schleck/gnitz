@@ -1001,3 +1001,50 @@ fn having_rejections() {
         "HAVING: column 'n' not found",
     );
 }
+
+/// The ad-hoc fold compiler and the view (HIR) compiler bind the same HAVING
+/// against the same grouped relation, so a rejection must read identically on
+/// both — a user cannot tell, and must not need to tell, which one answered.
+/// The two hold these verdicts as separate literals, so nothing but this pins
+/// them together.
+#[test]
+fn having_rejections_read_identically_on_both_compilers() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, amount BIGINT NOT NULL)",
+    );
+    // One body per HAVING rule that is reachable from SQL. (The
+    // unresolvable-aggregate verdict is not: both compilers collect a HAVING
+    // aggregate into the reduce before binding it, so every call resolves.)
+    for (i, body) in [
+        // A column that is neither grouped nor aggregated.
+        "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING amount > 0",
+        // A column that names nothing at all.
+        "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING nope > 0",
+        // IS [NOT] NULL over neither an aggregate nor a group column.
+        "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING (g + 1) IS NULL",
+        // An operand that is no column reference at all.
+        "SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING 1 IS NULL",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let adhoc = try_exec(&mut client, &sn, body).unwrap_err();
+        let view = try_exec(&mut client, &sn, &format!("CREATE VIEW v{i} AS {body}")).unwrap_err();
+        assert_eq!(msg_of(&adhoc), msg_of(&view), "the two compilers disagree on `{body}`");
+    }
+}
+
+/// The message text of a planner error, without its variant.
+fn msg_of(e: &GnitzSqlError) -> String {
+    match e {
+        GnitzSqlError::Unsupported(m) | GnitzSqlError::Bind(m) | GnitzSqlError::Plan(m) => m.clone(),
+        other => format!("{other:?}"),
+    }
+}

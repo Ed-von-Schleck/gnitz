@@ -382,9 +382,11 @@ fn type_of(env: &[HirCol], r: &HirRef) -> TypeCode {
 }
 
 /// The leaf for a single-relation body (linear WHERE + projection). Resolves a
-/// column name against the relation's env; structurally identical to
-/// `SingleTable`, differing only in the reference payload (`HirRef::Col(id)` vs a
-/// `usize` position).
+/// column name against the relation's env, by `HirRef::Col(id)` where
+/// `SingleTable` uses a `usize` position. Not a restatement of `SingleTable`:
+/// their `bind_function`s are opposites — `SingleTable` binds an aggregate call,
+/// this one rejects every aggregate, because a Simple body's aggregates route to
+/// the GroupBy builder instead.
 struct HirSingleTable<'a> {
     env: &'a [HirCol],
 }
@@ -1345,7 +1347,16 @@ impl<L: LeafBinder<HirRef>> GroupedLeaf<'_, L> {
         self.aggs
             .iter()
             .find(|a| a.agg.func == func && a.agg.arg == arg)
-            .ok_or_else(|| GnitzSqlError::Bind(format!("HAVING: aggregate {func:?} could not be resolved")))
+            .ok_or_else(|| {
+                // Defensive: an aggregate reaching here was collected into the
+                // reduce first, so no SQL body resolves to `None`. Spelled
+                // exactly as the ad-hoc fold binder spells it, argument column
+                // included, so the two cannot describe one invariant two ways.
+                GnitzSqlError::Bind(format!(
+                    "HAVING: aggregate {func:?}({}) could not be resolved",
+                    arg.map_or("*", |id| hircol_of(self.env, id).def.name.as_str())
+                ))
+            })
     }
 }
 
