@@ -157,16 +157,10 @@ pub fn validate_scan_multi_tids(tids: &[u64]) -> Result<(), String> {
 /// order) instead of the immediate-emit fast path — the multi-scan drain
 /// requires ring order to equal request order.
 ///
-/// **Deliberately aliases `FLAG_SCAN_MULTI`** (defined as its value so the two
-/// can never silently drift apart); disambiguated purely by frame direction. Bit
-/// 62 on a *client→master* frame is the SCAN_MULTI request (consumed at
-/// `handle_message`, never propagated into a SAL group); on a *master→worker scan
-/// group* it is this FIFO directive. The full u64 survives into the group's
-/// control block, so the worker reads it back as an ordinary wire flag. It is
-/// therefore deliberately **not** added to the `high_flags` disjointness guard
-/// below (doing so would trip the collision assert against `FLAG_SCAN_MULTI`,
-/// which the guard already covers).
-pub const FLAG_SCAN_FIFO_REPLY: u64 = FLAG_SCAN_MULTI;
+/// Sits with the other engine-internal booleans, `FLAG_SCAN_LAST` and
+/// `FLAG_RESOLVE`, and is covered by the disjointness guard below like every
+/// other flag.
+pub const FLAG_SCAN_FIFO_REPLY: u64 = 1 << 55;
 
 /// Engine-internal batch-layout claims stamped on SAL / W2M frames
 /// (sorted / consolidated); never sent to clients. Defined here so the
@@ -234,6 +228,7 @@ const _: () = {
         FLAG_ALLOCATE_INDEX_ID,
         FLAG_PUSH_TXN,
         FLAG_SCAN_MULTI,
+        FLAG_SCAN_FIFO_REPLY,
     ];
 
     let mut acc = 0u64;
