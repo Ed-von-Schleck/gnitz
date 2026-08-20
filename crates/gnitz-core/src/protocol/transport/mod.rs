@@ -342,12 +342,11 @@ pub(crate) fn parse_frame_len(hdr: [u8; 4], max_payload_len: usize) -> Result<us
     Ok(payload_len)
 }
 
-/// Encode the 4-byte LE length prefix for a frame, rejecting the two
-/// lengths that would corrupt the wire stream: zero (collides with the
-/// `recv_framed` close sentinel) and anything above `u32::MAX` (would
-/// silently truncate the prefix). Single enforcement point shared by every
-/// framed-send path.
-pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; 4], ProtocolError> {
+/// Encode the LE length prefix for a frame, rejecting the two lengths that would
+/// corrupt the wire stream: zero (collides with the `recv_framed` close
+/// sentinel) and anything above `u32::MAX` (would silently truncate the prefix).
+/// Single enforcement point shared by every framed-send path.
+pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], ProtocolError> {
     if len == 0 {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

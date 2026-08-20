@@ -14,6 +14,12 @@ pub const MAX_FRAME_PAYLOAD_SERVER: usize = 64 * 1024 * 1024; // 64 MB
 /// of MB; the server is trusted so the risk model is different.
 pub const MAX_FRAME_PAYLOAD_CLIENT: usize = 256 * 1024 * 1024; // 256 MB
 
+/// Width of the length prefix in front of every framed payload, on every path
+/// that carries one: the client socket stream (`recv_framed` and its senders),
+/// the reactor's header recv, and the W2M ring slot the master forwards to a
+/// client verbatim. A `u32` LE count of the payload bytes that follow.
+pub const FRAME_LEN_PREFIX_BYTES: usize = 4;
+
 // ---------------------------------------------------------------------------
 // HELLO handshake
 // ---------------------------------------------------------------------------
