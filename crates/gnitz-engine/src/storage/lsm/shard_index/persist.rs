@@ -43,7 +43,7 @@ impl ShardIndex {
     /// only read of that file, so the caller's own header fields come from here
     /// rather than a second peek. `Ok(None)` when the manifest is absent
     /// (first-time table boot); other read errors propagate.
-    pub fn load_manifest(&mut self, path: &str) -> Result<Option<ManifestHeader>, StorageError> {
+    pub(crate) fn load_manifest(&mut self, path: &str) -> Result<Option<ManifestHeader>, StorageError> {
         let cpath = super::super::cstr(path)?;
         let Some((entries, header)) = manifest::read_file(&cpath)? else {
             return Ok(None);
@@ -87,7 +87,7 @@ impl ShardIndex {
     /// Startup GC: removes orphaned shard/compaction files and stale `.tmp`
     /// artifacts left by crashes.  Must run after a successful load_manifest()
     /// so the live set is populated before files are deleted.
-    pub fn gc_orphans(&self) -> usize {
+    pub(crate) fn gc_orphans(&self) -> usize {
         let live: HashSet<&str> = self.all_entries().map(|e| shard_basename(&e.filename)).collect();
 
         let mut removed = 0usize;
@@ -108,7 +108,7 @@ impl ShardIndex {
     ///
     /// The header's two sequence fields come from the publisher: the checkpoint
     /// generation from the round, the layout sequence from the table's child set.
-    pub fn prepare_manifest(
+    pub(crate) fn prepare_manifest(
         &self,
         manifest_path: &CStr,
         checkpoint_gen: u64,

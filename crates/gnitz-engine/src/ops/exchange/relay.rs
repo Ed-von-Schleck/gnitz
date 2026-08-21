@@ -76,7 +76,7 @@ fn worker_rows_to_batches(
         .collect()
 }
 
-pub(crate) fn op_repartition_batches_mode(
+pub fn op_repartition_batches_mode(
     sources: &[Option<&Batch>],
     col_indices: &[u32],
     target_tcs: &[u8],
@@ -299,7 +299,7 @@ pub(super) fn op_relay_scatter_consolidated(
     op_relay_scatter_consolidated_mode(sources, col_indices, &[], schema, num_workers, RouteMode::GroupKey)
 }
 
-pub(crate) fn op_relay_scatter_consolidated_mode(
+pub fn op_relay_scatter_consolidated_mode(
     sources: &[Option<&Batch>],
     col_indices: &[u32],
     target_tcs: &[u8],
@@ -374,7 +374,7 @@ pub(crate) fn op_relay_scatter_consolidated_mode(
 /// row) cannot deliver. Sibling of `op_repartition_batches_mode` /
 /// `op_relay_scatter_consolidated_mode`, but without `col_indices` / `RouteMode`
 /// (broadcast routes nothing).
-pub(crate) fn op_relay_broadcast(sources: &[Option<&Batch>], schema: &SchemaDescriptor) -> Batch {
+pub fn op_relay_broadcast(sources: &[Option<&Batch>], schema: &SchemaDescriptor) -> Batch {
     let total: usize = sources.iter().flatten().map(|b| b.count).sum();
     if total == 0 {
         return Batch::empty_with_schema(schema);

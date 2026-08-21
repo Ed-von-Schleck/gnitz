@@ -19,7 +19,7 @@
 //! downward (schema/foundation) or sideways within this layer.
 
 pub(super) mod batch;
-pub(crate) mod batch_pool;
+pub mod batch_pool;
 pub(super) mod batch_wire;
 pub(super) mod bloom;
 pub(super) mod columnar;

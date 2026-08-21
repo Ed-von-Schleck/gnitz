@@ -403,7 +403,7 @@ pub(in crate::storage) fn write_test_shard(
 /// Write the .tmp shard, close, and rename to `basename`. The sole shard writer.
 /// Unsynced — the caller registers the result for the flush barrier's batched
 /// fdatasync sweep (see [`ShardWriteOpts`]).
-pub fn write_shard_streaming(
+pub(crate) fn write_shard_streaming(
     dirfd: c_int,
     basename: &CStr,
     row_count: u32,

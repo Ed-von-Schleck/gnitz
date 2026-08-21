@@ -4,7 +4,7 @@
 // One wire descriptor carries bound extraction, predicate evaluation, and the
 // sink — row forwarding (projection + ORDER BY / LIMIT top-k) or an aggregate
 // fold — out to the workers, executed single-pass over each worker's merged
-// partition cursor. Both client (gnitz-core) and engine (gnitz-engine worker)
+// partition cursor. Both client (gnitz-core) and engine (gnitz-server worker)
 // share this encoder/decoder — the same drift-safety rule `RangeDescriptor`
 // follows. The master forwards the encoded blob verbatim (it never decodes the
 // bound); the worker decodes it at the trust boundary and rejects any

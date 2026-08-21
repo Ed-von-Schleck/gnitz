@@ -14,7 +14,7 @@ use super::cogroup::cogroup_left;
 /// Production never calls this — `Instr::WeightClamp` dispatches to
 /// [`op_weight_clamp`] directly — so it is `#[cfg(test)]`.
 #[cfg(test)]
-pub fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> (Batch, Batch) {
+pub(crate) fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> (Batch, Batch) {
     op_weight_clamp(delta, cursor, schema, -1, 1)
 }
 
@@ -28,7 +28,7 @@ pub fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescrip
 /// Both are the DBSP incremental form of a per-element weight clamp lifted to its
 /// delta. Returns `(output_batch, consolidated_delta)`; the consolidated delta is
 /// returned so the caller can feed it to `ingest_batch`.
-pub fn op_weight_clamp(
+pub(crate) fn op_weight_clamp(
     delta: Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,

@@ -131,11 +131,11 @@ fn stream_fed_views_are_invalid_at_boot() {
         crate::storage::flush_barrier([store], crate::storage::FlushRound::Ephemeral(g)).unwrap();
     }
 
-    let invalid = engine.compute_invalid_views();
-    assert!(invalid.contains(&direct), "a direct stream source invalidates");
-    assert!(invalid.contains(&downstream), "and the verdict cascades");
+    engine.compute_invalid_views();
+    assert!(engine.view_is_invalid(direct), "a direct stream source invalidates");
+    assert!(engine.view_is_invalid(downstream), "and the verdict cascades");
     assert!(
-        !invalid.contains(&over_table),
+        !engine.view_is_invalid(over_table),
         "a checkpointed view over a base table resumes, so the rejection is about the stream"
     );
 

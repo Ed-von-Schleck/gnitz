@@ -10,7 +10,7 @@
 //!
 //! Views are *not* rebuilt at catalog open. `hook_relation_register` registers a
 //! view empty and never fills it, so a `CatalogEngine::open` in isolation
-//! reopens views **empty**; boot view state lives in the runtime layer —
+//! reopens views **empty**; boot view state is the server's —
 //! checkpoint resume for generation-valid views, the master-driven invalid-view
 //! rebuild otherwise — and is exercised by the E2E suite, not this
 //! single-process catalog test. These tests assert the catalog-layer contract:
@@ -66,8 +66,8 @@ fn index_weight(engine: &mut CatalogEngine, tid: i64) -> i64 {
 // pass the equality vacuously), the secondary index must hold exactly the
 // single-materialisation weights (not doubled), and the view must be **empty**
 // both at registration and after reopen — every view is populated by the
-// runtime layer's distributed backfill, which this single-process engine has
-// no counterpart to.
+// server's distributed backfill, which this single-process engine has no
+// counterpart to.
 //
 // This path therefore exercises `backfill_index` (still inline at open) against
 // the *absence* of any catalog-layer view fill. View population is covered by
@@ -97,7 +97,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     // order registration needs to resolve the view's sources and schema.
     let vid = register_identity_view(&mut engine, tid, "v_base", &cols);
 
-    // Registration alone materialises nothing — the runtime's distributed
+    // Registration alone materialises nothing — the server's distributed
     // backfill is the sole driver, and a catalog-layer fill here would
     // double-count against it.
     let view_entry = engine.dag.tables.get(&vid).expect("view registered");
@@ -130,13 +130,13 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     );
 
     // The view's ephemeral storage was erased at open and is NOT rebuilt at the
-    // catalog layer: boot view state is the runtime layer's (checkpoint resume,
+    // catalog layer: boot view state is the server's (checkpoint resume,
     // else the master-driven rebuild), covered by the E2E suite.
     let view_entry = engine2.dag.tables.get(&vid).expect("view replayed");
     assert_eq!(
         sum_weights(view_entry.open_cursor()),
         0,
-        "view must come back empty at catalog open — rebuild deferred to runtime"
+        "view must come back empty at catalog open — rebuild deferred to the server"
     );
 
     // Same invariant for the secondary index.

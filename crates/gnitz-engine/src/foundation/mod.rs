@@ -5,15 +5,16 @@
 //!   - `env`        — numeric `GNITZ_*` environment-variable overrides
 //!   - `fault`      — debug-only `GNITZ_INJECT_*` fault-injection seams
 //!   - `xxh`        — XXH3 hashing
-//!   - `posix_io`   — POSIX I/O and Linux syscall wrappers (file I/O, sockets,
-//!     mmap + its unaligned `*_raw` accessors, eventfd/futex/memfd IPC)
+//!   - `posix_io`   — POSIX file-I/O and mmap wrappers. The server's IPC and
+//!     socket tier is NOT here: it has no caller in this crate and lives beside
+//!     the rings it serves, in `gnitz-server`
 //!   - `worker_ctx` — per-process worker rank / count, fork role, and the
 //!     checkpoint generation a manifest must carry to be resumed from
 
 #[macro_use]
-pub(crate) mod log;
-pub(crate) mod env;
-pub(crate) mod fault;
-pub(crate) mod posix_io;
-pub(crate) mod worker_ctx;
-pub(crate) mod xxh;
+pub mod log;
+pub mod env;
+pub mod fault;
+pub mod posix_io;
+pub mod worker_ctx;
+pub mod xxh;

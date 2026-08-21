@@ -194,7 +194,7 @@ impl Side {
     /// relayed batches (and empty placeholders) with. Never the view's final
     /// combine-widened schema, which is a different width for a JOIN and would
     /// mislabel the operand batch.
-    pub fn exchange_schema(&self) -> SchemaDescriptor {
+    pub(super) fn exchange_schema(&self) -> SchemaDescriptor {
         self.plan.vm.program.reg_meta[self.plan.out_reg as usize].schema
     }
 }
@@ -269,7 +269,7 @@ pub(crate) enum Hydration {
 impl CompileOutput {
     /// Every sub-plan of the shape, for whole-plan sweeps (regfile clears,
     /// checkpoint table collection).
-    pub fn sub_plans_mut(&mut self) -> impl Iterator<Item = &mut SubPlan> {
+    pub(super) fn sub_plans_mut(&mut self) -> impl Iterator<Item = &mut SubPlan> {
         let (sides, single, post) = match &mut self.shape {
             PlanShape::Single(sub) => (&mut [][..], Some(sub), None),
             PlanShape::Exchanged { sides, post } => (&mut sides[..], None, Some(post)),

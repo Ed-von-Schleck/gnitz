@@ -119,7 +119,7 @@ impl CatalogEngine {
     /// removes this worker's scratch operator dirs, and invalidates the
     /// plan cache so the next backfill recompiles against the empty store + fresh
     /// scratch.
-    pub(crate) fn reset_view_output_for_rebuild(&mut self, vid: i64) -> Result<(), String> {
+    pub fn reset_view_output_for_rebuild(&mut self, vid: i64) -> Result<(), String> {
         let dir = self
             .dag
             .tables
@@ -206,7 +206,7 @@ impl CatalogEngine {
     /// must be read together when either changes. A view checkpointed at a
     /// different worker count carries a different set of names and finds no
     /// manifest at all, which is the same verdict the topology word already gives.
-    pub fn compute_invalid_views(&mut self) -> FxHashSet<i64> {
+    pub fn compute_invalid_views(&mut self) {
         self.assert_pre_fork("compute_invalid_views");
         let launched_workers = self.num_workers;
         // The engine's own copy, which `index_recovery_source` reads for the index
@@ -219,7 +219,8 @@ impl CatalogEngine {
         // A worker-count or STATE_FORMAT change re-shapes every keyed store, so no
         // view resumes and nothing below need be read.
         if !topo_valid {
-            return view_ids.into_iter().collect();
+            self.invalid_views = view_ids.into_iter().collect();
+            return;
         }
 
         // Phase 1: local validity (no direct stream source + every output child's
@@ -249,7 +250,8 @@ impl CatalogEngine {
         }
         if invalid.is_empty() {
             // Clean restart: nothing to propagate, so skip the ordering walk below.
-            return invalid;
+            self.invalid_views = invalid;
+            return;
         }
 
         // Phase 2: propagate invalidity to any still-valid view that scans an
@@ -262,7 +264,7 @@ impl CatalogEngine {
                 invalid.insert(vid);
             }
         }
-        invalid
+        self.invalid_views = invalid;
     }
 
     /// Maximum `current_lsn` across all tables — system and user. The

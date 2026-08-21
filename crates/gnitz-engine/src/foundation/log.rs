@@ -17,15 +17,15 @@ static LEVEL: AtomicU32 = AtomicU32::new(0);
 /// Process tag packed as [b0, b1, b2, len] in native byte order.
 static TAG: AtomicU32 = AtomicU32::new(0);
 
-pub(crate) const QUIET: u32 = 0;
-pub(crate) const NORMAL: u32 = 1;
-pub(crate) const DEBUG: u32 = 2;
+pub const QUIET: u32 = 0;
+pub const NORMAL: u32 = 1;
+pub const DEBUG: u32 = 2;
 
 /// Set the log level and process tag. A tag is at most three bytes: `MAX_WORKERS`
 /// is 64 and `main.rs` validates the count into `1..=64`, so the longest one a
 /// worker forms is `"W63"` — exactly what fits. The clamp below is what keeps a
 /// release build from panicking rather than a supported way to pass more.
-pub(crate) fn init(level: u32, tag: &[u8]) {
+pub fn init(level: u32, tag: &[u8]) {
     debug_assert!(tag.len() <= 3);
     LEVEL.store(level.min(DEBUG), Ordering::Relaxed);
     let len = tag.len().min(3);
@@ -36,12 +36,12 @@ pub(crate) fn init(level: u32, tag: &[u8]) {
 }
 
 #[inline(always)]
-pub(crate) fn is_debug() -> bool {
+pub fn is_debug() -> bool {
     LEVEL.load(Ordering::Relaxed) >= DEBUG
 }
 
 #[inline(always)]
-pub(crate) fn is_info() -> bool {
+pub fn is_info() -> bool {
     LEVEL.load(Ordering::Relaxed) >= NORMAL
 }
 
@@ -52,12 +52,24 @@ pub(crate) fn is_info() -> bool {
 /// paths. An over-long message is truncated; the trailing `\n` is always the
 /// final byte, so even a truncated line terminates inside the one `write(2)`.
 #[cold]
-pub(crate) fn _emit(level_tag: &str, args: core::fmt::Arguments<'_>) {
+pub fn _emit(level_tag: &str, args: core::fmt::Arguments<'_>) {
     let mut buf = [0u8; LINE_MAX];
     let len = format_line(&mut buf, level_tag, args);
     unsafe {
         libc::write(2, buf.as_ptr() as *const libc::c_void, len);
     }
+}
+
+/// Terminate the process with exit code 134 (= 128 + SIGABRT) without running
+/// atexit handlers, TLS destructors or a stdio flush. Called by
+/// [`gnitz_fatal_abort!`]; it lives here so the macro expands to no unqualified
+/// `libc` path and a consumer needs no `libc` of its own.
+///
+/// Diverges, like the `_exit` it wraps: `gnitz_fatal_abort!` is used in
+/// value positions (a match arm whose siblings yield values), which a `()`
+/// return would break.
+pub fn _abort_134() -> ! {
+    unsafe { libc::_exit(134) }
 }
 
 /// Truncating `fmt::Write` over a fixed buffer: keeps what fits, silently
@@ -105,6 +117,7 @@ fn format_line(buf: &mut [u8; LINE_MAX], level_tag: &str, args: core::fmt::Argum
 }
 
 /// Log at ERROR level (always emits).
+#[macro_export]
 macro_rules! gnitz_error {
     ($($arg:tt)*) => {
         $crate::foundation::log::_emit("ERROR", format_args!($($arg)*));
@@ -112,6 +125,7 @@ macro_rules! gnitz_error {
 }
 
 /// Log at WARN level (always emits).
+#[macro_export]
 macro_rules! gnitz_warn {
     ($($arg:tt)*) => {
         $crate::foundation::log::_emit("WARN", format_args!($($arg)*));
@@ -119,6 +133,7 @@ macro_rules! gnitz_warn {
 }
 
 /// Log at INFO level (emits when level >= NORMAL).
+#[macro_export]
 macro_rules! gnitz_info {
     ($($arg:tt)*) => {
         if $crate::foundation::log::is_info() {
@@ -128,6 +143,7 @@ macro_rules! gnitz_info {
 }
 
 /// Log at DEBUG level (emits when level >= DEBUG).
+#[macro_export]
 macro_rules! gnitz_debug {
     ($($arg:tt)*) => {
         if $crate::foundation::log::is_debug() {
@@ -136,15 +152,21 @@ macro_rules! gnitz_debug {
     };
 }
 
-/// Emit a FATAL log line and immediately terminate the process with exit
-/// code 134 (= 128 + SIGABRT). Uses `libc::_exit` to skip atexit handlers,
-/// TLS destructors, and stdio flush — none of which are safe to run with a
-/// broken SAL mmap or in-flight io_uring SQEs. Matches the "aborted" signal
-/// convention that systemd/monit expect.
+/// Emit a FATAL log line and immediately terminate **the calling process** with
+/// exit code 134 (= 128 + SIGABRT), through [`_abort_134`].
+///
+/// The termination is unconditional and uninterceptable: `_exit` runs no atexit
+/// handler, no TLS destructor, no `Drop` and no stdio flush, `catch_unwind` does
+/// not see it, and no wrapper can intercept it. None of those are safe to run
+/// with a broken SAL mmap or in-flight io_uring SQEs, which is why the engine
+/// uses it — but a caller that cannot afford to lose its process must not reach
+/// any path that can invoke this. The exit code matches the "aborted"
+/// convention systemd/monit expect.
+#[macro_export]
 macro_rules! gnitz_fatal_abort {
     ($($arg:tt)*) => {{
         $crate::foundation::log::_emit("FATAL", format_args!($($arg)*));
-        unsafe { ::libc::_exit(134) };
+        $crate::foundation::log::_abort_134()
     }};
 }
 

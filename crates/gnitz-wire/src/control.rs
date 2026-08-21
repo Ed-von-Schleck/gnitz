@@ -1,7 +1,7 @@
 //! IPC control-block wire layout.
 //!
-//! The control WAL block carries the per-message header. Both `gnitz-engine`
-//! (server) and `gnitz-core` (client) build/parse this block; the column
+//! The control WAL block carries the per-message header. Both `gnitz-server`
+//! and `gnitz-core` (client) build/parse this block; the column
 //! indices, payload indices, and null-bit positions live here so the two
 //! implementations cannot drift.
 //!

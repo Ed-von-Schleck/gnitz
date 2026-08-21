@@ -95,7 +95,7 @@ impl CatalogEngine {
     /// while holding it, so a borrow would not do. Uses the infallible
     /// non-checking scan — the contiguity-checking form stays a direct storage
     /// scan at its precheck call sites.
-    pub(crate) fn read_column_defs(&mut self, owner_id: i64) -> Rc<Vec<ColumnDef>> {
+    pub fn read_column_defs(&mut self, owner_id: i64) -> Rc<Vec<ColumnDef>> {
         if let Some(defs) = self.caches.col_defs.get(&owner_id) {
             return defs.clone();
         }
@@ -110,7 +110,7 @@ impl CatalogEngine {
         self.dag.tables.contains_key(&table_id)
     }
 
-    pub(crate) fn has_schema(&self, name: &str) -> bool {
+    pub fn has_schema(&self, name: &str) -> bool {
         self.caches.schema_by_name.contains_key(name)
     }
 
@@ -190,7 +190,7 @@ impl CatalogEngine {
     }
 
     /// The entity id registered under a canonical `"schema.relation"` key.
-    pub(crate) fn entity_id_by_qname(&self, qname: &str) -> Option<i64> {
+    pub fn entity_id_by_qname(&self, qname: &str) -> Option<i64> {
         self.caches.entity_by_qname.get(qname).copied()
     }
 
@@ -311,7 +311,7 @@ impl CatalogEngine {
 
     /// The one writer of the resume generation: the field and the process-global
     /// mirror every no-catalog `Table::new` caller reads always move together.
-    pub(crate) fn set_resume_generation(&mut self, g: u64) {
+    pub fn set_resume_generation(&mut self, g: u64) {
         self.resume_generation = g;
         crate::foundation::worker_ctx::set_committed_generation(g);
     }

@@ -23,7 +23,7 @@ use gnitz_wire::{
 // ---------------------------------------------------------------------------
 
 pub(super) const SYSTEM_SCHEMA_ID: i64 = 1;
-pub(super) const PUBLIC_SCHEMA_ID: i64 = 2;
+pub const PUBLIC_SCHEMA_ID: i64 = 2;
 pub(super) const FIRST_USER_SCHEMA_ID: i64 = gnitz_wire::FIRST_USER_SCHEMA_ID as i64;
 
 pub(super) const OWNER_KIND_TABLE: i64 = gnitz_wire::OWNER_KIND_TABLE as i64;
@@ -41,7 +41,7 @@ pub(super) const SEQ_ID_CHECKPOINT_GEN: i64 = 4;
 /// Cluster topology: `(worker_count as u64) << 32 | STATE_FORMAT as u64`.
 pub(super) const SEQ_ID_TOPOLOGY: i64 = 5;
 
-pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
+pub const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
 
 /// A conservative tripwire on durable relation-id allocation, not a live limit —
@@ -66,7 +66,7 @@ pub(super) const TABLE_TAB_ID: i64 = gnitz_wire::TABLE_TAB as i64;
 pub(super) const VIEW_TAB_ID: i64 = gnitz_wire::VIEW_TAB as i64;
 pub(super) const COL_TAB_ID: i64 = gnitz_wire::COL_TAB as i64;
 pub(super) const IDX_TAB_ID: i64 = gnitz_wire::IDX_TAB as i64;
-pub(crate) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
+pub const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
 pub(super) const CIRCUIT_NODES_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODES_TAB as i64;
 pub(super) const CIRCUIT_EDGES_TAB_ID: i64 = gnitz_wire::CIRCUIT_EDGES_TAB as i64;
 pub(super) const CIRCUIT_NODE_COLUMNS_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB as i64;
@@ -253,7 +253,7 @@ pub(super) fn read_idx_tab_cursor_row(cursor: &crate::storage::ReadCursor) -> (i
 /// IDX_TAB family creates — positive-weight rows whose column list is
 /// well-formed. The DDL driver pre-flights each one before the bundle is made
 /// durable; `packed` is the same word the unique-filter map is keyed by.
-pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, u64, PkColList)> {
+pub fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, u64, PkColList)> {
     (0..batch.count)
         .filter(|&i| batch.get_weight(i) > 0)
         .filter_map(|i| {
@@ -267,7 +267,7 @@ pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, u64, PkColList)
 /// The `(owner_id, packed_source_cols)` of every index this IDX_TAB family drops
 /// — its negative-weight rows. The DDL driver clears each pair's unique filter
 /// once the drop is durable.
-pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, u64)> {
+pub fn idx_tab_drops(batch: &Batch) -> Vec<(i64, u64)> {
     (0..batch.count)
         .filter(|&i| batch.get_weight(i) < 0)
         .map(|i| {
@@ -357,7 +357,7 @@ pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
 /// both answers, so a view rename triggers no backfill and a table rename's tid
 /// is never treated as dropped. Batch-local: the whole family (both signs of a
 /// pair) arrives as one batch on every path.
-pub(crate) fn family_pks_by_sign(batch: &Batch, positive: bool) -> Vec<i64> {
+pub fn family_pks_by_sign(batch: &Batch, positive: bool) -> Vec<i64> {
     pk_signatures(batch)
         .into_iter()
         .filter(|s| !s.is_pair() && if positive { s.pos.is_some() } else { s.neg.is_some() })
@@ -538,7 +538,7 @@ const TOPO_PRIORITY: [u8; SysFamily::COUNT] = [
 /// `gnitz_wire::SYS_FAMILIES`, `TOPO_PRIORITY`, `SCHEMAS`, and
 /// `CatalogEngine::sys_stores`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SysFamily {
+pub enum SysFamily {
     Schema,
     Table,
     View,
@@ -584,7 +584,7 @@ impl SysFamily {
     /// The `*_TAB_ID` constant for this family, narrowed to the `i64` the
     /// catalog storage edge and every `sys_*` signature use.
     #[inline]
-    pub(crate) fn id(self) -> i64 {
+    pub fn id(self) -> i64 {
         self.wire().id as i64
     }
 
@@ -596,13 +596,13 @@ impl SysFamily {
 
     /// This family's fixed schema.
     #[inline]
-    pub(crate) fn schema(self) -> SchemaDescriptor {
+    pub fn schema(self) -> SchemaDescriptor {
         SCHEMAS[self.index()]
     }
 
     /// Topological creation priority (see [`TOPO_PRIORITY`]).
     #[inline]
-    pub(crate) fn topo_priority(self) -> u8 {
+    pub fn topo_priority(self) -> u8 {
         TOPO_PRIORITY[self.index()]
     }
 
@@ -620,7 +620,7 @@ impl SysFamily {
     }
 
     /// Inverse of [`Self::id`]; `None` for any id that is not a system family.
-    pub(crate) const fn from_id(id: i64) -> Option<Self> {
+    pub const fn from_id(id: i64) -> Option<Self> {
         match id {
             SCHEMA_TAB_ID => Some(SysFamily::Schema),
             TABLE_TAB_ID => Some(SysFamily::Table),

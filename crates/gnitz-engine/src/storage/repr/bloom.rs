@@ -17,7 +17,7 @@ pub(crate) struct BloomFilter {
 }
 
 impl BloomFilter {
-    pub fn new(expected_n: u32) -> Self {
+    pub(crate) fn new(expected_n: u32) -> Self {
         let n = (expected_n as usize).max(1);
         let m = n * BITS_PER_KEY;
         let num_bytes_raw = ((m + 7) >> 3).max(8);
@@ -32,14 +32,14 @@ impl BloomFilter {
     }
 
     #[inline]
-    pub fn add(&mut self, key: u64) {
+    pub(crate) fn add(&mut self, key: u64) {
         for pos in probes(key, self.num_bits) {
             self.bits[(pos >> 3) as usize] |= 1u8 << (pos & 7);
         }
     }
 
     #[inline]
-    pub fn may_contain(&self, key: u64) -> bool {
+    pub(crate) fn may_contain(&self, key: u64) -> bool {
         probes(key, self.num_bits).all(|pos| self.bits[(pos >> 3) as usize] & (1u8 << (pos & 7)) != 0)
     }
 }

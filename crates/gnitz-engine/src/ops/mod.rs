@@ -1,3 +1,19 @@
+//! The DBSP operators: the kernels a compiled circuit's instructions dispatch
+//! to, each consuming and emitting deltas rather than recomputing from state.
+//!
+//!   - `linear`    — filter, map, negate, union (Theorem 3.3: no state added)
+//!   - `join`      — the bilinear operators, equi and range, and their traces
+//!   - `reduce`    — the aggregates and their secondary value indexes
+//!   - `distinct`  — the weight clamps every set operation is built from
+//!   - `exchange`  — repartition, relay and broadcast across workers
+//!   - `index`     — integration into a store and its secondary indexes
+//!   - `cogroup` / `reindex` / `util` — the shared grouping and key machinery
+//!
+//! What leaves the crate is the exchange surface alone: the runtime drives
+//! repartition and relay directly, so those names are `pub`. Every other
+//! operator is reached through a compiled circuit, never called by name from
+//! outside, and stays `pub(crate)`.
+
 mod cogroup;
 mod distinct;
 mod exchange;
@@ -14,9 +30,9 @@ mod bench_secondary_index;
 #[cfg(test)]
 pub(crate) use distinct::op_distinct;
 pub(crate) use distinct::op_weight_clamp;
-pub(crate) use exchange::{
-    op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, op_worker_filter, reset_slots,
-    RouteMode,
+pub(crate) use exchange::op_worker_filter;
+pub use exchange::{
+    op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, reset_slots, RouteMode,
 };
 pub(crate) use index::{op_integrate_with_indexes, AviBake, IntegrateTarget as OpsIntegrateTarget};
 pub(crate) use join::{op_join_delta_trace, op_join_delta_trace_range};

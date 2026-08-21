@@ -1,0 +1,33 @@
+[package]
+name = "gnitz-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gnitz-server"
+path = "src/main.rs"
+
+[dependencies]
+gnitz-engine = { path = "../gnitz-engine" }
+gnitz-wire   = { path = "../gnitz-wire" }
+gnitz-expr   = { path = "../gnitz-expr" }
+libc = "0.2"
+io-uring = "0.7"
+rustc-hash = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# default-features = false pins the ring backend explicitly: rcgen's default
+# crypto backend must NOT be aws-lc-rs (it needs a C/cmake toolchain and would
+# break the "no C++ toolchain" promise). "pem" is required for Certificate::pem().
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+
+[dev-dependencies]
+gnitz-engine-testkit = { path = "../gnitz-engine-testkit" }
+gnitz-core = { path = "../gnitz-core" }
+tempfile = "3"
+proptest = "1"
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

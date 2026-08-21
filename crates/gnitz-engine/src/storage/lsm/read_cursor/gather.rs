@@ -12,7 +12,7 @@ use super::super::batch::Batch;
 use super::ReadCursor;
 use crate::schema::SchemaDescriptor;
 
-pub(crate) struct PkSetGather {
+pub struct PkSetGather {
     cursor: ReadCursor,
     /// The keys' OPK images, `stride` bytes each, concatenated. **Ascending**:
     /// OPK order is typed PK order, so a sorted list makes the walk monotone

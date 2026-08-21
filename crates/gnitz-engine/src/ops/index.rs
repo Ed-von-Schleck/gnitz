@@ -21,7 +21,7 @@ use super::reindex::ReindexPacker;
 /// a stripped `(col, for_max, type)` tuple) lets the population derive
 /// `for_max`/type the same way the reduce read side does, so the two cannot
 /// drift.
-pub struct AviBake {
+pub(crate) struct AviBake {
     /// Packs a row's group columns into the AVI key's leading OPK prefix. The
     /// same packer that stamps a reindexed `_join_pk`, so the prefix is the OPK
     /// image `AviBake::schema` declares — one byte comparison orders it.
@@ -54,7 +54,7 @@ impl AviBake {
 /// The `unsafe` deref does not disappear, it *moves*: `Program::tables` is a
 /// `Vec<*mut Table>`, so the VM resolves each pointer at its own seat where the
 /// pool lives, and `ops` stops carrying one.
-pub enum IntegrateTarget<'a> {
+pub(crate) enum IntegrateTarget<'a> {
     /// A trace table: the delta accumulates as rows.
     Trace(&'a mut crate::storage::Table),
     /// The combined aggregate value index: one table serves *every* MIN/MAX
@@ -70,7 +70,7 @@ pub enum IntegrateTarget<'a> {
 /// combined AggValueIndex secondary index.
 ///
 /// The Rust Table handles memtable capacity internally (flush-on-overflow).
-pub fn op_integrate_with_indexes(
+pub(crate) fn op_integrate_with_indexes(
     batch: &Batch,
     target: IntegrateTarget<'_>,
 ) -> Result<(), crate::storage::StorageError> {
@@ -149,7 +149,7 @@ pub fn op_integrate_with_indexes(
 
         if avi_batch.count > 0 {
             // Propagate like the trace ingest above: `ops` is a Result-returning
-            // library layer (its test/bench callers `.unwrap()`); the runtime
+            // library layer (its test/bench callers `.unwrap()`); the server
             // consumer (the VM Integrate instruction) is what fail-stops.
             avi_table.ingest_owned_batch(avi_batch)?;
         }

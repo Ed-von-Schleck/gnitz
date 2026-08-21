@@ -62,7 +62,7 @@ impl MappedShard {
     }
 
     #[inline]
-    pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
+    pub(crate) fn get_pk_bytes(&self, row: usize) -> &[u8] {
         let width = self.pk_stride as usize;
         &self.data()[self.pk.row_off(row)..][..width]
     }
@@ -72,7 +72,7 @@ impl MappedShard {
     /// (`count == 0`) has no row to read `get_pk_bytes` from, so it returns
     /// zero-key bounds; an empty shard is never probed, so these bounds are
     /// only a defensive backstop.
-    pub fn pk_bounds(&self) -> (PkBuf, PkBuf) {
+    pub(crate) fn pk_bounds(&self) -> (PkBuf, PkBuf) {
         if self.count > 0 {
             (
                 PkBuf::from_bytes(self.get_pk_bytes(0)),
@@ -85,7 +85,7 @@ impl MappedShard {
     }
 
     #[inline]
-    pub fn get_weight(&self, row: usize) -> i64 {
+    pub(crate) fn get_weight(&self, row: usize) -> i64 {
         match &self.weight {
             WeightRegion::Direct(v) => read_i64_le(self.data(), v.row_off(row)),
             WeightRegion::TwoValue {
@@ -106,12 +106,12 @@ impl MappedShard {
     /// every payload column the file predates forced to NULL (`null_pad_mask`,
     /// `0` for a full-width shard).
     #[inline]
-    pub fn get_null_word(&self, row: usize) -> u64 {
+    pub(crate) fn get_null_word(&self, row: usize) -> u64 {
         read_u64_le(self.data(), self.null_bmp.row_off(row)) | self.null_pad_mask
     }
 
     #[inline]
-    pub fn get_col_ptr(&self, row: usize, payload_col_idx: usize, col_size: usize) -> &[u8] {
+    pub(crate) fn get_col_ptr(&self, row: usize, payload_col_idx: usize, col_size: usize) -> &[u8] {
         match &self.col_regions[payload_col_idx] {
             PayloadRegion::Direct(v) => &self.data()[v.row_off(row)..][..col_size],
             // `col_size == elem_width`; the decoded image serves the same
@@ -122,7 +122,7 @@ impl MappedShard {
     }
 
     #[inline]
-    pub fn blob_slice(&self) -> &[u8] {
+    pub(crate) fn blob_slice(&self) -> &[u8] {
         &self.data()[self.blob_off..self.blob_off + self.blob_len]
     }
 
@@ -134,7 +134,7 @@ impl MappedShard {
     }
 
     /// A shard carrying no filter admits every key.
-    pub fn xor8_may_contain(&self, probe_key: u64) -> bool {
+    pub(crate) fn xor8_may_contain(&self, probe_key: u64) -> bool {
         match &self.xor8_filter {
             Some(filter) => xor8::may_contain(filter, probe_key),
             None => true,
@@ -171,7 +171,7 @@ impl MappedShard {
     /// First row whose OPK bytes are `>= key`. A raw `memcmp` binary search —
     /// correct at every PK width with no schema dependency. `key` must be
     /// exactly `pk_stride` OPK bytes.
-    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
+    pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         let stride = self.pk_stride as usize;
         let cp = self.pk_col_ptr();
         unsafe { super::super::columnar::seek_lower_bound(self.count, stride, cp, key) }
@@ -181,7 +181,7 @@ impl MappedShard {
     /// position): `O(log gap)` when the boundary is just ahead, `O(1)` when it
     /// IS the hint, never worse than `find_lower_bound_bytes`. `key` must be
     /// exactly `pk_stride` OPK bytes.
-    pub fn advance_to(&self, key: &[u8], hint: usize) -> usize {
+    pub(crate) fn advance_to(&self, key: &[u8], hint: usize) -> usize {
         let stride = self.pk_stride as usize;
         let cp = self.pk_col_ptr();
         unsafe { super::super::columnar::seek_advance_to(self.count, stride, cp, key, hint) }

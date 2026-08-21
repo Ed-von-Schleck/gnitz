@@ -366,8 +366,8 @@ impl CatalogEngine {
                     other => return Err(format!("{} is not a relation family", other.name())),
                 };
                 self.register_relation(reg)?;
-                // Registration leaves a view EMPTY. Filling it is the runtime
-                // layer's: `backfill_views_in_dep_order` for a live CREATE,
+                // Registration leaves a view EMPTY. Filling it is the server's:
+                // `backfill_views_in_dep_order` for a live CREATE,
                 // checkpoint resume, or the master's invalid-view rebuild at boot.
                 // Filling here would double-count against all three.
             } else if !net_live {

@@ -22,7 +22,7 @@ const COMPACT_RUN_LEN: usize = 16;
 /// How a map fills the output PK region — the explicit form of a decision the
 /// caller alone can make, so no path can silently leave the region unwritten.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PkFill {
+pub(crate) enum PkFill {
     /// Inherit the input PK verbatim. Requires equal PK strides, which the
     /// circuit compiler rejects a violation of and the ad-hoc reply guard checks.
     Copy,
@@ -289,7 +289,7 @@ struct ColMove {
 /// compiler/VM dispatch is per-node, so a func is only ever driven through the
 /// entry point matching its variant. Newtype over the private enum so the
 /// variant fields keep the module's internal visibility.
-pub struct ScalarFunc(Repr);
+pub(crate) struct ScalarFunc(Repr);
 
 /// Both variants are boxed so `Repr` stays pointer-sized: a `MapPlan` owns a
 /// whole `SchemaDescriptor` and an `Evaluator` a whole register file, so either
@@ -330,7 +330,7 @@ struct MapPlan {
 
 impl ScalarFunc {
     /// Filter via interpreted expression.
-    pub fn from_predicate(logical: LogicalProgram, schema: &SchemaDescriptor) -> Result<Self, ExprValidateErr> {
+    pub(crate) fn from_predicate(logical: LogicalProgram, schema: &SchemaDescriptor) -> Result<Self, ExprValidateErr> {
         Ok(ScalarFunc(Repr::Predicate(Box::new(logical.resolve_filter(schema)?))))
     }
 
@@ -338,7 +338,7 @@ impl ScalarFunc {
     /// special case where every instruction is a `CopyCol` (see
     /// [`LogicalProgram::copy_cols`]): `compute` is `None` and the plan reduces to
     /// `col_moves` + `null_perm`.
-    pub fn from_map(
+    pub(crate) fn from_map(
         logical: LogicalProgram,
         in_schema: &SchemaDescriptor,
         out_schema: &SchemaDescriptor,
@@ -401,7 +401,7 @@ impl ScalarFunc {
     /// The map's owned output schema. Callers that construct or stamp the
     /// output batch outside [`Self::evaluate_map_batch`] (op_map's reindex arms)
     /// read it here instead of carrying a parallel schema operand.
-    pub fn map_out_schema(&self) -> &SchemaDescriptor {
+    pub(crate) fn map_out_schema(&self) -> &SchemaDescriptor {
         &self.map().out_schema
     }
 
@@ -414,7 +414,7 @@ impl ScalarFunc {
     ///
     /// `out` is caller-owned so it can be reused across chunks; a `[(0, n)]`
     /// singleton is the agreed spelling of "no predicate".
-    pub fn filter_ranges(&self, batch: &Batch, out: &mut Vec<(usize, usize)>) {
+    pub(crate) fn filter_ranges(&self, batch: &Batch, out: &mut Vec<(usize, usize)>) {
         let Repr::Predicate(ev) = &self.0 else {
             unreachable!("filter_ranges on a Map ScalarFunc (the VM dispatch is per-node)");
         };
@@ -429,14 +429,14 @@ impl ScalarFunc {
     /// The PK region passes through verbatim ([`PkFill::Copy`]), so the strides
     /// must agree; that is the rows-sink reply guard, and PK *type* parity is
     /// planner-guaranteed by the verbatim passthrough clone.
-    pub fn append_map_ranges(&self, src: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
+    pub(crate) fn append_map_ranges(&self, src: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
         self.map().map_ranges_into(src, keeper, ranges, PkFill::Copy);
     }
 
     /// Execute map over a whole batch into a fresh output: the DBSP `op_map`
     /// entry point. `pk` says whether the output PK region is inherited verbatim
     /// or stamped by the caller's reindex afterwards.
-    pub fn evaluate_map_batch(&self, in_batch: &Batch, pk: PkFill) -> Batch {
+    pub(crate) fn evaluate_map_batch(&self, in_batch: &Batch, pk: PkFill) -> Batch {
         let map = self.map();
         let n = in_batch.count;
         if n == 0 {

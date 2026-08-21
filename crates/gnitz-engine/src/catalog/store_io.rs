@@ -382,7 +382,7 @@ impl CatalogEngine {
     /// The handle owns its sources via `Rc`, so it stays valid while the
     /// caller mutates OTHER relations (index table, view family) between
     /// chunks; the scanned relation itself must not be written mid-loop.
-    pub(crate) fn open_store_cursor(&self, table_id: i64) -> Option<ReadCursor> {
+    pub fn open_store_cursor(&self, table_id: i64) -> Option<ReadCursor> {
         self.dag.tables.get(&table_id).map(|e| e.open_cursor())
     }
 
@@ -402,7 +402,7 @@ impl CatalogEngine {
     /// this source". A registered-but-empty table yields `Some`, and a provably
     /// empty range yields `Some(SourceCursor::Empty)` — collapsing that into
     /// `None` would skip the source rather than feed it one empty epoch.
-    pub(crate) fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Option<SourceCursor> {
+    pub fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Option<SourceCursor> {
         // Must precede `source_scan_bound`: `handle_backfill` reaches here before
         // anything compiles the view, and an uncached plan would silently report
         // "no bound" — the motivating GROUP BY case would full-scan invisibly.
@@ -541,7 +541,7 @@ enum IndexScan {
 ///
 /// Every variant is boxed (a `ReadCursor` is ~560 bytes; clippy's
 /// `large_enum_variant`) — one allocation per scan, never per chunk.
-pub(crate) enum SourceCursor {
+pub enum SourceCursor {
     Full(Box<ReadCursor>),
     Bounded(Box<BoundedIndexCursor>),
     /// `pk IN (…)` gather over a listed key set.
@@ -560,7 +560,7 @@ impl SourceCursor {
     /// `max_rows` bounds every variant exactly except `PkSet`, which tests it
     /// before each key and then drains that key's whole group, so it can
     /// overshoot to `max_rows - 1 + |largest group|`. Callers read `chunk.count`.
-    pub(crate) fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
+    pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         match self {
             SourceCursor::Full(c) => c.drain_chunk(max_rows),
             SourceCursor::Bounded(c) => c.drain_chunk(max_rows),

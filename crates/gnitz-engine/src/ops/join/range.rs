@@ -100,7 +100,7 @@ use super::rowwrite::write_join_row;
 /// per delta row, and the span it then sweeps is output-bounded, so it is never
 /// more work than a per-row probe. `range_per_row_seek` survives as the
 /// `#[cfg(test)]` differential oracle.
-pub fn op_join_delta_trace_range(
+pub(crate) fn op_join_delta_trace_range(
     delta: &Batch,
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,

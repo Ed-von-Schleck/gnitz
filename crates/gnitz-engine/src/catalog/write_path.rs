@@ -136,7 +136,7 @@ impl CatalogEngine {
     /// happens after hooks so nested cascade pushes land first and the executor
     /// broadcasts children → parent; empty batches are dropped so worker-side
     /// no-op cascades don't accumulate unread entries.
-    pub(crate) fn apply_and_enqueue_family(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
+    pub fn apply_and_enqueue_family(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
         self.apply_local(family, &mut batch, self.ctx.ddl_zone_lsn())?;
         if batch.count > 0 {
             self.pending_broadcasts.push((family, batch));
@@ -248,7 +248,7 @@ impl CatalogEngine {
     /// Sound only because `cancel_gated_deletion` filters `pending_dir_deletions`
     /// too: otherwise the drain could remove a recreated same-name schema whose
     /// live path SAL replay left in the queue.
-    pub(crate) fn gc_orphan_directories(&mut self) {
+    pub fn gc_orphan_directories(&mut self) {
         // Full on-disk path of every live table/view (user + system).
         let live_tables: rustc_hash::FxHashSet<&str> = self.dag.tables.values().map(|e| e.directory.as_str()).collect();
 
@@ -333,7 +333,7 @@ impl CatalogEngine {
     /// circuit the engine cannot run is rejected while the DDL is still undoable.
     /// The path is built here because `catalog::utils` owns every entity
     /// directory's shape, and `query` sits below it.
-    pub(crate) fn preflight_view_compile(&self, vid: i64) -> Result<(), String> {
+    pub fn preflight_view_compile(&self, vid: i64) -> Result<(), String> {
         let Some((schema_name, _)) = self.caches.entity_by_id.get(&vid) else {
             return Err(format!("pre-flight: view {vid} is not registered"));
         };
@@ -357,7 +357,7 @@ impl CatalogEngine {
     /// the handler passes `None`: nothing was applied for that family, so nothing
     /// is reconstructed and **no ghost `-1` is written**. At most one family is
     /// ever applied-not-enqueued, so `Option` is the exact type.
-    pub(crate) fn compensate_stage_a(&mut self, applied_not_enqueued: Option<(SysFamily, Batch)>) {
+    pub fn compensate_stage_a(&mut self, applied_not_enqueued: Option<(SysFamily, Batch)>) {
         let mut rollback_list = self.drain_pending_broadcasts();
 
         if let Some(entry) = applied_not_enqueued {

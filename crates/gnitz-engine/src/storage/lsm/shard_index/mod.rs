@@ -38,7 +38,7 @@ pub(super) fn to_cstrings<S: AsRef<str>>(paths: impl IntoIterator<Item = S>) -> 
     paths.into_iter().map(|f| super::super::cstr(f.as_ref())).collect()
 }
 
-pub struct ShardEntry {
+pub(super) struct ShardEntry {
     shard: Rc<MappedShard>,
     filename: String,
     max_lsn: u64,
@@ -193,7 +193,7 @@ impl FLSMLevel {
     }
 }
 
-pub struct ShardIndex {
+pub(super) struct ShardIndex {
     table_id: u32,
     output_dir: String,
     schema: SchemaDescriptor,
@@ -216,7 +216,7 @@ pub struct ShardIndex {
 impl ShardIndex {
     /// `skip_pk_filter` declares that nothing point-probes this store by PK, so
     /// its shards need no XOR8 filter.
-    pub fn new(table_id: u32, output_dir: &str, schema: SchemaDescriptor, skip_pk_filter: bool) -> Self {
+    pub(super) fn new(table_id: u32, output_dir: &str, schema: SchemaDescriptor, skip_pk_filter: bool) -> Self {
         ShardIndex {
             table_id,
             output_dir: output_dir.to_string(),
@@ -231,7 +231,7 @@ impl ShardIndex {
     }
 
     /// Bound this store's registered shard bytes, once, at construction.
-    pub fn set_capacity(&mut self, capacity_bytes: Option<u64>) {
+    pub(super) fn set_capacity(&mut self, capacity_bytes: Option<u64>) {
         self.capacity_bytes = capacity_bytes;
     }
 

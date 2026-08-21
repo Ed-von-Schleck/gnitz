@@ -48,13 +48,13 @@ use crate::storage::{Batch, ReadCursor, RecoverySource, Table};
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
 // the value, and reads back what the bundle created or dropped.
-pub(crate) use sys_tables::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates};
-pub(crate) use sys_tables::{SysFamily, FIRST_USER_TABLE_ID, SEQ_TAB_ID};
-pub(crate) use types::{ColumnDef, FkEdge};
+pub use sys_tables::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates};
+pub use sys_tables::{SysFamily, FIRST_USER_TABLE_ID, PUBLIC_SCHEMA_ID, SEQ_TAB_ID};
+pub use types::{ColumnDef, FkEdge};
 // The reply path's cached schema wire block.
-pub(crate) use cache::SchemaWireEntry;
+pub use cache::SchemaWireEntry;
 // The master's ScanSpec confinement test.
-pub(crate) use scan_spec::scan_spec_worker;
+pub use scan_spec::scan_spec_worker;
 
 // Import everything from sys_tables for internal use.
 use registry::build_schema_from_col_defs;

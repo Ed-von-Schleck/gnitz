@@ -254,12 +254,12 @@ thread_local! {
 
 /// RAII wrapper that returns a pooled blob cache only when the schema has at
 /// least one STRING column, and recycles it on drop.
-pub(crate) struct BlobCacheGuard(Option<BlobCache>);
+pub struct BlobCacheGuard(Option<BlobCache>);
 
 impl BlobCacheGuard {
     /// `max_rows` is a sizing hint, clamped to [`BLOB_CACHE_RESERVE_CAP`] here so
     /// no caller has to remember to bound it.
-    pub(crate) fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
+    pub fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
         if schema.has_german_string() {
             let mut cache = tls_pool::acquire(&BLOB_CACHE_POOL);
             cache.reserve(max_rows.min(BLOB_CACHE_RESERVE_CAP));
@@ -279,7 +279,7 @@ impl BlobCacheGuard {
         self.0.is_some()
     }
 
-    pub(crate) fn get_mut(&mut self) -> Option<&mut BlobCache> {
+    pub fn get_mut(&mut self) -> Option<&mut BlobCache> {
         self.0.as_mut()
     }
 }
@@ -518,7 +518,7 @@ fn write_cell(dst: &mut [u8], off: usize, src: &[u8]) {
 /// `repr::scatter` kernels write PK/weight/null in one fused pass and every
 /// payload cell unconditionally. Rows the writer declines to count (a ghost
 /// weight) need nothing: every reader bounds the batch to `count`.
-pub struct DirectWriter<'a> {
+pub(crate) struct DirectWriter<'a> {
     // The repartition-scatter cluster (sibling `repr::scatter`) writes these
     // fixed-region buffers directly in its fused per-row loops, so they are
     // `pub(super)` (visible within `repr`); `blob`/`blob_cache` stay private —
@@ -540,7 +540,7 @@ pub struct DirectWriter<'a> {
 }
 
 impl<'a> DirectWriter<'a> {
-    pub fn new(
+    pub(crate) fn new(
         pk: &'a mut [u8],
         weight: &'a mut [u8],
         null_bmp: &'a mut [u8],
@@ -566,7 +566,7 @@ impl<'a> DirectWriter<'a> {
     // The row-at-a-time twin of the column-first `repr::scatter` kernels, kept for
     // the one path that streams: `fold_sorted` walks an already-sorted batch and
     // emits as it goes, with no survivor list to scatter from.
-    pub fn write_row(&mut self, batch: &MemBatch, row: usize, weight: i64) {
+    pub(crate) fn write_row(&mut self, batch: &MemBatch, row: usize, weight: i64) {
         if weight == 0 {
             return;
         }
@@ -626,7 +626,7 @@ impl<'a> DirectWriter<'a> {
         self.col_bufs[payload_col][off..off + 16].copy_from_slice(&dest);
     }
 
-    pub fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
         self.count
     }
 }

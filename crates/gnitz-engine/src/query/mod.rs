@@ -11,4 +11,5 @@ mod dag;
 mod vm;
 
 pub(crate) use compiler::SysTableRefs;
-pub(crate) use dag::{DagEngine, ExchangeCallback, IndexCircuitEntry, RelationKind, StoreHandle, TableEntry};
+pub use dag::{DagEngine, ExchangeCallback, RelationKind};
+pub(crate) use dag::{IndexCircuitEntry, StoreHandle, TableEntry};

@@ -16,17 +16,17 @@ use std::collections::hash_map::Entry;
 /// (`clear_col_cache_no_bump` drops the entry whole, and the version bump that
 /// follows it means a surviving entry always carries its build-time version).
 #[derive(Clone)]
-pub(crate) struct SchemaWireEntry {
-    pub(crate) block: Rc<Vec<u8>>,
+pub struct SchemaWireEntry {
+    pub block: Rc<Vec<u8>>,
     /// The owning table's schema version when the block was built.
-    pub(crate) version: u16,
+    pub version: u16,
     /// True when every column has a fixed-width 8-aligned stride and no
     /// German-string (STRING or BLOB) columns. Drives the `scatter_wire_group`
     /// fast path.
-    pub(crate) wire_safe: bool,
+    pub wire_safe: bool,
     /// Sum of pk_stride + 8 (weight) + 8 (null_bmp) + every payload column's
     /// stride. Only meaningful when `wire_safe`.
-    pub(crate) wire_row_fixed_stride: u32,
+    pub wire_row_fixed_stride: u32,
 }
 
 #[derive(Default)]

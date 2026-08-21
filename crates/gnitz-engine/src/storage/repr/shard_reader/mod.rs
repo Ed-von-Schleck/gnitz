@@ -95,7 +95,7 @@ pub(crate) enum WeightRegion {
     },
 }
 
-pub struct MappedShard {
+pub(crate) struct MappedShard {
     /// Owning RAII handle for the mmap.  Dropped last, so `as_slice()` /
     /// raw pointers derived from it remain valid for the entire lifetime
     /// of the `MappedShard`.

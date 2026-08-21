@@ -210,7 +210,7 @@ impl ReadCursor {
     ///
     /// A zero-row chunk drains nothing, so the count keeps its plain `usize`
     /// meaning here.
-    pub(crate) fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
+    pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         self.drain_to_batch(Drain::Rows(NonZeroUsize::new(max_rows)?))
     }
 

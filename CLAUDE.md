@@ -334,7 +334,9 @@ it to the engine over `gnitz-wire`; the engine never links the planner.
 | `gnitz-sql` | SQL front end: parser, binder, query planner | `core`, `expr`, `wire` |
 | `gnitz-capi` | C ABI bindings over the client core + planner | `core`, `sql` |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `sql`, `wire` |
-| `gnitz-engine` | The DBSP execution engine and `gnitz-server` binary | `wire`, `expr` |
+| `gnitz-engine` | The single-node database as a library: Z-set store, DBSP operators, circuit compiler, catalog | `wire`, `expr` |
+| `gnitz-server` | The multi-process server binary — the `runtime` rung and nothing else | `engine`, `wire`, `expr` |
+| `gnitz-engine-testkit` | Dev-only: `gnitz-engine`'s test helpers, compiled as a library so `gnitz-server`'s tests reach them | `engine`, `wire` |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests | — |
 
 ### The engine (`gnitz-engine`)
@@ -344,6 +346,7 @@ on `foundation`):
 
 ```
 runtime (L7)   → catalog, query, ops, storage, schema    orchestration · protocol · reactor
+                 — lives in `gnitz-server`, and is the only rung that does
 catalog        → query, ops, storage, schema
 query (L5)     → ops, expr, storage, schema               compiler · vm · dag
 ops            → expr, storage, schema                    join · reduce · exchange · …
@@ -362,7 +365,11 @@ an up-edge into the engine's own `expr` module. Read `expr` in the ladder above 
 the engine-local expression layer only.
 
 A relation is stored as one `Table` per worker. Test scaffolding lives in
-`test_support` / `test_rng` and per-module `tests/`.
+`test_support` / `test_rng` and per-module `tests/`. `test_support` is split by
+reach: `shared` is compiled a second time as `gnitz-engine-testkit` and so sees
+only the engine's public API, `internal` is this crate's own. A helper goes in
+`internal` unless `gnitz-server` needs it — putting an engine-only helper in
+`shared` forces whatever it touches to become published API.
 
 ## Running E2E tests
 
@@ -609,6 +616,7 @@ print throughput and must be run in `--release`:
 ```bash
 cd crates && cargo test -p gnitz-engine --release <name>_bench \
     -- --ignored --nocapture --test-threads=1
+# reactor/IPC benchmarks live in the server crate: -p gnitz-server
 ```
 
 Add one alongside the others: name the test `*_bench`, mark it `#[ignore]`,

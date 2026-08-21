@@ -351,7 +351,7 @@ impl Table {
     /// Unlink this store's manifest, so the next `Rederive` open
     /// peeks `None` and erases the shards instead of reloading them — how a
     /// caller rejects state it must not resume from.
-    pub(crate) fn unlink_manifest(&self) {
+    pub fn unlink_manifest(&self) {
         let _ = std::fs::remove_file(self.manifest_full_path());
     }
 

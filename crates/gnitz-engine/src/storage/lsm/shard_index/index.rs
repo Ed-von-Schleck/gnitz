@@ -41,7 +41,7 @@ impl ShardIndex {
 
     /// Open `path` and insert it into the sorted L0 tier. The entry registers
     /// unswept, so it is in the next barrier's fdatasync sweep by construction.
-    pub fn add_unsynced_shard(&mut self, path: &str, max_lsn: u64) -> Result<(), StorageError> {
+    pub(crate) fn add_unsynced_shard(&mut self, path: &str, max_lsn: u64) -> Result<(), StorageError> {
         let entry = ShardEntry::open(path, &self.schema, max_lsn, false)?;
         self.l0.push(entry);
         self.sort_l0();
@@ -61,19 +61,19 @@ impl ShardIndex {
     }
 
     /// Derived, not cached: the L0 tier crossed its compaction threshold.
-    pub fn should_compact(&self) -> bool {
+    pub(crate) fn should_compact(&self) -> bool {
         self.l0.len() > L0_COMPACT_THRESHOLD
     }
 
     /// The paths `flush_prepare` hands the barrier as its fdatasync sweep list:
     /// every live shard an fdatasync has not yet reached.
-    pub fn unsynced_paths(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn unsynced_paths(&self) -> impl Iterator<Item = &str> {
         self.all_entries().filter(|e| !e.synced).map(|e| e.filename.as_str())
     }
 
     /// Mark every live shard durable, once the barrier has fdatasync'd the sweep
     /// list and renamed the manifest that references them.
-    pub fn clear_unsynced(&mut self) {
+    pub(crate) fn clear_unsynced(&mut self) {
         for e in self.all_entries_mut() {
             e.synced = true;
         }
@@ -81,19 +81,19 @@ impl ShardIndex {
 
     /// Every live shard's `Rc`, yielded lazily — callers `extend` without an
     /// intermediate `Vec` (the per-worker cursor gather).
-    pub fn all_shard_arcs_iter(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+    pub(crate) fn all_shard_arcs_iter(&self) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
         self.all_entries().map(|e| Rc::clone(&e.shard))
     }
 
     #[cfg(test)]
-    pub fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
+    pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
         self.all_shard_arcs_iter().collect()
     }
 
     /// Raw rows across every live shard, summed without touching an `Rc`. Raw:
     /// cross-shard duplicates and ghosts are counted, so it is an upper bound on
     /// the live rows a walk would emit — the shape the selectivity gate wants.
-    pub fn total_rows(&self) -> usize {
+    pub(crate) fn total_rows(&self) -> usize {
         self.all_entries().map(|e| e.shard.count).sum()
     }
 
@@ -105,7 +105,7 @@ impl ShardIndex {
     /// unbounded one, and this is what lets it keep the ordinary read paths. Only
     /// compaction writes a skeleton, so the memtable and RAM tier never hold one
     /// and the registered set is the whole question.
-    pub fn has_skeleton_shard(&self) -> bool {
+    pub(crate) fn has_skeleton_shard(&self) -> bool {
         self.all_entries().any(|e| e.shard.is_skeleton())
     }
 
@@ -123,7 +123,7 @@ impl ShardIndex {
     /// scanned (range-rejected per entry); each L1+ level routes by the guard
     /// key `pack_pk_be(key)` (the same order-preserving space `l1_guard_keys`
     /// builds), restoring O(log N) routing for wide PKs too.
-    pub fn find_pk_bytes(&self, key: &[u8], xor8_key: u64, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
+    pub(crate) fn find_pk_bytes(&self, key: &[u8], xor8_key: u64, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
         // A pure function of `key`, so the sweep derives it once instead of once
         // per candidate shard.
         let route_key = crate::schema::key::pack_pk_be(key);
@@ -143,7 +143,7 @@ impl ShardIndex {
         }
     }
 
-    pub fn max_lsn(&self) -> u64 {
+    pub(crate) fn max_lsn(&self) -> u64 {
         self.all_entries().map(|e| e.max_lsn).max().unwrap_or(0)
     }
 
@@ -275,7 +275,7 @@ impl ShardIndex {
         Ok(())
     }
 
-    pub fn run_compact(&mut self) -> Result<(), StorageError> {
+    pub(crate) fn run_compact(&mut self) -> Result<(), StorageError> {
         let (inputs, max_lsn) = Self::compaction_inputs(&self.l0);
         let guard_keys = self.l1_guard_keys();
         self.compact_into(inputs, max_lsn, &guard_keys, 0, false, |s| s.l0.clear())?;
@@ -470,7 +470,7 @@ impl ShardIndex {
     /// `pending_deletions` until the checkpoint barrier's post-publish drain, so
     /// bytes on disk exceed this by the compaction garbage accumulated since the
     /// last checkpoint.
-    pub fn resident_bytes(&self) -> u64 {
+    pub(crate) fn resident_bytes(&self) -> u64 {
         self.all_entries().map(|e| e.shard.file_len()).sum()
     }
 
@@ -510,7 +510,7 @@ impl ShardIndex {
     /// Terminates: step 1 strictly decreases the hydrated-terminal-guard count and
     /// nothing here re-hydrates a guard; step 2 runs at most once. The fixpoint
     /// across calls is the skeleton floor.
-    pub fn enforce_capacity(&mut self) -> Result<(), StorageError> {
+    pub(crate) fn enforce_capacity(&mut self) -> Result<(), StorageError> {
         let Some(cap) = self.capacity_bytes else {
             return Ok(());
         };
@@ -559,7 +559,7 @@ impl ShardIndex {
         Ok(())
     }
 
-    pub fn try_cleanup(&mut self) -> usize {
+    pub(crate) fn try_cleanup(&mut self) -> usize {
         let mut deleted = 0;
         let mut remaining = Vec::new();
 

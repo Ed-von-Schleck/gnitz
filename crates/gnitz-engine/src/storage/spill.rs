@@ -63,7 +63,7 @@ fn sort_indices(flat: &[u8], stride: usize, idx: &mut Vec<u32>) {
 /// in-RAM sorted records (nothing ever spilled — the fast path) or a streaming
 /// k-way merge over the spilled runs. Every record is exactly `stride` bytes,
 /// so runs are unframed fixed-stride records with no per-record length prefix.
-pub(crate) struct SpillSort {
+pub struct SpillSort {
     stride: usize,
     budget: usize,
     dir: String,
@@ -86,7 +86,7 @@ impl SpillSort {
     /// `dir` anchors the `O_TMPFILE` spill on a specific filesystem (the fast
     /// path never touches it). `stride` is the fixed record width; `budget`
     /// the in-RAM byte ceiling before a run spills.
-    pub(crate) fn new(dir: &str, stride: usize, budget: usize) -> Self {
+    pub fn new(dir: &str, stride: usize, budget: usize) -> Self {
         debug_assert!(stride > 0);
         SpillSort {
             stride,
@@ -103,7 +103,7 @@ impl SpillSort {
     /// Append one `stride`-byte record; spill a sorted run once the buffer
     /// reaches the byte budget. Duplicates are preserved at full multiplicity;
     /// copies split across runs are still merged adjacently by `finish`.
-    pub(crate) fn push(&mut self, record: &[u8]) -> Result<(), String> {
+    pub fn push(&mut self, record: &[u8]) -> Result<(), String> {
         debug_assert_eq!(record.len(), self.stride);
         self.flat.extend_from_slice(record);
         if self.flat.len() >= self.budget {
@@ -150,7 +150,7 @@ impl SpillSort {
     /// path (nothing spilled) it sorts the in-RAM buffer; otherwise it spills
     /// the final partial run, `mmap`s the spill file, and primes the k-way
     /// merge. The last fallible I/O happens here — the producer is infallible.
-    pub(crate) fn finish(mut self) -> Result<KeyProducer, String> {
+    pub fn finish(mut self) -> Result<KeyProducer, String> {
         if self.runs.is_empty() {
             let mut idx = Vec::new();
             sort_indices(&self.flat, self.stride, &mut idx);
@@ -222,7 +222,7 @@ fn record_less<'a>(
 }
 
 /// Fast-path producer: the in-RAM flat buffer lent out in sorted-index order.
-pub(crate) struct FastProducer {
+pub struct FastProducer {
     flat: Vec<u8>,
     idx: Vec<u32>,
     stride: usize,
@@ -239,7 +239,7 @@ impl FastProducer {
 }
 
 /// Merge-path producer: a streaming k-way merge over the mapped spill runs.
-pub(crate) struct MergeProducer {
+pub struct MergeProducer {
     map: Mmap,
     stride: usize,
     run_starts: Vec<usize>,
@@ -273,15 +273,18 @@ impl MergeProducer {
 /// mid-stream (an I/O fault on a mapped page is a SIGBUS that kills the
 /// process — never a silently truncated stream), and all spill writes already
 /// completed in `push` / `finish`.
-pub(crate) enum KeyProducer {
+pub enum KeyProducer {
     Fast(FastProducer),
     Merge(MergeProducer),
 }
 
 impl KeyProducer {
     /// Lend the next sorted record, or `None` when drained.
+    // Not `Iterator::next`: the record is lent out of `self`, so the returned
+    // borrow outlives no second call — a shape `Iterator` cannot express.
+    #[allow(clippy::should_implement_trait)]
     #[inline]
-    pub(crate) fn next(&mut self) -> Option<&[u8]> {
+    pub fn next(&mut self) -> Option<&[u8]> {
         match self {
             KeyProducer::Fast(p) => p.next(),
             KeyProducer::Merge(p) => p.next(),
@@ -291,7 +294,7 @@ impl KeyProducer {
     /// Records not yet yielded. Exact — lets consumers size buffers and place
     /// end-of-stream markers without lookahead.
     #[inline]
-    pub(crate) fn remaining(&self) -> usize {
+    pub fn remaining(&self) -> usize {
         match self {
             KeyProducer::Fast(p) => p.idx.len() - p.pos,
             KeyProducer::Merge(p) => p.remaining,

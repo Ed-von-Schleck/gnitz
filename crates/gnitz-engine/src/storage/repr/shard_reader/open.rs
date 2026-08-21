@@ -23,7 +23,7 @@ use crate::foundation::xxh;
 use gnitz_wire::{read_i64_le, read_u64_le};
 
 impl MappedShard {
-    pub fn open(
+    pub(crate) fn open(
         path: &CStr,
         schema: &crate::schema::SchemaDescriptor,
         validate_checksums: bool,

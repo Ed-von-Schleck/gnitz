@@ -226,7 +226,7 @@ impl VmHandle {
     /// no background compactor. The epoch path's job, not a read's: a compaction
     /// mutates shard state. An `Err` leaves the shard index unchanged, so a
     /// cursor opened afterwards still sees a consistent snapshot.
-    pub fn compact_owned_traces(&mut self) {
+    pub(super) fn compact_owned_traces(&mut self) {
         for &(_, table_idx) in &self.trace_regs {
             // SAFETY: as in `bind_trace_cursors` — `table_idx` is set during
             // compilation, and `trace_regs` is not modified here.
@@ -239,7 +239,7 @@ impl VmHandle {
     /// `execute_epoch`: the dispatch loop dereferences every trace register's
     /// cursor without a null check. The cursor handles are stored in
     /// `owned_cursor_handles` and their raw pointers bound into the register file.
-    pub fn bind_trace_cursors(&mut self) {
+    pub(super) fn bind_trace_cursors(&mut self) {
         gnitz_debug!("vm: bind_trace_cursors, {} trace regs", self.trace_regs.len());
         // Drop previous cursors before creating new ones (releases shard refs
         // etc.), then size the slot storage back to full length.
@@ -263,7 +263,7 @@ impl VmHandle {
 
     /// Clear the register file's delta batches (a disjoint-field borrow of the
     /// program's reg_meta and the regfile, packaged for external callers).
-    pub fn clear_deltas(&mut self) {
+    pub(super) fn clear_deltas(&mut self) {
         self.regfile.clear_deltas(&self.program.reg_meta);
     }
 
@@ -278,7 +278,7 @@ impl VmHandle {
     /// flush's safety local and obvious. Only `trace_regs` are handled
     /// (`_int_`/`_hist_`/`_reduce_`/`_reduce_in_`, all cross-epoch); the epoch-local
     /// `_avidx_` cursor is created and dropped inside the `Reduce` instruction.
-    pub fn null_owned_cursors(&mut self) {
+    pub(super) fn null_owned_cursors(&mut self) {
         self.owned_cursor_handles.clear(); // drops every held cursor
         for &(reg_id, _table_idx) in &self.trace_regs {
             self.regfile.registers[reg_id as usize].cursor_ptr = std::ptr::null_mut();
@@ -302,13 +302,13 @@ pub(crate) struct RegisterMeta {
 }
 
 impl RegisterMeta {
-    pub const fn delta(schema: SchemaDescriptor) -> Self {
+    pub(super) const fn delta(schema: SchemaDescriptor) -> Self {
         Self {
             schema,
             owned_table: None,
         }
     }
-    pub const fn trace(schema: SchemaDescriptor, owned_table: u16) -> Self {
+    pub(super) const fn trace(schema: SchemaDescriptor, owned_table: u16) -> Self {
         Self {
             schema,
             owned_table: Some(owned_table),
@@ -360,7 +360,7 @@ impl RegisterFile {
     /// seed replaces a register's batch wholesale, so pre-sizing buys nothing —
     /// it only pinned a pooled buffer per register for the cached plan's
     /// lifetime) and null cursors.
-    pub fn new(metas: &[RegisterMeta]) -> Self {
+    pub(super) fn new(metas: &[RegisterMeta]) -> Self {
         let registers = metas
             .iter()
             .map(|m| Register {
@@ -376,7 +376,7 @@ impl RegisterFile {
     }
 
     /// Clear delta batches without refreshing cursors.
-    pub fn clear_deltas(&mut self, metas: &[RegisterMeta]) {
+    pub(super) fn clear_deltas(&mut self, metas: &[RegisterMeta]) {
         for (reg, meta) in self.registers.iter_mut().zip(metas) {
             if meta.owned_table.is_none() && meta.schema.num_columns() > 0 {
                 reg.batch.clear();

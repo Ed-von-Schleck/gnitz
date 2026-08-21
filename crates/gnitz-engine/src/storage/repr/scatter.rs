@@ -65,7 +65,7 @@ macro_rules! col_width_dispatch {
 /// Weight-0 rows are dropped — they are not Z-set elements, and a client is free
 /// to send one. Dropping them here means every consumer of the indices reads the
 /// same row set for free.
-pub(crate) fn route_rows_by_pk(mb: &MemBatch, schema: &crate::schema::SchemaDescriptor, slots: &mut [Vec<u32>]) {
+pub fn route_rows_by_pk(mb: &MemBatch, schema: &crate::schema::SchemaDescriptor, slots: &mut [Vec<u32>]) {
     let num_workers = slots.len();
     for i in 0..mb.count {
         if mb.get_weight(i) == 0 {
@@ -83,7 +83,7 @@ pub(crate) fn route_rows_by_pk(mb: &MemBatch, schema: &crate::schema::SchemaDesc
 /// weights, uses [`scatter_unified_sources`] — whose
 /// `(src, row, weight)` triples are 4× the index memory this one needs, on the
 /// per-worker SAL ingest scatter and the boot relayout.
-pub fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut DirectWriter) {
+pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut DirectWriter) {
     if indices.is_empty() {
         return;
     }

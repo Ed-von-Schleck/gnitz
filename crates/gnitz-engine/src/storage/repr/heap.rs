@@ -65,7 +65,7 @@ pub(crate) struct LoserTree {
 impl LoserTree {
     /// Buffers for a tournament over `n` sources, with every leaf a sentinel —
     /// an empty tree until [`rebuild`](Self::rebuild) plays it.
-    pub fn empty(n: usize) -> Self {
+    pub(crate) fn empty(n: usize) -> Self {
         // `source_idx`/`row` are `u32`. Sources `< u32::MAX` (the sentinel) and
         // rows-per-source `< 2^32` — fail loudly if a caller ever violates it.
         debug_assert!(n < u32::MAX as usize, "loser tree: source count must be < u32::MAX");
@@ -80,7 +80,7 @@ impl LoserTree {
     /// Allocate a tournament over `n` sources and play it. Callers that
     /// re-tournament the same sources (a read cursor, on every reposition) build
     /// once and then call [`rebuild`](Self::rebuild), which reuses both buffers.
-    pub fn build(
+    pub(crate) fn build(
         n: usize,
         init_fn: impl Fn(usize) -> Option<u32>,
         less: impl Fn(&HeapNode, &HeapNode) -> bool,
@@ -100,7 +100,11 @@ impl LoserTree {
     /// in the tree": both look identical to the walk yet require opposite
     /// handling at higher internal nodes. The bottom-up scheme makes the
     /// subtree-winner explicit and avoids the ambiguity.
-    pub fn rebuild(&mut self, init_fn: impl Fn(usize) -> Option<u32>, less: impl Fn(&HeapNode, &HeapNode) -> bool) {
+    pub(crate) fn rebuild(
+        &mut self,
+        init_fn: impl Fn(usize) -> Option<u32>,
+        less: impl Fn(&HeapNode, &HeapNode) -> bool,
+    ) {
         let n_pad = self.tree.len();
         // winners[idx] holds the current champion of the subtree rooted at
         // `idx`. Leaves live at `n_pad..2*n_pad`; for `i < n` with a live row,
@@ -143,12 +147,12 @@ impl LoserTree {
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.tree[0].source_idx == SENTINEL
     }
 
     #[inline]
-    pub fn peek(&self) -> &HeapNode {
+    pub(crate) fn peek(&self) -> &HeapNode {
         &self.tree[0]
     }
 
@@ -184,7 +188,7 @@ impl LoserTree {
     /// larger or smaller than the prior one; the loser tree handles either
     /// correctly (no monotonicity precondition) since `less` re-reads the bytes.
     #[inline]
-    pub fn replace_top(&mut self, new_row: u32, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
+    pub(crate) fn replace_top(&mut self, new_row: u32, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
         debug_assert!(!self.is_empty(), "replace_top on empty tree");
         let source_idx = self.tree[0].source_idx;
         let cur = HeapNode {
@@ -200,7 +204,7 @@ impl LoserTree {
     /// `None` needs `pop_top`'s two-phase sentinel walk rather than
     /// `replace_top`.
     #[inline(always)]
-    pub fn step_top(&mut self, next_row: Option<u32>, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
+    pub(crate) fn step_top(&mut self, next_row: Option<u32>, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
         match next_row {
             Some(row) => self.replace_top(row, less),
             None => self.pop_top(less),
@@ -211,7 +215,7 @@ impl LoserTree {
     /// new champion (if any) is at `tree[0]`; otherwise `is_empty()`
     /// returns true.
     #[inline]
-    pub fn pop_top(&mut self, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
+    pub(crate) fn pop_top(&mut self, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
         debug_assert!(!self.is_empty(), "pop_top on empty tree");
         let source_idx = self.tree[0].source_idx;
         let mut cur = SENTINEL_NODE;

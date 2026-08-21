@@ -15,7 +15,7 @@ use super::manifest;
 /// what lets a boot sweep reclaim children of a shape the relation no longer
 /// has, and lets an unparseable name be treated as foreign data.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ChildAddr<'a> {
+pub(crate) enum ChildAddr<'a> {
     /// `w{k}of{n}` — worker `k`'s store of a relation laid out for `n` workers.
     /// The worker count is in the name so the boot repartition can write the new
     /// layout beside the old one: the two sets are disjoint, so the source stays
@@ -33,7 +33,7 @@ pub enum ChildAddr<'a> {
 impl<'a> ChildAddr<'a> {
     /// This worker's store of a relation laid out for `of` workers. The master
     /// is rank 0 pre-fork, so it opens the child worker 0 will inherit.
-    pub fn this_worker(of: u32) -> Self {
+    pub(crate) fn this_worker(of: u32) -> Self {
         ChildAddr::Worker {
             rank: crate::foundation::worker_ctx::worker_rank(),
             of,
@@ -41,7 +41,7 @@ impl<'a> ChildAddr<'a> {
     }
 
     /// The directory name, relative to the relation's directory.
-    pub fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         match *self {
             ChildAddr::Worker { rank, of } => format!("w{rank}of{of}"),
             ChildAddr::Scratch { child, rank } => format!("scratch_{child}_w{rank}"),
@@ -50,20 +50,20 @@ impl<'a> ChildAddr<'a> {
     }
 
     /// The child's directory under `rel_dir`.
-    pub fn dir(&self, rel_dir: &str) -> String {
+    pub(crate) fn dir(&self, rel_dir: &str) -> String {
         format!("{rel_dir}/{}", self.name())
     }
 
     /// The child's manifest — what the boot resume verdict peeks and a rebuild
     /// unlinks.
-    pub fn manifest(&self, rel_dir: &str) -> String {
+    pub(crate) fn manifest(&self, rel_dir: &str) -> String {
         manifest::path(&self.dir(rel_dir))
     }
 
     /// The child `name` denotes, or `None` if it is in neither grammar. The
     /// scratch split is right-anchored because child names contain `_`
     /// themselves (`_reduce_in_{vid}_{nid}`).
-    pub fn parse(name: &'a str) -> Option<Self> {
+    pub(crate) fn parse(name: &'a str) -> Option<Self> {
         if let Some(rest) = name.strip_prefix('w') {
             if let Some((rank, of)) = rest.split_once("of") {
                 return Some(ChildAddr::Worker {
@@ -88,7 +88,7 @@ impl<'a> ChildAddr<'a> {
     /// stale either way. Scratch is judged by rank alone — the next compile
     /// recreates what it needs. An index directory is owned at every count; its
     /// own contents are swept by the catalog.
-    pub fn is_owned_by(&self, num_workers: u32) -> bool {
+    pub(crate) fn is_owned_by(&self, num_workers: u32) -> bool {
         match *self {
             ChildAddr::Worker { rank, of } => rank < num_workers && of == num_workers,
             ChildAddr::Scratch { rank, .. } => rank < num_workers,
@@ -101,7 +101,7 @@ impl<'a> ChildAddr<'a> {
 /// per launched rank. The boot resume verdict enumerates manifests through this,
 /// and the checkpoint's ephemeral round stamps exactly this set, so the two must
 /// be read together when either changes.
-pub fn cluster_children(num_workers: u32) -> impl Iterator<Item = ChildAddr<'static>> {
+pub(crate) fn cluster_children(num_workers: u32) -> impl Iterator<Item = ChildAddr<'static>> {
     (0..num_workers).map(move |rank| ChildAddr::Worker { rank, of: num_workers })
 }
 
@@ -112,7 +112,7 @@ pub fn cluster_children(num_workers: u32) -> impl Iterator<Item = ChildAddr<'sta
 /// Materialized rather than streamed: callers unlink entries from the directory
 /// they are walking, and `readdir` may skip entries when the directory is
 /// modified mid-iteration.
-pub fn subdir_names(path: &str) -> Vec<String> {
+pub(crate) fn subdir_names(path: &str) -> Vec<String> {
     let Ok(entries) = fs::read_dir(path) else {
         return Vec::new();
     };
@@ -173,14 +173,14 @@ pub(super) fn link_child(
 /// is what keeps a crash from leaving a manifest whose shards are gone — a
 /// state a `SalReplay` open cannot recover from. Best-effort: failing to
 /// reclaim costs disk space, not correctness.
-pub fn remove_child(dir: &str) {
+pub(crate) fn remove_child(dir: &str) {
     let _ = fs::remove_file(manifest::path(dir));
     let _ = fsync_dir(dir);
     let _ = fs::remove_dir_all(dir);
 }
 
 /// `fsync` a directory so its entries are durable.
-pub fn fsync_dir(dir: &str) -> Result<(), StorageError> {
+pub(crate) fn fsync_dir(dir: &str) -> Result<(), StorageError> {
     fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(StorageError::from)
@@ -192,7 +192,7 @@ pub fn fsync_dir(dir: &str) -> Result<(), StorageError> {
 /// children are per-worker stores under the same grammar, so the sweep descends
 /// into it. Runs after the boot repartition, which has already consumed any
 /// previous-layout set it needed.
-pub fn reclaim_retired_children(dir: &str, num_workers: u32) {
+pub(crate) fn reclaim_retired_children(dir: &str, num_workers: u32) {
     for name in subdir_names(dir) {
         let Some(child) = ChildAddr::parse(&name) else { continue };
         let full = format!("{dir}/{name}");

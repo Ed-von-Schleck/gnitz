@@ -8,6 +8,8 @@ members = [
     "gnitz-capi",
     "gnitz-py",
     "gnitz-engine",
+    "gnitz-server",
+    "gnitz-engine-testkit",
     "gnitz-test-harness",
 ]
 
@@ -18,7 +20,12 @@ members = [
 panic = "abort"
 # Fat LTO so hot paths inline across crate/module boundaries — e.g. the
 # `repr::scatter` kernels calling `DirectWriter` in a sibling module, and the
-# operator layer calling into storage.
+# operator layer calling into storage. Since `runtime` moved to `gnitz-server`
+# it also spans the engine/server seam, where what it buys is per-request and
+# per-frame, not per-row: the row kernels run inside the engine, driven by one
+# call per batch. What crosses is batch/send-buffer drop glue and the catalog
+# and DAG accessors, so trimming this costs a call per frame and per request,
+# not per row.
 lto = true
 
 [profile.dev]

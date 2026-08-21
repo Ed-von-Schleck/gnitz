@@ -42,21 +42,21 @@ const ROLE_WORKER: u8 = 2;
 /// before any view is compiled, so the scratch tables a worker opens carry its
 /// own rank and its `WorkerFilter` nodes are emitted with this process's
 /// `(worker_id, num_workers)`.
-pub(crate) fn set_worker_identity(rank: u32, num_workers: u32) {
+pub fn set_worker_identity(rank: u32, num_workers: u32) {
     WORKER_RANK.store(rank, Relaxed);
     NUM_WORKERS.store(num_workers.max(1), Relaxed);
 }
 
 /// Latch this process's role to Worker, in the forked child before any catalog
 /// work.
-pub(crate) fn set_worker_role() {
+pub fn set_worker_role() {
     ROLE.store(ROLE_WORKER, Relaxed);
 }
 
 /// Latch this process's role to Master. Called at the top of `server_main`,
 /// before `CatalogEngine::open`, so the pre-fork catalog replay hooks already
 /// see Master (and skip the index backfill their forked children rebuild).
-pub(crate) fn set_master_role() {
+pub fn set_master_role() {
     ROLE.store(ROLE_MASTER, Relaxed);
 }
 

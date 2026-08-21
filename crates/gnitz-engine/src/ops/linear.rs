@@ -18,7 +18,7 @@ use super::reindex::{reindex_hash_row, ReindexPacker};
 
 /// Filter: retain rows where predicate returns true.
 /// Uses contiguous-range bulk copy for efficiency.
-pub fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) -> Batch {
+pub(crate) fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) -> Batch {
     let n = batch.count;
     if n == 0 {
         return Batch::empty_with_schema(schema);
@@ -45,7 +45,7 @@ pub fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) ->
 /// alone. The stored instruction operand is `query::vm::ReindexOperand` (`Pack`
 /// there keeps a side-table range); the exec dispatch resolves it to this
 /// borrowed form.
-pub enum ReindexSpec<'a> {
+pub(crate) enum ReindexSpec<'a> {
     /// Plain batch map — the map inherits the input PK verbatim.
     None,
     /// Set each PK to a hash of the full output row (all payload columns) for
@@ -61,7 +61,7 @@ pub enum ReindexSpec<'a> {
 /// Map: transform batch via scalar function, then stamp the output PK region
 /// per `reindex` (see [`ReindexSpec`]). The output schema lives in the func
 /// (`ScalarFunc::Map.out_schema`).
-pub fn op_map(batch: &Batch, func: &ScalarFunc, reindex: ReindexSpec<'_>) -> Batch {
+pub(crate) fn op_map(batch: &Batch, func: &ScalarFunc, reindex: ReindexSpec<'_>) -> Batch {
     // A reindex-free MAP inherits the input PK region verbatim; the reindex arms
     // below overwrite every row of it, so the map must not write it at all
     // (their output stride legitimately differs from the input's).
@@ -99,7 +99,7 @@ pub fn op_map(batch: &Batch, func: &ScalarFunc, reindex: ReindexSpec<'_>) -> Bat
 }
 
 /// Negate: flip the sign of every weight.
-pub fn op_negate(batch: &Batch) -> Batch {
+pub(crate) fn op_negate(batch: &Batch) -> Batch {
     if batch.count == 0 {
         return batch.empty_like();
     }
@@ -124,7 +124,7 @@ pub fn op_negate(batch: &Batch) -> Batch {
 /// orders a NULL cell apart from a zero one. The merge below certifies its
 /// output `Sorted` under this schema, so a comparator narrower than the merged
 /// rows would leave a false order claim behind for `into_consolidated` to trust.
-pub fn op_union(batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
+pub(crate) fn op_union(batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
     if batch_b.count == 0 {
         // O(1) pass-through: no allocation, sorted/consolidated preserved.
         gnitz_debug!("op_union: a={} b=0 identity", batch_a.count);
@@ -250,7 +250,7 @@ where
 ///
 /// Appending NULL columns is a pure widening of the batch's region layout, so the
 /// copy itself is `Batch::widened_with_null_tail`; the Z-set content is unchanged.
-pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Batch {
+pub(crate) fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Batch {
     let output = batch.widened_with_null_tail(in_schema, out_schema);
     gnitz_debug!(
         "op_null_extend: in={} right_npc={}",

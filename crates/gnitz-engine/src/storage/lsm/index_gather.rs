@@ -159,7 +159,7 @@ fn retain_in_index_range(
 /// That the base snapshot is taken *after* the index snapshot is the safe order
 /// for the non-atomic base-then-index write path: an entry the index cursor
 /// yields had its base row written earlier still, so no row can go missing.
-pub(crate) struct BoundedIndexCursor {
+pub struct BoundedIndexCursor {
     idx: ReadCursor,
     src: ReadCursor,
     /// The current chunk window's inclusive lower bound — the walk's `start` at

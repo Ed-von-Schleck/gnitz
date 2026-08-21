@@ -17,7 +17,7 @@ pub(crate) use gnitz_wire::checksum;
 /// Writer and reader call this identically, so neither can restate the hashed
 /// span differently from the other.
 #[inline]
-pub(crate) fn digest_with_hole(seed: &[u8], buf: &[u8], hole: usize) -> u64 {
+pub fn digest_with_hole(seed: &[u8], buf: &[u8], hole: usize) -> u64 {
     let mut h = xxhash_rust::xxh3::Xxh3Default::default();
     h.update(seed);
     h.update(&buf[..hole]);

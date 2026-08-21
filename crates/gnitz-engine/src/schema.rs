@@ -27,13 +27,13 @@ pub(crate) use gnitz_expr::ColumnLocator;
 /// storage, and is the one import path: `storage` used to re-export the cluster
 /// so its call sites read `crate::storage::X`, which left the byte-order rule
 /// spelled two ways in adjacent lines of the same file.
-pub(crate) mod key;
+pub mod key;
 
 /// The precomputed per-row read/encode plan for an index's OPK leading-key span.
 /// Lives in [`key`] with the rest of the native→OPK encoders it shares its byte
 /// contract with; re-exported here because a spec is derived from a pair of
 /// schemas, so call sites keep naming `crate::schema::IndexKeySpec`.
-pub(crate) use key::IndexKeySpec;
+pub use key::IndexKeySpec;
 
 /// Build a `SchemaDescriptor` from a wire-neutral `WireSysCol` slice (the
 /// canonical system-table column arrays in `gnitz-wire`). The single builder
@@ -130,10 +130,10 @@ impl DerivedSchema {
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SchemaColumn {
-    pub(crate) type_code: u8,
+pub struct SchemaColumn {
+    pub type_code: u8,
     size: u8,
-    pub(crate) nullable: u8,
+    pub nullable: u8,
     is_signed: u8,
 }
 
@@ -143,7 +143,7 @@ impl SchemaColumn {
     /// that padding — the one legitimate use of the undecodable type code `0` —
     /// cannot be confused with a real column, and `new` can hold every column it
     /// builds to a decodable code.
-    pub(crate) const EMPTY: SchemaColumn = Self::raw(0, 0);
+    pub const EMPTY: SchemaColumn = Self::raw(0, 0);
 
     /// A real column of type `type_code`, which must decode (see
     /// [`gnitz_wire::is_valid_type_code`] for why an unknown one is not inert).
@@ -151,7 +151,7 @@ impl SchemaColumn {
     /// the tripwire for a path that forgets to. Debug-only — the release engine
     /// must still *survive* a corrupt code, which is what the expression
     /// validator's `check_col` and the catalog's `check_col_defs` are for.
-    pub(crate) const fn new(type_code: u8, nullable: u8) -> Self {
+    pub const fn new(type_code: u8, nullable: u8) -> Self {
         debug_assert!(gnitz_wire::is_valid_type_code(type_code), "invalid column type code");
         Self::raw(type_code, nullable)
     }
@@ -169,7 +169,7 @@ impl SchemaColumn {
     /// On-disk byte width of one cell of this column. Derived from `type_code`
     /// via `SchemaColumn::new` and never written independently.
     #[inline]
-    pub(crate) const fn size(&self) -> u8 {
+    pub const fn size(&self) -> u8 {
         self.size
     }
 
@@ -222,7 +222,7 @@ const fn compute_payload_cmp(
 /// sources' own stamped placements, which is what makes the property transitive
 /// up a view chain).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Placement {
+pub enum Placement {
     /// Every worker holds an identical full copy; writes broadcast, reads
     /// single-source worker 0.
     Replicated,
@@ -243,7 +243,7 @@ impl Placement {
     /// corrupt catalog flag could carry) against the schema's PK arity, so a
     /// `Keyed` prefix read back off a descriptor is never the sentinel — it is
     /// `pk_count` for the default and `1..pk_count` for a `CLUSTER BY` prefix.
-    pub(crate) const KEYED_DEFAULT: Placement = Placement::Keyed { prefix_len: 0 };
+    pub const KEYED_DEFAULT: Placement = Placement::Keyed { prefix_len: 0 };
 
     /// Decode a relation's placement out of a `TABLE_TAB.flags` word. The flags
     /// cannot make the replicated/prefix combination unrepresentable
@@ -271,13 +271,13 @@ impl Placement {
     /// rows arrive there — a broadcast copy (`Replicated`) or whatever that
     /// worker produced (`Local`), rather than the key's own hash slice.
     #[inline]
-    pub(crate) const fn is_key_routed(self) -> bool {
+    pub const fn is_key_routed(self) -> bool {
         matches!(self, Placement::Keyed { .. })
     }
 
     /// True iff a full identical copy lives on every worker.
     #[inline]
-    pub(crate) const fn is_replicated(self) -> bool {
+    pub const fn is_replicated(self) -> bool {
         matches!(self, Placement::Replicated)
     }
 
@@ -311,7 +311,7 @@ impl Placement {
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub(crate) struct SchemaDescriptor {
+pub struct SchemaDescriptor {
     num_columns: u32,
     pk_count: u32,
     pk_indices: [u32; MAX_PK_COLUMNS],
@@ -348,7 +348,7 @@ pub(crate) struct SchemaDescriptor {
     /// and the answer is a walk of the payload columns. Free in the struct's tail
     /// padding — a per-slot mask would not be, and would break the size pin.
     has_german_string: bool,
-    pub(crate) columns: [SchemaColumn; MAX_COLUMNS],
+    pub columns: [SchemaColumn; MAX_COLUMNS],
 }
 
 // `SchemaDescriptor` is `Copy` and embedded by value in ~20 structs (`Batch`
@@ -386,7 +386,7 @@ impl SchemaDescriptor {
     /// produced by `Default::default()` and is structurally invalid for real
     /// use. Accepts up to `MAX_PK_COLUMNS` entries.
     #[track_caller]
-    pub(crate) const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
+    pub const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
         // Default placement = hash-distributed by the full PK.
         Self::new_with_placement(cols, pk_indices, Placement::KEYED_DEFAULT)
     }
@@ -499,25 +499,25 @@ impl SchemaDescriptor {
         }
     }
 
-    /// Rebuild this schema with a different [`Placement`]. Every production site
-    /// knows the placement before it builds the descriptor and passes it to
-    /// `new_with_placement` / `build_schema_from_col_defs`; this is for tests that
-    /// re-stamp a shared fixture. It delegates so there is one derivation of the
-    /// route, not two.
-    #[cfg(test)]
-    pub(crate) const fn with_placement(&self, placement: Placement) -> Self {
+    /// Rebuild this schema with a different [`Placement`]. Every site that knows
+    /// its placement up front passes it to `new_with_placement` /
+    /// `build_schema_from_col_defs` instead; this re-stamps a descriptor that is
+    /// already built, which is what tests re-stamping a shared fixture need and
+    /// the only thing that calls it. It delegates, so there is one derivation of
+    /// the route, not two.
+    pub const fn with_placement(&self, placement: Placement) -> Self {
         let (cols, _) = self.columns.split_at(self.num_columns as usize);
         let (pk, _) = self.pk_indices.split_at(self.pk_count as usize);
         Self::new_with_placement(cols, pk, placement)
     }
 
-    pub(crate) const fn minimal_u64() -> Self {
+    pub const fn minimal_u64() -> Self {
         Self::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
     }
 
     /// Number of logical columns in this schema (PK + payload).
     #[inline]
-    pub(crate) const fn num_columns(&self) -> usize {
+    pub const fn num_columns(&self) -> usize {
         self.num_columns as usize
     }
 
@@ -525,7 +525,7 @@ impl SchemaDescriptor {
     /// 1 for a single-column PK, or the full sequence for a compound table PK
     /// (and the co-partition analyzers compare against this whole sequence).
     #[inline]
-    pub(crate) fn pk_indices(&self) -> &[u32] {
+    pub fn pk_indices(&self) -> &[u32] {
         &self.pk_indices[..self.pk_count as usize]
     }
 
@@ -565,7 +565,7 @@ impl SchemaDescriptor {
     /// and the storage-layer `pk_stride` caches; callers that need
     /// `usize` for buffer arithmetic cast at the use site.
     #[inline]
-    pub(crate) const fn pk_stride(&self) -> u8 {
+    pub const fn pk_stride(&self) -> u8 {
         self.pk_stride
     }
 
@@ -590,7 +590,7 @@ impl SchemaDescriptor {
     /// reindexed `_join_pk` over a derived schema and call `worker_for_pk_bytes`
     /// directly (their key is the whole region, never a table prefix).
     #[inline]
-    pub(crate) fn worker_for_pk(&self, key: &[u8], num_workers: usize) -> usize {
+    pub fn worker_for_pk(&self, key: &[u8], num_workers: usize) -> usize {
         gnitz_wire::worker_for_pk_bytes(&key[..self.dist_stride() as usize], num_workers)
     }
 
@@ -602,7 +602,7 @@ impl SchemaDescriptor {
     /// across the swap: `SchemaDescriptor::eq` ignores it, so a rebuilt
     /// descriptor must be constructed with it again.
     #[inline]
-    pub(crate) const fn placement(&self) -> Placement {
+    pub const fn placement(&self) -> Placement {
         self.placement
     }
 
@@ -623,7 +623,7 @@ impl SchemaDescriptor {
 
     /// Number of non-PK ("payload") columns.
     #[inline]
-    pub(crate) const fn num_payload_cols(&self) -> usize {
+    pub const fn num_payload_cols(&self) -> usize {
         self.num_columns as usize - self.pk_count as usize
     }
 
@@ -635,7 +635,7 @@ impl SchemaDescriptor {
     /// Walks a contiguous `0..num_payload` range with one byte load per
     /// element via `payload_to_ci` — no per-row predicate.
     #[inline]
-    pub(crate) fn payload_columns(&self) -> impl Iterator<Item = (usize, &SchemaColumn)> {
+    pub fn payload_columns(&self) -> impl Iterator<Item = (usize, &SchemaColumn)> {
         (0..self.num_payload_cols()).map(move |pi| (pi, &self.columns[self.payload_to_ci[pi] as usize]))
     }
 
@@ -669,7 +669,7 @@ impl SchemaDescriptor {
     /// True iff column `ci` is a PK column. Out of range answers `true`, which is
     /// what makes [`Self::try_payload_idx`] reject it.
     #[inline]
-    pub(crate) fn is_pk_col(&self, ci: usize) -> bool {
+    pub fn is_pk_col(&self, ci: usize) -> bool {
         ci >= self.num_columns() || self.pk_indices().contains(&(ci as u32))
     }
 
@@ -692,7 +692,7 @@ impl SchemaDescriptor {
     /// any order). Used by reduce to detect `GROUP BY pk` even when the
     /// SQL lists PK columns in an order that differs from the schema's
     /// pk-list order.
-    pub(crate) fn group_cols_eq_pk(&self, cols: &[u32]) -> bool {
+    pub fn group_cols_eq_pk(&self, cols: &[u32]) -> bool {
         let pk = self.pk_indices();
         cols.len() == pk.len() && pk.iter().all(|p| cols.contains(p))
     }
@@ -738,7 +738,7 @@ impl SchemaDescriptor {
     /// Byte offset of `col_idx` within the row's PK region. Walks
     /// `pk_columns()` in pk-list order; caller must ensure `col_idx` is
     /// a PK column.
-    pub(crate) fn pk_byte_offset(&self, col_idx: usize) -> u8 {
+    pub fn pk_byte_offset(&self, col_idx: usize) -> u8 {
         debug_assert!(self.is_pk_col(col_idx), "pk_byte_offset: col_idx must be a pk column");
         let mut off: u16 = 0;
         for (pk_ci, c) in self.pk_columns() {
@@ -755,14 +755,14 @@ impl SchemaDescriptor {
     /// column's width, never just `columns[0]` (a composite `UNIQUE (a, b)`
     /// span can exceed 16 bytes); the source-PK suffix begins there.
     #[inline]
-    pub(crate) fn leading_key_size(&self, n: usize) -> usize {
+    pub fn leading_key_size(&self, n: usize) -> usize {
         self.columns[..n].iter().map(|c| c.size() as usize).sum()
     }
 
     /// Resolve where column `col_idx`'s value lives. The canonical entry point
     /// for reading a column whose index is not statically a payload column.
     #[inline]
-    pub(crate) fn locate(&self, col_idx: usize) -> ColumnLocator {
+    pub fn locate(&self, col_idx: usize) -> ColumnLocator {
         // Release-active bound. An out-of-range `col_idx` otherwise resolves to
         // the PK arm and dies in `pk_byte_offset`'s `unreachable!()` with a
         // message naming neither `locate` nor the bad index. A `debug_assert`
@@ -886,7 +886,7 @@ impl Default for SchemaDescriptor {
 /// the sender chose (client INSERT frames, worker reply trains) — batch append
 /// helpers do not validate shape, so an unguarded mismatch turns into
 /// misinterpreted bytes handed onward.
-pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDescriptor) -> Result<(), String> {
+pub fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDescriptor) -> Result<(), String> {
     if wire == expected {
         return Ok(());
     }
@@ -930,7 +930,7 @@ pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDe
 // Schema-shaping free functions
 //
 // Built purely from a `SchemaDescriptor` (no catalog or storage state); used
-// by the catalog DDL/index paths and the runtime gather/preflight paths.
+// by the catalog DDL/index paths and the server's gather/preflight paths.
 // ---------------------------------------------------------------------------
 
 /// Wire schema of every unique pre-flight reply frame: the leading `n_promoted`
@@ -947,7 +947,7 @@ pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDe
 /// The single definition shared by the worker's encoder
 /// (`send_unique_preflight_keys`) and the master's merge decoder, so the frame
 /// layout agrees by construction.
-pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_promoted: usize) -> SchemaDescriptor {
+pub fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_promoted: usize) -> SchemaDescriptor {
     let cols = &idx_schema.columns[..n_promoted];
     let pks: Vec<u32> = (0..n_promoted as u32).collect();
     SchemaDescriptor::new(cols, &pks)
@@ -973,7 +973,7 @@ pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_prom
 /// persisted row replayed at boot, neither of which goes through the SQL
 /// planner's pre-check. Validating here converts the abort into a clean ingest
 /// `Err` for every path (defence in depth at the catalog trust boundary).
-pub(crate) fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) -> Result<SchemaDescriptor, String> {
+pub fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) -> Result<SchemaDescriptor, String> {
     let mut col_types: Vec<u8> = Vec::with_capacity(source_cols.len());
     for &c in source_cols {
         if c as usize >= source.num_columns() {
@@ -1012,7 +1012,7 @@ pub(crate) fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) 
 /// `pub(crate)`: the master's gather drain builds the same descriptor as the
 /// expected reply schema, so a projected reply with the wrong shape errors
 /// instead of mis-decoding.
-pub(crate) fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor {
+pub fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor {
     let mut b = DerivedSchema::new();
     b.push_pk_of(schema)
         .expect("project_schema: source PK exceeds the PK limit");

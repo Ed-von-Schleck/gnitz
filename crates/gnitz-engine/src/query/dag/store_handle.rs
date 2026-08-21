@@ -10,7 +10,7 @@ use crate::storage::{Batch, ReadCursor, StorageError, Table};
 use std::cell::UnsafeCell;
 
 /// Storage handle of a registered relation.
-pub enum StoreHandle {
+pub(crate) enum StoreHandle {
     /// Owned `Table` — this worker's whole slice of a base table or view.
     /// Wrapped in `UnsafeCell` so the interior-mutable accessors can hand out
     /// `&mut` through a shared `&self` without violating Stacked Borrows (a raw
@@ -71,7 +71,7 @@ impl StoreHandle {
     /// descriptor into a `Table` whose real owner publishes too
     /// (`swap_table_schema`).
     #[allow(clippy::mut_from_ref)]
-    pub fn as_owned_mut(&self) -> Option<&mut Table> {
+    pub(crate) fn as_owned_mut(&self) -> Option<&mut Table> {
         match self {
             StoreHandle::Owned(cell) => Some(unsafe { &mut **cell.get() }),
             _ => None,
@@ -82,7 +82,7 @@ impl StoreHandle {
     /// Test-only: production asks a total accessor what it can reach instead of
     /// branching on the variant.
     #[cfg(test)]
-    pub fn is_detached(&self) -> bool {
+    pub(crate) fn is_detached(&self) -> bool {
         matches!(self, StoreHandle::Detached)
     }
 
@@ -117,7 +117,7 @@ impl StoreHandle {
     /// Dispatched durable ingest of a borrowed `Batch` — the single-copy path
     /// for callers that keep reading the batch (see
     /// `Table::ingest_borrowed_batch`).
-    pub fn ingest_borrowed_batch(&self, batch: &Batch) -> Result<(), StorageError> {
+    pub(crate) fn ingest_borrowed_batch(&self, batch: &Batch) -> Result<(), StorageError> {
         match self.table_mut() {
             Some(t) => t.ingest_borrowed_batch(batch),
             // Nothing to drop: the master routes every user write to a worker, and a
@@ -130,7 +130,7 @@ impl StoreHandle {
     /// store. A relation this process holds no store for enforces nothing: it has
     /// no stored row to retract against, and the worker that does own the store
     /// runs the same walk on the same batch.
-    pub fn enforce_unique_pk(&self, schema: &SchemaDescriptor, batch: Batch) -> Batch {
+    pub(crate) fn enforce_unique_pk(&self, schema: &SchemaDescriptor, batch: Batch) -> Batch {
         // Not `map_or`: `batch` would have to move into both arms.
         match self.table_mut() {
             Some(t) => crate::storage::enforce_unique_pk(t, schema, batch),
@@ -142,7 +142,7 @@ impl StoreHandle {
     /// routed through [`Self::table_mut`]: `cell.get_mut()` is the one
     /// statically-checked mutation in this file, and keeping it costs the single
     /// caller nothing (it already holds `&mut self`).
-    pub fn flush(&mut self) -> Result<(), StorageError> {
+    pub(crate) fn flush(&mut self) -> Result<(), StorageError> {
         match self {
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush(),
             StoreHandle::Owned(cell) => cell.get_mut().flush(),
@@ -156,7 +156,7 @@ impl StoreHandle {
     /// relation holds exactly one `Table` per worker. The cluster-wide minimum a
     /// repartition stamps is a different quantity, taken by the master across a
     /// relation's per-worker children.
-    pub fn current_lsn(&self) -> u64 {
+    pub(crate) fn current_lsn(&self) -> u64 {
         self.table().map_or(0, Table::current_lsn)
     }
 }

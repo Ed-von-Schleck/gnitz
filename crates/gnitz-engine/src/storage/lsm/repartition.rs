@@ -164,7 +164,7 @@ fn classify(rel_dir: &str, launched: u32) -> Result<Layout, String> {
 
 /// Bring `rel_dir`'s children onto `launched` workers — see [`Layout`] for the
 /// three states its children can be in.
-pub fn repartition_relation(
+pub(crate) fn repartition_relation(
     rel_dir: &str,
     schema: &SchemaDescriptor,
     table_id: u32,

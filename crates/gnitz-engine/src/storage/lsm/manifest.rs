@@ -44,13 +44,13 @@ const ENTRY_SIZE: usize = 160;
 /// schema; a mismatch (recorded in `_sequences` via `SEQ_ID_TOPOLOGY`) marks
 /// every Rederive view invalid at boot, so its state is rebuilt. Shard and
 /// manifest layout changes are carried by their own version words.
-pub const STATE_FORMAT: u32 = 7;
+pub(crate) const STATE_FORMAT: u32 = 7;
 
 /// The durable topology word recorded in `_sequences` (`SEQ_ID_TOPOLOGY`):
 /// `(worker_count << 32) | STATE_FORMAT`. The single packer shared by the
 /// boot-time recorder and the resume-verdict validator, so the two can never
 /// drift on the encoding.
-pub fn topology_word(worker_count: u32) -> u64 {
+pub(crate) fn topology_word(worker_count: u32) -> u64 {
     ((worker_count as u64) << 32) | STATE_FORMAT as u64
 }
 
@@ -77,7 +77,7 @@ const _: () = assert!(
 
 /// On-disk manifest entry.
 #[derive(Clone, Copy, Debug)]
-pub struct ManifestEntryRaw {
+pub(crate) struct ManifestEntryRaw {
     pub max_lsn: u64,
     pub filename: [u8; 128],
     pub level: u64,
@@ -98,7 +98,7 @@ impl ManifestEntryRaw {
     /// reload. Every basename the naming grammar produces is bounded well under
     /// the field width, so an overflow is a naming-scheme bug — fail loudly
     /// rather than truncate.
-    pub fn new(basename: &str, max_lsn: u64, level: u64, guard_key: u128) -> Self {
+    pub(crate) fn new(basename: &str, max_lsn: u64, level: u64, guard_key: u128) -> Self {
         let bytes = basename.as_bytes();
         assert!(
             bytes.len() < 128,
@@ -114,14 +114,14 @@ impl ManifestEntryRaw {
         }
     }
 
-    pub fn filename_str(&self) -> &str {
+    pub(crate) fn filename_str(&self) -> &str {
         cstr_from_buf(&self.filename)
     }
 }
 
 /// Header metadata serialized alongside the entries.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct ManifestHeader {
+pub(crate) struct ManifestHeader {
     pub compact_seq: u64,
     /// The checkpoint generation the ephemeral round published at. Read by the
     /// conditional reload (`Rederive`) and the boot resume verdict.
@@ -239,7 +239,7 @@ fn parse(buf: &[u8]) -> Result<(Vec<ManifestEntryRaw>, ManifestHeader), StorageE
 }
 
 /// Returns the buffer size needed to serialize `count` entries.
-pub const fn serialized_size(count: usize) -> usize {
+pub(crate) const fn serialized_size(count: usize) -> usize {
     HEADER_SIZE + count * ENTRY_SIZE
 }
 
@@ -262,14 +262,16 @@ fn read_bytes(path: &std::ffi::CStr) -> Result<Option<Vec<u8>>, StorageError> {
 /// Read and parse a manifest file in one open. `Ok(None)` when the file does
 /// not exist yet; a damaged one is an error, since its shards are already open
 /// for business and dropping them silently would lose data.
-pub fn read_file(path: &std::ffi::CStr) -> Result<Option<(Vec<ManifestEntryRaw>, ManifestHeader)>, StorageError> {
+pub(crate) fn read_file(
+    path: &std::ffi::CStr,
+) -> Result<Option<(Vec<ManifestEntryRaw>, ManifestHeader)>, StorageError> {
     read_bytes(path)?.map(|buf| parse(&buf)).transpose()
 }
 
 /// Open .tmp manifest at "<path>.tmp", serialize entries into it, and return
 /// the open fd plus owned path buffers. Does NOT fdatasync, close, or rename.
 /// On any internal write error closes the fd and unlinks the .tmp.
-pub struct PreparedManifest {
+pub(crate) struct PreparedManifest {
     file: File,
     tmp_path: std::ffi::CString,
     final_path: std::ffi::CString,
@@ -285,20 +287,20 @@ impl PreparedManifest {
     /// drops (after `commit`'s rename, or on the abandon path). Raw because the
     /// flush barrier hands whole chunks of these to `IORING_OP_FSYNC` at once;
     /// a blocking `sync_data` per file would undo that batching.
-    pub fn fd(&self) -> libc::c_int {
+    pub(crate) fn fd(&self) -> libc::c_int {
         self.file.as_raw_fd()
     }
 
     /// Make the staged bytes durable. The one-directory-at-a-time counterpart
     /// of the barrier's batched fsync.
-    pub fn sync(&self) -> std::io::Result<()> {
+    pub(crate) fn sync(&self) -> std::io::Result<()> {
         self.file.sync_data()
     }
 
     /// Rename the staged `.tmp` into place, consuming the staging value. The
     /// sole owner of the rename + Drop-suppression transition: a failure leaves
     /// `committed` unset, so Drop unlinks the `.tmp`.
-    pub fn commit(mut self) -> Result<(), StorageError> {
+    pub(crate) fn commit(mut self) -> Result<(), StorageError> {
         // `self` drops on the error path: Drop unlinks the .tmp.
         posix_io::renameat(libc::AT_FDCWD, &self.tmp_path, libc::AT_FDCWD, &self.final_path)?;
         self.committed = true; // renamed; suppress the .tmp unlink in Drop
@@ -316,7 +318,7 @@ impl Drop for PreparedManifest {
     }
 }
 
-pub fn prepare_file(
+pub(crate) fn prepare_file(
     path: &std::ffi::CStr,
     entries: &[ManifestEntryRaw],
     header: ManifestHeader,
@@ -349,15 +351,15 @@ pub fn prepare_file(
 
 /// Basename of a table's manifest inside its own directory. The one spelling —
 /// every producer, peeker and unlinker goes through `path`/`tmp_path`.
-pub const MANIFEST_FILE: &str = "manifest.bin";
+pub(crate) const MANIFEST_FILE: &str = "manifest.bin";
 
 /// A table directory's manifest path.
-pub fn path(dir: &str) -> String {
+pub(crate) fn path(dir: &str) -> String {
     format!("{dir}/{MANIFEST_FILE}")
 }
 
 /// The staging name `prepare_file` writes before renaming into `path(dir)`.
-pub fn tmp_path(dir: &str) -> String {
+pub(crate) fn tmp_path(dir: &str) -> String {
     format!("{}.tmp", path(dir))
 }
 
@@ -368,7 +370,7 @@ pub fn tmp_path(dir: &str) -> String {
 ///
 /// The digest spans the entries, so no header-only peek can skip reading them,
 /// but decoding them is another matter — this stops at [`verify`].
-pub fn peek_header(path: &std::ffi::CStr) -> Result<Option<ManifestHeader>, StorageError> {
+pub(crate) fn peek_header(path: &std::ffi::CStr) -> Result<Option<ManifestHeader>, StorageError> {
     Ok(read_bytes(path)?.and_then(|buf| Some(verify(&buf).ok()?.0)))
 }
 

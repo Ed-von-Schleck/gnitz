@@ -21,7 +21,7 @@ use gnitz_wire::AggFunc;
 /// sites. `None` *is* "every aggregate is linear": the two are the same bit
 /// (`AggFunc::is_linear` and `uses_value_index` are disjoint and exhaustive, and
 /// every group set is indexable), which [`ReducePlan::new`] asserts.
-pub struct AviHistory<'a> {
+pub(crate) struct AviHistory<'a> {
     pub cursor: &'a mut ReadCursor,
     pub packer: &'a ReindexPacker,
 }
@@ -104,7 +104,7 @@ fn walk_group_rows(
 /// columns, aggregate descriptors, linearity, key kind, the group-exemplar
 /// locators, the global-ground flags — arrives baked in `plan` (one construction
 /// site, `ReducePlan::new`).
-pub fn op_reduce(
+pub(crate) fn op_reduce(
     delta: &Batch,
     trace_out_cursor: &mut ReadCursor,
     // The MIN/MAX history: the combined value index's cursor and the packer that

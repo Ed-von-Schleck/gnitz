@@ -31,7 +31,7 @@ use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES}
 /// compiles to an optimal `memcmp`. `a` and `b` are the OPK bytes produced by
 /// `Batch::get_pk_bytes` / `MappedShard::get_pk_bytes`.
 #[inline(always)]
-pub(crate) fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
+pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
 }
 
@@ -123,7 +123,7 @@ pub(crate) fn opk_key(schema: &SchemaDescriptor, native_le: &[u8]) -> PkBuf {
 /// `extra` (empty for narrow PKs).
 ///
 /// Errors if `extra` is shorter than that suffix.
-pub(crate) fn seek_opk_bytes(schema: &SchemaDescriptor, low: u128, extra: &[u8]) -> Result<PkBuf, String> {
+pub fn seek_opk_bytes(schema: &SchemaDescriptor, low: u128, extra: &[u8]) -> Result<PkBuf, String> {
     let stride = schema.pk_stride() as usize;
     if stride > MAX_PK_BYTES {
         return Err(format!("PK stride {stride} exceeds MAX_PK_BYTES {MAX_PK_BYTES}"));
@@ -185,7 +185,7 @@ pub(crate) fn encode_leading_opk(cols: impl IntoIterator<Item = (u8, SchemaColum
 /// a wider composite (the source-PK suffix is zero) widens it with
 /// [`PkBuf::padded`].
 #[inline]
-pub(crate) fn index_opk_prefix(native: u128, src_type: u8, idx_key_type: u8) -> PkBuf {
+pub fn index_opk_prefix(native: u128, src_type: u8, idx_key_type: u8) -> PkBuf {
     encode_leading_opk([(src_type, SchemaColumn::new(idx_key_type, 0))], &[native])
 }
 
@@ -377,7 +377,7 @@ impl PkSortKey for [u128; 2] {
 /// is hashed to 64 bits, keeping its entropy — this is deliberately not
 /// `worker_for_pk_bytes`, which reduces the same two images to a worker index.
 #[inline]
-pub(crate) fn probe_key(opk: &[u8]) -> u64 {
+pub fn probe_key(opk: &[u8]) -> u64 {
     let fingerprint = if opk.len() > NARROW_PK_MAX_BYTES {
         xxh::checksum(opk) as u128
     } else {
@@ -397,7 +397,7 @@ pub(crate) fn probe_key(opk: &[u8]) -> u64 {
 /// construction, which lets the single-PK fast path widen `bytes[..len]`
 /// to a `u128` with no ambiguity.
 #[derive(Clone, Copy)]
-pub(crate) struct PkBuf {
+pub struct PkBuf {
     pub(crate) bytes: [u8; MAX_PK_BYTES],
     pub(crate) len: u8,
 }
@@ -455,8 +455,9 @@ impl Ord for PkBuf {
 impl PkBuf {
     /// All-zero key of the given width — the zero-row / placeholder /
     /// empty-shard form, and the mutable scratch every reused key buffer starts
-    /// from (the fields are public; write the meaningful span in place).
-    pub(crate) fn zeroed(len: usize) -> Self {
+    /// from. The fields are crate-visible: in-crate callers write the meaningful
+    /// span in place, outside go through `set_from` / `pk_bytes` / `padded`.
+    pub fn zeroed(len: usize) -> Self {
         debug_assert!(len <= MAX_PK_BYTES);
         PkBuf {
             bytes: [0u8; MAX_PK_BYTES],
@@ -468,7 +469,7 @@ impl PkBuf {
     /// zero. The row constructor: `MappedShard::get_pk_bytes(row)`
     /// returns exactly `pk_stride` bytes, and manifest `parse` passes
     /// its on-disk `len`/payload slice.
-    pub(crate) fn from_bytes(slice: &[u8]) -> Self {
+    pub fn from_bytes(slice: &[u8]) -> Self {
         debug_assert!(slice.len() <= MAX_PK_BYTES);
         let mut bytes = [0u8; MAX_PK_BYTES];
         bytes[..slice.len()].copy_from_slice(slice);
@@ -483,7 +484,7 @@ impl PkBuf {
     /// array, and keeps the zero tail (`set_len` clears whatever a wider
     /// previous key left behind).
     #[inline]
-    pub(crate) fn set_from(&mut self, src: &[u8]) {
+    pub fn set_from(&mut self, src: &[u8]) {
         debug_assert!(src.len() <= MAX_PK_BYTES);
         self.bytes[..src.len()].copy_from_slice(src);
         self.set_len(src.len());
@@ -494,7 +495,7 @@ impl PkBuf {
     /// raw order-preserving bytes (`compare_pk_bytes` / `pack_pk_be`), so this
     /// is the single PK accessor.
     #[inline]
-    pub(crate) fn pk_bytes(&self) -> &[u8] {
+    pub fn pk_bytes(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
     }
 
@@ -503,7 +504,7 @@ impl PkBuf {
     /// an index leading-key span) must be widened to a full PK stride whose
     /// suffix is zero.
     #[inline]
-    pub(crate) fn padded(&self, width: usize) -> &[u8] {
+    pub fn padded(&self, width: usize) -> &[u8] {
         debug_assert!(self.len as usize <= width && width <= MAX_PK_BYTES);
         &self.bytes[..width]
     }
@@ -513,7 +514,7 @@ impl PkBuf {
     /// copy — the alternative, `PkBuf::from_bytes(k.padded(width))`, re-zeroes
     /// and re-copies the whole `MAX_PK_BYTES` array to reach the same value.
     #[inline]
-    pub(crate) fn widened(mut self, width: usize) -> Self {
+    pub fn widened(mut self, width: usize) -> Self {
         debug_assert!(self.len as usize <= width && width <= MAX_PK_BYTES);
         self.len = width as u8;
         self
@@ -548,7 +549,7 @@ impl PkBuf {
 /// insert-time check, pre-flight) — byte-equal ⟺ index-value equal at any
 /// width, and byte-lexicographic order is the seek/merge order.
 #[derive(Clone, Copy)]
-pub(crate) struct IndexKeySpec {
+pub struct IndexKeySpec {
     n: u8,
     /// Span width in bytes — the sum of the promoted column widths, precomputed
     /// so the per-row `key_bytes` path does no re-summation.
@@ -560,7 +561,7 @@ pub(crate) struct IndexKeySpec {
 impl IndexKeySpec {
     /// `cols` is the circuit's source column list (owner-schema indices);
     /// `idx_schema` supplies the promoted leading columns the span encodes at.
-    pub(crate) fn new(cols: &[u32], owner: &SchemaDescriptor, idx_schema: &SchemaDescriptor) -> Self {
+    pub fn new(cols: &[u32], owner: &SchemaDescriptor, idx_schema: &SchemaDescriptor) -> Self {
         debug_assert!(!cols.is_empty() && cols.len() <= gnitz_wire::PK_LIST_MAX_COLS);
         let mut locators = [ColumnLocator::Pk {
             byte_off: 0,
@@ -596,7 +597,7 @@ impl IndexKeySpec {
 
     /// Span width (`idx_key_size`); see `SchemaDescriptor::leading_key_size`.
     #[inline]
-    pub(crate) fn key_size(&self) -> usize {
+    pub fn key_size(&self) -> usize {
         self.key_size as usize
     }
 
@@ -672,7 +673,7 @@ impl IndexKeySpec {
     /// split is exact by layout (an index schema is the promoted indexed columns
     /// followed by the source PK columns, so its stride is `key_size() +
     /// src_pk_stride`), so nothing is decoded.
-    pub(crate) fn split_entry<'a>(&self, entry: &'a [u8]) -> (&'a [u8], &'a [u8]) {
+    pub fn split_entry<'a>(&self, entry: &'a [u8]) -> (&'a [u8], &'a [u8]) {
         debug_assert!(entry.len() > self.key_size(), "index entry shorter than its span");
         entry.split_at(self.key_size())
     }
@@ -684,7 +685,7 @@ impl IndexKeySpec {
     /// reused scratch — free in the common same-circuit loop), so callers may
     /// slice `out.bytes[..stride]` as the span zero-padded to any wider stride.
     /// A NULL-skipped row returns `false` with `out` unchanged in meaning.
-    pub(crate) fn key_bytes(&self, mb: &impl RowSource, row: usize, out: &mut PkBuf) -> bool {
+    pub fn key_bytes(&self, mb: &impl RowSource, row: usize, out: &mut PkBuf) -> bool {
         if !self.write_span(mb, row, &mut out.bytes) {
             return false;
         }

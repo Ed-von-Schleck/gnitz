@@ -45,7 +45,7 @@ impl CatalogEngine {
     /// SyntheticFold layout), an index an `exact` bound needs and cannot find — every one a
     /// corrupt/stale frame, surfaced as a `STATUS_ERROR` reply — or the fold's
     /// per-worker group cap (a resource-exhaustion abort).
-    pub(crate) fn scan_spec_family(
+    pub fn scan_spec_family(
         &mut self,
         target_id: i64,
         spec: &ReadSpec,
@@ -604,11 +604,7 @@ fn pk_range_keys(schema: &SchemaDescriptor, range: &RangeDescriptor) -> Result<O
 /// from the range's first and last keys. An owner is a hash of the key and so
 /// not monotone in key order; a prefix match over the whole range is what makes
 /// the single hash of `start` speak for all of it.
-pub(crate) fn scan_spec_worker(
-    schema: &SchemaDescriptor,
-    range: &RangeDescriptor,
-    num_workers: usize,
-) -> Option<usize> {
+pub fn scan_spec_worker(schema: &SchemaDescriptor, range: &RangeDescriptor, num_workers: usize) -> Option<usize> {
     let (start, end) = pk_range_keys(schema, range).ok().flatten()?;
     crate::schema::key::range_shares_prefix(&start, end.as_ref(), schema.dist_stride() as usize)
         .then(|| schema.worker_for_pk(start.pk_bytes(), num_workers))

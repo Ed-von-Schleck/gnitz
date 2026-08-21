@@ -44,9 +44,13 @@ impl FlushRound {
 
 /// Flush every table in `tables` through the two-phase publish for `round`.
 ///
-/// SAFETY: every pointer must be valid and uniquely owned for the call. The
-/// worker's checkpoint collects them from the DAG while the engine is
-/// single-threaded and cannot yield, so the table set is frozen for the flush.
+/// Takes raw pointers and dereferences each as `&mut Table`, so the caller owes
+/// what a `&mut` would have proved: every pointer must point at a live `Table`,
+/// no two may alias, and nothing else may touch any of them until this returns.
+/// The signature enforces none of it. The engine's own caller — the worker
+/// checkpoint — collects them from the DAG while the engine is single-threaded
+/// and cannot yield, which is how it discharges the obligation; a caller that
+/// can yield must freeze the set some other way.
 pub fn flush_barrier(tables: impl IntoIterator<Item = *mut Table>, round: FlushRound) -> Result<(), StorageError> {
     let mut ring = LazyRing::default();
     let mut pending: Vec<(*mut Table, FlushWork)> = Vec::new();

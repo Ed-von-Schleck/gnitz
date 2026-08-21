@@ -274,10 +274,13 @@ impl CatalogEngine {
             .map_err(|e| format!("boot flush of the system catalog failed: {e:?}"))
     }
 
-    /// Graceful close for tests; the server never closes the catalog (it
-    /// flushes durably per zone and exits via abort or process teardown).
-    #[cfg(test)]
-    pub(crate) fn close(&mut self) {
+    /// Flush every store this engine owns — each user table's owned handle and
+    /// then the system tables — and clear the DAG. There is no `Drop` doing any
+    /// of it, so a caller that wants the tree on disk complete must call this.
+    ///
+    /// The server never does: it flushes durably per zone and exits via abort or
+    /// process teardown.
+    pub fn close(&mut self) {
         // Flush all user tables before clearing DagEngine. System tables hold
         // Borrowed handles and are flushed below.
         for entry in self.dag.tables.values_mut() {

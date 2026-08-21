@@ -30,7 +30,7 @@ use gnitz_wire::{AggFunc, FixedInt};
 /// hand-built descriptors wrote the type literally, and a mismatch mis-decoded
 /// silently in [`readback_agg_bits`] rather than failing.
 #[derive(Clone, Copy)]
-pub struct AggDescriptor {
+pub(crate) struct AggDescriptor {
     pub col_idx: u32,
     pub agg_op: AggFunc,
 }

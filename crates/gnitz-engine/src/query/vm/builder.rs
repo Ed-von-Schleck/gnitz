@@ -22,7 +22,7 @@ pub(crate) struct ProgramBuilder {
 unsafe impl Send for ProgramBuilder {}
 
 impl ProgramBuilder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         ProgramBuilder {
             instructions: Vec::with_capacity(16),
             funcs: Vec::new(),
@@ -33,19 +33,19 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn push(&mut self, instr: Instr) {
+    pub(crate) fn push(&mut self, instr: Instr) {
         self.instructions.push(instr);
     }
 
     /// The instructions pushed so far — read by `build_plan`'s post-emission
     /// destructive-register ordering check.
-    pub fn instructions(&self) -> &[Instr] {
+    pub(crate) fn instructions(&self) -> &[Instr] {
         &self.instructions
     }
 
     // ── Resource interning (linear scan, small N) ────────────────────────
 
-    pub fn func_idx(&mut self, ptr: *const ScalarFunc) -> u16 {
+    pub(crate) fn func_idx(&mut self, ptr: *const ScalarFunc) -> u16 {
         for (i, &f) in self.funcs.iter().enumerate() {
             if f == ptr {
                 return i as u16;
@@ -59,7 +59,7 @@ impl ProgramBuilder {
     /// Intern `ptr` into `Program::tables` and return its instruction operand.
     /// The `u16` bound holds because each node contributes at most three owned
     /// tables and `build_plan` bounds the node count well below `u16::MAX / 3`.
-    pub fn table_idx(&mut self, ptr: *mut Table) -> u16 {
+    pub(crate) fn table_idx(&mut self, ptr: *mut Table) -> u16 {
         for (i, &t) in self.tables.iter().enumerate() {
             if t == ptr {
                 return i as u16;
@@ -72,7 +72,7 @@ impl ProgramBuilder {
     }
 
     /// Store a baked reduce plan, returning its `Instr::Reduce::plan_idx`.
-    pub fn add_reduce_plan(&mut self, plan: crate::ops::ReducePlan) -> u16 {
+    pub(crate) fn add_reduce_plan(&mut self, plan: crate::ops::ReducePlan) -> u16 {
         let idx = self.reduce_plans.len() as u16;
         self.reduce_plans.push(plan);
         idx
@@ -80,14 +80,14 @@ impl ProgramBuilder {
 
     /// Store the baked AVI write-side resources, returning
     /// `IntegrateAvi::bake_idx`.
-    pub fn add_avi_bake(&mut self, bake: crate::ops::AviBake) -> u16 {
+    pub(crate) fn add_avi_bake(&mut self, bake: crate::ops::AviBake) -> u16 {
         let idx = self.avi_bakes.len() as u16;
         self.avi_bakes.push(bake);
         idx
     }
 
     /// Store a baked reindex packer, returning its `ReindexOperand::Pack` index.
-    pub fn add_reindex_packer(&mut self, packer: crate::ops::ReindexPacker) -> u16 {
+    pub(crate) fn add_reindex_packer(&mut self, packer: crate::ops::ReindexPacker) -> u16 {
         let idx = self.reindex_packers.len() as u16;
         self.reindex_packers.push(packer);
         idx
@@ -106,7 +106,7 @@ impl ProgramBuilder {
     /// Consume the builder, producing a VmHandle that owns the child tables and
     /// scalar functions created by the compiler.
     #[allow(clippy::vec_box)]
-    pub fn build_with_owned(
+    pub(crate) fn build_with_owned(
         self,
         reg_meta: Vec<RegisterMeta>,
         owned_tables: Vec<Box<Table>>,

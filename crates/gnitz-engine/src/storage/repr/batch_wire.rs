@@ -51,7 +51,7 @@ pub fn compute_wire_props(schema: &SchemaDescriptor) -> (bool, u32) {
 /// the region count. The schema-level face of the writer↔reader region
 /// contract (`strides_from_schema`) for callers that size or frame a block
 /// without holding a `Batch`.
-pub fn wire_region_sizes(
+pub(crate) fn wire_region_sizes(
     schema: &SchemaDescriptor,
     count: usize,
     blob_size: usize,
@@ -75,7 +75,7 @@ pub fn wire_block_size(schema: &SchemaDescriptor, count: usize, blob_size: usize
 
 /// Header + directory bytes of a wire block for `schema` — the fixed prefix
 /// preceding the first region (a zero-row, zero-blob block is exactly this).
-pub fn wire_header_dir_size(schema: &SchemaDescriptor) -> usize {
+pub(crate) fn wire_header_dir_size(schema: &SchemaDescriptor) -> usize {
     wire_block_size(schema, 0, 0)
 }
 
@@ -94,7 +94,7 @@ impl Batch {
         shard_file::write_shard_streaming(libc::AT_FDCWD, path, self.count as u32, &regions, schema, opts)
     }
 
-    // ── Wire serialization (used by runtime::sal / runtime::wire) ───────────
+    // ── Wire serialization (used by the server's SAL and frame codecs) ─────
 
     /// WAL-block byte size for `count` rows of this batch's fixed regions plus a
     /// `blob_len`-byte heap — the sizing half of the region convention, shared by

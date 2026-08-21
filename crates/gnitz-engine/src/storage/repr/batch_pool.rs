@@ -59,7 +59,7 @@ thread_local! {
 
 /// Take a buffer from the pool (retains previous capacity).
 /// Returns `Vec::new()` (0 capacity) when the pool is empty.
-pub(crate) fn acquire_buf() -> Vec<u8> {
+pub fn acquire_buf() -> Vec<u8> {
     tls_pool::acquire(&BUF_POOL)
 }
 
@@ -76,7 +76,7 @@ pub(crate) fn recycle_buf(mut buf: Vec<u8>) {
 }
 
 /// A pooled send buffer that returns itself to the pool on drop.
-pub(crate) struct PooledSendBuf(pub(crate) Vec<u8>);
+pub struct PooledSendBuf(pub Vec<u8>);
 
 impl Drop for PooledSendBuf {
     fn drop(&mut self) {

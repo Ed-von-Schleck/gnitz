@@ -73,7 +73,7 @@ pub(crate) fn build_reduce_output_schema(
 /// The baked per-instruction reduce plan. Input facts (schemas, group columns,
 /// aggregate descriptors) plus every derived gate `op_reduce` previously
 /// recomputed per epoch. Built by [`ReducePlan::new`] only.
-pub struct ReducePlan {
+pub(crate) struct ReducePlan {
     pub(crate) input_schema: SchemaDescriptor,
     pub(crate) output_schema: SchemaDescriptor,
     pub(crate) agg_descs: Vec<AggDescriptor>,
@@ -136,7 +136,7 @@ impl ReducePlan {
     /// combined value-index table (the exec dispatch then always opens its
     /// cursor, so the compile-time flag and the runtime cursor agree).
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         input_schema: &SchemaDescriptor,
         output_schema: &SchemaDescriptor,
         group_by_cols: &[u32],

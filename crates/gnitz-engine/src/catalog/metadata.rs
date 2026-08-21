@@ -5,10 +5,89 @@
 use super::*;
 
 impl CatalogEngine {
+    // -- Engine state, reached only through these ----------------------------
+    //
+    // `CatalogEngine` declares no `pub` field. A public field is assignable by
+    // anyone who can name it and offers no place to state what a caller owes, so
+    // every out-of-crate reach into this engine's own state comes through an
+    // accessor, and each one is where the next field behind it stops being
+    // reachable.
+
+    /// The relation DAG: registered tables, views and their compiled circuits.
+    pub fn dag(&self) -> &DagEngine {
+        &self.dag
+    }
+
+    /// [`Self::dag`] for the callers that register, flush or re-order relations.
+    /// The caches this engine maintains index into the DAG by id, so mutations
+    /// here must leave the id set alone unless they go through a hook.
+    pub fn dag_mut(&mut self) -> &mut DagEngine {
+        &mut self.dag
+    }
+
+    /// Enter the DDL zone at `lsn`: every store LSN written until
+    /// [`Self::close_ddl_zone`] is stamped with it, so one crash-recovery unit
+    /// covers the whole DDL. Nesting is not supported — a second open before the
+    /// close overwrites the first.
+    pub fn open_ddl_zone(&mut self, lsn: std::num::NonZeroU64) {
+        self.ctx.open_ddl_zone(lsn);
+    }
+
+    /// Leave the DDL zone and reset the rollback flag. Must run on both the
+    /// success and the compensated-failure path: a zone left open stamps every
+    /// later ingest with a stale LSN.
+    pub fn close_ddl_zone(&mut self) {
+        self.ctx.close_ddl_zone();
+    }
+
+    /// The checkpoint generation durably recorded in `SEQ_ID_CHECKPOINT_GEN`.
+    pub fn durable_generation(&self) -> u64 {
+        self.durable_generation
+    }
+
+    /// The generation a manifest must carry to be resumed from. Equal to
+    /// [`Self::durable_generation`] except across the recovery-start bump.
+    pub fn resume_generation(&self) -> u64 {
+        self.resume_generation
+    }
+
+    /// The data directory this engine's relations live under.
+    pub fn base_dir(&self) -> &str {
+        &self.base_dir
+    }
+
+    /// Rows per `drain_chunk` call on every chunked scan this engine drives.
+    pub fn ddl_scan_chunk_rows(&self) -> usize {
+        self.ddl_scan_chunk_rows
+    }
+
+    /// The high-water mark of user SERIAL sequence `seq_id` (== the table id) —
+    /// the last id handed out. `None` when the sequence has never advanced.
+    pub fn user_sequence(&self, seq_id: i64) -> Option<i64> {
+        self.user_sequences.get(&seq_id).copied()
+    }
+
+    /// Whether `view_id`'s checkpointed output was rejected at boot and must be
+    /// rebuilt rather than resumed.
+    pub fn view_is_invalid(&self, view_id: i64) -> bool {
+        self.invalid_views.contains(&view_id)
+    }
+
+    /// Every view id [`Self::view_is_invalid`] holds for, in no defined order.
+    pub fn invalid_views(&self) -> impl Iterator<Item = i64> + '_ {
+        self.invalid_views.iter().copied()
+    }
+
+    /// Drop `view_id` from the invalid set once its output has been rebuilt.
+    /// Returns whether it was there.
+    pub fn clear_invalid_view(&mut self, view_id: i64) -> bool {
+        self.invalid_views.remove(&view_id)
+    }
+
     // -- FK / index metadata queries (for distributed validation) -------------
 
     /// All FK edges where `table_id` is the child (empty when none).
-    pub(crate) fn fk_constraints_of(&self, table_id: i64) -> &[FkEdge] {
+    pub fn fk_constraints_of(&self, table_id: i64) -> &[FkEdge] {
         self.caches
             .fk_by_child
             .get(&table_id)
@@ -19,7 +98,7 @@ impl CatalogEngine {
     /// All index circuits on a table (empty when none) — the one-pass
     /// accessor for consumers that walk every circuit (e.g. the master's
     /// unique-filter descriptors).
-    pub(crate) fn index_circuits(&self, table_id: i64) -> &[crate::query::IndexCircuitEntry] {
+    pub fn index_circuits(&self, table_id: i64) -> &[crate::query::IndexCircuitEntry] {
         self.dag
             .tables
             .get(&table_id)
@@ -125,7 +204,7 @@ impl CatalogEngine {
     /// contract as [`StoreHandle::as_owned_mut`] — no aliasing `&mut` into
     /// the same store may be live across the call.
     #[allow(clippy::mut_from_ref)]
-    pub(crate) fn get_store_handle(&self, table_id: i64) -> Option<&mut Table> {
+    pub fn get_store_handle(&self, table_id: i64) -> Option<&mut Table> {
         self.dag.tables.get(&table_id).and_then(|e| e.handle.as_owned_mut())
     }
 
@@ -142,19 +221,14 @@ impl CatalogEngine {
     /// the data filesystem once the table is created, so it anchors an
     /// `O_TMPFILE` spill (e.g. the CREATE UNIQUE INDEX pre-flight external sort)
     /// onto the same disk as the table's data. `None` for an unknown table.
-    pub(crate) fn table_directory(&self, table_id: i64) -> Option<&str> {
+    pub fn table_directory(&self, table_id: i64) -> Option<&str> {
         self.dag.tables.get(&table_id).map(|e| e.directory.as_str())
-    }
-
-    /// Get a raw mutable pointer to the DagEngine.
-    pub(crate) fn get_dag_ptr(&mut self) -> *mut DagEngine {
-        &mut self.dag as *mut DagEngine
     }
 
     // -- FK constraint queries ---------------------------------------------
 
     /// All FK edges where `parent_id` is the parent (empty when none).
-    pub(crate) fn fk_children_of(&self, parent_id: i64) -> &[FkEdge] {
+    pub fn fk_children_of(&self, parent_id: i64) -> &[FkEdge] {
         self.caches
             .fk_by_parent
             .get(&parent_id)
@@ -186,7 +260,7 @@ impl CatalogEngine {
     /// already-committed data. Single source of truth for this message — the
     /// distributed path (`MasterDispatcher`) delegates here. A composite index
     /// passes its full `col_indices`, joined as `(a, b)`.
-    pub(crate) fn unique_violation_err(&mut self, table_id: i64, col_indices: &[u32], in_batch: bool) -> String {
+    pub fn unique_violation_err(&mut self, table_id: i64, col_indices: &[u32], in_batch: bool) -> String {
         let (sn, tn, col) = self.qualified_col_names(table_id, col_indices);
         if in_batch {
             format!("Unique index violation on '{sn}.{tn}' column '{col}': duplicate in batch")
@@ -198,7 +272,7 @@ impl CatalogEngine {
     /// Format the `CREATE UNIQUE INDEX` rejection raised when the target
     /// column(s) already hold duplicate values. Same single-source-of-truth
     /// contract as [`Self::unique_violation_err`].
-    pub(crate) fn unique_create_dup_err(&mut self, table_id: i64, col_indices: &[u32]) -> String {
+    pub fn unique_create_dup_err(&mut self, table_id: i64, col_indices: &[u32]) -> String {
         let (sn, tn, col) = self.qualified_col_names(table_id, col_indices);
         format!("cannot create unique index on '{sn}.{tn}' column '{col}': column contains duplicate values")
     }
@@ -206,13 +280,7 @@ impl CatalogEngine {
     /// Format the PK-uniqueness rejection, PG-style. `key_str` is the
     /// already-rendered offending key. `in_batch` distinguishes two rows of one
     /// ingest batch sharing a PK from a collision with committed data.
-    pub(crate) fn pk_violation_err(
-        &mut self,
-        table_id: i64,
-        pk_indices: &[u32],
-        key_str: &str,
-        in_batch: bool,
-    ) -> String {
+    pub fn pk_violation_err(&mut self, table_id: i64, pk_indices: &[u32], key_str: &str, in_batch: bool) -> String {
         let (sn, tn, cols) = self.qualified_col_names(table_id, pk_indices);
         let what = if in_batch {
             format!("Batch contains multiple rows with key ({cols})=({key_str})")
@@ -224,7 +292,7 @@ impl CatalogEngine {
 
     /// Format "an inserted child row references a value the parent does not
     /// hold". Shared by the inline DDL-time check and the distributed pre-flight.
-    pub(crate) fn fk_missing_err(&self, child_tid: i64, parent_tid: i64) -> String {
+    pub fn fk_missing_err(&self, child_tid: i64, parent_tid: i64) -> String {
         let (sn, tn) = self.qualified_name_or_unknown(child_tid);
         let (tsn, ttn) = self.qualified_name_or_unknown(parent_tid);
         format!("Foreign Key violation in '{sn}.{tn}': value not found in target '{tsn}.{ttn}'")
@@ -233,7 +301,7 @@ impl CatalogEngine {
     /// Format "a row a child still references cannot be removed". `verb` names
     /// what the parent write was doing: `"delete from"` when the row goes away,
     /// `"update"` when the referenced value changes under it.
-    pub(crate) fn fk_restrict_err(&self, parent_tid: i64, child_tid: i64, verb: &str) -> String {
+    pub fn fk_restrict_err(&self, parent_tid: i64, child_tid: i64, verb: &str) -> String {
         let (sn, tn) = self.qualified_name_or_unknown(parent_tid);
         let (csn, ctn) = self.qualified_name_or_unknown(child_tid);
         format!("Foreign Key violation: cannot {verb} '{sn}.{tn}', row still referenced by '{csn}.{ctn}'")
@@ -243,7 +311,7 @@ impl CatalogEngine {
     /// live request names" error. Every caller is a fail-stop — reaching it
     /// means the catalog diverged from the request that named the table — so
     /// `op` labels which path observed the divergence.
-    pub(crate) fn schema_or_err(&self, table_id: i64, op: &str) -> Result<SchemaDescriptor, String> {
+    pub fn schema_or_err(&self, table_id: i64, op: &str) -> Result<SchemaDescriptor, String> {
         self.get_schema_desc(table_id)
             .ok_or_else(|| format!("{op}: no schema for table {table_id}"))
     }

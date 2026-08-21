@@ -46,7 +46,7 @@ pub(crate) fn op_worker_filter(batch: &Batch, schema: &SchemaDescriptor, worker_
 /// and `ScatterKind::Fold` (whose docs carry the two contracts). The two keys
 /// diverge for nullable and string columns, so the scatter caller picks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum RouteMode {
+pub enum RouteMode {
     GroupKey,
     JoinPromote,
 }

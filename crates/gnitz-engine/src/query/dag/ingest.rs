@@ -168,7 +168,7 @@ impl DagEngine {
     /// by `tid`. Valid because the worker flush handler is a synchronous `fn` on
     /// a single-threaded process: no reactor yield and no concurrent
     /// `cache`/`tables` mutation, so the table set is frozen for the flush.
-    pub(crate) fn collect_base_flush_tables(&mut self) -> Vec<*mut Table> {
+    pub fn collect_base_flush_tables(&mut self) -> Vec<*mut Table> {
         let mut out: Vec<*mut Table> = Vec::new();
         for entry in self.tables.values_mut() {
             if let Some(t) = entry.handle.as_owned_mut() {
@@ -184,7 +184,7 @@ impl DagEngine {
     /// True when a base round would publish a cut newer than the last one.
     /// Asked of the same table set the round flushes, so the two cannot drift
     /// on which stores publish.
-    pub(crate) fn base_advanced_since_publish(&mut self) -> bool {
+    pub fn base_advanced_since_publish(&mut self) -> bool {
         self.collect_base_flush_tables()
             .into_iter()
             .any(|t| unsafe { &*t }.base_round_advances_publish())
@@ -199,7 +199,7 @@ impl DagEngine {
     /// The sets are disjoint allocations — scratch dirs versus the relation dir
     /// — and `cache` and `tables` are separate fields, so the borrows are clean.
     /// Same `*mut Table` validity argument as `collect_base_flush_tables`.
-    pub(crate) fn collect_ephemeral_flush_tables(&mut self) -> (Vec<*mut Table>, Vec<*mut Table>) {
+    pub fn collect_ephemeral_flush_tables(&mut self) -> (Vec<*mut Table>, Vec<*mut Table>) {
         // Iterate the (smaller) plan cache and consult `tables` — a disjoint
         // sibling field — for each plan's kind. Every `cache` entry has a
         // matching `tables` entry (`ensure_compiled` requires `tables.get`
@@ -234,7 +234,7 @@ impl DagEngine {
     /// PK bytes: the leading slot is the indexed column value (low bytes of
     /// its LE form, zero-padded out to the index column's width), followed
     /// by each source PK column laid out contiguously after it.
-    pub(crate) fn batch_project_index(
+    pub fn batch_project_index(
         src: &Batch,
         spec: &crate::schema::IndexKeySpec,
         idx_schema: &SchemaDescriptor,

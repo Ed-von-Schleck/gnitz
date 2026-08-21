@@ -40,8 +40,8 @@ pub struct IndexCircuitEntry {
     /// When a second index promotes an incumbent circuit (UNIQUE+FK case), no
     /// new directory is created; this field identifies the actual on-disk path
     /// so the retraction branch queues the correct directory for deletion.
-    pub index_id: i64,
-    pub index_table: UnsafeCell<Box<Table>>,
+    pub(crate) index_id: i64,
+    pub(crate) index_table: UnsafeCell<Box<Table>>,
     pub index_schema: SchemaDescriptor,
     /// Full-arity span-encode plan, precomputed at registration so the per-push
     /// consumers do no per-call spec rebuild. It survives every column ALTER of
@@ -173,7 +173,7 @@ impl RelationKind {
 // Table entry — per-table metadata in the entity registry
 // ---------------------------------------------------------------------------
 
-pub struct TableEntry {
+pub(crate) struct TableEntry {
     pub handle: StoreHandle,
     pub schema: SchemaDescriptor,
     pub kind: RelationKind,
@@ -191,7 +191,7 @@ pub struct TableEntry {
 impl TableEntry {
     /// A registry entry with no index circuits yet. `capacity_bytes` is `None`
     /// for everything but a capacity-bounded view.
-    pub fn new(
+    pub(crate) fn new(
         handle: StoreHandle,
         schema: SchemaDescriptor,
         kind: RelationKind,
@@ -215,7 +215,7 @@ impl TableEntry {
     /// silent `Table` at the wire boundary. A bounded view is its own wire class:
     /// the client's leaf rule refuses to bind one inside a view body, and
     /// `ALTER VIEW … AS` refuses to retarget it.
-    pub fn class(&self) -> gnitz_wire::RelClass {
+    pub(crate) fn class(&self) -> gnitz_wire::RelClass {
         use gnitz_wire::RelClass;
         match self.kind {
             RelationKind::Stream => RelClass::Stream,
@@ -229,12 +229,12 @@ impl TableEntry {
     /// is what a detached handle opens empty in, so reading through here is what
     /// keeps that answer in the relation's shape without the handle holding a
     /// second copy of the descriptor to keep in step across an ALTER.
-    pub fn open_cursor(&self) -> crate::storage::ReadCursor {
+    pub(crate) fn open_cursor(&self) -> crate::storage::ReadCursor {
         self.handle.open_cursor(&self.schema)
     }
 
     /// Materialize every positive-weight row of this relation's store.
-    pub fn full_scan(&self) -> std::rc::Rc<Batch> {
+    pub(crate) fn full_scan(&self) -> std::rc::Rc<Batch> {
         self.handle.full_scan(&self.schema)
     }
 
@@ -244,13 +244,13 @@ impl TableEntry {
     /// nothing and reads exactly like an unbounded one, so it keeps the ordinary
     /// cached/bulk read paths, and the branch cannot disagree with what the
     /// capacity sweep did.
-    pub fn needs_hydration(&self) -> bool {
+    pub(crate) fn needs_hydration(&self) -> bool {
         self.handle.has_skeleton_rows()
     }
 
     /// The index circuit covering exactly `cols`, if one exists. The circuit
     /// list is deduped by ordered column list, so at most one entry matches.
-    pub fn index_circuit_on(&self, cols: &[u32]) -> Option<&IndexCircuitEntry> {
+    pub(crate) fn index_circuit_on(&self, cols: &[u32]) -> Option<&IndexCircuitEntry> {
         self.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols)
     }
 
@@ -265,11 +265,16 @@ impl TableEntry {
 // ExchangeCallback — trait for multi-worker exchange IPC
 // ---------------------------------------------------------------------------
 
-/// Callback trait for exchange IPC between workers.
+/// How a multi-worker operator reaches the other workers.
 ///
-/// The worker event loop implements this trait to send pre-exchange output
-/// to the master (via W2M) and receive relayed data (via SAL).
-/// This breaks the circular dependency between worker.rs ↔ dag.rs.
+/// Given this worker's pre-exchange output for `view_id`, return the batch this
+/// worker owns once every worker's output has been repartitioned. The transport
+/// is entirely the implementor's: this crate computes, and never names a channel.
+///
+/// That is what lets the whole exchange path sit below the process model —
+/// `gnitz-server` realizes it by sending to the master over W2M and receiving
+/// the relay over the SAL, and a single-process embedder implements it as the
+/// identity.
 pub trait ExchangeCallback {
     fn do_exchange(&mut self, view_id: i64, batch: &Batch, source_id: i64) -> Batch;
 }
@@ -288,7 +293,7 @@ pub struct DagEngine {
 }
 
 impl DagEngine {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         DagEngine {
             cache: FxHashMap::default(),
             dep: DepMap::default(),
@@ -300,7 +305,7 @@ impl DagEngine {
 
     // ── System table setup ──────────────────────────────────────────────
 
-    pub fn set_sys_tables(&mut self, sys: SysTableRefs) {
+    pub(crate) fn set_sys_tables(&mut self, sys: SysTableRefs) {
         self.sys = sys;
     }
 
@@ -308,11 +313,11 @@ impl DagEngine {
 
     /// Enter a relation in the registry. `index_circuits` starts empty and is
     /// filled by `add_index_circuit`.
-    pub fn register_table(&mut self, table_id: i64, entry: TableEntry) {
+    pub(crate) fn register_table(&mut self, table_id: i64, entry: TableEntry) {
         self.tables.insert(table_id, entry);
     }
 
-    pub fn unregister_table(&mut self, table_id: i64) {
+    pub(crate) fn unregister_table(&mut self, table_id: i64) {
         self.tables.remove(&table_id);
         self.cache.remove(&table_id);
         self.evict_meta(table_id);
@@ -545,9 +550,9 @@ impl DagEngine {
         }
     }
 
-    /// Close the DagEngine, dropping all cached plans. Test-only, like the
-    /// `CatalogEngine::close` that drives it: the server never closes gracefully.
-    #[cfg(test)]
+    /// Close the DagEngine, dropping all cached plans. Reached only through
+    /// `CatalogEngine::close`, which the server never calls — it flushes durably
+    /// per zone and exits via abort or process teardown.
     pub(crate) fn close(&mut self) {
         self.cache.clear();
         self.tables.clear();

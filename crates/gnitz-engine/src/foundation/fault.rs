@@ -7,18 +7,24 @@
 //! cannot leak into a release binary. The variable is read once per process —
 //! it cannot change mid-run, and several seams sit on per-push or per-relay
 //! paths where a fresh `std::env::var` would allocate every call.
+//!
+//! Which build decides is *this* crate's: the `cfg!(debug_assertions)` below is
+//! evaluated in `gnitz-engine`'s compilation unit, and most `Seam` declarations
+//! now live in `gnitz-server`. The two profiles agree in this workspace, so a
+//! debug server arms its seams — but a profile that optimized only the engine
+//! would disarm every one of them, server-side included, with no diagnostic.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-pub(crate) struct Seam {
+pub struct Seam {
     var: &'static str,
     setting: OnceLock<Option<String>>,
     spent: AtomicBool,
 }
 
 impl Seam {
-    pub(crate) const fn new(var: &'static str) -> Self {
+    pub const fn new(var: &'static str) -> Self {
         Self {
             var,
             setting: OnceLock::new(),
@@ -36,19 +42,19 @@ impl Seam {
     }
 
     /// True while the seam is set to any value.
-    pub(crate) fn armed(&self) -> bool {
+    pub fn armed(&self) -> bool {
         self.setting().is_some()
     }
 
     /// True while the seam names this stage — for seams that pick one of several
     /// injection points.
-    pub(crate) fn at(&self, stage: &str) -> bool {
+    pub fn at(&self, stage: &str) -> bool {
         self.setting() == Some(stage)
     }
 
     /// The seam's setting as a name the caller matches against its own state
     /// (a table name, a pipeline stage).
-    pub(crate) fn names(&self) -> Option<&str> {
+    pub fn names(&self) -> Option<&str> {
         self.setting()
     }
 
@@ -61,7 +67,7 @@ impl Seam {
 
     /// Consume the seam's one-shot latch: true on the first call while armed,
     /// false ever after, so the rest of the run behaves normally.
-    pub(crate) fn take_once(&self) -> bool {
+    pub fn take_once(&self) -> bool {
         self.armed() && !self.spent.swap(true, Ordering::Relaxed)
     }
 }

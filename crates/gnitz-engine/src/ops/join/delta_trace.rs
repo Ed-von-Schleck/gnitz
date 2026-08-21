@@ -24,7 +24,7 @@ use super::rowwrite::write_join_row;
 /// (random-access) delta group `[i, j)` — trace-major emission. Galloping skips
 /// make this optimal in both former selector regimes (huge delta + tiny trace,
 /// and the reverse) with no `rewind` / `estimated_length` / size selector.
-pub fn op_join_delta_trace(
+pub(crate) fn op_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,

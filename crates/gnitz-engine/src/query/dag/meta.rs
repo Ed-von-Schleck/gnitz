@@ -14,7 +14,7 @@ use std::rc::Rc;
 /// Per-view circuit metadata derived from one `load_meta_circuit` pass.
 /// Everything a plan-free caller needs; eviction is one map `remove`.
 #[derive(Default)]
-pub(crate) struct ViewMeta {
+pub struct ViewMeta {
     /// The sink-nearest `ExchangeShard`'s shard columns — the master relay's
     /// routing key — and `None` when the circuit carries no `ExchangeShard` at
     /// all. The two states are distinct: an ungrouped global aggregate shards on
@@ -47,7 +47,7 @@ pub(crate) struct ViewMeta {
 /// and the per-slot carried promotion targets, mirroring the trace-side reindex
 /// Map slot-for-slot. Held pre-split because the relay reads the two halves
 /// separately, once per relay round.
-pub(crate) struct JoinScatterKey {
+pub struct JoinScatterKey {
     pub cols: Rc<[u32]>,
     pub target_tcs: Rc<[u8]>,
 }
@@ -106,7 +106,7 @@ pub(super) struct DepMap {
 }
 
 impl DepMap {
-    pub fn invalidate(&mut self) {
+    pub(super) fn invalidate(&mut self) {
         self.valid = false;
     }
 
@@ -118,7 +118,7 @@ impl DepMap {
     /// `nodes` is passed in (a Copy raw pointer) because the table lives on
     /// `DagEngine`; reading it through `self` here would double-borrow against
     /// the `&mut self.dep`.
-    pub fn get_or_rebuild(&mut self, nodes: *mut Table) -> &FxHashMap<i64, Vec<i64>> {
+    pub(super) fn get_or_rebuild(&mut self, nodes: *mut Table) -> &FxHashMap<i64, Vec<i64>> {
         if self.valid {
             return &self.forward;
         }
@@ -178,7 +178,7 @@ impl DagEngine {
     /// Applies no `tables` kind filter, so a source absent from `tables` is still
     /// reported: the read-freshness test that drives this must not narrow its own
     /// input, or a dropped source would vanish from the closure and read as fresh.
-    pub(crate) fn source_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
+    pub fn source_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
         self.get_dep_map();
         DepMap::closure(&self.dep.reverse, seeds)
     }
@@ -249,10 +249,17 @@ impl DagEngine {
         bases
     }
 
+    /// A registered relation's wire class, or `None` for an unknown id — the
+    /// shape a `FLAG_RESOLVE` descriptor reports. `RelClass` is `Copy`, so the
+    /// `tables` borrow ends with the call.
+    pub fn relation_class(&self, id: i64) -> Option<gnitz_wire::RelClass> {
+        self.tables.get(&id).map(|e| e.class())
+    }
+
     /// A registered relation's kind, or `None` for an unknown id. `RelationKind`
     /// is `Copy`, so the `tables` borrow ends with the call — callers may await
     /// on the result.
-    pub(crate) fn relation_kind(&self, id: i64) -> Option<RelationKind> {
+    pub fn relation_kind(&self, id: i64) -> Option<RelationKind> {
         self.tables.get(&id).map(|e| e.kind)
     }
 
@@ -265,14 +272,14 @@ impl DagEngine {
     /// taking one worker's copy instead of N identical ones — both the scan
     /// dispatch and the exchange relay read this for that. SEEK already unicasts
     /// to one worker, so it needs no check.
-    pub(crate) fn relation_is_replicated(&self, id: i64) -> bool {
+    pub fn relation_is_replicated(&self, id: i64) -> bool {
         self.tables
             .get(&id)
             .is_some_and(|e| e.schema.placement().is_replicated())
     }
 
     /// Every registered view id.
-    pub(crate) fn view_ids(&self) -> Vec<i64> {
+    pub fn view_ids(&self) -> Vec<i64> {
         self.tables
             .iter()
             .filter(|(_, e)| e.kind.is_view())
@@ -365,7 +372,7 @@ impl DagEngine {
 
     /// The memoized per-view circuit metadata, computed from ONE
     /// `load_meta_circuit` pass on first touch.
-    pub(crate) fn view_meta(&mut self, view_id: i64) -> Rc<ViewMeta> {
+    pub fn view_meta(&mut self, view_id: i64) -> Rc<ViewMeta> {
         if let Some(m) = self.meta.get(&view_id) {
             return m.clone();
         }

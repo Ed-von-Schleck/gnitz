@@ -41,7 +41,7 @@ const RELOCATE_CELL_COST_BYTES: usize = 500;
 /// (schema max is `MAX_COLUMNS` = 65 total columns, 1 is the PK).  The blob is
 /// not in this array; it lives in `self.blob` and is accounted for separately.
 /// 3 + 64 = 67, rounded up to 68 to keep the array size as a multiple of 4.
-pub(crate) const MAX_BATCH_REGIONS: usize = 68;
+pub const MAX_BATCH_REGIONS: usize = 68;
 
 /// How many payload columns the region array can hold — the writer's own cap,
 /// enforced by `fill_payload_strides`. Deliberately looser than the semantic cap
@@ -74,7 +74,7 @@ pub(in crate::storage) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as 
 /// path (`append_ranges`, `Batch::from_ranges`, `ScalarFunc::append_map_ranges`)
 /// sizes its destination by.
 #[inline]
-pub fn range_rows(ranges: &[(usize, usize)]) -> usize {
+pub(crate) fn range_rows(ranges: &[(usize, usize)]) -> usize {
     ranges.iter().map(|&(s, e)| e - s).sum()
 }
 
@@ -320,7 +320,7 @@ pub(super) unsafe fn copy_regions(
 /// private — only `certify_layout` / `inherit_layout` / `downgrade` (and
 /// `set_weight`'s `Sorted` ceiling) mutate it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) enum Layout {
+pub enum Layout {
     /// No order/fold guarantee.
     Raw,
     /// Rows are (PK, payload)-sorted (non-decreasing), but may carry unfolded
@@ -469,9 +469,12 @@ impl Batch {
     /// particular content, and so writes no rows at all.
     ///
     /// `vec![0u8; _]` deliberately — a calloc of this size is demand-zero mmap
-    /// the test never faults in, where `with_capacity` + a memset would touch
+    /// the caller never faults in, where `with_capacity` + a memset would touch
     /// every page of what is routinely a 256 MiB arena.
-    #[cfg(test)]
+    ///
+    /// Every caller is a test. It carries no `#[cfg(test)]` because the test
+    /// helpers also compile as `gnitz-engine-testkit`, an ordinary dependent
+    /// crate, which sees only what the library publishes.
     pub fn zeroed(schema: SchemaDescriptor, rows: usize) -> Self {
         let (strides, nr) = strides_from_schema(&schema);
         let (offsets, total_size) = compute_offsets(&strides, nr as usize, rows.max(1));
@@ -724,12 +727,17 @@ impl Batch {
     // ── Extend methods (building batches row-by-row) ────────────────────
 
     /// Ensure the data buffer has room for at least one more row.
-    pub(crate) fn ensure_row_capacity(&mut self) {
+    #[inline]
+    pub fn ensure_row_capacity(&mut self) {
         self.reserve_rows(1);
     }
 
     /// Ensure the data buffer has room for at least `n` more rows beyond `count`.
-    pub(crate) fn reserve_rows(&mut self, n: usize) {
+    /// `#[inline]` for the already-has-room test: without it both this and
+    /// [`Self::ensure_row_capacity`] are out-of-line calls through the GOT in any
+    /// build without cross-crate LTO, once per row appended from another crate.
+    #[inline]
+    pub fn reserve_rows(&mut self, n: usize) {
         if self.count + n <= self.capacity as usize {
             return;
         }
@@ -1104,7 +1112,7 @@ impl Batch {
     /// The cached layout claim (non-verifying). Use `layout()`/`is_*()` where the
     /// boolean suffices; use the verifying `*_verified` readers at trust sites.
     #[inline]
-    pub(crate) fn layout(&self) -> Layout {
+    pub fn layout(&self) -> Layout {
         self.layout
     }
 
@@ -1112,14 +1120,14 @@ impl Batch {
     /// structurally (no pair can be out of order), independent of the cached tag —
     /// so the constructor default of `Raw` needs no per-reader special-casing.
     #[inline]
-    pub(crate) fn is_sorted(&self) -> bool {
+    pub fn is_sorted(&self) -> bool {
         self.count == 0 || self.layout >= Layout::Sorted
     }
 
     /// True if the rows are consolidated (strictly (PK, payload)-increasing and
     /// ghost-free). An empty batch is consolidated structurally.
     #[inline]
-    pub(crate) fn is_consolidated(&self) -> bool {
+    pub fn is_consolidated(&self) -> bool {
         self.count == 0 || self.layout == Layout::Consolidated
     }
 
@@ -1155,11 +1163,17 @@ impl Batch {
     /// Raise this batch's layout to `layout`, debug-verifying the data first. The
     /// ONLY way the guarantee goes up. Both provenance kernels and the wire-decode
     /// trust boundary call it, so an over-claiming kernel and a lying wire frame
-    /// are caught identically — at the producer, schema in hand. In release it is
-    /// a single field store.
+    /// are caught identically — at the producer, schema in hand.
+    ///
+    /// **In release the verification does not run** — the `debug_verify_*` calls
+    /// below are `#[cfg(debug_assertions)]`, so this is a single field store and
+    /// the claim is entirely the caller's. Claiming `Consolidated` over data that
+    /// is not sorted-and-summed makes every downstream skip-point fold weights
+    /// against the wrong element, with no error and no assertion. Call it only
+    /// where the code just produced the property it names.
     #[cfg_attr(not(debug_assertions), allow(unused_variables))]
     #[inline]
-    pub(crate) fn certify_layout(&mut self, layout: Layout, schema: &SchemaDescriptor) {
+    pub fn certify_layout(&mut self, layout: Layout, schema: &SchemaDescriptor) {
         #[cfg(debug_assertions)]
         self.debug_verify_null_bits(schema);
         #[cfg(debug_assertions)]
@@ -1173,7 +1187,7 @@ impl Batch {
 
     /// Reset to no layout claim. Every order/fold-destroying mutator calls this.
     #[inline]
-    pub(crate) fn downgrade(&mut self) {
+    pub fn downgrade(&mut self) {
         self.layout = Layout::Raw;
     }
 
@@ -1538,6 +1552,9 @@ impl Batch {
     /// every non-null, non-STRING column.  For STRING columns the pointer must
     /// point to a 16-byte German String struct.  `blob_src` must contain the
     /// blob bytes referenced by any long-string structs.
+    ///
+    /// `#[cfg(test)]`, so it is compiled out of every consumer's build: the
+    /// production append paths go through `AppendSession`.
     #[cfg(test)]
     pub unsafe fn append_row(
         &mut self,
@@ -1577,9 +1594,16 @@ impl Batch {
 
     /// Append a row from RowBuilder-style value arrays.
     ///
+    /// Every caller is a test fixture, seven of them in `gnitz-server`'s own
+    /// test modules. Those link the ordinary rlib, where a `#[cfg(test)]` item
+    /// does not exist — which is why this one cannot carry the attribute its
+    /// `pub(crate)` siblings do.
+    ///
     /// # Safety
     /// For STRING columns, `str_ptrs[i]` must be valid for `str_lens[i]` bytes.
-    #[cfg(test)]
+    /// The value arrays must match this batch's schema: one entry per payload
+    /// column, in schema order, of the width that column's type code implies —
+    /// a mismatch writes a row the readers decode as some other row's bytes.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn append_row_simple(
         &mut self,
@@ -1993,7 +2017,7 @@ impl ColumnarSource for Batch {
 /// counts, and every reader — accessor, `region_slice`, `regions`, `total_bytes`
 /// — bounds the batch to `count`, so the `[count, capacity)` tail and the
 /// inter-region alignment padding are never read and never serialized.
-pub fn write_to_batch(
+pub(crate) fn write_to_batch(
     schema: &SchemaDescriptor,
     max_rows: usize,
     max_blob: usize,
@@ -2037,13 +2061,13 @@ pub fn write_to_batch(
 //
 // A pure storage utility: it holds no catalog state and builds a `Batch`
 // row-by-row from a schema, so it lives here with `Batch`. Re-exported from
-// `catalog` for its DDL/bootstrap/store callers; `runtime::executor` and the
-// `compiler` tests import it from `storage` directly.
+// `catalog` for its DDL/bootstrap/store callers; `gnitz-server`'s executor and
+// the `compiler` tests import it from `storage` directly.
 // ---------------------------------------------------------------------------
 
 /// Lightweight row-by-row builder for constructing Batch in Rust.
 /// Operates on Batch directly; the schema lives on the batch itself.
-pub(crate) struct BatchBuilder {
+pub struct BatchBuilder {
     pub(crate) batch: Batch,
     // per-row state
     pub(crate) curr_null_word: u64,
@@ -2074,7 +2098,7 @@ impl gnitz_wire::sys_rows::SysRowSink for BatchBuilder {
 }
 
 impl BatchBuilder {
-    pub(crate) fn new(schema: SchemaDescriptor) -> Self {
+    pub fn new(schema: SchemaDescriptor) -> Self {
         BatchBuilder {
             // Uninitialized, like every batch arena: every row writes every
             // column (`put_null` zero-fills rather than skipping).
@@ -2201,7 +2225,7 @@ impl BatchBuilder {
     }
 
     /// Consume the builder, returning the built batch.
-    pub(crate) fn finish(self) -> Batch {
+    pub fn finish(self) -> Batch {
         self.batch
     }
 

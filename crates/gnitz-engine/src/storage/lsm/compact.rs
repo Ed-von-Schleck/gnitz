@@ -74,7 +74,7 @@ fn fold_bucket_per_pk(shards: &[MappedShard], bucket: &[(u32, u32, i64)]) -> Vec
 /// Where one compaction's outputs go: the four values `naming::compact_shard_name`
 /// needs, plus whether the store they belong to is ever point-probed by PK. They
 /// travel together and are decided together, by `ShardIndex::compact_into`.
-pub struct Output<'a> {
+pub(super) struct Output<'a> {
     pub dir: &'a str,
     pub table_id: u32,
     pub level_num: u32,
@@ -95,7 +95,7 @@ pub struct Output<'a> {
 /// Returns `(guard_key, path)` per written shard in increasing guard-index order.
 /// On a write error every shard already written this call is removed before
 /// returning `Err` (atomic-or-nothing).
-pub fn merge_and_route(
+pub(super) fn merge_and_route(
     input_files: &[&CStr],
     guards: &[(u128, bool)],
     schema: &SchemaDescriptor,

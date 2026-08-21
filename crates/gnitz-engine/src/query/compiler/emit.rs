@@ -78,13 +78,13 @@ pub(super) fn child_scratch_dir(view_dir: &str, child_name: &str) -> String {
 pub(super) struct ScratchGuard(Vec<String>);
 
 impl ScratchGuard {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         ScratchGuard(Vec::new())
     }
     fn track(&mut self, dir: String) {
         self.0.push(dir);
     }
-    pub fn defuse(&mut self) {
+    pub(super) fn defuse(&mut self) {
         self.0.clear();
     }
 }

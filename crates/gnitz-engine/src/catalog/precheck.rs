@@ -520,7 +520,7 @@ impl CatalogEngine {
     /// Exhaustive over `SysFamily` (like `fire_hooks`): a newly-added family
     /// must decide here whether it carries precheck guards, rather than falling
     /// into a silent `_` arm.
-    pub(crate) fn precheck_family(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+    pub fn precheck_family(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         match family {
             SysFamily::Schema => self.precheck_schema_family(batch),
             SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch),
