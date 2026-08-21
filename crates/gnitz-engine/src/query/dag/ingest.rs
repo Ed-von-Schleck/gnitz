@@ -107,14 +107,23 @@ impl DagEngine {
         };
         let stamped = batch.stamped_with_pk_prefix(&entry.schema, &feed.schema, tick_round);
         if let Err(e) = feed.handle.ingest_owned_batch(stamped) {
-            // The view's own store has already absorbed this batch, so a swallowed
-            // failure would leave the feed one round short with no error anywhere
-            // — every subscriber applying a hole. Restart re-derives the view and
-            // erases the delta store, and the fresh boot nonce makes every cursor
-            // a client holds stop matching, so it re-reads from scratch.
-            gnitz_fatal_abort!(
-                "dag: delta-store ingest failed (view_id={}, round={}): {} — the feed \
-                 would silently lose a round; aborting for restart+re-derive",
+            // Logged, not fatal, because **this round is not lost**. The batch is
+            // moved into the memtable before anything fallible runs, and the only
+            // error source above that is the spill: every one of its failure paths
+            // leaves the run in the RAM tier (`persist_l0_run` writes, registers,
+            // and only then clears the tier), and every error after the clear has
+            // the rows registered on disk. So what failed is the spill of
+            // accumulated data, which the next tick retries — not the capture.
+            //
+            // Aborting would also destroy the thing it claims to protect: unlike a
+            // base table, whose abort is answered by SAL replay, a delta store is
+            // opened `Rederive { resume_at: None }` and is **erased at open**, so a
+            // restart drops every retained round of every fed view and forces every
+            // subscriber to bootstrap again. The cost of continuing is back-pressure
+            // — a RAM tier that grows while the disk stays broken — not a hole.
+            gnitz_error!(
+                "dag: delta-store spill failed (view_id={}, round={}): {} — the round is \
+                 held in RAM and retried on the next tick; the feed is intact",
                 view_id,
                 tick_round,
                 e,

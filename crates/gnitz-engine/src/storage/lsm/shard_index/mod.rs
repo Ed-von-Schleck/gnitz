@@ -1489,6 +1489,59 @@ mod tests {
         assert_eq!(on_disk_shards(tmp.path()).len(), registered, "no orphan shard files");
     }
 
+    /// The contract `open_delta_cursor`'s refusal is derived from: a drop removes
+    /// only rows **at or below** the floor it raises, so every round above the
+    /// floor survives it whole.
+    ///
+    /// That is what lets a cursor sitting exactly *at* the floor be served rather
+    /// than refused — it asks for `(floor, cut]`, and nothing in that span was
+    /// ever dropped. Refusing it as well would strand a bootstrap whose watermark
+    /// landed on the floor: it would re-read at 0, be handed the same round, and
+    /// be refused again until a later tick moved it.
+    #[test]
+    fn a_drop_removes_nothing_above_the_floor_it_raises() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64(), false);
+        let mut written: Vec<u64> = Vec::new();
+        let add = |idx: &mut ShardIndex, written: &mut Vec<u64>, round: u64| {
+            // Ascending and distinct, as a `_tick`-led delta store's keys are, so
+            // nothing cancels in a fold and a row count is a faithful census.
+            let pks: Vec<u64> = (0..40).map(|i| round * 1000 + i + 1).collect();
+            let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+            let p = write_test_shard(tmp.path(), &format!("spill_{round}.db"), &pks, &vals);
+            idx.add_unsynced_shard(&p, round + 1).unwrap();
+            written.extend_from_slice(&pks);
+        };
+
+        // Fill unbudgeted first, so the budget below is a size the store has
+        // actually reached rather than a guess.
+        for round in 0..6u64 {
+            add(&mut idx, &mut written, round);
+        }
+        idx.run_compact().unwrap();
+        idx.set_delta_budget(idx.resident_bytes());
+
+        for round in 6..24u64 {
+            add(&mut idx, &mut written, round);
+            if idx.should_compact() {
+                idx.run_compact().unwrap();
+            }
+            idx.enforce_capacity().unwrap();
+        }
+
+        let floor = idx.dropped_through();
+        let retained: usize = idx.all_entries().map(|e| e.shard.count).sum();
+        assert!(floor > 0, "the sweep dropped nothing — nothing is being tested");
+        assert!(retained > 0, "the sweep emptied the store — nothing is being tested");
+
+        let above = written.iter().filter(|&&k| k > floor).count();
+        assert_eq!(
+            retained, above,
+            "floor {floor}: every one of the {above} rows above it must survive, and \
+             every row at or below it must be gone — {retained} retained",
+        );
+    }
+
     /// Dehydration picks its victim by **write recency**: the terminal guard
     /// whose newest entry carries the smallest `max_lsn` goes first. The row
     /// content survives — a skeleton row keeps its key and its summed weight.

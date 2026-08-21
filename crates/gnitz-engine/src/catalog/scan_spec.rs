@@ -264,22 +264,30 @@ impl CatalogEngine {
     /// alone. A start key not below the end comes back as an empty range rather
     /// than an error, so a forged `after_tick` above the cut is inert.
     ///
-    /// Refused when the cursor is at or below this worker's `dropped_through`:
-    /// that round's rows may have gone, and the floors are independent across
-    /// workers, so one refusal refuses the read — a broadcast one worker cannot
-    /// serve whole has a hole in it. `<=`, not `<`, because a drop can leave the
-    /// tail of its highest round behind, so a cursor *at* that round would be
-    /// served a fragment.
+    /// Refused when this worker has dropped a round the walk would have to cover.
+    /// The floors are independent across workers, so one refusal refuses the read
+    /// — a broadcast one worker cannot serve whole has a hole in it.
+    ///
+    /// The test is `after_tick < dropped_through`, and the strictness is exact
+    /// rather than cautious. `dropped_through` is the **highest** `_tick` this
+    /// store has dropped, and the walk covers `(after_tick, cut]`, so a dropped
+    /// row falls inside it iff `dropped_through > after_tick`. A cursor sitting
+    /// *at* the floor is therefore served in full: a drop can leave the tail of
+    /// its highest round behind, but `Cut::After(after_tick)` starts above that
+    /// round, so the surviving fragment is excluded rather than returned. Refusing
+    /// it as well would strand a bootstrap whose watermark landed on the floor —
+    /// it would re-read at 0, be handed the same round, and be refused again until
+    /// a later tick moved it.
     fn open_delta_cursor(&mut self, source: i64, after_tick: u64, cut_tick: u64) -> Result<SourceCursor, WireFault> {
         let Some(feed) = self.table_entry(source)?.delta.as_ref() else {
             return Err(format!("scan_spec: this process holds no delta store for relation {source}").into());
         };
         let dropped_through = feed.handle.dropped_through();
-        if after_tick <= dropped_through {
+        if after_tick < dropped_through {
             return Err(WireFault {
                 status: gnitz_wire::STATUS_DELTA_EXPIRED,
                 text: format!(
-                    "delta cursor {after_tick} of relation {source} is at or below the \
+                    "delta cursor {after_tick} of relation {source} is below the \
                      retained floor {dropped_through}; re-read at 0"
                 ),
             });
