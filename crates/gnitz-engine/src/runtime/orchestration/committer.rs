@@ -356,6 +356,15 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<
 /// and leaves `batch` holding the pushes it held across the sequence — folded
 /// with any that arrived mid-drain — plus the deferred DDL/Shutdown barriers,
 /// for the caller to commit and signal.
+///
+/// This sequence and boot's pre-reactor `boot_checkpoint` are the only SAL
+/// checkpoint drivers; `MasterDispatcher::reclaim_base` states the exclusivity a
+/// third one would have to own. Inside a round `flush_round` holds
+/// `sal_writer_excl` across write + ACK wait + reset, and that span cannot be
+/// shortened: a writer admitted before the reset emits its group in the old
+/// epoch, which every worker skips, and the reset then orphans that group and
+/// hangs its writer. The lock is released across the step-2 drain because the
+/// tick task re-acquires it per tick.
 async fn run_checkpoint_sequence(
     rx: &mut mpsc::Receiver<CommitRequest>,
     shared: &Rc<Shared>,
@@ -765,8 +774,9 @@ async fn commit_pushes(
     // fsync is awaited separately in Phase D so DAG evaluation overlaps
     // with fdatasync (~5 ms gap eliminated). LSN publish is deferred to
     // after fsync so clients only see a durable LSN.
-    // unique_filter_ingest_batch is NOT called here — per the invariant in
-    // async-invariants.md it must run only after fsync confirms durability.
+    // unique_filter_ingest_batch is NOT called here: a filter entry for rows a
+    // crash would discard makes the next INSERT of the same key fail a
+    // uniqueness check nothing durable backs. It runs after Phase D's fsync.
     // ------------------------------------------------------------------
     {
         join_into(fut_slots, ack_slots).await;

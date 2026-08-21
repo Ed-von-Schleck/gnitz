@@ -44,7 +44,8 @@ impl IoUringRing {
 
     /// Queue one SQE, flushing the pending batch first if the ring is full.
     /// Infallible: the only way `push` can fail is a full SQ, which the flush
-    /// clears.
+    /// clears. A full SQ therefore never reaches a caller as backpressure — it
+    /// costs one extra `submit()` and is invisible above this line.
     #[inline]
     fn push(&mut self, entry: squeue::Entry) {
         if self.ring.submission().is_full() {

@@ -387,6 +387,11 @@ impl Reactor {
     /// exits cleanly. Also cancels the outstanding `FUTEX_WAITV` SQE
     /// (if any) so its `FutexWaitV` array storage can be dropped
     /// safely; waits for the `-ECANCELED` CQE before returning.
+    ///
+    /// In-flight client SENDs are abandoned, not drained: a reply whose CQE has
+    /// not landed is lost, so a client can see its connection close instead of
+    /// its last response. Durability is unaffected — `watchdog` runs the full
+    /// checkpoint sequence to completion before it calls this.
     pub fn request_shutdown(&self) {
         self.inner.shutdown.set(true);
         self.cancel_futex_waitv_and_wait();
@@ -743,8 +748,9 @@ impl Reactor {
     /// Park `decoded` for its awaiter. FLAG_EXCHANGE replies are
     /// demuxed into `exchange_acc` so the tick req_id's waker stays
     /// parked until the final (non-FLAG_EXCHANGE) ACK lands. When an
-    /// exchange round completes, the resulting `PendingRelay` is
-    /// dispatched on `relay_tx`. See SAL-writer exclusivity in async-invariants.md.
+    /// exchange round completes, the resulting `PendingRelay` is dispatched on
+    /// `relay_tx` — the write itself happens in `relay_loop`, which can take the
+    /// catalog read lock and `sal_writer_excl`; this handler cannot.
     ///
     /// Routes on `prefix` — the ring slot's `internal_req_id` — which is the
     /// key `send_msg` documents as the reply's identity. The payload's

@@ -72,9 +72,10 @@ struct ExchangeRound {
     all_pad: bool,
 }
 
-/// One completed exchange ready for relay.  The relay task owns this:
-/// it acquires the catalog read lock + SAL-writer mutex, calls
-/// `MasterDispatcher::relay_exchange`, then releases both.
+/// One completed exchange ready for relay. The relay task owns this: it builds
+/// the group under the catalog read lock (`prepare_relay`), then emits it under
+/// `sal_writer_excl` (`emit_relay_with_decision`) — two separate holds, never
+/// one.
 pub struct PendingRelay {
     pub view_id: i64,
     pub payloads: Vec<Option<Batch>>,

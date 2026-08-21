@@ -2,6 +2,16 @@
 //!
 //! `server_main()` opens the catalog, allocates shared IPC resources, forks workers,
 //! runs SAL recovery, and enters the executor event loop.
+//!
+//! **Recovery order is a crash guard.** Each step in `run_server` is placed so a
+//! crash at any point rebuilds a view rather than silently resuming a stale one,
+//! and the monotonic checkpoint generation is what carries that. The
+//! recovery-start bump (`G → G+1`: durable, pre-fork, deliberately not published
+//! to `worker_ctx`) covers the window from the SAL reset to `boot_checkpoint` — a
+//! crash inside it leaves the durable generation ahead of every un-checkpointed
+//! view's stamp, which `compute_invalid_views` reads as "rebuild".
+//! `boot_checkpoint`'s own bump then re-stamps the resumed and rebuilt state
+//! together. `run_checkpoint_sequence`'s step-0 bump is the steady-state analogue.
 
 use std::collections::{HashMap, HashSet};
 

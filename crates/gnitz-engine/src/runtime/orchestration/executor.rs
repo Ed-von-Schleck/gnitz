@@ -174,7 +174,12 @@ pub struct Shared {
     /// SAL-writer exclusivity. Held by committer (checkpoint + commit
     /// emission), tick (per-tid emission), relay (FLAG_EXCHANGE_RELAY),
     /// DDL (broadcast_ddl + fsync), and all fan-out operations (seek,
-    /// scan, pipeline checks, unique-filter warmup). See async-invariants.md.
+    /// scan, pipeline checks, unique-filter warmup). Without it a `FLAG_FLUSH`
+    /// landing between a `FLAG_TICK` and its `FLAG_EXCHANGE_RELAY` bumps the
+    /// worker epoch and the relay is skipped with no error anywhere.
+    /// Non-reentrant: a holder must not `.await` anything that re-acquires it,
+    /// so a fan-out drops it after the synchronous write + signal and awaits
+    /// its replies unlocked.
     sal_writer_excl: Rc<AsyncMutex>,
     /// Tick trigger sender; senders include INSERT (auto-trigger on
     /// threshold cross) and SCAN (explicit drain).
@@ -364,6 +369,8 @@ impl ServerExecutor {
         server_fd: i32,
         tls: Option<TlsListener>,
     ) -> i32 {
+        // 256 SQEs. Not a bound on outstanding work: `IoUringRing::push` flushes
+        // a full SQ rather than refusing, so this sets submit batching, not depth.
         let reactor = match Reactor::new(256) {
             Ok(r) => Rc::new(r),
             Err(e) => {
@@ -743,9 +750,9 @@ async fn watchdog(shared: Rc<Shared>) {
 
 /// Drive ticks from a channel of `TickTrigger`s. Coalesces triggers
 /// inside a bounded deadline window, then issues one batched tick for
-/// the union of pending tids. Per IV.6, every per-(tid, worker) req_id
-/// is allocated up front, all groups are written, then a single
-/// `signal_all` fires.  ACKs are awaited via `join_all` through the
+/// the union of pending tids. Every per-(tid, worker) req_id is allocated up
+/// front, all groups are written, then a single `signal_all` fires (see
+/// `write_tick_group`). ACKs are awaited via `join_all` through the
 /// reactor's reply routing.
 ///
 /// Task liveness: the outer loop body is wrapped so a failure in one
@@ -950,10 +957,10 @@ const HOLD_RELAY_MAX_POLLS: u32 = 10_000;
 /// Consume completed `PendingRelay`s from the reactor's exchange
 /// accumulator and write FLAG_EXCHANGE_RELAY groups back through the
 /// dispatcher.  Lives in its own task so the SAL write happens outside
-/// the reactor's synchronous CQE handler — `relay_exchange` reads the
-/// catalog DAG (needs catalog_rwlock.read) and writes a SAL group
-/// (needs sal_writer_excl), neither of which can block-acquire from
-/// inside the reactor's tick.
+/// the reactor's synchronous CQE handler — `prepare_relay` reads the
+/// catalog DAG (needs catalog_rwlock.read) and `emit_relay_with_decision`
+/// writes a SAL group (needs sal_writer_excl), neither of which can
+/// block-acquire from inside the reactor's tick.
 ///
 /// A lost relay wedges workers blocked in `do_exchange_wait` forever
 /// (they ACK neither tick nor relay and the master stays alive), so both
@@ -1175,8 +1182,8 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     if flags & FLAG_SEEK != 0 {
         // A base-table or system seek is the RMW hot path: base state is fresh at
         // push-apply time, so `read_lock` locks once and never drains. A view seek
-        // drains inside it (BF-1), which is why the lock is taken there and not
-        // at dispatch level.
+        // drains inside it — which `drain_pending_ticks` requires happen with no
+        // catalog lock held — so the lock is taken there and not at dispatch level.
         if let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id).await {
             serve_seek(
                 shared,
@@ -1920,7 +1927,7 @@ fn build_resolve_reply(
 }
 
 /// Drive one tick of everything pending, returning with NO catalog lock held.
-/// Views derive from source-table pushes through the DAG (IV.2), so a read of a
+/// Views derive from source-table pushes through the DAG, so a read of a
 /// stale view must first flush the pending — possibly in-flight — tick carrying
 /// its sources' deltas.
 ///
@@ -1942,7 +1949,7 @@ fn build_resolve_reply(
 ///
 /// MUST be called with NO catalog read lock held: the drain parks at `rx.await`,
 /// and the writer-preferring `AsyncRwLock` held across that park would block DDL
-/// writers and `tick_loop`'s own read lock — a three-way deadlock (BF-1).
+/// writers and `tick_loop`'s own read lock — a three-way deadlock.
 ///
 /// A failed tick is reported rather than swallowed: its views are stale, and
 /// serving them under `STATUS_OK` would be a silent stale read.
@@ -2010,7 +2017,8 @@ fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
 ///
 /// A base table's rows AND its secondary indexes are written by the same ingest
 /// apply, which is what makes skipping the drain safe for an `IndexRange` bound
-/// too. A stale view drops the lock, drains with NO lock held (BF-1), then
+/// too. A stale view drops the lock, drains with NO lock held (see
+/// `drain_pending_ticks`), then
 /// re-locks and re-resolves — a DDL may have dropped it during the drain.
 async fn read_lock(
     shared: &Rc<Shared>,
@@ -2224,8 +2232,8 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     gnitz_wire::validate_scan_multi_tids(&tids)?;
 
     // Drain once if any target is a stale view — the same test `read_lock` runs
-    // for a single target — and with NO catalog
-    // lock held (BF-1). The classifying lock is dropped before the drain; Phase 1
+    // for a single target — and with NO catalog lock held (see
+    // `drain_pending_ticks`). The classifying lock is dropped before the drain; Phase 1
     // re-resolves every tid's kind under a fresh lock, so a DDL during the drain
     // is caught there, and an unknown tid is rejected there rather than here.
     let needs_drain = {

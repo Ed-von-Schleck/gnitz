@@ -643,10 +643,6 @@ anything the optimizer could elide.
 8. **Verify your fix is in the binary.** `make e2e` rebuilds both the
    server and the Python extension before running tests.
 
-## See also
-
-- `async-invariants.md` — runtime & reactor: kernel coordination, scheduling, known latent issues.
-
 ## GIT Branches
 
 All development happens on main for now; never branch off.

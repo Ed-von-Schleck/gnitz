@@ -557,7 +557,7 @@ impl MasterDispatcher {
     /// reactor parked, so no other SAL writer exists — the same exclusivity boot
     /// has). The *async* fan-out / tick / steady-state DDL paths must NOT call
     /// this — a concurrent FLAG_FLUSH races the committer's own and orphans SAL
-    /// writes straddling `sal.checkpoint_reset`. See async-invariants.md.
+    /// writes straddling `sal.checkpoint_reset`.
     ///
     /// Publish every base table's shards and reset the SAL, invalidating
     /// checkpointed derived state first. The bump is not optional: this path
@@ -1255,9 +1255,12 @@ impl MasterDispatcher {
         fires
     }
 
-    /// Write a FLAG_TICK group for `tid` with per-worker req_ids. Does
-    /// NOT signal — the caller batches multiple `write_tick_group` calls
-    /// followed by a single `signal_all` (IV.6). Per-worker slots each carry
+    /// Write a FLAG_TICK group for `tid` with per-worker req_ids. Does NOT
+    /// signal: the caller writes every group in the batch, then calls
+    /// `signal_all` once. A signal is a wake, not framing — a worker reaches a
+    /// published group through the mapping either way — so batching the wake
+    /// changes no outcome and saves `nw` eventfd writes per group beyond the
+    /// first. Per-worker slots each carry
     /// the corresponding req_id from `req_ids[w]`. No schema block:
     /// `handle_tick` looks the target's schema up in its own catalog.
     pub(crate) fn write_tick_group(&self, tid: i64, req_ids: &[u64]) -> Result<(), String> {

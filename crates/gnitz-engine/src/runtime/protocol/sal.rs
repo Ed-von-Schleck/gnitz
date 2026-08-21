@@ -1232,9 +1232,10 @@ impl SalReader {
     /// live reader is never behind the writer's epoch, so every leftover is
     /// rejected by [`EpochGate::Live`]'s prefix gate before a header byte is
     /// read, and a gate-passing prefix implies a fully published header (`commit`
-    /// Release-stores the prefix last). Parking instead would read as a silent
-    /// end-of-drain and the committer would wait forever on its ACK. The argument
-    /// in full is in `async-invariants.md`.
+    /// Release-stores the prefix last). Parking instead would be indistinguishable
+    /// from having caught up — `next_sal_message` maps `None` to end-of-drain — so
+    /// the worker would go quiet and the committer would wait forever on an ACK
+    /// nobody will send.
     pub fn next(&self) -> Option<SalMessage<'static>> {
         let cursor = self.read_cursor.get();
         match self.read_at(cursor, EpochGate::Live(self.expected_epoch.get())) {
