@@ -173,8 +173,60 @@ impl RelationKind {
 // Table entry — per-table metadata in the entity registry
 // ---------------------------------------------------------------------------
 
+/// The `WITH (…)` byte budgets a view can carry. They travel as one value
+/// because every path that opens a relation's store must carry both: a
+/// `delta_bytes` that reached the catalog but not the store builder would leave
+/// a view the catalog calls fed with no delta store on any worker, on every
+/// boot, with no error anywhere.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct ViewBudgets {
+    /// `WITH (capacity = …)`, in bytes; `None` for every unbounded relation.
+    pub capacity_bytes: Option<u64>,
+    /// `WITH (delta = …)`, in bytes; `None` for every relation with no feed.
+    pub delta_bytes: Option<u64>,
+}
+
+/// A fed view's **delta store**: the second store beside its output store,
+/// holding the deltas the view emitted, each row stamped with the tick round
+/// that produced it.
+///
+/// Held behind a `Box` wherever a relation owns one, because it embeds a
+/// `SchemaDescriptor` — 360 bytes, pinned, and paid for by every relation in the
+/// registry if this sat inline in [`TableEntry`], fed or not.
+pub(crate) struct DeltaFeed {
+    /// The derived `_tick ‖ view PK ‖ view payload` schema
+    /// ([`crate::schema::make_delta_schema`]). Held rather than re-derived per
+    /// read: it is a pure function of the view's schema, and a read needs it to
+    /// open the cursor and to guard the client's authored reply schema.
+    pub schema: SchemaDescriptor,
+    pub handle: StoreHandle,
+}
+
+impl DeltaFeed {
+    /// A cursor over this feed's rows in its own derived schema — the pairing
+    /// [`TableEntry::open_cursor`] makes for a relation's own store, and the
+    /// reason `StoreHandle::open_cursor` stays module-private: the schema a
+    /// cursor is opened under is never the caller's to choose.
+    pub(crate) fn open_cursor(&self) -> crate::storage::ReadCursor {
+        self.handle.open_cursor(&self.schema)
+    }
+}
+
+/// The stores one relation owns on this process: its own, plus the delta store
+/// of a fed view. `build_relation_store` returns both, so no path can open one
+/// and forget the other.
+pub(crate) struct RelationStores {
+    pub handle: StoreHandle,
+    pub delta: Option<Box<DeltaFeed>>,
+}
+
 pub(crate) struct TableEntry {
     pub handle: StoreHandle,
+    /// The delta store, when this process holds one — `None` on the post-fork
+    /// master, which holds no user store at all, and for every relation with no
+    /// feed. `delta_bytes` is what says a feed *exists*; this is what says this
+    /// process can read it.
+    pub delta: Option<Box<DeltaFeed>>,
     pub schema: SchemaDescriptor,
     pub kind: RelationKind,
     pub depth: i32,
@@ -186,27 +238,43 @@ pub(crate) struct TableEntry {
     /// relation is `StoreHandle::Detached` and there is no `Table` to ask.
     /// `build_relation_store` stamps it onto each store it opens.
     pub capacity_bytes: Option<u64>,
+    /// `CREATE VIEW … WITH (delta = …)` in bytes; `None` for every other
+    /// relation. The registry's copy, for the same reason `capacity_bytes` keeps
+    /// one: the resolve reply's `delta` flag is answered on the post-fork master.
+    pub delta_bytes: Option<u64>,
 }
 
 impl TableEntry {
-    /// A registry entry with no index circuits yet. `capacity_bytes` is `None`
-    /// for everything but a capacity-bounded view.
+    /// A registry entry with no index circuits yet. Both budgets are `None` for
+    /// everything but a bounded or a fed view.
     pub(crate) fn new(
-        handle: StoreHandle,
+        stores: RelationStores,
         schema: SchemaDescriptor,
         kind: RelationKind,
         depth: i32,
         directory: String,
-        capacity_bytes: Option<u64>,
+        budgets: ViewBudgets,
     ) -> Self {
         TableEntry {
-            handle,
+            handle: stores.handle,
+            delta: stores.delta,
             schema,
             kind,
             depth,
             directory,
             index_circuits: Vec::new(),
-            capacity_bytes,
+            capacity_bytes: budgets.capacity_bytes,
+            delta_bytes: budgets.delta_bytes,
+        }
+    }
+
+    /// The budgets this relation was registered with — what a rehome or a rebuild
+    /// must hand back to `build_relation_store` so neither store comes back
+    /// unbounded or missing.
+    pub(crate) fn budgets(&self) -> ViewBudgets {
+        ViewBudgets {
+            capacity_bytes: self.capacity_bytes,
+            delta_bytes: self.delta_bytes,
         }
     }
 
@@ -590,12 +658,15 @@ mod tests {
         dag.register_table(
             100,
             TableEntry::new(
-                StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                RelationStores {
+                    handle: StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                    delta: None,
+                },
                 schema,
                 RelationKind::BaseTable,
                 0,
                 String::new(),
-                None,
+                ViewBudgets::default(),
             ),
         );
         assert!(dag.tables.contains_key(&100));
@@ -679,12 +750,15 @@ mod tests {
         dag.register_table(
             50,
             TableEntry::new(
-                StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                RelationStores {
+                    handle: StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                    delta: None,
+                },
                 schema,
                 RelationKind::BaseTable,
                 0,
                 String::new(),
-                None,
+                ViewBudgets::default(),
             ),
         );
         let idx_tbl = make_test_table("idx_child");
@@ -753,12 +827,15 @@ mod tests {
         dag.register_table(
             70,
             TableEntry::new(
-                StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                RelationStores {
+                    handle: StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                    delta: None,
+                },
                 parent_schema,
                 RelationKind::BaseTable,
                 0,
                 String::new(),
-                None,
+                ViewBudgets::default(),
             ),
         );
 
@@ -820,12 +897,15 @@ mod tests {
         dag.register_table(
             70,
             TableEntry::new(
-                StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                RelationStores {
+                    handle: StoreHandle::Borrowed(&mut *tbl as *mut Table),
+                    delta: None,
+                },
                 schema,
                 RelationKind::View,
                 0,
                 String::new(),
-                None,
+                ViewBudgets::default(),
             ),
         );
         let mut batch = Batch::with_capacity(schema, 1);

@@ -62,7 +62,7 @@ fn identity_spec(bound: ReadBound, order: Vec<OrderKey>, limit_k: u64) -> ReadSp
 
 fn run(engine: &mut CatalogEngine, tid: i64, spec: &ReadSpec) -> Vec<(u128, i64, i64)> {
     let reply_schema = engine.get_schema_desc(tid).unwrap();
-    let keeper = engine.scan_spec_family(tid, spec, &reply_schema).unwrap();
+    let keeper = engine.scan_spec_family(tid, spec, &reply_schema, 0).unwrap();
     triples(&keeper)
 }
 
@@ -122,7 +122,7 @@ fn pk_set_over_a_system_table_keeps_every_key() {
     let (mut e, tid, _dir) = table_fixture("ss_pkset_sys", &id_val_cols());
     let sys_schema = e.get_schema_desc(TABLE_TAB_ID).unwrap();
     let spec = identity_spec(ReadBound::PkSet(vec![tid as u128]), vec![], 0);
-    let keeper = e.scan_spec_family(TABLE_TAB_ID, &spec, &sys_schema).unwrap();
+    let keeper = e.scan_spec_family(TABLE_TAB_ID, &spec, &sys_schema, 0).unwrap();
     assert_eq!(
         (0..keeper.count).map(|i| keeper.get_pk(i)).collect::<Vec<_>>(),
         vec![tid as u128],
@@ -142,10 +142,10 @@ fn pk_set_rejects_keys_colliding_after_truncation() {
     let (mut e, tid) = fixture("ss_pkset_trunc", 10, |i| i as i64);
     let spec = identity_spec(ReadBound::PkSet(vec![5, 5 + (1u128 << 64)]), vec![], 0);
     let reply_schema = e.get_schema_desc(tid).unwrap();
-    let Err(err) = e.scan_spec_family(tid, &spec, &reply_schema) else {
+    let Err(err) = e.scan_spec_family(tid, &spec, &reply_schema, 0) else {
         panic!("colliding PkSet keys must be rejected, not gathered twice");
     };
-    assert!(err.contains("duplicate"), "{err}");
+    assert!(err.text.contains("duplicate"), "{err}");
 }
 
 /// A REPLICATED base table holds a full copy of the dataset in this worker's own
@@ -344,7 +344,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
     };
     let scan = |e: &mut CatalogEngine, desc: RangeDescriptor| {
         let spec = identity_spec(ReadBound::PkRange(desc), vec![], 0);
-        decode(&e.scan_spec_family(tid, &spec, &schema).unwrap())
+        decode(&e.scan_spec_family(tid, &spec, &schema, 0).unwrap())
     };
 
     // `a = 2 AND b >= 0` — a whole trailing-column range inside one `a` group,
@@ -403,7 +403,7 @@ fn order_key_column_out_of_range_is_rejected() {
         0,
     );
     let reply_schema = e.get_schema_desc(tid).unwrap();
-    assert!(e.scan_spec_family(tid, &spec, &reply_schema).is_err());
+    assert!(e.scan_spec_family(tid, &spec, &reply_schema, 0).is_err());
 }
 
 #[test]
@@ -521,7 +521,7 @@ fn gather_of_64_payload_columns_covers_every_slot() {
     let copies: Vec<(u32, u32)> = (0..P as u32).map(|k| (k + 1, k)).collect();
     let reply = e.get_schema_desc(tid).unwrap();
     let spec = rows_spec(vec![], proj_blob(&copies), vec![], 0);
-    let got = e.scan_spec_family(tid, &spec, &reply).unwrap();
+    let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
     assert_eq!(got.count, 40);
     for r in 0..got.count {
         let id = got.get_pk(r) as u64;
@@ -551,7 +551,7 @@ fn all_pk_sourced_projection_zeroes_null_words_across_chunks() {
         &[0],
     );
     let spec = rows_spec(vec![], proj_blob(&[(0, 0)]), vec![], 0);
-    let got = e.scan_spec_family(tid, &spec, &reply).unwrap();
+    let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
     assert_eq!(got.count, 300, "10 chunks of 32 rows minus the short tail");
     for r in 0..got.count {
         assert_eq!(
@@ -602,7 +602,7 @@ fn permuted_gather_with_string_and_nullable_across_chunks() {
         &[0],
     );
     let spec = rows_spec(vec![], proj_blob(&[(2, 0), (0, 1), (1, 2)]), vec![], 0);
-    let got = e.scan_spec_family(tid, &spec, &reply).unwrap();
+    let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
     assert_eq!(got.count as u64, N);
 
     // Decoded rows: (pk, s, pk_copy, Option<nv>).
@@ -673,7 +673,7 @@ fn compute_projection_writes_at_keeper_tail_across_chunks() {
     };
     // `keep = id * 10 < 1000` keeps ids 0..99, interleaved with the chunking.
     let spec = rows_spec(pred_lt_blob(2, 1000), projection, vec![], 0);
-    let got = e.scan_spec_family(tid, &spec, &reply).unwrap();
+    let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
 
     let mut decoded: Vec<(u128, Option<i64>, i64)> = (0..got.count)
         .map(|r| {
@@ -711,8 +711,8 @@ fn projection_missing_an_output_slot_errs() {
         &[0],
     );
     let spec = rows_spec(vec![], proj_blob(&[(1, 0)]), vec![], 0);
-    let err = e.scan_spec_family(tid, &spec, &reply).err().unwrap();
-    assert!(err.contains("OutputSlotUnwritten"), "{err}");
+    let err = e.scan_spec_family(tid, &spec, &reply, 0).err().unwrap();
+    assert!(err.text.contains("OutputSlotUnwritten"), "{err}");
 }
 
 /// A gather + ORDER BY … LIMIT k over weight-3 rows, sized so
@@ -730,7 +730,7 @@ fn gather_top_k_keeps_boundary_row_whole() {
         nulls_first: false,
     }];
     let spec = rows_spec(vec![], proj_blob(&[(1, 0)]), order, 2);
-    let got = e.scan_spec_family(tid, &spec, &reply).unwrap();
+    let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
     // LIMIT 2 is covered by the single smallest row's weight 3 — kept whole.
     assert_eq!(triples(&got), vec![(0u128, 0, 3)]);
 }
@@ -752,7 +752,7 @@ fn gather_limit_cuts_the_range_list_mid_chunk() {
     });
     let reply = e.get_schema_desc(tid).unwrap();
     let spec = rows_spec(pred_lt_blob(1, 1), proj_blob(&[(1, 0)]), vec![], 5);
-    let got = e.scan_spec_family(tid, &spec, &reply).unwrap();
+    let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
     let total: i64 = (0..got.count).map(|r| got.get_weight(r)).sum();
     assert!(total >= 5, "early-stop must cover the window weight, got {total}");
     assert!(
@@ -774,5 +774,5 @@ fn reply_pk_stride_mismatch_errs() {
         &[0],
     );
     let spec = identity_spec(ReadBound::None, vec![], 0);
-    assert!(e.scan_spec_family(tid, &spec, &bad).is_err());
+    assert!(e.scan_spec_family(tid, &spec, &bad, 0).is_err());
 }

@@ -237,7 +237,7 @@ impl PreflightKeyStream {
     fn attach_frame(&mut self, slot: W2mSlot, frame_schema: &SchemaDescriptor) -> Result<(), String> {
         self.row = 0;
         self.count = 0;
-        let (ctrl, has_more) = parse_train_header(&slot, self.w, "unique pre-flight")?;
+        let (ctrl, has_more) = parse_train_header(&slot, self.w, "unique pre-flight").map_err(|f| f.text)?;
         self.has_more = has_more;
         // Every frame decodes against the shared compile-time wire schema
         // (version 0): the first frame's embedded schema block equals it by
@@ -250,7 +250,7 @@ impl PreflightKeyStream {
         let bytes = slot.bytes();
         let mut offsets = [0usize; gnitz_engine::storage::MAX_BATCH_REGIONS];
         let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, schema_hint, &mut offsets)
-            .map_err(|e| scan_decode_err(self.w, e))?;
+            .map_err(|e| scan_decode_err(self.w, e).text)?;
         if let Some(mb) = zc.data_batch.as_ref() {
             let pk = mb.pk();
             // `pk` points inside `bytes`, which `slot` owns for as long as it is
@@ -1533,7 +1533,7 @@ impl MasterDispatcher {
             .enumerate()
             .find_map(|(i, d)| worker_error(i % nw, "pipeline", &d.control))
         {
-            return Err(err);
+            return Err(err.text);
         }
         // Each set holds only the probe keys that turned out to exist committed
         // — for a fresh-key insert stream, none — so it is grown on demand
@@ -1631,7 +1631,8 @@ impl MasterDispatcher {
             }
             Ok(())
         })
-        .await?;
+        .await
+        .map_err(|f| f.text)?;
         Ok(out)
     }
 }

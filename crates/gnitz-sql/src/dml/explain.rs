@@ -131,6 +131,11 @@ fn access(plan: &AccessPlan<'_>, schema: &Schema, sink: &Sink) -> String {
         },
         // The keys ship deduplicated, so this is the distinct key count.
         ReadBound::PkSet(keys) => format!("pk set gather ({} keys)", keys.len()),
+        // No SQL surface reaches a delta bound: a `SELECT` projects rows without
+        // weights, so a retraction would render indistinguishable from an insert.
+        // It is reachable through the read verbs, where weights are native, and
+        // nowhere else — so no planner ever builds one for EXPLAIN to describe.
+        ReadBound::Delta { after_tick } => format!("delta feed after round {after_tick}"),
         ReadBound::IndexRange { idx_cols, exact, .. } => {
             let cols = gnitz_wire::unpack_pk_cols(*idx_cols)
                 .as_slice()

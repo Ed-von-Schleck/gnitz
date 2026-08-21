@@ -15,7 +15,8 @@ use gnitz_wire::{
     RelClass, TableProps, CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, IDXTAB_COL_IS_UNIQUE,
     IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE, OWNER_KIND_VIEW,
     SCHEMATAB_COL_NAME, TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX, TABTAB_COL_SCHEMA_ID,
-    VIEWTAB_COL_CAPACITY, VIEWTAB_COL_NAME, VIEWTAB_COL_PK_COL_IDX, VIEWTAB_COL_SCHEMA_ID, VIEWTAB_COL_SQL,
+    VIEWTAB_COL_CAPACITY, VIEWTAB_COL_DELTA, VIEWTAB_COL_NAME, VIEWTAB_COL_PK_COL_IDX, VIEWTAB_COL_SCHEMA_ID,
+    VIEWTAB_COL_SQL,
 };
 
 // --- Module-private helpers ---
@@ -108,6 +109,8 @@ struct ViewRecord {
     /// `WITH (capacity = …)` in bytes; `0` is unbounded. Round-trips a RENAME by
     /// construction — `alter_rename_relation` re-emits `ViewRecord { name, ..vr }`.
     capacity_bytes: u64,
+    /// `WITH (delta = …)` in bytes; `0` is no delta feed. Same round-trip rule.
+    delta_bytes: u64,
 }
 
 /// `is_unique` stays the stored word rather than a `bool`, so a DROP echoes
@@ -180,11 +183,77 @@ fn is_hidden_view_name(name: &str) -> bool {
     name.starts_with(gnitz_wire::HIDDEN_VIEW_PREFIX)
 }
 
+/// A subscriber's whole state: one word, held on the client.
+///
+/// `tag` names what the cursor is a cursor *into* — a `(boot, relation)`
+/// identity. A round number alone identifies nothing: it is meaningless across a
+/// restart, because the counter starts over, and meaningless across a
+/// `DROP VIEW v; CREATE VIEW v …`, because the recreated `v` takes a fresh id
+/// whose rounds are numbered from the same global counter as the old one's — so a
+/// stale cursor would read as "nothing changed" and the client would sit on the
+/// previous view's rows. A tag the server does not echo back means: discard the
+/// copy and bootstrap again.
+///
+/// The cursor lives here and nowhere else, so there is nothing to lose on a
+/// disconnect, nothing to forge, and no liveness for the server to detect.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub struct DeltaCursor {
+    /// Identifies the boot and the relation this cursor belongs to.
+    pub tag: u64,
+    /// The last tick round it covers; the next poll asks for everything after it.
+    pub tick: u64,
+}
+
+impl DeltaCursor {
+    /// Split a terminal frame's watermark word: tag in the high half, round in
+    /// the low half.
+    fn from_watermark(w: u128) -> Self {
+        let (tag, tick) = gnitz_wire::unpack_delta_watermark(w);
+        DeltaCursor { tag, tick }
+    }
+
+    /// True when `self` and `other` name the same boot and the same relation, so
+    /// `self` may be advanced to `other`. The rule
+    /// [`GnitzClient::delta_poll`](crate::GnitzClient::delta_poll) enforces: a
+    /// mismatch is refused as [`ClientError::DeltaExpired`] rather than returned
+    /// as rows, because the rows a foreign cursor draws are unsafe to apply.
+    pub fn continues(self, other: DeltaCursor) -> bool {
+        self.tag == other.tag
+    }
+}
+
+/// The reply schema of an incremental delta read: a `_tick` U64 key column, then
+/// `view`'s PK columns in PK order, then its payload columns in schema order.
+///
+/// The client-side mirror of what the engine derives for the delta store, and the
+/// shape [`GnitzClient::delta_poll`] must be handed. Getting it wrong is a typed
+/// error rather than a misread PK region: the worker's identity-rows path demands
+/// the reply schema match the source's physical layout exactly.
+///
+/// A bootstrap read is **not** in this shape — it walks the view's own store and
+/// comes back in the view's own schema.
+pub fn delta_reply_schema(view: &Schema) -> Schema {
+    let mut columns = Vec::with_capacity(view.columns.len() + 1);
+    columns.push(ColumnDef::new("_tick", TypeCode::U64, false).hidden());
+    for &pi in view.pk_indices() {
+        columns.push(view.columns[pi].clone());
+    }
+    for (_, _, c) in view.payload_columns() {
+        columns.push(c.clone());
+    }
+    let pk_cols = (0..=view.pk_count()).collect();
+    Schema { columns, pk_cols }
+}
+
 /// A relation's class resolved together with its id, so the two cannot disagree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RelKind {
     pub tid: u64,
     pub class: RelClass,
+    /// The view keeps a delta feed. A bool beside the class rather than a fourth
+    /// [`RelClass`] variant, because it is orthogonal to the class — folding it in
+    /// would square `View`/`BoundedView`.
+    pub delta: bool,
 }
 
 impl RelKind {
@@ -192,6 +261,7 @@ impl RelKind {
         RelKind {
             tid: d.tid,
             class: d.class,
+            delta: d.delta,
         }
     }
 }
@@ -209,6 +279,11 @@ pub struct PlannedView {
     /// `WITH (capacity = …)` in bytes, set on the chain's **final** segment only;
     /// `None` is unbounded. Hidden chain segments never carry one.
     pub capacity_bytes: Option<u64>,
+    /// `WITH (delta = …)` in bytes, set on the chain's **final** segment only —
+    /// the one the client names and the only one whose store it can read; the
+    /// hidden segments tick in the same round without carrying feeds of their own.
+    /// `None` is no feed.
+    pub delta_bytes: Option<u64>,
 }
 
 /// Everything a statement needs to know about one relation. Statement-scoped:
@@ -219,6 +294,8 @@ struct RelDescriptor {
     tid: u64,
     class: RelClass,
     replicated: bool,
+    /// The view keeps a delta feed, so `ReadBound::Delta` against it is answerable.
+    delta: bool,
     schema: Arc<Schema>,
     indexes: Arc<Vec<IndexMeta>>,
 }
@@ -472,7 +549,89 @@ impl GnitzClient {
         spec: &[u8],
         reply_schema: &Schema,
     ) -> Result<Option<ZSetBatch>, ClientError> {
-        self.session.scan_spec(table_id, spec, reply_schema)
+        // An ad-hoc SELECT holds no cursor across reads, so the terminal
+        // watermark is dropped here rather than pushed through every caller.
+        self.session.scan_spec(table_id, spec, reply_schema).map(|(b, _)| b)
+    }
+
+    /// Bootstrap a view's delta feed: the view's whole current value, in the
+    /// view's own schema, together with the cursor to poll from.
+    ///
+    /// `Delta { after_tick: 0 }` is *the sum of every delta after round 0* —
+    /// the view's entire history, which is precisely what its output store
+    /// holds — so this costs exactly what a scan of the view costs, because it
+    /// is one. That is the price of joining, and it is paid once per subscriber
+    /// rather than once per poll.
+    ///
+    /// The reply carries true net weights: a bag-valued view's weight-3 row
+    /// arrives as weight 3, not as a presence bit. Apply it to a fresh copy —
+    /// this replaces state, it does not add to it.
+    pub fn delta_bootstrap(
+        &mut self,
+        view_id: u64,
+        view_schema: &Schema,
+    ) -> Result<(Option<ZSetBatch>, DeltaCursor), ClientError> {
+        self.delta_read(view_id, 0, view_schema)
+    }
+
+    /// Poll a view's delta feed: every delta it emitted in `(cursor.tick, T]`,
+    /// in [`delta_reply_schema`]'s shape, with the cursor to poll from next.
+    /// Apply what comes back and store the new cursor; there is nothing to
+    /// filter and nothing to reconcile.
+    ///
+    /// A cursor whose tag does not match the returned one names a different boot
+    /// or a different relation — a restart, or a `DROP VIEW v; CREATE VIEW v …`.
+    /// **This refuses it** rather than handing back rows that are unsafe to
+    /// apply: the reply would carry the *other* relation's recent deltas, and a
+    /// recreated view's backfill never enters a delta store at all, so applying
+    /// them silently yields a copy missing everything before the cursor. The
+    /// answer is [`ClientError::DeltaExpired`] — the same error, and the same
+    /// recovery, as a cursor that fell out of the retention window: discard the
+    /// copy and [`delta_bootstrap`](Self::delta_bootstrap) again.
+    ///
+    /// A cursor at tick `0` is **refused**, not silently answered. It names no
+    /// copy to protect and no tag to match, so it could only mean a bootstrap —
+    /// but a bootstrap walks the view's own store and comes back in the view's
+    /// schema, not in the [`delta_reply_schema`] shape this call is documented to
+    /// take, so answering it here would fail the worker's identity-layout check
+    /// and surface as an opaque `STATUS_ERROR`. Call
+    /// [`delta_bootstrap`](Self::delta_bootstrap), which names its schema.
+    ///
+    /// A poll does **not** drive a tick: a delta read answers "what has
+    /// happened", not "what is current", so a push the tick loop has not run yet
+    /// is a round the next poll will carry.
+    pub fn delta_poll(
+        &mut self,
+        view_id: u64,
+        cursor: DeltaCursor,
+        reply_schema: &Schema,
+    ) -> Result<(Option<ZSetBatch>, DeltaCursor), ClientError> {
+        if cursor.tick == 0 {
+            return Err(ClientError::DeltaExpired);
+        }
+        let (data, next) = self.delta_read(view_id, cursor.tick, reply_schema)?;
+        if !cursor.continues(next) {
+            return Err(ClientError::DeltaExpired);
+        }
+        Ok((data, next))
+    }
+
+    /// The one request both delta calls make: a `ScanSpec` with a
+    /// `ReadBound::Delta` and an identity sink, returning the rows and the
+    /// terminal frame's `(tag, T)` pair.
+    fn delta_read(
+        &mut self,
+        view_id: u64,
+        after_tick: u64,
+        reply_schema: &Schema,
+    ) -> Result<(Option<ZSetBatch>, DeltaCursor), ClientError> {
+        let spec = gnitz_wire::ReadSpec::encode_parts(
+            &gnitz_wire::ReadBound::Delta { after_tick },
+            &[],
+            &gnitz_wire::ReadSink::all_rows(),
+        );
+        let (data, watermark) = self.session.scan_spec(view_id, &spec, reply_schema)?;
+        Ok((data, DeltaCursor::from_watermark(watermark)))
     }
 
     /// Consistent snapshot of N relations at one server-side SAL cut, returned
@@ -1064,8 +1223,9 @@ impl GnitzClient {
                 circuit,
                 output_columns: output_columns.to_vec(),
                 pk_cols: pk_cols.to_vec(),
-                // The circuit-builder API has no capacity surface.
+                // The circuit-builder API has no options surface at all.
                 capacity_bytes: None,
+                delta_bytes: None,
             }],
             None,
         )?;
@@ -1208,6 +1368,7 @@ impl GnitzClient {
                         sql_definition: pv.sql_text,
                         pk_col_idx: pk_packed,
                         capacity_bytes: pv.capacity_bytes.unwrap_or(0),
+                        delta_bytes: pv.delta_bytes.unwrap_or(0),
                     },
                 );
             }
@@ -1536,6 +1697,7 @@ impl GnitzClient {
             tid,
             class: blob.class,
             replicated: blob.replicated,
+            delta: blob.delta,
             schema,
             indexes: Arc::new(blob.indexes),
         })))
@@ -1750,6 +1912,7 @@ fn decode_view_record(batch: &ZSetBatch, i: usize) -> Result<ViewRecord, ClientE
         sql_definition: col_str(&batch.columns[VIEWTAB_COL_SQL], i)?.unwrap_or("").to_string(),
         pk_col_idx: col_u64(&batch.columns[VIEWTAB_COL_PK_COL_IDX], i)?,
         capacity_bytes: col_u64(&batch.columns[VIEWTAB_COL_CAPACITY], i)?,
+        delta_bytes: col_u64(&batch.columns[VIEWTAB_COL_DELTA], i)?,
     })
 }
 
@@ -1828,6 +1991,7 @@ fn append_view_row(a: &mut BatchAppender<'_>, weight: i64, rec: &ViewRecord) {
             sql_definition: &rec.sql_definition,
             pk_col_idx: rec.pk_col_idx,
             capacity_bytes: rec.capacity_bytes,
+            delta_bytes: rec.delta_bytes,
         },
         weight,
     );
@@ -2203,6 +2367,7 @@ mod tests {
             sql_definition: "SELECT id FROM t".into(),
             pk_col_idx: gnitz_wire::pack_pk_cols(&[2]),
             capacity_bytes: 4 << 20,
+            delta_bytes: 32 << 20,
         };
         let mut batch = ZSetBatch::new(schema);
         append_view_row(&mut BatchAppender::new(&mut batch, schema), 1, &rec);

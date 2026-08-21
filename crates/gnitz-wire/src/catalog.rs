@@ -128,6 +128,12 @@ pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
     // engine reads this at boot from the replayed rows and never links the SQL
     // parser.
     col("capacity_bytes", TypeCode::U64, false),
+    // `CREATE VIEW … WITH (delta = …)`, in bytes; `0` is no feed. Presence of a
+    // budget *is* the fed classification, exactly as `capacity_bytes` above.
+    // Orthogonal to it: the two are refused together, but by a rule, not by the
+    // encoding. Not re-derivable from `sql_definition` — the engine reads this at
+    // boot from the replayed rows and never links the SQL parser.
+    col("delta_bytes", TypeCode::U64, false),
 ];
 
 pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
@@ -239,11 +245,13 @@ pub const VIEWTAB_COL_NAME: usize = col_index_in(VIEW_TAB_COLS, "name");
 pub const VIEWTAB_COL_SQL: usize = col_index_in(VIEW_TAB_COLS, "sql_definition");
 pub const VIEWTAB_COL_PK_COL_IDX: usize = col_index_in(VIEW_TAB_COLS, "pk_col_idx");
 pub const VIEWTAB_COL_CAPACITY: usize = col_index_in(VIEW_TAB_COLS, "capacity_bytes");
+pub const VIEWTAB_COL_DELTA: usize = col_index_in(VIEW_TAB_COLS, "delta_bytes");
 pub const VIEWTAB_PAY_SCHEMA_ID: usize = pay_index_in(VIEW_TAB_COLS, "schema_id");
 pub const VIEWTAB_PAY_NAME: usize = pay_index_in(VIEW_TAB_COLS, "name");
 pub const VIEWTAB_PAY_SQL: usize = pay_index_in(VIEW_TAB_COLS, "sql_definition");
 pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in(VIEW_TAB_COLS, "pk_col_idx");
 pub const VIEWTAB_PAY_CAPACITY: usize = pay_index_in(VIEW_TAB_COLS, "capacity_bytes");
+pub const VIEWTAB_PAY_DELTA: usize = pay_index_in(VIEW_TAB_COLS, "delta_bytes");
 
 /// One code path decodes TABLE_TAB and VIEW_TAB on both sides — the engine's
 /// `apply_entity_caches`, the client's `collect_schema_member_names` — reading

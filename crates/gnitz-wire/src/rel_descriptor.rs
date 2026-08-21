@@ -14,7 +14,8 @@
 //! ```text
 //! u8   version
 //! u8   flags         bit 0 = replicated; bits 1..4 = the relation's class
-//!                    (bit 1 = view, bit 2 = capacity-bounded, bit 3 = stream)
+//!                    (bit 1 = view, bit 2 = capacity-bounded, bit 3 = stream);
+//!                    bit 4 = the view carries a delta feed
 //! u16  fk_count
 //! u16  index_count
 //!      fk_count    × { u32 col_idx, u32 fk_col_idx, u64 fk_table_id }
@@ -45,6 +46,15 @@ const DESC_FLAG_VIEW: u8 = 1 << 1;
 const DESC_FLAG_BOUNDED: u8 = 1 << 2;
 const DESC_FLAG_STREAM: u8 = 1 << 3;
 const DESC_FLAG_CLASS: u8 = DESC_FLAG_VIEW | DESC_FLAG_BOUNDED | DESC_FLAG_STREAM;
+/// Descriptor `flags` bit 4: the view was created `WITH (delta = …)`, so it keeps
+/// its recent deltas in a store of its own and answers `ReadBound::Delta`.
+///
+/// A bool beside the class rather than a fourth [`RelClass`] variant: the two are
+/// orthogonal in principle — `capacity` and `delta` are refused together today
+/// only because a bounded view hydrates from a store no tick governs — so folding
+/// it in would square `View`/`BoundedView` the moment that is lifted.
+/// [`RelDescriptorBlob::decode`] holds today's rule instead.
+const DESC_FLAG_DELTA: u8 = 1 << 4;
 
 /// What a relation *is* — the one vocabulary the client and the engine share for
 /// this. A single value rather than three independent booleans, so the impossible
@@ -128,6 +138,10 @@ pub struct RelDescriptorBlob {
     pub class: RelClass,
     /// The relation's rows are a full copy on every worker.
     pub replicated: bool,
+    /// The view keeps a delta feed: a subscriber discovers the capability here
+    /// instead of probing for it with a read that errors. Never set on a
+    /// non-view.
+    pub delta: bool,
     pub fks: Vec<RelFk>,
     pub indexes: Vec<RelIndex>,
 }
@@ -143,7 +157,13 @@ impl RelDescriptorBlob {
     pub fn encode(&self) -> Vec<u8> {
         debug_assert!(self.fks.len() <= u16::MAX as usize && self.indexes.len() <= u16::MAX as usize);
         let mut w = Writer::with_capacity(HEADER_LEN + 16 * (self.fks.len() + self.indexes.len()));
-        let flags = self.class.to_flags() | if self.replicated { DESC_FLAG_REPLICATED } else { 0 };
+        debug_assert!(
+            !self.delta || self.class.is_view(),
+            "only a view can carry a delta feed"
+        );
+        let flags = self.class.to_flags()
+            | if self.replicated { DESC_FLAG_REPLICATED } else { 0 }
+            | if self.delta { DESC_FLAG_DELTA } else { 0 };
         w.u8(VERSION)
             .u8(flags)
             .u16(self.fks.len() as u16)
@@ -181,10 +201,24 @@ impl RelDescriptorBlob {
             return Err(format!("rel descriptor: unknown version {version}"));
         }
         let flags = r.u8()?;
-        if flags & !(DESC_FLAG_REPLICATED | DESC_FLAG_CLASS) != 0 {
+        if flags & !(DESC_FLAG_REPLICATED | DESC_FLAG_CLASS | DESC_FLAG_DELTA) != 0 {
             return Err(format!("rel descriptor: unknown flag bits {flags:#04x}"));
         }
         let class = RelClass::from_flags(flags)?;
+        let delta = flags & DESC_FLAG_DELTA != 0;
+        // A plain view, not merely any view: `capacity` and `delta` are refused
+        // together at the SQL layer and again at `view_registration`, so a
+        // `BoundedView` carrying a feed is a combination the system does not
+        // build. This is the boundary that keeps it unbuildable off the wire too.
+        if delta && class != RelClass::View {
+            return Err(format!(
+                "rel descriptor: a delta feed on a {} names no relation",
+                match class {
+                    RelClass::BoundedView => "capacity-bounded view",
+                    other => other.noun(),
+                }
+            ));
+        }
         let fk_count = r.u16()? as usize;
         let index_count = r.u16()? as usize;
 
@@ -229,6 +263,7 @@ impl RelDescriptorBlob {
         Ok(Some(RelDescriptorBlob {
             class,
             replicated: flags & DESC_FLAG_REPLICATED != 0,
+            delta,
             fks,
             indexes,
         }))
@@ -256,6 +291,29 @@ mod tests {
         assert_eq!(crate::control::german_spill_len(present.len()), 0);
     }
 
+    /// The feed bit round-trips on a plain view and is refused on every other
+    /// class — a bounded one included, since `capacity` and `delta` are refused
+    /// together everywhere else. A blob claiming otherwise is rejected rather
+    /// than believed.
+    #[test]
+    fn delta_flag_roundtrips_on_a_view_and_is_refused_elsewhere() {
+        let d = RelDescriptorBlob {
+            class: RelClass::View,
+            delta: true,
+            ..Default::default()
+        };
+        assert_eq!(roundtrip(&d, 2), d);
+        for class in [RelClass::Table, RelClass::Stream, RelClass::BoundedView] {
+            let mut bytes = RelDescriptorBlob {
+                class,
+                ..Default::default()
+            }
+            .encode();
+            bytes[1] |= DESC_FLAG_DELTA;
+            assert!(RelDescriptorBlob::decode(&bytes, 2).unwrap_err().contains("delta feed"));
+        }
+    }
+
     #[test]
     fn empty_lists_roundtrip() {
         let d = RelDescriptorBlob::default();
@@ -267,6 +325,7 @@ mod tests {
         let d = RelDescriptorBlob {
             class: RelClass::BoundedView,
             replicated: true,
+            delta: false,
             fks: vec![
                 RelFk {
                     col_idx: 0,

@@ -26,24 +26,26 @@ impl Iterator for BitIter {
 /// A replicated relation is a full identical copy on every worker, so worker 0
 /// answers it alone; otherwise the read goes to the single worker owning its PK
 /// range when [`confined_worker`] can prove one, and is broadcast when it cannot.
-pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> Fanout {
+pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, spec: &[u8]) -> Fanout {
     match replicated_unicast(disp, target_id) {
         Fanout::One(w) => Fanout::One(w),
-        Fanout::Broadcast => confined_worker(disp, target_id, seek_pk_extra).map_or(Fanout::Broadcast, Fanout::One),
+        Fanout::Broadcast => confined_worker(disp, target_id, spec).map_or(Fanout::Broadcast, Fanout::One),
     }
 }
 
 /// The one worker that can answer this read, or `None` when nothing proves one —
 /// a relation whose rows are not key-placed, a non-`PkRange` bound, a forged
 /// descriptor (left for the worker to reject at the trust boundary), or a range
-/// spanning workers. An `IndexRange` bound is never confined: a secondary index
+/// spanning workers. Takes the already-unpacked `ReadSpec`, not the whole
+/// `seek_pk_extra` blob: `handle_scan_spec` unpacks it once for the gate and the
+/// routing both. An `IndexRange` bound is never confined: a secondary index
 /// is one unpartitioned table per worker, so nothing derives its owner from the
 /// key.
 ///
 /// Only a key-routed relation names an owner, and the catalog — not the master's
 /// own stores — answers whether a relation is: the master holds no store at all
 /// after the fork, so its own handles cannot speak for the workers'.
-fn confined_worker(disp: &MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]) -> Option<usize> {
+fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: &[u8]) -> Option<usize> {
     let cat = disp.cat();
     let schema = cat.get_schema_desc(target_id)?;
     // For anything but `Keyed` no key names an owner, so nothing can be routed
@@ -51,7 +53,6 @@ fn confined_worker(disp: &MasterDispatcher, target_id: i64, seek_pk_extra: &[u8]
     if !schema.placement().is_key_routed() {
         return None;
     }
-    let (spec, _block) = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).ok()?;
     let desc = gnitz_wire::peek_pk_range(spec)?;
     gnitz_engine::catalog::scan_spec_worker(&schema, &desc, disp.num_workers)
 }
@@ -90,6 +91,25 @@ static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 /// never route by req_id, so zeros are correct rather than merely unused.
 const SYNC_COLLECT_REQ_IDS: [u64; MAX_WORKERS] = [0; MAX_WORKERS];
 
+/// A `u64` from the OS entropy pool, mixed into every delta reply's cursor tag.
+///
+/// From the OS rather than from a seeded generator because two back-to-back
+/// boots must not collide: a client holding a cursor across a restart has to see
+/// a tag it does not recognise, discard its copy and re-read at `after_tick = 0`.
+/// A short read or an unavailable pool falls back to the boot's wall clock and
+/// pid, which is weaker but still distinguishes two boots of one machine.
+fn boot_nonce() -> u64 {
+    let mut bytes = [0u8; 8];
+    let n = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+    if n == bytes.len() as isize {
+        return u64::from_ne_bytes(bytes);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    nanos ^ ((std::process::id() as u64) << 32)
+}
+
 impl MasterDispatcher {
     pub fn new(
         num_workers: usize,
@@ -118,6 +138,9 @@ impl MasterDispatcher {
             } else {
                 unsafe { (*catalog).durable_generation() }
             }),
+            tick_round: Cell::new(1),
+            last_delta_round: RefCell::new(FxHashMap::default()),
+            boot_nonce: boot_nonce(),
         }
     }
 
@@ -301,6 +324,11 @@ impl MasterDispatcher {
     /// its reply carries no schema block, so there is no version to negotiate.
     /// The master reads only the bound header out of the spec, to route
     /// (`confined_worker`); the worker is the sole `ReadSpec`/OPK decoder.
+    ///
+    /// `seek_pk` carries the last tick round the master had emitted when it wrote
+    /// this group, which is what cuts a delta read's interval above. It was
+    /// hard-coded `0` before, and read by nothing in either scan arm, so the two
+    /// callers with nothing to say there still pass `0`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn write_scan_group(
         &self,
@@ -311,13 +339,14 @@ impl MasterDispatcher {
         unicast_worker: Fanout,
         client_id: u64,
         seek_pk_extra: &[u8],
+        seek_pk: u128,
     ) -> Result<(), String> {
         self.write_command_group(
             target_id,
             0,
             sal_flags,
             wire_flags,
-            0,
+            seek_pk,
             0,
             req_ids,
             unicast_worker,
@@ -413,7 +442,7 @@ impl MasterDispatcher {
                 match self.w2m.try_read(w) {
                     Some(decoded) => {
                         if let Some(e) = worker_error(w, "recovery sync", &decoded.control) {
-                            return Err(e);
+                            return Err(e.text);
                         }
                         break;
                     }
@@ -509,7 +538,7 @@ impl MasterDispatcher {
                     }
                 } else {
                     if let Some(e) = worker_error(w, "backfill relay", &decoded.control) {
-                        return Err(e);
+                        return Err(e.text);
                     }
                     pending_mask &= !(1u64 << w);
                 }
@@ -1002,7 +1031,7 @@ impl MasterDispatcher {
         let slot = slots.pop().expect("unicast fan-out returns one slot");
         // A point seek's reply must fit one frame; a train would be forwarded
         // truncated, so reject it rather than silently drop the remainder.
-        expect_single_frame(&slot, worker, "seek")?;
+        expect_single_frame(&slot, worker, "seek").map_err(|f| f.text)?;
         Ok(slot)
     }
 
@@ -1079,13 +1108,15 @@ impl MasterDispatcher {
                     "{OP}: result exceeds the {} MiB reply cap; add a tighter \
                      predicate or LIMIT",
                     crate::runtime::wire::FRAME_CAP >> 20
-                ));
+                )
+                .into());
             }
             let a = acc.get_or_insert_with(|| Batch::with_capacity(expected, mb.count));
             a.append_mem_batch(mb);
             Ok(())
         })
-        .await?;
+        .await
+        .map_err(|f| f.text)?;
         // The sink runs only for non-empty frames, so `Some` implies rows.
         Ok(acc)
     }
@@ -1111,11 +1142,37 @@ impl MasterDispatcher {
     /// every undrained frame at the ring boundary, advancing `consume_cursor`, so
     /// a still-streaming worker cannot wedge in `send_encoded` — draining the
     /// doomed trains would be pure waste. The client may already have received
-    /// earlier workers' data frames when the fault surfaces, so the STATUS_ERROR
-    /// frame `send_error` emits can arrive mid-stream:
+    /// earlier workers' data frames when the fault surfaces, so the fault frame
+    /// `finish_scan_fanout` emits can arrive mid-stream:
     /// `Connection::drain_reply_train` (gnitz-core), the one reply reassembler,
-    /// returns on the first STATUS_ERROR and discards the batch it had
+    /// returns on the first failing status and discards the batch it had
     /// accumulated, so no partial rows surface.
+    ///
+    /// **It also returns the tick round it sampled**, and samples it *inside* the
+    /// closure `dispatch_scan_fanout` runs under `sal_writer_excl` — the same
+    /// window the read's group is written in. That is what makes the round a
+    /// property of the SAL prefix rather than of a tick's success: every worker
+    /// sees the read group after exactly the tick groups of rounds `<= T` and
+    /// before any group of a later round.
+    ///
+    /// No tick group can land between the sample and the write, and the mutex is
+    /// only half of why — which matters because the other half is the fragile
+    /// half. `run_tick` writes its groups under it; the three `drain_tick_blocking`
+    /// callers write theirs under **no** mutex at all. What covers all four paths
+    /// is that the reactor is single-threaded and each of them is await-free, so
+    /// two of them cannot interleave. The mutex earns its place against the
+    /// *committer*, which holds it across an fsync and would otherwise put a read
+    /// group inside a commit zone. Stated that way, the first `drain_tick_blocking`
+    /// caller to grow an `await` is a visible break rather than a silent one.
+    ///
+    /// The round is written into the group's `seek_pk` as well as returned, so the
+    /// worker cuts the delta interval at it rather than walking to the end of its
+    /// store. `seek_pk` is genuinely free on a scan group — hard-coded `0` before
+    /// this and read by nothing in either scan arm.
+    ///
+    /// Sampling unconditionally is a `Cell` read under a lock the function already
+    /// holds, so it costs the other callers nothing; the plain scan and the
+    /// multi-scan drop the payload explicitly at their own call sites.
     #[allow(clippy::too_many_arguments)]
     pub async fn fan_out_scan(
         disp: &MasterDispatcher,
@@ -1128,13 +1185,16 @@ impl MasterDispatcher {
         sal_flags: u32,
         wire_flags: u64,
         seek_pk_extra: &[u8],
-    ) -> Result<bool, String> {
+    ) -> Result<(bool, u64), WorkerFault> {
         // `_lease` held across the entire continuation drain: every worker
         // streams a multi-frame train, and a cancelled drain (client disconnect)
         // must keep the ids active until the lease drops so the gate discards —
         // not parks — late frames.
+        let sampled = Cell::new(0u64);
         let (slots, req_ids, _lease) =
             dispatch_scan_fanout(disp, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
+                let round = disp.last_tick_round();
+                sampled.set(round);
                 disp.write_scan_group(
                     target_id,
                     sal_flags,
@@ -1143,10 +1203,12 @@ impl MasterDispatcher {
                     unicast,
                     client_id,
                     seek_pk_extra,
+                    round as u128,
                 )
             })
             .await?;
-        forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await
+        let ok = forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await?;
+        Ok((ok, sampled.get()))
     }
 
     /// Await + forward one already-dispatched scan relation: the await+drain
@@ -1170,7 +1232,7 @@ impl MasterDispatcher {
         unicast: Fanout,
         req_ids: &[u64],
         nw: usize,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, WorkerFault> {
         let slots = await_scan_slots(reactor, unicast, req_ids, nw).await;
         forward_scan_slots(reactor, peer, slots, req_ids, unicast).await
     }
@@ -1263,11 +1325,103 @@ impl MasterDispatcher {
     /// first. Per-worker slots each carry
     /// the corresponding req_id from `req_ids[w]`. No schema block:
     /// `handle_tick` looks the target's schema up in its own catalog.
+    ///
+    /// **This is where the tick round is allocated**, because this is the one
+    /// writer of a tick group: `run_tick` and `drain_tick_blocking` — itself the
+    /// CREATE-VIEW drain, the boot recovery sweep and the post-reclaim restamp —
+    /// all funnel here. Allocating anywhere else means enumerating those paths,
+    /// and an enumeration is wrong the day a fifth appears. It also makes the
+    /// idle-poll map complete for free: the round, the record of which views it
+    /// reaches, and the group write are one synchronous await-free body, so a poll
+    /// that sees the counter advanced also sees the round recorded.
+    ///
+    /// The round rides in the group header's `lsn`, which is free for it: every
+    /// command verb passes `0` there except the ephemeral flush round, which
+    /// carries the checkpoint generation, and the replay walk already says a
+    /// non-zero `lsn` alone does not make a group a zone. So the round costs no
+    /// SAL bytes and changes no recovery behaviour.
+    ///
+    /// The counter is advanced — and the map written — **before** the
+    /// injected-failure seam fires, so a failed emit burns a round rather than
+    /// reusing it: rounds must be strictly increasing, and the re-queued tid ticks
+    /// again under a later one. Recording a round that never reached a worker
+    /// gates away nothing: no rows exist at it, and the re-tick raises the map
+    /// past it, so a cursor sitting at the burnt round falls through again.
     pub(crate) fn write_tick_group(&self, tid: i64, req_ids: &[u64]) -> Result<(), String> {
+        let round = self.tick_round.get() + 1;
+        self.tick_round.set(round);
+        self.record_delta_round(tid, round);
         if self.take_injected_tick_emit_error(tid) {
             return Err(format!("injected tick emit error (tid={tid})"));
         }
-        self.write_command_group(tid, 0, FLAG_TICK, 0, 0, 0, req_ids, Fanout::Broadcast, 0, &[])
+        self.write_command_group(tid, round, FLAG_TICK, 0, 0, 0, req_ids, Fanout::Broadcast, 0, &[])
+    }
+
+    /// Raise the last-reached round of every fed view in `tid`'s **forward**
+    /// closure — which views this source reaches. Skipped outright when no view
+    /// carries a feed, which is every server that does not use the feature.
+    ///
+    /// At **emit** time, not at ACK time: a round emitted but not yet ACKed has
+    /// already reached the view's workers, and an ACK-time update would let the
+    /// gate answer "nothing changed" over a round whose rows are already in flight.
+    fn record_delta_round(&self, tid: i64, round: u64) {
+        let cat = self.cat();
+        if !cat.dag().any_delta_feed() {
+            return;
+        }
+        let reached = cat.dag_mut().dependent_closure(vec![tid]);
+        let mut map = self.last_delta_round.borrow_mut();
+        for vid in reached {
+            if cat.dag().relation_has_delta_feed(vid) {
+                map.insert(vid, round);
+            }
+        }
+    }
+
+    /// The last tick round this master has **emitted** — the `T` a delta reply
+    /// promises, sampled by the read's own fan-out under `sal_writer_excl` so no
+    /// tick group can land between the sample and the read group.
+    pub(crate) fn last_tick_round(&self) -> u64 {
+        self.tick_round.get()
+    }
+
+    /// The cursor tag a delta reply carries: `boot_nonce ^ splitmix64(view_id)`.
+    ///
+    /// One field answers two questions because they are the same question. A round
+    /// number alone identifies nothing — it is meaningless across a restart,
+    /// because the counter starts over, and meaningless across a
+    /// `DROP VIEW v; CREATE VIEW v …`, because the recreated `v` takes a fresh id
+    /// whose rounds are numbered from the same global counter as the old one's. A
+    /// client that does not recognise the tag discards its copy and re-reads at
+    /// `after_tick = 0`, which is the right answer to both.
+    ///
+    /// A per-view first round recorded on the master is the obvious alternative and
+    /// cannot be made exact: a subscriber that bootstraps a view immediately after
+    /// its creation is handed the counter's current value as `T` — the same value a
+    /// cursor from the dropped view can hold — so any threshold that refuses the
+    /// stale cursor also refuses the fresh one, and the client loops. The tag has no
+    /// such overlap because it compares identities, not magnitudes.
+    pub(crate) fn delta_cursor_tag(&self, view_id: i64) -> u64 {
+        // splitmix64's finalizer: the view id is a small dense integer, and an
+        // unmixed XOR would make neighbouring ids' tags differ in one bit.
+        let mut z = (view_id as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        self.boot_nonce ^ (z ^ (z >> 31))
+    }
+
+    /// The last round that reached `view_id`, or `1` for a view no round has
+    /// reached — the boot round, which is never emitted and stamps nothing, so a
+    /// bootstrap at `after_tick = 0` always falls through to the store.
+    pub(crate) fn last_delta_round(&self, view_id: i64) -> u64 {
+        self.last_delta_round.borrow().get(&view_id).copied().unwrap_or(1)
+    }
+
+    /// Drop a dropped relation's gate entry. Ids are never reused, so nothing else
+    /// would ever reclaim it, and a per-DDL leak on the master is not a leak that
+    /// stops.
+    pub(crate) fn forget_delta_round(&self, id: i64) {
+        self.last_delta_round.borrow_mut().remove(&id);
     }
 
     // -----------------------------------------------------------------------

@@ -618,7 +618,7 @@ impl CatalogEngine {
                 let (sid, name, pk, flags) = read_table_tab_row(batch, i);
                 (sid, name, pk, RelationKind::from_table_flags(flags))
             } else {
-                let (sid, name, pk, _capacity) = read_view_tab_row(batch, i);
+                let (sid, name, pk, _capacity, _delta) = read_view_tab_row(batch, i);
                 (sid, name, pk, RelationKind::View)
             };
             validate_relation_defs(kind, id, &name, &col_defs, &pk)?;

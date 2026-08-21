@@ -10,46 +10,88 @@ use crate::SqlResult;
 use gnitz_core::{GnitzClient, PlannedView, RelClass};
 use sqlparser::ast::{CreateTableOptions, ObjectName, Query, Value, ValueWithSpan};
 
-/// Binary units accepted by `WITH (capacity = '<uint><unit>')`.
-const CAPACITY_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
+/// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
+const SIZE_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
 
-/// Decode the `WITH (...)` clause of a `CREATE VIEW` into a byte capacity.
+/// The two byte budgets a `CREATE VIEW`'s `WITH (...)` clause can carry.
+/// Presence of a budget *is* the classification on each side — a second flag word
+/// could only ever disagree with it.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ViewOptions {
+    /// `capacity`: bound the view's own output store, dehydrating past it.
+    pub capacity: Option<u64>,
+    /// `delta`: keep the view's recent deltas in a store of its own, so a client
+    /// can read "what changed since round N".
+    pub delta: Option<u64>,
+}
+
+/// Decode the `WITH (...)` clause of a `CREATE VIEW`.
 ///
 /// `sqlparser::parse_create_view` fills `options` from `parse_options(WITH)` with
 /// no dialect gate, so no grammar of ours is involved — only the meaning of the
-/// one key we honour. Presence of a capacity *is* the bounded classification;
-/// there is no second word to keep consistent with it.
-fn decode_capacity(options: &CreateTableOptions) -> Result<Option<u64>, GnitzSqlError> {
-    let mut capacity = None;
+/// keys we honour. Both are decoded here rather than in a second pass over the
+/// same list, because an option this loop does not know about is rejected by
+/// name: adding one anywhere else would refuse `WITH (delta = …)` with a message
+/// naming `capacity` as the only option.
+///
+/// **The two are refused together.** A bounded view's read hydrates its missing
+/// keys from the *source relation's live store*, which no tick round governs, so
+/// its `Delta(0)` cannot be the view's value at round `T` — and the whole feed
+/// contract is that it is. The bootstrap would report `T` while already carrying
+/// an un-ticked push, and the next poll would deliver that same push again at
+/// double weight, with no error and no row-set difference. The engine's
+/// `view_registration` refuses the pair as well: it is the trust boundary, and
+/// this is where the message is legible.
+fn decode_view_options(options: &CreateTableOptions) -> Result<ViewOptions, GnitzSqlError> {
+    let mut out = ViewOptions::default();
     for opt in crate::validate::with_options(options)? {
         let (key, value) = crate::validate::require_kv_option(opt, "CREATE VIEW")?;
-        if !key.value.eq_ignore_ascii_case("capacity") {
+        // The option's name and the field it fills are bound together, so a third
+        // option is one arm rather than an arm plus a second dispatch on the name.
+        let (name, slot) = if key.value.eq_ignore_ascii_case("capacity") {
+            ("capacity", &mut out.capacity)
+        } else if key.value.eq_ignore_ascii_case("delta") {
+            ("delta", &mut out.delta)
+        } else {
             return Err(GnitzSqlError::Plan(format!(
-                "unknown CREATE VIEW option '{}'; the only supported option is `capacity`",
+                "unknown CREATE VIEW option '{}'; the supported options are `capacity` and `delta`",
                 key.value
             )));
-        }
+        };
         let sqlparser::ast::Expr::Value(ValueWithSpan {
             value: Value::SingleQuotedString(text),
             ..
         }) = value
         else {
-            return Err(GnitzSqlError::Plan(
-                "CREATE VIEW option `capacity` takes a single-quoted size string, e.g. '256 MB'".to_string(),
-            ));
+            return Err(GnitzSqlError::Plan(format!(
+                "CREATE VIEW option `{name}` takes a single-quoted size string, e.g. '256 MB'"
+            )));
         };
-        capacity = Some(parse_capacity(text)?);
+        *slot = Some(parse_size(name, text)?);
     }
-    Ok(capacity)
+    if out.capacity.is_some() && out.delta.is_some() {
+        return Err(GnitzSqlError::Unsupported(
+            "CREATE VIEW WITH (capacity …, delta …): a capacity-bounded view cannot carry a \
+             delta feed — its bootstrap read hydrates from the source relation's live store, \
+             which no tick round governs"
+                .to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 /// `<uint><unit>` with an optional space, unit in {KB, MB, GB}, binary
 /// (KB = 2^10). Zero and a `u64`-overflowing product are rejected: a zero
-/// capacity names a store that cannot hold its own skeleton.
-fn parse_capacity(text: &str) -> Result<u64, GnitzSqlError> {
+/// capacity names a store that cannot hold its own skeleton, and a zero delta
+/// budget one that retains nothing.
+///
+/// `option` is threaded through rather than duplicated into a second parser: the
+/// grammar is shared verbatim between the two options, only the error text names
+/// which one.
+fn parse_size(option: &str, text: &str) -> Result<u64, GnitzSqlError> {
     let bad = || {
         GnitzSqlError::Plan(format!(
-            "CREATE VIEW option `capacity`: '{text}' is not a size like '256 MB' \
+            "CREATE VIEW option `{option}`: '{text}' is not a size like '256 MB' \
              (a positive integer followed by KB, MB or GB)"
         ))
     };
@@ -58,14 +100,14 @@ fn parse_capacity(text: &str) -> Result<u64, GnitzSqlError> {
     let (num, unit) = trimmed.split_at(digits);
     let num: u64 = num.parse().map_err(|_| bad())?;
     let unit = unit.trim();
-    let mult = CAPACITY_UNITS
+    let mult = SIZE_UNITS
         .iter()
         .find(|(u, _)| unit.eq_ignore_ascii_case(u))
         .map(|&(_, m)| m)
         .ok_or_else(bad)?;
     match num.checked_mul(mult) {
         Some(0) | None => Err(GnitzSqlError::Plan(format!(
-            "CREATE VIEW option `capacity`: '{text}' is out of range (must be positive and fit a u64)"
+            "CREATE VIEW option `{option}`: '{text}' is out of range (must be positive and fit a u64)"
         ))),
         Some(bytes) => Ok(bytes),
     }
@@ -101,10 +143,10 @@ pub(crate) fn execute_create_view(
     // Compile the body into a durable chain (real `alloc_table_id` ids), then
     // commit it atomically. `build_query_segments` owns every shape rule; CREATE
     // VIEW adds only the durable id origin and the `create_view_chain` commit.
-    let capacity = decode_capacity(&cv.options)?;
+    let options = decode_view_options(&cv.options)?;
 
     let mut chain = ViewChain::new();
-    let final_vid = build_query_segments(client, query, binder, &mut chain, view_name, sql_text, capacity)?;
+    let final_vid = build_query_segments(client, query, binder, &mut chain, view_name, sql_text, options)?;
     client.create_view_chain(schema_name, chain.segments, None)?;
     Ok(SqlResult::ViewCreated { view_id: final_vid })
 }
@@ -146,7 +188,15 @@ pub(crate) fn execute_alter_view(
     // Compile + validate the new plan (fresh vids) BEFORE issuing the zone, so a
     // planner error leaves the old view fully intact.
     let mut chain = ViewChain::new();
-    build_query_segments(client, query, binder, &mut chain, view_name.clone(), sql_text, None)?;
+    build_query_segments(
+        client,
+        query,
+        binder,
+        &mut chain,
+        view_name.clone(),
+        sql_text,
+        ViewOptions::default(),
+    )?;
 
     // Reject self-reference: `FROM v` in the new query resolves to the still-live
     // old vid, which would appear as a source of the new plan — the bundle
@@ -183,6 +233,18 @@ fn resolve_view_id(client: &mut GnitzClient, schema_name: &str, name: &str) -> R
         Some(rel) if rel.class == RelClass::BoundedView => Err(GnitzSqlError::Unsupported(format!(
             "ALTER VIEW cannot retarget a capacity-bounded view; DROP and CREATE '{name}' instead"
         ))),
+        // The same rule for a fed view, and it needs its own clause: `delta` is
+        // deliberately not part of the relation class, so a fed unbounded view is
+        // `RelClass::View` and would sail past the test above into exactly the
+        // failure it exists to prevent — the feed gone, and every later delta read
+        // (`after_tick = 0` included) the typed error a relation with no delta
+        // store gets. There is no ALTER that turns a feed *on* either, for the
+        // reason a feed cannot start mid-life: it would begin empty while its view
+        // already held rows, and every `after_tick > 0` against it would be a lie
+        // rather than an expiry.
+        Some(rel) if rel.delta => Err(GnitzSqlError::Unsupported(format!(
+            "ALTER VIEW cannot retarget a view with a delta feed; DROP and CREATE '{name}' instead"
+        ))),
         Some(rel) if rel.class.is_view() => Ok(rel.tid),
         Some(rel) => Err(GnitzSqlError::Unsupported(format!(
             "'{name}' is a {}; ALTER VIEW requires a view (use ALTER TABLE)",
@@ -206,8 +268,9 @@ fn build_query_segments(
     chain: &mut ViewChain,
     final_name: String,
     sql_text: String,
-    capacity: Option<u64>,
+    options: ViewOptions,
 ) -> Result<u64, GnitzSqlError> {
+    let capacity = options.capacity;
     // The CTE phase compiles each CTE body (a pass-through alias into the binder
     // cache, or a hidden segment on `chain`) and registers it, so the body below
     // resolves a CTE by name. A derived table is not pre-compiled — it binds as an
@@ -258,6 +321,7 @@ fn build_query_segments(
         output_columns: out_cols,
         pk_cols,
         capacity_bytes: capacity,
+        delta_bytes: options.delta,
     });
     Ok(final_vid)
 }

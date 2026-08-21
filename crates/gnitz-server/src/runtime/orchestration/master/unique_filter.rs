@@ -294,7 +294,7 @@ impl MasterDispatcher {
         // frame at the ring boundary.
         let (slots, req_ids, _lease) =
             dispatch_scan_fanout(disp, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                disp.write_scan_group(table_id, 0, 0, req_ids, unicast, 0, &[])
+                disp.write_scan_group(table_id, 0, 0, req_ids, unicast, 0, &[], 0)
             })
             .await?;
 
@@ -315,7 +315,8 @@ impl MasterDispatcher {
             }
             Ok(())
         })
-        .await?;
+        .await
+        .map_err(|f| f.text)?;
 
         // Fully populated → mark warm so the broadcast-skip shortcut may trust
         // them, and disarm the guard so its Drop leaves them in place.

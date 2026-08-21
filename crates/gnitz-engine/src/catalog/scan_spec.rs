@@ -17,7 +17,7 @@
 
 use std::cmp::Ordering;
 
-use gnitz_wire::{AggReadSpec, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec};
+use gnitz_wire::{AggReadSpec, Cut, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec, WireFault};
 
 use super::store_io::{BoundedRead, SourceCursor};
 use super::*;
@@ -43,15 +43,21 @@ impl CatalogEngine {
     /// `Err` on a corrupt program blob, a reply schema that does not match the
     /// sink's expected shape (rows: PK-stride equality; fold: the derived
     /// SyntheticFold layout), an index an `exact` bound needs and cannot find — every one a
-    /// corrupt/stale frame, surfaced as a `STATUS_ERROR` reply — or the fold's
-    /// per-worker group cap (a resource-exhaustion abort).
+    /// corrupt/stale frame, surfaced as a `STATUS_ERROR` reply — the fold's
+    /// per-worker group cap (a resource-exhaustion abort), or a delta cursor
+    /// below this worker's retention floor, which carries `STATUS_DELTA_EXPIRED`.
+    ///
+    /// `cut_tick` is the last tick round the master had emitted when it wrote
+    /// this read's group, and bounds an incremental delta read above. Every other
+    /// bound ignores it.
     pub fn scan_spec_family(
         &mut self,
         target_id: i64,
         spec: &ReadSpec,
         reply_schema: &SchemaDescriptor,
-    ) -> Result<Batch, String> {
-        let src_schema = self.table_entry(target_id)?.schema;
+        cut_tick: u64,
+    ) -> Result<Batch, WireFault> {
+        let src_schema = self.scan_spec_source_schema(target_id, &spec.bound)?;
 
         // Compile the predicate once per request, exactly as the circuit
         // compiler does (`query/compiler/emit.rs`).
@@ -62,14 +68,21 @@ impl CatalogEngine {
 
         let chunk_rows = self.ddl_scan_chunk_rows.max(1);
         let group_cap = self.adhoc_group_cap;
-        let mut source = self.open_scan_spec_cursor(target_id, &spec.bound, &src_schema)?;
+        let mut source = self.open_scan_spec_cursor(target_id, &spec.bound, &src_schema, cut_tick)?;
         let ctx = ScanSinkCtx {
             predicate: predicate.as_ref(),
             chunk_rows,
         };
 
         match &spec.sink {
-            ReadSink::Fold(agg) => run_scan_fold_sink(&mut source, ctx, &src_schema, reply_schema, agg, group_cap),
+            ReadSink::Fold(agg) => Ok(run_scan_fold_sink(
+                &mut source,
+                ctx,
+                &src_schema,
+                reply_schema,
+                agg,
+                group_cap,
+            )?),
             ReadSink::Rows {
                 projection,
                 order,
@@ -87,7 +100,8 @@ impl CatalogEngine {
                         "scan_spec: order key column {} out of range ({} cols)",
                         k.col,
                         reply_schema.num_columns()
-                    ));
+                    )
+                    .into());
                 }
                 // The rows sink byte-copies the source OPK verbatim into the reply
                 // PK region, so the strides must agree — a mismatch would leave
@@ -112,7 +126,8 @@ impl CatalogEngine {
                                 "scan_spec: reply pk_stride {} != source pk_stride {}",
                                 reply_schema.pk_stride(),
                                 src_schema.pk_stride()
-                            ));
+                            )
+                            .into());
                         }
                         Some(compile_projection(projection, &src_schema, reply_schema)?)
                     }
@@ -129,6 +144,39 @@ impl CatalogEngine {
         }
     }
 
+    /// The schema the bound's rows arrive in — what the predicate, the projection
+    /// and the identity-layout check below are all resolved against.
+    ///
+    /// Taken from the **bound**, not from the registry entry: an incremental delta
+    /// read walks the view's delta store, whose rows are `_tick ‖ view PK ‖ view
+    /// payload`. The bootstrap arm (`after_tick = 0`) is *the sum of every delta
+    /// after round 0*, which is the view's whole history — precisely what its own
+    /// output store holds — so it walks that, in the view's own schema.
+    ///
+    /// A `Delta` bound against a relation with no feed is refused at **every**
+    /// `after_tick`, zero included: the reply would otherwise promise a
+    /// continuation the server cannot serve.
+    fn scan_spec_source_schema(&mut self, target: i64, bound: &ReadBound) -> Result<SchemaDescriptor, String> {
+        let entry = self.table_entry(target)?;
+        let ReadBound::Delta { after_tick } = bound else {
+            return Ok(entry.schema);
+        };
+        if entry.delta_bytes.is_none() {
+            return Err(format!(
+                "scan_spec: relation {target} carries no delta feed; \
+                 create the view WITH (delta = '<size>') to subscribe to it"
+            ));
+        }
+        if *after_tick == 0 {
+            return Ok(entry.schema);
+        }
+        entry
+            .delta
+            .as_ref()
+            .map(|f| f.schema)
+            .ok_or_else(|| format!("scan_spec: this process holds no delta store for relation {target}"))
+    }
+
     /// Open the source cursor for `bound` over `source`, bounded within this
     /// worker's store by whatever the bound names. Each arm owns its own
     /// trust-boundary rejections; see the per-bound openers below.
@@ -137,7 +185,8 @@ impl CatalogEngine {
         source: i64,
         bound: &ReadBound,
         src_schema: &SchemaDescriptor,
-    ) -> Result<SourceCursor, String> {
+        cut_tick: u64,
+    ) -> Result<SourceCursor, WireFault> {
         // A store holding skeleton rows is hydrated over the bound into one
         // in-memory run first, so the predicate, projection, ORDER BY / LIMIT and
         // aggregate sinks below run unchanged over source-schema rows and never see
@@ -166,7 +215,20 @@ impl CatalogEngine {
                 ReadBound::IndexRange { .. } => {
                     return Err(format!(
                         "scan_spec: an index bound cannot name view {source} — only base tables own index circuits"
-                    ))
+                    )
+                    .into())
+                }
+                // Unreachable while `capacity` and `delta` are refused together:
+                // a fed view never holds a skeleton row, so this test is always
+                // false for one and the delta arm below is reached
+                // unconditionally. Stated as a rejection rather than as an
+                // assertion because what keeps the branch out of reach is a
+                // prohibition two layers away.
+                ReadBound::Delta { .. } => {
+                    return Err(format!(
+                        "scan_spec: relation {source} holds skeleton rows, which no relation with a delta feed can"
+                    )
+                    .into())
                 }
             };
             return Ok(SourceCursor::Full(Box::new(ReadCursor::over_batches(
@@ -175,13 +237,55 @@ impl CatalogEngine {
             ))));
         }
         match bound {
-            ReadBound::None => Ok(SourceCursor::Full(Box::new(self.table_entry(source)?.open_cursor()))),
-            ReadBound::PkRange(desc) => self.open_pk_range_cursor(source, desc, src_schema),
-            ReadBound::IndexRange { idx_cols, exact, desc } => {
-                self.open_index_bound_cursor(source, *idx_cols, *exact, desc)
+            // The bootstrap arm reads the view's own store, which is what
+            // `scan_spec_source_schema` already told the caller.
+            ReadBound::None | ReadBound::Delta { after_tick: 0 } => {
+                Ok(SourceCursor::Full(Box::new(self.table_entry(source)?.open_cursor())))
             }
-            ReadBound::PkSet(keys) => self.open_pk_set_gather(source, keys, src_schema),
+            ReadBound::PkRange(desc) => Ok(self.open_pk_range_cursor(source, desc, src_schema)?),
+            ReadBound::IndexRange { idx_cols, exact, desc } => {
+                Ok(self.open_index_bound_cursor(source, *idx_cols, *exact, desc)?)
+            }
+            ReadBound::PkSet(keys) => Ok(self.open_pk_set_gather(source, keys, src_schema)?),
+            ReadBound::Delta { after_tick } => self.open_delta_cursor(source, *after_tick, cut_tick),
         }
+    }
+
+    /// The `(after_tick, cut_tick]` walk over a fed view's delta store.
+    ///
+    /// Both ends go through `pk_range_keys`, never through arithmetic on the
+    /// tick. Two bugs avoided rather than a preference: `after_tick` is
+    /// client-supplied and unvalidated until here, so `after_tick + 1` at
+    /// `u64::MAX` would panic in a debug build and wrap in release, where
+    /// `Cut::After`'s saturation arm answers "no key space above" instead; and the
+    /// keys it produces are `pk_stride` wide and zero-padded past the tick, which
+    /// is what `seek_range_bytes` requires and what makes the padded key the
+    /// minimum of its tick group — every fed view's key is wider than the stamp
+    /// alone. A start key not below the end comes back as an empty range rather
+    /// than an error, so a forged `after_tick` above the cut is inert.
+    ///
+    /// Refused when the cursor is at or below this worker's `dropped_through`:
+    /// that round's rows may have gone, and the floors are independent across
+    /// workers, so one refusal refuses the read — a broadcast one worker cannot
+    /// serve whole has a hole in it. `<=`, not `<`, because a drop can leave the
+    /// tail of its highest round behind, so a cursor *at* that round would be
+    /// served a fragment.
+    fn open_delta_cursor(&mut self, source: i64, after_tick: u64, cut_tick: u64) -> Result<SourceCursor, WireFault> {
+        let Some(feed) = self.table_entry(source)?.delta.as_ref() else {
+            return Err(format!("scan_spec: this process holds no delta store for relation {source}").into());
+        };
+        let dropped_through = feed.handle.dropped_through();
+        if after_tick <= dropped_through {
+            return Err(WireFault {
+                status: gnitz_wire::STATUS_DELTA_EXPIRED,
+                text: format!(
+                    "delta cursor {after_tick} of relation {source} is at or below the \
+                     retained floor {dropped_through}; re-read at 0"
+                ),
+            });
+        }
+        let desc = RangeDescriptor::new(&[], Cut::After(after_tick as u128), Cut::After(cut_tick as u128));
+        Ok(Self::seek_range(feed.open_cursor(), &feed.schema, &desc)?)
     }
 
     /// A base-PK range walk, clamped to `[start, end)` so it is O(range): a
@@ -198,10 +302,24 @@ impl CatalogEngine {
         desc: &RangeDescriptor,
         src_schema: &SchemaDescriptor,
     ) -> Result<SourceCursor, String> {
-        let Some((start, end)) = pk_range_keys(src_schema, desc)? else {
+        let cursor = self.table_entry(source)?.open_cursor();
+        Self::seek_range(cursor, src_schema, desc)
+    }
+
+    /// Clamp `cursor` to the half-open key range `desc` names over `schema`'s PK
+    /// space, or `Empty` for a provably-empty one. The one place a range
+    /// descriptor becomes a cursor cut: the `PkRange` bound over a relation's own
+    /// store and the `Delta` bound over a fed view's delta store both reach
+    /// `seek_range_bytes` through here, so both get `pk_stride`-wide zero-padded
+    /// keys and the saturating `After` arm.
+    fn seek_range(
+        mut cursor: ReadCursor,
+        schema: &SchemaDescriptor,
+        desc: &RangeDescriptor,
+    ) -> Result<SourceCursor, String> {
+        let Some((start, end)) = pk_range_keys(schema, desc)? else {
             return Ok(SourceCursor::Empty);
         };
-        let mut cursor = self.table_entry(source)?.open_cursor();
         cursor.seek_range_bytes(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
         Ok(SourceCursor::Full(Box::new(cursor)))
     }

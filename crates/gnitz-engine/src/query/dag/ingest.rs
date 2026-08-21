@@ -45,6 +45,83 @@ impl DagEngine {
         }
     }
 
+    /// Ingest a view's tick output into its own store and — when the view carries
+    /// a feed — a copy stamped with `tick_round` into its delta store.
+    ///
+    /// One entry lookup for both stores, as [`Self::ingest_store_and_indices`]
+    /// already does for a relation and its index circuits. This is the only moment
+    /// a view's delta exists as an addressable object: the store ingest below
+    /// consolidates it into the memtable, whose fold drops net-zero (PK, payload)
+    /// rows, so an insert in one round and its retraction in the next annihilate
+    /// and no later reader could recover either. The capture and the ingest are
+    /// the same batch on the same worker, so every batch this store absorbs on the
+    /// tick path is captured byte-identically.
+    ///
+    /// **A replicated view stamps on worker 0 alone.** `execute_multi_worker_step`
+    /// short-circuits one: every worker holds every source in full and computes
+    /// the entire result locally, so `out_delta` is the full global delta on all
+    /// W. A delta read of such a view is routed by `replicated_unicast` to worker
+    /// 0, so the other W−1 delta stores would be written every tick and read
+    /// never. Writer and reader take "which worker holds this feed" from the same
+    /// replicated-placement fact, so they cannot come to different answers — and
+    /// if they ever did, a broadcast gather over W identical stores would hand
+    /// back every row W times, which no row-set comparison would show.
+    ///
+    /// **A fed view consolidates once, here, and both stores take the result.**
+    /// The two ingests would otherwise sort and fold the same rows independently:
+    /// `ingest_borrowed_batch` consolidates into the memtable's owned copy, and
+    /// the stamp inherits its source's layout claim — which is `Raw` for every
+    /// operator but the single-source exchange arm, `reduce` included — so
+    /// `ingest_owned_batch` would re-sort it. Consolidating first makes the
+    /// inherited `Consolidated` claim true (prepending one constant to every key
+    /// preserves sortedness and distinctness), so the stamp is copied by value
+    /// into a store that moves rather than re-folds it, and it carries the folded
+    /// row count rather than the raw one.
+    pub(crate) fn ingest_view_delta(&mut self, view_id: i64, batch: &Batch, tick_round: u64) {
+        let Some(entry) = self.tables.get_mut(&view_id) else {
+            gnitz_warn!("dag: ingest_view_delta — view_id={} not registered", view_id);
+            return;
+        };
+        debug_assert!(
+            entry.kind.is_view(),
+            "ingest_view_delta drives the tick path, which only ever reaches a view; \
+             a base table would silently skip enforce_unique_pk here",
+        );
+        if batch.count == 0 {
+            return;
+        }
+        // Only a fed view that stamps on this worker pays the up-front fold; every
+        // other view hands the batch straight to the store ingest it always did.
+        // `delta.is_some()` leads, so a view with no feed — every view on a server
+        // not using the feature — reads no placement and loads no worker rank.
+        let stamps_here = entry.delta.is_some()
+            && (!entry.schema.placement().is_replicated() || crate::foundation::worker_ctx::worker_rank() == 0);
+        let folded = stamps_here
+            .then(|| Batch::consolidate_if_needed(batch, &entry.schema))
+            .flatten();
+        let batch = folded.as_ref().unwrap_or(batch);
+        Self::ingest_store_and_indices(view_id, entry, batch);
+
+        let Some(feed) = entry.delta.as_ref().filter(|_| stamps_here) else {
+            return;
+        };
+        let stamped = batch.stamped_with_pk_prefix(&entry.schema, &feed.schema, tick_round);
+        if let Err(e) = feed.handle.ingest_owned_batch(stamped) {
+            // The view's own store has already absorbed this batch, so a swallowed
+            // failure would leave the feed one round short with no error anywhere
+            // — every subscriber applying a hole. Restart re-derives the view and
+            // erases the delta store, and the fresh boot nonce makes every cursor
+            // a client holds stop matching, so it re-reads from scratch.
+            gnitz_fatal_abort!(
+                "dag: delta-store ingest failed (view_id={}, round={}): {} — the feed \
+                 would silently lose a round; aborting for restart+re-derive",
+                view_id,
+                tick_round,
+                e,
+            );
+        }
+    }
+
     /// Ingest a batch into a relation's store + index projections and return the
     /// effective batch (after PK enforcement) — what downstream views need to
     /// see. `None` means exactly "table not registered"; a storage-apply failure
@@ -153,9 +230,16 @@ impl DagEngine {
         }
     }
 
-    /// Every store this process **owns**: each relation's `Owned` handle plus its
-    /// index-circuit tables. `Borrowed` and `Detached` handles drop out — that is
-    /// what keeps workers from barrier-flushing their inherited `_sys` copies.
+    /// Every store this process **owns and checkpoints**: each relation's `Owned`
+    /// handle plus its index-circuit tables. `Borrowed` and `Detached` handles
+    /// drop out — that is what keeps workers from barrier-flushing their inherited
+    /// `_sys` copies.
+    ///
+    /// A fed view's delta store is `Owned` and is deliberately **not** here, which
+    /// is what puts it in neither checkpoint round: it publishes no manifest and is
+    /// erased at open, so there is nothing a restart could resume it from. That is
+    /// also what makes its shard unlinking immediate rather than deferred to the
+    /// post-publish drain this set feeds (`ShardIndex::evict_by_drop`).
     ///
     /// Both checkpoint rounds start from this one set and let `Table` decide:
     /// the base round is handed it whole (`flush_prepare` publishes the durable

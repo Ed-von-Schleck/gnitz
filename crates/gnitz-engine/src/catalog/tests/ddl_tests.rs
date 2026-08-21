@@ -834,3 +834,63 @@ fn replicated_bit_is_transitive_and_survives_replay() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Delta feeds (`WITH (delta = …)`)
+// ---------------------------------------------------------------------------
+
+/// `capacity` and `delta` are refused **together**, here as well as at the SQL
+/// layer. This is the trust boundary: driven from a registration the SQL planner
+/// cannot produce, so a test that only went through SQL would pass with the rule
+/// absent.
+///
+/// The reason is not cost and not effort. A bounded view's read hydrates its
+/// missing keys from the *source relation's live store*, which `handle_push`
+/// advances outside any tick — so a `Delta(0)` over a partly-dehydrated view
+/// reports round `T` while already carrying an un-ticked push, and the next poll
+/// delivers that same push again as round `T+1`, at double weight, with no error
+/// and no row-set difference.
+#[test]
+fn a_view_declaring_both_capacity_and_delta_is_rejected() {
+    let dir = temp_dir("capacity_and_delta_together");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![
+        crate::test_support::col_def("id", gnitz_wire::type_code::U64),
+        crate::test_support::col_def("v", gnitz_wire::type_code::I64),
+    ];
+    let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
+
+    let err = try_register_identity_view_with(&mut engine, tid, "both", &cols, 4 << 20, 4 << 20)
+        .expect_err("the pair must be refused");
+    assert!(err.contains("capacity") && err.contains("delta"), "got: {err}");
+
+    // Either alone is accepted, so the rejection is about the pair.
+    try_register_identity_view_with(&mut engine, tid, "bounded", &cols, 4 << 20, 0).expect("capacity alone");
+    try_register_identity_view_with(&mut engine, tid, "fed", &cols, 0, 4 << 20).expect("delta alone");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A fed view's delta store prepends a `_tick` key column, so a view already at
+/// `MAX_COLUMNS` cannot carry a feed. Refused at registration, on every process:
+/// the post-fork master opens no user store at all, so leaving it to the store
+/// open would be a worker-side fatal abort taken after the client was told the
+/// CREATE succeeded.
+#[test]
+fn a_view_at_the_column_limit_cannot_carry_a_feed() {
+    let dir = temp_dir("fed_view_at_the_column_limit");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols: Vec<ColumnDef> = (0..gnitz_wire::MAX_COLUMNS)
+        .map(|i| crate::test_support::col_def(&format!("c{i}"), gnitz_wire::type_code::U64))
+        .collect();
+    let tid = create_flagged_table(&mut engine, "wide", &cols, &[0], 0);
+
+    let err = try_register_identity_view_with(&mut engine, tid, "fed_wide", &cols, 0, 4 << 20)
+        .expect_err("the stamp is a 66th column");
+    assert!(err.contains("delta feed"), "got: {err}");
+
+    // The same view without a feed is fine, so the rejection is about the stamp.
+    try_register_identity_view_with(&mut engine, tid, "plain_wide", &cols, 0, 0).expect("unfed wide view");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

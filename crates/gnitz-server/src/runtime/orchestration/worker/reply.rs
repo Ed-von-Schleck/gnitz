@@ -51,8 +51,20 @@ impl WorkerProcess {
     }
 
     pub(super) fn send_error(&self, error_msg: &str, request_id: u64) {
+        self.send_fault(&error_msg.into(), request_id);
+    }
+
+    /// One control-only failure frame carrying the fault's **own** status, so a
+    /// refusal a worker mints (`STATUS_DELTA_EXPIRED`) reaches the client as a
+    /// code rather than as a string. [`Self::send_error`] is this with the status
+    /// every ordinary rejection carries.
+    ///
+    /// `target_id` is `0` for both, and that is not a loss: no master-side reader
+    /// of a reply consumes it — the reactor routes by the ring slot, and
+    /// `worker_error` reads the status and the text alone.
+    pub(super) fn send_fault(&self, fault: &gnitz_wire::WireFault, request_id: u64) {
         self.w2m_writer
-            .send_status(0, request_id, STATUS_ERROR, error_msg.as_bytes());
+            .send_status(0, request_id, fault.status, fault.text.as_bytes());
     }
 
     /// Reply schema wire block: the table's cached block for `Table`, a
@@ -119,7 +131,7 @@ impl WorkerProcess {
         request_id: u64,
         client_id: u64,
         seek_pk: u128,
-    ) -> Result<(), String> {
+    ) -> Result<(), gnitz_wire::WireFault> {
         let (prebuilt_rc, server_version, _) = self.reply_schema_block(target_id as i64, schema);
         let msg = Self::whole_batch_msg(
             target_id,
@@ -132,9 +144,7 @@ impl WorkerProcess {
         );
         let sz = msg.size();
         if sz > FRAME_CAP {
-            return Err(format!(
-                "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}"
-            ));
+            return Err(format!("reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}").into());
         }
         self.w2m_writer.send_msg_sized(request_id, &msg, sz);
         Ok(())
@@ -155,7 +165,7 @@ impl WorkerProcess {
         request_id: u64,
         client_id: u64,
         seek_pk: u128,
-    ) -> Result<(), String> {
+    ) -> Result<(), gnitz_wire::WireFault> {
         let Some(batch) = result.filter(|b| b.count > 0) else {
             return self.send_response(target_id, None, schema, request_id, client_id, seek_pk);
         };
@@ -211,7 +221,7 @@ impl WorkerProcess {
         client_id: u64,
         client_version: u16,
         force_fifo: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), gnitz_wire::WireFault> {
         // `include_schema` controls whether the first frame carries a schema
         // block; `server_version` is always embedded in the wire flags so the
         // client can cache/verify.
@@ -482,11 +492,11 @@ impl WorkerProcess {
 
 /// A blob-bearing (STRING/German-string) reply cannot be split across frames, so
 /// one too large for a single frame has no way out.
-fn oversized_string_reply(sz: usize) -> String {
-    format!(
+fn oversized_string_reply(sz: usize) -> gnitz_wire::WireFault {
+    gnitz_wire::WireFault::from(format!(
         "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}; a STRING-column \
          result cannot be chunked — add a tighter predicate or a LIMIT"
-    )
+    ))
 }
 
 /// Stream the sorted OPK leading-key spans lent by `keys` to the master as a

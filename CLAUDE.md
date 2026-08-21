@@ -545,6 +545,31 @@ Every read of a stream-fed view drains pending ticks: freshness is measured
 against the published tick, which a stream push never advances. A cost, not a
 correctness defect — when nothing is pending the drain takes the empty fast path.
 
+## Delta feeds
+
+`CREATE VIEW … WITH (delta = '32 MB')` retains a view's recent deltas, read back
+through `ReadBound::Delta { after_tick }` as ordinary batches — **weights and
+all**, so a row-set comparison of a feed tests nothing. No subscription verb and
+no server-side cursor registry: the engine stays request/response, the cursor
+lives on the client, nothing retained survives a restart, `capacity` is refused
+with it, and `ALTER VIEW … AS` cannot retarget a fed view.
+
+**A delta read is the one read verb that does not drain pending ticks** — the
+exception to the paragraph above. It answers "what has happened", not "what is
+current", so a push the tick loop has not run yet is a round the next poll
+carries.
+
+**A cursor can expire, and every subscriber must handle it.** The budget bounds
+**registered on-disk shard bytes**, exactly as `capacity` does, and the sweep
+drops the oldest rounds whether or not anyone is still reading them; the RAM tier
+beneath it is bounded separately. A cursor at or below what a worker has dropped
+is refused, and so is one whose tag names a different boot or a different
+relation. The recovery is always the same and is not optional: discard the copy
+and bootstrap. A `CREATE VIEW` backfill never enters the delta store, which is
+what makes a foreign cursor unsafe rather than merely stale.
+
+The feed is per-worker; a replicated view's feed lives on worker 0 alone.
+
 ## SAL durability contract
 
 **Rule: an ACK to a client implies fdatasync iff the operation wrote something a

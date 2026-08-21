@@ -114,6 +114,24 @@ impl StoreHandle {
         }
     }
 
+    /// The highest tick round this store's capacity sweep has dropped — `0` for
+    /// every store but a fed view's delta store, and for one that has dropped
+    /// nothing. See [`Table::dropped_through`].
+    pub(crate) fn dropped_through(&self) -> u64 {
+        self.table().map_or(0, Table::dropped_through)
+    }
+
+    /// Dispatched ingest of an owned `Batch` — what the delta stamp takes,
+    /// because the stamped batch arrives `Consolidated` and passing it borrowed
+    /// would have `ingest_borrowed_batch` clone it, blob heap included, for
+    /// nothing.
+    pub(crate) fn ingest_owned_batch(&self, batch: Batch) -> Result<(), StorageError> {
+        match self.table_mut() {
+            Some(t) => t.ingest_owned_batch(batch),
+            None => Ok(()),
+        }
+    }
+
     /// Dispatched durable ingest of a borrowed `Batch` — the single-copy path
     /// for callers that keep reading the batch (see
     /// `Table::ingest_borrowed_batch`).

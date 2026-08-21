@@ -14,6 +14,16 @@ pub enum ClientError {
     TxnConflict {
         fresh_basis: u64,
     },
+    /// A delta cursor that cannot be polled from. It named rounds a worker's
+    /// retention sweep has already dropped (`STATUS_DELTA_EXPIRED`); or it
+    /// belongs to a different boot or a different relation, which `delta_poll`
+    /// detects by comparing the tag the reply carries against the one the cursor
+    /// holds; or it is the zero cursor, which names no copy to continue.
+    ///
+    /// One variant for all three, because the recovery is one action: discard the
+    /// local copy and bootstrap. Splitting it would make every caller catch
+    /// several errors to take one branch.
+    DeltaExpired,
 }
 
 /// Whether a failure is a retryable OCC conflict rather than a hard error. The
@@ -46,6 +56,11 @@ impl fmt::Display for ClientError {
             ClientError::TxnConflict { fresh_basis } => {
                 write!(f, "transaction conflict (fresh basis {fresh_basis}); retry")
             }
+            ClientError::DeltaExpired => write!(
+                f,
+                "delta cursor is not honourable — its rounds were dropped, or it names a \
+                 different boot or relation; re-read the feed from 0"
+            ),
         }
     }
 }

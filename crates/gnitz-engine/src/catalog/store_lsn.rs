@@ -18,6 +18,11 @@ impl CatalogEngine {
             if !matches!(entry.handle, StoreHandle::Borrowed(_)) {
                 entry.handle = StoreHandle::Detached;
             }
+            // A fed view's delta store goes too. The pre-fork master builds one at
+            // `ChildAddr::Delta { rank: 0 }` during boot replay, and worker 0 homes
+            // its own there — so leaving it would have two processes holding a live
+            // `Table` on one directory, which is what this whole function prevents.
+            entry.delta = None;
         }
     }
 
@@ -69,19 +74,26 @@ impl CatalogEngine {
     /// kind)` and install it. `build_relation_store` opens this worker's own
     /// child, so the rebuilt handle is homed wherever the caller now runs. The
     /// caller does whatever on-disk preparation its case needs first.
+    ///
+    /// Both stores are rebuilt, and both are installed: a fed view whose delta
+    /// store did not come back here would still carry its `delta_bytes` in the
+    /// catalog and have no delta store on any worker, on every boot, with no error
+    /// anywhere.
     fn rebuild_relation_store(&mut self, tid: i64, what: &str) -> Result<(), String> {
-        let (dir, schema, kind, capacity_bytes) = {
+        let (dir, schema, kind, budgets) = {
             let e = self
                 .dag
                 .tables
                 .get(&tid)
                 .ok_or_else(|| format!("{what}: relation {tid} not registered"))?;
-            (e.directory.clone(), e.schema, e.kind, e.capacity_bytes)
+            (e.directory.clone(), e.schema, e.kind, e.budgets())
         };
-        let handle = self
-            .build_relation_store(kind, &dir, tid, schema, capacity_bytes)
+        let stores = self
+            .build_relation_store(kind, &dir, tid, schema, budgets)
             .map_err(|e| format!("{what} tid={tid}: {e}"))?;
-        self.dag.tables.get_mut(&tid).expect("entry read above").handle = handle;
+        let entry = self.dag.tables.get_mut(&tid).expect("entry read above");
+        entry.handle = stores.handle;
+        entry.delta = stores.delta;
         Ok(())
     }
 

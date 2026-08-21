@@ -204,16 +204,16 @@ impl ShardIndex {
     /// `guard_keys`, then release the entries they came from via `drop_sources`.
     ///
     /// Each destination guard is written skeleton iff it is already dehydrated or
-    /// `force_skeleton` is set. The two halves answer different questions:
-    /// `force_skeleton` performs a guard's *first* dehydration (a hydrated guard
-    /// derives `false`, so the derived rule alone could never start), while the
-    /// derived rule is the never-re-hydrate rule — a vertical folding hydrated L1
-    /// data into an already-dehydrated L2 guard emits skeleton, so ordinary
-    /// compaction cannot undo the sweep's work, and data landing in a dehydrated
-    /// guard is skeletonized without the sweep running at all. The slice is
-    /// per-guard because a vertical's destination set is every L2 guard its key
-    /// range overlaps while the sweep dehydrates one guard at a time, so a mixed
-    /// destination set is routine.
+    /// the caller passed `force_skeleton`. The two halves
+    /// answer different questions: `Skeleton` performs a guard's *first*
+    /// dehydration (a hydrated guard derives `false`, so the derived rule alone
+    /// could never start), while the derived rule is the never-re-hydrate rule — a
+    /// vertical folding hydrated L1 data into an already-dehydrated L2 guard emits
+    /// skeleton, so ordinary compaction cannot undo the sweep's work, and data
+    /// landing in a dehydrated guard is skeletonized without the sweep running at
+    /// all. The slice is per-guard because a vertical's destination set is every L2
+    /// guard its key range overlaps while the sweep dehydrates one guard at a time,
+    /// so a mixed destination set is routine.
     ///
     /// Nothing is mutated until every output shard has been written *and*
     /// reopened, so a failure leaves the index exactly as it was and the caller
@@ -272,7 +272,24 @@ impl ShardIndex {
         for (gk, entry) in opened {
             self.levels[dest_idx].get_or_create_guard(gk).entries.push(entry);
         }
+        self.unlink_superseded_now();
         Ok(())
+    }
+
+    /// Drain `pending_deletions` right here, for a store that publishes no
+    /// manifest ([`ShardIndex::evict_by_drop`]). A no-op for every other store,
+    /// which defers to the checkpoint barrier's post-publish drain.
+    ///
+    /// Hung off the *store*, not off the eviction step: a delta store runs the
+    /// ordinary compactions — L0 folds, overfull-guard folds, verticals — far more
+    /// often than it drops, so draining only on a drop would unlink the sweep's
+    /// victims and leak everything else. It empties the whole queue rather than
+    /// this compaction's share, which is correct here because every entry in such
+    /// a store's queue is its own.
+    fn unlink_superseded_now(&mut self) {
+        if self.evict_by_drop {
+            self.try_cleanup();
+        }
     }
 
     pub(crate) fn run_compact(&mut self) -> Result<(), StorageError> {
@@ -357,9 +374,9 @@ impl ShardIndex {
 
     /// Fold one guard's files into a single output, in place. A guard whose rows
     /// all cancel is left with no entries rather than an empty shard.
-    /// `force_skeleton` dehydrates the rewritten guard (see [`Self::compact_into`]);
-    /// the destination is the one guard key it names, so the flag reaches exactly
-    /// that guard.
+    /// `force_skeleton` says what the rewritten guard becomes (see
+    /// [`Self::compact_into`]); the destination is the one guard key it names, so
+    /// it reaches exactly that guard.
     fn compact_one_guard(
         &mut self,
         level_idx: usize,
@@ -369,10 +386,37 @@ impl ShardIndex {
         let guard = &self.levels[level_idx].guards[guard_idx];
         let guard_key = guard.guard_key;
         let (inputs, max_lsn) = Self::compaction_inputs(&guard.entries);
-
         self.compact_into(inputs, max_lsn, &[guard_key], level_idx, force_skeleton, |s| {
             s.levels[level_idx].guards[guard_idx].entries.clear();
         })
+    }
+
+    /// Evict a guard by **unlinking** it: no output shard is written at all, so
+    /// the sweep costs unlinks where a bounded view's costs a whole-guard rewrite.
+    /// A delta store's eviction — its rows are the change itself, not a key's
+    /// current value, so there is no summed weight worth keeping a stub of.
+    ///
+    /// The guard is **removed** rather than left with its entries cleared.
+    /// Clearing would leave a permanent entry-less guard behind every drop — one
+    /// per drop, forever, in `find_guard_idx`'s binary-search space — because
+    /// `_tick` leads a delta store's key and never goes backwards, so each spill
+    /// lands above the last and no later `vertical_fold` range ever covers the
+    /// emptied guard again. Removal is what `vertical_fold`'s own `drop_sources`
+    /// already does to its source guard, and keys below the new first guard
+    /// saturate to bucket 0 on both routing paths.
+    ///
+    /// This is also what raises `dropped_through`, as a running **max**, so the
+    /// invariant holds whatever order the victims are chosen in — including a drop
+    /// that lands in the middle of the retained range, which merely refuses more
+    /// cursors than it had to.
+    fn drop_guard(&mut self, level_idx: usize, guard_idx: usize) {
+        let guard = &self.levels[level_idx].guards[guard_idx];
+        let highest_round = guard.highest_leading_u64().unwrap_or(0);
+        let (inputs, _) = Self::compaction_inputs(&guard.entries);
+        self.dropped_through = self.dropped_through.max(highest_round);
+        self.pending_deletions.extend(inputs);
+        self.levels[level_idx].guards.remove(guard_idx);
+        self.unlink_superseded_now();
     }
 
     /// The ordinary vertical trigger: pick the worst (most-filed) L1 guard and
@@ -474,13 +518,15 @@ impl ShardIndex {
         self.all_entries().map(|e| e.shard.file_len()).sum()
     }
 
-    /// Hold this store's registered shard bytes at or under `cap` by dehydrating
-    /// terminal-level guards, oldest-written first.
+    /// Hold this store's registered shard bytes at or under `cap` by evicting
+    /// terminal-level guards, oldest-written first. An eviction leaves skeleton
+    /// rows behind for a capacity-bounded view's output store, and nothing at all
+    /// for a view's delta store ([`ShardIndex::evict_by_drop`]).
     ///
     /// While `resident_bytes() > cap`:
-    /// 1. a hydrated terminal-level guard exists → `compact_one_guard` on the one
-    ///    whose newest entry has the smallest `max_lsn`, with
-    ///    `force_skeleton = true`;
+    /// 1. a victim terminal-level guard exists → evict the one whose newest entry
+    ///    has the smallest `max_lsn`, by `drop_guard` or by `compact_one_guard`
+    ///    as the store says;
     /// 2. else, if this call has not pushed down yet: an L1 guard exists →
     ///    `vertical_fold` on the oldest one; else L0 non-empty → `run_compact`;
     ///    then loop — a `vertical_fold` gives step 1 a victim, a `run_compact`
@@ -494,6 +540,17 @@ impl ShardIndex {
     /// never fires and the terminal level never forms. Preferring L0 here would
     /// leave the sweep with nothing to dehydrate forever, because a spill has
     /// just refilled L0 at every trigger.
+    ///
+    /// Under `evict_by_drop` nothing is ever dehydrated, so step 1's
+    /// `!g.dehydrated()` filter is vacuous and its victim is simply the
+    /// oldest-written terminal guard, and step 3 is unreachable. Termination
+    /// survives: step 1 strictly decreases the terminal guard *count* where it
+    /// decreased the hydrated terminal guard count. There is no skeleton floor, so
+    /// the loop's exit is `resident_bytes()` reaching zero — reachable, because a
+    /// zero budget is refused at `CREATE VIEW`, so `resident_bytes() > cap` cannot
+    /// hold at zero. A budget the store can meet, it meets; a budget under one
+    /// guard's worth empties the store instead of stopping above it, which costs
+    /// every subscriber a re-read at 0 and costs correctness nothing.
     ///
     /// Only the terminal level can hold skeletons and the compaction trigger is a
     /// file count that never fires on byte volume, so pushing data down is the
@@ -528,7 +585,10 @@ impl ShardIndex {
                 .min_by_key(|&(_, lsn)| lsn)
                 .map(|(gi, _)| gi);
             if let Some(gi) = victim {
-                self.compact_one_guard(TERMINAL_LEVEL_IDX, gi, true)?;
+                match self.evict_by_drop {
+                    true => self.drop_guard(TERMINAL_LEVEL_IDX, gi),
+                    false => self.compact_one_guard(TERMINAL_LEVEL_IDX, gi, true)?,
+                }
                 continue;
             }
             // Step 2: nothing left to dehydrate where it sits — push one level's

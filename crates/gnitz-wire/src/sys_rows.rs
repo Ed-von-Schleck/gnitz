@@ -131,6 +131,8 @@ pub struct ViewTabRow<'a> {
     pub pk_col_idx: u64,
     /// `WITH (capacity = …)` in bytes; `0` is unbounded.
     pub capacity_bytes: u64,
+    /// `WITH (delta = …)` in bytes; `0` is no delta feed.
+    pub delta_bytes: u64,
 }
 
 pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i64) {
@@ -140,6 +142,7 @@ pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i6
     sink.put_string(r.sql_definition);
     sink.put_u64(r.pk_col_idx);
     sink.put_u64(r.capacity_bytes);
+    sink.put_u64(r.delta_bytes);
     sink.end_row();
 }
 
@@ -379,6 +382,7 @@ mod tests {
                 sql_definition: "SELECT 1",
                 pk_col_idx: 0,
                 capacity_bytes: 0,
+                delta_bytes: 0,
             },
             1,
         );
@@ -499,6 +503,7 @@ mod tests {
                 sql_definition: "SELECT 1",
                 pk_col_idx: 6,
                 capacity_bytes: 4096,
+                delta_bytes: 1 << 20,
             },
             1,
         );

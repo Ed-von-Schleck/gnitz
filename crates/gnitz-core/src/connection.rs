@@ -9,8 +9,8 @@ use crate::protocol::{
     wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version, ClientTransport,
     Message, PkTuple, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
     FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_PUSH,
-    FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK,
-    STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NO_INDEX,
+    STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use gnitz_wire::RelDescriptorBlob;
 use lru::LruCache;
@@ -30,6 +30,12 @@ pub type ScanReply = (Option<Arc<Schema>>, Option<ZSetBatch>, u64);
 
 /// The single-relation read result.
 pub type ScanResult = Result<ScanReply, ClientError>;
+
+/// What [`Session::drain_reply_train`] hands its callers before either of them
+/// has decided what the terminal watermark *means*: the reassembled schema and
+/// rows, plus the whole `u128` word. Private, because the narrowing to a public
+/// [`ScanReply`] is exactly what each caller owes.
+type ReplyTrain = (Option<Arc<Schema>>, Option<ZSetBatch>, u128);
 
 /// The N per-relation results of a `scan_multi`, in request order. Every
 /// relation was snapshotted at the same server-side SAL cut, so an atomic
@@ -54,6 +60,13 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
     if msg.status == STATUS_NO_INDEX {
         return Err(ClientError::ServerError("no index on requested column".into()));
     }
+    if msg.status == STATUS_DELTA_EXPIRED {
+        // The cursor named rounds the refusing worker's capacity sweep dropped.
+        // Structured, not a string, so the subscriber can react by re-reading at
+        // `after_tick = 0` — the read it made on its first day — rather than by
+        // matching on text.
+        return Err(ClientError::DeltaExpired);
+    }
     if msg.status == STATUS_TXN_CONFLICT {
         // Control-only frame: the fresh basis rides in `seek_pk`. Left as a
         // structured error so the SQL layer can retry (autocommit) or surface
@@ -72,6 +85,17 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "unknown server error".into());
         return Err(ClientError::ServerError(text));
+    }
+    if msg.status != STATUS_OK {
+        // A status this build does not know is a failure, not a success: falling
+        // through would hand the caller an empty reply and no error, so a read
+        // refused for a reason we cannot name would read as "no rows". The
+        // worker→master leg carries whatever status a fault names, so the set is
+        // not fixed by this crate.
+        return Err(ClientError::ServerError(format!(
+            "server returned unrecognized status {}",
+            msg.status
+        )));
     }
     Ok(msg)
 }
@@ -407,8 +431,12 @@ impl Session {
     /// concatenating data batches. Status is checked on **every** frame — a
     /// `STATUS_ERROR` fault frame has flags 0, structurally identical to the
     /// master's terminal frame, so a flags-only check would silently drop it.
-    /// Returns `(schema, data, terminal seek_pk)` — the scan paths read the
-    /// terminal frame's `seek_pk` as the last-committed LSN.
+    /// Returns `(schema, data, terminal seek_pk)` — the **whole** `u128` word.
+    /// A plain scan's is the last-committed LSN; a delta read's is the pair
+    /// `(cursor tag, T)`, tag in the high half. The narrowing to `u64` lives at
+    /// each caller: [`Self::recv_scan`] is where "this is the last-committed LSN"
+    /// is the thing being said, and narrowing here instead would hand a delta
+    /// reader a zeroed tag.
     ///
     /// The concatenated batch is the Z-set **sum** of the replies, unconsolidated:
     /// `extend_from_owned` never folds two entries sharing a `(PK, payload)`, and a
@@ -419,10 +447,10 @@ impl Session {
     fn drain_reply_train(
         &mut self,
         mut recv_one: impl FnMut(&mut Self) -> Result<Message, ClientError>,
-    ) -> Result<ScanReply, ClientError> {
+    ) -> Result<ReplyTrain, ClientError> {
         let mut schema: Option<Arc<Schema>> = None;
         let mut data: Option<ZSetBatch> = None;
-        let lsn: u64 = loop {
+        let watermark: u128 = loop {
             let msg = check_response(recv_one(self)?)?;
             let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
             schema = schema.or(msg.schema);
@@ -433,18 +461,18 @@ impl Session {
                 }
             }
             if !is_continuation {
-                break msg.seek_pk as u64;
+                break msg.seek_pk;
             }
         };
-        Ok((schema, data, lsn))
+        Ok((schema, data, watermark))
     }
 
     /// Receive a streaming scan/seek response: reassemble continuation frames,
     /// absorb any schema block into the cache, and recover the schema from the
     /// cache if the response was schema-less. Same body as the sync `scan`.
     pub fn recv_scan(&mut self, target_id: u64) -> ScanResult {
-        let (schema, data, lsn) = self.drain_reply_train(|s| s.recv_cached(target_id))?;
-        Ok((self.schema_or_cached(target_id, schema), data, lsn))
+        let (schema, data, watermark) = self.drain_reply_train(|s| s.recv_cached(target_id))?;
+        Ok((self.schema_or_cached(target_id, schema), data, watermark as u64))
     }
 
     /// Ship a parameterized bounded read (`ReadSpec`) and reassemble its result.
@@ -456,12 +484,14 @@ impl Session {
     /// advances no commit watermark and — critically — never touches the schema
     /// cache: a per-query projected schema keyed under the table id would corrupt
     /// a later plain scan of the same relation.
+    /// The terminal frame's whole watermark word comes back with the rows: a
+    /// delta read needs both halves of it, and every other caller drops it.
     pub fn scan_spec(
         &mut self,
         target_id: u64,
         spec: &[u8],
         reply_schema: &Schema,
-    ) -> Result<Option<ZSetBatch>, ClientError> {
+    ) -> Result<(Option<ZSetBatch>, u128), ClientError> {
         let block = encode_schema_block(reply_schema, target_id as u32);
         let extra = gnitz_wire::pack_scan_spec_extra(spec, &block);
         send_control(
@@ -473,14 +503,14 @@ impl Session {
             0,
             &extra,
         )?;
-        let (_, data, _) = self.drain_reply_train(|s| {
+        let (_, data, watermark) = self.drain_reply_train(|s| {
             Ok(recv_message(
                 &mut s.transport,
                 Some((reply_schema, 0)),
                 s.max_payload_len,
             )?)
         })?;
-        Ok(data)
+        Ok((data, watermark))
     }
 
     /// Receive a single push ACK and return its ingest LSN, absorbing any schema

@@ -834,8 +834,9 @@ mod tests {
                 .u64_val(3)
                 .str_val("v")
                 .str_val("")
-                .u64_val(0)
-                .u64_val(0);
+                .u64_val(0) // pk_col_idx
+                .u64_val(0) // capacity_bytes
+                .u64_val(0); // delta_bytes
             b
         };
         verify(

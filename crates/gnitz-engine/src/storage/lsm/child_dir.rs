@@ -23,6 +23,20 @@ pub(crate) enum ChildAddr<'a> {
     Worker { rank: u32, of: u32 },
     /// `scratch_{child}_w{k}` — worker `k`'s operator-state table for a view.
     Scratch { child: &'a str, rank: u32 },
+    /// `delta_w{k}` — worker `k`'s delta store of a fed view: the recent deltas
+    /// `WITH (delta = …)` retains, stamped with the tick round that produced
+    /// them. Owned at `rank < num_workers`, the rule `Scratch` uses, because it
+    /// is one store per launched worker and nothing repartitions it.
+    ///
+    /// A grammar of its own rather than a `Scratch` child, even though that would
+    /// give the reclaim sweep and the ownership rule for free:
+    /// `reset_view_output_for_rebuild` blanket-removes **every** `Scratch` child
+    /// at this rank, and does so *after* the store handles have been reopened —
+    /// so the delta store's directory would be unlinked out from under a live
+    /// `Table`. It also keeps a catalog-owned store out of a grammar the compiler
+    /// owns (`child_scratch_dir` and its `ScratchGuard` create and clean up
+    /// `Scratch` children).
+    Delta { rank: u32 },
     /// `idx_{id}` — a secondary index's own directory. Not a store of the owner
     /// relation: never repartitioned, and owned at every worker count (each
     /// worker rebuilds its slice inside it). Named here so one parser covers the
@@ -40,11 +54,21 @@ impl<'a> ChildAddr<'a> {
         }
     }
 
+    /// This worker's delta store of a fed view. Beside [`Self::this_worker`] so
+    /// "which rank am I" is answered inside the grammar module for every child
+    /// kind, rather than once here and once at each caller.
+    pub(crate) fn delta_for_this_worker() -> Self {
+        ChildAddr::Delta {
+            rank: crate::foundation::worker_ctx::worker_rank(),
+        }
+    }
+
     /// The directory name, relative to the relation's directory.
     pub(crate) fn name(&self) -> String {
         match *self {
             ChildAddr::Worker { rank, of } => format!("w{rank}of{of}"),
             ChildAddr::Scratch { child, rank } => format!("scratch_{child}_w{rank}"),
+            ChildAddr::Delta { rank } => format!("delta_w{rank}"),
             ChildAddr::Index { id } => format!("idx_{id}"),
         }
     }
@@ -75,6 +99,9 @@ impl<'a> ChildAddr<'a> {
         if let Some(id) = name.strip_prefix("idx_") {
             return Some(ChildAddr::Index { id: parse_id(id)? });
         }
+        if let Some(rank) = name.strip_prefix("delta_w") {
+            return Some(ChildAddr::Delta { rank: parse_id(rank)? });
+        }
         let (child, rank) = name.strip_prefix("scratch_")?.rsplit_once("_w")?;
         Some(ChildAddr::Scratch {
             child,
@@ -91,7 +118,7 @@ impl<'a> ChildAddr<'a> {
     pub(crate) fn is_owned_by(&self, num_workers: u32) -> bool {
         match *self {
             ChildAddr::Worker { rank, of } => rank < num_workers && of == num_workers,
-            ChildAddr::Scratch { rank, .. } => rank < num_workers,
+            ChildAddr::Scratch { rank, .. } | ChildAddr::Delta { rank } => rank < num_workers,
             ChildAddr::Index { .. } => true,
         }
     }
@@ -220,6 +247,8 @@ mod tests {
                 rank: 2,
             },
             ChildAddr::Index { id: 7 },
+            ChildAddr::Delta { rank: 0 },
+            ChildAddr::Delta { rank: 5 },
         ] {
             let name = addr.name();
             assert_eq!(ChildAddr::parse(&name), Some(addr), "round-trip of {name}");
@@ -241,6 +270,9 @@ mod tests {
             "scratch_x_wq",
             "idx_",
             "idx_x",
+            "delta_w",
+            "delta_wx",
+            "delta_0",
             "manifest.bin",
         ] {
             assert_eq!(ChildAddr::parse(name), None, "{name} is not a child dir");
@@ -259,6 +291,10 @@ mod tests {
         let scratch = |rank| ChildAddr::Scratch { child: "agg", rank };
         assert!(scratch(1).is_owned_by(2));
         assert!(!scratch(7).is_owned_by(2));
+        // A delta child is judged by rank alone too — which is what makes a
+        // narrowed worker count reclaim the ranks it dropped.
+        assert!(ChildAddr::Delta { rank: 1 }.is_owned_by(2));
+        assert!(!ChildAddr::Delta { rank: 2 }.is_owned_by(2));
     }
 
     #[test]

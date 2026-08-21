@@ -12,8 +12,8 @@
 use super::*;
 use crate::runtime::sal::MAX_WORKERS;
 
-pub(super) fn scan_decode_err(w: usize, e: &'static str) -> String {
-    format!("scan: worker {w}: decode error: {e}")
+pub(super) fn scan_decode_err(w: usize, e: &'static str) -> WorkerFault {
+    format!("scan: worker {w}: decode error: {e}").into()
 }
 
 /// Parse one frame header of worker `w`'s train. Returns the control block plus
@@ -34,7 +34,11 @@ pub(super) fn scan_decode_err(w: usize, e: &'static str) -> String {
 /// "no continuation flag" must read as terminal. Every multi-frame producer
 /// (worker scan chunks, chunked seek/gather replies, unique pre-flight frames)
 /// sets `FLAG_CONTINUATION` on every frame and `FLAG_SCAN_LAST` on the last.
-pub(super) fn parse_train_header(slot: &W2mSlot, w: usize, what: &str) -> Result<(wire::DecodedControl, bool), String> {
+pub(super) fn parse_train_header(
+    slot: &W2mSlot,
+    w: usize,
+    what: &str,
+) -> Result<(wire::DecodedControl, bool), WorkerFault> {
     let ctrl = peek_control_block_ipc(slot.bytes()).map_err(|e| scan_decode_err(w, e))?;
     if let Some(e) = super::worker_error(w, what, &ctrl) {
         return Err(e);
@@ -51,12 +55,10 @@ pub(super) fn parse_train_header(slot: &W2mSlot, w: usize, what: &str) -> Result
 /// lease drop. Callers only route requests whose replies fit one frame (e.g. a
 /// unique point seek); a train means that invariant broke (e.g. a shrunken
 /// GNITZ_REPLY_FRAME_BUDGET) — fail loudly instead.
-pub(super) fn expect_single_frame(slot: &W2mSlot, w: usize, what: &str) -> Result<(), String> {
+pub(super) fn expect_single_frame(slot: &W2mSlot, w: usize, what: &str) -> Result<(), WorkerFault> {
     let (ctrl, _) = parse_train_header(slot, w, what)?;
     if ctrl.flags & FLAG_CONTINUATION != 0 {
-        return Err(format!(
-            "worker {w}: {what}: unexpected chunked reply on a single-frame path"
-        ));
+        return Err(format!("worker {w}: {what}: unexpected chunked reply on a single-frame path").into());
     }
     Ok(())
 }
@@ -87,8 +89,8 @@ pub(super) async fn drain_index_scan(
     reactor: &crate::runtime::reactor::Reactor,
     what: &str,
     expected: &SchemaDescriptor,
-    mut on_batch: impl FnMut(&gnitz_engine::storage::MemBatch<'_>, usize) -> Result<(), String>,
-) -> Result<(), String> {
+    mut on_batch: impl FnMut(&gnitz_engine::storage::MemBatch<'_>, usize) -> Result<(), WorkerFault>,
+) -> Result<(), WorkerFault> {
     for (w, mut slot) in slots.into_iter().enumerate() {
         let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
         loop {
@@ -105,7 +107,7 @@ pub(super) async fn drain_index_scan(
             if saved_schema.is_none() {
                 if let Some(ref s) = zc.schema {
                     gnitz_engine::schema::validate_schema_match(s, expected)
-                        .map_err(|e| format!("worker {w}: {what}: {e}"))?;
+                        .map_err(|e| WorkerFault::from(format!("worker {w}: {what}: {e}")))?;
                     saved_schema = Some((*s, server_version));
                 }
             }
@@ -149,7 +151,7 @@ struct TrainHead {
 /// Parse and classify one scan-train frame. The single definition of which
 /// frames reach the client, shared by the fan-out's coalescing decision and by
 /// the per-worker drain.
-fn classify_head(slot: &W2mSlot, worker: usize) -> Result<TrainHead, String> {
+fn classify_head(slot: &W2mSlot, worker: usize) -> Result<TrainHead, WorkerFault> {
     let (ctrl, has_more) = parse_train_header(slot, worker, "scan")?;
     Ok(TrainHead {
         observable: ctrl.flags & (FLAG_HAS_DATA | FLAG_HAS_SCHEMA) != 0,
@@ -174,7 +176,7 @@ pub(super) async fn forward_scan_slots(
     slots: Vec<W2mSlot>,
     req_ids: &[u64],
     unicast: Fanout,
-) -> Result<bool, String> {
+) -> Result<bool, WorkerFault> {
     let worker_of = |i: usize| unicast.worker_of(i);
     // Classify every head before sending anything: whether they can leave as one
     // buffer is not known until every train has been seen. Both arms then run
@@ -245,7 +247,7 @@ async fn drain_scan_train(
     mut head: TrainHead,
     req_id: u32,
     worker: usize,
-) -> Result<bool, String> {
+) -> Result<bool, WorkerFault> {
     loop {
         if !head.observable {
             drop(slot);
@@ -458,8 +460,8 @@ mod tests {
             |_, _| Ok(()),
         ));
         let err = result.expect_err("worker fault must surface as Err");
-        assert!(err.contains("worker 0"), "error names the faulted worker: {err}");
-        assert!(err.contains("boom"), "error carries the worker message: {err}");
+        assert!(err.text.contains("worker 0"), "error names the faulted worker: {err}");
+        assert!(err.text.contains("boom"), "error carries the worker message: {err}");
 
         // Early return: worker 1's continuation must still be parked.
         assert_frame_still_parked(&fx.reactor, w1_req);
@@ -569,8 +571,8 @@ mod tests {
             },
         ));
         let err = result.expect_err("schema mismatch must surface as Err");
-        assert!(err.contains("Schema mismatch"), "error names the mismatch: {err}");
-        assert!(err.contains("worker 0"), "error names the worker: {err}");
+        assert!(err.text.contains("Schema mismatch"), "error names the mismatch: {err}");
+        assert!(err.text.contains("worker 0"), "error names the worker: {err}");
         assert_eq!(sink_calls, 0, "no row may reach the sink under a wrong schema");
 
         fx.teardown(lease);
@@ -616,10 +618,10 @@ mod tests {
             &fx.reactor,
             "seek_by_index",
             &schema,
-            |_, _| Err("seek_by_index: result exceeds the reply cap".to_string()),
+            |_, _| Err("seek_by_index: result exceeds the reply cap".into()),
         ));
         let err = result.expect_err("sink error must abort the drain");
-        assert!(err.contains("reply cap"), "sink error surfaces verbatim: {err}");
+        assert!(err.text.contains("reply cap"), "sink error surfaces verbatim: {err}");
 
         // The terminal continuation was never consumed.
         assert_frame_still_parked(&fx.reactor, w0_req);

@@ -2577,12 +2577,15 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     engine.dag.register_table(
         tid,
         crate::query::TableEntry::new(
-            StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(base))),
+            crate::query::RelationStores {
+                handle: StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(base))),
+                delta: None,
+            },
             schema,
             RelationKind::BaseTable,
             0,
             dir.clone(),
-            None,
+            crate::query::ViewBudgets::default(),
         ),
     );
     engine

@@ -102,6 +102,68 @@ pub struct MasterDispatcher {
     /// field stays ungated because two tests pin it, and `#[cfg]`-splitting it
     /// plus its writes would cost more than the `Cell<u64>` it saves.
     last_ephemeral_gen: Cell<u64>,
+
+    /// The last tick round allocated. **Strictly increasing**, one per emitted
+    /// tick group, and carried to the workers in that group's header `lsn` field,
+    /// which is otherwise `0` for every command verb.
+    ///
+    /// A round is **per source, not per tick**: `run_tick` writes one group per
+    /// pending tid, so a tick that drains K tids allocates K consecutive rounds
+    /// and a view reached by two of them takes two delta rows rather than one.
+    /// That is the behaviour to want — the rounds stay strictly increasing,
+    /// `(n, T]` still names a contiguous span, and a view reached twice would
+    /// otherwise have two deltas folded onto one `_tick` key, hiding the second
+    /// source behind the first for no gain.
+    ///
+    /// It cannot be `lsn_alloc.published()`, which `run_tick` snapshots: that
+    /// value is not unique per tick. The committer fires the auto-tick in Phase C,
+    /// *before* Phase D publishes the zone LSN, so a round triggered by commit N
+    /// snapshots commit N−1's; and a stream-only batch opens no zone and publishes
+    /// nothing at all, so every tick in a pure-stream workload — the headline use
+    /// case — would carry an identical value.
+    ///
+    /// Initialised to **1**, so every emitted round is ≥ 2. Round 1 is the boot
+    /// itself: never emitted, stamping nothing. It exists so that the `T` in every
+    /// reply is at least 1, which makes `0` the one `u64` that is not a round —
+    /// what lets `after_tick = 0` mean "I hold nothing" without colliding with a
+    /// real cursor. Without it a subscriber to a view that has not ticked since
+    /// boot would be handed `T = 0`, store it, ask again with `0`, and be sent the
+    /// whole view on every poll forever.
+    ///
+    /// It never has to survive a restart: the delta store does not either, and a
+    /// restart mints a new `boot_nonce`, which every cursor's tag is checked
+    /// against.
+    tick_round: Cell<u64>,
+
+    /// Feed-enabled view id → the last round that reached it. A poll at or beyond
+    /// that value has no rows to return, because no round in `(after_tick, T]`
+    /// reached the view at all, so the master answers it locally: one recv, one
+    /// send, zero SAL bytes, zero wakeups.
+    ///
+    /// Written where the round is allocated, in `write_tick_group`, and for the
+    /// same reason: a map maintained in `run_tick` would miss every round the
+    /// three `drain_tick_blocking` callers emit, and a view reached by one of those
+    /// would then be gated as unchanged — a silent hole.
+    ///
+    /// An **over-approximation** that errs in the one safe direction: it is raised
+    /// for every view in the emitted tid's forward closure, but a view whose
+    /// partition saw no change produces no output and writes no delta row, so this
+    /// can name a round that reached the view and left nothing. That poll falls
+    /// through to the store and comes back empty — work, not a wrong answer. The
+    /// direction that would be a wrong answer is the other one, and the closure
+    /// cannot under-report: it is computed from the DAG edges the tick walk itself
+    /// follows.
+    ///
+    /// A view absent from the map has never been reached and reads as round 1, so
+    /// a bootstrap (`after_tick = 0`, below 1) is never gated. No boot seeding is
+    /// needed: `MasterDispatcher::new` runs after every relation is registered and
+    /// before the recovery tick sweep, so that sweep's own rounds populate it
+    /// through this same function.
+    last_delta_round: RefCell<FxHashMap<i64, u64>>,
+
+    /// A `u64` taken from the OS at boot, mixed into every delta reply's cursor
+    /// tag. Not from a seeded generator: two back-to-back boots must not collide.
+    boot_nonce: u64,
 }
 
 mod dispatch;
@@ -120,23 +182,44 @@ pub(crate) use unique_filter::UniqueFilter;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Render worker `w`'s reply as an error, or `None` when it succeeded. The one
+/// A worker's failure reply, carried to the client as the pair the frame gave.
+///
+/// The worker→master leg has always been able to carry an arbitrary status — it
+/// arrives as `DecodedControl.status` — but [`worker_error`] formatted the text
+/// and dropped the code, and the scan finisher then sent `STATUS_ERROR` for
+/// everything. Every typed status in the tree used to be minted on the master;
+/// this is what lets a worker mint one (`STATUS_DELTA_EXPIRED`) and have the
+/// client react to a code rather than to a string.
+///
+/// The type is `gnitz-wire`'s, not this module's: the engine's `scan_spec_family`
+/// mints exactly this pair, the worker splits it onto the wire, and
+/// [`worker_error`] reassembles it here, so all three name one definition.
+pub(crate) use gnitz_wire::WireFault as WorkerFault;
+
+/// Render worker `w`'s reply as a fault, or `None` when it succeeded. The one
 /// place the fault contract of a worker reply is read: `status != 0` means the
-/// worker failed and `error_msg` holds its (UTF-8) text.
-pub(crate) fn worker_error(w: usize, op: &str, ctrl: &wire::DecodedControl) -> Option<String> {
+/// worker failed, `error_msg` holds its (UTF-8) text, and both halves travel on.
+pub(crate) fn worker_error(w: usize, op: &str, ctrl: &wire::DecodedControl) -> Option<WorkerFault> {
     (ctrl.status != 0).then(|| {
         let msg = String::from_utf8_lossy(&ctrl.error_msg);
-        format!("worker {w}: {op}: {msg}")
+        WorkerFault {
+            status: ctrl.status,
+            text: format!("worker {w}: {op}: {msg}"),
+        }
     })
 }
 
 /// The first worker error across a fan-out's replies, in worker-index order.
 /// Slots are `Some` once `join_into`'s future resolves; a `None` is a bug in
 /// the join driver.
+///
+/// Flattened to its text: these are the ACK-shaped fan-outs (push, tick, flush,
+/// relay), whose callers report a failure and have no typed status to forward.
+/// Only the scan-forward stack carries the whole [`WorkerFault`].
 pub(crate) fn first_worker_error_opt(op: &str, decoded: &[Option<DecodedWire>]) -> Option<String> {
     decoded.iter().enumerate().find_map(|(w, d)| {
         let d = d.as_ref().expect("join_into left a None slot — logic bug");
-        worker_error(w, op, &d.control)
+        worker_error(w, op, &d.control).map(|f| f.text)
     })
 }
 
@@ -330,7 +413,7 @@ pub(crate) async fn dispatch_scan_multi_fanout(
         let _guard = sal_excl.lock().await;
         for (&(tid, unicast, eff_ver), d) in relations.iter().zip(&dispatches) {
             let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, eff_ver) | gnitz_wire::FLAG_SCAN_FIFO_REPLY;
-            disp.write_scan_group(tid, 0, wire_flags, &d.req_ids[..nw], unicast, client_id, &[])?;
+            disp.write_scan_group(tid, 0, wire_flags, &d.req_ids[..nw], unicast, client_id, &[], 0)?;
         }
         disp.signal_all();
     }

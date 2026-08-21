@@ -312,6 +312,23 @@ impl Table {
         self.shard_index.set_capacity(capacity_bytes);
     }
 
+    /// Configure this store as a fed view's **delta store**: bounded by `budget`
+    /// registered shard bytes, evicting by dropping its victim outright, and
+    /// unlinking every compaction's superseded inputs at once because it
+    /// publishes no manifest. Called once, by `build_relation_store`, exactly as
+    /// [`Self::set_capacity`] is.
+    pub fn set_delta_budget(&mut self, budget: u64) {
+        self.shard_index.set_delta_budget(budget);
+    }
+
+    /// The highest tick round this delta store's capacity sweep has dropped. A
+    /// read at `after_tick > dropped_through` asks only for rounds above it, and
+    /// no such round was ever dropped; a read at or below it is refused with
+    /// `STATUS_DELTA_EXPIRED`. `0` for every store that has dropped nothing.
+    pub fn dropped_through(&self) -> u64 {
+        self.shard_index.dropped_through()
+    }
+
     /// Whether a read of this store can meet a skeleton row it has to hydrate.
     /// See [`ShardIndex::has_skeleton_shard`].
     pub fn has_skeleton_rows(&self) -> bool {
@@ -648,10 +665,12 @@ impl Table {
     /// references. Compaction only swaps the in-memory index and appends the
     /// superseded inputs to `pending_deletions`.
     ///
-    /// The superseded inputs are not unlinked here: every store publishes a
-    /// manifest, and unlinking mid-epoch would strand the last-published one
-    /// over deleted files. `flush_barrier` drains them once it has republished
-    /// over the compacted index.
+    /// The superseded inputs are not unlinked here for a store that publishes a
+    /// manifest: unlinking mid-epoch would strand the last-published one over
+    /// deleted files, so `flush_barrier` drains them once it has republished over
+    /// the compacted index. A fed view's delta store publishes none and is in
+    /// neither checkpoint round, so it unlinks at the end of each compaction
+    /// instead — see `ShardIndex::unlink_superseded`.
     pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         if !self.shard_index.should_compact() {
             return Ok(());

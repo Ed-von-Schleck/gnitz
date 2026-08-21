@@ -160,8 +160,11 @@ impl ViewChain {
             output_columns: cols,
             pk_cols: pk,
             // A hidden segment is never bounded — it is the unbounded
-            // materialization a bounded view may not sit on.
+            // materialization a bounded view may not sit on — and never fed: the
+            // feed belongs to the final segment, the one the client names and the
+            // only one whose store it can read.
             capacity_bytes: None,
+            delta_bytes: None,
         });
         Ok(())
     }

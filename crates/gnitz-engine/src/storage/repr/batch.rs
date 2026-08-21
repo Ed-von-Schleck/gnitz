@@ -1327,6 +1327,79 @@ impl Batch {
         out
     }
 
+    /// The three regions a widen and a stamp copy identically: the blob heap, the
+    /// weights, and every payload column of `in_schema`. Each of the two rewrites
+    /// exactly one more region — the widen the NULL words, the stamp the PK — so
+    /// what they share is one call rather than forty duplicated lines that would
+    /// have to be kept in step through every change to the region layout.
+    ///
+    /// `self.count` must already be the source's row count and the two schemas
+    /// must agree on payload indices; the caller states the source schema because
+    /// a `Batch` carries only its region strides.
+    fn take_blob_weights_and_payload(&mut self, src: &Batch, in_schema: &SchemaDescriptor) {
+        // Share the input heap so long (> 12 byte) STRING/BLOB values, whose
+        // 16-byte structs are copied verbatim below, still resolve. Sharing an
+        // empty blob is a no-op, so no emptiness guard.
+        if in_schema.has_german_string() {
+            self.share_blob_from(src);
+        }
+        self.weight_data_mut().copy_from_slice(src.weight_data());
+        let n = src.count;
+        for (pi, col) in in_schema.payload_columns() {
+            let stride = col.size() as usize;
+            self.col_data_mut(pi).copy_from_slice(&src.col_data(pi)[..n * stride]);
+        }
+    }
+
+    /// Copy every row into `out_schema`, whose key is `prefix` (eight big-endian
+    /// bytes) followed by this batch's own key and whose payload space is
+    /// unchanged — the shape [`crate::schema::make_delta_schema`] derives.
+    ///
+    /// Prepending one constant to every key preserves both sortedness and
+    /// distinctness, so the layout claim carries across: a batch that arrives
+    /// `Consolidated` stays `Consolidated` and the stamp never forces a re-sort
+    /// the caller would not otherwise have paid for.
+    ///
+    /// The sibling of [`Self::widened_with_null_tail`] rather than a call into it:
+    /// that one asserts the two schemas share a PK stride, and this changes it by
+    /// eight bytes. The NULL words copy whole here because the payload space is
+    /// identical — the delta schema is a reordering of the view's columns, not a
+    /// shift of them.
+    pub fn stamped_with_pk_prefix(
+        &self,
+        in_schema: &SchemaDescriptor,
+        out_schema: &SchemaDescriptor,
+        prefix: u64,
+    ) -> Self {
+        let in_stride = in_schema.pk_stride() as usize;
+        let out_stride = out_schema.pk_stride() as usize;
+        debug_assert_eq!(out_stride, in_stride + 8);
+        debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
+        let n = self.count;
+        if n == 0 {
+            return Self::empty_with_schema(out_schema);
+        }
+
+        let mut output = Self::with_capacity(*out_schema, n);
+        output.count = n;
+        output.take_blob_weights_and_payload(self, in_schema);
+        output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
+
+        let stamp = prefix.to_be_bytes();
+        let src_pk = self.pk_data();
+        for (dst, src) in output
+            .pk_data_mut()
+            .chunks_exact_mut(out_stride)
+            .zip(src_pk.chunks_exact(in_stride))
+        {
+            dst[..8].copy_from_slice(&stamp);
+            dst[8..].copy_from_slice(src);
+        }
+
+        output.inherit_layout(self);
+        output
+    }
+
     /// Copy every row into `out_schema`, which must extend this batch's schema
     /// with extra trailing payload columns, filling those columns with NULL.
     /// The PK region, weights and existing payload columns carry over verbatim,
@@ -1347,22 +1420,8 @@ impl Batch {
 
         let mut output = Self::with_capacity(*out_schema, n);
         output.count = n;
-
-        // Share the input heap so long (> 12 byte) STRING/BLOB values, whose
-        // 16-byte structs are copied verbatim below, still resolve. Sharing an
-        // empty blob is a no-op, so no emptiness guard.
-        if in_schema.has_german_string() {
-            output.share_blob_from(self);
-        }
-
+        output.take_blob_weights_and_payload(self, in_schema);
         output.pk_data_mut().copy_from_slice(self.pk_data());
-        output.weight_data_mut().copy_from_slice(self.weight_data());
-        for (pi, col) in in_schema.payload_columns() {
-            let stride = col.size() as usize;
-            output
-                .col_data_mut(pi)
-                .copy_from_slice(&self.col_data(pi)[..n * stride]);
-        }
 
         // A NULL cell is zero — the invariant `DirectWriter::write_row` and
         // `BatchBuilder::put_null` uphold actively. Zeroing just the appended

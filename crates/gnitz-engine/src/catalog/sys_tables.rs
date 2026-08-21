@@ -15,7 +15,7 @@ use gnitz_wire::{
     COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_TYPE_CODE, IDXTAB_COL_IS_UNIQUE,
     IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
     TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY,
-    VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
+    VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
 };
 
 // ---------------------------------------------------------------------------
@@ -189,15 +189,17 @@ pub(super) fn read_table_tab_row(batch: &Batch, i: usize) -> (i64, String, PkCol
     )
 }
 
-/// Decode VIEW_TAB row `i`: `(schema_id, name, pk_list, capacity_bytes)`. The
-/// pk_list is the view's persisted leading-k column list; a bare `0` decodes back
-/// to `[0]`. `capacity_bytes` is `0` for an unbounded view.
-pub(super) fn read_view_tab_row(batch: &Batch, i: usize) -> (i64, String, PkColList, u64) {
+/// Decode VIEW_TAB row `i`: `(schema_id, name, pk_list, capacity_bytes,
+/// delta_bytes)`. The pk_list is the view's persisted leading-k column list; a
+/// bare `0` decodes back to `[0]`. `capacity_bytes` is `0` for an unbounded view
+/// and `delta_bytes` `0` for one with no delta feed.
+pub(super) fn read_view_tab_row(batch: &Batch, i: usize) -> (i64, String, PkColList, u64, u64) {
     (
         batch.read_payload_u64(i, VIEWTAB_PAY_SCHEMA_ID) as i64,
         batch.read_payload_string(i, VIEWTAB_PAY_NAME),
         unpack_pk_cols(batch.read_payload_u64(i, VIEWTAB_PAY_PK_COL_IDX)),
         batch.read_payload_u64(i, VIEWTAB_PAY_CAPACITY),
+        batch.read_payload_u64(i, VIEWTAB_PAY_DELTA),
     )
 }
 

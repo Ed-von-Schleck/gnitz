@@ -76,12 +76,15 @@ fn setup_wide_unique(
     engine.dag.register_table(
         tid,
         crate::query::TableEntry::new(
-            StoreHandle::Borrowed(&mut *base as *mut Table),
+            crate::query::RelationStores {
+                handle: StoreHandle::Borrowed(&mut *base as *mut Table),
+                delta: None,
+            },
             schema,
             RelationKind::BaseTable,
             0,
             dir.to_string(),
-            None,
+            crate::query::ViewBudgets::default(),
         ),
     );
     engine
@@ -145,12 +148,15 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
     engine.dag.register_table(
         parent_tid,
         crate::query::TableEntry::new(
-            StoreHandle::Borrowed(&mut pbase as *mut Table),
+            crate::query::RelationStores {
+                handle: StoreHandle::Borrowed(&mut pbase as *mut Table),
+                delta: None,
+            },
             parent_schema,
             RelationKind::BaseTable,
             0,
             dir.clone(),
-            None,
+            crate::query::ViewBudgets::default(),
         ),
     );
 

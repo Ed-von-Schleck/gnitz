@@ -1,6 +1,6 @@
 //! Worker exchange-wait re-entry: the defer-then-replay machinery
 //! (`do_exchange_wait` inline dispatch loop + `dispatch_deferred`;
-//! deferred ticks replay in `replay_deferred_ticks`).
+//! deferred ticks replay in `replay_deferred`).
 
 use super::*;
 
@@ -80,8 +80,8 @@ impl WorkerProcess {
                 unsafe { libc::_exit(0) }
             }
 
-            while let Some((kind, target_id, wire)) = self.next_sal_message() {
-                if let Some(batch) = self.dispatch(ctx, kind, target_id, wire) {
+            while let Some((kind, target_id, lsn, wire)) = self.next_sal_message() {
+                if let Some(batch) = self.dispatch(ctx, kind, target_id, lsn, wire) {
                     return batch;
                 }
             }

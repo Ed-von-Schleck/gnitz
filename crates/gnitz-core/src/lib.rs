@@ -16,8 +16,8 @@ pub use circuit::{
     agg_output_type, Circuit, CircuitBuilder, CircuitRows, NodeId, OpNode, RangeRel, ReduceOutKey, ReindexRole,
 };
 pub use client::{
-    hidden_view_name, retraction_batch, GnitzClient, IndexMeta, InlineUniqueIndex, PlannedView, RelKind, TxnBuffer,
-    MAX_CHAIN_SEGMENTS,
+    delta_reply_schema, hidden_view_name, retraction_batch, DeltaCursor, GnitzClient, IndexMeta, InlineUniqueIndex,
+    PlannedView, RelKind, TxnBuffer, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{Session, FIRST_USER_TABLE_ID, TABLE_TAB};
 pub use error::{ClientError, ConflictClass};

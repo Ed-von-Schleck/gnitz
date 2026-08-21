@@ -209,12 +209,15 @@ impl CatalogEngine {
             self.dag.register_table(
                 family.id(),
                 crate::query::TableEntry::new(
-                    StoreHandle::Borrowed(&mut **store),
+                    RelationStores {
+                        handle: StoreHandle::Borrowed(&mut **store),
+                        delta: None,
+                    },
                     family.schema(),
                     RelationKind::SystemCatalog,
                     0,
                     dir,
-                    None,
+                    crate::query::ViewBudgets::default(),
                 ),
             );
         }
@@ -274,9 +277,14 @@ impl CatalogEngine {
             .map_err(|e| format!("boot flush of the system catalog failed: {e:?}"))
     }
 
-    /// Flush every store this engine owns — each user table's owned handle and
-    /// then the system tables — and clear the DAG. There is no `Drop` doing any
-    /// of it, so a caller that wants the tree on disk complete must call this.
+    /// Flush every store this engine owns that a restart could read back — each
+    /// user table's owned handle and then the system tables — and clear the DAG.
+    /// There is no `Drop` doing any of it, so a caller that wants the tree on disk
+    /// complete must call this.
+    ///
+    /// A fed view's delta store is skipped for the reason it is in neither
+    /// checkpoint round: it is erased at open, so flushing it would write bytes
+    /// the next boot deletes.
     ///
     /// The server never does: it flushes durably per zone and exits via abort or
     /// process teardown.

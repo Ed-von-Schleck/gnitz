@@ -26,6 +26,11 @@ pyo3::create_exception!(_native, GnitzError, pyo3::exceptions::PyException);
 // `except GnitzError` handlers still catch it, while applications that want to
 // retry can `except GnitzConflictError`.
 pyo3::create_exception!(_native, GnitzConflictError, GnitzError);
+// A delta cursor named tick rounds the server's delta store has already dropped
+// (STATUS_DELTA_EXPIRED). A subtype of GnitzError, like the conflict error, so
+// `except GnitzError` still catches it while a subscriber can name it and
+// bootstrap again.
+pyo3::create_exception!(_native, GnitzDeltaExpiredError, GnitzError);
 
 /// Wrap any `Display` error as a `GnitzError` PyErr. For the handful of
 /// failures that carry no retryability verdict (handshake, waker setup).
@@ -46,6 +51,17 @@ fn classified_err(e: &(impl std::fmt::Display + ConflictClass)) -> PyErr {
         GnitzConflictError::new_err(e.to_string())
     } else {
         gnitz_err(e)
+    }
+}
+
+/// [`classified_err`] plus the one classification only a `ClientError` carries:
+/// an expired delta cursor, whose recovery is mechanical (bootstrap again) and so
+/// gets a name a subscriber can catch. Used by the delta reads alone — every
+/// other path goes through `to_py_err`, which has no delta cursor to speak of.
+fn delta_err(e: &ClientError) -> PyErr {
+    match e {
+        ClientError::DeltaExpired => GnitzDeltaExpiredError::new_err(e.to_string()),
+        other => classified_err(other),
     }
 }
 
@@ -1677,6 +1693,43 @@ fn triple_to_lazy(
     batch_to_lazy(py, opt_schema, opt_batch, Some(view_lsn), include_hidden)
 }
 
+/// One delta read's answer: the rows, and the cursor to poll from next. The two
+/// travel together because a subscriber that kept one without the other would
+/// either re-apply rounds it already has or step over rounds it never received.
+#[pyclass(name = "DeltaReply", frozen)]
+pub struct PyDeltaReply {
+    /// The delta rows, weights included — a retraction arrives at weight −1.
+    #[pyo3(get)]
+    rows: Py<PyScanResult>,
+    /// Identifies the boot and the relation this cursor belongs to.
+    #[pyo3(get)]
+    tag: u64,
+    /// The last tick round the reply covers.
+    #[pyo3(get)]
+    tick: u64,
+}
+
+/// Build a [`PyDeltaReply`] from a delta read's `(rows, cursor)` pair. The reply
+/// carries no schema block — the client authored it — so the schema is the one
+/// the caller handed in.
+fn delta_reply_to_py(
+    py: Python<'_>,
+    schema: Arc<Schema>,
+    out: (Option<ZSetBatch>, gnitz_core::DeltaCursor),
+    include_hidden: bool,
+) -> PyResult<Py<PyDeltaReply>> {
+    let (batch, cursor) = out;
+    let rows = batch_to_lazy(py, Some(schema), batch, None, include_hidden)?;
+    Py::new(
+        py,
+        PyDeltaReply {
+            rows,
+            tag: cursor.tag,
+            tick: cursor.tick,
+        },
+    )
+}
+
 /// The `PyScanResult` build shared by the read paths and the SQL path, which
 /// differ only in whether an LSN exists at all.
 fn batch_to_lazy(
@@ -1874,6 +1927,63 @@ impl PyGnitzClient {
     pub fn scan(&mut self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<Py<PyScanResult>> {
         let triple = self.call(py, |c| c.scan(target_id))?;
         triple_to_lazy(py, triple, include_hidden)
+    }
+
+    /// delta_bootstrap(view_id, view_schema, include_hidden=False) -> DeltaReply
+    ///
+    /// The view's whole current value, in the view's own schema, plus the cursor
+    /// to poll from. `Delta { after_tick: 0 }` is the sum of every delta after
+    /// round 0 — the view's entire history — which is precisely what its output
+    /// store holds, so this costs exactly what a scan of the view costs. Apply it
+    /// to a fresh copy: it replaces state, it does not add to it.
+    #[pyo3(signature = (view_id, view_schema, include_hidden = false))]
+    pub fn delta_bootstrap(
+        &mut self,
+        py: Python<'_>,
+        view_id: u64,
+        view_schema: &Bound<'_, PyAny>,
+        include_hidden: bool,
+    ) -> PyResult<Py<PyDeltaReply>> {
+        let schema = Arc::clone(&resolve_py_schema(py, view_schema)?.borrow().rust);
+        let client = self.live()?;
+        let out = py
+            .detach(|| client.delta_bootstrap(view_id, &schema))
+            .map_err(|e| delta_err(&e))?;
+        delta_reply_to_py(py, schema, out, include_hidden)
+    }
+
+    /// delta_poll(view_id, reply_schema, tag, tick, include_hidden=False) -> DeltaReply
+    ///
+    /// Every delta the view emitted in `(tick, T]`, in `delta_reply_schema`'s
+    /// shape. Apply what comes back and store the returned cursor; there is
+    /// nothing to filter and nothing to reconcile.
+    ///
+    /// A `tag` that does not match the one the reply carries names a different
+    /// boot or a different relation — a restart, or a `DROP VIEW` /
+    /// `CREATE VIEW` of the same name. That is refused with
+    /// `GnitzDeltaExpiredError`, not answered with rows: a foreign cursor draws
+    /// the other relation's recent deltas, which are unsafe to apply. The
+    /// recovery is the one that error always calls for — bootstrap again.
+    /// A `tick` of 0 gets the same error for the same reason: it names no copy to
+    /// continue, and a bootstrap comes back in the view's schema rather than in
+    /// this one.
+    #[pyo3(signature = (view_id, reply_schema, tag, tick, include_hidden = false))]
+    pub fn delta_poll(
+        &mut self,
+        py: Python<'_>,
+        view_id: u64,
+        reply_schema: &Bound<'_, PyAny>,
+        tag: u64,
+        tick: u64,
+        include_hidden: bool,
+    ) -> PyResult<Py<PyDeltaReply>> {
+        let schema = Arc::clone(&resolve_py_schema(py, reply_schema)?.borrow().rust);
+        let cursor = gnitz_core::DeltaCursor { tag, tick };
+        let client = self.live()?;
+        let out = py
+            .detach(|| client.delta_poll(view_id, cursor, &schema))
+            .map_err(|e| delta_err(&e))?;
+        delta_reply_to_py(py, schema, out, include_hidden)
     }
 
     /// scan_many(target_ids, include_hidden=False) -> list[ScanResult]
@@ -2625,6 +2735,20 @@ fn unpack_pk_cols(v: u64) -> Vec<u32> {
     gnitz_wire::unpack_pk_cols(v).as_slice().to_vec()
 }
 
+/// The reply schema of an incremental delta poll, derived from a view's own
+/// schema: a `_tick` U64 key column, then the view's PK columns in PK order,
+/// then its payload columns in schema order. Delegates to the shared
+/// `gnitz_core` builder, which mirrors what the engine derives for the delta
+/// store, so the Python side cannot drift from it.
+///
+/// A bootstrap read is **not** in this shape — it walks the view's own store and
+/// comes back in the view's own schema.
+#[pyfunction]
+fn delta_reply_schema(py: Python<'_>, view_schema: &Bound<'_, PyAny>) -> PyResult<Py<PySchema>> {
+    let rust = Arc::clone(&resolve_py_schema(py, view_schema)?.borrow().rust);
+    rust_schema_to_py(py, &Arc::new(gnitz_core::delta_reply_schema(&rust)))
+}
+
 /// The `(name, code)` column-type table, straight off `TypeCode::ALL`.
 /// `_types.py` builds its `TypeCode` IntEnum from this rather than re-typing the
 /// codes, so a variant added in `gnitz_wire` reaches Python with no edit here
@@ -2652,12 +2776,15 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAsyncTransport>()?;
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
     m.add("GnitzConflictError", m.py().get_type::<GnitzConflictError>())?;
+    m.add("GnitzDeltaExpiredError", m.py().get_type::<GnitzDeltaExpiredError>())?;
     // System-table IDs — single-sourced from gnitz_wire (delegating codec, not
     // a re-typed copy), as is the column-type table behind `type_codes()`.
     // Only the ids something addresses a relation by are exported.
     m.add("TABLE_TAB", gnitz_wire::TABLE_TAB)?;
     m.add("IDX_TAB", gnitz_wire::IDX_TAB)?;
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
+    m.add_class::<PyDeltaReply>()?;
+    m.add_function(wrap_pyfunction!(delta_reply_schema, m)?)?;
     m.add_function(wrap_pyfunction!(unpack_pk_cols, m)?)?;
     m.add_function(wrap_pyfunction!(type_codes, m)?)?;
     Ok(())

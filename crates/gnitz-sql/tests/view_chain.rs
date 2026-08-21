@@ -88,6 +88,7 @@ fn plan_chain_with(
         output_columns: cols.to_vec(),
         pk_cols: vec![0],
         capacity_bytes: None,
+        delta_bytes: None,
     };
     let f = PlannedView {
         name: f_name.to_string(),
@@ -96,6 +97,7 @@ fn plan_chain_with(
         output_columns: cols.to_vec(),
         pk_cols: vec![0],
         capacity_bytes: None,
+        delta_bytes: None,
     };
     [h, f]
 }
@@ -324,6 +326,7 @@ fn chain_rejects_over_length() {
             output_columns: cols.clone(),
             pk_cols: vec![0],
             capacity_bytes: None,
+            delta_bytes: None,
         })
         .collect();
     let res = client.create_view_chain(&sn, planned, None);

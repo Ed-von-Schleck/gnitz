@@ -20,9 +20,9 @@ struct RelationRegistration {
     pk: PkColList,
     placement: Placement,
     depth: i32,
-    /// `WITH (capacity = …)` in bytes; `None` for a base table and for an
-    /// unbounded view.
-    capacity_bytes: Option<u64>,
+    /// The `WITH (…)` byte budgets; both `None` for a base table and for a plain
+    /// view.
+    budgets: crate::query::ViewBudgets,
 }
 
 impl CatalogEngine {
@@ -213,6 +213,13 @@ impl CatalogEngine {
     /// Both storeless cases are decided here rather than at the callers, so a new
     /// caller cannot build a `Table` for one of them.
     ///
+    /// A fed view's **delta store** is opened here too, and returned with the
+    /// relation's own: every path that opens a relation's store comes through
+    /// here, so a feed cannot come back missing from a rehome or a rebuild — the
+    /// same reason the capacity is stamped here. Its derived schema is built
+    /// ahead of the storeless early returns, so the one limit that can refuse a
+    /// feed is refused identically on every process.
+    ///
     /// Crash-cleanup of the directory is the caller's: this takes `&self` and is
     /// pure construction.
     pub(crate) fn build_relation_store(
@@ -221,16 +228,35 @@ impl CatalogEngine {
         directory: &str,
         id: i64,
         schema: SchemaDescriptor,
-        capacity_bytes: Option<u64>,
-    ) -> Result<StoreHandle, String> {
+        budgets: crate::query::ViewBudgets,
+    ) -> Result<RelationStores, String> {
+        // Above every early return below, so it runs on **every** process: the
+        // post-fork master opens no user store at all, and a limit first noticed
+        // on a worker would be a fatal abort taken after the client was told the
+        // CREATE succeeded.
+        let delta = budgets
+            .delta_bytes
+            .map(|budget| {
+                crate::schema::make_delta_schema(&schema)
+                    .map(|delta_schema| (budget, delta_schema))
+                    .ok_or_else(|| format!("view {id} has too many columns to carry a delta feed"))
+            })
+            .transpose()?;
+
         // Above `ensure_dir`: a kind with no recovery source owns no store in any
         // process, so no directory is created for one.
         let Some(recovery) = kind.recovery_source() else {
-            return Ok(StoreHandle::Detached);
+            return Ok(RelationStores {
+                handle: StoreHandle::Detached,
+                delta: None,
+            });
         };
         ensure_dir(directory)?;
         if !self.owns_stores {
-            return Ok(StoreHandle::Detached);
+            return Ok(RelationStores {
+                handle: StoreHandle::Detached,
+                delta: None,
+            });
         }
 
         // Widen the window where the table dir exists but its child subdir does
@@ -247,8 +273,44 @@ impl CatalogEngine {
             .map_err(|e| format!("Failed to open relation {id}: error {e} (dir={directory})"))?;
         // Every store this worker opens for a relation comes through here, so a
         // bounded view cannot come back unbounded from a rehome or a rebuild.
-        table.set_capacity(capacity_bytes);
-        Ok(StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(table))))
+        table.set_capacity(budgets.capacity_bytes);
+        Ok(RelationStores {
+            handle: StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(table))),
+            delta: delta
+                .map(|(budget, s)| Self::build_delta_store(directory, id, s, budget))
+                .transpose()?,
+        })
+    }
+
+    /// This worker's delta store for a fed view, under `delta_w{rank}` of the
+    /// view's own directory.
+    ///
+    /// Erased at open — `RecoverySource::Rederive { resume_at: None }`, the "never
+    /// resume" spelling the enum already carries, which unlinks the manifest and
+    /// erases the shards. That is the intent, not an omission: no delta expresses
+    /// what a boot does to a view over a stream (it returns to the value it would
+    /// have if the stream had never received a row) or to an invalidated view
+    /// (rebuilt from base), and a restart mints a fresh boot nonce, so every cursor
+    /// a client holds stops matching and it re-reads at `after_tick = 0`.
+    fn build_delta_store(
+        directory: &str,
+        id: i64,
+        delta_schema: SchemaDescriptor,
+        budget: u64,
+    ) -> Result<Box<DeltaFeed>, String> {
+        let child = ChildAddr::delta_for_this_worker();
+        let mut table = Table::new(
+            &child.dir(directory),
+            delta_schema,
+            id as u32,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .map_err(|e| format!("Failed to open delta store of view {id}: error {e} (dir={directory})"))?;
+        table.set_delta_budget(budget);
+        Ok(Box::new(DeltaFeed {
+            schema: delta_schema,
+            handle: StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(table))),
+        }))
     }
 
     /// Build a relation's store and enter it in the registry — the `+1` half of
@@ -263,7 +325,7 @@ impl CatalogEngine {
             pk,
             placement,
             depth,
-            capacity_bytes,
+            budgets,
         } = reg;
         let col_defs = self.read_column_defs(id);
         validate_relation_defs(kind, id, &name, &col_defs, &pk)?;
@@ -285,7 +347,7 @@ impl CatalogEngine {
             // `compensate_stage_a`'s drain removes what was made here.
             let staged = directory.clone();
             self.with_staged_dir(staged, |s| {
-                s.build_relation_store(kind, &directory, id, schema, capacity_bytes)
+                s.build_relation_store(kind, &directory, id, schema, budgets)
             })?
         } else {
             // A boot replay: the directory already holds the relation's rows, so
@@ -299,7 +361,7 @@ impl CatalogEngine {
             if kind.is_base_table() {
                 crate::storage::repartition_relation(&directory, &schema, id as u32, self.num_workers)?;
             }
-            self.build_relation_store(kind, &directory, id, schema, capacity_bytes)?
+            self.build_relation_store(kind, &directory, id, schema, budgets)?
         };
         // Only a live CREATE adds an entry to the schema dir, and only a kind that
         // owns a store creates one at all — a boot replay reopens a directory that
@@ -310,7 +372,7 @@ impl CatalogEngine {
         }
         self.dag.register_table(
             id,
-            crate::query::TableEntry::new(handle, schema, kind, depth, directory, capacity_bytes),
+            crate::query::TableEntry::new(handle, schema, kind, depth, directory, budgets),
         );
         raise_id_counter(&mut self.next_table_id, id);
         Ok(())
@@ -429,7 +491,7 @@ impl CatalogEngine {
             pk,
             placement,
             depth: 0,
-            capacity_bytes: None,
+            budgets: crate::query::ViewBudgets::default(),
         })
     }
 
@@ -444,14 +506,32 @@ impl CatalogEngine {
     /// here — a compound-PK plain projection prepends the k source PK columns, so
     /// `SELECT *` over a wide compound-PK table can cross MAX_COLUMNS.
     fn view_registration(&mut self, batch: &Batch, i: usize, vid: i64) -> Result<RelationRegistration, String> {
-        let (schema_id, name, pk, capacity) = read_view_tab_row(batch, i);
-        let capacity_bytes = (capacity != 0).then_some(capacity);
+        let (schema_id, name, pk, capacity, delta) = read_view_tab_row(batch, i);
+        let budgets = crate::query::ViewBudgets {
+            capacity_bytes: (capacity != 0).then_some(capacity),
+            delta_bytes: (delta != 0).then_some(delta),
+        };
         // Trust-boundary re-check, in the style of the placement rejection in
         // `table_registration`: a hidden chain segment is an internal relation
-        // the planner mints, never something a capacity clause may name.
-        if capacity_bytes.is_some() && name.starts_with(gnitz_wire::HIDDEN_VIEW_PREFIX) {
+        // the planner mints, never something an option clause may name.
+        if (budgets.capacity_bytes.is_some() || budgets.delta_bytes.is_some())
+            && name.starts_with(gnitz_wire::HIDDEN_VIEW_PREFIX)
+        {
             return Err(format!(
-                "catalog invariant violated: hidden segment '{name}' (vid={vid}) carries a capacity."
+                "catalog invariant violated: hidden segment '{name}' (vid={vid}) carries a WITH option."
+            ));
+        }
+        // The two budgets are refused together, here as well as at the SQL layer:
+        // a bounded view's `Delta(0)` cannot be a function of the tick round, and
+        // the whole feed contract is that it is. A read over a partly-dehydrated
+        // view hydrates its missing keys from the *source relation's live store*,
+        // which `handle_push` advances outside any tick, so the bootstrap would
+        // report round `T` while already carrying a push the next poll delivers
+        // again as round `T+1` — double weight, no error, no row-set difference.
+        if budgets.capacity_bytes.is_some() && budgets.delta_bytes.is_some() {
+            return Err(format!(
+                "view '{name}' (vid={vid}) declares both `capacity` and `delta`; \
+                 a capacity-bounded view cannot carry a delta feed"
             ));
         }
         // The circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
@@ -472,7 +552,7 @@ impl CatalogEngine {
                      capacity-bounded view; views cannot be created over one"
                 ));
             }
-            if capacity_bytes.is_some() && e.kind == RelationKind::Stream {
+            if budgets.capacity_bytes.is_some() && e.kind == RelationKind::Stream {
                 return Err(format!(
                     "view '{name}' (vid={vid}) reads relation {src}, which is a stream; \
                      a capacity-bounded view cannot be created over one"
@@ -500,7 +580,7 @@ impl CatalogEngine {
             pk,
             placement,
             depth,
-            capacity_bytes,
+            budgets,
         })
     }
 

@@ -143,6 +143,18 @@ impl LevelGuard {
         self.entries.iter().map(|e| e.max_lsn).max()
     }
 
+    /// The highest value the leading eight OPK bytes of this guard's rows take —
+    /// for a delta store, whose key is `_tick ‖ view PK`, the newest round it
+    /// holds. `None` for a guard holding no rows.
+    ///
+    /// Taken from the *highest* round because guard boundaries are key ranges, not
+    /// round boundaries: a drop can leave the tail of its highest round behind, and
+    /// taking that round refuses exactly the cursors that would have needed the
+    /// part that went.
+    fn highest_leading_u64(&self) -> Option<u64> {
+        self.key_extent().map(|(_, max)| (max >> 64) as u64)
+    }
+
     /// The `pack_pk_be` key span this guard's entries actually cover, or `None` for
     /// a guard holding no rows. The guard *key* is only the span's lower fence, so
     /// a fold out of this guard must route by this instead — see
@@ -207,6 +219,24 @@ pub(super) struct ShardIndex {
     /// `CREATE VIEW … WITH (capacity = …)`. `None` for every store but a
     /// capacity-bounded view's output store, which pays nothing.
     capacity_bytes: Option<u64>,
+    /// This store evicts by **dropping** its victim rather than by dehydrating
+    /// it, and unlinks each compaction's superseded inputs at once rather than
+    /// deferring them to the checkpoint barrier. `false` for every store but a
+    /// view's delta store.
+    ///
+    /// One field for both because one fact decides both: a delta store's rows
+    /// are the change itself, so there is no summed weight worth a skeleton stub
+    /// of, and it publishes no manifest, so the post-publish drain it would
+    /// otherwise defer to never runs — deferring there would leak every dropped
+    /// *and* every compacted-away shard for the life of the process, invisibly to
+    /// `resident_bytes`, which counts registered entries only.
+    evict_by_drop: bool,
+    /// Running **max** over the leading eight OPK bytes — the `_tick` — of every row
+    /// this store has ever dropped. A delta read at `after_tick > dropped_through`
+    /// asks only for rows above it, and no such row was ever dropped; a read at or
+    /// below it is refused. Zero until the first drop, and always zero for a store
+    /// whose eviction residue is not `Nothing`.
+    dropped_through: u64,
     /// Passed to every compaction's write. Held rather than derived from the
     /// input shards: a derivation would let one filterless input turn the filter
     /// off for this table's whole descendant line, permanently and invisibly.
@@ -226,6 +256,8 @@ impl ShardIndex {
             compact_seq: 0,
             pending_deletions: Vec::new(),
             capacity_bytes: None,
+            evict_by_drop: false,
+            dropped_through: 0,
             skip_pk_filter,
         }
     }
@@ -233,6 +265,25 @@ impl ShardIndex {
     /// Bound this store's registered shard bytes, once, at construction.
     pub(super) fn set_capacity(&mut self, capacity_bytes: Option<u64>) {
         self.capacity_bytes = capacity_bytes;
+    }
+
+    /// Configure this index as a view's **delta store**: bounded by `budget`,
+    /// and evicting by dropping rather than by dehydrating (see
+    /// [`Self::evict_by_drop`]).
+    ///
+    /// The budget is bytes and never a subscriber's cursor: the sweep drops the
+    /// oldest-written guard whether or not someone is still reading it, so a slow
+    /// reader falls off the window alone — it is refused at
+    /// [`Self::dropped_through`] and re-reads from scratch — and cannot hold
+    /// bytes against a healthy one.
+    pub(super) fn set_delta_budget(&mut self, budget: u64) {
+        self.capacity_bytes = Some(budget);
+        self.evict_by_drop = true;
+    }
+
+    /// The highest round this store has dropped; see [`Self::dropped_through`].
+    pub(super) fn dropped_through(&self) -> u64 {
+        self.dropped_through
     }
 
     /// Fallible half of a schema swap: re-open every registered shard under
@@ -1274,6 +1325,168 @@ mod tests {
         assert!(floor > 1);
         idx.enforce_capacity().unwrap();
         assert_eq!(idx.resident_bytes(), floor, "the floor is the fixpoint");
+    }
+
+    // -----------------------------------------------------------------------
+    // Delta-store retention (evict_by_drop)
+    // -----------------------------------------------------------------------
+
+    /// Every `.db` file physically present in `dir` — what a leak shows up in and
+    /// `resident_bytes` cannot see, since it counts registered entries only.
+    fn on_disk_shards(dir: &std::path::Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".db"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A delta store's sweep **drops** its victim rather than dehydrating it: the
+    /// guard is removed, its file unlinked at once, and the highest round it held
+    /// becomes the retention floor. A read at `after_tick > dropped_through` asks
+    /// only for rounds above it, and no such round was ever dropped.
+    #[test]
+    fn a_delta_budget_drops_its_victim_and_raises_the_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut idx = index_with_l0(tmp.path(), 4);
+        idx.set_delta_budget(1);
+        assert_eq!(idx.dropped_through(), 0, "nothing dropped yet");
+
+        // Same shape as the skeleton floor's convergence: one push-down per call,
+        // dehydration — here, dropping — unbudgeted above it.
+        for _ in 0..12 {
+            idx.enforce_capacity().unwrap();
+        }
+
+        assert!(idx.l0.is_empty(), "L0 sank");
+        assert!(idx.levels[0].guards.is_empty(), "L1 sank");
+        assert!(
+            idx.levels[TERMINAL_LEVEL_IDX].guards.is_empty(),
+            "a drop REMOVES its guard; clearing it would leave one entry-less guard \
+             behind every drop, forever, in the binary-search space"
+        );
+        assert_eq!(idx.resident_bytes(), 0, "a delta store has no floor to stop above");
+        // The last key `index_with_l0` writes is `3 * 1000 + 40`.
+        assert_eq!(
+            idx.dropped_through(),
+            3_040,
+            "the watermark is the HIGHEST round dropped, taken from the victim's pk_max"
+        );
+        assert!(on_disk_shards(tmp.path()).is_empty(), "every dropped shard is unlinked");
+        assert!(idx.pending_deletions.is_empty());
+    }
+
+    /// The residue is a **per-call** parameter, and only the sweep's own eviction
+    /// step may pass anything but `Derived`. A store-scoped residue would be the
+    /// shorter change and a silent data-loss bug: a delta store runs every
+    /// ordinary compaction too, and those would then delete live, un-evicted rows
+    /// and raise the floor past rounds nothing asked to evict — with no error and
+    /// no row-set difference.
+    #[test]
+    fn ordinary_compaction_of_a_delta_store_keeps_its_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut idx = index_with_l0(tmp.path(), 4);
+        // A budget the store already meets, so the sweep's own step never runs.
+        idx.set_delta_budget(idx.resident_bytes() * 8);
+        let before = idx.resident_bytes();
+
+        idx.run_compact().unwrap(); // L0 fold
+        for gi in (0..idx.levels[0].guards.len()).rev() {
+            idx.vertical_fold(gi).unwrap(); // push-down
+        }
+        idx.enforce_capacity().unwrap();
+
+        assert_eq!(idx.dropped_through(), 0, "ordinary compaction drops nothing");
+        assert!(idx.resident_bytes() > 0, "the rows survived");
+        assert!(
+            idx.resident_bytes() <= before,
+            "a fold never grows the store: {} -> {}",
+            before,
+            idx.resident_bytes()
+        );
+        let live: usize = idx.all_entries().map(|e| e.shard.count).sum();
+        assert_eq!(live, 4 * 40, "every row survived the folds");
+    }
+
+    /// A delta store publishes no manifest and is in neither checkpoint round, so
+    /// the post-publish drain every other store defers to never runs at all.
+    /// Deferring there would leak every dropped **and every compacted-away** shard
+    /// for the life of the process — invisibly to `resident_bytes`, which counts
+    /// registered entries.
+    ///
+    /// The trigger is the **store**, not the residue: an ordinary compaction is
+    /// what a delta store runs most often, so draining only on a drop would unlink
+    /// the sweep's victims and leak everything else.
+    #[test]
+    fn a_delta_stores_superseded_shards_unlink_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain_dir = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        let mut plain = index_with_l0(&plain_dir, 4);
+        plain.run_compact().unwrap();
+        assert!(
+            !plain.pending_deletions.is_empty(),
+            "every other store defers its superseded inputs to the checkpoint barrier",
+        );
+
+        let dir = tmp.path().join("delta");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut idx = index_with_l0(&dir, 4);
+        let inputs = on_disk_shards(&dir);
+        idx.set_delta_budget(idx.resident_bytes() * 8);
+        idx.run_compact().unwrap();
+
+        assert!(
+            idx.pending_deletions.is_empty(),
+            "unlinked at the end of the compaction"
+        );
+        let after = on_disk_shards(&dir);
+        assert!(
+            after.iter().all(|f| !inputs.contains(f)),
+            "the compaction's inputs are gone: {inputs:?} -> {after:?}",
+        );
+        assert!(!after.is_empty(), "its output is not");
+    }
+
+    /// A store fed one spill's worth per round, swept every round — the shape a
+    /// live delta store takes. Its footprint must plateau: what a leak, or a sweep
+    /// that cannot keep pace, shows up as is a footprint that tracks everything
+    /// ever written.
+    #[test]
+    fn a_swept_delta_store_plateaus_under_a_steady_write_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64(), false);
+        idx.set_delta_budget(1);
+
+        let mut early = 0u64;
+        for round in 0..60u64 {
+            // Ascending keys, as a `_tick`-led delta store's always are.
+            let pks: Vec<u64> = (0..40).map(|i| round * 1000 + i + 1).collect();
+            let vals: Vec<i64> = pks.iter().map(|&p| p as i64).collect();
+            let p = write_test_shard(tmp.path(), &format!("spill_{round}.db"), &pks, &vals);
+            idx.add_unsynced_shard(&p, round + 1).unwrap();
+            if idx.should_compact() {
+                idx.run_compact().unwrap();
+            }
+            idx.enforce_capacity().unwrap();
+            if round == 9 {
+                early = idx.resident_bytes();
+            }
+        }
+
+        let late = idx.resident_bytes();
+        assert!(
+            late <= early.max(1) * 2,
+            "footprint grew {early} -> {late} bytes over 50 further rounds of the same \
+             write rate — the sweep is not keeping pace",
+        );
+        assert!(idx.dropped_through() > 0, "the sweep dropped something");
+        // Nothing left behind on disk beyond what the index still registers.
+        let registered: usize = idx.all_entries().count();
+        assert_eq!(on_disk_shards(tmp.path()).len(), registered, "no orphan shard files");
     }
 
     /// Dehydration picks its victim by **write recency**: the terminal guard

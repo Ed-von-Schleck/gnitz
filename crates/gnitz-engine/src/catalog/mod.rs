@@ -41,7 +41,7 @@ mod tests;
 use std::fs;
 use std::rc::Rc;
 
-use crate::query::{DagEngine, RelationKind, StoreHandle};
+use crate::query::{DagEngine, DeltaFeed, RelationKind, RelationStores, StoreHandle};
 use crate::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, ReadCursor, RecoverySource, Table};
 

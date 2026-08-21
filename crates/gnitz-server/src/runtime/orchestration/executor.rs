@@ -31,7 +31,7 @@ use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, P
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
     await_worker_acks, dispatch_scan_multi_fanout, replicated_unicast, scan_spec_route, Fanout, MasterDispatcher,
-    TxnFamily, UniqueFilter,
+    TxnFamily, UniqueFilter, WorkerFault,
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::BACKFILL_DECISION_CONTINUE;
@@ -39,7 +39,7 @@ use crate::runtime::reactor::{
     mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard,
     ReplyFuture, WriteGuard,
 };
-use crate::runtime::sal::{SalFit, FLAG_SCAN_SPEC};
+use crate::runtime::sal::{SalFit, FLAG_DELTA_SCAN, FLAG_SCAN_SPEC};
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, FLAG_RESOLVE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
@@ -321,9 +321,16 @@ impl Shared {
     /// catalog write guard because every `table_lock` acquisition is enclosed by a
     /// catalog *read* guard, so holding the write guard is what proves no task
     /// holds or awaits the lock being removed.
+    ///
+    /// The dispatcher's own per-relation entry — the idle-poll gate's last-round
+    /// map — goes here too rather than through a second hook of the feed's own:
+    /// this is already the one place a dropped relation's per-relation master
+    /// state is cleared, and ids are never reused, so nothing else would ever
+    /// reclaim it.
     fn forget_relation(&self, _catalog_write: &WriteGuard, id: i64) {
         self.table_locks.borrow_mut().remove(&id);
         self.table_commit_lsn.borrow_mut().remove(&id);
+        self.disp().forget_delta_round(id);
     }
 
     /// True iff some pending tid has crossed the row coalesce threshold.
@@ -1187,7 +1194,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         // push-apply time, so `read_lock` locks once and never drains. A view seek
         // drains inside it — which `drain_pending_ticks` requires happen with no
         // catalog lock held — so the lock is taken there and not at dispatch level.
-        if let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id).await {
+        if let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id, ReadFreshness::Current).await {
             serve_seek(
                 shared,
                 peer,
@@ -1205,7 +1212,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     if flags & FLAG_SEEK_BY_INDEX != 0 {
         // Only a base table can own a secondary index, so in practice `read_lock`
         // never drains here — but it is the same call every other read verb makes.
-        let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id).await else {
+        let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id, ReadFreshness::Current).await else {
             return;
         };
         handle_seek_by_index(
@@ -1911,6 +1918,9 @@ fn build_resolve_reply(
     let blob = gnitz_wire::RelDescriptorBlob {
         class,
         replicated,
+        // Answered off the registry's own `delta_bytes`, so a subscriber discovers
+        // the capability here instead of probing for it with a read that errors.
+        delta: shared.cat().dag().relation_has_delta_feed(tid),
         fks,
         indexes,
     }
@@ -2013,12 +2023,33 @@ fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
         .all(|s| shared.commit_lsn_of(s) <= ticked)
 }
 
+/// What a read owes the writes that came before it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadFreshness {
+    /// Drain pending ticks when the target is a view `read_is_fresh` reports
+    /// stale — every read verb that answers "what is current".
+    Current,
+    /// Answer against whatever the tick loop has already run. A delta read
+    /// answers "what has happened", not "what is current", so a round the tick
+    /// loop has not run yet is a round the next poll will carry — and the gate
+    /// stays sound under that choice, because it keys on the last round that
+    /// *reached* the view and an unticked push has reached nothing.
+    ///
+    /// Draining would be expensive in exactly the wrong place: a `Drain` skips
+    /// the coalesce window and takes *every* pending tid, not just this view's,
+    /// so fifty subscribers at 20 Hz would defeat tick coalescing for the whole
+    /// server. And it matters most on the workload the feed is for — a stream
+    /// push publishes nothing, so `read_is_fresh` answers false and **every**
+    /// read of a stream-fed view drains today.
+    AsOfLastTick,
+}
+
 /// Take the catalog read lock and resolve `target_id`'s kind from the same probe
-/// that validated it, draining pending ticks first only when the target is a view
-/// `read_is_fresh` reports stale. Returns `(guard, kind)`, or `None` if the target
-/// was rejected (error already sent). The one read-lock entry point for every
-/// single-target read verb: each one routes on the returned kind rather than
-/// re-deciding the system/user split from the id.
+/// that validated it, draining pending ticks first only when `freshness` asks for
+/// it and the target is a view `read_is_fresh` reports stale. Returns `(guard,
+/// kind)`, or `None` if the target was rejected (error already sent). The one
+/// read-lock entry point for every single-target read verb: each one routes on
+/// the returned kind rather than re-deciding the system/user split from the id.
 ///
 /// A base table's rows AND its secondary indexes are written by the same ingest
 /// apply, which is what makes skipping the drain safe for an `IndexRange` bound
@@ -2030,11 +2061,12 @@ async fn read_lock(
     peer: &Peer,
     client_id: u64,
     target_id: i64,
+    freshness: ReadFreshness,
 ) -> Option<(ReadGuard, RelationKind)> {
     {
         let g = shared.catalog_rwlock.read().await;
         let kind = target_kind_or_reject(shared, peer, client_id, target_id, Access::Read).await?;
-        if read_is_fresh(shared, target_id) {
+        if freshness == ReadFreshness::AsOfLastTick || read_is_fresh(shared, target_id) {
             return Some((g, kind));
         }
     }
@@ -2090,7 +2122,7 @@ fn build_prelim_schema_frame(tid: i64, client_id: u64, server_version: u16, bloc
 }
 
 async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
-    let Some((_g, _kind)) = read_lock(shared, peer, client_id, target_id).await else {
+    let Some((_g, _kind)) = read_lock(shared, peer, client_id, target_id, ReadFreshness::Current).await else {
         return;
     };
     let lsn = shared.last_tick_lsn.get();
@@ -2125,43 +2157,80 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
         &[],
     )
     .await;
-    finish_scan_fanout(peer, target_id, client_id, lsn, result).await;
+    // A plain scan has only an LSN to report, so the sampled round is dropped
+    // explicitly here rather than hidden inside the fan-out.
+    finish_scan_fanout(peer, target_id, client_id, lsn as u128, result.map(|(ok, _)| ok)).await;
 }
 
-fn make_terminal_scan_frame(target_id: i64, client_id: u64, lsn: u64) -> PooledSendBuf {
-    // Terminal scan frame: no schema block, no data. Client ignores schema version here.
+/// The terminal frame of a reply train: `STATUS_OK`, no schema block, no data.
+///
+/// `seek_pk` is the read's watermark, and the field is already a `u128`. A plain
+/// scan puts the last-committed LSN there; a delta read puts the pair
+/// `(cursor tag, T)`, tag in the high half — so the whole cursor a subscriber
+/// stores costs no wire bytes.
+fn make_terminal_scan_frame(target_id: i64, client_id: u64, seek_pk: u128) -> PooledSendBuf {
     encode_response_buffer(ipc::WireMsg {
         target_id: target_id as u64,
         client_id,
-        seek_pk: lsn as u128,
+        seek_pk,
         status: STATUS_OK,
         ..Default::default()
     })
 }
 
 /// Finish one scan-shaped fan-out: `Ok(true)` → the terminal frame (stamped
-/// with the pre-dispatch `lsn`), `Ok(false)` → the forward already failed
-/// (close the peer), `Err` → the error frame. Shared by the plain scan and the
-/// ScanSpec handler.
-async fn finish_scan_fanout(peer: &Peer, target_id: i64, client_id: u64, lsn: u64, result: Result<bool, String>) {
+/// with the pre-dispatch `seek_pk`), `Ok(false)` → the forward already failed
+/// (close the peer), `Err` → a fault frame carrying the worker's own status.
+/// Shared by the plain scan and the ScanSpec handler.
+async fn finish_scan_fanout(
+    peer: &Peer,
+    target_id: i64,
+    client_id: u64,
+    seek_pk: u128,
+    result: Result<bool, WorkerFault>,
+) {
     match result {
         Ok(true) => {
-            let terminal = make_terminal_scan_frame(target_id, client_id, lsn);
+            let terminal = make_terminal_scan_frame(target_id, client_id, seek_pk);
             peer.send_buffer_or_close(terminal).await;
         }
         Ok(false) => peer.close(),
-        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
+        Err(f) => send_status_frame(peer, target_id, client_id, f.status, f.text.as_bytes()).await,
     }
 }
 
 /// Parameterized bounded read (`ReadSpec`). The scan pipeline, minus schema
 /// negotiation: the client authors the reply schema and ships it in
-/// `seek_pk_extra`, so the reply carries no schema block. `read_lock` still drains a
-/// view target's pending ticks first (freshness), and terminal-frame/error
-/// handling are identical to `handle_scan`; only the routing differs, since a
-/// bound can confine the read to one worker.
+/// `seek_pk_extra`, so the reply carries no schema block. Terminal-frame and
+/// failure handling are identical to `handle_scan`; the routing differs, since a
+/// bound can confine the read to one worker, and a **delta** bound differs in
+/// three more ways.
+///
+/// The request blob is unpacked **once**, at the top, and the resulting spec
+/// drives all three of the dispatch classification, the routing and the gate —
+/// `confined_worker` takes that spec rather than unpacking the blob again to
+/// reach the same bytes.
+///
+/// 1. It takes no drain ([`ReadFreshness::AsOfLastTick`]).
+/// 2. Its group carries `FLAG_DELTA_SCAN`, which is what makes the worker defer
+///    it out of an in-flight evaluation.
+/// 3. Its terminal frame reports `(cursor tag, T)` instead of the last-committed
+///    LSN, and an up-to-date poll is answered here, master-locally.
 async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, seek_pk_extra: &[u8]) {
-    let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id).await else {
+    // The one unpack of the request blob on this side; `confined_worker` takes
+    // the spec it yields rather than reaching the same bytes a second time. A
+    // blob that does not split is left to the worker — the sole `ReadSpec`
+    // decoder and trust boundary — and routes meanwhile as an empty spec, which
+    // names no PK range and so confines nothing.
+    let spec = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra)
+        .map(|(spec, _block)| spec)
+        .unwrap_or(&[]);
+    let delta_cursor = gnitz_wire::peek_delta_bound(spec);
+    let freshness = match delta_cursor {
+        Some(_) => ReadFreshness::AsOfLastTick,
+        None => ReadFreshness::Current,
+    };
+    let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id, freshness).await else {
         return;
     };
     // A `ReadSpec` has only a fan-out realization, and every worker holds a full
@@ -2172,11 +2241,41 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
         send_error(peer, target_id, client_id, msg.as_bytes()).await;
         return;
     }
-    let lsn = shared.last_tick_lsn.get();
+
+    // The steady state of a subscription is a poll that returns nothing, so that
+    // is the case that must be cheap — and a bare fan-out costs a broadcast SAL
+    // group carrying W copies of the request blob, W eventfd writes, W wakeups
+    // and W control-only replies. Since no read path rewinds the SAL cursor, that
+    // alone would drive the checkpoint threshold on an idle database.
+    //
+    // The gate is a gate in front of the store, not a replacement for it: a view
+    // no round has reached reads as round 1, so a bootstrap at `after_tick = 0`
+    // is below it and falls through, which is what makes the whole-history arm
+    // reachable at all. It samples the counter and the map with no await between
+    // them, so it cannot pair a `T` from after a tick with a map from before it.
+    //
+    // The reply goes out through the terminal-frame builder rather than
+    // `send_control_only`: that builds its frame with `..Default::default()`, so
+    // `seek_pk` would be zero — a `tag = 0, T = 0` the client's stored tag never
+    // matches, driving exactly the permanent re-read loop this design avoids.
+    //
+    // Only a fed relation is gated. A `Delta` bound against one with no feed has
+    // to reach the worker, which is the only place that refusal is worded.
+    if let Some(after) = delta_cursor.filter(|&n| n > 0) {
+        let disp = shared.disp();
+        if shared.cat().dag().relation_has_delta_feed(target_id) && after >= disp.last_delta_round(target_id) {
+            let seek_pk = delta_terminal_seek_pk(disp, target_id, disp.last_tick_round());
+            let frame = make_terminal_scan_frame(target_id, client_id, seek_pk);
+            peer.send_buffer_or_close(frame).await;
+            return;
+        }
+    }
+
     // A PK range confined to one partition unicasts: one SAL slot instead of W,
     // each of which would carry its own copy of the spec blob under the exclusive
     // SAL mutex.
-    let unicast = scan_spec_route(shared.disp(), target_id, seek_pk_extra);
+    let unicast = scan_spec_route(shared.disp(), target_id, spec);
+    let sal_flags = FLAG_SCAN_SPEC | if delta_cursor.is_some() { FLAG_DELTA_SCAN } else { 0 };
     let result = MasterDispatcher::fan_out_scan(
         shared.disp(),
         &shared.reactor,
@@ -2185,12 +2284,25 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
         target_id,
         client_id,
         peer,
-        FLAG_SCAN_SPEC,
+        sal_flags,
         0,
         seek_pk_extra,
     )
     .await;
-    finish_scan_fanout(peer, target_id, client_id, lsn, result).await;
+    let seek_pk = match (&result, delta_cursor) {
+        (Ok((_, round)), Some(_)) => delta_terminal_seek_pk(shared.disp(), target_id, *round),
+        _ => shared.last_tick_lsn.get() as u128,
+    };
+    finish_scan_fanout(peer, target_id, client_id, seek_pk, result.map(|(ok, _)| ok)).await;
+}
+
+/// A delta reply's terminal `seek_pk`: the cursor tag in the high half, `T` in
+/// the low half. One field, because "is this cursor mine?" and "which boot is it
+/// from?" are the same question — a client that does not recognise the tag
+/// discards its copy and re-reads at `after_tick = 0`, which is the right answer
+/// to both.
+fn delta_terminal_seek_pk(disp: &MasterDispatcher, target_id: i64, round: u64) -> u128 {
+    gnitz_wire::pack_delta_watermark(disp.delta_cursor_tag(target_id), round)
 }
 
 /// One relation's Phase-1 capture for `scan_multi_body`: its tid and the
@@ -2306,10 +2418,10 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
         match MasterDispatcher::await_and_drain_scan_relation(&shared.reactor, peer, d.unicast, &d.req_ids, nw).await {
             Ok(true) => {}
             Ok(false) => return Ok(false),
-            Err(e) => return Err(e),
+            Err(f) => return Err(f.text),
         }
         // Terminal frame for this relation (tid + the shared LSN).
-        let terminal = make_terminal_scan_frame(plan.tid, client_id, lsn);
+        let terminal = make_terminal_scan_frame(plan.tid, client_id, lsn as u128);
         if peer.send_buffer(terminal).await < 0 {
             return Ok(false);
         }
@@ -2730,27 +2842,31 @@ async fn send_ok_response(
 /// schema-mismatch and no-index signals, and an id allocation, whose answer *is*
 /// the target id — goes out through here.
 async fn send_control_only(peer: &Peer, target_id: i64, client_id: u64, status: u32) {
+    send_status_frame(peer, target_id, client_id, status, &[]).await
+}
+
+/// One control-only failure frame carrying `status` verbatim. A failing status
+/// suppresses the schema block (has_schema = false), so `prebuilt_schema = None`
+/// is correct and saves the cache lookup; flags = 0, since the client ignores the
+/// schema version on a failure.
+///
+/// The one place a status a *worker* minted reaches the client: the scan-forward
+/// stack carries `(status, text)` from `worker_error` down to here, where before
+/// it flattened the pair to text and sent `STATUS_ERROR` for everything.
+async fn send_status_frame(peer: &Peer, target_id: i64, client_id: u64, status: u32, error_msg: &[u8]) {
     let buf = encode_response_buffer(ipc::WireMsg {
         target_id: target_id as u64,
         client_id,
         status,
+        error_msg,
         ..Default::default()
     });
     peer.send_buffer_or_close(buf).await;
 }
 
+/// The master's own rejections, which are all `STATUS_ERROR`.
 async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8]) {
-    // STATUS_ERROR suppresses the schema block (has_schema = false), so
-    // prebuilt_schema = None is correct and saves the cache lookup.
-    // flags=0: client ignores schema version on error responses.
-    let buf = encode_response_buffer(ipc::WireMsg {
-        target_id: target_id as u64,
-        client_id,
-        status: STATUS_ERROR,
-        error_msg,
-        ..Default::default()
-    });
-    peer.send_buffer_or_close(buf).await;
+    send_status_frame(peer, target_id, client_id, STATUS_ERROR, error_msg).await
 }
 
 /// Why a stream cannot accept this push, or `None` if it can. Both rules restate

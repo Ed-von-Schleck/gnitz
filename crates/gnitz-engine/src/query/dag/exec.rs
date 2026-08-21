@@ -331,7 +331,17 @@ impl DagEngine {
     /// placeholder so collective exchange rounds stay in lockstep across workers
     /// — onto each downstream edge, until the queue drains. Every modified view's
     /// output store is flushed exactly once after the DAG settles.
-    pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(&mut self, source_id: i64, delta: Batch, exchange: &mut E) {
+    ///
+    /// `tick_round` is the strictly-increasing round the master allocated for the
+    /// tick group that drove this evaluation. It stamps every fed view's captured
+    /// delta, and is what makes "give me what changed since N" answerable.
+    pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(
+        &mut self,
+        source_id: i64,
+        delta: Batch,
+        tick_round: u64,
+        exchange: &mut E,
+    ) {
         self.get_dep_map();
         let Some(view_ids) = self.dep.forward.get(&source_id).filter(|v| !v.is_empty()) else {
             return;
@@ -363,7 +373,7 @@ impl DagEngine {
 
             if let Some(out) = out_delta.as_ref() {
                 dirty_views.insert(view_id);
-                self.ingest_by_ref(view_id, out);
+                self.ingest_view_delta(view_id, out, tick_round);
             }
 
             // Fan the output onto each dependent edge. Both borrows are shared

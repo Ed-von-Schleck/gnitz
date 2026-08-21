@@ -11,14 +11,14 @@ pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// sizes come from that schema, so they reject most shards written under a
 /// different one; a Constant-encoded region is one element wide under either
 /// schema, and only this word rejects that.
-pub(crate) const SHARD_VERSION: u64 = 13;
+pub(crate) const SHARD_VERSION: u64 = 14;
 
 /// Pin the system-family column shapes to the version word above, the way
 /// `gnitz_wire::wal` pins them to `WAL_FORMAT_VERSION`. Nothing else notices a
 /// shape change. If this fails, bump `SHARD_VERSION` and paste the reported
 /// digest here.
 const _: () = assert!(
-    gnitz_wire::SYS_SCHEMA_DIGEST == 4260079152260924933 && SHARD_VERSION == 13,
+    gnitz_wire::SYS_SCHEMA_DIGEST == 14684290124813841089 && SHARD_VERSION == 14,
     "system-family column shapes changed: bump SHARD_VERSION"
 );
 pub(crate) const HEADER_SIZE: usize = 64;

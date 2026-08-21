@@ -349,6 +349,45 @@ pub const STATUS_NO_INDEX: u32 = 3;
 /// or surfaces the conflict (BEGIN/COMMIT). Cleanly retryable — nothing validated,
 /// nothing written.
 pub const STATUS_TXN_CONFLICT: u32 = 4;
+/// A `Delta { after_tick }` read whose cursor is at or below the refusing
+/// worker's retention floor: the rounds it asks for were dropped by that store's
+/// capacity sweep. Control-only frame; the subscriber's recovery is the read it
+/// made on its first day, `after_tick = 0`. The one status a *worker* mints —
+/// `worker_error` carries the code to the client rather than flattening it into
+/// a string.
+pub const STATUS_DELTA_EXPIRED: u32 = 5;
+
+/// A failure as the reply frame carries it: one of the `STATUS_*` words above
+/// plus its message. The decoded form of a control block's `(status, error_msg)`
+/// pair, defined here because both halves of that hop need to name it — the
+/// engine's `scan_spec_family` mints one, the worker splits it onto the wire,
+/// and the master's `worker_error` puts it back together.
+///
+/// `From<S: Into<String>>` defaults the status to [`STATUS_ERROR`], which is what
+/// every rejection that is not a typed refusal is, and what keeps a plain
+/// `Err(format!(…))?` compiling unchanged. There is deliberately no conversion
+/// *back* to `String`: a caller that has no typed status to forward discards the
+/// code explicitly, so the sites where a status is dropped stay visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireFault {
+    pub status: u32,
+    pub text: String,
+}
+
+impl<S: Into<String>> From<S> for WireFault {
+    fn from(text: S) -> Self {
+        WireFault {
+            status: STATUS_ERROR,
+            text: text.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for WireFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
 
 pub const META_FLAG_NULLABLE: u64 = 1;
 pub(crate) const META_FLAG_IS_PK: u64 = 2;

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT};
 use crate::runtime::sal::{SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
-use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_SCAN_LAST, STATUS_ERROR, STATUS_OK};
+use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_SCAN_LAST, STATUS_OK};
 use gnitz_engine::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::query::{DagEngine, ExchangeCallback};
@@ -63,15 +63,46 @@ struct DeferredDdl {
     batch: Batch,
 }
 
-/// A FLAG_TICK deferred out of a *blocking* evaluation poll (an exchange wait),
-/// replayed at the next top-level drain in SAL arrival order. Replay needs only
-/// the view id and the original request id (so the replayed ACK is routable) —
-/// decoded EAGERLY at defer time: `Flush` runs inline in `InEval` and resets the
-/// SAL, so no raw wire pointer may be stashed across the wait (the `DeferredDdl`
-/// discipline).
-struct DeferredTick {
-    target_id: i64,
-    req_id: u64,
+/// A SAL message deferred out of a *blocking* evaluation poll (an exchange
+/// wait), replayed at the next top-level drain in SAL arrival order.
+///
+/// Both variants decode EAGERLY at defer time: `Flush` runs inline in `InEval`
+/// and resets the SAL, so no raw wire pointer may be stashed across the wait —
+/// the discipline `DeferredDdl` already follows by storing a decoded `Batch`.
+/// Eager is also why the replay dispatches on the entry rather than re-entering
+/// `run_via_dispatch_inner`, which takes the raw `&'static [u8]` mapping and
+/// decodes it itself.
+///
+/// **One queue for both**, drained in insertion order, which is SAL order: a tick
+/// deferred before a read is replayed before it. `deferred: Vec<DeferredDdl>`
+/// stays separate even though it reads alike, because it is drained at a
+/// different point with a different meaning — `replay_deferred` runs at top
+/// level *after* the outer tick's ACK, `dispatch_deferred` inside `evaluate_dag`
+/// *before* it. Drain the merged queue at the earlier point and a deferred tick
+/// re-enters the DAG, which is the thing tick-deferral exists to prevent; drain
+/// it at the later point and a catalog mutation lands after an ACK that implied
+/// it had not.
+#[derive(Debug)]
+enum Deferred {
+    /// A `FLAG_TICK`. Replay needs the view id, the round that produced it, and
+    /// the original request id so the replayed ACK is routable.
+    ///
+    /// The round **travels with the message**: a latched "current round" would
+    /// stamp the replay with a *later* round than the one that produced it.
+    Tick { target_id: i64, round: u64, req_id: u64 },
+    /// A delta read. Carries the whole request, `seek_pk` included — the one it
+    /// would be easiest to leave out, and where the master put the interval's
+    /// upper cut. A replayed read that lost it would cut at `T = 0`, return
+    /// nothing, and still be answered with a terminal frame reporting the real
+    /// `T`: the client would advance its cursor over rounds it never received,
+    /// the exact silent loss the cut was added to prevent.
+    DeltaRead {
+        target_id: i64,
+        request_id: u64,
+        client_id: u64,
+        seek_pk: u128,
+        seek_pk_extra: Vec<u8>,
+    },
 }
 
 /// Per-chunk collective decision the master stamps onto a distributed-backfill
@@ -115,14 +146,14 @@ enum DispatchContext {
 
 struct WorkerExchangeHandler {
     deferred: Vec<DeferredDdl>,
-    /// A maintenance `Tick` encountered inside a *blocking* evaluation poll (an
-    /// exchange wait) re-enters the DAG, so it is stashed (decoded, see
-    /// [`DeferredTick`]) and replayed at the next top-level drain
-    /// (`replay_deferred_ticks`) in SAL arrival order, after the current tick's
-    /// ACK is sent, so the master observes ACKs in SAL arrival order and a later
-    /// tick cannot re-enter `view_id` while an outer exchange for the same view is
-    /// still awaiting its relay.
-    deferred_ticks: Vec<DeferredTick>,
+    /// A maintenance `Tick` — or a delta read — encountered inside a *blocking*
+    /// evaluation poll (an exchange wait) is stashed (decoded, see [`Deferred`])
+    /// and replayed at the next top-level drain ([`WorkerProcess::replay_deferred`])
+    /// in SAL arrival order, after the current tick's ACK is sent, so the master
+    /// observes ACKs in SAL arrival order and a later tick cannot re-enter
+    /// `view_id` while an outer exchange for the same view is still awaiting its
+    /// relay.
+    deferred_replay: Vec<Deferred>,
     /// FLAG_EXCHANGE_RELAY messages whose `(view_id, source_id)` doesn't
     /// match the active exchange wait. Keyed by the tuple so a stashed
     /// relay for one source never satisfies a wait for a different source
@@ -325,7 +356,7 @@ impl WorkerProcess {
             w2m_writer,
             exchange: WorkerExchangeHandler {
                 deferred: Vec::new(),
-                deferred_ticks: Vec::new(),
+                deferred_replay: Vec::new(),
                 pending_relays: HashMap::new(),
                 backfill_pad: None,
                 backfill_signal: None,
@@ -385,31 +416,52 @@ impl WorkerProcess {
         if !self.pending_streams.is_empty() {
             self.emit_pending_scan_chunk();
         }
-        while let Some((kind, target_id, wire)) = self.next_sal_message() {
+        while let Some((kind, target_id, lsn, wire)) = self.next_sal_message() {
             // Only an exchange wait can match a relay; the top-level dispatcher
             // classifies ExchangeRelay as a protocol bug and returns nothing.
-            let matched = self.dispatch(DispatchContext::TopLevel, kind, target_id, wire);
+            let matched = self.dispatch(DispatchContext::TopLevel, kind, target_id, lsn, wire);
             debug_assert!(matched.is_none(), "relay matched at top-level drain_sal");
-            // Replay ticks deferred during any exchange wait now that the outer
-            // tick's ACK has been sent. Pushes are handled inline in
-            // `do_exchange_wait` (safe because a user-table push only appends to
-            // `pending_deltas`), so they are never deferred.
-            if !self.exchange.deferred_ticks.is_empty() {
-                self.replay_deferred_ticks();
+            // Replay whatever an exchange wait deferred — a tick or a delta read
+            // — now that the outer tick's ACK has been sent. Pushes are handled
+            // inline in `do_exchange_wait` (safe because a user-table push only
+            // appends to `pending_deltas`), so they are never deferred.
+            if !self.exchange.deferred_replay.is_empty() {
+                self.replay_deferred();
             }
         }
     }
 
-    /// Replay ticks deferred inside a blocking evaluation poll, at top level in
+    /// Replay whatever a blocking evaluation poll deferred, at top level and in
     /// SAL arrival order. Drained into a scratch vec first — a replayed tick may
-    /// itself reach an exchange wait and defer more ticks into a fresh
-    /// `deferred_ticks` — and looped until the queue stays empty.
-    fn replay_deferred_ticks(&mut self) {
-        while !self.exchange.deferred_ticks.is_empty() {
-            for DeferredTick { target_id, req_id } in std::mem::take(&mut self.exchange.deferred_ticks) {
-                match self.handle_tick(target_id, req_id) {
-                    Ok(()) => self.send_ack(target_id as u64, req_id),
-                    Err(e) => self.send_error(&e, req_id),
+    /// itself reach an exchange wait and defer more entries into a fresh
+    /// `deferred_replay` — and looped until the queue stays empty.
+    fn replay_deferred(&mut self) {
+        while !self.exchange.deferred_replay.is_empty() {
+            for entry in std::mem::take(&mut self.exchange.deferred_replay) {
+                match entry {
+                    Deferred::Tick {
+                        target_id,
+                        round,
+                        req_id,
+                    } => match self.handle_tick(target_id, round, req_id) {
+                        Ok(()) => self.send_ack(target_id as u64, req_id),
+                        Err(e) => self.send_error(&e, req_id),
+                    },
+                    // The same body the inline arm runs, so a deferred read
+                    // answers with the frame train it would have answered with
+                    // inline — a tick-shaped `send_ack` is not a reply it has.
+                    Deferred::DeltaRead {
+                        target_id,
+                        request_id,
+                        client_id,
+                        seek_pk,
+                        seek_pk_extra,
+                    } => {
+                        if let Err(f) = self.answer_scan_spec(target_id, request_id, client_id, seek_pk, &seek_pk_extra)
+                        {
+                            self.send_fault(&f, request_id);
+                        }
+                    }
                 }
             }
         }
@@ -417,7 +469,12 @@ impl WorkerProcess {
 
     /// The next SAL group to dispatch. The single SAL-read choke point — both
     /// the top-level loop and the inside-exchange-wait loop funnel through here.
-    fn next_sal_message(&mut self) -> Option<(SalMessageKind, i64, Option<&'static [u8]>)> {
+    ///
+    /// The group header's `lsn` joins the tuple rather than being latched into the
+    /// catalog the way `FLAG_FLUSH_EPH`'s generation is: that latch is correct for
+    /// a generation that governs the whole round, and wrong for a tick round one
+    /// deferred message must carry to its replay.
+    fn next_sal_message(&mut self) -> Option<(SalMessageKind, i64, u64, Option<&'static [u8]>)> {
         let msg = self.sal_reader.next()?;
         // The ephemeral flush round carries the checkpoint generation in the
         // group header's `lsn` field. Latch it before dispatch so
@@ -427,7 +484,7 @@ impl WorkerProcess {
         if msg.kind == SalMessageKind::FlushEph {
             self.cat().set_resume_generation(msg.lsn);
         }
-        Some((msg.kind, msg.target_id as i64, msg.wire_data))
+        Some((msg.kind, msg.target_id as i64, msg.lsn, msg.wire_data))
     }
 
     /// The single source of truth for the inline-vs-defer matrix. Match
@@ -435,14 +492,24 @@ impl WorkerProcess {
     /// cannot be added without explicitly deciding its behavior in both
     /// contexts; the walk-the-matrix tests pin the non-trivial cells.
     ///
-    /// Nearly every kind runs inline in both contexts. Only four cells differ,
+    /// Nearly every kind runs inline in both contexts. Only five cells differ,
     /// and each is here because getting it wrong broke something:
     ///
     /// * **Tick defers inside an evaluation.** An inline tick eval would
     ///   re-enter `view_id` with a different source and produce
     ///   schema-mismatched relays. Defer + replay after the outer
     ///   tick's ACK so the master observes ACKs in SAL arrival order.
-    ///   See `WorkerExchangeHandler::deferred_ticks`.
+    ///   See `WorkerExchangeHandler::deferred_replay`.
+    ///
+    /// * **DeltaScanSpec defers inside an evaluation, and a plain ScanSpec does
+    ///   not.** A read answered while the worker is parked in `do_exchange_wait`
+    ///   sees a half-ingested round — some of that round's views ingested, others
+    ///   not, and a sibling tick group of the same round sitting deferred behind
+    ///   it. A client that then advanced its cursor to that round would lose the
+    ///   rest of it silently, and no row-set comparison would show it. It shares
+    ///   the tick's replay FIFO so the replay order is SAL order. A plain read
+    ///   holds no cursor across calls, so deferring it would only make an ad-hoc
+    ///   point read wait out an exchange round-trip it has no stake in.
     ///
     /// * **DdlSync defers inside an evaluation.** Applying a catalog mutation
     ///   inline would race in-flight DAG eval and create schema
@@ -469,6 +536,7 @@ impl WorkerProcess {
         ctx: DispatchContext,
         kind: SalMessageKind,
         target_id: i64,
+        group_lsn: u64,
         wire: Option<&'static [u8]>,
     ) -> Option<Batch> {
         // Unicast kinds without a per-worker payload aren't for us.
@@ -480,21 +548,59 @@ impl WorkerProcess {
             // ── Tick (maintenance): inline at top-level; defer inside an
             //    in-flight evaluation — an inline tick would re-enter the DAG
             //    with a different source and emit schema-mismatched relays.
-            (DispatchContext::TopLevel, SalMessageKind::Tick) => self.run_via_dispatch_inner(kind, target_id, wire),
+            (DispatchContext::TopLevel, SalMessageKind::Tick) => {
+                self.run_via_dispatch_inner(kind, target_id, group_lsn, wire)
+            }
             (DispatchContext::InEval { .. }, SalMessageKind::Tick) => {
                 // Only the request id is needed; peek the control block instead of
-                // decoding the whole frame.
+                // decoding the whole frame. The round comes off the group header,
+                // so the replay stamps the round that produced this delta rather
+                // than whatever the counter reaches by then.
                 let req_id = wire
                     .and_then(|d| ipc::peek_client_control(d).ok())
                     .map(|c| c.request_id)
                     .unwrap_or(0);
-                self.exchange.deferred_ticks.push(DeferredTick { target_id, req_id });
+                self.exchange.deferred_replay.push(Deferred::Tick {
+                    target_id,
+                    round: group_lsn,
+                    req_id,
+                });
+                None
+            }
+
+            // ── DeltaScanSpec: inline at top-level; defer inside an in-flight
+            //    evaluation, where the answer would span a half-ingested round.
+            (DispatchContext::TopLevel, SalMessageKind::DeltaScanSpec) => {
+                self.run_via_dispatch_inner(kind, target_id, group_lsn, wire)
+            }
+            (DispatchContext::InEval { .. }, SalMessageKind::DeltaScanSpec) => {
+                let Some(data) = wire else {
+                    // Unicast-shaped, so the `wire.is_none()` guard above already
+                    // filtered a slot that is not ours.
+                    unreachable!("DeltaScanSpec with no payload (filtered by dispatch's None guard)")
+                };
+                match ipc::decode_wire(data) {
+                    Ok(mut decoded) => self.exchange.deferred_replay.push(Deferred::DeltaRead {
+                        target_id,
+                        request_id: decoded.control.request_id,
+                        client_id: decoded.control.client_id,
+                        seek_pk: decoded.control.seek_pk,
+                        seek_pk_extra: std::mem::take(&mut decoded.control.seek_pk_extra),
+                    }),
+                    // Dropping it would leave the client waiting forever on a
+                    // request the master has already leased ids for.
+                    Err(e) => self.fatal_shutdown(&format!(
+                        "failed to decode deferred delta read for tid={target_id}: {e}"
+                    )),
+                }
                 None
             }
 
             // ── DdlSync (catalog mutation): apply at top-level; defer inside —
             //    an inline catalog mutation races in-flight DAG eval.
-            (DispatchContext::TopLevel, SalMessageKind::DdlSync) => self.run_via_dispatch_inner(kind, target_id, wire),
+            (DispatchContext::TopLevel, SalMessageKind::DdlSync) => {
+                self.run_via_dispatch_inner(kind, target_id, group_lsn, wire)
+            }
             (DispatchContext::InEval { .. }, SalMessageKind::DdlSync) => {
                 if let Some(data) = wire {
                     match ipc::decode_wire(data) {
@@ -577,18 +683,21 @@ impl WorkerProcess {
             | (_, SalMessageKind::SeekByIndex)
             | (_, SalMessageKind::Seek)
             | (_, SalMessageKind::ScanSpec)
-            | (_, SalMessageKind::Scan) => self.run_via_dispatch_inner(kind, target_id, wire),
+            | (_, SalMessageKind::Scan) => self.run_via_dispatch_inner(kind, target_id, group_lsn, wire),
         }
     }
 
-    /// Decode (with the context-appropriate schema cache policy) and
-    /// dispatch through `dispatch_inner`. Errors are sent on the W2M ring
-    /// with the inbound request_id so the master reactor can route the
-    /// failure back to the original caller.
+    /// Decode (with the context-appropriate schema cache policy) and dispatch
+    /// through `dispatch_inner`. A failure is sent on the W2M ring with the
+    /// inbound request_id so the master reactor can route it back to the original
+    /// caller, carrying whatever status the fault names — this is the one place a
+    /// worker's reply status is chosen, so a typed refusal needs no path of its
+    /// own to reach the wire.
     fn run_via_dispatch_inner(
         &mut self,
         kind: SalMessageKind,
         target_id: i64,
+        group_lsn: u64,
         wire: Option<&'static [u8]>,
     ) -> Option<Batch> {
         // A frame that fails to decode is fail-stop, not a silent no-op: the
@@ -603,13 +712,13 @@ impl WorkerProcess {
             },
         };
         let request_id = decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0);
-        if let Err(msg) = self.dispatch_inner(kind, target_id, decoded, request_id) {
-            self.send_error(&msg, request_id);
+        if let Err(fault) = self.dispatch_inner(kind, target_id, group_lsn, decoded, request_id) {
+            self.send_fault(&fault, request_id);
             if kind == SalMessageKind::DdlSync {
                 // DDL application failure on trusted master→worker IPC means
                 // memory corruption or an engine bug; continuing would leave
                 // this worker with a permanently stale catalog.
-                self.fatal_shutdown(&format!("DdlSync application failed for tid={target_id}: {msg}"));
+                self.fatal_shutdown(&format!("DdlSync application failed for tid={target_id}: {fault}"));
             }
         }
         None
@@ -619,9 +728,10 @@ impl WorkerProcess {
         &mut self,
         kind: SalMessageKind,
         target_id: i64,
+        group_lsn: u64,
         mut decoded: Option<ipc::DecodedWire>,
         request_id: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), gnitz_wire::WireFault> {
         // Extract control fields before consuming decoded
         let seek_pk = decoded.as_ref().map(|d| d.control.seek_pk).unwrap_or(0);
         let seek_col_idx = decoded.as_ref().map(|d| d.control.seek_col_idx).unwrap_or(0);
@@ -744,7 +854,7 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Tick => {
-                self.handle_tick(target_id, request_id)?;
+                self.handle_tick(target_id, group_lsn, request_id)?;
                 self.send_ack(target_id as u64, request_id);
                 Ok(())
             }
@@ -802,26 +912,8 @@ impl WorkerProcess {
                 )
             }
 
-            SalMessageKind::ScanSpec => {
-                // The control block's `seek_pk_extra` bundles the encoded `ReadSpec`
-                // and the client's reply-schema wire block. Decoding the block both
-                // validates it and gives `scan_spec_family` its output shape; it goes
-                // no further, since the client decodes the reply against its own copy.
-                let (spec_bytes, reply_block) =
-                    gnitz_wire::unpack_scan_spec_extra(&seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
-                let spec = gnitz_wire::ReadSpec::decode(spec_bytes).map_err(|e| format!("scan_spec: {e}"))?;
-                let reply_schema = ipc::decode_schema_block(reply_block, true)
-                    .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
-                let keeper = self.cat().scan_spec_family(target_id, &spec, &reply_schema)?;
-                self.send_scan_response(
-                    target_id as u64,
-                    Rc::new(keeper),
-                    ReplySchema::ClientAuthored(&reply_schema),
-                    request_id,
-                    client_id,
-                    0,
-                    false,
-                )
+            SalMessageKind::ScanSpec | SalMessageKind::DeltaScanSpec => {
+                self.answer_scan_spec(target_id, request_id, client_id, seek_pk, &seek_pk_extra)
             }
 
             SalMessageKind::UniquePreflight => {
@@ -865,7 +957,10 @@ impl WorkerProcess {
         Ok(())
     }
 
-    fn handle_tick(&mut self, target_id: i64, request_id: u64) -> Result<(), String> {
+    /// Drive one view-maintenance tick of `target_id`'s dependent closure.
+    /// `round` is the tick round the master allocated for this group; every fed
+    /// view's captured delta is stamped with it.
+    fn handle_tick(&mut self, target_id: i64, round: u64, request_id: u64) -> Result<(), String> {
         let delta = if let Some(d) = self.pending_deltas.remove(&target_id) {
             d
         } else {
@@ -875,8 +970,64 @@ impl WorkerProcess {
             let schema = self.cat().schema_or_err(target_id, "tick")?;
             Batch::empty_with_schema(&schema)
         };
-        self.evaluate_dag(target_id, delta, request_id);
+        self.evaluate_dag(target_id, delta, round, request_id);
         Ok(())
+    }
+
+    /// Answer one `ReadSpec` read: split the control block's `seek_pk_extra` into
+    /// the encoded spec and the client's reply-schema block, run the read, and
+    /// stream the keeper back with no schema block of its own — the client
+    /// authored that schema and decodes against its own copy.
+    ///
+    /// Shared by the inline dispatch arm and by the replay of a deferred delta
+    /// read, so a deferred read answers with the frame train it would have
+    /// answered with inline.
+    ///
+    /// `seek_pk`'s low half is the cut the master sampled when it wrote this
+    /// read's group — the last tick round it had emitted — which bounds an
+    /// incremental delta read above. Every other bound ignores it.
+    ///
+    /// A refusal that is not `STATUS_ERROR` — today only a delta cursor below this
+    /// worker's retention floor — needs nothing of its own: the fault carries its
+    /// status out through the one reply path every other failure here takes.
+    fn answer_scan_spec(
+        &mut self,
+        target_id: i64,
+        request_id: u64,
+        client_id: u64,
+        seek_pk: u128,
+        seek_pk_extra: &[u8],
+    ) -> Result<(), gnitz_wire::WireFault> {
+        let (spec_bytes, reply_block) =
+            gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
+        let spec = gnitz_wire::ReadSpec::decode(spec_bytes).map_err(|e| format!("scan_spec: {e}"))?;
+        let reply_schema =
+            ipc::decode_schema_block(reply_block, true).map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
+        let keeper = self
+            .cat()
+            .scan_spec_family(target_id, &spec, &reply_schema, seek_pk as u64)?;
+        // No row of an incremental reply may exceed the cut: the interval is
+        // closed by construction there, and a below-bound regression — a round
+        // landing after the read group — is what this makes loud in the debug
+        // binary the E2E suite runs.
+        debug_assert!(
+            !matches!(spec.bound, gnitz_wire::ReadBound::Delta { after_tick } if after_tick > 0)
+                || (0..keeper.count).all(|r| {
+                    let pk = keeper.get_pk_bytes(r);
+                    pk.len() >= 8 && u64::from_be_bytes(pk[..8].try_into().unwrap()) <= seek_pk as u64
+                }),
+            "delta reply carries a row above the cut {}",
+            seek_pk as u64,
+        );
+        self.send_scan_response(
+            target_id as u64,
+            Rc::new(keeper),
+            ReplySchema::ClientAuthored(&reply_schema),
+            request_id,
+            client_id,
+            0,
+            false,
+        )
     }
 
     /// Distributed CREATE-VIEW backfill, worker side. Streams this worker's
@@ -1099,7 +1250,7 @@ impl WorkerProcess {
         request_id: u64,
         client_id: u64,
         seek_pk: u128,
-    ) -> Result<(), String> {
+    ) -> Result<(), gnitz_wire::WireFault> {
         // Each arm resolves the probe and names the schema its reply carries;
         // the single exit below frames both the same way.
         let (result, schema, one_off) = match lookup {
@@ -1209,14 +1360,15 @@ impl WorkerProcess {
     /// `request_id` is the master's request id of the message that
     /// triggered this evaluation (FLAG_TICK / FLAG_PUSH / FLAG_BACKFILL);
     /// echoed by `do_exchange_wait` so the master accumulator's wakers
-    /// stay routable.
-    fn evaluate_dag(&mut self, source_id: i64, delta: Batch, request_id: u64) {
+    /// stay routable. `tick_round` is the round that group carried, which stamps
+    /// every fed view's captured delta.
+    fn evaluate_dag(&mut self, source_id: i64, delta: Batch, tick_round: u64, request_id: u64) {
         let dag = self.cat().dag_mut() as *mut DagEngine;
         let mut ctx = WorkerExchangeCtx {
             worker: self,
             tick_request_id: request_id,
         };
-        unsafe { &mut *dag }.evaluate_dag_multi_worker(source_id, delta, &mut ctx);
+        unsafe { &mut *dag }.evaluate_dag_multi_worker(source_id, delta, tick_round, &mut ctx);
         // Apply DDL_SYNC messages deferred during exchange waits.
         self.dispatch_deferred();
     }
@@ -1334,7 +1486,7 @@ mod tests {
     fn make_handler() -> WorkerExchangeHandler {
         WorkerExchangeHandler {
             deferred: Vec::<DeferredDdl>::new(),
-            deferred_ticks: Vec::new(),
+            deferred_replay: Vec::new(),
             pending_relays: HashMap::new(),
             backfill_pad: None,
             backfill_signal: None,
@@ -1465,20 +1617,88 @@ mod tests {
         make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() })
     }
 
-    /// Tick inside an exchange wait MUST defer to `deferred_ticks`,
+    /// Tick inside an exchange wait MUST defer to `deferred_replay`,
     /// not run inline. Cited bug: an inline tick eval re-enters `view_id`
     /// with a different source and produces schema-mismatched relays.
     #[test]
     fn test_dispatch_matrix_tick_defers_inside_exchange() {
         let mut wp = make_worker_for_matrix();
         let ctx = DispatchContext::InEval { relay_wait: (100, 5) };
-        assert!(wp.exchange.deferred_ticks.is_empty());
-        assert!(wp.dispatch(ctx, SalMessageKind::Tick, 999, None).is_none());
-        assert_eq!(wp.exchange.deferred_ticks.len(), 1);
-        assert_eq!(
-            wp.exchange.deferred_ticks[0].target_id, 999,
-            "Tick target_id must be carried into deferred_ticks"
+        assert!(wp.exchange.deferred_replay.is_empty());
+        assert!(wp.dispatch(ctx, SalMessageKind::Tick, 999, 7, None).is_none());
+        assert_eq!(wp.exchange.deferred_replay.len(), 1);
+        assert!(
+            matches!(
+                wp.exchange.deferred_replay[0],
+                Deferred::Tick {
+                    target_id: 999,
+                    round: 7,
+                    ..
+                }
+            ),
+            "the Tick's target and its round must both be carried into the replay queue"
         );
+    }
+
+    /// A **delta** read inside an exchange wait must defer, carrying the whole
+    /// request — `seek_pk` above all, which is where the master put the
+    /// interval's upper cut. A replayed read that lost it would cut at `T = 0`,
+    /// return nothing, and still be answered with a terminal frame reporting the
+    /// real `T`: the client would advance its cursor over rounds it never
+    /// received. It shares the tick's FIFO, so the replay order is SAL order.
+    #[test]
+    fn test_dispatch_matrix_delta_read_defers_inside_exchange_with_its_whole_request() {
+        let mut wp = make_worker_for_matrix();
+        let ctx = DispatchContext::InEval { relay_wait: (100, 5) };
+        let frame = Box::leak(
+            ipc::WireMsg {
+                target_id: 77,
+                client_id: 0xC1,
+                seek_pk: 4242,
+                seek_pk_extra: &[9, 8, 7],
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into_boxed_slice(),
+        );
+        // A tick first, so the shared FIFO's insertion order is observable.
+        assert!(wp.dispatch(ctx, SalMessageKind::Tick, 999, 3, None).is_none());
+        assert!(wp
+            .dispatch(ctx, SalMessageKind::DeltaScanSpec, 77, 0, Some(frame))
+            .is_none());
+        assert_eq!(wp.exchange.deferred_replay.len(), 2, "one queue, in SAL order");
+        assert!(matches!(wp.exchange.deferred_replay[0], Deferred::Tick { .. }));
+        match &wp.exchange.deferred_replay[1] {
+            Deferred::DeltaRead {
+                target_id,
+                client_id,
+                seek_pk,
+                seek_pk_extra,
+                ..
+            } => {
+                assert_eq!((*target_id, *client_id, *seek_pk), (77, 0xC1, 4242));
+                assert_eq!(seek_pk_extra.as_slice(), &[9, 8, 7]);
+            }
+            other => panic!("a delta read must defer as a DeltaRead, got {other:?}"),
+        }
+    }
+
+    /// A **plain** ScanSpec does not defer: it holds no cursor across calls, so
+    /// making an ad-hoc point read wait out an exchange round-trip it has no
+    /// stake in buys nothing. The classification is what separates the two, and
+    /// `FLAG_DELTA_SCAN` must outrank `FLAG_SCAN_SPEC` for it to survive — a
+    /// delta read's group carries both bits.
+    #[test]
+    fn test_delta_scan_outranks_plain_scan_spec_in_the_classifier() {
+        use crate::runtime::sal::{FLAG_DELTA_SCAN, FLAG_SCAN_SPEC};
+        assert_eq!(
+            SalMessageKind::classify(FLAG_SCAN_SPEC | FLAG_DELTA_SCAN),
+            SalMessageKind::DeltaScanSpec,
+        );
+        assert_eq!(SalMessageKind::classify(FLAG_SCAN_SPEC), SalMessageKind::ScanSpec);
+        // Unicast-shaped, like every other read: a replicated view's worker-0
+        // delta read must not be acted on by the workers that got no slot.
+        assert!(!SalMessageKind::DeltaScanSpec.is_broadcast());
     }
 
     /// Encode a header-only ExchangeRelay wire frame (schema, no data batch)
@@ -1524,7 +1744,7 @@ mod tests {
         // Mismatched view (target_id=200 ≠ want 100): parked under (200, 0).
         let frame = encode_relay_frame(200, 0, &schema);
         assert!(wp
-            .dispatch(ctx, SalMessageKind::ExchangeRelay, 200, Some(frame))
+            .dispatch(ctx, SalMessageKind::ExchangeRelay, 200, 0, Some(frame))
             .is_none());
         assert!(
             wp.exchange.pending_relays.contains_key(&(200, 0)),
@@ -1534,7 +1754,7 @@ mod tests {
         // Matching key (target_id=100, source_id=0 == want_key): returns the batch.
         let frame = encode_relay_frame(100, 0, &schema);
         assert!(
-            wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 100, Some(frame))
+            wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 100, 0, Some(frame))
                 .is_some(),
             "a key-matching relay must short-circuit out of dispatch with its batch"
         );
@@ -1552,6 +1772,7 @@ mod tests {
                 DispatchContext::TopLevel,
                 SalMessageKind::ExchangeRelay,
                 100,
+                0,
                 Some(empty)
             )
             .is_none());
@@ -1574,7 +1795,7 @@ mod tests {
         let ctx = DispatchContext::InEval { relay_wait: (0, 0) };
 
         let frame = encode_data_frame(42, &schema, &one_row_batch(&schema, 1, 10));
-        assert!(wp.dispatch(ctx, SalMessageKind::DdlSync, 42, Some(frame)).is_none());
+        assert!(wp.dispatch(ctx, SalMessageKind::DdlSync, 42, 0, Some(frame)).is_none());
         assert_eq!(
             wp.exchange.deferred.len(),
             1,
@@ -1582,7 +1803,7 @@ mod tests {
         );
         assert_eq!(wp.exchange.deferred[0].target_id, 42);
         assert!(
-            wp.exchange.deferred_ticks.is_empty(),
+            wp.exchange.deferred_replay.is_empty(),
             "DdlSync must not touch the deferred-tick queue"
         );
     }
@@ -1621,11 +1842,11 @@ mod tests {
         wp.sal_reader = SalReader::new(sal_ptr as *const u8, 0, SAL_SIZE, -1, 1);
 
         assert_eq!(
-            wp.next_sal_message().map(|(k, t, _)| (k, t)),
+            wp.next_sal_message().map(|(k, t, _, _)| (k, t)),
             Some((SalMessageKind::Push, 42))
         );
         assert_eq!(
-            wp.next_sal_message().map(|(k, t, _)| (k, t)),
+            wp.next_sal_message().map(|(k, t, _, _)| (k, t)),
             Some((SalMessageKind::DdlSync, 43))
         );
 
@@ -1639,7 +1860,7 @@ mod tests {
         write(0, 77, 103, FLAG_PUSH, 2);
         wp.sal_reader.checkpoint_reset();
         assert_eq!(
-            wp.next_sal_message().map(|(k, t, _)| (k, t)),
+            wp.next_sal_message().map(|(k, t, _, _)| (k, t)),
             Some((SalMessageKind::Push, 77))
         );
     }
@@ -2255,7 +2476,10 @@ mod tests {
         let err = wp
             .stream_batch_response(tid as u64, Some(batch), ReplySchema::Table(&schema), 5, 0, 0)
             .expect_err("oversized STRING result must surface the clean error");
-        assert!(err.contains("cannot be chunked"), "error names the limitation: {err}");
+        assert!(
+            err.text.contains("cannot be chunked"),
+            "error names the limitation: {err}"
+        );
         assert!(wp.pending_streams.is_empty(), "non-wire-safe results never enqueue");
 
         engine.close();

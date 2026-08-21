@@ -285,13 +285,29 @@ pub const FLAG_ZONE_START: u32 = 1 << 18;
 /// distinct so the base round (`FLAG_FLUSH`, `SalReplay` user tables) and the
 /// ephemeral round (`Rederive` view state) stay separate handlers.
 pub const FLAG_FLUSH_EPH: u32 = 1 << 19;
+/// A `FLAG_SCAN_SPEC` read whose bound is a delta bound. A dispatch
+/// classification, not a verb: the client still sends `FLAG_SCAN_SPEC`, and the
+/// master peeks the bound once (`peek_delta_bound`) and stamps this alongside it.
+///
+/// It exists because the worker's inline-vs-defer matrix is a function of
+/// `(context, kind)` and nothing else — deciding inside the `ScanSpec` arm by
+/// peeking the bound there would break that, and deferring *every* `ScanSpec`
+/// would make an ad-hoc point read wait out an exchange round-trip it has no
+/// stake in.
+pub const FLAG_DELTA_SCAN: u32 = 1 << 20;
 
 // The flags above that `gnitz_wire` does not allocate are the engine's own, and
 // stay strictly above the shared 0-15 block — that separation is what lets the
 // two crates allocate independently. `gnitz_wire`'s guard covers the block
 // itself; this covers the engine's side of the line.
 const _: () = {
-    let engine_only = [FLAG_GATHER, FLAG_UNIQUE_PREFLIGHT, FLAG_ZONE_START, FLAG_FLUSH_EPH];
+    let engine_only = [
+        FLAG_GATHER,
+        FLAG_UNIQUE_PREFLIGHT,
+        FLAG_ZONE_START,
+        FLAG_FLUSH_EPH,
+        FLAG_DELTA_SCAN,
+    ];
     let mut acc = 0u32;
     let mut i = 0;
     while i < engine_only.len() {
@@ -336,14 +352,24 @@ pub enum SalMessageKind {
     Tick,
     SeekByIndex,
     Seek,
+    /// A `ReadSpec` read carrying a delta bound. Answered by the same handler a
+    /// plain `ScanSpec` is, and separate only so the defer matrix can name it: a
+    /// delta read answered from inside an in-flight evaluation would see a
+    /// half-ingested round, and a client that advanced its cursor to that round
+    /// would lose the rest of it silently.
+    DeltaScanSpec,
     ScanSpec,
     Scan,
 }
 
 /// Flag bit → kind, in priority order; the first bit set on the group wins.
-/// Each kind owns a distinct bit, so only `Shutdown` leading and the two flush
-/// rounds preceding the rest actually constrains anything.
-const KIND_BY_FLAG: [(u32, SalMessageKind); 14] = [
+///
+/// Two positions constrain the order. `Shutdown` leads and the two flush rounds
+/// precede the rest, as before. And `FLAG_DELTA_SCAN` must sit **above**
+/// `FLAG_SCAN_SPEC`: a delta read's group carries both bits, so the other order
+/// would classify every one of them as a plain `ScanSpec` and silently give up
+/// the deferral. Every other kind owns a distinct bit and is unconstrained.
+const KIND_BY_FLAG: [(u32, SalMessageKind); 15] = [
     (FLAG_SHUTDOWN, SalMessageKind::Shutdown),
     (FLAG_FLUSH, SalMessageKind::Flush),
     (FLAG_FLUSH_EPH, SalMessageKind::FlushEph),
@@ -357,6 +383,7 @@ const KIND_BY_FLAG: [(u32, SalMessageKind); 14] = [
     (FLAG_TICK, SalMessageKind::Tick),
     (FLAG_SEEK_BY_INDEX, SalMessageKind::SeekByIndex),
     (FLAG_SEEK, SalMessageKind::Seek),
+    (FLAG_DELTA_SCAN, SalMessageKind::DeltaScanSpec),
     (FLAG_SCAN_SPEC, SalMessageKind::ScanSpec),
 ];
 
@@ -371,9 +398,11 @@ impl SalMessageKind {
 
     /// True when the worker must act on the group even if its per-worker
     /// data slot is empty (broadcast / control / data-rebroadcast kinds).
-    /// Unicast kinds (SEEK, SEEK_BY_INDEX, Scan, UniquePreflight,
-    /// ExchangeRelay) return false: a missing slot means the message
-    /// wasn't for us.
+    /// Unicast kinds (SEEK, SEEK_BY_INDEX, Scan, ScanSpec, DeltaScanSpec,
+    /// UniquePreflight, ExchangeRelay) return false: a missing slot means the
+    /// message wasn't for us — which is also what keeps a replicated view's
+    /// worker-0 delta unicast from being acted on by the workers that got no
+    /// slot.
     pub fn is_broadcast(self) -> bool {
         matches!(
             self,

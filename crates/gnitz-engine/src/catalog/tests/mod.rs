@@ -272,12 +272,27 @@ fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, s
 /// `0` pk_col_idx decodes back to a single-column PK `[0]`. A `-1` reproduces
 /// exactly what a `+1` wrote, which is what the retraction CAS compares.
 fn push_view_tab_row(bb: &mut BatchBuilder, weight: i64, vid: i64, view_name: &str, sql: &str, capacity_bytes: u64) {
+    push_view_tab_row_with(bb, weight, vid, view_name, sql, capacity_bytes, 0);
+}
+
+/// [`push_view_tab_row`] with both `WITH (…)` budgets, for the tests that assert
+/// on a delta feed or on the two being refused together.
+fn push_view_tab_row_with(
+    bb: &mut BatchBuilder,
+    weight: i64,
+    vid: i64,
+    view_name: &str,
+    sql: &str,
+    capacity_bytes: u64,
+    delta_bytes: u64,
+) {
     bb.begin_row(vid as u128, weight);
     bb.put_u64(PUBLIC_SCHEMA_ID as u64);
     bb.put_string(view_name);
     bb.put_string(sql);
     bb.put_u64(0); // pk_col_idx
     bb.put_u64(capacity_bytes); // 0 = unbounded
+    bb.put_u64(delta_bytes); // 0 = no delta feed
     bb.end_row();
 }
 
@@ -301,11 +316,24 @@ fn try_register_identity_view(
     cols: &[ColumnDef],
     capacity_bytes: u64,
 ) -> Result<i64, String> {
+    try_register_identity_view_with(engine, base_tid, name, cols, capacity_bytes, 0)
+}
+
+/// [`try_register_identity_view`] carrying both `WITH (…)` budgets — for the
+/// rules that turn on a delta feed, and on the pair.
+fn try_register_identity_view_with(
+    engine: &mut CatalogEngine,
+    base_tid: i64,
+    name: &str,
+    cols: &[ColumnDef],
+    capacity_bytes: u64,
+    delta_bytes: u64,
+) -> Result<i64, String> {
     let vid = engine.allocate_table_id();
     write_identity_circuit(engine, vid, base_tid, None);
     engine.write_column_records(vid, OWNER_KIND_VIEW, cols).unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, vid, name, "", capacity_bytes);
+    push_view_tab_row_with(&mut bb, 1, vid, name, "", capacity_bytes, delta_bytes);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish())?;
     Ok(vid)
 }

@@ -1003,6 +1003,57 @@ pub fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) -> Resu
     Ok(b.finish())
 }
 
+/// The delta store's schema for a fed view: a `_tick` U64 key column, then the
+/// view's PK columns in PK-list order, then the view's payload columns in schema
+/// order. Derived rather than persisted, exactly as [`make_index_schema`] is —
+/// the delta store is registered and recovered the way a secondary index is.
+///
+/// A `SchemaDescriptor` holds types, nullability and a PK-index list and **no
+/// column names at all**, so `_tick` is a position, not an identifier: there is
+/// nothing for a user column name to collide with.
+///
+/// This is a **reordering** of the view's columns, not a shift of them, and that
+/// is what lets a stamp copy the payload regions verbatim: the set of columns
+/// excluded from the payload space is the same set plus `_tick`, which is not one
+/// of them, so the *k*-th payload column of the view is the *k*-th payload column
+/// of the delta — null bitmap included, which indexes by payload position.
+///
+/// `None` — never an abort — for the one limit that binds: a view already at
+/// `MAX_COLUMNS` cannot carry a feed, because the stamp is one more column.
+/// Neither PK limit can, which the assertion below this holds to rather than
+/// leaving to prose.
+///
+/// Stamped [`Placement::Local`] — "rows live on whichever worker produced them
+/// and are not keyed by `worker_for_pk` at all", which is what these rows are.
+/// Nothing routes by it (a delta read is routed off the *view's* schema), so this
+/// is not a second line of defence; it is what keeps a future router from being
+/// told something false.
+///
+/// Prepending the stamp to the widest declarable view PK still fits both PK
+/// limits, so neither can refuse a feed. Stated to the compiler because all four
+/// numbers are `const` and a change to any of them would otherwise turn this from
+/// a proof into a wrong comment.
+const _: () = {
+    // The stamp is one U64 column ahead of a view PK, which is at most
+    // `PK_LIST_MAX_COLS` columns of at most 16 bytes each.
+    const STAMPED_COLS: usize = 1 + gnitz_wire::PK_LIST_MAX_COLS;
+    const STAMPED_BYTES: usize = 8 + gnitz_wire::PK_LIST_MAX_COLS * 16;
+    assert!(
+        STAMPED_COLS <= MAX_PK_COLUMNS && STAMPED_BYTES <= MAX_PK_BYTES,
+        "a _tick stamp on the widest view PK no longer fits the PK limits"
+    );
+};
+
+pub fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk(SchemaColumn::new(type_code::U64, 0))?;
+    b.push_pk_of(view)?;
+    for (_, c) in view.payload_columns() {
+        b.push(*c)?;
+    }
+    Some(b.finish().with_placement(Placement::Local))
+}
+
 /// Build the schema for a `gather_family` result: the PK columns of `schema`
 /// (in pk-list order, so the packed PK round-trips identically) followed by
 /// the projected columns in `project` order as payload. `project` must list

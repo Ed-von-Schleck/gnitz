@@ -183,6 +183,18 @@ impl DagEngine {
         DepMap::closure(&self.dep.reverse, seeds)
     }
 
+    /// The other direction over the same edges: every view reachable from
+    /// `seeds` by following `source → dependents`, with the seeds excluded — which
+    /// views a tick of these sources reaches.
+    ///
+    /// Beside [`Self::source_closure`] rather than re-derived outside the crate
+    /// off `get_dep_map`, because the two directions belong next to each other and
+    /// only one of them was reachable from outside.
+    pub fn dependent_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
+        self.get_dep_map();
+        DepMap::closure(&self.dep.forward, seeds)
+    }
+
     /// The distinct ids of `view_ids` in dependency order (Kahn's algorithm over
     /// `get_source_ids(vid) ∩ view_ids`): a source view precedes every dependent
     /// that scans it, so it is registered and backfilled first. Neither order a
@@ -276,6 +288,23 @@ impl DagEngine {
         self.tables
             .get(&id)
             .is_some_and(|e| e.schema.placement().is_replicated())
+    }
+
+    /// True iff at least one registered view carries a delta feed. The master's
+    /// idle-poll bookkeeping — the forward-closure walk and the last-round map —
+    /// is skipped outright when this is false, which is every server that does not
+    /// use the feature. A walk of the registry rather than a maintained counter:
+    /// it runs once per emitted tick group, against a relation count in the tens,
+    /// beside a SAL write and an eventfd.
+    pub fn any_delta_feed(&self) -> bool {
+        self.tables.values().any(|e| e.delta_bytes.is_some())
+    }
+
+    /// True iff `id` is a relation carrying a delta feed. Answered off the
+    /// registry, so it is the same answer on the post-fork master — which holds no
+    /// store — as on a worker.
+    pub fn relation_has_delta_feed(&self, id: i64) -> bool {
+        self.tables.get(&id).is_some_and(|e| e.delta_bytes.is_some())
     }
 
     /// Every registered view id.

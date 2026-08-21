@@ -30,6 +30,7 @@ const BOUND_NONE: u8 = 0;
 const BOUND_PK_RANGE: u8 = 1;
 const BOUND_INDEX_RANGE: u8 = 2;
 const BOUND_PK_SET: u8 = 3;
+const BOUND_DELTA: u8 = 4;
 
 const SINK_ROWS: u8 = 0;
 const SINK_FOLD: u8 = 1;
@@ -136,6 +137,17 @@ pub enum ReadBound {
     /// PK's width** — the worker rejects the rest. Wire order is irrelevant: the
     /// worker OPK-sorts the keys before its forward gather.
     PkSet(Vec<u128>),
+    /// Every delta a fed view emitted after tick round `after_tick`, walked over
+    /// the view's delta store rather than its output store. `after_tick = 0` is
+    /// the bootstrap: it names the view's whole history, which is what the output
+    /// store already holds, so that arm reads the output store in the view's own
+    /// schema.
+    ///
+    /// A distinct tag rather than a `PkRange` over the delta store's leading
+    /// `_tick` column: the tag is what the master's router reads, and a
+    /// `PkRange`-tagged delta read would be hashed against the *view's* schema
+    /// and unicast to one worker — a silently partial answer.
+    Delta { after_tick: u64 },
 }
 
 impl ReadBound {
@@ -145,6 +157,7 @@ impl ReadBound {
             ReadBound::PkRange(_) => BOUND_PK_RANGE,
             ReadBound::IndexRange { .. } => BOUND_INDEX_RANGE,
             ReadBound::PkSet(_) => BOUND_PK_SET,
+            ReadBound::Delta { .. } => BOUND_DELTA,
         }
     }
 }
@@ -158,6 +171,24 @@ pub struct ReadSpec {
     /// bound is exact and no residual filter runs.
     pub predicate: Vec<u8>,
     pub sink: ReadSink,
+}
+
+/// Pack a delta reply's terminal watermark: the cursor tag in the high half of
+/// `seek_pk`, the tick round `T` in the low half. Defined here, beside the bound
+/// it answers, because the encoder is in the server and the decoder in the
+/// client — the same reason [`pack_scan_spec_extra`], `pack_col_id` and
+/// `pack_pk_cols` are single-sourced in this crate.
+///
+/// One field, because "which cursor is this?" and "how far does it reach?" are
+/// answered together: a client that does not recognise the tag discards its copy
+/// and re-reads at `after_tick = 0` whatever `T` says.
+pub fn pack_delta_watermark(tag: u64, tick: u64) -> u128 {
+    ((tag as u128) << 64) | tick as u128
+}
+
+/// The inverse of [`pack_delta_watermark`]: `(tag, tick)`.
+pub fn unpack_delta_watermark(watermark: u128) -> (u64, u64) {
+    ((watermark >> 64) as u64, watermark as u64)
 }
 
 /// Pack a ScanSpec request's control-block `seek_pk_extra` blob: the encoded
@@ -192,13 +223,37 @@ pub fn unpack_scan_spec_extra(extra: &[u8]) -> Result<(&[u8], &[u8]), String> {
 /// compare rather than a megabyte-scale parse. [`ReadSpec::decode`] remains the
 /// worker's full validating parse.
 pub fn peek_pk_range(buf: &[u8]) -> Option<RangeDescriptor> {
+    read_range_descriptor(&mut peek_bound(buf, BOUND_PK_RANGE)?).ok()
+}
+
+/// A reader positioned just past the fixed header of an encoded `ReadSpec`, if
+/// that spec carries a `kind` bound. `None` for every other bound kind, an
+/// unknown version, or a truncated prefix.
+///
+/// Both peeks read the header through here rather than each spelling it out.
+/// They are the master's routing and gating inputs and their failure mode is
+/// silent — a header that grew a field would make one of two hand-written parses
+/// return `None`, which routes every read as a broadcast and gates no poll, with
+/// no error anywhere.
+fn peek_bound<'a>(buf: &'a [u8], kind: u8) -> Option<Reader<'a>> {
     let mut r = Reader::new(buf, "read_spec");
-    if r.u8().ok()? != VERSION || r.u8().ok()? != BOUND_PK_RANGE {
+    if r.u8().ok()? != VERSION || r.u8().ok()? != kind {
         return None;
     }
     r.u8().ok()?; // sink tag
     r.u8().ok()?; // reserved
-    read_range_descriptor(&mut r).ok()
+    Some(r)
+}
+
+/// The `after_tick` of an encoded `ReadSpec` carrying a delta bound, or `None`
+/// for every other bound kind, an unknown version, or a truncated prefix.
+///
+/// Read once per request by the master and its answer used for all three of the
+/// dispatch classification, the routing and the idle-poll gate, so the bound is
+/// decoded once rather than three times. [`ReadSpec::decode`] remains the
+/// worker's full validating parse and the sole trust boundary.
+pub fn peek_delta_bound(buf: &[u8]) -> Option<u64> {
+    peek_bound(buf, BOUND_DELTA)?.u64().ok()
 }
 
 /// Read an embedded `RangeDescriptor`: peek its `n_eq` to learn its span, slice
@@ -250,6 +305,9 @@ impl ReadSpec {
                 // One memcpy: on a little-endian target the `u128` slice already
                 // IS its wire image. A `pk IN (…)` set reaches MAX_PK_SET_KEYS.
                 w.u32(keys.len() as u32).raw(crate::as_le_bytes(keys));
+            }
+            ReadBound::Delta { after_tick } => {
+                w.u64(*after_tick);
             }
         }
 
@@ -339,6 +397,7 @@ impl ReadSpec {
                     .collect();
                 ReadBound::PkSet(keys)
             }
+            BOUND_DELTA => ReadBound::Delta { after_tick: r.u64()? },
             other => return Err(format!("read_spec: unknown bound kind {other}")),
         };
 
@@ -494,6 +553,18 @@ mod tests {
                     limit_k: 8,
                 },
             },
+            // The bootstrap sentinel and a saturated cursor, both of which the
+            // router must see as a delta bound rather than as a range.
+            ReadSpec {
+                bound: ReadBound::Delta { after_tick: 0 },
+                predicate: vec![],
+                sink: ReadSink::all_rows(),
+            },
+            ReadSpec {
+                bound: ReadBound::Delta { after_tick: u64::MAX },
+                predicate: vec![7, 7],
+                sink: ReadSink::all_rows(),
+            },
         ];
         for spec in specs {
             let bytes = enc(&spec);
@@ -522,6 +593,72 @@ mod tests {
             predicate: vec![],
             sink: ReadSink::all_rows(),
         }
+    }
+
+    /// The delta bound must peek as itself and NOT as a `PkRange`: the master
+    /// routes off `peek_pk_range`, and a delta read misread as a range would be
+    /// hashed against the view's schema and unicast to one worker.
+    #[test]
+    fn delta_bound_peeks_as_delta_and_never_as_a_range() {
+        for tick in [0u64, 1, 42, u64::MAX] {
+            let bytes = enc(&ReadSpec {
+                bound: ReadBound::Delta { after_tick: tick },
+                predicate: vec![],
+                sink: ReadSink::all_rows(),
+            });
+            assert_eq!(peek_delta_bound(&bytes), Some(tick));
+            assert_eq!(peek_pk_range(&bytes), None);
+        }
+        // And every other bound peeks as no delta.
+        let range = enc(&ReadSpec {
+            bound: ReadBound::PkRange(RangeDescriptor::new(&[], After(1), After(9))),
+            predicate: vec![],
+            sink: ReadSink::all_rows(),
+        });
+        assert_eq!(peek_delta_bound(&range), None);
+        assert_eq!(peek_delta_bound(&enc(&empty_spec())), None);
+    }
+
+    /// The watermark's two halves survive the round trip independently — the
+    /// server packs it, the client unpacks it, and nothing else binds them.
+    #[test]
+    fn delta_watermark_roundtrips_both_halves() {
+        for &(tag, tick) in &[(0u64, 0u64), (1, 2), (u64::MAX, 0), (0, u64::MAX), (u64::MAX, u64::MAX)] {
+            assert_eq!(unpack_delta_watermark(pack_delta_watermark(tag, tick)), (tag, tick));
+        }
+    }
+
+    /// Both peeks take the **unpacked** `ReadSpec`, never the packed
+    /// `seek_pk_extra` blob it travels inside. The two are both `&[u8]`, so
+    /// handing over the wrong one compiles, routes every read as a broadcast and
+    /// gates no poll — correct answers, silently unrouted, which no row
+    /// comparison would show. Pin the distinction the types cannot.
+    #[test]
+    fn the_peeks_read_a_spec_never_the_packed_blob() {
+        let range = enc(&ReadSpec {
+            bound: ReadBound::PkRange(RangeDescriptor::new(&[], After(1), After(9))),
+            predicate: vec![],
+            sink: ReadSink::all_rows(),
+        });
+        let delta = enc(&ReadSpec {
+            bound: ReadBound::Delta { after_tick: 7 },
+            predicate: vec![],
+            sink: ReadSink::all_rows(),
+        });
+        assert!(peek_pk_range(&range).is_some(), "an unpacked spec names its range");
+        assert_eq!(peek_delta_bound(&delta), Some(7), "an unpacked spec names its cursor");
+
+        // The reply-schema block is what a real request carries beside the spec.
+        assert_eq!(
+            peek_pk_range(&pack_scan_spec_extra(&range, &[1, 2, 3])),
+            None,
+            "the packed blob is not a spec: it must confine no worker"
+        );
+        assert_eq!(
+            peek_delta_bound(&pack_scan_spec_extra(&delta, &[1, 2, 3])),
+            None,
+            "the packed blob is not a spec: it must gate no poll"
+        );
     }
 
     #[test]
