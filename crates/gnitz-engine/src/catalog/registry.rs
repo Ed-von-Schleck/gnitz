@@ -265,8 +265,13 @@ impl CatalogEngine {
     /// this master publishes from now on carries the new stamp. Returns the new
     /// generation. Synchronous (memtable ingest + blocking flush), so it runs as
     /// an atomic block between the committer's checkpoint steps with no
-    /// interleaving. From this instant every existing Rederive manifest is stale;
-    /// a crash below rebuilds views instead of silently staleifying them.
+    /// interleaving.
+    ///
+    /// **A fence.** Nothing is written at generation `g` until `g` is durable, so
+    /// a crash below leaves the durable generation at or ahead of every manifest
+    /// and every record a caller keeps beside them. Each is honoured only at
+    /// equality with [`Self::resume_generation`], so a half-finished checkpoint
+    /// rebuilds instead of resuming something stale.
     pub fn bump_checkpoint_generation(&mut self) -> Result<u64, String> {
         let new = self.durable_generation + 1;
         self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, new as i64)

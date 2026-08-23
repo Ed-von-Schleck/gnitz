@@ -11,24 +11,17 @@
 //!
 //! **The header carries the checkpoint generation the records were written
 //! for, and a reopen acts on them only when that is the generation the engine
-//! came back at.** Write order alone leaves two silent failures, and the file
-//! records where the *feed* got to while saying nothing about which durable
-//! state that round belongs to:
+//! came back at.** The file is one of the records the generation fence covers
+//! (`bump_checkpoint_generation`): written after the copies are durable at `g`,
+//! and carrying the `g` the flush reported, so equality with the resumed
+//! generation *is* "these copies resumed from the checkpoint these positions
+//! were written for". Any crash inside the sequence leaves the two unequal and
+//! every view bootstraps.
 //!
-//! * A crash between the ephemeral round and this write leaves copies holding
-//!   every round through `T₂` beside a file still naming `T₁`. The tag still
-//!   continues, so the poll re-applies `(T₁, T₂]` onto a store that already
-//!   absorbed it and every weight in that interval doubles — with an identical
-//!   row set, which is why nothing notices.
-//! * A crash between the generation bump and the ephemeral round leaves the
-//!   durable generation at `g+1` while every output manifest carries `g`, so
-//!   each `Rederive` open erases. The poll then delivers `(T₁, …]` onto nothing
-//!   and everything at or below `T₁` is gone permanently.
-//!
-//! Both are one comparison away: the engine's resumed generation *is* the one
-//! every `Rederive` open just gated on, so "the file's generation equals it" is
-//! precisely "these copies resumed from the checkpoint these cursors were
-//! written for".
+//! Write order alone would not do it, and the failure it misses is the quiet
+//! one: a file still naming `T₁` beside copies that already absorbed through
+//! `T₂` makes the next poll re-apply `(T₁, T₂]` onto rows that hold it, doubling
+//! every weight in the interval while the row set stays identical.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -85,10 +78,6 @@ pub(crate) fn read_cursors(
 
 /// Replace the cursor file atomically: write a temp, `fdatasync` it, rename it
 /// into place, then fsync the directory so the rename itself is durable.
-///
-/// The caller writes this **last** in the checkpoint sequence. A cursor written
-/// before the copies would name a round the store never absorbed even in the
-/// clean case, and no header could tell that from a good checkpoint.
 pub(crate) fn write_cursors(base_dir: &str, generation: u64, cursors: &[(u64, DeltaCursor)]) -> Result<(), String> {
     let mut buf = Vec::with_capacity(16 + cursors.len() * 24);
     buf.extend_from_slice(&CURSOR_MAGIC.to_le_bytes());

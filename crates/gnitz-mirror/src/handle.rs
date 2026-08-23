@@ -241,17 +241,13 @@ impl Mirror {
         self.applied_bytes >= self.checkpoint_bytes
     }
 
-    /// Make every copy and its cursor durable.
+    /// Make every copy and its cursor durable — the committer's sequence minus
+    /// the steps that only exist for a SAL: raise the generation fence, flush the
+    /// copies to it, record the cursors at the generation the flush reports.
     ///
-    /// The committer's sequence minus the steps that only exist for a SAL: bump
-    /// the generation (which is itself durable and publishes to `worker_ctx`),
-    /// run the engine's ephemeral flush round over the mirrored copies, then
-    /// write the cursor file **last**.
-    ///
-    /// The ephemeral round publishes unconditionally, which is what makes the
-    /// resume gate decidable for a mirror that polled nothing since the last
-    /// checkpoint: a gated publish would leave "resumed at `gen`" and "never
-    /// checkpointed" indistinguishable.
+    /// The round publishes even for a copy that absorbed nothing since the last
+    /// checkpoint, which is what keeps "resumed at `gen`" and "never
+    /// checkpointed" distinguishable.
     ///
     /// **A failed checkpoint is reported, not poisoned** — the one `Err` here
     /// that is not fatal to the handle. The flush writes shards and publishes
@@ -267,10 +263,10 @@ impl Mirror {
     }
 
     fn checkpoint_inner(&mut self) -> Result<(), MirrorError> {
-        let gen = self.engine.bump_checkpoint_generation()?;
-        self.engine.flush_ephemeral_round()?;
+        self.engine.bump_checkpoint_generation()?;
+        let generation = self.engine.flush_ephemeral_round()?;
         let cursors: Vec<(u64, DeltaCursor)> = self.cursors.iter().map(|(&view_id, &c)| (view_id, c)).collect();
-        write_cursors(&self.base_dir, gen, &cursors)?;
+        write_cursors(&self.base_dir, generation, &cursors)?;
         self.applied_bytes = 0;
         Ok(())
     }

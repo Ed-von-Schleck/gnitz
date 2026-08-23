@@ -283,15 +283,16 @@ impl CatalogEngine {
     }
 
     /// The ephemeral checkpoint round: force-persist every view's operator-trace
-    /// tables and output stores, stamped with this engine's resume generation.
+    /// tables and output stores, stamped with this engine's resume generation,
+    /// and return that stamp.
     ///
     /// Two global passes — traces first, then outputs — so that any output at
     /// generation `G` implies that view's own traces are already durable at `G`.
     /// Batching each pass into one barrier also beats per-view interleaving.
     ///
     /// The caller latches the generation first: the server off the `FlushEph`
-    /// message, an embedder through `bump_checkpoint_generation`.
-    pub fn flush_ephemeral_round(&mut self) -> Result<(), String> {
+    /// message, an embedder through [`Self::bump_checkpoint_generation`].
+    pub fn flush_ephemeral_round(&mut self) -> Result<u64, String> {
         let (traces, outputs) = self.dag.collect_ephemeral_flush_tables();
         let generation = self.resume_generation();
         let pass = |tables: Vec<*mut Table>, what: &str| {
@@ -299,7 +300,8 @@ impl CatalogEngine {
                 .map_err(|e| format!("ephemeral {what} flush: {e}"))
         };
         pass(traces, "trace")?;
-        pass(outputs, "output")
+        pass(outputs, "output")?;
+        Ok(generation)
     }
 
     /// Flush every store this engine owns that a restart could read back — each
