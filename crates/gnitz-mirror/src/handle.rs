@@ -70,9 +70,6 @@ pub(crate) struct MirroredView {
     /// The engine's derived delta-store shape, from the same builder the server
     /// derives its own delta store with.
     pub(crate) delta_desc: SchemaDescriptor,
-    /// `None` until the first bootstrap, and after a reopen whose cursor record
-    /// did not survive the two-part verdict.
-    pub(crate) cursor: Option<DeltaCursor>,
 }
 
 /// A maintained local copy of one or more views, and the connection that feeds
@@ -86,11 +83,13 @@ pub struct Mirror {
     pub(crate) engine: CatalogEngine,
     pub(crate) client: GnitzClient,
     pub(crate) views: HashMap<u64, MirroredView>,
-    /// The feed positions the cursor file replayed at open, less the ones a
-    /// [`Mirror::mirror_view`] has since claimed. The *registrations* they
-    /// belong to are not shadowed here: the local catalog holds them, and
-    /// answers by id, by qualified name and by layout.
-    pub(crate) replayed: HashMap<u64, DeltaCursor>,
+    /// Where each view's feed got to, and by its presence that the copy is
+    /// valid — see [`Mirror::readable`].
+    ///
+    /// Not a field of [`MirroredView`]: it outlives one. A checkpoint
+    /// republishes every copy in the local catalog, including views this session
+    /// never re-registered, so the cursors beside them must cover the same set.
+    pub(crate) cursors: HashMap<u64, DeltaCursor>,
     pub(crate) base_dir: String,
     pub(crate) poison: Option<String>,
     applied_bytes: usize,
@@ -126,7 +125,7 @@ impl Mirror {
         // source gates on the generation alone, and the server's second gate
         // lives in a pre-fork step the mirror never runs. Re-record either way,
         // so the next open has one to compare.
-        let replayed = read_cursors(base_dir, engine.resume_generation(), engine.topology_matches());
+        let cursors = read_cursors(base_dir, engine.resume_generation(), engine.topology_matches());
         engine
             .record_topology(1)
             .map_err(|e| MirrorError::Engine(format!("topology record failed: {e}")))?;
@@ -135,7 +134,7 @@ impl Mirror {
             engine,
             client,
             views: HashMap::new(),
-            replayed,
+            cursors,
             base_dir: base_dir.to_string(),
             poison: None,
             applied_bytes: 0,
@@ -155,21 +154,36 @@ impl Mirror {
         &mut self.client
     }
 
-    /// The views this handle currently mirrors, by server id.
+    /// The views this handle holds a registration for — the set [`Mirror::poll`]
+    /// advances, which is wider than [`Mirror::mirrors`] by the ones whose copy
+    /// the next poll has yet to make valid.
     pub fn mirrored_ids(&self) -> Vec<u64> {
         self.views.keys().copied().collect()
     }
 
-    /// Whether `table_id` is answered locally.
-    pub fn mirrors(&self, table_id: u64) -> bool {
-        self.views.contains_key(&table_id)
+    /// The registration a local read answers out of, and the one gate that says
+    /// it may: `None` sends the read upstream.
+    ///
+    /// A registration is written before the copy behind it exists, and a
+    /// bootstrap erases the copy before it re-reads it. The cursor is what marks
+    /// the difference, so it is returned together with the registration and
+    /// cannot be forgotten at a call site.
+    pub(crate) fn readable(&self, table_id: u64) -> Option<&MirroredView> {
+        self.views
+            .get(&table_id)
+            .filter(|_| self.cursors.contains_key(&table_id))
     }
 
-    /// The round each mirrored view's copy is current as of — what
-    /// [`Mirror::poll`] last carried through, and the round a local read of it
-    /// answers at.
+    /// Whether `table_id` is answered locally — [`Self::readable`] as a bool.
+    pub fn mirrors(&self, table_id: u64) -> bool {
+        self.readable(table_id).is_some()
+    }
+
+    /// The round `table_id`'s copy is current as of — what [`Mirror::poll`] last
+    /// carried through, and the round a local read of it answers at. `None` when
+    /// there is no valid copy to read one off.
     pub fn cursor_of(&self, table_id: u64) -> Option<DeltaCursor> {
-        self.views.get(&table_id).and_then(|v| v.cursor)
+        self.cursors.get(&table_id).copied()
     }
 
     // -- Poison ------------------------------------------------------------
@@ -254,12 +268,8 @@ impl Mirror {
 
     fn checkpoint_inner(&mut self) -> Result<(), MirrorError> {
         let gen = self.engine.bump_checkpoint_generation()?;
-        self.engine.flush_ephemeral_round().map_err(MirrorError::Engine)?;
-        let cursors: Vec<(u64, DeltaCursor)> = self
-            .views
-            .iter()
-            .filter_map(|(&view_id, v)| v.cursor.map(|c| (view_id, c)))
-            .collect();
+        self.engine.flush_ephemeral_round()?;
+        let cursors: Vec<(u64, DeltaCursor)> = self.cursors.iter().map(|(&view_id, &c)| (view_id, c)).collect();
         write_cursors(&self.base_dir, gen, &cursors)?;
         self.applied_bytes = 0;
         Ok(())

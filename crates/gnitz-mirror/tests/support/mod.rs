@@ -86,9 +86,11 @@ pub fn canonical(schema: &Schema, batch: &ZSetBatch) -> BTreeMap<Row, i64> {
     out
 }
 
-/// Assert two replies denote the same Z-set, naming the first difference.
-/// Returns how many distinct rows were compared, so a caller can refuse a
-/// vacuous pass: two empty replies agree about nothing.
+/// Assert two replies denote the same Z-set, naming the first difference, and
+/// refuse a vacuous pass: two empty replies agree about nothing.
+///
+/// Returns the rows compared, so a caller can hold a sum to a floor of its own —
+/// worth doing, since a global aggregate replies with one row whatever it read.
 pub fn assert_same_zset(what: &str, a: (&Schema, &ZSetBatch), b: (&Schema, &ZSetBatch)) -> usize {
     assert_eq!(
         a.0.columns.len(),
@@ -96,6 +98,10 @@ pub fn assert_same_zset(what: &str, a: (&Schema, &ZSetBatch), b: (&Schema, &ZSet
         "{what}: the two replies have different shapes"
     );
     let (ca, cb) = (canonical(a.0, a.1), canonical(b.0, b.1));
+    assert!(
+        !(ca.is_empty() && cb.is_empty()),
+        "{what}: both replies are empty, so they agree about nothing"
+    );
     for (row, wa) in &ca {
         match cb.get(row) {
             Some(wb) if wb == wa => {}
@@ -110,4 +116,21 @@ pub fn assert_same_zset(what: &str, a: (&Schema, &ZSetBatch), b: (&Schema, &ZSet
         );
     }
     ca.len()
+}
+
+/// An env var set for one test and removed on the way out: the tests are threads
+/// of one process, and a panicking one must not leave it set for its siblings.
+pub struct EnvVar(&'static str);
+
+impl EnvVar {
+    pub fn set(name: &'static str, value: &str) -> EnvVar {
+        std::env::set_var(name, value);
+        EnvVar(name)
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
 }

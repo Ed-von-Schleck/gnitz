@@ -1,27 +1,27 @@
 //! Applying a delta: the bootstrap that replaces a copy and the poll that
 //! advances it.
-//!
-//! **Two shapes arrive, and the caller states which.** A bootstrap answers with
-//! the view's own store in the view's own schema, and the copy is erased first;
-//! a poll answers with the delta store's rows, whose key is the server's round
-//! number prepended to the view's key.
-//!
-//! Confusing the two is silent: a polled batch's PK region is eight bytes wider,
-//! and the ingest's only shape check is the payload-column count, which matches
-//! either way. So the caller states only which arrived, and [`Mirror`] pairs it
-//! with the schemas the registration recorded.
-//!
-//! **A read never polls, and that is a decision rather than an omission.** The
-//! host drives [`Mirror::poll`], and a read answers off whatever the last one
-//! applied. A read that polled would be a read with a round trip in it — the one
-//! thing a mirror exists to remove — and it would have it on every read, not
-//! just the ones whose answer had changed.
 
 use gnitz_core::{ClientError, RawBlock};
+use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::storage::Batch;
 
 use crate::error::MirrorError;
 use crate::handle::{Mirror, MirroredView};
+
+/// `GNITZ_MIRROR_INJECT_BOOTSTRAP_ERROR`: fail the next bootstrap's upstream read
+/// once, after the copy has been erased. Debug-only. The window is unreachable
+/// otherwise — the server's only refusal here is an oversized reply.
+static BOOTSTRAP_ERROR: Seam = Seam::new("GNITZ_MIRROR_INJECT_BOOTSTRAP_ERROR");
+
+/// Which reply shape a train carries. The bytes do not say; the caller does.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// A bootstrap's: the view's own rows, in the view's own schema.
+    Plain,
+    /// A poll's: the delta store's rows, keyed by the round number prepended to
+    /// the view's key.
+    Stamped,
+}
 
 impl Mirror {
     /// Advance every mirrored view by one poll each.
@@ -33,24 +33,50 @@ impl Mirror {
     /// A poll does **not** drive a tick server-side: a delta read answers "what
     /// has happened", not "what is current", so a push the tick loop has not run
     /// yet is a round the next poll carries.
+    ///
+    /// **Every view is attempted; the first failure is returned after the loop.**
+    /// A view dropped upstream fails its poll forever, and stopping there would
+    /// freeze every view after it in the map at a round that never advances
+    /// again, while their reads went on succeeding.
     pub fn poll(&mut self) -> Result<(), MirrorError> {
         self.check_poison()?;
+        let mut first: Option<MirrorError> = None;
         for tid in self.mirrored_ids() {
-            self.advance_or_bootstrap(tid)?;
+            if let Err(e) = self.advance_or_bootstrap(tid) {
+                first.get_or_insert(self.named_failure(tid, e));
+            }
         }
-        Ok(())
+        first.map_or(Ok(()), Err)
+    }
+
+    /// `e`, prefixed with which view produced it — what a host needs to pick the
+    /// one to [`Mirror::forget_view`]. Only a message is prefixed: a classified
+    /// upstream refusal is something a host branches on, and keeps its class.
+    fn named_failure(&self, table_id: u64, e: MirrorError) -> MirrorError {
+        let Some(view) = self.views.get(&table_id) else {
+            return e;
+        };
+        let who = |m: String| format!("view '{}.{}' ({table_id}): {m}", view.schema_name, view.name);
+        match e {
+            MirrorError::Upstream(ClientError::ServerError(m)) => {
+                MirrorError::Upstream(ClientError::ServerError(who(m)))
+            }
+            MirrorError::Engine(m) => MirrorError::Engine(who(m)),
+            MirrorError::Poisoned(m) => MirrorError::Poisoned(who(m)),
+            e => e,
+        }
     }
 
     pub(crate) fn advance_or_bootstrap(&mut self, table_id: u64) -> Result<(), MirrorError> {
-        let view = self.view(table_id)?;
-        let Some(cursor) = view.cursor else {
+        self.check_poison()?;
+        let Some(&cursor) = self.cursors.get(&table_id) else {
             return self.bootstrap(table_id);
         };
-        let reply_schema = std::sync::Arc::clone(&view.delta_reply_schema);
+        let reply_schema = std::sync::Arc::clone(&self.view(table_id)?.delta_reply_schema);
         match self.client.delta_poll_raw(table_id, cursor, &reply_schema) {
             Ok((blocks, next)) => {
-                self.guarded("applying a poll", |m| m.ingest_blocks(table_id, blocks, true))?;
-                self.view_mut(table_id)?.cursor = Some(next);
+                self.guarded("applying a poll", |m| m.ingest_blocks(table_id, blocks, Shape::Stamped))?;
+                self.cursors.insert(table_id, next);
                 self.checkpoint_if_due()
             }
             // The one recovery the feed names, and it is single: discard the copy
@@ -94,8 +120,8 @@ impl Mirror {
         // Drop the cursor first: whatever the reconcile finds, the copy it ends
         // up with must come from a bootstrap, not from a round the expired cursor
         // named.
-        let view = self.view_mut(table_id)?;
-        view.cursor = None;
+        self.cursors.remove(&table_id);
+        let view = self.view(table_id)?;
         let (schema_name, name) = (view.schema_name.clone(), view.name.clone());
         let tid = self.reconcile_registration(&schema_name, &name)?;
         self.bootstrap(tid)
@@ -110,18 +136,24 @@ impl Mirror {
     pub(crate) fn bootstrap(&mut self, table_id: u64) -> Result<(), MirrorError> {
         self.check_poison()?;
         let view_schema = self.view(table_id)?.schema.clone();
-        // The cursor goes first, and stays gone until the reply is applied: the
-        // erase below leaves a store holding nothing, so a cursor surviving a
-        // failed read would have the next poll deliver `(T, …]` onto an empty
-        // copy and lose everything at or below `T` with no error anywhere.
-        self.view_mut(table_id)?.cursor = None;
+        // Everything between here and the insert below is a copy that does not
+        // exist, and the missing cursor is what says so: a cursor surviving a
+        // failed read would have the next poll deliver `(T, …]` onto an erased
+        // store and lose everything at or below `T` in silence.
+        self.cursors.remove(&table_id);
         self.engine
             .reset_view_output_for_rebuild(table_id as i64)
             .map_err(|e| self.poison(format!("erasing the copy of {table_id} failed: {e}")))?;
 
-        let (blocks, cursor) = self.client.delta_bootstrap_raw(table_id, &view_schema)?;
-        self.guarded("applying a bootstrap", |m| m.ingest_blocks(table_id, blocks, false))?;
-        self.view_mut(table_id)?.cursor = Some(cursor);
+        let (blocks, cursor) = if BOOTSTRAP_ERROR.take_once() {
+            Err(ClientError::ServerError("injected bootstrap read failure".to_string()))
+        } else {
+            self.client.delta_bootstrap_raw(table_id, &view_schema)
+        }?;
+        self.guarded("applying a bootstrap", |m| {
+            m.ingest_blocks(table_id, blocks, Shape::Plain)
+        })?;
+        self.cursors.insert(table_id, cursor);
         self.checkpoint_if_due()
     }
 
@@ -133,53 +165,31 @@ impl Mirror {
             .ok_or_else(|| MirrorError::Engine(format!("relation {table_id} is not mirrored")))
     }
 
-    fn view_mut(&mut self, table_id: u64) -> Result<&mut MirroredView, MirrorError> {
-        self.views
-            .get_mut(&table_id)
-            .ok_or_else(|| MirrorError::Engine(format!("relation {table_id} is not mirrored")))
-    }
-
-    /// Decode each block and ingest it. `stamped` says which of the two shapes
-    /// arrived — a poll's rows, keyed by the round number prepended to the
-    /// view's key, or a bootstrap's, already in the view's own shape. Both
-    /// schemas come from the registration, so the pairing cannot be got wrong
-    /// here.
+    /// Decode each block under the schema `shape` names — both come from the
+    /// registration — and ingest it.
     ///
-    /// The decode is the engine's public entry, not the ring-internal one: that
-    /// one skips the long-string extent check because its contract confines it
-    /// to the W2M ring, and every frame arriving over a socket is a client
-    /// frame.
-    ///
-    /// The batch comes back `Layout::Raw`, which is what makes the ingest's
-    /// sort-and-fold run. A sender-supplied `Consolidated` tag would let every
-    /// downstream merge fold weights against the wrong element, and the merge's
-    /// own sortedness check is `#[cfg(debug_assertions)]` — absent in a release
-    /// host.
-    ///
-    /// The ingest is the checked catalog entry, not the raw store: it rejects a
-    /// system id and checks the batch's payload-column count against the
-    /// registered schema. For a view it skips PK-uniqueness enforcement, which
-    /// is what a view needs — a view's PK is not unique.
-    ///
-    /// Takes the blocks by value so each frame buffer is freed as its rows land
-    /// in the store. The client hands over the whole train — a bootstrap's is
-    /// the view's entire value — but freeing as we go keeps that off the peak:
-    /// at the busiest moment roughly one frame is live, and the decode and the
-    /// store ingest of that frame dominate what the train itself costs.
-    fn ingest_blocks(&mut self, table_id: u64, blocks: Vec<RawBlock>, stamped: bool) -> Result<(), MirrorError> {
+    /// Two engine entries here have a near twin that is silently wrong for a
+    /// socket frame, so each is named for what it keeps: the **public** decode
+    /// keeps the long-string extent check the ring-internal one drops, and the
+    /// `Layout::Raw` it returns keeps the ingest's sort-and-fold, where a
+    /// sender's `Consolidated` claim would fold weights onto the wrong element
+    /// past a sortedness check that is debug-only.
+    fn ingest_blocks(&mut self, table_id: u64, blocks: Vec<RawBlock>, shape: Shape) -> Result<(), MirrorError> {
         let view = self.view(table_id)?;
         let (view_desc, delta_desc) = (view.view_desc, view.delta_desc);
-        let in_desc = if stamped { delta_desc } else { view_desc };
+        let in_desc = match shape {
+            Shape::Plain => view_desc,
+            Shape::Stamped => delta_desc,
+        };
         let mut applied = 0usize;
         for raw in blocks {
             let block = raw.block();
             applied += block.len();
             let (batch, _) = Batch::decode_from_wal_block(block, &in_desc, false)
                 .map_err(|e| self.poison(format!("decoding a delta for {table_id} failed: {e}")))?;
-            let batch = if stamped {
-                batch.stripped_of_pk_prefix(&in_desc, &view_desc)
-            } else {
-                batch
+            let batch = match shape {
+                Shape::Plain => batch,
+                Shape::Stamped => batch.stripped_of_pk_prefix(&in_desc, &view_desc),
             };
             if batch.count == 0 {
                 continue;

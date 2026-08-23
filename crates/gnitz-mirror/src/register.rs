@@ -27,10 +27,10 @@ use std::sync::Arc;
 use gnitz_core::{delta_reply_schema, qualified_name, RelClass, Schema};
 use gnitz_engine::catalog::SysFamily;
 use gnitz_engine::schema::{make_delta_schema, SchemaDescriptor};
-use gnitz_engine::storage::{Batch, BatchBuilder};
+use gnitz_engine::storage::BatchBuilder;
 use gnitz_wire::sys_rows::{write_col_tab_row, write_schema_tab_row, write_view_tab_row};
 use gnitz_wire::sys_rows::{ColTabRow, SchemaTabRow, ViewTabRow};
-use gnitz_wire::{COLTAB_PAY_OWNER_ID, OWNER_KIND_VIEW};
+use gnitz_wire::OWNER_KIND_VIEW;
 
 use crate::error::MirrorError;
 use crate::handle::{Mirror, MirroredView};
@@ -71,7 +71,7 @@ impl Mirror {
             return Ok(());
         }
         self.views.remove(&table_id);
-        self.replayed.remove(&table_id);
+        self.cursors.remove(&table_id);
         self.retract_relation(table_id)
     }
 
@@ -108,20 +108,14 @@ impl Mirror {
         let tid = kind.tid;
         let want_desc = descriptor_of(&schema)?;
 
-        // Already mirrored at this id and layout: nothing to register, and the
-        // cursor stands. Failing that, a registration the local catalog replayed
-        // at open under this id and layout is adopted, with the cursor the file
-        // recorded for it.
-        let carried = if self.views.get(&tid).is_some_and(|v| v.view_desc == want_desc) {
-            self.views[&tid].cursor
-        } else if !self.views.contains_key(&tid)
-            && self
-                .engine
-                .get_schema_desc(tid as i64)
-                .is_some_and(|desc| desc == want_desc)
+        // A registration the local catalog already holds at this id and layout
+        // stands, and its cursor with it — whether this session registered it or
+        // a previous one did and the open replayed it.
+        if !self
+            .engine
+            .get_schema_desc(tid as i64)
+            .is_some_and(|desc| desc == want_desc)
         {
-            self.replayed.remove(&tid)
-        } else {
             // Retract whatever the local catalog holds at this id, and — the
             // dropped-and-recreated case — whatever it holds under this name at
             // some other id. Then register fresh.
@@ -135,12 +129,11 @@ impl Mirror {
                     continue;
                 }
                 self.views.remove(&old);
-                self.replayed.remove(&old);
+                self.cursors.remove(&old);
                 self.retract_relation(old)?;
             }
             self.register_locally(schema_name, name, tid, &schema)?;
-            None
-        };
+        }
 
         let view_desc = self.engine.schema_or_err(tid as i64, "mirror registration")?;
         let delta_desc = make_delta_schema(&view_desc).ok_or_else(|| {
@@ -159,7 +152,6 @@ impl Mirror {
                 schema,
                 view_desc,
                 delta_desc,
-                cursor: carried,
             },
         );
         Ok(tid)
@@ -220,8 +212,7 @@ impl Mirror {
                     is_hidden: cd.is_hidden,
                 },
                 1,
-            )
-            .map_err(MirrorError::Engine)?;
+            )?;
         }
 
         let pk_cols: Vec<u32> = schema.pk_indices().iter().map(|&i| i as u32).collect();
@@ -262,52 +253,15 @@ impl Mirror {
         Ok(())
     }
 
-    /// Retract every catalog row registering `relation_id`, **columns before the
-    /// VIEW_TAB row** — the order a worker applies a live DROP in, and the only
-    /// order that leaves no residue.
-    ///
-    /// The VIEW_TAB `-1` fires the engine's relation-register hook, which
-    /// cascades a retraction of every COL_TAB row the relation still owns.
-    /// Retracting the columns first makes that cascade find nothing live and
-    /// emit nothing; the reverse order would have the cascade cancel the columns
-    /// and the retraction below land a *second* `-1` on them, leaving each at net
-    /// `-1` — where the next registration's `+1` sums to zero and the relation
-    /// registers with no columns at all.
-    ///
-    /// The retractions are built by negating the *live* rows rather than by
-    /// re-encoding what registration would have written, so each `-1` is
-    /// byte-equal to the row it cancels by construction. A payload that differed
-    /// in one byte would not cancel: the two would be distinct elements sharing a
-    /// PK, and the surviving `+1` would keep the relation registered while the
-    /// `-1` sat beside it forever.
-    ///
-    /// The SCHEMA_TAB row is deliberately left alone — it is shared by every view
-    /// the handle mirrors out of that schema.
+    /// Unregister `relation_id` locally and remove its directory. The SCHEMA_TAB
+    /// row stays: every view mirrored out of that schema shares it.
     fn retract_relation(&mut self, relation_id: u64) -> Result<(), MirrorError> {
-        let col_undo = self.negated_rows(SysFamily::Column, |b, r| {
-            b.read_payload_u64(r, COLTAB_PAY_OWNER_ID) == relation_id
-        })?;
-        let view_undo = self.negated_rows(SysFamily::View, |b, r| b.get_pk(r) == relation_id as u128)?;
-        for (family, batch) in [(SysFamily::Column, col_undo), (SysFamily::View, view_undo)] {
-            if batch.count > 0 {
-                self.engine.ddl_sync(family.id(), batch)?;
-            }
-        }
-        // The VIEW_TAB retraction's hook queued the relation's directory. There
-        // are no workers here to still be applying its create, so the gate the
-        // server needs is vacuous and the removal happens now.
+        self.engine.retract_relation_registration(relation_id as i64)?;
+        // No worker here can still be applying the create this drop races, so the
+        // gate the server needs is vacuous and the directory goes now.
         self.engine.defer_pending_dir_deletions();
         self.engine.drain_checkpoint_gated_deletions();
         Ok(())
-    }
-
-    /// The live rows of `family` that `keep` selects, at negated weight.
-    fn negated_rows(&mut self, family: SysFamily, keep: impl Fn(&Batch, usize) -> bool) -> Result<Batch, MirrorError> {
-        let (rows, schema) = self.engine.scan_family(family.id())?;
-        let picked: Vec<u32> = (0..rows.count).filter(|&r| keep(&rows, r)).map(|r| r as u32).collect();
-        let mut undo = Batch::from_indexed_rows(&rows.as_mem_batch(), &picked, &schema);
-        undo.map_weights(i64::wrapping_neg);
-        Ok(undo)
     }
 }
 

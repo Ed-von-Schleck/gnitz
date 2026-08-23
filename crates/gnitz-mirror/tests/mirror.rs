@@ -16,7 +16,7 @@ mod support;
 use gnitz_core::{GnitzClient, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
 use gnitz_test_harness::ServerHandle;
-use support::{assert_same_zset, canonical, query, serial, sql};
+use support::{assert_same_zset, canonical, query, serial, sql, EnvVar};
 
 /// Four workers, because that is the only count that exercises the fan-out.
 const WORKERS: usize = 4;
@@ -33,9 +33,19 @@ struct Fixture {
     dir: tempfile::TempDir,
 }
 
+/// A four-worker server, or a panic naming what is missing. The harness answers
+/// `None` when the binary is absent, and an early `return` on that would report
+/// green having run nothing — with no CI, that silence has no beneficiary.
+fn start_server() -> ServerHandle {
+    ServerHandle::start_n(WORKERS).expect(
+        "no server binary: `make server` builds one and copies it to <repo>/gnitz-server, \
+         which is where the harness looks (`make test` does it for you)",
+    )
+}
+
 impl Fixture {
-    fn start() -> Option<Fixture> {
-        let server = ServerHandle::start_n(WORKERS)?;
+    fn start() -> Fixture {
+        let server = start_server();
         let dir = tempfile::tempdir().unwrap();
         let mut direct = GnitzClient::connect(server.sock_path()).unwrap();
         seed(&mut direct);
@@ -44,12 +54,12 @@ impl Fixture {
             GnitzClient::connect(server.sock_path()).unwrap(),
         )
         .expect("a fresh mirror opens");
-        Some(Fixture {
+        Fixture {
             server,
             direct,
             mirror: Some(mirror),
             dir,
-        })
+        }
     }
 
     fn mirror(&mut self) -> &mut Mirror {
@@ -104,8 +114,9 @@ impl Fixture {
     }
 
     /// Assert a query answers identically locally and against the server, and
-    /// return how many rows that agreement covered — two empty replies agree
-    /// about nothing, so every caller sums this and refuses a vacuous pass.
+    /// return how many rows that agreement covered. The vacuous pass is refused
+    /// inside `assert_same_zset`; the count is here so a caller comparing several
+    /// queries can hold their sum to a floor of its own.
     fn assert_differential(&mut self, sql_text: &str) -> usize {
         let local = self.local(sql_text);
         let remote = query(&mut self.direct, "s", sql_text);
@@ -183,7 +194,7 @@ fn churn(client: &mut GnitzClient, lo: i64, hi: i64) {
 #[test]
 fn a_mirrored_read_equals_the_server_read() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     churn(&mut fx.direct, 1, 200);
     fx.mirror_both();
@@ -221,7 +232,7 @@ fn a_mirrored_read_equals_the_server_read() {
 #[test]
 fn a_multi_round_poll_over_repeated_keys_stays_weight_exact() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     churn(&mut fx.direct, 1, 60);
     fx.mirror_both();
@@ -256,7 +267,7 @@ fn a_multi_round_poll_over_repeated_keys_stays_weight_exact() {
 #[test]
 fn integer_aggregates_are_exact_and_floats_are_close() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     churn(&mut fx.direct, 1, 300);
     fx.mirror_both();
@@ -303,7 +314,7 @@ fn f64_of(b: &[u8]) -> f64 {
 #[test]
 fn a_mirrored_select_issues_no_request() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     churn(&mut fx.direct, 1, 40);
     fx.mirror_both();
@@ -335,7 +346,7 @@ fn a_mirrored_select_issues_no_request() {
 #[test]
 fn a_second_handle_is_refused() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     // In-process: any directory, because what it protects is process-global.
     let other = tempfile::tempdir().unwrap();
@@ -372,13 +383,12 @@ fn a_second_handle_is_refused() {
 #[test]
 fn a_forgotten_view_can_be_mirrored_again() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     churn(&mut fx.direct, 1, 60);
     let tid = fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
     fx.quiesce();
     let before = fx.assert_differential("SELECT * FROM v_keyed");
-    assert!(before > 0, "the differential must cover some rows");
 
     fx.mirror().forget_view(tid).expect("forget");
     assert!(
@@ -403,7 +413,7 @@ fn a_forgotten_view_can_be_mirrored_again() {
 #[test]
 fn only_a_fed_view_can_be_mirrored() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
     sql(&mut fx.direct, "s", "CREATE VIEW plain AS SELECT a, b, v FROM t");
 
     let m = fx.mirror.as_mut().unwrap();
@@ -430,14 +440,7 @@ fn a_storage_fault_does_not_kill_the_host() {
     if !cfg!(debug_assertions) {
         return; // the seam folds away in a release build
     }
-    let Some(server) = ServerHandle::start_n(WORKERS) else {
-        return;
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let mut direct = GnitzClient::connect(server.sock_path()).unwrap();
-    seed(&mut direct);
-    churn(&mut direct, 1, 40);
-    let _ = query(&mut direct, "s", "SELECT * FROM v_keyed");
+    let (server, dir) = child_fixture();
 
     let out = child_test(
         "poisons_on_a_storage_fault_child",
@@ -447,9 +450,9 @@ fn a_storage_fault_does_not_kill_the_host() {
             ("GNITZ_INJECT_INGEST_APPLY_ERROR", "store"),
         ],
     );
-    assert_eq!(
-        out.status.code(),
-        Some(0),
+    assert_child_ok(
+        &out,
+        FAULT_CHILD_OK,
         "the host must survive a storage fault and see an error; exit 134 is the abort this replaced",
     );
 }
@@ -457,9 +460,7 @@ fn a_storage_fault_does_not_kill_the_host() {
 /// Runs only in the child the test above spawns.
 #[test]
 fn poisons_on_a_storage_fault_child() {
-    let (Ok(sock), Ok(dir)) = (std::env::var("GNITZ_MIRROR_SOCK"), std::env::var("GNITZ_MIRROR_DIR")) else {
-        return;
-    };
+    let Some((sock, dir)) = child_target() else { return };
     let client = GnitzClient::connect(&sock).unwrap();
     let mut mirror = Mirror::open(&dir, client).expect("open");
     let err = mirror
@@ -476,6 +477,86 @@ fn poisons_on_a_storage_fault_child() {
     assert!(mirror.checkpoint().is_err());
     // And the drop must not checkpoint a possibly-torn store.
     drop(mirror);
+    println!("{FAULT_CHILD_OK}");
+}
+
+/// A registration whose bootstrap could not finish answers no read locally.
+///
+/// A read gated on the registration alone answers the erased copy with zero
+/// rows, no request and no error — and keeps doing it, since the refusal behind
+/// it is repeatable. Seam-driven: the server's only refusal here is an oversized
+/// reply.
+#[test]
+fn a_failed_bootstrap_answers_no_read_locally() {
+    let _g = serial();
+    if !cfg!(debug_assertions) {
+        return; // the seam folds away in a release build
+    }
+    let (server, dir) = child_fixture();
+
+    let out = child_test(
+        "failed_bootstrap_child",
+        &[
+            ("GNITZ_MIRROR_SOCK", server.sock_path()),
+            ("GNITZ_MIRROR_DIR", dir.path().to_str().unwrap()),
+            ("GNITZ_MIRROR_INJECT_BOOTSTRAP_ERROR", "1"),
+        ],
+    );
+    assert_child_ok(
+        &out,
+        WINDOW_CHILD_OK,
+        "a read over a copy that never arrived must delegate rather than answer empty",
+    );
+}
+
+/// Runs only in the child the test above spawns.
+#[test]
+fn failed_bootstrap_child() {
+    let Some((sock, dir)) = child_target() else { return };
+    let mut direct = GnitzClient::connect(&sock).unwrap();
+    let mut mirror = Mirror::open(&dir, GnitzClient::connect(&sock).unwrap()).expect("open");
+
+    let err = mirror
+        .mirror_view("s", "v_keyed")
+        .expect_err("the armed seam must fail the bootstrap read");
+    assert!(
+        matches!(err, gnitz_mirror::MirrorError::Upstream(_)),
+        "an upstream refusal is not a poisoning: {err}",
+    );
+    assert!(mirror.poisoned().is_none(), "the handle stays usable");
+
+    // The registration outlives the failed bootstrap, which is what makes the
+    // window reachable at all; the copy behind it does not.
+    let [tid] = mirror.mirrored_ids()[..] else {
+        panic!("the failed bootstrap must leave exactly its own registration behind")
+    };
+    assert!(
+        !mirror.mirrors(tid),
+        "a registration with no valid copy is not answered locally"
+    );
+
+    let local = query(&mut mirror, "s", "SELECT * FROM v_keyed");
+    let remote = query(&mut direct, "s", "SELECT * FROM v_keyed");
+    assert_same_zset(
+        "the read must be delegated, not answered off the erased copy",
+        (&local.0, &local.1),
+        (&remote.0, &remote.1),
+    );
+
+    // The seam is one-shot, so the next poll is a real bootstrap: the handle
+    // recovers rather than delegating forever.
+    mirror.poll().expect("the next poll bootstraps for real");
+    assert!(
+        mirror.mirrors(tid),
+        "a completed bootstrap makes the copy answerable again"
+    );
+    let local = query(&mut mirror, "s", "SELECT * FROM v_keyed");
+    assert_same_zset(
+        "the recovered copy answers what the server does",
+        (&local.0, &local.1),
+        (&remote.0, &remote.1),
+    );
+    println!("{WINDOW_CHILD_OK}");
 }
 
 /// The whole durability path runs with `io_uring` unavailable: open, checkpoint,
@@ -483,14 +564,7 @@ fn poisons_on_a_storage_fault_child() {
 #[test]
 fn the_blocking_fsync_fallback_carries_durability() {
     let _g = serial();
-    let Some(server) = ServerHandle::start_n(WORKERS) else {
-        return;
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let mut direct = GnitzClient::connect(server.sock_path()).unwrap();
-    seed(&mut direct);
-    churn(&mut direct, 1, 40);
-    let _ = query(&mut direct, "s", "SELECT * FROM v_keyed");
+    let (server, dir) = child_fixture();
 
     let out = child_test(
         "blocking_fsync_fallback_child",
@@ -500,19 +574,13 @@ fn the_blocking_fsync_fallback_carries_durability() {
             ("GNITZ_DISABLE_IO_URING", "1"),
         ],
     );
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "the blocking fallback must carry the full path"
-    );
+    assert_child_ok(&out, FSYNC_CHILD_OK, "the blocking fallback must carry the full path");
 }
 
 /// Runs only in the child the test above spawns.
 #[test]
 fn blocking_fsync_fallback_child() {
-    let (Ok(sock), Ok(dir)) = (std::env::var("GNITZ_MIRROR_SOCK"), std::env::var("GNITZ_MIRROR_DIR")) else {
-        return;
-    };
+    let Some((sock, dir)) = child_target() else { return };
     let open = |dir: &str| Mirror::open(dir, GnitzClient::connect(&sock).unwrap()).expect("open");
     let mut mirror = open(&dir);
     let tid = mirror.mirror_view("s", "v_keyed").expect("mirror");
@@ -539,6 +607,7 @@ fn blocking_fsync_fallback_child() {
         canonical(&after.0, &after.1),
         "the resumed copy must hold what the checkpoint made durable",
     );
+    println!("{FSYNC_CHILD_OK}");
 }
 
 /// The round trip, measured as instructions retired: a narrowly-bounded read
@@ -564,7 +633,7 @@ fn blocking_fsync_fallback_child() {
 #[ignore]
 fn round_trip_cost_bench() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
     let Some(counter) = support::perf::Instructions::open() else {
         println!("perf_event_open refused; skipping the instruction count");
         return;
@@ -608,7 +677,7 @@ fn round_trip_cost_bench() {
 #[test]
 fn a_restart_resumes_rather_than_reseeds() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     churn(&mut fx.direct, 1, 120);
     let tid = fx.mirror_both();
@@ -655,7 +724,7 @@ fn a_restart_resumes_rather_than_reseeds() {
 #[test]
 fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     churn(&mut fx.direct, 1, 90);
     fx.mirror_both();
@@ -665,7 +734,7 @@ fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
     // Case 1 — the copies moved on and were published; the cursor file did not.
     // Snapshot the file, apply more rounds, checkpoint again, restore the old
     // file: that is exactly a crash between the ephemeral round and the write.
-    let cursor_path = format!("{}/mirror_cursors", fx.base_dir());
+    let cursor_path = cursor_file(&fx.base_dir());
     let stale = std::fs::read(&cursor_path).expect("a checkpoint writes the cursor file");
     churn(&mut fx.direct, 91, 180);
     fx.quiesce();
@@ -694,6 +763,67 @@ fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
     fx.assert_differential("SELECT * FROM v_repl");
 }
 
+/// An apply past the byte threshold checkpoints on its own — the 64 MB default
+/// puts it out of every other test's reach. The observable is the manifest, which
+/// only a checkpoint publishes, and this test calls none.
+#[test]
+fn an_applied_delta_drives_its_own_checkpoint() {
+    let _g = serial();
+    // Declared before the fixture so it is removed after the handle it governs
+    // is dropped.
+    let _threshold = EnvVar::set("GNITZ_MIRROR_CHECKPOINT_BYTES", "1");
+    let mut fx = Fixture::start();
+
+    churn(&mut fx.direct, 1, 40);
+    let tid = fx.mirror_both();
+    fx.quiesce();
+
+    assert!(
+        has_manifest(&fx.base_dir(), tid),
+        "an apply past the threshold must publish the copy's manifest with no explicit checkpoint",
+    );
+    assert!(
+        std::path::Path::new(&cursor_file(&fx.base_dir())).exists(),
+        "the same checkpoint must write the cursor file",
+    );
+    fx.assert_differential("SELECT * FROM v_keyed");
+}
+
+/// A checkpoint by a handle that re-registered only some of its views keeps every
+/// cursor.
+///
+/// The flush round republishes every copy in the catalog, so a cursor set gathered
+/// from the registrations alone strands the unclaimed one — published at the new
+/// generation with no cursor, and bootstrapped next session though it was intact.
+/// Checked by the manifest, before any further checkpoint republishes one.
+#[test]
+fn a_partially_registered_reopen_keeps_every_cursor() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+
+    churn(&mut fx.direct, 1, 60);
+    fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
+    let repl = fx.mirror().mirror_view("s", "v_repl").expect("mirror v_repl");
+    fx.quiesce();
+    fx.mirror().checkpoint().expect("checkpoint");
+
+    // Reopen holding both copies, claim only one, and checkpoint again.
+    fx.reopen();
+    fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
+    fx.mirror().checkpoint().expect("checkpoint with v_repl unclaimed");
+
+    fx.reopen();
+    fx.mirror().mirror_view("s", "v_repl").expect("re-mirror v_repl");
+    assert!(
+        has_manifest(&fx.base_dir(), repl),
+        "the unclaimed view's cursor must survive the checkpoint that republished its copy",
+    );
+    fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
+    fx.quiesce();
+    fx.assert_differential("SELECT * FROM v_repl");
+    fx.assert_differential("SELECT * FROM v_keyed");
+}
+
 /// A foreign topology word reseeds, even though the generation still matches.
 ///
 /// Without this gate the copies resume on the generation alone, because a view's
@@ -711,7 +841,7 @@ fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
 #[test]
 fn a_foreign_topology_word_reseeds() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     churn(&mut fx.direct, 1, 60);
     let tid = fx.mirror_both();
@@ -739,6 +869,11 @@ fn a_foreign_topology_word_reseeds() {
     fx.assert_differential("SELECT * FROM v_repl");
 }
 
+/// The cursor file the crate writes beside the copies.
+fn cursor_file(base_dir: &str) -> String {
+    format!("{base_dir}/mirror_cursors")
+}
+
 /// Whether the mirrored copy of `view_id` currently has a published manifest —
 /// the on-disk difference between a resumed store and an erased one.
 fn has_manifest(base_dir: &str, view_id: u64) -> bool {
@@ -764,7 +899,7 @@ fn has_manifest(base_dir: &str, view_id: u64) -> bool {
 #[test]
 fn a_server_restart_reseeds_the_copy() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     churn(&mut fx.direct, 1, 60);
     let tid = fx.mirror_both();
@@ -794,7 +929,7 @@ fn a_server_restart_reseeds_the_copy() {
 #[test]
 fn a_view_recreated_under_the_same_name_reseeds_under_its_new_id() {
     let _g = serial();
-    let Some(mut fx) = Fixture::start() else { return };
+    let mut fx = Fixture::start();
 
     churn(&mut fx.direct, 1, 60);
     let old = fx.mirror_both();
@@ -850,6 +985,45 @@ fn child_test(name: &str, envs: &[(&str, &str)]) -> std::process::Output {
         cmd.env(k, v);
     }
     cmd.output().unwrap()
+}
+
+/// A seeded, churned server and an empty mirror directory — the setup every
+/// parent of a child test needs before it can hand the pair over.
+fn child_fixture() -> (ServerHandle, tempfile::TempDir) {
+    let server = start_server();
+    let dir = tempfile::tempdir().unwrap();
+    let mut direct = GnitzClient::connect(server.sock_path()).unwrap();
+    seed(&mut direct);
+    churn(&mut direct, 1, 40);
+    // Drains the pending ticks, so the rounds a bootstrap reads already exist.
+    let _ = query(&mut direct, "s", "SELECT * FROM v_keyed");
+    (server, dir)
+}
+
+/// What a parent handed this child, or `None` in the parent's own run of the
+/// same test — every child test is also collected by the outer `cargo test`.
+fn child_target() -> Option<(String, String)> {
+    Some((
+        std::env::var("GNITZ_MIRROR_SOCK").ok()?,
+        std::env::var("GNITZ_MIRROR_DIR").ok()?,
+    ))
+}
+
+/// What each child prints once it has run every assertion.
+const FAULT_CHILD_OK: &str = "the fault poisoned the handle and the host survived";
+const FSYNC_CHILD_OK: &str = "the blocking fallback carried open, checkpoint and resume";
+const WINDOW_CHILD_OK: &str = "a copy with no cursor delegated its read and then recovered";
+
+/// Assert the child exited cleanly **and** reached its final `println!`. The exit
+/// code alone proves nothing: `libtest` exits 0 when its filter matches nothing, so
+/// renaming a child would leave its parent green covering nothing.
+fn assert_child_ok(out: &std::process::Output, sentinel: &str, what: &str) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.code() == Some(0) && stdout.contains(sentinel),
+        "{what}\n-- child stdout --\n{stdout}-- child stderr --\n{stderr}",
+    );
 }
 
 /// Runs only in the child `a_second_handle_is_refused` spawns. It opens the

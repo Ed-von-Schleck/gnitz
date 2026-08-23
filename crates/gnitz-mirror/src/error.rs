@@ -43,3 +43,11 @@ impl From<String> for MirrorError {
         MirrorError::Engine(m)
     }
 }
+
+/// The one spelling of a mirror failure at the [`gnitz_core::ReadTarget`] seam,
+/// whose error channel is `ClientError`.
+impl From<MirrorError> for ClientError {
+    fn from(e: MirrorError) -> Self {
+        ClientError::ServerError(e.to_string())
+    }
+}

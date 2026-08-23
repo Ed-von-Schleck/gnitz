@@ -42,7 +42,10 @@
 //! projection, predicate or `LIMIT` to narrow, and the feed's one recovery is to
 //! bootstrap again, which fails identically. So a view whose STRING/BLOB rows on
 //! one worker exceed the cap cannot be mirrored, and [`Mirror::mirror_view`]
-//! reports the server's refusal rather than leaving a partial copy.
+//! reports the server's refusal. What it leaves behind is a registration with no
+//! copy beneath it, and [`Mirror::mirrors`] answers `false` for one: a read of it
+//! is delegated upstream, where it is refused for the same reason, rather than
+//! answered off a copy that never arrived.
 //!
 //! # Cost
 //!

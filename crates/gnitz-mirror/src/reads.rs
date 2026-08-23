@@ -58,7 +58,9 @@ impl ReadTarget for Mirror {
     /// staleness the mirror already has: a mirrored read answers as of the last
     /// poll, and the binding falls under that rather than being an exception to
     /// it. The detector is the feed — the next poll's tag stops continuing — and
-    /// the recovery re-resolves before it reseeds.
+    /// the recovery re-resolves before it reseeds. Answered off the registration
+    /// rather than [`Mirror::readable`], so that a name whose copy is not valid
+    /// still binds locally and only the read it feeds goes upstream.
     fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(Arc<Schema>, RelKind), ClientError> {
         // The local catalog's own name index answers this: the mirror registered
         // the relation through it, under the same lower-cased spelling and the
@@ -76,11 +78,11 @@ impl ReadTarget for Mirror {
     }
 
     fn scan(&mut self, table_id: u64) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), ClientError> {
-        if !self.mirrors(table_id) {
+        let Some(view) = self.readable(table_id) else {
             return ReadTarget::scan(&mut self.client, table_id);
-        }
-        self.check_poison().map_err(as_client_error)?;
-        let view_schema = Arc::clone(&self.views[&table_id].schema);
+        };
+        let view_schema = Arc::clone(&view.schema);
+        self.check_poison()?;
         let (batch, desc) = self
             .engine
             .scan_family(table_id as i64)
@@ -105,10 +107,10 @@ impl ReadTarget for Mirror {
         if !self.mirrors(table_id) {
             return self.client.scan_spec(table_id, spec, reply_schema);
         }
-        self.check_poison().map_err(as_client_error)?;
+        self.check_poison()?;
         let spec = gnitz_wire::ReadSpec::decode(spec)
             .map_err(|e| ClientError::ServerError(format!("mirror: read spec: {e}")))?;
-        let reply_desc = descriptor_of(reply_schema).map_err(|e| ClientError::ServerError(e.to_string()))?;
+        let reply_desc = descriptor_of(reply_schema)?;
         let keeper = self
             .engine
             .scan_spec_family(table_id as i64, &spec, &reply_desc, 0)
@@ -153,8 +155,4 @@ fn reply_batch(
     );
     let (rows, _) = decode_wal_block(&block, schema).map_err(|e| ClientError::ServerError(e.to_string()))?;
     Ok(rows)
-}
-
-fn as_client_error(e: crate::MirrorError) -> ClientError {
-    ClientError::ServerError(e.to_string())
 }

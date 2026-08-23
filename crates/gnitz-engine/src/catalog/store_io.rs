@@ -399,6 +399,32 @@ impl CatalogEngine {
         self.apply_local(family, &mut batch, None)
     }
 
+    /// Drop `relation_id` from a catalog this process owns alone — [`Self::ddl_sync`]
+    /// in reverse, for the mirror. A production DROP arrives as a wire delta the
+    /// executor prechecks and broadcasts, and never comes through here.
+    ///
+    /// Builds only the relation's own row: its `-1` fires `hook_relation_register`,
+    /// whose cascade retracts the columns, indices and circuit rows and queues the
+    /// directory. Retracting a child here too would leave it at net `-1`, where the
+    /// next registration's `+1` sums to zero. The cascade's broadcast queue has no
+    /// worker to reach, so it is discarded rather than left to grow.
+    pub fn retract_relation_registration(&mut self, relation_id: i64) -> Result<(), String> {
+        let family = match self.table_entry(relation_id)?.kind {
+            RelationKind::View => SysFamily::View,
+            RelationKind::BaseTable | RelationKind::Stream => SysFamily::Table,
+            RelationKind::SystemCatalog => {
+                return Err(format!("table_id {relation_id} is a system table"));
+            }
+        };
+        let schema = family.schema();
+        let batch = retract_single_row(self.sys_store(family), &schema, relation_id as u128);
+        if batch.count > 0 {
+            self.ddl_sync(family.id(), batch)?;
+        }
+        self.drain_pending_broadcasts();
+        Ok(())
+    }
+
     /// Cursor-returning sibling of `scan_family` for callers that stream the
     /// relation chunk-wise (`drain_chunk`) instead of materializing it whole.
     /// `None` when the table is unregistered — callers treat that as empty.
