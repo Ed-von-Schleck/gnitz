@@ -124,8 +124,9 @@ impl CatalogEngine {
             let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
             self.submit(family, batch.clone())
         } else {
-            self.dag.ingest_by_ref(table_id, batch);
-            Ok(())
+            self.dag
+                .ingest_by_ref(table_id, batch)
+                .map_err(|e| format!("ingest failed for table_id={table_id}: {e}"))
         }
     }
 
@@ -357,7 +358,11 @@ impl CatalogEngine {
     /// the handler passes `None`: nothing was applied for that family, so nothing
     /// is reconstructed and **no ghost `-1` is written**. At most one family is
     /// ever applied-not-enqueued, so `Option` is the exact type.
-    pub fn compensate_stage_a(&mut self, applied_not_enqueued: Option<(SysFamily, Batch)>) {
+    ///
+    /// `Err` means the compensation itself failed and the catalog cannot be
+    /// restored; the caller that owns a watchdog aborts rather than serve a
+    /// diverged catalog.
+    pub fn compensate_stage_a(&mut self, applied_not_enqueued: Option<(SysFamily, Batch)>) -> Result<(), String> {
         let mut rollback_list = self.drain_pending_broadcasts();
 
         if let Some(entry) = applied_not_enqueued {
@@ -366,7 +371,7 @@ impl CatalogEngine {
 
         // Precheck-failed first family: nothing applied, trivial no-op.
         if rollback_list.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Directories of entities the bundle DROPPED are queued for removal, and
@@ -434,12 +439,11 @@ impl CatalogEngine {
         // Everything the rollback queued is a creation that never committed.
         self.drain_pending_dir_deletions();
 
-        result.unwrap_or_else(|e| {
-            gnitz_fatal_abort!(
-                "Stage-A DDL compensation failed — catalog cannot be restored; \
-                 aborting to prevent serving a diverged catalog. Cause: {}",
-                e
-            );
-        });
+        result.map_err(|e| {
+            format!(
+                "Stage-A DDL compensation failed — catalog cannot be restored, \
+                 and serving it would serve a diverged catalog. Cause: {e}"
+            )
+        })
     }
 }

@@ -29,20 +29,21 @@ impl DagEngine {
     /// Ingest a borrowed batch (no clone) for relations that run no PK
     /// enforcement. A base table falls back to cloning +
     /// [`Self::ingest_returning_effective`].
-    pub fn ingest_by_ref(&mut self, table_id: i64, batch: &Batch) {
+    pub fn ingest_by_ref(&mut self, table_id: i64, batch: &Batch) -> Result<(), StorageError> {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => {
                 gnitz_warn!("dag: ingest_by_ref — table_id={} not registered", table_id);
-                return;
+                return Ok(());
             }
         };
 
         if entry.kind.is_base_table() {
-            self.ingest_returning_effective(table_id, batch.clone_batch());
+            self.ingest_returning_effective(table_id, batch.clone_batch())?;
         } else if batch.count > 0 {
-            Self::ingest_store_and_indices(table_id, entry, batch);
+            Self::ingest_store_and_indices(table_id, entry, batch)?;
         }
+        Ok(())
     }
 
     /// Ingest a view's tick output into its own store and — when the view carries
@@ -77,10 +78,15 @@ impl DagEngine {
     /// preserves sortedness and distinctness), so the stamp is copied by value
     /// into a store that moves rather than re-folds it, and it carries the folded
     /// row count rather than the raw one.
-    pub(crate) fn ingest_view_delta(&mut self, view_id: i64, batch: &Batch, tick_round: u64) {
+    pub(crate) fn ingest_view_delta(
+        &mut self,
+        view_id: i64,
+        batch: &Batch,
+        tick_round: u64,
+    ) -> Result<(), StorageError> {
         let Some(entry) = self.tables.get_mut(&view_id) else {
             gnitz_warn!("dag: ingest_view_delta — view_id={} not registered", view_id);
-            return;
+            return Ok(());
         };
         debug_assert!(
             entry.kind.is_view(),
@@ -88,7 +94,7 @@ impl DagEngine {
              a base table would silently skip enforce_unique_pk here",
         );
         if batch.count == 0 {
-            return;
+            return Ok(());
         }
         // Only a fed view that stamps on this worker pays the up-front fold; every
         // other view hands the batch straight to the store ingest it always did.
@@ -100,10 +106,10 @@ impl DagEngine {
             .then(|| Batch::consolidate_if_needed(batch, &entry.schema))
             .flatten();
         let batch = folded.as_ref().unwrap_or(batch);
-        Self::ingest_store_and_indices(view_id, entry, batch);
+        Self::ingest_store_and_indices(view_id, entry, batch)?;
 
         let Some(feed) = entry.delta.as_ref().filter(|_| stamps_here) else {
-            return;
+            return Ok(());
         };
         let stamped = batch.stamped_with_pk_prefix(&entry.schema, &feed.schema, tick_round);
         if let Err(e) = feed.handle.ingest_owned_batch(stamped) {
@@ -129,22 +135,23 @@ impl DagEngine {
                 e,
             );
         }
+        Ok(())
     }
 
     /// Ingest a batch into a relation's store + index projections and return the
     /// effective batch (after PK enforcement) — what downstream views need to
-    /// see. `None` means exactly "table not registered"; a storage-apply failure
-    /// never returns (`ingest_store_and_indices` aborts).
+    /// see. `Ok(None)` means exactly "table not registered"; `Err` is a
+    /// storage-apply failure.
     ///
     /// Named apart from `CatalogEngine::ingest_to_family` (which routes a
     /// *system* family through the precheck/hooks path) — the two are different
     /// operations that were one keystroke apart.
-    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> Option<Batch> {
+    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> Result<Option<Batch>, StorageError> {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => {
                 gnitz_warn!("dag: ingest_returning_effective — table_id={} not registered", table_id);
-                return None;
+                return Ok(None);
             }
         };
 
@@ -155,9 +162,9 @@ impl DagEngine {
         };
 
         if effective_batch.count > 0 {
-            Self::ingest_store_and_indices(table_id, entry, &effective_batch);
+            Self::ingest_store_and_indices(table_id, entry, &effective_batch)?;
         }
-        Some(effective_batch)
+        Ok(Some(effective_batch))
     }
 
     /// Project all index batches from `source`, ingest a clone into the store,
@@ -166,42 +173,43 @@ impl DagEngine {
     ///
     /// A storage error here means committed (or SAL-replayed) data was not
     /// applied while the client already holds a durability ACK, so process state
-    /// has diverged from the durable SAL. That is fatal at the point of
-    /// detection: `gnitz_fatal_abort!` and let restart + SAL replay re-apply the
-    /// batch (its WAL zone stays above the flushed-shard watermark, so it *will*
-    /// be replayed). Silent swallowing is the one unsound response — it neither
-    /// applies nor replays the entry, and the next checkpoint orphans it.
-    fn ingest_store_and_indices(table_id: i64, entry: &mut TableEntry, source: &Batch) {
+    /// has diverged from the durable SAL. Silent swallowing is the one unsound
+    /// response — it neither applies nor replays the entry, and the next
+    /// checkpoint orphans it. The error is returned instead: a caller that owns
+    /// a watchdog aborts on it and lets restart + SAL replay re-apply the batch
+    /// (its WAL zone stays above the flushed-shard watermark, so it *will* be
+    /// replayed); one that does not, poisons its handle.
+    fn ingest_store_and_indices(table_id: i64, entry: &mut TableEntry, source: &Batch) -> Result<(), StorageError> {
         let index_batches: Vec<Batch> = entry
             .index_circuits
             .iter()
             .map(|ic| Self::batch_project_index(source, &ic.key_spec, &ic.index_schema))
             .collect();
 
-        if let Err(e) = inject_ingest_apply_error("store", entry.handle.ingest_borrowed_batch(source)) {
-            gnitz_fatal_abort!(
+        inject_ingest_apply_error("store", entry.handle.ingest_borrowed_batch(source)).inspect_err(|e| {
+            gnitz_error!(
                 "dag: base-table ingest failed (table_id={}): {} — committed data \
-                 not applied, state diverged from durable SAL; aborting for \
-                 restart+replay",
+                 not applied, state diverged from durable SAL",
                 table_id,
                 e,
             );
-        }
+        })?;
 
         for (ic, idx_batch) in entry.index_circuits.iter_mut().zip(index_batches) {
             if idx_batch.count > 0 {
                 let index_id = ic.index_id;
-                if let Err(e) = inject_ingest_apply_error("index", ic.table_mut().ingest_owned_batch(idx_batch)) {
-                    gnitz_fatal_abort!(
+                inject_ingest_apply_error("index", ic.table_mut().ingest_owned_batch(idx_batch)).inspect_err(|e| {
+                    gnitz_error!(
                         "dag: secondary-index ingest failed (table_id={}, index_id={}): {} \
-                         — index diverged from base table; aborting for restart+replay",
+                         — index diverged from base table",
                         table_id,
                         index_id,
                         e,
                     );
-                }
+                })?;
             }
         }
+        Ok(())
     }
 
     // ── Flush / checkpoint collection ───────────────────────────────────
@@ -219,24 +227,6 @@ impl DagEngine {
             ic.table_mut().flush()?;
         }
         Ok(())
-    }
-
-    /// Flush `view_id`'s output store (and index circuits) — NOT its operator
-    /// traces, which are checkpoint-only. Aborts the process on a storage fault:
-    /// the callers flush a view they just ingested or backfilled, so a failure is
-    /// a RAM-tier spill fault — the store can no longer be bounded, and
-    /// continuing would grow memory unchecked under a sustained fault. Restart
-    /// re-derives the view from its base tables (the same disk fault would
-    /// already abort the base ingest via `ingest_store_and_indices`).
-    pub fn flush_view_or_abort(&mut self, view_id: i64) {
-        if let Err(e) = self.flush(view_id) {
-            gnitz_fatal_abort!(
-                "dag: view store flush failed (view_id={}): {} — view state \
-                 cannot be bounded; aborting for restart+re-derive",
-                view_id,
-                e,
-            );
-        }
     }
 
     /// Every store this process **owns and checkpoints**: each relation's `Owned`

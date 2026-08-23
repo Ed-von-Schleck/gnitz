@@ -280,6 +280,48 @@ pub fn send_control(
 /// hard protocol error. Pass `None` for the initial frame or when no cache
 /// entry exists.
 pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result<Message, ProtocolError> {
+    let parsed = parse_response_frame(buf, schema_hint)?;
+    let data_batch = match parsed.data_block {
+        Some(range) => {
+            let eff: &Schema = match parsed.message.schema.as_deref() {
+                Some(s) => s,
+                None => schema_hint
+                    .map(|(s, _)| s)
+                    .ok_or_else(|| ProtocolError::DecodeError("no schema for data block".into()))?,
+            };
+            Some(decode_wal_block(&buf[range], eff)?.0)
+        }
+        None => None,
+    };
+    Ok(Message {
+        data_batch,
+        ..parsed.message
+    })
+}
+
+/// A parsed reply frame whose data block has been located but not decoded.
+///
+/// `message.data_batch` is always `None` here: locating the block is all this
+/// does, and decoding it is what [`parse_response`] adds.
+pub(crate) struct ParsedFrame {
+    pub(crate) message: Message,
+    /// Where the data block sits in the frame buffer, or `None` when the frame
+    /// carries no data.
+    pub(crate) data_block: Option<std::ops::Range<usize>>,
+}
+
+/// Everything [`parse_response`] does except decoding the data block: frame
+/// bounds, control block, error text, schema block and the schema-version check.
+///
+/// The split exists so a caller that wants the block's *bytes* — a subscriber
+/// feeding them into a store, which would otherwise pay an OPK→native decode
+/// and a native→OPK re-encode of every key to rebuild what the socket already
+/// delivered — reaches them through the same validation the decoding entry
+/// runs, rather than a second copy of it that could drift on what it checked.
+pub(crate) fn parse_response_frame(
+    buf: &[u8],
+    schema_hint: Option<(&Schema, u16)>,
+) -> Result<ParsedFrame, ProtocolError> {
     if buf.len() < WAL_BLOCK_HEADER_SIZE {
         return Err(ProtocolError::DecodeError("message too small".into()));
     }
@@ -318,15 +360,9 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         }
     }
 
-    let data_batch = if has_data {
-        let eff: &Schema = match wire_schema.as_ref() {
-            Some(s) => s,
-            None => schema_hint
-                .map(|(s, _)| s)
-                .ok_or_else(|| ProtocolError::DecodeError("no schema for data block".into()))?,
-        };
-        let (batch, _) = decode_wal_block(gnitz_wire::wal::block_slice_at(buf, off)?, eff)?;
-        Some(batch)
+    let data_block = if has_data {
+        let block = gnitz_wire::wal::block_slice_at(buf, off)?;
+        Some(off..off + block.len())
     } else {
         None
     };
@@ -335,15 +371,18 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
     // blocks are already absent and there is nothing to suppress.
     let error_text = (ctrl_header.status == STATUS_ERROR).then_some(error_msg);
 
-    Ok(Message {
-        status: ctrl_header.status,
-        target_id: ctrl_header.target_id,
-        flags: ctrl_header.flags,
-        seek_pk: ctrl_header.seek_pk,
-        schema: wire_schema.map(std::sync::Arc::new),
-        data_batch,
-        error_text,
-        seek_pk_extra,
+    Ok(ParsedFrame {
+        message: Message {
+            status: ctrl_header.status,
+            target_id: ctrl_header.target_id,
+            flags: ctrl_header.flags,
+            seek_pk: ctrl_header.seek_pk,
+            schema: wire_schema.map(std::sync::Arc::new),
+            data_batch: None,
+            error_text,
+            seek_pk_extra,
+        },
+        data_block,
     })
 }
 

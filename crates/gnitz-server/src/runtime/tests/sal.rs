@@ -1006,13 +1006,15 @@ fn the_live_path_parks_on_a_leftover_whose_prefix_epoch_was_raised() {
 /// live drain fail-stops rather than reading it as end-of-log.
 #[test]
 fn the_live_path_aborts_on_a_damaged_header() {
-    gnitz_engine_testkit::assert_test_aborts_134("the_live_path_aborts_on_a_damaged_header_internal", &[]);
+    let name = "the_live_path_aborts_on_a_damaged_header_internal";
+    let status = gnitz_engine_testkit::run_test_in_child(name, &[]);
+    assert_eq!(status.code(), Some(134), "{name} must fail-stop (exit 134)");
 }
 
 /// Runs only in the re-exec'd abort child.
 #[test]
 fn the_live_path_aborts_on_a_damaged_header_internal() {
-    if !gnitz_engine_testkit::in_abort_child() {
+    if !gnitz_engine_testkit::in_child_test() {
         return;
     }
     let size = 1 << 20;

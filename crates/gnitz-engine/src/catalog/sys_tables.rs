@@ -61,6 +61,11 @@ pub(super) const RELATION_ID_CEILING: i64 = 1 << 31;
 
 pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
 
+/// The `flock`ed file that makes a data directory single-writer. A plain file in
+/// `base_dir`, never a schema directory, so the boot orphan sweep (which scans
+/// registered schema names) never reaches it.
+pub(super) const DIR_LOCK_FILENAME: &str = "LOCK";
+
 pub(super) const SCHEMA_TAB_ID: i64 = gnitz_wire::SCHEMA_TAB as i64;
 pub(super) const TABLE_TAB_ID: i64 = gnitz_wire::TABLE_TAB as i64;
 pub(super) const VIEW_TAB_ID: i64 = gnitz_wire::VIEW_TAB as i64;

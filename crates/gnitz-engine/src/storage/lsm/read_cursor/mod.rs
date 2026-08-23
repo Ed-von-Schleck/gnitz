@@ -464,6 +464,7 @@ impl ReadCursor {
     /// to `pk_stride` to form the seek key. 0x00 is the OPK minimum for every PK
     /// type (signed MIN maps to all-zeros after the sign flip), so the padded key
     /// is the correct lower bound for the suffix columns at every type.
+    #[inline]
     pub fn seek_first_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
         let stride = self.schema.pk_stride() as usize;
         debug_assert!(prefix.len() <= stride, "prefix is wider than the PK");

@@ -602,7 +602,7 @@ impl MasterDispatcher {
     /// Half a checkpoint on its own. Both callers pair it with `restamp_derived`
     /// in the same reactor-parked span.
     fn reclaim_base(&self) -> Result<u64, String> {
-        let gen = self.bump_checkpoint_generation();
+        let gen = self.bump_checkpoint_generation()?;
         self.sync_round(0, FLAG_FLUSH)?;
         Ok(gen)
     }
@@ -1609,7 +1609,7 @@ impl MasterDispatcher {
     /// Bump the committed checkpoint generation (step 0 of the sequence).
     /// Delegates to the catalog: durably records the seq-4 row and publishes the
     /// new value to `worker_ctx`. Returns the new generation.
-    pub(crate) fn bump_checkpoint_generation(&self) -> u64 {
+    pub(crate) fn bump_checkpoint_generation(&self) -> Result<u64, String> {
         self.cat().bump_checkpoint_generation()
     }
 
@@ -1622,7 +1622,9 @@ impl MasterDispatcher {
         // The topology row's durability rides the gen bump's system-table flush
         // (both are `_sequences` rows), so a manifest stamped at a generation
         // implies the topology row for that layout is durable.
-        self.cat().record_topology(worker_count);
+        self.cat()
+            .record_topology(worker_count)
+            .map_err(|e| format!("topology record failed: {e}"))?;
         self.reclaim_base()?;
         self.restamp_derived(&[])
     }

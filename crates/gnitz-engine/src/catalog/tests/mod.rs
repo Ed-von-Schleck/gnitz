@@ -183,7 +183,7 @@ fn create_flagged_table(
     pk_cols: &[u32],
     flags: u64,
 ) -> i64 {
-    let tid = engine.allocate_table_id();
+    let tid = engine.allocate_table_id().unwrap();
     engine.write_column_records(tid, OWNER_KIND_TABLE, cols).unwrap();
     let batch = build_table_tab_row_flags(tid, pack_pk_cols(pk_cols), table_name, flags);
     engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
@@ -329,7 +329,7 @@ fn try_register_identity_view_with(
     capacity_bytes: u64,
     delta_bytes: u64,
 ) -> Result<i64, String> {
-    let vid = engine.allocate_table_id();
+    let vid = engine.allocate_table_id().unwrap();
     write_identity_circuit(engine, vid, base_tid, None);
     engine.write_column_records(vid, OWNER_KIND_VIEW, cols).unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());

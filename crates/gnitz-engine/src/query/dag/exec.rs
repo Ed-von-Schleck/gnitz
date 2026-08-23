@@ -19,7 +19,7 @@ impl DagEngine {
     /// view of any shape (arm 1), where the identity relay does run because the
     /// shape is still `Exchanged` but every worker already holds every source in
     /// full.
-    fn execute_epoch(&mut self, view_id: i64, input: Batch, source_id: i64) -> Option<Batch> {
+    fn execute_epoch(&mut self, view_id: i64, input: Batch, source_id: i64) -> Result<Option<Batch>, String> {
         self.run_view_epoch(view_id, input, source_id, |pre, _| pre)
     }
 
@@ -52,14 +52,14 @@ impl DagEngine {
         input: Batch,
         src_id: i64,
         mut relay: impl FnMut(Batch, i64) -> Batch,
-    ) -> Option<Batch> {
-        if !self.ensure_compiled(view_id) {
+    ) -> Result<Option<Batch>, String> {
+        if !self.ensure_compiled(view_id)? {
             gnitz_warn!("dag: run_view_epoch — no plan for view_id={}", view_id);
-            return None;
+            return Ok(None);
         }
         let plan = self.cache.get_mut(&view_id).unwrap();
         match &mut plan.shape {
-            PlanShape::Single(sub) => Self::execute_sub_plan(sub, input, src_id),
+            PlanShape::Single(sub) => Self::execute_sub_plan(sub, input, src_id).map_err(|e| e.to_string()),
             PlanShape::Exchanged { sides, post } => {
                 // A unary side takes every delta; a set-op side takes it iff it
                 // scans the delta's source (`a UNION a` — both sides scan one
@@ -94,6 +94,7 @@ impl DagEngine {
                         // encode already sees the side's pre-exchange schema
                         // (never the view's combine-widened final one).
                         let pre = Self::execute_sub_plan(&mut side.plan, delta, src_id)
+                            .map_err(|e| e.to_string())?
                             .unwrap_or_else(|| Batch::empty_with_schema(&schema));
                         let relay_key = if unary { 0 } else { side.source_id };
                         Self::consolidate_exchanged(relay(pre, relay_key), &schema)
@@ -104,9 +105,9 @@ impl DagEngine {
                 }
                 // A pad round whose every side produced nothing.
                 if Self::latch_empty_epoch(post, seeds.iter().all(|(_, b)| b.count == 0)) {
-                    return None;
+                    return Ok(None);
                 }
-                Self::execute_sub_plan_multi(post, seeds)
+                Self::execute_sub_plan_multi(post, seeds).map_err(|e| e.to_string())
             }
         }
     }
@@ -127,7 +128,10 @@ impl DagEngine {
     /// Execute one sub-pipeline epoch, seeding one register per input. Takes the
     /// sub-plan by mutable reference, to reach the VM's regfile and owned-cursor
     /// state.
-    fn execute_sub_plan_multi(sub: &mut SubPlan, inputs: impl IntoIterator<Item = (u16, Batch)>) -> Option<Batch> {
+    fn execute_sub_plan_multi(
+        sub: &mut SubPlan,
+        inputs: impl IntoIterator<Item = (u16, Batch)>,
+    ) -> Result<Option<Batch>, StorageError> {
         let SubPlan { vm, out_reg, .. } = sub;
         vm.compact_owned_traces();
         vm.bind_trace_cursors();
@@ -158,9 +162,9 @@ impl DagEngine {
     /// Single-input sub-pipeline epoch. `source_id > 0` selects the input
     /// register from the sub-plan's `source_reg_map`; pass `0` when the
     /// sub-plan has a single unambiguous input.
-    fn execute_sub_plan(sub: &mut SubPlan, input: Batch, source_id: i64) -> Option<Batch> {
+    fn execute_sub_plan(sub: &mut SubPlan, input: Batch, source_id: i64) -> Result<Option<Batch>, StorageError> {
         if Self::latch_empty_epoch(sub, input.count == 0) {
-            return None;
+            return Ok(None);
         }
         let in_reg = if source_id > 0 {
             sub.source_reg_map.get(&source_id).copied().unwrap_or(sub.in_reg)
@@ -227,10 +231,10 @@ impl DagEngine {
         input: Batch,
         src_id: i64,
         exchange: &mut E,
-    ) -> Option<Batch> {
-        if !self.ensure_compiled(view_id) {
+    ) -> Result<Option<Batch>, String> {
+        if !self.ensure_compiled(view_id)? {
             gnitz_warn!("dag: execute_multi_worker_step — no plan for view_id={}", view_id);
-            return None;
+            return Ok(None);
         }
 
         // Arm 1. A view stamped replicated holds every source in full and receives
@@ -299,9 +303,9 @@ impl DagEngine {
         source_id: i64,
         delta: Batch,
         exchange: &mut E,
-    ) -> bool {
+    ) -> Result<bool, String> {
         if !self.tables.contains_key(&view_id) {
-            return false;
+            return Ok(false);
         }
         // A backfilled view must be ephemeral: a durable one loads its shards
         // from its manifest at open, which would double-count against the deltas
@@ -313,12 +317,13 @@ impl DagEngine {
             "distributed backfill into durable relation {view_id}: \
              would double-count loaded shards",
         );
-        match self.execute_multi_worker_step(view_id, delta, source_id, exchange) {
+        match self.execute_multi_worker_step(view_id, delta, source_id, exchange)? {
             Some(out) if out.count > 0 => {
-                self.ingest_returning_effective(view_id, out);
-                true
+                self.ingest_returning_effective(view_id, out)
+                    .map_err(|e| e.to_string())?;
+                Ok(true)
             }
-            _ => false,
+            _ => Ok(false),
         }
     }
 
@@ -341,10 +346,10 @@ impl DagEngine {
         delta: Batch,
         tick_round: u64,
         exchange: &mut E,
-    ) {
+    ) -> Result<(), String> {
         self.get_dep_map();
         let Some(view_ids) = self.dep.forward.get(&source_id).filter(|v| !v.is_empty()) else {
-            return;
+            return Ok(());
         };
 
         let mut pending = self.build_pending(view_ids, source_id, delta);
@@ -368,12 +373,13 @@ impl DagEngine {
             }
 
             let out_delta = self
-                .execute_multi_worker_step(view_id, input, src_id, exchange)
+                .execute_multi_worker_step(view_id, input, src_id, exchange)?
                 .filter(|b| b.count > 0);
 
             if let Some(out) = out_delta.as_ref() {
                 dirty_views.insert(view_id);
-                self.ingest_view_delta(view_id, out, tick_round);
+                self.ingest_view_delta(view_id, out, tick_round)
+                    .map_err(|e| format!("view store ingest failed (view_id={view_id}): {e}"))?;
             }
 
             // Fan the output onto each dependent edge. Both borrows are shared
@@ -384,9 +390,14 @@ impl DagEngine {
             Self::queue_dependents(&mut pending, &self.tables, dep_view_ids, view_id, src_schema, out_delta);
         }
 
+        // A failure here is a RAM-tier spill fault: the view store can no longer
+        // be bounded, and continuing would grow memory unchecked under a
+        // sustained fault.
         for vid in dirty_views {
-            self.flush_view_or_abort(vid);
+            self.flush(vid)
+                .map_err(|e| format!("view store flush failed (view_id={vid}): {e}"))?;
         }
+        Ok(())
     }
 
     /// Seed the pending queue from `source_id`'s direct dependents. The last live

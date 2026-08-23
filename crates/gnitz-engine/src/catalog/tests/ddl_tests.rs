@@ -451,7 +451,7 @@ fn test_hook_relation_register_rejects_malformed_pk() {
         nullable_def("c2", type_code::U64),
         col_def("c3", type_code::F32),
     ];
-    let tid = engine.allocate_table_id();
+    let tid = engine.allocate_table_id().unwrap();
     engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
 
     let mut assert_rejects = |raw_pk_cols: u64, snippet: &str| {
@@ -780,10 +780,10 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     let pt = engine.create_table("public.pt", &cols, &[0]).unwrap();
 
     // Consumer ids allocated BEFORE their producers, on both chains.
-    let r_consumer = engine.allocate_table_id();
-    let r_producer = engine.allocate_table_id();
-    let p_consumer = engine.allocate_table_id();
-    let p_producer = engine.allocate_table_id();
+    let r_consumer = engine.allocate_table_id().unwrap();
+    let r_producer = engine.allocate_table_id().unwrap();
+    let p_consumer = engine.allocate_table_id().unwrap();
+    let p_producer = engine.allocate_table_id().unwrap();
 
     for (vid, src) in [
         (r_producer, rt),

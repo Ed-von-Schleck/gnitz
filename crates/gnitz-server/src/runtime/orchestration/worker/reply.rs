@@ -492,10 +492,15 @@ impl WorkerProcess {
 
 /// A blob-bearing (STRING/German-string) reply cannot be split across frames, so
 /// one too large for a single frame has no way out.
+///
+/// The remedy names a projection first because narrowing the row count is not
+/// always one: a join builds a row out of two that each fit, and no predicate or
+/// `LIMIT` makes that single row returnable.
 fn oversized_string_reply(sz: usize) -> gnitz_wire::WireFault {
     gnitz_wire::WireFault::from(format!(
         "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}; a STRING-column \
-         result cannot be chunked — add a tighter predicate or a LIMIT"
+         result cannot be chunked — project fewer STRING columns, or match fewer rows. \
+         One row wider than the cap cannot be returned at all."
     ))
 }
 

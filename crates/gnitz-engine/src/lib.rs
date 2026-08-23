@@ -9,10 +9,10 @@
 //! and `storage::batch_pool`).
 //!
 //! There is no crate-root re-export façade: a type's rung is part of what its
-//! path says. The only names at the root are the `gnitz_*!` macros, which have
-//! no other export site. Four of them log; the fifth, `gnitz_fatal_abort!`,
-//! ends the calling process — see its doc before linking this crate into one
-//! that cannot afford to be ended.
+//! path says. The only names at the root are the four `gnitz_*!` logging
+//! macros, which have no other export site. Nothing this crate exports ends the
+//! calling process: every fallible path returns its error, and the decision to
+//! fail-stop belongs to the process that owns a restart contract.
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");

@@ -87,7 +87,11 @@ pub(crate) fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch
 /// runs over a trusted stream (OS-delivered Unix socket bytes or a TLS
 /// record layer) where transport integrity is already guaranteed. Use
 /// [`decode_wal_block_verified`] where the checksum itself is under test.
-pub(crate) fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
+///
+/// Public because a locally-served read has to end in a `ZSetBatch` too, and it
+/// must be *this* function: a local reply and a remote one decoded by two
+/// different rules could disagree.
+pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
     decode_wal_block_impl(data, schema, false)
 }
 

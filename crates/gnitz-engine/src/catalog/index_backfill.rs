@@ -8,19 +8,18 @@ use crate::schema::make_index_schema;
 
 impl CatalogEngine {
     /// Locally retract an index registration whose +1 was applied but never
-    /// broadcast. A failed rollback leaves the +1 in sys_indices while the
-    /// client is handed an error — a permanently diverged catalog, and the
-    /// next boot's replay would open a missing index directory — so it
-    /// fail-stops, matching `compensate_stage_a`'s rollback abort.
-    pub(super) fn rollback_index_registration(&mut self, undo: Batch, index_id: i64) {
-        if let Err(undo_err) = self.submit_local(SysFamily::Index, undo) {
-            gnitz_fatal_abort!(
-                "catalog: index registration rollback failed (index_id={}): {} \
-                 — catalog state permanently diverged; aborting",
-                index_id,
-                undo_err,
-            );
-        }
+    /// broadcast. `Err` means the rollback itself failed, leaving the +1 in
+    /// sys_indices while the client is handed an error — a permanently diverged
+    /// catalog, and the next boot's replay would open a missing index directory.
+    /// The caller that owns a watchdog fail-stops on it, matching
+    /// `compensate_stage_a`'s rollback.
+    pub(super) fn rollback_index_registration(&mut self, undo: Batch, index_id: i64) -> Result<(), String> {
+        self.submit_local(SysFamily::Index, undo).map_err(|undo_err| {
+            format!(
+                "catalog: index registration rollback failed (index_id={index_id}): {undo_err} \
+                 — catalog state permanently diverged"
+            )
+        })
     }
 
     /// The recovery policy for a secondary-index table: resume from a manifest
@@ -284,7 +283,9 @@ impl CatalogEngine {
                 continue;
             }
 
-            let index_id = self.allocate_index_id();
+            let index_id = self
+                .allocate_index_id()
+                .map_err(|e| format!("index id allocation failed: {e}"))?;
 
             // Write index record to sys_indices (FK indices are not unique).
             let packed_cols = gnitz_wire::pack_pk_cols(&[col_idx as u32]);
@@ -300,7 +301,7 @@ impl CatalogEngine {
                 // otherwise the next boot's replay opens a missing index
                 // directory and crashes.
                 let undo = idx_tab_batch(index_id, table_id, packed_cols, &index_name, false, -1);
-                self.rollback_index_registration(undo, index_id);
+                self.rollback_index_registration(undo, index_id)?;
                 return Err(e);
             }
         }

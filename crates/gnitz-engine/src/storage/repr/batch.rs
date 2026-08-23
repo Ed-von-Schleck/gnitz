@@ -1400,6 +1400,50 @@ impl Batch {
         output
     }
 
+    /// Copy every row into `out_schema`, dropping the eight leading big-endian
+    /// bytes [`Self::stamped_with_pk_prefix`] wrote — the inverse of that call,
+    /// with the schemas swapped.
+    ///
+    /// **It is not that one's mirror image in the layout claim, and that is what
+    /// makes the ingest below it correct.** The stamp inherits the input's claim
+    /// because prepending one constant to every key preserves sortedness and
+    /// distinctness. *Removing* the prefix preserves neither once the batch spans
+    /// more than one stamp value: the rows are then ordered by stamp first, so
+    /// round 5's key 100 sits before round 6's key 3, and the same
+    /// `(key, payload)` element legitimately appears under two stamps. So the
+    /// result claims `Layout::Raw`, and the ingest's sort-and-fold is what sums
+    /// those weights onto the right element. An inherited `Consolidated` claim
+    /// would make `into_consolidated` a no-op and push an unsorted,
+    /// duplicate-carrying run straight into the memtable, where the RunSet merge
+    /// reads each run linearly and accumulates weights against the wrong element
+    /// — with no error outside `#[cfg(debug_assertions)]`.
+    pub fn stripped_of_pk_prefix(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
+        let in_stride = in_schema.pk_stride() as usize;
+        let out_stride = out_schema.pk_stride() as usize;
+        debug_assert_eq!(in_stride, out_stride + 8);
+        debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
+        let n = self.count;
+        if n == 0 {
+            return Self::empty_with_schema(out_schema);
+        }
+
+        let mut output = Self::with_capacity(*out_schema, n);
+        output.count = n;
+        output.take_blob_weights_and_payload(self, in_schema);
+        output.null_bmp_data_mut().copy_from_slice(self.null_bmp_data());
+
+        let src_pk = self.pk_data();
+        for (dst, src) in output
+            .pk_data_mut()
+            .chunks_exact_mut(out_stride)
+            .zip(src_pk.chunks_exact(in_stride))
+        {
+            dst.copy_from_slice(&src[8..]);
+        }
+
+        output
+    }
+
     /// Copy every row into `out_schema`, which must extend this batch's schema
     /// with extra trailing payload columns, filling those columns with NULL.
     /// The PK region, weights and existing payload columns carry over verbatim,

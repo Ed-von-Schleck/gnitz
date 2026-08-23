@@ -276,8 +276,8 @@ fn checkpointed_table_with_index(dir: &str) -> (i64, u64) {
     let tid = base_with_index(&mut engine);
 
     // The two halves of the verdict, written the way a boot writes them.
-    engine.record_topology(1);
-    let g = engine.bump_checkpoint_generation();
+    engine.record_topology(1).unwrap();
+    let g = engine.bump_checkpoint_generation().unwrap();
 
     let entry = engine.dag.tables.get_mut(&tid).unwrap();
     let idx: *mut crate::storage::Table = entry.index_circuits[0].table_mut();

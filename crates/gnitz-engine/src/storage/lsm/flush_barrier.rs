@@ -138,6 +138,22 @@ fn publish_chunk(
 
 const DATASYNC: io_uring::types::FsyncFlags = io_uring::types::FsyncFlags::DATASYNC;
 
+/// The process's io_uring verdict, decided by the first barrier that needs a
+/// ring and latched from then on — `LazyRing::default()` is constructed fresh on
+/// every `flush_barrier` call, so a per-instance verdict would re-decide, and
+/// re-read the env override, on every one.
+static IO_URING_USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The errnos that mean "this platform denies the syscall" rather than "this
+/// call failed": Docker's default seccomp profile and
+/// `kernel.io_uring_disabled=2` both report one of them. On any of the three the
+/// flush path falls back to blocking `fsync`/`fdatasync` — for every caller,
+/// server included — rather than failing the flush, and logs a warning once.
+fn is_uring_denied(e: &std::io::Error) -> bool {
+    e.raw_os_error()
+        .is_some_and(|c| c == libc::ENOSYS || c == libc::EPERM || c == libc::EACCES)
+}
+
 /// io_uring created on first use: a barrier over a table set that turns out to
 /// need no I/O should not pay `io_uring_setup` plus its two mmaps.
 #[derive(Default)]
@@ -147,6 +163,11 @@ impl LazyRing {
     /// Submit one FSYNC SQE per fd and await completion of all of them. Drains
     /// the SQ when full, so a batch larger than the ring's SQ entries takes
     /// several `submit_and_wait` calls.
+    ///
+    /// Where io_uring is unavailable this loops the fds through blocking
+    /// `fsync`/`fdatasync` instead. This is the engine's only io_uring user, so
+    /// the fallback here is what lets the whole flush path run on a host that
+    /// denies the syscall.
     fn batch_sync(&mut self, fds: &[libc::c_int], flags: io_uring::types::FsyncFlags) -> Result<(), StorageError> {
         self.batch_sync_with(fds, flags, |r, want| r.submit_and_wait(want))
     }
@@ -164,10 +185,10 @@ impl LazyRing {
         }
         let ring = match self.0 {
             Some(ref mut r) => r,
-            None => self.0.insert(io_uring::IoUring::new(256).map_err(|e| {
-                gnitz_warn!("io_uring::new failed: {}", e);
-                StorageError::from(e)
-            })?),
+            None => match new_ring()? {
+                Some(r) => self.0.insert(r),
+                None => return blocking_sync(fds, flags),
+            },
         };
         let sq_capacity = ring.params().sq_entries() as usize;
         let mut completed = 0usize;
@@ -204,6 +225,67 @@ impl LazyRing {
     }
 }
 
+/// Build the ring, or `Ok(None)` where this host denies `io_uring_setup` and the
+/// caller must fall back to blocking `fsync`. `GNITZ_DISABLE_IO_URING` forces
+/// that fallback without a sysctl, which is what lets `make verify` exercise it.
+///
+/// Either verdict latches, so the syscall — and the env read that can veto it —
+/// happen once per process. A setup that fails for any other reason (ENOMEM,
+/// EMFILE) is this one call failing rather than a platform verdict, so it
+/// decides nothing and is reported as the flush error it is.
+fn new_ring() -> Result<Option<io_uring::IoUring>, StorageError> {
+    match IO_URING_USABLE.get() {
+        Some(false) => return Ok(None),
+        Some(true) => {}
+        // Undecided, so the env override gets its say before the first attempt.
+        None if crate::foundation::env::env_flag("GNITZ_DISABLE_IO_URING") => {
+            let _ = IO_URING_USABLE.set(false);
+            return Ok(None);
+        }
+        None => {}
+    }
+    match io_uring::IoUring::new(256) {
+        Ok(r) => {
+            let _ = IO_URING_USABLE.set(true);
+            Ok(Some(r))
+        }
+        Err(e) if is_uring_denied(&e) => {
+            gnitz_warn!("io_uring unavailable ({}); flushing through blocking fsync", e);
+            let _ = IO_URING_USABLE.set(false);
+            Ok(None)
+        }
+        Err(e) => {
+            gnitz_warn!("io_uring::new failed: {}", e);
+            Err(StorageError::from(e))
+        }
+    }
+}
+
+/// `batch_sync`'s fallback: one blocking `fsync`/`fdatasync` per fd, retried
+/// through EINTR. Same contract — every fd is durable when this returns Ok.
+fn blocking_sync(fds: &[libc::c_int], flags: io_uring::types::FsyncFlags) -> Result<(), StorageError> {
+    let datasync = flags.contains(DATASYNC);
+    for &fd in fds {
+        loop {
+            let rc = if datasync {
+                unsafe { libc::fdatasync(fd) }
+            } else {
+                unsafe { libc::fsync(fd) }
+            };
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            gnitz_warn!("blocking fsync failed: {}", err);
+            return Err(StorageError::from(err));
+        }
+    }
+    Ok(())
+}
+
 /// Consume every ready CQE, returning how many completed. Any failed fsync is
 /// the barrier's failure.
 fn drain(ring: &mut io_uring::IoUring) -> Result<usize, StorageError> {
@@ -229,12 +311,7 @@ mod tests {
     fn try_lazy_ring(entries: u32) -> Option<LazyRing> {
         match io_uring::IoUring::new(entries) {
             Ok(r) => Some(LazyRing(Some(r))),
-            Err(e)
-                if e.raw_os_error()
-                    .is_some_and(|c| c == libc::ENOSYS || c == libc::EPERM || c == libc::EACCES) =>
-            {
-                None
-            }
+            Err(e) if is_uring_denied(&e) => None,
             Err(e) => panic!("io_uring::new: {e}"),
         }
     }

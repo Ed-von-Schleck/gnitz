@@ -1,0 +1,293 @@
+//! The handle: what a host opens, registers views on, polls, and reads through.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use gnitz_core::{DeltaCursor, GnitzClient, RelKind, Schema};
+use gnitz_engine::catalog::CatalogEngine;
+use gnitz_engine::foundation::env::env_num;
+use gnitz_engine::foundation::worker_ctx;
+use gnitz_engine::schema::SchemaDescriptor;
+
+use crate::cursors::{read_cursors, write_cursors};
+use crate::error::MirrorError;
+
+/// Applied delta bytes after which an apply drives a checkpoint of its own.
+/// `GNITZ_MIRROR_CHECKPOINT_BYTES` overrides it.
+const DEFAULT_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
+
+/// One live handle per process.
+///
+/// Not a `!Send` consequence but a process-global one: `worker_ctx` holds the
+/// committed checkpoint generation as a process static, `CatalogEngine::open`
+/// publishes its own durable generation into it, and every `Rederive` store
+/// captures that global at open. A second handle on a second data directory
+/// would overwrite it, and the first handle's next store would then be created
+/// against a generation from someone else's checkpoint history.
+///
+/// A latch the handle's `Drop` clears, not a once-per-process trip switch, so a
+/// host (and this crate's own tests) may open and drop repeatedly — but never
+/// *concurrently*, which is the same process-global state the latch exists for.
+static HANDLE_LIVE: AtomicBool = AtomicBool::new(false);
+
+struct HandleGuard;
+
+impl HandleGuard {
+    fn take() -> Result<Self, MirrorError> {
+        if HANDLE_LIVE.swap(true, Ordering::SeqCst) {
+            return Err(MirrorError::Engine(
+                "a mirror handle is already live in this process".to_string(),
+            ));
+        }
+        Ok(HandleGuard)
+    }
+}
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        HANDLE_LIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+/// One mirrored view: what registration resolved, and where its feed got to.
+pub(crate) struct MirroredView {
+    pub(crate) schema_name: String,
+    pub(crate) name: String,
+    pub(crate) kind: RelKind,
+    /// The client-side schema, as the resolve returned it — hidden columns
+    /// included, which is what keeps `pk_stride` right for a view whose physical
+    /// PK is a synthetic hidden column.
+    pub(crate) schema: Arc<Schema>,
+    /// The client-side shape a poll's *request* carries. `Arc` like `schema`
+    /// above: a poll hands it to the client by clone, and a deep one would
+    /// allocate per column on every poll, including the empty ones.
+    pub(crate) delta_reply_schema: Arc<Schema>,
+    /// The engine's own descriptor for the local store — read back from the
+    /// local catalog, so it is by construction the one the store was created
+    /// with.
+    pub(crate) view_desc: SchemaDescriptor,
+    /// The engine's derived delta-store shape, from the same builder the server
+    /// derives its own delta store with.
+    pub(crate) delta_desc: SchemaDescriptor,
+    /// `None` until the first bootstrap, and after a reopen whose cursor record
+    /// did not survive the two-part verdict.
+    pub(crate) cursor: Option<DeltaCursor>,
+}
+
+/// A maintained local copy of one or more views, and the connection that feeds
+/// it.
+///
+/// One handle mirrors many views: the engine is a registry of relations, so each
+/// lives under its own server id in one local catalog, one data directory, one
+/// lock and one checkpoint. Each carries its own cursor and is polled
+/// independently.
+pub struct Mirror {
+    pub(crate) engine: CatalogEngine,
+    pub(crate) client: GnitzClient,
+    pub(crate) views: HashMap<u64, MirroredView>,
+    /// The feed positions the cursor file replayed at open, less the ones a
+    /// [`Mirror::mirror_view`] has since claimed. The *registrations* they
+    /// belong to are not shadowed here: the local catalog holds them, and
+    /// answers by id, by qualified name and by layout.
+    pub(crate) replayed: HashMap<u64, DeltaCursor>,
+    pub(crate) base_dir: String,
+    pub(crate) poison: Option<String>,
+    applied_bytes: usize,
+    checkpoint_bytes: usize,
+    _guard: HandleGuard,
+}
+
+impl Mirror {
+    /// Open (or create) a mirror at `base_dir`, feeding it through `client`.
+    ///
+    /// The handle owns the connection: registration, every poll and every read
+    /// it delegates upstream all run on this thread, so nothing but the host's
+    /// own calls crosses a channel. While a poll is in flight a local read waits
+    /// one round trip — which is what a read against the server pays every time.
+    ///
+    /// Fails if the process has taken a server role, if another handle is live
+    /// in it, or if another process holds `base_dir`.
+    pub fn open(base_dir: &str, client: GnitzClient) -> Result<Self, MirrorError> {
+        // Assert Standalone rather than set it. `set_worker_role` would invert
+        // the local index backfill, the index home directory and `store_lsn`'s
+        // own assertion; and a mirror opened inside a forked worker would home
+        // its stores at `w{k}of1`, which the next boot sweep deletes as unowned.
+        if !worker_ctx::is_standalone() {
+            return Err(MirrorError::Engine(
+                "a mirror cannot be opened in a process that has taken a server role".to_string(),
+            ));
+        }
+        let guard = HandleGuard::take()?;
+        let mut engine = CatalogEngine::open(base_dir, 1)?;
+
+        // The generation is half the reopen verdict; the topology word is the
+        // other half, and nothing asks for the mirror: a view's own recovery
+        // source gates on the generation alone, and the server's second gate
+        // lives in a pre-fork step the mirror never runs. Re-record either way,
+        // so the next open has one to compare.
+        let replayed = read_cursors(base_dir, engine.resume_generation(), engine.topology_matches());
+        engine
+            .record_topology(1)
+            .map_err(|e| MirrorError::Engine(format!("topology record failed: {e}")))?;
+
+        Ok(Mirror {
+            engine,
+            client,
+            views: HashMap::new(),
+            replayed,
+            base_dir: base_dir.to_string(),
+            poison: None,
+            applied_bytes: 0,
+            checkpoint_bytes: env_num("GNITZ_MIRROR_CHECKPOINT_BYTES", DEFAULT_CHECKPOINT_BYTES),
+            _guard: guard,
+        })
+    }
+
+    /// The connection the handle owns. A host writes through it — the mirror is
+    /// read-only, and a mirrored relation is a view, which is not a DML target
+    /// upstream either.
+    ///
+    /// A host that drops a view it mirrors stops mirroring it; the crate offers
+    /// [`Mirror::forget_view`] as that statement of intent rather than inferring
+    /// it from a `DROP` that happened to pass through here.
+    pub fn client_mut(&mut self) -> &mut GnitzClient {
+        &mut self.client
+    }
+
+    /// The views this handle currently mirrors, by server id.
+    pub fn mirrored_ids(&self) -> Vec<u64> {
+        self.views.keys().copied().collect()
+    }
+
+    /// Whether `table_id` is answered locally.
+    pub fn mirrors(&self, table_id: u64) -> bool {
+        self.views.contains_key(&table_id)
+    }
+
+    /// The round each mirrored view's copy is current as of — what
+    /// [`Mirror::poll`] last carried through, and the round a local read of it
+    /// answers at.
+    pub fn cursor_of(&self, table_id: u64) -> Option<DeltaCursor> {
+        self.views.get(&table_id).and_then(|v| v.cursor)
+    }
+
+    // -- Poison ------------------------------------------------------------
+
+    /// The message that poisoned this handle, if any.
+    pub fn poisoned(&self) -> Option<&str> {
+        self.poison.as_deref()
+    }
+
+    pub(crate) fn check_poison(&self) -> Result<(), MirrorError> {
+        match &self.poison {
+            Some(m) => Err(MirrorError::Poisoned(m.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Poison the handle and report why.
+    ///
+    /// An ingest error is the one that *must* poison: the delta it dropped
+    /// leaves a hole the cursor would step over, so every later read would
+    /// answer off a copy silently missing rows. A checkpoint error is the
+    /// opposite case — see [`Mirror::checkpoint`].
+    pub(crate) fn poison(&mut self, why: String) -> MirrorError {
+        if self.poison.is_none() {
+            self.poison = Some(why.clone());
+        }
+        MirrorError::Poisoned(why)
+    }
+
+    /// Run `f` with a panic guard that poisons before the unwind continues.
+    ///
+    /// The `Err` channel covers the expected faults — a full or failing disk —
+    /// and works in every build. This covers *bugs*, and only where the panic
+    /// unwinds: a mirror built inside this workspace in release inherits
+    /// `panic = "abort"`, which cannot be set per package, so a bug in the
+    /// engine still ends the process there. That is the ordinary contract of any
+    /// `panic = "abort"` library.
+    pub(crate) fn guarded<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> T) -> T {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(v) => v,
+            Err(payload) => {
+                self.poison(format!("panic while {what}; a store may be torn"));
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    // -- Checkpoint --------------------------------------------------------
+
+    pub(crate) fn note_applied(&mut self, bytes: usize) {
+        self.applied_bytes += bytes;
+    }
+
+    pub(crate) fn checkpoint_is_due(&self) -> bool {
+        self.applied_bytes >= self.checkpoint_bytes
+    }
+
+    /// Make every copy and its cursor durable.
+    ///
+    /// The committer's sequence minus the steps that only exist for a SAL: bump
+    /// the generation (which is itself durable and publishes to `worker_ctx`),
+    /// run the engine's ephemeral flush round over the mirrored copies, then
+    /// write the cursor file **last**.
+    ///
+    /// The ephemeral round publishes unconditionally, which is what makes the
+    /// resume gate decidable for a mirror that polled nothing since the last
+    /// checkpoint: a gated publish would leave "resumed at `gen`" and "never
+    /// checkpointed" indistinguishable.
+    ///
+    /// **A failed checkpoint is reported, not poisoned** — the one `Err` here
+    /// that is not fatal to the handle. The flush writes shards and publishes
+    /// manifests; neither mutates what a store holds, so every copy is intact in
+    /// the RAM tier and retrying is sound. What it leaves durably is a
+    /// generation ahead of the manifests beside a cursor file still at the last
+    /// good generation, which a reopen reads as bootstrap. Under a sustained
+    /// fault the RAM tier grows and the host is told at exactly the rate it
+    /// asks: every checkpoint returns the same error.
+    pub fn checkpoint(&mut self) -> Result<(), MirrorError> {
+        self.check_poison()?;
+        self.guarded("checkpointing", |m| m.checkpoint_inner())
+    }
+
+    fn checkpoint_inner(&mut self) -> Result<(), MirrorError> {
+        let gen = self.engine.bump_checkpoint_generation()?;
+        self.engine.flush_ephemeral_round().map_err(MirrorError::Engine)?;
+        let cursors: Vec<(u64, DeltaCursor)> = self
+            .views
+            .iter()
+            .filter_map(|(&view_id, v)| v.cursor.map(|c| (view_id, c)))
+            .collect();
+        write_cursors(&self.base_dir, gen, &cursors)?;
+        self.applied_bytes = 0;
+        Ok(())
+    }
+}
+
+impl Drop for Mirror {
+    /// Check point on the way out — unless the handle is poisoned.
+    ///
+    /// A host that just drops the handle would otherwise lose every round since
+    /// the last checkpoint. It has to be the whole sequence and not
+    /// `CatalogEngine::close` alone: `close` flushes each store on the **Base**
+    /// round, where a `Rederive` store folds to RAM and publishes nothing, so
+    /// `close` by itself would discard exactly what this is meant to save.
+    ///
+    /// A poisoned handle skips both: poisoning means a store may be torn, and
+    /// checkpointing a torn store would publish the tear. That leaves the last
+    /// checkpoint standing, which the next open resumes from.
+    fn drop(&mut self) {
+        if self.poison.is_some() {
+            return;
+        }
+        // Swallowed, and the panic case with it: a `Drop` that panics while the
+        // thread is already unwinding ends the process, which is the one outcome
+        // this whole design exists to keep off a host.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.checkpoint_inner();
+            self.engine.close();
+        }));
+    }
+}

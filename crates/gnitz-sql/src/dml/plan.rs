@@ -11,7 +11,7 @@ use crate::ast_util::expr_usize_literal;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
-use gnitz_core::{ClientError, GnitzClient, IndexMeta, PkTuple, Schema, ZSetBatch};
+use gnitz_core::{ClientError, IndexMeta, PkTuple, ReadTarget, Schema, ZSetBatch};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 use sqlparser::ast::LimitClause;
 use std::sync::Arc;
@@ -133,13 +133,13 @@ impl<'e> AccessPlan<'e> {
 ///
 /// The caller owns the bound WHERE, because the plan borrows its conjuncts.
 pub(crate) fn plan_where<'e>(
-    client: &mut GnitzClient,
+    reads: &mut dyn ReadTarget,
     tid: u64,
     schema: &Schema,
     where_expr: Option<&'e BoundExpr>,
     budget: ReadBudget,
 ) -> Result<AccessPlan<'e>, GnitzSqlError> {
-    bound_and_predicate(schema, where_expr, budget, || client.table_indexes(tid))
+    bound_and_predicate(schema, where_expr, budget, || reads.table_indexes(tid))
 }
 
 /// Bind a single-table `WHERE` (or its absence) for [`plan_where`].
@@ -283,16 +283,16 @@ fn index_plan<'e>(
 /// a count taken off the reply reports rows actually touched. An empty result is
 /// an empty batch, not an absent one — no caller distinguishes the two.
 pub(crate) fn fetch_bound(
-    client: &mut GnitzClient,
+    reads: &mut dyn ReadTarget,
     table_id: u64,
     plan: &AccessPlan<'_>,
     sink: &ReadSink,
     reply_schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let mut out: Option<ZSetBatch> = None;
-    let mut send = |client: &mut GnitzClient, bound: &ReadBound| -> Result<(), GnitzSqlError> {
+    let mut send = |reads: &mut dyn ReadTarget, bound: &ReadBound| -> Result<(), GnitzSqlError> {
         let blob = ReadSpec::encode_parts(bound, &plan.predicate, sink);
-        if let Some(batch) = client.scan_spec(table_id, &blob, reply_schema)? {
+        if let Some(batch) = reads.scan_spec(table_id, &blob, reply_schema)? {
             match out.as_mut() {
                 Some(acc) => acc.extend_from_owned(batch),
                 None => out = Some(batch),
@@ -303,10 +303,10 @@ pub(crate) fn fetch_bound(
     match &plan.bound {
         ReadBound::PkSet(keys) if keys.len() > gnitz_wire::MAX_PK_SET_KEYS => {
             for chunk in keys.chunks(gnitz_wire::MAX_PK_SET_KEYS) {
-                send(client, &ReadBound::PkSet(chunk.to_vec()))?;
+                send(reads, &ReadBound::PkSet(chunk.to_vec()))?;
             }
         }
-        bound => send(client, bound)?,
+        bound => send(reads, bound)?,
     }
     Ok(out.unwrap_or_else(|| ZSetBatch::new(reply_schema)))
 }

@@ -1044,6 +1044,25 @@ const _: () = {
     );
 };
 
+/// Rebuild a [`SchemaDescriptor`] from a meta-schema block.
+///
+/// Every wire rule — region shape, `col_idx` ordering, type-code validity, PK
+/// eligibility and arity — is enforced by the shared codec, so this is only the
+/// projection onto the engine's own type. Column names are carried in the block
+/// but nothing engine-side reads one.
+///
+/// `MAX_PK_COLUMNS` is the engine's PK-arity limit (its internal
+/// secondary-index schema has the extra slot), deliberately wider than the
+/// client's `PK_LIST_MAX_COLS`.
+pub fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
+    let sb = gnitz_wire::schema_block::SchemaBlock::decode(data, verify_checksum, gnitz_wire::MAX_PK_COLUMNS)?;
+    let mut cols = [SchemaColumn::EMPTY; gnitz_wire::MAX_COLUMNS];
+    for (col, c) in cols[..sb.num_columns()].iter_mut().zip(sb.columns()) {
+        *col = SchemaColumn::new(c.type_code, gnitz_wire::col_meta_nullable(c.flags) as u8);
+    }
+    Ok(SchemaDescriptor::new(&cols[..sb.num_columns()], sb.pk_indices()))
+}
+
 pub fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
     b.push_pk(SchemaColumn::new(type_code::U64, 0))?;

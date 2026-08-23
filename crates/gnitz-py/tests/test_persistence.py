@@ -35,10 +35,11 @@ def test_table_data_survives_restart(own_server):
 
     conn.close()
 
-    # Remove socket so new server can bind
-
     # --- Phase 2: restart and verify ---
-    own_server.start()
+    # `restart`, not a second `start`: the first server is still running, and two
+    # live processes on one data directory both reseed `current_lsn` from
+    # `max_lsn + 1` and mint the same shard names.
+    own_server.restart()
     conn = gnitz.connect(sock_path)
 
     tid2, _ = conn.resolve_table("test_persist", "t")
@@ -119,9 +120,9 @@ def test_view_survives_restart(own_server):
 
     conn.close()
 
-
     # --- Phase 2: restart, push new data, verify view processes it ---
-    own_server.start()
+    # `restart`, not a second `start` — see `test_table_data_survives_restart`.
+    own_server.restart()
     conn = gnitz.connect(sock_path)
 
     tid2, _ = conn.resolve_table("test_persist", "t")

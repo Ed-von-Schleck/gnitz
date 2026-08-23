@@ -372,7 +372,14 @@ async fn run_checkpoint_sequence(
 ) {
     // Step 0: gen bump. From this instant every existing rederived manifest is
     // stale; a crash below rebuilds views instead of silently staleifying them.
-    let gen = shared.disp.bump_checkpoint_generation();
+    let gen = match shared.disp.bump_checkpoint_generation() {
+        Ok(g) => g,
+        // The generation bump is what makes every existing rederived manifest
+        // stale before the rounds below overwrite the base. Failing it leaves
+        // the SAL un-reset, so restart replays it — but continuing the sequence
+        // would publish a base cut that no view manifest is invalidated against.
+        Err(e) => gnitz_fatal_abort!("checkpoint generation bump failed: {}", e),
+    };
 
     // Step 1: base round. A failure is unrecoverable in-process (workers
     // already bumped their read epoch on FLAG_FLUSH but the master did not

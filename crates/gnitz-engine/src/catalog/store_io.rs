@@ -7,6 +7,28 @@ use super::*;
 use crate::schema::project_schema;
 use crate::storage::{BoundedIndexCursor, PkSetGather};
 
+/// Why an ingest did not happen. The two variants differ in what a caller may
+/// do next: `Rejected` means nothing was applied and the request is at fault, so
+/// answering the caller with the message is the whole response; `Storage` means
+/// committed data did not reach the store, which leaves this process's state
+/// diverged from whatever durable log carried the batch.
+#[derive(Debug)]
+pub enum IngestError {
+    /// The target or the batch was refused before anything was applied.
+    Rejected(String),
+    /// The store failed to absorb the batch.
+    Storage(StorageError),
+}
+
+impl std::fmt::Display for IngestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IngestError::Rejected(m) => write!(f, "{m}"),
+            IngestError::Storage(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// What part of a capacity-bounded view's store one read wants. `Keys` carries
 /// the flat concatenation of the OPK images, ascending.
 pub(crate) enum BoundedRead<'a> {
@@ -29,9 +51,11 @@ impl CatalogEngine {
     /// enforcement).  Used by multi-worker push where the worker needs the effective
     /// batch for later DAG evaluation but does NOT evaluate immediately.
     /// System tables are NOT supported (use `ingest_to_family` for those).
-    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> Result<Batch, String> {
+    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> Result<Batch, IngestError> {
         if table_id < FIRST_USER_TABLE_ID {
-            return Err("ingest_returning_effective not supported for system tables".to_string());
+            return Err(IngestError::Rejected(
+                "ingest_returning_effective not supported for system tables".to_string(),
+            ));
         }
         // Width guard, ahead of `enforce_unique_pk`. A worker parked mid-epoch
         // stashes an incoming `DdlSync` and replays it at the next top-level
@@ -43,16 +67,17 @@ impl CatalogEngine {
         // extra column and ACK the push as success.
         if let Some(schema) = self.get_schema_desc(table_id) {
             if batch.num_payload_cols() != schema.num_payload_cols() {
-                return Err(format!(
+                return Err(IngestError::Rejected(format!(
                     "push for table_id={table_id} carries {} payload columns, table schema has {}",
                     batch.num_payload_cols(),
                     schema.num_payload_cols()
-                ));
+                )));
             }
         }
         self.dag
             .ingest_returning_effective(table_id, batch)
-            .ok_or_else(|| format!("ingest failed for table_id={table_id}: not registered"))
+            .map_err(IngestError::Storage)?
+            .ok_or_else(|| IngestError::Rejected(format!("ingest failed for table_id={table_id}: not registered")))
     }
 
     /// Scan all positive-weight rows from a relation. One registry lookup serves
@@ -398,22 +423,23 @@ impl CatalogEngine {
     /// circuit's `Filter` is authoritative either way, so the choice only decides
     /// how many rows are read. The open may COMPILE the view.
     ///
-    /// `None` iff the source table is unregistered, which callers treat as "skip
-    /// this source". A registered-but-empty table yields `Some`, and a provably
-    /// empty range yields `Some(SourceCursor::Empty)` — collapsing that into
-    /// `None` would skip the source rather than feed it one empty epoch.
-    pub fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Option<SourceCursor> {
+    /// `Ok(None)` iff the source table is unregistered, which callers treat as
+    /// "skip this source". A registered-but-empty table yields `Some`, and a
+    /// provably empty range yields `Some(SourceCursor::Empty)` — collapsing that
+    /// into `None` would skip the source rather than feed it one empty epoch.
+    /// `Err` is a view that does not compile.
+    pub fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Result<Option<SourceCursor>, String> {
         // Must precede `source_scan_bound`: `handle_backfill` reaches here before
         // anything compiles the view, and an uncached plan would silently report
         // "no bound" — the motivating GROUP BY case would full-scan invisibly.
         // Cache-first and idempotent.
         let bound = self
             .dag
-            .ensure_compiled(view_id)
+            .ensure_compiled(view_id)?
             .then(|| self.dag.source_scan_bound(view_id, source))
             .flatten();
         let Some(bound) = bound else {
-            return self.full_source(source);
+            return Ok(self.full_source(source));
         };
         // A bounded cursor is only sound in a process that owns its base store: an
         // index circuit is a local shadow of the local base slice, and where no
@@ -426,7 +452,7 @@ impl CatalogEngine {
             "bounded source cursor in a process owning no base store (view {view_id}, source {source})",
         );
 
-        self.open_bounded_source(source, bound.idx_cols.as_slice(), &bound.desc)
+        Ok(self.open_bounded_source(source, bound.idx_cols.as_slice(), &bound.desc))
     }
 
     /// The index-bounded source cursor for the range `desc` on `idx_cols` of

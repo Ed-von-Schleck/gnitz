@@ -11,12 +11,12 @@ use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_ST
 use crate::runtime::sal::{SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_SCAN_LAST, STATUS_OK};
-use gnitz_engine::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
+use gnitz_engine::catalog::{CatalogEngine, IngestError, FIRST_USER_TABLE_ID};
 use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::query::{DagEngine, ExchangeCallback};
 use gnitz_engine::schema::key::PkBuf;
 use gnitz_engine::schema::SchemaDescriptor;
-use gnitz_engine::storage::{flush_barrier, BlobCacheGuard, FlushRound, Table};
+use gnitz_engine::storage::{flush_barrier, BlobCacheGuard, FlushRound};
 use gnitz_engine::storage::{schema_wire_safe, Batch};
 
 // ---------------------------------------------------------------------------
@@ -764,7 +764,7 @@ impl WorkerProcess {
             // already latched into `worker_ctx` at the classify site.
             SalMessageKind::FlushEph => {
                 self.sal_reader.checkpoint_reset();
-                self.handle_flush_all_ephemeral()?;
+                self.cat().flush_ephemeral_round()?;
                 self.send_ack(0, request_id);
                 Ok(())
             }
@@ -951,7 +951,21 @@ impl WorkerProcess {
             // means a protocol invariant was violated.
             return Err(format!("FLAG_PUSH for system table_id={target_id}; expected DDL_SYNC"));
         }
-        let effective = self.cat().ingest_returning_effective(target_id, batch)?;
+        // A storage fault here means committed data was not applied while the
+        // client already holds a durability ACK, so this worker has diverged from
+        // the durable SAL. Restart + SAL replay re-applies the batch — its zone
+        // stays above the flushed-shard watermark — where a fault reply would
+        // neither apply nor replay it and the next checkpoint would orphan it.
+        let effective = match self.cat().ingest_returning_effective(target_id, batch) {
+            Ok(b) => b,
+            Err(IngestError::Rejected(msg)) => return Err(msg),
+            Err(IngestError::Storage(e)) => gnitz_fatal_abort!(
+                "worker: push apply failed (table_id={}): {} — committed data not \
+                 applied, state diverged from durable SAL; aborting for restart+replay",
+                target_id,
+                e,
+            ),
+        };
         buffer_pending_delta(&mut self.pending_deltas, target_id, effective);
         gnitz_debug!("push tid={} rows={}", target_id, row_count);
         Ok(())
@@ -1069,7 +1083,7 @@ impl WorkerProcess {
         // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see
         // the source has diverged from the catalog.
         let schema = self.cat().schema_or_err(source_tid, "backfill")?;
-        let mut handle = self.cat().open_source_cursor(view_id, source_tid);
+        let mut handle = self.cat().open_source_cursor(view_id, source_tid)?;
         let mut produced_any = false;
 
         loop {
@@ -1102,9 +1116,17 @@ impl WorkerProcess {
         // produced rows (the first source of a join produces none — it just
         // fills its trace).
         if produced_any {
-            // On abort the master's watchdog turns the dead worker into a
+            // A spill fault leaves the view store unbounded, so the process
+            // cannot continue. The master's watchdog turns the dead worker into a
             // cluster abort, and restart re-derives the view.
-            self.cat().dag_mut().flush_view_or_abort(view_id);
+            if let Err(e) = self.cat().dag_mut().flush(view_id) {
+                gnitz_fatal_abort!(
+                    "worker: view store flush failed (view_id={}): {} — view state \
+                     cannot be bounded; aborting for restart+re-derive",
+                    view_id,
+                    e,
+                );
+            }
         }
         Ok(())
     }
@@ -1124,7 +1146,16 @@ impl WorkerProcess {
         // Apply DDL_SYNC messages deferred during exchange waits (mirrors
         // `evaluate_dag`).
         self.dispatch_deferred();
-        produced
+        match produced {
+            Ok(p) => p,
+            Err(e) => gnitz_fatal_abort!(
+                "worker: backfill ingest failed (view_id={}, source_id={}): {} — \
+                 aborting for restart+re-derive",
+                view_id,
+                source_id,
+                e,
+            ),
+        }
     }
 
     /// Act on the backfill decision a master stamped onto a relay's
@@ -1339,23 +1370,6 @@ impl WorkerProcess {
         flush_barrier(tables, FlushRound::Base).map_err(|e| format!("base flush: {e}"))
     }
 
-    /// Ephemeral checkpoint round: force-persist every view's operator-trace
-    /// tables and output stores, stamped with the generation latched at the
-    /// classify site. Two global passes — traces first, then outputs — satisfy
-    /// the flush-ordering invariant (any output@G ⟹ that view's own traces
-    /// durable@G) and batch better than per-view interleaving.
-    fn handle_flush_all_ephemeral(&mut self) -> Result<(), String> {
-        let (traces, outputs) = self.cat().dag_mut().collect_ephemeral_flush_tables();
-        // Stamp every manifest with the generation latched at the classify site
-        // (`set_resume_generation` off the FlushEph message).
-        let generation = self.cat().resume_generation();
-        let pass = |tables: Vec<*mut Table>, what: &str| {
-            flush_barrier(tables, FlushRound::Ephemeral(generation)).map_err(|e| format!("ephemeral {what} flush: {e}"))
-        };
-        pass(traces, "trace")?; // Pass 1: all traces fully durable FIRST
-        pass(outputs, "output") // Pass 2: all output stores
-    }
-
     /// Run multi-worker DAG evaluation with the exchange context.
     /// `request_id` is the master's request id of the message that
     /// triggered this evaluation (FLAG_TICK / FLAG_PUSH / FLAG_BACKFILL);
@@ -1368,9 +1382,21 @@ impl WorkerProcess {
             worker: self,
             tick_request_id: request_id,
         };
-        unsafe { &mut *dag }.evaluate_dag_multi_worker(source_id, delta, tick_round, &mut ctx);
+        let res = unsafe { &mut *dag }.evaluate_dag_multi_worker(source_id, delta, tick_round, &mut ctx);
         // Apply DDL_SYNC messages deferred during exchange waits.
         self.dispatch_deferred();
+        // The whole tick path funnels through the call above, so this is the one
+        // site that answers a storage fault during view maintenance. Restart
+        // re-derives every view from its durable base tables.
+        if let Err(e) = res {
+            gnitz_fatal_abort!(
+                "worker: view-maintenance tick failed (source_id={}, round={}): {} — \
+                 aborting for restart+re-derive",
+                source_id,
+                tick_round,
+                e,
+            );
+        }
     }
 
     /// Whether the master process has exited (killed, or `gnitz_fatal_abort`).

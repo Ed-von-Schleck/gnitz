@@ -5,12 +5,12 @@ use crate::error::ClientError;
 use crate::protocol::codec::encode_schema_block;
 use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
 use crate::protocol::{
-    encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, recv_message, send_control,
-    wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version, ClientTransport,
-    Message, PkTuple, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
-    FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_PUSH,
-    FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NO_INDEX,
-    STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, parse_response_frame, recv_message,
+    send_control, wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version,
+    ClientTransport, Message, ParsedFrame, PkTuple, ProtocolError, Schema, WireConflictMode, ZSetBatch,
+    FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
+    FLAG_CONTINUATION, FLAG_PUSH, FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED,
+    STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use gnitz_wire::RelDescriptorBlob;
 use lru::LruCache;
@@ -36,6 +36,21 @@ pub type ScanResult = Result<ScanReply, ClientError>;
 /// rows, plus the whole `u128` word. Private, because the narrowing to a public
 /// [`ScanReply`] is exactly what each caller owes.
 type ReplyTrain = (Option<Arc<Schema>>, Option<ZSetBatch>, u128);
+type RawReplyTrain = (Vec<RawBlock>, u128);
+
+/// One reply frame's data block, kept undecoded: the owned frame buffer and the
+/// block's extent within it. `block()` is the block itself.
+pub struct RawBlock {
+    frame: Vec<u8>,
+    block: std::ops::Range<usize>,
+}
+
+impl RawBlock {
+    /// The data block's bytes, ready to decode against the reply schema.
+    pub fn block(&self) -> &[u8] {
+        &self.frame[self.block.clone()]
+    }
+}
 
 /// The N per-relation results of a `scan_multi`, in request order. Every
 /// relation was snapshotted at the same server-side SAL cut, so an atomic
@@ -467,6 +482,71 @@ impl Session {
         Ok((schema, data, watermark))
     }
 
+    /// Ship a `SCAN_SPEC` request: the encoded `ReadSpec` bundled with the reply
+    /// schema the caller built for the result, which the master forwards
+    /// verbatim. The two drains differ only in what they keep of the reply.
+    fn send_scan_spec(&mut self, target_id: u64, spec: &[u8], reply_schema: &Schema) -> Result<(), ClientError> {
+        let block = encode_schema_block(reply_schema, target_id as u32);
+        let extra = gnitz_wire::pack_scan_spec_extra(spec, &block);
+        send_control(
+            &mut self.transport,
+            target_id,
+            self.client_id,
+            FLAG_SCAN_SPEC,
+            0,
+            0,
+            &extra,
+        )?;
+        Ok(())
+    }
+
+    /// [`Self::drain_reply_train`] keeping each frame's *undecoded* data block
+    /// instead of concatenating decoded batches — same loop, same per-frame
+    /// status check, same terminal watermark.
+    ///
+    /// The blocks come back as owned frame buffers paired with the block's
+    /// extent, so a consumer that wants the bytes (a mirror feeding an engine
+    /// store) gets them with no copy and no OPK round trip. A round may straddle
+    /// two frames; that is invisible to a consumer that applies them in order,
+    /// because nothing runs between them.
+    fn drain_reply_train_raw(
+        &mut self,
+        mut recv_one: impl FnMut(&mut Self) -> Result<(Vec<u8>, ParsedFrame), ClientError>,
+    ) -> Result<RawReplyTrain, ClientError> {
+        let mut blocks: Vec<RawBlock> = Vec::new();
+        let watermark: u128 = loop {
+            let (buf, parsed) = recv_one(self)?;
+            let msg = check_response(parsed.message)?;
+            let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
+            if let Some(range) = parsed.data_block {
+                blocks.push(RawBlock {
+                    frame: buf,
+                    block: range,
+                });
+            }
+            if !is_continuation {
+                break msg.seek_pk;
+            }
+        };
+        Ok((blocks, watermark))
+    }
+
+    /// [`Self::scan_spec`] keeping the reply's raw data blocks instead of a
+    /// decoded batch; the caller decodes them itself.
+    pub fn scan_spec_raw(
+        &mut self,
+        target_id: u64,
+        spec: &[u8],
+        reply_schema: &Schema,
+    ) -> Result<(Vec<RawBlock>, u128), ClientError> {
+        self.send_scan_spec(target_id, spec, reply_schema)?;
+        self.drain_reply_train_raw(|s| {
+            let buf = s.transport.recv_framed(s.max_payload_len)?;
+            let parsed = parse_response_frame(&buf, Some((reply_schema, 0)))?;
+            Ok((buf, parsed))
+        })
+    }
+
     /// Receive a streaming scan/seek response: reassemble continuation frames,
     /// absorb any schema block into the cache, and recover the schema from the
     /// cache if the response was schema-less. Same body as the sync `scan`.
@@ -492,17 +572,7 @@ impl Session {
         spec: &[u8],
         reply_schema: &Schema,
     ) -> Result<(Option<ZSetBatch>, u128), ClientError> {
-        let block = encode_schema_block(reply_schema, target_id as u32);
-        let extra = gnitz_wire::pack_scan_spec_extra(spec, &block);
-        send_control(
-            &mut self.transport,
-            target_id,
-            self.client_id,
-            FLAG_SCAN_SPEC,
-            0,
-            0,
-            &extra,
-        )?;
+        self.send_scan_spec(target_id, spec, reply_schema)?;
         let (_, data, watermark) = self.drain_reply_train(|s| {
             Ok(recv_message(
                 &mut s.transport,

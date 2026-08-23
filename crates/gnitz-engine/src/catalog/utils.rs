@@ -104,6 +104,63 @@ pub(crate) fn ensure_dir(path: &str) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|e| format!("Failed to create directory '{path}': {e}"))
 }
 
+/// `<base_dir>/LOCK` — the file whose `flock` makes a data directory
+/// single-writer.
+fn lock_file_path(base_dir: &str) -> String {
+    format!("{base_dir}/{DIR_LOCK_FILENAME}")
+}
+
+/// How long [`lock_data_dir`] keeps retrying before it reports the directory as
+/// held, and how long it sleeps between attempts.
+///
+/// It is a bounded retry rather than one `LOCK_NB` attempt because of how a
+/// server restarts: a worker is a forked child carrying `PR_SET_PDEATHSIG`, so
+/// it dies *after* the master, while the master's exit is what a supervisor
+/// observes. Between those two instants a worker still holds the inherited
+/// lock, and a bare `LOCK_NB` would turn every fast restart into an intermittent
+/// "another process holds this data directory". A directory whose owner is
+/// genuinely live still fails, because it stays held for the whole window.
+const DIR_LOCK_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+const DIR_LOCK_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Take the exclusive `flock` on `base_dir`'s lock file, so exactly one live
+/// handle writes it.
+///
+/// Two writers on one directory silently corrupt shard state: `current_lsn` is
+/// per-`Table` and reseeded from `max_lsn + 1` at open, so both would mint
+/// identical shard names. Nothing else enforces this — a forked worker inherits
+/// the open file description and with it the same lock, which `flock` treats as
+/// one holder rather than a conflict, so the server's own children never
+/// contend.
+///
+/// The returned file must outlive every store under `base_dir`: closing it
+/// releases the lock.
+pub(crate) fn lock_data_dir(base_dir: &str) -> Result<fs::File, String> {
+    let path = lock_file_path(base_dir);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("Failed to open data-directory lock '{path}': {e}"))?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+    let deadline = std::time::Instant::now() + DIR_LOCK_RETRY_FOR;
+    loop {
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(format!("Failed to lock data directory '{base_dir}': {err}"));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("data directory '{base_dir}' is locked by another live process"));
+        }
+        std::thread::sleep(DIR_LOCK_RETRY_EVERY);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Copy/retract helpers
 // ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ mod validate;
 pub use error::GnitzSqlError;
 
 use gnitz_core::GnitzClient;
-use gnitz_core::{Schema, ZSetBatch};
+use gnitz_core::{ReadTarget, Schema, ZSetBatch};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -115,4 +115,41 @@ impl<'a> SqlPlanner<'a> {
         }
         Ok(results)
     }
+}
+
+/// Execute one `SELECT` against any [`ReadTarget`].
+///
+/// The entry a host uses to read through something that is not a
+/// [`GnitzClient`] — a local copy of a relation, say. Passing `&mut client`
+/// serves the ordinary remote case identically, so this is one SELECT entry
+/// rather than a second path.
+///
+/// It exists because [`dispatch::execute_statement`] cannot: the rest of that
+/// function dispatches DDL and DML, which only a concrete client can serve. What
+/// it does not share with [`SqlPlanner::execute`] is the parse and the statement
+/// bracket; planning is the same builders in the same order.
+///
+/// `sql` must be exactly one statement and that statement must be a query. It
+/// does not re-check the in-transaction rule: `Statement::Query` is on that
+/// rule's allow-list, and the trait carries no transaction buffer to overlay
+/// from.
+pub fn execute_query(reads: &mut dyn ReadTarget, schema_name: &str, sql: &str) -> Result<SqlResult, GnitzSqlError> {
+    let dialect = GenericDialect {};
+    let mut stmts = Parser::parse_sql(&dialect, sql)?;
+    if stmts.len() != 1 {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "execute_query takes exactly one statement, got {}",
+            stmts.len()
+        )));
+    }
+    let sqlparser::ast::Statement::Query(query) = stmts.remove(0) else {
+        return Err(GnitzSqlError::Unsupported(
+            "execute_query takes a SELECT; this statement is not one".to_string(),
+        ));
+    };
+    let mut binder = bind::Binder::new(schema_name);
+    reads.begin_statement();
+    let r = dml::execute_select(reads, &query, &mut binder);
+    reads.end_statement();
+    r
 }

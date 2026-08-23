@@ -12,18 +12,24 @@ use crate::storage::{Batch, ReadCursor};
 
 /// Storage failure while integrating a tick's delta into an owned table: the
 /// view/history state has diverged from its durable inputs and there is no
-/// sound continue (dropping the delta permanently desyncs the integral).
-/// Recovery is restart + SAL replay.
-fn fatal_on_tick_ingest_err(op: &str, table_idx: u16, r: Result<(), crate::storage::StorageError>) {
-    if let Err(e) = r {
-        gnitz_fatal_abort!(
+/// sound continue (dropping the delta permanently desyncs the integral). The
+/// error is returned so the process that owns the recovery decision makes it —
+/// for a server, restart + SAL replay. This only logs; every call site applies
+/// `?` to what it hands back.
+fn log_tick_ingest_err(
+    op: &str,
+    table_idx: u16,
+    r: Result<(), crate::storage::StorageError>,
+) -> Result<(), crate::storage::StorageError> {
+    r.inspect_err(|e| {
+        gnitz_error!(
             "vm: {} ingest failed (table_idx={}): {} — tick state diverged \
-             from durable inputs; aborting for restart+SAL replay",
+             from durable inputs",
             op,
             table_idx,
             e,
         );
-    }
+    })
 }
 
 /// Execute one epoch of a compiled program with a single input register —
@@ -41,7 +47,7 @@ pub(crate) fn execute_epoch(
     input_batch: Batch,
     input_reg: u16,
     output_reg: u16,
-) -> Option<Batch> {
+) -> Result<Option<Batch>, crate::storage::StorageError> {
     execute_epoch_multi(program, regfile, std::iter::once((input_reg, input_batch)), output_reg)
 }
 
@@ -58,7 +64,7 @@ pub(crate) fn execute_epoch_multi(
     regfile: &mut RegisterFile,
     inputs: impl IntoIterator<Item = (u16, Batch)>,
     output_reg: u16,
-) -> Option<Batch> {
+) -> Result<Option<Batch>, crate::storage::StorageError> {
     execute_epoch_from(program, regfile, inputs, output_reg, 0, false)
 }
 
@@ -75,7 +81,7 @@ pub(crate) fn execute_epoch_from(
     output_reg: u16,
     start_pc: usize,
     read_only: bool,
-) -> Option<Batch> {
+) -> Result<Option<Batch>, crate::storage::StorageError> {
     gnitz_debug!(
         "vm: execute_epoch output_reg={} instrs={}",
         output_reg,
@@ -238,7 +244,7 @@ pub(crate) fn execute_epoch_from(
                 let ptr = program.tables[*hist_table_idx as usize];
                 let table = unsafe { &mut *ptr };
                 let res = table.ingest_owned_batch(consolidated);
-                fatal_on_tick_ingest_err("weight-clamp history", *hist_table_idx, res);
+                log_tick_ingest_err("weight-clamp history", *hist_table_idx, res)?;
             }
 
             Instr::JoinDT {
@@ -322,7 +328,7 @@ pub(crate) fn execute_epoch_from(
                     matches!(op_target, OpsIntegrateTarget::Avi(..)),
                 );
                 let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, op_target);
-                fatal_on_tick_ingest_err("integrate", table_idx, res);
+                log_tick_ingest_err("integrate", table_idx, res)?;
             }
 
             Instr::Reduce {
@@ -379,7 +385,7 @@ pub(crate) fn execute_epoch_from(
     // `op_union`), so the label on it may be an operand's; downstream — the
     // exchange wire, `prepare_relay`, `queue_dependents` — cannot re-derive it.
     let out = &mut regfile.registers[output_reg as usize];
-    (out.batch.count > 0).then(|| {
+    Ok((out.batch.count > 0).then(|| {
         let mut batch = out.batch.take();
         let want = program.reg_meta[output_reg as usize].schema;
         // Only a narrower nullability may legitimately arrive here. A different
@@ -391,28 +397,5 @@ pub(crate) fn execute_epoch_from(
         );
         batch.set_schema(want);
         batch
-    })
-}
-
-#[cfg(test)]
-mod fail_stop_tests {
-    use super::fatal_on_tick_ingest_err;
-    use crate::storage::StorageError;
-
-    // A storage error while integrating a tick delta must _exit(134).
-    #[test]
-    fn test_fatal_on_tick_ingest_err_exit_status() {
-        crate::test_support::assert_test_aborts_134("fatal_on_tick_ingest_err_internal", &[]);
-    }
-
-    // Runs only in the re-exec'd abort child. A returning call would fail the
-    // `unreachable!`.
-    #[test]
-    fn fatal_on_tick_ingest_err_internal() {
-        if !crate::test_support::in_abort_child() {
-            return;
-        }
-        fatal_on_tick_ingest_err("integrate", 7, Err(StorageError::Io(libc::ENOSPC)));
-        unreachable!("fatal_on_tick_ingest_err must not return on Err");
-    }
+    }))
 }

@@ -4,8 +4,12 @@ use std::fmt;
 #[derive(Debug)]
 pub enum ClientError {
     Protocol(ProtocolError), // wire / IO / decode failure
-    ServerError(String),     // STATUS_ERROR returned by server
-    SchemaMismatch,          // STATUS_SCHEMA_MISMATCH: server rejected schema-less PUSH
+    /// Anything that fails with a message rather than a classified outcome: a
+    /// `STATUS_ERROR` the server returned, a client-side validation the request
+    /// never got past, or — for a [`crate::ReadTarget`] that is not a client — a
+    /// fault in whatever answered locally.
+    ServerError(String),
+    SchemaMismatch, // STATUS_SCHEMA_MISMATCH: server rejected schema-less PUSH
     /// STATUS_TXN_CONFLICT: a user-table TXN failed its OCC precondition — a table
     /// it read was written since its basis. `fresh_basis` is the server's current
     /// watermark, which the autocommit RMW retry adopts before re-reading. The

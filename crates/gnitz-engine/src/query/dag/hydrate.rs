@@ -42,9 +42,9 @@ impl DagEngine {
         };
         // The plan cache is lazy and is dropped on every rebuild, so a read
         // arriving before the view's first tick would otherwise find nothing.
-        // `ensure_compiled` fails only on that same registry lookup (a real
-        // compile failure aborts), so above it cannot fail here.
-        let compiled = self.ensure_compiled(view_id);
+        // `Ok(false)` is that same registry lookup, which the check above already
+        // passed, so only a real compile failure leaves here.
+        let compiled = self.ensure_compiled(view_id)?;
         debug_assert!(compiled, "ensure_compiled false for a registered view");
         let hydration = self.cache[&view_id]
             .hydration
@@ -105,7 +105,8 @@ impl DagEngine {
                 *out_reg,
                 start_pc,
                 true,
-            );
+            )
+            .map_err(|e| format!("hydrate: view {view_id} replay failed: {e}"))?;
             if let Some(b) = produced {
                 debug_assert!(
                     b.schema.is_none_or(|s| s.same_physical_layout(&view_schema)),

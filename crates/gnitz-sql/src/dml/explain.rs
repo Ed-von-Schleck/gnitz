@@ -16,24 +16,24 @@ use crate::dml::select::{build_fold_shape, build_rows_shape, route_select, Route
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::FoldShape;
 use crate::SqlResult;
-use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{BatchAppender, ColumnDef, ReadTarget, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::{AggFunc, ReadBound};
 use sqlparser::ast::Query;
 
 /// Describe the plan for `query` without running it.
 pub(crate) fn execute_explain(
-    client: &mut GnitzClient,
+    reads: &mut dyn ReadTarget,
     query: &Query,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let route = route_select(client, query, binder)?;
+    let route = route_select(reads, query, binder)?;
     let (target, select) = (&route.target, route.select);
     let schema = &*target.schema;
 
     // The same WHERE → plan the tails build. A route with no WHERE short-circuits
     // inside `bound_and_predicate` without an index probe, so this stays free.
     let bound_where = bind_where(schema, select.selection.as_ref())?;
-    let plan = plan_where(client, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
+    let plan = plan_where(reads, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
 
     // Line 4 is the sink's own shape: what the fold accumulates, or how wide the
     // projected reply is.

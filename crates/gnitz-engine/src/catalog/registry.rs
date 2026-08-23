@@ -141,11 +141,11 @@ impl CatalogEngine {
     // caller can take an id without the advance. A create that later fails
     // burns the id — harmless, since recovery maxes over positive rows and gaps
     // are fine.
-    pub fn allocate_schema_id(&mut self) -> i64 {
+    pub fn allocate_schema_id(&mut self) -> Result<i64, StorageError> {
         let sid = self.next_schema_id;
         self.next_schema_id += 1;
-        self.advance_sequence(SEQ_ID_SCHEMAS, sid);
-        sid
+        self.advance_sequence(SEQ_ID_SCHEMAS, sid)?;
+        Ok(sid)
     }
 
     /// Allocate the next durable relation id (tables and views share this
@@ -157,22 +157,22 @@ impl CatalogEngine {
     /// rejects a ceiling id at the point one enters `dag.tables`, which covers the
     /// caller-chosen ids the register hooks `raise_id_counter` from and which
     /// never pass through here.
-    pub fn allocate_table_id(&mut self) -> i64 {
+    pub fn allocate_table_id(&mut self) -> Result<i64, StorageError> {
         let tid = self.next_table_id;
         assert!(
             tid < sys_tables::RELATION_ID_CEILING,
             "durable relation ids exhausted: {tid} would reach the relation-id ceiling"
         );
         self.next_table_id += 1;
-        self.advance_sequence(SEQ_ID_TABLES, tid);
-        tid
+        self.advance_sequence(SEQ_ID_TABLES, tid)?;
+        Ok(tid)
     }
 
-    pub fn allocate_index_id(&mut self) -> i64 {
+    pub fn allocate_index_id(&mut self) -> Result<i64, StorageError> {
         let iid = self.next_index_id;
         self.next_index_id += 1;
-        self.advance_sequence(SEQ_ID_INDICES, iid);
-        iid
+        self.advance_sequence(SEQ_ID_INDICES, iid)?;
+        Ok(iid)
     }
 
     pub fn get_qualified_name(&self, table_id: i64) -> Option<(&str, &str)> {
@@ -206,20 +206,13 @@ impl CatalogEngine {
 
     // -- Sequence management -----------------------------------------------
 
-    pub(crate) fn advance_sequence(&mut self, seq_id: i64, new_val: i64) {
+    /// `Err` means the bump did not reach the sequence store, so a restart would
+    /// reissue whatever this call allocated. The caller must not go on to use it:
+    /// every allocator above propagates, and the id it burned is harmless because
+    /// recovery maxes over the live rows and gaps are fine.
+    pub(crate) fn advance_sequence(&mut self, seq_id: i64, new_val: i64) -> Result<(), StorageError> {
         let batch = self.build_seq_delta(seq_id, new_val);
-        // The caller has already handed the allocated id to memory; un-allocating
-        // is impossible, and replying an error while keeping the bump would
-        // re-issue the id after restart. Fail-stop — same as the serial-range
-        // sequence ingest in `executor.rs`.
-        if let Err(e) = self.sys_store_mut(SysFamily::Sequence).ingest_borrowed_batch(&batch) {
-            gnitz_fatal_abort!(
-                "sys_sequences ingest (object id advance, seq_id={}) failed: {} \
-                 — allocated id would be reissued after restart; aborting",
-                seq_id,
-                e,
-            );
-        }
+        self.sys_store_mut(SysFamily::Sequence).ingest_borrowed_batch(&batch)
     }
 
     /// Reserve `count` ids for a user-table SERIAL sequence. Returns
@@ -274,19 +267,18 @@ impl CatalogEngine {
     /// an atomic block between the committer's checkpoint steps with no
     /// interleaving. From this instant every existing Rederive manifest is stale;
     /// a crash below rebuilds views instead of silently staleifying them.
-    pub fn bump_checkpoint_generation(&mut self) -> u64 {
+    pub fn bump_checkpoint_generation(&mut self) -> Result<u64, String> {
         let new = self.durable_generation + 1;
-        // `advance_sequence` fatal-aborts on ingest failure.
-        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, new as i64);
+        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, new as i64)
+            .map_err(|e| format!("sys_sequences ingest (checkpoint generation) failed: {e}"))?;
         self.durable_generation = new;
         self.set_resume_generation(new);
         // The row must be shard-durable before the SAL reset that follows
-        // discards the memtable copy. A flush failure here is fatal: resetting
-        // the SAL on a swallowed failure destroys the only durable copy.
-        if let Err(e) = self.flush_all_system_tables() {
-            gnitz_fatal_abort!("checkpoint generation flush failed: {} — aborting before SAL reset", e);
-        }
-        new
+        // discards the memtable copy: resetting the SAL on a swallowed failure
+        // destroys the only durable copy, so the caller must not proceed to it.
+        self.flush_all_system_tables()
+            .map_err(|e| format!("checkpoint generation flush failed: {e}"))?;
+        Ok(new)
     }
 
     /// Durably advance the checkpoint generation by one **at recovery start**,
@@ -303,7 +295,8 @@ impl CatalogEngine {
     /// next bump retracts `G+1` rather than `G`.
     pub fn recovery_start_generation_bump(&mut self) -> Result<(), String> {
         let g = self.durable_generation;
-        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, (g + 1) as i64);
+        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, (g + 1) as i64)
+            .map_err(|e| format!("sys_sequences ingest (recovery generation bump) failed: {e}"))?;
         self.durable_generation = g + 1;
         // Durable before the SAL reset that follows discards the memtable copy.
         self.flush_all_system_tables()
@@ -320,7 +313,7 @@ impl CatalogEngine {
     /// persisted derived state was written under. Half of every resume verdict:
     /// a change on either axis invalidates every rederived relation regardless
     /// of what generation its manifest carries.
-    pub(crate) fn topology_matches(&self) -> bool {
+    pub fn topology_matches(&self) -> bool {
         self.recorded_topology == crate::storage::topology_word(self.num_workers)
     }
 
@@ -347,15 +340,16 @@ impl CatalogEngine {
     /// Record the cluster topology (`worker_count << 32 | STATE_FORMAT`) in
     /// `_sequences` (seq id 5). Idempotent: a same-topology restart already
     /// holds the current value, so the write is skipped. Does not flush — the
-    /// sole caller (`boot_checkpoint`) bumps the checkpoint generation right
+    /// server's caller (`boot_checkpoint`) bumps the checkpoint generation right
     /// after, and that flush carries this row to the same shard.
-    pub fn record_topology(&mut self, worker_count: u32) {
+    pub fn record_topology(&mut self, worker_count: u32) -> Result<(), StorageError> {
         let value = crate::storage::topology_word(worker_count);
         if self.recorded_topology == value {
-            return;
+            return Ok(());
         }
-        self.advance_sequence(SEQ_ID_TOPOLOGY, value as i64);
+        self.advance_sequence(SEQ_ID_TOPOLOGY, value as i64)?;
         self.recorded_topology = value;
+        Ok(())
     }
 }
 

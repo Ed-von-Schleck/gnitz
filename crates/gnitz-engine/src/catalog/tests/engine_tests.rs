@@ -197,10 +197,14 @@ fn test_recover_checkpoint_gen_and_topology() {
         assert_eq!(engine.recorded_topology, 0, "fresh DB has no topology row");
         // Boot order: the topology row is written first and its durability
         // rides the following gen bump's system-table flush.
-        engine.record_topology(4);
+        engine.record_topology(4).unwrap();
         assert_eq!(engine.recorded_topology, expected_topology);
-        assert_eq!(engine.bump_checkpoint_generation(), 1);
-        assert_eq!(engine.bump_checkpoint_generation(), 2, "generation is monotonic");
+        assert_eq!(engine.bump_checkpoint_generation().unwrap(), 1);
+        assert_eq!(
+            engine.bump_checkpoint_generation().unwrap(),
+            2,
+            "generation is monotonic"
+        );
         engine.close();
     }
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -226,9 +230,9 @@ fn test_recovery_start_generation_bump_monotonic() {
     {
         // Simulate two prior checkpoints so the recovered G is 2, not 0.
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-        engine.record_topology(4);
-        assert_eq!(engine.bump_checkpoint_generation(), 1);
-        assert_eq!(engine.bump_checkpoint_generation(), 2);
+        engine.record_topology(4).unwrap();
+        assert_eq!(engine.bump_checkpoint_generation().unwrap(), 1);
+        assert_eq!(engine.bump_checkpoint_generation().unwrap(), 2);
         engine.close();
     }
     {
@@ -242,7 +246,11 @@ fn test_recovery_start_generation_bump_monotonic() {
         );
         // The boot checkpoint's single bump (inside `reclaim_base`, which owns it
         // for every base round) then retracts G+1 and inserts G+2.
-        assert_eq!(engine.bump_checkpoint_generation(), 4, "boot_checkpoint goes G+1 → G+2");
+        assert_eq!(
+            engine.bump_checkpoint_generation().unwrap(),
+            4,
+            "boot_checkpoint goes G+1 → G+2"
+        );
         engine.close();
     }
     // The final durable generation survives a reopen monotonically.
@@ -691,7 +699,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     assert_eq!(engine.dag.get_dep_map().get(&tid), Some(&vec![v1]));
 
     // ALTER VIEW: one VIEW_TAB batch retiring v1 and registering v2.
-    let v2 = engine.allocate_table_id();
+    let v2 = engine.allocate_table_id().unwrap();
     write_identity_circuit(&mut engine, v2, tid, None);
     engine.write_column_records(v2, OWNER_KIND_VIEW, &cols).unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());

@@ -259,21 +259,32 @@ impl ServerHandle {
         )
     }
 
-    /// Kill the server and respawn it on the same data dir, same socket
-    /// path, and the SAME TLS port (read back from `tls_endpoint` before the
-    /// kill), so clients holding the old target can observe fail-fast errors
-    /// and then reconnect.
+    /// Kill the server and respawn it on the same data dir and socket path.
+    ///
+    /// A TLS server rebinds the SAME port (read back from `tls_endpoint` before
+    /// the kill), so clients holding the old target can observe fail-fast errors
+    /// and then reconnect; a plain server has no endpoint to preserve.
     pub fn restart(&mut self) {
-        let endpoint = self.tls_endpoint();
+        let endpoint = self.tls.then(|| self.tls_endpoint());
         self.process.kill().ok();
         self.process.wait().ok();
+        // Unlink the old socket path before respawning. `kill()` reaps the
+        // master, but its forked workers inherited the listening fd and die a
+        // moment later, so a connect by path can still be accepted into that
+        // dying listener's backlog — and `spawn_and_wait_ready`'s probe would
+        // take it as the new boot's readiness. Removing the path leaves the
+        // probe nothing to reach until the new server binds.
+        fs::remove_file(&self.paths.sock_path).ok();
         // Remove the stale endpoint file so tls_endpoint() polling observes
         // the NEW boot's publish (same content, but existence must imply the
         // new listener is bound).
         fs::remove_file(self.paths.data_dir.join("tls_endpoint")).ok();
-        let mut tls_args = vec![format!("--tls-listen={endpoint}")];
-        if let Some(ca) = &self.client_ca {
-            tls_args.push(format!("--tls-client-ca={}", ca.display()));
+        let mut tls_args: Vec<String> = Vec::new();
+        if let Some(endpoint) = &endpoint {
+            tls_args.push(format!("--tls-listen={endpoint}"));
+            if let Some(ca) = &self.client_ca {
+                tls_args.push(format!("--tls-client-ca={}", ca.display()));
+            }
         }
         self.process = spawn_and_wait_ready(&self.paths, self.workers, &[], &tls_args)
             // ServerHandle::Drop preserves the tmpdir during the unwind.
@@ -282,8 +293,13 @@ impl ServerHandle {
         // bind (and its endpoint publish) happens slightly later in boot —
         // block until the new listener is up so a caller's immediate
         // reconnect cannot race it.
-        let republished = self.tls_endpoint();
-        assert_eq!(republished, endpoint, "restart must rebind the same TLS endpoint");
+        if let Some(endpoint) = endpoint {
+            assert_eq!(
+                self.tls_endpoint(),
+                endpoint,
+                "restart must rebind the same TLS endpoint"
+            );
+        }
     }
 }
 

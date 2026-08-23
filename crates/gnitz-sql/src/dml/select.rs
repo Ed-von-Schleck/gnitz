@@ -38,7 +38,7 @@ use crate::validate::{
     HonoredClauses, HonoredQueryClauses,
 };
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, ReduceOutKey, RelClass, Schema, ZSetBatch, MAX_COLUMNS};
+use gnitz_core::{ReadTarget, ReduceOutKey, RelClass, Schema, ZSetBatch, MAX_COLUMNS};
 use gnitz_wire::{AggReadItem, AggReadSpec, ReadSink};
 use sqlparser::ast::{LimitClause, Query, Select, SetExpr};
 use std::sync::Arc;
@@ -99,8 +99,8 @@ pub(super) struct Route<'q> {
 }
 
 /// Resolve `name` to the read's target; the relation kind rides the resolution.
-fn resolve_target(client: &mut GnitzClient, binder: &mut Binder<'_>, name: String) -> Result<Target, GnitzSqlError> {
-    let (tid, schema, kind) = binder.resolve(client, &name)?;
+fn resolve_target(reads: &mut dyn ReadTarget, binder: &mut Binder<'_>, name: String) -> Result<Target, GnitzSqlError> {
+    let (tid, schema, kind) = binder.resolve(reads, &name)?;
     Ok(Target {
         name,
         tid,
@@ -113,7 +113,7 @@ fn resolve_target(client: &mut GnitzClient, binder: &mut Binder<'_>, name: Strin
 /// relation it reads. Both tails then run the same builders in the same order, so
 /// describing a query that has no plan yields the identical rejection.
 pub(super) fn route_select<'q>(
-    client: &mut GnitzClient,
+    reads: &mut dyn ReadTarget,
     query: &'q Query,
     binder: &mut Binder<'_>,
 ) -> Result<Route<'q>, GnitzSqlError> {
@@ -178,7 +178,7 @@ pub(super) fn route_select<'q>(
         if cte_select.selection.is_some() || cte_select.having.is_some() || body_is_grouped(cte_select) {
             return reject_derivation("non-pass-through CTE");
         }
-        match cte_passthrough(client, cte_select, &cte.alias.columns, binder)? {
+        match cte_passthrough(reads, cte_select, &cte.alias.columns, binder)? {
             Some(resolved) => binder.cache_alias(&cte.alias.name.value, resolved)?,
             None => return reject_derivation("non-pass-through CTE"),
         }
@@ -242,7 +242,7 @@ pub(super) fn route_select<'q>(
                 "aggregate SELECT"
             },
         )?;
-        let target = resolve_target(client, binder, table_name)?;
+        let target = resolve_target(reads, binder, table_name)?;
         return Ok(Route {
             target,
             select,
@@ -256,7 +256,7 @@ pub(super) fn route_select<'q>(
     // routed above; the exotic tail (PREWHERE, TOP, QUALIFY, …) rejects here.
     reject_unhonored_select_clauses(select, HonoredClauses::PLAIN, "direct SELECT")?;
 
-    let target = resolve_target(client, binder, table_name)?;
+    let target = resolve_target(reads, binder, table_name)?;
 
     // A plain `SELECT *` (no EXCEPT/RENAME/… modifiers) with no WHERE / ORDER BY /
     // LIMIT / OFFSET reads through `client.scan` rather than a `ReadSpec`: the rows
@@ -290,14 +290,14 @@ pub(super) fn route_select<'q>(
 }
 
 pub(crate) fn execute_select(
-    client: &mut GnitzClient,
+    reads: &mut dyn ReadTarget,
     query: &Query,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let route = route_select(client, query, binder)?;
+    let route = route_select(reads, query, binder)?;
     match route.sink {
         Sink::PlainScan => {
-            let (schema_out, batch_opt, _) = client.scan(route.target.tid)?;
+            let (schema_out, batch_opt) = reads.scan(route.target.tid)?;
             let out_schema = schema_out
                 .map(|s| (*s).clone())
                 .unwrap_or_else(|| (*route.target.schema).clone());
@@ -307,8 +307,8 @@ pub(crate) fn execute_select(
                 batch,
             })
         }
-        Sink::Rows => plan_read_spec(client, query, &route),
-        Sink::Fold => execute_aggregate_select(client, query, &route),
+        Sink::Rows => plan_read_spec(reads, query, &route),
+        Sink::Fold => execute_aggregate_select(reads, query, &route),
     }
 }
 
@@ -348,12 +348,12 @@ pub(super) fn build_rows_shape(select: &Select, query: &Query, schema: &Schema) 
 }
 
 /// Build and run a `ReadSpec` for a single-relation, non-aggregate SELECT.
-fn plan_read_spec(client: &mut GnitzClient, query: &Query, route: &Route<'_>) -> Result<SqlResult, GnitzSqlError> {
+fn plan_read_spec(reads: &mut dyn ReadTarget, query: &Query, route: &Route<'_>) -> Result<SqlResult, GnitzSqlError> {
     let (target, select, limit, offset) = (&route.target, route.select, route.limit, route.offset);
     let schema = &*target.schema;
     // WHERE → bound + compiled server-side predicate, then the reply shape.
     let bound_where = bind_where(schema, select.selection.as_ref())?;
-    let plan = plan_where(client, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
+    let plan = plan_where(reads, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
     let shape = build_rows_shape(select, query, schema)?;
 
     // `LIMIT 0` short-circuits to an empty result — no request dispatched.
@@ -369,7 +369,7 @@ fn plan_read_spec(client: &mut GnitzClient, query: &Query, route: &Route<'_>) ->
         order: shape.order.clone(),
         limit_k,
     };
-    let batch = fetch_bound(client, target.tid, &plan, &sink, &shape.reply_schema)?;
+    let batch = fetch_bound(reads, target.tid, &plan, &sink, &shape.reply_schema)?;
 
     // Client finish: sort the concatenation by the wire keys, window, present.
     let (schema, batch) = read_spec_finish(shape.reply_schema, batch, &shape.order, offset, limit);
@@ -460,7 +460,7 @@ pub(super) fn build_fold_shape(select: &Select, schema: &Schema) -> Result<FoldS
 /// via the ReadSpec fold sink (a per-worker hash-fold) + client finishing. The
 /// only runtime error is the per-worker group cap, surfaced from the wire call.
 fn execute_aggregate_select(
-    client: &mut GnitzClient,
+    reads: &mut dyn ReadTarget,
     query: &Query,
     route: &Route<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
@@ -473,7 +473,7 @@ fn execute_aggregate_select(
     // does in `plan_read_spec`: a query unsupported on both axes must name the
     // same one whichever sink it routes to.
     let bound_where = bind_where(schema, select.selection.as_ref())?;
-    let plan = plan_where(client, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
+    let plan = plan_where(reads, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
     let shape = build_fold_shape(select, schema)?;
 
     // `LIMIT 0` short-circuits to an empty result — no request dispatched
@@ -496,7 +496,7 @@ fn execute_aggregate_select(
     });
     // Dispatch. A wire error (including the runtime per-worker group cap) is HARD —
     // by now the fold is mid-flight on the workers and cannot fall back.
-    let partial = fetch_bound(client, target.tid, &plan, &sink, &shape.partial_schema)?;
+    let partial = fetch_bound(reads, target.tid, &plan, &sink, &shape.partial_schema)?;
 
     // Client finishing (combine by group value, ground row, AVG/NullfillSum,
     // HAVING, projection), then the shared ORDER BY / OFFSET / LIMIT sink.

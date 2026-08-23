@@ -21,14 +21,15 @@ pub use gnitz_wire::{
     SCAN_MULTI_MAX_RELATIONS, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
     STATUS_TXN_CONFLICT,
 };
-pub(crate) use message::recv_message;
 pub use message::{
     decode_control_block, encode_ddl_txn, encode_message_noschema_parts, encode_message_parts, encode_push_txn,
     encode_scan_multi, parse_response, send_control, Message, MessageParts,
 };
+pub(crate) use message::{parse_response_frame, recv_message, ParsedFrame};
 pub use regions::{ViewBuffers, ZSetBatchView};
 pub use transport::{hello_handshake, ClientTransport, TransportWaker};
 pub use types::{
     null_word_get, null_word_set, BatchAppender, ColData, ColumnDef, FixedInt, PkColumn, PkTuple, Schema, TypeCode,
     ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };
+pub use wal_block::decode_wal_block;

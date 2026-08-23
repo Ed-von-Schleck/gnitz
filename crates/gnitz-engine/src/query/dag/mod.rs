@@ -511,17 +511,21 @@ impl DagEngine {
 
     // ── Compilation ─────────────────────────────────────────────────────
 
-    /// Ensure a view's plan is compiled. Returns true if compilation succeeded.
-    pub fn ensure_compiled(&mut self, view_id: i64) -> bool {
+    /// Ensure a view's plan is compiled. `Ok(false)` means `view_id` is not a
+    /// registered relation; `Err` means a registered view did not compile.
+    ///
+    /// The error is `String` rather than `CompileError`, which is `pub(crate)`
+    /// and so cannot appear in a `pub fn`'s signature.
+    pub fn ensure_compiled(&mut self, view_id: i64) -> Result<bool, String> {
         if self.cache.contains_key(&view_id) {
-            return true;
+            return Ok(true);
         }
-        match self.compile_view_internal(view_id) {
+        match self.compile_view_internal(view_id)? {
             Some(plan) => {
                 self.cache.insert(view_id, plan);
-                true
+                Ok(true)
             }
-            None => false,
+            None => Ok(false),
         }
     }
 
@@ -592,29 +596,27 @@ impl DagEngine {
 
     /// Compile a view by reading system tables and calling `compiler::compile_view`.
     ///
-    /// `None` means only "not a registered relation". Nothing re-pre-flights the
-    /// circuit here — replay, fork inheritance, checkpoint resume, rebuild and
+    /// `Ok(None)` means only "not a registered relation". Nothing re-pre-flights
+    /// the circuit here — replay, fork inheritance, checkpoint resume, rebuild and
     /// relayout all reach this with no pre-flight in the process, and this compile
     /// additionally opens resumed operator state the master's throwaway root never
-    /// had. An `Err` is therefore unrecoverable: the alternative to aborting is a
-    /// view that has stopped integrating while still answering reads with stale
-    /// rows. The abort message names the causes.
-    fn compile_view_internal(&self, view_id: i64) -> Option<CompileOutput> {
-        let entry = self.tables.get(&view_id)?;
+    /// had. An `Err` is therefore unrecoverable for a server: the alternative to
+    /// aborting is a view that has stopped integrating while still answering reads
+    /// with stale rows. The message names the causes.
+    fn compile_view_internal(&self, view_id: i64) -> Result<Option<CompileOutput>, String> {
+        let Some(entry) = self.tables.get(&view_id) else {
+            return Ok(None);
+        };
         match self.compile_circuit(view_id, &entry.directory, &entry.schema, entry.capacity_bytes.is_some()) {
             Ok(output) => {
                 gnitz_debug!("dag: compiled view_id={}", view_id);
-                Some(output)
+                Ok(Some(output))
             }
-            Err(err) => {
-                gnitz_fatal_abort!(
-                    "view_id={} does not compile from its durable circuit — this build no \
-                     longer accepts that circuit or its expr blobs, its derived state is \
-                     corrupt or unreadable, or resources are exhausted: {}",
-                    view_id,
-                    err
-                );
-            }
+            Err(err) => Err(format!(
+                "view_id={view_id} does not compile from its durable circuit — this build no \
+                 longer accepts that circuit or its expr blobs, its derived state is \
+                 corrupt or unreadable, or resources are exhausted: {err}"
+            )),
         }
     }
 
@@ -868,26 +870,25 @@ mod tests {
     }
 
     // A storage error while applying committed data in `ingest_store_and_indices`
-    // must _exit(134) (fail-stop; recovery is restart + SAL replay). Driven via
-    // the `GNITZ_INJECT_INGEST_APPLY_ERROR` debug seam. The `index`-stage
-    // variant is exercised end-to-end by the
-    // `test_ingest_apply_error_aborts_and_replays` e2e test.
+    // is returned rather than swallowed; the process that owns the recovery
+    // decision makes it (for a server, restart + SAL replay, asserted beside its
+    // own call site and end-to-end by `test_ingest_apply_error_aborts_and_replays`).
+    // Driven via the `GNITZ_INJECT_INGEST_APPLY_ERROR` debug seam.
     #[test]
-    fn test_ingest_apply_error_abort_exit_status() {
-        crate::test_support::assert_test_aborts_134(
-            "ingest_apply_error_abort_internal",
-            &[("GNITZ_INJECT_INGEST_APPLY_ERROR", "store")],
-        );
+    fn test_ingest_apply_error_is_returned() {
+        let name = "ingest_apply_error_returned_internal";
+        let status = crate::test_support::run_test_in_child(name, &[("GNITZ_INJECT_INGEST_APPLY_ERROR", "store")]);
+        assert_eq!(status.code(), Some(0), "{name} must pass with the seam armed");
     }
 
-    // Runs only in the re-exec'd abort child. Registers a view and ingests one
-    // row; the armed "store" seam substitutes Err for the store ingest,
-    // tripping the abort. `View`, not `BaseTable`: a base table must be a
-    // `Partitioned` handle (it runs `enforce_unique_pk`), and this fixture
-    // holds a `Borrowed` one.
+    // Runs only in the re-exec'd child, which is where the armed seam is read.
+    // Registers a view and ingests one row; the "store" seam substitutes Err for
+    // the store ingest. `View`, not `BaseTable`: a base table must be a
+    // `Partitioned` handle (it runs `enforce_unique_pk`), and this fixture holds
+    // a `Borrowed` one.
     #[test]
-    fn ingest_apply_error_abort_internal() {
-        if !crate::test_support::in_abort_child() {
+    fn ingest_apply_error_returned_internal() {
+        if !crate::test_support::in_child_test() {
             return;
         }
         let mut dag = DagEngine::new();
@@ -913,8 +914,13 @@ mod tests {
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
         batch.count += 1;
-        dag.ingest_returning_effective(70, batch);
-        unreachable!("ingest_store_and_indices must abort when the seam is armed");
+        assert!(
+            matches!(
+                dag.ingest_returning_effective(70, batch),
+                Err(crate::storage::StorageError::Io(_))
+            ),
+            "ingest_store_and_indices must return the storage error when the seam is armed",
+        );
     }
 
     // ── ViewMeta relay routing ───────────────────────────────────────────────

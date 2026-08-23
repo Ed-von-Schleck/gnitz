@@ -560,7 +560,10 @@ def test_worker_boot_flush_failure_preserves_sal(own_server):
         schema_name="boot_flush",
     )
     conn.close()
-    # Hard kill: the rows live only in the SAL + memtable, never flushed.
+    # Hard kill: the rows live only in the SAL + memtable, never flushed. The
+    # kill is not optional — the data directory takes one live process, so a
+    # second boot over a still-running server is refused, not raced.
+    own_server.stop()
 
     # ---- Phase 2: boot with the injected flush fault must FAIL. --------
     # Every worker reports the boot-flush failure on its startup ACK; the
@@ -606,6 +609,7 @@ def test_master_sys_flush_failure_preserves_sal(own_server):
         schema_name="sys_flush",
     )
     conn.close()
+    own_server.stop()
 
     # ---- Phase 2: boot with the injected sys-flush fault must FAIL. ----
     # The master aborts after recover_system_tables_from_sal, before the
@@ -905,6 +909,7 @@ def test_boot_replay_apply_error_aborts_boot(own_server):
         schema_name="replay_err",
     )
     conn.close()
+    own_server.stop()
     # Rows live only in the SAL + memtable, never flushed.
 
     # ---- Phase 2: boot with the seam armed must FAIL during SAL replay. --

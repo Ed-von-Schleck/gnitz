@@ -43,7 +43,7 @@ use std::rc::Rc;
 
 use crate::query::{DagEngine, DeltaFeed, RelationKind, RelationStores, StoreHandle};
 use crate::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, ReadCursor, RecoverySource, Table};
+use crate::storage::{Batch, ReadCursor, RecoverySource, StorageError, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
@@ -53,6 +53,7 @@ pub use sys_tables::{SysFamily, FIRST_USER_TABLE_ID, PUBLIC_SCHEMA_ID, SEQ_TAB_I
 pub use types::{ColumnDef, FkEdge};
 // The reply path's cached schema wire block.
 pub use cache::SchemaWireEntry;
+pub use store_io::IngestError;
 // The master's ScanSpec confinement test.
 pub use scan_spec::scan_spec_worker;
 
@@ -73,8 +74,9 @@ pub(in crate::catalog) use registry::raise_id_counter;
 // catalog only consumes them.
 pub(in crate::catalog) use crate::storage::{fsync_dir, reclaim_retired_children, subdir_names, ChildAddr};
 pub(in crate::catalog) use utils::{
-    cursor_read_string, cursor_read_u64, ensure_dir, index_dir, is_table_dir_name, make_fk_index_name, preflight_dir,
-    relation_dir, retract_key_range, retract_single_row, schema_dir, sys_catalog_dir, sys_family_dir, sys_opk,
+    cursor_read_string, cursor_read_u64, ensure_dir, index_dir, is_table_dir_name, lock_data_dir, make_fk_index_name,
+    preflight_dir, relation_dir, retract_key_range, retract_single_row, schema_dir, sys_catalog_dir, sys_family_dir,
+    sys_opk,
 };
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
 // for the catalog's row builders.
@@ -93,6 +95,12 @@ pub(crate) const DDL_SCAN_CHUNK_ROWS: usize = 65_536;
 pub struct CatalogEngine {
     pub(crate) dag: DagEngine,
     pub(crate) base_dir: String,
+
+    /// The `flock`ed handle on `base_dir`'s lock file, dropped by
+    /// [`CatalogEngine::close`]. Closing it releases the lock, so it is held
+    /// until then: a second writer would reseed `current_lsn` from
+    /// `max_lsn + 1` and mint shard names the first writer is already using.
+    dir_lock: Option<fs::File>,
 
     /// Every derived lookup the catalog maintains from system-table deltas.
     pub(crate) caches: CatalogCacheSet,

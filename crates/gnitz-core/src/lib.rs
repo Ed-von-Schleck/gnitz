@@ -6,6 +6,7 @@ pub mod client;
 pub mod connection;
 pub mod error;
 pub mod protocol;
+pub mod read_target;
 pub mod types;
 
 // The crate prelude: the names a client of gnitz-core names by hand. Every
@@ -16,12 +17,13 @@ pub use circuit::{
     agg_output_type, Circuit, CircuitBuilder, CircuitRows, NodeId, OpNode, RangeRel, ReduceOutKey, ReindexRole,
 };
 pub use client::{
-    delta_reply_schema, hidden_view_name, retraction_batch, DeltaCursor, GnitzClient, IndexMeta, InlineUniqueIndex,
-    PlannedView, RelKind, TxnBuffer, MAX_CHAIN_SEGMENTS,
+    delta_reply_schema, hidden_view_name, qualified_name, retraction_batch, DeltaCursor, GnitzClient, IndexMeta,
+    InlineUniqueIndex, PlannedView, RelKind, TxnBuffer, MAX_CHAIN_SEGMENTS,
 };
-pub use connection::{Session, FIRST_USER_TABLE_ID, TABLE_TAB};
+pub use connection::{RawBlock, Session, FIRST_USER_TABLE_ID, TABLE_TAB};
 pub use error::{ClientError, ConflictClass};
 pub use gnitz_wire::{RelClass, TableProps};
+pub use read_target::ReadTarget;
 // The expression emitter and the resolved column addressing it reads through
 // live in `gnitz-expr`, beside the decoder they must agree with. Re-exported
 // here because `gnitz-capi` exposes 18 `gnitz_expr_*` C symbols over the former

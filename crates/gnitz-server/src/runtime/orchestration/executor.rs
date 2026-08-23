@@ -1179,8 +1179,14 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         } else {
             None
         };
-        if let Some(new_id) = alloc {
-            send_control_only(peer, new_id, client_id, STATUS_OK).await;
+        if let Some(alloc) = alloc {
+            match alloc {
+                Ok(new_id) => send_control_only(peer, new_id, client_id, STATUS_OK).await,
+                Err(e) => {
+                    let msg = format!("id allocation failed: {e}");
+                    send_error(peer, target_id, client_id, msg.as_bytes()).await;
+                }
+            }
             return;
         }
     }
@@ -2683,14 +2689,11 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
             Ok(())
         });
         if let Err(e) = ingest_res {
-            guard_panic("DDL-compensate", || {
-                unsafe {
-                    (*cat_ptr_raw).compensate_stage_a(applied_not_enqueued.take());
-                }
-                Ok::<(), String>(())
+            guard_panic("DDL-compensate", || unsafe {
+                (*cat_ptr_raw).compensate_stage_a(applied_not_enqueued.take())
             })
             .unwrap_or_else(|ce| {
-                gnitz_fatal_abort!("Stage-A DDL compensation panicked after DDL error '{}': {}", e, ce);
+                gnitz_fatal_abort!("Stage-A DDL compensation failed after DDL error '{}': {}", e, ce);
             });
             unsafe {
                 (*cat_ptr_raw).close_ddl_zone();

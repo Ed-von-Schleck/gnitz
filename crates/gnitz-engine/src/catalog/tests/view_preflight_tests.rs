@@ -220,7 +220,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
 
     // The pre-flight rejects the replacement's circuit — the bundle fails after
     // VIEW_TAB was applied, exactly where the handler compensates.
-    engine.compensate_stage_a(None);
+    engine.compensate_stage_a(None).unwrap();
 
     assert!(
         engine.dag.tables.contains_key(&old_vid),

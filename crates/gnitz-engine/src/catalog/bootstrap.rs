@@ -12,6 +12,10 @@ impl CatalogEngine {
     pub fn open(base_dir: &str, num_workers: u32) -> Result<Self, String> {
         ensure_dir(base_dir)?;
 
+        // Before any store opens: two writers on one directory mint identical
+        // shard names and corrupt it silently.
+        let dir_lock = lock_data_dir(base_dir)?;
+
         ensure_dir(&sys_catalog_dir(base_dir))?;
 
         // Create system tables (one `Table` each; durability derived from the
@@ -42,6 +46,7 @@ impl CatalogEngine {
         let mut engine = CatalogEngine {
             dag,
             base_dir: base_dir.to_string(),
+            dir_lock: Some(dir_lock),
             caches: CatalogCacheSet::default(),
             next_schema_id: FIRST_USER_SCHEMA_ID,
             next_table_id: FIRST_USER_TABLE_ID,
@@ -277,10 +282,31 @@ impl CatalogEngine {
             .map_err(|e| format!("boot flush of the system catalog failed: {e:?}"))
     }
 
+    /// The ephemeral checkpoint round: force-persist every view's operator-trace
+    /// tables and output stores, stamped with this engine's resume generation.
+    ///
+    /// Two global passes — traces first, then outputs — so that any output at
+    /// generation `G` implies that view's own traces are already durable at `G`.
+    /// Batching each pass into one barrier also beats per-view interleaving.
+    ///
+    /// The caller latches the generation first: the server off the `FlushEph`
+    /// message, an embedder through `bump_checkpoint_generation`.
+    pub fn flush_ephemeral_round(&mut self) -> Result<(), String> {
+        let (traces, outputs) = self.dag.collect_ephemeral_flush_tables();
+        let generation = self.resume_generation();
+        let pass = |tables: Vec<*mut Table>, what: &str| {
+            crate::storage::flush_barrier(tables, crate::storage::FlushRound::Ephemeral(generation))
+                .map_err(|e| format!("ephemeral {what} flush: {e}"))
+        };
+        pass(traces, "trace")?;
+        pass(outputs, "output")
+    }
+
     /// Flush every store this engine owns that a restart could read back — each
-    /// user table's owned handle and then the system tables — and clear the DAG.
-    /// There is no `Drop` doing any of it, so a caller that wants the tree on disk
-    /// complete must call this.
+    /// user table's owned handle and then the system tables — clear the DAG, and
+    /// release the data-directory lock. There is no `Drop` doing any of it, so a
+    /// caller that wants the tree on disk complete, or wants to reopen the same
+    /// directory, must call this.
     ///
     /// A fed view's delta store is skipped for the reason it is in neither
     /// checkpoint round: it is erased at open, so flushing it would write bytes
@@ -299,5 +325,8 @@ impl CatalogEngine {
         // tables.clear() in dag.close() drops the owned `Box<Table>` automatically.
         self.dag.close();
         let _ = self.flush_all_system_tables();
+        // Last: dropping the file releases the directory lock, so the next open
+        // of this directory succeeds.
+        self.dir_lock = None;
     }
 }

@@ -94,34 +94,35 @@ pub fn arb_type_code() -> impl Strategy<Value = u8> {
     ]
 }
 
-/// Set by [`assert_test_aborts_134`] on the child it spawns; the abort-body
-/// test guards on [`in_abort_child`] so a normal sweep skips it.
-const ABORT_CHILD_VAR: &str = "GNITZ_RUN_ABORT_TEST";
+/// Set by [`run_test_in_child`] on the child it spawns; the body test guards on
+/// [`in_child_test`] so a normal sweep skips it.
+const CHILD_TEST_VAR: &str = "GNITZ_RUN_CHILD_TEST";
 
-/// True only inside the re-exec'd child of [`assert_test_aborts_134`].
-pub fn in_abort_child() -> bool {
-    std::env::var(ABORT_CHILD_VAR).is_ok()
+/// True only inside a re-exec'd child spawned by [`run_test_in_child`].
+pub fn in_child_test() -> bool {
+    std::env::var(CHILD_TEST_VAR).is_ok()
 }
 
-/// Re-run the current test binary filtered to `internal_test` (with `envs`
-/// set) and assert the child `gnitz_fatal_abort!`s — `_exit(134)` is a normal
-/// (non-signal) exit on Linux, so `code() == Some(134)`. A direct in-process
-/// call would terminate the test runner; a clean subprocess also avoids any
-/// multi-threaded fork hazard. `internal_test` must return early unless
-/// [`in_abort_child`], so a normal test sweep skips its abort.
-pub fn assert_test_aborts_134(internal_test: &str, envs: &[(&str, &str)]) {
+/// Re-run the current test binary filtered to `internal_test`, with `envs` set,
+/// and hand back the child's exit status. A caller asserts the code it expects:
+/// `Some(0)` for a test that must pass under those variables, `Some(134)` for
+/// one that must fail-stop (`_exit(134)` is a normal, non-signal exit on Linux).
+///
+/// The reason a test needs a child at all rather than setting the variable
+/// itself: a `Seam` reads its variable once per process into a `OnceLock`, and
+/// the test runner runs a crate's tests as threads of one process, so an
+/// in-process `set_var` would race every other test and lose to whichever seam
+/// read first. A direct in-process fail-stop would also terminate the runner.
+/// `internal_test` must return early unless [`in_child_test`], so a normal test
+/// sweep skips it.
+pub fn run_test_in_child(internal_test: &str, envs: &[(&str, &str)]) -> std::process::ExitStatus {
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
     cmd.arg(internal_test);
-    cmd.env(ABORT_CHILD_VAR, "1");
+    cmd.env(CHILD_TEST_VAR, "1");
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let status = cmd.status().unwrap();
-    assert_eq!(
-        status.code(),
-        Some(134),
-        "{internal_test} must gnitz_fatal_abort! (exit 134)",
-    );
+    cmd.status().unwrap()
 }
 
 /// Flip each bit of `buf[span]` in turn, run `check(byte, bit, buf)` with it

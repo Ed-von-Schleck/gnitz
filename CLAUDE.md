@@ -319,10 +319,11 @@ list, this is not. The ones whose semantics are not obvious from the name:
 
 ## Project structure
 
-Two sides that meet only at the wire protocol: the **SQL/client side** (a library,
-also exposed as C and Python bindings) plans and drives queries; the **engine**
-executes them as a multi-process server. The SQL side compiles a query and ships
-it to the engine over `gnitz-wire`; the engine never links the planner.
+Two sides that meet at the wire protocol: the **SQL/client side** (a library,
+also exposed as C and Python bindings) plans and drives queries, and ships them
+over `gnitz-wire`; the **engine** executes them as a multi-process server and
+never links the planner. `gnitz-mirror` is the sole crate on both sides, and
+links no planner either.
 
 ### Workspace crates
 
@@ -336,6 +337,7 @@ it to the engine over `gnitz-wire`; the engine never links the planner.
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `sql`, `wire` |
 | `gnitz-engine` | The single-node database as a library: Z-set store, DBSP operators, circuit compiler, catalog | `wire`, `expr` |
 | `gnitz-server` | The multi-process server binary — the `runtime` rung and nothing else | `engine`, `wire`, `expr` |
+| `gnitz-mirror` | The client mirror: a local copy of a view answering reads in the host's process — the one crate on both sides, and a leaf | `core`, `engine`, `wire` |
 | `gnitz-engine-testkit` | Dev-only: `gnitz-engine`'s test helpers, compiled as a library so `gnitz-server`'s tests reach them | `engine`, `wire` |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests | — |
 
@@ -569,6 +571,17 @@ and bootstrap. A `CREATE VIEW` backfill never enters the delta store, which is
 what makes a foreign cursor unsafe rather than merely stale.
 
 The feed is per-worker; a replicated view's feed lives on worker 0 alone.
+
+A **mirror** (`gnitz-mirror`) is a local copy of a view fed by that feed, read in
+the host's process at its last polled round: not read-your-own-writes, and two
+mirrors are no consistent cut; an unheld relation is delegated upstream. One live
+handle per process, one process per data directory; it poisons on an ingest error.
+
+A view whose STRING/BLOB rows on one worker exceed the reply frame cap **cannot
+be mirrored**: such a reply goes out as one frame, and a bootstrap reads the view
+whole, so it has no projection, predicate or `LIMIT` to narrow and its one
+recovery — bootstrap again — fails identically. The ceiling is the server's, not
+the mirror's: an unprojected read of that view fails for any client.
 
 ## SAL durability contract
 

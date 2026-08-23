@@ -596,7 +596,9 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2).unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2)
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
@@ -631,7 +633,7 @@ mod tests {
         let vm = builder.build(&reg_meta);
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1);
 
-        assert!(result.is_none());
+        assert!(result.unwrap().is_none());
     }
 
     #[test]
@@ -653,7 +655,7 @@ mod tests {
         let vm = builder.build(&reg_meta);
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1);
 
-        assert!(result.is_none());
+        assert!(result.unwrap().is_none());
     }
 
     #[test]
@@ -675,8 +677,9 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let result =
-            execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, input), (2u16, input_b)], 1).unwrap();
+        let result = execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, input), (2u16, input_b)], 1)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.count, 3);
     }
@@ -739,7 +742,9 @@ mod tests {
             RegisterMeta::delta(schema_b),
         ];
         let vm = builder.build(&reg_meta);
-        let result = execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, left), (2u16, right)], 1).unwrap();
+        let result = execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, left), (2u16, right)], 1)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.count, 2, "Z-Set + keeps both rows");
         assert!(
@@ -774,7 +779,9 @@ mod tests {
             RegisterMeta::delta(schema_b),
         ];
         let vm = builder.build(&reg_meta);
-        let result = execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, left)], 1).unwrap();
+        let result = execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, left)], 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(result.count, 1);
         assert_eq!(
             result.schema,
@@ -799,7 +806,9 @@ mod tests {
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 3, 20)]);
         let reg_meta = [RegisterMeta::delta(schema); 2];
         let vm = builder.build(&reg_meta);
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1).unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1)
+            .unwrap()
+            .unwrap();
         let rows = extract_rows(&result);
         assert_eq!(
             rows,
@@ -826,7 +835,9 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1).unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1)
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
@@ -853,12 +864,16 @@ mod tests {
 
         // Tick 1
         let input1 = make_batch(schema, &[(1u128, 1, 10)]);
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 1).unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(r1.count, 1);
 
         // Tick 2 with different data
         let input2 = make_batch(schema, &[(2u128, 1, 20), (3u128, 1, 30)]);
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 1).unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 1)
+            .unwrap()
+            .unwrap();
         // Should have exactly 2 rows from tick 2, not 3 (no bleed from tick 1)
         assert_eq!(r2.count, 2);
         let rows = extract_rows(&r2);
@@ -893,7 +908,9 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(in_schema), RegisterMeta::delta(out_schema)];
         let vm = builder.build(&reg_meta);
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1).unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1)
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
@@ -940,7 +957,9 @@ mod tests {
         // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
         let input1 = make_batch(schema, &[(1u128, 3, 42)]);
         vm.bind_trace_cursors();
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2).unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2)
+            .unwrap()
+            .unwrap();
 
         let rows1 = extract_rows(&r1);
         assert_eq!(rows1.len(), 1);
@@ -951,13 +970,15 @@ mod tests {
         let input2 = make_batch(schema, &[(1u128, -1, 42)]);
         vm.bind_trace_cursors();
         let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2);
-        assert!(r2.is_none(), "no boundary crossing: output should be empty");
+        assert!(r2.unwrap().is_none(), "no boundary crossing: output should be empty");
 
         // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
         // Positive→non-positive boundary crossed → retraction: output pk=1 w=-1.
         let input3 = make_batch(schema, &[(1u128, -2, 42)]);
         vm.bind_trace_cursors();
-        let r3 = execute_epoch(&vm.program, &mut vm.regfile, input3, 0, 2).unwrap();
+        let r3 = execute_epoch(&vm.program, &mut vm.regfile, input3, 0, 2)
+            .unwrap()
+            .unwrap();
         let rows3 = extract_rows(&r3);
         assert_eq!(rows3.len(), 1);
         assert_eq!(rows3[0], (1, -1, 42)); // retraction
@@ -998,7 +1019,9 @@ mod tests {
         vm.bind_trace_cursors();
 
         let input = make_batch(left_schema, &[(10u128, 1, 100)]);
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2).unwrap();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.count, 1);
         // Weight should be product: 1*1 = 1
@@ -1041,7 +1064,9 @@ mod tests {
         vm.bind_trace_cursors();
 
         let input = make_batch(left_schema, &[(10u128, 2, 50)]); // weight=2
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2).unwrap();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2)
+            .unwrap()
+            .unwrap();
 
         // Should produce 3 output rows (1 delta × 3 trace)
         assert_eq!(result.count, 3);
@@ -1103,7 +1128,9 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
         let vm = builder.build(&reg_meta);
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1).unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1)
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 1);
@@ -1186,7 +1213,9 @@ mod tests {
         );
 
         vm.bind_trace_cursors();
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2).unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2)
+            .unwrap()
+            .unwrap();
 
         // SUM of group=1: 10+20 = 30. Output should be one row with sum=30.
         assert_eq!(r1.count, 1, "one group → one output row");
@@ -1294,7 +1323,9 @@ mod tests {
 
         let reg_meta = [RegisterMeta::delta(schema); 2];
         let vm = builder.build(&reg_meta);
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1).unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1)
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 3, "filter col1>25 should keep 3 rows (30,40,50)");
@@ -1363,7 +1394,9 @@ mod tests {
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
 
         vm.bind_trace_cursors();
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2).unwrap();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2)
+            .unwrap()
+            .unwrap();
 
         // Should produce 1 row: pk=1, count=3, sum=60
         assert_eq!(result.count, 1, "multi-agg should produce 1 group");
@@ -1426,7 +1459,9 @@ mod tests {
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
 
         vm.bind_trace_cursors();
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 3).expect("SUM reduce must produce output");
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 3)
+            .unwrap()
+            .expect("SUM reduce must produce output");
 
         assert_eq!(result.count, 1, "one group → one output row");
         let sum_val = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());

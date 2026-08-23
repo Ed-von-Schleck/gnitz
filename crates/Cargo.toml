@@ -8,6 +8,7 @@ members = [
     "gnitz-capi",
     "gnitz-py",
     "gnitz-engine",
+    "gnitz-mirror",
     "gnitz-server",
     "gnitz-engine-testkit",
     "gnitz-test-harness",

@@ -1,0 +1,321 @@
+//! Registering a mirrored view in the local catalog — the worker's own
+//! registration path, plus ownership of the generation counter.
+//!
+//! The mirror must hold the relation under the **server's** `table_id`: the SQL
+//! layer resolves a name to a server-assigned id and the read seam is
+//! `scan_spec(table_id, …)`. A local `CatalogEngine` allocates its own ids from
+//! `FIRST_USER_TABLE_ID`, so the mirror needs a way to own an id it did not
+//! allocate — and that is exactly a worker's situation. A worker never allocates
+//! either: the master does, and every worker learns relations through
+//! `ddl_sync`, whose `table_id` argument is the *system-table family*, so the
+//! user relation's own id travels inside the rows where nothing constrains it to
+//! a locally-allocated value.
+//!
+//! No `IDX_TAB` row is ever written: only a base table may own an index, and the
+//! registration guard refuses a view owner wherever it arrives. So the mirror
+//! holds no index and can never be handed the `IndexRange { exact: true }` bound
+//! whose conjunct-stripping contract would make a missing index a correctness
+//! fault rather than a slowdown.
+//!
+//! Nor are any circuit rows written, and that is what keeps the compile path
+//! unreachable: the copy is fed by direct ingest of drained deltas and never by
+//! evaluating a circuit, and `capacity_bytes = 0` means no store of the
+//! mirror's ever holds a skeleton row, so nothing can ask it to hydrate.
+
+use std::sync::Arc;
+
+use gnitz_core::{delta_reply_schema, qualified_name, RelClass, Schema};
+use gnitz_engine::catalog::SysFamily;
+use gnitz_engine::schema::{make_delta_schema, SchemaDescriptor};
+use gnitz_engine::storage::{Batch, BatchBuilder};
+use gnitz_wire::sys_rows::{write_col_tab_row, write_schema_tab_row, write_view_tab_row};
+use gnitz_wire::sys_rows::{ColTabRow, SchemaTabRow, ViewTabRow};
+use gnitz_wire::{COLTAB_PAY_OWNER_ID, OWNER_KIND_VIEW};
+
+use crate::error::MirrorError;
+use crate::handle::{Mirror, MirroredView};
+
+impl Mirror {
+    /// Mirror `schema_name.name`, and bring its copy up to date.
+    ///
+    /// Idempotent, and the same call whether this is a first registration or a
+    /// reopen: it resolves the relation upstream, reconciles that against
+    /// whatever the local catalog replayed, and then either advances the copy
+    /// from its persisted cursor or reseeds it.
+    ///
+    /// Only a view with a delta feed can be mirrored. `delta_bytes` is a
+    /// `VIEW_TAB` column and a `Delta` bound is refused against any relation
+    /// whose feed is absent, at every round including zero — so a base table
+    /// cannot be mirrored, and neither can a view created without one.
+    ///
+    /// Returns the relation's server id, which is what a read names it by.
+    pub fn mirror_view(&mut self, schema_name: &str, name: &str) -> Result<u64, MirrorError> {
+        self.check_poison()?;
+        // Identifiers are canonically lower-case: the rows written below must
+        // carry the same spelling the server's do, or a later resolve of the
+        // local catalog would miss.
+        let schema_name = schema_name.to_ascii_lowercase();
+        let name = name.to_ascii_lowercase();
+
+        let tid = self.reconcile_registration(&schema_name, &name)?;
+        self.advance_or_bootstrap(tid)?;
+        Ok(tid)
+    }
+
+    /// Stop mirroring `table_id`: retract its local catalog rows — which
+    /// unregisters the relation and queues its directory for deletion — and drop
+    /// its cursor.
+    pub fn forget_view(&mut self, table_id: u64) -> Result<(), MirrorError> {
+        self.check_poison()?;
+        if !self.engine.has_id(table_id as i64) {
+            return Ok(());
+        }
+        self.views.remove(&table_id);
+        self.replayed.remove(&table_id);
+        self.retract_relation(table_id)
+    }
+
+    /// Resolve upstream, reconcile that against the local catalog, and leave a
+    /// [`MirroredView`] entry for the result. Returns the relation's server id.
+    ///
+    /// Reconciliation is keyed by **id**, not by name: the id is what the copy
+    /// is stored under and what a read names. A registration that still holds
+    /// the resolved id with the same layout stands; anything else describes a
+    /// relation that was dropped and recreated, or altered, and the local copy
+    /// of a relation that changed identity is worthless — the bootstrap that
+    /// follows is the only correct answer anyway.
+    pub(crate) fn reconcile_registration(&mut self, schema_name: &str, name: &str) -> Result<u64, MirrorError> {
+        let (schema, kind) = self.client.resolve_relation(schema_name, name)?;
+        if !kind.class.is_view() {
+            return Err(MirrorError::Engine(format!(
+                "'{schema_name}.{name}' is a {}; only a view can be mirrored",
+                kind.class.noun()
+            )));
+        }
+        if kind.class == RelClass::BoundedView {
+            return Err(MirrorError::Engine(format!(
+                "view '{schema_name}.{name}' is capacity-bounded, and a capacity and a feed \
+                 are refused together, so it carries no feed to subscribe to"
+            )));
+        }
+        if !kind.delta {
+            return Err(MirrorError::Engine(format!(
+                "view '{schema_name}.{name}' keeps no delta feed; \
+                 create it WITH (delta = '<size>') to mirror it"
+            )));
+        }
+
+        let tid = kind.tid;
+        let want_desc = descriptor_of(&schema)?;
+
+        // Already mirrored at this id and layout: nothing to register, and the
+        // cursor stands. Failing that, a registration the local catalog replayed
+        // at open under this id and layout is adopted, with the cursor the file
+        // recorded for it.
+        let carried = if self.views.get(&tid).is_some_and(|v| v.view_desc == want_desc) {
+            self.views[&tid].cursor
+        } else if !self.views.contains_key(&tid)
+            && self
+                .engine
+                .get_schema_desc(tid as i64)
+                .is_some_and(|desc| desc == want_desc)
+        {
+            self.replayed.remove(&tid)
+        } else {
+            // Retract whatever the local catalog holds at this id, and — the
+            // dropped-and-recreated case — whatever it holds under this name at
+            // some other id. Then register fresh.
+            let renamed = self
+                .engine
+                .entity_id_by_qname(&qualified_name(schema_name, name))
+                .map(|t| t as u64)
+                .filter(|&t| t != tid);
+            for old in std::iter::once(tid).chain(renamed) {
+                if !self.engine.has_id(old as i64) {
+                    continue;
+                }
+                self.views.remove(&old);
+                self.replayed.remove(&old);
+                self.retract_relation(old)?;
+            }
+            self.register_locally(schema_name, name, tid, &schema)?;
+            None
+        };
+
+        let view_desc = self.engine.schema_or_err(tid as i64, "mirror registration")?;
+        let delta_desc = make_delta_schema(&view_desc).ok_or_else(|| {
+            MirrorError::Engine(format!(
+                "view '{schema_name}.{name}' cannot carry a delta feed: the stamped shape \
+                 overruns a schema limit"
+            ))
+        })?;
+        self.views.insert(
+            tid,
+            MirroredView {
+                schema_name: schema_name.to_string(),
+                name: name.to_string(),
+                kind,
+                delta_reply_schema: Arc::new(delta_reply_schema(&schema)),
+                schema,
+                view_desc,
+                delta_desc,
+                cursor: carried,
+            },
+        );
+        Ok(tid)
+    }
+
+    /// Write the catalog rows a mirrored view needs, in registration order.
+    fn register_locally(
+        &mut self,
+        schema_name: &str,
+        name: &str,
+        tid: u64,
+        schema: &Schema,
+    ) -> Result<(), MirrorError> {
+        // The schema id is the one field the resolve reply does not carry, so it
+        // comes from the same SCHEMA_TAB scan every DDL path takes. Using the
+        // server's id rather than a locally-allocated one is not cosmetic: the
+        // mirror writes one SCHEMA_TAB row per distinct schema name it mirrors
+        // from, and a local counter would mint an id the server had already
+        // given to a *different* schema whose view the handle mirrors next.
+        let schema_id = self.client.schema_id(schema_name)?;
+
+        // One SCHEMA_TAB row per schema, not per view: the row is shared by
+        // every view the handle mirrors out of it, and the local catalog runs no
+        // PK-uniqueness enforcement on a system family, so a second `+1` would
+        // stack a weight rather than be absorbed — and the retraction of one
+        // view would then leave the others' schema row behind at the wrong
+        // weight. `public` is already there from the local bootstrap.
+        let mut schema_b = BatchBuilder::new(SysFamily::Schema.schema());
+        if !self.engine.has_schema(schema_name) {
+            write_schema_tab_row(
+                &mut schema_b,
+                &SchemaTabRow {
+                    schema_id,
+                    name: schema_name,
+                },
+                1,
+            );
+        }
+
+        let mut col_b = BatchBuilder::new(SysFamily::Column.schema());
+        for (ci, cd) in schema.columns.iter().enumerate() {
+            write_col_tab_row(
+                &mut col_b,
+                &ColTabRow {
+                    owner_id: tid,
+                    owner_kind: OWNER_KIND_VIEW,
+                    col_idx: ci as u64,
+                    name: &cd.name,
+                    type_code: cd.type_code as u64,
+                    is_nullable: cd.is_nullable,
+                    // A view's column carries no FK.
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                    is_serial: cd.is_serial,
+                    // A view's physical PK is often a synthetic hidden column, and
+                    // dropping the flag would leave the local schema a column
+                    // narrower than the one the store is keyed by.
+                    is_hidden: cd.is_hidden,
+                },
+                1,
+            )
+            .map_err(MirrorError::Engine)?;
+        }
+
+        let pk_cols: Vec<u32> = schema.pk_indices().iter().map(|&i| i as u32).collect();
+        let mut view_b = BatchBuilder::new(SysFamily::View.schema());
+        write_view_tab_row(
+            &mut view_b,
+            &ViewTabRow {
+                view_id: tid,
+                schema_id,
+                name,
+                // Nothing local re-plans the view; the definition lives upstream.
+                sql_definition: "",
+                pk_col_idx: gnitz_wire::pack_pk_cols(&pk_cols),
+                // The copy holds no skeleton rows, so nothing can ask it to
+                // hydrate — which is what keeps the compile path unreachable.
+                capacity_bytes: 0,
+                // The mirror maintains no feed of its own.
+                delta_bytes: 0,
+            },
+            1,
+        );
+
+        // Ascending topo priority, and the order is a correctness requirement: the
+        // relation register hook reads its columns back through `sys_columns`
+        // storage rather than the cache, so a VIEW_TAB row applied before the
+        // COL_TAB rows registers a view whose schema build finds no columns.
+        // Nothing sorts for this caller — it calls `ddl_sync` directly.
+        let families = [
+            (SysFamily::Schema, schema_b.finish()),
+            (SysFamily::Column, col_b.finish()),
+            (SysFamily::View, view_b.finish()),
+        ];
+        for (family, batch) in families {
+            if batch.count > 0 {
+                self.engine.ddl_sync(family.id(), batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Retract every catalog row registering `relation_id`, **columns before the
+    /// VIEW_TAB row** — the order a worker applies a live DROP in, and the only
+    /// order that leaves no residue.
+    ///
+    /// The VIEW_TAB `-1` fires the engine's relation-register hook, which
+    /// cascades a retraction of every COL_TAB row the relation still owns.
+    /// Retracting the columns first makes that cascade find nothing live and
+    /// emit nothing; the reverse order would have the cascade cancel the columns
+    /// and the retraction below land a *second* `-1` on them, leaving each at net
+    /// `-1` — where the next registration's `+1` sums to zero and the relation
+    /// registers with no columns at all.
+    ///
+    /// The retractions are built by negating the *live* rows rather than by
+    /// re-encoding what registration would have written, so each `-1` is
+    /// byte-equal to the row it cancels by construction. A payload that differed
+    /// in one byte would not cancel: the two would be distinct elements sharing a
+    /// PK, and the surviving `+1` would keep the relation registered while the
+    /// `-1` sat beside it forever.
+    ///
+    /// The SCHEMA_TAB row is deliberately left alone — it is shared by every view
+    /// the handle mirrors out of that schema.
+    fn retract_relation(&mut self, relation_id: u64) -> Result<(), MirrorError> {
+        let col_undo = self.negated_rows(SysFamily::Column, |b, r| {
+            b.read_payload_u64(r, COLTAB_PAY_OWNER_ID) == relation_id
+        })?;
+        let view_undo = self.negated_rows(SysFamily::View, |b, r| b.get_pk(r) == relation_id as u128)?;
+        for (family, batch) in [(SysFamily::Column, col_undo), (SysFamily::View, view_undo)] {
+            if batch.count > 0 {
+                self.engine.ddl_sync(family.id(), batch)?;
+            }
+        }
+        // The VIEW_TAB retraction's hook queued the relation's directory. There
+        // are no workers here to still be applying its create, so the gate the
+        // server needs is vacuous and the removal happens now.
+        self.engine.defer_pending_dir_deletions();
+        self.engine.drain_checkpoint_gated_deletions();
+        Ok(())
+    }
+
+    /// The live rows of `family` that `keep` selects, at negated weight.
+    fn negated_rows(&mut self, family: SysFamily, keep: impl Fn(&Batch, usize) -> bool) -> Result<Batch, MirrorError> {
+        let (rows, schema) = self.engine.scan_family(family.id())?;
+        let picked: Vec<u32> = (0..rows.count).filter(|&r| keep(&rows, r)).map(|r| r as u32).collect();
+        let mut undo = Batch::from_indexed_rows(&rows.as_mem_batch(), &picked, &schema);
+        undo.map_weights(i64::wrapping_neg);
+        Ok(undo)
+    }
+}
+
+/// The engine descriptor a client `Schema` denotes, through the shared wire
+/// codec in both directions — so neither end is a second spelling of the block's
+/// rules.
+pub(crate) fn descriptor_of(schema: &Schema) -> Result<SchemaDescriptor, MirrorError> {
+    let block = gnitz_core::protocol::codec::encode_schema_block(schema, 0);
+    gnitz_engine::schema::decode_schema_block(&block, false)
+        .map_err(|e| MirrorError::Engine(format!("mirror: schema block: {e}")))
+}

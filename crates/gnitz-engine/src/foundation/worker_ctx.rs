@@ -60,6 +60,20 @@ pub fn set_master_role() {
     ROLE.store(ROLE_MASTER, Relaxed);
 }
 
+/// True while this process has taken neither of the two server roles — the
+/// default, which is what a unit test and any in-process embedding run under.
+///
+/// Public where `is_master`/`is_worker` are not, because an embedder has to
+/// *assert* it rather than set it: `set_worker_role` would invert the local
+/// index backfill, the index home directory and `store_lsn`'s
+/// `!is_worker() && owns_stores` assertion, and a store opened under a
+/// non-zero rank is homed at a child directory the next boot sweep deletes.
+/// Publishing this one boolean rather than the four role predicates keeps the
+/// role model itself internal.
+pub fn is_standalone() -> bool {
+    ROLE.load(Relaxed) == 0
+}
+
 pub(crate) fn is_master() -> bool {
     ROLE.load(Relaxed) == ROLE_MASTER
 }

@@ -6,6 +6,11 @@ compile_error!("GnitzDB requires a little-endian target; the wire format is LE-o
 #[macro_use]
 extern crate gnitz_engine;
 
+// Before `mod runtime;` for the same reason: `gnitz_fatal_abort!` is invoked
+// unqualified throughout it.
+#[macro_use]
+mod fatal;
+
 mod runtime;
 
 use std::env;

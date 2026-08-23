@@ -54,7 +54,7 @@ impl CatalogEngine {
         if self.has_schema(name) {
             return Err(format!("Schema already exists: {name}"));
         }
-        let sid = self.allocate_schema_id();
+        let sid = self.allocate_schema_id().unwrap();
 
         // Write schema record
         let schema = SysFamily::Schema.schema();
@@ -152,7 +152,7 @@ impl CatalogEngine {
         let raw_pk_cols = pack_pk_cols(pk_cols);
         let pk = unpack_pk_cols(raw_pk_cols);
 
-        let tid = self.allocate_table_id();
+        let tid = self.allocate_table_id().unwrap();
         validate_relation_defs(RelationKind::BaseTable, tid, table_name, col_defs, &pk)?;
         let sid = self.get_schema_id(schema_name);
         self.validate_fk_columns(tid, col_defs, pk.as_slice())?;
@@ -250,7 +250,7 @@ impl CatalogEngine {
             .collect::<Result<_, _>>()?;
 
         let index_name = make_secondary_index_name(schema_name, table_name, &col_names.join("_"));
-        let index_id = self.allocate_index_id();
+        let index_id = self.allocate_index_id().unwrap();
 
         // Precheck and apply as two steps, exactly as the DDL_TXN handler does:
         // a precheck rejection wrote nothing, so submitting the compensating −1
@@ -266,7 +266,7 @@ impl CatalogEngine {
             // hooks but does NOT enqueue the −1. Broadcasting the −1 would
             // deliver a phantom retraction to workers that never saw the +1.
             let undo = idx_tab_batch(index_id, owner_id, packed_cols, &index_name, is_unique, -1);
-            self.rollback_index_registration(undo, index_id);
+            self.rollback_index_registration(undo, index_id).unwrap();
             // The index directory is already gone: the hook staged it before
             // `Table::new`, and `with_staged_dir` reclaims a stage whose
             // closure failed. Nothing queued it here — the `-1` retraction

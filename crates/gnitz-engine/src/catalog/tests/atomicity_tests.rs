@@ -63,7 +63,7 @@ fn test_table_tab_no_cols_leaves_clean_state() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
-    let tid = engine.allocate_table_id();
+    let tid = engine.allocate_table_id().unwrap();
     // No column records written — TABLE_TAB ingestion must fail.
     let batch = build_table_tab_row(tid, pack_pk_cols(&[0]), "badtable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
@@ -85,7 +85,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
-    let tid = engine.allocate_table_id();
+    let tid = engine.allocate_table_id().unwrap();
     // STRING column is not pk-eligible.
     let cols = vec![col_def("label", type_code::STRING)];
     engine.write_column_records(tid, OWNER_KIND_TABLE, &cols).unwrap();
@@ -116,7 +116,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
     let orig_tid = engine.create_table("public.dupname", &cols, &[0]).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
-    let new_tid = engine.allocate_table_id();
+    let new_tid = engine.allocate_table_id().unwrap();
     engine.write_column_records(new_tid, OWNER_KIND_TABLE, &cols).unwrap();
 
     let batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "dupname");
@@ -156,7 +156,7 @@ fn test_table_tab_col_contiguity_gap_rejected() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
-    let tid = engine.allocate_table_id();
+    let tid = engine.allocate_table_id().unwrap();
     // Insert columns at indices 0 and 2 — index 1 is absent (gap).
     write_col_at_index(&mut engine, tid, 0, &col_def("id", type_code::U64)).unwrap();
     write_col_at_index(&mut engine, tid, 2, &col_def("gapped", type_code::U64)).unwrap();
@@ -183,7 +183,7 @@ fn test_view_tab_no_cols_leaves_clean_state() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::View));
 
-    let vid = engine.allocate_table_id();
+    let vid = engine.allocate_table_id().unwrap();
     // No column records for vid.
     let batch = build_view_tab_row(vid, "badview", "");
     let result = engine.ingest_to_family(VIEW_TAB_ID, &batch);
@@ -208,7 +208,7 @@ fn test_view_tab_too_many_cols_rejected() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::View));
 
-    let vid = engine.allocate_table_id();
+    let vid = engine.allocate_table_id().unwrap();
     // MAX_COLUMNS + 1 contiguous column records (col 0 is a valid U64 PK).
     for i in 0..(crate::schema::MAX_COLUMNS as i64 + 1) {
         write_col_at_index(&mut engine, vid, i, &col_def(&format!("c{i}"), type_code::U64)).unwrap();
@@ -237,8 +237,8 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
 
-    let nonexistent_owner = engine.allocate_table_id();
-    let idx_id = engine.allocate_index_id();
+    let nonexistent_owner = engine.allocate_table_id().unwrap();
+    let idx_id = engine.allocate_index_id().unwrap();
     let batch = idx_tab_batch(idx_id, nonexistent_owner, 0, "bad_owner_idx", false, 1);
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
     assert!(result.is_err(), "expected error for IDX_TAB with non-existent owner");
@@ -274,7 +274,7 @@ fn test_idx_tab_view_owner_rejected() {
 
     // Register a view via the raw system-table path (no circuit needed — the
     // precheck must fire before any backfill).
-    let vid = engine.allocate_table_id();
+    let vid = engine.allocate_table_id().unwrap();
     engine
         .write_column_records(vid, OWNER_KIND_VIEW, &[col_def("id", type_code::U64)])
         .unwrap();
@@ -283,7 +283,7 @@ fn test_idx_tab_view_owner_rejected() {
     assert!(engine.dag.tables.contains_key(&vid), "view registered");
 
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
-    let idx_id = engine.allocate_index_id();
+    let idx_id = engine.allocate_index_id().unwrap();
     let batch = idx_tab_batch(idx_id, vid, 0, "idx_on_view", false, 1);
     let err = engine
         .ingest_to_family(IDX_TAB_ID, &batch)
@@ -329,7 +329,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
 
     let orig_name = "public__idxtest__idx_val";
-    let new_idx_id = engine.allocate_index_id();
+    let new_idx_id = engine.allocate_index_id().unwrap();
     // Same name, different col (ts at index 2) — bypasses create_index dup check.
     let batch = idx_tab_batch(new_idx_id, tid, 2, orig_name, false, 1);
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
@@ -498,7 +498,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     let tid = engine
         .create_table("owner.t", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
-    let vid = engine.allocate_table_id();
+    let vid = engine.allocate_table_id().unwrap();
     write_identity_circuit(&mut engine, vid, tid, None);
     assert_eq!(
         engine.dag.get_dep_map().get(&tid),
@@ -613,7 +613,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     // bundle's families.
     let _ = engine.drain_pending_broadcasts();
 
-    let new_tid = engine.allocate_table_id();
+    let new_tid = engine.allocate_table_id().unwrap();
     // Ascending topo: COL_TAB(1) applied + enqueued first.
     let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
     engine.precheck_family(SysFamily::Column, &col_batch).unwrap();
@@ -626,7 +626,7 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
         engine.precheck_family(SysFamily::Table, &table_batch).is_err(),
         "duplicate-name TABLE_TAB must fail precheck"
     );
-    engine.compensate_stage_a(None);
+    engine.compensate_stage_a(None).unwrap();
 
     // The durable property: no orphan COL_TAB, no ghost -1 TABLE_TAB.
     assert_eq!(
@@ -663,7 +663,7 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     let cols_before = count_records(engine.sys_store_mut(SysFamily::Column));
     let tables_before = count_records(engine.sys_store_mut(SysFamily::Table));
 
-    let new_tid = engine.allocate_table_id();
+    let new_tid = engine.allocate_table_id().unwrap();
     let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
     engine.precheck_family(SysFamily::Column, &col_batch).unwrap();
     engine.apply_and_enqueue_family(SysFamily::Column, col_batch).unwrap();
@@ -686,7 +686,7 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
         applied.is_err(),
         "hook_relation_register must reject a REPLICATED table with a distribution prefix"
     );
-    engine.compensate_stage_a(marker.take());
+    engine.compensate_stage_a(marker.take()).unwrap();
 
     assert_eq!(
         count_records(engine.sys_store_mut(SysFamily::Table)),
@@ -720,7 +720,7 @@ fn two_creates_of_one_name_in_one_batch_rejected() {
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
 
     let cols = vec![col_def("id", type_code::U64)];
-    let (a, b) = (engine.allocate_table_id(), engine.allocate_table_id());
+    let (a, b) = (engine.allocate_table_id().unwrap(), engine.allocate_table_id().unwrap());
     engine.write_column_records(a, OWNER_KIND_TABLE, &cols).unwrap();
     engine.write_column_records(b, OWNER_KIND_TABLE, &cols).unwrap();
 
@@ -761,12 +761,12 @@ fn sequence_advances_leave_no_negative_ghost() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     engine.create_table("s.t", &cols, &[0]).unwrap();
     engine.create_index("s.t", &["val"], false).unwrap();
-    engine.record_topology(1);
-    engine.bump_checkpoint_generation();
+    engine.record_topology(1).unwrap();
+    engine.bump_checkpoint_generation().unwrap();
     // …and a second round, where each retraction now has a live row to cancel.
     engine.create_table("s.t2", &cols, &[0]).unwrap();
-    engine.record_topology(4);
-    engine.bump_checkpoint_generation();
+    engine.record_topology(4).unwrap();
+    engine.bump_checkpoint_generation().unwrap();
 
     assert_eq!(
         count_negative_records(engine.sys_store_mut(SysFamily::Sequence)),

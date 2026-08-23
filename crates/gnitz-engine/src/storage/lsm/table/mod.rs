@@ -566,6 +566,7 @@ impl Table {
 
     /// Byte-keyed PK existence check: the net weight across every tier is
     /// positive.
+    #[inline]
     pub fn has_pk_bytes(&self, key: &[u8]) -> bool {
         let mut w: i64 = 0;
         self.for_each_pk_candidate(key, |row| w += row.weight());

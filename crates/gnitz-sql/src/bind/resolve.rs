@@ -1,6 +1,6 @@
 use crate::ast_util::{classify_from, extract_table_factor_name, is_bare_wildcard_projection, FromShape};
 use crate::error::GnitzSqlError;
-use gnitz_core::{ColumnDef, GnitzClient, RelClass, Schema};
+use gnitz_core::{ColumnDef, GnitzClient, ReadTarget, RelClass, Schema};
 use sqlparser::ast::{Expr, Select, SelectItem, TableAliasColumnDef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -108,7 +108,7 @@ impl<'a> Binder<'a> {
     /// Resolve `name` to its id, schema and provenance. The provenance rides the
     /// same entry as the id, so a caller that needs it makes no second lookup and
     /// the two can never disagree.
-    pub(crate) fn resolve(&mut self, client: &mut GnitzClient, name: &str) -> Result<Resolved, GnitzSqlError> {
+    pub(crate) fn resolve(&mut self, reads: &mut dyn ReadTarget, name: &str) -> Result<Resolved, GnitzSqlError> {
         // Probe with the canonical key — the cache holds base-table resolutions
         // *and* CTE/derived-table aliases (which never reach the catalog).
         if let Some(entry) = self.cache.get(&name.to_ascii_lowercase()) {
@@ -122,7 +122,7 @@ impl<'a> Binder<'a> {
         // on insert (`cache_alias` validates; `cache_relation` is fed from these
         // already-validated probes), never a raw `__h…` catalog name.
         crate::validate::validate_user_name(name)?;
-        let (schema, rel) = client.resolve_relation(self.schema_name, name)?;
+        let (schema, rel) = reads.resolve_relation(self.schema_name, name)?;
         // Leaf rule. A bounded view's store keeps only skeleton rows past its
         // capacity, and hydrating them replays *sources* — so a view over one
         // would have to hydrate through it, and its own store would be a second
@@ -260,7 +260,7 @@ pub(crate) fn apply_positional_aliases(
 /// that compiled to a chain-minted segment inherits that segment's `None`, so the
 /// alias never claims a catalog id it does not have.
 pub(crate) fn cte_passthrough(
-    client: &mut GnitzClient,
+    reads: &mut dyn ReadTarget,
     cte_select: &Select,
     column_aliases: &[TableAliasColumnDef],
     binder: &mut Binder<'_>,
@@ -270,7 +270,7 @@ pub(crate) fn cte_passthrough(
         return Ok(None);
     }
     let cte_table_name = extract_table_factor_name(&cte_select.from[0].relation, "CTE")?;
-    let (cte_tid, cte_schema, cte_kind) = binder.resolve(client, &cte_table_name)?;
+    let (cte_tid, cte_schema, cte_kind) = binder.resolve(reads, &cte_table_name)?;
     // Positional identity projection: `*`, or one identifier per source column in
     // order. The qualified form (`SELECT t.a, t.b FROM t`) parses as `CompoundIdentifier`
     // and is the same positional pass-through; a dup-named source fails the per-position

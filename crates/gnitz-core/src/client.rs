@@ -1,5 +1,5 @@
 use crate::connection::{
-    MultiScanResult, RelTarget, ScanResult, Session, COL_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
+    MultiScanResult, RawBlock, RelTarget, ScanResult, Session, COL_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
 };
 use crate::error::ClientError;
 use crate::protocol::{
@@ -51,7 +51,7 @@ fn canon_name(name: &str) -> String {
 
 /// The canonical `"schema.relation"` key — the engine's `entity_by_qname` key
 /// and the statement memo's. Built in one allocation, not three.
-fn qualified_name(schema_name: &str, name: &str) -> String {
+pub fn qualified_name(schema_name: &str, name: &str) -> String {
     let mut q = String::with_capacity(schema_name.len() + 1 + name.len());
     q.push_str(schema_name);
     q.push('.');
@@ -212,13 +212,25 @@ impl DeltaCursor {
         DeltaCursor { tag, tick }
     }
 
-    /// True when `self` and `other` name the same boot and the same relation, so
-    /// `self` may be advanced to `other`. The rule
-    /// [`GnitzClient::delta_poll`](crate::GnitzClient::delta_poll) enforces: a
-    /// mismatch is refused as [`ClientError::DeltaExpired`] rather than returned
-    /// as rows, because the rows a foreign cursor draws are unsafe to apply.
-    pub fn continues(self, other: DeltaCursor) -> bool {
-        self.tag == other.tag
+    /// The tick a poll from this cursor reads after.
+    ///
+    /// Tick `0` is **refused**: it names no copy to protect and no tag to match,
+    /// so it could only mean a bootstrap — and a bootstrap walks the view's own
+    /// store and comes back in the view's schema, not the [`delta_reply_schema`]
+    /// shape a poll takes.
+    fn poll_after(self) -> Result<u64, ClientError> {
+        (self.tick != 0).then_some(self.tick).ok_or(ClientError::DeltaExpired)
+    }
+
+    /// `next` as this cursor's successor, or [`ClientError::DeltaExpired`].
+    ///
+    /// A tag the server did not echo back names a different boot or a different
+    /// relation, and the rows such a read draws are unsafe to apply: they are the
+    /// *other* relation's recent deltas, and a recreated view's backfill never
+    /// enters a delta store at all. The recovery is the one a cursor that fell out
+    /// of the retention window gets — discard the copy and bootstrap.
+    fn advanced_to(self, next: DeltaCursor) -> Result<DeltaCursor, ClientError> {
+        (self.tag == next.tag).then_some(next).ok_or(ClientError::DeltaExpired)
     }
 }
 
@@ -243,6 +255,38 @@ pub fn delta_reply_schema(view: &Schema) -> Schema {
     }
     let pk_cols = (0..=view.pk_count()).collect();
     Schema { columns, pk_cols }
+}
+
+impl crate::read_target::ReadTarget for GnitzClient {
+    fn begin_statement(&mut self) {
+        GnitzClient::begin_statement(self)
+    }
+
+    fn end_statement(&mut self) {
+        GnitzClient::end_statement(self)
+    }
+
+    fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(Arc<Schema>, RelKind), ClientError> {
+        GnitzClient::resolve_relation(self, schema_name, name)
+    }
+
+    fn scan(&mut self, table_id: u64) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), ClientError> {
+        let (schema, data, _lsn) = GnitzClient::scan(self, table_id)?;
+        Ok((schema, data))
+    }
+
+    fn scan_spec(
+        &mut self,
+        table_id: u64,
+        spec: &[u8],
+        reply_schema: &Schema,
+    ) -> Result<Option<ZSetBatch>, ClientError> {
+        GnitzClient::scan_spec(self, table_id, spec, reply_schema)
+    }
+
+    fn table_indexes(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
+        GnitzClient::table_indexes(self, table_id)
+    }
 }
 
 /// A relation's class resolved together with its id, so the two cannot disagree.
@@ -579,23 +623,13 @@ impl GnitzClient {
     /// Apply what comes back and store the new cursor; there is nothing to
     /// filter and nothing to reconcile.
     ///
-    /// A cursor whose tag does not match the returned one names a different boot
-    /// or a different relation — a restart, or a `DROP VIEW v; CREATE VIEW v …`.
-    /// **This refuses it** rather than handing back rows that are unsafe to
-    /// apply: the reply would carry the *other* relation's recent deltas, and a
-    /// recreated view's backfill never enters a delta store at all, so applying
-    /// them silently yields a copy missing everything before the cursor. The
-    /// answer is [`ClientError::DeltaExpired`] — the same error, and the same
-    /// recovery, as a cursor that fell out of the retention window: discard the
-    /// copy and [`delta_bootstrap`](Self::delta_bootstrap) again.
-    ///
-    /// A cursor at tick `0` is **refused**, not silently answered. It names no
-    /// copy to protect and no tag to match, so it could only mean a bootstrap —
-    /// but a bootstrap walks the view's own store and comes back in the view's
-    /// schema, not in the [`delta_reply_schema`] shape this call is documented to
-    /// take, so answering it here would fail the worker's identity-layout check
-    /// and surface as an opaque `STATUS_ERROR`. Call
-    /// [`delta_bootstrap`](Self::delta_bootstrap), which names its schema.
+    /// Both refusals a poll can answer with — a cursor at tick `0`, and a reply
+    /// whose tag does not continue the cursor — are
+    /// [`DeltaCursor::poll_after`] and [`DeltaCursor::advanced_to`], which state
+    /// the rule once for this call and for
+    /// [`delta_poll_raw`](Self::delta_poll_raw). Both surface as
+    /// [`ClientError::DeltaExpired`], whose recovery is to discard the copy and
+    /// [`delta_bootstrap`](Self::delta_bootstrap) again.
     ///
     /// A poll does **not** drive a tick: a delta read answers "what has
     /// happened", not "what is current", so a push the tick loop has not run yet
@@ -606,32 +640,69 @@ impl GnitzClient {
         cursor: DeltaCursor,
         reply_schema: &Schema,
     ) -> Result<(Option<ZSetBatch>, DeltaCursor), ClientError> {
-        if cursor.tick == 0 {
-            return Err(ClientError::DeltaExpired);
-        }
-        let (data, next) = self.delta_read(view_id, cursor.tick, reply_schema)?;
-        if !cursor.continues(next) {
-            return Err(ClientError::DeltaExpired);
-        }
-        Ok((data, next))
+        let (data, next) = self.delta_read(view_id, cursor.poll_after()?, reply_schema)?;
+        Ok((data, cursor.advanced_to(next)?))
     }
 
-    /// The one request both delta calls make: a `ScanSpec` with a
-    /// `ReadBound::Delta` and an identity sink, returning the rows and the
-    /// terminal frame's `(tag, T)` pair.
+    /// [`Self::delta_bootstrap`] handing back the reply's *undecoded* blocks.
+    ///
+    /// For a subscriber that feeds the rows into a store rather than reading
+    /// them: decoding to a `ZSetBatch` walks every OPK key back to a native
+    /// value, and re-encoding it costs the walk again plus a second full region
+    /// copy — to reconstruct the block the socket already delivered.
+    pub fn delta_bootstrap_raw(
+        &mut self,
+        view_id: u64,
+        view_schema: &Schema,
+    ) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
+        self.delta_read_raw(view_id, 0, view_schema)
+    }
+
+    /// [`Self::delta_poll`] handing back the reply's *undecoded* blocks, under
+    /// the same two cursor rules.
+    pub fn delta_poll_raw(
+        &mut self,
+        view_id: u64,
+        cursor: DeltaCursor,
+        reply_schema: &Schema,
+    ) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
+        let (blocks, next) = self.delta_read_raw(view_id, cursor.poll_after()?, reply_schema)?;
+        Ok((blocks, cursor.advanced_to(next)?))
+    }
+
+    /// The one request every delta call makes: a `ScanSpec` with a
+    /// `ReadBound::Delta` and an identity sink.
+    fn delta_spec(after_tick: u64) -> Vec<u8> {
+        gnitz_wire::ReadSpec::encode_parts(
+            &gnitz_wire::ReadBound::Delta { after_tick },
+            &[],
+            &gnitz_wire::ReadSink::all_rows(),
+        )
+    }
+
+    /// [`Self::delta_spec`] shipped, returning the rows and the terminal frame's
+    /// `(tag, T)` pair.
     fn delta_read(
         &mut self,
         view_id: u64,
         after_tick: u64,
         reply_schema: &Schema,
     ) -> Result<(Option<ZSetBatch>, DeltaCursor), ClientError> {
-        let spec = gnitz_wire::ReadSpec::encode_parts(
-            &gnitz_wire::ReadBound::Delta { after_tick },
-            &[],
-            &gnitz_wire::ReadSink::all_rows(),
-        );
+        let spec = Self::delta_spec(after_tick);
         let (data, watermark) = self.session.scan_spec(view_id, &spec, reply_schema)?;
         Ok((data, DeltaCursor::from_watermark(watermark)))
+    }
+
+    /// [`Self::delta_read`] keeping the reply's raw blocks.
+    fn delta_read_raw(
+        &mut self,
+        view_id: u64,
+        after_tick: u64,
+        reply_schema: &Schema,
+    ) -> Result<(Vec<RawBlock>, DeltaCursor), ClientError> {
+        let spec = Self::delta_spec(after_tick);
+        let (blocks, watermark) = self.session.scan_spec_raw(view_id, &spec, reply_schema)?;
+        Ok((blocks, DeltaCursor::from_watermark(watermark)))
     }
 
     /// Consistent snapshot of N relations at one server-side SAL cut, returned
@@ -1701,6 +1772,18 @@ impl GnitzClient {
             schema,
             indexes: Arc::new(blob.indexes),
         })))
+    }
+
+    /// Resolve `schema_name` to its SCHEMA_TAB id.
+    ///
+    /// The resolve reply carries a relation's class, flags, FKs, indexes and
+    /// columns but not the id of the schema it lives in, so a caller writing
+    /// catalog rows of its own needs this scan. It is the same one every DDL
+    /// path takes, so a caller cannot end up with a different id than the
+    /// server's for the same name.
+    pub fn schema_id(&mut self, name: &str) -> Result<u64, ClientError> {
+        let canonical = canon_name(name);
+        self.lookup_schema_id(&canonical)
     }
 
     // --- Private catalog-lookup helpers ---

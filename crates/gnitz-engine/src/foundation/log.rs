@@ -47,10 +47,10 @@ pub fn is_info() -> bool {
 
 /// Format and write a log line to stderr. Called by macros, not directly.
 ///
-/// Formats straight into a fixed stack buffer — no heap allocation, so
-/// `gnitz_fatal_abort!` can log with a broken SAL mmap — and has no panic
-/// paths. An over-long message is truncated; the trailing `\n` is always the
-/// final byte, so even a truncated line terminates inside the one `write(2)`.
+/// Formats straight into a fixed stack buffer — no heap allocation, so a
+/// fail-stop path can log with a broken SAL mmap — and has no panic paths. An
+/// over-long message is truncated; the trailing `\n` is always the final byte,
+/// so even a truncated line terminates inside the one `write(2)`.
 #[cold]
 pub fn _emit(level_tag: &str, args: core::fmt::Arguments<'_>) {
     let mut buf = [0u8; LINE_MAX];
@@ -58,18 +58,6 @@ pub fn _emit(level_tag: &str, args: core::fmt::Arguments<'_>) {
     unsafe {
         libc::write(2, buf.as_ptr() as *const libc::c_void, len);
     }
-}
-
-/// Terminate the process with exit code 134 (= 128 + SIGABRT) without running
-/// atexit handlers, TLS destructors or a stdio flush. Called by
-/// [`gnitz_fatal_abort!`]; it lives here so the macro expands to no unqualified
-/// `libc` path and a consumer needs no `libc` of its own.
-///
-/// Diverges, like the `_exit` it wraps: `gnitz_fatal_abort!` is used in
-/// value positions (a match arm whose siblings yield values), which a `()`
-/// return would break.
-pub fn _abort_134() -> ! {
-    unsafe { libc::_exit(134) }
 }
 
 /// Truncating `fmt::Write` over a fixed buffer: keeps what fits, silently
@@ -150,24 +138,6 @@ macro_rules! gnitz_debug {
             $crate::foundation::log::_emit("DEBUG", format_args!($($arg)*));
         }
     };
-}
-
-/// Emit a FATAL log line and immediately terminate **the calling process** with
-/// exit code 134 (= 128 + SIGABRT), through [`_abort_134`].
-///
-/// The termination is unconditional and uninterceptable: `_exit` runs no atexit
-/// handler, no TLS destructor, no `Drop` and no stdio flush, `catch_unwind` does
-/// not see it, and no wrapper can intercept it. None of those are safe to run
-/// with a broken SAL mmap or in-flight io_uring SQEs, which is why the engine
-/// uses it — but a caller that cannot afford to lose its process must not reach
-/// any path that can invoke this. The exit code matches the "aborted"
-/// convention systemd/monit expect.
-#[macro_export]
-macro_rules! gnitz_fatal_abort {
-    ($($arg:tt)*) => {{
-        $crate::foundation::log::_emit("FATAL", format_args!($($arg)*));
-        $crate::foundation::log::_abort_134()
-    }};
 }
 
 #[cfg(test)]
