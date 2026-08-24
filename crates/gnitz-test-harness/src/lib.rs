@@ -390,6 +390,13 @@ fn configure_command(paths: &BootPaths, workers: usize, extra_env: &[(&str, &str
     if env::var_os("GNITZ_SAL_BYTES").is_none() {
         cmd.env("GNITZ_SAL_BYTES", "134217728"); // 128 MiB
     }
+
+    // A parallel `cargo test` run is one server per test, and each would derive
+    // its placement from `sched_getaffinity` knowing nothing of the others, so
+    // the whole fleet pins onto the same cores. Unless the caller asked for it.
+    if env::var_os("GNITZ_CPU_AFFINITY").is_none() {
+        cmd.env("GNITZ_CPU_AFFINITY", "0");
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

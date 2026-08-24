@@ -11,11 +11,11 @@ import gnitz
 from _paths import REPO_ROOT
 from _serverproc import (
     NUM_WORKERS,
-    TEST_SAL_BYTES,
     ServerProc,
     is_debug_build,
     server_binary,
     server_preexec,
+    test_server_env,
 )
 
 _TMP_DIR = str(REPO_ROOT / "tmp")
@@ -170,8 +170,7 @@ class _Server:
             cmd += [f"--log-level={ll}"]
         # Append so a restart does not discard the log that contains the crash.
         self._stderr_f = open(_LOG_PATH, "a")
-        env = os.environ.copy()
-        env.setdefault("GNITZ_SAL_BYTES", TEST_SAL_BYTES)
+        env = test_server_env()
         # preexec_fn ties the master's life to pytest's (PR_SET_PDEATHSIG): an
         # interrupted run (Ctrl-C / SIGKILL / crash) can't orphan the server.
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=self._stderr_f,

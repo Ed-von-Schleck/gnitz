@@ -395,6 +395,7 @@ The knobs a session usually reaches for. This is not the full set — every
 |-----|--------|
 | `GNITZ_WORKERS` | Worker count (Makefile/tests → server `--workers`) |
 | `GNITZ_LOG_LEVEL` | `quiet` / `normal` / `verbose` (`debug` = alias) |
+| `GNITZ_CPU_AFFINITY` | Pin master and workers to CPUs (default on); `0` when servers share a host |
 | `GNITZ_SERVER_BIN` | Override server binary (e.g. aim E2E at the release build) |
 | `GNITZ_CHECKPOINT_BYTES` | SAL checkpoint threshold |
 | `GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES` | CREATE UNIQUE INDEX pre-flight in-RAM sort budget before spilling to disk |

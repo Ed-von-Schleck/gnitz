@@ -19,6 +19,7 @@ use gnitz_engine::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::foundation::posix_io;
 
+use crate::runtime::affinity;
 use crate::runtime::executor::{ServerExecutor, TlsListener};
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::posix;
@@ -753,6 +754,7 @@ fn run_worker_child(
     catalog_ptr: *mut CatalogEngine,
     ipc: &SharedIpc,
     boot_epoch: u32,
+    placement: Option<&affinity::Placement>,
 ) -> ! {
     // Die immediately if the master exits for any reason.  The getppid() check
     // in sal_reader.wait() is a belt-and-suspenders fallback; this closes the
@@ -794,6 +796,14 @@ fn run_worker_child(
     // recovery below emits carries `W{w}` rather than the inherited master tag.
     gnitz_engine::foundation::log::init(log_level, format!("W{w}").as_bytes());
 
+    // Pin after the log re-tag, so a failed pin is recorded in this worker's own
+    // `worker_N.log` rather than the master's stdout, and before every
+    // allocation below — trim, re-home, index rebuild, SAL replay, backfill —
+    // whose first touch decides which node its memory lands on.
+    if let Some(p) = placement {
+        p.pin_worker(w);
+    }
+
     // Close M2W eventfds of OTHER workers (W2M uses futex, no fd).
     for (j, &efd) in ipc.m2w_efds.iter().enumerate() {
         if j != w {
@@ -832,7 +842,7 @@ fn run_worker_child(
     // zeroes the SAL sentinel.
     let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) = match catalog
         .rehome_stores()
-        .map_err(|e| format!("W{w} rehome stores failed: {e}"))
+        .map_err(|e| format!("rehome stores failed: {e}"))
         .and_then(|()| worker_boot_recovery(catalog, ipc.sal_ptr as *const u8, w as u32, num_workers, boot_epoch - 1))
     {
         Ok(pd) => (pd, None),
@@ -875,12 +885,29 @@ fn run_server(
     // Raise fd limit (child directories + shard files)
     posix::raise_fd_limit(65536);
 
+    // Pin the master before `CatalogEngine::open`: the boot-time system-table
+    // flush below creates the master's first io_uring ring, and an io-wq pool
+    // keeps the mask its ring's creating thread held. Each forked child then
+    // inherits this mask until its own pin narrows it. See `runtime::affinity`
+    // for the placement itself and what it assumes about the host.
+    let nw = num_workers as usize;
+    let placement = match affinity::plan(nw) {
+        Ok(p) => {
+            boot_log(&format!("affinity: {}\n", p.describe()));
+            p.pin_master();
+            Some(p)
+        }
+        Err(why) => {
+            boot_log(&format!("affinity: not applied ({why})\n"));
+            None
+        }
+    };
+
     gnitz_info!("Opening database at {}", data_dir);
 
     let catalog = CatalogEngine::open(data_dir, num_workers).map_err(|e| format!("failed to open catalog: {e}"))?;
     let catalog_ptr = Box::into_raw(Box::new(catalog));
 
-    let nw = num_workers as usize;
     boot_log(&format!("Starting {num_workers} workers\n"));
     boot_log(&format!(
         "Worker logs: {}/worker_N.log (N=0..{})\n",
@@ -986,6 +1013,7 @@ fn run_server(
                 catalog_ptr,
                 &ipc,
                 boot_epoch,
+                placement.as_ref(),
             );
         }
         *slot = pid;

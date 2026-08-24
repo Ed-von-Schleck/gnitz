@@ -39,11 +39,27 @@ _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 # skip and the `--workers` a server is actually spawned with can never disagree.
 NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
 
-# Each server fallocates its whole SAL at startup, so the 1 GiB production
-# default would have a suite that spawns ~100 servers write 100 GiB. E2E tests
-# are functional (small writes), so cap it — unless the caller pinned a size,
-# which the SAL-sizing tests do.
-TEST_SAL_BYTES = str(128 * 1024 * 1024)
+def test_server_env():
+    """The environment every test-spawned server boots in: this process's, plus
+    the defaults below wherever the caller has not set one itself.
+
+    One definition, because a suite runs several servers at once — the shared
+    session server outlives every `own_server` — and a default that only some
+    spawn sites remember is a default that does not hold.
+
+    `GNITZ_SAL_BYTES`: each server fallocates its whole SAL at startup, so the
+    1 GiB production default would have a suite that spawns ~100 servers write
+    100 GiB. E2E tests are functional, so cap it — unless the caller pinned a
+    size, which the SAL-sizing tests do.
+
+    `GNITZ_CPU_AFFINITY`: the placement is derived from `sched_getaffinity` and
+    knows nothing of other tenants, so concurrent servers pin onto each other's
+    cores.
+    """
+    env = os.environ.copy()
+    for k, v in (("GNITZ_SAL_BYTES", str(128 * 1024 * 1024)), ("GNITZ_CPU_AFFINITY", "0")):
+        env.setdefault(k, v)
+    return env
 
 
 def server_preexec():
@@ -98,8 +114,7 @@ class ServerProc:
     # ── spawning ─────────────────────────────────────────────────────────────
 
     def _popen(self, spawn_env):
-        env = os.environ.copy()
-        env.setdefault("GNITZ_SAL_BYTES", TEST_SAL_BYTES)
+        env = test_server_env()
         env.update(self.extra_env)     # config of this server, every boot
         env.update(spawn_env or {})    # this boot only
         # A killed server leaves its socket behind and the next bind would fail.

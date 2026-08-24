@@ -2,7 +2,7 @@
 //! leaf keeps its own narrow surface; this module only groups them so the
 //! layering reads cleanly. The leaves share nothing but being leaves:
 //!   - `log`        — the `gnitz_*` logging macros + level/tag state
-//!   - `env`        — numeric `GNITZ_*` environment-variable overrides
+//!   - `env`        — `GNITZ_*` environment-variable overrides
 //!   - `fault`      — debug-only `GNITZ_INJECT_*` fault-injection seams
 //!   - `xxh`        — XXH3 hashing
 //!   - `posix_io`   — POSIX file-I/O and mmap wrappers. The server's IPC and

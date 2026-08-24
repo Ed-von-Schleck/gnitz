@@ -238,7 +238,7 @@ fn new_ring() -> Result<Option<io_uring::IoUring>, StorageError> {
         Some(false) => return Ok(None),
         Some(true) => {}
         // Undecided, so the env override gets its say before the first attempt.
-        None if crate::foundation::env::env_flag("GNITZ_DISABLE_IO_URING") => {
+        None if crate::foundation::env::env_flag("GNITZ_DISABLE_IO_URING", false) => {
             let _ = IO_URING_USABLE.set(false);
             return Ok(None);
         }

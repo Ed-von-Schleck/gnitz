@@ -59,6 +59,8 @@ Options:
 Environment:
   GNITZ_LOG_LEVEL          Same as --log-level; CLI flag takes precedence
   GNITZ_CHECKPOINT_BYTES   SAL checkpoint threshold in bytes (default: 75% of SAL size)
+  GNITZ_CPU_AFFINITY       Pin the master and each worker to CPUs (default: on; 0 disables).
+                           Set to 0 when servers share a host without per-server cpusets.
 ";
 
 fn parse_level(s: &str) -> u32 {

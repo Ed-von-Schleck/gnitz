@@ -1,7 +1,8 @@
 //! Environment-variable overrides — the one parse rule for every `GNITZ_*`
-//! knob: a missing, unparseable, or zero value falls back to `default`, so an
-//! override can never zero out a knob whose consumer requires a positive value.
-//! Call-site-specific clamps and `OnceLock` caching stay local to the consumer.
+//! knob: a missing or unparseable value falls back to the `default` the reader
+//! names. `env_num` additionally refuses a zero, because its consumers require
+//! a positive value. Call-site-specific clamps and `OnceLock` caching stay
+//! local to the consumer.
 
 /// A positive-integer env override: a 0 or unparseable value falls back to
 /// `default`.
@@ -13,8 +14,22 @@ pub fn env_num<T: std::str::FromStr + Default + PartialOrd>(name: &str, default:
         .unwrap_or(default)
 }
 
-/// A boolean env override: set to anything but `0` or the empty string turns
-/// the flag on. Unset is off.
-pub fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0")
+/// A boolean env override: `0` or the empty string turn it off, any other value
+/// turns it on. Unset falls back to `default`.
+pub fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name).map_or(default, |v| !v.is_empty() && v != "0")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unset variable is whatever the reader asked for, either way round.
+    /// Hermetic: nothing here mutates the process environment, which the
+    /// thread-per-test runner would let another test observe.
+    #[test]
+    fn an_unset_flag_reads_as_its_default() {
+        assert!(env_flag("GNITZ_UNSET_FLAG_FOR_TEST", true));
+        assert!(!env_flag("GNITZ_UNSET_FLAG_FOR_TEST", false));
+    }
 }
