@@ -276,6 +276,27 @@ def own_server(server_dirs):
         proc.stop()
 
 
+# A delta store spills once its RAM tier crosses this ceiling; shrinking it is
+# how the capacity sweep is reached on small data, exactly as the bounded-view
+# tests reach it.
+_SWEEP_ENV = {"GNITZ_RAM_TIER_BYTES": "1024", "GNITZ_CHECKPOINT_BYTES": str(32 * 1024)}
+
+
+@pytest.fixture
+def sweeping_server(server_dirs):
+    """A server whose delta stores sweep on modest data, for the retention and
+    cursor-expiry cases. Shared by the delta-feed suite and the mirror suite —
+    the mirror's own expiry recovery is the same event seen from the other
+    side."""
+    data_dir, sock_path = server_dirs
+    proc = ServerProc(data_dir, sock_path, extra_env=dict(_SWEEP_ENV))
+    proc.start()
+    try:
+        yield proc
+    finally:
+        proc.stop()
+
+
 @pytest.fixture(scope="session")
 def _srv(tmp_path_factory, _sock_path):
     """Session-scoped mutable server handle shared by all per-class and per-test fixtures."""
@@ -301,6 +322,37 @@ def client(_srv):
     """Per-test connection.  Always resolves through _srv so it follows restarts."""
     with gnitz.connect(_srv.target) as conn:
         yield conn
+
+
+# ── mirror fixtures ───────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def mirror_dir(tmp_path):
+    """A private data directory for one `gnitz.Mirror`, reclaimed with the test."""
+    return str(tmp_path / "mirror")
+
+
+@pytest.fixture
+def mirror_on():
+    """Factory taking `gnitz.Mirror`'s own arguments — `mirror_on(base_dir,
+    target)` — and closing the handle at teardown however the test left it.
+
+    Closing is not tidiness. pytest is one process, and a mirror handle takes a
+    process-global latch: the next test's `Mirror(...)` is refused while this one
+    lives.
+    """
+    with contextlib.ExitStack() as stack:
+        def make(base_dir, target):
+            return stack.enter_context(gnitz.Mirror(base_dir, target))
+
+        yield make
+
+
+@pytest.fixture
+def mirror(mirror_on, server, mirror_dir):
+    """A handle on the session server at `mirror_dir`."""
+    return mirror_on(mirror_dir, server)
 
 
 @pytest.fixture

@@ -81,11 +81,11 @@ fn stale_schema_retraction_spares_the_live_schemas_directory() {
     let cols = vec![col_def("id", type_code::U64)];
 
     engine.create_schema("s").unwrap();
-    let old_sid = engine.get_schema_id("s");
+    let old_sid = engine.schema_id("s").expect("the schema exists");
     engine.drop_schema("s").unwrap();
     engine.defer_pending_dir_deletions(); // the DROP-success path
     engine.create_schema("s").unwrap();
-    let new_sid = engine.get_schema_id("s");
+    let new_sid = engine.schema_id("s").expect("the schema exists");
     assert_ne!(old_sid, new_sid, "the recreate must allocate a fresh id");
     let tid = engine.create_table("s.t", &cols, &[0]).unwrap();
     let tbl_dir = format!("{dir}/s/t_{tid}");
@@ -125,7 +125,7 @@ fn schema_retraction_under_another_schemas_name_rejected() {
 
     engine.create_schema("a").unwrap();
     engine.create_schema("b").unwrap();
-    let sid_a = engine.get_schema_id("a");
+    let sid_a = engine.schema_id("a").expect("the schema exists");
     let tid = engine.create_table("b.t", &cols, &[0]).unwrap();
     let b_dir = format!("{dir}/b");
 
@@ -302,7 +302,7 @@ fn duplicate_live_head_rejected_for_index_and_schema() {
     assert_eq!(idx_weights_for(&engine, idx), vec![1]);
 
     engine.create_schema("s").unwrap();
-    let sid = engine.get_schema_id("s");
+    let sid = engine.schema_id("s").expect("the schema exists");
     let err = engine
         .ingest_to_family(SCHEMA_TAB_ID, &schema_tab_batch(sid, 1, "s"))
         .unwrap_err();

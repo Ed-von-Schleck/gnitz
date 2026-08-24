@@ -209,10 +209,10 @@ fn test_edge_cases() {
 
     // 13. Recreated schema gets new ID
     engine.create_schema("temp").unwrap();
-    let sid1 = engine.get_schema_id("temp");
+    let sid1 = engine.schema_id("temp").expect("the schema exists");
     engine.drop_schema("temp").unwrap();
     engine.create_schema("temp").unwrap();
-    let sid2 = engine.get_schema_id("temp");
+    let sid2 = engine.schema_id("temp").expect("the schema exists");
     assert_ne!(sid1, sid2);
     engine.drop_schema("temp").unwrap();
 
@@ -253,7 +253,7 @@ fn test_edge_cases() {
     engine.drop_table("public.casetest").unwrap();
 
     // 24. Invalid schema ID lookup
-    assert_eq!(engine.get_schema_id("nonexistent"), -1);
+    assert_eq!(engine.schema_id("nonexistent"), None);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -275,7 +275,7 @@ fn test_nonempty_schema_drop_rejected() {
     let tid = engine
         .create_table("s.t", &[col_def("id", type_code::U64)], &[0])
         .unwrap();
-    let sid = engine.get_schema_id("s");
+    let sid = engine.schema_id("s").expect("the schema exists");
     assert!(!engine.schema_is_empty("s"), "precondition: schema has a member");
     assert!(engine.pending_dir_deletions.is_empty(), "precondition: no dir queued");
 

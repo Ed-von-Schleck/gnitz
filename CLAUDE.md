@@ -323,7 +323,8 @@ Two sides that meet at the wire protocol: the **SQL/client side** (a library,
 also exposed as C and Python bindings) plans and drives queries, and ships them
 over `gnitz-wire`; the **engine** executes them as a multi-process server and
 never links the planner. `gnitz-mirror` is the sole crate on both sides, and
-links no planner either.
+links no planner either; `gnitz-py` links it, so the Python extension carries the
+engine too.
 
 ### Workspace crates
 
@@ -334,7 +335,7 @@ links no planner either.
 | `gnitz-core` | Client core: connection, protocol, and the logical type / expression / circuit model | `wire`, `expr` |
 | `gnitz-sql` | SQL front end: parser, binder, query planner | `core`, `expr`, `wire` |
 | `gnitz-capi` | C ABI bindings over the client core + planner | `core`, `sql` |
-| `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `sql`, `wire` |
+| `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `mirror`, `sql`, `wire` |
 | `gnitz-engine` | The single-node database as a library: Z-set store, DBSP operators, circuit compiler, catalog | `wire`, `expr` |
 | `gnitz-server` | The multi-process server binary — the `runtime` rung and nothing else | `engine`, `wire`, `expr` |
 | `gnitz-mirror` | The client mirror: a local copy of a view answering reads in the host's process — the one crate on both sides, and a leaf | `core`, `engine`, `wire` |
@@ -577,6 +578,13 @@ A **mirror** (`gnitz-mirror`) is a local copy of a view fed by that feed, read i
 the host's process at its last polled round: not read-your-own-writes, and two
 mirrors are no consistent cut; an unheld relation is delegated upstream. One live
 handle per process, one process per data directory; it poisons on an ingest error.
+It is reachable from Python as `gnitz.Mirror`, opened on a private data directory
+under the same one-per-process rule.
+
+**A poll reports, per view, whether it reseeded** — discarded the copy and read
+the view whole. That is a discontinuity every subscriber has to react to, and no
+cursor carries it: an expiry-driven reseed inside one boot keeps the tag and moves
+the tick forward, which is exactly what an ordinary advance looks like.
 
 A view whose STRING/BLOB rows on one worker exceed the reply frame cap **cannot
 be mirrored**: such a reply goes out as one frame, and a bootstrap reads the view

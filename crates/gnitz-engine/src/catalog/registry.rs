@@ -110,13 +110,14 @@ impl CatalogEngine {
         self.dag.tables.contains_key(&table_id)
     }
 
-    pub fn has_schema(&self, name: &str) -> bool {
-        self.caches.schema_by_name.contains_key(name)
+    /// The id this catalog holds for schema `name`, or `None` when it holds no
+    /// such schema.
+    pub fn schema_id(&self, name: &str) -> Option<i64> {
+        self.caches.schema_by_name.get(name).copied()
     }
 
-    #[cfg(test)]
-    pub(crate) fn get_schema_id(&self, name: &str) -> i64 {
-        self.caches.schema_by_name.get(name).copied().unwrap_or(-1)
+    pub fn has_schema(&self, name: &str) -> bool {
+        self.schema_id(name).is_some()
     }
 
     /// Number of live member relations (tables + views) in schema `sid`. Reads

@@ -89,7 +89,7 @@ impl CatalogEngine {
         if !self.has_schema(name) {
             return Err("Schema does not exist".into());
         }
-        let sid = self.get_schema_id(name);
+        let sid = self.schema_id(name).expect("the schema exists");
 
         let members: Vec<i64> = self
             .caches
@@ -154,7 +154,7 @@ impl CatalogEngine {
 
         let tid = self.allocate_table_id().unwrap();
         validate_relation_defs(RelationKind::BaseTable, tid, table_name, col_defs, &pk)?;
-        let sid = self.get_schema_id(schema_name);
+        let sid = self.schema_id(schema_name).expect("the schema exists");
         self.validate_fk_columns(tid, col_defs, pk.as_slice())?;
 
         // This in-process test shortcut always builds a keyed, full-PK-distributed

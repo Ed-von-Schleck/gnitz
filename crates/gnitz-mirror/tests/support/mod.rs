@@ -32,7 +32,11 @@ pub fn sql(client: &mut GnitzClient, schema: &str, statements: &str) {
 
 /// Run one `SELECT` and return `(schema, rows)`.
 pub fn query(reads: &mut dyn gnitz_core::ReadTarget, schema: &str, s: &str) -> (Schema, ZSetBatch) {
-    match gnitz_sql::execute_query(reads, schema, s).unwrap_or_else(|e| panic!("{s}: {e}")) {
+    let mut results = SqlPlanner::new(reads, schema)
+        .execute(s)
+        .unwrap_or_else(|e| panic!("{s}: {e}"));
+    assert_eq!(results.len(), 1, "{s} is not one statement");
+    match results.remove(0) {
         SqlResult::Rows { schema, batch } => (schema, batch),
         other => panic!("{s} did not return rows: {other:?}"),
     }
@@ -54,9 +58,21 @@ pub type Row = (Vec<u8>, Vec<Option<Vec<u8>>>);
 /// comparison would accept a replicated view read as if it were keyed, which
 /// returns W copies and inflates every weight W-fold while replying OK.
 pub fn canonical(schema: &Schema, batch: &ZSetBatch) -> BTreeMap<Row, i64> {
+    let mut out: BTreeMap<Row, i64> = BTreeMap::new();
+    for (row, w) in canonical_rows(schema, batch) {
+        *out.entry(row).or_insert(0) += w;
+    }
+    out.retain(|_, w| *w != 0);
+    out
+}
+
+/// The same canonical rows **in reply order**, weights beside them — what an
+/// `ORDER BY` comparison needs, since the multiset above is order-blind and so
+/// accepts the right rows in the wrong order.
+pub fn canonical_rows(schema: &Schema, batch: &ZSetBatch) -> Vec<(Row, i64)> {
     let stride = schema.pk_stride();
     let codes: Vec<(usize, u8)> = schema.pk_col_codes().collect();
-    let mut out: BTreeMap<Row, i64> = BTreeMap::new();
+    let mut out: Vec<(Row, i64)> = Vec::with_capacity(batch.weights.len());
     for row in 0..batch.weights.len() {
         let mut opk = vec![0u8; stride];
         gnitz_wire::encode_pk_tuple(
@@ -80,9 +96,8 @@ pub fn canonical(schema: &Schema, batch: &ZSetBatch) -> BTreeMap<Row, i64> {
                 })
             })
             .collect();
-        *out.entry((opk, cells)).or_insert(0) += batch.weights[row];
+        out.push(((opk, cells), batch.weights[row]));
     }
-    out.retain(|_, w| *w != 0);
     out
 }
 
@@ -116,6 +131,31 @@ pub fn assert_same_zset(what: &str, a: (&Schema, &ZSetBatch), b: (&Schema, &ZSet
         );
     }
     ca.len()
+}
+
+/// Assert two replies are the same rows in the same order, and refuse the
+/// vacuous pass.
+///
+/// **Only for a query carrying `ORDER BY`.** Row order is otherwise
+/// unspecified, and the mirror is one partition where the server is W, so two
+/// correct replies legitimately differ in sequence.
+pub fn assert_same_sequence(what: &str, a: (&Schema, &ZSetBatch), b: (&Schema, &ZSetBatch)) -> usize {
+    let (ra, rb) = (canonical_rows(a.0, a.1), canonical_rows(b.0, b.1));
+    assert!(
+        !ra.is_empty(),
+        "{what}: the ordered reply is empty, so it agrees about nothing"
+    );
+    assert_eq!(
+        ra.len(),
+        rb.len(),
+        "{what}: the ordered replies are {} rows locally and {} on the server",
+        ra.len(),
+        rb.len()
+    );
+    for (i, (x, y)) in ra.iter().zip(rb.iter()).enumerate() {
+        assert_eq!(x, y, "{what}: the replies differ at position {i}");
+    }
+    ra.len()
 }
 
 /// An env var set for one test and removed on the way out: the tests are threads

@@ -103,26 +103,45 @@ pub fn in_child_test() -> bool {
     std::env::var(CHILD_TEST_VAR).is_ok()
 }
 
+/// What a child prints once it has run every assertion — see [`assert_child_ok`].
+/// A child that must fail-stop instead never reaches it, and its caller asserts
+/// on the exit code.
+pub const CHILD_OK: &str = "the child ran every assertion";
+
 /// Re-run the current test binary filtered to `internal_test`, with `envs` set,
-/// and hand back the child's exit status. A caller asserts the code it expects:
-/// `Some(0)` for a test that must pass under those variables, `Some(134)` for
-/// one that must fail-stop (`_exit(134)` is a normal, non-signal exit on Linux).
+/// and hand back the child's exit status and captured output.
 ///
 /// The reason a test needs a child at all rather than setting the variable
-/// itself: a `Seam` reads its variable once per process into a `OnceLock`, and
-/// the test runner runs a crate's tests as threads of one process, so an
-/// in-process `set_var` would race every other test and lose to whichever seam
-/// read first. A direct in-process fail-stop would also terminate the runner.
-/// `internal_test` must return early unless [`in_child_test`], so a normal test
-/// sweep skips it.
-pub fn run_test_in_child(internal_test: &str, envs: &[(&str, &str)]) -> std::process::ExitStatus {
+/// itself: a `Seam` — and the `io_uring` verdict — reads its variable once per
+/// process into a `OnceLock`, and the test runner runs a crate's tests as
+/// threads of one process, so an in-process `set_var` would race every other
+/// test and lose to whichever read first. A direct in-process fail-stop would
+/// also terminate the runner. `internal_test` must return early unless
+/// [`in_child_test`], so a normal test sweep skips it.
+///
+/// `--exact`, so the filter cannot also pick up a sibling whose name contains
+/// this one.
+pub fn run_test_in_child(internal_test: &str, envs: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-    cmd.arg(internal_test);
+    cmd.arg("--exact").arg(internal_test).arg("--nocapture");
     cmd.env(CHILD_TEST_VAR, "1");
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.status().unwrap()
+    cmd.output().unwrap()
+}
+
+/// Assert the child exited cleanly **and** reached its final [`CHILD_OK`] print.
+/// The exit code alone proves nothing: `libtest` exits 0 when its filter matches
+/// nothing, so renaming a child would otherwise leave its caller green covering
+/// nothing.
+pub fn assert_child_ok(out: &std::process::Output, what: &str) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.code() == Some(0) && stdout.contains(CHILD_OK),
+        "{what}\n-- child stdout --\n{stdout}-- child stderr --\n{stderr}",
+    );
 }
 
 /// Flip each bit of `buf[span]` in turn, run `check(byte, bit, buf)` with it

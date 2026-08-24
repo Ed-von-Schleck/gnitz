@@ -8,10 +8,26 @@ use gnitz_engine::storage::Batch;
 use crate::error::MirrorError;
 use crate::handle::{Mirror, MirroredView};
 
-/// `GNITZ_MIRROR_INJECT_BOOTSTRAP_ERROR`: fail the next bootstrap's upstream read
+/// `GNITZ_INJECT_MIRROR_BOOTSTRAP_ERROR`: fail the next bootstrap's upstream read
 /// once, after the copy has been erased. Debug-only. The window is unreachable
 /// otherwise — the server's only refusal here is an oversized reply.
-static BOOTSTRAP_ERROR: Seam = Seam::new("GNITZ_MIRROR_INJECT_BOOTSTRAP_ERROR");
+static BOOTSTRAP_ERROR: Seam = Seam::new("GNITZ_INJECT_MIRROR_BOOTSTRAP_ERROR");
+
+/// What one view's poll did. The round it left the copy at is
+/// [`Mirror::cursor_of`]; this says only whether the copy is a continuation of
+/// what the caller last saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollOutcome {
+    /// The relation's server id, which a recreated view moves.
+    pub view_id: u64,
+    /// The call bootstrapped rather than applying deltas, so anything derived
+    /// from the copy's previous contents is stale in a way no delta explains.
+    ///
+    /// The cursor cannot carry this: an expiry-driven reseed inside one boot
+    /// keeps the tag and moves the tick forward, exactly as an ordinary advance
+    /// does.
+    pub reseeded: bool,
+}
 
 /// Which reply shape a train carries. The bytes do not say; the caller does.
 #[derive(Clone, Copy)]
@@ -34,19 +50,24 @@ impl Mirror {
     /// has happened", not "what is current", so a push the tick loop has not run
     /// yet is a round the next poll carries.
     ///
-    /// **Every view is attempted; the first failure is returned after the loop.**
-    /// A view dropped upstream fails its poll forever, and stopping there would
-    /// freeze every view after it in the map at a round that never advances
-    /// again, while their reads went on succeeding.
-    pub fn poll(&mut self) -> Result<(), MirrorError> {
+    /// **Every view is attempted; the first failure is returned after the loop**,
+    /// naming the view for [`Mirror::forget_view`] — a view dropped upstream
+    /// fails forever, and stopping at it would freeze every view behind it. An
+    /// `Err` therefore carries no report, and a host that sees one treats every
+    /// mirrored view as possibly reseeded.
+    pub fn poll(&mut self) -> Result<Vec<PollOutcome>, MirrorError> {
         self.check_poison()?;
         let mut first: Option<MirrorError> = None;
+        let mut out = Vec::new();
         for tid in self.mirrored_ids() {
-            if let Err(e) = self.advance_or_bootstrap(tid) {
-                first.get_or_insert(self.named_failure(tid, e));
+            match self.advance_or_bootstrap(tid) {
+                Ok(outcome) => out.push(outcome),
+                Err(e) => {
+                    first.get_or_insert(self.named_failure(tid, e));
+                }
             }
         }
-        first.map_or(Ok(()), Err)
+        first.map_or(Ok(out), Err)
     }
 
     /// `e`, prefixed with which view produced it — what a host needs to pick the
@@ -67,7 +88,7 @@ impl Mirror {
         }
     }
 
-    pub(crate) fn advance_or_bootstrap(&mut self, table_id: u64) -> Result<(), MirrorError> {
+    pub(crate) fn advance_or_bootstrap(&mut self, table_id: u64) -> Result<PollOutcome, MirrorError> {
         self.check_poison()?;
         let Some(&cursor) = self.cursors.get(&table_id) else {
             return self.bootstrap(table_id);
@@ -77,7 +98,11 @@ impl Mirror {
             Ok((blocks, next)) => {
                 self.guarded("applying a poll", |m| m.ingest_blocks(table_id, blocks, Shape::Stamped))?;
                 self.cursors.insert(table_id, next);
-                self.checkpoint_if_due()
+                self.checkpoint_if_due()?;
+                Ok(PollOutcome {
+                    view_id: table_id,
+                    reseeded: false,
+                })
             }
             // The one recovery the feed names, and it is single: discard the copy
             // and bootstrap. It re-resolves first, because a foreign tag is
@@ -116,7 +141,7 @@ impl Mirror {
     /// If the descriptor still matches, the tag moved for the other reason — a
     /// server restart — and the bootstrap is under the id already registered. One
     /// path either way, and it is the path a reopen takes too.
-    fn reseed_after_expiry(&mut self, table_id: u64) -> Result<(), MirrorError> {
+    fn reseed_after_expiry(&mut self, table_id: u64) -> Result<PollOutcome, MirrorError> {
         // Drop the cursor first: whatever the reconcile finds, the copy it ends
         // up with must come from a bootstrap, not from a round the expired cursor
         // named.
@@ -133,7 +158,7 @@ impl Mirror {
     /// `Rederive` open peeks `None` and *erases* the stale shards rather than
     /// reloading them, then rebuilds the handle empty. It is exactly the state
     /// transition a bootstrap needs, and it compiles nothing.
-    pub(crate) fn bootstrap(&mut self, table_id: u64) -> Result<(), MirrorError> {
+    pub(crate) fn bootstrap(&mut self, table_id: u64) -> Result<PollOutcome, MirrorError> {
         self.check_poison()?;
         let view_schema = self.view(table_id)?.schema.clone();
         // Everything between here and the insert below is a copy that does not
@@ -154,7 +179,11 @@ impl Mirror {
             m.ingest_blocks(table_id, blocks, Shape::Plain)
         })?;
         self.cursors.insert(table_id, cursor);
-        self.checkpoint_if_due()
+        self.checkpoint_if_due()?;
+        Ok(PollOutcome {
+            view_id: table_id,
+            reseeded: true,
+        })
     }
 
     /// The entry for `table_id`, or the error every mirrored-relation lookup

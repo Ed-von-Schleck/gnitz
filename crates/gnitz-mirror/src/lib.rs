@@ -61,5 +61,6 @@ mod handle;
 mod reads;
 mod register;
 
+pub use apply::PollOutcome;
 pub use error::MirrorError;
 pub use handle::Mirror;

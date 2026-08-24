@@ -876,9 +876,14 @@ mod tests {
     // Driven via the `GNITZ_INJECT_INGEST_APPLY_ERROR` debug seam.
     #[test]
     fn test_ingest_apply_error_is_returned() {
-        let name = "ingest_apply_error_returned_internal";
-        let status = crate::test_support::run_test_in_child(name, &[("GNITZ_INJECT_INGEST_APPLY_ERROR", "store")]);
-        assert_eq!(status.code(), Some(0), "{name} must pass with the seam armed");
+        // The full path, not the bare name: `run_test_in_child` filters with
+        // `--exact`.
+        let name = "query::dag::tests::ingest_apply_error_returned_internal";
+        let out = crate::test_support::run_test_in_child(name, &[("GNITZ_INJECT_INGEST_APPLY_ERROR", "store")]);
+        crate::test_support::assert_child_ok(
+            &out,
+            "the seam-armed child must return the error rather than swallow it",
+        );
     }
 
     // Runs only in the re-exec'd child, which is where the armed seam is read.
@@ -921,6 +926,7 @@ mod tests {
             ),
             "ingest_store_and_indices must return the storage error when the seam is armed",
         );
+        println!("{}", crate::test_support::CHILD_OK);
     }
 
     // ── ViewMeta relay routing ───────────────────────────────────────────────

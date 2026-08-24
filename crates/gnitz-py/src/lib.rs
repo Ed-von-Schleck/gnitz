@@ -16,6 +16,9 @@ use gnitz_core::{ConflictClass, GnitzClient};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_sql::{SqlPlanner, SqlResult};
 
+mod mirror;
+use mirror::{GnitzMirrorPoisonedError, PyMirror, PyPollResult};
+
 // ---------------------------------------------------------------------------
 // GnitzError Python exception
 // ---------------------------------------------------------------------------
@@ -2058,61 +2061,67 @@ impl PyGnitzClient {
         let results = py
             .detach(|| SqlPlanner::new(client_ref, schema_name).execute(sql))
             .map_err(|e| classified_err(&e))?;
-
-        let py_list = PyList::empty(py);
-        // Interned keys: `r["type"]` on the Python side hits on pointer identity
-        // against its own source literal, where a `PyUnicode` freshly built per
-        // key per result makes every lookup a string compare.
-        let k_type = pyo3::intern!(py, "type");
-        for r in results {
-            let d = PyDict::new(py);
-            match r {
-                SqlResult::TableCreated { table_id } => {
-                    d.set_item(k_type, "TableCreated")?;
-                    d.set_item(pyo3::intern!(py, "table_id"), table_id)?;
-                }
-                SqlResult::ViewCreated { view_id } => {
-                    d.set_item(k_type, "ViewCreated")?;
-                    d.set_item(pyo3::intern!(py, "view_id"), view_id)?;
-                }
-                SqlResult::IndexCreated { index_id } => {
-                    d.set_item(k_type, "IndexCreated")?;
-                    d.set_item(pyo3::intern!(py, "index_id"), index_id)?;
-                }
-                SqlResult::Dropped => {
-                    d.set_item(k_type, "Dropped")?;
-                }
-                SqlResult::Altered { object, name } => {
-                    d.set_item(k_type, "Altered")?;
-                    d.set_item(pyo3::intern!(py, "object"), object)?;
-                    d.set_item(pyo3::intern!(py, "name"), name)?;
-                }
-                SqlResult::RowsAffected { count } => {
-                    d.set_item(k_type, "RowsAffected")?;
-                    d.set_item(pyo3::intern!(py, "count"), count)?;
-                }
-                SqlResult::Rows { schema, batch } => {
-                    d.set_item(k_type, "Rows")?;
-                    d.set_item(
-                        pyo3::intern!(py, "rows"),
-                        batch_to_lazy(py, Some(Arc::new(schema)), Some(batch), None, false)?,
-                    )?;
-                }
-                SqlResult::TransactionStarted => {
-                    d.set_item(k_type, "TransactionStarted")?;
-                }
-                SqlResult::TransactionCommitted { lsn } => {
-                    d.set_item(k_type, "TransactionCommitted")?;
-                    d.set_item(pyo3::intern!(py, "lsn"), lsn)?;
-                }
-                SqlResult::TransactionRolledBack => {
-                    d.set_item(k_type, "TransactionRolledBack")?;
-                }
-            }
-            py_list.append(d)?;
-        }
-        Ok(py_list.into_any().unbind())
+        sql_results_to_py(py, results)
     }
+}
+
+/// One `SqlResult` per statement as the list of dicts every SQL entry point
+/// hands back — the client's and the mirror's alike, so a statement run through
+/// either comes back in the same shape.
+pub(crate) fn sql_results_to_py(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Py<PyAny>> {
+    let py_list = PyList::empty(py);
+    // Interned keys: `r["type"]` on the Python side hits on pointer identity
+    // against its own source literal, where a `PyUnicode` freshly built per
+    // key per result makes every lookup a string compare.
+    let k_type = pyo3::intern!(py, "type");
+    for r in results {
+        let d = PyDict::new(py);
+        match r {
+            SqlResult::TableCreated { table_id } => {
+                d.set_item(k_type, "TableCreated")?;
+                d.set_item(pyo3::intern!(py, "table_id"), table_id)?;
+            }
+            SqlResult::ViewCreated { view_id } => {
+                d.set_item(k_type, "ViewCreated")?;
+                d.set_item(pyo3::intern!(py, "view_id"), view_id)?;
+            }
+            SqlResult::IndexCreated { index_id } => {
+                d.set_item(k_type, "IndexCreated")?;
+                d.set_item(pyo3::intern!(py, "index_id"), index_id)?;
+            }
+            SqlResult::Dropped => {
+                d.set_item(k_type, "Dropped")?;
+            }
+            SqlResult::Altered { object, name } => {
+                d.set_item(k_type, "Altered")?;
+                d.set_item(pyo3::intern!(py, "object"), object)?;
+                d.set_item(pyo3::intern!(py, "name"), name)?;
+            }
+            SqlResult::RowsAffected { count } => {
+                d.set_item(k_type, "RowsAffected")?;
+                d.set_item(pyo3::intern!(py, "count"), count)?;
+            }
+            SqlResult::Rows { schema, batch } => {
+                d.set_item(k_type, "Rows")?;
+                d.set_item(
+                    pyo3::intern!(py, "rows"),
+                    batch_to_lazy(py, Some(Arc::new(schema)), Some(batch), None, false)?,
+                )?;
+            }
+            SqlResult::TransactionStarted => {
+                d.set_item(k_type, "TransactionStarted")?;
+            }
+            SqlResult::TransactionCommitted { lsn } => {
+                d.set_item(k_type, "TransactionCommitted")?;
+                d.set_item(pyo3::intern!(py, "lsn"), lsn)?;
+            }
+            SqlResult::TransactionRolledBack => {
+                d.set_item(k_type, "TransactionRolledBack")?;
+            }
+        }
+        py_list.append(d)?;
+    }
+    Ok(py_list.into_any().unbind())
 }
 
 /// Atomic write-batch transaction context manager: an RAII handle on the
@@ -2774,9 +2783,15 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGnitzClient>()?;
     m.add_class::<PyTxn>()?;
     m.add_class::<PyAsyncTransport>()?;
+    m.add_class::<PyMirror>()?;
+    m.add_class::<PyPollResult>()?;
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
     m.add("GnitzConflictError", m.py().get_type::<GnitzConflictError>())?;
     m.add("GnitzDeltaExpiredError", m.py().get_type::<GnitzDeltaExpiredError>())?;
+    m.add(
+        "GnitzMirrorPoisonedError",
+        m.py().get_type::<GnitzMirrorPoisonedError>(),
+    )?;
     // System-table IDs — single-sourced from gnitz_wire (delegating codec, not
     // a re-typed copy), as is the column-type table behind `type_codes()`.
     // Only the ids something addresses a relation by are exported.

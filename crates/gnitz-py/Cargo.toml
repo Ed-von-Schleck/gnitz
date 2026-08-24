@@ -14,5 +14,6 @@ default     = []
 pyo3           = { version = "0.29", features = ["extension-module"] }
 gnitz-core     = { path = "../gnitz-core" }
 gnitz-expr     = { path = "../gnitz-expr" }
+gnitz-mirror   = { path = "../gnitz-mirror" }
 gnitz-sql      = { path = "../gnitz-sql" }
 gnitz-wire     = { path = "../gnitz-wire" }

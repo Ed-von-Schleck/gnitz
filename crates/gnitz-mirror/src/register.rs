@@ -32,6 +32,7 @@ use gnitz_wire::sys_rows::{write_col_tab_row, write_schema_tab_row, write_view_t
 use gnitz_wire::sys_rows::{ColTabRow, SchemaTabRow, ViewTabRow};
 use gnitz_wire::OWNER_KIND_VIEW;
 
+use crate::apply::PollOutcome;
 use crate::error::MirrorError;
 use crate::handle::{Mirror, MirroredView};
 
@@ -48,8 +49,10 @@ impl Mirror {
     /// whose feed is absent, at every round including zero — so a base table
     /// cannot be mirrored, and neither can a view created without one.
     ///
-    /// Returns the relation's server id, which is what a read names it by.
-    pub fn mirror_view(&mut self, schema_name: &str, name: &str) -> Result<u64, MirrorError> {
+    /// Returns the relation's server id — which is what a read names it by — and
+    /// whether the copy was reseeded rather than advanced: after a reopen this is
+    /// the call that resumes-or-reseeds, so it is where a host learns which.
+    pub fn mirror_view(&mut self, schema_name: &str, name: &str) -> Result<PollOutcome, MirrorError> {
         self.check_poison()?;
         // Identifiers are canonically lower-case: the rows written below must
         // carry the same spelling the server's do, or a later resolve of the
@@ -58,8 +61,7 @@ impl Mirror {
         let name = name.to_ascii_lowercase();
 
         let tid = self.reconcile_registration(&schema_name, &name)?;
-        self.advance_or_bootstrap(tid)?;
-        Ok(tid)
+        self.advance_or_bootstrap(tid)
     }
 
     /// Stop mirroring `table_id`: retract its local catalog rows — which
@@ -165,14 +167,14 @@ impl Mirror {
         tid: u64,
         schema: &Schema,
     ) -> Result<(), MirrorError> {
-        // The schema id is the one field the resolve reply does not carry, so it
-        // comes from the same SCHEMA_TAB scan every DDL path takes. Using the
-        // server's id rather than a locally-allocated one is not cosmetic: the
-        // mirror writes one SCHEMA_TAB row per distinct schema name it mirrors
-        // from, and a local counter would mint an id the server had already
-        // given to a *different* schema whose view the handle mirrors next.
-        let schema_id = self.client.schema_id(schema_name)?;
-
+        // The schema id is the one field the resolve reply does not carry. A
+        // schema the local catalog already holds answers it from the id written
+        // there on the first registration, which came from the server; only a
+        // first sighting pays the SCHEMA_TAB scan every DDL path takes. Using
+        // the server's id rather than a locally-allocated one is not cosmetic: a
+        // local counter would mint an id the server had already given to a
+        // *different* schema whose view the handle mirrors next.
+        //
         // One SCHEMA_TAB row per schema, not per view: the row is shared by
         // every view the handle mirrors out of it, and the local catalog runs no
         // PK-uniqueness enforcement on a system family, so a second `+1` would
@@ -180,16 +182,21 @@ impl Mirror {
         // view would then leave the others' schema row behind at the wrong
         // weight. `public` is already there from the local bootstrap.
         let mut schema_b = BatchBuilder::new(SysFamily::Schema.schema());
-        if !self.engine.has_schema(schema_name) {
-            write_schema_tab_row(
-                &mut schema_b,
-                &SchemaTabRow {
-                    schema_id,
-                    name: schema_name,
-                },
-                1,
-            );
-        }
+        let schema_id = match self.engine.schema_id(schema_name) {
+            Some(id) => id as u64,
+            None => {
+                let id = self.client.schema_id(schema_name)?;
+                write_schema_tab_row(
+                    &mut schema_b,
+                    &SchemaTabRow {
+                        schema_id: id,
+                        name: schema_name,
+                    },
+                    1,
+                );
+                id
+            }
+        };
 
         let mut col_b = BatchBuilder::new(SysFamily::Column.schema());
         for (ci, cd) in schema.columns.iter().enumerate() {

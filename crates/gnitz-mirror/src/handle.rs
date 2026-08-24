@@ -7,6 +7,7 @@ use std::sync::Arc;
 use gnitz_core::{DeltaCursor, GnitzClient, RelKind, Schema};
 use gnitz_engine::catalog::CatalogEngine;
 use gnitz_engine::foundation::env::env_num;
+use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::foundation::worker_ctx;
 use gnitz_engine::schema::SchemaDescriptor;
 
@@ -16,6 +17,11 @@ use crate::error::MirrorError;
 /// Applied delta bytes after which an apply drives a checkpoint of its own.
 /// `GNITZ_MIRROR_CHECKPOINT_BYTES` overrides it.
 const DEFAULT_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
+
+/// `GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR`: fail the next checkpoint once, before
+/// it has changed anything durable. Debug-only. It is the only way to reach
+/// [`Mirror::checkpoint`]'s report-rather-than-poison path without a disk fault.
+static CHECKPOINT_ERROR: Seam = Seam::new("GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR");
 
 /// One live handle per process.
 ///
@@ -143,6 +149,13 @@ impl Mirror {
         })
     }
 
+    /// Whether this process currently holds a live handle, and so whether
+    /// [`Mirror::open`] would be refused for that reason. Not a reservation: only
+    /// `open` itself takes the latch.
+    pub fn any_live() -> bool {
+        HANDLE_LIVE.load(Ordering::SeqCst)
+    }
+
     /// The connection the handle owns. A host writes through it — the mirror is
     /// read-only, and a mirrored relation is a view, which is not a DML target
     /// upstream either.
@@ -263,6 +276,11 @@ impl Mirror {
     }
 
     fn checkpoint_inner(&mut self) -> Result<(), MirrorError> {
+        // Before the bump, so the injected failure is the one that changed
+        // nothing durably — the retryable case this method's doc promises.
+        if CHECKPOINT_ERROR.take_once() {
+            return Err(MirrorError::Engine("injected checkpoint failure".to_string()));
+        }
         self.engine.bump_checkpoint_generation()?;
         let generation = self.engine.flush_ephemeral_round()?;
         let cursors: Vec<(u64, DeltaCursor)> = self.cursors.iter().map(|(&view_id, &c)| (view_id, c)).collect();

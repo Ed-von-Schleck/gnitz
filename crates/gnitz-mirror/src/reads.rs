@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use gnitz_core::protocol::decode_wal_block;
-use gnitz_core::{ClientError, IndexMeta, ReadTarget, RelKind, Schema, ZSetBatch};
+use gnitz_core::{ClientError, GnitzClient, IndexMeta, ReadTarget, RelKind, Schema, ZSetBatch};
 use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine::storage::Batch;
 
@@ -33,19 +33,8 @@ use crate::handle::Mirror;
 use crate::register::descriptor_of;
 
 impl ReadTarget for Mirror {
-    /// Forwarded to the client the handle owns.
-    ///
-    /// The bracket is on the trait because dropping it would cost the delegated
-    /// path a round trip: `resolve_relation` populates the statement scope by
-    /// name and `table_indexes` reads it back by id, so with no scope an
-    /// unmirrored relation read through here costs two RESOLVEs where the plain
-    /// planner costs one.
-    fn begin_statement(&mut self) {
-        self.client.begin_statement();
-    }
-
-    fn end_statement(&mut self) {
-        self.client.end_statement();
+    fn client_mut(&mut self) -> &mut GnitzClient {
+        &mut self.client
     }
 
     /// A mirrored name resolves out of its registration, and **that is what

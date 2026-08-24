@@ -13,7 +13,7 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use crate::{ddl, dml};
-use gnitz_core::{ClientError, GnitzClient};
+use gnitz_core::{ClientError, GnitzClient, ReadTarget};
 use sqlparser::ast::Statement;
 
 /// Inside a transaction, only DML and transaction control may run. Everything
@@ -46,14 +46,38 @@ fn reject_in_transaction(client: &GnitzClient, stmt: &Statement) -> Result<(), G
     Ok(())
 }
 
+/// Route one statement.
+///
+/// A query and the `EXPLAIN` of one go to `reads`, which is what holds the
+/// relation: routing the `EXPLAIN` to the connection instead would cost a round
+/// trip and describe the *server's* relation, which a stale local registration
+/// need not agree with. Everything below the split is DDL, DML or transaction
+/// control, which only a connection can serve.
 pub(crate) fn execute_statement(
-    client: &mut GnitzClient,
+    reads: &mut dyn ReadTarget,
     schema_name: &str,
     stmt: &Statement,
 ) -> Result<SqlResult, GnitzSqlError> {
     let mut binder = Binder::new(schema_name);
-    reject_in_transaction(client, stmt)?;
+    reject_in_transaction(reads.client_mut(), stmt)?;
 
+    match stmt {
+        Statement::Query(query) => return dml::execute_select(reads, query, &mut binder),
+        // Bare `DESC t` is `Statement::ExplainTable` — table introspection, a
+        // separate feature — and falls to the catch-all below.
+        Statement::Explain { statement, .. } => {
+            reject_unhonored_explain_clauses(stmt, "EXPLAIN")?;
+            return match statement.as_ref() {
+                Statement::Query(query) => dml::execute_explain(reads, query, &mut binder),
+                _ => Err(GnitzSqlError::Unsupported(
+                    "EXPLAIN describes a SELECT; this statement is not one".to_string(),
+                )),
+            };
+        }
+        _ => {}
+    }
+
+    let client = reads.client_mut();
     match stmt {
         // Transaction control. Each is a pure client-state-machine transition
         // (no compile, no data reshape), so the handler is inlined here; the
@@ -100,18 +124,6 @@ pub(crate) fn execute_statement(
         Statement::Insert(insert) => {
             reject_unhonored_insert_clauses(insert, "INSERT")?;
             dml::execute_insert(client, insert, &mut binder)
-        }
-        Statement::Query(query) => dml::execute_select(client, query, &mut binder),
-        // Bare `DESC t` is `Statement::ExplainTable` — table introspection, a
-        // separate feature — and falls to the catch-all.
-        Statement::Explain { statement, .. } => {
-            reject_unhonored_explain_clauses(stmt, "EXPLAIN")?;
-            match statement.as_ref() {
-                Statement::Query(query) => dml::execute_explain(client, query, &mut binder),
-                _ => Err(GnitzSqlError::Unsupported(
-                    "EXPLAIN describes a SELECT; this statement is not one".to_string(),
-                )),
-            }
         }
         Statement::CreateIndex(ci) => {
             reject_unhonored_create_index_clauses(ci, "CREATE INDEX")?;

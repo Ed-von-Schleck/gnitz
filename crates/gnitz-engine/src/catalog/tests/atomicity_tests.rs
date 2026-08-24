@@ -507,7 +507,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     );
 
     // Allocate filler schemas until the next schema id collides with `tid`,
-    // then create the victim schema so that get_schema_id("victim") == tid.
+    // then create the victim schema so that schema_id("victim") == Some(tid).
     while engine.next_schema_id < tid {
         let name = format!("filler_{}", engine.next_schema_id);
         engine.create_schema(&name).unwrap();
@@ -518,7 +518,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     );
     engine.create_schema("victim").unwrap();
     assert_eq!(
-        engine.get_schema_id("victim"),
+        engine.schema_id("victim").expect("the schema exists"),
         tid,
         "test setup: victim schema id must collide with tid"
     );

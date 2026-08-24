@@ -258,34 +258,10 @@ pub fn delta_reply_schema(view: &Schema) -> Schema {
 }
 
 impl crate::read_target::ReadTarget for GnitzClient {
-    fn begin_statement(&mut self) {
-        GnitzClient::begin_statement(self)
-    }
-
-    fn end_statement(&mut self) {
-        GnitzClient::end_statement(self)
-    }
-
-    fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(Arc<Schema>, RelKind), ClientError> {
-        GnitzClient::resolve_relation(self, schema_name, name)
-    }
-
-    fn scan(&mut self, table_id: u64) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), ClientError> {
-        let (schema, data, _lsn) = GnitzClient::scan(self, table_id)?;
-        Ok((schema, data))
-    }
-
-    fn scan_spec(
-        &mut self,
-        table_id: u64,
-        spec: &[u8],
-        reply_schema: &Schema,
-    ) -> Result<Option<ZSetBatch>, ClientError> {
-        GnitzClient::scan_spec(self, table_id, spec, reply_schema)
-    }
-
-    fn table_indexes(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
-        GnitzClient::table_indexes(self, table_id)
+    /// A client is its own connection, so every read method takes the trait's
+    /// default and delegates straight back here.
+    fn client_mut(&mut self) -> &mut GnitzClient {
+        self
     }
 }
 

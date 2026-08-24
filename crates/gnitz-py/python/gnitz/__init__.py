@@ -1,6 +1,8 @@
 from gnitz._native import (
-    GnitzError, GnitzConflictError, GnitzDeltaExpiredError, Row, ScanResult,
+    GnitzError, GnitzConflictError, GnitzDeltaExpiredError,
+    GnitzMirrorPoisonedError, Row, ScanResult,
     ColumnDef, Schema, ZSetBatch, GnitzClient, DeltaReply, delta_reply_schema,
+    Mirror, PollResult,
     TABLE_TAB, FIRST_USER_TABLE_ID,
 )
 from gnitz._types import TypeCode

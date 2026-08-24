@@ -20,7 +20,6 @@ mod validate;
 
 pub use error::GnitzSqlError;
 
-use gnitz_core::GnitzClient;
 use gnitz_core::{ReadTarget, Schema, ZSetBatch};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -65,15 +64,20 @@ pub enum SqlResult {
 }
 
 /// High-level SQL execution planner.
+///
+/// It plans against whatever [`ReadTarget`] it was handed: a `SELECT` and an
+/// `EXPLAIN` of one are served by the target, everything else by the connection
+/// the target owns. A [`gnitz_core::GnitzClient`] is its own connection, so
+/// passing one is the ordinary remote case.
 pub struct SqlPlanner<'a> {
-    client: &'a mut GnitzClient,
+    reads: &'a mut dyn ReadTarget,
     schema_name: String,
 }
 
 impl<'a> SqlPlanner<'a> {
-    pub fn new(client: &'a mut GnitzClient, schema_name: impl Into<String>) -> Self {
+    pub fn new(reads: &'a mut dyn ReadTarget, schema_name: impl Into<String>) -> Self {
         SqlPlanner {
-            client,
+            reads,
             schema_name: schema_name.into(),
         }
     }
@@ -97,17 +101,20 @@ impl<'a> SqlPlanner<'a> {
         // call is left open (the caller owns its lifecycle). On a COMMIT failure
         // `txn_commit` already took the buffer out, so `txn_active()` is false
         // here — no double-rollback.
-        let txn_was_active = self.client.txn_active();
+        let txn_was_active = self.reads.client_mut().txn_active();
         let mut results = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
-            self.client.begin_statement();
-            let r = dispatch::execute_statement(self.client, &self.schema_name, stmt);
-            self.client.end_statement();
+            // The scope lives on the connection whatever the target is:
+            // `resolve_relation` fills it by name and `table_indexes` reads it
+            // back by id, so a delegated read costs one RESOLVE rather than two.
+            self.reads.client_mut().begin_statement();
+            let r = dispatch::execute_statement(self.reads, &self.schema_name, stmt);
+            self.reads.client_mut().end_statement();
             match r {
                 Ok(res) => results.push(res),
                 Err(e) => {
-                    if !txn_was_active && self.client.txn_active() {
-                        let _ = self.client.txn_rollback();
+                    if !txn_was_active && self.reads.client_mut().txn_active() {
+                        let _ = self.reads.client_mut().txn_rollback();
                     }
                     return Err(e);
                 }
@@ -115,41 +122,4 @@ impl<'a> SqlPlanner<'a> {
         }
         Ok(results)
     }
-}
-
-/// Execute one `SELECT` against any [`ReadTarget`].
-///
-/// The entry a host uses to read through something that is not a
-/// [`GnitzClient`] — a local copy of a relation, say. Passing `&mut client`
-/// serves the ordinary remote case identically, so this is one SELECT entry
-/// rather than a second path.
-///
-/// It exists because [`dispatch::execute_statement`] cannot: the rest of that
-/// function dispatches DDL and DML, which only a concrete client can serve. What
-/// it does not share with [`SqlPlanner::execute`] is the parse and the statement
-/// bracket; planning is the same builders in the same order.
-///
-/// `sql` must be exactly one statement and that statement must be a query. It
-/// does not re-check the in-transaction rule: `Statement::Query` is on that
-/// rule's allow-list, and the trait carries no transaction buffer to overlay
-/// from.
-pub fn execute_query(reads: &mut dyn ReadTarget, schema_name: &str, sql: &str) -> Result<SqlResult, GnitzSqlError> {
-    let dialect = GenericDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql)?;
-    if stmts.len() != 1 {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "execute_query takes exactly one statement, got {}",
-            stmts.len()
-        )));
-    }
-    let sqlparser::ast::Statement::Query(query) = stmts.remove(0) else {
-        return Err(GnitzSqlError::Unsupported(
-            "execute_query takes a SELECT; this statement is not one".to_string(),
-        ));
-    };
-    let mut binder = bind::Binder::new(schema_name);
-    reads.begin_statement();
-    let r = dml::execute_select(reads, &query, &mut binder);
-    reads.end_statement();
-    r
 }

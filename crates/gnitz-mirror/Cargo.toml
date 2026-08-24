@@ -9,6 +9,7 @@ gnitz-engine = { path = "../gnitz-engine" }
 gnitz-wire   = { path = "../gnitz-wire" }
 
 [dev-dependencies]
+gnitz-engine-testkit = { path = "../gnitz-engine-testkit" }
 gnitz-sql = { path = "../gnitz-sql" }
 gnitz-test-harness = { path = "../gnitz-test-harness" }
 libc = "0.2"
