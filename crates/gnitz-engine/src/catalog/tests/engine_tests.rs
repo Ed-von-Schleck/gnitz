@@ -492,7 +492,7 @@ fn test_ddl_sync_zone_lsn_tracking() {
     // SCHEMA_TAB stays at 5 (untouched in this zone).
     engine.ctx.open_ddl_zone(zone(7));
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let _tid = engine.create_table("z.t", &cols, &[0]).unwrap();
+    let tid = engine.create_table("z.t", &cols, &[0]).unwrap();
     assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 7);
     assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 7);
     assert_eq!(
@@ -503,15 +503,20 @@ fn test_ddl_sync_zone_lsn_tracking() {
 
     // Zone 9: another table. TABLE_TAB and COL_TAB advance to lsn=9.
     engine.ctx.open_ddl_zone(zone(9));
-    let _tid2 = engine.create_table("z.t2", &cols, &[0]).unwrap();
+    let tid2 = engine.create_table("z.t2", &cols, &[0]).unwrap();
     assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 9);
     assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 9);
 
-    // collect_all_flushed_lsns covers every system table.
-    let map = engine.collect_all_flushed_lsns();
+    // system_flushed_lsns covers every system table, and only those.
+    let map = engine.system_flushed_lsns();
     assert_eq!(map.get(&SCHEMA_TAB_ID), Some(&5));
     assert_eq!(map.get(&TABLE_TAB_ID), Some(&9));
     assert_eq!(map.get(&COL_TAB_ID), Some(&9));
+    assert!(map.keys().all(|&t| t < FIRST_USER_TABLE_ID));
+    // and the user half is the complement: both created tables, no system family.
+    let users = engine.user_flushed_lsns();
+    assert!(users.contains_key(&tid) && users.contains_key(&tid2));
+    assert!(users.keys().all(|&t| t >= FIRST_USER_TABLE_ID));
 
     // max_table_current_lsn is at least the highest zone LSN observed.
     assert!(engine.max_table_current_lsn() >= 9);
@@ -576,25 +581,6 @@ fn test_fk_index_metadata_queries() {
 
     // The index circuit resolves, so its store is reachable.
     assert!(engine.index_circuit_for_cols(tid, &[1]).is_some());
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── test_iter_user_table_ids_and_lsn ────────────────────────────────
-
-#[test]
-fn test_iter_user_table_ids() {
-    let dir = temp_dir("catalog_iter_lsn");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let tid1 = engine.create_table("public.t1", &cols, &[0]).unwrap();
-    let tid2 = engine.create_table("public.t2", &cols, &[0]).unwrap();
-
-    let ids = engine.iter_user_table_ids();
-    assert!(ids.contains(&tid1));
-    assert!(ids.contains(&tid2));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

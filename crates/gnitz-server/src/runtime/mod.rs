@@ -31,8 +31,9 @@ mod tls;
 use orchestration::{committer, executor, lsn, master, peer, worker};
 use protocol::{sal, w2m, w2m_ring, wire};
 
-pub(crate) use bootstrap::{server_main, TlsCli};
+pub(crate) use bootstrap::server_main;
 pub(crate) use protocol::sal::MAX_WORKERS;
+pub(crate) use tls::TlsCli;
 
 #[cfg(test)]
 mod tests;

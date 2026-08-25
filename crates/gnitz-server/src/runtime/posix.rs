@@ -6,10 +6,11 @@
 //! The IPC calls return raw codes rather than `io::Result`, because their
 //! callers inspect errno (EAGAIN/ETIMEDOUT) and re-read the rings rather than
 //! trust the return, and `eventfd_create`/`memfd_create` hand back a raw fd
-//! because their callers hold the descriptor across `fork()` and close it by
-//! hand, which an `OwnedFd` would fight. The socket and process-limit calls
-//! keep `io::Result`, as the file tier in `gnitz_engine::foundation::posix_io`
-//! does.
+//! because their callers close the descriptor by hand — the eventfds across
+//! `fork()`, each child closing every rank but its own; the W2M memfds as soon
+//! as the mapping is up — which an `OwnedFd` would fight. The socket and
+//! process-limit calls keep `io::Result`, as the file tier in
+//! `gnitz_engine::foundation::posix_io` does.
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::AtomicU32;

@@ -16,7 +16,7 @@ use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::query::{DagEngine, ExchangeCallback};
 use gnitz_engine::schema::key::PkBuf;
 use gnitz_engine::schema::SchemaDescriptor;
-use gnitz_engine::storage::{flush_barrier, BlobCacheGuard, FlushRound};
+use gnitz_engine::storage::BlobCacheGuard;
 use gnitz_engine::storage::{schema_wire_safe, Batch};
 
 // ---------------------------------------------------------------------------
@@ -1366,8 +1366,7 @@ impl WorkerProcess {
         // by the next auto-tick or the scan barrier. Live entries drain on the
         // next tick (bounded by the 10k-row auto-tick); a dropped table's entry is
         // GC'd in the DdlSync arm (retain(has_id)).
-        let tables = self.cat().dag_mut().collect_base_flush_tables();
-        flush_barrier(tables, FlushRound::Base).map_err(|e| format!("base flush: {e}"))
+        self.cat().flush_base_round()
     }
 
     /// Run multi-worker DAG evaluation with the exchange context.

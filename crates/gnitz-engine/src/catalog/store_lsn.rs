@@ -167,29 +167,42 @@ impl CatalogEngine {
         self.dag.invalidate_all();
     }
 
-    /// Get max flushed LSN for a table. Recovery itself reads the bulk map
-    /// from `collect_all_flushed_lsns`; this single-table form is test-only.
+    /// Get max flushed LSN for a table. Recovery itself reads the bulk maps from
+    /// `system_flushed_lsns` / `user_flushed_lsns`; this single-table form is
+    /// test-only.
     #[cfg(test)]
     pub(crate) fn get_max_flushed_lsn(&self, table_id: i64) -> u64 {
         self.dag.tables.get(&table_id).map_or(0, |e| e.handle.current_lsn())
     }
 
-    /// Every registered relation's `(table id, current_lsn)` — the one walk
-    /// behind both the recovery dedup map and the zone-allocator floor. A system
+    /// Every registered relation's `(table id, kind, current_lsn)` — the one walk
+    /// behind both the recovery dedup maps and the zone-allocator floor. A system
     /// family's registry handle is a `Borrowed` re-export of its `sys_stores`
     /// box, so this reads the same counter its own store would report.
-    fn all_store_lsns(&self) -> impl Iterator<Item = (i64, u64)> + '_ {
+    fn all_store_lsns(&self) -> impl Iterator<Item = (i64, RelationKind, u64)> + '_ {
         self.dag
             .tables
             .iter()
-            .map(|(&tid, entry)| (tid, entry.handle.current_lsn()))
+            .map(|(&tid, entry)| (tid, entry.kind, entry.handle.current_lsn()))
     }
 
-    /// Build a map of every known table id → max flushed LSN, covering
-    /// both system tables and user tables. Recovery uses this as the
-    /// dedup filter for the unified two-pass walk.
-    pub fn collect_all_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
-        self.all_store_lsns().collect()
+    /// The system families' `table id → max flushed LSN`: the dedup filter for the
+    /// master's pre-fork SAL walk. The id band excludes 0, which is "no target".
+    pub fn system_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
+        self.all_store_lsns()
+            .filter(|&(tid, _, _)| (1..FIRST_USER_TABLE_ID).contains(&tid))
+            .map(|(tid, _, lsn)| (tid, lsn))
+            .collect()
+    }
+
+    /// The user relations' `table id → max flushed LSN`: the dedup filter for a
+    /// worker's post-fork SAL walk. A storeless relation is absent rather than
+    /// present at 0 — there is nothing to recover into.
+    pub fn user_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
+        self.all_store_lsns()
+            .filter(|&(tid, kind, _)| tid >= FIRST_USER_TABLE_ID && kind.owns_store())
+            .map(|(tid, _, lsn)| (tid, lsn))
+            .collect()
     }
 
     /// Compute the set of view ids whose checkpointed state — output stores and
@@ -289,6 +302,6 @@ impl CatalogEngine {
     /// watermark a checkpoint persisted can cover a committed-but-unflushed
     /// zone, and a failed zone's pinned LSN is never reused.
     pub fn max_table_current_lsn(&self) -> u64 {
-        self.all_store_lsns().map(|(_, lsn)| lsn).max().unwrap_or(0)
+        self.all_store_lsns().map(|(_, _, lsn)| lsn).max().unwrap_or(0)
     }
 }

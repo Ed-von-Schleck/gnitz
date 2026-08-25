@@ -368,9 +368,9 @@ fn test_sal_epoch_fence() {
 
 #[test]
 fn test_commit_sentinel_round_trip() {
-    // Zone shape: two normal groups at lsn=K, one sentinel at lsn=K,
-    // then an unrelated group at lsn=K+1. After read-back the third
-    // group must be the only one with FLAG_TXN_COMMIT set.
+    // Two groups at lsn=K, the writer's own sentinel at lsn=K, then a group at
+    // lsn=K+1: on read-back the sentinel must be the only one carrying
+    // FLAG_TXN_COMMIT. Framing only; the zone rule is `sal::zone`'s.
     unsafe {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
@@ -434,9 +434,10 @@ fn test_commit_sentinel_zero_payload() {
 
 #[test]
 fn test_batched_push_shares_zone_lsn() {
-    // Phase 6 invariant: every push group in a batched commit carries
-    // the same zone LSN, followed by exactly one commit sentinel. Two
-    // pipelined pushes thus produce three SAL groups: push, push, sentinel.
+    // Framing only: two pipelined pushes at one zone LSN are three SAL groups —
+    // push, push, sentinel — and each carries its LSN and flags back. These groups
+    // have no `FLAG_ZONE_START`, so the recovery verdict over them is not asserted
+    // here; the zone rules are `sal::zone`'s.
     use crate::runtime::sal::FLAG_PUSH;
     unsafe {
         let size = 1 << 20;
@@ -466,33 +467,14 @@ fn test_batched_push_shares_zone_lsn() {
         assert_eq!(m1.flags & FLAG_PUSH, FLAG_PUSH);
         assert_eq!(m2.flags & FLAG_PUSH, FLAG_PUSH);
         assert_eq!(m3.flags & FLAG_TXN_COMMIT, FLAG_TXN_COMMIT);
-        // Recovery's collect_committed_lsns must see this LSN as committed.
-        let committed = {
-            // Inline scan of the SAL: same logic as bootstrap's pass 1.
-            let mut set = std::collections::HashSet::new();
-            let mut off = 0u64;
-            while (off as usize) + 8 < size {
-                let (msg, next) = match reader.try_read(off, EpochGate::Any) {
-                    Some(v) => v,
-                    None => break,
-                };
-                off = next;
-                if msg.flags & FLAG_TXN_COMMIT != 0 {
-                    set.insert(msg.lsn);
-                }
-            }
-            set
-        };
-        assert!(committed.contains(&zone_lsn), "sentinel must commit the push zone");
     }
 }
 
 #[test]
 fn test_zone_two_groups_one_sentinel() {
-    // Phase 3 shape: a CREATE TABLE emits two broadcasts (e.g. COL_TAB
-    // then TABLE_TAB) at one zone-LSN, then a sentinel at the same LSN.
-    // Recovery must see all three groups carry the same LSN, and only
-    // the sentinel must carry FLAG_TXN_COMMIT.
+    // The per-slot half of the same framing, over a CREATE TABLE's shape: from
+    // *every* worker's slot, two broadcasts and a sentinel at one LSN read back
+    // that LSN, and only the sentinel carries FLAG_TXN_COMMIT and no payload.
     unsafe {
         let size = 1 << 20;
         let region = SharedRegion::new(size);

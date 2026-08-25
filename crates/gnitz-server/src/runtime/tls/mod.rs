@@ -24,8 +24,17 @@
 //! wrapped in the per-frame eviction deadline (`send_guarded` / the
 //! flusher's guard), whose expiry fires the lock-free `posix::shutdown`
 //! that aborts whichever `send_raw` holds the mutex.
+//!
+//! The two siblings hold the rest of TLS: `config` builds the rustls
+//! `ServerConfig` — operator PEM or minted dev cert, plus the client CA that
+//! becomes a required-mTLS verifier — and `listener` holds what `--tls-listen`
+//! asks for, the bind refusal guarding it, and the bound listener the executor
+//! accepts on. Only `listener`'s three items leave this module.
 
-pub(crate) mod config;
+mod config;
+mod listener;
+
+pub(crate) use listener::{setup_tls_listener, TlsCli, TlsListener};
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;

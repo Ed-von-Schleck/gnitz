@@ -40,18 +40,6 @@ pub(crate) fn build_schema_from_col_defs(
 }
 
 impl CatalogEngine {
-    // -- Iteration helpers ----------------------------------------------------
-
-    /// Collect all user table IDs.
-    pub fn iter_user_table_ids(&self) -> Vec<i64> {
-        self.dag
-            .tables
-            .keys()
-            .filter(|&&tid| tid >= FIRST_USER_TABLE_ID)
-            .copied()
-            .collect()
-    }
-
     // -- Read column definitions from sys_columns --------------------------
 
     /// Scan sys_columns for every positive-weight column record owned by

@@ -150,7 +150,7 @@ impl MasterDispatcher {
     /// pointer have (`executor::Shared::cat`, `WorkerProcess::cat`): the master
     /// reactor is single-threaded and the catalog outlives the dispatcher.
     #[allow(clippy::mut_from_ref)]
-    pub(super) fn cat(&self) -> &mut CatalogEngine {
+    pub(crate) fn cat(&self) -> &mut CatalogEngine {
         unsafe { &mut *self.catalog }
     }
 

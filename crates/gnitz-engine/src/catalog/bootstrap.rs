@@ -280,6 +280,16 @@ impl CatalogEngine {
             .map_err(|e| format!("boot flush of the system catalog failed: {e:?}"))
     }
 
+    /// The base round over every store this process owns, in **one** barrier —
+    /// the user-relation sibling of [`Self::flush_all_system_tables`], and the
+    /// same argument: a per-table loop builds an io_uring and forces a journal
+    /// commit per table, where the batched set joins one. It trades peak dirty
+    /// page cache and a table id in the error message for that.
+    pub fn flush_base_round(&mut self) -> Result<(), String> {
+        let tables = self.dag.collect_base_flush_tables();
+        crate::storage::flush_barrier(tables, crate::storage::FlushRound::Base).map_err(|e| format!("base flush: {e}"))
+    }
+
     /// The ephemeral checkpoint round: force-persist every view's operator-trace
     /// tables and output stores, stamped with this engine's resume generation,
     /// and return that stamp.

@@ -24,7 +24,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 /// a client that cannot present a cert chaining to this CA (valid dates, and
 /// proven private-key possession via CertificateVerify) never completes the
 /// handshake. `None` keeps `.with_no_client_auth()` (server-auth only).
-pub(crate) fn server_crypto(
+pub(super) fn server_crypto(
     cert_key: Option<(&str, &str)>,
     client_ca: Option<&str>,
 ) -> Result<(Arc<rustls::ServerConfig>, Option<String>), String> {

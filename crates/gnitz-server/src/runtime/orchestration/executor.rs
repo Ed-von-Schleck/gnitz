@@ -23,7 +23,7 @@ use rustc_hash::FxHashMap;
 
 use super::guard_panic;
 use crate::runtime::posix;
-use crate::runtime::tls::{ConnCountGuard, TlsShared};
+use crate::runtime::tls::{ConnCountGuard, TlsListener, TlsShared};
 use gnitz_engine::foundation::fault::Seam;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -476,15 +476,6 @@ impl ServerExecutor {
 // ---------------------------------------------------------------------------
 // Accept loop
 // ---------------------------------------------------------------------------
-
-/// TLS listener runtime inputs, produced by `bootstrap::setup_tls_listener`
-/// and threaded into `ServerExecutor::run` (hence `pub(crate)`): the bound
-/// listen fd, the rustls config, and the global live-connection cap.
-pub(crate) struct TlsListener {
-    pub fd: i32,
-    pub cfg: std::sync::Arc<rustls::ServerConfig>,
-    pub max_conns: u32,
-}
 
 /// Accept-routing inputs: which listener fd is which, the TLS listener, and
 /// the reactor-thread live-TLS-connection counter. Carried explicitly — the

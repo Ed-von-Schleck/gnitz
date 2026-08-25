@@ -2,6 +2,13 @@
 //!
 //! Owns the mmap layout, group-header write/read helpers, SalWriter,
 //! SalMessage, SalReader, and the atomic primitives used by the SAL.
+//!
+//! The **zone protocol** — both directions of it, the commit sentinel a writer
+//! emits and the recovery walk a reader decides zone commitment with — lives in
+//! the [`zone`] child module. A child, so the walk keeps reading `read_at` and
+//! `valid_headers_from` without either becoming part of this module's surface.
+
+pub(crate) mod zone;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1156,19 +1163,6 @@ impl SalWriter {
         )
     }
 
-    /// Write an empty commit sentinel for an atomic zone.
-    ///
-    /// A slotless group carrying `FLAG_DDL_SYNC | FLAG_TXN_COMMIT`. Recovery uses
-    /// the sentinel as the "this LSN is closed" mark — without it, all groups at
-    /// this LSN are skipped. Every worker still sees it (the flags live in the
-    /// group header, which is not per-slot) and it is inert under the worker's hot
-    /// path: the FLAG_DDL_SYNC branch no-ops on a group with no batch.
-    pub fn write_commit_sentinel(&self, lsn: u64) -> Result<(), String> {
-        let group = self.begin("write_commit_sentinel", 0, lsn, FLAG_DDL_SYNC | FLAG_TXN_COMMIT, &[])?;
-        self.finish(group);
-        Ok(())
-    }
-
     pub fn needs_checkpoint(&self) -> bool {
         self.write_cursor.get() >= self.checkpoint_threshold
     }
@@ -1306,7 +1300,7 @@ impl SalReader {
 
     /// Classify the bytes at `cursor` for this reader's worker slot, building
     /// the message and the next cursor when they are a readable group.
-    pub fn read_at(&self, cursor: u64, gate: EpochGate) -> SalStep {
+    fn read_at(&self, cursor: u64, gate: EpochGate) -> SalStep {
         if cursor + 8 > self.mmap_size {
             return SalStep::Absent;
         }
@@ -1324,17 +1318,17 @@ impl SalReader {
     }
 
     /// Every 8-byte-aligned candidate at or after `from` whose header verifies,
-    /// as `(base, slots, epoch)`. Group bases are 8-aligned — `payload_size` is
+    /// as `(base, epoch)`. Group bases are 8-aligned — `payload_size` is
     /// always a multiple of 8 and bases start at 0 — so the stride cannot step
     /// over one. Testing the prefix word before the digest is what bounds the
     /// cost: the zero run filling a partly-used ring pays no hashing at all.
-    pub fn valid_headers_from(&self, from: u64) -> impl Iterator<Item = (u64, u32, u32)> + '_ {
+    fn valid_headers_from(&self, from: u64) -> impl Iterator<Item = (u64, u32)> + '_ {
         (from..self.mmap_size).step_by(8).filter_map(move |base| {
             if base + 8 > self.mmap_size || unsafe { sal_prefix_word(self.ptr, base) } == 0 {
                 return None;
             }
-            let (slots, epoch) = unsafe { sal_probe_header(self.ptr, base, self.mmap_size) }?;
-            Some((base, slots, epoch))
+            let (_, epoch) = unsafe { sal_probe_header(self.ptr, base, self.mmap_size) }?;
+            Some((base, epoch))
         })
     }
 
@@ -1355,7 +1349,7 @@ impl SalReader {
         if unsafe { sal_prefix_word(self.ptr, 0) } == 0 {
             return 0;
         }
-        self.valid_headers_from(0).map(|(_, _, e)| e).max().unwrap_or(0)
+        self.valid_headers_from(0).map(|(_, e)| e).max().unwrap_or(0)
     }
 
     /// Slot `w` of the group published at `base`, independent of this reader's
