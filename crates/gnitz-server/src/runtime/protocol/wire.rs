@@ -29,7 +29,7 @@ pub(crate) use gnitz_wire::FLAG_SCAN_LAST;
 pub use gnitz_wire::{
     wire_flags_get_conflict_mode, wire_flags_get_schema_version, wire_flags_set_schema_version, WireConflictMode,
     FLAG_BATCH_CONSOLIDATED, FLAG_BATCH_SORTED, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
-    FLAG_RESOLVE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 
 /// Map a batch's layout claim to its wire flag bits. Encode normalizes

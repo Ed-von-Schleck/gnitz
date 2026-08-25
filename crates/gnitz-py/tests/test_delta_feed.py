@@ -367,8 +367,20 @@ def test_a_cursor_below_the_floor_is_refused_as_a_code(sweeping_server):
             client.delta_poll(sub.vid, sub.delta_schema, sub.tag, stale_tick, include_hidden=True)
 
         # And the recovery is exact: re-read at 0 and the copy is the view.
+        #
+        # Settle BEFORE re-reading, which is why this does not go through
+        # `assert_converged`. That helper scans first on purpose — a scan drives a
+        # tick and a poll does not — and then polls up the round the scan
+        # produced. On the 32 MB feeds everything else here uses, that round is
+        # still retained when the poll arrives. On this test's deliberately
+        # starved 1 KB budget it is not: one round of these rows overruns the
+        # budget outright, so the sweep drops it before it can be polled and the
+        # just-issued cursor is refused in turn. Driving the tick first makes the
+        # bootstrap's watermark the settled cut, which is what "the recovery is
+        # the read it made on its first day" actually claims.
+        live = sub.scan()
         sub.bootstrap()
-        sub.assert_converged("after re-reading at 0")
+        assert sub.copy == live, "after re-reading at 0"
 
 
 def test_a_delta_store_does_not_grow_without_bound(sweeping_server):

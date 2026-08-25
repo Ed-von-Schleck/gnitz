@@ -68,6 +68,14 @@ pub struct MasterDispatcher {
     num_workers: usize,
     worker_pids: RefCell<Vec<i32>>,
     sal: SalWriter,
+    /// SAL-writer exclusivity, guarding `sal` above. The rule, not a roster of
+    /// today's holders: hold it across the synchronous write + `signal_all`, drop
+    /// it before awaiting. Without it a `FLAG_FLUSH` landing between a `FLAG_TICK`
+    /// and its `FLAG_EXCHANGE_RELAY` bumps the worker epoch and the relay is
+    /// skipped with no error anywhere.
+    ///
+    /// **Non-reentrant**: never `.await` anything that re-acquires it.
+    sal_writer_excl: Rc<AsyncMutex>,
     /// Per-worker wakeup eventfds, in worker order. Signalling is not framing:
     /// the SAL writer decides a group's shape from its own worker count, and this
     /// only tells the workers to go look.
@@ -328,7 +336,6 @@ fn alloc_scan_req_ids_and_lease(
 pub(crate) async fn dispatch_scan_fanout<F>(
     disp: &MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
-    sal_excl: &Rc<AsyncMutex>,
     unicast: Fanout,
     submit: F,
 ) -> Result<(Vec<W2mSlot>, [u64; crate::runtime::sal::MAX_WORKERS], ScanLease), String>
@@ -339,7 +346,7 @@ where
     let (req_ids, lease) = alloc_scan_req_ids_and_lease(reactor, nw, unicast);
 
     {
-        let _guard = sal_excl.lock().await;
+        let _guard = disp.sal_excl().lock().await;
         submit(disp, &req_ids[..nw], unicast)?;
         match unicast {
             Fanout::One(w) => disp.signal_one(w),
@@ -388,7 +395,6 @@ pub(crate) struct MultiScanDispatch {
 pub(crate) async fn dispatch_scan_multi_fanout(
     disp: &MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
-    sal_excl: &Rc<AsyncMutex>,
     client_id: u64,
     relations: &[(i64, Fanout, u16)],
 ) -> Result<Vec<MultiScanDispatch>, String> {
@@ -410,7 +416,7 @@ pub(crate) async fn dispatch_scan_multi_fanout(
     // `.await`, so the groups land contiguously — the single cut. The lock
     // releases at block end, before the caller's first await.
     {
-        let _guard = sal_excl.lock().await;
+        let _guard = disp.sal_excl().lock().await;
         for (&(tid, unicast, eff_ver), d) in relations.iter().zip(&dispatches) {
             let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, eff_ver) | gnitz_wire::FLAG_SCAN_FIFO_REPLY;
             disp.write_scan_group(tid, 0, wire_flags, &d.req_ids[..nw], unicast, client_id, &[], 0)?;

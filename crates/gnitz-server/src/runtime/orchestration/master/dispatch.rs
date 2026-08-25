@@ -124,6 +124,7 @@ impl MasterDispatcher {
             num_workers,
             worker_pids: RefCell::new(worker_pids),
             sal,
+            sal_writer_excl: Rc::new(AsyncMutex::new()),
             m2w_efds,
             w2m,
             catalog,
@@ -146,12 +147,24 @@ impl MasterDispatcher {
 
     /// The catalog behind the raw pointer the dispatcher was constructed with.
     /// Every `&self` method reaches the catalog through here, so the pointer is
-    /// dereferenced in one place. Same accessor the two sibling owners of this
-    /// pointer have (`executor::Shared::cat`, `WorkerProcess::cat`): the master
+    /// dereferenced in one place — and on the master side this is the *only*
+    /// place: `executor::Shared::cat`/`cat_mut` are two names for this accessor
+    /// rather than a second owner of the pointer. `WorkerProcess::cat` is the
+    /// worker-side equivalent, in a different process. Sound because the master
     /// reactor is single-threaded and the catalog outlives the dispatcher.
     #[allow(clippy::mut_from_ref)]
     pub(crate) fn cat(&self) -> &mut CatalogEngine {
         unsafe { &mut *self.catalog }
+    }
+
+    /// The SAL-writer mutex guarding this dispatcher's `sal`. Held by whoever is
+    /// writing a group; see the field's own doc for the rule.
+    ///
+    /// `AsyncMutex::lock` clones the `Rc` into its future and the guard owns one,
+    /// so `disp.sal_excl().lock().await` holds no borrow of the dispatcher across
+    /// the await.
+    pub(crate) fn sal_excl(&self) -> &Rc<AsyncMutex> {
+        &self.sal_writer_excl
     }
 
     /// Boot-time SAL reset: sentinel prefix cleared, cursor 0, `epoch` (the
@@ -913,8 +926,12 @@ impl MasterDispatcher {
 
     /// Synchronous second half of a relay: writes the FLAG_EXCHANGE_RELAY group to
     /// SAL and signals workers, stamping the round `decision` (a
-    /// `BACKFILL_DECISION_*`) onto the relay's `seek_col_idx`. Caller holds
-    /// `sal_writer_excl` for the duration; no awaits inside.
+    /// `BACKFILL_DECISION_*`) onto the relay's `seek_col_idx`. No awaits inside.
+    ///
+    /// The caller must exclude every other SAL writer, by either of the two means
+    /// this codebase has: `relay_loop` holds `sal_writer_excl` across the call,
+    /// while `collect_acks_and_relay` instead runs with the reactor parked, so
+    /// no other task can reach the SAL at all.
     ///
     /// CONTINUE == 0 is the value a plain steady-state relay's `seek_col_idx` has
     /// always carried. `collect_acks_and_relay` is the sole STOP/CHECKPOINT
@@ -993,20 +1010,15 @@ impl MasterDispatcher {
         self.collect_acks_and_relay(false)
     }
 
-    // The async fan-outs below are free functions over `&MasterDispatcher`, not
-    // methods: other reactor tasks re-enter the dispatcher across their awaits,
-    // so no exclusive borrow may span one.
-
     pub async fn fan_out_seek(
-        disp: &MasterDispatcher,
+        &self,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
         pk: u128,
         seek_pk_extra: &[u8],
     ) -> Result<W2mSlot, String> {
-        let num_workers = disp.num_workers;
-        let schema = disp
+        let num_workers = self.num_workers;
+        let schema = self
             .cat()
             .get_schema_desc(target_id)
             .ok_or_else(|| format!("seek: table {target_id} not found"))?;
@@ -1018,16 +1030,11 @@ impl MasterDispatcher {
         let opk = gnitz_engine::schema::key::seek_opk_bytes(&schema, pk, seek_pk_extra)
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
         let worker = schema.worker_for_pk(opk.pk_bytes(), num_workers);
-        let (mut slots, _req_ids, _lease) = dispatch_scan_fanout(
-            disp,
-            reactor,
-            sal_excl,
-            Fanout::One(worker),
-            |disp, req_ids, unicast| {
-                disp.write_command_group(target_id, 0, FLAG_SEEK, 0, pk, 0, req_ids, unicast, 0, seek_pk_extra)
-            },
-        )
-        .await?;
+        let (mut slots, _req_ids, _lease) =
+            dispatch_scan_fanout(self, reactor, Fanout::One(worker), |_, req_ids, unicast| {
+                self.write_command_group(target_id, 0, FLAG_SEEK, 0, pk, 0, req_ids, unicast, 0, seek_pk_extra)
+            })
+            .await?;
         let slot = slots.pop().expect("unicast fan-out returns one slot");
         // A point seek's reply must fit one frame; a train would be forwarded
         // truncated, so reject it rather than silently drop the remainder.
@@ -1053,9 +1060,8 @@ impl MasterDispatcher {
     /// the gate before every train is consumed (or the drain errors and the
     /// lease drop discards the rest) risks a discarded late frame.
     pub async fn fan_out_seek_by_index_collect(
-        disp: &MasterDispatcher,
+        &self,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
         seek_col_idx: u64,
         seek_pk: u128,
@@ -1070,28 +1076,27 @@ impl MasterDispatcher {
         // each matching row `nw` times (weights copied verbatim, no consolidation),
         // handing the client `nw` duplicates of every row. Hashed owners keep
         // the fan-out (matches scatter by PK).
-        let unicast = replicated_unicast(disp, target_id);
+        let unicast = replicated_unicast(self, target_id);
         let mut expected: Option<SchemaDescriptor> = None;
-        let (slots, req_ids, _lease) =
-            dispatch_scan_fanout(disp, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                // The schema is the master's own reply guard, not something the
-                // group carries: the worker's `seek_by_index` arm resolves its
-                // own from its own catalog.
-                expected = Some(disp.schema_desc_for(target_id));
-                disp.write_command_group(
-                    target_id,
-                    0,
-                    FLAG_SEEK_BY_INDEX,
-                    0,
-                    seek_pk,
-                    seek_col_idx,
-                    req_ids,
-                    unicast,
-                    0,
-                    seek_pk_extra,
-                )
-            })
-            .await?;
+        let (slots, req_ids, _lease) = dispatch_scan_fanout(self, reactor, unicast, |_, req_ids, unicast| {
+            // The schema is the master's own reply guard, not something the
+            // group carries: the worker's `seek_by_index` arm resolves its
+            // own from its own catalog.
+            expected = Some(self.schema_desc_for(target_id));
+            self.write_command_group(
+                target_id,
+                0,
+                FLAG_SEEK_BY_INDEX,
+                0,
+                seek_pk,
+                seek_col_idx,
+                req_ids,
+                unicast,
+                0,
+                seek_pk_extra,
+            )
+        })
+        .await?;
         let expected = expected.expect("fan-out closure ran");
 
         let mut acc: Option<Batch> = None;
@@ -1175,9 +1180,8 @@ impl MasterDispatcher {
     /// multi-scan drop the payload explicitly at their own call sites.
     #[allow(clippy::too_many_arguments)]
     pub async fn fan_out_scan(
-        disp: &MasterDispatcher,
+        &self,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         unicast: Fanout,
         target_id: i64,
         client_id: u64,
@@ -1191,22 +1195,21 @@ impl MasterDispatcher {
         // must keep the ids active until the lease drops so the gate discards —
         // not parks — late frames.
         let sampled = Cell::new(0u64);
-        let (slots, req_ids, _lease) =
-            dispatch_scan_fanout(disp, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                let round = disp.last_tick_round();
-                sampled.set(round);
-                disp.write_scan_group(
-                    target_id,
-                    sal_flags,
-                    wire_flags,
-                    req_ids,
-                    unicast,
-                    client_id,
-                    seek_pk_extra,
-                    round as u128,
-                )
-            })
-            .await?;
+        let (slots, req_ids, _lease) = dispatch_scan_fanout(self, reactor, unicast, |_, req_ids, unicast| {
+            let round = self.last_tick_round();
+            sampled.set(round);
+            self.write_scan_group(
+                target_id,
+                sal_flags,
+                wire_flags,
+                req_ids,
+                unicast,
+                client_id,
+                seek_pk_extra,
+                round as u128,
+            )
+        })
+        .await?;
         let ok = forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await?;
         Ok((ok, sampled.get()))
     }

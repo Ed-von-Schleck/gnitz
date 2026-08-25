@@ -74,7 +74,9 @@ pub const FLAG_CONTINUATION: u64 = 1 << 52;
 ///
 /// Client-only and never written to SAL, so it sits above the SAL mirror
 /// (bits 0-15) and the bit-16–39 packed fields rather than in the request-flag run at
-/// 4..256 — all of bits 0-15 are already allocated.
+/// 4..256 — a flag placed there would be carried verbatim into every SAL group
+/// header, which is exactly what a client-only bit must not be. (Bits 0, 1 and 13
+/// of that block are unallocated, so the placement is a rule, not a shortage.)
 pub const FLAG_RESOLVE: u64 = 1 << 54;
 
 /// ALLOCATE_SERIAL_RANGE request flag. The client→master leg of a user-table
@@ -247,6 +249,140 @@ const _: () = {
     while i < high_flags.len() {
         assert!(high_flags[i] & acc == 0, "wire flag bit collision");
         acc |= high_flags[i];
+        i += 1;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Client request verbs
+// ---------------------------------------------------------------------------
+
+/// The one verb a client request frame names.
+///
+/// A verb is a choice, but the wire spells it as independent bits, so one frame
+/// can set two — the disjointness guard above relates flag *definitions*, not the
+/// bits within a frame. [`ClientVerb::from_flags`] refuses that rather than
+/// letting branch order pick, as [`WireConflictMode::from_u8`] refuses an unknown
+/// byte rather than defaulting it.
+///
+/// A plain SCAN sets no verb bit, so absence *is* a verb: [`ClientVerb::Scan`]'s
+/// [`ClientVerb::bit`] is `0`, which names the case without spending one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientVerb {
+    /// No verb bit set: stream a whole relation.
+    Scan,
+    Push,
+    Seek,
+    SeekByIndex,
+    ScanSpec,
+    Resolve,
+    DdlTxn,
+    PushTxn,
+    ScanMulti,
+    AllocSerialRange,
+    AllocTableId,
+    AllocSchemaId,
+    AllocIndexId,
+}
+
+impl ClientVerb {
+    /// Every verb. [`CLIENT_VERB_MASK`] and [`ClientVerb::from_flags`] both fold
+    /// over this, so the mask cannot drift from the routes: a verb added to the
+    /// enum and to [`ClientVerb::bit`] is covered by both without a third list to
+    /// keep in step.
+    pub const ALL: [ClientVerb; 13] = [
+        ClientVerb::Scan,
+        ClientVerb::Push,
+        ClientVerb::Seek,
+        ClientVerb::SeekByIndex,
+        ClientVerb::ScanSpec,
+        ClientVerb::Resolve,
+        ClientVerb::DdlTxn,
+        ClientVerb::PushTxn,
+        ClientVerb::ScanMulti,
+        ClientVerb::AllocSerialRange,
+        ClientVerb::AllocTableId,
+        ClientVerb::AllocSchemaId,
+        ClientVerb::AllocIndexId,
+    ];
+
+    /// The single flag bit naming this verb — `0` for [`ClientVerb::Scan`], which
+    /// is named by the absence of every other.
+    pub const fn bit(self) -> u64 {
+        match self {
+            ClientVerb::Scan => 0,
+            ClientVerb::Push => FLAG_PUSH,
+            ClientVerb::Seek => FLAG_SEEK,
+            ClientVerb::SeekByIndex => FLAG_SEEK_BY_INDEX,
+            ClientVerb::ScanSpec => FLAG_SCAN_SPEC,
+            ClientVerb::Resolve => FLAG_RESOLVE,
+            ClientVerb::DdlTxn => FLAG_DDL_TXN,
+            ClientVerb::PushTxn => FLAG_PUSH_TXN,
+            ClientVerb::ScanMulti => FLAG_SCAN_MULTI,
+            ClientVerb::AllocSerialRange => FLAG_ALLOCATE_SERIAL_RANGE,
+            ClientVerb::AllocTableId => FLAG_ALLOCATE_TABLE_ID,
+            ClientVerb::AllocSchemaId => FLAG_ALLOCATE_SCHEMA_ID,
+            ClientVerb::AllocIndexId => FLAG_ALLOCATE_INDEX_ID,
+        }
+    }
+
+    /// The verb `flags` names, or an error for a frame no client can legitimately
+    /// have encoded: two verb bits, or a data block on any verb but PUSH.
+    ///
+    /// The second rule is what keeps [`ClientVerb::Scan`] safe. Only a push
+    /// carries rows, so a data-carrying frame that names no verb would otherwise
+    /// resolve to `Scan` and be answered with a streamed table dump — the desync
+    /// [`FLAG_PUSH`] exists to prevent.
+    pub fn from_flags(flags: u64) -> Result<Self, &'static str> {
+        let named = flags & CLIENT_VERB_MASK;
+        if named.count_ones() > 1 {
+            return Err("frame names more than one request verb");
+        }
+        // `named` is now either zero (Scan) or exactly one verb's bit, so the
+        // scan below always terminates on the right variant.
+        let mut verb = ClientVerb::Scan;
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            if named != 0 && Self::ALL[i].bit() == named {
+                verb = Self::ALL[i];
+                break;
+            }
+            i += 1;
+        }
+        if flags & FLAG_HAS_DATA != 0 && verb != ClientVerb::Push {
+            return Err("frame carries a data block on a verb other than PUSH");
+        }
+        Ok(verb)
+    }
+}
+
+/// The union of every verb bit — folded from [`ClientVerb::ALL`] rather than
+/// written out, so it cannot fall behind the enum.
+const CLIENT_VERB_MASK: u64 = {
+    let mut acc = 0u64;
+    let mut i = 0;
+    while i < ClientVerb::ALL.len() {
+        acc |= ClientVerb::ALL[i].bit();
+        i += 1;
+    }
+    acc
+};
+
+// Every verb names at most one bit, no two verbs share one, and no verb lands in
+// the wire-level packed fields. The bits themselves are already swept for
+// collision by the guard above; this covers the *derived* mask, which that guard
+// cannot see.
+const _: () = {
+    let packed = WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK;
+    assert!(CLIENT_VERB_MASK & packed == 0, "a verb bit lands in a packed field");
+
+    let mut acc = 0u64;
+    let mut i = 0;
+    while i < ClientVerb::ALL.len() {
+        let bit = ClientVerb::ALL[i].bit();
+        assert!(bit.count_ones() <= 1, "a verb names more than one bit");
+        assert!(bit & acc == 0, "two verbs share a bit");
+        acc |= bit;
         i += 1;
     }
 };
@@ -502,6 +638,61 @@ mod tests {
             assert_eq!(WireConflictMode::from_u8(raw), None, "byte {raw} names no mode");
             let flags = (raw as u64) << 16;
             assert_eq!(wire_flags_get_conflict_mode(flags), None);
+        }
+    }
+
+    /// Every verb round-trips through its own bit. The const guard proves the
+    /// bits are distinct; this proves each one decodes back to the variant that
+    /// produced it, which a disjointness assert cannot express.
+    #[test]
+    fn client_verb_roundtrips_through_its_bit() {
+        for verb in ClientVerb::ALL {
+            assert_eq!(ClientVerb::from_flags(verb.bit()), Ok(verb));
+        }
+    }
+
+    /// A plain SCAN names no verb bit, so a frame carrying only the packed schema
+    /// version must resolve to `Scan` rather than to whatever bit happens to be
+    /// tested first.
+    #[test]
+    fn client_verb_reads_absence_as_scan() {
+        assert_eq!(ClientVerb::from_flags(0), Ok(ClientVerb::Scan));
+        let versioned = wire_flags_set_schema_version(0, 7);
+        assert_eq!(ClientVerb::from_flags(versioned), Ok(ClientVerb::Scan));
+        // The conflict-mode field is likewise not a verb.
+        let moded = wire_flags_set_conflict_mode(0, WireConflictMode::Error);
+        assert_eq!(ClientVerb::from_flags(moded), Ok(ClientVerb::Scan));
+    }
+
+    /// A frame setting two verb bits is refused, not resolved by branch order —
+    /// otherwise a client reaches a verb it did not name.
+    #[test]
+    fn client_verb_rejects_two_verbs() {
+        assert!(ClientVerb::from_flags(FLAG_SEEK | FLAG_PUSH).is_err());
+        assert!(ClientVerb::from_flags(FLAG_DDL_TXN | FLAG_SCAN_MULTI).is_err());
+        // Including the pair that a `target_id`-gated router would have let
+        // through to the plain-scan tail.
+        assert!(ClientVerb::from_flags(FLAG_ALLOCATE_TABLE_ID | FLAG_ALLOCATE_INDEX_ID).is_err());
+    }
+
+    /// Only a push carries rows. A data block on any other verb — `Scan`
+    /// included, which is the dangerous one, since that frame would otherwise be
+    /// answered with a streamed table dump — is a malformed frame.
+    #[test]
+    fn client_verb_rejects_data_on_a_non_push_verb() {
+        assert_eq!(ClientVerb::from_flags(FLAG_HAS_DATA | FLAG_PUSH), Ok(ClientVerb::Push));
+        assert!(
+            ClientVerb::from_flags(FLAG_HAS_DATA).is_err(),
+            "a data block with no verb bit must not read as a scan"
+        );
+        for verb in ClientVerb::ALL {
+            if verb == ClientVerb::Push {
+                continue;
+            }
+            assert!(
+                ClientVerb::from_flags(verb.bit() | FLAG_HAS_DATA).is_err(),
+                "{verb:?} must not accept a data block"
+            );
         }
     }
 

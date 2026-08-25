@@ -758,7 +758,6 @@ fn run_server(
     boot_log("GnitzDB ready\n");
 
     Ok(ServerExecutor::run(
-        catalog_ptr,
         std::rc::Rc::clone(&dispatcher_rc),
         server_fd,
         tls_init,

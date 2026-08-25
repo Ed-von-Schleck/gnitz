@@ -256,7 +256,6 @@ impl MasterDispatcher {
     pub(super) async fn ensure_unique_filters_warm(
         disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         table_id: i64,
     ) -> Result<(), String> {
         let (missing, mut guard): (Vec<UniqueIndexDesc>, WarmupGuard) = {
@@ -292,11 +291,10 @@ impl MasterDispatcher {
         // stream multi-frame trains, and on an early error return (or a
         // mid-scan cancellation) the lease drop discards every undrained
         // frame at the ring boundary.
-        let (slots, req_ids, _lease) =
-            dispatch_scan_fanout(disp, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                disp.write_scan_group(table_id, 0, 0, req_ids, unicast, 0, &[], 0)
-            })
-            .await?;
+        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp, reactor, unicast, |disp, req_ids, unicast| {
+            disp.write_scan_group(table_id, 0, 0, req_ids, unicast, 0, &[], 0)
+        })
+        .await?;
 
         // Drain every worker's continuation-frame train into the cold filters.
         // `drain_index_scan` owns the early-return error contract (the lease

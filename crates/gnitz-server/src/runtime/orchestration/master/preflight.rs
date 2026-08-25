@@ -696,10 +696,9 @@ impl MasterDispatcher {
     async fn execute_and_reclaim(
         disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         checks: Vec<PipelinedCheck>,
     ) -> Result<Vec<FxHashSet<PkBuf>>, String> {
-        let results = Self::execute_pipeline(disp, reactor, sal_excl, &checks).await?;
+        let results = Self::execute_pipeline(disp, reactor, &checks).await?;
         reclaim_check_batches(disp, checks);
         Ok(results)
     }
@@ -714,22 +713,21 @@ impl MasterDispatcher {
     /// probe because the caller holds the involved tables' locks and the
     /// catalog read lock through the ACK.
     pub async fn validate_txn_distributed(
-        disp: &MasterDispatcher,
+        &self,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         families: &[TxnFamily],
     ) -> Result<(), String> {
         // No family whose write reads committed state ⇒ every rule below would
         // find nothing to check, so the bundle (an O(rows) fold) is not built.
-        let cat = disp.cat();
+        let cat = self.cat();
         let reads_committed = families.iter().any(|f| cat.push_reads_committed_state(f.tid, f.mode));
         if !reads_committed {
             return Ok(());
         }
-        let bundle = TxnBundle::new(disp, families)?;
-        let committed = Self::txn_check_pk(disp, reactor, sal_excl, &bundle).await?;
-        Self::txn_check_unique_indices(disp, reactor, sal_excl, &bundle).await?;
-        Self::txn_check_foreign_keys(disp, reactor, sal_excl, &bundle, &committed).await
+        let bundle = TxnBundle::new(self, families)?;
+        let committed = Self::txn_check_pk(self, reactor, &bundle).await?;
+        Self::txn_check_unique_indices(self, reactor, &bundle).await?;
+        Self::txn_check_foreign_keys(self, reactor, &bundle, &committed).await
     }
 
     /// Rule U-PK: Error-mode PK existence, cumulative in frame order. One
@@ -744,7 +742,6 @@ impl MasterDispatcher {
     async fn txn_check_pk(
         disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         b: &TxnBundle<'_>,
     ) -> Result<FxHashMap<i64, FxHashSet<PkBuf>>, String> {
         let mut checks: Vec<PipelinedCheck> = Vec::new();
@@ -792,7 +789,7 @@ impl MasterDispatcher {
             });
         }
         let probed: Vec<i64> = checks.iter().map(|c| c.target_id).collect();
-        let results = Self::execute_and_reclaim(disp, reactor, sal_excl, checks).await?;
+        let results = Self::execute_and_reclaim(disp, reactor, checks).await?;
 
         let mut committed_by_tid: FxHashMap<i64, FxHashSet<PkBuf>> = FxHashMap::default();
         for (tid, committed) in probed.into_iter().zip(results) {
@@ -850,7 +847,6 @@ impl MasterDispatcher {
     async fn txn_check_unique_indices<'a>(
         disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         b: &TxnBundle<'a>,
     ) -> Result<(), String> {
         let mut plans: Vec<UniquePlan<'a>> = Vec::new();
@@ -867,7 +863,7 @@ impl MasterDispatcher {
             // Warm the filters before planning: a provably-absent span set
             // elides the whole broadcast below. The warm-up is one O(table)
             // scan fan-out per (table, index) per process.
-            Self::ensure_unique_filters_warm(disp, reactor, sal_excl, tid).await?;
+            Self::ensure_unique_filters_warm(disp, reactor, tid).await?;
             for ci in 0..n_circuits {
                 // One circuit lookup: its column list, index schema, and the
                 // span-encode plan baked at registration. Copied out so the
@@ -933,7 +929,7 @@ impl MasterDispatcher {
                 });
             }
         }
-        let results = Self::execute_and_reclaim(disp, reactor, sal_excl, checks).await?;
+        let results = Self::execute_and_reclaim(disp, reactor, checks).await?;
 
         // Each reply entry is an occupied span plus the committed row holding it,
         // `[span ‖ holder PK]`, split back apart by index layout alone.
@@ -988,7 +984,6 @@ impl MasterDispatcher {
     async fn txn_check_foreign_keys(
         disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         b: &TxnBundle<'_>,
         committed_pks: &FxHashMap<i64, FxHashSet<PkBuf>>,
     ) -> Result<(), String> {
@@ -1022,17 +1017,7 @@ impl MasterDispatcher {
         // fetches already do) beats one sequential round trip per parent column.
         let futs: Vec<_> = needed
             .iter()
-            .map(|&(ptid, pcol)| {
-                Box::pin(Self::parent_retired_added(
-                    disp,
-                    reactor,
-                    sal_excl,
-                    b,
-                    committed_pks,
-                    ptid,
-                    pcol,
-                ))
-            })
+            .map(|&(ptid, pcol)| Box::pin(Self::parent_retired_added(disp, reactor, b, committed_pks, ptid, pcol)))
             .collect();
         let resolved = crate::runtime::reactor::join_all_unpin(futs).await;
         let mut deltas: ParentDeltas = ParentDeltas::default();
@@ -1040,8 +1025,8 @@ impl MasterDispatcher {
             deltas.insert((ptid, pcol), d?);
         }
 
-        Self::txn_check_fk_existence(disp, reactor, sal_excl, b, &constraints, &deltas).await?;
-        Self::txn_check_fk_restrict(disp, reactor, sal_excl, b, &children, &deltas).await
+        Self::txn_check_fk_existence(disp, reactor, b, &constraints, &deltas).await?;
+        Self::txn_check_fk_restrict(disp, reactor, b, &children, &deltas).await
     }
 
     /// Rule F1: every surviving row's FK value must reference a row that exists
@@ -1050,7 +1035,6 @@ impl MasterDispatcher {
     async fn txn_check_fk_existence(
         disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         b: &TxnBundle<'_>,
         constraints: &[FkEdge],
         deltas: &ParentDeltas,
@@ -1120,7 +1104,7 @@ impl MasterDispatcher {
                 values,
             });
         }
-        let results = Self::execute_and_reclaim(disp, reactor, sal_excl, checks).await?;
+        let results = Self::execute_and_reclaim(disp, reactor, checks).await?;
 
         // A non-bundled parent has no delta (the degenerate plain-push case).
         let no_delta: ParentDelta = (FxHashMap::default(), FxHashSet::default());
@@ -1144,7 +1128,6 @@ impl MasterDispatcher {
     async fn txn_check_fk_restrict(
         disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         b: &TxnBundle<'_>,
         children: &[FkEdge],
         deltas: &ParentDeltas,
@@ -1185,7 +1168,7 @@ impl MasterDispatcher {
                 values: v_check,
             });
         }
-        let results = Self::execute_and_reclaim(disp, reactor, sal_excl, checks).await?;
+        let results = Self::execute_and_reclaim(disp, reactor, checks).await?;
 
         // A committed child reference is fatal unless the bundle also touches the
         // child table and every referencing child row is retired or re-pointed —
@@ -1228,7 +1211,6 @@ impl MasterDispatcher {
                 Box::pin(Self::fan_out_seek_by_index_collect(
                     disp,
                     reactor,
-                    sal_excl,
                     plan.edge.child_tid,
                     gnitz_wire::pack_pk_cols(&[plan.edge.fk_col as u32]),
                     v,
@@ -1280,7 +1262,6 @@ impl MasterDispatcher {
     async fn parent_retired_added(
         disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         b: &TxnBundle<'_>,
         committed_pks: &FxHashMap<i64, FxHashSet<PkBuf>>,
         parent_tid: i64,
@@ -1308,7 +1289,7 @@ impl MasterDispatcher {
         } else {
             let pks: Vec<PkBuf> = touched().map(PkBuf::from_bytes).collect();
             if !pks.is_empty() {
-                let gathered = Self::execute_gather(disp, reactor, sal_excl, parent_tid, pks, ref_col as u8).await?;
+                let gathered = Self::execute_gather(disp, reactor, parent_tid, pks, ref_col as u8).await?;
                 for p in touched() {
                     if let Some(&v) = gathered.get(p) {
                         old_of.insert(p, v);
@@ -1377,14 +1358,13 @@ impl MasterDispatcher {
     ///
     /// An unknown table yields an empty set (nothing to validate).
     pub async fn validate_unique_index_create(
-        disp: &MasterDispatcher,
+        &self,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         owner_id: i64,
         col_indices: &[u32],
     ) -> Result<UniqueFilter, String> {
         let (idx_schema, packed) = {
-            let cat = disp.cat();
+            let cat = self.cat();
             let owner_schema = match cat.get_schema_desc(owner_id) {
                 Some(s) => s,
                 None => return Ok(UniqueFilter::new()),
@@ -1421,35 +1401,34 @@ impl MasterDispatcher {
         // check, and the seed reflects true cardinality. Hashed owners keep the
         // full fan-out (genuine cross-partition duplicates surface as equal
         // spans from different workers).
-        let unicast = replicated_unicast(disp, owner_id);
+        let unicast = replicated_unicast(self, owner_id);
 
         // Fan out the pre-flight command (the packed column list rides in
         // seek_col_idx); each worker answers with its sorted-span
         // continuation-frame train. `_lease` held to end of scope: when the
         // merge returns early (error or duplicate verdict) the lease drop
         // discards the undrained trains at the ring boundary.
-        let (slots, req_ids, _lease) =
-            dispatch_scan_fanout(disp, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
-                // The worker's `UniquePreflight` arm resolves the owner's schema
-                // from its own catalog.
-                disp.write_command_group(
-                    owner_id,
-                    0,
-                    FLAG_UNIQUE_PREFLIGHT,
-                    0,
-                    0,
-                    packed,
-                    req_ids,
-                    unicast,
-                    0,
-                    &[],
-                )
-            })
-            .await?;
+        let (slots, req_ids, _lease) = dispatch_scan_fanout(self, reactor, unicast, |_, req_ids, unicast| {
+            // The worker's `UniquePreflight` arm resolves the owner's schema
+            // from its own catalog.
+            self.write_command_group(
+                owner_id,
+                0,
+                FLAG_UNIQUE_PREFLIGHT,
+                0,
+                0,
+                packed,
+                req_ids,
+                unicast,
+                0,
+                &[],
+            )
+        })
+        .await?;
 
         let merged = merge_index_scan(slots, &req_ids, reactor, &frame_schema).await?;
         if merged.duplicate {
-            return Err(disp.cat().unique_create_dup_err(owner_id, col_indices));
+            return Err(self.cat().unique_create_dup_err(owner_id, col_indices));
         }
         Ok(merged.into_seed())
     }
@@ -1473,7 +1452,6 @@ impl MasterDispatcher {
     pub(super) async fn execute_pipeline(
         disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         checks: &[PipelinedCheck],
     ) -> Result<Vec<FxHashSet<PkBuf>>, String> {
         let num_checks = checks.len();
@@ -1482,7 +1460,7 @@ impl MasterDispatcher {
         }
 
         let (nw, all_req_ids): (usize, Vec<u64>) = {
-            let _guard = sal_excl.lock().await;
+            let _guard = disp.sal_excl().lock().await;
             let nw = disp.num_workers();
             let mut rids: Vec<u64> = Vec::with_capacity(num_checks * nw);
             for _ in 0..(num_checks * nw) {
@@ -1579,7 +1557,6 @@ impl MasterDispatcher {
     pub(super) async fn execute_gather(
         disp: &MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
-        sal_excl: &Rc<AsyncMutex>,
         target_id: i64,
         mut pks: Vec<PkBuf>,
         ref_col: u8,
@@ -1600,7 +1577,7 @@ impl MasterDispatcher {
 
         // `_lease` held across the full drain below (see `dispatch_scan_fanout`).
         let (slots, req_ids, _lease) =
-            dispatch_scan_fanout(disp, reactor, sal_excl, Fanout::Broadcast, |disp, rids, _unicast| {
+            dispatch_scan_fanout(disp, reactor, Fanout::Broadcast, |disp, rids, _unicast| {
                 let pooled = disp.pool_pop_batch((target_id, 0));
                 let batch = build_check_batch_pk_bytes(&parent_schema, pks.iter().map(|p| p.pk_bytes()), pooled);
                 disp.write_scatter_group(&batch, &parent_schema, target_id, FLAG_GATHER, ref_col as u64, rids)?;

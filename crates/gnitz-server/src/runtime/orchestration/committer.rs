@@ -23,17 +23,15 @@
 //!   catalog mutation, by `relay_loop` to reclaim SAL space, and by the
 //!   graceful-shutdown watchdog (see `BarrierKind`).
 
-use super::executor::{TickTrigger, TICK_COALESCE_ROWS};
+use super::executor::{Shared, TickTrigger};
 use super::guard_panic;
-use crate::runtime::lsn::ZoneLsnAllocator;
-use crate::runtime::master::{await_worker_acks, first_worker_error_opt, MasterDispatcher, TxnFamily};
-use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, AsyncMutex, Either, Reactor, ReplyFuture};
+use crate::runtime::master::{await_worker_acks, first_worker_error_opt, TxnFamily};
+use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, Either, ReplyFuture};
 use crate::runtime::sal::{SalFit, FLAG_FLUSH, FLAG_FLUSH_EPH};
 use crate::runtime::wire::{DecodedWire, WireConflictMode};
 use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::storage::Batch;
 use rustc_hash::FxHashMap;
-use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const MAX_PENDING_ROWS: usize = 100_000;
@@ -107,43 +105,6 @@ pub struct PendingPush {
     pub done: oneshot::Sender<Result<u64, String>>,
 }
 
-/// Shared state between the committer task and the executor.
-pub struct Shared {
-    pub reactor: Rc<Reactor>,
-    pub disp: Rc<MasterDispatcher>,
-    /// SAL-writer exclusivity. The committer holds this for
-    /// the entire checkpoint + commit emission window so a concurrent
-    /// tick task or DDL broadcast cannot interleave a SAL group.
-    pub sal_writer_excl: Rc<AsyncMutex>,
-    /// Zone-LSN allocation high-water + durability watermark, shared with the
-    /// executor so SCAN/SEEK responses report the same LSN commits publish.
-    pub lsn_alloc: Rc<ZoneLsnAllocator>,
-    /// One-shot "checkpoint before the next batch" request, for the one path that
-    /// needs a checkpoint on an otherwise-idle server where
-    /// `sal_needs_checkpoint()` would stay false: `commit_pushes` when a
-    /// transaction is rejected for transient SAL overflow, so the client's retry
-    /// finds a reclaimed SAL.
-    ///
-    /// Consumed with `take()` in `run`'s checkpoint decision, which only reaches
-    /// it outside a DDL window — so a request raised inside one survives until
-    /// the window closes.
-    pub force_checkpoint: Cell<bool>,
-    pub tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
-    /// Tick-trigger sender: fires the auto-tick after large commits, and drives
-    /// the checkpoint sequence's drain (`Drain`) and quiesce (`Quiesce`)
-    /// between its base and ephemeral rounds.
-    pub tick_tx: mpsc::Sender<TickTrigger>,
-    /// Nesting depth of the DDL windows in which the tick loop is parked (see
-    /// `TickGate`). No checkpoint round may run while it is non-zero.
-    pub ddl_window: Rc<Cell<usize>>,
-}
-
-impl Shared {
-    fn num_workers(&self) -> usize {
-        self.disp.num_workers()
-    }
-}
-
 /// The committer task loop. Returns when all senders drop (shutdown).
 ///
 /// For normal commit groups `sal_writer_excl` is held only for the
@@ -159,8 +120,8 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
     // per-commit Vec<ReplyFuture> + Vec<Option<DecodedWire>> pair. Sized for one
     // group's ACKs; commit_pushes grows them on the first multi-group batch and
     // reuses the capacity thereafter.
-    let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(shared.num_workers());
-    let mut ack_slots: Vec<Option<DecodedWire>> = Vec::with_capacity(shared.num_workers());
+    let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(shared.disp().num_workers());
+    let mut ack_slots: Vec<Option<DecodedWire>> = Vec::with_capacity(shared.disp().num_workers());
     // Per-(tid, mode) merged-batch pool. `Batch::clear()` resets count and
     // blob without freeing the data buffer, so subsequent multi-push runs
     // skip the `strides_from_schema + zero-fill via buf.resize` cost.
@@ -212,8 +173,8 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         let checkpoint = !ddl_window
             && (forced
                 || force_ckpt
-                || shared.disp.sal_needs_checkpoint()
-                || (has_barriers && !shared.disp.sal_has_relay_space()));
+                || shared.disp().sal_needs_checkpoint()
+                || (has_barriers && !shared.disp().sal_has_relay_space()));
 
         if checkpoint {
             // The full three-step sequence: gen bump → base round → drain →
@@ -323,7 +284,7 @@ fn drain_ready_batch(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitReques
 /// after the base round's reset, so the ephemeral reset must flush the system
 /// tables first or that advance is discarded on a crash.
 async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<(), String> {
-    let nw = shared.num_workers();
+    let nw = shared.disp().num_workers();
     // A round already costs a broadcast, an `nw`-way ACK wait, a system-table
     // flush and a SAL reset, so it allocates its own scratch rather than
     // threading `run`'s through three frames; `req_ids` below is allocated per
@@ -332,10 +293,10 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<
     let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
     let mut ack_slots: Vec<Option<DecodedWire>> = Vec::with_capacity(nw);
 
-    let _sal_excl = shared.sal_writer_excl.lock().await;
+    let _sal_excl = shared.disp().sal_excl().lock().await;
 
     {
-        let disp = &shared.disp;
+        let disp = shared.disp();
         // FlushEph's lsn IS the checkpoint generation — workers latch it via
         // `set_resume_generation`. The base round's lsn is unread; pass 0.
         let (lsn, flags) = match ephemeral_gen {
@@ -348,7 +309,7 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<
 
     await_worker_acks(&shared.reactor, &req_ids, "checkpoint", &mut fut_slots, &mut ack_slots).await?;
     // Both rounds finalize the same way: flush system tables, then reset the SAL.
-    guard_panic("checkpoint_post_ack", || shared.disp.checkpoint_post_ack())
+    guard_panic("checkpoint_post_ack", || shared.disp().checkpoint_post_ack())
 }
 
 /// The full steady-state checkpoint sequence: gen bump → base round → drain →
@@ -372,7 +333,7 @@ async fn run_checkpoint_sequence(
 ) {
     // Step 0: gen bump. From this instant every existing rederived manifest is
     // stale; a crash below rebuilds views instead of silently staleifying them.
-    let gen = match shared.disp.bump_checkpoint_generation() {
+    let gen = match shared.disp().bump_checkpoint_generation() {
         Ok(g) => g,
         // The generation bump is what makes every existing rederived manifest
         // stale before the rounds below overwrite the base. Failing it leaves
@@ -478,7 +439,7 @@ async fn await_servicing<T>(
                 // broadcast + per-worker-ACK + system-table flush for nothing.
                 // A `forced` request states a requirement that predicate cannot
                 // see, so it runs the round regardless.
-                if forced || !shared.disp.sal_has_relay_space() {
+                if forced || !shared.disp().sal_has_relay_space() {
                     if let Err(e) = flush_round(shared, None).await {
                         gnitz_fatal_abort!("reclaim checkpoint failed, cluster epoch-desynced: {}", e);
                     }
@@ -555,7 +516,7 @@ async fn commit_pushes(
     // Sort by (tid, mode) so runs are homogeneous.
     pushes.sort_by_key(|p| (p.tid, p.mode.as_u8()));
 
-    let nw = shared.num_workers();
+    let nw = shared.disp().num_workers();
     let mut groups: Vec<GroupInfo> = Vec::new();
     let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
     let alloc_req_ids = || -> Vec<u64> { (0..nw).map(|_| shared.reactor.alloc_request_id()).collect() };
@@ -609,7 +570,7 @@ async fn commit_pushes(
             if batches.len() == 1 {
                 return Ok(batches.pop().expect("one batch in a single-push run"));
             }
-            let schema = shared.disp.schema_desc_for(tid);
+            let schema = shared.disp().schema_desc_for(tid);
             let mut m = match merge_pool.remove(&(tid, mode.as_u8())) {
                 Some(pooled) if pooled.schema.as_ref() == Some(&schema) => pooled,
                 _ => Batch::with_capacity(schema, total_rows.max(1)),
@@ -624,7 +585,7 @@ async fn commit_pushes(
             Ok(m) => (m, None),
             Err(panic_msg) => {
                 let placeholder = guard_panic("commit_fallback_schema", || {
-                    Ok(Batch::empty_with_schema(&shared.disp.schema_desc_for(tid)))
+                    Ok(Batch::empty_with_schema(&shared.disp().schema_desc_for(tid)))
                 })
                 .unwrap_or_else(|_| Batch::empty_with_schema(&gnitz_engine::schema::SchemaDescriptor::minimal_u64()));
                 (placeholder, Some(panic_msg))
@@ -659,7 +620,7 @@ async fn commit_pushes(
     // LSNs. A batch of nothing but stream groups writes no zone at all.
     // ------------------------------------------------------------------
     let (zone_lsn, fsync_fut) = {
-        let _sal_excl = shared.sal_writer_excl.lock().await;
+        let _sal_excl = shared.disp().sal_excl().lock().await;
 
         // Reserve under sal_writer_excl so reservation order == SAL write order
         // across every durable allocator (this committer, DDL, SERIAL). A
@@ -689,7 +650,7 @@ async fn commit_pushes(
             // committed zone. A failure on the FIRST family (nothing committed
             // yet) fails the transaction cleanly.
             let families: Vec<(i64, &Batch)> = groups[span.clone()].iter().map(|g| (g.tid, &g.merged)).collect();
-            let fail = match shared.disp.txn_fit(&families) {
+            let fail = match shared.disp().txn_fit(&families) {
                 SalFit::Terminal => Some("transaction exceeds SAL capacity".to_string()),
                 SalFit::Transient => {
                     // Force a checkpoint before the next batch so the client's
@@ -750,7 +711,7 @@ async fn commit_pushes(
         // after a restart while the client already received Ok.  Abort.
         // `commit_zone` signals the workers itself once the sentinel is published.
         let fsync_fut = if zone_opened {
-            if let Some(e) = shared.disp.commit_zone(zone_lsn).err() {
+            if let Some(e) = shared.disp().commit_zone(zone_lsn).err() {
                 gnitz_fatal_abort!("commit_zone failed, durability lost: {}", e);
             }
             // Submit fsync SQE (synchronous — returns a future). The
@@ -758,10 +719,10 @@ async fn commit_pushes(
             // await_reply only borrows reactor state, never the SAL writer,
             // so populating the slots after dropping the lock is correct
             // and lets concurrent tick/relay tasks make progress sooner.
-            Some(shared.reactor.fsync(shared.disp.sal_fd()))
+            Some(shared.reactor.fsync(shared.disp().sal_fd()))
         } else {
             // The signal `commit_zone` would have sent. Phase C awaits its ACKs.
-            shared.disp.signal_all();
+            shared.disp().signal_all();
             None
         };
         (zone_lsn, fsync_fut)
@@ -837,12 +798,7 @@ async fn commit_pushes(
                 }
             }
         }
-        if shared
-            .tick_rows
-            .borrow()
-            .values()
-            .any(|&rows| rows >= TICK_COALESCE_ROWS)
-        {
+        if shared.any_threshold_crossed() {
             shared.tick_tx.send(TickTrigger::Auto);
         }
     }
@@ -872,7 +828,7 @@ async fn commit_pushes(
     // constrained INSERT re-validates from scratch.
     for g in groups.iter().filter(|g| g.write_err.is_none()) {
         if let Err(e) = guard_panic("unique_filter_ingest", || {
-            shared.disp.unique_filter_ingest_batch(g.tid, &g.merged);
+            shared.disp().unique_filter_ingest_batch(g.tid, &g.merged);
             Ok(())
         }) {
             invalidate_filters(shared, g.tid);
@@ -901,7 +857,7 @@ async fn commit_pushes(
 /// already durable, so a panic in the filter map must not fail the commit.
 fn invalidate_filters(shared: &Rc<Shared>, tid: i64) {
     let _ = guard_panic("unique_filter_invalidate", || {
-        shared.disp.unique_filter_invalidate_table(tid);
+        shared.disp().unique_filter_invalidate_table(tid);
         Ok(())
     });
 }
@@ -915,7 +871,7 @@ fn write_group(shared: &Rc<Shared>, g: &GroupInfo, zone_lsn: u64, zone_opened: &
     let zone_start = !*zone_opened && g.recoverable;
     let err = guard_panic("commit_write", || {
         Ok(shared
-            .disp
+            .disp()
             .write_commit_group(g.tid, zone_lsn, &g.merged, g.mode, &g.req_ids, zone_start)
             .err())
     })
