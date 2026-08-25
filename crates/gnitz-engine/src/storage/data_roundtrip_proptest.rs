@@ -249,7 +249,7 @@ proptest! {
 
     /// has_pk_bytes re-finds every ingested row before and after flush; an
     /// absent prefix-twin is rejected both times. Durable so the post-flush
-    /// XOR8 bloom is probed.
+    /// shard PK filter is probed.
     #[test]
     fn point_lookup_after_flush(schema in arb_schema(), rows in 1usize..=64, seed in any::<u64>()) {
         let dir = tempfile::tempdir().unwrap();

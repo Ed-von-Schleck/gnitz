@@ -3,7 +3,7 @@
 //! (`batch_wire`), TLS buffer recycling (`batch_pool`), the columnar comparators
 //! (`columnar`), sort-merge consolidation (`merge`), exchange repartition
 //! (`scatter`), the fused k-way merge kernel (`heap`), the PK-probe filters
-//! (`bloom`, `xor8`), the shard-image encoder and its atomic writer
+//! (`bloom`, `shard_filter`), the shard-image encoder and its atomic writer
 //! (`shard_file`), and the shard-format constants (`layout`). The low-level
 //! WAL-block framer lives in `gnitz_wire::wal` (the one definition client and
 //! engine share); `batch_wire` and the SAL scatter writer call it.
@@ -28,8 +28,8 @@ pub(super) mod layout;
 pub(super) mod merge;
 pub(super) mod scatter;
 pub(super) mod shard_file;
+pub(super) mod shard_filter;
 pub(in crate::storage) mod shard_reader;
-pub(super) mod xor8;
 
 // The one storage-level helper the shard reader names (`StorageError`), aliased
 // so its files keep their `super::super::<mod>` paths.

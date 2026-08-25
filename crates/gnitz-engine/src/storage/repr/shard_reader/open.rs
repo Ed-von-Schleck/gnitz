@@ -1,14 +1,16 @@
 //! Cold open-time path for [`MappedShard`]: header + directory validation,
-//! region decoding, optional per-region checksum verification, and the XOR8
+//! region decoding, optional per-region checksum verification, and the PK
 //! membership-filter load. Runs once per shard open, never per row.
 //!
 //! Two digests are unconditional, over the two spans this path reads in full
 //! regardless of `validate_checksums`: the descriptive prefix (header +
 //! directory), which decides how every payload byte is interpreted, and the
-//! serialized filter, whose corruption answers "not present" rather than
-//! failing. The payload regions stay behind `validate_checksums` — they are
-//! demand-paged, so hashing them here would fault in a whole shard for a point
-//! lookup. Only compaction passes it; the boot/reload path opens with it off.
+//! filter region, whose descriptor drives the fingerprint indexing a probe
+//! performs — a corrupt one panics rather than answering wrongly, so the digest
+//! is what keeps it unreachable. The payload regions stay behind
+//! `validate_checksums` — they are demand-paged, so hashing them here would
+//! fault in a whole shard for a point lookup. Only compaction passes it; the
+//! boot/reload path opens with it off.
 
 use std::ffi::CStr;
 
@@ -17,7 +19,7 @@ use super::super::batch::{
 };
 use super::super::error::StorageError;
 use super::super::layout::*;
-use super::super::xor8;
+use super::super::shard_filter;
 use super::{Advice, MappedShard, Mmap, PackedRegion, PayloadRegion, RegionView, WeightRegion};
 use crate::foundation::xxh;
 use gnitz_wire::{read_i64_le, read_u64_le};
@@ -233,19 +235,27 @@ impl MappedShard {
         let blob_off = entries[file_nr].offset;
         let blob_len = entries[file_nr].size;
 
-        let xor8_off = read_u64_le(data, OFF_XOR8_OFFSET) as usize;
-        let xor8_sz = read_u64_le(data, OFF_XOR8_SIZE) as usize;
-        // Unconditional: `deserialize` reads every one of these bytes anyway. A
-        // corrupt filter answers "not present" for keys the shard holds instead
-        // of failing, so it has to be rejected here rather than degrade probes.
-        let xor8_filter = if xor8_off > 0 && xor8_sz >= 16 && xor8_off + xor8_sz <= file_size {
-            let bytes = &data[xor8_off..xor8_off + xor8_sz];
-            if xxh::checksum(bytes) != read_u64_le(data, OFF_XOR8_CHECKSUM) {
+        // A zero offset is the filterless marker and the only one: anything
+        // else must parse or the open fails, the way every other structural
+        // defect here does. The checksum is unconditional — `read` touches
+        // every one of these bytes anyway, and a corrupt descriptor panics a
+        // probe rather than answering wrongly.
+        let off = read_u64_le(data, OFF_SHARD_FILTER_OFFSET) as usize;
+        let sz = read_u64_le(data, OFF_SHARD_FILTER_SIZE) as usize;
+        let shard_filter = if off == 0 {
+            None
+        } else {
+            // Both operands come from the header, so their sum can wrap past the
+            // bound below and then panic on the slice.
+            let end = off.checked_add(sz).ok_or(StorageError::InvalidShard)?;
+            if end > file_size {
+                return Err(StorageError::InvalidShard);
+            }
+            let bytes = &data[off..end];
+            if xxh::checksum(bytes) != read_u64_le(data, OFF_SHARD_FILTER_CHECKSUM) {
                 return Err(StorageError::ChecksumMismatch);
             }
-            xor8::deserialize(bytes)
-        } else {
-            None
+            Some(shard_filter::ShardFilter::parse(bytes, off).ok_or(StorageError::InvalidShard)?)
         };
 
         Ok(MappedShard {
@@ -258,7 +268,7 @@ impl MappedShard {
             null_pad_mask,
             blob_off,
             blob_len,
-            xor8_filter,
+            shard_filter,
             pk_stride,
             skeleton,
         })

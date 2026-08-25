@@ -148,27 +148,27 @@ impl ShardIndex {
     #[cfg(test)]
     pub(crate) fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
         let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
-        let xor8_key = crate::schema::key::probe_key(opk.pk_bytes());
-        self.find_pk_bytes(opk.pk_bytes(), xor8_key, visitor);
+        let filter_key = crate::schema::key::probe_key(opk.pk_bytes());
+        self.find_pk_bytes(opk.pk_bytes(), filter_key, visitor);
     }
 
     /// Point lookup by OPK `key` bytes — universal across all PK widths. L0 is
     /// scanned (range-rejected per entry); each L1+ level routes by the guard
     /// key `pack_pk_be(key)` (the same order-preserving space `l1_guard_keys`
     /// builds), restoring O(log N) routing for wide PKs too.
-    pub(crate) fn find_pk_bytes(&self, key: &[u8], xor8_key: u64, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
+    pub(crate) fn find_pk_bytes(&self, key: &[u8], filter_key: u64, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
         // A pure function of `key`, so the sweep derives it once instead of once
         // per candidate shard.
         let route_key = crate::schema::key::pack_pk_be(key);
         for e in &self.l0 {
-            if let Some((arc, idx)) = e.probe_pk_bytes(key, xor8_key) {
+            if let Some((arc, idx)) = e.probe_pk_bytes(key, filter_key) {
                 visitor(arc, idx);
             }
         }
         for level in &self.levels {
             if let Some(g_idx) = level.find_guard_idx(route_key) {
                 for e in &level.guards[g_idx].entries {
-                    if let Some((arc, idx)) = e.probe_pk_bytes(key, xor8_key) {
+                    if let Some((arc, idx)) = e.probe_pk_bytes(key, filter_key) {
                         visitor(arc, idx);
                     }
                 }

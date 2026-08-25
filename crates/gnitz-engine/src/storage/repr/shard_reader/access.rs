@@ -1,4 +1,4 @@
-//! Per-row accessors for [`MappedShard`] — the region reads, the XOR8 probe and
+//! Per-row accessors for [`MappedShard`] — the region reads, the PK-filter probe and
 //! the OPK binary searches — plus the bulk `*_owned_batch` materializers.
 
 use super::super::batch::{
@@ -6,7 +6,6 @@ use super::super::batch::{
 };
 use super::super::layout::two_value_bit;
 use super::super::merge::{prorated_blob_cap, relocate_german_string_vec, BlobCacheGuard, ColPtr, UnifiedSource};
-use super::super::xor8;
 use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion, ZERO_CELL};
 use crate::schema::key::PkBuf;
 use crate::schema::SchemaDescriptor;
@@ -127,16 +126,17 @@ impl MappedShard {
     }
 
     /// Test-only: distinguishes "no filter" from "filter admits it", which
-    /// [`xor8_may_contain`](Self::xor8_may_contain) deliberately cannot.
+    /// [`shard_filter_may_contain`](Self::shard_filter_may_contain) deliberately
+    /// cannot.
     #[cfg(test)]
-    pub(crate) fn has_xor8(&self) -> bool {
-        self.xor8_filter.is_some()
+    pub(crate) fn has_shard_filter(&self) -> bool {
+        self.shard_filter.is_some()
     }
 
     /// A shard carrying no filter admits every key.
-    pub(crate) fn xor8_may_contain(&self, probe_key: u64) -> bool {
-        match &self.xor8_filter {
-            Some(filter) => xor8::may_contain(filter, probe_key),
+    pub(crate) fn shard_filter_may_contain(&self, probe_key: u64) -> bool {
+        match &self.shard_filter {
+            Some(filter) => filter.may_contain(self.data(), probe_key),
             None => true,
         }
     }

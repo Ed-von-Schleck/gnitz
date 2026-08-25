@@ -89,7 +89,7 @@ typed lexicographic PK order, at any width — so every ordered operation (merge
 sort, consolidation, range scan) is one `compare_pk_bytes`, and the encode/decode
 boundary is the only type-aware code. The encoding is also a bijection, so
 byte-equal ⟺ key-equal and consolidation and dedup group on the raw bytes.
-Routing and XOR8 probes hash those same bytes, making the hash a **pure function
+Routing and shard PK-filter probes hash those same bytes, making the hash a **pure function
 of the logical key**: equal keys co-partition and co-probe, and physical width or
 padding at the wire boundary never moves a key.
 

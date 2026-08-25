@@ -270,3 +270,73 @@ fn compaction_amplification_bench() {
     );
     assert!(phases[0].n > 0, "no compaction ran — the sweep measures nothing");
 }
+
+/// The share of a probed store's work that is PK-filter work: the same ingest
+/// run with the filter on and off, differenced by an external `perf stat`.
+/// Read the difference in cycles — `BinaryFuse8`'s construction trades retired
+/// instructions for cache behaviour, so the two counters need not move together
+/// and instructions alone can report the wrong sign.
+///
+/// `SalReplay` because it is the one recovery source whose stores build a
+/// filter, and no per-tick `flush()` because a `SalReplay` barrier publishes a
+/// manifest per tick and its fsyncs dominate everything being measured — ingest
+/// overflow alone drives the RAM tier, the spill and the compaction. Both arms
+/// must report the same compacted bytes; if they diverge the arms are not
+/// comparable and the cycle delta means nothing.
+///
+/// ```text
+/// BIN=$(find target/release/deps -maxdepth 1 -type f -executable \
+///     -name 'gnitz_engine-*' ! -name '*.*' | head -1)
+/// for t in 4000 16000; do
+///   for f in 0 1; do
+///     GNITZ_BENCH_DIR=$(realpath tmp)/bfs GNITZ_NO_PK_FILTER=$f GNITZ_BENCH_TICKS=$t \
+///       perf stat -e cycles,instructions -x, $BIN filter_share_of_compaction \
+///       --ignored --nocapture --test-threads=1
+///   done
+/// done
+/// ```
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn filter_share_of_compaction() {
+    const ROWS_PER_TICK: usize = 4096;
+
+    use crate::foundation::env::{env_flag, env_num};
+    let ticks_n: usize = env_num("GNITZ_BENCH_TICKS", 4000);
+    let keyspace: u64 = env_num("GNITZ_BENCH_KEYSPACE", 200_000_000);
+    let filter_off = env_flag("GNITZ_NO_PK_FILTER", false);
+
+    let schema = make_schema_flush();
+    let tmp = tempfile::tempdir().unwrap();
+    // A real filesystem when one is named: this writes and re-reads shard bytes,
+    // and a tmpfs prices them differently.
+    let root = std::env::var("GNITZ_BENCH_DIR").unwrap_or_else(|_| tmp.path().to_str().unwrap().to_string());
+    let dir = std::path::Path::new(&root).join(format!("fs_{ticks_n}_{}", filter_off as u8));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut table = Table::new(dir.to_str().unwrap(), schema, 9, RecoverySource::SalReplay).unwrap();
+    // The off arm. Force-off only: every store that skips by policy is
+    // `Rederive` and never carries a base-table workload, so forcing a filter
+    // *on* would measure nothing.
+    if filter_off {
+        table.set_skip_pk_filter_for_test(true);
+    }
+
+    use crate::storage::lsm::shard_index::cstats;
+    cstats::reset();
+    let mut rng = crate::test_rng::Rng::new(0x5EED_1234);
+    let mut ingested: usize = 0;
+    for _ in 0..ticks_n {
+        let batch = scatter_tick(&schema, &mut rng, ROWS_PER_TICK, keyspace);
+        ingested += batch.count;
+        table.ingest_owned_batch(batch).unwrap();
+    }
+
+    let phases = cstats::dump();
+    let compactions: usize = phases.iter().map(|p| p.n).sum();
+    let bytes_in: u64 = phases.iter().map(|p| p.in_bytes).sum();
+    assert!(compactions > 0, "no compaction ran — the run measures nothing");
+    println!(
+        "filter_share/{ticks_n}t filter={}: {ingested} rows  {compactions} compactions  {bytes_in} compacted bytes in",
+        if filter_off { "off" } else { "on" },
+    );
+}

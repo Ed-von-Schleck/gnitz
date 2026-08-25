@@ -256,7 +256,7 @@ impl Table {
             memtable: RunSet::new(arena_size as usize * 3 / 4),
             ram_tier: RunSet::new(inmem_ceiling()),
             // Only a `SalReplay` store is point-probed by PK, so only it needs
-            // the XOR8 filters its shards would otherwise all carry.
+            // the PK filters its shards would otherwise all carry.
             shard_index: ShardIndex::new(
                 table_id,
                 dir,
@@ -561,6 +561,13 @@ impl Table {
         self.ram_tier.set_budget(bytes);
     }
 
+    /// Test helper: stop this store's writes from building a PK filter, so a
+    /// benchmark can price one against the same ingest run without it.
+    #[cfg(test)]
+    pub(crate) fn set_skip_pk_filter_for_test(&mut self, skip: bool) {
+        self.shard_index.set_skip_pk_filter_for_test(skip);
+    }
+
     /// Test helper: push a consolidated batch straight into the memtable,
     /// skipping the ingest path's flush check.
     #[cfg(test)]
@@ -598,7 +605,7 @@ impl Table {
 
     /// Visit every row whose PK equals `key`, in tier order — memtable, RAM
     /// tier, then shards. Each RAM tier gates on its own bloom and each shard on
-    /// its PK range plus XOR8 filter, so a miss costs a few loads and no search.
+    /// its PK range plus PK filter, so a miss costs a few loads and no search.
     ///
     /// The one PK walk of the table. Both point-lookup entry points read through
     /// it, so no tier can be visible to one and invisible to the other — a live
@@ -606,7 +613,7 @@ impl Table {
     /// memtable row.
     fn for_each_pk_candidate(&self, key: &[u8], mut f: impl FnMut(StoredRow)) {
         // One derivation for every filter this walk consults — both RAM-tier
-        // blooms and each shard's XOR8.
+        // blooms and each shard's PK filter.
         let fingerprint = probe_key(key);
         for set in self.ram_tiers() {
             if !set.may_contain(fingerprint) {
@@ -2069,7 +2076,7 @@ mod tests {
 
     /// A barrier folds the live memtable and L0 into one shard, and a ceiling
     /// breach spills to one shard. Both outputs go through the filter-building
-    /// writer, so each carries an XOR8 — and the barrier's covers a PK that was
+    /// writer, so each carries a PK filter — and the barrier's covers a PK that was
     /// only ever live in the memtable, which is what pins that the fold happened
     /// before the write.
     #[test]
@@ -2079,7 +2086,7 @@ mod tests {
         // Barrier shard: live memtable + populated L0.
         {
             let dir = tempfile::tempdir().unwrap();
-            let tdir = dir.path().join("barrier_xor8");
+            let tdir = dir.path().join("barrier_filter");
             let mut t = new_table(&tdir, schema, 7300, 128, RecoverySource::SalReplay);
 
             // Overflow 8 rows into L0, then leave 2 rows live in the memtable.
@@ -2093,17 +2100,17 @@ mod tests {
             t.flush().unwrap();
             let shards = t.all_shard_arcs();
             assert_eq!(shards.len(), 1, "barrier folds memtable + L0 into one shard");
-            assert!(shards[0].has_xor8(), "barrier shard must carry the XOR8 filter");
+            assert!(shards[0].has_shard_filter(), "barrier shard must carry the PK filter");
             assert!(
-                shards[0].xor8_may_contain(probe_key(&100u64.to_be_bytes())),
-                "XOR8 must contain a folded memtable PK"
+                shards[0].shard_filter_may_contain(probe_key(&100u64.to_be_bytes())),
+                "the PK filter must contain a folded memtable PK"
             );
         }
 
         // Ceiling-breach spill.
         {
             let dir = tempfile::tempdir().unwrap();
-            let tdir = dir.path().join("spill_xor8");
+            let tdir = dir.path().join("spill_filter");
             let mut t = new_table(&tdir, schema, 7301, 128, RecoverySource::SalReplay);
             t.set_inmem_ceiling_for_test(100);
 
@@ -2112,7 +2119,7 @@ mod tests {
             assert_eq!(t.ram_bytes(), 0, "ceiling breach spilled to disk");
             let shards = t.all_shard_arcs();
             assert_eq!(shards.len(), 1, "one spilled shard");
-            assert!(shards[0].has_xor8(), "SalReplay spill must carry the XOR8 filter");
+            assert!(shards[0].has_shard_filter(), "SalReplay spill must carry the PK filter");
         }
     }
 
@@ -2664,7 +2671,7 @@ mod tests {
     }
 
     /// Only base-table paths point-probe a store by PK, and they are the only
-    /// readers of a shard's XOR8 filter. Silent both ways: a missing filter
+    /// readers of a shard's PK filter. Silent both ways: a missing filter
     /// still answers every probe (just slower), a useless one costs only bytes.
     #[test]
     fn pk_filter_follows_whether_the_store_is_probed() {
@@ -2688,7 +2695,7 @@ mod tests {
         let shards = base.all_shard_arcs();
         assert!(shards.len() > 1, "spills and compaction outputs both present");
         assert!(
-            shards.iter().all(|s| s.has_xor8()),
+            shards.iter().all(|s| s.has_shard_filter()),
             "a probed store filters every shard"
         );
 
@@ -2698,7 +2705,7 @@ mod tests {
             RecoverySource::Rederive { resume_at: None },
         );
         assert!(
-            reder.all_shard_arcs().iter().all(|s| !s.has_xor8()),
+            reder.all_shard_arcs().iter().all(|s| !s.has_shard_filter()),
             "a store nothing probes builds no filter",
         );
         assert!(

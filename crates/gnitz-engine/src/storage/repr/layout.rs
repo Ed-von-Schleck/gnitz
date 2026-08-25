@@ -11,14 +11,14 @@ pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// sizes come from that schema, so they reject most shards written under a
 /// different one; a Constant-encoded region is one element wide under either
 /// schema, and only this word rejects that.
-pub(crate) const SHARD_VERSION: u64 = 14;
+pub(crate) const SHARD_VERSION: u64 = 15;
 
 /// Pin the system-family column shapes to the version word above, the way
 /// `gnitz_wire::wal` pins them to `WAL_FORMAT_VERSION`. Nothing else notices a
 /// shape change. If this fails, bump `SHARD_VERSION` and paste the reported
 /// digest here.
 const _: () = assert!(
-    gnitz_wire::SYS_SCHEMA_DIGEST == 14684290124813841089 && SHARD_VERSION == 14,
+    gnitz_wire::SYS_SCHEMA_DIGEST == 14684290124813841089 && SHARD_VERSION == 15,
     "system-family column shapes changed: bump SHARD_VERSION"
 );
 pub(crate) const HEADER_SIZE: usize = 64;
@@ -48,9 +48,19 @@ pub(crate) const OFF_FILE_NPC: usize = 32;
 /// word are otherwise unused and already inside [`desc_digest`]'s span, so the
 /// bit is as unforgeable as any other descriptive byte.
 pub(crate) const SHARD_FLAG_SKELETON: u64 = 1 << 63;
-pub(crate) const OFF_XOR8_OFFSET: usize = 40;
-pub(crate) const OFF_XOR8_SIZE: usize = 48;
-pub(crate) const OFF_XOR8_CHECKSUM: usize = 56;
+pub(crate) const OFF_SHARD_FILTER_OFFSET: usize = 40;
+pub(crate) const OFF_SHARD_FILTER_SIZE: usize = 48;
+pub(crate) const OFF_SHARD_FILTER_CHECKSUM: usize = 56;
+
+/// The shard filter's region is `[descriptor: DMA_LEN][fingerprints]`, split at
+/// a constant rather than at a framed length — so the dependency's descriptor
+/// width is part of the on-disk format, and a change to it would reinterpret
+/// every fingerprint byte of every existing shard. It has to fail the build
+/// instead: bump `SHARD_VERSION` and paste the new width here.
+const _: () = assert!(
+    xorf::Descriptor::DMA_LEN == 20,
+    "BinaryFuse8 descriptor width changed: bump SHARD_VERSION",
+);
 
 /// Byte offset of directory entry `i`. The directory follows the header
 /// immediately, so an entry's position is implied by its index — the file

@@ -145,7 +145,7 @@ impl Table {
             // L0 spill/checkpoint shards stay plain (no FoR packing), and carry
             // a PK filter only where something point-probes this store.
             shard_file::ShardWriteOpts {
-                skip_pk_filter: self.is_rederived(),
+                skip_pk_filter: self.shard_index.skip_pk_filter(),
                 ..Default::default()
             },
         );

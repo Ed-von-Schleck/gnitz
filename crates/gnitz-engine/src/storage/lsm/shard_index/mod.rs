@@ -211,16 +211,16 @@ impl ShardEntry {
     }
 
     /// Probe this shard for a PK by its OPK `key` bytes (exactly `pk_stride`
-    /// wide). `xor8_key` is `probe_key(key)` — the caller hoists it because
+    /// wide). `filter_key` is `probe_key(key)` — the caller hoists it because
     /// it is the same value for every shard in one sweep.
-    fn probe_pk_bytes(&self, key: &[u8], xor8_key: u64) -> Option<(Rc<MappedShard>, usize)> {
+    fn probe_pk_bytes(&self, key: &[u8], filter_key: u64) -> Option<(Rc<MappedShard>, usize)> {
         if self.is_empty() {
             return None;
         }
         if !pk_in_range(self.pk_min.pk_bytes(), self.pk_max.pk_bytes(), key) {
             return None;
         }
-        if !self.shard.xor8_may_contain(xor8_key) {
+        if !self.shard.shard_filter_may_contain(filter_key) {
             return None;
         }
         let idx = self.shard.find_lower_bound_bytes(key);
@@ -446,7 +446,7 @@ pub(super) struct ShardIndex {
 
 impl ShardIndex {
     /// `skip_pk_filter` declares that nothing point-probes this store by PK, so
-    /// its shards need no XOR8 filter.
+    /// its shards need no PK filter.
     pub(super) fn new(table_id: u32, output_dir: &str, schema: SchemaDescriptor, skip_pk_filter: bool) -> Self {
         ShardIndex {
             table_id,
@@ -462,6 +462,20 @@ impl ShardIndex {
             dropped_through: 0,
             skip_pk_filter,
         }
+    }
+
+    /// Whether this store's writes skip the PK filter. Every write reads it
+    /// here — the spill path and compaction must agree, or a store's shards
+    /// disagree about whether a probe can trust them.
+    pub(super) fn skip_pk_filter(&self) -> bool {
+        self.skip_pk_filter
+    }
+
+    /// Test helper: flip the filter off for a store that would otherwise build
+    /// one, so a benchmark can price what the filter costs.
+    #[cfg(test)]
+    pub(super) fn set_skip_pk_filter_for_test(&mut self, skip: bool) {
+        self.skip_pk_filter = skip;
     }
 
     /// Bound this store's registered shard bytes, once, at construction.
@@ -504,7 +518,7 @@ impl ShardIndex {
     /// `null_pad_mask` cannot be retrofitted. Old `Rc`s held by in-flight
     /// consumers stay valid and drop naturally.
     ///
-    /// Re-opening re-reads each shard's XOR8 filter, so this costs one extra
+    /// Re-opening re-reads each shard's PK filter, so this costs one extra
     /// filter allocation per shard until the commit drops the old handles.
     pub(super) fn reopen_all(&self, new_schema: &SchemaDescriptor) -> Result<Vec<Rc<MappedShard>>, StorageError> {
         if new_schema.num_payload_cols() == self.schema.num_payload_cols() {

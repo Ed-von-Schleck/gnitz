@@ -7,7 +7,7 @@ edition = "2021"
 gnitz-wire  = { path = "../gnitz-wire" }
 gnitz-expr  = { path = "../gnitz-expr" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-xorf = { version = "0.12", default-features = false }
+xorf = { version = "0.13", default-features = false, features = ["binary-fuse"] }
 libc = "0.2"
 io-uring = "0.7"
 rustc-hash = "2"

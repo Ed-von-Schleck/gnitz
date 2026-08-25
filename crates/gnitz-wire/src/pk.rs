@@ -183,7 +183,7 @@ pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mu
 /// mirrors: the general arm's `copy_from_slice` has a runtime length, so it
 /// lowers to a zeroed 16-byte stack buffer plus a `memcpy` call, while a whole-
 /// width arm is one load and one `bswap`. This is the bottom of every PK→u128
-/// conversion — partition routing, XOR8 probes, the merge path. Compound widths
+/// conversion — partition routing, shard PK-filter probes, the merge path. Compound widths
 /// 9..=15 (e.g. `(U32, U64)` = 12) get two overlapping loads for the same reason;
 /// only 3/5/6/7 still reach the buffer.
 /// `widen_pk_be_matches_the_general_form` pins every stride against it.
@@ -312,7 +312,7 @@ pub const MAX_WORKERS: usize = 64;
 /// Which worker owns `key`.
 ///
 /// Multiplicative hash: two Fibonacci multipliers XOR'd together, then
-/// [`bucket`]. XXH3 is reserved for filters (xor8, bloom) where collision
+/// [`bucket`]. XXH3 is reserved for filters (the shard PK filter, bloom) where collision
 /// quality matters.
 ///
 /// The count is a parameter: every producer and consumer of a row must route it

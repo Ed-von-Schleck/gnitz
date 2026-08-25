@@ -10,8 +10,6 @@
 
 use std::cell::OnceCell;
 
-use xorf::Xor8;
-
 use super::shard_file::DecodedRegion;
 #[cfg(test)]
 use gnitz_wire::as_le_bytes;
@@ -114,8 +112,9 @@ pub(crate) struct MappedShard {
     pub(crate) null_pad_mask: u64,
     pub(crate) blob_off: usize,
     pub(crate) blob_len: usize,
-    /// XOR8 membership filter (loaded from embedded header data).
-    xor8_filter: Option<Xor8>,
+    /// PK membership filter over this file's own filter region, or `None` when
+    /// the file carries none.
+    shard_filter: Option<super::shard_filter::ShardFilter>,
     /// Encoded OPK width per row: the sum of the PK columns' widths.
     pub(crate) pk_stride: u8,
     /// `SHARD_FLAG_SKELETON`: this file's rows are (PK, coarse weight) pairs
@@ -1553,18 +1552,18 @@ mod tests {
     }
 
     /// The filter's own digest, which lives outside the descriptive prefix. A
-    /// corrupt filter still deserializes and answers "not present" for keys the
-    /// shard holds, so rejecting it is not optional.
+    /// corrupt filter's descriptor drives `contains`'s fingerprint indexing, so
+    /// probing one panics; rejecting it is not optional.
     #[test]
-    fn forged_xor8_rejected() {
+    fn forged_shard_filter_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_u64_i64();
         let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64)).collect();
         let path = build_test_shard(dir.path(), &rows);
         let base = std::fs::read(&path).unwrap();
-        let xoff = read_u64_le(&base, OFF_XOR8_OFFSET) as usize;
-        let xsz = read_u64_le(&base, OFF_XOR8_SIZE) as usize;
-        assert!(xoff > 0 && xsz >= 16);
+        let xoff = read_u64_le(&base, OFF_SHARD_FILTER_OFFSET) as usize;
+        let xsz = read_u64_le(&base, OFF_SHARD_FILTER_SIZE) as usize;
+        assert!(xoff > 0 && xsz > xorf::Descriptor::DMA_LEN);
 
         // The patches land outside the prefix, so the stale descriptive digest is
         // irrelevant and the verdict is the filter digest's.
@@ -1582,11 +1581,40 @@ mod tests {
             open_patched(&path, &schema, &base, |d| {
                 d[xoff + 4] ^= 0x01;
                 let cs = xxh::checksum(&d[xoff..xoff + xsz]);
-                write_u64_le(d, OFF_XOR8_CHECKSUM, cs);
+                write_u64_le(d, OFF_SHARD_FILTER_CHECKSUM, cs);
             })
             .err(),
             Some(StorageError::ChecksumMismatch),
             "a re-stamped filter checksum is inside the descriptive digest",
+        );
+    }
+
+    /// A structurally invalid filter region fails the open rather than degrading
+    /// to filterless — its descriptor drives `contains`'s indexing, and the
+    /// checksum runs ahead of the parse, so reaching this means a writer bug.
+    /// Both digests are re-stamped, the filter's own living inside the
+    /// descriptive one, or the verdict would be `ChecksumMismatch` and the rule
+    /// under test never reached.
+    #[test]
+    fn a_structurally_invalid_filter_fails_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64_i64();
+        let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64)).collect();
+        let path = build_test_shard(dir.path(), &rows);
+        let base = std::fs::read(&path).unwrap();
+        let xoff = read_u64_le(&base, OFF_SHARD_FILTER_OFFSET) as usize;
+        let xsz = read_u64_le(&base, OFF_SHARD_FILTER_SIZE) as usize;
+
+        assert_eq!(
+            open_patched_restamped(&path, &schema, &base, |d| {
+                // `segment_length_mask` (descriptor bytes 12..16) no longer
+                // agrees with `segment_length`.
+                d[xoff + 12] ^= 0x01;
+                let cs = xxh::checksum(&d[xoff..xoff + xsz]);
+                write_u64_le(d, OFF_SHARD_FILTER_CHECKSUM, cs);
+            })
+            .err(),
+            Some(StorageError::InvalidShard),
         );
     }
 
@@ -1596,10 +1624,10 @@ mod tests {
         let schema = make_schema_u64_i64();
         let path = build_test_shard(dir.path(), &[]);
         let image = std::fs::read(&path).unwrap();
-        assert_eq!(read_u64_le(&image, OFF_XOR8_OFFSET), 0);
-        assert_eq!(read_u64_le(&image, OFF_XOR8_CHECKSUM), 0);
+        assert_eq!(read_u64_le(&image, OFF_SHARD_FILTER_OFFSET), 0);
+        assert_eq!(read_u64_le(&image, OFF_SHARD_FILTER_CHECKSUM), 0);
         let shard = MappedShard::open(&std::ffi::CString::new(path).unwrap(), &schema, true).unwrap();
-        assert!(!shard.has_xor8());
+        assert!(!shard.has_shard_filter());
     }
 
     /// The digest is seeded with the basename and nothing else: a shard renamed

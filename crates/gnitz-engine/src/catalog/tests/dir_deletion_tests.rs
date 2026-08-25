@@ -629,7 +629,7 @@ fn repartition_handles_a_relation_with_empty_children() {
         .collect();
     assert!(!relaid.is_empty(), "the relayout wrote shards");
     assert!(
-        relaid.iter().all(|s| s.has_xor8()),
+        relaid.iter().all(|s| s.has_shard_filter()),
         "a relayout writes probed base shards",
     );
     assert!(got.iter().all(|&(_, _, w)| w == 1), "no row may double");

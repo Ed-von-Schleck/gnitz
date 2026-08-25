@@ -103,7 +103,7 @@ fn shard_merge_scan_bench() {
 /// shuffled `seek_bytes` probes drawn ~50/50 from present keys and absent keys
 /// (odd keys landing *between* the sparse even shard keys → lower-bound
 /// resolution). Both APIs run a raw-`memcmp` binary-search/gallop over the PK
-/// region — they do not consult the XOR8 filter — so this pins the
+/// region — they do not consult the PK filter — so this pins the
 /// gallop/binary-search cost.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]

@@ -12,7 +12,7 @@ use libc::c_int;
 use super::super::error::StorageError;
 use super::batch::{strides_from_schema, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
-use super::xor8;
+use super::shard_filter;
 use crate::foundation::posix_io;
 use crate::foundation::xxh;
 use crate::schema::key::probe_key;
@@ -20,7 +20,7 @@ use crate::schema::SchemaDescriptor;
 use gnitz_wire::{
     is_fixed_int, is_signed_int, read_i64_le, read_signed_exact, read_u64_le, read_unsigned_exact, write_u64_le,
 };
-use xorf::Xor8;
+use xorf::BinaryFuse8;
 
 fn align64(val: usize) -> usize {
     (val + ALIGNMENT - 1) & !(ALIGNMENT - 1)
@@ -300,15 +300,17 @@ pub(crate) fn region_dir(image: &[u8], i: usize) -> (usize, u8) {
     (e.size, e.encoding)
 }
 
-fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
+fn build_shard_filter_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<BinaryFuse8> {
+    // `chunks_exact(0)` panics, and a non-empty region does not exclude a zero
+    // stride.
     if pk_bytes.is_empty() || stride == 0 {
         return None;
     }
     // One hashed key per distinct PK. The PK region is sorted, so rows that
     // share a PK but differ in payload (valid under (PK, payload) element
     // identity) are adjacent — skipping chunks byte-equal to their predecessor
-    // is an O(n) pre-shrink that keeps `build`'s sort at d distinct keys
-    // instead of n rows on duplicate-PK trace shards (MIN/MAX AggValueIndex).
+    // is an allocation-free O(n) pre-shrink that bounds `build`'s sort at the
+    // number of *distinct* PKs in the region rather than its row count.
     // `probe_key` owns the narrow/wide derivation the probe side must
     // match exactly.
     let mut keys: Vec<u64> = Vec::with_capacity(pk_bytes.len() / stride);
@@ -320,7 +322,7 @@ fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
         prev = Some(chunk);
         keys.push(probe_key(chunk));
     }
-    xor8::build(keys)
+    shard_filter::build(keys)
 }
 
 /// Per-call policy for the shard writers ([`write_shard_streaming`] /
@@ -336,10 +338,11 @@ fn build_xor8_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<Xor8> {
 /// independent policies over one write. They merely never co-occur today, since
 /// a skeleton's schema has no payload region to pack.
 ///
-/// `skip_pk_filter` drops the XOR8 PK filter, for a store nothing point-probes.
+/// `skip_pk_filter` drops the shard PK filter, for a store nothing point-probes.
 /// Named for what it turns *off* so the derived default keeps building one: a
-/// missing filter changes no answer (`xor8_may_contain` admits everything on a
-/// filterless shard), so the wrong default would be invisible to every test.
+/// missing filter changes no answer (`shard_filter_may_contain` admits
+/// everything on a filterless shard), so the wrong default would be invisible to
+/// every test.
 ///
 /// Durability is not a per-write choice: the flush barrier fdatasyncs every
 /// registered-unsynced shard in one batched io_uring submission, then fsyncs the
@@ -443,7 +446,7 @@ fn check_region_shape(regions: &[&[u8]], n: usize, strides: &[u8], nr: usize) ->
     Ok(())
 }
 
-/// Open the .tmp shard, write header+regions+xor8, and close it — unsynced,
+/// Open the .tmp shard, write header+regions+filter, and close it — unsynced,
 /// since the flush barrier fdatasyncs every registered file later. Returns the
 /// .tmp's name for the caller to rename. On error the .tmp is unlinked.
 #[allow(clippy::needless_range_loop)]
@@ -514,11 +517,11 @@ fn write_shard_streaming_inner(
         encodings.push(enc);
     }
 
-    // --- Phase 2: XOR8 filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
+    // --- Phase 2: PK filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
     // A store nothing point-probes writes no filter: the build, the file bytes
     // and the open-time checksum are all work for a reader that does not exist.
-    let xor8_filter = if row_count > 0 && !opts.skip_pk_filter {
-        build_xor8_from_pk_region(regions[REG_PK], schema.pk_stride() as usize)
+    let pk_filter = if row_count > 0 && !opts.skip_pk_filter {
+        build_shard_filter_from_pk_region(regions[REG_PK], schema.pk_stride() as usize)
     } else {
         None
     };
@@ -534,11 +537,11 @@ fn write_shard_streaming_inner(
     // num_regions >= 4 always (pk, weight, null, blob at minimum).
     let data_end = region_offsets[num_regions - 1] + actual_sizes[num_regions - 1];
 
-    let xor8_data = xor8_filter.as_ref().map(xor8::serialize);
-    let xor8_offset = if xor8_data.is_some() { align64(data_end) } else { 0 };
-    let xor8_size = xor8_data.as_ref().map_or(0, |d| d.len());
-    let total_size = if xor8_data.is_some() {
-        xor8_offset + xor8_size
+    let filter_data = pk_filter.as_ref().map(shard_filter::serialize);
+    let filter_offset = if filter_data.is_some() { align64(data_end) } else { 0 };
+    let filter_size = filter_data.as_ref().map_or(0, |d| d.len());
+    let total_size = if filter_data.is_some() {
+        filter_offset + filter_size
     } else {
         data_end
     };
@@ -586,15 +589,15 @@ fn write_shard_streaming_inner(
         OFF_FILE_NPC,
         schema.num_payload_cols() as u64 | if skeleton { SHARD_FLAG_SKELETON } else { 0 },
     );
-    write_u64_le(&mut hdr_buf, OFF_XOR8_OFFSET, xor8_offset as u64);
-    write_u64_le(&mut hdr_buf, OFF_XOR8_SIZE, xor8_size as u64);
-    // A filterless shard carries 0 here and `xor8_offset == 0`, which is the
+    write_u64_le(&mut hdr_buf, OFF_SHARD_FILTER_OFFSET, filter_offset as u64);
+    write_u64_le(&mut hdr_buf, OFF_SHARD_FILTER_SIZE, filter_size as u64);
+    // A filterless shard carries 0 here and `filter_offset == 0`, which is the
     // reader's own filterless arm. The field sits in the header, so the digest
     // below closes over it: a forged filter cannot be re-stamped to match.
     write_u64_le(
         &mut hdr_buf,
-        OFF_XOR8_CHECKSUM,
-        xor8_data.as_ref().map_or(0, |d| xxh::checksum(d)),
+        OFF_SHARD_FILTER_CHECKSUM,
+        filter_data.as_ref().map_or(0, |d| xxh::checksum(d)),
     );
 
     // Last, over every other field. `basename` is the *final* name — the `.tmp`
@@ -630,8 +633,8 @@ fn write_shard_streaming_inner(
         }
     }
 
-    if let Some(ref data) = xor8_data {
-        file.write_all_at(data, xor8_offset as u64).map_err(abort)?;
+    if let Some(ref data) = filter_data {
+        file.write_all_at(data, filter_offset as u64).map_err(abort)?;
     }
 
     drop(file); // Closed before the caller renames, matching the manifest path.
@@ -645,6 +648,7 @@ mod tests {
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::{make_schema_u64_i64, pk_only_schema};
     use gnitz_wire::as_le_bytes;
+    use xorf::Filter;
 
     #[test]
     fn build_image_roundtrip() {
@@ -680,8 +684,8 @@ mod tests {
         assert_eq!(read_u64_le(&image, OFF_MAGIC), SHARD_MAGIC);
         assert_eq!(read_u64_le(&image, OFF_VERSION), SHARD_VERSION);
         assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), 3);
-        assert!(read_u64_le(&image, OFF_XOR8_OFFSET) > 0);
-        assert!(read_u64_le(&image, OFF_XOR8_SIZE) > 0);
+        assert!(read_u64_le(&image, OFF_SHARD_FILTER_OFFSET) > 0);
+        assert!(read_u64_le(&image, OFF_SHARD_FILTER_SIZE) > 0);
     }
 
     #[test]
@@ -698,7 +702,7 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 0);
-        assert!(!shard.has_xor8());
+        assert!(!shard.has_shard_filter());
     }
 
     /// write_shard_streaming roundtrip — PK + weight + null_bmp + i64 value regions.
@@ -744,10 +748,10 @@ mod tests {
         assert_eq!(shard.get_weight(0), 1);
         assert_eq!(shard.get_weight(1), 1);
         assert_eq!(shard.get_weight(2), 1);
-        assert!(shard.has_xor8());
-        assert!(shard.xor8_may_contain(probe_key(&10u64.to_be_bytes())));
-        assert!(shard.xor8_may_contain(probe_key(&20u64.to_be_bytes())));
-        assert!(shard.xor8_may_contain(probe_key(&30u64.to_be_bytes())));
+        assert!(shard.has_shard_filter());
+        assert!(shard.shard_filter_may_contain(probe_key(&10u64.to_be_bytes())));
+        assert!(shard.shard_filter_may_contain(probe_key(&20u64.to_be_bytes())));
+        assert!(shard.shard_filter_may_contain(probe_key(&30u64.to_be_bytes())));
     }
 
     #[test]
@@ -789,13 +793,70 @@ mod tests {
         for (i, &expected_pk) in pks.iter().enumerate() {
             assert_eq!(shard.get_pk(i), expected_pk as u128, "get_pk row {i}");
         }
-        assert!(shard.has_xor8());
+        assert!(shard.has_shard_filter());
         for &pk in &pks {
             assert!(
-                shard.xor8_may_contain(probe_key(&pk.to_be_bytes())),
-                "XOR8 must contain PK {pk}"
+                shard.shard_filter_may_contain(probe_key(&pk.to_be_bytes())),
+                "the PK filter must contain PK {pk}"
             );
         }
+    }
+
+    /// No false negatives through the real write → `open` → probe path, at a
+    /// key count where the construction picks a segment geometry the handful of
+    /// rows the other shard tests write never reach. The in-module
+    /// `build_and_query_no_false_negatives` covers the same property in memory;
+    /// this one is what a descriptor that survives the round trip but is
+    /// reassembled wrong would fail.
+    #[test]
+    fn no_false_negatives_through_write_open_probe() {
+        const N: usize = 200_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fn.db");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        // Members and non-members from one stream, split by parity of the draw,
+        // so neither set is a range the other can be confused with.
+        let mut rng = crate::test_rng::Rng::new(0xF11E_5EED);
+        let mut members: Vec<u64> = (0..N).map(|_| rng.next_u64()).collect();
+        let absent: Vec<u64> = (0..N).map(|_| rng.next_u64()).collect();
+        // The PK region is sorted by (PK, payload) — the writer's contract.
+        members.sort_unstable();
+        members.dedup();
+        let n = members.len() as u32;
+
+        let weights: Vec<i64> = vec![1; members.len()];
+        let nulls: Vec<u64> = vec![0; members.len()];
+        let vals: Vec<i64> = members.iter().map(|&p| p as i64).collect();
+        let pk_bytes: Vec<u8> = members.iter().flat_map(|p| p.to_be_bytes()).collect();
+        let blob: Vec<u8> = vec![];
+        let regions: Vec<&[u8]> = vec![
+            &pk_bytes,
+            as_le_bytes(&weights),
+            as_le_bytes(&nulls),
+            as_le_bytes(&vals),
+            &blob,
+        ];
+
+        let schema = make_schema_u64_i64();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, n, &regions, &schema, ShardWriteOpts::default()).unwrap();
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        assert!(shard.has_shard_filter());
+
+        for &pk in &members {
+            assert!(
+                shard.shard_filter_may_contain(probe_key(&pk.to_be_bytes())),
+                "false negative for PK {pk}",
+            );
+        }
+        // The filter still discriminates: at ~0.4% nominal, a filter that
+        // admitted everything (or was rebuilt against the wrong fingerprints)
+        // would blow this bound rather than fail above.
+        let fp = absent
+            .iter()
+            .filter(|&&pk| shard.shard_filter_may_contain(probe_key(&pk.to_be_bytes())))
+            .count();
+        assert!(fp * 100 < N, "false-positive rate above 1%: {fp}/{N}");
     }
 
     #[test]
@@ -1046,55 +1107,50 @@ mod tests {
     }
 
     #[test]
-    fn build_xor8_wide_compound_region() {
+    fn build_filter_wide_compound_region() {
         let stride = 24usize;
         let rows: Vec<Vec<u8>> = (0u8..5)
             .map(|r| (0..stride).map(|b| r.wrapping_add(b as u8)).collect())
             .collect();
         let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
-        let f = build_xor8_from_pk_region(&pk_bytes, stride).expect("wide compound region must build a filter");
+        let f = build_shard_filter_from_pk_region(&pk_bytes, stride).expect("wide compound region must build a filter");
         for row in &rows {
-            assert!(
-                xor8::may_contain(&f, probe_key(row)),
-                "no false negative for wide-region row"
-            );
+            assert!(f.contains(&probe_key(row)), "no false negative for wide-region row");
         }
     }
 
     #[test]
-    fn build_xor8_narrow_compound_region() {
+    fn build_filter_narrow_compound_region() {
         let stride = 12usize;
         let rows: Vec<Vec<u8>> = (0u8..5)
             .map(|r| (0..stride).map(|b| r.wrapping_mul(7).wrapping_add(b as u8)).collect())
             .collect();
         let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
-        let f = build_xor8_from_pk_region(&pk_bytes, stride).expect("narrow compound region must build a filter");
+        let f =
+            build_shard_filter_from_pk_region(&pk_bytes, stride).expect("narrow compound region must build a filter");
         for row in &rows {
             // Builder fingerprint for stride <= 16 is widen_pk_be(OPK bytes);
             // the probe must derive the same value.
-            assert!(
-                xor8::may_contain(&f, probe_key(row)),
-                "no false negative for narrow-compound row"
-            );
+            assert!(f.contains(&probe_key(row)), "no false negative for narrow-compound row");
         }
     }
 
     #[test]
-    fn build_xor8_single_pk_regression() {
+    fn build_filter_single_pk_regression() {
         let pks64: Vec<u64> = vec![10, 20, 30, 40];
         // OPK at rest: U64 region is big-endian.
         let b64: Vec<u8> = pks64.iter().flat_map(|p| p.to_be_bytes()).collect();
-        let f64 = build_xor8_from_pk_region(&b64, 8).expect("8-byte region must build a filter");
+        let f64 = build_shard_filter_from_pk_region(&b64, 8).expect("8-byte region must build a filter");
         for p in &pks64 {
-            assert!(xor8::may_contain(&f64, probe_key(&p.to_be_bytes())));
+            assert!(f64.contains(&probe_key(&p.to_be_bytes())));
         }
 
         let pks128: Vec<u128> = vec![1, 1 << 64, u128::MAX, 12345];
         // OPK at rest: U128 region is big-endian.
         let b128: Vec<u8> = pks128.iter().flat_map(|p| p.to_be_bytes()).collect();
-        let f128 = build_xor8_from_pk_region(&b128, 16).expect("16-byte region must build a filter");
+        let f128 = build_shard_filter_from_pk_region(&b128, 16).expect("16-byte region must build a filter");
         for p in &pks128 {
-            assert!(xor8::may_contain(&f128, probe_key(&p.to_be_bytes())));
+            assert!(f128.contains(&probe_key(&p.to_be_bytes())));
         }
     }
 }
