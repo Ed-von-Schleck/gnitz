@@ -316,6 +316,9 @@ list, this is not. The ones whose semantics are not obvious from the name:
   (which carries the SQL planner) before running pytest. Maturin no-ops when
   nothing changed, so the rebuild costs nothing — never skip it, and never
   trust a stale binary.
+- **`make e2e-checked`** runs the suite against release codegen with the Z-set
+  layout verifiers left in. Run it when the unsafe batch kernels changed or a
+  bug is release-only — release compiles the layout verifiers out.
 
 ## Project structure
 

@@ -28,7 +28,8 @@ TARGET_CPU ?= x86-64-v3
 
 .PHONY: all help \
         test rust-engine-test fmt fmt-check clippy check verify \
-        server release-server pyext pyext-release e2e e2e-tls e2e-release release-test \
+        server release-server checked-server pyext pyext-release e2e e2e-tls e2e-release \
+        e2e-checked release-test \
         clean distclean \
         bench bench-full bench-features bench-txn bench-sweep bench-sweep-dwarf \
         bench-perf bench-perf-dwarf bench-native bench-profile profiling-server profiling-server-dwarf
@@ -75,6 +76,10 @@ release-server: ## Build the release server binary -> ./gnitz-server-release
 	cd crates && cargo build --release -p gnitz-server
 	cp crates/target/release/gnitz-server gnitz-server-release
 
+checked-server: ## Build the release server WITH the Z-set layout verifiers -> ./gnitz-server-checked
+	cd crates && cargo build --profile release-checked -p gnitz-server
+	cp crates/target/release-checked/gnitz-server gnitz-server-checked
+
 pyext: ## Build & install the Python extension (debug) into the uv venv
 	cd crates/gnitz-py && uv run maturin develop
 
@@ -95,6 +100,15 @@ e2e-release: release-server pyext ## Run the E2E suite against the release serve
 	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release GNITZ_WORKERS=$(WORKERS) \
 		uv run pytest tests/ -v $(if $(K),-k '$(K)')
 
+# Release codegen with the layout verifiers live — the only build where the
+# kernels that ship and the checks that would catch them over-claiming both
+# exist. An over-claimed batch aborts the server here instead of silently
+# folding weights against the wrong element.
+e2e-checked: WORKERS = 4
+e2e-checked: checked-server pyext ## Run the E2E suite against the layout-verifying release server
+	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-checked GNITZ_WORKERS=$(WORKERS) \
+		uv run pytest tests/ -v $(if $(K),-k '$(K)')
+
 release-test: e2e-release ## Validate the release build end-to-end
 
 # ---------------------------------------------------------------------------
@@ -103,7 +117,7 @@ release-test: e2e-release ## Validate the release build end-to-end
 
 clean: ## Remove built binaries + per-run scratch data (keeps post-mortem logs)
 	@echo "Removing server binaries and per-run scratch data..."
-	@rm -f gnitz-server gnitz-server-release gnitz-server-profiling
+	@rm -f gnitz-server gnitz-server-release gnitz-server-checked gnitz-server-profiling
 	rm -f crates/gnitz-py/python/gnitz/_native*.so
 	@rm -rf tmp/pytest-of-* tmp/bench_*
 

@@ -139,6 +139,7 @@ cython_debug/
 # Server binaries (built by Makefile)
 /gnitz-server
 /gnitz-server-release
+/gnitz-server-checked
 /gnitz-server-profiling
 /gnitz-server-profiling-dwarf
 

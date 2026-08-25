@@ -29,6 +29,21 @@ panic = "abort"
 # not per row.
 lto = true
 
+[profile.release-checked]
+# Release codegen with the Z-set layout verifiers left in. `[profile.release]`
+# is the only configuration the LTO'd, vectorised batch kernels ever run in, and
+# it is also the one where `certify_layout` degrades to a bare field store — so
+# a kernel that over-claims `Sorted`/`Consolidated` corrupts weights silently
+# with nothing to catch it. This profile reunites the two: reach for it when a
+# batch kernel changed or a bug reproduces only in release. Never the inner
+# loop, and never benchmarked — the verifiers are an O(n) pass per batch.
+inherits = "release"
+debug-assertions = true
+# Independent of `debug-assertions`, and deliberately off: overflow-checks turn
+# a wrapping add into a panic, which is a different claim than "this batch is
+# laid out as its tag says". Keeping it off leaves an abort here unambiguous.
+overflow-checks = false
+
 [profile.dev]
 panic = "unwind"
 
