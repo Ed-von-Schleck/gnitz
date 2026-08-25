@@ -629,7 +629,7 @@ impl MasterDispatcher {
     /// One synchronous round (pre-reactor W2M path, or a reactor-parked window):
     /// emit the flush group, block for every worker's ACK, finalize.
     /// A `FLAG_FLUSH_EPH` round's `lsn` IS the checkpoint generation (workers
-    /// latch it via `set_committed_generation`); the base round passes 0.
+    /// latch it via `set_resume_generation`); the base round passes 0.
     fn sync_round(&self, lsn: u64, flags: u32) -> Result<(), String> {
         self.note_flush_round(lsn, flags);
         // No schema block: `handle_flush_all` takes neither a schema nor a batch.
@@ -1568,8 +1568,8 @@ impl MasterDispatcher {
     /// workers read to stamp view manifests (the base round passes 0).
     ///
     /// Every worker gets a bare control block: `handle_flush_all` takes neither a
-    /// schema nor a batch, and reads the generation from
-    /// `worker_ctx::committed_generation()`.
+    /// schema nor a batch, and reads the generation the worker latched into its
+    /// catalog off this round's header.
     pub(crate) fn write_checkpoint_group(&self, lsn: u64, flags: u32, req_ids: &[u64]) -> Result<(), String> {
         self.note_flush_round(lsn, flags);
         self.write_command_group(0, lsn, flags, 0, 0, 0, req_ids, Fanout::Broadcast, 0, &[])
@@ -1607,8 +1607,8 @@ impl MasterDispatcher {
     }
 
     /// Bump the committed checkpoint generation (step 0 of the sequence).
-    /// Delegates to the catalog: durably records the seq-4 row and publishes the
-    /// new value to `worker_ctx`. Returns the new generation.
+    /// Delegates to the catalog: durably records the seq-4 row and moves this
+    /// engine's resume generation onto it. Returns the new generation.
     pub(crate) fn bump_checkpoint_generation(&self) -> Result<u64, String> {
         self.cat().bump_checkpoint_generation()
     }

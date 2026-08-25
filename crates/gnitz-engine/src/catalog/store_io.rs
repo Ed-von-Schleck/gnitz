@@ -550,7 +550,7 @@ impl CatalogEngine {
             // Only user base tables own index circuits, so a resolved index
             // implies an owned base store; a borrowed system table degrades to
             // the full scan like any other decline.
-            let Some(store) = entry.handle.as_owned_mut() else {
+            let Some(store) = entry.handle.as_owned() else {
                 return IndexScan::Decline("index owner holds no local base store".into());
             };
             if matches > store.estimated_rows() / INDEX_SCAN_RATIO {

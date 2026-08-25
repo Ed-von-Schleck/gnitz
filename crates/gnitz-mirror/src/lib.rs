@@ -26,10 +26,10 @@
 //! # Threads and processes
 //!
 //! The handle is pinned to one thread — the engine's stores are `!Send` and the
-//! compiler enforces it — and there may be **one live handle per process**,
-//! because the engine publishes its resume generation into a process-global.
-//! Across processes the engine's own `flock` on the data directory is what
-//! refuses a second writer.
+//! compiler enforces it — and there is **one handle per data directory**. The
+//! engine's own `flock` on that directory is what refuses a second one, in this
+//! process or any other: a second `open` takes a fresh file description, which
+//! `flock` treats as a conflict.
 //!
 //! # The read ceiling a mirror inherits
 //!

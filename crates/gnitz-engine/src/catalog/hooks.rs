@@ -243,13 +243,19 @@ impl CatalogEngine {
             })
             .transpose()?;
 
-        // Above `ensure_dir`: a kind with no recovery source owns no store in any
-        // process, so no directory is created for one.
-        let Some(recovery) = kind.recovery_source() else {
-            return Ok(RelationStores {
-                handle: StoreHandle::Detached,
-                delta: None,
-            });
+        // Above `ensure_dir`: a storeless kind owns no store in any process, so no
+        // directory is created for one.
+        let recovery = match kind {
+            RelationKind::Stream => {
+                return Ok(RelationStores {
+                    handle: StoreHandle::Detached,
+                    delta: None,
+                })
+            }
+            // A view's output store and its operator traces resume from the
+            // manifest the ephemeral checkpoint round stamped, or are rebuilt.
+            RelationKind::View => self.rederive_source(),
+            RelationKind::SystemCatalog | RelationKind::BaseTable => RecoverySource::SalReplay,
         };
         ensure_dir(directory)?;
         if !self.owns_stores {
@@ -367,7 +373,7 @@ impl CatalogEngine {
         // owns a store creates one at all — a boot replay reopens a directory that
         // is already there, so there is nothing new to make durable. A storeless
         // kind's definition rides on the system tables like any other row.
-        if self.ctx.is_live() && kind.recovery_source().is_some() {
+        if self.ctx.is_live() && kind.owns_store() {
             let _ = fsync_dir(&schema_dir(&self.base_dir, &schema_name));
         }
         self.dag.register_table(

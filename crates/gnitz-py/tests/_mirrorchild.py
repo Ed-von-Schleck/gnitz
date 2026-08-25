@@ -49,11 +49,11 @@ def poison():
             pass
 
     # A poisoned handle can still be diagnosed and released; a close() that
-    # raised would strand the one-handle-per-process latch for the life of the
-    # interpreter.
+    # raised would hold its data directory for the life of the interpreter.
+    # Reopening `base` itself is what proves the lock came back.
     assert m.mirrors(0) is False
     m.close()
-    gnitz.Mirror(base + "2", target).close()
+    gnitz.Mirror(base, target).close()
 
 
 def crash():

@@ -90,19 +90,6 @@ pub enum RecoverySource {
     },
 }
 
-impl RecoverySource {
-    /// The rederive policy sampled at the current committed checkpoint
-    /// generation — the one constructor for a view's output store and its
-    /// operator-trace tables, so the reload gate's sample can never drift
-    /// between the two.
-    #[inline]
-    pub fn rederive_checkpointed_now() -> RecoverySource {
-        RecoverySource::Rederive {
-            resume_at: Some(crate::foundation::worker_ctx::committed_generation()),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Two-phase flush API
 // ---------------------------------------------------------------------------
@@ -347,6 +334,13 @@ impl Table {
     /// these.
     pub(crate) fn is_rederived(&self) -> bool {
         matches!(self.recovery_source, RecoverySource::Rederive { .. })
+    }
+
+    /// The policy this open accepted its on-disk state under — a frozen fact of
+    /// this open, not the engine's current verdict, which every later checkpoint
+    /// moves.
+    pub(crate) fn recovery_source(&self) -> RecoverySource {
+        self.recovery_source
     }
 
     /// True when the base round would publish this store at a cut newer than its

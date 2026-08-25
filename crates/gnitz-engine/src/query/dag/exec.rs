@@ -309,11 +309,12 @@ impl DagEngine {
         }
         // A backfilled view must be ephemeral: a durable one loads its shards
         // from its manifest at open, which would double-count against the deltas
-        // ingested below.
+        // ingested below. Narrower than "not `SalReplay`": a stream owns no store
+        // at all and would have passed that test, and cannot reach here either —
+        // `invalid_views` holds only view ids, and a backfill on a stream is
+        // rejected before this.
         debug_assert!(
-            self.tables
-                .get(&view_id)
-                .is_none_or(|e| e.kind.recovery_source() != Some(RecoverySource::SalReplay)),
+            self.tables.get(&view_id).is_none_or(|e| e.kind.is_view()),
             "distributed backfill into durable relation {view_id}: \
              would double-count loaded shards",
         );

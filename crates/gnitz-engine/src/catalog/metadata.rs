@@ -197,15 +197,21 @@ impl CatalogEngine {
 
     // -- Store handle accessors -----------------------------------------------
 
-    /// Get a `&mut Table` for a user relation's own store, or `None` if the
-    /// relation is absent, detached, or a `Borrowed` system table.
-    ///
-    /// SAFETY: hands out `&mut` from `&self` through the same `UnsafeCell`
-    /// contract as [`StoreHandle::as_owned_mut`] — no aliasing `&mut` into
-    /// the same store may be live across the call.
-    #[allow(clippy::mut_from_ref)]
-    pub fn get_store_handle(&self, table_id: i64) -> Option<&mut Table> {
-        self.dag.tables.get(&table_id).and_then(|e| e.handle.as_owned_mut())
+    /// A user relation's own store, or `None` if the relation is absent,
+    /// detached, or a `Borrowed` system table.
+    pub fn get_store_handle(&self, table_id: i64) -> Option<&Table> {
+        self.dag.tables.get(&table_id).and_then(|e| e.handle.as_owned())
+    }
+
+    /// Whether `tid`'s store came back from a checkpoint manifest at this open,
+    /// rather than being erased or created empty. `false` for a relation this
+    /// process holds no owned store for.
+    pub fn store_resumed(&self, tid: i64) -> bool {
+        self.dag
+            .tables
+            .get(&tid)
+            .and_then(|e| e.handle.as_owned())
+            .is_some_and(|t| t.resumed_from_checkpoint())
     }
 
     /// Get schema descriptor for a table. Registry-uniform: system tables are

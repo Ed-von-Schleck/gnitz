@@ -77,10 +77,9 @@ impl PyPollResult {
 /// **A mirrored read answers at the last poll**, not at what the server holds
 /// now: not read-your-own-writes, and two mirrored views are no consistent cut.
 ///
-/// **One live handle per process, one process per data directory.** Use
-/// `with Mirror(...) as m:` or call `close()` — the exit checkpoint runs from
-/// the handle's destructor, which an exiting interpreter may never run, and
-/// `close()` is what frees the one-per-process latch.
+/// **One handle per data directory.** Use `with Mirror(...) as m:` or call
+/// `close()` — the exit checkpoint runs from the handle's destructor, which an
+/// exiting interpreter may never run.
 ///
 /// **Use it from the thread that opened it, and from no other.** A second thread
 /// gets `pyo3_runtime.PanicException` from pyo3's borrow check — a
@@ -134,15 +133,8 @@ impl PyMirror {
         Ok(PyMirror { inner: Some(inner) })
     }
 
-    /// Whether this process currently holds a live handle, and so whether
-    /// `Mirror(...)` would be refused for that reason.
-    #[staticmethod]
-    pub fn any_live() -> bool {
-        Mirror::any_live()
-    }
-
-    /// Checkpoint (unless poisoned) and release the handle, freeing the
-    /// one-handle-per-process latch. Calling it twice is fine.
+    /// Checkpoint (unless poisoned) and release the handle. Calling it twice is
+    /// fine.
     pub fn close(&mut self) {
         drop(self.inner.take());
     }

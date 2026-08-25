@@ -116,8 +116,7 @@ pub(super) struct EmitCtx<'a> {
     pub loaded: &'a LoadedCircuit,
     pub skip_nodes: &'a HashSet<i32>,
     pub ext_tables: &'a ExtTables,
-    pub view_dir: &'a str,
-    pub view_id: u64,
+    pub site: super::ViewSite<'a>,
     pub builder: ProgramBuilder,
     pub out_reg_of: HashMap<i32, u16>,
     pub reg_meta: Vec<RegisterMeta>,
@@ -189,19 +188,11 @@ impl EmitCtx<'_> {
     /// directory, tracked by the scratch guard (so a later compile failure
     /// removes it).
     fn create_child_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<Table, CompileError> {
-        let child_dir = child_scratch_dir(self.view_dir, child_name);
+        let child_dir = child_scratch_dir(self.site.dir, child_name);
         // Track the path before creating so cleanup also removes a partially
         // created directory if Table::new fails.
         self.scratch.track(child_dir.clone());
-        // Only views compile plans, so a view's recovery policy applies: its
-        // operator-trace tables are `Rederive` (the ephemeral
-        // checkpoint round force-persists them with generation-stamped
-        // manifests). Never reached from index-circuit compilation, which builds
-        // its one table through `CatalogEngine::new_index_table` — also
-        // checkpointed, but against a verdict the catalog computes rather than
-        // this ambient read.
-        let recovery = RecoverySource::rederive_checkpointed_now();
-        Table::new(&child_dir, schema, self.view_id as u32, recovery)
+        Table::new(&child_dir, schema, self.site.id as u32, self.site.recovery)
             .map_err(|e| CompileError::StorageFailed("child table create failed", e))
     }
 
@@ -342,7 +333,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
             } else {
                 (-1, 1)
             };
-            let child_name = format!("_hist_{}_{nid}", ctx.view_id);
+            let child_name = format!("_hist_{}_{nid}", ctx.site.id);
             let hist_table_ptr = ctx.add_owned_trace_table(&child_name, in_reg_schema, Some(reg_id))?;
             let out_delta_id = ctx.push_delta_reg(in_reg_schema);
             ctx.out_reg_of.insert(nid, out_delta_id);
@@ -419,7 +410,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
         gnitz_wire::OpNode::IntegrateTrace => {
             let in_reg = ctx.in_reg(nid, PORT_IN, "integrate-trace: missing input port")?;
             let in_reg_schema = ctx.reg_meta[in_reg as usize].schema;
-            let child_name = format!("_int_{}_{nid}", ctx.view_id);
+            let child_name = format!("_int_{}_{nid}", ctx.site.id);
             // Must fail the compile on a table-open error: emitting the view without
             // the Integrate would compile a view that never persists its differential
             // state, leaving its output permanently empty.
@@ -720,7 +711,7 @@ pub(super) fn emit_reduce(
         .ok_or(CompileError::Rejected("reduce: output exceeds MAX_COLUMNS"))?;
 
     let trace_table_ptr = ctx.add_owned_trace_table(
-        &format!("_reduce_{}_{nid}", ctx.view_id),
+        &format!("_reduce_{}_{nid}", ctx.site.id),
         reduce_out_schema,
         Some(reg_id),
     )?;
@@ -776,7 +767,7 @@ pub(super) fn emit_reduce(
         // Not optional: a non-linear reduce has no history other than this index,
         // so a swallowed failure would leave MIN/MAX computed from the delta alone
         // with the old row still retracted.
-        let avi_table_ptr = ctx.add_owned_trace_table(&format!("_avidx_{}_{nid}", ctx.view_id), bake.schema, None)?;
+        let avi_table_ptr = ctx.add_owned_trace_table(&format!("_avidx_{}_{nid}", ctx.site.id), bake.schema, None)?;
         let bake_idx = ctx.builder.add_avi_bake(bake);
         let table_idx = ctx.builder.table_idx(avi_table_ptr);
         ctx.builder.push(Instr::Integrate {
@@ -845,8 +836,7 @@ pub(super) fn build_plan(
     skip_nodes: &HashSet<i32>,
     ordered: &[i32],
     ext_tables: &ExtTables,
-    view_dir: &str,
-    view_id: u64,
+    site: super::ViewSite<'_>,
     target: PlanTarget,
 ) -> Result<PlanBuildResult, CompileError> {
     let exchange_inputs: &[(i32, SchemaDescriptor)] = match target {
@@ -892,8 +882,7 @@ pub(super) fn build_plan(
         loaded,
         skip_nodes,
         ext_tables,
-        view_dir,
-        view_id,
+        site,
         builder: ProgramBuilder::new(),
         out_reg_of,
         reg_meta,

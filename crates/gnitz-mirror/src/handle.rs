@@ -1,7 +1,6 @@
 //! The handle: what a host opens, registers views on, polls, and reads through.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use gnitz_core::{DeltaCursor, GnitzClient, RelKind, Schema};
@@ -22,39 +21,6 @@ const DEFAULT_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 /// it has changed anything durable. Debug-only. It is the only way to reach
 /// [`Mirror::checkpoint`]'s report-rather-than-poison path without a disk fault.
 static CHECKPOINT_ERROR: Seam = Seam::new("GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR");
-
-/// One live handle per process.
-///
-/// Not a `!Send` consequence but a process-global one: `worker_ctx` holds the
-/// committed checkpoint generation as a process static, `CatalogEngine::open`
-/// publishes its own durable generation into it, and every `Rederive` store
-/// captures that global at open. A second handle on a second data directory
-/// would overwrite it, and the first handle's next store would then be created
-/// against a generation from someone else's checkpoint history.
-///
-/// A latch the handle's `Drop` clears, not a once-per-process trip switch, so a
-/// host (and this crate's own tests) may open and drop repeatedly — but never
-/// *concurrently*, which is the same process-global state the latch exists for.
-static HANDLE_LIVE: AtomicBool = AtomicBool::new(false);
-
-struct HandleGuard;
-
-impl HandleGuard {
-    fn take() -> Result<Self, MirrorError> {
-        if HANDLE_LIVE.swap(true, Ordering::SeqCst) {
-            return Err(MirrorError::Engine(
-                "a mirror handle is already live in this process".to_string(),
-            ));
-        }
-        Ok(HandleGuard)
-    }
-}
-
-impl Drop for HandleGuard {
-    fn drop(&mut self) {
-        HANDLE_LIVE.store(false, Ordering::SeqCst);
-    }
-}
 
 /// One mirrored view: what registration resolved, and where its feed got to.
 pub(crate) struct MirroredView {
@@ -100,7 +66,6 @@ pub struct Mirror {
     pub(crate) poison: Option<String>,
     applied_bytes: usize,
     checkpoint_bytes: usize,
-    _guard: HandleGuard,
 }
 
 impl Mirror {
@@ -111,8 +76,8 @@ impl Mirror {
     /// own calls crosses a channel. While a poll is in flight a local read waits
     /// one round trip — which is what a read against the server pays every time.
     ///
-    /// Fails if the process has taken a server role, if another handle is live
-    /// in it, or if another process holds `base_dir`.
+    /// Fails if the process has taken a server role, or if `base_dir` is already
+    /// held — by another process, or by another handle in this one.
     pub fn open(base_dir: &str, client: GnitzClient) -> Result<Self, MirrorError> {
         // Assert Standalone rather than set it. `set_worker_role` would invert
         // the local index backfill, the index home directory and `store_lsn`'s
@@ -123,15 +88,15 @@ impl Mirror {
                 "a mirror cannot be opened in a process that has taken a server role".to_string(),
             ));
         }
-        let guard = HandleGuard::take()?;
         let mut engine = CatalogEngine::open(base_dir, 1)?;
 
-        // The generation is half the reopen verdict; the topology word is the
-        // other half, and nothing asks for the mirror: a view's own recovery
-        // source gates on the generation alone, and the server's second gate
-        // lives in a pre-fork step the mirror never runs. Re-record either way,
-        // so the next open has one to compare.
-        let cursors = read_cursors(base_dir, engine.resume_generation(), engine.topology_matches());
+        // The stores are already open, so the cursor read takes the whole verdict
+        // they took: the same generation, the same topology word, and — per view —
+        // whether that store actually came back. A cursor naming a copy that is
+        // not there is dropped, which makes its view bootstrap.
+        // `record_topology(1)` follows so the next open has one to compare.
+        let mut cursors = read_cursors(base_dir, engine.resume_generation(), engine.topology_matches());
+        cursors.retain(|&vid, _| engine.store_resumed(vid as i64));
         engine
             .record_topology(1)
             .map_err(|e| MirrorError::Engine(format!("topology record failed: {e}")))?;
@@ -145,15 +110,7 @@ impl Mirror {
             poison: None,
             applied_bytes: 0,
             checkpoint_bytes: env_num("GNITZ_MIRROR_CHECKPOINT_BYTES", DEFAULT_CHECKPOINT_BYTES),
-            _guard: guard,
         })
-    }
-
-    /// Whether this process currently holds a live handle, and so whether
-    /// [`Mirror::open`] would be refused for that reason. Not a reservation: only
-    /// `open` itself takes the latch.
-    pub fn any_live() -> bool {
-        HANDLE_LIVE.load(Ordering::SeqCst)
     }
 
     /// The connection the handle owns. A host writes through it — the mirror is

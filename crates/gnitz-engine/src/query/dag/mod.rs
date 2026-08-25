@@ -129,18 +129,12 @@ impl RelationKind {
         }
     }
 
-    /// How this kind's tail is recovered, or `None` for a kind that owns no store
-    /// and so has no directory and nothing to recover. `SalReplay` kinds load
-    /// shards from the manifest and replay the SAL tail; a view output store
-    /// resumes from the manifest the ephemeral checkpoint round stamped, or is
-    /// rebuilt.
+    /// True iff this kind has a store, and so a directory, on a process that owns
+    /// stores. A stream holds no rows: its definition rides on the system tables
+    /// like any other row, and there is nothing to recover.
     #[inline]
-    pub fn recovery_source(self) -> Option<RecoverySource> {
-        match self {
-            RelationKind::SystemCatalog | RelationKind::BaseTable => Some(RecoverySource::SalReplay),
-            RelationKind::View => Some(RecoverySource::rederive_checkpointed_now()),
-            RelationKind::Stream => None,
-        }
+    pub fn owns_store(self) -> bool {
+        !matches!(self, RelationKind::Stream)
     }
 
     /// True iff this is a user base table. Gates what only base tables do:
@@ -546,20 +540,40 @@ impl DagEngine {
     }
 
     /// Read `view_id`'s circuit out of the system tables and compile it, homing
-    /// every scratch child under `view_dir`. The directory is a parameter and not
-    /// read off the entry because the pre-flight compiles into a throwaway root.
-    /// `bounded` likewise: the compiler layer sees only the circuit system tables,
-    /// never `VIEW_TAB`, so it cannot derive whether the view is capacity-bounded,
-    /// and both callers already hold the registry entry it comes off.
+    /// every scratch child under `dir`. The directory is a parameter and not read
+    /// off `entry` because the pre-flight compiles into a throwaway root.
+    ///
+    /// The scratch children open under the policy `entry`'s own output store was
+    /// opened with, so a view's operator traces cannot end up looking for a
+    /// different manifest generation than its output. An entry holding no owned
+    /// store — the post-fork master's, and the pre-flight's — resumes nothing,
+    /// which is what a compile into a directory with no manifest concludes anyway.
     fn compile_circuit(
         &self,
         view_id: i64,
-        view_dir: &str,
-        view_schema: &SchemaDescriptor,
-        bounded: bool,
+        dir: &str,
+        entry: &TableEntry,
     ) -> Result<CompileOutput, compiler::CompileError> {
+        let site = compiler::ViewSite {
+            dir,
+            id: view_id as u64,
+            recovery: entry
+                .handle
+                .as_owned()
+                .map_or(RecoverySource::Rederive { resume_at: None }, Table::recovery_source),
+        };
         let ext_tables = self.ext_tables();
-        unsafe { compiler::compile_view(view_id as u64, self.sys, view_dir, view_schema, &ext_tables, bounded) }
+        // The compiler layer sees only the circuit system tables, never `VIEW_TAB`,
+        // so it cannot derive whether the view is capacity-bounded.
+        unsafe {
+            compiler::compile_view(
+                site,
+                self.sys,
+                &entry.schema,
+                &ext_tables,
+                entry.capacity_bytes.is_some(),
+            )
+        }
     }
 
     /// Decide whether a just-registered view's circuit compiles, keeping nothing.
@@ -573,11 +587,10 @@ impl DagEngine {
     ///
     /// The verdict is worker-independent: worker context reaches the compile only
     /// as the scratch path component (which `root` overrides), as `WorkerFilter`
-    /// and `ReducePlan` operands baked into instructions nothing here executes, as
-    /// the committed generation a manifest-less directory makes moot, and — since a
-    /// `WorkerFilter` emits no instruction at `W == 1` — as instruction *offsets*,
-    /// which only a bounded view's hydration plan reads and no rejection depends
-    /// on.
+    /// and `ReducePlan` operands baked into instructions nothing here executes,
+    /// and — since a `WorkerFilter` emits no instruction at `W == 1` — as
+    /// instruction *offsets*, which only a bounded view's hydration plan reads and
+    /// no rejection depends on.
     pub(crate) fn preflight_compile(&self, view_id: i64, root: &str) -> Result<(), compiler::CompileError> {
         // `hook_relation_register` ran earlier in this bundle's ingest loop, so a
         // registered `+1` VIEW_TAB row is always in `tables`; a miss is an engine
@@ -587,9 +600,7 @@ impl DagEngine {
         };
         // `map(drop)` closes the plan — and the `Table`s it holds open under
         // `root` — before the directory is removed.
-        let verdict = self
-            .compile_circuit(view_id, root, &entry.schema, entry.capacity_bytes.is_some())
-            .map(drop);
+        let verdict = self.compile_circuit(view_id, root, entry).map(drop);
         let _ = std::fs::remove_dir_all(root);
         verdict
     }
@@ -607,7 +618,7 @@ impl DagEngine {
         let Some(entry) = self.tables.get(&view_id) else {
             return Ok(None);
         };
-        match self.compile_circuit(view_id, &entry.directory, &entry.schema, entry.capacity_bytes.is_some()) {
+        match self.compile_circuit(view_id, &entry.directory, entry) {
             Ok(output) => {
                 gnitz_debug!("dag: compiled view_id={}", view_id);
                 Ok(Some(output))

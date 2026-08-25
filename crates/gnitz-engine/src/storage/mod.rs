@@ -59,7 +59,7 @@ pub(crate) use columnar::{
 // rule across two import paths, visibly — `ops/reduce/sort.rs` and
 // `catalog/scan_spec.rs` each imported from both in adjacent lines.
 pub(crate) use lsm::child_dir::{
-    cluster_children, fsync_dir, reclaim_retired_children, remove_child, subdir_names, ChildAddr,
+    fsync_dir, reclaim_retired_children, remove_child, state_child_manifests, subdir_names, ChildAddr,
 };
 pub(crate) use lsm::index_gather::BoundedIndexCursor;
 pub(crate) use lsm::manifest::{peek_header, topology_word};

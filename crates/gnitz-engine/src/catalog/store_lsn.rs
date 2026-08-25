@@ -59,7 +59,7 @@ impl CatalogEngine {
             .iter()
             .filter(|(_, e)| {
                 e.handle
-                    .as_owned_mut()
+                    .as_owned()
                     .is_some_and(|t| t.directory() != home.dir(&e.directory))
             })
             .map(|(&tid, _)| tid)
@@ -152,7 +152,7 @@ impl CatalogEngine {
         // behind whose shards are gone — `remove_dir_all` deletes in readdir order.
         for name in subdir_names(&dir) {
             if matches!(ChildAddr::parse(&name), Some(ChildAddr::Scratch { rank: r, .. }) if r == rank) {
-                crate::storage::remove_child(&format!("{dir}/{name}"));
+                remove_child(&format!("{dir}/{name}"));
             }
         }
 
@@ -192,16 +192,18 @@ impl CatalogEngine {
         self.all_store_lsns().collect()
     }
 
-    /// Compute the set of view ids whose checkpointed output state must be
-    /// rejected at boot and rebuilt, rather than resumed from its manifests.
+    /// Compute the set of view ids whose checkpointed state — output stores and
+    /// operator traces alike — must be rejected at boot and rebuilt, rather than
+    /// resumed from its manifests.
     ///
     /// A view is **valid** (resumed) iff:
     ///   * the recorded topology matches the launched `(worker_count, STATE_FORMAT)`
     ///     — a different worker count re-shapes every keyed store's row placement;
-    ///   * every one of its output-store child manifests is stamped with the
-    ///     committed checkpoint generation — `resume_generation`, the in-memory
-    ///     recovered `G`, NOT the recovery-start-bumped durable `G+1` — matching
-    ///     what `Table::new`'s conditional load peeks; and
+    ///   * every child that carries its state — its output-store children and its
+    ///     owned operator scratch — is stamped with the committed checkpoint
+    ///     generation — `resume_generation`, the in-memory recovered `G`, NOT the
+    ///     recovery-start-bumped durable `G+1` — matching what `Table::new`'s
+    ///     conditional load peeks; and
     ///   * every VIEW it scans is itself valid — else it could read a rebuilt
     ///     sibling's freshly-emptied output store; and
     ///   * none of its sources is a STREAM — a stream-fed view's manifests are
@@ -209,21 +211,19 @@ impl CatalogEngine {
     ///     generation onto state whose stream inputs are gone.
     ///
     /// The topology word is decided once for the whole set. Then phase 1 decides
-    /// each view's **local** validity (direct sources + output manifests), and
+    /// each view's **local** validity (direct sources + child manifests), and
     /// phase 2 propagates invalidity to any view scanning an invalid source,
     /// walking the views in dependency order so one pass reaches the whole cascade.
     ///
-    /// Output manifests are enumerated as `w{k}of{launched}` for every launched
-    /// rank — exactly the set the checkpoint's ephemeral round stamps, so the two
-    /// must be read together when either changes. A view checkpointed at a
-    /// different worker count carries a different set of names and finds no
-    /// manifest at all, which is the same verdict the topology word already gives.
+    /// Which children carry that state is [`state_child_manifests`].
+    /// Reading the operator scratch alongside the output stores is what rejects an
+    /// output store one generation ahead of the integral beneath it — the ephemeral
+    /// round stamps every output store but only a *compiled* view's traces.
     pub fn compute_invalid_views(&mut self) {
         self.assert_pre_fork("compute_invalid_views");
         let launched_workers = self.num_workers;
-        // The engine's own copy, which `index_recovery_source` reads for the index
-        // half of the same verdict — not the `worker_ctx` global it is mirrored into,
-        // so both halves answer from one field.
+        // The same field `rederive_source` reads for the store-open half of the
+        // verdict, so both halves answer from one value.
         let g = self.resume_generation;
         let topo_valid = self.topology_matches();
 
@@ -239,6 +239,14 @@ impl CatalogEngine {
         // manifest at g). A *transitive* stream source needs no walk here: phase 2
         // propagates invalidity down every dependency chain. The source test comes
         // first, so it short-circuits the per-child manifest reads.
+        // An unpeekable manifest reads as a mismatch, which is the verdict a child
+        // whose manifest a previous open erased must get: its siblings may still
+        // be at `g`.
+        let at_g = |m: String| match std::ffi::CString::new(m) {
+            Ok(c) => matches!(peek_header(&c), Ok(Some(h)) if h.checkpoint_gen == g),
+            Err(_) => false,
+        };
+
         let mut invalid: FxHashSet<i64> = FxHashSet::default();
         for &vid in &view_ids {
             let stream_fed = self
@@ -251,12 +259,7 @@ impl CatalogEngine {
                 continue;
             }
             let dir = &self.dag.tables.get(&vid).expect("vid taken from tables iter").directory;
-            let at_g = |child: ChildAddr| match std::ffi::CString::new(child.manifest(dir)) {
-                Ok(c) => matches!(crate::storage::peek_header(&c), Ok(Some(h)) if h.checkpoint_gen == g),
-                Err(_) => false,
-            };
-            // The whole cluster's children, not just this process's.
-            if !crate::storage::cluster_children(launched_workers).all(at_g) {
+            if !state_child_manifests(dir, launched_workers).into_iter().all(at_g) {
                 invalid.insert(vid);
             }
         }

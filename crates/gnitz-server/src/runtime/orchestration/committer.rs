@@ -337,7 +337,7 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<
     {
         let disp = &shared.disp;
         // FlushEph's lsn IS the checkpoint generation — workers latch it via
-        // `set_committed_generation`. The base round's lsn is unread; pass 0.
+        // `set_resume_generation`. The base round's lsn is unread; pass 0.
         let (lsn, flags) = match ephemeral_gen {
             Some(gen) => (gen, FLAG_FLUSH_EPH),
             None => (0, FLAG_FLUSH),

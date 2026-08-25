@@ -125,11 +125,33 @@ impl<'a> ChildAddr<'a> {
 }
 
 /// Every child a relation has across the whole cluster at `num_workers` — one
-/// per launched rank. The boot resume verdict enumerates manifests through this,
-/// and the checkpoint's ephemeral round stamps exactly this set, so the two must
+/// per launched rank. The checkpoint's ephemeral round stamps exactly this set
+/// unconditionally, and [`state_child_manifests`] reads it back, so the two must
 /// be read together when either changes.
-pub(crate) fn cluster_children(num_workers: u32) -> impl Iterator<Item = ChildAddr<'static>> {
+pub(super) fn cluster_children(num_workers: u32) -> impl Iterator<Item = ChildAddr<'static>> {
     (0..num_workers).map(move |rank| ChildAddr::Worker { rank, of: num_workers })
+}
+
+/// The manifest of every child under `rel_dir` that carries the relation's
+/// checkpointed state at `num_workers`: each launched rank's output store, and
+/// every operator-scratch child. Those are what the ephemeral checkpoint round
+/// publishes, and the boot resume verdict accepts a view only when all of them
+/// stand at one generation.
+///
+/// The other two grammars carry no generation to compare against: a `Delta`
+/// child is in no checkpoint round (it is erased at open), and an `Index` child
+/// cannot appear here at all — `CREATE INDEX` is gated on a base table, and only
+/// views reach the resume verdict.
+pub(crate) fn state_child_manifests(rel_dir: &str, num_workers: u32) -> Vec<String> {
+    let scratch = subdir_names(rel_dir);
+    let scratch = scratch
+        .iter()
+        .filter(|n| matches!(ChildAddr::parse(n), Some(ChildAddr::Scratch { .. })))
+        .map(|n| manifest::path(&format!("{rel_dir}/{n}")));
+    cluster_children(num_workers)
+        .map(|c| c.manifest(rel_dir))
+        .chain(scratch)
+        .collect()
 }
 
 /// Immediate sub-directory names of `path`. Empty if `path` is missing or
@@ -277,6 +299,50 @@ mod tests {
         ] {
             assert_eq!(ChildAddr::parse(name), None, "{name} is not a child dir");
         }
+    }
+
+    /// The resume verdict reads the launched ranks' output stores and every
+    /// scratch child. A name admitted here that no checkpoint round stamps would
+    /// carry no generation, and so invalidate its view on every boot.
+    #[test]
+    fn state_children_are_the_output_stores_and_the_scratch() {
+        let dir = crate::test_support::scratch_dir("child_dir", "state_children");
+        for name in [
+            "w0of2",
+            "w1of2",
+            "scratch_agg_w0",
+            "scratch_agg_w1",
+            "delta_w0", // in neither checkpoint round
+            "idx_7",    // no index child ever sits under a view
+            "w0of4",    // the previous layout, consumed by the boot repartition
+            "not_a_child",
+        ] {
+            std::fs::create_dir_all(format!("{dir}/{name}")).unwrap();
+        }
+
+        let mut got: Vec<String> = state_child_manifests(&dir, 2)
+            .iter()
+            .map(|m| {
+                m.strip_prefix(&format!("{dir}/"))
+                    .and_then(|rest| rest.split('/').next())
+                    .expect("a manifest sits one level under the relation directory")
+                    .to_string()
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, ["scratch_agg_w0", "scratch_agg_w1", "w0of2", "w1of2"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An output store's manifest is enumerated whether or not its directory is
+    /// there — an absent one must read as a mismatch, not vanish from the verdict.
+    #[test]
+    fn state_children_name_every_launched_rank_on_an_empty_directory() {
+        let dir = crate::test_support::scratch_dir("child_dir", "state_children_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(state_child_manifests(&dir, 3).len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

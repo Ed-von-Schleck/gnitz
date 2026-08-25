@@ -10,11 +10,10 @@ use gnitz_sql::{SqlPlanner, SqlResult};
 
 /// Every test in this binary takes this lock.
 ///
-/// Not a workaround for the one-handle-per-process guard: `cargo test` runs a
-/// target's tests as threads of one process, and what the guard protects —
-/// `worker_ctx`'s committed generation, and the `Seam` / `io_uring` verdicts
-/// read once per process — is shared between them either way. A parallel test
-/// would be racing that state whether or not the guard caught it.
+/// `cargo test` runs a target's tests as threads of one process, so the state a
+/// mirror open touches process-wide is shared between them: the one-shot fault
+/// seams, the `io_uring` verdict latched once per process, and the environment
+/// variables an open re-reads. A parallel test would be racing all three.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 pub fn serial() -> MutexGuard<'static, ()> {

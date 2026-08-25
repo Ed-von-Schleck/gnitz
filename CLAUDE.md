@@ -576,10 +576,10 @@ The feed is per-worker; a replicated view's feed lives on worker 0 alone.
 
 A **mirror** (`gnitz-mirror`) is a local copy of a view fed by that feed, read in
 the host's process at its last polled round: not read-your-own-writes, and two
-mirrors are no consistent cut; an unheld relation is delegated upstream. One live
-handle per process, one process per data directory; it poisons on an ingest error.
-It is reachable from Python as `gnitz.Mirror`, opened on a private data directory
-under the same one-per-process rule.
+mirrors are no consistent cut; an unheld relation is delegated upstream. One
+handle per data directory, refused by the engine's own `flock` in this process or
+any other; it poisons on an ingest error. It is reachable from Python as
+`gnitz.Mirror`, opened on a private data directory under the same rule.
 
 **A poll reports, per view, whether it reseeded** — discarded the copy and read
 the view whole. That is a discontinuity every subscriber has to react to, and no

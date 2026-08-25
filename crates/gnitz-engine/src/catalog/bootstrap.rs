@@ -26,9 +26,7 @@ impl CatalogEngine {
                 &sys_family_dir(base_dir, family.name()),
                 family.schema(),
                 family.id() as u32,
-                RelationKind::SystemCatalog
-                    .recovery_source()
-                    .expect("a system catalog family owns a store"),
+                RecoverySource::SalReplay,
             )
             .map(Box::new)
             .map_err(|e| format!("Failed to create system table '{}': error {}", family.name(), e))?;
@@ -84,7 +82,7 @@ impl CatalogEngine {
         engine.recover_sequences();
 
         // Before `replay_catalog`, whose view and index register hooks read it
-        // (through `RelationKind::recovery_source`). `recovery_start_generation_bump`
+        // (through `CatalogEngine::recovery_source`). `recovery_start_generation_bump`
         // leaves this where it is, so a clean restart resumes from the last
         // completed checkpoint.
         engine.set_resume_generation(engine.durable_generation);
@@ -288,7 +286,12 @@ impl CatalogEngine {
     ///
     /// Two global passes — traces first, then outputs — so that any output at
     /// generation `G` implies that view's own traces are already durable at `G`.
-    /// Batching each pass into one barrier also beats per-view interleaving.
+    /// That holds only for a **compiled** view: the collector reads the plan
+    /// cache, and nothing here compiles one to widen it — a mirror registers its
+    /// views with no circuit rows and runs this same round. An output store
+    /// stamped with no trace beside it is what `compute_invalid_views` rejects at
+    /// the next boot. Batching each pass into one barrier also beats per-view
+    /// interleaving.
     ///
     /// The caller latches the generation first: the server off the `FlushEph`
     /// message, an embedder through [`Self::bump_checkpoint_generation`].

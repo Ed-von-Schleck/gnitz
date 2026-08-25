@@ -6,8 +6,8 @@
 //! **Recovery order is a crash guard.** Each step in `run_server` is placed so a
 //! crash at any point rebuilds a view rather than silently resuming a stale one,
 //! and the monotonic checkpoint generation is what carries that. The
-//! recovery-start bump (`G → G+1`: durable, pre-fork, deliberately not published
-//! to `worker_ctx`) covers the window from the SAL reset to `boot_checkpoint` — a
+//! recovery-start bump (`G → G+1`: durable, pre-fork, deliberately leaving the
+//! resume generation at `G`) covers the window from the SAL reset to `boot_checkpoint` — a
 //! crash inside it leaves the durable generation ahead of every un-checkpointed
 //! view's stamp, which `compute_invalid_views` reads as "rebuild".
 //! `boot_checkpoint`'s own bump then re-stamps the resumed and rebuilt state
@@ -965,8 +965,8 @@ fn run_server(
         // recovery-start bump advances the durable generation.
         catalog.compute_invalid_views();
 
-        // Durably advance the checkpoint generation G → G+1 without publishing to
-        // worker_ctx, closing the reset→boot_checkpoint crash window.
+        // Durably advance the checkpoint generation G → G+1 while the resume
+        // generation stays at G, closing the reset→boot_checkpoint crash window.
         catalog
             .recovery_start_generation_bump()
             .map_err(|e| format!("recovery-start generation bump failed: {e}"))?;

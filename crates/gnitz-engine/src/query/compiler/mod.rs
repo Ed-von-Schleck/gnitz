@@ -542,20 +542,29 @@ struct Carve {
     ancestors: HashSet<i32>,
 }
 
+/// Where a view's rederived children are created, and under what policy.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewSite<'a> {
+    pub dir: &'a str,
+    pub id: u64,
+    /// The policy the view's *output store* was opened under, handed down so its
+    /// operator traces cannot end up looking for a different manifest generation.
+    pub recovery: RecoverySource,
+}
+
 /// Compile a circuit for a single view: read the circuit from the system
 /// tables, then annotate → optimize → `build_plan`.
 ///
 /// # Safety
 /// All table handles must be valid pointers or null.
 pub(crate) unsafe fn compile_view(
-    view_id: u64,
+    site: ViewSite<'_>,
     sys: SysTableRefs,
-    view_dir: &str,
     view_schema: &SchemaDescriptor,
     ext_tables: &ExtTables,
     bounded: bool,
 ) -> Result<CompileOutput, CompileError> {
-    let loaded = load_circuit(sys, view_id, *view_schema)?;
+    let loaded = load_circuit(sys, site.id, *view_schema)?;
     if loaded.nodes.is_empty() {
         return Err(CompileError::EmptyCircuit);
     }
@@ -595,8 +604,7 @@ pub(crate) unsafe fn compile_view(
                 &skip_nodes,
                 &loaded.ordered,
                 ext_tables,
-                view_dir,
-                view_id,
+                site,
                 PlanTarget::ViewOutput { seeds: &[] },
             )?;
             // Only `PlanShape::Single` — which both eligible shapes are — can be
@@ -654,8 +662,7 @@ pub(crate) unsafe fn compile_view(
                     &skip_nodes,
                     &side_ordered,
                     ext_tables,
-                    view_dir,
-                    view_id,
+                    site,
                     PlanTarget::Subgraph { out: carve.ex_in },
                 )?;
                 let schema = finalize_side(&plan, &loaded, carve.ex_nid)?;
@@ -668,8 +675,7 @@ pub(crate) unsafe fn compile_view(
                 &skip_nodes,
                 &post_ordered,
                 ext_tables,
-                view_dir,
-                view_id,
+                site,
                 PlanTarget::ViewOutput {
                     seeds: &exchange_inputs,
                 },
@@ -698,7 +704,7 @@ pub(crate) unsafe fn compile_view(
             // planner path (set-ops are binary, GROUP BY/DISTINCT are unary).
             gnitz_warn!(
                 "compile_view: view_id={} has {} exchange nodes; unsupported",
-                view_id,
+                site.id,
                 exchange_nids.len()
             );
             Err(CompileError::TooManyExchanges)
@@ -936,8 +942,7 @@ mod tests {
             &no_skips(),
             &loaded.ordered,
             &ext_tables,
-            "/nonexistent_gnitz_test_path_xyz_abc",
-            99,
+            test_site("/nonexistent_gnitz_test_path_xyz_abc", 99),
             PlanTarget::ViewOutput { seeds: &[] },
         );
         assert!(result.is_err(), "build_plan must fail when child table creation fails");
@@ -959,8 +964,7 @@ mod tests {
             &no_skips(),
             &loaded.ordered,
             &HashMap::new(),
-            "",
-            1,
+            test_site("", 1),
             PlanTarget::ViewOutput { seeds: &[] },
         );
         assert!(
@@ -1119,8 +1123,7 @@ mod tests {
                 &no_skips(),
                 &loaded.ordered,
                 &ext,
-                view_dir,
-                1,
+                test_site(view_dir, 1),
                 PlanTarget::Subgraph { out: 2 }
             )
             .is_ok(),
@@ -1146,8 +1149,7 @@ mod tests {
             &no_skips(),
             &loaded.ordered,
             &ext,
-            "/nonexistent_gnitz_test_path_integrate_trace",
-            99,
+            test_site("/nonexistent_gnitz_test_path_integrate_trace", 99),
             PlanTarget::ViewOutput { seeds: &[] },
         );
         assert!(
@@ -1189,8 +1191,7 @@ mod tests {
             &no_skips(),
             &loaded.ordered,
             &ext,
-            "",
-            99,
+            test_site("", 99),
             PlanTarget::ViewOutput { seeds: &[] },
         );
         assert!(result.is_err(), "type-mismatched sink schema must be rejected");
@@ -1394,8 +1395,7 @@ mod tests {
             &no_skips(),
             &loaded.ordered,
             &ext,
-            view_dir.to_str().unwrap(),
-            1,
+            test_site(view_dir.to_str().unwrap(), 1),
             PlanTarget::Subgraph { out: 3 },
         );
         assert!(result.is_err(), "out-of-bounds projection must fail the compile");
@@ -1454,8 +1454,7 @@ mod tests {
             &no_skips(),
             &side_ordered,
             &ext,
-            dir.path().to_str().unwrap(),
-            1,
+            test_site(dir.path().to_str().unwrap(), 1),
             PlanTarget::Subgraph { out: ex_in },
         );
         assert!(
@@ -1674,8 +1673,7 @@ mod tests {
                 &no_skips(),
                 &loaded.ordered,
                 &ext,
-                dir.path().to_str().unwrap(),
-                1,
+                test_site(dir.path().to_str().unwrap(), 1),
                 match self.out_schema {
                     Some(_) => PlanTarget::ViewOutput { seeds: &[] },
                     None => PlanTarget::Subgraph { out: 2 },
@@ -1750,8 +1748,7 @@ mod tests {
                 &no_skips(),
                 &loaded.ordered,
                 &ext,
-                dir.path().to_str().unwrap(),
-                1,
+                test_site(dir.path().to_str().unwrap(), 1),
                 PlanTarget::Subgraph { out: 2 },
             )
             .map(|_| ())
@@ -1905,6 +1902,16 @@ mod tests {
         HashSet::new()
     }
 
+    /// A view site over a throwaway directory: nothing under it was ever
+    /// checkpointed, so the children it opens resume nothing.
+    fn test_site(dir: &str, id: u64) -> ViewSite<'_> {
+        ViewSite {
+            dir,
+            id,
+            recovery: RecoverySource::Rederive { resume_at: None },
+        }
+    }
+
     // ── Destructive-register ordering invariant ─────────────────────────────
     //
     // Union/Distinct/PositivePart empty their input register in place.
@@ -1956,8 +1963,7 @@ mod tests {
                 &no_skips(),
                 &loaded.ordered,
                 &ext,
-                view_dir,
-                1,
+                test_site(view_dir, 1),
                 PlanTarget::Subgraph { out: 3 }
             )
             .is_ok(),
@@ -1977,8 +1983,7 @@ mod tests {
             &no_skips(),
             &loaded.ordered,
             &ext,
-            "",
-            1,
+            test_site("", 1),
             PlanTarget::Subgraph { out: 3 },
         );
         assert!(
@@ -2009,8 +2014,7 @@ mod tests {
                 &skips,
                 &loaded.ordered,
                 &ext,
-                view_dir,
-                1,
+                test_site(view_dir, 1),
                 PlanTarget::Subgraph { out: 3 }
             )
             .is_ok(),

@@ -78,6 +78,15 @@ impl StoreHandle {
         }
     }
 
+    /// The `Table` this process owns **outright**, shared — [`Self::as_owned_mut`]'s
+    /// read-only half, and the one every reader must take.
+    pub(crate) fn as_owned(&self) -> Option<&Table> {
+        match self {
+            StoreHandle::Owned(cell) => Some(unsafe { &**cell.get() }),
+            _ => None,
+        }
+    }
+
     /// True for a storeless handle — the post-fork master's, or a stream's.
     /// Test-only: production asks a total accessor what it can reach instead of
     /// branching on the variant.

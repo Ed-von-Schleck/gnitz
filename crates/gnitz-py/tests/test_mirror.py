@@ -28,19 +28,6 @@ from _serverproc import is_debug_build
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-@pytest.fixture(autouse=True)
-def _mirror_latch_free():
-    """No test may leave a handle behind.
-
-    A leaked one otherwise fails every *later* mirror test and hides which one
-    leaked it; this fails the culprit. `any_live` reads the latch itself, so it
-    costs nothing and names what it found rather than inferring it from a
-    refused open.
-    """
-    yield
-    assert not gnitz.Mirror.any_live(), "the test left a mirror handle open"
-
-
 def _local(mirror, sn, vid, sql):
     """One read off the copy, with the proof that it was one."""
     assert mirror.mirrors(vid), f"{sql}: the view is not answered locally"
@@ -203,7 +190,7 @@ def test_an_unmirrored_relation_is_delegated_and_a_forgotten_one_goes_back(clien
 
 
 def test_the_handles_life_in_one_interpreter(client, server, tmp_path):
-    """Open, close, reopen — and the one-handle-per-process latch in between.
+    """Open, close, reopen.
 
     Not the `mirror` fixture: this test owns the handles' lifetimes, which is
     what it is about.
@@ -214,13 +201,10 @@ def test_the_handles_life_in_one_interpreter(client, server, tmp_path):
     base = str(tmp_path / "m")
 
     # Under `with` even for the explicit-close half, so a failing assertion
-    # still frees the latch and fails this test rather than every later one.
+    # still releases the directory rather than holding it for the reopen below.
     with gnitz.Mirror(base, server) as first:
         r = first.mirror_view(sn, "f")
         assert r.reseeded is True, "a first registration bootstraps"
-
-        with pytest.raises(gnitz.GnitzError):
-            gnitz.Mirror(str(tmp_path / "other"), server)
 
         first.close()
         first.close()  # idempotent — a host must be able to release a handle twice

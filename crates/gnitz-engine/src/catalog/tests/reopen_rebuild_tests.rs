@@ -14,7 +14,8 @@
 //! checkpoint resume for generation-valid views, the master-driven invalid-view
 //! rebuild otherwise — and is exercised by the E2E suite, not this
 //! single-process catalog test. These tests assert the catalog-layer contract:
-//! index rebuilds once, view defers (comes back empty).
+//! index rebuilds once, view defers (comes back empty), and a view's operator
+//! traces resume — or are rejected — together with its output store.
 
 use super::*;
 
@@ -33,12 +34,11 @@ fn sum_weights(mut c: ReadCursor) -> i64 {
     sum
 }
 
-/// `public.base` with `N` rows (`val = id * 10`) flushed to shards, plus one
-/// non-unique secondary index on `val` that the live CREATE backfills. Returns
-/// the table id.
-fn base_with_index(engine: &mut CatalogEngine) -> i64 {
+/// A `(id, val)` table named `name`, holding `N` rows at `val = id * 10`.
+/// Returns its id and the column defs, which every caller needs again.
+fn seed_base(engine: &mut CatalogEngine, name: &str) -> (i64, Vec<ColumnDef>) {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
+    let tid = engine.create_table(name, &cols, &[0]).unwrap();
     let schema = engine.get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..N as u64 {
@@ -47,6 +47,13 @@ fn base_with_index(engine: &mut CatalogEngine) -> i64 {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    (tid, cols)
+}
+
+/// `public.base` seeded and flushed to shards, plus one non-unique secondary
+/// index on `val` that the live CREATE backfills. Returns the table id.
+fn base_with_index(engine: &mut CatalogEngine) -> i64 {
+    let (tid, _) = seed_base(engine, "public.base");
     engine.flush_family(tid).unwrap();
     engine.create_index("public.base", &["val"], false).unwrap();
     tid
@@ -300,7 +307,7 @@ fn index_rebuild_is_skipped_after_resume() {
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
-        engine.index_recovery_source(),
+        engine.rederive_source(),
         RecoverySource::Rederive { resume_at: Some(g) },
         "a matching topology leaves the recovered generation as the whole verdict"
     );
@@ -333,7 +340,7 @@ fn index_rebuild_forced_by_topology_change() {
     // Simulate the format bump: the recorded word no longer matches this boot's.
     engine.recorded_topology = crate::storage::topology_word(1) + 1;
     assert_eq!(
-        engine.index_recovery_source(),
+        engine.rederive_source(),
         RecoverySource::Rederive { resume_at: None },
         "a foreign topology must refuse every manifest"
     );
@@ -346,6 +353,114 @@ fn index_rebuild_forced_by_topology_change() {
         index_weight(&mut engine, tid),
         N,
         "the rebuild replaces the erased state, never adds to it"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── The view twin: one policy for a view's output store and its traces ───
+//
+// A view's operator traces must look for the same manifest generation its output
+// store was opened under. The two are decided at different moments — the store at
+// registration, the traces at compile — so a checkpoint landing between them is
+// what these two tests put there.
+
+/// `public.vbase` plus a trace-bearing view over it. Returns the view id, with
+/// its output store and its operator traces both published at one generation and
+/// the engine closed — the state a worker reopens into, plan cache empty.
+///
+/// The `IntegrateTrace` node is what makes the compile create a scratch child at
+/// all; an identity circuit would leave nothing for either test to catch on.
+fn checkpointed_traced_view(dir: &str) -> i64 {
+    let mut engine = CatalogEngine::open(dir, 1).unwrap();
+    let (tid, cols) = seed_base(&mut engine, "public.vbase");
+
+    let vid = engine.allocate_table_id().unwrap();
+    write_circuit_chain(
+        &mut engine,
+        vid,
+        &[
+            (gnitz_wire::OPCODE_SCAN_DELTA, Some(tid), None),
+            (gnitz_wire::OPCODE_INTEGRATE_TRACE, None, None),
+            (gnitz_wire::OPCODE_INTEGRATE, None, None),
+        ],
+    );
+    engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
+    engine
+        .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, "v_traced", "SELECT * FROM vbase"))
+        .unwrap();
+    assert!(
+        engine.dag.ensure_compiled(vid).unwrap(),
+        "the fixture view must compile"
+    );
+
+    engine.record_topology(1).unwrap();
+    let g = engine.bump_checkpoint_generation().unwrap();
+    assert_eq!(engine.flush_ephemeral_round().unwrap(), g);
+
+    engine.close();
+    vid
+}
+
+// ── view_traces_resume_with_their_output_store ──────────────────────────
+// A compile must not sample the resume generation independently of the store it
+// is compiling for: it opens the traces against the generation the *output store*
+// accepted, not whatever the engine holds when the compile happens to run. A
+// generation bump between the two — which is all it takes — otherwise leaves the
+// compile looking for `g + 1` while the manifests say `g`, and `Table::new`
+// erases them: an empty integral under a full output store, with the view nowhere
+// in `invalid_views`.
+#[test]
+fn view_traces_resume_with_their_output_store() {
+    let dir = temp_dir("view_traces_resume_with_output");
+    let vid = checkpointed_traced_view(&dir);
+
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    assert!(
+        engine.store_resumed(vid),
+        "the fixture must leave a resumable output store"
+    );
+    engine.bump_checkpoint_generation().unwrap();
+    assert!(engine.dag.ensure_compiled(vid).unwrap());
+
+    // The compiled plan's own tables — both the set the next ephemeral round
+    // would publish and the integral this view reads through.
+    let (traces, _outputs) = engine.dag.collect_ephemeral_flush_tables();
+    assert!(!traces.is_empty(), "a trace-bearing view must contribute trace tables");
+    for t in traces {
+        assert!(
+            unsafe { &*t }.resumed_from_checkpoint(),
+            "a trace opened against a generation its manifest never carried is erased"
+        );
+    }
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── uncompiled_view_traces_invalidate_the_view ──────────────────────────
+// The other half: the ephemeral round stamps every output store but only the
+// traces of the views in the plan cache, so a view that goes through a checkpoint
+// uncompiled lands an output store one generation ahead of its integral. The boot
+// verdict must reject that pair rather than resume it.
+#[test]
+fn uncompiled_view_traces_invalidate_the_view() {
+    let dir = temp_dir("view_uncompiled_traces_invalidate");
+    let vid = checkpointed_traced_view(&dir);
+
+    // A checkpoint with nothing in the plan cache — what a boot checkpoint is for
+    // a view no tick sweep reaches.
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let g2 = engine.bump_checkpoint_generation().unwrap();
+    assert_eq!(engine.flush_ephemeral_round().unwrap(), g2);
+    engine.close();
+
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    engine.compute_invalid_views();
+    assert!(
+        engine.invalid_views.contains(&vid),
+        "an output store ahead of its traces must be rebuilt, not resumed"
     );
 
     engine.close();

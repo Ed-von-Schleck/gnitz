@@ -760,8 +760,8 @@ impl WorkerProcess {
             }
 
             // Ephemeral-state flush round: persist every view's operator-trace
-            // tables and output stores, stamped with the checkpoint generation
-            // already latched into `worker_ctx` at the classify site.
+            // tables and output stores, stamped with the checkpoint generation this
+            // round's header already latched into the catalog at the classify site.
             SalMessageKind::FlushEph => {
                 self.sal_reader.checkpoint_reset();
                 self.cat().flush_ephemeral_round()?;
@@ -1331,7 +1331,7 @@ impl WorkerProcess {
                 // (OPK-widened) to `has_pk(u128)` would re-OPK-encode it, a double
                 // sign-flip that misses signed PKs.
                 let result = filter_by_pk_bytes(batch.as_ref(), schema, |pkb, _| {
-                    if store.as_ref().is_some_and(|t| t.has_pk_bytes(pkb)) {
+                    if store.is_some_and(|t| t.has_pk_bytes(pkb)) {
                         Resolved::ProbeKey
                     } else {
                         Resolved::Absent

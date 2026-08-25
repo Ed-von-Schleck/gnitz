@@ -262,8 +262,8 @@ impl CatalogEngine {
     // -- Checkpoint records -------------------------------------------------
 
     /// Bump the committed checkpoint generation, durably record it in
-    /// `_sequences` (seq id 4), and publish it to `worker_ctx` so every manifest
-    /// this master publishes from now on carries the new stamp. Returns the new
+    /// `_sequences` (seq id 4), and move this engine's resume generation onto it,
+    /// so every manifest published from now on carries the new stamp. Returns the new
     /// generation. Synchronous (memtable ingest + blocking flush), so it runs as
     /// an atomic block between the committer's checkpoint steps with no
     /// interleaving.
@@ -288,17 +288,17 @@ impl CatalogEngine {
     }
 
     /// Durably advance the checkpoint generation by one **at recovery start**,
-    /// WITHOUT publishing it to `worker_ctx`. This closes the
+    /// WITHOUT moving the resume generation. This closes the
     /// reset→`boot_checkpoint` crash window: recovery resets the SAL before its
     /// master-driven tick sweep, so a crash in that gap would otherwise leave the
     /// base durable at `G + tail` while every un-checkpointed view is cleanly
     /// stamped `G` and would silently resume as stale. With the durable
     /// generation at `G+1`, the per-child verdict forces a rebuild instead.
     ///
-    /// `worker_ctx::committed_generation()` stays at `G` on purpose: the resume
-    /// load and the boot verdict both compare view manifests against it, so a
-    /// clean restart still resumes. `self.durable_generation` IS advanced, so the
-    /// next bump retracts `G+1` rather than `G`.
+    /// [`Self::resume_generation`] stays at `G` on purpose: the resume load and
+    /// the boot verdict both compare view manifests against it, so a clean
+    /// restart still resumes. `self.durable_generation` IS advanced, so the next
+    /// bump retracts `G+1` rather than `G`.
     pub fn recovery_start_generation_bump(&mut self) -> Result<(), String> {
         let g = self.durable_generation;
         self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, (g + 1) as i64)
@@ -308,11 +308,10 @@ impl CatalogEngine {
         self.flush_all_system_tables()
     }
 
-    /// The one writer of the resume generation: the field and the process-global
-    /// mirror every no-catalog `Table::new` caller reads always move together.
+    /// The one writer of the resume generation. `pub` because a worker latches it
+    /// off the `FLAG_FLUSH_EPH` round header from outside the crate.
     pub fn set_resume_generation(&mut self, g: u64) {
         self.resume_generation = g;
-        crate::foundation::worker_ctx::set_committed_generation(g);
     }
 
     /// True when this boot's `(worker count, STATE_FORMAT)` is the one the
@@ -321,6 +320,18 @@ impl CatalogEngine {
     /// of what generation its manifest carries.
     pub fn topology_matches(&self) -> bool {
         self.recorded_topology == crate::storage::topology_word(self.num_workers)
+    }
+
+    /// The recovery policy for a rederived relation — a view's output store and
+    /// operator traces, a secondary index: resume from a manifest at this
+    /// engine's resume generation, and only while the topology it was written
+    /// under still holds. The one constructor of a generation-bearing
+    /// `RecoverySource`, so no consumer can sample a generation of its own at a
+    /// second moment.
+    pub(crate) fn rederive_source(&self) -> RecoverySource {
+        RecoverySource::Rederive {
+            resume_at: self.topology_matches().then_some(self.resume_generation),
+        }
     }
 
     /// Build the `sys_sequences` delta that moves one sequence to `new_val`: a

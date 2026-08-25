@@ -338,9 +338,8 @@ def mirror_on():
     """Factory taking `gnitz.Mirror`'s own arguments — `mirror_on(base_dir,
     target)` — and closing the handle at teardown however the test left it.
 
-    Closing is not tidiness. pytest is one process, and a mirror handle takes a
-    process-global latch: the next test's `Mirror(...)` is refused while this one
-    lives.
+    Closing is not tidiness: an unclosed handle skips the exit checkpoint and
+    keeps its data directory locked for the life of the interpreter.
     """
     with contextlib.ExitStack() as stack:
         def make(base_dir, target):

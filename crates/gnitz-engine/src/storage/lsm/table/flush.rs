@@ -78,9 +78,9 @@ impl Table {
     /// A rederived table on the **base** round publishes nothing — it is rebuilt
     /// from its sources at open — and just folds to RAM inline. The base round
     /// stamps generation 0, so a manifest published here would be the one a
-    /// `Rederive` open accepts while the committed generation is
-    /// still 0: the view would resume from a base-round snapshot its operator
-    /// traces never matched, and the replayed delta would land twice.
+    /// `Rederive` open accepts while the resume generation is still 0: the view
+    /// would resume from a base-round snapshot its operator traces never matched,
+    /// and the replayed delta would land twice.
     ///
     /// Every other table publishes on both rounds, even when unchanged or empty,
     /// because two boot decisions read "has a manifest" as a fact about the

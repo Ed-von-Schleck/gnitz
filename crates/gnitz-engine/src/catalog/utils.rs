@@ -131,7 +131,8 @@ const DIR_LOCK_RETRY_EVERY: std::time::Duration = std::time::Duration::from_mill
 /// identical shard names. Nothing else enforces this — a forked worker inherits
 /// the open file description and with it the same lock, which `flock` treats as
 /// one holder rather than a conflict, so the server's own children never
-/// contend.
+/// contend. A second `open` in the *same* process does contend: it opens a fresh
+/// file description, so two mirror handles on one directory are refused here.
 ///
 /// The returned file must outlive every store under `base_dir`: closing it
 /// releases the lock.
@@ -155,7 +156,7 @@ pub(crate) fn lock_data_dir(base_dir: &str) -> Result<fs::File, String> {
             return Err(format!("Failed to lock data directory '{base_dir}': {err}"));
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("data directory '{base_dir}' is locked by another live process"));
+            return Err(format!("data directory '{base_dir}' is already held"));
         }
         std::thread::sleep(DIR_LOCK_RETRY_EVERY);
     }

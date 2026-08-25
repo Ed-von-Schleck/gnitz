@@ -72,7 +72,9 @@ pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use registry::raise_id_counter;
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.
-pub(in crate::catalog) use crate::storage::{fsync_dir, reclaim_retired_children, subdir_names, ChildAddr};
+pub(in crate::catalog) use crate::storage::{
+    fsync_dir, peek_header, reclaim_retired_children, remove_child, state_child_manifests, subdir_names, ChildAddr,
+};
 pub(in crate::catalog) use utils::{
     cursor_read_string, cursor_read_u64, ensure_dir, index_dir, is_table_dir_name, lock_data_dir, make_fk_index_name,
     preflight_dir, relation_dir, retract_key_range, retract_single_row, schema_dir, sys_catalog_dir, sys_family_dir,
@@ -135,16 +137,18 @@ pub struct CatalogEngine {
     /// The generation a manifest must carry to be resumed from. Equal to
     /// `durable_generation` except across `recovery_start_generation_bump`,
     /// which pushes that one to `G+1` while what a boot may resume from stays
-    /// the recovered `G`. Written only by `set_resume_generation`, which mirrors
-    /// it into `worker_ctx` for the `Table::new` callers holding no catalog.
+    /// the recovered `G`. Written only by `set_resume_generation`, and reaches a
+    /// `Table::new` only through `rederive_source`, so every rederived relation
+    /// opens against one value.
     pub(crate) resume_generation: u64,
     /// The topology row last recorded: `(worker_count as u64) << 32 | STATE_FORMAT`.
     /// Recovered from `SEQ_ID_TOPOLOGY` at boot (0 on a fresh DB). `topology_matches`
     /// compares it against the launched worker count + `STATE_FORMAT` to decide
     /// whether persisted view state is reloadable.
     pub(crate) recorded_topology: u64,
-    /// View ids whose checkpointed output state was rejected at boot (generation
-    /// mismatch, topology change, or a transitively-invalid source view) and must
+    /// View ids whose checkpointed state — output stores and operator traces
+    /// alike — was rejected at boot (generation mismatch, topology change, or a
+    /// transitively-invalid source view) and must
     /// be reset-and-rebuilt rather than resumed. Computed pre-fork by
     /// `compute_invalid_views`, COW-inherited by every worker, and consumed by
     /// the master's boot rebuild sweep and the per-worker output reset. Empty on

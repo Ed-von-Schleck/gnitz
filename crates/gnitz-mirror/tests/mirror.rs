@@ -379,22 +379,23 @@ fn a_mirrored_select_issues_no_request() {
 // Refusals
 // ---------------------------------------------------------------------------
 
-/// A second handle is refused, in the process and across processes alike.
+/// A second handle on a *held directory* is refused, in this process and across
+/// processes alike — the data-directory `flock` is the only thing that refuses
+/// one, and it does not care which process the second opener is in.
 #[test]
-fn a_second_handle_is_refused() {
+fn a_second_handle_on_one_directory_is_refused() {
     let _g = serial();
     let mut fx = Fixture::start();
 
-    // In-process: any directory, because what it protects is process-global.
-    let other = tempfile::tempdir().unwrap();
+    // In-process. A second open takes a fresh open file description, which
+    // `flock` treats as a conflict — unlike a forked worker's inherited one.
     let client = GnitzClient::connect(fx.server.sock_path()).unwrap();
     assert!(
-        Mirror::open(other.path().to_str().unwrap(), client).is_err(),
-        "a second live handle in one process must be refused",
+        Mirror::open(&fx.base_dir(), client).is_err(),
+        "a second handle on a directory this process holds must be refused",
     );
 
-    // Cross-process: the same directory, with the first handle dropped so only
-    // the flock can refuse it.
+    // Cross-process, with the first handle dropped so only the flock can refuse.
     let dir = fx.base_dir();
     fx.mirror = None;
     let client = GnitzClient::connect(fx.server.sock_path()).unwrap();
@@ -403,10 +404,116 @@ fn a_second_handle_is_refused() {
     assert_child_ok(&out, "the second-process child must run to the end");
     let printed = String::from_utf8_lossy(&out.stdout);
     assert!(
-        printed.contains("locked by another live process"),
+        printed.contains("is already held"),
         "a second process on a held directory must be refused: {printed}",
     );
     drop(held);
+}
+
+/// Two handles on two directories, in one process, each resuming its own copy.
+///
+/// Nothing process-global decides what a store resumes from any more, so the two
+/// are independent: each reopens at the generation its own checkpoint published,
+/// advances rather than reseeds, and answers what the server answers.
+#[test]
+fn two_handles_on_two_directories_keep_their_own_state() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    let second_dir = tempfile::tempdir().unwrap();
+    let mut second = Mirror::open(
+        second_dir.path().to_str().unwrap(),
+        GnitzClient::connect(fx.server.sock_path()).unwrap(),
+    )
+    .expect("a second handle on its own directory opens");
+
+    churn(&mut fx.direct, 1, 80);
+    fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
+    second.mirror_view("s", "v_repl").expect("mirror v_repl");
+    fx.quiesce();
+    second.poll().expect("poll the second handle");
+
+    // Put the two directories at *different* generations, so a shared one would
+    // leave at least one of them looking for a generation its manifests never
+    // carried. The drop below checkpoints each again, first to 2, second to 1.
+    fx.mirror().checkpoint().expect("checkpoint the first copy");
+
+    // Both checkpoint on the way out, then both come back.
+    drop(second);
+    fx.reopen();
+    let mut second = Mirror::open(
+        second_dir.path().to_str().unwrap(),
+        GnitzClient::connect(fx.server.sock_path()).unwrap(),
+    )
+    .expect("the second directory reopens");
+
+    let keyed = fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
+    let repl = second.mirror_view("s", "v_repl").expect("re-mirror v_repl");
+    for (view, outcome) in [("v_keyed", keyed), ("v_repl", repl)] {
+        assert!(
+            !outcome.reseeded,
+            "{view} was checkpointed and must resume, not bootstrap",
+        );
+    }
+
+    fx.differential("s", "SELECT * FROM v_keyed");
+    let sql_text = "SELECT * FROM v_repl";
+    let local = query(&mut second, "s", sql_text);
+    let remote = query(&mut fx.direct, "s", sql_text);
+    assert_same_zset(sql_text, (&local.0, &local.1), (&remote.0, &remote.1));
+}
+
+/// A cursor naming a copy that is not there must not be honoured.
+///
+/// `forget_view` retracts the registration into the system memtable and removes
+/// the store directory at once, so an exit before the next checkpoint leaves the
+/// view replayed as registered over a store that never came back — with its
+/// cursor still in a file whose generation matches. Advancing on that cursor
+/// applies `(c, now]` onto nothing: reads answer short, and `reseeded` says
+/// `false`, so no subscriber is told.
+#[test]
+fn a_cursor_naming_an_absent_copy_bootstraps() {
+    let _g = serial();
+    let (server, dir) = child_fixture();
+
+    run_child(
+        "forgotten_view_leaves_its_cursor_child",
+        &server,
+        &dir,
+        &[],
+        "the child must checkpoint, forget the view, and exit without checkpointing again",
+    );
+
+    let mut mirror = Mirror::open(
+        dir.path().to_str().unwrap(),
+        GnitzClient::connect(server.sock_path()).unwrap(),
+    )
+    .expect("the directory the child left behind reopens");
+    let outcome = mirror.mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
+    assert!(
+        outcome.reseeded,
+        "a cursor over a copy that never came back must bootstrap, not advance",
+    );
+    let mut direct = GnitzClient::connect(server.sock_path()).unwrap();
+    let sql_text = "SELECT * FROM v_keyed";
+    let local = query(&mut mirror, "s", sql_text);
+    let remote = query(&mut direct, "s", sql_text);
+    assert_same_zset(sql_text, (&local.0, &local.1), (&remote.0, &remote.1));
+}
+
+/// Runs only in the child `a_cursor_naming_an_absent_copy_bootstraps` spawns.
+///
+/// `std::process::exit` rather than a drop: it is what a crash or a `SIGKILL`
+/// leaves behind — a durable cursor file and a durable registration, both from
+/// the checkpoint, and no record of the forget.
+#[test]
+fn forgotten_view_leaves_its_cursor_child() {
+    let Some((sock, dir)) = child_target() else { return };
+    let mut mirror = Mirror::open(&dir, GnitzClient::connect(&sock).unwrap()).expect("open");
+    let tid = mirror.mirror_view("s", "v_keyed").expect("mirror v_keyed").view_id;
+    mirror.checkpoint().expect("checkpoint the copy and its cursor");
+    mirror.forget_view(tid).expect("forget v_keyed");
+    println!("{CHILD_OK}");
+    std::process::exit(0);
 }
 
 /// Forgetting a view and mirroring it again — same server id, same layout —
@@ -1819,7 +1926,7 @@ fn child_target() -> Option<(String, String)> {
     ))
 }
 
-/// Runs only in the child `a_second_handle_is_refused` spawns. It opens the
+/// Runs only in the child `a_second_handle_on_one_directory_is_refused` spawns. It opens the
 /// engine rather than a `Mirror` because that is where the lock is taken, and
 /// because it needs no server to reach it.
 #[test]
