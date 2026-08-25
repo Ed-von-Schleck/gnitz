@@ -81,6 +81,16 @@ impl ShardIndex {
             }
         }
         self.sort_l0();
+        // Every guard was held at the `R` of the session that wrote it, so the
+        // largest one recovers that unit. Without it a resumed store carries the
+        // `MIN_GUARD_BYTES` floor until its first fold and shatters every guard
+        // it loaded against a target orders of magnitude too small.
+        self.l0_run_bytes = self.l0_run_bytes.max(
+            (0..self.levels.len())
+                .flat_map(|li| self.guard_bytes(li))
+                .max()
+                .unwrap_or(0),
+        );
         Ok(Some(header))
     }
 

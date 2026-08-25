@@ -1,6 +1,7 @@
 //! In-memory FLSM index state + the compaction trigger/orchestration for
 //! [`ShardIndex`]: shard insertion, L0 sort, PK probes, the `should_compact`
-//! trigger, and `run_compact` with its L0→L1 / vertical guard merges.
+//! trigger, and `run_compact` — the L0→L1 fold, the byte targets every level's
+//! guard partition is held at, and the vertical drain into the terminal level.
 
 use std::cmp::Ordering;
 use std::ffi::CStr;
@@ -11,8 +12,8 @@ use super::super::compact;
 use super::super::error::StorageError;
 use super::super::shard_reader::MappedShard;
 use super::{
-    to_cstrings, FLSMLevel, ShardEntry, ShardIndex, GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD, L1_TARGET_FILES,
-    LMAX_FILE_THRESHOLD, TERMINAL_LEVEL_IDX,
+    to_cstrings, CompactionInputs, CompactionKind, FLSMLevel, LevelGuard, ShardEntry, ShardIndex, GUARD_FILE_THRESHOLD,
+    L0_COMPACT_THRESHOLD, LMAX_FILE_THRESHOLD, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL_LEVEL_IDX,
 };
 
 impl ShardIndex {
@@ -90,6 +91,31 @@ impl ShardIndex {
         self.all_shard_arcs_iter().collect()
     }
 
+    /// Every shard that can hold a key in `[start, end]`, `end` `None` meaning
+    /// the top of the key space. Complete because guards partition the key line:
+    /// a key is reachable from exactly one guard per level.
+    pub(crate) fn shard_arcs_in_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
+        let lo = crate::schema::key::pack_pk_be(start);
+        let hi = end.map_or(u128::MAX, crate::schema::key::pack_pk_be);
+        let pack = |k: &crate::schema::key::PkBuf| crate::schema::key::pack_pk_be(k.pk_bytes());
+        let l0 = self
+            .l0
+            .iter()
+            .filter(move |e| !e.is_empty() && pack(&e.pk_max) >= lo && pack(&e.pk_min) <= hi)
+            .map(|e| Rc::clone(&e.shard));
+        let deep = self.levels.iter().flat_map(move |level| {
+            let run = level.find_guards_for_range(lo, hi);
+            level.guards[run]
+                .iter()
+                .flat_map(|g| g.entries.iter().map(|e| Rc::clone(&e.shard)))
+        });
+        l0.chain(deep)
+    }
+
     /// Raw rows across every live shard, summed without touching an `Rc`. Raw:
     /// cross-shard duplicates and ghosts are counted, so it is an upper bound on
     /// the live rows a walk would emit — the shape the selectivity gate wants.
@@ -100,13 +126,20 @@ impl ShardIndex {
     /// Whether any registered shard is a skeleton — i.e. whether a read of this
     /// store can meet a `(PK, coarse weight)` row it has to hydrate.
     ///
-    /// Derived from the shards themselves rather than from the store's capacity:
-    /// a bounded view under its cap has never dehydrated and reads exactly like an
-    /// unbounded one, and this is what lets it keep the ordinary read paths. Only
-    /// compaction writes a skeleton, so the memtable and RAM tier never hold one
-    /// and the registered set is the whole question.
+    /// A budget is necessary but not sufficient: only `dehydrate_guard` writes a
+    /// skeleton and only `enforce_capacity` reaches it, but a bounded view under
+    /// its cap has never dehydrated and reads exactly like an unbounded one. So
+    /// the answer is still derived from the shards — over the terminal level
+    /// alone, the only one a skeleton is ever written into. Every read verb asks
+    /// this, so the unbounded store answers it without touching a shard.
     pub(crate) fn has_skeleton_shard(&self) -> bool {
-        self.all_entries().any(|e| e.shard.is_skeleton())
+        self.capacity_bytes.is_some()
+            && self.levels.get(TERMINAL_LEVEL_IDX).is_some_and(|l| {
+                l.guards
+                    .iter()
+                    .flat_map(|g| g.entries.iter())
+                    .any(|e| e.shard.is_skeleton())
+            })
     }
 
     /// Test-only u128 oracle: OPK-encodes a **native** PK value (handling
@@ -187,53 +220,53 @@ impl ShardIndex {
         Ok(opened)
     }
 
-    /// Filenames of `entries` plus their LSN watermark. One derivation, because
-    /// `Table::new` seeds `current_lsn = max_lsn() + 1`: a watermark below an
-    /// input's would let a later spill reuse a live shard's name.
-    fn compaction_inputs<'a>(entries: impl IntoIterator<Item = &'a ShardEntry>) -> (Vec<String>, u64) {
-        let mut files = Vec::new();
-        let mut max_lsn = 0u64;
+    /// One compaction's input set, gathered in a single walk of `entries`: their
+    /// paths, their LSN watermark, and their registered bytes.
+    ///
+    /// The watermark is one derivation because `Table::new` seeds
+    /// `current_lsn = max_lsn() + 1`: a watermark below an input's would let a
+    /// later spill reuse a live shard's name.
+    fn compaction_inputs<'a>(entries: impl IntoIterator<Item = &'a ShardEntry>) -> CompactionInputs {
+        let mut inputs = CompactionInputs::default();
         for e in entries {
-            files.push(e.filename.clone());
-            max_lsn = max_lsn.max(e.max_lsn);
+            inputs.files.push(e.filename.clone());
+            inputs.max_lsn = inputs.max_lsn.max(e.max_lsn);
+            inputs.bytes += e.shard.file_len();
         }
-        (files, max_lsn)
+        inputs
     }
 
     /// The one compaction driver: merge `inputs` into `dest_idx`, routed across
     /// `guard_keys`, then release the entries they came from via `drop_sources`.
     ///
-    /// Each destination guard is written skeleton iff it is already dehydrated or
-    /// the caller passed `force_skeleton`. The two halves
-    /// answer different questions: `Skeleton` performs a guard's *first*
-    /// dehydration (a hydrated guard derives `false`, so the derived rule alone
-    /// could never start), while the derived rule is the never-re-hydrate rule — a
-    /// vertical folding hydrated L1 data into an already-dehydrated L2 guard emits
-    /// skeleton, so ordinary compaction cannot undo the sweep's work, and data
-    /// landing in a dehydrated guard is skeletonized without the sweep running at
-    /// all. The slice is per-guard because a vertical's destination set is every L2
-    /// guard its key range overlaps while the sweep dehydrates one guard at a time,
-    /// so a mixed destination set is routine.
+    /// A destination guard is written skeleton if it is already dehydrated —
+    /// ordinary compaction never re-hydrates what the sweep evicted — or if
+    /// `force_skeleton` says so, which is how a dehydration starts. Derived per
+    /// destination, because a vertical routes into every terminal guard its key
+    /// range overlaps while the sweep dehydrates one at a time.
     ///
     /// Nothing is mutated until every output shard has been written *and*
     /// reopened, so a failure leaves the index exactly as it was and the caller
     /// can retry against the untouched source tier.
     fn compact_into(
         &mut self,
-        inputs: Vec<String>,
-        max_lsn: u64,
+        inputs: CompactionInputs,
         guard_keys: &[u128],
         dest_idx: usize,
         force_skeleton: bool,
+        kind: CompactionKind,
         drop_sources: impl FnOnce(&mut Self),
     ) -> Result<(), StorageError> {
+        let CompactionInputs {
+            files,
+            max_lsn,
+            bytes: in_bytes,
+        } = inputs;
         let compact_seq = self.next_compact_seq();
-        let cstrings = to_cstrings(&inputs)?;
+        let cstrings = to_cstrings(&files)?;
         let cstrs: Vec<&CStr> = cstrings.iter().map(|c| c.as_c_str()).collect();
 
-        // Only terminal-level guards are ever dehydrated, so the derived half is
-        // asked only there; every shallower destination is hydrated unless the
-        // sweep is forcing this guard's first dehydration.
+        // Only terminal-level guards are ever dehydrated.
         let dest = (dest_idx == TERMINAL_LEVEL_IDX)
             .then(|| self.levels.get(dest_idx))
             .flatten();
@@ -241,10 +274,7 @@ impl ShardIndex {
             .iter()
             .map(|&gk| {
                 let skeleton = force_skeleton
-                    || dest.is_some_and(|l| {
-                        l.find_guard_idx(gk)
-                            .is_some_and(|gi| l.guards[gi].guard_key == gk && l.guards[gi].dehydrated())
-                    });
+                    || dest.is_some_and(|l| l.find_exact_guard(gk).is_some_and(|gi| l.guards[gi].dehydrated()));
                 (gk, skeleton)
             })
             .collect();
@@ -262,11 +292,17 @@ impl ShardIndex {
             },
         )?;
         let opened = self.open_outputs(&outputs, max_lsn)?;
+        super::cstats::record(
+            kind,
+            in_bytes,
+            opened.iter().map(|(_, e)| e.shard.file_len()).sum(),
+            files.len(),
+        );
 
         // The superseded inputs are the sole writer of `pending_deletions`. Each
         // leaves the index carrying its own sweep flag, so an unpublished spill
         // among them stops being swept with nothing having to prune it.
-        self.pending_deletions.extend(inputs);
+        self.pending_deletions.extend(files);
         drop_sources(self);
         self.ensure_level(dest_idx);
         for (gk, entry) in opened {
@@ -292,17 +328,96 @@ impl ShardIndex {
         }
     }
 
+    /// Fold L0 into L1, rebalance every level's guards against their byte
+    /// targets, then drain L1 down to its own. Observing `R` first is what makes
+    /// those targets reflect the fold this call is about to perform.
     pub(crate) fn run_compact(&mut self) -> Result<(), StorageError> {
-        let (inputs, max_lsn) = Self::compaction_inputs(&self.l0);
+        self.l0_run_bytes = self.l0_run_bytes.max(self.l0.iter().map(|e| e.shard.file_len()).sum());
+
+        let inputs = Self::compaction_inputs(&self.l0);
         let guard_keys = self.l1_guard_keys();
-        self.compact_into(inputs, max_lsn, &guard_keys, 0, false, |s| s.l0.clear())?;
+        self.compact_into(inputs, &guard_keys, 0, false, CompactionKind::L0Fold, |s| s.l0.clear())?;
 
-        self.compact_guards_if_needed()?;
+        self.rebalance_guards()?;
 
-        if self.levels[0].total_file_count() > L1_TARGET_FILES {
-            self.compact_guard_vertical()?;
+        while self.level_bytes(0) > self.l1_target_bytes() {
+            let Some(gi) = self.cheapest_l1_guard_to_drain() else {
+                break;
+            };
+            self.vertical_fold(gi)?;
         }
         Ok(())
+    }
+
+    /// Registered shard bytes of one level — 0 for a level that does not exist
+    /// yet, which is the terminal level's state until the first vertical.
+    pub(super) fn level_bytes(&self, level_idx: usize) -> u64 {
+        self.levels.get(level_idx).map_or(0, FLSMLevel::bytes)
+    }
+
+    /// Registered shard bytes of each guard of `level_idx`, in key order.
+    pub(super) fn guard_bytes(&self, level_idx: usize) -> impl Iterator<Item = u64> + '_ {
+        self.levels
+            .get(level_idx)
+            .into_iter()
+            .flat_map(|l| l.guards.iter())
+            .map(LevelGuard::bytes)
+    }
+
+    /// The largest a guard of `level_idx` is allowed to get: `R`, so no
+    /// compaction's input grows with the dataset — every fold reads at most two
+    /// guards' worth.
+    ///
+    /// A budgeted store's terminal level takes one sweep step instead, since that
+    /// is the granularity `enforce_capacity` evicts at. The clamp keeps a very
+    /// large or very small `capacity` from naming a target outside
+    /// `[MIN_GUARD_BYTES, R]`.
+    pub(super) fn guard_target_bytes(&self, level_idx: usize) -> u64 {
+        match self.capacity_bytes {
+            Some(cap) if level_idx == TERMINAL_LEVEL_IDX => {
+                (cap / SWEEP_STEPS).clamp(MIN_GUARD_BYTES, self.l0_run_bytes)
+            }
+            _ => self.l0_run_bytes,
+        }
+    }
+
+    /// Bytes L1 is drained to. Capped at two sweep steps for a budgeted store:
+    /// `enforce_capacity` cannot evict from L1, so bytes parked there come out of
+    /// what the user asked for.
+    pub(super) fn l1_target_bytes(&self) -> u64 {
+        let target = Self::balanced_l1_target(self.level_bytes(TERMINAL_LEVEL_IDX), self.l0_run_bytes);
+        match self.capacity_bytes {
+            Some(cap) => target.min(2 * (cap / SWEEP_STEPS)),
+            None => target,
+        }
+    }
+
+    /// L1's two rewrite terms — one per guard fold, one per vertical — balance at
+    /// `2√(|L2|·R)`. The `16 R` floor under it is a chosen minimum, not a derived
+    /// one: it keeps a small store from draining L1 on every spill.
+    ///
+    /// `l2_bytes × r` overflows a `u64` at 100 GiB of terminal bytes, hence the
+    /// `u128`; the `2` stays outside the root so the extremes saturate rather
+    /// than overflow it in turn.
+    pub(super) fn balanced_l1_target(l2_bytes: u64, r: u64) -> u64 {
+        let balanced = 2 * (u128::from(l2_bytes) * u128::from(r)).isqrt();
+        u64::try_from(balanced).unwrap_or(u64::MAX).max(16u64.saturating_mul(r))
+    }
+
+    /// The L1 guard whose fold costs least: the narrowest key span, and so the
+    /// fewest terminal guards to merge with. Write recency would be degenerate
+    /// here — one L0 fold stamps every destination guard with the same `max_lsn`.
+    ///
+    /// Nothing starves: a guard skipped for being wide is one absorbing a large
+    /// share of every fold, so it crosses its byte target and splits.
+    fn cheapest_l1_guard_to_drain(&self) -> Option<usize> {
+        let guards = &self.levels.first()?.guards;
+        (0..guards.len())
+            .filter(|&gi| !guards[gi].entries.is_empty())
+            .min_by_key(|&gi| {
+                let (lo, hi) = self.src_guard_span(gi);
+                hi - lo
+            })
     }
 
     pub(super) fn l1_guard_keys(&self) -> Vec<u128> {
@@ -350,45 +465,120 @@ impl ShardIndex {
         }
     }
 
-    pub(super) fn compact_guards_if_needed(&mut self) -> Result<(), StorageError> {
+    /// Hold every level's partition at its byte target, in the order the two
+    /// passes have to run: a merge must see the sizes a split left.
+    pub(super) fn rebalance_guards(&mut self) -> Result<(), StorageError> {
         for li in 0..self.levels.len() {
-            self.compact_overfull_guards(li, Self::guard_threshold(li))?;
+            self.split_overfull_guards(li)?;
+            self.merge_underfull_guards(li)?;
         }
         Ok(())
     }
 
-    /// Fold every guard in `level_idx` whose file count exceeds `threshold` down
-    /// to one file via `compact_one_guard`. Index-based walk because
-    /// `compact_one_guard` replaces a guard's `entries` in place (guard count is
-    /// stable across the loop).
-    fn compact_overfull_guards(&mut self, level_idx: usize, threshold: usize) -> Result<(), StorageError> {
-        let mut gi = 0;
-        while gi < self.levels[level_idx].guards.len() {
-            if self.levels[level_idx].guards[gi].entries.len() > threshold {
-                self.compact_one_guard(level_idx, gi, false)?;
-            }
-            gi += 1;
-        }
-        Ok(())
-    }
-
-    /// Fold one guard's files into a single output, in place. A guard whose rows
-    /// all cancel is left with no entries rather than an empty shard.
-    /// `force_skeleton` says what the rewritten guard becomes (see
-    /// [`Self::compact_into`]); the destination is the one guard key it names, so
-    /// it reaches exactly that guard.
-    fn compact_one_guard(
+    /// Fold the guards `range` names into `keys` within their own level — one
+    /// output shard per non-empty destination bucket. A split, a merge and the
+    /// sweep's dehydration are this same rewrite under different triggers.
+    ///
+    /// Sources are drained, so a bucket that came out empty leaves no entry-less
+    /// guard behind; keys in an emptied band route to the guard below it, which
+    /// holds no row for them either.
+    ///
+    /// A dehydrated source makes every destination skeleton: skeleton rows carry
+    /// no payload, so nothing may rewrite them full width.
+    fn fold_guards(
         &mut self,
         level_idx: usize,
-        guard_idx: usize,
-        force_skeleton: bool,
+        range: std::ops::Range<usize>,
+        keys: &[u128],
+        kind: CompactionKind,
     ) -> Result<(), StorageError> {
-        let guard = &self.levels[level_idx].guards[guard_idx];
-        let guard_key = guard.guard_key;
-        let (inputs, max_lsn) = Self::compaction_inputs(&guard.entries);
-        self.compact_into(inputs, max_lsn, &[guard_key], level_idx, force_skeleton, |s| {
-            s.levels[level_idx].guards[guard_idx].entries.clear();
+        debug_assert!(
+            keys.windows(2).all(|w| w[0] < w[1]),
+            "destination keys must be sorted and distinct"
+        );
+        let guards = &self.levels[level_idx].guards[range.clone()];
+        let skeleton = kind == CompactionKind::Dehydrate || guards.iter().any(LevelGuard::dehydrated);
+        let inputs = Self::compaction_inputs(guards.iter().flat_map(|g| g.entries.iter()));
+        self.compact_into(inputs, keys, level_idx, skeleton, kind, |s| {
+            s.levels[level_idx].guards.drain(range);
         })
+    }
+
+    /// Fold every guard in `level_idx` that is over its file threshold or its
+    /// byte target, cutting the byte-overfull ones at their own key quantiles —
+    /// a guard over the file threshold alone folds to one shard in place.
+    ///
+    /// Walked by key rather than by index because a fold reshapes the level under
+    /// it. Each guard present on entry is folded once; what a split creates is
+    /// already at the target.
+    pub(super) fn split_overfull_guards(&mut self, level_idx: usize) -> Result<(), StorageError> {
+        let target = self.guard_target_bytes(level_idx);
+        let threshold = Self::guard_threshold(level_idx);
+        let present: Vec<u128> = self.levels[level_idx].guards.iter().map(|g| g.guard_key).collect();
+        for gk in present {
+            let Some(gi) = self.levels[level_idx].find_exact_guard(gk) else {
+                continue;
+            };
+            let guard = &self.levels[level_idx].guards[gi];
+            let keys = guard.fold_destinations(target);
+            if keys.len() > 1 || guard.entries.len() > threshold {
+                self.fold_guards(level_idx, gi..gi + 1, &keys, CompactionKind::GuardSplit)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Maximal runs of two or more adjacent guards whose combined bytes fit
+    /// `bound`. A run also breaks at a change of representation, because folding
+    /// a hydrated guard together with a dehydrated one would evict it (see
+    /// [`Self::fold_guards`]).
+    fn underfull_runs(&self, level_idx: usize, bound: u64) -> Vec<std::ops::Range<usize>> {
+        let guards = &self.levels[level_idx].guards;
+        let mut runs = Vec::new();
+        let (mut start, mut acc) = (0usize, 0u64);
+        for (i, g) in guards.iter().enumerate() {
+            let bytes = g.bytes();
+            if i > start && (acc + bytes > bound || g.dehydrated() != guards[start].dehydrated()) {
+                if i - start > 1 {
+                    runs.push(start..i);
+                }
+                (start, acc) = (i, 0);
+            }
+            acc += bytes;
+        }
+        if guards.len() - start > 1 {
+            runs.push(start..guards.len());
+        }
+        runs
+    }
+
+    /// Fold each underfull run into its lowest key, so the guard count follows
+    /// the level's bytes down as well as up — the capacity sweep can shrink a
+    /// guard by an order of magnitude in one rewrite.
+    ///
+    /// Half the target is the hysteresis: a merged run is under the split trigger
+    /// by construction, so the two passes cannot trade the same bytes forever.
+    pub(super) fn merge_underfull_guards(&mut self, level_idx: usize) -> Result<(), StorageError> {
+        let bound = self.guard_target_bytes(level_idx) / 2;
+        // Descending, so each drain shifts only indices above the runs still to go.
+        for run in self.underfull_runs(level_idx, bound).into_iter().rev() {
+            let key = self.levels[level_idx].guards[run.start].guard_key;
+            self.fold_guards(level_idx, run, &[key], CompactionKind::GuardMerge)?;
+        }
+        Ok(())
+    }
+
+    /// The sweep's first dehydration of a hydrated terminal guard: one skeleton
+    /// shard in place, never split — the output is one row per key, so a part
+    /// count derived from the hydrated input would shatter it.
+    pub(super) fn dehydrate_guard(&mut self, guard_idx: usize) -> Result<(), StorageError> {
+        let key = self.levels[TERMINAL_LEVEL_IDX].guards[guard_idx].guard_key;
+        self.fold_guards(
+            TERMINAL_LEVEL_IDX,
+            guard_idx..guard_idx + 1,
+            &[key],
+            CompactionKind::Dehydrate,
+        )
     }
 
     /// Evict a guard by **unlinking** it: no output shard is written at all, so
@@ -412,80 +602,89 @@ impl ShardIndex {
     fn drop_guard(&mut self, level_idx: usize, guard_idx: usize) {
         let guard = &self.levels[level_idx].guards[guard_idx];
         let highest_round = guard.highest_leading_u64().unwrap_or(0);
-        let (inputs, _) = Self::compaction_inputs(&guard.entries);
+        let inputs = Self::compaction_inputs(&guard.entries);
         self.dropped_through = self.dropped_through.max(highest_round);
-        self.pending_deletions.extend(inputs);
+        self.pending_deletions.extend(inputs.files);
         self.levels[level_idx].guards.remove(guard_idx);
         self.unlink_superseded_now();
     }
 
-    /// The ordinary vertical trigger: pick the worst (most-filed) L1 guard and
-    /// hand it to [`Self::vertical_fold`]. A guard holding one file is left alone —
-    /// folding it would rewrite the terminal level to save nothing.
-    pub(super) fn compact_guard_vertical(&mut self) -> Result<(), StorageError> {
-        const SRC_IDX: usize = 0; // L1
-
-        let worst_idx = {
-            let src = &self.levels[SRC_IDX];
-            let mut worst = None;
-            let mut worst_count = 0;
-            for (i, g) in src.guards.iter().enumerate() {
-                if g.entries.len() > worst_count {
-                    worst_count = g.entries.len();
-                    worst = Some(i);
-                }
-            }
-            match worst {
-                Some(idx) if worst_count > 1 => idx,
-                _ => return Ok(()),
-            }
-        };
-
-        self.vertical_fold(worst_idx)
+    /// The `pack_pk_be` span an L1 guard's fold has to cover: its own key on the
+    /// low side, since it owns everything below it, and its true key extent on
+    /// the high side. The gap to the next L1 guard key would be `u128::MAX` for
+    /// the last one and route the fold into the whole terminal level.
+    fn src_guard_span(&self, src_guard_idx: usize) -> (u128, u128) {
+        let g = &self.levels[0].guards[src_guard_idx];
+        let (lo, hi) = g.key_extent().unwrap_or((g.guard_key, g.guard_key));
+        (g.guard_key.min(lo), hi)
     }
 
-    /// Fold L1 guard `src_guard_idx`, together with the L2 guards its key range
-    /// overlaps, down into L2 — the deepest vertical destination, since an L2→L3
-    /// fold would serialize a level `load_manifest` rejects.
+    /// The keys an L1 guard is cut at before it is folded down: its own key, plus
+    /// every terminal guard key its span covers. Each band then overlaps exactly
+    /// one destination guard, so one merge reads one band plus one terminal
+    /// guard.
+    fn vertical_band_keys(&self, src_guard_idx: usize) -> Vec<u128> {
+        let (lo, hi) = self.src_guard_span(src_guard_idx);
+        let mut keys = vec![self.levels[0].guards[src_guard_idx].guard_key];
+        if let Some(dest) = self.levels.get(TERMINAL_LEVEL_IDX) {
+            // `skip(1)`: the run's first guard owns everything below its own key,
+            // so cutting there would route the source rows below it into a guard
+            // that does not own them.
+            let run = dest.find_guards_for_range(lo, hi);
+            keys.extend(dest.guards[run].iter().skip(1).map(|d| d.guard_key));
+            keys.sort_unstable();
+            keys.dedup();
+        }
+        keys
+    }
+
+    /// Fold L1 guard `src_guard_idx` down into the terminal level, banded so no
+    /// single merge reads more than one band plus one terminal guard.
     ///
-    /// The destination range comes from the source guard's true key extent, not
-    /// from the gap to the next L1 guard key: the latter is `u128::MAX` for the
-    /// last (or only) L1 guard, which would route the fold into every L2 guard at
-    /// or above its key and rewrite the whole terminal level on every such fold.
-    /// That holds for any store, not just a bounded one — a single L1 guard is just
-    /// the common case under the capacity sweep.
-    ///
-    /// Passes `force_skeleton = false`: only the sweep's own dehydration step
-    /// overrides a destination guard's derived representation.
+    /// Atomic per band, not per call: a failure in band *k* leaves bands `0..k`
+    /// folded, every intermediate state a valid partition, and the next spill
+    /// redoes the rest.
     pub(super) fn vertical_fold(&mut self, src_guard_idx: usize) -> Result<(), StorageError> {
-        const SRC_IDX: usize = 0; // L1
-        const DEST_IDX: usize = TERMINAL_LEVEL_IDX; // L2
+        self.ensure_level(TERMINAL_LEVEL_IDX);
+        let keys = self.vertical_band_keys(src_guard_idx);
+        if keys.len() > 1 {
+            self.fold_guards(0, src_guard_idx..src_guard_idx + 1, &keys, CompactionKind::Vertical)?;
+        }
+        for key in keys {
+            // A band whose bucket came out empty was never created.
+            if let Some(gi) = self.levels[0].find_exact_guard(key) {
+                self.fold_band_into_terminal(gi)?;
+            }
+        }
+        // Once, not per band: the bands were cut against the terminal partition
+        // as it stood, so reshaping it mid-loop would leave a later band
+        // straddling a guard it was cut to overlap singly.
+        self.split_overfull_guards(TERMINAL_LEVEL_IDX)?;
+        self.merge_underfull_guards(TERMINAL_LEVEL_IDX)
+    }
 
-        let src_guard = &self.levels[SRC_IDX].guards[src_guard_idx];
-        let src_guard_key = src_guard.guard_key;
-        // An empty source guard has no extent; its own key bounds the range on
-        // both sides, so the fold touches at most the guard it would land in.
-        let (extent_min, extent_max) = src_guard.key_extent().unwrap_or((src_guard_key, src_guard_key));
-        // Guard 0 also owns everything below `guards[0].guard_key`, so the range
-        // start is the lower of the guard's own key and its extent's.
-        let range_min = src_guard_key.min(extent_min);
+    /// Merge one L1 band with the terminal guards its span overlaps — a run of
+    /// exactly one once [`Self::vertical_fold`] has banded the source. The
+    /// terminal level is the deepest destination: an L2→L3 fold would serialize a
+    /// level `load_manifest` rejects.
+    fn fold_band_into_terminal(&mut self, src_guard_idx: usize) -> Result<(), StorageError> {
+        const DEST_IDX: usize = TERMINAL_LEVEL_IDX;
 
-        self.ensure_level(DEST_IDX);
-
-        let dest_range = self.levels[DEST_IDX].find_guards_for_range(range_min, extent_max);
-        // The source guard's files followed by every overlapping destination
-        // guard's, in one pass. Input order does not affect the merge — it orders
-        // by (PK, payload) and sums the weights of equal rows.
-        let (all_input_files, vert_max_lsn) = Self::compaction_inputs(
-            self.levels[SRC_IDX].guards[src_guard_idx].entries.iter().chain(
+        let src_guard_key = self.levels[0].guards[src_guard_idx].guard_key;
+        let (range_min, range_max) = self.src_guard_span(src_guard_idx);
+        let dest_range = self.levels[DEST_IDX].find_guards_for_range(range_min, range_max);
+        // Input order does not affect the merge — it orders by (PK, payload) and
+        // sums the weights of equal rows.
+        let inputs = Self::compaction_inputs(
+            self.levels[0].guards[src_guard_idx].entries.iter().chain(
                 self.levels[DEST_IDX].guards[dest_range.clone()]
                     .iter()
                     .flat_map(|g| g.entries.iter()),
             ),
         );
 
-        // No overlapping destination guard yet: the source guard's own key seeds
-        // one, so the folded rows keep a slot to route to.
+        // An empty terminal level has no guard to route to; the source's own key
+        // seeds the first one.
         let guard_keys: Vec<u128> = if dest_range.is_empty() {
             vec![src_guard_key]
         } else {
@@ -495,78 +694,43 @@ impl ShardIndex {
                 .collect()
         };
 
-        self.compact_into(all_input_files, vert_max_lsn, &guard_keys, DEST_IDX, false, |s| {
-            s.levels[SRC_IDX].guards.remove(src_guard_idx);
+        self.compact_into(inputs, &guard_keys, DEST_IDX, false, CompactionKind::Vertical, |s| {
+            s.levels[0].guards.remove(src_guard_idx);
             s.levels[DEST_IDX].guards.drain(dest_range);
-        })?;
-
-        self.compact_overfull_guards(DEST_IDX, Self::guard_threshold(DEST_IDX))
+        })
     }
 
     /// Sum of every **registered** shard's file size — the quantity a
-    /// capacity-bounded store is held under. Derived, not cached: it runs only
-    /// under a capacity and only once per spill, so recomputing beats maintaining
-    /// a counter across the install (`add_unsynced_shard`, `open_outputs`) and
-    /// removal (`supersede_files`, every `drop_sources` closure) sites, and cannot
-    /// drift from them.
+    /// capacity-bounded store is held under. Derived rather than counted, so it
+    /// cannot drift from the several install and removal sites that would have to
+    /// maintain a counter.
     ///
     /// Registered, not on-disk: a compaction's superseded inputs sit in
     /// `pending_deletions` until the checkpoint barrier's post-publish drain, so
-    /// bytes on disk exceed this by the compaction garbage accumulated since the
-    /// last checkpoint.
+    /// bytes on disk exceed this by the compaction garbage since the last
+    /// checkpoint.
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.all_entries().map(|e| e.shard.file_len()).sum()
     }
 
     /// Hold this store's registered shard bytes at or under `cap` by evicting
-    /// terminal-level guards, oldest-written first. An eviction leaves skeleton
-    /// rows behind for a capacity-bounded view's output store, and nothing at all
-    /// for a view's delta store ([`ShardIndex::evict_by_drop`]).
+    /// terminal-level guards, oldest-written first — the only recency signal the
+    /// tree carries, since nothing records that a row was *read*. An eviction
+    /// leaves skeleton rows behind for a capacity-bounded view's output store and
+    /// nothing at all for a delta store ([`ShardIndex::evict_by_drop`]).
     ///
-    /// While `resident_bytes() > cap`:
-    /// 1. a victim terminal-level guard exists → evict the one whose newest entry
-    ///    has the smallest `max_lsn`, by `drop_guard` or by `compact_one_guard`
-    ///    as the store says;
-    /// 2. else, if this call has not pushed down yet: an L1 guard exists →
-    ///    `vertical_fold` on the oldest one; else L0 non-empty → `run_compact`;
-    ///    then loop — a `vertical_fold` gives step 1 a victim, a `run_compact`
-    ///    only moves L0 into L1 for the next call's fold;
-    /// 3. otherwise stop.
+    /// While over `cap`: evict the oldest hydrated terminal guard if there is
+    /// one; otherwise push a level's worth of data down to make one — draining L1
+    /// before refilling L0, because a spill has just refilled L0 at every trigger.
+    /// The push-down is the expensive half, so it is budgeted to one per call and
+    /// a store below its skeleton floor converges across spills instead of running
+    /// the whole level down inside one trigger.
     ///
-    /// L1 is drained before L0 is refilled because ordinary compaction cannot be
-    /// relied on to do it: the vertical is gated on `L1_TARGET_FILES`, and a
-    /// store whose keys form one guard band has its L1 guard folded back to a
-    /// single file by `compact_guards_if_needed` on every pass, so that gate
-    /// never fires and the terminal level never forms. Preferring L0 here would
-    /// leave the sweep with nothing to dehydrate forever, because a spill has
-    /// just refilled L0 at every trigger.
-    ///
-    /// Under `evict_by_drop` nothing is ever dehydrated, so step 1's
-    /// `!g.dehydrated()` filter is vacuous and its victim is simply the
-    /// oldest-written terminal guard, and step 3 is unreachable. Termination
-    /// survives: step 1 strictly decreases the terminal guard *count* where it
-    /// decreased the hydrated terminal guard count. There is no skeleton floor, so
-    /// the loop's exit is `resident_bytes()` reaching zero — reachable, because a
-    /// zero budget is refused at `CREATE VIEW`, so `resident_bytes() > cap` cannot
-    /// hold at zero. A budget the store can meet, it meets; a budget under one
-    /// guard's worth empties the store instead of stopping above it, which costs
-    /// every subscriber a re-read at 0 and costs correctness nothing.
-    ///
-    /// Only the terminal level can hold skeletons and the compaction trigger is a
-    /// file count that never fires on byte volume, so pushing data down is the
-    /// sweep's second job — but it is the expensive half (a whole guard's worth
-    /// of data rewritten), so it is budgeted to one per call. A store held under
-    /// its capacity by dehydration alone never reaches step 2; a store whose
-    /// capacity is under its **skeleton floor** (the size of a fully dehydrated
-    /// store) performs one push-down per spill and then stops, converging across
-    /// spills rather than running the whole level down inside one trigger.
-    ///
-    /// Victim choice is **write recency** (`max_lsn`), the only recency signal the
-    /// tree carries — nothing anywhere records that a row was *read*.
-    ///
-    /// Terminates: step 1 strictly decreases the hydrated-terminal-guard count and
-    /// nothing here re-hydrates a guard; step 2 runs at most once. The fixpoint
-    /// across calls is the skeleton floor.
+    /// Terminates: an eviction strictly decreases the hydrated terminal guard
+    /// count (the guard count itself, when dropping) and nothing here re-hydrates;
+    /// the push-down runs at most once. The fixpoint across calls is the skeleton
+    /// floor — or, for a dropping store, an empty one, since a drop leaves no
+    /// residue to stop at.
     pub(crate) fn enforce_capacity(&mut self) -> Result<(), StorageError> {
         let Some(cap) = self.capacity_bytes else {
             return Ok(());
@@ -587,7 +751,7 @@ impl ShardIndex {
             if let Some(gi) = victim {
                 match self.evict_by_drop {
                     true => self.drop_guard(TERMINAL_LEVEL_IDX, gi),
-                    false => self.compact_one_guard(TERMINAL_LEVEL_IDX, gi, true)?,
+                    false => self.dehydrate_guard(gi)?,
                 }
                 continue;
             }
@@ -597,16 +761,7 @@ impl ShardIndex {
                 return Ok(());
             }
             pushed_down = true;
-            let oldest_l1 = self.levels.first().and_then(|l| {
-                l.guards
-                    .iter()
-                    .enumerate()
-                    // An empty guard was never written, so it sorts last: it is
-                    // folded away only once no guard holding data is left.
-                    .min_by_key(|(_, g)| g.newest_lsn().unwrap_or(u64::MAX))
-                    .map(|(gi, _)| gi)
-            });
-            if let Some(gi) = oldest_l1 {
+            if let Some(gi) = self.cheapest_l1_guard_to_drain() {
                 self.vertical_fold(gi)?;
             } else if !self.l0.is_empty() {
                 self.run_compact()?;

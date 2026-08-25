@@ -107,6 +107,20 @@ impl StoreHandle {
         }
     }
 
+    /// [`Self::open_cursor`] over `[start, end]` only — see
+    /// [`Table::open_cursor_in_range`].
+    pub(super) fn open_cursor_in_range(
+        &self,
+        schema: &SchemaDescriptor,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> ReadCursor {
+        match self.table() {
+            Some(t) => t.open_cursor_in_range(start, end),
+            None => crate::storage::empty_cursor(*schema),
+        }
+    }
+
     /// Whether a read of this store can meet a skeleton row it has to hydrate.
     /// A detached relation reads empty, so it never can.
     pub(super) fn has_skeleton_rows(&self) -> bool {

@@ -379,7 +379,11 @@ def test_a_delta_store_does_not_grow_without_bound(sweeping_server):
     with gnitz.connect(sweeping_server.sock_path) as client:
         sn = "s" + _uid()
         _base_tables(client, sn)
-        _mk_feed(client, sn, "f", LINEAR, feed="1 KB")
+        # Above the guard granularity, so the store settles *on* disk with
+        # something to measure. A budget under one guard's worth has no residual
+        # at all — a drop is destructive, so the guard is the residual step — and
+        # the plateau this pins would be zero against zero.
+        _mk_feed(client, sn, "f", LINEAR, feed="256 KB")
         vid, _ = client.resolve_table(sn, "f")
 
         # Measure the plateau, not a ratio. The first burst has to be long

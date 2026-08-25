@@ -62,10 +62,13 @@ impl CatalogEngine {
     /// The non-checking form is infallible by construction.
     pub(crate) fn scan_column_defs(&self, owner_id: i64, check_contiguity: bool) -> Result<Vec<ColumnDef>, String> {
         let (start_pk, end_pk) = column_id_band(owner_id);
-        let mut cursor = self.sys_store(SysFamily::Column).open_cursor();
         // sys_columns has a single U64 PK; OPK == big-endian. The range clamp
         // exhausts the cursor at `end_pk`, so the walk needs no bound test.
-        cursor.seek_range_bytes(&start_pk.to_be_bytes(), Some(&end_pk.to_be_bytes()));
+        let (start, end) = (start_pk.to_be_bytes(), end_pk.to_be_bytes());
+        let mut cursor = self
+            .sys_store(SysFamily::Column)
+            .open_cursor_in_range(&start, Some(&end));
+        cursor.seek_range_bytes(&start, Some(&end));
 
         let mut defs = Vec::new();
         let mut expected: i64 = 0;

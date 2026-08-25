@@ -197,12 +197,12 @@ pub(crate) struct DeltaFeed {
 }
 
 impl DeltaFeed {
-    /// A cursor over this feed's rows in its own derived schema — the pairing
-    /// [`TableEntry::open_cursor`] makes for a relation's own store, and the
-    /// reason `StoreHandle::open_cursor` stays module-private: the schema a
-    /// cursor is opened under is never the caller's to choose.
-    pub(crate) fn open_cursor(&self) -> crate::storage::ReadCursor {
-        self.handle.open_cursor(&self.schema)
+    /// This feed's rows over `[start, end]`, in its own derived schema. There is
+    /// no unbounded spelling because every delta read is a `(after_tick, cut]`
+    /// range — and no caller-supplied schema, because the schema a cursor opens
+    /// under is never the caller's to choose.
+    pub(crate) fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
+        self.handle.open_cursor_in_range(&self.schema, start, end)
     }
 }
 
@@ -293,6 +293,12 @@ impl TableEntry {
     /// second copy of the descriptor to keep in step across an ALTER.
     pub(crate) fn open_cursor(&self) -> crate::storage::ReadCursor {
         self.handle.open_cursor(&self.schema)
+    }
+
+    /// This relation's rows over `[start, end]` only — see
+    /// [`Table::open_cursor_in_range`](crate::storage::Table::open_cursor_in_range).
+    pub(crate) fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
+        self.handle.open_cursor_in_range(&self.schema, start, end)
     }
 
     /// Materialize every positive-weight row of this relation's store.

@@ -139,7 +139,16 @@ impl CatalogEngine {
             }
         };
 
-        let mut cursor = entry.open_cursor();
+        // A bounded view's terminal partition is the finest in the tree, and this
+        // is the read that meets it, so every bounded arm opens over its own range.
+        let mut cursor = match read {
+            BoundedRead::Keys(keys) => match crate::storage::key_list_range(keys, stride) {
+                Some((lo, hi)) => entry.open_cursor_in_range(lo, Some(hi)),
+                None => entry.open_cursor(),
+            },
+            BoundedRead::Range(start, end) => entry.open_cursor_in_range(start, end),
+            BoundedRead::All => entry.open_cursor(),
+        };
         // Position first, then size the output off the walk's own upper bound so
         // the appends below re-grow as little as possible (each growth re-copies
         // every live byte). For a key list that bound is the key count, which a
@@ -226,7 +235,7 @@ impl CatalogEngine {
     /// group is what makes a seek answer the same rows a point-range read of that
     /// key does.
     fn seek_entry_bytes(entry: &crate::query::TableEntry, pk: &[u8]) -> Option<Batch> {
-        let mut cursor = entry.open_cursor();
+        let mut cursor = entry.open_cursor_in_range(pk, Some(pk));
         let mut batch = Batch::empty_with_schema(&entry.schema);
         cursor.copy_live_pk_group_into(pk, &mut batch);
         (batch.count > 0).then_some(batch)
@@ -544,8 +553,9 @@ impl CatalogEngine {
             // Malformed: `n_eq` pins every column with no range column left.
             Err(e) => return IndexScan::Decline(e),
         };
-        let idx = ic.table_mut().open_cursor();
-        let matches = idx.count_range_raw(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
+        let end_bytes = end.as_ref().map(|e| e.pk_bytes());
+        let idx = ic.table_mut().open_cursor_in_range(start.pk_bytes(), end_bytes);
+        let matches = idx.count_range_raw(start.pk_bytes(), end_bytes);
         if gate {
             // Only user base tables own index circuits, so a resolved index
             // implies an owned base store; a borrowed system table degrades to

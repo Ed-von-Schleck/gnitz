@@ -293,7 +293,9 @@ impl CatalogEngine {
             });
         }
         let desc = RangeDescriptor::new(&[], Cut::After(after_tick as u128), Cut::After(cut_tick as u128));
-        Ok(Self::seek_range(feed.open_cursor(), &feed.schema, &desc)?)
+        Ok(Self::range_cursor(&feed.schema, &desc, |s, e| {
+            feed.open_cursor_in_range(s, e)
+        })?)
     }
 
     /// A base-PK range walk, clamped to `[start, end)` so it is O(range): a
@@ -310,25 +312,29 @@ impl CatalogEngine {
         desc: &RangeDescriptor,
         src_schema: &SchemaDescriptor,
     ) -> Result<SourceCursor, String> {
-        let cursor = self.table_entry(source)?.open_cursor();
-        Self::seek_range(cursor, src_schema, desc)
+        let entry = self.table_entry(source)?;
+        Self::range_cursor(src_schema, desc, |s, e| entry.open_cursor_in_range(s, e))
     }
 
-    /// Clamp `cursor` to the half-open key range `desc` names over `schema`'s PK
+    /// A cursor cut to the half-open key range `desc` names over `schema`'s PK
     /// space, or `Empty` for a provably-empty one. The one place a range
-    /// descriptor becomes a cursor cut: the `PkRange` bound over a relation's own
-    /// store and the `Delta` bound over a fed view's delta store both reach
-    /// `seek_range_bytes` through here, so both get `pk_stride`-wide zero-padded
-    /// keys and the saturating `After` arm.
-    fn seek_range(
-        mut cursor: ReadCursor,
+    /// descriptor becomes a cursor cut, so the `PkRange` bound over a relation's
+    /// own store and the `Delta` bound over a fed view's delta store share the
+    /// zero-padded keys and the saturating `After` arm.
+    ///
+    /// The keys are derived before `open` runs, so it opens over the range rather
+    /// than over the whole store.
+    fn range_cursor(
         schema: &SchemaDescriptor,
         desc: &RangeDescriptor,
+        open: impl FnOnce(&[u8], Option<&[u8]>) -> ReadCursor,
     ) -> Result<SourceCursor, String> {
-        let Some((start, end)) = pk_range_keys(schema, desc)? else {
+        let Some((start, end_key)) = pk_range_keys(schema, desc)? else {
             return Ok(SourceCursor::Empty);
         };
-        cursor.seek_range_bytes(start.pk_bytes(), end.as_ref().map(|e| e.pk_bytes()));
+        let end = end_key.as_ref().map(|e| e.pk_bytes());
+        let mut cursor = open(start.pk_bytes(), end);
+        cursor.seek_range_bytes(start.pk_bytes(), end);
         Ok(SourceCursor::Full(Box::new(cursor)))
     }
 
@@ -371,10 +377,10 @@ impl CatalogEngine {
         let entry = self.table_entry(source)?;
         // A key this worker holds no row for copies nothing — the request is
         // broadcast, so at W workers most of the list belongs elsewhere.
-        Ok(SourceCursor::PkSet(Box::new(PkSetGather::new(
-            entry.open_cursor(),
+        Ok(SourceCursor::PkSet(Box::new(PkSetGather::open(
             opk,
             *src_schema,
+            |s, e| entry.open_cursor_in_range(s, e),
         ))))
     }
 }

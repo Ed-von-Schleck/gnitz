@@ -23,7 +23,7 @@ mod gather;
 mod output;
 
 use super::run::Run;
-pub(crate) use gather::PkSetGather;
+pub(crate) use gather::{key_list_range, PkSetGather};
 use gnitz_expr::RowSource;
 
 /// See [`ReadCursor::payload_cmp_vs_mem`].

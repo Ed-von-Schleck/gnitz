@@ -24,7 +24,33 @@ pub struct PkSetGather {
     src_schema: SchemaDescriptor,
 }
 
+/// The key range a flat **ascending** OPK key list spans — its first and last
+/// key — or `None` for an empty list. `stride` is the schema's `pk_stride`. A
+/// list spread across the whole key space degenerates to the whole store, which
+/// is the case a whole-store open was right for anyway.
+pub(crate) fn key_list_range(keys: &[u8], stride: usize) -> Option<(&[u8], &[u8])> {
+    let first = keys.chunks_exact(stride).next()?;
+    Some((first, &keys[keys.len() - stride..]))
+}
+
 impl PkSetGather {
+    /// Gather `keys` out of a store, opening over exactly the range they span —
+    /// `open` is that store's ranged cursor open. The bound comes from the list
+    /// this gather already owns, so no caller re-derives it.
+    pub(crate) fn open(
+        keys: Vec<u8>,
+        src_schema: SchemaDescriptor,
+        open: impl FnOnce(&[u8], Option<&[u8]>) -> ReadCursor,
+    ) -> Self {
+        let stride = src_schema.pk_stride() as usize;
+        let cursor = match key_list_range(&keys, stride) {
+            Some((lo, hi)) => open(lo, Some(hi)),
+            // No key to gather, so nothing to open over.
+            None => super::empty(src_schema),
+        };
+        Self::new(cursor, keys, src_schema)
+    }
+
     /// `keys` is the flat concatenation of the OPK images, each exactly
     /// `src_schema.pk_stride()` bytes, in ascending order.
     pub(crate) fn new(cursor: ReadCursor, keys: Vec<u8>, src_schema: SchemaDescriptor) -> Self {

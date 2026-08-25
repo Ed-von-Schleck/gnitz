@@ -173,7 +173,7 @@ pub(crate) fn lock_data_dir(base_dir: &str) -> Result<fs::File, String> {
 /// prefix — all produced through `schema::key`, so no call site re-derives the
 /// OPK layout.
 pub(crate) fn retract_key_range(table: &Table, schema: &SchemaDescriptor, start: &[u8], end: &[u8]) -> Batch {
-    let mut cursor = table.open_cursor();
+    let mut cursor = table.open_cursor_in_range(start, Some(end));
     cursor.seek_range_bytes(start, Some(end));
     // Sized off the positioned walk's own upper bound, so the appends never
     // re-grow (each growth re-copies every live byte).
@@ -198,8 +198,9 @@ pub(crate) fn sys_opk(schema: &SchemaDescriptor, pk: u128) -> crate::schema::key
 /// absent or already retracted.
 pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
     let mut batch = Batch::with_capacity(*schema, 1);
-    let mut cursor = table.open_cursor();
-    if cursor.advance_to_exact_live(sys_opk(schema, pk).pk_bytes()) {
+    let key = sys_opk(schema, pk);
+    let mut cursor = table.open_cursor_in_range(key.pk_bytes(), Some(key.pk_bytes()));
+    if cursor.advance_to_exact_live(key.pk_bytes()) {
         cursor.copy_current_row_into(&mut batch, -1);
     }
     batch

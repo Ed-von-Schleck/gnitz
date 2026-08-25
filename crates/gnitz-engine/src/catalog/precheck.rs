@@ -167,7 +167,7 @@ impl CatalogEngine {
     /// `retract_single_row`. `ReadCursor` is not a `ColumnarSource`, so the CAS
     /// needs the row materialized into a `Batch` before `compare_rows`.
     fn seek_live_sys_row(&self, family: SysFamily, pk_bytes: &[u8]) -> Option<(Batch, i64)> {
-        let mut cursor = self.sys_store(family).open_cursor();
+        let mut cursor = self.sys_store(family).open_cursor_in_range(pk_bytes, Some(pk_bytes));
         if !cursor.advance_to_exact_live(pk_bytes) {
             return None;
         }
@@ -740,8 +740,11 @@ impl CatalogEngine {
         for &idx_id in &drop_ids {
             // The CAS above already proved a live row exists at every dropped id.
             let (owner_id, cols, name) = {
-                let mut cursor = self.sys_store(SysFamily::Index).open_cursor();
-                if !cursor.advance_to_exact_live(sys_opk(&schema, idx_id as u128).pk_bytes()) {
+                let key = sys_opk(&schema, idx_id as u128);
+                let mut cursor = self
+                    .sys_store(SysFamily::Index)
+                    .open_cursor_in_range(key.pk_bytes(), Some(key.pk_bytes()));
+                if !cursor.advance_to_exact_live(key.pk_bytes()) {
                     continue;
                 }
                 let (owner_id, cols, _) = read_idx_tab_cursor_row(&cursor);

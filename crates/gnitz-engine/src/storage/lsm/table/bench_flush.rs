@@ -39,19 +39,21 @@ fn push_row(b: &mut Batch, pk: u64, payload: i64, weight: i64) {
     b.count += 1;
 }
 
-/// `distinct(d)`: tick `t` emits `d` rows with fresh keys `t*d .. t*d+d`,
-/// weight +1 — append-only window growth (the INSERT-stream shape).
+/// One tick of `distinct(d)`: `d` rows with fresh keys `t*d .. t*d+d`, weight +1
+/// — append-only window growth (the INSERT-stream shape), and the cheap arrival
+/// order for the FLSM tree: every fold lands in fresh key space, so a vertical
+/// overlaps nothing.
+fn distinct_tick(schema: &SchemaDescriptor, t: usize, d: usize) -> Batch {
+    let mut b = Batch::with_capacity(*schema, d.max(1));
+    for i in 0..d {
+        let k = (t * d + i) as u64;
+        push_row(&mut b, k, k as i64, 1);
+    }
+    b
+}
+
 fn gen_distinct(schema: &SchemaDescriptor, d: usize, ticks: usize) -> Vec<Batch> {
-    (0..ticks)
-        .map(|t| {
-            let mut b = Batch::with_capacity(*schema, d.max(1));
-            for i in 0..d {
-                let k = (t * d + i) as u64;
-                push_row(&mut b, k, k as i64, 1);
-            }
-            b
-        })
-        .collect()
+    (0..ticks).map(|t| distinct_tick(schema, t, d)).collect()
 }
 
 /// `churn(h, d)`: `d/2` updates per tick over a hot key set of size `h`, round
@@ -79,6 +81,21 @@ fn gen_churn(schema: &SchemaDescriptor, h: usize, d: usize, ticks: usize) -> Vec
             b
         })
         .collect()
+}
+
+/// One tick of `d` rows at keys drawn uniformly over `keyspace`, weight +1 — the
+/// arrival order a `map_reindex`'d store sees, and the expensive one for the FLSM
+/// tree: every L0 fold reaches every guard, and every vertical lands on terminal
+/// bytes already there. Streamed a tick at a time rather than materialized like
+/// the generators above, which run far fewer ticks.
+fn scatter_tick(schema: &SchemaDescriptor, rng: &mut crate::test_rng::Rng, d: usize, keyspace: u64) -> Batch {
+    let mut keys: Vec<u64> = (0..d).map(|_| rng.gen_range(keyspace)).collect();
+    keys.sort_unstable();
+    let mut b = Batch::with_capacity(*schema, d.max(1));
+    for k in keys {
+        push_row(&mut b, k, k as i64, 1);
+    }
+    b
 }
 
 enum Gen {
@@ -167,4 +184,89 @@ fn flush_cadence_amplification_bench() {
             "flush_cadence/{label}: {ingested} rows / {ticks_n} ticks in {secs:.3}s = {rps:.0} ingest-rows/s  merged-out {merged_out} rows  amp {amp:.1}x"
         );
     }
+}
+
+/// Compaction bytes read per ingest byte, and the largest single unit each
+/// compaction phase reads — the two quantities the FLSM byte targets exist to
+/// bound. Stated in bytes because wall-clock on the development machine varies
+/// 3.6× on bit-identical compaction work.
+///
+/// Acceptance: every phase's `max_in` settles at or under `2 × R` (printed), and
+/// `bytes_in/ingest` grows as √X rather than linearly across a doubling sweep.
+/// The second binds only once `l1_target` (printed) exceeds `16 R` — shrink
+/// `GNITZ_RAM_TIER_BYTES` to reach that regime rather than growing the sweep.
+///
+/// ```text
+/// for t in 2000 4000 8000 16000; do
+///   GNITZ_BENCH_TICKS=$t GNITZ_BENCH_KEYSPACE=200000000 \
+///     cargo test -p gnitz-engine --release compaction_amplification_bench \
+///     -- --ignored --nocapture --test-threads=1
+/// done
+/// ```
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn compaction_amplification_bench() {
+    const ROWS_PER_TICK: usize = 4096;
+
+    use crate::foundation::env::{env_flag, env_num};
+    let ticks_n: usize = env_num("GNITZ_BENCH_TICKS", 2000);
+    let keyspace: u64 = env_num("GNITZ_BENCH_KEYSPACE", 200_000_000);
+    // Both arrival orders: a monotone stream never makes a vertical overlap
+    // anything, so on its own it cannot tell a policy fix from a regression.
+    let monotone = env_flag("GNITZ_BENCH_MONOTONE", false);
+
+    let schema = make_schema_flush();
+    let tmp = tempfile::tempdir().unwrap();
+    // A real filesystem when one is named: shard bytes are what is counted here,
+    // and a tmpfs prices them differently.
+    let root = std::env::var("GNITZ_BENCH_DIR").unwrap_or_else(|_| tmp.path().to_str().unwrap().to_string());
+    let dir = std::path::Path::new(&root).join(format!("wa_{ticks_n}_{keyspace}"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut table = Table::new(
+        dir.to_str().unwrap(),
+        schema,
+        7,
+        RecoverySource::Rederive { resume_at: None },
+    )
+    .unwrap();
+
+    use crate::storage::lsm::shard_index::cstats;
+    cstats::reset();
+    let mut rng = crate::test_rng::Rng::new(0x5EED_1234);
+    for t in 0..ticks_n {
+        let batch = match monotone {
+            true => distinct_tick(&schema, t, ROWS_PER_TICK),
+            false => scatter_tick(&schema, &mut rng, ROWS_PER_TICK, keyspace),
+        };
+        table.ingest_owned_batch(batch).unwrap();
+        table.flush().unwrap();
+    }
+
+    let phases = cstats::dump();
+    let total_in: u64 = phases.iter().map(|p| p.in_bytes).sum();
+    let total_out: u64 = phases.iter().map(|p| p.out_bytes).sum();
+    // Every spill is folded out of L0 exactly once, so the L0 fold's input is the
+    // bytes this store was handed — measured, where a nominal row width would not
+    // be (the flush schema's 40 B row lands at ~17 B once its constant regions
+    // collapse).
+    let spilled = phases[0].in_bytes.max(1);
+    println!(
+        "compaction_amplification/{ticks_n}t {} keyspace={keyspace}: {}",
+        if monotone { "monotone" } else { "scattered" },
+        table.tree_report()
+    );
+    for (name, p) in cstats::PHASE_NAMES.iter().zip(&phases) {
+        let mean = p.in_bytes.checked_div(p.n as u64).unwrap_or(0);
+        println!(
+            "  {name:12} n={:<6} max_in={:>12} mean_in={:>12} in={:>13} out={:>13} in_files={}",
+            p.n, p.max_in, mean, p.in_bytes, p.out_bytes, p.in_files
+        );
+    }
+    println!(
+        "  per spilled byte: read {:.2}  written {:.2}   (spilled {spilled} B)",
+        total_in as f64 / spilled as f64,
+        total_out as f64 / spilled as f64,
+    );
+    assert!(phases[0].n > 0, "no compaction ran — the sweep measures nothing");
 }

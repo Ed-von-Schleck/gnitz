@@ -61,8 +61,9 @@ impl DagEngine {
         // PK and a key-restricted feed at the `ScanDelta` register would mean
         // scanning the whole source.
         //
-        // `open_cursor` takes `&self` and the cursor owns its runs via `Rc`, so
-        // both borrows of the registry end here and the VM is free to run below.
+        // The ranged cursor open takes `&self` and the cursor owns its runs via
+        // `Rc`, so both borrows of the registry end here and the VM is free to
+        // run below.
         let plan = self.cache.get_mut(&view_id).expect("ensure_compiled inserted the plan");
         let PlanShape::Single(sub) = &mut plan.shape else {
             return Err(format!("hydrate: view {view_id} is not a single-phase plan"));
@@ -71,8 +72,14 @@ impl DagEngine {
         // shard state. A linear circuit owns no trace table, so this is a no-op
         // there.
         sub.vm.bind_trace_cursors();
-        let (start_pc, in_reg, cursor) = match hydration {
-            Hydration::Relation { in_reg, source } => {
+        let (start_pc, in_reg) = match hydration {
+            Hydration::Relation { in_reg, .. } => (0, in_reg),
+            Hydration::Join { start_pc, in_reg, .. } => (start_pc, in_reg),
+        };
+        let seed_schema = sub.vm.program.reg_meta[in_reg as usize].schema;
+        // The gather opens over the range its own key list spans.
+        let mut gather = match hydration {
+            Hydration::Relation { source, .. } => {
                 let entry = self
                     .tables
                     .get(&source)
@@ -80,17 +87,13 @@ impl DagEngine {
                 // A linear view's physical PK is the leading source-PK columns,
                 // byte-identical to the source PK, so the store's own keys index
                 // the source directly.
-                (0, in_reg, entry.open_cursor())
+                PkSetGather::open(keys, seed_schema, |s, e| entry.open_cursor_in_range(s, e))
             }
-            Hydration::Join {
-                start_pc,
-                in_reg,
-                seed_table,
-            } => (start_pc, in_reg, sub.vm.owned_tables[seed_table as usize].open_cursor()),
+            Hydration::Join { seed_table, .. } => {
+                let trace = &sub.vm.owned_tables[seed_table as usize];
+                PkSetGather::open(keys, seed_schema, |s, e| trace.open_cursor_in_range(s, e))
+            }
         };
-        let seed_schema = sub.vm.program.reg_meta[in_reg as usize].schema;
-
-        let mut gather = PkSetGather::new(cursor, keys, seed_schema);
         while let Some(seed) = gather.next_chunk(chunk_rows) {
             // Reusing the cached `VmHandle`'s own register file is safe in both
             // directions: the dispatch clears every delta register on entry, so

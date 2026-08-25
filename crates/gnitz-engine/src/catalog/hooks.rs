@@ -144,7 +144,9 @@ impl CatalogEngine {
     /// at boot replay (where a rename pair has folded to net `+1`, no `-1`
     /// surviving) and to a multi-op recovery batch on one id.
     fn sys_pk_is_live(&self, family: SysFamily, pk_bytes: &[u8]) -> bool {
-        self.sys_store(family).open_cursor().advance_to_exact_live(pk_bytes)
+        self.sys_store(family)
+            .open_cursor_in_range(pk_bytes, Some(pk_bytes))
+            .advance_to_exact_live(pk_bytes)
     }
 
     /// Fold a `sys_sequences` advance into the in-memory `user_sequences` map.

@@ -457,11 +457,17 @@ impl Table {
         [&self.memtable, &self.ram_tier]
     }
 
-    /// Every run this table reads through, newest tier first.
-    pub(crate) fn runs(&self) -> impl Iterator<Item = Run> + '_ {
+    /// The heap-resident runs, newest tier first. No guard partitions them, so
+    /// every walk takes them whole however narrow its key bound.
+    fn mem_runs(&self) -> impl Iterator<Item = Run> + '_ {
         self.ram_tiers()
             .into_iter()
             .flat_map(|set| set.runs().iter().cloned().map(Run::Mem))
+    }
+
+    /// Every run this table reads through, newest tier first.
+    pub(crate) fn runs(&self) -> impl Iterator<Item = Run> + '_ {
+        self.mem_runs()
             .chain(self.shard_index.all_shard_arcs_iter().map(Run::Shard))
     }
 
@@ -469,8 +475,25 @@ impl Table {
     /// compaction is a maintenance operation, not part of the read path. Cheap
     /// and infallible. Maintenance paths that want an up-to-date L1 call
     /// `compact_if_needed` first.
+    ///
+    /// Opening is Θ(sources), so a read that knows its key bound beforehand
+    /// should take [`Self::open_cursor_in_range`].
     pub fn open_cursor(&self) -> ReadCursor {
         read_cursor::from_runs(self.runs(), self.schema)
+    }
+
+    /// A cursor that can answer only about keys in `[start, end]`, `end` `None`
+    /// meaning the top of the key space. Unpositioned, like
+    /// [`Self::open_cursor`] — the caller seeks or probes within the bound it
+    /// named.
+    ///
+    /// The gather over-approximates (a whole guard comes in for one key), so a
+    /// half-open `end` is safe to pass.
+    pub fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> ReadCursor {
+        let runs = self
+            .mem_runs()
+            .chain(self.shard_index.shard_arcs_in_range(start, end).map(Run::Shard));
+        read_cursor::from_runs(runs, self.schema)
     }
 
     /// Return the fully consolidated batch of all live rows, caching the result.
@@ -523,6 +546,12 @@ impl Table {
     #[cfg(test)]
     pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
         self.shard_index.all_shard_arcs()
+    }
+
+    /// Test helper: the FLSM tree's shape, for the amplification bench.
+    #[cfg(test)]
+    pub(crate) fn tree_report(&self) -> String {
+        self.shard_index.tree_report()
     }
 
     /// Test helper: shrink the per-table heap ceiling so spill paths can be
@@ -2597,18 +2626,56 @@ mod tests {
         }
     }
 
+    /// A cursor opened for a key range must answer exactly what the whole-index
+    /// cursor answers over that range. It reaches the shards by guard routing
+    /// instead of chaining every one, which is sound only because guards
+    /// partition the key line — a key reachable from two guards would be one this
+    /// gather could miss.
+    #[test]
+    fn a_range_opened_cursor_sees_every_row_the_whole_index_would() {
+        let schema = make_schema_u64_i64();
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = new_table(dir.path(), schema, 8200, 128, RecoverySource::SalReplay);
+        t.set_inmem_ceiling_for_test(100);
+        // Interleaved bands across several spills, so the shards the router has to
+        // pick from overlap in neither key order nor write order.
+        for r in 0..8u64 {
+            let rows: Vec<(u64, i64, i64)> = (0..40).map(|k| (k * 8 + r, 1, (k * 8 + r) as i64)).collect();
+            t.ingest_owned_batch(make_batch(&rows)).unwrap();
+        }
+        assert!(!t.all_shard_arcs().is_empty(), "the rows reached the shard tier");
+
+        let drain = |c: &mut crate::storage::ReadCursor| {
+            let mut out = Vec::new();
+            while c.valid {
+                out.push((c.current_pk_bytes().to_vec(), c.current_weight));
+                c.advance();
+            }
+            out
+        };
+        for (lo, hi) in [(0u64, 8u64), (37, 200), (100, 100), (0, 319), (400, 500)] {
+            let (lo_b, hi_b) = (lo.to_be_bytes(), hi.to_be_bytes());
+            let mut whole = t.open_cursor();
+            whole.seek_range_bytes(&lo_b, Some(&hi_b));
+            let mut ranged = t.open_cursor_in_range(&lo_b, Some(&hi_b));
+            ranged.seek_range_bytes(&lo_b, Some(&hi_b));
+            assert_eq!(drain(&mut ranged), drain(&mut whole), "range [{lo}, {hi})");
+        }
+    }
+
     /// Only base-table paths point-probe a store by PK, and they are the only
     /// readers of a shard's XOR8 filter. Silent both ways: a missing filter
     /// still answers every probe (just slower), a useless one costs only bytes.
     #[test]
     fn pk_filter_follows_whether_the_store_is_probed() {
         let schema = make_schema_u64_i64();
-        // Five ceiling breaches: each spills an L0 shard, and the fifth crosses
-        // the L0 threshold — so one store drives both shard writers.
+        // Six ceiling breaches: each spills an L0 shard, the fifth crosses the L0
+        // threshold and the sixth leaves a spill sitting above the fold — so one
+        // store registers both shard writers' output at once.
         let build = |dir: &std::path::Path, id: u32, rs: RecoverySource| {
             let mut t = new_table(dir, schema, id, 128, rs);
             t.set_inmem_ceiling_for_test(100);
-            for r in 0..5u64 {
+            for r in 0..6u64 {
                 let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
                 t.ingest_owned_batch(make_batch(&rows)).unwrap();
             }

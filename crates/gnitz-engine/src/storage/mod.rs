@@ -63,7 +63,7 @@ pub(crate) use lsm::child_dir::{
 };
 pub(crate) use lsm::index_gather::BoundedIndexCursor;
 pub(crate) use lsm::manifest::{peek_header, topology_word};
-pub(crate) use lsm::read_cursor::{empty as empty_cursor, PkSetGather, ReadCursor};
+pub(crate) use lsm::read_cursor::{empty as empty_cursor, key_list_range, PkSetGather, ReadCursor};
 pub(crate) use lsm::repartition::repartition_relation;
 pub use merge::BlobCacheGuard;
 pub(crate) use merge::{mem_batch_to_unified, prorated_blob_cap, relocate_german_string_vec, BlobCache, RowComparator};
