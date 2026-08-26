@@ -472,7 +472,7 @@ fn sentinel_07_mark() {
 const EXPECTED_07: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
 #1 UNION <- (#2@0,#19@1)
-#2 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#3@0)
+#2 MAP_EXPR params:[(MAP_OUT_COLS,0,9,0);(MAP_OUT_COLS,1,9,1)] <- (#3@0)
 #3 UNION <- (#4@0,#11@1)
 #4 NEGATE <- (#5@0)
 #5 POSITIVE_PART <- (#6@0)
@@ -489,7 +489,7 @@ const EXPECTED_07: &str = r#"seg 0:
 #16 MAP_PROJ params:[(PROJ,0,3,0);(PROJ,1,4,0);(PROJ,2,5,0)] <- (#17@0)
 #17 JOIN_DELTA_TRACE <- (#14@0,#18@1)
 #18 INTEGRATE_TRACE <- (#11@0)
-#19 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#5@0)
+#19 MAP_EXPR params:[(MAP_OUT_COLS,0,9,0);(MAP_OUT_COLS,1,9,1)] <- (#5@0)
 "#;
 
 // #8 — GROUP BY grouped: the reduce grouped arm.
@@ -518,7 +518,7 @@ fn sentinel_08_group_by_grouped() {
 // against the grouped weight pins (existing e2e).
 const EXPECTED_08: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
+#1 MAP_EXPR params:[(MAP_OUT_COLS,0,9,0);(MAP_OUT_COLS,1,9,0)] <- (#2@0)
 #2 REDUCE params:[(GROUP,0,0,0);(GROUP,1,1,0);(AGG_SPEC,0,1,0);(AGG_SPEC,1,2,2);(REDUCE_OUT_KEY,0,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD params:[(SHARD,0,0,0);(SHARD,1,1,0)] <- (#4@0)
 #4 SCAN_DELTA src:base:t
@@ -548,7 +548,7 @@ fn sentinel_09_global_funnel() {
 }
 const EXPECTED_09: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
+#1 MAP_EXPR params:[(MAP_OUT_COLS,0,9,1);(MAP_OUT_COLS,1,9,1);(MAP_OUT_COLS,2,9,1)] <- (#2@0)
 #2 REDUCE params:[(AGG_SPEC,0,2,2);(AGG_SPEC,1,3,2);(AGG_SPEC,2,4,2);(AGG_SPEC,3,1,0);(GLOBAL_GROUND,0,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD <- (#4@0)
 #4 SCAN_DELTA src:base:nn_t
@@ -581,7 +581,7 @@ fn sentinel_10_two_phase_global() {
 // func (SUM_ZERO=6 for the COUNT partial) plus the COUNT-of-partials gate.
 const EXPECTED_10: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
+#1 MAP_EXPR params:[(MAP_OUT_COLS,0,9,1);(MAP_OUT_COLS,1,9,0)] <- (#2@0)
 #2 REDUCE params:[(AGG_SPEC,0,2,1);(AGG_SPEC,1,6,2);(AGG_SPEC,2,1,0);(GLOBAL_GROUND,0,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD <- (#4@0)
 #4 REDUCE params:[(AGG_SPEC,0,2,1);(AGG_SPEC,1,1,0)] <- (#5@0)
@@ -614,7 +614,7 @@ fn sentinel_11_replicated_reduce() {
 // N-fold-multiply hazard this arm avoids is weight-pinned at W>1 (Part B.4).
 const EXPECTED_11: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
+#1 MAP_EXPR params:[(MAP_OUT_COLS,0,9,0);(MAP_OUT_COLS,1,9,0)] <- (#2@0)
 #2 REDUCE params:[(GROUP,0,1,0);(AGG_SPEC,0,2,2);(AGG_SPEC,1,1,0)] <- (#3@0)
 #3 SCAN_DELTA src:base:rt
 "#;
@@ -764,7 +764,7 @@ fn sentinel_14a_scalar_correlated() {
 // existing test_scalar_subquery.py — not captured here (expr excluded).
 const EXPECTED_14A: &str = r#"seg 0:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
+#1 MAP_EXPR params:[(MAP_OUT_COLS,0,9,0);(MAP_OUT_COLS,1,9,1)] <- (#2@0)
 #2 SCAN_DELTA src:seg:1
 
 seg 1:
@@ -789,7 +789,7 @@ seg 1:
 
 seg 2:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
+#1 MAP_EXPR params:[(MAP_OUT_COLS,0,9,0);(MAP_OUT_COLS,1,9,0)] <- (#2@0)
 #2 REDUCE params:[(GROUP,0,1,0);(AGG_SPEC,0,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD params:[(SHARD,0,1,0)] <- (#4@0)
 #4 SCAN_DELTA src:base:b
@@ -850,7 +850,7 @@ const EXPECTED_14B: &str = r#"seg 0:
 
 seg 1:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
+#1 MAP_EXPR params:[(MAP_OUT_COLS,0,9,1)] <- (#2@0)
 #2 REDUCE params:[(AGG_SPEC,0,4,2);(AGG_SPEC,1,1,0);(GLOBAL_GROUND,0,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD <- (#4@0)
 #4 SCAN_DELTA src:base:b
@@ -909,7 +909,7 @@ const EXPECTED_15: &str = r#"seg 0:
 
 seg 1:
 #0 INTEGRATE_SINK <- (#1@0)
-#1 MAP_EXPR params:[(ROUTE_KEY,0,0,0)] <- (#2@0)
+#1 MAP_EXPR params:[(MAP_OUT_COLS,0,9,0);(MAP_OUT_COLS,1,9,0)] <- (#2@0)
 #2 REDUCE params:[(GROUP,0,1,0);(AGG_SPEC,0,2,2);(AGG_SPEC,1,1,0)] <- (#3@0)
 #3 EXCHANGE_SHARD params:[(SHARD,0,1,0)] <- (#4@0)
 #4 SCAN_DELTA src:base:orders

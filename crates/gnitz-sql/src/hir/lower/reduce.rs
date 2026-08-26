@@ -13,7 +13,7 @@ use crate::agg::{
     emit_reduce, ensure_cardinality_count, group_col_reduce_pos, push_agg_specs, reduce_output_schema, AggSpec,
     ReduceShape,
 };
-use crate::codec::project_schema::{compile_projection_map, ProjItem};
+use crate::codec::project_schema::{compile_projection_map, declared_out_cols, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_filter_program;
 use crate::hir::chain::{EmitPieces, ViewChain};
@@ -165,7 +165,11 @@ pub(crate) fn lower_reduce(
     }
     // The payload slots, through the shared map compiler — `proj_items` is dense in
     // payload order, since a renamed-in-place PK column never pushes one.
-    let mapped = cb.map_expr(filtered_reduced, compile_projection_map(&proj_items, &reduce_schema)?);
+    let mapped = cb.map_expr(
+        filtered_reduced,
+        compile_projection_map(&proj_items, &reduce_schema)?,
+        &declared_out_cols(&out_cols[pk_len..]),
+    );
     cb.sink(mapped);
     let circuit = cb.build();
 

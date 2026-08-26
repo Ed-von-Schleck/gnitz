@@ -39,10 +39,16 @@ impl ProgramBuilder {
         self.instructions.push(instr);
     }
 
-    /// The instructions pushed so far — read by `build_plan`'s destructive-
-    /// register ordering check.
+    /// The instructions pushed so far, and the same list to write back into.
+    /// `build_plan`'s liveness pass needs both: whether a destructive instruction
+    /// may take its input depends on instructions that were not yet pushed when it
+    /// was emitted.
     pub(crate) fn instructions(&self) -> &[Instr] {
         &self.instructions
+    }
+
+    pub(crate) fn instructions_mut(&mut self) -> &mut [Instr] {
+        &mut self.instructions
     }
 
     // ── Resources ────────────────────────────────────────────────────────

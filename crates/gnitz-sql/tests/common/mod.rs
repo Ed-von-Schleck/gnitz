@@ -351,6 +351,7 @@ fn kind_name(kind: u64) -> &'static str {
         gnitz_wire::NODE_COL_KIND_REDUCE_OUT_KEY => "REDUCE_OUT_KEY",
         gnitz_wire::NODE_COL_KIND_SCAN_BOUND => "SCAN_BOUND",
         gnitz_wire::NODE_COL_KIND_ROUTE_KEY => "ROUTE_KEY",
+        gnitz_wire::NODE_COL_KIND_MAP_OUT_COLS => "MAP_OUT_COLS",
         other => panic!("canonical_circuit_dump: unknown node-column kind {other}"),
     }
 }

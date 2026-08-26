@@ -1,4 +1,4 @@
-//! Exchange worker routing: `RouteMode`, `ScatterKey`, `scatter_is_pk_routed`,
+//! Exchange worker routing: `RouteMode`, `ScatterKey`,
 //! and the per-row routing-key helpers.
 
 use crate::schema::SchemaDescriptor;
@@ -56,7 +56,7 @@ pub enum RouteMode {
 /// variant is picked from circuit metadata, not per-query data:
 ///
 /// - `PkBytes`: the key IS the schema's PK list with no promotion
-///   (`scatter_is_pk_routed`) — route by the row's native OPK bytes.
+///   (`SchemaDescriptor::scatter_routes_by_pk`) — route by the row's native OPK bytes.
 /// - `Packed`: a `JoinPromote` scatter packs the SAME OPK bytes the downstream
 ///   reindex Map stamps as the `_join_pk`, so the delta scatter and the
 ///   reindexed trace co-partition byte-for-byte. It is null-blind and
@@ -106,7 +106,7 @@ impl ScatterKey {
         schema: &SchemaDescriptor,
         num_workers: usize,
     ) -> Self {
-        let kind = if scatter_is_pk_routed(cols, tcs, schema) {
+        let kind = if schema.scatter_routes_by_pk(cols, tcs) {
             ScatterKind::PkBytes
         } else {
             match mode {
@@ -147,22 +147,6 @@ impl ScatterKey {
             ScatterKind::Fold { keys } => worker_for_key(keys.key_row(mb, row), nw),
         }
     }
-}
-
-/// One home for the relay-scatter "route by native PK bytes" gate: strict
-/// sequence equality with the schema's PK list (set equality would route a
-/// permuted compound PK differently from `worker_for_pk_bytes`, which
-/// hashes OPK bytes in schema order) AND no cross-width promotion — a promoted
-/// key (`tc != 0`) packs at the wider `T` via `ScatterKind::Packed`, so its
-/// narrow source PK bytes must not route natively. Consulted once, in
-/// `ScatterKey::new`, so the relay scatter paths cannot drift.
-///
-/// Deliberately NOT used by the write-path fan-out, which routes by the table's
-/// distribution prefix (`schema.worker_for_pk`) — a different hash domain
-/// with no promotion concept.
-#[inline]
-pub(super) fn scatter_is_pk_routed(col_indices: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
-    col_indices == schema.pk_indices() && target_tcs.iter().all(|&tc| tc == 0)
 }
 
 // ---------------------------------------------------------------------------

@@ -31,24 +31,11 @@ pub(crate) fn build_reduce_output_schema(
     out_key: ReduceOutKey,
 ) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
-    match out_key {
-        ReduceOutKey::PkPermutation => {
-            // Output PK region mirrors the source's PK byte layout: walk
-            // `pk_columns()` in pk-list order rather than `group_cols` order.
-            b.push_pk_of(input)?;
-        }
-        ReduceOutKey::SingleNaturalCol => {
-            // A single non-PK-or-PK natural group column keyed directly (e.g.
-            // GROUP BY a U64 payload column, where `pk_columns()` would name the
-            // wrong column).
-            b.push_pk(input.columns[group_cols[0] as usize])?;
-        }
-        ReduceOutKey::SyntheticFold => {
-            // Synthetic U128 PK, group columns as payload.
-            b.push_pk(SchemaColumn::new(type_code::U128, 0))?;
-            for &gc in group_cols {
-                b.push(input.columns[gc as usize])?;
-            }
+    for slot in out_key.output_layout(input.pk_indices(), group_cols) {
+        match slot {
+            gnitz_wire::ReduceOutSlot::SyntheticKey => b.push_pk(SchemaColumn::new(type_code::U128, 0))?,
+            gnitz_wire::ReduceOutSlot::Key(c) => b.push_pk(input.columns[c as usize])?,
+            gnitz_wire::ReduceOutSlot::Carried(c) => b.push(input.columns[c as usize])?,
         }
     }
     // Aggregate results (same for all arms). Nullability must cover what

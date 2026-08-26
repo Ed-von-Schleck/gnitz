@@ -57,7 +57,7 @@ pub fn substitute_seg_id(slot: u64, map: &HashMap<u64, u64>) -> Result<u64, Clie
 pub struct CircuitRows {
     /// `source_table` is `None` for nodes that don't carry one; the reindex column
     /// list is stored in `node_columns` under `NODE_COL_KIND_REINDEX`;
-    /// `expr_program` is `None` outside `Filter`/`MapKind::Expression`.
+    /// `expr_program` is `None` outside `Filter` and the two expression `Map`s.
     pub nodes: Vec<NodeRow>,
     /// `(dst_node, dst_port, src_node)`. View id is implicit at the call site.
     pub edges: Vec<(NodeId, Port, NodeId)>,
@@ -219,20 +219,16 @@ impl CircuitBuilder {
         self.alloc_unary(OpNode::Filter(expr.map(|e| e.encode())), input)
     }
 
-    /// A computed projection. It carries no reindex columns, so it re-keys nothing
-    /// — and the engine therefore types its output with the **view's own output
-    /// schema**, having no dense copy list to derive one from (`SELECT a + b` is
-    /// not a copy). Every caller must emit the circuit's final projection. A
-    /// reindex-free map that projected something narrower would be typed with the
-    /// view's width and mis-read downstream.
-    pub fn map_expr(&mut self, input: NodeId, program: ExprProgram) -> NodeId {
-        let blob = program.encode();
+    /// A computed projection: `program` writes one payload slot each, and
+    /// `out_cols` declares those slots as `(type_code, nullable)` in payload
+    /// order. `SELECT a + b` has no copy list the engine could derive a schema
+    /// from, so the declaration travels; the PK region is inherited from the input
+    /// and is not listed.
+    pub fn map_expr(&mut self, input: NodeId, program: ExprProgram, out_cols: &[(u8, bool)]) -> NodeId {
         self.alloc_unary(
-            OpNode::Map(MapKind::Expression {
-                program: blob,
-                reindex_cols: Vec::new(),
-                reindex_target_tcs: Vec::new(),
-                role: ReindexRole::Auxiliary,
+            OpNode::Map(MapKind::Compute {
+                program: program.encode(),
+                out_cols: out_cols.to_vec(),
             }),
             input,
         )
@@ -251,8 +247,10 @@ impl CircuitBuilder {
     /// The engine derives the node's output payload schema from `program`'s copy
     /// list: a program that is one COPY_COL per payload column with dense outputs
     /// `0..n` places exactly its source columns behind the key slots (so copying a
-    /// column subset prunes the payload). Only this arm derives it; a
-    /// *reindex-free* `map_expr` is typed by the view's own output schema.
+    /// column subset prunes the payload).
+    ///
+    /// Panics on an empty `reindex_cols`: a map that re-keys nothing is a
+    /// [`Self::map_expr`], and the wire tells the two apart by these columns.
     pub fn map_reindex(
         &mut self,
         input: NodeId,
@@ -261,11 +259,11 @@ impl CircuitBuilder {
         program: ExprProgram,
         role: ReindexRole,
     ) -> NodeId {
-        let blob = program.encode();
+        assert!(!reindex_cols.is_empty(), "a reindex map must name its key columns");
         self.alloc_unary(
-            OpNode::Map(MapKind::Expression {
-                program: blob,
-                reindex_cols: reindex_cols.iter().map(|&c| c as u16).collect(),
+            OpNode::Map(MapKind::Reindex {
+                program: program.encode(),
+                reindex_cols: reindex_cols.iter().map(|&c| c as u32).collect(),
                 reindex_target_tcs: target_tcs.to_vec(),
                 role,
             }),
@@ -288,7 +286,7 @@ impl CircuitBuilder {
     /// sides of a `UNION ALL` so identical rows do not collide to one PK, and 0
     /// to both sides of deduplicating set-ops.
     pub fn map_hash_row(&mut self, input: NodeId, projection: &[usize], target_tcs: &[u8], branch_id: u8) -> NodeId {
-        let cols: Vec<u16> = projection.iter().map(|&c| c as u16).collect();
+        let cols: Vec<u32> = projection.iter().map(|&c| c as u32).collect();
         self.alloc_unary(
             OpNode::Map(MapKind::HashRow(cols, target_tcs.to_vec(), branch_id)),
             input,
@@ -297,7 +295,7 @@ impl CircuitBuilder {
 
     /// Pure projection: keep only the listed payload columns, in order.
     pub fn map(&mut self, input: NodeId, projection: &[usize]) -> NodeId {
-        let cols: Vec<u16> = projection.iter().map(|&c| c as u16).collect();
+        let cols: Vec<u32> = projection.iter().map(|&c| c as u32).collect();
         self.alloc_unary(OpNode::Map(MapKind::Projection(cols)), input)
     }
 
@@ -323,11 +321,12 @@ impl CircuitBuilder {
     /// consolidated (PK, payload)'s net weight to `[0, i64::MAX]`, so output
     /// weights stay ≥ 0 without collapsing to set membership.
     ///
-    /// Centralizes the operand-order rule: the `minuend` rides the
-    /// non-destructive `PORT_IN_B` operand because `op_union` empties
-    /// `PORT_IN_A`, and the minuend may be a shared node (e.g. a null-fill's
-    /// `a_all` aliasing the join's `reindex_a`); `negate(subtrahend)` is freshly
-    /// allocated, so `PORT_IN_A` is safe for it.
+    /// The operand order is a **cost** contract, not a correctness one: the engine
+    /// takes `PORT_IN_A` in place where nothing reads it later and clones it
+    /// otherwise. `negate(subtrahend)` is freshly allocated and read nowhere else,
+    /// so it earns the take; the `minuend` may be shared (a null-fill's `a_all`
+    /// aliasing the join's `reindex_a`), where the swap would cost a clone every
+    /// epoch — the same answer, just paid for.
     pub fn positive_diff(&mut self, minuend: NodeId, subtrahend: NodeId) -> NodeId {
         let neg = self.negate(subtrahend);
         let diff = self.union(neg, minuend);
@@ -384,13 +383,13 @@ impl CircuitBuilder {
         global_ground: bool,
         out_key: ReduceOutKey,
     ) -> NodeId {
-        let group: Vec<u16> = group_cols.iter().map(|&c| c as u16).collect();
-        let specs: Vec<(AggFunc, u16)> = agg_specs
+        let group: Vec<u32> = group_cols.iter().map(|&c| c as u32).collect();
+        let specs: Vec<(AggFunc, u32)> = agg_specs
             .iter()
             .map(|&(func_id, col)| {
                 (
                     AggFunc::from_wire(func_id).unwrap_or_else(|| panic!("unknown agg func id {func_id}")),
-                    col as u16,
+                    col as u32,
                 )
             })
             .collect();
@@ -470,7 +469,7 @@ impl CircuitBuilder {
 
     /// Exchange shard: routes rows to workers by hashing the given columns.
     pub fn shard(&mut self, input: NodeId, shard_cols: &[usize]) -> NodeId {
-        let cols: Vec<u16> = shard_cols.iter().map(|&c| c as u16).collect();
+        let cols: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
         self.alloc_unary(OpNode::ExchangeShard { shard_cols: cols }, input)
     }
 
@@ -612,10 +611,10 @@ mod tests {
         // Round-trip: decode preserves the ordered list.
         let decoded = Circuit::from_rows(7, rows).expect("from_rows");
         match decoded.nodes.get(&map_nid) {
-            Some(OpNode::Map(MapKind::Expression { reindex_cols, .. })) => {
-                assert_eq!(*reindex_cols, vec![c1 as u16, c2 as u16], "order must be preserved");
+            Some(OpNode::Map(MapKind::Reindex { reindex_cols, .. })) => {
+                assert_eq!(*reindex_cols, vec![c1 as u32, c2 as u32], "order must be preserved");
             }
-            other => panic!("expected Map(Expression), got {other:?}"),
+            other => panic!("expected Map(Reindex), got {other:?}"),
         }
     }
 
@@ -649,7 +648,7 @@ mod tests {
 
         let decoded = Circuit::from_rows(7, rows).expect("from_rows");
         match decoded.nodes.get(&map_nid) {
-            Some(OpNode::Map(MapKind::Expression {
+            Some(OpNode::Map(MapKind::Reindex {
                 reindex_cols,
                 reindex_target_tcs,
                 ..
@@ -657,7 +656,7 @@ mod tests {
                 assert_eq!(*reindex_cols, vec![3, 3]);
                 assert_eq!(*reindex_target_tcs, vec![0, type_code::I64]);
             }
-            other => panic!("expected Map(Expression), got {other:?}"),
+            other => panic!("expected Map(Reindex), got {other:?}"),
         }
     }
 
@@ -791,25 +790,6 @@ mod tests {
                 Some(OpNode::Reduce { out_key, .. }) => assert_eq!(*out_key, kind),
                 other => panic!("expected Reduce, got {other:?}"),
             }
-        }
-    }
-
-    /// A plain compute map (`map_expr`) carries no reindex columns: no kind rows
-    /// and an empty decoded list.
-    #[test]
-    fn map_expr_has_no_reindex_cols() {
-        let mut cb = CircuitBuilder::new(1, 100);
-        let input = cb.input_delta();
-        let map_nid = cb.map_expr(input, empty_prog());
-        let rows = cb.build().into_rows();
-        assert!(rows
-            .node_columns
-            .iter()
-            .all(|(nid, kind, ..)| !(*nid == map_nid && *kind == NODE_COL_KIND_REINDEX)));
-        let decoded = Circuit::from_rows(1, rows).expect("from_rows");
-        match decoded.nodes.get(&map_nid) {
-            Some(OpNode::Map(MapKind::Expression { reindex_cols, .. })) => assert!(reindex_cols.is_empty()),
-            other => panic!("expected Map(Expression), got {other:?}"),
         }
     }
 }

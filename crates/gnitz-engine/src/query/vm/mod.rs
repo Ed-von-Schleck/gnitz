@@ -68,6 +68,11 @@ pub(crate) enum Instr {
         in_a: u16,
         in_b: u16,
         out_reg: u16,
+        /// Take `in_a`'s batch rather than clone it — set when `build_plan` proved
+        /// this is `in_a`'s last read. Never set for a self-union: that arm doubles
+        /// the weights in place and never reaches `op_union`, which is the operator
+        /// that would consume the operand.
+        consume: bool,
     },
     /// Shared instruction for `distinct` and `positive_part`: per consolidated
     /// (PK, payload), emit `clamp(w_new, lo, hi) − clamp(w_old, lo, hi)`. Bounds
@@ -80,6 +85,8 @@ pub(crate) enum Instr {
         hist_table_idx: TableIdx,
         lo: i64,
         hi: i64,
+        /// Take `in_reg`'s batch rather than clone it — see `Instr::Union`.
+        consume: bool,
     },
     /// The delta-trace inner join, equi and range alike: the probe is baked by
     /// the compiler from the wire's `JoinKind`, so the wire's relation spelling
@@ -131,10 +138,9 @@ pub(crate) enum ReindexOperand {
 }
 
 /// True iff `instr` reads the batch of register `r`. The instruction set's own
-/// read-set knowledge, consumed by `build_plan`'s destructive-register ordering
-/// check (a `Union`/`WeightClamp` consumes its input via `Batch::take`, so it
-/// must be the last reader). Trace registers are cursor-driven — their batches
-/// are never read — so trace ports don't count.
+/// read-set knowledge, consumed by `build_plan`'s liveness pass, which decides
+/// whether a `Union`/`WeightClamp` may take its input in place. Trace registers
+/// are cursor-driven — their batches are never read — so trace ports don't count.
 pub(crate) fn reads_reg(instr: &Instr, r: u16) -> bool {
     match instr {
         Instr::Filter { in_reg, .. }
@@ -629,6 +635,7 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
+            consume: true,
         });
         builder.push(Instr::Halt);
 
@@ -652,6 +659,7 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
+            consume: true,
         });
         builder.push(Instr::Halt);
 
@@ -675,6 +683,7 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
+            consume: true,
         });
         builder.push(Instr::Halt);
 
@@ -740,6 +749,7 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
+            consume: true,
         });
         builder.push(Instr::Halt);
         let reg_meta = [
@@ -777,6 +787,7 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
+            consume: true,
         });
         builder.push(Instr::Halt);
         let reg_meta = [
@@ -807,6 +818,10 @@ mod tests {
             in_a: 0,
             in_b: 0,
             out_reg: 1,
+            // The in_a == in_b arm doubles in place and never reaches `op_union`,
+            // so it takes the register whatever this says; `build_plan` emits
+            // `false` for that shape rather than claim a take it does not perform.
+            consume: false,
         });
         builder.push(Instr::Halt);
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 3, 20)]);
@@ -823,6 +838,33 @@ mod tests {
         );
     }
 
+    /// A non-consuming `Union` leaves its left operand in place, so an
+    /// instruction after it still sees the batch. Without the flag such a plan
+    /// could not be compiled at all — the register had to have no later reader.
+    #[test]
+    fn a_non_consuming_union_leaves_its_operand_readable() {
+        let schema = schema_1i64();
+        let mut builder = ProgramBuilder::new();
+        // reg1 = -reg0; reg2 = reg0 ∪ reg1 (non-consuming); reg3 = -reg0 again.
+        builder.push(Instr::Negate { in_reg: 0, out_reg: 1 });
+        builder.push(Instr::Union {
+            in_a: 0,
+            in_b: 1,
+            out_reg: 2,
+            consume: false,
+        });
+        builder.push(Instr::Negate { in_reg: 0, out_reg: 3 });
+        builder.push(Instr::Halt);
+
+        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 3, 20)]);
+        let reg_meta = [RegisterMeta::delta(schema); 4];
+        let vm = builder.build(reg_meta.to_vec());
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 3)
+            .unwrap()
+            .expect("the trailing reader must still see the union's operand");
+        assert_eq!(extract_rows(&result), vec![(1, -1, 10), (2, -3, 20)]);
+    }
+
     #[test]
     fn test_input_already_consolidated() {
         // Pre-consolidated input should not cause extra work.
@@ -834,6 +876,7 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
+            consume: true,
         });
         builder.push(Instr::Halt);
 
@@ -862,6 +905,7 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
+            consume: true,
         });
         builder.push(Instr::Halt);
 
@@ -940,6 +984,7 @@ mod tests {
             hist_table_idx,
             lo: -1,
             hi: 1,
+            consume: true,
         });
         builder.push(Instr::Halt);
 
@@ -1123,6 +1168,7 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
+            consume: true,
         });
         builder.push(Instr::Halt);
 

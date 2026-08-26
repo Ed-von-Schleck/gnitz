@@ -735,6 +735,25 @@ impl SchemaDescriptor {
         cols.len() == k && cols == &self.pk_indices()[..k]
     }
 
+    /// True iff a relay scatter over `(cols, target_tcs)` may route by this
+    /// relation's native PK bytes: strict sequence equality with the PK list (set
+    /// equality would route a permuted compound PK differently from
+    /// `worker_for_pk_bytes`, which hashes OPK bytes in schema order) AND no
+    /// cross-width promotion — a promoted key (`tc != 0`) packs at the wider `T`,
+    /// so its narrow source PK bytes must not route natively.
+    ///
+    /// Deliberately NOT used by the write-path fan-out, which routes by the
+    /// distribution prefix — a different hash domain with no promotion concept.
+    ///
+    /// Homed beside [`Self::shard_cols_match_dist_key`] because the two are
+    /// coupled in their promotion half: relaxing `tc != 0` on one side alone would
+    /// let a promoted side skip its exchange while its partner scatters at the
+    /// wider `T`, silently dropping matches.
+    #[inline]
+    pub(crate) fn scatter_routes_by_pk(&self, cols: &[u32], target_tcs: &[u8]) -> bool {
+        cols == self.pk_indices() && target_tcs.iter().all(|&tc| tc == 0)
+    }
+
     /// Byte offset of `col_idx` within the row's PK region. Walks
     /// `pk_columns()` in pk-list order; caller must ensure `col_idx` is
     /// a PK column.
@@ -1186,6 +1205,22 @@ pub(crate) fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor
     Some(SchemaDescriptor::new(&cols, a.pk_indices()))
 }
 
+/// Output schema of a computed-projection `Map`: the input's PK region (the map
+/// inherits it verbatim, `PkFill::Copy`), then one payload column per declared
+/// `(type_code, nullable)` slot. `decode_op_node` rejects an undecodable type
+/// code, so every entry is a real column type.
+pub(crate) fn compute_map_output_schema(
+    in_schema: &SchemaDescriptor,
+    out_cols: &[(u8, bool)],
+) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(in_schema)?;
+    for &(tc, nullable) in out_cols {
+        b.push(SchemaColumn::new(tc, nullable as u8))?;
+    }
+    Some(b.finish())
+}
+
 /// Output schema of an outer-join NULL_EXTEND: the input schema verbatim (PK
 /// region unchanged), then one nullable column per null-fill `type_codes` entry.
 /// `decode_op_node` rejects an undecodable type code, so every entry is a real
@@ -1243,6 +1278,60 @@ mod tests {
     use super::*;
 
     // ── Derived operator-output schemas ─────────────────────────────────────
+
+    #[test]
+    fn test_identity_map_detection() {
+        let a = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let b = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        assert!(a.same_physical_layout(&b));
+
+        let c = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        );
+        assert!(!a.same_physical_layout(&c));
+    }
+
+    /// `union_nullability_merge` ORs the two inputs' per-column nullability, so a
+    /// null-carrying side reclassifies the output from the null-blind
+    /// `FixedIntNonnull` fast comparator to the null-aware `Generic` one.
+    #[test]
+    fn test_union_nullability_merge_classification() {
+        use crate::schema::PayloadCmpKind;
+        let pk = SchemaColumn::new(type_code::U128, 0);
+        let nonnull = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
+        let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
+
+        // Non-nullable A + nullable B → nullable output column, Generic comparator.
+        let m = union_nullability_merge(&nonnull, &nullable).expect("shared layout");
+        assert_eq!(m.columns[1].nullable, 1, "OR of non-nullable and nullable = nullable");
+        assert_eq!(m.payload_cmp, PayloadCmpKind::Generic);
+
+        // Both non-nullable → stays on the FixedIntNonnull fast path (byte-identical).
+        let m2 = union_nullability_merge(&nonnull, &nonnull).expect("shared layout");
+        assert_eq!(m2.columns[1].nullable, 0);
+        assert_eq!(m2.payload_cmp, PayloadCmpKind::FixedIntNonnull);
+
+        // Nullable A + non-nullable B → Generic too (OR is symmetric).
+        let m3 = union_nullability_merge(&nullable, &nonnull).expect("shared layout");
+        assert_eq!(m3.columns[1].nullable, 1);
+        assert_eq!(m3.payload_cmp, PayloadCmpKind::Generic);
+    }
 
     #[test]
     fn test_merge_schemas_for_join() {

@@ -200,7 +200,12 @@ pub(crate) fn execute_epoch_from(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::Union { in_a, in_b, out_reg } => {
+            Instr::Union {
+                in_a,
+                in_b,
+                out_reg,
+                consume,
+            } => {
                 // The union's own (nullability-merged) schema, not the left
                 // input's — see `op_union` for why a narrower one mis-sorts
                 // nulls.
@@ -208,13 +213,18 @@ pub(crate) fn execute_epoch_from(
                 if in_a == in_b {
                     // Self-union: Z + Z doubles every weight in-place. Reading
                     // batch_b after moving batch_a out would see an empty batch
-                    // and produce +1 instead of +2.
+                    // and produce +1 instead of +2 — and going through `op_union`
+                    // would clone 2N rows to reach the same answer.
                     let mut batch = reg_mut!(*in_a).batch.take();
                     batch.map_weights(|w| w.wrapping_mul(2));
                     reg_mut!(*out_reg).batch = batch;
                 } else {
                     let batch_b = &reg!(*in_b).batch;
-                    let batch_a = reg_mut!(*in_a).batch.take();
+                    let batch_a = if *consume {
+                        reg_mut!(*in_a).batch.take()
+                    } else {
+                        reg!(*in_a).batch.clone_batch()
+                    };
                     reg_mut!(*out_reg).batch = ops::op_union(batch_a, batch_b, out_schema);
                 }
             }
@@ -226,10 +236,15 @@ pub(crate) fn execute_epoch_from(
                 hist_table_idx,
                 lo,
                 hi,
+                consume,
             } => {
                 let cursor = cursor_mut!(*hist_reg);
                 let schema = &program.reg_meta[*in_reg as usize].schema;
-                let delta = reg_mut!(*in_reg).batch.take();
+                let delta = if *consume {
+                    reg_mut!(*in_reg).batch.take()
+                } else {
+                    reg!(*in_reg).batch.clone_batch()
+                };
                 let (output, consolidated) = ops::op_weight_clamp(delta, cursor, schema, *lo, *hi);
                 reg_mut!(*out_reg).batch = output;
                 // Ingest consolidated delta into history table

@@ -921,4 +921,78 @@ mod tests {
         assert_eq!(out.get_pk(8) as u64, 18);
         assert_eq!(out.get_pk(9) as u64, 20);
     }
+
+    /// End-to-end mechanism: two rows that are both NULL in an `I64` payload
+    /// column but carry DIFFERENT non-zero bytes under the null bit (the
+    /// `NullGarbage` construction) and share one content-hash PK.
+    ///
+    /// Root-cause contrast at the dispatched row comparator: the merged schema's
+    /// null-aware `Generic` comparator reads `null == null` and coalesces them;
+    /// the pre-fix inherited `FixedIntNonnull` comparator orders by the raw
+    /// garbage bytes and splits them — the bug this fix removes. (The split can't
+    /// be shown by running consolidation to completion: the write path zero-fills
+    /// null cells, so the two rows become byte-equal only *after* the fast
+    /// comparator has already emitted them as two elements, tripping the
+    /// consolidated-layout debug assert rather than yielding a clean 2-row batch.)
+    ///
+    /// Then end-to-end under the merged (null-aware) schema: the two NULL-garbage
+    /// rows, fed one per `union` input, coalesce through the union + a distinct
+    /// weight-clamp to a single weight-1 row.
+    #[test]
+    fn test_union_nullability_merge_coalesces_null_garbage() {
+        use crate::ops::op_distinct;
+        use crate::storage::{compare_rows, compare_rows_fixedint_nonnull, Batch, Layout, ReadCursor};
+        use std::cmp::Ordering;
+        use std::rc::Rc;
+
+        let pk = SchemaColumn::new(type_code::U128, 0);
+        let schema_a = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
+        let schema_b = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
+        // Classification (merged → Generic, schema_a → FixedIntNonnull) is covered by
+        // test_union_nullability_merge_classification; this test starts from that
+        // given and exercises the row-comparator mechanism it selects.
+        let merged = crate::schema::union_nullability_merge(&schema_a, &schema_b).expect("shared layout");
+
+        // Append one NULL row carrying `garbage` bytes under the null bit, on a
+        // fixed content-hash PK shared by every row here.
+        let push_null_garbage = |bat: &mut Batch, garbage: i64| {
+            bat.extend_pk(0x1234_5678_9abc_def0);
+            bat.extend_weight(&1i64.to_le_bytes());
+            bat.extend_null_bmp(&1u64.to_le_bytes()); // payload col 0 → NULL
+            bat.extend_col(0, &garbage.to_le_bytes()); // non-zero bytes under the null bit
+            bat.count += 1;
+        };
+        let g0 = 0x5555_5555_5555_5555u64 as i64;
+        let g1 = 0xAAAA_AAAA_AAAA_AAAAu64 as i64;
+
+        // Root-cause contrast: same PK, both NULL, different garbage bytes.
+        let mut pair = Batch::with_capacity(merged, 2);
+        push_null_garbage(&mut pair, g0);
+        push_null_garbage(&mut pair, g1);
+        assert_eq!(
+            compare_rows(&merged, &pair, 0, &pair, 1),
+            Ordering::Equal,
+            "null-aware Generic comparator: two NULL rows are one element",
+        );
+        assert_ne!(
+            compare_rows_fixedint_nonnull(&schema_a, &pair, 0, &pair, 1),
+            Ordering::Equal,
+            "null-blind FixedIntNonnull comparator: garbage bytes split them (the bug)",
+        );
+
+        // End-to-end under the merged schema: one NULL-garbage row per union input.
+        let single = |garbage: i64| {
+            let mut bat = Batch::with_capacity(merged, 1);
+            push_null_garbage(&mut bat, garbage);
+            bat.certify_layout(Layout::Consolidated, &merged);
+            bat
+        };
+        let unioned = op_union(single(g0), &single(g1), &merged);
+        assert_eq!(unioned.count, 2, "Z-Set + keeps both rows before consolidation");
+        let empty = Rc::new(Batch::empty_with_schema(&merged));
+        let mut ch = ReadCursor::over_batches(std::slice::from_ref(&empty), merged);
+        let (out, _) = op_distinct(unioned, &mut ch, &merged);
+        assert_eq!(out.count, 1, "null-aware comparator coalesces the two NULL rows");
+        assert_eq!(out.get_weight(0), 1, "distinct clamps the coalesced weight 2 → 1");
+    }
 }

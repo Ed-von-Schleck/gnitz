@@ -17,7 +17,7 @@ use super::{
     apply_projection, collect_live_cols, emit_filter, key_region_layout, resolve_collisions, resolve_input,
     resolve_projection, seginput_of_get, split_filter, CutMemo, SegInput,
 };
-use crate::codec::project_schema::{compile_projection_map, ProjItem};
+use crate::codec::project_schema::{compile_projection_map, declared_out_cols, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::guards::reject_pure_range_threshold_tc;
@@ -484,7 +484,8 @@ impl MarkBranch<'_> {
             })
             .collect::<Result<_, GnitzSqlError>>()?;
         let program = compile_projection_map(&proj_items, self.schema)?;
-        Ok(cb.map_expr(filtered, program))
+        let out_cols = self.out_cols();
+        Ok(cb.map_expr(filtered, program, &declared_out_cols(&out_cols[self.pk_cols.len()..])))
     }
 }
 

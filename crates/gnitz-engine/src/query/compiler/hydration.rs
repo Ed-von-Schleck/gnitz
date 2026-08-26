@@ -16,7 +16,7 @@ pub(crate) enum Hydration {
     /// `ScanDelta`'s register `in_reg` from relation `source`'s store and replay
     /// the whole program.
     Relation { in_reg: u16, source: i64 },
-    /// Inner equi-join: seed `in_reg` from `owned_tables[seed_table]`'s store and
+    /// Inner equi-join: seed `in_reg` from the trace at `seed_table` and
     /// dispatch from `start_pc`. The seed must enter mid-program because the join
     /// key is not the source PK, so a key-restricted feed at the `ScanDelta`
     /// register would mean scanning the whole source.
@@ -47,14 +47,10 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
         .copied()
         .find(|nid| matches!(loaded.nodes.get(nid), Some(OpNode::IntegrateSink)))
         .ok_or(CompileError::Rejected("bounded view: circuit has no IntegrateSink"))?;
-    let mut cur =
-        input_on_port(loaded, sink, PORT_IN).ok_or(CompileError::Rejected("bounded view: sink has no input"))?;
+    let mut cur = loaded.inputs(sink).unary();
     loop {
         match loaded.nodes.get(&cur) {
-            Some(OpNode::Filter(_)) | Some(OpNode::Map(_)) => {
-                cur = input_on_port(loaded, cur, PORT_IN)
-                    .ok_or(CompileError::Rejected("bounded view: filter/map has no input"))?;
-            }
+            Some(OpNode::Filter(_)) | Some(OpNode::Map(_)) => cur = loaded.inputs(cur).unary(),
             // The linear shape: the whole program replays over the source store,
             // seeded at this `ScanDelta`'s own register.
             Some(OpNode::ScanDelta { source, .. }) => {
@@ -74,18 +70,14 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
     //    into canonical `[A, B]` column order. The node is in the circuit on both
     //    branches whatever `emit_map` does with it: the AB one is an identity the
     //    emitter elides, the BA one a real column permutation that emits.
-    let ins = loaded
-        .incoming
-        .get(&union)
-        .filter(|v| v.len() == 2)
-        .ok_or(CompileError::Rejected("bounded view: union does not have two inputs"))?;
+    let (branch_a, branch_b) = loaded.inputs(union).binary();
     let through_map = |mut nid: i32| -> Option<i32> {
         if matches!(loaded.nodes.get(&nid), Some(OpNode::Map(_))) {
-            nid = input_on_port(loaded, nid, PORT_IN)?;
+            nid = loaded.inputs(nid).unary();
         }
         matches!(loaded.nodes.get(&nid), Some(OpNode::Join(JoinKind::DeltaTrace))).then_some(nid)
     };
-    let j_a = through_map(ins[0].0).ok_or(CompileError::Rejected(
+    let j_a = through_map(branch_a).ok_or(CompileError::Rejected(
         "bounded view: union input is not an inner delta/trace join",
     ))?;
 
@@ -99,21 +91,20 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
     // Each join's trace port, checked to be an integral. Two calls, two messages,
     // so a rejection names the branch it came from.
     let trace_of = |j: i32, whose: &'static str| -> Result<i32, CompileError> {
-        let t = input_on_port(loaded, j, PORT_TRACE).ok_or(CompileError::Rejected(whose))?;
+        let t = loaded.inputs(j).binary().1;
         matches!(loaded.nodes.get(&t), Some(OpNode::IntegrateTrace))
             .then_some(t)
             .ok_or(CompileError::Rejected(whose))
     };
-    let d_a =
-        input_on_port(loaded, j_a, PORT_IN_A).ok_or(CompileError::Rejected("bounded view: join has no delta input"))?;
+    let d_a = loaded.inputs(j_a).binary().0;
     trace_of(j_a, "bounded view: the seeded join's trace port is not an integral")?;
     // `T_b` integrates the *other* branch's delta, so the seed is the trace whose
     // input node is `D_a` — found on the sibling join.
-    let j_b = through_map(ins[1].0).ok_or(CompileError::Rejected(
+    let j_b = through_map(branch_b).ok_or(CompileError::Rejected(
         "bounded view: union input is not an inner delta/trace join",
     ))?;
     let t_a = trace_of(j_b, "bounded view: the sibling join's trace port is not an integral")?;
-    if input_on_port(loaded, t_a, PORT_IN) != Some(d_a) {
+    if loaded.inputs(t_a).unary() != d_a {
         return Err(CompileError::Rejected(
             "bounded view: the join's trace port is not the other branch's delta integral",
         ));
@@ -227,7 +218,7 @@ mod tests {
     /// building it.
     #[allow(clippy::type_complexity)]
     fn equi_join_parts() -> (HashMap<i32, OpNode>, Vec<(i32, i32, i32)>) {
-        let m = |cols: Vec<u16>| OpNode::Map(MapKind::Projection(cols));
+        let m = |cols: Vec<u32>| OpNode::Map(MapKind::Projection(cols));
         let nodes = HashMap::from([
             (0, scan_delta(100)),
             (1, scan_delta(200)),

@@ -60,6 +60,17 @@ pub(super) fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
     }
 }
 
+/// The exact value set [`encode_ordered`] can encode: a narrow (<=8B) fixed int
+/// or float. Written as the canonical predicates rather than a negative variant
+/// list, so a future `TypeCode` is ineligible by default until classified.
+///
+/// This is what keeps the `unreachable!` arms below unreachable — the compiler
+/// rejects a MIN/MAX over anything it excludes. Change its *form* freely; never
+/// widen its accepted set without giving those arms an encoding.
+pub(crate) fn agg_value_idx_eligible(tc: TypeCode) -> bool {
+    gnitz_wire::is_fixed_int(tc as u8) || tc.is_float()
+}
+
 /// Order-preserving u64 encoding of a fixed-width aggregate value held in
 /// `bytes` (native little-endian). A PK aggregate column's at-rest bytes are
 /// the OPK window (big-endian, sign-flipped) — callers read them through

@@ -15,7 +15,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr};
 use crate::types::has_scalar_register;
 use gnitz_core::{ColumnDef, ReduceOutKey, Schema, TypeCode};
-use gnitz_wire::AggFunc as WireAggFunc;
+use gnitz_wire::{AggFunc as WireAggFunc, ReduceOutSlot};
 
 /// Tracks how a user-level aggregate maps to reduce agg_specs.
 pub(crate) struct AggMapping {
@@ -164,11 +164,41 @@ pub(crate) fn synthetic_group_col_pos(src_col: usize, group_col_indices: &[usize
         .expect("SyntheticFold: every group col is in the group list")
 }
 
-/// The SyntheticFold reduce-output column layout: the hidden U128 group-key PK,
-/// the group columns (source definitions), then one column per physical agg
-/// spec (at the spec's `out_type`). The single home of the layout the view
-/// path's virtual reduce schema, the ad-hoc partial reply schema, and the
-/// HAVING binder's `agg_col_offset = 1 + n_group` all assume.
+/// Materialize the shared reduce-output layout ([`ReduceOutKey::output_layout`])
+/// into this side's column defs, returning them with the PK positions. The
+/// aggregate columns are the caller's to append: their type and nullability come
+/// from the physical specs, which are per-side.
+fn reduce_out_key_region(
+    out_key: ReduceOutKey,
+    source_schema: &Schema,
+    group_col_indices: &[usize],
+) -> (Vec<ColumnDef>, Vec<usize>) {
+    let pk: Vec<u32> = source_schema.pk_cols.iter().map(|&i| i as u32).collect();
+    let group: Vec<u32> = group_col_indices.iter().map(|&i| i as u32).collect();
+    let mut cols = Vec::new();
+    let mut pk_cols = Vec::new();
+    for slot in out_key.output_layout(&pk, &group) {
+        match slot {
+            // Hidden: the synthetic group key is a physical PK column but not a
+            // presentation column. The group columns follow it as visible payload,
+            // so `SELECT *` shows the grouping values and aggregates, not the hash.
+            ReduceOutSlot::SyntheticKey => {
+                pk_cols.push(cols.len());
+                cols.push(ColumnDef::new("_group_pk", TypeCode::U128, false).hidden());
+            }
+            ReduceOutSlot::Key(c) => {
+                pk_cols.push(cols.len());
+                cols.push(source_schema.columns[c as usize].clone());
+            }
+            ReduceOutSlot::Carried(c) => cols.push(source_schema.columns[c as usize].clone()),
+        }
+    }
+    (cols, pk_cols)
+}
+
+/// The SyntheticFold key region ([`reduce_out_key_region`]) plus one column per
+/// physical agg spec, at the spec's `out_type` — the layout the ad-hoc partial
+/// reply schema and the HAVING binder's `agg_col_offset = 1 + n_group` assume.
 ///
 /// `exact_nullability` is the one divergence. `Some(is_global)` asks for the
 /// exact per-spec rule (`agg_raw_nullable`, matching the engine's physical
@@ -183,14 +213,7 @@ pub(crate) fn synthetic_fold_cols(
     agg_specs: &[AggSpec],
     exact_nullability: Option<bool>,
 ) -> Vec<ColumnDef> {
-    let mut cols = Vec::with_capacity(1 + group_col_indices.len() + agg_specs.len());
-    // Hidden: the synthetic group key is a physical PK column but not a
-    // presentation column. The group columns follow it as visible payload, so
-    // `SELECT *` shows the grouping values and aggregates, not the hash.
-    cols.push(ColumnDef::new("_group_pk", TypeCode::U128, false).hidden());
-    for &gi in group_col_indices {
-        cols.push(source_schema.columns[gi].clone());
-    }
+    let (mut cols, _) = reduce_out_key_region(ReduceOutKey::SyntheticFold, source_schema, group_col_indices);
     for spec in agg_specs {
         let nullable = match exact_nullability {
             Some(is_global) => agg_raw_nullable(source_schema, spec, is_global),
@@ -251,48 +274,23 @@ impl<'a> ReduceShape<'a> {
     }
 }
 
-/// The reduce output schema for a group set, mirroring the engine's
-/// `build_reduce_output_schema` (which lays out from the same `out_key`), plus
-/// the offset of the first aggregate column. The aggregate columns trail the PK
-/// region — plus, on the synthetic path only, the group cols carried as payload
-/// — at the output type `push_agg_specs` computed per spec (float SUM/MIN/MAX →
-/// F64, MIN/MAX preserve the source type, SUM/COUNT* → I64), so the planner's
-/// virtual reduce schema matches the compiler's physical reduce output with no
-/// per-op reconstruction. One home for the view path and the HIR reduce shell.
+/// The reduce output schema for a group set, plus the offset of the first
+/// aggregate column. The key region comes from the shared
+/// [`ReduceOutKey::output_layout`] the engine's `build_reduce_output_schema` also
+/// materializes, so the planner's virtual reduce schema matches the physical one
+/// by construction rather than by mirroring. The aggregate columns trail it at
+/// the output type `push_agg_specs` computed per spec (float SUM/MIN/MAX → F64,
+/// MIN/MAX preserve the source type, SUM/COUNT* → I64). One home for the view
+/// path and the HIR reduce shell.
 pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
     let (source_schema, agg_specs) = (sh.source_schema, sh.specs);
     let is_global = sh.global_ground();
-    // Every layout ends with one `_agg` column per physical spec, at the spec's
-    // own type and the shared per-spec nullability rule.
-    let agg_cols = |cols: &mut Vec<ColumnDef>| {
-        cols.extend(
-            agg_specs
-                .iter()
-                .map(|s| ColumnDef::new("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
-        )
-    };
-    let (columns, pk_cols) = match sh.out_key {
-        ReduceOutKey::PkPermutation => {
-            let mut cols: Vec<ColumnDef> = source_schema
-                .pk_cols
-                .iter()
-                .map(|&pi| source_schema.columns[pi].clone())
-                .collect();
-            let pk: Vec<usize> = (0..cols.len()).collect();
-            agg_cols(&mut cols);
-            (cols, pk)
-        }
-        ReduceOutKey::SingleNaturalCol => {
-            let mut cols = vec![source_schema.columns[sh.group_cols[0]].clone()];
-            agg_cols(&mut cols);
-            (cols, vec![0])
-        }
-        // The shared SyntheticFold layout (also the ad-hoc partial schema).
-        ReduceOutKey::SyntheticFold => (
-            synthetic_fold_cols(source_schema, sh.group_cols, agg_specs, Some(is_global)),
-            vec![0],
-        ),
-    };
+    let (mut columns, pk_cols) = reduce_out_key_region(sh.out_key, source_schema, sh.group_cols);
+    columns.extend(
+        agg_specs
+            .iter()
+            .map(|s| ColumnDef::new("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
+    );
     let agg_col_offset = columns.len() - agg_specs.len();
     (Schema { columns, pk_cols }, agg_col_offset)
 }

@@ -68,6 +68,15 @@ fn resolve_proj_col(
     }
 }
 
+/// The `(type_code, nullable)` declaration parallel to a compiled projection
+/// program's payload slots. `SELECT a + b` is not a copy list, so the engine
+/// cannot derive the schema of the map it types; this is what
+/// `CircuitBuilder::map_expr` ships instead. `cols` must be the same payload
+/// slice `compile_projection_map` was given.
+pub(crate) fn declared_out_cols(cols: &[ColumnDef]) -> Vec<(u8, bool)> {
+    cols.iter().map(|c| (c.type_code as u8, c.is_nullable)).collect()
+}
+
 /// Compile the *payload* slice of a projection (`items` must exclude the
 /// leading PK slots, which the engine carries verbatim) into one expr-map
 /// program: a COPY_COL per pass-through, a compiled expression + EMIT per

@@ -73,6 +73,7 @@ pub const NODE_COL_KIND_GLOBAL_GROUND: u64 = 8; // REDUCE global-aggregate groun
 pub const NODE_COL_KIND_REDUCE_OUT_KEY: u64 = 9; // REDUCE output-key kind (value1=ReduceOutKey); absent ⇒ SyntheticFold
 pub const NODE_COL_KIND_SCAN_BOUND: u64 = 10; // SCAN_DELTA backfill-scan index column list (value1=col_idx, position=key order)
 pub const NODE_COL_KIND_ROUTE_KEY: u64 = 11; // MAP_EXPR reindex role (value1 = ReindexRole)
+pub const NODE_COL_KIND_MAP_OUT_COLS: u64 = 12; // MAP_EXPR compute payload columns (value1=type_code, value2=nullable)
 
 // ---------------------------------------------------------------------------
 // Aggregate function IDs
@@ -289,6 +290,29 @@ impl ReduceOutKey {
         Self::decide(eq_pk, single_natural)
     }
 
+    /// The output layout this kind selects, up to the aggregate columns each side
+    /// types for itself.
+    ///
+    /// Both sides must lay a reduce's output out identically — the planner
+    /// declares the view's schema, the engine builds the batch — so the layout
+    /// lives beside the decision that picks it ([`Self::for_group_cols`]) rather
+    /// than as two matches kept in step by hand.
+    ///
+    /// `SingleNaturalCol` names `group_cols[0]`, which `for_group_cols` only
+    /// selects for a single-column group set; the engine validates the transmitted
+    /// kind against the input schema before laying anything out.
+    pub fn output_layout(self, pk_cols: &[u32], group_cols: &[u32]) -> Vec<ReduceOutSlot> {
+        match self {
+            // The output PK region mirrors the source's PK byte layout, so it
+            // walks the PK list in order rather than `group_cols` order.
+            ReduceOutKey::PkPermutation => pk_cols.iter().map(|&c| ReduceOutSlot::Key(c)).collect(),
+            ReduceOutKey::SingleNaturalCol => vec![ReduceOutSlot::Key(group_cols[0])],
+            ReduceOutKey::SyntheticFold => std::iter::once(ReduceOutSlot::SyntheticKey)
+                .chain(group_cols.iter().map(|&c| ReduceOutSlot::Carried(c)))
+                .collect(),
+        }
+    }
+
     pub fn decide(group_cols_eq_pk: bool, single_col_natural: bool) -> Self {
         if group_cols_eq_pk {
             ReduceOutKey::PkPermutation
@@ -298,6 +322,19 @@ impl ReduceOutKey {
             ReduceOutKey::SyntheticFold
         }
     }
+}
+
+/// One slot of a reduce's output layout, ahead of the aggregate columns. See
+/// [`ReduceOutKey::output_layout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceOutSlot {
+    /// The synthetic `U128` fold key: slot 0 of the fold arm, and its whole PK.
+    SyntheticKey,
+    /// Source column `col`, in the output's PK region.
+    Key(u32),
+    /// Source column `col`, carried into the payload — the fold arm's group
+    /// columns, which its synthetic key does not spell.
+    Carried(u32),
 }
 
 /// Join physical strategy carried by `OpNode::Join`. `DeltaTraceRange` keeps
@@ -342,26 +379,31 @@ impl ReindexRole {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MapKind {
     /// Pure projection/column-reorder. Carries payload column indices to keep.
-    Projection(Vec<u16>),
-    /// Expression-based map. `program` is an opaque `ExprProgram` blob;
-    /// each crate decodes it with its own decoder. `reindex_cols` lists the
-    /// source columns, in key order, that become the synthetic PK for equijoin
-    /// pre-indexing (empty for a plain compute map).
+    Projection(Vec<u32>),
+    /// Computed projection (`SELECT a + b`). `program` is an opaque `ExprProgram`
+    /// blob writing one payload slot each; `out_cols` declares those slots as
+    /// `(type_code, nullable)` in payload order. The PK region is inherited from
+    /// the input verbatim, so it is not listed.
     ///
-    /// `reindex_target_tcs` is parallel to `reindex_cols` — a decoded
-    /// `Expression` always has `reindex_target_tcs.len() == reindex_cols.len()`.
-    /// Entry `i` is the promoted key type code `T` for slot `i` of a cross-width
-    /// equijoin key, or `0` meaning "derive the slot type from the source column"
-    /// (the same-type path, byte-identical to non-promoted circuits). Both are
-    /// empty for a plain compute map.
-    ///
-    /// `role` is [`ReindexRole`]. With `reindex_cols` empty this is a plain
-    /// computed projection, which by contract is the circuit's **final**
-    /// projection: the engine has no dense copy list to derive a schema from
-    /// there, so it types the node with the view's output schema.
-    Expression {
+    /// The declared columns travel because a computed projection has no copy list
+    /// the engine could derive a schema from — `payload_copy_srcs` is `None` for
+    /// `a + b`. `ScalarFunc::from_map` validates the program against them.
+    Compute {
         program: Vec<u8>,
-        reindex_cols: Vec<u16>,
+        out_cols: Vec<(u8, bool)>,
+    },
+    /// Re-key: `reindex_cols` lists the source columns, in key order, that become
+    /// the synthetic PK for equijoin/group pre-indexing, and `program` is the copy
+    /// list placing the surviving payload behind them. Never empty — a map that
+    /// re-keys nothing is a [`MapKind::Compute`].
+    ///
+    /// `reindex_target_tcs` is parallel to `reindex_cols`. Entry `i` is the
+    /// promoted key type code `T` for slot `i` of a cross-width equijoin key, or
+    /// `0` meaning "derive the slot type from the source column" (the same-type
+    /// path, byte-identical to non-promoted circuits).
+    Reindex {
+        program: Vec<u8>,
+        reindex_cols: Vec<u32>,
         reindex_target_tcs: Vec<u8>,
         role: ReindexRole,
     },
@@ -383,7 +425,7 @@ pub enum MapKind {
     /// distinct synthetic PKs (and therefore accumulate weight +2 rather than
     /// collapsing). Deduplicating set-ops (UNION/EXCEPT/INTERSECT) use 0 on both
     /// sides; UNION ALL uses 0 on the left and 1 on the right.
-    HashRow(Vec<u16>, Vec<u8>, u8),
+    HashRow(Vec<u32>, Vec<u8>, u8),
 }
 
 /// A secondary-index range bound for a `ScanDelta`'s backfill scan: the index's
@@ -428,11 +470,11 @@ pub enum OpNode {
     /// `EXCEPT ALL = positive_part(A − B)` and `INTERSECT ALL = A − positive_part(A − B)`.
     PositivePart,
     Reduce {
-        group_cols: Vec<u16>,
+        group_cols: Vec<u32>,
         /// Aggregate specs `(func, source column)`. Never empty: a spec-less
         /// REDUCE is rejected at decode (every producer ships at least one —
         /// the SQL planner injects a companion COUNT for group-only reduces).
-        agg: Vec<(AggFunc, u16)>,
+        agg: Vec<(AggFunc, u32)>,
         /// True only for the user's ungrouped (global) scalar aggregate — the
         /// reduce that must emit exactly one row over an empty/fully-retracted
         /// source (COUNT(*)=0, SUM/MIN/MAX/AVG=NULL). A **SQL-intent
@@ -451,7 +493,7 @@ pub enum OpNode {
     /// `OPCODE_INTEGRATE_TRACE = 25`. Accumulates Z-set for join trace.
     IntegrateTrace,
     ExchangeShard {
-        shard_cols: Vec<u16>,
+        shard_cols: Vec<u32>,
     },
     NullExtend {
         type_codes: Vec<u8>,
@@ -461,6 +503,24 @@ pub enum OpNode {
     /// scatters by its eq prefix and omits this node). Worker identity is a
     /// compile-time constant, so no payload travels on the wire.
     WorkerFilter,
+}
+
+impl OpNode {
+    /// The input ports this operator is wired on, in port order. A function of
+    /// the variant alone, so a circuit's whole edge set can be held to it once at
+    /// load instead of every consumer re-checking arity where it reads an operand.
+    ///
+    /// `PORT_IN == PORT_IN_A == 0` and `PORT_TRACE == PORT_IN_B == 1`, so a
+    /// binary operator's set is `[0, 1]` however its ports are spelled.
+    pub const fn ports(&self) -> &'static [u64] {
+        match self {
+            // The circuit's own input: fed by the source drive, not by an edge.
+            OpNode::ScanDelta { .. } => &[],
+            OpNode::Union => &[PORT_IN_A, PORT_IN_B],
+            OpNode::Join(_) => &[PORT_IN_A, PORT_TRACE],
+            _ => &[PORT_IN],
+        }
+    }
 }
 
 /// One decoded row of the `CircuitNodeColumns` system table for a single node,
@@ -497,15 +557,15 @@ fn collect_cols_with_tcs(
     kind: u64,
     valid: fn(u8) -> bool,
     err: impl Fn(u8) -> String,
-) -> Result<(Vec<u16>, Vec<u8>), String> {
-    let mut out_cols: Vec<u16> = Vec::new();
+) -> Result<(Vec<u32>, Vec<u8>), String> {
+    let mut out_cols: Vec<u32> = Vec::new();
     let mut out_tcs: Vec<u8> = Vec::new();
     for c in rows_of(cols, kind) {
         let tc = c.value2 as u8;
         if tc != 0 && !valid(tc) {
             return Err(err(tc));
         }
-        out_cols.push(c.value1 as u16);
+        out_cols.push(c.value1 as u32);
         out_tcs.push(tc);
     }
     Ok((out_cols, out_tcs))
@@ -534,7 +594,7 @@ where
 /// Like [`encode_col_list`], but carries a per-column promoted target type code
 /// in `value2` (0 = keep/derive from the source type). `.get(i)...unwrap_or(0)`
 /// degrades a short/absent `target_tcs` to "no promotion" instead of panicking.
-fn encode_col_list_with_tcs(kind: u64, cols: &[u16], target_tcs: &[u8]) -> Vec<NodeColumnPayload> {
+fn encode_col_list_with_tcs(kind: u64, cols: &[u32], target_tcs: &[u8]) -> Vec<NodeColumnPayload> {
     cols.iter()
         .enumerate()
         .map(|(i, &col)| {
@@ -561,7 +621,15 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         OpNode::Map(MapKind::Projection(cols)) => {
             ((OPCODE_MAP_PROJ, None, None), encode_col_list(NODE_COL_KIND_PROJ, cols))
         }
-        OpNode::Map(MapKind::Expression {
+        OpNode::Map(MapKind::Compute { program, out_cols }) => {
+            let kind_rows = out_cols
+                .into_iter()
+                .enumerate()
+                .map(|(i, (tc, nullable))| (NODE_COL_KIND_MAP_OUT_COLS, i as u16, tc as u64, nullable as u64))
+                .collect();
+            ((OPCODE_MAP_EXPR, None, Some(program)), kind_rows)
+        }
+        OpNode::Map(MapKind::Reindex {
             program,
             reindex_cols,
             reindex_target_tcs,
@@ -640,7 +708,7 @@ pub fn decode_op_node(
     expr_blob: Option<Vec<u8>>,
     cols: &[CircuitNodeColumn],
 ) -> Result<OpNode, String> {
-    let collect_cols = |kind: u64| -> Vec<u16> { rows_of(cols, kind).iter().map(|c| c.value1 as u16).collect() };
+    let collect_cols = |kind: u64| -> Vec<u32> { rows_of(cols, kind).iter().map(|c| c.value1 as u32).collect() };
     // The null-fill type codes become schema columns verbatim, so this decode is
     // their trust boundary (see `is_valid_type_code` for why an unknown code is
     // not inert) — the same rule `collect_cols_with_tcs` applies to a carried
@@ -657,13 +725,13 @@ pub fn decode_op_node(
             })
             .collect()
     };
-    let collect_aggs = || -> Result<Vec<(AggFunc, u16)>, String> {
+    let collect_aggs = || -> Result<Vec<(AggFunc, u32)>, String> {
         rows_of(cols, NODE_COL_KIND_AGG_SPEC)
             .iter()
             .map(|c| {
                 AggFunc::from_wire(c.value1)
                     .ok_or_else(|| format!("unknown agg func id {}", c.value1))
-                    .map(|f| (f, c.value2 as u16))
+                    .map(|f| (f, c.value2 as u32))
             })
             .collect()
     };
@@ -676,11 +744,7 @@ pub fn decode_op_node(
             // erroring here would let one corrupt hint row make a stored view
             // unloadable. An absent list, an over-long one, a missing blob, and an
             // undecodable descriptor all mean the same thing: no usable hint.
-            let bound_cols: Vec<u32> = collect_cols(NODE_COL_KIND_SCAN_BOUND)
-                .iter()
-                .map(|&c| c as u32)
-                .collect();
-            let bound = crate::PkColList::try_from_slice(&bound_cols)
+            let bound = crate::PkColList::try_from_slice(&collect_cols(NODE_COL_KIND_SCAN_BOUND))
                 .zip(
                     expr_blob
                         .as_deref()
@@ -701,6 +765,21 @@ pub fn decode_op_node(
                 collect_cols_with_tcs(cols, NODE_COL_KIND_REINDEX, crate::is_pk_eligible, |tc| {
                     format!("MAP_EXPR reindex target type code {tc} is not PK-eligible")
                 })?;
+            // The reindex columns are the discriminator: a map that re-keys nothing
+            // is a computed projection, which is why the two cannot be confused.
+            if reindex_cols.is_empty() {
+                let out_cols = rows_of(cols, NODE_COL_KIND_MAP_OUT_COLS)
+                    .iter()
+                    .map(|c| {
+                        let tc = c.value1 as u8;
+                        match crate::is_valid_type_code(tc) {
+                            true => Ok((tc, c.value2 != 0)),
+                            false => Err(format!("MAP_EXPR output column type code {tc} is invalid")),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                return Ok(OpNode::Map(MapKind::Compute { program, out_cols }));
+            }
             // An `Err` rather than a default, unlike SCAN_BOUND above: that bound
             // decides scan speed and never correctness, so one corrupt hint row
             // must not make a stored view unloadable. The role decides which
@@ -710,10 +789,7 @@ pub fn decode_op_node(
                 .find(|c| c.kind == NODE_COL_KIND_ROUTE_KEY)
                 .map(|c| ReindexRole::from_wire(c.value1))
                 .ok_or_else(|| "MAP_EXPR missing its route-key row".to_string())?;
-            if role == ReindexRole::ScatterKey && reindex_cols.is_empty() {
-                return Err("MAP_EXPR is a scatter key but reindexes no columns".to_string());
-            }
-            OpNode::Map(MapKind::Expression {
+            OpNode::Map(MapKind::Reindex {
                 program,
                 reindex_cols,
                 reindex_target_tcs,
@@ -761,6 +837,17 @@ pub fn decode_op_node(
                     .ok_or_else(|| format!("REDUCE unknown out_key kind {}", c.value1))?,
                 None => ReduceOutKey::SyntheticFold,
             };
+            // `global_ground` and the group columns arrive independently, and the
+            // ground row is only well-formed group-less: `emit_global_ground`
+            // writes the aggregate columns at payload index 0, which with a
+            // non-empty group set overwrites the exemplar slots and leaves their
+            // regions short — a malformed batch in release. The implication runs
+            // one way only (`ground ⇒ empty`; a threshold reduce and a two-phase
+            // phase-1 partial are group-less with `global_ground = false`), so the
+            // flag cannot be derived — hence a cross-check and not a derivation.
+            if global_ground && !group_cols.is_empty() {
+                return Err("REDUCE is global-ground over a non-empty group set".to_string());
+            }
             OpNode::Reduce {
                 group_cols,
                 agg,
@@ -799,16 +886,16 @@ pub fn decode_op_node(
 mod tests {
     use super::*;
 
-    fn reindex_cols_of(node: OpNode) -> Vec<u16> {
+    fn reindex_cols_of(node: OpNode) -> Vec<u32> {
         match node {
-            OpNode::Map(MapKind::Expression { reindex_cols, .. }) => reindex_cols,
+            OpNode::Map(MapKind::Reindex { reindex_cols, .. }) => reindex_cols,
             other => panic!("expected Map(Expression), got {other:?}"),
         }
     }
 
-    fn reindex_of(node: OpNode) -> (Vec<u16>, Vec<u8>) {
+    fn reindex_of(node: OpNode) -> (Vec<u32>, Vec<u8>) {
         match node {
-            OpNode::Map(MapKind::Expression {
+            OpNode::Map(MapKind::Reindex {
                 reindex_cols,
                 reindex_target_tcs,
                 ..
@@ -1013,10 +1100,34 @@ mod tests {
     /// Every `OpNode` shape survives `encode_op_node` → `decode_op_node`. This is
     /// the crate's largest codec and the only one whose bugs land in a persisted
     /// A `MAP_EXPR` whose role cannot be read decides nothing about routing, so it
-    /// must fail the decode rather than default. (Contrast `SCAN_BOUND`, which
-    /// decides only scan speed and therefore degrades instead of erroring.)
-    /// Missing row = a circuit stored before the role existed; a `ScatterKey` over
-    /// no columns would funnel a whole source onto one worker.
+    /// The ground row is written at payload index 0, so a group set would leave
+    /// its exemplar slots short — the cross-check belongs where the two fields
+    /// arrive, which is here rather than in each consumer.
+    #[test]
+    fn a_global_ground_reduce_over_a_group_set_is_rejected() {
+        let row = |kind, position, value1, value2| CircuitNodeColumn {
+            kind,
+            position,
+            value1,
+            value2,
+        };
+        let agg = row(NODE_COL_KIND_AGG_SPEC, 0, AGG_COUNT, 0);
+        let ground = row(NODE_COL_KIND_GLOBAL_GROUND, 0, 1, 0);
+        let group = row(NODE_COL_KIND_GROUP, 0, 3, 0);
+        let decode = |cols: &[CircuitNodeColumn]| decode_op_node(OPCODE_REDUCE, None, None, cols);
+        assert!(decode(&[agg, ground]).is_ok(), "group-less ground is the valid shape");
+        assert!(
+            decode(&[agg, group]).is_ok(),
+            "a grouped reduce without the flag is fine"
+        );
+        assert!(decode(&[agg, ground, group]).unwrap_err().contains("global-ground"));
+    }
+
+    /// must fail the decode rather than default — a missing row is a circuit
+    /// stored before the role existed. (Contrast `SCAN_BOUND`, which decides only
+    /// scan speed and therefore degrades instead of erroring.) A route-key row
+    /// with no reindex columns cannot say anything: the columns are what
+    /// discriminate a re-key from a computed projection.
     #[test]
     fn a_map_expr_whose_role_is_unreadable_is_rejected() {
         let row = |kind, value1| {
@@ -1031,9 +1142,10 @@ mod tests {
         assert!(decode(&row(NODE_COL_KIND_REINDEX, 3))
             .unwrap_err()
             .contains("route-key"));
-        assert!(decode(&row(NODE_COL_KIND_ROUTE_KEY, 1))
-            .unwrap_err()
-            .contains("reindexes no columns"));
+        assert!(matches!(
+            decode(&row(NODE_COL_KIND_ROUTE_KEY, 1)),
+            Ok(OpNode::Map(MapKind::Compute { .. }))
+        ));
     }
 
     /// circuit, so the variant set is swept rather than sampled.
@@ -1045,19 +1157,21 @@ mod tests {
             OpNode::Filter(Some(vec![1, 2, 3, 4])),
             OpNode::Map(MapKind::Projection(vec![])),
             OpNode::Map(MapKind::Projection(vec![4, 0, 9])),
-            OpNode::Map(MapKind::Expression {
+            OpNode::Map(MapKind::Compute {
                 program: vec![9, 9],
-                reindex_cols: vec![],
-                reindex_target_tcs: vec![],
-                role: ReindexRole::Auxiliary,
+                out_cols: vec![],
             }),
-            OpNode::Map(MapKind::Expression {
+            OpNode::Map(MapKind::Compute {
+                program: vec![7],
+                out_cols: vec![(crate::type_code::I64, false), (crate::type_code::STRING, true)],
+            }),
+            OpNode::Map(MapKind::Reindex {
                 program: vec![1],
                 reindex_cols: vec![2, 5],
                 reindex_target_tcs: vec![0, crate::type_code::I64],
                 role: ReindexRole::ScatterKey,
             }),
-            OpNode::Map(MapKind::Expression {
+            OpNode::Map(MapKind::Reindex {
                 program: vec![1],
                 reindex_cols: vec![2, 5],
                 reindex_target_tcs: vec![0, crate::type_code::I64],

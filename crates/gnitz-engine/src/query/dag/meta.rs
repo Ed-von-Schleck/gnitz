@@ -88,15 +88,20 @@ impl ViewMeta {
         self.source_routes.get(&source_id).unwrap_or(&self.default_route)
     }
 
-    /// Derive the metadata from an already-loaded circuit. The body behind
-    /// `view_meta`'s memo miss.
-    /// `ext_tables` is what the routing half needs and the circuit alone cannot
-    /// supply: co-partitioning and the output-shard elision both test a shard key
-    /// against a *source relation's* distribution prefix.
-    pub(super) fn from_loaded(loaded: &compiler::LoadedCircuit, ext_tables: &compiler::ExtTables) -> ViewMeta {
-        let compiler::ScatterRouting { keys, scatter_sources } = compiler::compute_scatter_routing(loaded, ext_tables);
-        let shard_cols: Option<Rc<[u32]>> = compiler::output_exchange_shard(loaded).map(|(_, cols)| cols.into());
-        let range_join_n_eq = compiler::circuit_range_join_n_eq(loaded);
+    /// Fold the circuit's derived facts into the routing table the relay reads.
+    /// Takes the facts and not the circuit, so a caller that already compiled the
+    /// view hands its own over instead of loading the circuit a second time.
+    pub(super) fn from_facts(facts: compiler::CircuitFacts) -> ViewMeta {
+        let compiler::CircuitFacts {
+            keys,
+            scatter_sources,
+            shard_cols,
+            range_join_n_eq,
+            has_join,
+            skips_exchange,
+            ..
+        } = facts;
+        let shard_cols: Option<Rc<[u32]>> = shard_cols.map(Rc::from);
         let default_route = group_key_route(shard_cols.as_ref());
         // `range_join_n_eq` governs a JOIN relay only: a source carrying no
         // reindex key takes the shard columns whatever the join is.
@@ -116,13 +121,10 @@ impl ViewMeta {
             shard_cols,
             source_routes,
             default_route,
-            has_join: loaded
-                .nodes
-                .values()
-                .any(|op| matches!(op, gnitz_wire::OpNode::Join(_))),
+            has_join,
             scatter_sources,
             range_join_n_eq,
-            skips_exchange: compiler::compute_skips_exchange(loaded, ext_tables),
+            skips_exchange,
         }
     }
 }
@@ -469,7 +471,7 @@ impl DagEngine {
     /// circuit that cannot be read or is cyclic — one that cannot compile or
     /// execute either (`compile_view` rejects it the same way).
     pub(super) fn load_meta_circuit(&self, view_id: i64) -> Option<compiler::LoadedCircuit> {
-        compiler::load_circuit(self.sys, view_id as u64, SchemaDescriptor::default()).ok()
+        compiler::load_circuit(self.sys, view_id as u64).ok()
     }
 
     /// The memoized per-view circuit metadata, computed from ONE
@@ -478,12 +480,13 @@ impl DagEngine {
         if let Some(m) = self.meta.get(&view_id) {
             return m.clone();
         }
-        let ext = self.ext_tables();
-        let meta = Rc::new(
-            self.load_meta_circuit(view_id)
-                .as_ref()
-                .map_or_else(ViewMeta::nothing_special, |l| ViewMeta::from_loaded(l, &ext)),
-        );
+        // A circuit that cannot be read, is malformed, or carries an unscatterable
+        // source takes the conservative branch — the same circuits `compile_view`
+        // rejects, so no view that runs is metadata-less.
+        let facts = self
+            .load_meta_circuit(view_id)
+            .and_then(|l| compiler::CircuitFacts::derive(&l, &self.tables).ok());
+        let meta = Rc::new(facts.map_or_else(ViewMeta::nothing_special, ViewMeta::from_facts));
         self.meta.insert(view_id, meta.clone());
         meta
     }
@@ -517,12 +520,12 @@ mod tests {
     ///
     /// One shape covers every route: source 7 is the join relay, source 9 the
     /// keyless one, and source 0 the output relay.
-    fn join_meta(kind: JoinKind, key_cols: Vec<u16>) -> ViewMeta {
+    fn join_meta(kind: JoinKind, key_cols: Vec<u32>) -> ViewMeta {
         let mut nodes: HashMap<i32, OpNode> = HashMap::new();
         nodes.insert(0, OpNode::ScanDelta { source: 7, bound: None });
         nodes.insert(
             1,
-            OpNode::Map(MapKind::Expression {
+            OpNode::Map(MapKind::Reindex {
                 // An empty but decodable program; nothing here ever executes it.
                 program: gnitz_expr::ExprBuilder::new().build(0).encode(),
                 reindex_cols: key_cols,
@@ -542,7 +545,8 @@ mod tests {
             (4, 5, PORT_IN),
         ];
         let loaded = compiler::loaded_for_test(nodes, edges);
-        ViewMeta::from_loaded(&loaded, &compiler::ExtTables::default())
+        let facts = compiler::CircuitFacts::derive(&loaded, &compiler::ExtTables::default()).expect("fixture routes");
+        ViewMeta::from_facts(facts)
     }
 
     fn pure_range(n_eq: u8) -> JoinKind {

@@ -3186,3 +3186,26 @@ fn the_encoder_reaches_every_opcode_the_decoder_accepts() {
         "VARIANT_COUNT is behind the variant list",
     );
 }
+
+#[test]
+fn test_sequential_copy_projection() {
+    // num_regs covers the largest register index in the synthetic programs
+    // below so LogicalProgram::new's register-bounds assert passes; this test
+    // exercises sequential_copy_base, not register limits.
+    let make = |instrs: Vec<LogicalInstr>| LogicalProgram::new(instrs, 16, 0, vec![]);
+    let copy = |src_col: u32, out: u32| LogicalInstr::CopyCol { src_col, out };
+    // src 1,2 → dst 0,1: base = 1.
+    assert_eq!(make(vec![copy(1, 0), copy(2, 1)]).sequential_copy_base(), Some(1));
+    // sources not sequential (2, then 1)
+    assert_eq!(make(vec![copy(2, 0), copy(1, 1)]).sequential_copy_base(), None);
+    // a non-COPY_COL instruction breaks the block copy
+    assert_eq!(
+        make(vec![copy(1, 0), LogicalInstr::LoadColInt { dst: 9, col: 2 }]).sequential_copy_base(),
+        None
+    );
+    assert_eq!(make(vec![]).sequential_copy_base(), None); // empty
+                                                           // Sequential sources but destinations swapped (1, 0) — a permutation, not an identity.
+    assert_eq!(make(vec![copy(1, 1), copy(2, 0)]).sequential_copy_base(), None);
+    // Compound PK (k = 2): finalize copies columns 2, 3 → destinations 0, 1.
+    assert_eq!(make(vec![copy(2, 0), copy(3, 1)]).sequential_copy_base(), Some(2));
+}

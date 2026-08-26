@@ -1,25 +1,19 @@
-//! Annotation + optimization passes and the schema-construction helpers:
-//! co-partition analysis, distinct elision, and the join/reduce/map output
-//! schemas.
+//! What the compiler derives from a circuit besides its instructions:
+//! [`CircuitFacts`] — the routing, shape and scan-hint bundle the runtime reads
+//! off a view — plus the distinct elision the emitter consults and the promotion
+//! validators both of them lean on.
 
 use super::*;
 
-/// The node feeding `nid` on `port`, or `None` if there is no such input edge (a
-/// malformed circuit). Every "who produces this operand" question in the
-/// compiler resolves through this one lookup.
-pub(super) fn input_on_port(loaded: &LoadedCircuit, nid: i32, port: i32) -> Option<i32> {
-    loaded
-        .incoming
-        .get(&nid)
-        .and_then(|ins| ins.iter().find(|&&(_, p)| p == port))
-        .map(|&(src, _)| src)
-}
-
-/// A view's join/group scatter routing: both projections of ONE walk over the
-/// circuit's `ScanDelta` nodes. They answer different questions about the same
-/// fact — the distinct `ScatterKey` sequences each source's scans feed — and
-/// deriving them apart let them disagree.
-pub(crate) struct ScatterRouting {
+/// Everything the runtime needs to know about a view's circuit that is not the
+/// executable plan: its routing, its shape, and its source scan's access hint.
+///
+/// One struct with one producer because these are projections of one circuit, and
+/// deriving them apart let them disagree — the master derives the relay's key in
+/// its process while the worker derives the scatter set in its own. Anything
+/// order-sensitive is therefore read off `loaded.ordered` and never off `nodes`,
+/// whose iteration order differs per process.
+pub(crate) struct CircuitFacts {
     /// source table id → the one key the master relay may pack and route that
     /// source's delta by, or `None` when its scans feed several distinct keys:
     /// no single pack key then co-partitions with the trace sides, and the relay
@@ -30,79 +24,124 @@ pub(crate) struct ScatterRouting {
     /// less those whose native distribution already aligns with the key (or
     /// whose partner is replicated, making the exchange unnecessary either way).
     pub scatter_sources: FxHashSet<i64>,
+    /// The sink-nearest `ExchangeShard`'s columns — the routing key of every
+    /// source that carries no reindex key of its own — and `None` when the circuit
+    /// carries no `ExchangeShard` at all. The two states are distinct: an ungrouped
+    /// global aggregate shards on `∅`, a real exchange that funnels every row onto
+    /// `worker_for_key(V₀)`.
+    pub shard_cols: Option<Vec<u32>>,
+    /// `Some(n_eq)` iff the view is a non-equi (range / band) join.
+    pub range_join_n_eq: Option<u8>,
+    /// The circuit carries a `Join` node.
+    pub has_join: bool,
+    /// The output `ExchangeShard` is a proven no-op, so the output IPC is elided.
+    pub skips_exchange: bool,
+    /// The `(source table id, secondary-index range)` the planner pushed onto the
+    /// primary source's `ScanDelta`.
+    pub source_bound: Option<(i64, gnitz_wire::ScanBound)>,
 }
 
-/// Derive a view's [`ScatterRouting`].
-///
-/// Walks `loaded.ordered` — total over `nodes`, else `topo_sorted` would have
-/// returned `Cycle` — and NOT `loaded.nodes`, whose `RandomState` iteration order
-/// differs per process: the master derives `keys` in its process while the worker
-/// derives `scatter_sources` in its own, so a per-process order could route the
-/// two differently.
-pub(crate) fn compute_scatter_routing(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> ScatterRouting {
-    // source → the distinct sequences its scans feed. Deduping ACROSS scan nodes
-    // mirrors the within-node dedup in `scatter_key_of_scan`: two scans on one
-    // source carrying the same key must still resolve to one sequence, or the
-    // pack-key gate below would newly refuse a round that routes fine today.
-    let mut seqs: HashMap<i64, Vec<Vec<(u32, u8)>>> = HashMap::new();
-    for &nid in &loaded.ordered {
-        let Some(gnitz_wire::OpNode::ScanDelta { source, .. }) = loaded.nodes.get(&nid) else {
-            continue;
-        };
-        let node_seqs = load::scatter_key_of_scan(loaded, nid).0;
-        // WITHIN one scan the `ScatterKey` role filter and the identical-sequence
-        // dedup appear to hold every live circuit to one sequence, so a second one
-        // means the shape became constructible and wants a real plan, not a silent
-        // refusal. Across scan nodes it is only a tripwire, not a rule — see the
-        // pack-key projection below.
-        debug_assert!(
-            node_seqs.len() <= 1,
-            "scan {nid} feeds {} distinct scatter keys; no single pack key routes it",
-            node_seqs.len(),
-        );
-        let acc = seqs.entry(*source as i64).or_default();
-        for seq in node_seqs {
-            if !acc.contains(&seq) {
-                acc.push(seq);
+impl CircuitFacts {
+    /// Derive every fact, in the one place they are derived.
+    ///
+    /// `ext_tables` is what the routing half needs and the circuit alone cannot
+    /// supply: co-partitioning and the output-shard elision both test a shard key
+    /// against a *source relation's* distribution prefix.
+    ///
+    /// `Err` when a source's reindex maps carry no route key: its delta cannot be
+    /// scattered. Returned rather than carried as a field, because a field is a
+    /// verdict every consumer has to remember to read.
+    pub(crate) fn derive(loaded: &LoadedCircuit, ext_tables: &dyn SchemaSource) -> Result<CircuitFacts, CompileError> {
+        // source → the distinct sequences its scans feed. Deduping ACROSS scan
+        // nodes mirrors the within-node dedup in `scatter_key_of_scan`: two scans
+        // on one source carrying the same key must still resolve to one sequence,
+        // or the pack-key gate below would newly refuse a round that routes fine
+        // today.
+        let mut seqs: HashMap<i64, Vec<Vec<(u32, u8)>>> = HashMap::new();
+        for &nid in &loaded.ordered {
+            let Some(gnitz_wire::OpNode::ScanDelta { source, .. }) = loaded.nodes.get(&nid) else {
+                continue;
+            };
+            let (node_seqs, orphaned) = load::scatter_key_of_scan(loaded, nid);
+            // A scan reaching reindex maps of which none is a `ScatterKey` is what
+            // a planner call site that forgot its role produces — the likelier of
+            // the two possible mistakes, and silently-unscattered rows if honoured.
+            // Deliberately not conditioned on the circuit carrying a `Join`: a
+            // GROUP BY or PK-redistribution circuit's group reindex is equally
+            // load-bearing for routing.
+            if orphaned {
+                return Err(CompileError::Rejected(
+                    "a source's reindex maps carry no route key, so its delta cannot be scattered",
+                ));
+            }
+            // WITHIN one scan the `ScatterKey` role filter and the
+            // identical-sequence dedup appear to hold every live circuit to one
+            // sequence, so a second one means the shape became constructible and
+            // wants a real plan, not a silent refusal. Across scan nodes it is only
+            // a tripwire, not a rule — see the pack-key projection below.
+            debug_assert!(
+                node_seqs.len() <= 1,
+                "scan {nid} feeds {} distinct scatter keys; no single pack key routes it",
+                node_seqs.len(),
+            );
+            let acc = seqs.entry(*source as i64).or_default();
+            for seq in node_seqs {
+                if !acc.contains(&seq) {
+                    acc.push(seq);
+                }
             }
         }
+        seqs.retain(|_, s| !s.is_empty());
+
+        // The co-partition prefix test wants the sequences CONCATENATED, and wants
+        // a conservative refusal when a source carries more than one key: the
+        // concatenation matches no source's distribution prefix, so that source
+        // correctly goes through the exchange.
+        let concatenated: JoinShardMap = seqs
+            .iter()
+            .map(|(&tid, s)| (tid, s.iter().flatten().copied().collect()))
+            .collect();
+        let co_partitioned = compute_co_partitioned(&concatenated, ext_tables);
+        let scatter_sources = concatenated
+            .into_keys()
+            .filter(|tid| !co_partitioned.contains(tid))
+            .collect();
+
+        // The relay's pack key wants ONE sequence or a refusal, never the
+        // concatenation: with sequences `a` and `b` the delta would scatter by
+        // `pack(a ‖ b)` while each trace side is keyed by `pack(a)` or `pack(b)`,
+        // so the two would never co-partition and matches would drop silently.
+        // Refusing is the only safe answer, and it is the relay's to report.
+        //
+        // Two scans of one source carrying DIFFERENT keys is not SQL-reachable —
+        // the planner wraps a repeated tid in a pass-through segment before
+        // lowering a join — but a hand-built wire circuit can express it, and
+        // refusing is what this walk owes it. Deliberately NOT a `debug_assert`,
+        // unlike the per-scan tripwire above.
+        let keys = seqs
+            .into_iter()
+            .map(|(tid, mut s)| (tid, (s.len() == 1).then(|| s.pop().expect("len == 1"))))
+            .collect();
+
+        let shard = load::output_exchange_shard(loaded);
+        Ok(CircuitFacts {
+            keys,
+            scatter_sources,
+            skips_exchange: shard
+                .as_ref()
+                .is_some_and(|(enid, cols)| skips_output_exchange(loaded, *enid, cols, ext_tables)),
+            shard_cols: shard.map(|(_, cols)| cols),
+            range_join_n_eq: load::circuit_range_join_n_eq(loaded),
+            has_join: loaded
+                .nodes
+                .values()
+                .any(|op| matches!(op, gnitz_wire::OpNode::Join(_))),
+            source_bound: load::circuit_source_bound(loaded),
+        })
     }
-    seqs.retain(|_, s| !s.is_empty());
-
-    // The co-partition prefix test wants the sequences CONCATENATED, and wants a
-    // conservative refusal when a source carries more than one key: the
-    // concatenation matches no source's distribution prefix, so that source
-    // correctly goes through the exchange.
-    let concatenated: JoinShardMap = seqs
-        .iter()
-        .map(|(&tid, s)| (tid, s.iter().flatten().copied().collect()))
-        .collect();
-    let co_partitioned = compute_co_partitioned(&concatenated, ext_tables);
-    let scatter_sources = concatenated
-        .into_keys()
-        .filter(|tid| !co_partitioned.contains(tid))
-        .collect();
-
-    // The relay's pack key wants ONE sequence or a refusal, never the
-    // concatenation: with sequences `a` and `b` the delta would scatter by
-    // `pack(a ‖ b)` while each trace side is keyed by `pack(a)` or `pack(b)`, so
-    // the two would never co-partition and matches would drop silently. Refusing
-    // is the only safe answer, and it is the relay's to report.
-    //
-    // Two scans of one source carrying DIFFERENT keys is not SQL-reachable — the
-    // planner wraps a repeated tid in a pass-through segment before lowering a
-    // join — but a hand-built wire circuit can express it, and refusing is what
-    // this walk owes it. Deliberately NOT a `debug_assert`, unlike the per-scan
-    // tripwire above.
-    let keys = seqs
-        .into_iter()
-        .map(|(tid, mut s)| (tid, (s.len() == 1).then(|| s.pop().expect("len == 1"))))
-        .collect();
-
-    ScatterRouting { keys, scatter_sources }
 }
 
-pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: &ExtTables) -> HashSet<i64> {
+pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: &dyn SchemaSource) -> HashSet<i64> {
     // Replication skip, computed once for the whole join: if ANY participating
     // source is replicated, EVERY participant skips its exchange. This deliberately
     // does NOT widen `shard_cols_match_dist_key` (the pure prefix predicate also
@@ -116,14 +155,12 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
     //     dim copy, so no exchange is needed on either side. This is the case
     //     hash co-partitioning cannot serve: the fact need not be distributed by
     //     the join key, so one fact can join many replicated dims.
-    let any_replicated = join_shard_map.keys().any(|tid| {
-        ext_tables
-            .get(tid)
-            .is_some_and(|schema| schema.placement().is_replicated())
-    });
+    let any_replicated = join_shard_map
+        .keys()
+        .any(|&tid| ext_tables.schema_of(tid).is_some_and(|s| s.placement().is_replicated()));
     let mut co_partitioned = HashSet::new();
     for (&tid, cols) in join_shard_map {
-        let Some(ext_schema) = ext_tables.get(&tid) else {
+        let Some(ext_schema) = ext_tables.schema_of(tid) else {
             continue;
         };
 
@@ -153,9 +190,9 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
     co_partitioned
 }
 
-/// True iff the view's output `ExchangeShard` is a no-op (every row already on
-/// the worker owning its distribution key) and the output IPC can be skipped:
-/// the shard reads a scan — through any Filter chain — whose distribution prefix
+/// True iff the view's output `ExchangeShard` at `enid` is a no-op (every row
+/// already on the worker owning its distribution key) and the output IPC can be
+/// skipped: the shard reads a scan — through any Filter chain — whose distribution prefix
 /// (`pk_indices[..k]`) is exactly the shard key, AND the pipeline's output
 /// reproduces that shard key as its own route key.
 ///
@@ -179,15 +216,12 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
 /// shard key *is* the group key (`reduce_multi` hands one column slice to both),
 /// and `ReduceOutKey` alone would be the wrong discriminator anyway — a signed or
 /// narrow single prefix column keys `SyntheticFold` and is nonetheless correct.
-pub(crate) fn compute_skips_exchange(loaded: &LoadedCircuit, ext_tables: &ExtTables) -> bool {
-    let Some((enid, shard_cols)) = super::output_exchange_shard(loaded) else {
-        return false;
-    };
+fn skips_output_exchange(loaded: &LoadedCircuit, enid: i32, shard_cols: &[u32], ext_tables: &dyn SchemaSource) -> bool {
     let Some(tid) = scan_tid_through_filters(loaded, enid) else {
         return false;
     };
-    ext_tables.get(&tid).is_some_and(|schema| {
-        schema.shard_cols_match_dist_key(&shard_cols)
+    ext_tables.schema_of(tid).is_some_and(|schema| {
+        schema.shard_cols_match_dist_key(shard_cols)
             && (shard_cols.len() <= 1 || shard_cols.len() == schema.pk_indices().len())
     })
 }
@@ -205,29 +239,30 @@ pub(super) fn compute_skip_nodes(loaded: &LoadedCircuit) -> HashSet<i32> {
     let mut distinct_at: HashSet<i32> = HashSet::new();
     let mut skip = HashSet::new();
     for &nid in &loaded.ordered {
-        let input_distinct = input_on_port(loaded, nid, PORT_IN).is_some_and(|src| distinct_at.contains(&src));
+        // Every arm below is a unary operator, so its one input is where the
+        // property it preserves or establishes comes from.
+        let input_distinct = |nid: i32| distinct_at.contains(&loaded.inputs(nid).unary());
         match loaded.nodes.get(&nid) {
             Some(gnitz_wire::OpNode::Reduce { .. }) => {
                 distinct_at.insert(nid);
             }
             Some(gnitz_wire::OpNode::Distinct) => {
-                if input_distinct {
+                if input_distinct(nid) {
                     skip.insert(nid);
                 }
                 distinct_at.insert(nid);
             }
             Some(gnitz_wire::OpNode::Filter(_)) => {
-                if input_distinct {
+                if input_distinct(nid) {
                     distinct_at.insert(nid);
                 }
             }
             Some(gnitz_wire::OpNode::Map(mk)) => {
-                let has_reindex = match mk {
-                    gnitz_wire::MapKind::Expression { reindex_cols, .. } => !reindex_cols.is_empty(),
-                    gnitz_wire::MapKind::HashRow(..) => true,
-                    _ => false,
-                };
-                if !has_reindex && input_distinct {
+                let re_keys = matches!(
+                    mk,
+                    gnitz_wire::MapKind::Reindex { .. } | gnitz_wire::MapKind::HashRow(..)
+                );
+                if !re_keys && input_distinct(nid) {
                     distinct_at.insert(nid);
                 }
             }
@@ -245,7 +280,7 @@ pub(super) fn compute_skip_nodes(loaded: &LoadedCircuit) -> HashSet<i32> {
 /// accepted. Shared body of [`key_promotion_invalid`] and
 /// [`payload_promotion_invalid`], which differ only in `valid`.
 fn promotion_invalid(
-    cols: &[u16],
+    cols: &[u32],
     target_tcs: &[u8],
     schema: &SchemaDescriptor,
     valid: impl Fn(u8, u8) -> bool,
@@ -266,7 +301,7 @@ fn promotion_invalid(
 /// read back (a `#[test]` pins the idempotency). It also screens PK-ineligible
 /// targets for free, since the function only ever yields PK-eligible types, and
 /// admits the 16-byte OPK targets the key region supports.
-pub(super) fn key_promotion_invalid(cols: &[u16], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
+pub(super) fn key_promotion_invalid(cols: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
     promotion_invalid(cols, target_tcs, schema, |src, t| {
         gnitz_wire::join_key_common_type(src, t) == Some(t)
     })
@@ -276,17 +311,349 @@ pub(super) fn key_promotion_invalid(cols: &[u16], target_tcs: &[u8], schema: &Sc
 /// promotion the copy kernel supports. Identical to the rule `check_copy_types`
 /// holds a COPY_COL destination to — the HashRow payload widen is that same
 /// kernel — so it is narrower than [`key_promotion_invalid`], not a mode of it.
-pub(super) fn payload_promotion_invalid(cols: &[u16], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
+pub(super) fn payload_promotion_invalid(cols: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
     promotion_invalid(cols, target_tcs, schema, gnitz_wire::is_widening_promotion)
 }
 
-pub(super) fn agg_value_idx_eligible(tc: TypeCode) -> bool {
-    // The exact order-encodable AVI value set: a narrow (<=8B) fixed int or float.
-    // Reuse the canonical predicates instead of a negative variant allow-list, so a
-    // future TypeCode is AVI-ineligible by default until explicitly classified.
-    // Load-bearing: the excluded types are exactly what keep the `unreachable!` arms
-    // of `encode_ordered`/`decode_ordered` (ops/util.rs) unreachable — change the
-    // *form* of this predicate freely, but never widen its accepted set without
-    // updating those arms.
-    is_fixed_int(tc as u8) || tc.is_float()
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{type_code, SchemaColumn};
+
+    #[test]
+    fn test_compute_co_partitioned_strict_full_pk_sequence() {
+        // Compound PK (a, b) at columns 0, 1; column 2 is payload.
+        let compound = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        );
+        let ext: ExtTables = HashMap::from([(7, compound)]);
+        let co = |cols: Vec<(u32, u8)>| {
+            let mut m = HashMap::new();
+            m.insert(7i64, cols);
+            compute_co_partitioned(&m, &ext).contains(&7)
+        };
+        // Only the exact PK sequence in schema order co-partitions.
+        assert!(
+            co(vec![(0, 0), (1, 0)]),
+            "shard [pk0, pk1] equals pk_indices() → co-partitioned"
+        );
+        assert!(!co(vec![(0, 0)]), "shard [pk0] alone is not the full PK");
+        assert!(!co(vec![(1, 0)]), "shard [pk1] alone is not the full PK");
+        assert!(!co(vec![(1, 0), (0, 0)]), "permuted [pk1, pk0] != pk_indices() order");
+        // A promoted key (non-zero carried tc) never co-partitions: native PK
+        // partitions are at the source width, not the T-wide trace key.
+        assert!(
+            !co(vec![(0, type_code::I64), (1, 0)]),
+            "a promoted PK slot must go through the exchange"
+        );
+
+        // Single-PK source: [pk] stays co-partitioned (no regression).
+        let single = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let ext1: ExtTables = HashMap::from([(9, single)]);
+        let mut m = HashMap::new();
+        m.insert(9i64, vec![(0, 0)]);
+        assert!(
+            compute_co_partitioned(&m, &ext1).contains(&9),
+            "single-PK shard [pk] stays co-partitioned"
+        );
+    }
+
+    #[test]
+    fn test_compute_co_partitioned_replicated() {
+        // Two single-PK (U64) join sides; the join key is a NON-PK payload column
+        // (col 1), so neither side's shard key matches its distribution prefix —
+        // the only reason to skip the exchange is replication.
+        const COLS: [SchemaColumn; 2] = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ];
+        let base = || SchemaDescriptor::new(&COLS, &[0]);
+        let replicated = SchemaDescriptor::new_with_placement(&COLS, &[0], crate::schema::Placement::Replicated);
+        let join_on_payload = || {
+            let mut m = HashMap::new();
+            m.insert(7i64, vec![(1u32, 0u8)]); // dim  shards on payload col 1
+            m.insert(8i64, vec![(1u32, 0u8)]); // fact shards on payload col 1
+            m
+        };
+
+        // partitioned ⋈ partitioned on a non-PK key: neither side skips.
+        let ext_pp: ExtTables = HashMap::from([(7, base()), (8, base())]);
+        let co = compute_co_partitioned(&join_on_payload(), &ext_pp);
+        assert!(
+            !co.contains(&7) && !co.contains(&8),
+            "two partitioned sides on a non-PK key both go through the exchange"
+        );
+
+        // partitioned fact ⋈ REPLICATED dim: BOTH skip — the dim because it is
+        // replicated, the fact because its join partner is replicated (it stays in
+        // its own PK partitioning and joins the full local dim copy).
+        let ext_pr: ExtTables = HashMap::from([(7, replicated), (8, base())]);
+        let co = compute_co_partitioned(&join_on_payload(), &ext_pr);
+        assert!(co.contains(&7), "a replicated source always skips its exchange");
+        assert!(
+            co.contains(&8),
+            "a partitioned fact skips when its partner is replicated"
+        );
+
+        // replicated ⋈ replicated: both skip (output is replicated; single-sourced on read).
+        let ext_rr: ExtTables = HashMap::from([(7, replicated), (8, replicated)]);
+        let co = compute_co_partitioned(&join_on_payload(), &ext_rr);
+        assert!(
+            co.contains(&7) && co.contains(&8),
+            "replicated ⋈ replicated: both sides skip"
+        );
+
+        // A replicated source skips even with a promoted (non-zero tc) key: the
+        // write broadcast already placed its full trace on every worker, so the
+        // tc-promotion exchange gate (which blocks a partitioned source) does not apply.
+        let ext_r: ExtTables = HashMap::from([(7, replicated)]);
+        let mut promoted = HashMap::new();
+        promoted.insert(7i64, vec![(0u32, type_code::I64)]);
+        assert!(
+            compute_co_partitioned(&promoted, &ext_r).contains(&7),
+            "replicated source skips regardless of carried type-promotion"
+        );
+    }
+
+    // ── compute_scatter_routing covers ScanDelta (SQL-planner join pattern) ──
+
+    /// The routing walk must find ScanDelta → Map(reindex) chains.
+    #[test]
+    fn test_scatter_routing_scan_delta() {
+        use gnitz_wire::{MapKind, OpNode};
+
+        // Minimal two-sided SQL join circuit skeleton:
+        //   ScanDelta(left_tid=10) → Map(reindex_col=1) → Join → IntegrateSink
+        //   ScanDelta(right_tid=20) → Map(reindex_col=0) → Join
+        let dummy_blob = dummy_expr_blob();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, scan_delta(10));
+        nodes.insert(
+            1,
+            OpNode::Map(MapKind::Reindex {
+                program: dummy_blob.clone(),
+                reindex_cols: vec![1],
+                reindex_target_tcs: vec![],
+                role: gnitz_wire::ReindexRole::ScatterKey,
+            }),
+        );
+        nodes.insert(2, scan_delta(20));
+        nodes.insert(
+            3,
+            OpNode::Map(MapKind::Reindex {
+                program: dummy_blob,
+                reindex_cols: vec![0],
+                reindex_target_tcs: vec![],
+                role: gnitz_wire::ReindexRole::ScatterKey,
+            }),
+        );
+        nodes.insert(4, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(5, OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 1, PORT_IN),
+            (2, 3, PORT_IN),
+            (1, 4, PORT_IN_A),
+            (3, 4, PORT_TRACE),
+            (4, 5, PORT_IN),
+        ];
+        let loaded = loaded_for_test(nodes, edges);
+
+        let keys = CircuitFacts::derive(&loaded, &ExtTables::default()).unwrap().keys;
+
+        assert_eq!(
+            keys.get(&10),
+            Some(&Some(vec![(1, 0)])),
+            "left side (source 10) must map to reindex_col=1"
+        );
+        assert_eq!(
+            keys.get(&20),
+            Some(&Some(vec![(0, 0)])),
+            "right side (source 20) must map to reindex_col=0"
+        );
+    }
+
+    #[test]
+    fn test_scatter_routing_through_filter() {
+        use gnitz_wire::{MapKind, OpNode};
+        // ScanDelta(42) → Filter → Map(reindex_col=1) → Join → IntegrateSink.
+        // The reindex Map is two hops from the scan (a Filter sits between),
+        // so the one-hop lookup misses it; BFS through Filter must find it.
+        let dummy_blob = dummy_expr_blob();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, scan_delta(42));
+        nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
+        nodes.insert(
+            2,
+            OpNode::Map(MapKind::Reindex {
+                program: dummy_blob,
+                reindex_cols: vec![1],
+                reindex_target_tcs: vec![],
+                role: gnitz_wire::ReindexRole::ScatterKey,
+            }),
+        );
+        nodes.insert(3, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(4, OpNode::IntegrateSink);
+        nodes.insert(5, OpNode::IntegrateTrace);
+        let edges = vec![
+            (0, 1, PORT_IN), // ScanDelta → Filter
+            (1, 2, PORT_IN), // Filter → reindex Map
+            (2, 3, PORT_IN_A),
+            (2, 5, PORT_IN), // reindex Map → its own integral
+            (5, 3, PORT_TRACE),
+            (3, 4, PORT_IN),
+        ];
+        let loaded = loaded_for_test(nodes, edges);
+
+        let keys = CircuitFacts::derive(&loaded, &ExtTables::default()).unwrap().keys;
+        assert_eq!(
+            keys.get(&42),
+            Some(&Some(vec![(1, 0)])),
+            "ScanDelta → Filter → Map(reindex) must map source 42 to col 1"
+        );
+    }
+
+    /// Two `ScanDelta` nodes on ONE source with DIFFERENT scatter keys. Under the
+    /// old `loaded.nodes` walk, last-writer-wins over a per-process `RandomState`
+    /// order picked one of the two at random — and the master and the worker
+    /// derive their halves of the routing in separate processes. Accumulating
+    /// over `loaded.ordered` makes the answer the same everywhere: two sequences,
+    /// so no single pack key routes the source and the relay refuses.
+    #[test]
+    fn test_scatter_routing_two_keys_one_source_is_deterministic() {
+        use gnitz_wire::{MapKind, OpNode};
+
+        let dummy_blob = dummy_expr_blob();
+        let reindex = |col: u32, blob| {
+            OpNode::Map(MapKind::Reindex {
+                program: blob,
+                reindex_cols: vec![col],
+                reindex_target_tcs: vec![],
+                role: gnitz_wire::ReindexRole::ScatterKey,
+            })
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(0, scan_delta(10));
+        nodes.insert(1, reindex(1, dummy_blob.clone()));
+        nodes.insert(2, scan_delta(10));
+        nodes.insert(3, reindex(2, dummy_blob));
+        nodes.insert(4, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(5, OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 1, PORT_IN),
+            (2, 3, PORT_IN),
+            (1, 4, PORT_IN_A),
+            (3, 4, PORT_TRACE),
+            (4, 5, PORT_IN),
+        ];
+        let loaded = loaded_for_test(nodes, edges);
+
+        let keys = CircuitFacts::derive(&loaded, &ExtTables::default()).unwrap().keys;
+        assert_eq!(
+            keys.get(&10),
+            Some(&None),
+            "two distinct keys on one source must refuse, not pick one at random"
+        );
+    }
+
+    /// The same shape with the SAME key on both scans must still route. Today's
+    /// last-writer-wins resolves it to the one correct sequence, so a naive
+    /// accumulation that skipped the cross-node dedup would newly produce two
+    /// sequences and refuse a round that works — a regression the rewrite must
+    /// not introduce.
+    #[test]
+    fn test_scatter_routing_repeated_key_one_source_still_routes() {
+        use gnitz_wire::{MapKind, OpNode};
+
+        let dummy_blob = dummy_expr_blob();
+        let reindex = |blob| {
+            OpNode::Map(MapKind::Reindex {
+                program: blob,
+                reindex_cols: vec![1],
+                reindex_target_tcs: vec![],
+                role: gnitz_wire::ReindexRole::ScatterKey,
+            })
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(0, scan_delta(10));
+        nodes.insert(1, reindex(dummy_blob.clone()));
+        nodes.insert(2, scan_delta(10));
+        nodes.insert(3, reindex(dummy_blob));
+        nodes.insert(4, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(5, OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 1, PORT_IN),
+            (2, 3, PORT_IN),
+            (1, 4, PORT_IN_A),
+            (3, 4, PORT_TRACE),
+            (4, 5, PORT_IN),
+        ];
+        let loaded = loaded_for_test(nodes, edges);
+
+        let keys = CircuitFacts::derive(&loaded, &ExtTables::default()).unwrap().keys;
+        assert_eq!(
+            keys.get(&10),
+            Some(&Some(vec![(1, 0)])),
+            "one key reached twice is still one key"
+        );
+    }
+
+    /// A source whose path to the join carries no reindex Map stays out of the map.
+    #[test]
+    fn test_scatter_routing_unreindexed_trace_side_absent() {
+        use gnitz_wire::{MapKind, OpNode};
+
+        let dummy_blob = dummy_expr_blob();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, scan_delta(10));
+        nodes.insert(1, scan_delta(20));
+        nodes.insert(
+            2,
+            OpNode::Map(MapKind::Reindex {
+                program: dummy_blob,
+                reindex_cols: vec![2],
+                reindex_target_tcs: vec![],
+                role: gnitz_wire::ReindexRole::ScatterKey,
+            }),
+        );
+        nodes.insert(3, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(4, OpNode::IntegrateSink);
+        nodes.insert(5, OpNode::IntegrateTrace);
+        let edges = vec![
+            (0, 2, PORT_IN),    // ScanDelta → reindex Map
+            (1, 5, PORT_IN),    // ScanDelta(20) → IntegrateTrace (no reindex)
+            (5, 3, PORT_TRACE), // trace → join trace port
+            (2, 3, PORT_IN_A),
+            (3, 4, PORT_IN),
+        ];
+        let loaded = loaded_for_test(nodes, edges);
+
+        let map = CircuitFacts::derive(&loaded, &ExtTables::default()).unwrap().keys;
+
+        // ScanDelta(10) → Map(reindex_col=2) must be found.
+        assert_eq!(
+            map.get(&10),
+            Some(&Some(vec![(2, 0)])),
+            "ScanDelta source must be in the routing map"
+        );
+        // Source 20 has no downstream reindex Map — must NOT appear.
+        assert!(
+            !map.contains_key(&20),
+            "a source with no reindex Map must not be in the routing map"
+        );
+    }
 }

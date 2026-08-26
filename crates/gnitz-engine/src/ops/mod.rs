@@ -42,3 +42,4 @@ pub(crate) use join::{op_join_delta_trace, JoinProbe, RangeProbe};
 pub(crate) use linear::{op_filter, op_map, op_negate, op_null_extend, op_union, ReindexSpec};
 pub(crate) use reduce::{build_reduce_output_schema, op_reduce, AdhocFold, AggDescriptor, AviHistory, ReducePlan};
 pub(crate) use reindex::ReindexPacker;
+pub(crate) use util::agg_value_idx_eligible;

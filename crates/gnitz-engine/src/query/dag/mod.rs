@@ -215,6 +215,14 @@ pub(crate) struct RelationStores {
     pub delta: Option<Box<DeltaFeed>>,
 }
 
+/// The registry answers the compiler's schema lookups in place — the compiler
+/// names only its own trait, so this is the one edge from `dag` down to it.
+impl compiler::SchemaSource for FxHashMap<i64, TableEntry> {
+    fn schema_of(&self, tid: i64) -> Option<SchemaDescriptor> {
+        self.get(&tid).map(|te| te.schema)
+    }
+}
+
 pub(crate) struct TableEntry {
     pub handle: StoreHandle,
     /// The delta store, when this process holds one — `None` on the post-fork
@@ -521,8 +529,12 @@ impl DagEngine {
             return Ok(true);
         }
         match self.compile_view_internal(view_id)? {
-            Some(plan) => {
-                self.cache.insert(view_id, plan);
+            Some(compiler::CompiledView { output, facts }) => {
+                // The compile already walked this circuit, so seed the memo from
+                // what it derived rather than let the first metadata touch read
+                // the same three system tables again.
+                self.meta.insert(view_id, Rc::new(ViewMeta::from_facts(facts)));
+                self.cache.insert(view_id, output);
                 Ok(true)
             }
             None => Ok(false),
@@ -540,11 +552,6 @@ impl DagEngine {
             .map(|(_, b)| b)
     }
 
-    /// The registered relations visible to a compile: table id → schema.
-    fn ext_tables(&self) -> compiler::ExtTables {
-        self.tables.iter().map(|(&tid, te)| (tid, te.schema)).collect()
-    }
-
     /// Read `view_id`'s circuit out of the system tables and compile it, homing
     /// every scratch child under `dir`. The directory is a parameter and not read
     /// off `entry` because the pre-flight compiles into a throwaway root.
@@ -559,7 +566,7 @@ impl DagEngine {
         view_id: i64,
         dir: &str,
         entry: &TableEntry,
-    ) -> Result<CompileOutput, compiler::CompileError> {
+    ) -> Result<compiler::CompiledView, compiler::CompileError> {
         let site = compiler::ViewSite {
             dir,
             id: view_id as u64,
@@ -568,7 +575,6 @@ impl DagEngine {
                 .as_owned()
                 .map_or(RecoverySource::Rederive { resume_at: None }, Table::recovery_source),
         };
-        let ext_tables = self.ext_tables();
         // The compiler layer sees only the circuit system tables, never `VIEW_TAB`,
         // so it cannot derive whether the view is capacity-bounded.
         unsafe {
@@ -576,7 +582,7 @@ impl DagEngine {
                 site,
                 self.sys,
                 &entry.schema,
-                &ext_tables,
+                &self.tables,
                 entry.capacity_bytes.is_some(),
             )
         }
@@ -620,7 +626,7 @@ impl DagEngine {
     /// had. An `Err` is therefore unrecoverable for a server: the alternative to
     /// aborting is a view that has stopped integrating while still answering reads
     /// with stale rows. The message names the causes.
-    fn compile_view_internal(&self, view_id: i64) -> Result<Option<CompileOutput>, String> {
+    fn compile_view_internal(&self, view_id: i64) -> Result<Option<compiler::CompiledView>, String> {
         let Some(entry) = self.tables.get(&view_id) else {
             return Ok(None);
         };
