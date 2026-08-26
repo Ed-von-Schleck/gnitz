@@ -32,12 +32,13 @@
 //! > generic one is re-instantiated in the *consuming* crate, at that crate's
 //! > opt-level — 0 for gnitz-engine in dev.
 //!
-//! `nm` on the debug server shows `eval_batch<B: BatchView>` there as a local
-//! (`t`) symbol, ~80 KB — the opt-0 copy, not the rlib's. So moving a body out
-//! of a generic function into a non-generic one *improves* the debug build, and
-//! the reverse costs. Anything reached from another crate per row is annotated
+//! So moving a body out of a generic function into a non-generic one *improves*
+//! the debug build, and the reverse costs. `nm` on the debug server is what
+//! shows which: a generic body appears there as a local (`t`) symbol, once per
+//! consuming crate. Anything reached from another crate per row is annotated
 //! `#[inline(always)]` regardless, since its caller is an opt-0 codegen unit:
-//! [`ColumnLocator`]'s methods, [`MorselOut`]'s, `RowSource::row_count`.
+//! [`ColumnLocator`]'s methods, [`MorselOut`]'s, `RowSource::row_count`, and the
+//! generic drive methods' own preamble.
 //!
 //! Judge an inlining or kernel change on retired instructions
 //! (`perf stat -e instructions:u`), never on wall-clock: timings on the

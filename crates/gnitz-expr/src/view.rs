@@ -11,9 +11,11 @@
 /// nothing more. Every source is a whole multi-row batch, which is why
 /// [`Self::row_count`] sits here and not one level up.
 ///
-/// Static dispatch only — never take `&dyn RowSource`; it would put a vtable on
-/// the per-row locator paths. (Convention: the trait is dyn-compatible, nothing
-/// enforces this.)
+/// Static dispatch only wherever a *cell* is read per row: a `&dyn RowSource`
+/// there would put an indirect call on every [`crate::ColumnLocator`] read.
+/// A whole-batch consumer that resolves the regions once per morsel is not one
+/// of those, and [`crate::Evaluator`]'s kernels take `&dyn BatchView`.
+/// (Convention: the trait is dyn-compatible, nothing enforces this.)
 ///
 /// All lifetimes are tied to `&self`, NOT decoupled — a client adapter owns the
 /// buffers it materializes and can only lend them for `&self`.

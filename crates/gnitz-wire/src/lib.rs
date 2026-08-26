@@ -185,7 +185,10 @@ le_scalar!(u8, i8, u16, i16, u32, i32, u64, i64, u128, i128);
 /// little-endian target the native layout *is* the wire/shard layout, so this is
 /// the zero-copy way to hand a typed column (weights, null words, `u128` cells)
 /// to the byte-oriented region APIs.
-#[inline]
+/// `#[inline(always)]`: `gnitz-wire` has no dev opt-level override, and the
+/// per-morsel callers in gnitz-expr are themselves `#[inline(always)]` for
+/// opt-0 consumers, where only the always-inline pass runs.
+#[inline(always)]
 pub fn as_le_bytes<T: LeScalar>(v: &[T]) -> &[u8] {
     // SAFETY: `size_of_val(v)` initialized bytes borrowed from `v`, consumed as
     // opaque bytes and never as typed values.

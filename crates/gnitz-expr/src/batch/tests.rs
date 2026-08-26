@@ -5,13 +5,19 @@
 
 use gnitz_wire::{type_code, FixedInt};
 
-use super::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
+use super::{eval_batch, with_str_bufs, EvalScratch, MAX_STR_COL_BUFS, MORSEL, NULL_WORDS_PER_REG};
 use crate::program::IntUnaryOp;
 use crate::test_support::{
     decode_f64, encode_f64, filter_prog, make_int_row, make_int_view, make_n_col_view, passing_rows, scalar_prog,
     schema_pk_ints, TestSchema, TestView,
 };
 use crate::{CmpOp, LogicalInstr, ResolvedProgram, RowSource};
+
+/// `eval_batch` with the string-buffer table the drive methods assemble. These
+/// tests sit below `Evaluator`, so they build the same preamble it does.
+fn drive(prog: &ResolvedProgram, mb: &dyn crate::BatchView, start: usize, m: usize, scratch: &mut EvalScratch) {
+    with_str_bufs(prog, mb, |bufs| eval_batch(prog, mb, bufs, start, m, scratch));
+}
 
 /// Resolve a test program down to the raw evaluable form the kernel tests drive
 /// `eval_batch` with. The `Evaluator` wrapper is the *caller's* surface; these
@@ -86,7 +92,7 @@ fn test_eval_batch_add() {
     let prog = resolved(&schema, instrs, 3, 2);
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, 3);
-    eval_batch(&prog, &mb, 0, 3, &mut scratch);
+    drive(&prog, &mb, 0, 3, &mut scratch);
 
     // row 0: pk=1, val=10, sum=11
     assert_eq!(scratch.regs[2 * MORSEL + 0], 11);
@@ -149,7 +155,7 @@ fn select_boundary_sweep() {
         for morsel_start in (0..n).step_by(MORSEL) {
             let m = MORSEL.min(n - morsel_start);
             scratch.ensure_capacity(&prog, m);
-            eval_batch(&prog, &mb, morsel_start, m, &mut scratch);
+            drive(&prog, &mb, morsel_start, m, &mut scratch);
             let r = 3usize; // result_reg
             for i in 0..m {
                 let row = morsel_start + i;
@@ -202,7 +208,7 @@ fn select_no_nulls_fast_arm() {
     );
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, n);
-    eval_batch(&prog, &mb, 0, n, &mut scratch);
+    drive(&prog, &mb, 0, n, &mut scratch);
     for row in 0..n {
         let expected = if row % 2 == 1 {
             1000 + row as i64
@@ -255,7 +261,7 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
 
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, 1);
-    eval_batch(&prog, &mb, 0, 1, &mut scratch);
+    drive(&prog, &mb, 0, 1, &mut scratch);
     // r5 lives in regs as 0/1; r7 = r5 + 0 = 1.
     assert_eq!(
         scratch.regs[5 * MORSEL],
@@ -293,14 +299,14 @@ fn not_null_load_clears_a_previous_programs_null_bits() {
 
     let mut scratch = EvalScratch::new(&nullable_load);
     scratch.ensure_capacity(&nullable_load, 0);
-    eval_batch(&nullable_load, &mb, 0, m, &mut scratch);
+    drive(&nullable_load, &mb, 0, m, &mut scratch);
     assert!(
         scratch.null_bits[0..words].iter().any(|&w| w != 0),
         "the nullable load must leave null bits behind for the next program to inherit",
     );
 
     scratch.ensure_capacity(&not_null_load, 0);
-    eval_batch(&not_null_load, &mb, 0, m, &mut scratch);
+    drive(&not_null_load, &mb, 0, m, &mut scratch);
     assert!(
         scratch.null_bits[0..words].iter().all(|&w| w == 0),
         "a NOT NULL load left a stale null bit behind: {:?}",
@@ -368,7 +374,7 @@ fn int_loads_cover_every_width_and_both_pk_signednesses() {
     let prog = resolved(&schema, instrs, cols.len() as u32, 0);
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, ROWS);
-    eval_batch(&prog, &mb, 0, ROWS, &mut scratch);
+    drive(&prog, &mb, 0, ROWS, &mut scratch);
 
     for (ci, col_expected) in expected.iter().enumerate() {
         for (r, want) in col_expected.iter().enumerate() {
@@ -399,7 +405,7 @@ fn run_unary_rows(vals: &[i64], nulls: &[bool], mk: impl Fn(u16, u16) -> Logical
     let prog = resolved(&schema, instrs, 2, 1);
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, n);
-    eval_batch(&prog, &view, 0, n, &mut scratch);
+    drive(&prog, &view, 0, n, &mut scratch);
     (0..n)
         .map(|i| {
             let v = scratch.regs[1 * MORSEL + i];
@@ -433,7 +439,7 @@ fn run_binary_rows(
     let prog = resolved(&schema, instrs, 3, 2);
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, n);
-    eval_batch(&prog, &view, 0, n, &mut scratch);
+    drive(&prog, &view, 0, n, &mut scratch);
     (0..n)
         .map(|i| {
             let v = scratch.regs[2 * MORSEL + i];
@@ -562,7 +568,7 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
     let prog = resolved(&schema, instrs, 2, 1);
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, n);
-    eval_batch(&prog, &view, 0, n, &mut scratch);
+    drive(&prog, &view, 0, n, &mut scratch);
     assert_eq!(scratch.regs[1 * MORSEL], 5);
     assert!((scratch.null_bits[1 * NULL_WORDS_PER_REG] & 1) == 0, "5 fits I64");
     assert!(
@@ -724,6 +730,67 @@ fn row_str(ev: &Evaluator, view: &TestView, i: usize) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let is_null = ev.eval_row_str(view, i, &mut out);
     (out, is_null)
+}
+
+/// A program past `MAX_STR_COL_BUFS` distinct string columns. The first
+/// `MAX_STR_COL_BUFS` address their column regions in place; the overflow column
+/// falls back to copying its inline cells into the arena. Both forms must read
+/// back the same bytes, which is the whole point of keeping the fallback.
+#[test]
+fn a_string_column_past_the_buffer_table_still_reads_its_own_bytes() {
+    const N: usize = MAX_STR_COL_BUFS + 1;
+    let schema = schema_pk_strings(N, false);
+    // Mixed widths: a short cell is addressed inline, a long one lands in the
+    // blob whichever buffer slot its column was given.
+    let vals: Vec<Vec<u8>> = (0..N)
+        .map(|c| {
+            if c % 2 == 0 {
+                format!("c{c}").into_bytes()
+            } else {
+                format!("column-{c}-is-past-twelve-bytes").into_bytes()
+            }
+        })
+        .collect();
+    let cells: Vec<&[u8]> = vals.iter().map(Vec::as_slice).collect();
+    let view = make_string_view(&schema, &[cells.as_slice()]);
+
+    let mut instrs: Vec<LogicalInstr> = (0..N)
+        .map(|c| LogicalInstr::LoadColStr {
+            dst: c as u16,
+            col: c as u32 + 1,
+        })
+        .collect();
+    // Fold left, so every column's view is resolved into the result.
+    let mut acc = 0u16;
+    for c in 1..N {
+        let dst = (N + c - 1) as u16;
+        instrs.push(LogicalInstr::StrConcat {
+            dst,
+            a: acc,
+            b: c as u16,
+            skip_null: false,
+        });
+        acc = dst;
+    }
+    let ev = scalar_prog(&schema, instrs, (2 * N - 1) as u32, acc as u32, vec![]);
+
+    assert_eq!(
+        ev.prog.str_cols.len(),
+        MAX_STR_COL_BUFS,
+        "the buffer table fills before the overflow column asks for a slot",
+    );
+    assert!(
+        matches!(
+            ev.prog.instrs[N - 1],
+            crate::Instr::LoadColStr {
+                buf: super::SRC_ARENA,
+                ..
+            }
+        ),
+        "the column past the table must load through the arena copy",
+    );
+
+    assert_eq!(row_str(&ev, &view, 0).0, vals.concat());
 }
 
 /// Values crossing the 12-byte inline/heap boundary, so every kernel is driven
@@ -1189,8 +1256,10 @@ fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
         &[(type_code::U64, false), (type_code::U64, true), (type_code::I64, true)],
         &[0],
     );
-    let view = make_int_view(&schema, &[(1, 0, &[u64::MAX as i64, i64::MIN])]);
-    let text = |col: u32| {
+    // Row 1 pins the digit loop's own edges: zero is the one magnitude with no
+    // significant digit, and -7 is the one-digit negative.
+    let view = make_int_view(&schema, &[(1, 0, &[u64::MAX as i64, i64::MIN]), (2, 0, &[0, -7])]);
+    let text = |col: u32, row: usize| {
         let ev = scalar_prog(
             &schema,
             vec![
@@ -1201,10 +1270,12 @@ fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
             1,
             vec![],
         );
-        row_str(&ev, &view, 0).0
+        row_str(&ev, &view, row).0
     };
-    assert_eq!(text(1), u64::MAX.to_string().as_bytes());
-    assert_eq!(text(2), i64::MIN.to_string().as_bytes());
+    assert_eq!(text(1, 0), u64::MAX.to_string().as_bytes());
+    assert_eq!(text(2, 0), i64::MIN.to_string().as_bytes());
+    assert_eq!(text(1, 1), b"0");
+    assert_eq!(text(2, 1), b"-7");
 }
 
 /// The magnitude switch is what bounds the output: Rust's positional `Display`

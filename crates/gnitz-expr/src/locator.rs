@@ -5,6 +5,8 @@
 //! gnitz-engine, which builds at opt-level 0 in dev, where only the
 //! always-inline pass runs.
 
+use std::cmp::Ordering;
+
 use crate::RowSource;
 
 /// Where a logical column's value physically lives in a row, resolved once from
@@ -125,6 +127,44 @@ impl ColumnLocator {
         match *self {
             ColumnLocator::Pk { .. } => gnitz_wire::decode_opk_i64(self.bytes(mb, row), fi),
             ColumnLocator::Payload { .. } => fi.decode_le_i64(self.bytes(mb, row)),
+        }
+    }
+
+    /// Order two rows on this column, **both known non-NULL** — the caller keeps
+    /// its own NULL policy, direction and tiebreak. A PK window is OPK, so plain
+    /// byte order *is* its typed order (an LE decode would invert it); a payload
+    /// window is native LE and goes through the typed dispatch, which is also
+    /// what routes STRING/BLOB to content comparison.
+    ///
+    /// The two sources are separate types so a cursor-vs-exemplar compare and an
+    /// intra-batch argsort share one body.
+    #[inline(always)]
+    pub fn cmp_non_null<A: RowSource, B: RowSource>(&self, a: &A, ra: usize, b: &B, rb: usize) -> Ordering {
+        match *self {
+            ColumnLocator::Pk { .. } => self.bytes(a, ra).cmp(self.bytes(b, rb)),
+            ColumnLocator::Payload { type_code, .. } => {
+                gnitz_wire::cmp_col_window(self.bytes(a, ra), a.blob(), self.bytes(b, rb), b.blob(), type_code)
+            }
+        }
+    }
+
+    /// Encode this column's value in `row` as the OPK image of `out_tc`, into
+    /// `dst` (exactly `out_tc`'s width). Order-preserving, sign-correct and
+    /// equality-correct at any source width, and the identity copy when `out_tc`
+    /// already equals this column's type. Callers must [`Self::is_null`]-gate a
+    /// nullable payload column first; a PK column is never null.
+    ///
+    /// One method rather than the same dispatch at each site because index-key
+    /// projection and join-key repartitioning must emit byte-identical keys for
+    /// one logical value.
+    #[inline(always)]
+    pub fn encode_opk_promoted(&self, mb: &impl RowSource, row: usize, out_tc: u8, dst: &mut [u8]) {
+        let src = self.bytes(mb, row);
+        match *self {
+            ColumnLocator::Pk { type_code, .. } => gnitz_wire::promote_opk_column(src, type_code, out_tc, dst),
+            ColumnLocator::Payload { type_code, .. } => {
+                gnitz_wire::encode_pk_column_promoted(src, type_code, out_tc, dst)
+            }
         }
     }
 

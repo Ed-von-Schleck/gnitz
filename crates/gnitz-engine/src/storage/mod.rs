@@ -51,9 +51,9 @@ pub use batch_wire::{compute_wire_props, schema_wire_safe, wire_block_size};
 // `ColumnarSource` is deliberately NOT re-exported: it adds only the Z-set
 // weight, and every out-of-storage consumer (the comparators, the group-key
 // extractors, the row appenders) reads rows through `gnitz_expr::RowSource`.
-pub(crate) use columnar::{
-    cmp_col_window, compare_rows, compare_rows_except, compare_rows_fixedint_nonnull, with_payload_cmp,
-};
+// `cmp_col_window` is NOT re-exported: it lives in `gnitz-wire`, where the
+// client-side comparators can reach the same STRING/BLOB-before-fixed-width rule.
+pub(crate) use columnar::{compare_rows, compare_rows_except, compare_rows_fixedint_nonnull, with_payload_cmp};
 // The OPK key cluster is NOT re-exported here: `schema::key` owns it and every
 // caller names `crate::schema::key::X`. Re-exporting it split one byte-order
 // rule across two import paths, visibly — `ops/reduce/sort.rs` and

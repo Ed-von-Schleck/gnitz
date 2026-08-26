@@ -11,7 +11,8 @@
 
 use std::cell::RefCell;
 
-use crate::batch::{eval_batch, scan_filter_bits, EvalScratch, MorselOut, MORSEL};
+use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, MORSEL};
+use crate::program::Role;
 use crate::{BatchView, ColumnLocator, ExprValidateErr, LogicalProgram, ResolvedProgram, SchemaFacts};
 
 /// A resolved expression program together with the register file it evaluates
@@ -39,16 +40,15 @@ pub struct Evaluator {
 /// makes "this program was checked against the schema it runs on" a property of
 /// the type rather than a convention every consuming crate has to remember.
 ///
-/// The three differ in which rules apply, which is also what fixes the
-/// `is_filter` classification each one resolves under — so no caller passes a
-/// bare boolean.
+/// The three differ in which rules apply, which is also what fixes the [`Role`]
+/// each one resolves under — so no caller passes a bare classification.
 impl LogicalProgram {
     /// A filter predicate: checked against the schema it reads, and required to
     /// own a result register. Resolved with `result_reg` eligible for the
     /// bit_only path, which [`Evaluator::filter`] reads as packed bits.
     pub fn resolve_filter(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
         let str_class = self.validate_predicate(schema)?;
-        Ok(self.into_evaluator(schema, /* is_filter = */ true, str_class))
+        Ok(self.into_evaluator(schema, Role::Filter, str_class))
     }
 
     /// A map: checked against both the schema it reads and the one it writes,
@@ -59,7 +59,7 @@ impl LogicalProgram {
         out_schema: &dyn SchemaFacts,
     ) -> Result<Evaluator, ExprValidateErr> {
         let str_class = self.validate(Some(in_schema), Some(out_schema))?;
-        Ok(self.into_evaluator(in_schema, /* is_filter = */ false, str_class))
+        Ok(self.into_evaluator(in_schema, Role::Map, str_class))
     }
 
     /// A scalar expression evaluated row at a time through
@@ -75,11 +75,11 @@ impl LogicalProgram {
     /// the packed bit.
     pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
         let str_class = self.validate_result_reg(schema)?;
-        Ok(self.into_evaluator(schema, /* is_filter = */ false, str_class))
+        Ok(self.into_evaluator(schema, Role::Scalar, str_class))
     }
 
-    fn into_evaluator(self, schema: &dyn SchemaFacts, is_filter: bool, str_class: u64) -> Evaluator {
-        let prog = self.resolve_program(schema, is_filter, str_class);
+    fn into_evaluator(self, schema: &dyn SchemaFacts, role: Role, str_class: u64) -> Evaluator {
+        let prog = self.resolve_program(schema, role, str_class);
         let scratch = RefCell::new(EvalScratch::new(&prog));
         Evaluator { prog, scratch }
     }
@@ -94,12 +94,12 @@ impl Evaluator {
     pub fn eval_row<B: BatchView>(&self, mb: &B, row: usize) -> Option<i64> {
         debug_assert!(row < mb.row_count(), "eval_row row {row} is past the batch's end");
         debug_assert!(
-            !self.prog.result_is_str,
+            !self.prog.result_is_str(),
             "string-valued program read through eval_row; use eval_row_str"
         );
         let scratch = &mut *self.scratch.borrow_mut();
         scratch.ensure_capacity(&self.prog, 1);
-        eval_batch(&self.prog, mb, row, 1, scratch);
+        with_str_bufs(&self.prog, mb, |bufs| eval_batch(&self.prog, mb, bufs, row, 1, scratch));
         scratch.row0_value(&self.prog)
     }
 
@@ -115,11 +115,13 @@ impl Evaluator {
         let n = mb.row_count();
         let scratch = &mut *self.scratch.borrow_mut();
         scratch.ensure_capacity(&self.prog, n);
-        for morsel_start in (0..n).step_by(MORSEL) {
-            let m = MORSEL.min(n - morsel_start);
-            eval_batch(&self.prog, mb, morsel_start, m, scratch);
-            scratch.write_filter_words(&self.prog, morsel_start, m);
-        }
+        with_str_bufs(&self.prog, mb, |bufs| {
+            for morsel_start in (0..n).step_by(MORSEL) {
+                let m = MORSEL.min(n - morsel_start);
+                eval_batch(&self.prog, mb, bufs, morsel_start, m, scratch);
+                scratch.write_filter_words(&self.prog, morsel_start, m);
+            }
+        });
         scan_filter_bits(scratch.filter_words(n), n, &mut append_range);
     }
 
@@ -141,11 +143,13 @@ impl Evaluator {
         let scratch = &mut *self.scratch.borrow_mut();
         // No filter bitmap on this path — `filter` is the only writer of one.
         scratch.ensure_capacity(&self.prog, 0);
-        for rel_start in (0..n).step_by(MORSEL) {
-            let m = MORSEL.min(n - rel_start);
-            eval_batch(&self.prog, mb, start + rel_start, m, scratch);
-            f(rel_start, &scratch.morsel_out(mb.blob(), m));
-        }
+        with_str_bufs(&self.prog, mb, |bufs| {
+            for rel_start in (0..n).step_by(MORSEL) {
+                let m = MORSEL.min(n - rel_start);
+                eval_batch(&self.prog, mb, bufs, start + rel_start, m, scratch);
+                f(rel_start, &scratch.morsel_out(bufs, m));
+            }
+        });
     }
 
     /// The verbatim column moves a map materializes columnar-side, as
@@ -157,14 +161,14 @@ impl Evaluator {
     /// The computed columns a map writes out of the register file, as
     /// `(source register, output payload slot, is_str)`.
     pub fn emit_targets(&self) -> impl Iterator<Item = (u16, u32, bool)> + '_ {
-        self.prog.emits.iter().copied()
+        self.prog.emit_targets()
     }
 
     /// Whether the result register holds a string, i.e. whether the result must
     /// be read through [`Self::eval_row_str`] rather than [`Self::eval_row`].
     /// Resolution knows the answer, so a caller never has to carry it alongside.
     pub fn result_is_str(&self) -> bool {
-        self.prog.result_is_str
+        self.prog.result_is_str()
     }
 
     /// Evaluate over a single row, append the string result's bytes to `out`, and
@@ -181,14 +185,16 @@ impl Evaluator {
     pub fn eval_row_str<B: BatchView>(&self, mb: &B, row: usize, out: &mut Vec<u8>) -> bool {
         debug_assert!(row < mb.row_count(), "eval_row_str row {row} is past the batch's end");
         debug_assert!(
-            self.prog.result_is_str,
+            self.prog.result_is_str(),
             "scalar program read through eval_row_str; use eval_row"
         );
         let scratch = &mut *self.scratch.borrow_mut();
         scratch.ensure_capacity(&self.prog, 1);
-        eval_batch(&self.prog, mb, row, 1, scratch);
         let r = self.prog.result_reg as usize;
-        out.extend_from_slice(scratch.morsel_out(mb.blob(), 1).str_bytes(r, 0));
+        with_str_bufs(&self.prog, mb, |bufs| {
+            eval_batch(&self.prog, mb, bufs, row, 1, scratch);
+            out.extend_from_slice(scratch.morsel_out(bufs, 1).str_bytes(r, 0));
+        });
         scratch.row0_is_null(r)
     }
 }

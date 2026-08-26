@@ -1393,9 +1393,45 @@ fn filter_kernel_bench() {
         vec![],
     );
 
+    // Five literal comparisons over one NOT NULL column: the `no_nulls` arm's
+    // cheapest per-row work carrying the most constant registers, which is where
+    // a per-morsel constant refill would show.
+    let lit_schema = schema_pk_ints(1, false);
+    let lit_view = make_n_col_view(&lit_schema, n, |row, _| (row % 1000) as i64, |_, _| false);
+    let mut lit_instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
+    let mut acc_reg = None;
+    for (i, (op, val)) in [
+        (CmpOp::Gt, 1i64),
+        (CmpOp::Lt, 999),
+        (CmpOp::Ne, 5),
+        (CmpOp::Ne, 7),
+        (CmpOp::Ne, 9),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (k, c) = (1 + 2 * i as u16, 2 + 2 * i as u16);
+        lit_instrs.push(LogicalInstr::LoadConst { dst: k, val });
+        lit_instrs.push(LogicalInstr::Cmp { op, dst: c, a: 0, b: k });
+        acc_reg = Some(match acc_reg {
+            None => c,
+            Some(prev) => {
+                let d = 11 + i as u16;
+                lit_instrs.push(LogicalInstr::BoolAnd { dst: d, a: prev, b: c });
+                d
+            }
+        });
+    }
+    let lit_result = acc_reg.expect("the literal chain has at least one compare");
+    let lit_filter = filter_prog(&lit_schema, lit_instrs, 16, lit_result as u32, vec![]);
+
     let mut hits = 0usize;
     let mut selected = 0usize;
-    for (name, ev, view) in [("pk", &pk_filter, &pk_view), ("nullable", &nn_filter, &nn_view)] {
+    for (name, ev, view) in [
+        ("pk", &pk_filter, &pk_view),
+        ("nullable", &nn_filter, &nn_view),
+        ("literals", &lit_filter, &lit_view),
+    ] {
         if !driven(name) {
             continue;
         }
@@ -1588,5 +1624,272 @@ fn is_null_arm_bench() {
     println!("is_null_arm_bench map: passes={passes} n={n}");
     // A misspelled shape name would otherwise drive nothing at all, and the two
     // pass counts would difference to a 0 % effect instead of failing.
+    assert!(selected > 0, "GNITZ_BENCH_SHAPE matched no shape: {only:?}");
+}
+
+/// One row of `cols` German strings per payload slot, alternating either side of
+/// the 12-byte inline boundary so a string bench drives both the in-place inline
+/// view and the blob view.
+fn str_bench_view(schema: &TestSchema, n: usize, cols: usize) -> TestView {
+    let mut v = TestView::new(n, schema.pk_stride());
+    push_payload_cols(&mut v, schema);
+    for row in 0..n {
+        set_row_pk(&mut v, schema, row, row as u64 + 1);
+        for pi in 0..cols {
+            let s = if row % 3 == 0 {
+                format!("row-{row}-col-{pi}-past-the-inline-boundary")
+            } else {
+                format!("r{}{pi}", row % 100)
+            };
+            v.set_string(row, pi, s.as_bytes());
+        }
+    }
+    v
+}
+
+/// Retired-instruction harness for the kernels [`filter_kernel_bench`] cannot
+/// reach: the ones whose result is not a predicate. Same protocol — run at two
+/// pass counts and difference, never report wall-clock.
+///
+///   for s in int_cast int_div select str_len str_upper str_like str_substr \
+///            str_concat int_to_str map; do
+///     for p in 1 501; do \
+///       GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
+///       cargo test -p gnitz-expr --release expr_kernel_bench -- --ignored --nocapture
+///   done; done
+///
+/// One shape per opcode family, never combined: a scalar `idiv` swamps a cast by
+/// an order of magnitude, so a shared shape would difference to that one arm.
+#[test]
+#[ignore]
+fn expr_kernel_bench() {
+    let passes = bench_passes();
+    let only = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "all".to_string());
+    let driven = |name: &str| only == "all" || only == name;
+    let mut selected = 0usize;
+    let n = 200_000usize;
+
+    // --- scalar shapes over two nullable I64 columns ---
+    let ints = schema_pk_ints(2, true);
+    let int_view = make_n_col_view(
+        &ints,
+        n,
+        |row, col| ((row * 7 + col) % 1000 + 1) as i64,
+        |row, _| row % 32 == 0,
+    );
+    let load2 = |c: u32, d: u16| LogicalInstr::LoadColInt { dst: d, col: c };
+
+    let int_cast = scalar_prog(
+        &ints,
+        vec![
+            load2(1, 0),
+            LogicalInstr::IntCast {
+                dst: 1,
+                a: 0,
+                tc: type_code::I32 as u32,
+            },
+        ],
+        2,
+        1,
+        vec![],
+    );
+    let int_div = scalar_prog(
+        &ints,
+        vec![
+            load2(1, 0),
+            LogicalInstr::LoadConst { dst: 1, val: 7 },
+            LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
+        ],
+        3,
+        2,
+        vec![],
+    );
+    // `CASE WHEN a > b THEN a ELSE b END` over nullable columns — the blend's
+    // nullable arm, which nothing else in the tree drives.
+    let select = scalar_prog(
+        &ints,
+        vec![
+            load2(1, 0),
+            load2(2, 1),
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+            LogicalInstr::Select {
+                dst: 3,
+                cond: 2,
+                a: 0,
+                b: 1,
+            },
+        ],
+        4,
+        3,
+        vec![],
+    );
+    let int_to_str = scalar_prog(
+        &ints,
+        vec![load2(1, 0), LogicalInstr::IntToStr { dst: 1, a: 0 }],
+        2,
+        1,
+        vec![],
+    );
+
+    // --- string shapes over two NOT NULL STRING columns ---
+    let strs = schema_pk_strings(2, false);
+    let str_view = str_bench_view(&strs, n, 2);
+    let load_str = |c: u32, d: u16| LogicalInstr::LoadColStr { dst: d, col: c };
+
+    let str_len = scalar_prog(
+        &strs,
+        vec![
+            load_str(1, 0),
+            LogicalInstr::StrLen {
+                dst: 1,
+                a: 0,
+                chars: false,
+            },
+        ],
+        2,
+        1,
+        vec![],
+    );
+    let str_upper = scalar_prog(
+        &strs,
+        vec![
+            load_str(1, 0),
+            LogicalInstr::StrCase {
+                dst: 1,
+                a: 0,
+                upper: true,
+            },
+        ],
+        2,
+        1,
+        vec![],
+    );
+    let str_like = scalar_prog(
+        &strs,
+        vec![
+            load_str(1, 0),
+            LogicalInstr::StrLike {
+                dst: 1,
+                src: 0,
+                escape: 0,
+                pat_idx: 0,
+                ci: false,
+            },
+        ],
+        2,
+        1,
+        vec![b"%boundary".to_vec()],
+    );
+    let str_substr = scalar_prog(
+        &strs,
+        vec![
+            load_str(1, 0),
+            LogicalInstr::LoadConst { dst: 1, val: 2 },
+            LogicalInstr::LoadConst { dst: 2, val: 6 },
+            LogicalInstr::StrSubstr {
+                dst: 3,
+                src: 0,
+                start_reg: 1,
+                len_reg: Some(2),
+            },
+        ],
+        4,
+        3,
+        vec![],
+    );
+    let str_concat = scalar_prog(
+        &strs,
+        vec![
+            load_str(1, 0),
+            load_str(2, 1),
+            LogicalInstr::StrConcat {
+                dst: 2,
+                a: 0,
+                b: 1,
+                skip_null: false,
+            },
+        ],
+        3,
+        2,
+        vec![],
+    );
+
+    // --- a real map: six compute opcodes plus two EMITs, driven through
+    //     `eval_morsels` the way a maintained view's projection is ---
+    let map_in = schema_pk_ints(3, false);
+    let map_out = TestSchema::new(
+        &[
+            (type_code::U64, false),
+            (type_code::I64, false),
+            (type_code::I64, false),
+        ],
+        &[0],
+    );
+    let map_view = make_n_col_view(&map_in, n, |row, col| ((row * 7 + col) % 1000) as i64, |_, _| false);
+    let map = map_prog(
+        &map_in,
+        &map_out,
+        vec![
+            load2(1, 0),
+            load2(2, 1),
+            LogicalInstr::LoadColInt { dst: 2, col: 3 },
+            LogicalInstr::IntAdd { dst: 3, a: 0, b: 1 },
+            LogicalInstr::IntMul { dst: 4, a: 3, b: 2 },
+            LogicalInstr::IntSub { dst: 5, a: 4, b: 0 },
+            LogicalInstr::Emit { src: 5, out: 0 },
+            LogicalInstr::Emit { src: 3, out: 1 },
+        ],
+        6,
+        0,
+        vec![],
+    );
+
+    let mut acc = 0i64;
+    // Scalar-result shapes: sum the result register, as an EMIT of an 8-byte
+    // slot would read it.
+    for (name, ev, view, reg) in [
+        ("int_cast", &int_cast, &int_view, 1usize),
+        ("int_div", &int_div, &int_view, 2),
+        ("select", &select, &int_view, 3),
+        ("str_len", &str_len, &str_view, 1),
+        ("str_like", &str_like, &str_view, 1),
+        ("map", &map, &map_view, 5),
+    ] {
+        if !driven(name) {
+            continue;
+        }
+        selected += 1;
+        for _ in 0..passes {
+            ev.eval_morsels(view, 0, n, |_, out| acc += out.reg_values(reg).iter().sum::<i64>());
+        }
+    }
+    // String-result shapes: resolve every view, as an EMIT of a string slot does.
+    for (name, ev, view, reg) in [
+        ("int_to_str", &int_to_str, &int_view, 1usize),
+        ("str_upper", &str_upper, &str_view, 1),
+        ("str_substr", &str_substr, &str_view, 3),
+        ("str_concat", &str_concat, &str_view, 2),
+    ] {
+        if !driven(name) {
+            continue;
+        }
+        selected += 1;
+        for _ in 0..passes {
+            ev.eval_morsels(view, 0, n, |_, out| {
+                for i in 0..out.rows() {
+                    acc += out.str_bytes(reg, i).len() as i64;
+                }
+            });
+        }
+    }
+    println!(
+        "expr_kernel_bench passes={passes} n={n} acc={}",
+        std::hint::black_box(acc)
+    );
     assert!(selected > 0, "GNITZ_BENCH_SHAPE matched no shape: {only:?}");
 }

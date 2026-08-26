@@ -25,8 +25,8 @@ use crate::expr::ScalarFunc;
 use crate::ops::AdhocFold;
 use crate::schema::key::{compare_pk_bytes, opk_key, PkBuf};
 use crate::schema::ColumnLocator;
-use crate::storage::{cmp_col_window, compare_rows, PkSetGather};
-use gnitz_expr::{LogicalProgram, RowSource};
+use crate::storage::{compare_rows, PkSetGather};
+use gnitz_expr::LogicalProgram;
 
 /// `limit_k` above which the worker materializes instead of running the bounded
 /// top-k sink (a deep OFFSET ships unsorted and the client sorts). Worker
@@ -638,56 +638,42 @@ fn scan_spec_cmp(
     let a_null = b.get_null_word(a);
     let c_null = b.get_null_word(c);
     for key in order_locs {
-        match key.loc {
-            // PK columns are never NULL; compare the OPK byte window (order-preserving).
-            ColumnLocator::Pk { byte_off, size, .. } => {
-                let o = byte_off as usize;
-                let sz = size as usize;
-                let av = &b.get_pk_bytes(a)[o..o + sz];
-                let cv = &b.get_pk_bytes(c)[o..o + sz];
-                let mut ord = av.cmp(cv);
-                if key.desc {
-                    ord = ord.reverse();
+        // PK columns are never NULL, so this is the payload-only gate. NULL
+        // placement is absolute — `nulls_first` decides it, and `desc` does not
+        // flip it.
+        if let ColumnLocator::Payload { slot, .. } = key.loc {
+            let pi = slot as usize;
+            match (
+                gnitz_wire::null_word_get(a_null, pi),
+                gnitz_wire::null_word_get(c_null, pi),
+            ) {
+                (true, true) => continue,
+                (true, false) => {
+                    return if key.nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
                 }
-                if ord != Ordering::Equal {
-                    return ord;
+                (false, true) => {
+                    return if key.nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
                 }
+                (false, false) => {}
             }
-            ColumnLocator::Payload { slot, size, type_code } => {
-                let pi = slot as usize;
-                let an = gnitz_wire::null_word_get(a_null, pi);
-                let cn = gnitz_wire::null_word_get(c_null, pi);
-                match (an, cn) {
-                    (true, true) => continue,
-                    // NULL placement is absolute (not flipped by `desc`).
-                    (true, false) => {
-                        return if key.nulls_first {
-                            Ordering::Less
-                        } else {
-                            Ordering::Greater
-                        }
-                    }
-                    (false, true) => {
-                        return if key.nulls_first {
-                            Ordering::Greater
-                        } else {
-                            Ordering::Less
-                        }
-                    }
-                    (false, false) => {
-                        let sz = size as usize;
-                        let av = b.get_col_ptr(a, pi, sz);
-                        let cv = b.get_col_ptr(c, pi, sz);
-                        let mut ord = cmp_col_window(av, b.blob(), cv, b.blob(), type_code);
-                        if key.desc {
-                            ord = ord.reverse();
-                        }
-                        if ord != Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                }
-            }
+        }
+        // The locator carries both the addressing and the order rule: a PK
+        // column's OPK window compares raw (order-preserving), a payload column
+        // through the typed dispatch that routes STRING/BLOB by content.
+        let mut ord = key.loc.cmp_non_null(b, a, b, c);
+        if key.desc {
+            ord = ord.reverse();
+        }
+        if ord != Ordering::Equal {
+            return ord;
         }
     }
     // Deterministic tiebreak (never reversed): OPK bytes, then payload columns.

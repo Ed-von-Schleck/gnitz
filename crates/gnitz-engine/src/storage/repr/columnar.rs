@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use super::merge::ColPtr;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
-use gnitz_wire::{compare_german_strings, null_word_get, read_unsigned_exact};
+use gnitz_wire::{cmp_col_window, null_word_get, read_unsigned_exact};
 
 // ---------------------------------------------------------------------------
 // ColumnarSource trait
@@ -122,27 +122,6 @@ fn compare_rows_impl<const SKIP: bool, A: RowSource, B: RowSource>(
     }
 
     Ordering::Equal
-}
-
-/// Compare two equal-width column windows of the given raw `u8` type code,
-/// dispatching German strings (STRING/BLOB) to content comparison through their
-/// backing blob arenas and every fixed-width type to `gnitz_wire::cmp_typed_le`
-/// (which is deliberately string-free — a mis-routed 16-byte string window hits
-/// its width `unreachable!` rather than silently mis-comparing). The blob slices
-/// back each side's German-string heap payload (ignored for non-string columns).
-///
-/// This is the single home for the "STRING and BLOB share the 16-byte layout, so
-/// they must be compared by content before the fixed-width dispatch" rule:
-/// `compare_rows` and the group-by / payload comparators in `ops` all route through
-/// here rather than re-spelling the per-type dispatch (a missed site would mis-order
-/// a BLOB key).
-#[inline]
-pub(crate) fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], type_code: u8) -> Ordering {
-    if gnitz_wire::is_german_string(type_code) {
-        compare_german_strings(a, a_blob, b, b_blob)
-    } else {
-        gnitz_wire::cmp_typed_le(a, b, type_code)
-    }
 }
 
 use crate::schema::key::PkSortKey; // the OPK register sort key, for the seek fast path below

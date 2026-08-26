@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 
 use crate::schema::key::{compare_pk_bytes, pk_width_dispatch};
 use crate::schema::{key::PkSortKey, ColumnLocator};
-use crate::storage::{cmp_col_window, Batch, MemBatch};
+use crate::storage::{Batch, MemBatch};
 use gnitz_expr::RowSource;
 
 /// Compare two rows by group columns through pre-resolved [`ColumnLocator`]s
@@ -22,51 +22,28 @@ pub(super) fn compare_by_group_cols<A: RowSource, B: RowSource>(
     let b_null_word = src_b.get_null_word(row_b);
 
     for loc in descs {
-        match *loc {
-            ColumnLocator::Pk { byte_off, size, .. } => {
-                // Isolate the addressed PK column's byte window. Comparing the
-                // whole PK region (the previous `get_pk(row)` widen) splits
-                // compound-PK groups that share the addressed column but differ
-                // in other PK columns.
-                // PK region holds OPK bytes, which are order-preserving — compare
-                // them raw. (A `cmp_typed_le` LE decode would invert order for
-                // big-endian/sign-flipped OPK bytes.)
-                let off = byte_off as usize;
-                let cs = size as usize;
-                let a = &src_a.get_pk_bytes(row_a)[off..off + cs];
-                let b = &src_b.get_pk_bytes(row_b)[off..off + cs];
-                let ord = a.cmp(b);
-                if ord != Ordering::Equal {
-                    return ord;
-                }
+        // NULLs sort before non-NULLs (NULLS FIRST), so all NULLs on a column are
+        // adjacent and form a single group. A non-nullable column never has the
+        // bit set, so the gate is harmless there; a PK column has no bit at all.
+        if let ColumnLocator::Payload { slot, .. } = *loc {
+            let pi = slot as usize;
+            match (
+                gnitz_wire::null_word_get(a_null_word, pi),
+                gnitz_wire::null_word_get(b_null_word, pi),
+            ) {
+                (true, true) => continue,
+                (true, false) => return Ordering::Less,
+                (false, true) => return Ordering::Greater,
+                (false, false) => {}
             }
-            ColumnLocator::Payload { slot, size, type_code } => {
-                let pi = slot as usize;
-
-                // NULL is never set on non-nullable columns, so the bit is always 0
-                // there and this branch is harmless. NULLs sort before non-NULLs
-                // (NULLS FIRST), so all NULLs are adjacent and form a single group.
-                let a_is_null = gnitz_wire::null_word_get(a_null_word, pi);
-                let b_is_null = gnitz_wire::null_word_get(b_null_word, pi);
-                match (a_is_null, b_is_null) {
-                    (true, true) => continue,
-                    (true, false) => return Ordering::Less,
-                    (false, true) => return Ordering::Greater,
-                    (false, false) => {}
-                }
-
-                // The locator's `size` is already 16 for STRING/BLOB, so a single
-                // `cs`-wide read feeds both the German-string content compare
-                // and the fixed-width path; each source's blob arena backs its
-                // own row's string tail.
-                let cs = size as usize;
-                let a = src_a.get_col_ptr(row_a, pi, cs);
-                let b = src_b.get_col_ptr(row_b, pi, cs);
-                let ord = cmp_col_window(a, src_a.blob(), b, src_b.blob(), type_code);
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
+        }
+        // Addressing and order rule both come off the locator: a PK column
+        // compares its own OPK byte window, not the whole PK region — the latter
+        // would split compound-PK groups that agree on the addressed column but
+        // differ elsewhere in the key.
+        let ord = loc.cmp_non_null(src_a, row_a, src_b, row_b);
+        if ord != Ordering::Equal {
+            return ord;
         }
     }
     Ordering::Equal

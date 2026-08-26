@@ -312,6 +312,24 @@ pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
     }
 }
 
+/// Compare two equal-width column windows of the given raw `u8` type code:
+/// German strings (STRING/BLOB) by content through their backing blob arenas,
+/// every fixed-width type through [`cmp_typed_le`]. The blob slices back each
+/// side's heap payload, and are ignored for non-string columns.
+///
+/// The single home for "STRING and BLOB share the 16-byte layout, so they must
+/// be compared by content before the fixed-width dispatch" — a missed site would
+/// mis-order a BLOB key. In `gnitz-wire` because the client-side comparators are
+/// held to the same order as the engine's.
+#[inline]
+pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], type_code: u8) -> Ordering {
+    if is_german_string(type_code) {
+        crate::compare_german_strings(a, a_blob, b, b_blob)
+    } else {
+        cmp_typed_le(a, b, type_code)
+    }
+}
+
 /// Whether a raw wire type code may be a PRIMARY KEY column. u8-based
 /// counterpart to [`TypeCode::is_pk_eligible`] for callers holding a raw
 /// `type_code` (mirrors the free `wire_stride`). Unknown codes are ineligible.

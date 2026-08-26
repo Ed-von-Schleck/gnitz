@@ -192,11 +192,9 @@ impl ColPromoter {
 
     /// Write this column's `out_size` OPK bytes into `dst` (len == out_size).
     ///
-    /// Every arm but the string hash is one call into the shared `gnitz-wire`
-    /// encoders, selected only by which region holds the source: an at-rest OPK
-    /// PK window (OPK→OPK) or a native-LE payload cell (native→OPK). Both reduce
-    /// to `encode_pk_column` when the slot type equals the source type, so an
-    /// unpromoted column costs no decode/re-encode round trip.
+    /// Every arm but the string hash is one call into `ColumnLocator`'s own OPK
+    /// promotion — the same method `IndexKeySpec::write_span` uses, which is what
+    /// holds an index key and a join key byte-identical for one logical value.
     #[inline]
     fn write_into(&self, dst: &mut [u8], batch: &MemBatch, row: usize, packer: &ReindexPacker) {
         if self.nullable
@@ -206,24 +204,11 @@ impl ColPromoter {
             return;
         }
         match self.kind {
-            PromoteKind::Col(loc) => {
-                let src = loc.bytes(batch, row);
-                match loc {
-                    // Source PK column is OPK at rest: verbatim copy when
-                    // unpromoted, else decode to native and re-encode at `out_tc`
-                    // (sign/zero-extended) so both join sides pack equal values
-                    // identically.
-                    ColumnLocator::Pk { type_code, .. } => {
-                        gnitz_wire::promote_opk_column(src, type_code, self.out_tc, dst)
-                    }
-                    // Payload cell, native LE — exactly the encoder's input, at
-                    // any width. A float self-derives to U128, so the promotion
-                    // also does the right-alignment the slot needs.
-                    ColumnLocator::Payload { type_code, .. } => {
-                        gnitz_wire::encode_pk_column_promoted(src, type_code, self.out_tc, dst)
-                    }
-                }
-            }
+            // Order-preserving at `out_tc` whichever region the source sits in,
+            // and the identity copy when unpromoted, so both join sides pack
+            // equal values identically. A float self-derives to U128, so the
+            // promotion also does the right-alignment the slot needs.
+            PromoteKind::Col(loc) => loc.encode_opk_promoted(batch, row, self.out_tc, dst),
             // Synthetic XXH3 content hash (unsigned U128): OPK == big-endian.
             PromoteKind::String { pi } => dst.copy_from_slice(&read_string(batch, pi, row).to_be_bytes()),
             PromoteKind::Bitmap => {

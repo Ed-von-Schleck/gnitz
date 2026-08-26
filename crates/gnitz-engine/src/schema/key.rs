@@ -617,15 +617,10 @@ impl IndexKeySpec {
     /// source already matches the index type (`U128`/`UUID`, base unsigned ≤8B)
     /// reduces to `encode_pk_column`.
     ///
-    /// The source bytes come from the locator (`is_null` gates, `bytes` reads the
-    /// OPK PK window or the native-LE payload cell); the only thing spelled per
-    /// variant is *which encoder* consumes them — a PK source is already OPK, so
-    /// it goes through `gnitz_wire::promote_opk_column` (OPK→OPK, identity when
-    /// unpromoted), a payload source through `encode_pk_column_promoted`
-    /// (native→OPK). Those are the same two primitives `ops::reindex`'s
-    /// `ColPromoter::write_into` uses — the two must emit byte-identical keys for
-    /// one logical value, so they share the encoders rather than each spelling the
-    /// promotion.
+    /// The encoding is the locator's own `encode_opk_promoted`, which is also
+    /// what `ops::reindex`'s `ColPromoter::write_into` calls: the two must emit
+    /// byte-identical keys for one logical value, and sharing the method is what
+    /// makes that hold by construction rather than by two sites agreeing.
     pub(crate) fn write_span(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
         debug_assert!(dst.len() >= self.key_size(), "write_span: dst shorter than the span");
         let mut off = 0;
@@ -636,16 +631,7 @@ impl IndexKeySpec {
                 return false;
             }
             let target_w = col.size() as usize; // promoted index column width
-            let out = &mut dst[off..off + target_w];
-            let src = loc.bytes(mb, row);
-            match *loc {
-                ColumnLocator::Pk { type_code, .. } => {
-                    gnitz_wire::promote_opk_column(src, type_code, col.type_code, out)
-                }
-                ColumnLocator::Payload { type_code, .. } => {
-                    gnitz_wire::encode_pk_column_promoted(src, type_code, col.type_code, out)
-                }
-            }
+            loc.encode_opk_promoted(mb, row, col.type_code, &mut dst[off..off + target_w]);
             off += target_w;
         }
         true
