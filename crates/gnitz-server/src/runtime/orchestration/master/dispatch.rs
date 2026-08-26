@@ -3,7 +3,7 @@
 //! (seek / scan / index / gather), checkpointing, and the scan-fanout helpers.
 
 use super::*;
-use crate::runtime::sal::{FLAG_ZONE_START, MAX_WORKERS};
+use crate::runtime::sal::FLAG_ZONE_START;
 use gnitz_engine::foundation::fault::Seam;
 
 /// Yields the set bit positions of a worker mask, lowest first.
@@ -57,17 +57,17 @@ fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: &[u8]) -> Opti
     gnitz_engine::catalog::scan_spec_worker(&schema, &desc, disp.num_workers)
 }
 
-/// Timeout for the synchronous `W2mReceiver::wait_for` fallback in the two
-/// reactor-driven-but-sometimes-parked collect loops below.
+/// Timeout for the synchronous `W2mReceiver::wait_any` park in the
+/// reactor-driven-but-sometimes-parked collect loop below.
 ///
-/// `wait_for` returns the instant a worker bumps `reader_seq` *as long as the
+/// `wait_any` returns the instant a worker bumps `reader_seq` *as long as the
 /// futex wake reaches it*. At boot (no reactor) and in the steady state nothing
 /// competes for that wake, so the loop is woken promptly and this value is just
-/// an unhit ceiling. But the reactor-parked CREATE-VIEW backfill runs these
-/// loops while the reactor's `FUTEX_WAITV` SQE is still armed on the same
+/// an unhit ceiling. But the reactor-parked CREATE-VIEW backfill runs the loop
+/// while the reactor's `FUTEX_WAITV` SQE is still armed on the same
 /// `reader_seq` words: the kernel can deliver a worker's wake to that op (whose
 /// CQE then sits unprocessed — the reactor is parked here) instead of to this
-/// `futex_wait`, which would otherwise sleep the full timeout while the reply
+/// `futex_waitv`, which would otherwise sleep the full timeout while the reply
 /// already sits in the ring. A short timeout caps that stolen-wake stall (the
 /// loop re-`try_read`s every iteration and finds the reply) at a few ms instead
 /// of ~1 s, with negligible extra polling on the never-stalled paths.
@@ -85,11 +85,6 @@ static BACKFILL_RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_BACKFILL_RELAY_S
 /// `GNITZ_INJECT_TICK_EMIT_ERROR=<table>`: fail the named table's next tick
 /// emit, once, as a full SAL would.
 static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
-
-/// The per-worker request ids a *synchronous* collect writes into its group.
-/// `collect_acks` / `collect_acks_and_relay` read the W2M rings directly and
-/// never route by req_id, so zeros are correct rather than merely unused.
-const SYNC_COLLECT_REQ_IDS: [u64; MAX_WORKERS] = [0; MAX_WORKERS];
 
 /// A `u64` from the OS entropy pool, mixed into every delta reply's cursor tag.
 ///
@@ -111,10 +106,13 @@ fn boot_nonce() -> u64 {
 }
 
 impl MasterDispatcher {
+    /// `last_ephemeral_gen` seeds `note_flush_round`'s ordering check: the
+    /// boot's recovered durable generation.
     pub fn new(
         num_workers: usize,
         worker_pids: Vec<i32>,
         catalog: *mut CatalogEngine,
+        last_ephemeral_gen: u64,
         sal: SalWriter,
         w2m: Rc<W2mReceiver>,
         m2w_efds: Vec<i32>,
@@ -130,15 +128,7 @@ impl MasterDispatcher {
             catalog,
             unique_filters: RefCell::new(FxHashMap::default()),
             check_batch_pool: RefCell::new(FxHashMap::default()),
-            // Seeded from the recovered generation: `recovery_start_generation_bump`
-            // has already pushed the durable one past whatever the last completed
-            // checkpoint stamped, so every base round below must bump again first.
-            // The unit tests that construct a null catalog never emit a round.
-            last_ephemeral_gen: Cell::new(if catalog.is_null() {
-                0
-            } else {
-                unsafe { (*catalog).durable_generation() }
-            }),
+            last_ephemeral_gen: Cell::new(last_ephemeral_gen),
             tick_round: Cell::new(1),
             last_delta_round: RefCell::new(FxHashMap::default()),
             boot_nonce: boot_nonce(),
@@ -181,8 +171,8 @@ impl MasterDispatcher {
     /// cache; it is invalidated alongside col_names whenever DDL modifies
     /// the table. Used by SAL write paths (commit/tick/broadcast) to skip
     /// per-call `build_schema_wire_block` allocations and per-column
-    /// iteration in `scatter_wire_group`.
-    pub(super) fn cached_schema_block(&self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<u8>>, bool, u32) {
+    /// iteration in `with_scatter_group`.
+    fn cached_schema_block(&self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<u8>>, bool, u32) {
         let schema = self.schema_desc_for(target_id);
         let cat = self.cat();
         let e = crate::runtime::wire::get_or_build_schema_wire_block(cat, target_id, &schema);
@@ -197,107 +187,31 @@ impl MasterDispatcher {
     // Core send/receive helpers
     // -----------------------------------------------------------------------
 
-    /// Write one command group with per-worker request ids: no rows and no
-    /// schema block, so each worker's slot is a bare control block. Every
-    /// command verb's worker arm resolves the schema it needs from its own
-    /// catalog, so no block is sent.
-    ///
-    /// `seek_pk`/`seek_col_idx` carry the verb's two scalar operands and
-    /// `seek_pk_extra` its verbatim payload. `lsn` is 0 for every verb — a lost
-    /// command needs no crash recovery — except the checkpoint rounds, where
-    /// FlushEph's lsn IS the checkpoint generation.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn write_command_group(
+    /// Write one SAL group and nothing else — no signal, no ack collection.
+    /// The one group writer: `template` is every slot's shared header, `data`
+    /// and `targets` are what varies per slot.
+    pub(super) fn write_group(
         &self,
-        target_id: i64,
+        template: wire::WireMsg<'_>,
+        data: GroupData<'_>,
         lsn: u64,
         sal_flags: u32,
-        wire_flags: u64,
-        seek_pk: u128,
-        seek_col_idx: u64,
-        req_ids: &[u64],
-        unicast_worker: Fanout,
-        client_id: u64,
-        seek_pk_extra: &[u8],
+        targets: GroupTargets<'_>,
     ) -> Result<(), String> {
         self.sal.write_group_direct(
             &DirectGroup {
-                template: wire::WireMsg {
-                    target_id: target_id as u64,
-                    client_id,
-                    flags: wire_flags,
-                    seek_pk,
-                    seek_col_idx,
-                    seek_pk_extra,
-                    ..Default::default()
-                },
-                worker_data: &[],
-                req_ids,
-                unicast_worker: match unicast_worker {
-                    Fanout::Broadcast => None,
-                    Fanout::One(w) => Some(w),
-                },
+                template,
+                data,
+                targets,
             },
             lsn,
             sal_flags,
         )
     }
 
-    /// One group carrying rows, broadcast with per-worker request ids. The two
-    /// data-bearing fan-outs: the exchange relay (whose schema block is what
-    /// stamps `Batch.schema` on the worker side) and the `FLAG_HAS_PK` unique
-    /// check.
-    ///
-    /// The schema block carries no column names: `decode_schema_block` parses
-    /// only the col_idx / type / flags regions, and these groups never leave the
-    /// master→worker SAL.
-    fn data_group<'a>(
-        target_id: i64,
-        worker_data: &'a [wire::WireData<'a>],
-        schema: &'a SchemaDescriptor,
-        seek_pk: u128,
-        seek_col_idx: u64,
-        req_ids: &'a [u64],
-    ) -> DirectGroup<'a> {
-        DirectGroup {
-            template: wire::WireMsg {
-                target_id: target_id as u64,
-                seek_pk,
-                seek_col_idx,
-                schema: Some(schema),
-                ..Default::default()
-            },
-            worker_data,
-            req_ids,
-            unicast_worker: None,
-        }
-    }
-
-    /// Emit a [`data_group`](Self::data_group). LSN 0 — both verbs are
-    /// command-scoped; durable writers (`scatter_wire_group`,
-    /// `write_broadcast_direct`, the commit sentinel) carry caller-supplied LSNs
-    /// on their own paths.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn write_data_group(
-        &self,
-        target_id: i64,
-        sal_flags: u32,
-        worker_batches: &[Option<&Batch>],
-        schema: &SchemaDescriptor,
-        seek_pk: u128,
-        seek_col_idx: u64,
-        req_ids: &[u64],
-    ) -> Result<(), String> {
-        let worker_data: Vec<wire::WireData> = worker_batches.iter().map(|b| wire::WireData::Whole(*b)).collect();
-        let group = Self::data_group(target_id, &worker_data, schema, seek_pk, seek_col_idx, req_ids);
-        self.sal.write_group_direct(&group, 0, sal_flags)
-    }
-
     /// Write one group whose rows are PK-partitioned across the workers: each
-    /// worker's slot carries only the rows it stores. The scatter sibling of
-    /// `write_data_group`, and the only shape the probe/gather paths need — the
-    /// durable commit scatter (`write_commit_group`) carries a schema block and
-    /// wire props of its own, so it calls `scatter_wire_group` directly.
+    /// worker's slot carries only the rows it stores — the scatter sibling of a
+    /// `GroupData::Same` broadcast.
     pub(super) fn write_scatter_group(
         &self,
         batch: &Batch,
@@ -305,101 +219,25 @@ impl MasterDispatcher {
         target_id: i64,
         sal_flags: u32,
         seek_col_idx: u64,
-        req_ids: &[u64],
+        targets: GroupTargets<'_>,
     ) -> Result<(), String> {
         // No reentrancy: the closure has no `.await`, so the SCATTER_INDICES
         // borrow is released before the next caller needs it.
         with_worker_indices(batch, schema, self.num_workers, |worker_indices| {
-            self.sal.scatter_wire_group(
+            self.sal.with_scatter_group(
                 batch,
                 worker_indices,
-                schema,
-                target_id as u32,
-                0,
-                sal_flags,
-                0,
-                seek_col_idx,
-                req_ids,
-                None,
-                None,
-            )
-        })
-    }
-
-    /// Write one scan group. The worker's `scan_family` resolves and returns the
-    /// relation's schema from its own catalog, so the group carries no rows and
-    /// no schema block.
-    ///
-    /// A plain scan passes `sal_flags = 0` and the schema-version bits in
-    /// `wire_flags` (plus `FLAG_SCAN_FIFO_REPLY` for a multi-scan). A ScanSpec
-    /// (`ReadSpec`) read passes `FLAG_SCAN_SPEC` and the client's bundled spec +
-    /// reply-schema blob **verbatim** in `seek_pk_extra`, with `wire_flags = 0`:
-    /// its reply carries no schema block, so there is no version to negotiate.
-    /// The master reads only the bound header out of the spec, to route
-    /// (`confined_worker`); the worker is the sole `ReadSpec`/OPK decoder.
-    ///
-    /// `seek_pk` carries the last tick round the master had emitted when it wrote
-    /// this group, which is what cuts a delta read's interval above. It was
-    /// hard-coded `0` before, and read by nothing in either scan arm, so the two
-    /// callers with nothing to say there still pass `0`.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn write_scan_group(
-        &self,
-        target_id: i64,
-        sal_flags: u32,
-        wire_flags: u64,
-        req_ids: &[u64],
-        unicast_worker: Fanout,
-        client_id: u64,
-        seek_pk_extra: &[u8],
-        seek_pk: u128,
-    ) -> Result<(), String> {
-        self.write_command_group(
-            target_id,
-            0,
-            sal_flags,
-            wire_flags,
-            seek_pk,
-            0,
-            req_ids,
-            unicast_worker,
-            client_id,
-            seek_pk_extra,
-        )
-    }
-
-    /// Replicate one dataless control slot to every worker, then signal (no
-    /// fdatasync). `lsn` is the caller's: a DDL zone LSN (`broadcast_ddl`), the
-    /// checkpoint generation (FlushEph round), or 0 for command-only groups.
-    ///
-    /// A schema block built here carries no column names: `decode_schema_block`
-    /// parses only the col_idx / type / flags regions, and the SAL never leaves
-    /// the master→worker path.
-    fn send_broadcast(
-        &self,
-        target_id: i64,
-        lsn: u64,
-        flags: u32,
-        schema: Option<&SchemaDescriptor>,
-        seek_pk: u128,
-    ) -> Result<(), String> {
-        self.sal.write_group_direct(
-            &DirectGroup {
-                template: wire::WireMsg {
+                wire::WireMsg {
                     target_id: target_id as u64,
-                    seek_pk,
-                    schema,
+                    seek_col_idx,
+                    schema: Some(schema),
                     ..Default::default()
                 },
-                worker_data: &[],
-                req_ids: &SYNC_COLLECT_REQ_IDS[..self.num_workers],
-                unicast_worker: None,
-            },
-            lsn,
-            flags,
-        )?;
-        self.signal_all();
-        Ok(())
+                targets,
+                None,
+                |g| self.sal.write_group_direct(g, 0, sal_flags),
+            )
+        })
     }
 
     /// Wake every worker: they see the SAL entry through the mapping's Acquire
@@ -426,47 +264,25 @@ impl MasterDispatcher {
     }
 
     /// Liveness gate for the pre-reactor bootstrap wait loops. A crashed worker
-    /// (panic / OOM-kill / SIGKILL) leaves its `reader_seq` frozen, so `wait_for`
+    /// (panic / OOM-kill / SIGKILL) leaves its `reader_seq` frozen, so the park
     /// only ever times out and the wait loop would spin forever. Callers probe
     /// before parking and surface the dead worker as an error instead of hanging
-    /// the master; `context` names the bootstrap phase ("before completing
-    /// recovery sync", "during backfill relay"). On these paths workers stay
-    /// alive after acking, so a reaped worker has not published the awaited
-    /// frame — no ack is lost.
-    fn fail_if_worker_dead(&self, context: &str) -> Result<(), String> {
+    /// the master; `ctx` names the phase ("recovery sync", "backfill relay"). On
+    /// these paths workers stay alive after acking, so a reaped worker has not
+    /// published the awaited frame — no ack is lost.
+    fn fail_if_worker_dead(&self, ctx: &str) -> Result<(), String> {
         let dead = self.check_workers();
         if dead >= 0 {
-            return Err(format!("worker {dead} exited {context}"));
+            return Err(format!("worker {dead} exited during {ctx}"));
         }
         Ok(())
     }
 
-    /// Wait for one ACK from each worker, driving each ring synchronously via
-    /// `W2mReceiver::wait_for` (FUTEX_WAIT on `reader_seq`). The tail-chasing
-    /// ring self-maintains — no reset needed.
-    ///
-    /// Two callers, matching `collect_acks_and_relay`: boot, before the reactor
-    /// is up, and the reactor-parked stop-the-world CREATE VIEW window (a
-    /// backfill whose `checkpoint_before_backfill` fires reaches this
-    /// post-handoff).
-    pub fn collect_acks(&self) -> Result<(), String> {
-        for w in 0..self.num_workers {
-            loop {
-                match self.w2m.try_read(w) {
-                    Some(decoded) => {
-                        if let Some(e) = worker_error(w, "recovery sync", &decoded.control) {
-                            return Err(e.text);
-                        }
-                        break;
-                    }
-                    None => {
-                        self.fail_if_worker_dead("before completing recovery sync")?;
-                        let _ = self.w2m.wait_for(w, W2M_SYNC_WAIT_MS);
-                    }
-                }
-            }
-        }
-        Ok(())
+    /// Collect one ACK per worker with no backfill relay to service and no
+    /// checkpoint permitted — [`Self::collect_acks_and_relay`] under the
+    /// narrowest of its shapes.
+    pub fn collect_acks(&self, ctx: &str) -> Result<(), String> {
+        self.collect_acks_and_relay(false, ctx)
     }
 
     pub(crate) fn num_workers(&self) -> usize {
@@ -474,21 +290,22 @@ impl MasterDispatcher {
     }
 
     /// Collect ACKs from all workers, relaying exchange messages inline by
-    /// walking each ring serially with `W2mReceiver::wait_for` and a private
-    /// `ExchangeAccumulator`. Two callers, both holding SAL-writer exclusivity
-    /// with no concurrent relay to service:
-    /// - **Boot** (`fan_out_backfill`), before the reactor is up.
-    /// - **Live CREATE VIEW**, the reactor-parked stop-the-world DDL window:
-    ///   `handle_ddl_txn` holds the catalog write lock (so the async
-    ///   `relay_loop`, which would take the read lock, cannot run and cannot
-    ///   deadlock) and drives the backfill/drain inline.
+    /// walking each ring serially and servicing any exchange round through a
+    /// private `ExchangeAccumulator`.
+    ///
+    /// The caller must exclude every other SAL writer and have no concurrent
+    /// relay to service — either by running before the reactor is up, or by
+    /// running with it parked under the catalog write lock, which is what stops
+    /// the async `relay_loop` taking the read lock and deadlocking against this.
     ///
     /// `checkpoint_allowed`: a backfill may stamp CHECKPOINT to reclaim SAL
     /// space mid-stream (workers re-epoch inline). A drain TICK must NOT —
     /// it carries no backfill pad, so a CHECKPOINT would advance the master
     /// epoch while workers stay on the old one and wedge the cluster; pass
     /// `false` to force CONTINUE.
-    fn collect_acks_and_relay(&self, checkpoint_allowed: bool) -> Result<(), String> {
+    ///
+    /// `ctx` names the phase in a worker-fault or dead-worker error.
+    fn collect_acks_and_relay(&self, checkpoint_allowed: bool, ctx: &str) -> Result<(), String> {
         let nw = self.num_workers;
         // One bit per worker still owing its ACK; `MAX_WORKERS` is 64.
         let mut pending_mask: u64 = if nw == 64 { u64::MAX } else { (1u64 << nw) - 1 };
@@ -540,7 +357,7 @@ impl MasterDispatcher {
                         let decision = if all_pad {
                             BACKFILL_DECISION_STOP
                         } else if checkpoint_allowed
-                            && (!self.sal_has_room_for(prep.footprint) || BACKFILL_RELAY_SPACE_LOW.armed())
+                            && (!self.relay_fits(prep.footprint) || BACKFILL_RELAY_SPACE_LOW.armed())
                         {
                             pending_reset = true;
                             BACKFILL_DECISION_CHECKPOINT
@@ -550,26 +367,18 @@ impl MasterDispatcher {
                         self.emit_relay_with_decision(&prep, decision)?;
                     }
                 } else {
-                    if let Some(e) = worker_error(w, "backfill relay", &decoded.control) {
+                    if let Some(e) = worker_error(w, ctx, &decoded.control) {
                         return Err(e.text);
                     }
                     pending_mask &= !(1u64 << w);
                 }
             }
             if !progressed {
-                self.fail_if_worker_dead("during backfill relay")?;
+                self.fail_if_worker_dead(ctx)?;
                 // Wait on ALL still-pending workers at once: any could be the next
                 // to publish, and a single-word wait would miss a wake on a
                 // different worker's reader_seq.
-                let mut pending = [0usize; MAX_WORKERS];
-                let mut np = 0;
-                for w in BitIter(pending_mask) {
-                    pending[np] = w;
-                    np += 1;
-                }
-                if np > 0 {
-                    let _ = self.w2m.wait_any(&pending[..np], W2M_SYNC_WAIT_MS);
-                }
+                let _ = self.w2m.wait_any(pending_mask, W2M_SYNC_WAIT_MS);
             }
         }
         Ok(())
@@ -586,7 +395,10 @@ impl MasterDispatcher {
     /// is the only lever there is. An idle server past neither line pays
     /// nothing.
     fn checkpoint_before_backfill(&self) -> Result<(), String> {
-        if self.sal.cursor() > self.relay_margin() || self.sal.needs_checkpoint() {
+        // Reclaim unless the log is still nearly empty. `needs_checkpoint()` is
+        // not implied by the watermark: `GNITZ_CHECKPOINT_BYTES` is unclamped
+        // and may sit below `mmap/8`.
+        if self.sal.cursor() > self.sal.mmap_size() >> 3 || self.sal.needs_checkpoint() {
             self.reclaim_base()?;
         }
         Ok(())
@@ -644,10 +456,9 @@ impl MasterDispatcher {
     /// A `FLAG_FLUSH_EPH` round's `lsn` IS the checkpoint generation (workers
     /// latch it via `set_resume_generation`); the base round passes 0.
     fn sync_round(&self, lsn: u64, flags: u32) -> Result<(), String> {
-        self.note_flush_round(lsn, flags);
-        // No schema block: `handle_flush_all` takes neither a schema nor a batch.
-        self.send_broadcast(0, lsn, flags, None, 0)?;
-        self.collect_acks()?;
+        self.write_checkpoint_group(lsn, flags, GroupTargets::AllSilent)?;
+        self.signal_all();
+        self.collect_acks("recovery sync")?;
         self.checkpoint_post_ack()
     }
 
@@ -687,69 +498,66 @@ impl MasterDispatcher {
         &ARMED
     }
 
-    /// Raw SAL relay-space threshold: at least 1/8 of the mmap still free.
-    /// Seam-free — the boot backfill relay checks this directly because it
-    /// must keep failing-on-low-space without observing the relay_loop test
-    /// seam (which would spuriously fail an in-progress backfill). The
-    /// watchdog's reclaim trigger reads it for the same reason: a timer
-    /// honouring the seam would checkpoint the armed epoch away before
-    /// `relay_loop` reached its low-space branch.
+    /// Whether a relay of `need` bytes may be written: it must fit, and the SAL
+    /// must still be above the 1/8-of-the-mapping reclaim watermark.
+    ///
+    /// A relay is refused below the watermark even when its own group fits, so
+    /// the reclaim lands on a relay with room to spare rather than on one that
+    /// has run out. `fit(x) == Fits` is `x <= capacity - cursor`, so one query
+    /// of the larger requirement answers both.
+    fn relay_fits(&self, need: usize) -> bool {
+        self.sal.fit(need.max(self.sal.mmap_size() as usize >> 3)) == SalFit::Fits
+    }
+
+    /// The watermark alone, ignoring the `relay_loop` test seam. The boot
+    /// backfill relay and the watchdog's reclaim timer both need the real
+    /// verdict: the seam would spuriously fail an in-progress backfill, and
+    /// checkpoint the armed epoch away before `relay_loop` saw it.
     pub(crate) fn sal_relay_space_ok_raw(&self) -> bool {
-        self.sal_has_room_for(0)
+        self.relay_fits(0)
     }
 
-    /// The proactive reclaim watermark: 1/8 of the mapping. A relay is refused
-    /// below it even when it would fit, so the reclaim happens on the relay that
-    /// still has room to spare rather than on the one that has run out.
-    fn relay_margin(&self) -> u64 {
-        self.sal.mmap_size() >> 3
-    }
-
-    /// Free SAL bytes, against both the reclaim watermark and a caller's own
-    /// requirement. `need` 0 asks about the watermark alone.
-    fn sal_has_room_for(&self, need: usize) -> bool {
-        let free = self.sal.mmap_size() - self.sal.cursor();
-        free >= std::cmp::max(self.relay_margin(), need as u64)
-    }
-
-    /// The per-worker slots a relay emits.
-    fn relay_data<'a>(&self, dest: &'a RelayDest) -> Vec<wire::WireData<'a>> {
-        match dest {
-            RelayDest::PerWorker(batches) => batches
-                .iter()
-                .map(|b| wire::WireData::Whole((b.count > 0).then_some(b)))
-                .collect(),
-            RelayDest::Broadcast(b) => {
-                vec![wire::WireData::Whole((b.count > 0).then_some(&**b)); self.num_workers]
-            }
-        }
-    }
-
-    /// The SAL group an exchange relay writes. `prepare_relay` sizes it and
-    /// `emit_relay_with_decision` emits it, so the bytes checked are the bytes
-    /// written — `decision` is the only field that differs between the two, and
-    /// `WireMsg::size` does not read it.
+    /// Build the SAL group an exchange relay writes and hand it to `f`. Sizing
+    /// and emission both go through here, so the bytes checked are the bytes
+    /// written; `WireMsg::size` does not read `decision`.
     ///
     /// `seek_pk` echoes `source_id` back so the worker's `do_exchange_wait` can
     /// match on (view_id, source_id). Without it, a multi-source view (join over
     /// 2+ tables) can deliver the wrong source's relay to a waiting exchange and
     /// the worker demuxes against the wrong sharding columns.
-    fn relay_group<'a>(
+    fn with_relay_group<R>(
         &self,
         view_id: i64,
         source_id: i64,
-        schema: &'a SchemaDescriptor,
-        worker_data: &'a [wire::WireData<'a>],
+        schema: &SchemaDescriptor,
+        dest: &RelayDest,
         decision: u64,
-    ) -> DirectGroup<'a> {
-        Self::data_group(
-            view_id,
-            worker_data,
-            schema,
-            source_id as u128,
-            decision,
-            &SYNC_COLLECT_REQ_IDS[..self.num_workers],
-        )
+        f: impl FnOnce(&DirectGroup) -> R,
+    ) -> R {
+        let template = wire::WireMsg {
+            target_id: view_id as u64,
+            seek_pk: source_id as u128,
+            seek_col_idx: decision,
+            schema: Some(schema),
+            ..Default::default()
+        };
+        let group = |data| DirectGroup {
+            template,
+            data,
+            targets: GroupTargets::AllSilent,
+        };
+        match dest {
+            RelayDest::Broadcast(b) => f(&group(GroupData::Same(wire::WireData::Whole(
+                (b.count > 0).then_some(&**b),
+            )))),
+            RelayDest::PerWorker(batches) => {
+                let slots: Vec<wire::WireData> = batches
+                    .iter()
+                    .map(|b| wire::WireData::Whole((b.count > 0).then_some(b)))
+                    .collect();
+                f(&group(GroupData::PerWorker(&slots)))
+            }
+        }
     }
 
     /// Whether a group of `need` bytes fits the SAL, and if not, whether a
@@ -824,96 +632,34 @@ impl MasterDispatcher {
         };
         let sources: Vec<Option<&Batch>> = payloads[..n_src].iter().map(|o| o.as_ref()).collect();
 
-        // A join-shard scatter (cols from a reindex chain) must route by the
-        // reindex key so a row lands on the worker that owns its `_join_pk`
-        // partition; a GROUP BY / set-op exchange scatter routes by the group
-        // key (consistent with op_reduce's output PK). See `RouteMode`.
-        // A join-shard scatter carries a per-slot promotion target; a GROUP BY /
-        // set-op scatter has none, and only the join arm ever consults one.
         let meta = cat.dag_mut().view_meta(view_id);
-        // A source whose scan feeds several distinct reindex keys has no single
-        // pack key: routing by any one of them, or by the view's `shard_cols`,
-        // would put the delta on a worker the trace side never stored under, and
-        // the join would silently drop matches. Refuse the round instead.
-        if let Some(None) = meta.join_shard_map.get(&source_id) {
-            return Err(format!(
-                "view {view_id}: source {source_id} feeds several distinct reindex keys; no single \
-                 scatter key co-partitions it"
-            ));
-        }
-        let join_key = (source_id > 0)
-            .then(|| meta.join_shard_map.get(&source_id))
-            .flatten()
-            .and_then(|k| k.as_ref())
-            .filter(|k| !k.cols.is_empty());
-        let is_join = join_key.is_some();
-        let shard_cols: &[u32] = match join_key {
-            Some(k) => &k.cols,
-            // A view with no `ExchangeShard` shards on `∅` — every row to
-            // partition 0's owner — the same route a global aggregate takes.
-            None => meta.shard_cols.as_deref().unwrap_or(&[]),
-        };
-
-        // A range-join INPUT relay (source_id > 0, is_join over a DeltaTraceRange
-        // view): `view_range_join_n_eq` reads the equality-conjunct count straight
-        // off the join node. The trace-side reindex key is [eq cols…, range col]
-        // (len n_eq + 1). A band join (n_eq ≥ 1) scatters by the eq PREFIX — route
-        // by the first n_eq slots, dropping the trailing range slot, so equal
-        // eq-values co-partition both sides and the range probe is partition-local.
-        // A pure range join (n_eq == 0) has no eq prefix: its matches are spread
-        // over the whole key space, so it BROADCASTS the full delta and each worker
-        // trims to its owned slice (WorkerFilter) before integrating. The output
-        // relay (source_id == 0) is NOT a join relay (is_join is false there) and
-        // keeps the GroupKey scatter.
-        let range_n_eq = if is_join { meta.range_join_n_eq } else { None };
-
-        let dest = if range_n_eq == Some(0) {
-            // Pure range join: broadcast the full delta to every worker.
-            RelayDest::Broadcast(Box::new(op_relay_broadcast(&sources, &schema)))
-        } else {
-            // Scatter. Band join (range_n_eq == Some(n_eq ≥ 1)): route by the eq
-            // prefix shard_cols[..n_eq]. Equi-join: full shard cols. Both
-            // JoinPromote. GROUP BY / set-op: full shard cols, GroupKey.
-            let route_len = range_n_eq.map_or(shard_cols.len(), |n_eq| n_eq as usize);
-            debug_assert!(
-                range_n_eq.is_none_or(|n_eq| shard_cols.len() == n_eq as usize + 1),
-                "range-join reindex key = [eq…, range]: len must be n_eq + 1"
-            );
-            let col_indices = &shard_cols[..route_len];
-            // A GroupKey scatter promotes nothing; a join's target list is as long
-            // as its key, so slice it to the routing prefix.
-            let route_tcs: &[u8] = match join_key {
-                Some(k) => &k.target_tcs[..route_len],
-                None => &[],
-            };
-            let mode = if is_join {
-                RouteMode::JoinPromote
-            } else {
-                RouteMode::GroupKey
-            };
-            // Every contributing source must be consolidated to take the
-            // merge-walk scatter; a single non-consolidated source falls back to
-            // the re-sorting repartition. The scatter
-            // (`op_relay_scatter_consolidated_mode`) debug-verifies each.
-            RelayDest::PerWorker(if sources.iter().flatten().all(|b| b.is_consolidated()) {
-                op_relay_scatter_consolidated_mode(&sources, col_indices, route_tcs, &schema, self.num_workers, mode)
-            } else {
-                op_repartition_batches_mode(&sources, col_indices, route_tcs, &schema, self.num_workers, mode)
-            })
+        let dest = match meta.relay_route(source_id) {
+            RelayRoute::NoSingleKey => {
+                return Err(format!(
+                    "view {view_id}: source {source_id} feeds several distinct reindex keys; no single \
+                     scatter key co-partitions it"
+                ))
+            }
+            RelayRoute::Broadcast => RelayDest::Broadcast(Box::new(op_relay_broadcast(&sources, &schema))),
+            RelayRoute::Scatter { cols, target_tcs, mode } => {
+                // Every contributing source must be consolidated to take the
+                // merge-walk scatter; a single non-consolidated source falls back to
+                // the re-sorting repartition. The scatter
+                // (`op_relay_scatter_consolidated_mode`) debug-verifies each.
+                RelayDest::PerWorker(if sources.iter().flatten().all(|b| b.is_consolidated()) {
+                    op_relay_scatter_consolidated_mode(&sources, cols, target_tcs, &schema, self.num_workers, *mode)
+                } else {
+                    op_repartition_batches_mode(&sources, cols, target_tcs, &schema, self.num_workers, *mode)
+                })
+            }
         };
 
         // Size the group here, outside `sal_writer_excl`: the batches are in
         // hand, so the fit check under the lock is a comparison rather than a
         // sizing pass.
-        let worker_data = self.relay_data(&dest);
-        let footprint = self.sal.group_footprint_direct(&self.relay_group(
-            view_id,
-            source_id,
-            &schema,
-            &worker_data,
-            BACKFILL_DECISION_CONTINUE,
-        ));
-        drop(worker_data);
+        let footprint = self.with_relay_group(view_id, source_id, &schema, &dest, BACKFILL_DECISION_CONTINUE, |g| {
+            self.sal.group_footprint_direct(g)
+        });
 
         Ok(RelayPrepared {
             view_id,
@@ -933,15 +679,14 @@ impl MasterDispatcher {
     /// while `collect_acks_and_relay` instead runs with the reactor parked, so
     /// no other task can reach the SAL at all.
     ///
-    /// CONTINUE == 0 is the value a plain steady-state relay's `seek_col_idx` has
-    /// always carried. `collect_acks_and_relay` is the sole STOP/CHECKPOINT
-    /// stamper (it terminates a backfill's chunked exchange on an all-pad round);
-    /// the reactor's `relay_loop` serves only steady-state tick exchanges and
-    /// always passes CONTINUE.
+    /// `collect_acks_and_relay` is the sole STOP/CHECKPOINT stamper (it
+    /// terminates a backfill's chunked exchange on an all-pad round); the
+    /// reactor's `relay_loop` serves only steady-state tick exchanges and always
+    /// passes CONTINUE, which is 0.
     pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), String> {
-        let worker_data = self.relay_data(&prep.dest);
-        let group = self.relay_group(prep.view_id, prep.source_id, &prep.schema, &worker_data, decision);
-        self.sal.write_group_direct(&group, 0, FLAG_EXCHANGE_RELAY)?;
+        self.with_relay_group(prep.view_id, prep.source_id, &prep.schema, &prep.dest, decision, |g| {
+            self.sal.write_group_direct(g, 0, FLAG_EXCHANGE_RELAY)
+        })?;
         self.signal_all();
         Ok(())
     }
@@ -963,11 +708,24 @@ impl MasterDispatcher {
     /// view and index invalid until an ephemeral round re-stamps them — so a
     /// caller that observes the bump must run `restamp_derived` before its window
     /// closes.
-    pub fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), String> {
+    fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), String> {
         self.checkpoint_before_backfill()?;
+        // The schema block is what stamps `Batch.schema` on the worker side.
         let schema = self.schema_desc_for(source_id);
-        self.send_broadcast(source_id, 0, FLAG_BACKFILL, Some(&schema), view_id as u128)?;
-        self.collect_acks_and_relay(true)
+        self.write_group(
+            wire::WireMsg {
+                target_id: source_id as u64,
+                seek_pk: view_id as u128,
+                schema: Some(&schema),
+                ..Default::default()
+            },
+            GroupData::NONE,
+            0,
+            FLAG_BACKFILL,
+            GroupTargets::AllSilent,
+        )?;
+        self.signal_all();
+        self.collect_acks_and_relay(true, "backfill relay")
     }
 
     /// Backfill every view in `view_ids`, in dependency order, from each of its
@@ -1004,10 +762,9 @@ impl MasterDispatcher {
     /// so a CHECKPOINT verdict would advance only the master's epoch and wedge
     /// the cluster (see `collect_acks_and_relay`).
     pub(crate) fn drain_tick_blocking(&self, source_id: i64) -> Result<(), String> {
-        let nw = self.num_workers;
-        self.write_tick_group(source_id, &SYNC_COLLECT_REQ_IDS[..nw])?;
+        self.write_tick_group(source_id, GroupTargets::AllSilent)?;
         self.signal_all();
-        self.collect_acks_and_relay(false)
+        self.collect_acks_and_relay(false, "backfill relay")
     }
 
     pub async fn fan_out_seek(
@@ -1018,10 +775,7 @@ impl MasterDispatcher {
         seek_pk_extra: &[u8],
     ) -> Result<W2mSlot, String> {
         let num_workers = self.num_workers;
-        let schema = self
-            .cat()
-            .get_schema_desc(target_id)
-            .ok_or_else(|| format!("seek: table {target_id} not found"))?;
+        let schema = self.cat().schema_or_err(target_id, "seek")?;
         // Decode the wire pair to the OPK bytes (width-universal), then route off
         // the distribution prefix via the shared `worker_for_pk`. A FLAG_SEEK
         // always carries the full PK and the prefix ⊆ the PK, so a full-PK seek
@@ -1030,11 +784,21 @@ impl MasterDispatcher {
         let opk = gnitz_engine::schema::key::seek_opk_bytes(&schema, pk, seek_pk_extra)
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
         let worker = schema.worker_for_pk(opk.pk_bytes(), num_workers);
-        let (mut slots, _req_ids, _lease) =
-            dispatch_scan_fanout(self, reactor, Fanout::One(worker), |_, req_ids, unicast| {
-                self.write_command_group(target_id, 0, FLAG_SEEK, 0, pk, 0, req_ids, unicast, 0, seek_pk_extra)
-            })
-            .await?;
+        let (mut slots, _scan) = dispatch_scan_fanout(self, reactor, Fanout::One(worker), |targets| {
+            self.write_group(
+                wire::WireMsg {
+                    target_id: target_id as u64,
+                    seek_pk: pk,
+                    seek_pk_extra,
+                    ..Default::default()
+                },
+                GroupData::NONE,
+                0,
+                FLAG_SEEK,
+                targets,
+            )
+        })
+        .await?;
         let slot = slots.pop().expect("unicast fan-out returns one slot");
         // A point seek's reply must fit one frame; a train would be forwarded
         // truncated, so reject it rather than silently drop the remainder.
@@ -1078,22 +842,23 @@ impl MasterDispatcher {
         // the fan-out (matches scatter by PK).
         let unicast = replicated_unicast(self, target_id);
         let mut expected: Option<SchemaDescriptor> = None;
-        let (slots, req_ids, _lease) = dispatch_scan_fanout(self, reactor, unicast, |_, req_ids, unicast| {
+        let (slots, scan) = dispatch_scan_fanout(self, reactor, unicast, |targets| {
             // The schema is the master's own reply guard, not something the
             // group carries: the worker's `seek_by_index` arm resolves its
             // own from its own catalog.
             expected = Some(self.schema_desc_for(target_id));
-            self.write_command_group(
-                target_id,
+            self.write_group(
+                wire::WireMsg {
+                    target_id: target_id as u64,
+                    seek_pk,
+                    seek_col_idx,
+                    seek_pk_extra,
+                    ..Default::default()
+                },
+                GroupData::NONE,
                 0,
                 FLAG_SEEK_BY_INDEX,
-                0,
-                seek_pk,
-                seek_col_idx,
-                req_ids,
-                unicast,
-                0,
-                seek_pk_extra,
+                targets,
             )
         })
         .await?;
@@ -1101,7 +866,7 @@ impl MasterDispatcher {
 
         let mut acc: Option<Batch> = None;
         let mut merged_bytes = 0usize;
-        drain_index_scan(slots, &req_ids, reactor, OP, &expected, |mb, frame_len| {
+        drain_index_scan(slots, &scan, reactor, OP, &expected, |mb, frame_len| {
             // The merge goes back out as one frame, so it is bounded by what the
             // client will read (`FRAME_CAP`). Σ frame bytes ≥ that merged encode
             // size — every frame re-counts its header and the first one the schema
@@ -1132,12 +897,15 @@ impl MasterDispatcher {
     /// `Ok(false)` if the client disconnects mid-stream, `Err` on a worker
     /// error.
     ///
-    /// `sal_flags`/`wire_flags`/`seek_pk_extra` select the read shape, as
-    /// `write_scan_group` documents: a plain scan passes the client's schema
-    /// version in `wire_flags` so workers can decide whether to include a schema
-    /// block; a ScanSpec read passes `FLAG_SCAN_SPEC` and the client's verbatim
-    /// spec blob, and negotiates no version (its reply carries no schema block —
-    /// the client decodes against the schema it authored). `unicast` comes from
+    /// `sal_flags`/`wire_flags`/`seek_pk_extra` select the read shape. A plain
+    /// scan passes the client's schema version in `wire_flags` so workers can
+    /// decide whether to include a schema block; a ScanSpec (`ReadSpec`) read
+    /// passes `FLAG_SCAN_SPEC` and the client's bundled spec + reply-schema blob
+    /// **verbatim** in `seek_pk_extra` with `wire_flags = 0`, negotiating no
+    /// version (its reply carries no schema block — the client decodes against
+    /// the schema it authored). The master reads only the bound header out of
+    /// the spec, to route (`confined_worker`); the worker is the sole
+    /// `ReadSpec`/OPK decoder. `unicast` comes from
     /// [`replicated_unicast`] or [`scan_spec_route`], which own the routing
     /// policy (replicated relations to worker 0, confinable ranges to their
     /// owner).
@@ -1160,24 +928,16 @@ impl MasterDispatcher {
     /// sees the read group after exactly the tick groups of rounds `<= T` and
     /// before any group of a later round.
     ///
-    /// No tick group can land between the sample and the write, and the mutex is
-    /// only half of why — which matters because the other half is the fragile
-    /// half. `run_tick` writes its groups under it; the three `drain_tick_blocking`
-    /// callers write theirs under **no** mutex at all. What covers all four paths
-    /// is that the reactor is single-threaded and each of them is await-free, so
-    /// two of them cannot interleave. The mutex earns its place against the
-    /// *committer*, which holds it across an fsync and would otherwise put a read
-    /// group inside a commit zone. Stated that way, the first `drain_tick_blocking`
-    /// caller to grow an `await` is a visible break rather than a silent one.
+    /// No tick group can land between the sample and the write. `run_tick`
+    /// writes its groups under this mutex; `drain_tick_blocking` writes under
+    /// none, but is `fn` rather than `async fn`, so the single-threaded reactor
+    /// cannot interleave it. The mutex earns its place against the *committer*,
+    /// which holds it across an fsync and would otherwise put a read group
+    /// inside a commit zone.
     ///
     /// The round is written into the group's `seek_pk` as well as returned, so the
     /// worker cuts the delta interval at it rather than walking to the end of its
-    /// store. `seek_pk` is genuinely free on a scan group — hard-coded `0` before
-    /// this and read by nothing in either scan arm.
-    ///
-    /// Sampling unconditionally is a `Cell` read under a lock the function already
-    /// holds, so it costs the other callers nothing; the plain scan and the
-    /// multi-scan drop the payload explicitly at their own call sites.
+    /// store. `seek_pk` is free on a scan group: neither scan arm reads it.
     #[allow(clippy::too_many_arguments)]
     pub async fn fan_out_scan(
         &self,
@@ -1190,28 +950,28 @@ impl MasterDispatcher {
         wire_flags: u64,
         seek_pk_extra: &[u8],
     ) -> Result<(bool, u64), WorkerFault> {
-        // `_lease` held across the entire continuation drain: every worker
-        // streams a multi-frame train, and a cancelled drain (client disconnect)
-        // must keep the ids active until the lease drops so the gate discards —
-        // not parks — late frames.
-        let sampled = Cell::new(0u64);
-        let (slots, req_ids, _lease) = dispatch_scan_fanout(self, reactor, unicast, |_, req_ids, unicast| {
+        let mut sampled = 0u64;
+        let (slots, scan) = dispatch_scan_fanout(self, reactor, unicast, |targets| {
             let round = self.last_tick_round();
-            sampled.set(round);
-            self.write_scan_group(
-                target_id,
+            sampled = round;
+            self.write_group(
+                wire::WireMsg {
+                    target_id: target_id as u64,
+                    client_id,
+                    flags: wire_flags,
+                    seek_pk: round as u128,
+                    seek_pk_extra,
+                    ..Default::default()
+                },
+                GroupData::NONE,
+                0,
                 sal_flags,
-                wire_flags,
-                req_ids,
-                unicast,
-                client_id,
-                seek_pk_extra,
-                round as u128,
+                targets,
             )
         })
         .await?;
-        let ok = forward_scan_slots(reactor, peer, slots, &req_ids, unicast).await?;
-        Ok((ok, sampled.get()))
+        let ok = forward_scan_slots(reactor, peer, slots, &scan).await?;
+        Ok((ok, sampled))
     }
 
     /// Await + forward one already-dispatched scan relation: the await+drain
@@ -1232,12 +992,10 @@ impl MasterDispatcher {
     pub(crate) async fn await_and_drain_scan_relation(
         reactor: &crate::runtime::reactor::Reactor,
         peer: &Peer,
-        unicast: Fanout,
-        req_ids: &[u64],
-        nw: usize,
+        scan: &ScanDispatch,
     ) -> Result<bool, WorkerFault> {
-        let slots = await_scan_slots(reactor, unicast, req_ids, nw).await;
-        forward_scan_slots(reactor, peer, slots, req_ids, unicast).await
+        let slots = await_scan_slots(reactor, scan).await;
+        forward_scan_slots(reactor, peer, slots, scan).await
     }
 
     /// Broadcast a DDL batch to every worker. `lsn` is the caller's zone
@@ -1246,21 +1004,17 @@ impl MasterDispatcher {
     /// which is what gives the zone a byte span recovery can attribute damage to.
     pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64, zone_start: bool) -> Result<(), String> {
         let (schema, schema_block, _safe, _stride) = self.cached_schema_block(target_id);
-        let worker_data = vec![wire::WireData::Whole(Some(batch)); self.num_workers];
-        self.sal.write_group_direct(
-            &DirectGroup {
-                template: wire::WireMsg {
-                    target_id: target_id as u64,
-                    schema: Some(&schema),
-                    prebuilt_schema_block: Some(schema_block.as_slice()),
-                    ..Default::default()
-                },
-                worker_data: &worker_data,
-                req_ids: &SYNC_COLLECT_REQ_IDS[..self.num_workers],
-                unicast_worker: None,
+        self.write_group(
+            wire::WireMsg {
+                target_id: target_id as u64,
+                schema: Some(&schema),
+                prebuilt_schema_block: Some(schema_block.as_slice()),
+                ..Default::default()
             },
+            GroupData::Same(wire::WireData::Whole(Some(batch))),
             lsn,
             FLAG_DDL_SYNC | if zone_start { FLAG_ZONE_START } else { 0 },
+            GroupTargets::AllSilent,
         )?;
         self.signal_all();
         gnitz_debug!("broadcast_ddl tid={} rows={} lsn={}", target_id, batch.count, lsn);
@@ -1320,13 +1074,9 @@ impl MasterDispatcher {
         fires
     }
 
-    /// Write a FLAG_TICK group for `tid` with per-worker req_ids. Does NOT
-    /// signal: the caller writes every group in the batch, then calls
-    /// `signal_all` once. A signal is a wake, not framing — a worker reaches a
-    /// published group through the mapping either way — so batching the wake
-    /// changes no outcome and saves `nw` eventfd writes per group beyond the
-    /// first. Per-worker slots each carry
-    /// the corresponding req_id from `req_ids[w]`. No schema block:
+    /// Write a FLAG_TICK group for `tid`. Does NOT signal: the caller writes
+    /// every group in the batch, then calls `signal_all` once — a signal is a
+    /// wake, not framing, so batching it changes no outcome. No schema block:
     /// `handle_tick` looks the target's schema up in its own catalog.
     ///
     /// **This is where the tick round is allocated**, because this is the one
@@ -1350,14 +1100,23 @@ impl MasterDispatcher {
     /// again under a later one. Recording a round that never reached a worker
     /// gates away nothing: no rows exist at it, and the re-tick raises the map
     /// past it, so a cursor sitting at the burnt round falls through again.
-    pub(crate) fn write_tick_group(&self, tid: i64, req_ids: &[u64]) -> Result<(), String> {
+    pub(crate) fn write_tick_group(&self, tid: i64, targets: GroupTargets<'_>) -> Result<(), String> {
         let round = self.tick_round.get() + 1;
         self.tick_round.set(round);
         self.record_delta_round(tid, round);
         if self.take_injected_tick_emit_error(tid) {
             return Err(format!("injected tick emit error (tid={tid})"));
         }
-        self.write_command_group(tid, round, FLAG_TICK, 0, 0, 0, req_ids, Fanout::Broadcast, 0, &[])
+        self.write_group(
+            wire::WireMsg {
+                target_id: tid as u64,
+                ..Default::default()
+            },
+            GroupData::NONE,
+            round,
+            FLAG_TICK,
+            targets,
+        )
     }
 
     /// Raise the last-reached round of every fed view in `tid`'s **forward**
@@ -1406,7 +1165,10 @@ impl MasterDispatcher {
     /// such overlap because it compares identities, not magnitudes.
     pub(crate) fn delta_cursor_tag(&self, view_id: i64) -> u64 {
         // splitmix64's finalizer: the view id is a small dense integer, and an
-        // unmixed XOR would make neighbouring ids' tags differ in one bit.
+        // unmixed XOR would make neighbouring ids' tags differ in one bit. It is
+        // a **bijection** on u64 — `x ^ (x >> k)` is invertible and both
+        // multipliers are odd — so distinct view ids cannot collide within a
+        // boot, which a general hash (XXH3 over 8 bytes) would not guarantee.
         let mut z = (view_id as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -1472,7 +1234,14 @@ impl MasterDispatcher {
     /// worker processes.
     pub fn shutdown_workers(&self) {
         // No schema block: the worker's `Shutdown` arm takes no arguments.
-        let _ = self.send_broadcast(0, 0, FLAG_SHUTDOWN, None, 0);
+        let _ = self.write_group(
+            wire::WireMsg::default(),
+            GroupData::NONE,
+            0,
+            FLAG_SHUTDOWN,
+            GroupTargets::AllSilent,
+        );
+        self.signal_all();
         for w in 0..self.num_workers {
             let pid = self.worker_pids.borrow()[w];
             if pid > 0 {
@@ -1499,7 +1268,7 @@ impl MasterDispatcher {
     /// `write_commit_group` will emit it (broadcast for a replicated schema, else
     /// PK-partitioned).
     ///
-    /// Each family is measured as the [`DirectGroup`] `scatter_wire_group` builds
+    /// Each family is measured as the [`DirectGroup`] `with_scatter_group` builds
     /// for it, so the fit check and the emission read one set of slot sizes. They
     /// must not drift: the committer fail-stops the node when a family fails to
     /// fit after an earlier family already wrote to the SAL.
@@ -1540,22 +1309,25 @@ impl MasterDispatcher {
         let nw = self.num_workers;
         let wire_flags = wire_flags_set_conflict_mode(0, mode);
         // Identical scatter for both routings; only the per-worker index fill
-        // differs (full broadcast vs PK-partitioned). One `scatter_wire_group`
+        // differs (full broadcast vs PK-partitioned). One `with_scatter_group`
         // call site keeps the atomic-zone framing, LSN, ACK accounting, and the
         // committer's single `fdatasync` shared between them.
+        let template = wire::WireMsg {
+            target_id: target_id as u64,
+            flags: wire_flags,
+            schema: Some(&schema),
+            prebuilt_schema_block: Some(schema_block.as_slice()),
+            ..Default::default()
+        };
+        let sal_flags = FLAG_PUSH | if zone_start { FLAG_ZONE_START } else { 0 };
         let scatter = |worker_indices: &[Vec<u32>]| {
-            self.sal.scatter_wire_group(
+            self.sal.with_scatter_group(
                 batch,
                 worker_indices,
-                &schema,
-                target_id as u32,
-                lsn,
-                FLAG_PUSH | if zone_start { FLAG_ZONE_START } else { 0 },
-                wire_flags,
-                0,
-                req_ids,
-                Some(schema_block.as_slice()),
+                template,
+                GroupTargets::All(req_ids),
                 Some((wire_safe, wire_row_stride)),
+                |g| self.sal.write_group_direct(g, lsn, sal_flags),
             )
         };
         // A replicated relation broadcasts: the whole batch lands in every
@@ -1565,17 +1337,17 @@ impl MasterDispatcher {
     }
 
     /// Write a checkpoint flush group (`FLAG_FLUSH` base round or
-    /// `FLAG_FLUSH_EPH` ephemeral round) with per-worker req_ids. Does NOT
-    /// sync/signal. Caller signals + awaits replies. `lsn` is supplied by the
+    /// `FLAG_FLUSH_EPH` ephemeral round). Does NOT sync/signal. Caller signals,
+    /// then either awaits the replies `targets` names or reads the rings. `lsn` is supplied by the
     /// caller — the ephemeral round passes the checkpoint generation there, which
     /// workers read to stamp view manifests (the base round passes 0).
     ///
     /// Every worker gets a bare control block: `handle_flush_all` takes neither a
     /// schema nor a batch, and reads the generation the worker latched into its
     /// catalog off this round's header.
-    pub(crate) fn write_checkpoint_group(&self, lsn: u64, flags: u32, req_ids: &[u64]) -> Result<(), String> {
+    pub(crate) fn write_checkpoint_group(&self, lsn: u64, flags: u32, targets: GroupTargets<'_>) -> Result<(), String> {
         self.note_flush_round(lsn, flags);
-        self.write_command_group(0, lsn, flags, 0, 0, 0, req_ids, Fanout::Broadcast, 0, &[])
+        self.write_group(wire::WireMsg::default(), GroupData::NONE, lsn, flags, targets)
     }
 
     /// Post-ACK checkpoint cleanup: flush system tables before resetting
@@ -1647,23 +1419,14 @@ impl MasterDispatcher {
     }
 }
 
-/// Await each dispatched worker's first reply slot for a scan group: the single
-/// slot under `Fanout::One` (keyed on `req_ids[0]`), or all `nw` in worker
-/// order under `Fanout::Broadcast`. The one owner of the unicast/broadcast await
-/// shape, shared by `dispatch_scan_fanout`, `fan_out_scan`, and
+/// Await the first reply slot of every worker this scan dispatched to, in reply
+/// order. Shared by `dispatch_scan_fanout`, `fan_out_scan` and
 /// `await_and_drain_scan_relation`.
-pub(crate) async fn await_scan_slots(
-    reactor: &crate::runtime::reactor::Reactor,
-    unicast: Fanout,
-    req_ids: &[u64],
-    nw: usize,
-) -> Vec<W2mSlot> {
-    if unicast != Fanout::Broadcast {
-        vec![reactor.await_scan_slot(req_ids[0] as u32).await]
-    } else {
-        crate::runtime::reactor::join_all_unpin(req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32)))
-            .await
-    }
+pub(crate) async fn await_scan_slots(reactor: &crate::runtime::reactor::Reactor, scan: &ScanDispatch) -> Vec<W2mSlot> {
+    crate::runtime::reactor::join_all_unpin(
+        (0..scan.reply_count()).map(|i| reactor.await_scan_slot(scan.reply(i).1 as u32)),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1694,6 +1457,7 @@ mod worker_liveness_tests {
             nw,
             worker_pids,
             std::ptr::null_mut(),
+            0,
             SalWriter::new(std::ptr::null_mut(), -1, 0, nw),
             Rc::new(W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect())),
             vec![-1; nw],
@@ -1772,10 +1536,12 @@ mod worker_liveness_tests {
     fn collect_acks_errors_when_worker_dies_before_acking() {
         // Boot-recovery path: wait_all_workers finds an empty ring and reaches
         // the park arm, whose liveness probe must surface the dead worker as a
-        // clean error instead of looping on `wait_for` forever.
+        // clean error instead of looping on the park forever.
         let dead = spawn_and_reap_dead();
         let (disp, _rings) = probe_dispatcher(vec![dead]);
-        let err = disp.collect_acks().expect_err("a dead worker must fail ack collection");
+        let err = disp
+            .collect_acks("recovery sync")
+            .expect_err("a dead worker must fail ack collection");
         assert!(err.contains("worker 0"), "error names the dead worker: {err}");
         assert!(
             err.contains("recovery sync"),
@@ -1792,7 +1558,7 @@ mod worker_liveness_tests {
         let dead = spawn_and_reap_dead();
         let (disp, _rings) = probe_dispatcher(vec![dead]);
         let err = disp
-            .collect_acks_and_relay(true)
+            .collect_acks_and_relay(true, "backfill relay")
             .expect_err("a dead worker must fail the backfill relay");
         assert!(err.contains("worker 0"), "error names the dead worker: {err}");
         assert!(
@@ -1815,6 +1581,22 @@ mod checkpoint_finalize_tests {
 
     fn finalize_temp_dir(name: &str) -> String {
         gnitz_engine_testkit::scratch_dir("checkpoint_finalize", name)
+    }
+
+    /// Zero workers over a real catalog and a real (if tiny, and necessarily
+    /// writable) SAL region: every ACK collection is an empty loop, so the
+    /// checkpoint rounds and the finalizer run for real without a forked
+    /// cluster.
+    fn finalize_dispatcher(catalog: *mut CatalogEngine, sal_region: &SharedRegion) -> MasterDispatcher {
+        MasterDispatcher::new(
+            0,
+            Vec::new(),
+            catalog,
+            0,
+            SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, 0),
+            Rc::new(W2mReceiver::new(Vec::new())),
+            Vec::new(),
+        )
     }
 
     /// The checkpoint finalizer must flush system tables before resetting the SAL:
@@ -1841,16 +1623,7 @@ mod checkpoint_finalize_tests {
             // A fake but real, writable SAL region: checkpoint_reset() stores 0 at
             // the base pointer, so it must not be null.
             let sal_region = SharedRegion::new(SAL_SIZE);
-            let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, 0);
-            let catalog_ptr = &mut engine as *mut CatalogEngine;
-            let disp = MasterDispatcher::new(
-                0,
-                Vec::new(),
-                catalog_ptr,
-                sal_writer,
-                Rc::new(W2mReceiver::new(Vec::new())),
-                Vec::new(),
-            );
+            let disp = finalize_dispatcher(&mut engine as *mut CatalogEngine, &sal_region);
 
             // The finalizer under guard: must durably flush sys_sequences before the
             // reset.
@@ -1885,16 +1658,7 @@ mod checkpoint_finalize_tests {
         assert_eq!(engine.durable_generation(), 0, "fresh DB starts at generation 0");
 
         let sal_region = SharedRegion::new(SAL_SIZE);
-        let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, 0);
-        let catalog_ptr = &mut engine as *mut CatalogEngine;
-        let disp = MasterDispatcher::new(
-            0,
-            Vec::new(),
-            catalog_ptr,
-            sal_writer,
-            Rc::new(W2mReceiver::new(Vec::new())),
-            Vec::new(),
-        );
+        let disp = finalize_dispatcher(&mut engine as *mut CatalogEngine, &sal_region);
 
         // Epoch 0 is the empty-slot sentinel, so the region needs a boot reset
         // before any group is written — what `server_main` does after worker ACKs.
@@ -1927,16 +1691,7 @@ mod checkpoint_finalize_tests {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
         let sal_region = SharedRegion::new(SAL_SIZE);
-        let sal_writer = SalWriter::new(sal_region.ptr(), -1, SAL_SIZE as u64, 0);
-        let catalog_ptr = &mut engine as *mut CatalogEngine;
-        let disp = MasterDispatcher::new(
-            0,
-            Vec::new(),
-            catalog_ptr,
-            sal_writer,
-            Rc::new(W2mReceiver::new(Vec::new())),
-            Vec::new(),
-        );
+        let disp = finalize_dispatcher(&mut engine as *mut CatalogEngine, &sal_region);
         disp.reset_sal(1);
 
         let gen = disp.reclaim_base().unwrap();

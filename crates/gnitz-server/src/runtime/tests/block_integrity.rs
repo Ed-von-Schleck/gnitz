@@ -2,6 +2,7 @@
 //! own checksum, so only the exact region-size relations constrain it) and the
 //! control block (checksummed but never verified until now).
 
+use crate::runtime::sal::GroupTargets;
 use crate::runtime::wire::{
     build_schema_wire_block, decode_schema_block, encode_ctrl_block_direct, peek_control_block, peek_control_block_ipc,
     WireData, WireMsg, STATUS_OK,
@@ -306,7 +307,7 @@ fn the_control_blocks_size_field_is_exact() {
     }
 }
 
-/// The push fast path (`scatter_wire_group`) stamps the control-block checksum
+/// The push fast path (`with_scatter_group`) stamps the control-block checksum
 /// too — the SAL's highest-volume writer, and the one every other fixture here
 /// misses.
 #[test]
@@ -329,18 +330,18 @@ fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
     let req_ids: Vec<u64> = (0..nw as u64).collect();
     with_commit_indices(&batch, &schema, nw, |wi| {
         writer
-            .scatter_wire_group(
+            .with_scatter_group(
                 &batch,
                 wi,
-                &schema,
-                16,
-                5,
-                FLAG_PUSH,
-                0,
-                0,
-                &req_ids,
-                Some(block.as_slice()),
+                WireMsg {
+                    target_id: 16,
+                    schema: Some(&schema),
+                    prebuilt_schema_block: Some(block.as_slice()),
+                    ..Default::default()
+                },
+                GroupTargets::All(&req_ids),
                 Some(props),
+                |g| writer.write_group_direct(g, 5, FLAG_PUSH),
             )
             .expect("group fits")
     });

@@ -58,7 +58,7 @@ where
 /// shape, so the SAL fit check and the emit that follows it cannot size the same
 /// batch differently.
 ///
-/// A replicated table broadcasts because the same `scatter_wire_group(…
+/// A replicated table broadcasts because the same `with_scatter_group(…
 /// FLAG_PUSH …)` machinery then lands the whole batch in every worker's ingest +
 /// SAL slot (inheriting the atomic zone, LSN, ACK accounting, and the
 /// committer's single `fdatasync`), so every worker holds an identical full copy.

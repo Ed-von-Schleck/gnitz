@@ -306,8 +306,8 @@ impl<'a> CommittedTail<'a> {
 mod tests {
     use super::*;
     use crate::runtime::master::scatter::with_commit_indices;
-    use crate::runtime::sal::{group_header_size, sal_write_group, FLAG_PUSH, FLAG_TICK};
-    use crate::runtime::wire::build_schema_wire_block;
+    use crate::runtime::sal::{group_header_size, sal_write_group, GroupTargets, FLAG_PUSH, FLAG_TICK};
+    use crate::runtime::wire::{build_schema_wire_block, WireMsg};
     use gnitz_engine::storage::compute_wire_props;
     use gnitz_engine_testkit::{make_batch, make_schema_u64_i64, sweep_bit_flips, SharedRegion};
 
@@ -784,7 +784,7 @@ mod tests {
         assert_eq!(committed(&reader).unwrap(), vec![1, 2]);
     }
 
-    /// A push zone over `NW` workers: one `scatter_wire_group` per entry of
+    /// A push zone over `NW` workers: one `with_scatter_group` per entry of
     /// `targets` (the first opening the zone), then the commit sentinel. Rows are
     /// PK-partitioned, so most slots are `ctrl + schema` with no data block —
     /// exactly the shape a partitioned push leaves. Returns each group's base.
@@ -800,18 +800,18 @@ mod tests {
             let flags = FLAG_PUSH | if i == 0 { FLAG_ZONE_START } else { 0 };
             with_commit_indices(&batch, &schema, NW, |wi| {
                 writer
-                    .scatter_wire_group(
+                    .with_scatter_group(
                         &batch,
                         wi,
-                        &schema,
-                        t,
-                        lsn,
-                        flags,
-                        0,
-                        0,
-                        &req_ids,
-                        Some(block.as_slice()),
+                        WireMsg {
+                            target_id: t as u64,
+                            schema: Some(&schema),
+                            prebuilt_schema_block: Some(block.as_slice()),
+                            ..Default::default()
+                        },
+                        GroupTargets::All(&req_ids),
                         Some(props),
+                        |g| writer.write_group_direct(g, lsn, flags),
                     )
                     .expect("group fits")
             });

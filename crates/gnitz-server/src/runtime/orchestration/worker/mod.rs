@@ -938,7 +938,7 @@ impl WorkerProcess {
     // ── Request handlers ───────────────────────────────────────────────
 
     fn handle_push(&mut self, target_id: i64, batch: Batch) -> Result<(), String> {
-        // Master pre-partitions FLAG_PUSH rows in `scatter_wire_group`,
+        // Master pre-partitions FLAG_PUSH rows in `with_scatter_group`,
         // so every slot already contains only this worker's rows. A second
         // partition-hash filter here would be pure overhead.
         if batch.count == 0 {

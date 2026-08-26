@@ -18,18 +18,17 @@ use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
 use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP};
 use crate::runtime::sal::{
-    DirectGroup, SalFit, SalWriter, FLAG_BACKFILL, FLAG_DDL_SYNC, FLAG_EXCHANGE_RELAY, FLAG_FLUSH, FLAG_FLUSH_EPH,
-    FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN, FLAG_TICK,
-    FLAG_UNIQUE_PREFLIGHT,
+    DirectGroup, GroupData, GroupTargets, SalFit, SalWriter, FLAG_BACKFILL, FLAG_DDL_SYNC, FLAG_EXCHANGE_RELAY,
+    FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN,
+    FLAG_TICK, FLAG_UNIQUE_PREFLIGHT,
 };
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{
     self, peek_control_block_ipc, DecodedWire, SchemaWithVersion, WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE,
     FLAG_HAS_DATA, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
 };
-use gnitz_engine::ops::{
-    op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, RouteMode,
-};
+use gnitz_engine::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
+use gnitz_engine::query::RelayRoute;
 use gnitz_engine::schema::key::PkBuf;
 use gnitz_engine::storage::Batch;
 use gnitz_wire::wire_flags_set_conflict_mode;
@@ -102,13 +101,8 @@ pub struct MasterDispatcher {
     /// (DDL between bursts) is still checked at pop time.
     check_batch_pool: RefCell<FxHashMap<preflight::PoolSlot, Vec<Batch>>>,
 
-    /// The generation the last ephemeral round stamped. Read by
-    /// `note_flush_round`, which holds the rule every base publish must obey: a
-    /// durable base advance is always preceded by a generation bump with no
-    /// ephemeral round in between. That read is inside a `debug_assert!`, so a
-    /// release build writes this field on every round and never reads it — the
-    /// field stays ungated because two tests pin it, and `#[cfg]`-splitting it
-    /// plus its writes would cost more than the `Cell<u64>` it saves.
+    /// The generation the last ephemeral round stamped. Read only inside a
+    /// `debug_assert!` (`note_flush_round`); two tests pin it.
     last_ephemeral_gen: Cell<u64>,
 
     /// The last tick round allocated. **Strictly increasing**, one per emitted
@@ -190,14 +184,9 @@ pub(crate) use unique_filter::UniqueFilter;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// A worker's failure reply, carried to the client as the pair the frame gave.
-///
-/// The worker→master leg has always been able to carry an arbitrary status — it
-/// arrives as `DecodedControl.status` — but [`worker_error`] formatted the text
-/// and dropped the code, and the scan finisher then sent `STATUS_ERROR` for
-/// everything. Every typed status in the tree used to be minted on the master;
-/// this is what lets a worker mint one (`STATUS_DELTA_EXPIRED`) and have the
-/// client react to a code rather than to a string.
+/// A worker's failure reply, carried to the client as the pair the frame gave —
+/// a worker may mint its own typed status (`STATUS_DELTA_EXPIRED`) and the
+/// client reacts to the code rather than to the text.
 ///
 /// The type is `gnitz-wire`'s, not this module's: the engine's `scan_spec_family`
 /// mints exactly this pair, the worker splits it onto the wire, and
@@ -250,30 +239,14 @@ pub(crate) async fn await_worker_acks(
     err.map_or(Ok(()), Err)
 }
 
-/// Which workers a scan-shaped dispatch goes to. This is the one statement of
-/// what each shape costs in request ids and replies; every scan dispatch below
-/// realizes it rather than restating it.
+/// Which workers a scan-shaped dispatch goes to, before any request id exists.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fanout {
     /// Every worker; each answers for the rows it owns. One distinct scan
     /// request id per worker, and `nw` replies awaited in worker order.
     Broadcast,
-    /// This worker alone. ONE scan request id, mirrored across the whole
-    /// `req_ids` array because `write_group_direct` keys replies by worker
-    /// slot — only this worker's slot is written and replies, so exactly one
-    /// reply arrives, on that one id.
+    /// This worker alone. ONE scan request id, and one reply.
     One(usize),
-}
-
-impl Fanout {
-    /// The worker that produced reply `i`. Under `One` every reply is that
-    /// worker's, so the index does not name it.
-    fn worker_of(self, i: usize) -> usize {
-        match self {
-            Fanout::Broadcast => i,
-            Fanout::One(w) => w,
-        }
-    }
 }
 
 /// Fan-out shape for a scan-shaped dispatch over `target_id`: worker 0 alone
@@ -289,31 +262,70 @@ pub(crate) fn replicated_unicast(disp: &MasterDispatcher, target_id: i64) -> Fan
     }
 }
 
-/// Allocate a scan group's per-worker request ids per [`Fanout`] and register
-/// them into a fresh `ScanLease`, the setup both `dispatch_scan_fanout` and
-/// `dispatch_scan_multi_fanout` need before their SAL write. The lease is
-/// registered BEFORE any await, so a cancelled drain still deregisters the ids
-/// and `route_scan_slot` discards late frames. The returned lease MUST be bound
-/// to a named local held to the end of the caller's drain scope (never a bare
-/// `_`, which would drop it immediately and re-open the wedge).
-fn alloc_scan_req_ids_and_lease(
-    reactor: &crate::runtime::reactor::Reactor,
-    nw: usize,
-    unicast: Fanout,
-) -> ([u64; crate::runtime::sal::MAX_WORKERS], ScanLease) {
-    let mut req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
-    if unicast != Fanout::Broadcast {
-        let id = reactor.alloc_scan_request_id();
-        req_ids[..nw].fill(id);
-        (req_ids, reactor.scan_lease(&[id as u32]))
-    } else {
+/// A dispatched scan: who answers it, on which request ids, and the lease
+/// keeping those ids registered until the caller finishes draining.
+///
+/// Replies are addressed only through [`Self::reply`], which returns the
+/// producing worker and its request id together.
+///
+/// **Hold it to the end of the drain.** Dropping it releases the lease, which
+/// deregisters the ids; `route_scan_slot` then discards every queued and future
+/// frame at the ring boundary, which is what cancels a scan on client death and
+/// what would silently truncate one that is still wanted.
+pub(crate) struct ScanDispatch {
+    /// Reply `i` arrives on `ids[i]`, for `i < n`. Indexed by **reply**, never
+    /// by worker — a unicast has one reply, so it uses one slot.
+    ids: [u64; crate::runtime::sal::MAX_WORKERS],
+    n: usize,
+    /// The one worker a unicast wrote to; `None` when reply `i` is worker `i`'s.
+    worker: Option<usize>,
+    _lease: ScanLease,
+}
+
+impl ScanDispatch {
+    /// Allocate this fan-out's request ids and register them into a fresh
+    /// `ScanLease`, before any await.
+    fn alloc(reactor: &crate::runtime::reactor::Reactor, nw: usize, fanout: Fanout) -> ScanDispatch {
+        let mut ids = [0u64; crate::runtime::sal::MAX_WORKERS];
+        let n = match fanout {
+            Fanout::Broadcast => nw,
+            Fanout::One(_) => 1,
+        };
         let mut scan_ids = [0u32; crate::runtime::sal::MAX_WORKERS];
-        for (r, s) in req_ids[..nw].iter_mut().zip(&mut scan_ids[..nw]) {
-            let id = reactor.alloc_scan_request_id();
-            *r = id;
-            *s = id as u32;
+        for (r, s) in ids[..n].iter_mut().zip(&mut scan_ids[..n]) {
+            *r = reactor.alloc_scan_request_id();
+            *s = *r as u32;
         }
-        (req_ids, reactor.scan_lease(&scan_ids[..nw]))
+        ScanDispatch {
+            ids,
+            n,
+            worker: match fanout {
+                Fanout::Broadcast => None,
+                Fanout::One(w) => Some(w),
+            },
+            _lease: reactor.scan_lease(&scan_ids[..n]),
+        }
+    }
+
+    /// The slots this scan's group writes, and the id each answers on.
+    pub(crate) fn targets(&self) -> GroupTargets<'_> {
+        match self.worker {
+            None => GroupTargets::All(&self.ids[..self.n]),
+            Some(worker) => GroupTargets::One {
+                worker,
+                req_id: self.ids[0],
+            },
+        }
+    }
+
+    /// Replies to expect, in arrival order — one per written slot.
+    pub(crate) fn reply_count(&self) -> usize {
+        self.n
+    }
+
+    /// Reply `i`: the worker that produced it, and the request id it arrives on.
+    pub(crate) fn reply(&self, i: usize) -> (usize, u64) {
+        (self.worker.unwrap_or(i), self.ids[i])
     }
 }
 
@@ -321,12 +333,9 @@ fn alloc_scan_req_ids_and_lease(
 /// raw `W2mSlot` replies, returned so the caller can forward or merge them
 /// without an intermediate decode/copy.
 ///
-/// `unicast` selects the shape ([`Fanout`] states what each costs) and is also
-/// passed to `submit` so the group write's routing can never diverge from it.
-/// The returned `Vec` therefore holds `nw` slots under `Broadcast` and one
-/// under `One(w)`; the downstream drains (`drain_index_scan` /
-/// `merge_index_scan`) iterate `slots.len()`, so a length-1 `Vec` merges
-/// exactly that worker's stream.
+/// `unicast` selects the shape ([`Fanout`] states what each costs). The
+/// returned `Vec` holds one slot per [`ScanDispatch::reply_count`], in the same
+/// order.
 ///
 /// `sal_excl` is held only for the synchronous write + signal phase and
 /// released before awaiting replies. This serialises the SAL write against
@@ -338,38 +347,22 @@ pub(crate) async fn dispatch_scan_fanout<F>(
     reactor: &crate::runtime::reactor::Reactor,
     unicast: Fanout,
     submit: F,
-) -> Result<(Vec<W2mSlot>, [u64; crate::runtime::sal::MAX_WORKERS], ScanLease), String>
+) -> Result<(Vec<W2mSlot>, ScanDispatch), String>
 where
-    F: FnOnce(&MasterDispatcher, &[u64], Fanout) -> Result<(), String>,
+    F: FnOnce(GroupTargets<'_>) -> Result<(), String>,
 {
-    let nw = disp.num_workers;
-    let (req_ids, lease) = alloc_scan_req_ids_and_lease(reactor, nw, unicast);
+    let scan = ScanDispatch::alloc(reactor, disp.num_workers, unicast);
 
     {
         let _guard = disp.sal_excl().lock().await;
-        submit(disp, &req_ids[..nw], unicast)?;
+        submit(scan.targets())?;
         match unicast {
             Fanout::One(w) => disp.signal_one(w),
             Fanout::Broadcast => disp.signal_all(),
         }
     }
-    let slots = dispatch::await_scan_slots(reactor, unicast, &req_ids, nw).await;
-    Ok((slots, req_ids, lease))
-}
-
-/// One relation's dispatch handle from `dispatch_scan_multi_fanout`: its
-/// per-worker request ids, its routing, and the live `ScanLease` keeping those
-/// ids registered
-/// until the master finishes draining the relation. The caller holds every
-/// dispatch (hence every lease) for the whole of the sequential drain; dropping
-/// them deregisters the ids and discards any queued/future frames, cancelling
-/// the multi-scan on client death.
-pub(crate) struct MultiScanDispatch {
-    pub(crate) req_ids: [u64; crate::runtime::sal::MAX_WORKERS],
-    pub(crate) unicast: Fanout,
-    // Held only for its RAII effect (the `_` name silences the never-read lint);
-    // its drop deregisters the relation's scan ids.
-    _lease: ScanLease,
+    let slots = dispatch::await_scan_slots(reactor, &scan).await;
+    Ok((slots, scan))
 }
 
 /// One SAL cut across N relations: write all N scan groups back-to-back under a
@@ -388,28 +381,21 @@ pub(crate) struct MultiScanDispatch {
 /// queue the reply in request order.
 ///
 /// `relations` gives, per relation in request order, `(tid, routing,
-/// effective_client_version)`; returns one `MultiScanDispatch` per relation in
-/// the same order. Each relation's ids are registered into their own lease
-/// BEFORE the lock (and before any await), so a cancelled drain still
-/// deregisters them and `route_scan_slot` discards late frames.
+/// effective_client_version)`; returns one [`ScanDispatch`] per relation in the
+/// same order.
 pub(crate) async fn dispatch_scan_multi_fanout(
     disp: &MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
     client_id: u64,
     relations: &[(i64, Fanout, u16)],
-) -> Result<Vec<MultiScanDispatch>, String> {
+) -> Result<Vec<ScanDispatch>, String> {
     let nw = disp.num_workers;
     // Allocate ids + register every relation's lease BEFORE the lock (no await
     // between here and the write).
-    let mut dispatches: Vec<MultiScanDispatch> = Vec::with_capacity(relations.len());
-    for &(_tid, unicast, _ver) in relations {
-        let (req_ids, lease) = alloc_scan_req_ids_and_lease(reactor, nw, unicast);
-        dispatches.push(MultiScanDispatch {
-            req_ids,
-            unicast,
-            _lease: lease,
-        });
-    }
+    let dispatches: Vec<ScanDispatch> = relations
+        .iter()
+        .map(|&(_tid, unicast, _ver)| ScanDispatch::alloc(reactor, nw, unicast))
+        .collect();
 
     // One hold: write every scan group at a consecutive `write_cursor` position,
     // then signal once. The reactor is single-threaded and each write has no
@@ -417,9 +403,20 @@ pub(crate) async fn dispatch_scan_multi_fanout(
     // releases at block end, before the caller's first await.
     {
         let _guard = disp.sal_excl().lock().await;
-        for (&(tid, unicast, eff_ver), d) in relations.iter().zip(&dispatches) {
+        for (&(tid, _unicast, eff_ver), d) in relations.iter().zip(&dispatches) {
             let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, eff_ver) | gnitz_wire::FLAG_SCAN_FIFO_REPLY;
-            disp.write_scan_group(tid, 0, wire_flags, &d.req_ids[..nw], unicast, client_id, &[], 0)?;
+            disp.write_group(
+                wire::WireMsg {
+                    target_id: tid as u64,
+                    client_id,
+                    flags: wire_flags,
+                    ..Default::default()
+                },
+                GroupData::NONE,
+                0,
+                0,
+                d.targets(),
+            )?;
         }
         disp.signal_all();
     }

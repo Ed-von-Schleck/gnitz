@@ -291,8 +291,17 @@ impl MasterDispatcher {
         // stream multi-frame trains, and on an early error return (or a
         // mid-scan cancellation) the lease drop discards every undrained
         // frame at the ring boundary.
-        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp, reactor, unicast, |disp, req_ids, unicast| {
-            disp.write_scan_group(table_id, 0, 0, req_ids, unicast, 0, &[], 0)
+        let (slots, scan) = dispatch_scan_fanout(disp, reactor, unicast, |targets| {
+            disp.write_group(
+                wire::WireMsg {
+                    target_id: table_id as u64,
+                    ..Default::default()
+                },
+                GroupData::NONE,
+                0,
+                0,
+                targets,
+            )
         })
         .await?;
 
@@ -304,7 +313,7 @@ impl MasterDispatcher {
         // On failure (worker crash mid-scan or cancellation) the guard is left
         // armed, so its Drop removes the cold entries and the next validation
         // retries warmup from scratch.
-        drain_index_scan(slots, &req_ids, reactor, "scan", &schema, |mb, _| {
+        drain_index_scan(slots, &scan, reactor, "scan", &schema, |mb, _| {
             let mut filters = disp.unique_filters.borrow_mut();
             for d in &missing {
                 if let Some(filter) = filters.get_mut(&(table_id, d.packed)) {
@@ -490,6 +499,7 @@ mod unique_filter_tests {
             0,
             Vec::new(),
             std::ptr::null_mut(),
+            0,
             SalWriter::new(std::ptr::null_mut(), -1, 0, 0),
             Rc::new(W2mReceiver::new(Vec::new())),
             Vec::new(),

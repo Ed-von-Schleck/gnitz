@@ -38,7 +38,7 @@ use crate::runtime::reactor::BACKFILL_DECISION_CONTINUE;
 use crate::runtime::reactor::{
     mpsc, oneshot, select2, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard, ReplyFuture, WriteGuard,
 };
-use crate::runtime::sal::{SalFit, FLAG_DELTA_SCAN, FLAG_SCAN_SPEC};
+use crate::runtime::sal::{GroupTargets, SalFit, FLAG_DELTA_SCAN, FLAG_SCAN_SPEC};
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
@@ -874,7 +874,7 @@ async fn run_tick(
         let disp = shared.disp();
         let mut result = Ok(());
         for (i, &tid) in tids.iter().enumerate() {
-            if let Err(e) = disp.write_tick_group(tid, &req_ids[i * nw..(i + 1) * nw]) {
+            if let Err(e) = disp.write_tick_group(tid, GroupTargets::All(&req_ids[i * nw..(i + 1) * nw])) {
                 result = Err(e);
                 break;
             }
@@ -2302,7 +2302,6 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     };
 
     // ── Phase 2: sequential per-relation drain (no locks; holds all leases) ──
-    let nw = shared.disp().num_workers();
     for (plan, d) in plans.iter().zip(&dispatches) {
         // Preliminary schema-only frame first, when captured in Phase 1.
         if let Some(block) = plan.block.as_ref() {
@@ -2313,7 +2312,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
         }
         // Drain this relation's train (all workers, ascending) before the next —
         // the FIFO reply contract makes request order == ring order.
-        match MasterDispatcher::await_and_drain_scan_relation(&shared.reactor, peer, d.unicast, &d.req_ids, nw).await {
+        match MasterDispatcher::await_and_drain_scan_relation(&shared.reactor, peer, d).await {
             Ok(true) => {}
             Ok(false) => return Ok(false),
             Err(f) => return Err(f.text),

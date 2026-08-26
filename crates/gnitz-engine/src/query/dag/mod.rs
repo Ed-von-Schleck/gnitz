@@ -20,6 +20,7 @@ mod meta;
 mod store_handle;
 
 use meta::DepMap;
+pub use meta::RelayRoute;
 pub(crate) use meta::ViewMeta;
 
 pub(crate) use store_handle::StoreHandle;
@@ -694,30 +695,10 @@ mod tests {
         assert!(!dag.tables.contains_key(&100));
     }
 
-    /// A `ViewMeta` fixture whose join-shard map names `src` as a source.
-    fn meta_with_source(src: i64) -> Rc<ViewMeta> {
-        let mut jm: FxHashMap<i64, Option<meta::JoinScatterKey>> = FxHashMap::default();
-        jm.insert(
-            src,
-            Some(meta::JoinScatterKey {
-                cols: Rc::from([]),
-                target_tcs: Rc::from([]),
-            }),
-        );
-        Rc::new(ViewMeta {
-            shard_cols: None,
-            join_shard_map: jm,
-            range_join_n_eq: None,
-            has_join: false,
-            scatter_sources: FxHashSet::default(),
-            skips_exchange: false,
-        })
-    }
-
     #[test]
     fn test_invalidation() {
         let mut dag = DagEngine::new();
-        dag.meta.insert(42, meta_with_source(7));
+        dag.meta.insert(42, Rc::new(meta::meta_with_source(7)));
         dag.dep.valid = true;
 
         dag.invalidate(42);
@@ -728,7 +709,7 @@ mod tests {
         dag.invalidate_dep_map();
         assert!(!dag.dep.valid);
 
-        dag.meta.insert(99, meta_with_source(7));
+        dag.meta.insert(99, Rc::new(meta::meta_with_source(7)));
         dag.invalidate_all();
         assert!(dag.meta.is_empty());
     }
@@ -740,8 +721,8 @@ mod tests {
     #[test]
     fn test_view_meta_eviction() {
         let mut dag = DagEngine::new();
-        dag.meta.insert(42, meta_with_source(7)); // 42 as the view
-        dag.meta.insert(7, meta_with_source(42)); // 42 as a source of view 7
+        dag.meta.insert(42, Rc::new(meta::meta_with_source(7))); // 42 as the view
+        dag.meta.insert(7, Rc::new(meta::meta_with_source(42))); // 42 as a source of view 7
         dag.evict_meta(42);
         assert!(!dag.meta.contains_key(&42));
         assert!(
@@ -751,7 +732,7 @@ mod tests {
 
         // Wiring: the production table/view-drop path routes through evict_meta.
         let mut dag = DagEngine::new();
-        dag.meta.insert(43, meta_with_source(1));
+        dag.meta.insert(43, Rc::new(meta::meta_with_source(1)));
         dag.unregister_table(43);
         assert!(!dag.meta.contains_key(&43), "unregister_table must evict");
     }
@@ -944,47 +925,5 @@ mod tests {
             "ingest_store_and_indices must return the storage error when the seam is armed",
         );
         println!("{}", crate::test_support::CHILD_OK);
-    }
-
-    // ── ViewMeta relay routing ───────────────────────────────────────────────
-
-    /// `ViewMeta::from_loaded` must derive a pure-range join's relay routing from
-    /// the circuit alone: a memo miss that read an empty circuit would answer
-    /// `range_join_n_eq = None` + empty `shard_cols`, silently dropping the
-    /// `op_relay_broadcast` a pure-range join's input relay needs (n_eq == 0 ⇒
-    /// broadcast, not scatter), losing rows.
-    #[test]
-    fn view_meta_from_loaded_carries_range_join_relay_routing() {
-        use gnitz_wire::{JoinKind, OpNode, RangeRel};
-
-        // A pure-range join: ScanDelta → ExchangeShard → Join(DeltaTraceRange
-        // { n_eq: 0 }) → IntegrateSink.
-        let mut nodes: std::collections::HashMap<i32, OpNode> = std::collections::HashMap::new();
-        nodes.insert(0, OpNode::ScanDelta { source: 7, bound: None });
-        nodes.insert(1, OpNode::ExchangeShard { shard_cols: vec![1] });
-        nodes.insert(
-            2,
-            OpNode::Join(JoinKind::DeltaTraceRange {
-                n_eq: 0,
-                rel: RangeRel::Lt,
-            }),
-        );
-        nodes.insert(3, OpNode::IntegrateSink);
-        let edges = vec![(0, 1, 0), (1, 2, 0), (2, 3, 0)];
-
-        let loaded = compiler::loaded_for_test(nodes, edges);
-
-        let meta = ViewMeta::from_loaded(&loaded, &compiler::ExtTables::default());
-        assert_eq!(
-            meta.range_join_n_eq,
-            Some(0),
-            "a pure-range join must be discriminated so the relay broadcasts instead of scattering"
-        );
-        assert_eq!(
-            meta.shard_cols.as_deref(),
-            Some(&[1][..]),
-            "the output ExchangeShard's shard cols must survive"
-        );
-        assert!(meta.has_join);
     }
 }

@@ -11,64 +11,81 @@
 use super::*;
 use std::rc::Rc;
 
+/// How the master relay routes one source's delta into a view.
+pub enum RelayRoute {
+    /// The source feeds several distinct reindex keys: no single key
+    /// co-partitions it with the trace sides, so the round must be refused
+    /// rather than routed by a key nothing was stored under
+    /// (see `compiler::load::scatter_key`).
+    NoSingleKey,
+    /// Pure range join (`n_eq == 0`): the matches are spread over the whole key
+    /// space, so every worker needs the full delta and trims to its owned slice
+    /// (`WorkerFilter`) before integrating.
+    Broadcast,
+    /// Scatter by `cols`, already truncated to the routing prefix. A band join
+    /// (`n_eq >= 1`) routes by the equality prefix alone, dropping the trailing
+    /// range slot, so equal eq-values co-partition both sides and the range
+    /// probe stays partition-local.
+    Scatter {
+        cols: Rc<[u32]>,
+        /// The per-slot promotion targets a `JoinPromote` scatter carries,
+        /// mirroring the trace-side reindex Map slot-for-slot. Empty under
+        /// `GroupKey`, which promotes nothing.
+        target_tcs: Rc<[u8]>,
+        mode: ops::RouteMode,
+    },
+}
+
 /// Per-view circuit metadata derived from one `load_meta_circuit` pass.
 /// Everything a plan-free caller needs; eviction is one map `remove`.
-#[derive(Default)]
 pub struct ViewMeta {
-    /// The sink-nearest `ExchangeShard`'s shard columns — the master relay's
-    /// routing key — and `None` when the circuit carries no `ExchangeShard` at
-    /// all. The two states are distinct: an ungrouped global aggregate shards on
-    /// `∅`, a real exchange that funnels every row onto `worker_for_key(V₀)`.
-    pub shard_cols: Option<Rc<[u32]>>,
-    /// source table id → the one key the relay packs and routes that source's
-    /// delta by. `None` for a source whose scan feeds several distinct reindex
-    /// keys: no single pack key co-partitions with the trace sides, so the relay
-    /// must refuse the round rather than route by a key nothing was stored under
-    /// (see `compiler::load::scatter_key`). Absent = the source carries no
-    /// reindex key at all, and the view's own `shard_cols` route it.
-    pub join_shard_map: FxHashMap<i64, Option<JoinScatterKey>>,
-    /// `Some(n_eq)` iff the view is a non-equi (range / band) join. Drives the
-    /// master relay's eq-prefix scatter (`n_eq ≥ 1`) vs broadcast (`n_eq == 0`),
-    /// and the worker dispatch's input-relay arm.
-    pub range_join_n_eq: Option<u8>,
+    /// The sink-nearest `ExchangeShard`'s shard columns — the routing key of
+    /// every source that carries no reindex key of its own — and `None` when the
+    /// circuit carries no `ExchangeShard` at all. The two states are distinct:
+    /// an ungrouped global aggregate shards on `∅`, a real exchange that funnels
+    /// every row onto `worker_for_key(V₀)`.
+    pub(super) shard_cols: Option<Rc<[u32]>>,
+    /// source table id → that source's relay route.
+    source_routes: FxHashMap<i64, RelayRoute>,
+    /// The route of everything absent from `source_routes`.
+    default_route: RelayRoute,
     /// The circuit carries a `Join` node.
-    pub has_join: bool,
+    pub(super) has_join: bool,
     /// The sources whose deltas must go through the join scatter: those carrying
     /// a join/group reindex key, minus those whose native distribution already
     /// matches it (or whose partner is replicated). Probed once per epoch on the
     /// multi-worker dispatch path, which is why it is `Fx`-hashed.
-    pub scatter_sources: FxHashSet<i64>,
+    pub(super) scatter_sources: FxHashSet<i64>,
+    /// `Some(n_eq)` iff the view is a non-equi (range / band) join. Read by the
+    /// worker dispatch's input-relay arm; the master relay reads the
+    /// [`RelayRoute`] this already folded it into.
+    pub(super) range_join_n_eq: Option<u8>,
     /// The unary output `ExchangeShard` is a proven no-op (every row already on
     /// the worker owning its distribution key) — the output IPC is elided.
-    pub skips_exchange: bool,
-}
-
-/// One source's join/group reindex scatter key: the columns the relay routes by
-/// and the per-slot carried promotion targets, mirroring the trace-side reindex
-/// Map slot-for-slot. Held pre-split because the relay reads the two halves
-/// separately, once per relay round.
-pub struct JoinScatterKey {
-    pub cols: Rc<[u32]>,
-    pub target_tcs: Rc<[u8]>,
-}
-
-impl JoinScatterKey {
-    fn from_pairs(pairs: Vec<(u32, u8)>) -> JoinScatterKey {
-        JoinScatterKey {
-            cols: pairs.iter().map(|&(c, _)| c).collect(),
-            target_tcs: pairs.iter().map(|&(_, t)| t).collect(),
-        }
-    }
+    pub(super) skips_exchange: bool,
 }
 
 impl ViewMeta {
     /// The answer for a circuit that could not be read or is cyclic: no exchange
     /// skip, no shard or join columns, no range join. Every metadata query then
     /// takes its conservative branch instead of walking a graph that is not there.
-    /// Field-for-field the `Default`, and named so the call site reads as that
-    /// decision rather than as an accident.
     pub(super) fn nothing_special() -> ViewMeta {
-        ViewMeta::default()
+        ViewMeta {
+            shard_cols: None,
+            source_routes: FxHashMap::default(),
+            default_route: group_key_route(None),
+            has_join: false,
+            scatter_sources: FxHashSet::default(),
+            range_join_n_eq: None,
+            skips_exchange: false,
+        }
+    }
+
+    /// How the master relay routes `source_id`'s delta into this view. The
+    /// output relay (`source_id == 0`) and any source carrying no reindex key
+    /// take the view's own shard columns.
+    pub fn relay_route(&self, source_id: i64) -> &RelayRoute {
+        self.source_routes.get(&source_id).unwrap_or(&self.default_route)
     }
 
     /// Derive the metadata from an already-loaded circuit. The body behind
@@ -78,20 +95,73 @@ impl ViewMeta {
     /// against a *source relation's* distribution prefix.
     pub(super) fn from_loaded(loaded: &compiler::LoadedCircuit, ext_tables: &compiler::ExtTables) -> ViewMeta {
         let compiler::ScatterRouting { keys, scatter_sources } = compiler::compute_scatter_routing(loaded, ext_tables);
+        let shard_cols: Option<Rc<[u32]>> = compiler::output_exchange_shard(loaded).map(|(_, cols)| cols.into());
+        let range_join_n_eq = compiler::circuit_range_join_n_eq(loaded);
+        let default_route = group_key_route(shard_cols.as_ref());
+        // `range_join_n_eq` governs a JOIN relay only: a source carrying no
+        // reindex key takes the shard columns whatever the join is.
+        let source_routes = keys
+            .into_iter()
+            .map(|(tid, key)| {
+                let route = match key {
+                    None => RelayRoute::NoSingleKey,
+                    // A key with no columns is not a join key.
+                    Some(pairs) if pairs.is_empty() => group_key_route(shard_cols.as_ref()),
+                    Some(pairs) => join_route(pairs, range_join_n_eq),
+                };
+                (tid, route)
+            })
+            .collect();
         ViewMeta {
-            shard_cols: compiler::output_exchange_shard(loaded).map(|(_, cols)| cols.into()),
-            join_shard_map: keys
-                .into_iter()
-                .map(|(tid, key)| (tid, key.map(JoinScatterKey::from_pairs)))
-                .collect(),
-            range_join_n_eq: compiler::circuit_range_join_n_eq(loaded),
+            shard_cols,
+            source_routes,
+            default_route,
             has_join: loaded
                 .nodes
                 .values()
                 .any(|op| matches!(op, gnitz_wire::OpNode::Join(_))),
             scatter_sources,
+            range_join_n_eq,
             skips_exchange: compiler::compute_skips_exchange(loaded, ext_tables),
         }
+    }
+}
+
+/// A `ViewMeta` whose relay routing names `src` as a source — the shape
+/// `evict_meta` retains on.
+#[cfg(test)]
+pub(super) fn meta_with_source(src: i64) -> ViewMeta {
+    let mut m = ViewMeta::nothing_special();
+    m.source_routes.insert(src, RelayRoute::NoSingleKey);
+    m
+}
+
+/// The view's shard columns under `GroupKey`, consistent with `op_reduce`'s
+/// output PK.
+fn group_key_route(shard_cols: Option<&Rc<[u32]>>) -> RelayRoute {
+    RelayRoute::Scatter {
+        cols: shard_cols.cloned().unwrap_or_else(|| Rc::from([])),
+        target_tcs: Rc::from([]),
+        mode: ops::RouteMode::GroupKey,
+    }
+}
+
+/// The route a source carrying a non-empty reindex key takes. `pairs` is that
+/// key, `(column, promotion target)` per slot, in trace-side reindex order.
+fn join_route(pairs: Vec<(u32, u8)>, range_join_n_eq: Option<u8>) -> RelayRoute {
+    if range_join_n_eq == Some(0) {
+        return RelayRoute::Broadcast;
+    }
+    debug_assert!(
+        range_join_n_eq.is_none_or(|n_eq| pairs.len() == n_eq as usize + 1),
+        "range-join reindex key = [eq…, range]: len must be n_eq + 1"
+    );
+    // A band join routes by the eq prefix; an equi-join by the whole key.
+    let route_len = range_join_n_eq.map_or(pairs.len(), |n_eq| n_eq as usize);
+    RelayRoute::Scatter {
+        cols: pairs[..route_len].iter().map(|&(c, _)| c).collect(),
+        target_tcs: pairs[..route_len].iter().map(|&(_, t)| t).collect(),
+        mode: ops::RouteMode::JoinPromote,
     }
 }
 
@@ -420,6 +490,142 @@ impl DagEngine {
     /// Over-eviction is always safe: entries are recomputed on next touch.
     pub(super) fn evict_meta(&mut self, id: i64) {
         self.meta.remove(&id);
-        self.meta.retain(|_, m| !m.join_shard_map.contains_key(&id));
+        self.meta.retain(|_, m| !m.source_routes.contains_key(&id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel, ReindexRole};
+    use std::collections::HashMap;
+
+    const PORT_IN: i32 = gnitz_wire::PORT_IN as i32;
+    const PORT_IN_A: i32 = gnitz_wire::PORT_IN_A as i32;
+    const PORT_TRACE: i32 = gnitz_wire::PORT_TRACE as i32;
+
+    /// A two-sided join over source 7 (reindexed on `key_cols`, so it carries a
+    /// scatter key) and source 9 (no reindex at all), with an output
+    /// `ExchangeShard` on column 1:
+    ///
+    ///   ScanDelta(7) → Map(reindex key_cols) ─┐
+    ///   ScanDelta(9) ─────────────────────────→ Join(kind)
+    ///                                           → ExchangeShard([1]) → IntegrateSink
+    ///
+    /// One shape covers every route: source 7 is the join relay, source 9 the
+    /// keyless one, and source 0 the output relay.
+    fn join_meta(kind: JoinKind, key_cols: Vec<u16>) -> ViewMeta {
+        let mut nodes: HashMap<i32, OpNode> = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta { source: 7, bound: None });
+        nodes.insert(
+            1,
+            OpNode::Map(MapKind::Expression {
+                // The minimum an expression program needs to parse.
+                program: vec![0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                reindex_cols: key_cols,
+                reindex_target_tcs: vec![],
+                role: ReindexRole::ScatterKey,
+            }),
+        );
+        nodes.insert(2, OpNode::ScanDelta { source: 9, bound: None });
+        nodes.insert(3, OpNode::Join(kind));
+        nodes.insert(4, OpNode::ExchangeShard { shard_cols: vec![1] });
+        nodes.insert(5, OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 1, PORT_IN),
+            (1, 3, PORT_IN_A),
+            (2, 3, PORT_TRACE),
+            (3, 4, PORT_IN),
+            (4, 5, PORT_IN),
+        ];
+        let loaded = compiler::loaded_for_test(nodes, edges);
+        ViewMeta::from_loaded(&loaded, &compiler::ExtTables::default())
+    }
+
+    fn pure_range(n_eq: u8) -> JoinKind {
+        JoinKind::DeltaTraceRange {
+            n_eq,
+            rel: RangeRel::Lt,
+        }
+    }
+
+    /// The `GroupKey` scatter's columns, or `None` when the route is not one.
+    fn group_key_cols(route: &RelayRoute) -> Option<Vec<u32>> {
+        match route {
+            RelayRoute::Scatter {
+                cols,
+                mode: ops::RouteMode::GroupKey,
+                ..
+            } => Some(cols.to_vec()),
+            _ => None,
+        }
+    }
+
+    /// The `JoinPromote` scatter's columns, or `None` when the route is not one.
+    fn join_cols(route: &RelayRoute) -> Option<Vec<u32>> {
+        match route {
+            RelayRoute::Scatter {
+                cols,
+                mode: ops::RouteMode::JoinPromote,
+                ..
+            } => Some(cols.to_vec()),
+            _ => None,
+        }
+    }
+
+    /// A pure-range join (`n_eq == 0`) must broadcast the keyed source's delta:
+    /// its matches spread over the whole key space, so a scatter would leave each
+    /// worker probing a slice it does not own and drop rows silently.
+    ///
+    /// `range_join_n_eq` governs a JOIN relay ONLY: neither the output relay
+    /// (`source_id == 0`) nor a source whose scans reach no reindex key (9) is
+    /// one, and reading either as one broadcasts what must scatter.
+    #[test]
+    fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
+        let meta = join_meta(pure_range(0), vec![1]);
+        assert_eq!(meta.range_join_n_eq, Some(0));
+        assert!(
+            matches!(meta.relay_route(7), RelayRoute::Broadcast),
+            "the keyed input relay of a pure-range join must broadcast"
+        );
+        assert_eq!(
+            group_key_cols(meta.relay_route(0)).as_deref(),
+            Some(&[1u32][..]),
+            "source 0 is not a join relay: it routes by the view's shard cols"
+        );
+        assert_eq!(
+            group_key_cols(meta.relay_route(9)).as_deref(),
+            Some(&[1u32][..]),
+            "a source carrying no reindex key routes by the view's shard cols"
+        );
+    }
+
+    /// A band join (`n_eq >= 1`) scatters by the equality prefix, dropping the
+    /// trailing range slot: equal eq-values then co-partition both sides and the
+    /// range probe stays partition-local. The trace-side key is `[eq…, range]`,
+    /// so the relay's columns are one shorter than it — where an equi-join, which
+    /// carries no `range_join_n_eq`, routes by the whole key.
+    #[test]
+    fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key() {
+        let band = join_meta(pure_range(1), vec![3, 4]);
+        assert_eq!(band.range_join_n_eq, Some(1));
+        assert_eq!(
+            join_cols(band.relay_route(7)),
+            Some(vec![3]),
+            "the trailing range slot must not route"
+        );
+
+        let equi = join_meta(JoinKind::DeltaTrace, vec![3, 4]);
+        assert_eq!(equi.range_join_n_eq, None);
+        assert_eq!(join_cols(equi.relay_route(7)), Some(vec![3, 4]));
+    }
+
+    /// A circuit that could not be read routes everything by `∅` — every row to
+    /// partition 0's owner — rather than by a graph that is not there.
+    #[test]
+    fn nothing_special_routes_every_source_by_the_empty_key() {
+        let meta = ViewMeta::nothing_special();
+        assert_eq!(group_key_cols(meta.relay_route(0)), Some(vec![]));
+        assert_eq!(group_key_cols(meta.relay_route(42)), Some(vec![]));
     }
 }

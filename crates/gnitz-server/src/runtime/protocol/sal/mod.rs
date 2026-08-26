@@ -79,24 +79,53 @@ fn group_payload_size(worker_sizes: &[u32]) -> usize {
     group_header_size(worker_sizes.len()) + worker_sizes.iter().map(|&sz| align8(sz as usize)).sum::<usize>()
 }
 
+/// Which of a group's slots are written, and the request id each answers on.
+#[derive(Clone, Copy)]
+pub(crate) enum GroupTargets<'a> {
+    /// Broadcast; no slot answers. Every slot's request id is 0.
+    AllSilent,
+    /// Broadcast; slot `w` answers on `ids[w]`. `ids.len()` must be `nw`.
+    All(&'a [u64]),
+    /// Only `worker`'s slot is written, and it answers on `req_id`.
+    One { worker: usize, req_id: u64 },
+}
+
+/// What a group's slots carry.
+#[derive(Clone, Copy)]
+pub(crate) enum GroupData<'a> {
+    /// Every slot carries this payload.
+    Same(WireData<'a>),
+    /// Slot `w` carries `d[w]`. `d.len()` must be `nw`.
+    PerWorker(&'a [WireData<'a>]),
+}
+
+impl<'a> GroupData<'a> {
+    /// A control-only group: every slot is a bare control block.
+    pub(crate) const NONE: Self = Self::Same(WireData::Whole(None));
+
+    /// True when no slot carries a row — the one shape allowed to omit a schema.
+    fn is_dataless(&self) -> bool {
+        match *self {
+            GroupData::Same(d) => d.row_count() == 0,
+            GroupData::PerWorker(d) => d.iter().all(|d| d.row_count() == 0),
+        }
+    }
+}
+
 /// One group's worth of per-worker wire messages, as
 /// [`SalWriter::write_group_direct`] emits them: the [`WireMsg`] every slot
-/// shares, plus the two fields that vary by worker.
+/// shares, plus what varies by worker.
 ///
 /// [`SalWriter::group_footprint_direct`] sizes the same value, so a caller that
 /// checks fit and then writes measures one group, not two.
 #[derive(Clone, Copy)]
 pub(crate) struct DirectGroup<'a> {
     /// Every slot's message but its `data` and `request_id`, which `msg` fills
-    /// per worker — set either of those here and the per-worker fill overwrites
-    /// it (debug-asserted in `msg`).
+    /// from `data`/`targets` — set either of those here and the per-worker fill
+    /// overwrites it (debug-asserted in `msg`).
     pub template: WireMsg<'a>,
-    /// Worker `w`'s payload. An empty slice — or any slot past its end — is a
-    /// dataless slot, so a control-only group passes `&[]`.
-    pub worker_data: &'a [WireData<'a>],
-    pub req_ids: &'a [u64],
-    /// `Some(w)` restricts the group to worker `w`'s slot; `None` fills all.
-    pub unicast_worker: Option<usize>,
+    pub data: GroupData<'a>,
+    pub targets: GroupTargets<'a>,
 }
 
 impl<'a> DirectGroup<'a> {
@@ -108,8 +137,15 @@ impl<'a> DirectGroup<'a> {
             "DirectGroup template must leave `data` and `request_id` to the per-worker fill"
         );
         WireMsg {
-            data: self.worker_data.get(w).copied().unwrap_or_default(),
-            request_id: self.req_ids[w],
+            data: match self.data {
+                GroupData::Same(d) => d,
+                GroupData::PerWorker(d) => d[w],
+            },
+            request_id: match self.targets {
+                GroupTargets::AllSilent => 0,
+                GroupTargets::All(ids) => ids[w],
+                GroupTargets::One { req_id, .. } => req_id,
+            },
             ..self.template
         }
     }
@@ -117,7 +153,7 @@ impl<'a> DirectGroup<'a> {
     fn slot_sizes(&self, nw: usize) -> [u32; MAX_WORKERS] {
         let mut sizes = [0u32; MAX_WORKERS];
         for (w, size) in sizes.iter_mut().enumerate().take(nw) {
-            if self.unicast_worker.is_some_and(|u| w != u) {
+            if matches!(self.targets, GroupTargets::One { worker, .. } if w != worker) {
                 continue;
             }
             *size = self.msg(w).size() as u32;
@@ -156,11 +192,6 @@ fn group_digest(base: u64, hdr: &[u8]) -> u64 {
 }
 
 const SAL_MMAP_SIZE: usize = 1 << 30;
-
-/// All-zero request ids, for a group whose slots answer nobody — what
-/// `scatter_group_footprint` measures with, since a request id never moves a
-/// slot's size.
-const NO_REQ_IDS: [u64; MAX_WORKERS] = [0; MAX_WORKERS];
 
 /// The exact SAL footprint of a zone-closing `FLAG_TXN_COMMIT` sentinel — a
 /// slotless group, header only. `sal_begin_group` reserves this much headroom for
@@ -963,17 +994,26 @@ impl SalWriter {
     /// back to 0 and the master's `ReplyFuture` would never resolve.
     pub fn write_group_direct(&self, g: &DirectGroup, lsn: u64, sal_flags: u32) -> Result<(), String> {
         let nw = self.num_workers;
-        assert_eq!(
-            g.req_ids.len(),
-            nw,
-            "write_group_direct: req_ids.len()={} != num_workers={}",
-            g.req_ids.len(),
-            nw
-        );
+        if let GroupTargets::All(ids) = g.targets {
+            assert_eq!(
+                ids.len(),
+                nw,
+                "write_group_direct: req_ids.len()={} != num_workers={}",
+                ids.len(),
+                nw
+            );
+        }
+        if let GroupData::PerWorker(d) = g.data {
+            assert_eq!(
+                d.len(),
+                nw,
+                "write_group_direct: worker_data.len()={} != num_workers={}",
+                d.len(),
+                nw
+            );
+        }
         debug_assert!(
-            g.template.schema.is_some()
-                || g.template.prebuilt_schema_block.is_some()
-                || g.worker_data.iter().all(|d| d.row_count() == 0),
+            g.template.schema.is_some() || g.template.prebuilt_schema_block.is_some() || g.data.is_dataless(),
             "write_group_direct: data without a schema — `decode_wire` rejects FLAG_HAS_DATA \
              without FLAG_HAS_SCHEMA",
         );
@@ -1012,8 +1052,9 @@ impl SalWriter {
     }
 
     /// Build the [`DirectGroup`] a scatter emission of `input_batch` under
-    /// `worker_indices` produces, and hand it to `f`. The one construction:
-    /// `scatter_wire_group` emits it and `scatter_group_footprint` sizes it, so a
+    /// `worker_indices` produces, and hand it to `f`. The one construction: both
+    /// emitters (`write_scatter_group`, `write_commit_group`) write what it
+    /// builds and `scatter_group_footprint` sizes the same thing, so a
     /// transaction's fit check measures the group that is later written.
     ///
     /// Rows go into the slots two ways. A `wire_safe` schema — fixed-width
@@ -1023,36 +1064,24 @@ impl SalWriter {
     /// carries out-of-line string bytes and has no scatter encoder, so its slots
     /// materialize a per-worker sub-`Batch` first.
     ///
-    /// `prebuilt_schema_block`: when `Some`, those bytes are the slot's schema
-    /// block; when `None`, `write_group_direct` builds one nameless block for the
-    /// whole group. `wire_props`: `(wire_safe, wire_row_fixed_stride)` as from
-    /// `cached_schema_block`, letting a caller that already has it skip the
-    /// per-column iteration; only `wire_safe` is read.
-    #[allow(clippy::too_many_arguments)]
-    fn with_scatter_group<R>(
+    /// `template` is the group's shared header and must name a schema — every
+    /// slot here carries rows. `wire_props` is `(wire_safe,
+    /// wire_row_fixed_stride)` as from `cached_schema_block`, letting a caller
+    /// that already has it skip the per-column iteration.
+    pub(crate) fn with_scatter_group<R>(
         &self,
         input_batch: &Batch,
         worker_indices: &[Vec<u32>],
-        schema: &SchemaDescriptor,
-        target_id: u32,
-        wire_flags: u64,
-        seek_col_idx: u64,
-        req_ids: &[u64],
-        prebuilt_schema_block: Option<&[u8]>,
+        template: WireMsg<'_>,
+        targets: GroupTargets<'_>,
         wire_props: Option<(bool, u32)>,
         f: impl FnOnce(&DirectGroup) -> R,
     ) -> R {
         let nw = self.num_workers;
+        let schema = template
+            .schema
+            .expect("a scatter group carries rows, so its template must name their schema");
         let (wire_safe, _) = wire_props.unwrap_or_else(|| gnitz_engine::storage::compute_wire_props(schema));
-
-        let template = WireMsg {
-            target_id: target_id as u64,
-            flags: wire_flags,
-            seek_col_idx,
-            schema: Some(schema),
-            prebuilt_schema_block,
-            ..Default::default()
-        };
 
         // The sub-batches must outlive the group that borrows them, so they are
         // built here rather than inside the `worker_data` map.
@@ -1091,47 +1120,15 @@ impl SalWriter {
 
         f(&DirectGroup {
             template,
-            worker_data: &worker_data,
-            req_ids,
-            unicast_worker: None,
+            data: GroupData::PerWorker(&worker_data),
+            targets,
         })
     }
 
-    /// Scatter rows from `input_batch` into per-worker SAL slots using
-    /// pre-computed `worker_indices` — see [`Self::with_scatter_group`] for the
-    /// group this emits. Does NOT sync/signal; `lsn` is the caller's.
-    #[allow(clippy::too_many_arguments)]
-    pub fn scatter_wire_group(
-        &self,
-        input_batch: &Batch,
-        worker_indices: &[Vec<u32>],
-        schema: &SchemaDescriptor,
-        target_id: u32,
-        lsn: u64,
-        sal_flags: u32,
-        wire_flags: u64,
-        seek_col_idx: u64,
-        req_ids: &[u64],
-        prebuilt_schema_block: Option<&[u8]>,
-        wire_props: Option<(bool, u32)>,
-    ) -> Result<(), String> {
-        self.with_scatter_group(
-            input_batch,
-            worker_indices,
-            schema,
-            target_id,
-            wire_flags,
-            seek_col_idx,
-            req_ids,
-            prebuilt_schema_block,
-            wire_props,
-            |g| self.write_group_direct(g, lsn, sal_flags),
-        )
-    }
-
-    /// The exact number of SAL bytes [`Self::scatter_wire_group`] will consume
-    /// for this batch and partitioning. Neither the sentinel nor the checkpoint
-    /// band is included; both are held back globally by `effective_capacity`.
+    /// The exact number of SAL bytes a [`Self::with_scatter_group`] emission
+    /// will consume for this batch and partitioning. Neither the sentinel nor
+    /// the checkpoint band is included; both are held back globally by
+    /// `effective_capacity`.
     ///
     /// The group is built by the emission's own constructor, so the slot sizes
     /// are the emitted ones. `wire_flags`, `seek_col_idx` and the request ids
@@ -1148,16 +1145,16 @@ impl SalWriter {
         prebuilt_schema_block: Option<&[u8]>,
         wire_props: Option<(bool, u32)>,
     ) -> usize {
-        let nw = self.num_workers;
         self.with_scatter_group(
             input_batch,
             worker_indices,
-            schema,
-            target_id,
-            0,
-            0,
-            &NO_REQ_IDS[..nw],
-            prebuilt_schema_block,
+            WireMsg {
+                target_id: target_id as u64,
+                schema: Some(schema),
+                prebuilt_schema_block,
+                ..Default::default()
+            },
+            GroupTargets::AllSilent,
             wire_props,
             |g| self.group_footprint_direct(g),
         )

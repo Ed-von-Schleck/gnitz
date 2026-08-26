@@ -21,7 +21,7 @@ pub struct SchemaWireEntry {
     /// The owning table's schema version when the block was built.
     pub version: u16,
     /// True when every column has a fixed-width 8-aligned stride and no
-    /// German-string (STRING or BLOB) columns. Drives the `scatter_wire_group`
+    /// German-string (STRING or BLOB) columns. Drives the `with_scatter_group`
     /// fast path.
     pub wire_safe: bool,
     /// Sum of pk_stride + 8 (weight) + 8 (null_bmp) + every payload column's

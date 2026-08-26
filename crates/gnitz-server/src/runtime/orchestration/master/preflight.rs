@@ -27,7 +27,7 @@ pub(super) enum CheckRoute {
     /// partition.
     Broadcast,
     /// Partition by the schema PK and scatter, so each worker is sent only the
-    /// keys it stores. Delivered via `scatter_wire_group` without materializing
+    /// keys it stores. Delivered via `with_scatter_group` without materializing
     /// intermediate per-worker `Batch`es — `execute_pipeline` computes the
     /// routing from `check.schema.pk_indices()` via `with_worker_indices`.
     ScatterByPk,
@@ -367,7 +367,7 @@ impl PreflightAccumulator {
 /// boundary — a still-streaming worker never wedges in `send_encoded`.
 async fn merge_index_scan(
     slots: Vec<W2mSlot>,
-    req_ids: &[u64; crate::runtime::sal::MAX_WORKERS],
+    scan: &ScanDispatch,
     reactor: &crate::runtime::reactor::Reactor,
     frame_schema: &SchemaDescriptor,
 ) -> Result<PreflightAccumulator, String> {
@@ -388,8 +388,9 @@ async fn merge_index_scan(
     // lexicographic via `PkBuf: Ord` — pops equal spans adjacently regardless
     // of which workers hold them, the merge order replacing numeric `u128`.
     let mut heap: BinaryHeap<Reverse<(PkBuf, usize)>> = BinaryHeap::with_capacity(nw);
-    for (w, slot) in slots.into_iter().enumerate() {
-        let mut s = PreflightKeyStream::new(w, req_ids[w]);
+    for (i, slot) in slots.into_iter().enumerate() {
+        let (w, req_id) = scan.reply(i);
+        let mut s = PreflightKeyStream::new(w, req_id);
         s.attach_frame(slot, frame_schema)?;
         if let Some(key) = s.next_key(frame_schema, reactor).await? {
             heap.push(Reverse((key, w)));
@@ -1408,25 +1409,24 @@ impl MasterDispatcher {
         // continuation-frame train. `_lease` held to end of scope: when the
         // merge returns early (error or duplicate verdict) the lease drop
         // discards the undrained trains at the ring boundary.
-        let (slots, req_ids, _lease) = dispatch_scan_fanout(self, reactor, unicast, |_, req_ids, unicast| {
+        let (slots, scan) = dispatch_scan_fanout(self, reactor, unicast, |targets| {
             // The worker's `UniquePreflight` arm resolves the owner's schema
             // from its own catalog.
-            self.write_command_group(
-                owner_id,
+            self.write_group(
+                wire::WireMsg {
+                    target_id: owner_id as u64,
+                    seek_col_idx: packed,
+                    ..Default::default()
+                },
+                GroupData::NONE,
                 0,
                 FLAG_UNIQUE_PREFLIGHT,
-                0,
-                0,
-                packed,
-                req_ids,
-                unicast,
-                0,
-                &[],
+                targets,
             )
         })
         .await?;
 
-        let merged = merge_index_scan(slots, &req_ids, reactor, &frame_schema).await?;
+        let merged = merge_index_scan(slots, &scan, reactor, &frame_schema).await?;
         if merged.duplicate {
             return Err(self.cat().unique_create_dup_err(owner_id, col_indices));
         }
@@ -1475,25 +1475,25 @@ impl MasterDispatcher {
                 // catalog lookup on the target id would give the owner's
                 // prefix width.
                 match check.route {
-                    CheckRoute::Broadcast => {
-                        let refs: Vec<Option<&Batch>> = (0..nw).map(|_| Some(&check.batch)).collect();
-                        disp.write_data_group(
-                            check.target_id,
-                            FLAG_HAS_PK,
-                            &refs,
-                            &check.schema,
-                            0,
-                            check.col_hint,
-                            req_slice,
-                        )?;
-                    }
+                    CheckRoute::Broadcast => disp.write_group(
+                        wire::WireMsg {
+                            target_id: check.target_id as u64,
+                            seek_col_idx: check.col_hint,
+                            schema: Some(&check.schema),
+                            ..Default::default()
+                        },
+                        GroupData::Same(wire::WireData::Whole(Some(&check.batch))),
+                        0,
+                        FLAG_HAS_PK,
+                        GroupTargets::All(req_slice),
+                    )?,
                     CheckRoute::ScatterByPk => disp.write_scatter_group(
                         &check.batch,
                         &check.schema,
                         check.target_id,
                         FLAG_HAS_PK,
                         check.col_hint,
-                        req_slice,
+                        GroupTargets::All(req_slice),
                     )?,
                 }
             }
@@ -1566,7 +1566,7 @@ impl MasterDispatcher {
         }
         // Sort so each worker's sublist reaches `gather_family` ascending:
         // `removed`/updated PKs are extracted from an FxHashMap (arbitrary
-        // order) and `scatter_wire_group` preserves per-worker relative order,
+        // order) and `with_scatter_group` preserves per-worker relative order,
         // so a globally sorted input yields per-worker-sorted sublists.
         pks.sort_unstable();
 
@@ -1576,17 +1576,16 @@ impl MasterDispatcher {
         let expected = gnitz_engine::schema::project_schema(&parent_schema, &[ref_col]);
 
         // `_lease` held across the full drain below (see `dispatch_scan_fanout`).
-        let (slots, req_ids, _lease) =
-            dispatch_scan_fanout(disp, reactor, Fanout::Broadcast, |disp, rids, _unicast| {
-                let pooled = disp.pool_pop_batch((target_id, 0));
-                let batch = build_check_batch_pk_bytes(&parent_schema, pks.iter().map(|p| p.pk_bytes()), pooled);
-                disp.write_scatter_group(&batch, &parent_schema, target_id, FLAG_GATHER, ref_col as u64, rids)?;
-                // The scatter batch is fully consumed by the synchronous
-                // scatter_wire_group above; return it to the pool.
-                recycle_check_batch(disp, (target_id, 0), batch);
-                Ok(())
-            })
-            .await?;
+        let (slots, scan) = dispatch_scan_fanout(disp, reactor, Fanout::Broadcast, |targets| {
+            let pooled = disp.pool_pop_batch((target_id, 0));
+            let batch = build_check_batch_pk_bytes(&parent_schema, pks.iter().map(|p| p.pk_bytes()), pooled);
+            disp.write_scatter_group(&batch, &parent_schema, target_id, FLAG_GATHER, ref_col as u64, targets)?;
+            // The scatter batch is fully consumed by the synchronous
+            // with_scatter_group above; return it to the pool.
+            recycle_check_batch(disp, (target_id, 0), batch);
+            Ok(())
+        })
+        .await?;
 
         // The reply projects `ref_col` to payload column 0; read its type and
         // width off the parent schema once.
@@ -1594,7 +1593,7 @@ impl MasterDispatcher {
         let (col_type, col_size) = (col.type_code, col.size() as usize);
 
         let mut out: FxHashMap<PkBuf, u128> = FxHashMap::default();
-        drain_index_scan(slots, &req_ids, reactor, "gather", &expected, |b, _| {
+        drain_index_scan(slots, &scan, reactor, "gather", &expected, |b, _| {
             // The column slice is invariant across a frame's rows; derive it
             // once per frame rather than once per row.
             let col_data = b.col_data(0, col_size);

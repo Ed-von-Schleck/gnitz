@@ -27,7 +27,7 @@ use super::executor::{Shared, TickTrigger};
 use super::guard_panic;
 use crate::runtime::master::{await_worker_acks, first_worker_error_opt, TxnFamily};
 use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, Either, ReplyFuture};
-use crate::runtime::sal::{SalFit, FLAG_FLUSH, FLAG_FLUSH_EPH};
+use crate::runtime::sal::{GroupTargets, SalFit, FLAG_FLUSH, FLAG_FLUSH_EPH};
 use crate::runtime::wire::{DecodedWire, WireConflictMode};
 use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::storage::Batch;
@@ -303,7 +303,7 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<
             Some(gen) => (gen, FLAG_FLUSH_EPH),
             None => (0, FLAG_FLUSH),
         };
-        disp.write_checkpoint_group(lsn, flags, &req_ids)?;
+        disp.write_checkpoint_group(lsn, flags, GroupTargets::All(&req_ids))?;
         disp.signal_all();
     }
 

@@ -2585,7 +2585,7 @@ mod tests {
         // Source 20 has no downstream reindex Map — must NOT appear.
         assert!(
             !map.contains_key(&20),
-            "a source with no reindex Map must not be in join_shard_map"
+            "a source with no reindex Map must not be in the routing map"
         );
     }
 

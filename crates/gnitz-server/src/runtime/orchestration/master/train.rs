@@ -85,13 +85,14 @@ pub(super) fn expect_single_frame(slot: &W2mSlot, w: usize, what: &str) -> Resul
 /// slot is dropped only after `on_batch` returns.
 pub(super) async fn drain_index_scan(
     slots: Vec<W2mSlot>,
-    req_ids: &[u64; MAX_WORKERS],
+    scan: &ScanDispatch,
     reactor: &crate::runtime::reactor::Reactor,
     what: &str,
     expected: &SchemaDescriptor,
     mut on_batch: impl FnMut(&gnitz_engine::storage::MemBatch<'_>, usize) -> Result<(), WorkerFault>,
 ) -> Result<(), WorkerFault> {
-    for (w, mut slot) in slots.into_iter().enumerate() {
+    for (i, mut slot) in slots.into_iter().enumerate() {
+        let (w, req_id) = scan.reply(i);
         let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
         loop {
             let (ctrl, has_more) = parse_train_header(&slot, w, what)?;
@@ -121,7 +122,7 @@ pub(super) async fn drain_index_scan(
             if !has_more {
                 break;
             }
-            slot = reactor.await_scan_slot(req_ids[w] as u32).await;
+            slot = reactor.await_scan_slot(req_id as u32).await;
         }
     }
     Ok(())
@@ -159,10 +160,8 @@ fn classify_head(slot: &W2mSlot, worker: usize) -> Result<TrainHead, WorkerFault
     })
 }
 
-/// Forward each already-awaited worker scan train to the client in ascending
-/// worker order. Under `Fanout::One(w)` the single slot belongs to `w`, not
-/// slot 0. `Ok(false)` on client disconnect, `Err` on a worker fault /
-/// malformed train.
+/// Forward each already-awaited worker scan train to the client in reply order.
+/// `Ok(false)` on client disconnect, `Err` on a worker fault / malformed train.
 ///
 /// When every train is a single frame and the heads together stay under
 /// [`COALESCE_MAX_BYTES`], they are concatenated into one pooled buffer and
@@ -174,10 +173,8 @@ pub(super) async fn forward_scan_slots(
     reactor: &crate::runtime::reactor::Reactor,
     peer: &Peer,
     slots: Vec<W2mSlot>,
-    req_ids: &[u64],
-    unicast: Fanout,
+    scan: &ScanDispatch,
 ) -> Result<bool, WorkerFault> {
-    let worker_of = |i: usize| unicast.worker_of(i);
     // Classify every head before sending anything: whether they can leave as one
     // buffer is not known until every train has been seen. Both arms then run
     // off these, so no head is parsed twice. `slots.len()` is the worker count,
@@ -187,7 +184,7 @@ pub(super) async fn forward_scan_slots(
     let mut total = 0usize;
     let mut any_tail = false;
     for (i, slot) in slots.iter().enumerate() {
-        heads[i] = classify_head(slot, worker_of(i))?;
+        heads[i] = classify_head(slot, scan.reply(i).0)?;
         any_tail |= heads[i].has_more;
         if heads[i].observable {
             observable += 1;
@@ -199,7 +196,8 @@ pub(super) async fn forward_scan_slots(
         // next worker's head, reordering the client's rows. Below two frames
         // there is no kernel op to save.
         for (i, slot) in slots.into_iter().enumerate() {
-            if !drain_scan_train(reactor, peer, slot, heads[i], req_ids[i] as u32, worker_of(i)).await? {
+            let (w, req_id) = scan.reply(i);
+            if !drain_scan_train(reactor, peer, slot, heads[i], req_id as u32, w).await? {
                 return Ok(false);
             }
         }
@@ -286,7 +284,10 @@ mod tests {
         /// Owns the fd `peer` borrows; closes it on drop.
         peer_sock: std::os::unix::net::UnixStream,
         receiver: Rc<crate::runtime::w2m::W2mReceiver>,
-        req_ids: [u64; crate::runtime::sal::MAX_WORKERS],
+        /// The broadcast dispatch the drains under test are handed, holding the
+        /// scan lease. Built the same way production builds one, so the tests
+        /// cannot pair ids with a routing decision the drains disagree with.
+        scan: ScanDispatch,
     }
 
     /// The fixture's rings hold a handful of small reply frames each — every
@@ -306,10 +307,7 @@ mod tests {
                 rings.push(region);
             }
             let reactor = Rc::new(crate::runtime::reactor::Reactor::new(16).expect("reactor"));
-            let mut req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
-            for id in req_ids[..n_workers].iter_mut() {
-                *id = reactor.alloc_scan_request_id();
-            }
+            let scan = ScanDispatch::alloc(&reactor, n_workers, Fanout::Broadcast);
             let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
             let (peer_sock, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
             drop(partner);
@@ -321,7 +319,7 @@ mod tests {
                     peer,
                     peer_sock,
                     receiver: Rc::new(receiver),
-                    req_ids,
+                    scan,
                 },
                 writers,
             )
@@ -342,14 +340,20 @@ mod tests {
             slots
         }
 
-        fn teardown(self, lease: ScanLease) {
-            // Drop the lease before the rings: its Drop purges the scan's
-            // which would drop any still-queued W2mSlot borrowing the
-            // soon-to-be-unmapped region. The Reactor goes next, for the same
-            // reason — it owns the queued frames, and a slot dropped after the
-            // unmap writes `consume_cursor` into freed memory. The Peer holds
-            // an owning `Rc<Reactor>`, so it must go before the Reactor.
-            drop(lease);
+        /// Reply `i`'s request id, as the reactor keys it.
+        fn req(&self, i: usize) -> u32 {
+            self.scan.reply(i).1 as u32
+        }
+
+        fn teardown(self) {
+            // Drop the dispatch (hence the scan lease) before the rings: its
+            // Drop purges the scan's queue, which would drop any still-queued
+            // W2mSlot borrowing the soon-to-be-unmapped region. The Reactor goes
+            // next, for the same reason — it owns the queued frames, and a slot
+            // dropped after the unmap writes `consume_cursor` into freed memory.
+            // The Peer holds an owning `Rc<Reactor>`, so it must go before the
+            // Reactor.
+            drop(self.scan);
             drop(self.peer);
             drop(self.peer_sock);
             drop(self.reactor);
@@ -432,8 +436,8 @@ mod tests {
         use crate::runtime::wire::{STATUS_ERROR, STATUS_OK};
 
         let (fx, writers) = DrainFixture::new(2);
-        let w0_req = fx.req_ids[0] as u32;
-        let w1_req = fx.req_ids[1] as u32;
+        let w0_req = fx.req(0);
+        let w1_req = fx.req(1);
 
         write_test_frame(&writers[0], w0_req, 0, STATUS_ERROR, b"boom", None, None);
         write_test_frame(&writers[1], w1_req, FLAG_CONTINUATION, STATUS_OK, b"", None, None);
@@ -447,13 +451,12 @@ mod tests {
             None,
         );
 
-        let lease = fx.reactor.scan_lease(&[w0_req, w1_req]);
         let slots = fx.initial_slots();
 
         // The frames carry no schema block, so `expected` is never consulted.
         let result = poll_once(drain_index_scan(
             slots,
-            &fx.req_ids,
+            &fx.scan,
             &fx.reactor,
             "scan",
             &two_col_schema(),
@@ -466,7 +469,7 @@ mod tests {
         // Early return: worker 1's continuation must still be parked.
         assert_frame_still_parked(&fx.reactor, w1_req);
 
-        fx.teardown(lease);
+        fx.teardown();
     }
 
     /// Multi-frame trains from one worker merge with a single-frame (flag-free,
@@ -484,8 +487,8 @@ mod tests {
         let single = make_row_batch(schema, &[(4, 1, 0, 40), (5, -1, 0, 50)]);
 
         let (fx, writers) = DrainFixture::new(2);
-        let w0_req = fx.req_ids[0] as u32;
-        let w1_req = fx.req_ids[1] as u32;
+        let w0_req = fx.req(0);
+        let w1_req = fx.req(1);
 
         // Worker 0: chunked train — schema on the first frame only.
         write_test_frame(
@@ -509,13 +512,12 @@ mod tests {
         // Worker 1: single-frame reply, no train flags (send_response shape).
         write_test_frame(&writers[1], w1_req, 0, STATUS_OK, b"", Some(&schema), Some(&single));
 
-        let lease = fx.reactor.scan_lease(&[w0_req, w1_req]);
         let slots = fx.initial_slots();
 
         let mut rows: Vec<(u128, i64)> = Vec::new();
         let result = poll_once(drain_index_scan(
             slots,
-            &fx.req_ids,
+            &fx.scan,
             &fx.reactor,
             "seek_by_index",
             &schema,
@@ -537,7 +539,7 @@ mod tests {
             "every frame's rows reach the sink in worker order, weights verbatim",
         );
 
-        fx.teardown(lease);
+        fx.teardown();
     }
 
     /// A first-frame schema that does not match `expected` must error before
@@ -552,16 +554,15 @@ mod tests {
         let batch = make_row_batch(wire_schema, &[(1, 1, 0, 10)]);
 
         let (fx, writers) = DrainFixture::new(1);
-        let w0_req = fx.req_ids[0] as u32;
+        let w0_req = fx.req(0);
         write_test_frame(&writers[0], w0_req, 0, STATUS_OK, b"", Some(&wire_schema), Some(&batch));
 
-        let lease = fx.reactor.scan_lease(&[w0_req]);
         let slots = fx.initial_slots();
 
         let mut sink_calls = 0usize;
         let result = poll_once(drain_index_scan(
             slots,
-            &fx.req_ids,
+            &fx.scan,
             &fx.reactor,
             "gather",
             &expected,
@@ -575,7 +576,7 @@ mod tests {
         assert!(err.text.contains("worker 0"), "error names the worker: {err}");
         assert_eq!(sink_calls, 0, "no row may reach the sink under a wrong schema");
 
-        fx.teardown(lease);
+        fx.teardown();
     }
 
     /// A sink `Err` (the reply-cap path in `fan_out_index_collect_common`)
@@ -589,7 +590,7 @@ mod tests {
         let chunk = make_row_batch(schema, &[(1, 1, 0, 10)]);
 
         let (fx, writers) = DrainFixture::new(1);
-        let w0_req = fx.req_ids[0] as u32;
+        let w0_req = fx.req(0);
         write_test_frame(
             &writers[0],
             w0_req,
@@ -609,12 +610,11 @@ mod tests {
             Some(&chunk),
         );
 
-        let lease = fx.reactor.scan_lease(&[w0_req]);
         let slots = fx.initial_slots();
 
         let result = poll_once(drain_index_scan(
             slots,
-            &fx.req_ids,
+            &fx.scan,
             &fx.reactor,
             "seek_by_index",
             &schema,
@@ -626,7 +626,7 @@ mod tests {
         // The terminal continuation was never consumed.
         assert_frame_still_parked(&fx.reactor, w0_req);
 
-        fx.teardown(lease);
+        fx.teardown();
     }
 
     /// A worker scan frame carrying neither rows nor a schema block — every
@@ -644,7 +644,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let (fx, writers) = DrainFixture::new(1);
-        let w0_req = fx.req_ids[0] as u32;
+        let w0_req = fx.req(0);
         write_test_frame(
             &writers[0],
             w0_req,
@@ -655,7 +655,6 @@ mod tests {
             None,
         );
 
-        let lease = fx.reactor.scan_lease(&[w0_req]);
         let mut slots = fx.initial_slots();
         let slot = slots.pop().expect("first frame");
 
@@ -674,7 +673,7 @@ mod tests {
             "the dropped slot was released at the ring"
         );
 
-        fx.teardown(lease);
+        fx.teardown();
     }
 
     /// When every train is one frame, `forward_scan_slots` concatenates the
@@ -697,12 +696,11 @@ mod tests {
         let rows_c = make_row_batch(schema, &[(2, 1, 0, 20)]);
 
         let (fx, writers) = DrainFixture::new(3);
-        let reqs: Vec<u32> = (0..3).map(|w| fx.req_ids[w] as u32).collect();
+        let reqs: Vec<u32> = (0..3).map(|i| fx.req(i)).collect();
         write_test_frame(&writers[0], reqs[0], 0, STATUS_OK, b"", Some(&schema), Some(&rows_a));
         write_test_frame(&writers[1], reqs[1], 0, STATUS_OK, b"", None, None);
         write_test_frame(&writers[2], reqs[2], 0, STATUS_OK, b"", Some(&schema), Some(&rows_c));
 
-        let lease = fx.reactor.scan_lease(&reqs);
         let slots = fx.initial_slots();
         let before: Vec<u64> = (0..3)
             .map(|w| {
@@ -714,13 +712,7 @@ mod tests {
 
         // The fixture's peer has no reader, so the send parks and the forward
         // cannot finish in one poll — the cursors are what carry the verdict.
-        let done = try_poll_once(forward_scan_slots(
-            &fx.reactor,
-            &fx.peer,
-            slots,
-            &fx.req_ids,
-            Fanout::Broadcast,
-        ));
+        let done = try_poll_once(forward_scan_slots(&fx.reactor, &fx.peer, slots, &fx.scan));
         assert!(done.is_none(), "the coalesced send parks on a peer nobody reads");
         for (w, &was) in before.iter().enumerate() {
             assert!(
@@ -732,6 +724,6 @@ mod tests {
             );
         }
 
-        fx.teardown(lease);
+        fx.teardown();
     }
 }

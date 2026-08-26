@@ -2,9 +2,9 @@ use crate::runtime::posix;
 use crate::runtime::posix::write_u32_raw;
 use crate::runtime::sal::{
     atomic_load_u64, effective_max, group_header_size, sal_begin_group, sal_probe_header, sal_read_group_header,
-    sal_tail_slot_count, sal_write_group, EpochGate, SalMessage, SalReader, SalStep, SalWriter, CHECKPOINT_RESERVE,
-    FLAG_DDL_SYNC, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_SHUTDOWN, FLAG_TXN_COMMIT, MAX_WORKERS, MIN_SAL_BYTES,
-    SENTINEL_SIZE,
+    sal_tail_slot_count, sal_write_group, EpochGate, GroupData, GroupTargets, SalMessage, SalReader, SalStep,
+    SalWriter, CHECKPOINT_RESERVE, FLAG_DDL_SYNC, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_SHUTDOWN, FLAG_TXN_COMMIT,
+    MAX_WORKERS, MIN_SAL_BYTES, SENTINEL_SIZE,
 };
 use gnitz_engine_testkit::{sweep_bit_flips, SharedRegion};
 use gnitz_wire::align8;
@@ -666,7 +666,7 @@ fn test_sal_prefix_packing_boundaries() {
 // and Phase-B fail-stop depend on it equaling the bytes emission consumes.
 // ---------------------------------------------------------------------------
 
-/// Emit `batch` (partitioned or broadcast) through `scatter_wire_group` and
+/// Emit `batch` (partitioned or broadcast) through `with_scatter_group` and
 /// assert the cursor advance equals `scatter_group_footprint`'s prediction.
 unsafe fn assert_footprint_exact(
     schema: &gnitz_engine::schema::SchemaDescriptor,
@@ -676,7 +676,7 @@ unsafe fn assert_footprint_exact(
 ) {
     use crate::runtime::master::scatter::with_commit_indices;
     use crate::runtime::sal::FLAG_PUSH;
-    use crate::runtime::wire::build_schema_wire_block;
+    use crate::runtime::wire::{build_schema_wire_block, WireMsg};
     use gnitz_engine::storage::compute_wire_props;
 
     // Drive the production dispatch: `broadcast` is exactly the `Replicated`
@@ -705,18 +705,18 @@ unsafe fn assert_footprint_exact(
             writer.scatter_group_footprint(batch, wi, schema, target_id, Some(block.as_slice()), Some(props));
         let before = writer.cursor();
         writer
-            .scatter_wire_group(
+            .with_scatter_group(
                 batch,
                 wi,
-                schema,
-                target_id,
-                7,
-                FLAG_PUSH,
-                0,
-                0,
-                &req_ids,
-                Some(block.as_slice()),
+                WireMsg {
+                    target_id: target_id as u64,
+                    schema: Some(schema),
+                    prebuilt_schema_block: Some(block.as_slice()),
+                    ..Default::default()
+                },
+                GroupTargets::All(&req_ids),
                 Some(props),
+                |g| writer.write_group_direct(g, 7, FLAG_PUSH),
             )
             .expect("group fits");
         let actual = (writer.cursor() - before) as usize;
@@ -794,8 +794,7 @@ fn test_group_footprint_direct_equals_emitted_bytes() {
     let writer = SalWriter::new(region.ptr(), -1, size as u64, nw);
     writer.reset(0, 1); // epoch >= 1 for sal_begin_group's debug_assert
 
-    // Slot 2 stays empty: `relay_data` passes a dataless slot for a zero-row worker.
-    let req_ids = [0u64; 4];
+    // Slot 2 stays empty: the relay passes a dataless slot for a zero-row worker.
     let worker_data = [
         WireData::Whole(Some(&batch)),
         WireData::Whole(Some(&batch)),
@@ -810,9 +809,8 @@ fn test_group_footprint_direct_equals_emitted_bytes() {
             schema: Some(&schema),
             ..Default::default()
         },
-        worker_data: &worker_data,
-        req_ids: &req_ids,
-        unicast_worker: None,
+        data: GroupData::PerWorker(&worker_data),
+        targets: GroupTargets::AllSilent,
     };
 
     let predicted = writer.group_footprint_direct(&group);

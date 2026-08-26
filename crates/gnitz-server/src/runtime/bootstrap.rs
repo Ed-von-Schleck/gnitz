@@ -688,7 +688,18 @@ fn run_server(
     let sal_writer = SalWriter::new(sal_ptr, sal_fd, sal_mmap_size() as u64, nw);
     let w2m_receiver = std::rc::Rc::new(W2mReceiver::new(w2m_ptrs));
 
-    let dispatcher = MasterDispatcher::new(nw, worker_pids, catalog_ptr, sal_writer, w2m_receiver, m2w_efds);
+    // `recovery_start_generation_bump` has already run, so this is the floor
+    // every base round must publish past.
+    let boot_generation = unsafe { (*catalog_ptr).durable_generation() };
+    let dispatcher = MasterDispatcher::new(
+        nw,
+        worker_pids,
+        catalog_ptr,
+        boot_generation,
+        sal_writer,
+        w2m_receiver,
+        m2w_efds,
+    );
     // Before the workers get anywhere: each is re-homing the very stores this
     // process inherited handles to, and two live `Table`s on one directory is the
     // hazard. Only constructors ran between the fork and here.
@@ -698,7 +709,7 @@ fn run_server(
     // Wait for all workers to complete recovery and signal readiness
     let dispatcher = &*dispatcher_rc;
     dispatcher
-        .collect_acks()
+        .collect_acks("recovery sync")
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
 
     // Reset SAL for fresh use (all workers have recovered), one epoch above the

@@ -377,22 +377,11 @@ impl W2mReceiver {
         }
     }
 
-    pub fn wait_for(&self, worker: usize, timeout_ms: i32) -> i32 {
-        let hdr = unsafe { self.header(worker) };
-        let (expected, has_unread) = hdr.arm_master_park();
-        let rc = if has_unread {
-            0
-        } else {
-            posix::futex_wait_u32(hdr.reader_seq() as *const AtomicU32, expected, timeout_ms)
-        };
-        hdr.waiter_flags().fetch_and(!FLAG_MASTER_PARKED, Ordering::AcqRel);
-        rc
-    }
-
-    /// Wait until ANY of `workers` publishes (its `reader_seq` advances) or
+    /// Wait until ANY worker in the `workers` bit mask publishes (its
+    /// `reader_seq` advances) or
     /// `timeout_ms` elapses — the synchronous analogue of the reactor's FUTEX_WAITV.
-    /// A single-word `wait_for` only catches a wake on the one worker it parks on;
-    /// when a DIFFERENT worker is next to publish, its wake hits a different word and
+    /// A single-bit mask only catches a wake on the one worker it parks on; when
+    /// a DIFFERENT worker is next to publish, its wake hits a different word and
     /// the call sleeps to the timeout. Waiting on all pending workers' words at once
     /// fixes that. Returns immediately if any worker already has unread data.
     ///
@@ -402,16 +391,17 @@ impl W2mReceiver {
     /// value-mismatch fast return; one that published before is caught by the
     /// unread-data check (we re-read instead of parking).
     ///
-    /// Does not clear `FLAG_MASTER_PARKED` on return (unlike `wait_for`).
-    /// Correctness rests on `futex_waitv`'s value-compare against the snapshot, not
+    /// Does not clear `FLAG_MASTER_PARKED` on return. Correctness rests on `futex_waitv`'s value-compare against the snapshot, not
     /// on the flag — the flag only gates whether a worker bothers to issue a (cheap)
     /// wake syscall. Leaving it set costs at most a few no-op wakes against unparked
     /// words; once the reactor resumes it re-establishes the flag via
     /// `refresh_futex_waitv_vals`, so there is nothing to restore.
-    pub fn wait_any(&self, workers: &[usize], timeout_ms: i32) -> i32 {
+    pub fn wait_any(&self, mut workers: u64, timeout_ms: i32) -> i32 {
         let mut waiters = [FutexWaitV::new(); gnitz_wire::MAX_WORKERS];
         let mut n = 0;
-        for &w in workers {
+        while workers != 0 {
+            let w = workers.trailing_zeros() as usize;
+            workers &= workers - 1;
             let hdr = unsafe { self.header(w) };
             let (exp, has_unread) = hdr.arm_master_park();
             // Already-published worker: don't park, let the caller re-read.
@@ -732,12 +722,13 @@ mod tests {
         }
     }
 
-    /// BUG: a single-word `wait_for` misses a wake on another ring. `wait_for(0)`
-    /// arms `FLAG_MASTER_PARKED` on ring 0 only, so a publish to ring 3 (flag
+    /// BUG: a mask naming one ring misses a wake on another. Parking on ring 0
+    /// alone arms `FLAG_MASTER_PARKED` there only, so a publish to ring 3 (flag
     /// clear) issues no wake and ring 0's word never changes — the wait sleeps the
-    /// full ceiling even though ring 3 carried the round.
+    /// full ceiling even though ring 3 carried the round. This is why every
+    /// caller passes its whole pending set.
     #[test]
-    fn test_wait_for_misses_publish_on_other_ring() {
+    fn test_wait_any_on_one_ring_misses_publish_on_another() {
         unsafe {
             let rings: Vec<SharedRegion> = (0..4).map(|_| w2m_ring::make_ring(64, 4, 8)).collect();
             let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
@@ -747,18 +738,18 @@ mod tests {
                 W2mWriter::new(pub_ptr as *mut u8).send_encoded(64, 0, |s| s[0] = 7);
             });
             let start = std::time::Instant::now();
-            let _ = receiver.wait_for(0, 300); // parks on ring 0; ring 3's wake can't reach it
+            let _ = receiver.wait_any(1, 300); // parks on ring 0; ring 3's wake can't reach it
             let elapsed = start.elapsed().as_millis();
             handle.join().unwrap();
             assert!(
                 elapsed >= 250,
-                "wait_for(0) must sleep the full ceiling, slept {elapsed}ms"
+                "a ring-0-only mask must sleep the full ceiling, slept {elapsed}ms"
             );
             assert!(receiver.try_read_slot(3).is_some(), "ring 3 really did publish");
         }
     }
 
-    /// FIX: the same setup, but `wait_any([0,1,2,3])` arms `FLAG_MASTER_PARKED` on
+    /// FIX: the same setup, but `wait_any(0b1111)` arms `FLAG_MASTER_PARKED` on
     /// ring 3 too, so the publish wakes the multi-word wait well before the ceiling.
     #[test]
     fn test_wait_any_woken_by_publish_on_other_ring() {
@@ -771,7 +762,7 @@ mod tests {
                 W2mWriter::new(pub_ptr as *mut u8).send_encoded(64, 0, |s| s[0] = 7);
             });
             let start = std::time::Instant::now();
-            let _ = receiver.wait_any(&[0, 1, 2, 3], 5000); // any ring's wake reaches it
+            let _ = receiver.wait_any(0b1111, 5000); // any ring's wake reaches it
             let elapsed = start.elapsed().as_millis();
             handle.join().unwrap();
             assert!(
@@ -790,7 +781,7 @@ mod tests {
             let rings: Vec<SharedRegion> = (0..1).map(|_| w2m_ring::make_ring(64, 4, 8)).collect();
             let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
             let start = std::time::Instant::now();
-            let rc = receiver.wait_any(&[0], 200);
+            let rc = receiver.wait_any(1, 200);
             let elapsed = start.elapsed().as_millis();
             assert_eq!(rc, -1, "no publisher → timeout returns -1");
             assert!(
