@@ -31,7 +31,7 @@ use crate::validate::{
     cte_body, non_recursive_ctes, plain_select_body, reject_duplicate_names, reject_float_key,
     reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
 };
-use gnitz_core::{ColumnDef, GnitzClient, TypeCode};
+use gnitz_core::{CatalogSnapshot, ColumnDef, TypeCode};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, TableFactor,
 };
@@ -48,7 +48,7 @@ use std::rc::Rc;
 /// resolve it by name. Scoping precedence as SQL defines it: a CTE shadows a
 /// catalog name, and a later CTE sees earlier ones (registration is immediate).
 pub(crate) fn bind_ctes(
-    client: &mut GnitzClient,
+    cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
     chain: &mut ViewChain,
     query: &Query,
@@ -64,7 +64,7 @@ pub(crate) fn bind_ctes(
         if let SetExpr::Select(s) = body {
             if s.selection.is_none() && !body_is_grouped(s) && s.distinct.is_none() {
                 reject_unhonored_select_clauses(s, HonoredClauses::PLAIN, &ctx)?;
-                if let Some(resolved) = cte_passthrough(client, s, &cte.alias.columns, binder)? {
+                if let Some(resolved) = cte_passthrough(cat, s, &cte.alias.columns, binder)? {
                     binder.cache_alias(&name, resolved)?;
                     continue;
                 }
@@ -72,8 +72,8 @@ pub(crate) fn bind_ctes(
         }
         // Compiled path: a hidden HIR segment, with the CTE's positional column
         // aliases applied to the emitted visible columns.
-        let (seg_vid, seg_schema, ()) = chain.add_segment(client, |client, chain, vid| {
-            let (circuit, mut cols, pk) = bind_and_lower(client, binder, chain, body, vid, false)?;
+        let (seg_vid, seg_schema, ()) = chain.add_segment(|chain, vid| {
+            let (circuit, mut cols, pk) = bind_and_lower(cat, binder, chain, body, vid, false)?;
             apply_positional_aliases(&cte.alias.columns, cols.iter_mut().collect(), &ctx)?;
             Ok(((circuit, cols, pk), ()))
         })?;
@@ -86,20 +86,20 @@ pub(crate) fn bind_ctes(
 /// Bind one query body — a single SELECT (linear / join / grouped / DISTINCT) or
 /// a set operation whose sides bind recursively.
 pub(crate) fn bind_body(
-    client: &mut GnitzClient,
+    cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
     ids: &ColIdGen,
     body: &SetExpr,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     match body {
-        SetExpr::Select(select) => bind_select(client, binder, ids, select),
+        SetExpr::Select(select) => bind_select(cat, binder, ids, select),
         SetExpr::SetOperation {
             op,
             set_quantifier,
             left,
             right,
-        } => bind_set_op(client, binder, ids, *op, *set_quantifier, left, right),
-        SetExpr::Query(q) => bind_body(client, binder, ids, q.body.as_ref()),
+        } => bind_set_op(cat, binder, ids, *op, *set_quantifier, left, right),
+        SetExpr::Query(q) => bind_body(cat, binder, ids, q.body.as_ref()),
         _ => Err(GnitzSqlError::Unsupported(
             "CREATE VIEW only supports SELECT and set operations".to_string(),
         )),
@@ -123,7 +123,7 @@ fn bind_conjuncts<L: LeafBinder<HirRef>>(expr: &Expr, leaf: &L) -> Result<Vec<Hi
 /// caller pushes into its scope/env. The subtree itself keeps its own names; a
 /// derived alias resolves through the caller's scope, never the binder cache.
 fn resolve_table_factor(
-    client: &mut GnitzClient,
+    cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
     ids: &ColIdGen,
     factor: &TableFactor,
@@ -156,21 +156,21 @@ fn resolve_table_factor(
             )));
         }
         let body = reject_query_envelope_body(subquery, &ctx)?;
-        let subtree = bind_body(client, binder, ids, body)?;
+        let subtree = bind_body(cat, binder, ids, body)?;
         let mut cols = subtree.cols();
         apply_positional_aliases(&alias.columns, cols.iter_mut().map(|c| &mut c.def).collect(), &ctx)?;
         return Ok((subtree, alias.name.value.clone(), cols));
     }
     let (name, alias) = extract_table_name_and_alias(factor, "CREATE VIEW")?;
-    let (tid, schema, kind) = binder.resolve(client, &name)?;
-    let get = RelExpr::get(ids, tid, schema, kind.is_some());
+    let (tid, schema, desc) = binder.resolve(cat, &name)?;
+    let get = RelExpr::get(ids, tid, schema, desc);
     let cols = get.cols();
     Ok((get, alias, cols))
 }
 
 /// Bind one single-SELECT body — a linear body or a FROM-join body.
 fn bind_select(
-    client: &mut GnitzClient,
+    cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
     ids: &ColIdGen,
     select: &Select,
@@ -181,15 +181,15 @@ fn bind_select(
         ));
     }
     if select.from[0].joins.is_empty() {
-        bind_linear_select(client, binder, ids, select)
+        bind_linear_select(cat, binder, ids, select)
     } else {
-        bind_join_select(client, binder, ids, select)
+        bind_join_select(cat, binder, ids, select)
     }
 }
 
 /// Bind a single-table linear body to `Project(Filter?(Get))`.
 fn bind_linear_select(
-    client: &mut GnitzClient,
+    cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
     ids: &ColIdGen,
     select: &Select,
@@ -201,7 +201,7 @@ fn bind_linear_select(
     // The sole FROM relation (a table, a CTE, or a derived table) → its source
     // subtree, alias, and the cols that form the leaf environment for name
     // resolution.
-    let (source, outer_alias, env) = resolve_table_factor(client, binder, ids, &select.from[0].relation)?;
+    let (source, outer_alias, env) = resolve_table_factor(cat, binder, ids, &select.from[0].relation)?;
 
     // A subquery-carrying single-table body (EXISTS/IN, scalar aggregate, ANY/ALL)
     // routes to the subquery-aware leaf, which binds each subquery as a
@@ -223,7 +223,7 @@ fn bind_linear_select(
             )));
         }
         if !grouped && !distinct {
-            return bind_linear_subquery_body(client, binder, ids, select, source, env, &outer_alias);
+            return bind_linear_subquery_body(cat, binder, ids, select, source, env, &outer_alias);
         }
     }
 
@@ -424,8 +424,8 @@ impl LeafBinder<HirRef> for HirSingleTable<'_> {
 // `bind_structural`, so every desugar/fold the structural recursion performs —
 // COALESCE truncation at a never-NULL COUNT, provably-non-null elision, CASE
 // short-circuit — is reached for free. `SubqueryLeaf` binds each subquery node to a
-// `HirRef::Subquery` leaf where the walk meets it, reaching `&mut client, &mut
-// binder` through a `RefCell` (the `LeafBinder` methods take `&self`). Decorrelation
+// `HirRef::Subquery` leaf where the walk meets it, reaching the snapshot and the
+// binder through a `RefCell` (the `LeafBinder` methods take `&self`). Decorrelation
 // (`hir::rewrite`) consumes the leaves.
 
 /// Whether an expression node is itself a subquery of any kind (an opaque leaf to
@@ -447,13 +447,13 @@ fn value_never_null(value: &HirExpr) -> bool {
     matches!(value, BExpr::ColRef(HirRef::Subquery(s)) if s.never_null())
 }
 
-/// Everything a subquery bind resolves against: the two mutable compilation
-/// handles plus the outer scope it correlates to. Behind one `RefCell` on the leaf,
-/// so `LeafBinder`'s `&self` methods can reach it; borrowed only for the duration of
-/// a single `bind_one_subquery` call, which never re-enters this leaf (a nested
+/// Everything a subquery bind resolves against: the catalog snapshot, the mutable
+/// binder, and the outer scope it correlates to. Behind one `RefCell` on the leaf,
+/// so `LeafBinder`'s `&self` methods can reach it; borrowed only for the duration
+/// of a single `bind_one_subquery` call, which never re-enters this leaf (a nested
 /// subquery is rejected by the inner correlation leaf).
 struct SubCtx<'a, 'b, 'c> {
-    client: &'a mut GnitzClient,
+    cat: &'c CatalogSnapshot,
     binder: &'a mut Binder<'b>,
     ids: &'c ColIdGen,
     outer_env: &'c [HirCol],
@@ -508,7 +508,7 @@ impl LeafBinder<HirRef> for SubqueryLeaf<'_, '_, '_> {
 /// One pass: each subquery binds where `bind_structural` meets it, so the WHERE
 /// and the projection are walked exactly once and in source order.
 fn bind_linear_subquery_body(
-    client: &mut GnitzClient,
+    cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
     ids: &ColIdGen,
     select: &Select,
@@ -519,7 +519,7 @@ fn bind_linear_subquery_body(
     let leaf = SubqueryLeaf {
         inner: HirSingleTable { env: &env },
         ctx: RefCell::new(SubCtx {
-            client,
+            cat,
             binder,
             ids,
             outer_env: &env,
@@ -566,8 +566,8 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_, '_>, subquery: &'e Query) -> Result
             "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
         )));
     }
-    let (inner_tid, inner_schema, inner_kind) = cx.binder.resolve(cx.client, &inner_name)?;
-    let inner_get = RelExpr::get(cx.ids, inner_tid, inner_schema, inner_kind.is_some());
+    let (inner_tid, inner_schema, inner_desc) = cx.binder.resolve(cx.cat, &inner_name)?;
+    let inner_get = RelExpr::get(cx.ids, inner_tid, inner_schema, inner_desc);
     let inner_cols = inner_get.cols();
 
     // Split the inner WHERE against the (outer, inner) scope by `ColId` membership.
@@ -933,7 +933,7 @@ fn build_scalar_reduce(
 /// rewrite classifies them); the WHERE binds to a `Filter` over the top join (the
 /// rewrite folds INNER into the residual, keeps OUTER as a post-null-fill filter).
 fn bind_join_select(
-    client: &mut GnitzClient,
+    cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
     ids: &ColIdGen,
     select: &Select,
@@ -944,7 +944,7 @@ fn bind_join_select(
     let from = &select.from[0];
 
     // Leftmost relation (a table, a CTE, or a derived table).
-    let (left_src, lalias, lcols) = resolve_table_factor(client, binder, ids, &from.relation)?;
+    let (left_src, lalias, lcols) = resolve_table_factor(cat, binder, ids, &from.relation)?;
     let mut scope = JoinScope::new();
     scope.push(&lalias, lcols);
     let mut left = left_src;
@@ -953,7 +953,7 @@ fn bind_join_select(
     // accumulated scope, then fold into a `Join` node.
     for join in &from.joins {
         let (on_expr, kind) = join_on_and_type(join)?;
-        let (right_src, ralias, rcols) = resolve_table_factor(client, binder, ids, &join.relation)?;
+        let (right_src, ralias, rcols) = resolve_table_factor(cat, binder, ids, &join.relation)?;
         scope.push(&ralias, rcols);
         let on = bind_conjuncts(on_expr, &join_leaf(&scope))?;
         left = RelExpr::join(left, right_src, kind, on, None);
@@ -1404,7 +1404,7 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
 /// Bind a set operation, binding both sides recursively; the `SetOp` constructor
 /// pairs columns positionally and promotes cross-width types.
 fn bind_set_op(
-    client: &mut GnitzClient,
+    cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
     ids: &ColIdGen,
     op: SetOperator,
@@ -1434,7 +1434,7 @@ fn bind_set_op(
     // Each side binds as any relational body — a plain SELECT, a join, a grouped
     // query, a nested set operation, or a derived table (all handled by
     // `bind_body` → `resolve_table_factor`).
-    let left_rel = bind_body(client, binder, ids, left)?;
-    let right_rel = bind_body(client, binder, ids, right)?;
+    let left_rel = bind_body(cat, binder, ids, left)?;
+    let right_rel = bind_body(cat, binder, ids, right)?;
     RelExpr::set_op(ids, kind, all, left_rel, right_rel)
 }

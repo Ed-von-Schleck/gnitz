@@ -139,8 +139,7 @@ fn rename_relation(
     let source_name = extract_name(source, "ALTER TABLE")?;
     validate_user_name(&source_name)?;
 
-    let resolved = client.resolve_relation_kind(schema_name, &source_name)?;
-    let Some(rel) = resolved else {
+    let Some(rel) = client.resolve(schema_name, &source_name)? else {
         if if_exists {
             return Ok(altered("table", extract_name(target, "ALTER TABLE")?));
         }
@@ -291,7 +290,7 @@ fn drop_column(
     // dormant). Served from the statement's resolved descriptor; `cols` are
     // physical indices in the same space as `col_idx`, so a composite-index
     // member is caught.
-    let indexes = client.table_indexes(tid)?;
+    let indexes = Arc::clone(&client.describe_by_id(tid)?.indexes);
     if indexes.iter().any(|im| im.cols.as_slice().contains(&(col_idx as u32))) {
         return Err(GnitzSqlError::Unsupported(format!(
             "cannot DROP COLUMN '{col_name}': it is covered by a secondary index; DROP the index first"
@@ -413,7 +412,7 @@ fn alter_base_table_exists(
     op: &str,
 ) -> Result<bool, GnitzSqlError> {
     validate_user_name(source_name)?;
-    match client.resolve_relation_kind(schema_name, source_name)? {
+    match client.resolve(schema_name, source_name)? {
         None if if_exists => Ok(false),
         None => Err(missing("Table", schema_name, source_name)),
         // No class but a base table has a column shape to ALTER: a view is

@@ -87,27 +87,28 @@ impl Mirror {
     /// of a relation that changed identity is worthless — the bootstrap that
     /// follows is the only correct answer anyway.
     pub(crate) fn reconcile_registration(&mut self, schema_name: &str, name: &str) -> Result<u64, MirrorError> {
-        let (schema, kind) = self.client.resolve_relation(schema_name, name)?;
-        if !kind.class.is_view() {
+        let rel = self.client.resolve_relation(schema_name, name)?;
+        if !rel.class.is_view() {
             return Err(MirrorError::Engine(format!(
                 "'{schema_name}.{name}' is a {}; only a view can be mirrored",
-                kind.class.noun()
+                rel.class.noun()
             )));
         }
-        if kind.class == RelClass::BoundedView {
+        if rel.class == RelClass::BoundedView {
             return Err(MirrorError::Engine(format!(
                 "view '{schema_name}.{name}' is capacity-bounded, and a capacity and a feed \
                  are refused together, so it carries no feed to subscribe to"
             )));
         }
-        if !kind.delta {
+        if !rel.delta {
             return Err(MirrorError::Engine(format!(
                 "view '{schema_name}.{name}' keeps no delta feed; \
                  create it WITH (delta = '<size>') to mirror it"
             )));
         }
 
-        let tid = kind.tid;
+        let tid = rel.tid;
+        let schema = Arc::clone(&rel.schema);
         let want_desc = descriptor_of(&schema)?;
 
         // A registration the local catalog already holds at this id and layout
@@ -149,9 +150,8 @@ impl Mirror {
             MirroredView {
                 schema_name: schema_name.to_string(),
                 name: name.to_string(),
-                kind,
                 delta_reply_schema: Arc::new(delta_reply_schema(&schema)),
-                schema,
+                desc: rel,
                 view_desc,
                 delta_desc,
             },

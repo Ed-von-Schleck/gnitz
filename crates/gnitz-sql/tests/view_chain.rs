@@ -16,12 +16,17 @@
 //! that is pinned for both segment shapes, since the shard-free one has no
 //! barrier and stops on local drain exhaustion instead.
 
-use gnitz_core::{hidden_view_name, CircuitBuilder, ColumnDef, GnitzClient, PlannedView};
+use gnitz_core::{hidden_view_name, CircuitBuilder, ColumnDef, GnitzClient, PlannedView, ViewName};
 use gnitz_sql::GnitzSqlError;
 use gnitz_test_harness::ServerHandle;
 
 mod common;
 use common::*;
+
+/// A user-visible view name.
+fn named(name: &str) -> ViewName {
+    ViewName::Named(name.to_string())
+}
 
 /// A minimal exchanging identity view over `source_id`, keyed on PK col 0:
 /// `input_delta → shard([0]) → sink`. Its backfill runs a cross-worker exchange
@@ -63,8 +68,8 @@ fn plan_chain(
     h_vid: u64,
     f_vid: u64,
     base_tid: u64,
-    h_name: &str,
-    f_name: &str,
+    h_name: ViewName,
+    f_name: ViewName,
     cols: &[ColumnDef],
 ) -> [PlannedView; 2] {
     plan_chain_with(identity_exchange_circuit, h_vid, f_vid, base_tid, h_name, f_name, cols)
@@ -77,12 +82,12 @@ fn plan_chain_with(
     h_vid: u64,
     f_vid: u64,
     base_tid: u64,
-    h_name: &str,
-    f_name: &str,
+    h_name: ViewName,
+    f_name: ViewName,
     cols: &[ColumnDef],
 ) -> [PlannedView; 2] {
     let h = PlannedView {
-        name: h_name.to_string(),
+        name: h_name,
         sql_text: "-- hidden segment".to_string(),
         circuit: circuit_of(h_vid, base_tid),
         output_columns: cols.to_vec(),
@@ -91,7 +96,7 @@ fn plan_chain_with(
         delta_bytes: None,
     };
     let f = PlannedView {
-        name: f_name.to_string(),
+        name: f_name,
         sql_text: "-- final segment".to_string(),
         circuit: circuit_of(f_vid, h_vid),
         output_columns: cols.to_vec(),
@@ -115,7 +120,7 @@ fn chain_backfill_dependency_order() {
 
     let h_vid = client.alloc_table_id().unwrap();
     let f_vid = client.alloc_table_id().unwrap();
-    let views = plan_chain(h_vid, f_vid, base_tid, "chain_h", "chain_f", &cols);
+    let views = plan_chain(h_vid, f_vid, base_tid, named("chain_h"), named("chain_f"), &cols);
 
     let vids = client.create_view_chain(&sn, Vec::from(views), None).unwrap();
     assert_eq!(vids, vec![h_vid, f_vid], "vids returned in input order");
@@ -141,7 +146,7 @@ fn chain_backfill_row_misordered() {
 
     let h_vid = client.alloc_table_id().unwrap();
     let f_vid = client.alloc_table_id().unwrap();
-    let [h, f] = plan_chain(h_vid, f_vid, base_tid, "mis_h", "mis_f", &cols);
+    let [h, f] = plan_chain(h_vid, f_vid, base_tid, named("mis_h"), named("mis_f"), &cols);
     // Consumer (f) before producer (h) in the bundle.
     let vids = client.create_view_chain(&sn, vec![f, h], None).unwrap();
     assert_eq!(vids, vec![f_vid, h_vid], "vids returned in input order");
@@ -170,7 +175,15 @@ fn chain_backfill_row_misordered_linear() {
 
     let h_vid = client.alloc_table_id().unwrap();
     let f_vid = client.alloc_table_id().unwrap();
-    let [h, f] = plan_chain_with(identity_linear_circuit, h_vid, f_vid, base_tid, "lin_h", "lin_f", &cols);
+    let [h, f] = plan_chain_with(
+        identity_linear_circuit,
+        h_vid,
+        f_vid,
+        base_tid,
+        named("lin_h"),
+        named("lin_f"),
+        &cols,
+    );
     // Consumer (f) before producer (h) in the bundle.
     client.create_view_chain(&sn, vec![f, h], None).unwrap();
 
@@ -199,7 +212,7 @@ fn chain_atomic_rollback_on_name_collision() {
     let h_vid = client.alloc_table_id().unwrap();
     let f_vid = client.alloc_table_id().unwrap();
     // h has a fresh name; f collides with `taken`.
-    let views = plan_chain(h_vid, f_vid, base_tid, "roll_h", "taken", &cols);
+    let views = plan_chain(h_vid, f_vid, base_tid, named("roll_h"), named("taken"), &cols);
     let res = client.create_view_chain(&sn, Vec::from(views), None);
     assert!(res.is_err(), "collision must fail the bundle");
 
@@ -229,7 +242,14 @@ fn chain_drop_cascades_hidden_members() {
     // Hidden segment named by the real `__h{final_vid}_{i}` convention so
     // `drop_view`'s prefix scan (`__h{f_vid}_`) matches it.
     let h_name = hidden_view_name(f_vid, 0);
-    let views = plan_chain(h_vid, f_vid, base_tid, &h_name, "userview", &cols);
+    let views = plan_chain(
+        h_vid,
+        f_vid,
+        base_tid,
+        ViewName::Hidden { owner: f_vid, idx: 0 },
+        named("userview"),
+        &cols,
+    );
     client.create_view_chain(&sn, Vec::from(views), None).unwrap();
 
     assert!(
@@ -256,6 +276,46 @@ fn chain_drop_cascades_hidden_members() {
     client.drop_table(&sn, "base").unwrap();
 }
 
+/// A misordered bundle (the consumer's VIEW_TAB row before the producer's) still
+/// names its hidden segment after the owner, so `DROP VIEW` cascades to it. A name
+/// derived from the bundle's last row would name the segment after itself, and the
+/// prefix scan the cascade runs would never find it: the segment would stay live
+/// and undroppable.
+#[test]
+fn chain_misordered_bundle_still_cascades_its_hidden_segment() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let (base_tid, cols) = make_base(&mut client, &sn);
+
+    let h_vid = client.alloc_table_id().unwrap();
+    let f_vid = client.alloc_table_id().unwrap();
+    let [h, f] = plan_chain(
+        h_vid,
+        f_vid,
+        base_tid,
+        ViewName::Hidden { owner: f_vid, idx: 0 },
+        named("userview"),
+        &cols,
+    );
+    // Consumer (f) before producer (h) in the bundle.
+    client.create_view_chain(&sn, vec![f, h], None).unwrap();
+
+    let h_name = hidden_view_name(f_vid, 0);
+    assert!(
+        client.resolve_table_or_view_id(&sn, &h_name).is_ok(),
+        "the segment is named after its owner, not after the bundle's last row"
+    );
+    client.drop_view(&sn, "userview").unwrap();
+    assert!(
+        client.resolve_table_or_view_id(&sn, &h_name).is_err(),
+        "hidden segment cascaded away with its owner"
+    );
+    client.drop_table(&sn, "base").unwrap();
+}
+
 /// A base table under a live chain cannot be dropped — the hidden and final
 /// segments depend on it, so the engine RESTRICTs.
 #[test]
@@ -269,8 +329,14 @@ fn chain_drop_table_restricts_under_chain() {
 
     let h_vid = client.alloc_table_id().unwrap();
     let f_vid = client.alloc_table_id().unwrap();
-    let h_name = hidden_view_name(f_vid, 0);
-    let views = plan_chain(h_vid, f_vid, base_tid, &h_name, "userview", &cols);
+    let views = plan_chain(
+        h_vid,
+        f_vid,
+        base_tid,
+        ViewName::Hidden { owner: f_vid, idx: 0 },
+        named("userview"),
+        &cols,
+    );
     client.create_view_chain(&sn, Vec::from(views), None).unwrap();
 
     assert!(
@@ -295,8 +361,14 @@ fn chain_drop_schema_drains_hidden_members() {
 
     let h_vid = client.alloc_table_id().unwrap();
     let f_vid = client.alloc_table_id().unwrap();
-    let h_name = hidden_view_name(f_vid, 0);
-    let views = plan_chain(h_vid, f_vid, base_tid, &h_name, "userview", &cols);
+    let views = plan_chain(
+        h_vid,
+        f_vid,
+        base_tid,
+        ViewName::Hidden { owner: f_vid, idx: 0 },
+        named("userview"),
+        &cols,
+    );
     client.create_view_chain(&sn, Vec::from(views), None).unwrap();
 
     client.drop_schema(&sn).unwrap();
@@ -320,7 +392,7 @@ fn chain_rejects_over_length() {
     let over = gnitz_core::MAX_CHAIN_SEGMENTS + 1;
     let planned: Vec<PlannedView> = (0..over)
         .map(|_| PlannedView {
-            name: "x".to_string(),
+            name: ViewName::Named("x".to_string()),
             sql_text: String::new(),
             circuit: identity_exchange_circuit(0, base_tid),
             output_columns: cols.clone(),

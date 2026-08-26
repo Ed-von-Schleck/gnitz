@@ -25,7 +25,7 @@ use crate::hir::physical;
 use crate::hir::JoinType;
 use crate::ir::BExpr;
 use crate::validate::reject_column_overflow;
-use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, NodeId, Schema};
+use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, Schema};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -72,7 +72,6 @@ struct ExistsCircuit {
 /// WHERE (the left-input prefilter for a semi/anti view; empty for a mark view,
 /// whose WHERE is applied post-mark per branch).
 fn emit_exists_circuit(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     source: &Rc<RelExpr>,
@@ -99,7 +98,7 @@ fn emit_exists_circuit(
         live.insert(r.left);
     }
 
-    let left_in = resolve_input(client, chain, memo, left, &live)?;
+    let left_in = resolve_input(chain, memo, left, &live)?;
     let (inner_preds, inner_src) = split_filter(right);
     let right_in = seginput_of_get(inner_src)
         .ok_or_else(|| GnitzSqlError::Internal("EXISTS/IN inner relation is not a base Get".into()))?;
@@ -108,7 +107,7 @@ fn emit_exists_circuit(
     // as a distinct source (single-source-per-epoch) — wrap the colliding inner
     // side in a pass-through segment (the shared source-collision rule).
     let mut inputs = [left_in, right_in];
-    resolve_collisions(client, chain, &mut inputs, &[left, right], false)?;
+    resolve_collisions(chain, &mut inputs, &[left, right], false)?;
     let [left_in, right_in] = inputs;
 
     let a_n = left_in.schema.columns.len();
@@ -354,7 +353,6 @@ impl ExistsCore<'_> {
 
 /// Lower a decorrelated `Project(Filter?(Join{Semi|Anti}))` to circuit pieces.
 pub(crate) fn lower_semi_anti_view(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     items: &[ProjEntry],
@@ -369,7 +367,7 @@ pub(crate) fn lower_semi_anti_view(
         shard,
         left_in,
         ..
-    } = emit_exists_circuit(client, chain, memo, source, fpreds, items, view_id)?;
+    } = emit_exists_circuit(chain, memo, source, fpreds, items, view_id)?;
 
     let npk = out_pk_cols.len();
     let a_n = left_in.schema.columns.len();
@@ -390,7 +388,6 @@ pub(crate) fn lower_semi_anti_view(
 /// matched / unmatched branches each bind the (post-mark) WHERE + projection with
 /// the mark column substituted by its `0/1` constant, then union.
 pub(crate) fn lower_mark_view(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     items: &[ProjEntry],
@@ -412,7 +409,7 @@ pub(crate) fn lower_mark_view(
         out_pk_cols,
         shard,
         left_in,
-    } = emit_exists_circuit(client, chain, memo, source, &[], items, view_id)?;
+    } = emit_exists_circuit(chain, memo, source, &[], items, view_id)?;
     let unmatched = unmatched.expect("mark core returns an unmatched branch");
 
     let npk = out_pk_cols.len();

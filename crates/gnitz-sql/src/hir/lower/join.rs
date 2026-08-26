@@ -20,9 +20,7 @@ use super::{
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 
-use gnitz_core::{
-    CircuitBuilder, ColumnDef, GnitzClient, NodeId, RangeRel, ReduceOutKey, ReindexRole, Schema, TypeCode,
-};
+use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, RangeRel, ReduceOutKey, ReindexRole, Schema, TypeCode};
 use gnitz_wire::{AGG_MAX, AGG_MIN};
 use std::collections::HashSet;
 
@@ -46,7 +44,6 @@ impl Demand<'_> {
 /// plus the output `ColId` layout: `[k hidden `_join_pk` / `_pair_pk` slots]`
 /// followed by the projected payload in item order.
 pub(crate) fn lower_join_view(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     project_items: &[ProjEntry],
@@ -58,7 +55,7 @@ pub(crate) fn lower_join_view(
         items: project_items,
         where_preds,
     };
-    let pieces = emit_step(client, chain, memo, down, join, view_id)?;
+    let pieces = emit_step(chain, memo, down, join, view_id)?;
     // The emitted pk-list is the synthetic key region; its width is the number of
     // identity-free slots the layout leads with.
     let layout = key_region_layout(pieces.2.len(), project_items);
@@ -67,7 +64,6 @@ pub(crate) fn lower_join_view(
 
 /// Emit one join step, resolving (and cutting/wrapping) its two inputs first.
 fn emit_step(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     down: Demand<'_>,
@@ -97,10 +93,10 @@ fn emit_step(
     // delta inputs are distinct sources. The wrapped `Get` reuses its ColIds,
     // re-ordered to the wrapper's PK-front schema — `resolve_refs` absorbs it.
     let mut inputs = [
-        resolve_input(client, chain, memo, left, &live)?,
-        resolve_input(client, chain, memo, right, &live)?,
+        resolve_input(chain, memo, left, &live)?,
+        resolve_input(chain, memo, right, &live)?,
     ];
-    resolve_collisions(client, chain, &mut inputs, &[left, right], false)?;
+    resolve_collisions(chain, &mut inputs, &[left, right], false)?;
     let [left_in, right_in] = inputs;
 
     if class.range.is_some() {

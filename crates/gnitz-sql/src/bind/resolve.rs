@@ -1,6 +1,6 @@
 use crate::ast_util::{classify_from, extract_table_factor_name, is_bare_wildcard_projection, FromShape};
 use crate::error::GnitzSqlError;
-use gnitz_core::{ColumnDef, GnitzClient, ReadTarget, RelClass, Schema};
+use gnitz_core::{CatalogSnapshot, ClientError, ColumnDef, GnitzClient, RelClass, RelDescriptor, Schema};
 use sqlparser::ast::{Expr, Select, SelectItem, TableAliasColumnDef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,27 +43,28 @@ pub(crate) fn find_unique_column<'a>(
     Ok(found)
 }
 
-/// One Binder cache entry: a name's resolved id and schema, plus how that id was
-/// issued.
+/// One Binder cache entry: a name's resolved id and schema, plus the catalog
+/// descriptor the id came from.
 ///
-/// `catalog_kind` is `None` for a chain-minted CTE/derived-table segment id.
-/// A segment id is issued by the same never-reused monotonic counter as a real
-/// relation's, so it names nothing else — but the segment's catalog rows are not
-/// published until the whole chain is created at statement end, so a catalog
-/// probe for one fails outright (`relation N not found`) rather than merely
-/// wasting a round-trip. Every such probe is therefore gated on this field. It
-/// lives IN the entry so an alias that shadows an earlier resolution
-/// (`FROM (SELECT * FROM t) t` re-caching `t` as a minted segment) atomically
-/// replaces id and provenance together.
+/// `desc` is `None` for a chain-minted CTE/derived-table segment id: its catalog
+/// rows are not published until the whole chain is created at statement end, so
+/// there is no descriptor to carry. It lives in the entry so an alias that
+/// shadows an earlier resolution (`FROM (SELECT * FROM t) t` re-caching `t` as a
+/// minted segment) replaces id and descriptor together.
+///
+/// The schema rides beside the descriptor rather than being read out of it: a
+/// CTE's positional column aliases rename the schema the alias resolves through,
+/// while the descriptor keeps the source relation's own names.
 struct CachedRelation {
     table_id: u64,
     schema: Arc<Schema>,
-    catalog_kind: Option<RelClass>,
+    desc: Option<Arc<RelDescriptor>>,
 }
 
-/// A resolved relation: its id, its schema, and `None` if the id was chain-minted
-/// rather than catalog-issued.
-pub(crate) type Resolved = (u64, Arc<Schema>, Option<RelClass>);
+/// A resolved relation: its id, the schema references resolve through, and its
+/// catalog descriptor — `None` if the id was chain-minted rather than
+/// catalog-issued.
+pub(crate) type Resolved = (u64, Arc<Schema>, Option<Arc<RelDescriptor>>);
 
 pub(crate) struct Binder<'a> {
     schema_name: &'a str,
@@ -94,25 +95,23 @@ impl<'a> Binder<'a> {
     /// form — the single fold site, so a case-varying reference (`WITH Cc … FROM
     /// cc`) hits regardless of which caller inserted (SQL identifiers are
     /// case-insensitive).
-    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Arc<Schema>, catalog_kind: Option<RelClass>) {
-        self.cache.insert(
-            name.to_ascii_lowercase(),
-            CachedRelation {
-                table_id,
-                schema,
-                catalog_kind,
-            },
-        );
+    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Arc<Schema>, desc: Option<Arc<RelDescriptor>>) {
+        self.cache
+            .insert(name.to_ascii_lowercase(), CachedRelation { table_id, schema, desc });
     }
 
-    /// Resolve `name` to its id, schema and provenance. The provenance rides the
-    /// same entry as the id, so a caller that needs it makes no second lookup and
-    /// the two can never disagree.
-    pub(crate) fn resolve(&mut self, reads: &mut dyn ReadTarget, name: &str) -> Result<Resolved, GnitzSqlError> {
+    /// Resolve `name` to its id, schema and descriptor against the statement's
+    /// catalog snapshot. The descriptor rides the same cache entry as the id, so
+    /// the two cannot disagree.
+    ///
+    /// A name the snapshot does not hold raises [`GnitzSqlError::CatalogMiss`],
+    /// which `dispatch::plan_resolving` answers by resolving it and re-running the
+    /// pass. A name it holds as a recorded absence is the ordinary "not found".
+    pub(crate) fn resolve(&mut self, cat: &CatalogSnapshot, name: &str) -> Result<Resolved, GnitzSqlError> {
         // Probe with the canonical key — the cache holds base-table resolutions
         // *and* CTE/derived-table aliases (which never reach the catalog).
         if let Some(entry) = self.cache.get(&name.to_ascii_lowercase()) {
-            return Ok((entry.table_id, Arc::clone(&entry.schema), entry.catalog_kind));
+            return Ok((entry.table_id, Arc::clone(&entry.schema), entry.desc.clone()));
         }
         // Referenced relations obey the same reserved-prefix rule as created
         // ones: a fresh catalog probe of a leading-`_` name can only be a user
@@ -122,7 +121,16 @@ impl<'a> Binder<'a> {
         // on insert (`cache_alias` validates; `cache_relation` is fed from these
         // already-validated probes), never a raw `__h…` catalog name.
         crate::validate::validate_user_name(name)?;
-        let (schema, rel) = reads.resolve_relation(self.schema_name, name)?;
+        let rel = cat
+            .get(self.schema_name, name)
+            .ok_or_else(|| GnitzSqlError::CatalogMiss(name.to_string()))?
+            .ok_or_else(|| {
+                GnitzSqlError::Exec(ClientError::ServerError(format!(
+                    "Table or view '{}' not found",
+                    gnitz_core::qualified_name(self.schema_name, name)
+                )))
+            })?;
+        let schema = Arc::clone(&rel.schema);
         // Leaf rule. A bounded view's store keeps only skeleton rows past its
         // capacity, and hydrating them replays *sources* — so a view over one
         // would have to hydrate through it, and its own store would be a second
@@ -142,9 +150,8 @@ impl<'a> Binder<'a> {
                 "'{name}' is a stream; it holds no rows and can only be read inside a view body"
             )));
         }
-        let kind = Some(rel.class);
-        self.cache_relation(name, rel.tid, Arc::clone(&schema), kind);
-        Ok((rel.tid, schema, kind))
+        self.cache_relation(name, rel.tid, Arc::clone(&schema), Some(Arc::clone(&rel)));
+        Ok((rel.tid, schema, Some(rel)))
     }
 
     /// Resolve a write/index target that must be a base table: UPDATE, DELETE and
@@ -162,17 +169,17 @@ impl<'a> Binder<'a> {
         &mut self,
         client: &mut GnitzClient,
         name: &str,
-    ) -> Result<(u64, Arc<Schema>), GnitzSqlError> {
+    ) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
         crate::validate::validate_user_name(name)?;
-        let (schema, rel) = client.resolve_relation(self.schema_name, name)?;
+        let rel = client.resolve_relation(self.schema_name, name)?;
         if rel.class != RelClass::Table {
             return Err(GnitzSqlError::Unsupported(format!(
                 "'{name}' is a {}; UPDATE, DELETE and CREATE INDEX require a base table",
                 rel.class.noun()
             )));
         }
-        self.cache_relation(name, rel.tid, Arc::clone(&schema), Some(RelClass::Table));
-        Ok((rel.tid, schema))
+        self.cache_relation(name, rel.tid, Arc::clone(&rel.schema), Some(Arc::clone(&rel)));
+        Ok(rel)
     }
 
     /// Resolve an INSERT target, which may be a base table or a stream — the one
@@ -184,16 +191,16 @@ impl<'a> Binder<'a> {
         &mut self,
         client: &mut GnitzClient,
         name: &str,
-    ) -> Result<(u64, Arc<Schema>, RelClass), GnitzSqlError> {
+    ) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
         crate::validate::validate_user_name(name)?;
-        let (schema, rel) = client.resolve_relation(self.schema_name, name)?;
+        let rel = client.resolve_relation(self.schema_name, name)?;
         if rel.class.is_view() {
             return Err(GnitzSqlError::Unsupported(format!(
                 "'{name}' is a {}; INSERT requires a base table or a stream",
                 rel.class.noun()
             )));
         }
-        Ok((rel.tid, schema, rel.class))
+        Ok(rel)
     }
 
     /// Cache a CTE / derived-table alias as resolving to the given
@@ -202,13 +209,12 @@ impl<'a> Binder<'a> {
     /// probed before validation), so it is held to the same reserved-prefix rule
     /// here — the one gate every alias passes to become resolvable.
     ///
-    /// `catalog_kind` is the caller's: a pass-through CTE passes its source's
-    /// kind, a compiled derived table / CTE segment passes `None` (see
-    /// [`CachedRelation`]).
+    /// The descriptor is the caller's: a pass-through CTE passes its source's, a
+    /// compiled derived table / CTE segment passes `None` (see [`CachedRelation`]).
     pub(crate) fn cache_alias(&mut self, name: &str, resolved: Resolved) -> Result<(), GnitzSqlError> {
         crate::validate::validate_user_name(name)?;
-        let (table_id, schema, catalog_kind) = resolved;
-        self.cache_relation(name, table_id, schema, catalog_kind);
+        let (table_id, schema, desc) = resolved;
+        self.cache_relation(name, table_id, schema, desc);
         Ok(())
     }
 }
@@ -260,7 +266,7 @@ pub(crate) fn apply_positional_aliases(
 /// that compiled to a chain-minted segment inherits that segment's `None`, so the
 /// alias never claims a catalog id it does not have.
 pub(crate) fn cte_passthrough(
-    reads: &mut dyn ReadTarget,
+    cat: &CatalogSnapshot,
     cte_select: &Select,
     column_aliases: &[TableAliasColumnDef],
     binder: &mut Binder<'_>,
@@ -270,7 +276,7 @@ pub(crate) fn cte_passthrough(
         return Ok(None);
     }
     let cte_table_name = extract_table_factor_name(&cte_select.from[0].relation, "CTE")?;
-    let (cte_tid, cte_schema, cte_kind) = binder.resolve(reads, &cte_table_name)?;
+    let (cte_tid, cte_schema, cte_kind) = binder.resolve(cat, &cte_table_name)?;
     // Positional identity projection: `*`, or one identifier per source column in
     // order. The qualified form (`SELECT t.a, t.b FROM t`) parses as `CompoundIdentifier`
     // and is the same positional pass-through; a dup-named source fails the per-position
@@ -311,43 +317,61 @@ mod tests {
         ColumnDef::new(name, tc, false)
     }
 
-    /// The index-bound gate: a cached alias reports back the provenance it was
+    /// The index-bound gate: a cached alias reports back the descriptor it was
     /// cached with, keyed case-insensitively, and an unseen name resolves to
-    /// nothing. A chain-minted id has no catalog rows yet, so treating it as
-    /// catalog-issued would fail the index probe that bounds a scan.
+    /// nothing. A chain-minted id has no catalog rows yet, so carrying a
+    /// descriptor for one would bound a scan against an index the segment has not
+    /// got.
     #[test]
     fn catalog_provenance_tracks_the_cache_alias_kind() {
         let schema = Arc::new(Schema {
             columns: vec![col("a", TypeCode::U64)],
             pk_cols: vec![0],
         });
-        let kind = |b: &Binder<'_>, n: &str| b.cache.get(&n.to_ascii_lowercase()).map(|e| e.catalog_kind);
+        let desc = |tid, class| {
+            Arc::new(RelDescriptor {
+                tid,
+                class,
+                replicated: false,
+                delta: false,
+                schema: Arc::new(Schema {
+                    columns: vec![col("a", TypeCode::U64)],
+                    pk_cols: vec![0],
+                }),
+                indexes: Arc::new(Vec::new()),
+            })
+        };
+        let class = |b: &Binder<'_>, n: &str| {
+            b.cache
+                .get(&n.to_ascii_lowercase())
+                .map(|e| e.desc.as_ref().map(|d| d.class))
+        };
         let mut b = Binder::new("public");
         b.cache_alias("minted", (1, Arc::clone(&schema), None)).unwrap();
-        b.cache_alias("real", (16, Arc::clone(&schema), Some(RelClass::Table)))
+        b.cache_alias("real", (16, Arc::clone(&schema), Some(desc(16, RelClass::Table))))
             .unwrap();
-        b.cache_alias("aview", (17, Arc::clone(&schema), Some(RelClass::View)))
+        b.cache_alias("aview", (17, Arc::clone(&schema), Some(desc(17, RelClass::View))))
             .unwrap();
 
         assert_eq!(
-            kind(&b, "minted"),
+            class(&b, "minted"),
             Some(None),
             "a chain-minted id is not catalog-issued"
         );
-        assert_eq!(kind(&b, "real"), Some(Some(RelClass::Table)));
-        assert_eq!(kind(&b, "aview"), Some(Some(RelClass::View)));
-        assert_eq!(kind(&b, "unseen"), None);
+        assert_eq!(class(&b, "real"), Some(Some(RelClass::Table)));
+        assert_eq!(class(&b, "aview"), Some(Some(RelClass::View)));
+        assert_eq!(class(&b, "unseen"), None);
         // Provenance keys on the same lowercased string as the resolution.
-        assert_eq!(kind(&b, "REAL"), Some(Some(RelClass::Table)));
-        assert_eq!(kind(&b, "MINTED"), Some(None));
+        assert_eq!(class(&b, "REAL"), Some(Some(RelClass::Table)));
+        assert_eq!(class(&b, "MINTED"), Some(None));
 
         // Shadowing: a minted alias overwriting a catalog resolution must drop
-        // the provenance with it — `FROM (SELECT * FROM t) t` re-caches `t` as a
-        // chain-minted segment, and a stale `Some(_)` here would probe the
-        // catalog for a segment whose rows are not published yet.
+        // the descriptor with it — `FROM (SELECT * FROM t) t` re-caches `t` as a
+        // chain-minted segment, and a stale `Some(_)` here would bound a scan
+        // against the shadowed relation's indexes.
         b.cache_alias("real", (2, Arc::clone(&schema), None)).unwrap();
         assert_eq!(
-            kind(&b, "real"),
+            class(&b, "real"),
             Some(None),
             "an alias shadowing a catalog resolution must shed its provenance"
         );

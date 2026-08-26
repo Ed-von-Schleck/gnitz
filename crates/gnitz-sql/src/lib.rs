@@ -18,7 +18,12 @@ mod test_support;
 mod types;
 mod validate;
 
+pub use dml::{plan_read, ReadKind, ReadPlan};
 pub use error::GnitzSqlError;
+pub use hir::plan_view;
+// The planning entry points take a `sqlparser::ast::Statement`, so a caller must
+// be able to build one with the same pinned parser the planner matches on.
+pub use sqlparser;
 
 use gnitz_core::{ReadTarget, Schema, ZSetBatch};
 use sqlparser::dialect::GenericDialect;
@@ -104,9 +109,10 @@ impl<'a> SqlPlanner<'a> {
         let txn_was_active = self.reads.client_mut().txn_active();
         let mut results = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
-            // The scope lives on the connection whatever the target is:
-            // `resolve_relation` fills it by name and `table_indexes` reads it
-            // back by id, so a delegated read costs one RESOLVE rather than two.
+            // The snapshot lives on the connection whatever the target is: the
+            // planner's resolve loop fills it by name and the index / replication
+            // probes read it back by id, so a delegated read costs one RESOLVE
+            // rather than two.
             self.reads.client_mut().begin_statement();
             let r = dispatch::execute_statement(self.reads, &self.schema_name, stmt);
             self.reads.client_mut().end_statement();

@@ -27,3 +27,4 @@ pub(crate) use explain::execute_explain;
 pub(crate) use insert::execute_insert;
 pub(crate) use mutate::{execute_delete, execute_update};
 pub(crate) use select::execute_select;
+pub use select::{plan_read, ReadKind, ReadPlan};

@@ -14,13 +14,12 @@ use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical;
 use crate::ir::{BExpr, BoundExpr};
 use crate::validate::{reject_duplicate_column_names, reject_float_key};
-use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, NodeId, TypeCode};
+use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, TypeCode};
 use std::collections::HashSet;
 use std::rc::Rc;
 
 /// Lower a `SetOp` body to circuit pieces + output `ColId` layout.
 pub(crate) fn lower_setop(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     setop: &RelExpr,
@@ -57,7 +56,6 @@ pub(crate) fn lower_setop(
     ];
     let (l_node, l_slots, r_node, r_slots) = lower_sides(
         &mut cb,
-        client,
         chain,
         memo,
         [left, right],
@@ -96,7 +94,6 @@ pub(crate) fn lower_setop(
 /// Lower a `SELECT DISTINCT` body (`Distinct(Project(...))`) — dedup over the
 /// projected content via the synthetic hash key.
 pub(crate) fn lower_distinct(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     input: &Rc<RelExpr>,
@@ -109,7 +106,7 @@ pub(crate) fn lower_distinct(
     }
     let side_ids: Vec<ColId> = side_cols.iter().map(|c| c.id).collect();
     let mut cb = CircuitBuilder::new(view_id, 0);
-    let (seg, kind) = resolve_set_input(client, chain, memo, input, &side_ids)?;
+    let (seg, kind) = resolve_set_input(chain, memo, input, &side_ids)?;
     let (node, slots) = emit_side(&mut cb, &seg, &kind, &side_ids)?;
     let sharded = hash_shard_side(&mut cb, node, &slots, &[], 0);
     let distinct_node = cb.distinct(sharded);
@@ -144,19 +141,18 @@ fn hashed_out<'a>(
 /// correctly seen as distinct and never wrapped redundantly.
 fn lower_sides(
     cb: &mut CircuitBuilder,
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     sides: [&Rc<RelExpr>; 2],
     side_ids: &[Vec<ColId>; 2],
     exempt: bool,
 ) -> Result<(NodeId, Vec<usize>, NodeId, Vec<usize>), GnitzSqlError> {
-    let (l_seg, l_kind) = resolve_set_input(client, chain, memo, sides[0], &side_ids[0])?;
-    let (r_seg, r_kind) = resolve_set_input(client, chain, memo, sides[1], &side_ids[1])?;
+    let (l_seg, l_kind) = resolve_set_input(chain, memo, sides[0], &side_ids[0])?;
+    let (r_seg, r_kind) = resolve_set_input(chain, memo, sides[1], &side_ids[1])?;
     // The collision rule may re-point a side at a pass-through wrapper segment; the
     // wrapper's layout still carries the source ids, so the addressing kind holds.
     let mut inputs = [l_seg, r_seg];
-    resolve_collisions(client, chain, &mut inputs, &sides, exempt)?;
+    resolve_collisions(chain, &mut inputs, &sides, exempt)?;
     let [l_seg, r_seg] = inputs;
     let (l_node, l_slots) = emit_side(cb, &l_seg, &l_kind, &side_ids[0])?;
     let (r_node, r_slots) = emit_side(cb, &r_seg, &r_kind, &side_ids[1])?;
@@ -184,7 +180,6 @@ enum SetSideKind<'a> {
 /// Resolve one set-op side to its delta source plus the addressing kind, making
 /// the pass-through-vs-segment decision once.
 fn resolve_set_input<'a>(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     side: &'a Rc<RelExpr>,
@@ -197,7 +192,7 @@ fn resolve_set_input<'a>(
         return Ok((seg, SetSideKind::PassThrough { items, where_preds }));
     }
     let live: HashSet<ColId> = side_ids.iter().copied().collect();
-    Ok((cut_segment(client, chain, memo, side, &live)?, SetSideKind::Segment))
+    Ok((cut_segment(chain, memo, side, &live)?, SetSideKind::Segment))
 }
 
 /// A pure pass-through side (`Project(Filter?(Get))` whose every item is a bare

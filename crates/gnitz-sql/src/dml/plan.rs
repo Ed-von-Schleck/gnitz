@@ -11,10 +11,9 @@ use crate::ast_util::expr_usize_literal;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
-use gnitz_core::{ClientError, IndexMeta, PkTuple, ReadTarget, Schema, ZSetBatch};
+use gnitz_core::{IndexMeta, PkTuple, ReadTarget, Schema, ZSetBatch};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 use sqlparser::ast::LimitClause;
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // The access-path ladder
@@ -34,17 +33,46 @@ pub(crate) enum ReadBudget {
     MayChunk,
 }
 
-/// A WHERE turned into an access path: the pushed-down [`ReadBound`] (an access
-/// superset) and the compiled server-side predicate re-imposing whatever the
-/// bound does not apply. Together they are the whole WHERE, so the reply rows a
-/// [`fetch_bound`] read returns are final.
+/// The pushed-down [`ReadBound`] (an access superset) and the compiled
+/// server-side predicate re-imposing whatever the bound does not apply. Together
+/// they are the whole WHERE, so the reply rows a [`fetch_bound`] read returns are
+/// final.
 ///
-/// Opaque: [`fetch_bound`] is the only way to run it, and
-/// [`AccessPlan::buffered_scope`] the only way to complete it over rows the
-/// server never saw. `SELECT` needs the former alone.
-pub(crate) struct AccessPlan<'e> {
+/// Fully owned, so a finished read plan carries it across the seam between
+/// planning and dispatch.
+pub(crate) struct Access {
     bound: ReadBound,
     predicate: Vec<u8>,
+}
+
+impl Access {
+    /// The walk this access pushes down.
+    pub(crate) fn bound(&self) -> &ReadBound {
+        &self.bound
+    }
+
+    /// Whether a compiled predicate ships with the bound. False means the bound
+    /// is exact: the walk alone is the whole WHERE.
+    pub(crate) fn has_predicate(&self) -> bool {
+        !self.predicate.is_empty()
+    }
+
+    /// The `ReadSpec` blob this access ships under `sink`, walking `bound` rather
+    /// than [`Self::bound`], so a chunked `PkSet` gather can send a sub-range per
+    /// request under the same predicate and sink. The one encode site.
+    pub(crate) fn encode(&self, bound: &ReadBound, sink: &ReadSink) -> Vec<u8> {
+        ReadSpec::encode_parts(bound, &self.predicate, sink)
+    }
+}
+
+/// A WHERE turned into an access path: the owned [`Access`] plus the borrowed
+/// conjuncts a DML verb needs to complete it over rows the server never saw.
+///
+/// [`fetch_bound`] is the only way to run an access, and
+/// [`AccessPlan::buffered_scope`] the only way to complete it over the
+/// transaction's own buffer. A read takes the `Access` and drops the rest.
+pub(crate) struct AccessPlan<'e> {
+    pub(super) access: Access,
     /// The WHERE this plan serves, `None` when there was none.
     where_expr: Option<&'e BoundExpr>,
     /// The bound conjuncts the walk does not apply exactly.
@@ -52,18 +80,21 @@ pub(crate) struct AccessPlan<'e> {
 }
 
 impl<'e> AccessPlan<'e> {
-    /// The plan for `bound`, its predicate compiled from `residual`. The one
-    /// constructor that pairs them, so a plan cannot carry a predicate that is not
-    /// its own residual's — the invariant every rung of the ladder below relies on.
-    fn new(
+    /// The plan for `bound`, its predicate compiled from `residual`. The only
+    /// constructor, and the only producer of an [`Access`], so a plan cannot carry
+    /// a predicate that is not its own residual's. Every rung of the ladder below
+    /// relies on that.
+    pub(super) fn new(
         bound: ReadBound,
         where_expr: Option<&'e BoundExpr>,
         residual: Vec<&'e BoundExpr>,
         schema: &Schema,
     ) -> Result<Self, GnitzSqlError> {
         Ok(AccessPlan {
-            predicate: compile_wire_conjuncts(&residual, &schema.columns)?,
-            bound,
+            access: Access {
+                predicate: compile_wire_conjuncts(&residual, &schema.columns)?,
+                bound,
+            },
             where_expr,
             residual,
         })
@@ -86,7 +117,7 @@ impl<'e> AccessPlan<'e> {
     /// `PkTuple`.
     pub(crate) fn buffered_scope(&self, schema: &Schema) -> (Option<Vec<PkTuple>>, &[&'e BoundExpr]) {
         let stride = schema.pk_stride() as u8;
-        let keys = match &self.bound {
+        let keys = match &self.access.bound {
             ReadBound::PkSet(keys) => Some(keys.iter().map(|&k| PkTuple::from_u128(stride, k)).collect()),
             ReadBound::PkRange(desc) => pk_point_tuple(desc, schema).map(|k| vec![k]),
             _ => None,
@@ -96,53 +127,9 @@ impl<'e> AccessPlan<'e> {
             None => (None, self.where_expr.as_slice()),
         }
     }
-
-    /// A plan that gathers exactly `keys`. There is no WHERE behind it, so no
-    /// predicate ships and nothing stays residual — the gather *is* the whole
-    /// selection. INSERT's ON CONFLICT paths need the committed rows for a key
-    /// set they already hold, which is this bound with the recognizer ladder
-    /// skipped rather than re-derived from a synthetic `pk IN (…)`.
-    ///
-    /// A literal rather than [`AccessPlan::new`]: with no residual there is
-    /// nothing to compile, so demanding a `schema` here would be for nothing.
-    pub(super) fn for_pk_set(keys: Vec<u128>) -> Self {
-        AccessPlan {
-            bound: ReadBound::PkSet(keys),
-            predicate: Vec::new(),
-            where_expr: None,
-            residual: Vec::new(),
-        }
-    }
-
-    /// The walk this plan pushes down. Read-only: running still needs the private
-    /// compiled predicate, so [`fetch_bound`] stays the only way to execute a plan.
-    pub(super) fn bound(&self) -> &ReadBound {
-        &self.bound
-    }
-
-    /// Whether a compiled predicate ships with the bound. False means the bound
-    /// is exact — the walk alone is the whole WHERE.
-    pub(super) fn has_predicate(&self) -> bool {
-        !self.predicate.is_empty()
-    }
 }
 
-/// Plan `where_expr` against `tid`'s indexes under `budget`. The one wrapper over
-/// [`bound_and_predicate`] that owns the index-probe closure, so every read verb
-/// states only the budget it needs — the single axis they disagree on.
-///
-/// The caller owns the bound WHERE, because the plan borrows its conjuncts.
-pub(crate) fn plan_where<'e>(
-    reads: &mut dyn ReadTarget,
-    tid: u64,
-    schema: &Schema,
-    where_expr: Option<&'e BoundExpr>,
-    budget: ReadBudget,
-) -> Result<AccessPlan<'e>, GnitzSqlError> {
-    bound_and_predicate(schema, where_expr, budget, || reads.table_indexes(tid))
-}
-
-/// Bind a single-table `WHERE` (or its absence) for [`plan_where`].
+/// Bind a single-table `WHERE` (or its absence) for [`bound_and_predicate`].
 pub(crate) fn bind_where(
     schema: &Schema,
     where_expr: Option<&sqlparser::ast::Expr>,
@@ -163,18 +150,17 @@ pub(crate) fn bind_where(
 /// UNIQUE index, which admits at most one row. A WHERE the expression VM cannot
 /// compile is an `Unsupported`, propagated.
 ///
-/// `fetch_indexes` is the index-list probe, injected so the ladder stays
-/// client-free; it is called at most once per statement (`best_index_bound`
-/// memoizes across its two collectors, and the ladder reaches it once).
-fn bound_and_predicate<'e, F>(
+/// `indexes` is the relation's declared secondary-index list, which the caller
+/// already holds: the pure path reads it off the statement's resolved descriptor,
+/// the write verbs off the one `resolve_base_table` returned.
+///
+/// The caller owns the bound WHERE, because the plan borrows its conjuncts.
+pub(crate) fn bound_and_predicate<'e>(
     schema: &Schema,
     where_expr: Option<&'e BoundExpr>,
     budget: ReadBudget,
-    mut fetch_indexes: F,
-) -> Result<AccessPlan<'e>, GnitzSqlError>
-where
-    F: FnMut() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
-{
+    indexes: &[IndexMeta],
+) -> Result<AccessPlan<'e>, GnitzSqlError> {
     let Some(bound_where) = where_expr else {
         return AccessPlan::new(ReadBound::None, None, Vec::new(), schema);
     };
@@ -206,8 +192,7 @@ where
             // a U128 column) that the PK walk consumes byte-exactly. Keep the PK
             // walk instead of failing the query; an uncompilable residual still
             // raises below.
-            if let Some(c) = best_index_bound(bound_where, schema, &mut fetch_indexes)?.filter(|c| c.is_unique_point())
-            {
+            if let Some(c) = best_index_bound(bound_where, schema, indexes).filter(|c| c.is_unique_point()) {
                 if let Some(p) = if_supported(index_plan(c, bound_where, schema))? {
                     return Ok(p);
                 }
@@ -217,7 +202,7 @@ where
     }
 
     // The best secondary-index bound, keeping its residual.
-    if let Some(c) = best_index_bound(bound_where, schema, &mut fetch_indexes)? {
+    if let Some(c) = best_index_bound(bound_where, schema, indexes) {
         return index_plan(c, bound_where, schema);
     }
 
@@ -285,13 +270,13 @@ fn index_plan<'e>(
 pub(crate) fn fetch_bound(
     reads: &mut dyn ReadTarget,
     table_id: u64,
-    plan: &AccessPlan<'_>,
+    access: &Access,
     sink: &ReadSink,
     reply_schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let mut out: Option<ZSetBatch> = None;
     let mut send = |reads: &mut dyn ReadTarget, bound: &ReadBound| -> Result<(), GnitzSqlError> {
-        let blob = ReadSpec::encode_parts(bound, &plan.predicate, sink);
+        let blob = access.encode(bound, sink);
         if let Some(batch) = reads.scan_spec(table_id, &blob, reply_schema)? {
             match out.as_mut() {
                 Some(acc) => acc.extend_from_owned(batch),
@@ -300,7 +285,7 @@ pub(crate) fn fetch_bound(
         }
         Ok(())
     };
-    match &plan.bound {
+    match &access.bound {
         ReadBound::PkSet(keys) if keys.len() > gnitz_wire::MAX_PK_SET_KEYS => {
             for chunk in keys.chunks(gnitz_wire::MAX_PK_SET_KEYS) {
                 send(reads, &ReadBound::PkSet(chunk.to_vec()))?;
@@ -363,21 +348,14 @@ mod tests {
         }
     }
 
-    /// The plan for `where_expr` against `lists` (the table's indexes), with the
-    /// index-probe count — a probe is wire traffic, so "zero" is contract.
+    /// The plan for `where_expr` against `lists` (the table's indexes).
     fn plan_of<'e>(
         where_expr: Option<&'e BoundExpr>,
         schema: &Schema,
         lists: &[(&[u32], bool)],
         budget: ReadBudget,
-    ) -> (AccessPlan<'e>, u32) {
-        let calls = std::cell::Cell::new(0);
-        let plan = bound_and_predicate(schema, where_expr, budget, || {
-            calls.set(calls.get() + 1);
-            Ok(idx_metas_flagged(lists))
-        })
-        .expect("the WHERE must plan");
-        (plan, calls.get())
+    ) -> AccessPlan<'e> {
+        bound_and_predicate(schema, where_expr, budget, &idx_metas_flagged(lists)).expect("the WHERE must plan")
     }
 
     /// The bound's discriminant name, for a shape assertion that does not care
@@ -393,46 +371,42 @@ mod tests {
     }
 
     /// Every WHERE shape, one ladder: which bound it takes, how much of it stays
-    /// residual, how many keys the bound pins, and how many index probes it cost
-    /// (a probe is wire traffic, so "zero" is contract). The schema is `(id U64
-    /// pk, v I64)` with an index on `v`, so every rung is reachable from one
-    /// table.
+    /// residual, and how many keys the bound pins. The schema is `(id U64 pk, v
+    /// I64)` with an index on `v`, so every rung is reachable from one table.
     #[test]
     fn the_ladder_maps_each_where_shape_to_its_bound() {
         let schema = pk_schema(TypeCode::U64);
         let idx: &[(&[u32], bool)] = &[(&[1], false)];
-        for (sql, want_shape, want_residual, want_keys, want_calls) in [
-            // No WHERE: nothing to walk, nothing to re-impose, no probe.
-            (None, "None", 0, 0, 0),
+        for (sql, want_shape, want_residual, want_keys) in [
+            // No WHERE: nothing to walk, nothing to re-impose.
+            (None, "None", 0, 0),
             // A `pk IN (…)` gather, and the point a one-key list folds to at bind.
-            (Some("id IN (7, 9)"), "PkSet", 0, 2, 0),
-            (Some("id IN (7)"), "PkRange", 0, 1, 0),
-            (Some("id = 7"), "PkRange", 0, 1, 0),
+            (Some("id IN (7, 9)"), "PkSet", 0, 2),
+            (Some("id IN (7)"), "PkRange", 0, 1),
+            (Some("id = 7"), "PkRange", 0, 1),
             // `NOT IN` binds to `Not(…)`, which no PK recognizer matches.
-            (Some("id NOT IN (7, 9)"), "None", 1, 0, 0),
+            (Some("id NOT IN (7, 9)"), "None", 1, 0),
             // A companion conjunct rides the residual of a key-pinning bound: the
             // key restriction supplies the consumed PK conjunct, the residual the rest.
-            (Some("id IN (7, 9) AND v > 5"), "PkSet", 1, 2, 0),
-            (Some("id = 7 AND v > 5"), "PkRange", 1, 1, 0),
+            (Some("id IN (7, 9) AND v > 5"), "PkSet", 1, 2),
+            (Some("id = 7 AND v > 5"), "PkRange", 1, 1),
             // No PK conjunct: the index rung, then the unbounded scan. An
-            // arithmetic WHERE has no `col OP literal` conjunct at all, so it
-            // reaches the scan without probing.
-            (Some("v = 7"), "IndexRange", 1, 0, 1),
-            (Some("id + v = 7"), "None", 1, 0, 0),
+            // arithmetic WHERE has no `col OP literal` conjunct at all.
+            (Some("v = 7"), "IndexRange", 1, 0),
+            (Some("id + v = 7"), "None", 1, 0),
         ] {
             let bound_where = sql.map(|s| bind_where(s, &schema));
-            let (plan, calls) = plan_of(bound_where.as_ref(), &schema, idx, ReadBudget::OneRequest);
+            let plan = plan_of(bound_where.as_ref(), &schema, idx, ReadBudget::OneRequest);
             let label = sql.unwrap_or("<no WHERE>");
-            assert_eq!(shape(&plan.bound), want_shape, "{label}");
+            assert_eq!(shape(&plan.access.bound), want_shape, "{label}");
             assert_eq!(plan.residual.len(), want_residual, "{label}: residual");
             assert_eq!(
                 plan.buffered_scope(&schema).0.map_or(0, |k| k.len()),
                 want_keys,
                 "{label}: pinned keys"
             );
-            assert_eq!(calls, want_calls, "{label}: index probes");
             assert_eq!(
-                plan.predicate.is_empty(),
+                plan.access.predicate.is_empty(),
                 want_residual == 0,
                 "{label}: the residual is what ships as a predicate"
             );
@@ -451,13 +425,20 @@ mod tests {
             inner: Box::new(BoundExpr::ColRef(0)),
             items: (0..n as i64).map(BoundExpr::LitInt).collect(),
         };
-        let (declined, _) = plan_of(Some(&where_expr), &schema, &[], ReadBudget::OneRequest);
-        assert_eq!(shape(&declined.bound), "None", "{n} keys past the one-request cap");
+        let declined = plan_of(Some(&where_expr), &schema, &[], ReadBudget::OneRequest);
+        assert_eq!(
+            shape(&declined.access.bound),
+            "None",
+            "{n} keys past the one-request cap"
+        );
         assert!(declined.buffered_scope(&schema).0.is_none());
-        assert!(!declined.predicate.is_empty(), "the list ships as a predicate instead");
+        assert!(
+            !declined.access.predicate.is_empty(),
+            "the list ships as a predicate instead"
+        );
 
-        let (gathered, _) = plan_of(Some(&where_expr), &schema, &[], ReadBudget::MayChunk);
-        assert_eq!(shape(&gathered.bound), "PkSet");
+        let gathered = plan_of(Some(&where_expr), &schema, &[], ReadBudget::MayChunk);
+        assert_eq!(shape(&gathered.access.bound), "PkSet");
         assert_eq!(gathered.buffered_scope(&schema).0.map_or(0, |k| k.len()), n);
     }
 
@@ -491,8 +472,8 @@ mod tests {
             ("id = 7 AND v = 42", uniq, "PkRange", "a PK point is never given up"),
         ] {
             let where_expr = bind_where(sql, &schema);
-            let (plan, _) = plan_of(Some(&where_expr), &schema, idx, ReadBudget::OneRequest);
-            assert_eq!(shape(&plan.bound), want, "{sql}: {why}");
+            let plan = plan_of(Some(&where_expr), &schema, idx, ReadBudget::OneRequest);
+            assert_eq!(shape(&plan.access.bound), want, "{sql}: {why}");
         }
 
         // A pinned *leading* PK column can share the distribution prefix and
@@ -516,8 +497,8 @@ mod tests {
             ("tenant = 7 AND email = 42", "a bare prefix lowers to a pinned point"),
         ] {
             let where_expr = bind_where(sql, &compound);
-            let (plan, _) = plan_of(Some(&where_expr), &compound, email_uniq, ReadBudget::OneRequest);
-            assert_eq!(shape(&plan.bound), "PkRange", "{sql}: {why}");
+            let plan = plan_of(Some(&where_expr), &compound, email_uniq, ReadBudget::OneRequest);
+            assert_eq!(shape(&plan.access.bound), "PkRange", "{sql}: {why}");
         }
     }
 
@@ -547,9 +528,9 @@ mod tests {
             (&wide, "val = 7", true, 0),
         ] {
             let where_expr = bind_where(sql, schema);
-            let (plan, _) = plan_of(Some(&where_expr), schema, idx, ReadBudget::OneRequest);
-            let ReadBound::IndexRange { exact, .. } = plan.bound else {
-                panic!("{sql}: expected an index bound, got {}", shape(&plan.bound));
+            let plan = plan_of(Some(&where_expr), schema, idx, ReadBudget::OneRequest);
+            let ReadBound::IndexRange { exact, .. } = plan.access.bound else {
+                panic!("{sql}: expected an index bound, got {}", shape(&plan.access.bound));
             };
             assert_eq!(exact, want_exact, "{sql}: exactness");
             assert_eq!(plan.residual.len(), want_residual, "{sql}: residual");
@@ -562,13 +543,12 @@ mod tests {
     fn an_unpinned_pk_range_yields_to_a_full_unique_point() {
         let schema = two_col(TypeCode::U64);
         let where_expr = bind_where("pk > 0 AND val = 42", &schema);
-        let (plan, calls) = plan_of(Some(&where_expr), &schema, &[(&[1], true)], ReadBudget::OneRequest);
-        assert_eq!(shape(&plan.bound), "IndexRange");
+        let plan = plan_of(Some(&where_expr), &schema, &[(&[1], true)], ReadBudget::OneRequest);
+        assert_eq!(shape(&plan.access.bound), "IndexRange");
         assert!(
             plan.buffered_scope(&schema).0.is_none(),
             "an index bound never pins a PK key"
         );
-        assert_eq!(calls, 1, "one probe serves the arbitration");
     }
 
     #[test]

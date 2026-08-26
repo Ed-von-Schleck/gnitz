@@ -44,20 +44,11 @@ pub(super) const SEQ_ID_TOPOLOGY: i64 = 5;
 pub const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
 
-/// A conservative tripwire on durable relation-id allocation, not a live limit —
-/// reaching it needs 2^31 durable CREATEs. Durable relations live in
-/// `[FIRST_USER_TABLE_ID, 1<<31)`; `allocate_table_id` and `precheck_family` (the
-/// point an id enters `dag.tables`) reject any id at or above this ceiling.
-///
-/// It sits well below the true `u32` physical ceiling a relation id narrows to at
-/// every boundary — the SAL group header carries it as a u32 (`sal_begin_group`),
-/// `Table` stores `table_id: u32`, `Table::new`/`ShardIndex::new` take
-/// a u32, `Batch::encode_to_wire` stamps a u32, and shard **file names on disk**
-/// embed it (`shard_{tid}_{lsn}.db`). The `i64` used for `dag.tables` keys and
-/// `target_id` parameters is a convenience width over that u32. `1<<31` is a safe
-/// tripwire far short of any narrowing: an id there round-trips every one of them
-/// exactly.
-pub(super) const RELATION_ID_CEILING: i64 = 1 << 31;
+/// The durable relation-id tripwire in this crate's `i64` id width; the value and
+/// its rationale live on [`gnitz_wire::RELATION_ID_CEILING`].
+/// `allocate_table_id` and `precheck_family` (the point an id enters `dag.tables`)
+/// reject any id at or above it.
+pub(super) const RELATION_ID_CEILING: i64 = gnitz_wire::RELATION_ID_CEILING as i64;
 
 pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
 

@@ -11,6 +11,7 @@
 
 use gnitz_core::GnitzClient;
 use gnitz_test_harness::ServerHandle;
+use std::sync::Arc;
 
 mod common;
 use common::*;
@@ -44,17 +45,14 @@ fn resolve_reports_found_absent_and_missing_schema() {
     assert_eq!(schema.columns.len(), 2);
     assert_eq!(schema.pk_cols, vec![0]);
 
-    // Relation absent under a live schema: `Ok(None)` from the kind probe, and
-    // the "Table or view" wording from the schema-bearing one.
-    assert!(client.resolve_relation_kind(&sn, "nope").unwrap().is_none());
+    // Relation absent under a live schema: `Ok(None)` from the optional probe,
+    // and the "Table or view" wording from the erroring one.
+    assert!(client.resolve(&sn, "nope").unwrap().is_none());
     let err = client.resolve_relation(&sn, "nope").unwrap_err().to_string();
     assert!(err.contains("Table or view") && err.contains("not found"), "got: {err}");
 
     // Schema absent is an error on every entry point, with the schema's wording.
-    let err = client
-        .resolve_relation_kind("no_such_schema", "t")
-        .unwrap_err()
-        .to_string();
+    let err = client.resolve("no_such_schema", "t").unwrap_err().to_string();
     assert!(err.contains("Schema 'no_such_schema' not found"), "got: {err}");
 }
 
@@ -71,13 +69,13 @@ fn a_view_resolves_as_a_view_and_fails_the_base_table_probe() {
     );
     exec(&mut client, &sn, "CREATE VIEW v AS SELECT id, v FROM t");
 
-    let (_, rel) = client.resolve_relation(&sn, "v").unwrap();
+    let rel = client.resolve_relation(&sn, "v").unwrap();
     assert_eq!(
         rel.class,
         gnitz_core::RelClass::View,
         "a plain CREATE VIEW resolves as an unbounded view"
     );
-    assert_eq!(client.resolve_relation_kind(&sn, "v").unwrap(), Some(rel));
+    assert_eq!(client.resolve(&sn, "v").unwrap().map(|d| d.tid), Some(rel.tid));
 
     let err = client.resolve_table_id(&sn, "v").unwrap_err().to_string();
     assert!(err.contains("Table") && err.contains("not found"), "got: {err}");
@@ -112,7 +110,7 @@ fn a_long_relation_name_round_trips() {
 
     // A near-miss differing only past byte 16 must NOT resolve to it.
     let sibling = "a_relation_name_far_longer_than_sixteen_bytes_two";
-    assert!(client.resolve_relation_kind(&sn, sibling).unwrap().is_none());
+    assert!(client.resolve(&sn, sibling).unwrap().is_none());
 }
 
 // ── The descriptor's contents ────────────────────────────────────────────
@@ -217,10 +215,10 @@ fn the_index_list_is_exact_across_create_and_drop() {
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
     );
     let (tid, _) = client.resolve_table_id(&sn, "t").unwrap();
-    assert!(client.table_indexes(tid).unwrap().is_empty(), "no index yet");
+    assert!(client.describe_by_id(tid).unwrap().indexes.is_empty(), "no index yet");
 
     exec(&mut client, &sn, "CREATE INDEX ix_ab ON t(a, b)");
-    let list = client.table_indexes(tid).unwrap();
+    let list = Arc::clone(&client.describe_by_id(tid).unwrap().indexes);
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].cols.as_slice(), &[1, 2], "the full declared column list");
     assert!(!list[0].is_unique);
@@ -232,7 +230,7 @@ fn the_index_list_is_exact_across_create_and_drop() {
     );
 
     exec(&mut client, &sn, "DROP INDEX ix_ab");
-    let list = client.table_indexes(tid).unwrap();
+    let list = Arc::clone(&client.describe_by_id(tid).unwrap().indexes);
     assert_eq!(list.len(), 1, "the dropped index is gone from the next resolve");
     assert_eq!(list[0].cols.as_slice(), &[1]);
 }
@@ -259,18 +257,19 @@ fn only_a_base_table_reports_its_replication() {
 
     let (r_tid, _) = client.resolve_table_id(&sn, "r").unwrap();
     let (plain_tid, _) = client.resolve_table_id(&sn, "plain").unwrap();
-    let rv_tid = client.resolve_relation(&sn, "rv").unwrap().1.tid;
+    let rv_tid = client.resolve_relation(&sn, "rv").unwrap().tid;
+    let replicated = |c: &mut GnitzClient, tid: u64| c.describe_by_id(tid).unwrap().replicated;
 
-    assert!(client.table_replicated(r_tid).unwrap(), "a REPLICATED base table");
-    assert!(!client.table_replicated(plain_tid).unwrap(), "a plain base table");
+    assert!(replicated(&mut client, r_tid), "a REPLICATED base table");
+    assert!(!replicated(&mut client, plain_tid), "a plain base table");
     assert!(
-        !client.table_replicated(rv_tid).unwrap(),
+        !replicated(&mut client, rv_tid),
         "a view's locality is the compiler's call, not this hint's"
     );
     // A system family is stamped Replicated too, and is likewise not a base
     // table.
     assert!(
-        !client.table_replicated(gnitz_core::TABLE_TAB).unwrap(),
+        !replicated(&mut client, gnitz_core::TABLE_TAB),
         "a system family is not a base table"
     );
 }
@@ -286,14 +285,14 @@ fn an_unregistered_id_is_a_clean_miss() {
     let (mut client, _sn) = make_planner(&srv);
 
     for tid in [
-        1_000_000_u64, // never allocated
-        1 << 31,       // at RELATION_ID_CEILING
-        1 << 55,       // above the COL_TAB packing limit
-        u64::MAX,      // negative once cast to i64
+        1_000_000_u64,                   // never allocated
+        gnitz_wire::RELATION_ID_CEILING, // at the durable relation-id ceiling
+        1 << 55,                         // above the COL_TAB packing limit
+        u64::MAX,                        // negative once cast to i64
         u64::MAX - 1,
     ] {
         let err = client
-            .table_indexes(tid)
+            .describe_by_id(tid)
             .expect_err("an unregistered id must not resolve")
             .to_string();
         assert!(err.contains("not found"), "tid {tid}: got {err}");
@@ -321,8 +320,8 @@ fn a_tid_probe_outside_a_statement_still_answers_the_truth() {
 
     // No statement bracket is open here, so both probes go to the wire by id.
     let (tid, _) = client.resolve_table_id(&sn, "t").unwrap();
-    assert!(client.table_replicated(tid).unwrap());
-    let list = client.table_indexes(tid).unwrap();
+    assert!(client.describe_by_id(tid).unwrap().replicated);
+    let list = Arc::clone(&client.describe_by_id(tid).unwrap().indexes);
     assert_eq!(list.len(), 1);
     assert!(list[0].is_unique);
     assert_eq!(
@@ -558,15 +557,22 @@ fn a_second_client_sees_index_ddl_immediately() {
     );
     exec(&mut a, &sn, "INSERT INTO t (id, x) VALUES (1, 5), (2, 5), (3, 6)");
     let (tid, _) = b.resolve_table_id(&sn, "t").unwrap();
-    assert!(b.table_indexes(tid).unwrap().is_empty());
+    assert!(b.describe_by_id(tid).unwrap().indexes.is_empty());
     assert_eq!(read_sql(&mut b, &sn, "SELECT id FROM t WHERE x = 5").1.len(), 2);
 
     exec(&mut a, &sn, "CREATE INDEX ix ON t(x)");
-    assert_eq!(b.table_indexes(tid).unwrap().len(), 1, "B sees the new index at once");
+    assert_eq!(
+        b.describe_by_id(tid).unwrap().indexes.len(),
+        1,
+        "B sees the new index at once"
+    );
     assert_eq!(read_sql(&mut b, &sn, "SELECT id FROM t WHERE x = 5").1.len(), 2);
 
     exec(&mut a, &sn, "DROP INDEX ix");
-    assert!(b.table_indexes(tid).unwrap().is_empty(), "B sees the drop at once");
+    assert!(
+        b.describe_by_id(tid).unwrap().indexes.is_empty(),
+        "B sees the drop at once"
+    );
     assert_eq!(
         read_sql(&mut b, &sn, "SELECT id FROM t WHERE x = 5").1.len(),
         2,
@@ -622,7 +628,7 @@ fn own_ddl_is_visible_to_the_next_statement() {
     let (tid, _) = client.resolve_table_id(&sn, "t").unwrap();
 
     exec(&mut client, &sn, "CREATE INDEX ix ON t(x)");
-    assert_eq!(client.table_indexes(tid).unwrap().len(), 1);
+    assert_eq!(client.describe_by_id(tid).unwrap().indexes.len(), 1);
     assert_eq!(read_sql(&mut client, &sn, "SELECT id FROM t WHERE x = 5").1.len(), 1);
 
     exec(&mut client, &sn, "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY)");
@@ -644,7 +650,7 @@ fn a_recreated_schema_resolves_its_new_members() {
     client.drop_schema(&sn).unwrap();
     client.create_schema(&sn).unwrap();
     assert!(
-        client.resolve_relation_kind(&sn, "t").unwrap().is_none(),
+        client.resolve(&sn, "t").unwrap().is_none(),
         "the old member must not resurrect under the recreated schema"
     );
 

@@ -1,64 +1,63 @@
 //! `EXPLAIN <select>`: the access decisions the ad-hoc read path makes, rendered
-//! as rows. It runs the same planning `dml::select` runs, in the same order —
-//! `route_select`, then the WHERE, then the sink's shape builder — and diverges
-//! only at the tail: `execute_select` dispatches, this formats. The order matters
-//! as much as the steps: it decides which rejection a query unsupported on two
-//! axes reports. So a query the planner rejects returns that query's own
-//! rejection.
+//! as rows. It formats the same [`ReadPlan`], from the same `plan_read`, that
+//! `dml::select` would dispatch, so a query the planner rejects returns that
+//! query's own rejection and every line describes what the SELECT would run.
 //!
-//! Metadata lookups only: planning reaches the wire where it always does
-//! (`binder.resolve` and the `plan_where` index probe) and never scans.
+//! It reaches nothing: describing a query is as server-free as compiling one.
 
 use crate::access::pk_point_tuple;
-use crate::bind::Binder;
-use crate::dml::plan::{bind_where, plan_where, AccessPlan, ReadBudget};
-use crate::dml::select::{build_fold_shape, build_rows_shape, route_select, Route, Sink, Target};
+use crate::dml::plan::Access;
+use crate::dml::select::{ReadCase, ReadPlan, SinkTail, SpecRead, Target};
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::FoldShape;
 use crate::SqlResult;
-use gnitz_core::{BatchAppender, ColumnDef, ReadTarget, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::{AggFunc, ReadBound};
-use sqlparser::ast::Query;
 
-/// Describe the plan for `query` without running it.
-pub(crate) fn execute_explain(
-    reads: &mut dyn ReadTarget,
-    query: &Query,
-    binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
-    let route = route_select(reads, query, binder)?;
-    let (target, select) = (&route.target, route.select);
+/// Describe `plan` without running it.
+pub(crate) fn execute_explain(plan: ReadPlan) -> Result<SqlResult, GnitzSqlError> {
+    let target = &plan.target;
     let schema = &*target.schema;
 
-    // The same WHERE → plan the tails build. A route with no WHERE short-circuits
-    // inside `bound_and_predicate` without an index probe, so this stays free.
-    let bound_where = bind_where(schema, select.selection.as_ref())?;
-    let plan = plan_where(reads, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
+    // The bare-`*` scan ships no `ReadSpec`, so it reads through a different
+    // request kind than any other full scan. It projects nothing and orders by
+    // nothing, so the reply is the source's own visible width.
+    let ReadCase::Spec(spec) = &plan.case else {
+        return Ok(plan_rows(&[
+            read_line(target),
+            "access: full scan (unprojected)".to_string(),
+            "predicate: none".to_string(),
+            projection_line(schema.visible_columns().count(), 0),
+            "order/limit: none".to_string(),
+        ]));
+    };
 
     // Line 4 is the sink's own shape: what the fold accumulates, or how wide the
     // projected reply is.
-    let shape_line = match route.sink {
-        Sink::Fold => fold_line(&build_fold_shape(select, schema)?, schema, select.distinct.is_some()),
-        // The bare-`*` scan projects nothing and orders by nothing, so the reply is
-        // the source's own visible width — no shape to build.
-        Sink::PlainScan => projection_line(schema.visible_columns().count(), 0),
-        Sink::Rows => {
-            let reply = build_rows_shape(select, query, schema)?.reply_schema;
+    let shape_line = match &spec.tail {
+        SinkTail::Rows { reply_schema } => {
             // The hidden columns `resolve_read_spec_order` appended to order by a
             // non-projected source column. The prepended source PK is hidden too,
             // but is a PK column rather than a payload one.
-            let extra = (0..reply.columns.len()).filter(|&i| reply.is_hidden_payload(i)).count();
-            projection_line(reply.visible_columns().count(), extra)
+            let extra = (0..reply_schema.columns.len())
+                .filter(|&i| reply_schema.is_hidden_payload(i))
+                .count();
+            projection_line(reply_schema.visible_columns().count(), extra)
         }
+        SinkTail::Fold { shape, is_distinct } => fold_line(shape, schema, *is_distinct),
     };
 
-    let facts = order_limit_facts(&route, query.order_by.is_some());
+    let facts = order_limit_facts(spec);
     Ok(plan_rows(&[
         read_line(target),
-        format!("access: {}", access(&plan, schema, &route.sink)),
+        format!("access: {}", access_line(&spec.access, schema)),
         format!(
             "predicate: {}",
-            if plan.has_predicate() { "server-side" } else { "none" }
+            if spec.access.has_predicate() {
+                "server-side"
+            } else {
+                "none"
+            }
         ),
         shape_line,
         if facts.is_empty() {
@@ -71,16 +70,17 @@ pub(crate) fn execute_explain(
 
 /// Where the ORDER BY / LIMIT / OFFSET work happens. Only the rows sink pushes
 /// anything down; all fold finishing is client-side.
-fn order_limit_facts(route: &Route<'_>, has_order: bool) -> Vec<String> {
+fn order_limit_facts(spec: &SpecRead) -> Vec<String> {
     // Both tails short-circuit `LIMIT 0` to an empty result before dispatching.
-    if route.limit == Some(0) {
+    if spec.limit == Some(0) {
         return vec!["no request (LIMIT 0)".to_string()];
     }
+    let has_order = !spec.order.is_empty();
     let mut facts = Vec::new();
     // The per-worker cut is OFFSET+LIMIT deep, because the client windows. With no
     // ORDER BY keys the same wire field just stops the worker early.
-    if let (Sink::Rows, Some(l)) = (&route.sink, route.limit) {
-        let limit_k = l.saturating_add(route.offset);
+    if let (SinkTail::Rows { .. }, Some(l)) = (&spec.tail, spec.limit) {
+        let limit_k = l.saturating_add(spec.offset);
         facts.push(if has_order {
             format!("server top-{limit_k}")
         } else {
@@ -92,7 +92,7 @@ fn order_limit_facts(route: &Route<'_>, has_order: bool) -> Vec<String> {
     if has_order {
         facts.push("client sort".to_string());
     }
-    if route.offset > 0 || route.limit.is_some() {
+    if spec.offset > 0 || spec.limit.is_some() {
         facts.push("client window".to_string());
     }
     facts
@@ -107,7 +107,7 @@ fn order_limit_facts(route: &Route<'_>, has_order: bool) -> Vec<String> {
 /// before serving. EXPLAIN cannot know staleness at plan time, so it names the
 /// condition, not a verdict.
 fn read_line(target: &Target) -> String {
-    match target.kind {
+    match target.desc.as_ref().map(|d| d.class) {
         Some(c) if c.is_view() => format!("read view {} (drains pending ticks when stale)", target.name),
         Some(c) => format!("read {} {}", c.noun(), target.name),
         None => format!("read {}", target.name),
@@ -117,14 +117,9 @@ fn read_line(target: &Target) -> String {
 /// The walk the bound names. A `PkRange` is a point lookup exactly when it pins
 /// every PK column — the same [`pk_point_tuple`] test `AccessPlan::buffered_scope`
 /// uses to decide a bound names a key rather than a key group.
-fn access(plan: &AccessPlan<'_>, schema: &Schema, sink: &Sink) -> String {
-    match plan.bound() {
-        // The unprojected scan is the one route that ships no `ReadSpec`, so it
-        // reads through a different request kind than any other full scan.
-        ReadBound::None => match sink {
-            Sink::PlainScan => "full scan (unprojected)".to_string(),
-            _ => "full scan".to_string(),
-        },
+fn access_line(access: &Access, schema: &Schema) -> String {
+    match access.bound() {
+        ReadBound::None => "full scan".to_string(),
         ReadBound::PkRange(desc) => match pk_point_tuple(desc, schema) {
             Some(_) => "pk point lookup".to_string(),
             None => "pk range walk".to_string(),

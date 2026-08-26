@@ -19,7 +19,7 @@ use crate::expr_lower::compile_filter_program;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::ir::BExpr;
 use crate::validate::reject_duplicate_column_names;
-use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, ReduceOutKey};
+use gnitz_core::{CircuitBuilder, ColumnDef, ReduceOutKey};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -28,7 +28,6 @@ use std::sync::Arc;
 /// the finalize projection; `having_preds` is the HAVING filter over the raw
 /// reduce output.
 pub(crate) fn lower_reduce(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     items: &[ProjEntry],
@@ -52,7 +51,7 @@ pub(crate) fn lower_reduce(
         Some(seg) => {
             // Base/segment Get: apply the WHERE + scan bound inline.
             let folded = physical::fold_preds(inner_where, &seg.layout)?;
-            let bound = extract_scan_bound(client, &folded, seg.from_catalog, seg.tid, &seg.schema)?;
+            let bound = extract_scan_bound(&folded, &seg);
             (seg, bound, folded)
         }
         None => {
@@ -61,7 +60,7 @@ pub(crate) fn lower_reduce(
             let mut live: HashSet<ColId> = HashSet::new();
             live.extend(group_cols.iter().copied());
             live.extend(aggs.iter().filter_map(|a| a.arg));
-            (cut_segment(client, chain, memo, input, &live)?, None, None)
+            (cut_segment(chain, memo, input, &live)?, None, None)
         }
     };
     let (source_tid, source_schema) = (source.tid, Arc::clone(&source.schema));
@@ -82,10 +81,9 @@ pub(crate) fn lower_reduce(
     }
     ensure_cardinality_count(&source_schema.columns, &mut specs)?;
 
-    // Reduce strategy (two-phase global / replicated / sharded). Gated on
-    // catalog provenance: a chain-minted segment has no catalog rows yet, and a
-    // segment is never replicated anyway.
-    let source_replicated = source.from_catalog && client.table_replicated(source_tid)?;
+    // Reduce strategy (two-phase global / replicated / sharded). A chain-minted
+    // segment carries no descriptor, and is never replicated anyway.
+    let source_replicated = source.desc.as_ref().is_some_and(|d| d.replicated);
     let shape = ReduceShape::new(&source_schema, &group_positions, &specs, source_replicated);
     let out_key = shape.out_key;
     let (reduce_schema, agg_col_offset) = reduce_output_schema(&shape);

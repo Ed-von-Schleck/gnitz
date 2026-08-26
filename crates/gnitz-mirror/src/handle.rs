@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gnitz_core::{DeltaCursor, GnitzClient, RelKind, Schema};
+use gnitz_core::{DeltaCursor, GnitzClient, RelDescriptor, Schema};
 use gnitz_engine::catalog::CatalogEngine;
 use gnitz_engine::foundation::env::env_num;
 use gnitz_engine::foundation::fault::Seam;
@@ -26,11 +26,11 @@ static CHECKPOINT_ERROR: Seam = Seam::new("GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR"
 pub(crate) struct MirroredView {
     pub(crate) schema_name: String,
     pub(crate) name: String,
-    pub(crate) kind: RelKind,
-    /// The client-side schema, as the resolve returned it — hidden columns
-    /// included, which is what keeps `pk_stride` right for a view whose physical
+    /// The upstream descriptor registration resolved, handed back verbatim to
+    /// every `describe_relation`. Its schema is the client-side one, hidden
+    /// columns included, which keeps `pk_stride` right for a view whose physical
     /// PK is a synthetic hidden column.
-    pub(crate) schema: Arc<Schema>,
+    pub(crate) desc: Arc<RelDescriptor>,
     /// The client-side shape a poll's *request* carries. `Arc` like `schema`
     /// above: a poll hands it to the client by clone, and a deep one would
     /// allocate per column on every poll, including the empty ones.

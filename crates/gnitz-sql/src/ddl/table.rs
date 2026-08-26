@@ -180,9 +180,10 @@ fn resolve_fk_target(
     // The one relation-name catalog probe outside the Binder funnels: hold the
     // FK target to the same reserved-prefix rule they enforce.
     validate_user_name(&ref_table)?;
-    let (ref_schema, ref_rel) = client
+    let ref_rel = client
         .resolve_relation(schema_name, &ref_table)
         .map_err(|e| GnitzSqlError::Bind(format!("FK target '{ref_table}': {e}")))?;
+    let ref_schema = &ref_rel.schema;
     // The PK/UNIQUE tests below read only the schema, and both a view's and a
     // stream's PK look exactly like a base table's without being the unique, stored
     // key the parent probe reads.
@@ -668,7 +669,8 @@ pub(crate) fn create_index_core(
     // derived data has no defined semantics) with a precise error, and yields the
     // schema used to resolve the indexed columns. The client write below takes the
     // already-resolved (table_id, col_indices), so the name is resolved once.
-    let (table_id, schema) = binder.resolve_base_table(client, table_name)?;
+    let target = binder.resolve_base_table(client, table_name)?;
+    let (table_id, schema) = (target.tid, &target.schema);
 
     let (col_names, col_indices) = resolve_index_columns(columns, &schema.columns, ctx)?;
 

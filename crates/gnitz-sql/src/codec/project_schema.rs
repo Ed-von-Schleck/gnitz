@@ -142,7 +142,7 @@ pub(crate) fn place_pk_front(
 }
 
 /// Build the projected `(items, out_cols)` for the **ad-hoc read path**
-/// (`plan_read_spec`): the full source PK is **always hidden-prepended** to slots
+/// (the rows sink): the full source PK is **always hidden-prepended** to slots
 /// `0..k`, and every SELECT item — a projected PK column included — is a payload
 /// slot in SELECT order (materialized by a `COPY_COL` / computed `EMIT`). Unlike
 /// the CREATE VIEW linear path's [`place_pk_front`] (which *promotes* a projected

@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use gnitz_core::protocol::decode_wal_block;
-use gnitz_core::{ClientError, GnitzClient, IndexMeta, ReadTarget, RelKind, Schema, ZSetBatch};
+use gnitz_core::{ClientError, GnitzClient, ReadTarget, RelDescriptor, Schema, ZSetBatch};
 use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine::storage::Batch;
 
@@ -37,40 +37,43 @@ impl ReadTarget for Mirror {
         &mut self.client
     }
 
-    /// A mirrored name resolves out of its registration, and **that is what
-    /// keeps a mirrored SELECT round-trip-free at all**: the client's own
-    /// resolve caches into a statement scope that is dropped whole, so it is one
-    /// RESOLVE per relation per statement by design. Delegating it would put a
-    /// round trip back into every mirrored SELECT.
+    /// A mirrored name resolves out of its registration, which is what keeps a
+    /// mirrored SELECT round-trip-free: the client's own resolve caches into a
+    /// statement scope that is dropped whole, so it is one RESOLVE per relation
+    /// per statement. Delegating would put that round trip back into every
+    /// mirrored SELECT.
     ///
-    /// What that trades is the staleness of the name → id binding, and it is the
+    /// The trade is the staleness of the name → id binding, which is the
     /// staleness the mirror already has: a mirrored read answers as of the last
-    /// poll, and the binding falls under that rather than being an exception to
-    /// it. The detector is the feed — the next poll's tag stops continuing — and
+    /// poll. The detector is the feed (the next poll's tag stops continuing) and
     /// the recovery re-resolves before it reseeds. Answered off the registration
-    /// rather than [`Mirror::readable`], so that a name whose copy is not valid
-    /// still binds locally and only the read it feeds goes upstream.
-    fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(Arc<Schema>, RelKind), ClientError> {
+    /// rather than [`Mirror::readable`], so a name whose copy is not valid still
+    /// binds locally and only the read it feeds goes upstream.
+    ///
+    /// The descriptor is the one registration resolved upstream, returned as it
+    /// arrived rather than rebuilt field by field.
+    fn describe_relation(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
         // The local catalog's own name index answers this: the mirror registered
         // the relation through it, under the same lower-cased spelling and the
-        // same `"schema.name"` key the server's catalog uses. A mirrored view
-        // owns no secondary index either, so `RelKind` is complete here.
+        // same `"schema.name"` key the server's catalog uses.
         let qname = gnitz_core::qualified_name(schema_name, name);
         if let Some(view) = self
             .engine
             .entity_id_by_qname(&qname)
             .and_then(|tid| self.views.get(&(tid as u64)))
         {
-            return Ok((Arc::clone(&view.schema), view.kind));
+            let desc = Arc::clone(&view.desc);
+            self.client.record_relation(schema_name, name, Some(Arc::clone(&desc)));
+            return Ok(Some(desc));
         }
-        self.client.resolve_relation(schema_name, name)
+        ReadTarget::describe_relation(&mut self.client, schema_name, name)
     }
 
     fn scan(&mut self, table_id: u64) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), ClientError> {
         let Some(view) = self.readable(table_id) else {
             return ReadTarget::scan(&mut self.client, table_id);
         };
-        let view_schema = Arc::clone(&view.schema);
+        let view_schema = Arc::clone(&view.desc.schema);
         self.check_poison()?;
         let (batch, desc) = self
             .engine
@@ -108,17 +111,6 @@ impl ReadTarget for Mirror {
             return Ok(None);
         }
         Ok(Some(reply_batch(&keeper, &reply_desc, table_id, reply_schema)?))
-    }
-
-    /// A mirrored view owns no secondary index — not a simplification but a
-    /// fact: only a base table may own one, so the empty list is exact. That is
-    /// also what keeps a descriptor-cache miss from turning the planner's index
-    /// probe into a round trip of its own.
-    fn table_indexes(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
-        if self.mirrors(table_id) {
-            return Ok(Arc::new(Vec::new()));
-        }
-        self.client.table_indexes(table_id)
     }
 }
 

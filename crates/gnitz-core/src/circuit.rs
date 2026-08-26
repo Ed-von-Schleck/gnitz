@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+
 use gnitz_expr::ExprProgram;
+
+use crate::error::ClientError;
 
 pub use gnitz_wire::{
     agg_output_type, AggFunc, JoinKind, MapKind, NodeColumnPayload, NodeFields, OpNode, RangeRel, ReduceOutKey,
@@ -19,6 +23,33 @@ pub struct Circuit {
 
 /// One full row of the `nodes` system table: node id + [`NodeFields`].
 pub type NodeRow = (NodeId, u64, Option<TableId>, Option<Vec<u8>>);
+
+/// The `k`-th symbolic segment id of one view bundle. Symbolic ids start at
+/// [`gnitz_wire::RELATION_ID_CEILING`], which no durable relation id reaches, so
+/// a `ScanDelta.source` naming a segment is distinguishable from one naming a
+/// base table.
+pub fn segment_id(k: u64) -> u64 {
+    gnitz_wire::RELATION_ID_CEILING + k
+}
+
+/// Whether `id` is a symbolic segment id rather than a real relation id.
+pub fn is_segment_id(id: u64) -> bool {
+    id >= gnitz_wire::RELATION_ID_CEILING
+}
+
+/// Rewrite one id slot through `map`, rejecting a segment id that survives it: a
+/// slot whose id was minted but never registered. Both substitution sites use
+/// this — [`Circuit::resolve_seg_ids`] for the circuit's own slots,
+/// `create_view_chain` for a hidden segment's owner.
+pub fn substitute_seg_id(slot: u64, map: &HashMap<u64, u64>) -> Result<u64, ClientError> {
+    let real = map.get(&slot).copied().unwrap_or(slot);
+    if is_segment_id(real) {
+        return Err(ClientError::ServerError(format!(
+            "view bundle carries unresolved segment id {slot}"
+        )));
+    }
+    Ok(real)
+}
 
 /// Three-table row bundle materialised from a `Circuit` for a single catalog
 /// write. Each `Vec` is one logical row in the corresponding system table.
@@ -51,6 +82,21 @@ impl Circuit {
             }
         }
         deps
+    }
+
+    /// Rewrite `view_id` and every `ScanDelta.source` through `map`. Nothing
+    /// downstream catches a segment id that survives: the engine's id-ceiling
+    /// rejection covers only TABLE_TAB and VIEW_TAB PKs, so a phantom source
+    /// would commit as a durable dependency edge on a relation that does not
+    /// exist.
+    pub fn resolve_seg_ids(&mut self, map: &HashMap<u64, u64>) -> Result<(), ClientError> {
+        self.view_id = substitute_seg_id(self.view_id, map)?;
+        for op in self.nodes.values_mut() {
+            if let OpNode::ScanDelta { source, .. } = op {
+                *source = substitute_seg_id(*source, map)?;
+            }
+        }
+        Ok(())
     }
 
     /// Materialise the circuit into the three-table row bundle. Pure
@@ -468,6 +514,76 @@ mod tests {
             code: Vec::new(),
             const_strings: Vec::new(),
         }
+    }
+
+    /// A two-segment chain lowered with symbolic ids substitutes to the circuit
+    /// inline real-id allocation would have produced (same nodes, same `view_id`,
+    /// same `ScanDelta.source`), and leaves the base-table id alone.
+    #[test]
+    fn resolve_seg_ids_reproduces_inline_allocation() {
+        // `base → seg → final`, built once with symbolic ids and once with the
+        // real ones the substitution assigns.
+        let (base, seg_real, final_real) = (100u64, 4096u64, 4097u64);
+        let (seg_a, seg_b) = (segment_id(0), segment_id(1));
+        let chain = |seg: u64, fin: u64| {
+            let mut cb = CircuitBuilder::new(fin, seg);
+            let up = cb.input_delta_tagged(base);
+            let inp = cb.input_delta();
+            cb.sink(up);
+            cb.sink(inp);
+            cb.build()
+        };
+
+        let mut symbolic = chain(seg_a, seg_b);
+        let map = HashMap::from([(seg_a, seg_real), (seg_b, final_real)]);
+        symbolic.resolve_seg_ids(&map).expect("every tag is in the map");
+
+        let inline = chain(seg_real, final_real);
+        assert_eq!(symbolic.view_id, inline.view_id);
+        assert_eq!(
+            format!("{:?}", symbolic.into_rows()),
+            format!("{:?}", inline.into_rows()),
+            "substitution must produce the inline-allocated rows"
+        );
+    }
+
+    /// An identity pass over an empty map leaves a real relation id untouched:
+    /// the shape a bundle of caller-preset ids takes.
+    #[test]
+    fn resolve_seg_ids_leaves_real_ids_alone() {
+        let mut cb = CircuitBuilder::new(17, 100);
+        let inp = cb.input_delta();
+        cb.sink(inp);
+        let mut circuit = cb.build();
+        circuit.resolve_seg_ids(&HashMap::new()).expect("no tag to resolve");
+        assert_eq!(circuit.view_id, 17);
+        assert_eq!(circuit.dependencies(), vec![100]);
+    }
+
+    /// A tag that survives the substitution is rejected, in `view_id` and in a
+    /// `ScanDelta.source` alike, whether the map is empty or merely missing that
+    /// one entry.
+    #[test]
+    fn resolve_seg_ids_rejects_a_surviving_tag() {
+        // A tagged `view_id` with nothing to resolve it.
+        let mut cb = CircuitBuilder::new(segment_id(0), 100);
+        let inp = cb.input_delta();
+        cb.sink(inp);
+        let mut circuit = cb.build();
+        assert!(circuit.resolve_seg_ids(&HashMap::new()).is_err(), "tagged view_id");
+
+        // A tagged source absent from a non-empty map: the lowering path that
+        // mints a segment id and forgets to register it.
+        let mut cb = CircuitBuilder::new(segment_id(0), 100);
+        let up = cb.input_delta_tagged(segment_id(7));
+        cb.sink(up);
+        let mut circuit = cb.build();
+        let map = HashMap::from([(segment_id(0), 17u64)]);
+        let err = circuit.resolve_seg_ids(&map).expect_err("tagged source");
+        assert!(
+            format!("{err}").contains(&format!("{}", segment_id(7))),
+            "the error names the unresolved id: {err}"
+        );
     }
 
     /// A compound (2-column) reindex descriptor must survive into_rows → from_rows

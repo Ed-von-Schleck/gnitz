@@ -15,12 +15,10 @@
 //! clones (or compiles) only the winner's residual.
 
 use crate::codec::pk_codec::{pack_pk_value, parse_literal_i128, parse_pk_literal_packed, parse_uuid_str};
-use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, BoundExpr, UnaryOp};
-use gnitz_core::{ClientError, Cut, FixedInt, IndexMeta, PkColList, PkTuple, RangeDescriptor, Schema, TypeCode};
+use gnitz_core::{Cut, FixedInt, IndexMeta, PkColList, PkTuple, RangeDescriptor, Schema, TypeCode};
 use std::cmp::Reverse;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // The bound-literal seam
@@ -484,21 +482,19 @@ impl IndexSeekCandidate<'_> {
 }
 
 /// Every index-servable seek candidate among the conjuncts of `expr`, best first.
-/// `fetch_indexes` is called only when at least one eligible equality exists.
 fn collect_index_seek_candidates<'e>(
     expr: &'e BoundExpr,
     schema: &Schema,
-    fetch_indexes: impl FnOnce() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
-) -> Result<Vec<IndexSeekCandidate<'e>>, ClientError> {
+    indexes: &[IndexMeta],
+) -> Vec<IndexSeekCandidate<'e>> {
     let mut conjuncts = Vec::new();
     flatten_bound_conjuncts(expr, &mut conjuncts);
 
     let eqs = collect_eq_conjuncts(&conjuncts, schema, |col| index_eligible_col(schema, col));
     if eqs.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
-    let indexes = fetch_indexes()?;
     let mut out: Vec<IndexSeekCandidate<'e>> = Vec::new();
     for meta in indexes.iter() {
         let idx_cols = meta.cols.as_slice();
@@ -526,7 +522,7 @@ fn collect_index_seek_candidates<'e>(
             .then_with(|| b.vals.len().cmp(&a.vals.len()))
             .then_with(|| a.cols.as_slice().len().cmp(&b.cols.as_slice().len()))
     });
-    Ok(out)
+    out
 }
 
 /// One index-servable range candidate: the index's FULL declared column list, the
@@ -564,22 +560,21 @@ impl IndexRangeCandidate<'_> {
 fn collect_index_range_candidates<'e>(
     expr: &'e BoundExpr,
     schema: &Schema,
-    fetch_indexes: impl FnOnce() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
-) -> Result<Vec<IndexRangeCandidate<'e>>, ClientError> {
+    indexes: &[IndexMeta],
+) -> Vec<IndexRangeCandidate<'e>> {
     let mut conjuncts = Vec::new();
     flatten_bound_conjuncts(expr, &mut conjuncts);
 
     // A range candidate needs at least one range end; a pure-equality WHERE is
-    // handled by collect_index_seek_candidates, so this costs no wire traffic
-    // then. Tested before `eqs` is built, which parses a literal per conjunct
-    // and would be discarded on the most common index-servable shape.
+    // handled by collect_index_seek_candidates. Tested before `eqs` is built,
+    // which parses a literal per conjunct and would be discarded on the most
+    // common index-servable shape.
     let ends = collect_range_ends(&conjuncts, schema);
     if ends.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let eqs = collect_eq_conjuncts(&conjuncts, schema, |col| index_eligible_col(schema, col));
 
-    let indexes = fetch_indexes()?;
     let mut out: Vec<IndexRangeCandidate<'e>> = Vec::new();
     for meta in indexes.iter() {
         let idx_cols = meta.cols.as_slice();
@@ -617,56 +612,25 @@ fn collect_index_range_candidates<'e>(
             .cmp(&a.desc.eq_vals().len())
             .then_with(|| a.idx_cols.as_slice().len().cmp(&b.idx_cols.as_slice().len()))
     });
-    Ok(out)
-}
-
-/// Memoizes one `table_indexes` list across the range → equality collector
-/// fall-through, so one bound extraction fetches at most once regardless of how
-/// the caller's `fetch` is backed. It does not assume `table_indexes` hits the
-/// wire — inside a statement bracket that call is already served from the
-/// statement's resolved descriptor — the point is that this function's own
-/// "called at most once" contract holds locally, without depending on a caching
-/// detail of a lower layer.
-#[derive(Default)]
-struct IndexListMemo(Option<Arc<Vec<IndexMeta>>>);
-
-impl IndexListMemo {
-    fn get(
-        &mut self,
-        fetch: impl FnOnce() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
-    ) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
-        match &self.0 {
-            Some(list) => Ok(Arc::clone(list)),
-            None => {
-                let list = fetch()?;
-                self.0 = Some(Arc::clone(&list));
-                Ok(list)
-            }
-        }
-    }
+    out
 }
 
 /// The best index range/equality bound for `where_expr` as a full
 /// [`IndexRangeCandidate`] — descriptor plus the chosen candidate's residual (the
-/// WHERE conjuncts the bound does not apply). `fetch` (the index-list probe) is
-/// injected and called **at most once** (both collectors are lazy and share one
-/// [`IndexListMemo`]).
+/// WHERE conjuncts the bound does not apply) — over `indexes`, the relation's
+/// declared secondary-index list.
 ///
 /// Every candidate unifies as a range: a pure n-column equality lowers to a
 /// degenerate point range over its LAST column, since `RangeDescriptor` cannot
 /// express "no range column". The merged candidates are ranked by [`pinned_score`]
 /// — most-constrained first — and the head taken outright.
-pub(crate) fn best_index_bound<'e, F>(
+pub(crate) fn best_index_bound<'e>(
     where_expr: &'e BoundExpr,
     schema: &Schema,
-    mut fetch: F,
-) -> Result<Option<IndexRangeCandidate<'e>>, GnitzSqlError>
-where
-    F: FnMut() -> Result<Arc<Vec<IndexMeta>>, ClientError>,
-{
-    let mut memo = IndexListMemo::default();
-    let ranges = collect_index_range_candidates(where_expr, schema, || memo.get(&mut fetch))?;
-    let seeks = collect_index_seek_candidates(where_expr, schema, || memo.get(&mut fetch))?;
+    indexes: &[IndexMeta],
+) -> Option<IndexRangeCandidate<'e>> {
+    let ranges = collect_index_range_candidates(where_expr, schema, indexes);
+    let seeks = collect_index_seek_candidates(where_expr, schema, indexes);
 
     let cands = ranges.into_iter().chain(seeks.into_iter().map(|c| {
         let n = c.vals.len();
@@ -681,7 +645,7 @@ where
     // collector's candidate (listed first) wins, matching each collector's own
     // internal preference order. It also scores each candidate exactly once,
     // where a sort would re-derive the key per comparison.
-    Ok(cands.min_by_key(|c| Reverse(pinned_score(c, schema))))
+    cands.min_by_key(|c| Reverse(pinned_score(c, schema)))
 }
 
 /// How constrained a candidate leaves the index walk, as a totally ordered key:
@@ -828,7 +792,7 @@ mod tests {
             &schema,
         )
         .expect_err("double-quoted token must not bind as a literal");
-        assert!(matches!(err, GnitzSqlError::Bind(_)), "got {err:?}");
+        assert!(matches!(err, crate::GnitzSqlError::Bind(_)), "got {err:?}");
     }
 
     // ------------------------------------------------------------------
@@ -908,14 +872,10 @@ mod tests {
     #[test]
     fn collect_index_seek_candidates_skips_float_col() {
         // `WHERE val = 1` on a float column emits no candidate: a float column is
-        // never index-key-eligible, so fetch_indexes must not even be called.
+        // never index-key-eligible, so no index can serve it.
         let schema = two_col(TypeCode::F64);
         let expr = bind_where("val = 1", &schema);
-        let cands = collect_index_seek_candidates(&expr, &schema, || {
-            panic!("no eligible equality — the index list must not be fetched")
-        })
-        .unwrap();
-        assert!(cands.is_empty());
+        assert!(collect_index_seek_candidates(&expr, &schema, &idx_metas(&[&[1]])).is_empty());
     }
 
     #[test]
@@ -932,7 +892,7 @@ mod tests {
         // (a = 1 AND b = 2) AND c = 3 — flattening the whole AND-tree finds all three.
         let expr = bind_where("a = 1 AND b = 2 AND c = 3", &schema);
         let indexes = idx_metas(&[&[1], &[2], &[3]]);
-        let cands = collect_index_seek_candidates(&expr, &schema, || Ok(indexes)).unwrap();
+        let cands = collect_index_seek_candidates(&expr, &schema, &indexes);
         let mut cols: Vec<Vec<u32>> = cands.iter().map(|c| c.cols.as_slice().to_vec()).collect();
         cols.sort();
         assert_eq!(cols, vec![vec![1], vec![2], vec![3]]);
@@ -960,7 +920,7 @@ mod tests {
     /// The columns of the head (best) seek candidate for `where_sql`.
     fn head_seek_cols(where_sql: &str, sch: &Schema, lists: &[(&[u32], bool)]) -> Vec<u32> {
         let expr = bind_where(where_sql, sch);
-        let cands = collect_index_seek_candidates(&expr, sch, || Ok(idx_metas_flagged(lists))).unwrap();
+        let cands = collect_index_seek_candidates(&expr, sch, &idx_metas_flagged(lists));
         cands
             .first()
             .expect("some index must be seekable")
@@ -1081,9 +1041,7 @@ mod tests {
     fn one_key_in_list_takes_an_index_bound() {
         let schema = two_col(TypeCode::U128);
         let expr = bind_where("val IN (7)", &schema);
-        let c = best_index_bound(&expr, &schema, || Ok(idx_metas(&[&[1]])))
-            .unwrap()
-            .expect("one-key IN must take an index bound");
+        let c = best_index_bound(&expr, &schema, &idx_metas(&[&[1]])).expect("one-key IN must take an index bound");
         assert_eq!(c.desc, RangeDescriptor::point(&[], 7));
         assert!(c.residual.is_empty(), "the bound consumes the conjunct");
     }
@@ -1257,7 +1215,7 @@ mod tests {
         use Cut::Before;
         let schema = abc_schema();
         let expr = bind_where("a = 7 AND b < 50", &schema);
-        let cands = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1, 2]]))).unwrap();
+        let cands = collect_index_range_candidates(&expr, &schema, &idx_metas(&[&[1, 2]]));
         assert_eq!(cands.len(), 1);
         let c = &cands[0];
         assert_eq!(c.desc.eq_vals(), &[7u128]);
@@ -1275,7 +1233,7 @@ mod tests {
         };
         // BETWEEN desugars at bind to `x >= 10 AND x <= 20` → two consumed range ends.
         let expr = bind_where("x BETWEEN 10 AND 20", &schema);
-        let cands = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1]]))).unwrap();
+        let cands = collect_index_range_candidates(&expr, &schema, &idx_metas(&[&[1]]));
         assert_eq!(cands.len(), 1);
         let c = &cands[0];
         assert_eq!((c.desc.start, c.desc.end), (Before(10), After(20)));
@@ -1284,7 +1242,7 @@ mod tests {
         // NOT BETWEEN binds to `Not(x >= 10 AND x <= 20)` — one leaf conjunct, no
         // range end → no candidate.
         let expr = bind_where("x NOT BETWEEN 10 AND 20", &schema);
-        let cands = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1]]))).unwrap();
+        let cands = collect_index_range_candidates(&expr, &schema, &idx_metas(&[&[1]]));
         assert!(cands.is_empty());
     }
 
@@ -1297,7 +1255,7 @@ mod tests {
         };
         for sql in ["x > 5 AND x > 10", "x > 10 AND x > 5"] {
             let expr = bind_where(sql, &schema);
-            let cands = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1]]))).unwrap();
+            let cands = collect_index_range_candidates(&expr, &schema, &idx_metas(&[&[1]]));
             assert_eq!(cands.len(), 1, "{sql}");
             let c = &cands[0];
             let first_val: u128 = if sql.starts_with("x > 5") { 5 } else { 10 };
@@ -1316,12 +1274,12 @@ mod tests {
         let (min, max) = ((i32::MIN as u32) as u128, i32::MAX as u128);
 
         let expr = bind_where("x > 3000000000", &schema);
-        let c = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1]]))).unwrap();
+        let c = collect_index_range_candidates(&expr, &schema, &idx_metas(&[&[1]]));
         assert_eq!(c.len(), 1);
         assert_eq!((c[0].desc.start, c[0].desc.end), (After(max), After(max)));
 
         let expr = bind_where("x < 3000000000", &schema);
-        let c = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[1]]))).unwrap();
+        let c = collect_index_range_candidates(&expr, &schema, &idx_metas(&[&[1]]));
         assert_eq!(c.len(), 1);
         assert_eq!((c[0].desc.start, c[0].desc.end), (Before(min), After(max)));
     }
@@ -1332,7 +1290,7 @@ mod tests {
         let schema = abc_schema();
         // `b` indexed, `a` not part of the index → `a = 7` stays residual.
         let expr = bind_where("b > 10 AND a = 7", &schema);
-        let cands = collect_index_range_candidates(&expr, &schema, || Ok(idx_metas(&[&[2]]))).unwrap();
+        let cands = collect_index_range_candidates(&expr, &schema, &idx_metas(&[&[2]]));
         assert_eq!(cands.len(), 1);
         let c = &cands[0];
         assert!(c.desc.eq_vals().is_empty());
@@ -1343,8 +1301,7 @@ mod tests {
     // ── best_index_bound: the whole-WHERE arbitration ────────────────────────────
     //
     // These pin the *chosen* bound, not just the per-shape collectors above: which
-    // candidate wins across shapes and across separate indexes, and how many index
-    // round-trips the choice costs (a probe is wire traffic, so "zero" is contract).
+    // candidate wins across shapes and across separate indexes.
 
     /// `(id U64 pk, a U64, b U64 [nullable per arg])` — indexable cols a=1, b=2.
     fn bound_schema(b_nullable: bool) -> Schema {
@@ -1365,32 +1322,25 @@ mod tests {
         where_sql: &str,
         sch: &Schema,
         lists: &[&[u32]],
-    ) -> (Option<(gnitz_wire::PkColList, gnitz_wire::RangeDescriptor)>, u32) {
-        let calls = std::cell::Cell::new(0);
+    ) -> Option<(gnitz_wire::PkColList, gnitz_wire::RangeDescriptor)> {
         let bound = bind_single_table(&parse_expr_sql(where_sql), sch).unwrap();
-        let c = best_index_bound(&bound, sch, || {
-            calls.set(calls.get() + 1);
-            Ok(idx_metas(lists))
-        })
-        .unwrap();
-        (c.map(|c| (c.idx_cols, c.desc)), calls.get())
+        best_index_bound(&bound, sch, &idx_metas(lists)).map(|c| (c.idx_cols, c.desc))
     }
 
     /// A pure equality on a 1-column index lowers to a degenerate point range.
     #[test]
     fn equality_lowers_to_a_degenerate_point_range() {
-        let (b, calls) = bound_of("a = 5", &bound_schema(false), &[&[1]]);
-        let (idx_cols, desc) = b.expect("a = 5 on an index over `a` must bound");
+        let (idx_cols, desc) =
+            bound_of("a = 5", &bound_schema(false), &[&[1]]).expect("a = 5 on an index over `a` must bound");
         assert_eq!(idx_cols.as_slice(), &[1]);
         assert_eq!(desc.eq_vals(), &[] as &[u128]);
         assert_eq!((desc.start, desc.end), (Cut::Before(5), Cut::After(5)));
-        assert_eq!(calls, 1, "one round-trip serves both collectors");
     }
 
     /// A two-column equality pins the leading column and points at the last.
     #[test]
     fn compound_equality_pins_the_leading_column() {
-        let (b, _) = bound_of("a = 5 AND b = 7", &bound_schema(false), &[&[1, 2]]);
+        let b = bound_of("a = 5 AND b = 7", &bound_schema(false), &[&[1, 2]]);
         let (idx_cols, desc) = b.expect("a compound equality must bound the compound index");
         assert_eq!(idx_cols.as_slice(), &[1, 2]);
         assert_eq!(desc.eq_vals(), &[5u128]);
@@ -1400,7 +1350,7 @@ mod tests {
     /// An equality prefix plus a range on ONE index takes the range candidate.
     #[test]
     fn equality_prefix_plus_range_takes_the_range_candidate() {
-        let (b, _) = bound_of("a = 5 AND b > 10", &bound_schema(false), &[&[1, 2]]);
+        let b = bound_of("a = 5 AND b > 10", &bound_schema(false), &[&[1, 2]]);
         let (_, desc) = b.expect("an eq-prefix + range must bound");
         assert_eq!(desc.eq_vals(), &[5u128], "`a` is the pinned prefix");
         assert_eq!(desc.start, Cut::After(10), "`b > 10` is an exclusive lower cut");
@@ -1410,7 +1360,7 @@ mod tests {
     /// Across SEPARATE indexes, most-pinned wins.
     #[test]
     fn point_on_one_index_beats_half_open_range_on_another() {
-        let (b, _) = bound_of("a = 5 AND b > 10", &bound_schema(false), &[&[1], &[2]]);
+        let b = bound_of("a = 5 AND b > 10", &bound_schema(false), &[&[1], &[2]]);
         let (idx_cols, desc) = b.expect("the point candidate must bound");
         assert_eq!(idx_cols.as_slice(), &[1], "INDEX(a)'s point beats INDEX(b)'s range");
         assert_eq!((desc.start, desc.end), (Cut::Before(5), Cut::After(5)));
@@ -1419,32 +1369,28 @@ mod tests {
     /// A PK predicate never bounds: the collectors skip PK columns unconditionally.
     #[test]
     fn pk_equality_never_bounds() {
-        assert!(bound_of("id = 5", &bound_schema(false), &[&[1]]).0.is_none());
+        assert!(bound_of("id = 5", &bound_schema(false), &[&[1]]).is_none());
     }
 
     /// An uncovered NULLABLE trailing index column must NOT bound.
     #[test]
     fn uncovered_nullable_trailing_column_never_bounds() {
-        assert!(bound_of("a = 5", &bound_schema(true), &[&[1, 2]]).0.is_none());
-        assert!(bound_of("a = 5", &bound_schema(false), &[&[1, 2]]).0.is_some());
+        assert!(bound_of("a = 5", &bound_schema(true), &[&[1, 2]]).is_none());
+        assert!(bound_of("a = 5", &bound_schema(false), &[&[1, 2]]).is_some());
     }
 
-    /// A WHERE no index covers costs ZERO round-trips on the range path and at most
-    /// one overall — the collectors are lazy by contract.
+    /// A column no index covers bounds nothing, and neither does a WHERE with no
+    /// `col OP literal` conjunct at all.
     #[test]
     fn unindexed_column_bounds_nothing() {
-        let (b, calls) = bound_of("a = 5", &bound_schema(false), &[&[2]]);
-        assert!(b.is_none());
-        assert_eq!(calls, 1, "the eq collector probes once, then finds no match");
-        let (b, calls) = bound_of("a + b > 3", &bound_schema(false), &[&[1]]);
-        assert!(b.is_none());
-        assert_eq!(calls, 0, "a non-servable WHERE must cost no wire traffic");
+        assert!(bound_of("a = 5", &bound_schema(false), &[&[2]]).is_none());
+        assert!(bound_of("a + b > 3", &bound_schema(false), &[&[1]]).is_none());
     }
 
     /// A BETWEEN is a two-sided range over one column (desugared at bind).
     #[test]
     fn between_bounds_both_sides() {
-        let (b, _) = bound_of("a BETWEEN 5 AND 9", &bound_schema(false), &[&[1]]);
+        let b = bound_of("a BETWEEN 5 AND 9", &bound_schema(false), &[&[1]]);
         let (_, desc) = b.expect("BETWEEN must bound");
         assert_eq!(desc.eq_vals(), &[] as &[u128]);
         assert_eq!((desc.start, desc.end), (Cut::Before(5), Cut::After(9)));
@@ -1470,9 +1416,7 @@ mod tests {
     /// The index the arbitration picks for `where_sql`, given per-index uniqueness.
     fn picked(where_sql: &str, sch: &Schema, lists: &[(&[u32], bool)]) -> (Vec<u32>, Cut, Cut) {
         let bound = bind_single_table(&parse_expr_sql(where_sql), sch).unwrap();
-        let c = best_index_bound(&bound, sch, || Ok(idx_metas_flagged(lists)))
-            .unwrap()
-            .expect("the WHERE must bound some index");
+        let c = best_index_bound(&bound, sch, &idx_metas_flagged(lists)).expect("the WHERE must bound some index");
         (c.idx_cols.as_slice().to_vec(), c.desc.start, c.desc.end)
     }
 
@@ -1560,8 +1504,7 @@ mod tests {
     fn a_full_unique_point_is_recognized() {
         let sch = bound_schema(false);
         let bound = bind_where("a = 42", &sch);
-        let c = best_index_bound(&bound, &sch, || Ok(idx_metas_flagged(&[(&[1], true)])))
-            .unwrap()
+        let c = best_index_bound(&bound, &sch, &idx_metas_flagged(&[(&[1], true)]))
             .expect("the WHERE must bound some index");
         assert!(c.is_unique_point());
     }

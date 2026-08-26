@@ -13,6 +13,11 @@ pub enum GnitzSqlError {
     /// SQL a user can write, which is what makes it worth its own variant — a
     /// `Plan` string prefix cannot be asserted on.
     Internal(String),
+    /// A planning pass asked for a relation the statement's catalog snapshot does
+    /// not hold. A control signal for `dispatch::plan_resolving`, which resolves
+    /// the name and re-runs the pass; it never reaches a caller of
+    /// `SqlPlanner::execute`.
+    CatalogMiss(String),
     /// An OCC precondition failed (a read table was written concurrently) and the
     /// statement could not commit lose-update-free. `table` names the conflicting
     /// table for an autocommit RMW statement; `None` for a `BEGIN`/`COMMIT`
@@ -45,6 +50,9 @@ impl fmt::Display for GnitzSqlError {
             GnitzSqlError::Exec(e) => write!(f, "exec error: {e}"),
             GnitzSqlError::Unsupported(s) => write!(f, "unsupported: {s}"),
             GnitzSqlError::Internal(s) => write!(f, "internal error: {s}"),
+            GnitzSqlError::CatalogMiss(name) => {
+                write!(f, "internal error: relation '{name}' was not resolved before planning")
+            }
             GnitzSqlError::Conflict { table: Some(t) } => {
                 write!(f, "transaction conflict on table '{t}'; retry the statement")
             }
@@ -67,6 +75,7 @@ impl std::error::Error for GnitzSqlError {
             | GnitzSqlError::Plan(_)
             | GnitzSqlError::Unsupported(_)
             | GnitzSqlError::Internal(_)
+            | GnitzSqlError::CatalogMiss(_)
             | GnitzSqlError::Conflict { .. } => None,
         }
     }

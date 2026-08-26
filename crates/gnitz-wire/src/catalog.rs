@@ -458,6 +458,16 @@ pub const fn sys_family(id: u64) -> Option<&'static WireSysFamily> {
 pub const FIRST_USER_TABLE_ID: u64 = 16;
 pub const FIRST_USER_SCHEMA_ID: u64 = 3;
 
+/// A tripwire on durable relation-id allocation, not a live limit: reaching it
+/// needs 2^31 durable CREATEs. Durable relations live in
+/// `[FIRST_USER_TABLE_ID, RELATION_ID_CEILING)`, and the engine rejects any id at
+/// or above it where one enters its relation DAG.
+///
+/// A relation id narrows to a `u32` at every physical boundary (the SAL group
+/// header, a store's `table_id`, a wire batch, a shard file name). `1<<31` sits
+/// short of that ceiling, so an id below it round-trips all of them exactly.
+pub const RELATION_ID_CEILING: u64 = 1 << 31;
+
 pub const OWNER_KIND_TABLE: u64 = 0;
 pub const OWNER_KIND_VIEW: u64 = 1;
 

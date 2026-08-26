@@ -5,10 +5,10 @@ use crate::error::ClientError;
 use crate::protocol::{
     BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, WireConflictMode, ZSetBatch,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use crate::circuit::Circuit;
+use crate::circuit::{is_segment_id, substitute_seg_id, Circuit};
 use crate::types::sys_schema;
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::{
@@ -171,6 +171,17 @@ pub fn hidden_view_name(owner_vid: u64, idx: usize) -> String {
     format!("{}{idx}", hidden_view_prefix(owner_vid))
 }
 
+/// A bundle's view name as a string, resolving a hidden segment's owner through
+/// the bundle's symbolic-id substitution. A segment id the substitution cannot
+/// resolve is an error rather than a name: `drop_view` cascades by name prefix,
+/// so a segment named after a tag would be undroppable.
+fn resolve_view_name(name: &ViewName, seg_ids: &HashMap<u64, u64>) -> Result<String, ClientError> {
+    match name {
+        ViewName::Named(n) => Ok(n.clone()),
+        ViewName::Hidden { owner, idx } => Ok(hidden_view_name(substitute_seg_id(*owner, seg_ids)?, *idx)),
+    }
+}
+
 /// The name prefix every hidden segment of `owner_vid` carries. The trailing
 /// separator keeps `__h5_` from matching `__h51_0`.
 fn hidden_view_prefix(owner_vid: u64) -> String {
@@ -265,33 +276,39 @@ impl crate::read_target::ReadTarget for GnitzClient {
     }
 }
 
-/// A relation's class resolved together with its id, so the two cannot disagree.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct RelKind {
-    pub tid: u64,
-    pub class: RelClass,
-    /// The view keeps a delta feed. A bool beside the class rather than a fourth
-    /// [`RelClass`] variant, because it is orthogonal to the class — folding it in
-    /// would square `View`/`BoundedView`.
-    pub delta: bool,
+/// What a bundle's view is called. A hidden segment's name embeds its owner's
+/// real id, which a planner minting symbolic ids does not have, so it names the
+/// owner and [`GnitzClient::create_view_chain`] mints the string once that id is
+/// assigned. Naming the owner also keeps the name off the segment's row position
+/// in the bundle.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ViewName {
+    Named(String),
+    /// [`hidden_view_name(owner, idx)`](hidden_view_name), minted once `owner`'s
+    /// real id exists.
+    Hidden {
+        owner: u64,
+        idx: usize,
+    },
 }
 
-impl RelKind {
-    fn of(d: &RelDescriptor) -> Self {
-        RelKind {
-            tid: d.tid,
-            class: d.class,
-            delta: d.delta,
+impl std::fmt::Display for ViewName {
+    /// The user-visible name, or what a hidden segment is. Never a `__h…` string
+    /// built from a symbolic owner, which would name a view no catalog holds.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewName::Named(n) => f.write_str(n),
+            ViewName::Hidden { idx, .. } => write!(f, "hidden segment {idx}"),
         }
     }
 }
 
 /// One view in a [`GnitzClient::create_view_chain`] bundle. The `circuit`'s
-/// `view_id` names the view's allocated id when non-zero — a chain pre-allocates
-/// every segment's id so a downstream circuit can `ScanDelta` an upstream hidden
-/// view; a zero id is allocated by `create_view_chain`.
+/// `view_id` is the view's own id: zero for one `create_view_chain` should
+/// allocate, a [`segment_id`](crate::segment_id) for one it should allocate *and*
+/// substitute through the whole bundle, else an id the caller already holds.
 pub struct PlannedView {
-    pub name: String,
+    pub name: ViewName,
     pub sql_text: String,
     pub circuit: Circuit,
     pub output_columns: Vec<ColumnDef>,
@@ -310,23 +327,54 @@ pub struct PlannedView {
 /// built by a resolve, dropped at `end_statement`, never carried across. That is
 /// what makes a stale name → id binding unreachable rather than merely checked —
 /// there is nothing retained to go stale, so nothing to invalidate.
-struct RelDescriptor {
-    tid: u64,
-    class: RelClass,
-    replicated: bool,
+#[derive(Debug)]
+pub struct RelDescriptor {
+    pub tid: u64,
+    pub class: RelClass,
+    pub replicated: bool,
     /// The view keeps a delta feed, so `ReadBound::Delta` against it is answerable.
-    delta: bool,
-    schema: Arc<Schema>,
-    indexes: Arc<Vec<IndexMeta>>,
+    pub delta: bool,
+    pub schema: Arc<Schema>,
+    pub indexes: Arc<Vec<IndexMeta>>,
 }
 
 /// What one statement has already read, dropped whole at `end_statement`.
 ///
 /// One entry per resolved canonical `"schema.name"`, absent verdicts included,
 /// so a two-probe error ladder costs one round trip rather than two.
+/// [`Self::get`] and [`Self::insert`] build the key through [`qualified_name`]
+/// themselves, so a case-varying reference cannot split into two entries.
+///
+/// `BTreeMap` rather than `HashMap` because `BTreeMap::new()` is `const`, which
+/// [`EMPTY_CATALOG`] needs to be a `static`.
 #[derive(Default)]
-struct StatementScope {
-    relations: HashMap<String, Option<Arc<RelDescriptor>>>,
+pub struct CatalogSnapshot {
+    relations: BTreeMap<String, Option<Arc<RelDescriptor>>>,
+}
+
+/// What a planning pass sees outside a statement bracket: nothing, because every
+/// read issued between statements hits the wire.
+static EMPTY_CATALOG: CatalogSnapshot = CatalogSnapshot {
+    relations: BTreeMap::new(),
+};
+
+impl CatalogSnapshot {
+    /// This statement's verdict for `schema_name.name`: `None` if the statement
+    /// has not resolved that name at all, `Some(None)` for a recorded absence.
+    pub fn get(&self, schema_name: &str, name: &str) -> Option<Option<Arc<RelDescriptor>>> {
+        self.relations.get(&qualified_name(schema_name, name)).cloned()
+    }
+
+    /// Record a verdict, replacing any entry already under the same key.
+    pub fn insert(&mut self, schema_name: &str, name: &str, desc: Option<Arc<RelDescriptor>>) {
+        self.relations.insert(qualified_name(schema_name, name), desc);
+    }
+
+    /// The descriptor this statement resolved for `tid`. A linear scan with no
+    /// wire fallback; a statement resolves a handful of relations.
+    pub fn by_tid(&self, tid: u64) -> Option<Arc<RelDescriptor>> {
+        self.relations.values().flatten().find(|d| d.tid == tid).map(Arc::clone)
+    }
 }
 
 pub struct GnitzClient {
@@ -334,7 +382,7 @@ pub struct GnitzClient {
     serial_cache: HashMap<u64, SerialRange>,
     /// What the current statement has resolved and scanned; `None` outside a
     /// statement, so a read issued between statements always hits the wire.
-    scope: Option<StatementScope>,
+    scope: Option<CatalogSnapshot>,
     /// Open transaction, if any. `Some` between `txn_begin` and its
     /// `txn_commit`/`txn_rollback`: **every** user-table write on this client
     /// (`push`, `push_with_mode`, `delete` — and so every SQL DML statement, C
@@ -424,13 +472,29 @@ impl GnitzClient {
     /// survives a catalog write and there is no cross-statement state to
     /// invalidate. The SQL planner brackets each statement with begin/end.
     pub fn begin_statement(&mut self) {
-        self.scope = Some(StatementScope::default());
+        self.scope = Some(CatalogSnapshot::default());
     }
 
     /// Close the statement scope. The next statement opens a fresh one, so a DDL
     /// write in this statement is visible to the next.
     pub fn end_statement(&mut self) {
         self.scope = None;
+    }
+
+    /// What this statement has resolved: the whole catalog input a pure planning
+    /// pass reads. Empty outside a statement bracket.
+    pub fn catalog(&self) -> &CatalogSnapshot {
+        self.scope.as_ref().unwrap_or(&EMPTY_CATALOG)
+    }
+
+    /// Record a resolve a caller performed itself, which
+    /// [`ReadTarget::describe_relation`](crate::read_target::ReadTarget::describe_relation)
+    /// requires of a backend answering out of its own catalog. A no-op outside a
+    /// statement bracket.
+    pub fn record_relation(&mut self, schema_name: &str, name: &str, desc: Option<Arc<RelDescriptor>>) {
+        if let Some(scope) = &mut self.scope {
+            scope.insert(schema_name, name, desc);
+        }
     }
 
     /// Reserve at least `count` SERIAL ids for `table_id` in **one** master round
@@ -726,42 +790,20 @@ impl GnitzClient {
     /// `index_circuits` — so this check can never accept an FK the server would
     /// reject, nor reject one it would accept.
     pub fn index_for_column(&mut self, table_id: u64, col_idx: usize) -> Result<Option<IndexMeta>, ClientError> {
-        let list = self.table_indexes(table_id)?;
+        let list = Arc::clone(&self.describe_by_id(table_id)?.indexes);
         // Exact single-element match: a composite index does NOT answer a
         // single-column FK/uniqueness query (a `(a, b)` index does not guarantee
         // uniqueness of `a` alone).
         Ok(list.iter().find(|m| m.cols.as_slice() == [col_idx as u32]).copied())
     }
 
-    /// The full secondary-index list for `table_id`. Used by the SQL
-    /// point-lookup planner, which must see every index's full declared column
-    /// list to plan a leading-prefix seek.
-    pub fn table_indexes(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
-        Ok(Arc::clone(&self.descriptor_by_tid(table_id)?.indexes))
-    }
-
-    /// True iff relation `tid` is REPLICATED. The SQL planner consults this when
-    /// building an aggregate directly over a source: a reduce over a replicated
-    /// relation must be the shard-free `reduce_multi_local` (every worker holds
-    /// the full copy, so a sharded reduce would N-fold-multiply the aggregate —
-    /// see the replicated-tables design).
-    pub fn table_replicated(&mut self, tid: u64) -> Result<bool, ClientError> {
-        Ok(self.descriptor_by_tid(tid)?.replicated)
-    }
-
-    /// The statement's descriptor for `tid`. A tid normally comes from resolving
-    /// that same relation by name earlier in the statement, so this is a scope
-    /// hit; the by-id round trip keeps the answer correct for a caller holding a
-    /// tid from anywhere else, rather than handing it an empty index list and a
-    /// `false` placement. The statement resolves a handful of relations, so the
-    /// linear search costs less than a second map to keep in step.
-    fn descriptor_by_tid(&mut self, tid: u64) -> Result<Arc<RelDescriptor>, ClientError> {
-        let hit = self
-            .scope
-            .as_ref()
-            .and_then(|s| s.relations.values().flatten().find(|d| d.tid == tid));
-        if let Some(d) = hit {
-            return Ok(Arc::clone(d));
+    /// The statement's descriptor for `tid` — the by-id twin of [`Self::resolve`].
+    /// A tid usually comes from resolving the same relation by name earlier in the
+    /// statement, which makes this a scope hit; a tid from anywhere else falls back
+    /// to a by-id round trip rather than reporting an empty index list.
+    pub fn describe_by_id(&mut self, tid: u64) -> Result<Arc<RelDescriptor>, ClientError> {
+        if let Some(d) = self.catalog().by_tid(tid) {
+            return Ok(d);
         }
         self.fetch_descriptor(RelTarget::Id(tid))?
             .ok_or_else(|| ClientError::ServerError(format!("relation {tid} not found")))
@@ -1265,7 +1307,7 @@ impl GnitzClient {
         let vids = self.create_view_chain(
             schema_name,
             vec![PlannedView {
-                name: view_name.to_string(),
+                name: ViewName::Named(view_name.to_string()),
                 sql_text: sql_text.to_string(),
                 circuit,
                 output_columns: output_columns.to_vec(),
@@ -1328,8 +1370,8 @@ impl GnitzClient {
             // `[A-Za-z0-9_]` charset `canon_name` relies on. Hidden segment names
             // are system-generated (`__h…` — the leading `_` is exactly what marks
             // them non-user), so only user-visible names are validated.
-            if !is_hidden_view_name(&pv.name) {
-                crate::validate_user_identifier(&pv.name).map_err(ClientError::ServerError)?;
+            if let ViewName::Named(n) = &pv.name {
+                crate::validate_user_identifier(n).map_err(ClientError::ServerError)?;
             }
             let pk_indices: Vec<usize> = pv.pk_cols.iter().map(|&c| c as usize).collect();
             Schema::validate_parts(&pk_indices, &pv.output_columns)
@@ -1345,15 +1387,21 @@ impl GnitzClient {
             None => Vec::new(),
         };
 
-        // Each view's vid: its circuit's pre-allocated id, or a fresh one. A chain
-        // pre-sets every id (downstream circuits reference upstream hidden views),
-        // so no alloc happens on that path.
+        // The whole bundle is assigned before any substitution runs, because a
+        // downstream segment's `ScanDelta` names an upstream segment's id.
+        // `seg_ids` holds only the symbolic ones, so a bundle of real preset ids
+        // gets an empty map and an identity substitution pass.
         let mut vids: Vec<u64> = Vec::with_capacity(views.len());
+        let mut seg_ids: HashMap<u64, u64> = HashMap::new();
         for pv in &views {
-            let vid = if pv.circuit.view_id == 0 {
-                self.session.alloc_table_id()?
-            } else {
-                pv.circuit.view_id
+            let vid = match pv.circuit.view_id {
+                0 => self.session.alloc_table_id()?,
+                seg if is_segment_id(seg) => {
+                    let vid = self.session.alloc_table_id()?;
+                    seg_ids.insert(seg, vid);
+                    vid
+                }
+                real => real,
             };
             vids.push(vid);
         }
@@ -1386,7 +1434,12 @@ impl GnitzClient {
                 append_view_row(&mut view_a, -1, rec);
             }
 
-            for (pv, vid) in views.into_iter().zip(vids.iter().copied()) {
+            for (mut pv, vid) in views.into_iter().zip(vids.iter().copied()) {
+                // 0.5. Substitute the bundle's symbolic ids. Unconditional, so no
+                // path reaches a catalog write without the surviving-tag check.
+                pv.circuit.resolve_seg_ids(&seg_ids)?;
+                let name = resolve_view_name(&pv.name, &seg_ids)?;
+
                 // 1. Column records.
                 append_col_rows(&mut col_a, vid, OWNER_KIND_VIEW, &pv.output_columns)?;
 
@@ -1411,7 +1464,7 @@ impl GnitzClient {
                     &ViewRecord {
                         vid,
                         schema_id,
-                        name: canon_name(&pv.name),
+                        name: canon_name(&name),
                         sql_definition: pv.sql_text,
                         pk_col_idx: pk_packed,
                         capacity_bytes: pv.capacity_bytes.unwrap_or(0),
@@ -1606,7 +1659,7 @@ impl GnitzClient {
     /// reach storage and only surface later as "column reference is ambiguous".
     pub fn alter_add_column(&mut self, tid: u64, def: &ColumnDef) -> Result<(), ClientError> {
         crate::reject_reserved_infix(&def.name).map_err(ClientError::ServerError)?;
-        let desc = self.descriptor_by_tid(tid)?;
+        let desc = self.describe_by_id(tid)?;
         if desc.schema.visible_column_named(&def.name).is_some() {
             return Err(ClientError::ServerError(format!(
                 "column '{}' already exists on table {tid}",
@@ -1641,7 +1694,7 @@ impl GnitzClient {
         col_idx: usize,
         flip: impl FnOnce(&mut ColumnDef),
     ) -> Result<(), ClientError> {
-        let desc = self.descriptor_by_tid(tid)?;
+        let desc = self.describe_by_id(tid)?;
         // The rows written below carry `owner_kind = OWNER_KIND_TABLE`, so
         // against a stored view row the `-1` would fail as an opaque CAS
         // conflict. Reject here, where the assumption is made, rather than in
@@ -1687,16 +1740,16 @@ impl GnitzClient {
         }
     }
 
-    /// Resolve `name` under `schema_name` to its id and kind; both come from the
-    /// same descriptor, so they can never disagree.
-    pub fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(Arc<Schema>, RelKind), ClientError> {
-        let d = self.resolve(schema_name, name)?.ok_or_else(|| {
+    /// Resolve `name` under `schema_name`, rejecting a missing relation. The
+    /// erroring form of [`Self::resolve`], for the callers whose next step needs
+    /// the relation to exist.
+    pub fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<Arc<RelDescriptor>, ClientError> {
+        self.resolve(schema_name, name)?.ok_or_else(|| {
             ClientError::ServerError(format!(
                 "Table or view '{}' not found",
                 qualified_name(schema_name, name)
             ))
-        })?;
-        Ok((Arc::clone(&d.schema), RelKind::of(&d)))
+        })
     }
 
     pub fn resolve_table_or_view_id(
@@ -1704,34 +1757,25 @@ impl GnitzClient {
         schema_name: &str,
         name: &str,
     ) -> Result<(u64, Arc<Schema>), ClientError> {
-        let (schema, kind) = self.resolve_relation(schema_name, name)?;
-        Ok((kind.tid, schema))
-    }
-
-    /// The class probe, without the schema. Every relation-class disambiguation
-    /// (the binder's writable-target check, ALTER's target resolution) routes
-    /// through here rather than re-spelling it. `Ok(None)` = no such relation;
-    /// `Err` = a missing schema or a decode error, which must surface rather than
-    /// be masked as a miss.
-    pub fn resolve_relation_kind(&mut self, schema_name: &str, name: &str) -> Result<Option<RelKind>, ClientError> {
-        Ok(self.resolve(schema_name, name)?.map(|d| RelKind::of(&d)))
+        let d = self.resolve_relation(schema_name, name)?;
+        Ok((d.tid, Arc::clone(&d.schema)))
     }
 
     // --- Relation resolution ---
 
     /// The statement's descriptor for `schema_name.name`, or `None` when no such
-    /// relation exists. One round trip per relation per statement: the scope
-    /// holds the absent verdict too, so a two-probe error ladder does not pay
-    /// twice.
-    fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
+    /// relation exists. Every relation lookup routes through here: the binder's
+    /// writable-target check, ALTER's target resolution, the planner's resolve
+    /// loop. One round trip per relation per statement — the scope holds the
+    /// absent verdict too, so a two-probe error ladder does not pay twice. `Err`
+    /// is a missing schema or a decode error, not a miss.
+    pub fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
+        if let Some(hit) = self.catalog().get(schema_name, name) {
+            return Ok(hit);
+        }
         let qname = qualified_name(schema_name, name);
-        if let Some(hit) = self.scope.as_ref().and_then(|s| s.relations.get(&qname)) {
-            return Ok(hit.clone());
-        }
         let found = self.fetch_descriptor(RelTarget::Name(&qname))?;
-        if let Some(s) = &mut self.scope {
-            s.relations.insert(qname, found.clone());
-        }
+        self.record_relation(schema_name, name, found.clone());
         Ok(found)
     }
 

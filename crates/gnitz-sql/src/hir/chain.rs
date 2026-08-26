@@ -5,7 +5,7 @@
 //! structural backstop every emitted circuit passes through.
 
 use crate::error::GnitzSqlError;
-use gnitz_core::{Circuit, ColumnDef, GnitzClient, PlannedView, Schema};
+use gnitz_core::{segment_id, Circuit, ColumnDef, PlannedView, Schema, ViewName};
 use std::sync::Arc;
 
 /// Circuit + output columns + pk-list — the pieces every view emitter returns
@@ -94,67 +94,67 @@ fn schema_of(cols: &[ColumnDef], pk: &[u32]) -> Arc<Schema> {
 }
 
 /// The in-flight CREATE VIEW bundle: the hidden segments compiled so far plus
-/// the lazily allocated id of the user-named final view, which every hidden
-/// segment's name embeds (`__h{owner}_{idx}`, the DROP-cascade convention).
-/// Ends as one atomic `create_view_chain` bundle (hiddens then final).
+/// the id of the user-named final view, which every hidden segment names as its
+/// owner (the DROP-cascade convention). Ends as one atomic `create_view_chain`
+/// bundle (hiddens then final).
+///
+/// Ids are symbolic, minted from a chain-local counter and substituted for real
+/// ones at commit. Compiling a body therefore reaches no server and repeats
+/// exactly, which the resolve loop needs to re-run a pass.
 pub(crate) struct ViewChain {
-    owner_vid: Option<u64>,
+    next_seg: u64,
     pub(crate) segments: Vec<PlannedView>,
 }
 
 impl ViewChain {
     pub(crate) fn new() -> Self {
         ViewChain {
-            owner_vid: None,
+            // Slot 0 is the owner's, taken before any hidden segment can mint.
+            next_seg: 1,
             segments: Vec::new(),
         }
     }
 
-    /// The final view's id — a durable `alloc_table_id` server round trip,
-    /// allocated on first use so a view with no hidden segments never pays the
-    /// allocation before its own emit.
-    pub(crate) fn owner_vid(&mut self, client: &mut GnitzClient) -> Result<u64, GnitzSqlError> {
-        if let Some(v) = self.owner_vid {
-            return Ok(v);
-        }
-        let v = client.alloc_table_id()?;
-        self.owner_vid = Some(v);
-        Ok(v)
+    /// The next chain-local symbolic id.
+    fn mint(&mut self) -> u64 {
+        let v = segment_id(self.next_seg);
+        self.next_seg += 1;
+        v
     }
 
-    /// Mint one hidden segment: allocate its view id, run `emit` with it (the
-    /// emitter may push its own upstream segments first — it gets `self` back),
-    /// and push the emitted pieces. Returns the segment's `(view id, schema)` plus
-    /// whatever `emit` returned alongside its pieces (the lowering passes its
-    /// `ColId` layout out this way; the CTE phase passes `()`).
-    /// The single home for the mint sequence's invariants: the id is allocated
-    /// before the circuit is built (so downstream circuits can reference it) and
-    /// segments land on the chain in dependency order.
+    /// The final view's symbolic id — chain-local slot 0.
+    pub(crate) fn owner_vid(&self) -> u64 {
+        segment_id(0)
+    }
+
+    /// Mint one hidden segment: take its view id, run `emit` with it (the emitter
+    /// may push its own upstream segments first — it gets `self` back), and push
+    /// the emitted pieces. Returns the segment's `(view id, schema)` plus whatever
+    /// `emit` returned alongside its pieces.
+    ///
+    /// The mint order is the invariant this owns: the id exists before the circuit
+    /// is built, so a downstream circuit can reference it, and segments land on the
+    /// chain in dependency order.
     pub(crate) fn add_segment<T>(
         &mut self,
-        client: &mut GnitzClient,
-        emit: impl FnOnce(&mut GnitzClient, &mut ViewChain, u64) -> Result<(EmitPieces, T), GnitzSqlError>,
+        emit: impl FnOnce(&mut ViewChain, u64) -> Result<(EmitPieces, T), GnitzSqlError>,
     ) -> Result<(u64, Arc<Schema>, T), GnitzSqlError> {
-        let vid = client.alloc_table_id()?;
-        let ((circuit, cols, pk), extra) = emit(client, self, vid)?;
+        let vid = self.mint();
+        let ((circuit, cols, pk), extra) = emit(self, vid)?;
         debug_assert_exchange_topology(&circuit);
         let schema = schema_of(&cols, &pk);
-        self.push_hidden(client, cols, pk, circuit)?;
+        self.push_hidden(cols, pk, circuit);
         Ok((vid, schema, extra))
     }
 
-    /// Append a hidden segment, naming it `__h{owner}_{idx}` at creation — the
-    /// single site that mints hidden view names.
-    fn push_hidden(
-        &mut self,
-        client: &mut GnitzClient,
-        cols: Vec<ColumnDef>,
-        pk: Vec<u32>,
-        circuit: Circuit,
-    ) -> Result<(), GnitzSqlError> {
-        let owner = self.owner_vid(client)?;
+    /// Append a hidden segment, naming it after its owner and position. The one
+    /// site that names one, and it uses `ViewName::Hidden` rather than a string
+    /// because the owner's real id does not exist yet.
+    fn push_hidden(&mut self, cols: Vec<ColumnDef>, pk: Vec<u32>, circuit: Circuit) {
+        let owner = self.owner_vid();
+        let idx = self.segments.len();
         self.segments.push(PlannedView {
-            name: gnitz_core::hidden_view_name(owner, self.segments.len()),
+            name: ViewName::Hidden { owner, idx },
             sql_text: "-- hidden segment".to_string(),
             circuit,
             output_columns: cols,
@@ -166,6 +166,5 @@ impl ViewChain {
             capacity_bytes: None,
             delta_bytes: None,
         });
-        Ok(())
     }
 }

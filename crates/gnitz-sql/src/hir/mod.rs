@@ -19,13 +19,14 @@ mod lower;
 mod physical;
 mod rewrite;
 
+pub use create::plan_view;
 pub(crate) use create::{execute_alter_view, execute_create_view};
 
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr};
 use chain::{EmitPieces, ViewChain};
-use gnitz_core::{ColumnDef, GnitzClient, RangeRel, Schema, TypeCode};
+use gnitz_core::{CatalogSnapshot, ColumnDef, RangeRel, RelDescriptor, Schema, TypeCode};
 use sqlparser::ast::SetExpr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -37,7 +38,7 @@ use std::sync::Arc;
 /// the top path share one pipeline; only the CTE phase threads `chain` ahead of
 /// it (to compile CTE segments before the body binds against their aliases).
 pub(crate) fn bind_and_lower(
-    client: &mut GnitzClient,
+    cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
     chain: &mut ViewChain,
     body: &SetExpr,
@@ -45,10 +46,10 @@ pub(crate) fn bind_and_lower(
     bounded: bool,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let rel = bind::bind_body(client, binder, &ids, body)?;
+    let rel = bind::bind_body(cat, binder, &ids, body)?;
     let rel = rewrite::decorrelate(rel, &ids)?;
     let rel = rewrite::classify(rel)?;
-    lower::lower(client, chain, rel, view_id, bounded)
+    lower::lower(chain, rel, view_id, bounded)
 }
 
 /// Opaque column identity, unique within one `bind_and_lower` invocation, never
@@ -252,7 +253,10 @@ pub(crate) enum RelExpr {
         tid: u64,
         schema: Arc<Schema>,
         cols: Vec<HirCol>,
-        from_catalog: bool,
+        /// The catalog descriptor `tid` resolved to, or `None` for a chain-minted
+        /// segment id, which has no catalog rows until the chain commits: no index
+        /// list to bound a scan with and no replication flag to read.
+        desc: Option<Arc<RelDescriptor>>,
     },
     Filter {
         input: Rc<RelExpr>,
@@ -492,7 +496,7 @@ impl RelExpr {
     /// A base table or committed/hidden-view source: one fresh `ColId` per
     /// registered schema column, in schema order (so a `ColId`'s env position is
     /// its schema position).
-    pub(crate) fn get(ids: &ColIdGen, tid: u64, schema: Arc<Schema>, from_catalog: bool) -> Rc<RelExpr> {
+    pub(crate) fn get(ids: &ColIdGen, tid: u64, schema: Arc<Schema>, desc: Option<Arc<RelDescriptor>>) -> Rc<RelExpr> {
         let cols = schema
             .columns
             .iter()
@@ -505,7 +509,7 @@ impl RelExpr {
             tid,
             schema,
             cols,
-            from_catalog,
+            desc,
         })
     }
 

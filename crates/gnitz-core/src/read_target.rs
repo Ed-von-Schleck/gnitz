@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::client::{GnitzClient, IndexMeta, RelKind};
+use crate::client::{GnitzClient, RelDescriptor};
 use crate::error::ClientError;
 use crate::protocol::{Schema, ZSetBatch};
 
@@ -39,9 +39,16 @@ pub trait ReadTarget {
     /// the trait's job.
     fn client_mut(&mut self) -> &mut GnitzClient;
 
-    /// The relation's schema and its resolved `(id, class, delta)`.
-    fn resolve_relation(&mut self, schema_name: &str, name: &str) -> Result<(Arc<Schema>, RelKind), ClientError> {
-        GnitzClient::resolve_relation(self.client_mut(), schema_name, name)
+    /// The whole descriptor for one relation, or a recorded absence. This is the
+    /// only catalog answer a planning pass needs, so the backend holding the
+    /// relation is the one that describes it.
+    ///
+    /// An implementation must record its answer through
+    /// [`GnitzClient::record_relation`]; the planner's resolve loop reads the
+    /// statement snapshot back rather than the return value. The default records
+    /// via [`GnitzClient::resolve`]'s own memo.
+    fn describe_relation(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
+        GnitzClient::resolve(self.client_mut(), schema_name, name)
     }
 
     /// Every row of the relation. The path a bare `SELECT *` with no WHERE,
@@ -68,10 +75,5 @@ pub trait ReadTarget {
         reply_schema: &Schema,
     ) -> Result<Option<ZSetBatch>, ClientError> {
         GnitzClient::scan_spec(self.client_mut(), table_id, spec, reply_schema)
-    }
-
-    /// The relation's secondary indexes, for the planner's index probe.
-    fn table_indexes(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
-        GnitzClient::table_indexes(self.client_mut(), table_id)
     }
 }

@@ -131,20 +131,18 @@ pub(crate) fn parse_expr_sql(src: &str) -> Expr {
 }
 
 /// Non-unique `IndexMeta` list from raw column-index lists.
-pub(crate) fn idx_metas(col_lists: &[&[u32]]) -> std::sync::Arc<Vec<gnitz_core::IndexMeta>> {
+pub(crate) fn idx_metas(col_lists: &[&[u32]]) -> Vec<gnitz_core::IndexMeta> {
     let flagged: Vec<(&[u32], bool)> = col_lists.iter().map(|cols| (*cols, false)).collect();
     idx_metas_flagged(&flagged)
 }
 
 /// `IndexMeta` list from raw column-index lists, each with its `is_unique` flag.
-pub(crate) fn idx_metas_flagged(col_lists: &[(&[u32], bool)]) -> std::sync::Arc<Vec<gnitz_core::IndexMeta>> {
-    std::sync::Arc::new(
-        col_lists
-            .iter()
-            .map(|(cols, is_unique)| gnitz_core::IndexMeta {
-                cols: gnitz_core::PkColList::from_slice(cols),
-                is_unique: *is_unique,
-            })
-            .collect(),
-    )
+pub(crate) fn idx_metas_flagged(col_lists: &[(&[u32], bool)]) -> Vec<gnitz_core::IndexMeta> {
+    col_lists
+        .iter()
+        .map(|(cols, is_unique)| gnitz_core::IndexMeta {
+            cols: gnitz_core::PkColList::from_slice(cols),
+            is_unique: *is_unique,
+        })
+        .collect()
 }

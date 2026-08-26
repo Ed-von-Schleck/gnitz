@@ -128,8 +128,7 @@ impl Mirror {
     fn relation_id_moved(&mut self, table_id: u64) -> Result<bool, MirrorError> {
         let view = self.view(table_id)?;
         let (schema_name, name) = (view.schema_name.clone(), view.name.clone());
-        let (_, kind) = self.client.resolve_relation(&schema_name, &name)?;
-        Ok(kind.tid != table_id)
+        Ok(self.client.resolve_relation(&schema_name, &name)?.tid != table_id)
     }
 
     /// **A live expiry re-resolves by name; it does not bootstrap in place.**
@@ -160,7 +159,7 @@ impl Mirror {
     /// transition a bootstrap needs, and it compiles nothing.
     pub(crate) fn bootstrap(&mut self, table_id: u64) -> Result<PollOutcome, MirrorError> {
         self.check_poison()?;
-        let view_schema = self.view(table_id)?.schema.clone();
+        let view_schema = std::sync::Arc::clone(&self.view(table_id)?.desc.schema);
         // Everything between here and the insert below is a copy that does not
         // exist, and the missing cursor is what says so: a cursor surviving a
         // failed read would have the next poll deliver `(T, …]` onto an erased

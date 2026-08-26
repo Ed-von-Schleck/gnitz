@@ -374,28 +374,29 @@ fn paginate(weights: &[i64], offset: u64, hi: u64) -> Vec<(usize, i64)> {
 // The sink
 // ---------------------------------------------------------------------------
 
-/// The sink over an already-projected result (the aggregate finisher's output):
-/// sort and paginate in place — hidden synthetic keys stay physical, exactly
-/// like a view scan, and are stripped at presentation. Returns the schema
-/// unchanged alongside the windowed batch (untouched when there is nothing to
-/// reorder, skip, or bound).
-pub(crate) fn order_limit_passthrough(
-    schema: Schema,
-    batch: ZSetBatch,
+/// Resolve the ORDER BY of an already-projected result (the aggregate finisher's
+/// output) against its own output schema, to the wire `OrderKey`s
+/// [`read_spec_finish`] windows by.
+///
+/// `col` is a full output-schema column index and `desc = !asc`, which is what
+/// [`read_spec_finish`] decodes — so both sinks finish through that one function.
+pub(crate) fn resolve_out_schema_order(
     order_by: Option<&OrderBy>,
-    offset: usize,
-    limit: Option<usize>,
-) -> Result<(Schema, ZSetBatch), GnitzSqlError> {
-    let order_keys = match order_by {
-        Some(ob) => resolve_order_by(ob)?,
-        None => Vec::new(),
+    schema: &Schema,
+) -> Result<Vec<gnitz_wire::OrderKey>, GnitzSqlError> {
+    let Some(ob) = order_by else {
+        return Ok(Vec::new());
     };
-    let mut sort_keys = Vec::with_capacity(order_keys.len());
-    for k in &order_keys {
-        let ci = resolve_key_col(k, &schema)?;
-        sort_keys.push(SortKey::new(&schema, ci, k.asc, k.nulls_first));
-    }
-    Ok(finish_window(schema, batch, sort_keys, offset, limit))
+    resolve_order_by(ob)?
+        .iter()
+        .map(|k| {
+            Ok(gnitz_wire::OrderKey {
+                col: resolve_key_col(k, schema)? as u16,
+                desc: !k.asc,
+                nulls_first: k.nulls_first,
+            })
+        })
+        .collect()
 }
 
 /// Sort + window an already-server-projected ScanSpec reply by its wire
@@ -579,10 +580,23 @@ mod tests {
         }
     }
 
-    /// Test-only sort → window → project: the production sinks sort either an
-    /// already-projected result (`order_limit_passthrough`) or a ScanSpec reply
-    /// (`read_spec_finish`); this wrapper windows over the full source schema
-    /// and projects afterwards so the tests can order by non-projected columns.
+    /// The two halves the fold tail runs, composed: resolve the ORDER BY over the
+    /// result's own schema, then sort and window by those keys.
+    fn passthrough(
+        schema: Schema,
+        batch: ZSetBatch,
+        order_by: Option<&OrderBy>,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<(Schema, ZSetBatch), GnitzSqlError> {
+        let keys = resolve_out_schema_order(order_by, &schema)?;
+        Ok(read_spec_finish(schema, batch, &keys, offset, limit))
+    }
+
+    /// Test-only sort → window → project: the production sinks window an
+    /// already-projected result or a ScanSpec reply, both through
+    /// [`read_spec_finish`]; this wrapper windows over the full source schema and
+    /// projects afterwards so the tests can order by non-projected columns.
     fn order_limit_project(
         projection: &[SelectItem],
         actual_schema: &Schema,
@@ -593,7 +607,7 @@ mod tests {
     ) -> Result<(Schema, ZSetBatch), GnitzSqlError> {
         let resolved = resolve_projection(projection, actual_schema)?;
         let full = full_batch.unwrap_or_else(|| ZSetBatch::new(actual_schema));
-        let (_, windowed) = order_limit_passthrough(actual_schema.clone(), full, order_by, offset, limit)?;
+        let (_, windowed) = passthrough(actual_schema.clone(), full, order_by, offset, limit)?;
         Ok(project(resolved, actual_schema, Some(windowed)))
     }
 
@@ -678,11 +692,11 @@ mod tests {
         let ids = |out: &ZSetBatch| (0..out.len()).map(|i| out.pks.get(i) as u64).collect::<Vec<_>>();
 
         let q = parse_query("SELECT * FROM t ORDER BY val");
-        let (_, out) = order_limit_passthrough(schema.clone(), b.clone(), q.order_by.as_ref(), 0, None).unwrap();
+        let (_, out) = passthrough(schema.clone(), b.clone(), q.order_by.as_ref(), 0, None).unwrap();
         assert_eq!(ids(&out), vec![2, 3, 1]);
         // Positional: the 2nd visible column is `val`.
         let q = parse_query("SELECT * FROM t ORDER BY 2 DESC");
-        let (_, out) = order_limit_passthrough(schema, b, q.order_by.as_ref(), 0, None).unwrap();
+        let (_, out) = passthrough(schema, b, q.order_by.as_ref(), 0, None).unwrap();
         assert_eq!(ids(&out), vec![1, 3, 2]);
     }
 
@@ -781,8 +795,8 @@ mod tests {
         push_kv(&mut folded, 1, Some(10), None, 5);
         push_kv(&mut folded, 2, Some(20), None, 1);
 
-        let (s_dup, out_dup) = order_limit_passthrough(schema.clone(), dup, q.order_by.as_ref(), 0, Some(2)).unwrap();
-        let (s_folded, out_folded) = order_limit_passthrough(schema, folded, q.order_by.as_ref(), 0, Some(2)).unwrap();
+        let (s_dup, out_dup) = passthrough(schema.clone(), dup, q.order_by.as_ref(), 0, Some(2)).unwrap();
+        let (s_folded, out_folded) = passthrough(schema, folded, q.order_by.as_ref(), 0, Some(2)).unwrap();
 
         assert_eq!(expand_kv(&s_dup, &out_dup), vec![(1, Some(10)); 2]);
         assert_eq!(expand_kv(&s_dup, &out_dup), expand_kv(&s_folded, &out_folded));
@@ -800,7 +814,7 @@ mod tests {
         push_kv(&mut b, 1, Some(10), None, 1);
         push_kv(&mut b, 2, Some(20), None, 1);
         push_kv(&mut b, 3, Some(30), None, 0);
-        let _ = order_limit_passthrough(schema, b, q.order_by.as_ref(), 0, Some(2));
+        let _ = passthrough(schema, b, q.order_by.as_ref(), 0, Some(2));
     }
 
     #[test]

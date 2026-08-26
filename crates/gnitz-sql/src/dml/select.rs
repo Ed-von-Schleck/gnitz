@@ -1,8 +1,8 @@
 //! Direct `SELECT`: an ad-hoc SELECT reads exactly one relation, served through
-//! the **parameterized bounded read** (`plan_read_spec` → a `ReadSpec` rows sink
-//! executed server-side: bound pushdown, predicate, projection, ORDER BY / LIMIT
-//! top-k) or, for aggregate / DISTINCT shapes, through the **fold sink**
-//! (`execute_aggregate_select` → a per-worker hash-fold + client finishing).
+//! the **parameterized bounded read** (a `ReadSpec` rows sink executed
+//! server-side: bound pushdown, predicate, projection, ORDER BY / LIMIT top-k)
+//! or, for aggregate / DISTINCT shapes, through the **fold sink** (a per-worker
+//! hash-fold + client finishing).
 //!
 //! A query that *derives* a new relation — a JOIN, a set operation, an EXISTS/IN
 //! or scalar subquery, a derived table, a non-pass-through CTE — has no
@@ -14,33 +14,34 @@
 //! pass-through CTE over one relation is inlined (`cte_passthrough`) so trivial
 //! `WITH` queries keep reading through the direct path.
 //!
-//! Planning is separable from dispatch: [`route_select`] validates and resolves,
-//! [`build_rows_shape`] / [`build_fold_shape`] decide each sink's reply shape, and
-//! only the tails below reach the wire. `dml::explain` runs the same builders in
-//! the same order and formats their decisions instead of dispatching them.
+//! Planning is separate from dispatch, and the seam is [`ReadPlan`]:
+//! [`plan_read`] validates, resolves, and decides the sink's access and reply
+//! shape without reaching a server; [`execute_select`] runs the resulting plan and
+//! `dml::explain` formats the same plan instead of dispatching it.
 
 use crate::agg::{synthetic_fold_cols, GroupByLayout};
 use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_factor_name, has_exists_in_subquery, has_scalar_subquery,
     is_bare_wildcard_projection, FromShape,
 };
-use crate::bind::cte_passthrough;
-use crate::bind::Binder;
+use crate::bind::{cte_passthrough, Binder};
 use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::group_by::{analyze_group_by, bind_having_expr, resolve_set_projection, HavingCtx};
-use crate::dml::plan::{bind_where, extract_limit, extract_offset, fetch_bound, plan_where, ReadBudget};
+use crate::dml::plan::{
+    bind_where, bound_and_predicate, extract_limit, extract_offset, fetch_bound, Access, ReadBudget,
+};
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, FoldShape};
-use crate::exec::order::{order_limit_passthrough, read_spec_finish, resolve_read_spec_order};
+use crate::exec::order::{read_spec_finish, resolve_out_schema_order, resolve_read_spec_order};
 use crate::expr_lower::compile_filter_evaluator;
 use crate::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
     HonoredClauses, HonoredQueryClauses,
 };
 use crate::SqlResult;
-use gnitz_core::{ReadTarget, ReduceOutKey, RelClass, Schema, ZSetBatch, MAX_COLUMNS};
+use gnitz_core::{CatalogSnapshot, ReadTarget, ReduceOutKey, RelDescriptor, Schema, ZSetBatch, MAX_COLUMNS};
 use gnitz_wire::{AggReadItem, AggReadSpec, ReadSink};
-use sqlparser::ast::{LimitClause, Query, Select, SetExpr};
+use sqlparser::ast::{LimitClause, Query, Select, SetExpr, Statement};
 use std::sync::Arc;
 
 /// The single derivation-rejection: an ad-hoc SELECT reads one relation, but this
@@ -75,11 +76,14 @@ pub(super) struct Target {
     pub(super) schema: Arc<Schema>,
     /// `None` is a chain-minted segment id, which never reaches here: a derived
     /// table in FROM is rejected as a derivation before any resolution.
-    pub(super) kind: Option<RelClass>,
+    ///
+    /// `None` only for a chain-minted id, which an ad-hoc read never names: a
+    /// derived table or non-pass-through CTE is rejected as a derivation first.
+    pub(super) desc: Option<Arc<RelDescriptor>>,
 }
 
 /// Which sink a validated ad-hoc SELECT lands on.
-pub(super) enum Sink {
+enum Sink {
     /// Bare `SELECT *` with no WHERE / ORDER BY / LIMIT / OFFSET: the
     /// unprojected full scan (`client.scan`), which builds no `ReadSpec`.
     PlainScan,
@@ -87,33 +91,33 @@ pub(super) enum Sink {
     Fold,
 }
 
-/// A validated ad-hoc SELECT: its sink and everything that sink needs. The one
-/// seam between planning and dispatch — `execute_select` runs the tail,
-/// `dml::explain` formats it.
-pub(super) struct Route<'q> {
-    pub(super) target: Target,
-    pub(super) select: &'q Select,
-    pub(super) limit: Option<usize>,
-    pub(super) offset: usize,
-    pub(super) sink: Sink,
+/// A validated ad-hoc SELECT: its sink and everything that sink needs.
+/// `plan_read` consumes it on the way to a [`ReadPlan`], which is what both tails
+/// see.
+struct Route<'q> {
+    target: Target,
+    select: &'q Select,
+    limit: Option<usize>,
+    offset: usize,
+    sink: Sink,
 }
 
 /// Resolve `name` to the read's target; the relation kind rides the resolution.
-fn resolve_target(reads: &mut dyn ReadTarget, binder: &mut Binder<'_>, name: String) -> Result<Target, GnitzSqlError> {
-    let (tid, schema, kind) = binder.resolve(reads, &name)?;
+fn resolve_target(cat: &CatalogSnapshot, binder: &mut Binder<'_>, name: String) -> Result<Target, GnitzSqlError> {
+    let (tid, schema, desc) = binder.resolve(cat, &name)?;
     Ok(Target {
         name,
         tid,
         schema,
-        kind,
+        desc,
     })
 }
 
 /// Validate an ad-hoc SELECT's shape, route it to its sink, and resolve the one
 /// relation it reads. Both tails then run the same builders in the same order, so
 /// describing a query that has no plan yields the identical rejection.
-pub(super) fn route_select<'q>(
-    reads: &mut dyn ReadTarget,
+fn route_select<'q>(
+    cat: &CatalogSnapshot,
     query: &'q Query,
     binder: &mut Binder<'_>,
 ) -> Result<Route<'q>, GnitzSqlError> {
@@ -178,7 +182,7 @@ pub(super) fn route_select<'q>(
         if cte_select.selection.is_some() || cte_select.having.is_some() || body_is_grouped(cte_select) {
             return reject_derivation("non-pass-through CTE");
         }
-        match cte_passthrough(reads, cte_select, &cte.alias.columns, binder)? {
+        match cte_passthrough(cat, cte_select, &cte.alias.columns, binder)? {
             Some(resolved) => binder.cache_alias(&cte.alias.name.value, resolved)?,
             None => return reject_derivation("non-pass-through CTE"),
         }
@@ -242,7 +246,7 @@ pub(super) fn route_select<'q>(
                 "aggregate SELECT"
             },
         )?;
-        let target = resolve_target(reads, binder, table_name)?;
+        let target = resolve_target(cat, binder, table_name)?;
         return Ok(Route {
             target,
             select,
@@ -256,14 +260,14 @@ pub(super) fn route_select<'q>(
     // routed above; the exotic tail (PREWHERE, TOP, QUALIFY, …) rejects here.
     reject_unhonored_select_clauses(select, HonoredClauses::PLAIN, "direct SELECT")?;
 
-    let target = resolve_target(reads, binder, table_name)?;
+    let target = resolve_target(cat, binder, table_name)?;
 
     // A plain `SELECT *` (no EXCEPT/RENAME/… modifiers) with no WHERE / ORDER BY /
     // LIMIT / OFFSET reads through `client.scan` rather than a `ReadSpec`: the rows
     // come back verbatim with no per-row projection program, and the reply carries
     // the server's own schema block, which warms the client schema cache (a
     // `ReadSpec` ships a per-query projected schema and never touches that cache).
-    // A modifier-bearing wildcard falls through to `plan_read_spec`, which expands
+    // A modifier-bearing wildcard falls through to the rows sink, which expands
     // it, as does a DROP COLUMN'd base table — its hidden *payload* slot must be
     // projected away rather than leaked. A view's hidden synthetic *key* slots do
     // not: those are filtered at presentation.
@@ -289,39 +293,286 @@ pub(super) fn route_select<'q>(
     })
 }
 
-pub(crate) fn execute_select(
-    reads: &mut dyn ReadTarget,
-    query: &Query,
-    binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
-    let route = route_select(reads, query, binder)?;
-    match route.sink {
-        Sink::PlainScan => {
-            let (schema_out, batch_opt) = reads.scan(route.target.tid)?;
-            let out_schema = schema_out
-                .map(|s| (*s).clone())
-                .unwrap_or_else(|| (*route.target.schema).clone());
-            let batch = batch_opt.unwrap_or_else(|| ZSetBatch::new(&out_schema));
-            Ok(SqlResult::Rows {
-                schema: out_schema,
-                batch,
-            })
+// ---------------------------------------------------------------------------
+// The planning seam
+// ---------------------------------------------------------------------------
+
+/// Which sink a finished [`ReadPlan`] lands on. Fieldless: the sink's own
+/// description stays in-crate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadKind {
+    PlainScan,
+    Rows,
+    Fold,
+}
+
+/// A finished ad-hoc read: the relation it reads plus everything its sink needs,
+/// fully owned and borrowing nothing from the AST.
+///
+/// A `pub` struct wrapping a private enum, so the variants' fields stay in-crate
+/// where the two tails match on them; the accessors below are what leaves.
+pub struct ReadPlan {
+    pub(super) target: Target,
+    pub(super) case: ReadCase,
+}
+
+pub(super) enum ReadCase {
+    /// The unprojected full scan: no `ReadSpec` at all, the relation read whole.
+    PlainScan,
+    /// Boxed so the plain scan, which carries nothing, does not widen the plan to
+    /// the sink shapes' schemas.
+    Spec(Box<SpecRead>),
+}
+
+/// A read that ships a `ReadSpec`: the pushed-down access, the sink it ships
+/// under, and the client-side window. These are the same for both sinks; only
+/// [`SpecRead::tail`] differs.
+pub(super) struct SpecRead {
+    pub(super) access: Access,
+    pub(super) sink: ReadSink,
+    /// The ORDER BY keys, over the reply columns. For the rows sink these are the
+    /// keys the worker's top-k selects by *and* the client re-sorts the
+    /// concatenation by; the fold resolves them over its own output schema and
+    /// finishes client-side.
+    pub(super) order: Vec<gnitz_wire::OrderKey>,
+    pub(super) offset: usize,
+    pub(super) limit: Option<usize>,
+    pub(super) tail: SinkTail,
+}
+
+/// What the client does with the reply.
+pub(super) enum SinkTail {
+    /// Decode against `reply_schema` and window.
+    Rows { reply_schema: Schema },
+    /// Finish the partial fold, then window.
+    Fold {
+        shape: Box<FoldShape>,
+        /// Whether the shape came from `DISTINCT`. Nothing in the layout
+        /// distinguishes a DISTINCT fold from a zero-aggregate GROUP BY, and
+        /// `EXPLAIN` names them differently.
+        is_distinct: bool,
+    },
+}
+
+impl ReadPlan {
+    pub fn kind(&self) -> ReadKind {
+        match &self.case {
+            ReadCase::PlainScan => ReadKind::PlainScan,
+            ReadCase::Spec(s) => match s.tail {
+                SinkTail::Rows { .. } => ReadKind::Rows,
+                SinkTail::Fold { .. } => ReadKind::Fold,
+            },
         }
-        Sink::Rows => plan_read_spec(reads, query, &route),
-        Sink::Fold => execute_aggregate_select(reads, query, &route),
+    }
+
+    /// The relation this read names.
+    pub fn target_id(&self) -> u64 {
+        self.target.tid
+    }
+
+    /// The schema the reply decodes against; `None` for `PlainScan`, which
+    /// replies under the relation's own schema.
+    pub fn reply_schema(&self) -> Option<&Schema> {
+        match &self.case {
+            ReadCase::PlainScan => None,
+            ReadCase::Spec(s) => Some(s.reply_schema()),
+        }
+    }
+
+    /// The encoded `ReadSpec` this read ships; `None` for `PlainScan`. One, not a
+    /// list: an over-cap `PkSet` gather needs `ReadBudget::MayChunk`, and a read
+    /// plans under `OneRequest`.
+    pub fn encoded_spec(&self) -> Option<Vec<u8>> {
+        match &self.case {
+            ReadCase::PlainScan => None,
+            ReadCase::Spec(s) => Some(s.access.encode(s.access.bound(), &s.sink)),
+        }
+    }
+
+    /// Whether running this plan issues a request at all. False for `LIMIT 0`,
+    /// which answers empty without one.
+    pub fn dispatches(&self) -> bool {
+        match &self.case {
+            ReadCase::PlainScan => true,
+            ReadCase::Spec(s) => s.limit != Some(0),
+        }
     }
 }
 
+impl SpecRead {
+    /// The schema this read's reply decodes against — the projected reply for the
+    /// rows sink, the partial fold for the fold sink.
+    pub(super) fn reply_schema(&self) -> &Schema {
+        match &self.tail {
+            SinkTail::Rows { reply_schema } => reply_schema,
+            SinkTail::Fold { shape, .. } => &shape.partial_schema,
+        }
+    }
+}
+
+/// Plan a `SELECT`, or the `EXPLAIN` of one, into the read it runs: a pure
+/// function of `(stmt, cat)`, reaching no server. Both statement forms yield the
+/// same plan, down to the rejection a query unsupported on two axes reports.
+pub fn plan_read(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> Result<ReadPlan, GnitzSqlError> {
+    let query = match stmt {
+        Statement::Query(q) => q.as_ref(),
+        Statement::Explain { statement, .. } => match statement.as_ref() {
+            Statement::Query(q) => q.as_ref(),
+            _ => {
+                return Err(GnitzSqlError::Unsupported(
+                    "EXPLAIN describes a SELECT; this statement is not one".to_string(),
+                ))
+            }
+        },
+        _ => {
+            return Err(GnitzSqlError::Unsupported(
+                "plan_read describes a SELECT or the EXPLAIN of one; this statement is neither".to_string(),
+            ))
+        }
+    };
+    // A fresh binder per pass: the alias cache a re-run's discarded pass filled
+    // must not reach the next one.
+    let mut binder = Binder::new(schema_name);
+    let route = route_select(cat, query, &mut binder)?;
+    let case = match route.sink {
+        Sink::PlainScan => ReadCase::PlainScan,
+        Sink::Rows => ReadCase::Spec(Box::new(plan_rows_read(query, &route)?)),
+        Sink::Fold => ReadCase::Spec(Box::new(plan_fold_read(query, &route)?)),
+    };
+    Ok(ReadPlan {
+        target: route.target,
+        case,
+    })
+}
+
+/// The WHERE → access step. Both sinks take it before building their own shape,
+/// so a query unsupported on both axes names the same one whichever sink it
+/// routes to. The bound WHERE lives and dies here; only the owned [`Access`]
+/// outlives it.
+fn plan_access(target: &Target, select: &Select) -> Result<Access, GnitzSqlError> {
+    let bound_where = bind_where(&target.schema, select.selection.as_ref())?;
+    let indexes = target.desc.as_ref().map(|d| &d.indexes[..]).unwrap_or_default();
+    let plan = bound_and_predicate(&target.schema, bound_where.as_ref(), ReadBudget::OneRequest, indexes)?;
+    Ok(plan.access)
+}
+
+fn plan_rows_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSqlError> {
+    let (target, select) = (&route.target, route.select);
+    let access = plan_access(target, select)?;
+    let shape = build_rows_shape(select, query, &target.schema)?;
+    // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
+    let limit_k = route.limit.map(|l| l.saturating_add(route.offset) as u64).unwrap_or(0);
+    Ok(SpecRead {
+        access,
+        sink: ReadSink::Rows {
+            projection: shape.projection,
+            order: shape.order.clone(),
+            limit_k,
+        },
+        order: shape.order,
+        offset: route.offset,
+        limit: route.limit,
+        tail: SinkTail::Rows {
+            reply_schema: shape.reply_schema,
+        },
+    })
+}
+
+fn plan_fold_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSqlError> {
+    let (target, select) = (&route.target, route.select);
+    let access = plan_access(target, select)?;
+    let shape = build_fold_shape(select, &target.schema)?;
+    // Resolved against the finished output schema at plan time, so a key naming a
+    // missing column rejects before the fold is dispatched, as HAVING already does.
+    let order = resolve_out_schema_order(query.order_by.as_ref(), &shape.out_schema)?;
+    let sink = ReadSink::Fold(AggReadSpec {
+        group_cols: shape.layout.group_col_indices.iter().map(|&c| c as u16).collect(),
+        aggs: shape
+            .layout
+            .agg_specs
+            .iter()
+            .map(|s| AggReadItem {
+                op: s.op,
+                src_col: s.col as u16,
+            })
+            .collect(),
+    });
+    Ok(SpecRead {
+        access,
+        sink,
+        order,
+        offset: route.offset,
+        limit: route.limit,
+        tail: SinkTail::Fold {
+            is_distinct: select.distinct.is_some(),
+            shape: Box::new(shape),
+        },
+    })
+}
+
 // ---------------------------------------------------------------------------
-// plan_read_spec — the parameterized bounded read
+// The dispatch tail
+// ---------------------------------------------------------------------------
+
+pub(crate) fn execute_select(reads: &mut dyn ReadTarget, plan: ReadPlan) -> Result<SqlResult, GnitzSqlError> {
+    let tid = plan.target.tid;
+    let ReadCase::Spec(spec) = plan.case else {
+        let (schema_out, batch_opt) = reads.scan(tid)?;
+        let out_schema = schema_out
+            .map(|s| (*s).clone())
+            .unwrap_or_else(|| (*plan.target.schema).clone());
+        let batch = batch_opt.unwrap_or_else(|| ZSetBatch::new(&out_schema));
+        return Ok(SqlResult::Rows {
+            schema: out_schema,
+            batch,
+        });
+    };
+    let SpecRead {
+        access,
+        sink,
+        order,
+        offset,
+        limit,
+        tail,
+    } = *spec;
+    // The output schema the window runs over, and the batch to window. `LIMIT 0`
+    // answers from the schema alone, with no request issued.
+    let (out_schema, batch) = match tail {
+        SinkTail::Rows { reply_schema } => {
+            if limit == Some(0) {
+                return Ok(empty_rows(reply_schema));
+            }
+            let batch = fetch_bound(reads, tid, &access, &sink, &reply_schema)?;
+            (reply_schema, batch)
+        }
+        SinkTail::Fold { shape, .. } => {
+            if limit == Some(0) {
+                return Ok(empty_rows(shape.out_schema));
+            }
+            // A wire error (including the runtime per-worker group cap) is hard: by
+            // now the fold is mid-flight on the workers and cannot fall back.
+            let partial = fetch_bound(reads, tid, &access, &sink, &shape.partial_schema)?;
+            // Client finishing: combine by group value, ground row, AVG/NullfillSum,
+            // HAVING, projection.
+            let out_batch = agg_finish(&shape, &partial);
+            (shape.out_schema, out_batch)
+        }
+    };
+    // Sort the concatenation by the wire keys, window, present.
+    let (schema, batch) = read_spec_finish(out_schema, batch, &order, offset, limit);
+    Ok(SqlResult::Rows { schema, batch })
+}
+
+// ---------------------------------------------------------------------------
+// The sink shapes
 // ---------------------------------------------------------------------------
 
 /// The rows sink's reply shape: what the worker projects and how it orders.
-pub(super) struct RowsShape {
-    pub(super) reply_schema: Schema,
+struct RowsShape {
+    reply_schema: Schema,
     /// The compiled projection-map program.
-    pub(super) projection: Vec<u8>,
-    pub(super) order: Vec<gnitz_wire::OrderKey>,
+    projection: Vec<u8>,
+    order: Vec<gnitz_wire::OrderKey>,
 }
 
 /// The `(reply schema, projection, ORDER BY keys)` a rows read replies under — a
@@ -329,7 +580,7 @@ pub(super) struct RowsShape {
 /// express (a qualified-wildcard / other non-map projection, an ORDER BY
 /// expression) surfaces the offending resolver's own feature-named `Unsupported`;
 /// an unknown column is a `Bind` error.
-pub(super) fn build_rows_shape(select: &Select, query: &Query, schema: &Schema) -> Result<RowsShape, GnitzSqlError> {
+fn build_rows_shape(select: &Select, query: &Query, schema: &Schema) -> Result<RowsShape, GnitzSqlError> {
     // Projection items — the source PK hidden-prepended to slots `0..k`, then
     // every SELECT item as a payload slot in SELECT order.
     let (mut items, mut out_cols) = build_read_projection(&select.projection, schema)?;
@@ -347,45 +598,12 @@ pub(super) fn build_rows_shape(select: &Select, query: &Query, schema: &Schema) 
     })
 }
 
-/// Build and run a `ReadSpec` for a single-relation, non-aggregate SELECT.
-fn plan_read_spec(reads: &mut dyn ReadTarget, query: &Query, route: &Route<'_>) -> Result<SqlResult, GnitzSqlError> {
-    let (target, select, limit, offset) = (&route.target, route.select, route.limit, route.offset);
-    let schema = &*target.schema;
-    // WHERE → bound + compiled server-side predicate, then the reply shape.
-    let bound_where = bind_where(schema, select.selection.as_ref())?;
-    let plan = plan_where(reads, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
-    let shape = build_rows_shape(select, query, schema)?;
-
-    // `LIMIT 0` short-circuits to an empty result — no request dispatched.
-    if limit == Some(0) {
-        return Ok(empty_rows(shape.reply_schema));
-    }
-    // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
-    let limit_k = limit.map(|l| l.saturating_add(offset) as u64).unwrap_or(0);
-
-    // Ship the spec; the reply schema is the one we built.
-    let sink = ReadSink::Rows {
-        projection: shape.projection,
-        order: shape.order.clone(),
-        limit_k,
-    };
-    let batch = fetch_bound(reads, target.tid, &plan, &sink, &shape.reply_schema)?;
-
-    // Client finish: sort the concatenation by the wire keys, window, present.
-    let (schema, batch) = read_spec_finish(shape.reply_schema, batch, &shape.order, offset, limit);
-    Ok(SqlResult::Rows { schema, batch })
-}
-
-// ---------------------------------------------------------------------------
-// execute_aggregate_select — the ad-hoc aggregate / DISTINCT fold
-// ---------------------------------------------------------------------------
-
 /// The physical layout and reply schemas a GROUP BY / global aggregate / HAVING /
 /// DISTINCT read folds under — a pure function of the AST and the source schema. A
 /// shape the fold cannot express (a partial reply wider than the column limit, a
 /// HAVING the shared expression compiler rejects) is a feature-named
 /// `Unsupported`; a resolver's own `Unsupported`/`Bind` propagates.
-pub(super) fn build_fold_shape(select: &Select, schema: &Schema) -> Result<FoldShape, GnitzSqlError> {
+fn build_fold_shape(select: &Select, schema: &Schema) -> Result<FoldShape, GnitzSqlError> {
     // Resolve the physical layout (shared with the view path). DISTINCT is the
     // degenerate grouped fold — zero aggregates over the set-op projection
     // resolver (bare columns only, float keys rejected); GROUP BY / global
@@ -453,59 +671,5 @@ pub(super) fn build_fold_shape(select: &Select, schema: &Schema) -> Result<FoldS
         partial_schema,
         out_schema,
         having,
-    })
-}
-
-/// Serve a single-relation GROUP BY / global aggregate / HAVING / DISTINCT query
-/// via the ReadSpec fold sink (a per-worker hash-fold) + client finishing. The
-/// only runtime error is the per-worker group cap, surfaced from the wire call.
-fn execute_aggregate_select(
-    reads: &mut dyn ReadTarget,
-    query: &Query,
-    route: &Route<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
-    let (target, select, limit, offset) = (&route.target, route.select, route.limit, route.offset);
-    let schema = &*target.schema;
-
-    // WHERE → bound + residual predicate, exactly as the plain read path (the
-    // grouped view applies WHERE via the identical compiler, so a WHERE the direct
-    // path cannot compile also fails the view). It precedes the sink shape as it
-    // does in `plan_read_spec`: a query unsupported on both axes must name the
-    // same one whichever sink it routes to.
-    let bound_where = bind_where(schema, select.selection.as_ref())?;
-    let plan = plan_where(reads, target.tid, schema, bound_where.as_ref(), ReadBudget::OneRequest)?;
-    let shape = build_fold_shape(select, schema)?;
-
-    // `LIMIT 0` short-circuits to an empty result — no request dispatched
-    // (parity with the rows path).
-    if limit == Some(0) {
-        return Ok(empty_rows(shape.out_schema));
-    }
-
-    let sink = ReadSink::Fold(AggReadSpec {
-        group_cols: shape.layout.group_col_indices.iter().map(|&c| c as u16).collect(),
-        aggs: shape
-            .layout
-            .agg_specs
-            .iter()
-            .map(|s| AggReadItem {
-                op: s.op,
-                src_col: s.col as u16,
-            })
-            .collect(),
-    });
-    // Dispatch. A wire error (including the runtime per-worker group cap) is HARD —
-    // by now the fold is mid-flight on the workers and cannot fall back.
-    let partial = fetch_bound(reads, target.tid, &plan, &sink, &shape.partial_schema)?;
-
-    // Client finishing (combine by group value, ground row, AVG/NullfillSum,
-    // HAVING, projection), then the shared ORDER BY / OFFSET / LIMIT sink.
-    let out_batch = agg_finish(&shape, &partial);
-
-    let (schema_out, batch_out) =
-        order_limit_passthrough(shape.out_schema, out_batch, query.order_by.as_ref(), offset, limit)?;
-    Ok(SqlResult::Rows {
-        schema: schema_out,
-        batch: batch_out,
     })
 }

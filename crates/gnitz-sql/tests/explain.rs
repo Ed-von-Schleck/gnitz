@@ -244,6 +244,40 @@ fn order_and_limit_name_which_side_does_the_work() {
     }
 }
 
+/// `LIMIT 0` shows up on the fifth line only. The first four still describe the
+/// access, the predicate and the sink's shape: the query has a plan, it just
+/// answers from the reply schema without issuing the request.
+#[test]
+fn a_limit_zero_query_still_describes_its_plan() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut client, sn) = make_planner(&srv);
+    seed(&mut client, &sn);
+
+    for (sql, want_access, want_predicate, want_shape) in [
+        // A full PK point applies the whole WHERE itself, so nothing is residual.
+        (
+            "SELECT v FROM t WHERE id = 2 LIMIT 0",
+            "access: pk point lookup",
+            "predicate: none",
+            "projection: 1 columns",
+        ),
+        // An inexact index walk keeps its conjunct in the predicate.
+        (
+            "SELECT v, COUNT(*) FROM t WHERE v = 10 GROUP BY v LIMIT 0",
+            "access: index range on (v) — may be traded for a full scan on low selectivity",
+            "predicate: server-side",
+            "fold: group by (v): COUNT(*)",
+        ),
+    ] {
+        let lines = explain(&mut client, &sn, &format!("EXPLAIN {sql}"));
+        assert_eq!(lines.len(), 5, "`{sql}`: {lines:?}");
+        assert_eq!(lines[1], want_access, "`{sql}`");
+        assert_eq!(lines[2], want_predicate, "`{sql}`");
+        assert_eq!(lines[3], want_shape, "`{sql}`");
+        assert_eq!(lines[4], "order/limit: no request (LIMIT 0)", "`{sql}`");
+    }
+}
+
 // ── Folds ────────────────────────────────────────────────────────────────────
 
 /// The fold line names the physical reduce the worker runs — which is why AVG

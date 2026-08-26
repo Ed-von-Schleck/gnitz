@@ -7,8 +7,8 @@ use crate::error::GnitzSqlError;
 use crate::hir::chain::{debug_assert_exchange_topology, ViewChain};
 use crate::validate::{reject_unhonored_query_clauses, validate_user_name, HonoredQueryClauses};
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, PlannedView, RelClass};
-use sqlparser::ast::{CreateTableOptions, ObjectName, Query, Value, ValueWithSpan};
+use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass, ViewName};
+use sqlparser::ast::{CreateTableOptions, ObjectName, Query, Statement, Value, ValueWithSpan};
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
 const SIZE_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
@@ -113,12 +113,47 @@ fn parse_size(option: &str, text: &str) -> Result<u64, GnitzSqlError> {
     }
 }
 
-pub(crate) fn execute_create_view(
-    client: &mut GnitzClient,
+/// Plan a `CREATE VIEW` or an `ALTER VIEW … AS` into the bundle its commit
+/// writes: a pure function of `(stmt, cat)`, minting symbolic segment ids and
+/// reaching no server.
+///
+/// The last segment is the user-named final view; every earlier one is a hidden
+/// segment it depends on, which is the dependency order `create_view_chain`
+/// wants anyway. The commit half reads the owner off that position rather than
+/// re-deriving it from the AST.
+pub fn plan_view(
+    stmt: &Statement,
+    cat: &CatalogSnapshot,
     schema_name: &str,
+) -> Result<Vec<PlannedView>, GnitzSqlError> {
+    // A fresh binder per pass: the alias cache a re-run's discarded pass filled
+    // must not reach the next one.
+    let mut binder = Binder::new(schema_name).for_view_body();
+    match stmt {
+        Statement::CreateView(cv) => plan_create_view(cat, cv, &mut binder),
+        Statement::AlterView { name, query, .. } => plan_alter_view(cat, schema_name, name, query, &mut binder),
+        _ => Err(GnitzSqlError::Unsupported(
+            "plan_view describes a CREATE VIEW or an ALTER VIEW … AS; this statement is neither".to_string(),
+        )),
+    }
+}
+
+/// The bundle owner's name — `build_query_segments` pushes the user-named view
+/// last, after every hidden segment.
+fn owner_name(views: &[PlannedView]) -> Result<&str, GnitzSqlError> {
+    match views.last().map(|pv| &pv.name) {
+        Some(ViewName::Named(n)) => Ok(n),
+        _ => Err(GnitzSqlError::Internal(
+            "a planned view bundle must end with its user-named segment".to_string(),
+        )),
+    }
+}
+
+fn plan_create_view(
+    cat: &CatalogSnapshot,
     cv: &sqlparser::ast::CreateView,
     binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
+) -> Result<Vec<PlannedView>, GnitzSqlError> {
     let query: &Query = &cv.query;
     let view_name = crate::ast_util::extract_name(&cv.name, "CREATE VIEW")?;
     validate_user_name(&view_name)?;
@@ -139,16 +174,11 @@ pub(crate) fn execute_create_view(
     // `CreateView`'s `Display` is exactly what `Statement::CreateView` delegates
     // to, so this is the statement's full SQL text.
     let sql_text = format!("{cv}");
-
-    // Compile the body into a durable chain (real `alloc_table_id` ids), then
-    // commit it atomically. `build_query_segments` owns every shape rule; CREATE
-    // VIEW adds only the durable id origin and the `create_view_chain` commit.
     let options = decode_view_options(&cv.options)?;
 
     let mut chain = ViewChain::new();
-    let final_vid = build_query_segments(client, query, binder, &mut chain, view_name, sql_text, options)?;
-    client.create_view_chain(schema_name, chain.segments, None)?;
-    Ok(SqlResult::ViewCreated { view_id: final_vid })
+    build_query_segments(cat, query, binder, &mut chain, view_name, sql_text, options)?;
+    Ok(chain.segments)
 }
 
 /// `ALTER VIEW <v> AS <query>` — drop-then-create under the same name with a
@@ -158,18 +188,18 @@ pub(crate) fn execute_create_view(
 /// a bundle that fails there — or on any other guard — leaves the old view
 /// serving its rows untouched.
 /// sqlparser's `AlterView` has no `if_exists`, so a missing view is a hard error.
-pub(crate) fn execute_alter_view(
-    client: &mut GnitzClient,
+fn plan_alter_view(
+    cat: &CatalogSnapshot,
     schema_name: &str,
     name: &ObjectName,
     query: &Query,
     binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
+) -> Result<Vec<PlannedView>, GnitzSqlError> {
     let view_name = crate::ast_util::extract_name(name, "ALTER VIEW")?;
     validate_user_name(&view_name)?;
 
     // Resolve the old vid; reject `ALTER VIEW <table>` and a missing relation.
-    let old_vid = resolve_view_id(client, schema_name, &view_name)?;
+    let old_vid = resolve_view_id(cat, schema_name, &view_name)?;
 
     // Same envelope rules as CREATE VIEW (only `WITH` honored).
     reject_unhonored_query_clauses(
@@ -185,11 +215,9 @@ pub(crate) fn execute_alter_view(
     // CREATE VIEW of the new definition.
     let sql_text = format!("CREATE VIEW {view_name} AS {query}");
 
-    // Compile + validate the new plan (fresh vids) BEFORE issuing the zone, so a
-    // planner error leaves the old view fully intact.
     let mut chain = ViewChain::new();
     build_query_segments(
-        client,
+        cat,
         query,
         binder,
         &mut chain,
@@ -211,12 +239,34 @@ pub(crate) fn execute_alter_view(
         )));
     }
 
-    // One zone: the old view's retractions plus the new chain. The engine's
-    // view-dependency guard (re-evaluated under the catalog write lock) still
-    // rejects the retraction if dependents exist — RESTRICT, and nothing is torn
-    // down when it fires.
-    client.create_view_chain(schema_name, chain.segments, Some(&view_name))?;
+    Ok(chain.segments)
+}
 
+/// Commit a planned `CREATE VIEW` bundle; the owner's real id comes back from it.
+pub(crate) fn execute_create_view(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    views: Vec<PlannedView>,
+) -> Result<SqlResult, GnitzSqlError> {
+    owner_name(&views)?;
+    let vids = client.create_view_chain(schema_name, views, None)?;
+    let view_id = *vids
+        .last()
+        .ok_or_else(|| GnitzSqlError::Internal("create_view_chain returned no ids".to_string()))?;
+    Ok(SqlResult::ViewCreated { view_id })
+}
+
+/// Commit a planned `ALTER VIEW … AS` bundle: one zone carrying the old view's
+/// retractions and the new chain. The engine's view-dependency guard
+/// (re-evaluated under the catalog write lock) still rejects the retraction if
+/// dependents exist — RESTRICT, and nothing is torn down when it fires.
+pub(crate) fn execute_alter_view(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    views: Vec<PlannedView>,
+) -> Result<SqlResult, GnitzSqlError> {
+    let view_name = owner_name(&views)?.to_string();
+    client.create_view_chain(schema_name, views, Some(&view_name))?;
     Ok(SqlResult::Altered {
         object: "view".to_string(),
         name: view_name,
@@ -225,8 +275,11 @@ pub(crate) fn execute_alter_view(
 
 /// Resolve `name` to a VIEW id, rejecting `ALTER VIEW <table>` and a missing
 /// relation.
-fn resolve_view_id(client: &mut GnitzClient, schema_name: &str, name: &str) -> Result<u64, GnitzSqlError> {
-    match client.resolve_relation_kind(schema_name, name)? {
+fn resolve_view_id(cat: &CatalogSnapshot, schema_name: &str, name: &str) -> Result<u64, GnitzSqlError> {
+    let resolved = cat
+        .get(schema_name, name)
+        .ok_or_else(|| GnitzSqlError::CatalogMiss(name.to_string()))?;
+    match resolved {
         // `ALTER VIEW … AS` re-renders its body as a bare `CREATE VIEW … AS …`,
         // dropping any option clause — so retargeting a bounded view would
         // silently convert it into an unbounded one.
@@ -257,26 +310,25 @@ fn resolve_view_id(client: &mut GnitzClient, schema_name: &str, name: &str) -> R
 }
 
 /// Compile one query body into a chain of `PlannedView` segments (hidden
-/// segments in dependency order, then the final view named `final_name`),
-/// filling `chain.segments` and returning the final view's id. Does NOT reject
-/// unhonored tail clauses — the caller owns that (CREATE VIEW rejects ORDER
-/// BY/LIMIT before calling).
+/// segments in dependency order, then the final view named `final_name`), filling
+/// `chain.segments`. Does NOT reject unhonored tail clauses — the caller owns that
+/// (CREATE VIEW rejects ORDER BY/LIMIT before calling).
 fn build_query_segments(
-    client: &mut GnitzClient,
+    cat: &CatalogSnapshot,
     query: &Query,
     binder: &mut Binder<'_>,
     chain: &mut ViewChain,
     final_name: String,
     sql_text: String,
     options: ViewOptions,
-) -> Result<u64, GnitzSqlError> {
+) -> Result<(), GnitzSqlError> {
     let capacity = options.capacity;
     // The CTE phase compiles each CTE body (a pass-through alias into the binder
     // cache, or a hidden segment on `chain`) and registers it, so the body below
     // resolves a CTE by name. A derived table is not pre-compiled — it binds as an
     // inline subtree inside the body bind (`resolve_table_factor`).
-    let final_vid = chain.owner_vid(client)?;
-    crate::hir::bind::bind_ctes(client, binder, chain, query)?;
+    let final_vid = chain.owner_vid();
+    crate::hir::bind::bind_ctes(cat, binder, chain, query)?;
 
     // Every view shape — linear, join, GROUP BY, DISTINCT, set operation, and every
     // subquery form (EXISTS/IN, scalar aggregate, ANY/ALL) — routes through the HIR
@@ -284,14 +336,8 @@ fn build_query_segments(
     // subqueries into `Join`/`Reduce` structure, classify predicates, then lower to
     // circuit(s) — nested combine segments / self-collision pass-through wrappers
     // land on `chain`, and the final step is emitted with `final_vid`.
-    let (circuit, out_cols, pk_cols) = crate::hir::bind_and_lower(
-        client,
-        binder,
-        chain,
-        query.body.as_ref(),
-        final_vid,
-        capacity.is_some(),
-    )?;
+    let (circuit, out_cols, pk_cols) =
+        crate::hir::bind_and_lower(cat, binder, chain, query.body.as_ref(), final_vid, capacity.is_some())?;
 
     // Structural eligibility, over what the body actually compiled to rather than
     // over the shapes it was written in: both bounded shapes are a single segment,
@@ -315,7 +361,7 @@ fn build_query_segments(
     // paths every emitted circuit reaches.
     debug_assert_exchange_topology(&circuit);
     chain.segments.push(PlannedView {
-        name: final_name,
+        name: ViewName::Named(final_name),
         sql_text,
         circuit,
         output_columns: out_cols,
@@ -323,5 +369,5 @@ fn build_query_segments(
         capacity_bytes: capacity,
         delta_bytes: options.delta,
     });
-    Ok(final_vid)
+    Ok(())
 }

@@ -13,6 +13,7 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use crate::{ddl, dml};
+use gnitz_core::CatalogSnapshot;
 use gnitz_core::{ClientError, GnitzClient, ReadTarget};
 use sqlparser::ast::Statement;
 
@@ -46,36 +47,70 @@ fn reject_in_transaction(client: &GnitzClient, stmt: &Statement) -> Result<(), G
     Ok(())
 }
 
+/// Run `plan` against the statement's catalog snapshot, resolving each name it
+/// reports missing and re-running.
+///
+/// A planning pass has no side effects — it reads the snapshot and builds owned
+/// values, minting segment ids symbolically — so a discarded pass costs CPU over
+/// an already-parsed AST, not a round trip. One resolve per name the planner
+/// asks for, and none for a name it does not.
+pub(crate) fn plan_resolving<T>(
+    reads: &mut dyn ReadTarget,
+    schema_name: &str,
+    mut plan: impl FnMut(&CatalogSnapshot) -> Result<T, GnitzSqlError>,
+) -> Result<T, GnitzSqlError> {
+    loop {
+        let missing = match plan(reads.client_mut().catalog()) {
+            Err(GnitzSqlError::CatalogMiss(name)) => name,
+            other => return other,
+        };
+        // Progress, and so termination: `describe_relation` records its answer, and
+        // `CatalogSnapshot` keys both sides through `qualified_name`, so a repeat
+        // ask is a broken invariant rather than a second round trip.
+        if reads.client_mut().catalog().get(schema_name, &missing).is_some() {
+            return Err(GnitzSqlError::Internal(format!(
+                "planning re-asked for relation '{missing}', which the statement's snapshot already holds"
+            )));
+        }
+        reads.describe_relation(schema_name, &missing)?;
+    }
+}
+
 /// Route one statement.
 ///
 /// A query and the `EXPLAIN` of one go to `reads`, which is what holds the
-/// relation: routing the `EXPLAIN` to the connection instead would cost a round
-/// trip and describe the *server's* relation, which a stale local registration
-/// need not agree with. Everything below the split is DDL, DML or transaction
-/// control, which only a connection can serve.
+/// relation: routing them to the connection instead would cost a round trip and
+/// describe the *server's* relation, which a stale local registration need not
+/// agree with. Everything below the split is DDL, DML or transaction control,
+/// which only a connection can serve. Those arms take `reads.client_mut()`, and
+/// that borrow is what stops a DDL statement from planning against a local
+/// binding only as fresh as the last poll.
 pub(crate) fn execute_statement(
     reads: &mut dyn ReadTarget,
     schema_name: &str,
     stmt: &Statement,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let mut binder = Binder::new(schema_name);
     reject_in_transaction(reads.client_mut(), stmt)?;
 
     match stmt {
-        Statement::Query(query) => return dml::execute_select(reads, query, &mut binder),
+        Statement::Query(_) => {
+            let plan = plan_resolving(reads, schema_name, |cat| crate::plan_read(stmt, cat, schema_name))?;
+            return dml::execute_select(reads, plan);
+        }
         // Bare `DESC t` is `Statement::ExplainTable` — table introspection, a
-        // separate feature — and falls to the catch-all below.
-        Statement::Explain { statement, .. } => {
+        // separate feature — and falls to the catch-all below. `plan_read` rejects
+        // the EXPLAIN of a non-SELECT.
+        Statement::Explain { .. } => {
             reject_unhonored_explain_clauses(stmt, "EXPLAIN")?;
-            return match statement.as_ref() {
-                Statement::Query(query) => dml::execute_explain(reads, query, &mut binder),
-                _ => Err(GnitzSqlError::Unsupported(
-                    "EXPLAIN describes a SELECT; this statement is not one".to_string(),
-                )),
-            };
+            let plan = plan_resolving(reads, schema_name, |cat| crate::plan_read(stmt, cat, schema_name))?;
+            return dml::execute_explain(plan);
         }
         _ => {}
     }
+
+    // Only the write verbs below reach a binder: the read paths above bind inside
+    // the pure planner, against the statement's snapshot rather than a connection.
+    let mut binder = Binder::new(schema_name);
 
     let client = reads.client_mut();
     match stmt {
@@ -116,10 +151,8 @@ pub(crate) fn execute_statement(
         }
         Statement::CreateView(cv) => {
             reject_unhonored_create_view_clauses(cv, "CREATE VIEW")?;
-            // Everything this binder resolves becomes a source of the new view,
-            // so the bounded-view leaf rule applies to all of it.
-            let mut binder = binder.for_view_body();
-            crate::hir::execute_create_view(client, schema_name, cv, &mut binder)
+            let views = plan_resolving(client, schema_name, |cat| crate::plan_view(stmt, cat, schema_name))?;
+            crate::hir::execute_create_view(client, schema_name, views)
         }
         Statement::Insert(insert) => {
             reject_unhonored_insert_clauses(insert, "INSERT")?;
@@ -151,14 +184,11 @@ pub(crate) fn execute_statement(
             ddl::execute_alter_table(client, schema_name, a, &mut binder)
         }
         Statement::AlterView {
-            name,
-            columns,
-            query,
-            with_options,
+            columns, with_options, ..
         } => {
             reject_unhonored_alter_view_clauses(columns, with_options, "ALTER VIEW")?;
-            let mut binder = binder.for_view_body();
-            crate::hir::execute_alter_view(client, schema_name, name, query, &mut binder)
+            let views = plan_resolving(client, schema_name, |cat| crate::plan_view(stmt, cat, schema_name))?;
+            crate::hir::execute_alter_view(client, schema_name, views)
         }
         _ => Err(GnitzSqlError::Unsupported(format!(
             "unsupported SQL statement: {stmt:?}"

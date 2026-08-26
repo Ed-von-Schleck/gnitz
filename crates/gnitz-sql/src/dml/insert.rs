@@ -107,12 +107,13 @@ pub(crate) fn execute_insert(
     // Extract table name, row source, ON CONFLICT action, and RETURNING clause.
     let (table_name_str, rows, columns, on_insert, returning) = extract_insert_parts(insert)?;
 
-    let (tid, schema, class) = binder.resolve_push_target(client, &table_name_str)?;
-    let is_stream = class == RelClass::Stream;
+    let target = binder.resolve_push_target(client, &table_name_str)?;
+    let (tid, schema) = (target.tid, &target.schema);
+    let is_stream = target.class == RelClass::Stream;
 
     // INSERT is positional; reject any column list that isn't every non-SERIAL
     // column in schema order (it would otherwise silently misplace values).
-    validate_insert_column_list(columns, &schema)?;
+    validate_insert_column_list(columns, schema)?;
 
     // RETURNING is supported on the plain-INSERT path only; capturing the
     // effective row under ON CONFLICT (which may UPDATE or skip a row) is out of
@@ -144,7 +145,7 @@ pub(crate) fn execute_insert(
                     "'{table_name_str}' is a stream; ON CONFLICT needs stored rows to resolve against"
                 )));
             }
-            validate_conflict_target(conflict_target, &schema)?;
+            validate_conflict_target(conflict_target, schema)?;
 
             match action {
                 OnConflictAction::DoNothing => ConflictPlan::DoNothingPk,
@@ -154,7 +155,7 @@ pub(crate) fn execute_insert(
                             "ON CONFLICT ... DO UPDATE WHERE not supported".to_string(),
                         ));
                     }
-                    let assignments = bind_do_update_assignments(&do_update.assignments, &schema)?;
+                    let assignments = bind_do_update_assignments(&do_update.assignments, schema)?;
                     ConflictPlan::DoUpdatePk { assignments }
                 }
             }
@@ -168,7 +169,7 @@ pub(crate) fn execute_insert(
 
     // Build the incoming batch from VALUES rows, sized for the known row count.
     let n = rows.len();
-    let mut batch = ZSetBatch::with_capacity(&schema, n);
+    let mut batch = ZSetBatch::with_capacity(schema, n);
 
     // A SERIAL PK is the table's lone single-column PK (enforced at CREATE), so
     // the user omits it: arity excludes it, the PK is drawn from the sequence and
@@ -201,7 +202,7 @@ pub(crate) fn execute_insert(
     let stride = schema.pk_stride() as u8;
     // Built once: `payload_columns` filters on `is_pk_col`, itself a PK-list scan,
     // so leaving it in the row loop pays that scan per row per column.
-    let payload = merge_payload_plan(&schema);
+    let payload = merge_payload_plan(schema);
     // The row count is known here, so the whole statement's ids come from one
     // durable advance rather than one per 64 rows.
     if is_serial {
@@ -239,7 +240,7 @@ pub(crate) fn execute_insert(
             }
             batch.pks.push_tuple(&PkTuple::from_u128(stride, id as u128));
         } else {
-            batch.pks.push_tuple(&extract_pk_value_mapped(row, &slot_of, &schema)?);
+            batch.pks.push_tuple(&extract_pk_value_mapped(row, &slot_of, schema)?);
         }
         batch.weights.push(1);
 
@@ -277,7 +278,7 @@ pub(crate) fn execute_insert(
             // BEFORE the write, so a bad RETURNING list writes nothing rather than
             // committing the row and then failing; `project` afterwards is
             // infallible and consumes the batch, so nothing is copied.
-            let proj = returning.map(|items| resolve_projection(items, &schema)).transpose()?;
+            let proj = returning.map(|items| resolve_projection(items, schema)).transpose()?;
             // A stream has no PK conflict to reject: the engine refuses `Error` on
             // one and leaves `Update` unread, so the push appends. INSERTing the
             // same row twice therefore yields one element at weight 2.
@@ -286,10 +287,10 @@ pub(crate) fn execute_insert(
             } else {
                 WireConflictMode::Error
             };
-            client.push_with_mode(tid, &schema, &batch, mode)?;
+            client.push_with_mode(tid, schema, &batch, mode)?;
             match proj {
                 Some(proj) => {
-                    let (proj_schema, proj_batch) = project(proj, &schema, Some(batch));
+                    let (proj_schema, proj_batch) = project(proj, schema, Some(batch));
                     Ok(SqlResult::Rows {
                         schema: proj_schema,
                         batch: proj_batch,
@@ -306,8 +307,8 @@ pub(crate) fn execute_insert(
             // check. De-duplicate intra-batch (first-wins) before pushing. The
             // filter re-runs per RMW retry against fresh committed state; the
             // incoming VALUES batch (already built, ids drawn) is reused as-is.
-            let count = commit_rmw_or_buffer(client, &table_name_str, tid, &schema, |client| {
-                let filtered = client_side_filter_do_nothing(client, tid, &schema, &batch)?;
+            let count = commit_rmw_or_buffer(client, &table_name_str, tid, schema, |client| {
+                let filtered = client_side_filter_do_nothing(client, tid, schema, &batch)?;
                 let count = filtered.len();
                 let write = (count > 0).then_some(RmwWrite {
                     batch: filtered,
@@ -323,8 +324,8 @@ pub(crate) fn execute_insert(
             // freshest `x`. Update mode: the merged batch carries both +1 merged
             // rows (which may UPSERT) and untouched +1 rows for non-conflicting
             // inserts; workers do the retract-and-insert via enforce_unique_pk.
-            let count = commit_rmw_or_buffer(client, &table_name_str, tid, &schema, |client| {
-                let merged = client_side_merge_do_update(client, tid, &schema, &batch, &assignments)?;
+            let count = commit_rmw_or_buffer(client, &table_name_str, tid, schema, |client| {
+                let merged = client_side_merge_do_update(client, tid, schema, &batch, &assignments)?;
                 let write = (!merged.pks.is_empty()).then_some(RmwWrite {
                     batch: merged,
                     mode: WireConflictMode::Update,

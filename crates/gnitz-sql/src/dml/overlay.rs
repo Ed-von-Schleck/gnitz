@@ -27,7 +27,7 @@ use crate::dml::plan::{fetch_bound, AccessPlan};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
 use gnitz_core::{GnitzClient, PkTuple, Schema, ZSetBatch};
-use gnitz_wire::ReadSink;
+use gnitz_wire::{ReadBound, ReadSink};
 use std::collections::{HashMap, HashSet};
 
 /// A PK's net effect within the transaction so far. `Present` borrows the
@@ -100,8 +100,13 @@ fn fetch_committed(
     keys: &[PkTuple],
 ) -> Result<ZSetBatch, GnitzSqlError> {
     if schema.pk_count() == 1 {
-        let plan = AccessPlan::for_pk_set(keys.iter().map(|k| k.split_wire().0).collect());
-        return fetch_bound(client, tid, &plan, &ReadSink::all_rows(), schema);
+        // No WHERE behind it, so nothing is residual and no predicate ships: the
+        // gather is the whole selection. ON CONFLICT needs the committed rows for
+        // a key set it already holds, so it takes this bound directly rather than
+        // re-deriving it from a synthetic `pk IN (…)`.
+        let keys = keys.iter().map(|k| k.split_wire().0).collect();
+        let plan = AccessPlan::new(ReadBound::PkSet(keys), None, Vec::new(), schema)?;
+        return fetch_bound(client, tid, &plan.access, &ReadSink::all_rows(), schema);
     }
     let gather = RowGather::new(schema);
     let mut out = ZSetBatch::with_capacity(schema, keys.len());

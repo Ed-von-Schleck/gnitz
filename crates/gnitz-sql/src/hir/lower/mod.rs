@@ -31,7 +31,7 @@ use super::{ColId, HirExpr, HirRef, ProjEntry, RelExpr};
 use crate::access::best_index_bound;
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
-use gnitz_core::{ColumnDef, GnitzClient, Schema};
+use gnitz_core::{ColumnDef, RelDescriptor, Schema};
 use gnitz_wire::ScanBound;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -47,10 +47,11 @@ pub(crate) struct SegInput {
     pub tid: u64,
     pub schema: Arc<Schema>,
     pub layout: Vec<ColId>,
-    /// Whether `tid` names a catalog relation rather than a chain-minted segment.
-    /// Every catalog probe (scan-bound index lookup, replication) is gated on it;
-    /// see [`crate::bind::resolve::Resolved`] for why probing a segment id fails.
-    pub from_catalog: bool,
+    /// The catalog descriptor `tid` resolved to, or `None` when `tid` is a
+    /// chain-minted segment, which has no catalog rows until the chain commits.
+    /// The lowering reads every catalog fact off this: the scan-bound index list
+    /// and the reduce's replication flag.
+    pub desc: Option<Arc<RelDescriptor>>,
 }
 
 /// The `Rc::as_ptr` cut memo, threaded through the whole lowering: a subtree
@@ -136,7 +137,7 @@ pub(crate) fn seginput_of_get(rel: &RelExpr) -> Option<SegInput> {
         tid,
         schema,
         cols,
-        from_catalog,
+        desc,
     } = rel
     else {
         return None;
@@ -145,14 +146,13 @@ pub(crate) fn seginput_of_get(rel: &RelExpr) -> Option<SegInput> {
         tid: *tid,
         schema: Arc::clone(schema),
         layout: cols.iter().map(|c| c.id).collect(),
-        from_catalog: *from_catalog,
+        desc: desc.clone(),
     })
 }
 
 /// Lower a bound + classified `RelExpr` tree to circuit pieces for the
 /// pre-allocated `view_id`.
 pub(crate) fn lower(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     rel: Rc<RelExpr>,
     view_id: u64,
@@ -162,7 +162,7 @@ pub(crate) fn lower(
         reject_ineligible_capacity_body(&rel)?;
     }
     let mut memo = CutMemo::new();
-    let (pieces, _layout) = lower_body(client, chain, &mut memo, &rel, view_id)?;
+    let (pieces, _layout) = lower_body(chain, &mut memo, &rel, view_id)?;
     Ok(pieces)
 }
 
@@ -236,7 +236,6 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
 /// what a cut segment exposes to its parent, so every body shape is cuttable by
 /// construction.
 fn lower_body(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     rel: &Rc<RelExpr>,
@@ -252,32 +251,32 @@ fn lower_body(
                 // projection are lowered as a linear body over it (the
                 // scalar-decorrelation finalize shape).
                 _ if projection_is_computed(items) && !fuses_computed_projection(source) => {
-                    lower_computed_over_combine(client, chain, memo, items, fpreds, source, view_id)
+                    lower_computed_over_combine(chain, memo, items, fpreds, source, view_id)
                 }
                 RelExpr::Get { .. } => {
                     let src = seginput_of_get(source).expect("Get arm resolves to a SegInput");
-                    lower_linear(client, &src, fpreds, items, view_id)
+                    lower_linear(&src, fpreds, items, view_id)
                 }
                 RelExpr::Join {
                     kind: JoinType::Semi | JoinType::Anti,
                     ..
-                } => exists::lower_semi_anti_view(client, chain, memo, items, fpreds, source, view_id),
+                } => exists::lower_semi_anti_view(chain, memo, items, fpreds, source, view_id),
                 RelExpr::Join {
                     kind: JoinType::Mark, ..
-                } => exists::lower_mark_view(client, chain, memo, items, fpreds, source, view_id),
-                RelExpr::Join { .. } => join::lower_join_view(client, chain, memo, items, fpreds, source, view_id),
-                RelExpr::Reduce { .. } => reduce::lower_reduce(client, chain, memo, items, fpreds, source, view_id),
+                } => exists::lower_mark_view(chain, memo, items, fpreds, source, view_id),
+                RelExpr::Join { .. } => join::lower_join_view(chain, memo, items, fpreds, source, view_id),
+                RelExpr::Reduce { .. } => reduce::lower_reduce(chain, memo, items, fpreds, source, view_id),
                 // A derived table (a projection, DISTINCT, or set operation) is not a
                 // delta source the linear path can read in place, so it cuts even for
                 // a bare-column projection.
                 RelExpr::Project { .. } | RelExpr::Distinct { .. } | RelExpr::SetOp { .. } => {
-                    lower_computed_over_combine(client, chain, memo, items, fpreds, source, view_id)
+                    lower_computed_over_combine(chain, memo, items, fpreds, source, view_id)
                 }
                 _ => Err(unsupported_body()),
             }
         }
-        RelExpr::Distinct { input } => setop::lower_distinct(client, chain, memo, input, view_id),
-        RelExpr::SetOp { .. } => setop::lower_setop(client, chain, memo, rel, view_id),
+        RelExpr::Distinct { input } => setop::lower_distinct(chain, memo, input, view_id),
+        RelExpr::SetOp { .. } => setop::lower_setop(chain, memo, rel, view_id),
         _ => Err(unsupported_body()),
     }
 }
@@ -310,7 +309,6 @@ fn fuses_computed_projection(source: &RelExpr) -> bool {
 /// scalar-decorrelation finalize: the finalize composite and the outer WHERE both
 /// run over the materialized join output.
 fn lower_computed_over_combine(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     items: &[ProjEntry],
@@ -320,8 +318,8 @@ fn lower_computed_over_combine(
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let mut live: HashSet<ColId> = HashSet::new();
     collect_live_cols(items.iter().map(|i| &i.expr).chain(where_preds), &mut live);
-    let seg = cut_segment(client, chain, memo, source, &live)?;
-    lower_linear(client, &seg, where_preds, items, view_id)
+    let seg = cut_segment(chain, memo, source, &live)?;
+    lower_linear(&seg, where_preds, items, view_id)
 }
 
 /// A body shape the driver has no arm for. Every shape bind can produce is
@@ -337,7 +335,6 @@ fn unsupported_body() -> GnitzSqlError {
 /// itself); every other shape — a nested combine, or a linear spine whose
 /// projection must be materialized first — is cut to a hidden segment.
 pub(crate) fn resolve_input(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     input: &Rc<RelExpr>,
@@ -345,7 +342,7 @@ pub(crate) fn resolve_input(
 ) -> Result<SegInput, GnitzSqlError> {
     match seginput_of_get(input) {
         Some(seg) => Ok(seg),
-        None => cut_segment(client, chain, memo, input, live),
+        None => cut_segment(chain, memo, input, live),
     }
 }
 
@@ -355,7 +352,6 @@ pub(crate) fn resolve_input(
 /// prune, so the registered segment schema carries only what the parent demands.
 /// Memoized by `Rc::as_ptr`: one segment per shared subtree.
 pub(crate) fn cut_segment(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     subtree: &Rc<RelExpr>,
@@ -366,13 +362,12 @@ pub(crate) fn cut_segment(
         return Ok(cached.clone());
     }
     let body = as_body(subtree, live);
-    let (seg_vid, seg_schema, layout) =
-        chain.add_segment(client, |client, chain, vid| lower_body(client, chain, memo, &body, vid))?;
+    let (seg_vid, seg_schema, layout) = chain.add_segment(|chain, vid| lower_body(chain, memo, &body, vid))?;
     let seg = SegInput {
         tid: seg_vid,
         schema: seg_schema,
         layout,
-        from_catalog: false,
+        desc: None,
     };
     memo.insert(key, seg.clone());
     Ok(seg)
@@ -413,7 +408,6 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
 /// explicitly drives by cloning one epoch's delta to both sides, and `a UNION a`
 /// compiles unwrapped today — wrapping would regress a working physical plan.
 pub(crate) fn resolve_collisions(
-    client: &mut GnitzClient,
     chain: &mut ViewChain,
     inputs: &mut [SegInput],
     sources: &[&Rc<RelExpr>],
@@ -434,7 +428,7 @@ pub(crate) fn resolve_collisions(
                 "HIR source collision on a non-Get input".into(),
             ));
         }
-        *input = wrap_passthrough_segment(client, chain, get)?;
+        *input = wrap_passthrough_segment(chain, get)?;
         seen.insert(input.tid);
     }
     Ok(())
@@ -473,11 +467,7 @@ fn identity_project(subtree: &Rc<RelExpr>, keep: impl Fn(&super::HirCol) -> bool
 /// PK-front convention and the resulting `ColId` layout both come from
 /// `physicalize_projection`, the one home, instead of being hand-rolled here
 /// against a separately-synthesized `SELECT *`.
-fn wrap_passthrough_segment(
-    client: &mut GnitzClient,
-    chain: &mut ViewChain,
-    get: &Rc<RelExpr>,
-) -> Result<SegInput, GnitzSqlError> {
+fn wrap_passthrough_segment(chain: &mut ViewChain, get: &Rc<RelExpr>) -> Result<SegInput, GnitzSqlError> {
     // Visible columns only — `place_pk_front` re-prepends an unprojected source
     // PK (staying hidden), exactly as a `SELECT *` view body would.
     let body = identity_project(get, |c| !c.def.is_hidden);
@@ -485,14 +475,12 @@ fn wrap_passthrough_segment(
         unreachable!("identity_project builds a Project");
     };
     let src = seginput_of_get(get).expect("pass-through wrapper receives a Get");
-    let (wrap_vid, wrap_schema, layout) = chain.add_segment(client, |client, _chain, vid| {
-        lower_linear(client, &src, &[], items, vid)
-    })?;
+    let (wrap_vid, wrap_schema, layout) = chain.add_segment(|_chain, vid| lower_linear(&src, &[], items, vid))?;
     Ok(SegInput {
         tid: wrap_vid,
         schema: wrap_schema,
         layout,
-        from_catalog: false,
+        desc: None,
     })
 }
 
@@ -512,14 +500,13 @@ pub(crate) fn split_filter(input: &Rc<RelExpr>) -> (&[HirExpr], &Rc<RelExpr>) {
 /// the source layout, extract the scan bound, physicalize the projection, and hand
 /// the physical inputs to `linear::emit_linear`.
 fn lower_linear(
-    client: &mut GnitzClient,
     src: &SegInput,
     filter_preds: &[HirExpr],
     proj_items: &[ProjEntry],
     view_id: u64,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let folded = physical::fold_preds(filter_preds, &src.layout)?;
-    let bound = extract_scan_bound(client, &folded, src.from_catalog, src.tid, &src.schema)?;
+    let bound = extract_scan_bound(&folded, src);
     let proj = physical::physicalize_projection(proj_items, &src.layout, &src.schema)?;
     let pieces = linear::emit_linear(view_id, src, bound, folded, &proj)?;
     Ok((pieces, proj.layout))
@@ -548,24 +535,16 @@ pub(crate) fn emit_filter<'a>(
     }
 }
 
-/// Scan-bound extraction — a primary-position lowering decision (client, tid,
-/// schema, and the resolved WHERE all in hand). Only a catalog source with a
-/// folded WHERE bounds. Shared by every primary-position `Get` lowering
-/// (`lower_linear` here, `reduce::lower_reduce`'s inline-source arm).
-pub(crate) fn extract_scan_bound(
-    client: &mut GnitzClient,
-    folded: &Option<crate::ir::BoundExpr>,
-    from_catalog: bool,
-    tid: u64,
-    schema: &Schema,
-) -> Result<Option<ScanBound>, GnitzSqlError> {
-    match (folded, from_catalog) {
-        (Some(f), true) => Ok(
-            best_index_bound(f, schema, || client.table_indexes(tid))?.map(|c| ScanBound {
-                idx_cols: c.idx_cols,
-                desc: c.desc,
-            }),
-        ),
-        _ => Ok(None),
-    }
+/// Scan-bound extraction — a primary-position lowering decision (source and the
+/// resolved WHERE both in hand). Only a catalog source with a folded WHERE bounds.
+/// Shared by every primary-position `Get` lowering (`lower_linear` here,
+/// `reduce::lower_reduce`'s inline-source arm).
+pub(crate) fn extract_scan_bound(folded: &Option<crate::ir::BoundExpr>, src: &SegInput) -> Option<ScanBound> {
+    let (Some(f), Some(desc)) = (folded, src.desc.as_ref()) else {
+        return None;
+    };
+    best_index_bound(f, &src.schema, &desc.indexes).map(|c| ScanBound {
+        idx_cols: c.idx_cols,
+        desc: c.desc,
+    })
 }

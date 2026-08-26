@@ -1,11 +1,11 @@
 #![cfg(feature = "integration")]
 
 //! Planner-level tests for the ad-hoc `SELECT` surface: an ad-hoc SELECT reads
-//! exactly one relation, served by the parameterized bounded read
-//! (`plan_read_spec`) or, for aggregate / DISTINCT shapes, the fold sink
-//! (`execute_aggregate_select`). A query that *derives* a new relation — a JOIN, a
-//! set operation, an EXISTS/IN or scalar subquery, a derived table, a
-//! non-pass-through CTE — is rejected from the AST alone with one actionable
+//! exactly one relation, served by the parameterized bounded read (the rows
+//! sink) or, for aggregate / DISTINCT shapes, the fold sink. A query that
+//! *derives* a new relation — a JOIN, a set operation, an EXISTS/IN or scalar
+//! subquery, a derived table, a non-pass-through CTE — is rejected from the AST
+//! alone with one actionable
 //! message pointing at CREATE VIEW. A single-relation read the direct path cannot
 //! express (a LIKE / string-function WHERE, an ORDER BY expression) is a
 //! feature-named `Unsupported`, never the derivation template.

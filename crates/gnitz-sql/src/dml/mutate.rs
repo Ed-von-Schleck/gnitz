@@ -10,7 +10,7 @@ use crate::codec::colwrite::{append_column_value, check_not_null, set_target_adm
 use crate::codec::pk_codec::pack_pk_value;
 use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::overlay::{buffered_net, present_rows};
-use crate::dml::plan::{bind_where, fetch_bound, plan_where, AccessPlan, ReadBudget};
+use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, AccessPlan, ReadBudget};
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
@@ -333,7 +333,7 @@ fn resolve_where_matches(
     sink: &ReadSink,
     reply_schema: &Schema,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let mut committed = fetch_bound(client, tid, plan, sink, reply_schema)?;
+    let mut committed = fetch_bound(client, tid, &plan.access, sink, reply_schema)?;
     // In autocommit there is no buffer to overlay, and `buffered_scope`'s gather
     // can be megabytes of `PkTuple` for a large `pk IN (…)` — so ask only when a
     // transaction is open, which is the condition its doc already states.
@@ -377,14 +377,15 @@ pub(crate) fn execute_update(
 
     let table_name = extract_table_factor_name(&table.relation, "UPDATE")?;
 
-    let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
+    let target = binder.resolve_base_table(client, &table_name)?;
+    let (table_id, schema) = (target.tid, &target.schema);
 
     // Bind SET assignments; reject PK writes and duplicate columns.
     let mut assignments: Vec<(usize, BoundExpr)> = Vec::new();
     let mut seen: Vec<usize> = Vec::with_capacity(assignments_raw.len());
     for assignment in assignments_raw {
-        let col_idx = resolve_set_target(assignment, &schema, &mut seen, "UPDATE SET")?;
-        assignments.push((col_idx, bind_single_table(&assignment.value, &schema)?));
+        let col_idx = resolve_set_target(assignment, schema, &mut seen, "UPDATE SET")?;
+        assignments.push((col_idx, bind_single_table(&assignment.value, schema)?));
     }
 
     // Compile the SET list against the catalog schema — the one the RHS was bound
@@ -397,23 +398,23 @@ pub(crate) fn execute_update(
     // only when at least one row matched.
     let programs = assignments
         .iter()
-        .map(|(ci, e)| Ok((*ci, classify_set_rhs(e, *ci, &schema)?)))
+        .map(|(ci, e)| Ok((*ci, classify_set_rhs(e, *ci, schema)?)))
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
 
-    let where_expr = bind_where(&schema, selection.as_ref())?;
-    let plan = plan_where(client, table_id, &schema, where_expr.as_ref(), ReadBudget::MayChunk)?;
+    let where_expr = bind_where(schema, selection.as_ref())?;
+    let plan = bound_and_predicate(schema, where_expr.as_ref(), ReadBudget::MayChunk, &target.indexes)?;
     let sink = ReadSink::all_rows();
 
     // Read the target rows and build the SET batch under the RMW driver: an
     // autocommit UPDATE commits it lose-update-free via a one-precondition TXN
     // frame with bounded retry; inside a transaction it buffers and records the
     // read-set. The build re-runs per retry so a conflict re-reads fresh state.
-    let count = commit_rmw_or_buffer(client, &table_name, table_id, &schema, |client| {
-        let matched = resolve_where_matches(client, table_id, &schema, &plan, &sink, &schema)?;
+    let count = commit_rmw_or_buffer(client, &table_name, table_id, schema, |client| {
+        let matched = resolve_where_matches(client, table_id, schema, &plan, &sink, schema)?;
         let count = matched.len();
         let write = if count > 0 {
-            let mut updates = ZSetBatch::with_capacity(&schema, count);
-            write_set_rows(&matched, &programs, &schema, &mut updates)?;
+            let mut updates = ZSetBatch::with_capacity(schema, count);
+            write_set_rows(&matched, &programs, schema, &mut updates)?;
             Some(RmwWrite {
                 batch: updates,
                 mode: WireConflictMode::Update,
@@ -445,11 +446,12 @@ pub(crate) fn execute_delete(
     }
     let table_name = extract_table_factor_name(&tables[0].relation, "DELETE")?;
 
-    let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
+    let target = binder.resolve_base_table(client, &table_name)?;
+    let (table_id, schema) = (target.tid, &target.schema);
 
-    let where_expr = bind_where(&schema, del.selection.as_ref())?;
-    let plan = plan_where(client, table_id, &schema, where_expr.as_ref(), ReadBudget::MayChunk)?;
-    let (reply_schema, sink) = pk_only_reply(&schema)?;
+    let where_expr = bind_where(schema, del.selection.as_ref())?;
+    let plan = bound_and_predicate(schema, where_expr.as_ref(), ReadBudget::MayChunk, &target.indexes)?;
+    let (reply_schema, sink) = pk_only_reply(schema)?;
 
     // Resolve the target PKs and build the retraction batch under the RMW driver
     // (autocommit: one-precondition TXN frame with bounded retry; in a
@@ -459,12 +461,12 @@ pub(crate) fn execute_delete(
     // `retraction_batch` fills, so an in-transaction DELETE buffers under the same
     // schema INSERT does (`TxnBuffer` extends a tid's later batches into the first
     // family's schema).
-    let count = commit_rmw_or_buffer(client, &table_name, table_id, &schema, |client| {
-        let matched = resolve_where_matches(client, table_id, &schema, &plan, &sink, &reply_schema)?;
+    let count = commit_rmw_or_buffer(client, &table_name, table_id, schema, |client| {
+        let matched = resolve_where_matches(client, table_id, schema, &plan, &sink, &reply_schema)?;
         let pks = matched.pks;
         let count = pks.len();
         let write = (count > 0).then(|| RmwWrite {
-            batch: retraction_batch(&schema, pks),
+            batch: retraction_batch(schema, pks),
             mode: WireConflictMode::Update,
         });
         Ok(RmwBuild { count, write })

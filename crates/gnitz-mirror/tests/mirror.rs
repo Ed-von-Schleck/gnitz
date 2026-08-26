@@ -13,7 +13,7 @@
 
 mod support;
 
-use gnitz_core::{GnitzClient, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, ReadTarget, Schema, ZSetBatch};
 use gnitz_engine_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_mirror::Mirror;
 use gnitz_test_harness::ServerHandle;
@@ -327,13 +327,97 @@ fn f64_of(b: &[u8]) -> f64 {
 // The round trip
 // ---------------------------------------------------------------------------
 
+/// A registered view is described out of the local registration; an unregistered
+/// name delegates. The planner asks for exactly one descriptor per relation, so
+/// this call is what keeps a mirrored SELECT round-trip-free.
+#[test]
+fn a_registered_view_is_described_locally() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 10);
+    let (keyed, _) = fx.mirror_both();
+    fx.quiesce();
+
+    let m = fx.mirror.as_mut().unwrap();
+    let before = m.client_mut().requests_sent();
+    let desc = ReadTarget::describe_relation(m, "s", "v_keyed")
+        .expect("a registered view describes")
+        .expect("and is present");
+    assert_eq!(
+        m.client_mut().requests_sent(),
+        before,
+        "describing a registered view must issue no request"
+    );
+    assert_eq!(desc.tid, keyed, "the copy is held under the server's id");
+    assert!(desc.class.is_view());
+    assert!(desc.delta, "only a fed view can be mirrored");
+    assert!(!desc.replicated, "a resolve reports replication for a base table alone");
+    assert!(desc.indexes.is_empty(), "only a base table may own an index");
+
+    // An unregistered relation goes upstream: one RESOLVE, answered by the server.
+    let before = m.client_mut().requests_sent();
+    let delegated = ReadTarget::describe_relation(m, "s", "t")
+        .expect("a delegated describe")
+        .expect("and the table is present");
+    assert_eq!(
+        m.client_mut().requests_sent() - before,
+        1,
+        "a delegated describe costs one RESOLVE"
+    );
+    assert!(!delegated.class.is_view());
+}
+
+/// A `CREATE VIEW` over a mirrored view binds the server's id, not the local
+/// registration's. The registration is only as fresh as the last poll, and this
+/// statement writes a durable catalog row against it. The view is recreated
+/// upstream under a fresh id here; the new view must read that one.
+#[test]
+fn a_view_created_over_a_mirrored_view_binds_the_servers_id() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 10);
+    fx.mirror_both();
+    fx.quiesce();
+
+    let live = query(&mut fx.direct, "s", "SELECT a, b FROM v_keyed").1.len();
+    assert!(live > 0, "the differential needs rows to differ over");
+
+    // Recreate the mirrored view upstream: same name, fresh id. Nothing tells the
+    // mirror, so its registration still binds the retired one.
+    sql(&mut fx.direct, "s", "DROP VIEW v_keyed");
+    sql(
+        &mut fx.direct,
+        "s",
+        &format!("CREATE VIEW v_keyed WITH (delta = '{FEED}') AS SELECT a, b, v, f, body FROM t WHERE v >= 0"),
+    );
+
+    {
+        let m = fx.mirror.as_mut().unwrap();
+        let before = m.client_mut().requests_sent();
+        let mut planner = gnitz_sql::SqlPlanner::new(m, "s");
+        planner
+            .execute("CREATE VIEW over_mirror AS SELECT a, b FROM v_keyed")
+            .expect("a view over the recreated relation");
+        drop(planner);
+        assert!(
+            m.client_mut().requests_sent() > before,
+            "a DDL statement must resolve upstream"
+        );
+    }
+
+    // Bound to the retired id the new view would backfill from a relation that no
+    // longer exists and come back empty.
+    let got = query(&mut fx.direct, "s", "SELECT a, b FROM over_mirror").1.len();
+    assert_eq!(got, live, "the new view reads the live v_keyed, not the retired one");
+}
+
 /// A mirrored SELECT issues no request; a delegated one issues exactly one.
 ///
-/// The first is the falsifiable form of the local `resolve_relation` and
-/// `table_indexes`: a delegated resolve would show up as one request per
-/// statement and nothing else in this suite would notice. The second pins the
-/// statement bracket — without it the descriptor-by-id lookup misses the scope
-/// and the index probe issues a second RESOLVE, so the count reads two.
+/// The first covers the local `describe_relation`: a delegated resolve would show
+/// up as one request per statement and nothing else in this suite would notice.
+/// The second pins the statement bracket — without it the descriptor-by-id lookup
+/// misses the scope and the index probe issues a second RESOLVE, so the count
+/// reads two.
 ///
 /// Both are counts, not clocks.
 #[test]
