@@ -25,7 +25,7 @@ pub use message::{
     decode_control_block, encode_ddl_txn, encode_message_noschema_parts, encode_message_parts, encode_push_txn,
     encode_scan_multi, parse_response, send_control, Message, MessageParts,
 };
-pub(crate) use message::{parse_response_frame, recv_message, ParsedFrame};
+pub(crate) use message::{encode_control_frame, parse_response_frame, recv_message};
 pub use regions::{ViewBuffers, ZSetBatchView};
 pub use transport::{hello_handshake, ClientTransport, TransportWaker};
 pub use types::{

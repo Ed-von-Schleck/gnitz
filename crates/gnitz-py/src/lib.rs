@@ -57,21 +57,42 @@ fn classified_err(e: &(impl std::fmt::Display + ConflictClass)) -> PyErr {
     }
 }
 
-/// [`classified_err`] plus the one classification only a `ClientError` carries:
-/// an expired delta cursor, whose recovery is mechanical (bootstrap again) and so
-/// gets a name a subscriber can catch. Used by the delta reads alone — every
-/// other path goes through `to_py_err`, which has no delta cursor to speak of.
-fn delta_err(e: &ClientError) -> PyErr {
+/// [`classified_err`] plus the one outcome that is not a gnitz error at all:
+/// a blocking call the park hook aborted because a Python signal handler
+/// raised, whose `PyErr` rides the error and is re-raised as itself (a
+/// `KeyboardInterrupt` must not surface as a `GnitzError`).
+fn client_err(e: ClientError) -> PyErr {
+    match e {
+        ClientError::Interrupted(inner) => match inner.downcast::<PyErr>() {
+            Ok(py_err) => *py_err,
+            Err(other) => gnitz_err(other),
+        },
+        other => classified_err(&other),
+    }
+}
+
+/// [`client_err`] plus the one classification only a delta read carries: an
+/// expired cursor, whose recovery is mechanical (bootstrap again) and so gets
+/// a name a subscriber can catch.
+fn delta_err(e: ClientError) -> PyErr {
     match e {
         ClientError::DeltaExpired => GnitzDeltaExpiredError::new_err(e.to_string()),
-        other => classified_err(other),
+        other => client_err(other),
+    }
+}
+
+/// [`client_err`] for the SQL layer's error, which wraps a `ClientError`.
+fn sql_err(e: gnitz_sql::GnitzSqlError) -> PyErr {
+    match e {
+        gnitz_sql::GnitzSqlError::Exec(inner) => client_err(inner),
+        other => classified_err(&other),
     }
 }
 
 /// Map a client error to a Python exception — the default mapping, beside
 /// [`delta_err`] for a path that can raise an expired cursor.
 fn to_py_err<T>(res: Result<T, ClientError>) -> PyResult<T> {
-    res.map_err(|e| classified_err(&e))
+    res.map_err(client_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -1765,18 +1786,37 @@ impl PyGnitzClient {
             .ok_or_else(|| GnitzError::new_err("client already closed"))
     }
 
+    /// Wrap a fresh client with the park hook that makes its blocking calls
+    /// Ctrl-C-interruptible: a signal handler that raises aborts the call with
+    /// its exception, which `client_err` re-raises as itself.
+    fn wrap(mut client: GnitzClient) -> Self {
+        client.set_park_hook(Some(Box::new(|| {
+            Python::attach(|py| py.check_signals()).map_err(|e| ClientError::Interrupted(Box::new(e)))
+        })));
+        PyGnitzClient { inner: Some(client) }
+    }
+
     /// Run one blocking client call: check the client is open, drop the GIL
-    /// across it, and map the failure to a Python exception (a retryable OCC
-    /// conflict to `GnitzConflictError`). What a blocking method takes unless it
-    /// needs its own error mapping — the delta reads and `execute_sql` spell the
-    /// same `detach` out so they can raise their own classes.
+    /// across it, and map the failure with `map` — [`client_err`] unless the
+    /// path raises a class of its own.
+    fn call_with<T: Send, E: Send>(
+        &mut self,
+        py: Python<'_>,
+        map: impl FnOnce(E) -> PyErr,
+        f: impl FnOnce(&mut GnitzClient) -> Result<T, E> + Send,
+    ) -> PyResult<T> {
+        let c = self.live()?;
+        py.detach(move || f(c)).map_err(map)
+    }
+
+    /// [`Self::call_with`] under the default error mapping (a retryable OCC
+    /// conflict to `GnitzConflictError`). What a blocking method takes.
     fn call<T: Send>(
         &mut self,
         py: Python<'_>,
         f: impl FnOnce(&mut GnitzClient) -> Result<T, ClientError> + Send,
     ) -> PyResult<T> {
-        let c = self.live()?;
-        to_py_err(py.detach(move || f(c)))
+        self.call_with(py, client_err, f)
     }
 }
 
@@ -1787,7 +1827,7 @@ impl PyGnitzClient {
         // Connect + HELLO are blocking syscalls (up to a 10 s timeout for a
         // `tls://` target); drop the GIL across them as every other blocking
         // method here does.
-        to_py_err(py.detach(|| GnitzClient::connect(socket_path))).map(|c| PyGnitzClient { inner: Some(c) })
+        to_py_err(py.detach(|| GnitzClient::connect(socket_path))).map(PyGnitzClient::wrap)
     }
 
     /// The client's current OCC basis (the running max of observed server
@@ -1946,10 +1986,7 @@ impl PyGnitzClient {
         include_hidden: bool,
     ) -> PyResult<Py<PyDeltaReply>> {
         let schema = Arc::clone(&resolve_py_schema(py, view_schema)?.borrow().rust);
-        let client = self.live()?;
-        let out = py
-            .detach(|| client.delta_bootstrap(view_id, &schema))
-            .map_err(|e| delta_err(&e))?;
+        let out = self.call_with(py, delta_err, |c| c.delta_bootstrap(view_id, &schema))?;
         delta_reply_to_py(py, schema, out, include_hidden)
     }
 
@@ -1980,10 +2017,7 @@ impl PyGnitzClient {
     ) -> PyResult<Py<PyDeltaReply>> {
         let schema = Arc::clone(&resolve_py_schema(py, reply_schema)?.borrow().rust);
         let cursor = gnitz_core::DeltaCursor { tag, tick };
-        let client = self.live()?;
-        let out = py
-            .detach(|| client.delta_poll(view_id, cursor, &schema))
-            .map_err(|e| delta_err(&e))?;
+        let out = self.call_with(py, delta_err, |c| c.delta_poll(view_id, cursor, &schema))?;
         delta_reply_to_py(py, schema, out, include_hidden)
     }
 
@@ -2055,10 +2089,7 @@ impl PyGnitzClient {
     #[pyo3(signature = (sql, schema_name = "public"))]
     pub fn execute_sql(&mut self, py: Python<'_>, sql: &str, schema_name: &str) -> PyResult<Py<PyAny>> {
         // Plan + execute (all wire I/O, no Python) with the GIL released.
-        let client_ref = self.live()?;
-        let results = py
-            .detach(|| SqlPlanner::new(client_ref, schema_name).execute(sql))
-            .map_err(|e| classified_err(&e))?;
+        let results = self.call_with(py, sql_err, |c| SqlPlanner::new(c, schema_name).execute(sql))?;
         sql_results_to_py(py, results)
     }
 }
@@ -2616,8 +2647,9 @@ fn async_io_loop(
             }
         }
 
-        // Send the whole batch as one writev sequence.
-        if let Err(e) = session.send_batch(&parts) {
+        // Send the whole batch through the session's outbound queue; `parts` is
+        // drained and keeps its capacity for the next cycle.
+        if let Err(e) = session.send_batch(&mut parts) {
             fail_all(
                 &rx,
                 &mut pending,

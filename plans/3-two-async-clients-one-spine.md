@@ -1,12 +1,13 @@
 # 3 — Two async clients over one spine, and no I/O thread
 
-The connection is a sans-io state machine — `submit` queues a request,
-`step(ready)` does the non-blocking I/O the driver says the fd will accept,
-returns the slots that completed, and returns only once nothing buffered can
-advance another one, `interest()` reports which directions to watch, and
-`close()` abandons every pending slot, returns them, and refuses further work.
-Nothing in it waits. Two async clients are added over it: a Rust one for any
-runtime, and an asyncio one that replaces `gnitz.aio`'s background I/O thread.
+`Session` is a sans-io state machine — `submit` encodes against the
+connection's schema cache and registers a slot, `step(ready)` does the I/O the
+driver says the fd will accept and returns the slots that completed, returning
+only once nothing buffered can advance another one, `interest()` reports which
+directions to watch, `close()` abandons every pending slot, returns them, and
+refuses further work. Nothing in it waits. Two async clients are added over it:
+a Rust one for any runtime, and an asyncio one that replaces `gnitz.aio`'s
+background I/O thread.
 
 Measured, 400 pushes of 4 rows × 10 columns on one connection, `strace -f -c`,
 interpreter startup subtracted:
@@ -28,20 +29,28 @@ OS thread and 480 KiB of RSS before a byte is sent — `sync_channel(4096)`
 eagerly allocates `4096 × size_of::<Slot<IoRequest>>()` = 491,520 B.
 
 The 808 `recvfrom` on the `gather` row is two syscalls per reply frame, because
-the current reader takes the 4-byte header and the payload separately. The
-connection's reader over-reads into a 64 KiB scratch, so a run of pipelined push
-ACKs — 4 + `CTRL_BLOCK_SIZE_NO_BLOB` = 260 bytes each — drains ~252 per read.
+the thread reads through `recv_framed`, which takes the 4-byte header and the
+payload separately. The spine's reader over-reads into a 64 KiB scratch, so a
+run of pipelined push ACKs — 4 + `CTRL_BLOCK_SIZE_NO_BLOB` = 260 bytes each —
+drains ~252 per read.
 
-Acceptance: `await`-in-a-loop reaches 4 syscalls per operation; `gather` falls
-below 1; futex and `sendto` reach zero on both. Neither has an assertion today.
+**Acceptance.** `await`-in-a-loop costs 5 syscalls per operation: `writev`,
+`recvfrom`, one blocking `epoll_wait`, and two zero-timeout `epoll_wait`s that
+are asyncio's own turn cost — `_run_once` selects with `timeout = 0` whenever a
+handle is ready, and each operation schedules two handles: the deferred flush,
+and the task wake-up `Future.set_result` posts. They cannot be folded: a handle
+scheduled during an iteration runs in the next one. `gather` costs fewer than 1
+per operation. Futex and `sendto` reach zero on both. Neither has an assertion
+today; the blocking client has one (`three_syscalls_per_push_*` in
+`spine_driver.rs`), and its `strace -f -c` harness is the pattern.
 
 ## The executor contract
 
 **The spine is the maximal shared unit, and it is shared by all three clients.**
 It owns request encoding, the schema LRU, warm/cold push packing, positional
-correlation, reply-train reassembly, the retry below, the 4096-request in-flight
-cap, and `STATUS_*`→`ClientError` classification. An executor owns exactly two
-things: how it waits, and what primitive it resolves.
+correlation, reply-train reassembly, the schema-mismatch resend below, the
+`MAX_IN_FLIGHT` cap, and `STATUS_*`→`ClientError` classification. An executor
+owns exactly two things: how it waits, and what primitive it resolves.
 
 That line is where it is because **each runtime owns its own reactor**. Only one
 thing can be blocked on a fd set; when asyncio is running, its loop *is* the
@@ -62,162 +71,242 @@ value", and three copies of that policy drift. `ClientError` is not `Clone`
 (`ProtocolError` carries a `std::io::Error`), so `close` returns the slot ids
 and the executor holds the cause.
 
-## Pushes pack warm, and the schema retry quiesces
+Three spine surfaces the blocking verbs keep private today become `pub`, because
+both async clients need them and each would otherwise re-derive them:
+
+- `Session::scan_reply(tid, ReplyTrain) -> ScanReply` (today's `narrow_train`):
+  the schema the train carried else the cached one, its rows, the terminal
+  watermark. `ReplyTrain.schema` is only the in-frame block, so a warm scan
+  reply is unusable without this fallback.
+- `Request::scan(tid)` and `Request::seek(tid, &PkTuple)` constructors, so a
+  driver never spells `FLAG_SEEK` and `split_wire` itself; `seek_roundtrip`
+  uses them too.
+- RESOLVE split into `Session::resolve_request(RelTarget) -> Vec<u8>` (the
+  frame; submitted as `Request::Uncorrelated`) and
+  `Session::resolve_reply(ReplyTrain) -> Option<(u64, Arc<Schema>, RelDescriptorBlob)>`,
+  which merges the descriptor's FKs into the schema and installs it under the
+  **live** tid. The slot is uncorrelated, so `feed` absorbs nothing for it —
+  the install is this method's, not the accumulator's. `RelTarget` becomes
+  `pub`. `RelDescriptor::from_resolve(tid, schema, blob)` is the pure
+  construction `GnitzClient::fetch_descriptor` performs today, moved onto the
+  type so the async handle builds the same descriptor.
+
+## Pushes pack warm, and a mismatch resends
 
 `PyAsyncTransport::push` encodes with `Some((schema, batch))` unconditionally —
 bare `FLAG_PUSH`, no version stamp; `gnitz-py` has no reference to
 `schema_version`, `schema_cache` or `wire_flags`. Measured off the wire, async
 ships 1428 bytes/push against sync's 780 for 4 rows × 10 columns; the 648-byte
 delta is exactly the schema block (88 fixed + 56 per column × 10), 45% of the
-frame. Packing on the spine against the connection's own cache removes it, and
-both async clients get it by construction.
+frame. `submit`'s push arm already packs warm against the connection's own
+cache, so both async clients get it by construction.
 
-That makes `STATUS_SCHEMA_MISMATCH` reachable on an async path for the first
-time: the server's `decode_push_frame` raises it only for
-`has_data && !has_schema`, and every async push sets `FLAG_HAS_SCHEMA` today. So
-a retry is required.
+That makes `STATUS_SCHEMA_MISMATCH` reachable on an async path: the server's
+`decode_push_frame` raises it only for `has_data && !has_schema`, and every
+async push sets `FLAG_HAS_SCHEMA` today. A mismatched push **commits nothing**
+— `decode_push_frame` returns before the commit path — and a cold frame cannot
+draw it. So the spine resends cold, and the only thing to get right is order:
+a relation's pushes must commit in submission order.
 
-A mismatched push **commits nothing** — `decode_push_frame` returns before the
-commit path — so a retry re-orders the relation's history only if something for
-that relation committed *after* it. That is the one condition to watch, and it
-is directly observable while draining.
+**Every push at the stale stamp is resent at once, in order, at the tail.**
+A push slot records the version it was stamped with (`0` for cold). On a
+`STATUS_SCHEMA_MISMATCH` reply to a push slot for relation `T` at stamp `v`:
 
-**Quiesce, retry a contiguous run, resume.** On the first
-`STATUS_SCHEMA_MISMATCH` for a relation: evict the cache entry immediately, stop
-flushing, and drain the outstanding replies, collecting every further mismatch
-for that relation. Then re-send every mismatched push cold, at the *front* of
-the outbound queue and in submission order, and only then resume flushing what
-queued behind them.
+1. Evict `T`'s cache entry if it still holds `v`. A scan reply may already have
+   installed a newer block; that one stays.
+2. Let `S` be every pending push slot for `T` at stamp `v`, in queue order —
+   the replying head first, then sent-but-unanswered, then still-queued.
+   Every one of them will draw the same reply: the server's version is not `v`,
+   `submit` encodes at submit time, and the cache's only writer is reply
+   processing.
+3. If a push for `T` that is **not** at stamp `v` — a different stamp, or cold —
+   is pending behind the first member of `S`, nothing is resent: the head
+   completes with `ClientError::SchemaMismatch`, and the rest of `S` complete as
+   their own replies say. Resending `S` behind that push would reorder the
+   relation's history. It arises when a reply processed *between* two submits
+   refreshed the stamp: `scan(T)` and `push(T, v=10)` submitted together, a
+   concurrent `ALTER TABLE T` upstream, the scan's reply (first, positionally)
+   installing the new version, then `push(T, v=20)` encoded warm at it. Failing
+   is what the async path does for every mismatch today, so it takes nothing
+   away.
+4. Otherwise, for each member of `S` in order: enqueue its cold frame at the
+   tail and register a new pending entry carrying the **same** `SlotId`; mark
+   the original superseded. The head's own entry is first, and it is popped now
+   and reported to nobody.
+5. A superseded entry's reply is consumed and discarded, whatever its status —
+   it keeps positional correlation and nothing else. The one status it cannot
+   carry is `STATUS_OK`: the server's version counter only moves forward
+   (`invalidate_col_names` increments, wrapping 65535 → 1), so a stamp it has
+   refused is not accepted again short of 65,534 further ALTERs on one
+   relation inside one server boot.
 
-The eviction comes first because it bounds the recovery at one round: a cold
-frame sets `FLAG_HAS_SCHEMA` and cannot re-trigger, and any push for that
-relation submitted while the drain runs finds no cache entry and is encoded cold
-too. Evicting after the drain would let a push submitted during it inherit the
-stale stamp, mismatch in turn, and start a second round.
+Nothing pauses, and there is no drain phase: the resends are appended in one
+pass, so a push submitted afterwards queues behind all of them, and it is
+encoded cold because the eviction came first. Submitting `A(pk=1, v=10)` and
+`B(pk=1, v=20)` warm at a stale stamp, then `C(pk=1, v=30)` after `A`'s
+mismatch, commits `A'`, `B'`, `C` — the row ends at 30. A retry that resends
+each push as its own mismatch arrives commits `A'`, `C`, `B'`. That the
+still-queued members of `S` go out warm and mismatch before their cold copies
+is bytes, not history: they commit nothing.
 
-**If any push for that relation ACKs `STATUS_OK` after the first mismatch, the
-mismatched slots fail with `ClientError::SchemaMismatch` rather than being
-retried.** They ordinarily cannot — every in-flight push for a relation carries
-the same stamp, because `submit` encodes at submit time and the cache's only
-writer is reply processing. But they can when a reply processed *between* two
-submits refreshes that stamp: `scan(T)` and `push(T, v=10)` submitted together,
-a concurrent `ALTER TABLE T` upstream, the scan's reply (which arrives first,
-positionally) installing the new version, then `push(T, v=20)` encoded warm at
-the new version and committed. Retrying the v=10 push behind it leaves the row
-at 10. Failing there is what the async path does for every mismatch today, so it
-takes nothing away.
+A resend counts in `requests_sent` and in `pending.len()` — so the cap is
+transiently tighter by the number of superseded entries still awaiting their
+reply — and `close()` reports each `SlotId` once, skipping superseded entries.
 
-Quiescing is what a contiguous run needs, and a tail retry without it corrupts.
-`WireConflictMode::Update = 0` is retract-and-insert, last-write-wins. Pipeline
-`A(pk=1, v=10)` and `B(pk=1, v=20)`, both warm, both mismatching; between
-observing A's mismatch and B's, the caller submits `C(pk=1, v=30)`. A tail retry
-appends `A'`, then `C`, then `B'`, and the row ends at 20 though 30 was
-submitted last. Retrying "in place" is not a third option: on a stream socket a
-retry frame is at the tail by construction.
+**The retained payload is the submitter's, and it is shared, not copied.**
+`MessageParts.data` becomes `Arc<Vec<u8>>` — the encoded data block is the one
+allocation a push makes that the cold frame reuses byte-for-byte:
+`encode_parts` builds it as `encode_wal_block(schema, target_id as u32, batch)`,
+reading no flags, and the cold and warm routes produce identical
+`seek_pk` / `seek_col_idx` / extra, so the two frames differ only in `ctrl` and
+the schema block. The push slot retains `(Arc<Vec<u8>>, Arc<Schema>, base
+flags)`; the cold `ctrl` is rebuilt from the base flags through
+`encode_control_block`, which is `pub(crate)` already, and the schema block
+from the `Arc<Schema>` — which is **not** the cached block: the warm gate is
+`types_match`, which ignores column names, so the cache can hold a
+type-compatible schema with different names than the one the rows were encoded
+against. A control-only frame's `data` is an empty `Arc<Vec<u8>>` — one small
+allocation, no buffer. An empty batch is not a hazard: `encode_parts` filters it
+out of `data`, so `has_data` is false and the server never reaches the mismatch
+branch.
 
-The re-send needs no re-encode of the rows. `encode_parts` builds the data block
-as `encode_wal_block(schema, target_id as u32, batch)`, reading no flags, and
-the cold and warm routes produce identical `seek_pk` / `seek_col_idx` / extra —
-`PkTuple::EMPTY` splits to `(0, &[])` and `encode_message_noschema_parts` passes
-`0, 0, &[]` — so the two frames carry a byte-identical data block and differ
-only in `ctrl` and the schema block. `encode_control_block` is `pub(crate)`, so
-rebuilding the control block needs no new API. An empty warm push is not a
-hazard: `encode_parts` filters an empty batch out of `data`, so `has_data` is
-false and the server never reaches the mismatch branch.
-
-**The retry payload is the submitter's.** The push variant of `Request` carries
-`Option<Arc<Schema>>` and the slot retains
-`(MessageParts, Option<Arc<Schema>>, client_id, base_flags)`. Both async clients
-already own an `Arc<Schema>` — `PyZSetBatch.schema` is one and
-`AsyncClient::push` takes one — so they pay nothing. **The blocking client
-passes `None`**, keeps its own in-place retry, and arms none of this: it has one
-operation outstanding and nothing to order against. Threading the retry
-uniformly would make `GnitzClient::push`, whose signature takes `&Schema`, pay
-`Arc::new(schema.clone())` — an `Arc`, a `Vec` and one `String` per column — on
-every call to arm machinery it can never use. A slot carrying `None` that draws
-a mismatch simply completes with `ClientError::SchemaMismatch`.
-
-The cached block is not a substitute for the caller's schema: the warm path is
-gated on `types_match`, which ignores column names, so the cache can hold a
-type-compatible schema with different names than the one the caller encoded
-against.
-
-## `Readiness`, and where the tokio impl lives
+The push variant of `Request` carries its schema as
 
 ```rust
-/// Waits for any of `interest` on the connection's fd, and reports which
-/// directions became ready — the set the caller then hands to `step`.
-///
-/// The caller guarantees it drives every direction this returns to a drained
-/// fd before polling again — an implementation may therefore clear a cached
-/// readiness flag eagerly.
-pub trait Readiness {
-    fn poll_ready(&mut self, cx: &mut Context<'_>, interest: Interest)
-        -> Poll<io::Result<Interest>>;
+pub enum PushSchema<'a> {
+    Borrowed(&'a Schema),
+    Shared(Arc<Schema>),
 }
 ```
 
-Returning the ready set rather than `()` is what lets `Connection<R>` call
+`Shared` is what makes a slot resendable. Both async clients already own an
+`Arc<Schema>` — `PyZSetBatch.schema` is one and `AsyncClient::push` takes one —
+so they pay a refcount bump. **The blocking client passes `Borrowed`** and keeps
+its own retry in `roundtrip_push`: it has one live operation and nothing to
+order against, and threading `Shared` through `GnitzClient::push`, whose
+signature takes `&Schema`, would make every call pay `Arc::new(schema.clone())`
+— an `Arc`, a `Vec` and one `String` per column — to arm machinery it can never
+use. A `Borrowed` slot that draws a mismatch completes with
+`ClientError::SchemaMismatch`, which is what `roundtrip_push` matches on. Its
+retry then needs no `cold` flag: it evicts the entry and resubmits, and a
+relation with no cache entry encodes cold. The `cold` field on `Request::Push`
+goes.
+
+## `Readiness`
+
+```rust
+/// A runtime's readiness source for the connection's fd.
+///
+/// Waits for any direction in `interest`. Once at least one is ready, runs
+/// `io` with the ready set — the set the caller hands to `step` — and `io`
+/// returns, with its result, the directions it exhausted: proven drained, or
+/// refused with `WouldBlock`. An implementation that caches readiness forgets
+/// exactly those directions, as observed *before* `io` ran.
+pub trait Readiness {
+    fn poll_io<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        interest: Interest,
+        io: impl FnOnce(Interest) -> (T, Interest),
+    ) -> Poll<io::Result<T>>;
+}
+```
+
+Passing the ready set rather than `()` is what lets `Connection<R>` call
 `step(ready)` instead of `step(READ | WRITE)`: a direction that did not fire
 would otherwise cost a syscall per wakeup to discover, which is the same
-speculative read the blocking client avoids. `AsyncFd` exposes
-`poll_read_ready` and `poll_write_ready` separately, so the union is what the
-impl already has to compute.
+speculative read the blocking client avoids.
 
-The drained-before-repolling contract is not a convenience; it is what makes a
-correct tokio impl possible. `AsyncFd` caches readiness with edge-triggered
-semantics: once epoll reports the fd readable, `poll_read_ready` returns `Ready`
-immediately until an `AsyncFdReadyGuard` clears the flag. Poll, drop the guard,
-do the I/O yourself, hit `EAGAIN`, poll again → `Ready` again → a busy loop at
-100% CPU. tokio's own guidance is the same rule stated from the other side:
-attempt the I/O first and poll for readiness only when it fails with
-`WouldBlock`.
+The closure shape, rather than a `poll_ready` that returns the set, is forced
+by tokio's `AsyncFd`, which caches readiness with edge-triggered semantics: once
+epoll reports the fd readable, `poll_read_ready` returns `Ready` until an
+`AsyncFdReadyGuard` clears the flag. Which directions may be cleared, and when,
+differ:
 
-Clearing eagerly inside `poll_ready` is correct *only* under that contract.
-`step(READ)` returns only with the source drained — either an explicit `EAGAIN`
-or the short read that proves the queue is empty — and with nothing buffered
-that could advance a slot, so the flag genuinely no longer describes the fd and
-the executor never has cause to skip a park. A short
-read is as good as an `EAGAIN` here for the same reason it is on the blocking
-path: it leaves the kernel queue empty, so the next arrival is a fresh edge.
-Clearing eagerly without the contract is worse than a busy loop: it waits for an
-edge that may never come while data sits in the buffer. The trait therefore
-needs no `clear_ready` method, and `async-io`'s `Async<T>`, whose
-`poll_readable` re-registers on every call, implements it in ten lines with
-nothing to clear.
+- **Read is exhausted by every step.** `step(READ)` returns only with the
+  source drained — an explicit `EAGAIN`, or the short read that proves the
+  queue was empty — and nothing buffered that could advance a slot. A short
+  read is as good as an `EAGAIN` here: `recv` on a `SOCK_STREAM` copies until
+  the buffer is full or the receive queue is empty. Measured against a queue
+  quiesced on `FIONREAD` with a probe buffer strictly larger than it: no short
+  read left a byte behind, on AF_UNIX or TCP, at every queued size from 260 B
+  to 1 MiB, across 300 multi-burst trials on each transport. Data arriving
+  after the read returns is a fresh edge — `sk_data_ready` fires on every
+  arrival — which is what the cleared flag then waits for.
+- **Write is exhausted only by `WouldBlock`**, which after a step is exactly
+  `interest().write` still set: `flush` loops until the queue is empty or the
+  fd refuses. Clearing it after a flush that *succeeded* hangs on TCP. The
+  kernel's own comment (`net/core/stream.c`, `sk_stream_wait_memory`): "When
+  TCP receives ACK packets that make room, tcp_check_space() only calls
+  tcp_new_space() if SOCK_NOSPACE is set" — and `SOCK_NOSPACE` is set by the
+  refusal, so a socket that never refused never produces an `EPOLLOUT` edge.
+  What does re-set the flag is the next *read* event — epoll reports an item's
+  whole current mask (`ep_item_poll`, masked by the interest set) on every
+  wakeup — so a submit issued while a reply is outstanding would wait for that
+  reply before it could flush: pipelining destroyed rather than a hang, and
+  invisible to a test that submits everything before the first flush. AF_UNIX
+  edges on every consumed skb (`unix_write_space`), which only hides it.
+
+The guard's tick makes the before/after distinction safe: `clear_readiness`
+runs `set_readiness(Tick::Clear(event.tick), …)`, which returns without clearing
+when the driver has since set readiness under a newer tick. So an edge that
+arrives between the poll and the clear is kept, and a clear of the guard
+obtained *before* `io` never discards an event `io` did not see. The tokio impl
+is therefore: poll `poll_read_ready` / `poll_write_ready` for the directions in
+`interest`; if neither is `Ready`, `Pending`; else run `io` with the union, and
+`clear_ready` on each guard whose direction `io` reports exhausted. The two
+guards borrow the `AsyncFd` immutably and coexist. `Connection`'s `io` is
+`step(ready)`, reporting `read: ready.read, write: ready.write &&
+interest().write`.
+
+`async-io`'s `Async<T>`, whose `poll_readable` re-registers on every call,
+implements the trait with nothing to clear: poll, run `io`, return. It is the
+witness that the trait is runtime-neutral; it is not shipped.
 
 `AsyncFd` requires the fd to be non-blocking, which the connection's own
 `mark_established` guarantees, and it does not close the fd — the inner
 `AsRawFd` type does. So the impl wraps the raw fd in a newtype with no `Drop`;
-the transport owns the fd and closes it.
+the transport owns the fd and closes it. `AsyncFd::new` must run inside a tokio
+runtime context, so `connect` must be called from one.
 
-**The tokio impl ships as `gnitz-tokio`, a new workspace member, not as a
-`gnitz-core` feature.** `gnitz-core` gets no async-runtime dependency, ever.
-This is not tidiness: `gnitz-py` depends on `gnitz-core`, and the workspace is
+## Where it lives: `gnitz-async`
+
+**One new workspace member, `gnitz-async`, holds `Readiness`, `Connection<R>`,
+`AsyncClient`, and the tokio impl behind a `tokio` feature that is on by
+default.** `gnitz-core` gets no async dependency, ever, and nothing else gains a
+`tokio` feature: `gnitz-py` depends on `gnitz-core`, and the workspace is
 `resolver = "2"`, which splits feature unification for build-dependencies,
-proc-macros and inactive target-dependencies but **not** for a normal dependency
-shared by two workspace members in one build. A `gnitz-core/tokio` feature
-enabled anywhere in `cargo clippy --workspace --all-targets` — which includes
-`gnitz-py` — unifies tokio into the pyo3 extension's `gnitz-core`, while
-`maturin develop` (run from `crates/gnitz-py`) resolves without it. Two builds
-of one crate with different feature sets. A separate leaf crate makes that
-unrepresentable, and its tests then run under a plain `cargo test --workspace`
-with no Makefile flag.
+proc-macros and inactive target-dependencies but **not** for a normal
+dependency shared by two workspace members in one build. A `gnitz-core/tokio`
+feature enabled anywhere in `cargo clippy --workspace --all-targets` — which
+includes `gnitz-py` — would unify tokio into the pyo3 extension's `gnitz-core`,
+while `maturin develop` (run from `crates/gnitz-py`) resolves without it: two
+builds of one crate with different feature sets. Nothing depends on
+`gnitz-async`, so a feature on it unifies into nothing; a runtime other than
+tokio takes it with `default-features = false` and implements the ten-line
+trait. Its tests run under a plain `cargo test --workspace`; the tokio-bound
+ones are `#[cfg(feature = "tokio")]`.
+
+Dependencies: `gnitz-core`, `futures-channel` (the bounded mpsc and the
+oneshot) and `futures-core` (the `Stream` trait `Receiver::poll_next` needs),
+`tokio` with `net` + `rt` under the feature, `tokio`'s `rt-multi-thread` +
+`macros` and `gnitz-test-harness` as dev-dependencies. `std::future::poll_fn`
+is the only other async primitive used. No `futures-util`.
 
 `CLAUDE.md` gains a crate-table row:
 
 ```
-| `gnitz-tokio` | The `Readiness` impl that puts the async client on tokio's reactor | `core` |
+| `gnitz-async` | The Rust async client: a `Connection` future over any runtime's `Readiness`, tokio's impl by default | `core` |
 ```
 
-and `crates/Cargo.toml` a `"gnitz-tokio"` member.
+and `crates/Cargo.toml` a `"gnitz-async"` member.
 
 ## The Rust async client
 
 ```rust
 /// Owns the connection and the request channel; drains, steps, resolves.
 pub struct Connection<R: Readiness> { /* … */ }
-impl<R: Readiness> Future for Connection<R> { type Output = Result<(), ClientError>; }
+impl<R: Readiness + Unpin> Future for Connection<R> { type Output = Result<(), ClientError>; }
 
 /// A channel sender and a client id. Send + Sync + Clone; owns no connection.
 #[derive(Clone)]
@@ -243,26 +332,52 @@ impl AsyncClient {
         -> Result<Option<Arc<RelDescriptor>>, ClientError>;
     pub fn client_id(&self) -> u64;
 }
+
+/// `#[cfg(feature = "tokio")]`: `connect` with the `AsyncFd` source.
+pub fn connect(target: &str) -> Result<(AsyncClient, Connection<TokioReadiness>), ClientError>;
 ```
 
 `connect` is a plain `fn` because it blocks; an `async fn` that blocks its
 executor says the opposite in its type.
 
+What crosses the channel is owned — `Request<'_>` borrows, and the borrow ends
+at `submit`:
+
+```rust
+enum Op {
+    Push { tid: u64, schema: Arc<Schema>, batch: ZSetBatch },
+    Scan(u64),
+    Seek(u64, PkTuple),
+    ScanMany(Vec<u64>),
+    Resolve(String),          // the canonical "schema.name"
+}
+struct Submission { op: Op, reply: oneshot::Sender<Result<Reply, ClientError>> }
+```
+
+`Connection` encodes on its own task at `submit` — the push arm submits
+`PushSchema::Shared(schema)` and validates the batch first, as
+`push_with_mode` does — and keeps `SlotId → oneshot::Sender` until the slot
+completes. Each verb's `async fn` sends its `Submission`, awaits the receiver,
+and narrows the `Reply`: `terminal.seek_pk as u64` for a push (conflict mode
+`Update`, as the asyncio push), `scan_reply`
+for a scan or seek, `scan_reply` per tid for `scan_many`, `resolve_reply` then
+`RelDescriptor::from_resolve` for a resolve. The narrowing needs the session,
+so it runs on the driver before the oneshot is fired; the oneshot carries the
+narrowed value.
+
 **`resolve` is on the surface** because without it the handle cannot address a
 relation at all — every other verb takes a `tid` — and the alternative is
-opening a second, blocking connection just to look one up. It is a single
-control-frame round trip whose only client-side effect is installing the reply's
-schema block under the live tid, which the spine's cache absorption already
-does; the descriptor is then built from the reply by the same pure construction
-`GnitzClient::fetch_descriptor` performs, which reads no client state. It is
-**always** a round trip: `GnitzClient::resolve` first consults the
-statement-scoped `CatalogSnapshot`, and an async handle has no statement bracket
-to scope one to. `PkTuple` is `Copy`, so `seek` takes it by value across the
-channel.
+opening a second, blocking connection just to look one up. It is **always** a
+round trip: `GnitzClient::resolve` first consults the statement-scoped
+`CatalogSnapshot`, and an async handle has no statement bracket to scope one
+to. `PkTuple` is `Copy`, so `seek` takes it by value.
 
 **`AsyncClient` is `Clone`.** It is a channel sender; every method takes
 `&self`; cloning is what a shared handle should cost. It has no `&mut self`
-method to protect precisely because of what is left off it.
+method to protect precisely because of what is left off it. Each verb clones
+the sender for its own send — `Sender::poll_ready` takes `&mut self` — which is
+an atomic increment and decrement, and lends the channel one extra slot for
+the call's duration.
 
 **Not on the async surface: `execute_sql`, `transaction`, DDL and id
 allocation.** A statement is a plan followed by an interleaved
@@ -275,17 +390,25 @@ allocate-then-canonicalize-then-write sequences. All stay on the blocking
 client. A `Mirror` also stays there: it is `!Send`, so `AsyncClient` will never
 feed one.
 
-The request channel is bounded at **256**. The spine's 4096-request cap is the
-real in-flight bound and dominates memory; the channel only hands work across,
-and a suspended `push` costs nothing — no thread, no allocation — so the depth
-need only be enough that a burst rarely round-trips through the scheduler
-mid-flight. `Connection` drains the channel into `submit` while the spine is
-under its cap, so `push` suspends on a full channel rather than seeing the cap's
-error.
+The request channel is `futures_channel::mpsc::channel(256)`. The spine's
+`MAX_IN_FLIGHT` is the real in-flight bound and dominates memory; the channel
+only hands work across, and a suspended `push` costs nothing — no thread, no
+allocation — so the depth need only be enough that a burst rarely round-trips
+through the scheduler mid-flight. `Connection` drains the channel into `submit`
+only while `pending.len() < MAX_IN_FLIGHT`, so `push` suspends on a full
+channel rather than seeing the cap's error.
 
-`Connection` erroring calls `close` and resolves every returned slot with
-that error, then completes. Dropping every `AsyncClient` closes the channel and
-ends `Connection`.
+`Connection::poll` is one loop: drain the channel while under the cap; if
+`interest()` is empty, `Pending` on the channel alone; else `poll_io` with
+`step`, resolve every completion, and go round again — it returns `Pending`
+only when both the channel and the readiness source are. A `step` error calls
+`close`, resolves every returned slot with that error, and completes with it.
+When every `AsyncClient` is dropped the channel closes and `Connection`
+completes with `Ok(())`; a `push` future that was still alive holds a borrow of
+its handle, so no listener can be left behind. Dropping a verb's future after
+its submission was sent is not cancellation: the frame is written and the
+server commits it; the oneshot's receiver is gone and the driver drops the
+result.
 
 ## The asyncio executor
 
@@ -295,65 +418,67 @@ It replaces `PyAsyncTransport` entirely: the OS thread, the `sync_channel`,
 `classify_recv_err` and `loop_result_to_py` — the contiguous ~500-line block in
 `gnitz-py/src/lib.rs` plus its `add_class` registration.
 
-**That is the last consumer of the blocking reply path, which goes with it.**
-`Session::send_batch`, `recv_push_ack` and `recv_scan` are deleted;
-`pack_scan`, `pack_seek` and `pack_scan_multi` drop to crate visibility, having
-been `pub` only for this transport, and become the spine's own encoders. The
-private path beneath them — `drain_reply_train`, `recv_cached`, `recv_checked`,
-`recv_message` — has no other caller once the spine's accumulator serves every
-`GnitzClient` verb, and goes too. So do `ClientTransport::waker`,
-`Session::waker`, `TransportWaker` and its two re-exports (`protocol/mod.rs`'s
-`pub use transport::{…}` and `lib.rs`'s prelude), whose only consumer is this
-transport's teardown; `transport/mod.rs`'s
-`test_transport_waker_unblocks_parked_recv` goes with them, and `client.rs`'s
-Send-assertion comment loses its "the async transport moves a bare `Session`
-into its I/O thread" clause.
-
-`not_null_bit_rejection.rs` drove `send_batch` + `recv_push_ack` from a plain
-`#[test]`, to skip `push_with_mode`'s client-side `ZSetBatch::validate` and ship
-a null bit under a `NOT NULL` column. It moves to the raw-wire surface
-`tls_client.rs` and `slow_client_eviction.rs` already use —
-`ClientTransport::connect`, `hello_handshake`, `encode_message_parts`,
-`send_framed_iov(&parts.segments())`, `ClientTransport::recv_framed`,
-`parse_response` — all public and all staying, with a literal client id as
-`tls_client.rs` uses. That leaves one raw-wire test surface rather than two, and
-no production entry point gated on a test feature.
-
-One pyo3 crossing per readiness event:
+**Rust owns the session, the slot map and resolution; Python owns the loop.**
+The `#[pyclass] AsyncTransport` holds the `Session`, `create_future` bound
+once, and `SlotId → (future, include_hidden)`. It exposes `fileno()`, the four
+verbs, `close()`, `client_id`, and two step entry points:
 
 ```rust
-let done = py.detach(|| conn.step(ready));  // read or flush, decode, advance
-// reacquire: for each completed slot, convert its Reply and resolve the
-// asyncio.Future this executor holds for it.
+/// The loop's reader callback: one pyo3 crossing per readable event.
+fn on_readable(&mut self, py) -> PyResult<bool>   // returns interest().write
+/// The loop's writer callback, and the deferred flush after submits.
+fn on_writable(&mut self, py) -> PyResult<bool>   // returns interest().write
 ```
 
-`ready` is `READ` from the `add_reader` callback and `WRITE` from
-`add_writer` — the loop already knows which fired, so neither callback spends a
-syscall discovering that the other direction has nothing for it.
+Each runs `let done = py.detach(|| session.step(ready))`, then, attached, for
+every completed slot converts its `Reply` with the existing `triple_to_lazy` /
+`classified_err` and calls `set_result` / `set_exception` on the slot's future
+(skipping one already `done()`: a cancelled future refuses a result). The
+`bool` is `interest().write` after the step, and it is read on **every** step,
+not only writes: on TLS a read can queue an alert or key update that
+`wants_write` then reports. A `scan_many` slot keeps its tid list beside the
+future, as the blocking `scan_multi` keeps it in its frame, so each train
+narrows under its own relation. A `step` error — the peer's EOF or reset, an
+out-of-order reply — closes the transport exactly as `Connection` does: the
+spine's `close`, every returned slot failed with that error, both callbacks
+removed. A callback the loop had already queued before the removal finds the
+session closed and `step` returns nothing.
 
-Anything per-operation must stay out of Python. That is the argument the deleted
-`dispatch` already makes for `call_soon_threadsafe` — CPython allocates a
-handle, takes the loop lock and writes the self-pipe per call — one level down:
-one GIL acquisition per readable event is independent of N, where a per-op poll
-or resolve callback on a `gather` of 1000 is 1000 of them. The
-`SlotId -> Py<PyAny>` map lives in `gnitz-py`, not the spine.
+`aio.py` arms and disarms from those booleans. The reader is armed once, at
+construction, and removed at close: an armed reader on a quiet socket costs
+nothing, while arming per operation would cost two `epoll_ctl` per operation.
+The writer is armed only while the step reported `write` — a permanently-armed
+writer callback spins the loop at 100% CPU on an always-writable fd — and
+removed the moment a step reports it clear. A submit schedules
+`loop.call_soon(on_writable)` once per idle→pending transition, not once per
+submit: a Python-side flag is raised by the submit that schedules the handle
+and lowered by the first step that reports `write` clear — so while the flush
+handle is pending, or the writer is armed after a `WouldBlock`, a further
+submit schedules nothing and rides the flush already coming. A `gather` of N
+therefore leaves in one `writev`.
 
-Because the reader callback runs **on** the loop thread, futures resolve
-directly. `aio.py`'s `_resolve_batch`, the `resolve_batch_fn` constructor
-argument, the bound `call_soon_threadsafe` and the four positionally-aligned
-lists all go; the constructor becomes `AsyncTransport(socket_path, event_loop)`.
+The `SlotId → future` map lives in `gnitz-py`, not the spine, and anything
+per-operation stays out of Python: the reader callback is one GIL crossing per
+readable event, independent of N, where a per-op poll or resolve callback on a
+`gather` of 1000 is 1000 of them. Because it runs **on** the loop thread,
+futures resolve directly. `aio.py`'s `_resolve_batch`, the `resolve_batch_fn`
+constructor argument, the bound `call_soon_threadsafe` and the four
+positionally-aligned lists all go; the constructor becomes
+`AsyncTransport(socket_path, event_loop)`.
 
-`interest()` arms `loop.add_reader` and `loop.add_writer`, and **disarms each
-the moment its bit drops** — a permanently-armed writer callback spins the loop
-at 100% CPU on an always-writable fd. Submissions arm at most one
-`loop.call_soon` per idle→pending transition, not one per submit, so a `gather`
-of N still leaves in one `writev`.
-
-`close()` disarms both callbacks and fails every slot the spine's `close`
-returns; further submits are refused with
+`close()` removes both callbacks, then runs the spine's `close` and fails every
+slot it returns; further submits are refused with
 `ClientError::ServerError("connection closed")` — the text
-`test_enqueue_after_close_raises` matches. There is no thread to join,
-so `Drop` does the same and the "do NOT join from GC" comment goes with it.
+`test_enqueue_after_close_raises` matches. Removal precedes the fd's close so
+the selector never holds a dead fd. There is no thread to join, and the "do NOT
+join from GC" comment goes.
+
+**An `AsyncConnection` that is never closed lives as long as its loop.**
+`add_reader` holds a bound method of the transport, so the loop keeps the object
+alive until `close()` removes the callback or the loop itself closes, and only
+then does `Drop` run — closing the fd through the `Session`. That is the
+lifetime asyncio's own selector transports have, and it is documented as such
+rather than papered over with a weak reference.
 
 Deleting the thread removes a shutdown crash without a finalizer: a release
 build today dies with `Fatal Python error: gilstate_tss_set: failed to set
@@ -361,81 +486,144 @@ current tstate` when an exception escapes `asyncio.run` with work in flight —
 the I/O thread calling `Python::attach` after finalization began.
 
 `aio.py`'s "All I/O runs on a background Rust thread" becomes false and is
-replaced. Two limitations stay and are documented as choices: connect is
-synchronous and blocks the loop for up to `CONNECT_TIMEOUT` per resolved
-address, and `AsyncConnection` stays bound to its constructing loop, because
-`add_reader` is a property of that loop. A third is documented for the first
-time: abandoning an operation is not cancellation — `asyncio.wait_for(conn.push(...), t)`
-still writes the frame, and the server still commits it.
+replaced. Three limitations are documented as choices: connect is synchronous
+and blocks the loop for up to `CONNECT_TIMEOUT` per resolved address;
+`AsyncConnection` is bound to its constructing loop, because `add_reader` is a
+property of that loop; and abandoning an operation is not cancellation —
+`asyncio.wait_for(conn.push(...), t)` still writes the frame, and the server
+still commits it.
 
 `client_id` stays exposed on the connection object: `test_distinct_client_ids`
 is the only coverage of the shared-generator invariant that stops one process
 minting the same client id twice.
 
+## The blocking reply path goes with its last consumer
+
+`Session::send_batch`, `recv_push_ack`, `recv_scan`, `pack_scan`, `pack_seek`
+and `pack_scan_multi` are deleted — `submit` encodes every one of those shapes
+already, through `encode_control_frame` / `versioned_flags` /
+`encode_scan_multi_frame`, so nothing "becomes the spine's encoder"; the
+`pack_*` are dead. So are `drain_reply_train` and `recv_cached`. `recv_message`
+goes too; the `message.rs` tests that call it read
+`parse_response(&t.recv_framed()?, hint)` instead, which is what it is. So do
+`ClientTransport::waker`, `Session::waker`, `TransportWaker` and its two
+re-exports (`protocol/mod.rs`'s `pub use transport::{…}` and `lib.rs`'s
+prelude), whose only consumer is the deleted transport's teardown, and both
+waker tests in `transport/tests.rs`,
+`test_transport_waker_unblocks_parked_recv` and
+`test_transport_waker_unblocks_parked_poll`.
+
+Four comments describe the thread and are rewritten, not trimmed: the
+`connection.rs` module header (the "blocking reply path the gnitz-py
+background I/O transport still calls" paragraph), `Session`'s doc ("the
+gnitz-py async I/O thread holds its own"), `MAX_IN_FLIGHT`'s doc ("the async
+transport's channel"), and the Send-assertion comments in `client.rs` and
+`transport/mod.rs`. The `Send` requirement itself stays and gains its real
+reason: the asyncio executor steps the `Session` inside `Python::detach`, whose
+`Ungil` bound is `Send` on the closure.
+
+`ClientTransport` gains `bytes_sent()` beside `frames_sent()`, counted where
+frames are: in `enqueue`. It is what the warm-bytes test reads.
+
+`not_null_bit_rejection.rs` drove `send_batch` + `recv_push_ack` from a plain
+`#[test]`, to skip `push_with_mode`'s client-side `ZSetBatch::validate` and ship
+a null bit under a `NOT NULL` column. `submit` runs no validator either, so it
+moves onto the spine: `Session::connect`, `submit(Request::Push { schema:
+PushSchema::Borrowed(..), .. })`, then `step` / `poll` / `step` as
+`spine_driver.rs`'s `drive_all` does. No raw-wire surface, no second copy of
+the handshake.
+
 ## Tests
 
 **Deleted**: `test_drop_without_close_releases_thread` and
 `test_explicit_close_no_deadlock` in `test_async.py`, and with them the file's
-`gc` and `time` imports and `_os_thread_count`;
-`test_transport_waker_unblocks_parked_recv` in `transport/mod.rs`.
+`gc` and `time` imports and `_os_thread_count`; both waker tests in
+`transport/tests.rs`.
 
-**Moved**: `not_null_bit_rejection.rs` to the raw-`ClientTransport` surface.
+**Moved**: `not_null_bit_rejection.rs` onto the spine.
 
 **Rewritten**: `test_connection_loss_resolves_every_queued_request`, whose
 docstring is entirely about `IO_BATCH_MAX` and the request channel. Its 3000
-submissions stay — below the 4096 cap — and its assertion is unchanged.
+submissions stay — below `MAX_IN_FLIGHT` — and its assertion is unchanged:
+the flush hits the reset or the reader reads the EOF, that step's error
+closes, and every slot fails.
 
 **Must keep passing**: the rest of `test_async.py`, in particular
 `test_pipeline_mixes_operation_kinds` (push, scan, seek and `scan_many` gathered
 as one in-flight group, run at `GNITZ_WORKERS=4` so replies leave the workers
 out of order), `test_pipeline_empty_push_interleaved`,
 `test_scan_many_malformed_list_does_not_desync`, `test_close_idempotent` and
-`test_enqueue_after_close_raises`.
+`test_enqueue_after_close_raises`; `push_retries_cold_on_schema_mismatch` in
+`spine_tests.rs`, whose `requests_sent() == 3` holds unchanged.
 
-**New**:
-- Two pipelined pushes to one PK both draw `STATUS_SCHEMA_MISMATCH`, and a third
-  to the same PK is submitted between their replies: the committed row is the
-  third value. Fails against a tail retry that does not quiesce.
-- Every warm push in flight at a stale version is retried, in order, and each
-  future resolves to its own ACK — not only the first to mismatch.
-- A push for the relation that ACKs OK after a mismatch fails the mismatched
-  slots instead of retrying behind it; the committed row is the one that
-  succeeded.
-- A warm async push ships 780 bytes, not 1428, counted off the wire.
-- `Readiness` under tokio: a connection idle after a completed operation
-  consumes no CPU over a one-second window, measured as process CPU time. This
-  is the busy-loop guard and it is the reason the eager-clear contract exists.
-- The actor: N operations on cloned `AsyncClient` handles across tasks complete
-  correctly and leave in one `writev`; dropping every handle ends `Connection`;
+**New — the resend, over the scripted peer of `spine_tests.rs`**, where the
+policy lives and a mismatch is one line to script:
+- Two warm pushes to one PK at a stale stamp and a third submitted between
+  the first mismatch and the second reply: the peer sees `A'`, `B'`, `C` in
+  that order, each slot completes exactly once with its cold copy's ACK, and
+  the superseded replies complete nothing. Fails against a retry that resends
+  per mismatch.
+- A push at a different stamp pending behind a stale one: the stale slots
+  complete with `SchemaMismatch`, the other with its ACK, and the peer sees no
+  resend.
+- A `Borrowed` slot draws `SchemaMismatch` and nothing is resent.
+- `close()` after a resend reports each `SlotId` once.
+
+**New — end to end**, in `test_async.py`: warm the cache, `ALTER TABLE …
+RENAME COLUMN` through the sync client — it bumps the version and changes no
+type, and the server's cold gate compares count, types and nullability, never
+names — then gather pushes encoded against the old schema: every future
+resolves to its own ACK and the rows are committed. And a warm async push
+ships 780 bytes, not 1428, read off `bytes_sent`.
+
+**New — `gnitz-async`**:
+- A connection idle after a completed operation consumes no CPU over a
+  one-second window, measured as process CPU time: the busy-loop guard.
+- A submit issued while a reply is outstanding flushes before that reply
+  arrives — hold the server's reply with a scripted peer, submit a second
+  operation, and assert the peer receives its frame. This is the test the
+  write-exhaustion rule exists for, and eager clearing fails it on TCP.
+- N operations on cloned `AsyncClient` handles across tasks complete
+  correctly, each to its own result; a burst of N from one task on a
+  `current_thread` runtime leaves in one `writev`, counted as
+  `count_syscalls` counts — across tasks on a multi-thread runtime the driver
+  may be polled between two sends, so the count is only bounded there;
+  dropping every handle ends `Connection`;
   `Connection` erroring fails every outstanding operation rather than hanging
   one; `resolve` on the async handle returns the same descriptor the blocking
   client does.
-- Python, release build: every shutdown shape exits 0, in particular an
-  exception escaping `asyncio.run` with work in flight.
+
+**New — Python**:
+- Every shutdown shape exits with the exception's status and never an abort,
+  in particular an exception escaping `asyncio.run` with work in flight, run in
+  a subprocess.
 - An idle `AsyncConnection` with one operation outstanding consumes no CPU —
-  the `add_writer` disarm guard, which a spinning loop would fail.
-- `await`-in-a-loop costs 4 syscalls per operation and `gather` fewer than 1,
-  both with futex and `sendto` at zero, counted with `strace -f -c`.
+  the writer-disarm guard, which a spinning loop would fail.
+- `await`-in-a-loop costs 5 syscalls per operation and `gather` fewer than 1,
+  both with futex and `sendto` at zero, counted with `strace -f -c` over a
+  subprocess, skipped when `strace` is absent, as `count_syscalls` does.
 
 ## Sequencing
 
-- [ ] Warm push packing on the spine, the push `Request` variant's
-      `Option<Arc<Schema>>`, and the quiescing retry with its
-      committed-after-mismatch guard. The blocking client passes `None` and is
-      unchanged.
-- [ ] `Readiness` added to `gnitz-core`, returning the ready set, with the
-      drive-before-repolling contract on the trait.
-- [ ] `gnitz-tokio`: the workspace member, the non-owning fd newtype, the
-      eager-clearing `AsyncFd` impl, the idle-CPU test, and the `CLAUDE.md`
-      crate-table row.
-- [ ] `Connection<R>`, `AsyncClient`, the 256-deep channel, and the actor tests.
-- [ ] The asyncio executor over one `step` crossing per readable event, with the
-      interest arm/disarm and the single `call_soon` per idle→pending
-      transition; `PyAsyncTransport` and its ~500-line block deleted;
-      `_resolve_batch` and `call_soon_threadsafe` gone from `aio.py`;
-      `client_id` re-exposed; the three documented limitations written down.
-- [ ] The blocking reply path deleted with its last consumer: `send_batch` /
-      `recv_push_ack` / `recv_scan`, the `pack_*` visibility drop,
-      `drain_reply_train` / `recv_cached` / `recv_checked` / `recv_message`,
-      `TransportWaker` with both `waker()` methods and its two re-exports, and
-      `not_null_bit_rejection.rs` moved to the raw-wire surface.
+- [ ] `PushSchema`, the retained payload with `MessageParts.data: Arc<Vec<u8>>`,
+      the stamp on the push slot, the resend with its ordering guard, the
+      `cold` field removed and `roundtrip_push` on evict-and-resubmit; the
+      scripted-peer tests.
+- [ ] The spine surfaces: `scan_reply`, `Request::scan` / `Request::seek`, the
+      RESOLVE split with `RelTarget` public and `RelDescriptor::from_resolve`,
+      `bytes_sent`.
+- [ ] `gnitz-async`: the workspace member and `CLAUDE.md` row, `Readiness`,
+      the tokio impl over the non-owning fd newtype, `Connection<R>`,
+      `AsyncClient`, `connect`, and its tests including the idle-CPU and
+      flush-while-outstanding guards.
+- [ ] The asyncio executor: the `AsyncTransport` pyclass over one `step`
+      crossing per event, `aio.py`'s arming from the returned booleans and the
+      one `call_soon` per idle→pending transition, `PyAsyncTransport` and its
+      block deleted, `_resolve_batch` and `call_soon_threadsafe` gone,
+      `client_id` re-exposed, the three limitations and the lifetime written
+      down; the Python tests above.
+- [ ] The blocking reply path deleted: `send_batch` / `recv_push_ack` /
+      `recv_scan` / the three `pack_*` / `drain_reply_train` / `recv_cached` /
+      `recv_message`, `TransportWaker` with both `waker()` methods, both
+      re-exports and both tests, the four comments rewritten, and
+      `not_null_bit_rejection.rs` moved onto the spine.

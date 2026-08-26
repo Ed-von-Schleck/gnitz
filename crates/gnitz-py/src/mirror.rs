@@ -56,10 +56,10 @@ fn detached<T: Send>(py: Python<'_>, m: &mut Mirror, f: impl Send + FnOnce(&mut 
 /// The one place a [`MirrorError`] becomes a Python exception. `Upstream` keeps
 /// the client's own classification, so an expired cursor still raises
 /// `GnitzDeltaExpiredError`.
-fn mirror_err(e: &MirrorError) -> PyErr {
+fn mirror_err(e: MirrorError) -> PyErr {
     match e {
         MirrorError::Upstream(c) => delta_err(c),
-        MirrorError::Engine(m) => GnitzError::new_err(m.clone()),
+        MirrorError::Engine(m) => GnitzError::new_err(m),
         MirrorError::Poisoned(_) => GnitzMirrorPoisonedError::new_err(e.to_string()),
     }
 }
@@ -143,7 +143,7 @@ impl PyMirror {
     /// would raise the wrong class.
     fn live(&mut self) -> PyResult<&mut Mirror> {
         if let Some(why) = self.opened()?.poisoned().map(str::to_string) {
-            return Err(mirror_err(&MirrorError::Poisoned(why)));
+            return Err(mirror_err(MirrorError::Poisoned(why)));
         }
         self.opened()
     }
@@ -161,7 +161,7 @@ impl PyMirror {
         // The connect blocks — up to 10 s for a `tls://` target — and the engine
         // open behind it is disk work, so the GIL is down for both.
         let opened = py.detach(move || Confined(GnitzClient::connect(target).map(|c| Mirror::open(base_dir, c))));
-        let inner = to_py_err(opened.into_inner())?.map_err(|e| mirror_err(&e))?;
+        let inner = to_py_err(opened.into_inner())?.map_err(mirror_err)?;
         Ok(PyMirror { inner: Some(inner) })
     }
 
@@ -193,7 +193,7 @@ impl PyMirror {
     /// Only a view with a delta feed can be mirrored — create it
     /// `WITH (delta = '<size>')`.
     pub fn mirror_view(&mut self, py: Python<'_>, schema_name: &str, name: &str) -> PyResult<Py<PyPollResult>> {
-        let outcome = detached(py, self.live()?, |m| m.mirror_view(schema_name, name)).map_err(|e| mirror_err(&e))?;
+        let outcome = detached(py, self.live()?, |m| m.mirror_view(schema_name, name)).map_err(mirror_err)?;
         Py::new(py, PyPollResult::from(outcome))
     }
 
@@ -202,7 +202,7 @@ impl PyMirror {
     /// Stop mirroring the relation: the copy and its directory go, and a later
     /// read of it is delegated upstream.
     pub fn forget_view(&mut self, py: Python<'_>, view_id: u64) -> PyResult<()> {
-        detached(py, self.live()?, |m| m.forget_view(view_id)).map_err(|e| mirror_err(&e))
+        detached(py, self.live()?, |m| m.forget_view(view_id)).map_err(mirror_err)
     }
 
     /// poll() -> list[PollResult]
@@ -217,7 +217,7 @@ impl PyMirror {
     /// naming the view. An error therefore carries no report, so treat every
     /// mirrored view as possibly reseeded.
     pub fn poll(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyPollResult>>> {
-        let outcomes = detached(py, self.live()?, |m| m.poll()).map_err(|e| mirror_err(&e))?;
+        let outcomes = detached(py, self.live()?, |m| m.poll()).map_err(mirror_err)?;
         outcomes
             .into_iter()
             .map(|o| Py::new(py, PyPollResult::from(o)))
@@ -230,7 +230,7 @@ impl PyMirror {
     /// manifests, neither of which mutates what a copy holds, so the handle
     /// stays usable and a retry is sound.
     pub fn checkpoint(&mut self, py: Python<'_>) -> PyResult<()> {
-        detached(py, self.live()?, |m| m.checkpoint()).map_err(|e| mirror_err(&e))
+        detached(py, self.live()?, |m| m.checkpoint()).map_err(mirror_err)
     }
 
     /// Whether a read of `view_id` is answered locally. Answers on a poisoned

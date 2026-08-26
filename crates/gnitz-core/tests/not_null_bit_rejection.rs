@@ -18,22 +18,14 @@ use gnitz_core::TableProps;
 use gnitz_core::{
     encode_message_parts, BatchAppender, GnitzClient, PkTuple, Session, WireConflictMode, ZSetBatch, FLAG_PUSH,
 };
-use gnitz_test_harness::ServerHandle;
-
-/// Per-test unique schema name (each test owns its server; uniqueness keeps a
-/// failure unambiguous).
-fn unique_schema() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    format!("nnb{}", SEQ.fetch_add(1, Ordering::Relaxed))
-}
+use gnitz_test_harness::{unique_schema, ServerHandle};
 
 /// Ship `batch` as a cold PUSH frame over a raw session, bypassing
 /// `Session::push_with_mode`'s client-side `ZSetBatch::validate`.
 fn hostile_push(session: &mut Session, tid: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, String> {
     let flags = gnitz_core::protocol::wire_flags_set_conflict_mode(FLAG_PUSH, WireConflictMode::Update);
     let parts = encode_message_parts(tid, session.client_id, flags, &PkTuple::EMPTY, 0, Some((schema, batch)));
-    session.send_batch(&[parts]).map_err(|e| e.to_string())?;
+    session.send_batch(&mut vec![parts]).map_err(|e| e.to_string())?;
     session.recv_push_ack(tid).map_err(|e| e.to_string())
 }
 
@@ -43,7 +35,7 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
         return;
     };
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-    let sn = unique_schema();
+    let sn = unique_schema("nnb");
     client.create_schema(&sn).unwrap();
 
     // `v` is NOT NULL, `w` is nullable — so the schema's not-null payload mask

@@ -14,6 +14,16 @@ pub const MAX_FRAME_PAYLOAD_SERVER: usize = 64 * 1024 * 1024; // 64 MB
 /// of MB; the server is trusted so the risk model is different.
 pub const MAX_FRAME_PAYLOAD_CLIENT: usize = 256 * 1024 * 1024; // 256 MB
 
+/// Payload ceiling the client applies to a frame arriving **before** the HELLO
+/// ACK, when the peer has proved nothing yet. Exactly two frames are legal
+/// there and both are small: the ACK (`HELLO_ACK_PAYLOAD_LEN`) and a
+/// `STATUS_ERROR` control block — `CTRL_BLOCK_SIZE_NO_BLOB` plus the spill of
+/// the one error text that path emits, ~306 bytes at worst. 4 KiB is an order
+/// of magnitude of headroom over that; without it four header bytes from an
+/// unauthenticated peer would size a 256 MB allocation. The server bounds its
+/// own pre-handshake frame the same way (`HELLO_PAYLOAD_LEN`).
+pub const MAX_FRAME_PAYLOAD_PRE_HANDSHAKE: usize = 4 * 1024;
+
 /// Width of the length prefix in front of every framed payload, on every path
 /// that carries one: the client socket stream (`recv_framed` and its senders),
 /// the reactor's header recv, and the W2M ring slot the master forwards to a

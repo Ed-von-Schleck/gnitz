@@ -21,7 +21,10 @@ pub use client::{
     delta_reply_schema, hidden_view_name, qualified_name, retraction_batch, CatalogSnapshot, DeltaCursor, GnitzClient,
     IndexMeta, InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, ViewName, MAX_CHAIN_SEGMENTS,
 };
-pub use connection::{RawBlock, Session, FIRST_USER_TABLE_ID, TABLE_TAB};
+pub use connection::{
+    Completions, Interest, ParkHook, RawBlock, Reply, ReplyTrain, Request, Session, SlotId, FIRST_USER_TABLE_ID,
+    MAX_IN_FLIGHT, TABLE_TAB,
+};
 pub use error::{ClientError, ConflictClass};
 pub use gnitz_wire::{
     index_key_types, validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, RelClass,

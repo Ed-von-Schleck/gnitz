@@ -415,11 +415,16 @@ pub struct GnitzClient {
 // that reachable set breaks the build in `gnitz-py`, a crate away, with an error
 // naming a pyo3 trait rather than the field. Asserted here so the failure lands
 // on the line that caused it.
+//
+// `Sync` is asserted for the three connection types as well: the park hook is
+// a boxed closure field that could narrow it silently, and nothing in this
+// crate would notice.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send::<GnitzClient>();
-    assert_send::<Session>();
+    assert_send_sync::<GnitzClient>();
+    assert_send_sync::<Session>();
+    assert_send_sync::<crate::protocol::ClientTransport>();
     assert_send::<ZSetBatch>();
     assert_send::<ClientError>();
     // Handed back as `Arc<Schema>` by the scan path, and `Arc<T>: Send` requires
@@ -445,6 +450,14 @@ impl GnitzClient {
     /// round-trip-count assertions; see [`Session::requests_sent`].
     pub fn requests_sent(&self) -> u64 {
         self.session.requests_sent()
+    }
+
+    /// Install (or clear) the hook the blocking client runs before each park
+    /// on the fd; its `Err` aborts the operation in progress and leaves the
+    /// connection usable for the next call. The client holds no hook of its
+    /// own — the parking code lives in the session.
+    pub fn set_park_hook(&mut self, hook: Option<crate::connection::ParkHook>) {
+        self.session.set_park_hook(hook);
     }
 
     /// The client's current OCC basis (running max of observed watermarks).

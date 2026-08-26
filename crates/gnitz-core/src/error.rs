@@ -28,6 +28,10 @@ pub enum ClientError {
     /// local copy and bootstrap. Splitting it would make every caller catch
     /// several errors to take one branch.
     DeltaExpired,
+    /// The host runtime aborted a blocking call from the park hook — for the
+    /// Python binding, a signal handler raised. Carries the host's own error
+    /// so the binding re-raises exactly what the handler produced.
+    Interrupted(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Whether a failure is a retryable OCC conflict rather than a hard error. The
@@ -65,6 +69,7 @@ impl fmt::Display for ClientError {
                 "delta cursor is not honourable — its rounds were dropped, or it names a \
                  different boot or relation; re-read the feed from 0"
             ),
+            ClientError::Interrupted(e) => write!(f, "interrupted: {e}"),
         }
     }
 }

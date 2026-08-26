@@ -23,21 +23,13 @@ use gnitz_core::{
     wire_flags_set_conflict_mode, ColData, ColumnDef, GnitzClient, PkColumn, PkTuple, Schema, TypeCode,
     WireConflictMode, ZSetBatch, FLAG_PUSH,
 };
-use gnitz_test_harness::ServerHandle;
-
-/// Per-test unique schema name (parallel tests share nothing — each has its
-/// own server — but uniqueness keeps failures unambiguous).
-fn unique_schema() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    format!("tls{}", SEQ.fetch_add(1, Ordering::Relaxed))
-}
+use gnitz_test_harness::{unique_schema, ServerHandle};
 
 /// `(client, schema_name, table_id, schema)` for a fresh `(pk BIGINT, a
 /// BIGINT, b BIGINT)` table reachable via `target`.
 fn client_with_table(target: &str) -> (GnitzClient, String, u64, std::sync::Arc<Schema>) {
     let mut client = GnitzClient::connect(target).expect("connect");
-    let sn = unique_schema();
+    let sn = unique_schema("tls");
     client.create_schema(&sn).unwrap();
     let cols = vec![
         ColumnDef::new("pk", TypeCode::I64, false),
@@ -122,19 +114,10 @@ fn set_small_bufs(fd: RawFd) {
 /// client's receive window is closed (the FIN queues behind the stalled
 /// data), so probe actively: periodically send a tiny frame — a probe
 /// segment reaching the closed server socket draws an RST, and a subsequent
-/// send errors. Probe writes are deadline-bounded (SO_SNDTIMEO) so a full
-/// send buffer surfaces as WouldBlock (keep probing) instead of hanging.
+/// send errors. Probe writes are deadline-bounded so a full send buffer
+/// surfaces as WouldBlock (keep probing) instead of hanging.
 fn eviction_observed_within(t: &mut ClientTransport, ms: u64) -> bool {
-    let tv = libc::timeval { tv_sec: 1, tv_usec: 0 };
-    unsafe {
-        libc::setsockopt(
-            t.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDTIMEO,
-            &tv as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
-    }
+    t.set_deadline(Some(Duration::from_secs(1)));
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
@@ -310,7 +293,7 @@ fn wire_version_mismatch_hello_gets_status_error() {
     let mut t = ClientTransport::connect(&srv.tls_target()).unwrap();
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16 + 1);
     t.send_framed(&payload).unwrap();
-    let buf = t.recv_framed(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+    let buf = t.recv_framed().unwrap();
     let msg = parse_response(&buf, None).unwrap();
     assert_eq!(msg.status, STATUS_ERROR);
     let text = msg.error_text.unwrap_or_default();
@@ -319,7 +302,7 @@ fn wire_version_mismatch_hello_gets_status_error() {
         "STATUS_ERROR must name the version mismatch, got: {text}"
     );
     // Clean close follows the error frame.
-    assert!(t.recv_framed(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).is_err());
+    assert!(t.recv_framed().is_err());
 }
 
 // ── 7. restart: fail fast, same port, fresh connect works ─────────────────
@@ -380,14 +363,14 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
 
         // Now read everything: n ACKs, then the scan train.
         for _ in 0..n_pushes {
-            let buf = t.recv_framed(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+            let buf = t.recv_framed().unwrap();
             let ack = parse_response(&buf, None).unwrap();
             assert_eq!(ack.status, 0, "push ACK must be OK");
         }
         let mut rows = 0usize;
         let mut schema_seen: Option<(std::sync::Arc<Schema>, u16)> = None;
         loop {
-            let buf = t.recv_framed(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+            let buf = t.recv_framed().unwrap();
             let hint = schema_seen.as_ref().map(|(s, v)| (s.as_ref(), *v));
             let msg = parse_response(&buf, hint).unwrap();
             assert_eq!(msg.status, 0, "scan frame must be OK");

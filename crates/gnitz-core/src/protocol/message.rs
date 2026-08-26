@@ -88,12 +88,6 @@ impl MessageParts {
     }
 }
 
-impl super::transport::FrameSegments for MessageParts {
-    fn segments(&self) -> [&[u8]; 3] {
-        MessageParts::segments(self)
-    }
-}
-
 /// The one frame encoder: control block + optional schema block + optional data
 /// block, without the 4-byte frame header. `FLAG_HAS_SCHEMA` / `FLAG_HAS_DATA`
 /// are derived here, so no caller sets them.
@@ -138,7 +132,7 @@ fn encode_parts(
 }
 
 /// Encode a request/response carrying `schema` in the frame. Pass the parts to
-/// `send_framed_iov` / `send_framed_batch` for framing.
+/// `send_framed_iov`, or hand them to the outbound queue, for framing.
 ///
 /// `seek_pk` carries the seek key for `FLAG_SEEK` / `FLAG_SEEK_BY_INDEX` frames;
 /// pass `&PkTuple::EMPTY` for non-seek frames. The wire-level
@@ -243,12 +237,35 @@ pub fn encode_ddl_txn(client_id: u64, families: &[(u64, ZSetBatch)]) -> Vec<u8> 
     gnitz_wire::txn_frame::encode_ddl_txn(client_id, &refs)
 }
 
-/// Send one control-only frame: no schema block, no data block.
+/// Encode one control-only frame: no schema block, no data block.
 ///
 /// The seek key arrives as its two raw wire halves, not as a `PkTuple`, because
 /// `PkTuple::split_wire` caps the extra region at 64 bytes (`MAX_PK_BYTES - 16`)
 /// and this channel also carries the SEEK_BY_INDEX_RANGE `RangeDescriptor`, up
 /// to 82 bytes at max arity. The control block's BLOB column has no such cap.
+pub(crate) fn encode_control_frame(
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    seek_pk: u128,
+    seek_col_idx: u64,
+    seek_pk_extra: &[u8],
+) -> Vec<u8> {
+    encode_parts(
+        target_id,
+        client_id,
+        flags,
+        seek_pk,
+        seek_col_idx,
+        seek_pk_extra,
+        None,
+        None,
+    )
+    .ctrl
+}
+
+/// Send one control-only frame ([`encode_control_frame`]), blocking until it
+/// is on the wire.
 pub fn send_control(
     t: &mut ClientTransport,
     target_id: u64,
@@ -258,17 +275,14 @@ pub fn send_control(
     seek_col_idx: u64,
     seek_pk_extra: &[u8],
 ) -> Result<(), ProtocolError> {
-    let parts = encode_parts(
+    t.send_framed(&encode_control_frame(
         target_id,
         client_id,
         flags,
         seek_pk,
         seek_col_idx,
         seek_pk_extra,
-        None,
-        None,
-    );
-    t.send_framed(&parts.ctrl)
+    ))
 }
 
 /// Parse a wire payload (without 4-byte frame header) into a `Message`.
@@ -389,9 +403,8 @@ pub(crate) fn parse_response_frame(
 pub(crate) fn recv_message(
     t: &mut ClientTransport,
     schema_hint: Option<(&Schema, u16)>,
-    max_payload_len: usize,
 ) -> Result<Message, ProtocolError> {
-    let buf = t.recv_framed(max_payload_len)?;
+    let buf = t.recv_framed()?;
     parse_response(&buf, schema_hint)
 }
 
@@ -559,7 +572,7 @@ mod tests {
         let empty_batch = ZSetBatch::new(&schema);
         let (mut a, mut b) = make_transport_pair();
         send_push(&mut a, &schema, &empty_batch);
-        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let msg = recv_message(&mut b, None).unwrap();
 
         // Schema was sent, data was not (empty batch)
         assert!(msg.schema.is_some());
@@ -607,7 +620,7 @@ mod tests {
 
         let (mut a, mut b) = make_transport_pair();
         send_push(&mut a, &schema, &batch);
-        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let msg = recv_message(&mut b, None).unwrap();
 
         let data = msg.data_batch.unwrap();
         assert_eq!(data.pks.to_vec_u128(), pks);
@@ -664,7 +677,7 @@ mod tests {
 
         let (mut a, mut b) = make_transport_pair();
         send_push(&mut a, &schema, &batch);
-        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let msg = recv_message(&mut b, None).unwrap();
 
         let data = msg.data_batch.unwrap();
         assert_eq!(data.nulls, nulls);
@@ -684,7 +697,7 @@ mod tests {
         // Control-only message (scan/alloc style)
         let (mut a, mut b) = make_transport_pair();
         send_control(&mut a, 0, 0, FLAG_PUSH, 0, 0, &[]).unwrap();
-        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let msg = recv_message(&mut b, None).unwrap();
         assert!(msg.schema.is_none());
         assert!(msg.data_batch.is_none());
     }
@@ -704,7 +717,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let msg = recv_message(&mut b, None).unwrap();
         assert_eq!(msg.target_id, 0xDEAD_BEEF_1234_5678);
         assert_eq!(msg.seek_pk, seek_pk);
     }
@@ -719,7 +732,7 @@ mod tests {
         };
         let encoded = encode_control_block(&err_hdr, "something broke", &[]);
         a.send_framed(&encoded).unwrap();
-        let msg = recv_message(&mut b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let msg = recv_message(&mut b, None).unwrap();
         assert_eq!(msg.status, STATUS_ERROR);
         assert!(msg.error_text.is_some());
     }
@@ -802,9 +815,9 @@ mod tests {
     }
 
     /// A hint-only frame (FLAG_HAS_DATA set, FLAG_HAS_SCHEMA clear, matching schema
-    /// version) must decode data_batch correctly but leave schema == None.
-    /// Before Fix 1, parse_response cloned the hint into wire_schema, so msg.schema
-    /// would be Some — this test catches that regression.
+    /// version) decodes its data under the hint but reports `schema == None`:
+    /// `Message::schema` means "the block was physically in the frame", which is
+    /// what the cache absorb keys on.
     #[test]
     fn hint_only_frame_returns_data_schema_none() {
         let schema = Schema {
@@ -830,9 +843,9 @@ mod tests {
         a.send_framed_iov(&parts.segments()).unwrap();
 
         // Parse with a matching hint (same schema, version 1).
-        let msg = recv_message(&mut b, Some((&schema, 1)), gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
+        let msg = recv_message(&mut b, Some((&schema, 1))).unwrap();
 
-        // Fix 1: schema must be None — the hint was not physically in the frame.
+        // The hint was not physically in the frame.
         assert!(msg.schema.is_none(), "schema must be None for hint-only frame");
         // Data must still decode correctly.
         let data = msg.data_batch.expect("data_batch must be Some");

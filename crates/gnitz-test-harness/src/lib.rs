@@ -527,3 +527,12 @@ fn read_stderr_tail(path: &Path) -> String {
     let start = lines.len().saturating_sub(MAX_TAIL_LINES);
     lines[start..].join("\n")
 }
+
+/// A schema name no other test in this process has used: `prefix` plus a
+/// process-wide sequence number. Keeps a failure unambiguous when several
+/// tests share one server.
+pub fn unique_schema(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!("{prefix}{}", SEQ.fetch_add(1, Ordering::Relaxed))
+}

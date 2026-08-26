@@ -15,16 +15,8 @@
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{BatchAppender, ColData, GnitzClient, TableProps, ZSetBatch};
 use gnitz_expr::{CmpOp, ExprBuilder};
-use gnitz_test_harness::ServerHandle;
+use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
-
-/// Per-test unique schema name (each test owns its server; uniqueness keeps a
-/// failure unambiguous).
-fn unique_schema() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    format!("zpp{}", SEQ.fetch_add(1, Ordering::Relaxed))
-}
 
 /// The PK-only reply for `schema`: its PK columns in `pk_indices()` order, keyed
 /// on all of them, with no payload column at all.
@@ -84,7 +76,7 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
         return;
     };
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-    let sn = unique_schema();
+    let sn = unique_schema("zpp");
     client.create_schema(&sn).unwrap();
 
     let cols = vec![
@@ -133,7 +125,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
         return;
     };
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-    let sn = unique_schema();
+    let sn = unique_schema("zpp");
     client.create_schema(&sn).unwrap();
 
     // Column order deliberately unrelated to PK order: the key is (c3, c0).
