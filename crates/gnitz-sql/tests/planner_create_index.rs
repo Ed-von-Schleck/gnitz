@@ -108,9 +108,9 @@ fn client_gateway_rejects_invalid_index_name() {
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT)");
     let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
     // Bypass the planner: the client (catalog gateway) must itself reject a name
-    // outside the ASCII identifier charset — non-SQL front ends (capi) reach it
-    // without planner validation, and `canon_name`'s collision-free-fold premise
-    // depends on that charset.
+    // outside the ASCII identifier charset — `GnitzClient` is public API, so it
+    // is reachable without planner validation, and `canon_name`'s
+    // collision-free-fold premise depends on that charset.
     let err = client.create_index(tid, &[1], &[schema.columns[1].type_code], "bad-name", false);
     assert!(err.is_err(), "client gateway must reject a non-identifier index name");
 }

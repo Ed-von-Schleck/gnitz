@@ -23,16 +23,9 @@ pub use client::{
 };
 pub use connection::{RawBlock, Session, FIRST_USER_TABLE_ID, TABLE_TAB};
 pub use error::{ClientError, ConflictClass};
-pub use gnitz_wire::{RelClass, TableProps};
-pub use read_target::ReadTarget;
-// The expression emitter and the resolved column addressing it reads through
-// live in `gnitz-expr`, beside the decoder they must agree with. Re-exported
-// here because `gnitz-capi` exposes 18 `gnitz_expr_*` C symbols over the former
-// and reads batch cells through the latter, without depending on that crate.
-pub use gnitz_expr::{CmpOp, ColumnLocator, ExprBuilder, ExprProgram, SchemaFacts, StrOp};
 pub use gnitz_wire::{
-    index_key_types, reject_reserved_infix, validate_dist_prefix, validate_user_identifier, Cut, PkColList,
-    RangeDescriptor, FK_INDEX_INFIX,
+    index_key_types, validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, RelClass,
+    TableProps,
 };
 pub use protocol::{
     encode_message_parts, null_word_get, null_word_set, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
@@ -40,3 +33,4 @@ pub use protocol::{
     TransportWaker, TypeCode, ViewBuffers, WireConflictMode, ZSetBatch, ZSetBatchView, FLAG_PUSH, MAX_COLUMNS,
     MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };
+pub use read_target::ReadTarget;

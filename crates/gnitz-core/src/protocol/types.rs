@@ -51,10 +51,10 @@ impl ColumnDef {
     pub const SELF_FK_TABLE_ID: u64 = u64::MAX;
 
     /// A non-FK, non-SERIAL column — the common case. Client-side schema builders
-    /// (the SQL planner, the C ABI, the Python driver) synthesize columns through
-    /// here; the planner's FK path assigns `fk_table_id`/`fk_col_idx` on the
-    /// returned column once the referenced table resolves, and a SERIAL column
-    /// chains [`ColumnDef::serial`].
+    /// (the SQL planner, the Python driver) synthesize columns through here; the
+    /// planner's FK path assigns `fk_table_id`/`fk_col_idx` on the returned
+    /// column once the referenced table resolves, and a SERIAL column chains
+    /// [`ColumnDef::serial`].
     pub fn new(name: impl Into<String>, type_code: TypeCode, is_nullable: bool) -> Self {
         Self {
             name: name.into(),
@@ -271,39 +271,25 @@ impl Schema {
         })
     }
 
-    /// Validate a candidate PK index list against the schema's arity and
-    /// column count constraints. Shared by all FFI surfaces (capi, py) so the
-    /// rules — non-empty, ≤ `PK_LIST_MAX_COLS`, all indices `< ncols`, no
-    /// duplicates — stay in one place. `ncols` is passed in because the C ABI
-    /// builds the PK list before adding columns. The cap is the persisted
-    /// PK-list codec capacity (`PK_LIST_MAX_COLS`), not the wider in-memory
-    /// `MAX_PK_COLUMNS`: these surfaces never build the engine-internal
-    /// secondary-index schema that uses the extra `MAX_PK_COLUMNS` slot, so a
-    /// PK they accept must round-trip through the codec.
-    pub fn validate_pk_cols(pk_cols: &[usize], ncols: usize) -> Result<(), String> {
-        // Saturate rather than cast: the narrowing happens *before*
-        // `validate_pk_indices` compares against `ncols`, so a plain `as u32`
-        // would wrap an index of exactly 2^32 to 0 and let it pass.
-        let idx: Vec<u32> = pk_cols.iter().map(|&c| c.min(u32::MAX as usize) as u32).collect();
-        gnitz_wire::validate_pk_indices(&idx, ncols).map_err(|r| r.to_string())
-    }
-
     /// The single definition of "these parts form an admissible schema": the
     /// `MAX_COLUMNS` cap (the region null bitmap is one u64 word), the
-    /// structural PK rules ([`Schema::validate_pk_cols`] — non-empty,
-    /// `≤ PK_LIST_MAX_COLS`, every index `< columns.len()`, no duplicates), and
-    /// the per-column invariants the engine's `SchemaDescriptor::new`
-    /// hard-asserts — each PK column non-nullable and PK-eligible. Shared by
-    /// [`Schema::from_parts`], the client's `create_table` / `create_view_chain`
-    /// DDL gateways, and capi's `gnitz_batch_new`, so a malformed spec is a
-    /// clean client error rather than a server-side assert.
-    pub fn validate_parts(pk_cols: &[usize], columns: &[ColumnDef]) -> Result<(), String> {
+    /// structural PK rules (non-empty, ≤ `PK_LIST_MAX_COLS`, every index
+    /// `< columns.len()`, no duplicates), and the per-column invariants the
+    /// engine's `SchemaDescriptor::new` hard-asserts — each PK column
+    /// non-nullable and PK-eligible. Shared by [`Schema::from_parts`] and the
+    /// client's `create_table` / `create_view_chain` DDL gateways, so a
+    /// malformed spec is a clean client error rather than a server-side assert.
+    ///
+    /// The arity cap is the persisted PK-list codec capacity, not the wider
+    /// in-memory `MAX_PK_COLUMNS`: a client never builds the engine-internal
+    /// secondary-index schema that uses the extra slot, so a PK it accepts must
+    /// round-trip through the codec.
+    pub fn validate_parts(pk_cols: &[u32], columns: &[ColumnDef]) -> Result<(), String> {
         if columns.len() > MAX_COLUMNS {
             return Err("column count exceeds MAX_COLUMNS".into());
         }
-        Self::validate_pk_cols(pk_cols, columns.len())?;
-        let idx: Vec<u32> = pk_cols.iter().map(|&c| c as u32).collect();
-        gnitz_wire::validate_pk_column_types(&idx, |c| {
+        gnitz_wire::validate_pk_indices(pk_cols, columns.len()).map_err(|r| r.to_string())?;
+        gnitz_wire::validate_pk_column_types(pk_cols, |c| {
             let cd = &columns[c as usize];
             (cd.type_code as u8, cd.is_nullable)
         })
@@ -315,7 +301,11 @@ impl Schema {
     /// wire schema block or catalog rows. Runs [`Schema::validate_parts`],
     /// so every decode boundary applies the same rule set.
     pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: Vec<usize>) -> Result<Schema, String> {
-        Self::validate_parts(&pk_cols, &columns)?;
+        // Saturate rather than cast: the narrowing happens *before*
+        // `validate_pk_indices` compares against the column count, so a plain
+        // `as u32` would wrap an index of exactly 2^32 to 0 and let it pass.
+        let idx: Vec<u32> = pk_cols.iter().map(|&c| c.min(u32::MAX as usize) as u32).collect();
+        Self::validate_parts(&idx, &columns)?;
         Ok(Schema { columns, pk_cols })
     }
 
@@ -536,18 +526,18 @@ impl PkTuple {
         t
     }
 
-    /// FFI-boundary constructor: build a tuple from a u128 with the full
-    /// 16-byte narrow stride, without a schema lookup. The server reads
-    /// only the column's actual stride; the high padding bytes (if any)
-    /// are inert. Used by C and Python seek shims.
+    /// Build a tuple from a u128 with the full 16-byte narrow stride, without
+    /// a schema lookup — for a caller holding a key value but not the schema.
+    /// The server reads only the column's actual stride; the high padding bytes
+    /// (if any) are inert.
     pub fn from_u128_narrow(v: u128) -> Self {
         Self::from_u128(16, v)
     }
 
-    /// [`PkTuple::from_bytes`] for an FFI caller holding a length it has not
-    /// checked: the one rule (a packed PK region is 1..=`MAX_PK_BYTES` bytes)
-    /// and the one message, instead of a per-binding pre-check ahead of the
-    /// hard assert below.
+    /// [`PkTuple::from_bytes`] for a caller holding a length it has not checked:
+    /// the one rule (a packed PK region is 1..=`MAX_PK_BYTES` bytes) and the one
+    /// message, instead of a per-caller pre-check ahead of the hard assert
+    /// below.
     pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, String> {
         if bytes.is_empty() || bytes.len() > MAX_PK_BYTES {
             return Err(format!(
@@ -558,11 +548,10 @@ impl PkTuple {
         Ok(Self::from_bytes(bytes))
     }
 
-    /// Build a tuple from a raw byte slice. `bytes.len()` becomes the stride.
-    /// Used by all FFI paths that pass packed PK regions through opaque
-    /// byte buffers.
+    /// Build a tuple from a raw byte slice. `bytes.len()` becomes the stride —
+    /// for the paths that carry a packed PK region as an opaque byte buffer.
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        // Hard assert (not debug-only): `bytes` is an externally-controlled FFI
+        // Hard assert (not debug-only): `bytes` is an externally-controlled
         // length, and in release `t.buf[..bytes.len()]` would OOB-panic (or, for
         // len ≥ 256, `bytes.len() as u8` would silently truncate the stride first).
         // The assert bounds the length, making the `as u8` cast lossless.

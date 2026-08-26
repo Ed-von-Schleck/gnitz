@@ -177,6 +177,3 @@ benchmarks/results/
 # Generated Rust docs
 crates/doc/
 
-# Compiled C examples
-crates/gnitz-capi/examples/c_test
-

@@ -21,9 +21,9 @@ pub enum GnitzSqlError {
     /// An OCC precondition failed (a read table was written concurrently) and the
     /// statement could not commit lose-update-free. `table` names the conflicting
     /// table for an autocommit RMW statement; `None` for a `BEGIN`/`COMMIT`
-    /// transaction (the conflict spans statements). The language bindings map this
-    /// to a dedicated retryable error (Python `GnitzConflictError`, C
-    /// `GNITZ_ERR_TXN_CONFLICT`), distinct from a generic `Exec` failure.
+    /// transaction (the conflict spans statements). The Python binding maps this
+    /// to a dedicated retryable `GnitzConflictError`, distinct from a generic
+    /// `Exec` failure.
     Conflict {
         table: Option<String>,
     },

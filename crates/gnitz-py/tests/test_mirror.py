@@ -14,6 +14,7 @@ server against itself and passes.
 """
 import os
 import signal
+import threading
 
 import pytest
 import gnitz
@@ -498,7 +499,85 @@ async def test_an_open_mirror_leaves_the_rest_of_the_process_alone(client, serve
     assert _zset(_rows(client.execute_sql("SELECT * FROM f", schema_name=sn))) == expected
 
 
-# ── P10 · a mirrored read with the server stopped ────────────────────────────
+# ── P10 · the GIL across a mirror call ──────────────────────────────────────
+
+
+class _Contender:
+    """A thread that does nothing but count, so increments over a window say
+    whether the GIL was available to another thread across it.
+
+    Counts, never elapsed time: a clock would measure the call instead.
+    """
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self.count = 0
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+
+    def _spin(self):
+        while not self._stop.is_set():
+            self.count += 1
+
+    def __enter__(self):
+        self._thread.start()
+        while self.count == 0:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join()
+
+    def during(self, call):
+        """`call()`'s result, and the increments this thread managed while it ran."""
+        before = self.count
+        out = call()
+        return out, self.count - before
+
+
+def test_a_mirror_call_releases_the_gil(client, mirror):
+    """A mirror method that does work lets the rest of the interpreter run.
+
+    Two windows that work — one that talks to the server, one answered entirely
+    off the copy — and one control that only reads memory. The control is what
+    makes the other two mean anything: without it the test cannot tell a released
+    GIL from ambient scheduling.
+
+    Each window holds one extension call and nothing else, so the control's count
+    is structural: no Python bytecode runs inside it to be preempted.
+    """
+    sn = "s" + _uid()
+    _fed_view(client, sn, LINEAR)
+    _churn(client, sn, 1, 200)
+
+    with _Contender() as spin:
+        registered, _ = spin.during(lambda: mirror.mirror_view(sn, "f"))
+        vid = registered.view_id
+
+        _churn(client, sn, 201, 400)
+        client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
+        polled, during_poll = spin.during(mirror.poll)
+
+        before = mirror.requests_sent
+        held, during_mirrored = spin.during(
+            lambda: mirror.execute_sql("SELECT * FROM f", schema_name=sn)
+        )
+        assert mirror.requests_sent == before, "the mirrored read must be answered off the copy"
+
+        _, during_control = spin.during(lambda: mirror.mirrors(vid))
+
+    assert polled, "the poll must have covered the registered view"
+    assert _rows(held), "the mirrored read must return rows, or it proves nothing"
+
+    assert during_poll > 0, "a poll must drop the GIL across its delta read"
+    assert during_mirrored > 0, "a mirrored read must drop the GIL across the engine scan"
+    assert during_control == 0, (
+        f"a metadata getter answers out of memory, so it must never drop the GIL; "
+        f"got {during_control} increments"
+    )
+
+
+# ── P11 · a mirrored read with the server stopped ────────────────────────────
 
 
 def test_the_copy_answers_with_the_server_stopped(own_server, mirror_on, mirror_dir):

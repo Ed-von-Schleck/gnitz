@@ -6,7 +6,8 @@
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr_to_program;
 use crate::ir::{BinOp, BoundExpr};
-use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, NodeId, ReindexRole, Schema, TypeCode};
+use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, ReindexRole, Schema, TypeCode};
+use gnitz_expr::ExprBuilder;
 
 /// Multi-column NULL predicate for a Filter over a composite equijoin key,
 /// reusing the WHERE-clause bound-expr → ExprProgram path so each column index
@@ -25,7 +26,7 @@ pub(crate) fn multi_null_filter_prog(
     cols: &[usize],
     coldefs: &[ColumnDef],
     want_null: bool,
-) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
+) -> Result<gnitz_expr::ExprProgram, GnitzSqlError> {
     // Caller invariant: cols is non-empty (at least one join key column) AND at
     // least one entry is nullable (the outer guard in the join lowering
     // ensures both). Guard here so future callers fail loudly rather than
@@ -88,7 +89,7 @@ pub(crate) fn null_gate(
 /// `0..n`, and the engine places those payload columns at physical
 /// indices `k..k+n` regardless of the key arity `k` (the `k` PK slots precede
 /// them), so the payload offsets never shift with the number of key columns.
-pub(crate) fn build_reindex_program(n_cols: usize) -> gnitz_core::ExprProgram {
+pub(crate) fn build_reindex_program(n_cols: usize) -> gnitz_expr::ExprProgram {
     build_reindex_program_keep(&(0..n_cols).collect::<Vec<_>>())
 }
 
@@ -104,7 +105,7 @@ pub(crate) fn build_reindex_program(n_cols: usize) -> gnitz_core::ExprProgram {
 /// The one producer of every reindex program, so the output slots are **dense
 /// `0..keep.len()` by construction** — which is what lets the engine require
 /// every map to write every declared output slot.
-pub(crate) fn build_reindex_program_keep(keep: &[usize]) -> gnitz_core::ExprProgram {
+pub(crate) fn build_reindex_program_keep(keep: &[usize]) -> gnitz_expr::ExprProgram {
     let mut eb = ExprBuilder::new();
     for (out_pos, &ci) in keep.iter().enumerate() {
         eb.copy_col(ci as u32, out_pos as u32);

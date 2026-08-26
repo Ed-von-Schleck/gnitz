@@ -13,7 +13,8 @@
 //! permuted, non-adjacent compound PK whose OPK sign flip must survive.
 
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
-use gnitz_core::{BatchAppender, ColData, ExprBuilder, GnitzClient, TableProps, ZSetBatch};
+use gnitz_core::{BatchAppender, ColData, GnitzClient, TableProps, ZSetBatch};
+use gnitz_expr::{CmpOp, ExprBuilder};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 
@@ -43,7 +44,7 @@ fn gt_predicate(col: usize, threshold: i64) -> Vec<u8> {
     let mut b = ExprBuilder::new();
     let c = b.load_col_int(col);
     let k = b.load_const(threshold);
-    let cond = b.cmp(gnitz_core::CmpOp::Gt, c, k);
+    let cond = b.cmp(CmpOp::Gt, c, k);
     b.build(cond).encode()
 }
 

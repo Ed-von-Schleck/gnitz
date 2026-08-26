@@ -7,8 +7,8 @@
 
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, NumFunc, StrFunc, TrimMode, UnaryOp};
-use gnitz_core::{ColumnDef, ExprBuilder, Schema, TypeCode};
-use gnitz_expr::{Evaluator, ExprValidateErr, FloatUnaryOp, IntUnaryOp, LogicalProgram, StrOp};
+use gnitz_core::{ColumnDef, Schema, TypeCode};
+use gnitz_expr::{Evaluator, ExprBuilder, ExprValidateErr, FloatUnaryOp, IntUnaryOp, LogicalProgram, StrOp};
 
 /// An IN-list item folds to an integer constant iff it is an integer literal or
 /// the unary negation of one (`-1` binds to `UnaryOp(Neg, LitInt(1))` — sqlparser
@@ -763,7 +763,7 @@ pub(crate) fn compile_bound_expr(
 pub(crate) fn compile_bound_expr_to_program(
     expr: &BoundExpr,
     cols: &[ColumnDef],
-) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
+) -> Result<gnitz_expr::ExprProgram, GnitzSqlError> {
     let mut eb = ExprBuilder::new();
     let reg = compile_bound_expr(expr, cols, &mut eb)?;
     Ok(eb.build(reg))
@@ -778,7 +778,7 @@ pub(crate) fn compile_bound_expr_to_program(
 pub(crate) fn compile_filter_program(
     pred: &BoundExpr,
     cols: &[ColumnDef],
-) -> Result<Option<gnitz_core::ExprProgram>, GnitzSqlError> {
+) -> Result<Option<gnitz_expr::ExprProgram>, GnitzSqlError> {
     match pred {
         BoundExpr::LitInt(v) if *v != 0 => Ok(None),
         _ => Ok(Some(compile_bound_expr_to_program(pred, cols)?)),
@@ -829,7 +829,7 @@ pub(crate) fn compile_wire_conjuncts(exprs: &[&BoundExpr], cols: &[ColumnDef]) -
 /// `LogicalProgram::from_wire` will. Nothing client-side runs it; validating here
 /// turns a round-trip `STATUS_ERROR` naming an internal enum into a plan-time
 /// `Unsupported`.
-fn encode_validated(p: gnitz_core::ExprProgram) -> Result<Vec<u8>, GnitzSqlError> {
+fn encode_validated(p: gnitz_expr::ExprProgram) -> Result<Vec<u8>, GnitzSqlError> {
     let blob = p.encode();
     LogicalProgram::from_wire(&p.code, p.num_regs, p.result_reg, p.const_strings).map_err(expr_unsupported)?;
     Ok(blob)
@@ -909,7 +909,8 @@ fn expr_unsupported(e: ExprValidateErr) -> GnitzSqlError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gnitz_core::{ColumnDef, ExprProgram, Schema, TypeCode};
+    use gnitz_core::{ColumnDef, Schema, TypeCode};
+    use gnitz_expr::ExprProgram;
     use gnitz_wire::ExprOp;
 
     /// Decode a built program the way the engine will. Production resolves locally

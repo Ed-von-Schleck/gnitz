@@ -14,7 +14,8 @@ use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr;
 use crate::ir::BoundExpr;
 use crate::validate::reject_duplicate_column_names;
-use gnitz_core::{ColumnDef, ExprBuilder, ExprProgram, Schema};
+use gnitz_core::{ColumnDef, Schema};
+use gnitz_expr::{ExprBuilder, ExprProgram};
 use sqlparser::ast::SelectItem;
 
 /// One output column of a projection: a verbatim source column

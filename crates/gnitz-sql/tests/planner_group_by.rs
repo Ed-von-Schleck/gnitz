@@ -1,6 +1,6 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::SchemaFacts;
+use gnitz_expr::SchemaFacts;
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 

@@ -21,6 +21,38 @@ use crate::{GnitzError, PyScanResult};
 // while a host that wants to discard and reopen the handle can name it.
 pyo3::create_exception!(_native, GnitzMirrorPoisonedError, GnitzError);
 
+/// A `!Send` value carried across [`Python::detach`].
+///
+/// `Ungil` is `Send` only as a stand-in for "holds no Python reference" —
+/// `detach` runs the closure on this same thread and starts none. A [`Mirror`]
+/// is `!Send` for an unrelated reason, the `Rc`s in the engine under it, and
+/// `gnitz-mirror` does not depend on pyo3, so nothing reachable from one can be
+/// a Python reference.
+struct Confined<T>(T);
+// SAFETY: as above — the value never leaves this thread, and holds nothing of
+// Python's to smuggle out from under the GIL.
+unsafe impl<T> Send for Confined<T> {}
+
+impl<T> Confined<T> {
+    /// Unwrap inside the detached closure. A method rather than a field read:
+    /// reading `.0` would make the closure capture the field, which is the
+    /// `!Send` value itself, and the wrapper would not apply.
+    fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+/// Run `f` on the handle with the GIL released, so the rest of the interpreter
+/// runs across the whole operation — the round trips, and the engine and disk
+/// work between them.
+///
+/// pyo3's borrow flag and the `unsendable` pyclass keep another thread out of
+/// the handle meanwhile: a second thread reaching it raises rather than racing.
+fn detached<T: Send>(py: Python<'_>, m: &mut Mirror, f: impl Send + FnOnce(&mut Mirror) -> T) -> T {
+    let m = Confined(m);
+    py.detach(move || f(m.into_inner()))
+}
+
 /// The one place a [`MirrorError`] becomes a Python exception. `Upstream` keeps
 /// the client's own classification, so an expired cursor still raises
 /// `GnitzDeltaExpiredError`.
@@ -86,10 +118,11 @@ impl PyPollResult {
 /// `BaseException`, which `except Exception` does not catch; that thread dies
 /// and the process lives on.
 ///
-/// **Every method but the constructor and `reconnect` holds the GIL**, where the
-/// same call on a `GnitzClient` releases it: a poll freezes the other Python
-/// threads for a round trip. Keep a separate `GnitzClient` for work that is not
-/// a mirrored read; a mirror cannot be driven from `gnitz.aio`.
+/// **Every method that does work drops the GIL for all of it** — the round
+/// trips, and the engine and disk work between them. Only the metadata getters,
+/// which answer out of memory, hold it.
+///
+/// A mirror cannot be driven from `gnitz.aio`.
 #[pyclass(name = "Mirror", unsendable)]
 pub struct PyMirror {
     inner: Option<Mirror>,
@@ -125,26 +158,29 @@ impl PyMirror {
     /// catalog, one store per mirrored view, and the cursor file.
     #[new]
     pub fn new(py: Python<'_>, base_dir: &str, target: &str) -> PyResult<Self> {
-        // The connect blocks — up to 10 s for a `tls://` target — so drop the
-        // GIL across it, as `GnitzClient.__init__` does. The engine open below
-        // is local disk work and cannot be detached: a `Mirror` is not `Send`.
-        let client = to_py_err(py.detach(|| GnitzClient::connect(target)))?;
-        let inner = Mirror::open(base_dir, client).map_err(|e| mirror_err(&e))?;
+        // The connect blocks — up to 10 s for a `tls://` target — and the engine
+        // open behind it is disk work, so the GIL is down for both.
+        let opened = py.detach(move || Confined(GnitzClient::connect(target).map(|c| Mirror::open(base_dir, c))));
+        let inner = to_py_err(opened.into_inner())?.map_err(|e| mirror_err(&e))?;
         Ok(PyMirror { inner: Some(inner) })
     }
 
     /// Checkpoint (unless poisoned) and release the handle. Calling it twice is
     /// fine.
-    pub fn close(&mut self) {
-        drop(self.inner.take());
+    pub fn close(&mut self, py: Python<'_>) {
+        // The drop checkpoints, so the GIL goes down for it like any other write.
+        if let Some(m) = self.inner.take() {
+            let m = Confined(m);
+            py.detach(move || drop(m));
+        }
     }
 
     pub fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    pub fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_val: Py<PyAny>, _exc_tb: Py<PyAny>) -> bool {
-        self.close();
+    pub fn __exit__(&mut self, py: Python<'_>, _exc_type: Py<PyAny>, _exc_val: Py<PyAny>, _exc_tb: Py<PyAny>) -> bool {
+        self.close(py);
         false
     }
 
@@ -157,10 +193,7 @@ impl PyMirror {
     /// Only a view with a delta feed can be mirrored — create it
     /// `WITH (delta = '<size>')`.
     pub fn mirror_view(&mut self, py: Python<'_>, schema_name: &str, name: &str) -> PyResult<Py<PyPollResult>> {
-        let outcome = self
-            .live()?
-            .mirror_view(schema_name, name)
-            .map_err(|e| mirror_err(&e))?;
+        let outcome = detached(py, self.live()?, |m| m.mirror_view(schema_name, name)).map_err(|e| mirror_err(&e))?;
         Py::new(py, PyPollResult::from(outcome))
     }
 
@@ -168,8 +201,8 @@ impl PyMirror {
     ///
     /// Stop mirroring the relation: the copy and its directory go, and a later
     /// read of it is delegated upstream.
-    pub fn forget_view(&mut self, view_id: u64) -> PyResult<()> {
-        self.live()?.forget_view(view_id).map_err(|e| mirror_err(&e))
+    pub fn forget_view(&mut self, py: Python<'_>, view_id: u64) -> PyResult<()> {
+        detached(py, self.live()?, |m| m.forget_view(view_id)).map_err(|e| mirror_err(&e))
     }
 
     /// poll() -> list[PollResult]
@@ -184,7 +217,7 @@ impl PyMirror {
     /// naming the view. An error therefore carries no report, so treat every
     /// mirrored view as possibly reseeded.
     pub fn poll(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyPollResult>>> {
-        let outcomes = self.live()?.poll().map_err(|e| mirror_err(&e))?;
+        let outcomes = detached(py, self.live()?, |m| m.poll()).map_err(|e| mirror_err(&e))?;
         outcomes
             .into_iter()
             .map(|o| Py::new(py, PyPollResult::from(o)))
@@ -196,8 +229,8 @@ impl PyMirror {
     /// A failure is reported, not fatal: the flush writes shards and publishes
     /// manifests, neither of which mutates what a copy holds, so the handle
     /// stays usable and a retry is sound.
-    pub fn checkpoint(&mut self) -> PyResult<()> {
-        self.live()?.checkpoint().map_err(|e| mirror_err(&e))
+    pub fn checkpoint(&mut self, py: Python<'_>) -> PyResult<()> {
+        detached(py, self.live()?, |m| m.checkpoint()).map_err(|e| mirror_err(&e))
     }
 
     /// Whether a read of `view_id` is answered locally. Answers on a poisoned
@@ -257,10 +290,7 @@ impl PyMirror {
     /// handle does not hold, runs on the connection the handle owns.
     #[pyo3(signature = (sql, schema_name = "public"))]
     pub fn execute_sql(&mut self, py: Python<'_>, sql: &str, schema_name: &str) -> PyResult<Py<PyAny>> {
-        // No `detach`: a `Mirror` is `!Send`, so the planner cannot cross the
-        // closure.
-        let results = SqlPlanner::new(self.live()?, schema_name)
-            .execute(sql)
+        let results = detached(py, self.live()?, |m| SqlPlanner::new(m, schema_name).execute(sql))
             .map_err(|e| classified_err(&e))?;
         sql_results_to_py(py, results)
     }
@@ -273,7 +303,7 @@ impl PyMirror {
     /// where a host reads it.
     #[pyo3(signature = (view_id, include_hidden = false))]
     pub fn scan(&mut self, py: Python<'_>, view_id: u64, include_hidden: bool) -> PyResult<Py<PyScanResult>> {
-        let (schema, batch) = to_py_err(ReadTarget::scan(self.live()?, view_id))?;
+        let (schema, batch) = to_py_err(detached(py, self.live()?, |m| ReadTarget::scan(m, view_id)))?;
         batch_to_lazy(py, schema, batch, None, include_hidden)
     }
 

@@ -545,18 +545,10 @@ impl GnitzClient {
         Ok(base)
     }
 
-    /// Close the connection. Takes `self` by value, so the session — and with it
-    /// the transport — is dropped here; the C ABI calls this to close explicitly.
-    pub fn close(self) {}
-
     // --- Raw ops ---
 
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
         self.session.alloc_table_id()
-    }
-
-    pub fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
-        self.session.alloc_schema_id()
     }
 
     pub fn push(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
@@ -828,9 +820,6 @@ impl GnitzClient {
         index_name: &str,
         is_unique: bool,
     ) -> Result<u64, ClientError> {
-        // Gateway backstop for non-SQL front ends (capi): enforce the ASCII
-        // `[A-Za-z0-9_]` charset `canon_name` relies on. The SQL planner
-        // validates earlier with better error types.
         crate::validate_user_identifier(index_name).map_err(ClientError::ServerError)?;
         let index_name = canon_name(index_name);
         // Arity, 7-bit column range, duplicates — the Err form of the
@@ -1153,9 +1142,6 @@ impl GnitzClient {
         props: TableProps,
         unique_indexes: &[InlineUniqueIndex],
     ) -> Result<u64, ClientError> {
-        // Gateway backstop for non-SQL front ends (capi): enforce the ASCII
-        // `[A-Za-z0-9_]` charset `canon_name` relies on for the names this call
-        // stores. The SQL planner validates earlier with better error types.
         crate::validate_user_identifier(table_name).map_err(ClientError::ServerError)?;
         for spec in unique_indexes {
             crate::validate_user_identifier(spec.name).map_err(ClientError::ServerError)?;
@@ -1165,17 +1151,15 @@ impl GnitzClient {
         // undroppable index. This is the only enforcement point — the SQL planner
         // validates relation names, never column ones.
         for c in columns {
-            crate::reject_reserved_infix(&c.name).map_err(ClientError::ServerError)?;
+            gnitz_wire::reject_reserved_infix(&c.name).map_err(ClientError::ServerError)?;
         }
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
         // Full schema-admissibility rule set (column cap + PK rules), applied
-        // here so a non-SQL (capi) caller gets a clean error before any id
-        // allocation instead of relying on the server-side reject (and
+        // here so a caller that skipped the planner gets a clean error before
+        // any id allocation instead of relying on the server-side reject (and
         // `pack_pk_cols` below can never panic).
-        let pk_indices: Vec<usize> = pk_cols.iter().map(|&c| c as usize).collect();
-        Schema::validate_parts(&pk_indices, columns)
-            .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
+        Schema::validate_parts(pk_cols, columns).map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
         // `dist_prefix_len` is a leading-PK-prefix length (0 = default = full PK);
         // a value past the PK count is meaningless and the engine would silently
         // clamp it, so reject it here to catch the caller's mistake.
@@ -1225,8 +1209,7 @@ impl GnitzClient {
             // Structural rules only (arity, in-range, no duplicates) — unlike a
             // PK, an indexed column may be nullable. In-range against the actual
             // column list also keeps the `columns[c]` read below panic-free.
-            let idx_indices: Vec<usize> = spec.col_indices.iter().map(|&c| c as usize).collect();
-            Schema::validate_pk_cols(&idx_indices, columns.len())
+            gnitz_wire::validate_pk_indices(spec.col_indices, columns.len())
                 .map_err(|e| ClientError::ServerError(format!("create_table: unique index '{}': {e}", spec.name)))?;
             for &c in spec.col_indices {
                 validate_index_col_type(columns[c as usize].type_code)?;
@@ -1366,15 +1349,13 @@ impl GnitzClient {
         // at `pack_pk_cols`, trip the engine's build_schema_from_col_defs assert,
         // or abort the master in `SchemaDescriptor::new`; reject it all here.
         for pv in &views {
-            // Gateway backstop for non-SQL front ends (capi): enforce the ASCII
-            // `[A-Za-z0-9_]` charset `canon_name` relies on. Hidden segment names
-            // are system-generated (`__h…` — the leading `_` is exactly what marks
-            // them non-user), so only user-visible names are validated.
+            // Hidden segment names are system-generated (`__h…` — the leading
+            // `_` is exactly what marks them non-user), so only user-visible
+            // names are validated.
             if let ViewName::Named(n) = &pv.name {
                 crate::validate_user_identifier(n).map_err(ClientError::ServerError)?;
             }
-            let pk_indices: Vec<usize> = pv.pk_cols.iter().map(|&c| c as usize).collect();
-            Schema::validate_parts(&pk_indices, &pv.output_columns)
+            Schema::validate_parts(&pv.pk_cols, &pv.output_columns)
                 .map_err(|e| ClientError::ServerError(format!("View '{}': {e}", pv.name)))?;
         }
 
@@ -1605,7 +1586,7 @@ impl GnitzClient {
         old_col: &str,
         new_col: &str,
     ) -> Result<(), ClientError> {
-        crate::reject_reserved_infix(new_col).map_err(ClientError::ServerError)?;
+        gnitz_wire::reject_reserved_infix(new_col).map_err(ClientError::ServerError)?;
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
         // One resolve yields the tid and the schema together. `alter_col_pair`
@@ -1658,7 +1639,7 @@ impl GnitzClient {
     /// precheck does not scan COL_TAB for names — a duplicate would otherwise
     /// reach storage and only surface later as "column reference is ambiguous".
     pub fn alter_add_column(&mut self, tid: u64, def: &ColumnDef) -> Result<(), ClientError> {
-        crate::reject_reserved_infix(&def.name).map_err(ClientError::ServerError)?;
+        gnitz_wire::reject_reserved_infix(&def.name).map_err(ClientError::ServerError)?;
         let desc = self.describe_by_id(tid)?;
         if desc.schema.visible_column_named(&def.name).is_some() {
             return Err(ClientError::ServerError(format!(

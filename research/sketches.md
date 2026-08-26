@@ -341,7 +341,7 @@ XXHash64 (via the `xxhash-rust` crate) is the correct hash for all sketch struct
 ExaLogLog, KLL, and Theta sketches at the shard level should follow `.xor8`'s sidecar pattern: a `filename + ".exll"`, `filename + ".kll_c<col_idx>"`, and `filename + ".theta_c<col_idx>"` file written atomically alongside the shard. `ShardHandle` loads them at open time with a fallback to `None` if the sidecar does not exist. This ensures backwards compatibility: old shards without sidecars work (sketches are absent but no error); new shards have full statistics.
 
 ### sketch_oxide
-`sketch_oxide` is a 2025 pure-Rust library containing 41 production-ready sketch implementations including UltraLogLog, Binary Fuse Filters, REQ, and others. It is a candidate dependency for the server — evaluate whether its implementations are suitable before building custom ones. The `gnitz-py` and `gnitz-capi` Rust crates could also use it for client-side analytics.
+`sketch_oxide` is a 2025 pure-Rust library containing 41 production-ready sketch implementations including UltraLogLog, Binary Fuse Filters, REQ, and others. It is a candidate dependency for the server — evaluate whether its implementations are suitable before building custom ones. The `gnitz-py` Rust crate could also use it for client-side analytics.
 
 ### Column indexing
 The shard's directory already maps `col_to_reg_map` (column index → register offset in the columnar layout). Sketch construction can iterate column buffers using the same mapping.

@@ -323,7 +323,7 @@ list, this is not. The ones whose semantics are not obvious from the name:
 ## Project structure
 
 Two sides that meet at the wire protocol: the **SQL/client side** (a library,
-also exposed as C and Python bindings) plans and drives queries, and ships them
+also exposed as Python bindings) plans and drives queries, and ships them
 over `gnitz-wire`; the **engine** executes them as a multi-process server and
 never links the planner. `gnitz-mirror` is the sole crate on both sides, and
 links no planner either; `gnitz-py` links it, so the Python extension carries the
@@ -337,7 +337,6 @@ engine too.
 | `gnitz-expr` | The one expression evaluator, and the resolved column addressing it reads through | `wire` |
 | `gnitz-core` | Client core: connection, protocol, and the logical type / expression / circuit model | `wire`, `expr` |
 | `gnitz-sql` | SQL front end: parser, binder, query planner | `core`, `expr`, `wire` |
-| `gnitz-capi` | C ABI bindings over the client core + planner | `core`, `sql` |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `mirror`, `sql`, `wire` |
 | `gnitz-engine` | The single-node database as a library: Z-set store, DBSP operators, circuit compiler, catalog | `wire`, `expr` |
 | `gnitz-server` | The multi-process server binary — the `runtime` rung and nothing else | `engine`, `wire`, `expr` |

@@ -68,8 +68,8 @@ fn delta_err(e: &ClientError) -> PyErr {
     }
 }
 
-/// Map a client error to a Python exception. Every `ClientError` in this file
-/// passes through here.
+/// Map a client error to a Python exception — the default mapping, beside
+/// [`delta_err`] for a path that can raise an expired cursor.
 fn to_py_err<T>(res: Result<T, ClientError>) -> PyResult<T> {
     res.map_err(|e| classified_err(&e))
 }
@@ -1767,9 +1767,9 @@ impl PyGnitzClient {
 
     /// Run one blocking client call: check the client is open, drop the GIL
     /// across it, and map the failure to a Python exception (a retryable OCC
-    /// conflict to `GnitzConflictError`). Every blocking method below goes
-    /// through here, so freezing the other Python threads for a server
-    /// round-trip is impossible to reintroduce by forgetting `detach`.
+    /// conflict to `GnitzConflictError`). What a blocking method takes unless it
+    /// needs its own error mapping — the delta reads and `execute_sql` spell the
+    /// same `detach` out so they can raise their own classes.
     fn call<T: Send>(
         &mut self,
         py: Python<'_>,
@@ -1798,9 +1798,7 @@ impl PyGnitzClient {
     }
 
     pub fn close(&mut self) {
-        if let Some(c) = self.inner.take() {
-            c.close();
-        }
+        self.inner = None;
     }
 
     pub fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -2771,7 +2769,10 @@ fn type_codes() -> Vec<(&'static str, u8)> {
 // Module registration
 // ---------------------------------------------------------------------------
 
-#[pymodule]
+// pyo3 0.29 makes free-threading opt-*out*: a bare `#[pymodule]` emits
+// `Py_MOD_GIL_NOT_USED`. This module holds an `unsendable` pyclass and links the
+// `Rc`-based engine, so that claim would be false.
+#[pymodule(gil_used = true)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyColumnDef>()?;
     m.add_class::<PySchema>()?;

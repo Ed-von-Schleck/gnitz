@@ -433,8 +433,9 @@ impl core::fmt::Display for PkRule {
 
 /// The structural half of the primary-key admission rule: non-empty, within the
 /// [`crate::PK_LIST_MAX_COLS`] arity cap, every index naming a real column, no
-/// duplicates. Needs only the PK list and the column count, so the surfaces that
-/// build a PK before their columns exist (the C ABI) can run it on its own.
+/// duplicates. Split from the column-type half so a caller holding only the PK
+/// list can run it alone; `ncols` is whatever bound that caller has — a real
+/// column count, or a field width for a list whose columns do not exist yet.
 pub fn validate_pk_indices(pk_cols: &[u32], ncols: usize) -> Result<(), PkRule> {
     if pk_cols.is_empty() {
         return Err(PkRule::Empty);
