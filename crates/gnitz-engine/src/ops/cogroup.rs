@@ -1,18 +1,19 @@
 //! Sorted-stream co-group merge skeletons.
 //!
-//! Every place the engine merges two sorted OPK-byte streams — the delta-trace
-//! joins, distinct, the natural-PK reduce reads, and the symmetric set-union
-//! merge — is one operation: **co-group two sorted byte-key
-//! streams** by equal PK, hand each `(key, left-group, right-group)` to the
-//! operator. These skeletons own that control flow; the operator callback owns
-//! the row copy. The skip step galloping-seeks from the live position
-//! (`advance_to`), so K ascending probes over an N-row source
-//! cost `O(K · log gap)`, not `O(K · log N)` or a linear `O(K + N)` scan.
+//! Three skeletons over one operation: **co-group two sorted OPK-byte streams by
+//! equal PK**, handing each `(key, left-group, right-group)` to the operator.
+//! [`cogroup_intersection`] serves the equi delta-trace join, [`cogroup_left`]
+//! distinct, and [`cogroup_union`] the symmetric set-union merge. The skip step
+//! galloping-seeks from the live position, so K ascending probes over an N-row
+//! source cost `O(K · log gap)`, not `O(K · log N)` or a linear `O(K + N)` scan.
+//!
+//! Equal key is the whole contract — which is why the range join's ordered-span
+//! walk is not a fourth skeleton here.
 
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use crate::schema::key::pk_bytes_eq;
+use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
 use crate::storage::{AppendSession, Batch, MemBatch, ReadCursor};
 
 /// First row index past the equal-PK group beginning at `start`. Requires
@@ -106,7 +107,7 @@ pub(crate) fn cogroup_intersection(
     let mut i = 0;
     while i < n && m.valid {
         let dk = delta.get_pk_bytes(i);
-        match dk.cmp(m.current_pk_bytes()) {
+        match compare_pk_ordering(dk, m.current_pk_bytes()) {
             Ordering::Less => i = delta.advance_to(m.current_pk_bytes(), i), // skip delta
             Ordering::Greater => m.advance_to(dk),                           // skip match side
             Ordering::Equal => {
@@ -170,7 +171,7 @@ pub(crate) fn cogroup_union(
             (true, true) => {
                 // Both keys present: temporaries from key() drop at the end of
                 // this `let`, freeing a/b for the per-arm mutation below.
-                let ord = a.key().unwrap().cmp(b.key().unwrap());
+                let ord = compare_pk_ordering(a.key().unwrap(), b.key().unwrap());
                 match ord {
                     Ordering::Less => {
                         let s = a.pos;

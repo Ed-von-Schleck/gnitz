@@ -251,35 +251,19 @@ pub(crate) fn execute_epoch_from(
                 delta_reg,
                 trace_reg,
                 out_reg,
+                probe,
             } => {
                 let left_schema = &program.reg_meta[*delta_reg as usize].schema;
                 let right_schema = &program.reg_meta[*trace_reg as usize].schema;
                 let out_schema = &program.reg_meta[*out_reg as usize].schema;
                 let cursor = cursor_mut!(*trace_reg);
-                let result =
-                    ops::op_join_delta_trace(&reg!(*delta_reg).batch, cursor, left_schema, right_schema, out_schema);
-                reg_mut!(*out_reg).batch = result;
-            }
-
-            Instr::JoinDTRange {
-                delta_reg,
-                trace_reg,
-                out_reg,
-                n_eq,
-                rel,
-            } => {
-                let left_schema = &program.reg_meta[*delta_reg as usize].schema;
-                let right_schema = &program.reg_meta[*trace_reg as usize].schema;
-                let out_schema = &program.reg_meta[*out_reg as usize].schema;
-                let cursor = cursor_mut!(*trace_reg);
-                let result = ops::op_join_delta_trace_range(
+                let result = ops::op_join_delta_trace(
                     &reg!(*delta_reg).batch,
                     cursor,
                     left_schema,
                     right_schema,
                     out_schema,
-                    *n_eq as usize,
-                    *rel,
+                    *probe,
                 );
                 reg_mut!(*out_reg).batch = result;
             }

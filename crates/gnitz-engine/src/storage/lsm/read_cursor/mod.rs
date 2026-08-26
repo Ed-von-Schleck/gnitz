@@ -204,9 +204,7 @@ impl ReadCursor {
     }
 
     /// Reset every source to its first row, positioning the cursor at the first
-    /// row in storage order. Rewinding by row index rather than by seeking the
-    /// all-zero key is what makes this correct for a signed PK, whose minimum is
-    /// a negative value that sorts below the zero key.
+    /// row in storage order — by row index, so no key has to be spelled.
     pub fn rewind(&mut self) {
         for state in self.states.iter_mut() {
             state.position = 0;
@@ -411,12 +409,14 @@ impl ReadCursor {
     /// Seek-free: a caller that has just located `key` through the merge (a
     /// cogroup's `Equal` arm) would pay a discarded comparison for a reposition it
     /// knows is unnecessary. Everyone else calls [`Self::seek_pk_group`] first.
+    ///
+    /// Has its own body rather than deferring to [`Self::for_each_row_while`]
+    /// with an equality `cont`: that closure does not fold into the walk, and the
+    /// call it leaves costs 0.8% of `join_equi_dt_bench`.
     pub(crate) fn for_each_pk_group_row<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], f: F) {
         with_payload_cmp!(self.schema, Self::for_each_pk_group_row_with::<_, _>, self, key, f);
     }
 
-    /// Threads the monomorphized `row_cmp` through each drive, so the per-row
-    /// advance never re-selects the comparator.
     #[inline]
     fn for_each_pk_group_row_with<RowCmp: RowComparator, F: FnMut(&ReadCursor)>(
         &mut self,
@@ -425,6 +425,32 @@ impl ReadCursor {
         row_cmp: RowCmp,
     ) {
         while self.valid && self.current_pk_eq(key) {
+            f(&*self);
+            self.drive_with(row_cmp);
+        }
+    }
+
+    /// Walk forward from the current row while `cont` holds, calling `f` on each;
+    /// `f` reads the row through the committed `current_*` state and must not
+    /// re-enter the cursor. Seek-free — the caller positions it. On return the
+    /// cursor sits ON the first row for which `cont` was false, or is exhausted.
+    ///
+    /// Selects the payload comparator once for the whole walk, where
+    /// [`Self::advance`] re-runs that dispatch per call in `Multi` mode.
+    pub(crate) fn for_each_row_while<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor)>(&mut self, cont: C, f: F) {
+        with_payload_cmp!(self.schema, Self::for_each_row_while_with::<_, _, _>, self, cont, f);
+    }
+
+    /// Threads the monomorphized `row_cmp` through each drive, so the per-row
+    /// advance never re-selects the comparator.
+    #[inline]
+    fn for_each_row_while_with<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor), RowCmp: RowComparator>(
+        &mut self,
+        cont: C,
+        mut f: F,
+        row_cmp: RowCmp,
+    ) {
+        while self.valid && cont(self.current_pk_bytes()) {
             f(&*self);
             self.drive_with(row_cmp);
         }
@@ -480,12 +506,17 @@ impl ReadCursor {
     /// state; it must not re-enter the cursor). The seek/advance/walk loop the
     /// system-table readers (circuit load, view-row retraction) share.
     pub fn for_each_positive_with_prefix<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], mut f: F) {
-        let mut hit = self.seek_first_positive_with_prefix(prefix);
-        while hit {
-            f(&*self);
-            self.advance();
-            hit = self.walk_to_positive_with_prefix(prefix);
+        if !self.seek_first_positive_with_prefix(prefix) {
+            return;
         }
+        self.for_each_row_while(
+            |pk| pk.starts_with(prefix),
+            |c| {
+                if c.current_weight > 0 {
+                    f(c);
+                }
+            },
+        );
     }
 
     /// Walk forward from the current position (no seek) to the next row whose PK

@@ -749,21 +749,57 @@ fn decrement_key_in_place(p: &mut [u8]) {
     }
 }
 
-/// Map `range`'s cut pair to its half-open `[start, end)` OPK key range over a
-/// `stride`-byte key space. `encode(v)` returns the OPK group prefix for cut
-/// value `v` — a `PkBuf` whose `len` is the prefix width, so by `PkBuf`'s own
-/// zero-tail invariant `group(v)` IS `pad(group(v))` (the minimum full key of
-/// the group). Each cut then maps uniformly:
+/// A cut in the OPK key space, named by an OPK group prefix: either that
+/// group's own minimum key or the first key above every member of it. Zero-
+/// padding the prefix to the key width is what makes it the group's minimum.
+#[derive(Clone, Copy)]
+pub(crate) struct KeyCut<'a> {
+    group: &'a [u8],
+    above: bool,
+}
+
+impl<'a> KeyCut<'a> {
+    /// The group's own minimum key — below every member of it.
+    pub(crate) fn min_of(group: &'a [u8]) -> Self {
+        KeyCut { group, above: false }
+    }
+
+    /// The first key above every member of the group. A saturated group — and
+    /// the zero-width group, which is the whole key space — has none.
+    pub(crate) fn above(group: &'a [u8]) -> Self {
+        KeyCut { group, above: true }
+    }
+
+    /// This cut as a `stride`-wide key; `None` when it lies above the whole key
+    /// space. The successor's carry ripples into the equality prefix, landing
+    /// exactly on the first key of the next equality group.
+    fn key(&self, stride: usize) -> Option<PkBuf> {
+        let mut k = PkBuf::from_bytes(self.group);
+        let exists = !self.above || increment_key_in_place(&mut k.bytes[..self.group.len()]);
+        exists.then(|| k.widened(stride))
+    }
+}
+
+/// Half-open `[start, end)` OPK key range between two cuts over a `stride`-byte
+/// key space.
 ///
-/// | cut         | byte key                                                |
-/// |-------------|---------------------------------------------------------|
-/// | `Before(v)` | `pad(group(v))` — below every duplicate of `v`          |
-/// | `After(v)`  | `pad(succ(group(v)))` — above every duplicate of `v`;   |
-/// |             | `succ` overflow ⇒ no key space above the group (`+∞`)   |
+/// `None` = provably empty: `start` lies above the whole key space, or
+/// `start >= end`. `end == None` inside `Some` means the range runs to the table
+/// end.
+pub(crate) fn key_range_between_cuts(start: KeyCut, end: KeyCut, stride: usize) -> Option<(PkBuf, Option<PkBuf>)> {
+    let start = start.key(stride)?;
+    let end = end.key(stride);
+    if end.as_ref().is_some_and(|e| start.pk_bytes() >= e.pk_bytes()) {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Map `range`'s cut pair to its half-open `[start, end)` OPK key range via
+/// [`key_range_between_cuts`]: `Before(v)` is [`KeyCut::min_of`] the group
+/// `encode(v)` names, `After(v)` is [`KeyCut::above`] it. `encode` returns that
+/// group as a `PkBuf` whose `len` is the prefix width.
 ///
-/// `None` = provably empty: a `+∞` start (`After` on a saturated group), or
-/// `start ≥ end` (an inverted / zero-width interval the planner does not
-/// pre-reject). `end == None` inside `Some` means "scan to the table end".
 /// SQL bound semantics (inclusivity, unboundedness, out-of-range saturation)
 /// are resolved to cuts in the planner; none reach this layer.
 pub(crate) fn range_keys_from_cuts(
@@ -771,22 +807,14 @@ pub(crate) fn range_keys_from_cuts(
     stride: usize,
     mut encode: impl FnMut(u128) -> PkBuf,
 ) -> Option<(PkBuf, Option<PkBuf>)> {
-    let mut cut_key = |c: Cut| -> Option<PkBuf> {
-        let mut k = encode(c.value());
-        let prefix_len = k.len as usize;
-        // The carry may ripple into the equality prefix — exactly the first key
-        // of the next equality group; overflow means no key space above it.
-        if matches!(c, Cut::After(_)) && !increment_key_in_place(&mut k.bytes[..prefix_len]) {
-            return None;
+    fn cut(c: Cut, group: &PkBuf) -> KeyCut<'_> {
+        match c {
+            Cut::Before(_) => KeyCut::min_of(group.pk_bytes()),
+            Cut::After(_) => KeyCut::above(group.pk_bytes()),
         }
-        Some(k.widened(stride))
-    };
-    let start = cut_key(range.start)?;
-    let end = cut_key(range.end);
-    if end.as_ref().is_some_and(|e| start.pk_bytes() >= e.pk_bytes()) {
-        return None;
     }
-    Some((start, end))
+    let (s, e) = (encode(range.start.value()), encode(range.end.value()));
+    key_range_between_cuts(cut(range.start, &s), cut(range.end, &e), stride)
 }
 
 /// [`range_keys_from_cuts`] for a range whose leading `range.eq_vals()` columns

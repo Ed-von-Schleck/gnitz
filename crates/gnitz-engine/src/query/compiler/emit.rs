@@ -2,6 +2,7 @@
 //! constructors, and `build_plan` (one plan, pre or post exchange).
 
 use super::*;
+use crate::ops::{JoinProbe, RangeProbe};
 use crate::query::vm::{reads_reg, Instr, IntegrateAvi, IntegrateTarget, ReduceAvi, ReindexOperand};
 
 // ---------------------------------------------------------------------------
@@ -162,25 +163,6 @@ impl EmitCtx<'_> {
         let func = LogicalProgram::from_blob(blob, "filter")
             .and_then(|p| ScalarFunc::from_predicate(p, schema))
             .map_err(expr_reject("filter: invalid predicate program"))?;
-        Ok(self.push_func(func))
-    }
-
-    /// A MAP whose program is all-`CopyCol`: output payload `i` ← input column
-    /// `src_indices[i]`, widening into a promoted slot when the output column is
-    /// wider. The source type is derived per-column in `resolve` from `in_schema`.
-    fn create_universal_projection(
-        &mut self,
-        src_indices: &[u32],
-        in_schema: &SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
-    ) -> Result<*const ScalarFunc, CompileError> {
-        let prog = LogicalProgram::copy_cols(src_indices);
-        // `from_map` validates. The out-schema is derived here rather than
-        // supplied, but from a client column list: `build_map_output_schema` drops
-        // PK sources while `copy_cols` numbers destinations densely, so a PK index
-        // leaves a copy addressing a slot that does not exist.
-        let func = ScalarFunc::from_map(prog, in_schema, out_schema)
-            .map_err(expr_reject("projection map: program/schema mismatch"))?;
         Ok(self.push_func(func))
     }
 
@@ -364,40 +346,22 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
             let a_schema = ctx.reg_meta[a_reg as usize].schema;
             let b_schema = ctx.reg_meta[b_reg as usize].schema;
             // Both kinds produce the same output layout — only the probe differs —
-            // so the schema, the register meta and the operand registers are shared
-            // and each arm contributes only its instruction.
-            let instr = match kind {
-                gnitz_wire::JoinKind::DeltaTrace => Instr::JoinDT {
-                    delta_reg: a_reg,
-                    trace_reg: b_reg,
-                    out_reg: reg_id,
-                },
+            // so the schema, the register meta and the operand registers are shared.
+            let probe = match kind {
+                gnitz_wire::JoinKind::DeltaTrace => JoinProbe::Equi,
                 gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => {
-                    // The trace side's reindexed key is `[eq slots…, range slot]`, so
-                    // its PK arity is exactly `n_eq + 1` (ops/join/range.rs). A crafted
-                    // `n_eq` otherwise slices `columns[..n_eq]` out of range at runtime;
-                    // reject here, promoting the release-stripped `debug_assert` to a
-                    // compile-time guard (also closing the `dispatch.rs` slice).
-                    if *n_eq as usize + 1 != b_schema.pk_indices().len() {
-                        return Err(CompileError::Rejected(
-                            "range join: n_eq does not match trace key arity",
-                        ));
-                    }
-                    // `n_eq`/`rel` ride to the op so it can derive the eq-prefix /
-                    // range-slot split and the cut direction.
-                    Instr::JoinDTRange {
-                        delta_reg: a_reg,
-                        trace_reg: b_reg,
-                        out_reg: reg_id,
-                        n_eq: *n_eq,
-                        rel: *rel,
-                    }
+                    JoinProbe::Range(bake_range_probe(&a_schema, &b_schema, *n_eq, *rel)?)
                 }
             };
             let out_schema = merge_schemas_for_join(&a_schema, &b_schema)
                 .ok_or(CompileError::Rejected("join: merged schema exceeds MAX_COLUMNS"))?;
             ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
-            ctx.builder.push(instr);
+            ctx.builder.push(Instr::JoinDT {
+                delta_reg: a_reg,
+                trace_reg: b_reg,
+                out_reg: reg_id,
+                probe,
+            });
         }
 
         gnitz_wire::OpNode::IntegrateSink => {
@@ -471,6 +435,39 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
     Ok(())
 }
 
+/// Resolve a wire range-join relation against the two input schemas into the
+/// probe the operator runs, rejecting a circuit the walk could not slice safely.
+/// A circuit is client-supplied catalog data and the operator's own asserts are
+/// stripped in release, so this is where those preconditions are enforced.
+fn bake_range_probe(
+    a_schema: &SchemaDescriptor,
+    b_schema: &SchemaDescriptor,
+    n_eq: u8,
+    rel: gnitz_wire::RangeRel,
+) -> Result<RangeProbe, CompileError> {
+    // The trace's reindexed key is `[eq slots…, range slot]`.
+    if n_eq as usize + 1 != b_schema.pk_indices().len() {
+        return Err(CompileError::Rejected(
+            "range join: n_eq does not match trace key arity",
+        ));
+    }
+    // Both sides reindex at the pair's common promoted type, so their PK regions
+    // have one width — which the walk slices both of at.
+    if a_schema.pk_stride() != b_schema.pk_stride() {
+        return Err(CompileError::Rejected(
+            "range join: delta and trace PK strides differ (both sides must reindex at the pair's common type)",
+        ));
+    }
+    // Not implied by the arity check above: `leading_key_size` sums *schema*-order
+    // columns, so a crafted circuit can spend the whole key on the eq prefix while
+    // still naming `n_eq + 1` PK columns.
+    let eq_size = b_schema.leading_key_size(n_eq as usize);
+    if eq_size >= b_schema.pk_stride() as usize {
+        return Err(CompileError::Rejected("range join: eq prefix covers the whole key"));
+    }
+    Ok(RangeProbe::of(eq_size, rel))
+}
+
 // ---------------------------------------------------------------------------
 // MAP emission
 // ---------------------------------------------------------------------------
@@ -506,13 +503,14 @@ fn dense_copy_srcs(prog: &LogicalProgram, in_schema: &SchemaDescriptor) -> Resul
 }
 
 /// The three `MapKind`s differ only in how they derive `(output schema, map
-/// function, reindex operand)`; the emission is shared. The `Expression` arm's
-/// identity elision is the one path that emits nothing, so it returns early.
+/// program, reindex operand)`; building the `ScalarFunc`, eliding an identity and
+/// the emission are shared. Each arm hands its `LogicalProgram` down rather than
+/// consuming it, so the shared exit's identity check sees every arm.
 fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) -> Result<(), CompileError> {
     let loaded = ctx.loaded;
     let in_reg = ctx.in_reg(nid, PORT_IN, "map: missing input port")?;
     let in_reg_schema = ctx.reg_meta[in_reg as usize].schema;
-    let (node_schema, fp, reindex) = match mk {
+    let (node_schema, prog, reindex) = match mk {
         gnitz_wire::MapKind::Expression {
             program,
             reindex_cols,
@@ -522,10 +520,6 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             // One decode serves the structural scans below and `from_map`; the
             // scans never touch the const pool, but `from_map` does.
             let prog = decode_map_program(program)?;
-            if reindex_cols.is_empty() && copies_input_verbatim(&prog, &in_reg_schema, &loaded.out_schema) {
-                ctx.out_reg_of.insert(nid, in_reg);
-                return Ok(());
-            }
             if oob_cols(reindex_cols, &in_reg_schema) {
                 return Err(CompileError::Rejected("map: reindex columns out of range"));
             }
@@ -558,21 +552,13 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
                     .output_schema(&in_reg_schema, &dense_copy_srcs(&prog, &in_reg_schema)?)
                     .ok_or(CompileError::Rejected("map: reindex output exceeds MAX_COLUMNS"))?,
             };
-            let func = ScalarFunc::from_map(prog, &in_reg_schema, &node_schema)
-                .map_err(expr_reject("map: program/schema mismatch"))?;
-            // A reindex-free map inherits the input PK region verbatim
-            // (`PkFill::Copy`); both reindex arms overwrite every row's PK.
-            if reindex_cols.is_empty() && func.map_out_schema().pk_stride() != in_reg_schema.pk_stride() {
-                return Err(CompileError::Rejected("map: output PK stride differs from the input's"));
-            }
-            let fp = ctx.push_func(func);
             let reindex = match packer {
                 None => ReindexOperand::None,
                 Some(p) => ReindexOperand::Pack {
                     packer_idx: ctx.builder.add_reindex_packer(p),
                 },
             };
-            (node_schema, fp, reindex)
+            (node_schema, prog, reindex)
         }
 
         gnitz_wire::MapKind::HashRow(proj_cols, target_tcs, branch_id) => {
@@ -589,8 +575,11 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             let src_indices: Vec<u32> = proj_cols.iter().map(|&c| c as u32).collect();
             let node_schema = hashrow_output_schema(&in_reg_schema, &src_indices, target_tcs)
                 .ok_or(CompileError::Rejected("hash-row map: output exceeds MAX_COLUMNS"))?;
-            let fp = ctx.create_universal_projection(&src_indices, &in_reg_schema, &node_schema)?;
-            (node_schema, fp, ReindexOperand::HashRow { branch_id: *branch_id })
+            (
+                node_schema,
+                LogicalProgram::copy_cols(&src_indices),
+                ReindexOperand::HashRow { branch_id: *branch_id },
+            )
         }
 
         gnitz_wire::MapKind::Projection(cols) => {
@@ -604,10 +593,32 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             // PK-inclusive and lives inside the builder.
             let node_schema = build_map_output_schema(&in_reg_schema, &src_indices)
                 .ok_or(CompileError::Rejected("projection map: output exceeds MAX_COLUMNS"))?;
-            let fp = ctx.create_universal_projection(&src_indices, &in_reg_schema, &node_schema)?;
-            (node_schema, fp, ReindexOperand::None)
+            (
+                node_schema,
+                LogicalProgram::copy_cols(&src_indices),
+                ReindexOperand::None,
+            )
         }
     };
+
+    // A MAP that reproduces its input row verbatim emits nothing; the node's
+    // consumers read the input register instead. A reindex overwrites every row's
+    // PK, so it is never an identity.
+    if matches!(reindex, ReindexOperand::None) && copies_input_verbatim(&prog, &in_reg_schema, &node_schema) {
+        ctx.out_reg_of.insert(nid, in_reg);
+        return Ok(());
+    }
+    // For the projection arms the output schema is derived from a client column
+    // list rather than supplied, and `build_map_output_schema` drops PK sources
+    // while `copy_cols` numbers destinations densely — so a PK index leaves a copy
+    // addressing a slot that does not exist. This is what catches it.
+    let func = ScalarFunc::from_map(prog, &in_reg_schema, &node_schema)
+        .map_err(expr_reject("map: program/schema mismatch"))?;
+    // A reindex-free map inherits the input PK region verbatim (`PkFill::Copy`).
+    if matches!(reindex, ReindexOperand::None) && func.map_out_schema().pk_stride() != in_reg_schema.pk_stride() {
+        return Err(CompileError::Rejected("map: output PK stride differs from the input's"));
+    }
+    let fp = ctx.push_func(func);
 
     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
     let func_idx = ctx.builder.func_idx(fp);

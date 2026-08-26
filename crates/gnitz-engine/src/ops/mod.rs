@@ -1,8 +1,9 @@
 //! The DBSP operators: the kernels a compiled circuit's instructions dispatch
 //! to, each consuming and emitting deltas rather than recomputing from state.
 //!
-//!   - `linear`    — filter, map, negate, union (Theorem 3.3: no state added)
-//!   - `join`      — the bilinear operators, equi and range, and their traces
+//!   - `linear`    — filter, map, negate, union, null-extend (Theorem 3.3: no
+//!     state added)
+//!   - `join`      — the bilinear operator, equi and range, over one probe
 //!   - `reduce`    — the aggregates and their secondary value indexes
 //!   - `distinct`  — the weight clamps every set operation is built from
 //!   - `exchange`  — repartition, relay and broadcast across workers
@@ -25,6 +26,8 @@ mod reindex;
 mod util;
 
 #[cfg(test)]
+mod bench_join;
+#[cfg(test)]
 mod bench_secondary_index;
 
 #[cfg(test)]
@@ -35,7 +38,7 @@ pub use exchange::{
     op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, reset_slots, RouteMode,
 };
 pub(crate) use index::{op_integrate_with_indexes, AviBake, IntegrateTarget as OpsIntegrateTarget};
-pub(crate) use join::{op_join_delta_trace, op_join_delta_trace_range};
+pub(crate) use join::{op_join_delta_trace, JoinProbe, RangeProbe};
 pub(crate) use linear::{op_filter, op_map, op_negate, op_null_extend, op_union, ReindexSpec};
 pub(crate) use reduce::{build_reduce_output_schema, op_reduce, AdhocFold, AggDescriptor, AviHistory, ReducePlan};
 pub(crate) use reindex::ReindexPacker;

@@ -52,17 +52,14 @@ pub(crate) enum Instr {
         lo: i64,
         hi: i64,
     },
+    /// The delta-trace inner join, equi and range alike: the probe is baked by
+    /// the compiler from the wire's `JoinKind`, so the wire's relation spelling
+    /// never reaches the instruction set.
     JoinDT {
         delta_reg: u16,
         trace_reg: u16,
         out_reg: u16,
-    },
-    JoinDTRange {
-        delta_reg: u16,
-        trace_reg: u16,
-        out_reg: u16,
-        n_eq: u8,
-        rel: gnitz_wire::RangeRel,
+        probe: crate::ops::JoinProbe,
     },
     WorkerFilter {
         in_reg: u16,
@@ -120,7 +117,7 @@ pub(crate) fn reads_reg(instr: &Instr, r: u16) -> bool {
         | Instr::Integrate { in_reg, .. }
         | Instr::Reduce { in_reg, .. } => *in_reg == r,
         Instr::Union { in_a, in_b, .. } => *in_a == r || *in_b == r,
-        Instr::JoinDT { delta_reg, .. } | Instr::JoinDTRange { delta_reg, .. } => *delta_reg == r,
+        Instr::JoinDT { delta_reg, .. } => *delta_reg == r,
         Instr::Halt => false,
     }
 }
@@ -142,7 +139,6 @@ pub(crate) fn writes_state(instr: &Instr) -> bool {
         | Instr::NullExtend { .. }
         | Instr::Union { .. }
         | Instr::JoinDT { .. }
-        | Instr::JoinDTRange { .. }
         | Instr::Halt => false,
     }
 }
@@ -1003,6 +999,7 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         // reg 0 = left delta, reg 1 = right trace, reg 2 = output
         builder.push(Instr::JoinDT {
+            probe: crate::ops::JoinProbe::Equi,
             delta_reg: 0,
             trace_reg: 1,
             out_reg: 2,
@@ -1049,6 +1046,7 @@ mod tests {
 
         let mut builder = ProgramBuilder::new();
         builder.push(Instr::JoinDT {
+            probe: crate::ops::JoinProbe::Equi,
             delta_reg: 0,
             trace_reg: 1,
             out_reg: 2,

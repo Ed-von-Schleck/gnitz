@@ -409,8 +409,10 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
     let union = cur;
 
     // 2. Both `Union` inputs must be `Join(DeltaTrace)`, optionally behind one
-    //    `Map` (`normalize_to_ab`'s per-branch projection, emitted for both
-    //    branches but elidable as an identity).
+    //    `Map` — `normalize_to_ab`'s per-branch projection. The node is in the
+    //    circuit on both branches whatever `emit_map` does with it: the AB one is
+    //    an identity the emitter elides, the BA one a real column permutation
+    //    that emits.
     let ins = loaded
         .incoming
         .get(&union)
@@ -1684,6 +1686,96 @@ mod tests {
         fn compiles(&self, mid: gnitz_wire::OpNode) -> bool {
             self.build(mid).is_ok()
         }
+    }
+
+    /// `ScanDelta(10) ⋈range IntegrateTrace(ScanDelta(11)) → IntegrateSink`,
+    /// compiled against the two given source schemas. Reports whether it
+    /// compiles.
+    fn range_join_plan(
+        delta_schema: SchemaDescriptor,
+        trace_schema: SchemaDescriptor,
+        n_eq: u8,
+    ) -> Result<PlanBuildResult, CompileError> {
+        use gnitz_wire::{JoinKind, OpNode, RangeRel};
+        let dir = tempfile::tempdir().unwrap();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, scan_delta(10));
+        nodes.insert(1, scan_delta(11));
+        nodes.insert(2, OpNode::IntegrateTrace);
+        nodes.insert(
+            3,
+            OpNode::Join(JoinKind::DeltaTraceRange {
+                n_eq,
+                rel: RangeRel::Lt,
+            }),
+        );
+        nodes.insert(4, OpNode::IntegrateSink);
+        let loaded = loaded_for_test(
+            nodes,
+            vec![(0, 3, PORT_IN_A), (1, 2, PORT_IN), (2, 3, PORT_TRACE), (3, 4, PORT_IN)],
+        );
+        let ext: ExtTables = HashMap::from([(10, delta_schema), (11, trace_schema)]);
+        build_plan(
+            &loaded,
+            &no_skips(),
+            &loaded.ordered,
+            &ext,
+            test_site(dir.path().to_str().unwrap(), 1),
+            PlanTarget::Subgraph { out: 4 },
+        )
+    }
+
+    /// The range probe's preconditions are enforced at compile time, not by a
+    /// `debug_assert` a release build strips. The walk slices both sides' PK
+    /// regions at one equality width, so a crafted circuit whose two sides
+    /// reindex to different strides — or whose `n_eq` leaves no range slot — must
+    /// be rejected rather than reach the operator.
+    #[test]
+    fn test_range_join_probe_preconditions_rejected() {
+        // The shape the reindex packer produces: `[eq slot, range slot]` PK, then
+        // payload.
+        let band = |eq_tc: u8| {
+            SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(eq_tc, 0),
+                    SchemaColumn::new(type_code::U64, 0),
+                    SchemaColumn::new(type_code::I64, 0),
+                ],
+                &[0, 1],
+            )
+        };
+        let wide = band(type_code::U64); // pk_stride 16
+        let narrow = band(type_code::U32); // pk_stride 12
+        let rejection = |d, t, n_eq| match range_join_plan(d, t, n_eq) {
+            Err(CompileError::Rejected(guard)) => guard,
+            other => panic!("expected a rejection, got {:?}", other.map(|_| "a plan")),
+        };
+        assert!(
+            range_join_plan(wide, wide, 1).is_ok(),
+            "a matched pair at the common promoted type must compile"
+        );
+        const STRIDE: &str =
+            "range join: delta and trace PK strides differ (both sides must reindex at the pair's common type)";
+        assert_eq!(rejection(narrow, wide, 1), STRIDE, "delta side narrower than the trace");
+        assert_eq!(rejection(wide, narrow, 1), STRIDE, "delta side wider than the trace");
+
+        // `leading_key_size` sums *schema*-order columns, so a PK-last column
+        // order — which the packer never emits but a crafted circuit can name —
+        // puts the whole 8-byte key inside the `n_eq = 1` prefix while the key
+        // arity is still `n_eq + 1`. That leaves no range slot.
+        let pk_last = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(type_code::U32, 0),
+            ],
+            &[1, 2],
+        );
+        assert_eq!(
+            rejection(pk_last, pk_last, 1),
+            "range join: eq prefix covers the whole key",
+            "an eq prefix leaving no range slot",
+        );
     }
 
     /// Build `ScanDelta(10) → mid → IntegrateSink` and report whether it compiles.
