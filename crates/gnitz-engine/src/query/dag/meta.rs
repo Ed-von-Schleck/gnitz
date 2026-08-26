@@ -16,7 +16,7 @@ pub enum RelayRoute {
     /// The source feeds several distinct reindex keys: no single key
     /// co-partitions it with the trace sides, so the round must be refused
     /// rather than routed by a key nothing was stored under
-    /// (see `compiler::load::scatter_key`).
+    /// (see `compiler::load::scatter_key_of_scan`).
     NoSingleKey,
     /// Pure range join (`n_eq == 0`): the matches are spread over the whole key
     /// space, so every worker needs the full delta and trims to its owned slice
@@ -176,6 +176,9 @@ pub(super) struct DepMap {
 }
 
 impl DepMap {
+    /// Both maps are a pure function of the `CircuitNodes` system table, so only
+    /// a writer of that table has dirtied them — the catalog ingest hook, and a
+    /// dropped base table whose scan edges outlive it.
     pub(super) fn invalidate(&mut self) {
         self.valid = false;
     }
@@ -520,8 +523,8 @@ mod tests {
         nodes.insert(
             1,
             OpNode::Map(MapKind::Expression {
-                // The minimum an expression program needs to parse.
-                program: vec![0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                // An empty but decodable program; nothing here ever executes it.
+                program: gnitz_expr::ExprBuilder::new().build(0).encode(),
                 reindex_cols: key_cols,
                 reindex_target_tcs: vec![],
                 role: ReindexRole::ScatterKey,

@@ -34,7 +34,7 @@ pub(crate) enum ChildAddr<'a> {
     /// at this rank, and does so *after* the store handles have been reopened —
     /// so the delta store's directory would be unlinked out from under a live
     /// `Table`. It also keeps a catalog-owned store out of a grammar the compiler
-    /// owns (`child_scratch_dir` and its `ScratchGuard` create and clean up
+    /// owns (`EmitCtx::create_child_table` and its `ScratchGuard` create and clean up
     /// `Scratch` children).
     Delta { rank: u32 },
     /// `idx_{id}` — a secondary index's own directory. Not a store of the owner
@@ -86,7 +86,7 @@ impl<'a> ChildAddr<'a> {
 
     /// The child `name` denotes, or `None` if it is in neither grammar. The
     /// scratch split is right-anchored because child names contain `_`
-    /// themselves (`_reduce_in_{vid}_{nid}`).
+    /// themselves (`_reduce_{vid}_{nid}`).
     pub(crate) fn parse(name: &'a str) -> Option<Self> {
         if let Some(rest) = name.strip_prefix('w') {
             if let Some((rank, of)) = rest.split_once("of") {
@@ -265,7 +265,7 @@ mod tests {
             ChildAddr::Worker { rank: 0, of: 1 },
             ChildAddr::Worker { rank: 3, of: 64 },
             ChildAddr::Scratch {
-                child: "_reduce_in_9_3",
+                child: "_reduce_9_3",
                 rank: 2,
             },
             ChildAddr::Index { id: 7 },

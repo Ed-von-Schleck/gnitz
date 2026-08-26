@@ -376,7 +376,9 @@ fn join_range_dt_bench() {
                             &schema,
                             &schema,
                             &out_schema,
-                            JoinProbe::Range(RangeProbe::of(schema.leading_key_size(n_eq), rel)),
+                            JoinProbe::Range(
+                                RangeProbe::new(&schema, &schema, n_eq as u8, rel).expect("bench probe is well-formed"),
+                            ),
                         );
                         out_rows = out.count;
                         std::hint::black_box(&out);

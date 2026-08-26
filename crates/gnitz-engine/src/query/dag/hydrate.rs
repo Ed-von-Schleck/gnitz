@@ -90,7 +90,7 @@ impl DagEngine {
                 PkSetGather::open(keys, seed_schema, |s, e| entry.open_cursor_in_range(s, e))
             }
             Hydration::Join { seed_table, .. } => {
-                let trace = &sub.vm.owned_tables[seed_table as usize];
+                let trace = sub.vm.program.table_mut(seed_table);
                 PkSetGather::open(keys, seed_schema, |s, e| trace.open_cursor_in_range(s, e))
             }
         };

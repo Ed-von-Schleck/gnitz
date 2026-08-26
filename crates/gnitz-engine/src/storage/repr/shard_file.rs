@@ -1325,7 +1325,7 @@ mod for_codec_tests {
         use std::time::Instant;
 
         // A representative re-keyed ex-PK column: 1M I64 rows over a narrow
-        // range far from zero (the `_int_`/`_hist_`/`_reduce_in_` shape).
+        // range far from zero (the `_int_`/`_hist_`/`_reduce_` shape).
         let n = 1_000_000usize;
         let vals: Vec<i128> = (0..n).map(|i| 3_000_000_000i128 + (i % 4000) as i128).collect();
         let raw = pack(&vals, 8);

@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::ops::{JoinProbe, RangeProbe};
-use crate::query::vm::{reads_reg, Instr, IntegrateAvi, IntegrateTarget, ReduceAvi, ReindexOperand};
+use crate::query::vm::{reads_reg, FuncIdx, Instr, IntegrateAvi, IntegrateTarget, ReduceAvi, ReindexOperand, TableIdx};
 
 // ---------------------------------------------------------------------------
 // Expression + scalar function construction helpers
@@ -34,37 +34,6 @@ pub(super) fn ext_schema(
     what: &'static str,
 ) -> Result<SchemaDescriptor, CompileError> {
     ext_tables.get(&tid).copied().ok_or(CompileError::Rejected(what))
-}
-
-/// Both inputs of a `Union` share a physical layout (equal type codes, sizes, and
-/// PK indices); only per-column nullability may differ. Return `a`'s schema with
-/// each column's nullability OR-ed with `b`'s, so a null-carrying side forces the
-/// null-aware `Generic` row comparator instead of the null-blind `FixedIntNonnull`
-/// fast path (which orders by raw payload bytes and would fail to coalesce two
-/// logically-NULL rows carrying non-zero bytes under the null bit).
-pub(super) fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> SchemaDescriptor {
-    debug_assert_eq!(a.num_columns(), b.num_columns(), "union inputs must share a layout");
-    debug_assert_eq!(a.pk_indices(), b.pk_indices(), "union inputs must share a layout");
-    let cols: Vec<SchemaColumn> = (0..a.num_columns())
-        .map(|c| {
-            let (ac, bc) = (a.columns[c], b.columns[c]);
-            debug_assert_eq!(ac.type_code, bc.type_code, "union inputs must share a layout");
-            SchemaColumn::new(ac.type_code, ac.nullable | bc.nullable)
-        })
-        .collect();
-    SchemaDescriptor::new(&cols, a.pk_indices())
-}
-
-/// Path of a per-worker scratch directory under `view_dir`. Rank-stamped because
-/// forked workers share `view_dir`; an un-stamped path would have every worker
-/// open the same directory and clobber each other's shard files. The name comes
-/// from `ChildAddr`, which also parses it back for the boot and rebuild sweeps.
-pub(super) fn child_scratch_dir(view_dir: &str, child_name: &str) -> String {
-    crate::storage::ChildAddr::Scratch {
-        child: child_name,
-        rank: worker_rank(),
-    }
-    .dir(view_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -115,14 +84,15 @@ impl Drop for ScratchGuard {
 #[allow(clippy::vec_box)]
 pub(super) struct EmitCtx<'a> {
     pub loaded: &'a LoadedCircuit,
-    pub skip_nodes: &'a HashSet<i32>,
+    /// Nodes the optimizer elided. A pure function of `loaded` — derived here
+    /// rather than threaded in, so no caller can hand a build a skip set that
+    /// disagrees with its circuit.
+    pub skip_nodes: HashSet<i32>,
     pub ext_tables: &'a ExtTables,
     pub site: super::ViewSite<'a>,
     pub builder: ProgramBuilder,
     pub out_reg_of: HashMap<i32, u16>,
     pub reg_meta: Vec<RegisterMeta>,
-    pub owned_tables: Vec<Box<Table>>,
-    pub owned_funcs: Vec<Box<ScalarFunc>>,
     pub source_reg_map: HashMap<i64, u16>,
     pub sink_reg_id: Option<u16>,
     /// Set by `emit_reduce` when it emits a global-ground aggregate — the one
@@ -144,33 +114,24 @@ impl EmitCtx<'_> {
         self.loaded.out_schema.placement().is_replicated()
     }
 
-    /// Box `func`, keep it alive in `owned_funcs`, and return a raw pointer into
-    /// the box. Valid for the box's lifetime — the heap `ScalarFunc` is stable
-    /// across the `Vec`'s growth — which is what the VM's raw `*const ScalarFunc`
-    /// handles rely on.
-    fn push_func(&mut self, func: ScalarFunc) -> *const ScalarFunc {
-        self.owned_funcs.push(Box::new(func));
-        &**self.owned_funcs.last().unwrap() as *const ScalarFunc
-    }
-
     /// Decode + validate a client filter blob against `schema`, then build its
     /// predicate `ScalarFunc`.
-    fn create_expr_predicate(
-        &mut self,
-        blob: &[u8],
-        schema: &SchemaDescriptor,
-    ) -> Result<*const ScalarFunc, CompileError> {
+    fn create_expr_predicate(&mut self, blob: &[u8], schema: &SchemaDescriptor) -> Result<FuncIdx, CompileError> {
         let func = LogicalProgram::from_blob(blob, "filter")
             .and_then(|p| ScalarFunc::from_predicate(p, schema))
             .map_err(expr_reject("filter: invalid predicate program"))?;
-        Ok(self.push_func(func))
+        Ok(self.builder.push_func(func))
     }
 
-    /// Create a child table in a rank-stamped subdirectory of the view's
-    /// directory, tracked by the scratch guard (so a later compile failure
-    /// removes it).
+    /// Create a child table in a [`crate::storage::ChildAddr::Scratch`]
+    /// subdirectory of the view's directory, tracked by the scratch guard (so a
+    /// later compile failure removes it).
     fn create_child_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<Table, CompileError> {
-        let child_dir = child_scratch_dir(self.site.dir, child_name);
+        let child_dir = crate::storage::ChildAddr::Scratch {
+            child: child_name,
+            rank: worker_rank(),
+        }
+        .dir(self.site.dir);
         // Track the path before creating so cleanup also removes a partially
         // created directory if Table::new fails.
         self.scratch.track(child_dir.clone());
@@ -178,27 +139,21 @@ impl EmitCtx<'_> {
             .map_err(|e| CompileError::StorageFailed("child table create failed", e))
     }
 
-    /// Create a child table, keep it alive in `owned_tables`, and return a raw
-    /// pointer into the box. When `trace_reg` is given, mark it a trace register
-    /// backed by the new table (`bind_trace_cursors` opens a cursor on it
-    /// each epoch).
+    /// Create a child table, hand it to the program, and return its instruction
+    /// operand. When `trace_reg` is given, mark it a trace register backed by the
+    /// new table (`bind_trace_cursors` opens a cursor on it each epoch).
     fn add_owned_trace_table(
         &mut self,
         child_name: &str,
         schema: SchemaDescriptor,
         trace_reg: Option<u16>,
-    ) -> Result<*mut Table, CompileError> {
+    ) -> Result<TableIdx, CompileError> {
         let t = self.create_child_table(child_name, schema)?;
-        let idx = self.owned_tables.len();
-        self.owned_tables.push(Box::new(t));
-        let ptr = &*self.owned_tables[idx] as *const Table as *mut Table;
+        let idx = self.builder.push_table(t);
         if let Some(reg) = trace_reg {
-            // Each node contributes at most three owned tables and `build_plan`
-            // already bounds the node count well below `u16::MAX / 3`.
-            debug_assert!(idx <= u16::MAX as usize);
-            self.reg_meta[reg as usize] = RegisterMeta::trace(schema, idx as u16);
+            self.reg_meta[reg as usize] = RegisterMeta::trace(schema, idx);
         }
-        Ok(ptr)
+        Ok(idx)
     }
 
     /// The resolved input register of `nid`'s `port`, or the named compile
@@ -220,9 +175,8 @@ impl EmitCtx<'_> {
         id
     }
 
-    /// A plain integrate of `in_reg` into `table`'s trace.
-    fn push_integrate(&mut self, in_reg: u16, table: *mut Table) {
-        let table_idx = self.builder.table_idx(table);
+    /// A plain integrate of `in_reg` into the trace at `table_idx`.
+    fn push_integrate(&mut self, in_reg: u16, table_idx: TableIdx) {
         self.builder.push(Instr::Integrate {
             in_reg,
             target: IntegrateTarget::Trace(table_idx),
@@ -234,12 +188,7 @@ impl EmitCtx<'_> {
 // Instruction emission — per-node handler
 // ---------------------------------------------------------------------------
 
-pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), CompileError> {
-    let loaded = ctx.loaded;
-    let Some(op) = loaded.nodes.get(&nid) else {
-        return Ok(());
-    };
-
+pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, reg_id: u16) -> Result<(), CompileError> {
     match op {
         // `bound` is a backfill-scan hint consumed by the source drive, not by the
         // VM: emission is identical bounded or not.
@@ -262,8 +211,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
             // A present-but-corrupt blob, or a rejected program, is catalog
             // corruption. Falling back to pass-all would silently turn a WHERE
             // into WHERE TRUE; fail the compile instead.
-            let func_ptr = ctx.create_expr_predicate(blob, &in_schema)?;
-            let func_idx = ctx.builder.func_idx(func_ptr);
+            let func_idx = ctx.create_expr_predicate(blob, &in_schema)?;
             ctx.builder.push(Instr::Filter {
                 in_reg,
                 out_reg: reg_id,
@@ -288,7 +236,8 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
             let in_a = ctx.in_reg(nid, PORT_IN_A, "union: missing left input port")?;
             let in_b = ctx.in_reg(nid, PORT_IN_B, "union: missing right input port")?;
             let a_schema = ctx.reg_meta[in_a as usize].schema;
-            let out_schema = union_nullability_merge(&a_schema, &ctx.reg_meta[in_b as usize].schema);
+            let out_schema = union_nullability_merge(&a_schema, &ctx.reg_meta[in_b as usize].schema)
+                .ok_or(CompileError::Rejected("union: inputs do not share a physical layout"))?;
             ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
             ctx.builder.push(Instr::Union {
                 in_a,
@@ -316,10 +265,9 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
                 (-1, 1)
             };
             let child_name = format!("_hist_{}_{nid}", ctx.site.id);
-            let hist_table_ptr = ctx.add_owned_trace_table(&child_name, in_reg_schema, Some(reg_id))?;
+            let hist_table_idx = ctx.add_owned_trace_table(&child_name, in_reg_schema, Some(reg_id))?;
             let out_delta_id = ctx.push_delta_reg(in_reg_schema);
             ctx.out_reg_of.insert(nid, out_delta_id);
-            let hist_table_idx = ctx.builder.table_idx(hist_table_ptr);
             ctx.builder.push(Instr::WeightClamp {
                 in_reg,
                 hist_reg: reg_id,
@@ -349,9 +297,9 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
             // so the schema, the register meta and the operand registers are shared.
             let probe = match kind {
                 gnitz_wire::JoinKind::DeltaTrace => JoinProbe::Equi,
-                gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => {
-                    JoinProbe::Range(bake_range_probe(&a_schema, &b_schema, *n_eq, *rel)?)
-                }
+                gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => JoinProbe::Range(
+                    RangeProbe::new(&a_schema, &b_schema, *n_eq, *rel).map_err(CompileError::Rejected)?,
+                ),
             };
             let out_schema = merge_schemas_for_join(&a_schema, &b_schema)
                 .ok_or(CompileError::Rejected("join: merged schema exceeds MAX_COLUMNS"))?;
@@ -378,8 +326,8 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
             // Must fail the compile on a table-open error: emitting the view without
             // the Integrate would compile a view that never persists its differential
             // state, leaving its output permanently empty.
-            let table_ptr = ctx.add_owned_trace_table(&child_name, in_reg_schema, Some(reg_id))?;
-            ctx.push_integrate(in_reg, table_ptr);
+            let table_idx = ctx.add_owned_trace_table(&child_name, in_reg_schema, Some(reg_id))?;
+            ctx.push_integrate(in_reg, table_idx);
         }
 
         gnitz_wire::OpNode::ExchangeShard { .. } => {
@@ -435,39 +383,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, reg_id: u16) -> Result<(), 
     Ok(())
 }
 
-/// Resolve a wire range-join relation against the two input schemas into the
-/// probe the operator runs, rejecting a circuit the walk could not slice safely.
-/// A circuit is client-supplied catalog data and the operator's own asserts are
-/// stripped in release, so this is where those preconditions are enforced.
-fn bake_range_probe(
-    a_schema: &SchemaDescriptor,
-    b_schema: &SchemaDescriptor,
-    n_eq: u8,
-    rel: gnitz_wire::RangeRel,
-) -> Result<RangeProbe, CompileError> {
-    // The trace's reindexed key is `[eq slots…, range slot]`.
-    if n_eq as usize + 1 != b_schema.pk_indices().len() {
-        return Err(CompileError::Rejected(
-            "range join: n_eq does not match trace key arity",
-        ));
-    }
-    // Both sides reindex at the pair's common promoted type, so their PK regions
-    // have one width — which the walk slices both of at.
-    if a_schema.pk_stride() != b_schema.pk_stride() {
-        return Err(CompileError::Rejected(
-            "range join: delta and trace PK strides differ (both sides must reindex at the pair's common type)",
-        ));
-    }
-    // Not implied by the arity check above: `leading_key_size` sums *schema*-order
-    // columns, so a crafted circuit can spend the whole key on the eq prefix while
-    // still naming `n_eq + 1` PK columns.
-    let eq_size = b_schema.leading_key_size(n_eq as usize);
-    if eq_size >= b_schema.pk_stride() as usize {
-        return Err(CompileError::Rejected("range join: eq prefix covers the whole key"));
-    }
-    Ok(RangeProbe::of(eq_size, rel))
-}
-
 // ---------------------------------------------------------------------------
 // MAP emission
 // ---------------------------------------------------------------------------
@@ -499,7 +414,7 @@ fn dense_copy_srcs(prog: &LogicalProgram, in_schema: &SchemaDescriptor) -> Resul
     if srcs.iter().any(|&c| c as usize >= in_schema.num_columns()) {
         return Err(CompileError::Rejected("map: reindex payload column out of range"));
     }
-    Ok(srcs.to_vec())
+    Ok(srcs)
 }
 
 /// The three `MapKind`s differ only in how they derive `(output schema, map
@@ -618,10 +533,9 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
     if matches!(reindex, ReindexOperand::None) && func.map_out_schema().pk_stride() != in_reg_schema.pk_stride() {
         return Err(CompileError::Rejected("map: output PK stride differs from the input's"));
     }
-    let fp = ctx.push_func(func);
+    let func_idx = ctx.builder.push_func(func);
 
     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
-    let func_idx = ctx.builder.func_idx(fp);
     ctx.builder.push(Instr::Map {
         in_reg,
         out_reg: reg_id,
@@ -657,9 +571,7 @@ pub(super) fn emit_reduce(
     if oob_cols(group_cols, &in_reg_schema) {
         return Err(CompileError::Rejected("reduce: group columns out of range"));
     }
-    if agg.is_empty() {
-        return Err(CompileError::Rejected("reduce: no aggregate spec"));
-    }
+    debug_assert!(!agg.is_empty(), "decode_op_node rejects a spec-less REDUCE");
     // The low-level `CircuitBuilder` API and the wire decode take `global_ground`
     // and the group columns independently and cross-check neither, but the ground
     // row is only well-formed group-less: `emit_global_ground` writes the aggregate
@@ -721,7 +633,7 @@ pub(super) fn emit_reduce(
     let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols_u32, &agg_descs, out_key)
         .ok_or(CompileError::Rejected("reduce: output exceeds MAX_COLUMNS"))?;
 
-    let trace_table_ptr = ctx.add_owned_trace_table(
+    let trace_table_idx = ctx.add_owned_trace_table(
         &format!("_reduce_{}_{nid}", ctx.site.id),
         reduce_out_schema,
         Some(reg_id),
@@ -751,7 +663,7 @@ pub(super) fn emit_reduce(
     // hand the reduce a *delta* register with no `Integrate` behind it, and
     // `cursor_mut!` hard-asserts on the resulting null cursor — a worker abort. The
     // circuit families carry no catalog precheck, so a forged bundle reaches here;
-    // reject it like the ~30 neighbouring guards rather than honouring the edge.
+    // reject it like the neighbouring guards rather than honouring the edge.
     if input_on_port(loaded, nid, PORT_TRACE).is_some() {
         return Err(CompileError::Rejected("reduce: unexpected trace input port"));
     }
@@ -778,9 +690,8 @@ pub(super) fn emit_reduce(
         // Not optional: a non-linear reduce has no history other than this index,
         // so a swallowed failure would leave MIN/MAX computed from the delta alone
         // with the old row still retracted.
-        let avi_table_ptr = ctx.add_owned_trace_table(&format!("_avidx_{}_{nid}", ctx.site.id), bake.schema, None)?;
+        let table_idx = ctx.add_owned_trace_table(&format!("_avidx_{}_{nid}", ctx.site.id), bake.schema, None)?;
         let bake_idx = ctx.builder.add_avi_bake(bake);
-        let table_idx = ctx.builder.table_idx(avi_table_ptr);
         ctx.builder.push(Instr::Integrate {
             in_reg: in_reg_id,
             target: IntegrateTarget::Avi(IntegrateAvi { table_idx, bake_idx }),
@@ -834,7 +745,7 @@ pub(super) fn emit_reduce(
         avi,
     });
 
-    ctx.push_integrate(raw_delta_id, trace_table_ptr);
+    ctx.push_integrate(raw_delta_id, trace_table_idx);
     Ok(())
 }
 
@@ -844,7 +755,6 @@ pub(super) fn emit_reduce(
 
 pub(super) fn build_plan(
     loaded: &LoadedCircuit,
-    skip_nodes: &HashSet<i32>,
     ordered: &[i32],
     ext_tables: &ExtTables,
     site: super::ViewSite<'_>,
@@ -855,12 +765,11 @@ pub(super) fn build_plan(
         PlanTarget::Subgraph { .. } => &[],
     };
     // Register ids are u16 instruction fields. `reg_meta` gets one base register
-    // per node plus one seed per exchange input; the emitters push the extras on
-    // demand — Distinct pushes 1, Reduce up to 2 (raw_delta + trace-in). Each node
-    // pushes at most 2, so this bound holds the whole program in a single
-    // allocation. Rejected here, before the first id is handed out and before the
-    // emit loop creates any scratch table, so every register id below fits `u16`.
-    let reg_cap = 3 * ordered.len() + exchange_inputs.len();
+    // per node plus one seed per exchange input, and `push_delta_reg` — its only
+    // growth site — runs at most once per node. Rejected here, before the first id
+    // is handed out and before the emit loop creates any scratch table, so every
+    // register id below fits `u16`; the post-loop assert holds the bound.
+    let reg_cap = 2 * ordered.len() + exchange_inputs.len();
     if reg_cap > u16::MAX as usize {
         return Err(CompileError::Rejected("register count exceeds u16::MAX"));
     }
@@ -874,31 +783,29 @@ pub(super) fn build_plan(
 
     // One seed register per exchange input (the post phase of an exchange view
     // reads each side's relayed batch from its own register).
-    let mut exchange_input_regs: Vec<(i32, u16)> = Vec::with_capacity(exchange_inputs.len());
+    let mut exchange_input_regs: Vec<u16> = Vec::with_capacity(exchange_inputs.len());
     let first_exchange_input_reg_id: Option<u16> = (!exchange_inputs.is_empty()).then_some(next_reg);
-    for (ex_nid, _) in exchange_inputs {
-        exchange_input_regs.push((*ex_nid, next_reg));
+    for _ in exchange_inputs {
+        exchange_input_regs.push(next_reg);
         next_reg += 1;
     }
 
     let mut reg_meta = Vec::with_capacity(reg_cap);
     reg_meta.resize(next_reg as usize, RegisterMeta::delta(SchemaDescriptor::default()));
 
-    for ((ex_nid, ex_schema), &(_, reg)) in exchange_inputs.iter().zip(&exchange_input_regs) {
+    for ((ex_nid, ex_schema), &reg) in exchange_inputs.iter().zip(&exchange_input_regs) {
         out_reg_of.insert(*ex_nid, reg);
         reg_meta[reg as usize] = RegisterMeta::delta(*ex_schema);
     }
 
     let mut ctx = EmitCtx {
         loaded,
-        skip_nodes,
+        skip_nodes: compute_skip_nodes(loaded),
         ext_tables,
         site,
         builder: ProgramBuilder::new(),
         out_reg_of,
         reg_meta,
-        owned_tables: Vec::new(),
-        owned_funcs: Vec::new(),
         source_reg_map: HashMap::new(),
         sink_reg_id: None,
         can_emit_on_empty: false,
@@ -920,7 +827,11 @@ pub(super) fn build_plan(
         // inodes (on success they are handed to the caller in PlanBuildResult,
         // kept alive by the VM's tables).
         let reg_id = *ctx.out_reg_of.get(&nid).unwrap();
-        emit_node(&mut ctx, nid, reg_id)?;
+        let op = loaded
+            .nodes
+            .get(&nid)
+            .expect("topo_sorted builds `ordered` out of `nodes`' own keys");
+        emit_node(&mut ctx, nid, op, reg_id)?;
         instr_end.insert(nid, ctx.builder.instructions().len());
     }
 
@@ -938,13 +849,17 @@ pub(super) fn build_plan(
         })
         .ok_or(CompileError::Rejected("plan has no input delta register"))?;
 
-    let sink_reg = ctx
-        .sink_reg_id
-        .or_else(|| match target {
-            PlanTarget::Subgraph { out } => ctx.out_reg_of.get(&out).copied(),
-            PlanTarget::ViewOutput { .. } => None,
-        })
-        .ok_or(CompileError::Rejected("plan has no output register"))?;
+    let sink_reg = match target {
+        PlanTarget::ViewOutput { .. } => ctx.sink_reg_id,
+        // A side's node list is the ancestors of its exchange input, so the sink
+        // is downstream of the shard and outside it. One that got in would give
+        // the plan an output register that is not `out`.
+        PlanTarget::Subgraph { out } => match ctx.sink_reg_id {
+            Some(_) => return Err(CompileError::Rejected("subgraph contains the sink")),
+            None => ctx.out_reg_of.get(&out).copied(),
+        },
+    }
+    .ok_or(CompileError::Rejected("plan has no output register"))?;
 
     // Destructive-register ordering invariant. `Union` and `WeightClamp`
     // (distinct / positive_part) empty their input register in place
@@ -984,16 +899,17 @@ pub(super) fn build_plan(
         // A column-count match is not enough: two schemas with equal column
         // counts but mismatched types (e.g. I64 vs German-string) let the client
         // read a 16-byte string descriptor out of 8-byte integer storage.
-        if sink_schema.num_columns() > 0 && !sink_schema.same_physical_layout(out_schema) {
+        if !sink_schema.same_physical_layout(out_schema) {
             return Err(CompileError::Rejected("sink schema does not match view output schema"));
         }
     }
 
-    // The pre-loop bound already guaranteed `reg_meta.len()` could not exceed u16
-    // during emission. `reg_meta` is moved into `build_with_owned` below.
-    debug_assert!(ctx.reg_meta.len() <= u16::MAX as usize);
-    // The reservation above is the worst case (every node pushing two extra
-    // registers); the typical plan uses two or three. `reg_meta` is moved verbatim
+    debug_assert!(
+        ctx.reg_meta.len() <= reg_cap,
+        "emission grew reg_meta past the reservation, so a register id may not fit u16",
+    );
+    // The reservation is the worst case (every node pushing its extra register);
+    // the typical plan uses two or three. `reg_meta` is moved verbatim
     // into `Program` and held for as long as the plan stays cached, and a
     // `RegisterMeta` is a whole `SchemaDescriptor`, so the unused tail would be
     // tens of KB of dead heap per sub-plan, per view, per worker.
@@ -1002,15 +918,13 @@ pub(super) fn build_plan(
     let EmitCtx {
         builder,
         reg_meta,
-        owned_tables,
-        owned_funcs,
         source_reg_map,
         can_emit_on_empty,
         scratch,
         out_reg_of,
         ..
     } = ctx;
-    let vm = builder.build_with_owned(reg_meta, owned_tables, owned_funcs);
+    let vm = builder.build(reg_meta);
 
     Ok(PlanBuildResult {
         vm,
@@ -1046,10 +960,4 @@ pub(super) fn ancestors_inclusive(loaded: &LoadedCircuit, start: i32) -> HashSet
         }
     }
     set
-}
-
-/// The node feeding an `ExchangeShard` on `PORT_IN` (the value to repartition),
-/// or `None` if the exchange has no such input edge (a malformed circuit).
-pub(super) fn exchange_input_node(loaded: &LoadedCircuit, ex_nid: i32) -> Option<i32> {
-    super::optimize::input_on_port(loaded, ex_nid, PORT_IN)
 }

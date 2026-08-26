@@ -4690,8 +4690,8 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
 // The fallback path is reached when all hold: non-linear aggregate,
 // no combined value index (a non-AVI-eligible MIN/MAX, e.g. over a
 // German string), group_by is not the PK. The tests here pin
-// three properties: (1) hash correctness (extract_group_key_cursor must
-// produce byte-identical results to extract_group_key for the same row),
+// three properties: (1) hash correctness (the cursor-side group key must
+// produce byte-identical results to the batch-side one for the same row),
 // (2) aggregate correctness across INSERT/DELETE ticks, and (3) the
 // trace is scanned at most once per tick (REWIND_CALLS ≤ 1).
 // -----------------------------------------------------------------------
@@ -6921,7 +6921,7 @@ fn reduce_nullable_group_stays_absolute_seek() {
 // Pin the shared classifier: the two canonical single-column arms (a PK
 // column, a non-nullable routable-int payload), and the hash fold (None) for
 // nullable / STRING / float / multi-column / empty group sets.
-// `extract_group_key` dispatches its fast path on the arm and `op_reduce`
+// `GroupKeyCols::key_row` dispatches its fast path on the arm and `op_reduce`
 // keys its monotone probe on `is_some()`, so a drift here is a correctness
 // bug, not a perf one.
 #[test]

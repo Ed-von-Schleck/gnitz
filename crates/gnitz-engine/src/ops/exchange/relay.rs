@@ -1146,7 +1146,7 @@ mod tests {
         // A compound JoinPromote scatter must route every row by the SAME packed
         // OPK bytes the reindex Map writes as `_join_pk` — i.e. by
         // `worker_for_pk_bytes(ReindexPacker::pack(cols, row))`, NOT by
-        // `extract_group_key`. Exercised through BOTH production scatter
+        // `GroupKeyCols::key_row`. Exercised through BOTH production scatter
         // functions: the non-consolidated row loop in `op_repartition_batches_mode`
         // and the consolidated merge-walk's `route_group` in
         // `op_relay_scatter_consolidated_mode` — the latter through both the

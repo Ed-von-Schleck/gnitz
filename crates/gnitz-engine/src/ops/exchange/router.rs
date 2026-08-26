@@ -316,7 +316,7 @@ mod tests {
 
         // (6) single sub-column of a compound PK — the one legacy JoinPromote
         // shape that fell through `route_partition_key`'s non-PK guard to the
-        // group fold `extract_group_key` (its Pk arm is `pk_route_key`).
+        // group fold `GroupKeyCols::key_row` (its Pk arm is `pk_route_key`).
         {
             let schema = SchemaDescriptor::new(
                 &[

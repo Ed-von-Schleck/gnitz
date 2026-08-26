@@ -1,5 +1,7 @@
 //! DBSP VM: executes compiled circuit programs entirely in Rust.
 
+use std::cell::UnsafeCell;
+
 use crate::expr::ScalarFunc;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ReadCursor, Table};
@@ -17,18 +19,45 @@ pub(crate) use exec::execute_epoch_multi;
 // Instruction set
 // ---------------------------------------------------------------------------
 
+/// The resource pools a `Program` owns are unrelated index spaces, all naturally
+/// `u16`. `IntegrateAvi` builds two of them on adjacent lines, where a swap would
+/// mis-dispatch into a live table with no panic — so each gets its own type and
+/// the compiler does the checking.
+macro_rules! resource_idx {
+    ($($name:ident => $pool:literal;)*) => {$(
+        #[doc = concat!("Index into `Program::", $pool, "`.")]
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub(crate) struct $name(pub u16);
+
+        impl $name {
+            #[inline]
+            fn at(self) -> usize {
+                self.0 as usize
+            }
+        }
+    )*};
+}
+
+resource_idx! {
+    TableIdx => "tables";
+    FuncIdx => "funcs";
+    PackerIdx => "reindex_packers";
+    PlanIdx => "reduce_plans";
+    BakeIdx => "avi_bakes";
+}
+
 /// One VM instruction with all operator-specific data pre-resolved.
 pub(crate) enum Instr {
     Halt,
     Filter {
         in_reg: u16,
         out_reg: u16,
-        func_idx: u16,
+        func_idx: FuncIdx,
     },
     Map {
         in_reg: u16,
         out_reg: u16,
-        func_idx: u16,
+        func_idx: FuncIdx,
         reindex: ReindexOperand,
     },
     Negate {
@@ -48,7 +77,7 @@ pub(crate) enum Instr {
         in_reg: u16,
         hist_reg: u16,
         out_reg: u16,
-        hist_table_idx: u16,
+        hist_table_idx: TableIdx,
         lo: i64,
         hi: i64,
     },
@@ -79,10 +108,10 @@ pub(crate) enum Instr {
         in_reg: u16,
         trace_out_reg: u16,
         out_reg: u16,
-        /// Index into `Program::reduce_plans` — the baked `ops::ReducePlan`
-        /// carrying the schemas, group columns, aggregate descriptors, and every
-        /// derived gate (linearity, key kind, emission roles, ground flags).
-        plan_idx: u16,
+        /// The baked `ops::ReducePlan` carrying the schemas, group columns,
+        /// aggregate descriptors, and every derived gate (linearity, key kind,
+        /// emission roles, ground flags).
+        plan_idx: PlanIdx,
         /// The MIN/MAX history. The cursor is created fresh from the table each
         /// tick; `None` means every aggregate is linear.
         avi: Option<ReduceAvi>,
@@ -98,7 +127,7 @@ pub(crate) enum Instr {
 pub(crate) enum ReindexOperand {
     None,
     HashRow { branch_id: u8 },
-    Pack { packer_idx: u16 },
+    Pack { packer_idx: PackerIdx },
 }
 
 /// True iff `instr` reads the batch of register `r`. The instruction set's own
@@ -151,9 +180,8 @@ pub(crate) fn writes_state(instr: &Instr) -> bool {
 /// `for_max`/type from each baked descriptor, matching the read side.
 #[derive(Clone, Copy)]
 pub(crate) struct IntegrateAvi {
-    pub table_idx: u16,
-    /// Index into `Program::avi_bakes`.
-    pub bake_idx: u16,
+    pub table_idx: TableIdx,
+    pub bake_idx: BakeIdx,
 }
 
 /// The value index an `Instr::Reduce` reads: the table to open a cursor against
@@ -162,9 +190,8 @@ pub(crate) struct IntegrateAvi {
 /// with no packer is a state the emitter cannot express.
 #[derive(Clone, Copy)]
 pub(crate) struct ReduceAvi {
-    pub table_idx: u16,
-    /// Index into `Program::avi_bakes`.
-    pub bake_idx: u16,
+    pub table_idx: TableIdx,
+    pub bake_idx: BakeIdx,
 }
 
 /// What an `Instr::Integrate` accumulates into. The two are exclusive by
@@ -172,50 +199,28 @@ pub(crate) struct ReduceAvi {
 /// pair of `Option`s would admit two states nothing produces.
 #[derive(Clone, Copy)]
 pub(crate) enum IntegrateTarget {
-    /// A trace table: index into `Program::tables`.
-    Trace(u16),
+    /// A trace table.
+    Trace(TableIdx),
     /// The combined aggregate value index; the delta lands nowhere else.
     Avi(IntegrateAvi),
 }
 
 /// Opaque handle owning a compiled program and its register file.
-///
-/// When produced by the Rust compiler (`compile_view`), `owned_tables` and
-/// `owned_funcs` hold heap resources that `program.tables` / `program.funcs`
-/// borrow via raw pointers.  Rust drop order (declaration order) ensures
-/// `program` drops before the owned vecs, so dangling pointers are never chased.
-///
-/// The compile-time assertions below are machine-checked: reordering any
-/// owned vec before `program` produces a compile error, not a use-after-free.
-#[allow(clippy::vec_box)]
 pub(crate) struct VmHandle {
-    pub program: Program,
-    pub regfile: RegisterFile,
     /// Cursor handles for the trace registers, kept alive across the epoch.
     /// Indexed in parallel with `trace_regs`. Cursor destructors dereference the
-    /// `Table` they were opened against, so this MUST drop before `owned_tables`.
+    /// `Table` they were opened against, and those tables live in `program`, so
+    /// this MUST drop first — the assertion below is the machine check.
     owned_cursor_handles: Vec<Option<Box<ReadCursor>>>,
-    /// Child tables created during compilation (history, reduce-in, AVI).
-    /// `program.tables` may point into these.  Dropped AFTER `program`.
-    pub owned_tables: Vec<Box<Table>>,
-    /// Scalar functions created during compilation — filters, maps, projections,
-    /// and the post-reduce finalize maps.
-    /// `program.funcs` may point into these.  Dropped AFTER `program`.
-    #[allow(dead_code)]
-    pub owned_funcs: Vec<Box<ScalarFunc>>,
-    /// `(reg_id, index into owned_tables)` for every trace register, derived
+    pub program: Program,
+    pub regfile: RegisterFile,
+    /// `(reg_id, backing table)` for every trace register, derived
     /// once from `program.reg_meta` so the per-epoch refresh walks only the
     /// trace registers instead of the whole register file.
-    trace_regs: Vec<(u16, usize)>,
+    trace_regs: Vec<(u16, TableIdx)>,
 }
 
-// Compile-time proof that `program` precedes all owned resource vecs, so
-// Rust's declaration-order drop visits `program` before any vec it borrows.
-const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_tables));
-const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_funcs));
-// Cursor destructors dereference their owning `Table`; cursors MUST drop first.
-const _: () =
-    assert!(std::mem::offset_of!(VmHandle, owned_cursor_handles) < std::mem::offset_of!(VmHandle, owned_tables));
+const _: () = assert!(std::mem::offset_of!(VmHandle, owned_cursor_handles) < std::mem::offset_of!(VmHandle, program));
 
 impl VmHandle {
     /// Compact every owned trace table, keeping its L0 fan-in bounded — there is
@@ -223,11 +228,8 @@ impl VmHandle {
     /// mutates shard state. An `Err` leaves the shard index unchanged, so a
     /// cursor opened afterwards still sees a consistent snapshot.
     pub(super) fn compact_owned_traces(&mut self) {
-        for &(_, table_idx) in &self.trace_regs {
-            // SAFETY: as in `bind_trace_cursors` — `table_idx` is set during
-            // compilation, and `trace_regs` is not modified here.
-            let table: &mut Table = unsafe { &mut *(&mut *self.owned_tables[table_idx] as *mut Table) };
-            let _ = table.compact_if_needed();
+        for slot in 0..self.trace_regs.len() {
+            let _ = self.program.table_mut(self.trace_regs[slot].1).compact_if_needed();
         }
     }
 
@@ -241,17 +243,14 @@ impl VmHandle {
         // etc.), then size the slot storage back to full length.
         self.null_owned_cursors();
         self.owned_cursor_handles.resize_with(self.trace_regs.len(), || None);
-        for (slot, &(reg_id, table_idx)) in self.trace_regs.iter().enumerate() {
-            // SAFETY: table_idx is valid (set during compilation). We need &mut
-            // to the table, but we also hold &self.trace_regs. This is safe
-            // because trace_regs is not modified here, and the table is
-            // accessed through owned_tables which is a separate field.
-            let table: &mut Table = unsafe { &mut *(&mut *self.owned_tables[table_idx] as *mut Table) };
+        for slot in 0..self.trace_regs.len() {
+            let (reg_id, table_idx) = self.trace_regs[slot];
+            let cursor = self.program.table_mut(table_idx).open_cursor();
             // Store the Box into its slot first, then derive the
             // pointer from the slot — taking the pointer before the
             // move raises Stacked Borrows aliasing questions even
             // though the heap address is stable across the move.
-            self.owned_cursor_handles[slot] = Some(Box::new(table.open_cursor()));
+            self.owned_cursor_handles[slot] = Some(Box::new(cursor));
             let ptr = self.owned_cursor_handles[slot].as_mut().unwrap().as_mut() as *mut ReadCursor;
             self.regfile.registers[reg_id as usize].cursor_ptr = ptr;
         }
@@ -272,7 +271,7 @@ impl VmHandle {
     /// stale-not-dangling snapshot) and the next epoch calls
     /// `bind_trace_cursors` before any deref — but nulling here keeps the
     /// flush's safety local and obvious. Only `trace_regs` are handled
-    /// (`_int_`/`_hist_`/`_reduce_`/`_reduce_in_`, all cross-epoch); the epoch-local
+    /// (`_int_`/`_hist_`/`_reduce_`, all cross-epoch); the epoch-local
     /// `_avidx_` cursor is created and dropped inside the `Reduce` instruction.
     pub(super) fn null_owned_cursors(&mut self) {
         self.owned_cursor_handles.clear(); // drops every held cursor
@@ -290,11 +289,10 @@ impl VmHandle {
 #[derive(Clone, Copy)]
 pub(crate) struct RegisterMeta {
     pub schema: SchemaDescriptor,
-    /// A trace register's backing table, as an index into
-    /// `VmHandle::owned_tables`; `None` for a delta register. Naming the table
-    /// here rather than in a side list is what lets `bind_trace_cursors`
+    /// A trace register's backing table; `None` for a delta register. Naming the
+    /// table here rather than in a side list is what lets `bind_trace_cursors`
     /// guarantee every trace register holds a live cursor at dispatch.
-    pub owned_table: Option<u16>,
+    pub owned_table: Option<TableIdx>,
 }
 
 impl RegisterMeta {
@@ -304,7 +302,7 @@ impl RegisterMeta {
             owned_table: None,
         }
     }
-    pub(super) const fn trace(schema: SchemaDescriptor, owned_table: u16) -> Self {
+    pub(super) const fn trace(schema: SchemaDescriptor, owned_table: TableIdx) -> Self {
         Self {
             schema,
             owned_table: Some(owned_table),
@@ -313,12 +311,20 @@ impl RegisterMeta {
 }
 
 /// A compiled DBSP program ready for execution.
+///
+/// Owns every resource its instructions name, in the index space those
+/// instructions use — so an operand is a position in one vector and there is no
+/// second numbering to keep in step.
+#[allow(clippy::vec_box)]
 pub(crate) struct Program {
     pub instructions: Vec<Instr>,
     pub reg_meta: Vec<RegisterMeta>,
-    /// Shared resource arrays — referenced by index from instructions.
-    pub funcs: Vec<*const ScalarFunc>,
-    pub tables: Vec<*mut Table>,
+    /// Scalar functions — filters, maps, projections, post-reduce finalizes.
+    pub funcs: Vec<Box<ScalarFunc>>,
+    /// Child tables created during compilation (integrate, history, reduce, AVI).
+    /// `UnsafeCell` because an operator mutates its table while the dispatch
+    /// still holds `&program` for the instruction stream and `reg_meta`.
+    pub tables: Vec<UnsafeCell<Box<Table>>>,
     /// Baked per-`Instr::Map` reindex packers (see `ReindexOperand::Pack`).
     pub reindex_packers: Vec<crate::ops::ReindexPacker>,
     /// Baked per-`Instr::Reduce` plans (see `ops::ReducePlan`).
@@ -328,9 +334,27 @@ pub(crate) struct Program {
 }
 
 // SAFETY: Program is only accessed from a single thread (the worker thread
-// that owns the plan).  Raw pointers into ScalarFunc and Table are stable for
-// the lifetime of the plan.
+// that owns the plan), which is also what makes the `UnsafeCell` tables sound.
 unsafe impl Send for Program {}
+
+impl Program {
+    /// The table at `idx`, for the operator about to write it. Takes `&self`
+    /// because the dispatch loop is iterating `self.instructions` at the time;
+    /// single-threaded execution is what keeps the two borrows apart. Callers
+    /// must not hold a second `&mut` into the same table (each instruction names
+    /// one) — the same contract `IndexCircuitEntry::table_mut` carries.
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) fn table_mut(&self, idx: TableIdx) -> &mut Table {
+        // SAFETY: one worker thread owns the plan, and each instruction names
+        // one table, so no second `&mut` to it is live.
+        unsafe { &mut *self.tables[idx.at()].get() }
+    }
+
+    /// Every owned table, for the checkpoint flush sweep.
+    pub(crate) fn table_indices(&self) -> impl Iterator<Item = TableIdx> {
+        (0..self.tables.len() as u16).map(TableIdx)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Register file (runtime state)
@@ -413,7 +437,7 @@ mod tests {
         trace_batch.extend_col(0, &20i64.to_le_bytes());
         trace_batch.count += 1;
 
-        let metas = [RegisterMeta::delta(schema), RegisterMeta::trace(schema, 0)];
+        let metas = [RegisterMeta::delta(schema), RegisterMeta::trace(schema, TableIdx(0))];
         let mut rf = RegisterFile {
             registers: vec![
                 Register {
@@ -434,28 +458,22 @@ mod tests {
 
     // ── Test helpers ─────────────────────────────────────────────────────
 
-    /// A boxed table under `dir`, plus a raw pointer to it — the shape
-    /// `build_with_owned` takes for a trace register's backing store. Boxing is
-    /// what keeps the pointer valid once the table moves into `owned_tables`.
-    fn owned_table(dir: &std::path::Path, name: &str, schema: SchemaDescriptor) -> (Box<Table>, *mut Table) {
-        let mut t = Box::new(
-            Table::with_arena(
-                dir.join(name).to_str().unwrap(),
-                schema,
-                0,
-                1 << 20,
-                crate::storage::RecoverySource::Rederive { resume_at: None },
-            )
-            .unwrap(),
-        );
-        let ptr = &mut *t as *mut Table;
-        (t, ptr)
+    /// A table under `dir` for a trace register's backing store; the caller
+    /// hands it to `ProgramBuilder::push_table`, which owns it from then on.
+    fn owned_table(dir: &std::path::Path, name: &str, schema: SchemaDescriptor) -> Table {
+        Table::with_arena(
+            dir.join(name).to_str().unwrap(),
+            schema,
+            0,
+            1 << 20,
+            crate::storage::RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap()
     }
 
     /// A plain integrate of `in_reg` into `table` (no AVI) — the shape every
     /// test integrate uses.
-    fn push_integrate(b: &mut ProgramBuilder, in_reg: u16, table: *mut Table) {
-        let table_idx = b.table_idx(table);
+    fn push_integrate(b: &mut ProgramBuilder, in_reg: u16, table_idx: TableIdx) {
         b.push(Instr::Integrate {
             in_reg,
             target: IntegrateTarget::Trace(table_idx),
@@ -575,11 +593,8 @@ mod tests {
             }, // r2 = r0 > r1
         ];
         let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
-        let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema).unwrap());
-        let func_ptr = Box::into_raw(func) as *const ScalarFunc;
-
         let mut builder = ProgramBuilder::new();
-        let func_idx = builder.func_idx(func_ptr);
+        let func_idx = builder.push_func(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema).unwrap());
         builder.push(Instr::Filter {
             in_reg: 0,
             out_reg: 1,
@@ -591,7 +606,7 @@ mod tests {
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, -5), (3u128, 1, 20)]);
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2)
             .unwrap()
             .unwrap();
@@ -600,11 +615,6 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], (1, -1, 10));
         assert_eq!(rows[1], (3, -1, 20));
-
-        // Cleanup
-        unsafe {
-            drop(Box::from_raw(func_ptr as *mut ScalarFunc));
-        }
     }
 
     #[test]
@@ -626,7 +636,7 @@ mod tests {
         let input = make_batch(schema, &[]);
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1);
 
         assert!(result.unwrap().is_none());
@@ -648,7 +658,7 @@ mod tests {
         let input = make_batch(schema, &[]);
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1);
 
         assert!(result.unwrap().is_none());
@@ -672,7 +682,7 @@ mod tests {
         let input_b = make_batch(schema, &[(3u128, 1, 30)]);
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, input), (2u16, input_b)], 1)
             .unwrap()
             .unwrap();
@@ -737,7 +747,7 @@ mod tests {
             RegisterMeta::delta(merged),
             RegisterMeta::delta(schema_b),
         ];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, left), (2u16, right)], 1)
             .unwrap()
             .unwrap();
@@ -774,7 +784,7 @@ mod tests {
             RegisterMeta::delta(merged),
             RegisterMeta::delta(schema_b),
         ];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch_multi(&vm.program, &mut { vm.regfile }, [(0u16, left)], 1)
             .unwrap()
             .unwrap();
@@ -801,7 +811,7 @@ mod tests {
         builder.push(Instr::Halt);
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 3, 20)]);
         let reg_meta = [RegisterMeta::delta(schema); 2];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1)
             .unwrap()
             .unwrap();
@@ -830,7 +840,7 @@ mod tests {
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20)]);
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1)
             .unwrap()
             .unwrap();
@@ -856,7 +866,7 @@ mod tests {
         builder.push(Instr::Halt);
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
-        let mut vm = *builder.build(&reg_meta);
+        let mut vm = *builder.build(reg_meta.to_vec());
 
         // Tick 1
         let input1 = make_batch(schema, &[(1u128, 1, 10)]);
@@ -884,14 +894,11 @@ mod tests {
         let out_schema = make_schema(&[type_code::I64]);
 
         // MAP with ScalarFunc projection: reorder/select columns.
-        let func = Box::new(
+        let mut builder = ProgramBuilder::new();
+        let func_idx = builder.push_func(
             crate::expr::ScalarFunc::from_map(gnitz_expr::LogicalProgram::copy_cols(&[2]), &in_schema, &out_schema)
                 .unwrap(),
         );
-        let func_ptr = Box::into_raw(func) as *const ScalarFunc;
-
-        let mut builder = ProgramBuilder::new();
-        let func_idx = builder.func_idx(func_ptr);
         builder.push(Instr::Map {
             in_reg: 0,
             out_reg: 1,
@@ -903,7 +910,7 @@ mod tests {
         let input = make_batch_2col(in_schema, &[(1u128, 1, 10, 100), (2u128, 1, 20, 200)]);
 
         let reg_meta = [RegisterMeta::delta(in_schema), RegisterMeta::delta(out_schema)];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1)
             .unwrap()
             .unwrap();
@@ -913,10 +920,6 @@ mod tests {
         // Projected column should be the second payload col (100, 200)
         assert_eq!(rows[0].2, 100);
         assert_eq!(rows[1].2, 200);
-
-        unsafe {
-            drop(Box::from_raw(func_ptr as *mut ScalarFunc));
-        }
     }
 
     #[test]
@@ -926,10 +929,10 @@ mod tests {
         let schema = schema_1i64();
 
         let dir = tempfile::tempdir().unwrap();
-        let (table, table_ptr) = owned_table(dir.path(), "dist_test", schema);
+        let table = owned_table(dir.path(), "dist_test", schema);
         let mut builder = ProgramBuilder::new();
         // reg 0 = input delta, reg 1 = history trace, reg 2 = output delta
-        let hist_table_idx = builder.table_idx(table_ptr);
+        let hist_table_idx = builder.push_table(table);
         builder.push(Instr::WeightClamp {
             in_reg: 0,
             hist_reg: 1,
@@ -942,13 +945,13 @@ mod tests {
 
         let reg_meta = [
             RegisterMeta::delta(schema),
-            RegisterMeta::trace(schema, 0),
+            RegisterMeta::trace(schema, TableIdx(0)),
             RegisterMeta::delta(schema),
         ];
 
         // The history register is backed by the plan's owned table, so each tick
         // opens its cursor through `bind_trace_cursors` — the production path.
-        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![table], Vec::new());
+        let mut vm = *builder.build(reg_meta.to_vec());
 
         // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
         let input1 = make_batch(schema, &[(1u128, 3, 42)]);
@@ -991,12 +994,13 @@ mod tests {
         let join_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
-        let (mut table, _) = owned_table(dir.path(), "join_test", right_schema);
+        let mut table = owned_table(dir.path(), "join_test", right_schema);
         // Ingest trace data
         let trace_batch = make_batch(right_schema, &[(10u128, 1, 200)]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
         let mut builder = ProgramBuilder::new();
+        builder.push_table(table);
         // reg 0 = left delta, reg 1 = right trace, reg 2 = output
         builder.push(Instr::JoinDT {
             probe: crate::ops::JoinProbe::Equi,
@@ -1008,11 +1012,11 @@ mod tests {
 
         let reg_meta = [
             RegisterMeta::delta(left_schema),
-            RegisterMeta::trace(right_schema, 0),
+            RegisterMeta::trace(right_schema, TableIdx(0)),
             RegisterMeta::delta(join_schema),
         ];
 
-        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![table], Vec::new());
+        let mut vm = *builder.build(reg_meta.to_vec());
         vm.bind_trace_cursors();
 
         let input = make_batch(left_schema, &[(10u128, 1, 100)]);
@@ -1039,12 +1043,13 @@ mod tests {
         let join_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
-        let (mut table, _) = owned_table(dir.path(), "join_multi_test", right_schema);
+        let mut table = owned_table(dir.path(), "join_multi_test", right_schema);
         // Ingest 3 trace rows with same PK but different payloads
         let trace_batch = make_batch(right_schema, &[(10u128, 1, 100), (10u128, 1, 200), (10u128, 1, 300)]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
         let mut builder = ProgramBuilder::new();
+        builder.push_table(table);
         builder.push(Instr::JoinDT {
             probe: crate::ops::JoinProbe::Equi,
             delta_reg: 0,
@@ -1055,10 +1060,10 @@ mod tests {
 
         let reg_meta = [
             RegisterMeta::delta(left_schema),
-            RegisterMeta::trace(right_schema, 0),
+            RegisterMeta::trace(right_schema, TableIdx(0)),
             RegisterMeta::delta(join_schema),
         ];
-        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![table], Vec::new());
+        let mut vm = *builder.build(reg_meta.to_vec());
         vm.bind_trace_cursors();
 
         let input = make_batch(left_schema, &[(10u128, 2, 50)]); // weight=2
@@ -1125,7 +1130,7 @@ mod tests {
         let input = make_batch(schema, &[(1u128, 5, 42)]);
 
         let reg_meta = [RegisterMeta::delta(schema); 3];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1)
             .unwrap()
             .unwrap();
@@ -1150,7 +1155,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // trace_out table
-        let (trace_out_table, trace_out_ptr) = owned_table(dir.path(), "tr_out", out_schema);
+        let trace_out_table = owned_table(dir.path(), "tr_out", out_schema);
         // Agg descriptors: SUM of payload col 1 (schema col 2), plus the trailing
         // Count cardinality companion every all-linear reduce carries.
         let agg_descs = [
@@ -1166,6 +1171,7 @@ mod tests {
         let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
 
         let mut builder = ProgramBuilder::new();
+        let trace_out_idx = builder.push_table(trace_out_table);
         // reg 0 = input delta
         // reg 1 = trace_out (trace register for output)
         // reg 2 = raw_delta output
@@ -1184,22 +1190,18 @@ mod tests {
         );
 
         // INTEGRATE raw_delta → trace_out
-        push_integrate(
-            &mut builder,
-            2, // in_reg (raw_delta)
-            trace_out_ptr,
-        );
+        push_integrate(&mut builder, 2, trace_out_idx);
 
         builder.push(Instr::Halt);
 
         let reg_meta = [
             RegisterMeta::delta(in_schema),
-            RegisterMeta::trace(out_schema, 0),
+            RegisterMeta::trace(out_schema, TableIdx(0)),
             RegisterMeta::delta(out_schema),
         ];
 
         // reg 1 = trace_out (owned table 0)
-        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table], Vec::new());
+        let mut vm = *builder.build(reg_meta.to_vec());
 
         // Tick 1: Insert group=1 with values 10, 20
         let input1 = make_batch_2col(
@@ -1219,60 +1221,6 @@ mod tests {
         assert_eq!(r1.count, 1, "one group → one output row");
         let sum_val = i64::from_le_bytes(r1.col_data(1)[0..8].try_into().unwrap());
         assert_eq!(sum_val, 30, "SUM(10+20) must be 30");
-    }
-
-    #[test]
-    fn test_program_builder_resource_dedup() {
-        // Verify that adding the same func/table pointer twice reuses the same index.
-        let schema = schema_1i64();
-
-        let pred_instrs = vec![
-            gnitz_expr::LogicalInstr::LoadColInt { dst: 0, col: 1 },
-            gnitz_expr::LogicalInstr::LoadConst { dst: 1, val: 0 },
-            gnitz_expr::LogicalInstr::Cmp {
-                op: gnitz_expr::CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
-            },
-        ];
-        let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
-        let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema).unwrap());
-        let func_ptr = Box::into_raw(func) as *const ScalarFunc;
-
-        let mut builder = ProgramBuilder::new();
-        let func_idx = builder.func_idx(func_ptr);
-        builder.push(Instr::Filter {
-            in_reg: 0,
-            out_reg: 1,
-            func_idx,
-        });
-        let func_idx = builder.func_idx(func_ptr);
-        builder.push(Instr::Filter {
-            in_reg: 1,
-            out_reg: 2,
-            func_idx,
-        });
-        builder.push(Instr::Halt);
-
-        let reg_meta = [RegisterMeta::delta(schema); 4];
-        let vm = builder.build(&reg_meta);
-
-        // Should have only 1 func, not 2
-        assert_eq!(vm.program.funcs.len(), 1);
-        // Both filter instructions should reference func_idx=0
-        match &vm.program.instructions[0] {
-            Instr::Filter { func_idx, .. } => assert_eq!(*func_idx, 0),
-            _ => panic!("expected Filter"),
-        }
-        match &vm.program.instructions[1] {
-            Instr::Filter { func_idx, .. } => assert_eq!(*func_idx, 0),
-            _ => panic!("expected Filter"),
-        }
-
-        unsafe {
-            drop(Box::from_raw(func_ptr as *mut ScalarFunc));
-        }
     }
 
     /// Filter with expression bytecode: col1 > 25 keeps rows with val 30, 40, 50.
@@ -1296,11 +1244,8 @@ mod tests {
         ];
         let prog = LogicalProgram::new(instrs, 3, 2, vec![]);
 
-        let func = Box::new(crate::expr::ScalarFunc::from_predicate(prog, &schema).unwrap());
-        let func_ptr = Box::into_raw(func) as *const ScalarFunc;
-
         let mut builder = ProgramBuilder::new();
-        let func_idx = builder.func_idx(func_ptr);
+        let func_idx = builder.push_func(crate::expr::ScalarFunc::from_predicate(prog, &schema).unwrap());
         builder.push(Instr::Filter {
             in_reg: 0,
             out_reg: 1,
@@ -1320,7 +1265,7 @@ mod tests {
         );
 
         let reg_meta = [RegisterMeta::delta(schema); 2];
-        let vm = builder.build(&reg_meta);
+        let vm = builder.build(reg_meta.to_vec());
         let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1)
             .unwrap()
             .unwrap();
@@ -1330,10 +1275,6 @@ mod tests {
         assert_eq!(rows[0].0, 3); // pk=3, val=30
         assert_eq!(rows[1].0, 4); // pk=4, val=40
         assert_eq!(rows[2].0, 5); // pk=5, val=50
-
-        unsafe {
-            drop(Box::from_raw(func_ptr as *mut ScalarFunc));
-        }
     }
 
     /// Multi-agg reduce: COUNT + SUM on same column in one pass.
@@ -1350,7 +1291,7 @@ mod tests {
         ]);
 
         let dir = tempfile::tempdir().unwrap();
-        let (trace_out_table, trace_out_ptr) = owned_table(dir.path(), "ma_tr_out", out_schema);
+        let trace_out_table = owned_table(dir.path(), "ma_tr_out", out_schema);
         // Two agg descriptors: COUNT(col=1) and SUM(col=1)
         let agg_descs = [
             AggDescriptor {
@@ -1366,6 +1307,7 @@ mod tests {
         let group_cols = [0u32];
 
         let mut builder = ProgramBuilder::new();
+        let trace_out_idx = builder.push_table(trace_out_table);
         // reg 0 = input delta, reg 1 = trace_out, reg 2 = output
         push_reduce(
             &mut builder,
@@ -1378,15 +1320,15 @@ mod tests {
             out_schema,
             in_schema.reduce_out_key(&group_cols),
         );
-        push_integrate(&mut builder, 2, trace_out_ptr);
+        push_integrate(&mut builder, 2, trace_out_idx);
         builder.push(Instr::Halt);
 
         let reg_meta = [
             RegisterMeta::delta(in_schema),
-            RegisterMeta::trace(out_schema, 0),
+            RegisterMeta::trace(out_schema, TableIdx(0)),
             RegisterMeta::delta(out_schema),
         ];
-        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table], Vec::new());
+        let mut vm = *builder.build(reg_meta.to_vec());
 
         // Input: 3 rows all with pk=1, vals 10, 20, 30
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
@@ -1413,7 +1355,7 @@ mod tests {
         let out_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
-        let (trace_out_table, trace_out_ptr) = owned_table(dir.path(), "sv_tr_out", out_schema);
+        let trace_out_table = owned_table(dir.path(), "sv_tr_out", out_schema);
         // SUM of col 1 (agg_op=2 = AGG_SUM, not AGG_COUNT) plus the trailing Count
         // cardinality companion every all-linear reduce carries.
         let agg_descs = [
@@ -1430,6 +1372,7 @@ mod tests {
         let group_cols = [0u32];
 
         let mut builder = ProgramBuilder::new();
+        let trace_out_idx = builder.push_table(trace_out_table);
         push_reduce(
             &mut builder,
             0,
@@ -1441,17 +1384,17 @@ mod tests {
             out_schema,
             in_schema.reduce_out_key(&group_cols),
         );
-        push_integrate(&mut builder, 3, trace_out_ptr);
+        push_integrate(&mut builder, 3, trace_out_idx);
         builder.push(Instr::Halt);
 
         let reg_meta = [
             RegisterMeta::delta(in_schema),
-            RegisterMeta::trace(out_schema, 0),
+            RegisterMeta::trace(out_schema, TableIdx(0)),
             RegisterMeta::delta(out_schema),
             RegisterMeta::delta(out_schema),
         ];
         // reg 1 = trace_out (owned table 0)
-        let mut vm = *builder.build_with_owned(reg_meta.to_vec(), vec![trace_out_table], Vec::new());
+        let mut vm = *builder.build(reg_meta.to_vec());
 
         // Three rows all in the same group (same pk), values 10, 20, 30 → SUM=60
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);

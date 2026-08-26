@@ -18,7 +18,7 @@ use crate::storage::{Batch, ReadCursor};
 /// `?` to what it hands back.
 fn log_tick_ingest_err(
     op: &str,
-    table_idx: u16,
+    table_idx: TableIdx,
     r: Result<(), crate::storage::StorageError>,
 ) -> Result<(), crate::storage::StorageError> {
     r.inspect_err(|e| {
@@ -26,7 +26,7 @@ fn log_tick_ingest_err(
             "vm: {} ingest failed (table_idx={}): {} — tick state diverged \
              from durable inputs",
             op,
-            table_idx,
+            table_idx.0,
             e,
         );
     })
@@ -169,11 +169,7 @@ pub(crate) fn execute_epoch_from(
                 func_idx,
             } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Filter: in_reg and out_reg must be distinct");
-                let func_ptr = program.funcs[*func_idx as usize];
-                // A predicate-less Filter (no WHERE clause) is elided at emit
-                // time by register aliasing; every emitted Filter carries a func.
-                debug_assert!(!func_ptr.is_null(), "Filter: null predicate must be elided at emit");
-                let func = unsafe { &*func_ptr };
+                let func = &program.funcs[func_idx.at()];
                 let schema = &program.reg_meta[*in_reg as usize].schema;
                 let result = ops::op_filter(&reg!(*in_reg).batch, func, schema);
                 reg_mut!(*out_reg).batch = result;
@@ -186,16 +182,12 @@ pub(crate) fn execute_epoch_from(
                 reindex,
             } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Map: in_reg and out_reg must be distinct");
-                let func_ptr = program.funcs[*func_idx as usize];
-                // Identity MAPs are elided at emit time by register aliasing;
-                // every emitted Map carries a func.
-                debug_assert!(!func_ptr.is_null(), "Map: identity map must be elided at emit");
-                let func = unsafe { &*func_ptr };
+                let func = &program.funcs[func_idx.at()];
                 let reindex = match *reindex {
                     ReindexOperand::None => ops::ReindexSpec::None,
                     ReindexOperand::HashRow { branch_id } => ops::ReindexSpec::HashRow { branch_id },
                     ReindexOperand::Pack { packer_idx } => {
-                        ops::ReindexSpec::Pack(&program.reindex_packers[packer_idx as usize])
+                        ops::ReindexSpec::Pack(&program.reindex_packers[packer_idx.at()])
                     }
                 };
                 let result = ops::op_map(&reg!(*in_reg).batch, func, reindex);
@@ -241,9 +233,7 @@ pub(crate) fn execute_epoch_from(
                 let (output, consolidated) = ops::op_weight_clamp(delta, cursor, schema, *lo, *hi);
                 reg_mut!(*out_reg).batch = output;
                 // Ingest consolidated delta into history table
-                let ptr = program.tables[*hist_table_idx as usize];
-                let table = unsafe { &mut *ptr };
-                let res = table.ingest_owned_batch(consolidated);
+                let res = program.table_mut(*hist_table_idx).ingest_owned_batch(consolidated);
                 log_tick_ingest_err("weight-clamp history", *hist_table_idx, res)?;
             }
 
@@ -290,20 +280,12 @@ pub(crate) fn execute_epoch_from(
                 if read_only {
                     continue;
                 }
-                // The pointer pool lives here, so the `unsafe` deref does too;
-                // the operator takes a borrow.
                 let (table_idx, op_target) = match target {
-                    IntegrateTarget::Trace(idx) => {
-                        let ptr = program.tables[*idx as usize];
-                        (*idx, OpsIntegrateTarget::Trace(unsafe { &mut *ptr }))
-                    }
-                    IntegrateTarget::Avi(a) => {
-                        let ptr = program.tables[a.table_idx as usize];
-                        (
-                            a.table_idx,
-                            OpsIntegrateTarget::Avi(unsafe { &mut *ptr }, &program.avi_bakes[a.bake_idx as usize]),
-                        )
-                    }
+                    IntegrateTarget::Trace(idx) => (*idx, OpsIntegrateTarget::Trace(program.table_mut(*idx))),
+                    IntegrateTarget::Avi(a) => (
+                        a.table_idx,
+                        OpsIntegrateTarget::Avi(program.table_mut(a.table_idx), &program.avi_bakes[a.bake_idx.at()]),
+                    ),
                 };
 
                 gnitz_debug!(
@@ -322,7 +304,7 @@ pub(crate) fn execute_epoch_from(
                 plan_idx,
                 avi,
             } => {
-                let plan = &program.reduce_plans[*plan_idx as usize];
+                let plan = &program.reduce_plans[plan_idx.at()];
                 let to_cursor = cursor_mut!(*trace_out_reg);
 
                 // Combined AVI cursor — created fresh from the value-index table
@@ -331,8 +313,7 @@ pub(crate) fn execute_epoch_from(
                 // Operator-state read; compact first (see compact_owned_traces).
                 let mut avi_handle: Option<(ReduceAvi, Box<ReadCursor>)> = match avi {
                     Some(a) => {
-                        let ptr = program.tables[a.table_idx as usize];
-                        let avi_table = unsafe { &mut *ptr };
+                        let avi_table = program.table_mut(a.table_idx);
                         let _ = avi_table.compact_if_needed();
                         Some((*a, Box::new(avi_table.open_cursor())))
                     }
@@ -350,7 +331,7 @@ pub(crate) fn execute_epoch_from(
                 // the operator never re-derives which mode it is in.
                 let history = avi_handle.as_mut().map(|(a, cursor)| ops::AviHistory {
                     cursor: cursor.as_mut(),
-                    packer: &program.avi_bakes[a.bake_idx as usize].key_packer,
+                    packer: &program.avi_bakes[a.bake_idx.at()].key_packer,
                 });
                 let raw_out = ops::op_reduce(&reg!(*in_reg).batch, to_cursor, history, plan);
 

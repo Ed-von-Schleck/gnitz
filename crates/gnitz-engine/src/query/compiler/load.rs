@@ -68,7 +68,7 @@ pub(crate) fn load_circuit(
     view_id: u64,
     out_schema: SchemaDescriptor,
 ) -> Result<LoadedCircuit, CompileError> {
-    let fail = || CompileError::LoadFailed;
+    let fail = || CompileError::Rejected("circuit load failed");
     let mut nodes_cur = open_system_cursor(sys.nodes).ok_or_else(fail)?;
     let mut edges_cur = open_system_cursor(sys.edges).ok_or_else(fail)?;
     let mut node_cols_cur = open_system_cursor(sys.node_columns).ok_or_else(fail)?;
@@ -169,9 +169,7 @@ pub(super) fn topo_sorted(
 ) -> Result<LoadedCircuit, CompileError> {
     let mut outgoing: HashMap<i32, Vec<(i32, i32)>> = HashMap::new();
     let mut incoming: HashMap<i32, Vec<(i32, i32)>> = HashMap::new();
-    let mut in_degree: HashMap<i32, i32> = HashMap::new();
     for &nid in nodes.keys() {
-        in_degree.insert(nid, 0);
         outgoing.entry(nid).or_default();
         incoming.entry(nid).or_default();
     }
@@ -179,14 +177,11 @@ pub(super) fn topo_sorted(
     for &(src, dst, port) in &edges {
         outgoing.entry(src).or_default().push((dst, port));
         incoming.entry(dst).or_default().push((src, port));
-        *in_degree.entry(dst).or_insert(0) += 1;
     }
 
-    let mut init: Vec<i32> = nodes
-        .keys()
-        .filter(|&&nid| *in_degree.get(&nid).unwrap_or(&0) == 0)
-        .copied()
-        .collect();
+    let mut in_degree: HashMap<i32, i32> = incoming.iter().map(|(&nid, ins)| (nid, ins.len() as i32)).collect();
+
+    let mut init: Vec<i32> = nodes.keys().filter(|nid| in_degree[nid] == 0).copied().collect();
     init.sort_unstable(); // deterministic order for tied sources
     let mut queue: VecDeque<i32> = init.into();
 
@@ -208,7 +203,7 @@ pub(super) fn topo_sorted(
     }
 
     if ordered.len() != nodes.len() {
-        return Err(CompileError::Cycle);
+        return Err(CompileError::Rejected("circuit graph has a cycle"));
     }
     Ok(LoadedCircuit {
         out_schema,
@@ -288,14 +283,6 @@ pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec
     (seqs, orphaned)
 }
 
-/// One scan's `ScatterKey` sequences concatenated — the projection
-/// [`super::optimize::compute_scatter_routing`] builds the co-partition prefix
-/// test from, isolated to one scan node so the tests can pin the walk itself.
-#[cfg(test)]
-pub(super) fn co_partition_keys(loaded: &LoadedCircuit, scan_nid: i32) -> Vec<(u32, u8)> {
-    scatter_key_of_scan(loaded, scan_nid).0.into_iter().flatten().collect()
-}
-
 /// True iff some scan reaches reindex `Map`s and none of them is a `ScatterKey`.
 ///
 /// Deliberately not conditioned on the circuit carrying a `Join`: a GROUP BY or
@@ -315,8 +302,8 @@ pub(super) fn scan_reaches_only_unflagged_reindexes(loaded: &LoadedCircuit) -> b
 /// region, never moves a row
 /// off-worker; Map/Reduce/Distinct/join change the key or its distribution, and a
 /// `WorkerFilter` (range-join broadcast input) is not a `Filter` either. The
-/// backward dual of `reindex_cols_through_filters`, reading the same `loaded.incoming`
-/// adjacency as `ancestors_inclusive` / `exchange_input_node`. The chain is acyclic —
+/// backward dual of `scatter_key_of_scan`, reading the same `loaded.incoming`
+/// adjacency as `ancestors_inclusive`. The chain is acyclic —
 /// both `compile_view` and `load_meta_circuit` reject a malformed cyclic circuit (the
 /// latter presents it as empty, so this walk is never entered on one) — and each hop
 /// has exactly one incoming edge, so it terminates without a visited guard.
@@ -378,10 +365,10 @@ fn find_in_topo_order<T>(loaded: &LoadedCircuit, f: impl Fn(&gnitz_wire::OpNode)
 ///
 /// It is deliberately NOT `has_join_shard && has_exchange`: that predicate is
 /// also true for every GROUP BY / reduce / single-sided set-op view (a group
-/// reindex matches `reindex_cols_through_filters`, and the view has an output
+/// reindex matches `scatter_key_of_scan`, and the view has an output
 /// `ExchangeShard`), so keying on it would divert those views into the relay
-/// path and corrupt them. Shared by `DagEngine::view_range_join_n_eq` and its
-/// unit test.
+/// path and corrupt them. Read once into `ViewMeta::range_join_n_eq`, which is
+/// what every runtime caller consults.
 pub(crate) fn circuit_range_join_n_eq(loaded: &LoadedCircuit) -> Option<u8> {
     find_in_topo_order(loaded, |op| match op {
         gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq, .. }) => Some(*n_eq),

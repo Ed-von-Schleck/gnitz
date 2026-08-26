@@ -31,8 +31,8 @@ pub(crate) enum JoinProbe {
 }
 
 /// A range relation as its two independent dimensions, plus the width they
-/// operate at. [`RangeProbe::of`] is the only constructor, so the pair always
-/// spells a real relation.
+/// operate at. [`RangeProbe::new`] is the only public constructor, so the pair
+/// always spells a real relation over a key width the sweep can slice.
 #[derive(Clone, Copy)]
 pub(crate) struct RangeProbe {
     /// Width in OPK bytes of the equality-pinned leading slots; the rest of a PK
@@ -45,7 +45,40 @@ pub(crate) struct RangeProbe {
 }
 
 impl RangeProbe {
-    pub(crate) fn of(eq_size: usize, rel: RangeRel) -> RangeProbe {
+    /// Resolve a wire range relation against the two input schemas, or name the
+    /// precondition the circuit violated. `Result`, not a debug assert: a circuit
+    /// is client-supplied catalog data, and the sweep's `pk[..eq_size]` /
+    /// `pk[eq_size..]` slices have nothing else establishing them.
+    pub(crate) fn new(
+        delta_schema: &SchemaDescriptor,
+        trace_schema: &SchemaDescriptor,
+        n_eq: u8,
+        rel: RangeRel,
+    ) -> Result<RangeProbe, &'static str> {
+        // The trace's reindexed key is `[eq slots…, range slot]`.
+        if n_eq as usize + 1 != trace_schema.pk_indices().len() {
+            return Err("range join: n_eq does not match trace key arity");
+        }
+        // Both sides reindex at the pair's common promoted type, so their PK
+        // regions have one width — which the sweep slices both of at.
+        if delta_schema.pk_stride() != trace_schema.pk_stride() {
+            return Err(
+                "range join: delta and trace PK strides differ (both sides must reindex at the pair's common type)",
+            );
+        }
+        // Not implied by the arity check above: `leading_key_size` sums *schema*-
+        // order columns, so a crafted circuit can spend the whole key on the eq
+        // prefix while still naming `n_eq + 1` PK columns.
+        let eq_size = trace_schema.leading_key_size(n_eq as usize);
+        if eq_size >= trace_schema.pk_stride() as usize {
+            return Err("range join: eq prefix covers the whole key");
+        }
+        Ok(RangeProbe::of(eq_size, rel))
+    }
+
+    /// The relation's two dimensions at a validated `eq_size`. Private: only
+    /// [`RangeProbe::new`] establishes that width against a real key region.
+    fn of(eq_size: usize, rel: RangeRel) -> RangeProbe {
         let (prefix, nonstrict) = match rel {
             RangeRel::Gt => (true, false),
             RangeRel::Ge => (true, true),
@@ -370,7 +403,7 @@ mod tests {
             schema,
             schema,
             &join_out_schema(schema, schema),
-            JoinProbe::Range(RangeProbe::of(schema.leading_key_size(n_eq), rel)),
+            JoinProbe::Range(RangeProbe::new(schema, schema, n_eq as u8, rel).expect("fixture probe is well-formed")),
         )
     }
 
@@ -1088,11 +1121,16 @@ mod tests {
     // RangeProbe::cut_points, over 1-byte slots so the keys are exact-comparable
     // -----------------------------------------------------------------------
 
-    /// The cut points for `pk = eq ‖ d` under `rel`.
+    /// The cut points for `pk = eq ‖ d` under `rel`, over the all-`U8` PK schema
+    /// whose one-byte slots make `pk` its own OPK image.
     fn cuts(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
         let mut pk = eq.to_vec();
         pk.extend_from_slice(d);
-        RangeProbe::of(eq.len(), rel)
+        let cols: Vec<SchemaColumn> = (0..pk.len()).map(|_| SchemaColumn::new(type_code::U8, 0)).collect();
+        let pk_idx: Vec<u32> = (0..pk.len() as u32).collect();
+        let schema = SchemaDescriptor::new(&cols, &pk_idx);
+        RangeProbe::new(&schema, &schema, eq.len() as u8, rel)
+            .expect("u8-slot fixture is a well-formed range key")
             .cut_points(&pk)
             .map(|(s, e)| (s.pk_bytes().to_vec(), e.map(|e| e.pk_bytes().to_vec())))
     }

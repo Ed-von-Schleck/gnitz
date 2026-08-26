@@ -295,8 +295,8 @@ impl DagEngine {
             for sub in plan.sub_plans_mut() {
                 // Null owned cursors before the fold so none holds a stale snapshot.
                 sub.vm.null_owned_cursors();
-                for owned in sub.vm.owned_tables.iter_mut() {
-                    traces.push(&mut **owned as *mut Table);
+                for idx in sub.vm.program.table_indices().collect::<Vec<_>>() {
+                    traces.push(sub.vm.program.table_mut(idx) as *mut Table);
                 }
             }
         }

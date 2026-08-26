@@ -497,7 +497,6 @@ impl DagEngine {
     pub fn invalidate(&mut self, view_id: i64) {
         self.cache.remove(&view_id);
         self.evict_meta(view_id);
-        self.dep.invalidate();
     }
 
     pub fn invalidate_all(&mut self) {
@@ -703,9 +702,8 @@ mod tests {
 
         dag.invalidate(42);
         assert!(!dag.meta.contains_key(&42));
-        assert!(!dag.dep.valid);
+        assert!(dag.dep.valid, "invalidate drops the plan and its meta, not the dep map");
 
-        dag.dep.valid = true;
         dag.invalidate_dep_map();
         assert!(!dag.dep.valid);
 

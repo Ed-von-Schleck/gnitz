@@ -163,10 +163,9 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
     col.nullable == 0 && gnitz_wire::is_pk_eligible(col.type_code)
 }
 
-/// Hash one group column into the fold-path digest. The single per-column
-/// body shared by the schema-walking [`extract_group_key`] and the baked
-/// [`GroupKeyCols::key_row`] — a divergence would silently merge or split
-/// groups (a wrong output PK, and a wrong AVI bucket).
+/// Hash one group column into the fold-path digest. The single per-column body
+/// [`GroupKeyCols::key_row`] folds with — a divergence would silently merge or
+/// split groups (a wrong output PK, and a wrong AVI bucket).
 ///
 /// Reads the null bit unconditionally, like the sibling `compare_by_group_cols`:
 /// a NOT NULL column never carries one, so masking it off would cost a per-row

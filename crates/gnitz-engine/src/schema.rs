@@ -770,7 +770,7 @@ impl SchemaDescriptor {
         // last-line guard against an internal bug, distinct from untrusted-index
         // rejection (a client-supplied circuit naming an OOB column). `locate`
         // runs at extractor/program setup and, at worst, once per group
-        // (`extract_group_key`) — never per row — so the check and the PK arm's
+        // (`GroupKeyCols::new`) — never per row — so the check and the PK arm's
         // `pk_byte_offset` walk are both free.
         assert!(
             col_idx < self.num_columns(),
@@ -1161,6 +1161,29 @@ pub(crate) fn hashrow_output_schema(
         b.push(SchemaColumn::new(out_tc, src.nullable))?;
     }
     Some(b.finish())
+}
+
+/// Both inputs of a `Union` must share a physical layout (equal column count, PK
+/// indices, and per-column `type_code`); `None` rejects a circuit whose branches
+/// do not. On success the result is `a`'s schema with each column's nullability
+/// OR-ed with `b`'s, so a null-carrying side forces the null-aware `Generic` row
+/// comparator instead of the null-blind `FixedIntNonnull` fast path (which orders
+/// by raw payload bytes and would fail to coalesce two logically-NULL rows
+/// carrying non-zero bytes under the null bit).
+///
+/// Built through `SchemaDescriptor::new` and not `DerivedSchema`, which forces
+/// `pk_indices = 0..pk_len`: a `Union` input's PK need not be a column prefix.
+pub(crate) fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Option<SchemaDescriptor> {
+    if !a.same_physical_layout(b) {
+        return None;
+    }
+    let cols: Vec<SchemaColumn> = (0..a.num_columns())
+        .map(|c| {
+            let (ac, bc) = (a.columns[c], b.columns[c]);
+            SchemaColumn::new(ac.type_code, ac.nullable | bc.nullable)
+        })
+        .collect();
+    Some(SchemaDescriptor::new(&cols, a.pk_indices()))
 }
 
 /// Output schema of an outer-join NULL_EXTEND: the input schema verbatim (PK

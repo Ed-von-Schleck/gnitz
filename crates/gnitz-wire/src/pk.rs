@@ -349,7 +349,7 @@ pub fn worker_for_pk_bytes(bytes: &[u8], num_workers: usize) -> usize {
 // unsigned types and differ for signed:
 //
 // * ROUTING (`*_route_key`): the canonical `widen_pk_be(OPK)` value — sign-
-//   flipped for signed. Used by exchange/`extract_group_key`, matching
+//   flipped for signed. Used by the exchange's group-key fold, matching
 //   `worker_for_pk_bytes`, which is schema-less and *cannot* decode, so it
 //   must hash the OPK bytes' widened value. Both sides of a distributed join
 //   agree only in this space.

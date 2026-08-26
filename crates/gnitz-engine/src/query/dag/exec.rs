@@ -151,11 +151,11 @@ impl DagEngine {
         if !input_is_empty {
             return false;
         }
-        if !sub.can_emit_on_empty.get() {
+        if !sub.can_emit_on_empty {
             sub.vm.clear_deltas();
             return true;
         }
-        sub.can_emit_on_empty.set(false);
+        sub.can_emit_on_empty = false;
         false
     }
 
