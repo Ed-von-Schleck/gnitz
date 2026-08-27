@@ -1,77 +1,20 @@
 //! Sorted-stream co-group merge skeletons.
 //!
-//! Three skeletons over one operation: **co-group two sorted OPK-byte streams by
-//! equal PK**, handing each `(key, left-group, right-group)` to the operator.
-//! [`cogroup_intersection`] serves the equi delta-trace join, [`cogroup_left`]
-//! distinct, and [`cogroup_union`] the symmetric set-union merge. The skip step
-//! galloping-seeks from the live position, so K ascending probes over an N-row
-//! source cost `O(K · log gap)`, not `O(K · log N)` or a linear `O(K + N)` scan.
+//! Two skeletons over one operation: **walk a sorted delta batch against a sorted
+//! [`ReadCursor`], grouped by equal PK**, handing each `(key, delta-group, cursor)`
+//! to the operator, which makes the Z-set decision — the equi delta-trace join
+//! ([`cogroup_intersection`]) and distinct ([`cogroup_left`]). The skip step
+//! galloping-seeks from the live position: K ascending probes over an N-row source
+//! cost `O(K · log gap)`, not `O(K · log N)` or a linear `O(K + N)` scan.
 //!
-//! Equal key is the whole contract — which is why the range join's ordered-span
-//! walk is not a fourth skeleton here.
+//! Equal key is the whole contract — which is why neither the range join's
+//! ordered-span walk nor `Batch::merged_sorted` is a third skeleton here.
 
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
-use crate::storage::{AppendSession, Batch, MemBatch, ReadCursor};
-
-/// First row index past the equal-PK group beginning at `start`. Requires
-/// `start < batch.count`.
-#[inline]
-pub(crate) fn pk_group_end(batch: &Batch, start: usize) -> usize {
-    let k = batch.get_pk_bytes(start);
-    let mut j = start + 1;
-    while j < batch.count && pk_bytes_eq(batch.get_pk_bytes(j), k) {
-        j += 1;
-    }
-    j
-}
-
-/// A random-access cursor over a sorted `&Batch`, advanced by row index. Beyond
-/// the galloping skip it exposes its `pos` and equal-PK group extent
-/// (`group_end`/`seek`), which [`cogroup_union`] uses to bracket and
-/// bulk-advance both sides.
-pub(crate) struct BatchCursor<'a> {
-    batch: &'a Batch,
-    pub(crate) pos: usize,
-}
-
-impl<'a> BatchCursor<'a> {
-    #[inline]
-    pub(crate) fn new(batch: &'a Batch) -> Self {
-        Self { batch, pos: 0 }
-    }
-
-    /// Jump to an absolute row index (used to skip past a bracketed group).
-    #[inline]
-    pub(crate) fn seek(&mut self, idx: usize) {
-        self.pos = idx;
-    }
-
-    /// First row index past the equal-PK group beginning at `pos`. Requires
-    /// `pos < batch.count`.
-    #[inline]
-    pub(crate) fn group_end(&self) -> usize {
-        pk_group_end(self.batch, self.pos)
-    }
-
-    /// Current row's OPK bytes; `None` when exhausted.
-    #[inline]
-    pub(crate) fn key(&self) -> Option<&[u8]> {
-        if self.pos < self.batch.count {
-            Some(self.batch.get_pk_bytes(self.pos))
-        } else {
-            None
-        }
-    }
-
-    /// Galloping forward lower-bound skip to the first row with `key() >= key`.
-    #[inline]
-    pub(crate) fn advance_to(&mut self, key: &[u8]) {
-        self.pos = self.batch.advance_to(key, self.pos);
-    }
-}
+use crate::schema::key::compare_pk_ordering;
+use crate::storage::{Batch, ReadCursor};
 
 /// Intersection co-group: emit only at keys present on **both** sides. Both
 /// pointers galloping-skip to catch up, so the cost is bounded by the smaller
@@ -111,7 +54,7 @@ pub(crate) fn cogroup_intersection(
             Ordering::Less => i = delta.advance_to(m.current_pk_bytes(), i), // skip delta
             Ordering::Greater => m.advance_to(dk),                           // skip match side
             Ordering::Equal => {
-                let j = pk_group_end(delta, i); // delta group
+                let j = delta.pk_group_end(i); // delta group
                 on_match(dk, i..j, m); // walks match group
                 i = j;
             }
@@ -136,74 +79,10 @@ pub(crate) fn cogroup_left(
     let mut i = 0;
     while i < n {
         let dk = delta.get_pk_bytes(i);
-        let j = pk_group_end(delta, i);
+        let j = delta.pk_group_end(i);
         m.advance_to(dk); // galloping skip; group may be empty
         on_group(dk, i..j, m);
         i = j;
-    }
-}
-
-/// Full-outer co-group: emit every key from **both** sides (the symmetric
-/// set-union merge). Galloping-skips the lagging side to the other's key, so a
-/// long single-source run is one `advance_to` (`O(log gap)`) + one bulk append
-/// instead of a per-row crawl. At a shared key the skeleton brackets both
-/// equal-PK groups and hands them to `on_shared` to interleave by payload. Both
-/// sides are random-access batches, so the skeleton owns every advance: it
-/// bulk-appends each single-source run into `out` itself (the trivial part), and
-/// the callback only emits the payload-merged shared groups — through the same
-/// session and the same two `MemBatch` views, so the shared groups cost no more
-/// per-call setup than the runs around them.
-#[inline]
-pub(crate) fn cogroup_union(
-    a: &mut BatchCursor,
-    b: &mut BatchCursor,
-    out: &mut Batch,
-    mut on_shared: impl FnMut(&mut AppendSession, &MemBatch, &MemBatch, Range<usize>, Range<usize>),
-) {
-    // One append session for the whole merge. Every single-source run below is
-    // one push, and for a set operation the runs are ~1 row (the branches carry
-    // uniform 128-bit `reindex_hash_row` PKs), so re-deriving the string map and
-    // re-acquiring a blob cache per run would cost more than the copy.
-    let (mb_a, mb_b) = (a.batch.as_mem_batch(), b.batch.as_mem_batch());
-    let mut sink = out.append_session(mb_a.count + mb_b.count);
-    loop {
-        match (a.key().is_some(), b.key().is_some()) {
-            (true, true) => {
-                // Both keys present: temporaries from key() drop at the end of
-                // this `let`, freeing a/b for the per-arm mutation below.
-                let ord = compare_pk_ordering(a.key().unwrap(), b.key().unwrap());
-                match ord {
-                    Ordering::Less => {
-                        let s = a.pos;
-                        let k = b.key().unwrap();
-                        a.advance_to(k);
-                        sink.push_range(&mb_a, s, a.pos);
-                    }
-                    Ordering::Greater => {
-                        let s = b.pos;
-                        let k = a.key().unwrap();
-                        b.advance_to(k);
-                        sink.push_range(&mb_b, s, b.pos);
-                    }
-                    Ordering::Equal => {
-                        let ga = a.group_end();
-                        let gb = b.group_end();
-                        on_shared(&mut sink, &mb_a, &mb_b, a.pos..ga, b.pos..gb);
-                        a.seek(ga);
-                        b.seek(gb);
-                    }
-                }
-            }
-            (true, false) => {
-                sink.push_range(&mb_a, a.pos, mb_a.count);
-                return;
-            }
-            (false, true) => {
-                sink.push_range(&mb_b, b.pos, mb_b.count);
-                return;
-            }
-            (false, false) => return,
-        }
     }
 }
 
@@ -400,50 +279,5 @@ mod tests {
 
         let got = strip(&run_intersection(&delta, &mut ch));
         assert_eq!(got, want, "stale cursor must be reset by self-positioning");
-    }
-
-    /// `cogroup_union` emits **every** row from both sides exactly once: the
-    /// reconstructed output multiset equals the concatenation of a's and b's
-    /// rows. Covers disjoint, shared-key, skewed (tiny ∪ huge, exercising the
-    /// gallop skip over a long run), all-equal, and one-empty-side shapes.
-    #[test]
-    fn union_emits_every_row_both_sides() {
-        let cases: &[CoGroupCase] = &[
-            (
-                &[(1, 1, 10), (3, 1, 30), (5, 1, 50)],
-                &[(2, 1, 20), (3, 1, 33), (4, 1, 40)],
-            ),
-            (&[(1, 1, 1)], &[(2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5), (6, 1, 6)]), // tiny ∪ huge
-            (&[(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5)], &[(3, 1, 9)]), // huge ∪ tiny
-            (&[(7, 1, 70), (7, 1, 71)], &[(7, 1, 72), (7, 1, 73)]),                   // all equal, multi-payload
-            (&[(1, 1, 1), (2, 1, 2)], &[]),                                           // empty b
-            (&[], &[(1, 1, 1), (2, 1, 2)]),                                           // empty a
-        ];
-
-        for (ai, bi) in cases {
-            let a = make_batch(ai);
-            let b = make_batch(bi);
-            let mut ac = BatchCursor::new(&a);
-            let mut bc = BatchCursor::new(&b);
-
-            // Emit into a real output batch; the skeleton bulk-appends the
-            // single-source runs, the callback appends both shared groups.
-            let mut out = Batch::with_capacity(make_schema_u64_i64(), (a.count + b.count).max(1));
-            cogroup_union(&mut ac, &mut bc, &mut out, |sink, mb_a, mb_b, ra, rb| {
-                sink.push_range(mb_a, ra.start, ra.end);
-                sink.push_range(mb_b, rb.start, rb.end);
-            });
-
-            let mut emitted: Vec<u64> = (0..out.count).map(|i| pk_of(out.get_pk_bytes(i))).collect();
-            emitted.sort_unstable();
-
-            let mut expected: Vec<u64> = (0..a.count)
-                .map(|i| pk_of(a.get_pk_bytes(i)))
-                .chain((0..b.count).map(|i| pk_of(b.get_pk_bytes(i))))
-                .collect();
-            expected.sort_unstable();
-
-            assert_eq!(emitted, expected, "union a={ai:?} b={bi:?}");
-        }
     }
 }

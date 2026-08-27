@@ -11,7 +11,7 @@ fn names(s: &gnitz_core::Schema) -> Vec<String> {
     s.columns.iter().map(|c| c.name.to_lowercase()).collect()
 }
 
-// ── item 40: PK column move must preserve remaining order ─────────────
+// ── PK column move must preserve remaining order ─────────────
 
 #[test]
 fn test_projection_pk_move_preserves_order() {
@@ -37,7 +37,7 @@ fn test_projection_pk_move_preserves_order() {
     );
 }
 
-// ── item 43: PK column with alias is PassThrough, not Computed ─────────
+// ── PK column with alias is PassThrough, not Computed ─────────
 
 #[test]
 fn test_projection_pk_alias_accepted() {

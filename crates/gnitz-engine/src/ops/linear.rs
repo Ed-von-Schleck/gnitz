@@ -1,17 +1,13 @@
-//! Linear operators: op_filter, op_negate, op_union, op_null_extend.
+//! Linear operators: filter, negate, union.
 //!
-//! MAP has no operator here: a `MapPlan` owns its output schema and its PK
-//! source, so `crate::expr::MapPlan::evaluate_map_batch` *is* the whole body and
-//! a forwarder would only re-spell its arguments.
-
-use std::cmp::Ordering;
+//! The other two live with the batch mechanics they are: MAP is
+//! `crate::expr::MapPlan::evaluate_map_batch`, null-extend
+//! `Batch::widened_with_null_tail`.
 
 use gnitz_expr::Evaluator;
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{with_payload_cmp, Batch, Layout, MemBatch, RowComparator};
-
-use super::cogroup::{cogroup_union, BatchCursor};
+use crate::storage::{Batch, Layout};
 
 // ---------------------------------------------------------------------------
 // Linear operators
@@ -20,185 +16,61 @@ use super::cogroup::{cogroup_union, BatchCursor};
 /// Filter: retain rows where predicate returns true.
 /// Uses contiguous-range bulk copy for efficiency.
 pub(crate) fn op_filter(batch: &Batch, pred: &Evaluator, schema: &SchemaDescriptor) -> Batch {
-    let n = batch.count;
-    if n == 0 {
+    // The DAG pushes an empty placeholder every epoch, and `filter_ranges` takes
+    // its scratch borrow and sizes it before the morsel loop.
+    if batch.count == 0 {
         return Batch::empty_with_schema(schema);
     }
 
-    // The survivor list is a plain per-call `Vec`: measured against a reused one
-    // it is a wash (glibc grows the fresh allocation in place), and it is ~1% of
-    // the gather it feeds either way.
+    // A per-call `Vec`: measured against a reused one it is a wash. `filter_ranges`
+    // lends `out` so a *chunked* scan can carry one list; this caller has one batch.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     pred.filter_ranges(&batch.as_mem_batch(), &mut ranges);
-    let mut output = Batch::from_ranges(batch, &ranges, schema);
-
-    // The gather downgraded `output` to `Raw`. A filtered subset preserves the
-    // input's order, weights, and (PK, payload) distinctness, so it carries
-    // exactly the input's layout — a faithful propagate (no re-verify).
-    output.inherit_layout(batch);
-
-    gnitz_debug!("op_filter: in={} out={}", n, output.count);
-    output
+    Batch::from_ranges(batch, &ranges, schema)
 }
 
-/// Negate: flip the sign of every weight.
-pub(crate) fn op_negate(batch: &Batch) -> Batch {
-    if batch.count == 0 {
-        return batch.empty_like();
-    }
-
-    // clone_batch copies all column regions and the blob verbatim — no
-    // per-string relocation is needed since we keep the same blob content.
-    let mut output = batch.clone_batch();
-    output.map_weights(i64::wrapping_neg);
-
-    // clone_batch preserves sorted and consolidated; negating weights does not change element
-    // identity, so both invariants survive as-is.
-    gnitz_debug!("op_negate: count={}", batch.count);
-    output
+/// Negate: flip the sign of every weight. `wrapping_neg` because `i64::MIN` must
+/// not panic; element identity is untouched, so the layout claim carries over.
+pub(crate) fn op_negate(mut batch: Batch) -> Batch {
+    batch.map_weights(i64::wrapping_neg);
+    batch
 }
 
-/// Union: algebraic addition of two Z-Set streams.
-/// When both inputs are sorted, performs O(N) merge preserving sort order.
-///
-/// `out_schema` is the UNION's own schema, not either input's: the two sides
-/// share a physical layout but may disagree on a column's nullability, and only
-/// the OR of the two (`union_nullability_merge`) selects a row comparator that
-/// orders a NULL cell apart from a zero one. The merge below certifies its
-/// output `Sorted` under this schema, so a comparator narrower than the merged
-/// rows would leave a false order claim behind for `into_consolidated` to trust.
+/// Union: algebraic addition of two Z-Set streams; sorted inputs take an O(N)
+/// merge. `out_schema` is the UNION's own, not either input's — the merge
+/// certifies `Sorted` under it, so a narrower comparator would leave a false
+/// order claim for `into_consolidated` to trust.
 pub(crate) fn op_union(batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
     if batch_b.count == 0 {
         // O(1) pass-through: no allocation, sorted/consolidated preserved.
         gnitz_debug!("op_union: a={} b=0 identity", batch_a.count);
         return batch_a;
     }
-    let b = batch_b;
     if batch_a.count == 0 {
-        return b.clone_batch();
+        return batch_b.clone_batch();
     }
 
-    if batch_a.sorted_verified(out_schema) && b.sorted_verified(out_schema) {
-        return op_union_merge(&batch_a, b, out_schema);
+    if batch_a.sorted_verified(out_schema) && batch_b.sorted_verified(out_schema) {
+        let mut output = batch_a.merged_sorted(batch_b, out_schema);
+        // A payload-aware merge of two sorted inputs is genuinely
+        // (PK, payload)-sorted, but unfolded (Z-Set `+` does not sum weights).
+        output.certify_layout(Layout::Sorted, out_schema);
+        gnitz_debug!(
+            "op_union: a={} b={} out={} sorted_merge",
+            batch_a.count,
+            batch_b.count,
+            output.count
+        );
+        return output;
     }
 
     // Unsorted: concatenate (the appends leave `output` `Raw`).
-    let mut output = Batch::with_capacity(*out_schema, batch_a.count + b.count);
-    output.append_batch(&batch_a, 0, batch_a.count);
-    output.append_batch(b, 0, b.count);
+    let output = batch_a.concatenated(batch_b, out_schema);
     gnitz_debug!(
         "op_union: a={} b={} out={} concat",
         batch_a.count,
-        b.count,
+        batch_b.count,
         output.count
-    );
-    output
-}
-
-/// Sorted merge of two sorted batches with contiguous-run batching.
-fn op_union_merge(batch_a: &Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
-    with_payload_cmp!(out_schema, op_union_merge_inner, batch_a, batch_b, out_schema)
-}
-
-#[inline]
-fn op_union_merge_inner<RowCmp>(
-    batch_a: &Batch,
-    batch_b: &Batch,
-    out_schema: &SchemaDescriptor,
-    row_cmp: RowCmp,
-) -> Batch
-where
-    RowCmp: for<'x> RowComparator<MemBatch<'x>>,
-{
-    let n_a = batch_a.count;
-    let n_b = batch_b.count;
-    let mut output = Batch::with_capacity(*out_schema, n_a + n_b);
-
-    let mut a = BatchCursor::new(batch_a);
-    let mut b = BatchCursor::new(batch_b);
-
-    // Symmetric full-outer co-group (Z-Set `+`: every row from both sides). The
-    // skeleton bulk-appends each single-source run itself; only the shared-PK
-    // groups need the payload merge below, which coalesces contiguous
-    // single-source runs into one append each (the row count per group is often
-    // single-digit and `append_batch` has fixed per-call offset overhead).
-    cogroup_union(&mut a, &mut b, &mut output, |sink, mb_a, mb_b, ra, rb| {
-        let (i, i_end) = (ra.start, ra.end);
-        let (j, j_end) = (rb.start, rb.end);
-        let (mut ia, mut jb) = (i, j);
-        if ia < i_end && jb < j_end {
-            let mut prev_a = row_cmp(out_schema, mb_a, ia, mb_b, jb) != Ordering::Greater;
-            let mut run_start = if prev_a { ia } else { jb };
-            if prev_a {
-                ia += 1;
-            } else {
-                jb += 1;
-            }
-            while ia < i_end && jb < j_end {
-                let pick_a = row_cmp(out_schema, mb_a, ia, mb_b, jb) != Ordering::Greater;
-                if pick_a != prev_a {
-                    if prev_a {
-                        sink.push_range(mb_a, run_start, ia);
-                        run_start = jb;
-                    } else {
-                        sink.push_range(mb_b, run_start, jb);
-                        run_start = ia;
-                    }
-                    prev_a = pick_a;
-                }
-                if pick_a {
-                    ia += 1;
-                } else {
-                    jb += 1;
-                }
-            }
-            // Flush the in-progress run, folding its side's still-unpicked
-            // tail (rows the loop never reached because the *other* side
-            // exhausted first) into the same append. The opposite side then
-            // drains as a separate run.
-            if prev_a {
-                sink.push_range(mb_a, run_start, i_end);
-                if jb < j_end {
-                    sink.push_range(mb_b, jb, j_end);
-                }
-            } else {
-                sink.push_range(mb_b, run_start, j_end);
-                if ia < i_end {
-                    sink.push_range(mb_a, ia, i_end);
-                }
-            }
-        } else {
-            if ia < i_end {
-                sink.push_range(mb_a, ia, i_end);
-            }
-            if jb < j_end {
-                sink.push_range(mb_b, jb, j_end);
-            }
-        }
-    });
-
-    // Payload-aware merge of two sorted inputs ⇒ genuinely (PK, payload)-sorted,
-    // but unfolded (Z-Set `+` does not sum weights). Certify `Sorted`.
-    output.certify_layout(Layout::Sorted, out_schema);
-    gnitz_debug!("op_union: a={} b={} out={} sorted_merge", n_a, n_b, output.count);
-    output
-}
-
-/// Null-extend: copy the input batch and append NULL-filled payload columns.
-/// Used by the LEFT JOIN null-fill to extend the unmatched preserved rows
-/// (ν = positive_part(A − π_A(inner))) with NULL right columns. The output
-/// schema is the compiler-built register schema (`reg_meta`) — the single home
-/// for the merged shape; the appended column count is derived from it.
-/// (Combined-width overflow is compile-rejected at emit, so no runtime guard.)
-///
-/// Appending NULL columns is a pure widening of the batch's region layout, so the
-/// copy itself is `Batch::widened_with_null_tail`; the Z-set content is unchanged.
-pub(crate) fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Batch {
-    let output = batch.widened_with_null_tail(in_schema, out_schema);
-    gnitz_debug!(
-        "op_null_extend: in={} right_npc={}",
-        batch.count,
-        out_schema.num_payload_cols() - in_schema.num_payload_cols()
     );
     output
 }
@@ -210,12 +82,9 @@ pub(crate) fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, out_sc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::{Batch, Layout};
     use crate::test_support::{
-        make_batch, make_batch_i64pk, make_schema_i64pk_i64, make_schema_pk_u64_payload_blob,
-        make_schema_pk_u64_payload_string, make_schema_u64_i64, make_wide_batch, read_german_string,
-        wide_pk_3xu64_schema,
+        make_batch, make_batch_bytes, make_batch_i64pk, make_schema_i64pk_i64, make_schema_pk_u64_payload_string,
+        make_schema_u64_i64, make_wide_batch, opk_pk, wide_pk_3xu64_schema,
     };
 
     fn get_payload_i64(b: &Batch, row: usize) -> i64 {
@@ -225,6 +94,45 @@ mod tests {
     // -----------------------------------------------------------------------
     // Union merge sort-invariant tests
     // -----------------------------------------------------------------------
+
+    /// The order oracle: every row of both sides exactly once, at its own weight,
+    /// in (PK, payload) order. Compared unsorted, so it pins the emitted order.
+    /// Covers disjoint keys, a shared key, a skewed gallop on each side, an
+    /// all-equal PK, and each empty side.
+    #[test]
+    fn union_emits_every_row_both_sides() {
+        let schema = make_schema_u64_i64();
+        type Rows = &'static [(u64, i64, i64)];
+        let cases: &[(Rows, Rows)] = &[
+            (
+                &[(1, 1, 10), (3, 1, 30), (5, 1, 50)],
+                &[(2, 1, 20), (3, 1, 33), (4, 1, 40)],
+            ),
+            // tiny ∪ huge: the b-side gallop
+            (&[(1, 1, 1)], &[(2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5), (6, 1, 6)]),
+            // huge ∪ tiny: the a-side gallop
+            (&[(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5)], &[(3, 1, 9)]),
+            // all equal, multi-payload, mixed weights
+            (&[(7, 1, 70), (7, 1, 71)], &[(7, -2, 72), (7, 1, 73)]),
+            (&[(1, 1, 1), (2, 1, 2)], &[]),
+            (&[], &[(1, 1, 1), (2, 1, 2)]),
+        ];
+
+        for (ai, bi) in cases {
+            let out = op_union(make_batch(&schema, ai), &make_batch(&schema, bi), &schema);
+
+            // (pk, payload, weight), in (PK, payload) order. A stable sort over
+            // `a` then `b` breaks a (PK, payload) tie a-first, which is what the
+            // merge's `!= Greater` pick does.
+            let mut want: Vec<(u64, i64, i64)> = ai.iter().chain(bi.iter()).map(|&(pk, w, v)| (pk, v, w)).collect();
+            want.sort_by_key(|&(pk, v, _)| (pk, v));
+
+            let got: Vec<(u64, i64, i64)> = (0..out.count)
+                .map(|r| (out.get_pk(r) as u64, get_payload_i64(&out, r), out.get_weight(r)))
+                .collect();
+            assert_eq!(got, want, "union a={ai:?} b={bi:?}");
+        }
+    }
 
     #[test]
     fn test_union_merge_same_pk_payload_order() {
@@ -283,41 +191,6 @@ mod tests {
     }
 
     #[test]
-    fn test_union_merge_same_pk_multiple_entries() {
-        // a: [(1,1,20),(1,1,30)], b: [(1,1,10),(1,1,25)] → payloads [10,20,25,30]
-        let schema = make_schema_u64_i64();
-        let a = make_batch(&schema, &[(1, 1, 20), (1, 1, 30)]);
-        let b = make_batch(&schema, &[(1, 1, 10), (1, 1, 25)]);
-        let out = op_union(a, &b, &schema);
-        assert_eq!(out.count, 4);
-        assert!(out.is_sorted());
-        assert_eq!(get_payload_i64(&out, 0), 10);
-        assert_eq!(get_payload_i64(&out, 1), 20);
-        assert_eq!(get_payload_i64(&out, 2), 25);
-        assert_eq!(get_payload_i64(&out, 3), 30);
-    }
-
-    #[test]
-    fn test_union_merge_mixed_same_diff_pk() {
-        // a: [(1,1,20),(3,1,300)], b: [(1,1,10),(2,1,200)]
-        // output PKs [1,1,2,3], vals [10,20,200,300]
-        let schema = make_schema_u64_i64();
-        let a = make_batch(&schema, &[(1, 1, 20), (3, 1, 300)]);
-        let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 200)]);
-        let out = op_union(a, &b, &schema);
-        assert_eq!(out.count, 4);
-        assert!(out.is_sorted());
-        assert_eq!((out.get_pk(0) as u64), 1);
-        assert_eq!(get_payload_i64(&out, 0), 10);
-        assert_eq!((out.get_pk(1) as u64), 1);
-        assert_eq!(get_payload_i64(&out, 1), 20);
-        assert_eq!((out.get_pk(2) as u64), 2);
-        assert_eq!(get_payload_i64(&out, 2), 200);
-        assert_eq!((out.get_pk(3) as u64), 3);
-        assert_eq!(get_payload_i64(&out, 3), 300);
-    }
-
-    #[test]
     fn test_union_merge_same_pk_equal_payload() {
         // Same (PK, payload), opposite weights — must be adjacent for consolidation
         let schema = make_schema_u64_i64();
@@ -330,38 +203,9 @@ mod tests {
         assert_eq!(get_payload_i64(&out, 1), 10);
     }
 
-    /// Read a STRING/BLOB payload column's value back out as a `String`.
-    fn read_str_col(batch: &Batch, col: usize, row: usize) -> String {
-        String::from_utf8_lossy(&read_german_string(batch, col, row)).to_string()
-    }
-
-    /// Build a `Batch` for a `(U64 pk, STRING payload)` schema from
-    /// `(pk, weight, &str)` rows. Short (≤12 byte) strings are stored inline;
-    /// the resulting batch is marked sorted+consolidated (caller supplies rows
-    /// already in (PK, payload) order).
-    fn make_str_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
-        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
-        for &(pk, w, s) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            let gs = gnitz_wire::encode_german_string(s.as_bytes(), &mut b.blob);
-            b.extend_col(0, &gs);
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, schema);
-        b
-    }
-
-    /// Pin: the GENERIC `RowCmp` arm (`compare_rows`, German-string comparison)
-    /// must drive `op_union_merge_inner`'s shared-PK payload merge. A
-    /// `(U64 pk, STRING payload)` schema resolves to `PayloadCmpKind::Generic`,
-    /// so `with_payload_cmp!` threads the string-aware comparator into the merge.
-    /// Two rows share PK=1 with payloads "banana" (in a) and "apple" (in b); the
-    /// union must produce both rows (PK, payload)-sorted: "apple" before
-    /// "banana". The fixed-int comparator would treat these German-string structs
-    /// as raw 8-byte integers and order them by the wrong bytes (or merge them),
-    /// so a fixed-int dispatch through this path flips the string order.
+    /// Pin: the GENERIC arm (`compare_rows`, German-string comparison) must drive
+    /// the shared-PK payload interleave. The fixed-int comparator would read these
+    /// 16-byte structs as raw integers and order "banana" before "apple".
     #[test]
     fn test_union_merge_generic_rowcmp_shared_pk_string_payload() {
         let schema = make_schema_pk_u64_payload_string();
@@ -374,8 +218,8 @@ mod tests {
             "U64+STRING schema must use the GENERIC payload comparator",
         );
 
-        let a = make_str_batch(&schema, &[(1, 1, "banana")]);
-        let b = make_str_batch(&schema, &[(1, 1, "apple")]);
+        let a = make_batch_bytes(&schema, &[(1, 1, b"banana")]);
+        let b = make_batch_bytes(&schema, &[(1, 1, b"apple")]);
         let out = op_union(a, &b, &schema);
 
         assert_eq!(out.count, 2, "Z-Set + keeps both shared-PK rows");
@@ -384,95 +228,13 @@ mod tests {
         assert_eq!(out.get_pk(0) as u64, 1);
         assert_eq!(out.get_pk(1) as u64, 1);
         // (PK, payload) order: German-string compare puts "apple" before "banana".
-        assert_eq!(read_str_col(&out, 0, 0), "apple", "row0 payload (string-sorted)");
-        assert_eq!(read_str_col(&out, 0, 1), "banana", "row1 payload (string-sorted)");
-    }
-
-    // -----------------------------------------------------------------------
-    // op_filter tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_op_filter_basic() {
-        use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
-
-        let schema = make_schema_u64_i64();
-        let batch = make_batch(&schema, &[(1, 1, 5), (2, 1, 15), (3, 1, 25)]);
-
-        let instrs = vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1]
-            LogicalInstr::LoadConst { dst: 1, val: 10 }, // r1 = 10
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
-            }, // r2 = (r0 > r1)
-        ];
-        let func = LogicalProgram::new(instrs, 3, 2, vec![])
-            .resolve_filter(&schema)
-            .unwrap();
-
-        let out = op_filter(&batch, &func, &schema);
-        assert_eq!(out.count, 2, "only pk=2 and pk=3 pass val>10");
-        assert_eq!((out.get_pk(0) as u64), 2);
-        assert_eq!((out.get_pk(1) as u64), 3);
-    }
-
-    #[test]
-    fn test_op_filter_consolidated_flag() {
-        use gnitz_expr::{LogicalInstr, LogicalProgram};
-
-        let instrs = vec![
-            LogicalInstr::LoadConst { dst: 0, val: 1 }, // always true
-        ];
-        let schema = make_schema_u64_i64();
-        let func = LogicalProgram::new(instrs, 1, 0, vec![])
-            .resolve_filter(&schema)
-            .unwrap();
-
-        let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-
-        let out = op_filter(&batch, &func, &schema);
-        assert_eq!(out.count, 2);
-        assert!(
-            out.is_consolidated(),
-            "consolidated input + pass-all → consolidated output"
-        );
-        assert!(out.is_sorted());
-    }
-
-    // -----------------------------------------------------------------------
-    // op_negate tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_op_negate_weights() {
-        let schema = make_schema_u64_i64();
-        let batch = make_batch(&schema, &[(1, 3, 10), (2, -1, 20)]);
-        let out = op_negate(&batch);
-        assert_eq!(out.count, 2);
-        assert_eq!(out.get_weight(0), -3);
-        assert_eq!(out.get_weight(1), 1);
-        assert_eq!(get_payload_i64(&out, 0), 10);
-        assert_eq!(get_payload_i64(&out, 1), 20);
-        assert!(out.is_consolidated());
+        assert_eq!(out.read_payload_string(0, 0), "apple", "row0 payload (string-sorted)");
+        assert_eq!(out.read_payload_string(1, 0), "banana", "row1 payload (string-sorted)");
     }
 
     // -----------------------------------------------------------------------
     // Wide-PK union merge (pk_stride > 16)
     // -----------------------------------------------------------------------
-
-    fn wide_pk_triple(b: &Batch, row: usize) -> (u64, u64, u64) {
-        let pk = b.get_pk_bytes(row);
-        // OPK encodes each U64 column big-endian (the at-rest layout), so
-        // the columns must be read back big-endian.
-        (
-            u64::from_be_bytes(pk[0..8].try_into().unwrap()),
-            u64::from_be_bytes(pk[8..16].try_into().unwrap()),
-            u64::from_be_bytes(pk[16..24].try_into().unwrap()),
-        )
-    }
 
     #[test]
     fn test_op_union_merge_wide_pk() {
@@ -489,13 +251,14 @@ mod tests {
         assert!(out.is_sorted());
         assert!(!out.is_consolidated());
 
-        assert_eq!(wide_pk_triple(&out, 0), (0, 0, 1));
+        let pk = |c: u128| opk_pk(&schema, &[0, 0, c]);
+        assert_eq!(out.get_pk_bytes(0), &pk(1)[..]);
         assert_eq!(get_payload_i64(&out, 0), 10);
-        assert_eq!(wide_pk_triple(&out, 1), (0, 0, 1));
+        assert_eq!(out.get_pk_bytes(1), &pk(1)[..]);
         assert_eq!(get_payload_i64(&out, 1), 20);
-        assert_eq!(wide_pk_triple(&out, 2), (0, 0, 2));
+        assert_eq!(out.get_pk_bytes(2), &pk(2)[..]);
         assert_eq!(get_payload_i64(&out, 2), 200);
-        assert_eq!(wide_pk_triple(&out, 3), (0, 0, 3));
+        assert_eq!(out.get_pk_bytes(3), &pk(3)[..]);
         assert_eq!(get_payload_i64(&out, 3), 300);
     }
 
@@ -525,14 +288,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // op_union_merge signed I64 PK ordering (item 33)
+    // op_union_merge signed I64 PK ordering
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_op_union_merge_signed_i64_pk() {
-        // Signed PK has high bit set for negatives. Raw-u128 comparison (narrow
-        // path) would sort negatives after positives. The merge must produce
-        // signed ascending order.
+        // Signed PK columns are sign-flipped into the OPK bytes, so the merge's
+        // plain byte comparison must yield signed ascending order — this pins
+        // that the union merge reads the PK through that encoding.
         let schema = make_schema_i64pk_i64();
         let a = make_batch_i64pk(&schema, &[(-5, 1, 100), (0, 1, 200), (7, 1, 300)]);
         let b = make_batch_i64pk(&schema, &[(-1, 1, 400), (3, 1, 500)]);
@@ -546,218 +309,35 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // op_null_extend blob propagation
+    // op_filter tests
     // -----------------------------------------------------------------------
-
-    /// The null-extend output schema `reg_meta` carries and `exec.rs` hands the
-    /// op — the compiler's own builder, not a look-alike, so a change to the
-    /// layout reaches these tests instead of silently passing against a stale copy.
-    fn null_extend_out_schema(in_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> SchemaDescriptor {
-        let fill: Vec<u8> = right_schema.payload_columns().map(|(_, c)| c.type_code).collect();
-        crate::schema::null_extend_output_schema(in_schema, &fill).expect("test schema exceeds MAX_COLUMNS")
-    }
 
     #[test]
-    fn test_op_null_extend_blob_propagation() {
-        // Regression: op_null_extend did not propagate the input blob, so a
-        // long (> 12 byte) string in the output resolved against an empty
-        // blob and returned garbage.
-        let in_schema = make_schema_pk_u64_payload_string();
-        let mut b = Batch::with_capacity(in_schema, 1);
-        let long_str: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
-        b.extend_pk(1u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        let gs = gnitz_wire::encode_german_string(long_str, &mut b.blob);
-        b.extend_col(0, &gs);
-        b.count += 1;
-
-        // Right side: a single I64 payload column.
-        let right_schema = make_schema_u64_i64();
-        let out = op_null_extend(&b, &in_schema, &null_extend_out_schema(&in_schema, &right_schema));
-
-        assert!(!out.blob.is_empty(), "output blob must be propagated");
-
-        // Resolve the long string from the output's STRING column (col 0).
-        assert_eq!(
-            read_german_string(&out, 0, 0),
-            long_str,
-            "long string must resolve to the original"
-        );
-    }
-
-    #[test]
-    fn test_op_filter_blob_passthrough_long_value() {
-        // op_filter over a batch with a BLOB payload column holding a long
-        // (> 12 byte) value. The output BLOB must resolve to the original.
-        let schema = make_schema_pk_u64_payload_blob();
-        let mut b = Batch::with_capacity(schema, 2);
-        let long_blob: &[u8] = b"a-fairly-long-blob-value-xyz"; // 28 bytes > 12
-                                                                // Row 0: long blob, val passes always-true filter.
-        b.extend_pk(1u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        let gs = gnitz_wire::encode_german_string(long_blob, &mut b.blob);
-        b.extend_col(0, &gs);
-        b.count += 1;
-        b.certify_layout(Layout::Consolidated, &schema);
-
-        let func = always_true_func(&schema);
-        let out = op_filter(&b, &func, &schema);
-        assert_eq!(out.count, 1);
-        assert!(!out.blob.is_empty(), "BLOB filter output must carry the blob buffer");
-        assert_eq!(
-            read_german_string(&out, 0, 0),
-            long_blob,
-            "long BLOB must resolve to the original bytes"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Stride consistency on early-exit empty batches (item 3)
-    // -----------------------------------------------------------------------
-
-    fn always_true_func(schema: &SchemaDescriptor) -> Evaluator {
+    fn test_op_filter_consolidated_flag() {
         use gnitz_expr::{LogicalInstr, LogicalProgram};
-        let instrs = vec![LogicalInstr::LoadConst { dst: 0, val: 1 }]; // always true
-        LogicalProgram::new(instrs, 1, 0, vec![])
-            .resolve_filter(schema)
-            .unwrap()
-    }
 
-    #[test]
-    fn test_op_filter_empty_stride_u64() {
-        // U64 PK → stride 8. Early-exit empty batch must carry the schema
-        // stride, not a hardcoded 16.
+        let instrs = vec![
+            LogicalInstr::LoadConst { dst: 0, val: 1 }, // always true
+        ];
         let schema = make_schema_u64_i64();
-        let empty = make_batch(&schema, &[]);
-        assert_eq!(empty.count, 0);
-        let func = always_true_func(&schema);
-        let out = op_filter(&empty, &func, &schema);
-        assert_eq!(out.count, 0);
-        assert_eq!(
-            out.pk_stride(),
-            8,
-            "op_filter empty must use schema stride 8 for U64 PK"
-        );
-    }
+        let func = LogicalProgram::new(instrs, 1, 0, vec![])
+            .resolve_filter(&schema)
+            .unwrap();
 
-    #[test]
-    fn test_op_negate_empty_stride_u64() {
-        let schema = make_schema_u64_i64();
-        let empty = make_batch(&schema, &[]);
-        let out = op_negate(&empty);
-        assert_eq!(out.count, 0);
-        assert_eq!(
-            out.pk_stride(),
-            8,
-            "op_negate empty must use schema stride 8 for U64 PK"
-        );
-    }
+        let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
 
-    #[test]
-    fn test_op_null_extend_empty_stride_u64() {
-        let in_schema = make_schema_u64_i64();
-        let right_schema = make_schema_u64_i64();
-        let empty = make_batch(&in_schema, &[]);
-        let out = op_null_extend(&empty, &in_schema, &null_extend_out_schema(&in_schema, &right_schema));
-        assert_eq!(out.count, 0);
-        assert_eq!(
-            out.pk_stride(),
-            8,
-            "op_null_extend empty must use combined-schema stride 8"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // op_null_extend shift guard (item 4a)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_op_null_extend_shift_guard_64_payload_cols() {
-        // in_npc == 64 (65-column schema, 1 PK col) and right_npc == 0.
-        // shift == 64 makes `right_null_bits << 64` panic in debug builds even
-        // though right_null_bits is 0.
-        let mut in_cols = vec![SchemaColumn::new(type_code::U64, 0)];
-        for _ in 0..64 {
-            in_cols.push(SchemaColumn::new(type_code::I64, 0));
-        }
-        let in_schema = SchemaDescriptor::new(&in_cols, &[0]);
-        assert_eq!(in_schema.num_payload_cols(), 64);
-
-        // Right schema: PK only, no payload columns → right_npc == 0.
-        let right_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-        assert_eq!(right_schema.num_payload_cols(), 0);
-
-        let mut b = Batch::with_capacity(in_schema, 1);
-        b.extend_pk(1u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        for pi in 0..in_schema.num_payload_cols() {
-            b.extend_col(pi, &0i64.to_le_bytes());
-        }
-        b.count += 1;
-
-        // Must not panic.
-        let out = op_null_extend(&b, &in_schema, &null_extend_out_schema(&in_schema, &right_schema));
-        assert_eq!(out.count, 1);
-        let in_null = u64::from_le_bytes(b.null_bmp_data()[0..8].try_into().unwrap());
-        let out_null = u64::from_le_bytes(out.null_bmp_data()[0..8].try_into().unwrap());
-        assert_eq!(out_null, in_null, "no right cols → output null word equals input");
-    }
-
-    #[test]
-    fn test_op_null_extend_mask_guard_64_appended_cols() {
-        // The mirror of the shift guard above: in_npc == 0 and 64 columns
-        // appended, so the tail mask is `all_payload_null_mask(64)` — the arm
-        // that must return `u64::MAX` outright rather than evaluate `1u64 << 64`.
-        // Reached by widening a PK-only relation to the 65-column maximum.
-        let in_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-        assert_eq!(in_schema.num_payload_cols(), 0);
-
-        let mut right_cols = vec![SchemaColumn::new(type_code::U64, 0)];
-        for _ in 0..64 {
-            right_cols.push(SchemaColumn::new(type_code::I64, 1));
-        }
-        let right_schema = SchemaDescriptor::new(&right_cols, &[0]);
-        assert_eq!(right_schema.num_payload_cols(), 64);
-
-        let mut b = Batch::with_capacity(in_schema, 1);
-        b.extend_pk(1u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.count += 1;
-
-        // Must not panic, and every appended column must read NULL.
-        let out = op_null_extend(&b, &in_schema, &null_extend_out_schema(&in_schema, &right_schema));
-        assert_eq!(out.count, 1);
-        let out_null = u64::from_le_bytes(out.null_bmp_data()[0..8].try_into().unwrap());
-        assert_eq!(out_null, u64::MAX, "all 64 appended columns are NULL");
-    }
-
-    // -----------------------------------------------------------------------
-    // op_negate i64::MIN (item 46)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_op_negate_i64_min_no_panic() {
-        // -i64::MIN overflows; debug builds panic, release wraps silently.
-        // wrapping_neg must leave i64::MIN unchanged without panicking.
-        let schema = make_schema_u64_i64();
-        let batch = make_batch(&schema, &[(1, i64::MIN, 10), (2, 5, 20)]);
-        let out = op_negate(&batch);
+        let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2);
-        assert_eq!(out.get_weight(0), i64::MIN, "wrapping_neg(i64::MIN) == i64::MIN");
-        assert_eq!(out.get_weight(1), -5);
+        assert!(
+            out.is_consolidated(),
+            "consolidated input + pass-all → consolidated output"
+        );
+        assert!(out.is_sorted());
     }
 
-    // -----------------------------------------------------------------------
-    // op_filter
-    // -----------------------------------------------------------------------
-
-    /// Per-row differential oracle for the batch filter path: 20 rows (≥
-    /// THRESHOLD=16, so the batch evaluator is taken) filtered by `col[1] > 10`
-    /// must keep exactly the rows whose payload exceeds 10, in input PK order.
+    /// Per-row differential oracle for the batch filter path: 20 rows filtered by
+    /// `col[1] > 10` must keep exactly the rows whose payload exceeds 10, in
+    /// input PK order.
     #[test]
     fn test_filter_batch_matches_per_row() {
         use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
@@ -808,89 +388,34 @@ mod tests {
         let out = op_filter(&batch, &func, &schema);
         // pk=2(15), 3(25), 5(20), 7(30), 9(11), 11(50), 13(12), 15(100), 18(13), 20(22)
         assert_eq!(out.count, 10, "expected 10 rows with val > 10");
-        assert_eq!(out.get_pk(0) as u64, 2);
-        assert_eq!(out.get_pk(1) as u64, 3);
-        assert_eq!(out.get_pk(2) as u64, 5);
-        assert_eq!(out.get_pk(3) as u64, 7);
-        assert_eq!(out.get_pk(4) as u64, 9);
-        assert_eq!(out.get_pk(5) as u64, 11);
-        assert_eq!(out.get_pk(6) as u64, 13);
-        assert_eq!(out.get_pk(7) as u64, 15);
-        assert_eq!(out.get_pk(8) as u64, 18);
-        assert_eq!(out.get_pk(9) as u64, 20);
+        let pks: Vec<u64> = (0..out.count).map(|r| out.get_pk(r) as u64).collect();
+        assert_eq!(pks, vec![2, 3, 5, 7, 9, 11, 13, 15, 18, 20]);
     }
 
-    /// End-to-end mechanism: two rows that are both NULL in an `I64` payload
-    /// column but carry DIFFERENT non-zero bytes under the null bit (the
-    /// `NullGarbage` construction) and share one content-hash PK.
-    ///
-    /// Root-cause contrast at the dispatched row comparator: the merged schema's
-    /// null-aware `Generic` comparator reads `null == null` and coalesces them;
-    /// the pre-fix inherited `FixedIntNonnull` comparator orders by the raw
-    /// garbage bytes and splits them — the bug this fix removes. (The split can't
-    /// be shown by running consolidation to completion: the write path zero-fills
-    /// null cells, so the two rows become byte-equal only *after* the fast
-    /// comparator has already emitted them as two elements, tripping the
-    /// consolidated-layout debug assert rather than yielding a clean 2-row batch.)
-    ///
-    /// Then end-to-end under the merged (null-aware) schema: the two NULL-garbage
-    /// rows, fed one per `union` input, coalesce through the union + a distinct
-    /// weight-clamp to a single weight-1 row.
+    // -----------------------------------------------------------------------
+    // op_negate tests
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_union_nullability_merge_coalesces_null_garbage() {
-        use crate::ops::op_distinct;
-        use crate::storage::{compare_rows, compare_rows_fixedint_nonnull, Batch, Layout, ReadCursor};
-        use std::cmp::Ordering;
-        use std::rc::Rc;
+    fn test_op_negate_weights() {
+        let schema = make_schema_u64_i64();
+        let out = op_negate(make_batch(&schema, &[(1, 3, 10), (2, -1, 20)]));
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_weight(0), -3);
+        assert_eq!(out.get_weight(1), 1);
+        assert_eq!(get_payload_i64(&out, 0), 10);
+        assert_eq!(get_payload_i64(&out, 1), 20);
+        assert!(out.is_consolidated());
+    }
 
-        let pk = SchemaColumn::new(type_code::U128, 0);
-        let schema_a = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
-        let schema_b = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
-        // Classification (merged → Generic, schema_a → FixedIntNonnull) is covered by
-        // test_union_nullability_merge_classification; this test starts from that
-        // given and exercises the row-comparator mechanism it selects.
-        let merged = crate::schema::union_nullability_merge(&schema_a, &schema_b).expect("shared layout");
-
-        // Append one NULL row carrying `garbage` bytes under the null bit, on a
-        // fixed content-hash PK shared by every row here.
-        let push_null_garbage = |bat: &mut Batch, garbage: i64| {
-            bat.extend_pk(0x1234_5678_9abc_def0);
-            bat.extend_weight(&1i64.to_le_bytes());
-            bat.extend_null_bmp(&1u64.to_le_bytes()); // payload col 0 → NULL
-            bat.extend_col(0, &garbage.to_le_bytes()); // non-zero bytes under the null bit
-            bat.count += 1;
-        };
-        let g0 = 0x5555_5555_5555_5555u64 as i64;
-        let g1 = 0xAAAA_AAAA_AAAA_AAAAu64 as i64;
-
-        // Root-cause contrast: same PK, both NULL, different garbage bytes.
-        let mut pair = Batch::with_capacity(merged, 2);
-        push_null_garbage(&mut pair, g0);
-        push_null_garbage(&mut pair, g1);
-        assert_eq!(
-            compare_rows(&merged, &pair, 0, &pair, 1),
-            Ordering::Equal,
-            "null-aware Generic comparator: two NULL rows are one element",
-        );
-        assert_ne!(
-            compare_rows_fixedint_nonnull(&schema_a, &pair, 0, &pair, 1),
-            Ordering::Equal,
-            "null-blind FixedIntNonnull comparator: garbage bytes split them (the bug)",
-        );
-
-        // End-to-end under the merged schema: one NULL-garbage row per union input.
-        let single = |garbage: i64| {
-            let mut bat = Batch::with_capacity(merged, 1);
-            push_null_garbage(&mut bat, garbage);
-            bat.certify_layout(Layout::Consolidated, &merged);
-            bat
-        };
-        let unioned = op_union(single(g0), &single(g1), &merged);
-        assert_eq!(unioned.count, 2, "Z-Set + keeps both rows before consolidation");
-        let empty = Rc::new(Batch::empty_with_schema(&merged));
-        let mut ch = ReadCursor::over_batches(std::slice::from_ref(&empty), merged);
-        let (out, _) = op_distinct(unioned, &mut ch, &merged);
-        assert_eq!(out.count, 1, "null-aware comparator coalesces the two NULL rows");
-        assert_eq!(out.get_weight(0), 1, "distinct clamps the coalesced weight 2 → 1");
+    #[test]
+    fn test_op_negate_i64_min_no_panic() {
+        // -i64::MIN overflows; debug builds panic, release wraps silently.
+        // wrapping_neg must leave i64::MIN unchanged without panicking.
+        let schema = make_schema_u64_i64();
+        let out = op_negate(make_batch(&schema, &[(1, i64::MIN, 10), (2, 5, 20)]));
+        assert_eq!(out.count, 2);
+        assert_eq!(out.get_weight(0), i64::MIN, "wrapping_neg(i64::MIN) == i64::MIN");
+        assert_eq!(out.get_weight(1), -5);
     }
 }

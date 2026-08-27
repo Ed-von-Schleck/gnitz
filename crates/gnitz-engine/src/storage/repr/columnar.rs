@@ -359,11 +359,11 @@ macro_rules! with_payload_cmp {
         match $schema.payload_cmp {
             $crate::schema::PayloadCmpKind::FixedIntNonnull => $f(
                 $($arg,)*
-                |s, a, ai, b, bi| $crate::storage::compare_rows_fixedint_nonnull(s, a, ai, b, bi),
+                |s, a, ai, b, bi| $crate::storage::columnar::compare_rows_fixedint_nonnull(s, a, ai, b, bi),
             ),
             $crate::schema::PayloadCmpKind::Generic => $f(
                 $($arg,)*
-                |s, a, ai, b, bi| $crate::storage::compare_rows(s, a, ai, b, bi),
+                |s, a, ai, b, bi| $crate::storage::columnar::compare_rows(s, a, ai, b, bi),
             ),
         }
     };
@@ -379,6 +379,40 @@ mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::pk_only_schema;
+
+    /// Two rows both NULL in an `I64` payload column, carrying DIFFERENT bytes under
+    /// the null bit. [`compare_rows`] reads `null == null` and makes them one element;
+    /// [`compare_rows_fixedint_nonnull`] never reads the null word and splits them by
+    /// the garbage — which is why a nullable schema must resolve to `Generic`.
+    #[test]
+    fn null_equality_separates_the_two_payload_comparators() {
+        use crate::storage::Batch;
+
+        let pk = SchemaColumn::new(type_code::U128, 0);
+        let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
+        let non_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
+
+        // Same PK, both NULL, different bytes under the null bit.
+        let mut pair = Batch::with_capacity(nullable, 2);
+        for garbage in [0x5555_5555_5555_5555u64 as i64, 0xAAAA_AAAA_AAAA_AAAAu64 as i64] {
+            pair.extend_pk(0x1234_5678_9abc_def0);
+            pair.extend_weight(&1i64.to_le_bytes());
+            pair.extend_null_bmp(&1u64.to_le_bytes()); // payload col 0 → NULL
+            pair.extend_col(0, &garbage.to_le_bytes());
+            pair.count += 1;
+        }
+
+        assert_eq!(
+            compare_rows(&nullable, &pair, 0, &pair, 1),
+            Ordering::Equal,
+            "null-aware: two NULL cells are one element whatever lies under the bit",
+        );
+        assert_ne!(
+            compare_rows_fixedint_nonnull(&non_null, &pair, 0, &pair, 1),
+            Ordering::Equal,
+            "null-blind: the fixed-int comparator orders by the garbage bytes",
+        );
+    }
 
     /// A minimal ColumnarSource for unit tests.
     struct TestBatch {

@@ -955,7 +955,10 @@ impl Batch {
         let no_strings = [false; MAX_BATCH_REGIONS];
         let is_string_at = if shares_blob { &no_strings } else { is_string_at };
         if !shares_blob && !src.blob.is_empty() {
-            self.blob.reserve(src.blob.len());
+            // The rows this call copies, not the whole source heap: a many-run merge
+            // appends into one output, and the whole heap per run ratchets capacity.
+            self.blob
+                .reserve(merge::prorated_blob_cap(src.blob.len(), src.count, total));
         }
         for &(start, end) in ranges {
             let n = end - start;
@@ -1039,9 +1042,14 @@ impl<'d> AppendSession<'d> {
 
     /// Append every listed range of `src`, in list order.
     pub(crate) fn push_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
-        let is_string_at = self.is_string_at;
-        self.dst
-            .append_ranges_inner(src, ranges, &is_string_at, self.guard.get_mut());
+        // Destructured so the disjoint fields lend one borrow each, rather than
+        // copying the 68-byte map through `self` on every push.
+        let Self {
+            dst,
+            is_string_at,
+            guard,
+        } = self;
+        dst.append_ranges_inner(src, ranges, is_string_at, guard.get_mut());
     }
 }
 
@@ -1514,6 +1522,20 @@ impl Batch {
         unsafe { super::columnar::seek_advance_to(self.count, stride, cp, key, hint) }
     }
 
+    /// First row index past the equal-PK group beginning at `start`. Requires
+    /// `start < self.count`. A linear step, not a seek: the co-group callers
+    /// reach it having just landed on the group's first row, where the group is
+    /// short and [`advance_to`](Self::advance_to)'s gallop would cost more.
+    #[inline]
+    pub(crate) fn pk_group_end(&self, start: usize) -> usize {
+        let k = self.get_pk_bytes(start);
+        let mut j = start + 1;
+        while j < self.count && crate::schema::key::pk_bytes_eq(self.get_pk_bytes(j), k) {
+            j += 1;
+        }
+        j
+    }
+
     /// Append all of `src`, relocating German-string blob data into `self`'s
     /// heap. The full-range decode/accumulate entry point (W2M ingest, the
     /// master's index-scan merge).
@@ -1563,48 +1585,31 @@ impl Batch {
         src_count > 0 && src_blob_len > row_count.saturating_mul(RELOCATE_CELL_COST_BYTES + src_blob_len / src_count)
     }
 
-    /// Gather every `[start, end)` row range of `src`, in list order, into a
-    /// fresh batch — the survivor list of one filter pass, materialized.
+    /// Gather every `[start, end)` row range of `src`, in list order, into a fresh
+    /// batch — a filter pass's survivor list, or one slice of a RAM-tier run.
     ///
-    /// The blob is shared up front, so a German-string column copies its 16-byte
-    /// structs verbatim rather than relocating each cell: both batches then hold
-    /// identical heaps, and every offset inside a struct stays valid. Sharing an
-    /// empty blob is a no-op, so this needs no non-empty guard — an all-short-
-    /// string batch (≤12 bytes, stored inline) has an empty heap and must not be
-    /// dropped to the per-cell path.
-    ///
-    /// That trade is right for a batch consumed in-process (the circuit's
-    /// `op_filter`): one memcpy of the heap beats a probe per surviving cell, and
-    /// downstream operators relocate anyway. A gather whose result is *shipped* —
-    /// the wire index range-seek — must not share, or the dropped rows' spans go
-    /// over the wire; it builds the output with `append_ranges` instead, which
-    /// relocates only the survivors, deduped.
+    /// Disjoint ascending ranges (debug-checked) make the result a subset *in source
+    /// order*, which is what lets it inherit `src`'s layout tag; an overlap would
+    /// repeat a row and break the distinctness half of a `Consolidated` claim. The
+    /// blob arm is [`should_relocate_blob`](Self::should_relocate_blob)'s call.
     pub fn from_ranges(src: &Batch, ranges: &[(usize, usize)], schema: &SchemaDescriptor) -> Batch {
+        debug_assert!(
+            ranges.windows(2).all(|w| w[0].1 <= w[1].0),
+            "from_ranges: ranges must be disjoint and ascending",
+        );
         let rows = range_rows(ranges);
         if rows == 0 {
-            // Not `with_capacity(_, 0)`: that rounds up to a 1-row arena and
-            // would still clone the whole source blob for no rows.
+            // Not `with_capacity(_, 0)`, which rounds up to a 1-row arena. The `Raw`
+            // tag needs no repair: both layout readers short-circuit on `count == 0`.
             return Batch::empty_with_schema(schema);
         }
         let mut out = Batch::with_capacity(*schema, rows);
-        out.share_blob_from(src);
-        out.append_ranges(src, ranges);
-        out
-    }
-
-    /// Bulk-copy the contiguous row range `[start, start + row_count)` into a
-    /// fresh batch — the in-heap twin of `MappedShard::slice_to_owned_batch`,
-    /// picking the same blob arm via [`should_relocate_blob`](Self::should_relocate_blob).
-    /// A contiguous slice preserves whatever layout the source claimed, so the
-    /// result inherits the tag rather than certifying one.
-    pub(crate) fn slice_to_owned_batch(&self, start: usize, row_count: usize, schema: &SchemaDescriptor) -> Batch {
-        let mut out = Batch::with_capacity(*schema, row_count.max(1));
-        if !Batch::should_relocate_blob(row_count, self.count, self.blob.len()) {
-            out.share_blob_from(self);
+        if !Batch::should_relocate_blob(rows, src.count, src.blob.len()) {
+            out.share_blob_from(src);
         }
-        out.append_ranges(self, &[(start, start + row_count)]);
+        out.append_ranges(src, ranges);
         // `append_ranges` downgraded `out` to `Raw` first.
-        out.inherit_layout(self);
+        out.inherit_layout(src);
         out
     }
 
@@ -3345,6 +3350,113 @@ mod tests {
             count += 1;
         }
         assert!(count >= 2, "expected at least 2 recycled buffers, got {count}");
+    }
+
+    // ── Gather / widen: blob arms, layout propagation, empty shape ──────────
+
+    /// A long (> 12 byte) value must resolve in the gathered output under BOTH blob
+    /// arms — sharing carries the source heap verbatim, relocating rewrites each
+    /// surviving cell into a fresh one.
+    #[test]
+    fn from_ranges_resolves_long_values_under_both_blob_arms() {
+        use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_blob, read_german_string};
+        let schema = make_schema_pk_u64_payload_blob();
+
+        // Sharing arm: a small heap, where a per-cell rewrite would cost more
+        // than the whole-heap memcpy it replaces.
+        let long: &[u8] = b"a-fairly-long-blob-value-xyz"; // 28 bytes > 12
+        let small = make_batch_bytes(&schema, &[(1, 1, long), (2, 1, b"hi")]);
+        assert!(
+            !Batch::should_relocate_blob(1, small.count, small.blob.len()),
+            "precondition: this shape takes the sharing arm",
+        );
+        let shared = Batch::from_ranges(&small, &[(0, 1)], &schema);
+        assert_eq!(shared.count, 1);
+        assert_eq!(read_german_string(&shared, 0, 0), long);
+        assert_eq!(
+            shared.blob.len(),
+            small.blob.len(),
+            "the sharing arm carries the heap whole"
+        );
+
+        // Relocating arm: a wide heap where one survivor out of a hundred would
+        // otherwise carry every dropped row's span.
+        let vals: Vec<Vec<u8>> = (0..100u64).map(|i| vec![b'a' + (i % 26) as u8; 1024]).collect();
+        let rows: Vec<(u64, i64, &[u8])> = vals.iter().enumerate().map(|(i, v)| (i as u64, 1, &v[..])).collect();
+        let wide = make_batch_bytes(&schema, &rows);
+        assert!(
+            Batch::should_relocate_blob(1, wide.count, wide.blob.len()),
+            "precondition: this shape takes the relocating arm",
+        );
+        let relocated = Batch::from_ranges(&wide, &[(7, 8)], &schema);
+        assert_eq!(relocated.count, 1);
+        assert_eq!(read_german_string(&relocated, 0, 0), vals[7]);
+        assert!(
+            relocated.blob.len() < wide.blob.len(),
+            "the relocating arm carries only the survivor's span",
+        );
+    }
+
+    /// `inherit_layout` is a bare field store with no debug verification, so a
+    /// gather that dropped the tag is caught nowhere at the producer — only
+    /// downstream, at the next skip-point that trusts the claim.
+    #[test]
+    fn from_ranges_inherits_its_source_layout() {
+        let schema = crate::test_support::make_schema_u64_i64();
+        let src = crate::test_support::make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+        assert!(src.is_consolidated(), "precondition: the source claims consolidated");
+
+        let subset = Batch::from_ranges(&src, &[(0, 1), (2, 3)], &schema);
+        assert_eq!(subset.count, 2);
+        assert!(
+            subset.is_consolidated(),
+            "a disjoint ascending subset keeps order, weights and distinctness",
+        );
+        assert!(subset.is_sorted());
+    }
+
+    /// Regression: the widen must carry the input's blob heap, or a long
+    /// (> 12 byte) string in the output resolves against an empty heap and reads
+    /// back as garbage.
+    #[test]
+    fn widened_with_null_tail_carries_the_blob() {
+        use crate::test_support::{make_batch_bytes, make_schema_pk_u64_payload_string, read_german_string};
+        let in_schema = make_schema_pk_u64_payload_string();
+        let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
+        let b = make_batch_bytes(&in_schema, &[(1, 1, long)]);
+
+        // One appended I64 column — the shape a LEFT JOIN null-fill widens to.
+        let out_schema = crate::schema::null_extend_output_schema(&in_schema, &[type_code::I64])
+            .expect("two columns is well inside MAX_COLUMNS");
+        let out = b.widened_with_null_tail(&in_schema, &out_schema);
+
+        assert_eq!(out.count, 1);
+        assert!(!out.blob.is_empty(), "output blob must be propagated");
+        assert_eq!(
+            read_german_string(&out, 0, 0),
+            long,
+            "long string must resolve to the original"
+        );
+        assert!(
+            gnitz_wire::null_word_get(out.get_null_word(0), 1),
+            "the appended column reads NULL",
+        );
+    }
+
+    /// Every operator's empty early-return goes through one of these two, so both
+    /// must carry the schema's PK stride rather than a fixed width: a placeholder
+    /// whose shape disagrees with its register's is one a later reader trusts.
+    #[test]
+    fn empty_constructors_carry_the_schema_pk_stride() {
+        let narrow = crate::test_support::make_schema_u64_i64(); // U64 PK → stride 8
+        let empty = Batch::empty_with_schema(&narrow);
+        assert_eq!(empty.count, 0);
+        assert_eq!(empty.pk_stride(), 8);
+        assert_eq!(empty.empty_like().pk_stride(), 8);
+
+        let wide = Batch::empty_with_schema(&wide_pk_3xu64_schema()); // 3×U64 → stride 24
+        assert_eq!(wide.pk_stride(), 24);
+        assert_eq!(wide.empty_like().pk_stride(), 24);
     }
 
     #[test]

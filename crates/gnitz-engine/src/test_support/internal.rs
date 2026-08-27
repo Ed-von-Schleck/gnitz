@@ -181,6 +181,23 @@ pub fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
     u64_pk_schema(type_code::BLOB)
 }
 
+/// Build a sorted, consolidated batch for a `(U64 pk, STRING|BLOB payload)` schema
+/// from `(pk, weight, bytes)` rows, already in (PK, payload) order. Values over 12
+/// bytes land in the blob heap, so this is the builder for blob-propagation tests.
+pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
+    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    for &(pk, w, val) in rows {
+        let cell = gnitz_wire::encode_german_string(val, &mut b.blob);
+        b.extend_pk(pk as u128);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &cell);
+        b.count += 1;
+    }
+    b.certify_layout(Layout::Consolidated, schema);
+    b
+}
+
 // ---------------------------------------------------------------------------
 // Shared proptest strategies
 // ---------------------------------------------------------------------------

@@ -159,7 +159,7 @@ fn test_set_ops_wide_pk_regression() {
     assert_eq!(vals, vec![100, 200]);
 }
 
-// ── item 36: EXCEPT/INTERSECT use full-row identity, not source PK ────
+// ── EXCEPT/INTERSECT use full-row identity, not source PK ────
 
 #[test]
 fn test_except_full_row_identity() {
@@ -218,7 +218,7 @@ fn test_set_ops_identical_rows_match() {
     assert_eq!(eb.len(), 0, "EXCEPT of identical rows yields nothing");
 }
 
-// ── item 37: a set-op side projects only the selected column ─────────
+// ── a set-op side projects only the selected column ─────────
 
 #[test]
 fn test_union_projection_applied() {
@@ -253,7 +253,7 @@ fn test_union_projection_applied() {
     assert_eq!(i64_at(&batch, col_idx(&schema, "name"), 0), 100);
 }
 
-// ── item 27: EXCEPT/INTERSECT lift each side through distinct ────
+// ── EXCEPT/INTERSECT lift each side through distinct ────
 //
 // Two B rows with different PKs but identical projected content must change
 // B's set membership only ONCE. EXCEPT DISTINCT = positive_part(da − db) with

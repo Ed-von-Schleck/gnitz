@@ -62,6 +62,8 @@ pub(crate) enum Instr {
     Negate {
         in_reg: u16,
         out_reg: u16,
+        /// Take `in_reg`'s batch rather than clone it — see [`consume_slots`].
+        consume: bool,
     },
     Union {
         in_a: u16,
@@ -71,7 +73,10 @@ pub(crate) enum Instr {
         /// this is `in_a`'s last read. Never set for a self-union: that arm doubles
         /// the weights in place and never reaches `op_union`, which is the operator
         /// that would consume the operand.
-        consume: bool,
+        consume_a: bool,
+        /// The same verdict for `in_b`, which the empty-`in_a` identity arm returns
+        /// verbatim rather than copying.
+        consume_b: bool,
     },
     /// Shared instruction for `distinct` and `positive_part`: per consolidated
     /// (PK, payload), emit `clamp(w_new, lo, hi) − clamp(w_old, lo, hi)`. Bounds
@@ -84,7 +89,7 @@ pub(crate) enum Instr {
         hist_table_idx: TableIdx,
         lo: i64,
         hi: i64,
-        /// Take `in_reg`'s batch rather than clone it — see `Instr::Union`.
+        /// Take `in_reg`'s batch rather than clone it — see [`consume_slots`].
         consume: bool,
     },
     /// The delta-trace inner join, equi and range alike: the probe is baked by
@@ -102,6 +107,9 @@ pub(crate) enum Instr {
         worker_id: u32,
         num_workers: u32,
     },
+    /// Widen every row with NULL-filled trailing payload columns — the LEFT JOIN
+    /// null-fill's unmatched preserved rows. The appended column count is the
+    /// difference between the two registers' schemas, which the compiler built.
     NullExtend {
         in_reg: u16,
         out_reg: u16,
@@ -141,6 +149,40 @@ pub(crate) fn reads_reg(instr: &Instr, r: u16) -> bool {
         Instr::Union { in_a, in_b, .. } => *in_a == r || *in_b == r,
         Instr::JoinDT { delta_reg, .. } => *delta_reg == r,
         Instr::Halt => false,
+    }
+}
+
+/// Each input register `instr` may empty in place, paired with the flag recording
+/// that verdict — matched exhaustively so a new destructive opcode is a compile
+/// error here rather than one that silently keeps copying. `Union` is the one
+/// opcode with two such registers. Consumed by `build_plan`'s liveness pass.
+pub(crate) fn consume_slots(instr: &mut Instr) -> [Option<(u16, &mut bool)>; 2] {
+    match instr {
+        Instr::Union {
+            in_a,
+            in_b,
+            consume_a,
+            consume_b,
+            ..
+        } => {
+            if in_a == in_b {
+                // Self-union doubles the weights in place and never reaches
+                // `op_union`; its take is unconditional and carries no flag.
+                [None, None]
+            } else {
+                [Some((*in_a, consume_a)), Some((*in_b, consume_b))]
+            }
+        }
+        Instr::WeightClamp { in_reg, consume, .. } => [Some((*in_reg, consume)), None],
+        Instr::Negate { in_reg, consume, .. } => [Some((*in_reg, consume)), None],
+        Instr::Filter { .. }
+        | Instr::Map { .. }
+        | Instr::JoinDT { .. }
+        | Instr::WorkerFilter { .. }
+        | Instr::NullExtend { .. }
+        | Instr::Integrate { .. }
+        | Instr::Reduce { .. }
+        | Instr::Halt => [None, None],
     }
 }
 
@@ -579,7 +621,11 @@ mod tests {
             out_reg: 1,
             pred_idx,
         });
-        builder.push(Instr::Negate { in_reg: 1, out_reg: 2 });
+        builder.push(Instr::Negate {
+            in_reg: 1,
+            out_reg: 2,
+            consume: true,
+        });
         builder.push(Instr::Halt);
 
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, -5), (3u128, 1, 20)]);
@@ -608,7 +654,8 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
-            consume: true,
+            consume_a: true,
+            consume_b: true,
         });
         builder.push(Instr::Halt);
 
@@ -632,7 +679,8 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
-            consume: true,
+            consume_a: true,
+            consume_b: true,
         });
         builder.push(Instr::Halt);
 
@@ -656,7 +704,8 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
-            consume: true,
+            consume_a: true,
+            consume_b: true,
         });
         builder.push(Instr::Halt);
 
@@ -670,6 +719,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.count, 3);
+    }
+
+    /// `0 + B = B`: with an empty left operand the VM hands the right one
+    /// straight to the output register, weights and all, instead of copying it.
+    /// Under single-source-per-epoch that is every right-driven epoch of every
+    /// set operation, whose two operands are both post-exchange relay outputs.
+    #[test]
+    fn a_union_with_an_empty_left_operand_returns_the_right_one() {
+        let schema = schema_1i64();
+
+        let mut builder = ProgramBuilder::new();
+        builder.push(Instr::Union {
+            in_a: 0,
+            in_b: 2,
+            out_reg: 1,
+            consume_a: true,
+            consume_b: true,
+        });
+        builder.push(Instr::Halt);
+
+        let input_b = make_batch(schema, &[(3u128, 2, 30), (4u128, -1, 40)]);
+        let reg_meta = [RegisterMeta::delta(schema); 3];
+        let vm = builder.build(reg_meta.to_vec());
+        let result = execute_epoch_multi(
+            &vm.program,
+            &mut { vm.regfile },
+            [(0u16, make_batch(schema, &[])), (2u16, input_b)],
+            1,
+        )
+        .unwrap()
+        .expect("the right operand is the whole output");
+
+        assert_eq!(extract_rows(&result), vec![(3, 2, 30), (4, -1, 40)]);
+        assert_eq!(
+            result.pk_stride(),
+            schema.pk_stride(),
+            "the output carries the register's own shape",
+        );
     }
 
     /// Schemas for a UNION whose sides disagree on the payload column's
@@ -722,7 +809,8 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
-            consume: true,
+            consume_a: true,
+            consume_b: true,
         });
         builder.push(Instr::Halt);
         let reg_meta = [
@@ -760,7 +848,8 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
-            consume: true,
+            consume_a: true,
+            consume_b: true,
         });
         builder.push(Instr::Halt);
         let reg_meta = [
@@ -793,7 +882,8 @@ mod tests {
             // The in_a == in_b arm doubles in place and never reaches `op_union`,
             // so it takes the register whatever this says; `build_plan` emits
             // `false` for that shape rather than claim a take it does not perform.
-            consume: false,
+            consume_a: false,
+            consume_b: false,
         });
         builder.push(Instr::Halt);
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 3, 20)]);
@@ -818,14 +908,23 @@ mod tests {
         let schema = schema_1i64();
         let mut builder = ProgramBuilder::new();
         // reg1 = -reg0; reg2 = reg0 ∪ reg1 (non-consuming); reg3 = -reg0 again.
-        builder.push(Instr::Negate { in_reg: 0, out_reg: 1 });
+        builder.push(Instr::Negate {
+            in_reg: 0,
+            out_reg: 1,
+            consume: false,
+        });
         builder.push(Instr::Union {
             in_a: 0,
             in_b: 1,
             out_reg: 2,
-            consume: false,
+            consume_a: false,
+            consume_b: false,
         });
-        builder.push(Instr::Negate { in_reg: 0, out_reg: 3 });
+        builder.push(Instr::Negate {
+            in_reg: 0,
+            out_reg: 3,
+            consume: true,
+        });
         builder.push(Instr::Halt);
 
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 3, 20)]);
@@ -848,7 +947,8 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
-            consume: true,
+            consume_a: true,
+            consume_b: true,
         });
         builder.push(Instr::Halt);
 
@@ -877,7 +977,8 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
-            consume: true,
+            consume_a: true,
+            consume_b: true,
         });
         builder.push(Instr::Halt);
 
@@ -1143,7 +1244,8 @@ mod tests {
             in_a: 0,
             in_b: 2,
             out_reg: 1,
-            consume: true,
+            consume_a: true,
+            consume_b: true,
         });
         builder.push(Instr::Halt);
 

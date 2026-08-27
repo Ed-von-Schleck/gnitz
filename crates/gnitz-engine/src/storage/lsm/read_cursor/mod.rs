@@ -356,7 +356,7 @@ impl ReadCursor {
         match self.schema.payload_cmp {
             crate::schema::PayloadCmpKind::FixedIntNonnull => |c, s, mb, i| {
                 let (src, row) = c.current_row_source();
-                crate::storage::compare_rows_fixedint_nonnull(s, src, row, mb, i)
+                crate::storage::columnar::compare_rows_fixedint_nonnull(s, src, row, mb, i)
             },
             crate::schema::PayloadCmpKind::Generic => |c, s, mb, i| {
                 let (src, row) = c.current_row_source();

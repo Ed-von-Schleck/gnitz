@@ -336,6 +336,15 @@ mod tests {
         assert_eq!(all_payload_null_mask(64), u64::MAX);
     }
 
+    /// `left_npc == 64` is the row-major cap, where the naive
+    /// `left | (right << left_npc)` would shift by the word width. It is
+    /// reachable only with an empty right side, so dropping the shift is exact.
+    #[test]
+    fn merge_null_words_at_the_full_left_width() {
+        assert_eq!(merge_null_words(0b1011, 0, 64), 0b1011);
+        assert_eq!(merge_null_words(u64::MAX, 0, 64), u64::MAX);
+    }
+
     #[test]
     fn read_unsigned_zero_extends() {
         // size 1: high-bit-set vs small — must match u8.cmp.

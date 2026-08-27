@@ -6,7 +6,7 @@ use gnitz_test_harness::ServerHandle;
 mod common;
 use common::*;
 
-// ── item 45: CTE column aliases applied ──────────────────────────────
+// ── CTE column aliases applied ──────────────────────────────
 
 #[test]
 fn test_cte_column_aliases_applied() {
@@ -33,7 +33,7 @@ fn test_cte_column_aliases_applied() {
     );
 }
 
-// ── item 45: CTE alias count mismatch ────────────────────────────────
+// ── CTE alias count mismatch ────────────────────────────────
 
 #[test]
 fn test_cte_alias_count_mismatch_rejected() {
@@ -58,7 +58,7 @@ fn test_cte_alias_count_mismatch_rejected() {
     );
 }
 
-// ── item 15: a CTE body with a WHERE compiles into a hidden view segment ──
+// ── a CTE body with a WHERE compiles into a hidden view segment ──
 // chained to the final view — never silently discarded (which would return
 // the unfiltered base table).
 

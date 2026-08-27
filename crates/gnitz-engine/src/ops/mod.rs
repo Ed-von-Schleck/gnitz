@@ -1,8 +1,7 @@
 //! The DBSP operators: the kernels a compiled circuit's instructions dispatch
 //! to, each consuming and emitting deltas rather than recomputing from state.
 //!
-//!   - `linear`    — filter, map, negate, union, null-extend (Theorem 3.3: no
-//!     state added)
+//!   - `linear`    — filter, negate, union (Theorem 3.3: no state added)
 //!   - `join`      — the bilinear operator, equi and range, over one probe
 //!   - `reduce`    — the aggregates and their secondary value indexes
 //!   - `distinct`  — the weight clamps every set operation is built from
@@ -29,8 +28,6 @@ mod bench_join;
 #[cfg(test)]
 mod bench_secondary_index;
 
-#[cfg(test)]
-pub(crate) use distinct::op_distinct;
 pub(crate) use distinct::op_weight_clamp;
 pub(crate) use exchange::op_worker_filter;
 pub use exchange::{
@@ -38,5 +35,5 @@ pub use exchange::{
 };
 pub(crate) use index::{op_integrate_with_indexes, AviBake, IntegrateTarget as OpsIntegrateTarget};
 pub(crate) use join::{op_join_delta_trace, JoinProbe, RangeProbe};
-pub(crate) use linear::{op_filter, op_negate, op_null_extend, op_union};
+pub(crate) use linear::{op_filter, op_negate, op_union};
 pub(crate) use reduce::{op_reduce, AdhocFold, AggDescriptor, AviHistory, ReducePlan};

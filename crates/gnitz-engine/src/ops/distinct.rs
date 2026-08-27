@@ -14,7 +14,7 @@ use super::cogroup::cogroup_left;
 /// Production never calls this — `Instr::WeightClamp` dispatches to
 /// [`op_weight_clamp`] directly — so it is `#[cfg(test)]`.
 #[cfg(test)]
-pub(crate) fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> (Batch, Batch) {
+fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> (Batch, Batch) {
     op_weight_clamp(delta, cursor, schema, -1, 1)
 }
 
@@ -118,8 +118,9 @@ mod tests {
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::{Batch, Layout};
     use crate::test_support::{
-        make_batch, make_batch_i64pk as make_signed_batch, make_schema_i64pk_i64 as make_schema_signed,
-        make_schema_u64_i64, make_wide_batch, opk_pk, opk_pk_i64, wide_pk_3xu64_schema,
+        make_batch, make_batch_bytes, make_batch_i64pk as make_signed_batch,
+        make_schema_i64pk_i64 as make_schema_signed, make_schema_pk_u64_payload_blob, make_schema_u64_i64,
+        make_wide_batch, opk_pk, opk_pk_i64, u64_pk_schema, wide_pk_3xu64_schema,
     };
 
     #[test]
@@ -164,8 +165,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Empty trace → all positive deltas emit +1
-        let empty = Rc::new(Batch::empty_with_schema(&schema));
-        let mut ch = ReadCursor::over_batches(std::slice::from_ref(&empty), schema);
+        let mut ch = crate::storage::empty_cursor(schema);
 
         // Delta: pk=1 w=+3, pk=2 w=+1
         let delta = make_batch(&schema, &[(1, 3, 10), (2, 1, 20)]);
@@ -250,36 +250,6 @@ mod tests {
         assert_eq!((payload(1), out.get_weight(1)), (40, 1));
     }
 
-    fn make_schema_u64_i32() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I32, 0),
-            ],
-            &[0],
-        )
-    }
-
-    fn make_schema_u64_i16() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I16, 0),
-            ],
-            &[0],
-        )
-    }
-
-    fn make_schema_u64_i8() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I8, 0),
-            ],
-            &[0],
-        )
-    }
-
     fn make_batch_narrow<const N: usize>(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_capacity(*schema, n.max(1));
@@ -304,7 +274,7 @@ mod tests {
         use crate::storage::ReadCursor;
         use std::rc::Rc;
 
-        let schema = make_schema_u64_i32();
+        let schema = u64_pk_schema(type_code::I32);
         let trace = Rc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]));
         let mut ch = ReadCursor::over_batches(&[trace], schema);
 
@@ -325,7 +295,7 @@ mod tests {
         use crate::storage::ReadCursor;
         use std::rc::Rc;
 
-        let schema = make_schema_u64_i16();
+        let schema = u64_pk_schema(type_code::I16);
         let trace = Rc::new(make_batch_narrow::<2>(&schema, &[(5, 1, -100)]));
         let mut ch = ReadCursor::over_batches(&[trace], schema);
 
@@ -339,38 +309,13 @@ mod tests {
         use crate::storage::ReadCursor;
         use std::rc::Rc;
 
-        let schema = make_schema_u64_i8();
+        let schema = u64_pk_schema(type_code::I8);
         let trace = Rc::new(make_batch_narrow::<1>(&schema, &[(7, 1, -1)]));
         let mut ch = ReadCursor::over_batches(&[trace], schema);
 
         let delta = make_batch_narrow::<1>(&schema, &[(7, 1, -1)]);
         let (out, _) = op_distinct(delta, &mut ch, &schema);
         assert_eq!(out.count, 0, "I8: matching (PK,payload) should produce no output");
-    }
-
-    fn make_schema_u64_blob() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::BLOB, 0),
-            ],
-            &[0],
-        )
-    }
-
-    /// Build a batch with one BLOB payload value per row.
-    fn make_batch_blob(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
-        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
-        for &(pk, w, val) in rows {
-            let cell = gnitz_wire::encode_german_string(val, &mut b.blob);
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &cell);
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, schema);
-        b
     }
 
     /// Regression: a non-null BLOB payload column previously panicked. The
@@ -383,19 +328,19 @@ mod tests {
         use crate::storage::ReadCursor;
         use std::rc::Rc;
 
-        let schema = make_schema_u64_blob();
+        let schema = make_schema_pk_u64_payload_blob();
 
         // Equal (PK=1, "hi") on both sides → compare returns Equal → no output.
-        let trace = Rc::new(make_batch_blob(&schema, &[(1, 1, b"hi")]));
+        let trace = Rc::new(make_batch_bytes(&schema, &[(1, 1, b"hi")]));
         let mut ch = ReadCursor::over_batches(&[trace], schema);
-        let delta = make_batch_blob(&schema, &[(1, 1, b"hi")]);
+        let delta = make_batch_bytes(&schema, &[(1, 1, b"hi")]);
         let (out, _) = op_distinct(delta, &mut ch, &schema);
         assert_eq!(out.count, 0, "BLOB: matching (PK,payload) should produce no output");
 
         // A different blob at the same PK is a distinct element → +1.
-        let trace2 = Rc::new(make_batch_blob(&schema, &[(1, 1, b"hi")]));
+        let trace2 = Rc::new(make_batch_bytes(&schema, &[(1, 1, b"hi")]));
         let mut ch2 = ReadCursor::over_batches(&[trace2], schema);
-        let delta2 = make_batch_blob(&schema, &[(1, 1, b"bye")]);
+        let delta2 = make_batch_bytes(&schema, &[(1, 1, b"bye")]);
         let (out2, _) = op_distinct(delta2, &mut ch2, &schema);
         assert_eq!(out2.count, 1, "BLOB: a new payload at an existing PK emits +1");
     }
@@ -487,12 +432,8 @@ mod tests {
 
     #[test]
     fn test_op_distinct_consolidated_flag() {
-        use crate::storage::ReadCursor;
-        use std::rc::Rc;
-
         let schema = make_schema_u64_i64();
-        let empty = Rc::new(Batch::empty_with_schema(&schema));
-        let mut ch = ReadCursor::over_batches(&[empty], schema);
+        let mut ch = crate::storage::empty_cursor(schema);
 
         let delta = make_batch(&schema, &[(1, 1, 10)]);
         let (out, consolidated) = op_distinct(delta, &mut ch, &schema);
@@ -510,13 +451,10 @@ mod tests {
 
     #[test]
     fn test_distinct_wide_pk_empty_trace_three_new_rows() {
-        use crate::storage::ReadCursor;
-        use std::rc::Rc;
         // Trace empty; delta has three wide-PK rows with distinct PKs.
         // All three must emit +1.
         let schema = wide_pk_3xu64_schema();
-        let empty = Rc::new(Batch::empty_with_schema(&schema));
-        let mut ch = ReadCursor::over_batches(&[empty], schema);
+        let mut ch = crate::storage::empty_cursor(schema);
 
         let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (2, 0, 0, 1, 20), (3, 0, 0, 1, 30)]);
         let (out, _) = op_distinct(delta, &mut ch, &schema);

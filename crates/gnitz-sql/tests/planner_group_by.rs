@@ -17,7 +17,7 @@ fn col_nullable(schema: &gnitz_core::Schema, name: &str) -> bool {
         .is_nullable
 }
 
-// ── item 42: AVG ignores NULLs and never emits NaN/Infinity ───────
+// ── AVG ignores NULLs and never emits NaN/Infinity ───────
 //
 // The plan's literal scenario (a *zero-count* group reaching `float_div` and
 // producing NaN) is unreachable: AVG's divisor is COUNT(non-null), and
@@ -135,7 +135,7 @@ fn test_avg_emits_null_on_delete_to_all_null() {
     );
 }
 
-// ── item 13: numeric aggregate type rejection ────────────────────────
+// ── numeric aggregate type rejection ────────────────────────
 
 #[test]
 fn test_sum_string_rejected() {
@@ -315,7 +315,7 @@ fn test_agg_i128_join_pk_rejected() {
     }
 }
 
-// ── item 12 + 34: float SUM and AVG ──────────────────────────────────
+// ── float SUM and AVG ──────────────────────────────────
 
 #[test]
 fn test_float_sum_and_avg() {
@@ -350,7 +350,7 @@ fn test_float_sum_and_avg() {
     );
 }
 
-// ── item 11: HAVING binds to the correct aggregate ───────────────────
+// ── HAVING binds to the correct aggregate ───────────────────
 
 #[test]
 fn test_having_binds_correct_aggregate() {

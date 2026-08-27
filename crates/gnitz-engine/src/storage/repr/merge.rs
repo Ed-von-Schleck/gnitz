@@ -1,14 +1,17 @@
-//! In-memory N-way merge for run-set consolidation.
+//! In-memory merge for run-set consolidation, and the two-way batch merge.
 //!
 //! Operates on flat columnar buffers: pk[OPK big-endian, `pk_stride` B/row],
 //! weight[i64 LE], null_bitmap[u64 LE], payload columns, blob arena.
 //!
-//! The merge is a fused k-way merge + inline consolidation: rows with the same
-//! (PK, payload) have their weights summed; rows whose net weight is zero are dropped.
+//! The N-way merge is a fused k-way merge + inline consolidation: rows with the
+//! same (PK, payload) have their weights summed; rows whose net weight is zero
+//! are dropped. [`Batch::merged_sorted`] is the two-input, fold-free counterpart
+//! (Z-Set `+`), over the same comparator family.
 
 use std::cell::Cell;
 use std::cmp::Ordering;
 
+use super::batch::Batch;
 use super::batch_pool::tls_pool;
 use super::columnar::{schema_is_fixedint_nonnull, with_payload_cmp, ColumnarSource};
 // `columnar` as a module path is needed only by the test module's
@@ -832,6 +835,131 @@ fn run_merge_body<S, RowCmp>(
             std::ops::ControlFlow::Continue(())
         },
     );
+}
+
+// ---------------------------------------------------------------------------
+// The two-way merge: Z-Set `+` over two sorted batches
+// ---------------------------------------------------------------------------
+
+impl Batch {
+    /// Both batches' rows in (PK, payload) order — Z-Set `+` without the fold: every
+    /// row survives at its own weight, and two sharing a (PK, payload) land adjacent
+    /// for a later consolidation to sum. Sorted inputs are a debug-checked
+    /// precondition; the output carries no layout claim.
+    pub(crate) fn merged_sorted(&self, other: &Batch, schema: &SchemaDescriptor) -> Batch {
+        with_payload_cmp!(schema, merged_sorted_body, self, other, schema)
+    }
+
+    /// Both batches' rows, `self`'s first — Z-Set `+` where an input is unsorted,
+    /// so the output can claim no order. One session covers both sides.
+    pub(crate) fn concatenated(&self, other: &Batch, schema: &SchemaDescriptor) -> Batch {
+        let (n_a, n_b) = (self.count, other.count);
+        let mut out = Batch::with_capacity(*schema, n_a + n_b);
+        {
+            let mut sink = out.append_session(n_a + n_b);
+            sink.push_range(&self.as_mem_batch(), 0, n_a);
+            sink.push_range(&other.as_mem_batch(), 0, n_b);
+        }
+        out
+    }
+}
+
+#[inline]
+fn merged_sorted_body<RowCmp>(a: &Batch, b: &Batch, schema: &SchemaDescriptor, row_cmp: RowCmp) -> Batch
+where
+    RowCmp: for<'x> RowComparator<MemBatch<'x>>,
+{
+    let (n_a, n_b) = (a.count, b.count);
+    let (mb_a, mb_b) = (a.as_mem_batch(), b.as_mem_batch());
+
+    // §2's one silent failure: an out-of-order input makes the walk sum weights
+    // against the wrong element, with no error. Same tripwire as `run_merge_body`.
+    #[cfg(debug_assertions)]
+    for (side, src) in [("a", a), ("b", b)] {
+        let mb = src.as_mem_batch();
+        for r in 1..src.count {
+            let ord = compare_pk_ordering(src.get_pk_bytes(r - 1), src.get_pk_bytes(r))
+                .then_with(|| row_cmp(schema, &mb, r - 1, &mb, r));
+            debug_assert_ne!(
+                ord,
+                Ordering::Greater,
+                "merged_sorted: input {side} unsorted at row {r}"
+            );
+        }
+    }
+
+    let mut out = Batch::with_capacity(*schema, n_a + n_b);
+    {
+        // One session for the whole merge: expected run length is 2 for a set
+        // operation's uniform 128-bit PKs, so per-run setup would dominate.
+        let mut sink = out.append_session(n_a + n_b);
+        let (mut ia, mut jb) = (0usize, 0usize);
+        while ia < n_a && jb < n_b {
+            match compare_pk_ordering(a.get_pk_bytes(ia), b.get_pk_bytes(jb)) {
+                // A single-source run: one galloping skip, one bulk append.
+                Ordering::Less => {
+                    let s = ia;
+                    ia = a.advance_to(b.get_pk_bytes(jb), ia);
+                    sink.push_range(&mb_a, s, ia);
+                }
+                Ordering::Greater => {
+                    let s = jb;
+                    jb = b.advance_to(a.get_pk_bytes(ia), jb);
+                    sink.push_range(&mb_b, s, jb);
+                }
+                // A shared PK: bracket both equal-PK groups and interleave them by
+                // payload, coalescing each single-source stretch into one push. The
+                // comparison that ends a stretch also picks the next row.
+                Ordering::Equal => {
+                    let (ga, gb) = (a.pk_group_end(ia), b.pk_group_end(jb));
+                    let mut prev_a = row_cmp(schema, &mb_a, ia, &mb_b, jb) != Ordering::Greater;
+                    let mut run_start = if prev_a { ia } else { jb };
+                    if prev_a {
+                        ia += 1;
+                    } else {
+                        jb += 1;
+                    }
+                    while ia < ga && jb < gb {
+                        let pick_a = row_cmp(schema, &mb_a, ia, &mb_b, jb) != Ordering::Greater;
+                        if pick_a != prev_a {
+                            if prev_a {
+                                sink.push_range(&mb_a, run_start, ia);
+                                run_start = jb;
+                            } else {
+                                sink.push_range(&mb_b, run_start, jb);
+                                run_start = ia;
+                            }
+                            prev_a = pick_a;
+                        }
+                        if pick_a {
+                            ia += 1;
+                        } else {
+                            jb += 1;
+                        }
+                    }
+                    // Flush the in-progress stretch, folding in its side's tail —
+                    // rows left unpicked because the *other* group ended first.
+                    if prev_a {
+                        sink.push_range(&mb_a, run_start, ga);
+                        if jb < gb {
+                            sink.push_range(&mb_b, jb, gb);
+                        }
+                    } else {
+                        sink.push_range(&mb_b, run_start, gb);
+                        if ia < ga {
+                            sink.push_range(&mb_a, ia, ga);
+                        }
+                    }
+                    // The only advance that is not an `advance_to`.
+                    ia = ga;
+                    jb = gb;
+                }
+            }
+        }
+        sink.push_range(&mb_a, ia, n_a);
+        sink.push_range(&mb_b, jb, n_b);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

@@ -45,7 +45,6 @@ pub use scatter::route_rows_by_pk;
 pub(crate) use scatter::scatter_unified_sources;
 
 // ── Operator hot-path types ──────────────────────────────────────────────────
-pub(crate) use batch::AppendSession;
 pub use batch::{BatchBuilder, Layout};
 pub use batch_wire::{compute_wire_props, schema_wire_safe, wire_block_size};
 // `ColumnarSource` is deliberately NOT re-exported: it adds only the Z-set
@@ -53,7 +52,11 @@ pub use batch_wire::{compute_wire_props, schema_wire_safe, wire_block_size};
 // extractors, the row appenders) reads rows through `gnitz_expr::RowSource`.
 // `cmp_col_window` is NOT re-exported: it lives in `gnitz-wire`, where the
 // client-side comparators can reach the same STRING/BLOB-before-fixed-width rule.
-pub(crate) use columnar::{compare_rows, compare_rows_except, compare_rows_fixedint_nonnull, with_payload_cmp};
+// `compare_rows_fixedint_nonnull` and `with_payload_cmp!` are NOT re-exported:
+// picking between the two payload comparators is a merge-seat decision, and
+// every seat is in storage. The macro names the comparator through
+// `crate::storage::columnar`, which resolves only from inside storage.
+pub(crate) use columnar::{compare_rows, compare_rows_except};
 // The OPK key cluster is NOT re-exported here: `schema::key` owns it and every
 // caller names `crate::schema::key::X`. Re-exporting it split one byte-order
 // rule across two import paths, visibly — `ops/reduce/sort.rs` and
@@ -66,7 +69,7 @@ pub(crate) use lsm::manifest::{peek_header, topology_word};
 pub(crate) use lsm::read_cursor::{empty as empty_cursor, key_list_range, PkSetGather, ReadCursor};
 pub(crate) use lsm::repartition::repartition_relation;
 pub use merge::BlobCacheGuard;
-pub(crate) use merge::{mem_batch_to_unified, prorated_blob_cap, relocate_german_string_vec, BlobCache, RowComparator};
+pub(crate) use merge::{mem_batch_to_unified, prorated_blob_cap, relocate_german_string_vec, BlobCache};
 pub use spill::{KeyProducer, SpillSort};
 
 /// Convert a path string to a `CString`, mapping an interior NUL to

@@ -399,35 +399,9 @@ mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::{
-        make_batch, make_schema_u128_i64, make_schema_u64_i64, make_wide_batch, opk_pk, wide_pk_3xu64_schema,
+        make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64,
+        make_wide_batch, opk_pk, wide_pk_3xu64_schema,
     };
-
-    fn make_schema_u64_string() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::STRING, 0),
-            ],
-            &[0],
-        )
-    }
-
-    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
-        let n = rows.len();
-        let mut b = Batch::with_capacity(*schema, n.max(1));
-
-        for &(pk, w, s) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-
-            let gs = gnitz_wire::encode_german_string(s.as_bytes(), &mut b.blob);
-            b.extend_col(0, &gs);
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, schema);
-        b
-    }
 
     fn total_rows(batches: &[Batch]) -> usize {
         batches.iter().map(|b| b.count).sum()
@@ -794,11 +768,11 @@ mod tests {
 
     #[test]
     fn test_repartition_batch_string_col() {
-        let schema = make_schema_u64_string();
+        let schema = make_schema_pk_u64_payload_string();
         let num_workers = 4;
 
         // Short string "hello" (≤ 12 bytes): two rows must go to same worker
-        let b = make_batch_str(&schema, &[(1, 1, "hello"), (2, 1, "hello"), (3, 1, "world")]);
+        let b = make_batch_bytes(&schema, &[(1, 1, b"hello"), (2, 1, b"hello"), (3, 1, b"world")]);
         let sub_batches =
             op_repartition_batches_mode(&[Some(&b)], &[1u32], &[], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub_batches), 3);
@@ -816,8 +790,8 @@ mod tests {
         assert!(pk2_same, "same short string 'hello' must route to same worker");
 
         // Long string (> 12 bytes): two rows must go to same worker
-        let long_str = "this is a longer string for heap";
-        let b2 = make_batch_str(&schema, &[(10, 1, long_str), (11, 1, long_str)]);
+        let long_str: &[u8] = b"this is a longer string for heap";
+        let b2 = make_batch_bytes(&schema, &[(10, 1, long_str), (11, 1, long_str)]);
         let sub2 = op_repartition_batches_mode(&[Some(&b2)], &[1u32], &[], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub2), 2);
 

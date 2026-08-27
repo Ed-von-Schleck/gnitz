@@ -4,7 +4,7 @@
 use super::*;
 use crate::expr::PkSource;
 use crate::ops::{JoinProbe, RangeProbe};
-use crate::query::vm::{reads_reg, Instr, IntegrateAvi, IntegrateTarget, ReduceAvi, TableIdx};
+use crate::query::vm::{consume_slots, reads_reg, Instr, IntegrateAvi, IntegrateTarget, ReduceAvi, TableIdx};
 
 // ---------------------------------------------------------------------------
 // Expression construction helpers
@@ -206,6 +206,10 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
             ctx.builder.push(Instr::Negate {
                 in_reg,
                 out_reg: reg_id,
+                // Non-consuming is always correct, sometimes one clone too many;
+                // `build_plan`'s liveness pass upgrades every destructive flag
+                // once the whole instruction list exists.
+                consume: false,
             });
         }
 
@@ -220,10 +224,8 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
                 in_a,
                 in_b,
                 out_reg: reg_id,
-                // Non-consuming is always correct, sometimes one clone too many;
-                // `build_plan`'s liveness pass upgrades it once the whole
-                // instruction list exists.
-                consume: false,
+                consume_a: false, // see `Instr::Negate` above
+                consume_b: false,
             });
         }
 
@@ -256,7 +258,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
                 hist_table_idx,
                 lo,
                 hi,
-                consume: false, // see `Instr::Union` above
+                consume: false, // see `Instr::Negate` above
             });
         }
 
@@ -745,30 +747,15 @@ pub(super) fn build_plan(
     }
     .ok_or(CompileError::Rejected("plan has no output register"))?;
 
-    // Destructive-register liveness: `Union` and `WeightClamp` may empty their
-    // input register in place only where nothing reads it afterwards. Decided over
-    // the EMITTED instructions with resolved registers, so register aliasing from
-    // elided nodes — identity MAPs, `Filter(None)` pass-throughs, skipped
-    // Distincts — is seen through rather than reasoned about via graph edges. The
-    // sink register is read once more at epoch end by the output extraction, which
-    // is a reader no instruction spells.
-    let instrs = ctx.builder.instructions();
-    let consumable: Vec<bool> = instrs
-        .iter()
-        .enumerate()
-        .map(|(i, instr)| {
-            let dtor_reg = match instr {
-                Instr::Union { in_a, in_b, .. } if in_a == in_b => return false,
-                Instr::Union { in_a, .. } => *in_a,
-                Instr::WeightClamp { in_reg, .. } => *in_reg,
-                _ => return false,
-            };
-            dtor_reg != sink_reg && !instrs[i + 1..].iter().any(|later| reads_reg(later, dtor_reg))
-        })
-        .collect();
-    for (instr, take) in ctx.builder.instructions_mut().iter_mut().zip(consumable) {
-        if let Instr::Union { consume, .. } | Instr::WeightClamp { consume, .. } = instr {
-            *consume = take;
+    // Destructive-register liveness: `consume_slots` names the registers an opcode
+    // could empty; this decides whether it may. Over the EMITTED instructions, so
+    // register aliasing from elided nodes is seen through rather than re-derived
+    // from graph edges. The sink is a reader no instruction spells.
+    let instrs = ctx.builder.instructions_mut();
+    for i in 0..instrs.len() {
+        let (head, tail) = instrs.split_at_mut(i + 1);
+        for (reg, consume) in consume_slots(&mut head[i]).into_iter().flatten() {
+            *consume = reg != sink_reg && !tail.iter().any(|later| reads_reg(later, reg));
         }
     }
 
@@ -1094,7 +1081,7 @@ mod tests {
     fn test_build_plan_sink_schema_type_mismatch_rejected() {
         // ScanDelta(99) → IntegrateSink. The source schema is [U64 pk, I64];
         // the view's declared out_schema is [U64 pk, STRING]. Same column count,
-        // different physical layout → must be rejected (item 32), else the client
+        // different physical layout → must be rejected, else the client
         // reads a 16-byte string descriptor out of 8-byte integer storage.
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(99));
@@ -1725,21 +1712,24 @@ mod tests {
 
     // ── Destructive-register liveness ───────────────────────────────────────
     //
-    // Union/Distinct/PositivePart can empty their input register in place. Whether
-    // they may is a property of the emitted instruction list — the register must
-    // have no later reader, and must not be the sink the epoch extracts — so
-    // `build_plan` decides it per instruction rather than accepting or rejecting
-    // the whole view.
+    // A register may be emptied in place iff it has no later reader and is not the
+    // sink the epoch extracts — a property of the emitted list, decided per input
+    // register rather than per view.
 
-    /// The `consume` flag of every destructive instruction, in program order.
-    fn consume_flags(plan: &PlanBuildResult) -> Vec<bool> {
+    /// Every `consume` verdict in program order, labelled by its slot; a `Union`
+    /// contributes both operands.
+    fn consume_flags(plan: &PlanBuildResult) -> Vec<(&'static str, bool)> {
         plan.vm
             .program
             .instructions
             .iter()
-            .filter_map(|i| match i {
-                Instr::Union { consume, .. } | Instr::WeightClamp { consume, .. } => Some(*consume),
-                _ => None,
+            .flat_map(|i| match i {
+                Instr::Union {
+                    consume_a, consume_b, ..
+                } => vec![("union.a", *consume_a), ("union.b", *consume_b)],
+                Instr::WeightClamp { consume, .. } => vec![("clamp", *consume)],
+                Instr::Negate { consume, .. } => vec![("negate", *consume)],
+                _ => vec![],
             })
             .collect()
     }
@@ -1776,12 +1766,38 @@ mod tests {
             .expect("both orderings compile");
             consume_flags(&plan)
         };
-        assert_eq!(flags(2, 1), vec![true], "the co-reader ran first, so the take is free");
+        assert_eq!(
+            flags(2, 1),
+            vec![("negate", false), ("clamp", true)],
+            "the co-reader ran first and had to clone; the clamp's take is then free"
+        );
         assert_eq!(
             flags(1, 2),
-            vec![false],
-            "the co-reader still has to read the register, so the clamp must clone"
+            vec![("clamp", false), ("negate", true)],
+            "the clamp runs first while the co-reader still has to read, so it must clone"
         );
+    }
+
+    /// The set-operation shape: two sources meet at one `Union`, neither operand has
+    /// a later reader, so both sides are taken. `consume_b` carries as much as
+    /// `consume_a`: one operand is empty every epoch and the other is returned whole.
+    #[test]
+    fn a_union_of_two_unread_operands_takes_both_sides() {
+        let mut nodes = HashMap::new();
+        nodes.insert(0, scan_delta(10));
+        nodes.insert(1, scan_delta(11));
+        nodes.insert(2, gnitz_wire::OpNode::Union);
+        let loaded = loaded_for_test(nodes, vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)]);
+        let plan = build_plan(
+            &loaded,
+            &loaded.ordered,
+            &HashMap::from([(10, two_col_schema()), (11, two_col_schema())]),
+            test_site("", 1),
+            crate::schema::Placement::KEYED_DEFAULT,
+            PlanTarget::Subgraph { out: 2 },
+        )
+        .expect("a two-source union compiles");
+        assert_eq!(consume_flags(&plan), vec![("union.a", true), ("union.b", true)]);
     }
 
     /// The epoch-end output extraction reads the sink register, and it is not an
@@ -1803,7 +1819,12 @@ mod tests {
             PlanTarget::Subgraph { out: 1 },
         )
         .expect("a union over the plan's own output register compiles");
-        assert_eq!(consume_flags(&plan), vec![false]);
+        assert_eq!(
+            consume_flags(&plan),
+            vec![("negate", false), ("union.a", false), ("union.b", true)],
+            "operand A is the sink and must not be taken; the Negate's own input is \
+             still read by operand B, which has no later reader of its own",
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use gnitz_test_harness::ServerHandle;
 mod common;
 use common::*;
 
-// ── item 21: LIMIT/OFFSET in VIEW definitions ────────────────────────
+// ── LIMIT/OFFSET in VIEW definitions ────────────────────────
 
 #[test]
 fn test_view_limit_rejected() {
@@ -29,7 +29,7 @@ fn test_view_limit_rejected() {
     );
 }
 
-// ── item 22: set operation column type mismatch ──────────────────────
+// ── set operation column type mismatch ──────────────────────
 
 #[test]
 fn test_set_op_type_mismatch_rejected() {
@@ -50,7 +50,7 @@ fn test_set_op_type_mismatch_rejected() {
     }
 }
 
-// ── item 23: duplicate column names in CREATE TABLE ──────────────────
+// ── duplicate column names in CREATE TABLE ──────────────────
 
 #[test]
 fn test_duplicate_column_name_rejected() {
@@ -73,7 +73,7 @@ fn test_duplicate_column_name_rejected() {
     );
 }
 
-// ── item 24: self-join via pass-through wrap ─────────────────────────
+// ── self-join via pass-through wrap ─────────────────────────
 
 #[test]
 fn test_self_join_supported() {
@@ -96,7 +96,7 @@ fn test_self_join_supported() {
     assert_eq!(rows, vec![vec![1, 1], vec![1, 2], vec![2, 1], vec![2, 2], vec![3, 3]]);
 }
 
-// ── item 26: self-referencing foreign key ────────────────────────────
+// ── self-referencing foreign key ────────────────────────────
 
 #[test]
 fn test_self_referencing_fk_accepted() {
@@ -123,7 +123,7 @@ fn test_self_referencing_fk_accepted() {
     assert_eq!(fk.fk_table_id, tid, "self-ref FK resolves to the table's own id");
 }
 
-// ── item 17: wide-join combined column count > MAX_COLUMNS ────────────
+// ── wide-join combined column count > MAX_COLUMNS ────────────
 
 #[test]
 fn test_wide_join_column_count_rejected() {

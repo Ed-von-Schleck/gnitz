@@ -141,6 +141,18 @@ pub(crate) fn execute_epoch_from(
             unsafe { &mut *regs.add($i as usize) }
         }};
     }
+    // Take on the register's last read — and also when it is already empty,
+    // where `take` leaves an `empty_like` placeholder a later reader cannot tell
+    // apart, and `clone_batch` would pop two pooled arenas to copy nothing.
+    macro_rules! take_or_clone {
+        ($consume:expr, $i:expr) => {
+            if $consume || reg!($i).batch.count == 0 {
+                reg_mut!($i).batch.take()
+            } else {
+                reg!($i).batch.clone_batch()
+            }
+        };
+    }
     // Every trace register names its backing table in `reg_meta`, and
     // `bind_trace_cursors` opens a cursor on each one before dispatch, so a
     // null here is a VM bug rather than a state the circuit can reach.
@@ -183,9 +195,13 @@ pub(crate) fn execute_epoch_from(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::Negate { in_reg, out_reg } => {
+            Instr::Negate {
+                in_reg,
+                out_reg,
+                consume,
+            } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Negate: in_reg and out_reg must be distinct");
-                let result = ops::op_negate(&reg!(*in_reg).batch);
+                let result = ops::op_negate(take_or_clone!(*consume, *in_reg));
                 reg_mut!(*out_reg).batch = result;
             }
 
@@ -193,28 +209,34 @@ pub(crate) fn execute_epoch_from(
                 in_a,
                 in_b,
                 out_reg,
-                consume,
+                consume_a,
+                consume_b,
             } => {
                 // The union's own (nullability-merged) schema, not the left
                 // input's — see `op_union` for why a narrower one mis-sorts
                 // nulls.
                 let out_schema = &program.reg_meta[*out_reg as usize].schema;
                 if in_a == in_b {
-                    // Self-union: Z + Z doubles every weight in-place. Reading
-                    // batch_b after moving batch_a out would see an empty batch
-                    // and produce +1 instead of +2 — and going through `op_union`
-                    // would clone 2N rows to reach the same answer.
+                    // Self-union: Z + Z doubles every weight in place. `op_union`
+                    // would clone 2N rows to reach the same answer, and reading
+                    // `in_b` after taking `in_a` would see an empty batch. One
+                    // register read once, so `consume_slots` returns no slot.
                     let mut batch = reg_mut!(*in_a).batch.take();
                     batch.map_weights(|w| w.wrapping_mul(2));
                     reg_mut!(*out_reg).batch = batch;
                 } else {
-                    let batch_b = &reg!(*in_b).batch;
-                    let batch_a = if *consume {
-                        reg_mut!(*in_a).batch.take()
+                    // Both identity arms live here because taking an operand is the
+                    // VM's decision, and single-source-per-epoch leaves one side of
+                    // a set operation's union empty every epoch.
+                    let (a_empty, b_empty) = (reg!(*in_a).batch.count == 0, reg!(*in_b).batch.count == 0);
+                    let result = if b_empty {
+                        take_or_clone!(*consume_a, *in_a) // A + 0 = A
+                    } else if a_empty {
+                        take_or_clone!(*consume_b, *in_b) // 0 + B = B
                     } else {
-                        reg!(*in_a).batch.clone_batch()
+                        ops::op_union(take_or_clone!(*consume_a, *in_a), &reg!(*in_b).batch, out_schema)
                     };
-                    reg_mut!(*out_reg).batch = ops::op_union(batch_a, batch_b, out_schema);
+                    reg_mut!(*out_reg).batch = result;
                 }
             }
 
@@ -229,11 +251,7 @@ pub(crate) fn execute_epoch_from(
             } => {
                 let cursor = cursor_mut!(*hist_reg);
                 let schema = &program.reg_meta[*in_reg as usize].schema;
-                let delta = if *consume {
-                    reg_mut!(*in_reg).batch.take()
-                } else {
-                    reg!(*in_reg).batch.clone_batch()
-                };
+                let delta = take_or_clone!(*consume, *in_reg);
                 let (output, consolidated) = ops::op_weight_clamp(delta, cursor, schema, *lo, *hi);
                 reg_mut!(*out_reg).batch = output;
                 // Ingest consolidated delta into history table
@@ -276,7 +294,7 @@ pub(crate) fn execute_epoch_from(
             Instr::NullExtend { in_reg, out_reg } => {
                 let in_schema = &program.reg_meta[*in_reg as usize].schema;
                 let out_schema = &program.reg_meta[*out_reg as usize].schema;
-                let result = ops::op_null_extend(&reg!(*in_reg).batch, in_schema, out_schema);
+                let result = reg!(*in_reg).batch.widened_with_null_tail(in_schema, out_schema);
                 reg_mut!(*out_reg).batch = result;
             }
 

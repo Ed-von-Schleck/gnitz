@@ -115,7 +115,7 @@ fn test_select_distinct_wide_pk_regression() {
     assert_eq!(vals, vec![7, 9]);
 }
 
-// ── item 14: SELECT DISTINCT projects and deduplicates ───────────────
+// ── SELECT DISTINCT projects and deduplicates ───────────────
 
 #[test]
 fn test_select_distinct_projects_and_dedups() {
