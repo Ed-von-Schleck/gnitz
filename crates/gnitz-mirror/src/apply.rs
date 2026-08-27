@@ -55,6 +55,10 @@ impl Mirror {
     /// fails forever, and stopping at it would freeze every view behind it. An
     /// `Err` therefore carries no report, and a host that sees one treats every
     /// mirrored view as possibly reseeded.
+    ///
+    /// **An interrupt is the one failure that stops the loop.** It is the host's
+    /// signal handler asking for the call to end, and one Ctrl-C must end it:
+    /// recording it and polling the next view would block again, N−1 more times.
     pub fn poll(&mut self) -> Result<Vec<PollOutcome>, MirrorError> {
         self.check_poison()?;
         let mut first: Option<MirrorError> = None;
@@ -62,6 +66,7 @@ impl Mirror {
         for tid in self.mirrored_ids() {
             match self.advance_or_bootstrap(tid) {
                 Ok(outcome) => out.push(outcome),
+                Err(e @ MirrorError::Upstream(ClientError::Interrupted(_))) => return Err(self.named_failure(tid, e)),
                 Err(e) => {
                     first.get_or_insert(self.named_failure(tid, e));
                 }
@@ -110,6 +115,10 @@ impl Mirror {
             // name — a bootstrap at the old id would read a relation that no
             // longer exists.
             Err(ClientError::DeltaExpired) => self.reseed_after_expiry(table_id),
+            // An interrupt is not a refusal to reconcile. Re-resolving would
+            // block on a second round trip past a Ctrl-C already consumed, and
+            // a name that had moved would discard the interrupt and reseed.
+            Err(e @ ClientError::Interrupted(_)) => Err(e.into()),
             // A poll can also fail because the id itself is gone rather than
             // because its tag moved: a `DROP VIEW v; CREATE VIEW v …` upstream
             // leaves the mirror holding an id that names nothing, and the read is

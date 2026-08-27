@@ -48,10 +48,15 @@ def _make_table(client):
 
 class TestSchemaConstruction:
 
-    def test_pk_defaults_to_column_zero(self):
+    def test_no_flagged_column_is_rejected(self):
+        """A key-less schema is an error, as `CREATE TABLE` without a PRIMARY KEY
+        is. The binding infers the PK list from the flags and nothing else — it
+        does not invent one, which would key a table on whichever column the
+        caller happened to declare first."""
         cols = [ColumnDef("a", TypeCode.U64),
                 ColumnDef("b", TypeCode.I64)]
-        assert Schema(cols).pk_indices == [0]
+        with pytest.raises(ValueError):
+            Schema(cols)
 
     def test_pk_inferred_from_flagged_columns_in_declaration_order(self):
         cols = [ColumnDef("a", TypeCode.U64),
@@ -230,11 +235,16 @@ class TestAppendKeywordPlan:
         # The batch-wide parameter still reaches such a schema.
         assert ZSetBatch(schema).extend([{"pk": 1, "_weight": 5}], -1).weights == [-1]
 
-    def test_one_name_feeds_every_column_that_has_it(self):
+    def test_one_name_feeds_every_visible_column_that_has_it(self):
         """A hidden column may shadow a visible one's name. The plan is resolved
-        by walking the schema, so both columns get the value — resolving
-        name->column instead would leave the shadow NULL (or fail outright, were
-        it NOT NULL)."""
+        by walking the schema, so every *visible* column carrying the name gets
+        the value — resolving name->column instead would leave a second visible
+        one NULL, or fail outright were it NOT NULL.
+
+        A hidden payload column takes neither: it is a DROP COLUMN tombstone, so
+        it takes the same zero filler the SQL writer pushes, whatever the caller
+        supplied under its name.
+        """
         schema = Schema([
             ColumnDef("pk", TypeCode.U64, primary_key=True),
             ColumnDef("v",  TypeCode.I64),
@@ -242,7 +252,7 @@ class TestAppendKeywordPlan:
         ])
         batch = ZSetBatch(schema)
         batch.append(pk=1, v=7)
-        assert batch.columns == [[], [7], [7]]
+        assert batch.columns == [[], [7], [0]]
 
     def test_unknown_keyword_raises_type_error_and_rolls_back(self):
         """An unrecognised keyword is an error, not a value the writer absorbs:
@@ -409,6 +419,94 @@ class TestExtend:
             result = client.scan(tid)
             assert len(result) == 2
             assert {row.pk: row.val for row in result} == {1: 10, 2: 20}
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_cycling_shapes_through_extend_keeps_every_row_correct(self):
+        """`extend` resolves a plan from each row's key sequence and reuses it
+        while the sequence holds. Sparse, shuffled, mixed-`_weight` rows through
+        one batch make it rebuild constantly: no row may be written through the
+        plan another row resolved, and a row that carries no `_weight` must take
+        the batch-wide default rather than the previous row's weight."""
+        cols = [ColumnDef("pk", TypeCode.U64, primary_key=True)] + [
+            ColumnDef("c%d" % i, TypeCode.I64, is_nullable=True) for i in range(5)]
+        schema = Schema(cols)
+        names = [c.name for c in cols[1:]]
+
+        rng = random.Random(11)
+        rows = []
+        for pk in range(500):
+            present = rng.sample(names, rng.randint(0, len(names)))
+            rng.shuffle(present)
+            row = dict({"pk": pk}, **{n: pk * 10 + int(n[1:]) for n in present})
+            if rng.random() < 0.4:
+                row["_weight"] = rng.choice([-1, 2, 7])
+            keys = list(row)
+            rng.shuffle(keys)
+            rows.append({k: row[k] for k in keys})
+
+        batch = ZSetBatch(schema)
+        batch.extend(rows, 3)
+        assert len(batch) == len(rows)
+        assert batch.pks == [r["pk"] for r in rows]
+        assert batch.weights == [r.get("_weight", 3) for r in rows]
+        for col_i, name in enumerate(names, start=1):
+            assert batch.columns[col_i] == [r.get(name) for r in rows]
+
+    def test_extend_over_a_duplicate_name_schema(self, client):
+        """A schema read back off the wire can carry two columns of one name: a
+        DROP COLUMN leaves its slot behind, hidden, and a re-ADD reuses the name.
+        `extend` resolves through the same schema walk `append` does, so the
+        supplied value reaches the visible column and the tombstone takes its
+        filler — and a name that is nobody's column is still an error."""
+        sn = "zb" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=sn)
+            client.execute_sql("ALTER TABLE t ADD COLUMN a BIGINT", schema_name=sn)
+            tid, schema = client.resolve_table(sn, "t")
+            assert [c.name for c in schema.columns].count("a") == 2
+
+            batch = ZSetBatch(schema)
+            batch.extend([{"id": 1, "a": 10}, {"id": 2, "a": 20}])
+            client.push(tid, batch)
+            assert {r.id: r.a for r in client.scan(tid)} == {1: 10, 2: 20}
+
+            with pytest.raises(TypeError, match="_weight"):
+                ZSetBatch(schema).extend([{"id": 3, "a": 30, "nosuch": 1}])
+        finally:
+            _cleanup(client, sn, "t")
+
+    def test_push_after_dropping_a_not_null_column(self, client):
+        """`DROP COLUMN` flips `is_hidden` and nothing else, so a dropped NOT NULL
+        column stays NOT NULL in the schema `resolve_table` hands back. A binary
+        push naming only the surviving columns has to fill that slot itself — the
+        caller cannot name a column SQL has already taken away."""
+        sn = "zb" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, "
+                "a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=sn)
+            tid, schema = client.resolve_table(sn, "t")
+
+            batch = ZSetBatch(schema)
+            batch.append(id=1, b=100)
+            batch.extend([{"id": 2, "b": 200}])
+            client.push(tid, batch)
+
+            rows = list(client.scan(tid))
+            assert {r.id: r.b for r in rows} == {1: 100, 2: 200}
+            assert all("a" not in r._fields for r in rows)
+
+            # The tombstone is not a column the caller may write to.
+            with pytest.raises(TypeError, match="unexpected column name"):
+                ZSetBatch(schema).append(id=3, a=1, b=300)
         finally:
             _cleanup(client, sn, "t")
 

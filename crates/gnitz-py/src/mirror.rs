@@ -8,11 +8,11 @@
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
-use gnitz_core::{GnitzClient, ReadTarget};
+use gnitz_core::ReadTarget;
 use gnitz_mirror::{Mirror, MirrorError, PollOutcome};
 use gnitz_sql::SqlPlanner;
 
-use crate::{batch_to_lazy, classified_err, delta_err, sql_results_to_py, to_py_err};
+use crate::{batch_to_lazy, client_err, connect_client, sql_err, sql_results_to_py, to_py_err};
 use crate::{GnitzError, PyScanResult};
 
 // A mirror handle refused every further call because a delta did not reach its
@@ -58,7 +58,7 @@ fn detached<T: Send>(py: Python<'_>, m: &mut Mirror, f: impl Send + FnOnce(&mut 
 /// `GnitzDeltaExpiredError`.
 fn mirror_err(e: MirrorError) -> PyErr {
     match e {
-        MirrorError::Upstream(c) => delta_err(c),
+        MirrorError::Upstream(c) => client_err(c),
         MirrorError::Engine(m) => GnitzError::new_err(m),
         MirrorError::Poisoned(_) => GnitzMirrorPoisonedError::new_err(e.to_string()),
     }
@@ -158,11 +158,13 @@ impl PyMirror {
     /// catalog, one store per mirrored view, and the cursor file.
     #[new]
     pub fn new(py: Python<'_>, base_dir: &str, target: &str) -> PyResult<Self> {
-        // The connect blocks — up to 10 s for a `tls://` target — and the engine
-        // open behind it is disk work, so the GIL is down for both.
-        let opened = py.detach(move || Confined(GnitzClient::connect(target).map(|c| Mirror::open(base_dir, c))));
-        let inner = to_py_err(opened.into_inner())?.map_err(mirror_err)?;
-        Ok(PyMirror { inner: Some(inner) })
+        let client = connect_client(py, target)?;
+        // The engine open is disk work, so the GIL is down for it as it was for
+        // the connect.
+        let opened = py.detach(move || Confined(Mirror::open(base_dir, client)));
+        Ok(PyMirror {
+            inner: Some(opened.into_inner().map_err(mirror_err)?),
+        })
     }
 
     /// Checkpoint (unless poisoned) and release the handle. Calling it twice is
@@ -214,7 +216,8 @@ impl PyMirror {
     /// the server, then poll once".
     ///
     /// Every view is attempted and the first failure is raised after the loop,
-    /// naming the view. An error therefore carries no report, so treat every
+    /// naming the view — except a `KeyboardInterrupt`, which stops at the view
+    /// it interrupted. An error therefore carries no report, so treat every
     /// mirrored view as possibly reseeded.
     pub fn poll(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyPollResult>>> {
         let outcomes = detached(py, self.live()?, |m| m.poll()).map_err(mirror_err)?;
@@ -277,7 +280,7 @@ impl PyMirror {
     /// while the copy — durable, and resumable — survives it.
     pub fn reconnect(&mut self, py: Python<'_>, target: &str) -> PyResult<()> {
         self.live()?; // refuse a closed or poisoned handle before paying for a connect
-        let client = to_py_err(py.detach(|| GnitzClient::connect(target)))?;
+        let client = connect_client(py, target)?;
         *self.opened()?.client_mut() = client;
         Ok(())
     }
@@ -290,8 +293,11 @@ impl PyMirror {
     /// handle does not hold, runs on the connection the handle owns.
     #[pyo3(signature = (sql, schema_name = "public"))]
     pub fn execute_sql(&mut self, py: Python<'_>, sql: &str, schema_name: &str) -> PyResult<Py<PyAny>> {
-        let results = detached(py, self.live()?, |m| SqlPlanner::new(m, schema_name).execute(sql))
-            .map_err(|e| classified_err(&e))?;
+        // `sql_err`, not the bare classifier: an unheld relation is delegated to
+        // the handle's own client, so a Ctrl-C here arrives as
+        // `Exec(ClientError::Interrupted)` and has to reach Python as the
+        // `KeyboardInterrupt` it carries.
+        let results = detached(py, self.live()?, |m| SqlPlanner::new(m, schema_name).execute(sql)).map_err(sql_err)?;
         sql_results_to_py(py, results)
     }
 

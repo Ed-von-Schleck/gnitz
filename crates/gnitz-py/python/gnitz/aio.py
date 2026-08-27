@@ -64,81 +64,33 @@ class AsyncConnection:
 
     All I/O runs **on the event loop**: it calls back on readability, and that
     callback steps the connection and resolves whatever completed — one
-    crossing into Rust per event, however many operations are in flight.
+    crossing into Rust per event, however many operations are in flight. The
+    transport holds the loop and drives its own reader and writer
+    registrations, so this class is the public surface over it and nothing
+    else.
 
     Connecting is synchronous, so the object ``connect()`` returns is the
     connection itself: awaiting it yields the same object, and entering it as
     an ``async with`` block closes it on exit.
     """
 
-    __slots__ = ("_transport", "_loop", "_fd", "_writer_armed", "_closed")
+    __slots__ = ("_transport",)
 
     def __init__(self, socket_path):
-        self._loop = asyncio.get_running_loop()
-        self._transport = AsyncTransport(socket_path, self._loop)
-        self._fd = self._transport.fileno()
-        self._writer_armed = False
-        self._closed = False
-        # Armed once, for the life of the connection: a reader on a quiet socket
-        # costs nothing, where arming per operation costs two `epoll_ctl`.
-        self._loop.add_reader(self._fd, self._on_readable)
-
-    # -- loop callbacks ----------------------------------------------------
-    #
-    # The loop holds these, not the Rust entry points: `add_reader` discards a
-    # callback's return value, and these are what read it.
-
-    def _on_readable(self):
-        self._apply(self._transport.on_readable())
-
-    def _on_writable(self):
-        self._apply(self._transport.on_writable())
-
-    def _apply(self, wants_write):
-        """React to what a step reported: ``None`` is "finished, deregister"."""
-        if wants_write is None:
-            self._teardown()
-        else:
-            self._arm_writer(wants_write)
-
-    def _arm_writer(self, on):
-        """Add or remove the writable callback, idempotently — the flag is
-        exactly "the loop owes us an ``_on_writable``". Disarming matters as
-        much as arming: a writer left on an always-writable fd spins the loop
-        at 100%."""
-        if on == self._writer_armed:
-            return
-        self._writer_armed = on
-        if on:
-            self._loop.add_writer(self._fd, self._on_writable)
-        else:
-            self._loop.remove_writer(self._fd)
-
-    def _teardown(self):
-        """Deregister both callbacks. Every caller runs it before the
-        transport's own close, so the selector never holds a dead fd."""
-        if self._closed:
-            return
-        self._closed = True
-        self._loop.remove_reader(self._fd)
-        self._arm_writer(False)
+        self._transport = AsyncTransport(socket_path, asyncio.get_running_loop())
+        # Two steps: binding the loop callbacks needs the transport object,
+        # which its constructor cannot hand itself.
+        self._transport.install()
 
     # -- verbs -------------------------------------------------------------
 
-    def _submit(self, future):
-        """Every verb returns through here. A submitted frame is only queued;
-        the writer callback is what ships it, and deferring to that callback is
-        what keeps a whole turn's submits in one ``writev``."""
-        self._arm_writer(True)
-        return future
-
     def push(self, target_id, batch):
         """Push a batch to a table.  Awaits to the ingest LSN (int)."""
-        return self._submit(self._transport.push(target_id, batch))
+        return self._transport.push(target_id, batch)
 
     def scan(self, target_id, include_hidden=False):
         """Scan a table/view.  Awaits to a ``ScanResult``."""
-        return self._submit(self._transport.scan(target_id, include_hidden))
+        return self._transport.scan(target_id, include_hidden)
 
     def scan_many(self, target_ids, include_hidden=False):
         """Consistent snapshot of N relations at one server-side SAL cut.
@@ -146,11 +98,11 @@ class AsyncConnection:
         Awaits to a ``list`` of ``ScanResult`` in request order.  An atomic
         multi-table transaction is never observed torn across the list.
         """
-        return self._submit(self._transport.scan_many(target_ids, include_hidden))
+        return self._transport.scan_many(target_ids, include_hidden)
 
     def seek(self, table_id, pk=0, include_hidden=False):
         """Point-lookup by primary key.  Awaits to a ``ScanResult``."""
-        return self._submit(self._transport.seek(table_id, pk, include_hidden))
+        return self._transport.seek(table_id, pk, include_hidden)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -162,8 +114,8 @@ class AsyncConnection:
         return _immediate_return(self).__await__()
 
     async def aclose(self):
-        """Close the connection."""
-        self._teardown()
+        """Close the connection. Deregisters both loop callbacks, abandons every
+        outstanding operation, and releases the socket."""
         self._transport.close()
 
     async def __aenter__(self):

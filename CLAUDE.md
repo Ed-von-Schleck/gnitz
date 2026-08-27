@@ -97,7 +97,7 @@ padding at the wire boundary never moves a key.
 and unprojected passthrough PK columns are real schema columns flagged hidden
 (`META_FLAG_HIDDEN`). They are excluded from wildcard expansion, name resolution,
 duplicate-name checks and client rows; PK region, routing, sort and consolidation
-are unaffected. Base-table columns are never hidden.
+are unaffected.
 
 ## 2. Z-Set Operations
 
