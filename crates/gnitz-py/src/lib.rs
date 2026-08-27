@@ -2417,6 +2417,11 @@ impl PyAsyncTransport {
         // cross as plain `&` refs, no clone (the `PyRef` guard stays out of the
         // closure). `submit` packs warm against the session's own cache; a
         // stale stamp's mismatch fails this slot and the caller re-issues.
+        // No await here to back-pressure on, so at the cap ship what the
+        // socket will take; `submit` below raises only if that was not enough.
+        if self.session.queued_bytes() >= gnitz_core::MAX_QUEUED_BYTES {
+            self.drive(py, gnitz_core::Interest::WRITE);
+        }
         let schema = batch.schema.as_ref();
         let b = &batch.batch;
         let session = &mut self.session;

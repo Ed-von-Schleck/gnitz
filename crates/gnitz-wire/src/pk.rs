@@ -224,7 +224,7 @@ pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
 }
 
 /// Decode one OPK PK column straight to `i64` — the exact inverse of
-/// [`encode_pk_column`], fused with the widening [`FixedInt`] defines.
+/// [`encode_pk_column`], fused with the widening [`crate::types::FixedInt`] defines.
 ///
 /// Spelled with byte-array literals rather than composed from `decode_pk_column`
 /// and [`widen_pk_be`]: its production caller is `ColumnLocator::decode_i64`,

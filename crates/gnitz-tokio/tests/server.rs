@@ -95,8 +95,11 @@ fn an_idle_connection_consumes_no_cpu() {
     let before = cpu_time();
     std::thread::sleep(Duration::from_secs(1));
     let spent = cpu_time() - before;
+    // A spin burns a whole core, so 250ms of the second still catches one four
+    // times over. Loose because this counts every thread, and tokio's idle
+    // workers spin before parking — more so when the rest of the suite is busy.
     assert!(
-        spent < Duration::from_millis(50),
+        spent < Duration::from_millis(250),
         "an idle connection spent {spent:?} of CPU over a quiet second",
     );
 

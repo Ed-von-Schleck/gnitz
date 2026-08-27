@@ -8,7 +8,7 @@
 
 /// Terminate the process with exit code 134 (= 128 + SIGABRT) without running
 /// atexit handlers, TLS destructors or a stdio flush. Called by
-/// [`gnitz_fatal_abort!`]; it lives beside the macro so that expands to no
+/// `gnitz_fatal_abort!`; it lives beside the macro so that expands to no
 /// unqualified `libc` path.
 ///
 /// Diverges, like the `_exit` it wraps: `gnitz_fatal_abort!` is used in value

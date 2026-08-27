@@ -290,7 +290,7 @@ impl ClientTransport {
         self.deadline = deadline;
     }
 
-    /// Send a length-prefixed frame: [u32 LE payload_length][payload].
+    /// Send a length-prefixed frame: `[u32 LE payload_length][payload]`.
     pub fn send_framed(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
         self.send_framed_iov(&[data])
     }
@@ -357,6 +357,11 @@ impl ClientTransport {
             self.park(libc::POLLOUT)?;
         }
         Ok(())
+    }
+
+    /// Frame bytes queued and not yet written.
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.queue.bytes
     }
 
     /// Bytes queued, or ciphertext pending: the `WRITE` half of a driver's
@@ -612,11 +617,15 @@ struct OutQueue {
     frames: VecDeque<QueuedFrame>,
     seg: usize,
     off: usize,
+    /// Bytes queued and not yet written, prefixes included.
+    bytes: usize,
 }
 
 impl OutQueue {
     fn push(&mut self, prefix: [u8; 4], parts: MessageParts) {
-        self.frames.push_back(QueuedFrame { prefix, parts });
+        let frame = QueuedFrame { prefix, parts };
+        self.bytes += frame.segments().map(<[u8]>::len).sum::<usize>();
+        self.frames.push_back(frame);
     }
 
     fn is_empty(&self) -> bool {
@@ -631,6 +640,7 @@ impl OutQueue {
         self.frames.clear();
         self.seg = 0;
         self.off = 0;
+        self.bytes = 0;
     }
 
     /// Slices from the cursor forward, at most `IOV_MAX_CHUNK` of them.
@@ -649,6 +659,7 @@ impl OutQueue {
 
     /// Advance the cursor by `n` written bytes, popping fully-sent frames.
     fn advance(&mut self, mut n: usize) {
+        self.bytes -= n;
         while n > 0 {
             let front = self.frames.front().expect("advance past the queue");
             let seg_len = front.segments().nth(self.seg).map_or(0, |s| s.len());

@@ -28,8 +28,12 @@ together, and each future resolves to its own operation's result.
 Three limitations are choices, not oversights:
 
 * **Connect is synchronous** — connect + HELLO run on the calling thread, so a
-  ``tls://`` connect to a slow host blocks the loop for both. Harmless for
-  loopback.
+  ``tls://`` connect to a slow host blocks the loop for both, and the 10 s
+  connect timeout is per resolved address. ``asyncio.wait_for`` around
+  ``connect`` therefore bounds nothing: the socket is already open by the time
+  it sees the object. Harmless for loopback. Moving the connect to a thread
+  would fix it and cost a thread — which is the one thing this client does not
+  have, and what keeps a gathered burst free of futex traffic.
 * **A connection is bound to the loop that constructed it**, because
   ``add_reader`` is a property of that loop.
 * **Abandoning an operation is not cancellation.**
@@ -78,7 +82,6 @@ class AsyncConnection:
         # Armed once, for the life of the connection: a reader on a quiet socket
         # costs nothing, where arming per operation costs two `epoll_ctl`.
         self._loop.add_reader(self._fd, self._on_readable)
-
 
     # -- loop callbacks ----------------------------------------------------
     #
@@ -152,11 +155,10 @@ class AsyncConnection:
     # -- lifecycle ---------------------------------------------------------
 
     def __await__(self):
-        # `connect()` must serve both `await connect(p)` and
-        # `async with connect(p)`, so it returns the connection itself rather
-        # than a coroutine; this is what makes the object awaitable. Connecting
-        # already happened in `__init__`, so there is nothing to wait for — the
-        # delegated coroutine returns without ever reaching the event loop.
+        # `connect()` serves both `await connect(p)` and `async with
+        # connect(p)`, so it returns the connection rather than a coroutine;
+        # this is what makes that object awaitable. Connecting already happened,
+        # so the delegated coroutine never reaches the event loop.
         return _immediate_return(self).__await__()
 
     async def aclose(self):

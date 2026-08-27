@@ -110,7 +110,7 @@ pub(crate) const TABLE_TAB_COLS: &[WireSysCol] = &[
     // Packed PK column list (`pack_pk_cols`); a bare index (flag bit clear)
     // decodes as a single-column PK.
     col("pk_col_idx", TypeCode::U64, false),
-    // See `pack_table_flags` for the bit layout.
+    // See `TableProps::pack` for the bit layout.
     col("flags", TypeCode::U64, false),
 ];
 

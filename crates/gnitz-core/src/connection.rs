@@ -1,16 +1,17 @@
 //! The protocol session: a sans-io connection state machine and the blocking
 //! verbs written over it.
 //!
-//! The **spine** is five methods — [`Session::submit`], [`Session::step`],
-//! [`Session::interest`], [`Session::close`] and [`Session::as_raw_fd`] — and
-//! "nothing in it ever waits" is a property of those five, not of the type.
+//! The **spine** is [`Session::submit`] and [`Session::step`], plus what a
+//! driver reads between them: [`Session::interest`], [`Session::close`], and
+//! the fd through [`Session::as_raw_fd`] or [`Session::try_clone_fd`].
+//! "Nothing in it ever waits" is a property of those methods, not of the type.
 //! `submit` encodes a request against the connection's schema cache and
 //! registers a slot; `step` does the I/O the driver says the fd is ready for
 //! and reports which slots completed; waiting belongs to whoever drives it.
+//!
 //! Above the spine sit `Session`'s own blocking verb bodies, which park in
-//! [`Session::round_trip`]; every other client — the tokio driver, the asyncio
-//! executor — drives the same five methods and does its own waiting. There is
-//! no second reply path.
+//! [`Session::round_trip`]; the tokio driver and the asyncio executor drive the
+//! same methods and do their own waiting. There is no second reply path.
 //!
 //! Replies leave the server in request order, so there is exactly one reply
 //! accumulator and it belongs to the head of the pending queue: every byte
@@ -47,6 +48,12 @@ const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64)
 /// Requests one connection may hold in flight; `submit` raises past it. A bound
 /// on the memory a driver that never waits can pin, not a throughput knob.
 pub const MAX_IN_FLIGHT: usize = 4096;
+
+/// Unwritten frame bytes one connection may hold; `submit` raises past it. An
+/// encoded push is a full copy of its batch, so the count above bounds no
+/// memory on its own. Checked before queueing, so one frame of any size always
+/// goes through — what it bounds is a driver that submits without flushing.
+pub const MAX_QUEUED_BYTES: usize = 64 << 20;
 
 /// One relation's reply to a `scan`/`seek`/`seek_by_index`: the (cached)
 /// `Schema`, the materialised `ZSetBatch` if any rows came back, and the server
@@ -380,7 +387,6 @@ pub struct Session {
     next_slot: u64,
     accum: Accumulator,
     closed: bool,
-    write_refused: bool,
     /// Run before every park of the blocking client; its `Err` aborts the
     /// operation. `Send + Sync` so the field cannot silently narrow the
     /// auto-traits of the public types that hold a session.
@@ -415,7 +421,6 @@ impl Session {
             next_slot: 1,
             accum: Accumulator::default(),
             closed: false,
-            write_refused: false,
             park_hook: None,
         }
     }
@@ -472,6 +477,12 @@ impl Session {
         if self.pending.len() >= MAX_IN_FLIGHT {
             return Err(ClientError::ServerError(format!(
                 "connection has {MAX_IN_FLIGHT} requests in flight"
+            )));
+        }
+        let queued = self.transport.queued_bytes();
+        if queued >= MAX_QUEUED_BYTES {
+            return Err(ClientError::ServerError(format!(
+                "connection has {queued} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap"
             )));
         }
         let client_id = self.client_id;
@@ -575,23 +586,24 @@ impl Session {
         if self.closed {
             return Ok(done);
         }
-        if ready.write {
-            self.write_refused = self.transport.flush()?;
-        }
         if ready.read {
             self.transport.begin_read();
         }
         while let Next::Frame(buf) = self.transport.next_frame(ready.read)? {
             self.feed(buf, &mut done)?;
         }
+        // Last, so that bytes still queued when this returns are ones the fd
+        // refused — a read of its own can queue ciphertext, and flushing before
+        // it would leave that behind and make the two indistinguishable.
+        if ready.write {
+            self.transport.flush()?;
+        }
         Ok(done)
     }
 
-    /// Whether the last flush left bytes the fd refused. Narrower than
-    /// `interest().write`, which a read in the same step also sets when rustls
-    /// queues ciphertext after that flush ran.
-    pub fn write_refused(&self) -> bool {
-        self.write_refused
+    /// Frame bytes queued and not yet written, against [`MAX_QUEUED_BYTES`].
+    pub fn queued_bytes(&self) -> usize {
+        self.transport.queued_bytes()
     }
 
     /// `READ` while any slot is outstanding; `WRITE` while bytes remain queued

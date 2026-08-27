@@ -559,7 +559,7 @@ const META_FLAG_PK_POS_MASK: u64 = 0xFF << META_FLAG_PK_POS_SHIFT;
 /// This word is written by both ends (the client encodes a schema it pushes,
 /// the engine encodes the schema it replies with) and read by both, so the bit
 /// layout lives here with its accessors rather than being re-spelled per codec —
-/// the same rule [`pack_table_flags`] follows for `TABLE_TAB.flags`.
+/// the same rule [`crate::TableProps::pack`] follows for `TABLE_TAB.flags`.
 #[inline]
 pub fn pack_col_meta_flags(nullable: bool, hidden: bool, serial: bool, pk_pos: Option<u8>) -> u64 {
     let pk = match pk_pos {

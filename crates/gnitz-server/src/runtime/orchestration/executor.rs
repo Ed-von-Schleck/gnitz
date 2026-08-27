@@ -1768,7 +1768,7 @@ fn resolve_request_target(
         .map(|kind| (candidate, kind)))
 }
 
-/// Build the RESOLVE reply: the schema block plus the [`RelDescriptorBlob`]
+/// Build the RESOLVE reply: the schema block plus the [`gnitz_wire::RelDescriptorBlob`]
 /// carrying what the block cannot (kind, placement, foreign keys, secondary
 /// indexes). Served entirely from the typed caches the master already
 /// maintains; it writes no SAL group and wakes no worker.

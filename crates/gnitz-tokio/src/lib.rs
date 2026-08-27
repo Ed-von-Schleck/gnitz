@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 
 use gnitz_core::{
     qualified_name, ClientError, Interest, PkTuple, RelDescriptor, RelTarget, Reply, Request, ScanReply, Schema,
-    Session, SlotId, WireConflictMode, ZSetBatch, MAX_IN_FLIGHT,
+    Session, SlotId, WireConflictMode, ZSetBatch, MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::{mpsc, oneshot};
@@ -165,10 +165,12 @@ pub struct Connection {
 
 impl Connection {
     /// Encode every submission the channel holds; `true` when the last handle
-    /// is gone. At the cap the channel is left unpolled, which is what turns
-    /// `MAX_IN_FLIGHT` into back-pressure on `AsyncClient::call`.
+    /// is gone. At either cap the channel is left unpolled, which is what turns
+    /// them into back-pressure on `AsyncClient::call` rather than the error
+    /// `submit` would raise. Queued bytes always arm `write`, so the next step
+    /// brings the loop back round.
     fn drain_channel(&mut self, cx: &mut Context<'_>) -> bool {
-        while self.pending.len() < MAX_IN_FLIGHT {
+        while self.pending.len() < MAX_IN_FLIGHT && self.session.queued_bytes() < MAX_QUEUED_BYTES {
             match self.rx.poll_recv(cx) {
                 Poll::Ready(Some(sub)) => self.submit(sub),
                 Poll::Ready(None) => return true,
@@ -292,10 +294,10 @@ impl Future for Connection {
             }
 
             let stepped = this.session.step(ready);
-            // A step always drains the read source; it exhausts the write queue
-            // only when the fd refused it.
+            // A step drains the read source and flushes last, so bytes still
+            // queued after one are exactly what the fd refused.
             give_back(read, true);
-            give_back(write, this.session.write_refused());
+            give_back(write, this.session.interest().write);
 
             match stepped {
                 Ok(done) => {

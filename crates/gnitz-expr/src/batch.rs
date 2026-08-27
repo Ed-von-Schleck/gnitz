@@ -289,7 +289,7 @@ impl EvalScratch {
 }
 
 /// One morsel's results, read out of the register file. Handed to
-/// [`Evaluator::eval_morsels`]'s callback for the lifetime of that call.
+/// [`crate::eval::Evaluator::eval_morsels`]'s callback for the lifetime of that call.
 pub struct MorselOut<'a> {
     regs: &'a [i64],
     null_bits: &'a [u64],

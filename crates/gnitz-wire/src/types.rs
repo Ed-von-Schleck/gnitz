@@ -404,7 +404,7 @@ pub fn index_key_types(col_types: &[u8], src_pk_count: usize, src_pk_stride: usi
 pub enum PkRule {
     /// No PK columns at all. Every base table has an enforced primary key.
     Empty,
-    /// Arity past [`PK_LIST_MAX_COLS`], the persisted PK-list codec capacity.
+    /// Arity past [`crate::PK_LIST_MAX_COLS`], the persisted PK-list codec capacity.
     TooManyColumns { count: usize },
     /// A PK index that names no column.
     IndexOutOfRange { col: u32 },

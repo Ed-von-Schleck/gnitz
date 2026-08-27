@@ -23,7 +23,7 @@ pub use client::{
 };
 pub use connection::{
     Completions, Interest, ParkHook, RawBlock, RelTarget, Reply, ReplyTrain, Request, ScanReply, Session, SlotId,
-    FIRST_USER_TABLE_ID, MAX_IN_FLIGHT, TABLE_TAB,
+    FIRST_USER_TABLE_ID, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, TABLE_TAB,
 };
 pub use error::{ClientError, ConflictClass};
 pub use gnitz_wire::{

@@ -368,6 +368,44 @@ fn close_abandons_every_pending_slot_and_refuses_further_work() {
         .is_empty());
 }
 
+/// The count cap does not bound bytes: an encoded push is a full copy of its
+/// batch, so a driver that never flushes pins memory in proportion to what it
+/// pushed, not to how many times.
+#[test]
+fn queued_bytes_cap_raises_before_the_in_flight_count_does() {
+    let (mut s, _peer) = pair();
+    let sa = schema_a();
+    // 32 bytes a row, so 8192 rows is a 256 KiB frame and the byte cap lands
+    // around 256 submits — an order of magnitude under `MAX_IN_FLIGHT`.
+    let b = batch_a(&(0..8192).collect::<Vec<u64>>());
+    let mut n = 0usize;
+    loop {
+        let r = s.submit(Request::Push {
+            target_id: 4,
+            schema: &sa,
+            batch: &b,
+            mode: WireConflictMode::Update,
+        });
+        match r {
+            Ok(_) => n += 1,
+            Err(ClientError::ServerError(m)) => {
+                assert!(m.contains("unwritten bytes queued"), "wrong cap: {m}");
+                break;
+            }
+            Err(e) => panic!("{e}"),
+        }
+        assert!(n < MAX_IN_FLIGHT, "the byte cap must bite before the count one");
+    }
+    assert!(s.queued_bytes() >= MAX_QUEUED_BYTES);
+    assert!(s.interest().write, "nothing was flushed, so it is all still queued");
+
+    // Writing gives the budget back — the counter tracks the write cursor, not
+    // just the pushes.
+    let queued = s.queued_bytes();
+    s.step(Interest::WRITE).unwrap();
+    assert!(s.queued_bytes() < queued, "a flush releases what it wrote");
+}
+
 #[test]
 fn in_flight_cap_raises_rather_than_hanging() {
     let (mut s, _peer) = pair();
