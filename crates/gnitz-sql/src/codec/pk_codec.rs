@@ -5,8 +5,13 @@
 //! SEEK PK literal flows (`extract_pk_value_mapped`, plus `try_col_eq_literal` /
 //! `try_extract_pk_in` in the WHERE planner), so the master cannot route an
 //! INSERT and a DELETE for the same key to different workers.
+//!
+//! Two literal surfaces feed those packers, both defined here: the AST
+//! ([`SqlLiteral`]) that INSERT VALUES parses, and the bound IR ([`BoundLit`])
+//! that the WHERE recognizers and the UPDATE SET classifier read.
 
 use crate::error::GnitzSqlError;
+use crate::ir::{BExpr, BoundExpr, UnaryOp};
 use gnitz_core::{FixedInt, PkTuple, Schema, TypeCode};
 use sqlparser::ast::{Expr, UnaryOperator, Value};
 
@@ -73,6 +78,88 @@ pub(crate) fn pack_pk_value(tc: TypeCode, v: i128) -> Option<u128> {
             let (min, max) = fi.range();
             (min <= v && v <= max).then(|| fi.pack(v))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The bound-literal seam
+// ---------------------------------------------------------------------------
+
+/// A bound numeric literal, sign applied. `LitInt` and `LitWide` — the two numeric
+/// literal shapes binding produces — optionally under an outer `Neg`, are the only
+/// cases: a negative literal rides as `UnaryOp(Neg, Lit…)`.
+#[derive(Clone, Copy)]
+pub(crate) enum NumLit<'e> {
+    /// A native literal (any i64, sign applied — `-(i64::MIN)` fits i128).
+    Small(i128),
+    /// A wide magnitude digit string + sign. Kept as the raw string because the
+    /// `i128`-vs-`u128` parse is the consumer's call: it holds the column
+    /// `TypeCode`, and a `LitWide` in the `(i128::MAX, u128::MAX]` band
+    /// (`U128`/`UUID`) needs the u128 parse a signed value could not represent.
+    Wide(&'e str, bool),
+}
+
+impl NumLit<'_> {
+    /// The literal as a signed value, for a consumer that classifies against a
+    /// ≤8-byte type's range. `None` for a magnitude past `i128` — only a
+    /// `U128`/`UUID` literal, which takes [`pack_num`]'s unsigned path instead.
+    pub(crate) fn to_i128(self) -> Option<i128> {
+        match self {
+            NumLit::Small(v) => Some(v),
+            NumLit::Wide(s, negated) => parse_literal_i128(s, negated),
+        }
+    }
+}
+
+/// The one seam from a bound numeric literal to a [`NumLit`].
+pub(crate) fn bound_num_literal(e: &BoundExpr) -> Option<NumLit<'_>> {
+    match e {
+        BExpr::LitInt(v) => Some(NumLit::Small(*v as i128)),
+        BExpr::LitWide(s) => Some(NumLit::Wide(s, false)),
+        BExpr::UnaryOp(UnaryOp::Neg, inner) => match inner.as_ref() {
+            BExpr::LitInt(v) => Some(NumLit::Small(-(*v as i128))),
+            BExpr::LitWide(s) => Some(NumLit::Wide(s, true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Pack a numeric literal as a seek/range key for column type `tc`, byte-exactly
+/// (an out-of-type-range literal declines, never wraps).
+pub(crate) fn pack_num(tc: TypeCode, lit: NumLit<'_>) -> Option<u128> {
+    match lit {
+        NumLit::Small(v) => pack_pk_value(tc, v),
+        NumLit::Wide(s, negated) => parse_pk_literal_packed(tc, s, negated),
+    }
+}
+
+/// A bound literal accepted for a seek/range key: a numeric value + sign, or a
+/// string (a single-quoted UUID). The bound-IR analogue of [`SqlLiteral`].
+pub(crate) enum BoundLit<'e> {
+    Num(NumLit<'e>),
+    Str(&'e str),
+}
+
+pub(crate) fn bound_literal(e: &BoundExpr) -> Option<BoundLit<'_>> {
+    if let Some(n) = bound_num_literal(e) {
+        return Some(BoundLit::Num(n));
+    }
+    if let BExpr::LitStr(s) = e {
+        return Some(BoundLit::Str(s));
+    }
+    None
+}
+
+/// A bound literal as the packed key of a column of type `tc`: a single-quoted
+/// string is a key only for a UUID column, numerics pack through the same
+/// `pk_codec` path INSERT takes. The one rule behind `col = literal` and
+/// `col IN (literal, …)`, so those two spellings cannot route differently.
+pub(crate) fn bound_key_literal(lit: BoundLit<'_>, tc: TypeCode) -> Option<u128> {
+    match lit {
+        BoundLit::Str(s) if tc == TypeCode::UUID => parse_uuid_str(s).ok(),
+        BoundLit::Str(_) => None,
+        BoundLit::Num(n) => pack_num(tc, n),
     }
 }
 

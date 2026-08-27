@@ -192,7 +192,9 @@ fn unbounded_shapes_carry_no_bound() {
     );
     assert_eq!(view_bound_cols(&mut client, &sn, "v_distinct"), 0);
 
-    // A PK predicate: PK columns are never eq conjuncts, whatever indexes exist.
+    // A PK predicate over a table whose only index is on `ind`: no key list the
+    // recognizer walks names `pk`, so nothing bounds. (A `CREATE VIEW` compiles no
+    // PK-range bound either — `ScanBound` has no wire form for one.)
     exec(
         &mut client,
         &sn,

@@ -42,8 +42,9 @@ fn line(client: &mut GnitzClient, sn: &str, sql: &str, prefix: &str) -> String {
         .clone()
 }
 
-/// `(id U64 pk, v U64, w U64)` with a secondary index on `v` — every access rung
-/// is reachable from this one table.
+/// `(id U64 pk, v U64, w U64)` with a secondary index on each of `v` and `w` —
+/// every access rung is reachable from this one table, and two indexes are what
+/// makes the arbitration between them observable at all.
 fn seed(client: &mut GnitzClient, sn: &str) {
     exec(
         client,
@@ -51,6 +52,7 @@ fn seed(client: &mut GnitzClient, sn: &str) {
         "CREATE TABLE t (id BIGINT UNSIGNED PRIMARY KEY, v BIGINT UNSIGNED NOT NULL, w BIGINT UNSIGNED NOT NULL)",
     );
     exec(client, sn, "CREATE INDEX t_v ON t (v)");
+    exec(client, sn, "CREATE INDEX t_w ON t (w)");
     exec(
         client,
         sn,
@@ -97,6 +99,55 @@ fn each_where_shape_names_its_access() {
             "{sql}"
         );
     }
+}
+
+/// Which of two indexes serves a WHERE that bounds both. An equality pins its
+/// column outright; a `BETWEEN` only narrows one, however few groups the interval
+/// spans — so the point wins even though the interval constrains two cut sides.
+#[test]
+fn an_equality_outranks_a_between_on_another_index() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut client, sn) = make_planner(&srv);
+    seed(&mut client, &sn);
+
+    assert_eq!(
+        line(
+            &mut client,
+            &sn,
+            "EXPLAIN SELECT id FROM t WHERE v = 10 AND w BETWEEN 1 AND 9",
+            "access:"
+        ),
+        "access: index range on (v) — may be traded for a full scan on low selectivity"
+    );
+}
+
+/// A wide (U128) column has no register in the predicate VM, so a conjunct over
+/// one is servable ONLY by an index walk that consumes it byte-exactly. The
+/// best-ranked bound here is the point on `flag`, whose residual is exactly that
+/// unservable conjunct — so the plan must descend to the next candidate rather
+/// than raise. Failing that, this query has no plan at all.
+#[test]
+fn a_bound_whose_residual_cannot_compile_yields_to_the_next_index() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE wide (id BIGINT UNSIGNED PRIMARY KEY, flag BIGINT UNSIGNED NOT NULL, \
+         big DECIMAL(38,0) NOT NULL)",
+    );
+    exec(&mut client, &sn, "CREATE INDEX wide_flag ON wide (flag)");
+    exec(&mut client, &sn, "CREATE INDEX wide_big ON wide (big)");
+
+    assert_eq!(
+        line(
+            &mut client,
+            &sn,
+            "EXPLAIN SELECT id FROM wide WHERE flag = 1 AND big BETWEEN 100 AND 200",
+            "access:"
+        ),
+        "access: index range on (big) — exact walk, never traded"
+    );
 }
 
 /// A compound PK: an equality on the leading column alone names a key *group* —

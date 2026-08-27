@@ -1939,6 +1939,17 @@ def _pks(results):
     return sorted(row.pk for row in results[0]["rows"])
 
 
+def _access(client, sn, q):
+    """EXPLAIN's `access:` line for `q` — which walk the plan chose. Found by
+    prefix rather than by row position, so adding a plan line cannot silently
+    make this read a different fact."""
+    res = client.execute_sql("EXPLAIN " + q, schema_name=sn)
+    assert res[0]["type"] == "Rows", res[0]
+    got = [r[0] for r in res[0]["rows"] if r[0].startswith("access: ")]
+    assert len(got) == 1, res[0]["rows"]
+    return got[0]
+
+
 class TestCompositeIndex:
     """CREATE INDEX (a, b), full-key and out-of-order WHERE lookups,
     leading-prefix seeks, the nullable-trailing-prefix guard, DROP-INDEX
@@ -1997,10 +2008,14 @@ class TestCompositeIndex:
             client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
             client.execute_sql("CREATE INDEX ON t(a, b, c)", schema_name=sn)
 
-            # With both (a,b) and (a,b,c), WHERE a=1 AND b=200 must still return
-            # the correct row regardless of which index the planner picks.
-            assert _pks(client.execute_sql(
-                "SELECT * FROM t WHERE a = 1 AND b = 200", schema_name=sn)) == [20]
+            # Both indexes pin (a, b) to the same point, so the tie falls to
+            # arity: the narrower (a, b) walk wins — the fact the name claims —
+            # and it returns the right row.
+            q = "SELECT * FROM t WHERE a = 1 AND b = 200"
+            assert _access(client, sn, q) == (
+                "access: index range on (a, b) — may be traded for a full scan "
+                "on low selectivity")
+            assert _pks(client.execute_sql(q, schema_name=sn)) == [20]
         finally:
             _drop_all(client, sn, tables=["t"])
 
@@ -2303,6 +2318,62 @@ def _result_rows(result):
     SELECT Rows result (positive weight only)."""
     assert result[0]["type"] == "Rows"
     return sorted(tuple(row) for row in result[0]["rows"])
+
+
+class TestPkColumnIndex:
+    """A secondary index may name a PK column, and the planner treats it as any
+    other index column. Both shapes below have no PK-range plan — the WHERE
+    leaves the LEADING PK column free — and the second has no index-free plan
+    either, so the index walk is the only plan it has."""
+
+    _CREATE = (
+        "CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+        "v BIGINT NOT NULL, PRIMARY KEY (a, b))"
+    )
+
+    def test_index_over_a_trailing_pk_column_serves_the_where(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE, schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 100), (2, 10, 200), (3, 20, 300)",
+                schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(b, v)", schema_name=sn)
+
+            # An equality on the index's leading column (a PK column) pins it,
+            # and `v` completes the key.
+            q = "SELECT * FROM t WHERE b = 10 AND v = 200"
+            assert _access(client, sn, q).startswith("access: index range on (b, v)")
+            assert _result_rows(client.execute_sql(q, schema_name=sn)) == [(2, 10, 200)]
+
+            # A range on the same column bounds the same index.
+            assert _result_rows(client.execute_sql(
+                "SELECT * FROM t WHERE b > 10", schema_name=sn)) == [(3, 20, 300)]
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_wide_literal_on_an_indexed_pk_column_is_servable(self, client):
+        """The literal overflows i64, so the predicate VM has no form for the
+        conjunct: only an index walk that consumes it byte-exactly can serve
+        this WHERE, and the PK rung cannot bound it (nothing pins `a`)."""
+        u64_max = 18446744073709551615
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(self._CREATE, schema_name=sn)
+            client.execute_sql(
+                f"INSERT INTO t VALUES (1, {u64_max}, 100), (2, 5, 200)",
+                schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(b)", schema_name=sn)
+
+            q = f"SELECT * FROM t WHERE b = {u64_max}"
+            assert _access(client, sn, q) == (
+                "access: index range on (b) — exact walk, never traded")
+            assert _result_rows(client.execute_sql(q, schema_name=sn)) == [
+                (1, u64_max, 100)]
+        finally:
+            _drop_all(client, sn, tables=["t"])
 
 
 class TestIndexRangeSql:

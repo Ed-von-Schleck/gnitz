@@ -141,6 +141,20 @@ impl RangeDescriptor {
         matches!((self.start, self.end), (Cut::Before(a), Cut::After(b)) if a == b)
     }
 
+    /// True iff this descriptor pins every column of an `n_cols`-column key
+    /// list: a point whose equality prefix plus its own range column cover the
+    /// whole list, so it names one key group and nothing wider.
+    pub fn pins_all(&self, n_cols: usize) -> bool {
+        self.is_point() && self.n_eq + 1 == n_cols
+    }
+
+    /// True iff this descriptor pins no column at all — no equality prefix, and a
+    /// range column left as an interval rather than one value. Such a walk is
+    /// bounded but names no key group, so it can cover the whole relation.
+    pub fn pins_none(&self) -> bool {
+        self.n_eq == 0 && !self.is_point()
+    }
+
     /// The equality-pinned leading values; the range column sits right after
     /// them at index position `eq_vals().len()`.
     pub fn eq_vals(&self) -> &[u128] {

@@ -6,7 +6,9 @@
 //! and recognition itself lives in the `access` leaf. `select` and `mutate` sink
 //! into this module; it never references either.
 
-use crate::access::{best_index_bound, pk_point_tuple, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate};
+use crate::access::{
+    pk_point_tuple, ranked_index_bounds, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate,
+};
 use crate::ast_util::expr_usize_literal;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
@@ -181,18 +183,18 @@ pub(crate) fn bound_and_predicate<'e>(
     // every column of a UNIQUE index is available: that admits one row where an
     // unpinned PK range admits the table.
     if let Some((desc, residual)) = try_extract_pk_range(bound_where, schema) {
-        // Only a descriptor that pins nothing is worth giving up: one that pins a
-        // leading PK column can share the distribution prefix and unicast to one
-        // worker (an `IndexRange` never does), and a full-PK point already admits
-        // one row. Whether an index can actually beat it is the `is_unique_point`
-        // filter below — the one place that question is answered.
-        if desc.eq_vals().is_empty() && !desc.is_point() {
+        // A descriptor pinning nothing is the only one worth giving up: the ladder
+        // bets that a pinned leading PK column shares the distribution prefix and
+        // unicasts, which holds only under a `CLUSTER BY` shorter than the PK.
+        if desc.pins_none() {
             // The index arm re-imposes more of the WHERE than the PK arm's
-            // residual, so it can need a conjunct the VM refuses (a wide literal,
-            // a U128 column) that the PK walk consumes byte-exactly. Keep the PK
-            // walk instead of failing the query; an uncompilable residual still
-            // raises below.
-            if let Some(c) = best_index_bound(bound_where, schema, indexes).filter(|c| c.is_unique_point()) {
+            // residual, so a conjunct the VM refuses (a wide literal, a U128
+            // column) can sink it; keep the PK walk rather than fail the query.
+            if let Some(c) = ranked_index_bounds(bound_where, schema, indexes)
+                .into_iter()
+                .next()
+                .filter(|c| c.is_unique_point())
+            {
                 if let Some(p) = if_supported(index_plan(c, bound_where, schema))? {
                     return Ok(p);
                 }
@@ -201,9 +203,13 @@ pub(crate) fn bound_and_predicate<'e>(
         return AccessPlan::new(ReadBound::PkRange(desc), where_expr, residual, schema);
     }
 
-    // The best secondary-index bound, keeping its residual.
-    if let Some(c) = best_index_bound(bound_where, schema, indexes) {
-        return index_plan(c, bound_where, schema);
+    // Most-constrained first, and the first whose plan compiles wins: the tightest
+    // bound is not servable if its leftover conjunct has no compiled form, where a
+    // looser candidate consumes that same conjunct byte-exactly.
+    for c in ranked_index_bounds(bound_where, schema, indexes) {
+        if let Some(p) = if_supported(index_plan(c, bound_where, schema))? {
+            return Ok(p);
+        }
     }
 
     AccessPlan::new(ReadBound::None, where_expr, vec![bound_where], schema)
@@ -476,11 +482,9 @@ mod tests {
             assert_eq!(shape(&plan.access.bound), want, "{sql}: {why}");
         }
 
-        // A pinned *leading* PK column can share the distribution prefix and
-        // unicast to one worker (`PRIMARY KEY (tenant, id) CLUSTER BY (tenant)`),
-        // which an `IndexRange` never does — so it keeps the PK walk even with a
-        // unique point on offer. True regardless of `dist_prefix_len`, which the
-        // client cannot see.
+        // A descriptor pinning any PK column keeps the PK walk, unique point on
+        // offer or not — the client cannot see `dist_prefix_len`, so the ladder
+        // bets on the `CLUSTER BY` unicast rather than measuring it.
         let compound = Schema {
             columns: vec![
                 col_def("tenant", TypeCode::U64, false),

@@ -7,7 +7,7 @@
 use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
-use crate::codec::pk_codec::pack_pk_value;
+use crate::codec::pk_codec::{bound_num_literal, pack_pk_value, NumLit};
 use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::overlay::{buffered_net, present_rows};
 use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, AccessPlan, ReadBudget};
@@ -16,7 +16,7 @@ use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
 use crate::exec::residual::matching_indices;
 use crate::expr_lower::compile_scalar_evaluator;
-use crate::ir::{BoundExpr, UnaryOp};
+use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::null_word_set;
 use gnitz_core::{
@@ -70,7 +70,7 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
     // the wide ones the VM cannot lower — so a literal past `i64::MAX` writes
     // (SET reaches the upper half of U64) and an out-of-range one is caught by
     // the range check below, before any row is read.
-    let p = if let Some(v) = const_int_literal(expr) {
+    let p = if let Some(v) = bound_num_literal(expr).and_then(NumLit::to_i128) {
         SetProgram::Const(ColumnValue::Int(v))
     } else {
         match expr {
@@ -108,26 +108,6 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
         }
     }
     Ok(p)
-}
-
-/// A bound integer literal's value, sign applied — `LitInt` or the wide
-/// `LitWide` digit string, each optionally under an outer `Neg`. The SET path's
-/// half of the literal seam `access::bound_num_literal` holds for seeks. Every
-/// SET-admissible column is ≤ 8 bytes wide, so the whole accepted domain fits
-/// `i128`; a magnitude that does not (only a `U128`/`UUID` literal, which no SET
-/// target admits) declines here and is rejected as an un-lowerable RHS.
-fn const_int_literal(e: &BoundExpr) -> Option<i128> {
-    fn magnitude(e: &BoundExpr) -> Option<i128> {
-        match e {
-            BoundExpr::LitInt(v) => Some(*v as i128),
-            BoundExpr::LitWide(s) => s.parse::<i128>().ok(),
-            _ => None,
-        }
-    }
-    match e {
-        BoundExpr::UnaryOp(UnaryOp::Neg, inner) => magnitude(inner).map(|v| -v),
-        e => magnitude(e),
-    }
 }
 
 /// Read one SET RHS for `row` of the batch `view` presents. Infallible: every

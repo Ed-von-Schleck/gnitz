@@ -28,7 +28,7 @@ use super::chain::{EmitPieces, ViewChain};
 use super::physical;
 use super::JoinType;
 use super::{ColId, HirExpr, HirRef, ProjEntry, RelExpr};
-use crate::access::best_index_bound;
+use crate::access::ranked_index_bounds;
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use gnitz_core::{ColumnDef, RelDescriptor, Schema};
@@ -543,8 +543,14 @@ pub(crate) fn extract_scan_bound(folded: &Option<crate::ir::BoundExpr>, src: &Se
     let (Some(f), Some(desc)) = (folded, src.desc.as_ref()) else {
         return None;
     };
-    best_index_bound(f, &src.schema, &desc.indexes).map(|c| ScanBound {
-        idx_cols: c.idx_cols,
-        desc: c.desc,
-    })
+    // The head candidate outright: this path compiles no residual — the `Filter`
+    // is emitted verbatim either way — so there is nothing a later candidate
+    // could express that the best-ranked one cannot.
+    ranked_index_bounds(f, &src.schema, &desc.indexes)
+        .into_iter()
+        .next()
+        .map(|c| ScanBound {
+            idx_cols: c.idx_cols,
+            desc: c.desc,
+        })
 }

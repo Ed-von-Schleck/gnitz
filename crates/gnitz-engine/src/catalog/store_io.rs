@@ -323,7 +323,7 @@ impl CatalogEngine {
         let (&last, eq) = natives
             .split_last()
             .ok_or_else(|| "seek_by_index: no key values supplied".to_string())?;
-        let range = gnitz_wire::RangeDescriptor::new(eq, gnitz_wire::Cut::Before(last), gnitz_wire::Cut::After(last));
+        let range = gnitz_wire::RangeDescriptor::point(eq, last);
         self.seek_by_index_range(table_id, col_indices, &range)
     }
 
