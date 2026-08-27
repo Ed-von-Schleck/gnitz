@@ -1,6 +1,6 @@
 //! The descriptive bytes of a WAL block: its 32-byte header (outside the block's
 //! own checksum, so only the exact region-size relations constrain it) and the
-//! control block (checksummed but never verified until now).
+//! control block, whose own checksum this file exercises.
 
 use crate::runtime::sal::GroupTargets;
 use crate::runtime::wire::{
@@ -69,29 +69,8 @@ fn data_block_count_forgeries_are_rejected() {
     );
 }
 
-/// The shape every `FLAG_DDL_SYNC` group and every single-row `INSERT` takes:
-/// `COUNT 1 -> 0` is one bit, and the row's bytes are still in the block.
-#[test]
-fn one_row_data_block_count_zero_is_rejected() {
-    let (schema, clean) = data_block(&[(42, 1, 99)]);
-    assert_eq!(
-        Batch::decode_from_wal_block(&clean, &schema, true)
-            .map(|(b, _)| b.count)
-            .ok(),
-        Some(1)
-    );
-    let mut buf = clean;
-    // Bit 0 of COUNT: 1 -> 0.
-    buf[WAL_OFF_COUNT] ^= 1;
-    assert_eq!(
-        Batch::decode_from_wal_block(&buf, &schema, true).err(),
-        Some("data WAL region size mismatch"),
-        "a single-bit COUNT 1 -> 0 flip must not decode as an empty block"
-    );
-}
-
-/// A genuinely empty block still round-trips — the case the deleted `n == 0`
-/// short-circuit existed to serve.
+/// A genuinely empty block round-trips: `count == 0` is a legitimate block, not
+/// the forgery above.
 #[test]
 fn empty_data_block_still_decodes() {
     let schema = make_schema_u64_i64();
@@ -205,54 +184,18 @@ fn wire_frame(schema: &SchemaDescriptor, batch: &Batch, flags: u64) -> Vec<u8> {
         data: WireData::Whole(Some(batch)),
         ..Default::default()
     };
-    let mut buf = vec![0u8; msg.size()];
-    msg.encode(&mut buf, 0);
-    buf
-}
-
-/// `decode_wire_body` routes on `FLAG_HAS_DATA`, so clearing it returns `Ok`
-/// with no batch and a committed push slot's rows vanish silently. Only the
-/// control block's own checksum catches it: `Ok` with no batch is the legitimate
-/// reading of every row-less slot, so the shape itself cannot be made fatal.
-#[test]
-fn a_cleared_flag_has_data_bit_is_an_error_not_an_empty_slot() {
-    let schema = make_schema_u64_i64();
-    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-    let marker: u64 = 0x0BAD_C0DE_0000_0000;
-    let clean = wire_frame(&schema, &batch, marker);
-    assert_eq!(
-        crate::runtime::wire::decode_wire(&clean)
-            .expect("clean frame")
-            .data_batch
-            .map(|b| b.count),
-        Some(2)
-    );
-
-    // The encoder ORs FLAG_HAS_SCHEMA / FLAG_HAS_DATA / the layout bits onto the
-    // marker, so locate the cell by the value actually written.
-    let flags_cell = {
-        let ctrl = &clean[..CTRL_BLOCK_SIZE_NO_BLOB];
-        (WAL_HEADER_SIZE..CTRL_BLOCK_SIZE_NO_BLOB - 8)
-            .find(|&off| {
-                let v = u64::from_le_bytes(ctrl[off..off + 8].try_into().unwrap());
-                v & marker == marker
-            })
-            .expect("flags cell present")
-    };
-
-    let mut forged = clean;
-    let cleared = u64::from_le_bytes(forged[flags_cell..flags_cell + 8].try_into().unwrap()) & !(1u64 << 49);
-    forged[flags_cell..flags_cell + 8].copy_from_slice(&cleared.to_le_bytes());
-    assert_eq!(
-        crate::runtime::wire::decode_wire(&forged).err(),
-        Some("control block checksum mismatch"),
-        "clearing FLAG_HAS_DATA must be an error, not a silently row-less slot"
-    );
+    msg.encode_to_vec()
 }
 
 /// Every descriptive byte of the control block — `seek_pk`, `seek_col_idx`,
 /// `request_id`, `target_id`, `client_id`, `status`, the layout bits, the
 /// directory — is covered by one sweep over the checksummed span.
+///
+/// `FLAG_HAS_DATA` is the costliest bit in that span: `decode_wire_body` routes
+/// on it, so clearing it returns `Ok` with no batch and a committed push slot's
+/// rows vanish silently. Nothing but the checksum can catch that — `Ok` with no
+/// batch is the legitimate reading of every row-less slot, so the shape itself
+/// cannot be made fatal.
 #[test]
 fn every_single_bit_flip_in_the_control_block_body_is_rejected() {
     let schema = make_schema_u64_i64();
@@ -351,7 +294,7 @@ fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
         .expect("slot 0 carries bytes");
     crate::runtime::wire::decode_wire(slot).expect("the fast path's slot must verify");
 
-    // And a flipped control byte in that slot is now detected.
+    // A flipped control byte in that slot fails the same checksum.
     let mut forged = slot.to_vec();
     forged[WAL_HEADER_SIZE] ^= 1;
     assert!(

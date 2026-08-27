@@ -10,10 +10,6 @@ use gnitz_engine_testkit::{sweep_bit_flips, SharedRegion};
 use gnitz_wire::align8;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 
-fn make_test_data(val: u8, len: usize) -> Vec<u8> {
-    vec![val; len]
-}
-
 /// The group `worker` reads at `base` and the cursor past it, or a panic if the
 /// bytes are not a group.
 unsafe fn group_at(ptr: *const u8, base: u64, worker: u32, size: usize) -> (SalMessage<'static>, u64) {
@@ -28,19 +24,29 @@ unsafe fn epoch_at(ptr: *const u8, base: u64, size: usize) -> u32 {
     sal_probe_header(ptr, base, size as u64).expect("header verifies").1
 }
 
+/// Reap `pid` and require a clean exit. A forked child that panics unwinds into
+/// a copy of the test harness whose main thread no longer exists, so without
+/// this the parent's own assertions are the only thing standing between a
+/// broken child and a green test.
+unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
+    let mut status = 0i32;
+    while libc::waitpid(pid, &mut status, 0) < 0 {
+        assert_eq!(*libc::__errno_location(), libc::EINTR, "waitpid failed on child {pid}");
+    }
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "child {pid} did not exit cleanly (status {status:#x})"
+    );
+}
+
 #[test]
-fn test_sal_round_trip() {
+fn sal_round_trip() {
     unsafe {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
 
-        let bufs: Vec<Vec<u8>> = vec![
-            make_test_data(0xAA, 100),
-            vec![],
-            make_test_data(0xBB, 200),
-            make_test_data(0xCC, 50),
-        ];
+        let bufs: Vec<Vec<u8>> = vec![vec![0xAA; 100], vec![], vec![0xBB; 200], vec![0xCC; 50]];
 
         let payloads: Vec<&[u8]> = bufs.iter().map(|b| b.as_slice()).collect();
         let new_cursor = sal_write_group(ptr, 0, 42, 100, 0, 1, size as u64, &payloads).expect("group fits");
@@ -63,29 +69,7 @@ fn test_sal_round_trip() {
 }
 
 #[test]
-fn test_sal_unicast_isolation() {
-    unsafe {
-        let size = 1 << 20;
-        let region = SharedRegion::new(size);
-        let ptr = region.ptr();
-
-        let buf = make_test_data(0xDD, 128);
-        let payloads: [&[u8]; 4] = [&[], &[], &buf, &[]];
-
-        sal_write_group(ptr, 0, 10, 1, 0, 1, size as u64, &payloads).expect("group fits");
-
-        for w in [0u32, 1, 3] {
-            let (rr, next) = group_at(ptr, 0, w, size);
-            assert!(rr.wire_data.is_none(), "no data slot for worker {w}");
-            assert!(next > 0);
-        }
-        let (rr, _) = group_at(ptr, 0, 2, size);
-        assert_eq!(rr.wire_data.expect("data slot"), buf.as_slice());
-    }
-}
-
-#[test]
-fn test_sal_multiple_groups() {
+fn sal_multiple_groups() {
     unsafe {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
@@ -93,7 +77,7 @@ fn test_sal_multiple_groups() {
 
         let mut cursor = 0u64;
         for g in 0..3u64 {
-            let buf = make_test_data((g + 1) as u8, 64);
+            let buf = vec![(g + 1) as u8; 64];
             let payloads: [&[u8]; 2] = [&buf, &[]];
             cursor = sal_write_group(ptr, cursor, g as u32, g * 10, 0, 1, size as u64, &payloads).expect("group fits");
         }
@@ -114,22 +98,7 @@ fn test_sal_multiple_groups() {
 }
 
 #[test]
-fn test_sal_epoch_write_read() {
-    unsafe {
-        let size = 1 << 20;
-        let region = SharedRegion::new(size);
-        let ptr = region.ptr();
-
-        let buf = make_test_data(0x11, 32);
-        sal_write_group(ptr, 0, 0, 0, 0, 42, size as u64, &[&buf]).expect("group fits");
-
-        group_at(ptr, 0, 0, size);
-        assert_eq!(epoch_at(ptr, 0, size), 42);
-    }
-}
-
-#[test]
-fn test_sal_full_error() {
+fn sal_full_error() {
     unsafe {
         // Sized off the ordinary cap, not off the raw mapping: with a bare 256-byte
         // region the reserve alone would refuse the group and the size arithmetic
@@ -139,7 +108,7 @@ fn test_sal_full_error() {
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
 
-        let buf = make_test_data(0xFF, payload);
+        let buf = vec![0xFF; payload];
         assert!(
             sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &[&buf]).is_none(),
             "a group overrunning the ordinary cap must be rejected"
@@ -148,7 +117,7 @@ fn test_sal_full_error() {
 }
 
 #[test]
-fn test_sal_cross_process() {
+fn sal_cross_process() {
     unsafe {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
@@ -156,40 +125,42 @@ fn test_sal_cross_process() {
         let efd = posix::eventfd_create();
         assert!(efd >= 0);
 
+        // Built before the fork: the child inherits the bytes copy-on-write and
+        // never allocates between `fork` and `_exit`.
+        let buf = vec![0x77u8; 128];
+
         let pid = libc::fork();
         if pid == 0 {
-            let buf = make_test_data(0x77, 128);
             sal_write_group(ptr, 0, 99, 555, 0, 1, size as u64, &[&buf]).expect("group fits");
             posix::eventfd_signal(efd);
             libc::_exit(0);
         }
 
-        let r = posix::eventfd_wait(efd, 5000);
-        assert!(r > 0, "eventfd timed out");
+        assert!(posix::eventfd_wait(efd, 5000) > 0, "child never signalled");
 
         let (rr, _) = group_at(ptr, 0, 0, size);
         assert_eq!(rr.lsn, 555);
         assert_eq!(rr.target_id, 99);
-        assert_eq!(rr.wire_data.expect("data slot"), vec![0x77u8; 128].as_slice());
+        assert_eq!(rr.wire_data.expect("data slot"), buf.as_slice());
 
-        let mut status = 0i32;
-        libc::waitpid(pid, &mut status, 0);
+        assert_child_exited_ok(pid);
         libc::close(efd);
     }
 }
 
 #[test]
-fn test_sal_checkpoint_reset() {
+fn sal_checkpoint_reset() {
     unsafe {
-        let size = 1 << 20;
+        // Small: the whole region is zeroed below, and that memset is the test.
+        let size = 128 << 10;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
 
-        let buf1 = make_test_data(0x11, 32);
+        let buf1 = vec![0x11; 32];
         sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &[&buf1]).expect("group fits");
 
         std::ptr::write_bytes(ptr, 0, size);
-        let buf2 = make_test_data(0x22, 32);
+        let buf2 = vec![0x22; 32];
         sal_write_group(ptr, 0, 0, 0, 0, 2, size as u64, &[&buf2]).expect("group fits");
 
         let (rr, _) = group_at(ptr, 0, 0, size);
@@ -209,12 +180,12 @@ fn a_group_hides_the_slots_of_a_wider_group_at_the_same_offset() {
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
         // An 8-worker group leaves a fully populated directory at offset 0.
-        let wide: Vec<Vec<u8>> = (0..8).map(|i| make_test_data(0xA0 + i as u8, 64)).collect();
+        let wide: Vec<Vec<u8>> = (0..8).map(|i| vec![0xA0 + i as u8; 64]).collect();
         let wide_refs: Vec<&[u8]> = wide.iter().map(|b| b.as_slice()).collect();
         sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &wide_refs).expect("group fits");
 
         // The same offset rewritten by a 2-worker topology.
-        let narrow = [make_test_data(0x11, 32), make_test_data(0x22, 32)];
+        let narrow = [vec![0x11; 32], vec![0x22; 32]];
         let narrow_refs: Vec<&[u8]> = narrow.iter().map(|b| b.as_slice()).collect();
         sal_write_group(ptr, 0, 0, 0, 0, 2, size as u64, &narrow_refs).expect("group fits");
 
@@ -349,13 +320,13 @@ fn terminal_and_sentinel_fit_where_an_ordinary_group_does_not() {
 }
 
 #[test]
-fn test_sal_epoch_fence() {
+fn sal_epoch_fence() {
     unsafe {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
 
-        let buf = make_test_data(0x33, 32);
+        let buf = vec![0x33; 32];
         let c1 = sal_write_group(ptr, 0, 0, 0, 0, 5, size as u64, &[&buf]).expect("group fits");
         sal_write_group(ptr, c1, 0, 0, 0, 6, size as u64, &[&buf]).expect("group fits");
 
@@ -367,7 +338,7 @@ fn test_sal_epoch_fence() {
 }
 
 #[test]
-fn test_commit_sentinel_round_trip() {
+fn commit_sentinel_round_trip() {
     // Two groups at lsn=K, the writer's own sentinel at lsn=K, then a group at
     // lsn=K+1: on read-back the sentinel must be the only one carrying
     // FLAG_TXN_COMMIT. Framing only; the zone rule is `sal::zone`'s.
@@ -377,7 +348,7 @@ fn test_commit_sentinel_round_trip() {
         let ptr = region.ptr();
 
         // Two normal groups at the same LSN.
-        let buf = make_test_data(0xAA, 32);
+        let buf = vec![0xAA; 32];
         let payloads: [&[u8]; 2] = [&buf, &buf];
         let c1 = sal_write_group(ptr, 0, 100, 7, 0, 1, size as u64, &payloads).expect("group fits");
         let c2 = sal_write_group(ptr, c1, 101, 7, 0, 1, size as u64, &payloads).expect("group fits");
@@ -409,142 +380,56 @@ fn test_commit_sentinel_round_trip() {
     }
 }
 
+/// A zone as the committer writes one: two broadcast groups and a closing
+/// sentinel at a single LSN. From *every* worker's slot all three read back that
+/// LSN, the caller's own flags survive on the groups that carried them, and only
+/// the sentinel carries `FLAG_TXN_COMMIT` and no payload. Framing only — the
+/// recovery verdict over a zone is `sal::zone`'s.
 #[test]
-fn test_commit_sentinel_zero_payload() {
-    // The sentinel must produce wire_data=None for every worker — it is
-    // a header-only group and must not be misread as a DDL_SYNC batch.
-    let size = 1 << 20;
-    let region = SharedRegion::new(size);
-    let ptr = region.ptr();
-
-    let writer = SalWriter::new(ptr, -1, size as u64, 4);
-    writer.reset(0, 1);
-    writer.write_commit_sentinel(123).unwrap();
-
-    for w in 0..4 {
-        let reader = SalReader::for_walk(ptr as *const u8, w, size);
-        let (msg, _) = reader.try_read(0, EpochGate::Any).unwrap();
-        assert_eq!(msg.lsn, 123);
-        assert!(
-            msg.wire_data.is_none(),
-            "sentinel must carry no per-worker payload for worker {w}"
-        );
-    }
-}
-
-#[test]
-fn test_batched_push_shares_zone_lsn() {
-    // Framing only: two pipelined pushes at one zone LSN are three SAL groups —
-    // push, push, sentinel — and each carries its LSN and flags back. These groups
-    // have no `FLAG_ZONE_START`, so the recovery verdict over them is not asserted
-    // here; the zone rules are `sal::zone`'s.
+fn zone_two_groups_one_sentinel() {
     use crate::runtime::sal::FLAG_PUSH;
     unsafe {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
         let nw = 4u32;
-        let zone_lsn = 42u64;
-
-        let payload = make_test_data(0xDD, 64);
-        let payloads: Vec<&[u8]> = (0..nw).map(|_| payload.as_slice()).collect();
-        // Two push groups at the same LSN.
-        let c1 = sal_write_group(ptr, 0, 1000, zone_lsn, FLAG_PUSH, 1, size as u64, &payloads).expect("group fits");
-        let c2 = sal_write_group(ptr, c1, 1001, zone_lsn, FLAG_PUSH, 1, size as u64, &payloads).expect("group fits");
-
-        // Closing sentinel.
-        let writer = SalWriter::new(ptr, -1, size as u64, nw as usize);
-        writer.reset(c2, 1);
-        writer.write_commit_sentinel(zone_lsn).unwrap();
-
-        let reader = SalReader::for_walk(ptr as *const u8, 0, size);
-        let (m1, c1) = reader.try_read(0, EpochGate::Any).unwrap();
-        let (m2, c2) = reader.try_read(c1, EpochGate::Any).unwrap();
-        let (m3, _) = reader.try_read(c2, EpochGate::Any).unwrap();
-        assert_eq!(m1.lsn, zone_lsn);
-        assert_eq!(m2.lsn, zone_lsn);
-        assert_eq!(m3.lsn, zone_lsn);
-        assert_eq!(m1.flags & FLAG_PUSH, FLAG_PUSH);
-        assert_eq!(m2.flags & FLAG_PUSH, FLAG_PUSH);
-        assert_eq!(m3.flags & FLAG_TXN_COMMIT, FLAG_TXN_COMMIT);
-    }
-}
-
-#[test]
-fn test_zone_two_groups_one_sentinel() {
-    // The per-slot half of the same framing, over a CREATE TABLE's shape: from
-    // *every* worker's slot, two broadcasts and a sentinel at one LSN read back
-    // that LSN, and only the sentinel carries FLAG_TXN_COMMIT and no payload.
-    unsafe {
-        let size = 1 << 20;
-        let region = SharedRegion::new(size);
-        let ptr = region.ptr();
-        let nw = 4u32;
-
-        let buf_col = make_test_data(0xC0, 64);
-        let buf_tab = make_test_data(0x7A, 96);
         let zone_lsn = 17u64;
 
-        // Group 1: COL_TAB rows.
-        let payloads_col: Vec<&[u8]> = (0..nw).map(|_| buf_col.as_slice()).collect();
-        let c1 = sal_write_group(ptr, 0, 200, zone_lsn, 0, 1, size as u64, &payloads_col).expect("group fits");
+        // Two groups at one LSN, carrying a caller flag the reader must hand back.
+        let buf_a = vec![0xC0u8; 64];
+        let payloads_a: Vec<&[u8]> = (0..nw).map(|_| buf_a.as_slice()).collect();
+        let c1 = sal_write_group(ptr, 0, 200, zone_lsn, FLAG_PUSH, 1, size as u64, &payloads_a).expect("group fits");
 
-        // Group 2: TABLE_TAB row, same LSN.
-        let payloads_tab: Vec<&[u8]> = (0..nw).map(|_| buf_tab.as_slice()).collect();
-        let c2 = sal_write_group(ptr, c1, 201, zone_lsn, 0, 1, size as u64, &payloads_tab).expect("group fits");
+        let buf_b = vec![0x7Au8; 96];
+        let payloads_b: Vec<&[u8]> = (0..nw).map(|_| buf_b.as_slice()).collect();
+        let c2 = sal_write_group(ptr, c1, 201, zone_lsn, FLAG_PUSH, 1, size as u64, &payloads_b).expect("group fits");
 
-        // Sentinel.
         let writer = SalWriter::new(ptr, -1, size as u64, nw as usize);
         writer.reset(c2, 1);
         writer.write_commit_sentinel(zone_lsn).unwrap();
 
-        // Walk on every worker's perspective; assert zone shape.
         for w in 0..nw {
             let reader = SalReader::for_walk(ptr as *const u8, w, size);
             let (m1, c1) = reader.try_read(0, EpochGate::Any).unwrap();
             let (m2, c2) = reader.try_read(c1, EpochGate::Any).unwrap();
             let (m3, _) = reader.try_read(c2, EpochGate::Any).unwrap();
-            assert_eq!(m1.lsn, zone_lsn);
-            assert_eq!(m2.lsn, zone_lsn);
-            assert_eq!(m3.lsn, zone_lsn);
+            assert_eq!((m1.lsn, m2.lsn, m3.lsn), (zone_lsn, zone_lsn, zone_lsn));
+            assert_eq!(m1.target_id, 200);
+            assert_eq!(m2.target_id, 201);
+            assert_eq!(m1.flags & FLAG_PUSH, FLAG_PUSH, "worker {w}");
+            assert_eq!(m2.flags & FLAG_PUSH, FLAG_PUSH, "worker {w}");
             assert_eq!(m1.flags & FLAG_TXN_COMMIT, 0);
             assert_eq!(m2.flags & FLAG_TXN_COMMIT, 0);
             assert_eq!(m3.flags & FLAG_TXN_COMMIT, FLAG_TXN_COMMIT);
-            assert!(m1.wire_data.is_some(), "first DDL group has data");
-            assert!(m2.wire_data.is_some(), "second DDL group has data");
-            assert!(m3.wire_data.is_none(), "sentinel carries no data");
+            assert!(m1.wire_data.is_some(), "first group has data");
+            assert!(m2.wire_data.is_some(), "second group has data");
+            assert!(m3.wire_data.is_none(), "sentinel carries no payload");
         }
     }
 }
 
 #[test]
-fn test_two_groups_same_lsn() {
-    // Phase 1 invariant: the SAL writer accepts whatever LSN the caller
-    // supplies — it no longer owns a counter. Two groups written at the
-    // same LSN must both carry it on read-back. Phase 3 builds a zone on
-    // top of this: multiple groups + a sentinel, all sharing one LSN.
-    unsafe {
-        let size = 1 << 20;
-        let region = SharedRegion::new(size);
-        let ptr = region.ptr();
-
-        let buf1 = make_test_data(0x10, 32);
-        let c1 = sal_write_group(ptr, 0, 7, 42, 0, 1, size as u64, &[&buf1]).expect("group fits");
-
-        let buf2 = make_test_data(0x20, 32);
-        sal_write_group(ptr, c1, 8, 42, 0, 1, size as u64, &[&buf2]).expect("group fits");
-
-        let (rr1, next) = group_at(ptr, 0, 0, size);
-        let (rr2, _) = group_at(ptr, next, 0, size);
-        assert_eq!(rr1.lsn, 42);
-        assert_eq!(rr2.lsn, 42);
-        assert_eq!(rr1.target_id, 7);
-        assert_eq!(rr2.target_id, 8);
-    }
-}
-
-#[test]
-fn test_sal_cross_process_checkpoint() {
+fn sal_cross_process_checkpoint() {
     unsafe {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
@@ -553,40 +438,46 @@ fn test_sal_cross_process_checkpoint() {
         let efd2 = posix::eventfd_create();
         assert!(efd >= 0 && efd2 >= 0);
 
+        // Both payloads exist before the fork, so the child allocates nothing.
+        let buf = vec![0xAAu8; 64];
+        let buf2 = vec![0xBBu8; 64];
+
         let pid = libc::fork();
         if pid == 0 {
-            let buf = make_test_data(0xAA, 64);
             sal_write_group(ptr, 0, 0, 10, 0, 1, size as u64, &[&buf]).expect("group fits");
             posix::eventfd_signal(efd);
 
-            posix::eventfd_wait(efd2, 5000);
+            // Wait for the parent to finish reading round 1 before zeroing the
+            // region under it.
+            if posix::eventfd_wait(efd2, 5000) <= 0 {
+                libc::_exit(1);
+            }
 
             std::ptr::write_bytes(ptr, 0, size);
-            let buf2 = make_test_data(0xBB, 64);
             sal_write_group(ptr, 0, 0, 20, 0, 2, size as u64, &[&buf2]).expect("group fits");
             posix::eventfd_signal(efd);
             libc::_exit(0);
         }
 
-        posix::eventfd_wait(efd, 5000);
+        assert!(posix::eventfd_wait(efd, 5000) > 0, "round 1 never signalled");
         let (rr1, _) = group_at(ptr, 0, 0, size);
         assert_eq!(epoch_at(ptr, 0, size), 1);
         assert_eq!(rr1.lsn, 10);
         posix::eventfd_signal(efd2);
 
-        posix::eventfd_wait(efd, 5000);
+        assert!(posix::eventfd_wait(efd, 5000) > 0, "round 2 never signalled");
         let (rr2, _) = group_at(ptr, 0, 0, size);
         assert_eq!(epoch_at(ptr, 0, size), 2);
         assert_eq!(rr2.lsn, 20);
 
-        let mut status = 0i32;
-        libc::waitpid(pid, &mut status, 0);
+        assert_child_exited_ok(pid);
         libc::close(efd);
+        libc::close(efd2);
     }
 }
 
 #[test]
-fn test_sal_prefix_epoch_gate() {
+fn sal_prefix_epoch_gate() {
     // The reader-side epoch gate: the group's (epoch << 32 | payload_size)
     // prefix is checked BEFORE any header byte is read. A mismatched
     // expectation parks the reader (no message, cursor unmoved); a matching
@@ -596,7 +487,7 @@ fn test_sal_prefix_epoch_gate() {
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
 
-        let buf = make_test_data(0x5A, 48);
+        let buf = vec![0x5A; 48];
         let new_cursor = sal_write_group(ptr, 0, 7, 11, 0, 1, size as u64, &[&buf]).expect("group fits");
 
         let reader = SalReader::new(ptr as *const u8, 0, size, -1, 1);
@@ -626,12 +517,13 @@ fn test_sal_prefix_epoch_gate() {
 }
 
 #[test]
-fn test_sal_prefix_packing_boundaries() {
+fn sal_prefix_packing_boundaries() {
     // The (epoch << 32 | payload_size) prefix word must round-trip at the
     // boundaries: a one-slot group with no data (payload_size == its header
     // size) at epoch u32::MAX, and a multi-MiB group at epoch 1.
     unsafe {
-        let size = 8 << 20;
+        // The 3 MiB group plus the reserve; nothing here needs more.
+        let size = 4 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
 
@@ -646,9 +538,10 @@ fn test_sal_prefix_packing_boundaries() {
         assert_eq!(next, (8 + group_header_size(1)) as u64);
         assert_eq!(new_cursor, next);
 
-        // Multi-MiB group, epoch 1.
-        std::ptr::write_bytes(ptr, 0, size);
-        let big = make_test_data(0xEE, 3 << 20);
+        // Multi-MiB group, epoch 1. Only the first group's bytes need clearing —
+        // the one written over them is strictly larger.
+        std::ptr::write_bytes(ptr, 0, 8 + group_header_size(1));
+        let big = vec![0xEEu8; 3 << 20];
         sal_write_group(ptr, 0, 0, 0, 0, 1, size as u64, &[&big]).expect("group fits");
         let expected_payload = group_header_size(1) + (3 << 20); // 3 MiB is already 8-aligned
         let word = atomic_load_u64(ptr);
@@ -726,7 +619,7 @@ unsafe fn assert_footprint_exact(
 }
 
 #[test]
-fn test_scatter_group_footprint_wire_safe_partitioned_and_empty_slots() {
+fn scatter_group_footprint_wire_safe_partitioned_and_empty_slots() {
     // A small partitioned batch over 4 workers leaves some worker slots empty
     // (schema-only), exercising the count-0 branch of the closed form.
     use gnitz_engine_testkit::{make_batch, make_schema_u64_i64};
@@ -736,7 +629,7 @@ fn test_scatter_group_footprint_wire_safe_partitioned_and_empty_slots() {
 }
 
 #[test]
-fn test_scatter_group_footprint_wire_safe_broadcast() {
+fn scatter_group_footprint_wire_safe_broadcast() {
     // Broadcast fills every worker slot with all rows (replicated family shape),
     // and the schema block is paid once per worker.
     use gnitz_engine_testkit::{make_batch, make_schema_u64_i64};
@@ -746,7 +639,7 @@ fn test_scatter_group_footprint_wire_safe_broadcast() {
 }
 
 #[test]
-fn test_scatter_group_footprint_non_wire_safe_shared_span_dedup() {
+fn scatter_group_footprint_non_wire_safe_shared_span_dedup() {
     // A string (non-wire-safe) batch whose two rows reference the SAME source
     // span: the per-worker sub-batch's BlobCache copies the span once, so
     // measuring the materialized sub-batch (not a naive per-row sum) is the only
@@ -779,7 +672,7 @@ fn test_scatter_group_footprint_non_wire_safe_shared_span_dedup() {
 /// Both an empty slot (no rows → control block only) and a populated one are
 /// covered, since only a populated slot pays the schema block and the data.
 #[test]
-fn test_group_footprint_direct_equals_emitted_bytes() {
+fn group_footprint_direct_equals_emitted_bytes() {
     use crate::runtime::sal::DirectGroup;
     use crate::runtime::sal::FLAG_EXCHANGE_RELAY;
     use crate::runtime::wire::{WireData, WireMsg};
@@ -824,8 +717,8 @@ fn test_group_footprint_direct_equals_emitted_bytes() {
 
 // ---------------------------------------------------------------------------
 // The group header's own integrity: a digest over the header, seeded with the
-// group's byte offset. Every one of the fields swept below is a routing or
-// replay decision that was taken entirely on trust before.
+// group's byte offset. Every field swept below drives a routing or replay
+// decision, so the digest is what stands between a damaged log and a wrong one.
 // ---------------------------------------------------------------------------
 
 /// `lsn`, `flags`, `target_id`, `slot_count`, the epoch word and every directory
@@ -838,7 +731,7 @@ fn every_single_bit_flip_in_a_group_header_is_rejected() {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
-        let buf = make_test_data(0x5A, 64);
+        let buf = vec![0x5A; 64];
         let payloads: [&[u8]; 3] = [&buf, &[], &buf];
         sal_write_group(ptr, 0, 42, 100, FLAG_DDL_SYNC, 1, size as u64, &payloads).expect("group fits");
 
@@ -868,7 +761,7 @@ fn a_header_only_verifies_at_the_offset_it_was_published_at() {
         let size = 1 << 20;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
-        let buf = make_test_data(0x11, 64);
+        let buf = vec![0x11; 64];
         let cur = sal_write_group(ptr, 0, 42, 100, 0, 1, size as u64, &[&buf]).expect("group fits");
         sal_write_group(ptr, cur, 43, 101, 0, 1, size as u64, &[&buf]).expect("group fits");
 
@@ -920,12 +813,15 @@ fn a_probe_never_reads_past_the_end_of_the_mapping() {
 #[test]
 fn the_derived_stride_equals_the_writers_payload_size_at_every_width() {
     unsafe {
-        let size = 8 << 20;
+        let size = 128 << 10;
         let region = SharedRegion::new(size);
         let ptr = region.ptr();
+        // Every iteration writes at offset 0, so only the widest group's bytes
+        // can be left over from the one before it.
+        let widest = 8 + group_header_size(MAX_WORKERS) + MAX_WORKERS * align8(100);
+        let buf = vec![0x33u8; 100];
         for &slots in &[1usize, 2, 4, MAX_WORKERS] {
-            std::ptr::write_bytes(ptr, 0, size);
-            let buf = make_test_data(0x33, 100);
+            std::ptr::write_bytes(ptr, 0, widest);
             // Every other slot empty from slot 1 on, so the widths past 1 all carry
             // the interleaved shape.
             let payloads: Vec<&[u8]> = (0..slots)
@@ -990,7 +886,18 @@ fn the_live_path_aborts_on_a_damaged_header() {
     // `--exact`.
     let name = "runtime::tests::sal::the_live_path_aborts_on_a_damaged_header_internal";
     let out = gnitz_engine_testkit::run_test_in_child(name, &[]);
-    assert_eq!(out.status.code(), Some(134), "{name} must fail-stop (exit 134)");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(134),
+        "{name} must fail-stop (exit 134)\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // The code alone would be satisfied by any other fatal abort reached first.
+    assert!(
+        stderr.contains("SAL group header failed its digest"),
+        "{name} aborted for the wrong reason\nstderr:\n{stderr}"
+    );
 }
 
 /// Runs only in the re-exec'd abort child.

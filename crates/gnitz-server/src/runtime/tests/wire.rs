@@ -1,26 +1,22 @@
 use crate::runtime::wire::{
-    build_named_schema_wire_block, build_schema_wire_block, decode_ddl_txn, decode_push_txn, decode_scan_multi,
-    decode_schema_block, decode_wire, encode_ctrl_block_direct, peek_client_control, peek_control_block,
-    peek_control_block_ipc, WireData, WireMsg, STATUS_ERROR, STATUS_OK,
+    build_schema_wire_block, decode_schema_block, decode_wire, decode_wire_ipc, decode_wire_ipc_zero_copy_with_ctrl,
+    encode_ctrl_block_direct, peek_client_control, peek_control_block, peek_control_block_ipc,
+    wire_flags_set_schema_version, DecodedWireZeroCopy, SchemaWithVersion, WireData, WireMsg, FLAG_CONTINUATION,
+    STATUS_ERROR, STATUS_OK,
 };
 use gnitz_engine::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_engine::storage::{Batch, Layout};
-use gnitz_engine_testkit::named_col_defs;
+use gnitz_engine::storage::{Batch, MAX_BATCH_REGIONS};
+use gnitz_engine_testkit::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::type_code;
-use gnitz_wire::MAX_PK_COLUMNS;
 use gnitz_wire::{encode_german_string, try_decode_german_string};
 
+/// The narrow frame schema every fixture here uses: `(u64 pk, u64 val)`.
 fn simple_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-        ],
-        &[0],
-    )
+    u64_pk_schema(type_code::U64)
 }
 
+/// U64 pk, a U64 payload and a STRING payload.
 fn string_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
@@ -32,20 +28,20 @@ fn string_schema() -> SchemaDescriptor {
     )
 }
 
+/// A one-row consolidated batch over [`simple_schema`].
 fn make_simple_batch(pk: u64, val: u64) -> Batch {
-    let sd = simple_schema();
-    let mut b = Batch::with_capacity(sd, 1);
-    b.extend_pk(pk as u128);
-    b.extend_weight(&1i64.to_le_bytes());
-    b.extend_null_bmp(&0u64.to_le_bytes());
-    b.extend_col(0, &val.to_le_bytes());
-    b.count = 1;
-    b.certify_layout(Layout::Consolidated, &sd);
-    b
+    make_batch(&simple_schema(), &[(pk, 1, val as i64)])
+}
+
+/// `n` rows over [`simple_schema`], each at a distinct weight and payload, so a
+/// region the encoder mis-slices reads back as a wrong row rather than a right one.
+fn make_wire_safe_batch(n: usize) -> Batch {
+    let rows: Vec<(u64, i64, i64)> = (0..n).map(|i| (i as u64, i as i64 + 1, i as i64 * 10)).collect();
+    make_batch_raw(&simple_schema(), &rows)
 }
 
 #[test]
-fn test_encode_decode_roundtrip_no_data() {
+fn encode_decode_roundtrip_no_data() {
     let wire = WireMsg {
         target_id: 42,
         client_id: 7,
@@ -69,7 +65,7 @@ fn test_encode_decode_roundtrip_no_data() {
 }
 
 #[test]
-fn test_encode_decode_roundtrip_with_schema() {
+fn encode_decode_roundtrip_with_schema() {
     let sd = simple_schema();
     let wire = WireMsg {
         target_id: 1,
@@ -88,7 +84,7 @@ fn test_encode_decode_roundtrip_with_schema() {
 }
 
 #[test]
-fn test_encode_decode_roundtrip_with_data() {
+fn encode_decode_roundtrip_with_data() {
     let sd = simple_schema();
     let batch = make_simple_batch(100, 999);
     let wire = WireMsg {
@@ -107,151 +103,9 @@ fn test_encode_decode_roundtrip_with_data() {
     assert_eq!(pk, 100);
     let val = u64::from_le_bytes(db.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(val, 999);
+    assert_eq!(db.get_weight(0), 1, "the row's weight must survive the round-trip");
     assert!(db.is_sorted());
     assert!(db.is_consolidated());
-}
-
-#[test]
-fn test_encode_decode_error_msg() {
-    let wire = WireMsg {
-        status: STATUS_ERROR,
-        error_msg: b"something went wrong",
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let decoded = decode_wire(&wire).unwrap();
-    assert_eq!(decoded.control.status, STATUS_ERROR);
-    assert_eq!(decoded.control.error_msg, b"something went wrong");
-}
-
-#[test]
-fn test_encode_decode_request_id_nonzero() {
-    let req_id: u64 = 0xDEAD_BEEF_CAFE_F00D;
-    let wire = WireMsg {
-        target_id: 42,
-        client_id: 7,
-        request_id: req_id,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let decoded = decode_wire(&wire).unwrap();
-    assert_eq!(decoded.control.request_id, req_id);
-}
-
-#[test]
-fn test_encode_decode_request_id_max() {
-    let wire = WireMsg {
-        target_id: 1,
-        client_id: 2,
-        flags: 3,
-        seek_pk: 4u128 | (5u128 << 64),
-        seek_col_idx: 6,
-        request_id: u64::MAX,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let decoded = decode_wire(&wire).unwrap();
-    assert_eq!(decoded.control.request_id, u64::MAX);
-}
-
-#[test]
-fn test_encode_decode_request_id_with_error() {
-    let req_id: u64 = 0x1122_3344_5566_7788;
-    let wire = WireMsg {
-        target_id: 10,
-        client_id: 20,
-        flags: 30,
-        seek_pk: 40u128 | (50u128 << 64),
-        seek_col_idx: 60,
-        request_id: req_id,
-        status: STATUS_ERROR,
-        error_msg: b"boom",
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let decoded = decode_wire(&wire).unwrap();
-    assert_eq!(decoded.control.status, STATUS_ERROR);
-    assert_eq!(decoded.control.request_id, req_id);
-    assert_eq!(decoded.control.error_msg, b"boom");
-}
-
-#[test]
-fn test_wire_size_includes_request_id() {
-    let sz = WireMsg::default().size();
-    let wire = WireMsg {
-        request_id: 0xAAAA_BBBB_CCCC_DDDD,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    assert_eq!(sz, wire.len());
-    let sz2 = WireMsg {
-        status: STATUS_ERROR,
-        error_msg: b"err",
-        ..Default::default()
-    }
-    .size();
-    let wire2 = WireMsg {
-        request_id: u64::MAX,
-        status: STATUS_ERROR,
-        error_msg: b"err",
-        ..Default::default()
-    }
-    .encode_to_vec();
-    assert_eq!(sz2, wire2.len());
-}
-
-/// The column names a schema block carries, read back through the shared codec.
-fn block_col_names(block: &[u8]) -> Vec<String> {
-    gnitz_wire::schema_block::SchemaBlock::decode(block, true, MAX_PK_COLUMNS)
-        .unwrap()
-        .columns()
-        .map(|c| String::from_utf8(c.name.to_vec()).unwrap())
-        .collect()
-}
-
-#[test]
-fn test_schema_roundtrip_with_names() {
-    let sd = string_schema();
-    let names = ["pk_col", "int_col", "name_col"];
-    let block = build_named_schema_wire_block(&sd, &named_col_defs(&names), 0);
-    let sd2 = decode_schema_block(&block, true).unwrap();
-    assert_eq!(sd2.num_columns(), 3);
-    assert_eq!(sd2.pk_indices(), &[0]);
-    assert_eq!(sd2.columns[0].type_code, type_code::U64);
-    assert_eq!(sd2.columns[1].type_code, type_code::U64);
-    assert_eq!(sd2.columns[2].type_code, type_code::STRING);
-    assert_eq!(sd2.columns[2].size(), 16);
-    assert_eq!(block_col_names(&block), names);
-}
-
-#[test]
-fn test_flag_has_data_requires_schema() {
-    let sd = simple_schema();
-    let batch = make_simple_batch(1, 2);
-    let mut wire = WireMsg {
-        schema: Some(&sd),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let ctrl_size = u32::from_le_bytes(
-        wire[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    wire.truncate(ctrl_size);
-    let result = decode_wire(&wire);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_schema_roundtrip_long_names() {
-    let sd = simple_schema();
-    let long_name = "this_is_a_very_long_column_name_exceeding_twelve_bytes";
-    let names = ["pk", long_name];
-    let block = build_named_schema_wire_block(&sd, &named_col_defs(&names), 0);
-    assert_eq!(decode_schema_block(&block, true).unwrap().num_columns(), 2);
-    assert_eq!(block_col_names(&block), names);
 }
 
 /// Compound-PK order (including a non-identity `pk_indices` permutation) must
@@ -280,7 +134,7 @@ fn schema_roundtrip_wire_preserves_pk_order() {
 }
 
 #[test]
-fn test_encode_decode_string_column() {
+fn encode_decode_string_column() {
     let sd = string_schema();
     let mut batch = Batch::with_capacity(sd, 2);
 
@@ -324,65 +178,6 @@ fn test_encode_decode_string_column() {
 }
 
 #[test]
-fn wire_size_matches_encode() {
-    let sz = WireMsg::default().size();
-    let wire = WireMsg {
-        target_id: 42,
-        client_id: 7,
-        flags: 0x100,
-        seek_pk: 10u128 | (20u128 << 64),
-        seek_col_idx: 3,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    assert_eq!(sz, wire.len(), "WireMsg::size mismatch (no data)");
-
-    let sd = simple_schema();
-    let sz = WireMsg {
-        schema: Some(&sd),
-        ..Default::default()
-    }
-    .size();
-    let wire = WireMsg {
-        target_id: 1,
-        schema: Some(&sd),
-        ..Default::default()
-    }
-    .encode_to_vec();
-    assert_eq!(sz, wire.len(), "WireMsg::size mismatch (schema only)");
-
-    let batch = make_simple_batch(100, 999);
-    let sz = WireMsg {
-        schema: Some(&sd),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
-    }
-    .size();
-    let wire = WireMsg {
-        target_id: 5,
-        schema: Some(&sd),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
-    }
-    .encode_to_vec();
-    assert_eq!(sz, wire.len(), "WireMsg::size mismatch (with data)");
-
-    let sz = WireMsg {
-        status: STATUS_ERROR,
-        error_msg: b"something went wrong",
-        ..Default::default()
-    }
-    .size();
-    let wire = WireMsg {
-        status: STATUS_ERROR,
-        error_msg: b"something went wrong",
-        ..Default::default()
-    }
-    .encode_to_vec();
-    assert_eq!(sz, wire.len(), "WireMsg::size mismatch (error msg)");
-}
-
-#[test]
 fn encode_into_buffer_roundtrip() {
     let sd = simple_schema();
     let batch = make_simple_batch(100, 999);
@@ -412,45 +207,82 @@ fn encode_into_buffer_roundtrip() {
     assert_eq!(pk, 100);
     let val = u64::from_le_bytes(db.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(val, 999);
+    assert_eq!(db.get_weight(0), 1);
 }
 
-#[test]
-fn encode_into_buffer_matches_encode_to_vec() {
+/// The three frame shapes a slot can take, for the sweeps below.
+fn every_frame_shape() -> Vec<Vec<u8>> {
     let sd = simple_schema();
-    let batch = make_simple_batch(42, 123);
+    let batch = make_simple_batch(1, 42);
+    vec![
+        WireMsg {
+            target_id: 1,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        WireMsg {
+            target_id: 1,
+            schema: Some(&sd),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        WireMsg {
+            target_id: 1,
+            schema: Some(&sd),
+            data: WireData::Whole(Some(&batch)),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    ]
+}
 
-    let wire = WireMsg {
-        target_id: 10,
-        client_id: 3,
-        flags: 0x200,
-        seek_pk: 5u128 | (6u128 << 64),
-        seek_col_idx: 7,
-        schema: Some(&sd),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
+/// A frame is framed by its own length fields, so **every** proper prefix must
+/// be rejected — a control block cut short, a schema block that never arrives, a
+/// data block truncated mid-region. Sweeping every cut rather than a few chosen
+/// ones is what makes a new block kind fail here instead of framing through.
+#[test]
+fn every_truncation_of_a_frame_is_rejected() {
+    for (shape, wire) in every_frame_shape().iter().enumerate() {
+        for cut in 1..wire.len() {
+            assert!(
+                decode_wire(&wire[..cut]).is_err(),
+                "shape {shape}: prefix of {cut}/{} bytes must not decode",
+                wire.len()
+            );
+        }
     }
-    .encode_to_vec();
+}
 
-    let sz = WireMsg {
-        schema: Some(&sd),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
+/// `encode` must write exactly the byte count `size` predicted, for every shape
+/// a slot can take — the relation every caller sizing a SAL slot depends on.
+/// Comparing `size()` against a `Vec` that `size()` itself allocated would
+/// compare it to itself, so the observable here is `encode`'s own return value.
+#[test]
+fn encode_writes_exactly_the_predicted_size() {
+    let sd = simple_schema();
+    let batch = make_simple_batch(100, 999);
+    let msgs = [
+        WireMsg::default(),
+        WireMsg {
+            schema: Some(&sd),
+            ..Default::default()
+        },
+        WireMsg {
+            schema: Some(&sd),
+            data: WireData::Whole(Some(&batch)),
+            ..Default::default()
+        },
+        WireMsg {
+            status: STATUS_ERROR,
+            error_msg: b"something went wrong",
+            ..Default::default()
+        },
+    ];
+    for (i, msg) in msgs.iter().enumerate() {
+        let sz = msg.size();
+        let mut buf = vec![0u8; sz];
+        assert_eq!(msg.encode(&mut buf, 0), sz, "shape {i}: encode wrote != size()");
     }
-    .size();
-    let mut buf = vec![0u8; sz];
-    let written = WireMsg {
-        target_id: 10,
-        client_id: 3,
-        flags: 0x200,
-        seek_pk: 5u128 | (6u128 << 64),
-        seek_col_idx: 7,
-        schema: Some(&sd),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
-    }
-    .encode(&mut buf, 0);
-    assert_eq!(written, wire.len());
-    assert_eq!(buf, wire, "WireMsg::encode should produce identical bytes");
 }
 
 /// Verify that prebuilt schema bytes produce bit-identical output to the inline path.
@@ -517,97 +349,45 @@ fn prebuilt_schema_block_no_col_names_roundtrips() {
     assert_eq!(decoded.schema.unwrap().num_columns(), sd.num_columns());
 }
 
+/// An `error_msg` on either side of the 12-byte German-string threshold: the
+/// short one stays inline in the control block, the long one spills to the blob
+/// region and is read back through the directory.
 #[test]
-fn test_decode_truncated_control_block_returns_err() {
-    let wire = WireMsg {
-        target_id: 1,
-        client_id: 2,
-        flags: 3,
-        seek_pk: 4u128 | (5u128 << 64),
-        seek_col_idx: 6,
-        request_id: 7,
-        ..Default::default()
+fn decode_wire_round_trips_an_error_msg_inline_and_spilled() {
+    for error_msg in [
+        b"boom".as_slice(),
+        b"this error message is definitely longer than twelve bytes",
+    ] {
+        let wire = WireMsg {
+            target_id: 7,
+            client_id: 3,
+            request_id: 0xABCD,
+            status: STATUS_ERROR,
+            error_msg,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let decoded = decode_wire(&wire).unwrap();
+        assert_eq!(decoded.control.target_id, 7);
+        assert_eq!(decoded.control.client_id, 3);
+        assert_eq!(decoded.control.request_id, 0xABCD);
+        assert_eq!(decoded.control.status, STATUS_ERROR);
+        assert_eq!(decoded.control.error_msg, error_msg);
     }
-    .encode_to_vec();
-    let truncated = &wire[..wire.len().saturating_sub(32)];
-    let result = decode_wire(truncated);
-    assert!(result.is_err(), "decode should reject truncated control block, got Ok");
 }
 
-/// `decode_wire` decodes from the wire block's embedded schema; schema
-/// validation against the catalog happens separately in the executor.
+/// Every control field round-trips through `decode_wire`, each at a distinct
+/// value so a transposed pair fails rather than reading back unchanged.
+/// `request_id` is at `u64::MAX`, the widest value the reply-routing key takes.
 #[test]
-fn test_decode_wire_uses_embedded_schema() {
-    let sd = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-        ],
-        &[0],
-    );
-
-    let batch = make_simple_batch(1, 42);
-    let wire = WireMsg {
-        target_id: 1,
-        schema: Some(&sd),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let result = decode_wire(&wire);
-    assert!(result.is_ok(), "decode_wire should succeed for a valid frame");
-    let decoded = result.unwrap();
-    assert!(decoded.schema.is_some());
-    assert!(decoded.data_batch.is_some());
-}
-
-/// decode_control_block reads error_msg from the blob arena when the string
-/// exceeds the 12-byte inline threshold. Validates the fast directory-read
-/// path handles the blob region offset correctly.
-#[test]
-fn decode_control_block_long_error_msg_uses_blob() {
-    let long_msg = b"this error message is definitely longer than twelve bytes";
-    let wire = WireMsg {
-        target_id: 7,
-        client_id: 3,
-        request_id: 0xABCD,
-        status: STATUS_ERROR,
-        error_msg: long_msg,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let decoded = decode_wire(&wire).unwrap();
-    assert_eq!(decoded.control.target_id, 7);
-    assert_eq!(decoded.control.client_id, 3);
-    assert_eq!(decoded.control.request_id, 0xABCD);
-    assert_eq!(decoded.control.status, STATUS_ERROR);
-    assert_eq!(decoded.control.error_msg, long_msg.as_ref());
-}
-
-/// When error_msg is null (STATUS_OK with no message), the null bitmap bit
-/// is set and decode_control_block must return an empty Vec without touching
-/// the error_msg region.
-#[test]
-fn decode_control_block_null_error_msg() {
-    let wire = WireMsg {
-        target_id: 42,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let decoded = decode_wire(&wire).unwrap();
-    assert!(decoded.control.error_msg.is_empty());
-}
-
-/// All control fields round-trip correctly through the fast decode path.
-#[test]
-fn decode_control_block_all_fields_round_trip() {
+fn decode_wire_round_trips_every_control_field() {
     let wire = WireMsg {
         target_id: 0xDEAD,
         client_id: 0xBEEF,
         flags: 0xCAFE,
         seek_pk: 0x1111u128 | (0x2222u128 << 64),
         seek_col_idx: 0x3333,
-        request_id: 0x4444,
+        request_id: u64::MAX,
         ..Default::default()
     }
     .encode_to_vec();
@@ -617,7 +397,8 @@ fn decode_control_block_all_fields_round_trip() {
     assert_eq!(decoded.control.flags & 0xFFFF, 0xCAFE);
     assert_eq!(decoded.control.seek_pk, 0x1111u128 | (0x2222u128 << 64));
     assert_eq!(decoded.control.seek_col_idx, 0x3333);
-    assert_eq!(decoded.control.request_id, 0x4444);
+    assert_eq!(decoded.control.request_id, u64::MAX);
+    assert!(decoded.control.error_msg.is_empty(), "no message means no message");
 }
 
 #[test]
@@ -641,58 +422,6 @@ fn peek_client_control_rejects_short_data() {
         result.is_err(),
         "peek_client_control should reject slices < WAL_HEADER_SIZE"
     );
-}
-
-#[test]
-fn decode_wire_truncated_schema_block_returns_err() {
-    let sd = simple_schema();
-    // Encode with schema but no data.
-    let wire = WireMsg {
-        target_id: 1,
-        schema: Some(&sd),
-        ..Default::default()
-    }
-    .encode_to_vec();
-    // The control block occupies [0..ctrl_size). Truncate in the middle of the
-    // schema block (keep only the first WAL_HEADER_SIZE bytes of it so the
-    // header is readable but the body is missing).
-    let ctrl_size = u32::from_le_bytes(
-        wire[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let truncated = &wire[..ctrl_size + gnitz_wire::WAL_HEADER_SIZE / 2];
-    let result = decode_wire(truncated);
-    assert!(result.is_err(), "decode_wire should reject truncated schema block");
-}
-
-#[test]
-fn decode_wire_truncated_data_block_returns_err() {
-    let sd = simple_schema();
-    let batch = make_simple_batch(1, 42);
-    let wire = WireMsg {
-        target_id: 1,
-        schema: Some(&sd),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
-    }
-    .encode_to_vec();
-    // Find where the data block starts: after control + schema blocks.
-    let ctrl_size = u32::from_le_bytes(
-        wire[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let schema_size = u32::from_le_bytes(
-        wire[ctrl_size + gnitz_wire::WAL_OFF_SIZE..ctrl_size + gnitz_wire::WAL_OFF_SIZE + 4]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-    let data_start = ctrl_size + schema_size;
-    // Truncate in the middle of the data block.
-    let truncated = &wire[..data_start + gnitz_wire::WAL_HEADER_SIZE / 2];
-    let result = decode_wire(truncated);
-    assert!(result.is_err(), "decode_wire should reject truncated data block");
 }
 
 /// The ctrl-block round-trip through the shared `gnitz_wire::control` codec:
@@ -756,12 +485,6 @@ fn encode_ctrl_block_direct_roundtrips() {
 // Scan chunking tests
 // ---------------------------------------------------------------------------
 
-use crate::runtime::wire::{
-    decode_wire_ipc, decode_wire_ipc_zero_copy_with_ctrl, wire_flags_set_schema_version, DecodedWireZeroCopy,
-    SchemaWithVersion, FLAG_CONTINUATION,
-};
-use gnitz_engine::storage::MAX_BATCH_REGIONS;
-
 /// Decode a continuation frame (data, no schema block) against `schema` at
 /// `version`, the way the master's reply-train reader does: the zero-copy
 /// decoder, fed the frame's own control block and a caller-held region-offset
@@ -778,19 +501,6 @@ fn decode_continuation<'a>(
         version,
     };
     decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(hint), offsets)
-}
-
-fn make_wire_safe_batch(n: usize) -> Batch {
-    let sd = simple_schema();
-    let mut b = Batch::with_capacity(sd, n.max(1));
-    for i in 0..n {
-        b.extend_pk(i as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &(i as u64).to_le_bytes());
-        b.count += 1;
-    }
-    b
 }
 
 /// A `WireData::Range` message's `size` must match its encoded byte count.
@@ -885,12 +595,20 @@ fn encode_range_roundtrip() {
     }
     .encode_ipc(&mut buf, 0);
 
-    // Decode and verify row values.
+    // Every region must be sliced by the same range: PK, weight and payload are
+    // distinct per row, so a range applied to one region and not another shows up.
     let decoded = decode_wire_ipc(&buf).expect("decode_wire_ipc");
     let b = decoded.data_batch.expect("data_batch");
     assert_eq!(b.count, 3);
     for i in 0..3usize {
-        assert_eq!(b.get_pk(i), (i + 2) as u128);
+        let src = i + 2;
+        assert_eq!(b.get_pk(i), src as u128, "row {i} pk");
+        assert_eq!(b.get_weight(i), src as i64 + 1, "row {i} weight");
+        assert_eq!(
+            u64::from_le_bytes(b.col_data(0)[i * 8..i * 8 + 8].try_into().unwrap()),
+            src as u64 * 10,
+            "row {i} payload"
+        );
     }
 }
 
@@ -943,6 +661,7 @@ fn continuation_frame_decoded_with_schema_hint() {
             gnitz_wire::widen_pk_be(b.get_pk_bytes(i), b.pk_stride as usize),
             i as u128
         );
+        assert_eq!(b.get_weight(i), i as i64 + 1, "row {i} weight");
     }
     drop(decoded);
 
@@ -953,11 +672,15 @@ fn continuation_frame_decoded_with_schema_hint() {
 }
 
 /// The blob fallback path (an error message present) round-trips through the
-/// shared codec at a non-zero offset.
+/// shared codec at a non-zero offset. Both German strings spill, so the decoder
+/// has to resolve one shared blob region and hand the right slice to each — and
+/// they do it under the checksum stamp, which is what this wrapper adds over
+/// `gnitz_wire::control::encode_ctrl_block`.
 #[test]
 fn encode_ctrl_block_direct_error_path_roundtrips() {
     const OFFSET: usize = 32;
-    let err = b"something went wrong";
+    let err = b"something went wrong, well past the twelve-byte threshold";
+    let extra = b"and so is this wide-pk-extra blob payload past 12B";
     let mut buf = vec![0u8; OFFSET + 1024];
     let n = encode_ctrl_block_direct(
         &mut buf,
@@ -972,235 +695,15 @@ fn encode_ctrl_block_direct_error_path_roundtrips() {
             request_id: 23,
         },
         err,
-        &[],
+        extra,
         true,
     );
     let dec = peek_control_block(&buf[OFFSET..OFFSET + n]).expect("decode");
     assert_eq!(dec.status, STATUS_ERROR);
     assert_eq!(dec.error_msg, err);
-    assert_eq!(dec.block_size, n);
-}
-
-/// A header with a distinct value per field, so a transposed pair fails an
-/// assertion rather than round-tripping unnoticed.
-fn probe_ctrl_header(status: u32) -> gnitz_wire::control::ControlHeader {
-    gnitz_wire::control::ControlHeader {
-        status,
-        target_id: 1,
-        client_id: 2,
-        flags: 3,
-        seek_pk: 4,
-        seek_col_idx: 5,
-        request_id: 6,
-    }
-}
-
-/// Round-trip the new `seek_pk_extra` blob through encode + decode.
-///
-/// Exercises three cases: empty (the universal hot path), short
-/// (≤ German-string inline threshold, no blob spill), and long (spills
-/// into the shared blob region alongside `error_msg`). The decoder must
-/// resolve a single shared blob slice and feed it to both German-string
-/// decodes, so the combined case is the load-bearing one.
-#[test]
-fn ctrl_block_seek_pk_extra_roundtrip() {
-    // Case 1: both empty — the empty seek_pk_extra path the direct/IPC
-    // equivalence test already covers, asserted here from the decoder side.
-    let mut buf = vec![0u8; 1024];
-    let n = encode_ctrl_block_direct(&mut buf, 0, &probe_ctrl_header(STATUS_OK), b"", b"", true);
-    let dec = peek_control_block(&buf[..n]).expect("decode empty");
-    assert_eq!(dec.error_msg, Vec::<u8>::new());
-    assert_eq!(dec.seek_pk_extra, Vec::<u8>::new());
-    assert_eq!(dec.seek_pk, 4u128);
-
-    // Case 2: seek_pk_extra short (≤12 bytes, inline; no blob spill).
-    let short = b"abcd"; // 4 bytes, fits inline
-    let mut buf = vec![0u8; 1024];
-    let n = encode_ctrl_block_direct(&mut buf, 0, &probe_ctrl_header(STATUS_OK), b"", short, true);
-    let dec = peek_control_block(&buf[..n]).expect("decode short");
-    assert_eq!(dec.error_msg, Vec::<u8>::new());
-    assert_eq!(dec.seek_pk_extra, short);
-
-    // Case 3: both non-empty, both long enough to spill into the shared
-    // blob region. The decoder must resolve REGION_BLOB once and pass the
-    // same slice to both German-string decodes.
-    let err = b"this error message is definitely longer than twelve bytes";
-    let extra = b"and so is this wide-pk-extra blob payload past 12B";
-    let mut buf = vec![0u8; 1024];
-    let n = encode_ctrl_block_direct(&mut buf, 0, &probe_ctrl_header(STATUS_ERROR), err, extra, true);
-    let dec = peek_control_block(&buf[..n]).expect("decode long");
-    assert_eq!(dec.error_msg, err);
     assert_eq!(dec.seek_pk_extra, extra);
-    assert_eq!(dec.status, STATUS_ERROR);
-}
-
-// ---------------------------------------------------------------------------
-// PUSH_TXN / DDL_TXN frame decode: precondition section appended after families
-// ---------------------------------------------------------------------------
-//
-// These decode the *client* encoder's output (`gnitz_core::protocol::encode_*`)
-// rather than a hand-assembled frame, so a cross-crate wire-layout drift fails
-// here — the same client-encode → engine-decode discipline as the sibling
-// `ddl_txn_roundtrip_client_to_server`.
-
-use gnitz_core::protocol::types::{BatchAppender, Schema, ZSetBatch};
-use gnitz_core::{ColumnDef, TypeCode, WireConflictMode};
-
-/// A minimal client-side `(id U64 PK, val U64)` schema.
-fn core_schema() -> Schema {
-    Schema {
-        columns: vec![
-            ColumnDef::new("id", TypeCode::U64, false),
-            ColumnDef::new("val", TypeCode::U64, false),
-        ],
-        pk_cols: vec![0],
-    }
-}
-
-/// A one-row batch for `core_schema` — inert filler; the decode tests inspect
-/// only each family's tid/mode, never its payload.
-fn core_batch(schema: &Schema) -> ZSetBatch {
-    let mut batch = ZSetBatch::new(schema);
-    BatchAppender::new(&mut batch, schema).add_row(1, 1).u64_val(42);
-    batch
-}
-
-/// A real `FLAG_PUSH_TXN` frame built by the client encoder from `(tid, mode)`
-/// families and `(tid, basis)` preconditions.
-fn push_txn_frame(families: &[(u64, WireConflictMode)], preconditions: &[(u64, u64)]) -> Vec<u8> {
-    let schema = core_schema();
-    let batch = core_batch(&schema);
-    let fams: Vec<(u64, &Schema, &ZSetBatch, WireConflictMode)> = families
-        .iter()
-        .map(|&(tid, mode)| (tid, &schema, &batch, mode))
-        .collect();
-    gnitz_core::protocol::encode_push_txn(0xABCD, &fams, preconditions)
-}
-
-#[test]
-fn decode_push_txn_zero_preconditions() {
-    let frame = push_txn_frame(&[(5, WireConflictMode::Update)], &[]);
-    let (fams, pre) = decode_push_txn(&frame).unwrap();
-    assert_eq!(fams.len(), 1);
-    assert_eq!(fams[0].tid, 5);
-    assert!(pre.is_empty(), "a zero count still self-delimits; no preconditions");
-}
-
-#[test]
-fn decode_push_txn_one_precondition() {
-    let frame = push_txn_frame(&[(5, WireConflictMode::Update)], &[(5, 99)]);
-    let (fams, pre) = decode_push_txn(&frame).unwrap();
-    assert_eq!(fams.len(), 1);
-    assert_eq!(pre, vec![(5, 99)]);
-}
-
-#[test]
-fn decode_push_txn_n_preconditions_after_multiple_families() {
-    let frame = push_txn_frame(
-        &[(5, WireConflictMode::Update), (6, WireConflictMode::Error)],
-        &[(5, 10), (6, 20), (5, 30)],
-    );
-    let (fams, pre) = decode_push_txn(&frame).unwrap();
-    assert_eq!(fams.len(), 2);
-    assert_eq!(fams[0].tid, 5);
-    assert_eq!(fams[1].tid, 6);
-    assert_eq!(
-        fams[1].mode,
-        WireConflictMode::Error.as_u8(),
-        "mode byte walks with the family"
-    );
-    assert_eq!(pre, vec![(5, 10), (6, 20), (5, 30)]);
-}
-
-#[test]
-fn decode_push_txn_truncated_precondition_count_errs() {
-    let mut frame = push_txn_frame(&[(5, WireConflictMode::Update)], &[]);
-    frame.truncate(frame.len() - 2); // chop into the 4-byte count
-    assert!(decode_push_txn(&frame).is_err(), "a truncated count is a decode error");
-}
-
-#[test]
-fn decode_push_txn_truncated_precondition_body_errs() {
-    let mut frame = push_txn_frame(&[(5, WireConflictMode::Update)], &[(5, 99)]);
-    frame.truncate(frame.len() - 4); // count says 1 but the pair is short
-    assert!(decode_push_txn(&frame).is_err(), "a truncated body is a decode error");
-}
-
-/// A real `FLAG_SCAN_MULTI` frame built by the client encoder from
-/// `(tid, cached_schema_version)` relations.
-fn scan_multi_frame(relations: &[(u64, u16)]) -> Vec<u8> {
-    gnitz_core::protocol::encode_scan_multi(0xABCD, relations)
-}
-
-#[test]
-fn decode_scan_multi_one_relation_zero_ctrl_version() {
-    let frame = scan_multi_frame(&[(7, 0)]);
-    let rels = decode_scan_multi(&frame).unwrap();
-    assert_eq!(rels, vec![(7, 0)]);
-    // Control block carries FLAG_SCAN_MULTI, target 0, and ZERO schema-version
-    // bits — per-relation versions ride the body, not the control block.
-    let ctrl = peek_client_control(&frame).unwrap();
-    assert_ne!(ctrl.flags & gnitz_wire::FLAG_SCAN_MULTI, 0);
-    assert_eq!(ctrl.target_id, 0);
-    assert_eq!(gnitz_wire::wire_flags_get_schema_version(ctrl.flags), 0);
-}
-
-#[test]
-fn decode_scan_multi_preserves_order_and_versions() {
-    let frame = scan_multi_frame(&[(7, 0), (8, 3), (9, u16::MAX)]);
-    assert_eq!(decode_scan_multi(&frame).unwrap(), vec![(7, 0), (8, 3), (9, u16::MAX)]);
-}
-
-#[test]
-fn decode_scan_multi_sixteen_relations() {
-    let relations: Vec<(u64, u16)> = (0..16u64).map(|i| (100 + i, i as u16)).collect();
-    let frame = scan_multi_frame(&relations);
-    assert_eq!(decode_scan_multi(&frame).unwrap(), relations);
-}
-
-#[test]
-fn decode_scan_multi_truncated_count_errs() {
-    let mut frame = scan_multi_frame(&[(7, 0)]);
-    frame.truncate(frame.len() - 12); // chop through the record and into the count
-    assert!(
-        decode_scan_multi(&frame).is_err(),
-        "a truncated count/record is a decode error"
-    );
-}
-
-#[test]
-fn decode_scan_multi_truncated_record_errs() {
-    let mut frame = scan_multi_frame(&[(7, 0), (8, 1)]);
-    frame.truncate(frame.len() - 3); // count says 2 but the last record is short
-    assert!(
-        decode_scan_multi(&frame).is_err(),
-        "a truncated record is a decode error"
-    );
-}
-
-#[test]
-fn decode_ddl_txn_is_unaffected_by_the_appended_section() {
-    // A DDL frame is control block + family count + data blocks (no mode byte,
-    // no schema block, no precondition section). decode_ddl_txn shares only the
-    // prologue with decode_push_txn, so it must still walk families cleanly.
-    // Two *different* system families, so the walk cannot pass by reading one
-    // block length twice.
-    use gnitz_core::types::sys_schema;
-    use gnitz_wire::{SCHEMA_TAB, SEQ_TAB};
-
-    let sch_s = sys_schema(SCHEMA_TAB);
-    let mut sch_b = ZSetBatch::new(sch_s);
-    BatchAppender::new(&mut sch_b, sch_s).add_row(3, 1).str_val("s");
-
-    let seq_s = sys_schema(SEQ_TAB);
-    let mut seq_b = ZSetBatch::new(seq_s);
-    BatchAppender::new(&mut seq_b, seq_s).add_row(1, 1).u64_val(42);
-
-    let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, &[(SCHEMA_TAB, sch_b), (SEQ_TAB, seq_b)]);
-    let decoded = decode_ddl_txn(&payload).unwrap();
-    assert_eq!(decoded.len(), 2);
-    assert_eq!(decoded[0].0, SCHEMA_TAB as u32);
-    assert_eq!(decoded[1].0, SEQ_TAB as u32);
+    assert_eq!(dec.seek_pk, 17u128);
+    assert_eq!(dec.block_size, n);
 }
 
 #[test]

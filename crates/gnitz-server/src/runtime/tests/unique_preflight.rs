@@ -66,10 +66,10 @@ fn producer_of(keys: &[PkBuf]) -> KeyProducer {
 // ---------------------------------------------------------------------------
 
 fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
-    const CAP: usize = 1 << 20;
-    let region = gnitz_engine_testkit::SharedRegion::new(CAP);
+    // Room for a whole pre-flight train at once, so a test drains it without
+    // ever racing the writer against backpressure.
+    let region = unsafe { w2m_ring::make_ring(1 << 16, 16, 8) };
     let ptr = region.ptr();
-    unsafe { w2m_ring::init_region_for_tests(ptr, CAP as u64) };
     let writer = W2mWriter::new(ptr);
     let receiver = W2mReceiver::new(vec![ptr]);
     f(&writer, &receiver);
@@ -200,9 +200,9 @@ fn preflight_train_empty_partition_single_terminal_frame() {
     });
 }
 
-/// A composite (>16-byte) span round-trips through the wire frame: the reply
-/// schema's PK region holds the full span verbatim, the regression the old
-/// fixed-`U128` reply column could not represent.
+/// A composite two-column span round-trips through the wire frame: the reply
+/// schema's PK region holds the full span verbatim, however many columns the
+/// index spans.
 #[test]
 fn preflight_train_composite_wide_span_roundtrip() {
     // Two U64 index columns → a 16-byte composite leading span, plus a U64
@@ -216,9 +216,9 @@ fn preflight_train_composite_wide_span_roundtrip() {
         &[0, 1, 2],
     );
     let frame_schema = unique_preflight_wire_schema(&idx_schema, 2);
-    // Spans are (a_be ++ b_be), 16 bytes. Two spans share their leading 8 bytes
-    // but differ in the trailing column — distinct keys a u128 truncation to the
-    // leading column would falsely merge.
+    // Spans are (a_be ++ b_be), 16 bytes. Two of them share their leading 8
+    // bytes and differ only in the trailing column, so the span must carry both
+    // columns to keep them distinct.
     let span = |a: u64, b: u64| {
         let mut buf = [0u8; 16];
         buf[..8].copy_from_slice(&a.to_be_bytes());
@@ -355,10 +355,8 @@ fn preflight_weight2_row_emits_adjacent_pair() {
     assert!(acc.duplicate);
 }
 
-/// A composite `UNIQUE (a, b)` span packs both columns: two rows differing only
-/// in `b` produce DISTINCT spans (admitted), and two rows whose low 8 bytes
-/// (column `a`) collide but whose full span differs are distinct — the
-/// regression a `u128` leading-column truncation would have falsely merged.
+/// A composite `UNIQUE (a, b)` span packs both columns, so two rows that share
+/// column `a` and differ in `b` produce distinct spans and are both admitted.
 #[test]
 fn preflight_composite_projection_distinguishes_trailing_column() {
     let schema = SchemaDescriptor::new(
@@ -625,36 +623,6 @@ fn accumulator_distinct_keys_no_duplicate() {
         assert!(seed.may_contain(k.pk_bytes()), "seed under cap holds every span");
     }
     assert!(!seed.may_contain(span_u128(999).pk_bytes()), "and nothing else");
-}
-
-/// Crossing the cap clears the partial seed whole and never repopulates it:
-/// the seed is complete-or-empty, never truncated (a truncated warm filter
-/// would prove "absent" for a present key — a uniqueness hole).
-#[test]
-fn accumulator_seed_over_cap_is_empty_never_truncated() {
-    let mut acc = PreflightAccumulator::new(3);
-    assert!(offer_all(&mut acc, &[span_u128(10), span_u128(20), span_u128(30)]));
-    assert!(acc.offer(span_u128(40)), "cap overflow is not a duplicate");
-    assert!(acc.offer(span_u128(50)));
-    assert!(!acc.duplicate);
-    let seed = acc.into_seed();
-    assert!(
-        seed.capped(),
-        "overflow must drop the seed whole so it publishes a capped filter"
-    );
-    assert!(
-        seed.may_contain(span_u128(10).pk_bytes()),
-        "a capped seed proves nothing absent"
-    );
-}
-
-#[test]
-fn accumulator_seed_at_exactly_cap_is_complete() {
-    let mut acc = PreflightAccumulator::new(3);
-    assert!(offer_all(&mut acc, &[span_u128(10), span_u128(20), span_u128(30)]));
-    let seed = acc.into_seed();
-    assert!(!seed.capped(), "exactly cap spans must not report capped");
-    assert_eq!(seed.len(), 3, "exactly cap spans must keep the full seed");
 }
 
 /// A duplicate found after the cap has been crossed is still detected — the

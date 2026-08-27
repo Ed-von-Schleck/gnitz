@@ -528,14 +528,12 @@ async def test_lsn_monotonic(aconn, table):
 
 @pytest.mark.asyncio
 async def test_pipelined_pushes_lsn_non_strict(aconn, table):
-    """Phase 6 (Design 2): pushes that the committer batches together
-    share one zone LSN, so pipelined returns may carry duplicate LSNs.
-    The strict per-group LSN guarantee is gone — only non-decreasing
-    monotonicity is preserved. Whether *this* run actually batches
-    depends on scheduling (committer.try_recv timing); we therefore
-    only assert LSN monotonicity, not the batching itself. The
-    SAL-level invariant is unit-tested in
-    `runtime::tests::sal::test_batched_push_shares_zone_lsn`.
+    """Pushes that the committer batches together share one zone LSN, so
+    pipelined returns may carry duplicate LSNs; only non-decreasing
+    monotonicity is guaranteed, not a distinct LSN per group. Whether
+    *this* run actually batches depends on scheduling (committer.try_recv
+    timing), so only monotonicity is asserted here. The SAL-level framing
+    is unit-tested on the Rust side.
     """
     tid, cols, _ = table
     schema = gnitz.Schema(cols)
