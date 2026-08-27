@@ -544,40 +544,39 @@ pub(super) fn emit_reduce(
         .map(|&(agg_op, col_idx)| AggDescriptor { col_idx, agg_op })
         .collect();
 
-    // Every aggregate that decodes its column value needs an order-encodable
-    // (≤8-byte int/float) scalar. SUM/SUM_ZERO sum it — a 16-byte source would abort
-    // when the accumulator classifies its widening (`SumWiden::classify`) and a string would
-    // silently mis-sum; MIN/MAX compare it via `encode_ordered`, which has no
-    // monotone key for STRING / U128 / UUID / BLOB. COUNT / COUNT_NON_NULL never
-    // read the value. The SQL binder already rejects these,
-    // so this is the defensive guard for the low-level CircuitBuilder path that
-    // bypasses it: a failure fails the compile (so the view compiles to nothing)
-    // rather than panicking a worker at execution.
-    if agg_descs.iter().any(|ad| {
-        matches!(ad.agg_op, AggFunc::Sum | AggFunc::SumZero | AggFunc::Min | AggFunc::Max)
-            && !agg_value_idx_eligible(TypeCode::from_validated_u8(
-                in_reg_schema.columns[ad.col_idx as usize].type_code,
-            ))
-    }) {
-        return Err(CompileError::Rejected(
-            "reduce: aggregate column is not order-encodable",
-        ));
-    }
-
-    // Validate the planner's shipped output-key kind against the input schema
-    // before building the output schema. Everything downstream — the output
-    // schema layout and `op_reduce`'s row keying — obeys `out_key`, so a kind
-    // the schema does not warrant would silently scramble the output columns;
-    // reject the circuit instead (same failure class as the
-    // MIN/MAX-eligibility guard above).
+    // The output layout and `op_reduce`'s row keying both obey `out_key`, so a
+    // kind the schema does not warrant would silently scramble the output columns.
     if out_key != in_reg_schema.reduce_out_key(group_cols) {
         return Err(CompileError::Rejected("reduce: out_key does not match input schema"));
     }
-    // `oob_cols` bounds each group/agg column index but not the list lengths,
-    // and duplicates are legal, so the schema builder owns the column-count
-    // bound (see `build_reduce_output_schema`).
-    let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, group_cols, &agg_descs, out_key)
-        .ok_or(CompileError::Rejected("reduce: output exceeds MAX_COLUMNS"))?;
+
+    // A worker owns the global-aggregate ground row when it holds the whole
+    // input: the view is replicated (correct-local everywhere, read
+    // single-sourced from worker 0), or nothing shards into this reduce, or it is
+    // the one worker a sharded funnel routes V₀ to. `ReducePlan::new` conjoins
+    // this with `global_ground`, so a grouped reduce cannot carry a live seed.
+    let unsharded = !matches!(
+        loaded.nodes.get(&loaded.inputs(nid).unary()),
+        Some(gnitz_wire::OpNode::ExchangeShard { .. })
+    );
+    let i_am_owner = ctx.placement.is_replicated()
+        || unsharded
+        || worker_rank() as usize == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), num_workers() as usize);
+
+    // `oob_cols` above bounds each column index but not the list lengths, and the
+    // SQL binder — which the low-level CircuitBuilder path bypasses — is not the
+    // only thing that must reject an unaggregatable column type. `ReducePlan::new`
+    // owns both, so a bad circuit fails the compile instead of aborting a worker.
+    let plan = crate::ops::ReducePlan::new(
+        &in_reg_schema,
+        group_cols,
+        &agg_descs,
+        out_key,
+        global_ground,
+        i_am_owner,
+    )
+    .map_err(CompileError::Rejected)?;
+    let reduce_out_schema = plan.output_schema;
 
     let trace_table_idx = ctx.add_owned_trace_table(
         &format!("_reduce_{}_{nid}", ctx.site.id),
@@ -588,46 +587,29 @@ pub(super) fn emit_reduce(
     let raw_delta_id = ctx.push_delta_reg(reduce_out_schema);
     ctx.out_reg_of.insert(nid, raw_delta_id);
 
-    // Serve every MIN/MAX aggregate (grouped or global) from one combined value
-    // index, keyed `group_cols ‖ ordinal ‖ av_encoded`. Every group set has a
-    // packed group key (`gnitz_wire::group_key_layout` reserves the ordinal and
-    // value slots out of the PK budget and folds an over-long key into a trailing
-    // hash slot), and every value-indexed aggregate is order-encodable — the
-    // combined value-decode guard above rejected any that were not. So a reduce
-    // carries a value index iff it has a non-linear aggregate, with no eligibility
-    // gate and no trace-replay history to fall back to.
+    // A reduce carries a value index iff it has a non-linear aggregate: every
+    // group set has a packed key, and the plan above already rejected any
+    // aggregate the index could not encode — so there is no eligibility gate
+    // here, and no trace-replay history to fall back to.
     //
-    // No nullable check on the aggregate columns: NULL aggregate values never
-    // reach the AVI. The reduce accumulator skips NULL inputs (ops/reduce/agg.rs)
-    // and AVI population skips a NULL aggregate value before encoding the index
-    // key (ops/index.rs), whose value column is a non-nullable PK. Moving either
-    // filter without revisiting this would write a zeroed key and corrupt MIN/MAX.
-    let use_avi = agg_descs.iter().any(|a| a.agg_op.uses_value_index());
-
-    // One combined value index per reduce: a single table keyed
-    // `group_cols ‖ ordinal ‖ av_encoded`, serving every MIN/MAX aggregate, in
-    // descriptor order (ordinal = position) — the same order, selected by the same
-    // predicate, that the reduce read side walks into its seek prefix. One table →
-    // one table_id, one scratch dir, one compaction-filename namespace, so
-    // per-aggregate entries cannot collide on a memory-pressure flush.
-    //
-    // It integrates BEFORE the reduce reads it, so a prefix seek returns the
-    // post-delta extreme directly. (The trace-in integrate below runs after.)
-    let avi = if use_avi {
-        let avi_aggs: Vec<AggDescriptor> = agg_descs
-            .iter()
-            .filter(|d| d.agg_op.uses_value_index())
-            .copied()
-            .collect();
-        // Build the bake first and take the index schema off it, rather than
-        // deriving the same schema a second time for the table.
-        let bake = crate::ops::AviBake::new(&in_reg_schema, group_cols, &avi_aggs)
+    // NULL aggregate values never reach the index: the accumulator skips NULL
+    // inputs and AVI population skips them before encoding a key whose value
+    // column is a non-nullable PK. Moving either filter would write a zeroed key
+    // and corrupt MIN/MAX.
+    let avi = if agg_descs.iter().any(|a| a.agg_op.uses_value_index()) {
+        // One table serving every MIN/MAX of this reduce, so per-aggregate
+        // entries share a table_id, scratch dir and compaction namespace and
+        // cannot collide on a memory-pressure flush. Take the index schema off
+        // the bake rather than deriving it a second time.
+        let bake = crate::ops::AviBake::new(&in_reg_schema, group_cols, &agg_descs)
             .ok_or(CompileError::Rejected("reduce: value-index key exceeds the PK budget"))?;
-        // Not optional: a non-linear reduce has no history other than this index,
-        // so a swallowed failure would leave MIN/MAX computed from the delta alone
-        // with the old row still retracted.
+        // Not optional: a non-linear reduce has no other history, so a swallowed
+        // failure would compute MIN/MAX from the delta alone while still
+        // retracting the old row.
         let table_idx = ctx.add_owned_trace_table(&format!("_avidx_{}_{nid}", ctx.site.id), bake.schema, None)?;
         let bake_idx = ctx.builder.add_avi_bake(bake);
+        // Integrates BEFORE the reduce reads it, so a prefix seek returns the
+        // post-delta extreme. (The trace-in integrate below runs after.)
         ctx.builder.push(Instr::Integrate {
             in_reg: in_reg_id,
             target: IntegrateTarget::Avi(IntegrateAvi { table_idx, bake_idx }),
@@ -637,40 +619,7 @@ pub(super) fn emit_reduce(
         None
     };
 
-    // Bake worker ownership of the global-aggregate seed, exactly as the
-    // `WorkerFilter` arm bakes `(worker_rank(), num_workers())`. A worker seeds
-    // when it holds the whole input: either the view is stamped replicated (it runs
-    // correct-local everywhere and the read single-sources worker 0, which is not
-    // `worker_for_key(V₀)`) or the reduce has no upstream `ExchangeShard`
-    // (`reduce_multi_local`, also reachable over a partitioned table through the raw
-    // `reduce()` binding — which is why the two tests stay separate). A sharded
-    // global aggregate funnels every row to `worker_for_key(V₀)`, so only
-    // that worker seeds. The shard test reads the static `loaded.incoming` graph,
-    // which keeps the `ExchangeShard → Reduce` edge across the post-phase split (the
-    // ExchangeShard node itself emits no instruction). Meaningful only when
-    // `global_ground`; left `false` otherwise so a grouped reduce never pays the bake.
-    let unsharded = !matches!(
-        loaded.nodes.get(&loaded.inputs(nid).unary()),
-        Some(gnitz_wire::OpNode::ExchangeShard { .. })
-    );
-    let i_am_owner = global_ground
-        && (ctx.placement.is_replicated()
-            || unsharded
-            || worker_rank() as usize
-                == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), num_workers() as usize));
-
-    // Bake the reduce plan — the one construction site for everything the
-    // operator would otherwise re-derive per epoch from the instruction operands.
-    let plan_idx = ctx.builder.add_reduce_plan(crate::ops::ReducePlan::new(
-        &in_reg_schema,
-        &reduce_out_schema,
-        group_cols,
-        &agg_descs,
-        out_key,
-        avi.is_some(),
-        global_ground,
-        i_am_owner,
-    ));
+    let plan_idx = ctx.builder.add_reduce_plan(plan);
 
     ctx.builder.push(Instr::Reduce {
         in_reg: in_reg_id,
@@ -1670,7 +1619,7 @@ mod tests {
     }
 
     /// Every aggregate that decodes its column value needs an order-encodable
-    /// (≤8-byte int/float) scalar: SUM would abort in `SumWiden::classify` on a
+    /// (≤8-byte int/float) scalar: SUM would abort in `SumWiden::for_type` on a
     /// 16-byte source and silently mis-sum a string, and MIN/MAX would reach
     /// `encode_ordered`'s `unreachable!` arm and abort a worker at execution. The
     /// SQL binder rejects these upstream, so this covers the low-level

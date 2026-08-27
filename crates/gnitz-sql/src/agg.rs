@@ -328,9 +328,7 @@ pub(crate) fn emit_reduce(
     // The circuit builder needs only (op, col) per spec; out_type is the
     // planner's concern and already shaped the reduce schema above.
     let circuit_specs: Vec<(u64, usize)> = agg_specs.iter().map(|s| (s.op.as_wire(), s.col)).collect();
-    let all_linear = agg_specs
-        .iter()
-        .all(|s| matches!(s.op, WireAggFunc::Count | WireAggFunc::Sum | WireAggFunc::CountNonNull));
+    let all_linear = agg_specs.iter().all(|s| s.op.is_linear());
     // Two-phase (distributable) path for an all-linear, integer, partitioned GLOBAL
     // aggregate: fold a per-worker partial locally (no exchange), then exchange only
     // the ≤ N partials to V₀'s owner and combine them. A linear aggregate satisfies

@@ -339,7 +339,7 @@ pub(crate) fn execute_epoch_from(
                     "vm: REDUCE in_count={} avi={} aggs={}",
                     reg!(*in_reg).batch.count,
                     avi_handle.is_some(),
-                    plan.agg_descs.len()
+                    plan.acc_template.len()
                 );
 
                 // The cursor and the packer that keys it arrive as one value, so

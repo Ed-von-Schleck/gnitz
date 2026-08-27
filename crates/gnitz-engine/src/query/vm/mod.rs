@@ -496,19 +496,10 @@ mod tests {
         aggs: &[AggDescriptor],
         gcols: &[u32],
         in_schema: SchemaDescriptor,
-        out_schema: SchemaDescriptor,
         out_key: crate::schema::ReduceOutKey,
     ) {
-        let plan_idx = b.add_reduce_plan(crate::ops::ReducePlan::new(
-            &in_schema,
-            &out_schema,
-            gcols,
-            aggs,
-            out_key,
-            false,
-            false,
-            false,
-        ));
+        let plan_idx =
+            b.add_reduce_plan(crate::ops::ReducePlan::new(&in_schema, gcols, aggs, out_key, false, false).unwrap());
         b.push(Instr::Reduce {
             in_reg,
             trace_out_reg,
@@ -1231,7 +1222,6 @@ mod tests {
             &agg_descs,
             &group_cols,
             in_schema,
-            out_schema,
             in_schema.reduce_out_key(&group_cols),
         );
 
@@ -1363,7 +1353,6 @@ mod tests {
             &agg_descs,
             &group_cols,
             in_schema,
-            out_schema,
             in_schema.reduce_out_key(&group_cols),
         );
         push_integrate(&mut builder, 2, trace_out_idx);
@@ -1427,7 +1416,6 @@ mod tests {
             &agg_descs,
             &group_cols,
             in_schema,
-            out_schema,
             in_schema.reduce_out_key(&group_cols),
         );
         push_integrate(&mut builder, 3, trace_out_idx);

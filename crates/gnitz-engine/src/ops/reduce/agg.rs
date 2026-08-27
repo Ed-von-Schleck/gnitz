@@ -35,10 +35,12 @@ pub(crate) struct AggDescriptor {
     pub agg_op: AggFunc,
 }
 
-/// Accumulator: internal state for one aggregate column. Rebuilt per epoch, then
-/// stepped once per input row per aggregate, so everything the step body needs
-/// beyond the row itself is resolved in `new`.
-pub(super) struct Accumulator {
+/// Accumulator: internal state for one aggregate column. Cloned per epoch (and,
+/// in the ad-hoc fold, per group) off the plan's template, then stepped once per
+/// input row per aggregate — so everything the step body needs beyond the row
+/// itself is resolved in `new`, once per plan.
+#[derive(Clone)]
+pub(crate) struct Accumulator {
     acc: i64,
     agg_op: AggFunc,
     /// Where the aggregated column's value lives in a row (PK byte offset or
@@ -104,48 +106,62 @@ impl SumWiden {
 }
 
 impl Accumulator {
-    /// `loc` is the pre-resolved locator of `desc.col_idx` (the plan's baked
-    /// `agg_locs` entry) — accumulators are rebuilt per epoch, the `locate()`
-    /// walk is not. What one row does to the slot is resolved here too, so the
-    /// per-row body dispatches on neither `agg_op` nor `TypeCode`.
-    pub(super) fn new(desc: &AggDescriptor, loc: ColumnLocator) -> Self {
+    /// Build the accumulator for `agg_op` over the column at `loc`. What one row
+    /// does to the slot is resolved here, so the per-row body dispatches on
+    /// neither `agg_op` nor `TypeCode`.
+    ///
+    /// `None` iff the aggregate reads its argument's value and the source type
+    /// has no ≤8-byte numeric image. That is the whole aggregate-eligibility
+    /// rule; the COUNT family reads no value and takes any type.
+    pub(super) fn new(agg_op: AggFunc, loc: ColumnLocator) -> Option<Self> {
         let tc = TypeCode::from_validated_u8(loc.type_code());
         // Exhaustive over `AggFunc`: a new opcode cannot reach the row path
-        // unclassified. Only SUM reads the value's type, and only SUM can fail
-        // to classify — the planner (`compiler::emit_reduce`) rejects a
-        // non-numeric SUM source, so this is an internal-bug assert, now paid
-        // once per epoch rather than per row.
-        let kind = match desc.agg_op {
+        // unclassified.
+        let kind = match agg_op {
             AggFunc::Count => StepKind::Count,
             AggFunc::CountNonNull => StepKind::CountNonNull,
-            AggFunc::Sum | AggFunc::SumZero => StepKind::Sum(
-                SumWiden::for_type(tc)
-                    .unwrap_or_else(|| unreachable!("SUM over non-numeric type {tc:?} (planner-rejected)")),
-            ),
-            AggFunc::Min => StepKind::Extreme { max: false },
-            AggFunc::Max => StepKind::Extreme { max: true },
+            AggFunc::Sum | AggFunc::SumZero => StepKind::Sum(SumWiden::for_type(tc)?),
+            // MIN/MAX hold the AVI's order-preserving encoding, whose domain
+            // (`agg_value_idx_eligible`) is the same ≤8-byte int/float set SUM
+            // widens — so `encode_ordered`'s unreachable arms stay unreachable.
+            AggFunc::Min | AggFunc::Max => {
+                super::super::util::agg_value_idx_eligible(tc).then_some(StepKind::Extreme {
+                    max: agg_op == AggFunc::Max,
+                })?
+            }
         };
-        Accumulator {
+        Some(Accumulator {
             acc: 0,
             has_value: false,
-            agg_op: desc.agg_op,
+            agg_op,
             loc,
             tc,
             kind,
-            linear: desc.agg_op.is_linear(),
-        }
+            linear: agg_op.is_linear(),
+        })
     }
 
+    #[inline(always)]
     pub(super) fn reset(&mut self) {
         self.acc = 0;
         self.has_value = false;
     }
 
+    #[inline(always)]
     pub(super) fn is_linear(&self) -> bool {
         self.linear
     }
 
+    /// True for a MAX accumulator — the extreme direction the AVI probe seeks
+    /// in. The same bit [`Self::extreme_replaces`] tests; meaningful only for
+    /// the MIN/MAX family.
+    #[inline(always)]
+    pub(super) fn is_max(&self) -> bool {
+        matches!(self.kind, StepKind::Extreme { max: true })
+    }
+
     /// The aggregated column's source type, resolved from its locator at `new`.
+    #[inline(always)]
     pub(super) fn type_code(&self) -> TypeCode {
         self.tc
     }
@@ -160,12 +176,14 @@ impl Accumulator {
     /// True iff the accumulator was never stepped (`has_value` is false) — "no
     /// row contributed," not "the value equals zero." `emit_agg_col` reads this to
     /// pick the empty-render (NULL, or `0` per `empty_renders_zero`).
+    #[inline(always)]
     pub(super) fn is_untouched(&self) -> bool {
         !self.has_value
     }
 
     /// Row count held by a COUNT/COUNT_NON_NULL accumulator — a group's net
     /// cardinality, for the emission gate. Meaningful only for the count family.
+    #[inline(always)]
     pub(super) fn count_value(&self) -> i64 {
         self.acc
     }
@@ -191,7 +209,7 @@ impl Accumulator {
     /// only, so callers gate on their own first/has_value state.
     #[inline]
     fn extreme_replaces(&self, enc: u64) -> bool {
-        if matches!(self.kind, StepKind::Extreme { max: true }) {
+        if self.is_max() {
             enc > self.acc as u64
         } else {
             enc < self.acc as u64
@@ -240,16 +258,6 @@ impl Accumulator {
             return;
         }
 
-        // SUM widens into an i64/u64 slot; MIN/MAX order-encode via
-        // encode_ordered. Both handle only the order-encodable ≤8-byte int/float
-        // types — any wider or non-numeric source (STRING, U128/UUID/BLOB, I128)
-        // is rejected when the reduce circuit is compiled (`compiler::emit_reduce`,
-        // for SQL and raw CircuitBuilder circuits alike) and never reaches here.
-        debug_assert!(
-            self.loc.size() <= 8,
-            "SUM/MIN/MAX over a >8-byte column must be rejected by the planner",
-        );
-
         let first = !self.has_value;
         self.has_value = true;
 
@@ -291,10 +299,9 @@ impl Accumulator {
             // unsigned `u64` compare — the U64-unsigned and float-total-order
             // rules live solely in the codec, never duplicated here. The encoded
             // extreme is decoded back to native bits at emit (`get_value_bits`).
-            // Only order-encodable types reach here: a non-encodable MIN/MAX
-            // source (STRING, U128/UUID/BLOB) is rejected when the reduce circuit
-            // is compiled (`compiler::emit_reduce`), never executed, so
-            // `encode_ordered`'s unreachable arm is genuinely unreachable.
+            // Only order-encodable types reach here: `Accumulator::new` refuses
+            // to build an `Extreme` over anything else, so `encode_ordered`'s
+            // unreachable arm is genuinely unreachable.
             StepKind::Extreme { .. } => {
                 let mut scratch = [0u8; 16];
                 let bytes = self.loc.native_le_bytes(mb, row, &mut scratch);
@@ -507,8 +514,7 @@ mod tests {
             ],
             &[0],
         );
-        let desc = AggDescriptor { col_idx: 1, agg_op };
-        Accumulator::new(&desc, schema.locate(1))
+        Accumulator::new(agg_op, schema.locate(1)).unwrap()
     }
 
     // Item 19: a NaN seen first must not poison MIN. A subsequent finite value

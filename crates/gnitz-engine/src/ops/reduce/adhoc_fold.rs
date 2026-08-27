@@ -27,10 +27,9 @@ use rustc_hash::FxHashMap;
 
 use gnitz_wire::AggReadSpec;
 
-use super::super::util::GroupKeyCols;
 use super::agg::{Accumulator, AggDescriptor};
 use super::emit::emit_reduce_row;
-use super::plan::{build_reduce_output_schema, ReducePlan};
+use super::plan::ReducePlan;
 use super::sort::compare_by_group_cols;
 use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ReduceOutKey, SchemaDescriptor};
@@ -41,13 +40,9 @@ use crate::storage::Batch;
 /// this descendant of `ops::reduce`.
 pub(crate) struct AdhocFold {
     /// The baked reduce plan — the single home of the schemas, group columns,
-    /// aggregate descriptors/locators, group comparator descs, and emission
-    /// roles the fold reads (`ReducePlan::new` derives them all once).
+    /// the group keyer and comparator locators, the accumulator template, and
+    /// the emission roles the fold reads (`ReducePlan::new` derives them once).
     plan: ReducePlan,
-    /// Baked per-row group keyer; `None` = a global aggregate — one group at
-    /// ordinal 0, no per-row hash or probe (its emit key is the constant
-    /// `global_group_key()`).
-    keyer: Option<GroupKeyCols>,
     /// One representative source row per group, in group-discovery order; the
     /// row index IS the group ordinal (and `rep_rows.count` the group count).
     /// `emit_reduce_row` reads the group columns from it, and the group key is
@@ -56,10 +51,11 @@ pub(crate) struct AdhocFold {
     /// Flat accumulator matrix: group `ord` owns
     /// `accs[ord * n_aggs .. (ord + 1) * n_aggs]`.
     accs: Vec<Accumulator>,
-    /// Group-key hash → group ordinals sharing it (FxHash — the key is already
-    /// a uniform 128-bit XXH3 digest, so no second strong hash is needed).
-    /// Collisions are disambiguated by `compare_by_group_cols` (value grouping,
-    /// never hash-only), exactly as the view path never trusts a hash alone.
+    /// Group key → group ordinals sharing it (FxHash — the key is already a
+    /// uniform 128-bit XXH3 digest, so no second strong hash is needed). A
+    /// hashed key is confirmed by value with `compare_by_group_cols` before a
+    /// row joins a bucket, so two groups colliding on the digest stay distinct
+    /// partials; a canonical key is injective and skips that confirmation.
     by_hash: FxHashMap<u128, Vec<u32>>,
     /// Same-group memo: the previous row's `(key, ordinal)`. Consecutive rows
     /// of one group — per cluster, when the scan is ordered by the group
@@ -69,12 +65,11 @@ pub(crate) struct AdhocFold {
 }
 
 impl AdhocFold {
-    /// Build the fold state from a decoded fold spec. Validates group/agg
-    /// column indices against the source schema and the client's `reply_schema`
-    /// against the engine-derived SyntheticFold layout (the spec AND the client
-    /// blob are a trust boundary — a wrong-shaped but structurally valid
-    /// reply schema would otherwise panic `ReducePlan::new`); aggregate-op
-    /// validity is decode-enforced (`AggReadItem.op` is typed).
+    /// Build the fold state from a decoded fold spec. The spec and the client's
+    /// reply schema are a trust boundary: the column indices are range-checked
+    /// here, the aggregate types and output width by `ReducePlan::new`, and the
+    /// reply schema against the plan's own layout. (Aggregate-op validity is
+    /// already decode-enforced — `AggReadItem.op` is typed.)
     pub(crate) fn new(
         src_schema: &SchemaDescriptor,
         reply_schema: &SchemaDescriptor,
@@ -106,30 +101,25 @@ impl AdhocFold {
 
         // The ad-hoc partial layout is ALWAYS synthetic-fold: `_agg_pk` U128 PK,
         // group cols as payload, then the agg partial columns — a pure function
-        // of `(src_schema, agg)`, derived here through the same authority the
-        // compiler lays every reduce output with. The client's reply schema must
-        // match it physically (types + PK region; nullability is presentation)
-        // or the frame is malformed.
-        let derived = build_reduce_output_schema(src_schema, &group_cols, &agg_descs, ReduceOutKey::SyntheticFold)
-            .ok_or("scan_spec fold: group + agg columns exceed the schema column cap")?;
-        if !reply_schema.same_physical_layout(&derived) {
-            return Err("scan_spec fold: reply schema does not match the derived fold layout".to_string());
-        }
+        // of `(src_schema, agg)`, laid out by the same authority the compiler
+        // lays every reduce output with. The client's reply schema must match it
+        // physically (types + PK region; nullability is presentation) or the
+        // frame is malformed.
         let plan = ReducePlan::new(
             src_schema,
-            &derived,
             &group_cols,
             &agg_descs,
             ReduceOutKey::SyntheticFold,
-            false, // has_avi — no AggValueIndex on the one-shot path
             false, // global_ground — the client synthesizes the empty-input ground row
             false, // i_am_owner
-        );
-        let keyer = (!group_cols.is_empty()).then(|| GroupKeyCols::new(src_schema, &group_cols));
+        )
+        .map_err(str::to_string)?;
+        if !reply_schema.same_physical_layout(&plan.output_schema) {
+            return Err("scan_spec fold: reply schema does not match the derived fold layout".to_string());
+        }
 
         Ok(AdhocFold {
             plan,
-            keyer,
             rep_rows: Batch::empty_with_schema(src_schema),
             accs: Vec::new(),
             by_hash: FxHashMap::default(),
@@ -149,24 +139,19 @@ impl AdhocFold {
     pub(crate) fn fold_ranges(&mut self, chunk: &Batch, ranges: &[(usize, usize)]) -> Result<(), String> {
         let Self {
             plan,
-            keyer,
             rep_rows,
             accs,
             by_hash,
             last,
             group_cap,
         } = self;
-        let n_aggs = plan.agg_descs.len();
+        let n_aggs = plan.acc_template.len();
         let mb = chunk.as_mem_batch();
-        let new_accs = |accs: &mut Vec<Accumulator>| {
-            accs.extend(
-                plan.agg_descs
-                    .iter()
-                    .zip(&plan.agg_locs)
-                    .map(|(d, &loc)| Accumulator::new(d, loc)),
-            );
-        };
-        let Some(keyer) = keyer else {
+        // Append onto the flat matrix, never a fresh `Vec` per group: the tail
+        // grows amortized, where a per-group allocation would be one malloc per
+        // group, up to the cap.
+        let new_accs = |accs: &mut Vec<Accumulator>| accs.extend_from_slice(&plan.acc_template);
+        if plan.group_key.cols.is_empty() {
             // Global aggregate: one group at ordinal 0, created on the first
             // surviving row — no per-row key hash, memo, or comparator probe.
             for row in ranges.iter().flat_map(|&(s, e)| s..e) {
@@ -184,7 +169,11 @@ impl AdhocFold {
                 }
             }
             return Ok(());
-        };
+        }
+        // A canonical key is `route_key` over one non-nullable `is_pk_eligible`
+        // column, so key equality *is* group equality and the value confirmation
+        // below cannot change the answer.
+        let injective_key = plan.group_key.canonical_col().is_some();
         // Rebuilt only when a group insert mutates `rep_rows` — never per row.
         let mut rep_mb = rep_rows.as_mem_batch();
         for row in ranges.iter().flat_map(|&(s, e)| s..e) {
@@ -198,11 +187,13 @@ impl AdhocFold {
             if w <= 0 {
                 continue;
             }
-            let key = keyer.key_row(&mb, row);
-            // The memo hit and the bucket probe both confirm by VALUE, so a
-            // hash collision can never merge two groups.
-            let same =
-                |ord: u32| compare_by_group_cols(&mb, row, &rep_mb, ord as usize, &plan.sort_descs) == Ordering::Equal;
+            let key = plan.group_key.key_row(&mb, row);
+            // A hashed key is confirmed by value, on the memo hit and the bucket
+            // probe alike, so a digest collision can never merge two groups.
+            let same = |ord: u32| {
+                injective_key
+                    || compare_by_group_cols(&mb, row, &rep_mb, ord as usize, &plan.group_key.cols) == Ordering::Equal
+            };
             let ord = match *last {
                 Some((k, ord)) if k == key && same(ord) => ord,
                 _ => {
@@ -246,7 +237,7 @@ impl AdhocFold {
     /// no rows emits an empty batch (the client synthesizes the global ground
     /// row when needed).
     pub(crate) fn finish(self) -> Batch {
-        let n_aggs = self.plan.agg_descs.len();
+        let n_aggs = self.plan.acc_template.len();
         // The exact output row count is the group count — reserve once.
         let mut output = Batch::with_capacity(self.plan.output_schema, self.rep_rows.count.max(1));
         let rep_mb = self.rep_rows.as_mem_batch();
@@ -255,12 +246,10 @@ impl AdhocFold {
             // Synthetic `_agg_pk`: the group key (re-derived from the retained
             // representative row — a pure function of its group columns),
             // order-preserving big-endian truncated to the PK stride — the same
-            // bytes `op_reduce` writes.
-            let key = match &self.keyer {
-                Some(k) => k.key_row(&rep_mb, ord),
-                None => gnitz_wire::global_group_key(),
-            };
-            let pk = NarrowPkOpk::new(key, stride);
+            // bytes `op_reduce` writes. Over an empty group set `key_row` folds
+            // nothing and yields `global_group_key()`, so the global partial and
+            // a view's ground row land on the same V₀ with no arm of its own.
+            let pk = NarrowPkOpk::new(self.plan.group_key.key_row(&rep_mb, ord), stride);
             emit_reduce_row(
                 &mut output,
                 (&rep_mb, ord),
@@ -298,6 +287,15 @@ mod tests {
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 0),
         ];
+        for _ in 0..n_aggs {
+            cols.push(SchemaColumn::new(type_code::I64, 1));
+        }
+        SchemaDescriptor::new(&cols, &[0])
+    }
+
+    /// Global (group-less) reply: `_agg_pk(U128)` then one I64 per agg spec.
+    fn reply_global(n_aggs: usize) -> SchemaDescriptor {
+        let mut cols = vec![SchemaColumn::new(type_code::U128, 0)];
         for _ in 0..n_aggs {
             cols.push(SchemaColumn::new(type_code::I64, 1));
         }
@@ -495,6 +493,43 @@ mod tests {
             &[0],
         );
         assert!(AdhocFold::new(&src, &wrong_type, &spec, 1000).is_err());
+    }
+
+    /// The spec is a trust boundary and the accumulator is not defensive: SUM
+    /// over a STRING and MIN over a U128 have no ≤8-byte numeric image, and
+    /// before `ReducePlan::new` owned that check both reached `Accumulator::new`
+    /// and aborted the worker — the U128 MIN in release too, since
+    /// `agg_output_type(Min, U128)` is I64 and the reply schema matched.
+    #[test]
+    fn fold_rejects_aggregates_with_no_encoding() {
+        // pk(U64), s(STRING), w(U128).
+        let src = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+                SchemaColumn::new(type_code::U128, 0),
+            ],
+            &[0],
+        );
+        let reply = reply_schema(1);
+        for (op, col) in [(AGG_SUM, 1u16), (AGG_MIN, 2)] {
+            let spec = AggReadSpec {
+                group_cols: vec![],
+                aggs: vec![agg(op, col)],
+            };
+            let Err(err) = AdhocFold::new(&src, &reply, &spec, 1000) else {
+                panic!("{op:#x} over column {col} must be rejected");
+            };
+            assert!(err.contains("order-encodable"), "{err}");
+        }
+        // COUNT reads no value, so the same columns are countable.
+        for col in [1u16, 2] {
+            let spec = AggReadSpec {
+                group_cols: vec![],
+                aggs: vec![agg(AGG_COUNT, col)],
+            };
+            assert!(AdhocFold::new(&src, &reply_global(1), &spec, 1000).is_ok());
+        }
     }
 
     #[test]

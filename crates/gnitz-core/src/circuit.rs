@@ -404,24 +404,6 @@ impl CircuitBuilder {
         )
     }
 
-    /// Reduce with automatic shard insertion (required for multi-worker correctness).
-    pub fn reduce(&mut self, input: NodeId, group_cols: &[usize], agg_func_id: u64, agg_col_idx: usize) -> NodeId {
-        let sharded = self.shard(input, group_cols);
-        // The low-level single-agg API is never the user's global scalar
-        // aggregate (that path goes through `reduce_multi`/`reduce_multi_local`),
-        // so it never seeds a ground row. It also cannot track the input schema,
-        // so it always keys the output synthetically; the engine hard-rejects it
-        // if the group set actually warrants a natural key (only the SQL planner
-        // ships the natural-key kinds).
-        self.reduce_node(
-            sharded,
-            group_cols,
-            &[(agg_func_id, agg_col_idx)],
-            false,
-            ReduceOutKey::SyntheticFold,
-        )
-    }
-
     /// Multi-aggregate reduce with automatic shard insertion (required for
     /// multi-worker correctness). `agg_specs`: list of (agg_func_id, col_idx).
     /// `global_ground` is `true` only for the user's ungrouped scalar aggregate

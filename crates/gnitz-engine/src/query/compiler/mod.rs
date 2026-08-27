@@ -8,15 +8,14 @@ use std::fmt;
 
 use crate::expr::ScalarFunc;
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
-use crate::ops::{agg_value_idx_eligible, build_reduce_output_schema, AggDescriptor};
+use crate::ops::AggDescriptor;
 use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{
     build_map_output_schema, compute_map_output_schema, hashrow_output_schema, merge_schemas_for_join,
-    null_extend_output_schema, union_nullability_merge, SchemaDescriptor, TypeCode,
+    null_extend_output_schema, union_nullability_merge, SchemaDescriptor,
 };
 use crate::storage::{ReadCursor, RecoverySource, StorageError, Table};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
-use gnitz_wire::AggFunc;
 
 mod emit;
 mod hydration;

@@ -122,18 +122,15 @@ pub(super) fn emit_global_ground(raw_output: &mut Batch, out_pk_bytes: &[u8], pl
         "global_ground output schema must have zero group-exemplar columns",
     );
 
-    // Fresh accumulators in the empty-group state — every one untouched
-    // (`has_value` false). `emit_agg_col` renders each by `empty_renders_zero`: the
+    // The plan's template is exactly the empty-group state — every accumulator
+    // untouched (`has_value` false), never stepped, and the plan holds it behind
+    // `&` so the clone can never observe a mutated one.
+    // `emit_agg_col` renders each by `empty_renders_zero`: the
     // COUNT family and SumZero ground to a concrete `0` (null bit clear), SUM/MIN/MAX
     // to NULL. No COUNT seed is needed — an untouched Count / CountNonNull already
     // renders `0` (byte-identical to a `seed_from_raw_bits(0)` value), so the ground
     // row shares the one render path with a normal row.
-    let accs: Vec<Accumulator> = plan
-        .agg_descs
-        .iter()
-        .zip(&plan.agg_locs)
-        .map(|(d, &loc)| Accumulator::new(d, loc))
-        .collect();
+    let accs: Vec<Accumulator> = plan.acc_template.clone();
 
     begin_row(raw_output, out_pk_bytes);
     let mut null_word: u64 = 0;

@@ -21,6 +21,10 @@ use super::reindex::ReindexPacker;
 /// a stripped `(col, for_max, type)` tuple) lets the population derive
 /// `for_max`/type the same way the reduce read side does, so the two cannot
 /// drift.
+///
+/// [`AviBake::new`] takes the reduce's *whole* descriptor list and applies the
+/// `uses_value_index` selection itself, so the ordinal order this documents has
+/// one spelling rather than one per caller.
 pub(crate) struct AviBake {
     /// Packs a row's group columns into the AVI key's leading OPK prefix. The
     /// same packer that stamps a reindexed `_join_pk`, so the prefix is the OPK
@@ -40,7 +44,11 @@ impl AviBake {
         Some(AviBake {
             key_packer: ReindexPacker::new_group_key(src, group_by_cols),
             schema: crate::schema::avi_schema(src, group_by_cols)?,
-            aggs: aggs.iter().map(|d| (*d, src.locate(d.col_idx as usize))).collect(),
+            aggs: aggs
+                .iter()
+                .filter(|d| d.agg_op.uses_value_index())
+                .map(|d| (*d, src.locate(d.col_idx as usize)))
+                .collect(),
         })
     }
 }
@@ -321,5 +329,82 @@ mod avi_encode_tests {
             TypeCode::U64,
             &[1, 256, 0x0100_0000, (u32::MAX as i128) + 1, i64::MAX as i128],
         );
+    }
+
+    /// `encode_ordered` is the *encoding* form of the scalar total order whose
+    /// *comparison* form is `gnitz_wire::cmp_typed_le`. The AVI's correctness is
+    /// exactly their agreement: an ascending cursor walk over encoded keys yields
+    /// the extremum `cmp_typed_le` would pick. Every pair of every order-encodable
+    /// type, both directions.
+    fn assert_encode_matches_cmp(tc: TypeCode, vals: &[[u8; 8]]) {
+        let w = SchemaColumn::new(tc as u8, 0).size() as usize;
+        for a in vals {
+            for b in vals {
+                let (ea, eb) = (encode_ordered(&a[..w], tc, false), encode_ordered(&b[..w], tc, false));
+                assert_eq!(
+                    ea.cmp(&eb),
+                    gnitz_wire::cmp_typed_le(&a[..w], &b[..w], tc as u8),
+                    "{tc:?}: encode order disagrees with cmp_typed_le for {a:02x?} vs {b:02x?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_ordered_agrees_with_cmp_typed_le() {
+        let pad = |v: u64| v.to_le_bytes();
+        for (tc, vals) in [
+            (TypeCode::U8, vec![0u64, 1, 0x7f, 0x80, 0xff]),
+            (TypeCode::U16, vec![0, 1, 256, 0x7fff, 0x8000, 0xffff]),
+            (TypeCode::U32, vec![0, 1, 0x7fff_ffff, 0x8000_0000, u32::MAX as u64]),
+            (TypeCode::U64, vec![0, 1, i64::MAX as u64, 1u64 << 63, u64::MAX]),
+            (TypeCode::I8, vec![-128i64 as u64, -1i64 as u64, 0, 1, 127]),
+            (TypeCode::I16, vec![-32768i64 as u64, -1i64 as u64, 0, 1, 32767]),
+            (
+                TypeCode::I32,
+                vec![i32::MIN as i64 as u64, -1i64 as u64, 0, 1, i32::MAX as u64],
+            ),
+            (
+                TypeCode::I64,
+                vec![i64::MIN as u64, -1i64 as u64, 0, 1, i64::MAX as u64],
+            ),
+        ] {
+            assert_encode_matches_cmp(tc, &vals.into_iter().map(pad).collect::<Vec<_>>());
+        }
+
+        // Floats carry the cases the integer types cannot: NaN (which has a
+        // defined position under `total_cmp` and none under `<`), and −0.0 vs
+        // +0.0 (byte-distinct, numerically equal, and ordered by `total_cmp`).
+        let f64s: Vec<[u8; 8]> = [
+            f64::NEG_INFINITY,
+            -1.5,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.5,
+            f64::INFINITY,
+            f64::NAN,
+            -f64::NAN,
+        ]
+        .iter()
+        .map(|v| v.to_bits().to_le_bytes())
+        .collect();
+        assert_encode_matches_cmp(TypeCode::F64, &f64s);
+
+        let f32s: Vec<[u8; 8]> = [
+            f32::NEG_INFINITY,
+            -1.5,
+            -0.0,
+            0.0,
+            f32::MIN_POSITIVE,
+            1.5,
+            f32::INFINITY,
+            f32::NAN,
+            -f32::NAN,
+        ]
+        .iter()
+        .map(|v| (v.to_bits() as u64).to_le_bytes())
+        .collect();
+        assert_encode_matches_cmp(TypeCode::F32, &f32s);
     }
 }

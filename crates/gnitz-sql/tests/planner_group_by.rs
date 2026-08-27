@@ -285,7 +285,7 @@ fn test_min_uuid_rejected() {
 /// which is the signed-128 type `I128`. A 16-byte value cannot be order-encoded
 /// into the AVI slot or accumulated in the 64-bit aggregate slot, so MIN/MAX/SUM/
 /// AVG over it must be rejected cleanly at bind time — this guards the engine's
-/// `SumWiden::classify(I128)` / `encode_ordered(I128)` `unreachable!` panics.
+/// `SumWiden::for_type(I128)` / `encode_ordered(I128)` `unreachable!` panics.
 #[test]
 fn test_agg_i128_join_pk_rejected() {
     let srv = match ServerHandle::start() {

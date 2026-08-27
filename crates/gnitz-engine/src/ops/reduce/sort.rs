@@ -4,13 +4,15 @@ use std::cmp::Ordering;
 
 use crate::schema::key::{compare_pk_bytes, pk_width_dispatch};
 use crate::schema::{key::PkSortKey, ColumnLocator};
-use crate::storage::{Batch, MemBatch};
+use crate::storage::MemBatch;
 use gnitz_expr::RowSource;
 
+use super::super::util::GroupKeyCols;
+
 /// Compare two rows by group columns through pre-resolved [`ColumnLocator`]s
-/// (the reduce plan's baked `sort_descs`). Generic over two
-/// [`ColumnarSource`]s, so an intra-batch argsort compare and the
-/// trace-cursor-vs-exemplar group-membership test share this one body.
+/// (the reduce plan's baked `group_key.cols`). Generic over two
+/// [`ColumnarSource`]s, so the group-walk boundary test and the ad-hoc fold's
+/// bucket confirmation share this one body.
 pub(super) fn compare_by_group_cols<A: RowSource, B: RowSource>(
     src_a: &A,
     row_a: usize,
@@ -55,39 +57,42 @@ pub(super) fn compare_by_group_cols<A: RowSource, B: RowSource>(
 ///
 /// Sorts `(key, index)` pairs rather than sorting indices against a side table:
 /// the side table costs two random loads per comparison, where the pair carries
-/// its key inline. Rows with equal keys keep an arbitrary relative order either
-/// way.
+/// its key inline. The whole pair is the sort key, so rows sharing a key come
+/// back in ascending source-index order — which is what makes a float SUM over
+/// a group reproducible for a fixed access path.
 fn argsort_by_key<K: Ord>(n: usize, key: impl Fn(usize) -> K) -> Vec<u32> {
     let mut pairs: Vec<(K, u32)> = (0..n).map(|i| (key(i), i as u32)).collect();
-    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    pairs.sort_unstable();
     pairs.into_iter().map(|(_, i)| i).collect()
 }
 
-/// Argsort delta batch by group columns, through the pre-resolved locator slice
-/// the reduce plan baked (`sort_descs`).
-pub(super) fn argsort_delta(batch: &Batch, descs: &[ColumnLocator]) -> Vec<u32> {
-    let mb = batch.as_mem_batch();
-    let n = batch.count;
+/// Argsort a delta batch into group order: the rows of one group land
+/// contiguously, ordered by the plan's baked group key.
+///
+/// Sorting by the key rather than by `compare_by_group_cols` cannot fragment a
+/// group — every row of one group yields the identical key. A non-injective key
+/// can only *merge* two groups, and the emitted output PK is that same digest,
+/// so the merge is already decided elsewhere.
+///
+/// The `u64` arm is exact, not a truncation: a canonical key over a ≤8-byte
+/// column fits 64 bits (`pk_route_key` widens a ≤8-byte OPK window;
+/// `payload_route_key`'s narrow arm is an 8-byte unsigned read XOR a sign bit
+/// below `2^63`), and it halves the sorted payload for `GROUP BY <BIGINT>`.
+pub(super) fn argsort_delta(mb: &MemBatch, keyer: &GroupKeyCols) -> Vec<u32> {
+    let n = mb.count;
     if n <= 1 {
         return (0..n as u32).collect();
     }
-
-    // No group columns: one group, so the comparator calls every pair equal and
-    // any order folds to the same aggregate. Visiting the batch as it lies keeps
-    // the fold on the canonical (PK, payload) order the epoch driver
-    // consolidated it into.
-    if descs.is_empty() {
-        return (0..n as u32).collect();
+    if keyer.canonical_col().is_some_and(|c| c.size() <= 8) {
+        argsort_by_key(n, |i| keyer.key_row(mb, i) as u64)
+    } else {
+        argsort_by_key(n, |i| keyer.key_row(mb, i))
     }
-
-    let mut indices: Vec<u32> = (0..n as u32).collect();
-    indices.sort_unstable_by(|&a, &b| compare_by_group_cols(&mb, a as usize, &mb, b as usize, descs));
-    indices
 }
 
 /// Argsort into canonical PK order via a width-matched `PkSortKey`. The key is
-/// the whole OPK image, so the compare is exact; rows sharing a PK keep
-/// arbitrary relative order (the reduce groups them regardless).
+/// the whole OPK image, so the compare is exact; rows sharing a PK come back in
+/// ascending source-index order (the reduce groups them regardless).
 fn sort_indices_keyed<K: PkSortKey>(mb: &MemBatch) -> Vec<u32> {
     argsort_by_key(mb.count, |i| K::from_opk(mb.get_pk_bytes(i)))
 }
@@ -108,7 +113,8 @@ pub(super) fn argsort_pk_canonical(mb: &MemBatch) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::argsort_pk_canonical;
+    use super::super::super::util::GroupKeyCols;
+    use super::{argsort_by_key, argsort_delta, argsort_pk_canonical};
     use crate::schema::key::compare_pk_bytes;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Batch;
@@ -234,6 +240,18 @@ mod tests {
         );
     }
 
+    /// Rows sharing a key come back in ascending source-index order: the whole
+    /// `(key, index)` pair is the sort key, so the index breaks every tie. That
+    /// is what makes a float SUM over a group reproducible for a fixed access path.
+    #[test]
+    fn argsort_by_key_breaks_ties_on_source_index() {
+        // Three keys, four rows each, interleaved.
+        let got = argsort_by_key(12, |i| i % 3);
+        assert_eq!(got, vec![0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]);
+        // Every row one key: the identity permutation.
+        assert_eq!(argsort_by_key(5, |_| 0u64), vec![0, 1, 2, 3, 4]);
+    }
+
     /// Regression guard — time `argsort_pk_canonical` over a shuffled ~1M-row batch
     /// at each keyed arm. `#[ignore]`; run release:
     ///   cargo test -p gnitz-engine --release reduce_sort -- --ignored --nocapture --test-threads=1
@@ -273,6 +291,51 @@ mod tests {
 
             let mrps = n as f64 / dt.as_secs_f64() / 1e6;
             println!("argsort stride {stride}: {n} rows in {dt:?} = {mrps:.1} M rows/s");
+        }
+    }
+
+    /// The group-sort sibling: `argsort_delta` over a shuffled ~1M-row batch at
+    /// each key arm — narrow canonical (`u64`), wide canonical (`u128`), and the
+    /// multi-column digest. `#[ignore]`; run release, as above.
+    #[test]
+    #[ignore]
+    fn reduce_sort_argsort_delta_bench() {
+        let n = 1_000_000usize;
+        // (label, schema, group cols) — the three arms.
+        let narrow = schema_single_pk(type_code::U64);
+        let wide = schema_single_pk(type_code::U128);
+        let multi = schema_3xu64_pk();
+        for (label, schema, group_cols) in [
+            ("canonical u64", &narrow, &[0u32][..]),
+            ("canonical u128", &wide, &[0u32][..]),
+            ("digest 2-col", &multi, &[0u32, 1u32][..]),
+        ] {
+            let stride = schema.pk_stride() as usize;
+            let rows: Vec<Vec<u8>> = (0..n)
+                .map(|i| {
+                    let mut v = vec![0u8; stride];
+                    for chunk in 0..stride.div_ceil(8) {
+                        let seed = (i as u64)
+                            .wrapping_add((chunk as u64).wrapping_mul(0x1000))
+                            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        let start = chunk * 8;
+                        let end = (start + 8).min(stride);
+                        v[start..end].copy_from_slice(&seed.to_be_bytes()[..end - start]);
+                    }
+                    v
+                })
+                .collect();
+            let batch = build_pk_batch(schema, &rows);
+            let mb = batch.as_mem_batch();
+            let keyer = GroupKeyCols::new(schema, group_cols);
+
+            let t = std::time::Instant::now();
+            let idx = argsort_delta(&mb, &keyer);
+            let dt = t.elapsed();
+            std::hint::black_box(&idx);
+
+            let mrps = n as f64 / dt.as_secs_f64() / 1e6;
+            println!("argsort_delta {label}: {n} rows in {dt:?} = {mrps:.1} M rows/s");
         }
     }
 }

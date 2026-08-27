@@ -67,7 +67,7 @@ pub(super) fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
 /// This is what keeps the `unreachable!` arms below unreachable — the compiler
 /// rejects a MIN/MAX over anything it excludes. Change its *form* freely; never
 /// widen its accepted set without giving those arms an encoding.
-pub(crate) fn agg_value_idx_eligible(tc: TypeCode) -> bool {
+pub(super) fn agg_value_idx_eligible(tc: TypeCode) -> bool {
     gnitz_wire::is_fixed_int(tc as u8) || tc.is_float()
 }
 
@@ -156,11 +156,10 @@ pub(super) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &
 /// the other. `route_key` dispatches on the locator, so the two need no
 /// separate arm here.
 ///
-/// `op_reduce` upgrades its `trace_out` retraction probe to the monotone
-/// `advance_to` exactly when this is true: a canonical key ascends in
-/// group-visit order because the group comparator, the route-key encoding, and
-/// the OPK truncation to the output stride agree on one byte order — the
-/// agreement `op_reduce`'s debug tripwire and the monotone-probe tests pin.
+/// A canonical key is **injective** on the group value, which is what lets a
+/// key-equality test stand in for a value comparison (the ad-hoc fold's
+/// per-row confirmation), and it is order-preserving, so sorting by it visits
+/// groups in ascending output-PK order.
 #[inline]
 pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> bool {
     if group_by_cols.len() != 1 {
@@ -231,8 +230,15 @@ pub(super) fn hash_group_col<R: RowSource>(
 /// The one implementation. It used to have a schema-walking twin whose only job
 /// was to be byte-identical to this one, policed by a test; the twin is gone.
 pub(super) struct GroupKeyCols {
+    /// See [`single_col_canonical_group_key`]. Private, and read only through
+    /// [`GroupKeyCols::canonical_col`], so the flag and the single column it
+    /// promises can never be consulted apart.
     canonical: bool,
-    cols: Vec<ColumnLocator>,
+    /// The group columns' resolved locators, in group-set order. Empty for a
+    /// global (ungrouped) aggregate, whose key is the constant
+    /// `gnitz_wire::global_group_key()` — which is what `key_row` folds to over
+    /// zero columns.
+    pub(super) cols: Vec<ColumnLocator>,
 }
 
 impl GroupKeyCols {
@@ -243,11 +249,21 @@ impl GroupKeyCols {
         }
     }
 
-    /// The 128-bit group key of `row`.
+    /// The single column the group key is the canonical `route_key` of, or
+    /// `None` when the key is the hash fold. `Some` is exactly "the key is
+    /// injective and order-preserving on the group value".
+    #[inline]
+    pub(super) fn canonical_col(&self) -> Option<ColumnLocator> {
+        self.canonical.then(|| self.cols[0])
+    }
+
+    /// The 128-bit group key of `row`. Over an empty group set this is the fold
+    /// of nothing — `gnitz_wire::global_group_key()`, the V₀ every global
+    /// aggregate keys its one row by.
     #[inline]
     pub(super) fn key_row<R: RowSource>(&self, src: &R, row: usize) -> u128 {
-        if self.canonical {
-            return self.cols[0].route_key(src, row);
+        if let Some(col) = self.canonical_col() {
+            return col.route_key(src, row);
         }
         let null_word = src.get_null_word(row);
         let mut hasher = RowHasher::new();
