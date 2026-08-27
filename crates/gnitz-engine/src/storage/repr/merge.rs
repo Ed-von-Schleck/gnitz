@@ -275,10 +275,6 @@ impl BlobCacheGuard {
         Self(None)
     }
 
-    pub(crate) fn is_active(&self) -> bool {
-        self.0.is_some()
-    }
-
     pub fn get_mut(&mut self) -> Option<&mut BlobCache> {
         self.0.as_mut()
     }
@@ -323,7 +319,7 @@ pub struct MemBatch<'a> {
     pub count: usize,
     /// The source [`Batch::blob_id`], carried so an appending destination can
     /// recognize its *own* blob and copy German-string structs verbatim instead
-    /// of relocating each cell (see `Batch::append_mem_batch_ranges`). A borrowed
+    /// of relocating each cell (see `Batch::append_ranges_inner`). A borrowed
     /// wire view has no such identity and uses `0`, which no live batch ever has
     /// (the counter starts at 1).
     pub blob_id: u64,

@@ -1296,7 +1296,7 @@ impl WorkerProcess {
                 // `(indexed_col, src_pk…)` — NOT the owner table's schema.
                 // `idx_key_size` and the PK-byte reads below come from it, so an
                 // owner-table schema would compute the wrong prefix width.
-                let schema = batch.as_ref().and_then(|b| b.schema).unwrap_or(ic.index_schema);
+                let schema = batch.as_ref().map_or(ic.index_schema, |b| b.schema);
                 // Index layout: PK = (indexed-key field, src_pk_cols). Any
                 // positive-weight match means the value is already in the index.
                 // `open_cursor` keeps a compaction Io/InvalidShard failure from

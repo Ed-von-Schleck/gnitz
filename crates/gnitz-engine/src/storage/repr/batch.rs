@@ -71,7 +71,7 @@ const FIXED_REGION_STRIDE: u8 = 8;
 pub(in crate::storage) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 
 /// Total rows in a `[start, end)` row-range list — the shape every range-driven
-/// path (`append_ranges`, `Batch::from_ranges`, `ScalarFunc::append_map_ranges`)
+/// path (`append_ranges`, `Batch::from_ranges`, `MapPlan::append_map_ranges`)
 /// sizes its destination by.
 #[inline]
 pub(crate) fn range_rows(ranges: &[(usize, usize)]) -> usize {
@@ -357,11 +357,11 @@ pub struct Batch {
     /// Fresh batches default to `Raw` — a forgotten raise degrades to a safe
     /// re-fold, never a lie.
     layout: Layout,
-    pub schema: Option<SchemaDescriptor>,
+    pub schema: SchemaDescriptor,
     /// Identity token for blob-sharing: two batches with equal `blob_id` have
     /// identical blob content, making verbatim 16-byte German String struct
     /// copies safe.  Set by `share_blob_from` and read by
-    /// `append_mem_batch_ranges` (via `MemBatch::blob_id`) to skip per-cell
+    /// `append_ranges_inner` (via `MemBatch::blob_id`) to skip per-cell
     /// relocation.
     pub(crate) blob_id: u64,
 }
@@ -371,7 +371,7 @@ impl Batch {
 
     /// The one zero-allocation empty constructor: shape (strides / region
     /// count / schema) supplied by the caller, everything else empty.
-    fn empty_from(strides: [u8; MAX_BATCH_REGIONS], num_regions: u8, schema: Option<SchemaDescriptor>) -> Self {
+    fn empty_from(strides: [u8; MAX_BATCH_REGIONS], num_regions: u8, schema: SchemaDescriptor) -> Self {
         Batch {
             data: Vec::new(),
             blob: Vec::new(),
@@ -393,7 +393,7 @@ impl Batch {
     /// no one-shot realloc fires on the first column write.
     pub fn empty_with_schema(schema: &SchemaDescriptor) -> Self {
         let (strides, nr) = strides_from_schema(schema);
-        Self::empty_from(strides, nr, Some(*schema))
+        Self::empty_from(strides, nr, *schema)
     }
 
     /// Zero-allocation empty batch with this batch's exact shape (strides,
@@ -408,15 +408,6 @@ impl Batch {
     pub fn take(&mut self) -> Self {
         let empty = self.empty_like();
         std::mem::replace(self, empty)
-    }
-
-    /// Zero-shape placeholder (no PK stride, no payload regions) for
-    /// pre-first-write register slots only — never populate or shape-read one.
-    pub fn placeholder() -> Self {
-        let mut strides = [0u8; MAX_BATCH_REGIONS];
-        strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
-        strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
-        Self::empty_from(strides, REG_PAYLOAD_START as u8, None)
     }
 
     /// An empty batch with schema, pre-allocated for `rows` rows. The arena is
@@ -459,7 +450,7 @@ impl Batch {
             capacity: cap as u32,
             count: 0,
             layout: Layout::Raw,
-            schema: Some(schema),
+            schema,
             blob_id: next_blob_id(),
         }
     }
@@ -487,7 +478,7 @@ impl Batch {
             capacity: rows.max(1) as u32,
             count: rows,
             layout: Layout::Raw,
-            schema: Some(schema),
+            schema,
             blob_id: next_blob_id(),
         }
     }
@@ -508,7 +499,15 @@ impl Batch {
         offsets: [usize; MAX_BATCH_REGIONS],
         num_regions: u8,
         count: usize,
+        schema: SchemaDescriptor,
     ) -> Self {
+        // `set_schema`'s shape check, applied where the buffers arrive rather
+        // than one statement later.
+        debug_assert_eq!(
+            num_regions as usize - REG_PAYLOAD_START,
+            schema.num_payload_cols(),
+            "from_prebuilt: payload regions disagree with the schema",
+        );
         Batch {
             data,
             blob,
@@ -518,7 +517,7 @@ impl Batch {
             capacity: count as u32,
             count,
             layout: Layout::Raw,
-            schema: None,
+            schema,
             blob_id: next_blob_id(),
         }
     }
@@ -547,7 +546,7 @@ impl Batch {
             s.num_payload_cols(),
             s.pk_indices().len()
         );
-        self.schema = Some(s);
+        self.schema = s;
     }
 
     // ── Read accessors ──────────────────────────────────────────────────
@@ -843,7 +842,7 @@ impl Batch {
     #[inline]
     pub fn extend_pk(&mut self, pk: u128) {
         debug_assert!(
-            self.schema.as_ref().is_none_or(|s| !s.pk_has_signed_col()),
+            !self.schema.pk_has_signed_col(),
             "extend_pk writes an unflipped right-aligned big-endian key: a PK with a signed column \
              must use extend_pk_opk / extend_pk_bytes",
         );
@@ -873,30 +872,6 @@ impl Batch {
     pub(crate) fn extend_pk_opk(&mut self, schema: &SchemaDescriptor, native_col_vals: &[u128]) {
         let cols = schema.pk_columns().map(|(_, col)| (col.type_code, *col));
         self.extend_pk_bytes(crate::schema::key::encode_leading_opk(cols, native_col_vals).pk_bytes());
-    }
-
-    /// Overwrite the narrow PK at `row` with a `u128` — the [`NarrowPkOpk`] image
-    /// written through [`Self::set_pk_at_bytes`], the overwrite twin of
-    /// [`Self::extend_pk`]. Unsigned-only (no sign flip); signed/compound callers
-    /// use `set_pk_at_bytes` directly.
-    #[inline]
-    pub(crate) fn set_pk_at(&mut self, row: usize, pk: u128) {
-        let key = NarrowPkOpk::new(pk, self.strides[REG_PK] as usize);
-        self.set_pk_at_bytes(row, key.bytes());
-    }
-
-    /// Overwrite the PK at `row` with raw OPK bytes. Like every order-key mutator
-    /// this downgrades the layout to `Raw`: an in-place PK rewrite can break
-    /// (PK, payload) order, so no prior sort/fold claim survives. (Today's reindex
-    /// callers build a fresh `Raw` output, so this is a no-op for them — but it
-    /// keeps the "order-destroying mutator self-downgrades" discipline uniform.)
-    #[inline]
-    pub fn set_pk_at_bytes(&mut self, row: usize, bytes: &[u8]) {
-        let stride = self.strides[REG_PK] as usize;
-        debug_assert_eq!(bytes.len(), stride, "set_pk_at_bytes: length must equal pk_stride",);
-        let off = self.offsets[REG_PK] + row * stride;
-        self.data[off..off + stride].copy_from_slice(bytes);
-        self.downgrade();
     }
 
     /// Iterate PKs as `u128`. Test-only (the only caller is a batch round-trip
@@ -976,17 +951,7 @@ impl Batch {
         let npc = self.num_payload_cols();
         // A shared blob needs no per-cell relocation, so it needs no string map
         // either — every column takes the bulk region copy below.
-        //
-        // Load-bearing: a *wire-borrowed* `MemBatch` carries `blob_id == 0`
-        // (`batch_wire.rs`) while every `Batch` mints an id from 1 up, so a
-        // wire source can never take this path — which is what makes the
-        // relocation below the canonicalizing gate for W2M frames, the one
-        // German-string ingress that skips `validate_string_heap_extents`.
-        debug_assert!(
-            self.blob_id != 0,
-            "append_ranges_inner: a Batch must never carry the wire blob_id 0"
-        );
-        let shares_blob = self.blob_id == src.blob_id && self.blob.len() == src.blob.len();
+        let shares_blob = self.shares_blob_with(src);
         let no_strings = [false; MAX_BATCH_REGIONS];
         let is_string_at = if shares_blob { &no_strings } else { is_string_at };
         if !shares_blob && !src.blob.is_empty() {
@@ -1045,14 +1010,12 @@ pub(crate) struct AppendSession<'d> {
 impl<'d> AppendSession<'d> {
     fn string_map(dst: &Batch) -> [bool; MAX_BATCH_REGIONS] {
         let mut is_string_at = [false; MAX_BATCH_REGIONS];
-        if let Some(s) = dst.schema.as_ref() {
-            let npc = dst.num_payload_cols();
-            for (pi, col) in s.payload_columns() {
-                if pi >= npc {
-                    break;
-                }
-                is_string_at[pi] = gnitz_wire::is_german_string(col.type_code);
+        let npc = dst.num_payload_cols();
+        for (pi, col) in dst.schema.payload_columns() {
+            if pi >= npc {
+                break;
             }
+            is_string_at[pi] = gnitz_wire::is_german_string(col.type_code);
         }
         is_string_at
     }
@@ -1061,10 +1024,7 @@ impl<'d> AppendSession<'d> {
     /// repeated long-string spans are appended once across every push.
     fn open(dst: &'d mut Batch, hint_rows: usize) -> Self {
         let is_string_at = Self::string_map(dst);
-        let guard = match dst.schema {
-            Some(s) => BlobCacheGuard::acquire(&s, hint_rows),
-            None => BlobCacheGuard::empty(),
-        };
+        let guard = BlobCacheGuard::acquire(&dst.schema, hint_rows);
         AppendSession {
             dst,
             is_string_at,
@@ -1579,7 +1539,7 @@ impl Batch {
     /// survivor list of a filter pass, instead of one per range.
     ///
     /// Call [`Self::share_blob_from`] first to skip per-cell string relocation
-    /// (see `append_mem_batch_ranges`); it is a pure optimization, correct either
+    /// (see `append_ranges_inner`); it is a pure optimization, correct either
     /// way.
     pub fn append_ranges(&mut self, src: &Batch, ranges: &[(usize, usize)]) {
         self.append_session(range_rows(ranges))
@@ -1677,14 +1637,12 @@ impl Batch {
 
         // `pi` is the dense payload index; it equals `enumerate`'s counter.
         for (pi, (ptr, &sz)) in col_ptrs.iter().zip(col_sizes.iter()).enumerate() {
-            let ci = schema.map_or(pi, |s| s.payload_col_idx(pi));
-            let type_code = schema.map_or(0, |s| {
-                if ci < s.num_columns() {
-                    s.columns[ci].type_code
-                } else {
-                    0
-                }
-            });
+            let ci = schema.payload_col_idx(pi);
+            let type_code = if ci < schema.num_columns() {
+                schema.columns[ci].type_code
+            } else {
+                0
+            };
             let is_null = gnitz_wire::null_word_get(null_word, pi);
             let col_size = sz as usize;
             let cell = (!is_null).then(|| std::slice::from_raw_parts(*ptr, col_size));
@@ -1723,7 +1681,7 @@ impl Batch {
         self.extend_weight(&weight.to_le_bytes());
         self.extend_null_bmp(&null_word.to_le_bytes());
 
-        let schema = self.schema.expect("append_row_simple requires schema");
+        let schema = self.schema;
 
         for (pi, col) in schema.payload_columns() {
             let col_size = col.size() as usize;
@@ -1802,8 +1760,17 @@ impl Batch {
     /// append from some other source afterwards grows `self.blob` past `src`'s.
     /// Blobs only ever grow by appending, so length equality closes exactly that
     /// gap and the pair is an exact test.
+    ///
+    /// A *wire-borrowed* `MemBatch` carries `blob_id == 0` while every `Batch`
+    /// mints one from 1 up, so a wire source always answers `false` — which is
+    /// what makes relocation the canonicalizing gate for W2M frames, the one
+    /// German-string ingress that skips `validate_string_heap_extents`.
     #[inline]
-    pub fn shares_blob_with(&self, src: &Batch) -> bool {
+    pub fn shares_blob_with(&self, src: &MemBatch<'_>) -> bool {
+        debug_assert!(
+            self.blob_id != 0,
+            "shares_blob_with: a Batch must never carry the wire blob_id 0"
+        );
         self.blob_id == src.blob_id && self.blob.len() == src.blob.len()
     }
 
@@ -1928,10 +1895,10 @@ impl Batch {
         // out to dodge that puts a 424-byte `memcpy` on this per-row path. The
         // cell body is still the shared `append_payload_cell`.
         let src_blob = source.blob();
-        let num_payload = self.own_schema().num_payload_cols();
+        let num_payload = self.schema.num_payload_cols();
         for pi in 0..num_payload {
             let col = {
-                let s = self.own_schema();
+                let s = &self.schema;
                 s.columns[s.payload_col_idx(pi)]
             };
             let cs = col.size() as usize;
@@ -1941,12 +1908,6 @@ impl Batch {
 
         self.count += 1;
         self.downgrade();
-    }
-
-    /// This batch's schema, which every row-append path requires.
-    #[inline]
-    fn own_schema(&self) -> &SchemaDescriptor {
-        self.schema.as_ref().expect("appending a row requires a schema")
     }
 
     /// Append the payload columns described by `schema` from `src[row]` into
@@ -2155,7 +2116,7 @@ pub(crate) fn write_to_batch(
         capacity: max_rows as u32,
         count: actual_rows,
         layout: Layout::Raw,
-        schema: Some(*schema),
+        schema: *schema,
     }
 }
 
@@ -2333,10 +2294,7 @@ impl BatchBuilder {
     }
 
     fn schema(&self) -> &SchemaDescriptor {
-        self.batch
-            .schema
-            .as_ref()
-            .expect("BatchBuilder batch always carries a schema")
+        &self.batch.schema
     }
 
     fn physical_col_idx(&self) -> usize {
@@ -2511,25 +2469,6 @@ mod tests {
         }
         let iter_pks: Vec<u128> = b.pk_iter().collect();
         assert_eq!(iter_pks, keys);
-    }
-
-    #[test]
-    fn set_pk_at_overwrites_existing_row() {
-        let schema = crate::test_support::pk_i64_schema(type_code::U128);
-        let mut b = Batch::with_capacity(schema, 4);
-        for pk in [10u128, 20, 30, 40] {
-            b.extend_pk(pk);
-            b.extend_weight(&1i64.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &0i64.to_le_bytes());
-            b.count += 1;
-        }
-        let new_pk = (u64::MAX as u128) + 7;
-        b.set_pk_at(2, new_pk);
-        assert_eq!(b.get_pk(0), 10);
-        assert_eq!(b.get_pk(1), 20);
-        assert_eq!(b.get_pk(2), new_pk);
-        assert_eq!(b.get_pk(3), 40);
     }
 
     fn minimal_u64_with_i64_schema() -> SchemaDescriptor {
@@ -2716,27 +2655,6 @@ mod tests {
             assert_eq!(b.get_pk_bytes(i), pk, "row {i} bytes roundtrip");
             assert_eq!(b.get_pk(i), u128::from_be_bytes(*pk), "row {i} u128");
         }
-    }
-
-    #[test]
-    fn set_pk_at_bytes_overwrites_existing_row() {
-        let schema = crate::test_support::pk_i64_schema(type_code::U128);
-        let mut b = Batch::with_capacity(schema, 4);
-        for pk in [10u128, 20, 30] {
-            b.extend_pk(pk);
-            b.extend_weight(&1i64.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &0i64.to_le_bytes());
-            b.count += 1;
-        }
-        let new_pk_bytes: [u8; 16] = [
-            0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78,
-        ];
-        b.set_pk_at_bytes(1, &new_pk_bytes);
-        assert_eq!(b.get_pk(0), 10);
-        assert_eq!(b.get_pk_bytes(1), &new_pk_bytes);
-        assert_eq!(b.get_pk(1), u128::from_be_bytes(new_pk_bytes));
-        assert_eq!(b.get_pk(2), 30);
     }
 
     #[test]
@@ -2932,10 +2850,6 @@ mod tests {
         for (i, &pk) in pks.iter().enumerate() {
             assert_eq!(b.get_pk(i), pk, "stride-12 row {i} roundtrip");
         }
-        // set_pk_at must also handle stride 12.
-        let new_pk = 9u128 | (123u128 << 64);
-        b.set_pk_at(1, new_pk);
-        assert_eq!(b.get_pk(1), new_pk);
     }
 
     /// extend_pk on a stride-12 batch must reject a u128 with bits set above the
@@ -3438,7 +3352,7 @@ mod tests {
         use crate::storage::batch_pool::acquire_buf;
         while acquire_buf().capacity() > 0 {}
 
-        let batch = Batch::placeholder();
+        let batch = Batch::empty_with_schema(&SchemaDescriptor::default());
         assert_eq!(batch.data_capacity(), 0);
         drop(batch);
 

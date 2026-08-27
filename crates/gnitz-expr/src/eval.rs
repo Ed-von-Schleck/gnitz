@@ -20,11 +20,11 @@ use crate::{BatchView, ColumnLocator, ExprValidateErr, LogicalProgram, ResolvedP
 /// and the whole surface a caller outside this crate needs.
 ///
 /// The scratch is a `RefCell` because every entry point takes `&self` — a plan
-/// node is reached through a shared handle (the VM interns `*const ScalarFunc`)
-/// while its evaluator mutates registers. Single-threaded by construction: an
-/// evaluator is owned by one operator on one worker, and the drive methods are
-/// **not re-entrant** — calling one from inside [`Self::eval_morsels`]'s
-/// callback panics on the live borrow.
+/// node is reached through a shared handle while its evaluator mutates
+/// registers. Single-threaded by construction: an evaluator is owned by one
+/// operator on one worker, and the drive methods are **not re-entrant** —
+/// calling one from inside [`Self::eval_morsels`]'s callback panics on the live
+/// borrow.
 pub struct Evaluator {
     pub(crate) prog: ResolvedProgram,
     scratch: RefCell<EvalScratch>,
@@ -48,7 +48,7 @@ impl LogicalProgram {
     /// bit_only path, which [`Evaluator::filter`] reads as packed bits.
     pub fn resolve_filter(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
         let str_class = self.validate_predicate(schema)?;
-        Ok(self.into_evaluator(schema, Role::Filter, str_class))
+        Ok(self.into_evaluator(schema, None, Role::Filter, str_class))
     }
 
     /// A map: checked against both the schema it reads and the one it writes,
@@ -59,7 +59,7 @@ impl LogicalProgram {
         out_schema: &dyn SchemaFacts,
     ) -> Result<Evaluator, ExprValidateErr> {
         let str_class = self.validate(Some(in_schema), Some(out_schema))?;
-        Ok(self.into_evaluator(in_schema, Role::Map, str_class))
+        Ok(self.into_evaluator(in_schema, Some(out_schema), Role::Map, str_class))
     }
 
     /// A scalar expression evaluated row at a time through
@@ -75,11 +75,19 @@ impl LogicalProgram {
     /// the packed bit.
     pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
         let str_class = self.validate_result_reg(schema)?;
-        Ok(self.into_evaluator(schema, Role::Scalar, str_class))
+        Ok(self.into_evaluator(schema, None, Role::Scalar, str_class))
     }
 
-    fn into_evaluator(self, schema: &dyn SchemaFacts, role: Role, str_class: u64) -> Evaluator {
-        let prog = self.resolve_program(schema, role, str_class);
+    /// `out_schema` is `Some` only for a map; the other two roles write no
+    /// output slots and so resolve no copy destination widths.
+    fn into_evaluator(
+        self,
+        schema: &dyn SchemaFacts,
+        out_schema: Option<&dyn SchemaFacts>,
+        role: Role,
+        str_class: u64,
+    ) -> Evaluator {
+        let prog = self.resolve_program(schema, out_schema, role, str_class);
         let scratch = RefCell::new(EvalScratch::new(&prog));
         Evaluator { prog, scratch }
     }
@@ -153,15 +161,51 @@ impl Evaluator {
     }
 
     /// The verbatim column moves a map materializes columnar-side, as
-    /// `(source locator, output payload slot)`.
-    pub fn copy_moves(&self) -> impl Iterator<Item = (ColumnLocator, u32)> + '_ {
-        self.prog.copies.iter().copied()
+    /// `(source locator, output payload slot, destination write width)`. A slice
+    /// rather than an iterator: at `opt-level=0` the iterator's `next` would be
+    /// an out-of-line call per (range × move).
+    pub fn copies(&self) -> &[(ColumnLocator, u32, u8)] {
+        &self.prog.copies
     }
 
     /// The computed columns a map writes out of the register file, as
     /// `(source register, output payload slot, is_str)`.
     pub fn emit_targets(&self) -> impl Iterator<Item = (u16, u32, bool)> + '_ {
         self.prog.emit_targets()
+    }
+
+    /// The scalar-register emits: one bulk copy of the register image each.
+    pub fn scalar_emits(&self) -> &[(u16, u32)] {
+        self.prog.scalar_emits()
+    }
+
+    /// The string-register emits: a German-string cell encoded per row each.
+    pub fn str_emits(&self) -> &[(u16, u32)] {
+        self.prog.str_emits()
+    }
+
+    /// True iff the program writes any output slot out of the register file, so
+    /// driving the kernel can change the output. A pure projection emits
+    /// nothing.
+    pub fn emits_anything(&self) -> bool {
+        !self.prog.emits.is_empty()
+    }
+
+    /// Bit `N` set iff payload slot `N` of the schema this program was resolved
+    /// against admits NULL — the mask the resolution's own nullability verdict
+    /// rests on, so a columnar consumer reads it rather than recomputing it.
+    pub fn nullable_slots(&self) -> u64 {
+        self.prog.nullable_slots
+    }
+
+    /// The surviving row ranges of `mb`, collected into `out` (cleared first) —
+    /// what every range-driven consumer reads instead of driving
+    /// [`Self::filter`]'s callback, which cannot carry a `?` out or be cut
+    /// against a `LIMIT` window. `out` is caller-owned so it can be reused
+    /// across chunks; `[(0, n)]` is the agreed spelling of "no predicate".
+    pub fn filter_ranges<B: BatchView>(&self, mb: &B, out: &mut Vec<(usize, usize)>) {
+        out.clear();
+        self.filter(mb, |start, end| out.push((start, end)));
     }
 
     /// Whether the result register holds a string, i.e. whether the result must

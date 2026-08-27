@@ -1,7 +1,8 @@
 //! Shared helpers used by ≥2 sub-modules.
 
-use crate::foundation::xxh::RowHasher;
-
+use crate::schema::key::{
+    hash_fold, ieee_order_bits, ieee_order_bits_f32, ieee_order_bits_f32_reverse, ieee_order_bits_reverse,
+};
 use crate::schema::{ColumnLocator, SchemaDescriptor, TypeCode};
 use gnitz_expr::RowSource;
 
@@ -19,46 +20,6 @@ use gnitz_expr::RowSource;
 /// u64, so this is the trailing-segment length the index schema, the population
 /// loop, and the lookup all agree on.
 pub(crate) const AVI_AV_BYTES: usize = 8;
-
-#[inline]
-pub(super) fn ieee_order_bits(raw_bits: u64) -> u64 {
-    if raw_bits >> 63 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u64 << 63)
-    }
-}
-
-#[inline]
-fn ieee_order_bits_reverse(encoded: u64) -> u64 {
-    if encoded >> 63 != 0 {
-        encoded ^ (1u64 << 63)
-    } else {
-        !encoded
-    }
-}
-
-/// IEEE 754 order-preserving encoding for 32-bit floats, returning u64.
-/// Checks the F32 sign bit (bit 31), not bit 63.
-#[inline]
-pub(super) fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
-    (if raw_bits >> 31 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u32 << 31)
-    }) as u64
-}
-
-/// Reverse of [`ieee_order_bits_f32`].
-#[inline]
-pub(super) fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
-    let e = encoded as u32;
-    if e >> 31 != 0 {
-        e ^ (1u32 << 31)
-    } else {
-        !e
-    }
-}
 
 /// The exact value set [`encode_ordered`] can encode: a narrow (<=8B) fixed int
 /// or float. Written as the canonical predicates rather than a negative variant
@@ -128,24 +89,6 @@ pub(super) fn decode_ordered(e: u64, col_type_code: TypeCode) -> u64 {
 // Group key helpers (shared by reduce, exchange)
 // ---------------------------------------------------------------------------
 
-/// Feed a German-string column's content into `hasher` as a length-prefixed
-/// byte run: a 4-byte LE length, then the content (following the heap pointer
-/// for long strings). The length prefix keeps "ab"+"c" from aliasing "a"+"bc"
-/// across adjacent columns.
-///
-/// Shared by the group-key fold below and the set-op row-identity hash
-/// (`reindex_hash_row`) so a string column contributes the same bytes to both.
-/// The two *digests* still differ by construction and are meant to: the group
-/// fold streams each column's canonical `route_key` under a `1`/`0` null marker,
-/// the row hash streams raw native cell bytes under the inverted marker and a
-/// leading branch discriminator. Only this per-column body is shared.
-#[inline]
-pub(super) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &[u8], blob: &[u8]) {
-    let content = gnitz_wire::german_string_content(struct_bytes, blob);
-    hasher.update(&(content.len() as u32).to_le_bytes());
-    hasher.update(content);
-}
-
 /// Whether the group key of `group_by_cols` can be emitted through the
 /// canonical (order-preserving) fast path — `ColumnLocator::route_key` on the
 /// single group column — rather than the XXH3 fold (multi-column, nullable, or
@@ -171,52 +114,6 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
     }
     let col = &schema.columns[c];
     col.nullable == 0 && gnitz_wire::is_pk_eligible(col.type_code)
-}
-
-/// Hash one group column into the fold-path digest. The single per-column body
-/// [`GroupKeyCols::key_row`] folds with — a divergence would silently merge or
-/// split groups (a wrong output PK, and a wrong AVI bucket).
-///
-/// Reads the null bit unconditionally, like the sibling `compare_by_group_cols`:
-/// a NOT NULL column never carries one, so masking it off would cost a per-row
-/// AND to change nothing.
-#[inline]
-pub(super) fn hash_group_col<R: RowSource>(
-    hasher: &mut RowHasher,
-    src: &R,
-    row: usize,
-    null_word: u64,
-    loc: ColumnLocator,
-) {
-    // A PK column is never null, so this is the payload-only NULL gate.
-    if loc.is_null_word(null_word) {
-        hasher.update(&[0u8]); // null marker
-        return;
-    }
-    hasher.update(&[1u8]); // non-null marker
-    match loc {
-        // Length-prefixed content, matching reindex_hash_row. BLOB comes here too:
-        // it shares the 16-byte struct, so hashing that would key on a heap pointer.
-        ColumnLocator::Payload { slot, size, type_code } if gnitz_wire::is_german_string(type_code) => {
-            hash_german_string_content(hasher, src.get_col_ptr(row, slot as usize, size as usize), src.blob());
-        }
-        // Canonical (sign-flipped/widened) value, so a payload FK hashes like the
-        // same value stored as a PK column. U128/UUID included: their
-        // `payload_route_key` arm is `u128::from_le_bytes(cell)`.
-        _ => hasher.update(&loc.route_key(src, row).to_le_bytes()),
-    }
-}
-
-/// The 128-bit XXH3 fold of `locs` over one row. The one body behind both folds
-/// — [`GroupKeyCols::key_row`]'s non-canonical branch and the packed group key's
-/// overflow slot — so the two cannot drift apart.
-#[inline]
-pub(super) fn hash_fold<R: RowSource>(locs: &[ColumnLocator], src: &R, row: usize, null_word: u64) -> u128 {
-    let mut hasher = RowHasher::new();
-    for &loc in locs {
-        hash_group_col(&mut hasher, src, row, null_word, loc);
-    }
-    hasher.digest128()
 }
 
 /// The 128-bit group key of a row: the canonical single-column route key where

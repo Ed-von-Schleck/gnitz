@@ -372,8 +372,8 @@ impl MappedShard {
             Vec::new()
         };
 
-        let mut batch = unsafe { Batch::from_prebuilt(data, blob, strides, offsets, num_regions_u8, row_count) };
-        batch.set_schema(*schema);
+        let mut batch =
+            unsafe { Batch::from_prebuilt(data, blob, strides, offsets, num_regions_u8, row_count, *schema) };
         // Shards are written consolidated; a contiguous slice stays (PK, payload)-
         // sorted and ghost-free (shards are ghost-free by construction). Certify it.
         batch.certify_layout(Layout::Consolidated, schema);

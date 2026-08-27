@@ -2,7 +2,7 @@
 
 use std::cell::UnsafeCell;
 
-use crate::expr::ScalarFunc;
+use crate::expr::MapPlan;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ReadCursor, Table};
 
@@ -40,8 +40,8 @@ macro_rules! resource_idx {
 
 resource_idx! {
     TableIdx => "tables";
-    FuncIdx => "funcs";
-    PackerIdx => "reindex_packers";
+    PredIdx => "predicates";
+    MapIdx => "maps";
     PlanIdx => "reduce_plans";
     BakeIdx => "avi_bakes";
 }
@@ -52,13 +52,12 @@ pub(crate) enum Instr {
     Filter {
         in_reg: u16,
         out_reg: u16,
-        func_idx: FuncIdx,
+        pred_idx: PredIdx,
     },
     Map {
         in_reg: u16,
         out_reg: u16,
-        func_idx: FuncIdx,
-        reindex: ReindexOperand,
+        map_idx: MapIdx,
     },
     Negate {
         in_reg: u16,
@@ -123,18 +122,6 @@ pub(crate) enum Instr {
         /// tick; `None` means every aggregate is linear.
         avi: Option<ReduceAvi>,
     },
-}
-
-/// Stored form of [`crate::ops::ReindexSpec`] — the `Instr::Map` PK-restamp
-/// operand. `Pack` indexes `Program::reindex_packers` rather than inlining the
-/// packer: a `ReindexPacker` is an order of magnitude wider than an `Instr`, and
-/// inlining it would grow every instruction and wreck the dispatch loop's
-/// locality. The exec dispatch resolves the index to the borrowed ops enum.
-#[derive(Clone, Copy)]
-pub(crate) enum ReindexOperand {
-    None,
-    HashRow { branch_id: u8 },
-    Pack { packer_idx: PackerIdx },
 }
 
 /// True iff `instr` reads the batch of register `r`. The instruction set's own
@@ -321,18 +308,17 @@ impl RegisterMeta {
 /// Owns every resource its instructions name, in the index space those
 /// instructions use — so an operand is a position in one vector and there is no
 /// second numbering to keep in step.
-#[allow(clippy::vec_box)]
 pub(crate) struct Program {
     pub instructions: Vec<Instr>,
     pub reg_meta: Vec<RegisterMeta>,
-    /// Scalar functions — filters, maps, projections, post-reduce finalizes.
-    pub funcs: Vec<Box<ScalarFunc>>,
+    /// Filter predicates.
+    pub predicates: Vec<gnitz_expr::Evaluator>,
+    /// Map plans — maps, projections, post-reduce finalizes.
+    pub maps: Vec<MapPlan>,
     /// Child tables created during compilation (integrate, history, reduce, AVI).
     /// `UnsafeCell` because an operator mutates its table while the dispatch
     /// still holds `&program` for the instruction stream and `reg_meta`.
     pub tables: Vec<UnsafeCell<Box<Table>>>,
-    /// Baked per-`Instr::Map` reindex packers (see `ReindexOperand::Pack`).
-    pub reindex_packers: Vec<crate::ops::ReindexPacker>,
     /// Baked per-`Instr::Reduce` plans (see `ops::ReducePlan`).
     pub reduce_plans: Vec<crate::ops::ReducePlan>,
     /// Baked AVI write-side resources, indexed by `IntegrateAvi::bake_idx`.
@@ -390,11 +376,7 @@ impl RegisterFile {
         let registers = metas
             .iter()
             .map(|m| Register {
-                batch: if m.schema.num_columns() > 0 {
-                    Batch::empty_with_schema(&m.schema)
-                } else {
-                    Batch::placeholder()
-                },
+                batch: Batch::empty_with_schema(&m.schema),
                 cursor_ptr: std::ptr::null_mut(),
             })
             .collect();
@@ -404,7 +386,7 @@ impl RegisterFile {
     /// Clear delta batches without refreshing cursors.
     pub(super) fn clear_deltas(&mut self, metas: &[RegisterMeta]) {
         for (reg, meta) in self.registers.iter_mut().zip(metas) {
-            if meta.owned_table.is_none() && meta.schema.num_columns() > 0 {
+            if meta.owned_table.is_none() {
                 reg.batch.clear();
             }
         }
@@ -591,11 +573,11 @@ mod tests {
         ];
         let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
         let mut builder = ProgramBuilder::new();
-        let func_idx = builder.push_func(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema).unwrap());
+        let pred_idx = builder.push_predicate(pred_prog.resolve_filter(&schema).unwrap());
         builder.push(Instr::Filter {
             in_reg: 0,
             out_reg: 1,
-            func_idx,
+            pred_idx,
         });
         builder.push(Instr::Negate { in_reg: 1, out_reg: 2 });
         builder.push(Instr::Halt);
@@ -792,8 +774,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.count, 1);
         assert_eq!(
-            result.schema,
-            Some(merged),
+            result.schema, merged,
             "a batch leaving the VM carries its output register's schema, not the operand's",
         );
     }
@@ -924,21 +905,24 @@ mod tests {
 
     #[test]
     fn test_map_operator() {
-        // MAP with ScalarFunc projection: reorder/select columns.
+        // MAP projection: reorder/select columns.
         let in_schema = make_schema(&[type_code::I64, type_code::I64]);
         let out_schema = make_schema(&[type_code::I64]);
 
-        // MAP with ScalarFunc projection: reorder/select columns.
         let mut builder = ProgramBuilder::new();
-        let func_idx = builder.push_func(
-            crate::expr::ScalarFunc::from_map(gnitz_expr::LogicalProgram::copy_cols(&[2]), &in_schema, &out_schema)
-                .unwrap(),
+        let map_idx = builder.push_map(
+            crate::expr::MapPlan::from_map(
+                gnitz_expr::LogicalProgram::copy_cols(&[2]),
+                &in_schema,
+                &out_schema,
+                crate::expr::PkSource::Inherit,
+            )
+            .unwrap(),
         );
         builder.push(Instr::Map {
             in_reg: 0,
             out_reg: 1,
-            func_idx,
-            reindex: ReindexOperand::None,
+            map_idx,
         });
         builder.push(Instr::Halt);
 
@@ -1281,11 +1265,11 @@ mod tests {
         let prog = LogicalProgram::new(instrs, 3, 2, vec![]);
 
         let mut builder = ProgramBuilder::new();
-        let func_idx = builder.push_func(crate::expr::ScalarFunc::from_predicate(prog, &schema).unwrap());
+        let pred_idx = builder.push_predicate(prog.resolve_filter(&schema).unwrap());
         builder.push(Instr::Filter {
             in_reg: 0,
             out_reg: 1,
-            func_idx,
+            pred_idx,
         });
         builder.push(Instr::Halt);
 

@@ -76,7 +76,7 @@ pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, u8)>, src: &[u8], 
 /// big-endian image is read, its sign bit un-flipped for signed types, and the
 /// native little-endian value stored — the mirror of the encoder, arm for arm,
 /// and likewise never a read-modify-write of `dst`.
-#[inline]
+#[inline(always)]
 pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
     let flip = crate::is_signed_int(tc);

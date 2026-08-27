@@ -189,18 +189,6 @@ impl DagEngine {
         batch.into_consolidated(schema)
     }
 
-    /// Stamp a delta headed for the exchange wire with its source table's schema
-    /// when it carries none: a row-bearing batch with a `None` schema emits
-    /// `FLAG_HAS_DATA` without `FLAG_HAS_SCHEMA` and panics the reactor decode.
-    fn ensure_wire_schema(&self, mut input: Batch, src_id: i64) -> Batch {
-        if input.schema.is_none() {
-            if let Some(entry) = self.tables.get(&src_id) {
-                input.set_schema(entry.schema);
-            }
-        }
-        input
-    }
-
     // ── Multi-worker dispatch ───────────────────────────────────────────
 
     /// Run one multi-worker DAG step: ensure the view's circuit is compiled,
@@ -262,7 +250,6 @@ impl DagEngine {
 
         if is_range_join {
             // Arm 2 — relay the input delta first, then the exchanged pipeline.
-            let input = self.ensure_wire_schema(input, src_id);
             let bc = exchange.do_exchange(view_id, &input, src_id);
             self.run_view_epoch(view_id, bc, src_id, |pre, key| exchange.do_exchange(view_id, &pre, key))
         } else if sides > 0 {
@@ -277,7 +264,6 @@ impl DagEngine {
             })
         } else if join_scatter {
             // Arm 5 — scatter the delta by the join-shard cols before the pipeline.
-            let input = self.ensure_wire_schema(input, src_id);
             let exchanged = exchange.do_exchange(view_id, &input, src_id);
             self.execute_epoch(view_id, exchanged, src_id)
         } else {
@@ -461,7 +447,7 @@ impl DagEngine {
                     continue;
                 }
                 let existing = slot.take();
-                let schema = existing.schema.unwrap_or(src_schema);
+                let schema = existing.schema;
                 *slot = ops::op_union(existing, d, &schema);
             }
         }

@@ -52,7 +52,7 @@ impl WorkerProcess {
             seek_pk: source_id as u128,
             seek_col_idx: pad_bit,
             request_id: tick_request_id,
-            schema: schema.as_ref(),
+            schema: Some(&schema),
             data: ipc::WireData::Whole(Some(batch)),
             ..Default::default()
         };

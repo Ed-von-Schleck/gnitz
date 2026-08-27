@@ -3,19 +3,19 @@
 
 use std::rc::Rc;
 
-use crate::expr::PkFill;
+use crate::expr::PkSource;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, Layout, ReadCursor};
 use crate::test_support::{make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64};
 use gnitz_wire::{encode_german_string, read_i64_le, read_u64_le};
 
-use super::super::reindex::ReindexPacker;
 use super::super::util::GroupKeyCols;
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor};
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::op_reduce::AviHistory;
 use super::plan::{build_reduce_output_schema, ReducePlan};
 use super::sort::{argsort_delta, compare_by_group_cols};
+use crate::schema::key::ReindexPacker;
 use crate::schema::ColumnLocator;
 use gnitz_wire::AggFunc;
 
@@ -506,8 +506,13 @@ fn linear_sum_only_new_all_null_group_present() {
         LogicalInstr::IntDiv { dst: 4, a: 3, b: 2 }, // r4 = sum / gate
         LogicalInstr::Emit { src: 4, out: 1 },       // emit r4 → fin payload 1 (sum)
     ];
-    let fin_func =
-        crate::expr::ScalarFunc::from_map(LogicalProgram::new(instrs, 5, 0, vec![]), &out_schema, &fin_schema).unwrap();
+    let fin_func = crate::expr::MapPlan::from_map(
+        LogicalProgram::new(instrs, 5, 0, vec![]),
+        &out_schema,
+        &fin_schema,
+        PkSource::Inherit,
+    )
+    .unwrap();
 
     let aggs = [
         AggDescriptor {
@@ -538,7 +543,7 @@ fn linear_sum_only_new_all_null_group_present() {
         b
     };
     let raw = op_reduce(&delta, &mut to_ch, &in_schema, &[1u32], &aggs, None, false, false);
-    let fin = fin_func.evaluate_map_batch(&raw, PkFill::Copy);
+    let fin = fin_func.evaluate_map_batch(&raw);
     assert_eq!(
         raw.count, 1,
         "new all-NULL group is present (cardinality 1), not dropped"
@@ -676,8 +681,13 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         LogicalInstr::IntDiv { dst: 4, a: 3, b: 2 },  // r4 = sum / gate (NULL when gate == 0)
         LogicalInstr::Emit { src: 4, out: 2 },        // emit r4 → fin payload 2 (sum)
     ];
-    let fin_func =
-        crate::expr::ScalarFunc::from_map(LogicalProgram::new(instrs, 5, 0, vec![]), &out_schema, &fin_schema).unwrap();
+    let fin_func = crate::expr::MapPlan::from_map(
+        LogicalProgram::new(instrs, 5, 0, vec![]),
+        &out_schema,
+        &fin_schema,
+        PkSource::Inherit,
+    )
+    .unwrap();
 
     let aggs = [
         AggDescriptor {
@@ -716,7 +726,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     };
 
     let raw1 = op_reduce(&delta1, &mut to_ch, &in_schema, &[1u32], &aggs, None, false, false);
-    let fin1 = fin_func.evaluate_map_batch(&raw1, PkFill::Copy);
+    let fin1 = fin_func.evaluate_map_batch(&raw1);
     // One group: count=2, sum=5 (non-null while a contributor remains), cnn=1.
     assert_eq!(raw1.count, 1);
     assert_eq!(fin1.count, 1);
@@ -745,7 +755,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     };
 
     let _raw2 = op_reduce(&delta2, &mut to_ch2, &in_schema, &[1u32], &aggs, None, false, false);
-    let fin2 = fin_func.evaluate_map_batch(&_raw2, PkFill::Copy);
+    let fin2 = fin_func.evaluate_map_batch(&_raw2);
     // Retract the old aggregate (w=-1) and insert the new one (w=+1).
     assert_eq!(fin2.count, 2);
 

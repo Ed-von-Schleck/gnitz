@@ -572,7 +572,7 @@ async fn commit_pushes(
             }
             let schema = shared.disp().schema_desc_for(tid);
             let mut m = match merge_pool.remove(&(tid, mode.as_u8())) {
-                Some(pooled) if pooled.schema.as_ref() == Some(&schema) => pooled,
+                Some(pooled) if pooled.schema == schema => pooled,
                 _ => Batch::with_capacity(schema, total_rows.max(1)),
             };
             m.clear();

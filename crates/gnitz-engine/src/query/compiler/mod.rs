@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rustc_hash::FxHashSet;
 use std::fmt;
 
-use crate::expr::ScalarFunc;
+use crate::expr::MapPlan;
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::AggDescriptor;
 use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};

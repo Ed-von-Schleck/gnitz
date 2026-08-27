@@ -1,12 +1,13 @@
-//! Instruction emission: per-node `emit_*`, the expression/scalar-func
+//! Instruction emission: per-node `emit_*`, the predicate/map-plan
 //! constructors, and `build_plan` (one plan, pre or post exchange).
 
 use super::*;
+use crate::expr::PkSource;
 use crate::ops::{JoinProbe, RangeProbe};
-use crate::query::vm::{reads_reg, Instr, IntegrateAvi, IntegrateTarget, ReduceAvi, ReindexOperand, TableIdx};
+use crate::query::vm::{reads_reg, Instr, IntegrateAvi, IntegrateTarget, ReduceAvi, TableIdx};
 
 // ---------------------------------------------------------------------------
-// Expression + scalar function construction helpers
+// Expression construction helpers
 // ---------------------------------------------------------------------------
 
 /// Name the failed guard in the compile error and carry the validator's reason
@@ -184,14 +185,14 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
             // A present-but-corrupt blob, or a rejected program, is catalog
             // corruption. Falling back to pass-all would silently turn a WHERE
             // into WHERE TRUE; fail the compile instead.
-            let func = LogicalProgram::from_blob(blob, "filter")
-                .and_then(|p| ScalarFunc::from_predicate(p, &in_schema))
+            let pred = LogicalProgram::from_blob(blob, "filter")
+                .and_then(|p| p.resolve_filter(&in_schema))
                 .map_err(expr_reject("filter: invalid predicate program"))?;
-            let func_idx = ctx.builder.push_func(func);
+            let pred_idx = ctx.builder.push_predicate(pred);
             ctx.builder.push(Instr::Filter {
                 in_reg,
                 out_reg: reg_id,
-                func_idx,
+                pred_idx,
             });
         }
 
@@ -401,20 +402,20 @@ fn dense_copy_srcs(prog: &LogicalProgram, in_schema: &SchemaDescriptor) -> Resul
 }
 
 /// The `MapKind`s differ only in how they derive `(output schema, map program,
-/// reindex operand)`; building the `ScalarFunc`, eliding an identity and the
-/// emission are shared. Each arm hands its `LogicalProgram` down rather than
+/// PK source)`; building the `MapPlan`, eliding an identity and the emission are
+/// shared. Each arm hands its `LogicalProgram` down rather than
 /// consuming it, so the shared exit's identity check sees every arm.
 fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) -> Result<(), CompileError> {
     let in_reg = ctx.unary_in(nid)?;
     let in_reg_schema = ctx.reg_meta[in_reg as usize].schema;
-    let (node_schema, prog, reindex) = match mk {
+    let (node_schema, prog, pk_source) = match mk {
         gnitz_wire::MapKind::Compute { program, out_cols } => {
             // The declared payload slots ARE the layout: a computed projection has
             // no dense copy list to derive one from. `from_map` below validates the
             // program against them, which is what catches a false declaration.
             let node_schema = compute_map_output_schema(&in_reg_schema, out_cols)
                 .ok_or(CompileError::Rejected("compute map: output exceeds MAX_COLUMNS"))?;
-            (node_schema, decode_map_program(program)?, ReindexOperand::None)
+            (node_schema, decode_map_program(program)?, PkSource::Inherit)
         }
 
         gnitz_wire::MapKind::Reindex {
@@ -437,17 +438,16 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             // schema reads the promoters the per-row pack writes through, so the
             // reindexed `_join_pk` and the delta scatter co-partition by
             // construction. Same packer the exchange scatter builds from `ViewMeta`.
-            let packer = crate::ops::ReindexPacker::new(&in_reg_schema, reindex_cols, reindex_target_tcs)
+            let packer = crate::schema::key::ReindexPacker::new(&in_reg_schema, reindex_cols, reindex_target_tcs)
                 .ok_or(CompileError::Rejected("map: invalid reindex key"))?;
             let node_schema = packer
                 .output_schema(&in_reg_schema, &dense_copy_srcs(&prog, &in_reg_schema)?)
                 .ok_or(CompileError::Rejected("map: reindex output exceeds MAX_COLUMNS"))?;
-            let packer_idx = ctx.builder.add_reindex_packer(packer);
-            (node_schema, prog, ReindexOperand::Pack { packer_idx })
+            (node_schema, prog, PkSource::Pack(packer))
         }
 
         gnitz_wire::MapKind::HashRow(proj_cols, target_tcs, branch_id) => {
-            // `hashrow_output_schema` declares the synthetic U128 PK op_map
+            // `hashrow_output_schema` declares the synthetic U128 PK the map
             // hashes, and `create_universal_projection` widens each source into
             // its (possibly promoted) slot — so both set-op sides hash one
             // physical layout.
@@ -462,7 +462,7 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             (
                 node_schema,
                 LogicalProgram::copy_cols(proj_cols),
-                ReindexOperand::HashRow { branch_id: *branch_id },
+                PkSource::HashRow { branch_id: *branch_id },
             )
         }
 
@@ -476,35 +476,35 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             // PK-inclusive and lives inside the builder.
             let node_schema = build_map_output_schema(&in_reg_schema, cols)
                 .ok_or(CompileError::Rejected("projection map: output exceeds MAX_COLUMNS"))?;
-            (node_schema, LogicalProgram::copy_cols(cols), ReindexOperand::None)
+            (node_schema, LogicalProgram::copy_cols(cols), PkSource::Inherit)
         }
     };
 
     // A MAP that reproduces its input row verbatim emits nothing; the node's
     // consumers read the input register instead. A reindex overwrites every row's
     // PK, so it is never an identity.
-    if matches!(reindex, ReindexOperand::None) && copies_input_verbatim(&prog, &in_reg_schema, &node_schema) {
+    if matches!(pk_source, PkSource::Inherit) && copies_input_verbatim(&prog, &in_reg_schema, &node_schema) {
         ctx.out_reg_of.insert(nid, in_reg);
         return Ok(());
+    }
+    // A `PkSource::Inherit` map copies the input PK region verbatim, so the two
+    // strides must agree.
+    if matches!(pk_source, PkSource::Inherit) && node_schema.pk_stride() != in_reg_schema.pk_stride() {
+        return Err(CompileError::Rejected("map: output PK stride differs from the input's"));
     }
     // For the projection arms the output schema is derived from a client column
     // list rather than supplied, and `build_map_output_schema` drops PK sources
     // while `copy_cols` numbers destinations densely — so a PK index leaves a copy
     // addressing a slot that does not exist. This is what catches it.
-    let func = ScalarFunc::from_map(prog, &in_reg_schema, &node_schema)
+    let plan = MapPlan::from_map(prog, &in_reg_schema, &node_schema, pk_source)
         .map_err(expr_reject("map: program/schema mismatch"))?;
-    // A reindex-free map inherits the input PK region verbatim (`PkFill::Copy`).
-    if matches!(reindex, ReindexOperand::None) && func.map_out_schema().pk_stride() != in_reg_schema.pk_stride() {
-        return Err(CompileError::Rejected("map: output PK stride differs from the input's"));
-    }
-    let func_idx = ctx.builder.push_func(func);
+    let map_idx = ctx.builder.push_map(plan);
 
     ctx.reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
     ctx.builder.push(Instr::Map {
         in_reg,
         out_reg: reg_id,
-        func_idx,
-        reindex,
+        map_idx,
     });
     Ok(())
 }
@@ -1185,7 +1185,7 @@ mod tests {
         );
         // The sink validates against the reindex Map's output schema (2 synthetic
         // PK slots [U64, I64] + the two input columns).
-        let out_schema = crate::ops::ReindexPacker::new(&in_schema, &[0, 1], &[])
+        let out_schema = crate::schema::key::ReindexPacker::new(&in_schema, &[0, 1], &[])
             .unwrap()
             .output_schema(&in_schema, &[0, 1])
             .unwrap();
@@ -1246,7 +1246,7 @@ mod tests {
             ],
             &[0],
         );
-        let out_schema = crate::ops::ReindexPacker::new(&in_schema, &[0], &[])
+        let out_schema = crate::schema::key::ReindexPacker::new(&in_schema, &[0], &[])
             .unwrap()
             .output_schema(&in_schema, &[2])
             .unwrap();
@@ -1870,14 +1870,14 @@ mod tests {
         }
     }
 
-    /// The two derived map out-schemas are by construction ones `ScalarFunc`
+    /// The two derived map out-schemas are by construction ones `MapPlan`
     /// accepts. `HashRow` is the only site that emits a *promoting* `CopyCol`,
     /// so it is what makes `check_copy_types`' widening clause do work; the
     /// reindex case pins that `payload_copy_srcs` and
     /// `ReindexPacker::output_schema` cannot drift apart into a mixed-type copy.
     #[test]
     fn test_derived_map_schemas_satisfy_copy_types() {
-        use crate::expr::ScalarFunc;
+        use crate::expr::{MapPlan, PkSource};
         use gnitz_expr::LogicalProgram;
         let in_schema = SchemaDescriptor::new(
             &[
@@ -1894,11 +1894,11 @@ mod tests {
         let cols: Vec<u32> = vec![0, 1, 2, 3, 4];
         let prog = || LogicalProgram::copy_cols(&cols);
         let payload_cols = prog().payload_copy_srcs().unwrap().to_vec();
-        let reindexed = crate::ops::ReindexPacker::new(&in_schema, &[4], &[type_code::U64])
+        let reindexed = crate::schema::key::ReindexPacker::new(&in_schema, &[4], &[type_code::U64])
             .unwrap()
             .output_schema(&in_schema, &payload_cols)
             .unwrap();
-        assert!(ScalarFunc::from_map(prog(), &in_schema, &reindexed).is_ok());
+        assert!(MapPlan::from_map(prog(), &in_schema, &reindexed, PkSource::Inherit).is_ok());
 
         // A cross-width set-op coercion: the U32 column promoted to I64, every
         // other column carried verbatim (target 0). The promotion is one
@@ -1907,6 +1907,6 @@ mod tests {
         let wire_cols: Vec<u32> = cols.to_vec();
         assert!(!optimize::payload_promotion_invalid(&wire_cols, &tcs, &in_schema));
         let hashed = hashrow_output_schema(&in_schema, &cols, &tcs).unwrap();
-        assert!(ScalarFunc::from_map(prog(), &in_schema, &hashed).is_ok());
+        assert!(MapPlan::from_map(prog(), &in_schema, &hashed, PkSource::Inherit).is_ok());
     }
 }

@@ -112,7 +112,7 @@ fn build_check_batch_with<K>(
 ) -> Batch {
     let n = keys.len();
     let mut batch = match pooled {
-        Some(b) if b.schema.as_ref() == Some(schema) => {
+        Some(b) if b.schema == *schema => {
             let mut b = b;
             b.clear();
             b.reserve_rows(n);

@@ -112,7 +112,7 @@ impl DagEngine {
             .map_err(|e| format!("hydrate: view {view_id} replay failed: {e}"))?;
             if let Some(b) = produced {
                 debug_assert!(
-                    b.schema.is_none_or(|s| s.same_physical_layout(&view_schema)),
+                    b.schema.same_physical_layout(&view_schema),
                     "hydration produced a batch that is not in the view's schema",
                 );
                 out.append_batch(&b, 0, b.count);

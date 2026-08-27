@@ -17,9 +17,9 @@ use super::router::{RouteMode, ScatterKey};
 // hoisted `ScatterKey`, and settle PK ties with the canonical
 // `compare_pk_ordering`.
 #[cfg(test)]
-use super::super::reindex::ReindexPacker;
-#[cfg(test)]
 use crate::schema::key::compare_pk_bytes;
+#[cfg(test)]
+use crate::schema::key::ReindexPacker;
 #[cfg(test)]
 use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 

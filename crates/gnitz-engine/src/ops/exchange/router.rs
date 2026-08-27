@@ -5,8 +5,8 @@ use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, MemBatch};
 use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 
-use super::super::reindex::ReindexPacker;
 use super::super::util::GroupKeyCols;
+use crate::schema::key::ReindexPacker;
 
 /// Keep only the rows this worker owns, by packed-PK hash — the trace-side
 /// counterpart of the **pure** range-join broadcast input relay. A pure range
@@ -270,7 +270,7 @@ mod tests {
             for row in 0..2 {
                 // Legacy: string → german_string_promote_key → worker_for_key.
                 let legacy = worker_for_key(
-                    crate::ops::reindex::german_string_promote_key(mb.get_col_ptr(row, 0, 16), mb.blob),
+                    crate::schema::key::german_string_promote_key(mb.get_col_ptr(row, 0, 16), mb.blob),
                     NW,
                 );
                 assert_eq!(packed(&schema, &[1], &[], &mb, row), legacy, "STRING row {row}");

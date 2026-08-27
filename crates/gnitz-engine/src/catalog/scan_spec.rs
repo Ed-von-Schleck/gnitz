@@ -21,12 +21,12 @@ use gnitz_wire::{AggReadSpec, Cut, OrderKey, RangeDescriptor, ReadBound, ReadSin
 
 use super::store_io::{BoundedRead, SourceCursor};
 use super::*;
-use crate::expr::ScalarFunc;
+use crate::expr::{MapPlan, PkSource};
 use crate::ops::AdhocFold;
 use crate::schema::key::{compare_pk_bytes, opk_key, PkBuf};
 use crate::schema::ColumnLocator;
 use crate::storage::{compare_rows, PkSetGather};
-use gnitz_expr::LogicalProgram;
+use gnitz_expr::{Evaluator, LogicalProgram};
 
 /// `limit_k` above which the worker materializes instead of running the bounded
 /// top-k sink (a deep OFFSET ships unsorted and the client sorts). Worker
@@ -435,7 +435,7 @@ fn pk_set_opk_keys(source: i64, keys: &[u128], src_schema: &SchemaDescriptor) ->
 /// The per-request context both sinks read on every chunk: the compiled
 /// predicate and the drain size.
 struct ScanSinkCtx<'a> {
-    predicate: Option<&'a ScalarFunc>,
+    predicate: Option<&'a Evaluator>,
     chunk_rows: usize,
 }
 
@@ -466,9 +466,9 @@ fn run_scan_fold_sink(
 
 /// The filter's surviving row ranges over one chunk — the whole chunk when there
 /// is no predicate. `out` is per-request scratch reused across chunks.
-fn survivor_ranges(predicate: Option<&ScalarFunc>, chunk: &Batch, out: &mut Vec<(usize, usize)>) {
+fn survivor_ranges(predicate: Option<&Evaluator>, chunk: &Batch, out: &mut Vec<(usize, usize)>) {
     match predicate {
-        Some(f) => f.filter_ranges(chunk, out),
+        Some(f) => f.filter_ranges(&chunk.as_mem_batch(), out),
         None => {
             out.clear();
             out.push((0, chunk.count));
@@ -485,7 +485,7 @@ fn survivor_ranges(predicate: Option<&ScalarFunc>, chunk: &Batch, out: &mut Vec<
 fn run_scan_rows_sink(
     source: &mut SourceCursor,
     ctx: ScanSinkCtx,
-    projection: Option<&ScalarFunc>,
+    projection: Option<&MapPlan>,
     reply_schema: &SchemaDescriptor,
     order: &[OrderKey],
     limit_k: u64,
@@ -729,26 +729,26 @@ pub fn scan_spec_worker(schema: &SchemaDescriptor, range: &RangeDescriptor, num_
 }
 
 /// Decode + validate a client predicate blob against `schema`, then build its
-/// predicate `ScalarFunc` — the same path the circuit compiler runs. Any failure
+/// predicate `Evaluator` — the same path the circuit compiler runs. Any failure
 /// is a corrupt frame (the client pre-compiled the identical program at plan time).
-fn compile_predicate(blob: &[u8], schema: &SchemaDescriptor) -> Result<ScalarFunc, String> {
+fn compile_predicate(blob: &[u8], schema: &SchemaDescriptor) -> Result<Evaluator, String> {
     LogicalProgram::from_blob(blob, "scan_spec predicate")
-        .and_then(|p| ScalarFunc::from_predicate(p, schema))
+        .and_then(|p| p.resolve_filter(schema))
         .map_err(|e| format!("scan_spec: invalid predicate program: {e}"))
 }
 
-/// Decode + validate a client projection (MAP) blob and build its map
-/// `ScalarFunc` — the same path the circuit compiler runs. `validate` bounds
-/// every payload slot against `out_schema.num_payload_cols()` and requires the
-/// program to write all of them, so an OOB or unwritten slot is a clean `Err`
-/// rather than a panic or a shipped byte of the keeper's recycled tail.
+/// Decode + validate a client projection (MAP) blob and build its [`MapPlan`] —
+/// the same path the circuit compiler runs. `validate` bounds every payload slot
+/// against `out_schema.num_payload_cols()` and requires the program to write all
+/// of them, so an OOB or unwritten slot is a clean `Err` rather than a panic or
+/// a shipped byte of the keeper's recycled tail.
 fn compile_projection(
     blob: &[u8],
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
-) -> Result<ScalarFunc, String> {
+) -> Result<MapPlan, String> {
     LogicalProgram::from_map_blob(blob, "scan_spec projection")
-        .and_then(|p| ScalarFunc::from_map(p, in_schema, out_schema))
+        .and_then(|p| MapPlan::from_map(p, in_schema, out_schema, PkSource::Inherit))
         .map_err(|e| format!("scan_spec: invalid projection program: {e}"))
 }
 

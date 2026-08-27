@@ -103,13 +103,11 @@ pub(crate) fn execute_epoch_from(
             // A mismatched schema with count>0 means we'd run the program against
             // the wrong column layout, silently scrambling every downstream read —
             // fail loudly instead.
-            if let Some(ref s) = input_batch.schema {
-                assert_eq!(
-                    s.num_columns(),
-                    program.reg_meta[input_reg as usize].schema.num_columns(),
-                    "VM register {input_reg} schema/batch column-count mismatch",
-                );
-            }
+            assert_eq!(
+                input_batch.schema.num_columns(),
+                program.reg_meta[input_reg as usize].schema.num_columns(),
+                "VM register {input_reg} schema/batch column-count mismatch",
+            );
         }
         regfile.registers[input_reg as usize].batch = input_batch;
     }
@@ -166,31 +164,22 @@ pub(crate) fn execute_epoch_from(
             Instr::Filter {
                 in_reg,
                 out_reg,
-                func_idx,
+                pred_idx,
             } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Filter: in_reg and out_reg must be distinct");
-                let func = &program.funcs[func_idx.at()];
+                let pred = &program.predicates[pred_idx.at()];
                 let schema = &program.reg_meta[*in_reg as usize].schema;
-                let result = ops::op_filter(&reg!(*in_reg).batch, func, schema);
+                let result = ops::op_filter(&reg!(*in_reg).batch, pred, schema);
                 reg_mut!(*out_reg).batch = result;
             }
 
             Instr::Map {
                 in_reg,
                 out_reg,
-                func_idx,
-                reindex,
+                map_idx,
             } => {
                 debug_assert_ne!(*in_reg, *out_reg, "Map: in_reg and out_reg must be distinct");
-                let func = &program.funcs[func_idx.at()];
-                let reindex = match *reindex {
-                    ReindexOperand::None => ops::ReindexSpec::None,
-                    ReindexOperand::HashRow { branch_id } => ops::ReindexSpec::HashRow { branch_id },
-                    ReindexOperand::Pack { packer_idx } => {
-                        ops::ReindexSpec::Pack(&program.reindex_packers[packer_idx.at()])
-                    }
-                };
-                let result = ops::op_map(&reg!(*in_reg).batch, func, reindex);
+                let result = program.maps[map_idx.at()].evaluate_map_batch(&reg!(*in_reg).batch);
                 reg_mut!(*out_reg).batch = result;
             }
 
@@ -372,7 +361,7 @@ pub(crate) fn execute_epoch_from(
         // physical layout means the batch was built against another schema
         // entirely, which the stamp would hide from the wire encode.
         debug_assert!(
-            batch.schema.is_none_or(|got| got.same_physical_layout(&want)),
+            batch.schema.same_physical_layout(&want),
             "VM output register {output_reg}: batch label is not the register's physical layout",
         );
         batch.set_schema(want);

@@ -5,11 +5,11 @@ use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ColumnLocator, ReduceOutKey};
 use crate::storage::{Batch, MemBatch, ReadCursor};
 
-use super::super::reindex::ReindexPacker;
 use super::agg::{apply_agg_from_value_index, fold_old_aggs, read_old_minmax_encoded, Accumulator};
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::plan::ReducePlan;
 use super::sort::{argsort_delta, argsort_pk_canonical, compare_by_group_cols};
+use crate::schema::key::ReindexPacker;
 
 /// The history a non-linear (MIN/MAX) reduce consults: the combined
 /// aggregate-value index's cursor, together with the packer that spells a

@@ -387,7 +387,7 @@ pub enum MapKind {
     ///
     /// The declared columns travel because a computed projection has no copy list
     /// the engine could derive a schema from — `payload_copy_srcs` is `None` for
-    /// `a + b`. `ScalarFunc::from_map` validates the program against them.
+    /// `a + b`. `MapPlan::from_map` validates the program against them.
     Compute {
         program: Vec<u8>,
         out_cols: Vec<(u8, bool)>,

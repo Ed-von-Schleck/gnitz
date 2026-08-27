@@ -8,7 +8,7 @@
 //!   - `distinct`  — the weight clamps every set operation is built from
 //!   - `exchange`  — repartition, relay and broadcast across workers
 //!   - `index`     — integration into a store and its secondary indexes
-//!   - `cogroup` / `reindex` / `util` — the shared grouping and key machinery
+//!   - `cogroup` / `util` — the shared grouping and key machinery
 //!
 //! What leaves the crate is the exchange surface alone: the runtime drives
 //! repartition and relay directly, so those names are `pub`. Every other
@@ -22,7 +22,6 @@ mod index;
 mod join;
 mod linear;
 mod reduce;
-mod reindex;
 mod util;
 
 #[cfg(test)]
@@ -39,6 +38,5 @@ pub use exchange::{
 };
 pub(crate) use index::{op_integrate_with_indexes, AviBake, IntegrateTarget as OpsIntegrateTarget};
 pub(crate) use join::{op_join_delta_trace, JoinProbe, RangeProbe};
-pub(crate) use linear::{op_filter, op_map, op_negate, op_null_extend, op_union, ReindexSpec};
+pub(crate) use linear::{op_filter, op_negate, op_null_extend, op_union};
 pub(crate) use reduce::{op_reduce, AdhocFold, AggDescriptor, AviHistory, ReducePlan};
-pub(crate) use reindex::ReindexPacker;

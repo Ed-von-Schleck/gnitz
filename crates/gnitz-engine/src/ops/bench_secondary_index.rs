@@ -22,9 +22,9 @@
 use std::time::{Duration, Instant};
 
 use super::index::{op_integrate_with_indexes, AviBake, IntegrateTarget};
-use super::reindex::ReindexPacker;
 use super::util::{encode_ordered, AVI_AV_BYTES};
 use super::AggDescriptor;
+use crate::schema::key::ReindexPacker;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::storage::{Batch, RecoverySource, Table};
 use gnitz_wire::AggFunc;

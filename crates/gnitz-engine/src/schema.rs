@@ -608,7 +608,7 @@ impl SchemaDescriptor {
 
     /// True iff any PK column is a signed integer.
     ///
-    /// The `extend_pk` / `set_pk_at` `u128` fast paths write the value's
+    /// The `extend_pk` `u128` fast path writes the value's
     /// right-aligned big-endian bytes with **no sign flip**, which is the OPK
     /// encoding for unsigned columns only — an all-unsigned compound PK is fine
     /// (its OPK is the big-endian concatenation, which is what a correctly packed
@@ -1206,7 +1206,7 @@ pub(crate) fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor
 }
 
 /// Output schema of a computed-projection `Map`: the input's PK region (the map
-/// inherits it verbatim, `PkFill::Copy`), then one payload column per declared
+/// inherits it verbatim, `PkSource::Inherit`), then one payload column per declared
 /// `(type_code, nullable)` slot. `decode_op_node` rejects an undecodable type
 /// code, so every entry is a real column type.
 pub(crate) fn compute_map_output_schema(

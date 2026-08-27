@@ -1489,10 +1489,21 @@ impl LogicalProgram {
     /// the `Emit` split below, which must classify a slot exactly as
     /// `check_emit_slot` did when it approved it.
     ///
+    /// `out_schema` is the map's output schema, `None` for the roles that write
+    /// no output slots. It fixes each copy's destination width here, where
+    /// `check_copy_types` has just approved the widening — so the legality of a
+    /// widening and the width it writes at are one fact.
+    ///
     /// Every "decoded once" below — LIKE matchers, trim sets, const cells, the
     /// `INT_IN_SET` pools — means **once per compile**, not once per program run
     /// and never per row.
-    pub(crate) fn resolve_program(self, schema: &dyn SchemaFacts, role: Role, str_class: u64) -> ResolvedProgram {
+    pub(crate) fn resolve_program(
+        self,
+        schema: &dyn SchemaFacts,
+        out_schema: Option<&dyn SchemaFacts>,
+        role: Role,
+        str_class: u64,
+    ) -> ResolvedProgram {
         use gnitz_wire::type_code;
         use Instr as I;
         use LogicalInstr as L;
@@ -1531,7 +1542,7 @@ impl LogicalProgram {
         // const-pool index to the cell it was encoded into.
         let mut const_cells: Vec<[u8; 16]> = Vec::new();
         let mut cell_slots: Vec<Option<u32>> = vec![None; self.const_strings.len()];
-        let mut copies: Vec<(ColumnLocator, u32)> = Vec::new();
+        let mut copies: Vec<(ColumnLocator, u32, u8)> = Vec::new();
         let mut emits: Vec<(u16, u32)> = Vec::new();
         // Filled by `batch::str_col_slot`, in buffer-slot order.
         let mut str_cols: Vec<u8> = Vec::new();
@@ -1561,7 +1572,12 @@ impl LogicalProgram {
             // depend on their position in the stream.
             match li {
                 L::CopyCol { src_col, out } => {
-                    copies.push((schema.locate(src_col as usize), out));
+                    // The same destination type code `check_copy_types` approved
+                    // the widening against; its `wire_stride` is the copy width.
+                    let stride = out_schema.map_or(0, |os| {
+                        gnitz_wire::wire_stride(os.col_type_code(os.payload_col_idx(out as usize))) as u8
+                    });
+                    copies.push((schema.locate(src_col as usize), out, stride));
                     continue;
                 }
                 L::Emit { src, out } => {
@@ -1820,9 +1836,17 @@ impl LogicalProgram {
                 L::CopyCol { .. } | L::Emit { .. } => unreachable!(),
             });
         }
+        // Stable-partition by register class, so each writer reads a slice
+        // instead of re-testing per entry. Safe because `validate` requires one
+        // writer per output slot, so emit order carries no meaning.
+        let (mut emits, str_emits): (Vec<_>, Vec<_>) =
+            emits.into_iter().partition(|&(src, _)| (str_class >> src) & 1 == 0);
+        let str_emit_start = emits.len();
+        emits.extend(str_emits);
         ResolvedProgram {
             copies,
             emits,
+            str_emit_start,
             no_nulls,
             nullable_slots,
             bit_only_mask: bit_only,
@@ -2558,15 +2582,23 @@ fn decode_int_set(bytes: &[u8]) -> Vec<i64> {
 
 pub(crate) struct ResolvedProgram {
     pub(crate) instrs: Vec<Instr>,
-    /// A map's verbatim column moves, as `(source locator, output payload slot)`.
-    /// Off the instruction stream, not in it: they name a destination rather than
-    /// a computation, so leaving them there gave the per-morsel dispatch up to
-    /// one no-op arm per projected column.
-    pub(crate) copies: Vec<(ColumnLocator, u32)>,
-    /// A map's computed columns, as `(source register, output payload slot)`. The
-    /// class a consumer needs is not stored beside them: [`Self::emit_targets`]
-    /// reads it off [`Self::str_class`], the one record of a register's class.
+    /// A map's verbatim column moves, as `(source locator, output payload slot,
+    /// destination write width)`. Off the instruction stream, not in it: they
+    /// name a destination rather than a computation, so leaving them there gave
+    /// the per-morsel dispatch up to one no-op arm per projected column.
+    ///
+    /// The width is the *output* column's, wider than the source's only for a
+    /// promoted integer column — the widening `check_copy_types` approved. `0`
+    /// for a role resolved without an output schema, which never reads these.
+    pub(crate) copies: Vec<(ColumnLocator, u32, u8)>,
+    /// A map's computed columns, as `(source register, output payload slot)`,
+    /// with the scalar-register entries first and the string-register ones from
+    /// [`Self::str_emit_start`] on. The class a consumer needs is not stored
+    /// beside them: the split — and [`Self::emit_targets`] — reads it off
+    /// [`Self::str_class`], the one record of a register's class.
     pub(crate) emits: Vec<(u16, u32)>,
+    /// Where [`Self::emits`]' string half starts.
+    str_emit_start: usize,
     pub(crate) num_regs: u32,
     /// The register holding the filter verdict, or the scalar result. A map's is
     /// meaningless and never read; [`LogicalProgram::from_map_blob`] is where
@@ -2679,6 +2711,16 @@ impl ResolvedProgram {
         self.emits
             .iter()
             .map(|&(src, out)| (src, out, (self.str_class >> src) & 1 != 0))
+    }
+
+    /// The emits whose source register holds a scalar.
+    pub(crate) fn scalar_emits(&self) -> &[(u16, u32)] {
+        &self.emits[..self.str_emit_start]
+    }
+
+    /// The emits whose source register holds a string.
+    pub(crate) fn str_emits(&self) -> &[(u16, u32)] {
+        &self.emits[self.str_emit_start..]
     }
 }
 

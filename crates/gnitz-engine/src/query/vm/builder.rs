@@ -2,20 +2,20 @@
 //!
 //! Emission constructs `Instr` literals directly (there is deliberately no
 //! per-opcode constructor mirror); the builder's job is holding the resources
-//! those instructions index — funcs, tables, and the baked operator pools —
-//! and assembling the final `Program`. Each `push`/`add` returns the index that
-//! *is* the instruction operand, so nothing has to be numbered twice.
+//! those instructions index — predicates, map plans, tables, and the baked
+//! operator pools — and assembling the final `Program`. Each `push`/`add`
+//! returns the index that *is* the instruction operand, so nothing has to be
+//! numbered twice.
 
 use super::*;
-use crate::expr::ScalarFunc;
+use crate::expr::MapPlan;
 use crate::storage::Table;
 
-#[allow(clippy::vec_box)]
 pub(crate) struct ProgramBuilder {
     instructions: Vec<Instr>,
-    funcs: Vec<Box<ScalarFunc>>,
+    predicates: Vec<gnitz_expr::Evaluator>,
+    maps: Vec<MapPlan>,
     tables: Vec<UnsafeCell<Box<Table>>>,
-    reindex_packers: Vec<crate::ops::ReindexPacker>,
     reduce_plans: Vec<crate::ops::ReducePlan>,
     avi_bakes: Vec<crate::ops::AviBake>,
 }
@@ -27,9 +27,9 @@ impl ProgramBuilder {
     pub(crate) fn new() -> Self {
         ProgramBuilder {
             instructions: Vec::with_capacity(16),
-            funcs: Vec::new(),
+            predicates: Vec::new(),
+            maps: Vec::new(),
             tables: Vec::new(),
-            reindex_packers: Vec::new(),
             reduce_plans: Vec::new(),
             avi_bakes: Vec::new(),
         }
@@ -53,10 +53,17 @@ impl ProgramBuilder {
 
     // ── Resources ────────────────────────────────────────────────────────
 
-    /// Take ownership of `func`, returning its `Instr` operand.
-    pub(crate) fn push_func(&mut self, func: ScalarFunc) -> FuncIdx {
-        let idx = FuncIdx(self.funcs.len() as u16);
-        self.funcs.push(Box::new(func));
+    /// Take ownership of `pred`, returning its `Instr::Filter` operand.
+    pub(crate) fn push_predicate(&mut self, pred: gnitz_expr::Evaluator) -> PredIdx {
+        let idx = PredIdx(self.predicates.len() as u16);
+        self.predicates.push(pred);
+        idx
+    }
+
+    /// Take ownership of `plan`, returning its `Instr::Map` operand.
+    pub(crate) fn push_map(&mut self, plan: MapPlan) -> MapIdx {
+        let idx = MapIdx(self.maps.len() as u16);
+        self.maps.push(plan);
         idx
     }
 
@@ -88,13 +95,6 @@ impl ProgramBuilder {
         idx
     }
 
-    /// Store a baked reindex packer, returning its `ReindexOperand::Pack` index.
-    pub(crate) fn add_reindex_packer(&mut self, packer: crate::ops::ReindexPacker) -> PackerIdx {
-        let idx = PackerIdx(self.reindex_packers.len() as u16);
-        self.reindex_packers.push(packer);
-        idx
-    }
-
     // ── Build ────────────────────────────────────────────────────────────
 
     /// Consume the builder into a runnable `VmHandle`.
@@ -111,9 +111,9 @@ impl ProgramBuilder {
         let program = Program {
             instructions: self.instructions,
             reg_meta,
-            funcs: self.funcs,
+            predicates: self.predicates,
+            maps: self.maps,
             tables: self.tables,
-            reindex_packers: self.reindex_packers,
             reduce_plans: self.reduce_plans,
             avi_bakes: self.avi_bakes,
         };

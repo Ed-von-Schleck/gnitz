@@ -1,16 +1,17 @@
-//! Linear operators: op_filter, op_map, op_negate, op_union, op_null_extend.
+//! Linear operators: op_filter, op_negate, op_union, op_null_extend.
 //!
-//! PK-promotion for reindex (GROUP BY / equijoin / set-op keys) lives in the
-//! sibling `reindex` module; `op_map` calls into it for the reindex paths.
+//! MAP has no operator here: a `MapPlan` owns its output schema and its PK
+//! source, so `crate::expr::MapPlan::evaluate_map_batch` *is* the whole body and
+//! a forwarder would only re-spell its arguments.
 
 use std::cmp::Ordering;
 
-use crate::expr::{PkFill, ScalarFunc};
+use gnitz_expr::Evaluator;
+
 use crate::schema::SchemaDescriptor;
 use crate::storage::{with_payload_cmp, Batch, Layout, MemBatch, RowComparator};
 
 use super::cogroup::{cogroup_union, BatchCursor};
-use super::reindex::{reindex_hash_row, ReindexPacker};
 
 // ---------------------------------------------------------------------------
 // Linear operators
@@ -18,7 +19,7 @@ use super::reindex::{reindex_hash_row, ReindexPacker};
 
 /// Filter: retain rows where predicate returns true.
 /// Uses contiguous-range bulk copy for efficiency.
-pub(crate) fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) -> Batch {
+pub(crate) fn op_filter(batch: &Batch, pred: &Evaluator, schema: &SchemaDescriptor) -> Batch {
     let n = batch.count;
     if n == 0 {
         return Batch::empty_with_schema(schema);
@@ -28,7 +29,7 @@ pub(crate) fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescrip
     // it is a wash (glibc grows the fresh allocation in place), and it is ~1% of
     // the gather it feeds either way.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    func.filter_ranges(batch, &mut ranges);
+    pred.filter_ranges(&batch.as_mem_batch(), &mut ranges);
     let mut output = Batch::from_ranges(batch, &ranges, schema);
 
     // The gather downgraded `output` to `Raw`. A filtered subset preserves the
@@ -37,64 +38,6 @@ pub(crate) fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescrip
     output.inherit_layout(batch);
 
     gnitz_debug!("op_filter: in={} out={}", n, output.count);
-    output
-}
-
-/// Who writes the output PK region of a MAP — see [`op_map`]. Anything but
-/// `None` stamps it here, so the map itself runs `PkFill::Reindex` and leaves it
-/// alone. The stored instruction operand is `query::vm::ReindexOperand` (`Pack`
-/// there keeps a side-table range); the exec dispatch resolves it to this
-/// borrowed form.
-pub(crate) enum ReindexSpec<'a> {
-    /// Plain batch map — the map inherits the input PK verbatim.
-    None,
-    /// Set each PK to a hash of the full output row (all payload columns) for
-    /// EXCEPT/INTERSECT/DISTINCT full-row set identity.
-    HashRow { branch_id: u8 },
-    /// Pack the reindex columns' OPK bytes contiguously into the output PK (the
-    /// `_join_pk` for an equijoin / GROUP BY repartition). The packer is baked at
-    /// compile time — its per-column promoters are a function of the input schema
-    /// and the key, neither of which changes between batches.
-    Pack(&'a ReindexPacker),
-}
-
-/// Map: transform batch via scalar function, then stamp the output PK region
-/// per `reindex` (see [`ReindexSpec`]). The output schema lives in the func
-/// (`ScalarFunc::Map.out_schema`).
-pub(crate) fn op_map(batch: &Batch, func: &ScalarFunc, reindex: ReindexSpec<'_>) -> Batch {
-    // A reindex-free MAP inherits the input PK region verbatim; the reindex arms
-    // below overwrite every row of it, so the map must not write it at all
-    // (their output stride legitimately differs from the input's).
-    let pk = match reindex {
-        ReindexSpec::None => PkFill::Copy,
-        _ => PkFill::Reindex,
-    };
-    let mut output = func.evaluate_map_batch(batch, pk);
-    if batch.count == 0 {
-        return output;
-    }
-    debug_assert_eq!(
-        output.count, batch.count,
-        "MAP output row count must equal input row count",
-    );
-    match reindex {
-        // Set each PK to a hash of the full output row so rows with identical
-        // content collide and distinct content does not (EXCEPT/INTERSECT/
-        // DISTINCT full-row set identity).
-        ReindexSpec::HashRow { branch_id } => reindex_hash_row(func.map_out_schema(), &mut output, branch_id),
-        // Pack each reindex column's OPK bytes contiguously into the output PK.
-        // The SAME packer routes the exchange scatter (via `ScatterKey`), so the
-        // reindexed `_join_pk` and the delta scatter co-partition byte-for-byte.
-        ReindexSpec::Pack(packer) => packer.promote_into(&batch.as_mem_batch(), &mut output),
-        ReindexSpec::None => {}
-    }
-
-    // `evaluate_map_batch` returns `Raw`, and every path keeps it there: a
-    // reindex/hash stamp only rewrites PK bytes (no layout raise), and a plain
-    // projection stays `Raw` because a payload-reordering projection over a
-    // duplicate-PK input can break (PK, payload) order (the D1 fail-safe — only
-    // `into_consolidated` would trust `sorted`, and it re-sorts a `Raw` batch).
-    gnitz_debug!("op_map: in={} out={}", batch.count, output.count);
     output
 }
 
@@ -466,7 +409,9 @@ mod tests {
                 b: 1,
             }, // r2 = (r0 > r1)
         ];
-        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema).unwrap();
+        let func = LogicalProgram::new(instrs, 3, 2, vec![])
+            .resolve_filter(&schema)
+            .unwrap();
 
         let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2, "only pk=2 and pk=3 pass val>10");
@@ -482,7 +427,9 @@ mod tests {
             LogicalInstr::LoadConst { dst: 0, val: 1 }, // always true
         ];
         let schema = make_schema_u64_i64();
-        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), &schema).unwrap();
+        let func = LogicalProgram::new(instrs, 1, 0, vec![])
+            .resolve_filter(&schema)
+            .unwrap();
 
         let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
 
@@ -510,21 +457,6 @@ mod tests {
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!(get_payload_i64(&out, 1), 20);
         assert!(out.is_consolidated());
-    }
-
-    // -----------------------------------------------------------------------
-    // op_map tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_op_map_empty_batch() {
-        use gnitz_expr::LogicalProgram;
-        let schema = make_schema_u64_i64();
-        let empty_batch = Batch::empty_with_schema(&schema);
-
-        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).unwrap();
-        let out = op_map(&empty_batch, &func, ReindexSpec::None);
-        assert_eq!(out.count, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -685,10 +617,12 @@ mod tests {
     // Stride consistency on early-exit empty batches (item 3)
     // -----------------------------------------------------------------------
 
-    fn always_true_func(schema: &SchemaDescriptor) -> ScalarFunc {
+    fn always_true_func(schema: &SchemaDescriptor) -> Evaluator {
         use gnitz_expr::{LogicalInstr, LogicalProgram};
         let instrs = vec![LogicalInstr::LoadConst { dst: 0, val: 1 }]; // always true
-        ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), schema).unwrap()
+        LogicalProgram::new(instrs, 1, 0, vec![])
+            .resolve_filter(schema)
+            .unwrap()
     }
 
     #[test]
@@ -817,43 +751,6 @@ mod tests {
         assert_eq!(out.get_weight(1), -5);
     }
 
-    #[test]
-    fn test_op_map_with_reindex_promotes_payload_to_pk() {
-        use gnitz_expr::LogicalProgram;
-        // op_map with reindex_col >= 0 rewrites the output PK by reading the
-        // referenced column through the reindex packer. Verifies (1) every row's
-        // output PK matches the source column value, (2) the resulting
-        // batch is correctly marked unsorted/unconsolidated (sort order on
-        // the new PK is not preserved by the row-by-row promote).
-
-        // Input: PK u64, payload i64. Reindex on the payload (col 1) — the
-        // new output PK is each row's payload value.
-        let schema = make_schema_u64_i64();
-        let batch = make_batch(&schema, &[(1, 1, 200), (2, 1, 100), (3, 1, 300)]);
-
-        // Projection plan: output keeps the same single payload column.
-        let func = ScalarFunc::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema).unwrap();
-
-        let packer = ReindexPacker::new(&schema, &[1], &[]).unwrap();
-        let out = op_map(&batch, &func, ReindexSpec::Pack(&packer));
-        assert_eq!(out.count, 3);
-        // Each output row's PK is the sign-aware OPK image of its source payload
-        // value (col 1 is I64): `widen_pk_be(encode_pk_column(v))`, i.e. the value
-        // with its sign bit flipped, matching how `ColumnLocator::route_key` routes the same
-        // value. A raw-native `== 200` assertion would falsely fail signed reindex.
-        let opk_i64 = |v: i64| ((v as u64) ^ 0x8000_0000_0000_0000) as u128;
-        assert_eq!(out.get_pk(0), opk_i64(200));
-        assert_eq!(out.get_pk(1), opk_i64(100));
-        assert_eq!(out.get_pk(2), opk_i64(300));
-        // Payload itself is unchanged by the projection.
-        assert_eq!(get_payload_i64(&out, 0), 200);
-        assert_eq!(get_payload_i64(&out, 1), 100);
-        assert_eq!(get_payload_i64(&out, 2), 300);
-        // Reindex destroys PK order — output must be marked accordingly.
-        assert!(!out.is_sorted(), "reindex output must not be marked sorted");
-        assert!(!out.is_consolidated(), "reindex output must not be marked consolidated");
-    }
-
     // -----------------------------------------------------------------------
     // op_filter
     // -----------------------------------------------------------------------
@@ -863,7 +760,6 @@ mod tests {
     /// must keep exactly the rows whose payload exceeds 10, in input PK order.
     #[test]
     fn test_filter_batch_matches_per_row() {
-        use crate::expr::ScalarFunc;
         use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
 
         let schema = make_schema_u64_i64();
@@ -905,7 +801,9 @@ mod tests {
                 b: 1,
             },
         ];
-        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema).unwrap();
+        let func = LogicalProgram::new(instrs, 3, 2, vec![])
+            .resolve_filter(&schema)
+            .unwrap();
 
         let out = op_filter(&batch, &func, &schema);
         // pk=2(15), 3(25), 5(20), 7(30), 9(11), 11(50), 13(12), 15(100), 18(13), 20(22)

@@ -80,10 +80,9 @@ pub(crate) fn wire_header_dir_size(schema: &SchemaDescriptor) -> usize {
 }
 
 impl Batch {
-    /// Write this batch as a shard file directly to disk. `schema` is passed
-    /// explicitly (not read from `Batch.schema`, which is `Option` and absent
-    /// for some constructors); `opts` carries the durability / flags / FoR
-    /// packing policy (see [`shard_file::ShardWriteOpts`]).
+    /// Write this batch as a shard file directly to disk. `opts` carries the
+    /// durability / flags / FoR packing policy (see
+    /// [`shard_file::ShardWriteOpts`]).
     pub fn write_as_shard(
         &self,
         path: &CStr,
@@ -297,8 +296,7 @@ impl Batch {
 
         // SAFETY: `data_buf`/`offsets` were laid out by compute_offsets for
         // `mb.count` rows of these strides and every region was filled above.
-        let mut batch = unsafe { Batch::from_prebuilt(data_buf, blob, strides, offsets, nr, mb.count) };
-        batch.set_schema(*schema);
+        let batch = unsafe { Batch::from_prebuilt(data_buf, blob, strides, offsets, nr, mb.count, *schema) };
         Ok((batch, bytes_consumed))
     }
 }

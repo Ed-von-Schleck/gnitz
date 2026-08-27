@@ -5,7 +5,7 @@ use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::Batch;
 use gnitz_wire::AggFunc;
 
-use super::reindex::ReindexPacker;
+use crate::schema::key::ReindexPacker;
 
 // ---------------------------------------------------------------------------
 // Public descriptor types
