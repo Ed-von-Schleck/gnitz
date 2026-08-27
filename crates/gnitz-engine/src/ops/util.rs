@@ -188,38 +188,35 @@ pub(super) fn hash_group_col<R: RowSource>(
     null_word: u64,
     loc: ColumnLocator,
 ) {
-    match loc {
-        ColumnLocator::Pk { .. } => {
-            // PK columns are non-nullable; canonical OPK-derived route key, so
-            // a PK sub-column hashes like the same value as a payload FK on a
-            // join's other side.
-            hasher.update(&[1u8]); // non-null marker
-            hasher.update(&loc.route_key(src, row).to_le_bytes());
-        }
-        ColumnLocator::Payload { slot, size, type_code } => {
-            if gnitz_wire::null_word_get(null_word, slot as usize) {
-                hasher.update(&[0u8]); // null marker
-                return;
-            }
-            hasher.update(&[1u8]); // non-null marker
-            if gnitz_wire::is_german_string(type_code) {
-                // STRING and BLOB both hash length-prefixed content via the shared
-                // helper (matching reindex_hash_row). BLOB takes this path too: it
-                // shares the 16-byte German-string struct, so hashing the struct
-                // instead of the content would key on a heap pointer. `size` is
-                // already 16 for both.
-                hash_german_string_content(hasher, src.get_col_ptr(row, slot as usize, size as usize), src.blob());
-            } else {
-                // Canonical (sign-flipped/widened) value: a payload FK hashes like
-                // the same value stored as a PK column — the same `route_key` the
-                // Pk arm takes, which is exactly why the two agree. This covers
-                // U128/UUID too: `payload_route_key`'s arm for them is
-                // `u128::from_le_bytes(cell)`, so its `to_le_bytes()` *is* the
-                // 16-byte cell.
-                hasher.update(&loc.route_key(src, row).to_le_bytes());
-            }
-        }
+    // A PK column is never null, so this is the payload-only NULL gate.
+    if loc.is_null_word(null_word) {
+        hasher.update(&[0u8]); // null marker
+        return;
     }
+    hasher.update(&[1u8]); // non-null marker
+    match loc {
+        // Length-prefixed content, matching reindex_hash_row. BLOB comes here too:
+        // it shares the 16-byte struct, so hashing that would key on a heap pointer.
+        ColumnLocator::Payload { slot, size, type_code } if gnitz_wire::is_german_string(type_code) => {
+            hash_german_string_content(hasher, src.get_col_ptr(row, slot as usize, size as usize), src.blob());
+        }
+        // Canonical (sign-flipped/widened) value, so a payload FK hashes like the
+        // same value stored as a PK column. U128/UUID included: their
+        // `payload_route_key` arm is `u128::from_le_bytes(cell)`.
+        _ => hasher.update(&loc.route_key(src, row).to_le_bytes()),
+    }
+}
+
+/// The 128-bit XXH3 fold of `locs` over one row. The one body behind both folds
+/// — [`GroupKeyCols::key_row`]'s non-canonical branch and the packed group key's
+/// overflow slot — so the two cannot drift apart.
+#[inline]
+pub(super) fn hash_fold<R: RowSource>(locs: &[ColumnLocator], src: &R, row: usize, null_word: u64) -> u128 {
+    let mut hasher = RowHasher::new();
+    for &loc in locs {
+        hash_group_col(&mut hasher, src, row, null_word, loc);
+    }
+    hasher.digest128()
 }
 
 /// The 128-bit group key of a row: the canonical single-column route key where
@@ -265,12 +262,7 @@ impl GroupKeyCols {
         if let Some(col) = self.canonical_col() {
             return col.route_key(src, row);
         }
-        let null_word = src.get_null_word(row);
-        let mut hasher = RowHasher::new();
-        for &loc in &self.cols {
-            hash_group_col(&mut hasher, src, row, null_word, loc);
-        }
-        hasher.digest128()
+        hash_fold(&self.cols, src, row, src.get_null_word(row))
     }
 }
 

@@ -618,7 +618,7 @@ impl IndexKeySpec {
     /// reduces to `encode_pk_column`.
     ///
     /// The encoding is the locator's own `encode_opk_promoted`, which is also
-    /// what `ops::reindex`'s `ColPromoter::write_into` calls: the two must emit
+    /// what `ops::reindex`'s `ReindexPacker::pack_into` calls: the two must emit
     /// byte-identical keys for one logical value, and sharing the method is what
     /// makes that hold by construction rather than by two sites agreeing.
     pub(crate) fn write_span(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {

@@ -15,7 +15,7 @@ use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout};
 use gnitz_wire::type_code;
 
-use super::shared::{arb_type_code, col_def, pk_i64_schema};
+use super::shared::{arb_type_code, col_def, pk_i64_schema, u64_pk_schema};
 use crate::catalog::ColumnDef;
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
@@ -178,13 +178,7 @@ pub fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> 
 
 /// U64 pk + a single BLOB payload column.
 pub fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::BLOB, 0),
-        ],
-        &[0],
-    )
+    u64_pk_schema(type_code::BLOB)
 }
 
 // ---------------------------------------------------------------------------

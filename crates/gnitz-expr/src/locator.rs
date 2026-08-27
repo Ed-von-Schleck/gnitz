@@ -60,12 +60,25 @@ impl ColumnLocator {
         }
     }
 
-    /// True iff this column is NULL in `row`. PK columns are never null.
+    /// True iff this column is NULL in `row`. PK columns are never null, and
+    /// short-circuit *before* the null-word load — per-row callers hitting that
+    /// arm must not pay a load for a value they never read.
     #[inline(always)]
     pub fn is_null(&self, mb: &impl RowSource, row: usize) -> bool {
         match *self {
             ColumnLocator::Pk { .. } => false,
-            ColumnLocator::Payload { slot, .. } => gnitz_wire::null_word_get(mb.get_null_word(row), slot as usize),
+            ColumnLocator::Payload { .. } => self.is_null_word(mb.get_null_word(row)),
+        }
+    }
+
+    /// [`Self::is_null`] against an already-read null word, for the callers that
+    /// hold one: a row loop reading several columns, or one that needs the word
+    /// for a group fold anyway.
+    #[inline(always)]
+    pub fn is_null_word(&self, null_word: u64) -> bool {
+        match *self {
+            ColumnLocator::Pk { .. } => false,
+            ColumnLocator::Payload { slot, .. } => gnitz_wire::null_word_get(null_word, slot as usize),
         }
     }
 
@@ -149,10 +162,12 @@ impl ColumnLocator {
     }
 
     /// Encode this column's value in `row` as the OPK image of `out_tc`, into
-    /// `dst` (exactly `out_tc`'s width). Order-preserving, sign-correct and
-    /// equality-correct at any source width, and the identity copy when `out_tc`
-    /// already equals this column's type. Callers must [`Self::is_null`]-gate a
-    /// nullable payload column first; a PK column is never null.
+    /// `dst` (exactly `out_tc`'s width). For an **integer** source: order-
+    /// preserving, sign-correct and equality-correct at any source width, and the
+    /// identity copy when `out_tc` already equals this column's type. A **float**
+    /// source is equality-correct only: `widen_native_le` sign-extends on
+    /// `is_signed_int`, false for F32/F64, so `-1.0` encodes above `1.0`.
+    /// Callers must [`Self::is_null`]-gate a nullable payload column first.
     ///
     /// One method rather than the same dispatch at each site because index-key
     /// projection and join-key repartitioning must emit byte-identical keys for

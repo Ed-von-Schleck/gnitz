@@ -265,7 +265,7 @@ pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {
 /// (`ColPromoter`) must produce byte-identical output for the same logical
 /// value, and they did so only by spelling the same branch twice.
 /// `#[inline(always)]`, not `#[inline]`: this is a per-row call on two hot paths
-/// (`IndexKeySpec::write_span`'s PK arm, `ColPromoter::write_into`), and at
+/// (`IndexKeySpec::write_span`'s PK arm, `ReindexPacker::pack_into`), and at
 /// `opt-level=0` — the debug binary the E2E suite runs — LLVM runs only the
 /// always-inline pass, so a plain hint would leave a real call frame around what
 /// is otherwise a `copy_from_slice`. (The `debug_assert!` is deliberately not

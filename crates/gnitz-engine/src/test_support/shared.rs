@@ -60,15 +60,15 @@ pub fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Ba
     b
 }
 
+/// A U64 PK plus one payload column of type `tc` — the reindex/promotion tests'
+/// counterpart to [`pk_i64_schema`], parameterized by payload type instead.
+pub fn u64_pk_schema(tc: u8) -> SchemaDescriptor {
+    SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0])
+}
+
 /// U64 pk + a single STRING payload column.
 pub fn make_schema_pk_u64_payload_string() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
-        ],
-        &[0],
-    )
+    u64_pk_schema(type_code::STRING)
 }
 
 /// Every wire `TypeCode`. The single source of truth for the schema-generating
