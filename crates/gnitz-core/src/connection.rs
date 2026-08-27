@@ -8,16 +8,16 @@
 //! registers a slot; `step` does the I/O the driver says the fd is ready for
 //! and reports which slots completed; waiting belongs to whoever drives it.
 //! Above the spine sit `Session`'s own blocking verb bodies, which park in
-//! [`Session::round_trip`]; beneath it, the blocking reply path the gnitz-py
-//! background I/O transport still calls (`send_batch`, `recv_push_ack`,
-//! `recv_scan`), which reads through `ClientTransport::recv_framed`.
+//! [`Session::round_trip`]; every other client — the tokio driver, the asyncio
+//! executor — drives the same five methods and does its own waiting. There is
+//! no second reply path.
 //!
 //! Replies leave the server in request order, so there is exactly one reply
 //! accumulator and it belongs to the head of the pending queue: every byte
 //! that arrives is the head slot's until its last train terminates.
 
 use std::collections::VecDeque;
-use std::os::unix::io::RawFd;
+use std::os::fd::{OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -27,11 +27,11 @@ use crate::protocol::message::{encode_message_noschema_parts, encode_message_par
 use crate::protocol::transport::{poll_fd, Next};
 use crate::protocol::{
     encode_control_frame, encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, parse_response,
-    parse_response_frame, recv_message, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
-    wire_flags_set_schema_version, ClientTransport, Message, PkTuple, ProtocolError, Schema, WireConflictMode,
-    ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
-    FLAG_CONTINUATION, FLAG_PUSH, FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED,
-    STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    parse_response_frame, wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version,
+    ClientTransport, Message, PkTuple, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
+    FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_PUSH,
+    FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NO_INDEX,
+    STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use gnitz_wire::RelDescriptorBlob;
 use lru::LruCache;
@@ -44,9 +44,8 @@ pub use gnitz_wire::{
 /// working set of tables/views without unbounded growth.
 const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
 
-/// Requests one connection may hold in flight; `submit` raises past it — a
-/// bound on the memory a driver that never waits can pin, not a throughput
-/// knob: 4× the deepest batch anything hands a connection.
+/// Requests one connection may hold in flight; `submit` raises past it. A bound
+/// on the memory a driver that never waits can pin, not a throughput knob.
 pub const MAX_IN_FLIGHT: usize = 4096;
 
 /// One relation's reply to a `scan`/`seek`/`seek_by_index`: the (cached)
@@ -142,7 +141,7 @@ fn closed_error() -> ClientError {
 /// a name blob and lets the name win, but exactly one is ever meaningful — this
 /// says which, so no caller has to encode that as a `0` / `""` sentinel pair.
 #[derive(Copy, Clone, Debug)]
-pub(crate) enum RelTarget<'a> {
+pub enum RelTarget<'a> {
     /// The canonical `"schema_name.relation_name"`.
     Name(&'a str),
     Id(u64),
@@ -202,31 +201,33 @@ pub struct SlotId(u64);
 /// where the verb names do. It borrows its inputs; the borrow ends at
 /// `submit`, which encodes there and then.
 pub enum Request<'a> {
-    /// A correlated control frame — SCAN, SEEK, SEEK_BY_INDEX: the reply's
-    /// `target_id` must be this one, and any schema block it carries is
-    /// absorbed into the cache under it.
-    Control {
+    /// A correlated read — SCAN, SEEK, SEEK_BY_INDEX: the reply's `target_id`
+    /// must be this one, any schema block it carries is absorbed into the cache
+    /// under it, and it completes as [`Reply::Scan`].
+    Read {
         target_id: u64,
         flags: u64,
         seek_pk: u128,
         seek_col_idx: u64,
         seek_pk_extra: &'a [u8],
     },
-    /// A pre-encoded, uncorrelated frame whose *answer* may be a target id:
-    /// the id allocations, RESOLVE, and the two transaction frames. Nothing is
-    /// absorbed into the cache. Owned, because it is the one variant whose
-    /// encoding already happened — a transaction frame can be megabytes, and
-    /// every producer holds the `Vec` this becomes the queue entry of.
+    /// A frame its producer already encoded — the id allocations and the two
+    /// transaction frames. Uncorrelated: nothing is absorbed into the cache,
+    /// and it completes as [`Reply::Train`].
     Uncorrelated(Vec<u8>),
-    /// PUSH — correlated like `Control`, and the one variant that chooses the
-    /// warm (schema-less) encoding against the cold one. `cold` forces the
-    /// schema block, which is what the mismatch retry sends.
+    /// RESOLVE — describe one relation. Uncorrelated on the wire, because a
+    /// by-name resolve names no id, so nothing is absorbed under the *requested*
+    /// target; the reply installs the schema under the live id it carries.
+    Resolve(RelTarget<'a>),
+    /// PUSH — correlated like `Read`, and the one variant that chooses the
+    /// warm (schema-less) encoding against the cold one. The choice is the
+    /// cache's alone: a mismatch evicts the entry in `feed`, so a re-submit
+    /// finds nothing warm and encodes cold with no flag to carry it.
     Push {
         target_id: u64,
         schema: &'a Schema,
         batch: &'a ZSetBatch,
         mode: WireConflictMode,
-        cold: bool,
     },
     /// SCAN_SPEC, carrying the caller's reply schema — the decode hint for
     /// every frame of the train, since the server sends none back — and
@@ -243,44 +244,89 @@ pub enum Request<'a> {
     ScanMulti(&'a [u64]),
 }
 
-/// One reassembled train. The terminal frame is kept whole because it is what
-/// several verbs' answers live in — `target_id` for an id allocation,
-/// `seek_pk` for a push ACK's LSN and a scan's watermark, `seek_pk_extra` for
-/// a RESOLVE's descriptor blob — and its own data block and schema are folded
-/// into `data` / `schema`, not left on it.
-///
-/// `schema` is the block the train physically carried and never a cache
-/// lookup: `schema_or_cached`'s fallback stays at the caller, because a slot
-/// that is off the cache — `scan_spec`, `scan_spec_raw` — must not be handed a
-/// cached schema for the tid it happens to name.
+impl<'a> Request<'a> {
+    /// A full-relation SCAN.
+    pub fn scan(target_id: u64) -> Request<'static> {
+        Request::Read {
+            target_id,
+            flags: 0,
+            seek_pk: 0,
+            seek_col_idx: 0,
+            seek_pk_extra: &[],
+        }
+    }
+
+    /// A point SEEK by primary key. `split_wire` routes the key's low bytes to
+    /// `seek_pk` and any overflow to `seek_pk_extra`, so no driver spells the
+    /// split itself.
+    pub fn seek(target_id: u64, pk: &'a PkTuple) -> Request<'a> {
+        let (seek_pk, seek_pk_extra) = pk.split_wire();
+        Request::Read {
+            target_id,
+            flags: FLAG_SEEK,
+            seek_pk,
+            seek_col_idx: 0,
+            seek_pk_extra,
+        }
+    }
+}
+
+/// One reassembled train: every frame's rows concatenated into `data`, the
+/// schema they decoded under, and the terminal frame whole — `target_id` and
+/// `seek_pk` are where the answers of [`Reply::Train`]'s verbs live.
 pub struct ReplyTrain {
     pub terminal: Message,
+    /// The block the train carried, else the one it decoded under — a warm
+    /// reply omits the block.
     pub schema: Option<Arc<Schema>>,
     pub data: Option<ZSetBatch>,
 }
 
+impl ReplyTrain {
+    /// The train as one relation's read result: its schema, its rows, and the
+    /// terminal watermark as a plain LSN.
+    fn into_scan(self) -> ScanReply {
+        (self.schema, self.data, self.terminal.seek_pk as u64)
+    }
+}
+
+/// What a slot's verb asked for. The spine resolves a reply against the request
+/// that opened its slot, so no driver re-attaches a relation id.
 pub enum Reply {
+    /// SCAN / SEEK / SEEK_BY_INDEX.
+    Scan(ScanReply),
+    /// `scan_multi`: N per-relation results in request order.
+    Multi(Vec<ScanReply>),
+    /// A PUSH ACK's ingest LSN.
+    Lsn(u64),
+    /// A RESOLVE: the live id, the FK-complete schema and the descriptor, or
+    /// `None` when no such relation exists.
+    Resolve(Option<(u64, Arc<Schema>, RelDescriptorBlob)>),
+    /// The train itself, for the verbs whose answer is a field of the terminal
+    /// frame: the id allocations, the transaction ACKs, and `scan_spec`.
     Train(ReplyTrain),
     /// The same train with each frame's data block left undecoded in its own
     /// frame buffer: `scan_spec_raw`, and the mirror's copy-free ingest. It
     /// carries no schema — the server sends no block back for a SCAN_SPEC.
-    Raw {
-        blocks: Vec<RawBlock>,
-        terminal: Message,
-    },
-    /// `scan_multi`: N trains in request order.
-    Multi(Vec<ReplyTrain>),
+    Raw { blocks: Vec<RawBlock>, terminal: Message },
 }
 
 pub type Completions = Vec<(SlotId, Result<Reply, ClientError>)>;
 
-/// The three decode facts a slot carries, read off the `Request` variant.
+/// How a slot decodes its reply and what that reply becomes, read off the
+/// `Request` variant at `submit`.
 enum SlotKind {
-    /// Correlate on `tid` and absorb schema blocks under it.
-    Correlated {
+    /// A correlated read: frames decode under `tid`, and schema blocks are
+    /// absorbed under it.
+    Read {
+        tid: u64,
+    },
+    /// A push: correlated the same way.
+    Push {
         tid: u64,
     },
     Uncorrelated,
+    Resolve,
     ScanSpec {
         reply_schema: Arc<Schema>,
         raw: bool,
@@ -288,6 +334,19 @@ enum SlotKind {
     Multi {
         tids: Vec<u64>,
     },
+}
+
+/// Which [`Reply`] the head slot's terminating train becomes, projected from
+/// the slot's kind. `feed` reads the kind once and carries this instead.
+enum ReplyShape {
+    Scan,
+    PushAck,
+    Resolve,
+    Train,
+    /// `scan_spec_raw`: the data blocks stay undecoded.
+    Raw,
+    /// `scan_multi`, whose slot wants this many trains in all.
+    Multi(usize),
 }
 
 struct Slot {
@@ -301,17 +360,18 @@ struct Accumulator {
     schema: Option<Arc<Schema>>,
     data: Option<ZSetBatch>,
     blocks: Vec<RawBlock>,
-    /// Finished trains of a `scan_multi`; its index is `trains.len()`.
-    trains: Vec<ReplyTrain>,
+    /// Narrowed results of a `scan_multi`; the next train's index is
+    /// `replies.len()`.
+    replies: Vec<ScanReply>,
 }
 
 /// A protocol session: the transport plus all per-connection protocol state
 /// (client id, the schema LRU, the pending queue and reply accumulator, and
 /// the warm/cold packing, continuation reassembly, cache absorption, and
 /// status→error policy that read/write them). Exactly one owner of that
-/// state — the sync [`crate::GnitzClient`] holds one; the gnitz-py async I/O
-/// thread holds its own. Because the session owns the cache, no `LruCache` is
-/// threaded as a parameter and no cache lock is shared across threads.
+/// state — the sync [`crate::GnitzClient`] holds one, and so does each async
+/// executor. Because the session owns the cache, no `LruCache` is threaded as
+/// a parameter and no cache lock is shared across threads.
 pub struct Session {
     transport: ClientTransport,
     pub client_id: u64,
@@ -320,6 +380,7 @@ pub struct Session {
     next_slot: u64,
     accum: Accumulator,
     closed: bool,
+    write_refused: bool,
     /// Run before every park of the blocking client; its `Err` aborts the
     /// operation. `Send + Sync` so the field cannot silently narrow the
     /// auto-traits of the public types that hold a session.
@@ -354,6 +415,7 @@ impl Session {
             next_slot: 1,
             accum: Accumulator::default(),
             closed: false,
+            write_refused: false,
             park_hook: None,
         }
     }
@@ -374,15 +436,18 @@ impl Session {
         self.transport.frames_sent()
     }
 
-    /// Handle that unblocks a blocking recv parked in another thread (the
-    /// async I/O loop's teardown wake). Delegates to the transport.
-    pub fn waker(&self) -> Result<crate::protocol::TransportWaker, ProtocolError> {
-        self.transport.waker()
-    }
-
-    /// The fd a driver polls. The one thing the spine will not do for it.
+    /// The fd a driver polls. Borrowed: it lives exactly as long as the
+    /// session, so a reactor that outlives one call wants
+    /// [`Self::try_clone_fd`] instead.
     pub fn as_raw_fd(&self) -> RawFd {
         self.transport.as_raw_fd()
+    }
+
+    /// An owned `dup` of the connection's socket, for a reactor to register and
+    /// drop on its own schedule. It shares the open file description, so it
+    /// reports the same readiness, and closing it leaves the connection open.
+    pub fn try_clone_fd(&self) -> Result<OwnedFd, ClientError> {
+        Ok(self.transport.try_clone_fd()?)
     }
 
     #[cfg(test)]
@@ -411,7 +476,7 @@ impl Session {
         }
         let client_id = self.client_id;
         let (parts, kind) = match req {
-            Request::Control {
+            Request::Read {
                 target_id,
                 flags,
                 seek_pk,
@@ -420,16 +485,20 @@ impl Session {
             } => {
                 let flags = self.versioned_flags(target_id, flags);
                 let ctrl = encode_control_frame(target_id, client_id, flags, seek_pk, seek_col_idx, seek_pk_extra);
-                (control_parts(ctrl), SlotKind::Correlated { tid: target_id })
+                (control_parts(ctrl), SlotKind::Read { tid: target_id })
             }
             Request::Uncorrelated(frame) => (control_parts(frame), SlotKind::Uncorrelated),
+            Request::Resolve(target) => (control_parts(self.resolve_request(target)), SlotKind::Resolve),
             Request::Push {
                 target_id,
                 schema,
                 batch,
                 mode,
-                cold,
             } => {
+                // In-process, so a convenience and never a trust boundary; the
+                // server checks the same things. Here so no driver has to
+                // remember to.
+                batch.validate(schema).map_err(ClientError::ServerError)?;
                 // FLAG_PUSH marks the frame as a push independent of data
                 // presence, so an empty batch (a legitimate empty Z-set delta)
                 // is ACKed as a no-op push instead of being mistaken for a scan.
@@ -440,7 +509,7 @@ impl Session {
                 // schema-less frame under mismatched types is reinterpreted
                 // silently at rest.
                 let warm_version = match self.schema_cache.peek(&target_id) {
-                    Some((cached, v)) if !cold && *v != 0 && schema.types_match(cached.as_ref()) => Some(*v),
+                    Some((cached, v)) if *v != 0 && schema.types_match(cached.as_ref()) => Some(*v),
                     _ => None,
                 };
                 let parts = match warm_version {
@@ -457,7 +526,7 @@ impl Session {
                         Some((schema, batch)),
                     ),
                 };
-                (parts, SlotKind::Correlated { tid: target_id })
+                (parts, SlotKind::Push { tid: target_id })
             }
             Request::ScanSpec {
                 target_id,
@@ -507,7 +576,7 @@ impl Session {
             return Ok(done);
         }
         if ready.write {
-            self.transport.flush()?;
+            self.write_refused = self.transport.flush()?;
         }
         if ready.read {
             self.transport.begin_read();
@@ -516,6 +585,13 @@ impl Session {
             self.feed(buf, &mut done)?;
         }
         Ok(done)
+    }
+
+    /// Whether the last flush left bytes the fd refused. Narrower than
+    /// `interest().write`, which a read in the same step also sets when rustls
+    /// queues ciphertext after that flush ran.
+    pub fn write_refused(&self) -> bool {
+        self.write_refused
     }
 
     /// `READ` while any slot is outstanding; `WRITE` while bytes remain queued
@@ -527,17 +603,15 @@ impl Session {
         }
     }
 
-    /// Abandon every pending slot, return them, and refuse further work: a
-    /// later `submit` returns `ClientError::ServerError("connection closed")`.
-    /// Drops the outbound queue and resets the accumulator with them, so
-    /// `interest()` reports nothing afterwards and a driver still in its loop
-    /// finds no readiness to wait on rather than spinning on a `WRITE` bit
-    /// nothing will ever clear.
-    pub fn close(&mut self) -> Vec<SlotId> {
+    /// Abandon every pending slot and refuse further work; the outbound queue
+    /// and the accumulator go with them, so `interest()` reports nothing
+    /// afterwards. A driver fails its own outstanding futures — it registered
+    /// them, so it already knows which they are.
+    pub fn close(&mut self) {
         self.closed = true;
         self.transport.clear_queue();
         self.accum = Accumulator::default();
-        self.pending.drain(..).map(|s| s.id).collect()
+        self.pending.clear();
     }
 
     /// One reply frame for the head slot. Status is classified on every
@@ -551,22 +625,27 @@ impl Session {
                 "reply frame with no request pending".into(),
             )));
         };
-        // The relation a `scan_multi` train decodes under advances with the
-        // train: tids[i] for train i, never the slot's first tid. The decode
-        // hint is the slot's own reply schema when it is off the cache, else
-        // the cached schema for the correlated relation.
-        let (correlate_tid, raw, multi_len, hint_owned) = match &head.kind {
-            SlotKind::Correlated { tid } => (Some(*tid), false, None, self.cached_hint(*tid)),
-            SlotKind::Uncorrelated => (None, false, None, None),
-            SlotKind::ScanSpec { reply_schema, raw } => (None, *raw, None, Some((Arc::clone(reply_schema), 0))),
+        // Read the head slot's kind once; everything below works off these.
+        // A `scan_multi` slot advances with its train: tids[i] for train i,
+        // never the slot's first tid.
+        let (correlate_tid, hint_owned, shape) = match &head.kind {
+            SlotKind::Read { tid } => (Some(*tid), self.cached_hint(*tid), ReplyShape::Scan),
+            SlotKind::Push { tid } => (Some(*tid), self.cached_hint(*tid), ReplyShape::PushAck),
+            SlotKind::Uncorrelated => (None, None, ReplyShape::Train),
+            SlotKind::Resolve => (None, None, ReplyShape::Resolve),
+            SlotKind::ScanSpec { reply_schema, raw } => (
+                None,
+                Some((Arc::clone(reply_schema), 0)),
+                if *raw { ReplyShape::Raw } else { ReplyShape::Train },
+            ),
             SlotKind::Multi { tids } => {
-                let tid = tids[self.accum.trains.len()];
-                (Some(tid), false, Some(tids.len()), self.cached_hint(tid))
+                let (tid, n) = (tids[self.accum.replies.len()], tids.len());
+                (Some(tid), self.cached_hint(tid), ReplyShape::Multi(n))
             }
         };
         let hint = hint_owned.as_ref().map(|(s, v)| (s.as_ref(), *v));
 
-        let (msg, block) = if raw {
+        let (msg, block) = if matches!(shape, ReplyShape::Raw) {
             let parsed = parse_response_frame(&buf, hint)?;
             (parsed.message, parsed.data_block)
         } else {
@@ -575,6 +654,11 @@ impl Session {
         let mut msg = match check_response(msg) {
             Ok(m) => m,
             Err(e) => {
+                // A rejected warm stamp, and the mismatch reply carries no
+                // block to refresh it with: evict, so the next push is cold.
+                if let (ClientError::SchemaMismatch, ReplyShape::PushAck, Some(tid)) = (&e, &shape, correlate_tid) {
+                    self.schema_cache.pop(&tid);
+                }
                 self.complete_head(Err(e), done);
                 return Ok(());
             }
@@ -619,24 +703,27 @@ impl Session {
         // The train terminated.
         let train = ReplyTrain {
             terminal,
-            schema: acc.schema.take(),
+            schema: acc.schema.take().or_else(|| hint_owned.map(|(s, _)| s)),
             data: acc.data.take(),
         };
-        let reply = match multi_len {
-            Some(n) => {
-                acc.trains.push(train);
-                if acc.trains.len() < n {
+        let reply = match shape {
+            ReplyShape::Scan => Ok(Reply::Scan(train.into_scan())),
+            ReplyShape::PushAck => Ok(Reply::Lsn(train.terminal.seek_pk as u64)),
+            ReplyShape::Resolve => self.resolve_reply(train).map(Reply::Resolve),
+            ReplyShape::Train => Ok(Reply::Train(train)),
+            ReplyShape::Raw => Ok(Reply::Raw {
+                blocks: std::mem::take(&mut self.accum.blocks),
+                terminal: train.terminal,
+            }),
+            ReplyShape::Multi(n) => {
+                self.accum.replies.push(train.into_scan());
+                if self.accum.replies.len() < n {
                     return Ok(());
                 }
-                Reply::Multi(std::mem::take(&mut acc.trains))
+                Ok(Reply::Multi(std::mem::take(&mut self.accum.replies)))
             }
-            None if raw => Reply::Raw {
-                blocks: std::mem::take(&mut acc.blocks),
-                terminal: train.terminal,
-            },
-            None => Reply::Train(train),
         };
-        self.complete_head(Ok(reply), done);
+        self.complete_head(reply, done);
         Ok(())
     }
 
@@ -655,12 +742,13 @@ impl Session {
 
     // ── The blocking client ────────────────────────────────────────────────
 
-    /// Submit, then drive to completion. The one place the blocking client
-    /// waits. A `step` error closes the connection: its framing can no longer
-    /// be trusted, and the next call reports it closed rather than submitting
-    /// onto a desynced stream. A slot abandoned by an aborting park stays
-    /// pending, and the next call drains its train before its own can start.
-    fn round_trip(&mut self, req: Request<'_>) -> Result<Reply, ClientError> {
+    /// Submit, then park on `interest()` until that slot completes, running the
+    /// park hook and absorbing `EINTR`. The blocking way to drive the spine.
+    ///
+    /// A `step` error closes the connection: its framing can no longer be
+    /// trusted. A slot abandoned by an aborting park stays pending, and the
+    /// next call drains its train before its own can start.
+    pub fn round_trip(&mut self, req: Request<'_>) -> Result<Reply, ClientError> {
         let slot = self.submit(req)?;
         let mut ready = Interest::WRITE;
         loop {
@@ -710,24 +798,19 @@ impl Session {
         }
     }
 
-    /// An uncorrelated control-only round trip: one control frame, one train.
-    fn uncorrelated(
-        &mut self,
-        target_id: u64,
-        flags: u64,
-        seek_col_idx: u64,
-        extra: &[u8],
-    ) -> Result<ReplyTrain, ClientError> {
-        let frame = encode_control_frame(target_id, self.client_id, flags, 0, seek_col_idx, extra);
-        self.round_trip_train(Request::Uncorrelated(frame))
+    /// `round_trip` narrowed to a single relation's read result.
+    fn round_trip_scan(&mut self, req: Request<'_>) -> ScanResult {
+        match self.round_trip(req)? {
+            Reply::Scan(r) => Ok(r),
+            _ => unreachable!("a correlated read completes as Reply::Scan"),
+        }
     }
 
-    /// An id allocation: the answer rides the terminal frame's `target_id`.
+    /// An id allocation: one uncorrelated control frame, and the answer rides
+    /// the terminal frame's `target_id`.
     fn alloc(&mut self, target_id: u64, flag: u64, seek_col_idx: u64) -> Result<u64, ClientError> {
-        Ok(self
-            .uncorrelated(target_id, flag, seek_col_idx, &[])?
-            .terminal
-            .target_id)
+        let frame = encode_control_frame(target_id, self.client_id, flag, 0, seek_col_idx, &[]);
+        Ok(self.round_trip_train(Request::Uncorrelated(frame))?.terminal.target_id)
     }
 
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
@@ -751,6 +834,10 @@ impl Session {
         self.alloc(seq_table_id, FLAG_ALLOCATE_SERIAL_RANGE, count)
     }
 
+    /// One push, retried once on a mismatch: `feed` evicted the cache entry, so
+    /// the re-submit finds nothing warm and encodes cold. Retrying is safe only
+    /// because the blocking client has exactly one *live* operation, so nothing
+    /// can be ordered against it.
     pub fn push_with_mode(
         &mut self,
         target_id: u64,
@@ -758,9 +845,20 @@ impl Session {
         batch: &ZSetBatch,
         mode: WireConflictMode,
     ) -> Result<u64, ClientError> {
-        batch.validate(schema).map_err(ClientError::ServerError)?;
-        let msg = self.roundtrip_push(target_id, schema, batch, mode)?;
-        Ok(msg.seek_pk as u64)
+        let push = || Request::Push {
+            target_id,
+            schema,
+            batch,
+            mode,
+        };
+        let reply = match self.round_trip(push()) {
+            Err(ClientError::SchemaMismatch) => self.round_trip(push())?,
+            other => other?,
+        };
+        match reply {
+            Reply::Lsn(lsn) => Ok(lsn),
+            _ => unreachable!("a push completes as Reply::Lsn"),
+        }
     }
 
     /// Send an atomic DDL transaction: a bundle of system-table family batches
@@ -824,37 +922,8 @@ impl Session {
         self.send_txn_frame(payload)
     }
 
-    /// A correlated control-only round trip narrowed to a `ScanReply`: the
-    /// schema the train carried else the cached one, its rows, and the
-    /// terminal watermark as a plain LSN.
-    fn control_scan(
-        &mut self,
-        target_id: u64,
-        flags: u64,
-        seek_pk: u128,
-        seek_col_idx: u64,
-        extra: &[u8],
-    ) -> ScanResult {
-        let train = self.round_trip_train(Request::Control {
-            target_id,
-            flags,
-            seek_pk,
-            seek_col_idx,
-            seek_pk_extra: extra,
-        })?;
-        Ok(self.narrow_train(target_id, train))
-    }
-
-    fn narrow_train(&mut self, target_id: u64, train: ReplyTrain) -> ScanReply {
-        (
-            self.schema_or_cached(target_id, train.schema),
-            train.data,
-            train.terminal.seek_pk as u64,
-        )
-    }
-
     pub fn scan(&mut self, target_id: u64) -> ScanResult {
-        self.control_scan(target_id, 0, 0, 0, &[])
+        self.round_trip_scan(Request::scan(target_id))
     }
 
     /// Consistent multi-relation scan: snapshot every relation in `tids` at one
@@ -871,65 +940,74 @@ impl Session {
     /// runs) before the frame is sent; other shape/tid errors surface from the
     /// server as `ClientError::ServerError`.
     pub fn scan_multi(&mut self, tids: &[u64]) -> MultiScanResult {
-        let trains = match self.round_trip(Request::ScanMulti(tids))? {
-            Reply::Multi(t) => t,
+        match self.round_trip(Request::ScanMulti(tids))? {
+            Reply::Multi(replies) => Ok(replies),
             _ => unreachable!("a scan_multi completes as Reply::Multi"),
-        };
-        Ok(tids
-            .iter()
-            .zip(trains)
-            .map(|(&tid, train)| self.narrow_train(tid, train))
-            .collect())
-    }
-
-    /// One single-frame seek round trip. `base_flag` picks the seek kind; the
-    /// cached schema version is embedded so the server can omit the schema block
-    /// on a warm-cache hit (matching push/scan).
-    fn seek_roundtrip(&mut self, target_id: u64, base_flag: u64, pk: &PkTuple, seek_col_idx: u64) -> ScanResult {
-        let (seek_pk, seek_pk_extra) = pk.split_wire();
-        self.control_scan(target_id, base_flag, seek_pk, seek_col_idx, seek_pk_extra)
+        }
     }
 
     pub fn seek(&mut self, target_id: u64, pk: &PkTuple) -> ScanResult {
-        self.seek_roundtrip(target_id, FLAG_SEEK, pk, 0)
+        self.round_trip_scan(Request::seek(target_id, pk))
     }
 
     pub fn seek_by_index(&mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128]) -> ScanResult {
-        // `seek_roundtrip`'s `split_wire` routes slot 0 → seek_pk and slots 1..K →
-        // seek_pk_extra, where the worker reassembles them with
-        // `unpack_index_key_slots`. Arity is validated upstream in
-        // `GnitzClient::seek_by_index` (the one choke point for every binding).
+        // `split_wire` routes slot 0 → seek_pk and slots 1..K → seek_pk_extra,
+        // where the worker reassembles them with `unpack_index_key_slots`.
+        // Arity is validated upstream in `GnitzClient::seek_by_index`.
         let (buf, len) = gnitz_wire::pack_index_key_slots(key_vals);
-        let pk = PkTuple::from_bytes(&buf[..len]);
-        let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
-        self.seek_roundtrip(table_id, FLAG_SEEK_BY_INDEX, &pk, seek_col_idx)
+        let key = PkTuple::from_bytes(&buf[..len]);
+        let (seek_pk, seek_pk_extra) = key.split_wire();
+        self.round_trip_scan(Request::Read {
+            target_id: table_id,
+            flags: FLAG_SEEK_BY_INDEX,
+            seek_pk,
+            seek_col_idx: gnitz_wire::pack_pk_cols(col_indices),
+            seek_pk_extra,
+        })
     }
 
     /// Describe one relation in a single round trip: `(live tid, schema,
     /// descriptor)`, or `None` when no such relation exists — a successful
     /// answer the caller renders in its own wording.
     ///
-    /// The descriptor's foreign keys are merged into the schema here, while the
-    /// `Arc` is still unique, so the block installed in `schema_cache` is the
-    /// same FK-complete schema the caller gets rather than a second copy of it.
+    /// The descriptor's foreign keys are merged into the schema by
+    /// [`Self::resolve_reply`], while the `Arc` is still unique, so the block
+    /// installed in `schema_cache` is the same FK-complete schema the caller
+    /// gets rather than a second copy of it.
     ///
     /// The reply is received uncorrelated: it never carries data, and a
     /// correlated slot would absorb the block under the *requested* tid, which
-    /// for a by-name resolve is 0. The block is instead installed under the
-    /// **live** tid the reply carries, which is what keeps a following
-    /// `scan`/`push` on its warm path.
+    /// for a by-name resolve is 0.
     pub(crate) fn resolve(
         &mut self,
         target: RelTarget<'_>,
     ) -> Result<Option<(u64, Arc<Schema>, RelDescriptorBlob)>, ClientError> {
-        // The one place the request's "name wins, else id" encoding is spelled.
+        match self.round_trip(Request::Resolve(target))? {
+            Reply::Resolve(d) => Ok(d),
+            _ => unreachable!("a resolve completes as Reply::Resolve"),
+        }
+    }
+
+    /// The RESOLVE request frame for `target`. The one place the wire's "name
+    /// wins, else id" encoding is spelled: the name rides an explicit extra
+    /// blob rather than a `PkTuple`, whose `split_wire` would silently truncate
+    /// it past `MAX_PK_BYTES`.
+    fn resolve_request(&self, target: RelTarget<'_>) -> Vec<u8> {
         let (target_id, qname) = match target {
             RelTarget::Name(q) => (0, q),
             RelTarget::Id(tid) => (tid, ""),
         };
-        // The name rides an explicit extra blob rather than a `PkTuple`, whose
-        // `split_wire` would silently truncate it past `MAX_PK_BYTES`.
-        let train = self.uncorrelated(target_id, FLAG_RESOLVE, 0, qname.as_bytes())?;
+        encode_control_frame(target_id, self.client_id, FLAG_RESOLVE, 0, 0, qname.as_bytes())
+    }
+
+    /// The matching reply: `(live tid, schema, descriptor)`, or `None` when no
+    /// such relation exists. The slot is uncorrelated, so installing the block
+    /// under the **live** tid — which is what puts a following `scan`/`push` on
+    /// its warm path — happens here rather than in `feed`.
+    fn resolve_reply(
+        &mut self,
+        train: ReplyTrain,
+    ) -> Result<Option<(u64, Arc<Schema>, RelDescriptorBlob)>, ClientError> {
         let msg = train.terminal;
         let ncols = train.schema.as_ref().map_or(0, |s| s.columns.len());
         let Some(desc) = RelDescriptorBlob::decode(&msg.seek_pk_extra, ncols).map_err(ClientError::ServerError)? else {
@@ -1000,141 +1078,6 @@ impl Session {
         Ok((train.data, train.terminal.seek_pk))
     }
 
-    /// Push path: packs `WireConflictMode` into bits 16-23 of `wire_flags`.
-    /// When the schema cache holds a valid version for `target_id` *and* the
-    /// caller's `schema` type-matches the cached one, omits the schema block
-    /// from the wire frame (warm path). On STATUS_SCHEMA_MISMATCH the cache
-    /// entry is evicted and the push is retried with the full schema. The
-    /// retry is safe because the blocking client has exactly one *live*
-    /// operation, so nothing can be ordered against it.
-    fn roundtrip_push(
-        &mut self,
-        target_id: u64,
-        schema: &Schema,
-        batch: &ZSetBatch,
-        mode: WireConflictMode,
-    ) -> Result<Message, ClientError> {
-        let push = |cold| Request::Push {
-            target_id,
-            schema,
-            batch,
-            mode,
-            cold,
-        };
-        let ack = match self.round_trip_train(push(false)) {
-            Err(ClientError::SchemaMismatch) => {
-                // Stale cache: evict and retry with full schema.
-                self.schema_cache.pop(&target_id);
-                self.round_trip_train(push(true))?
-            }
-            Ok(train) => train,
-            Err(e) => return Err(e),
-        };
-        // The cache is written by the accumulator alone. Whenever the server
-        // changes the schema version it also ships the schema block in the ACK
-        // (`wire_should_include_schema`), so the cached entry carries the
-        // server's real column names paired with the matching version. Writing
-        // the caller's copy here would clobber both.
-        Ok(ack.terminal)
-    }
-
-    // ── Async-shared protocol surface ──────────────────────────────────────
-    //
-    // Build/receive helpers the gnitz-py async I/O loop drives directly: it
-    // packs a batch of requests, ships them with one `send_batch`, then reads
-    // the responses back through the blocking reply path below. `send_batch`
-    // takes pre-packed parts and carries none of the decode facts a slot
-    // needs, so it registers none: the pending queue and the accumulator
-    // stay empty on a connection driven this way, and the correlate-then-
-    // absorb policy is written a second time in `recv_cached` for as long as
-    // that transport exists.
-
-    /// Pack a scan request (control-only) with the cached schema version, so
-    /// the server may omit the schema block on a warm hit. The matching
-    /// [`Self::recv_scan`] resolves the schema from the cache the session
-    /// owns, so no hint is threaded back.
-    pub fn pack_scan(&self, target_id: u64) -> MessageParts {
-        let flags = self.versioned_flags(target_id, 0);
-        encode_message_parts(target_id, self.client_id, flags, &PkTuple::EMPTY, 0, None)
-    }
-
-    /// Pack a point-seek request with the cached schema version.
-    pub fn pack_seek(&self, target_id: u64, pk: &PkTuple) -> MessageParts {
-        let flags = self.versioned_flags(target_id, FLAG_SEEK);
-        encode_message_parts(target_id, self.client_id, flags, pk, 0, None)
-    }
-
-    /// Pack a SCAN_MULTI request (control-only), stamping each relation with its
-    /// cached schema version. The whole self-contained frame body rides the
-    /// `ctrl` segment; the matching receiver reads N `recv_scan` trains in
-    /// request order. Rejects a list outside `1..=SCAN_MULTI_MAX_RELATIONS` or
-    /// with a duplicate tid through the shared `encode_scan_multi_frame`, so an
-    /// async driver needs no pre-check of its own.
-    pub fn pack_scan_multi(&self, tids: &[u64]) -> Result<MessageParts, ClientError> {
-        Ok(control_parts(self.encode_scan_multi_frame(tids)?))
-    }
-
-    /// Ship many pre-encoded frames: enqueue every part, then flush until the
-    /// queue is empty. Drains the caller's vector — each `MessageParts` moves
-    /// (three `Vec` headers, no payload byte copied) and the caller keeps its
-    /// capacity as scratch.
-    pub fn send_batch(&mut self, parts: &mut Vec<MessageParts>) -> Result<(), ProtocolError> {
-        for p in parts.drain(..) {
-            self.transport.enqueue(p)?;
-        }
-        self.transport.flush_blocking()
-    }
-
-    /// Reassemble one reply train: receive frames via `recv_one` until the
-    /// terminal (non-continuation) frame, keeping the first in-frame schema and
-    /// concatenating data batches. Status is checked on **every** frame — a
-    /// `STATUS_ERROR` fault frame has flags 0, structurally identical to the
-    /// master's terminal frame, so a flags-only check would silently drop it.
-    ///
-    /// The concatenated batch is the Z-set **sum** of the replies, unconsolidated:
-    /// `extend_from_owned` never folds two entries sharing a `(PK, payload)`, and a
-    /// non-injective server-side projection can collide two within one reply — so
-    /// consumers must not assume unique `(PK, payload)`. The sum is correct because
-    /// the replies partition the relation: each entry lives in one worker's store,
-    /// and a replicated relation's read goes to worker 0 alone.
-    fn drain_reply_train(&mut self, mut recv_one: impl FnMut(&mut Self) -> Result<Message, ClientError>) -> ScanResult {
-        let mut schema: Option<Arc<Schema>> = None;
-        let mut data: Option<ZSetBatch> = None;
-        let watermark = loop {
-            let msg = check_response(recv_one(self)?)?;
-            let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
-            schema = schema.or(msg.schema);
-            if let Some(batch) = msg.data_batch {
-                match data.as_mut() {
-                    Some(acc) => acc.extend_from_owned(batch),
-                    None => data = Some(batch),
-                }
-            }
-            if !is_continuation {
-                break msg.seek_pk;
-            }
-        };
-        Ok((schema, data, watermark as u64))
-    }
-
-    /// Receive a streaming scan/seek response: reassemble continuation frames,
-    /// absorb any schema block into the cache, and recover the schema from the
-    /// cache if the response was schema-less. Same policy as the sync `scan`.
-    pub fn recv_scan(&mut self, target_id: u64) -> ScanResult {
-        let (schema, data, watermark) = self.drain_reply_train(|s| s.recv_cached(target_id))?;
-        Ok((self.schema_or_cached(target_id, schema), data, watermark))
-    }
-
-    /// Receive a single push ACK and return its ingest LSN, absorbing any schema
-    /// block it carries into the cache (matching the sync push path). The status
-    /// runs through the session's own `check_response`, so a pipelined push
-    /// classifies server failures exactly as the sync push does rather than
-    /// leaving each caller to re-derive the policy.
-    pub fn recv_push_ack(&mut self, target_id: u64) -> Result<u64, ClientError> {
-        let msg = self.recv_cached(target_id)?;
-        check_response(msg).map(|m| m.seek_pk as u64)
-    }
-
     /// The client's cached schema version for `tid` (`0` = no cached schema, so
     /// the server sends the block). `peek` leaves LRU recency untouched — a
     /// version probe is not an access.
@@ -1143,12 +1086,11 @@ impl Session {
     }
 
     /// Build a SCAN_MULTI request frame, stamping each tid with its cached schema
-    /// version. The one choke point both encode routes funnel through — `submit`
-    /// and the async `pack_scan_multi` — so the wire-shape contract is enforced
-    /// here, in every build profile, for every caller. The case that matters is
-    /// the empty list: it would encode a count=0 frame whose lone server error
-    /// frame an N=0 accumulator never consumes, permanently shifting every later
-    /// read on this connection by one frame.
+    /// version. Rejects the list here, in every build profile, before a frame
+    /// exists. The case that matters is the empty list: it would encode a
+    /// count=0 frame whose lone server error frame an N=0 accumulator never
+    /// consumes, permanently shifting every later read on this connection by
+    /// one frame.
     fn encode_scan_multi_frame(&self, tids: &[u64]) -> Result<Vec<u8>, ClientError> {
         gnitz_wire::validate_scan_multi_tids(tids).map_err(ClientError::ServerError)?;
         let relations: Vec<(u64, u16)> = tids.iter().map(|&tid| (tid, self.cached_schema_version(tid))).collect();
@@ -1159,49 +1101,6 @@ impl Session {
     /// warm-cache request lets the server omit the schema block.
     fn versioned_flags(&self, target_id: u64, base: u64) -> u64 {
         wire_flags_set_schema_version(base, self.cached_schema_version(target_id))
-    }
-
-    /// The schema for a reply: the one the frame carried, else the cached one —
-    /// a warm-cache response omits the block, so the LRU is the only source.
-    fn schema_or_cached(&mut self, target_id: u64, in_frame: Option<Arc<Schema>>) -> Option<Arc<Schema>> {
-        in_frame.or_else(|| self.schema_cache.get(&target_id).map(|(s, _)| Arc::clone(s)))
-    }
-
-    /// Receive one framed message *correlated to `target_id`*, using the LRU
-    /// cache to decode continuation frames that arrive without a schema block,
-    /// and caching any schema block the frame does carry.
-    ///
-    /// Every recv reaching here — scan, seek, push ACK — awaits a reply for one
-    /// known relation, and the server replies to a connection strictly in request
-    /// order, so the frame's own `target_id` must be that relation. Checking it
-    /// makes a violation loud: the schema hint is keyed by `target_id`, so an
-    /// out-of-order frame would otherwise decode under the *wrong schema* and
-    /// return a wrong answer silently. The check precedes the cache absorb, so a
-    /// mis-correlated block is not installed either.
-    ///
-    /// `STATUS_OK` only — an error frame names no relation (`target_id = 0`).
-    fn recv_cached(&mut self, target_id: u64) -> Result<Message, ClientError> {
-        let msg = {
-            // `get` (not `peek`) so a frequently-accessed schema refreshes its
-            // LRU recency and isn't evicted under memory pressure.
-            let hint = self.schema_cache.get(&target_id).map(|(s, v)| (s.as_ref(), *v));
-            recv_message(&mut self.transport, hint)?
-        };
-        if msg.status == STATUS_OK && msg.target_id != target_id {
-            return Err(ClientError::Protocol(ProtocolError::DecodeError(format!(
-                "reply out of order: expected target {target_id}, got {}",
-                msg.target_id
-            ))));
-        }
-        // `msg.schema` is `Some` exactly when the schema block was physically
-        // in the frame. Absorb it as an `Arc` clone (refcount bump, no deep
-        // copy) — this is the authoritative schema with the server's real
-        // column names.
-        if let Some(s) = msg.schema.as_ref() {
-            let version = wire_flags_get_schema_version(msg.flags);
-            self.schema_cache.put(target_id, (Arc::clone(s), version));
-        }
-        Ok(msg)
     }
 }
 

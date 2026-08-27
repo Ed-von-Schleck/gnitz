@@ -25,9 +25,9 @@ pub use message::{
     decode_control_block, encode_ddl_txn, encode_message_noschema_parts, encode_message_parts, encode_push_txn,
     encode_scan_multi, parse_response, send_control, Message, MessageParts,
 };
-pub(crate) use message::{encode_control_frame, parse_response_frame, recv_message};
+pub(crate) use message::{encode_control_frame, parse_response_frame};
 pub use regions::{ViewBuffers, ZSetBatchView};
-pub use transport::{hello_handshake, ClientTransport, TransportWaker};
+pub use transport::{hello_handshake, ClientTransport};
 pub use types::{
     null_word_get, null_word_set, BatchAppender, ColData, ColumnDef, FixedInt, PkColumn, PkTuple, Schema, TypeCode,
     ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,

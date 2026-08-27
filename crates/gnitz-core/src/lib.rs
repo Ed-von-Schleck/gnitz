@@ -22,8 +22,8 @@ pub use client::{
     IndexMeta, InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, ViewName, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
-    Completions, Interest, ParkHook, RawBlock, Reply, ReplyTrain, Request, Session, SlotId, FIRST_USER_TABLE_ID,
-    MAX_IN_FLIGHT, TABLE_TAB,
+    Completions, Interest, ParkHook, RawBlock, RelTarget, Reply, ReplyTrain, Request, ScanReply, Session, SlotId,
+    FIRST_USER_TABLE_ID, MAX_IN_FLIGHT, TABLE_TAB,
 };
 pub use error::{ClientError, ConflictClass};
 pub use gnitz_wire::{
@@ -31,9 +31,8 @@ pub use gnitz_wire::{
     TableProps,
 };
 pub use protocol::{
-    encode_message_parts, null_word_get, null_word_set, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
-    BatchAppender, ColData, ColumnDef, FixedInt, MessageParts, PkColumn, PkTuple, ProtocolError, Schema,
-    TransportWaker, TypeCode, ViewBuffers, WireConflictMode, ZSetBatch, ZSetBatchView, FLAG_PUSH, MAX_COLUMNS,
-    MAX_PK_BYTES, PK_LIST_MAX_COLS,
+    null_word_get, null_word_set, wire_flags_get_schema_version, wire_flags_set_conflict_mode, BatchAppender, ColData,
+    ColumnDef, FixedInt, PkColumn, PkTuple, ProtocolError, Schema, TypeCode, ViewBuffers, WireConflictMode, ZSetBatch,
+    ZSetBatchView, FLAG_PUSH, MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };
 pub use read_target::ReadTarget;

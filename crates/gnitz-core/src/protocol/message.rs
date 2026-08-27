@@ -400,14 +400,6 @@ pub(crate) fn parse_response_frame(
     })
 }
 
-pub(crate) fn recv_message(
-    t: &mut ClientTransport,
-    schema_hint: Option<(&Schema, u16)>,
-) -> Result<Message, ProtocolError> {
-    let buf = t.recv_framed()?;
-    parse_response(&buf, schema_hint)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,7 +564,7 @@ mod tests {
         let empty_batch = ZSetBatch::new(&schema);
         let (mut a, mut b) = make_transport_pair();
         send_push(&mut a, &schema, &empty_batch);
-        let msg = recv_message(&mut b, None).unwrap();
+        let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
 
         // Schema was sent, data was not (empty batch)
         assert!(msg.schema.is_some());
@@ -620,7 +612,7 @@ mod tests {
 
         let (mut a, mut b) = make_transport_pair();
         send_push(&mut a, &schema, &batch);
-        let msg = recv_message(&mut b, None).unwrap();
+        let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
 
         let data = msg.data_batch.unwrap();
         assert_eq!(data.pks.to_vec_u128(), pks);
@@ -677,7 +669,7 @@ mod tests {
 
         let (mut a, mut b) = make_transport_pair();
         send_push(&mut a, &schema, &batch);
-        let msg = recv_message(&mut b, None).unwrap();
+        let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
 
         let data = msg.data_batch.unwrap();
         assert_eq!(data.nulls, nulls);
@@ -697,7 +689,7 @@ mod tests {
         // Control-only message (scan/alloc style)
         let (mut a, mut b) = make_transport_pair();
         send_control(&mut a, 0, 0, FLAG_PUSH, 0, 0, &[]).unwrap();
-        let msg = recv_message(&mut b, None).unwrap();
+        let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
         assert!(msg.schema.is_none());
         assert!(msg.data_batch.is_none());
     }
@@ -717,7 +709,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        let msg = recv_message(&mut b, None).unwrap();
+        let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
         assert_eq!(msg.target_id, 0xDEAD_BEEF_1234_5678);
         assert_eq!(msg.seek_pk, seek_pk);
     }
@@ -732,7 +724,7 @@ mod tests {
         };
         let encoded = encode_control_block(&err_hdr, "something broke", &[]);
         a.send_framed(&encoded).unwrap();
-        let msg = recv_message(&mut b, None).unwrap();
+        let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
         assert_eq!(msg.status, STATUS_ERROR);
         assert!(msg.error_text.is_some());
     }
@@ -843,7 +835,7 @@ mod tests {
         a.send_framed_iov(&parts.segments()).unwrap();
 
         // Parse with a matching hint (same schema, version 1).
-        let msg = recv_message(&mut b, Some((&schema, 1))).unwrap();
+        let msg = parse_response(&b.recv_framed().unwrap(), Some((&schema, 1))).unwrap();
 
         // The hint was not physically in the frame.
         assert!(msg.schema.is_none(), "schema must be None for hint-only frame");

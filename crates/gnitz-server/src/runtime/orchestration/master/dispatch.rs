@@ -916,10 +916,10 @@ impl MasterDispatcher {
     /// a still-streaming worker cannot wedge in `send_encoded` — draining the
     /// doomed trains would be pure waste. The client may already have received
     /// earlier workers' data frames when the fault surfaces, so the fault frame
-    /// `finish_scan_fanout` emits can arrive mid-stream:
-    /// `Connection::drain_reply_train` (gnitz-core), the one reply reassembler,
-    /// returns on the first failing status and discards the batch it had
-    /// accumulated, so no partial rows surface.
+    /// `finish_scan_fanout` emits can arrive mid-stream: the client's reply
+    /// accumulator, the one reply reassembler, completes the slot on the first
+    /// failing status and discards the batch it had accumulated, so no partial
+    /// rows surface.
     ///
     /// **It also returns the tick round it sampled**, and samples it *inside* the
     /// closure `dispatch_scan_fanout` runs under `sal_writer_excl` — the same

@@ -12,11 +12,11 @@ use crate::circuit::{is_segment_id, substitute_seg_id, Circuit};
 use crate::types::sys_schema;
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::{
-    RelClass, TableProps, CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB, IDXTAB_COL_IS_UNIQUE,
-    IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE, OWNER_KIND_VIEW,
-    SCHEMATAB_COL_NAME, TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX, TABTAB_COL_SCHEMA_ID,
-    VIEWTAB_COL_CAPACITY, VIEWTAB_COL_DELTA, VIEWTAB_COL_NAME, VIEWTAB_COL_PK_COL_IDX, VIEWTAB_COL_SCHEMA_ID,
-    VIEWTAB_COL_SQL,
+    RelClass, RelDescriptorBlob, TableProps, CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB,
+    IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE,
+    OWNER_KIND_VIEW, SCHEMATAB_COL_NAME, TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX,
+    TABTAB_COL_SCHEMA_ID, VIEWTAB_COL_CAPACITY, VIEWTAB_COL_DELTA, VIEWTAB_COL_NAME, VIEWTAB_COL_PK_COL_IDX,
+    VIEWTAB_COL_SCHEMA_ID, VIEWTAB_COL_SQL,
 };
 
 // --- Module-private helpers ---
@@ -338,6 +338,21 @@ pub struct RelDescriptor {
     pub indexes: Arc<Vec<IndexMeta>>,
 }
 
+impl RelDescriptor {
+    /// The descriptor a RESOLVE reply describes, from the three values
+    /// [`Reply::Resolve`](crate::Reply::Resolve) carries.
+    pub fn from_resolve(tid: u64, schema: Arc<Schema>, blob: RelDescriptorBlob) -> RelDescriptor {
+        RelDescriptor {
+            tid,
+            class: blob.class,
+            replicated: blob.replicated,
+            delta: blob.delta,
+            schema,
+            indexes: Arc::new(blob.indexes),
+        }
+    }
+}
+
 /// What one statement has already read, dropped whole at `end_statement`.
 ///
 /// One entry per resolved canonical `"schema.name"`, absent verdicts included,
@@ -407,14 +422,11 @@ pub struct GnitzClient {
     last_seen_lsn: u64,
 }
 
-// The client-facing types must stay `Send`, so nothing reachable from them may
-// hold an `Rc`. The requirement comes from the Python binding: every blocking
-// call runs inside `Python::detach`, whose `Ungil` bound resolves to `Send` on
-// both the closure (capturing `&mut GnitzClient`) and its return value — and the
-// async transport moves a bare `Session` into its I/O thread. An `Rc` anywhere in
-// that reachable set breaks the build in `gnitz-py`, a crate away, with an error
-// naming a pyo3 trait rather than the field. Asserted here so the failure lands
-// on the line that caused it.
+// The client-facing types must stay `Send`: `gnitz-py` drops the GIL inside
+// `Python::detach`, whose `Ungil` bound is `Send`, and `gnitz-tokio` spawns a
+// `Session`-owning future onto a multi-thread runtime. An `Rc` anywhere in
+// their reachable set otherwise breaks the build a crate away, naming a pyo3
+// trait rather than the field.
 //
 // `Sync` is asserted for the three connection types as well: the park hook is
 // a boxed closure field that could narrow it silently, and nothing in this
@@ -1778,14 +1790,7 @@ impl GnitzClient {
         let Some((tid, schema, blob)) = self.session.resolve(target)? else {
             return Ok(None);
         };
-        Ok(Some(Arc::new(RelDescriptor {
-            tid,
-            class: blob.class,
-            replicated: blob.replicated,
-            delta: blob.delta,
-            schema,
-            indexes: Arc::new(blob.indexes),
-        })))
+        Ok(Some(Arc::new(RelDescriptor::from_resolve(tid, schema, blob))))
     }
 
     /// Resolve `schema_name` to its SCHEMA_TAB id.

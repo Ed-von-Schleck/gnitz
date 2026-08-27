@@ -5,6 +5,7 @@ members = [
     "gnitz-expr",
     "gnitz-core",
     "gnitz-sql",
+    "gnitz-tokio",
     "gnitz-py",
     "gnitz-engine",
     "gnitz-mirror",

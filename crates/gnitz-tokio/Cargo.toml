@@ -1,0 +1,22 @@
+[package]
+name = "gnitz-tokio"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+integration = []
+
+[dependencies]
+gnitz-core = { path = "../gnitz-core" }
+# `net` brings `AsyncFd`, `rt` the runtime context it must be built inside plus
+# `spawn_blocking`, and `sync` the bounded mpsc and the oneshot the handle and
+# driver share.
+tokio = { version = "1", default-features = false, features = ["net", "rt", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+gnitz-test-harness = { path = "../gnitz-test-harness" }
+# The scripted peer's HELLO ACK, encoded by the definition both sides share
+# rather than re-typed as bytes in a test.
+gnitz-wire = { path = "../gnitz-wire" }
+libc = "0.2"

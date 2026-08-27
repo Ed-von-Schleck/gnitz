@@ -55,6 +55,12 @@ impl From<ProtocolError> for ClientError {
     }
 }
 
+impl From<std::io::Error> for ClientError {
+    fn from(e: std::io::Error) -> Self {
+        ClientError::Protocol(ProtocolError::IoError(e))
+    }
+}
+
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

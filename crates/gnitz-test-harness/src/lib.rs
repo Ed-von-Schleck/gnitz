@@ -536,3 +536,64 @@ pub fn unique_schema(prefix: &str) -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     format!("{prefix}{}", SEQ.fetch_add(1, Ordering::Relaxed))
 }
+
+// ── Syscall counting ─────────────────────────────────────────────────────────
+
+/// Syscall totals from one `strace -f -c` run, plus the report they were read
+/// from, for an assertion to print.
+pub struct SyscallCounts {
+    calls: std::collections::HashMap<String, usize>,
+    pub report: String,
+}
+
+impl SyscallCounts {
+    /// Calls to `name` across every traced thread.
+    pub fn get(&self, name: &str) -> usize {
+        self.calls.get(name).copied().unwrap_or(0)
+    }
+
+    /// Calls to any of `names` — one operation's spelling varies with the libc
+    /// and the socket family, so a count is usually over a set.
+    pub fn sum(&self, names: &[&str]) -> usize {
+        names.iter().map(|n| self.get(n)).sum()
+    }
+}
+
+/// Re-run **this** test binary's `child_test` under `strace -f -c`, with `env`
+/// set, and total the syscalls it made. The child reads its work out of `env`
+/// and no-ops without it, so an ordinary run leaves it inert.
+///
+/// `None` when `strace` is not installed — the caller skips.
+pub fn strace_test(child_test: &str, env: &[(&str, &str)]) -> Option<SyscallCounts> {
+    let strace =
+        env::var_os("PATH").and_then(|p| env::split_paths(&p).map(|d| d.join("strace")).find(|c| c.is_file()))?;
+    let exe = env::current_exe().expect("current_exe");
+    let mut cmd = Command::new(strace);
+    cmd.args(["-f", "-c", "-o", "/dev/stdout"]).arg(&exe).args([
+        "--exact",
+        child_test,
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn strace");
+    assert!(
+        out.status.success(),
+        "the traced child failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = String::from_utf8_lossy(&out.stdout).into_owned();
+    // A summary row is `% time  seconds  usecs/call  calls [errors] syscall`,
+    // so the name is last and the call count is column 3 either way.
+    let calls = report
+        .lines()
+        .filter_map(|l| {
+            let c: Vec<&str> = l.split_whitespace().collect();
+            let name = c.last()?;
+            Some((name.to_string(), c.get(3)?.parse::<usize>().ok()?))
+        })
+        .collect();
+    Some(SyscallCounts { calls, report })
+}

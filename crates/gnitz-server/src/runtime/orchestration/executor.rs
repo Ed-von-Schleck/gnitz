@@ -578,9 +578,9 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>, first_frame_deadline: O
     // client-peer write in this file happens inside that awaited chain — so
     // replies leave this connection in request order, unconditionally. Clients
     // correlate pipelined replies positionally on exactly that (`gnitz.aio`
-    // gathers a mixed group onto one round-trip, and `Session::recv_cached`
-    // rejects an out-of-order `target_id` as a protocol error). Spawning
-    // `handle_message` to overlap requests would break both.
+    // gathers a mixed group onto one round-trip, and the client's reply
+    // accumulator rejects an out-of-order `target_id` as a protocol error).
+    // Spawning `handle_message` to overlap requests would break both.
     loop {
         let Some(buf) = peer.recv().await else { break };
         handle_message(&peer, buf.as_slice(), &shared).await;

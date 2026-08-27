@@ -3,30 +3,41 @@
 //! A client that sets a null bit under a `NOT NULL` column must be rejected at
 //! the server's client-decode boundary.
 //!
-//! `ZSetBatch::nulls` is a `pub Vec<u64>` and `encode_message_parts` /
-//! `Session::send_batch` are public, so the client-side `ZSetBatch::validate`
-//! that `Session::push_with_mode` runs is skippable — it lives in the client
-//! process. The bit it lets through is one the engine's two camps read
+//! `ZSetBatch::nulls` is a `pub Vec<u64>`, and the client-side
+//! `ZSetBatch::validate` that `Session::submit` runs is skippable by anyone who
+//! encodes a frame and submits it raw — it lives in the client process, so it
+//! is a convenience, never a trust boundary. The bit it lets through is one the
+//! engine's two camps read
 //! differently: `is_null` (index projection, FK probe) and
 //! `compare_by_group_cols` believe the bit, while the evaluator's
 //! `nullable_slots`, a projection's `NullPerm` and the `FixedIntNonnull` row
 //! comparator believe the schema. This test drives the frame the client library
 //! would never build.
 
-use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
+use gnitz_core::protocol::{encode_message_parts, ColumnDef, Schema, TypeCode};
 use gnitz_core::TableProps;
-use gnitz_core::{
-    encode_message_parts, BatchAppender, GnitzClient, PkTuple, Session, WireConflictMode, ZSetBatch, FLAG_PUSH,
-};
+use gnitz_core::{BatchAppender, GnitzClient, PkTuple, Reply, Request, Session, ZSetBatch, FLAG_PUSH};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
-/// Ship `batch` as a cold PUSH frame over a raw session, bypassing
-/// `Session::push_with_mode`'s client-side `ZSetBatch::validate`.
+/// Ship `batch` as a PUSH, bypassing `Session::submit`'s client-side
+/// `ZSetBatch::validate` by handing the spine an already-encoded frame — byte
+/// for byte the one `submit` would have built for a cold push.
 fn hostile_push(session: &mut Session, tid: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, String> {
-    let flags = gnitz_core::protocol::wire_flags_set_conflict_mode(FLAG_PUSH, WireConflictMode::Update);
-    let parts = encode_message_parts(tid, session.client_id, flags, &PkTuple::EMPTY, 0, Some((schema, batch)));
-    session.send_batch(&mut vec![parts]).map_err(|e| e.to_string())?;
-    session.recv_push_ack(tid).map_err(|e| e.to_string())
+    let parts = encode_message_parts(
+        tid,
+        session.client_id,
+        FLAG_PUSH,
+        &PkTuple::EMPTY,
+        0,
+        Some((schema, batch)),
+    );
+    match session
+        .round_trip(Request::Uncorrelated(parts.segments().concat()))
+        .map_err(|e| e.to_string())?
+    {
+        Reply::Train(t) => Ok(t.terminal.seek_pk as u64),
+        _ => Err("a raw frame completes as a single train".to_string()),
+    }
 }
 
 #[test]
@@ -59,8 +70,8 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
         batch
     };
 
-    // A second, raw connection: `GnitzClient`'s own session is private, and this
-    // one never runs the client-side validator.
+    // A second, raw connection: `GnitzClient`'s own session is private, and a
+    // pre-encoded frame is what walks past the validator.
     let (mut raw, _lsn) = Session::connect(srv.sock_path()).unwrap();
 
     // The same rows, unmodified, are accepted — so the rejection below is about

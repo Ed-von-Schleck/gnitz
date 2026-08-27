@@ -45,7 +45,7 @@ help: ## Show this help
 # ---------------------------------------------------------------------------
 
 test: server ## Run all Rust workspace tests incl. gnitz-sql/gnitz-core integration (gnitz-py excluded — pyo3 extension can't link a test harness)
-	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration --features gnitz-core/integration $(T)
+	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration $(T)
 
 rust-engine-test: ## Run only the gnitz-engine + gnitz-server tests (faster inner loop)
 	cd crates && cargo test -p gnitz-engine -p gnitz-server $(T)
@@ -57,7 +57,7 @@ fmt-check: ## Check formatting without writing (CI gate)
 	cd crates && cargo fmt --all --check
 
 clippy: ## Lint the workspace incl. integration tests; warnings are errors
-	cd crates && cargo clippy --workspace --all-targets --features gnitz-sql/integration --features gnitz-core/integration -- -D warnings
+	cd crates && cargo clippy --workspace --all-targets --features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration -- -D warnings
 
 check: ## Fast type-check without producing binaries
 	cd crates && cargo check --workspace

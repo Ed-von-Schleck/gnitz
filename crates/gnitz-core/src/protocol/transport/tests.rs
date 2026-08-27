@@ -336,21 +336,6 @@ fn test_client_transport_unix_roundtrip() {
 }
 
 #[test]
-fn test_transport_waker_unblocks_parked_poll() {
-    // A recv_framed parked in another thread must return with an error
-    // once the waker is dropped (shutdown on the shared description).
-    let (a, _b) = make_transport_pair();
-    let waker = a.waker().unwrap();
-    let handle = std::thread::spawn(move || {
-        let mut t = a;
-        t.recv_framed()
-    });
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    drop(waker);
-    assert!(handle.join().unwrap().is_err());
-}
-
-#[test]
 fn test_connect_rejects_malformed_tls_targets() {
     // The tls:// prefix is the sole discriminator; these must not be
     // treated as socket paths, and must fail with a parse error.

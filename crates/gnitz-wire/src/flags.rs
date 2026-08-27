@@ -62,8 +62,8 @@ pub const FLAG_TXN_COMMIT: u64 = 1 << 15;
 pub const FLAG_HAS_SCHEMA: u64 = 1 << 48;
 pub const FLAG_HAS_DATA: u64 = 1 << 49;
 /// Set on every per-worker scan response frame. Absent on the terminal
-/// frame sent by the master after all worker frames. Clients loop on
-/// `recv_message` until they see a frame without this bit.
+/// frame sent by the master after all worker frames. A client accumulates
+/// frames into one reply until it sees one without this bit.
 pub const FLAG_CONTINUATION: u64 = 1 << 52;
 
 /// RESOLVE request flag. Answers "what is the shape of relation X?" in one
@@ -125,15 +125,15 @@ pub const SCAN_MULTI_MAX_RELATIONS: usize = 16;
 /// Validate a `scan_multi` / `scan_many` relation list against the SCAN_MULTI
 /// wire-shape rules: non-empty, at most `SCAN_MULTI_MAX_RELATIONS`, no duplicate
 /// tid. The single source of truth for these checks, shared by every entry point
-/// — the sync `Session::scan_multi`, the async `PyAsyncTransport::scan_many`, and
-/// the server's authoritative `scan_multi_body` — so all three reject an identical
-/// set with identical wording.
+/// — the client's `Session::submit`, which every client's `scan_many` funnels
+/// through, and the server's authoritative `scan_multi_body` — so both reject an
+/// identical set with identical wording.
 ///
 /// The empty check is load-bearing on the client, not cosmetic: an empty list
 /// encodes a count=0 frame whose single server error frame the positional N-train
 /// read loop (N=0) never consumes, leaving it unread and desyncing the
 /// connection. Over-cap / duplicate are non-empty, so their round-tripped error
-/// frame is always consumed by the first `recv_scan`; validating them
+/// frame is always consumed by the slot's own accumulator; validating them
 /// client-side is a fast-fail nicety. The O(n²) duplicate scan is over n ≤ 16.
 pub fn validate_scan_multi_tids(tids: &[u64]) -> Result<(), String> {
     if tids.is_empty() {
@@ -438,9 +438,10 @@ pub enum WireConflictMode {
 impl std::str::FromStr for WireConflictMode {
     type Err = String;
 
-    /// The two modes' user-facing names — the vocabulary every client binding
-    /// exposes as `push(conflict_mode=...)`. Owned here, next to the
-    /// discriminants, so no binding gets to invent a third spelling.
+    /// The two modes' user-facing names, for the bindings that let a caller
+    /// choose one (the blocking `push(conflict_mode=...)`; the async clients
+    /// always push `Update`). Owned here, next to the discriminants, so no
+    /// binding gets to invent a third spelling.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "update" => Ok(WireConflictMode::Update),

@@ -16,7 +16,7 @@ use gnitz_core::{
     ColData, ColumnDef, GnitzClient, Interest, PkColumn, PkTuple, Reply, Request, Schema, Session, SlotId, TableProps,
     TypeCode, WireConflictMode, ZSetBatch, MAX_IN_FLIGHT,
 };
-use gnitz_test_harness::{unique_schema, ServerHandle};
+use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
 
 /// A `(pk BIGINT, a BIGINT)` table reachable through `target`, and the
 /// blocking client that made it.
@@ -109,12 +109,12 @@ fn concurrent_pushes_and_scans(target: &str) {
             .remove(&id)
             .expect("every slot completes")
             .expect("no server error");
-        let Reply::Train(t) = r else { panic!("single train") };
         if is_push {
             pushed += per;
-            assert!(t.data.is_none());
+            assert!(matches!(r, Reply::Lsn(_)), "a push completes as its ingest LSN");
         } else {
-            let got = t.data.map_or(0, |b| b.len());
+            let Reply::Scan((_, data, _)) = r else { panic!("scan") };
+            let got = data.map_or(0, |b| b.len());
             assert_eq!(got, pushed, "a scan sees every push submitted ahead of it");
         }
     }
@@ -161,7 +161,7 @@ fn cap_raises_and_every_slot_below_it_completes() {
 }
 
 #[test]
-fn abandoned_slot_does_not_desync_and_close_reports_every_slot() {
+fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     let Some(srv) = ServerHandle::start_with_env(4, &[]) else {
         return;
     };
@@ -176,16 +176,15 @@ fn abandoned_slot_does_not_desync_and_close_reports_every_slot() {
     let scan = s.submit(scan_req(tid)).unwrap();
     let (done, _) = drive_all(&mut s, 2);
     assert!(done[&abandoned].is_ok());
-    let Reply::Train(t) = done[&scan].as_ref().unwrap() else {
-        panic!("train")
+    let Reply::Scan((_, data, _)) = done[&scan].as_ref().unwrap() else {
+        panic!("scan")
     };
-    assert_eq!(t.data.as_ref().map_or(0, |b| b.len()), 10);
+    assert_eq!(data.as_ref().map_or(0, |b| b.len()), 10);
 
     // Now close with work pending.
-    let a = s.submit(scan_req(tid)).unwrap();
-    let b = s.submit(scan_req(tid)).unwrap();
-    let closed = s.close();
-    assert_eq!(closed, vec![a, b]);
+    s.submit(scan_req(tid)).unwrap();
+    s.submit(scan_req(tid)).unwrap();
+    s.close();
     assert_eq!(s.interest(), Interest::NONE);
     assert!(matches!(
         s.submit(scan_req(tid)),
@@ -194,7 +193,7 @@ fn abandoned_slot_does_not_desync_and_close_reports_every_slot() {
 }
 
 fn scan_req(tid: u64) -> Request<'static> {
-    Request::Control {
+    Request::Read {
         target_id: tid,
         flags: 0,
         seek_pk: 0,
@@ -209,7 +208,6 @@ fn push_req<'a>(tid: u64, schema: &'a Schema, batch: &'a ZSetBatch) -> Request<'
         schema,
         batch,
         mode: WireConflictMode::Update,
-        cold: false,
     }
 }
 
@@ -259,58 +257,34 @@ fn syscall_count_child() {
 /// `writev` (the request), `poll` (the park) and the one read that takes
 /// header and payload together, per push, plus connect-time slack.
 fn count_syscalls(target: &str, tid: u64) {
-    let Ok(strace) = which("strace") else {
+    let n = 200usize;
+    let Some(counts) = strace_test(
+        "syscall_count_child",
+        &[
+            ("GNITZ_SYSCALL_TARGET", target),
+            ("GNITZ_SYSCALL_TID", &tid.to_string()),
+            ("GNITZ_SYSCALL_N", &n.to_string()),
+        ],
+    ) else {
         eprintln!("strace not installed; skipping the syscall count");
         return;
     };
-    let n = 200usize;
-    let exe = std::env::current_exe().unwrap();
-    let out = std::process::Command::new(strace)
-        .args(["-f", "-c", "-o", "/dev/stdout"])
-        .arg(&exe)
-        .args(["--exact", "syscall_count_child", "--nocapture", "--test-threads=1"])
-        .env("GNITZ_SYSCALL_TARGET", target)
-        .env("GNITZ_SYSCALL_TID", tid.to_string())
-        .env("GNITZ_SYSCALL_N", n.to_string())
-        .output()
-        .expect("spawn strace");
-    assert!(
-        out.status.success(),
-        "child failed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let text = String::from_utf8_lossy(&out.stdout);
-    let count = |name: &str| -> usize {
-        text.lines()
-            .filter_map(|l| {
-                let cols: Vec<&str> = l.split_whitespace().collect();
-                (cols.last() == Some(&name)).then(|| cols[3].parse::<usize>().unwrap_or(0))
-            })
-            .sum()
-    };
-    let io: usize = [
+    let io = counts.sum(&[
         "writev", "write", "sendto", "sendmsg", "poll", "ppoll", "recvfrom", "read", "recvmsg",
-    ]
-    .iter()
-    .map(|s| count(s))
-    .sum();
+    ]);
     // Connect, the handshake and the test harness's own I/O are the slack.
     let slack = 400;
     assert!(
         io <= 3 * n + slack,
-        "expected ≤ {} socket syscalls for {n} pushes, strace counted {io}:\n{text}",
-        3 * n + slack
+        "expected ≤ {} socket syscalls for {n} pushes, strace counted {io}:\n{}",
+        3 * n + slack,
+        counts.report
     );
     assert!(
-        count("writev") >= n && count("poll") >= n,
-        "each push is one writev and one poll:\n{text}"
+        counts.get("writev") >= n && counts.get("poll") >= n,
+        "each push is one writev and one poll:\n{}",
+        counts.report
     );
-}
-
-fn which(bin: &str) -> Result<std::path::PathBuf, ()> {
-    std::env::var_os("PATH")
-        .and_then(|p| std::env::split_paths(&p).map(|d| d.join(bin)).find(|c| c.is_file()))
-        .ok_or(())
 }
 
 #[test]

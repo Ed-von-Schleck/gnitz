@@ -215,8 +215,10 @@ pub(crate) fn poll_fd(
     }
 }
 
-// The sync API surfaces (#[pyclass], the async I/O thread) require the
-// transport to be Send; Sync is what the public client types inherit from it.
+// Every async driver needs the transport to be Send: the asyncio executor steps
+// its `Session` inside `Python::detach`, whose `Ungil` bound is `Send`, and the
+// tokio `Connection` future is spawned onto a multi-thread runtime. Sync is what
+// the public client types inherit from it.
 const fn assert_send_sync<T: Send + Sync>() {}
 const _: () = assert_send_sync::<ClientTransport>();
 
@@ -235,6 +237,16 @@ impl ClientTransport {
     /// Frames written to this connection since it was opened.
     pub fn frames_sent(&self) -> u64 {
         self.frames_sent
+    }
+
+    /// A `dup` of the underlying stream socket — the AF_UNIX socket, or the
+    /// `TcpStream` under TLS. The copy shares the open file description, so it
+    /// reports the same readiness, and closing it leaves this transport open.
+    pub fn try_clone_fd(&self) -> Result<std::os::fd::OwnedFd, ProtocolError> {
+        // SAFETY: the transport owns this fd for the whole of the borrow.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.as_raw_fd()) }
+            .try_clone_to_owned()
+            .map_err(ProtocolError::IoError)
     }
 
     /// Connect to `target`: a literal `tls://HOST:PORT[?insecure|?ca=PATH]`
@@ -403,34 +415,6 @@ impl ClientTransport {
     pub(crate) fn mark_established(&mut self, server_limit: usize) {
         self.deadline = None;
         self.reader.max_payload_len = server_limit.min(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
-    }
-
-    /// Handle that unblocks a `recv_framed` parked in another thread.
-    pub fn waker(&self) -> Result<TransportWaker, ProtocolError> {
-        // SAFETY: dup of a valid fd we own.
-        let raw = unsafe { libc::dup(self.as_raw_fd()) };
-        if raw < 0 {
-            return Err(ProtocolError::IoError(std::io::Error::last_os_error()));
-        }
-        Ok(TransportWaker(raw))
-    }
-}
-
-/// One shape for both transports: a dup'd fd of the underlying stream
-/// socket (the AF_UNIX socket, or the TcpStream under TLS).
-/// Dropping the waker is the wake: `shutdown(SHUT_RDWR)` unblocks a parked
-/// `poll` on the same open file description even after the I/O thread has
-/// closed its own fd (the integer may already be recycled; the dup keeps the
-/// open file description alive), then the dup itself is closed.
-pub struct TransportWaker(RawFd);
-
-impl Drop for TransportWaker {
-    fn drop(&mut self) {
-        // SAFETY: shutdown + close on a kernel-managed dup'd fd we own.
-        unsafe {
-            libc::shutdown(self.0, libc::SHUT_RDWR);
-            libc::close(self.0);
-        }
     }
 }
 

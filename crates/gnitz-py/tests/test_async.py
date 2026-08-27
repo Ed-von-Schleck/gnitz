@@ -372,7 +372,7 @@ async def test_pipeline_push(aconn, table):
 
 @pytest.mark.asyncio
 async def test_pipeline_large(aconn, table):
-    """500 concurrent pushes — exercises natural batching in the I/O thread."""
+    """500 concurrent pushes on one connection, all in flight at once."""
     tid, cols, _ = table
     schema = gnitz.Schema(cols)
     n = 500
@@ -605,28 +605,18 @@ def test_api_parity_sync_has_all_dml():
 
 
 # ---------------------------------------------------------------------------
-# Transport lifecycle — cleanup on close()/drop()
+# Transport lifecycle
 # ---------------------------------------------------------------------------
-
-import gc
-import time
-
-
-def _os_thread_count() -> int:
-    # Linux-only — the rest of the suite already assumes Linux.
-    return len(os.listdir("/proc/self/task"))
 
 
 @pytest.mark.asyncio
 async def test_connection_loss_resolves_every_queued_request(disposable_server):
-    """Losing the connection must fail every submitted request, including the
-    ones still queued behind the in-flight batch.
+    """Losing the connection must fail every submitted request.
 
-    The I/O thread batches at most IO_BATCH_MAX (1024) requests per cycle, so
-    the 3000 below leave ~2000 sitting in the request channel while the first
-    batch fails. Those carry futures nobody else can resolve: dropping them
-    would leave their coroutines awaiting forever, which is a hang, not an
-    error. The `wait_for` is the guard — a dropped future shows up as a timeout.
+    All 3000 are submitted before the loop gets a turn, so each holds a future
+    and a queued frame. The step that meets the dead peer must resolve all of
+    them: a future nobody resolves is a hang, not an error, and the `wait_for`
+    is what turns that into a failure.
     """
     target, proc = disposable_server
     conn = await aio.connect(target)
@@ -647,44 +637,6 @@ async def test_connection_loss_resolves_every_queued_request(disposable_server):
 
 
 @pytest.mark.asyncio
-async def test_drop_without_close_releases_thread(server):
-    """Dropping an AsyncTransport (no close()) must let the I/O thread exit
-    on its own — Drop shuts down the dup'd fd so recv_framed unblocks."""
-    before = _os_thread_count()
-    conn = await aio.connect(server)
-    # Issue one request so the I/O thread has actually started its recv loop
-    # (otherwise it might still be at the initial rx.recv() blocking point).
-    await conn.scan(1)
-    assert _os_thread_count() >= before + 1
-
-    # Drop without close(): no aclose, no __aexit__.
-    del conn
-    gc.collect()
-
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if _os_thread_count() <= before:
-            break
-        time.sleep(0.05)
-    assert _os_thread_count() <= before, (
-        f"I/O thread did not exit after Drop "
-        f"(threads: before={before}, now={_os_thread_count()})"
-    )
-
-
-@pytest.mark.asyncio
-async def test_explicit_close_no_deadlock(server):
-    """close() must release the GIL so the I/O thread can finish its
-    in-progress with_gil block, and must complete promptly."""
-    conn = await aio.connect(server)
-    await conn.scan(1)
-    t0 = time.monotonic()
-    await conn.aclose()
-    elapsed = time.monotonic() - t0
-    assert elapsed < 3.0, f"aclose took {elapsed:.2f}s — possible join deadlock"
-
-
-@pytest.mark.asyncio
 async def test_enqueue_after_close_raises(server):
     """Once close() has run, push/scan/seek must raise GnitzError immediately."""
     conn = await aio.connect(server)
@@ -699,3 +651,197 @@ async def test_distinct_client_ids(server):
     """Two transports from the same process must have distinct client_ids."""
     async with aio.connect(server) as c1, aio.connect(server) as c2:
         assert c1._transport.client_id != c2._transport.client_id
+
+
+# ---------------------------------------------------------------------------
+# The mismatch a stale stamp draws
+#
+# That an async push packs warm at all is what makes the mismatch below
+# reachable: a cold frame carries its own schema block and never draws one.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stale_stamp_pushes_fail_and_the_connection_recovers(aconn, sync):
+    """A column rename bumps the relation's schema version, so every push
+    already encoded at the stale stamp bounces. Each future fails with the
+    mismatch, none of their rows is committed, and the connection stays usable:
+    the eviction makes the next push cold, and it lands. The sync client holds
+    its batch across the round trip, so its own retry is transparent."""
+    sn = "am" + _uid()
+    sync.create_schema(sn)
+    tid = sync.create_table(sn, "t", PK_VAL_COLS)
+    try:
+        # Warm the async connection's cache under the current version.
+        await aconn.push(tid, _batch(PK_VAL_COLS, [{"pk": 1, "val": 1}]))
+
+        sync.execute_sql("ALTER TABLE t RENAME COLUMN val TO amount", schema_name=sn)
+
+        stale = [_batch(PK_VAL_COLS, [{"pk": 10 + i, "val": 100 + i}]) for i in range(3)]
+        results = await asyncio.gather(
+            *[aconn.push(tid, b) for b in stale], return_exceptions=True)
+        assert all(isinstance(r, gnitz.GnitzError) for r in results), results
+        assert all("schema version mismatch" in str(r) for r in results), results
+
+        # Nothing they carried was committed — a mismatched push returns before
+        # the commit path.
+        rows = {r.pk for r in await aconn.scan(tid)}
+        assert rows == {1}, rows
+
+        # Same connection, no reconnect: the next push is cold and lands.
+        await aconn.push(tid, _batch(PK_VAL_COLS, [{"pk": 20, "val": 200}]))
+        rows = {r.pk: r.amount for r in await aconn.scan(tid)}
+        assert rows[20] == 200
+
+        # The sync client's own retry makes the same stale batch transparent.
+        sync.push(tid, _batch(PK_VAL_COLS, [{"pk": 30, "val": 300}]))
+        rows = {r.pk: r.amount for r in await aconn.scan(tid)}
+        assert rows[30] == 300
+    finally:
+        sync.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# The loop's own costs: no spin, no thread, and a bounded syscall bill
+# ---------------------------------------------------------------------------
+
+
+def _process_cpu_seconds():
+    return sum(os.times()[:2])
+
+
+@pytest.mark.asyncio
+async def test_an_idle_connection_consumes_no_cpu(aconn, table):
+    """The writer-disarm guard: a writer callback left armed on an
+    always-writable fd spins the loop at 100% CPU."""
+    tid, cols, _ = table
+    await aconn.push(tid, _batch(cols, [{"pk": 1, "val": 1}]))
+
+    before = _process_cpu_seconds()
+    await asyncio.sleep(1.0)
+    spent = _process_cpu_seconds() - before
+    assert spent < 0.05, f"an idle connection spent {spent:.3f}s of CPU over a quiet second"
+
+
+_SYSCALL_CHILD = '''
+import asyncio, sys
+from gnitz import aio
+import gnitz
+
+target, tid, n, mode = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+        gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+schema = gnitz.Schema(cols)
+
+def batch(pk):
+    b = gnitz.ZSetBatch(schema)
+    b.append(pk=pk, val=pk)
+    return b
+
+async def main():
+    async with aio.connect(target) as conn:
+        # One warm-up push, so the schema cache and the measured region are the
+        # same shape for every mode and for the n=0 baseline.
+        await conn.push(tid, batch(0))
+        if mode == "loop":
+            for i in range(n):
+                await conn.push(tid, batch(i + 1))
+        elif n:
+            await asyncio.gather(*[conn.push(tid, batch(i + 1)) for i in range(n)])
+
+asyncio.run(main())
+'''
+
+_COUNTED = ("writev", "write", "sendto", "sendmsg", "recvfrom", "read", "recvmsg",
+            "epoll_wait", "epoll_pwait", "futex", "poll", "ppoll")
+
+
+def _strace_counts(script, target, tid, n, mode):
+    import subprocess, sys
+    out = subprocess.run(
+        ["strace", "-f", "-c", "-o", "/dev/stdout",
+         sys.executable, script, target, str(tid), str(n), mode],
+        capture_output=True, text=True, timeout=180)
+    assert out.returncode == 0, f"child exited {out.returncode}\n{out.stdout}\n{out.stderr}"
+    counts = {}
+    for line in out.stdout.splitlines():
+        f = line.split()
+        if len(f) >= 5 and f[-1] in _COUNTED:
+            counts[f[-1]] = counts.get(f[-1], 0) + int(f[3])
+    return counts
+
+
+@pytest.mark.asyncio
+async def test_syscalls_per_operation(server, sync, tmp_path):
+    """The acceptance measure: `strace -f -c` over a subprocess, with the n=0
+    run subtracted so startup and connect are out.
+
+    `await` in a loop costs 5 syscalls per operation — writev, recvfrom, one
+    blocking epoll_wait, and the two zero-timeout epoll_waits asyncio spends on
+    the two handles each operation schedules (the deferred flush, and the wake
+    `Future.set_result` posts).
+
+    `gather`'s bill is not a per-operation constant: it is set by how many ACKs
+    the server has queued when a read runs. What is the client's, and is pinned
+    here, is one writev for the whole burst and at most one recvfrom per reply
+    frame — never the two a header-then-payload read costs. Near 1.4/op on a
+    quiet box. Futex and sendto reach zero on both: no thread left to wake."""
+    import shutil
+    if shutil.which("strace") is None:
+        pytest.skip("strace not installed")
+    sn = "as" + _uid()
+    sync.create_schema(sn)
+    tid = sync.create_table(sn, "t", PK_VAL_COLS)
+    script = tmp_path / "syscall_child.py"
+    script.write_text(_SYSCALL_CHILD)
+    try:
+        n = 400
+        measured = {}
+        for mode in ("loop", "gather"):
+            base = _strace_counts(str(script), server, tid, 0, mode)
+            full = _strace_counts(str(script), server, tid, n, mode)
+            measured[mode] = {k: full.get(k, 0) - base.get(k, 0) for k in _COUNTED}
+            assert measured[mode]["futex"] <= 0, f"{mode} still wakes a thread: {measured}"
+            assert measured[mode]["sendto"] <= 0, f"{mode} still writes a self-pipe: {measured}"
+
+        loop_total = sum(max(v, 0) for v in measured["loop"].values())
+        assert loop_total <= 5 * n + 8, (
+            f"await-in-a-loop: {loop_total / n:.2f}/op over a 5/op budget\n{measured}")
+
+        g = measured["gather"]
+        assert g["writev"] <= 8, f"a gathered burst must leave in one writev, not {g['writev']}"
+        # One read per reply frame at worst, plus the slack the n=0 subtraction
+        # does not perfectly cancel; two per frame is what this rules out.
+        assert g["recvfrom"] <= n + 8, f"at most one read per reply frame, got {g['recvfrom']} for {n}"
+        gather_total = sum(max(v, 0) for v in g.values())
+        assert gather_total * 4 <= loop_total * 3, (
+            f"gather must cost materially less than awaiting one at a time: "
+            f"{gather_total} vs {loop_total}\n{measured}")
+    finally:
+        sync.drop_schema(sn)
+
+
+_SHUTDOWN_CHILD = '''
+import asyncio, sys
+from gnitz import aio
+
+async def main():
+    conn = await aio.connect(sys.argv[1])
+    # Work in flight when the exception escapes.
+    conn.scan(1)
+    conn.scan(1)
+    raise RuntimeError("boom")
+
+asyncio.run(main())
+'''
+
+
+def test_an_exception_escaping_asyncio_run_exits_cleanly(server, tmp_path):
+    """An exception escaping `asyncio.run` with work in flight must exit with
+    the exception's status, never an abort."""
+    import subprocess, sys
+    script = tmp_path / "shutdown_child.py"
+    script.write_text(_SHUTDOWN_CHILD)
+    out = subprocess.run([sys.executable, str(script), server],
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 1, f"rc={out.returncode}\n{out.stdout}\n{out.stderr}"
+    assert "RuntimeError: boom" in out.stderr, out.stderr

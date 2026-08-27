@@ -2265,164 +2265,219 @@ fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
 }
 
 // ---------------------------------------------------------------------------
-// AsyncTransport — background I/O thread for async pipelining
+// AsyncTransport — the asyncio executor over the connection spine
 // ---------------------------------------------------------------------------
+//
+// Rust owns the session and the slots; Python owns the loop. The callbacks run
+// *on* the loop thread, so futures resolve directly: no thread, no channel, no
+// cross-thread wake.
 
-/// A pipelined I/O operation. Push frames are encoded on the submitting
-/// thread (schema always included — the async push path is cold); scan/seek
-/// are packed on the I/O thread so the cache-aware schema-version stamp reads
-/// the session's own cache (never shared cross-thread).
-enum IoOp {
-    /// Pre-encoded push frame; resolves with u64 (seek_pk = ingest LSN).
-    Push {
-        parts: gnitz_core::MessageParts,
-        target_id: u64,
-    },
-    /// Full-table scan; resolves with PyScanResult.
-    Scan(u64),
-    /// Point seek by PK; resolves with PyScanResult.
-    Seek(u64, gnitz_core::PkTuple),
-    /// Consistent multi-relation scan; resolves with list[PyScanResult]. The
-    /// relation ids ride the frame body, so this op addresses no single one.
-    ScanMulti(Vec<u64>),
-}
+/// Whether the loop should keep a writer armed, or `None` to deregister — this
+/// transport is finished. A value rather than a raise, because a Rust method
+/// cannot reach the loop's `remove_reader`.
+type WatchWrite = Option<bool>;
 
-struct IoRequest {
-    /// The operation, carrying whatever it addresses: a per-op target id, so no
-    /// op has to be handed a meaningless one.
-    op: IoOp,
-    /// The future to resolve, paired with whether its rows present hidden
-    /// columns. `include_hidden` is a property of how the *result* is surfaced,
-    /// not of the request, so it travels with the future all the way to the GIL
-    /// block instead of being copied into the recv and decode types.
+/// One outstanding operation. `include_hidden` is how the *result* is surfaced,
+/// not part of the request, so it travels with the future.
+struct Outstanding {
     future: Py<PyAny>,
     include_hidden: bool,
 }
 
-/// Bound on the I/O request channel. Limits RAM when Python sends faster than
-/// the network flushes. `enqueue` returns GnitzError if the channel is full.
-const IO_CHANNEL_DEPTH: usize = 4096;
-
-/// Cap on requests merged into one natural-batching cycle.
-const IO_BATCH_MAX: usize = 1024;
-
 #[pyclass(name = "AsyncTransport")]
 struct PyAsyncTransport {
-    tx: Option<std::sync::mpsc::SyncSender<IoRequest>>,
-    /// dup'd fd of the connection's stream socket. The I/O thread owns the
-    /// session (and its transport); the waker's `shutdown` (fired on drop)
-    /// wakes any in-flight `recv_framed` on the shared open file description,
-    /// even after the I/O thread has dropped the session (the integer may
-    /// already be recycled).
-    waker: Option<gnitz_core::TransportWaker>,
-    /// `event_loop.create_future`, bound once — the enqueue path calls it per
-    /// operation, and resolving the attribute by name each time would build its
-    /// name string every call. Same treatment `call_soon_threadsafe` gets.
+    session: gnitz_core::Session,
+    /// `event_loop.create_future`, bound once — the submit path calls it per
+    /// operation, and resolving the attribute by name each time would build
+    /// its name string every call.
     create_future: Py<PyAny>,
+    slots: std::collections::HashMap<gnitz_core::SlotId, Outstanding>,
     client_id: u64,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// Set by `close` and by a failed step; every later step answers `None`.
+    closed: bool,
+}
+
+/// The Python value one reply resolves its future to. The spine already
+/// narrowed it against the request, so nothing here needs the session.
+fn narrow(py: Python<'_>, reply: gnitz_core::Reply, include_hidden: bool) -> PyResult<Py<PyAny>> {
+    match reply {
+        gnitz_core::Reply::Lsn(lsn) => Ok(lsn.into_pyobject(py)?.into_any().unbind()),
+        gnitz_core::Reply::Scan(r) => Ok(triple_to_lazy(py, r, include_hidden)?.into_any()),
+        // One PyScanResult per relation, in request order → a Python list,
+        // resolving the single scan_many future.
+        gnitz_core::Reply::Multi(replies) => {
+            let per_rel = replies.into_iter().map(|r| triple_to_lazy(py, r, include_hidden));
+            Ok(build_pylist(py, per_rel)?.into_any().unbind())
+        }
+        _ => unreachable!("this transport submits no verb with another reply shape"),
+    }
+}
+
+/// Resolve one loop future, skipping one already `done()` — a cancelled future
+/// refuses a result.
+fn settle(py: Python<'_>, future: &Py<PyAny>, value: PyResult<Py<PyAny>>) {
+    let _ = (|| -> PyResult<()> {
+        let bound = future.bind(py);
+        if bound.call_method0(pyo3::intern!(py, "done"))?.is_truthy()? {
+            return Ok(());
+        }
+        match value {
+            Ok(v) => bound.call_method1(pyo3::intern!(py, "set_result"), (v,))?,
+            Err(e) => bound.call_method1(pyo3::intern!(py, "set_exception"), (e.into_value(py),))?,
+        };
+        Ok(())
+    })();
 }
 
 impl PyAsyncTransport {
-    fn enqueue(&self, py: Python<'_>, op: IoOp, include_hidden: bool) -> PyResult<Py<PyAny>> {
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| GnitzError::new_err("connection closed"))?;
-        let fut = self.create_future.call0(py)?;
-        tx.try_send(IoRequest {
-            op,
-            include_hidden,
-            future: fut.clone_ref(py),
-        })
-        .map_err(|e| match e {
-            std::sync::mpsc::TrySendError::Full(_) => GnitzError::new_err("transport queue full"),
-            std::sync::mpsc::TrySendError::Disconnected(_) => GnitzError::new_err("I/O thread exited"),
-        })?;
-        Ok(fut)
+    /// Register a submitted slot against a fresh loop future. Built after the
+    /// submit, so a request the spine refuses raises where the caller made it.
+    fn register(&mut self, py: Python<'_>, slot: gnitz_core::SlotId, include_hidden: bool) -> PyResult<Py<PyAny>> {
+        let future = self.create_future.call0(py)?;
+        self.slots.insert(
+            slot,
+            Outstanding {
+                future: future.clone_ref(py),
+                include_hidden,
+            },
+        );
+        Ok(future)
+    }
+
+    /// Step the spine for what the loop says the fd will accept and resolve
+    /// every slot that completed.
+    fn drive(&mut self, py: Python<'_>, ready: gnitz_core::Interest) -> WatchWrite {
+        if self.closed {
+            return None;
+        }
+        let session = &mut self.session;
+        let stepped = py.detach(|| session.step(ready));
+        let done = match stepped {
+            Ok(d) => d,
+            Err(e) => {
+                self.shutdown(py, &e);
+                return None;
+            }
+        };
+        for (slot, result) in done {
+            self.resolve(py, slot, result);
+        }
+        // Asked after every step, not only a write one: on TLS a read can
+        // queue ciphertext too.
+        Some(self.session.interest().write)
+    }
+
+    fn resolve(&mut self, py: Python<'_>, slot: gnitz_core::SlotId, result: Result<gnitz_core::Reply, ClientError>) {
+        let Some(o) = self.slots.remove(&slot) else {
+            return;
+        };
+        let value = match result {
+            Ok(reply) => narrow(py, reply, o.include_hidden),
+            Err(e) => Err(classified_err(&e)),
+        };
+        settle(py, &o.future, value);
+    }
+
+    /// Abandon everything with `cause` and refuse further work.
+    fn shutdown(&mut self, py: Python<'_>, cause: &ClientError) {
+        self.closed = true;
+        self.session.close();
+        for (_, o) in std::mem::take(&mut self.slots) {
+            settle(py, &o.future, Err(classified_err(cause)));
+        }
     }
 }
 
 #[pymethods]
 impl PyAsyncTransport {
     #[new]
-    fn new(py: Python<'_>, socket_path: &str, event_loop: Py<PyAny>, resolve_batch_fn: Py<PyAny>) -> PyResult<Self> {
-        // The session owns the connection from birth, so every early return
-        // below closes it via RAII; on success it moves into the I/O thread,
-        // which closes it when it exits. Connect + HELLO run synchronously on
-        // the calling thread, with the GIL dropped across the blocking syscalls
-        // so other Python threads can progress if the server is slow.
-        // A bare `Session`, not a `GnitzClient`, so no OCC basis is tracked —
-        // the HELLO ACK's `published_lsn` is discarded here.
+    fn new(py: Python<'_>, socket_path: &str, event_loop: Py<PyAny>) -> PyResult<Self> {
+        // Connect + HELLO run on the calling (loop) thread, GIL dropped across
+        // the blocking syscalls. A bare `Session`, not a `GnitzClient`: no OCC
+        // basis to track, so the HELLO ACK's `published_lsn` is discarded.
         let (session, _published_lsn) = to_py_err(py.detach(|| gnitz_core::Session::connect(socket_path)))?;
-        let waker = session.waker().map_err(gnitz_err)?;
-        // `Session::connect` mints this from the same generator the sync client
-        // uses, so a process holding both a `GnitzClient` and an
-        // `AsyncTransport` cannot mint the same id twice.
         let client_id = session.client_id;
-        let (tx, rx) = std::sync::mpsc::sync_channel(IO_CHANNEL_DEPTH);
-        // Bind the two loop methods once instead of resolving the attribute
-        // (and building its name string) per resolved future / per enqueue.
-        let call_soon = event_loop.getattr(py, "call_soon_threadsafe")?;
         let create_future = event_loop.getattr(py, "create_future")?;
-
-        let handle = std::thread::spawn(move || {
-            async_io_loop(session, rx, call_soon, resolve_batch_fn);
-        });
-
         Ok(PyAsyncTransport {
-            tx: Some(tx),
-            waker: Some(waker),
+            session,
             create_future,
+            slots: std::collections::HashMap::new(),
             client_id,
-            thread: Some(handle),
+            closed: false,
         })
     }
 
-    fn push(&self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>) -> PyResult<Py<PyAny>> {
-        // Encode the push frame with the GIL released — the schema/batch cross
-        // as plain `&` refs, no clone (the `PyRef` guard stays out of the closure).
-        // FLAG_PUSH marks the frame as a push independent of data presence, so an
-        // empty batch (a legitimate empty Z-set delta) is ACKed as a no-op push
-        // (LSN 0) instead of being mistaken for a scan — a mis-route whose streamed
-        // table dump would desync the one-frame Push reply reader.
-        let client_id = self.client_id;
+    /// The fd the loop registers its reader and writer on.
+    fn fileno(&self) -> i32 {
+        self.session.as_raw_fd()
+    }
+
+    fn push(&mut self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>) -> PyResult<Py<PyAny>> {
+        // Validate and encode with the GIL released — the schema and batch
+        // cross as plain `&` refs, no clone (the `PyRef` guard stays out of the
+        // closure). `submit` packs warm against the session's own cache; a
+        // stale stamp's mismatch fails this slot and the caller re-issues.
         let schema = batch.schema.as_ref();
         let b = &batch.batch;
-        let parts = py.detach(|| {
-            gnitz_core::encode_message_parts(
+        let session = &mut self.session;
+        let slot = py.detach(|| {
+            session.submit(gnitz_core::Request::Push {
                 target_id,
-                client_id,
-                gnitz_core::FLAG_PUSH,
-                &gnitz_core::PkTuple::EMPTY,
-                0,
-                Some((schema, b)),
-            )
+                schema,
+                batch: b,
+                mode: WireConflictMode::Update,
+            })
         });
-        self.enqueue(py, IoOp::Push { parts, target_id }, false)
+        let slot = to_py_err(slot)?;
+        self.register(py, slot, false)
     }
 
     #[pyo3(signature = (target_id, include_hidden = false))]
-    fn scan(&self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<Py<PyAny>> {
-        self.enqueue(py, IoOp::Scan(target_id), include_hidden)
+    fn scan(&mut self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<Py<PyAny>> {
+        let slot = to_py_err(self.session.submit(gnitz_core::Request::scan(target_id)))?;
+        self.register(py, slot, include_hidden)
     }
 
     /// scan_many(target_ids, include_hidden=False) -> awaitable[list[ScanResult]]
     ///
     /// Consistent snapshot of N relations at one server-side SAL cut, resolved
-    /// as a list in request order.
+    /// as a list in request order. A malformed list (empty, over-cap, duplicate
+    /// tid) is rejected before any frame is written, and raises here.
     #[pyo3(signature = (target_ids, include_hidden = false))]
-    fn scan_many(&self, py: Python<'_>, target_ids: Vec<u64>, include_hidden: bool) -> PyResult<Py<PyAny>> {
-        // A malformed list (empty, over-cap, duplicate tid) is rejected by
-        // `Session::pack_scan_multi` when the I/O thread packs it, before any
-        // frame is written, and fails this one future.
-        self.enqueue(py, IoOp::ScanMulti(target_ids), include_hidden)
+    fn scan_many(&mut self, py: Python<'_>, target_ids: Vec<u64>, include_hidden: bool) -> PyResult<Py<PyAny>> {
+        let slot = to_py_err(self.session.submit(gnitz_core::Request::ScanMulti(&target_ids)))?;
+        self.register(py, slot, include_hidden)
     }
 
     #[pyo3(signature = (target_id, pk, include_hidden = false))]
-    fn seek(&self, py: Python<'_>, target_id: u64, pk: Bound<'_, PyAny>, include_hidden: bool) -> PyResult<Py<PyAny>> {
+    fn seek(
+        &mut self,
+        py: Python<'_>,
+        target_id: u64,
+        pk: Bound<'_, PyAny>,
+        include_hidden: bool,
+    ) -> PyResult<Py<PyAny>> {
         let t = pk_tuple_from_py(&pk)?;
-        self.enqueue(py, IoOp::Seek(target_id, t), include_hidden)
+        let slot = to_py_err(self.session.submit(gnitz_core::Request::seek(target_id, &t)))?;
+        self.register(py, slot, include_hidden)
+    }
+
+    /// One pyo3 crossing per readable event. It flushes as well as reads, so a
+    /// submit a coroutine made earlier in this same loop turn ships here rather
+    /// than arming a writer for one turn.
+    fn on_readable(&mut self, py: Python<'_>) -> WatchWrite {
+        self.drive(
+            py,
+            gnitz_core::Interest {
+                read: true,
+                write: true,
+            },
+        )
+    }
+
+    /// The writer callback: `step(WRITE)`.
+    fn on_writable(&mut self, py: Python<'_>) -> WatchWrite {
+        self.drive(py, gnitz_core::Interest::WRITE)
     }
 
     #[getter]
@@ -2431,336 +2486,7 @@ impl PyAsyncTransport {
     }
 
     fn close(&mut self, py: Python<'_>) {
-        self.tx.take();
-        // TransportWaker::drop shuts down + closes the dup'd fd; the
-        // shutdown wakes any in-flight recv_framed on the I/O thread.
-        self.waker.take();
-        if let Some(h) = self.thread.take() {
-            // Release the GIL so the I/O thread can finish any in-progress
-            // `attach` block before the join returns.
-            py.detach(|| {
-                let _ = h.join();
-            });
-        }
-    }
-}
-
-impl Drop for PyAsyncTransport {
-    fn drop(&mut self) {
-        // Do NOT join: Drop may be called from GC while holding the GIL, and
-        // the I/O thread acquires the GIL to resolve futures — joining would
-        // deadlock. TransportWaker::drop still fires the shutdown so the I/O
-        // thread can exit promptly on its own.
-        self.tx.take();
-        self.waker.take();
-    }
-}
-
-/// One decoded scan reply: the `(schema, batch, lsn)` triple `Session::recv_scan`
-/// returns and `triple_to_lazy` consumes, unchanged.
-type ScanTriple = (Option<Arc<Schema>>, Option<ZSetBatch>, u64);
-
-/// What one pipelined request's response resolved to.
-enum LoopResult {
-    PushOk(u64),
-    /// A server-level failure for this one request; fails its future alone. The
-    /// `ClientError` itself, not a message plus a detached verdict: stringifying
-    /// here is what would make `GnitzConflictError` unreachable through
-    /// `gnitz.aio`.
-    Error(ClientError),
-    /// Boxed so the scan payload doesn't pad the small `PushOk`/`Error` variants.
-    Scan(Box<ScanTriple>),
-    /// One `scan_many`'s N per-relation results, in request order.
-    ScanMulti(Vec<ScanTriple>),
-    /// A request the session rejected at pack time, so it never reached the wire.
-    /// Not a `ClientError`: a malformed request has no server verdict to preserve
-    /// and is never an OCC conflict.
-    Rejected(String),
-}
-
-/// How to receive a given request's response. `Scan` covers both a full scan and
-/// a point seek — they read identically. `Failed` is a request that never
-/// reached the wire (its frame was rejected at pack time); it consumes no reply
-/// and fails its future alone.
-enum RecvKind {
-    Push { target_id: u64 },
-    Scan { target_id: u64 },
-    ScanMulti { target_ids: Vec<u64> },
-    Failed(String),
-}
-
-/// One outstanding request: how to read its reply, the future that reply
-/// resolves, and how that future's rows are surfaced. One record rather than
-/// three positionally-aligned collections — the alignment was correct but
-/// nothing kept it so, and two of the three had different lengths.
-struct Pending {
-    recv: RecvKind,
-    future: Py<PyAny>,
-    include_hidden: bool,
-}
-
-/// Classify a recv error into the loop's result contract: a transport/protocol
-/// failure stops the whole batch (`Err`), any other (server-level) error resolves
-/// just that one future. Shared by every recv arm.
-fn classify_recv_err(e: ClientError) -> Result<LoopResult, ClientError> {
-    match e {
-        ClientError::Protocol(_) => Err(e),
-        e => Ok(LoopResult::Error(e)),
-    }
-}
-
-/// The Python value one response resolves its future to, or the exception that
-/// fails it. A server-level error and a failure to *build* the value (a
-/// `MemoryError` from a list allocation) are the same thing here: one failed
-/// future. On this thread `panic = "abort"` would make an `unwrap` take the
-/// interpreter down with no traceback, where the sync path merely raises.
-fn loop_result_to_py(py: Python<'_>, result: LoopResult, include_hidden: bool) -> PyResult<Py<PyAny>> {
-    match result {
-        LoopResult::PushOk(lsn) => Ok(lsn.into_pyobject(py)?.into_any().unbind()),
-        LoopResult::Error(e) => Err(classified_err(&e)),
-        LoopResult::Rejected(msg) => Err(GnitzError::new_err(msg)),
-        LoopResult::Scan(t) => Ok(triple_to_lazy(py, *t, include_hidden)?.into_any()),
-        // One PyScanResult per relation, in request order → a Python list,
-        // resolving the single scan_many future.
-        LoopResult::ScanMulti(triples) => {
-            let per_rel = triples.into_iter().map(|t| triple_to_lazy(py, t, include_hidden));
-            Ok(build_pylist(py, per_rel)?.into_any().unbind())
-        }
-    }
-}
-
-/// The four positionally-paired lists `gnitz.aio._resolve_batch` consumes.
-/// Successes and failures kept apart, so its loop needs no per-item
-/// discriminator — an `isinstance` on the value costs more per future than the
-/// flag it replaces, and one interleaved list silently drops a trailing element
-/// on an odd length, leaving a coroutine awaiting a future nobody resolves.
-#[derive(Default)]
-struct Resolutions {
-    ok_futures: Vec<Py<PyAny>>,
-    ok_values: Vec<Py<PyAny>>,
-    err_futures: Vec<Py<PyAny>>,
-    err_excs: Vec<Py<PyAny>>,
-}
-
-impl Resolutions {
-    fn push(&mut self, py: Python<'_>, future: Py<PyAny>, outcome: PyResult<Py<PyAny>>) {
-        match outcome {
-            Ok(v) => {
-                self.ok_futures.push(future);
-                self.ok_values.push(v);
-            }
-            Err(e) => {
-                self.err_futures.push(future);
-                self.err_excs.push(e.into_value(py).into_any());
-            }
-        }
-    }
-}
-
-/// Hand a whole batch of resolutions to the event loop in **one**
-/// `call_soon_threadsafe`. CPython allocates a Handle, takes the loop lock and
-/// writes the self-pipe per call, so scheduling a full batch one future at a time
-/// spends milliseconds under the GIL on syscalls, starving the loop it is
-/// feeding. The batch is the unit on the failure path as much as the success one.
-///
-/// Leaves `r` empty. A failure to build the lists or schedule the callback leaves
-/// that batch unresolved: there is no thread left to raise on, and the
-/// connection's next failure fails them through `fail_all`.
-fn dispatch(py: Python<'_>, call_soon: &Py<PyAny>, resolve_fn: &Py<PyAny>, r: &mut Resolutions) {
-    if r.ok_futures.is_empty() && r.err_futures.is_empty() {
-        return;
-    }
-    let _ = (|| -> PyResult<()> {
-        let args = (
-            resolve_fn,
-            PyList::new(py, r.ok_futures.drain(..))?,
-            PyList::new(py, r.ok_values.drain(..))?,
-            PyList::new(py, r.err_futures.drain(..))?,
-            PyList::new(py, r.err_excs.drain(..))?,
-        );
-        call_soon.call1(py, args)?;
-        Ok(())
-    })();
-}
-
-fn async_io_loop(
-    mut session: gnitz_core::Session,
-    rx: std::sync::mpsc::Receiver<IoRequest>,
-    call_soon: Py<PyAny>,
-    resolve_fn: Py<PyAny>,
-) {
-    // `session` owns the connection for the whole loop: the early return and
-    // the normal `break` both fall through to its drop, which closes it — so
-    // an unwind through this loop cannot leak it either.
-
-    // Hoisted scratch — every one of these is fully consumed before the next
-    // iteration reaches it, so the outer buffers are reused rather than refilled.
-    // `parts` is the one that is legitimately shorter than `pending`: a request
-    // rejected at pack time contributes a `Pending` but no frame.
-    let mut pending: Vec<Pending> = Vec::with_capacity(IO_BATCH_MAX);
-    let mut parts: Vec<gnitz_core::MessageParts> = Vec::with_capacity(IO_BATCH_MAX);
-    let mut results: Vec<LoopResult> = Vec::with_capacity(IO_BATCH_MAX);
-    let mut resolutions = Resolutions::default();
-
-    loop {
-        // Block until at least one request.
-        let first = match rx.recv() {
-            Ok(req) => req,
-            Err(_) => break, // sender dropped → clean shutdown
-        };
-
-        // Drain queued requests (natural batching), capped to avoid filling
-        // the socket send buffer before reading any responses. Each request
-        // is packed here on the I/O thread: push frames arrive pre-encoded,
-        // scan/seek are stamped with the session-owned cache's schema version.
-        // A pack that the session rejects (a malformed `scan_many` tid list)
-        // contributes no frame — only a `Failed` recv kind — so the rejection
-        // fails that one future without ever touching the wire.
-        parts.clear();
-        let pack = |req: IoRequest, parts: &mut Vec<_>, pending: &mut Vec<Pending>| {
-            let packed = match req.op {
-                IoOp::Push { parts: p, target_id } => Ok((p, RecvKind::Push { target_id })),
-                IoOp::Scan(target_id) => Ok((session.pack_scan(target_id), RecvKind::Scan { target_id })),
-                IoOp::Seek(target_id, pk) => Ok((session.pack_seek(target_id, &pk), RecvKind::Scan { target_id })),
-                IoOp::ScanMulti(tids) => session
-                    .pack_scan_multi(&tids)
-                    .map(|p| (p, RecvKind::ScanMulti { target_ids: tids })),
-            };
-            let recv = match packed {
-                Ok((p, rk)) => {
-                    parts.push(p);
-                    rk
-                }
-                Err(e) => RecvKind::Failed(e.to_string()),
-            };
-            pending.push(Pending {
-                recv,
-                future: req.future,
-                include_hidden: req.include_hidden,
-            });
-        };
-        pack(first, &mut parts, &mut pending);
-        while pending.len() < IO_BATCH_MAX {
-            match rx.try_recv() {
-                Ok(req) => pack(req, &mut parts, &mut pending),
-                Err(_) => break,
-            }
-        }
-
-        // Send the whole batch through the session's outbound queue; `parts` is
-        // drained and keeps its capacity for the next cycle.
-        if let Err(e) = session.send_batch(&mut parts) {
-            fail_all(
-                &rx,
-                &mut pending,
-                &ClientError::from(e),
-                &call_soon,
-                &resolve_fn,
-                &mut resolutions,
-            );
-            return;
-        }
-
-        // Recv all responses for this batch through the session's cache-aware
-        // reassembly (pure Rust, no GIL). A server-level error resolves that
-        // one future (transport stays up); a transport/protocol failure stops
-        // reading and fails the rest below. STATUS_SCHEMA_MISMATCH surfaces as
-        // a ServerError here and fails the future — the async driver never
-        // inline-retries (positional FIFO correlation forbids it).
-        results.clear();
-        let mut recv_err: Option<ClientError> = None;
-        for p in &pending {
-            let r: Result<LoopResult, ClientError> = match p.recv {
-                RecvKind::Push { target_id } => match session.recv_push_ack(target_id) {
-                    Ok(lsn) => Ok(LoopResult::PushOk(lsn)),
-                    Err(e) => classify_recv_err(e),
-                },
-                RecvKind::Scan { target_id } => match session.recv_scan(target_id) {
-                    Ok(t) => Ok(LoopResult::Scan(Box::new(t))),
-                    Err(e) => classify_recv_err(e),
-                },
-                RecvKind::ScanMulti { ref target_ids } => {
-                    // Read the N reply trains positionally, in request order. A
-                    // server-side shape/tid rejection arrives as one STATUS_ERROR
-                    // train that fails the whole scan_many; a transport/protocol
-                    // failure stops the batch (as the single scan does). `collect`
-                    // short-circuits on the first error, so `recv_scan` is not
-                    // called for tids past a failure — matching a per-tid `break`.
-                    match target_ids
-                        .iter()
-                        .map(|&tid| session.recv_scan(tid))
-                        .collect::<Result<Vec<ScanTriple>, _>>()
-                    {
-                        Ok(triples) => Ok(LoopResult::ScanMulti(triples)),
-                        Err(e) => classify_recv_err(e),
-                    }
-                }
-                // Never reached the wire; no reply to consume.
-                RecvKind::Failed(ref msg) => Ok(LoopResult::Rejected(msg.clone())),
-            };
-            match r {
-                Ok(res) => results.push(res),
-                Err(e) => {
-                    recv_err = Some(e);
-                    break;
-                }
-            }
-        }
-
-        // A single GIL acquisition for the whole batch. The session absorbed
-        // every response's schema into its own cache during recv, so there is
-        // no separate cache-update step and no cross-thread lock. The paired
-        // drain is the length relation `results.len() <= pending.len()` written
-        // down: a short read leaves exactly the un-answered requests behind, and
-        // those are what `fail_all` drains below.
-        Python::attach(|py| {
-            for (p, result) in pending.drain(..results.len()).zip(results.drain(..)) {
-                let outcome = loop_result_to_py(py, result, p.include_hidden);
-                resolutions.push(py, p.future, outcome);
-            }
-            dispatch(py, &call_soon, &resolve_fn, &mut resolutions);
-        });
-
-        if let Some(e) = recv_err {
-            fail_all(&rx, &mut pending, &e, &call_soon, &resolve_fn, &mut resolutions);
-            return;
-        }
-    }
-}
-
-/// Fail every future this loop still owns with `err` and stop: the ones already
-/// dequeued for the current batch, then every request still sitting in the
-/// channel. Draining `rx` to exhaustion (rather than dropping it) is what makes
-/// a lost connection surface as a raised exception on *every* submitted
-/// operation — a dropped `IoRequest` would leave its coroutine awaiting a future
-/// nobody is left to resolve. The drain ends when the last sender is gone, after
-/// which `enqueue` reports the closed channel directly.
-fn fail_all(
-    rx: &std::sync::mpsc::Receiver<IoRequest>,
-    pending: &mut Vec<Pending>,
-    err: &ClientError,
-    call_soon: &Py<PyAny>,
-    resolve_fn: &Py<PyAny>,
-    resolutions: &mut Resolutions,
-) {
-    let mut fail_batch = |py: Python<'_>, futs: Vec<Py<PyAny>>| {
-        for fut in futs {
-            resolutions.push(py, fut, Err(classified_err(err)));
-        }
-        dispatch(py, call_soon, resolve_fn, resolutions);
-    };
-    Python::attach(|py| fail_batch(py, pending.drain(..).map(|p| p.future).collect()));
-    // Block for the next arrival, then take everything already queued behind it
-    // in one batch. The GIL is never held across the blocking `recv`: the last
-    // sender is dropped by `close()`/`Drop` on the Python side, which cannot run
-    // while this thread holds it — so the wait has to happen outside `attach`,
-    // and only the batch that has already arrived is resolved under it.
-    while let Ok(first) = rx.recv() {
-        let mut futs = vec![first.future];
-        while let Ok(req) = rx.try_recv() {
-            futs.push(req.future);
-        }
-        Python::attach(|py| fail_batch(py, futs));
+        self.shutdown(py, &ClientError::ServerError("connection closed".into()));
     }
 }
 

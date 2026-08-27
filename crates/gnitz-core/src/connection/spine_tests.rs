@@ -2,6 +2,7 @@
 //! end of a socketpair feeds reply frames one `step` at a time.
 
 use super::*;
+use crate::protocol::codec::encode_schema_block;
 use crate::protocol::message::{encode_control_block, encode_message_noschema_parts};
 use crate::protocol::transport::{established, framed, make_socketpair, poll_fd, raw_read_frame, raw_send};
 use crate::protocol::{ColData, ColumnDef, Header, PkColumn, TypeCode};
@@ -137,7 +138,7 @@ fn drive(s: &mut Session, slot: SlotId) -> Result<Reply, ClientError> {
 }
 
 fn scan_req(tid: u64) -> Request<'static> {
-    Request::Control {
+    Request::Read {
         target_id: tid,
         flags: 0,
         seek_pk: 0,
@@ -172,12 +173,11 @@ fn train_split_across_continuation_frames_completes_once() {
     assert_eq!(done.len(), 1);
     let (id, reply) = done.pop().unwrap();
     assert_eq!(id, slot);
-    let Reply::Train(train) = reply.unwrap() else {
-        panic!("train")
+    let Reply::Scan((schema, data, _)) = reply.unwrap() else {
+        panic!("scan")
     };
-    assert_eq!(train.data.unwrap().pks.to_vec_u128(), vec![1, 2, 3, 4, 5]);
-    assert!(train.schema.is_some(), "the block the train carried");
-    assert!(train.terminal.schema.is_none() && train.terminal.data_batch.is_none());
+    assert_eq!(data.unwrap().pks.to_vec_u128(), vec![1, 2, 3, 4, 5]);
+    assert!(schema.is_some(), "the block the train carried");
     // Absorbed into the cache under version 3.
     assert_eq!(s.cached_schema_version(7), 3);
     assert!(s.step(Interest::READ).unwrap().is_empty());
@@ -209,20 +209,23 @@ fn scan_multi_decodes_each_train_under_its_own_relation() {
     assert!(s.step(Interest::READ).unwrap().is_empty(), "one of two trains");
     peer.send(&reply_warm(2, 1, &sb, &batch_b(&[20]), true));
     peer.send(&reply_warm(2, 1, &sb, &batch_b(&[21]), false));
-    let Reply::Multi(trains) = drive(&mut s, slot).unwrap() else {
+    let Reply::Multi(replies) = drive(&mut s, slot).unwrap() else {
         panic!("multi")
     };
-    assert_eq!(trains.len(), 2);
-    let d0 = trains[0].data.as_ref().unwrap();
+    assert_eq!(replies.len(), 2);
+    let d0 = replies[0].1.as_ref().unwrap();
     assert_eq!(d0.columns.len(), 2);
     assert_eq!(d0.pks.to_vec_u128(), vec![10, 11]);
-    let d1 = trains[1].data.as_ref().unwrap();
+    let d1 = replies[1].1.as_ref().unwrap();
     assert_eq!(d1.columns.len(), 3);
     assert_eq!(d1.pks.to_vec_u128(), vec![20, 21]);
     match &d1.columns[1] {
-        ColData::Strings(v) => assert_eq!(v, &vec![Some("s20".into()), Some("s21".into())]),
+        ColData::Strings(v) => assert_eq!(v.as_slice(), [Some("s20".into()), Some("s21".into())]),
         _ => panic!("strings"),
     }
+    // Each reply carries its own relation's schema, resolved off the cache.
+    assert_eq!(replies[0].0.as_ref().unwrap().columns.len(), 2);
+    assert_eq!(replies[1].0.as_ref().unwrap().columns.len(), 3);
     assert_eq!(s.interest(), Interest::NONE);
 }
 
@@ -245,10 +248,10 @@ fn scan_multi_error_on_kth_train_fails_slot_and_connection_stays_usable() {
     s.step(Interest::WRITE).unwrap();
     peer.drain_request();
     peer.send(&reply_cold(3, 1, &sa, &batch_a(&[5]), 42, false));
-    let Reply::Train(t) = drive(&mut s, slot).unwrap() else {
-        panic!("train")
+    let Reply::Scan((_, _, lsn)) = drive(&mut s, slot).unwrap() else {
+        panic!("scan")
     };
-    assert_eq!(t.terminal.seek_pk, 42);
+    assert_eq!(lsn, 42);
 }
 
 #[test]
@@ -266,8 +269,10 @@ fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
     let ids: Vec<SlotId> = done.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids, vec![s1, s2], "in request order");
     for (id, r) in done {
-        let Reply::Train(t) = r.unwrap() else { panic!("train") };
-        assert_eq!(t.terminal.seek_pk, if id == s1 { 11 } else { 22 });
+        let Reply::Scan((_, _, lsn)) = r.unwrap() else {
+            panic!("scan")
+        };
+        assert_eq!(lsn, if id == s1 { 11 } else { 22 });
     }
     assert_eq!(s.interest(), Interest::NONE);
 }
@@ -340,10 +345,10 @@ fn peer_closing_while_parked_completes_the_operation_with_an_error() {
 }
 
 #[test]
-fn close_returns_every_pending_slot_once_and_refuses_further_work() {
+fn close_abandons_every_pending_slot_and_refuses_further_work() {
     let (mut s, _peer) = pair();
-    let a = s.submit(scan_req(1)).unwrap();
-    let b = s.submit(scan_req(2)).unwrap();
+    s.submit(scan_req(1)).unwrap();
+    s.submit(scan_req(2)).unwrap();
     assert_eq!(
         s.interest(),
         Interest {
@@ -351,10 +356,8 @@ fn close_returns_every_pending_slot_once_and_refuses_further_work() {
             write: true
         }
     );
-    let closed = s.close();
-    assert_eq!(closed, vec![a, b]);
+    s.close();
     assert_eq!(s.interest(), Interest::NONE);
-    assert!(s.close().is_empty());
     assert!(matches!(s.submit(scan_req(3)), Err(ClientError::ServerError(ref m)) if m == "connection closed"));
     assert!(s
         .step(Interest {
@@ -376,8 +379,8 @@ fn in_flight_cap_raises_rather_than_hanging() {
     }
     let r = s.submit(scan_req(1));
     assert!(matches!(r, Err(ClientError::ServerError(ref m)) if m.contains("in flight")));
-    let ids = s.close();
-    assert_eq!(ids.len(), MAX_IN_FLIGHT);
+    s.close();
+    assert!(s.submit(scan_req(1)).is_err(), "and the cap is not what refuses now");
 }
 
 /// Deliver `SIGUSR1` to the calling thread `after` from now, with a no-op
@@ -486,4 +489,71 @@ fn push_retries_cold_on_schema_mismatch() {
     let (warm, cold, _peer) = h.join().unwrap();
     assert!(cold > warm, "the retry carries the schema block the warm frame omitted");
     assert_eq!(s.requests_sent(), 3, "counted once per frame, on enqueue");
+}
+
+#[test]
+fn a_mismatch_evicts_the_cache_and_the_next_push_goes_out_cold() {
+    let (mut s, peer) = pair();
+    let sa = schema_a();
+    let b = batch_a(&[1]);
+    // Warm relation 4 at version 2, so both pushes below encode schema-less.
+    let slot = s.submit(scan_req(4)).unwrap();
+    s.step(Interest::WRITE).unwrap();
+    peer.drain_request();
+    peer.send(&reply_cold(4, 2, &sa, &b, 0, false));
+    drive(&mut s, slot).unwrap();
+
+    let push = |s: &mut Session| {
+        s.submit(Request::Push {
+            target_id: 4,
+            schema: &sa,
+            batch: &b,
+            mode: WireConflictMode::Update,
+        })
+        .unwrap()
+    };
+    let (a, c) = (push(&mut s), push(&mut s));
+    s.step(Interest::WRITE).unwrap();
+    let warm_len = peer.drain_request().len();
+    assert_eq!(peer.drain_request().len(), warm_len, "both encoded at the stale stamp");
+
+    // The first mismatch fails its own slot and evicts the entry.
+    peer.send(&reply_status(STATUS_SCHEMA_MISMATCH, "", 0));
+    let mut done = s.step(Interest::READ).unwrap();
+    assert_eq!(done.len(), 1);
+    let (id, r) = done.pop().unwrap();
+    assert_eq!(id, a);
+    assert!(matches!(r, Err(ClientError::SchemaMismatch)));
+    assert!(!s.closed, "a per-slot error leaves the connection usable");
+    assert_eq!(s.cached_schema_version(4), 0, "the entry is gone");
+
+    // Submitted after the eviction: cold, longer by the schema block.
+    let cold = push(&mut s);
+    s.step(Interest::WRITE).unwrap();
+    let cold_len = peer.drain_request().len();
+    assert_eq!(
+        cold_len - warm_len,
+        encode_schema_block(&sa, 4).len(),
+        "the cold frame is longer by exactly the schema block the warm ones omitted"
+    );
+
+    // The second stale push fails too — every push encoded at the stale stamp does.
+    peer.send(&reply_status(STATUS_SCHEMA_MISMATCH, "", 0));
+    let mut done = s.step(Interest::READ).unwrap();
+    assert_eq!(done.len(), 1);
+    let (id, r) = done.pop().unwrap();
+    assert_eq!(id, c);
+    assert!(matches!(r, Err(ClientError::SchemaMismatch)));
+
+    // The cold push's ACK carries the block at the new version, which puts the
+    // next push back on the warm path.
+    peer.send(&reply_cold(4, 5, &sa, &batch_a(&[]), 999, false));
+    let Reply::Lsn(lsn) = drive(&mut s, cold).unwrap() else {
+        panic!("push ACK")
+    };
+    assert_eq!(lsn, 999);
+    assert_eq!(s.cached_schema_version(4), 5);
+    push(&mut s);
+    s.step(Interest::WRITE).unwrap();
+    assert_eq!(peer.drain_request().len(), warm_len, "warm again");
 }
