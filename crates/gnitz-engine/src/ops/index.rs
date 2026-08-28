@@ -1,7 +1,7 @@
 //! Secondary index integration: AviBake, IntegrateTarget, op_integrate_with_indexes.
 
 use crate::ops::AggDescriptor;
-use crate::schema::{ColumnLocator, SchemaDescriptor};
+use crate::schema::{type_code, ColumnLocator, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
 use gnitz_wire::AggFunc;
 
@@ -37,13 +37,30 @@ pub(crate) struct AviBake {
 }
 
 impl AviBake {
-    /// `None` only if the composite key overflows the schema builder's bounds,
-    /// which the group-key layout's reserved suffix rules out for a well-formed
-    /// input schema.
+    /// The index schema is the key packer's own key columns, then the ordinal
+    /// selecting which non-linear aggregate the entry belongs to, then
+    /// [`super::util::AVI_AV_COL`]. All columns are PK; there is no payload.
+    ///
+    /// The ordinal sits **between** the group key and the value so the
+    /// byte-ordered key sorts by `(group, ordinal, av)`: `MIN(a)` (ordinal 0) and
+    /// `MAX(a)` (ordinal 1) coexist with no collision, and within an ordinal the
+    /// per-aggregate `for_max` encoding sorts the extreme first. The empty global
+    /// key reduces the prefix to just `ordinal`.
+    ///
+    /// `None` is unreachable for a well-formed input schema: the group-key layout
+    /// reserves these two slots out of the PK budget, so **every** group set has
+    /// an index and no reduce is left on a per-epoch trace rescan.
     pub(crate) fn new(src: &SchemaDescriptor, group_by_cols: &[u32], aggs: &[AggDescriptor]) -> Option<Self> {
+        let key_packer = ReindexPacker::new_group_key(src, group_by_cols);
+        let mut b = crate::schema::DerivedSchema::new();
+        for c in key_packer.key_columns() {
+            b.push_pk(c)?;
+        }
+        b.push_pk(SchemaColumn::new(type_code::U8, 0))?; // ordinal
+        b.push_pk(SchemaColumn::new(super::util::AVI_AV_COL, 0))?; // av_encoded
         Some(AviBake {
-            key_packer: ReindexPacker::new_group_key(src, group_by_cols),
-            schema: crate::schema::avi_schema(src, group_by_cols)?,
+            schema: b.finish(),
+            key_packer,
             aggs: aggs
                 .iter()
                 .filter(|d| d.agg_op.uses_value_index())

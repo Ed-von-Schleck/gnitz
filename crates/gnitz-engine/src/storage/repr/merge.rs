@@ -528,9 +528,9 @@ pub(crate) struct DirectWriter<'a> {
     blob: &'a mut Vec<u8>,
     blob_cache: BlobCacheGuard,
     pub(super) count: usize,
-    /// Borrowed, not owned: `write_row` reads it per row, and a `SchemaDescriptor`
-    /// is 424 bytes — copying it in would put a `memcpy` of that size on the
-    /// per-row path (and inflate the writer by the same amount).
+    /// Borrowed, not owned: `write_row` reads it per row, and a
+    /// `SchemaDescriptor` is 360 bytes (pinned in `schema`) — copying it in would
+    /// put a `memcpy` of that size on the per-row path.
     pub(super) schema: &'a SchemaDescriptor,
 }
 

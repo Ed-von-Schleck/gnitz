@@ -20,8 +20,9 @@
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use super::join::merge_schemas_for_join;
 use super::{op_join_delta_trace, JoinProbe, RangeProbe};
-use crate::schema::{merge_schemas_for_join, type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout, ReadCursor};
 use gnitz_wire::RangeRel;
 

@@ -31,7 +31,9 @@ pub(super) fn open_shards(input_files: &[&CStr], schema: &SchemaDescriptor) -> R
 /// A skeleton shard is serialized under this, so its regions are
 /// `[pk, weight, null, blob]`.
 pub(super) fn skeleton_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
-    crate::schema::project_schema(schema, &[])
+    // An empty projection adds no column, so only the source PK is pushed and
+    // the builder's bounds cannot be reached.
+    crate::schema::project_schema(schema, &[]).expect("a schema's own PK fits the PK limit")
 }
 
 /// Fold `bucket` — one guard's (PK, payload)-sorted survivor slice — into one

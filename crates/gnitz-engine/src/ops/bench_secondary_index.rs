@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 use super::index::{op_integrate_with_indexes, AviBake, IntegrateTarget};
 use super::util::{encode_ordered, AVI_AV_BYTES};
 use super::AggDescriptor;
-use crate::schema::key::ReindexPacker;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::storage::{Batch, RecoverySource, Table};
 use gnitz_wire::AggFunc;
@@ -140,11 +139,20 @@ fn time_upsert(
 fn secondary_index_bench_avi_decomposition() {
     let schema = src_schema();
     let group_by_cols = vec![1u32];
-    let avi_schema = crate::schema::avi_schema(&schema, &group_by_cols).unwrap();
+    let bake = AviBake::new(
+        &schema,
+        &group_by_cols,
+        &[AggDescriptor {
+            col_idx: 2,
+            agg_op: AggFunc::Min,
+        }],
+    )
+    .unwrap();
+    let avi_schema = bake.schema;
     let input = build_input(&schema);
     let mb = input.as_mem_batch();
     let tmp = tempfile::tempdir().unwrap();
-    let packer = ReindexPacker::new_group_key(&schema, &group_by_cols);
+    let packer = &bake.key_packer;
     let n = packer.out_stride;
     let avi_pi = schema
         .try_payload_idx(2)
@@ -203,15 +211,6 @@ fn secondary_index_bench_avi_decomposition() {
         )
         .unwrap();
         id += 1;
-        let bake = AviBake::new(
-            &schema,
-            &group_by_cols,
-            &[AggDescriptor {
-                col_idx: 2,
-                agg_op: AggFunc::Min,
-            }],
-        )
-        .unwrap();
         let avi = IntegrateTarget::Avi(&mut t, &bake);
         op_integrate_with_indexes(&input, avi).unwrap();
         std::hint::black_box(&t);
@@ -247,9 +246,8 @@ fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: 
     );
 }
 
-/// Single-U64 PK: the `pk_is_fast` path that must NOT regress (OPK is bypassed;
-/// `pack_pk_le` output is byte-identical). Guards against accidental routing of
-/// the fast path through the OPK encoder.
+/// Single-U64 PK: the `pk_is_fast` path that must NOT regress. Guards against
+/// accidental routing of the fast path through the OPK encoder.
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn secondary_index_bench_single_u64_pk_sort() {

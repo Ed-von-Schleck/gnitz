@@ -40,14 +40,15 @@ use crate::runtime::reactor::{
 };
 use crate::runtime::sal::{GroupTargets, SalFit, FLAG_DELTA_SCAN, FLAG_SCAN_SPEC};
 use crate::runtime::wire::{
-    self as ipc, SchemaWithVersion, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
+    self as ipc, validate_schema_match, SchemaWithVersion, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK,
+    STATUS_SCHEMA_MISMATCH,
 };
 use gnitz_engine::catalog::{
     family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, CatalogEngine, SysFamily, FIRST_USER_TABLE_ID,
     SEQ_TAB_ID,
 };
 use gnitz_engine::query::RelationKind;
-use gnitz_engine::schema::{validate_schema_match, SchemaDescriptor};
+use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine::storage::Batch;
 
 const TICK_COALESCE_ROWS: usize = 10_000;

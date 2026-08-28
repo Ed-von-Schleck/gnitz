@@ -38,6 +38,6 @@ pub use exchange::{
     op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, reset_slots, RouteMode,
 };
 pub(crate) use index::{op_integrate_with_indexes, AviBake, IntegrateTarget as OpsIntegrateTarget};
-pub(crate) use join::{op_join_delta_trace, JoinProbe, RangeProbe};
+pub(crate) use join::{merge_schemas_for_join, op_join_delta_trace, JoinProbe, RangeProbe};
 pub(crate) use linear::{op_filter, op_negate, op_union};
 pub(crate) use reduce::{op_reduce, AdhocFold, AggDescriptor, AviHistory, ReducePlan};

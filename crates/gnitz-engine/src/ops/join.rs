@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::key::{compare_pk_ordering, key_range_between_cuts, pk_bytes_eq, KeyCut, PkBuf};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{DerivedSchema, SchemaDescriptor};
 use crate::storage::{Batch, BlobCacheGuard, MemBatch, ReadCursor};
 
 use super::cogroup::cogroup_intersection;
@@ -139,8 +139,8 @@ impl RangeProbe {
 // ---------------------------------------------------------------------------
 
 /// Join delta rows against the trace. Output schema:
-/// `[left_PK, left_payload..., right_payload...]`, built by the compiler's
-/// `merge_schemas_for_join` and handed down as `out_schema`.
+/// `[left_PK, left_payload..., right_payload...]`, built by
+/// [`merge_schemas_for_join`] above and handed down as `out_schema`.
 ///
 /// Emission is trace-major under both probes: each trace row is walked once and
 /// producted against a contiguous, random-access delta run. So the output is
@@ -297,6 +297,24 @@ fn skip_to_group(delta: &MemBatch, eq_size: usize, from: usize, group: &[u8]) ->
         hi += 1;
     }
     hi
+}
+
+// ---------------------------------------------------------------------------
+// The output schema
+// ---------------------------------------------------------------------------
+
+/// `left`'s PK, then both sides' payloads — the layout [`write_join_row`] below
+/// writes, homed beside it because that writer derives the same layout
+/// independently (`extend_pk_bytes(left)`, then `append_payload_cols` at 0 and
+/// at `left_npc`). An outer join's null-fill columns are appended by the
+/// compiler's own null-extend builder, not here.
+pub(crate) fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(left)?;
+    for (_, c) in left.payload_columns().chain(right.payload_columns()) {
+        b.push(*c)?;
+    }
+    Some(b.finish())
 }
 
 // ---------------------------------------------------------------------------

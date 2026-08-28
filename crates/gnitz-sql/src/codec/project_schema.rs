@@ -100,7 +100,7 @@ pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Res
 }
 
 /// Pin the full source PK to output slots `0..k` in `pk_indices()` order,
-/// matching the engine's `build_map_output_schema` (which copies every PK
+/// matching the engine's `project_schema` (which copies every PK
 /// column to the front via `DerivedSchema::push_pk_of`). A PK column already at its
 /// target slot stays; one appearing later is removed+inserted (shifting the
 /// spanned non-PK columns right by one, preserving their relative order — a

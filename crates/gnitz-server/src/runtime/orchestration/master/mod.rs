@@ -10,7 +10,7 @@ use std::rc::Rc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use gnitz_engine::catalog::CatalogEngine;
-use gnitz_engine::schema::{unique_preflight_wire_schema, IndexKeySpec, SchemaDescriptor};
+use gnitz_engine::schema::{IndexKeySpec, SchemaDescriptor};
 use gnitz_wire::PkColList;
 use gnitz_wire::{payload_native_key, pk_native_key};
 
@@ -24,8 +24,8 @@ use crate::runtime::sal::{
 };
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{
-    self, peek_control_block_ipc, DecodedWire, SchemaWithVersion, WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE,
-    FLAG_HAS_DATA, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
+    self, peek_control_block_ipc, unique_preflight_wire_schema, DecodedWire, SchemaWithVersion, WireConflictMode,
+    FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
 };
 use gnitz_engine::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
 use gnitz_engine::query::RelayRoute;

@@ -108,9 +108,11 @@ pub enum RelationKind {
 }
 
 impl RelationKind {
-    /// Which kind a `TABLE_TAB.flags` word describes — the one read of the `stream`
-    /// bit, beside `Placement::from_table_flags` over the same word. VIEW_TAB rows
-    /// do not come through here.
+    /// Which kind a `TABLE_TAB.flags` word describes — the one read of the
+    /// `stream` bit. `Placement::from_table_flags` is the peer decoder over the
+    /// same word, homed with `Placement` in `schema`; they stay apart because
+    /// only one of this one's two callers wants a placement. VIEW_TAB rows do
+    /// not come through here.
     #[inline]
     pub fn from_table_flags(flags: u64) -> RelationKind {
         if gnitz_wire::TableProps::from_flags(flags).stream {
@@ -670,7 +672,7 @@ mod tests {
     }
 
     fn make_test_table(name: &str) -> Box<Table> {
-        let schema = SchemaDescriptor::default();
+        let schema = SchemaDescriptor::minimal_u64();
         let dir = dag_test_dir(name);
         Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive { resume_at: None }).unwrap())
     }
@@ -678,7 +680,7 @@ mod tests {
     #[test]
     fn test_register_unregister_table() {
         let mut dag = DagEngine::new();
-        let schema = SchemaDescriptor::default();
+        let schema = SchemaDescriptor::minimal_u64();
         let mut tbl = make_test_table("reg_unreg");
         dag.register_table(
             100,

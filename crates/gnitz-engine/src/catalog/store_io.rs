@@ -263,12 +263,12 @@ impl CatalogEngine {
     ) -> Result<(Batch, SchemaDescriptor), String> {
         let entry = self.table_entry(table_id)?;
         let schema = entry.schema;
-        let result_schema = project_schema(&schema, &[ref_col]);
-        // Resolve the projection once — payload slot and column size — instead
-        // of re-deriving both per row inside the seek loop. The column is
-        // master-picked and is never a PK column (the FK rules gather only a
-        // non-PK referenced column; `project_schema` asserts it one frame up),
-        // so it has a payload slot.
+        let result_schema =
+            project_schema(&schema, &[ref_col as u32]).expect("a one-column projection fits MAX_COLUMNS");
+        // The column is master-picked and is never a PK column (the FK rules
+        // gather only a non-PK referenced column), which this rejects: a PK
+        // `ref_col` would be skipped by `project_schema` and leave the reply
+        // payload-less.
         let ci = ref_col as usize;
         let pi = schema.try_payload_idx(ci).expect("FK projection excludes PK columns");
         let col_size = schema.columns[ci].size() as usize;

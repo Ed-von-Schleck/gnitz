@@ -10,10 +10,7 @@ use crate::expr::MapPlan;
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::AggDescriptor;
 use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};
-use crate::schema::{
-    build_map_output_schema, compute_map_output_schema, hashrow_output_schema, merge_schemas_for_join,
-    null_extend_output_schema, union_nullability_merge, SchemaDescriptor,
-};
+use crate::schema::{project_schema, SchemaDescriptor};
 use crate::storage::{ReadCursor, RecoverySource, StorageError, Table};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
 

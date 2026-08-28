@@ -121,8 +121,11 @@ impl CatalogEngine {
     /// `pack_pk_cols` word: the master applies it as an early client-facing
     /// reject, the worker as its trust boundary, and both render the same error.
     pub fn validate_index_cols(&self, table_id: i64, cols: &PkColList, op: &str) -> Result<(), String> {
+        let in_range = |s: &SchemaDescriptor| {
+            cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < s.num_columns())
+        };
         match self.get_schema_desc(table_id) {
-            Some(s) if s.cols_in_range(cols) => Ok(()),
+            Some(s) if in_range(&s) => Ok(()),
             _ => Err(format!("{op}: invalid column list for table {table_id}")),
         }
     }

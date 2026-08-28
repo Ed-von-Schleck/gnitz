@@ -1218,7 +1218,7 @@ impl WorkerProcess {
         // promoted per-column types/sizes for the span.
         let idx_schema = gnitz_engine::schema::make_index_schema(col_indices, &schema)?;
         let spec = gnitz_engine::schema::IndexKeySpec::new(col_indices, &schema, &idx_schema);
-        let frame_schema = gnitz_engine::schema::unique_preflight_wire_schema(&idx_schema, col_indices.len());
+        let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
         // The spill file is an anonymous inode on the owner table's own data
         // disk, so it never leaks and shares the table's filesystem.
@@ -2531,7 +2531,7 @@ mod tests {
             .register_table(tid, PUBLIC_SCHEMA_ID, "tproj", &cols, &[0])
             .unwrap();
         let table_schema = engine.get_schema_desc(tid).unwrap();
-        let projected = gnitz_engine::schema::project_schema(&table_schema, &[1]);
+        let projected = gnitz_engine::schema::project_schema(&table_schema, &[1]).unwrap();
         assert_ne!(projected.num_columns(), table_schema.num_columns());
 
         let (region, writer) = make_ring();

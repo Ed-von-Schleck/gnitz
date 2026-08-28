@@ -835,14 +835,16 @@ impl Batch {
     }
 
     /// Append a narrow PK from a `u128` — the [`NarrowPkOpk`] image (right-aligned
-    /// big-endian) appended through [`Self::extend_pk_bytes`]. For UNSIGNED PKs
-    /// this is the correct OPK encoding (OPK == BE for unsigned), and
-    /// `widen_pk_be(extend_pk(v))` round-trips. SIGNED or compound PKs are NOT
-    /// sign-flipped here and must use `extend_pk_opk` / `extend_pk_bytes`.
+    /// big-endian) appended through [`Self::extend_pk_bytes`]. Valid for an
+    /// **all-unsigned** PK only: OPK == BE there, so `widen_pk_be(extend_pk(v))`
+    /// round-trips and a compound key is just the big-endian concatenation a
+    /// packed `u128` already spells. A signed column anywhere needs
+    /// `extend_pk_opk` / `extend_pk_bytes`; the assert below holds every call
+    /// site to that.
     #[inline]
     pub fn extend_pk(&mut self, pk: u128) {
         debug_assert!(
-            !self.schema.pk_has_signed_col(),
+            !self.schema.pk_columns().any(|(_, c)| c.is_signed()),
             "extend_pk writes an unflipped right-aligned big-endian key: a PK with a signed column \
              must use extend_pk_opk / extend_pk_bytes",
         );

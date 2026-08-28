@@ -461,7 +461,7 @@ pub(super) fn apply_agg_from_value_index(
     use super::super::util::AVI_AV_BYTES;
     if avi_cursor.seek_first_positive_with_prefix(group_key) {
         let k = avi_cursor.current_pk_bytes();
-        // current_pk_bytes() is the full AVI PK region; `avi_schema` lays it
+        // current_pk_bytes() is the full AVI PK region; `AviBake::new` lays it
         // out as `group ‖ ordinal ‖ av_encoded`, so the trailing av bytes are
         // always in bounds for a seek prefix `group_key` of length
         // `group_stride + 1` (group plus the ordinal byte).

@@ -213,8 +213,8 @@ pub fn index_opk_prefix(native: u128, src_type: u8, idx_key_type: u8) -> PkBuf {
 /// loads for the same reason; only 1/3/5/6/7 reach the pad-and-copy arm.
 ///
 /// NOT a value accessor — for a U64 OPK value 1 (`[0,…,0,1]` at `[..8]`) this
-/// packs as `1·2^64`, not 1. Sibling of `pack_pk_le`, opposite alignment from
-/// `gnitz_wire::widen_pk_be` (right-aligned value recovery); never conflate them.
+/// packs as `1·2^64`, not 1. Opposite alignment from `gnitz_wire::widen_pk_be`
+/// (right-aligned value recovery); never conflate them.
 #[inline(always)]
 pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
     match pk_bytes.len() {
@@ -733,7 +733,7 @@ impl IndexKeySpec {
 /// `false` when `p` is all-`0xFF` (or empty) — no successor exists at this width
 /// (carry-out), which a caller reads as `+∞` (scan to the table end, or a
 /// provably-empty start).
-pub(crate) fn increment_key_in_place(p: &mut [u8]) -> bool {
+fn increment_key_in_place(p: &mut [u8]) -> bool {
     for b in p.iter_mut().rev() {
         *b = b.wrapping_add(1);
         if *b != 0 {
@@ -948,20 +948,14 @@ pub(crate) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &
 }
 
 /// Hash one group column into the fold-path digest. The single per-column body
-/// `ops::util::GroupKeyCols::key_row` folds with — a divergence would silently
-/// merge or split groups (a wrong output PK, and a wrong AVI bucket).
+/// [`hash_fold`] folds with — a divergence would silently merge or split groups
+/// (a wrong output PK, and a wrong AVI bucket).
 ///
 /// Reads the null bit unconditionally, like the sibling `compare_by_group_cols`:
 /// a NOT NULL column never carries one, so masking it off would cost a per-row
 /// AND to change nothing.
 #[inline]
-pub(crate) fn hash_group_col<R: RowSource>(
-    hasher: &mut RowHasher,
-    src: &R,
-    row: usize,
-    null_word: u64,
-    loc: ColumnLocator,
-) {
+fn hash_group_col<R: RowSource>(hasher: &mut RowHasher, src: &R, row: usize, null_word: u64, loc: ColumnLocator) {
     // A PK column is never null, so this is the payload-only NULL gate.
     if loc.is_null_word(null_word) {
         hasher.update(&[0u8]); // null marker
@@ -1157,16 +1151,24 @@ impl ReindexPacker {
         })
     }
 
-    /// The reindex Map's output schema: the promoters' own `out_col` per key
-    /// slot — so this schema's stride and `out_stride` are the same sum — then
+    /// The output PK columns this packer's bytes fill, in key order. The
+    /// promoters are the only derivation of that layout, so a schema built from
+    /// these describes what `pack_into` writes by construction —
+    /// [`Self::output_schema`] and `AviBake::new` both take theirs from here.
+    pub(crate) fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> + '_ {
+        self.cols[..self.num_cols].iter().map(|cp| cp.out_col)
+    }
+
+    /// The reindex Map's output schema: the packer's own [`Self::key_columns`]
+    /// — so this schema's stride and `out_stride` are the same sum — then
     /// `in_schema.columns[payload_cols[i]]`. `payload_cols` is what the reindex
     /// program copies, so a join side skipping a dead column stops persisting it.
     ///
     /// `None` iff the result exceeds `MAX_COLUMNS`; the PK-side bounds are `new`'s.
     pub(crate) fn output_schema(&self, in_schema: &SchemaDescriptor, payload_cols: &[u32]) -> Option<SchemaDescriptor> {
         let mut b = DerivedSchema::new();
-        for cp in &self.cols[..self.num_cols] {
-            b.push_pk(cp.out_col)?;
+        for c in self.key_columns() {
+            b.push_pk(c)?;
         }
         for &c in payload_cols {
             b.push(in_schema.columns[c as usize])?;
@@ -1175,9 +1177,9 @@ impl ReindexPacker {
     }
 
     /// Build the packer for a **group** key over `group_cols`. Every slot type
-    /// comes from [`gnitz_wire::group_key_layout`], which the AVI schema and the
-    /// reindex output schema also read, so a group key's slots and its bytes
-    /// cannot disagree.
+    /// comes from [`gnitz_wire::group_key_layout`], read here and nowhere else:
+    /// every schema over this key goes through [`Self::key_columns`], so a group
+    /// key's slots and its bytes cannot disagree.
     ///
     /// Unlike a join key this is total — columns past the budget fold into one
     /// trailing hash slot — which is what lets the reduce index every group set
@@ -1347,10 +1349,10 @@ mod tests {
         }
     }
 
-    /// Boundary sweeps for every PK-eligible scalar type. The value sets carry
-    /// the regressions that used to have a test each: sign-extension (`-1 < 1`),
-    /// zero-extension (`0xFFFE > 1`), LE-vs-lex byte order (`1 < 256`), and the
-    /// 2^63 / 2^64 width boundaries that separate a U64 image from an I64 one.
+    /// Boundary sweeps for every PK-eligible scalar type. The value sets pin
+    /// sign-extension (`-1 < 1`), zero-extension (`0xFFFE > 1`), LE-vs-lex byte
+    /// order (`1 < 256`), and the 2^63 / 2^64 width boundaries that separate a
+    /// U64 image from an I64 one.
     #[test]
     fn opk_order_matches_native_order_per_type() {
         assert_single_col_order(type_code::U8, &[0u8, 1, 0x7F, 0x80, 0xFF], |v| vec![v]);

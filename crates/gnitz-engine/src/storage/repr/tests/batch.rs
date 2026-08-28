@@ -704,9 +704,16 @@ fn widened_with_null_tail_carries_the_blob() {
     let long: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
     let b = make_batch_bytes(&in_schema, &[(1, 1, long)]);
 
-    // One appended I64 column — the shape a LEFT JOIN null-fill widens to.
-    let out_schema = crate::schema::null_extend_output_schema(&in_schema, &[type_code::I64])
-        .expect("two columns is well inside MAX_COLUMNS");
+    // One appended nullable I64 column — the shape a LEFT JOIN null-fill widens
+    // to: the input schema verbatim, then the fill column.
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
     let out = b.widened_with_null_tail(&in_schema, &out_schema);
 
     assert_eq!(out.count, 1);
@@ -743,7 +750,7 @@ fn empty_batch_drop_is_noop() {
     use crate::storage::batch_pool::acquire_buf;
     while acquire_buf().capacity() > 0 {}
 
-    let batch = Batch::empty_with_schema(&SchemaDescriptor::default());
+    let batch = Batch::empty_with_schema(&SchemaDescriptor::minimal_u64());
     assert_eq!(batch.data_capacity(), 0);
     drop(batch);
 

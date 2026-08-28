@@ -321,10 +321,10 @@ pub(crate) fn compare_rows_fixedint_nonnull<A: RowSource, B: RowSource>(
         // Branchless sign-flip: signed columns flip their MSB so two's-complement
         // negatives sort below non-negatives; `is_signed` is 0 for unsigned
         // columns, so the XOR is a no-op there. `cs*8-1 ∈ {7,15,31,63}` is always
-        // a valid u64 shift, because `FixedIntNonnull` admits a column only if
-        // `is_fixed_int(type_code)` — which is exactly "1/2/4/8 bytes", pinned by
-        // `gnitz_wire`'s `is_fixed_int_implies_shiftable_width`. Reads
-        // `size`/`is_signed` only — never `type_code`.
+        // a valid u64 shift: `FixedIntNonnull` admits a column only if
+        // `gnitz_wire::is_fixed_int(type_code)`, whose eight type codes are
+        // exactly the 1/2/4/8-byte widths. Reads `size`/`is_signed` only —
+        // never `type_code`.
         let sign_flip = (col.is_signed() as u64) << (cs * 8 - 1);
         // `get_col_ptr` returns exactly `cs` bytes, so this is the exact-width
         // read: the width form's `bytes[..cs]` bound is an out-of-line call at

@@ -5,15 +5,14 @@
 
 use super::*;
 
-/// The one place COL_TAB column records become a `SchemaDescriptor`, so it is
-/// where their admissibility is enforced — not at the callers. `Err` rather than
-/// `assert!`: the rows are catalog data a corrupt SAL can carry, and
-/// `hook_column_alter` plus the register hooks under boot replay / worker
-/// `ddl_sync` run on paths that skip the DDL precheck entirely.
-///
-/// The PK rules go through the same `gnitz_wire` predicate the planner, client
-/// and wire codec use, because `new_with_placement` below only *asserts* them —
-/// on these paths that is an abort at boot rather than a rejected relation.
+/// The one place COL_TAB column records become a `SchemaDescriptor`, and total
+/// over every `(col_defs, pk_cols)` pair: it rejects everything
+/// `new_with_placement` would `assert!` on, so no caller can abort the process
+/// with catalog data a corrupt SAL carried. That matters because
+/// `hook_column_alter` and the register hooks under boot replay / worker
+/// `ddl_sync` all skip the DDL precheck — and because the ALTER path pairs an
+/// already-built descriptor's PK list with freshly re-read column records, which
+/// a `DROP NOT NULL` on a PK column would have made inadmissible.
 ///
 /// `placement` is where the relation's rows live: the table-register path folds
 /// it out of `TABLE_TAB.flags`, the view path out of its sources' own stamped
@@ -24,14 +23,7 @@ pub(crate) fn build_schema_from_col_defs(
     placement: Placement,
 ) -> Result<SchemaDescriptor, String> {
     check_col_defs(col_defs)?;
-    if let Some(&c) = pk_cols.iter().find(|&&c| c as usize >= col_defs.len()) {
-        return Err(format!("PK column index {c} out of range ({} columns)", col_defs.len()));
-    }
-    gnitz_wire::validate_pk_column_types(pk_cols, |c| {
-        let cd = &col_defs[c as usize];
-        (cd.type_code, cd.is_nullable)
-    })
-    .map_err(|r| r.to_string())?;
+    validate_pk_against_cols(col_defs, pk_cols)?;
     let cols: Vec<SchemaColumn> = col_defs
         .iter()
         .map(|cd| SchemaColumn::new(cd.type_code, cd.is_nullable as u8))

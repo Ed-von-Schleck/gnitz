@@ -91,12 +91,22 @@ pub(super) fn validate_pk_cols(col_defs: &[ColumnDef], pk: &PkColList) -> Result
             gnitz_wire::PK_LIST_MAX_COLS
         ));
     }
-    // The rule set is `gnitz-wire`'s, shared with the SQL planner's CREATE TABLE
-    // pre-check and the client's `validate_parts`; only the wording below is the
-    // catalog's. The stride bound defends the catalog worker against a crafted
-    // SAL-replayed `TABLE_TAB` ingest whose decoded PK list packs an oversized
-    // region.
-    gnitz_wire::validate_pk_tuple(pk.as_slice(), col_defs.len(), |c| {
+    validate_pk_against_cols(col_defs, pk.as_slice())
+}
+
+/// The PK rule set a column-record list must satisfy, rendered in catalog
+/// vocabulary. The rules themselves are `gnitz-wire`'s, shared with the SQL
+/// planner's CREATE TABLE pre-check and the client's `validate_parts`; only the
+/// wording here is the catalog's. The stride bound defends the catalog worker
+/// against a crafted SAL-replayed `TABLE_TAB` ingest whose decoded PK list packs
+/// an oversized region.
+///
+/// The one catalog-side spelling: [`validate_pk_cols`] applies it as the early
+/// client-facing reject, and `build_schema_from_col_defs` applies it again over
+/// the *same* pair it is about to construct from — which is what makes that
+/// builder total where `SchemaDescriptor::new_with_placement` would abort.
+pub(super) fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) -> Result<(), String> {
+    gnitz_wire::validate_pk_tuple(pk_cols, col_defs.len(), |c| {
         let cd = &col_defs[c as usize];
         (cd.type_code, cd.is_nullable)
     })

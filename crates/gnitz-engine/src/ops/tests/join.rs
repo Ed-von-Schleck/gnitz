@@ -14,10 +14,91 @@ use gnitz_wire::read_i64_le;
 const RELS: [RangeRel; 4] = [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge];
 
 /// The join output schema `reg_meta` carries and `exec.rs` hands the op — the
-/// compiler's own builder, not a look-alike, so a change to the layout reaches
+/// operator's own builder, not a look-alike, so a change to the layout reaches
 /// these tests instead of silently passing against a stale copy.
 fn join_out_schema(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
-    crate::schema::merge_schemas_for_join(left, right).expect("test join schema exceeds MAX_COLUMNS")
+    merge_schemas_for_join(left, right).expect("test join schema exceeds MAX_COLUMNS")
+}
+
+#[test]
+fn test_merge_schemas_for_join() {
+    let left = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let right = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::STRING, 0),
+        ],
+        &[0],
+    );
+    let joined = merge_schemas_for_join(&left, &right).unwrap();
+    assert_eq!(joined.num_columns(), 3); // PK + left_I64 + right_STRING
+    assert_eq!(joined.columns[0].type_code, type_code::U128);
+    assert_eq!(joined.columns[1].type_code, type_code::I64);
+    assert_eq!(joined.columns[2].type_code, type_code::STRING);
+}
+
+#[test]
+fn test_merge_schemas_for_join_compound_pk() {
+    // Compound-PK left: 4 columns [U64, U64, U64, U64], PK = (col1, col2).
+    let left = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ],
+        &[1, 2],
+    );
+    let right = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let joined = merge_schemas_for_join(&left, &right).unwrap();
+    // Two PK columns up front, then left payload (2), then right payload (1) = 5.
+    assert_eq!(joined.num_columns(), 5);
+    assert_eq!(joined.pk_indices(), &[0, 1]);
+    assert_eq!(joined.columns[0].type_code, type_code::U64);
+    assert_eq!(joined.columns[1].type_code, type_code::U64);
+
+    // Single-PK left collapses back to pk_indices = [0].
+    let left_single = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let joined_single = merge_schemas_for_join(&left_single, &right).unwrap();
+    assert_eq!(joined_single.pk_indices(), &[0]);
+}
+
+#[test]
+fn test_merge_schemas_for_join_column_overflow() {
+    // A merged column count over MAX_COLUMNS returns None (compile rejected),
+    // rather than aborting.
+    use crate::schema::MAX_COLUMNS;
+    let half = MAX_COLUMNS / 2 + 2;
+    let make = |n: usize| {
+        let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
+        cols[0] = SchemaColumn::new(type_code::U128, 0);
+        for col in cols.iter_mut().take(n).skip(1) {
+            *col = SchemaColumn::new(type_code::I64, 0);
+        }
+        SchemaDescriptor::new(&cols[..n], &[0])
+    };
+    assert!(
+        merge_schemas_for_join(&make(half), &make(half)).is_none(),
+        "an over-wide join output must be rejected (None), not aborted"
+    );
 }
 
 /// The equi join over one schema on both sides.

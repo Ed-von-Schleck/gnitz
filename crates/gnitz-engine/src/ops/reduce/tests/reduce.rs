@@ -25,6 +25,22 @@ fn locate_cols(schema: &SchemaDescriptor, cols: &[u32]) -> Vec<ColumnLocator> {
     cols.iter().map(|&c| schema.locate(c as usize)).collect()
 }
 
+/// The AVI index schema for `(schema, group cols)` — the same one `AviBake::new`
+/// bakes onto the compiled reduce, reached without the aggregate list the bake
+/// also needs.
+fn avi_schema(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescriptor {
+    super::super::index::AviBake::new(
+        schema,
+        group_by_cols,
+        &[AggDescriptor {
+            col_idx: 0,
+            agg_op: AggFunc::Min,
+        }],
+    )
+    .expect("AVI key fits the schema builder's bounds")
+    .schema
+}
+
 /// A `trace_out` cursor over one prior reduce output — the integral an epoch
 /// reads its retraction from, as `bind_trace_cursors` hands it to the operator.
 fn trace_over(batch: Batch, schema: SchemaDescriptor) -> ReadCursor {
@@ -1120,7 +1136,10 @@ fn reduce_trace_seek_signed_pk() {
         ],
         &[0],
     );
-    assert!(in_schema.pk_has_signed_col(), "test invariant: single signed PK");
+    assert!(
+        in_schema.pk_columns().any(|(_, c)| c.is_signed()),
+        "test invariant: single signed PK"
+    );
 
     let aggs = sum_count_aggs(1);
     let group_by = [0u32];
@@ -2826,7 +2845,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
     };
 
     // AVI: key = a(4) ++ b(4) ++ av_encoded(8). Group (1,1) min=10, (2,2) min=20.
-    let avi_schema = crate::schema::avi_schema(&in_schema, &[1u32, 2u32]).unwrap();
+    let avi_schema = avi_schema(&in_schema, &[1u32, 2u32]);
     assert_eq!(avi_schema.pk_stride(), 17, "4 + 4 + 1 + 8");
     let avi_batch = {
         let mut b = Batch::with_capacity(avi_schema, 2);
@@ -2929,7 +2948,7 @@ fn avi_retraction_returns_next_extremum() {
 
     // AVI (post-state for group a=1): the retracted 5 is gone; the surviving
     // values are {10, 20}, so the prefix walk must return the smaller, 10.
-    let avi_schema = crate::schema::avi_schema(&in_schema, &[1u32]).unwrap();
+    let avi_schema = avi_schema(&in_schema, &[1u32]);
     let avi_batch = {
         let mut b = Batch::with_capacity(avi_schema, 2);
         for min in [10i64, 20] {
@@ -3042,7 +3061,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             b
         };
 
-        let avi_schema = crate::schema::avi_schema(&in_schema, &[1u32]).unwrap();
+        let avi_schema = avi_schema(&in_schema, &[1u32]);
         assert_eq!(avi_schema.pk_stride() as usize, stride);
         let avi_batch = {
             let mut b = Batch::with_capacity(avi_schema, 1);
@@ -3294,7 +3313,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
 
     // AVI post-state for (3, 4): surviving min is 9. A decoy entry for a
     // different group (3, 5) sharing the a-byte prefix must NOT be matched.
-    let avi_schema = crate::schema::avi_schema(&in_schema, &[1u32, 2u32]).unwrap();
+    let avi_schema = avi_schema(&in_schema, &[1u32, 2u32]);
     let avi_batch = {
         let mut b = Batch::with_capacity(avi_schema, 2);
         let put = |b: &mut Batch, a: u32, bb: u32, min: i64| {
@@ -3397,9 +3416,7 @@ fn avi_wide_two_u64_groups_match_reference() {
         &[0],
     );
     assert_eq!(
-        crate::schema::avi_schema(&in_schema, &[1u32, 2u32])
-            .unwrap()
-            .pk_stride(),
+        avi_schema(&in_schema, &[1u32, 2u32]).pk_stride(),
         25,
         "wide composite: 8 + 8 + 1 + 8",
     );
@@ -3432,7 +3449,7 @@ fn avi_wide_two_u64_groups_match_reference() {
 
     // AVI post-state: one entry per group holding its MIN, sorted by
     // compare_pk_bytes order (ascending a, then b — both unsigned).
-    let avi_schema = crate::schema::avi_schema(&in_schema, &[1u32, 2u32]).unwrap();
+    let avi_schema = avi_schema(&in_schema, &[1u32, 2u32]);
     let avi_batch = {
         let mut keys: Vec<[u8; 25]> = reference
             .iter()
@@ -3535,7 +3552,7 @@ fn avi_wide_single_u128_group_distinct() {
         ],
         &[0],
     );
-    let avi_schema = crate::schema::avi_schema(&in_schema, &[1u32]).unwrap();
+    let avi_schema = avi_schema(&in_schema, &[1u32]);
     assert_eq!(avi_schema.pk_stride(), 25, "16 + 1 + 8");
 
     // Two groups, large U128 values (high 64 bits set) → exercises the full
@@ -3635,7 +3652,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
         ],
         &[0],
     );
-    let avi_schema = crate::schema::avi_schema(&in_schema, &[1u32, 2u32]).unwrap();
+    let avi_schema = avi_schema(&in_schema, &[1u32, 2u32]);
     assert_eq!(avi_schema.pk_stride(), 25);
 
     // Groups: (-5, 10) MIN=100, (-5, 11) MIN=50, (3, 10) MIN=200.
@@ -3747,7 +3764,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
         ],
         &[0],
     );
-    let avi_schema = crate::schema::avi_schema(&in_schema, &[1u32, 2u32, 3u32]).unwrap();
+    let avi_schema = avi_schema(&in_schema, &[1u32, 2u32, 3u32]);
     assert_eq!(avi_schema.pk_stride(), 33, "8 + 8 + 8 + 1 + 8");
 
     // Both groups share (a, b) = (1, 2); they differ only in c.
@@ -3844,7 +3861,7 @@ fn avi_wide_retraction_returns_next_extremum() {
         ],
         &[0],
     );
-    let avi_schema = crate::schema::avi_schema(&in_schema, &[1u32, 2u32]).unwrap();
+    let avi_schema = avi_schema(&in_schema, &[1u32, 2u32]);
     assert_eq!(avi_schema.pk_stride(), 25);
 
     // Retract group (1<<40, 2)'s current MIN (val=5).
@@ -4000,7 +4017,7 @@ fn avi_read_extreme(
     use crate::storage::Table;
 
     // The aggregate's type is the source column's type.
-    let avi_schema = crate::schema::avi_schema(in_schema, group_by).unwrap();
+    let avi_schema = avi_schema(in_schema, group_by);
     let tmp = tempfile::tempdir().unwrap();
     let mut avi_t = Table::with_memtable_budget(
         tmp.path().to_str().unwrap(),
@@ -5097,7 +5114,7 @@ fn global_lone_min_avi_empty_prefix() {
     );
 
     // AVI for empty group cols: key = av_encoded(8) only (0-byte group prefix).
-    let avi_schema = crate::schema::avi_schema(&in_schema, &[]).unwrap();
+    let avi_schema = avi_schema(&in_schema, &[]);
     assert_eq!(avi_schema.pk_stride(), 9, "0 group + 1 ordinal + 8 av");
     let avi_with = |min: i64| {
         let mut b = Batch::with_capacity(avi_schema, 1);
@@ -5452,7 +5469,7 @@ fn build_combined_avi(
     deltas: &[&Batch],
 ) -> crate::storage::Table {
     use crate::ops::index::{op_integrate_with_indexes, IntegrateTarget};
-    let avi_schema = crate::schema::avi_schema(in_schema, group_cols).unwrap();
+    let avi_schema = avi_schema(in_schema, group_cols);
     let mut t = crate::storage::Table::with_memtable_budget(
         dir.to_str().unwrap(),
         avi_schema,
@@ -6443,7 +6460,7 @@ fn run_minmax_epochs(
         RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
-    let avi_schema = crate::schema::avi_schema(in_schema, group_by).unwrap();
+    let avi_schema = avi_schema(in_schema, group_by);
     let mut avi_t = Table::with_memtable_budget(
         dir,
         avi_schema,

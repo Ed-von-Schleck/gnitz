@@ -1371,15 +1371,13 @@ impl MasterDispatcher {
                 None => return Ok(UniqueFilter::new()),
             };
             // Trivial-uniqueness short-circuit, generalised to the compound PK:
-            // a composite index whose columns equal the table's enforced-unique
-            // PK (in any order) can never collide, so the scan is skipped.
-            // `group_cols_eq_pk` is order-insensitive set equality and returns
-            // false for an out-of-range index, so no separate bounds check is
-            // needed. The seed is empty rather than the committed value set,
-            // which stays sound because the index key IS the PK here: a span
-            // collision would be a PK collision, and `enforce_unique_pk` already
-            // makes those impossible.
-            if owner_schema.group_cols_eq_pk(col_indices) {
+            // a composite index whose columns are the table's enforced-unique PK
+            // (set equality — the SQL may list them in another order) can never
+            // collide, so the scan is skipped and the seed stays empty. The index
+            // key IS the PK here, so a span collision would be a PK collision,
+            // which `enforce_unique_pk` already makes impossible.
+            let pk = owner_schema.pk_indices();
+            if col_indices.len() == pk.len() && pk.iter().all(|p| col_indices.contains(p)) {
                 return Ok(UniqueFilter::new());
             }
             // Build the index schema (the circuit is not registered until this
@@ -1572,8 +1570,12 @@ impl MasterDispatcher {
 
         let parent_schema = disp.cat().schema_or_err(target_id, "gather")?;
         // The exact constructor the worker uses for its reply schema, so a
-        // matching reply validates by construction.
-        let expected = gnitz_engine::schema::project_schema(&parent_schema, &[ref_col]);
+        // matching reply validates by construction. A PK `ref_col` would be
+        // skipped and leave the reply payload-less; the sole caller branches on
+        // `is_pk_col` and reaches this only on the payload arm.
+        debug_assert!(!parent_schema.is_pk_col(ref_col as usize));
+        let expected = gnitz_engine::schema::project_schema(&parent_schema, &[ref_col as u32])
+            .expect("a one-column projection fits MAX_COLUMNS");
 
         // `_lease` held across the full drain below (see `dispatch_scan_fanout`).
         let (slots, scan) = dispatch_scan_fanout(disp, reactor, Fanout::Broadcast, |targets| {

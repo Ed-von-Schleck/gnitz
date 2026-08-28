@@ -2260,7 +2260,7 @@ class TestCompositeUniqueIndex:
     def test_trivial_pk_shortcircuit(self, client):
         """UNIQUE over a table whose PK is exactly those columns (any order) is
         created without a duplicate error and admits rows the PK already
-        permits — the trivial-uniqueness short-circuit (group_cols_eq_pk)."""
+        permits — the trivial-uniqueness short-circuit."""
         sn = _sn()
         client.create_schema(sn)
         try:

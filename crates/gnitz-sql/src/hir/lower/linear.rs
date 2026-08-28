@@ -71,10 +71,10 @@ pub(super) fn emit_linear(
         })
     {
         // Pure column reorder/subset — every payload item is a non-PK
-        // pass-through, so build_map_output_schema reproduces out_cols (PK region
+        // pass-through, so project_schema reproduces out_cols (PK region
         // in pk_indices() order, then non-PK cols in projection order). Pass only
         // the payload items (`items[k..]`): the k PK slots are inherited verbatim
-        // by evaluate_map_batch's bulk PK copy / build_map_output_schema's PK prepend.
+        // by evaluate_map_batch's bulk PK copy / project_schema's PK prepend.
         // Including them would emit one ColMove per PK index with dst_payload set
         // to the enumeration index, shifting every payload destination out of range
         // (single-PK: payload OOB; compound-PK: SENTINEL stride past num_payload).

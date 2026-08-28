@@ -15,11 +15,14 @@ use gnitz_expr::RowSource;
 // maps a value to a u64 whose unsigned ordering matches the value's natural
 // ordering, decode recovers the original bits. They must stay mutual inverses.
 
-/// Width in bytes of the order-encoded aggregate value appended to every AVI
-/// composite key (`group_key_bytes ++ av_encoded`). The codec always emits a
-/// u64, so this is the trailing-segment length the index schema, the population
-/// loop, and the lookup all agree on.
-pub(crate) const AVI_AV_BYTES: usize = 8;
+/// The AVI composite key's trailing value column (`group_key_bytes ++
+/// av_encoded`): [`encode_ordered`] always emits a u64, so the column is a U64
+/// and [`AVI_AV_BYTES`] its width. The index schema declares this column and the
+/// population loop and the lookup slice that width, off one definition.
+pub(super) const AVI_AV_COL: u8 = crate::schema::type_code::U64;
+
+/// Width in bytes of [`AVI_AV_COL`].
+pub(super) const AVI_AV_BYTES: usize = gnitz_wire::wire_stride(AVI_AV_COL);
 
 /// The exact value set [`encode_ordered`] can encode: a narrow (<=8B) fixed int
 /// or float. Written as the canonical predicates rather than a negative variant
@@ -112,8 +115,11 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
     if schema.is_pk_col(c) {
         return true;
     }
-    let col = &schema.columns[c];
-    col.nullable == 0 && gnitz_wire::is_pk_eligible(col.type_code)
+    // `try_payload_idx` is the totality gate: `Some` proves `c` names a real
+    // payload column, so the read below cannot land on a padding slot.
+    schema
+        .try_payload_idx(c)
+        .is_some_and(|_| schema.columns[c].nullable == 0 && gnitz_wire::is_pk_eligible(schema.columns[c].type_code))
 }
 
 /// The 128-bit group key of a row: the canonical single-column route key where
@@ -121,8 +127,8 @@ pub(super) fn single_col_canonical_group_key(schema: &SchemaDescriptor, group_by
 /// material. Per-column locators are resolved once at bake time, so the per-row
 /// body is the fold alone.
 ///
-/// The one implementation. It used to have a schema-walking twin whose only job
-/// was to be byte-identical to this one, policed by a test; the twin is gone.
+/// The one implementation: the scatter's routing key and `op_reduce`'s output
+/// PK both come off it, so they cannot drift.
 pub(super) struct GroupKeyCols {
     /// See [`single_col_canonical_group_key`]. Private, and read only through
     /// [`GroupKeyCols::canonical_col`], so the flag and the single column it
@@ -137,9 +143,12 @@ pub(super) struct GroupKeyCols {
 
 impl GroupKeyCols {
     pub(super) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Self {
+        // Resolve first: `locate` carries the release-active in-range assert, so
+        // every index is proven before anything else reads `schema.columns`.
+        let cols: Vec<ColumnLocator> = group_by_cols.iter().map(|&c| schema.locate(c as usize)).collect();
         GroupKeyCols {
             canonical: single_col_canonical_group_key(schema, group_by_cols),
-            cols: group_by_cols.iter().map(|&c| schema.locate(c as usize)).collect(),
+            cols,
         }
     }
 

@@ -452,7 +452,7 @@ fn test_projection_wide_compound_pk_tie_break() {
 // A projection that drops a non-PK column (and adds no computed column) takes
 // the pure-projection branch, which builds a `cb.map` column list. That list
 // must contain only the non-PK payload indices: the PK region is inherited by
-// the bulk PK copy / build_map_output_schema's PK prepend. Passing PK indices
+// the bulk PK copy / project_schema's PK prepend. Passing PK indices
 // there shifts every payload destination out of range and crashes the worker.
 
 #[test]

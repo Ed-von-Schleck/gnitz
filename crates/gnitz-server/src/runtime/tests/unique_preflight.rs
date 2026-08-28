@@ -13,12 +13,12 @@ use crate::runtime::sal::{SalMessageKind, FLAG_UNIQUE_PREFLIGHT};
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring;
 use crate::runtime::wire::{
-    self, peek_control_block_ipc, SchemaWithVersion, FLAG_CONTINUATION, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
+    self, peek_control_block_ipc, unique_preflight_wire_schema, SchemaWithVersion, FLAG_CONTINUATION, FLAG_HAS_SCHEMA,
+    FLAG_SCAN_LAST,
 };
 use crate::runtime::worker::send_unique_preflight_keys;
 use gnitz_engine::schema::key::PkBuf;
 use gnitz_engine::schema::make_index_schema;
-use gnitz_engine::schema::unique_preflight_wire_schema;
 use gnitz_engine::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
 use gnitz_engine::storage::{Batch, KeyProducer, SpillSort};
 use gnitz_wire::type_code;

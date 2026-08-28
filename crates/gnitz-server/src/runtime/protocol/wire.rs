@@ -412,6 +412,43 @@ impl<'a> WireMsg<'a> {
 
 pub use gnitz_engine::schema::decode_schema_block;
 
+/// Validate that a peer-supplied schema descriptor matches the expected one.
+/// Applied at every trust boundary where rows are decoded against a descriptor
+/// the sender chose (client INSERT frames, worker reply trains) — batch append
+/// helpers do not validate shape, so an unguarded mismatch turns into
+/// misinterpreted bytes handed onward.
+pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDescriptor) -> Result<(), String> {
+    if wire == expected {
+        return Ok(());
+    }
+    // `==` is the verdict; the scan only *names* the first differing column and
+    // restates no field list — `SchemaColumn: PartialEq` covers every field, and
+    // `Debug` renders exactly the fields `PartialEq` compares. Four error paths
+    // surface this string, and a 65-column schema is not diffable by eye.
+    let at = (wire.num_columns() == expected.num_columns())
+        .then(|| (0..wire.num_columns()).find(|&i| wire.columns[i] != expected.columns[i]))
+        .flatten()
+        .map_or(String::new(), |i| format!(" at column {i}"));
+    Err(format!("Schema mismatch{at}: expected {expected:?}, got {wire:?}"))
+}
+
+/// Wire schema of every unique pre-flight reply frame: the leading `n_promoted`
+/// columns of `idx_schema`, all marked PK. Its `pk_stride` is exactly
+/// `idx_key_size`, so the OPK leading-key span fills that PK region verbatim —
+/// built per-index because no single fixed-width column can represent a
+/// composite (e.g. 24-byte) span. The one definition shared by the worker's
+/// encoder (`send_unique_preflight_keys`) and the master's merge decoder, so the
+/// frame layout agrees by construction.
+///
+/// `idx_schema` must come from `make_index_schema`, whose columns are all
+/// non-nullable — which is what satisfies the constructor's non-nullable-PK
+/// assertion.
+pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_promoted: usize) -> SchemaDescriptor {
+    let cols = &idx_schema.columns[..n_promoted];
+    let pks: Vec<u32> = (0..n_promoted as u32).collect();
+    SchemaDescriptor::new(cols, &pks)
+}
+
 /// Decoded control fields + directory-driven control-block decoder — the
 /// shared codec both ends run.
 pub use gnitz_wire::control::{peek_control_block, peek_control_block_ipc, DecodedControl};
@@ -566,7 +603,7 @@ fn split_wire_blocks<'a>(
         let parsed = decode_schema_block(sblock, verify)?;
         wire_schema = Some(match hint {
             Some(ref h) => {
-                if gnitz_engine::schema::validate_schema_match(&parsed, h.descriptor).is_err() {
+                if parsed != *h.descriptor {
                     return Err("schema mismatch: client schema differs from server schema");
                 }
                 *h.descriptor
@@ -1089,5 +1126,64 @@ mod tests {
             !b.is_sorted() && !b.is_consolidated(),
             "strip clears both engine-internal flags"
         );
+    }
+    fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, col1_nullable),
+            ],
+            &[0],
+        )
+    }
+
+    #[test]
+    fn validate_schema_match_ok() {
+        let sd = two_col_schema(0);
+        assert!(validate_schema_match(&sd, &sd).is_ok());
+    }
+
+    /// Each mismatch family is rejected, and each names itself distinctly.
+    ///
+    /// `wire == expected` is the verdict; the message only names the first
+    /// differing column, and the executor and reply-train decoder surface it.
+    /// Four `is_err()` assertions would still pass if the message collapsed to
+    /// one constant string — pairwise distinctness is what tests it, without
+    /// pinning the prose.
+    #[test]
+    fn validate_schema_match_names_each_mismatch_distinctly() {
+        let col = |tc, n| SchemaColumn::new(tc, n);
+        let expected = two_col_schema(0);
+        let cases = [
+            (
+                "count",
+                SchemaDescriptor::new(&[col(type_code::U64, 0)], &[0]),
+                expected,
+            ),
+            (
+                "pk",
+                SchemaDescriptor::new(&[col(type_code::U64, 0), col(type_code::I64, 0)], &[1]),
+                expected,
+            ),
+            (
+                "type",
+                SchemaDescriptor::new(&[col(type_code::U64, 0), col(type_code::F64, 0)], &[0]),
+                expected,
+            ),
+            ("nullable", two_col_schema(0), two_col_schema(1)),
+        ];
+        let msgs: Vec<String> = cases
+            .iter()
+            .map(|(what, wire, exp)| validate_schema_match(wire, exp).expect_err(what))
+            .collect();
+        for i in 0..msgs.len() {
+            for j in (i + 1)..msgs.len() {
+                assert_ne!(
+                    msgs[i], msgs[j],
+                    "{} vs {} report the same message",
+                    cases[i].0, cases[j].0
+                );
+            }
+        }
     }
 }

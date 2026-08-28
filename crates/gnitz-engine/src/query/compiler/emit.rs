@@ -3,8 +3,94 @@
 
 use super::*;
 use crate::expr::PkSource;
-use crate::ops::{JoinProbe, RangeProbe};
+use crate::ops::{merge_schemas_for_join, JoinProbe, RangeProbe};
 use crate::query::vm::{consume_slots, reads_reg, Instr, IntegrateAvi, IntegrateTarget, ReduceAvi, TableIdx};
+use crate::schema::{DerivedSchema, SchemaColumn};
+
+// ---------------------------------------------------------------------------
+// Derived operator-output schemas
+// ---------------------------------------------------------------------------
+//
+// The operators whose output layout has no independent writer to sit beside, so
+// the emitter — their sole caller — is its home. Where a writer does exist the
+// schema comes off that instead: `ReindexPacker::output_schema`,
+// `ops::merge_schemas_for_join`, `build_reduce_output_schema`, `project_schema`.
+
+/// Output schema of a HashRow (set-op full-row identity) Map: a synthetic U128
+/// PK at slot 0, then the projected payload columns. `target_tcs[j] != 0`
+/// promotes payload column `j` to that <=8-byte integer type (cross-width
+/// set-op coercion) — `new` re-derives size/signedness for the promoted type —
+/// keeping THIS SIDE's nullability. Per-side, not the operator-merged view
+/// nullability: an INTERSECT/EXCEPT leaf is `distinct`-ed on its own before
+/// the tuple-tightening combine, so its row comparator must classify by what
+/// this side can actually emit.
+fn hashrow_output_schema(
+    in_schema: &SchemaDescriptor,
+    proj_cols: &[u32],
+    target_tcs: &[u8],
+) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk(SchemaColumn::new(crate::schema::type_code::U128, 0))?;
+    for (j, &c) in proj_cols.iter().enumerate() {
+        let src = in_schema.columns[c as usize];
+        let tgt = target_tcs.get(j).copied().unwrap_or(0);
+        let out_tc = if tgt != 0 { tgt } else { src.type_code };
+        b.push(SchemaColumn::new(out_tc, src.nullable))?;
+    }
+    Some(b.finish())
+}
+
+/// Both inputs of a `Union` must share a physical layout (equal column count, PK
+/// indices, and per-column `type_code`); `None` rejects a circuit whose branches
+/// do not. On success the result is `a`'s schema with each column's nullability
+/// OR-ed with `b`'s, so a null-carrying side forces the null-aware `Generic` row
+/// comparator instead of the null-blind `FixedIntNonnull` fast path (which orders
+/// by raw payload bytes and would fail to coalesce two logically-NULL rows
+/// carrying non-zero bytes under the null bit).
+///
+/// Built through `SchemaDescriptor::new` and not `DerivedSchema`, which forces
+/// `pk_indices = 0..pk_len`: a `Union` input's PK need not be a column prefix.
+fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Option<SchemaDescriptor> {
+    if !a.same_physical_layout(b) {
+        return None;
+    }
+    let cols: Vec<SchemaColumn> = (0..a.num_columns())
+        .map(|c| {
+            let (ac, bc) = (a.columns[c], b.columns[c]);
+            SchemaColumn::new(ac.type_code, ac.nullable | bc.nullable)
+        })
+        .collect();
+    Some(SchemaDescriptor::new(&cols, a.pk_indices()))
+}
+
+/// Output schema of a computed-projection `Map`: the input's PK region (the map
+/// inherits it verbatim, `PkSource::Inherit`), then one payload column per declared
+/// `(type_code, nullable)` slot. `decode_op_node` rejects an undecodable type
+/// code, so every entry is a real column type.
+fn compute_map_output_schema(in_schema: &SchemaDescriptor, out_cols: &[(u8, bool)]) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(in_schema)?;
+    for &(tc, nullable) in out_cols {
+        b.push(SchemaColumn::new(tc, nullable as u8))?;
+    }
+    Some(b.finish())
+}
+
+/// Output schema of an outer-join NULL_EXTEND: the input schema verbatim (PK
+/// region unchanged), then one nullable column per null-fill `type_codes` entry.
+/// `decode_op_node` rejects an undecodable type code, so every entry is a real
+/// column type.
+fn null_extend_output_schema(in_schema: &SchemaDescriptor, type_codes: &[u8]) -> Option<SchemaDescriptor> {
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(in_schema)?;
+    for (_, c) in in_schema.payload_columns() {
+        b.push(*c)?;
+    }
+    for &tc in type_codes {
+        b.push(SchemaColumn::new(tc, 1))?;
+    }
+    Some(b.finish())
+}
 
 // ---------------------------------------------------------------------------
 // Expression construction helpers
@@ -476,7 +562,7 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             // duplicates are allowed, so a long list would overrun the
             // fixed `[_; MAX_COLUMNS]` schema array — the bound is
             // PK-inclusive and lives inside the builder.
-            let node_schema = build_map_output_schema(&in_reg_schema, cols)
+            let node_schema = project_schema(&in_reg_schema, cols)
                 .ok_or(CompileError::Rejected("projection map: output exceeds MAX_COLUMNS"))?;
             (node_schema, LogicalProgram::copy_cols(cols), PkSource::Inherit)
         }
@@ -495,8 +581,8 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
         return Err(CompileError::Rejected("map: output PK stride differs from the input's"));
     }
     // For the projection arms the output schema is derived from a client column
-    // list rather than supplied, and `build_map_output_schema` drops PK sources
-    // while `copy_cols` numbers destinations densely — so a PK index leaves a copy
+    // list rather than supplied, and `project_schema` drops PK sources while
+    // `copy_cols` numbers destinations densely — so a PK index leaves a copy
     // addressing a slot that does not exist. This is what catches it.
     let plan = MapPlan::from_map(prog, &in_reg_schema, &node_schema, pk_source)
         .map_err(expr_reject("map: program/schema mismatch"))?;
@@ -681,7 +767,9 @@ pub(super) fn build_plan(
     }
 
     let mut reg_meta = Vec::with_capacity(reg_cap);
-    reg_meta.resize(next_reg as usize, RegisterMeta::delta(SchemaDescriptor::default()));
+    // Filler for slots the loop below overwrites: every live register's meta is
+    // assigned by its own emit arm, and every exchange-input slot two lines on.
+    reg_meta.resize(next_reg as usize, RegisterMeta::delta(SchemaDescriptor::minimal_u64()));
 
     for ((ex_nid, ex_schema), &reg) in exchange_inputs.iter().zip(&exchange_input_regs) {
         out_reg_of.insert(*ex_nid, reg);
@@ -832,6 +920,32 @@ mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn};
 
+    /// `union_nullability_merge` ORs the two inputs' per-column nullability, so a
+    /// null-carrying side reclassifies the output from the null-blind
+    /// `FixedIntNonnull` fast comparator to the null-aware `Generic` one.
+    #[test]
+    fn test_union_nullability_merge_classification() {
+        use crate::schema::PayloadCmpKind;
+        let pk = SchemaColumn::new(type_code::U128, 0);
+        let nonnull = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
+        let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
+
+        // Non-nullable A + nullable B → nullable output column, Generic comparator.
+        let m = union_nullability_merge(&nonnull, &nullable).expect("shared layout");
+        assert_eq!(m.columns[1].nullable, 1, "OR of non-nullable and nullable = nullable");
+        assert_eq!(m.payload_cmp, PayloadCmpKind::Generic);
+
+        // Both non-nullable → stays on the FixedIntNonnull fast path (byte-identical).
+        let m2 = union_nullability_merge(&nonnull, &nonnull).expect("shared layout");
+        assert_eq!(m2.columns[1].nullable, 0);
+        assert_eq!(m2.payload_cmp, PayloadCmpKind::FixedIntNonnull);
+
+        // Nullable A + non-nullable B → Generic too (OR is symmetric).
+        let m3 = union_nullability_merge(&nullable, &nonnull).expect("shared layout");
+        assert_eq!(m3.columns[1].nullable, 1);
+        assert_eq!(m3.payload_cmp, PayloadCmpKind::Generic);
+    }
+
     /// `union_nullability_merge` is the Union arm's whole layout contract, and in
     /// release there is nothing else: a mismatched pair would adopt `a`'s schema
     /// and let `op_union` read `b`'s bytes through it.
@@ -910,21 +1024,30 @@ mod tests {
         );
     }
 
-    /// The sink contract covers a sink register still carrying the default empty
-    /// schema. Reachable only from an unregistered-shaped source (every real
-    /// relation has at least a PK column), so the fixture supplies one directly.
+    /// A sink register whose schema is not the view's output schema is rejected
+    /// rather than emitted: the view store would then be written through a
+    /// descriptor its rows do not match.
     #[test]
-    fn test_default_schema_sink_rejected() {
+    fn test_mismatched_sink_schema_rejected() {
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(10));
         nodes.insert(1, gnitz_wire::OpNode::IntegrateSink);
         let view_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+        // The scan source carries an extra payload column, so the sink register
+        // reaches `build_plan` with a schema the view's does not equal.
+        let source_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
         let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN)]);
 
         let result = build_plan(
             &loaded,
             &loaded.ordered,
-            &HashMap::from([(10, SchemaDescriptor::default())]),
+            &HashMap::from([(10, source_schema)]),
             test_site("", 1),
             crate::schema::Placement::KEYED_DEFAULT,
             PlanTarget::ViewOutput {
@@ -960,7 +1083,7 @@ mod tests {
             test_site("", 1),
             crate::schema::Placement::KEYED_DEFAULT,
             PlanTarget::ViewOutput {
-                out_schema: &SchemaDescriptor::default(),
+                out_schema: &SchemaDescriptor::minimal_u64(),
                 seeds: &[],
             },
         );
@@ -1651,12 +1774,12 @@ mod tests {
         use gnitz_wire::{MapKind, OpNode};
         let rejection = |cols: Vec<u32>| mid_node_rejection(two_col_schema(), OpNode::Map(MapKind::Projection(cols)));
         assert_eq!(rejection(vec![200]), "projection map: columns out of range");
-        // A PK source: `build_map_output_schema` drops it while `copy_cols`
+        // A PK source: `project_schema` drops it while `copy_cols`
         // numbers destinations densely, so the copy addresses a slot that does
         // not exist — `from_map` would index past the fixed `[_; 65]`.
         assert!(rejection(vec![0]).starts_with("map: program/schema mismatch"));
         // `oob_cols` bounds each index but not the list length, and duplicates
-        // are legal, so a long list overruns `build_map_output_schema`'s array.
+        // are legal, so a long list overruns `project_schema`'s array.
         // Exactly MAX_COLUMNS payload sources already overflow — the schema also
         // carries the input's PK column, which a length-only bound misses.
         assert_eq!(

@@ -360,7 +360,7 @@ impl CatalogEngine {
 
                     let is_drop = (hid_old == 0 && hid_new == 1) || (null_old == 0 && null_new == 1);
                     if is_drop {
-                        if owner_schema.pk_indices().contains(&(col_idx as u32)) {
+                        if owner_schema.is_pk_col(col_idx as usize) {
                             return Err("cannot DROP COLUMN / DROP NOT NULL on a primary-key column".into());
                         }
                         self.reject_if_dependent_views(owner_id, "DROP COLUMN / DROP NOT NULL")?;
@@ -426,8 +426,9 @@ impl CatalogEngine {
         let appended = read_col_tab_row(batch, pj);
         // Run the prospective column set through `check_col_defs` — the sole home
         // of the column-record rules — so a rule added there reaches ADD COLUMN
-        // too. `validate_pk_cols` is not re-run: a trailing non-PK append cannot
-        // invalidate an already-valid PK list.
+        // too. The PK rules are not re-run here: a trailing non-PK append cannot
+        // invalidate an already-valid PK list, and the rebuild in
+        // `hook_column_alter` re-checks them against the new defs regardless.
         let mut prospective = (*self.read_column_defs(owner_id)).clone();
         prospective.push(appended.clone());
         check_col_defs(&prospective).map_err(|e| format!("cannot ADD COLUMN on table {owner_id}: {e}"))?;

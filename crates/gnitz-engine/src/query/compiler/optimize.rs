@@ -4,6 +4,7 @@
 //! validators both of them lean on.
 
 use super::*;
+use crate::schema::Placement;
 
 /// Everything the runtime needs to know about a view's circuit that is not the
 /// executable plan: its routing, its shape, and its source scan's access hint.
@@ -141,6 +142,29 @@ impl CircuitFacts {
     }
 }
 
+/// True iff `cols` is **exactly** `schema`'s distribution prefix —
+/// `pk_indices()[..k]` in PK order, where `k` is its `Keyed` prefix length. That
+/// means a derived operator co-partitions with the relation (the exchange router
+/// hashes the same leading `dist_stride` OPK bytes), so its network exchange can
+/// be skipped. A non-`Keyed` relation's rows are not placed by `worker_for_pk`
+/// at all, so no shard key names where they already are; a replicated *join*
+/// source still skips, through [`compute_co_partitioned`]'s replication arm.
+///
+/// **Exact `== k`, never a super-prefix.** A super-prefix gate would let the two
+/// sides of a join skip at *different* prefix widths, hashing equal join keys to
+/// different workers so the elided exchange silently drops matches. A side whose
+/// join-key length differs from its own `k` instead exchanges and repartitions to
+/// the full key, reconverging with the other side.
+/// `cluster_by_super_prefix_join_safety_multiworker` in
+/// `gnitz-sql/tests/planner_cluster_by.rs` exercises this.
+fn shard_cols_match_dist_key(schema: &SchemaDescriptor, cols: &[u32]) -> bool {
+    let Placement::Keyed { prefix_len } = schema.placement() else {
+        return false;
+    };
+    let k = prefix_len as usize;
+    cols.len() == k && cols == &schema.pk_indices()[..k]
+}
+
 pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: &dyn SchemaSource) -> HashSet<i64> {
     // Replication skip, computed once for the whole join: if ANY participating
     // source is replicated, EVERY participant skips its exchange. This deliberately
@@ -172,6 +196,9 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
         // A non-zero carried tc means the slot width differs from the source,
         // so native PK partitions do not align with the T-width trace key — the
         // source must go through the exchange even if its PK matches the key.
+        // This is the partner of `ScatterKey::new`'s own `tc == 0` gate:
+        // relaxing one alone would let a promoted side skip its exchange while
+        // its partner scatters at the wider `T`, silently dropping matches.
         if cols.iter().any(|&(_, tc)| tc != 0) {
             continue;
         }
@@ -183,7 +210,7 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
         // super-prefix skip could route the two join sides at mismatched
         // widths and silently drop matches (see `shard_cols_match_dist_key`).
         let col_indices: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();
-        if ext_schema.shard_cols_match_dist_key(&col_indices) {
+        if shard_cols_match_dist_key(&ext_schema, &col_indices) {
             co_partitioned.insert(tid);
         }
     }
@@ -221,7 +248,7 @@ fn skips_output_exchange(loaded: &LoadedCircuit, enid: i32, shard_cols: &[u32], 
         return false;
     };
     ext_tables.schema_of(tid).is_some_and(|schema| {
-        schema.shard_cols_match_dist_key(shard_cols)
+        shard_cols_match_dist_key(&schema, shard_cols)
             && (shard_cols.len() <= 1 || shard_cols.len() == schema.pk_indices().len())
     })
 }
@@ -323,6 +350,65 @@ pub(super) fn payload_promotion_invalid(cols: &[u32], target_tcs: &[u8], schema:
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn};
+
+    /// 3-column compound PK `(U32, U64, U64)` + one payload, so the columns have
+    /// distinct widths and a prefix stride is unambiguous.
+    fn three_col_pk_schema(dist_k: u8) -> SchemaDescriptor {
+        three_col_placed(Placement::Keyed { prefix_len: dist_k })
+    }
+
+    fn three_col_placed(placement: Placement) -> SchemaDescriptor {
+        SchemaDescriptor::new_with_placement(
+            &[
+                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+            placement,
+        )
+    }
+
+    #[test]
+    fn shard_cols_match_dist_key_is_exact_prefix() {
+        let k1 = three_col_pk_schema(1); // CLUSTER BY col0
+                                         // Exact prefix at k=1 matches; the full PK and a super-prefix do not.
+        assert!(shard_cols_match_dist_key(&k1, &[0]));
+        assert!(!shard_cols_match_dist_key(&k1, &[0, 1]), "super-prefix must NOT match");
+        assert!(!shard_cols_match_dist_key(&k1, &[0, 1, 2]));
+        assert!(!shard_cols_match_dist_key(&k1, &[1]), "non-leading column");
+        assert!(!shard_cols_match_dist_key(&k1, &[]));
+
+        // Default (full-PK) schema: dist key is the whole PK, exactly.
+        let full = three_col_pk_schema(0);
+        assert!(shard_cols_match_dist_key(&full, &[0, 1, 2]));
+        assert!(
+            !shard_cols_match_dist_key(&full, &[0]),
+            "a single component is not the full key"
+        );
+        assert!(!shard_cols_match_dist_key(&full, &[0, 1]));
+
+        // k=2 matches exactly [0,1], not [0] and not [0,1,2].
+        let k2 = three_col_pk_schema(2);
+        assert!(shard_cols_match_dist_key(&k2, &[0, 1]));
+        assert!(!shard_cols_match_dist_key(&k2, &[0]));
+        assert!(!shard_cols_match_dist_key(&k2, &[0, 1, 2]));
+    }
+
+    /// A relation whose rows are not placed by `worker_for_pk` has no shard
+    /// key that names where they already are — whatever its PK columns look
+    /// like. This is what stops a co-partition/exchange elision from firing onto
+    /// an unkeyed source.
+    #[test]
+    fn shard_cols_never_match_an_unkeyed_placement() {
+        for p in [Placement::Replicated, Placement::Local] {
+            let s = three_col_placed(p);
+            assert!(!shard_cols_match_dist_key(&s, &[0, 1, 2]), "{p:?}: full PK");
+            assert!(!shard_cols_match_dist_key(&s, &[0]), "{p:?}: leading column");
+            assert!(!shard_cols_match_dist_key(&s, &[]), "{p:?}: empty key");
+        }
+    }
 
     #[test]
     fn test_compute_co_partitioned_strict_full_pk_sequence() {

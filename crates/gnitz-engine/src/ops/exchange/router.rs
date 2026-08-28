@@ -55,8 +55,10 @@ pub enum RouteMode {
 /// per-column schema classification is hoisted here) and applied per row. The
 /// variant is picked from circuit metadata, not per-query data:
 ///
-/// - `PkBytes`: the key IS the schema's PK list with no promotion
-///   (`SchemaDescriptor::scatter_routes_by_pk`) — route by the row's native OPK bytes.
+/// - `PkBytes`: the key IS the schema's PK list with no promotion (see
+///   [`ScatterKey::new`]) — route by the row's native OPK bytes. Deliberately
+///   not the write-path fan-out's rule, which routes by the distribution prefix
+///   — a different hash domain with no promotion concept.
 /// - `Packed`: a `JoinPromote` scatter packs the SAME OPK bytes the downstream
 ///   reindex Map stamps as the `_join_pk`, so the delta scatter and the
 ///   reindexed trace co-partition byte-for-byte. It is null-blind and
@@ -106,7 +108,11 @@ impl ScatterKey {
         schema: &SchemaDescriptor,
         num_workers: usize,
     ) -> Self {
-        let kind = if schema.scatter_routes_by_pk(cols, tcs) {
+        // Sequence equality, not set equality: `worker_for_pk_bytes` hashes OPK
+        // bytes in schema order, so a permuted compound PK routes differently.
+        // And `tc == 0` throughout: a promoted key packs at the wider `T`, so its
+        // narrow source PK bytes must not route natively.
+        let kind = if cols == schema.pk_indices() && tcs.iter().all(|&tc| tc == 0) {
             ScatterKind::PkBytes
         } else {
             match mode {

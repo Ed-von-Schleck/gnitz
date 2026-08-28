@@ -107,7 +107,7 @@ pub(super) async fn drain_index_scan(
                 .map_err(|e| scan_decode_err(w, e))?;
             if saved_schema.is_none() {
                 if let Some(ref s) = zc.schema {
-                    gnitz_engine::schema::validate_schema_match(s, expected)
+                    wire::validate_schema_match(s, expected)
                         .map_err(|e| WorkerFault::from(format!("worker {w}: {what}: {e}")))?;
                     saved_schema = Some((*s, server_version));
                 }
