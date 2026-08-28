@@ -17,6 +17,10 @@
 //! each leaf's items and aliasing the submodules so the L3/LSM siblings keep their
 //! `super::<mod>` / `crate::storage::<mod>` paths. Every production edge points
 //! downward (schema/foundation) or sideways within this layer.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 pub(super) mod batch;
 pub mod batch_pool;

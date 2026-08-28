@@ -787,4 +787,5 @@ pub(crate) fn create_read_cursor(
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
+#[path = "../tests/read_cursor.rs"]
 mod tests;

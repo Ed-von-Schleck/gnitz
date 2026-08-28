@@ -14,6 +14,10 @@
 //! `cstr`/`cstr_with_tmp_suffix`, the `with_*` dispatch
 //! macros) so the LSM files keep their `super::<mod>` paths unchanged after the
 //! move under `lsm/`.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 // Re-exported from storage/mod.rs.
 pub(super) mod child_dir;
