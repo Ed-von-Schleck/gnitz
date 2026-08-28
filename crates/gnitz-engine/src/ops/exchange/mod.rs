@@ -1,5 +1,9 @@
 //! Exchange repartitioning facade: partition routing (`router`) and the
 //! relay/scatter operators (`relay`) that drive the master worker-exchange.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 mod relay;
 mod router;

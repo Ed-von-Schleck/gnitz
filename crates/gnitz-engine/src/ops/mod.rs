@@ -13,6 +13,10 @@
 //! repartition and relay directly, so those names are `pub`. Every other
 //! operator is reached through a compiled circuit, never called by name from
 //! outside, and stays `pub(crate)`.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 mod cogroup;
 mod distinct;
