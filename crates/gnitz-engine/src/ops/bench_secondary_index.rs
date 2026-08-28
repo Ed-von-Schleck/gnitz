@@ -33,12 +33,12 @@ const N_ROWS: usize = 500_000;
 const N_GROUPS: u64 = 10_000;
 const ITERS: usize = 40;
 
-/// Memtable arena size. Default 1 GiB isolates the in-memory cost (no flush
-/// during the timed region). Override with `GNITZ_BENCH_ARENA_KB` to measure
-/// the production-representative path, where small arenas (index tables use
-/// 256 KiB–1 MiB) flush shards to disk mid-population.
-fn arena() -> u64 {
-    crate::foundation::env::env_num("GNITZ_BENCH_ARENA_KB", 1 << 20) * 1024
+/// Memtable byte budget. Default 1 GiB isolates the in-memory cost (no flush
+/// during the timed region). Override with `GNITZ_BENCH_MEMTABLE_KB` to measure
+/// the production-representative path, where the real budget (a few hundred KiB)
+/// flushes shards to disk mid-population.
+fn memtable_budget() -> usize {
+    crate::foundation::env::env_num("GNITZ_BENCH_MEMTABLE_KB", 1 << 20) * 1024
 }
 
 /// Source schema: U64 pk (col 0) | U32 grp (col 1) | I64 val (col 2).
@@ -117,11 +117,11 @@ fn time_upsert(
     let mut total = Duration::ZERO;
     for i in 0..=ITERS as u32 {
         let pre = build_pre();
-        let mut t = Table::with_arena(
+        let mut t = Table::with_memtable_budget(
             tmp.to_str().unwrap(),
             schema,
             base_id + i,
-            arena(),
+            memtable_budget(),
             RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
@@ -194,11 +194,11 @@ fn secondary_index_bench_avi_decomposition() {
 
     let mut id = 2000u32;
     let full = time(|| {
-        let mut t = Table::with_arena(
+        let mut t = Table::with_memtable_budget(
             tmp.path().to_str().unwrap(),
             avi_schema,
             id,
-            arena(),
+            memtable_budget(),
             RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();

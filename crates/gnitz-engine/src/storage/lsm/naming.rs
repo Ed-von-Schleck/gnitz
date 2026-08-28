@@ -1,7 +1,7 @@
 //! The single owner of the table-directory filename grammar. Every producer
-//! (flush spill/barrier shards, compaction outputs) and every cleaner
-//! (`gc_orphans`, `erase_stale_shards`) routes through here, so writer and
-//! cleaner can never disagree about which files belong to a table.
+//! (flush spill/barrier shards, compaction outputs) and the one cleaner
+//! (`gc_orphans`) route through here, so writer and cleaner can never disagree
+//! about which files belong to a table.
 
 use std::collections::HashSet;
 

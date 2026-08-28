@@ -1,42 +1,46 @@
 //! Unified Table: two RAM-tier [`RunSet`]s over a `ShardIndex`.
 //!
-//! Ingest lands in the `memtable` run set and folds into the `ram_tier` at 3/4
-//! of the arena; the RAM tier spills to a shard past [`INMEM_CEILING`], and the
-//! checkpoint barrier folds it into one durable shard — on the base round for
-//! `SalReplay` tables, on the ephemeral round for `Rederive` ones.
+//! Ingest lands in the `memtable` run set and folds into the `ram_tier` once it
+//! passes its byte budget; the RAM tier spills to a shard past
+//! [`INMEM_CEILING`], and the checkpoint barrier folds it into one durable shard
+//! — on the base round for `SalReplay` tables, on the ephemeral round for
+//! `Rederive` ones.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 
 use super::batch::Batch;
-use super::columnar;
+use super::columnar::{with_payload_cmp, ColumnarSource};
 use super::error::StorageError;
 use super::manifest::PreparedManifest;
+use super::merge::RowComparator;
 use super::read_cursor::{self, ReadCursor};
 use super::run::{pk_match_rows_from, Run, StoredRow};
 use super::run_set::RunSet;
 use super::shard_index::ShardIndex;
 #[cfg(test)]
 use super::shard_reader::MappedShard;
-use crate::schema::key::probe_key;
+use crate::schema::key::{pk_bytes_eq, pk_in_range, probe_key};
 use crate::schema::SchemaDescriptor;
 
-/// Hard per-`Table` (= per relation per worker) heap ceiling for the RAM tier. A
-/// flush that would exceed it folds first; if the folded net state still exceeds
-/// it, the tier spills to a shard file. Bounds heap at this value per table at
-/// all times. The aggregate un-spilled RAM across the cluster is bounded by the
+/// Hard per-`Table` (= per relation per worker) heap ceiling for the **RAM
+/// tier**. A flush that would exceed it folds first; if the folded net state
+/// still exceeds it, the tier spills to a shard file.
+///
+/// It bounds that one tier, not the table's heap: the memtable's own bytes,
+/// `fold_to_single`'s 2× transient, a run a failed `persist_l0_run` left in
+/// place, and `cached_full_scan`'s whole materialized relation all sit outside
+/// it. The aggregate un-spilled RAM across the cluster is bounded by the
 /// un-checkpointed SAL tail: every ingested byte flows through the fsynced SAL,
 /// and a spill frees the RAM.
 ///
 /// Swept at the **production** checkpoint cadence (`GNITZ_SAL_BYTES` at its 1 GiB
 /// default, threshold 75% of it), 4M rows, W=4, btrfs: at 4 MiB a worker's single
 /// store wrote 98.7 MB of RAM-tier spill per 4M rows (~25 B/row); at 32 MiB that
-/// spill is gone, for +45 MB of cluster RSS. An earlier sweep found this constant
-/// flat from 4 to 128 MiB, but ran at a 4 MiB checkpoint threshold — 192× more
-/// frequent than production — which drains the tier continuously and is exactly
-/// the regime where the ceiling cannot bind.
+/// spill is gone, for +45 MB of cluster RSS.
 ///
 /// Spilling past the ceiling stays the intended safety valve; 32 MiB is where
 /// ordinary ingest stops reaching it, not a promise that nothing will.
@@ -46,21 +50,13 @@ const INMEM_CEILING: usize = 32 * 1024 * 1024;
 /// per process rather than per store — `Table::new` runs for every system table,
 /// every user relation, and every view's per-node scratch. Shrinking it is how an
 /// E2E test reaches the disk regime (spills, compaction, the capacity sweep) on
-/// small data. Being process-wide is why the per-table
-/// `set_inmem_ceiling_for_test` stays: the Rust units share one process and must
-/// not fight over a global.
+/// small data. Being process-wide is why a Rust unit test shrinks `ram_tier`'s
+/// own budget instead: those units share one process and must not fight over a
+/// global.
 fn inmem_ceiling() -> usize {
     static CEILING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CEILING.get_or_init(|| crate::foundation::env::env_num("GNITZ_RAM_TIER_BYTES", INMEM_CEILING))
 }
-
-/// Memtable arena of every store [`Table::new`] opens — every system table,
-/// every user relation, every view's operator scratch. Measured on btrfs, W=4,
-/// 4 views, 200k rows, interleaved ×3: 256 KiB and 1 MiB are indistinguishable
-/// in total stall (545/543/540 ms against 544/563/550 ms), so the smaller value
-/// stands. A separate non-interleaved sweep appeared to show 256 KiB winning by
-/// 1.5×; interleaving dissolved it.
-const DEFAULT_ARENA: u64 = 256 << 10;
 
 // ---------------------------------------------------------------------------
 // RecoverySource
@@ -94,17 +90,6 @@ pub enum RecoverySource {
 // Two-phase flush API
 // ---------------------------------------------------------------------------
 
-/// Outcome of `Table::flush_prepare`.
-pub(in crate::storage) enum FlushOutcome {
-    /// Nothing to publish: a rederived table on the base round, which folded into
-    /// the RAM tier with no file I/O.
-    Done,
-    /// `SalReplay`: the folded shard is written at its final name (unsynced) and
-    /// a manifest `.tmp` is staged; the barrier fdatasyncs `sync_paths` then
-    /// renames the manifest.
-    Pending(FlushWork),
-}
-
 /// The deferred half of one barrier flush, owned by the worker between
 /// `flush_prepare` and `flush_commit`. Carries the full paths of every file
 /// written unsynced since the last publish (prior spills + this barrier's own
@@ -115,40 +100,35 @@ pub(in crate::storage) enum FlushOutcome {
 /// `Drop`); the shard — already at its final name and registered in the index —
 /// is an unreferenced orphan reclaimed by `gc_orphans` at the next open.
 pub(in crate::storage) struct FlushWork {
-    sync_paths: Vec<CString>,
-    manifest: PreparedManifest,
-}
-
-impl FlushWork {
     /// Full paths the barrier must fdatasync (each opened O_RDONLY) before the
     /// manifest rename — the files this publish makes reachable that are not yet
     /// durable.
-    pub(in crate::storage) fn sync_paths(&self) -> &[CString] {
-        &self.sync_paths
-    }
-
-    /// The staged manifest `.tmp`'s fd, open from `prepare_file` until
+    pub(in crate::storage) sync_paths: Vec<CString>,
+    /// The staged manifest `.tmp`, its fd open from `prepare_file` until
     /// `flush_commit` consumes the work (it closes when the `PreparedManifest`
     /// drops after the rename).
-    pub(in crate::storage) fn manifest_fd(&self) -> libc::c_int {
-        self.manifest.fd()
-    }
+    pub(in crate::storage) manifest: PreparedManifest,
 }
 
 /// Index of the first candidate in `pool` (pool order) whose payload group nets
-/// strictly positive — the live row for the PK the pool was gathered for.
-/// Candidates equal to an earlier one are skipped rather than re-summed, so each
-/// group is judged once, at its first member.
-fn first_live_payload_group(schema: &SchemaDescriptor, pool: &[StoredRow]) -> Option<usize> {
-    let same_payload =
-        |a: &StoredRow, b: &StoredRow| columnar::compare_rows(schema, &a.run, a.row, &b.run, b.row) == Ordering::Equal;
+/// strictly positive — the live row for the PK the pool was gathered for. `cmp`
+/// is the payload comparator the merge seats pick between, so this groups the way
+/// every other (PK, payload) grouping in storage does.
+///
+/// "First" is a performance choice: the one production caller is a base table,
+/// whose per-PK accumulated weight is in {0, 1}, so at most one group is
+/// positive. *Which member* of it comes back is unspecified — two
+/// `compare_rows`-equal long German strings can differ in their 16-byte cells,
+/// and the append relocates the content regardless.
+fn first_live_payload_group(
+    schema: &SchemaDescriptor,
+    pool: &[StoredRow],
+    cmp: impl RowComparator<Run>,
+) -> Option<usize> {
     (0..pool.len()).find(|&i| {
-        if pool[..i].iter().any(|prev| same_payload(prev, &pool[i])) {
-            return false; // this payload was already judged at its first member
-        }
-        let net: i64 = pool[i..]
+        let net: i64 = pool
             .iter()
-            .filter(|c| same_payload(&pool[i], c))
+            .filter(|c| cmp(schema, &pool[i].run, pool[i].row, &c.run, c.row) == Ordering::Equal)
             .map(StoredRow::weight)
             .sum();
         net > 0
@@ -160,7 +140,7 @@ fn first_live_payload_group(schema: &SchemaDescriptor, pool: &[StoredRow]) -> Op
 // ---------------------------------------------------------------------------
 
 pub struct Table {
-    /// Ingest runs, folded into `ram_tier` once they pass 3/4 of the arena.
+    /// Ingest runs, folded into `ram_tier` once they pass its byte budget.
     memtable: RunSet,
     /// Flushed runs held in heap instead of on disk. Populated for **every**
     /// table on ingest overflow (`flush_to_ram`), bounded by `INMEM_CEILING`
@@ -189,12 +169,16 @@ pub struct Table {
     /// legitimately empty index over a large owner.
     resumed_from_checkpoint: bool,
 
-    /// Reused candidate pool for `retract_pk_bytes`' grouping pass; cleared per
-    /// call (dropping its `Rc`s) with capacity retained, so the path stops
-    /// allocating once warmed up.
-    retract_scratch: Vec<StoredRow>,
+    /// Reused candidate pool for `retract_pk_bytes`' grouping pass; taken out and
+    /// handed back per call (dropping its `Rc`s) with capacity retained, so the
+    /// path stops allocating once warmed up. In a `Cell` so the probe that fills
+    /// it is a read.
+    retract_scratch: Cell<Vec<StoredRow>>,
 
-    cached_full_scan: Option<Rc<Batch>>,
+    /// Last `full_scan` result, held until the row set moves. In a `Cell` so
+    /// `full_scan` stays `&self` — a read reborrowed as `&mut` would widen its
+    /// callers' aliasing obligation to "no reference at all live".
+    cached_full_scan: Cell<Option<Rc<Batch>>>,
 }
 
 mod flush;
@@ -208,6 +192,9 @@ mod bench_flush;
 #[cfg(test)]
 mod bench_ingest;
 
+#[cfg(test)]
+mod bench_unique_pk;
+
 impl Table {
     /// Create a new table. The `RecoverySource` decides what the open does with
     /// whatever is already on disk.
@@ -217,61 +204,61 @@ impl Table {
         table_id: u32,
         recovery_source: RecoverySource,
     ) -> Result<Self, StorageError> {
-        Self::with_arena(dir, schema, table_id, DEFAULT_ARENA, recovery_source)
-    }
+        /// Memtable byte budget of every store this opens — every system table,
+        /// every user relation, every view's operator scratch. Measured on btrfs,
+        /// W=4, 4 views, 200k rows, interleaved ×3: this and 768 KiB are
+        /// indistinguishable in total stall (545/543/540 ms against 544/563/550
+        /// ms), so the smaller value stands.
+        const MEMTABLE_BUDGET: usize = 192 << 10;
 
-    /// [`Table::new`] with an explicit memtable arena. Every production store
-    /// takes `DEFAULT_ARENA`; this exists for the tests that drive spill
-    /// pressure by shrinking it.
-    pub(crate) fn with_arena(
-        dir: &str,
-        schema: SchemaDescriptor,
-        table_id: u32,
-        arena_size: u64,
-        recovery_source: RecoverySource,
-    ) -> Result<Self, StorageError> {
         // The directory is created before either arm decides anything, so an
         // unusable one fails here — a client-visible rejection on the master's
         // CREATE VIEW pre-flight, where a first-flush failure would instead be a
         // worker abort with no client left to tell.
         // The fd is dropped: a relation pins none at rest.
         open_table_dirfd(dir)?;
+
+        // `skip_pk_filter` is exactly "is rederived": only a `SalReplay` store is
+        // point-probed by PK, so only it needs the filters its shards would
+        // otherwise all carry. Built before the recovery decision (pure field
+        // init, no I/O) so the non-resuming arm can erase through `gc_orphans` —
+        // an index holding no entry calls every file of this table an orphan.
+        let rederived = matches!(recovery_source, RecoverySource::Rederive { .. });
+        let shard_index = ShardIndex::new(table_id, dir, schema, rederived);
+
         let load_shards = match recovery_source {
             RecoverySource::SalReplay => true,
             // Resume only from the generation the caller named; otherwise erase
             // the shards *and* the manifest, so a later re-open cannot re-peek it.
             RecoverySource::Rederive { resume_at } => {
-                let cpath = super::super::cstr(super::manifest::path(dir))?;
-                let resumes =
-                    resume_at.is_some() && super::manifest::peek_header(&cpath)?.map(|h| h.checkpoint_gen) == resume_at;
+                let resumes = match resume_at {
+                    None => false,
+                    Some(want) => {
+                        let cpath = super::super::cstr(super::manifest::path(dir))?;
+                        super::manifest::peek_header(&cpath)?.is_some_and(|h| h.checkpoint_gen == want)
+                    }
+                };
                 if !resumes {
-                    erase_stale_shards(dir, table_id);
+                    shard_index.gc_orphans();
+                    let _ = std::fs::remove_file(super::manifest::path(dir));
                 }
                 resumes
             }
         };
 
         let mut table = Table {
-            // Fold at 3/4 of the arena so the next ingest batch always fits.
-            memtable: RunSet::new(arena_size as usize * 3 / 4),
+            memtable: RunSet::new(MEMTABLE_BUDGET),
             ram_tier: RunSet::new(inmem_ceiling()),
-            // Only a `SalReplay` store is point-probed by PK, so only it needs
-            // the PK filters its shards would otherwise all carry.
-            shard_index: ShardIndex::new(
-                table_id,
-                dir,
-                schema,
-                matches!(recovery_source, RecoverySource::Rederive { .. }),
-            ),
+            shard_index,
             schema,
             table_id,
             directory: dir.to_string(),
             recovery_source,
             current_lsn: 1,
             layout_seq: 0,
-            resumed_from_checkpoint: load_shards && matches!(recovery_source, RecoverySource::Rederive { .. }),
-            retract_scratch: Vec::new(),
-            cached_full_scan: None,
+            resumed_from_checkpoint: load_shards && rederived,
+            retract_scratch: Cell::new(Vec::new()),
+            cached_full_scan: Cell::new(None),
         };
 
         if load_shards {
@@ -284,6 +271,23 @@ impl Table {
             table.layout_seq = header.map_or(0, |h| h.layout_seq);
         }
 
+        Ok(table)
+    }
+
+    /// [`Table::new`] with an explicit memtable byte budget, for the tests that
+    /// drive spill pressure by shrinking it. A constructor rather than a field
+    /// poke because most of those tests live outside `lsm`, where `memtable` is
+    /// not visible.
+    #[cfg(test)]
+    pub(crate) fn with_memtable_budget(
+        dir: &str,
+        schema: SchemaDescriptor,
+        table_id: u32,
+        budget: usize,
+        recovery_source: RecoverySource,
+    ) -> Result<Self, StorageError> {
+        let mut table = Self::new(dir, schema, table_id, recovery_source)?;
+        table.memtable.set_budget(budget);
         Ok(table)
     }
 
@@ -381,7 +385,7 @@ impl Table {
         self.ram_tier.widen_runs(&self.schema, &schema);
         self.shard_index.install_reopened(staged, schema);
         self.schema = schema;
-        self.cached_full_scan = None;
+        self.cached_full_scan.set(None);
         Ok(())
     }
 
@@ -395,7 +399,7 @@ impl Table {
         if batch.count == 0 {
             return Ok(());
         }
-        self.cached_full_scan = None;
+        self.cached_full_scan.set(None);
 
         // Ingest overflow always folds into the RAM tier; durability lives in the
         // fsynced SAL, and the checkpoint barrier writes the durable shard. Bump
@@ -498,15 +502,15 @@ impl Table {
 
     /// Return the fully consolidated batch of all live rows, caching the result.
     /// The cache is invalidated wherever the row set can move: `ingest_owned_batch`,
-    /// `swap_schema`, and the RAM-tier fold in `flush.rs`.
+    /// `swap_schema`, the RAM-tier fold and the spill commit in `flush.rs`.
     /// Cheap on repeated calls: returns `Rc::clone` of the cached batch.
     /// Infallible: delegates to `open_cursor`.
-    pub fn full_scan(&mut self) -> Rc<Batch> {
-        if let Some(ref rc) = self.cached_full_scan {
-            return Rc::clone(rc);
-        }
-        let rc = self.open_cursor().materialize();
-        self.cached_full_scan = Some(Rc::clone(&rc));
+    pub fn full_scan(&self) -> Rc<Batch> {
+        let rc = self
+            .cached_full_scan
+            .take()
+            .unwrap_or_else(|| self.open_cursor().materialize());
+        self.cached_full_scan.set(Some(Rc::clone(&rc)));
         rc
     }
 
@@ -519,67 +523,18 @@ impl Table {
         self.ram_tiers().iter().map(|s| s.row_count()).sum::<usize>() + self.shard_index.total_rows()
     }
 
-    /// Test helper: returns true when the memtable has no rows.
-    #[cfg(test)]
-    pub(crate) fn memtable_is_empty(&self) -> bool {
-        self.memtable.is_empty()
-    }
-
-    /// Test helper: RAM-tier run count.
-    #[cfg(test)]
-    pub(crate) fn ram_run_count(&self) -> usize {
-        self.ram_tier.len()
-    }
-
-    /// Test helper: RAM-tier row count.
-    #[cfg(test)]
-    pub(crate) fn ram_row_count(&self) -> usize {
-        self.ram_tier.row_count()
-    }
-
-    /// Test helper: RAM-tier heap footprint.
-    #[cfg(test)]
-    pub(crate) fn ram_bytes(&self) -> usize {
-        self.ram_tier.bytes()
-    }
-
-    /// Test helper: shard Rcs (production reads go through `runs`).
+    /// Test helper: shard Rcs (production reads go through `runs`). Reached from
+    /// outside `lsm`, where the shard index itself is not visible.
     #[cfg(test)]
     pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
         self.shard_index.all_shard_arcs()
     }
 
-    /// Test helper: the FLSM tree's shape, for the amplification bench.
-    #[cfg(test)]
-    pub(crate) fn tree_report(&self) -> String {
-        self.shard_index.tree_report()
-    }
-
-    /// Test helper: `(L0 shard count, per-level guard count)`.
+    /// Test helper: `(L0 shard count, per-level guard count)`. Same reach as
+    /// [`Self::all_shard_arcs`].
     #[cfg(test)]
     pub(crate) fn level_shape(&self) -> (usize, Vec<usize>) {
         self.shard_index.level_shape()
-    }
-
-    /// Test helper: shrink the per-table heap ceiling so spill paths can be
-    /// exercised without ingesting megabytes.
-    #[cfg(test)]
-    pub(crate) fn set_inmem_ceiling_for_test(&mut self, bytes: usize) {
-        self.ram_tier.set_budget(bytes);
-    }
-
-    /// Test helper: stop this store's writes from building a PK filter, so a
-    /// benchmark can price one against the same ingest run without it.
-    #[cfg(test)]
-    pub(crate) fn set_skip_pk_filter_for_test(&mut self, skip: bool) {
-        self.shard_index.set_skip_pk_filter_for_test(skip);
-    }
-
-    /// Test helper: the highest LSN registered in the shard index (0 when no
-    /// shard is registered). Used to check spill/barrier LSN registration.
-    #[cfg(test)]
-    pub(crate) fn shard_index_max_lsn(&self) -> u64 {
-        self.shard_index.max_lsn()
     }
 
     // ------------------------------------------------------------------
@@ -588,7 +543,7 @@ impl Table {
 
     /// Check if a PK exists with positive net weight.
     #[cfg(test)] // production existence checks go through has_pk_bytes
-    pub fn has_pk(&mut self, key: u128) -> bool {
+    pub fn has_pk(&self, key: u128) -> bool {
         let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
         self.has_pk_bytes(opk.pk_bytes())
     }
@@ -598,19 +553,19 @@ impl Table {
     #[inline]
     pub fn has_pk_bytes(&self, key: &[u8]) -> bool {
         let mut w: i64 = 0;
-        self.for_each_pk_candidate(key, |row| w += row.weight());
+        self.for_each_pk_candidate(key, |run, row| w += run.get_weight(row));
         w > 0
     }
 
-    /// Visit every row whose PK equals `key`, in tier order — memtable, RAM
-    /// tier, then shards. Each RAM tier gates on its own bloom and each shard on
-    /// its PK range plus PK filter, so a miss costs a few loads and no search.
+    /// Visit every row whose PK equals `key`, newest first: memtable before RAM
+    /// tier before shards, and newest run first inside each tier — the order both
+    /// callers' grouping passes read it as.
     ///
-    /// The one PK walk of the table. Both point-lookup entry points read through
-    /// it, so no tier can be visible to one and invisible to the other — a live
-    /// row parked in the RAM tier between checkpoints is found exactly like a
-    /// memtable row.
-    fn for_each_pk_candidate(&self, key: &[u8], mut f: impl FnMut(StoredRow)) {
+    /// The one PK walk of the table, so no tier can be visible to one
+    /// point-lookup entry point and invisible to the other. The visitor borrows
+    /// its run because the bloom gates a whole `RunSet`: a hit walks all ≤16 of
+    /// its runs, and only the ones that hold the key clone an `Rc`.
+    fn for_each_pk_candidate(&self, key: &[u8], mut f: impl FnMut(&Run, usize)) {
         // One derivation for every filter this walk consults — both RAM-tier
         // blooms and each shard's PK filter.
         let fingerprint = probe_key(key);
@@ -618,22 +573,24 @@ impl Table {
             if !set.may_contain(fingerprint) {
                 continue;
             }
-            for batch in set.runs() {
+            // `runs()` is push-ordered (oldest first) and `ram_tiers()` is already
+            // newest-tier-first, so reversing here makes the whole walk newest-first.
+            for batch in set.runs().iter().rev() {
+                let Some(start) = pk_match_start(batch, key) else {
+                    continue;
+                };
                 let run = Run::Mem(Rc::clone(batch));
-                for row in run.pk_match_rows(key) {
-                    f(StoredRow { run: run.clone(), row });
+                for row in pk_match_rows_from(&run, batch.count, start, key) {
+                    f(&run, row);
                 }
             }
         }
         // The shard index's gated binary search already lands on the first
         // match, so the scan resumes from there rather than re-searching.
         self.shard_index.find_pk_bytes(key, fingerprint, &mut |shard, start| {
-            let count = shard.count;
-            for row in pk_match_rows_from(&*shard, count, start, key) {
-                f(StoredRow {
-                    run: Run::Shard(Rc::clone(&shard)),
-                    row,
-                });
+            let run = Run::Shard(shard);
+            for row in pk_match_rows_from(&run, run.count(), start, key) {
+                f(&run, row);
             }
         });
     }
@@ -644,7 +601,7 @@ impl Table {
     /// keys on verbatim OPK bytes via `retract_pk_bytes`, so this native entry
     /// point has no production caller and is retained only for unit tests.
     #[cfg(test)]
-    pub(crate) fn retract_pk(&mut self, key: u128) -> (i64, Option<StoredRow>) {
+    pub(crate) fn retract_pk(&self, key: u128) -> (i64, Option<StoredRow>) {
         let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
         self.retract_pk_bytes(opk.pk_bytes())
     }
@@ -659,29 +616,27 @@ impl Table {
     /// single row's own weight is what makes the answer right: a candidate whose
     /// weight is positive but whose full group nets ≤ 0 has been retracted by a
     /// later tier and must not be returned.
-    pub(in crate::storage) fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, Option<StoredRow>) {
-        let mut pool = std::mem::take(&mut self.retract_scratch);
-        debug_assert!(pool.is_empty());
+    pub(in crate::storage) fn retract_pk_bytes(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
+        let mut pool = self.retract_scratch.take();
 
         let mut total_w: i64 = 0;
-        self.for_each_pk_candidate(key, |row| {
-            total_w += row.weight();
-            pool.push(row);
+        self.for_each_pk_candidate(key, |run, row| {
+            total_w += run.get_weight(row);
+            pool.push(StoredRow { run: run.clone(), row });
         });
 
-        let row = (total_w > 0)
-            .then(|| {
-                let winner = first_live_payload_group(&self.schema, &pool);
-                debug_assert!(
-                    winner.is_some(),
-                    "positive net PK weight implies a positive payload group"
-                );
-                winner.map(|i| pool.swap_remove(i))
-            })
-            .flatten();
+        let mut row = None;
+        if total_w > 0 {
+            let winner = with_payload_cmp!(self.schema, first_live_payload_group, &self.schema, &pool);
+            debug_assert!(
+                winner.is_some(),
+                "positive net PK weight implies a positive payload group"
+            );
+            row = winner.map(|i| pool.swap_remove(i));
+        }
 
         pool.clear();
-        self.retract_scratch = pool;
+        self.retract_scratch.set(pool);
         (total_w, row)
     }
 
@@ -716,6 +671,18 @@ impl Table {
     }
 }
 
+/// Where `key`'s matching rows begin in a PK-sorted RAM-tier run, or `None` when
+/// it holds none — the run's own PK range rejects most keys before the binary
+/// search runs, and the equality test rejects the rest.
+fn pk_match_start(run: &Batch, key: &[u8]) -> Option<usize> {
+    let count = run.count;
+    if count == 0 || !pk_in_range(run.get_pk_bytes(0), run.get_pk_bytes(count - 1), key) {
+        return None;
+    }
+    let start = run.find_lower_bound_bytes(key);
+    (start < count && pk_bytes_eq(run.get_pk_bytes(start), key)).then_some(start)
+}
+
 // ---------------------------------------------------------------------------
 // OS helpers
 // ---------------------------------------------------------------------------
@@ -742,15 +709,6 @@ pub(super) fn open_table_dirfd(dir: &str) -> Result<OwnedFd, StorageError> {
     };
     crate::foundation::posix_io::try_set_nocow(fd.as_raw_fd());
     Ok(fd)
-}
-
-/// Drop a rederived table's on-disk state: this table's shard files (the
-/// grammar includes `table_id`, so a shared directory keeps its other tables)
-/// and its manifest. The manifest goes too, or a later open could accept a
-/// generation whose shards are gone.
-fn erase_stale_shards(dir: &str, table_id: u32) {
-    super::naming::remove_shard_files(dir, table_id, &std::collections::HashSet::new());
-    let _ = std::fs::remove_file(super::manifest::path(dir));
 }
 
 // ---------------------------------------------------------------------------

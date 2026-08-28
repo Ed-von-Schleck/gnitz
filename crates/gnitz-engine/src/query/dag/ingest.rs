@@ -246,19 +246,25 @@ impl DagEngine {
     /// the rederived half. Neither re-derives "which stores does this round
     /// touch" from the relation kind, so the two cannot drift apart.
     ///
-    /// Returned as raw `*mut Table` — the engine already passes `*mut Table`,
-    /// and owned trace tables are not in `self.tables` so they cannot be keyed
-    /// by `tid`. Valid because the worker flush handler is a synchronous `fn` on
-    /// a single-threaded process: no reactor yield and no concurrent
-    /// `cache`/`tables` mutation, so the table set is frozen for the flush.
-    pub fn collect_base_flush_tables(&mut self) -> Vec<*mut Table> {
-        let mut out: Vec<*mut Table> = Vec::new();
-        for entry in self.tables.values_mut() {
+    /// A `Vec` of `&mut Table` rather than a keyed lookup: an owned trace table is
+    /// not in `self.tables` at all. Both sources (`StoreHandle::as_owned_mut`,
+    /// `IndexCircuitEntry::table_mut`) hand a `&mut` out of an `UnsafeCell`, so
+    /// they own the disjointness argument, not the borrow checker.
+    pub fn collect_base_flush_tables(&mut self) -> Vec<&mut Table> {
+        Self::base_flush_tables(&mut self.tables)
+    }
+
+    /// [`Self::collect_base_flush_tables`] over the registry alone, so the
+    /// ephemeral collector can take it while holding a borrow of the disjoint
+    /// `cache` field.
+    fn base_flush_tables(tables: &mut FxHashMap<i64, TableEntry>) -> Vec<&mut Table> {
+        let mut out: Vec<&mut Table> = Vec::new();
+        for entry in tables.values_mut() {
             if let Some(t) = entry.handle.as_owned_mut() {
-                out.push(t as *mut Table);
+                out.push(t);
             }
             for ic in &mut entry.index_circuits {
-                out.push(ic.table_mut() as *mut Table);
+                out.push(ic.table_mut());
             }
         }
         out
@@ -270,7 +276,7 @@ impl DagEngine {
     pub fn base_advanced_since_publish(&mut self) -> bool {
         self.collect_base_flush_tables()
             .into_iter()
-            .any(|t| unsafe { &*t }.base_round_advances_publish())
+            .any(|t| t.base_round_advances_publish())
     }
 
     /// The tables the ephemeral checkpoint round force-persists, split into the
@@ -281,13 +287,12 @@ impl DagEngine {
     ///
     /// The sets are disjoint allocations — scratch dirs versus the relation dir
     /// — and `cache` and `tables` are separate fields, so the borrows are clean.
-    /// Same `*mut Table` validity argument as `collect_base_flush_tables`.
-    pub fn collect_ephemeral_flush_tables(&mut self) -> (Vec<*mut Table>, Vec<*mut Table>) {
+    pub fn collect_ephemeral_flush_tables(&mut self) -> (Vec<&mut Table>, Vec<&mut Table>) {
         // Iterate the (smaller) plan cache and consult `tables` — a disjoint
         // sibling field — for each plan's kind. Every `cache` entry has a
         // matching `tables` entry (`ensure_compiled` requires `tables.get`
         // first; `unregister_table` removes both), so this misses no view trace.
-        let mut traces: Vec<*mut Table> = Vec::new();
+        let mut traces: Vec<&mut Table> = Vec::new();
         for (tid, plan) in self.cache.iter_mut() {
             if !self.tables.get(tid).is_some_and(|e| e.kind.is_view()) {
                 continue;
@@ -296,15 +301,14 @@ impl DagEngine {
                 // Null owned cursors before the fold so none holds a stale snapshot.
                 sub.vm.null_owned_cursors();
                 for idx in sub.vm.program.table_indices() {
-                    traces.push(sub.vm.program.table_mut(idx) as *mut Table);
+                    traces.push(sub.vm.program.table_mut(idx));
                 }
             }
         }
 
-        let outputs = self
-            .collect_base_flush_tables()
+        let outputs = Self::base_flush_tables(&mut self.tables)
             .into_iter()
-            .filter(|&t| unsafe { &*t }.is_rederived())
+            .filter(|t| t.is_rederived())
             .collect();
         (traces, outputs)
     }

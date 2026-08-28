@@ -204,7 +204,7 @@ impl CatalogEngine {
     /// recovery maxes over the live rows and gaps are fine.
     pub(crate) fn advance_sequence(&mut self, seq_id: i64, new_val: i64) -> Result<(), StorageError> {
         let batch = self.build_seq_delta(seq_id, new_val);
-        self.sys_store_mut(SysFamily::Sequence).ingest_borrowed_batch(&batch)
+        self.sys_store_mut(SysFamily::Sequence).ingest_owned_batch(batch)
     }
 
     /// Reserve `count` ids for a user-table SERIAL sequence. Returns

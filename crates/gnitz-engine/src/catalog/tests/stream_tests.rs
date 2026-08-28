@@ -148,7 +148,7 @@ fn stream_fed_views_are_invalid_at_boot() {
     engine.record_topology(1).unwrap();
     let g = engine.bump_checkpoint_generation().unwrap();
     for vid in [direct, downstream, over_table] {
-        let store: *mut crate::storage::Table = engine.dag.tables.get(&vid).unwrap().handle.as_owned_mut().unwrap();
+        let store: &mut crate::storage::Table = engine.dag.tables.get(&vid).unwrap().handle.as_owned_mut().unwrap();
         crate::storage::flush_barrier([store], crate::storage::FlushRound::Ephemeral(g)).unwrap();
     }
 

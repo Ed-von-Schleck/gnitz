@@ -131,7 +131,7 @@ impl StoreHandle {
     /// so its `Rc` snapshot cache is preserved; a detached relation materializes
     /// an empty batch. Reached through [`TableEntry::full_scan`].
     pub(super) fn full_scan(&self, schema: &SchemaDescriptor) -> std::rc::Rc<Batch> {
-        match self.table_mut() {
+        match self.table() {
             Some(t) => t.full_scan(),
             None => self.open_cursor(schema).materialize(),
         }
@@ -173,7 +173,7 @@ impl StoreHandle {
     /// runs the same walk on the same batch.
     pub(crate) fn enforce_unique_pk(&self, schema: &SchemaDescriptor, batch: Batch) -> Batch {
         // Not `map_or`: `batch` would have to move into both arms.
-        match self.table_mut() {
+        match self.table() {
             Some(t) => crate::storage::enforce_unique_pk(t, schema, batch),
             None => batch,
         }

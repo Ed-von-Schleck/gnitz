@@ -145,20 +145,18 @@ fn arb_string(rng: &mut crate::test_rng::Rng) -> Vec<u8> {
 // Tests
 // ---------------------------------------------------------------------------
 
-// Table::with_arena(dir, name, schema, table_id, arena_size, persistence). The two
-// numerics are table_id = 1 and arena_size = 1 MiB (the memtable arena byte
-// budget), not a row capacity. Table::new calls ensure_dir, so the not-yet-
-// existing sub-dir is created here. full_scan / has_pk_bytes / retract_pk_bytes
-// all take `&mut self` (full_scan memoizes into a per-table cache, invalidated
-// on ingest) and all_shard_arcs returns `Vec<Rc<MappedShard>>` (single-threaded
-// — Rc, not Arc), so every test binds `let mut table`.
+// Table::with_memtable_budget(dir, schema, table_id, budget, recovery). The two
+// numerics are table_id = 1 and a 1 MiB memtable budget — large enough that no
+// test here folds — not a row capacity. The constructor creates the not-yet-
+// existing sub-dir. all_shard_arcs returns `Vec<Rc<MappedShard>>`
+// (single-threaded — Rc, not Arc).
 fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> Table {
     let p = if durable {
         RecoverySource::SalReplay
     } else {
         RecoverySource::Rederive { resume_at: None }
     };
-    Table::with_arena(dir.to_str().unwrap(), schema, 1, 1 << 20, p).unwrap()
+    Table::with_memtable_budget(dir.to_str().unwrap(), schema, 1, 1 << 20, p).unwrap()
 }
 
 proptest! {

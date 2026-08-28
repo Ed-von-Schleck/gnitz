@@ -491,7 +491,7 @@ mod tests {
     /// A table under `dir` for a trace register's backing store; the caller
     /// hands it to `ProgramBuilder::push_table`, which owns it from then on.
     fn owned_table(dir: &std::path::Path, name: &str, schema: SchemaDescriptor) -> Table {
-        Table::with_arena(
+        Table::with_memtable_budget(
             dir.join(name).to_str().unwrap(),
             schema,
             0,
@@ -1208,7 +1208,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cursor_test");
-        let mut table = Table::with_arena(
+        let mut table = Table::with_memtable_budget(
             tdir.to_str().unwrap(),
             schema,
             0,

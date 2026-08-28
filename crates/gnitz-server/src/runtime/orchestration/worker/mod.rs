@@ -1428,7 +1428,7 @@ impl WorkerProcess {
     fn unlink_derived_manifests(&mut self) {
         let (traces, outputs) = self.cat().dag_mut().collect_ephemeral_flush_tables();
         for t in traces.into_iter().chain(outputs) {
-            unsafe { &*t }.unlink_manifest();
+            t.unlink_manifest();
         }
     }
 

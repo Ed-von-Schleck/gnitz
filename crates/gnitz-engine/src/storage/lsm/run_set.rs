@@ -1,10 +1,13 @@
 //! `RunSet` — a set of in-heap sorted runs with a PK bloom and a fold trigger.
 //!
 //! Both RAM tiers of a [`Table`](super::table::Table) are this: the memtable
-//! accepts ingest batches and folds them into one run at 3/4 of its arena; the
+//! accepts ingest batches and folds them into one run past its byte budget; the
 //! RAM tier accepts those folded runs and spills to a shard past its ceiling.
-//! Same runs, same fold, same probe — only the byte trigger and where the folded
-//! run goes differ, and those live in `Table` as policy.
+//! The two are separate sets, not one, because the memtable's small budget is
+//! what keeps the RAM tier's big fold off the per-push path: the memtable
+//! absorbs many pushes per drain, so the tier below it re-merges its whole
+//! window far less often than a single set folding every [`FOLD_THRESHOLD`]
+//! pushes would.
 
 use std::cell::OnceCell;
 use std::rc::Rc;
@@ -187,6 +190,13 @@ impl RunSet {
     /// which probes both RAM tiers and every shard with the same key. The first
     /// probe builds the filter from all live runs.
     pub(super) fn may_contain(&self, probe_key: u64) -> bool {
+        // Before `get_or_init`, which would otherwise size a filter from the
+        // *budget* — a megabyte for the RAM tier — to answer a question an empty
+        // set already answers. An empty RAM tier is the normal state: it receives
+        // a run only once the memtable has drained.
+        if self.runs.is_empty() {
+            return false;
+        }
         let bloom = self.bloom.get_or_init(|| {
             // Sized to the budget's row capacity, NOT to the row count at first
             // probe — a filter sized to first-probe contents would over-saturate

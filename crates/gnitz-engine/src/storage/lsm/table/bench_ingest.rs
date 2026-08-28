@@ -10,31 +10,15 @@
 
 use super::super::batch::Batch;
 use super::{RecoverySource, Table};
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
+use crate::test_support::{make_batch_raw, make_schema_u64_i64};
 
-/// `(U64 pk, I64)` — the shape the client-side encode/decode was measured on,
-/// so the two halves of the round trip are directly comparable.
-fn schema_u64_i64() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
-
-/// One delta of `n` rows at consecutive PKs from `base`, all weight +1.
+/// One delta of `n` rows at consecutive PKs from `base`, all weight +1. Raw, not
+/// `Consolidated`: certifying it would short-circuit `into_consolidated` and the
+/// bench would stop measuring the kernel ingest actually runs.
 fn make_delta(schema: &SchemaDescriptor, base: u64, n: usize) -> Batch {
-    let mut b = Batch::with_capacity(*schema, n);
-    for i in 0..n as u64 {
-        b.extend_pk((base + i) as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &((base + i) as i64).to_le_bytes());
-        b.count += 1;
-    }
-    b
+    let rows: Vec<(u64, i64, i64)> = (0..n as u64).map(|i| (base + i, 1, (base + i) as i64)).collect();
+    make_batch_raw(schema, &rows)
 }
 
 #[test]
@@ -43,7 +27,7 @@ fn delta_ingest_bench() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    let schema = schema_u64_i64();
+    let schema = make_schema_u64_i64();
     const TOTAL: usize = 1_000_000;
 
     // Untimed warmup: thread-local batch pool + arena.
@@ -106,8 +90,8 @@ fn delta_ingest_bench() {
             table.flush().unwrap();
         }
         let ingest_ns = t1.elapsed().as_nanos() as f64;
-        let runs = table.ram_run_count();
-        black_box(table.current_lsn());
+        let runs = table.ram_tier.len();
+        black_box(&table);
 
         let rows = TOTAL as f64;
         let total_ns = decode_ns + ingest_ns;
@@ -153,7 +137,7 @@ fn delta_ingest_bench() {
             table.flush().unwrap();
         }
         let ns = t.elapsed().as_nanos() as f64;
-        black_box(table.current_lsn());
+        black_box(&table);
         println!(
             "{:>10} {:>10} {:>8} {:>12.1} {:>14.1}",
             n,
@@ -183,26 +167,19 @@ fn delta_ingest_bench() {
         // produces a growing store wearing a churn label.
         let mut last: Vec<Option<i64>> = vec![None; keys as usize];
         let mut batches: Vec<Batch> = Vec::with_capacity(k);
+        let mut rows: Vec<(u64, i64, i64)> = Vec::with_capacity(2 * n);
         for j in 0..k {
-            let mut b = Batch::with_capacity(schema, 2 * n);
+            rows.clear();
             for i in 0..n as u64 {
                 let pk = ((j * n) as u64 + i) % keys;
                 let new_val = (j + 1) as i64;
                 if let Some(prev) = last[pk as usize] {
-                    b.extend_pk(pk as u128);
-                    b.extend_weight(&(-1i64).to_le_bytes());
-                    b.extend_null_bmp(&0u64.to_le_bytes());
-                    b.extend_col(0, &prev.to_le_bytes());
-                    b.count += 1;
+                    rows.push((pk, -1, prev));
                 }
-                b.extend_pk(pk as u128);
-                b.extend_weight(&1i64.to_le_bytes());
-                b.extend_null_bmp(&0u64.to_le_bytes());
-                b.extend_col(0, &new_val.to_le_bytes());
-                b.count += 1;
+                rows.push((pk, 1, new_val));
                 last[pk as usize] = Some(new_val);
             }
-            batches.push(b);
+            batches.push(make_batch_raw(&schema, &rows));
         }
         let dir = tempfile::tempdir().unwrap();
         let mut table = Table::new(
@@ -218,7 +195,7 @@ fn delta_ingest_bench() {
             table.flush().unwrap();
         }
         let ns = t.elapsed().as_nanos() as f64;
-        black_box(table.current_lsn());
+        black_box(&table);
         println!(
             "{:>10} {:>10} {:>8} {:>12.1} {:>14.1}",
             keys,

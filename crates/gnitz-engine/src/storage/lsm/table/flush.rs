@@ -1,42 +1,41 @@
 //! Two-phase flush state machine for [`Table`].
 //!
-//! The flush/spill path carved off `Table`'s ingest/cursor/lookup surface:
-//! `flush_to_ram` (ingest overflow — fold the memtable into the RAM tier, no
-//! file I/O), `flush_prepare` (Phase 1 of the barrier / durable path — fold,
-//! write the shard one-shot at its final name, stage the manifest `.tmp`,
-//! returning `FlushWork`), `flush_commit` (Phase 2 — rename the manifest into
-//! place), the synchronous `flush` wrapper, and the ceiling spill
-//! (`spill_in_memory_to_disk`). `Table`'s fields are read directly here — `flush`
-//! is a child module of the `table` module that defines the struct.
+//! The flush/spill path carved off `Table`'s ingest/cursor/lookup surface: the
+//! ingest-overflow fold and its ceiling spill, the barrier's prepare/commit pair
+//! and the synchronous `flush` wrapper that drives one table through it, and the
+//! shard commit both the spill and the barrier share. `Table`'s fields are read
+//! directly here — `flush` is a child module of the `table` module that defines
+//! the struct.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::rc::Rc;
 
 use super::super::batch::Batch;
 use super::super::error::StorageError;
 use super::super::flush_barrier::FlushRound;
 use super::super::shard_file;
-use super::{FlushOutcome, FlushWork, RecoverySource, Table};
+use super::{FlushWork, Table};
 
 impl Table {
     /// Synchronous flush of this one table through the shared barrier. It runs a
     /// **base** round, so a `Rederive` table only folds into the RAM tier; a
     /// `SalReplay` table folds memtable + L0 into one shard, syncs it and the
     /// staged manifest, renames the manifest into place, fsyncs the directory,
-    /// and drains its deferred compaction cleanup. Used by manual FLUSH and the
-    /// system-table checkpoint, which never reach the worker's checkpoint round.
+    /// and drains its deferred compaction cleanup. Used by manual FLUSH and by
+    /// the post-backfill fold, neither of which reaches the worker's checkpoint
+    /// round.
     pub fn flush(&mut self) -> Result<(), StorageError> {
-        super::super::flush_barrier::flush_barrier([self as *mut Table], super::super::flush_barrier::FlushRound::Base)
+        super::super::flush_barrier::flush_barrier([&mut *self], FlushRound::Base)
     }
 
     /// Open the table directory fd on demand (`O_RDONLY|O_DIRECTORY`).
-    /// Opened per flush/compaction rather than held for the table's lifetime, so
-    /// a relation pins 0 directory fds at rest.
+    /// Opened per flush rather than held for the table's lifetime, so a relation
+    /// pins 0 directory fds at rest.
     /// The caller owns the returned `OwnedFd`, which closes it on drop — so an
     /// error `?` anywhere downstream releases it with no manual close.
     ///
-    /// An absent directory is created here — this is the single choke point
-    /// every file write goes through, so nothing downstream has to check.
+    /// An absent directory is created here. Nothing else re-creates one: the
+    /// shard write goes by path and `ENOENT`s instead.
     pub(super) fn open_dirfd(&self) -> Result<OwnedFd, StorageError> {
         super::open_table_dirfd(&self.directory)
     }
@@ -48,22 +47,39 @@ impl Table {
     /// Fold the residual memtable into the RAM tier (no spill).
     fn fold_memtable_into_l0(&mut self) {
         if let Some(run) = self.memtable.fold_to_single(&self.schema) {
-            self.cached_full_scan = None;
+            self.cached_full_scan.set(None);
             self.ram_tier.push(run, &self.schema);
         }
         self.memtable.clear();
     }
 
     /// The ingest-overflow path for **every** table: fold the memtable into the
-    /// RAM tier, then spill that tier if it is over its ceiling. No file I/O
-    /// unless the ceiling is breached; durability lives in the fsynced SAL until
-    /// the checkpoint barrier folds the tier into a durable shard.
+    /// RAM tier, and spill that tier only if folding it to net state leaves it
+    /// still over the ceiling — churn routinely cancels back under. Durability
+    /// lives in the fsynced SAL until a barrier writes the durable shard, so
+    /// nothing here touches disk unless the ceiling really is breached.
+    ///
+    /// Spills are written **unsynced** and register as owing a sweep: a
+    /// `SalReplay` table's are fdatasync'd by the next barrier, a `Rederive`
+    /// table's by the ephemeral round, and the latter are erased and rebuilt at
+    /// open if no round reaches them.
+    ///
+    /// A spilled table then holds disk runs *and* heap runs, and churn across the
+    /// two never cancels — the RAM-tier fold is heap-only, `run_compact` is
+    /// disk-only. That costs disk footprint, not heap (which stays ≤ the ceiling
+    /// by construction), and the disk tier still self-compacts.
     pub(super) fn flush_to_ram(&mut self) -> Result<(), StorageError> {
         self.fold_memtable_into_l0();
-        if self.ram_tier.is_full() {
-            self.spill_in_memory_to_disk()?;
+        if !self.ram_tier.is_full() {
+            return Ok(());
         }
-        Ok(())
+        let Some(run) = self.ram_tier.fold_to_single(&self.schema) else {
+            return Ok(());
+        };
+        if !self.ram_tier.is_full() {
+            return Ok(());
+        }
+        self.persist_l0_run(run)
     }
 
     // ------------------------------------------------------------------
@@ -90,10 +106,10 @@ impl Table {
     /// from a relation that had never been checkpointed. That costs `W` manifests
     /// per relation per checkpoint, whose `fdatasync`s `flush_barrier` batches
     /// through one ring.
-    pub(in crate::storage) fn flush_prepare(&mut self, round: FlushRound) -> Result<FlushOutcome, StorageError> {
-        if matches!(round, FlushRound::Base) && self.recovery_source != RecoverySource::SalReplay {
+    pub(in crate::storage) fn flush_prepare(&mut self, round: FlushRound) -> Result<Option<FlushWork>, StorageError> {
+        if matches!(round, FlushRound::Base) && self.is_rederived() {
             self.flush_to_ram()?;
-            return Ok(FlushOutcome::Done);
+            return Ok(None);
         }
 
         // Fold-first, then one shard.
@@ -110,7 +126,7 @@ impl Table {
         let manifest = self
             .shard_index
             .prepare_manifest(&manifest_c, round.checkpoint_gen(), self.layout_seq)?;
-        Ok(FlushOutcome::Pending(FlushWork { sync_paths, manifest }))
+        Ok(Some(FlushWork { sync_paths, manifest }))
     }
 
     /// Commit the RAM tier's single folded net-state run to disk at its final
@@ -133,14 +149,13 @@ impl Table {
     fn persist_l0_run(&mut self, run: Rc<Batch>) -> Result<(), StorageError> {
         let shard_name = super::super::naming::spill_shard_name(self.table_id, self.current_lsn);
         let lsn_max = self.current_lsn - 1;
-        let name_c = super::super::cstr(shard_name.as_str())?;
+        // Real LSNs, so a reopen seeds `current_lsn = max_lsn() + 1`.
+        let final_full = format!("{}/{}", self.directory, shard_name);
+        let full_c = super::super::cstr(final_full.as_str())?;
 
-        let dirfd = self.open_dirfd()?;
-        let res = shard_file::write_shard_streaming(
-            dirfd.as_raw_fd(),
-            &name_c,
-            run.count as u32,
-            &run.regions(),
+        // Write failed: heap still owns `run`; no on-disk residue.
+        run.write_as_shard(
+            &full_c,
             &self.schema,
             // L0 spill/checkpoint shards stay plain (no FoR packing), and carry
             // a PK filter only where something point-probes this store.
@@ -148,12 +163,8 @@ impl Table {
                 skip_pk_filter: self.shard_index.skip_pk_filter(),
                 ..Default::default()
             },
-        );
-        drop(dirfd);
-        res?; // Write failed: heap still owns `run`; no on-disk residue.
+        )?;
 
-        // Real LSNs, so a reopen seeds `current_lsn = max_lsn() + 1`.
-        let final_full = format!("{}/{}", self.directory, shard_name);
         if let Err(e) = self.shard_index.add_unsynced_shard(&final_full, lsn_max) {
             // Registration failed: unlink the shard we wrote, keep heap intact.
             let _ = std::fs::remove_file(&final_full);
@@ -162,23 +173,20 @@ impl Table {
 
         // Commit: the run is on disk and registered — safe to drop from heap.
         self.ram_tier.clear();
+        // The capacity sweep below can dehydrate or drop live rows, so this is
+        // where the materialized scan stops being a copy of the row set.
+        self.cached_full_scan.set(None);
 
         // The only path that grows L0, so the only place its fan-in can cross
         // `L0_COMPACT_THRESHOLD`. Publishes no manifest, so a barrier caller
         // stages one describing the already-compacted index.
         self.compact_if_needed()?;
 
-        // The one capacity trigger. Not inside `compact_if_needed`, whose
-        // `should_compact` early return would skip the check on exactly the
-        // spills that did not also cross the file-count threshold. One trigger
-        // suffices because this is the only place a store's shard bytes can
-        // grow — a tick that merely fills the memtable or the RAM tier changes no
-        // disk byte — so a view that goes over budget and then never spills again
-        // was enforced on its last spill.
-        //
-        // Its outputs register as unsynced and its superseded inputs go to
-        // `pending_deletions`, so it inherits the barrier plumbing
-        // `compact_if_needed` already uses here unchanged.
+        // The one capacity trigger, and it sits here rather than inside
+        // `compact_if_needed` because that one's `should_compact` early return
+        // would skip exactly the spills that did not also cross the file-count
+        // threshold. This is the only place a store's shard bytes can grow, so
+        // one trigger covers every store.
         self.shard_index.enforce_capacity()
     }
 
@@ -199,38 +207,5 @@ impl Table {
         // worker, barrier holds sal_writer_excl.
         self.shard_index.clear_unsynced();
         self.open_dirfd()
-    }
-
-    /// Ceiling breach: fold the RAM tier to net state first. Folding cancels
-    /// cross-flush churn (an insert in flush N against its retraction in N+1)
-    /// and can reclaim enough to fall back under the ceiling — in which case
-    /// this returns without touching disk. Otherwise commit the folded run
-    /// (`persist_l0_run`), which also bounds the disk tier: a repeatedly-spilling
-    /// table is read only via the non-compacting `open_cursor`, so without that
-    /// its shards would accumulate unbounded and every cursor would merge them
-    /// all.
-    ///
-    /// Spills are written **unsynced**, and register in the index as owing a sweep.
-    /// For `SalReplay` the next barrier fdatasyncs them by path before publishing
-    /// (every barrier publishes, so the checkpoint's global SAL reset never drops
-    /// an acknowledged spill). A `Rederive` table's spills wait for the
-    /// ephemeral round instead, and are erased+rebuilt at open if none reaches
-    /// them.
-    ///
-    /// After a spill the table carries disk runs + future heap runs; cross-tier
-    /// churn does NOT fold (the RAM-tier fold is heap-only and `run_compact` is
-    /// disk-only, so neither sees both). This is bounded: it only occurs for
-    /// tables that breached the ceiling, affects disk footprint not heap (heap
-    /// stays <= ceiling by construction), and the disk tier still self-compacts.
-    fn spill_in_memory_to_disk(&mut self) -> Result<(), StorageError> {
-        let Some(run) = self.ram_tier.fold_to_single(&self.schema) else {
-            return Ok(());
-        };
-        // Folding may have dropped the net state back under the ceiling (heavy
-        // churn cancels to near-nothing); if so there is nothing to spill.
-        if !self.ram_tier.is_full() {
-            return Ok(());
-        }
-        self.persist_l0_run(run)
     }
 }

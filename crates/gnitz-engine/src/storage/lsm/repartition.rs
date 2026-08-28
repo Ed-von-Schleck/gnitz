@@ -378,7 +378,12 @@ fn rewrite_targets(
     let mut targets: Vec<TargetChild> = super::child_dir::cluster_children(launched)
         .map(|c| {
             let dir = c.dir(rel_dir);
-            super::table::ensure_dir(&dir)?;
+            // The one directory opener, the same one `Table::new` takes: it
+            // applies the platform's no-CoW hint, and the shards below are
+            // written into this directory by path. Where the flag is inherited at
+            // file creation (btrfs) `ensure_dir` would leave every one of them
+            // copy-on-write, since nothing flags the directory until the next boot.
+            super::table::open_table_dirfd(&dir)?;
             Ok(TargetChild::new(dir, schema))
         })
         .collect::<Result<_, StorageError>>()?;

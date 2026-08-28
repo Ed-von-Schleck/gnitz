@@ -1,7 +1,7 @@
 //! End-to-end microbenchmark for the RAM-tier per-tick flush policy: the
 //! composition of `fold_memtable_into_l0` (memtable consolidation), the RAM
 //! tier's own fold at `FOLD_THRESHOLD` (window re-merge + re-materialize) and
-//! `spill_in_memory_to_disk`, driven at the production trigger thresholds.
+//! the ceiling spill in `flush_to_ram`, driven at the production thresholds.
 //!
 //! This is the bench a compaction-policy change must move, and the one whose
 //! `perf` profile must reproduce the e2e worker hot-symbol shape. As a child
@@ -103,6 +103,26 @@ enum Gen {
     Churn(usize, usize),
 }
 
+/// The emptied scratch directory both compaction sweeps write into — a real
+/// filesystem when `GNITZ_BENCH_DIR` names one, because shard bytes are what
+/// they count and a tmpfs prices them differently. `tmp` owns the fallback root
+/// and so must outlive the returned path.
+fn bench_dir(tmp: &tempfile::TempDir, name: String) -> std::path::PathBuf {
+    let root = std::env::var("GNITZ_BENCH_DIR").unwrap_or_else(|_| tmp.path().to_str().unwrap().to_string());
+    let dir = std::path::Path::new(&root).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// Open a fresh compaction-stats window and return the RNG the scatter ticks
+/// draw from. The seed lives here so every arm of every sweep replays the same
+/// arrival order — `filter_share_of_compaction`'s two arms must report identical
+/// compacted bytes or their cycle delta means nothing.
+fn start_compaction_sweep() -> crate::test_rng::Rng {
+    crate::storage::lsm::shard_index::cstats::reset();
+    crate::test_rng::Rng::new(0x5EED_1234)
+}
+
 /// The per-tick flush-policy cost at production thresholds. See the module doc.
 ///
 /// ```text
@@ -162,18 +182,18 @@ fn flush_cadence_amplification_bench() {
         let t = Instant::now();
         for batch in ticks {
             // Sampled before the fold; +1 accounts for the incoming fold's run.
-            let runs_before = table.ram_run_count();
+            let runs_before = table.ram_tier.len();
             table.ingest_owned_batch(batch).unwrap();
             table.flush().unwrap(); // Rederive → flush_prepare → flush_to_ram
             if runs_before + 1 >= FOLD_THRESHOLD {
-                merged_out += table.ram_row_count();
+                merged_out += table.ram_tier.row_count();
             }
         }
         let secs = t.elapsed().as_secs_f64();
 
         assert!(merged_out > 0, "{label}: compaction never fired");
         assert!(
-            table.ram_run_count() <= FOLD_THRESHOLD,
+            table.ram_tier.len() <= FOLD_THRESHOLD,
             "{label}: RAM-tier run bound violated",
         );
         black_box(merged_out);
@@ -217,11 +237,7 @@ fn compaction_amplification_bench() {
 
     let schema = make_schema_flush();
     let tmp = tempfile::tempdir().unwrap();
-    // A real filesystem when one is named: shard bytes are what is counted here,
-    // and a tmpfs prices them differently.
-    let root = std::env::var("GNITZ_BENCH_DIR").unwrap_or_else(|_| tmp.path().to_str().unwrap().to_string());
-    let dir = std::path::Path::new(&root).join(format!("wa_{ticks_n}_{keyspace}"));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = bench_dir(&tmp, format!("wa_{ticks_n}_{keyspace}"));
 
     let mut table = Table::new(
         dir.to_str().unwrap(),
@@ -232,8 +248,7 @@ fn compaction_amplification_bench() {
     .unwrap();
 
     use crate::storage::lsm::shard_index::cstats;
-    cstats::reset();
-    let mut rng = crate::test_rng::Rng::new(0x5EED_1234);
+    let mut rng = start_compaction_sweep();
     for t in 0..ticks_n {
         let batch = match monotone {
             true => distinct_tick(&schema, t, ROWS_PER_TICK),
@@ -254,7 +269,7 @@ fn compaction_amplification_bench() {
     println!(
         "compaction_amplification/{ticks_n}t {} keyspace={keyspace}: {}",
         if monotone { "monotone" } else { "scattered" },
-        table.tree_report()
+        table.shard_index.tree_report()
     );
     for (name, p) in cstats::PHASE_NAMES.iter().zip(&phases) {
         let mean = p.in_bytes.checked_div(p.n as u64).unwrap_or(0);
@@ -307,23 +322,18 @@ fn filter_share_of_compaction() {
 
     let schema = make_schema_flush();
     let tmp = tempfile::tempdir().unwrap();
-    // A real filesystem when one is named: this writes and re-reads shard bytes,
-    // and a tmpfs prices them differently.
-    let root = std::env::var("GNITZ_BENCH_DIR").unwrap_or_else(|_| tmp.path().to_str().unwrap().to_string());
-    let dir = std::path::Path::new(&root).join(format!("fs_{ticks_n}_{}", filter_off as u8));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = bench_dir(&tmp, format!("fs_{ticks_n}_{}", filter_off as u8));
 
     let mut table = Table::new(dir.to_str().unwrap(), schema, 9, RecoverySource::SalReplay).unwrap();
     // The off arm. Force-off only: every store that skips by policy is
     // `Rederive` and never carries a base-table workload, so forcing a filter
     // *on* would measure nothing.
     if filter_off {
-        table.set_skip_pk_filter_for_test(true);
+        table.shard_index.set_skip_pk_filter_for_test(true);
     }
 
     use crate::storage::lsm::shard_index::cstats;
-    cstats::reset();
-    let mut rng = crate::test_rng::Rng::new(0x5EED_1234);
+    let mut rng = start_compaction_sweep();
     let mut ingested: usize = 0;
     for _ in 0..ticks_n {
         let batch = scatter_tick(&schema, &mut rng, ROWS_PER_TICK, keyspace);

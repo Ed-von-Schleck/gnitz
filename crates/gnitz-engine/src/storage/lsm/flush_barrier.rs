@@ -10,7 +10,7 @@ use std::ffi::CStr;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::super::error::StorageError;
-use super::table::{FlushOutcome, FlushWork, Table};
+use super::table::{FlushWork, Table};
 use crate::foundation::posix_io::open_owned;
 
 /// Concurrent-fd budget for one barrier chunk. Bounds both the per-table
@@ -43,31 +43,25 @@ impl FlushRound {
 }
 
 /// Flush every table in `tables` through the two-phase publish for `round`.
-///
-/// Takes raw pointers and dereferences each as `&mut Table`, so the caller owes
-/// what a `&mut` would have proved: every pointer must point at a live `Table`,
-/// no two may alias, and nothing else may touch any of them until this returns.
-/// The signature enforces none of it. The engine's own caller — the worker
-/// checkpoint — collects them from the DAG while the engine is single-threaded
-/// and cannot yield, which is how it discharges the obligation; a caller that
-/// can yield must freeze the set some other way.
-pub fn flush_barrier(tables: impl IntoIterator<Item = *mut Table>, round: FlushRound) -> Result<(), StorageError> {
+pub fn flush_barrier<'a>(
+    tables: impl IntoIterator<Item = &'a mut Table>,
+    round: FlushRound,
+) -> Result<(), StorageError> {
     let mut ring = LazyRing::default();
-    let mut pending: Vec<(*mut Table, FlushWork)> = Vec::new();
+    let mut pending: Vec<(&'a mut Table, FlushWork)> = Vec::new();
     let mut pending_fds = 0usize;
     // Tables that published a manifest this round — drained only after every
     // chunk succeeded, so a crash between publish and drain loads the cut
     // manifest over intact files.
-    let mut flushed: Vec<*mut Table> = Vec::new();
+    let mut flushed: Vec<&'a mut Table> = Vec::new();
 
     for t in tables {
-        let work = match unsafe { &mut *t }.flush_prepare(round)? {
-            FlushOutcome::Done => continue,
-            FlushOutcome::Pending(w) => w,
+        let Some(work) = t.flush_prepare(round)? else {
+            continue;
         };
         // Each work opens one fd per unsynced file (the by-path sweep) plus the
         // manifest `.tmp` fd.
-        pending_fds += work.sync_paths().len() + 1;
+        pending_fds += work.sync_paths.len() + 1;
         pending.push((t, work));
         if pending_fds >= FD_CHUNK_THRESHOLD {
             publish_chunk(&mut ring, &mut pending, &mut flushed)?;
@@ -80,7 +74,7 @@ pub fn flush_barrier(tables: impl IntoIterator<Item = *mut Table>, round: FlushR
     // can no longer be unlinked while a manifest still referencing it is
     // unpublished.
     for t in flushed {
-        unsafe { &mut *t }.drain_deletions();
+        t.drain_deletions();
     }
     Ok(())
 }
@@ -107,21 +101,21 @@ pub(super) fn sync_by_path(ring: &mut LazyRing, paths: &[&CStr]) -> Result<(), S
 /// unsynced files, rename each manifest into place, then batch-fsync the
 /// directories that received one. Every fd this chunk opened is closed before
 /// the next chunk starts.
-fn publish_chunk(
+fn publish_chunk<'a>(
     ring: &mut LazyRing,
-    pending: &mut Vec<(*mut Table, FlushWork)>,
-    flushed: &mut Vec<*mut Table>,
+    pending: &mut Vec<(&'a mut Table, FlushWork)>,
+    flushed: &mut Vec<&'a mut Table>,
 ) -> Result<(), StorageError> {
     if pending.is_empty() {
         return Ok(());
     }
 
-    let manifest_fds: Vec<libc::c_int> = pending.iter().map(|(_, w)| w.manifest_fd()).collect();
+    let manifest_fds: Vec<libc::c_int> = pending.iter().map(|(_, w)| w.manifest.fd()).collect();
     ring.batch_sync(&manifest_fds, DATASYNC)?;
 
     let paths: Vec<&CStr> = pending
         .iter()
-        .flat_map(|(_, w)| w.sync_paths().iter().map(|c| c.as_c_str()))
+        .flat_map(|(_, w)| w.sync_paths.iter().map(|c| c.as_c_str()))
         .collect();
     sync_by_path(ring, &paths)?;
 
@@ -129,7 +123,7 @@ fn publish_chunk(
     // not fdatasync: the rename is metadata.
     let mut dir_fds: Vec<OwnedFd> = Vec::with_capacity(pending.len());
     for (t, work) in pending.drain(..) {
-        dir_fds.push(unsafe { &mut *t }.flush_commit(work)?);
+        dir_fds.push(t.flush_commit(work)?);
         flushed.push(t);
     }
     let raw: Vec<libc::c_int> = dir_fds.iter().map(|f| f.as_raw_fd()).collect();

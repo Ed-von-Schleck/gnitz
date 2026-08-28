@@ -110,7 +110,7 @@ impl CatalogEngine {
     fn bootstrap_ingest(&mut self, family: SysFamily, bb: BatchBuilder) -> Result<(), String> {
         let batch = bb.finish();
         self.sys_store_mut(family)
-            .ingest_borrowed_batch(&batch)
+            .ingest_owned_batch(batch)
             .map_err(|e| format!("bootstrap: {} ingest failed: {e}", family.name()))
     }
 
@@ -275,7 +275,7 @@ impl CatalogEngine {
         // family's manifest, data and directory syncs into three submissions and
         // builds at most one io_uring. System tables are `SalReplay`, so each
         // folds memtable + L0 into a durable shard and re-stamps its manifest.
-        let tables = self.sys_stores.iter_mut().map(|b| &mut **b as *mut Table);
+        let tables = self.sys_stores.iter_mut().map(|b| &mut **b);
         crate::storage::flush_barrier(tables, crate::storage::FlushRound::Base)
             .map_err(|e| format!("boot flush of the system catalog failed: {e:?}"))
     }
@@ -306,9 +306,9 @@ impl CatalogEngine {
     /// The caller latches the generation first: the server off the `FlushEph`
     /// message, an embedder through [`Self::bump_checkpoint_generation`].
     pub fn flush_ephemeral_round(&mut self) -> Result<u64, String> {
-        let (traces, outputs) = self.dag.collect_ephemeral_flush_tables();
         let generation = self.resume_generation();
-        let pass = |tables: Vec<*mut Table>, what: &str| {
+        let (traces, outputs) = self.dag.collect_ephemeral_flush_tables();
+        let pass = |tables: Vec<&mut Table>, what: &str| {
             crate::storage::flush_barrier(tables, crate::storage::FlushRound::Ephemeral(generation))
                 .map_err(|e| format!("ephemeral {what} flush: {e}"))
         };

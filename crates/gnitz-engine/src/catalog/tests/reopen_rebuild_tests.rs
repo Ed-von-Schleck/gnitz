@@ -287,7 +287,7 @@ fn checkpointed_table_with_index(dir: &str) -> (i64, u64) {
     let g = engine.bump_checkpoint_generation().unwrap();
 
     let entry = engine.dag.tables.get_mut(&tid).unwrap();
-    let idx: *mut crate::storage::Table = entry.index_circuits[0].table_mut();
+    let idx: &mut crate::storage::Table = entry.index_circuits[0].table_mut();
     crate::storage::flush_barrier([idx], crate::storage::FlushRound::Ephemeral(g)).unwrap();
 
     engine.close();
@@ -430,7 +430,7 @@ fn view_traces_resume_with_their_output_store() {
     assert!(!traces.is_empty(), "a trace-bearing view must contribute trace tables");
     for t in traces {
         assert!(
-            unsafe { &*t }.resumed_from_checkpoint(),
+            t.resumed_from_checkpoint(),
             "a trace opened against a generation its manifest never carried is erased"
         );
     }

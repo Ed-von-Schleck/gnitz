@@ -88,7 +88,7 @@ impl Avi {
         // ordinal `j` is position `j` in that subset exactly as production has it.
         let bake = AviBake::new(in_schema, group_cols, agg_descs).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let mut table = crate::storage::Table::with_arena(
+        let mut table = crate::storage::Table::with_memtable_budget(
             dir.path().to_str().unwrap(),
             bake.schema,
             0,
@@ -4002,7 +4002,7 @@ fn avi_read_extreme(
     // The aggregate's type is the source column's type.
     let avi_schema = crate::schema::avi_schema(in_schema, group_by).unwrap();
     let tmp = tempfile::tempdir().unwrap();
-    let mut avi_t = Table::with_arena(
+    let mut avi_t = Table::with_memtable_budget(
         tmp.path().to_str().unwrap(),
         avi_schema,
         0,
@@ -5453,7 +5453,7 @@ fn build_combined_avi(
 ) -> crate::storage::Table {
     use crate::ops::index::{op_integrate_with_indexes, IntegrateTarget};
     let avi_schema = crate::schema::avi_schema(in_schema, group_cols).unwrap();
-    let mut t = crate::storage::Table::with_arena(
+    let mut t = crate::storage::Table::with_memtable_budget(
         dir.to_str().unwrap(),
         avi_schema,
         0,
@@ -6088,7 +6088,7 @@ fn run_reduce_trace_epochs(
 ) -> (std::rc::Rc<Batch>, usize) {
     // A fresh tempdir per call isolates shard files, so a constant table_id is
     // collision-free.
-    let mut trace = crate::storage::Table::with_arena(
+    let mut trace = crate::storage::Table::with_memtable_budget(
         dir.to_str().unwrap(),
         *out_schema,
         0,
@@ -6435,7 +6435,7 @@ fn run_minmax_epochs(
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
 
-    let mut trace_out = Table::with_arena(
+    let mut trace_out = Table::with_memtable_budget(
         dir,
         *out_schema,
         0,
@@ -6444,7 +6444,7 @@ fn run_minmax_epochs(
     )
     .unwrap();
     let avi_schema = crate::schema::avi_schema(in_schema, group_by).unwrap();
-    let mut avi_t = Table::with_arena(
+    let mut avi_t = Table::with_memtable_budget(
         dir,
         avi_schema,
         2,
