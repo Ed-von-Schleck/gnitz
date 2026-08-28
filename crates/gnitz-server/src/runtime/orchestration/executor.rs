@@ -23,7 +23,7 @@ use rustc_hash::FxHashMap;
 
 use super::guard_panic;
 use crate::runtime::posix;
-use crate::runtime::tls::{ConnCountGuard, TlsListener, TlsShared};
+use crate::runtime::tls::{TlsListener, TlsShared};
 use gnitz_engine::foundation::fault::Seam;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -395,14 +395,9 @@ impl ServerExecutor {
         if let Some(tl) = &tls {
             reactor.attach_listener(tl.fd);
         }
-        // Reactor-thread live-TLS-connection counter, incremented by an RAII
-        // guard stored in each session's `TlsShared` and decremented on its
-        // drop. Single-threaded, so no atomics.
-        let tls_conn_count = Rc::new(Cell::new(0u32));
         let accept_ctx = AcceptCtx {
             unix_fd: server_fd,
             tls,
-            tls_conn_count,
         };
 
         // Seed the zone-LSN allocator above every table's current_lsn so each
@@ -460,14 +455,13 @@ impl ServerExecutor {
 // Accept loop
 // ---------------------------------------------------------------------------
 
-/// Accept-routing inputs: which listener fd is which, the TLS listener, and
-/// the reactor-thread live-TLS-connection counter. Carried explicitly, because
-/// the reactor records no listener fd — an accept reports which listener it came
-/// from through the udata round-trip, and this maps that back to a role.
+/// Accept-routing inputs: which listener fd is which, and the TLS listener.
+/// Carried explicitly, because the reactor records no listener fd — an accept
+/// reports which listener it came from through the udata round-trip, and this
+/// maps that back to a role.
 struct AcceptCtx {
     unix_fd: i32,
     tls: Option<TlsListener>,
-    tls_conn_count: Rc<Cell<u32>>,
 }
 
 async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
@@ -480,27 +474,24 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
             shared.reactor.register_conn(fd);
             let peer = Peer::unix(fd, Rc::clone(&shared.reactor));
             let s = Rc::clone(&shared);
-            // AF_UNIX (loopback) has no pre-auth deadline: the mature
-            // local path is behaviourally unchanged.
+            // No pre-auth deadline: access here is gated by the socket path's
+            // filesystem permissions, and whoever can open it already has full
+            // DDL/DML authority, so squatting gains nothing.
             shared.reactor.spawn(connection_loop(peer, s, None));
             continue;
         }
         match &ctx.tls {
             Some(tl) if listener == tl.fd => {
                 // Global connection cap: close the freshly-accepted fd before
-                // any TLS work when the live count is at the cap. No TOCTOU —
-                // on the single-threaded reactor there is no `.await` between
-                // this check and `ConnCountGuard::new`, only synchronous
-                // socket-option/`start` calls, so the count cannot go stale.
-                if ctx.tls_conn_count.get() >= tl.max_conns {
+                // any TLS work when the live count is at the cap.
+                let Some(guard) = tl.admit() else {
                     gnitz_warn!("tls: connection cap {} reached; closing fd={fd}", tl.max_conns);
                     // SAFETY: freshly-accepted fd we own; no SQE references it.
                     unsafe { libc::close(fd) };
                     continue;
-                }
+                };
                 posix::set_nodelay(fd);
                 posix::set_keepalive(fd);
-                let guard = ConnCountGuard::new(Rc::clone(&ctx.tls_conn_count));
                 match TlsShared::start(Rc::clone(&shared.reactor), fd, std::sync::Arc::clone(&tl.cfg), guard) {
                     Ok(conn) => {
                         let peer = Peer::tls(conn);

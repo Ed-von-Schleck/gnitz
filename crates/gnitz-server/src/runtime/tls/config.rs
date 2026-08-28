@@ -1,11 +1,10 @@
 //! rustls `ServerConfig` construction: operator-supplied PEM cert/key, or an
 //! auto-minted (rcgen) self-signed dev certificate for loopback use.
 //!
-//! Why auto-mint rather than committing a static dev cert+key to the repo: a
-//! committed private key is the exact "key on disk" smell this design
-//! otherwise avoids — CI secret-scanners flag it, and it invites misuse —
-//! whereas rcgen mints an ephemeral key that never touches disk (only the
-//! public PEM is persisted, for `?ca=` clients).
+//! Why auto-mint rather than committing a static dev cert+key to the repo: the
+//! rcgen key exists only in this boot's memory, so there is no long-lived dev
+//! private key to leak, or to be shared by every install. Only the public PEM
+//! is persisted, for `?ca=` clients.
 
 use std::sync::Arc;
 
@@ -87,15 +86,11 @@ pub(super) fn server_crypto(
         .with_single_cert(chain, key)
         .map_err(|e| format!("tls cert/key rejected: {e}"))?;
     cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
-    // Load-bearing, not cosmetic (the field defaults to 2): gnitz connections
-    // are long-lived, so resumption tickets add nothing, and disabling
-    // NewSessionTicket emission removes the most common post-handshake
-    // control-bytes race — tickets shipped by the flusher concurrently with
-    // connection_loop's HELLO-ACK send. (The send_mutex-across-send
-    // discipline is still required for handshake flights, KeyUpdate
-    // responses, and alerts.) 0-RTT stays off (`max_early_data_size`
-    // defaults to 0): once a future auth layer gives a session DML
-    // authority, replayable early data would be replayable DML.
+    // gnitz connections are long-lived, so resumption tickets buy nothing, and
+    // emitting none removes the post-handshake `NewSessionTicket` send that
+    // would otherwise race connection_loop's HELLO-ACK under `send_mutex`.
+    // 0-RTT stays off (`max_early_data_size` defaults to 0): once a future auth
+    // layer gives a session DML authority, replayable early data is replayable DML.
     cfg.send_tls13_tickets = 0;
     Ok((Arc::new(cfg), dev_pem))
 }
@@ -176,7 +171,8 @@ mod tests {
         // send_tls13_tickets = 0, so early data must stay off. Replayable
         // early data would be replayable DML once an auth layer grants
         // authority. The client-side `enable_early_data == false` mirror is
-        // asserted in the gnitz-core transport tests.
+        // asserted by `client_config_leaves_zero_rtt_off` in gnitz-core's
+        // `protocol::transport::tls` tests.
         let (cfg, _) = server_crypto(None, None).unwrap();
         assert_eq!(cfg.max_early_data_size, 0, "0-RTT early data must be disabled");
     }

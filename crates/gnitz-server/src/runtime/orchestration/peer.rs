@@ -13,7 +13,7 @@
 
 use std::rc::Rc;
 
-use crate::runtime::reactor::{Reactor, RecvBuf};
+use crate::runtime::reactor::{PeerToken, Reactor, RecvBuf};
 use crate::runtime::tls::TlsShared;
 use crate::runtime::w2m::W2mSlot;
 use gnitz_engine::storage::batch_pool::PooledSendBuf;
@@ -25,16 +25,19 @@ pub struct Peer {
 }
 
 enum PeerInner {
-    /// AF_UNIX stream connection serviced by the reactor's fd machinery.
-    Unix { fd: i32, reactor: Rc<Reactor> },
+    /// AF_UNIX stream connection serviced by the reactor's fd machinery. The
+    /// fd is reached through the `PeerToken`, which is what keeps the reactor
+    /// from closing (and the kernel from recycling) it under this handle.
+    Unix { conn: PeerToken, reactor: Rc<Reactor> },
     /// TLS 1.3 over TCP; framing and record I/O live in `runtime::tls`.
     Tls(Rc<TlsShared>),
 }
 
 impl Peer {
     pub fn unix(fd: i32, reactor: Rc<Reactor>) -> Peer {
+        let conn = PeerToken::new(&reactor, fd);
         Peer {
-            inner: PeerInner::Unix { fd, reactor },
+            inner: PeerInner::Unix { conn, reactor },
         }
     }
 
@@ -48,7 +51,7 @@ impl Peer {
     /// exit path including task cancellation), or `None` on disconnect.
     pub async fn recv(&self) -> Option<RecvBuf> {
         match &self.inner {
-            PeerInner::Unix { fd, reactor } => reactor.recv(*fd).await,
+            PeerInner::Unix { conn, reactor } => reactor.recv(conn.fd()).await,
             PeerInner::Tls(conn) => conn.recv().await,
         }
     }
@@ -60,7 +63,7 @@ impl Peer {
     /// eviction — means the client is gone).
     pub async fn send_buffer(&self, buf: PooledSendBuf) -> i32 {
         match &self.inner {
-            PeerInner::Unix { fd, reactor } => reactor.send_buffer(*fd, buf).await,
+            PeerInner::Unix { conn, reactor } => reactor.send_buffer(conn.fd(), buf).await,
             PeerInner::Tls(conn) => conn.send_buffer(buf).await,
         }
     }
@@ -70,7 +73,7 @@ impl Peer {
     /// [`Reactor::send_slot`] for why that matters.
     pub async fn send_slot(&self, slot: W2mSlot) -> i32 {
         match &self.inner {
-            PeerInner::Unix { fd, reactor } => reactor.send_slot(*fd, slot).await,
+            PeerInner::Unix { conn, reactor } => reactor.send_slot(conn.fd(), slot).await,
             PeerInner::Tls(conn) => conn.send_slot(slot).await,
         }
     }
@@ -116,14 +119,14 @@ impl Peer {
     /// (see `Reactor::set_max_payload_len`).
     pub fn set_max_payload_len(&self, limit: usize) {
         match &self.inner {
-            PeerInner::Unix { fd, reactor } => reactor.set_max_payload_len(*fd, limit),
+            PeerInner::Unix { conn, reactor } => reactor.set_max_payload_len(conn.fd(), limit),
             PeerInner::Tls(conn) => conn.set_max_payload_len(limit),
         }
     }
 
     pub fn close(&self) {
         match &self.inner {
-            PeerInner::Unix { fd, reactor } => reactor.close_fd(*fd),
+            PeerInner::Unix { conn, reactor } => reactor.close_fd(conn.fd()),
             PeerInner::Tls(conn) => conn.close(),
         }
     }

@@ -650,6 +650,16 @@ mod tests {
         crate::protocol::encode_control_frame(tid, 0, 0, lsn, 0, &[])
     }
 
+    /// 0-RTT lock, client side: early data must stay off, so that once a
+    /// future auth layer gives a session DML authority, replayable early data
+    /// cannot become replayable DML. The server-side half is asserted by
+    /// `zero_rtt_stays_locked_off_server_side` in gnitz-server's `tls::config`.
+    #[test]
+    fn client_config_leaves_zero_rtt_off() {
+        let cfg = build_client_config(&Verify::Insecure, None).expect("client config");
+        assert!(!cfg.enable_early_data, "client 0-RTT early data must be off");
+    }
+
     #[test]
     fn loopback_frame_split_across_two_records() {
         let payload: Vec<u8> = (0u8..=255).cycle().take(3000).collect();

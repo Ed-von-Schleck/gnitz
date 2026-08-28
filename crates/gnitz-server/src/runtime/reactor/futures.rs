@@ -248,24 +248,47 @@ impl Future for RecvFuture {
         let Some(conn) = conns.get_mut(&self.fd) else {
             return Poll::Ready(None);
         };
-        if let Some(buf) = conn.pending.pop_front() {
-            // Ownership of the charged `RecvBuf` passes to the caller; its
-            // `Drop` refunds the global inbound-byte counter once the caller is
-            // done, so the buffer stays accounted for its full residency.
-            return Poll::Ready(Some(buf));
-        }
-        if conn.recv_closed {
-            return Poll::Ready(None);
-        }
-        conn.recv_waiter = Some(cx.waker().clone());
-        Poll::Pending
+        conn.q.poll_recv(cx)
     }
 }
 
 impl Drop for RecvFuture {
     fn drop(&mut self) {
         if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&self.fd) {
-            conn.recv_waiter = None;
+            conn.q.clear_waiter();
+        }
+    }
+}
+
+/// A registered connection's fd, obtainable only by holding it open: while a
+/// `PeerToken` lives `reap_closing_conns` will not retire the fd, so the number
+/// [`Self::fd`] hands out cannot have been recycled to another client. A
+/// skipped reap keeps its `closing_fds` entry, so the next one retires it.
+pub(crate) struct PeerToken {
+    inner: Rc<ReactorShared>,
+    fd: i32,
+}
+
+impl PeerToken {
+    pub(crate) fn new(reactor: &Reactor, fd: i32) -> Self {
+        if let Some(conn) = reactor.inner.conns.borrow_mut().get_mut(&fd) {
+            conn.peer_held = true;
+        }
+        PeerToken {
+            inner: Rc::clone(&reactor.inner),
+            fd,
+        }
+    }
+
+    pub(crate) fn fd(&self) -> i32 {
+        self.fd
+    }
+}
+
+impl Drop for PeerToken {
+    fn drop(&mut self) {
+        if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&self.fd) {
+            conn.peer_held = false;
         }
     }
 }

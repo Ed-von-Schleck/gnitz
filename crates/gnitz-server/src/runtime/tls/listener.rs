@@ -3,6 +3,10 @@
 //! — an unauthenticated public bind is impossible by accident — is the other
 //! half of the rule `config` states, where the CA becomes an mTLS verifier.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
+use super::ConnCountGuard;
 use crate::runtime::posix;
 
 /// TLS listener request from the CLI: the address to bind, optional operator
@@ -18,12 +22,27 @@ pub(crate) struct TlsCli {
 }
 
 /// TLS listener runtime inputs, threaded into `ServerExecutor::run` (hence
-/// `pub(crate)`): the bound listen fd, the rustls config, and the global
-/// live-connection cap.
+/// `pub(crate)`): the bound listen fd, the rustls config, and both halves of
+/// the "live TLS sessions ≤ `max_conns`" invariant. `Rc<Cell<..>>` also makes
+/// this `!Send`, so the single-reactor-thread assumption the count rests on is
+/// checked rather than assumed.
 pub(crate) struct TlsListener {
     pub fd: i32,
     pub cfg: std::sync::Arc<rustls::ServerConfig>,
     pub max_conns: u32,
+    live: Rc<Cell<u32>>,
+}
+
+impl TlsListener {
+    /// Admit one session, or `None` at the cap. Test and increment are one
+    /// call, so there is no window between them and no other way to obtain a
+    /// [`ConnCountGuard`]. The guard's `Drop` decrements.
+    pub(crate) fn admit(&self) -> Option<ConnCountGuard> {
+        if self.live.get() >= self.max_conns {
+            return None;
+        }
+        Some(ConnCountGuard::new(Rc::clone(&self.live)))
+    }
 }
 
 /// Build the rustls server config (minting + persisting the public dev cert
@@ -79,5 +98,6 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsList
         fd: listen_fd,
         cfg: config,
         max_conns: cli.max_conns,
+        live: Rc::new(Cell::new(0)),
     })
 }

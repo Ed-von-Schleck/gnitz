@@ -64,7 +64,7 @@ mod uring;
 use conn::client_send_timeout;
 pub(crate) use conn::guard_client_egress;
 
-pub(crate) use futures::{FsyncFuture, ReplyFuture, ScanLease};
+pub(crate) use futures::{FsyncFuture, PeerToken, ReplyFuture, ScanLease};
 use futures::{ScanRoute, ScanSlotFuture, SendCarry, TimerFuture};
 use park::ParkMap;
 
@@ -193,19 +193,9 @@ struct ReactorShared {
     /// accounting. Boxed so the inline hdr buffer address survives HashMap
     /// resizes — io_uring SQEs capture the pointer.
     conns: RefCell<FxHashMap<i32, Box<io::Conn>>>,
-    /// Global running total of `frame_weight` over every live inbound
-    /// `RecvBuf` — in-flight (`recv_state`), queued for delivery, and any
-    /// handed to a consumer that has not dropped it yet. The OOM guard:
-    /// `HeaderDone` refuses (and closes the connection) any allocation that
-    /// would push this past `global_cap`. `RecvBuf::new` charges it and
-    /// `RecvBuf`'s `Drop` refunds it, so consume, connection reap, and
-    /// task-cancel all reconcile automatically with no hand-maintained
-    /// per-connection shadow. Shared with every `RecvBuf` via `Rc` so the
-    /// counter outlives them all regardless of teardown field-drop order.
-    total_inbound_bytes: Rc<Cell<usize>>,
-    /// Ceiling for `total_inbound_bytes`, resolved once at startup by
-    /// `resolve_inbound_cap`. A plain load on the recv hot path.
-    global_cap: Cell<usize>,
+    /// The OOM guard shared by every connection; its ceiling is resolved once
+    /// at startup by `resolve_inbound_cap`. See [`io::InboundBudget`].
+    inbound: Rc<io::InboundBudget>,
     /// Accept queue: `(conn_fd, listener_fd)` pairs delivered by the kernel
     /// but not yet claimed by an `accept().await` caller. The listener fd
     /// rides the multishot-accept SQE's udata `id` field, so the accept
@@ -353,8 +343,7 @@ impl Reactor {
             next_scan_req_id: Cell::new(SCAN_REQ_ID_BASE),
             next_op_id: Cell::new(1),
             conns: RefCell::new(FxHashMap::default()),
-            total_inbound_bytes: Rc::new(Cell::new(0)),
-            global_cap: Cell::new(resolve_inbound_cap()),
+            inbound: Rc::new(io::InboundBudget::new(resolve_inbound_cap())),
             accept_queue: RefCell::new(VecDeque::new()),
             accept_waker: RefCell::new(None),
             sends: ParkMap::default(),
@@ -824,11 +813,10 @@ impl Reactor {
         self.inner.tasks.borrow().len()
     }
 
-    /// Test-only: lower the inbound-memory cap so cap-trip paths can be
-    /// exercised without allocating gigabytes.
-    #[cfg(test)]
-    pub(super) fn set_inbound_cap(&self, cap: usize) {
-        self.inner.global_cap.set(cap);
+    /// The global inbound-memory budget, shared with every `RecvQueue` and
+    /// every `RecvBuf` it charges.
+    pub(crate) fn inbound(&self) -> &Rc<io::InboundBudget> {
+        &self.inner.inbound
     }
 }
 
@@ -1824,7 +1812,10 @@ mod tests {
         let r = make_reactor();
         let alive: SendAlive = Rc::new(gnitz_engine::storage::batch_pool::PooledSendBuf(vec![0u8; 16]));
         r.inner.sends.open(77, Some((42, Rc::clone(&alive))));
-        r.inner.conns.borrow_mut().insert(42, Box::new(io::Conn::new()));
+        r.inner
+            .conns
+            .borrow_mut()
+            .insert(42, Box::new(io::Conn::new(Rc::clone(&r.inner.inbound))));
         r.inner.conns.borrow_mut().get_mut(&42).unwrap().send_inflight = 1;
 
         r.inject_cqe(KIND_SEND, 77, 16);
@@ -1890,7 +1881,7 @@ mod tests {
         r.register_conn(read_end);
         // Peer EOF: closes the connection and queues it for reaping.
         r.handle_recv_cqe(read_end, 0);
-        assert!(r.inner.conns.borrow().get(&read_end).unwrap().recv_closed);
+        assert!(r.inner.conns.borrow().get(&read_end).unwrap().q.recv_closed());
         r.reap_closing_conns();
         assert!(
             r.inner.conns.borrow().is_empty(),
@@ -1902,8 +1893,8 @@ mod tests {
         r.register_conn(next_read);
         let conns = r.inner.conns.borrow();
         let conn = conns.get(&next_read).expect("registered");
-        assert!(!conn.recv_closed, "a fresh connection must not inherit phantom EOF");
-        assert!(conn.pending.is_empty(), "nor a stale delivery backlog");
+        assert!(!conn.q.recv_closed(), "a fresh connection must not inherit phantom EOF");
+        assert!(conn.q.pending().is_empty(), "nor a stale delivery backlog");
         drop(conns);
         unsafe {
             libc::close(write_end);
@@ -1946,7 +1937,10 @@ mod tests {
             }
         }
         let r: Rc<Reactor> = Rc::new(make_reactor());
-        r.inner.conns.borrow_mut().insert(sender, Box::new(io::Conn::new()));
+        r.inner
+            .conns
+            .borrow_mut()
+            .insert(sender, Box::new(io::Conn::new(Rc::clone(&r.inner.inbound))));
         (r, sender, receiver)
     }
 
@@ -2197,7 +2191,7 @@ mod tests {
             r.set_max_payload_len(read_fd, 1 << 20);
             // frame_weight(100) = 100. Two frames = 200 held; the 3rd frame's
             // header pushes 200 + 100 = 300 > 250 and is refused before malloc.
-            r.set_inbound_cap(250);
+            r.inbound().set_cap(250);
             let payload = vec![0xABu8; 100];
             let mut wire = Vec::new();
             for _ in 0..3 {
@@ -2208,7 +2202,7 @@ mod tests {
             let reaped = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd));
             assert!(reaped, "cap-trip connection was never reaped");
             assert_eq!(
-                r.inner.total_inbound_bytes.get(),
+                r.inbound().held(),
                 0,
                 "reap must subtract the reaped connection's undrained share"
             );
@@ -2232,7 +2226,7 @@ mod tests {
             r.register_conn(read_fd);
             r.set_max_payload_len(read_fd, 1 << 20);
             // Exactly one 10_000-byte in-flight buffer fits.
-            r.set_inbound_cap(10_000);
+            r.inbound().set_cap(10_000);
 
             // Header claims 10_000 bytes but only 100 are delivered: the buffer
             // is malloc'd and counted, yet no frame completes (no MessageDone).
@@ -2241,14 +2235,14 @@ mod tests {
             hdr_and_part.extend_from_slice(&[0x11u8; 100]);
             gnitz_engine::foundation::posix_io::write_all_fd(write_fd, &hdr_and_part).expect("write");
 
-            let counted = poll_until(&r, 10_000, || r.inner.total_inbound_bytes.get() == 10_000);
+            let counted = poll_until(&r, 10_000, || r.inbound().held() == 10_000);
             assert!(counted, "in-flight buffer was not accounted");
             assert!(
                 r.inner
                     .conns
                     .borrow()
                     .get(&read_fd)
-                    .is_none_or(|c| c.pending.is_empty()),
+                    .is_none_or(|c| c.q.pending().is_empty()),
                 "no frame should have completed from a partial payload"
             );
 
@@ -2261,7 +2255,7 @@ mod tests {
             let refused = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd2));
             assert!(refused, "over-cap second connection was not closed");
             // Refused connection allocated nothing; the first buffer is intact.
-            assert_eq!(r.inner.total_inbound_bytes.get(), 10_000);
+            assert_eq!(r.inbound().held(), 10_000);
 
             libc::close(write_fd);
             libc::close(write_fd2); // read_fd2 was closed by reap
@@ -2281,7 +2275,7 @@ mod tests {
         // Cap admits several frames; the pipeline holds ~1 at a time because
         // each frame is popped in the same tick it lands, so 10 frames/round of
         // 1_000-weight traffic (10_000 > cap) never trips.
-        r.set_inbound_cap(5_000);
+        r.inbound().set_cap(5_000);
 
         let payload = vec![0x7Eu8; 1_000]; // frame_weight = 1_000
         for _round in 0..2 {
@@ -2299,7 +2293,7 @@ mod tests {
             });
         }
         assert_eq!(
-            r.inner.total_inbound_bytes.get(),
+            r.inbound().held(),
             0,
             "counter must return to 0 once every frame is consumed"
         );
@@ -2321,7 +2315,7 @@ mod tests {
             r.register_conn(read_fd);
             // 1-byte payloads ≤ HELLO_PRE_HANDSHAKE_LEN (8), so no
             // set_max_payload_len is needed.
-            r.set_inbound_cap(4096);
+            r.inbound().set_cap(4096);
             // 64 frames = 64 × 64 = 4096 held; the 65th frame's header would
             // make 4160 > 4096 and is refused.
             let mut wire = Vec::new();
@@ -2333,9 +2327,114 @@ mod tests {
             let reaped = poll_until(&r, 20_000, || !r.inner.conns.borrow().contains_key(&read_fd));
             assert!(reaped, "tiny-frame flood must trip the cap via the frame_weight floor");
             assert_eq!(
-                r.inner.total_inbound_bytes.get(),
+                r.inbound().held(),
                 0,
                 "reap must reconcile the counter after a tiny-frame trip"
+            );
+
+            libc::close(write_fd); // read_fd was closed by reap
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Per-connection recv policy on the fd path: the pre-HELLO frame
+    // ceiling and the zero-length close sentinel. Both live in
+    // `RecvQueue::deliver`, shared with the TLS transport.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// A first frame larger than the pre-handshake ceiling is refused at its
+    /// header — before any payload byte is allocated — and the connection dies.
+    #[test]
+    fn oversize_first_frame_is_refused_at_the_header() {
+        unsafe {
+            let (read_fd, write_fd) = stream_pair();
+            let r = make_reactor();
+            r.register_conn(read_fd);
+            // No set_max_payload_len: the ceiling is still the 8-byte HELLO
+            // payload size, so a 9-byte frame must be refused.
+            let wire = framed(&[0u8; io::HELLO_PRE_HANDSHAKE_LEN + 1]);
+            gnitz_engine::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
+
+            let reaped = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd));
+            assert!(
+                reaped,
+                "a frame over the per-connection ceiling must close the connection"
+            );
+            assert_eq!(r.inbound().held(), 0, "a refused frame must never have been allocated");
+
+            libc::close(write_fd); // read_fd was closed by reap
+        }
+    }
+
+    /// A zero-length frame is the close sentinel, not a frame: it closes the
+    /// connection instead of completing a message.
+    #[test]
+    fn zero_length_frame_closes_the_connection() {
+        unsafe {
+            let (read_fd, write_fd) = stream_pair();
+            let r = make_reactor();
+            r.register_conn(read_fd);
+            gnitz_engine::foundation::posix_io::write_all_fd(write_fd, &0u32.to_le_bytes()).expect("write");
+
+            let reaped = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd));
+            assert!(reaped, "the zero-length sentinel must close the connection");
+
+            libc::close(write_fd); // read_fd was closed by reap
+        }
+    }
+
+    /// A live `PeerToken` — what `Peer::unix` holds for its whole life — must
+    /// defer the reap. Without it the fd is closed while its `Peer` can still
+    /// name that number, and the kernel may hand it to a freshly-accepted
+    /// client, so the old peer's next send goes into the new client's socket.
+    #[test]
+    fn peer_token_defers_reap_until_it_drops() {
+        unsafe {
+            let (read_fd, write_fd) = stream_pair();
+            let r = make_reactor();
+            r.register_conn(read_fd);
+            let token = PeerToken::new(&r, read_fd);
+
+            // Peer FIN while the token lives: the recv completes with 0, so
+            // nothing is outstanding but the token.
+            libc::close(write_fd);
+            let closing = poll_until(&r, 10_000, || r.inner.closing_fds.borrow().contains(&read_fd));
+            assert!(closing, "peer FIN must mark the connection closing");
+            r.tick(false);
+            assert!(
+                r.inner.conns.borrow().contains_key(&read_fd),
+                "a live PeerToken must defer the reap"
+            );
+
+            drop(token);
+            let reaped = poll_until(&r, 10, || !r.inner.conns.borrow().contains_key(&read_fd));
+            assert!(reaped, "the first reap after the token drops must retire the fd");
+        }
+    }
+
+    /// `close_fd` on a connection whose recv is armed must cancel it, so a
+    /// rejected client that then goes silent does not pin its fd forever.
+    /// The recv SQE is queued but unflushed when `close_fd` runs, which is the
+    /// same-tick ordering the reachable path produces (the HELLO rejection
+    /// closes right after `handle_recv_cqe` re-armed).
+    #[test]
+    fn close_fd_cancels_an_armed_recv_so_a_silent_peer_is_reaped() {
+        unsafe {
+            let (read_fd, write_fd) = stream_pair();
+            let r = make_reactor();
+            r.register_conn(read_fd);
+            assert!(
+                r.inner.conns.borrow().get(&read_fd).unwrap().recv_armed,
+                "register_conn arms the recv"
+            );
+            r.close_fd(read_fd);
+
+            // The peer neither writes nor closes: only the cancellation can
+            // complete the recv.
+            let reaped = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd));
+            assert!(
+                reaped,
+                "close_fd must cancel the armed recv; without it the fd leaks until the peer acts"
             );
 
             libc::close(write_fd); // read_fd was closed by reap
@@ -2730,7 +2829,8 @@ mod tests {
     #[test]
     fn handle_recv_cqe_error_populates_closing_fds() {
         let r = make_reactor();
-        r.inner.conns.borrow_mut().insert(55, Box::new(io::Conn::new()));
+        let conn = Box::new(io::Conn::new(Rc::clone(&r.inner.inbound)));
+        r.inner.conns.borrow_mut().insert(55, conn);
 
         r.inject_cqe(KIND_RECV, 55, -1);
 
@@ -2739,7 +2839,7 @@ mod tests {
             "res<=0 recv CQE must insert fd into closing_fds"
         );
         assert!(
-            r.inner.conns.borrow().get(&55).unwrap().recv_closed,
+            r.inner.conns.borrow().get(&55).unwrap().q.recv_closed(),
             "res<=0 recv CQE must mark the connection closed"
         );
     }
@@ -2750,7 +2850,7 @@ mod tests {
         unsafe {
             let (read_end, write_end) = pipe_pair();
 
-            let mut conn = Box::new(io::Conn::new());
+            let mut conn = Box::new(io::Conn::new(Rc::clone(&r.inner.inbound)));
             conn.closing = true;
             r.inner.conns.borrow_mut().insert(read_end, conn);
             r.inner.closing_fds.borrow_mut().insert(read_end);
@@ -2773,7 +2873,7 @@ mod tests {
     #[test]
     fn reap_closing_conns_defers_conn_with_outstanding_send() {
         let r = make_reactor();
-        let mut conn = Box::new(io::Conn::new());
+        let mut conn = Box::new(io::Conn::new(Rc::clone(&r.inner.inbound)));
         conn.closing = true;
         conn.send_inflight = 1; // outstanding send SQE
         r.inner.conns.borrow_mut().insert(77, conn);
@@ -2792,11 +2892,10 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // RecvState state-machine unit tests.
-    //
-    // io.rs has zero unit tests even though RecvState has four distinct
-    // transitions (NeedMore, HeaderDone, MessageDone, Disconnect).
-    // These tests drive the state machine directly — no io_uring needed.
+    // RecvState state-machine unit tests: its four transitions (NeedMore,
+    // HeaderDone, MessageDone, Disconnect) driven directly, with no io_uring.
+    // The policy `RecvQueue` layers on top is covered by the connection tests
+    // above.
     // ─────────────────────────────────────────────────────────────────
 
     #[test]
@@ -2822,7 +2921,7 @@ mod tests {
         assert!(matches!(rs.advance(4), io::RecvAdvance::HeaderDone));
 
         let buf = unsafe { libc::malloc(8) as *mut u8 };
-        rs.start_payload(io::RecvBuf::new(buf, 8, Rc::new(StdCell::new(0))));
+        rs.start_payload(io::RecvBuf::new(buf, 8, Rc::new(io::InboundBudget::new(usize::MAX))));
 
         // Partial payload.
         assert!(matches!(rs.advance(5), io::RecvAdvance::NeedMore));
@@ -2837,17 +2936,6 @@ mod tests {
         // After take_message the state must be back in header phase.
         let (_, rem) = rs.remaining();
         assert_eq!(rem, 4, "take_message must reset to header phase");
-    }
-
-    #[test]
-    fn recv_state_free_payload_resets_to_header() {
-        let mut rs = io::RecvState::new();
-        let buf = unsafe { libc::malloc(4) as *mut u8 };
-        rs.start_payload(io::RecvBuf::new(buf, 4, Rc::new(StdCell::new(0))));
-        // free_payload drops the RecvBuf (releasing the allocation) and resets.
-        rs.free_payload();
-        let (_, rem) = rs.remaining();
-        assert_eq!(rem, 4, "free_payload must reset to Header{{pos:0}}");
     }
 
     // ─────────────────────────────────────────────────────────────────

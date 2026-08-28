@@ -85,6 +85,16 @@ fn arm_recv(ring: &mut IoUringRing, conn: &mut io::Conn, fd: i32, ptr: *mut u8, 
     conn.recv_armed = true;
 }
 
+/// Cancel [`arm_recv`]'s SQE if one is outstanding — kept adjacent because the
+/// two must address the same udata. The op's `-ECANCELED` lands in
+/// `handle_recv_cqe` as `res < 0`. Cancels the *operation*, not the socket, so
+/// it works for the reactor's non-socket fds too.
+fn cancel_recv(ring: &mut IoUringRing, conn: &io::Conn, fd: i32) {
+    if conn.recv_armed {
+        ring.prep_async_cancel(udata(KIND_RECV, fd as u32 as u64), udata(KIND_CANCEL_SINK, 0));
+    }
+}
+
 impl Reactor {
     /// Attach a listen socket fd and arm its multishot-accept SQE. Callable
     /// once per listener (AF_UNIX + optional TLS); the listener fd rides the
@@ -150,9 +160,9 @@ impl Reactor {
     /// One-shot raw recv into the caller's buffer, resolving with
     /// `(buffer, byte_count)` (≤ 0 = EOF/error). The buffer round-trips so
     /// the caller (the TLS read pump) reuses one allocation forever. The
-    /// socket bytes are undeframed — under TLS they are ciphertext, so the
-    /// fd path's `RecvState` machinery cannot run here; the pump deframes
-    /// the decrypted plaintext itself.
+    /// socket bytes are undeframed — under TLS they are ciphertext, so no
+    /// deframing can run here; the pump feeds its own `RecvQueue` with the
+    /// decrypted plaintext instead.
     pub fn recv_raw(&self, fd: i32, mut buf: Vec<u8>) -> RawRecvFuture {
         let id = self.inner.alloc_op_id();
         // No eager flush: like the fd path's steady-state recv re-arm, the
@@ -178,35 +188,6 @@ impl Reactor {
         self.send_buf_inner(fd, ptr, len, cipher).await
     }
 
-    /// Charge and allocate one inbound frame payload buffer against the
-    /// global inbound-memory cap — the single accounting point shared by the
-    /// fd recv path (`handle_recv_cqe`) and the TLS pump. Charges
-    /// `frame_weight(plen)` at header-parse time, *before* any payload byte
-    /// arrives, so a declared-but-dribbled frame can never accumulate
-    /// uncounted bytes; `None` = cap breach or malloc failure, refused
-    /// before allocation. Intentionally silent: the caller logs (it knows
-    /// the fd).
-    pub(crate) fn alloc_inbound_buf(&self, plen: usize) -> Option<io::RecvBuf> {
-        let w = io::frame_weight(plen);
-        if self.inner.total_inbound_bytes.get() + w > self.inner.global_cap.get() {
-            return None; // refuse before malloc — no overshoot
-        }
-        // SAFETY: plen > 0 (zero-length frames are the close sentinel,
-        // rejected before this call); null is checked below.
-        let pbuf = unsafe { libc::malloc(plen) as *mut u8 };
-        if pbuf.is_null() {
-            return None;
-        }
-        // RecvBuf::new charges frame_weight(plen); its Drop refunds.
-        Some(io::RecvBuf::new(pbuf, plen, Rc::clone(&self.inner.total_inbound_bytes)))
-    }
-
-    /// Held bytes under the global inbound cap (test observability).
-    #[cfg(test)]
-    pub(crate) fn total_inbound_bytes(&self) -> usize {
-        self.inner.total_inbound_bytes.get()
-    }
-
     /// Elevate `fd`'s per-connection payload ceiling. Called after the
     /// HELLO handshake validates a connection. Must run synchronously
     /// before any `.await` inside `connection_loop`: the reactor re-arms
@@ -216,7 +197,7 @@ impl Reactor {
     /// 8-byte value, `handle_recv_cqe` would disconnect the second frame.
     pub fn set_max_payload_len(&self, fd: i32, limit: usize) {
         if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&fd) {
-            conn.max_payload_len = limit;
+            conn.q.set_max_payload_len(limit);
         }
     }
 
@@ -234,15 +215,11 @@ impl Reactor {
                 fd,
             );
         }
-        let conn = conns.entry(fd).or_insert_with(|| Box::new(io::Conn::new()));
-        let hdr_ptr = conn.recv_state.hdr_buf_ptr();
-        arm_recv(
-            &mut self.inner.ring.borrow_mut(),
-            conn,
-            fd,
-            hdr_ptr,
-            gnitz_wire::FRAME_LEN_PREFIX_BYTES as u32,
-        );
+        let conn = conns
+            .entry(fd)
+            .or_insert_with(|| Box::new(io::Conn::new(Rc::clone(&self.inner.inbound))));
+        let (ptr, len) = conn.q.remaining(); // a fresh queue's window is the 4-byte header
+        arm_recv(&mut self.inner.ring.borrow_mut(), conn, fd, ptr, len);
     }
 
     /// Future resolving to the next complete message on `fd` as an owned
@@ -334,27 +311,30 @@ impl Reactor {
         }
     }
 
-    /// Request the reactor close `fd` once all outstanding SQEs
-    /// complete.  Marks the connection as closing; `reap_closing` in
-    /// the tick loop frees the fd when its recv/send slots go quiet.
+    /// Request the reactor close `fd` once nothing can still address it: no
+    /// outstanding SQE and no live `PeerToken`. `reap_closing_conns` does the
+    /// retiring on a later tick.
+    ///
+    /// The recv is cancelled rather than waited out — nothing else would ever
+    /// complete it, so a client that goes silent after being rejected would
+    /// otherwise pin its fd, its `Conn` and any charged `RecvBuf` for as long
+    /// as it stays connected.
     pub fn close_fd(&self, fd: i32) {
         if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&fd) {
             conn.closing = true;
             self.inner.closing_fds.borrow_mut().insert(fd);
+            cancel_recv(&mut self.inner.ring.borrow_mut(), conn, fd);
         }
     }
 
-    /// Mark `conn`/`fd` closing and wake any parked recv waiter (so its
-    /// `recv().await` resolves to `None`). Leaving `recv_armed` false means
-    /// `reap_closing_conns` fires as soon as `send_inflight` reaches 0,
-    /// dropping the whole delivery backlog.
+    /// Mark `conn`/`fd` closing and finish its recv side, waking any parked
+    /// waiter (so its `recv().await` resolves to `None`). Leaving `recv_armed`
+    /// false means `reap_closing_conns` fires as soon as `send_inflight`
+    /// reaches 0 and the `Peer` is gone, dropping the whole delivery backlog.
     fn begin_recv_close(&self, conn: &mut io::Conn, fd: i32) {
         conn.closing = true;
-        conn.recv_closed = true;
+        conn.q.close();
         self.inner.closing_fds.borrow_mut().insert(fd);
-        if let Some(w) = conn.recv_waiter.take() {
-            w.wake();
-        }
     }
 
     pub(super) fn handle_recv_cqe(&self, fd: i32, res: i32) {
@@ -370,59 +350,9 @@ impl Reactor {
             return;
         }
 
-        match conn.recv_state.advance(res as usize) {
-            io::RecvAdvance::NeedMore => {
-                let (buf, len) = conn.recv_state.remaining();
-                arm_recv(&mut self.inner.ring.borrow_mut(), conn, fd, buf, len);
-            }
-            io::RecvAdvance::HeaderDone => {
-                let plen = conn.recv_state.payload_len();
-                if plen > conn.max_payload_len {
-                    self.begin_recv_close(conn, fd);
-                    return;
-                }
-                // `alloc_inbound_buf` charges `frame_weight(plen)` (refunded
-                // by the RecvBuf's `Drop`), refusing before malloc on a cap
-                // breach.
-                let Some(rbuf) = self.alloc_inbound_buf(plen) else {
-                    gnitz_warn!(
-                        "reactor: inbound cap would be exceeded, closing fd={} (held={} B + {} B, cap={} B)",
-                        fd,
-                        self.inner.total_inbound_bytes.get(),
-                        io::frame_weight(plen),
-                        self.inner.global_cap.get(),
-                    );
-                    self.begin_recv_close(conn, fd);
-                    return;
-                };
-                let pbuf = rbuf.ptr;
-                conn.recv_state.start_payload(rbuf);
-                arm_recv(&mut self.inner.ring.borrow_mut(), conn, fd, pbuf, plen as u32);
-            }
-            io::RecvAdvance::MessageDone => {
-                // The charged `RecvBuf` moves from the recv state machine into
-                // the delivery queue; its accounting rides along untouched.
-                let rbuf = conn.recv_state.take_message();
-                conn.pending.push_back(rbuf);
-                // Arm the next header recv immediately so the kernel can keep
-                // draining the client's send buffer. Per-session FIFO is
-                // preserved by the queue order — the handler still consumes
-                // messages in arrival order.
-                let hdr = conn.recv_state.hdr_buf_ptr();
-                arm_recv(
-                    &mut self.inner.ring.borrow_mut(),
-                    conn,
-                    fd,
-                    hdr,
-                    gnitz_wire::FRAME_LEN_PREFIX_BYTES as u32,
-                );
-                if let Some(w) = conn.recv_waiter.take() {
-                    w.wake();
-                }
-            }
-            io::RecvAdvance::Disconnect => {
-                self.begin_recv_close(conn, fd);
-            }
+        match conn.q.deliver(res as usize, fd) {
+            Ok((ptr, len)) => arm_recv(&mut self.inner.ring.borrow_mut(), conn, fd, ptr, len),
+            Err(()) => self.begin_recv_close(conn, fd),
         }
     }
 
