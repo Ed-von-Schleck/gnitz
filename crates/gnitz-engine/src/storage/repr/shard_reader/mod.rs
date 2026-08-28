@@ -11,10 +11,6 @@
 use std::cell::OnceCell;
 
 use super::shard_file::DecodedRegion;
-#[cfg(test)]
-use gnitz_wire::as_le_bytes;
-#[cfg(test)]
-use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le};
 
 mod access;
 mod open;

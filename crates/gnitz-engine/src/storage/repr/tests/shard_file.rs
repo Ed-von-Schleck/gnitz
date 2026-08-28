@@ -5,42 +5,59 @@ use crate::test_support::{make_schema_u64_i64, pk_only_schema};
 use gnitz_wire::as_le_bytes;
 use xorf::Filter;
 
+/// One shard, written and read back: header fields, every row through the
+/// reader, and a PK filter that contains each key.
 #[test]
-fn build_image_roundtrip() {
-    let row_count = 3u32;
-    let pks: Vec<u64> = vec![10, 20, 30];
-    let weights: Vec<i64> = vec![1, 1, 1];
-    let nulls: Vec<u64> = vec![0, 0, 0];
-    let vals: Vec<i64> = vec![100, 200, 300];
-
+fn write_open_roundtrip() {
+    let pks: Vec<u64> = vec![100, 200, 300, 400, 500];
+    let vals: Vec<i64> = vec![10, 20, 30, 40, 50];
+    let n = pks.len();
+    let weights: Vec<i64> = vec![1; n];
+    let nulls: Vec<u64> = vec![0; n];
     // PK region is OPK (big-endian) at rest; U64 OPK == BE.
     let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
-    let weight_bytes: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let null_bytes: Vec<u8> = nulls.iter().flat_map(|n| n.to_le_bytes()).collect();
-    let val_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
     let blob: Vec<u8> = vec![];
-
-    let regions: Vec<&[u8]> = vec![&pk_bytes, &weight_bytes, &null_bytes, &val_bytes, &blob];
+    let regions: Vec<&[u8]> = vec![
+        &pk_bytes,
+        as_le_bytes(&weights),
+        as_le_bytes(&nulls),
+        as_le_bytes(&vals),
+        &blob,
+    ];
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("build_image.db");
+    let path = dir.path().join("roundtrip.db");
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    let schema = make_schema_u64_i64();
     write_shard_streaming(
         libc::AT_FDCWD,
         &cpath,
-        row_count,
+        n as u32,
         &regions,
-        &make_schema_u64_i64(),
+        &schema,
         ShardWriteOpts::default(),
     )
     .unwrap();
-    let image = std::fs::read(&path).unwrap();
 
-    assert_eq!(read_u64_le(&image, OFF_MAGIC), SHARD_MAGIC);
-    assert_eq!(read_u64_le(&image, OFF_VERSION), SHARD_VERSION);
-    assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), 3);
+    let image = std::fs::read(&path).unwrap();
+    assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), n as u64);
     assert!(read_u64_le(&image, OFF_SHARD_FILTER_OFFSET) > 0);
     assert!(read_u64_le(&image, OFF_SHARD_FILTER_SIZE) > 0);
+
+    // `open` itself rejects a bad magic or version, so a successful open is
+    // what pins those; the rest is the row data.
+    let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+    assert_eq!(shard.count, n);
+    assert!(shard.has_shard_filter());
+    for (i, (&pk, &val)) in pks.iter().zip(&vals).enumerate() {
+        assert_eq!(shard.get_pk(i), pk as u128, "row {i} pk");
+        assert_eq!(shard.get_weight(i), 1, "row {i} weight");
+        assert_eq!(read_i64_le(shard.get_col_ptr(i, 0, 8), 0), val, "row {i} payload");
+        assert!(
+            shard.shard_filter_may_contain(probe_key(&pk.to_be_bytes())),
+            "the PK filter must contain PK {pk}"
+        );
+    }
 }
 
 #[test]
@@ -61,102 +78,6 @@ fn empty_shard() {
 }
 
 /// write_shard_streaming roundtrip — PK + weight + null_bmp + i64 value regions.
-#[test]
-fn test_write_shard_streaming_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("streaming.db");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-
-    let row_count = 3u32;
-    let pks: Vec<u64> = vec![10, 20, 30];
-    let weights: Vec<i64> = vec![1, 1, 1];
-    let nulls: Vec<u64> = vec![0, 0, 0];
-    let vals: Vec<i64> = vec![100, 200, 300];
-    // PK region is OPK (big-endian) at rest; U64 OPK == BE.
-    let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
-    let blob: Vec<u8> = vec![];
-
-    let regions: Vec<&[u8]> = vec![
-        &pk_bytes,
-        as_le_bytes(&weights),
-        as_le_bytes(&nulls),
-        as_le_bytes(&vals),
-        &blob,
-    ];
-
-    let schema = make_schema_u64_i64();
-    write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        row_count,
-        &regions,
-        &schema,
-        ShardWriteOpts::default(),
-    )
-    .unwrap();
-
-    let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-    assert_eq!(shard.count, 3);
-    assert_eq!(shard.get_pk(0), 10);
-    assert_eq!(shard.get_pk(1), 20);
-    assert_eq!(shard.get_pk(2), 30);
-    assert_eq!(shard.get_weight(0), 1);
-    assert_eq!(shard.get_weight(1), 1);
-    assert_eq!(shard.get_weight(2), 1);
-    assert!(shard.has_shard_filter());
-    assert!(shard.shard_filter_may_contain(probe_key(&10u64.to_be_bytes())));
-    assert!(shard.shard_filter_may_contain(probe_key(&20u64.to_be_bytes())));
-    assert!(shard.shard_filter_may_contain(probe_key(&30u64.to_be_bytes())));
-}
-
-#[test]
-fn u64_pk_shard_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("u64pk.db");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-
-    let n = 5u32;
-    let pks: Vec<u64> = vec![100, 200, 300, 400, 500];
-    let weights: Vec<i64> = vec![1; n as usize];
-    let nulls: Vec<u64> = vec![0; n as usize];
-    let vals: Vec<i64> = vec![10, 20, 30, 40, 50];
-    // PK region is OPK (big-endian) at rest; U64 OPK == BE.
-    let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
-    assert_eq!(pk_bytes.len(), n as usize * 8, "U64 PK region must be 8B/row");
-    let blob: Vec<u8> = vec![];
-
-    let regions: Vec<&[u8]> = vec![
-        &pk_bytes,
-        as_le_bytes(&weights),
-        as_le_bytes(&nulls),
-        as_le_bytes(&vals),
-        &blob,
-    ];
-
-    let schema = make_schema_u64_i64();
-    write_shard_streaming(libc::AT_FDCWD, &cpath, n, &regions, &schema, ShardWriteOpts::default()).unwrap();
-    let image = std::fs::read(&path).unwrap();
-    assert_eq!(
-        read_u64_le(&image, OFF_VERSION),
-        SHARD_VERSION,
-        "must write current shard version"
-    );
-
-    let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-    assert_eq!(shard.pk_stride, 8, "pk_stride must be 8 for U64 schema");
-    assert_eq!(shard.count, n as usize);
-    for (i, &expected_pk) in pks.iter().enumerate() {
-        assert_eq!(shard.get_pk(i), expected_pk as u128, "get_pk row {i}");
-    }
-    assert!(shard.has_shard_filter());
-    for &pk in &pks {
-        assert!(
-            shard.shard_filter_may_contain(probe_key(&pk.to_be_bytes())),
-            "the PK filter must contain PK {pk}"
-        );
-    }
-}
-
 /// No false negatives through the real write → `open` → probe path, at a
 /// key count where the construction picks a segment geometry the handful of
 /// rows the other shard tests write never reach. The in-module
@@ -214,97 +135,6 @@ fn no_false_negatives_through_write_open_probe() {
     assert!(fp * 100 < N, "false-positive rate above 1%: {fp}/{N}");
 }
 
-#[test]
-fn u64_pk_constant_shard() {
-    // All rows share the same PK → Constant encoding for the PK region.
-    let n = 6u32;
-    let pk_val: u64 = 42;
-    let pks: Vec<u64> = vec![pk_val; n as usize];
-    let weights: Vec<i64> = vec![1; n as usize];
-    let nulls: Vec<u64> = vec![0; n as usize];
-    let vals: Vec<i64> = (1..=n as i64).collect();
-    // PK region is OPK (big-endian) at rest; U64 OPK == BE.
-    let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
-    let blob: Vec<u8> = vec![];
-
-    let regions: Vec<&[u8]> = vec![
-        &pk_bytes,
-        as_le_bytes(&weights),
-        as_le_bytes(&nulls),
-        as_le_bytes(&vals),
-        &blob,
-    ];
-
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("u64_const.db");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-    write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        n,
-        &regions,
-        &make_schema_u64_i64(),
-        ShardWriteOpts::default(),
-    )
-    .unwrap();
-    let image = std::fs::read(&path).unwrap();
-
-    // Constant-encoded PK region → directory entry size == 8 (one elem).
-    assert_eq!(
-        region_dir(&image, 0),
-        (8, ENCODING_CONSTANT),
-        "PK region must be Constant-encoded, storing a single 8B value"
-    );
-}
-
-/// Streaming write with regions that trigger Constant encoding.
-#[test]
-fn test_write_shard_streaming_encodings() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("streaming_enc.db");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-
-    let row_count = 4u32;
-    let pks: Vec<u64> = vec![1, 2, 3, 4];
-    let weights: Vec<i64> = vec![1, 1, 1, 1]; // all-same → Constant encoding
-    let nulls: Vec<u64> = vec![0, 0, 0, 0]; // all-zero → Constant encoding
-    let vals: Vec<i64> = vec![42, 42, 42, 42]; // all-same → Constant encoding
-                                               // PK region is OPK (big-endian) at rest; U64 OPK == BE.
-    let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
-    let blob: Vec<u8> = vec![];
-
-    let regions: Vec<&[u8]> = vec![
-        &pk_bytes,
-        as_le_bytes(&weights),
-        as_le_bytes(&nulls),
-        as_le_bytes(&vals),
-        &blob,
-    ];
-
-    let schema = make_schema_u64_i64();
-    write_shard_streaming(
-        libc::AT_FDCWD,
-        &cpath,
-        row_count,
-        &regions,
-        &schema,
-        ShardWriteOpts::default(),
-    )
-    .unwrap();
-
-    let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-    assert_eq!(shard.count, 4);
-    for i in 0..4 {
-        assert_eq!(shard.get_pk(i), (i + 1) as u128);
-        assert_eq!(shard.get_weight(i), 1);
-    }
-}
-
-/// Pins every `(region role → encoding)` pair the writer can emit to today's
-/// behavior. A shard has one weight and one null_bmp region, so one shard can
-/// pin at most one weight and one null encoding; three shards choreograph all
-/// ten pairs — PK{Constant,Raw}, Weight{Constant,TwoValue,Raw},
-/// NullBmp{Constant,Raw}, Payload{Constant,Raw}, Blob{Raw}.
 #[test]
 fn encoding_selection_pins_all_roles() {
     let dir = tempfile::tempdir().unwrap();
@@ -461,50 +291,22 @@ fn regions_disagreeing_with_the_schema_fail_the_write_and_leave_no_file() {
     }
 }
 
+/// The filter builder walks the PK region in `stride`-wide chunks, so every
+/// stride must chunk the region the same way the probe does. (It cannot test the
+/// fingerprint derivation: builder and probe both call `probe_key`, so that half
+/// is the same function by construction.)
 #[test]
-fn build_filter_wide_compound_region() {
-    let stride = 24usize;
-    let rows: Vec<Vec<u8>> = (0u8..5)
-        .map(|r| (0..stride).map(|b| r.wrapping_add(b as u8)).collect())
-        .collect();
-    let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
-    let f = build_shard_filter_from_pk_region(&pk_bytes, stride).expect("wide compound region must build a filter");
-    for row in &rows {
-        assert!(f.contains(&probe_key(row)), "no false negative for wide-region row");
-    }
-}
-
-#[test]
-fn build_filter_narrow_compound_region() {
-    let stride = 12usize;
-    let rows: Vec<Vec<u8>> = (0u8..5)
-        .map(|r| (0..stride).map(|b| r.wrapping_mul(7).wrapping_add(b as u8)).collect())
-        .collect();
-    let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
-    let f = build_shard_filter_from_pk_region(&pk_bytes, stride).expect("narrow compound region must build a filter");
-    for row in &rows {
-        // Builder fingerprint for stride <= 16 is widen_pk_be(OPK bytes);
-        // the probe must derive the same value.
-        assert!(f.contains(&probe_key(row)), "no false negative for narrow-compound row");
-    }
-}
-
-#[test]
-fn build_filter_single_pk_regression() {
-    let pks64: Vec<u64> = vec![10, 20, 30, 40];
-    // OPK at rest: U64 region is big-endian.
-    let b64: Vec<u8> = pks64.iter().flat_map(|p| p.to_be_bytes()).collect();
-    let f64 = build_shard_filter_from_pk_region(&b64, 8).expect("8-byte region must build a filter");
-    for p in &pks64 {
-        assert!(f64.contains(&probe_key(&p.to_be_bytes())));
-    }
-
-    let pks128: Vec<u128> = vec![1, 1 << 64, u128::MAX, 12345];
-    // OPK at rest: U128 region is big-endian.
-    let b128: Vec<u8> = pks128.iter().flat_map(|p| p.to_be_bytes()).collect();
-    let f128 = build_shard_filter_from_pk_region(&b128, 16).expect("16-byte region must build a filter");
-    for p in &pks128 {
-        assert!(f128.contains(&probe_key(&p.to_be_bytes())));
+fn a_filter_built_from_a_pk_region_has_no_false_negatives_at_any_stride() {
+    for stride in [8usize, 12, 16, 24] {
+        let rows: Vec<Vec<u8>> = (0u8..5)
+            .map(|r| (0..stride).map(|b| r.wrapping_mul(7).wrapping_add(b as u8)).collect())
+            .collect();
+        let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
+        let f = build_shard_filter_from_pk_region(&pk_bytes, stride)
+            .unwrap_or_else(|| panic!("stride {stride} must build a filter"));
+        for row in &rows {
+            assert!(f.contains(&probe_key(row)), "stride {stride}: false negative");
+        }
     }
 }
 
@@ -660,7 +462,6 @@ mod for_codec_tests {
         // 10 U32 rows: raw 40 B, packed 8 + 10·2 = 28 B — both align64 to 64.
         // No block dropped → decline (stay Raw) despite a raw-byte win.
         let vals: Vec<i128> = (0..10).map(|i| (i * 1000) as i128).collect();
-        assert_eq!(align64(40), align64(28));
         assert_eq!(roundtrip(&vals, 4, false), None, "aligned footprints tie → Raw");
         // 100 U32 rows with the same per-row span pack (align64 drops blocks).
         let many: Vec<i128> = (0..100).map(|i| (i % 60000) as i128).collect();

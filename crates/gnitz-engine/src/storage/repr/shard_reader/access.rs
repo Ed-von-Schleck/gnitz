@@ -141,24 +141,6 @@ impl MappedShard {
         }
     }
 
-    /// Test-only u128 oracle that cross-checks `find_lower_bound_bytes` (the
-    /// production path): binary search for the first row where PK >= key.
-    /// Returns `count` if no such row exists.
-    #[cfg(test)]
-    pub(crate) fn find_lower_bound(&self, key: u128) -> usize {
-        let mut lo = 0usize;
-        let mut hi = self.count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.get_pk(mid) < key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
-
     /// The PK region as a [`ColPtr`] view — the addressing source for the OPK
     /// seeks below (via [`ColPtr::row`]) and `to_unified`'s PK column. The base
     /// aliases `self`; keep `self` alive while the view is read (the seek
@@ -185,18 +167,6 @@ impl MappedShard {
         let stride = self.pk_stride as usize;
         let cp = self.pk_col_ptr();
         unsafe { super::super::columnar::seek_advance_to(self.count, stride, cp, key, hint) }
-    }
-
-    /// Test-only u128 oracle (exact-match point lookup) cross-checking the
-    /// production byte path. Returns the row index, or `None` if absent.
-    #[cfg(test)]
-    pub(crate) fn find_row_index(&self, key: u128) -> Option<usize> {
-        let idx = self.find_lower_bound(key);
-        if idx < self.count && self.get_pk(idx) == key {
-            Some(idx)
-        } else {
-            None
-        }
     }
 
     /// Bulk-copy a contiguous slice of rows into an Batch.

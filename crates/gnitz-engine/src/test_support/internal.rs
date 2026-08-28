@@ -32,6 +32,16 @@ pub fn wide_pk_3xu64_schema() -> SchemaDescriptor {
     )
 }
 
+/// A schema with one PK column per type code in `tcs`, plus a single trailing
+/// I64 payload column — the generic PK-shape builder for the merge/sort/OPK
+/// tests, parameterized by the whole key rather than by one named shape.
+pub fn pk_payload_schema(tcs: &[u8]) -> SchemaDescriptor {
+    let mut cols: Vec<SchemaColumn> = tcs.iter().map(|&t| SchemaColumn::new(t, 0)).collect();
+    cols.push(SchemaColumn::new(type_code::I64, 0));
+    let pk: Vec<u32> = (0..tcs.len() as u32).collect();
+    SchemaDescriptor::new(&cols, &pk)
+}
+
 /// An all-PK schema: one column per type code in `types`, every column a PK
 /// column (`pk_indices = 0..n`) and no payload — the generic PK-shape builder
 /// for the OPK encode/compare/route tests.
@@ -85,6 +95,31 @@ pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i
         );
     }
     b.certify_layout(Layout::Consolidated, schema);
+    b
+}
+
+/// Build a batch from raw OPK key bytes, one row per `(pk, weight, payload)`,
+/// with a single non-null I64 payload at slot 0.
+///
+/// The PK is stored verbatim. Every consumer below the encode boundary treats it
+/// as an opaque ordered byte string, so this one builder serves every stride —
+/// which is what keeps a new PK width from growing another near-identical
+/// builder. [`opk_pk`] produces the bytes from native column values.
+pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(&[u8], i64, i64)]) -> Batch {
+    let mut b = Batch::empty_with_schema(schema);
+    b.reserve_rows(rows.len().max(1));
+    for &(pk, w, val) in rows {
+        assert_eq!(
+            pk.len(),
+            schema.pk_stride() as usize,
+            "PK bytes must be exactly one stride wide"
+        );
+        b.extend_pk_bytes(pk);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes());
+        b.count += 1;
+    }
     b
 }
 

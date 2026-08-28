@@ -769,8 +769,9 @@ fn test_merge_and_route_keys_below_first_guard() {
 
     // Verify all keys readable
     for &pk in &[50u64, 100, 150, 250] {
+        let at = shard.find_lower_bound_bytes(&pk.to_be_bytes());
         assert!(
-            shard.find_row_index(pk as u128).is_some(),
+            at < shard.count && shard.get_pk(at) == pk as u128,
             "key {pk} not found in output shard"
         );
     }

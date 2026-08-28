@@ -14,10 +14,6 @@ use std::cmp::Ordering;
 use super::batch::Batch;
 use super::batch_pool::tls_pool;
 use super::columnar::{schema_is_fixedint_nonnull, with_payload_cmp, ColumnarSource};
-// `columnar` as a module path is needed only by the test module's
-// `compare_rows` calls; dispatch uses `with_payload_cmp!`.
-#[cfg(test)]
-use super::columnar;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, pk_width_dispatch, PkSortKey};
 use crate::schema::SchemaDescriptor;
@@ -960,29 +956,6 @@ where
         sink.push_range(&mb_b, jb, n_b);
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// merge_batches: the flush-path entry point (run-set consolidation)
-// ---------------------------------------------------------------------------
-
-/// Full flush merge into a caller-provided writer, against an arena already
-/// sized to the Σ-input upper bound. The production fold path runs the two
-/// kernels itself so it can size the arena to the survivor count instead; this
-/// one-shot form is retained for the merge tests and microbench that pre-size
-/// their writer.
-#[cfg(test)]
-pub(crate) fn merge_batches(batches: &[MemBatch], schema: &SchemaDescriptor, writer: &mut DirectWriter) {
-    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batches.iter().map(|b| b.count).sum());
-    run_merge(batches, schema, |src, row, w| {
-        survivors.push((src as u32, row as u32, w))
-    });
-    let mut cols = Vec::new();
-    let unified: Vec<UnifiedSource> = batches
-        .iter()
-        .map(|b| mem_batch_to_unified(b, schema, &mut cols))
-        .collect();
-    super::scatter::scatter_unified_sources(&unified, &cols, &survivors, writer);
 }
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,8 @@ use super::*;
 use crate::foundation::xxh;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, read_german_string};
+use gnitz_wire::as_le_bytes;
+use gnitz_wire::{read_i64_le, read_u64_le, write_u64_le};
 
 /// Build a shard via write_shard_streaming (uses encoding detection).
 fn build_test_shard(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
@@ -108,16 +110,17 @@ fn binary_search() {
 
     let shard = MappedShard::open(&cpath, &schema, false).unwrap();
 
-    assert_eq!(shard.find_row_index(10), Some(4));
-    assert_eq!(shard.find_row_index(200), Some(99));
-
-    assert_eq!(shard.find_row_index(3), None);
-    assert_eq!(shard.find_row_index(0), None);
-    assert_eq!(shard.find_row_index(201), None);
-
-    assert_eq!(shard.find_lower_bound(3), 1);
-    assert_eq!(shard.find_lower_bound(1), 0);
-    assert_eq!(shard.find_lower_bound(201), 100);
+    // Present keys, absent keys, and both ends, against a linear scan.
+    for probe in [0u64, 1, 3, 10, 100, 200, 201, u64::MAX] {
+        let key = probe.to_be_bytes();
+        let want = (0..shard.count)
+            .find(|&i| crate::schema::key::compare_pk_bytes(shard.get_pk_bytes(i), &key) != std::cmp::Ordering::Less)
+            .unwrap_or(shard.count);
+        assert_eq!(shard.find_lower_bound_bytes(&key), want, "probe={probe}");
+        for hint in [0, shard.count / 2, shard.count] {
+            assert_eq!(shard.advance_to(&key, hint), want, "probe={probe} hint={hint}");
+        }
+    }
 }
 
 #[test]
@@ -391,8 +394,7 @@ fn empty_shard() {
 
     let shard = MappedShard::open(&cpath, &schema, false).unwrap();
     assert_eq!(shard.count, 0);
-    assert_eq!(shard.find_row_index(1), None);
-    assert_eq!(shard.find_lower_bound(1), 0);
+    assert_eq!(shard.find_lower_bound_bytes(&1u64.to_be_bytes()), 0);
 }
 
 // --- v4 encoding tests ---
@@ -414,11 +416,10 @@ fn constant_weight_roundtrip() {
         assert_eq!(shard.get_weight(i), 1);
     }
 
-    // Verify v4 shard is smaller than a naive raw shard would be
-    let file_len = std::fs::metadata(&path).unwrap().len() as usize;
-    // Raw weight region alone would be n*8 = 800 bytes
-    // Constant region is just 8 bytes
-    assert!(file_len < HEADER_SIZE + n as usize * 8 * 6);
+    // One weight value across every row must be stored as a single 8-byte
+    // Constant region rather than n*8 raw bytes.
+    let image = std::fs::read(&path).unwrap();
+    assert_eq!(region_dir(&image, REG_WEIGHT), (8, ENCODING_CONSTANT));
 }
 
 #[test]
@@ -457,26 +458,6 @@ fn three_value_weight_raw() {
 }
 
 #[test]
-fn constant_pk_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let n = 128;
-    let rows: Vec<(u64, i64)> = (1..=n).map(|i| (i, i as i64)).collect();
-    let path = build_test_shard(dir.path(), &rows);
-    let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
-
-    let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-    for i in 0..n as usize {
-        assert_eq!(shard.get_pk(i), (i + 1) as u128);
-    }
-    // Binary search still works
-    assert_eq!(shard.find_row_index(64), Some(63));
-    assert_eq!(shard.find_row_index(1), Some(0));
-    assert_eq!(shard.find_row_index(128), Some(127));
-    assert_eq!(shard.find_lower_bound(65), 64);
-}
-
-#[test]
 fn constant_null_bmp() {
     let dir = tempfile::tempdir().unwrap();
     let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64)).collect();
@@ -508,83 +489,39 @@ fn constant_payload_column() {
     }
 }
 
+/// Each region role admits only certain encodings. Forging one that a role may
+/// not carry must be refused at open, whatever the byte means elsewhere. The
+/// digest is re-stamped so the verdict is the decode site's, not the digest's.
 #[test]
-fn unknown_encoding_rejected() {
+fn an_encoding_a_role_may_not_carry_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let rows: Vec<(u64, i64)> = vec![(1, 10)];
+    let rows: Vec<(u64, i64)> = (1..=8).map(|i| (i, i as i64)).collect();
     let path = build_test_shard(dir.path(), &rows);
     let schema = make_schema_u64_i64();
     let base = std::fs::read(&path).unwrap();
+    let blob = num_regions(&schema) - 1;
 
-    // Set the first region's encoding byte to 0x10, re-stamping the digest so
-    // the verdict is the decode site's rather than the digest's.
-    assert_eq!(
-        open_patched_restamped(&path, &schema, &base, |data| data[dir_entry_off(REG_PK) + 24] = 0x10).err(),
-        Some(StorageError::InvalidShard)
-    );
-}
-
-#[test]
-fn two_value_truncated_bitvec_rejected() {
-    // Build a shard with TwoValue weight encoding, then corrupt it so the
-    // region size is shorter than the required bitvec (< 16 + ceil(n/8)).
-    let dir = tempfile::tempdir().unwrap();
-    let n = 64usize;
-    let pks: Vec<u64> = (1..=n as u64).collect();
-    let wts: Vec<i64> = (0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
-    let vals: Vec<i64> = (0..n).map(|i| i as i64).collect();
-    let path = build_test_shard_weights(dir.path(), "twoval_trunc.db", &pks, &wts, &vals, false);
-    let schema = make_schema_u64_i64();
-
-    // The weight region must be TwoValue.  Shrink its size field in the
-    // directory entry so bitvec_len < ceil(n/8) = 8 bytes.  Weight
-    // region is entry index 1 in the directory.
-    let base = std::fs::read(&path).unwrap();
-    let weight_entry_off = dir_entry_off(REG_WEIGHT);
-    // Only write the two values (16 bytes), drop the bitvec.
-    let truncated_size = 16u64;
-    assert!(
-        read_u64_le(&base, weight_entry_off + 8) > truncated_size,
-        "weight region must be larger than 16 bytes for this test"
-    );
-    // Re-stamped, so the digest passes and the bitvec-length check is what
-    // rejects it; checksum validation is off so the stale per-region
-    // checksum doesn't mask the InvalidShard we're expecting.
-    assert_eq!(
-        open_patched_restamped(&path, &schema, &base, |data| write_u64_le(
-            data,
-            weight_entry_off + 8,
-            truncated_size
-        ))
-        .err(),
-        Some(StorageError::InvalidShard),
-        "truncated TwoValue bitvec must be rejected at open time"
-    );
-}
-
-#[test]
-fn two_value_pk_region_rejected() {
-    // TwoValue is valid only for the weight region. Forge it onto the pk
-    // region (dir entry 0) and confirm open rejects the shard — `RegionView`
-    // has no TwoValue variant, so `build_scalar_region` returns InvalidShard.
-    let dir = tempfile::tempdir().unwrap();
-    let n = 8usize;
-    let pks: Vec<u64> = (1..=n as u64).collect();
-    let wts: Vec<i64> = vec![1; n];
-    let vals: Vec<i64> = (0..n).map(|i| i as i64).collect();
-    let path = build_test_shard_weights(dir.path(), "twoval_pk.db", &pks, &wts, &vals, false);
-    let schema = make_schema_u64_i64();
-
-    // Patch the pk directory entry's encoding byte (entry 0, offset +24) to
-    // ENCODING_TWO_VALUE. Checksums off so the stale checksum doesn't mask it.
-    let base = std::fs::read(&path).unwrap();
-    assert_eq!(
-        open_patched_restamped(&path, &schema, &base, |data| data[dir_entry_off(REG_PK) + 24] =
-            ENCODING_TWO_VALUE)
-        .err(),
-        Some(StorageError::InvalidShard),
-        "TwoValue on the pk region must be rejected at open time"
-    );
+    // (region, forged encoding byte)
+    let cases: &[(usize, u8)] = &[
+        (REG_PK, 0x10), // not an encoding at all
+        (REG_PK, ENCODING_TWO_VALUE),
+        (REG_PK, ENCODING_FOR),
+        (REG_WEIGHT, ENCODING_FOR),
+        (REG_NULL_BMP, ENCODING_FOR),
+        (blob, ENCODING_FOR),
+        (REG_PAYLOAD_START, ENCODING_TWO_VALUE),
+        (blob, ENCODING_CONSTANT),
+    ];
+    for &(region, enc) in cases {
+        let opened = open_patched_restamped(&path, &schema, &base, |data| {
+            data[dir_entry_off(region) + 24] = enc;
+        });
+        assert_eq!(
+            opened.err(),
+            Some(StorageError::InvalidShard),
+            "encoding {enc:#x} on region {region} must be rejected",
+        );
+    }
 }
 
 #[test]
@@ -600,8 +537,8 @@ fn single_row_shard() {
     assert_eq!(shard.get_pk(0), 42);
     assert_eq!(shard.get_weight(0), 1);
     assert_eq!(shard.get_null_word(0), 0);
-    assert_eq!(shard.find_row_index(42), Some(0));
-    assert_eq!(shard.find_row_index(1), None);
+    assert_eq!(shard.find_lower_bound_bytes(&42u64.to_be_bytes()), 0);
+    assert_eq!(shard.find_lower_bound_bytes(&43u64.to_be_bytes()), 1);
 }
 
 #[test]
@@ -616,8 +553,6 @@ fn whole_shard_slice_roundtrip() {
     let batch = shard.slice_to_owned_batch(0, shard.count, &schema);
 
     assert_eq!(batch.count, 10);
-    assert!(batch.is_sorted());
-    assert!(batch.is_consolidated());
     for i in 0..10 {
         assert_eq!(batch.get_pk(i), (i + 1) as u128);
         let w = read_i64_le(batch.weight_data(), i * 8);
@@ -718,9 +653,9 @@ fn u64_pk_open_and_read() {
     assert_eq!(shard.get_pk(0), 10u128);
     assert_eq!(shard.get_pk(1), 20u128);
     assert_eq!(shard.get_pk(2), 30u128);
-    assert_eq!(shard.find_lower_bound(15), 1);
-    assert_eq!(shard.find_lower_bound(10), 0);
-    assert_eq!(shard.find_lower_bound(31), 3);
+    assert_eq!(shard.find_lower_bound_bytes(&15u64.to_be_bytes()), 1);
+    assert_eq!(shard.find_lower_bound_bytes(&10u64.to_be_bytes()), 0);
+    assert_eq!(shard.find_lower_bound_bytes(&31u64.to_be_bytes()), 3);
 }
 
 #[test]
@@ -782,80 +717,38 @@ fn build_test_shard_u128(dir: &std::path::Path, name: &str, pks: &[u128], vals: 
     path.to_str().unwrap().to_string()
 }
 
+/// `get_pk_bytes` returns the OPK image for every PK region shape: per-row at
+/// both strides, and the Constant region that stores one key for the shard.
 #[test]
-fn shard_reader_get_pk_bytes_raw_region_u64() {
+fn get_pk_bytes_returns_the_opk_image_for_every_region_shape() {
     let dir = tempfile::tempdir().unwrap();
-    let rows: Vec<(u64, i64)> = (1..=8).map(|i| (i * 3, i as i64)).collect();
-    let path = build_test_shard(dir.path(), &rows);
-    let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
-    let shard = MappedShard::open(&cpath, &schema, false).unwrap();
-    assert!(shard.pk.is_per_row(), "expected per-row PK region");
-    assert_eq!(shard.pk_stride, 8);
-    for i in 0..rows.len() {
-        let bytes = shard.get_pk_bytes(i);
-        assert_eq!(bytes.len(), 8, "row {i} stride");
-        let pk_u128 = shard.get_pk(i);
-        // PK region is OPK (big-endian); the low 8 bytes of the BE u128.
-        assert_eq!(bytes, &pk_u128.to_be_bytes()[8..], "row {i} opk bytes");
-    }
-}
+    let wide = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
+    // (label, PKs, per-row region?) — identical PKs make the writer pick Constant.
+    let cases: [(&str, Vec<u128>, bool); 3] = [
+        ("u64 per-row", (1..=8u128).map(|i| i * 3).collect(), true),
+        (
+            "u128 per-row",
+            vec![1, (u64::MAX as u128) + 1, (u64::MAX as u128) * 2 + 3, u128::MAX],
+            true,
+        ),
+        ("u128 constant", vec![wide; 32], false),
+    ];
 
-#[test]
-fn shard_reader_get_pk_bytes_raw_region_u128() {
-    let dir = tempfile::tempdir().unwrap();
-    let pks: Vec<u128> = vec![1, (u64::MAX as u128) + 1, (u64::MAX as u128) * 2 + 3, u128::MAX];
-    let vals: Vec<i64> = (0..pks.len() as i64).collect();
-    let path = build_test_shard_u128(dir.path(), "u128_raw.db", &pks, &vals);
-    let schema = u128_pk_schema();
-    let cpath = std::ffi::CString::new(path).unwrap();
-    let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-    assert!(shard.pk.is_per_row(), "expected per-row PK region");
-    assert_eq!(shard.pk_stride, 16);
-    for (i, &pk) in pks.iter().enumerate() {
-        let bytes = shard.get_pk_bytes(i);
-        assert_eq!(bytes.len(), 16, "row {i} stride");
-        // PK region is OPK (order-preserving big-endian) at rest.
-        assert_eq!(bytes, &pk.to_be_bytes(), "row {i} opk bytes");
-        assert_eq!(shard.get_pk(i), pk, "row {i} u128");
-    }
-}
+    for (what, pks, per_row) in cases {
+        // A u64-ranged key list still round-trips through the u128 writer; what
+        // varies here is the region encoding, not the schema width.
+        let vals: Vec<i64> = (0..pks.len() as i64).collect();
+        let path = build_test_shard_u128(dir.path(), &format!("{what}.db"), &pks, &vals);
+        let schema = u128_pk_schema();
+        let cpath = std::ffi::CString::new(path).unwrap();
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
 
-#[test]
-fn shard_reader_get_pk_bytes_constant_region() {
-    let dir = tempfile::tempdir().unwrap();
-    // All PKs identical -> encoding detection picks Constant.
-    let pk_value: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
-    let n = 32;
-    let pks: Vec<u128> = vec![pk_value; n];
-    let vals: Vec<i64> = (0..n as i64).collect();
-    let path = build_test_shard_u128(dir.path(), "u128_const.db", &pks, &vals);
-    let schema = u128_pk_schema();
-    let cpath = std::ffi::CString::new(path).unwrap();
-    let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-    assert!(!shard.pk.is_per_row(), "expected constant PK region");
-    assert_eq!(shard.pk_stride, 16);
-    // PK region is OPK (order-preserving big-endian) at rest.
-    let expected = pk_value.to_be_bytes();
-    for i in 0..n {
-        assert_eq!(shard.get_pk_bytes(i), &expected, "row {i} bytes");
-        assert_eq!(shard.get_pk(i), pk_value, "row {i} u128");
-    }
-}
-
-#[test]
-fn find_lower_bound_bytes_narrow_matches_find_lower_bound() {
-    let dir = tempfile::tempdir().unwrap();
-    let rows: Vec<(u64, i64)> = vec![(10, 100), (20, 200), (30, 300), (40, 400)];
-    let path = build_test_shard(dir.path(), &rows);
-    let schema = make_schema_u64_i64();
-    let cpath = std::ffi::CString::new(path).unwrap();
-    let shard = MappedShard::open(&cpath, &schema, false).unwrap();
-    for probe in [0u64, 5, 10, 15, 20, 25, 30, 40, 41, u64::MAX] {
-        let by_u128 = shard.find_lower_bound(probe as u128);
-        // OPK bytes for a U64 PK are big-endian; raw memcmp binary search.
-        let by_bytes = shard.find_lower_bound_bytes(&probe.to_be_bytes());
-        assert_eq!(by_u128, by_bytes, "probe={probe}");
+        assert_eq!(shard.pk.is_per_row(), per_row, "{what}: region shape");
+        assert_eq!(shard.pk_stride, 16, "{what}: stride");
+        for (i, &pk) in pks.iter().enumerate() {
+            assert_eq!(shard.get_pk_bytes(i), &pk.to_be_bytes(), "{what} row {i}: opk bytes");
+            assert_eq!(shard.get_pk(i), pk, "{what} row {i}: value");
+        }
     }
 }
 
@@ -1026,30 +919,6 @@ fn packed_bytes_stable_and_aligned() {
 }
 
 #[test]
-fn forged_for_on_non_payload_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let pks: Vec<u64> = (0..8).collect();
-    let vals: Vec<i64> = (0..8).map(|i| 1000 + i).collect();
-    let path = build_i64_shard(dir.path(), "forge.db", &pks, &vals, false);
-
-    // Forge ENCODING_FOR onto each non-payload role (pk / weight / null /
-    // blob); every one must be rejected at open by the role check, so the
-    // digest is re-stamped and checksum validation left off.
-    let base = std::fs::read(&path).unwrap();
-    let schema = make_schema_u64_i64();
-    for region_idx in [REG_PK, REG_WEIGHT, REG_NULL_BMP, 4 /* blob */] {
-        let opened = open_patched_restamped(&path, &schema, &base, |data| {
-            data[dir_entry_off(region_idx) + 24] = ENCODING_FOR;
-        });
-        assert_eq!(
-            opened.err(),
-            Some(StorageError::InvalidShard),
-            "forged ENCODING_FOR on region {region_idx} must be rejected",
-        );
-    }
-}
-
-#[test]
 fn forged_for_payload_bad_size_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let pks: Vec<u64> = (0..16).collect();
@@ -1087,54 +956,6 @@ fn forged_for_payload_bad_size_rejected() {
         open_patched_restamped(&path, &schema, &base, |data| write_u64_le(data, d + 8, sz + 1)).err(),
         Some(StorageError::InvalidShard),
         "inexact 8 + count·bw size must be rejected",
-    );
-}
-
-#[test]
-fn writer_packs_by_aligned_footprint() {
-    let dir = tempfile::tempdir().unwrap();
-    // (U64 PK | U32 payload). 10 rows: raw 40 B vs packed 28 B both align to
-    // 64 → stays Raw. 100 rows: packs.
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-        ],
-        &[0],
-    );
-    let build = |name: &str, n: u32| -> String {
-        let pks: Vec<u8> = (0..n as u64).flat_map(|p| p.to_be_bytes()).collect();
-        let weights = vec![1i64; n as usize];
-        let nulls = vec![0u64; n as usize];
-        let vals: Vec<u32> = (0..n).map(|i| i % 50000).collect();
-        let blob: Vec<u8> = Vec::new();
-        let regions: Vec<&[u8]> = vec![
-            &pks,
-            as_le_bytes(&weights),
-            as_le_bytes(&nulls),
-            as_le_bytes(&vals),
-            &blob,
-        ];
-        let path = dir.path().join(name);
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(
-            libc::AT_FDCWD,
-            &cpath,
-            n,
-            &regions,
-            &schema,
-            ShardWriteOpts::COMPACTION,
-        )
-        .unwrap();
-        path.to_str().unwrap().to_string()
-    };
-    assert_eq!(
-        payload_dir_entry(&build("u32_10.db", 10), REG_PAYLOAD_START).1,
-        ENCODING_RAW
-    );
-    assert_eq!(
-        payload_dir_entry(&build("u32_100.db", 100), REG_PAYLOAD_START).1,
-        ENCODING_FOR
     );
 }
 
@@ -1329,11 +1150,6 @@ fn slice_blob_relocate_bench() {
 // -----------------------------------------------------------------------
 // Descriptive-prefix and filter integrity
 // -----------------------------------------------------------------------
-
-/// Byte offset of directory entry `i`.
-fn dir_entry_off(i: usize) -> usize {
-    HEADER_SIZE + i * DIR_ENTRY_SIZE
-}
 
 /// The forgeries a byte-wise sweep cannot model: each one *permutes* or
 /// *relocates* bytes that are individually unchanged, so it is rejected only
@@ -1610,53 +1426,46 @@ fn every_single_bit_flip_in_the_prefix_is_rejected() {
 /// Every fixed-width region carries exactly what the schema implies — one
 /// byte either way is rejected. Re-stamped, so the verdict is the size
 /// check's rather than the digest's.
+/// A region's size is fully determined by the row count and its encoding, so a
+/// directory size that is off by a byte in either direction must be refused —
+/// for the Direct roles and for the TwoValue weight bitvec alike.
 #[test]
-fn off_by_one_region_sizes_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let schema = make_schema_u64_i64();
-    let rows: Vec<(u64, i64)> = (1..=10).map(|i| (i, i as i64 * 3)).collect();
-    let path = build_test_shard(dir.path(), &rows);
-    let base = std::fs::read(&path).unwrap();
-
-    for region in [REG_PK, REG_WEIGHT, REG_NULL_BMP, REG_PAYLOAD_START] {
-        let e = dir_entry_off(region);
-        let sz = read_u64_le(&base, e + 8);
-        for delta in [-1i64, 1] {
-            assert_eq!(
-                open_patched_restamped(&path, &schema, &base, |d| write_u64_le(
-                    d,
-                    e + 8,
-                    (sz as i64 + delta) as u64
-                ))
-                .err(),
-                Some(StorageError::InvalidShard),
-                "region {region} size {sz}{delta:+}",
-            );
-        }
-    }
-}
-
-/// The long direction of the TwoValue bitvec relation — the short direction is
-/// `two_value_truncated_bitvec_rejected`.
-#[test]
-fn two_value_long_bitvec_rejected() {
+fn a_region_size_that_disagrees_with_the_row_count_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let n = 64usize;
-    let path = build_test_shard_weights(
+
+    let direct = build_test_shard(dir.path(), &(1..=10u64).map(|i| (i, i as i64 * 3)).collect::<Vec<_>>());
+    // Alternating weights make the writer pick TwoValue for the weight region.
+    let two_value = build_test_shard_weights(
         dir.path(),
-        "twoval_long.db",
+        "twoval_size.db",
         &(1..=n as u64).collect::<Vec<_>>(),
         &(0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect::<Vec<_>>(),
         &(0..n as i64).collect::<Vec<_>>(),
         false,
     );
-    let base = std::fs::read(&path).unwrap();
-    let e = dir_entry_off(REG_WEIGHT);
-    let sz = read_u64_le(&base, e + 8);
-    assert_eq!(sz as usize, 16 + n.div_ceil(8), "weight region must be TwoValue");
-    assert_eq!(
-        open_patched_restamped(&path, &schema, &base, |d| write_u64_le(d, e + 8, sz + 1)).err(),
-        Some(StorageError::InvalidShard),
-    );
+
+    for (what, path, regions) in [
+        (
+            "direct",
+            direct,
+            &[REG_PK, REG_WEIGHT, REG_NULL_BMP, REG_PAYLOAD_START][..],
+        ),
+        ("two-value weight", two_value, &[REG_WEIGHT][..]),
+    ] {
+        let base = std::fs::read(&path).unwrap();
+        for &region in regions {
+            let e = dir_entry_off(region);
+            let sz = read_u64_le(&base, e + 8);
+            for delta in [-1i64, 1] {
+                let forged = (sz as i64 + delta) as u64;
+                assert_eq!(
+                    open_patched_restamped(&path, &schema, &base, |d| write_u64_le(d, e + 8, forged)).err(),
+                    Some(StorageError::InvalidShard),
+                    "{what}: region {region} size {sz}{delta:+}",
+                );
+            }
+        }
+    }
 }

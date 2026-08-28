@@ -874,14 +874,6 @@ impl Batch {
         self.extend_pk_bytes(crate::schema::key::encode_leading_opk(cols, native_col_vals).pk_bytes());
     }
 
-    /// Iterate PKs as `u128`. Test-only (the only caller is a batch round-trip
-    /// test); production reads PK regions as OPK bytes via `get_pk_bytes`.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn pk_iter(&self) -> impl Iterator<Item = u128> + '_ {
-        (0..self.count).map(|row| self.get_pk(row))
-    }
-
     /// Fill `nbytes` of zeros at the current row position in a payload column.
     #[inline]
     pub fn fill_col_zero(&mut self, pi: usize, nbytes: usize) {
@@ -1830,34 +1822,11 @@ impl Batch {
         (0..self.num_regions_total()).map(|i| self.region_slice(i)).collect()
     }
 
-    /// Append a single row from any ColumnarSource with blob deduplication.
+    /// Append `source[row]` under a raw-OPK-bytes key, with blob deduplication.
     ///
-    /// Pass `None` for `blob_cache` when the schema has no STRING columns or
-    /// when cross-row dedup isn't worth the bookkeeping. Pass `Some(...)` to
-    /// dedup repeated source long-string spans into a single destination copy.
-    ///
-    /// Takes a **native** `u128` PK. The FK check-batch filter now keys on
-    /// verbatim OPK bytes (`append_row_from_source_bytes`), so this native entry
-    /// point has no production caller and is retained only for unit tests.
-    #[cfg(test)]
-    pub(crate) fn append_row_from_source<S: RowSource>(
-        &mut self,
-        key: u128,
-        weight: i64,
-        source: &S,
-        row: usize,
-        blob_cache: Option<&mut BlobCache>,
-    ) {
-        if weight == 0 {
-            return;
-        }
-        self.ensure_row_capacity();
-        self.extend_pk(key);
-        self.append_row_tail_from_source(weight, source, row, blob_cache);
-    }
-
-    /// Raw-PK-bytes counterpart of [`append_row_from_source`], for wide
-    /// (`pk_stride > 16`) PKs where `extend_pk` would panic. `pk_bytes` must be
+    /// Pass `None` for `blob_cache` when the schema has no STRING columns or when
+    /// cross-row dedup isn't worth the bookkeeping; `Some(..)` dedups repeated
+    /// source long-string spans into one destination copy. `pk_bytes` must be
     /// exactly `pk_stride` bytes (asserted by `extend_pk_bytes`). Also valid for
     /// narrow PKs — the only difference from the `u128` entry point is how the
     /// PK region is written.
