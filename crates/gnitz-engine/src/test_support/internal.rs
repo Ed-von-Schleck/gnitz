@@ -12,10 +12,10 @@ use proptest::prelude::*;
 
 use crate::schema::key::{compare_pk_bytes, encode_leading_opk};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, Layout};
+use crate::storage::{Batch, Layout, ReadCursor};
 use gnitz_wire::type_code;
 
-use super::shared::{arb_type_code, col_def, pk_i64_schema, u64_pk_schema};
+use super::shared::{arb_type_code, col_def, payload_slot_width, pk_i64_schema, u64_pk_schema};
 use crate::catalog::ColumnDef;
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
@@ -108,6 +108,7 @@ pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i
 pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(&[u8], i64, i64)]) -> Batch {
     let mut b = Batch::empty_with_schema(schema);
     b.reserve_rows(rows.len().max(1));
+    let width = payload_slot_width(schema);
     for &(pk, w, val) in rows {
         assert_eq!(
             pk.len(),
@@ -117,10 +118,16 @@ pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(&[u8], i64, i64)]) -> 
         b.extend_pk_bytes(pk);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes()[..width]);
         b.count += 1;
     }
     b
+}
+
+/// A [`ReadCursor`] over one in-memory batch: the integral an operator reads
+/// back as `z⁻¹(I(X))`, the shape every delta-against-trace unit test wants.
+pub fn trace_cursor(batch: Batch, schema: SchemaDescriptor) -> ReadCursor {
+    ReadCursor::over_batches(&[std::rc::Rc::new(batch)], schema)
 }
 
 /// Build a one-row `Batch` from OPK-encoded `pk` bytes (see [`opk_pk`]), DBSP
@@ -259,4 +266,51 @@ pub fn fk_def(name: &str, type_code: u8, parent_tid: i64, parent_col: u32) -> Co
         fk_col_idx: parent_col,
         ..col_def(name, type_code)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Z-Set reduction
+// ---------------------------------------------------------------------------
+
+/// A row's logical identity: its PK bytes plus one entry per payload column.
+pub type RowKey = (Vec<u8>, Vec<Option<Vec<u8>>>);
+
+/// Reduce a row to its logical identity. NULL is `None`, distinct from an empty
+/// string `Some(vec![])` — keeping the raw null word out of the key, so its
+/// non-load-bearing unused bits cannot cause a spurious mismatch while every
+/// meaningful null bit is still reflected. STRING / BLOB cells are **decoded**:
+/// the 16-byte German-string struct embeds a blob offset, so two batches holding
+/// the same logical string carry different struct bytes.
+pub fn row_key(batch: &Batch, schema: &SchemaDescriptor, row: usize) -> RowKey {
+    let nw = batch.get_null_word(row);
+    let vals = schema
+        .payload_columns()
+        .map(|(pi, col)| {
+            if gnitz_wire::null_word_get(nw, pi) {
+                return None;
+            }
+            let cs = col.size() as usize;
+            let raw = batch.get_col_ptr(row, pi, cs);
+            Some(if gnitz_wire::is_german_string(col.type_code) {
+                let st: [u8; 16] = raw.try_into().unwrap();
+                gnitz_wire::try_decode_german_string(&st, &batch.blob).unwrap()
+            } else {
+                raw.to_vec()
+            })
+        })
+        .collect();
+    (batch.get_pk_bytes(row).to_vec(), vals)
+}
+
+/// The batch as the Z-Set it denotes: `Σ weight` per logical row identity, with
+/// the net-zero entries dropped. Emission order and the physical encoding of a
+/// string both drop out, which is what lets two independently produced batches
+/// be compared.
+pub fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> std::collections::HashMap<RowKey, i64> {
+    let mut z: std::collections::HashMap<RowKey, i64> = std::collections::HashMap::new();
+    for row in 0..batch.count {
+        *z.entry(row_key(batch, schema, row)).or_insert(0) += batch.get_weight(row);
+    }
+    z.retain(|_, w| *w != 0);
+    z
 }

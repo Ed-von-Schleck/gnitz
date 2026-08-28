@@ -165,7 +165,3 @@ pub(crate) fn op_integrate_with_indexes(
 
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "tests/index.rs"]
-mod tests;

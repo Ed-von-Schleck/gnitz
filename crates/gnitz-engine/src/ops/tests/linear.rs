@@ -1,26 +1,59 @@
 use super::*;
+use crate::schema::type_code;
 use crate::test_support::{
-    make_batch, make_batch_bytes, make_batch_i64pk, make_schema_i64pk_i64, make_schema_pk_u64_payload_string,
-    make_schema_u64_i64, make_wide_batch, opk_pk, wide_pk_3xu64_schema,
+    make_batch, make_batch_bytes, make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string,
+    make_schema_u64_i64, opk_pk, pk_payload_schema,
 };
+use gnitz_wire::read_i64_le;
 
-fn get_payload_i64(b: &Batch, row: usize) -> i64 {
-    gnitz_wire::read_i64_le(b.col_data(0), row * 8)
+/// A union case row: an index into the shape's key list, a weight, and a payload.
+type Rows = &'static [(usize, i64, i64)];
+
+/// The PK-shape axis of the union merge: the schema's PK column types, and the
+/// eight key values a case row's index selects. Only the last PK column varies —
+/// the leading ones stay zero — so the key order is the index order at every
+/// stride, and the signed shape puts negatives below zero.
+const SHAPES: [(&[u8], [i128; 8]); 4] = [
+    (&[type_code::U64], [0, 1, 2, 3, 4, 5, 6, 7]),
+    (
+        &[type_code::U64, type_code::U64, type_code::U64],
+        [0, 1, 2, 3, 4, 5, 6, 7],
+    ),
+    (
+        &[type_code::U64, type_code::U16, type_code::U8],
+        [0, 1, 2, 3, 4, 5, 6, 7],
+    ),
+    (&[type_code::I64], [-4, -3, -2, -1, 0, 1, 2, 3]),
+];
+
+/// The OPK key a case row's index names: `keys[i]` in the schema's last PK
+/// column, the earlier ones zero.
+fn key_of(schema: &SchemaDescriptor, keys: &[i128; 8], i: usize) -> Vec<u8> {
+    let n = schema.pk_columns().count();
+    let mut vals = vec![0u128; n];
+    vals[n - 1] = keys[i] as u128;
+    opk_pk(schema, &vals)
 }
 
-// -----------------------------------------------------------------------
-// Union merge sort-invariant tests
-// -----------------------------------------------------------------------
+/// A `Consolidated` batch over `schema` from case rows, which must already be in
+/// (PK, payload) order.
+fn batch(schema: &SchemaDescriptor, keys: &[i128; 8], rows: Rows) -> Batch {
+    let pks: Vec<Vec<u8>> = rows.iter().map(|&(i, ..)| key_of(schema, keys, i)).collect();
+    let opk: Vec<(&[u8], i64, i64)> = pks.iter().zip(rows).map(|(k, &(_, w, v))| (&k[..], w, v)).collect();
+    let mut b = make_batch_opk(schema, &opk);
+    b.certify_layout(Layout::Consolidated, schema);
+    b
+}
 
-/// The order oracle: every row of both sides exactly once, at its own weight,
-/// in (PK, payload) order. Compared unsorted, so it pins the emitted order.
-/// Covers disjoint keys, a shared key, a skewed gallop on each side, an
-/// all-equal PK, and each empty side.
+/// Union is Z-Set `+`: every row of both sides survives at its own weight, in
+/// (PK, payload) order, with nothing folded. The oracle is the two inputs'
+/// multiset sorted by (OPK bytes, payload) — a stable sort with `a` first, which
+/// is the tie-break the merge's `!= Greater` pick makes — so it pins the emitted
+/// order and not just the contents, at every PK stride.
 #[test]
-fn union_emits_every_row_both_sides() {
-    let schema = make_schema_u64_i64();
-    type Rows = &'static [(u64, i64, i64)];
+fn union_emits_every_row_of_both_sides_in_pk_payload_order() {
     let cases: &[(Rows, Rows)] = &[
+        // disjoint keys plus one shared
         (
             &[(1, 1, 10), (3, 1, 30), (5, 1, 50)],
             &[(2, 1, 20), (3, 1, 33), (4, 1, 40)],
@@ -29,265 +62,137 @@ fn union_emits_every_row_both_sides() {
         (&[(1, 1, 1)], &[(2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5), (6, 1, 6)]),
         // huge ∪ tiny: the a-side gallop
         (&[(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5)], &[(3, 1, 9)]),
-        // all equal, multi-payload, mixed weights
+        // one key throughout, multiple payloads, mixed weights
         (&[(7, 1, 70), (7, 1, 71)], &[(7, -2, 72), (7, 1, 73)]),
+        // skewed, with both sides' payloads interleaving at the shared key 5
+        (
+            &[(5, 1, 100), (5, 1, 300)],
+            &[
+                (1, 1, 10),
+                (2, 1, 20),
+                (3, 1, 30),
+                (4, 1, 40),
+                (5, 1, 200),
+                (5, 1, 400),
+                (6, 1, 60),
+                (7, 1, 70),
+            ],
+        ),
+        // a shared key whose payloads order each way round
+        (&[(1, 1, 10)], &[(1, 1, 20)]),
+        (&[(1, 1, 20)], &[(1, 1, 10)]),
+        // equal (PK, payload) at opposite weights: they must land adjacent, so a
+        // later consolidation cancels them
+        (&[(1, 1, 10)], &[(1, -1, 10)]),
         (&[(1, 1, 1), (2, 1, 2)], &[]),
         (&[], &[(1, 1, 1), (2, 1, 2)]),
     ];
 
-    for (ai, bi) in cases {
-        let out = op_union(make_batch(&schema, ai), &make_batch(&schema, bi), &schema);
+    for (tcs, keys) in SHAPES {
+        let schema = pk_payload_schema(tcs);
+        for (ai, bi) in cases {
+            let out = op_union(batch(&schema, &keys, ai), &batch(&schema, &keys, bi), &schema);
 
-        // (pk, payload, weight), in (PK, payload) order. A stable sort over
-        // `a` then `b` breaks a (PK, payload) tie a-first, which is what the
-        // merge's `!= Greater` pick does.
-        let mut want: Vec<(u64, i64, i64)> = ai.iter().chain(bi.iter()).map(|&(pk, w, v)| (pk, v, w)).collect();
-        want.sort_by_key(|&(pk, v, _)| (pk, v));
+            let mut want: Vec<(Vec<u8>, i64, i64)> = ai
+                .iter()
+                .chain(bi.iter())
+                .map(|&(i, w, v)| (key_of(&schema, &keys, i), v, w))
+                .collect();
+            want.sort_by(|x, y| (&x.0, x.1).cmp(&(&y.0, y.1)));
+            let got: Vec<(Vec<u8>, i64, i64)> = (0..out.count)
+                .map(|r| {
+                    (
+                        out.get_pk_bytes(r).to_vec(),
+                        read_i64_le(out.col_data(0), r * 8),
+                        out.get_weight(r),
+                    )
+                })
+                .collect();
 
-        let got: Vec<(u64, i64, i64)> = (0..out.count)
-            .map(|r| (out.get_pk(r) as u64, get_payload_i64(&out, r), out.get_weight(r)))
-            .collect();
-        assert_eq!(got, want, "union a={ai:?} b={bi:?}");
+            assert_eq!(got, want, "{tcs:?}: a={ai:?} b={bi:?}");
+            assert!(out.is_sorted());
+            // A merge of two non-empty sides is unfolded, so only the
+            // pass-through of an empty side keeps the `Consolidated` claim.
+            assert_eq!(
+                out.is_consolidated(),
+                ai.is_empty() || bi.is_empty(),
+                "{tcs:?}: a={ai:?} b={bi:?}",
+            );
+        }
     }
 }
 
+/// The shared-PK payload interleave must run through the GENERIC arm
+/// (`compare_rows`, German-string comparison). The fixed-int comparator would
+/// read these 16-byte cells as raw integers and order "banana" before "apple".
 #[test]
-fn test_union_merge_same_pk_payload_order() {
-    // batch_a has val=20, batch_b has val=10 — output must be [10, 20]
-    let schema = make_schema_u64_i64();
-    let a = make_batch(&schema, &[(1, 1, 20)]);
-    let b = make_batch(&schema, &[(1, 1, 10)]);
-    let out = op_union(a, &b, &schema);
-    assert_eq!(out.count, 2);
-    assert!(out.is_sorted());
-    assert_eq!(get_payload_i64(&out, 0), 10);
-    assert_eq!(get_payload_i64(&out, 1), 20);
-}
-
-/// Skewed tiny ⋃ huge union: the gallop skip jumps the long b-only prefix in
-/// one `advance_to`, and the shared PK=5 carries interleaved payloads on BOTH
-/// sides ({100,300} ⋃ {200,400}). Output must be the full union multiset,
-/// (PK, payload)-sorted (Z-Set `+` keeps every row, weights unfolded).
-#[test]
-fn test_union_merge_skewed_interleaved_payloads() {
-    let schema = make_schema_u64_i64();
-    let a = make_batch(&schema, &[(5, 1, 100), (5, 1, 300)]); // tiny side
-    let b = make_batch(
-        &schema,
-        &[
-            (1, 1, 10),
-            (2, 1, 20),
-            (3, 1, 30),
-            (4, 1, 40),
-            (5, 1, 200),
-            (5, 1, 400),
-            (6, 1, 60),
-            (7, 1, 70),
-        ],
-    ); // huge side; PK=5 interleaves with a
-    let out = op_union(a, &b, &schema);
-
-    let got: Vec<(u64, i64)> = (0..out.count)
-        .map(|r| (out.get_pk(r) as u64, get_payload_i64(&out, r)))
-        .collect();
-    let want: Vec<(u64, i64)> = vec![
-        (1, 10),
-        (2, 20),
-        (3, 30),
-        (4, 40),
-        (5, 100),
-        (5, 200),
-        (5, 300),
-        (5, 400),
-        (6, 60),
-        (7, 70),
-    ];
-    assert_eq!(got, want, "full union, (PK, payload)-sorted");
-    assert!(out.is_sorted());
-    assert!(!out.is_consolidated(), "Z-Set + does not fold weights");
-}
-
-#[test]
-fn test_union_merge_same_pk_equal_payload() {
-    // Same (PK, payload), opposite weights — must be adjacent for consolidation
-    let schema = make_schema_u64_i64();
-    let a = make_batch(&schema, &[(1, 1, 10)]);
-    let b = make_batch(&schema, &[(1, -1, 10)]);
-    let out = op_union(a, &b, &schema);
-    assert_eq!(out.count, 2);
-    assert!(out.is_sorted());
-    assert_eq!(get_payload_i64(&out, 0), 10);
-    assert_eq!(get_payload_i64(&out, 1), 10);
-}
-
-/// Pin: the GENERIC arm (`compare_rows`, German-string comparison) must drive
-/// the shared-PK payload interleave. The fixed-int comparator would read these
-/// 16-byte structs as raw integers and order "banana" before "apple".
-#[test]
-fn test_union_merge_generic_rowcmp_shared_pk_string_payload() {
+fn union_orders_shared_pk_string_payloads_through_the_generic_comparator() {
     let schema = make_schema_pk_u64_payload_string();
-    // Guard: the schema must select the GENERIC comparator. If a future
-    // change moved STRING into the fixed-int fast path, this pin would no
-    // longer exercise the generic arm — fail loudly here instead.
+    // If a future change moved STRING into the fixed-int fast path this would
+    // stop exercising the generic arm — fail loudly here instead.
     assert_eq!(
         schema.payload_cmp,
         crate::schema::PayloadCmpKind::Generic,
-        "U64+STRING schema must use the GENERIC payload comparator",
+        "U64+STRING must select the GENERIC payload comparator",
     );
 
-    let a = make_batch_bytes(&schema, &[(1, 1, b"banana")]);
-    let b = make_batch_bytes(&schema, &[(1, 1, b"apple")]);
-    let out = op_union(a, &b, &schema);
+    let out = op_union(
+        make_batch_bytes(&schema, &[(1, 1, b"banana")]),
+        &make_batch_bytes(&schema, &[(1, 1, b"apple")]),
+        &schema,
+    );
 
     assert_eq!(out.count, 2, "Z-Set + keeps both shared-PK rows");
     assert!(out.is_sorted());
-    // Both rows carry PK=1.
     assert_eq!(out.get_pk(0) as u64, 1);
     assert_eq!(out.get_pk(1) as u64, 1);
-    // (PK, payload) order: German-string compare puts "apple" before "banana".
-    assert_eq!(out.read_payload_string(0, 0), "apple", "row0 payload (string-sorted)");
-    assert_eq!(out.read_payload_string(1, 0), "banana", "row1 payload (string-sorted)");
+    assert_eq!(out.read_payload_string(0, 0), "apple");
+    assert_eq!(out.read_payload_string(1, 0), "banana");
 }
 
-// -----------------------------------------------------------------------
-// Wide-PK union merge (pk_stride > 16)
-// -----------------------------------------------------------------------
-
+/// Neither side sorted: the merge is unavailable, so `op_union` concatenates and
+/// leaves the result `Raw` for a downstream re-sort. This is the shape `UNION
+/// ALL` over a join or reduce output takes — both emit `Raw` batches.
 #[test]
-fn test_op_union_merge_wide_pk() {
-    // Regression: op_union on wide-PK (pk_stride=24) batches previously
-    // panicked in get_pk -> widen_pk_le. Verify it merges correctly:
-    // sorted by (PK, payload), all rows present, equal-PK groups
-    // payload-sorted, weights not summed (union, not consolidation).
-    let schema = wide_pk_3xu64_schema();
-    let a = make_wide_batch(&schema, &[(0, 0, 1, 1, 20), (0, 0, 3, 1, 300)]);
-    let b = make_wide_batch(&schema, &[(0, 0, 1, 1, 10), (0, 0, 2, 1, 200)]);
-
-    let out = op_union(a, &b, &schema);
-    assert_eq!(out.count, 4);
-    assert!(out.is_sorted());
-    assert!(!out.is_consolidated());
-
-    let pk = |c: u128| opk_pk(&schema, &[0, 0, c]);
-    assert_eq!(out.get_pk_bytes(0), &pk(1)[..]);
-    assert_eq!(get_payload_i64(&out, 0), 10);
-    assert_eq!(out.get_pk_bytes(1), &pk(1)[..]);
-    assert_eq!(get_payload_i64(&out, 1), 20);
-    assert_eq!(out.get_pk_bytes(2), &pk(2)[..]);
-    assert_eq!(get_payload_i64(&out, 2), 200);
-    assert_eq!(out.get_pk_bytes(3), &pk(3)[..]);
-    assert_eq!(get_payload_i64(&out, 3), 300);
-}
-
-#[test]
-fn test_op_union_empty_a_returns_b() {
-    // batch_a empty, batch_b non-empty → result equals batch_b content.
+fn union_concatenates_unsorted_inputs_and_leaves_them_raw() {
     let schema = make_schema_u64_i64();
-    let a = make_batch(&schema, &[]);
-    let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+    let a = make_batch_raw(&schema, &[(3, 1, 30), (1, 1, 10)]);
+    let b = make_batch_raw(&schema, &[(2, 1, 20)]);
+
     let out = op_union(a, &b, &schema);
-    assert_eq!(out.count, 2);
-    assert_eq!(out.get_pk(0) as u64, 1);
-    assert_eq!(get_payload_i64(&out, 0), 10);
-    assert_eq!(out.get_pk(1) as u64, 2);
-    assert_eq!(get_payload_i64(&out, 1), 20);
-}
-
-#[test]
-fn test_op_union_empty_b_passthrough() {
-    // batch_b empty → batch_a returned verbatim (sorted/consolidated kept).
-    let schema = make_schema_u64_i64();
-    let a = make_batch(&schema, &[(1, 1, 10)]);
-    let out = op_union(a, &make_batch(&schema, &[]), &schema);
-    assert_eq!(out.count, 1);
-    assert!(out.is_sorted() && out.is_consolidated());
-    assert_eq!(get_payload_i64(&out, 0), 10);
-}
-
-// -----------------------------------------------------------------------
-// op_union_merge signed I64 PK ordering
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_op_union_merge_signed_i64_pk() {
-    // Signed PK columns are sign-flipped into the OPK bytes, so the merge's
-    // plain byte comparison must yield signed ascending order — this pins
-    // that the union merge reads the PK through that encoding.
-    let schema = make_schema_i64pk_i64();
-    let a = make_batch_i64pk(&schema, &[(-5, 1, 100), (0, 1, 200), (7, 1, 300)]);
-    let b = make_batch_i64pk(&schema, &[(-1, 1, 400), (3, 1, 500)]);
-    let out = op_union(a, &b, &schema);
-    assert_eq!(out.count, 5);
-    assert!(out.is_sorted());
-    let pks: Vec<i64> = (0..out.count)
-        .map(|i| crate::test_support::opk_pk_i64(out.get_pk_bytes(i)))
+    assert_eq!(out.layout(), Layout::Raw);
+    let got: Vec<(u64, i64)> = (0..out.count)
+        .map(|r| (out.get_pk(r) as u64, read_i64_le(out.col_data(0), r * 8)))
         .collect();
-    assert_eq!(pks, vec![-5, -1, 0, 3, 7], "signed ascending PK order");
-}
-
-// -----------------------------------------------------------------------
-// op_filter tests
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_op_filter_consolidated_flag() {
-    use gnitz_expr::{LogicalInstr, LogicalProgram};
-
-    let instrs = vec![
-        LogicalInstr::LoadConst { dst: 0, val: 1 }, // always true
-    ];
-    let schema = make_schema_u64_i64();
-    let func = LogicalProgram::new(instrs, 1, 0, vec![])
-        .resolve_filter(&schema)
-        .unwrap();
-
-    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-
-    let out = op_filter(&batch, &func, &schema);
-    assert_eq!(out.count, 2);
-    assert!(
-        out.is_consolidated(),
-        "consolidated input + pass-all → consolidated output"
+    assert_eq!(
+        got,
+        vec![(3, 30), (1, 10), (2, 20)],
+        "a's rows then b's, order untouched"
     );
-    assert!(out.is_sorted());
 }
 
-/// Per-row differential oracle for the batch filter path: 20 rows filtered by
-/// `col[1] > 10` must keep exactly the rows whose payload exceeds 10, in
-/// input PK order.
+/// Per-row differential oracle for the filter's contiguous-range bulk copy:
+/// `col[1] > 10` keeps exactly the rows whose payload exceeds 10, in input PK
+/// order, with runs of length 1, 2 and 3 on both sides of the predicate. Filter
+/// is linear, so a consolidated input stays consolidated.
 #[test]
-fn test_filter_batch_matches_per_row() {
+fn filter_keeps_exactly_the_matching_rows() {
     use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
 
     let schema = make_schema_u64_i64();
-    // (pk, weight, payload); a row passes iff payload > 10.
-    let batch = make_batch(
-        &schema,
-        &[
-            (1, 1, 5),    // fail
-            (2, 1, 15),   // pass
-            (3, 1, 25),   // pass
-            (4, 1, 10),   // fail (= not >)
-            (5, 1, 20),   // pass
-            (6, 1, 3),    // fail
-            (7, 1, 30),   // pass
-            (8, 1, 10),   // fail
-            (9, 1, 11),   // pass
-            (10, 1, 0),   // fail
-            (11, 1, 50),  // pass
-            (12, 1, 9),   // fail
-            (13, 1, 12),  // pass
-            (14, 1, 8),   // fail
-            (15, 1, 100), // pass
-            (16, 1, 10),  // fail
-            (17, 1, 1),   // fail
-            (18, 1, 13),  // pass
-            (19, 1, 7),   // fail
-            (20, 1, 22),  // pass
-        ],
-    );
-
-    // Predicate: col[1] > 10
+    let rows: &[(u64, i64, i64)] = &[
+        (1, 1, 5),
+        (2, 1, 15),
+        (3, 1, 25),
+        (4, 1, 10), // 10 fails: the predicate is strict
+        (5, 1, 20),
+        (6, 1, 3),
+        (7, 1, 8),
+        (8, 1, 30),
+        (9, 1, 11),
+        (10, 1, 12),
+        (11, 1, 0),
+    ];
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 1 },
         LogicalInstr::LoadConst { dst: 1, val: 10 },
@@ -302,36 +207,24 @@ fn test_filter_batch_matches_per_row() {
         .resolve_filter(&schema)
         .unwrap();
 
-    let out = op_filter(&batch, &func, &schema);
-    // pk=2(15), 3(25), 5(20), 7(30), 9(11), 11(50), 13(12), 15(100), 18(13), 20(22)
-    assert_eq!(out.count, 10, "expected 10 rows with val > 10");
-    let pks: Vec<u64> = (0..out.count).map(|r| out.get_pk(r) as u64).collect();
-    assert_eq!(pks, vec![2, 3, 5, 7, 9, 11, 13, 15, 18, 20]);
+    let out = op_filter(&make_batch(&schema, rows), &func, &schema);
+    let got: Vec<u64> = (0..out.count).map(|r| out.get_pk(r) as u64).collect();
+    let want: Vec<u64> = rows.iter().filter(|&&(_, _, v)| v > 10).map(|&(pk, ..)| pk).collect();
+    assert_eq!(got, want);
+    assert!(out.is_consolidated() && out.is_sorted());
 }
 
-// -----------------------------------------------------------------------
-// op_negate tests
-// -----------------------------------------------------------------------
-
+/// Negate is the Z-Set group inverse: every weight flips sign and nothing else
+/// moves. `i64::MIN` is its own inverse in ℤ/2⁶⁴, so `wrapping_neg` leaves it
+/// where it is instead of overflowing.
 #[test]
-fn test_op_negate_weights() {
+fn negate_flips_every_weight() {
     let schema = make_schema_u64_i64();
-    let out = op_negate(make_batch(&schema, &[(1, 3, 10), (2, -1, 20)]));
-    assert_eq!(out.count, 2);
-    assert_eq!(out.get_weight(0), -3);
-    assert_eq!(out.get_weight(1), 1);
-    assert_eq!(get_payload_i64(&out, 0), 10);
-    assert_eq!(get_payload_i64(&out, 1), 20);
+    let out = op_negate(make_batch(&schema, &[(1, 3, 10), (2, -1, 20), (3, i64::MIN, 30)]));
+
+    let got: Vec<(i64, i64)> = (0..out.count)
+        .map(|r| (out.get_weight(r), read_i64_le(out.col_data(0), r * 8)))
+        .collect();
+    assert_eq!(got, vec![(-3, 10), (1, 20), (i64::MIN, 30)]);
     assert!(out.is_consolidated());
-}
-
-#[test]
-fn test_op_negate_i64_min_no_panic() {
-    // -i64::MIN overflows; debug builds panic, release wraps silently.
-    // wrapping_neg must leave i64::MIN unchanged without panicking.
-    let schema = make_schema_u64_i64();
-    let out = op_negate(make_batch(&schema, &[(1, i64::MIN, 10), (2, 5, 20)]));
-    assert_eq!(out.count, 2);
-    assert_eq!(out.get_weight(0), i64::MIN, "wrapping_neg(i64::MIN) == i64::MIN");
-    assert_eq!(out.get_weight(1), -5);
 }

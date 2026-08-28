@@ -50,14 +50,26 @@ pub fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch 
 /// sort/fold paths themselves.
 pub fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
     let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let width = payload_slot_width(schema);
     for &(pk, w, val) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes()[..width]);
         b.count += 1;
     }
     b
+}
+
+/// How many of an `i64` payload's little-endian bytes belong in payload slot 0.
+/// `extend_col` writes `d.len()` bytes at `row * col_size`, so an over-wide
+/// write into a sub-64-bit column spills into the next row — this is what lets
+/// the one builder serve every fixed-int payload width.
+pub fn payload_slot_width(schema: &SchemaDescriptor) -> usize {
+    schema
+        .payload_columns()
+        .next()
+        .map_or(8, |(_, c)| (c.size() as usize).min(8))
 }
 
 /// A U64 PK plus one payload column of type `tc` — the reindex/promotion tests'

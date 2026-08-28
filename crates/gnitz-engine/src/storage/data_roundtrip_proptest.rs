@@ -13,13 +13,11 @@
 //! paths (the `full_scan` byte-merge cursor and the direct `slice_to_owned_batch`
 //! shard decode), and the non-prefix payload-slot renumbering in one place.
 
-use std::collections::HashMap;
-
 use proptest::prelude::*;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_PK_BYTES, MAX_PK_COLUMNS};
 use crate::storage::{Batch, RecoverySource, Table};
-use crate::test_support::{arb_pk_type, arb_type_code};
+use crate::test_support::{arb_pk_type, arb_type_code, row_key, zset_of};
 
 // ---------------------------------------------------------------------------
 // Strategies
@@ -141,51 +139,6 @@ fn arb_string(rng: &mut crate::test_rng::Rng) -> Vec<u8> {
         _ => 13 + rng.gen_range(24) as usize, // 13..=36, blob
     };
     (0..len).map(|_| rng.next_u64() as u8).collect()
-}
-
-// ---------------------------------------------------------------------------
-// Z-Set reduction
-// ---------------------------------------------------------------------------
-
-type RowKey = (Vec<u8>, Vec<Option<Vec<u8>>>);
-
-/// Reduce a row to its **logical** identity. Null is `None`, distinct from an
-/// empty string `Some(vec![])` — keeping the raw null word out of the key, so
-/// its non-load-bearing unused bits cannot cause a spurious mismatch, while
-/// every meaningful null bit is still reflected by a `None` entry. STRING /
-/// BLOB cells are **decoded** before comparison (the 16-byte German-string
-/// struct embeds a blob offset, so two batches holding the same logical string
-/// carry different struct bytes).
-fn row_key(batch: &Batch, schema: &SchemaDescriptor, row: usize) -> RowKey {
-    let pk = batch.get_pk_bytes(row).to_vec(); // byte-addressed: any width
-    let nw = batch.get_null_word(row);
-    let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(schema.num_payload_cols());
-    for (pi, col) in schema.payload_columns() {
-        if gnitz_wire::null_word_get(nw, pi) {
-            vals.push(None);
-            continue;
-        }
-        let cs = col.size() as usize;
-        // get_col_ptr's second argument is the payload index, matching `pi`.
-        let raw = batch.get_col_ptr(row, pi, cs);
-        let logical = if gnitz_wire::is_german_string(col.type_code) {
-            let st: [u8; 16] = raw.try_into().unwrap();
-            gnitz_wire::try_decode_german_string(&st, &batch.blob).unwrap()
-        } else {
-            raw.to_vec()
-        };
-        vals.push(Some(logical));
-    }
-    (pk, vals)
-}
-
-fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
-    let mut z: HashMap<RowKey, i64> = HashMap::new();
-    for row in 0..batch.count {
-        *z.entry(row_key(batch, schema, row)).or_insert(0) += batch.get_weight(row);
-    }
-    z.retain(|_, w| *w != 0);
-    z
 }
 
 // ---------------------------------------------------------------------------
