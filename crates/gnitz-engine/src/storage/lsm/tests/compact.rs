@@ -1,12 +1,12 @@
 use super::super::batch::{Batch, REG_PAYLOAD_START};
-use super::super::guard_slot;
 use super::super::layout::{ENCODING_FOR, ENCODING_RAW};
 use super::super::merge::{run_merge, BlobCacheGuard};
 use super::super::naming;
 use super::super::shard_file::{self, region_dir, ShardWriteOpts};
+use super::super::shard_index::guard_slot;
 use super::super::shard_reader::MappedShard;
 use super::*;
-use crate::schema::key::pack_pk_be;
+use crate::schema::key::PkBuf;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_schema_u64_i64, opk_pk, pk_payload_schema};
 use gnitz_wire::read_i64_le;
@@ -15,7 +15,7 @@ use std::fs;
 use type_code::{I64 as TYPE_I64, STRING as TYPE_STRING, U64 as TYPE_U64};
 
 /// A probed store's `Output` — the shape every test here compacts into.
-fn out(dir: &str, table_id: u32, level_num: u32, compact_seq: u64) -> Output<'_> {
+fn out(dir: &str, table_id: u32, level_num: usize, compact_seq: u64) -> Output<'_> {
     Output {
         dir,
         table_id,
@@ -51,7 +51,14 @@ fn compact_one_opt(
     schema: &SchemaDescriptor,
     seq: u64,
 ) -> Option<std::ffi::CString> {
-    let outs = merge_and_route(inputs, &[(0, false)], schema, out(dir.to_str().unwrap(), 0, 1, seq)).unwrap();
+    let anchor = PkBuf::zeroed(schema.pk_stride() as usize);
+    let outs = merge_and_route(
+        inputs,
+        &[(anchor, false)],
+        schema,
+        out(dir.to_str().unwrap(), 0, 1, seq),
+    )
+    .unwrap();
     outs.first().map(|(_, p)| std::ffi::CString::new(p.as_str()).unwrap())
 }
 
@@ -196,7 +203,7 @@ fn compaction_merges_inputs_and_drops_cancelled_rows() {
 /// first guard key, and the last guard owns everything above it.
 #[test]
 fn guard_slot_saturates_at_both_ends() {
-    let cases: &[(&[u128], u128, usize)] = &[
+    let cases: &[(&[u64], u64, usize)] = &[
         (&[], 42, 0),
         (&[0], 0, 0),
         (&[0], 999, 0),
@@ -209,7 +216,12 @@ fn guard_slot_saturates_at_both_ends() {
         (&[200, 400], 50, 0),
     ];
     for &(guards, key, want) in cases {
-        assert_eq!(guard_slot(guards, key, |&g| g), want, "guards={guards:?} key={key}");
+        let keys: Vec<[u8; 8]> = guards.iter().map(|g| g.to_be_bytes()).collect();
+        assert_eq!(
+            guard_slot(&keys, &key.to_be_bytes(), |g| &g[..]),
+            want,
+            "guards={guards:?} key={key}"
+        );
     }
 }
 
@@ -220,7 +232,7 @@ fn test_merge_and_route_rejects_empty_guards() {
     // merge loop; a caller passing one has violated the contract — fail
     // loudly up front.
     let schema = make_schema_u64_i64();
-    let guards: [(u128, bool); 0] = [];
+    let guards: [(PkBuf, bool); 0] = [];
     let _ = merge_and_route(&[], &guards, &schema, out("/tmp", 0, 1, 0));
 }
 
@@ -235,12 +247,12 @@ fn test_merge_and_route_basic() {
     let cs1 = write_shard(&dir, "s1.db", &[10, 50, 150, 250], &[1, 1, 1, 1], &schema);
     let inputs = [cs1.as_c_str()];
 
-    // Two guards: [0, 100)  and [100, ∞). Guard keys live in the same
-    // order-preserving pack_pk_be space as the router's sort key, so derive
-    // them from the OPK bytes of the boundary values (not native u128s).
+    // Two guards: [0, 100)  and [100, ∞). A guard key is a whole OPK key, the
+    // same bytes the router compares, so derive them from the OPK image of the
+    // boundary values (not their native little-endian form).
     let guards = [
-        (pack_pk_be(&0u64.to_be_bytes()), false),
-        (pack_pk_be(&100u64.to_be_bytes()), false),
+        (PkBuf::from_bytes(&0u64.to_be_bytes()), false),
+        (PkBuf::from_bytes(&100u64.to_be_bytes()), false),
     ];
     let guard_outputs = merge_and_route(&inputs, &guards, &schema, out(dir.to_str().unwrap(), 0, 1, 99)).unwrap();
     assert_eq!(guard_outputs.len(), 2); // both guards should have rows
@@ -270,12 +282,15 @@ fn test_merge_and_route_cleanup_on_partial_finalize_failure() {
     let cs1 = write_shard(&dir, "in1.db", &[10, 50], &[1, 1], &schema);
     let cs2 = write_shard(&dir, "in2.db", &[150, 250], &[1, 1], &schema);
     let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-    let guards: [(u128, bool); 2] = [(0, false), (100, false)];
+    let guards: [(PkBuf, bool); 2] = [
+        (PkBuf::from_bytes(&0u64.to_be_bytes()), false),
+        (PkBuf::from_bytes(&100u64.to_be_bytes()), false),
+    ];
 
-    // table_id=0, level_num=1, compact_seq=99, guard keys {0,100} → the second
-    // output is shard_0_99_L1_G100.db (named by guard key, not loop index).
+    // table_id=0, level_num=1, compact_seq=99 → the second output is
+    // shard_0_99_L1_P1.db, named by its part index within the compaction.
     // Block it with a directory so finalize fails for that guard.
-    let blocker = dir.join(naming::compact_shard_name(0, 99, 1, 100));
+    let blocker = dir.join(naming::compact_shard_name(0, 99, 1, 1));
     fs::create_dir_all(&blocker).unwrap();
 
     let rc = merge_and_route(&inputs, &guards, &schema, out(dir.to_str().unwrap(), 0, 1, 99));
@@ -505,7 +520,8 @@ fn test_merge_and_route_keys_below_first_guard() {
     let cs1 = write_shard(&dir, "s1.db", &[50, 100, 150, 250], &[1, 1, 1, 1], &schema);
     let inputs = [cs1.as_c_str()];
 
-    let guards = [(200u128, false)]; // single guard at key 200
+    // A single guard keyed at 200: everything below it is guard 0's tail.
+    let guards = [(PkBuf::from_bytes(&200u64.to_be_bytes()), false)];
     let guard_outputs = merge_and_route(&inputs, &guards, &schema, out(dir.to_str().unwrap(), 42, 2, 1)).unwrap();
     assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
 
@@ -863,7 +879,7 @@ fn test_compact_columnar_matches_row_at_a_time() {
 fn oracle_merge_and_route_row_at_a_time(
     input_files: &[&CStr],
     out_dir: &std::path::Path,
-    guard_keys: &[u128],
+    guard_keys: &[PkBuf],
     schema: &SchemaDescriptor,
 ) -> Vec<Option<String>> {
     let shards = open_shards(input_files, schema).unwrap();
@@ -872,7 +888,7 @@ fn oracle_merge_and_route_row_at_a_time(
     let mut blob_caches: Vec<BlobCacheGuard> = (0..n).map(|_| BlobCacheGuard::acquire(schema, 256)).collect();
     run_merge(&shards, schema, |src, row, w| {
         let pk = shards[src].get_pk_bytes(row);
-        let g = guard_slot(guard_keys, pack_pk_be(pk), |&g| g);
+        let g = guard_slot(guard_keys, pk, PkBuf::pk_bytes);
         batches[g].append_row_from_source_bytes(pk, w, &shards[src], row, blob_caches[g].get_mut());
     });
     (0..n)
@@ -925,16 +941,16 @@ fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
     let c1 = std::ffi::CString::new(p1.to_str().unwrap()).unwrap();
     let inputs = [c0.as_c_str(), c1.as_c_str()];
 
-    // Guard keys live in the same order-preserving pack_pk_be space as the
-    // router's sort key, so derive them from the boundary values' OPK bytes.
-    let guard_keys: Vec<u128> = [0u64, 100, 200, 300]
+    // A guard key is a whole OPK key, so derive them from the boundary values'
+    // OPK bytes.
+    let guard_keys: Vec<PkBuf> = [0u64, 100, 200, 300]
         .iter()
-        .map(|&b| crate::schema::key::pack_pk_be(&b.to_be_bytes()))
+        .map(|&b| PkBuf::from_bytes(&b.to_be_bytes()))
         .collect();
 
-    // table_id=7, level_num=1, compact_seq=42 → routed shards are named by the
-    // destination guard *key*: shard_7_42_L1_G{guard_keys[g]}.db.
-    let dests: Vec<(u128, bool)> = guard_keys.iter().map(|&k| (k, false)).collect();
+    // table_id=7, level_num=1, compact_seq=42 → routed shards are named by their
+    // part index within the compaction: shard_7_42_L1_P{g}.db.
+    let dests: Vec<(PkBuf, bool)> = guard_keys.iter().map(|&k| (k, false)).collect();
     let routed = merge_and_route(&inputs, &dests, &schema, out(dir.to_str().unwrap(), 7, 1, 42)).unwrap();
     let oracle = oracle_merge_and_route_row_at_a_time(&inputs, &dir, &guard_keys, &schema);
 
@@ -944,7 +960,7 @@ fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
     assert_eq!(routed[1].0, guard_keys[3]);
 
     for (g, oracle_entry) in oracle.iter().enumerate() {
-        let routed_path = dir.join(super::super::naming::compact_shard_name(7, 42, 1, guard_keys[g]));
+        let routed_path = dir.join(super::super::naming::compact_shard_name(7, 42, 1, g));
         match oracle_entry {
             None => assert!(
                 !routed_path.exists(),
@@ -960,7 +976,7 @@ fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
     }
 
     // Concrete per-guard pins beyond oracle agreement.
-    let g0_name = super::super::naming::compact_shard_name(7, 42, 1, guard_keys[0]);
+    let g0_name = super::super::naming::compact_shard_name(7, 42, 1, 0);
     let g0_rows = decode_diff_shard(dir.join(&g0_name).to_str().unwrap(), &schema);
     let pk10 = 10u64.to_be_bytes().to_vec();
     let folded = g0_rows
@@ -974,9 +990,67 @@ fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
         "guard 0: pk=10 (×2 payloads) + pk=50, got {g0_rows:?}"
     );
 
-    let g3_name = super::super::naming::compact_shard_name(7, 42, 1, guard_keys[3]);
+    let g3_name = super::super::naming::compact_shard_name(7, 42, 1, 3);
     let g3_rows = decode_diff_shard(dir.join(&g3_name).to_str().unwrap(), &schema);
     assert_eq!(g3_rows.len(), 3, "guard 3: pk=310,320,330, got {g3_rows:?}");
+}
+
+/// `merge_and_route`'s survivor split against `guard_slot` — independent
+/// derivations of one rule, so a boundary slip (`>` where the rule says `>=`)
+/// shows up as a disagreement. Swept across strides because at 24 and 32 the
+/// keys differ only past byte 16, which a stride ≤ 16 case cannot reach.
+#[test]
+fn the_routed_split_agrees_with_guard_slot_at_every_stride() {
+    for pk_cols in [1usize, 3, 4] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let schema = pk_payload_schema(&vec![TYPE_U64; pk_cols]);
+        assert_eq!(schema.pk_stride() as usize, pk_cols * 8);
+
+        // Keys ascending in the LAST PK column, so every one of them shares its
+        // leading `(pk_cols - 1) * 8` bytes with every other.
+        let key = |i: u64| {
+            let mut pk = vec![0u8; (pk_cols - 1) * 8];
+            pk.extend_from_slice(&i.to_be_bytes());
+            pk
+        };
+        let rows: Vec<(Vec<u8>, i64, i64)> = (0..400u64).map(|i| (key(i), 1, i as i64)).collect();
+        let path = shard_file::write_test_shard(&dir.join("in.db"), &schema, &rows, ShardWriteOpts::default());
+
+        // Guard keys straddling the data, including one below every row (so
+        // guard 0's tail is exercised) and one above every row (an empty bucket).
+        let guard_keys: Vec<PkBuf> = [0u64, 1, 100, 250, 399, 1000]
+            .iter()
+            .map(|&b| PkBuf::from_bytes(&key(b)))
+            .collect();
+        let dests: Vec<(PkBuf, bool)> = guard_keys.iter().map(|&k| (k, false)).collect();
+        let routed = merge_and_route(&[path.as_c_str()], &dests, &schema, out(dir.to_str().unwrap(), 5, 1, 7)).unwrap();
+
+        // Every written shard's rows must be exactly the ones `guard_slot` sends
+        // to that part, and an unwritten part must be one `guard_slot` sends
+        // nothing to.
+        for (g, &gkey) in guard_keys.iter().enumerate() {
+            let want: Vec<u64> = (0..400u64)
+                .filter(|&i| guard_slot(&guard_keys, &key(i), PkBuf::pk_bytes) == g)
+                .collect();
+            let hit = routed.iter().find(|(k, _)| *k == gkey);
+            match (hit, want.is_empty()) {
+                (None, true) => {}
+                (None, false) => panic!("stride {}: part {g} wrote no shard but owns {want:?}", pk_cols * 8),
+                (Some((_, path)), _) => {
+                    let shard =
+                        MappedShard::open(&std::ffi::CString::new(path.as_str()).unwrap(), &schema, true).unwrap();
+                    let got: Vec<Vec<u8>> = (0..shard.count).map(|r| shard.get_pk_bytes(r).to_vec()).collect();
+                    assert_eq!(
+                        got,
+                        want.iter().map(|&i| key(i)).collect::<Vec<_>>(),
+                        "stride {}: part {g} rows diverge from the guard_slot oracle",
+                        pk_cols * 8,
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,7 +1109,7 @@ mod skeleton_tests {
 
         let outs = merge_and_route(
             &[a.as_c_str(), b.as_c_str()],
-            &[(0, true)],
+            &[(crate::schema::key::PkBuf::zeroed(schema.pk_stride() as usize), true)],
             &schema,
             super::out(dir.to_str().unwrap(), 0, 2, 1),
         )
@@ -1065,18 +1139,19 @@ mod skeleton_tests {
         let schema = make_schema_u64_i64();
         let src = write_shard(&dir.join("src.db"), &[(1, 1, 10), (1, 2, 11), (100, 3, 30)], &schema);
         // Guard 0 owns [.., 100), guard 1 owns [100, ..).
-        let g1 = crate::schema::key::pack_pk_be(&100u64.to_be_bytes());
+        let g0 = crate::schema::key::PkBuf::zeroed(schema.pk_stride() as usize);
+        let g1 = crate::schema::key::PkBuf::from_bytes(&100u64.to_be_bytes());
 
         let mixed = merge_and_route(
             &[src.as_c_str()],
-            &[(0, true), (g1, false)],
+            &[(g0, true), (g1, false)],
             &schema,
             super::out(dir.to_str().unwrap(), 0, 2, 1),
         )
         .unwrap();
         let all_hydrated = merge_and_route(
             &[src.as_c_str()],
-            &[(0, false), (g1, false)],
+            &[(g0, false), (g1, false)],
             &schema,
             super::out(dir.to_str().unwrap(), 0, 2, 2),
         )

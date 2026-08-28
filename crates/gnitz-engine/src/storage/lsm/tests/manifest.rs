@@ -1,6 +1,19 @@
 use super::*;
 use crate::test_support::sweep_bit_flips;
 
+/// A guard key at a plausible PK stride — the field carries whole OPK bytes,
+/// zero-padded into the entry, so the round-trip has to preserve them exactly.
+fn gk() -> PkBuf {
+    PkBuf::from_bytes(&42u64.to_be_bytes())
+}
+
+/// The array form `ManifestEntryRaw` stores: [`gk`] zero-padded to the field.
+fn gk_stored() -> [u8; MAX_PK_BYTES] {
+    let mut a = [0u8; MAX_PK_BYTES];
+    a.copy_from_slice(gk().padded(MAX_PK_BYTES));
+    a
+}
+
 fn hdr(compact_seq: u64, checkpoint_gen: u64) -> ManifestHeader {
     ManifestHeader {
         compact_seq,
@@ -10,7 +23,7 @@ fn hdr(compact_seq: u64, checkpoint_gen: u64) -> ManifestHeader {
 }
 
 fn make_entry(max_lsn: u64, name: &str) -> ManifestEntryRaw {
-    ManifestEntryRaw::new(name, max_lsn, 1, 42)
+    ManifestEntryRaw::new(name, max_lsn, 1, gk())
 }
 
 /// A header-only buffer with `magic`, `version` and `count` written raw, so a
@@ -86,7 +99,7 @@ fn write_read_file_roundtrip() {
         assert_eq!(header, hdr(5, 2), "count={count}");
         assert_eq!(out.len(), count);
         for (i, e) in out.iter().enumerate() {
-            assert_eq!((e.max_lsn, e.level, e.guard_key), (i as u64 + 1, 1, 42));
+            assert_eq!((e.max_lsn, e.level, e.guard_key), (i as u64 + 1, 1, gk_stored()));
         }
     }
 }
@@ -124,7 +137,7 @@ fn roundtrips_at_zero_one_and_many_entries() {
         for (i, e) in out.iter().enumerate() {
             assert_eq!(e.max_lsn, 100 + i as u64);
             assert_eq!(e.filename_str(), format!("shard_7_{i}.db"));
-            assert_eq!((e.level, e.guard_key), (1, 42));
+            assert_eq!((e.level, e.guard_key), (1, gk_stored()));
         }
     }
 }

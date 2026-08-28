@@ -5,6 +5,8 @@ use std::os::fd::AsRawFd;
 use super::error::StorageError;
 use crate::foundation::posix_io::{self, open_owned};
 use crate::foundation::xxh;
+use crate::schema::key::PkBuf;
+use crate::schema::MAX_PK_BYTES;
 use gnitz_wire::{read_u64_le, write_u64_le};
 
 // ---------------------------------------------------------------------------
@@ -13,32 +15,31 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 //
 // Header (56 bytes):
 //   [0,8)   Magic   0x4D414E49464E5447
-//   [8,16)  Version u64 (9)
+//   [8,16)  Version u64 (10)
 //   [16,24) Count   u64
 //   [24,32) Compaction sequence u64
 //   [32,40) Checkpoint generation u64
 //   [40,48) Layout sequence u64
 //   [48,56) Checksum — XXH3-64 over the whole file, these eight bytes excluded
 //
-// Entry (160 bytes each):
-//   [0,8)     max_lsn    u64
-//   [8,136)   filename   128 bytes (null-terminated)
-//   [136,144) level      u64
-//   [144,160) guard_key  u128 LE
+// Entry, laid out by the `W_*` widths below (224 bytes at MAX_PK_BYTES = 80):
+//   max_lsn    u64
+//   filename   W_FILENAME bytes (null-terminated)
+//   level      u64
+//   guard_key  W_GUARD_KEY OPK bytes
 //
 // The manifest records only what `load_manifest` consumes: which shard files
 // are live, their tier placement (level, guard) and LSN watermark, plus the
 // two header counters that must survive a restart. PK bounds are re-derived
 // from each shard's mmap at open (`ShardEntry::open`), so they are not
-// serialized. `guard_key` lives in the order-preserving `pack_pk_be` prefix
-// space — the whole key for narrow PKs, a lossy-but-order-preserving 16-byte
-// prefix for wide (compound) PKs, exactly the routing key the compaction
-// writer and read router share.
+// serialized. `guard_key` is a whole OPK key — the same key the compaction
+// writer routes by and the read router probes with. It carries no length:
+// every stored guard key is exactly the schema's `pk_stride` wide, and
+// `load_manifest` holds the schema, exactly as `ShardEntry::open` does.
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION: u64 = 9;
+const VERSION: u64 = 10;
 const HEADER_SIZE: usize = 56;
-const ENTRY_SIZE: usize = 160;
 
 /// Operator-state format version. Bump on any change to an operator-state
 /// schema; a mismatch (recorded in `_sequences` via `SEQ_ID_TOPOLOGY`) marks
@@ -61,27 +62,31 @@ const OFF_CHECKPOINT_GEN: usize = 32;
 const OFF_LAYOUT_SEQ: usize = 40;
 const OFF_CHECKSUM: usize = 48;
 
-// Field offsets within an entry, kept in sync with the doc-comment above.
-const OFF_MAX_LSN: usize = 0;
-const OFF_FILENAME: usize = 8;
-const OFF_LEVEL: usize = 136;
-const OFF_GUARD_KEY: usize = 144;
+// One entry's field widths, in layout order. Each offset is the running sum of
+// the widths before it and `ENTRY_SIZE` is the total, so a width edit moves the
+// fields after it instead of desyncing an offset written down a second time.
+const W_MAX_LSN: usize = 8;
+/// Bound on a shard basename — the binding limit on the naming grammar, which
+/// checks against this rather than a second copy of the number.
+pub(super) const W_FILENAME: usize = 128;
+const W_LEVEL: usize = 8;
+const W_GUARD_KEY: usize = MAX_PK_BYTES;
 
-// Build break if the documented field widths stop summing to the entry
-// size — an offset/size edit that desyncs serialize/parse fails the
-// build rather than corrupting the manifest.
-const _: () = assert!(
-    ENTRY_SIZE == 8 + 128 + 8 + 16,
-    "entry field widths do not sum to ENTRY_SIZE",
-);
+const OFF_MAX_LSN: usize = 0;
+const OFF_FILENAME: usize = OFF_MAX_LSN + W_MAX_LSN;
+const OFF_LEVEL: usize = OFF_FILENAME + W_FILENAME;
+const OFF_GUARD_KEY: usize = OFF_LEVEL + W_LEVEL;
+const ENTRY_SIZE: usize = OFF_GUARD_KEY + W_GUARD_KEY;
 
 /// On-disk manifest entry.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ManifestEntryRaw {
     pub max_lsn: u64,
-    pub filename: [u8; 128],
+    pub filename: [u8; W_FILENAME],
     pub level: u64,
-    pub guard_key: u128,
+    /// The guard key zero-padded to the full array. Meaningful only for
+    /// `level > 0`; an L0 entry stores zeros, which nothing reads back.
+    pub guard_key: [u8; W_GUARD_KEY],
 }
 
 /// The NUL-terminated (or buffer-length) prefix of `buf` as UTF-8, `""` if
@@ -94,23 +99,28 @@ fn cstr_from_buf(buf: &[u8]) -> &str {
 impl ManifestEntryRaw {
     /// One entry naming a shard already written at `basename` inside the table's
     /// own directory. The **basename** is stored, never a full path: a path could
-    /// exceed the 128-byte field, and a truncated name is an unopenable shard at
+    /// exceed the field, and a truncated name is an unopenable shard at
     /// reload. Every basename the naming grammar produces is bounded well under
     /// the field width, so an overflow is a naming-scheme bug — fail loudly
     /// rather than truncate.
-    pub(crate) fn new(basename: &str, max_lsn: u64, level: u64, guard_key: u128) -> Self {
+    pub(crate) fn new(basename: &str, max_lsn: u64, level: u64, guard_key: PkBuf) -> Self {
         let bytes = basename.as_bytes();
         assert!(
-            bytes.len() < 128,
+            bytes.len() < W_FILENAME,
             "shard basename overflows the manifest filename field: {basename}",
         );
-        let mut filename = [0u8; 128];
+        let mut filename = [0u8; W_FILENAME];
         filename[..bytes.len()].copy_from_slice(bytes);
+        // A `PkBuf`'s tail past its width is always zero, so the stored array is
+        // the key zero-padded — which is what `load_manifest` slices back to
+        // `pk_stride`.
+        let mut key = [0u8; W_GUARD_KEY];
+        key.copy_from_slice(guard_key.padded(W_GUARD_KEY));
         ManifestEntryRaw {
             max_lsn,
             filename,
             level,
-            guard_key,
+            guard_key: key,
         }
     }
 
@@ -159,9 +169,9 @@ fn serialize(out_buf: &mut [u8], entries: &[ManifestEntryRaw], header: ManifestH
     for (i, e) in entries.iter().enumerate() {
         let off = HEADER_SIZE + i * ENTRY_SIZE;
         write_u64_le(out_buf, off + OFF_MAX_LSN, e.max_lsn);
-        out_buf[off + OFF_FILENAME..off + OFF_FILENAME + 128].copy_from_slice(&e.filename);
+        out_buf[off + OFF_FILENAME..off + OFF_FILENAME + W_FILENAME].copy_from_slice(&e.filename);
         write_u64_le(out_buf, off + OFF_LEVEL, e.level);
-        out_buf[off + OFF_GUARD_KEY..off + OFF_GUARD_KEY + 16].copy_from_slice(&e.guard_key.to_le_bytes());
+        out_buf[off + OFF_GUARD_KEY..off + OFF_GUARD_KEY + W_GUARD_KEY].copy_from_slice(&e.guard_key);
     }
 
     // Spans the whole serialized prefix, which is exactly what `prepare_file`
@@ -225,13 +235,15 @@ fn parse(buf: &[u8]) -> Result<(Vec<ManifestEntryRaw>, ManifestHeader), StorageE
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
         let off = HEADER_SIZE + i * ENTRY_SIZE;
-        let mut filename = [0u8; 128];
-        filename.copy_from_slice(&buf[off + OFF_FILENAME..off + OFF_FILENAME + 128]);
+        let mut filename = [0u8; W_FILENAME];
+        filename.copy_from_slice(&buf[off + OFF_FILENAME..off + OFF_FILENAME + W_FILENAME]);
+        let mut guard_key = [0u8; W_GUARD_KEY];
+        guard_key.copy_from_slice(&buf[off + OFF_GUARD_KEY..off + OFF_GUARD_KEY + W_GUARD_KEY]);
         entries.push(ManifestEntryRaw {
             max_lsn: read_u64_le(buf, off + OFF_MAX_LSN),
             filename,
             level: read_u64_le(buf, off + OFF_LEVEL),
-            guard_key: u128::from_le_bytes(buf[off + OFF_GUARD_KEY..off + OFF_GUARD_KEY + 16].try_into().unwrap()),
+            guard_key,
         });
     }
 

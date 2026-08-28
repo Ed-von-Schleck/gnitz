@@ -15,7 +15,7 @@ use super::batch::Batch;
 use super::batch_pool::tls_pool;
 use super::columnar::{schema_is_fixedint_nonnull, with_payload_cmp, ColumnarSource};
 use super::heap::{drive_merge, HeapNode, LoserTree};
-use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, pk_width_dispatch, PkSortKey};
+use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, PkSortKey};
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::{BatchView, RowSource};
 use gnitz_wire::{is_german_string, read_u64_le};
@@ -728,16 +728,12 @@ where
     }
 }
 
-/// OPK equality via `compare_pk_ordering == Equal` — deliberately not a raw
-/// `get_pk_bytes(..) == get_pk_bytes(..)`: on the runtime-width slices
-/// `get_pk_bytes` yields, raw `==` lowers to an out-of-line `bcmp` call,
-/// whereas `compare_pk_ordering` inlines to a register `pack_pk_be` compare
-/// for the dominant ≤16-byte PK (the `compare_pk_bytes` tiebreak fires only
-/// when two wide PKs share a 16-byte prefix, so they never fold).
+/// The PK-equality term of the merge's grouping trio, through the canonical
+/// [`pk_bytes_eq`], which carries why a raw slice `==` is the wrong spelling.
 #[inline]
 pub(crate) fn merge_same_pk<S: RowSource>(sources: &[S]) -> impl Fn(usize, usize, usize, usize) -> bool + Copy + '_ {
     move |a_src, a_row, b_src, b_row| {
-        compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) == Ordering::Equal
+        pk_bytes_eq(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row))
     }
 }
 
@@ -1069,13 +1065,12 @@ pub(crate) fn fold_sorted(batch: &MemBatch, schema: &SchemaDescriptor, writer: &
         return;
     }
     // No ordered PK comparison here: input is already sorted. Group detection
-    // in `drain_groups_into` is `compare_pk_ordering` on the OPK bytes, then
-    // the payload term.
+    // in `drain_groups` is `pk_bytes_eq` on the OPK bytes, then the payload term.
     with_payload_cmp!(schema, fold_with, n, batch, schema, writer)
 }
 
 /// `fold_sorted` closure dispatcher: forwards to the single generic drain, whose
-/// PK term is `compare_pk_ordering` at every width.
+/// PK term is `pk_bytes_eq` at every width.
 #[inline]
 fn fold_with<RowCmp>(n: usize, batch: &MemBatch, schema: &SchemaDescriptor, writer: &mut DirectWriter, row_cmp: RowCmp)
 where
@@ -1099,10 +1094,9 @@ where
 /// `sort_and_consolidate` this is an indirection through a sorted index array;
 /// for `fold_sorted` the input is already sorted so `pos == batch_row_idx`.
 ///
-/// Group detection is `compare_pk_ordering` on the two rows' OPK bytes, then
-/// the payload `row_cmp` — the same comparator the N-way merge fold settles
-/// its PK axis on, and for the same reason a register compare rather than a
-/// raw byte `==` (see [`merge_same_pk`]).
+/// Group detection is [`pk_bytes_eq`] on the two rows' OPK bytes, then the
+/// payload `row_cmp` — the same PK term the N-way merge fold uses (see
+/// [`merge_same_pk`]).
 #[inline]
 fn drain_groups<RowCmp>(
     n: usize,
@@ -1119,8 +1113,7 @@ fn drain_groups<RowCmp>(
 
     for pos in 1..n {
         let cur_idx = resolve(pos);
-        let same_group = compare_pk_ordering(batch.get_pk_bytes(pending_idx), batch.get_pk_bytes(cur_idx))
-            == Ordering::Equal
+        let same_group = pk_bytes_eq(batch.get_pk_bytes(pending_idx), batch.get_pk_bytes(cur_idx))
             && row_cmp(schema, batch, pending_idx, batch, cur_idx) == Ordering::Equal;
 
         if same_group {

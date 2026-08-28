@@ -48,11 +48,11 @@ fn write_compound_shard(dir: &std::path::Path, name: &str, pks: &[(u64, u64)], v
     path.to_str().unwrap().to_string()
 }
 
-/// Guard key for a native u64 PK value, in the order-preserving
-/// `pack_pk_be` space (the same key the read router and the compaction
-/// merge use), so multi-guard levels route data keys correctly.
-fn gk(v: u64) -> u128 {
-    crate::schema::key::pack_pk_be(&v.to_be_bytes())
+/// Guard key for a native u64 PK value — the OPK bytes themselves, which is
+/// exactly what the read router and the compaction merge compare, so
+/// multi-guard levels route data keys correctly.
+fn gk(v: u64) -> PkBuf {
+    PkBuf::from_bytes(&v.to_be_bytes())
 }
 
 /// Build and write a `(U64 PK | I64 payload)` shard at weight 1.
@@ -120,7 +120,7 @@ fn write_stable_shard(dir: &std::path::Path, name: &str, base: u64) -> (String, 
 }
 
 /// Register `path` as an entry of `level_idx`'s guard `key`, creating it.
-fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: u128, path: &str, lsn: u64) {
+fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, path: &str, lsn: u64) {
     let schema = idx.schema;
     let entry = ShardEntry::open(path, &schema, lsn, true).unwrap();
     idx.ensure_level(level_idx);
@@ -248,7 +248,7 @@ fn the_rebalance_holds_every_level_at_its_targets() {
 
     // Manually populate L1 with > GUARD_FILE_THRESHOLD entries in one guard
     idx.ensure_level(0); // L1
-    let guard = idx.levels[0].get_or_create_guard(0);
+    let guard = idx.levels[0].get_or_create_guard(gk(0));
     let mut all_pks = Vec::new();
     for i in 0..6u64 {
         let name = format!("guard_s{i}.db");
@@ -298,7 +298,9 @@ fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
 
     // compact_seq 1 splits the source into its two bands, 2 folds the first
     // band down, 3 folds the second — which is the one blocked here.
-    let blocker = dir.path().join(format!("shard_42_3_L2_G{}.db", gk(100_000)));
+    // compact_seq 3 is the second band's terminal fold; it routes into the one
+    // destination guard its span overlaps, so its single output is part 0.
+    let blocker = dir.path().join(naming::compact_shard_name(42, 3, 2, 0));
     std::fs::create_dir_all(&blocker).unwrap();
 
     let hi_dest_file = idx.levels[1].guards[1].entries[0].filename.clone();
@@ -319,9 +321,9 @@ fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
 
 #[test]
 fn test_l1_guard_routing_gap_key_below_first_guard() {
-    // Regression for the find_guard_idx/find_guard_for_key mismatch: a key
-    // inserted below L1's first guard key (100) must remain findable after
-    // an L0→L1 compaction.
+    // Regression for a routing mismatch between the write split and the read
+    // router: a key inserted below L1's first guard key (100) must remain
+    // findable after an L0→L1 compaction.
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
@@ -329,7 +331,7 @@ fn test_l1_guard_routing_gap_key_below_first_guard() {
     // L1 already has a guard at key 100 (keys 100, 200).
     idx.ensure_level(0); // L1
     let path = write_test_shard(dir.path(), "l1_g100.db", &[100, 200], &[1000, 2000]);
-    seed_guard(&mut idx, 0, 100, &path, 1);
+    seed_guard(&mut idx, 0, gk(100), &path, 1);
 
     // Insert 5 L0 shards (> L0_COMPACT_THRESHOLD) with keys all below 100.
     let low_keys = [50u64, 60, 70, 80, 90];
@@ -347,39 +349,41 @@ fn test_l1_guard_routing_gap_key_below_first_guard() {
 
 #[test]
 fn test_find_guards_for_range() {
+    let range = |l: &FLSMLevel, lo: u64, hi: u64| l.find_guards_for_range(gk(lo).pk_bytes(), gk(hi).pk_bytes());
+
     let mut level = FLSMLevel::new();
     // Guards at keys 0, 100, 200, 300
-    for gk in [0u64, 100, 200, 300] {
-        level.guards.push(LevelGuard::new(gk as u128));
+    for k in [0u64, 100, 200, 300] {
+        level.guards.push(LevelGuard::new(gk(k)));
     }
 
     // Range entirely within guard 0
-    assert_eq!(level.find_guards_for_range(10, 50), 0..1);
+    assert_eq!(range(&level, 10, 50), 0..1);
 
     // Range spanning guards 1 and 2
-    assert_eq!(level.find_guards_for_range(100, 250), 1..3);
+    assert_eq!(range(&level, 100, 250), 1..3);
 
     // Range spanning all guards
-    assert_eq!(level.find_guards_for_range(0, 999), 0..4);
+    assert_eq!(range(&level, 0, 999), 0..4);
 
     // Point query at exact guard boundary
-    assert_eq!(level.find_guards_for_range(200, 200), 2..3);
+    assert_eq!(range(&level, 200, 200), 2..3);
 
     // Range below all guards still hits guard 0 (partition_point - 1)
-    assert_eq!(level.find_guards_for_range(0, 0), 0..1);
+    assert_eq!(range(&level, 0, 0), 0..1);
 
     // A range entirely below the first guard KEY still names guard 0, which
     // owns the tail below it. An empty run here would let a caller mint a
     // second guard down there without rewriting the rows already in it.
     let mut above_zero = FLSMLevel::new();
-    for gk in [100u64, 200] {
-        above_zero.guards.push(LevelGuard::new(gk as u128));
+    for k in [100u64, 200] {
+        above_zero.guards.push(LevelGuard::new(gk(k)));
     }
-    assert_eq!(above_zero.find_guards_for_range(10, 50), 0..1);
+    assert_eq!(range(&above_zero, 10, 50), 0..1);
 
     // No guards at all
     let empty = FLSMLevel::new();
-    assert!(empty.find_guards_for_range(0, 100).is_empty());
+    assert!(range(&empty, 0, 100).is_empty());
 }
 
 #[test]
@@ -421,7 +425,7 @@ fn test_unsynced_tracking_register_prune_clear() {
     let mut spills = Vec::new();
     for i in 0..5u64 {
         let pk = (i + 1) * 10;
-        let p = write_test_shard(dir.path(), &format!("shard_42_{i}.db"), &[pk], &[pk as i64]);
+        let p = write_test_shard(dir.path(), &naming::spill_shard_name(42, i), &[pk], &[pk as i64]);
         idx.add_unsynced_shard(&p, i + 1).unwrap();
         spills.push(p);
     }
@@ -457,7 +461,7 @@ fn reload_and_widen_owe_no_sweep() {
     let schema = make_schema_u64_i64();
     let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
     for i in 0..3u64 {
-        let p = write_test_shard(dir.path(), &format!("shard_42_{i}.db"), &[i * 10 + 1], &[i as i64]);
+        let p = write_test_shard(dir.path(), &naming::spill_shard_name(42, i), &[i * 10 + 1], &[i as i64]);
         idx.add_unsynced_shard(&p, i + 1).unwrap();
     }
     let manifest_path = dir.path().join("MANIFEST");
@@ -555,19 +559,19 @@ fn a_vertical_does_not_lose_keys_below_the_destination_guard() {
     for (i, &pk) in src_pks.iter().enumerate() {
         let name = format!("src_{i}.db");
         let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
-        seed_guard(&mut idx, 0, 100, &path, 100);
+        seed_guard(&mut idx, 0, gk(100), &path, 100);
     }
 
     // L1 guard at key=500: 1 shard (so worst_guard picks key=100)
     {
         let path = write_test_shard(dir.path(), "high.db", &[500], &[5000]);
-        seed_guard(&mut idx, 0, 500, &path, 50);
+        seed_guard(&mut idx, 0, gk(500), &path, 50);
     }
 
     // L2 guard at key=200: 1 shard with key=250
     {
         let path = write_test_shard(dir.path(), "dest.db", &[250], &[2500]);
-        seed_guard(&mut idx, 1, 200, &path, 80);
+        seed_guard(&mut idx, 1, gk(200), &path, 80);
     }
 
     // Compact L1 → L2
@@ -630,7 +634,7 @@ fn a_vertical_bands_its_source_at_the_destination_partition() {
         seed_guard(&mut idx, TERMINAL_LEVEL_IDX, key, &p, 80);
         dest_pks.extend(pks);
     }
-    let before: Vec<(u128, String)> = idx.levels[TERMINAL_LEVEL_IDX]
+    let before: Vec<(PkBuf, String)> = idx.levels[TERMINAL_LEVEL_IDX]
         .guards
         .iter()
         .map(|g| (g.guard_key, g.entries[0].filename.clone()))
@@ -644,7 +648,7 @@ fn a_vertical_bands_its_source_at_the_destination_partition() {
     idx.vertical_fold(0).unwrap();
 
     assert!(idx.levels[0].guards.is_empty(), "every band went down");
-    let after: Vec<(u128, String)> = idx.levels[TERMINAL_LEVEL_IDX]
+    let after: Vec<(PkBuf, String)> = idx.levels[TERMINAL_LEVEL_IDX]
         .guards
         .iter()
         .map(|g| (g.guard_key, g.entries[0].filename.clone()))
@@ -937,21 +941,21 @@ fn test_compound_range_prune() {
     );
 }
 
-/// Wide (`pk_stride > 16`) 3×U64 schema. Guard keys are derived from the
-/// OPK pk_min bytes via `pack_pk_be`, so this width is handled uniformly.
+/// Wide (`pk_stride > 16`) 3×U64 schema. Guard keys are whole OPK keys, so this
+/// width is handled uniformly.
 fn wide_schema() -> SchemaDescriptor {
     pk_only_schema(&[type_code::U64; 3])
 }
 
-/// An empty wide-PK table has no L0 shards, so `l1_guard_keys` returns the
-/// anchor guard `vec![0]` for every PK width, wide included.
+/// An empty table has no L0 shards, so `l1_guard_keys` returns the zero anchor
+/// guard — at the schema's own stride, for every PK width, wide included.
 #[test]
 fn test_l1_guard_keys_wide_bypass() {
     let dir = tempfile::tempdir().unwrap();
     let schema = wide_schema();
     assert_eq!(schema.pk_stride(), 24);
     let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
-    assert_eq!(idx.l1_guard_keys(), vec![0]);
+    assert_eq!(idx.l1_guard_keys(), vec![PkBuf::zeroed(24)]);
 }
 
 // -----------------------------------------------------------------------
@@ -1007,11 +1011,12 @@ fn splitting_guard_zero_mints_keys_below_its_own() {
     assert_all_found(&idx, 1..=OVER_TARGET_ROWS);
 }
 
-/// A guard whose keys all share one route key cannot be cut, so it must not
-/// report itself overfull either — the fold would rewrite it to the same size
-/// forever.
+/// A guard holding one distinct key cannot be cut — a guard boundary IS a key,
+/// so rows sharing a PK cannot be split across one, under any key
+/// representation. It must therefore not report itself overfull either, or the
+/// fold would rewrite it to the same size forever.
 #[test]
-fn a_guard_behind_one_route_key_neither_splits_nor_refolds() {
+fn a_guard_of_one_distinct_key_neither_splits_nor_refolds() {
     let tmp = tempfile::tempdir().unwrap();
     let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), make_schema_u64_i64(), false);
     // 9000 rows of one PK at distinct payloads — a legal intermediate batch
@@ -1036,11 +1041,13 @@ fn a_guard_behind_one_route_key_neither_splits_nor_refolds() {
     );
 }
 
-/// The same limit stated for a wide PK: `pack_pk_be` keeps 16 bytes, so keys
-/// that differ only past them share a route key and the byte target stops
-/// being a bound.
+/// A wide PK whose keys agree on their leading sixteen bytes and differ only
+/// past them: the guard cuts between them, and the byte target bounds it, exactly
+/// as at a narrow stride. Under a truncated routing key these keys would be
+/// indistinguishable, the guard uncuttable, and the target no bound at all —
+/// which is the shape a capacity sweep dehydrates all-or-nothing.
 #[test]
-fn a_wide_pk_sharing_its_leading_sixteen_bytes_does_not_split() {
+fn a_wide_pk_sharing_its_leading_sixteen_bytes_still_splits() {
     let tmp = tempfile::tempdir().unwrap();
     let schema = SchemaDescriptor::new(
         &[
@@ -1062,10 +1069,122 @@ fn a_wide_pk_sharing_its_leading_sixteen_bytes_does_not_split() {
     shard_file::write_test_shard(&path, &schema, &rows, shard_file::ShardWriteOpts::default());
 
     let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, false);
-    seed_guard(&mut idx, 0, 0, path.to_str().unwrap(), 1);
+    seed_guard(&mut idx, 0, PkBuf::zeroed(24), path.to_str().unwrap(), 1);
     let target = idx.guard_target_bytes(0);
-    assert!(idx.levels[0].guards[0].bytes() > target, "premise: over target");
-    assert_eq!(idx.levels[0].guards[0].fold_destinations(target), vec![0]);
+    let before = idx.levels[0].guards[0].bytes();
+    assert!(before > target, "premise: {before} B is not over the {target} B target");
+
+    idx.split_overfull_guards(0).unwrap();
+    assert!(idx.levels[0].guards.len() > 1, "the guard cut past byte 16");
+    assert!(
+        idx.levels[0].guards.iter().all(|g| g.bytes() <= target),
+        "the byte target bounds a wide guard too",
+    );
+}
+
+/// A `pk_cols`×U64 PK plus an I64 payload — strides 8, 24 and 32, so a guard key
+/// is narrow, wide, and wide-with-a-16-byte-boundary in turn.
+fn stride_schema(pk_cols: usize) -> SchemaDescriptor {
+    pk_payload_schema(&vec![type_code::U64; pk_cols])
+}
+
+/// Row `i`'s key over `stride_schema(pk_cols)`: ascending in the **last** PK
+/// column, so at every stride but 8 the keys agree on their leading bytes and
+/// differ only in the trailing ones — past byte 16 for `pk_cols >= 3`.
+fn trailing_gk(pk_cols: usize, i: u64) -> PkBuf {
+    let mut pk = vec![0u8; (pk_cols - 1) * 8];
+    pk.extend_from_slice(&i.to_be_bytes());
+    PkBuf::from_bytes(&pk)
+}
+
+/// One shard of rows `base..base + n` at [`trailing_gk`]'s keys.
+fn write_trailing_key_shard(dir: &std::path::Path, name: &str, pk_cols: usize, base: u64, n: u64) -> String {
+    let rows: Vec<(Vec<u8>, i64, i64)> = (base..base + n)
+        .map(|i| (trailing_gk(pk_cols, i).pk_bytes().to_vec(), 1, i as i64))
+        .collect();
+    let path = dir.join(name);
+    shard_file::write_test_shard(
+        &path,
+        &stride_schema(pk_cols),
+        &rows,
+        shard_file::ShardWriteOpts::default(),
+    );
+    path.to_str().unwrap().to_string()
+}
+
+/// The byte target bounds a guard at every PK stride, and a split holds. Swept
+/// over 8, 24 and 32 rather than asserted at 8 alone: at 24 and 32 the keys
+/// differ only past byte 16, where a truncated routing key cannot tell them
+/// apart and the guard would be uncuttable.
+#[test]
+fn the_byte_target_bounds_a_guard_at_every_stride() {
+    for pk_cols in [1usize, 3, 4] {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = stride_schema(pk_cols);
+        assert_eq!(schema.pk_stride() as usize, pk_cols * 8);
+        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, false);
+        let p = write_trailing_key_shard(tmp.path(), "big.db", pk_cols, 1, OVER_TARGET_ROWS);
+        seed_guard(&mut idx, 0, trailing_gk(pk_cols, 1), &p, 1);
+
+        let target = idx.guard_target_bytes(0);
+        let before = idx.levels[0].guards[0].bytes();
+        assert!(before > target, "stride {}: {before} B is not over target", pk_cols * 8);
+
+        idx.split_overfull_guards(0).unwrap();
+        assert!(idx.levels[0].guards.len() > 1, "stride {}: no split", pk_cols * 8);
+        assert!(
+            idx.levels[0].guards.iter().all(|g| g.bytes() <= target),
+            "stride {}: a part is still over target",
+            pk_cols * 8,
+        );
+        // Every key still routes to a shard that holds it.
+        for i in (1..=OVER_TARGET_ROWS).step_by(97) {
+            let key = trailing_gk(pk_cols, i);
+            let mut found = false;
+            idx.find_pk_bytes(key.pk_bytes(), probe_key(key.pk_bytes()), &mut |_, _| found = true);
+            assert!(found, "stride {}: key {i} is unreachable", pk_cols * 8);
+        }
+    }
+}
+
+/// The merge pass follows the level's bytes back down at every stride too — a
+/// guard partition that can only grow is a partition the sweep cannot shrink.
+#[test]
+fn underfull_guards_merge_at_every_stride() {
+    for pk_cols in [1usize, 3, 4] {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = stride_schema(pk_cols);
+        let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, false);
+        for i in 0..4u64 {
+            let base = 1 + i * 1000;
+            let p = write_trailing_key_shard(tmp.path(), &format!("g{i}.db"), pk_cols, base, 100);
+            seed_guard(&mut idx, 0, trailing_gk(pk_cols, base), &p, i + 1);
+        }
+        assert_eq!(idx.levels[0].guards.len(), 4);
+        // The merge bound is a byte bound, so the four guards must fit it at the
+        // widest stride too or the run breaks for a reason this test is not about.
+        let bound = idx.guard_target_bytes(0) / 2;
+        let total: u64 = idx.guard_bytes(0).sum();
+        assert!(
+            total <= bound,
+            "stride {}: {total} B does not fit the {bound} B run bound",
+            pk_cols * 8
+        );
+
+        idx.merge_underfull_guards(0).unwrap();
+        assert_eq!(
+            idx.levels[0].guards.len(),
+            1,
+            "stride {}: one run, one guard",
+            pk_cols * 8
+        );
+        assert_eq!(
+            idx.levels[0].guards[0].guard_key,
+            trailing_gk(pk_cols, 1),
+            "stride {}: keyed by the run's lowest",
+            pk_cols * 8,
+        );
+    }
 }
 
 /// One fold writes at most `MAX_PARTS` shards however far over target the
@@ -1121,14 +1240,14 @@ fn a_guard_whose_rows_all_cancel_is_removed() {
         let rows: Vec<(Vec<u8>, i64, i64)> = (0..4u64).map(|k| (k.to_be_bytes().to_vec(), w, k as i64)).collect();
         let path = tmp.path().join(format!("cancel_{i}.db"));
         shard_file::write_test_shard(&path, &schema, &rows, shard_file::ShardWriteOpts::default());
-        seed_guard(&mut idx, 0, 0, path.to_str().unwrap(), i + 1);
+        seed_guard(&mut idx, 0, gk(0), path.to_str().unwrap(), i + 1);
     }
     // Weights sum to +1 per key over five entries, so one more retraction
     // takes every key to zero.
     let rows: Vec<(Vec<u8>, i64, i64)> = (0..4u64).map(|k| (k.to_be_bytes().to_vec(), -1, k as i64)).collect();
     let path = tmp.path().join("cancel_last.db");
     shard_file::write_test_shard(&path, &schema, &rows, shard_file::ShardWriteOpts::default());
-    seed_guard(&mut idx, 0, 0, path.to_str().unwrap(), 6);
+    seed_guard(&mut idx, 0, gk(0), path.to_str().unwrap(), 6);
 
     idx.split_overfull_guards(0).unwrap();
     assert!(
@@ -1784,8 +1903,8 @@ fn a_dehydrated_guard_stays_dehydrated_under_ordinary_compaction() {
 }
 
 /// `vertical_fold` bounds its destination range by the source guard's true
-/// key extent, not by the gap to the next L1 guard key — which is
-/// `u128::MAX` for the last (or only) guard and would rewrite the whole
+/// key extent, not by the gap to the next L1 guard key — which is the top of
+/// the key space for the last (or only) guard and would rewrite the whole
 /// terminal level on every spill.
 #[test]
 fn vertical_fold_touches_only_the_guards_its_extent_overlaps() {
@@ -1806,7 +1925,8 @@ fn vertical_fold_touches_only_the_guards_its_extent_overlaps() {
         .collect();
 
     // The only L1 guard, so a destination range derived from the gap to the
-    // next L1 guard key would be `u128::MAX` and rewrite all three.
+    // next L1 guard key would run to the top of the key space and rewrite all
+    // three.
     let p = write_test_shard(tmp.path(), "late.db", &[2, 3], &[2, 3]);
     seed_guard(&mut idx, 0, gk(2), &p, 50);
     idx.vertical_fold(0).unwrap();

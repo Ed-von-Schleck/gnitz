@@ -26,9 +26,16 @@ fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, id: u32, arena: u6
     Table::with_arena(dir.to_str().unwrap(), schema, id, arena, rs).unwrap()
 }
 
+/// Compaction output rather than flat spill? The `_L` level segment separates
+/// the two grammars. Only these tests ask — production reads each shard's level
+/// off the manifest.
+fn is_compaction_output(name: &str) -> bool {
+    name.contains("_L")
+}
+
 /// Names of the "flat" `shard_{table_id}_{lsn}.db` files directly in `dir` —
 /// the unified spill/barrier naming. Excludes L1+ compaction outputs
-/// (`shard_{tid}_{seq}_L{n}_G{guard}.db`, distinguished by the `_L` level
+/// (`shard_{tid}_{seq}_L{n}_P{part}.db`, distinguished by the `_L` level
 /// marker).
 fn shard_db_files(dir: &std::path::Path, table_id: u32) -> Vec<String> {
     let prefix = super::super::naming::shard_prefix(table_id);
@@ -36,9 +43,7 @@ fn shard_db_files(dir: &std::path::Path, table_id: u32) -> Vec<String> {
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| {
-                    n.starts_with(&prefix) && n.ends_with(".db") && !super::super::naming::is_compaction_output(n)
-                })
+                .filter(|n| n.starts_with(&prefix) && n.ends_with(".db") && !is_compaction_output(n))
                 .collect()
         })
         .unwrap_or_default()
@@ -52,13 +57,11 @@ fn count_files(dir: &std::path::Path, pred: impl Fn(&str) -> bool) -> usize {
 }
 
 /// Count compaction-output files for `table_id` — named
-/// `shard_{tid}_{seq}_L{n}_G{gk}.db`; the `_L` marker distinguishes them
+/// `shard_{tid}_{seq}_L{n}_P{part}.db`; the `_L` marker distinguishes them
 /// from flat spill/barrier shards. Presence proves a compaction ran.
 fn compaction_output_count(dir: &std::path::Path, table_id: u32) -> usize {
     let shard = super::super::naming::shard_prefix(table_id);
-    count_files(dir, |n| {
-        n.starts_with(&shard) && super::super::naming::is_compaction_output(n)
-    })
+    count_files(dir, |n| n.starts_with(&shard) && is_compaction_output(n))
 }
 
 /// Count every on-disk shard/compaction-output file for `table_id`.
@@ -397,7 +400,7 @@ fn table_new_corrupted_manifest_preserves_stray_shard() {
     std::fs::write(&manifest_path, b"not a valid manifest").unwrap();
 
     // Drop a stray shard file.
-    let stray = tdir.join("shard_200_1.db");
+    let stray = tdir.join(super::super::naming::spill_shard_name(200, 1));
     std::fs::write(&stray, b"orphan").unwrap();
 
     let result = Table::with_arena(tdir.to_str().unwrap(), schema, 200, 1 << 20, RecoverySource::SalReplay);
@@ -822,7 +825,7 @@ fn nondurable_mixed_disk_and_heap_read() {
 //
 // Twins of the durable retract tests above, but the rows stay in
 // the RAM tier (non-durable flush, sub-ceiling) instead of on disk, so the
-// `retract_pk*` / `has_pk_bytes` / `get_weight_for_row_bytes` RAM-tier code
+// `retract_pk*` / `has_pk_bytes` / `for_each_pk_candidate` RAM-tier code
 // is what's exercised. `retract_pk*` is production-invoked only on durable
 // base tables, but the machinery is tier-agnostic and these drive it directly.
 
@@ -866,9 +869,9 @@ fn inmem_retract_multiple_payloads() {
 }
 
 /// The live row sits in RAM while the memtable holds a *negative*-weight
-/// entry for the same PK. `get_weight_for_row_bytes` must net memtable + RAM
-/// per candidate (killing the payload that cancels to zero) and arm the
-/// globally-live payload from the RAM run.
+/// entry for the same PK. `for_each_pk_candidate` + `retract_pk_bytes` must net
+/// memtable + RAM per candidate (killing the payload that cancels to zero) and
+/// return the globally-live payload from the RAM run.
 #[test]
 fn inmem_cross_tier_netting() {
     let dir = tempfile::tempdir().unwrap();
@@ -941,11 +944,11 @@ fn retract_groups_across_all_three_tiers() {
     );
 }
 
-/// More than `FOLD_THRESHOLD` runs force a RAM-tier fold, which
-/// rebuilds the folded run's PK bloom via `InMemRun::from_batch`. After the
-/// fold, live rows must still be found (no false negative from the rebuilt
-/// bloom) and an all-runs-absent PK must report absent (bloom-miss path
-/// equals the linear result).
+/// More than `FOLD_THRESHOLD` runs force a RAM-tier fold, after which
+/// `RunSet::may_contain`'s `OnceCell` rebuilds the set's PK bloom over the live
+/// runs. Live rows must still be found (no false negative from the rebuilt
+/// bloom) and an all-runs-absent PK must report absent (bloom-miss path equals
+/// the linear result).
 #[test]
 fn inmem_fold_rebuilds_run_bloom() {
     let dir = tempfile::tempdir().unwrap();
@@ -1048,7 +1051,11 @@ fn salreplay_spill_unified_naming_and_lsn() {
         "spill registers with real LSNs (max_lsn == current_lsn - 1)"
     );
     let files1 = shard_db_files(&tdir, 7200);
-    assert_eq!(files1, vec![format!("shard_7200_{lsn1}.db")], "unified spill naming");
+    assert_eq!(
+        files1,
+        vec![super::super::naming::spill_shard_name(7200, lsn1)],
+        "unified spill naming"
+    );
 
     // Second spill at a distinct current_lsn → distinct filename, no collision.
     let b2: Vec<(u64, i64, i64)> = (100..110).map(|k| (k, 1, (k * 10) as i64)).collect();
@@ -1060,7 +1067,10 @@ fn salreplay_spill_unified_naming_and_lsn() {
     files2.sort();
     assert_eq!(
         files2,
-        vec![format!("shard_7200_{lsn1}.db"), format!("shard_7200_{lsn2}.db")],
+        vec![
+            super::super::naming::spill_shard_name(7200, lsn1),
+            super::super::naming::spill_shard_name(7200, lsn2)
+        ],
         "two spills → two distinct shard files"
     );
 
@@ -1546,7 +1556,7 @@ fn barrier_gate_matrix() {
                     .collect();
                 assert!(!swept.is_empty(), "the compaction outputs must be swept");
                 assert!(
-                    swept.iter().all(|p| super::super::naming::is_compaction_output(p)),
+                    swept.iter().all(|p| is_compaction_output(p)),
                     "the superseded inputs must have left the sweep list, got {swept:?}",
                 );
             }

@@ -123,7 +123,7 @@ fn linked_child_shard_opens_under_its_linked_name() {
     let source = ChildAddr::Worker { rank: 0, of: 2 }.dir(&rel_dir);
     super::super::table::ensure_dir(&source).unwrap();
 
-    let name = "shard_42_1.db";
+    let name = &super::super::naming::spill_shard_name(42, 1);
     let rows: Vec<(u64, i64, i64)> = (1..=4).map(|i| (i, 1, i as i64 * 10)).collect();
     make_batch(&schema, &rows)
         .write_as_shard(
@@ -133,7 +133,12 @@ fn linked_child_shard_opens_under_its_linked_name() {
         )
         .unwrap();
 
-    let entries = [manifest::ManifestEntryRaw::new(name, 1, 0, 0)];
+    let entries = [manifest::ManifestEntryRaw::new(
+        name,
+        1,
+        0,
+        crate::schema::key::PkBuf::zeroed(0),
+    )];
 
     let target = ChildAddr::Worker { rank: 1, of: 2 }.dir(&rel_dir);
     link_child(&source, &target, &entries, 0, 1).unwrap();

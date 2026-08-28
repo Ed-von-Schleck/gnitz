@@ -795,6 +795,137 @@ fn repartition_refuses_a_torn_set_at_a_foreign_count() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The `(worker, pk, weight)` triples a replicated `rows` must read back as at
+/// `of` workers — every rank holds every row. Sibling of [`expected_placement`],
+/// which is the key-routed rule.
+fn expected_replication(rows: &[(u128, i64)], of: u32) -> Vec<(u32, u128, i64)> {
+    (0..of)
+        .flat_map(|k| rows.iter().map(move |&(pk, _)| (k, pk, 1i64)))
+        .collect()
+}
+
+/// Fill every child of a replicated relation's `of`-worker set with all of
+/// `rows` and publish it. `seed_child_set`'s hash routing is the keyed rule and
+/// would leave each replica holding a slice.
+fn seed_replicated_set(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
+    for k in 0..of {
+        crate::storage::remove_child(&child_path(rel, k, of));
+        let mut t = open_child(rel, k, of, schema, tid);
+        fill_child(&mut t, schema, rows);
+    }
+}
+
+/// A replicated child set is a set of copies, so one survivor is a whole usable
+/// copy and a rank that never published still leaves the set relayable. Any
+/// survivor is safe, not only the newest: linking from a lagging one lowers the
+/// target's watermark and replays more, and cannot lose a row. The same shape on
+/// a keyed relation is a hash slice, not a copy, so it is still refused.
+#[test]
+fn a_replicated_set_relays_from_one_surviving_rank() {
+    for missing in [1u32, 0] {
+        let dir = temp_dir(&format!("repartition_replicated_partial_{missing}"));
+        let mut engine = CatalogEngine::open(&dir, 3).unwrap();
+        let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+        let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
+        let rel = engine.dag.tables[&rt].directory.clone();
+        let schema = engine.get_schema_desc(rt).unwrap();
+        engine.close();
+
+        let rows: Vec<(u128, i64)> = (0..30u128).map(|id| (id, id as i64)).collect();
+        seed_replicated_set(&rel, 3, schema, rt, &rows);
+        fs::remove_file(child_manifest(&rel, missing, 3)).unwrap();
+
+        let engine = CatalogEngine::open(&dir, 2).unwrap();
+        let got = set_rows(&rel, 2, schema, rt);
+        assert_eq!(
+            got,
+            expected_replication(&rows, 2),
+            "rank {missing} missing: every launched rank holds the copy"
+        );
+        assert!(
+            !Path::new(&child_path(&rel, 0, 3)).exists(),
+            "rank {missing} missing: the source set is retired"
+        );
+        drop(engine);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// The relaxation reaches the relay-source decision only. A relayout that
+/// crashed after its first target's publish leaves a *partial* set at the
+/// launched count carrying a layout sequence one above the source's; treating
+/// that as the live set would report `Current` and bring the relation up with an
+/// empty store on every rank whose child was never written — silently, and
+/// differently per worker.
+#[test]
+fn a_partial_target_at_the_launched_count_is_not_current() {
+    let dir = temp_dir("repartition_partial_target_replicated");
+    let mut engine = CatalogEngine::open(&dir, 2).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
+    let rel = engine.dag.tables[&rt].directory.clone();
+    let schema = engine.get_schema_desc(rt).unwrap();
+    engine.close();
+
+    // A 2-set relayed to 4, so the 4-set carries layout sequence 1.
+    let rows: Vec<(u128, i64)> = (0..30u128).map(|id| (id, id as i64)).collect();
+    seed_replicated_set(&rel, 2, schema, rt, &rows);
+    let engine = CatalogEngine::open(&dir, 4).unwrap();
+    drop(engine);
+    for k in 0..4 {
+        assert!(Path::new(&child_manifest(&rel, k, 4)).exists());
+    }
+
+    // Tear two ranks out of it and put a fresh 2-set (sequence 0) back beside
+    // it: the torn 4-set now outranks the complete 2-set on sequence alone.
+    for k in 2..4 {
+        crate::storage::remove_child(&child_path(&rel, k, 4));
+    }
+    seed_replicated_set(&rel, 2, schema, rt, &rows);
+
+    let engine = CatalogEngine::open(&dir, 4).unwrap();
+    assert_eq!(
+        set_rows(&rel, 4, schema, rt),
+        expected_replication(&rows, 4),
+        "the torn 4-set must be relaid over, not accepted as current"
+    );
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A relayout's output is already what a guard-partitioned level requires —
+/// globally ascending, non-overlapping, consolidated, one guard key per shard —
+/// so it registers at the terminal level. At L0 it would instead sit as a run
+/// nothing compacts until the next spill, whose single fold would then mint an
+/// `l0_run_bytes` the size of the whole child: a running max that never decays,
+/// leaving the store one guard for the rest of its life.
+#[test]
+fn a_relayout_registers_its_shards_at_the_terminal_level() {
+    let dir = temp_dir("repartition_terminal_level");
+    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
+    let rel = engine.dag.tables[&tid].directory.clone();
+    let schema = engine.get_schema_desc(tid).unwrap();
+    engine.close();
+
+    let rows: Vec<(u128, i64)> = (0..400u128).map(|id| (id, id as i64)).collect();
+    seed_child_set(&rel, 1, schema, tid, &rows);
+
+    let engine = CatalogEngine::open(&dir, 2).unwrap();
+    assert_eq!(set_rows(&rel, 2, schema, tid), expected_placement(&schema, &rows, 2));
+    for k in 0..2 {
+        let t = open_child(&rel, k, 2, schema, tid);
+        let shards = t.all_shard_arcs().len();
+        assert!(shards > 0, "child {k} holds no shard");
+        // Levels are 0-based in memory, so the relayout's output is the last:
+        // nothing in L0 or L1, one terminal guard per shard.
+        assert_eq!(t.level_shape(), (0, vec![0, shards]), "child {k}: terminal placement");
+    }
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Rebooting at the same count moves no data: the live set is already at the
 /// launched count, so no shard is rewritten.
 #[test]

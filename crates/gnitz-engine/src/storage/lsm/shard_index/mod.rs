@@ -12,7 +12,7 @@ use std::rc::Rc;
 use super::error::StorageError;
 use super::shard_reader::MappedShard;
 use crate::schema::key::PkBuf;
-use crate::schema::key::{pk_bytes_eq, pk_in_range};
+use crate::schema::key::{compare_pk_ordering, pack_pk_be, pk_bytes_eq, pk_in_range};
 use crate::schema::SchemaDescriptor;
 
 mod index;
@@ -118,6 +118,12 @@ impl ShardIndex {
             levels.join(" ")
         )
     }
+
+    /// The tree's shape as counts: L0 shards, then each level's guards. What a
+    /// test asserts a placement against, where `tree_report` is for reading.
+    pub(super) fn level_shape(&self) -> (usize, Vec<usize>) {
+        (self.l0.len(), self.levels.iter().map(|l| l.guards.len()).collect())
+    }
 }
 
 /// Serialized level bound: level numbers run 0 (L0) ..= `FLSM_LEVELS`, and
@@ -127,7 +133,7 @@ const MAX_LEVELS: usize = 3;
 const FLSM_LEVELS: usize = MAX_LEVELS - 1;
 /// Index of the deepest guarded level (L2). The one level whose guards fold to a
 /// single file, and the only one whose guards may be dehydrated.
-const TERMINAL_LEVEL_IDX: usize = FLSM_LEVELS - 1;
+pub(super) const TERMINAL_LEVEL_IDX: usize = FLSM_LEVELS - 1;
 /// L0 shards past this count trigger the fold into L1.
 pub(super) const L0_COMPACT_THRESHOLD: usize = 4;
 const GUARD_FILE_THRESHOLD: usize = 4;
@@ -144,6 +150,16 @@ const SWEEP_STEPS: u64 = 8;
 const SPLIT_SAMPLES: usize = 1024;
 /// Most destination buckets one fold may write — one output shard each.
 const MAX_PARTS: u64 = 64;
+
+/// Slot owning `key` in a sorted guard list: the last guard `≤ key`, saturating
+/// to slot 0 for keys below the first guard. `compact::merge_and_route` derives
+/// the same slots independently, and `compact`'s differential oracle checks the
+/// two — which is why this stays a named function.
+pub(super) fn guard_slot<T>(guards: &[T], key: &[u8], gk: impl Fn(&T) -> &[u8]) -> usize {
+    guards
+        .partition_point(|g| compare_pk_ordering(gk(g), key).is_le())
+        .saturating_sub(1)
+}
 
 /// One compaction's input set, as [`ShardIndex::compaction_inputs`] gathers it.
 #[derive(Default)]
@@ -233,12 +249,12 @@ impl ShardEntry {
 }
 
 struct LevelGuard {
-    guard_key: u128,
+    guard_key: PkBuf,
     entries: Vec<ShardEntry>,
 }
 
 impl LevelGuard {
-    fn new(gk: u128) -> Self {
+    fn new(gk: PkBuf) -> Self {
         LevelGuard {
             guard_key: gk,
             entries: Vec::new(),
@@ -276,7 +292,8 @@ impl LevelGuard {
     /// taking that round refuses exactly the cursors that would have needed the
     /// part that went.
     fn highest_leading_u64(&self) -> Option<u64> {
-        self.key_extent().map(|(_, max)| (max >> 64) as u64)
+        self.key_extent()
+            .map(|(_, max)| (pack_pk_be(max.pk_bytes()) >> 64) as u64)
     }
 
     /// Total registered bytes of this guard's entries.
@@ -294,12 +311,12 @@ impl LevelGuard {
     /// below its own key; minting a guard down there is what makes that tail
     /// addressable.
     ///
-    /// A guard whose rows share one `pack_pk_be` key cannot be cut, and says so
-    /// from its extent rather than from a sample — it stays over target forever,
-    /// so a sampling pass would repeat on it indefinitely. That is also the limit
-    /// of `target` as a bound: PKs differing only past their leading 16 bytes
-    /// share a route key, so their group never splits.
-    fn fold_destinations(&self, target: u64) -> Vec<u128> {
+    /// A guard holding one distinct key cannot be cut, and says so from its
+    /// extent rather than from a sample — it stays over target forever, so a
+    /// sampling pass would repeat on it indefinitely. That is the one limit of
+    /// `target` as a bound, and it is inherent: a guard boundary *is* a key, so
+    /// rows sharing a PK cannot be split across one.
+    fn fold_destinations(&self, target: u64) -> Vec<PkBuf> {
         let mut keys = vec![self.guard_key];
         let parts = self.bytes().div_ceil(target).min(MAX_PARTS) as usize;
         let cuttable = self.key_extent().is_some_and(|(lo, hi)| lo < hi);
@@ -316,15 +333,15 @@ impl LevelGuard {
     /// About [`SPLIT_SAMPLES`] of this guard's row keys, sorted and deduped. Each
     /// shard is already sorted and its PK region is fixed-stride, so a key is one
     /// O(1) read.
-    fn sample_keys(&self) -> Vec<u128> {
+    fn sample_keys(&self) -> Vec<PkBuf> {
         let rows: usize = self.entries.iter().map(|e| e.shard.count).sum();
         let step = (rows / SPLIT_SAMPLES).max(1);
-        let mut sample: Vec<u128> = Vec::with_capacity(SPLIT_SAMPLES + self.entries.len());
+        let mut sample: Vec<PkBuf> = Vec::with_capacity(SPLIT_SAMPLES + self.entries.len());
         for e in self.entries.iter().filter(|e| !e.is_empty()) {
             sample.extend(
                 (0..e.shard.count)
                     .step_by(step)
-                    .map(|r| crate::schema::key::pack_pk_be(e.shard.get_pk_bytes(r))),
+                    .map(|r| PkBuf::from_bytes(e.shard.get_pk_bytes(r))),
             );
         }
         sample.sort_unstable();
@@ -332,17 +349,13 @@ impl LevelGuard {
         sample
     }
 
-    /// The `pack_pk_be` key span this guard's entries actually cover, or `None` for
-    /// a guard holding no rows. The guard *key* is only the span's lower fence, so
-    /// a fold out of this guard must route by this instead — see
+    /// The key span this guard's entries actually cover, or `None` for a guard
+    /// holding no rows. The guard *key* is only the span's lower fence, so a fold
+    /// out of this guard must route by this instead — see
     /// [`ShardIndex::vertical_fold`].
-    fn key_extent(&self) -> Option<(u128, u128)> {
+    fn key_extent(&self) -> Option<(PkBuf, PkBuf)> {
         let live = || self.entries.iter().filter(|e| !e.is_empty());
-        let opk = |k: &crate::schema::key::PkBuf| crate::schema::key::pack_pk_be(k.pk_bytes());
-        Some((
-            live().map(|e| opk(&e.pk_min)).min()?,
-            live().map(|e| opk(&e.pk_max)).max()?,
-        ))
+        Some((live().map(|e| e.pk_min).min()?, live().map(|e| e.pk_max).max()?))
     }
 }
 
@@ -355,9 +368,9 @@ impl FLSMLevel {
         FLSMLevel { guards: Vec::new() }
     }
 
-    fn find_guard_idx(&self, key: u128) -> Option<usize> {
+    fn find_guard_idx(&self, key: &[u8]) -> Option<usize> {
         // Empty level → `None` (skip this level).
-        (!self.guards.is_empty()).then(|| super::guard_slot(&self.guards, key, |g| g.guard_key))
+        (!self.guards.is_empty()).then(|| guard_slot(&self.guards, key, |g| g.guard_key.pk_bytes()))
     }
 
     /// The guards overlapping `[range_min, range_max]`. Guards partition the key
@@ -365,12 +378,14 @@ impl FLSMLevel {
     ///
     /// Never empty while a guard exists: guard 0 owns the tail below its own key,
     /// so it answers a range that falls entirely under the partition.
-    fn find_guards_for_range(&self, range_min: u128, range_max: u128) -> std::ops::Range<usize> {
+    fn find_guards_for_range(&self, range_min: &[u8], range_max: &[u8]) -> std::ops::Range<usize> {
         // `find_guard_idx` is `None` exactly for an empty level.
         let Some(start) = self.find_guard_idx(range_min) else {
             return 0..0;
         };
-        let end = self.guards.partition_point(|g| g.guard_key <= range_max);
+        let end = self
+            .guards
+            .partition_point(|g| compare_pk_ordering(g.guard_key.pk_bytes(), range_max).is_le());
         start..end.max(start + 1)
     }
 
@@ -382,11 +397,11 @@ impl FLSMLevel {
     /// The guard keyed exactly `gk` — a guard's identity wherever a fold may have
     /// moved indices under the caller. [`Self::find_guard_idx`] answers the
     /// routing question instead.
-    fn find_exact_guard(&self, gk: u128) -> Option<usize> {
+    fn find_exact_guard(&self, gk: PkBuf) -> Option<usize> {
         self.guards.binary_search_by_key(&gk, |g| g.guard_key).ok()
     }
 
-    fn get_or_create_guard(&mut self, gk: u128) -> &mut LevelGuard {
+    fn get_or_create_guard(&mut self, gk: PkBuf) -> &mut LevelGuard {
         let pos = match self.guards.binary_search_by_key(&gk, |g| g.guard_key) {
             Ok(pos) => pos,
             Err(pos) => {
@@ -437,7 +452,7 @@ pub(super) struct ShardIndex {
     /// this store has ever dropped. A delta read at `after_tick > dropped_through`
     /// asks only for rows above it, and no such row was ever dropped; a read at or
     /// below it is refused. Zero until the first drop, and always zero for a store
-    /// whose eviction residue is not `Nothing`.
+    /// that does not evict by dropping ([`Self::evict_by_drop`]).
     dropped_through: u64,
     /// Passed to every compaction's write. Held rather than derived from the
     /// input shards: a derivation would let one filterless input turn the filter
@@ -446,6 +461,12 @@ pub(super) struct ShardIndex {
 }
 
 impl ShardIndex {
+    /// The 1-based level *number* of a 0-based tier index — see
+    /// [`ensure_level`](Self::ensure_level) for where that number is used.
+    pub(super) fn level_num(level_idx: usize) -> usize {
+        level_idx + 1
+    }
+
     /// `skip_pk_filter` declares that nothing point-probes this store by PK, so
     /// its shards need no PK filter.
     pub(super) fn new(table_id: u32, output_dir: &str, schema: SchemaDescriptor, skip_pk_filter: bool) -> Self {
@@ -531,9 +552,9 @@ impl ShardIndex {
     /// Infallible half: install the mappings [`reopen_all`](Self::reopen_all)
     /// staged, in the same (deterministic) `all_entries` order, and publish
     /// `new_schema`. `staged` is empty for an equal-region swap, in which case
-    /// only the comparator schema moves — `compact_shards` / `ShardEntry::open`
-    /// read `&self.schema` per call, so every subsequent compaction uses the new
-    /// comparator.
+    /// only the comparator schema moves — `ShardIndex::compact_into` /
+    /// `ShardEntry::open` read `&self.schema` per call, so every subsequent
+    /// compaction uses the new comparator.
     pub(super) fn install_reopened(&mut self, staged: Vec<Rc<MappedShard>>, new_schema: SchemaDescriptor) {
         debug_assert!(
             staged.is_empty() || staged.len() == self.all_entries().count(),

@@ -3,31 +3,22 @@
 //! under both the wire range-seek and the bounded backfill scan — all policy
 //! (which index, whether to bound at all, selectivity gating) stays with the
 //! caller.
+//!
+//! **An index owner is always a base table**, so `enforce_unique_pk` gives each
+//! PK exactly one live payload and a PK group cannot straddle a chunk boundary.
+//! That is what makes a chunked walk exact without a per-row window filter. If
+//! the invariant ever broke, a skewed entry would yield a visibly wrong row
+//! rather than being silently dropped.
 
 use super::batch::{Batch, Layout};
 use super::read_cursor::ReadCursor;
 use crate::schema::key::PkBuf;
-use crate::schema::{IndexKeySpec, SchemaDescriptor, MAX_PK_BYTES};
-use gnitz_expr::RowSource;
+use crate::schema::IndexKeySpec;
 
 /// Resolve already-collected source PKs against the base table into a result
-/// batch — every live row whose index entry key `[span ‖ src_pk]` lies in the
-/// half-open `[lo, hi)`, at its net `current_weight` (never a hardcoded 1, so
-/// Z-Set multiplicity is preserved) — or `None` when nothing resolves.
-///
-/// `lo`/`hi` are the byte bounds of exactly the entries whose PKs were collected
-/// (the caller's per-chunk window), over the identical key the write path built
-/// (`IndexKeySpec::write_entry`). An entry denotes (span, PK), not PK, so the
-/// window filter is what makes a *chunked* walk exact: a PK group is gathered by
-/// every chunk whose window touches it, but each row passes the filter only in
-/// the chunk whose window holds its entry. `hi == None` is `+∞`.
-/// `lo.len()` IS the index PK stride — every cut key is built at exactly that
-/// width (`index_range_keys`).
-///
-/// `spec` must be **full-arity** over the index's columns. A prefix-arity spec
-/// would only null-check its leading columns, admitting rows the index omits: the
-/// write path skips a row with a NULL in ANY indexed column, so the gather must
-/// apply that same all-column gate and let `lo`/`hi` do the prefix bounding.
+/// batch — every live row of each collected PK group, at its net
+/// `current_weight` (never a hardcoded 1, so Z-Set multiplicity is preserved) —
+/// or `None` when nothing resolves.
 ///
 /// The base cursor is caller-held so a chunked walk resolves every chunk against
 /// ONE base snapshot (a per-chunk re-open would give successive chunks different
@@ -40,107 +31,19 @@ use gnitz_expr::RowSource;
 /// suffixes, whose memcmp order equals base storage order, so a byte sort *is*
 /// the seek order. Ascending **within** a chunk only — chunk N+1's first PK may
 /// sort below chunk N's last, which is why the sweep must stay backward-capable.
-fn gather_source_rows(
-    src: &mut ReadCursor,
-    pks: &[PkBuf],
-    spec: &IndexKeySpec,
-    lo: &[u8],
-    hi: Option<&[u8]>,
-) -> Option<Batch> {
+fn gather_source_rows(src: &mut ReadCursor, pks: &[PkBuf]) -> Option<Batch> {
     debug_assert!(
         pks.windows(2).all(|w| w[0] < w[1]),
         "gather_source_rows requires strictly ascending (sorted + deduped) PKs"
     );
-    // Phase 1 — candidates: every live row of each PK group. An index owner is
-    // always a base table (one live payload per PK), so `pks.len()` sizes it
-    // exactly.
+    // An index owner is always a base table (one live payload per PK), so
+    // `pks.len()` sizes the result exactly.
     let src_schema = *src.schema();
     let mut cand = Batch::with_capacity(src_schema, pks.len());
     for pk in pks {
         src.copy_live_pk_group_into(pk.pk_bytes(), &mut cand);
     }
-    if cand.count == 0 {
-        return None;
-    }
-    // Phase 2 — drop every candidate outside `[lo, hi)`, or that the index omits
-    // (NULL in an indexed column).
-    retain_in_index_range(cand, &src_schema, spec, lo, hi)
-}
-
-/// Whether `row` of `mb` is denoted by an index entry in `[lo, hi)`. `key` is
-/// scratch for the row's entry key, rebuilt through the write path's own
-/// `IndexKeySpec::write_entry` (`false` = not indexed: a NULL in any indexed
-/// column).
-#[inline]
-fn row_in_index_range(
-    mb: &impl RowSource,
-    row: usize,
-    spec: &IndexKeySpec,
-    idx_stride: usize,
-    key: &mut [u8; MAX_PK_BYTES],
-    lo: &[u8],
-    hi: Option<&[u8]>,
-) -> bool {
-    if !spec.write_entry(mb, row, key) {
-        return false;
-    }
-    let k = &key[..idx_stride];
-    k >= lo && hi.is_none_or(|h| k < h)
-}
-
-/// Keep the rows of `cand` whose index entry key lies in `[lo, hi)`. One
-/// contiguous pass over the flat batch; on a miss, one range gather
-/// (`Batch::from_ranges`).
-///
-/// A candidate normally matches — the row's own span produced the entry the walk
-/// yielded — so the scan usually finds no failing row and returns `cand`
-/// verbatim. Misses come from a NULL-gated row on a prefix seek or a row whose
-/// entry falls outside the chunk window; survivors then come in contiguous runs,
-/// which is why the copy is range-based. The blob is *not* shared from `cand`
-/// (hence `append_ranges` rather than `Batch::from_ranges`): this result is what
-/// the wire range-seek ships, and sharing would carry the dropped candidates'
-/// string spans over the wire.
-fn retain_in_index_range(
-    cand: Batch,
-    src_schema: &SchemaDescriptor,
-    spec: &IndexKeySpec,
-    lo: &[u8],
-    hi: Option<&[u8]>,
-) -> Option<Batch> {
-    let idx_stride = lo.len();
-    // Guards the full-arity precondition: with a prefix spec the suffix copy in
-    // `write_entry` would land inside the uncovered columns' bytes.
-    debug_assert_eq!(spec.key_size() + src_schema.pk_stride() as usize, idx_stride);
-    debug_assert!(hi.is_none_or(|h| h.len() == idx_stride));
-    // MAX_PK_BYTES (80) bounds every index schema's pk_stride (asserted in
-    // `SchemaDescriptor::new`), so the key scratch is a stack array.
-    let mut key = [0u8; MAX_PK_BYTES];
-
-    let mb = cand.as_mem_batch();
-    let first_fail = (0..cand.count).position(|r| !row_in_index_range(&mb, r, spec, idx_stride, &mut key, lo, hi));
-    let Some(first_fail) = first_fail else {
-        return Some(cand);
-    };
-    // Rows below `first_fail` already passed — one range, never re-tested.
-    let mut keep: Vec<(usize, usize)> = Vec::new();
-    if first_fail > 0 {
-        keep.push((0, first_fail));
-    }
-    for r in first_fail + 1..cand.count {
-        if !row_in_index_range(&mb, r, spec, idx_stride, &mut key, lo, hi) {
-            continue;
-        }
-        match keep.last_mut() {
-            Some(last) if last.1 == r => last.1 = r + 1,
-            _ => keep.push((r, r + 1)),
-        }
-    }
-    if keep.is_empty() {
-        return None;
-    }
-    let mut out = Batch::with_capacity(*src_schema, crate::storage::range_rows(&keep));
-    out.append_ranges(&cand, &keep);
-    Some(out)
+    (cand.count > 0).then_some(cand)
 }
 
 /// A chunked walk of one secondary-index key range, gathering each in-range live
@@ -162,10 +65,6 @@ fn retain_in_index_range(
 pub struct BoundedIndexCursor {
     idx: ReadCursor,
     src: ReadCursor,
-    /// The current chunk window's inclusive lower bound — the walk's `start` at
-    /// first, then each chunk's exclusive upper bound in turn.
-    start: PkBuf,
-    end: Option<PkBuf>,
     pks: Vec<PkBuf>,
     spec: IndexKeySpec,
 }
@@ -173,11 +72,11 @@ pub struct BoundedIndexCursor {
 impl BoundedIndexCursor {
     /// Position `idx` at `start` and wrap the index cursor and the base cursor
     /// for the walk over the half-open range `[start, end)` (`end = None` ⇒ to
-    /// the end of the index). `spec` is the index's full-arity key spec — its
-    /// `key_size()` is the leading-key byte length (where the source-PK OPK
-    /// suffix starts), and it re-projects each candidate row's entry key for the
-    /// per-chunk window filter. `pk_capacity` pre-sizes the per-chunk PK scratch
-    /// (pass the measured range size capped at the chunk size, or 0 to grow).
+    /// the end of the index). The range is the cursor's from then on — no walk
+    /// re-checks it, per `ReadCursor::seek_range_bytes`. `spec` supplies
+    /// `key_size()`, the leading-key byte length where each entry's source-PK OPK
+    /// suffix starts. `pk_capacity` pre-sizes the per-chunk PK scratch (pass the
+    /// measured range size capped at the chunk size, or 0 to grow).
     pub(crate) fn new(
         mut idx: ReadCursor,
         src: ReadCursor,
@@ -190,8 +89,6 @@ impl BoundedIndexCursor {
         BoundedIndexCursor {
             idx,
             src,
-            start,
-            end,
             pks: Vec::with_capacity(pk_capacity),
             spec,
         }
@@ -219,18 +116,6 @@ impl BoundedIndexCursor {
         if self.pks.is_empty() {
             return None;
         }
-        // This chunk's exclusive upper bound: the first UNCOLLECTED entry (the
-        // index cursor's resting key), clamped to `end`. The gather emits every
-        // live row of each collected PK group, so on a source where one PK owns
-        // several live entries a group can straddle a chunk boundary; windowing
-        // each chunk to exactly the entries it collected makes each row pass the
-        // filter in the one chunk that collected its entry — chunked and
-        // unchunked drains yield identical multisets by construction.
-        let hi: Option<PkBuf> = if self.idx.valid {
-            Some(PkBuf::from_bytes(self.idx.current_pk_bytes()))
-        } else {
-            self.end
-        };
         // A range spans many duplicate groups, so collected PKs interleave across
         // the base; the gather requires ascending order for its monotone sweep.
         // No re-seek between chunks: chunk N+1's first PK may sort below chunk N's
@@ -243,27 +128,12 @@ impl BoundedIndexCursor {
         // `Some(empty)`, not `None`: the gather returns `None` when nothing
         // resolves. Both backfill drivers read `None` as exhaustion, so letting
         // that escape would silently truncate the view mid-range.
-        let mut batch = gather_source_rows(
-            &mut self.src,
-            &self.pks,
-            &self.spec,
-            self.start.pk_bytes(),
-            hi.as_ref().map(|e| e.pk_bytes()),
-        )
-        .unwrap_or_else(|| Batch::empty_with_schema(self.src.schema()));
-        // The next chunk's window begins where this one ended. (`None` = `+∞`:
-        // the walk is over and the next `drain_chunk` returns `None` above.)
-        if let Some(h) = hi {
-            self.start = h;
-        }
-        // Consolidated by construction — rows are emitted in (PK, payload) order
-        // (the group walk is at (PK, payload)-sub-group granularity, over
-        // strictly-ascending PKs) with nonzero net weights, and the window filter
-        // preserves order — so certify it (debug-verified) and spare the ingest
-        // tail its O(chunk log chunk) re-sort, matching what the full-scan drain
-        // path certifies. `debug_verify_consolidated` checks strictly-increasing
-        // (PK, payload) and nonzero weight, never PK uniqueness, so two rows
-        // sharing a PK with ascending payloads certify cleanly.
+        let mut batch =
+            gather_source_rows(&mut self.src, &self.pks).unwrap_or_else(|| Batch::empty_with_schema(self.src.schema()));
+        // Consolidated by construction: the group walk emits (PK, payload) order
+        // at sub-group granularity over strictly-ascending PKs, at nonzero net
+        // weights. Certifying it spares the ingest tail an O(chunk log chunk)
+        // re-sort, as the full-scan drain path does.
         batch.certify_layout(Layout::Consolidated, self.src.schema());
         Some(batch)
     }

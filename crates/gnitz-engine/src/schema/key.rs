@@ -470,6 +470,21 @@ impl PkBuf {
         }
     }
 
+    /// All-`0xFF` key of the given width — the top of the key space, and the
+    /// mirror of [`Self::zeroed`]: an OPK region is compared as unsigned bytes,
+    /// so no key of that width sorts above it. The upper bound an open-ended
+    /// range takes, where a short key would sort *below* every full key sharing
+    /// its prefix.
+    pub fn max(len: usize) -> Self {
+        debug_assert!(len <= MAX_PK_BYTES);
+        let mut k = PkBuf {
+            bytes: [0u8; MAX_PK_BYTES],
+            len: len as u8,
+        };
+        k.bytes[..len].fill(0xFF);
+        k
+    }
+
     /// `len = slice.len()`, `bytes[..len]` copied from `slice`, tail
     /// zero. The row constructor: `MappedShard::get_pk_bytes(row)`
     /// returns exactly `pk_stride` bytes, and manifest `parse` passes
@@ -645,11 +660,11 @@ impl IndexKeySpec {
     /// [`Self::write_span`] plus the source-PK OPK suffix: one row's full index
     /// entry key `[span ‖ src_pk]` in `dst[..key_size() + pk_stride]`. The single
     /// definition of "this row's index entry", shared by the write-side
-    /// projection (`batch_project_index`) and the read-side entry-range filter
-    /// (`row_in_index_range`), so the two agree byte-for-byte by construction.
-    /// Returns `false` (row not indexed — NULL in an indexed column; `dst`
-    /// partially written) exactly as `write_span` does. Full-arity specs only:
-    /// a prefix spec would place the suffix over the uncovered columns' bytes.
+    /// projection (`batch_project_index`) and the in-batch uniqueness validator,
+    /// so the two agree byte-for-byte by construction. Returns `false` (row not
+    /// indexed — NULL in an indexed column; `dst` partially written) exactly as
+    /// `write_span` does. Full-arity specs only: a prefix spec would place the
+    /// suffix over the uncovered columns' bytes.
     pub(crate) fn write_entry(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
         if !self.write_span(mb, row, dst) {
             return false;
@@ -857,7 +872,7 @@ pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: us
             decrement_key_in_place(&mut l.bytes[..l.len as usize]);
             l
         }
-        None => PkBuf::from_bytes(&[0xFFu8; MAX_PK_BYTES][..start.len as usize]),
+        None => PkBuf::max(start.len as usize),
     };
     start.pk_bytes()[..prefix] == last.pk_bytes()[..prefix]
 }

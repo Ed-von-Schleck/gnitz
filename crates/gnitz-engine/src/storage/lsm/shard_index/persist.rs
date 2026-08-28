@@ -8,6 +8,7 @@ use std::ffi::CStr;
 use super::super::error::StorageError;
 use super::super::manifest::{self, ManifestEntryRaw, ManifestHeader, PreparedManifest};
 use super::{ShardEntry, ShardIndex, MAX_LEVELS};
+use crate::schema::key::PkBuf;
 
 /// Basename of a shard's full path — its manifest identity. Shard files always
 /// live flat in the table's `output_dir`, which `load_manifest` re-prepends.
@@ -23,7 +24,9 @@ impl ShardIndex {
     fn build_manifest_entries(&self) -> Vec<ManifestEntryRaw> {
         let mut entries = Vec::new();
         for e in &self.l0 {
-            entries.push(self.entry_to_raw(e, 0, 0));
+            // An L0 entry has no guard; `load_manifest` reads `guard_key` only
+            // for `level > 0`, so the zero key it stores is never consulted.
+            entries.push(self.entry_to_raw(e, 0, PkBuf::zeroed(0)));
         }
         for (li, level) in self.levels.iter().enumerate() {
             for guard in &level.guards {
@@ -35,7 +38,7 @@ impl ShardIndex {
         entries
     }
 
-    fn entry_to_raw(&self, e: &ShardEntry, level: u64, gk: u128) -> ManifestEntryRaw {
+    fn entry_to_raw(&self, e: &ShardEntry, level: u64, gk: PkBuf) -> ManifestEntryRaw {
         ManifestEntryRaw::new(shard_basename(&e.filename), e.max_lsn, level, gk)
     }
 
@@ -52,6 +55,7 @@ impl ShardIndex {
         // manifest-referenced shard across a restart.
         self.compact_seq = header.compact_seq;
 
+        let stride = self.schema.pk_stride() as usize;
         for raw in &entries {
             // The manifest stores the basename; the shard lives in this table's
             // directory (`entry_to_raw`). Re-prepend it to recover the path.
@@ -69,15 +73,16 @@ impl ShardIndex {
                 if raw.level >= MAX_LEVELS as u64 {
                     return Err(StorageError::InvalidVersion);
                 }
-                // The manifest carries the 1-based level number; the in-memory
-                // tier is indexed from 0. This is one of the two places that
-                // conversion happens (the other is `entry_to_raw`, writing it).
+                // The read side of `ShardIndex::level_num`, which every writer
+                // goes through.
                 let level_idx = raw.level as usize - 1;
                 self.ensure_level(level_idx);
-                self.levels[level_idx]
-                    .get_or_create_guard(raw.guard_key)
-                    .entries
-                    .push(entry);
+                // Every stored guard key is exactly `pk_stride` wide (a sample
+                // key, a shard bound, or a synthetic key minted at that stride),
+                // zero-padded into the field — so the schema recovers the width
+                // and the manifest carries no length.
+                let gk = PkBuf::from_bytes(&raw.guard_key[..stride]);
+                self.levels[level_idx].get_or_create_guard(gk).entries.push(entry);
             }
         }
         self.sort_l0();

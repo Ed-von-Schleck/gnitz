@@ -10,19 +10,15 @@ pub(super) fn spill_shard_name(table_id: u32, lsn: u64) -> String {
     format!("shard_{table_id}_{lsn}.db")
 }
 
-/// Compaction-output shard basename: `shard_{tid}_{seq}_L{level}_G{guard}.db`.
-/// `compact_seq` is per-table monotonic and manifest-persisted (globally unique
-/// across restarts) and `guard_key` is unique within a call, so no two outputs
-/// ever share a basename over the table's lifetime — which is what keeps the
-/// finalizing rename from clobbering a live shard. Collision-free against the
-/// flat grammar: a spill name has no `_L` segment.
-pub(super) fn compact_shard_name(table_id: u32, compact_seq: u64, level_num: usize, guard_key: u128) -> String {
-    let name = format!("shard_{table_id}_{compact_seq}_L{level_num}_G{guard_key}.db");
-    // The grammar's worst case (~84 bytes) is well inside the manifest's 128-byte
-    // filename field, which is the binding limit — a basename that overflows it
-    // reloads as an unopenable shard.
+/// Compaction-output shard basename: `shard_{tid}_{seq}_L{level}_P{part}.db`.
+/// `compact_seq` is per-table monotonic and manifest-persisted and `part` is the
+/// output's index within the compaction, so `(seq, part)` is unique over the
+/// table's lifetime — which keeps the finalizing rename from clobbering a live
+/// shard. Collision-free against the flat grammar: a spill name has no `_L`.
+pub(super) fn compact_shard_name(table_id: u32, compact_seq: u64, level_num: usize, part: usize) -> String {
+    let name = format!("shard_{table_id}_{compact_seq}_L{level_num}_P{part}.db");
     debug_assert!(
-        name.len() < 128,
+        name.len() < super::manifest::W_FILENAME,
         "compaction basename overflows the manifest field: {name}"
     );
     name
@@ -32,14 +28,6 @@ pub(super) fn compact_shard_name(table_id: u32, compact_seq: u64, level_num: usi
 /// way to ask "does this file belong to `table_id`".
 pub(super) fn shard_prefix(table_id: u32) -> String {
     format!("shard_{table_id}_")
-}
-
-/// Compaction output rather than flat spill? The `_L` level segment separates the
-/// two grammars. Only tests ask — production reads each shard's level off the
-/// manifest.
-#[cfg(test)]
-pub(super) fn is_compaction_output(name: &str) -> bool {
-    name.contains("_L")
 }
 
 /// Remove every one of `table_id`'s shard files in `dir` whose basename is not

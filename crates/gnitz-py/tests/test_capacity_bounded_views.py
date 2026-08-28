@@ -242,6 +242,68 @@ def test_all_null_and_all_zero_payloads_survive_dehydration(bounded_client, boun
         assert _any_skeleton(bounded_server.data_dir, bid), f"{b} must have dehydrated"
 
 
+def test_a_single_tenant_uuid_pk_dehydrates_gradually(bounded_client, bounded_server):
+    """The degenerate PK shape: `PRIMARY KEY (a UUID, b UUID)` with one distinct
+    `a`, so every row's leading sixteen OPK bytes are identical.
+
+    A guard partition keyed on a truncated prefix cannot cut such a store — it is
+    one guard end to end, the byte target stops bounding it, and the first sweep
+    dehydrates the whole view at once, so a read recomputes everything from the
+    source and the view stops being materialized. Keyed on the whole PK the store
+    partitions on the trailing column like any other, so the sweep leaves
+    hydrated guards behind while it evicts the coldest.
+
+    Reads are checked against the unbounded twin first: correctness is never a
+    function of what is resident, whichever way the partition falls.
+    """
+    sn = "s" + _uid()
+    bounded_client.create_schema(sn)
+    bounded_client.execute_sql(
+        "CREATE TABLE t (a UUID NOT NULL, b UUID NOT NULL, body TEXT NOT NULL, PRIMARY KEY (a, b))",
+        schema_name=sn,
+    )
+    body = "SELECT a, b, body FROM t"
+    bounded_client.execute_sql(f"CREATE VIEW bu WITH (capacity = '1 KB') AS {body}", schema_name=sn)
+    bounded_client.execute_sql(f"CREATE VIEW pu AS {body}", schema_name=sn)
+    bid, _ = bounded_client.resolve_table(sn, "bu")
+    pid, _ = bounded_client.resolve_table(sn, "pu")
+
+    # One tenant, so `a` is constant; `b` varies only in its low bytes, which are
+    # the OPK bytes past 16. Inserted in batches so the view spills repeatedly.
+    tenant = "11111111-1111-1111-1111-111111111111"
+    n = 1200
+    for lo in range(0, n, 100):
+        vals = ",".join(
+            f"('{tenant}', '00000000-0000-0000-0000-{i:012x}', 'body-{i:0>20}')" for i in range(lo, lo + 100)
+        )
+        bounded_client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+
+    assert _rows(bounded_client, bid) == _rows(bounded_client, pid), "full scan"
+    # Point lookups on the coldest, middle and newest keys, plus the ScanSpec
+    # and aggregate paths. The wire `seek` verb takes a compound PK as its
+    # native byte image, which would be a second spelling of the OPK encoding
+    # here, so these go through SQL — the path a reader actually uses.
+    for i in [0, n // 2, n - 1]:
+        b = f"00000000-0000-0000-0000-{i:012x}"
+        q = f"SELECT b, body FROM {{v}} WHERE a = '{tenant}' AND b = '{b}'"
+        got = _sql_rows(bounded_client, sn, q.format(v="bu"))
+        assert got == _sql_rows(bounded_client, sn, q.format(v="pu")), f"point lookup {b}"
+        assert len(got) == 1, f"point lookup {b}: {got}"
+    for q in ["SELECT COUNT(*) FROM {v}", "SELECT b FROM {v} ORDER BY b LIMIT 25"]:
+        assert _sql_rows(bounded_client, sn, q.format(v="bu")) == _sql_rows(
+            bounded_client, sn, q.format(v="pu")
+        ), q
+
+    # The sweep evicted something, and it did so a guard at a time: an
+    # all-or-nothing store leaves not one hydrated shard behind.
+    shards = _shard_files(bounded_server.data_dir, bid)
+    assert any(_is_skeleton(p) for p in shards), "the bounded store must have dehydrated"
+    assert any(not _is_skeleton(p) for p in shards), (
+        "every shard is a skeleton — the store was one unsplittable guard, so the "
+        "sweep had no smaller unit than the whole view"
+    )
+
+
 # ── capacity semantics ───────────────────────────────────────────────────────
 
 

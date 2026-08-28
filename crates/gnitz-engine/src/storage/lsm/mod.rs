@@ -11,9 +11,9 @@
 //! single combined storage surface and re-exports the public items from these
 //! submodules. The repr (L2) siblings live under `storage/repr/`; this module
 //! aliases the repr submodules and the few storage-level helpers (`error`,
-//! `cstr`/`cstr_with_tmp_suffix`, the `with_*` dispatch
-//! macros) so the LSM files keep their `super::<mod>` paths unchanged after the
-//! move under `lsm/`.
+//! `cstr`/`cstr_with_tmp_suffix`) so the LSM files keep their `super::<mod>`
+//! paths unchanged after the move under `lsm/`. The `with_*` dispatch macros
+//! are not aliased here — they are reached through the aliased `columnar`.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -43,12 +43,3 @@ use super::repr::{batch, bloom, columnar, heap, merge, scatter, shard_file, shar
 #[cfg(test)]
 use super::repr::layout;
 use super::{cstr, cstr_with_tmp_suffix, error};
-
-/// Slot owning `key` in a sorted guard list: the last guard `≤ key`, saturating
-/// to slot 0 for keys below the first guard. The read router
-/// (`FLSMLevel::find_guard_idx`) routes through this; `compact::merge_and_route`
-/// reproduces the same slots by binary-searching its sorted survivor buffer, and
-/// the differential oracles route through here to keep the two independent.
-pub(crate) fn guard_slot<T>(guards: &[T], key: u128, gk: impl Fn(&T) -> u128) -> usize {
-    guards.partition_point(|g| gk(g) <= key).saturating_sub(1)
-}

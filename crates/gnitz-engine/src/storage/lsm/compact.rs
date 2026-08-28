@@ -16,7 +16,7 @@ use super::merge::{run_merge, ColPtr, UnifiedSource};
 use super::scatter::scatter_unified_sources;
 use super::shard_file::ShardWriteOpts;
 use super::shard_reader::MappedShard;
-use crate::schema::key::{pack_pk_be, pk_bytes_eq};
+use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, PkBuf};
 use crate::schema::SchemaDescriptor;
 
 /// Open the input shards into owned `MappedShard`s, validating checksums. File
@@ -68,7 +68,7 @@ fn fold_bucket_per_pk(shards: &[MappedShard], bucket: &[(u32, u32, i64)]) -> Vec
 pub(super) struct Output<'a> {
     pub dir: &'a str,
     pub table_id: u32,
-    pub level_num: u32,
+    pub level_num: usize,
     pub compact_seq: u64,
     pub skip_pk_filter: bool,
 }
@@ -88,10 +88,10 @@ pub(super) struct Output<'a> {
 /// returning `Err` (atomic-or-nothing).
 pub(super) fn merge_and_route(
     input_files: &[&CStr],
-    guards: &[(u128, bool)],
+    guards: &[(PkBuf, bool)],
     schema: &SchemaDescriptor,
     dest: Output<'_>,
-) -> Result<Vec<(u128, String)>, StorageError> {
+) -> Result<Vec<(PkBuf, String)>, StorageError> {
     // An empty guard list would drop every survivor on the floor while the caller
     // went on to clear the source tier — silent data loss, so reject it.
     assert!(!guards.is_empty(), "merge_and_route requires at least one guard");
@@ -100,20 +100,25 @@ pub(super) fn merge_and_route(
     let total_rows: usize = shards.iter().map(|s| s.count).sum(); // survivor upper bound
     let total_blob: usize = shards.iter().map(|s| s.blob_len).sum();
 
-    // Phase 1 — merge into survivors, sorted (PK, payload). The emit stays a bare
-    // push: `pack_pk_be` preserves the merge order, so each guard's survivors are
-    // one contiguous run and the split points are `guards.len()` binary
-    // searches over the finished buffer rather than a guard lookup per row.
+    // Phase 1 — merge into survivors, sorted (PK, payload). The merge order is
+    // the guard order, so each guard's survivors are one contiguous run and the
+    // split points below are `guards.len()` binary searches rather than a guard
+    // lookup per row.
     let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total_rows);
     run_merge(&shards, schema, |src, row, w| {
         survivors.push((src as u32, row as u32, w));
     });
 
-    // `bounds[g]..bounds[g + 1]` is guard `g`'s slice. Guard 0 also owns anything
-    // below `guards[0]`'s key, matching the read router's saturating guard slot.
-    let prefix_at = |&(src, row, _): &(u32, u32, i64)| pack_pk_be(shards[src as usize].get_pk_bytes(row as usize));
+    // `bounds[g]..bounds[g + 1]` is guard `g`'s slice: guard `g` owns
+    // `key >= guards[g]`, and guard 0 also owns everything below its own key —
+    // the read router's saturating guard slot. Keys are compared off the mmap,
+    // whole, so two rows differing past byte 16 route apart.
+    let pk_at = |&(src, row, _): &(u32, u32, i64)| shards[src as usize].get_pk_bytes(row as usize);
     let bounds: Vec<usize> = std::iter::once(0)
-        .chain((1..guards.len()).map(|g| survivors.partition_point(|s| prefix_at(s) < guards[g].0)))
+        .chain(
+            (1..guards.len())
+                .map(|g| survivors.partition_point(|s| compare_pk_ordering(pk_at(s), guards[g].0.pk_bytes()).is_lt())),
+        )
         .chain(std::iter::once(survivors.len()))
         .collect();
 
@@ -124,7 +129,7 @@ pub(super) fn merge_and_route(
     let mut cols: Vec<ColPtr> = Vec::new();
     let unified: Vec<UnifiedSource> = shards.iter().map(|s| s.to_unified(schema, &mut cols)).collect();
     let nsurv = survivors.len();
-    let mut out: Vec<(u128, String)> = Vec::with_capacity(guards.len());
+    let mut out: Vec<(PkBuf, String)> = Vec::with_capacity(guards.len());
 
     // Only built when some destination guard is dehydrated; a hydrated store
     // never derives it.
@@ -143,7 +148,7 @@ pub(super) fn merge_and_route(
         let path = format!(
             "{}/{}",
             dest.dir,
-            super::naming::compact_shard_name(dest.table_id, dest.compact_seq, dest.level_num as usize, guard_key)
+            super::naming::compact_shard_name(dest.table_id, dest.compact_seq, dest.level_num, g)
         );
         // A skeleton guard writes its folded rows under the PK-only schema; a
         // hydrated one writes the bucket at full width. The writer's schema drives

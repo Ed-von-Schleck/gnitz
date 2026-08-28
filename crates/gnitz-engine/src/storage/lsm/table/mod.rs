@@ -497,7 +497,8 @@ impl Table {
     }
 
     /// Return the fully consolidated batch of all live rows, caching the result.
-    /// The cache is invalidated on any logical write (upsert or test-helper upsert).
+    /// The cache is invalidated wherever the row set can move: `ingest_owned_batch`,
+    /// `swap_schema`, and the RAM-tier fold in `flush.rs`.
     /// Cheap on repeated calls: returns `Rc::clone` of the cached batch.
     /// Infallible: delegates to `open_cursor`.
     pub fn full_scan(&mut self) -> Rc<Batch> {
@@ -552,6 +553,12 @@ impl Table {
     #[cfg(test)]
     pub(crate) fn tree_report(&self) -> String {
         self.shard_index.tree_report()
+    }
+
+    /// Test helper: `(L0 shard count, per-level guard count)`.
+    #[cfg(test)]
+    pub(crate) fn level_shape(&self) -> (usize, Vec<usize>) {
+        self.shard_index.level_shape()
     }
 
     /// Test helper: shrink the per-table heap ceiling so spill paths can be
@@ -693,7 +700,7 @@ impl Table {
     /// deleted files, so `flush_barrier` drains them once it has republished over
     /// the compacted index. A fed view's delta store publishes none and is in
     /// neither checkpoint round, so it unlinks at the end of each compaction
-    /// instead — see `ShardIndex::unlink_superseded`.
+    /// instead — see `ShardIndex::unlink_superseded_now`.
     pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         if !self.shard_index.should_compact() {
             return Ok(());

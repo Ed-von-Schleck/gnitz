@@ -30,10 +30,10 @@ struct UniquePkRowState {
     /// rows that break any 1:1 correspondence.
     last_insert: Option<usize>,
     /// The store was already probed (and any stored row retracted) for this PK.
-    /// `retract_pk_bytes` is a pure lookup (it only arms the `found_*`
-    /// accessors) and the store cannot change mid-batch, so one probe per PK is
-    /// exact — and the stored-row retraction must be emitted at most once, or
-    /// downstream weights go negative.
+    /// `retract_pk_bytes` is a pure lookup — it mutates nothing, returning the
+    /// net weight and the located row — and the store cannot change mid-batch,
+    /// so one probe per PK is exact; the stored-row retraction must be emitted
+    /// at most once, or downstream weights go negative.
     store_probed: bool,
 }
 

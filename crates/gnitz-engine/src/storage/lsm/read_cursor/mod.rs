@@ -16,7 +16,7 @@ use super::merge::MemBatch;
 use super::merge::{self, ColPtr, PosCursor, UnifiedSource};
 #[cfg(test)]
 use super::shard_reader::MappedShard;
-use crate::schema::key::{compare_pk_ordering, pk_bytes_eq};
+use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, PkBuf};
 use crate::schema::SchemaDescriptor;
 
 mod gather;
@@ -493,11 +493,7 @@ impl ReadCursor {
     #[inline]
     pub fn seek_first_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
         let stride = self.schema.pk_stride() as usize;
-        debug_assert!(prefix.len() <= stride, "prefix is wider than the PK");
-        let copy_len = prefix.len().min(stride);
-        let mut key = [0u8; crate::schema::MAX_PK_BYTES];
-        key[..copy_len].copy_from_slice(&prefix[..copy_len]);
-        self.advance_to(&key[..stride]);
+        self.advance_to(PkBuf::from_bytes(prefix).padded(stride));
         self.walk_to_positive_with_prefix(prefix)
     }
 
@@ -744,7 +740,6 @@ impl ReadCursor {
 /// Build a ReadCursor over `runs`, skipping empty ones. Each `Run` owns its
 /// backing via `Rc`, so the cursor has no borrow lifetime and callers hand it a
 /// lazy iterator rather than materializing a slice per tier.
-///
 pub(crate) fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor) -> ReadCursor {
     let runs = runs.into_iter();
     let cap = runs.size_hint().0;

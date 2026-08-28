@@ -22,6 +22,7 @@ use super::flush_barrier::LazyRing;
 use super::manifest::{self, ManifestEntryRaw, ManifestHeader};
 use super::read_cursor::{self, ReadCursor};
 use super::shard_file::ShardWriteOpts;
+use super::shard_index::{ShardIndex, TERMINAL_LEVEL_IDX};
 use super::table::{RecoverySource, Table};
 use crate::schema::SchemaDescriptor;
 
@@ -36,27 +37,53 @@ const REWRITE_SHARD_BYTES: usize = 4 * 1024 * 1024;
 /// each drained chunk is split across the targets and appended, then dropped.
 const REWRITE_DRAIN_ROWS: usize = 64 * 1024;
 
-/// Rank 0's shard set, kept from the survey's own read. Rank 0 is a member of
-/// every complete set, and the replicated relayout hard-links exactly this into
-/// each target, so nothing has to re-open the manifest it came from.
-struct Rank0Manifest {
+/// One child's shard set, kept from the survey's own read, so the replicated
+/// relayout can hard-link it into each target without re-opening the manifest it
+/// came from.
+struct SourceManifest {
+    /// Which rank it came from — the lowest one in the set that published a
+    /// manifest.
+    rank: u32,
     entries: Vec<ManifestEntryRaw>,
     compact_seq: u64,
 }
 
-/// A complete child set on disk: `w{k}of{of}` exists with a manifest for every
-/// `k` in `0..of`.
-struct CompleteSet {
-    of: u32,
+/// What one `w*of{of}` child set's surviving children say about it.
+struct SetSurvey {
+    /// `(layout sequence, max lsn)` per rank that published a manifest. A rank
+    /// absent here has none, so the set is incomplete.
+    ranks: HashMap<u32, (u64, u64)>,
+    /// The manifest a relay would link from, if this set is the source.
+    source: SourceManifest,
+}
+
+impl SetSurvey {
+    /// Every rank in `0..of` published a manifest.
+    fn is_complete(&self, of: u32) -> bool {
+        (0..of).all(|k| self.ranks.contains_key(&k))
+    }
+
     /// The highest layout sequence its members carry.
-    seq: u64,
+    fn max_seq(&self) -> u64 {
+        self.ranks.values().map(|&(seq, _)| seq).max().unwrap_or(0)
+    }
+
     /// The recovery watermark the set presents: the **minimum** `max_lsn` across
     /// its children, stamped on every rewritten shard so the target set presents
     /// the same floor. The maximum would skip a committed SAL zone a lagging
     /// child never flushed; under-dedupe only costs a replay, since re-applying a
     /// base delta nets zero (`enforce_unique_pk` retracts before re-inserting).
+    fn floor(&self) -> u64 {
+        self.ranks.values().map(|&(_, lsn)| lsn).min().unwrap_or(0)
+    }
+}
+
+/// The child set a relayout reads from.
+struct SourceSet {
+    of: u32,
+    seq: u64,
     floor: u64,
-    rank0: Rank0Manifest,
+    source: SourceManifest,
 }
 
 /// What `rel_dir`'s children say this boot must do with them.
@@ -67,10 +94,11 @@ enum Layout {
     /// un-checkpointed SAL tail covers them.
     Current,
     /// Relay this set onto the launched count.
-    Relay(CompleteSet),
-    /// Durable children laid out for these counts, with no complete set at any
-    /// of them. Their rows cannot be placed, so the boot refuses rather than
-    /// come up without them.
+    Relay(SourceSet),
+    /// Durable children laid out for these counts, none of them relayable.
+    /// Their rows cannot be placed, so the boot refuses rather than come up
+    /// without them. Only a key-routed relation reaches this: a replicated set
+    /// with any manifest at all is a usable copy.
     Unplaceable(Vec<u32>),
 }
 
@@ -79,7 +107,7 @@ enum Layout {
 /// `Err` names a directory in no child grammar: a relation whose layout this
 /// build cannot read must refuse to boot rather than come up empty with its rows
 /// still on disk and unreferenced.
-fn classify(rel_dir: &str, launched: u32) -> Result<Layout, String> {
+fn classify(rel_dir: &str, launched: u32, replicated: bool) -> Result<Layout, String> {
     let names = super::child_dir::subdir_names(rel_dir);
     let mut workers: Vec<(u32, u32)> = Vec::new();
     for name in &names {
@@ -104,10 +132,11 @@ fn classify(rel_dir: &str, launched: u32) -> Result<Layout, String> {
         return Ok(Layout::Current);
     }
 
-    // `of` -> rank -> (layout sequence, max lsn); a rank absent from the inner
-    // map has no manifest, so its set is incomplete.
-    let mut sets: HashMap<u32, HashMap<u32, (u64, u64)>> = HashMap::new();
-    let mut rank0: HashMap<u32, Rank0Manifest> = HashMap::new();
+    // By `(rank, of)`, so each set's lowest surviving rank is the first read and
+    // the `or_insert_with` below keeps it. `subdir_names` is readdir order, which
+    // would pick a different source child across boots.
+    workers.sort_unstable();
+    let mut sets: HashMap<u32, SetSurvey> = HashMap::new();
     for &(rank, of) in &workers {
         let cpath = super::cstr(ChildAddr::Worker { rank, of }.manifest(rel_dir)).map_err(|e| e.to_string())?;
         let Some((entries, header)) = manifest::read_file(&cpath)
@@ -116,42 +145,48 @@ fn classify(rel_dir: &str, launched: u32) -> Result<Layout, String> {
             continue;
         };
         let max_lsn = entries.iter().map(|e| e.max_lsn).max().unwrap_or(0);
-        if rank == 0 {
-            rank0.insert(
-                of,
-                Rank0Manifest {
-                    entries,
-                    compact_seq: header.compact_seq,
-                },
-            );
-        }
-        sets.entry(of).or_default().insert(rank, (header.layout_seq, max_lsn));
+        let survey = sets.entry(of).or_insert_with(|| SetSurvey {
+            ranks: HashMap::new(),
+            source: SourceManifest {
+                rank,
+                entries,
+                compact_seq: header.compact_seq,
+            },
+        });
+        survey.ranks.insert(rank, (header.layout_seq, max_lsn));
     }
 
+    // Kept before the pool consumes `sets`, for the refusal message below.
+    let counts: Vec<u32> = sets.keys().copied().collect();
     let live = sets
-        .iter()
-        .filter(|(&of, ranks)| of > 0 && (0..of).all(|k| ranks.contains_key(&k)))
-        .map(|(&of, ranks)| {
-            (
-                of,
-                ranks.values().map(|&(seq, _)| seq).max().unwrap_or(0),
-                ranks.values().map(|&(_, lsn)| lsn).min().unwrap_or(0),
-            )
+        .into_iter()
+        .filter(|&(of, ref s)| match of {
+            0 => false,
+            // Nothing to move: the set must be whole, or a relayout that crashed
+            // part-way through writing it would be accepted as the live one.
+            of if of == launched => s.is_complete(of),
+            // A relay source. A replicated set needs one survivor, not all:
+            // `link_targets` reads one child and copies it, and a survivor a
+            // checkpoint behind is still whole — a published manifest plus the
+            // SAL tail is, and linking from the laggard only replays more.
+            _ => s.is_complete(of) || replicated,
         })
-        // A tie on the sequence is impossible for two *complete* sets — a rewrite
-        // stamps one above the source's highest — so `max` is total here.
-        .max_by_key(|&(_, seq, _)| seq);
+        // A tie on the sequence cannot arise: a relay-eligible partial set
+        // becomes the next relayout's source, which mints `seq + 1` above it,
+        // and a partial set at the launched count is cleared by `remove_set`
+        // before its sequence is ever reused.
+        .max_by_key(|(_, s)| s.max_seq());
 
     Ok(match live {
-        Some((of, _, _)) if of == launched => Layout::Current,
-        Some((of, seq, floor)) => Layout::Relay(CompleteSet {
+        Some((of, _)) if of == launched => Layout::Current,
+        Some((of, s)) => Layout::Relay(SourceSet {
             of,
-            seq,
-            floor,
-            rank0: rank0.remove(&of).expect("a complete set has a rank-0 manifest"),
+            seq: s.max_seq(),
+            floor: s.floor(),
+            source: s.source,
         }),
         None => {
-            let mut foreign: Vec<u32> = sets.into_keys().filter(|&of| of != launched).collect();
+            let mut foreign: Vec<u32> = counts.into_iter().filter(|&of| of != launched).collect();
             foreign.sort_unstable();
             if foreign.is_empty() {
                 Layout::Current
@@ -170,12 +205,13 @@ pub(crate) fn repartition_relation(
     table_id: u32,
     launched: u32,
 ) -> Result<(), String> {
-    let source = match classify(rel_dir, launched)? {
+    let replicated = schema.placement().is_replicated();
+    let source = match classify(rel_dir, launched, replicated)? {
         Layout::Current => return Ok(()),
         Layout::Unplaceable(counts) => {
             return Err(format!(
                 "{rel_dir} holds checkpointed children laid out for {counts:?} worker(s) but no complete \
-                 set for any count; launching {launched}, its rows cannot be placed. Refusing to boot."
+                 set at any of them; launching {launched}, its rows cannot be placed. Refusing to boot."
             ))
         }
         Layout::Relay(source) => source,
@@ -198,12 +234,18 @@ pub(crate) fn repartition_relation(
 
     // Replicated children are copies of one another, key-routed ones are hash
     // slices, so only the latter has to move rows.
-    let result = if schema.placement().is_replicated() {
+    let result = if replicated {
         link_targets(rel_dir, &source, launched, seq)
     } else {
         rewrite_targets(rel_dir, schema, table_id, &source, launched, seq)
     };
     result.map_err(|e| format!("repartition {rel_dir} to {launched} worker(s): error {e}"))?;
+
+    // Makes the target children's directory entries durable — nothing else
+    // does, and the source unlinks below are. A swallowed failure here is the
+    // whole relation, so it propagates.
+    super::child_dir::fsync_dir(rel_dir)
+        .map_err(|e| format!("repartition {rel_dir}: fsync of the relation directory failed: error {e}"))?;
 
     // Only now that every target child carries a durable manifest.
     remove_set(rel_dir, source.of);
@@ -219,16 +261,21 @@ fn remove_set(rel_dir: &str, of: u32) {
 }
 
 /// Replicated relations: every child is a copy of every other, so the target set
-/// is the source's rank 0 hard-linked `launched` times. No other source child is
-/// ever consulted.
-fn link_targets(rel_dir: &str, source: &CompleteSet, launched: u32, seq: u64) -> Result<(), StorageError> {
-    let source_dir = ChildAddr::Worker { rank: 0, of: source.of }.dir(rel_dir);
+/// is one surviving source child — the lowest-ranked one that published a
+/// manifest — hard-linked `launched` times. No other source child is ever
+/// consulted.
+fn link_targets(rel_dir: &str, source: &SourceSet, launched: u32, seq: u64) -> Result<(), StorageError> {
+    let source_dir = ChildAddr::Worker {
+        rank: source.source.rank,
+        of: source.of,
+    }
+    .dir(rel_dir);
     for target in super::child_dir::cluster_children(launched) {
         link_child(
             &source_dir,
             &target.dir(rel_dir),
-            &source.rank0.entries,
-            source.rank0.compact_seq,
+            &source.source.entries,
+            source.source.compact_seq,
             seq,
         )?;
     }
@@ -261,21 +308,30 @@ impl TargetChild {
     /// counter as `max_lsn() + 1`, so a shard named from a stamped-down floor
     /// would be clobbered by the next spill's finalizing rename. With no filename
     /// depending on the counter, the floor is a property of the manifest alone.
+    ///
+    /// Registered at the **terminal** guarded level: the output already satisfies
+    /// what a guarded level requires — globally ascending, non-overlapping,
+    /// consolidated, one guard key per shard. At L0 it would instead be an
+    /// unbounded run the next spill folds in one go, permanently raising that
+    /// store's guard target to the size of the whole child.
     fn flush_shard(&mut self, schema: &SchemaDescriptor, table_id: u32, floor: u64) -> Result<(), StorageError> {
         if self.buffer.count == 0 {
             return Ok(());
         }
         // The guard key is this shard's first PK: the rewrite emits globally
         // ascending rows, so each shard owns a distinct key range.
-        let guard_key = crate::schema::key::pack_pk_be(self.buffer.get_pk_bytes(0));
-        let name = super::naming::compact_shard_name(table_id, self.next_seq, 0, guard_key);
+        let guard_key = crate::schema::key::PkBuf::from_bytes(self.buffer.get_pk_bytes(0));
+        let level = ShardIndex::level_num(TERMINAL_LEVEL_IDX);
+        // Each shard draws its own `next_seq`, so the part index is always 0.
+        let name = super::naming::compact_shard_name(table_id, self.next_seq, level, 0);
         self.next_seq += 1;
         self.buffer.write_as_shard(
             &super::cstr(format!("{}/{name}", self.dir))?,
             schema,
             ShardWriteOpts::COMPACTION,
         )?;
-        self.entries.push(ManifestEntryRaw::new(&name, floor, 0, guard_key));
+        self.entries
+            .push(ManifestEntryRaw::new(&name, floor, level as u64, guard_key));
         // Keeps the buffer's capacity, so each shard is filled into the
         // allocation the previous one grew rather than re-growing from zero.
         self.buffer.clear();
@@ -309,7 +365,7 @@ fn rewrite_targets(
     rel_dir: &str,
     schema: &SchemaDescriptor,
     table_id: u32,
-    source: &CompleteSet,
+    source: &SourceSet,
     launched: u32,
     seq: u64,
 ) -> Result<(), StorageError> {

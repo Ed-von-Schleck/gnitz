@@ -3,7 +3,6 @@
 //! trigger, and `run_compact` — the L0→L1 fold, the byte targets every level's
 //! guard partition is held at, and the vertical drain into the terminal level.
 
-use std::cmp::Ordering;
 use std::ffi::CStr;
 use std::fs;
 use std::rc::Rc;
@@ -15,6 +14,7 @@ use super::{
     to_cstrings, CompactionInputs, CompactionKind, FLSMLevel, LevelGuard, ShardEntry, ShardIndex, GUARD_FILE_THRESHOLD,
     L0_COMPACT_THRESHOLD, LMAX_FILE_THRESHOLD, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL_LEVEL_IDX,
 };
+use crate::schema::key::{pack_pk_be, PkBuf};
 
 impl ShardIndex {
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
@@ -36,10 +36,6 @@ impl ShardIndex {
         )
     }
 
-    pub(super) fn level_num(level_idx: usize) -> usize {
-        level_idx + 1
-    }
-
     /// Open `path` and insert it into the sorted L0 tier. The entry registers
     /// unswept, so it is in the next barrier's fdatasync sweep by construction.
     pub(crate) fn add_unsynced_shard(&mut self, path: &str, max_lsn: u64) -> Result<(), StorageError> {
@@ -50,15 +46,11 @@ impl ShardIndex {
     }
 
     pub(super) fn sort_l0(&mut self) {
-        // OPK bytes are order-preserving, so a single byte-wise comparison of
-        // `pk_min` sorts L0 at every PK width. `false < true` sinks is_empty
-        // entries to the end.
-        self.l0.sort_by(|a, b| match (a.is_empty(), b.is_empty()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            (false, false) => a.pk_min.pk_bytes().cmp(b.pk_min.pk_bytes()),
-        });
+        // `PkBuf`'s own order is `compare_pk_bytes`, which sorts OPK bytes at
+        // every PK width; `false < true` sinks the empty entries to the end. An
+        // empty shard's bounds are the zero key (`MappedShard::pk_bounds`), so
+        // two of them tie either way and the sort is stable.
+        self.l0.sort_by_key(|e| (e.is_empty(), e.pk_min));
     }
 
     /// Derived, not cached: the L0 tier crossed its compaction threshold.
@@ -94,21 +86,31 @@ impl ShardIndex {
     /// Every shard that can hold a key in `[start, end]`, `end` `None` meaning
     /// the top of the key space. Complete because guards partition the key line:
     /// a key is reachable from exactly one guard per level.
+    ///
+    /// Both bounds must be exactly `pk_stride` OPK bytes — the convention
+    /// [`ReadCursor::seek_range_bytes`](super::super::read_cursor::ReadCursor::seek_range_bytes)
+    /// states for the cursor this feeds. A short `end` sorts below every full key
+    /// sharing its prefix, so it would prune shards that hold matching rows.
     pub(crate) fn shard_arcs_in_range(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
     ) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
-        let lo = crate::schema::key::pack_pk_be(start);
-        let hi = end.map_or(u128::MAX, crate::schema::key::pack_pk_be);
-        let pack = |k: &crate::schema::key::PkBuf| crate::schema::key::pack_pk_be(k.pk_bytes());
+        let stride = self.schema.pk_stride() as usize;
+        debug_assert_eq!(start.len(), stride, "shard_arcs_in_range: start is not pk_stride wide");
+        debug_assert!(
+            end.is_none_or(|e| e.len() == stride),
+            "shard_arcs_in_range: end is not pk_stride wide",
+        );
+        let lo = PkBuf::from_bytes(start);
+        let hi = end.map_or_else(|| PkBuf::max(stride), PkBuf::from_bytes);
         let l0 = self
             .l0
             .iter()
-            .filter(move |e| !e.is_empty() && pack(&e.pk_max) >= lo && pack(&e.pk_min) <= hi)
+            .filter(move |e| !e.is_empty() && e.pk_max >= lo && e.pk_min <= hi)
             .map(|e| Rc::clone(&e.shard));
         let deep = self.levels.iter().flat_map(move |level| {
-            let run = level.find_guards_for_range(lo, hi);
+            let run = level.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
             level.guards[run]
                 .iter()
                 .flat_map(|g| g.entries.iter().map(|e| Rc::clone(&e.shard)))
@@ -153,20 +155,17 @@ impl ShardIndex {
     }
 
     /// Point lookup by OPK `key` bytes — universal across all PK widths. L0 is
-    /// scanned (range-rejected per entry); each L1+ level routes by the guard
-    /// key `pack_pk_be(key)` (the same order-preserving space `l1_guard_keys`
-    /// builds), restoring O(log N) routing for wide PKs too.
+    /// scanned (range-rejected per entry); each L1+ level routes by the whole key
+    /// against its guard partition (the same keys `l1_guard_keys` builds),
+    /// restoring O(log N) routing for wide PKs too.
     pub(crate) fn find_pk_bytes(&self, key: &[u8], filter_key: u64, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
-        // A pure function of `key`, so the sweep derives it once instead of once
-        // per candidate shard.
-        let route_key = crate::schema::key::pack_pk_be(key);
         for e in &self.l0 {
             if let Some((arc, idx)) = e.probe_pk_bytes(key, filter_key) {
                 visitor(arc, idx);
             }
         }
         for level in &self.levels {
-            if let Some(g_idx) = level.find_guard_idx(route_key) {
+            if let Some(g_idx) = level.find_guard_idx(key) {
                 for e in &level.guards[g_idx].entries {
                     if let Some((arc, idx)) = e.probe_pk_bytes(key, filter_key) {
                         visitor(arc, idx);
@@ -201,7 +200,11 @@ impl ShardIndex {
     /// Open every just-compacted output shard. On any failure, unlink all
     /// outputs so a failed compaction leaves no orphan on disk for the running
     /// session; callers mutate index state only after every open succeeded.
-    fn open_outputs(&self, outputs: &[(u128, String)], max_lsn: u64) -> Result<Vec<(u128, ShardEntry)>, StorageError> {
+    fn open_outputs(
+        &self,
+        outputs: &[(PkBuf, String)],
+        max_lsn: u64,
+    ) -> Result<Vec<(PkBuf, ShardEntry)>, StorageError> {
         let mut opened = Vec::with_capacity(outputs.len());
         for (gk, filename) in outputs {
             // Unswept, like any other new shard: a crash before the sweep leaves
@@ -251,7 +254,7 @@ impl ShardIndex {
     fn compact_into(
         &mut self,
         inputs: CompactionInputs,
-        guard_keys: &[u128],
+        guard_keys: &[PkBuf],
         dest_idx: usize,
         force_skeleton: bool,
         kind: CompactionKind,
@@ -270,7 +273,7 @@ impl ShardIndex {
         let dest = (dest_idx == TERMINAL_LEVEL_IDX)
             .then(|| self.levels.get(dest_idx))
             .flatten();
-        let guards: Vec<(u128, bool)> = guard_keys
+        let guards: Vec<(PkBuf, bool)> = guard_keys
             .iter()
             .map(|&gk| {
                 let skeleton = force_skeleton
@@ -286,7 +289,7 @@ impl ShardIndex {
             compact::Output {
                 dir: &self.output_dir,
                 table_id: self.table_id,
-                level_num: Self::level_num(dest_idx) as u32,
+                level_num: Self::level_num(dest_idx),
                 compact_seq,
                 skip_pk_filter: self.skip_pk_filter,
             },
@@ -415,41 +418,41 @@ impl ShardIndex {
         (0..guards.len())
             .filter(|&gi| !guards[gi].entries.is_empty())
             .min_by_key(|&gi| {
+                // A span *width*, so a numeric projection of the two keys is
+                // what is wanted here — the one guard-layer use of `pack_pk_be`
+                // that is not a routing or identity key.
                 let (lo, hi) = self.src_guard_span(gi);
-                hi - lo
+                pack_pk_be(hi.pk_bytes()) - pack_pk_be(lo.pk_bytes())
             })
     }
 
-    pub(super) fn l1_guard_keys(&self) -> Vec<u128> {
-        // `pack_pk_be` (left-aligned OPK MSBs) is order-preserving at every PK
-        // width — a wide key's leading-16 prefix included — so one guard space
-        // serves all of them and L1+ point lookups stay O(log N).
+    pub(super) fn l1_guard_keys(&self) -> Vec<PkBuf> {
+        // A guard key is a whole OPK key, compared as one byte string, so the
+        // partition is exact at every PK width and L1+ point lookups stay
+        // O(log N).
         if !self.levels.is_empty() && !self.levels[0].guards.is_empty() {
             // Below-first-guard keys saturate to bucket 0 on both routing paths
-            // (`find_guard_for_key` write, `find_guard_idx` read), so the raw
-            // guard keys need no 0-anchor.
+            // (`merge_and_route`'s write split, `find_guard_idx`'s read), so the
+            // raw guard keys need no zero anchor.
             self.levels[0].guards.iter().map(|g| g.guard_key).collect()
         } else {
-            // The guard space is the order-preserving `pack_pk_be` image of
-            // the OPK pk_min bytes (a 16-byte prefix for wide PKs, the whole
-            // key otherwise), the same key the read
+            // Seed the partition from L0's shard bounds — the same keys the read
             // router (`find_pk_bytes`) and the compaction merge order use. Skip
             // empty shards; dedup consecutive keys (L0 is sorted by pk_min, so
-            // equal OPK keys are adjacent).
-            let mut keys: Vec<u128> = Vec::new();
+            // equal keys are adjacent).
+            let mut keys: Vec<PkBuf> = Vec::new();
             for e in &self.l0 {
                 if e.is_empty() {
                     continue;
                 }
-                let pk = crate::schema::key::pack_pk_be(e.pk_min.pk_bytes());
-                if keys.last().copied() != Some(pk) {
-                    keys.push(pk);
+                if keys.last() != Some(&e.pk_min) {
+                    keys.push(e.pk_min);
                 }
             }
             // merge_and_route rejects an empty guard list; an empty table still
             // needs one bucket.
             if keys.is_empty() {
-                keys.push(0);
+                keys.push(PkBuf::zeroed(self.schema.pk_stride() as usize));
             }
             keys
         }
@@ -489,7 +492,7 @@ impl ShardIndex {
         &mut self,
         level_idx: usize,
         range: std::ops::Range<usize>,
-        keys: &[u128],
+        keys: &[PkBuf],
         kind: CompactionKind,
     ) -> Result<(), StorageError> {
         debug_assert!(
@@ -514,7 +517,7 @@ impl ShardIndex {
     pub(super) fn split_overfull_guards(&mut self, level_idx: usize) -> Result<(), StorageError> {
         let target = self.guard_target_bytes(level_idx);
         let threshold = Self::guard_threshold(level_idx);
-        let present: Vec<u128> = self.levels[level_idx].guards.iter().map(|g| g.guard_key).collect();
+        let present: Vec<PkBuf> = self.levels[level_idx].guards.iter().map(|g| g.guard_key).collect();
         for gk in present {
             let Some(gi) = self.levels[level_idx].find_exact_guard(gk) else {
                 continue;
@@ -609,11 +612,11 @@ impl ShardIndex {
         self.unlink_superseded_now();
     }
 
-    /// The `pack_pk_be` span an L1 guard's fold has to cover: its own key on the
-    /// low side, since it owns everything below it, and its true key extent on
-    /// the high side. The gap to the next L1 guard key would be `u128::MAX` for
-    /// the last one and route the fold into the whole terminal level.
-    fn src_guard_span(&self, src_guard_idx: usize) -> (u128, u128) {
+    /// The key span an L1 guard's fold has to cover: its own key on the low
+    /// side, since it owns everything below it, and its true key extent on the
+    /// high side. The gap to the next L1 guard key would be the top of the key
+    /// space for the last one and route the fold into the whole terminal level.
+    fn src_guard_span(&self, src_guard_idx: usize) -> (PkBuf, PkBuf) {
         let g = &self.levels[0].guards[src_guard_idx];
         let (lo, hi) = g.key_extent().unwrap_or((g.guard_key, g.guard_key));
         (g.guard_key.min(lo), hi)
@@ -623,14 +626,14 @@ impl ShardIndex {
     /// every terminal guard key its span covers. Each band then overlaps exactly
     /// one destination guard, so one merge reads one band plus one terminal
     /// guard.
-    fn vertical_band_keys(&self, src_guard_idx: usize) -> Vec<u128> {
+    fn vertical_band_keys(&self, src_guard_idx: usize) -> Vec<PkBuf> {
         let (lo, hi) = self.src_guard_span(src_guard_idx);
         let mut keys = vec![self.levels[0].guards[src_guard_idx].guard_key];
         if let Some(dest) = self.levels.get(TERMINAL_LEVEL_IDX) {
             // `skip(1)`: the run's first guard owns everything below its own key,
             // so cutting there would route the source rows below it into a guard
             // that does not own them.
-            let run = dest.find_guards_for_range(lo, hi);
+            let run = dest.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
             keys.extend(dest.guards[run].iter().skip(1).map(|d| d.guard_key));
             keys.sort_unstable();
             keys.dedup();
@@ -672,7 +675,7 @@ impl ShardIndex {
 
         let src_guard_key = self.levels[0].guards[src_guard_idx].guard_key;
         let (range_min, range_max) = self.src_guard_span(src_guard_idx);
-        let dest_range = self.levels[DEST_IDX].find_guards_for_range(range_min, range_max);
+        let dest_range = self.levels[DEST_IDX].find_guards_for_range(range_min.pk_bytes(), range_max.pk_bytes());
         // Input order does not affect the merge — it orders by (PK, payload) and
         // sums the weights of equal rows.
         let inputs = Self::compaction_inputs(
@@ -685,7 +688,7 @@ impl ShardIndex {
 
         // An empty terminal level has no guard to route to; the source's own key
         // seeds the first one.
-        let guard_keys: Vec<u128> = if dest_range.is_empty() {
+        let guard_keys: Vec<PkBuf> = if dest_range.is_empty() {
             vec![src_guard_key]
         } else {
             self.levels[DEST_IDX].guards[dest_range.clone()]
