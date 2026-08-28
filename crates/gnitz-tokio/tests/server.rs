@@ -11,6 +11,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use gnitz_core::{ColData, ColumnDef, GnitzClient, PkColumn, PkTuple, Schema, TableProps, TypeCode, ZSetBatch};
+use gnitz_mirror::Mirror;
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
 use tokio::runtime::Runtime;
 
@@ -228,4 +229,145 @@ fn one_writev_per_burst() {
         "expected the {n}-push burst to leave in one writev, strace counted {writes}:\n{}",
         counts.report
     );
+}
+
+// ── Mirroring ─────────────────────────────────────────────────────────────
+
+/// A fed pass-through view over `tid`, built by hand: this crate links no
+/// planner, so the circuit is a `ScanDelta` into a predicate-less `Filter` into
+/// the sink the compiler takes as the plan's output register.
+fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
+    let mut b = gnitz_core::CircuitBuilder::new(0, tid);
+    let src = b.input_delta();
+    let filtered = b.filter(src, None);
+    b.sink(filtered);
+    let vids = client
+        .create_view_chain(
+            sn,
+            vec![gnitz_core::PlannedView {
+                name: gnitz_core::ViewName::Named("v".to_string()),
+                sql_text: String::new(),
+                circuit: b.build(),
+                output_columns: cols(),
+                pk_cols: vec![0],
+                capacity_bytes: None,
+                delta_bytes: Some(8 << 20),
+            }],
+            None,
+        )
+        .expect("create the fed view");
+    vids[0]
+}
+
+/// `pk → summed weight`, so a comparison is weight-exact: a poll applied twice
+/// leaves the row set identical and doubles every weight in the interval.
+fn weights(batch: &Option<ZSetBatch>) -> std::collections::BTreeMap<u64, i64> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(b) = batch else { return out };
+    for row in 0..b.weights.len() {
+        let pk = u64::from_le_bytes(b.pks.buf[row * 8..row * 8 + 8].try_into().unwrap());
+        *out.entry(pk).or_insert(0) += b.weights[row];
+    }
+    out.retain(|_, w| *w != 0);
+    out
+}
+
+/// The async handle's whole mirroring surface: what it refuses, what it answers
+/// off the copy, and what two clones doing the same thing at once leave behind.
+#[test]
+fn an_async_handle_mirrors_through_a_blocking_client() {
+    let Some(srv) = ServerHandle::start_with_env(4, &[]) else {
+        return;
+    };
+    let (mut blocking, tid, schema, sn) = table(srv.sock_path());
+    let vid = fed_view(&mut blocking, &sn, tid);
+    blocking.push(tid, &schema, &rows(0, 50)).unwrap();
+    // A read against the server drains the pending ticks, so the rounds a
+    // bootstrap reads already exist.
+    let _ = blocking.scan(vid).unwrap();
+
+    let rt = Runtime::new().unwrap();
+    let (client, conn) = rt.block_on(gnitz_tokio::connect(srv.sock_path())).expect("connect");
+    let driver = rt.spawn(conn);
+
+    // A handle that never attached answers exactly what `scan` answers, served
+    // LSN included — the observable half of the unattached fast path. That it
+    // took no `spawn_blocking` is not assertable and is not asserted.
+    let bare = rt.block_on(client.scan_local_first(vid)).unwrap();
+    let plain = rt.block_on(client.scan(vid)).unwrap();
+    assert_eq!(weights(&bare.1), weights(&plain.1));
+    assert_eq!(bare.2, Some(plain.2), "an unmirrored read carries the server's LSN");
+    assert!(
+        !weights(&bare.1).is_empty(),
+        "the view must hold rows, or this proves nothing"
+    );
+
+    // Two clones attaching at once install once and refuse once. Two stores on
+    // two directories, because two on *one* never get this far: the engine's
+    // lock refuses the second open.
+    let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (p1, p2) = (
+        d1.path().to_str().unwrap().to_string(),
+        d2.path().to_str().unwrap().to_string(),
+    );
+    let (a, b) = (client.clone(), client.clone());
+    let (s1, s2) = (Mirror::open(&p1).unwrap(), Mirror::open(&p2).unwrap());
+    let (ra, rb) = rt.block_on(async { tokio::join!(a.attach_mirror(s1), b.attach_mirror(s2)) });
+    drop((a, b));
+    assert_eq!(
+        [ra.is_ok(), rb.is_ok()].iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one of two concurrent attaches installs",
+    );
+    // The refused one dropped the store it was passed, so its directory is free.
+    let loser = if ra.is_ok() { &p2 } else { &p1 };
+    Mirror::open(loser).expect("a refused attach releases the store it was passed");
+    rt.block_on(client.close_mirror()).expect("close");
+
+    // The real one: attach, mirror, poll, read off the copy.
+    rt.block_on(client.attach_mirror(Mirror::open(&p1).unwrap()))
+        .expect("attach");
+    let outcome = rt.block_on(client.mirror_view(&sn, "v")).expect("mirror the view");
+    assert_eq!(outcome.view_id, vid);
+    assert!(rt.block_on(client.mirrors(vid)).unwrap());
+    assert_eq!(rt.block_on(client.mirrored_ids()).unwrap(), vec![vid]);
+    assert!(rt.block_on(client.cursor_of(vid)).unwrap().is_some());
+    assert!(rt.block_on(client.mirror_poisoned()).unwrap().is_none());
+
+    // Two clones polling one view concurrently. One whole advance runs under one
+    // lock, so they serialize instead of both fetching `(c, …]` and both
+    // applying it.
+    blocking.push(tid, &schema, &rows(50, 50)).unwrap();
+    let expected = weights(&blocking.scan(vid).unwrap().1);
+    let (a, b) = (client.clone(), client.clone());
+    let (ra, rb) = rt.block_on(async { tokio::join!(a.poll_mirror(), b.poll_mirror()) });
+    ra.expect("the first poll");
+    rb.expect("the second poll");
+    drop((a, b));
+    rt.block_on(client.poll_mirror()).expect("a third, for the tail round");
+
+    let local = rt.block_on(client.scan_local_first(vid)).unwrap();
+    assert!(local.2.is_none(), "a local answer carries no served LSN");
+    assert_eq!(
+        weights(&local.1),
+        expected,
+        "two concurrent polls must leave the weights one poll produces",
+    );
+
+    // A relation the copy does not hold still reads, over the wire.
+    let unheld = rt.block_on(client.scan_local_first(tid)).unwrap();
+    assert!(unheld.2.is_some(), "a delegated read carries the server's LSN");
+    assert_eq!(weights(&unheld.1).len(), 100);
+
+    rt.block_on(client.checkpoint_mirror()).expect("checkpoint");
+    rt.block_on(client.forget_view(vid)).expect("forget");
+    assert!(!rt.block_on(client.mirrors(vid)).unwrap());
+
+    rt.block_on(client.close_mirror()).expect("close the store");
+    rt.block_on(client.attach_mirror(Mirror::open(&p1).unwrap()))
+        .expect("the same directory can be attached again");
+    rt.block_on(client.close_mirror()).expect("close it again");
+
+    drop(client);
+    rt.block_on(driver).unwrap().unwrap();
 }

@@ -19,4 +19,9 @@ gnitz-test-harness = { path = "../gnitz-test-harness" }
 # The scripted peer's HELLO ACK, encoded by the definition both sides share
 # rather than re-typed as bytes in a test.
 gnitz-wire = { path = "../gnitz-wire" }
+# The store the mirroring integration test attaches. A dev-dependency, so the
+# crate itself stays engine-free — which is the whole point of taking an opened
+# store rather than a directory.
+gnitz-mirror = { path = "../gnitz-mirror" }
 libc = "0.2"
+tempfile = "3"

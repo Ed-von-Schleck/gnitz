@@ -5,10 +5,7 @@ use crate::test_support::{make_batch_raw, pk_i64_schema};
 
 /// A one-row batch encoded to a WAL block, ready to have its directory forged.
 fn encoded_block(schema: &SchemaDescriptor) -> Vec<u8> {
-    let b = make_batch_raw(schema, &[(42, 1, 7)]);
-    let mut buf = vec![0u8; b.wire_byte_size()];
-    b.encode_to_wire(1, &mut buf, 0, false);
-    buf
+    make_batch_raw(schema, &[(42, 1, 7)]).encode_to_wire_vec(1, false)
 }
 
 /// A fixed region whose directory size disagrees with what the schema implies

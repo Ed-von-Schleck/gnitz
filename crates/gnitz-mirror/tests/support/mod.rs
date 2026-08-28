@@ -29,9 +29,10 @@ pub fn sql(client: &mut GnitzClient, schema: &str, statements: &str) {
         .unwrap_or_else(|e| panic!("{statements}: {e}"));
 }
 
-/// Run one `SELECT` and return `(schema, rows)`.
-pub fn query(reads: &mut dyn gnitz_core::ReadTarget, schema: &str, s: &str) -> (Schema, ZSetBatch) {
-    let mut results = SqlPlanner::new(reads, schema)
+/// Run one `SELECT` and return `(schema, rows)`. Local-first: a client holding a
+/// valid copy of the relation answers off it.
+pub fn query(client: &mut GnitzClient, schema: &str, s: &str) -> (Schema, ZSetBatch) {
+    let mut results = SqlPlanner::new(client, schema)
         .execute(s)
         .unwrap_or_else(|e| panic!("{s}: {e}"));
     assert_eq!(results.len(), 1, "{s} is not one statement");

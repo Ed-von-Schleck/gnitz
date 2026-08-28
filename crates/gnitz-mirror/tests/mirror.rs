@@ -1,10 +1,13 @@
-//! The mirror's acceptance suite.
+//! The acceptance suite for a client that mirrors: one `GnitzClient` with a
+//! store attached, read through the SQL layer against a live server.
 //!
-//! A Rust integration test rather than a pytest: the Python suite drives
-//! `gnitz-py`, which links no mirror. It reaches a real server through
+//! A Rust integration test rather than a pytest: it reaches a real server through
 //! `gnitz-test-harness` and builds its `ReadSpec`s through `gnitz-sql`, both
 //! **dev**-dependencies — neither is in the crate's dependency graph, and
 //! neither closes a cycle, since nothing depends on `gnitz-mirror`.
+//!
+//! `tests/store.rs` beside it covers the store alone, with no server and no
+//! client.
 //!
 //! **Every test runs at four workers.** W=1 exercises none of what the design
 //! rests on: at W=1 there is one slice, so a mirror that mishandled the
@@ -13,9 +16,10 @@
 
 mod support;
 
-use gnitz_core::{GnitzClient, ReadTarget, Schema, ZSetBatch};
+use gnitz_core::{ClientError, GnitzClient, MirrorError, PollResult, Schema, ZSetBatch};
 use gnitz_engine_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_mirror::Mirror;
+use gnitz_sql::SqlPlanner;
 use gnitz_test_harness::ServerHandle;
 use support::{assert_same_sequence, assert_same_zset, canonical, query, serial, sql, EnvVar};
 
@@ -25,13 +29,24 @@ const WORKERS: usize = 4;
 /// a cursor except where a test means it to be.
 const FEED: &str = "8 MB";
 
-/// A test's server plus the two connections it needs: one the mirror owns, one
+/// A test's server plus the two clients it needs: one with a store attached, one
 /// that reads the same relations directly for the differential.
 struct Fixture {
     server: ServerHandle,
     direct: GnitzClient,
-    mirror: Option<Mirror>,
+    /// `Option` so a test can drop it — which checkpoints and releases the
+    /// directory — and open a fresh one on the same directory.
+    mirror: Option<GnitzClient>,
     dir: tempfile::TempDir,
+}
+
+/// A client on `target` with a store on `dir` attached.
+fn mirroring_client(target: &str, dir: &str) -> GnitzClient {
+    let mut client = GnitzClient::connect(target).unwrap();
+    client
+        .attach_mirror(Mirror::open(dir).expect("a store opens"))
+        .expect("a fresh client attaches it");
+    client
 }
 
 /// A four-worker server, or a panic naming what is missing. The harness answers
@@ -61,11 +76,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let mut direct = GnitzClient::connect(server.sock_path()).unwrap();
         seed(&mut direct);
-        let mirror = Mirror::open(
-            dir.path().to_str().unwrap(),
-            GnitzClient::connect(server.sock_path()).unwrap(),
-        )
-        .expect("a fresh mirror opens");
+        let mirror = mirroring_client(server.sock_path(), dir.path().to_str().unwrap());
         Fixture {
             server,
             direct,
@@ -74,7 +85,7 @@ impl Fixture {
         }
     }
 
-    fn mirror(&mut self) -> &mut Mirror {
+    fn mirror(&mut self) -> &mut GnitzClient {
         self.mirror.as_mut().unwrap()
     }
 
@@ -82,19 +93,19 @@ impl Fixture {
         self.dir.path().to_str().unwrap().to_string()
     }
 
-    /// Replace the mirror's upstream connection, keeping its local state — what
-    /// a host does after the server it was talking to went away.
+    /// Replace the connection, keeping the copies — what a host does after the
+    /// server it was talking to went away.
     fn reconnect_mirror(&mut self) {
-        let client = GnitzClient::connect(self.server.sock_path()).unwrap();
-        *self.mirror().client_mut() = client;
+        let target = self.server.sock_path().to_string();
+        self.mirror().reconnect(&target).expect("reconnect");
     }
 
-    /// Drop the handle (which checkpoints) and open a fresh one on the same
-    /// directory.
+    /// Drop the client (whose drop checkpoints the store and releases the
+    /// directory) and open a fresh one on the same directory.
     fn reopen(&mut self) {
         self.mirror = None;
-        let client = GnitzClient::connect(self.server.sock_path()).unwrap();
-        self.mirror = Some(Mirror::open(&self.base_dir(), client).expect("a checkpointed mirror reopens"));
+        let dir = self.base_dir();
+        self.mirror = Some(mirroring_client(self.server.sock_path(), &dir));
     }
 
     /// Make the named views of `schema` emit the rounds the pushes so far
@@ -110,7 +121,7 @@ impl Fixture {
         for v in views {
             let _ = query(&mut self.direct, schema, &format!("SELECT COUNT(*) AS n FROM {v}"));
         }
-        self.mirror().poll().expect("poll");
+        self.mirror().poll_mirror().expect("poll");
     }
 
     /// [`Fixture::drain`] over the two views of the shared schema.
@@ -127,7 +138,7 @@ impl Fixture {
         (keyed.view_id, repl.view_id)
     }
 
-    /// Run one `SELECT` against the local copy.
+    /// Run one `SELECT` through the mirroring client.
     fn local(&mut self, sql_text: &str) -> (Schema, ZSetBatch) {
         query(self.mirror.as_mut().unwrap(), "s", sql_text)
     }
@@ -339,12 +350,13 @@ fn a_registered_view_is_described_locally() {
     fx.quiesce();
 
     let m = fx.mirror.as_mut().unwrap();
-    let before = m.client_mut().requests_sent();
-    let desc = ReadTarget::describe_relation(m, "s", "v_keyed")
+    let before = m.requests_sent();
+    let desc = m
+        .resolve_local_first("s", "v_keyed")
         .expect("a registered view describes")
         .expect("and is present");
     assert_eq!(
-        m.client_mut().requests_sent(),
+        m.requests_sent(),
         before,
         "describing a registered view must issue no request"
     );
@@ -355,15 +367,12 @@ fn a_registered_view_is_described_locally() {
     assert!(desc.indexes.is_empty(), "only a base table may own an index");
 
     // An unregistered relation goes upstream: one RESOLVE, answered by the server.
-    let before = m.client_mut().requests_sent();
-    let delegated = ReadTarget::describe_relation(m, "s", "t")
+    let before = m.requests_sent();
+    let delegated = m
+        .resolve_local_first("s", "t")
         .expect("a delegated describe")
         .expect("and the table is present");
-    assert_eq!(
-        m.client_mut().requests_sent() - before,
-        1,
-        "a delegated describe costs one RESOLVE"
-    );
+    assert_eq!(m.requests_sent() - before, 1, "a delegated describe costs one RESOLVE");
     assert!(!delegated.class.is_view());
 }
 
@@ -393,16 +402,13 @@ fn a_view_created_over_a_mirrored_view_binds_the_servers_id() {
 
     {
         let m = fx.mirror.as_mut().unwrap();
-        let before = m.client_mut().requests_sent();
+        let before = m.requests_sent();
         let mut planner = gnitz_sql::SqlPlanner::new(m, "s");
         planner
             .execute("CREATE VIEW over_mirror AS SELECT a, b FROM v_keyed")
             .expect("a view over the recreated relation");
         drop(planner);
-        assert!(
-            m.client_mut().requests_sent() > before,
-            "a DDL statement must resolve upstream"
-        );
+        assert!(m.requests_sent() > before, "a DDL statement must resolve upstream");
     }
 
     // Bound to the retired id the new view would backfill from a relation that no
@@ -430,19 +436,19 @@ fn a_mirrored_select_issues_no_request() {
     fx.quiesce();
 
     let m = fx.mirror.as_mut().unwrap();
-    let before = m.client_mut().requests_sent();
+    let before = m.requests_sent();
     let _ = query(m, "s", "SELECT a, b, v FROM v_keyed WHERE a = 7");
-    let after = m.client_mut().requests_sent();
+    let after = m.requests_sent();
     assert_eq!(after, before, "a mirrored SELECT must issue no request at all");
 
     // The `EXPLAIN` of one is served by the copy as well. Routed to the
     // connection it would cost a round trip, fail with the server down, and
     // describe a plan against a relation the statement will not read.
-    let before = m.client_mut().requests_sent();
+    let before = m.requests_sent();
     let (_, plan) = query(m, "s", "EXPLAIN SELECT a, b, v FROM v_keyed WHERE a = 7");
     assert!(!plan.weights.is_empty(), "EXPLAIN must describe a plan");
     assert_eq!(
-        m.client_mut().requests_sent(),
+        m.requests_sent(),
         before,
         "EXPLAIN of a mirrored SELECT must issue no request either",
     );
@@ -450,9 +456,9 @@ fn a_mirrored_select_issues_no_request() {
     // An unmirrored relation read through the same call: one RESOLVE plus the
     // read itself is two frames, so assert the delta rather than a bare zero —
     // what this pins is that the bracket kept the resolve to *one*.
-    let before = m.client_mut().requests_sent();
+    let before = m.requests_sent();
     let _ = query(m, "s", "SELECT a, b, v FROM t WHERE a = 7");
-    let delegated = m.client_mut().requests_sent() - before;
+    let delegated = m.requests_sent() - before;
     assert_eq!(
         delegated, 2,
         "a delegated read costs one RESOLVE and one read; a missing statement bracket makes it three",
@@ -463,9 +469,10 @@ fn a_mirrored_select_issues_no_request() {
 // Refusals
 // ---------------------------------------------------------------------------
 
-/// A second handle on a *held directory* is refused, in this process and across
+/// A second store on a *held directory* is refused, in this process and across
 /// processes alike — the data-directory `flock` is the only thing that refuses
-/// one, and it does not care which process the second opener is in.
+/// one, and it does not care which process the second opener is in. The refusal
+/// lands on the open, before any client attaches.
 #[test]
 fn a_second_handle_on_one_directory_is_refused() {
     let _g = serial();
@@ -473,17 +480,15 @@ fn a_second_handle_on_one_directory_is_refused() {
 
     // In-process. A second open takes a fresh open file description, which
     // `flock` treats as a conflict — unlike a forked worker's inherited one.
-    let client = GnitzClient::connect(fx.server.sock_path()).unwrap();
     assert!(
-        Mirror::open(&fx.base_dir(), client).is_err(),
-        "a second handle on a directory this process holds must be refused",
+        Mirror::open(&fx.base_dir()).is_err(),
+        "a second store on a directory this process holds must be refused",
     );
 
-    // Cross-process, with the first handle dropped so only the flock can refuse.
+    // Cross-process, with the first client dropped so only the flock can refuse.
     let dir = fx.base_dir();
     fx.mirror = None;
-    let client = GnitzClient::connect(fx.server.sock_path()).unwrap();
-    let held = Mirror::open(&dir, client).expect("the directory is free again");
+    let held = Mirror::open(&dir).expect("the directory is free again");
     let out = run_test_in_child("second_process_open_child", &[("GNITZ_MIRROR_LOCK_DIR", &dir)]);
     assert_child_ok(&out, "the second-process child must run to the end");
     let printed = String::from_utf8_lossy(&out.stdout);
@@ -494,47 +499,40 @@ fn a_second_handle_on_one_directory_is_refused() {
     drop(held);
 }
 
-/// Two handles on two directories, in one process, each resuming its own copy.
+/// Two mirroring clients on two directories, in one process, each resuming its
+/// own copy.
 ///
-/// Nothing process-global decides what a store resumes from any more, so the two
-/// are independent: each reopens at the generation its own checkpoint published,
+/// Nothing process-global decides what a store resumes from, so the two are
+/// independent: each reopens at the generation its own checkpoint published,
 /// advances rather than reseeds, and answers what the server answers.
 #[test]
 fn two_handles_on_two_directories_keep_their_own_state() {
     let _g = serial();
     let mut fx = Fixture::start();
     let second_dir = tempfile::tempdir().unwrap();
-    let mut second = Mirror::open(
-        second_dir.path().to_str().unwrap(),
-        GnitzClient::connect(fx.server.sock_path()).unwrap(),
-    )
-    .expect("a second handle on its own directory opens");
+    let mut second = mirroring_client(fx.server.sock_path(), second_dir.path().to_str().unwrap());
 
     churn(&mut fx.direct, 1, 80);
     fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
     second.mirror_view("s", "v_repl").expect("mirror v_repl");
     fx.quiesce();
-    second.poll().expect("poll the second handle");
+    second.poll_mirror().expect("poll the second handle");
 
     // Put the two directories at *different* generations, so a shared one would
     // leave at least one of them looking for a generation its manifests never
     // carried. The drop below checkpoints each again, first to 2, second to 1.
-    fx.mirror().checkpoint().expect("checkpoint the first copy");
+    fx.mirror().checkpoint_mirror().expect("checkpoint the first copy");
 
     // Both checkpoint on the way out, then both come back.
     drop(second);
     fx.reopen();
-    let mut second = Mirror::open(
-        second_dir.path().to_str().unwrap(),
-        GnitzClient::connect(fx.server.sock_path()).unwrap(),
-    )
-    .expect("the second directory reopens");
+    let mut second = mirroring_client(fx.server.sock_path(), second_dir.path().to_str().unwrap());
 
     let keyed = fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
     let repl = second.mirror_view("s", "v_repl").expect("re-mirror v_repl");
     for (view, outcome) in [("v_keyed", keyed), ("v_repl", repl)] {
         assert!(
-            !outcome.reseeded,
+            !outcome.result.reseeded(),
             "{view} was checkpointed and must resume, not bootstrap",
         );
     }
@@ -567,14 +565,10 @@ fn a_cursor_naming_an_absent_copy_bootstraps() {
         "the child must checkpoint, forget the view, and exit without checkpointing again",
     );
 
-    let mut mirror = Mirror::open(
-        dir.path().to_str().unwrap(),
-        GnitzClient::connect(server.sock_path()).unwrap(),
-    )
-    .expect("the directory the child left behind reopens");
+    let mut mirror = mirroring_client(server.sock_path(), dir.path().to_str().unwrap());
     let outcome = mirror.mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
     assert!(
-        outcome.reseeded,
+        outcome.result.reseeded(),
         "a cursor over a copy that never came back must bootstrap, not advance",
     );
     let mut direct = GnitzClient::connect(server.sock_path()).unwrap();
@@ -592,9 +586,9 @@ fn a_cursor_naming_an_absent_copy_bootstraps() {
 #[test]
 fn forgotten_view_leaves_its_cursor_child() {
     let Some((sock, dir)) = child_target() else { return };
-    let mut mirror = Mirror::open(&dir, GnitzClient::connect(&sock).unwrap()).expect("open");
+    let mut mirror = mirroring_client(&sock, &dir);
     let tid = mirror.mirror_view("s", "v_keyed").expect("mirror v_keyed").view_id;
-    mirror.checkpoint().expect("checkpoint the copy and its cursor");
+    mirror.checkpoint_mirror().expect("checkpoint the copy and its cursor");
     mirror.forget_view(tid).expect("forget v_keyed");
     println!("{CHILD_OK}");
     std::process::exit(0);
@@ -684,20 +678,19 @@ fn a_storage_fault_does_not_kill_the_host() {
 #[test]
 fn poisons_on_a_storage_fault_child() {
     let Some((sock, dir)) = child_target() else { return };
-    let client = GnitzClient::connect(&sock).unwrap();
-    let mut mirror = Mirror::open(&dir, client).expect("open");
+    let mut mirror = mirroring_client(&sock, &dir);
     let err = mirror
         .mirror_view("s", "v_keyed")
         .expect_err("the armed seam must fail the bootstrap ingest");
     assert!(
-        matches!(err, gnitz_mirror::MirrorError::Poisoned(_)),
-        "an ingest fault must poison the handle: {err}",
+        matches!(err, ClientError::Mirror(MirrorError::Poisoned(_))),
+        "an ingest fault must poison the store: {err}",
     );
-    assert!(mirror.poisoned().is_some());
+    assert!(mirror.mirror_poisoned().is_some());
     // Every subsequent call is refused rather than answering off a copy with a
     // hole in it.
-    assert!(mirror.poll().is_err());
-    assert!(mirror.checkpoint().is_err());
+    assert!(mirror.poll_mirror().is_err());
+    assert!(mirror.checkpoint_mirror().is_err());
     // And the drop must not checkpoint a possibly-torn store.
     drop(mirror);
     println!("{CHILD_OK}");
@@ -731,16 +724,16 @@ fn a_failed_bootstrap_answers_no_read_locally() {
 fn failed_bootstrap_child() {
     let Some((sock, dir)) = child_target() else { return };
     let mut direct = GnitzClient::connect(&sock).unwrap();
-    let mut mirror = Mirror::open(&dir, GnitzClient::connect(&sock).unwrap()).expect("open");
+    let mut mirror = mirroring_client(&sock, &dir);
 
     let err = mirror
         .mirror_view("s", "v_keyed")
         .expect_err("the armed seam must fail the bootstrap read");
     assert!(
-        matches!(err, gnitz_mirror::MirrorError::Upstream(_)),
-        "an upstream refusal is not a poisoning: {err}",
+        !matches!(err, ClientError::Mirror(MirrorError::Poisoned(_))),
+        "a failed bootstrap is not a poisoning: {err}",
     );
-    assert!(mirror.poisoned().is_none(), "the handle stays usable");
+    assert!(mirror.mirror_poisoned().is_none(), "the client stays usable");
 
     // The registration outlives the failed bootstrap, which is what makes the
     // window reachable at all; the copy behind it does not.
@@ -762,7 +755,7 @@ fn failed_bootstrap_child() {
 
     // The seam is one-shot, so the next poll is a real bootstrap: the handle
     // recovers rather than delegating forever.
-    mirror.poll().expect("the next poll bootstraps for real");
+    mirror.poll_mirror().expect("the next poll bootstraps for real");
     assert!(
         mirror.mirrors(tid),
         "a completed bootstrap makes the copy answerable again"
@@ -796,11 +789,13 @@ fn the_blocking_fsync_fallback_carries_durability() {
 #[test]
 fn blocking_fsync_fallback_child() {
     let Some((sock, dir)) = child_target() else { return };
-    let open = |dir: &str| Mirror::open(dir, GnitzClient::connect(&sock).unwrap()).expect("open");
+    let open = |dir: &str| mirroring_client(&sock, dir);
     let mut mirror = open(&dir);
     let tid = mirror.mirror_view("s", "v_keyed").expect("mirror").view_id;
-    mirror.poll().expect("poll");
-    mirror.checkpoint().expect("checkpoint under the blocking fallback");
+    mirror.poll_mirror().expect("poll");
+    mirror
+        .checkpoint_mirror()
+        .expect("checkpoint under the blocking fallback");
     let before = query(&mut mirror, "s", "SELECT * FROM v_keyed");
     let cursor = mirror.cursor_of(tid).expect("a cursor");
     drop(mirror);
@@ -897,7 +892,7 @@ fn a_restart_resumes_rather_than_reseeds() {
     churn(&mut fx.direct, 1, 120);
     let (tid, _) = fx.mirror_both();
     fx.quiesce();
-    fx.mirror().checkpoint().expect("checkpoint");
+    fx.mirror().checkpoint_mirror().expect("checkpoint");
     let before = fx.local("SELECT * FROM v_keyed");
     let cursor = fx.mirror().cursor_of(tid).expect("a cursor");
 
@@ -944,7 +939,7 @@ fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
     churn(&mut fx.direct, 1, 90);
     fx.mirror_both();
     fx.quiesce();
-    fx.mirror().checkpoint().expect("checkpoint");
+    fx.mirror().checkpoint_mirror().expect("checkpoint");
 
     // Case 1 — the copies moved on and were published; the cursor file did not.
     // Snapshot the file, apply more rounds, checkpoint again, restore the old
@@ -953,7 +948,7 @@ fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
     let stale = std::fs::read(&cursor_path).expect("a checkpoint writes the cursor file");
     churn(&mut fx.direct, 91, 180);
     fx.quiesce();
-    fx.mirror().checkpoint().expect("second checkpoint");
+    fx.mirror().checkpoint_mirror().expect("second checkpoint");
     fx.mirror = None;
     std::fs::write(&cursor_path, &stale).unwrap();
 
@@ -965,7 +960,9 @@ fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
     // Case 2 — the generation is durably ahead of every output manifest, so each
     // copy erases at open. The bump is the same one the checkpoint's step 0
     // makes; leaving out the flush round is the crash.
-    fx.mirror().checkpoint().expect("checkpoint before the torn bump");
+    fx.mirror()
+        .checkpoint_mirror()
+        .expect("checkpoint before the torn bump");
     fx.mirror = None;
     with_engine(&fx.base_dir(), |e| {
         e.bump_checkpoint_generation().expect("durably advance the generation");
@@ -1020,12 +1017,14 @@ fn a_partially_registered_reopen_keeps_every_cursor() {
     fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
     let repl = fx.mirror().mirror_view("s", "v_repl").expect("mirror v_repl").view_id;
     fx.quiesce();
-    fx.mirror().checkpoint().expect("checkpoint");
+    fx.mirror().checkpoint_mirror().expect("checkpoint");
 
     // Reopen holding both copies, claim only one, and checkpoint again.
     fx.reopen();
     fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror v_keyed");
-    fx.mirror().checkpoint().expect("checkpoint with v_repl unclaimed");
+    fx.mirror()
+        .checkpoint_mirror()
+        .expect("checkpoint with v_repl unclaimed");
 
     fx.reopen();
     fx.mirror().mirror_view("s", "v_repl").expect("re-mirror v_repl");
@@ -1061,7 +1060,7 @@ fn a_foreign_topology_word_reseeds() {
     churn(&mut fx.direct, 1, 60);
     let (tid, _) = fx.mirror_both();
     fx.quiesce();
-    fx.mirror().checkpoint().expect("checkpoint");
+    fx.mirror().checkpoint_mirror().expect("checkpoint");
     assert!(
         has_manifest(&fx.base_dir(), tid),
         "a checkpoint must publish the copy's manifest",
@@ -1126,7 +1125,7 @@ fn a_server_restart_reseeds_the_copy() {
     churn(&mut fx.direct, 61, 120);
     let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
     fx.mirror()
-        .poll()
+        .poll_mirror()
         .expect("the poll must recover from a foreign tag by itself");
     assert!(fx.mirror().mirrors(tid), "the id is unchanged across a server restart");
     fx.quiesce();
@@ -1259,7 +1258,7 @@ fn every_view_body_shape_mirrors() {
     let names: Vec<&str> = SHAPE_VIEWS.iter().map(|(n, _, _)| *n).collect();
     for name in &names {
         let out = fx.mirror().mirror_view(SH, name).expect(name);
-        assert!(out.reseeded, "{name}: a first registration bootstraps");
+        assert!(out.result.reseeded(), "{name}: a first registration bootstraps");
         assert!(fx.mirror().mirrors(out.view_id), "{name}: the copy must answer locally");
     }
 
@@ -1581,13 +1580,13 @@ fn two_schemas_share_one_handle() {
     fx.differential(SH, "SELECT * FROM v_lin");
 }
 
-/// A view dropped upstream fails its poll forever, and nothing else stops.
+/// A view dropped upstream fails its own poll forever, and nothing else stops.
 ///
-/// The error names which view, `forget_view` clears it, and the survivor's
-/// cursor advanced anyway — read back through `cursor_of`, since an `Err`
-/// carries no outcome map. The dropped view's copy **keeps answering locally**
-/// until it is forgotten: the mirror answers as of its last poll and that round
-/// is real.
+/// Both halves come off the returned report — a `Failed` entry at the dropped
+/// view's id and an `Advanced` one at the survivor's, with the round the
+/// survivor now answers at beside it. The dropped view's copy **keeps answering
+/// locally** until it is forgotten: the copy answers as of its last poll and that
+/// round is real.
 #[test]
 fn a_view_dropped_upstream_names_itself_and_stops_nothing_else() {
     let _g = serial();
@@ -1602,12 +1601,33 @@ fn a_view_dropped_upstream_names_itself_and_stops_nothing_else() {
     churn(&mut fx.direct, 61, 120);
     let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
 
-    let e = fx.mirror().poll().expect_err("the dropped view must fail its poll");
-    let msg = e.to_string();
-    assert!(msg.contains("v_repl"), "the failure must name the dropped view: {msg}");
+    let report = fx
+        .mirror()
+        .poll_mirror()
+        .expect("a per-view failure is not a failure of the call");
+    let dead = report
+        .iter()
+        .find(|o| o.view_id == repl_id)
+        .expect("the dropped view is reported under its own id");
+    let PollResult::Failed(e) = &dead.result else {
+        panic!("the dropped view must fail: {:?}", dead.result)
+    };
+    // The id carries the identification now; the message need not.
+    assert!(!e.to_string().is_empty(), "a failed view reports why");
+
+    let alive = report
+        .iter()
+        .find(|o| o.view_id == keyed)
+        .expect("every view is attempted");
+    assert!(matches!(alive.result, PollResult::Advanced));
     assert!(
-        fx.mirror().cursor_of(keyed).is_some_and(|c| c.tick > before_keyed.tick),
-        "every view is attempted, so the survivor's cursor still advanced",
+        alive.cursor.is_some_and(|c| c.tick > before_keyed.tick),
+        "the survivor advanced, and the report says to which round",
+    );
+    assert_eq!(
+        alive.cursor,
+        fx.mirror().cursor_of(keyed),
+        "the reported round is the one the copy answers at",
     );
     fx.differential("s", "SELECT * FROM v_keyed");
 
@@ -1621,8 +1641,12 @@ fn a_view_dropped_upstream_names_itself_and_stops_nothing_else() {
     fx.mirror().forget_view(repl_id).expect("forget the dead registration");
     let report = fx
         .mirror()
-        .poll()
+        .poll_mirror()
         .expect("the poll recovers once the dead view is gone");
+    assert!(
+        report.iter().all(|o| !matches!(o.result, PollResult::Failed(_))),
+        "nothing fails once the dead registration is gone",
+    );
     assert!(
         report.iter().any(|o| o.view_id == keyed),
         "the survivor is reported again"
@@ -1663,7 +1687,9 @@ fn a_view_recreated_with_a_different_column_set_reseeds_under_the_new_shape() {
     churn(&mut fx.direct, 61, 120);
     let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
 
-    fx.mirror().poll().expect("the poll re-registers under the new shape");
+    fx.mirror()
+        .poll_mirror()
+        .expect("the poll re-registers under the new shape");
     let new = fx
         .mirror()
         .mirrored_ids()
@@ -1699,7 +1725,7 @@ fn registration_is_idempotent_and_an_empty_poll_moves_nothing() {
     let mut ids = Vec::new();
     for name in &names {
         let out = fx.mirror().mirror_view("s", name).expect(name);
-        assert!(out.reseeded, "{name}: a first registration bootstraps");
+        assert!(out.result.reseeded(), "{name}: a first registration bootstraps");
         ids.push(out.view_id);
     }
 
@@ -1716,14 +1742,20 @@ fn registration_is_idempotent_and_an_empty_poll_moves_nothing() {
     for (i, name) in names.iter().enumerate() {
         let out = fx.mirror().mirror_view("s", name).expect("re-register");
         assert_eq!(out.view_id, ids[i], "{name}: the same relation keeps its id");
-        assert!(!out.reseeded, "{name}: a re-registration resumes rather than reseeds");
+        assert!(
+            !out.result.reseeded(),
+            "{name}: a re-registration resumes rather than reseeds"
+        );
     }
     let after: Vec<_> = ids.iter().map(|&t| fx.mirror().cursor_of(t).unwrap()).collect();
     assert_eq!(before, after, "a re-registration with nothing pushed moves no cursor");
 
-    let report = fx.mirror().poll().expect("an empty poll");
+    let report = fx.mirror().poll_mirror().expect("an empty poll");
     assert_eq!(report.len(), ids.len(), "one poll reports every registration");
-    assert!(!report.iter().any(|o| o.reseeded), "an empty poll reseeds nothing");
+    assert!(
+        !report.iter().any(|o| o.result.reseeded()),
+        "an empty poll reseeds nothing"
+    );
     let again: Vec<_> = ids.iter().map(|&t| fx.mirror().cursor_of(t).unwrap()).collect();
     assert_eq!(after, again, "an empty poll moves no cursor");
 }
@@ -1781,9 +1813,12 @@ fn a_view_over_a_stream_follows_its_reset_across_a_restart() {
     fx.direct = GnitzClient::connect(fx.server.sock_path()).unwrap();
     fx.reconnect_mirror();
     let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_stream");
-    let report = fx.mirror().poll().expect("the poll recovers from the foreign tag");
+    let report = fx
+        .mirror()
+        .poll_mirror()
+        .expect("the poll recovers from the foreign tag");
     assert!(
-        report.iter().any(|o| o.view_id == tid && o.reseeded),
+        report.iter().any(|o| o.view_id == tid && o.result.reseeded()),
         "a tag that stopped continuing must be reported as a reseed",
     );
 
@@ -1856,17 +1891,17 @@ fn a_failing_checkpoint_leaves_the_handle_usable() {
 fn failing_checkpoint_child() {
     let Some((sock, dir)) = child_target() else { return };
     let mut direct = GnitzClient::connect(&sock).unwrap();
-    let mut mirror = Mirror::open(&dir, GnitzClient::connect(&sock).unwrap()).expect("open");
+    let mut mirror = mirroring_client(&sock, &dir);
     let tid = mirror.mirror_view("s", "v_keyed").expect("mirror").view_id;
 
     let err = mirror
-        .checkpoint()
+        .checkpoint_mirror()
         .expect_err("the armed seam must fail the checkpoint");
     assert!(
-        !matches!(err, gnitz_mirror::MirrorError::Poisoned(_)),
+        !matches!(err, ClientError::Mirror(MirrorError::Poisoned(_))),
         "a failed checkpoint is not a poisoning: {err}",
     );
-    assert!(mirror.poisoned().is_none(), "the handle stays usable");
+    assert!(mirror.mirror_poisoned().is_none(), "the client stays usable");
     assert!(
         !has_manifest(&dir, tid),
         "the failed checkpoint must have published nothing",
@@ -1882,7 +1917,9 @@ fn failing_checkpoint_child() {
     );
 
     // The seam is one-shot, so the retry is the real thing.
-    mirror.checkpoint().expect("the retry after a one-shot fault succeeds");
+    mirror
+        .checkpoint_mirror()
+        .expect("the retry after a one-shot fault succeeds");
     assert!(has_manifest(&dir, tid), "the successful retry must publish a manifest",);
     println!("{CHILD_OK}");
 }
@@ -1923,9 +1960,9 @@ fn resident_footprint_child() {
     let _ = query(&mut direct, "s", "SELECT * FROM v_keyed");
 
     let base = rss_bytes();
-    let mut mirror = Mirror::open(&dir, GnitzClient::connect(&sock).unwrap()).expect("open");
+    let mut mirror = mirroring_client(&sock, &dir);
     let tid = mirror.mirror_view("s", "v_keyed").expect("mirror").view_id;
-    mirror.checkpoint().expect("checkpoint");
+    mirror.checkpoint_mirror().expect("checkpoint");
     let rows = query(&mut mirror, "s", "SELECT a, b, v FROM v_keyed WHERE a = 2100")
         .1
         .weights
@@ -1968,6 +2005,283 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
             }
         })
         .sum()
+}
+
+// ---------------------------------------------------------------------------
+// One client, one copy
+// ---------------------------------------------------------------------------
+
+/// A store is attached once, and a mirror verb without one is refused.
+#[test]
+fn attaching_a_store_is_once_and_a_mirror_verb_needs_one() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+
+    let mut plain = GnitzClient::connect(fx.server.sock_path()).unwrap();
+    let e = plain.mirror_view("s", "v_keyed").unwrap_err().to_string();
+    assert!(e.contains("mirrors nothing"), "a client with no store says so: {e}");
+
+    let held = fx.base_dir();
+    let second_dir = tempfile::tempdir().unwrap();
+    let second_path = second_dir.path().to_str().unwrap().to_string();
+    let store = Mirror::open(&second_path).expect("a second directory opens");
+    let e = fx.mirror().attach_mirror(store).unwrap_err().to_string();
+    assert!(e.contains(&held), "the refusal must name the path already held: {e}");
+    // The refused store was dropped with the call, which released its lock.
+    Mirror::open(&second_path).expect("a refused attach must release the store it was passed");
+}
+
+/// `DROP VIEW` and a rename **through the mirroring client** stop that view
+/// answering locally, and `ALTER VIEW … AS` cannot reach one at all.
+///
+/// The copy and the DDL path share one object now, so without the hook a
+/// `SELECT` after a `DROP VIEW` on this same client answers rows off a view it
+/// just dropped, and a rename leaves the old name reading the copy while the new
+/// name goes upstream. The third case is closed one layer up: retargeting a view
+/// that carries a delta feed is refused, and a feed is what makes a view
+/// mirrorable at all.
+#[test]
+fn ddl_through_the_mirroring_client_retires_its_own_copy() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    for name in ["v_drop", "v_rename"] {
+        sql(
+            &mut fx.direct,
+            "s",
+            &format!("CREATE VIEW {name} WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE v >= 0"),
+        );
+    }
+    let mut ids = Vec::new();
+    for name in ["v_drop", "v_rename"] {
+        ids.push(fx.mirror().mirror_view("s", name).expect(name).view_id);
+    }
+    fx.drain("s", &["v_drop", "v_rename"]);
+    for &tid in &ids {
+        assert!(fx.mirror().mirrors(tid), "each copy answers before the DDL");
+    }
+
+    sql(fx.mirror(), "s", "DROP VIEW v_drop");
+    fx.mirror()
+        .alter_rename_relation("s", "v_rename", "v_renamed")
+        .expect("rename");
+
+    for (name, &tid) in ["v_drop", "v_rename"].iter().zip(ids.iter()) {
+        assert!(
+            !fx.mirror().mirrors(tid),
+            "{name}: the copy must stop answering once this client retired it",
+        );
+    }
+    // The one that still exists upstream reads correctly — delegated now.
+    fx.differential("s", "SELECT * FROM v_renamed");
+    // And the old name is gone rather than answering off the copy.
+    assert!(
+        SqlPlanner::new(fx.mirror(), "s")
+            .execute("SELECT * FROM v_rename")
+            .is_err(),
+        "a renamed view must not keep answering under its old name",
+    );
+    // A mirrored view cannot be retargeted, so no copy is ever left behind one.
+    let e = SqlPlanner::new(fx.mirror(), "s")
+        .execute("ALTER VIEW v_renamed AS SELECT a, b, v FROM t WHERE v > 1")
+        .expect_err("a fed view cannot be retargeted");
+    assert!(e.to_string().contains("delta feed"), "{e}");
+}
+
+/// A reconnect keeps every registration, is refused inside a transaction, and
+/// **closes the read gate** until the next poll.
+///
+/// The park hook rides along too — that it does is asserted where it can be
+/// asserted without a signal race, over the session move `reconnect` performs
+/// (`gnitz-core`'s `a_taken_park_hook_moves_to_the_session_that_replaces_it`).
+#[test]
+fn a_reconnect_keeps_the_registrations_and_closes_the_read_gate() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let (keyed, repl) = fx.mirror_both();
+    fx.quiesce();
+
+    let target = fx.server.sock_path().to_string();
+    fx.mirror().txn_begin().expect("begin");
+    assert!(
+        fx.mirror().reconnect(&target).is_err(),
+        "a reconnect inside a transaction is refused",
+    );
+    fx.mirror().txn_rollback().expect("rollback");
+
+    fx.reconnect_mirror();
+
+    let mut ids = fx.mirror().mirrored_ids();
+    ids.sort_unstable();
+    let mut want = vec![keyed, repl];
+    want.sort_unstable();
+    assert_eq!(ids, want, "the poll's work list survives a reconnect");
+    for tid in [keyed, repl] {
+        assert!(
+            !fx.mirror().mirrors(tid),
+            "every cursor is dropped, so the gate is shut"
+        );
+        assert!(fx.mirror().cursor_of(tid).is_none());
+    }
+
+    let before_reqs = fx.mirror().requests_sent();
+    fx.differential("s", "SELECT * FROM v_keyed");
+    assert!(
+        fx.mirror().requests_sent() > before_reqs,
+        "a read between the reconnect and the next poll goes upstream",
+    );
+    let report = fx.mirror().poll_mirror().expect("the poll after a reconnect");
+    assert_eq!(report.len(), 2);
+    assert!(
+        report.iter().all(|o| o.result.reseeded()),
+        "every view reseeds, and the report says so",
+    );
+    fx.quiesce();
+    fx.differential("s", "SELECT * FROM v_keyed");
+    fx.differential("s", "SELECT * FROM v_repl");
+}
+
+/// A poll whose id no longer resolves upstream re-resolves by name rather than
+/// bootstrapping at the stale id.
+///
+/// The reachable form of the cursor-less arm: a reconnect drops every cursor,
+/// and the view was recreated upstream under a fresh id meanwhile. A bootstrap
+/// in place would read a relation that no longer exists.
+#[test]
+fn a_cursor_less_poll_re_resolves_rather_than_bootstrapping_in_place() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let (old, _) = fx.mirror_both();
+    fx.quiesce();
+
+    sql(&mut fx.direct, "s", "DROP VIEW v_keyed");
+    sql(
+        &mut fx.direct,
+        "s",
+        &format!("CREATE VIEW v_keyed WITH (delta = '{FEED}') AS SELECT a, b, v, f, body FROM t WHERE v >= 0"),
+    );
+    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
+
+    fx.reconnect_mirror();
+    let report = fx.mirror().poll_mirror().expect("the poll re-resolves by name");
+    let moved = report
+        .iter()
+        .find(|o| o.view_id != old && o.result.reseeded())
+        .expect("the recreated view must be mirrored under its fresh id");
+    assert!(
+        !fx.mirror().mirrored_ids().contains(&old),
+        "the stale id must be retracted, not kept beside the new one",
+    );
+    assert!(fx.mirror().mirrors(moved.view_id));
+    fx.differential("s", "SELECT * FROM v_keyed");
+}
+
+/// A second view of a schema the store already knows issues no `SCHEMA_TAB`
+/// scan.
+///
+/// The round-trip assertion that keeps the store's own schema lookup from being
+/// quietly bypassed: only a first sighting pays that scan, and a client that
+/// asked the server every time would pay one per registration and per reseed.
+#[test]
+fn a_second_view_of_a_known_schema_costs_no_schema_scan() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 20);
+    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
+    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_repl");
+
+    let before = fx.mirror().requests_sent();
+    fx.mirror().mirror_view("s", "v_keyed").expect("the first view");
+    let first = fx.mirror().requests_sent() - before;
+    fx.mirror().mirror_view("s", "v_repl").expect("the second view");
+    let second = fx.mirror().requests_sent() - before - first;
+
+    assert_eq!(
+        second, 2,
+        "a second view of a known schema costs one RESOLVE and one bootstrap read",
+    );
+    assert_eq!(first, second + 1, "and the first pays exactly one SCHEMA_TAB scan more",);
+}
+
+/// A poisoned store refuses a mirrored read rather than answering it, an unheld
+/// relation still reads through the same client, and `close_mirror` is the way
+/// out.
+///
+/// In a child because the seam is a per-process latch. It is also the first test
+/// the panic guard has: nothing but a panic reaches its arm.
+#[test]
+fn a_poisoned_store_refuses_the_reads_it_would_answer() {
+    let _g = serial();
+    if !cfg!(debug_assertions) {
+        return; // the seam folds away in a release build
+    }
+    let (server, dir) = child_fixture();
+    run_child(
+        "poisoned_read_child",
+        &server,
+        &dir,
+        &[("GNITZ_INJECT_MIRROR_INGEST_PANIC", "1")],
+        "a poisoned copy must refuse its own reads and leave every other one alone",
+    );
+}
+
+/// Runs only in the child the test above spawns.
+#[test]
+fn poisoned_read_child() {
+    let Some((sock, dir)) = child_target() else { return };
+    let mut direct = GnitzClient::connect(&sock).unwrap();
+    let mut mirror = mirroring_client(&sock, &dir);
+    let tid = mirror
+        .mirror_view("s", "v_keyed")
+        .expect("the bootstrap succeeds")
+        .view_id;
+    assert!(mirror.mirrors(tid), "the copy is valid before the poll that panics");
+
+    churn(&mut direct, 41, 80);
+    let _ = query(&mut direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mirror.poll_mirror()));
+    assert!(unwound.is_err(), "the armed seam must panic inside the guarded region");
+    assert!(
+        mirror.mirror_poisoned().is_some(),
+        "the guard poisons before it lets the unwind continue",
+    );
+
+    // The copy is still gated in — cursor and registration both stand — so this
+    // is a read the store would otherwise have answered.
+    assert!(mirror.mirrors(tid));
+    let err = SqlPlanner::new(&mut mirror, "s")
+        .execute("SELECT * FROM v_keyed")
+        .expect_err("a poisoned copy must refuse the read it would answer");
+    assert!(err.to_string().contains("poisoned"), "the refusal must say why: {err}",);
+
+    // A relation the copy does not hold is unaffected: poison must not take
+    // every read on the connection down with it.
+    let local = query(&mut mirror, "s", "SELECT * FROM t");
+    let remote = query(&mut direct, "s", "SELECT * FROM t");
+    assert_same_zset(
+        "an unheld relation still reads through a poisoned client",
+        (&local.0, &local.1),
+        (&remote.0, &remote.1),
+    );
+
+    // `close_mirror` publishes no checkpoint, releases the directory, and leaves
+    // the connection usable — the only recovery a poisoned copy has.
+    mirror.close_mirror().expect("closing a poisoned store is not an error");
+    assert!(
+        !has_manifest(&dir, tid),
+        "a poisoned store must publish nothing on the way out",
+    );
+    assert!(mirror.mirror_poisoned().is_none(), "the poison went with the store");
+    let second = mirroring_client(&sock, &dir);
+    drop(second);
+    mirror
+        .attach_mirror(Mirror::open(&dir).expect("the directory came back"))
+        .expect("a later attach on the same connection is legal");
+    let recovered = mirror.mirror_view("s", "v_keyed").expect("and it bootstraps again");
+    assert!(recovered.result.reseeded());
+    println!("{CHILD_OK}");
 }
 
 // ---------------------------------------------------------------------------

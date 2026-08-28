@@ -335,13 +335,13 @@ engine too.
 |-------|------|------------|
 | `gnitz-wire` | Wire-protocol constants + codecs — the one definition client and engine must agree on | — |
 | `gnitz-expr` | The one expression evaluator, and the resolved column addressing it reads through | `wire` |
-| `gnitz-core` | Client core: connection, protocol, and the logical type / expression / circuit model | `wire`, `expr` |
+| `gnitz-core` | Client core: connection, protocol, the logical type / expression / circuit model, and the mirror state machine | `wire`, `expr` |
 | `gnitz-sql` | SQL front end: parser, binder, query planner | `core`, `expr`, `wire` |
 | `gnitz-tokio` | The Rust async client: a `Connection` future over tokio's reactor, and the `AsyncClient` handle | `core` |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `mirror`, `sql`, `wire` |
 | `gnitz-engine` | The single-node database as a library: Z-set store, DBSP operators, circuit compiler, catalog | `wire`, `expr` |
 | `gnitz-server` | The multi-process server binary — the `runtime` rung and nothing else | `engine`, `wire`, `expr` |
-| `gnitz-mirror` | The client mirror: a local copy of a view answering reads in the host's process — the one crate on both sides, and a leaf | `core`, `engine`, `wire` |
+| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides, and a leaf | `core`, `engine`, `wire` |
 | `gnitz-engine-testkit` | Dev-only: `gnitz-engine`'s test helpers, compiled as a library so `gnitz-server`'s tests reach them | `engine`, `wire` |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests | — |
 
@@ -577,12 +577,15 @@ what makes a foreign cursor unsafe rather than merely stale.
 
 The feed is per-worker; a replicated view's feed lives on worker 0 alone.
 
-A **mirror** (`gnitz-mirror`) is a local copy of a view fed by that feed, read in
-the host's process at its last polled round: not read-your-own-writes, and two
-mirrors are no consistent cut; an unheld relation is delegated upstream. One
-handle per data directory, refused by the engine's own `flock` in this process or
-any other; it poisons on an ingest error. It is reachable from Python as
-`gnitz.Mirror`, opened on a private data directory under the same rule.
+A **mirror** is a local copy of a view fed by that feed, held by a client and
+read in the host's process at its last polled round: not read-your-own-writes,
+and two mirrors are no consistent cut; a relation the copy does not hold is
+delegated upstream. The copy lives in a **store** (`gnitz-mirror`) the host opens
+and attaches to a client; one store per data directory, refused by the engine's
+own `flock` in this process or any other. A store poisons on an ingest error and
+then refuses the reads it would have answered — and only those — until it is
+closed, which is the one recovery. Every client can mirror — the blocking one,
+the async one, and Python.
 
 **A poll reports, per view, whether it reseeded** — discarded the copy and read
 the view whole. That is a discontinuity every subscriber has to react to, and no

@@ -1,9 +1,9 @@
 """The fed views two suites share, and the weight-exact comparison over them.
 
 `test_delta_feed.py` drives the feed by hand — bootstrap, poll, apply — and
-`test_mirror.py` drives the same views through a `gnitz.Mirror`, which does that
-for it. Both need the same base tables, the same churn (inserts, an UPDATE and a
-DELETE, so a round carries retractions and not just insertions), the same four
+`test_mirror.py` drives the same views through a mirroring client, which does
+that for it. Both need the same base tables, the same churn (inserts, an UPDATE
+and a DELETE, so a round carries retractions and not just insertions), the same four
 view bodies, and the same `{row → net weight}` comparison. Keeping one copy here
 is what makes "the mirror agrees with the feed" a comparison of two mechanisms
 rather than of two setups.

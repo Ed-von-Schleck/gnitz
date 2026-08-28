@@ -39,7 +39,7 @@ use crate::validate::{
     HonoredClauses, HonoredQueryClauses,
 };
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, ReadTarget, ReduceOutKey, RelDescriptor, Schema, ZSetBatch, MAX_COLUMNS};
+use gnitz_core::{CatalogSnapshot, GnitzClient, ReduceOutKey, RelDescriptor, Schema, ZSetBatch, MAX_COLUMNS};
 use gnitz_wire::{AggReadItem, AggReadSpec, ReadSink};
 use sqlparser::ast::{LimitClause, Query, Select, SetExpr, Statement};
 use std::sync::Arc;
@@ -514,10 +514,14 @@ fn plan_fold_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSql
 // The dispatch tail
 // ---------------------------------------------------------------------------
 
-pub(crate) fn execute_select(reads: &mut dyn ReadTarget, plan: ReadPlan) -> Result<SqlResult, GnitzSqlError> {
+/// Run one planned `SELECT`, reading local-first: a relation the client's copy
+/// holds is answered off it, and every other one over the wire.
+pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result<SqlResult, GnitzSqlError> {
     let tid = plan.target.tid;
     let ReadCase::Spec(spec) = plan.case else {
-        let (schema_out, batch_opt) = reads.scan(tid)?;
+        // The served LSN is dropped here: a `SELECT` holds no cursor across
+        // reads, and a local answer carries none anyway.
+        let (schema_out, batch_opt, _lsn) = client.scan_local_first(tid)?;
         let out_schema = schema_out
             .map(|s| (*s).clone())
             .unwrap_or_else(|| (*plan.target.schema).clone());
@@ -542,7 +546,7 @@ pub(crate) fn execute_select(reads: &mut dyn ReadTarget, plan: ReadPlan) -> Resu
             if limit == Some(0) {
                 return Ok(empty_rows(reply_schema));
             }
-            let batch = fetch_bound(reads, tid, &access, &sink, &reply_schema)?;
+            let batch = fetch_bound(client, tid, &access, &sink, &reply_schema)?;
             (reply_schema, batch)
         }
         SinkTail::Fold { shape, .. } => {
@@ -551,7 +555,7 @@ pub(crate) fn execute_select(reads: &mut dyn ReadTarget, plan: ReadPlan) -> Resu
             }
             // A wire error (including the runtime per-worker group cap) is hard: by
             // now the fold is mid-flight on the workers and cannot fall back.
-            let partial = fetch_bound(reads, tid, &access, &sink, &shape.partial_schema)?;
+            let partial = fetch_bound(client, tid, &access, &sink, &shape.partial_schema)?;
             // Client finishing: combine by group value, ground row, AVG/NullfillSum,
             // HAVING, projection.
             let out_batch = agg_finish(&shape, &partial);

@@ -14,8 +14,9 @@ use crate::validate::{
 use crate::SqlResult;
 use crate::{ddl, dml};
 use gnitz_core::CatalogSnapshot;
-use gnitz_core::{ClientError, GnitzClient, ReadTarget};
+use gnitz_core::{ClientError, GnitzClient, RelDescriptor};
 use sqlparser::ast::Statement;
+use std::sync::Arc;
 
 /// Inside a transaction, only DML and transaction control may run. Everything
 /// else — today's DDL, and every statement added later — is rejected by default:
@@ -47,62 +48,76 @@ fn reject_in_transaction(client: &GnitzClient, stmt: &Statement) -> Result<(), G
     Ok(())
 }
 
+/// The two spellings of "describe one relation" a statement can plan against:
+/// [`GnitzClient::resolve_local_first`], which answers off a mirrored
+/// registration, and [`GnitzClient::resolve`], which always asks the server.
+type Resolve = fn(&mut GnitzClient, &str, &str) -> Result<Option<Arc<RelDescriptor>>, ClientError>;
+
 /// Run `plan` against the statement's catalog snapshot, resolving each name it
-/// reports missing and re-running.
+/// reports missing through `resolve` and re-running.
 ///
 /// A planning pass has no side effects — it reads the snapshot and builds owned
 /// values, minting segment ids symbolically — so a discarded pass costs CPU over
 /// an already-parsed AST, not a round trip. One resolve per name the planner
 /// asks for, and none for a name it does not.
+///
+/// **`resolve` is a parameter and not a fixed choice**, because two of the four
+/// call sites are `CREATE VIEW` and `ALTER VIEW`: routing those through a local
+/// copy would compile a shipped circuit, or an `ALTER`'s outgoing view id,
+/// against a name → id binding only as fresh as the last poll.
 pub(crate) fn plan_resolving<T>(
-    reads: &mut dyn ReadTarget,
+    client: &mut GnitzClient,
+    resolve: Resolve,
     schema_name: &str,
     mut plan: impl FnMut(&CatalogSnapshot) -> Result<T, GnitzSqlError>,
 ) -> Result<T, GnitzSqlError> {
     loop {
-        let missing = match plan(reads.client_mut().catalog()) {
+        let missing = match plan(client.catalog()) {
             Err(GnitzSqlError::CatalogMiss(name)) => name,
             other => return other,
         };
-        // Progress, and so termination: `describe_relation` records its answer, and
+        // Progress, and so termination: both resolves record their answer, and
         // `CatalogSnapshot` keys both sides through `qualified_name`, so a repeat
         // ask is a broken invariant rather than a second round trip.
-        if reads.client_mut().catalog().get(schema_name, &missing).is_some() {
+        if client.catalog().get(schema_name, &missing).is_some() {
             return Err(GnitzSqlError::Internal(format!(
                 "planning re-asked for relation '{missing}', which the statement's snapshot already holds"
             )));
         }
-        reads.describe_relation(schema_name, &missing)?;
+        resolve(client, schema_name, &missing)?;
     }
 }
 
 /// Route one statement.
 ///
-/// A query and the `EXPLAIN` of one go to `reads`, which is what holds the
-/// relation: routing them to the connection instead would cost a round trip and
-/// describe the *server's* relation, which a stale local registration need not
-/// agree with. Everything below the split is DDL, DML or transaction control,
-/// which only a connection can serve. Those arms take `reads.client_mut()`, and
-/// that borrow is what stops a DDL statement from planning against a local
-/// binding only as fresh as the last poll.
+/// A query and the `EXPLAIN` of one resolve and read **local-first**: a relation
+/// the client's own copy holds is described and read off it, which is what keeps
+/// a mirrored `SELECT` round-trip-free. Everything below the split is DDL, DML or
+/// transaction control, which only a connection can serve — and what stops one of
+/// those planning against a binding only as fresh as the last poll is the resolve
+/// its arm names, [`GnitzClient::resolve`].
 pub(crate) fn execute_statement(
-    reads: &mut dyn ReadTarget,
+    client: &mut GnitzClient,
     schema_name: &str,
     stmt: &Statement,
 ) -> Result<SqlResult, GnitzSqlError> {
-    reject_in_transaction(reads.client_mut(), stmt)?;
+    reject_in_transaction(client, stmt)?;
 
     match stmt {
         Statement::Query(_) => {
-            let plan = plan_resolving(reads, schema_name, |cat| crate::plan_read(stmt, cat, schema_name))?;
-            return dml::execute_select(reads, plan);
+            let plan = plan_resolving(client, GnitzClient::resolve_local_first, schema_name, |cat| {
+                crate::plan_read(stmt, cat, schema_name)
+            })?;
+            return dml::execute_select(client, plan);
         }
         // Bare `DESC t` is `Statement::ExplainTable` — table introspection, a
         // separate feature — and falls to the catch-all below. `plan_read` rejects
         // the EXPLAIN of a non-SELECT.
         Statement::Explain { .. } => {
             reject_unhonored_explain_clauses(stmt, "EXPLAIN")?;
-            let plan = plan_resolving(reads, schema_name, |cat| crate::plan_read(stmt, cat, schema_name))?;
+            let plan = plan_resolving(client, GnitzClient::resolve_local_first, schema_name, |cat| {
+                crate::plan_read(stmt, cat, schema_name)
+            })?;
             return dml::execute_explain(plan);
         }
         _ => {}
@@ -112,7 +127,6 @@ pub(crate) fn execute_statement(
     // the pure planner, against the statement's snapshot rather than a connection.
     let mut binder = Binder::new(schema_name);
 
-    let client = reads.client_mut();
     match stmt {
         // Transaction control. Each is a pure client-state-machine transition
         // (no compile, no data reshape), so the handler is inlined here; the
@@ -151,7 +165,9 @@ pub(crate) fn execute_statement(
         }
         Statement::CreateView(cv) => {
             reject_unhonored_create_view_clauses(cv, "CREATE VIEW")?;
-            let views = plan_resolving(client, schema_name, |cat| crate::plan_view(stmt, cat, schema_name))?;
+            let views = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
+                crate::plan_view(stmt, cat, schema_name)
+            })?;
             crate::hir::execute_create_view(client, schema_name, views)
         }
         Statement::Insert(insert) => {
@@ -187,7 +203,9 @@ pub(crate) fn execute_statement(
             columns, with_options, ..
         } => {
             reject_unhonored_alter_view_clauses(columns, with_options, "ALTER VIEW")?;
-            let views = plan_resolving(client, schema_name, |cat| crate::plan_view(stmt, cat, schema_name))?;
+            let views = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
+                crate::plan_view(stmt, cat, schema_name)
+            })?;
             crate::hir::execute_alter_view(client, schema_name, views)
         }
         _ => Err(GnitzSqlError::Unsupported(format!(

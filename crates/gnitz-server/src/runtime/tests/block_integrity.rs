@@ -17,9 +17,7 @@ use gnitz_wire::{WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_R
 /// schema.
 fn data_block(rows: &[(u64, i64, i64)]) -> (SchemaDescriptor, Vec<u8>) {
     let schema = make_schema_u64_i64();
-    let batch = make_batch(&schema, rows);
-    let mut buf = vec![0u8; batch.wire_byte_size()];
-    batch.encode_to_wire(7, &mut buf, 0, true);
+    let buf = make_batch(&schema, rows).encode_to_wire_vec(7, true);
     (schema, buf)
 }
 
@@ -74,9 +72,7 @@ fn data_block_count_forgeries_are_rejected() {
 #[test]
 fn empty_data_block_still_decodes() {
     let schema = make_schema_u64_i64();
-    let batch = Batch::empty_with_schema(&schema);
-    let mut buf = vec![0u8; batch.wire_byte_size()];
-    batch.encode_to_wire(7, &mut buf, 0, true);
+    let buf = Batch::empty_with_schema(&schema).encode_to_wire_vec(7, true);
     let (decoded, _) = Batch::decode_from_wal_block(&buf, &schema, true).expect("an empty block decodes");
     assert_eq!(decoded.count, 0);
 }

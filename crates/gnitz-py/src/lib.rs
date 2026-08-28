@@ -12,12 +12,10 @@ use gnitz_core::{
     null_word_get, null_word_set, ClientError, ColData, ColumnDef, PkColumn, Schema, TableProps, TypeCode,
     WireConflictMode, ZSetBatch,
 };
-use gnitz_core::{ConflictClass, GnitzClient};
+use gnitz_core::{ConflictClass, DeltaCursor, GnitzClient, MirrorError, PollOutcome, PollResult};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
+use gnitz_mirror::Mirror;
 use gnitz_sql::{SqlPlanner, SqlResult};
-
-mod mirror;
-use mirror::{GnitzMirrorPoisonedError, PyMirror, PyPollResult};
 
 // ---------------------------------------------------------------------------
 // GnitzError Python exception
@@ -34,6 +32,12 @@ pyo3::create_exception!(_native, GnitzConflictError, GnitzError);
 // `except GnitzError` still catches it while a subscriber can name it and
 // bootstrap again.
 pyo3::create_exception!(_native, GnitzDeltaExpiredError, GnitzError);
+// A mirror store refused every further call that touches a copy, because a delta
+// did not reach it and the hole a cursor would step over is unrecoverable. A
+// subclass of GnitzError, like the conflict and expiry errors, so
+// `except GnitzError` still catches it while a host that wants to release the
+// store and start over can name it. `close_mirror()` is that recovery.
+pyo3::create_exception!(_native, GnitzMirrorPoisonedError, GnitzError);
 
 /// Wrap any `Display` error as a `GnitzError` PyErr. For the handful of
 /// failures that carry no retryability verdict (handshake, waker setup).
@@ -69,6 +73,11 @@ fn client_err(e: ClientError) -> PyErr {
             Err(other) => gnitz_err(other),
         },
         ClientError::DeltaExpired => GnitzDeltaExpiredError::new_err(e.to_string()),
+        // The arm, and not a pre-call check on the client, is what raises the
+        // poison class: refusing *every* method up front would take the
+        // connection's own reads down with the copy, where only a read that would
+        // have come off the copy is refused.
+        ClientError::Mirror(MirrorError::Poisoned(_)) => GnitzMirrorPoisonedError::new_err(e.to_string()),
         other => classified_err(&other),
     }
 }
@@ -1670,6 +1679,59 @@ fn batch_to_lazy(
     Py::new(py, PyScanResult { data, lsn })
 }
 
+/// What one view's poll did. The round its copy now answers at is `cursor`; the
+/// `reseeded` flag is the discontinuity a subscriber has to react to, and no
+/// cursor carries it — an expiry-driven reseed inside one boot keeps the tag and
+/// moves the tick forward, exactly as an ordinary advance does.
+///
+/// The flattening is this pyclass's, not the Rust type's: `PollResult` stays an
+/// enum where its invariant matters.
+#[pyclass(name = "PollResult", frozen, get_all)]
+pub struct PyPollResult {
+    /// The relation's server id, which a recreated view moves.
+    view_id: u64,
+    /// The copy was discarded and re-read whole. True for a first registration
+    /// and for every recovery; false for a poll that applied deltas, for a reopen
+    /// that resumed from its persisted cursor, and for a view whose poll failed —
+    /// which is the right answer to "did this view reseed".
+    reseeded: bool,
+    /// Why this one view's poll failed, or `None`. The other views went on; the
+    /// recovery is `forget_view(view_id)`.
+    error: Option<String>,
+    /// `(tag, tick)`, or `None` when the view has no valid copy.
+    cursor: Option<(u64, u64)>,
+}
+
+impl From<PollOutcome> for PyPollResult {
+    fn from(o: PollOutcome) -> PyPollResult {
+        PyPollResult {
+            view_id: o.view_id,
+            reseeded: o.result.reseeded(),
+            error: match &o.result {
+                PollResult::Failed(e) => Some(e.to_string()),
+                _ => None,
+            },
+            cursor: o.cursor.map(|c| (c.tag, c.tick)),
+        }
+    }
+}
+
+#[pymethods]
+impl PyPollResult {
+    /// Rendered the way Python prints the same values, not the way Rust does.
+    fn __repr__(&self) -> String {
+        let cursor = self
+            .cursor
+            .map_or("None".to_string(), |(tag, tick)| format!("({tag}, {tick})"));
+        let error = self.error.as_ref().map_or("None".to_string(), |m| format!("{m:?}"));
+        format!(
+            "PollResult(view_id={}, reseeded={}, cursor={cursor}, error={error})",
+            self.view_id,
+            if self.reseeded { "True" } else { "False" },
+        )
+    }
+}
+
 /// The one way this crate obtains a connection, so that no caller can skip the
 /// park hook: it is what makes a blocking call Ctrl-C-interruptible, by aborting
 /// it with the signal handler's own exception for [`client_err`] to re-raise.
@@ -1736,15 +1798,29 @@ impl PyGnitzClient {
         Ok(self.live()?.last_seen_lsn())
     }
 
-    pub fn close(&mut self) {
-        self.inner = None;
+    /// Request frames this connection has written — what a test asserts a
+    /// mirrored read does not move. Answers on a poisoned store.
+    #[getter]
+    pub fn requests_sent(&mut self) -> PyResult<u64> {
+        Ok(self.live()?.requests_sent())
+    }
+
+    /// Close the connection and release any mirror store with it. Calling it
+    /// twice is fine.
+    ///
+    /// The GIL goes down for the drop: with a store inside, that drop is a
+    /// checkpoint plus an engine close — fsync-bound and unbounded in the copy's
+    /// size — and it is also what releases the store's directory lock.
+    pub fn close(&mut self, py: Python<'_>) {
+        let taken = self.inner.take();
+        py.detach(move || drop(taken));
     }
 
     pub fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
-    pub fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_val: Py<PyAny>, _exc_tb: Py<PyAny>) -> bool {
-        self.close();
+    pub fn __exit__(&mut self, py: Python<'_>, _exc_type: Py<PyAny>, _exc_val: Py<PyAny>, _exc_tb: Py<PyAny>) -> bool {
+        self.close(py);
         false
     }
 
@@ -1863,10 +1939,15 @@ impl PyGnitzClient {
     }
 
     /// scan(target_id, include_hidden=False) -> ScanResult
+    ///
+    /// Every row of the relation, off this client's local copy if it mirrors one
+    /// and from the server if it does not. `lsn` is `None` for a local answer: a
+    /// served LSN is a server-side counter, and a copy's freshness is a feed
+    /// round — `cursor(view_id)` is where a host reads it.
     #[pyo3(signature = (target_id, include_hidden = false))]
     pub fn scan(&mut self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<Py<PyScanResult>> {
-        let triple = self.call(py, |c| c.scan(target_id))?;
-        triple_to_lazy(py, triple, include_hidden)
+        let (schema, batch, lsn) = self.call(py, |c| c.scan_local_first(target_id))?;
+        batch_to_lazy(py, schema, batch, lsn, include_hidden)
     }
 
     /// delta_bootstrap(view_id, view_schema, include_hidden=False) -> DeltaReply
@@ -1985,11 +2066,154 @@ impl PyGnitzClient {
     }
 
     /// execute_sql(sql, schema_name="public") -> list of result dicts
+    ///
+    /// A `SELECT` (and the `EXPLAIN` of one) over a view this client mirrors is
+    /// planned and answered against the local copy; every other statement, and
+    /// every read of a relation the copy does not hold, runs on the connection.
     #[pyo3(signature = (sql, schema_name = "public"))]
     pub fn execute_sql(&mut self, py: Python<'_>, sql: &str, schema_name: &str) -> PyResult<Py<PyAny>> {
         // Plan + execute (all wire I/O, no Python) with the GIL released.
         let results = self.call_with(py, sql_err, |c| SqlPlanner::new(c, schema_name).execute(sql))?;
         sql_results_to_py(py, results)
+    }
+
+    // ----- Mirroring -----
+    //
+    // Every method that does work drops the GIL for all of it — the round trips,
+    // and the engine and disk work between them. Only the metadata getters, which
+    // answer out of memory, hold it.
+
+    /// mirror_at(base_dir)
+    ///
+    /// Open (or resume) a local copy directory at `base_dir` and read this
+    /// client's mirrored views through it. The directory is this client's alone —
+    /// **one store per directory**, in this process or any other, and the engine's
+    /// own lock on it refuses a second.
+    ///
+    /// A second call on the same client is refused, naming the path it holds.
+    /// `close_mirror()` releases one; so does closing the client.
+    pub fn mirror_at(&mut self, py: Python<'_>, base_dir: &str) -> PyResult<()> {
+        let base_dir = base_dir.to_string();
+        self.call(py, move |c| c.attach_mirror(Mirror::open(&base_dir)?))
+    }
+
+    /// mirror_view(schema_name, name) -> PollResult
+    ///
+    /// Register the view and bring its copy up to date. Idempotent, and the same
+    /// call whether this is a first registration or a reopen: the result says
+    /// which it was.
+    ///
+    /// Only a view with a delta feed can be mirrored — create it
+    /// `WITH (delta = '<size>')`.
+    ///
+    /// **A mirrored read answers at the last poll**, not at what the server holds
+    /// now: not read-your-own-writes, and two mirrored views are no consistent
+    /// cut.
+    pub fn mirror_view(&mut self, py: Python<'_>, schema_name: &str, name: &str) -> PyResult<Py<PyPollResult>> {
+        let outcome = self.call(py, |c| c.mirror_view(schema_name, name))?;
+        Py::new(py, PyPollResult::from(outcome))
+    }
+
+    /// forget_view(view_id)
+    ///
+    /// Stop mirroring the relation: the copy and its directory go, and a later
+    /// read of it is delegated upstream.
+    pub fn forget_view(&mut self, py: Python<'_>, view_id: u64) -> PyResult<()> {
+        self.call(py, |c| c.forget_view(view_id))
+    }
+
+    /// poll() -> list[PollResult]
+    ///
+    /// Advance every registered view by one poll each, and report what each one
+    /// did — **one entry per view, whatever happened to it**. A view that failed
+    /// carries its message in `error`; the others went on.
+    ///
+    /// A poll drives no tick server-side, so a drain is "read the view against
+    /// the server, then poll once".
+    ///
+    /// It raises only for a failure of the call rather than of a view: no store
+    /// attached, a poisoned one, and a `KeyboardInterrupt`, which stops at the
+    /// view it interrupted.
+    pub fn poll(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyPollResult>>> {
+        let outcomes = self.call(py, GnitzClient::poll_mirror)?;
+        outcomes
+            .into_iter()
+            .map(|o| Py::new(py, PyPollResult::from(o)))
+            .collect()
+    }
+
+    /// Make every copy and its cursor durable.
+    ///
+    /// A failure is reported, not fatal: the flush writes shards and publishes
+    /// manifests, neither of which mutates what a copy holds, so the store stays
+    /// usable and a retry is sound.
+    pub fn checkpoint(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.call(py, GnitzClient::checkpoint_mirror)
+    }
+
+    /// close_mirror()
+    ///
+    /// Checkpoint (unless poisoned) and release the store, reporting the final
+    /// checkpoint rather than letting the destructor swallow it. The connection
+    /// stays open and `mirror_at` may be called again.
+    ///
+    /// It is also the **only** recovery from a poisoned copy, which refuses every
+    /// call that touches it and cannot be cleared.
+    pub fn close_mirror(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.call(py, GnitzClient::close_mirror)
+    }
+
+    /// Whether a read of `view_id` is answered locally. Answers on a poisoned
+    /// store.
+    pub fn mirrors(&mut self, view_id: u64) -> PyResult<bool> {
+        Ok(self.live()?.mirrors(view_id))
+    }
+
+    /// Every registration this client holds, whether or not the copy behind it is
+    /// valid — wider than `mirrors` by the ones a poll has yet to seed.
+    pub fn mirrored_ids(&mut self) -> PyResult<Vec<u64>> {
+        Ok(self.live()?.mirrored_ids())
+    }
+
+    /// cursor(view_id) -> (tag, tick) | None
+    ///
+    /// The round a local read of `view_id` answers at, or `None` when there is no
+    /// valid copy to read one off.
+    ///
+    /// The tick is the master's global round counter, shared by every relation,
+    /// so it advances over rounds that carried this view nothing. Whether a copy
+    /// changed is `PollResult.reseeded`, not this.
+    pub fn cursor(&mut self, py: Python<'_>, view_id: u64) -> PyResult<Py<PyAny>> {
+        match self.live()?.cursor_of(view_id) {
+            None => Ok(py.None()),
+            Some(DeltaCursor { tag, tick }) => Ok(PyTuple::new(py, [tag, tick])?.into_any().unbind()),
+        }
+    }
+
+    /// The message that poisoned this client's copy, or `None`. Answers on a
+    /// poisoned store — diagnosing one is what it is for.
+    #[getter]
+    pub fn mirror_poisoned(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self.live()?.mirror_poisoned() {
+            None => Ok(py.None()),
+            Some(m) => Ok(m.into_pyobject(py)?.into_any().unbind()),
+        }
+    }
+
+    /// reconnect(target)
+    ///
+    /// Replace the connection, keeping every mirrored copy. What a host does
+    /// after a server restart: the restart kills the socket, while the copies —
+    /// durable, and resumable — survive it. Refused inside a transaction.
+    ///
+    /// Every cursor is dropped, so a read between the reconnect and the next poll
+    /// goes upstream; the poll that follows reports a reseed for every view. A
+    /// client that mirrors nothing gains the same recovery.
+    pub fn reconnect(&mut self, py: Python<'_>, target: &str) -> PyResult<()> {
+        self.call(py, |c| c.reconnect(target))?;
+        // The park hook rides along with the reconnect, so a Ctrl-C still
+        // interrupts; nothing is reinstalled here.
+        Ok(())
     }
 }
 
@@ -2518,7 +2742,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGnitzClient>()?;
     m.add_class::<PyTxn>()?;
     m.add_class::<PyAsyncTransport>()?;
-    m.add_class::<PyMirror>()?;
     m.add_class::<PyPollResult>()?;
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
     m.add("GnitzConflictError", m.py().get_type::<GnitzConflictError>())?;

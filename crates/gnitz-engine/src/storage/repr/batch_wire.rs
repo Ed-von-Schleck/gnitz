@@ -195,6 +195,16 @@ impl Batch {
         self.encode_regions(0, self.count, &self.blob, table_id, out, offset, checksum)
     }
 
+    /// [`Self::encode_to_wire`] into a buffer of its own, sized by
+    /// [`Self::wire_byte_size`] — which is where the two must agree, so the
+    /// check lives here rather than at each caller.
+    pub fn encode_to_wire_vec(&self, table_id: u32, checksum: bool) -> Vec<u8> {
+        let mut out = vec![0u8; self.wire_byte_size()];
+        let written = self.encode_to_wire(table_id, &mut out, 0, checksum);
+        debug_assert_eq!(written, out.len(), "wire_byte_size must size its own encode");
+        out
+    }
+
     /// Encode the rows `indices` selects, in that order, as one WAL block at
     /// `out[offset..]`. Returns bytes written. Unlike its two siblings this one
     /// reads its region strides from `schema` rather than from the batch, so a

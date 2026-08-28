@@ -1,13 +1,17 @@
 //! The durable record of where each mirrored view's feed got to.
 //!
-//! It is a file the crate writes, not a relation in the mirror's own catalog. A
-//! locally-registered relation needs a locally-allocated `table_id`, and there
-//! is no id space to allocate one from that the server cannot also mint: both
-//! allocators count upward from `FIRST_USER_TABLE_ID`, and the register hook
-//! only ever raises the local counter *past* an id it adopts. So a mirror that
-//! registered a cursor relation first would take that id, and the first view a
-//! user asks it to mirror may well be the server's first user relation. That is
-//! what a two-line test setup produces, not a corner.
+//! It is a file the crate writes, not a relation in the mirror's own catalog.
+//! The engine partitions relation ids at `FIRST_USER_TABLE_ID` into two classes
+//! and no third. Below it every id is a system family: `ingest_to_family`
+//! resolves one through `SysFamily::from_id` and errors on a miss, and
+//! `reject_system_id` refuses a TABLE_TAB or VIEW_TAB row whose PK falls there.
+//! At or above it every id is a user relation, which the server's allocator and
+//! a local one both mint from, counting upward from that same floor. The
+//! unclaimed ids below it are not a third class — they are system-family ids
+//! with no family. So a cursor relation is either a user relation at an id the
+//! server can hand to the first view a user asks to mirror, or a tenth
+//! `SysFamily` that every server's catalog would create for a concern only a
+//! client has.
 //!
 //! **The header carries the checkpoint generation the records were written
 //! for, and a reopen acts on them only when that is the generation the engine

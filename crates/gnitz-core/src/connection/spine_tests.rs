@@ -475,6 +475,30 @@ fn aborted_park_leaves_the_slot_pending_and_the_next_call_drains_it_first() {
     assert_eq!(s.interest(), Interest::NONE);
 }
 
+/// The hook is the host's and outlives the session it was installed on — what
+/// [`crate::GnitzClient::reconnect`] relies on when it replaces the connection
+/// and keeps a blocking call Ctrl-C-interruptible.
+#[test]
+fn a_taken_park_hook_moves_to_the_session_that_replaces_it() {
+    let (mut old, _old_peer) = pair();
+    old.set_park_hook(Some(Box::new(|| Err(ClientError::ServerError("interrupted".into())))));
+    let hook = old.take_park_hook();
+    assert!(hook.is_some(), "the installed hook comes back out");
+    assert!(old.take_park_hook().is_none(), "and taking it leaves none behind");
+
+    // The peer never answers, so the scan parks; the signal makes the park
+    // return `EINTR`, which is the one place the hook runs.
+    let (mut fresh, _peer) = pair();
+    fresh.set_park_hook(hook);
+    let sig = signal_self_after(std::time::Duration::from_millis(100));
+    let r = fresh.scan(1);
+    assert!(
+        matches!(r, Err(ClientError::ServerError(ref m)) if m == "interrupted"),
+        "the moved hook must abort the park on the new session",
+    );
+    sig.join().unwrap();
+}
+
 #[test]
 fn raw_scan_spec_keeps_blocks_undecoded_and_off_the_cache() {
     let (mut s, peer) = pair();

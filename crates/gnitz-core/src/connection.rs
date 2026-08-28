@@ -63,6 +63,11 @@ pub type ScanReply = (Option<Arc<Schema>>, Option<ZSetBatch>, u64);
 /// The single-relation read result.
 pub type ScanResult = Result<ScanReply, ClientError>;
 
+/// A [`ScanReply`] whose served LSN may be absent: a mirrored copy answers at a
+/// feed round rather than a server-side counter, so a locally answered read
+/// carries none. What the `_local_first` reads hand back.
+pub type LocalScanReply = (Option<Arc<Schema>>, Option<ZSetBatch>, Option<u64>);
+
 /// One reply frame's data block, kept undecoded: the owned frame buffer and the
 /// block's extent within it. `block()` is the block itself.
 pub struct RawBlock {
@@ -74,6 +79,16 @@ impl RawBlock {
     /// The data block's bytes, ready to decode against the reply schema.
     pub fn block(&self) -> &[u8] {
         &self.frame[self.block.clone()]
+    }
+
+    /// A block that owns its whole buffer, for a producer that is not a reply
+    /// frame. [`MirrorStore::ingest`](crate::MirrorStore::ingest) takes these, so
+    /// a store's own tests need a way to build one.
+    pub fn from_block(block: Vec<u8>) -> RawBlock {
+        RawBlock {
+            block: 0..block.len(),
+            frame: block,
+        }
     }
 }
 
@@ -463,6 +478,14 @@ impl Session {
     /// Install (or clear) the hook `round_trip` runs before each park.
     pub fn set_park_hook(&mut self, hook: Option<ParkHook>) {
         self.park_hook = hook;
+    }
+
+    /// Take the hook out, leaving none. What
+    /// [`GnitzClient::reconnect`](crate::GnitzClient::reconnect) moves onto the
+    /// session it replaces this one with — the hook is the host's, and outlives
+    /// the connection it was installed on.
+    pub fn take_park_hook(&mut self) -> Option<ParkHook> {
+        self.park_hook.take()
     }
 
     // ── The spine ──────────────────────────────────────────────────────────

@@ -329,28 +329,31 @@ def client(_srv):
 
 @pytest.fixture
 def mirror_dir(tmp_path):
-    """A private data directory for one `gnitz.Mirror`, reclaimed with the test."""
+    """A private copy directory for one mirroring client, reclaimed with the
+    test."""
     return str(tmp_path / "mirror")
 
 
 @pytest.fixture
 def mirror_on():
-    """Factory taking `gnitz.Mirror`'s own arguments — `mirror_on(base_dir,
-    target)` — and closing the handle at teardown however the test left it.
+    """Factory for a client with a copy directory attached — `mirror_on(base_dir,
+    target)` — closed at teardown however the test left it.
 
-    Closing is not tidiness: an unclosed handle skips the exit checkpoint and
-    keeps its data directory locked for the life of the interpreter.
+    Closing is not tidiness: an unclosed client skips the exit checkpoint and
+    keeps its copy directory locked for the life of the interpreter.
     """
     with contextlib.ExitStack() as stack:
         def make(base_dir, target):
-            return stack.enter_context(gnitz.Mirror(base_dir, target))
+            client = stack.enter_context(gnitz.connect(target))
+            client.mirror_at(base_dir)
+            return client
 
         yield make
 
 
 @pytest.fixture
 def mirror(mirror_on, server, mirror_dir):
-    """A handle on the session server at `mirror_dir`."""
+    """A mirroring client on the session server at `mirror_dir`."""
     return mirror_on(mirror_dir, server)
 
 

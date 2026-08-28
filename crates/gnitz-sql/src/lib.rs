@@ -25,7 +25,7 @@ pub use hir::plan_view;
 // be able to build one with the same pinned parser the planner matches on.
 pub use sqlparser;
 
-use gnitz_core::{ReadTarget, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, Schema, ZSetBatch};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -70,19 +70,20 @@ pub enum SqlResult {
 
 /// High-level SQL execution planner.
 ///
-/// It plans against whatever [`ReadTarget`] it was handed: a `SELECT` and an
-/// `EXPLAIN` of one are served by the target, everything else by the connection
-/// the target owns. A [`gnitz_core::GnitzClient`] is its own connection, so
-/// passing one is the ordinary remote case.
+/// It plans against one [`GnitzClient`]. A `SELECT` and the `EXPLAIN` of one are
+/// answered off that client's local copy where it holds the relation and over
+/// the wire where it does not; everything else is the connection's. Which of the
+/// two a statement's arm asks for is named by the resolve and read functions it
+/// passes down, not by which object it borrows.
 pub struct SqlPlanner<'a> {
-    reads: &'a mut dyn ReadTarget,
+    client: &'a mut GnitzClient,
     schema_name: String,
 }
 
 impl<'a> SqlPlanner<'a> {
-    pub fn new(reads: &'a mut dyn ReadTarget, schema_name: impl Into<String>) -> Self {
+    pub fn new(client: &'a mut GnitzClient, schema_name: impl Into<String>) -> Self {
         SqlPlanner {
-            reads,
+            client,
             schema_name: schema_name.into(),
         }
     }
@@ -106,21 +107,21 @@ impl<'a> SqlPlanner<'a> {
         // call is left open (the caller owns its lifecycle). On a COMMIT failure
         // `txn_commit` already took the buffer out, so `txn_active()` is false
         // here — no double-rollback.
-        let txn_was_active = self.reads.client_mut().txn_active();
+        let txn_was_active = self.client.txn_active();
         let mut results = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
-            // The snapshot lives on the connection whatever the target is: the
-            // planner's resolve loop fills it by name and the index / replication
-            // probes read it back by id, so a delegated read costs one RESOLVE
-            // rather than two.
-            self.reads.client_mut().begin_statement();
-            let r = dispatch::execute_statement(self.reads, &self.schema_name, stmt);
-            self.reads.client_mut().end_statement();
+            // The snapshot lives on the client whether the read is local or
+            // delegated: the planner's resolve loop fills it by name and the
+            // index / replication probes read it back by id, so a delegated read
+            // costs one RESOLVE rather than two.
+            self.client.begin_statement();
+            let r = dispatch::execute_statement(self.client, &self.schema_name, stmt);
+            self.client.end_statement();
             match r {
                 Ok(res) => results.push(res),
                 Err(e) => {
-                    if !txn_was_active && self.reads.client_mut().txn_active() {
-                        let _ = self.reads.client_mut().txn_rollback();
+                    if !txn_was_active && self.client.txn_active() {
+                        let _ = self.client.txn_rollback();
                     }
                     return Err(e);
                 }

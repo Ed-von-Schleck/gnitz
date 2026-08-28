@@ -1,4 +1,5 @@
-"""`gnitz.Mirror`: a local copy of a view, read in this interpreter.
+"""A mirroring `gnitz.GnitzClient`: a local copy of a view, read in this
+interpreter.
 
 What this suite adds over the mirror crate's own — which owns the storage
 shapes, the worker counts and the recovery paths — is everything only the
@@ -193,8 +194,9 @@ def test_an_unmirrored_relation_is_delegated_and_a_forgotten_one_goes_back(clien
 def test_the_handles_life_in_one_interpreter(client, server, tmp_path):
     """Open, close, reopen.
 
-    Not the `mirror` fixture: this test owns the handles' lifetimes, which is
-    what it is about.
+    Not the `mirror` fixture: this test owns the clients' lifetimes, which is
+    what it is about. Closing a mirroring client releases its copy directory,
+    which is what lets the reopen below take it.
     """
     sn = "s" + _uid()
     _fed_view(client, sn, LINEAR)
@@ -203,22 +205,38 @@ def test_the_handles_life_in_one_interpreter(client, server, tmp_path):
 
     # Under `with` even for the explicit-close half, so a failing assertion
     # still releases the directory rather than holding it for the reopen below.
-    with gnitz.Mirror(base, server) as first:
+    with gnitz.connect(server) as first:
+        first.mirror_at(base)
         r = first.mirror_view(sn, "f")
         assert r.reseeded is True, "a first registration bootstraps"
 
         first.close()
-        first.close()  # idempotent — a host must be able to release a handle twice
+        first.close()  # idempotent — a host must be able to release a client twice
     for call in (lambda: first.poll(), lambda: first.mirrored_ids(), lambda: first.checkpoint()):
         with pytest.raises(gnitz.GnitzError):
             call()
 
-    with gnitz.Mirror(base, server) as second:
+    with gnitz.connect(server) as second:
+        second.mirror_at(base)
         again = second.mirror_view(sn, "f")
         assert again.view_id == r.view_id, "the reopen lands on the same server id"
         assert again.reseeded is False, "a reopen resumes from its persisted cursor"
     with pytest.raises(gnitz.GnitzError):
         second.poll()
+
+    # `close_mirror` is the narrower release: the copy goes, the connection
+    # stays, and the directory can be attached again — on this client or another.
+    with gnitz.connect(server) as third:
+        third.mirror_at(base)
+        third.close_mirror()
+        assert third.mirrored_ids() == [], "the registrations went with the store"
+        with pytest.raises(gnitz.GnitzError) as e:
+            third.poll()
+        assert "mirrors nothing" in str(e.value)
+        # The connection is untouched.
+        assert _rows(third.execute_sql("SELECT * FROM t", schema_name=sn))
+        third.mirror_at(base)
+        assert third.mirror_view(sn, "f").view_id == r.view_id
 
 
 # ── P4 · errors arrive as the right Python class ─────────────────────────────
@@ -250,7 +268,7 @@ def test_every_refusal_names_why(client, mirror):
         mirror.mirror_view("s" + _uid(), "f")
 
 
-def test_a_storage_fault_poisons_the_handle_and_the_process_lives(client, server, mirror_dir):
+def test_a_storage_fault_poisons_the_copy_and_the_process_lives(client, server, mirror_dir):
     """The host process surviving a storage fault is the whole reason the crate
     is safe to link into someone's application.
 
@@ -269,6 +287,32 @@ def test_a_storage_fault_poisons_the_handle_and_the_process_lives(client, server
 
     _mirrorproc.run(
         "poison", mirror_dir, server, sn, env={"GNITZ_INJECT_INGEST_APPLY_ERROR": "store"}
+    )
+
+
+def test_a_panicking_apply_poisons_the_copy_and_refuses_its_reads(client, server, mirror_dir):
+    """The panic guard, and the exception class a poison raised **through the SQL
+    layer** must arrive as.
+
+    A poll that panics leaves the copy gated in — cursor and registration both
+    stand — so the reads it refuses are exactly the ones it would otherwise have
+    answered off a copy that is silently missing rows. Reached only here: the
+    storage-fault case above poisons during a bootstrap, which leaves no cursor
+    and so no read to refuse.
+
+    In a fresh interpreter because the seam is a per-process latch, and because a
+    Rust panic crossing pyo3 raises a `BaseException` the suite should not have
+    to step around.
+    """
+    if not is_debug_build():
+        pytest.skip("the ingest panic seam requires a debug build")
+    sn = "s" + _uid()
+    _fed_view(client, sn, LINEAR)
+    _churn(client, sn, 1, 40)
+    client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
+
+    _mirrorproc.run(
+        "panic", mirror_dir, server, sn, env={"GNITZ_INJECT_MIRROR_INGEST_PANIC": "1"}
     )
 
 
@@ -297,7 +341,11 @@ def test_one_poll_reports_every_view(client, mirror):
     first = mirror.poll()
     assert {r.view_id for r in first} == set(ids.values()), "one poll advances every registration"
     assert not any(r.reseeded for r in first), "an ordinary advance is not a reseed"
+    assert all(r.error is None for r in first), "nothing failed, so nothing carries a message"
     advanced = {vid: mirror.cursor(vid) for vid in ids.values()}
+    assert all(r.cursor == advanced[r.view_id] for r in first), (
+        "the report carries the round each copy now answers at, so a host need not ask twice"
+    )
 
     for r in mirror.poll():
         assert not r.reseeded, "an empty poll reseeds nothing"
@@ -312,6 +360,39 @@ def test_one_poll_reports_every_view(client, mirror):
 
     unknown = max(ids.values()) + 10_000
     assert mirror.cursor(unknown) is None, "a view with no valid copy has no cursor"
+
+
+def test_a_dead_view_fails_its_own_entry_and_stops_nothing_else(client, mirror):
+    """A view dropped upstream fails forever, and the poll still reports every
+    other one.
+
+    `forget_view` clears it, and the id it needs is in the report rather than
+    inside a formatted message.
+    """
+    sn = "s" + _uid()
+    _base_tables(client, sn)
+    _mk_feed(client, sn, "f", LINEAR)
+    _mk_feed(client, sn, "g", "SELECT id, v, body FROM t WHERE v > 1")
+    dead = mirror.mirror_view(sn, "g").view_id
+    alive = mirror.mirror_view(sn, "f").view_id
+    _churn(client, sn, 1, 40)
+    _quiesce(client, mirror, sn)
+
+    client.execute_sql("DROP VIEW g", schema_name=sn)
+    _churn(client, sn, 41, 80)
+    client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
+
+    report = {r.view_id: r for r in mirror.poll()}
+    assert report[dead].error is not None, "the dropped view carries its own failure"
+    assert report[dead].reseeded is False, "a failed view did not reseed"
+    assert report[alive].error is None and report[alive].cursor is not None, (
+        "the survivor advanced, and the report says to which round"
+    )
+
+    mirror.forget_view(dead)
+    assert all(r.error is None for r in mirror.poll()), "the poll recovers once it is forgotten"
+    q = "SELECT * FROM f"
+    _same_zset(q, _local(mirror, sn, alive, q), _rows(client.execute_sql(q, schema_name=sn)))
 
 
 def test_a_reconnect_after_a_restart_reseeds_and_converges(own_server, mirror_on, mirror_dir):
@@ -434,9 +515,9 @@ def test_a_killed_host_reopens_at_its_last_checkpoint(own_server, mirror_on, mir
 
 
 def test_the_mirrors_own_connection_serves_every_other_statement(client, mirror):
-    """DDL, DML and a transaction through `mirror.execute_sql`, visible to a
-    plain client — the handle owns a connection, and everything the copy cannot
-    serve runs on it."""
+    """DDL, DML and a transaction through the mirroring client, visible to a
+    plain one — everything the copy cannot serve runs on the connection it is a
+    field of."""
     sn = "s" + _uid()
     client.create_schema(sn)
     mirror.execute_sql(
@@ -457,35 +538,18 @@ def test_the_mirrors_own_connection_serves_every_other_statement(client, mirror)
     )
 
 
-def test_a_multi_relation_select_fails_identically_through_either_object(client, mirror):
-    """No client plans an ad-hoc join, mirrored inputs included. The mirror must
-    not turn that into a different error."""
-    sn = "s" + _uid()
-    _fed_view(client, sn, LINEAR)
-    _churn(client, sn, 1, 20)
-    mirror.mirror_view(sn, "f")
-    _quiesce(client, mirror, sn)
-
-    q = "SELECT t.id, u.w FROM t JOIN u ON t.id = u.tid"
-    with pytest.raises(gnitz.GnitzError) as through_mirror:
-        mirror.execute_sql(q, schema_name=sn)
-    with pytest.raises(gnitz.GnitzError) as through_client:
-        client.execute_sql(q, schema_name=sn)
-    assert "derives a new one" in str(through_mirror.value)
-    assert str(through_mirror.value) == str(through_client.value)
-
-
 @pytest.mark.asyncio
 async def test_an_open_mirror_leaves_the_rest_of_the_process_alone(client, server, mirror_dir):
     """A `gnitz.aio` transport and a plain client both work in an interpreter
-    that has a mirror open, and after it is closed."""
+    that has a copy open, and after it is closed."""
     from gnitz import aio
 
     sn = "s" + _uid()
     _fed_view(client, sn, LINEAR)
     _churn(client, sn, 1, 20)
 
-    with gnitz.Mirror(mirror_dir, server) as m:
+    with gnitz.connect(server) as m:
+        m.mirror_at(mirror_dir)
         vid = m.mirror_view(sn, "f").view_id
         _quiesce(client, m, sn)
         expected = _zset(_rows(client.execute_sql("SELECT * FROM f", schema_name=sn)))
@@ -596,7 +660,13 @@ def test_the_copy_answers_with_the_server_stopped(own_server, mirror_on, mirror_
 
     assert _zset(_local(m, sn, vid, "SELECT * FROM f")) == expected
     assert _zset(_local(m, sn, vid, "SELECT id, v FROM f WHERE id = 7")) != {}
-    with pytest.raises(gnitz.GnitzError):
-        m.poll()
+
+    # The poll cannot reach the server, and says so per view rather than by
+    # raising: the copy is intact and every other view's entry is still worth
+    # reading.
+    assert all(r.error is not None for r in m.poll()), "a dead connection fails every view's poll"
+    assert _zset(_local(m, sn, vid, "SELECT * FROM f")) == expected, (
+        "and the copy still answers at the round it reached"
+    )
     with pytest.raises(gnitz.GnitzError):
         m.execute_sql("SELECT * FROM t", schema_name=sn)

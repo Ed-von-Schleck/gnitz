@@ -268,14 +268,6 @@ pub fn delta_reply_schema(view: &Schema) -> Schema {
     Schema { columns, pk_cols }
 }
 
-impl crate::read_target::ReadTarget for GnitzClient {
-    /// A client is its own connection, so every read method takes the trait's
-    /// default and delegates straight back here.
-    fn client_mut(&mut self) -> &mut GnitzClient {
-        self
-    }
-}
-
 /// What a bundle's view is called. A hidden segment's name embeds its owner's
 /// real id, which a planner minting symbolic ids does not have, so it names the
 /// owner and [`GnitzClient::create_view_chain`] mints the string once that id is
@@ -420,6 +412,9 @@ pub struct GnitzClient {
     /// never a false pass. Autocommit RMW statements read it as their basis;
     /// `BEGIN` snapshots it once for the whole transaction.
     last_seen_lsn: u64,
+    /// The local copy this client reads through, if a host attached one. Boxed,
+    /// so a client that never mirrors pays one `None` and no allocation.
+    pub(crate) mirror: Option<Box<crate::mirror::MirrorState>>,
 }
 
 // The client-facing types must stay `Send`: `gnitz-py` drops the GIL inside
@@ -455,6 +450,7 @@ impl GnitzClient {
             scope: None,
             txn: None,
             last_seen_lsn,
+            mirror: None,
         })
     }
 
@@ -513,9 +509,9 @@ impl GnitzClient {
     }
 
     /// Record a resolve a caller performed itself, which
-    /// [`ReadTarget::describe_relation`](crate::read_target::ReadTarget::describe_relation)
-    /// requires of a backend answering out of its own catalog. A no-op outside a
-    /// statement bracket.
+    /// [`Self::resolve_local_first`] must do: the planner's resolve loop reads
+    /// the statement snapshot back rather than the return value, and that is its
+    /// termination proof. A no-op outside a statement bracket.
     pub fn record_relation(&mut self, schema_name: &str, name: &str, desc: Option<Arc<RelDescriptor>>) {
         if let Some(scope) = &mut self.scope {
             scope.insert(schema_name, name, desc);
@@ -655,6 +651,119 @@ impl GnitzClient {
         self.session.scan_spec(table_id, spec, reply_schema).map(|(b, _)| b)
     }
 
+    // ── The read seam ──────────────────────────────────────────────────────
+    //
+    // `resolve`, `scan` and `scan_spec` are the connection; the `_local_first`
+    // trio below consults the copy and falls through to them, so every call site
+    // declares which freshness it is asking for. **The gate is what the copy
+    // holds, never whether a store is attached**, so a client with one reads
+    // exactly like a client without for every relation the copy does not hold.
+
+    /// [`Self::resolve`], answered off a mirrored registration when there is one
+    /// — which is what keeps a mirrored `SELECT` round-trip-free, since the
+    /// statement scope is dropped whole and delegating would cost one RESOLVE per
+    /// statement.
+    ///
+    /// The trade is a name → id binding as stale as the copy itself; the feed
+    /// detects it (the next poll's tag stops continuing) and the recovery
+    /// re-resolves before it reseeds. Answered off the registration rather than
+    /// the readability gate, so a name whose copy is not valid still binds
+    /// locally and only the read it feeds goes upstream.
+    pub fn resolve_local_first(
+        &mut self,
+        schema_name: &str,
+        name: &str,
+    ) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
+        let local = self.mirror.as_deref().and_then(|m| {
+            m.by_qname
+                .get(&qualified_name(schema_name, name))
+                .and_then(|tid| m.views.get(tid))
+                .map(|v| Arc::clone(&v.desc))
+        });
+        match local {
+            Some(desc) => {
+                self.record_relation(schema_name, name, Some(Arc::clone(&desc)));
+                Ok(Some(desc))
+            }
+            None => self.resolve(schema_name, name),
+        }
+    }
+
+    /// Every row of `table_id` off the copy, or `None` when the copy does not
+    /// hold it and the read is the caller's to delegate.
+    ///
+    /// **The store answers whether it holds the relation**, so nothing outside it
+    /// spells that gate a second time. For a caller that delegates on its own
+    /// terms — an async handle, which delegates on its own connection rather than
+    /// this one; [`Self::scan_local_first`] delegates here.
+    pub fn scan_local(&mut self, table_id: u64) -> Result<Option<(Arc<Schema>, ZSetBatch)>, ClientError> {
+        match self.mirror.as_deref_mut() {
+            Some(m) => Ok(m.store_mut().scan(table_id)?),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::scan`], answered off the copy when it holds `table_id`.
+    ///
+    /// The served LSN is `None` for a local answer: it is a server-side counter,
+    /// and a copy's freshness is a feed round — [`Self::cursor_of`] is where a
+    /// host reads it.
+    pub fn scan_local_first(&mut self, table_id: u64) -> Result<crate::connection::LocalScanReply, ClientError> {
+        if let Some((schema, batch)) = self.scan_local(table_id)? {
+            return Ok((Some(schema), Some(batch), None));
+        }
+        let (schema, data, lsn) = self.scan(table_id)?;
+        Ok((schema, data, Some(lsn)))
+    }
+
+    /// [`Self::scan_spec`], answered off the copy when it holds `table_id`.
+    ///
+    /// A held answer is the answer, empty or not; only "not held" falls through.
+    pub fn scan_spec_local_first(
+        &mut self,
+        table_id: u64,
+        spec: &[u8],
+        reply_schema: &Schema,
+    ) -> Result<Option<ZSetBatch>, ClientError> {
+        if let Some(m) = self.mirror.as_deref_mut() {
+            if let crate::mirror::StoreRead::Held(batch) = m.store_mut().scan_spec(table_id, spec, reply_schema)? {
+                return Ok(batch);
+            }
+        }
+        self.scan_spec(table_id, spec, reply_schema)
+    }
+
+    /// Replace the connection and keep the copies — what a host does after a
+    /// server restart, which kills the socket while the copies survive it.
+    ///
+    /// Refused while a transaction is open. Otherwise the client is rebuilt
+    /// through [`Self::connect`] rather than reset field by field, which keeps
+    /// the statement scope, the transaction slot, the SERIAL cache and the OCC
+    /// basis from being enumerated here and drifting. Nothing is taken out of
+    /// `self` until the new session exists, so a failed connect leaves this
+    /// client exactly as it was.
+    ///
+    /// A copy rides along and is repointed by `rebind_to_new_server`, whose doc
+    /// carries that rule. A poisoned store crosses unchanged, because poison is a
+    /// statement about the copy and not about the connection.
+    pub fn reconnect(&mut self, target: &str) -> Result<(), ClientError> {
+        if self.txn_active() {
+            return Err(ClientError::ServerError(
+                "reconnect inside a transaction; commit or roll back first".to_string(),
+            ));
+        }
+        let mut fresh = GnitzClient::connect(target)?;
+        // The hook lives on the session a reconnect replaces, and it is what
+        // keeps a blocking call Ctrl-C-interruptible.
+        fresh.session.set_park_hook(self.session.take_park_hook());
+        fresh.mirror = self.mirror.take();
+        if let Some(m) = fresh.mirror.as_deref_mut() {
+            m.rebind_to_new_server();
+        }
+        *self = fresh;
+        Ok(())
+    }
+
     /// Bootstrap a view's delta feed: the view's whole current value, in the
     /// view's own schema, together with the cursor to poll from.
     ///
@@ -701,13 +810,13 @@ impl GnitzClient {
         Ok((data, cursor.advanced_to(next)?))
     }
 
-    /// [`Self::delta_bootstrap`] handing back the reply's *undecoded* blocks.
+    /// [`Self::delta_bootstrap`] handing back the reply's *undecoded* blocks —
+    /// what the mirror state machine feeds a store.
     ///
-    /// For a subscriber that feeds the rows into a store rather than reading
-    /// them: decoding to a `ZSetBatch` walks every OPK key back to a native
-    /// value, and re-encoding it costs the walk again plus a second full region
-    /// copy — to reconstruct the block the socket already delivered.
-    pub fn delta_bootstrap_raw(
+    /// Decoding to a `ZSetBatch` walks every OPK key back to a native value, and
+    /// re-encoding it costs the walk again plus a second full region copy — to
+    /// reconstruct the block the socket already delivered.
+    pub(crate) fn delta_bootstrap_raw(
         &mut self,
         view_id: u64,
         view_schema: &Schema,
@@ -717,7 +826,7 @@ impl GnitzClient {
 
     /// [`Self::delta_poll`] handing back the reply's *undecoded* blocks, under
     /// the same two cursor rules.
-    pub fn delta_poll_raw(
+    pub(crate) fn delta_poll_raw(
         &mut self,
         view_id: u64,
         cursor: DeltaCursor,
@@ -1498,6 +1607,13 @@ impl GnitzClient {
 
         self.push_ddl(&families)?;
 
+        // Reached only by a host calling this directly: the SQL front end refuses
+        // to retarget a view carrying a delta feed, and a feed is what makes a
+        // view mirrorable.
+        for rec in &retracted {
+            self.invalidate_own_copy(rec.vid)?;
+        }
+
         Ok(vids)
     }
 
@@ -1523,6 +1639,12 @@ impl GnitzClient {
             }
         }
         self.push_ddl(&[(VIEW_TAB, vb)])?;
+
+        // Without this a `SELECT` after a `DROP VIEW` on this same client would
+        // answer rows off a view it just dropped.
+        for rec in &records {
+            self.invalidate_own_copy(rec.vid)?;
+        }
 
         Ok(())
     }
@@ -1582,6 +1704,11 @@ impl GnitzClient {
                 append_view_row(&mut a, 1, &renamed);
             }
             self.push_ddl(&[(VIEW_TAB, vb)])?;
+            // The whole registration, though a rename keeps the id and so costs a
+            // re-bootstrap: the store's `VIEW_TAB` row carries the *old* name,
+            // which is the state a re-registration reads to detect a
+            // drop-and-recreate.
+            self.invalidate_own_copy(desc.tid)?;
         } else {
             let (_, tbl_batch, _) = self.session.scan(TABLE_TAB)?;
             let tbl_batch = tbl_batch.ok_or_else(not_found)?;

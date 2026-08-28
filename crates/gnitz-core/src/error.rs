@@ -1,3 +1,4 @@
+use crate::mirror::MirrorError;
 use crate::protocol::ProtocolError;
 use std::fmt;
 
@@ -5,9 +6,8 @@ use std::fmt;
 pub enum ClientError {
     Protocol(ProtocolError), // wire / IO / decode failure
     /// Anything that fails with a message rather than a classified outcome: a
-    /// `STATUS_ERROR` the server returned, a client-side validation the request
-    /// never got past, or — for a [`crate::ReadTarget`] that is not a client — a
-    /// fault in whatever answered locally.
+    /// `STATUS_ERROR` the server returned, or a client-side validation the
+    /// request never got past.
     ServerError(String),
     SchemaMismatch, // STATUS_SCHEMA_MISMATCH: server rejected schema-less PUSH
     /// STATUS_TXN_CONFLICT: a user-table TXN failed its OCC precondition — a table
@@ -28,6 +28,12 @@ pub enum ClientError {
     /// local copy and bootstrap. Splitting it would make every caller catch
     /// several errors to take one branch.
     DeltaExpired,
+    /// A mirror store refused or failed. Kept as its own variant rather than
+    /// flattened to a message so [`MirrorError::Poisoned`] stays a class a host
+    /// can catch — a poisoned copy is recovered by
+    /// [`GnitzClient::close_mirror`](crate::GnitzClient::close_mirror) and by
+    /// nothing else.
+    Mirror(MirrorError),
     /// The host runtime aborted a blocking call from the park hook — for the
     /// Python binding, a signal handler raised. Carries the host's own error
     /// so the binding re-raises exactly what the handler produced.
@@ -75,6 +81,7 @@ impl fmt::Display for ClientError {
                 "delta cursor is not honourable — its rounds were dropped, or it names a \
                  different boot or relation; re-read the feed from 0"
             ),
+            ClientError::Mirror(e) => write!(f, "{e}"),
             ClientError::Interrupted(e) => write!(f, "interrupted: {e}"),
         }
     }

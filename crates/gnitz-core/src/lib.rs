@@ -5,8 +5,8 @@ pub mod circuit;
 pub mod client;
 pub mod connection;
 pub mod error;
+pub mod mirror;
 pub mod protocol;
-pub mod read_target;
 pub mod types;
 
 // The crate prelude: the names a client of gnitz-core names by hand. Every
@@ -22,17 +22,17 @@ pub use client::{
     IndexMeta, InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, ViewName, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
-    Completions, Interest, ParkHook, RawBlock, RelTarget, Reply, ReplyTrain, Request, ScanReply, Session, SlotId,
-    FIRST_USER_TABLE_ID, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, TABLE_TAB,
+    Completions, Interest, LocalScanReply, ParkHook, RawBlock, RelTarget, Reply, ReplyTrain, Request, ScanReply,
+    Session, SlotId, FIRST_USER_TABLE_ID, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, TABLE_TAB,
 };
 pub use error::{ClientError, ConflictClass};
 pub use gnitz_wire::{
     index_key_types, validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, RelClass,
     TableProps,
 };
+pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, Shape, StoreRead};
 pub use protocol::{
     null_word_get, null_word_set, wire_flags_get_schema_version, wire_flags_set_conflict_mode, BatchAppender, ColData,
     ColumnDef, FixedInt, PkColumn, PkTuple, ProtocolError, Schema, TypeCode, ViewBuffers, WireConflictMode, ZSetBatch,
     ZSetBatchView, FLAG_PUSH, MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };
-pub use read_target::ReadTarget;
