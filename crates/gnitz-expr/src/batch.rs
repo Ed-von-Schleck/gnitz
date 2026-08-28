@@ -1,9 +1,10 @@
 //! Morsel-oriented batch expression evaluator.
 //!
 //! `eval_batch` processes one morsel at a time (up to MORSEL rows), applying
-//! all expression opcodes as columnar loops over register buffers.  Base
-//! pointers are hoisted outside the inner loop, letting LLVM auto-vectorize
-//! every arithmetic opcode.
+//! all expression opcodes as columnar loops over register buffers. Base
+//! pointers are hoisted outside the inner loop, which is what lets LLVM
+//! auto-vectorize the arithmetic opcodes — the string and null-gathering
+//! kernels do not vectorize.
 
 use std::cmp::Ordering;
 use std::fmt::{self, Write as _};
@@ -487,7 +488,7 @@ fn fill_null_bits_mask(s: &mut EvalScratch, di: usize, mo: &Morsel<'_>, cols: u6
     }
 }
 
-/// IS [NOT] NULL: read payload column `pi`'s null bit per row, optionally invert
+/// `IS [NOT] NULL`: read payload column `pi`'s null bit per row, optionally invert
 /// (`invert` for IS NOT NULL), and write the boolean into register `dst`. The result
 /// register is always non-null (`clear_null_reg`).
 ///
@@ -673,7 +674,7 @@ fn merge_fail_mask(scratch: &mut EvalScratch, dst: usize, bad: &[u8; MORSEL], m:
 /// A `&[u8]` lane is not expressible at all — [`EvalScratch`] has no lifetime
 /// parameter, is `Default`-constructed once per evaluator, and outlives every
 /// batch it is driven over.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct StrView {
     off: u64,
     len: u32,
@@ -691,8 +692,8 @@ const SRC_BLOB: u32 = 1;
 const SRC_COL_BASE: u32 = 2;
 
 /// How many string columns one program can hold views into. A program naming
-/// more loads the extras through [`cell_to_arena_view`], the copying form every
-/// string column used before the table existed.
+/// more loads the extras through [`cell_to_arena_view`], which copies each cell
+/// into the arena instead of addressing the column region in place.
 pub(crate) const MAX_STR_COL_BUFS: usize = 8;
 
 /// The buffer slot a `LoadColStr` on payload slot `pi` loads through, appending

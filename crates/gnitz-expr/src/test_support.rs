@@ -154,10 +154,8 @@ impl TestSchema {
         }
     }
 
-    /// A PK at `pk_index` plus the other columns of `col_types` as payload, all
-    /// of them nullable. `col_types` may name an *undecodable* type code: a
-    /// release engine can carry one (a corrupt SAL / crafted wire schema), and
-    /// the validator tests exist to pin what happens then.
+    /// As [`TestSchema::new`], with the PK at `pk_index` and every other column
+    /// of `col_types` a nullable payload.
     pub fn with_pk_at(pk_index: usize, col_types: &[u8]) -> Self {
         let cols: Vec<(u8, bool)> = col_types.iter().enumerate().map(|(i, &t)| (t, i != pk_index)).collect();
         TestSchema::new(&cols, &[pk_index])
@@ -287,12 +285,6 @@ fn schema_pk_cols(payload_tc: u8, n: usize, nullable: bool) -> TestSchema {
     TestSchema::new(&cols, &[0])
 }
 
-/// A one-row view over `schema`: payload slot `i` holds `vals[i]`, and the
-/// row's whole null word is `null_word` (bit `i` = payload slot `i` is NULL).
-pub fn make_int_row(schema: &TestSchema, vals: &[i64], null_word: u64) -> TestView {
-    make_int_view(schema, &[(1, null_word, vals)])
-}
-
 /// An `n`-row view over `schema`'s `I64` payload columns: column `col` of `row`
 /// holds `f(row, col)`, and its null bit is set when `null_pred(row, col)`.
 /// PKs are `1..=n`.
@@ -330,6 +322,9 @@ pub fn scalar_prog(
         .resolve_scalar(schema)
         .expect("test program must validate")
 }
+
+/// A predicate as [`filter_prog`] takes it: `(instrs, num_regs, result_reg)`.
+pub type FilterShape = (Vec<LogicalInstr>, u32, u32);
 
 /// Build and resolve a filter program — the arm where `result_reg` stays
 /// bit_only-eligible. Same unwrap rule as [`scalar_prog`].
@@ -392,10 +387,6 @@ pub fn both_arms(label: &str, build: impl Fn() -> Evaluator) -> (Evaluator, Eval
     nullable.prog.no_nulls = false;
     (fast, nullable)
 }
-
-/// The float-register codec, re-exported under its own name so a test reads a
-/// float register through the kernel's own spelling and cannot disagree with it.
-pub(crate) use crate::batch::{decode_f64, encode_f64};
 
 /// A three-row view with a compound `(U32, I64)` PK and payload slots
 /// `0: I32`, `1: U128`, `2: U64`.

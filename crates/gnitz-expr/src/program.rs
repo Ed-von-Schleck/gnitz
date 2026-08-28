@@ -36,36 +36,88 @@ const _: () = assert!(
 pub enum ExprValidateErr {
     UnknownOpcode(u32),
     TooManyRegs(u32),
-    ResultRegOutOfRange { result_reg: u32, num_regs: u32 },
-    RegOutOfRange { reg: u16, num_regs: u32 },
-    RegisterAliasing { dst: u16, reg: u16 },
-    RegRewrite { reg: u16 },
-    RegReadBeforeWrite { reg: u16 },
-    RegClassMismatch { reg: u16 },
-    ConstIdxOutOfRange { const_idx: u32, n: usize },
-    IntSetNotAligned { set_idx: u32, len: usize },
-    ColOutOfRange { col: u32, num_columns: usize },
-    ColNotPayload { col: u32 },
-    ColKindMismatch { col: u32, type_code: u8, want: ColKind },
-    CopyTypeMismatch { col: u32, src_tc: u8, out: u32, out_tc: u8 },
-    EmitSlotNotEightBytes { out: u32, type_code: u8 },
-    EmitClassMismatch { out: u32, type_code: u8 },
-    OutputIdxOutOfRange { out: u32, num_payload_cols: usize },
-    OutputSlotUnwritten { written: u64, num_payload_cols: usize },
+    ResultRegOutOfRange {
+        result_reg: u32,
+        num_regs: u32,
+    },
+    RegOutOfRange {
+        reg: u16,
+        num_regs: u32,
+    },
+    RegisterAliasing {
+        dst: u16,
+        reg: u16,
+    },
+    RegRewrite {
+        reg: u16,
+    },
+    RegReadBeforeWrite {
+        reg: u16,
+    },
+    RegClassMismatch {
+        reg: u16,
+    },
+    ConstIdxOutOfRange {
+        const_idx: u32,
+        n: usize,
+    },
+    IntSetNotAligned {
+        set_idx: u32,
+        len: usize,
+    },
+    ColOutOfRange {
+        col: u32,
+        num_columns: usize,
+    },
+    ColNotPayload {
+        col: u32,
+    },
+    ColKindMismatch {
+        col: u32,
+        type_code: u8,
+        want: &'static str,
+    },
+    CopyTypeMismatch {
+        col: u32,
+        src_tc: u8,
+        out: u32,
+        out_tc: u8,
+    },
+    EmitSlotNotEightBytes {
+        out: u32,
+        type_code: u8,
+    },
+    EmitClassMismatch {
+        out: u32,
+        type_code: u8,
+    },
+    OutputIdxOutOfRange {
+        out: u32,
+        num_payload_cols: usize,
+    },
+    OutputSlotUnwritten {
+        written: u64,
+        num_payload_cols: usize,
+    },
     ResultRegRequired,
     CorruptBlob(&'static str),
-    BadCastTarget { tc: u32 },
-    BadTrimMode { mode: u32 },
-    BadLikeEscape { escape: u32 },
+    BadCastTarget {
+        tc: u32,
+    },
+    BadTrimMode {
+        mode: u32,
+    },
+    BadLikeEscape {
+        escape: u32,
+    },
 }
 
 /// The client-facing rendering. Lives on the type so the planner's `Unsupported`
 /// and the engine's compile rejection print the same wording, and so the limit
 /// printed is the one [`LogicalProgram::from_wire`] enforces. `TooManyRegs` and
 /// `ColKindMismatch` get sentences — they are the variants a working query can
-/// hit, and the latter's payload is otherwise rendered as the private struct's
-/// field list; the rest are internal-shape violations with no user action,
-/// rendered as `Debug`.
+/// hit; the rest are internal-shape violations with no user action, rendered as
+/// `Debug`.
 impl fmt::Display for ExprValidateErr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -88,7 +140,7 @@ impl fmt::Display for ExprValidateErr {
 
 /// The *type* half of a column operand's requirement — what the opcode's kernel
 /// can decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ColType {
     /// Any type: the kernel decodes no value, so U128 and STRING are legitimate.
     Any,
@@ -106,33 +158,34 @@ enum ColType {
 /// address a column through the dense payload index a PK column has none of — so
 /// they are two fields rather than a flattened variant list whose consumers have
 /// to re-derive the factorization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ColKind {
+#[derive(Clone, Copy)]
+struct ColKind {
     /// True iff a PK column is usable here.
     pk_ok: bool,
     ty: ColType,
 }
 
-/// The requirement as a client-readable phrase. `ColKind`'s fields are private,
-/// so without this a `ColKindMismatch` reaches a client through
-/// [`ExprValidateErr`]'s `Debug` fallthrough as this struct's field list.
-impl fmt::Display for ColKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ty = match self.ty {
-            ColType::Any => "a column of any type",
-            ColType::FixedInt => "a fixed-width integer column",
-            ColType::Float => "a floating-point column",
-            ColType::GermanString => "a string or blob column",
-        };
-        f.write_str(ty)?;
-        if !self.pk_ok {
-            f.write_str(" that is not part of the primary key")?;
-        }
-        Ok(())
-    }
-}
-
 impl ColKind {
+    /// The requirement as a client-readable phrase — what a `ColKindMismatch`
+    /// carries, since the fields and the constants below are private and there
+    /// is nothing else a client could do with one.
+    fn describe(self) -> &'static str {
+        // Every `(pk_ok, ty)` cell spelled out rather than composed from a
+        // suffix: three of the eight are unreachable today, and a wildcard arm
+        // covering them would silently render the wrong sentence for whichever
+        // one a later `ColKind` constant makes reachable.
+        match (self.pk_ok, self.ty) {
+            (true, ColType::Any) => "a column of any type",
+            (true, ColType::FixedInt) => "a fixed-width integer column",
+            (true, ColType::Float) => "a floating-point column",
+            (true, ColType::GermanString) => "a string or blob column",
+            (false, ColType::Any) => "a column of any type that is not part of the primary key",
+            (false, ColType::FixedInt) => "a fixed-width integer column that is not part of the primary key",
+            (false, ColType::Float) => "a floating-point column that is not part of the primary key",
+            (false, ColType::GermanString) => "a string or blob column that is not part of the primary key",
+        }
+    }
+
     /// PK or payload, any type — a `CopyCol` source.
     const ANY_COL: ColKind = ColKind {
         pk_ok: true,
@@ -518,7 +571,7 @@ pub enum LogicalInstr {
 /// [`operands`]. A variant here with no 1:1 logical counterpart therefore
 /// inherits both from whichever opcode lowers into it, and must match it in
 /// each.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum Instr {
     /// Payload integer load. `fi` *is* the eight-arm decode the kernel dispatches
     /// on, established once at resolve time (`validate` pins the column to
@@ -802,10 +855,9 @@ pub(crate) enum Instr {
 impl LogicalInstr {
     /// Serialise to the wire quad `[op, dst, a1, a2]` — the exact inverse of
     /// [`LogicalProgram::from_wire`]'s decode, and the **one** place the operand
-    /// word layout is written. Everything that used to know it (which word
-    /// carries a packed pair, which opcode a flag selects, where a cast target
-    /// rides) is stated here once and read back there once; the round-trip test
-    /// is what holds the two together.
+    /// word layout is written — which word carries a packed pair, which opcode a
+    /// flag selects, where a cast target rides. Stated here once and read back
+    /// there once; the round-trip test is what holds the two together.
     ///
     /// Unused words are 0, matching what the decoder ignores.
     pub(crate) fn to_wire(self) -> [u32; 4] {
@@ -1024,7 +1076,7 @@ impl LogicalInstr {
 /// What a resolved program is for. The one classification resolution needs that
 /// the instruction stream does not carry: it fixes `result_reg`'s eligibility
 /// for the bit_only path, and whether `result_reg` means anything at all.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
     /// A predicate driven through [`crate::Evaluator::filter`], which reads
     /// `result_reg` back out of `bool_bits`.
@@ -2429,7 +2481,7 @@ fn check_col(in_schema: Option<&dyn SchemaFacts>, col: u32, need: ColKind) -> Re
         Err(ExprValidateErr::ColKindMismatch {
             col,
             type_code,
-            want: need,
+            want: need.describe(),
         })
     }
 }
@@ -2509,8 +2561,9 @@ pub(crate) struct ResolvedProgram {
     pub(crate) instrs: Vec<Instr>,
     /// A map's verbatim column moves, as `(source locator, output payload slot,
     /// destination write width)`. Off the instruction stream, not in it: they
-    /// name a destination rather than a computation, so leaving them there gave
-    /// the per-morsel dispatch up to one no-op arm per projected column.
+    /// name a destination rather than a computation, so keeping them in the
+    /// stream would give the per-morsel dispatch up to one no-op arm per
+    /// projected column.
     ///
     /// The width is the *output* column's, wider than the source's only for a
     /// promoted integer column — the widening `check_copy_types` approved. `0`
@@ -2519,8 +2572,8 @@ pub(crate) struct ResolvedProgram {
     /// A map's computed columns, as `(source register, output payload slot)`,
     /// with the scalar-register entries first and the string-register ones from
     /// [`Self::str_emit_start`] on. The class a consumer needs is not stored
-    /// beside them: the split — and [`Self::emit_targets`] — reads it off
-    /// [`Self::str_class`], the one record of a register's class.
+    /// beside them: the partition point is read off [`Self::str_class`], the one
+    /// record of a register's class.
     pub(crate) emits: Vec<(u16, u32)>,
     /// Where [`Self::emits`]' string half starts.
     str_emit_start: usize,
@@ -2563,11 +2616,11 @@ pub(crate) struct ResolvedProgram {
     /// column region per entry.
     pub(crate) str_cols: Vec<u8>,
     /// Bit `r` set iff register `r` holds a string rather than a scalar —
-    /// `validate`'s own answer, kept rather than discarded for the three facts
-    /// derived from it ([`Self::str_lanes`], [`Self::result_is_str`], the class
-    /// on each [`Self::emit_targets`] entry). Storing the derivations instead
-    /// leaves three copies of one fact to drift.
-    pub(crate) str_class: u64,
+    /// `validate`'s own answer, kept rather than discarded for the facts derived
+    /// from it ([`Self::str_lanes`], [`Self::result_is_str`], and where
+    /// [`Self::emits`] splits). Storing the derivations instead leaves several
+    /// copies of one fact to drift.
+    str_class: u64,
     /// What this program is for. Read only to decide whether `result_reg` means
     /// anything — a map's is force-zeroed.
     role: Role,
@@ -2629,15 +2682,6 @@ impl ResolvedProgram {
         self.role != Role::Map && self.num_regs != 0 && (self.str_class >> self.result_reg) & 1 != 0
     }
 
-    /// A map's computed columns as `(source register, output payload slot,
-    /// is_str)`. The class comes off `str_class`, classified exactly as
-    /// `check_emit_slot` classified the slot when it approved it.
-    pub(crate) fn emit_targets(&self) -> impl Iterator<Item = (u16, u32, bool)> + '_ {
-        self.emits
-            .iter()
-            .map(|&(src, out)| (src, out, (self.str_class >> src) & 1 != 0))
-    }
-
     /// The emits whose source register holds a scalar.
     pub(crate) fn scalar_emits(&self) -> &[(u16, u32)] {
         &self.emits[..self.str_emit_start]
@@ -2669,7 +2713,7 @@ struct ProgramFacts {
 }
 
 /// Derive every per-register and per-program fact `resolve_program` needs, in one
-/// pass over the one operand table. Two facts that used to be two passes:
+/// pass over the one operand table:
 ///
 /// * **Register roles.** A filter's `result_reg` is forced to be a bool input:
 ///   the filter's nullable arm consumes the result as packed bits, so its

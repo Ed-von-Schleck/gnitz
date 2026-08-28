@@ -168,12 +168,6 @@ impl Evaluator {
         &self.prog.copies
     }
 
-    /// The computed columns a map writes out of the register file, as
-    /// `(source register, output payload slot, is_str)`.
-    pub fn emit_targets(&self) -> impl Iterator<Item = (u16, u32, bool)> + '_ {
-        self.prog.emit_targets()
-    }
-
     /// The scalar-register emits: one bulk copy of the register image each.
     pub fn scalar_emits(&self) -> &[(u16, u32)] {
         self.prog.scalar_emits()

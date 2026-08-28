@@ -1,18 +1,14 @@
 //! Driving a resolved program through [`crate::Evaluator`]: the filter over a
-//! whole batch, the m=1 row read, and the 3VL / bit_only / AND-chain behaviour
-//! visible at that surface.
-//!
-//! `0 * MORSEL`, `1 * NULL_WORDS_PER_REG` etc. are deliberate layout-documenting
-//! expressions making the register/word index explicit at each access site;
-//! collapsing them obscures which register is in use.
-#![allow(clippy::erasing_op, clippy::identity_op)]
+//! whole batch, the m=1 row read, the 3VL / bit_only / AND-chain behaviour
+//! visible at that surface, and the map-side accessors an engine consumer reads
+//! a resolved program through.
 
 use gnitz_wire::type_code;
 
 use crate::batch::MORSEL;
 use crate::test_support::{
-    both_arms, filter_prog, is_not_null_op, is_null_op, make_int_row, make_int_view, make_n_col_view, map_prog,
-    passing_ranges, passing_rows, push_payload_cols, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk,
+    both_arms, filter_prog, is_not_null_op, is_null_op, make_int_view, make_n_col_view, map_prog, passing_ranges,
+    passing_rows, push_payload_cols, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk, FilterShape,
     TestSchema, TestView,
 };
 use crate::{CmpOp, Evaluator, LogicalInstr, StrOp};
@@ -20,6 +16,104 @@ use crate::{CmpOp, Evaluator, LogicalInstr, StrOp};
 /// True iff `ev`'s predicate passes for `row`.
 fn passes(ev: &Evaluator, mb: &TestView, row: usize) -> bool {
     ev.eval_row(mb, row).is_some_and(|val| val != 0)
+}
+
+/// The map-side surface an engine consumer reads a resolved program through:
+/// which columns are copied verbatim, which are written out of the register
+/// file, and which output slots admit NULL. Every one of these is read by
+/// `gnitz-engine`'s columnar map, so a wrong answer here is a wrong output
+/// column there — but none of them is visible through the three drive methods
+/// the rest of this file exercises.
+#[test]
+fn a_resolved_map_reports_its_copies_emits_and_nullable_slots() {
+    // in:  pk U64, 0: I64 nullable, 1: STRING nullable
+    // out: pk U64, 0: I64 (copied verbatim), 1: I64 (computed), 2: STRING (computed)
+    let in_schema = TestSchema::new(
+        &[
+            (type_code::U64, false),
+            (type_code::I64, true),
+            (type_code::STRING, true),
+        ],
+        &[0],
+    );
+    let out_schema = TestSchema::new(
+        &[
+            (type_code::U64, false),
+            (type_code::I64, true),
+            (type_code::I64, false),
+            (type_code::STRING, true),
+        ],
+        &[0],
+    );
+    let instrs = vec![
+        LogicalInstr::CopyCol { src_col: 1, out: 0 },
+        LogicalInstr::LoadConst { dst: 0, val: 7 },
+        LogicalInstr::Emit { src: 0, out: 1 },
+        LogicalInstr::LoadColStr { dst: 1, col: 2 },
+        LogicalInstr::Emit { src: 1, out: 2 },
+    ];
+    let ev = map_prog(&in_schema, &out_schema, instrs, 2, 0, vec![]);
+
+    assert!(ev.emits_anything(), "this map writes two slots out of the registers");
+    // The scalar and string emits are two halves of one list, split by class.
+    assert_eq!(ev.scalar_emits(), &[(0, 1)]);
+    assert_eq!(ev.str_emits(), &[(1, 2)]);
+    // One verbatim move: input column 1 into output slot 0, at the output width.
+    let copies: Vec<(u32, u8)> = ev.copies().iter().map(|&(_, out, w)| (out, w)).collect();
+    assert_eq!(copies, vec![(0, 8)]);
+    // Bit N set iff *input* payload slot N admits NULL — the schema the program
+    // reads through, not the one it writes. Both input payload columns are
+    // nullable; the output's non-nullable slot 1 does not appear here.
+    assert_eq!(ev.nullable_slots(), 0b11);
+    assert!(!ev.result_is_str(), "a map's result register is meaningless");
+
+    // A pure projection emits nothing, so driving its kernel cannot change the
+    // output — the property `emits_anything` exists to let a caller skip it.
+    let projection = map_prog(
+        &in_schema,
+        &TestSchema::new(&[(type_code::U64, false), (type_code::I64, true)], &[0]),
+        vec![LogicalInstr::CopyCol { src_col: 1, out: 0 }],
+        0,
+        0,
+        vec![],
+    );
+    assert!(!projection.emits_anything());
+    assert!(projection.scalar_emits().is_empty() && projection.str_emits().is_empty());
+}
+
+/// `filter_ranges` is what every range-driven consumer uses instead of
+/// `filter`'s callback, and `[(0, n)]` is the agreed spelling of "no predicate".
+/// It must also clear the caller's buffer, which is reused across chunks.
+#[test]
+fn filter_ranges_collects_into_a_reused_buffer() {
+    let schema = schema_pk_ints(1, true);
+    let mb = make_n_col_view(&schema, 8, |row, _| i64::from(row < 3 || row == 7), |_, _| false);
+    let ev = filter_prog(
+        &schema,
+        vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 },
+            LogicalInstr::LoadConst { dst: 1, val: 0 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+        ],
+        3,
+        2,
+        vec![],
+    );
+
+    let mut out = vec![(99, 99)];
+    ev.filter_ranges(&mb, &mut out);
+    assert_eq!(out, vec![(0, 3), (7, 8)], "the stale entry must be cleared");
+    assert_eq!(out, passing_ranges(&ev, &mb), "both readers report one run list");
+
+    // An all-pass predicate is the single range covering the batch.
+    let all = make_n_col_view(&schema, 8, |_, _| 1, |_, _| false);
+    ev.filter_ranges(&all, &mut out);
+    assert_eq!(out, vec![(0, 8)]);
 }
 
 /// The batch filter and the m=1 row read are two drives of one program and must
@@ -52,13 +146,12 @@ fn filter_agrees_with_eval_row() {
     assert_eq!(passing, vec![false, false, true, false]);
 }
 
-/// Regression: `analyze` formerly ignored STR_COL_*_CONST,
-/// so a `WHERE str_col = 'foo'` against a nullable string column would set
-/// `no_nulls=true` on the batch path and let null rows leak through as
-/// definite-true / definite-false results. Verify the batch path is
-/// row-for-row correct on mixed null/non-null inputs.
+/// A fused string compare against a nullable column keeps the program on the
+/// nullable arm, so a NULL row can never satisfy `=`. Driven over enough rows to
+/// cross a morsel and read back both ways: the batch filter and the `m = 1` row
+/// read must agree, and neither may pass a NULL row.
 #[test]
-fn test_str_col_eq_const_nullable_column_matches_per_row() {
+fn a_fused_string_compare_never_passes_a_null_row() {
     let schema = schema_pk_strings(1, true);
 
     // 20 rows: alternating null/non-null, with the non-null rows alternating
@@ -160,68 +253,6 @@ fn filter_range_case(schema: TestSchema) {
     // The same, two words on: the gap word is interior rather than trailing.
     let gap = make_n_col_view(&schema, n, |row, _| i64::from(!(64..192).contains(&row)), |_, _| false);
     assert_eq!(passing_ranges(&ev, &gap), vec![(0, 64), (192, n)]);
-}
-
-#[test]
-fn golden_load_payload_null_row() {
-    let schema = schema_pk_ints(1, true);
-    let mb = make_int_row(&schema, &[42], 1);
-
-    // Predicate: col1 > 0. With col1 null, result must be null → predicate fails.
-    let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: 0 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            dst: 2,
-            a: 0,
-            b: 1,
-        },
-    ];
-    let kind = filter_prog(&schema, instrs, 3, 2, vec![]);
-    assert!(!passes(&kind, &mb, 0));
-}
-
-#[test]
-fn golden_str_col_eq_const_null_row() {
-    let schema = schema_pk_strings(1, true);
-    let mut mb = TestView::new(1, schema.pk_stride());
-    push_payload_cols(&mut mb, &schema);
-    set_row_pk(&mut mb, &schema, 0, 1);
-    mb.set_null_word(0, 1); // payload 0 (the string col) is NULL
-    mb.set_string(0, 0, b"foo");
-
-    let instrs = vec![LogicalInstr::StrColConst {
-        op: StrOp::Eq,
-        dst: 0,
-        col: 1,
-        const_idx: 0,
-    }];
-    let kind = filter_prog(&schema, instrs, 1, 0, vec![b"foo".to_vec()]);
-    assert!(!passes(&kind, &mb, 0), "STR_COL_EQ_CONST on NULL row must not pass",);
-}
-
-#[test]
-fn golden_is_null_and_is_not_null_single_row() {
-    let schema = schema_pk_ints(1, true);
-
-    // Null row: IS NULL → true, IS NOT NULL → false.
-    let mb = make_int_row(&schema, &[0], 1);
-    let instrs_is_null = vec![is_null_op(0, 1)];
-    let kind = filter_prog(&schema, instrs_is_null, 1, 0, vec![]);
-    assert!(passes(&kind, &mb, 0));
-    let instrs_is_not_null = vec![is_not_null_op(0, 1)];
-    let kind = filter_prog(&schema, instrs_is_not_null, 1, 0, vec![]);
-    assert!(!passes(&kind, &mb, 0));
-
-    // Non-null row: opposite.
-    let mb = make_int_row(&schema, &[7], 0);
-    let instrs_is_null = vec![is_null_op(0, 1)];
-    let kind = filter_prog(&schema, instrs_is_null, 1, 0, vec![]);
-    assert!(!passes(&kind, &mb, 0));
-    let instrs_is_not_null = vec![is_not_null_op(0, 1)];
-    let kind = filter_prog(&schema, instrs_is_not_null, 1, 0, vec![]);
-    assert!(passes(&kind, &mb, 0));
 }
 
 /// Differential test: the left-deep chain `col0 > k AND col1 > 1 AND col2 > 1`
@@ -331,7 +362,7 @@ fn bit_only_not_3vl_truth_table() {
     let cases: &[(i64, bool, Option<bool>)] = &[(1, false, Some(true)), (0, false, Some(false)), (0, true, None)];
 
     for &(val, null, src_truthy) in cases {
-        let mb = make_int_row(&schema, &[val], u64::from(null));
+        let mb = make_int_view(&schema, &[(1, u64::from(null), &[val])]);
 
         // Filter: NOT(col1 != 0). result_reg = NOT result (bit_only eligible).
         let instrs = vec![
@@ -384,41 +415,6 @@ fn classifier_filter_result_reg_non_bool_falls_back() {
         vec![true, false, false, true],
         "non-bool result_reg: packed truthiness must match per-row semantics"
     );
-}
-
-/// All-null word: 64 consecutive null rows on each side of an AND. Both
-/// nullable arms (no `bit_only` and `bit_only`) must yield null in every
-/// row, matching the historical 3VL behavior.
-#[test]
-fn bit_only_all_null_word_and() {
-    let schema = schema_pk_ints(2, true);
-
-    let n = 64;
-    // both columns NULL in every row
-    let mb = make_n_col_view(&schema, n, |_, _| 0, |_, _| true);
-
-    let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: 0 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Ne,
-            dst: 2,
-            a: 0,
-            b: 1,
-        }, // r2 = bool(col1)
-        LogicalInstr::LoadColInt { dst: 3, col: 2 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Ne,
-            dst: 4,
-            a: 3,
-            b: 1,
-        }, // r4 = bool(col2)
-        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
-    ];
-    let kind = filter_prog(&schema, instrs, 6, 5, vec![]);
-
-    let passed = passing_rows(&kind, &mb);
-    assert!(passed.iter().all(|&p| !p), "all-null AND must reject every row");
 }
 
 /// An absolute verdict for the AND of two null tests, over 65 rows so the last
@@ -509,10 +505,8 @@ fn bool_not_tail_mask() {
 /// arms-agree sweep below.
 const ARM_SWEEP_ROWS: [usize; 7] = [63, 64, 65, 255, 256, 257, 300];
 
-/// A predicate as `filter_prog` takes it: `(instrs, num_regs, result_reg)`.
-type FilterShape = (Vec<LogicalInstr>, u32, u32);
-
 /// A named null arrangement: the `null_pred` a sweep hands `make_n_col_view`.
+/// Spelled as an alias because the inline tuple trips `clippy::type_complexity`.
 type NullArrangement = (&'static str, fn(usize, usize) -> bool);
 
 /// The null arrangements the sweeps run every shape over: the two extremes plus
@@ -979,10 +973,9 @@ fn nullable_and_not_null_columns_side_by_side() {
 /// above — both arms run that one kernel. Pin the polarity absolutely: `IS NULL`
 /// selects exactly the NULL rows, and `IS NOT NULL` selects exactly the rest.
 ///
-/// The batch-drive counterpart to `golden_is_null_and_is_not_null_single_row`,
-/// which pins the same polarity through the `m = 1` `eval_row` drive. Polarity is
-/// row-local, so one multi-morsel `n` says everything a sweep would; the boundary
-/// counts belong to the packing routes, which `is_null_arms_agree` sweeps.
+/// Polarity is row-local, so one multi-morsel `n` says everything a sweep would;
+/// the boundary counts belong to the packing routes, which `is_null_arms_agree`
+/// sweeps.
 #[test]
 fn is_null_and_is_not_null_are_complementary() {
     let schema = schema_pk_ints(1, true);
@@ -1165,9 +1158,25 @@ fn and_chain_survivors_agree_across_arms() {
             );
         }
     }
+
+    // Neither arrangement above ever fills a whole 64-bit null word: `null_flood`
+    // nulls only col0. Every column NULL on every row is the input a
+    // word-at-a-time 3VL loop can treat differently from a mixed one, and it must
+    // still reject every row.
+    let schema = schema_pk_ints(3, true);
+    let ev = filter_prog(&schema, instrs, 10, 9, vec![]);
+    for &n in &[64, 128, 257] {
+        let mb = make_n_col_view(&schema, n, |_, _| 0, |_, _| true);
+        assert!(
+            passing_rows(&ev, &mb).iter().all(|&p| !p),
+            "an all-NULL batch has no survivors at n={n}"
+        );
+    }
 }
 
-/// Reference 3VL: returns (truthy, is_null) for `a AND b`.
+/// Reference 3VL: `(truthy, is_null)` for `a AND b`. A definite FALSE on either
+/// side forces FALSE even when the other is NULL, which is the rule a two-valued
+/// implementation gets wrong.
 fn ref_and(a: Option<bool>, b: Option<bool>) -> (bool, bool) {
     match (a, b) {
         (Some(false), _) | (_, Some(false)) => (false, false),
@@ -1176,720 +1185,58 @@ fn ref_and(a: Option<bool>, b: Option<bool>) -> (bool, bool) {
     }
 }
 
-/// The evidence for keeping the fused `STR_COL_EQ_CONST` opcode over the
-/// register channel on the `col <op> 'const'` filter loop — ~1M rows,
-/// non-nullable STRING. Both channels are built for every domain and their hit
-/// counts asserted equal, which is the only differential correctness check
-/// between them; `GNITZ_BENCH_CHANNEL` and `GNITZ_BENCH_DOMAIN` then cut the
-/// *driven* region down to one, so a `perf stat` over two pass counts
-/// differences to one channel's retired instructions on one domain.
-///
-/// The controlled pair is `digits-first` against `abcd-shared-prefix`: same
-/// lengths, same content bytes, differing only in whether the 4-byte prefix
-/// collides. Only the cell form can short-circuit on that prefix — a `StrView`
-/// carries none — so the fused cost moves between the two and the register cost
-/// does not, and the gap remaining at `abcd*` is the register lane's own cost of
-/// materialising each row into a `MORSEL`-wide lane. Matching the lengths is
-/// what makes that attributable.
-///
-///   for d in mixed long digits-first abcd-shared-prefix; do
-///     for c in fused registers; do for p in 1 201; do \
-///       GNITZ_BENCH_DOMAIN=$d GNITZ_BENCH_CHANNEL=$c GNITZ_BENCH_PASSES=$p \
-///       perf stat -e instructions:u cargo test -p gnitz-expr --release \
-///         str_const_filter_bench -- --ignored --nocapture --test-threads=1
-///   done; done; done
-#[test]
-#[ignore]
-fn str_const_filter_bench() {
-    let passes = bench_passes();
-    let channel = std::env::var("GNITZ_BENCH_CHANNEL").unwrap_or_else(|_| "both".to_string());
-    assert!(
-        matches!(channel.as_str(), "both" | "fused" | "registers"),
-        "GNITZ_BENCH_CHANNEL must be both/fused/registers, got {channel:?}"
-    );
-    let only = std::env::var("GNITZ_BENCH_DOMAIN").unwrap_or_else(|_| "all".to_string());
-    let (run_fused, run_regs) = (channel != "registers", channel != "fused");
-
-    let schema = schema_pk_strings(1, false);
-    let n = 1_000_000usize;
-    // (domain, constant, value per row). `mixed` is the original fixture:
-    // ~1/16 rows match and every 7th row is a long (heap-backed) string.
-    type Domain = (&'static str, &'static str, fn(usize) -> String);
-    let domains: [Domain; 4] = [
-        ("mixed", "match_target", |row| {
-            if row % 16 == 0 {
-                "match_target".to_string()
-            } else if row % 7 == 0 {
-                format!("long_string_variant_number_{row}")
-            } else {
-                format!("k{}", row % 97)
-            }
-        }),
-        ("long", "long_string_variant_number_42", |row| {
-            format!("long_string_variant_number_{}", row % 97)
-        }),
-        // The controlled pair: `{i}abcd` and `abcd{i}` hold the same bytes at the
-        // same lengths, so the prefix is the only thing that differs.
-        ("digits-first", "42abcd", |row| format!("{}abcd", row % 97)),
-        ("abcd-shared-prefix", "abcd42", |row| format!("abcd{}", row % 97)),
-    ];
-
-    let mut selected = 0usize;
-    for (domain, constant, value) in domains {
-        let mut mb = TestView::new(n, schema.pk_stride());
-        push_payload_cols(&mut mb, &schema);
-        for row in 0..n {
-            set_row_pk(&mut mb, &schema, row, row as u64 + 1);
-            mb.set_string(row, 0, value(row).as_bytes());
-        }
-
-        for (name, op) in [("eq", StrOp::Eq), ("lt", StrOp::Lt)] {
-            let consts = vec![constant.as_bytes().to_vec()];
-            let fused = filter_prog(
-                &schema,
-                vec![LogicalInstr::StrColConst {
-                    op,
-                    dst: 0,
-                    col: 1,
-                    const_idx: 0,
-                }],
-                1,
-                0,
-                consts.clone(),
-            );
-            let regs = filter_prog(
-                &schema,
-                vec![
-                    LogicalInstr::LoadColStr { dst: 0, col: 1 },
-                    LogicalInstr::LoadConstStr { dst: 1, const_idx: 0 },
-                    LogicalInstr::StrCmp { op, dst: 2, a: 0, b: 1 },
-                ],
-                3,
-                2,
-                consts,
-            );
-
-            // Also the warm-up, and outside the driven region — so both channels
-            // are still built and compared even when only one is driven.
-            let count = |f: &Evaluator| {
-                let mut hits = 0usize;
-                f.filter(&mb, |s, e| hits += e - s);
-                hits
-            };
-            let hits = count(&fused);
-            assert_eq!(hits, count(&regs), "{domain}/{name}: the channels disagree");
-
-            let run = |f: &Evaluator| {
-                let mut h = 0usize;
-                for _ in 0..passes {
-                    f.filter(&mb, |s, e| h += e - s);
-                }
-                std::hint::black_box(h);
-            };
-            for (want, ev) in [(run_fused, &fused), (run_regs, &regs)] {
-                if want && (only == "all" || only == domain) {
-                    selected += 1;
-                    run(ev);
-                }
-            }
-            println!("str_const_filter_bench {domain}/{name}: passes={passes} n={n} hits={hits}");
-        }
+/// The dual: a definite TRUE on either side forces TRUE.
+fn ref_or(a: Option<bool>, b: Option<bool>) -> (bool, bool) {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => (true, false),
+        (Some(false), Some(false)) => (false, false),
+        _ => (false, true), // NULL
     }
-    // A misspelled domain would otherwise drive nothing and difference to a 0 %
-    // effect instead of failing.
-    assert!(selected > 0, "GNITZ_BENCH_DOMAIN matched no domain: {only:?}");
 }
 
-/// Retired-instruction harness for the filter kernels. Prints nothing useful on
-/// its own: run it at two pass counts and difference them, so batch setup and
-/// process start cancel out. Wall-clock on these machines is far noisier than
-/// the effects being measured, so it is never reported.
-///
-///   for s in pk nullable; do for p in 1 501; do \
-///     GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
-///     cargo test -p gnitz-expr --release filter_kernel_bench -- --ignored --nocapture
-///   done; done
-/// The pass count the `#[ignore]`d benches loop over, from `GNITZ_BENCH_PASSES`.
-/// Two runs at different counts, differenced, cancel everything that happens
-/// once per process.
-fn bench_passes() -> usize {
-    std::env::var("GNITZ_BENCH_PASSES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
-}
-
+/// The complete `{TRUE, FALSE, NULL}²` table for both combinators, against the
+/// references above. Swept rather than hand-listed: the asymmetric cells are the
+/// whole content of 3VL, and a hand-written list of them silently omitted
+/// `T AND T` and `F OR F`.
 #[test]
-#[ignore]
-fn filter_kernel_bench() {
-    let passes = bench_passes();
-    // Every shape is still built and checked; only the driven loop is skipped,
-    // so a `perf stat` over the process attributes its pass-count difference to
-    // the one named here rather than to their sum.
-    let only = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "all".to_string());
-    let driven = |name: &str| only == "all" || only == name;
-    let n = 200_000usize;
+fn bool_and_or_cover_the_whole_three_valued_table() {
+    let schema = schema_pk_ints(2, true);
+    const STATES: [Option<bool>; 3] = [Some(true), Some(false), None];
+    let cells: Vec<(Option<bool>, Option<bool>)> = STATES.iter().flat_map(|&a| STATES.map(|b| (a, b))).collect();
 
-    // `pk > n/2` — the PK-region load.
-    let pk_schema = schema_pk_ints(1, false);
-    let pk_view = make_n_col_view(&pk_schema, n, |_, _| 1, |_, _| false);
-    let pk_filter = filter_prog(
-        &pk_schema,
-        vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 0 },
-            LogicalInstr::LoadConst {
-                dst: 1,
-                val: (n / 2) as i64,
-            },
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
-            },
-        ],
-        3,
-        2,
-        vec![],
-    );
+    // A NULL row still carries bytes, so the NULL cells store a *truthy* value:
+    // only the null bit may keep them out of the definite-true term.
+    let bit = |v: Option<bool>| i64::from(v.unwrap_or(true));
+    let vals: Vec<[i64; 2]> = cells.iter().map(|&(a, b)| [bit(a), bit(b)]).collect();
+    let rows: Vec<(u64, u64, &[i64])> = cells
+        .iter()
+        .zip(&vals)
+        .enumerate()
+        .map(|(i, (&(a, b), v))| {
+            let null_word = u64::from(a.is_none()) | (u64::from(b.is_none()) << 1);
+            (i as u64 + 1, null_word, &v[..])
+        })
+        .collect();
+    let mb = make_int_view(&schema, &rows);
 
-    // `-a > 0 AND b < 80` over nullable columns — unary, the 3VL AND, and the
-    // per-column null-bit gather.
-    let nn_schema = schema_pk_ints(2, true);
-    let nn_view = make_n_col_view(
-        &nn_schema,
-        n,
-        |row, col| ((row * 7 + col) % 100) as i64,
-        |row, _| row % 32 == 0,
-    );
-    let nn_filter = filter_prog(
-        &nn_schema,
-        vec![
+    for (name, mk, reference) in [
+        (
+            "AND",
+            (|dst, a, b| LogicalInstr::BoolAnd { dst, a, b }) as fn(u16, u16, u16) -> LogicalInstr,
+            ref_and as fn(Option<bool>, Option<bool>) -> (bool, bool),
+        ),
+        ("OR", |dst, a, b| LogicalInstr::BoolOr { dst, a, b }, ref_or),
+    ] {
+        let instrs = vec![
             LogicalInstr::LoadColInt { dst: 0, col: 1 },
-            LogicalInstr::IntUnary {
-                op: crate::program::IntUnaryOp::Neg,
-                dst: 1,
-                a: 0,
-            },
-            LogicalInstr::LoadConst { dst: 2, val: 0 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                dst: 3,
-                a: 1,
-                b: 2,
-            },
-            LogicalInstr::LoadColInt { dst: 4, col: 2 },
-            LogicalInstr::LoadConst { dst: 5, val: 80 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Lt,
-                dst: 6,
-                a: 4,
-                b: 5,
-            },
-            LogicalInstr::BoolAnd { dst: 7, a: 3, b: 6 },
-        ],
-        8,
-        7,
-        vec![],
-    );
-
-    // Five literal comparisons over one NOT NULL column: the `no_nulls` arm's
-    // cheapest per-row work carrying the most constant registers, which is where
-    // a per-morsel constant refill would show.
-    let lit_schema = schema_pk_ints(1, false);
-    let lit_view = make_n_col_view(&lit_schema, n, |row, _| (row % 1000) as i64, |_, _| false);
-    let mut lit_instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
-    let mut acc_reg = None;
-    for (i, (op, val)) in [
-        (CmpOp::Gt, 1i64),
-        (CmpOp::Lt, 999),
-        (CmpOp::Ne, 5),
-        (CmpOp::Ne, 7),
-        (CmpOp::Ne, 9),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (k, c) = (1 + 2 * i as u16, 2 + 2 * i as u16);
-        lit_instrs.push(LogicalInstr::LoadConst { dst: k, val });
-        lit_instrs.push(LogicalInstr::Cmp { op, dst: c, a: 0, b: k });
-        acc_reg = Some(match acc_reg {
-            None => c,
-            Some(prev) => {
-                let d = 11 + i as u16;
-                lit_instrs.push(LogicalInstr::BoolAnd { dst: d, a: prev, b: c });
-                d
-            }
-        });
-    }
-    let lit_result = acc_reg.expect("the literal chain has at least one compare");
-    let lit_filter = filter_prog(&lit_schema, lit_instrs, 16, lit_result as u32, vec![]);
-
-    let mut hits = 0usize;
-    let mut selected = 0usize;
-    for (name, ev, view) in [
-        ("pk", &pk_filter, &pk_view),
-        ("nullable", &nn_filter, &nn_view),
-        ("literals", &lit_filter, &lit_view),
-    ] {
-        if !driven(name) {
-            continue;
-        }
-        selected += 1;
-        for _ in 0..passes {
-            ev.filter(view, |s, e| hits += e - s);
+            LogicalInstr::LoadColInt { dst: 1, col: 2 },
+            mk(2, 0, 1),
+        ];
+        let ev = scalar_prog(&schema, instrs, 3, 2, vec![]);
+        for (row, &(a, b)) in cells.iter().enumerate() {
+            let (want_val, want_null) = reference(a, b);
+            let want = (!want_null).then_some(i64::from(want_val));
+            assert_eq!(ev.eval_row(&mb, row), want, "{name}: {a:?}, {b:?}");
         }
     }
-    println!(
-        "filter_kernel_bench passes={passes} n={n} hits={}",
-        std::hint::black_box(hits)
-    );
-    // A misspelled shape would otherwise drive nothing and difference to a 0 %
-    // effect instead of failing.
-    assert!(selected > 0, "GNITZ_BENCH_SHAPE matched no shape: {only:?}");
-}
-
-/// `col1 IS NULL AND col2 > k AND ... ` over `is_null_bench_schema`: `n_cmp`
-/// compares of NOT NULL columns hung off one null test, so the whole predicate
-/// still resolves `no_nulls`. `n_cmp` sets the chain depth, which is what scales
-/// the per-conjunct cost the arms are being compared on.
-fn is_null_chain(k: i64, n_cmp: u16) -> FilterShape {
-    let mut instrs = vec![is_null_op(0, 1)];
-    if n_cmp == 0 {
-        // No compare, so no constant to load — an unread `LoadConst` would still
-        // cost a register write per morsel and blunt the bare shape's figure.
-        return (instrs, 1, 0);
-    }
-    instrs.push(LogicalInstr::LoadConst { dst: 1, val: k });
-    let mut acc = 0u16;
-    for i in 0..n_cmp {
-        let base = 2 + i * 3;
-        instrs.push(LogicalInstr::LoadColInt {
-            dst: base,
-            col: u32::from(i) + 2,
-        });
-        instrs.push(LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            dst: base + 1,
-            a: base,
-            b: 1,
-        });
-        instrs.push(LogicalInstr::BoolAnd {
-            dst: base + 2,
-            a: acc,
-            b: base + 1,
-        });
-        acc = base + 2;
-    }
-    let num_regs = u32::from(2 + n_cmp * 3);
-    (instrs, num_regs, u32::from(acc))
-}
-
-/// One nullable column (the null test's) plus four NOT NULL ones (the
-/// compares'). Mixing the two is what the bench is about: a compare over a
-/// nullable column would hold the program on the nullable arm through its own
-/// load, whatever the null test is classified as.
-fn is_null_bench_schema() -> TestSchema {
-    let mut cols = vec![(type_code::U64, false), (type_code::I64, true)];
-    cols.extend(std::iter::repeat_n((type_code::I64, false), 4));
-    TestSchema::new(&cols, &[0])
-}
-
-/// A/B for the arm an `IS [NOT] NULL` predicate lands on. Each shape is built
-/// twice from one instruction stream — once as resolution classifies it
-/// (`no_nulls`), once forced onto the nullable arm — and the two are asserted to
-/// select the same rows before either is driven. Prints no measurement itself,
-/// like [`filter_kernel_bench`]: `GNITZ_BENCH_SHAPE` and `GNITZ_BENCH_ARM` cut
-/// the run down to one driven loop, and differencing two pass counts under
-/// `perf` cancels fixture construction, the warm-up and process start.
-///
-///   for s in bare one_and chain_spread chain_clustered \
-///            chain_nonselective chain_rare map; do
-///     for arm in fast nullable; do for p in 1 201; do \
-///       GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_ARM=$arm GNITZ_BENCH_PASSES=$p \
-///       perf stat -e instructions:u,cycles:u cargo test -p gnitz-expr --release \
-///         is_null_arm_bench -- --ignored --nocapture --test-threads=1
-///   done; done; done
-///
-/// Moving to the fast arm is cheaper on every shape here, at
-/// `-C target-cpu=x86-64-v3` (what `crates/.cargo/config.toml` ships): −3.0 %
-/// retired instructions on `map`, −5.9 % on `bare`, −11.1 % on `one_and`, and
-/// −13.8 % to −14.5 % across the four 4-conjunct chains. What separates the
-/// chain shapes from each other is only their NULL arrangement, and it barely
-/// separates them at all — the arms run the same kernels over the same word
-/// count. The compares read NOT NULL columns, which are outside
-/// `nullable_slots`, so the nullable arm clears their null words rather than
-/// gathering per row; what is left is the null bookkeeping the fast arm has
-/// none of.
-///
-/// Take both events. `instructions:u` repeats here to under 0.001 %, `cycles:u`
-/// to a few percent; the first is the reproducible one, the second is the one
-/// that sees a stall. Neither is a constant — batch size, NULL rate and
-/// clustering all move them.
-#[test]
-#[ignore]
-fn is_null_arm_bench() {
-    let passes = bench_passes();
-    let arm = std::env::var("GNITZ_BENCH_ARM").unwrap_or_else(|_| "both".to_string());
-    let (run_fast, run_nullable) = (arm != "nullable", arm != "fast");
-    // Which shape to drive. Every shape is still built and checked; only the
-    // driven loop is skipped, so a `perf stat` over the process attributes its
-    // pass-count difference to the one named here.
-    let only = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "all".to_string());
-    // Both selectors are decoded by inequality, so a typo would silently drive
-    // nothing (or both arms) and read out as a 0 % effect rather than an error.
-    assert!(
-        matches!(arm.as_str(), "both" | "fast" | "nullable"),
-        "GNITZ_BENCH_ARM must be both/fast/nullable, got {arm:?}"
-    );
-    let driven = |name: &str, want: bool| want && (only == "all" || only == name);
-    let n = 200_000usize;
-    let schema = is_null_bench_schema();
-
-    // Three views, shared by the shapes that want the same NULL arrangement.
-    // They span how the NULLs are distributed rather than just how many there
-    // are: `spread` puts 16 per morsel, `rare` 4, and `clustered` gives 7 of
-    // every 8 morsels no NULL at all — the arrangement a morsel-granular
-    // optimization would be most sensitive to.
-    let value = |row: usize, col: usize| ((row * 7 + col * 13) % 100) as i64;
-    let spread = make_n_col_view(&schema, n, value, |row, col| col == 0 && row.is_multiple_of(16));
-    let clustered = make_n_col_view(&schema, n, value, |row, col| {
-        col == 0 && (row / MORSEL).is_multiple_of(8)
-    });
-    let rare = make_n_col_view(&schema, n, value, |row, col| col == 0 && row.is_multiple_of(64));
-
-    // `k = 50` passes about half the rows; `k = -1` passes every row, which is
-    // the non-selective variant.
-    let shapes: [(&str, &TestView, FilterShape); 6] = [
-        ("bare", &spread, is_null_chain(50, 0)),
-        ("one_and", &spread, is_null_chain(50, 1)),
-        ("chain_spread", &spread, is_null_chain(50, 4)),
-        ("chain_clustered", &clustered, is_null_chain(50, 4)),
-        ("chain_nonselective", &spread, is_null_chain(-1, 4)),
-        ("chain_rare", &rare, is_null_chain(50, 4)),
-    ];
-
-    let mut selected = 0usize;
-    for (name, view, (instrs, num_regs, result_reg)) in &shapes {
-        let (fast, nullable) = both_arms(name, || {
-            filter_prog(&schema, instrs.clone(), *num_regs, *result_reg, vec![])
-        });
-        // Also the warm-up, and outside the driven region.
-        let passed = passing_rows(&fast, view);
-        assert_eq!(passed, passing_rows(&nullable, view), "{name}: the arms disagree");
-        let hits = passed.iter().filter(|&&p| p).count();
-
-        let run = |ev: &Evaluator| {
-            let mut h = 0usize;
-            for _ in 0..passes {
-                ev.filter(*view, |s, e| h += e - s);
-            }
-            std::hint::black_box(h);
-        };
-        for (want, ev) in [(run_fast, &fast), (run_nullable, &nullable)] {
-            if driven(name, want) {
-                selected += 1;
-                run(ev);
-            }
-        }
-        println!("is_null_arm_bench {name}: passes={passes} n={n} hits={hits}");
-    }
-
-    // The map drive, which leaves through EMIT's register rather than a bitmap.
-    let out_schema = schema_pk_ints(1, false);
-    let map_instrs = vec![is_null_op(0, 1), LogicalInstr::Emit { src: 0, out: 0 }];
-    let (fast, nullable) = both_arms("map", || {
-        map_prog(&schema, &out_schema, map_instrs.clone(), 1, 0, vec![])
-    });
-    // The warm-up doubles as the agreement check, as it does per filter shape.
-    let emitted = |ev: &Evaluator| {
-        let mut vals = Vec::with_capacity(n);
-        ev.eval_morsels(&spread, 0, n, |_, out| vals.extend_from_slice(out.reg_values(0)));
-        vals
-    };
-    assert_eq!(emitted(&fast), emitted(&nullable), "map: the arms disagree");
-    let run = |ev: &Evaluator| {
-        let mut acc = 0i64;
-        for _ in 0..passes {
-            ev.eval_morsels(&spread, 0, n, |_, out| acc += out.reg_values(0).iter().sum::<i64>());
-        }
-        std::hint::black_box(acc);
-    };
-    for (want, ev) in [(run_fast, &fast), (run_nullable, &nullable)] {
-        if driven("map", want) {
-            selected += 1;
-            run(ev);
-        }
-    }
-    println!("is_null_arm_bench map: passes={passes} n={n}");
-    // A misspelled shape name would otherwise drive nothing at all, and the two
-    // pass counts would difference to a 0 % effect instead of failing.
-    assert!(selected > 0, "GNITZ_BENCH_SHAPE matched no shape: {only:?}");
-}
-
-/// One row of `cols` German strings per payload slot, alternating either side of
-/// the 12-byte inline boundary so a string bench drives both the in-place inline
-/// view and the blob view.
-fn str_bench_view(schema: &TestSchema, n: usize, cols: usize) -> TestView {
-    let mut v = TestView::new(n, schema.pk_stride());
-    push_payload_cols(&mut v, schema);
-    for row in 0..n {
-        set_row_pk(&mut v, schema, row, row as u64 + 1);
-        for pi in 0..cols {
-            let s = if row % 3 == 0 {
-                format!("row-{row}-col-{pi}-past-the-inline-boundary")
-            } else {
-                format!("r{}{pi}", row % 100)
-            };
-            v.set_string(row, pi, s.as_bytes());
-        }
-    }
-    v
-}
-
-/// Retired-instruction harness for the kernels [`filter_kernel_bench`] cannot
-/// reach: the ones whose result is not a predicate. Same protocol — run at two
-/// pass counts and difference, never report wall-clock.
-///
-///   for s in int_cast int_div select str_len str_upper str_like str_substr \
-///            str_concat int_to_str map; do
-///     for p in 1 501; do \
-///       GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
-///       cargo test -p gnitz-expr --release expr_kernel_bench -- --ignored --nocapture
-///   done; done
-///
-/// One shape per opcode family, never combined: a scalar `idiv` swamps a cast by
-/// an order of magnitude, so a shared shape would difference to that one arm.
-#[test]
-#[ignore]
-fn expr_kernel_bench() {
-    let passes = bench_passes();
-    let only = std::env::var("GNITZ_BENCH_SHAPE").unwrap_or_else(|_| "all".to_string());
-    let driven = |name: &str| only == "all" || only == name;
-    let mut selected = 0usize;
-    let n = 200_000usize;
-
-    // --- scalar shapes over two nullable I64 columns ---
-    let ints = schema_pk_ints(2, true);
-    let int_view = make_n_col_view(
-        &ints,
-        n,
-        |row, col| ((row * 7 + col) % 1000 + 1) as i64,
-        |row, _| row % 32 == 0,
-    );
-    let load2 = |c: u32, d: u16| LogicalInstr::LoadColInt { dst: d, col: c };
-
-    let int_cast = scalar_prog(
-        &ints,
-        vec![
-            load2(1, 0),
-            LogicalInstr::IntCast {
-                dst: 1,
-                a: 0,
-                tc: type_code::I32 as u32,
-            },
-        ],
-        2,
-        1,
-        vec![],
-    );
-    let int_div = scalar_prog(
-        &ints,
-        vec![
-            load2(1, 0),
-            LogicalInstr::LoadConst { dst: 1, val: 7 },
-            LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
-        ],
-        3,
-        2,
-        vec![],
-    );
-    // `CASE WHEN a > b THEN a ELSE b END` over nullable columns — the blend's
-    // nullable arm, which nothing else in the tree drives.
-    let select = scalar_prog(
-        &ints,
-        vec![
-            load2(1, 0),
-            load2(2, 1),
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
-            },
-            LogicalInstr::Select {
-                dst: 3,
-                cond: 2,
-                a: 0,
-                b: 1,
-            },
-        ],
-        4,
-        3,
-        vec![],
-    );
-    let int_to_str = scalar_prog(
-        &ints,
-        vec![load2(1, 0), LogicalInstr::IntToStr { dst: 1, a: 0 }],
-        2,
-        1,
-        vec![],
-    );
-
-    // --- string shapes over two NOT NULL STRING columns ---
-    let strs = schema_pk_strings(2, false);
-    let str_view = str_bench_view(&strs, n, 2);
-    let load_str = |c: u32, d: u16| LogicalInstr::LoadColStr { dst: d, col: c };
-
-    let str_len = scalar_prog(
-        &strs,
-        vec![
-            load_str(1, 0),
-            LogicalInstr::StrLen {
-                dst: 1,
-                a: 0,
-                chars: false,
-            },
-        ],
-        2,
-        1,
-        vec![],
-    );
-    let str_upper = scalar_prog(
-        &strs,
-        vec![
-            load_str(1, 0),
-            LogicalInstr::StrCase {
-                dst: 1,
-                a: 0,
-                upper: true,
-            },
-        ],
-        2,
-        1,
-        vec![],
-    );
-    let str_like = scalar_prog(
-        &strs,
-        vec![
-            load_str(1, 0),
-            LogicalInstr::StrLike {
-                dst: 1,
-                src: 0,
-                escape: 0,
-                pat_idx: 0,
-                ci: false,
-            },
-        ],
-        2,
-        1,
-        vec![b"%boundary".to_vec()],
-    );
-    let str_substr = scalar_prog(
-        &strs,
-        vec![
-            load_str(1, 0),
-            LogicalInstr::LoadConst { dst: 1, val: 2 },
-            LogicalInstr::LoadConst { dst: 2, val: 6 },
-            LogicalInstr::StrSubstr {
-                dst: 3,
-                src: 0,
-                start_reg: 1,
-                len_reg: Some(2),
-            },
-        ],
-        4,
-        3,
-        vec![],
-    );
-    let str_concat = scalar_prog(
-        &strs,
-        vec![
-            load_str(1, 0),
-            load_str(2, 1),
-            LogicalInstr::StrConcat {
-                dst: 2,
-                a: 0,
-                b: 1,
-                skip_null: false,
-            },
-        ],
-        3,
-        2,
-        vec![],
-    );
-
-    // --- a real map: six compute opcodes plus two EMITs, driven through
-    //     `eval_morsels` the way a maintained view's projection is ---
-    let map_in = schema_pk_ints(3, false);
-    let map_out = TestSchema::new(
-        &[
-            (type_code::U64, false),
-            (type_code::I64, false),
-            (type_code::I64, false),
-        ],
-        &[0],
-    );
-    let map_view = make_n_col_view(&map_in, n, |row, col| ((row * 7 + col) % 1000) as i64, |_, _| false);
-    let map = map_prog(
-        &map_in,
-        &map_out,
-        vec![
-            load2(1, 0),
-            load2(2, 1),
-            LogicalInstr::LoadColInt { dst: 2, col: 3 },
-            LogicalInstr::IntAdd { dst: 3, a: 0, b: 1 },
-            LogicalInstr::IntMul { dst: 4, a: 3, b: 2 },
-            LogicalInstr::IntSub { dst: 5, a: 4, b: 0 },
-            LogicalInstr::Emit { src: 5, out: 0 },
-            LogicalInstr::Emit { src: 3, out: 1 },
-        ],
-        6,
-        0,
-        vec![],
-    );
-
-    let mut acc = 0i64;
-    // Scalar-result shapes: sum the result register, as an EMIT of an 8-byte
-    // slot would read it.
-    for (name, ev, view, reg) in [
-        ("int_cast", &int_cast, &int_view, 1usize),
-        ("int_div", &int_div, &int_view, 2),
-        ("select", &select, &int_view, 3),
-        ("str_len", &str_len, &str_view, 1),
-        ("str_like", &str_like, &str_view, 1),
-        ("map", &map, &map_view, 5),
-    ] {
-        if !driven(name) {
-            continue;
-        }
-        selected += 1;
-        for _ in 0..passes {
-            ev.eval_morsels(view, 0, n, |_, out| acc += out.reg_values(reg).iter().sum::<i64>());
-        }
-    }
-    // String-result shapes: resolve every view, as an EMIT of a string slot does.
-    for (name, ev, view, reg) in [
-        ("int_to_str", &int_to_str, &int_view, 1usize),
-        ("str_upper", &str_upper, &str_view, 1),
-        ("str_substr", &str_substr, &str_view, 3),
-        ("str_concat", &str_concat, &str_view, 2),
-    ] {
-        if !driven(name) {
-            continue;
-        }
-        selected += 1;
-        for _ in 0..passes {
-            ev.eval_morsels(view, 0, n, |_, out| {
-                for i in 0..out.rows() {
-                    acc += out.str_bytes(reg, i).len() as i64;
-                }
-            });
-        }
-    }
-    println!(
-        "expr_kernel_bench passes={passes} n={n} acc={}",
-        std::hint::black_box(acc)
-    );
-    assert!(selected > 0, "GNITZ_BENCH_SHAPE matched no shape: {only:?}");
 }
