@@ -20,9 +20,9 @@
 //! host meets it. What lives here is the store: the local catalog, the copies,
 //! their feed positions, and the durability around them.
 //!
-//! The store is `Send` and `!Sync`, which is what lets it live inside a
-//! `Send + Sync` [`gnitz_core::GnitzClient`]; the argument is beside the
-//! `unsafe impl` in `handle.rs`.
+//! The store is `Send` and `!Sync`, so a [`gnitz_core::GnitzClient`] holding one
+//! is `Send` and is not `Sync`; the argument is beside the `unsafe impl` in
+//! `handle.rs`.
 //!
 //! There is **one store per data directory**. The engine's own `flock` refuses a
 //! second one, in this process or any other: a second [`Mirror::open`] takes a

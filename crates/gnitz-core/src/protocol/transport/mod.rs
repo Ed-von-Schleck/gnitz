@@ -217,8 +217,9 @@ pub(crate) fn poll_fd(
 
 // Every async driver needs the transport to be Send: the asyncio executor steps
 // its `Session` inside `Python::detach`, whose `Ungil` bound is `Send`, and the
-// tokio `Connection` future is spawned onto a multi-thread runtime. Sync is what
-// the public client types inherit from it.
+// tokio `Connection` future is spawned onto a multi-thread runtime. `Sync`
+// because a `Session` holds one and must stay `Sync` itself — `gnitz-py`
+// exposes a bare `Session` as a `#[pyclass]`.
 const fn assert_send_sync<T: Send + Sync>() {}
 const _: () = assert_send_sync::<ClientTransport>();
 

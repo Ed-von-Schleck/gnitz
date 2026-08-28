@@ -403,8 +403,8 @@ pub struct Session {
     accum: Accumulator,
     closed: bool,
     /// Run before every park of the blocking client; its `Err` aborts the
-    /// operation. `Send + Sync` so the field cannot silently narrow the
-    /// auto-traits of the public types that hold a session.
+    /// operation. `Send + Sync` so the field cannot silently narrow `Session`'s
+    /// own auto-traits.
     park_hook: Option<ParkHook>,
 }
 

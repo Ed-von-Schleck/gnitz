@@ -295,7 +295,7 @@ impl AsyncClient {
 
     /// The message that poisoned the copy, if any.
     pub async fn mirror_poisoned(&self) -> Result<Option<String>, ClientError> {
-        self.on_mirror(|c| Ok(c.mirror_poisoned())).await
+        self.on_mirror(|c| Ok(c.mirror_poisoned().map(str::to_string))).await
     }
 
     /// Run `f` on the installed client, under the lock, on a blocking thread.

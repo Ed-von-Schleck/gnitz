@@ -1,5 +1,5 @@
 use std::ffi::CStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pyo3::ffi;
 use pyo3::impl_::extract_argument::argument_extraction_error;
@@ -1747,13 +1747,21 @@ pub(crate) fn connect_client(py: Python<'_>, target: &str) -> PyResult<GnitzClie
 
 #[pyclass(name = "GnitzClient")]
 pub struct PyGnitzClient {
-    inner: Option<GnitzClient>,
+    /// `#[pyclass]` demands `Sync`; a client that mirrors holds a live engine and
+    /// is `Send` only, and `Mutex<T>: Sync` needs just `T: Send`. The lock is what
+    /// makes that sound — it is the only way to reach the client from a `&self`.
+    /// Nothing takes it: every user here holds `&mut self` and goes through
+    /// `get_mut`, and what refuses a second caller is pyo3's borrow flag, with a
+    /// `RuntimeError` rather than by queueing.
+    inner: Mutex<Option<GnitzClient>>,
 }
 
 impl PyGnitzClient {
     /// The still-open client, or a `GnitzError` if `close()` already ran.
     fn live(&mut self) -> PyResult<&mut GnitzClient> {
         self.inner
+            .get_mut()
+            .expect("nothing locks this mutex, so it cannot be poisoned")
             .as_mut()
             .ok_or_else(|| GnitzError::new_err("client already closed"))
     }
@@ -1787,7 +1795,7 @@ impl PyGnitzClient {
     #[new]
     pub fn new(py: Python<'_>, socket_path: &str) -> PyResult<Self> {
         Ok(PyGnitzClient {
-            inner: Some(connect_client(py, socket_path)?),
+            inner: Mutex::new(Some(connect_client(py, socket_path)?)),
         })
     }
 
@@ -1812,7 +1820,11 @@ impl PyGnitzClient {
     /// checkpoint plus an engine close — fsync-bound and unbounded in the copy's
     /// size — and it is also what releases the store's directory lock.
     pub fn close(&mut self, py: Python<'_>) {
-        let taken = self.inner.take();
+        let taken = self
+            .inner
+            .get_mut()
+            .expect("nothing locks this mutex, so it cannot be poisoned")
+            .take();
         py.detach(move || drop(taken));
     }
 
@@ -2728,8 +2740,8 @@ fn type_codes() -> Vec<(&'static str, u8)> {
 // ---------------------------------------------------------------------------
 
 // pyo3 0.29 makes free-threading opt-*out*: a bare `#[pymodule]` emits
-// `Py_MOD_GIL_NOT_USED`. This module holds an `unsendable` pyclass and links the
-// `Rc`-based engine, so that claim would be false.
+// `Py_MOD_GIL_NOT_USED`. This module links the `Rc`-based engine, so that claim
+// would be false.
 #[pymodule(gil_used = true)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyColumnDef>()?;

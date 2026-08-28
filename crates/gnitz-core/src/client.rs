@@ -423,13 +423,14 @@ pub struct GnitzClient {
 // their reachable set otherwise breaks the build a crate away, naming a pyo3
 // trait rather than the field.
 //
-// `Sync` is asserted for the three connection types as well: the park hook is
-// a boxed closure field that could narrow it silently, and nothing in this
-// crate would notice.
+// A `GnitzClient` is deliberately *not* `Sync`: an attached store is a live
+// engine. `Session` is, because `gnitz-py` exposes a bare one as a `#[pyclass]`
+// and pyo3 demands `Sync` of every pyclass it holds by value; `ClientTransport`
+// follows, because a `Session` holds one.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<GnitzClient>();
+    assert_send::<GnitzClient>();
     assert_send_sync::<Session>();
     assert_send_sync::<crate::protocol::ClientTransport>();
     assert_send::<ZSetBatch>();
@@ -698,7 +699,7 @@ impl GnitzClient {
     /// this one; [`Self::scan_local_first`] delegates here.
     pub fn scan_local(&mut self, table_id: u64) -> Result<Option<(Arc<Schema>, ZSetBatch)>, ClientError> {
         match self.mirror.as_deref_mut() {
-            Some(m) => Ok(m.store_mut().scan(table_id)?),
+            Some(m) => Ok(m.store.scan(table_id)?),
             None => Ok(None),
         }
     }
@@ -726,7 +727,7 @@ impl GnitzClient {
         reply_schema: &Schema,
     ) -> Result<Option<ZSetBatch>, ClientError> {
         if let Some(m) = self.mirror.as_deref_mut() {
-            if let crate::mirror::StoreRead::Held(batch) = m.store_mut().scan_spec(table_id, spec, reply_schema)? {
+            if let crate::mirror::StoreRead::Held(batch) = m.store.scan_spec(table_id, spec, reply_schema)? {
                 return Ok(batch);
             }
         }

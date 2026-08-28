@@ -71,8 +71,14 @@ pub struct Mirror {
 // primitives — so every `Rc` the engine mints is reached only from inside it and
 // a move carries them all together. `Mirror` is `!Sync` (the engine's
 // `UnsafeCell`s and raw pointers make it so), so the graph is reached by one
-// thread at a time, and the move that transfers it between threads — the client
-// holds it by value — orders the non-atomic refcounts across the handover.
+// thread at a time. What orders the non-atomic refcounts across a handover is
+// whichever edge the host holds the client behind, and there are three: a
+// blocking host holds the client by value, so the move itself is the edge; the
+// Python host's client never moves — it sits at a fixed address in the Python
+// heap — and the edge is pyo3's borrow flag, an `AcqRel` compare-exchange on
+// entry to every `&mut self` method and a `Release` store on exit; `gnitz-tokio`
+// reaches the same store from `spawn_blocking` threads, where its own lock is
+// the edge.
 //
 // Nothing under the engine is thread-affine: process-wide atomics, an `flock`
 // held as an open file description, an `io_uring` built per call. The
