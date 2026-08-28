@@ -2,6 +2,7 @@ use super::*;
 
 use super::super::flush_barrier::FlushRound;
 use super::super::run_set::FOLD_THRESHOLD;
+use super::super::shard_index::L0_COMPACT_THRESHOLD;
 use gnitz_expr::RowSource;
 
 /// Payload column 0 (an 8-byte integer) of a located row — the one read
@@ -9,8 +10,10 @@ use gnitz_expr::RowSource;
 fn row_val(fr: &StoredRow) -> i64 {
     i64::from_le_bytes(RowSource::get_col_ptr(&fr.run, fr.row, 0, 8).try_into().unwrap())
 }
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::test_support::{make_batch_raw, make_schema_u64_i64, opk_pk, wide_pk_3xu64_schema, wide_row};
+use crate::schema::{type_code, SchemaDescriptor};
+use crate::test_support::{
+    make_batch_opk, make_batch_raw, make_schema_u64_i64, opk_pk, pk_payload_schema, wide_pk_3xu64_schema, wide_row,
+};
 
 /// Unsorted `Raw` rows for the U64+I64 schema; the ingest path runs the
 /// canonical sort+fold.
@@ -86,78 +89,37 @@ fn materialize_weights(t: &Table) -> std::collections::HashMap<u64, i64> {
     }
     out
 }
-
+/// The table's basic contract in both recovery modes: ingested rows are
+/// visible, absent keys are not, and they survive a flush. A durable table is
+/// additionally reopened from its manifest — the property that separates the
+/// two modes.
 #[test]
-fn table_ephemeral_lifecycle() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("eph_test");
-    let schema = make_schema_u64_i64();
+fn table_lifecycle_serves_rows_across_flush_and_reopen() {
+    for (tid, rs, reopens) in [
+        (100, RecoverySource::Rederive { resume_at: None }, false),
+        (200, RecoverySource::SalReplay, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("lifecycle");
+        let schema = make_schema_u64_i64();
+        let mut t = new_table(&tdir, schema, tid, 1 << 20, rs);
+        assert!(t.memtable_is_empty());
 
-    let mut t = new_table(
-        &tdir,
-        schema,
-        100,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
+        t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
+        assert!(t.has_pk(10), "table {tid}");
+        assert!(t.has_pk(20));
+        assert!(!t.has_pk(99), "table {tid}: an absent key must not be found");
 
-    assert!(t.memtable_is_empty());
+        t.flush().unwrap();
+        assert!(t.has_pk(10), "table {tid}: row must survive the flush");
+        assert!(t.has_pk(20));
 
-    t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
-
-    assert!(t.has_pk(10));
-    assert!(t.has_pk(20));
-    assert!(!t.has_pk(99));
-
-    t.flush().unwrap();
-
-    // After flush, data is in shards
-    assert!(t.has_pk(10));
-    assert!(t.has_pk(20));
-}
-
-#[test]
-fn table_persistent_lifecycle() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("pers_test");
-    let schema = make_schema_u64_i64();
-
-    let mut t = new_table(&tdir, schema, 200, 1 << 20, RecoverySource::SalReplay);
-
-    t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
-    t.flush().unwrap();
-
-    assert!(t.has_pk(10));
-
-    // Re-open and recover
-    let mut t2 = new_table(&tdir, schema, 200, 1 << 20, RecoverySource::SalReplay);
-
-    // Data should be in shards via manifest
-    assert!(t2.has_pk(10));
-    assert!(t2.has_pk(20));
-}
-
-#[test]
-fn table_cursor_iteration() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("cursor_test");
-    let schema = make_schema_u64_i64();
-
-    let mut t = new_table(
-        &tdir,
-        schema,
-        300,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
-
-    t.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200)]))
-        .unwrap();
-
-    let cursor = t.open_cursor();
-    assert!(cursor.valid);
-    assert_eq!(cursor.current_key_narrow() as u64, 10);
-    // Don't need to iterate further — cursor creation works
+        if reopens {
+            let mut t2 = new_table(&tdir, schema, tid, 1 << 20, rs);
+            assert!(t2.has_pk(10), "table {tid}: row must reload from the manifest");
+            assert!(t2.has_pk(20));
+        }
+    }
 }
 
 #[test]
@@ -189,33 +151,6 @@ fn table_retract_pk() {
     assert_eq!(w, 0);
     assert!(found.is_none());
 }
-
-#[test]
-fn table_compact() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("compact_test");
-    let schema = make_schema_u64_i64();
-
-    // Durable: each flush writes a real `shard_*` so `run_compact` (L0→L1)
-    // is exercised. Under non-durable flush these tiny rows would stay in
-    // the RAM tier and never reach the disk compaction path.
-    let mut t = new_table(&tdir, schema, 500, 256, RecoverySource::SalReplay);
-
-    // Create enough flushes to trigger compaction
-    for i in 0..6u64 {
-        t.ingest_owned_batch(make_batch(&[(i * 10, 1, (i * 100) as i64)]))
-            .unwrap();
-        t.flush().unwrap();
-    }
-
-    t.compact_if_needed().unwrap();
-
-    // All data should still be accessible
-    for i in 0..6u64 {
-        assert!(t.has_pk((i * 10) as u128));
-    }
-}
-
 /// After INSERT then UPDATE (which adds a retraction for the old payload and
 /// an insertion for the new payload), `retract_pk` must return the NEW payload,
 /// not the cancelled old one.
@@ -288,53 +223,15 @@ fn test_ingest_owned_batch_unsorted() {
     );
 }
 
-/// `ingest_owned_batch` must pre-flush when the memtable is already
-/// over its size budget, then accept the new batch (which itself may be
-/// unsorted). Pre-fill the memtable past `max_bytes` directly, then
-/// ingest a reverse-sorted batch and verify rows from both batches are
-/// retrievable in ascending PK order.
-#[test]
-fn test_ingest_owned_batch_pre_flushes_when_overflowing() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("pre_flush_test");
-    let schema = make_schema_u64_i64();
-
-    // Very small arena: 40 bytes. A 3-row batch (~120 bytes) will exceed it.
-    let mut t = new_table(&tdir, schema, 900, 40, RecoverySource::Rederive { resume_at: None });
-
-    // Directly fill memtable past max_bytes using memtable_upsert_sorted_batch
-    // (bypasses auto-flush so runs_bytes exceeds max_bytes).
-    let fill_batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    let fill_batch = fill_batch.into_consolidated(&schema);
-    t.memtable_upsert_sorted_batch(fill_batch);
-    // runs_bytes (~120) > max_bytes (40) — next ingest must pre-flush
-    // before upsert. The new owned-batch path checks should_flush()
-    // before upserting, so the pre-fill goes to a shard cleanly.
-
-    // Ingest a REVERSE-sorted batch. ingest_owned_batch must sort it
-    // (via into_consolidated) before insert.
-    t.ingest_owned_batch(make_batch(&[(50, 1, 500), (40, 1, 400), (30, 1, 300)]))
-        .unwrap();
-
-    // fill batch (1,2,3) is now in shard; sorted (30,40,50) is in memtable.
-    let cursor = t.open_cursor();
-    assert!(cursor.valid);
-    assert_eq!(
-        cursor.current_key_narrow() as u64,
-        1,
-        "cursor should start at PK=1 from flushed shard"
-    );
-}
-
-/// Two ingest calls that cumulatively cross the 75% threshold must produce
-/// an L0 shard and an empty memtable without any explicit flush() call.
+/// Two ingest calls that cumulatively overflow the memtable's byte budget
+/// must produce an L0 shard and an empty memtable with no explicit flush().
 #[test]
 fn test_memtable_overflow_auto_flush() {
     let dir = tempfile::tempdir().unwrap();
     let tdir = dir.path().join("overflow_auto_flush");
     let schema = make_schema_u64_i64();
 
-    // arena = 128 bytes → should_flush threshold = 96.
+    // arena = 128 bytes, so a second ingest overflows the memtable's budget.
     // Each row is 32 bytes (PK 8 + weight 8 + null_bmp 8 + col 8).
     // First call: 2 rows = 64 bytes, below threshold → no flush.
     // Second call: pre-check 64 < 96 → no pre-flush; upsert → 128 > 96 → post-flush.
@@ -543,141 +440,143 @@ fn flush_prepare_non_durable_done_inline() {
     assert!(t.has_pk(20));
 }
 
-/// Wide (`pk_stride = 24`) PK: `has_pk_bytes`/`retract_pk_bytes` must work
-/// across both the active memtable runs and flushed shards, and prefix-twins
-/// (sharing the OPK 16-byte prefix, differing in the trailing column) must be
-/// independently tracked.
+/// Wide (`pk_stride = 24`) PK in every tier its rows can live in.
+/// `has_pk_bytes`/`retract_pk_bytes` must resolve prefix-twins — keys sharing
+/// their OPK 16-byte prefix and differing only in the trailing column —
+/// independently, so a retraction nets against the twin it names and no other.
+///
+/// `RecoverySource` picks the tier: a durable table flushes to a real shard, an
+/// ephemeral one folds into the RAM tier. The lookup machinery is tier-agnostic,
+/// so one body drives both.
 #[test]
-fn table_wide_pk_has_and_retract_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("wide_pk_test");
-    let schema = wide_pk_3xu64_schema();
-    assert_eq!(schema.pk_stride(), 24);
+fn wide_pk_membership_and_retract_resolve_twins_in_every_tier() {
+    for (tid, rs) in [
+        (4242, RecoverySource::SalReplay),
+        (5002, RecoverySource::Rederive { resume_at: None }),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = wide_pk_3xu64_schema();
+        assert_eq!(schema.pk_stride(), 24);
+        let mut t = new_table(dir.path(), schema, tid, 1 << 20, rs);
 
-    let pk3 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
-    let wide_batch = |rows: &[(Vec<u8>, i64, i64)]| -> Batch {
-        let mut b = Batch::with_capacity(schema, rows.len().max(1));
-        for (pk, w, val) in rows {
-            b.extend_pk_bytes(pk);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
+        let pk3 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
+        let twin_a = pk3(1, 1, 100);
+        let twin_b = pk3(1, 1, 200);
+        let other = pk3(2, 0, 0);
+
+        t.ingest_owned_batch(make_batch_opk(
+            &schema,
+            &[(&twin_a, 1, 10), (&twin_b, 1, 20), (&other, 1, 30)],
+        ))
+        .unwrap();
+
+        // Memtable lookups, before anything reaches a tier.
+        for k in [&twin_a, &twin_b, &other] {
+            assert!(t.has_pk_bytes(k), "table {tid}: key must be found in the memtable");
         }
-        b
-    };
+        assert!(!t.has_pk_bytes(&pk3(1, 1, 300)), "absent prefix-twin must not be found");
+        assert!(!t.has_pk_bytes(&pk3(9, 9, 9)));
 
-    // Durable: this exercises `retract_pk_bytes` over flushed data, which is
-    // base-table-only (base tables are durable). A durable flush writes a
-    // real shard so the shard scan path is what's tested; a non-durable
-    // flush would route the rows into the RAM tier instead.
-    let mut t = new_table(&tdir, schema, 4242, 1 << 20, RecoverySource::SalReplay);
+        // The same keys, now served out of whichever tier the flush chose.
+        t.flush().unwrap();
+        for k in [&twin_a, &twin_b, &other] {
+            assert!(t.has_pk_bytes(k), "table {tid}: key must survive the flush");
+        }
+        assert!(!t.has_pk_bytes(&pk3(1, 1, 300)));
 
-    // Two prefix-twins (1,1,100)/(1,1,200) and a distinct (2,0,0).
-    t.ingest_owned_batch(wide_batch(&[
-        (pk3(1, 1, 100), 1, 10),
-        (pk3(1, 1, 200), 1, 20),
-        (pk3(2, 0, 0), 1, 30),
-    ]))
-    .unwrap();
+        // A retraction in the memtable nets against the tier's copy...
+        t.ingest_owned_batch(make_batch_opk(&schema, &[(&twin_a, -1, 10)]))
+            .unwrap();
+        assert!(!t.has_pk_bytes(&twin_a), "table {tid}: retracted twin must be gone");
+        assert!(t.has_pk_bytes(&twin_b), "table {tid}: the other twin must survive");
 
-    // Memtable lookups.
-    assert!(t.has_pk_bytes(&pk3(1, 1, 100)));
-    assert!(t.has_pk_bytes(&pk3(1, 1, 200)));
-    assert!(t.has_pk_bytes(&pk3(2, 0, 0)));
-    assert!(!t.has_pk_bytes(&pk3(1, 1, 300)), "absent prefix-twin must not be found");
-    assert!(!t.has_pk_bytes(&pk3(9, 9, 9)));
+        // ...and still nets once the retraction is itself in a tier.
+        t.flush().unwrap();
+        assert!(!t.has_pk_bytes(&twin_a));
+        assert!(t.has_pk_bytes(&twin_b));
 
-    // Flush to a shard, then re-check the same keys from disk.
-    t.flush().unwrap();
-    assert!(t.has_pk_bytes(&pk3(1, 1, 100)));
-    assert!(t.has_pk_bytes(&pk3(1, 1, 200)));
-    assert!(t.has_pk_bytes(&pk3(2, 0, 0)));
-    assert!(!t.has_pk_bytes(&pk3(1, 1, 300)));
-
-    // Retract one prefix-twin (DBSP -1 in the memtable); the other survives.
-    t.ingest_owned_batch(wide_batch(&[(pk3(1, 1, 100), -1, 10)])).unwrap();
-    assert!(!t.has_pk_bytes(&pk3(1, 1, 100)), "retracted twin must be gone");
-    assert!(t.has_pk_bytes(&pk3(1, 1, 200)), "the other twin must survive");
-
-    // retract_pk_bytes reports the live (PK, payload) row.
-    let (w, found) = t.retract_pk_bytes(&pk3(1, 1, 200));
-    assert_eq!(w, 1);
-    assert!(found.is_some());
-    let (w2, found2) = t.retract_pk_bytes(&pk3(1, 1, 100));
-    assert_eq!(w2, 0);
-    assert!(found2.is_none());
+        let (w, found) = t.retract_pk_bytes(&twin_b);
+        assert_eq!(w, 1);
+        assert_eq!(
+            row_val(&found.expect("live twin is the found row")),
+            20,
+            "found row must be the surviving twin's payload"
+        );
+        let (w2, found2) = t.retract_pk_bytes(&twin_a);
+        assert_eq!(w2, 0, "net-zero twin reports absent");
+        assert!(found2.is_none());
+    }
 }
 
-/// Wide (`pk_stride = 24`) PK with a *signed* leading column: OPK must order a
-/// negative leading value before a positive one, end-to-end through storage
-/// (compare, scan, membership, retract). This is the case where hand-written
-/// big-endian/little-endian bytes are wrong and only the real encoder's
-/// sign-flip is correct.
+/// Wide (`pk_stride = 24`) PK with a *signed* leading column, in every tier.
+/// OPK must order a negative leading value before a positive one end to end —
+/// compare, scan, membership, retract. This is the case where hand-written
+/// big-endian bytes are wrong and only the encoder's sign-flip is correct.
 #[test]
-fn table_wide_signed_compound_pk_opk_order() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("wide_signed_pk_test");
+fn signed_compound_pk_keeps_opk_order_in_every_tier() {
     // (I64, U64, U64) PK [stride 24, wide] + I64 payload used as an order marker.
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0, 1, 2],
-    );
+    let schema = pk_payload_schema(&[type_code::I64, type_code::U64, type_code::U64]);
     assert_eq!(schema.pk_stride(), 24);
-
     let key = |a: i64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
 
-    // Direct sign-flip property: a negative leading column sorts before a
-    // positive one in OPK byte order. Plain big-endian (no flip) would place
-    // 0xFF.. (negatives) after 0x00.. (positives) and fail this.
+    // Plain big-endian (no flip) would place 0xFF.. (negatives) after 0x00..
+    // (positives) and fail this.
     assert_eq!(
         crate::schema::key::compare_pk_bytes(&key(-1, 0, 0), &key(1, 0, 0)),
         std::cmp::Ordering::Less,
         "OPK must order a negative signed PK column before a positive one",
     );
 
-    let mut t = new_table(&tdir, schema, 4243, 1 << 20, RecoverySource::SalReplay);
+    for (tid, rs) in [
+        (4243, RecoverySource::SalReplay),
+        (5003, RecoverySource::Rederive { resume_at: None }),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = new_table(dir.path(), schema, tid, 1 << 20, rs);
 
-    // Payload marker == the signed leading value, so scan order is read back
-    // without decoding the PK. `w` lets the same builder emit the DBSP -1
-    // retraction row below.
-    let row = |a: i64, w: i64| wide_row(&schema, &key(a, 0, 0), w, a);
-    for a in [3i64, -5, 0, -1] {
-        // scrambled insertion order
-        t.ingest_owned_batch(row(a, 1)).unwrap();
+        // Payload marker == the signed leading value, so scan order is read
+        // back without decoding the PK. `w` lets the same builder emit the
+        // DBSP -1 retraction row below.
+        let row = |a: i64, w: i64| wide_row(&schema, &key(a, 0, 0), w, a);
+        for a in [3i64, -5, 0, -1] {
+            // scrambled insertion order
+            t.ingest_owned_batch(row(a, 1)).unwrap();
+        }
+        t.flush().unwrap();
+
+        assert!(t.has_pk_bytes(&key(-5, 0, 0)), "table {tid}");
+        assert!(t.has_pk_bytes(&key(3, 0, 0)));
+        assert!(!t.has_pk_bytes(&key(-2, 0, 0)), "absent signed key must not be found");
+
+        // full_scan returns rows in OPK (= typed signed) order: -5, -1, 0, 3.
+        // A missing sign-flip would scan back as 0, 3, -5, -1 and fail here.
+        let scanned = t.full_scan();
+        let payloads: Vec<i64> = (0..scanned.count)
+            .map(|r| i64::from_le_bytes(scanned.get_col_ptr(r, 0, 8).try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![-5, -1, 0, 3],
+            "table {tid}: wide signed compound PK must scan back in sign-flipped order",
+        );
+
+        // A read-only probe reports the live (weight, row) for the signed key.
+        let (w, found) = t.retract_pk_bytes(&key(-5, 0, 0));
+        assert_eq!(w, 1);
+        assert_eq!(
+            row_val(&found.expect("signed key is the found row")),
+            -5,
+            "found row payload marks the probed signed key"
+        );
+
+        // The row itself goes only via a DBSP -1 ingest, netting the +1 to zero.
+        t.ingest_owned_batch(row(-5, -1)).unwrap();
+        t.flush().unwrap();
+        assert!(
+            !t.has_pk_bytes(&key(-5, 0, 0)),
+            "table {tid}: retracted signed key is gone"
+        );
     }
-    t.flush().unwrap(); // Durable: one on-disk shard
-
-    // Membership at signed width, byte-keyed (both must survive the flush).
-    assert!(t.has_pk_bytes(&key(-5, 0, 0)));
-    assert!(t.has_pk_bytes(&key(3, 0, 0)));
-    assert!(!t.has_pk_bytes(&key(-2, 0, 0)), "absent signed key must not be found");
-
-    // full_scan returns rows in OPK (= typed signed) order: -5, -1, 0, 3.
-    // A missing sign-flip would scan back as 0, 3, -5, -1 and fail here.
-    let scanned = t.full_scan();
-    let payloads: Vec<i64> = (0..scanned.count)
-        .map(|r| i64::from_le_bytes(scanned.get_col_ptr(r, 0, 8).try_into().unwrap()))
-        .collect();
-    assert_eq!(
-        payloads,
-        vec![-5, -1, 0, 3],
-        "wide signed compound PK must scan back in typed (sign-flipped) order",
-    );
-
-    // `retract_pk_bytes` reports the live (weight, found) for the signed OPK
-    // key at wide width — a read-only probe; the row is removed by a DBSP -1
-    // ingest, whose memtable weight nets the shard's +1 to zero.
-    let (w, found) = t.retract_pk_bytes(&key(-5, 0, 0));
-    assert_eq!(w, 1);
-    assert!(found.is_some());
-    t.ingest_owned_batch(row(-5, -1)).unwrap();
-    assert!(!t.has_pk_bytes(&key(-5, 0, 0)), "retracted signed key is gone");
 }
 
 // ── In-memory Rederive flush (RAM tier, no file I/O) ─────────────────
@@ -834,7 +733,7 @@ fn repeated_spill_stays_bounded() {
         // Raw spill shards do not accumulate with rounds — disk L0 self-folds
         // into L1 and the consumed raw shards are unlinked.
         assert!(
-            shard_db_files(&tdir, 100).len() <= 5,
+            shard_db_files(&tdir, 100).len() <= L0_COMPACT_THRESHOLD + 1,
             "round {r}: {} raw shards accumulated",
             shard_db_files(&tdir, 100).len(),
         );
@@ -964,129 +863,6 @@ fn inmem_retract_multiple_payloads() {
         val, 200,
         "RAM-tier global-net must pick live payload 200, not cancelled 100"
     );
-}
-
-/// Twin of `table_wide_pk_has_and_retract_bytes`, in RAM: wide (`pk_stride =
-/// 24`) prefix-twins `(1,1,100)`/`(1,1,200)` held in the RAM tier. Retract
-/// the live twin; the other survives; the retracted one reports absent.
-#[test]
-fn inmem_retract_wide_pk() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("inmem_retract_wide_pk");
-    let schema = wide_pk_3xu64_schema();
-    assert_eq!(schema.pk_stride(), 24);
-    let mut t = new_table(
-        &tdir,
-        schema,
-        5002,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
-
-    let pk3 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
-    let wide_batch = |rows: &[(Vec<u8>, i64, i64)]| -> Batch {
-        let mut b = Batch::with_capacity(schema, rows.len().max(1));
-        for (pk, w, val) in rows {
-            b.extend_pk_bytes(pk);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b
-    };
-
-    // Two prefix-twins + a distinct key, flushed into the RAM tier.
-    t.ingest_owned_batch(wide_batch(&[
-        (pk3(1, 1, 100), 1, 10),
-        (pk3(1, 1, 200), 1, 20),
-        (pk3(2, 0, 0), 1, 30),
-    ]))
-    .unwrap();
-    t.flush().unwrap();
-    assert!(t.has_pk_bytes(&pk3(1, 1, 100)));
-    assert!(t.has_pk_bytes(&pk3(1, 1, 200)));
-    assert!(t.has_pk_bytes(&pk3(2, 0, 0)));
-    assert!(!t.has_pk_bytes(&pk3(1, 1, 300)), "absent prefix-twin must not be found");
-
-    // Retract one twin via a second in-memory run; the other must survive.
-    t.ingest_owned_batch(wide_batch(&[(pk3(1, 1, 100), -1, 10)])).unwrap();
-    t.flush().unwrap();
-    assert!(!t.has_pk_bytes(&pk3(1, 1, 100)), "retracted twin gone");
-    assert!(t.has_pk_bytes(&pk3(1, 1, 200)), "the other twin survives");
-
-    let (w, found) = t.retract_pk_bytes(&pk3(1, 1, 200));
-    assert_eq!(w, 1);
-    assert!(found.is_some());
-    let fr = found.expect("live twin is the found row");
-    let val = row_val(&fr);
-    assert_eq!(val, 20, "found row must be the surviving twin's payload");
-
-    let (w2, found2) = t.retract_pk_bytes(&pk3(1, 1, 100));
-    assert_eq!(w2, 0, "net-zero twin reports absent");
-    assert!(found2.is_none());
-}
-
-/// Twin of `table_wide_signed_compound_pk_opk_order`, in RAM: a signed
-/// leading PK column, rows in the RAM tier. OPK order is read back via
-/// `full_scan` (over the heap runs), then the signed key is retracted.
-#[test]
-fn inmem_retract_signed_compound_pk() {
-    let dir = tempfile::tempdir().unwrap();
-    let tdir = dir.path().join("inmem_signed_pk");
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0, 1, 2],
-    );
-    assert_eq!(schema.pk_stride(), 24);
-    let mut t = new_table(
-        &tdir,
-        schema,
-        5003,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    );
-
-    let key = |a: i64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
-    // Payload marker == the signed leading value, read back in scan order.
-    let row = |a: i64, w: i64| wide_row(&schema, &key(a, 0, 0), w, a);
-    for a in [3i64, -5, 0, -1] {
-        t.ingest_owned_batch(row(a, 1)).unwrap();
-    }
-    t.flush().unwrap(); // one in-memory L0 run
-    assert!(t.ram_run_count() > 0, "rows land in the RAM tier");
-
-    assert!(t.has_pk_bytes(&key(-5, 0, 0)));
-    assert!(t.has_pk_bytes(&key(3, 0, 0)));
-    assert!(!t.has_pk_bytes(&key(-2, 0, 0)), "absent signed key must not be found");
-
-    // full_scan over the heap run returns OPK (typed signed) order: -5,-1,0,3.
-    let scanned = t.full_scan();
-    let payloads: Vec<i64> = (0..scanned.count)
-        .map(|r| i64::from_le_bytes(scanned.get_col_ptr(r, 0, 8).try_into().unwrap()))
-        .collect();
-    assert_eq!(
-        payloads,
-        vec![-5, -1, 0, 3],
-        "wide signed compound PK scans back in sign-flipped order"
-    );
-
-    let (w, found) = t.retract_pk_bytes(&key(-5, 0, 0));
-    assert_eq!(w, 1);
-    assert!(found.is_some());
-    let fr = found.expect("signed key is the found row");
-    let val = row_val(&fr);
-    assert_eq!(val, -5, "found row payload marks the retracted signed key");
-
-    // Retraction across a second run nets the signed key to zero.
-    t.ingest_owned_batch(row(-5, -1)).unwrap();
-    t.flush().unwrap();
-    assert!(!t.has_pk_bytes(&key(-5, 0, 0)), "retracted signed key is gone");
 }
 
 /// The live row sits in RAM while the memtable holds a *negative*-weight
@@ -1234,8 +1010,6 @@ fn barrier_flush_folds_populated_l0_not_empty() {
         "sub-ceiling overflow writes no disk shard"
     );
 
-    // `flush()` returns false iff `flush_prepare` said `Empty` — which here
-    // would mean the fold-first gate dropped a populated the RAM tier.
     t.flush().unwrap();
 
     assert!(t.ram_run_count() == 0, "flush_commit clears the RAM tier");
@@ -1417,9 +1191,9 @@ fn salreplay_overflow_into_l0_retract() {
 
 /// F1 regression. A `SalReplay` table whose only post-checkpoint write
 /// spilled — clearing the RAM tier, one lone L0 shard, no compaction, so no
-/// manifest was published — must still barrier-flush to `Pending` (via the
-/// every barrier publishes) and durably capture the spill. Without the
-/// disjunct the barrier returns `Empty`, the spill is never manifested, and a
+/// manifest was published — must still barrier-flush to `Pending` and durably
+/// capture the spill. Without the unsynced-shard disjunct the barrier returns
+/// `Empty`, the spill is never manifested, and a
 /// reopen's `gc_orphans` deletes it — acknowledged rows lost.
 #[test]
 fn lone_spill_survives_checkpoint_barrier() {

@@ -568,14 +568,6 @@ impl Table {
         self.shard_index.set_skip_pk_filter_for_test(skip);
     }
 
-    /// Test helper: push a consolidated batch straight into the memtable,
-    /// skipping the ingest path's flush check.
-    #[cfg(test)]
-    pub(crate) fn memtable_upsert_sorted_batch(&mut self, batch: Batch) {
-        self.cached_full_scan = None;
-        self.memtable.push(Rc::new(batch), &self.schema);
-    }
-
     /// Test helper: the highest LSN registered in the shard index (0 when no
     /// shard is registered). Used to check spill/barrier LSN registration.
     #[cfg(test)]

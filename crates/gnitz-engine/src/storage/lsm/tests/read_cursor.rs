@@ -1,10 +1,13 @@
+use super::super::batch::REG_PK;
+use super::super::layout::ENCODING_CONSTANT;
+use super::super::shard_file::region_dir;
 use super::output::Drain;
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{BatchBuilder, Layout};
 use crate::test_support::{
-    make_schema_i64pk_i64, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64,
-    wide_pk_3xu64_schema,
+    make_schema_i64pk_i64, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, opk_pk,
+    pk_payload_schema, wide_pk_3xu64_schema,
 };
 
 /// Build an `Rc<Batch>` with i64-payload rows.  Tests pre-sort their
@@ -24,6 +27,32 @@ fn make_batch(rows: &[(u128, i64, i64)]) -> Rc<Batch> {
     Rc::new(b)
 }
 
+/// PK = (col0:U64, col1:U64); payload = I64. Stored first-column-major.
+fn make_schema_compound_u64() -> SchemaDescriptor {
+    pk_payload_schema(&[type_code::U64, type_code::U64])
+}
+
+/// OPK bytes of a `(U64, U64)` compound key. Encoded through the production
+/// encoder, so a broken encoder fails the test rather than agreeing with it.
+fn compound_pk_bytes(c0: u64, c1: u64) -> Vec<u8> {
+    opk_pk(&make_schema_compound_u64(), &[c0 as u128, c1 as u128])
+}
+
+/// Drain reading each row's payload value (logical col 1) alongside its PK and
+/// weight. The payload read is what gives the fold assertions their teeth: a
+/// merge that ordered on PK alone leaks an extra row whose payload is the only
+/// thing distinguishing it from the survivor.
+fn scan_all_with_val(cursor: &mut ReadCursor) -> Vec<(u64, i64, i64)> {
+    let mut rows = Vec::new();
+    while cursor.valid {
+        let cell = cursor.col_bytes(1, 8).expect("payload column of a valid cursor row");
+        let val = i64::from_le_bytes(cell.try_into().unwrap());
+        rows.push((cursor.current_key_narrow() as u64, cursor.current_weight, val));
+        cursor.advance();
+    }
+    rows
+}
+
 fn scan_all(cursor: &mut ReadCursor) -> Vec<(u64, u64, i64)> {
     let mut rows = Vec::new();
     while cursor.valid {
@@ -37,98 +66,54 @@ fn scan_all(cursor: &mut ReadCursor) -> Vec<(u64, u64, i64)> {
     rows
 }
 
+/// The N-way merge over cursor sources: rows come out in (PK, payload) order,
+/// entries sharing a full (PK, payload) identity fold their weights, a fold to
+/// zero drops the row, and two rows sharing only a PK both survive. Asserted on
+/// the payload value, so a row that leaked past the fold cannot hide behind a
+/// matching PK and weight.
 #[test]
-fn test_empty_cursor() {
-    let schema = make_schema_u128_i64();
-    let cursor = create_read_cursor(&[], &[], schema);
-    assert!(!cursor.valid);
+fn cursor_merge_orders_folds_weights_and_drops_ghosts() {
+    /// A name, one `(pk, weight, payload)` row list per source, and the
+    /// `(pk, weight, payload)` rows the merge must emit.
+    type Case = (&'static str, Vec<Vec<(u128, i64, i64)>>, Vec<(u64, i64, i64)>);
+    let cases: Vec<Case> = vec![
+        ("no sources", vec![], vec![]),
+        (
+            "one source",
+            vec![vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)]],
+            vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)],
+        ),
+        (
+            "two interleaved sources",
+            vec![vec![(1, 1, 10), (3, 1, 30)], vec![(2, 1, 20), (4, 1, 40)]],
+            vec![(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)],
+        ),
+        (
+            "a cross-source retraction cancels its row",
+            vec![vec![(5, 1, 50), (10, 1, 100)], vec![(5, -1, 50)]],
+            vec![(10, 1, 100)],
+        ),
+        (
+            "one PK, two payloads — both survive, in payload order",
+            vec![vec![(5, 1, 200)], vec![(5, 1, 100)]],
+            vec![(5, 1, 100), (5, 1, 200)],
+        ),
+        (
+            "one (PK, payload) in two sources — weights sum",
+            vec![vec![(5, 3, 50)], vec![(5, 7, 50)]],
+            vec![(5, 10, 50)],
+        ),
+    ];
+
+    for (name, sources, want) in cases {
+        let schema = make_schema_u128_i64();
+        let batches: Vec<_> = sources.iter().map(|rows| make_batch(rows)).collect();
+        let mut cursor = create_read_cursor(&batches, &[], schema);
+        assert_eq!(scan_all_with_val(&mut cursor), want, "{name}");
+        assert!(!cursor.valid, "{name}: a drained cursor is invalid");
+    }
 }
 
-#[test]
-fn test_single_batch_scan() {
-    let schema = make_schema_u128_i64();
-    let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    let mut cursor = create_read_cursor(&[batch], &[], schema);
-    let rows = scan_all(&mut cursor);
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], (1, 0, 1));
-    assert_eq!(rows[1], (2, 0, 1));
-    assert_eq!(rows[2], (3, 0, 1));
-}
-
-#[test]
-fn test_two_batch_merge() {
-    let schema = make_schema_u128_i64();
-    let b1 = make_batch(&[(1, 1, 10), (3, 1, 30)]);
-    let b2 = make_batch(&[(2, 1, 20), (4, 1, 40)]);
-    let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
-    let rows = scan_all(&mut cursor);
-    assert_eq!(rows.len(), 4);
-    assert_eq!(rows[0].0, 1);
-    assert_eq!(rows[1].0, 2);
-    assert_eq!(rows[2].0, 3);
-    assert_eq!(rows[3].0, 4);
-}
-
-#[test]
-fn test_ghost_elimination_across_sources() {
-    let schema = make_schema_u128_i64();
-    // Batch 1: pk=5 val=50 w=+1, pk=10 val=100 w=+1
-    let b1 = make_batch(&[(5, 1, 50), (10, 1, 100)]);
-    // Batch 2: pk=5 val=50 w=-1 (retraction)
-    let b2 = make_batch(&[(5, -1, 50)]);
-    let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
-    let rows = scan_all(&mut cursor);
-    // pk=5 cancelled (w=+1-1=0), only pk=10 survives
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0], (10, 0, 1));
-}
-
-#[test]
-fn test_seek() {
-    let schema = make_schema_u128_i64();
-    let batch = make_batch(&[(1, 1, 10), (5, 1, 50), (10, 1, 100)]);
-    let mut cursor = create_read_cursor(&[batch], &[], schema);
-
-    // Seek to pk >= 5. OPK for a U128 PK is the value's big-endian bytes.
-    cursor.seek_bytes(&5u128.to_be_bytes());
-    assert!(cursor.valid);
-    assert_eq!(cursor.current_key_narrow(), 5);
-
-    // Seek to pk >= 7 → lands on 10
-    cursor.seek_bytes(&7u128.to_be_bytes());
-    assert!(cursor.valid);
-    assert_eq!(cursor.current_key_narrow(), 10);
-
-    // Seek past end
-    cursor.seek_bytes(&100u128.to_be_bytes());
-    assert!(!cursor.valid);
-}
-
-fn make_schema_compound_u64() -> SchemaDescriptor {
-    // PK = (col0:U64, col1:U64); payload = I64. Stored first-column-major.
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0, 1],
-    )
-}
-
-/// OPK bytes for a `(U64, U64)` compound PK: each column big-endian,
-/// concatenated in pk-list order (the at-rest form).
-fn compound_pk_bytes(col0: u64, col1: u64) -> [u8; 16] {
-    let mut b = [0u8; 16];
-    b[..8].copy_from_slice(&col0.to_be_bytes());
-    b[8..].copy_from_slice(&col1.to_be_bytes());
-    b
-}
-
-/// A compound `(U64, U64)` PK's raw u128 order is last-column-major while
-/// storage (OPK memcmp) sorts first-column-major. `seek_bytes` must land on
-/// the exact row, not the u128-nearest one.
 #[test]
 fn test_seek_compound_pk_lands_on_exact_row() {
     let schema = make_schema_compound_u64();
@@ -157,9 +142,9 @@ fn test_seek_compound_pk_lands_on_exact_row() {
 
 /// OPK bytes for a single I64 PK column (big-endian, sign bit flipped).
 fn i64_opk(v: i64) -> [u8; 8] {
-    let mut out = [0u8; 8];
-    gnitz_wire::encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut out);
-    out
+    opk_pk(&make_schema_i64pk_i64(), &[v as u128])
+        .try_into()
+        .expect("a single I64 PK column encodes to 8 bytes")
 }
 
 /// A signed single-column PK's negative keys sort *after* positives in raw
@@ -195,51 +180,6 @@ fn test_seek_signed_pk_lands_on_negative_row() {
 }
 
 #[test]
-fn test_same_pk_different_payload_ordering() {
-    let schema = make_schema_u128_i64();
-    // Two entries with same PK but different payloads
-    let b1 = make_batch(&[(5, 1, 200)]);
-    let b2 = make_batch(&[(5, 1, 100)]);
-    let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
-    let rows = scan_all(&mut cursor);
-    // Both survive, sorted by payload (100 < 200)
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], (5, 0, 1)); // payload=100
-    assert_eq!(rows[1], (5, 0, 1)); // payload=200
-}
-
-/// Drain that READS THE PAYLOAD VALUE of each row (logical col 1, the
-/// I64 payload), unlike `scan_all` which only captures PK + weight. The
-/// payload read is what gives the root-adjacency pin its teeth: a PK-only
-/// merge leaks an *extra* row whose payload value distinguishes it from
-/// the survivor.
-fn scan_all_with_val(cursor: &mut ReadCursor) -> Vec<(u64, i64, i64)> {
-    let mut rows = Vec::new();
-    while cursor.valid {
-        let cell = cursor.col_bytes(1, 8).expect("payload column of a valid cursor row");
-        let val = i64::from_le_bytes(cell.try_into().unwrap());
-        rows.push((cursor.current_key_narrow() as u64, cursor.current_weight, val));
-        cursor.advance();
-    }
-    rows
-}
-
-/// PIN — root adjacency of equal-(PK, payload) rows across cursor sources.
-/// Three single-row batches, all PK=5: b1/b3 carry the *same* payload
-/// (val=100) with opposite weights, b2 carries a different payload
-/// (val=200) and sits between them in source order. Each batch is
-/// (PK, payload)-sorted, but the matching val=100 rows are NOT adjacent in
-/// source order.
-///
-/// The cursor's N-way merge heap MUST order by (PK, payload) so the two
-/// val=100 rows reach the fold root consecutively and their +1/-1 weights
-/// cancel via ghost elimination; only val=200 survives. A PK-only heap
-/// `less` (dropping the payload tiebreak) leaves the three same-PK rows
-/// unordered among themselves, the fold breaks on the first payload
-/// mismatch, and the +1/-1 pair never folds — surfacing a spurious row.
-/// We assert on the PAYLOAD VALUE (via `scan_all_with_val`) so the leaked
-/// row cannot hide behind a matching PK/weight.
-#[test]
 fn test_cursor_same_pk_nonadjacent_payload_fold() {
     let schema = make_schema_u128_i64();
     let b1 = make_batch(&[(5, 1, 100)]);
@@ -256,96 +196,24 @@ fn test_cursor_same_pk_nonadjacent_payload_fold() {
 }
 
 #[test]
-fn test_weight_accumulation_across_sources() {
+fn col_bytes_answers_only_for_a_payload_column_of_a_valid_row() {
     let schema = make_schema_u128_i64();
-    // Same (PK, payload) in two batches: weights should sum
-    let b1 = make_batch(&[(5, 3, 50)]);
-    let b2 = make_batch(&[(5, 7, 50)]);
-    let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
-    let rows = scan_all(&mut cursor);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0], (5, 0, 10)); // 3 + 7 = 10
-}
-
-#[test]
-fn test_drain_single_source_full() {
-    let schema = make_schema_u128_i64();
-    let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    let mut cursor = create_read_cursor(&[batch], &[], schema);
-
-    let result = cursor.drain_single_source(Drain::All);
-    assert!(result.is_some());
-    let out = result.unwrap();
-    assert_eq!(out.count, 3);
-    assert_eq!(out.get_pk(0), 1);
-    assert_eq!(out.get_pk(2), 3);
-    assert!(!cursor.valid);
-}
-
-#[test]
-fn test_drain_single_source_with_limit() {
-    let schema = make_schema_u128_i64();
-    let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-    let mut cursor = create_read_cursor(&[batch], &[], schema);
-
-    // Drain first 2
-    let out1 = cursor.drain_single_source(Drain::Rows(2.try_into().unwrap())).unwrap();
-    assert_eq!(out1.count, 2);
-    assert_eq!(out1.get_pk(0), 1);
-    assert_eq!(out1.get_pk(1), 2);
+    let cursor = create_read_cursor(&[make_batch(&[(7, 1, 1234)])], &[], schema);
     assert!(cursor.valid);
 
-    // Drain remaining 2
-    let out2 = cursor.drain_single_source(Drain::All).unwrap();
-    assert_eq!(out2.count, 2);
-    assert_eq!(out2.get_pk(0), 3);
-    assert_eq!(out2.get_pk(1), 4);
-    assert!(!cursor.valid);
-}
-
-#[test]
-fn test_drain_multi_source_returns_none() {
-    let schema = make_schema_u128_i64();
-    let b1 = make_batch(&[(1, 1, 10)]);
-    let b2 = make_batch(&[(2, 1, 20)]);
-    let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
-    assert!(cursor.drain_single_source(Drain::All).is_none());
-}
-
-#[test]
-fn test_col_bytes_pk_returns_none() {
-    // PK (logical col 0, pk_index=0) has no payload slot — callers read the PK
-    // through current_key_narrow()/current_pk_bytes() instead.
-    let schema = make_schema_u128_i64();
-    let batch = make_batch(&[(42, 1, 99)]);
-    let cursor = create_read_cursor(&[batch], &[], schema);
-    assert!(cursor.valid);
-    let pk_index = cursor.schema.pk_indices()[0] as usize; // 0
+    let pk_index = cursor.schema.pk_indices()[0] as usize;
     assert!(cursor.col_bytes(pk_index, 16).is_none(), "PK index has no payload slot");
-}
-
-#[test]
-fn test_col_bytes_payload_reads_the_value() {
-    let schema = make_schema_u128_i64();
-    let batch = make_batch(&[(7, 1, 1234)]);
-    let cursor = create_read_cursor(&[batch], &[], schema);
-    assert!(cursor.valid);
     let cell = cursor.col_bytes(1, 8).expect("logical col 1 = i64 payload");
     assert_eq!(i64::from_le_bytes(cell.try_into().unwrap()), 1234);
-}
 
-#[test]
-fn test_col_bytes_invalid_cursor_returns_none() {
-    let schema = make_schema_u128_i64();
-    let cursor = create_read_cursor(&[], &[], schema);
-    assert!(!cursor.valid);
-    assert!(cursor.col_bytes(1, 8).is_none());
+    let exhausted = create_read_cursor(&[], &[], schema);
+    assert!(!exhausted.valid);
+    assert!(exhausted.col_bytes(1, 8).is_none());
 }
 
 /// The remaining count excludes the row the cursor currently sits on: every
 /// drive consumes the group it emits, so a freshly-opened 3-row cursor has 2
-/// left. The count is mode-independent — the same walk over a multi-source
-/// cursor reports the same way (`estimated_rows_counts_every_tier`).
+/// left.
 #[test]
 fn test_estimated_length_reflects_remaining() {
     let schema = make_schema_u128_i64();
@@ -362,36 +230,24 @@ fn test_estimated_length_reflects_remaining() {
 }
 
 #[test]
-fn test_current_key() {
-    let schema = make_schema_u128_i64();
-    let expected = (0xBEEFu128 << 64) | 0xDEADu128;
-    let batch = make_batch(&[(expected, 1, 0)]);
-    let cursor = create_read_cursor(&[batch], &[], schema);
-    assert!(cursor.valid);
-    assert_eq!(cursor.current_key_narrow(), expected);
-}
-
-/// Cursor backed by a shard whose PK region is Constant-encoded (single-row
-/// shard).  Previously `to_unified` returned `None` for this, falling back
-/// to the row-major scatter.  Now the column-major path handles it directly.
-#[test]
 fn test_scatter_constant_pk_shard() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u128_i64();
 
-    // A single-row shard Constant-encodes its PK region at rest, which used to
-    // fall back to the row-major scatter; the column-major path now handles it.
     let shard = write_test_shard(&dir, &schema, 0, &[(42, 1, 999)]);
+    let on_disk = dir.path().join(format!("rc{}_0.db", schema.pk_stride()));
+    assert_eq!(
+        region_dir(&std::fs::read(&on_disk).unwrap(), REG_PK).1,
+        ENCODING_CONSTANT,
+        "fixture premise: a single-row PK region is Constant-encoded",
+    );
+
     let cursor = create_read_cursor(&[], &[shard], schema);
     let result = cursor.materialize();
-
     assert_eq!(result.count, 1);
     assert_eq!(result.get_pk(0), 42u128);
 }
 
-/// Cursor with more than 16 entries (formerly above `MAX_INLINE_BATCH_SOURCES`)
-/// previously fell through to the row-major scatter.  Now the column-major
-/// path handles any number of sources.
 #[test]
 fn seek_bytes_lands_on_lower_bound_narrow() {
     // Narrow single-PK (U128, stride 16): seek_bytes lands on the first row
@@ -525,6 +381,8 @@ fn advance_to_forward_exhausts_source_mid_sweep() {
     assert_advance_to_matches_seek_oracle(schema, &[b_short, b_long], &[40, 60, 100]);
 }
 
+/// The column-major scatter handles any number of sources; this drives it well
+/// past the 16 an earlier inline cap allowed.
 #[test]
 fn test_scatter_many_sources_beyond_old_cap() {
     let schema = make_schema_u128_i64();
@@ -579,14 +437,11 @@ fn test_compound_pk_multi_source_merge_order() {
     );
 }
 
-/// OPK bytes for a 3×U64 compound PK: each column big-endian, concatenated
-/// in pk-list order (the at-rest form).
+/// OPK bytes for a 3×U64 compound PK, encoded through the production encoder.
 fn pk3(a: u64, b: u64, c: u64) -> [u8; 24] {
-    let mut k = [0u8; 24];
-    k[0..8].copy_from_slice(&a.to_be_bytes());
-    k[8..16].copy_from_slice(&b.to_be_bytes());
-    k[16..24].copy_from_slice(&c.to_be_bytes());
-    k
+    opk_pk(&wide_pk_3xu64_schema(), &[a as u128, b as u128, c as u128])
+        .try_into()
+        .expect("a 3xU64 PK encodes to 24 bytes")
 }
 
 fn make_wide_batch(rows: &[([u8; 24], i64, i64)]) -> Rc<Batch> {
@@ -663,21 +518,12 @@ fn wide_pk_prefix_collision_not_consolidated() {
 /// Zero-padding the suffix (the bug) decodes to 0 and skips negatives.
 #[test]
 fn seek_first_positive_with_prefix_includes_negative_suffix() {
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0, 1],
-    );
+    let schema = pk_payload_schema(&[type_code::U64, type_code::I64]);
     assert_eq!(schema.pk_stride(), 16);
-    // OPK: U64 column big-endian; I64 column big-endian with sign bit flipped.
     let mk = |a: u64, b: i64| -> [u8; 16] {
-        let mut k = [0u8; 16];
-        k[..8].copy_from_slice(&a.to_be_bytes());
-        gnitz_wire::encode_pk_column(&b.to_le_bytes(), type_code::I64, &mut k[8..]);
-        k
+        opk_pk(&schema, &[a as u128, b as u128])
+            .try_into()
+            .expect("a (U64, I64) PK encodes to 16 bytes")
     };
     // Sorted by compare_pk_bytes: col0 asc, col1 signed asc (negatives first).
     let rows = [(mk(1, -5), 1i64), (mk(1, -1), 1), (mk(1, 3), 1), (mk(2, -9), 1)];

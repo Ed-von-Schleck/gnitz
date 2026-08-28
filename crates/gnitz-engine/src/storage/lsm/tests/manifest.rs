@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::sweep_bit_flips;
 
 fn hdr(compact_seq: u64, checkpoint_gen: u64) -> ManifestHeader {
     ManifestHeader {
@@ -8,79 +9,54 @@ fn hdr(compact_seq: u64, checkpoint_gen: u64) -> ManifestHeader {
     }
 }
 
-#[test]
-fn parse_rejects_count_overflow() {
-    // A corrupt header whose count * ENTRY_SIZE overflows usize must be
-    // rejected, not wrap past the length check.
-    let mut buf = vec![0u8; HEADER_SIZE];
-    write_u64_le(&mut buf, 0, MAGIC);
-    write_u64_le(&mut buf, 8, VERSION);
-    write_u64_le(&mut buf, 16, u64::MAX); // count
-    let r = parse(&buf);
-    assert!(matches!(r, Err(StorageError::Truncated)));
-}
-
 fn make_entry(max_lsn: u64, name: &str) -> ManifestEntryRaw {
     ManifestEntryRaw::new(name, max_lsn, 1, 42)
 }
 
-#[test]
-fn old_version_rejected() {
-    // Any non-current version must be rejected outright — no legacy reader.
+/// A header-only buffer with `magic`, `version` and `count` written raw, so a
+/// case can forge any one of them.
+fn forged_header(magic: u64, version: u64, count: u64) -> Vec<u8> {
     let mut buf = vec![0u8; HEADER_SIZE];
-    write_u64_le(&mut buf, 0, MAGIC);
-    write_u64_le(&mut buf, 8, VERSION - 1);
-    write_u64_le(&mut buf, 16, 0);
-
-    assert_eq!(parse(&buf).unwrap_err(), StorageError::InvalidVersion);
+    write_u64_le(&mut buf, 0, magic);
+    write_u64_le(&mut buf, 8, version);
+    write_u64_le(&mut buf, 16, count);
+    buf
 }
 
 #[test]
-fn bad_magic() {
+fn parse_rejects_a_malformed_header() {
+    let cases: &[(&str, Vec<u8>, StorageError)] = &[
+        (
+            "bad magic",
+            forged_header(0xDEADBEEF, VERSION, 0),
+            StorageError::InvalidMagic,
+        ),
+        // Any non-current version is rejected outright — there is no legacy reader.
+        (
+            "old version",
+            forged_header(MAGIC, VERSION - 1, 0),
+            StorageError::InvalidVersion,
+        ),
+        // `count * ENTRY_SIZE` must not wrap past the length check.
+        (
+            "count overflow",
+            forged_header(MAGIC, VERSION, u64::MAX),
+            StorageError::Truncated,
+        ),
+        ("short buffer", vec![0u8; 10], StorageError::Truncated),
+    ];
+    for (name, buf, want) in cases {
+        assert_eq!(parse(buf).unwrap_err(), *want, "{name}");
+    }
+}
+
+#[test]
+fn serialize_rejects_a_buffer_that_cannot_hold_the_entries() {
     let mut buf = vec![0u8; HEADER_SIZE];
-    write_u64_le(&mut buf, 0, 0xDEADBEEF);
-
-    assert_eq!(parse(&buf).unwrap_err(), StorageError::InvalidMagic);
-}
-
-#[test]
-fn truncated() {
-    assert_eq!(parse(&[0u8; 10]).unwrap_err(), StorageError::Truncated);
-}
-
-#[test]
-fn buffer_too_small() {
-    let entries = vec![make_entry(1, "test.db")];
-    let mut buf = vec![0u8; 32]; // too small for header + entry
     assert_eq!(
-        serialize(&mut buf, &entries, hdr(0, 0)),
+        serialize(&mut buf, &[make_entry(1, "test.db")], hdr(0, 0)),
         Err(StorageError::BufferTooSmall)
     );
-}
-
-#[test]
-fn empty_manifest() {
-    let mut buf = vec![0u8; HEADER_SIZE];
-    let written = serialize(&mut buf, &[], hdr(42, 0)).unwrap();
-    assert_eq!(written, HEADER_SIZE);
-
-    let (out, header) = parse(&buf).unwrap();
-    assert!(out.is_empty());
-    assert_eq!(header.compact_seq, 42);
-}
-
-#[test]
-fn filename_null_terminated() {
-    let e = make_entry(1, "hello.db");
-    let mut buf = vec![0u8; serialized_size(1)];
-    serialize(&mut buf, &[e], hdr(0, 0)).unwrap();
-
-    let (out, _) = parse(&buf).unwrap();
-
-    // Extract filename
-    let end = out[0].filename.iter().position(|&b| b == 0).unwrap_or(128);
-    let name = std::str::from_utf8(&out[0].filename[..end]).unwrap();
-    assert_eq!(name, "hello.db");
 }
 
 // --- File I/O tests ---
@@ -96,30 +72,23 @@ fn write_manifest(path: &std::ffi::CStr, entries: &[ManifestEntryRaw], header: M
 #[test]
 fn write_read_file_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("MANIFEST");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    for count in [0usize, 3] {
+        let path = dir.path().join(format!("MANIFEST_{count}"));
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let entries: Vec<ManifestEntryRaw> = (0..count)
+            .map(|i| make_entry(i as u64 + 1, &format!("shard_{i}.db")))
+            .collect();
 
-    let entries = vec![
-        make_entry(1, "shard_1.db"),
-        make_entry(2, "shard_2.db"),
-        make_entry(3, "shard_3.db"),
-    ];
+        write_manifest(&cpath, &entries, hdr(5, 2));
+        assert!(path.exists());
 
-    write_manifest(&cpath, &entries, hdr(5, 2));
-    assert!(path.exists());
-
-    let (out, header) = read_file(&cpath).unwrap().unwrap();
-    assert_eq!(out.len(), 3);
-    assert_eq!(
-        header,
-        hdr(5, 2),
-        "header must round-trip through prepare_file/read_file"
-    );
-    assert_eq!(out[0].max_lsn, 1);
-    assert_eq!(out[1].max_lsn, 2);
-    assert_eq!(out[2].max_lsn, 3);
-    assert_eq!(out[0].level, 1);
-    assert_eq!(out[0].guard_key, 42);
+        let (out, header) = read_file(&cpath).unwrap().unwrap();
+        assert_eq!(header, hdr(5, 2), "count={count}");
+        assert_eq!(out.len(), count);
+        for (i, e) in out.iter().enumerate() {
+            assert_eq!((e.max_lsn, e.level, e.guard_key), (i as u64 + 1, 1, 42));
+        }
+    }
 }
 
 #[test]
@@ -132,19 +101,6 @@ fn read_file_nonexistent() {
         read_file(&cpath).unwrap().is_none(),
         "missing manifest file reads as the empty manifest"
     );
-}
-
-#[test]
-fn write_file_empty() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("MANIFEST_EMPTY");
-    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-
-    write_manifest(&cpath, &[], hdr(42, 0));
-
-    let (out, header) = read_file(&cpath).unwrap().unwrap();
-    assert!(out.is_empty());
-    assert_eq!(header.compact_seq, 42);
 }
 
 /// A serialized manifest for `count` entries, ready to forge against.
@@ -207,12 +163,15 @@ fn every_byte_past_the_count_field_is_inside_the_digest() {
     // other check, so the sweep is over every byte rather than a chosen few.
     // It starts past the count field, whose forgeries split between
     // `Truncated` and `ChecksumMismatch` and have their own tests above.
-    let base = serialized(3);
-    for off in OFF_COMPACT_SEQ..base.len() {
-        let mut buf = base.clone();
-        buf[off] ^= 0x01;
-        assert_eq!(parse(&buf).unwrap_err(), StorageError::ChecksumMismatch, "byte {off}");
-    }
+    let mut buf = serialized(3);
+    let span = OFF_COMPACT_SEQ..buf.len();
+    sweep_bit_flips(&mut buf, span, |byte, bit, buf| {
+        assert_eq!(
+            parse(buf).unwrap_err(),
+            StorageError::ChecksumMismatch,
+            "byte {byte} bit {bit}"
+        );
+    });
 }
 
 #[test]

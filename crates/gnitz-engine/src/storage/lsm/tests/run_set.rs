@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{make_batch, make_schema_u64_i64};
+use crate::test_support::{make_batch, make_batch_raw, make_schema_u64_i64};
 
 fn push(set: &mut RunSet, schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) {
     set.push(Rc::new(make_batch(schema, rows)), schema);
@@ -45,6 +45,9 @@ fn empty_and_fully_cancelled_sets_fold_to_none() {
     let mut set = RunSet::new(1 << 20);
     assert!(set.fold_to_single(&schema).is_none(), "empty set");
 
+    set.push(Rc::new(make_batch(&schema, &[])), &schema);
+    assert!(set.is_empty(), "a 0-row push stores no run");
+
     push(&mut set, &schema, &[(1, 1, 10)]);
     push(&mut set, &schema, &[(1, -1, 10)]);
     assert!(set.fold_to_single(&schema).is_none(), "fully cancelled set");
@@ -65,14 +68,6 @@ fn push_folds_at_the_threshold() {
     push(&mut set, &schema, &[(FOLD_THRESHOLD as u64, 1, 1600)]);
     assert_eq!(set.len(), 1, "the threshold push folds");
     assert_eq!(set.row_count(), FOLD_THRESHOLD);
-}
-
-#[test]
-fn empty_runs_are_never_stored() {
-    let schema = make_schema_u64_i64();
-    let mut set = RunSet::new(1 << 20);
-    set.push(Rc::new(make_batch(&schema, &[])), &schema);
-    assert!(set.is_empty());
 }
 
 /// The bloom answers for every live PK, is maintained across pushes once
@@ -113,15 +108,7 @@ fn handed_out_runs_survive_clear() {
 
 /// A 2-row batch with descending PKs — not `(PK, payload)`-sorted.
 fn desc_two_row_batch(schema: &SchemaDescriptor) -> Batch {
-    let mut b = Batch::with_capacity(*schema, 2);
-    for &(pk, val) in &[(20u128, 200i64), (10, 100)] {
-        b.extend_pk(pk);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
-    }
-    b
+    make_batch_raw(schema, &[(20, 1, 200), (10, 1, 100)])
 }
 
 /// A run that lies about being consolidated is rejected on the way in.

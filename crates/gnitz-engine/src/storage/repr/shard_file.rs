@@ -374,8 +374,7 @@ impl ShardWriteOpts {
 /// The single-payload-column test shard writer: build a `Batch` through the typed
 /// row API and hand it to the production [`Batch::write_as_shard`], so region
 /// *order* has a single owner. Rows are `(opk_bytes, weight, i64_payload)`.
-/// Compaction's `write_test_shard` is the N-payload-column twin — a different row
-/// shape, not a second spelling of this one.
+/// A test needing several payload columns builds its own `Batch` instead.
 #[cfg(test)]
 pub(in crate::storage) fn write_test_shard(
     path: &std::path::Path,

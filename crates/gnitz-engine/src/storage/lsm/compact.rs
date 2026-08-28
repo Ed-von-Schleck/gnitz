@@ -26,15 +26,6 @@ pub(super) fn open_shards(input_files: &[&CStr], schema: &SchemaDescriptor) -> R
     input_files.iter().map(|f| MappedShard::open(f, schema, true)).collect()
 }
 
-/// Guard owning `key` (see [`super::guard_slot`]). Test-only: the
-/// production split is [`merge_and_route`]'s per-guard `partition_point` over the
-/// sorted survivor buffer, and the differential oracles route row-at-a-time
-/// through this instead so the two derivations stay independent.
-#[cfg(test)]
-pub(super) fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
-    crate::storage::lsm::guard_slot(guard_keys, key, |&g| g)
-}
-
 /// The PK-only projection of `schema`: the same PK columns in the same PK-list
 /// order — hence the same `pk_stride` and the same OPK bytes — and no payload.
 /// A skeleton shard is serialized under this, so its regions are
@@ -207,18 +198,6 @@ pub(super) fn merge_and_route(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-/// A probed store's `Output` — the shape every test here compacts into.
-#[cfg(test)]
-fn out(dir: &str, table_id: u32, level_num: u32, compact_seq: u64) -> Output<'_> {
-    Output {
-        dir,
-        table_id,
-        level_num,
-        compact_seq,
-        skip_pk_filter: false,
-    }
-}
 
 #[cfg(test)]
 #[path = "tests/compact.rs"]

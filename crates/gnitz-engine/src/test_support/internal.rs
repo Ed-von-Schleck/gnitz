@@ -185,13 +185,7 @@ pub fn read_german_string(batch: &Batch, col: usize, row: usize) -> Vec<u8> {
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
 /// key (negatives sort before positives only because the encoder sign-flips).
 pub fn make_schema_i64pk_i64() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
+    pk_i64_schema(type_code::I64)
 }
 
 /// Build a sorted, consolidated batch with an I64 PK and a single I64 payload

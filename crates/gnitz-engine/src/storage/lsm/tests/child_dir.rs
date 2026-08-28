@@ -48,7 +48,8 @@ fn parse_rejects_names_in_no_grammar() {
 /// carry no generation, and so invalidate its view on every boot.
 #[test]
 fn state_children_are_the_output_stores_and_the_scratch() {
-    let dir = crate::test_support::scratch_dir("child_dir", "state_children");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap().to_string();
     for name in [
         "w0of2",
         "w1of2",
@@ -73,18 +74,14 @@ fn state_children_are_the_output_stores_and_the_scratch() {
         .collect();
     got.sort();
     assert_eq!(got, ["scratch_agg_w0", "scratch_agg_w1", "w0of2", "w1of2"]);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An output store's manifest is enumerated whether or not its directory is
 /// there — an absent one must read as a mismatch, not vanish from the verdict.
 #[test]
 fn state_children_name_every_launched_rank_on_an_empty_directory() {
-    let dir = crate::test_support::scratch_dir("child_dir", "state_children_empty");
-    std::fs::create_dir_all(&dir).unwrap();
-    assert_eq!(state_child_manifests(&dir, 3).len(), 3);
-    let _ = std::fs::remove_dir_all(&dir);
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(state_child_manifests(tmp.path().to_str().unwrap(), 3).len(), 3);
 }
 
 #[test]

@@ -128,7 +128,8 @@ const FLSM_LEVELS: usize = MAX_LEVELS - 1;
 /// Index of the deepest guarded level (L2). The one level whose guards fold to a
 /// single file, and the only one whose guards may be dehydrated.
 const TERMINAL_LEVEL_IDX: usize = FLSM_LEVELS - 1;
-const L0_COMPACT_THRESHOLD: usize = 4;
+/// L0 shards past this count trigger the fold into L1.
+pub(super) const L0_COMPACT_THRESHOLD: usize = 4;
 const GUARD_FILE_THRESHOLD: usize = 4;
 const LMAX_FILE_THRESHOLD: usize = 1;
 /// Floor under every guard byte target. It bounds the guard *count*: a store

@@ -1,46 +1,46 @@
 use super::super::batch::{Batch, REG_PAYLOAD_START};
+use super::super::guard_slot;
 use super::super::layout::{ENCODING_FOR, ENCODING_RAW};
 use super::super::merge::{run_merge, BlobCacheGuard};
-use super::super::shard_file::{region_dir, ShardWriteOpts};
+use super::super::naming;
+use super::super::shard_file::{self, region_dir, ShardWriteOpts};
 use super::super::shard_reader::MappedShard;
 use super::*;
 use crate::schema::key::pack_pk_be;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::test_support::make_schema_u64_i64;
-use gnitz_wire::{read_i64_le, read_u32_le};
+use crate::test_support::{make_schema_u64_i64, opk_pk, pk_payload_schema};
+use gnitz_wire::read_i64_le;
 use std::ffi::CStr;
 use std::fs;
 use type_code::{I64 as TYPE_I64, STRING as TYPE_STRING, U64 as TYPE_U64};
 
-fn is_null(shard: &MappedShard, row: usize, col_idx: usize, schema: &SchemaDescriptor) -> bool {
-    let null_word = shard.get_null_word(row);
-    let pi = schema
-        .try_payload_idx(col_idx)
-        .expect("is_null test helper: col_idx is a payload column");
-    gnitz_wire::null_word_get(null_word, pi)
+/// A probed store's `Output` — the shape every test here compacts into.
+fn out(dir: &str, table_id: u32, level_num: u32, compact_seq: u64) -> Output<'_> {
+    Output {
+        dir,
+        table_id,
+        level_num,
+        compact_seq,
+        skip_pk_filter: false,
+    }
 }
 
-// Helper: build a minimal shard file in memory and write to disk
-fn write_test_shard(path: &str, pks: &[u64], weights: &[i64], schema: &SchemaDescriptor) {
-    let mut batch = Batch::with_capacity(*schema, pks.len());
-
-    for i in 0..pks.len() {
-        batch.extend_pk(pks[i] as u128);
-        batch.extend_weight(&weights[i].to_le_bytes());
-        batch.extend_null_bmp(&0u64.to_le_bytes());
-
-        for (pi, col) in schema.payload_columns() {
-            let cs = col.size() as usize;
-            let mut val_bytes = vec![0u8; cs];
-            let copy_len = cs.min(8);
-            val_bytes[..copy_len].copy_from_slice(&pks[i].to_le_bytes()[..copy_len]);
-            batch.extend_col(pi, &val_bytes);
-        }
-        batch.count += 1;
-    }
-
-    let cpath = std::ffi::CString::new(path).unwrap();
-    batch.write_as_shard(&cpath, schema, ShardWriteOpts::default()).unwrap();
+/// A one-payload-column shard of `pks` at `weights` (payload = pk), written to
+/// `dir/name`. Returns the path, so a caller can hand it straight to
+/// `compact_one` without restating it as a `CString`.
+fn write_shard(
+    dir: &std::path::Path,
+    name: &str,
+    pks: &[u64],
+    weights: &[i64],
+    schema: &SchemaDescriptor,
+) -> std::ffi::CString {
+    let rows: Vec<(Vec<u8>, i64, i64)> = pks
+        .iter()
+        .zip(weights)
+        .map(|(&p, &w)| (opk_pk(schema, &[p as u128]), w, p as i64))
+        .collect();
+    shard_file::write_test_shard(&dir.join(name), schema, &rows, ShardWriteOpts::default())
 }
 
 /// Single-guard compaction of `inputs` into `dir`. Returns the output
@@ -51,13 +51,7 @@ fn compact_one_opt(
     schema: &SchemaDescriptor,
     seq: u64,
 ) -> Option<std::ffi::CString> {
-    let outs = merge_and_route(
-        inputs,
-        &[(0, false)],
-        schema,
-        super::out(dir.to_str().unwrap(), 0, 1, seq),
-    )
-    .unwrap();
+    let outs = merge_and_route(inputs, &[(0, false)], schema, out(dir.to_str().unwrap(), 0, 1, seq)).unwrap();
     outs.first().map(|(_, p)| std::ffi::CString::new(p.as_str()).unwrap())
 }
 
@@ -81,22 +75,18 @@ fn compaction_packs_eligible_int_payload() {
 
     // Two raw L0-style inputs (write_test_shard → pack_ints = false). Payload
     // == PK, a narrow range that FoR packs once merged.
-    let s1 = dir.join("s1.db");
-    let s2 = dir.join("s2.db");
     let pks1: Vec<u64> = (0..300).map(|i| i * 2).collect(); // evens
     let pks2: Vec<u64> = (0..300).map(|i| i * 2 + 1).collect(); // odds
-    write_test_shard(s1.to_str().unwrap(), &pks1, &vec![1i64; 300], &schema);
-    write_test_shard(s2.to_str().unwrap(), &pks2, &vec![1i64; 300], &schema);
+    let cs1 = write_shard(&dir, "s1.db", &pks1, &vec![1i64; 300], &schema);
+    let cs2 = write_shard(&dir, "s2.db", &pks2, &vec![1i64; 300], &schema);
     // L0 spill inputs stay Raw (policy: only compaction packs).
     assert_eq!(
-        payload_encoding(s1.to_str().unwrap()),
+        payload_encoding(cs1.to_str().unwrap()),
         ENCODING_RAW,
         "L0 input stays raw"
     );
-    assert_eq!(payload_encoding(s2.to_str().unwrap()), ENCODING_RAW);
+    assert_eq!(payload_encoding(cs2.to_str().unwrap()), ENCODING_RAW);
 
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
     let cout = compact_one(&dir, &[cs1.as_c_str(), cs2.as_c_str()], &schema, 1);
 
     // Compaction output packs the eligible payload.
@@ -136,137 +126,91 @@ fn compaction_packs_eligible_int_payload() {
     }
 }
 
+/// Compaction over a whole input set: the survivors are the net-nonzero rows in
+/// ascending PK order, and an input set that cancels completely writes no shard
+/// at all rather than an empty one the caller would have to register. Every
+/// case reads its output back with checksum validation on.
 #[test]
-fn test_compact_basic() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
+fn compaction_merges_inputs_and_drops_cancelled_rows() {
+    /// One input shard: its pks and their weights.
+    type Shard = (Vec<u64>, Vec<i64>);
+    /// A name, the input shards, and the surviving pks — `None` when the
+    /// compaction writes no shard at all.
+    type Case = (&'static str, Vec<Shard>, Option<Vec<u64>>);
+    let cases: Vec<Case> = vec![
+        ("no inputs", vec![], None),
+        (
+            "single shard",
+            vec![(vec![10, 20, 30], vec![1; 3])],
+            Some(vec![10, 20, 30]),
+        ),
+        (
+            "two interleaved shards",
+            vec![(vec![1, 3, 5], vec![1; 3]), (vec![2, 4, 6], vec![1; 3])],
+            Some(vec![1, 2, 3, 4, 5, 6]),
+        ),
+        (
+            "one key cancels",
+            vec![(vec![1, 2, 3], vec![1; 3]), (vec![2], vec![-1])],
+            Some(vec![1, 3]),
+        ),
+        (
+            "every key cancels",
+            vec![(vec![1, 2, 3], vec![1; 3]), (vec![1, 2, 3], vec![-1; 3])],
+            None,
+        ),
+        (
+            "a thousand rows over two shards",
+            vec![
+                ((0..500).map(|i| i * 2 + 1).collect(), vec![1; 500]),
+                ((1..=500).map(|i| i * 2).collect(), vec![1; 500]),
+            ],
+            Some((1..=1000).collect()),
+        ),
+    ];
 
     let schema = make_schema_u64_i64();
+    for (name, shards, want) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let paths: Vec<std::ffi::CString> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, (pks, ws))| write_shard(&dir, &format!("s{i}.db"), pks, ws, &schema))
+            .collect();
+        let inputs: Vec<&CStr> = paths.iter().map(|p| p.as_c_str()).collect();
 
-    // Shard 1: keys 1, 3, 5
-    let s1 = dir.join("s1.db");
-    write_test_shard(s1.to_str().unwrap(), &[1, 3, 5], &[1, 1, 1], &schema);
-
-    // Shard 2: keys 2, 4, 6
-    let s2 = dir.join("s2.db");
-    write_test_shard(s2.to_str().unwrap(), &[2, 4, 6], &[1, 1, 1], &schema);
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-    let cout = compact_one(&dir, &inputs, &schema, 1);
-
-    // Read back merged shard
-    let merged = MappedShard::open(&cout, &schema, false).unwrap();
-    assert_eq!(merged.count, 6);
-
-    // Verify sorted order
-    let mut prev = 0u128;
-    for i in 0..merged.count {
-        let pk = merged.get_pk(i);
-        assert!(pk > prev, "not sorted at row {i}: {pk} <= {prev}");
-        prev = pk;
+        match (compact_one_opt(&dir, &inputs, &schema, 1), want) {
+            (None, None) => {}
+            (Some(cout), Some(want)) => {
+                let merged = MappedShard::open(&cout, &schema, true).unwrap();
+                let got: Vec<u64> = (0..merged.count).map(|i| merged.get_pk(i) as u64).collect();
+                assert_eq!(got, want, "{name}");
+            }
+            (got, want) => panic!("{name}: wrote a shard = {}, wanted {}", got.is_some(), want.is_some()),
+        }
     }
 }
 
+/// Guard routing is a saturating slot lookup: slot 0 owns every key below the
+/// first guard key, and the last guard owns everything above it.
 #[test]
-fn test_compact_weight_elimination() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    let schema = make_schema_u64_i64();
-
-    // Shard 1: insert keys 1, 2, 3
-    let s1 = dir.join("s1.db");
-    write_test_shard(s1.to_str().unwrap(), &[1, 2, 3], &[1, 1, 1], &schema);
-
-    // Shard 2: delete key 2 (weight = -1)
-    let s2 = dir.join("s2.db");
-    write_test_shard(s2.to_str().unwrap(), &[2], &[-1], &schema);
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-    let cout = compact_one(&dir, &inputs, &schema, 1);
-
-    // Key 2 should be eliminated (net weight = 0)
-    let merged = MappedShard::open(&cout, &schema, false).unwrap();
-    assert_eq!(merged.count, 2);
-    assert_eq!(merged.get_pk(0), 1);
-    assert_eq!(merged.get_pk(1), 3);
-}
-
-#[test]
-fn test_compact_single_shard() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    let schema = make_schema_u64_i64();
-    let s1 = dir.join("s1.db");
-    write_test_shard(s1.to_str().unwrap(), &[10, 20, 30], &[1, 1, 1], &schema);
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let inputs = [cs1.as_c_str()];
-    let cout = compact_one(&dir, &inputs, &schema, 1);
-
-    let merged = MappedShard::open(&cout, &schema, false).unwrap();
-    assert_eq!(merged.count, 3);
-}
-
-#[test]
-fn test_guard_routing() {
-    assert_eq!(find_guard_for_key(&[0, 100, 200], 50), 0);
-    assert_eq!(find_guard_for_key(&[0, 100, 200], 100), 1);
-    assert_eq!(find_guard_for_key(&[0, 100, 200], 150), 1);
-    assert_eq!(find_guard_for_key(&[0, 100, 200], 200), 2);
-    assert_eq!(find_guard_for_key(&[0, 100, 200], 999), 2);
-}
-
-#[test]
-fn test_guard_routing_empty() {
-    assert_eq!(find_guard_for_key(&[] as &[u128], 42), 0);
-}
-
-#[test]
-fn test_guard_routing_single() {
-    assert_eq!(find_guard_for_key(&[0u128], 0), 0);
-    assert_eq!(find_guard_for_key(&[0u128], 999), 0);
-}
-
-/// A guard with no survivors writes no shard, so the caller never registers
-/// an empty file.
-#[test]
-fn test_compact_empty_input() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    let schema = make_schema_u64_i64();
-    let inputs: [&CStr; 0] = [];
-    assert!(compact_one_opt(&dir, &inputs, &schema, 1).is_none());
-}
-
-#[test]
-fn test_compact_all_cancel() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    let schema = make_schema_u64_i64();
-
-    // Shard 1: insert keys 1, 2, 3
-    let s1 = dir.join("s1.db");
-    write_test_shard(s1.to_str().unwrap(), &[1, 2, 3], &[1, 1, 1], &schema);
-
-    // Shard 2: delete all
-    let s2 = dir.join("s2.db");
-    write_test_shard(s2.to_str().unwrap(), &[1, 2, 3], &[-1, -1, -1], &schema);
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-    assert!(
-        compact_one_opt(&dir, &inputs, &schema, 1).is_none(),
-        "every row cancelled, so no shard is written"
-    );
+fn guard_slot_saturates_at_both_ends() {
+    let cases: &[(&[u128], u128, usize)] = &[
+        (&[], 42, 0),
+        (&[0], 0, 0),
+        (&[0], 999, 0),
+        (&[0, 100, 200], 50, 0),
+        (&[0, 100, 200], 100, 1),
+        (&[0, 100, 200], 150, 1),
+        (&[0, 100, 200], 200, 2),
+        (&[0, 100, 200], 999, 2),
+        // Slot 0 owns keys below the first guard key, which is not always 0.
+        (&[200, 400], 50, 0),
+    ];
+    for &(guards, key, want) in cases {
+        assert_eq!(guard_slot(guards, key, |&g| g), want, "guards={guards:?} key={key}");
+    }
 }
 
 #[test]
@@ -277,7 +221,7 @@ fn test_merge_and_route_rejects_empty_guards() {
     // loudly up front.
     let schema = make_schema_u64_i64();
     let guards: [(u128, bool); 0] = [];
-    let _ = merge_and_route(&[], &guards, &schema, super::out("/tmp", 0, 1, 0));
+    let _ = merge_and_route(&[], &guards, &schema, out("/tmp", 0, 1, 0));
 }
 
 #[test]
@@ -288,10 +232,7 @@ fn test_merge_and_route_basic() {
     let schema = make_schema_u64_i64();
 
     // Shard with keys 10, 50, 150, 250
-    let s1 = dir.join("s1.db");
-    write_test_shard(s1.to_str().unwrap(), &[10, 50, 150, 250], &[1, 1, 1, 1], &schema);
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+    let cs1 = write_shard(&dir, "s1.db", &[10, 50, 150, 250], &[1, 1, 1, 1], &schema);
     let inputs = [cs1.as_c_str()];
 
     // Two guards: [0, 100)  and [100, ∞). Guard keys live in the same
@@ -301,8 +242,7 @@ fn test_merge_and_route_basic() {
         (pack_pk_be(&0u64.to_be_bytes()), false),
         (pack_pk_be(&100u64.to_be_bytes()), false),
     ];
-    let guard_outputs =
-        merge_and_route(&inputs, &guards, &schema, super::out(dir.to_str().unwrap(), 0, 1, 99)).unwrap();
+    let guard_outputs = merge_and_route(&inputs, &guards, &schema, out(dir.to_str().unwrap(), 0, 1, 99)).unwrap();
     assert_eq!(guard_outputs.len(), 2); // both guards should have rows
 
     // Guard 0 should have keys 10, 50
@@ -327,119 +267,22 @@ fn test_merge_and_route_cleanup_on_partial_finalize_failure() {
 
     let schema = make_schema_u64_i64();
 
-    let s1 = dir.join("in1.db");
-    let s2 = dir.join("in2.db");
-    write_test_shard(s1.to_str().unwrap(), &[10, 50], &[1, 1], &schema);
-    write_test_shard(s2.to_str().unwrap(), &[150, 250], &[1, 1], &schema);
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+    let cs1 = write_shard(&dir, "in1.db", &[10, 50], &[1, 1], &schema);
+    let cs2 = write_shard(&dir, "in2.db", &[150, 250], &[1, 1], &schema);
     let inputs = [cs1.as_c_str(), cs2.as_c_str()];
     let guards: [(u128, bool); 2] = [(0, false), (100, false)];
 
     // table_id=0, level_num=1, compact_seq=99, guard keys {0,100} → the second
     // output is shard_0_99_L1_G100.db (named by guard key, not loop index).
     // Block it with a directory so finalize fails for that guard.
-    let blocker = dir.join("shard_0_99_L1_G100.db");
+    let blocker = dir.join(naming::compact_shard_name(0, 99, 1, 100));
     fs::create_dir_all(&blocker).unwrap();
 
-    let rc = merge_and_route(&inputs, &guards, &schema, super::out(dir.to_str().unwrap(), 0, 1, 99));
+    let rc = merge_and_route(&inputs, &guards, &schema, out(dir.to_str().unwrap(), 0, 1, 99));
 
     assert!(rc.is_err(), "expected failure, got {rc:?}");
-    let guard0_file = dir.join("shard_0_99_L1_G0.db");
+    let guard0_file = dir.join(naming::compact_shard_name(0, 99, 1, 0));
     assert!(!guard0_file.exists(), "guard 0 output should have been cleaned up");
-}
-
-#[test]
-fn test_compact_string_column() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    // Schema: u64 PK + STRING payload
-    let schema = SchemaDescriptor::new(
-        &[SchemaColumn::new(TYPE_U64, 0), SchemaColumn::new(TYPE_STRING, 0)],
-        &[0],
-    );
-
-    // Build shard with short strings
-    let mut batch = Batch::with_capacity(schema, 3);
-    for pk in [1u64, 2, 3] {
-        batch.extend_pk(pk as u128);
-        batch.extend_weight(&1i64.to_le_bytes());
-        batch.extend_null_bmp(&0u64.to_le_bytes());
-
-        let str_struct = gnitz_wire::encode_german_string(b"hi", &mut batch.blob);
-        batch.extend_col(0, &str_struct);
-        batch.count += 1;
-    }
-    let s1 = dir.join("s1.db");
-    let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    batch
-        .write_as_shard(&cpath, &schema, ShardWriteOpts::default())
-        .unwrap();
-
-    // Compact it (single shard, should roundtrip)
-    let inputs = [cpath.as_c_str()];
-    let cout = compact_one(&dir, &inputs, &schema, 1);
-
-    let merged = MappedShard::open(&cout, &schema, false).unwrap();
-    assert_eq!(merged.count, 3);
-
-    // Verify string data survived
-    for row in 0..3 {
-        let col_data = merged.get_col_ptr(row, 0, 16);
-        let str_len = read_u32_le(col_data, 0);
-        assert_eq!(str_len, 2);
-        assert_eq!(col_data[4], b'h');
-        assert_eq!(col_data[5], b'i');
-    }
-}
-
-#[test]
-fn test_compact_nullable_column() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    // Schema: u64 PK + nullable i64 payload
-    let schema = SchemaDescriptor::new(&[SchemaColumn::new(TYPE_U64, 0), SchemaColumn::new(TYPE_I64, 1)], &[0]);
-
-    // Build shard: key 1 = non-null (42), key 2 = null
-    let mut batch = Batch::with_capacity(schema, 2);
-    // Row 1: non-null
-    batch.extend_pk(1u128);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes()); // no nulls
-    batch.extend_col(0, &42i64.to_le_bytes());
-    batch.count += 1;
-
-    // Row 2: null column
-    batch.extend_pk(2u128);
-    batch.extend_weight(&1i64.to_le_bytes());
-    // null bit for col_idx=1, pk_index=0 → payload_idx = 0 → bit 0
-    batch.extend_null_bmp(&1u64.to_le_bytes());
-    batch.extend_col(0, &0i64.to_le_bytes());
-    batch.count += 1;
-
-    let s1 = dir.join("s1.db");
-    let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    batch
-        .write_as_shard(&cpath, &schema, ShardWriteOpts::default())
-        .unwrap();
-
-    // Compact
-    let inputs = [cpath.as_c_str()];
-    let cout = compact_one(&dir, &inputs, &schema, 1);
-
-    let merged = MappedShard::open(&cout, &schema, false).unwrap();
-    assert_eq!(merged.count, 2);
-
-    // Row 0: not null
-    assert!(!is_null(&merged, 0, 1, &schema));
-    let val = read_i64_le(merged.get_col_ptr(0, 0, 8), 0);
-    assert_eq!(val, 42);
-
-    // Row 1: null
-    assert!(is_null(&merged, 1, 1, &schema));
 }
 
 // -- 3-column helpers for reduce-output-pattern tests --------------------
@@ -650,99 +493,6 @@ fn test_compact_10_tick_reduce_single_group() {
     assert_eq!(rows[0], (1, 1, 0, 50000), "expected final sum=50000");
 }
 
-/// merge_and_route with same-PK-different-payload entries: verifies the
-/// fix applies to the guard-routed path too (shares open_and_merge).
-#[test]
-fn test_merge_and_route_same_pk_different_payload() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    let schema = make_3col_schema();
-
-    let s1 = dir.join("s1.db");
-    write_3col_shard(s1.to_str().unwrap(), &[(10, 1, 0, 100), (20, 1, 1, 200)], &schema);
-
-    let s2 = dir.join("s2.db");
-    write_3col_shard(
-        s2.to_str().unwrap(),
-        &[(10, -1, 0, 100), (10, 1, 0, 300), (20, -1, 1, 200), (20, 1, 1, 400)],
-        &schema,
-    );
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-
-    let guards = [(0u128, false)]; // single guard
-    let guard_outputs =
-        merge_and_route(&inputs, &guards, &schema, super::out(dir.to_str().unwrap(), 99, 1, 1)).unwrap();
-    assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
-
-    let rows = read_3col_shard(&guard_outputs[0].1, &schema);
-    assert_eq!(rows.len(), 2, "expected 2 rows, got {rows:?}");
-    assert_eq!(rows[0], (10, 1, 0, 300));
-    assert_eq!(rows[1], (20, 1, 1, 400));
-}
-
-/// Valid data must survive compaction's checksum validation.
-#[test]
-fn test_compact_with_checksums_enabled() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    let schema = make_schema_u64_i64();
-
-    let s1 = dir.join("s1.db");
-    write_test_shard(s1.to_str().unwrap(), &[1, 3, 5], &[1, 1, 1], &schema);
-    let s2 = dir.join("s2.db");
-    write_test_shard(s2.to_str().unwrap(), &[2, 4, 6], &[1, 1, 1], &schema);
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-    let cout = compact_one(&dir, &inputs, &schema, 1);
-
-    let merged = MappedShard::open(&cout, &schema, true).unwrap();
-    assert_eq!(merged.count, 6);
-}
-
-/// 10K+ rows across two shards, exercising the streaming write path.
-#[test]
-fn test_compact_large_dataset() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    let schema = make_schema_u64_i64();
-
-    // Shard 1: odd keys 1..9999
-    let pks1: Vec<u64> = (0..5000).map(|i| i * 2 + 1).collect();
-    let weights1 = vec![1i64; 5000];
-    let s1 = dir.join("s1.db");
-    write_test_shard(s1.to_str().unwrap(), &pks1, &weights1, &schema);
-
-    // Shard 2: even keys 2..10000
-    let pks2: Vec<u64> = (1..=5000).map(|i| i * 2).collect();
-    let weights2 = vec![1i64; 5000];
-    let s2 = dir.join("s2.db");
-    write_test_shard(s2.to_str().unwrap(), &pks2, &weights2, &schema);
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-    let cout = compact_one(&dir, &inputs, &schema, 1);
-
-    let merged = MappedShard::open(&cout, &schema, true).unwrap();
-    assert_eq!(merged.count, 10000);
-
-    // Verify sorted order
-    let mut prev = 0u128;
-    for i in 0..merged.count {
-        let pk = merged.get_pk(i);
-        assert!(pk > prev, "not sorted at row {i}: {pk} <= {prev}");
-        prev = pk;
-    }
-}
-
 /// Keys below the only guard key must still route to it and stay readable.
 #[test]
 fn test_merge_and_route_keys_below_first_guard() {
@@ -752,15 +502,11 @@ fn test_merge_and_route_keys_below_first_guard() {
     let schema = make_schema_u64_i64();
 
     // Shard with keys 50, 100, 150, 250 — two are below guard key 200
-    let s1 = dir.join("s1.db");
-    write_test_shard(s1.to_str().unwrap(), &[50, 100, 150, 250], &[1, 1, 1, 1], &schema);
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+    let cs1 = write_shard(&dir, "s1.db", &[50, 100, 150, 250], &[1, 1, 1, 1], &schema);
     let inputs = [cs1.as_c_str()];
 
     let guards = [(200u128, false)]; // single guard at key 200
-    let guard_outputs =
-        merge_and_route(&inputs, &guards, &schema, super::out(dir.to_str().unwrap(), 42, 2, 1)).unwrap();
+    let guard_outputs = merge_and_route(&inputs, &guards, &schema, out(dir.to_str().unwrap(), 42, 2, 1)).unwrap();
     assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
 
     let cpath = std::ffi::CString::new(guard_outputs[0].1.as_str()).unwrap();
@@ -779,24 +525,6 @@ fn test_merge_and_route_keys_below_first_guard() {
 
 // -- Wide / compound / signed PK compaction (OPK ordering) ---------------
 
-/// Write a shard from explicit raw-PK-byte rows. `rows` is
-/// `(pk_bytes, weight, payload_i64_vals)`; rows must already be in
-/// `compare_pk_bytes` order (compaction assumes sorted inputs).
-fn write_bytes_pk_shard(path: &str, schema: &SchemaDescriptor, rows: &[(Vec<u8>, i64, Vec<i64>)]) {
-    let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
-    for (pk, w, vals) in rows {
-        batch.extend_pk_bytes(pk);
-        batch.extend_weight(&w.to_le_bytes());
-        batch.extend_null_bmp(&0u64.to_le_bytes());
-        for (pi, v) in vals.iter().enumerate() {
-            batch.extend_col(pi, &v.to_le_bytes());
-        }
-        batch.count += 1;
-    }
-    let cpath = std::ffi::CString::new(path).unwrap();
-    batch.write_as_shard(&cpath, schema, ShardWriteOpts::default()).unwrap();
-}
-
 fn assert_compare_pk_bytes_sorted(shard: &MappedShard) {
     for i in 1..shard.count {
         assert_ne!(
@@ -807,159 +535,110 @@ fn assert_compare_pk_bytes_sorted(shard: &MappedShard) {
     }
 }
 
-/// OPK bytes for a `(U64, U64)` compound PK: each column big-endian.
-fn pk2(a: u64, b: u64) -> Vec<u8> {
-    let mut v = a.to_be_bytes().to_vec();
-    v.extend_from_slice(&b.to_be_bytes());
-    v
-}
-
-/// Regression: a narrow compound `(U64, U64)` PK whose raw-LE u128
-/// order diverges from `compare_pk_bytes`. The input shards are physically
-/// written in compound (OPK) order; an N-way merge that compared raw-LE u128
-/// instead would produce mis-ordered output plus missed cross-shard
-/// consolidation.
+/// On the PK axis compaction is type-blind: it orders and folds on OPK bytes at
+/// whatever stride the schema gives it. Each case is a PK shape whose OPK order
+/// diverges from a raw little-endian `u128` compare of the same region — a
+/// compound key the second column reorders, a signed key whose negatives sort
+/// first, a wide key that collides on its leading 16 bytes, and narrow and
+/// mixed-width keys whose strides are not 8 or 16. A merge comparing raw LE
+/// would mis-order the output and miss the cross-shard fold.
 #[test]
-fn test_compact_narrow_compound_opk_order() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
+fn compaction_orders_and_folds_on_opk_bytes_at_every_pk_shape() {
+    // Native PK column values per row, with the row's weight and payload.
+    type Row = (Vec<u128>, i64, i64);
+    struct Case {
+        name: &'static str,
+        pk_types: &'static [u8],
+        stride: u8,
+        shards: Vec<Vec<Row>>,
+        /// Surviving rows' PK column values, in the order they must come back.
+        want: Vec<Vec<u128>>,
+    }
 
-    // (U64, U64) PK + I64 payload.
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TYPE_U64, 0),
-            SchemaColumn::new(TYPE_U64, 0),
-            SchemaColumn::new(TYPE_I64, 0),
-        ],
-        &[0, 1],
-    );
-    // Raw-LE u128 of these concatenations is scrambled vs compound order:
-    // (3,0)=3 < (2,3) < (1,5) < (1,9) — yet compound order is
-    // (1,5) < (1,9) < (2,3) < (3,0).
-    assert!(pk2(1, 5) < pk2(1, 9)); // byte-lex sanity for col0==1
+    let neg = |v: i64| v as u128;
+    let cases = vec![
+        Case {
+            // Raw-LE order of these concatenations is (3,0) < (2,3) < (1,5) < (1,9);
+            // compound order is (1,5) < (1,9) < (2,3) < (3,0). The (2,3) pair
+            // cancels, which needs both entries adjacent at the heap root.
+            name: "compound (U64, U64)",
+            pk_types: &[TYPE_U64, TYPE_U64],
+            stride: 16,
+            shards: vec![
+                vec![(vec![1, 5], 1, 10), (vec![2, 3], 1, 30)],
+                vec![(vec![1, 9], 1, 20), (vec![2, 3], -1, 30), (vec![3, 0], 1, 40)],
+            ],
+            want: vec![vec![1, 5], vec![1, 9], vec![3, 0]],
+        },
+        Case {
+            // Negatives sort last under raw LE (zero-extended), first under OPK.
+            name: "signed I64",
+            pk_types: &[TYPE_I64],
+            stride: 8,
+            shards: vec![
+                vec![(vec![neg(-5)], 1, 1), (vec![3], 1, 3)],
+                vec![(vec![neg(-2)], 1, 2), (vec![10], 1, 4)],
+            ],
+            want: vec![vec![neg(-5)], vec![neg(-2)], vec![3], vec![10]],
+        },
+        Case {
+            // (1,1,100) and (1,1,200) share their leading 16 bytes and carry
+            // identical payloads: the wide comparator's tiebreak must keep both.
+            name: "wide 3xU64, leading-16-byte collision",
+            pk_types: &[TYPE_U64, TYPE_U64, TYPE_U64],
+            stride: 24,
+            shards: vec![vec![(vec![1, 1, 100], 1, 7)], vec![(vec![1, 1, 200], 1, 7)]],
+            want: vec![vec![1, 1, 100], vec![1, 1, 200]],
+        },
+        Case {
+            name: "narrow U8",
+            pk_types: &[type_code::U8],
+            stride: 1,
+            shards: vec![
+                vec![(vec![200], 1, 1), (vec![255], 1, 2)],
+                vec![(vec![1], 1, 3), (vec![200], -1, 1)],
+            ],
+            want: vec![vec![1], vec![255]],
+        },
+        Case {
+            // A stride that is neither 8 nor 16, so no fast width arm applies.
+            name: "mixed-width (U64, U16, U8)",
+            pk_types: &[TYPE_U64, type_code::U16, type_code::U8],
+            stride: 11,
+            shards: vec![
+                vec![(vec![1, 2, 3], 1, 10), (vec![1, 2, 9], 1, 20)],
+                vec![(vec![1, 2, 9], -1, 20), (vec![1, 3, 0], 1, 30)],
+            ],
+            want: vec![vec![1, 2, 3], vec![1, 3, 0]],
+        },
+    ];
 
-    // Shard 1 (compound-sorted): (1,5) v10, (2,3) v30 weight +1.
-    let s1 = dir.join("s1.db");
-    write_bytes_pk_shard(
-        s1.to_str().unwrap(),
-        &schema,
-        &[(pk2(1, 5), 1, vec![10]), (pk2(2, 3), 1, vec![30])],
-    );
-    // Shard 2 (compound-sorted): (1,9) v20, (2,3) v30 weight -1, (3,0) v40.
-    let s2 = dir.join("s2.db");
-    write_bytes_pk_shard(
-        s2.to_str().unwrap(),
-        &schema,
-        &[
-            (pk2(1, 9), 1, vec![20]),
-            (pk2(2, 3), -1, vec![30]),
-            (pk2(3, 0), 1, vec![40]),
-        ],
-    );
+    for case in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let schema = pk_payload_schema(case.pk_types);
+        assert_eq!(schema.pk_stride(), case.stride, "{}: fixture stride", case.name);
 
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let cout = compact_one(&dir, &[cs1.as_c_str(), cs2.as_c_str()], &schema, 1);
+        let paths: Vec<std::ffi::CString> = case
+            .shards
+            .iter()
+            .enumerate()
+            .map(|(i, rows)| {
+                let rows: Vec<(Vec<u8>, i64, i64)> =
+                    rows.iter().map(|(pk, w, v)| (opk_pk(&schema, pk), *w, *v)).collect();
+                shard_file::write_test_shard(&dir.join(format!("s{i}.db")), &schema, &rows, ShardWriteOpts::default())
+            })
+            .collect();
+        let inputs: Vec<&CStr> = paths.iter().map(|p| p.as_c_str()).collect();
 
-    let merged = MappedShard::open(&cout, &schema, false).unwrap();
-    // (2,3) cancels (+1 -1 = 0). The cross-shard duplicate must fold, which
-    // requires the two (2,3) entries to be adjacent at the heap root.
-    assert_eq!(merged.count, 3, "expected 3 surviving rows (the (2,3) pair cancels)");
-    assert_compare_pk_bytes_sorted(&merged);
+        let cout = compact_one(&dir, &inputs, &schema, 1);
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
+        assert_compare_pk_bytes_sorted(&merged);
 
-    let present: Vec<Vec<u8>> = (0..merged.count).map(|i| merged.get_pk_bytes(i).to_vec()).collect();
-    assert_eq!(present, vec![pk2(1, 5), pk2(1, 9), pk2(3, 0)]);
-}
-
-/// Regression for a single narrow signed (`I64`) PK: negatives sort
-/// last under raw-LE (zero-extended) but first under `compare_pk_bytes`.
-#[test]
-fn test_compact_narrow_signed_opk_order() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    // I64 PK + I64 payload. Single signed column → not pk_is_fast.
-    let schema = SchemaDescriptor::new(&[SchemaColumn::new(TYPE_I64, 0), SchemaColumn::new(TYPE_I64, 0)], &[0]);
-    // OPK bytes for a single I64 PK column (big-endian, sign bit flipped).
-    let k = |v: i64| {
-        let mut out = [0u8; 8];
-        gnitz_wire::encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut out);
-        out.to_vec()
-    };
-
-    // Shard 1 (signed order): -5, 3.
-    let s1 = dir.join("s1.db");
-    write_bytes_pk_shard(
-        s1.to_str().unwrap(),
-        &schema,
-        &[(k(-5), 1, vec![1]), (k(3), 1, vec![3])],
-    );
-    // Shard 2 (signed order): -2, 10.
-    let s2 = dir.join("s2.db");
-    write_bytes_pk_shard(
-        s2.to_str().unwrap(),
-        &schema,
-        &[(k(-2), 1, vec![2]), (k(10), 1, vec![4])],
-    );
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let cout = compact_one(&dir, &[cs1.as_c_str(), cs2.as_c_str()], &schema, 1);
-
-    let merged = MappedShard::open(&cout, &schema, false).unwrap();
-    assert_eq!(merged.count, 4);
-    assert_compare_pk_bytes_sorted(&merged);
-    // PK region is OPK; decode each column back to its native I64 value.
-    let present: Vec<i64> = (0..merged.count)
-        .map(|i| crate::test_support::opk_pk_i64(merged.get_pk_bytes(i)))
-        .collect();
-    assert_eq!(present, vec![-5, -2, 3, 10], "must be signed-sorted, not raw-LE");
-}
-
-/// Wide (`pk_stride = 24`) prefix collision: two PKs share their
-/// order-preserving 16-byte prefix (col0, col1) but differ in the trailing
-/// column, with identical payloads. The `compare_pk_bytes` tiebreak in the
-/// wide comparator must keep them as two distinct rows (no fold).
-#[test]
-fn test_compact_wide_prefix_collision_no_fold() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().to_path_buf();
-
-    // (U64, U64, U64) PK (stride 24) + U64 payload.
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(TYPE_U64, 0),
-            SchemaColumn::new(TYPE_U64, 0),
-            SchemaColumn::new(TYPE_U64, 0),
-            SchemaColumn::new(TYPE_U64, 0),
-        ],
-        &[0, 1, 2],
-    );
-    assert_eq!(schema.pk_stride(), 24);
-    // OPK bytes for a 3×U64 compound PK: each column big-endian.
-    let pk3 = |a: u64, b: u64, c: u64| {
-        let mut v = a.to_be_bytes().to_vec();
-        v.extend_from_slice(&b.to_be_bytes());
-        v.extend_from_slice(&c.to_be_bytes());
-        v
-    };
-
-    // (1,1,100) and (1,1,200) share their first 16 bytes (col0,col1), differ
-    // in col2 — identical payloads. Separate shards, both weight +1.
-    let s1 = dir.join("s1.db");
-    write_bytes_pk_shard(s1.to_str().unwrap(), &schema, &[(pk3(1, 1, 100), 1, vec![7])]);
-    let s2 = dir.join("s2.db");
-    write_bytes_pk_shard(s2.to_str().unwrap(), &schema, &[(pk3(1, 1, 200), 1, vec![7])]);
-
-    let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-    let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
-    let cout = compact_one(&dir, &[cs1.as_c_str(), cs2.as_c_str()], &schema, 1);
-
-    let merged = MappedShard::open(&cout, &schema, false).unwrap();
-    assert_eq!(merged.count, 2, "prefix-colliding distinct wide PKs must not fold");
-    assert_compare_pk_bytes_sorted(&merged);
-    let present: Vec<Vec<u8>> = (0..merged.count).map(|i| merged.get_pk_bytes(i).to_vec()).collect();
-    assert_eq!(present, vec![pk3(1, 1, 100), pk3(1, 1, 200)]);
+        let got: Vec<Vec<u8>> = (0..merged.count).map(|i| merged.get_pk_bytes(i).to_vec()).collect();
+        let want: Vec<Vec<u8>> = case.want.iter().map(|pk| opk_pk(&schema, pk)).collect();
+        assert_eq!(got, want, "{}", case.name);
+    }
 }
 
 // -- Columnar vs row-at-a-time materialization (differential) ------------
@@ -1193,7 +872,7 @@ fn oracle_merge_and_route_row_at_a_time(
     let mut blob_caches: Vec<BlobCacheGuard> = (0..n).map(|_| BlobCacheGuard::acquire(schema, 256)).collect();
     run_merge(&shards, schema, |src, row, w| {
         let pk = shards[src].get_pk_bytes(row);
-        let g = find_guard_for_key(guard_keys, pack_pk_be(pk));
+        let g = guard_slot(guard_keys, pack_pk_be(pk), |&g| g);
         batches[g].append_row_from_source_bytes(pk, w, &shards[src], row, blob_caches[g].get_mut());
     });
     (0..n)
@@ -1256,7 +935,7 @@ fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
     // table_id=7, level_num=1, compact_seq=42 → routed shards are named by the
     // destination guard *key*: shard_7_42_L1_G{guard_keys[g]}.db.
     let dests: Vec<(u128, bool)> = guard_keys.iter().map(|&k| (k, false)).collect();
-    let routed = merge_and_route(&inputs, &dests, &schema, super::out(dir.to_str().unwrap(), 7, 1, 42)).unwrap();
+    let routed = merge_and_route(&inputs, &dests, &schema, out(dir.to_str().unwrap(), 7, 1, 42)).unwrap();
     let oracle = oracle_merge_and_route_row_at_a_time(&inputs, &dir, &guard_keys, &schema);
 
     // Only the populated guards (0 and 3) produce output, in increasing-g order.
@@ -1358,7 +1037,7 @@ mod skeleton_tests {
             &[a.as_c_str(), b.as_c_str()],
             &[(0, true)],
             &schema,
-            super::super::out(dir.to_str().unwrap(), 0, 2, 1),
+            super::out(dir.to_str().unwrap(), 0, 2, 1),
         )
         .unwrap();
         assert_eq!(outs.len(), 1);
@@ -1392,14 +1071,14 @@ mod skeleton_tests {
             &[src.as_c_str()],
             &[(0, true), (g1, false)],
             &schema,
-            super::super::out(dir.to_str().unwrap(), 0, 2, 1),
+            super::out(dir.to_str().unwrap(), 0, 2, 1),
         )
         .unwrap();
         let all_hydrated = merge_and_route(
             &[src.as_c_str()],
             &[(0, false), (g1, false)],
             &schema,
-            super::super::out(dir.to_str().unwrap(), 0, 2, 2),
+            super::out(dir.to_str().unwrap(), 0, 2, 2),
         )
         .unwrap();
 
