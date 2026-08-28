@@ -19,8 +19,12 @@
 //! *what the schema says about it*.
 //!
 //! `LogicalInstr::to_wire` and `LogicalProgram::decode_quad` are two tables over
-//! `gnitz_wire::ExprOp`; both live in `program.rs`, and `program/tests.rs`'s
+//! `gnitz_wire::ExprOp`; both live in `program.rs`, and `tests/program.rs`'s
 //! drift tests are what check them against each other.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 //!
 //! # Inlining
 //!

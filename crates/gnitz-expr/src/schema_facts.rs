@@ -270,4 +270,5 @@ pub(crate) fn assert_schema_facts_consistent(s: &dyn SchemaFacts, cols: &[(u8, b
 }
 
 #[cfg(test)]
+#[path = "tests/schema_facts.rs"]
 mod tests;

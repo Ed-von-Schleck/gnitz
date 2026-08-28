@@ -265,4 +265,5 @@ fn generic_match(toks: &[LikeTok], h: &[u8], ci: bool) -> bool {
 }
 
 #[cfg(test)]
+#[path = "tests/like.rs"]
 mod tests;

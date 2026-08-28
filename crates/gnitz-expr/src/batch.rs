@@ -2214,4 +2214,5 @@ pub(crate) fn eval_batch(
 }
 
 #[cfg(test)]
+#[path = "tests/batch.rs"]
 mod tests;

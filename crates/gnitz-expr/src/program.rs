@@ -799,73 +799,6 @@ pub(crate) enum Instr {
     },
 }
 
-/// A dense index per [`LogicalInstr`] variant, so
-/// [`every_variant`](tests::every_variant) can be checked for completeness
-/// without a second list of names to keep in step.
-///
-/// Adding a variant is three forced steps and one number: this `match` stops
-/// compiling, the author writes the next index, `VARIANT_COUNT`'s assert fires,
-/// they bump it — and then the completeness assert fails until `every_variant`
-/// gains an entry.
-#[cfg(test)]
-impl LogicalInstr {
-    pub(crate) const VARIANT_COUNT: usize = 48;
-
-    pub(crate) fn variant_index(&self) -> usize {
-        use LogicalInstr as L;
-        match *self {
-            L::LoadColInt { .. } => 0,
-            L::LoadColFloat { .. } => 1,
-            L::LoadConst { .. } => 2,
-            L::IntAdd { .. } => 3,
-            L::IntSub { .. } => 4,
-            L::IntMul { .. } => 5,
-            L::IntDiv { .. } => 6,
-            L::IntMod { .. } => 7,
-            L::FloatAdd { .. } => 8,
-            L::FloatSub { .. } => 9,
-            L::FloatMul { .. } => 10,
-            L::FloatDiv { .. } => 11,
-            L::Cmp { .. } => 12,
-            L::FCmp { .. } => 13,
-            L::IntToFloat { .. } => 14,
-            L::FloatUnary { .. } => 15,
-            L::IntUnary { .. } => 16,
-            L::FloatToInt { .. } => 17,
-            L::IntCast { .. } => 18,
-            L::FloatToF32 { .. } => 19,
-            L::IntMinMax2 { .. } => 20,
-            L::FloatMinMax2 { .. } => 21,
-            L::Select { .. } => 22,
-            L::LoadNull { .. } => 23,
-            L::BoolAnd { .. } => 24,
-            L::BoolOr { .. } => 25,
-            L::BoolNot { .. } => 26,
-            L::IsNull { .. } => 27,
-            L::StrColConst { .. } => 28,
-            L::StrColCol { .. } => 29,
-            L::IntInSet { .. } => 30,
-            L::LoadColStr { .. } => 31,
-            L::LoadConstStr { .. } => 32,
-            L::LoadNullStr { .. } => 33,
-            L::StrSelect { .. } => 34,
-            L::StrCmp { .. } => 35,
-            L::StrLen { .. } => 36,
-            L::StrCase { .. } => 37,
-            L::StrSubstr { .. } => 38,
-            L::StrTrim { .. } => 39,
-            L::StrLike { .. } => 40,
-            L::StrConcat { .. } => 41,
-            L::IntToStr { .. } => 42,
-            L::FloatToStr { .. } => 43,
-            L::StrToInt { .. } => 44,
-            L::StrToFloat { .. } => 45,
-            L::CopyCol { .. } => 46,
-            L::Emit { .. } => 47,
-        }
-    }
-}
-
 impl LogicalInstr {
     /// Serialise to the wire quad `[op, dst, a1, a2]` — the exact inverse of
     /// [`LogicalProgram::from_wire`]'s decode, and the **one** place the operand
@@ -1437,14 +1370,6 @@ impl LogicalProgram {
                 ExprOp::StrToFloat => LogicalInstr::StrToFloat { dst, a },
             })
         }
-    }
-
-    /// The decoded instruction list. Test-only: production consumers go through
-    /// `resolve`, which consumes it — this exists so `builder.rs`'s drift test
-    /// can compare what `ExprBuilder` emitted against what `from_wire` read back.
-    #[cfg(test)]
-    pub(crate) fn instrs(&self) -> &[LogicalInstr] {
-        &self.instrs
     }
 
     /// If every instruction is `CopyCol` writing dense payload outputs
@@ -2825,4 +2750,5 @@ fn u64_verdict(rule: U64Rule, ops: &Operands, schema: &dyn SchemaFacts, so_far: 
 }
 
 #[cfg(test)]
+#[path = "tests/program.rs"]
 mod tests;

@@ -147,4 +147,5 @@ pub fn assert_batchview_consistent<B: BatchView>(v: &B, rows: usize, cols: &[(us
 }
 
 #[cfg(test)]
+#[path = "tests/view.rs"]
 mod tests;

@@ -228,4 +228,5 @@ impl ColumnLocator {
 }
 
 #[cfg(test)]
+#[path = "tests/locator.rs"]
 mod tests;

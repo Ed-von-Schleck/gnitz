@@ -244,4 +244,5 @@ impl Evaluator {
 }
 
 #[cfg(test)]
+#[path = "tests/eval.rs"]
 mod tests;
