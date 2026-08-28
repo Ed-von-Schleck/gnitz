@@ -33,19 +33,6 @@ pub fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
     })
 }
 
-/// Compute `(wire_safe, wire_row_fixed_stride)` for `schema`. The stride is
-/// only meaningful when `wire_safe` is true: it's the byte cost of one row in
-/// a wire data block (`pk_stride + weight + null_bmp + payload strides`, all
-/// already 8-aligned because `schema_wire_safe` rejects non-8-aligned columns).
-/// Callers cache the result to skip the per-call column iteration.
-pub fn compute_wire_props(schema: &SchemaDescriptor) -> (bool, u32) {
-    if !schema_wire_safe(schema) {
-        return (false, 0);
-    }
-    let (strides, nr) = strides_from_schema(schema);
-    (true, strides[..nr as usize].iter().map(|&s| s as u32).sum())
-}
-
 /// Region byte sizes of the WAL wire block for `count` rows of `schema`, in
 /// canonical order (pk, weight, null_bmp, payload…, blob = `blob_size`), plus
 /// the region count. The schema-level face of the writer↔reader region

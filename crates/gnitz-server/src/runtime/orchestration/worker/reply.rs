@@ -72,20 +72,19 @@ impl WorkerProcess {
     /// `ClientAuthored` — the client wrote that schema and decodes against it.
     /// Returns the block, the schema version, and the schema's wire-safety —
     /// `Table` reads the cached wire-safe bit instead of recomputing it per
-    /// reply. This is the only reader of the descriptor: the encoders take the
-    /// block, never the descriptor, so a variant that emits no block emits no
-    /// schema.
+    /// reply. This is the only reader of the descriptor: a `WireMsg` carries
+    /// schema *bytes*, so a variant that yields no block emits no schema.
     fn reply_schema_block(&mut self, tid_key: i64, schema: ReplySchema<'_>) -> (Option<Rc<Vec<u8>>>, u16, bool) {
         match schema {
             // Version 0: the block is a projected/synthetic schema, so the
             // table's version does not describe it — reporting the table's would
             // let a version-suppression path drop a block the reader still needs.
             ReplySchema::OneOff(s) => {
-                let block = Rc::new(ipc::build_schema_wire_block(s, tid_key as u32));
+                let block = Rc::new(gnitz_engine::catalog::encode_schema_block(s, tid_key as u32));
                 (Some(block), 0, schema_wire_safe(s))
             }
             ReplySchema::Table(s) => {
-                let e = ipc::get_or_build_schema_wire_block(self.cat(), tid_key, s);
+                let e = self.cat().schema_wire_entry(tid_key, s);
                 (Some(e.block), e.version, e.wire_safe)
             }
             ReplySchema::ClientAuthored(s) => (None, 0, schema_wire_safe(s)),
@@ -111,7 +110,7 @@ impl WorkerProcess {
             seek_pk,
             request_id,
             data: WireData::Whole(result),
-            prebuilt_schema_block: prebuilt,
+            schema_block: prebuilt,
             ..Default::default()
         }
     }
@@ -344,7 +343,7 @@ impl WorkerProcess {
             client_id,
             flags: gnitz_wire::wire_flags_set_schema_version(FLAG_CONTINUATION | FLAG_SCAN_LAST, server_version),
             data: WireData::Whole(Some(batch)),
-            prebuilt_schema_block: prebuilt,
+            schema_block: prebuilt,
             ..Default::default()
         }
     }
@@ -378,7 +377,7 @@ impl WorkerProcess {
                 start_row,
                 count,
             },
-            prebuilt_schema_block: prebuilt,
+            schema_block: prebuilt,
             ..Default::default()
         }
     }
@@ -537,7 +536,7 @@ pub(crate) fn send_unique_preflight_keys(
     keys: &mut gnitz_engine::storage::KeyProducer,
 ) {
     debug_assert!(keys_per_frame > 0, "keys_per_frame must be positive");
-    let schema_block = ipc::build_schema_wire_block(frame_schema, target_id as u32);
+    let schema_block = gnitz_engine::catalog::encode_schema_block(frame_schema, target_id as u32);
 
     // Reusable chunk batch: filled, encoded, and cleared per frame, sized up
     // front to exactly one frame's fill.
@@ -569,7 +568,7 @@ pub(crate) fn send_unique_preflight_keys(
                 start_row: 0,
                 count: chunk.count,
             },
-            prebuilt_schema_block: is_first.then_some(schema_block.as_slice()),
+            schema_block: is_first.then_some(schema_block.as_slice()),
             ..Default::default()
         };
         w2m_writer.send_msg(request_id, &msg);

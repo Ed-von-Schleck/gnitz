@@ -46,7 +46,7 @@ pub(crate) use scatter::scatter_unified_sources;
 
 // ── Operator hot-path types ──────────────────────────────────────────────────
 pub use batch::{BatchBuilder, Layout};
-pub use batch_wire::{compute_wire_props, schema_wire_safe, wire_block_size};
+pub use batch_wire::{schema_wire_safe, wire_block_size};
 // `ColumnarSource` is deliberately NOT re-exported: it adds only the Z-set
 // weight, and every out-of-storage consumer (the comparators, the group-key
 // extractors, the row appenders) reads rows through `gnitz_expr::RowSource`.

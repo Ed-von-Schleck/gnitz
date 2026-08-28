@@ -1,7 +1,7 @@
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring;
-use crate::runtime::wire::STATUS_OK;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
+use gnitz_wire::STATUS_OK;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

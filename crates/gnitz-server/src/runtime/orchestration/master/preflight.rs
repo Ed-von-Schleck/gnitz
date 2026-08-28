@@ -29,7 +29,7 @@ pub(super) enum CheckRoute {
     /// Partition by the schema PK and scatter, so each worker is sent only the
     /// keys it stores. Delivered via `with_scatter_group` without materializing
     /// intermediate per-worker `Batch`es — `execute_pipeline` computes the
-    /// routing from `check.schema.pk_indices()` via `with_worker_indices`.
+    /// routing from the check schema's `pk_indices()` via `with_worker_indices`.
     ScatterByPk,
 }
 
@@ -43,7 +43,11 @@ pub(super) struct PipelinedCheck {
     pub(super) col_hint: u64,
     pub(super) route: CheckRoute,
     pub(super) batch: Batch,
-    pub(super) schema: SchemaDescriptor,
+    /// Carried, not looked up from `target_id`: for a unique secondary index
+    /// this is the INDEX table's schema `(indexed_col, src_pk…)` sent under the
+    /// owner table's id, which `handle_has_pk` reads back to size
+    /// `idx_key_size`. The owner's own schema would give the wrong prefix width.
+    pub(super) schema: wire::WireSchema,
 }
 
 impl PipelinedCheck {
@@ -786,7 +790,7 @@ impl MasterDispatcher {
                 col_hint: 0,
                 route: CheckRoute::ScatterByPk,
                 batch: build_check_batch_pk_bytes(&schema, keys.into_iter(), pooled),
-                schema,
+                schema: wire::WireSchema::encoded(tid, schema),
             });
         }
         let probed: Vec<i64> = checks.iter().map(|c| c.target_id).collect();
@@ -920,7 +924,7 @@ impl MasterDispatcher {
                     col_hint: packed | gnitz_wire::HAS_PK_WANT_HOLDER,
                     route: CheckRoute::Broadcast,
                     batch: chk,
-                    schema: idx_schema,
+                    schema: wire::WireSchema::encoded(tid, idx_schema),
                 });
                 plans.push(UniquePlan {
                     tid,
@@ -1096,7 +1100,7 @@ impl MasterDispatcher {
                     CheckRoute::ScatterByPk
                 },
                 batch: chk,
-                schema: probe_schema,
+                schema: wire::WireSchema::encoded(parent_tid, probe_schema),
             });
             plans.push(FkProbePlan {
                 edge,
@@ -1160,7 +1164,7 @@ impl MasterDispatcher {
                 col_hint,
                 route: CheckRoute::Broadcast,
                 batch: build_check_batch(&idx_schema, &v_check, src_type, pooled),
-                schema: idx_schema,
+                schema: wire::WireSchema::encoded(child_tid, idx_schema),
             });
             plans.push(FkProbePlan {
                 edge,
@@ -1466,20 +1470,12 @@ impl MasterDispatcher {
             }
             for (idx, check) in checks.iter().enumerate() {
                 let req_slice = &rids[idx * nw..(idx + 1) * nw];
-                // `check.schema` is not derivable from the target id: for a
-                // unique secondary index it is the INDEX table's schema
-                // `(indexed_col, src_pk…)` sent under the owner table's id, and
-                // `handle_has_pk` reads it back to size `idx_key_size`. A
-                // catalog lookup on the target id would give the owner's
-                // prefix width.
                 match check.route {
                     CheckRoute::Broadcast => disp.write_group(
-                        wire::WireMsg {
-                            target_id: check.target_id as u64,
+                        check.schema.frame(wire::WireMsg {
                             seek_col_idx: check.col_hint,
-                            schema: Some(&check.schema),
                             ..Default::default()
-                        },
+                        }),
                         GroupData::Same(wire::WireData::Whole(Some(&check.batch))),
                         0,
                         FLAG_HAS_PK,
@@ -1488,7 +1484,6 @@ impl MasterDispatcher {
                     CheckRoute::ScatterByPk => disp.write_scatter_group(
                         &check.batch,
                         &check.schema,
-                        check.target_id,
                         FLAG_HAS_PK,
                         check.col_hint,
                         GroupTargets::All(req_slice),
@@ -1576,12 +1571,13 @@ impl MasterDispatcher {
         debug_assert!(!parent_schema.is_pk_col(ref_col as usize));
         let expected = gnitz_engine::schema::project_schema(&parent_schema, &[ref_col as u32])
             .expect("a one-column projection fits MAX_COLUMNS");
+        let parent = wire::WireSchema::encoded(target_id, parent_schema);
 
         // `_lease` held across the full drain below (see `dispatch_scan_fanout`).
         let (slots, scan) = dispatch_scan_fanout(disp, reactor, Fanout::Broadcast, |targets| {
             let pooled = disp.pool_pop_batch((target_id, 0));
             let batch = build_check_batch_pk_bytes(&parent_schema, pks.iter().map(|p| p.pk_bytes()), pooled);
-            disp.write_scatter_group(&batch, &parent_schema, target_id, FLAG_GATHER, ref_col as u64, targets)?;
+            disp.write_scatter_group(&batch, &parent, FLAG_GATHER, ref_col as u64, targets)?;
             // The scatter batch is fully consumed by the synchronous
             // with_scatter_group above; return it to the pool.
             recycle_check_batch(disp, (target_id, 0), batch);

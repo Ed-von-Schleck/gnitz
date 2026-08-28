@@ -12,16 +12,15 @@ use crate::runtime::master::PreflightAccumulator;
 use crate::runtime::sal::{SalMessageKind, FLAG_UNIQUE_PREFLIGHT};
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring;
-use crate::runtime::wire::{
-    self, peek_control_block_ipc, unique_preflight_wire_schema, SchemaWithVersion, FLAG_CONTINUATION, FLAG_HAS_SCHEMA,
-    FLAG_SCAN_LAST,
-};
+use crate::runtime::wire::{self, unique_preflight_wire_schema, SchemaWithVersion, FLAG_SCAN_LAST};
 use crate::runtime::worker::send_unique_preflight_keys;
 use gnitz_engine::schema::key::PkBuf;
 use gnitz_engine::schema::make_index_schema;
 use gnitz_engine::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
 use gnitz_engine::storage::{Batch, KeyProducer, SpillSort};
+use gnitz_wire::control::peek_control_block_ipc;
 use gnitz_wire::type_code;
+use gnitz_wire::{FLAG_CONTINUATION, FLAG_HAS_SCHEMA};
 
 // ---------------------------------------------------------------------------
 // Span helpers
@@ -194,7 +193,7 @@ fn preflight_train_empty_partition_single_terminal_frame() {
         let ctrl = peek_control_block_ipc(slot.bytes()).expect("ctrl decodes");
         assert_eq!(ctrl.status, 0);
         assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0, "single frame must be terminal");
-        assert_eq!(ctrl.flags & wire::FLAG_HAS_DATA, 0, "no data on empty train");
+        assert_eq!(ctrl.flags & gnitz_wire::FLAG_HAS_DATA, 0, "no data on empty train");
         drop(slot);
         assert!(receiver.try_read_slot(0).is_none());
     });

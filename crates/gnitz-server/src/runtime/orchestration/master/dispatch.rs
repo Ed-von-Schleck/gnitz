@@ -165,18 +165,12 @@ impl MasterDispatcher {
         self.sal.boot_reset(epoch);
     }
 
-    /// Return the schema descriptor, a cached prebuilt schema wire block,
-    /// and the derived `(wire_safe, wire_row_fixed_stride)` for `target_id`.
-    /// The block is built lazily on first call and stored in the catalog
-    /// cache; it is invalidated alongside col_names whenever DDL modifies
-    /// the table. Used by SAL write paths (commit/tick/broadcast) to skip
-    /// per-call `build_schema_wire_block` allocations and per-column
-    /// iteration in `with_scatter_group`.
-    fn cached_schema_block(&self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<u8>>, bool, u32) {
-        let schema = self.schema_desc_for(target_id);
-        let cat = self.cat();
-        let e = crate::runtime::wire::get_or_build_schema_wire_block(cat, target_id, &schema);
-        (schema, e.block, e.wire_safe, e.wire_row_fixed_stride)
+    /// `target_id`'s wire identity, off the catalog's cache: the block is built
+    /// on first call and invalidated alongside col_names whenever DDL modifies
+    /// the table, so the SAL write paths (commit/tick/broadcast) pay neither a
+    /// block encode nor a per-column walk per group.
+    fn wire_schema(&self, target_id: i64) -> wire::WireSchema {
+        wire::WireSchema::from_catalog(self.cat(), target_id, self.schema_desc_for(target_id))
     }
 
     pub(super) fn pool_pop_batch(&self, slot: super::preflight::PoolSlot) -> Option<Batch> {
@@ -212,29 +206,27 @@ impl MasterDispatcher {
     /// Write one group whose rows are PK-partitioned across the workers: each
     /// worker's slot carries only the rows it stores — the scatter sibling of a
     /// `GroupData::Same` broadcast.
+    ///
     pub(super) fn write_scatter_group(
         &self,
         batch: &Batch,
-        schema: &SchemaDescriptor,
-        target_id: i64,
+        relation: &wire::WireSchema,
         sal_flags: u32,
         seek_col_idx: u64,
         targets: GroupTargets<'_>,
     ) -> Result<(), String> {
         // No reentrancy: the closure has no `.await`, so the SCATTER_INDICES
         // borrow is released before the next caller needs it.
-        with_worker_indices(batch, schema, self.num_workers, |worker_indices| {
+        with_worker_indices(batch, relation.descriptor(), self.num_workers, |worker_indices| {
             self.sal.with_scatter_group(
                 batch,
                 worker_indices,
+                relation,
                 wire::WireMsg {
-                    target_id: target_id as u64,
                     seek_col_idx,
-                    schema: Some(schema),
                     ..Default::default()
                 },
                 targets,
-                None,
                 |g| self.sal.write_group_direct(g, 0, sal_flags),
             )
         })
@@ -527,34 +519,26 @@ impl MasterDispatcher {
     /// the worker demuxes against the wrong sharding columns.
     fn with_relay_group<R>(
         &self,
-        view_id: i64,
+        view: &wire::WireSchema,
         source_id: i64,
-        schema: &SchemaDescriptor,
         dest: &RelayDest,
         decision: u64,
         f: impl FnOnce(&DirectGroup) -> R,
     ) -> R {
-        let template = wire::WireMsg {
-            target_id: view_id as u64,
+        let template = view.frame(wire::WireMsg {
             seek_pk: source_id as u128,
             seek_col_idx: decision,
-            schema: Some(schema),
             ..Default::default()
-        };
+        });
         let group = |data| DirectGroup {
             template,
             data,
             targets: GroupTargets::AllSilent,
         };
         match dest {
-            RelayDest::Broadcast(b) => f(&group(GroupData::Same(wire::WireData::Whole(
-                (b.count > 0).then_some(&**b),
-            )))),
+            RelayDest::Broadcast(b) => f(&group(GroupData::Same(wire::WireData::Whole(Some(&**b))))),
             RelayDest::PerWorker(batches) => {
-                let slots: Vec<wire::WireData> = batches
-                    .iter()
-                    .map(|b| wire::WireData::Whole((b.count > 0).then_some(b)))
-                    .collect();
+                let slots: Vec<wire::WireData> = batches.iter().map(|b| wire::WireData::Whole(Some(b))).collect();
                 f(&group(GroupData::PerWorker(&slots)))
             }
         }
@@ -654,18 +638,22 @@ impl MasterDispatcher {
             }
         };
 
+        // Encoded once and carried forward: `emit_relay_with_decision` runs the
+        // same group again — twice more when a reclaim barrier forces a retry —
+        // and every pass would otherwise rebuild these identical bytes.
+        let view = wire::WireSchema::encoded(view_id, schema);
+
         // Size the group here, outside `sal_writer_excl`: the batches are in
         // hand, so the fit check under the lock is a comparison rather than a
         // sizing pass.
-        let footprint = self.with_relay_group(view_id, source_id, &schema, &dest, BACKFILL_DECISION_CONTINUE, |g| {
+        let footprint = self.with_relay_group(&view, source_id, &dest, BACKFILL_DECISION_CONTINUE, |g| {
             self.sal.group_footprint_direct(g)
         });
 
         Ok(RelayPrepared {
-            view_id,
+            view,
             source_id,
             dest,
-            schema,
             footprint,
         })
     }
@@ -684,7 +672,7 @@ impl MasterDispatcher {
     /// reactor's `relay_loop` serves only steady-state tick exchanges and always
     /// passes CONTINUE, which is 0.
     pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), String> {
-        self.with_relay_group(prep.view_id, prep.source_id, &prep.schema, &prep.dest, decision, |g| {
+        self.with_relay_group(&prep.view, prep.source_id, &prep.dest, decision, |g| {
             self.sal.write_group_direct(g, 0, FLAG_EXCHANGE_RELAY)
         })?;
         self.signal_all();
@@ -710,15 +698,14 @@ impl MasterDispatcher {
     /// closes.
     fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), String> {
         self.checkpoint_before_backfill()?;
-        // The schema block is what stamps `Batch.schema` on the worker side.
-        let schema = self.schema_desc_for(source_id);
+        // Dataless, but it still carries a schema block: that block is what
+        // stamps `Batch.schema` on the worker side.
+        let source = wire::WireSchema::encoded(source_id, self.schema_desc_for(source_id));
         self.write_group(
-            wire::WireMsg {
-                target_id: source_id as u64,
+            source.frame(wire::WireMsg {
                 seek_pk: view_id as u128,
-                schema: Some(&schema),
                 ..Default::default()
-            },
+            }),
             GroupData::NONE,
             0,
             FLAG_BACKFILL,
@@ -1003,14 +990,9 @@ impl MasterDispatcher {
     /// them as an atomic zone. `zone_start` marks this as the zone's first group,
     /// which is what gives the zone a byte span recovery can attribute damage to.
     pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64, zone_start: bool) -> Result<(), String> {
-        let (schema, schema_block, _safe, _stride) = self.cached_schema_block(target_id);
+        let relation = self.wire_schema(target_id);
         self.write_group(
-            wire::WireMsg {
-                target_id: target_id as u64,
-                schema: Some(&schema),
-                prebuilt_schema_block: Some(schema_block.as_slice()),
-                ..Default::default()
-            },
+            relation.frame(wire::WireMsg::default()),
             GroupData::Same(wire::WireData::Whole(Some(batch))),
             lsn,
             FLAG_DDL_SYNC | if zone_start { FLAG_ZONE_START } else { 0 },
@@ -1276,17 +1258,10 @@ impl MasterDispatcher {
         let nw = self.num_workers;
         let mut total = 0usize;
         for &(tid, batch) in families {
-            let (schema, block, wire_safe, wire_row_stride) = self.cached_schema_block(tid);
+            let relation = self.wire_schema(tid);
             let sal = &self.sal;
-            total += with_commit_indices(batch, &schema, nw, |wi| {
-                sal.scatter_group_footprint(
-                    batch,
-                    wi,
-                    &schema,
-                    tid as u32,
-                    Some(block.as_slice()),
-                    Some((wire_safe, wire_row_stride)),
-                )
+            total += with_commit_indices(batch, relation.descriptor(), nw, |wi| {
+                sal.scatter_group_footprint(batch, wi, &relation)
             });
         }
         total
@@ -1305,7 +1280,7 @@ impl MasterDispatcher {
         zone_start: bool,
     ) -> Result<(), String> {
         self.arm_injected_tick_emit_error(target_id, batch.count);
-        let (schema, schema_block, wire_safe, wire_row_stride) = self.cached_schema_block(target_id);
+        let relation = self.wire_schema(target_id);
         let nw = self.num_workers;
         let wire_flags = wire_flags_set_conflict_mode(0, mode);
         // Identical scatter for both routings; only the per-worker index fill
@@ -1313,10 +1288,7 @@ impl MasterDispatcher {
         // call site keeps the atomic-zone framing, LSN, ACK accounting, and the
         // committer's single `fdatasync` shared between them.
         let template = wire::WireMsg {
-            target_id: target_id as u64,
             flags: wire_flags,
-            schema: Some(&schema),
-            prebuilt_schema_block: Some(schema_block.as_slice()),
             ..Default::default()
         };
         let sal_flags = FLAG_PUSH | if zone_start { FLAG_ZONE_START } else { 0 };
@@ -1324,16 +1296,16 @@ impl MasterDispatcher {
             self.sal.with_scatter_group(
                 batch,
                 worker_indices,
+                &relation,
                 template,
                 GroupTargets::All(req_ids),
-                Some((wire_safe, wire_row_stride)),
                 |g| self.sal.write_group_direct(g, lsn, sal_flags),
             )
         };
         // A replicated relation broadcasts: the whole batch lands in every
         // worker's ingest + SAL slot, so each worker durably logs the full table
         // and enforces uniqueness against its identical full copy.
-        with_commit_indices(batch, &schema, nw, scatter)
+        with_commit_indices(batch, relation.descriptor(), nw, scatter)
     }
 
     /// Write a checkpoint flush group (`FLAG_FLUSH` base round or

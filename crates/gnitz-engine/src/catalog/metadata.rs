@@ -145,8 +145,8 @@ impl CatalogEngine {
         self.index_circuits(table_id).iter().any(|ic| ic.is_unique)
     }
 
-    /// Return the cached schema wire entry (block, version, and derived wire
-    /// properties) for `table_id`, or `None` if the block isn't yet cached.
+    /// Return the cached schema wire entry (block, version, wire-safety) for
+    /// `table_id`, or `None` if the block isn't yet cached.
     pub fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<SchemaWireEntry> {
         self.caches.schema_wire_cache.get(&table_id).cloned()
     }
@@ -156,10 +156,10 @@ impl CatalogEngine {
         self.caches.get_schema_version(table_id)
     }
 
-    /// Store an encoded schema wire block in the cache, along with its
-    /// derived wire properties. Written together so the invalidation in
+    /// Store an encoded schema wire block in the cache, with the version and
+    /// wire-safety it was built at — written together so the invalidation in
     /// `clear_col_cache_no_bump` keeps them consistent.
-    pub fn set_schema_wire_block(&mut self, table_id: i64, entry: SchemaWireEntry) {
+    pub(crate) fn set_schema_wire_block(&mut self, table_id: i64, entry: SchemaWireEntry) {
         self.caches.schema_wire_cache.insert(table_id, entry);
     }
 

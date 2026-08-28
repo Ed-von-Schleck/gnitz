@@ -58,9 +58,8 @@ fn prologue(client_id: u64, flags: u64, count: usize, body_hint: usize) -> Write
     };
     let ctrl_len = ctrl_block_size(0, 0);
     let mut ctrl = vec![0u8; ctrl_len];
-    encode_ctrl_block(&mut ctrl, 0, &hdr, &[], &[]);
     // A client request frame carries a body checksum, as its WAL blocks do.
-    wal::stamp_checksum(&mut ctrl, ctrl_len);
+    encode_ctrl_block(&mut ctrl, 0, &hdr, &[], &[], true);
 
     let mut w = Writer::with_capacity(ctrl_len + 4 + body_hint);
     w.raw(&ctrl).u32(count as u32);

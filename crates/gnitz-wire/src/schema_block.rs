@@ -108,28 +108,18 @@ fn block_len(n: usize, blob: usize) -> usize {
     wal::block_size(&sizes)
 }
 
-/// Encoded size of the block for `cols` — what [`encode_into`] writes.
-pub(crate) fn encoded_len(cols: &[SchemaBlockCol]) -> usize {
+/// Encoded size of the block for `cols` — the size [`encode_vec`] reserves, so
+/// the reservation and the write read one rule.
+fn encoded_len(cols: &[SchemaBlockCol]) -> usize {
     block_len(cols.len(), cols.iter().map(|c| blob_bytes(c.name)).sum())
 }
 
-/// Encoded size of an **anonymous** block of `num_columns` columns — every name
-/// empty, so nothing spills and the size is a pure function of the count. Lets
-/// a caller that only needs the size (the engine's frame sizing, once per reply)
-/// skip building the column list at all.
-pub fn anonymous_encoded_len(num_columns: usize) -> usize {
-    block_len(num_columns, 0)
-}
-
-/// Write the block for `cols` into `out[offset..]`, returning the bytes written
-/// (always [`encoded_len`]). The offset form exists because the engine writes
-/// this block in place, into a buffer it pre-sized for the whole frame; the
-/// [`encode`] wrapper serves callers that just want the bytes.
+/// [`encode`] and [`encode_ipc`]'s shared body: the block for `cols`, framed
+/// into a `Vec` sized by [`encoded_len`].
 ///
-/// Panics if `out[offset..]` is shorter than [`encoded_len`] — a caller that
-/// sized its buffer from anything but `encoded_len` has a bug here, not a
-/// runtime condition to report.
-pub fn encode_into(out: &mut [u8], offset: usize, tid: u32, cols: &[SchemaBlockCol], checksum: bool) -> usize {
+/// Every frame that carries a schema block copies these bytes in — one encode
+/// per relation, one memcpy per slot — so there is no in-place form.
+fn encode_vec(tid: u32, cols: &[SchemaBlockCol], checksum: bool) -> Vec<u8> {
     let n = cols.len();
     // One scratch buffer carved into the six fixed-stride regions, so a block
     // whose names all fit inline (the anonymous case, and most named ones)
@@ -153,16 +143,21 @@ pub fn encode_into(out: &mut [u8], offset: usize, tid: u32, cols: &[SchemaBlockC
 
     // `null` stays all-zero: no meta-schema column is nullable.
     let regions: [&[u8]; SCHEMA_BLOCK_REGIONS] = [pk, weight, null, type_code, flags, names, &blob];
-    let end = wal::encode(out, offset, tid, n as u32, &regions, checksum).expect("schema block buffer too small");
-    end - offset
+    let mut out = vec![0u8; encoded_len(cols)];
+    wal::encode(&mut out, 0, tid, n as u32, &regions, checksum).expect("schema block buffer too small");
+    out
 }
 
-/// [`encode_into`] into a fresh `Vec`. Always checksummed — the in-place form
-/// is the one whose caller varies that.
+/// The block for `cols`, checksummed — for one crossing a durability or trust
+/// boundary.
 pub fn encode(tid: u32, cols: &[SchemaBlockCol]) -> Vec<u8> {
-    let mut out = vec![0u8; encoded_len(cols)];
-    encode_into(&mut out, 0, tid, cols, true);
-    out
+    encode_vec(tid, cols, true)
+}
+
+/// [`encode`] without the body checksum, for the intra-process frames whose
+/// reader verifies none.
+pub fn encode_ipc(tid: u32, cols: &[SchemaBlockCol]) -> Vec<u8> {
+    encode_vec(tid, cols, false)
 }
 
 /// A validated meta-schema block, borrowing the bytes it was decoded from.
@@ -399,6 +394,20 @@ mod tests {
         assert_eq!(sb.pk_indices(), &[1, 0]);
     }
 
+    /// A header claiming more regions than the buffer can hold must be rejected
+    /// before any `dir_entry` indexes past the end. `num_regions` lives in the
+    /// header, *outside* the checksummed body, so a forged value still passes
+    /// the checksum and reaches the directory guard.
+    #[test]
+    fn rejects_a_directory_that_overflows_the_buffer() {
+        let mut block = simple();
+        block[crate::WAL_OFF_NUM_REGIONS..crate::WAL_OFF_NUM_REGIONS + 4].copy_from_slice(&100_000u32.to_le_bytes());
+        assert_eq!(
+            decode_err(&block, MAX_PK_COLUMNS),
+            "schema block directory overflows buffer"
+        );
+    }
+
     #[test]
     fn encoded_len_matches_what_encode_writes() {
         let cols = [
@@ -406,19 +415,6 @@ mod tests {
             col(TypeCode::String, "spills_into_the_blob_heap", None, false),
         ];
         assert_eq!(encode(1, &cols).len(), encoded_len(&cols));
-    }
-
-    /// The count-only sizing path must agree with the general one, or a caller
-    /// that sizes a buffer through it writes past the end.
-    #[test]
-    fn anonymous_encoded_len_agrees_with_the_general_size() {
-        for n in [1usize, 2, 7, MAX_COLUMNS] {
-            let cols: Vec<SchemaBlockCol> = (0..n)
-                .map(|i| col(TypeCode::U64, "", (i == 0).then_some(0), false))
-                .collect();
-            assert_eq!(anonymous_encoded_len(n), encoded_len(&cols), "n = {n}");
-            assert_eq!(anonymous_encoded_len(n), encode(1, &cols).len(), "n = {n}");
-        }
     }
 
     /// A type_code word whose low byte names a valid type but whose high bits

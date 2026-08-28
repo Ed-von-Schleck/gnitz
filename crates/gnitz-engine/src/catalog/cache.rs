@@ -10,11 +10,11 @@ use std::collections::hash_map::Entry;
 // CatalogCacheSet — all typed caches for one CatalogEngine
 // ---------------------------------------------------------------------------
 
-/// Cached schema wire data for one table: the encoded block, the schema
-/// version it was built at, and the derived wire properties reused across
-/// SEEK/SCAN responses. All fields share one invalidation lifecycle
-/// (`clear_col_cache_no_bump` drops the entry whole, and the version bump that
-/// follows it means a surviving entry always carries its build-time version).
+/// Cached schema wire data for one table: the encoded block, the schema version
+/// it was built at, and its wire-safety. All three share one invalidation
+/// lifecycle (`clear_col_cache_no_bump` drops the entry whole, and the version
+/// bump that follows means a surviving entry always carries its build-time
+/// version).
 #[derive(Clone)]
 pub struct SchemaWireEntry {
     pub block: Rc<Vec<u8>>,
@@ -24,9 +24,6 @@ pub struct SchemaWireEntry {
     /// German-string (STRING or BLOB) columns. Drives the `with_scatter_group`
     /// fast path.
     pub wire_safe: bool,
-    /// Sum of pk_stride + 8 (weight) + 8 (null_bmp) + every payload column's
-    /// stride. Only meaningful when `wire_safe`.
-    pub wire_row_fixed_stride: u32,
 }
 
 #[derive(Default)]

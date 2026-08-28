@@ -25,7 +25,7 @@
 use crate::catalog::col;
 use crate::wal::IPC_CONTROL_TID;
 use crate::{
-    checksum, encode_german_string, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireSysCol,
+    checksum, encode_german_string_cell, read_u32_le, read_u64_le, try_decode_german_string, TypeCode, WireSysCol,
     REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION, WAL_HEADER_SIZE,
     WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
 };
@@ -165,8 +165,8 @@ const fn template_write<const N: usize>(buf: &mut [u8; CTRL_BLOCK_SIZE_NO_BLOB],
 
 /// Pre-encoded no-blob control block: header, directory, weight = 1, both
 /// nullable columns NULL, every variable field zero. `encode_ctrl_block`
-/// copies this and patches the variable fields. The checksum field stays 0 —
-/// callers that checksum their frames stamp it after encoding.
+/// copies this and patches the variable fields. The checksum field stays 0 in
+/// the template; `encode_ctrl_block` stamps it when its caller asks for one.
 const CTRL_BLOCK_TEMPLATE: [u8; CTRL_BLOCK_SIZE_NO_BLOB] = {
     let mut buf = [0u8; CTRL_BLOCK_SIZE_NO_BLOB];
     template_write(&mut buf, WAL_OFF_TID, IPC_CONTROL_TID.to_le_bytes());
@@ -198,9 +198,10 @@ const CTRL_BLOCK_TEMPLATE: [u8; CTRL_BLOCK_SIZE_NO_BLOB] = {
 /// Otherwise additionally write the German-string structs, clear the
 /// corresponding null bits, and append the blob spill.
 ///
-/// The checksum header field is left 0; callers that checksum their frames
-/// (durable WAL writes, TCP responses) stamp it over `[WAL_HEADER_SIZE, n)`
-/// after encoding.
+/// `checksum` stamps the header's checksum field over the encoded body, as
+/// `wal::encode` and `schema_block::encode_into` do for the blocks beside this
+/// one: `true` for what [`peek_control_block`] reads back, `false` for
+/// [`peek_control_block_ipc`].
 #[inline]
 pub fn encode_ctrl_block(
     out: &mut [u8],
@@ -208,6 +209,7 @@ pub fn encode_ctrl_block(
     hdr: &ControlHeader,
     error_msg: &[u8],
     seek_pk_extra: &[u8],
+    checksum: bool,
 ) -> usize {
     let total = ctrl_block_size(error_msg.len(), seek_pk_extra.len());
     let buf = &mut out[offset..offset + total];
@@ -221,26 +223,38 @@ pub fn encode_ctrl_block(
     buf[OFF_REQUEST_ID..OFF_REQUEST_ID + 8].copy_from_slice(&hdr.request_id.to_le_bytes());
 
     if error_msg.is_empty() && seek_pk_extra.is_empty() {
+        if checksum {
+            crate::wal::stamp_checksum(buf, CTRL_BLOCK_SIZE_NO_BLOB);
+        }
         return CTRL_BLOCK_SIZE_NO_BLOB;
     }
 
-    // Cold path: at least one German-string column is present.
-    let mut blob = Vec::with_capacity(total - CTRL_BLOCK_SIZE_NO_BLOB);
+    // Cold path: at least one German-string column is present. Each cell's
+    // spill goes straight into the blob region at the offset the cell names,
+    // so nothing is staged and copied twice.
+    let mut heap = 0usize;
     let mut null_word = NULL_BIT_ERROR_MSG | NULL_BIT_SEEK_PK_EXTRA;
+    let mut write_cell = |buf: &mut [u8], cell_off: usize, s: &[u8]| {
+        let (st, spill) = encode_german_string_cell(s, heap);
+        buf[cell_off..cell_off + 16].copy_from_slice(&st);
+        let at = CTRL_BLOCK_SIZE_NO_BLOB + heap;
+        buf[at..at + spill.len()].copy_from_slice(spill);
+        heap += spill.len();
+    };
     if !error_msg.is_empty() {
         null_word &= !NULL_BIT_ERROR_MSG;
-        let st = encode_german_string(error_msg, &mut blob);
-        buf[OFF_ERROR_MSG..OFF_ERROR_MSG + 16].copy_from_slice(&st);
+        write_cell(buf, OFF_ERROR_MSG, error_msg);
     }
     if !seek_pk_extra.is_empty() {
         null_word &= !NULL_BIT_SEEK_PK_EXTRA;
-        let st = encode_german_string(seek_pk_extra, &mut blob);
-        buf[OFF_SEEK_PK_EXTRA..OFF_SEEK_PK_EXTRA + 16].copy_from_slice(&st);
+        write_cell(buf, OFF_SEEK_PK_EXTRA, seek_pk_extra);
     }
     buf[OFF_NULL_BMP..OFF_NULL_BMP + 8].copy_from_slice(&null_word.to_le_bytes());
-    crate::write_u32_le(buf, crate::wal::dir_entry_offset(REG_BLOB) + 4, blob.len() as u32);
-    buf[CTRL_BLOCK_SIZE_NO_BLOB..CTRL_BLOCK_SIZE_NO_BLOB + blob.len()].copy_from_slice(&blob);
+    crate::write_u32_le(buf, crate::wal::dir_entry_offset(REG_BLOB) + 4, heap as u32);
     crate::write_u32_le(buf, WAL_OFF_SIZE, total as u32);
+    if checksum {
+        crate::wal::stamp_checksum(buf, total);
+    }
     total
 }
 
@@ -423,61 +437,69 @@ impl DecodedControl {
 mod tests {
     use super::*;
 
-    /// A header with a distinct value per field, so a transposed pair fails an
-    /// assertion rather than round-tripping unnoticed.
+    /// A header with a distinct wide value per field, so a transposed pair or a
+    /// truncated width fails an assertion rather than round-tripping unnoticed.
     fn probe_header() -> ControlHeader {
         ControlHeader {
-            target_id: 1,
-            client_id: 2,
-            flags: 3,
-            seek_pk: 4,
-            seek_col_idx: 5,
-            request_id: 6,
-            status: 7,
+            target_id: 0x1111_2222_3333_4444,
+            client_id: 0x5555_6666_7777_8888,
+            flags: 0x9999_AAAA_BBBB_CCCC,
+            seek_pk: (0xDDDD_EEEE_FFFF_0011u128 << 64) | 0x2233_4455_6677_8899u128,
+            seek_col_idx: 0xAA_BB_CC_DD_EE_FF_00_11,
+            request_id: 0x1234_5678_9ABC_DEF0,
+            status: 0xDEAD_BEEF,
         }
     }
 
-    /// The template-and-patch fast path and the blob fallback agree on the
-    /// shared fixed-region image: encoding with empty strings then with
-    /// spilling strings must differ only in the null word, the two German
-    /// structs, the blob directory entry / content, and the size field.
+    /// Every encode path — template fast path, inline strings, blob spill —
+    /// round-trips, at both trust levels and at a non-zero offset (a write
+    /// indexing through `out[offset + OFF_X..]` instead of the sub-slice then
+    /// lands outside the block).
     #[test]
     fn encode_roundtrip_all_paths() {
-        // Fast path.
-        let mut buf = vec![0u8; ctrl_block_size(0, 0)];
-        let n = encode_ctrl_block(&mut buf, 0, &probe_header(), b"", b"");
-        assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB);
-        let dec = peek_control_block_ipc(&buf[..n]).expect("decode empty");
-        assert_eq!(dec.target_id, 1);
-        assert_eq!(dec.client_id, 2);
-        assert_eq!(dec.flags, 3);
-        assert_eq!(dec.seek_pk, 4u128);
-        assert_eq!(dec.seek_col_idx, 5);
-        assert_eq!(dec.request_id, 6);
-        assert_eq!(dec.status, 7);
-        assert!(dec.error_msg.is_empty());
-        assert!(dec.seek_pk_extra.is_empty());
-        assert_eq!(dec.block_size, n);
+        const OFFSET: usize = 64;
+        for &checksum in &[false, true] {
+            let peek = |b: &[u8]| {
+                if checksum {
+                    peek_control_block(b)
+                } else {
+                    peek_control_block_ipc(b)
+                }
+            };
+            let hdr = probe_header();
 
-        // Inline strings (≤ 12 bytes, no blob spill).
-        let short = b"abcd";
-        let mut buf = vec![0u8; ctrl_block_size(short.len(), short.len())];
-        let n = encode_ctrl_block(&mut buf, 0, &probe_header(), short, short);
-        assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB, "inline strings must not grow the block");
-        let dec = peek_control_block_ipc(&buf[..n]).expect("decode short");
-        assert_eq!(dec.error_msg, short);
-        assert_eq!(dec.seek_pk_extra, short);
+            // Fast path.
+            let mut buf = vec![0u8; OFFSET + ctrl_block_size(0, 0)];
+            let n = encode_ctrl_block(&mut buf, OFFSET, &hdr, b"", b"", checksum);
+            assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB);
+            let dec = peek(&buf[OFFSET..OFFSET + n]).expect("decode empty");
+            assert_eq!(dec.header(), hdr, "checksum={checksum}");
+            assert!(dec.error_msg.is_empty());
+            assert!(dec.seek_pk_extra.is_empty());
+            assert_eq!(dec.block_size, n);
 
-        // Both spill into the shared blob region.
-        let err = b"this error message is definitely longer than twelve bytes";
-        let extra = b"and so is this wide-pk-extra blob payload past 12B";
-        let mut buf = vec![0u8; ctrl_block_size(err.len(), extra.len())];
-        let n = encode_ctrl_block(&mut buf, 0, &probe_header(), err, extra);
-        assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB + err.len() + extra.len());
-        let dec = peek_control_block_ipc(&buf[..n]).expect("decode long");
-        assert_eq!(dec.error_msg, err);
-        assert_eq!(dec.seek_pk_extra, extra);
-        assert_eq!(dec.block_size, n);
+            // Inline strings (≤ 12 bytes, no blob spill).
+            let short = b"abcd";
+            let mut buf = vec![0u8; OFFSET + ctrl_block_size(short.len(), short.len())];
+            let n = encode_ctrl_block(&mut buf, OFFSET, &hdr, short, short, checksum);
+            assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB, "inline strings must not grow the block");
+            let dec = peek(&buf[OFFSET..OFFSET + n]).expect("decode short");
+            assert_eq!(dec.error_msg, short);
+            assert_eq!(dec.seek_pk_extra, short);
+
+            // Both spill into the shared blob region, so the decoder has to
+            // resolve one heap and hand each cell the right slice of it.
+            let err = b"this error message is definitely longer than twelve bytes";
+            let extra = b"and so is this wide-pk-extra blob payload past 12B";
+            let mut buf = vec![0u8; OFFSET + ctrl_block_size(err.len(), extra.len())];
+            let n = encode_ctrl_block(&mut buf, OFFSET, &hdr, err, extra, checksum);
+            assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB + err.len() + extra.len());
+            let dec = peek(&buf[OFFSET..OFFSET + n]).expect("decode long");
+            assert_eq!(dec.header(), hdr);
+            assert_eq!(dec.error_msg, err);
+            assert_eq!(dec.seek_pk_extra, extra);
+            assert_eq!(dec.block_size, n);
+        }
     }
 
     /// The directory is part of the format, not something a sender gets to
@@ -487,7 +509,7 @@ mod tests {
     #[test]
     fn peek_rejects_a_directory_that_disagrees_with_the_template() {
         let mut buf = vec![0u8; ctrl_block_size(0, 0)];
-        let n = encode_ctrl_block(&mut buf, 0, &probe_header(), b"", b"");
+        let n = encode_ctrl_block(&mut buf, 0, &probe_header(), b"", b"", false);
         buf.truncate(n);
 
         // Aim `status` at `client_id`'s bytes: a well-formed, in-block extent.
@@ -506,7 +528,7 @@ mod tests {
         // The blob region's *size* is the one entry a sender legitimately varies.
         let long = b"an error message well past the twelve-byte inline threshold";
         let mut ok = vec![0u8; ctrl_block_size(long.len(), 0)];
-        let n = encode_ctrl_block(&mut ok, 0, &probe_header(), long, b"");
+        let n = encode_ctrl_block(&mut ok, 0, &probe_header(), long, b"", false);
         assert_eq!(peek_control_block_ipc(&ok[..n]).unwrap().error_msg, long);
     }
 
@@ -526,6 +548,7 @@ mod tests {
             },
             long_msg,
             b"",
+            false,
         );
         buf.truncate(n);
         let (err_off, _) = crate::wal::dir_entry(&buf, REG_ERROR_MSG);

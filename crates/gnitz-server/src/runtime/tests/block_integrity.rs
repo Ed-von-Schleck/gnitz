@@ -3,14 +3,14 @@
 //! control block, whose own checksum this file exercises.
 
 use crate::runtime::sal::GroupTargets;
-use crate::runtime::wire::{
-    build_schema_wire_block, decode_schema_block, encode_ctrl_block_direct, peek_control_block, peek_control_block_ipc,
-    WireData, WireMsg, STATUS_OK,
-};
+use crate::runtime::wire::{WireData, WireMsg};
+use gnitz_engine::schema::decode_schema_block;
 use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine::storage::Batch;
 use gnitz_engine_testkit::{make_batch, make_schema_u64_i64, sweep_bit_flips, SharedRegion};
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
+use gnitz_wire::control::{peek_control_block, peek_control_block_ipc};
+use gnitz_wire::STATUS_OK;
 use gnitz_wire::{WAL_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID};
 
 /// A checksummed data WAL block over `rows` of the standard `(u64 pk, i64 val)`
@@ -32,7 +32,7 @@ fn schema_block_4col() -> Vec<u8> {
         SchemaColumn::new(type_code::F64, 1),
     ];
     let schema = SchemaDescriptor::new(&cols, &[0]);
-    build_schema_wire_block(&schema, 7)
+    gnitz_engine::catalog::encode_schema_block(&schema, 7)
 }
 
 fn set_u32(buf: &mut [u8], off: usize, v: u32) {
@@ -172,11 +172,12 @@ fn single_bit_header_sweep_changes_nothing_observable() {
 /// A full checksummed wire frame: control + schema + data, as `write_group_direct`
 /// writes one into a SAL slot.
 fn wire_frame(schema: &SchemaDescriptor, batch: &Batch, flags: u64) -> Vec<u8> {
+    let block = gnitz_engine::catalog::encode_schema_block(schema, 7);
     let msg = WireMsg {
         target_id: 7,
         flags,
         request_id: 0x1234_5678_9ABC_DEF0,
-        schema: Some(schema),
+        schema_block: Some(&block),
         data: WireData::Whole(Some(batch)),
         ..Default::default()
     };
@@ -215,7 +216,7 @@ fn the_control_blocks_size_field_is_exact() {
         b"an error message well past the twelve-byte inline threshold",
     ] {
         let mut buf = vec![0u8; 1024];
-        let n = encode_ctrl_block_direct(
+        let n = gnitz_wire::control::encode_ctrl_block(
             &mut buf,
             0,
             &gnitz_wire::control::ControlHeader {
@@ -253,7 +254,6 @@ fn the_control_blocks_size_field_is_exact() {
 fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
     use crate::runtime::master::scatter::with_commit_indices;
     use crate::runtime::sal::{SalReader, SalWriter, FLAG_PUSH};
-    use gnitz_engine::storage::compute_wire_props;
 
     let size = 1 << 20;
     let region = SharedRegion::new(size);
@@ -264,22 +264,16 @@ fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
 
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-    let block = build_schema_wire_block(&schema, 16);
-    let props = compute_wire_props(&schema);
+    let relation = crate::runtime::wire::WireSchema::encoded(16, schema);
     let req_ids: Vec<u64> = (0..nw as u64).collect();
     with_commit_indices(&batch, &schema, nw, |wi| {
         writer
             .with_scatter_group(
                 &batch,
                 wi,
-                WireMsg {
-                    target_id: 16,
-                    schema: Some(&schema),
-                    prebuilt_schema_block: Some(block.as_slice()),
-                    ..Default::default()
-                },
+                &relation,
+                WireMsg::default(),
                 GroupTargets::All(&req_ids),
-                Some(props),
                 |g| writer.write_group_direct(g, 5, FLAG_PUSH),
             )
             .expect("group fits")

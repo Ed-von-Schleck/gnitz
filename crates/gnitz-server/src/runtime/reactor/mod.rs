@@ -38,7 +38,8 @@ use self::uring::{Cqe, IoUringRing, CQE_F_MORE};
 use crate::runtime::posix::FUTEX2_SIZE_U32;
 use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
-use crate::runtime::wire::{self, DecodedWire, FLAG_EXCHANGE};
+use crate::runtime::wire::{self, DecodedWire};
+use gnitz_wire::FLAG_EXCHANGE;
 
 /// High bit of `internal_req_id` (u32) marks scan-allocated request IDs.
 /// Regular IDs stay in [1, MAX_REGULAR_REQ_ID] (bit 31 clear).
@@ -680,7 +681,8 @@ impl Reactor {
                 self.route_scan_slot(slot);
                 continue;
             }
-            let ctrl = wire::peek_control_block_ipc(slot.bytes()).expect("W2M control block corrupt — ring corrupt");
+            let ctrl = gnitz_wire::control::peek_control_block_ipc(slot.bytes())
+                .expect("W2M control block corrupt — ring corrupt");
             let prefix = slot.internal_req_id;
             let decoded = self.decode_slot_owned(slot, ctrl);
             self.route_reply(w, prefix, decoded);
@@ -709,7 +711,7 @@ impl Reactor {
     /// bytes via `MemBatch`, allocates exactly one owned `Batch` when the
     /// frame carries data (ring → run, single `copy_from_slice`), then
     /// drops the slot so `consume_cursor` advances before any awaiter wakes.
-    fn decode_slot_owned(&self, slot: W2mSlot, ctrl: wire::DecodedControl) -> DecodedWire {
+    fn decode_slot_owned(&self, slot: W2mSlot, ctrl: gnitz_wire::control::DecodedControl) -> DecodedWire {
         let bytes = slot.bytes();
         let mut offsets = [0usize; gnitz_engine::storage::MAX_BATCH_REGIONS];
         let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, None, &mut offsets)
@@ -723,7 +725,7 @@ impl Reactor {
             owned.append_mem_batch(&mb);
             // The wire flags are ground truth. `append_mem_batch` leaves
             // `owned` `Raw`; raise to the decoded claim, debug-verifying the data.
-            owned.certify_layout(wire::layout_from_wire_flags(flags), sch);
+            owned.certify_layout(gnitz_engine::storage::Layout::from_wire_flags(flags), sch);
             owned
         });
         drop(slot); // RAII: advance consume_cursor before waking awaiter
@@ -1631,7 +1633,7 @@ mod tests {
 
     /// Build a minimal `DecodedWire` for tests — only `request_id` matters.
     fn synthetic_decoded_wire(req_id: u64) -> DecodedWire {
-        use crate::runtime::wire::DecodedControl;
+        use gnitz_wire::control::DecodedControl;
         DecodedWire {
             control: DecodedControl {
                 request_id: req_id,
@@ -2454,7 +2456,7 @@ mod tests {
     }
 
     fn synthetic_exchange_wire_src(view_id: i64, source_id: i64, req_id: u64) -> DecodedWire {
-        use crate::runtime::wire::DecodedControl;
+        use gnitz_wire::control::DecodedControl;
         DecodedWire {
             control: DecodedControl {
                 target_id: view_id as u64,
@@ -2640,7 +2642,7 @@ mod tests {
         use crate::runtime::reactor::{join_all_unpin, select2, Either};
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
-        use crate::runtime::wire::STATUS_OK;
+        use gnitz_wire::STATUS_OK;
         use std::time::Duration;
 
         const CAPACITY: usize = 64 * 1024;
@@ -2794,7 +2796,7 @@ mod tests {
     fn refresh_reports_pending_when_data_is_unread() {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
-        use crate::runtime::wire::STATUS_OK;
+        use gnitz_wire::STATUS_OK;
 
         const CAPACITY: usize = 64 * 1024;
 
@@ -3341,10 +3343,14 @@ mod tests {
 
         // await twice → frames returned in arrival order (100 then 101).
         let f0 = r.block_on(r.await_scan_slot(req_id));
-        let rid0 = wire::peek_control_block_ipc(f0.bytes()).unwrap().request_id;
+        let rid0 = gnitz_wire::control::peek_control_block_ipc(f0.bytes())
+            .unwrap()
+            .request_id;
         drop(f0);
         let f1 = r.block_on(r.await_scan_slot(req_id));
-        let rid1 = wire::peek_control_block_ipc(f1.bytes()).unwrap().request_id;
+        let rid1 = gnitz_wire::control::peek_control_block_ipc(f1.bytes())
+            .unwrap()
+            .request_id;
         drop(f1);
         assert_eq!(
             (rid0, rid1),
@@ -3384,7 +3390,9 @@ mod tests {
 
         for i in 0..N {
             let f = r.block_on(r.await_scan_slot(req_id));
-            let rid = wire::peek_control_block_ipc(f.bytes()).unwrap().request_id;
+            let rid = gnitz_wire::control::peek_control_block_ipc(f.bytes())
+                .unwrap()
+                .request_id;
             assert_eq!(rid, 100 + i as u64, "frame {i} delivered in arrival order");
             drop(f);
         }

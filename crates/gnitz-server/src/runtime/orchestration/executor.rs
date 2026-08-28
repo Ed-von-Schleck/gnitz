@@ -39,10 +39,7 @@ use crate::runtime::reactor::{
     mpsc, oneshot, select2, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard, ReplyFuture, WriteGuard,
 };
 use crate::runtime::sal::{GroupTargets, SalFit, FLAG_DELTA_SCAN, FLAG_SCAN_SPEC};
-use crate::runtime::wire::{
-    self as ipc, validate_schema_match, SchemaWithVersion, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK,
-    STATUS_SCHEMA_MISMATCH,
-};
+use crate::runtime::wire::{self as ipc, validate_schema_match, SchemaWithVersion};
 use gnitz_engine::catalog::{
     family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, CatalogEngine, SysFamily, FIRST_USER_TABLE_ID,
     SEQ_TAB_ID,
@@ -50,6 +47,7 @@ use gnitz_engine::catalog::{
 use gnitz_engine::query::RelationKind;
 use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine::storage::Batch;
+use gnitz_wire::{STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
 const TICK_DEADLINE_MS: u64 = 20;
@@ -258,7 +256,7 @@ impl Shared {
     /// invalidated alongside col_names whenever DDL modifies the table.
     fn get_schema_wire_block(&self, target_id: i64) -> Option<(Rc<Vec<u8>>, u16)> {
         let schema = self.cat().get_schema_desc(target_id)?;
-        let e = ipc::get_or_build_schema_wire_block(self.cat_mut(), target_id, &schema);
+        let e = self.cat_mut().schema_wire_entry(target_id, &schema);
         Some((e.block, e.version))
     }
 
@@ -1023,7 +1021,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     // decision and the push decode all read this same parse, so a malicious
     // client cannot forge a directory that points one at one region and another
     // at another.
-    let ctrl = match ipc::peek_client_control(data) {
+    let ctrl = match ipc::peek_frame_control(data) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("decode error: {e}");
@@ -1033,7 +1031,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     };
     let client_id = ctrl.client_id;
     let target_id = ctrl.target_id as i64;
-    let client_version = ipc::wire_flags_get_schema_version(ctrl.flags);
+    let client_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
 
     // The frame names exactly one verb, or it is malformed. A run of flag tests
     // would instead settle a two-verb frame by branch position, and would read a
@@ -1146,11 +1144,15 @@ enum PushReject {
 /// Staying off the catalog lock is the other reason: `AsyncRwLock` is
 /// writer-preferring, and a bulk load's multi-megabyte decode under the read
 /// guard would stall every DDL writer and everything queued behind it.
-fn decode_push_frame(shared: &Shared, data: &[u8], ctrl: ipc::DecodedControl) -> Result<ipc::DecodedWire, PushReject> {
+fn decode_push_frame(
+    shared: &Shared,
+    data: &[u8],
+    ctrl: gnitz_wire::control::DecodedControl,
+) -> Result<ipc::DecodedWire, PushReject> {
     let target_id = ctrl.target_id as i64;
-    let client_version = ipc::wire_flags_get_schema_version(ctrl.flags);
-    let has_schema = ctrl.flags & ipc::FLAG_HAS_SCHEMA != 0;
-    let has_data = ctrl.flags & ipc::FLAG_HAS_DATA != 0;
+    let client_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
+    let has_schema = ctrl.flags & gnitz_wire::FLAG_HAS_SCHEMA != 0;
+    let has_data = ctrl.flags & gnitz_wire::FLAG_HAS_DATA != 0;
 
     // A cold frame ships its own schema block and needs no hint.
     let catalog_schema = if has_data && !has_schema {
@@ -1176,12 +1178,12 @@ fn decode_push_frame(shared: &Shared, data: &[u8], ctrl: ipc::DecodedControl) ->
     decode_client_wire(data, ctrl, hint).map_err(|e| PushReject::Error(format!("decode error: {e}")))
 }
 
-async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: ipc::DecodedControl) {
+async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_wire::control::DecodedControl) {
     let client_id = ctrl.client_id;
     let target_id = ctrl.target_id as i64;
     let flags = ctrl.flags;
-    let client_version = ipc::wire_flags_get_schema_version(flags);
-    let has_schema = flags & ipc::FLAG_HAS_SCHEMA != 0;
+    let client_version = gnitz_wire::wire_flags_get_schema_version(flags);
+    let has_schema = flags & gnitz_wire::FLAG_HAS_SCHEMA != 0;
 
     // Decoding happens before the lock below, and cannot suspend: see
     // `decode_push_frame`.
@@ -1233,7 +1235,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: ipc::D
         }
     }
 
-    let Some(mode) = ipc::wire_flags_get_conflict_mode(flags) else {
+    let Some(mode) = gnitz_wire::wire_flags_get_conflict_mode(flags) else {
         send_error(peer, target_id, client_id, b"push: unknown conflict mode").await;
         return;
     };
@@ -1341,7 +1343,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: ipc::D
 /// base state is fresh at push-apply time, so the lock is taken once and never
 /// drains; a view seek drains inside `read_lock`, which requires that the drain
 /// happen with no catalog lock held.
-async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &ipc::DecodedControl, client_version: u16) {
+async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control::DecodedControl, client_version: u16) {
     let client_id = ctrl.client_id;
     let target_id = ctrl.target_id as i64;
     let pk = ctrl.seek_pk;
@@ -1397,7 +1399,7 @@ async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
                 // frame whose `seek_pk` carries the fresh basis. Empty message —
                 // the client synthesizes any human-readable text from the tid it
                 // sent.
-                PushTxnOutcome::Conflict(fresh_basis) => (fresh_basis, ipc::STATUS_TXN_CONFLICT),
+                PushTxnOutcome::Conflict(fresh_basis) => (fresh_basis, gnitz_wire::STATUS_TXN_CONFLICT),
             };
             let buf = encode_response_buffer(ipc::WireMsg {
                 client_id,
@@ -1418,7 +1420,8 @@ async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
 async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcome, String> {
     // 1. Decode + frame-local shape rules (no catalog access). The frame carries
     //    the families and the OCC preconditions (each `(tid, basis)`).
-    let (raw, preconditions) = ipc::decode_push_txn(data).map_err(|e| format!("decode error: {e}"))?;
+    let (raw, preconditions) =
+        gnitz_wire::txn_frame::decode_push_txn(data).map_err(|e| format!("decode error: {e}"))?;
     if raw.is_empty() {
         return Err("TXN: empty family bundle".to_string());
     }
@@ -1449,7 +1452,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         // The schema block is always present; validate it against the catalog
         // per family (a concurrent DDL between buffer time and commit surfaces as
         // a clean error the application re-runs).
-        let wire_schema = ipc::decode_schema_block(fam.schema_block, false)
+        let wire_schema = gnitz_engine::schema::decode_schema_block(fam.schema_block, false)
             .map_err(|e| format!("TXN family {tid} schema decode error: {e}"))?;
         validate_schema_match(&wire_schema, &catalog_schema)?;
         let batch = decode_client_batch(fam.wal_block, &catalog_schema)
@@ -1457,7 +1460,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         if batch.count == 0 {
             return Err(format!("TXN: empty batch for table {tid}"));
         }
-        let mode = ipc::WireConflictMode::from_u8(fam.mode)
+        let mode = gnitz_wire::WireConflictMode::from_u8(fam.mode)
             .ok_or_else(|| format!("TXN family {tid}: unknown conflict mode {}", fam.mode))?;
         families.push(TxnFamily { tid, mode, batch });
     }
@@ -1537,7 +1540,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
 /// `decode_client_batch`.
 fn decode_client_wire(
     data: &[u8],
-    ctrl: ipc::DecodedControl,
+    ctrl: gnitz_wire::control::DecodedControl,
     hint: Option<SchemaWithVersion<'_>>,
 ) -> Result<ipc::DecodedWire, &'static str> {
     let decoded = ipc::decode_wire_with_ctrl(data, ctrl, hint)?;
@@ -1647,7 +1650,12 @@ async fn target_kind_or_reject(
 /// `seek_col_idx` is `pack_pk_cols(col_indices)` and the key rides in
 /// `seek_pk` + `seek_pk_extra`; all three are read straight off the control block
 /// and forwarded verbatim to the fan-out.
-async fn handle_seek_by_index(shared: &Rc<Shared>, peer: &Peer, ctrl: &ipc::DecodedControl, client_version: u16) {
+async fn handle_seek_by_index(
+    shared: &Rc<Shared>,
+    peer: &Peer,
+    ctrl: &gnitz_wire::control::DecodedControl,
+    client_version: u16,
+) {
     let client_id = ctrl.client_id;
     let target_id = ctrl.target_id as i64;
     let seek_col_idx = ctrl.seek_col_idx;
@@ -1836,9 +1844,9 @@ fn build_resolve_reply(
     Ok(encode_response_buffer(ipc::WireMsg {
         target_id: tid as u64,
         client_id,
-        flags: ipc::wire_flags_set_schema_version(0, server_version),
+        flags: gnitz_wire::wire_flags_set_schema_version(0, server_version),
         status: STATUS_OK,
-        prebuilt_schema_block: Some(schema_block.as_slice()),
+        schema_block: Some(schema_block.as_slice()),
         seek_pk_extra: &blob,
         ..Default::default()
     }))
@@ -2002,13 +2010,13 @@ fn negotiate_scan_schema(shared: &Rc<Shared>, tid: i64, client_version: u16) -> 
 /// frames on a schema-cache miss. The caller chooses when to send it: inline for
 /// a single scan, deferred to the one-cut Phase 2 for a multi-scan.
 fn build_prelim_schema_frame(tid: i64, client_id: u64, server_version: u16, block: &[u8]) -> PooledSendBuf {
-    let prelim_flags = ipc::wire_flags_set_schema_version(ipc::FLAG_CONTINUATION, server_version);
+    let prelim_flags = gnitz_wire::wire_flags_set_schema_version(gnitz_wire::FLAG_CONTINUATION, server_version);
     encode_response_buffer(ipc::WireMsg {
         target_id: tid as u64,
         client_id,
         flags: prelim_flags,
         status: STATUS_OK,
-        prebuilt_schema_block: Some(block),
+        schema_block: Some(block),
         ..Default::default()
     })
 }
@@ -2237,7 +2245,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     // (`gnitz_wire::validate_scan_multi_tids`); this is the authoritative check —
     // a client may skip its own copy. tid legality is resolved in Phase 1 under
     // the catalog lock.
-    let relations = ipc::decode_scan_multi(data).map_err(|e| format!("decode error: {e}"))?;
+    let relations = gnitz_wire::txn_frame::decode_scan_multi(data).map_err(|e| format!("decode error: {e}"))?;
     let tids: Vec<u64> = relations.iter().map(|(tid, _)| *tid).collect();
     gnitz_wire::validate_scan_multi_tids(&tids)?;
 
@@ -2405,7 +2413,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
 async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), String> {
     // Decode the bundle and materialise each family's wal-block slice into an
     // owned Batch up front (before any lock) — see `decode_sys_family`.
-    let raw_families = ipc::decode_ddl_txn(data).map_err(|e| format!("decode error: {e}"))?;
+    let raw_families = gnitz_wire::txn_frame::decode_ddl_txn(data).map_err(|e| format!("decode error: {e}"))?;
     if raw_families.is_empty() {
         return Err("DDL_TXN: empty family bundle".to_string());
     }
@@ -2693,11 +2701,11 @@ async fn send_ok_response(
     let buf = encode_response_buffer(ipc::WireMsg {
         target_id: target_id as u64,
         client_id,
-        flags: ipc::wire_flags_set_schema_version(0, server_version),
+        flags: gnitz_wire::wire_flags_set_schema_version(0, server_version),
         seek_pk,
         status: STATUS_OK,
         data: ipc::WireData::Whole(result),
-        prebuilt_schema_block: schema_arg,
+        schema_block: schema_arg,
         ..Default::default()
     });
     peer.send_buffer_or_close(buf).await;
@@ -2713,10 +2721,9 @@ async fn send_control_only(peer: &Peer, target_id: i64, client_id: u64, status: 
     send_status_frame(peer, target_id, client_id, status, &[]).await
 }
 
-/// One control-only failure frame carrying `status` verbatim. A failing status
-/// suppresses the schema block (has_schema = false), so `prebuilt_schema = None`
-/// is correct and saves the cache lookup; flags = 0, since the client ignores the
-/// schema version on a failure.
+/// One control-only failure frame carrying `status` verbatim. No schema block:
+/// the client ignores both it and the schema version on a failure, so `flags`
+/// stays 0 and the cache lookup is skipped.
 ///
 /// The one place a status a *worker* minted reaches the client: the scan-forward
 /// stack carries `(status, text)` from `worker_error` down to here, so a typed
@@ -2742,8 +2749,8 @@ async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8
 /// what a stream lacks — a unique primary key, and any retraction at all — and
 /// rejecting `Error` mode is what keeps `push_reads_committed_state` false, and
 /// with it the shared table lock and the unread mode field.
-fn stream_push_error(target_id: i64, batch: &Batch, mode: ipc::WireConflictMode) -> Option<String> {
-    if mode == ipc::WireConflictMode::Error {
+fn stream_push_error(target_id: i64, batch: &Batch, mode: gnitz_wire::WireConflictMode) -> Option<String> {
+    if mode == gnitz_wire::WireConflictMode::Error {
         return Some(format!(
             "table {target_id} is a stream: conflict mode 'error' asserts a primary-key \
              uniqueness a stream does not have"
@@ -2915,7 +2922,7 @@ mod tests {
     /// legal case, so a `> 1` check would be wrong in the other direction.
     #[test]
     fn stream_push_rejects_only_non_positive_weights() {
-        let ok = ipc::WireConflictMode::Update;
+        let ok = gnitz_wire::WireConflictMode::Update;
         assert_eq!(stream_push_error(7, &weighted(&[1, 5, 1]), ok), None);
         assert_eq!(stream_push_error(7, &weighted(&[]), ok), None);
         for bad in [vec![0], vec![-1], vec![1, 1, -3], vec![2, 0]] {
@@ -2930,7 +2937,7 @@ mod tests {
     /// even when every weight is legal.
     #[test]
     fn stream_push_rejects_error_conflict_mode() {
-        let e = stream_push_error(7, &weighted(&[1]), ipc::WireConflictMode::Error).expect("must be rejected");
+        let e = stream_push_error(7, &weighted(&[1]), gnitz_wire::WireConflictMode::Error).expect("must be rejected");
         assert!(e.contains("conflict mode 'error'"), "got: {e}");
     }
 }

@@ -13,6 +13,7 @@ gnitz-engine-testkit = { path = "../gnitz-engine-testkit" }
 gnitz-sql = { path = "../gnitz-sql" }
 gnitz-test-harness = { path = "../gnitz-test-harness" }
 libc = "0.2"
+proptest = "1"
 tempfile = "3"
 
 [lints.rust]

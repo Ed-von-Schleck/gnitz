@@ -38,7 +38,7 @@ pub(super) fn parse_train_header(
     slot: &W2mSlot,
     w: usize,
     what: &str,
-) -> Result<(wire::DecodedControl, bool), WorkerFault> {
+) -> Result<(gnitz_wire::control::DecodedControl, bool), WorkerFault> {
     let ctrl = peek_control_block_ipc(slot.bytes()).map_err(|e| scan_decode_err(w, e))?;
     if let Some(e) = super::worker_error(w, what, &ctrl) {
         return Err(e);
@@ -374,12 +374,13 @@ mod tests {
         batch: Option<&Batch>,
     ) {
         use crate::runtime::wire::{self as ipc};
+        let block = schema.map(|s| gnitz_engine::catalog::encode_schema_block_ipc(s, 1));
         let msg = ipc::WireMsg {
             target_id: 1,
             flags,
             status,
             error_msg,
-            schema,
+            schema_block: block.as_deref(),
             data: ipc::WireData::Whole(batch),
             ..Default::default()
         };
@@ -433,7 +434,7 @@ mod tests {
     ///    assert.
     #[test]
     fn drain_index_scan_errs_immediately_on_fault_frame() {
-        use crate::runtime::wire::{STATUS_ERROR, STATUS_OK};
+        use gnitz_wire::{STATUS_ERROR, STATUS_OK};
 
         let (fx, writers) = DrainFixture::new(2);
         let w0_req = fx.req(0);
@@ -479,7 +480,7 @@ mod tests {
     /// FLAG_SCAN_LAST ⇒ more" instead would hang this test at `Pending`.
     #[test]
     fn drain_index_scan_merges_chunked_and_single_frame_trains() {
-        use crate::runtime::wire::STATUS_OK;
+        use gnitz_wire::STATUS_OK;
 
         let schema = two_col_schema();
         let chunk_a = make_row_batch(schema, &[(1, 1, 0, 10), (2, 1, 0, 20)]);
@@ -547,7 +548,7 @@ mod tests {
     /// shape, so a DDL-lagged worker reply would otherwise be mis-decoded.
     #[test]
     fn drain_index_scan_rejects_first_frame_schema_mismatch() {
-        use crate::runtime::wire::STATUS_OK;
+        use gnitz_wire::STATUS_OK;
 
         let wire_schema = two_col_schema();
         let expected = u64_schema(); // different column count
@@ -584,7 +585,7 @@ mod tests {
     /// parked for the lease drop to discard.
     #[test]
     fn drain_index_scan_sink_error_aborts_drain() {
-        use crate::runtime::wire::STATUS_OK;
+        use gnitz_wire::STATUS_OK;
 
         let schema = two_col_schema();
         let chunk = make_row_batch(schema, &[(1, 1, 0, 10)]);
@@ -640,7 +641,7 @@ mod tests {
     /// retired at the ring, not leaked.
     #[test]
     fn drain_scan_train_drops_a_frame_with_neither_data_nor_schema() {
-        use crate::runtime::wire::STATUS_OK;
+        use gnitz_wire::STATUS_OK;
         use std::sync::atomic::Ordering;
 
         let (fx, writers) = DrainFixture::new(1);
@@ -688,7 +689,7 @@ mod tests {
     /// dropped rather than concatenated, exactly as the per-worker drain does.
     #[test]
     fn forward_scan_slots_coalesces_single_frame_heads() {
-        use crate::runtime::wire::STATUS_OK;
+        use gnitz_wire::STATUS_OK;
         use std::sync::atomic::Ordering;
 
         let schema = two_col_schema();

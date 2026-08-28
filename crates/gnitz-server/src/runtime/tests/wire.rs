@@ -1,15 +1,22 @@
 use crate::runtime::wire::{
-    build_schema_wire_block, decode_schema_block, decode_wire, decode_wire_ipc, decode_wire_ipc_zero_copy_with_ctrl,
-    encode_ctrl_block_direct, peek_client_control, peek_control_block, peek_control_block_ipc,
-    wire_flags_set_schema_version, DecodedWireZeroCopy, SchemaWithVersion, WireData, WireMsg, FLAG_CONTINUATION,
-    STATUS_ERROR, STATUS_OK,
+    decode_wire, decode_wire_ipc, decode_wire_ipc_zero_copy_with_ctrl, peek_frame_control, validate_schema_match,
+    DecodedWireZeroCopy, SchemaWithVersion, WireData, WireMsg,
 };
-use gnitz_engine::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_engine::storage::{Batch, MAX_BATCH_REGIONS};
+use gnitz_engine::catalog::encode_schema_block;
+use gnitz_engine::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
+use gnitz_engine::storage::{Batch, Layout, MAX_BATCH_REGIONS};
 use gnitz_engine_testkit::{make_batch, make_batch_raw, u64_pk_schema};
+use gnitz_wire::control::peek_control_block_ipc;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::type_code;
 use gnitz_wire::{encode_german_string, try_decode_german_string};
+use gnitz_wire::{wire_flags_set_schema_version, FLAG_CONTINUATION, STATUS_ERROR, STATUS_OK};
+
+/// The anonymous schema block a frame for `sd` under `target_id` carries — what
+/// every producer in the tree hands `WireMsg::schema_block`.
+fn sblock(sd: &SchemaDescriptor, target_id: u64) -> Vec<u8> {
+    encode_schema_block(sd, target_id as u32)
+}
 
 /// The narrow frame schema every fixture here uses: `(u64 pk, u64 val)`.
 fn simple_schema() -> SchemaDescriptor {
@@ -67,9 +74,10 @@ fn encode_decode_roundtrip_no_data() {
 #[test]
 fn encode_decode_roundtrip_with_schema() {
     let sd = simple_schema();
+    let blk = sblock(&sd, 1);
     let wire = WireMsg {
         target_id: 1,
-        schema: Some(&sd),
+        schema_block: Some(&blk),
         ..Default::default()
     }
     .encode_to_vec();
@@ -87,9 +95,10 @@ fn encode_decode_roundtrip_with_schema() {
 fn encode_decode_roundtrip_with_data() {
     let sd = simple_schema();
     let batch = make_simple_batch(100, 999);
+    let blk = sblock(&sd, 5);
     let wire = WireMsg {
         target_id: 5,
-        schema: Some(&sd),
+        schema_block: Some(&blk),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -124,7 +133,7 @@ fn schema_roundtrip_wire_preserves_pk_order() {
     ];
     for &(cols, pk_indices) in cases {
         let original = SchemaDescriptor::new(cols, pk_indices);
-        let block = build_schema_wire_block(&original, 0);
+        let block = gnitz_engine::catalog::encode_schema_block(&original, 0);
         let decoded = decode_schema_block(&block, true).unwrap();
         assert!(
             original == decoded,
@@ -155,9 +164,10 @@ fn encode_decode_string_column() {
     batch.extend_col(1, &st2);
     batch.count += 1;
 
+    let blk = sblock(&sd, 10);
     let wire = WireMsg {
         target_id: 10,
-        schema: Some(&sd),
+        schema_block: Some(&blk),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -181,9 +191,10 @@ fn encode_decode_string_column() {
 fn encode_into_buffer_roundtrip() {
     let sd = simple_schema();
     let batch = make_simple_batch(100, 999);
+    let blk = sblock(&sd, 5);
 
     let sz = WireMsg {
-        schema: Some(&sd),
+        schema_block: Some(&blk),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -191,7 +202,7 @@ fn encode_into_buffer_roundtrip() {
     let mut buf = vec![0u8; sz];
     let written = WireMsg {
         target_id: 5,
-        schema: Some(&sd),
+        schema_block: Some(&blk),
         data: WireData::Whole(Some(&batch)),
         ..Default::default()
     }
@@ -214,6 +225,7 @@ fn encode_into_buffer_roundtrip() {
 fn every_frame_shape() -> Vec<Vec<u8>> {
     let sd = simple_schema();
     let batch = make_simple_batch(1, 42);
+    let blk = sblock(&sd, 1);
     vec![
         WireMsg {
             target_id: 1,
@@ -222,13 +234,13 @@ fn every_frame_shape() -> Vec<Vec<u8>> {
         .encode_to_vec(),
         WireMsg {
             target_id: 1,
-            schema: Some(&sd),
+            schema_block: Some(&blk),
             ..Default::default()
         }
         .encode_to_vec(),
         WireMsg {
             target_id: 1,
-            schema: Some(&sd),
+            schema_block: Some(&blk),
             data: WireData::Whole(Some(&batch)),
             ..Default::default()
         }
@@ -261,14 +273,15 @@ fn every_truncation_of_a_frame_is_rejected() {
 fn encode_writes_exactly_the_predicted_size() {
     let sd = simple_schema();
     let batch = make_simple_batch(100, 999);
+    let blk = sblock(&sd, 0);
     let msgs = [
         WireMsg::default(),
         WireMsg {
-            schema: Some(&sd),
+            schema_block: Some(&blk),
             ..Default::default()
         },
         WireMsg {
-            schema: Some(&sd),
+            schema_block: Some(&blk),
             data: WireData::Whole(Some(&batch)),
             ..Default::default()
         },
@@ -285,62 +298,22 @@ fn encode_writes_exactly_the_predicted_size() {
     }
 }
 
-/// Verify that prebuilt schema bytes produce bit-identical output to the inline path.
-/// This is the core invariant of the schema wire block cache.
+/// A schema block with no column defs — every name empty — is valid and
+/// round-trips correctly. This is the shape every SAL slot and exchange frame
+/// carries.
 #[test]
-fn prebuilt_schema_block_matches_inline_encode() {
+fn schema_block_no_col_names_roundtrips() {
     let sd = simple_schema();
-    let batch = make_simple_batch(7, 42);
-    let target_id: u64 = 99;
-
-    // Inline path (no prebuilt).
-    let inline = WireMsg {
-        target_id,
-        schema: Some(&sd),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
-    }
-    .encode_to_vec();
-
-    // Prebuilt path.
-    let prebuilt = build_schema_wire_block(&sd, target_id as u32);
+    let prebuilt = sblock(&sd, 5);
     let sz = WireMsg {
-        schema: Some(&sd),
-        prebuilt_schema_block: Some(&prebuilt),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
-    }
-    .size();
-    let mut buf = vec![0u8; sz];
-    WireMsg {
-        target_id,
-        schema: Some(&sd),
-        prebuilt_schema_block: Some(&prebuilt),
-        data: WireData::Whole(Some(&batch)),
-        ..Default::default()
-    }
-    .encode(&mut buf, 0);
-
-    assert_eq!(buf, inline, "prebuilt schema block must produce identical wire bytes");
-}
-
-/// A cached schema block with no column defs — every name empty — is valid and
-/// round-trips correctly.
-#[test]
-fn prebuilt_schema_block_no_col_names_roundtrips() {
-    let sd = simple_schema();
-    let prebuilt = build_schema_wire_block(&sd, 5);
-    let sz = WireMsg {
-        schema: Some(&sd),
-        prebuilt_schema_block: Some(&prebuilt),
+        schema_block: Some(&prebuilt),
         ..Default::default()
     }
     .size();
     let mut buf = vec![0u8; sz];
     WireMsg {
         target_id: 5,
-        schema: Some(&sd),
-        prebuilt_schema_block: Some(&prebuilt),
+        schema_block: Some(&prebuilt),
         ..Default::default()
     }
     .encode(&mut buf, 0);
@@ -402,83 +375,26 @@ fn decode_wire_round_trips_every_control_field() {
 }
 
 #[test]
-fn peek_client_control_on_valid_wire() {
+fn peek_frame_control_on_valid_wire() {
     let wire = WireMsg {
         target_id: 99,
         client_id: 0xCAFE_BABE,
         ..Default::default()
     }
     .encode_to_vec();
-    let ctrl = peek_client_control(&wire).unwrap();
+    let ctrl = peek_frame_control(&wire).unwrap();
     assert_eq!(ctrl.target_id, 99);
     assert_eq!(ctrl.client_id, 0xCAFE_BABE);
 }
 
 #[test]
-fn peek_client_control_rejects_short_data() {
+fn peek_frame_control_rejects_short_data() {
     // Any slice shorter than WAL_HEADER_SIZE must fail.
-    let result = peek_client_control(&[0u8; 10]);
+    let result = peek_frame_control(&[0u8; 10]);
     assert!(
         result.is_err(),
-        "peek_client_control should reject slices < WAL_HEADER_SIZE"
+        "peek_frame_control should reject slices < WAL_HEADER_SIZE"
     );
-}
-
-/// The ctrl-block round-trip through the shared `gnitz_wire::control` codec:
-/// every variable field distinct and non-zero so a swapped offset corrupts the
-/// bytes detectably; `offset = 64` so writes accidentally indexing through
-/// `out[offset + OFF_X..]` rather than the sub-slice are also caught. Runs
-/// with and without the engine's checksum stamp, decoded at the matching
-/// verification setting, so both frames must decode identically.
-#[test]
-fn encode_ctrl_block_direct_roundtrips() {
-    const OFFSET: usize = 64;
-    let target_id: u64 = 0x1111_2222_3333_4444;
-    let client_id: u64 = 0x5555_6666_7777_8888;
-    let wire_flags: u64 = 0x9999_AAAA_BBBB_CCCC;
-    let seek_pk: u128 = (0xDDDD_EEEE_FFFF_0011u128 << 64) | 0x2233_4455_6677_8899u128;
-    let seek_col_idx: u64 = 0xAA_BB_CC_DD_EE_FF_00_11;
-    let request_id: u64 = 0x1234_5678_9ABC_DEF0;
-    let status: u32 = 0xDEAD_BEEF;
-
-    for &checksum in &[false, true] {
-        let mut buf = vec![0u8; OFFSET + CTRL_BLOCK_SIZE_NO_BLOB];
-        let n = encode_ctrl_block_direct(
-            &mut buf,
-            OFFSET,
-            &gnitz_wire::control::ControlHeader {
-                status,
-                target_id,
-                client_id,
-                flags: wire_flags,
-                seek_pk,
-                seek_col_idx,
-                request_id,
-            },
-            b"",
-            &[],
-            checksum,
-        );
-        assert_eq!(
-            n, CTRL_BLOCK_SIZE_NO_BLOB,
-            "encoder size mismatch (checksum={checksum})"
-        );
-        let block = &buf[OFFSET..OFFSET + n];
-        let dec = if checksum {
-            peek_control_block(block)
-        } else {
-            peek_control_block_ipc(block)
-        }
-        .expect("decode");
-        assert_eq!(dec.target_id, target_id);
-        assert_eq!(dec.client_id, client_id);
-        assert_eq!(dec.flags, wire_flags);
-        assert_eq!(dec.seek_pk, seek_pk);
-        assert_eq!(dec.seek_col_idx, seek_col_idx);
-        assert_eq!(dec.request_id, request_id);
-        assert_eq!(dec.status, status);
-        assert_eq!(dec.block_size, n);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -508,10 +424,11 @@ fn decode_continuation<'a>(
 fn wire_size_range_matches_encoded_size() {
     let sd = simple_schema();
     let batch = make_wire_safe_batch(8);
+    let blk = sblock(&sd, 1);
 
     for count in [0usize, 1, 4, 8] {
         let sz = WireMsg {
-            schema: Some(&sd),
+            schema_block: Some(&blk),
             data: WireData::Range {
                 batch: &batch,
                 start_row: 0,
@@ -523,7 +440,7 @@ fn wire_size_range_matches_encoded_size() {
         let mut buf = vec![0u8; sz];
         let written = WireMsg {
             target_id: 1,
-            schema: Some(&sd),
+            schema_block: Some(&blk),
             data: WireData::Range {
                 batch: &batch,
                 start_row: 0,
@@ -542,8 +459,9 @@ fn wire_size_range_matches_encoded_size() {
 fn wire_size_range_positive_per_row_delta() {
     let sd = simple_schema();
     let batch = make_wire_safe_batch(1);
+    let blk = sblock(&sd, 0);
     let sz0 = WireMsg {
-        schema: Some(&sd),
+        schema_block: Some(&blk),
         data: WireData::Range {
             batch: &batch,
             start_row: 0,
@@ -553,7 +471,7 @@ fn wire_size_range_positive_per_row_delta() {
     }
     .size();
     let sz1 = WireMsg {
-        schema: Some(&sd),
+        schema_block: Some(&blk),
         data: WireData::Range {
             batch: &batch,
             start_row: 0,
@@ -570,10 +488,11 @@ fn wire_size_range_positive_per_row_delta() {
 fn encode_range_roundtrip() {
     let sd = simple_schema();
     let batch = make_wire_safe_batch(8);
+    let blk = sblock(&sd, 1);
 
     // Encode rows [2, 5) into a wire frame with the schema block.
     let sz = WireMsg {
-        schema: Some(&sd),
+        schema_block: Some(&blk),
         data: WireData::Range {
             batch: &batch,
             start_row: 0,
@@ -585,7 +504,7 @@ fn encode_range_roundtrip() {
     let mut buf = vec![0u8; sz];
     WireMsg {
         target_id: 1,
-        schema: Some(&sd),
+        schema_block: Some(&blk),
         data: WireData::Range {
             batch: &batch,
             start_row: 2,
@@ -671,41 +590,6 @@ fn continuation_frame_decoded_with_schema_hint() {
     assert!(err.is_err(), "version mismatch must return Err");
 }
 
-/// The blob fallback path (an error message present) round-trips through the
-/// shared codec at a non-zero offset. Both German strings spill, so the decoder
-/// has to resolve one shared blob region and hand the right slice to each — and
-/// they do it under the checksum stamp, which is what this wrapper adds over
-/// `gnitz_wire::control::encode_ctrl_block`.
-#[test]
-fn encode_ctrl_block_direct_error_path_roundtrips() {
-    const OFFSET: usize = 32;
-    let err = b"something went wrong, well past the twelve-byte threshold";
-    let extra = b"and so is this wide-pk-extra blob payload past 12B";
-    let mut buf = vec![0u8; OFFSET + 1024];
-    let n = encode_ctrl_block_direct(
-        &mut buf,
-        OFFSET,
-        &gnitz_wire::control::ControlHeader {
-            status: STATUS_ERROR,
-            target_id: 7,
-            client_id: 11,
-            flags: 13,
-            seek_pk: 17,
-            seek_col_idx: 19,
-            request_id: 23,
-        },
-        err,
-        extra,
-        true,
-    );
-    let dec = peek_control_block(&buf[OFFSET..OFFSET + n]).expect("decode");
-    assert_eq!(dec.status, STATUS_ERROR);
-    assert_eq!(dec.error_msg, err);
-    assert_eq!(dec.seek_pk_extra, extra);
-    assert_eq!(dec.seek_pk, 17u128);
-    assert_eq!(dec.block_size, n);
-}
-
 #[test]
 fn schemaless_command_slot_is_a_bare_control_block() {
     // Every command verb's SAL slot is written with no schema block and no data,
@@ -719,4 +603,94 @@ fn schemaless_command_slot_is_a_bare_control_block() {
     }
     .encode_to_vec();
     assert_eq!(buf.len(), CTRL_BLOCK_SIZE_NO_BLOB);
+}
+
+/// The shared decoder applies the header's FLAG_BATCH_SORTED /
+/// FLAG_BATCH_CONSOLIDATED bits onto the decoded batch. Encode a frame whose
+/// data batch is flagged sorted+consolidated (the encoder mirrors the batch's
+/// own claim into the header), decode it, and confirm both arrive set.
+#[test]
+fn decode_applies_batch_flags() {
+    let schema = two_col_schema(0);
+    let mut batch = Batch::with_capacity(schema, 1);
+    batch.extend_pk(1u128);
+    batch.extend_weight(&1i64.to_le_bytes());
+    batch.extend_null_bmp(&0u64.to_le_bytes());
+    batch.extend_col(0, &42i64.to_le_bytes());
+    batch.count += 1;
+    batch.certify_layout(Layout::Consolidated, &schema);
+
+    let blk = sblock(&schema, 7);
+    let wire = WireMsg {
+        target_id: 7,
+        schema_block: Some(&blk),
+        data: WireData::Whole(Some(&batch)),
+        ..Default::default()
+    }
+    .encode_to_vec();
+
+    let decoded = decode_wire(&wire).expect("decode");
+    let b = decoded.data_batch.as_ref().expect("data batch present");
+    assert!(b.is_sorted(), "decoder applies FLAG_BATCH_SORTED");
+    assert!(b.is_consolidated(), "decoder applies FLAG_BATCH_CONSOLIDATED");
+}
+
+fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, col1_nullable),
+        ],
+        &[0],
+    )
+}
+
+#[test]
+fn validate_schema_match_ok() {
+    let sd = two_col_schema(0);
+    assert!(validate_schema_match(&sd, &sd).is_ok());
+}
+
+/// Each mismatch family is rejected, and each names itself distinctly.
+///
+/// `wire == expected` is the verdict; the message only names the first
+/// differing column, and the executor and reply-train decoder surface it.
+/// Four `is_err()` assertions would still pass if the message collapsed to
+/// one constant string — pairwise distinctness is what tests it, without
+/// pinning the prose.
+#[test]
+fn validate_schema_match_names_each_mismatch_distinctly() {
+    let col = |tc, n| SchemaColumn::new(tc, n);
+    let expected = two_col_schema(0);
+    let cases = [
+        (
+            "count",
+            SchemaDescriptor::new(&[col(type_code::U64, 0)], &[0]),
+            expected,
+        ),
+        (
+            "pk",
+            SchemaDescriptor::new(&[col(type_code::U64, 0), col(type_code::I64, 0)], &[1]),
+            expected,
+        ),
+        (
+            "type",
+            SchemaDescriptor::new(&[col(type_code::U64, 0), col(type_code::F64, 0)], &[0]),
+            expected,
+        ),
+        ("nullable", two_col_schema(0), two_col_schema(1)),
+    ];
+    let msgs: Vec<String> = cases
+        .iter()
+        .map(|(what, wire, exp)| validate_schema_match(wire, exp).expect_err(what))
+        .collect();
+    for i in 0..msgs.len() {
+        for j in (i + 1)..msgs.len() {
+            assert_ne!(
+                msgs[i], msgs[j],
+                "{} vs {} report the same message",
+                cases[i].0, cases[j].0
+            );
+        }
+    }
 }

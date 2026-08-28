@@ -28,6 +28,7 @@ mod metadata;
 mod precheck;
 mod registry;
 mod scan_spec;
+mod schema_block;
 mod store_io;
 mod store_lsn;
 mod sys_tables;
@@ -51,8 +52,9 @@ use crate::storage::{Batch, ReadCursor, RecoverySource, StorageError, Table};
 pub use sys_tables::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates};
 pub use sys_tables::{SysFamily, FIRST_USER_TABLE_ID, PUBLIC_SCHEMA_ID, SEQ_TAB_ID};
 pub use types::{ColumnDef, FkEdge};
-// The reply path's cached schema wire block.
+// The reply path's cached schema wire block, and the encoders that fill it.
 pub use cache::SchemaWireEntry;
+pub use schema_block::{encode_named_schema_block, encode_schema_block, encode_schema_block_ipc};
 pub use store_io::IngestError;
 // The master's ScanSpec confinement test.
 pub use scan_spec::scan_spec_worker;

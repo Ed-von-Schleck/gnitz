@@ -155,9 +155,10 @@ impl ExchangeAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::wire::FLAG_EXCHANGE;
-    use crate::runtime::wire::{DecodedControl, DecodedWire};
+    use crate::runtime::wire::DecodedWire;
     use gnitz_engine::schema::SchemaDescriptor;
+    use gnitz_wire::control::DecodedControl;
+    use gnitz_wire::FLAG_EXCHANGE;
 
     fn make_wire(view_id: i64, source_id: i64, with_schema: bool) -> DecodedWire {
         DecodedWire {

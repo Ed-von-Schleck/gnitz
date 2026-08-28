@@ -569,8 +569,7 @@ unsafe fn assert_footprint_exact(
 ) {
     use crate::runtime::master::scatter::with_commit_indices;
     use crate::runtime::sal::FLAG_PUSH;
-    use crate::runtime::wire::{build_schema_wire_block, WireMsg};
-    use gnitz_engine::storage::compute_wire_props;
+    use crate::runtime::wire::WireMsg;
 
     // Drive the production dispatch: `broadcast` is exactly the `Replicated`
     // placement `with_commit_indices` routes on, and nothing in the wire encoding
@@ -588,27 +587,19 @@ unsafe fn assert_footprint_exact(
     let writer = SalWriter::new(ptr, -1, size as u64, nw);
     writer.reset(0, 1); // epoch >= 1 for sal_begin_group's debug_assert
 
-    let target_id = 16u32;
-    let block = build_schema_wire_block(schema, target_id);
-    let props = compute_wire_props(schema);
+    let relation = crate::runtime::wire::WireSchema::encoded(16, *schema);
     let req_ids: Vec<u64> = (0..nw as u64).map(|i| i + 1).collect();
 
     let emit = |wi: &[Vec<u32>]| {
-        let predicted =
-            writer.scatter_group_footprint(batch, wi, schema, target_id, Some(block.as_slice()), Some(props));
+        let predicted = writer.scatter_group_footprint(batch, wi, &relation);
         let before = writer.cursor();
         writer
             .with_scatter_group(
                 batch,
                 wi,
-                WireMsg {
-                    target_id: target_id as u64,
-                    schema: Some(schema),
-                    prebuilt_schema_block: Some(block.as_slice()),
-                    ..Default::default()
-                },
+                &relation,
+                WireMsg::default(),
                 GroupTargets::All(&req_ids),
-                Some(props),
                 |g| writer.write_group_direct(g, 7, FLAG_PUSH),
             )
             .expect("group fits");
@@ -669,8 +660,8 @@ fn scatter_group_footprint_non_wire_safe_shared_span_dedup() {
 /// after, and a prediction below the truth turns a reclaim-and-retry into a
 /// fatal `SAL full` on a relay no worker can go without.
 ///
-/// Both an empty slot (no rows → control block only) and a populated one are
-/// covered, since only a populated slot pays the schema block and the data.
+/// Both an empty slot and a populated one are covered: a dataless slot still
+/// carries the group's schema block, so only the data block distinguishes them.
 #[test]
 fn group_footprint_direct_equals_emitted_bytes() {
     use crate::runtime::sal::DirectGroup;
@@ -681,6 +672,7 @@ fn group_footprint_direct_equals_emitted_bytes() {
     let nw = 4;
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+    let block = gnitz_engine::catalog::encode_schema_block(&schema, 16);
 
     let size = 1 << 20;
     let region = SharedRegion::new(size);
@@ -699,7 +691,7 @@ fn group_footprint_direct_equals_emitted_bytes() {
             target_id: 16,
             seek_pk: 7,
             seek_col_idx: 1,
-            schema: Some(&schema),
+            schema_block: Some(&block),
             ..Default::default()
         },
         data: GroupData::PerWorker(&worker_data),

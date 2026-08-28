@@ -5,15 +5,17 @@ use crate::{read_u32_le, read_u64_le};
 /// Threshold for inline German String storage (bytes).
 pub const SHORT_STRING_THRESHOLD: usize = 12;
 
-/// Encode a byte slice as a 16-byte German String struct, appending overflow
-/// data to `blob`.
+/// Encode a byte slice as a 16-byte German String struct destined for a heap
+/// whose current end is `heap_off`, returning the cell and the bytes it spills
+/// there — empty while the value fits inline. Returning the spill rather than
+/// appending it lets a caller writing into a pre-sized slice place it directly.
 ///
 /// Layout:
 ///   [0..4]  length (u32 LE)
 ///   [4..8]  prefix — first min(4, len) bytes, zero-padded
 ///   [8..16] if len ≤ 12: suffix bytes [4..len], zero-padded
 ///           if len > 12: blob arena offset (u64 LE)
-pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
+pub(crate) fn encode_german_string_cell(s: &[u8], heap_off: usize) -> ([u8; 16], &[u8]) {
     let len = s.len();
     // The 4-byte length field caps a string at u32::MAX bytes. Silently
     // truncating `len as u32` would corrupt this persisted format, so reject
@@ -25,7 +27,7 @@ pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     let mut st = [0u8; 16];
     st[0..4].copy_from_slice(&(len as u32).to_le_bytes());
     if len == 0 {
-        return st;
+        return (st, &[]);
     }
     let pfx = len.min(4);
     st[4..4 + pfx].copy_from_slice(&s[..pfx]);
@@ -33,11 +35,18 @@ pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
         if len > 4 {
             st[8..8 + (len - 4)].copy_from_slice(&s[4..len]);
         }
+        (st, &[])
     } else {
-        let off = blob.len();
-        blob.extend_from_slice(s);
-        st[8..16].copy_from_slice(&(off as u64).to_le_bytes());
+        st[8..16].copy_from_slice(&(heap_off as u64).to_le_bytes());
+        (st, s)
     }
+}
+
+/// [`encode_german_string_cell`] against a growable arena: the spill, if any,
+/// is appended to `blob`.
+pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
+    let (st, spill) = encode_german_string_cell(s, blob.len());
+    blob.extend_from_slice(spill);
     st
 }
 

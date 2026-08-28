@@ -23,15 +23,15 @@ use crate::runtime::sal::{
     FLAG_TICK, FLAG_UNIQUE_PREFLIGHT,
 };
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
-use crate::runtime::wire::{
-    self, peek_control_block_ipc, unique_preflight_wire_schema, DecodedWire, SchemaWithVersion, WireConflictMode,
-    FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
-};
+use crate::runtime::wire::{self, unique_preflight_wire_schema, DecodedWire, SchemaWithVersion, FLAG_SCAN_LAST};
 use gnitz_engine::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
 use gnitz_engine::query::RelayRoute;
 use gnitz_engine::schema::key::PkBuf;
 use gnitz_engine::storage::Batch;
-use gnitz_wire::wire_flags_set_conflict_mode;
+use gnitz_wire::control::peek_control_block_ipc;
+use gnitz_wire::{
+    wire_flags_set_conflict_mode, WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
+};
 use scatter::{with_commit_indices, with_worker_indices};
 
 // ---------------------------------------------------------------------------
@@ -43,10 +43,12 @@ use scatter::{with_commit_indices, with_worker_indices};
 /// left, which `emit_relay_with_decision` does synchronously under
 /// `sal_writer_excl`.
 pub(crate) struct RelayPrepared {
-    view_id: i64,
+    /// The view the relay targets, its schema block encoded once in
+    /// `prepare_relay`: the group is measured before the SAL lock and emitted
+    /// under it, and both passes read these same bytes.
+    view: wire::WireSchema,
     source_id: i64,
     dest: RelayDest,
-    schema: SchemaDescriptor,
     /// SAL bytes the emission will write, sized from `dest` while it was built.
     pub(crate) footprint: usize,
 }
@@ -196,7 +198,7 @@ pub(crate) use gnitz_wire::WireFault as WorkerFault;
 /// Render worker `w`'s reply as a fault, or `None` when it succeeded. The one
 /// place the fault contract of a worker reply is read: `status != 0` means the
 /// worker failed, `error_msg` holds its (UTF-8) text, and both halves travel on.
-pub(crate) fn worker_error(w: usize, op: &str, ctrl: &wire::DecodedControl) -> Option<WorkerFault> {
+pub(crate) fn worker_error(w: usize, op: &str, ctrl: &gnitz_wire::control::DecodedControl) -> Option<WorkerFault> {
     (ctrl.status != 0).then(|| {
         let msg = String::from_utf8_lossy(&ctrl.error_msg);
         WorkerFault {

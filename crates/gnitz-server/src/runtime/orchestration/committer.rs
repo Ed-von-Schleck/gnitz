@@ -28,9 +28,10 @@ use super::guard_panic;
 use crate::runtime::master::{await_worker_acks, first_worker_error_opt, TxnFamily};
 use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, Either, ReplyFuture};
 use crate::runtime::sal::{GroupTargets, SalFit, FLAG_FLUSH, FLAG_FLUSH_EPH};
-use crate::runtime::wire::{DecodedWire, WireConflictMode};
+use crate::runtime::wire::DecodedWire;
 use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::storage::Batch;
+use gnitz_wire::WireConflictMode;
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 

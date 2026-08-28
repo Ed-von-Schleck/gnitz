@@ -307,8 +307,7 @@ mod tests {
     use super::*;
     use crate::runtime::master::scatter::with_commit_indices;
     use crate::runtime::sal::{group_header_size, sal_write_group, GroupTargets, FLAG_PUSH, FLAG_TICK};
-    use crate::runtime::wire::{build_schema_wire_block, WireMsg};
-    use gnitz_engine::storage::compute_wire_props;
+    use crate::runtime::wire::WireMsg;
     use gnitz_engine_testkit::{make_batch, make_schema_u64_i64, sweep_bit_flips, SharedRegion};
 
     const SIZE: usize = 1 << 20;
@@ -791,26 +790,20 @@ mod tests {
     fn push_zone(writer: &SalWriter, lsn: u64, targets: &[u32]) -> Vec<u64> {
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-        let block = build_schema_wire_block(&schema, TID);
-        let props = compute_wire_props(&schema);
         let req_ids: Vec<u64> = (0..NW as u64).collect();
         let mut bases = Vec::new();
         for (i, &t) in targets.iter().enumerate() {
             bases.push(writer.cursor());
+            let relation = ipc::WireSchema::encoded(t as i64, schema);
             let flags = FLAG_PUSH | if i == 0 { FLAG_ZONE_START } else { 0 };
             with_commit_indices(&batch, &schema, NW, |wi| {
                 writer
                     .with_scatter_group(
                         &batch,
                         wi,
-                        WireMsg {
-                            target_id: t as u64,
-                            schema: Some(&schema),
-                            prebuilt_schema_block: Some(block.as_slice()),
-                            ..Default::default()
-                        },
+                        &relation,
+                        WireMsg::default(),
                         GroupTargets::All(&req_ids),
-                        Some(props),
                         |g| writer.write_group_direct(g, lsn, flags),
                     )
                     .expect("group fits")

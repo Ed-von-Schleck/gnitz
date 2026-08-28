@@ -14,8 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::posix;
 use crate::runtime::posix::{read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw};
-use crate::runtime::wire::{build_schema_wire_block, WireData, WireMsg};
-use gnitz_engine::schema::SchemaDescriptor;
+use crate::runtime::wire::{WireData, WireMsg, WireSchema};
 use gnitz_engine::storage::Batch;
 use gnitz_wire::align8;
 
@@ -159,27 +158,6 @@ impl<'a> DirectGroup<'a> {
             *size = self.msg(w).size() as u32;
         }
         sizes
-    }
-
-    /// Run `f` on this group with its schema block materialized once for the
-    /// whole group. Without it every slot re-encodes the same descriptor, so a
-    /// `nw`-worker group builds `nw` bit-identical blocks; with it each slot
-    /// copies one encoding. Sizing and emission both go through this, so the
-    /// group measured is the group emitted.
-    fn with_group_schema_block<R>(&self, f: impl FnOnce(&DirectGroup) -> R) -> R {
-        match (self.template.schema, self.template.prebuilt_schema_block) {
-            (Some(schema), None) => {
-                let block = build_schema_wire_block(schema, self.template.target_id as u32);
-                f(&DirectGroup {
-                    template: WireMsg {
-                        prebuilt_schema_block: Some(&block),
-                        ..self.template
-                    },
-                    ..*self
-                })
-            }
-            _ => f(self),
-        }
     }
 }
 
@@ -983,15 +961,10 @@ impl SalWriter {
     /// `lsn` is supplied by the caller; the SAL writer no longer owns the
     /// counter (Design 2: caller controls zone-LSN allocation).
     ///
-    /// `prebuilt_schema_block`: when `Some`, the bytes are copied into each
-    /// slot's schema region instead of building one from `schema`.
-    ///
-    /// `schema: None` (with no prebuilt block) emits no schema block at all —
-    /// the command verbs whose worker arm resolves its own schema from its own
-    /// catalog. A group carrying data must always name its schema: that is what
-    /// stamps `Batch.schema` on the worker side, and `decode_wire` hard-errors on
-    /// FLAG_HAS_DATA without FLAG_HAS_SCHEMA, so the reply's request_id would fall
-    /// back to 0 and the master's `ReplyFuture` would never resolve.
+    /// The template's `schema_block` is copied verbatim into every slot — one
+    /// encoding, `nw` memcpys — or omitted entirely when it is `None`, which the
+    /// command verbs do: their worker arm resolves its own schema. A group
+    /// carrying data must carry one, as the `debug_assert` below states.
     pub fn write_group_direct(&self, g: &DirectGroup, lsn: u64, sal_flags: u32) -> Result<(), String> {
         let nw = self.num_workers;
         if let GroupTargets::All(ids) = g.targets {
@@ -1013,42 +986,36 @@ impl SalWriter {
             );
         }
         debug_assert!(
-            g.template.schema.is_some() || g.template.prebuilt_schema_block.is_some() || g.data.is_dataless(),
+            g.template.schema_block.is_some() || g.data.is_dataless(),
             "write_group_direct: data without a schema — `decode_wire` rejects FLAG_HAS_DATA \
              without FLAG_HAS_SCHEMA",
         );
 
-        g.with_group_schema_block(|g| {
-            let worker_sizes = g.slot_sizes(nw);
-            let group = self.begin(
-                "write_group_direct",
-                g.template.target_id as u32,
-                lsn,
-                sal_flags,
-                &worker_sizes[..nw],
-            )?;
+        let worker_sizes = g.slot_sizes(nw);
+        let group = self.begin(
+            "write_group_direct",
+            g.template.target_id as u32,
+            lsn,
+            sal_flags,
+            &worker_sizes[..nw],
+        )?;
 
-            unsafe {
-                group.for_each_slot(|w, slot| {
-                    let written = g.msg(w).encode(slot, 0);
-                    debug_assert_eq!(written, slot.len());
-                });
-            }
+        unsafe {
+            group.for_each_slot(|w, slot| {
+                let written = g.msg(w).encode(slot, 0);
+                debug_assert_eq!(written, slot.len());
+            });
+        }
 
-            self.finish(group);
-            Ok(())
-        })
+        self.finish(group);
+        Ok(())
     }
 
     /// The exact number of SAL bytes `write_group_direct` will consume for `g`.
     /// Neither the sentinel nor the checkpoint band is included; both are held
     /// back globally by `effective_capacity`.
     pub(crate) fn group_footprint_direct(&self, g: &DirectGroup) -> usize {
-        let nw = self.num_workers;
-        // Through the same schema-block hoist the emission uses, so the group
-        // measured is the group written rather than one that merely sizes the
-        // same.
-        g.with_group_schema_block(|g| 8 + group_payload_size(&g.slot_sizes(nw)[..nw]))
+        8 + group_payload_size(&g.slot_sizes(self.num_workers)[..self.num_workers])
     }
 
     /// Build the [`DirectGroup`] a scatter emission of `input_batch` under
@@ -1064,24 +1031,21 @@ impl SalWriter {
     /// carries out-of-line string bytes and has no scatter encoder, so its slots
     /// materialize a per-worker sub-`Batch` first.
     ///
-    /// `template` is the group's shared header and must name a schema — every
-    /// slot here carries rows. `wire_props` is `(wire_safe,
-    /// wire_row_fixed_stride)` as from `cached_schema_block`, letting a caller
-    /// that already has it skip the per-column iteration.
+    /// `relation` supplies the target id, the schema block every slot carries,
+    /// and the descriptor the scatter encoder reads region strides off; the
+    /// caller's `template` contributes only its own header fields.
     pub(crate) fn with_scatter_group<R>(
         &self,
         input_batch: &Batch,
         worker_indices: &[Vec<u32>],
+        relation: &WireSchema,
         template: WireMsg<'_>,
         targets: GroupTargets<'_>,
-        wire_props: Option<(bool, u32)>,
         f: impl FnOnce(&DirectGroup) -> R,
     ) -> R {
         let nw = self.num_workers;
-        let schema = template
-            .schema
-            .expect("a scatter group carries rows, so its template must name their schema");
-        let (wire_safe, _) = wire_props.unwrap_or_else(|| gnitz_engine::storage::compute_wire_props(schema));
+        let schema = relation.descriptor();
+        let wire_safe = relation.wire_safe();
 
         // The sub-batches must outlive the group that borrows them, so they are
         // built here rather than inside the `worker_data` map.
@@ -1112,14 +1076,11 @@ impl SalWriter {
                 })
                 .collect()
         } else {
-            sub_batches
-                .iter()
-                .map(|b| WireData::Whole((b.count > 0).then_some(b)))
-                .collect()
+            sub_batches.iter().map(|b| WireData::Whole(Some(b))).collect()
         };
 
         f(&DirectGroup {
-            template,
+            template: relation.frame(template),
             data: GroupData::PerWorker(&worker_data),
             targets,
         })
@@ -1140,22 +1101,14 @@ impl SalWriter {
         &self,
         input_batch: &Batch,
         worker_indices: &[Vec<u32>],
-        schema: &SchemaDescriptor,
-        target_id: u32,
-        prebuilt_schema_block: Option<&[u8]>,
-        wire_props: Option<(bool, u32)>,
+        relation: &WireSchema,
     ) -> usize {
         self.with_scatter_group(
             input_batch,
             worker_indices,
-            WireMsg {
-                target_id: target_id as u64,
-                schema: Some(schema),
-                prebuilt_schema_block,
-                ..Default::default()
-            },
+            relation,
+            WireMsg::default(),
             GroupTargets::AllSilent,
-            wire_props,
             |g| self.group_footprint_direct(g),
         )
     }

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT};
 use crate::runtime::sal::{SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
-use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_SCAN_LAST, STATUS_OK};
+use crate::runtime::wire::{self as ipc, FLAG_SCAN_LAST};
 use gnitz_engine::catalog::{CatalogEngine, IngestError, FIRST_USER_TABLE_ID};
 use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::query::{DagEngine, ExchangeCallback};
@@ -18,6 +18,7 @@ use gnitz_engine::schema::key::PkBuf;
 use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine::storage::BlobCacheGuard;
 use gnitz_engine::storage::{schema_wire_safe, Batch};
+use gnitz_wire::{FLAG_CONTINUATION, FLAG_EXCHANGE, STATUS_OK};
 
 // ---------------------------------------------------------------------------
 // WorkerExchangeHandler
@@ -557,7 +558,7 @@ impl WorkerProcess {
                 // so the replay stamps the round that produced this delta rather
                 // than whatever the counter reaches by then.
                 let req_id = wire
-                    .and_then(|d| ipc::peek_client_control(d).ok())
+                    .and_then(|d| ipc::peek_frame_control(d).ok())
                     .map(|c| c.request_id)
                     .unwrap_or(0);
                 self.exchange.deferred_replay.push(Deferred::Tick {
@@ -1015,8 +1016,8 @@ impl WorkerProcess {
         let (spec_bytes, reply_block) =
             gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
         let spec = gnitz_wire::ReadSpec::decode(spec_bytes).map_err(|e| format!("scan_spec: {e}"))?;
-        let reply_schema =
-            ipc::decode_schema_block(reply_block, true).map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
+        let reply_schema = gnitz_engine::schema::decode_schema_block(reply_block, true)
+            .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self
             .cat()
             .scan_spec_family(target_id, &spec, &reply_schema, seek_pk as u64)?;
@@ -1735,10 +1736,11 @@ mod tests {
     fn encode_relay_frame(target_id: u64, source_id: u128, schema: &SchemaDescriptor) -> &'static [u8] {
         // No data batch — a header-only relay. `seek_pk` echoes the source_id the
         // waiter matches on; `seek_col_idx` 0 is BACKFILL_DECISION_CONTINUE.
+        let block = gnitz_engine::catalog::encode_schema_block(schema, target_id as u32);
         let msg = ipc::WireMsg {
             target_id,
             seek_pk: source_id,
-            schema: Some(schema),
+            schema_block: Some(&block),
             ..Default::default()
         };
         Box::leak(msg.encode_to_vec().into_boxed_slice())
@@ -1747,9 +1749,10 @@ mod tests {
     /// Encode a wire frame carrying `batch` under `schema`. Leaked to `'static`
     /// for `dispatch`, which takes its payload from the SAL mapping.
     fn encode_data_frame(target_id: u64, schema: &SchemaDescriptor, batch: &Batch) -> &'static [u8] {
+        let block = gnitz_engine::catalog::encode_schema_block(schema, target_id as u32);
         let msg = ipc::WireMsg {
             target_id,
-            schema: Some(schema),
+            schema_block: Some(&block),
             data: ipc::WireData::Whole(Some(batch)),
             ..Default::default()
         };
@@ -1923,7 +1926,7 @@ mod tests {
         schema: &gnitz_engine::schema::SchemaDescriptor,
         offsets: &'a mut [usize; gnitz_engine::storage::MAX_BATCH_REGIONS],
     ) -> Result<ipc::DecodedWireZeroCopy<'a>, &'static str> {
-        let ctrl = ipc::peek_control_block_ipc(bytes)?;
+        let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes)?;
         let hint = ipc::SchemaWithVersion {
             descriptor: schema,
             version: 0,
@@ -1950,7 +1953,7 @@ mod tests {
                 start_row: 0,
                 count,
             },
-            prebuilt_schema_block: prebuilt,
+            schema_block: prebuilt,
             ..Default::default()
         }
         .size()
@@ -1965,7 +1968,7 @@ mod tests {
     fn test_chunk_wire_size_is_affine_in_the_row_count() {
         let schema = test_schema();
         let batch = make_n_row_batch(schema, 32);
-        let block = ipc::build_schema_wire_block(&schema, 1);
+        let block = gnitz_engine::catalog::encode_schema_block(&schema, 1);
 
         let base = range_size(&batch, 0, Some(block.as_slice()));
         let hdr = batch.wire_byte_size_range(0);
@@ -1990,7 +1993,7 @@ mod tests {
     fn test_train_frames_fill_the_budget_to_within_one_row() {
         let schema = test_schema();
         let batch = make_n_row_batch(schema, 40);
-        let block = Rc::new(ipc::build_schema_wire_block(&schema, 1));
+        let block = Rc::new(gnitz_engine::catalog::encode_schema_block(&schema, 1));
         let per_row = batch.wire_byte_size_range(1) - batch.wire_byte_size_range(0);
         // Room for four rows beside the schema block on the first frame.
         let budget = range_size(&batch, 4, Some(block.as_slice()));
@@ -2035,7 +2038,7 @@ mod tests {
     fn test_pending_scan_first_chunk_includes_schema() {
         let schema = test_schema();
         let batch = make_n_row_batch(schema, 10);
-        let schema_block = Rc::new(ipc::build_schema_wire_block(&schema, 1));
+        let schema_block = Rc::new(gnitz_engine::catalog::encode_schema_block(&schema, 1));
 
         let (region, writer) = make_ring();
         let ptr = region.ptr();
@@ -2141,7 +2144,7 @@ mod tests {
         );
 
         let data = consume_one(ptr);
-        let ctrl = ipc::peek_control_block_ipc(&data).expect("peek_control_block");
+        let ctrl = gnitz_wire::control::peek_control_block_ipc(&data).expect("peek_control_block");
         assert_eq!(ctrl.status, STATUS_OK);
         assert_ne!(
             ctrl.flags & FLAG_SCAN_LAST,
@@ -2188,7 +2191,7 @@ mod tests {
         assert!(wp.pending_streams.is_empty(), "a one-chunk train pops after one emit");
         let frames = walk_frames(ptr);
         assert_eq!(frames.len(), 1);
-        let ctrl = ipc::peek_control_block_ipc(&frames[0].1).unwrap();
+        let ctrl = gnitz_wire::control::peek_control_block_ipc(&frames[0].1).unwrap();
         assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
         assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
     }
@@ -2234,7 +2237,7 @@ mod tests {
         assert!(wp.pending_streams.is_empty(), "the single blob frame pops the train");
         let frames = walk_frames(ptr);
         assert_eq!(frames.len(), 1);
-        let ctrl = ipc::peek_control_block_ipc(&frames[0].1).unwrap();
+        let ctrl = gnitz_wire::control::peek_control_block_ipc(&frames[0].1).unwrap();
         assert_eq!(ctrl.status, STATUS_OK);
         assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
         assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
@@ -2314,8 +2317,8 @@ mod tests {
         );
         let batch_a = make_n_row_batch(schema_a, 10);
         let batch_b = make_n_row_batch(schema_b, 5);
-        let block_a = Rc::new(ipc::build_schema_wire_block(&schema_a, 1));
-        let block_b = Rc::new(ipc::build_schema_wire_block(&schema_b, 2));
+        let block_a = Rc::new(gnitz_engine::catalog::encode_schema_block(&schema_a, 1));
+        let block_b = Rc::new(gnitz_engine::catalog::encode_schema_block(&schema_b, 2));
 
         // Budget: exactly the first chunk's size at 4 rows (A's schema block
         // included), so train A's 10 rows span at least two frames.
@@ -2371,7 +2374,7 @@ mod tests {
             let train: Vec<_> = frames.iter().filter(|(r, _)| *r == req).collect();
             let mut rows = 0usize;
             for (i, (_, bytes)) in train.iter().enumerate() {
-                let ctrl = ipc::peek_control_block_ipc(bytes).expect("ctrl");
+                let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes).expect("ctrl");
                 assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
                 let is_last = i == train.len() - 1;
                 assert_eq!(
@@ -2558,7 +2561,7 @@ mod tests {
             .stream_batch_response(tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0)
             .is_ok());
         assert_eq!(wp.pending_streams.len(), 1);
-        let expected_block = ipc::build_schema_wire_block(&projected, tid as u32);
+        let expected_block = gnitz_engine::catalog::encode_schema_block(&projected, tid as u32);
         let ps = wp.pending_streams.front().unwrap();
         assert!(
             matches!(ps.kind, PendingScanKind::WireSafe { .. }),

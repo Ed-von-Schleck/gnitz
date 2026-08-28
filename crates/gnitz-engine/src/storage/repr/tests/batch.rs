@@ -756,3 +756,12 @@ fn empty_batch_drop_is_noop() {
 
     assert_eq!(acquire_buf().capacity(), 0, "empty batch should not pollute pool");
 }
+
+/// The wire-bit pair is a bijection over the ladder: every variant survives
+/// encode→decode, including `Sorted` alone, whose single bit no other test sets.
+#[test]
+fn layout_wire_flags_round_trip() {
+    for l in [Layout::Raw, Layout::Sorted, Layout::Consolidated] {
+        assert_eq!(Layout::from_wire_flags(l.to_wire_flags()), l, "{l:?}");
+    }
+}

@@ -41,9 +41,8 @@ pub struct Message {
 pub(crate) fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u8]) -> Vec<u8> {
     let total = gnitz_wire::control::ctrl_block_size(error_msg.len(), seek_pk_extra.len());
     let mut buf = vec![0u8; total];
-    gnitz_wire::control::encode_ctrl_block(&mut buf, 0, header, error_msg.as_bytes(), seek_pk_extra);
     // Client frames carry a body checksum, matching `encode_wal_block`.
-    gnitz_wire::wal::stamp_checksum(&mut buf, total);
+    gnitz_wire::control::encode_ctrl_block(&mut buf, 0, header, error_msg.as_bytes(), seek_pk_extra, true);
     buf
 }
 
