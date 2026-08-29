@@ -277,7 +277,7 @@ pub(crate) fn replicated_unicast(disp: &MasterDispatcher, target_id: i64) -> Fan
 pub(crate) struct ScanDispatch {
     /// Reply `i` arrives on `ids[i]`, for `i < n`. Indexed by **reply**, never
     /// by worker — a unicast has one reply, so it uses one slot.
-    ids: [u64; crate::runtime::sal::MAX_WORKERS],
+    ids: [u64; gnitz_wire::MAX_WORKERS],
     n: usize,
     /// The one worker a unicast wrote to; `None` when reply `i` is worker `i`'s.
     worker: Option<usize>,
@@ -288,12 +288,12 @@ impl ScanDispatch {
     /// Allocate this fan-out's request ids and register them into a fresh
     /// `ScanLease`, before any await.
     fn alloc(reactor: &crate::runtime::reactor::Reactor, nw: usize, fanout: Fanout) -> ScanDispatch {
-        let mut ids = [0u64; crate::runtime::sal::MAX_WORKERS];
+        let mut ids = [0u64; gnitz_wire::MAX_WORKERS];
         let n = match fanout {
             Fanout::Broadcast => nw,
             Fanout::One(_) => 1,
         };
-        let mut scan_ids = [0u32; crate::runtime::sal::MAX_WORKERS];
+        let mut scan_ids = [0u32; gnitz_wire::MAX_WORKERS];
         for (r, s) in ids[..n].iter_mut().zip(&mut scan_ids[..n]) {
             *r = reactor.alloc_scan_request_id();
             *s = *r as u32;

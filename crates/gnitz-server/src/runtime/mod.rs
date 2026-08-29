@@ -11,7 +11,7 @@
 // sibling module.
 //
 // `orchestration` (master/worker/executor/committer) and `protocol`
-// (wire/sal/w2m/w2m_ring) group the submodules by layer; `posix` holds the
+// (wire/sal/w2m) group the submodules by layer; `posix` holds the
 // syscall tier that serves them — sockets, eventfd/futex/memfd and the
 // `MAP_SHARED` rings — which is why it is here and not in the engine's
 // `foundation::posix_io`. `affinity` is a peer rather than part of `posix`
@@ -29,10 +29,9 @@ mod reactor;
 mod tls;
 
 use orchestration::{committer, executor, lsn, master, peer, worker};
-use protocol::{sal, w2m, w2m_ring, wire};
+use protocol::{sal, w2m, wire};
 
 pub(crate) use bootstrap::server_main;
-pub(crate) use protocol::sal::MAX_WORKERS;
 pub(crate) use tls::TlsCli;
 
 #[cfg(test)]

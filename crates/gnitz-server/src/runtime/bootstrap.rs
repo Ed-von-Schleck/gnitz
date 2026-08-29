@@ -22,8 +22,7 @@ use crate::runtime::posix;
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{sal_mmap_size, sal_tail_slot_count, SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_PUSH};
 use crate::runtime::tls::{setup_tls_listener, TlsCli};
-use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-use crate::runtime::w2m_ring::{self, W2M_REGION_SIZE};
+use crate::runtime::w2m::{self, W2mReceiver, W2mWriter, W2M_REGION_SIZE};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
 use gnitz_engine::storage::Batch;
@@ -383,7 +382,7 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
         // Initialize the SPSC ring header (cursors at HEADER_SIZE,
         // capacity = full region).
         unsafe {
-            w2m_ring::init_region(wptr, W2M_REGION_SIZE as u64);
+            w2m::init_region(wptr, W2M_REGION_SIZE as u64);
         }
         w2m_ptrs.push(wptr);
 

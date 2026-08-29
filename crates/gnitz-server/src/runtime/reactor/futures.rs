@@ -107,7 +107,7 @@ pub(super) struct ScanRoute {
     /// A *queue*, not a single slot: a worker streams continuation frames ahead
     /// while the master drains a different worker serially, so a single value
     /// would drop all but the last. Each queued `W2mSlot` holds its ring slot
-    /// until dropped, so the worker blocks in `send_encoded` once the ring
+    /// until dropped, so the worker blocks in `W2mWriter::send_msg` once the ring
     /// fills — depth is bounded by ring capacity.
     pub(super) queue: VecDeque<W2mSlot>,
     pub(super) waker: Option<Waker>,

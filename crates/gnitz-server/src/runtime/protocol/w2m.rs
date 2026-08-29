@@ -1,24 +1,35 @@
-//! W2M (worker→master) SPSC ring handles: the worker's [`W2mWriter`], the
-//! master's [`W2mReceiver`], and the park/wake protocol between them.
+//! W2M: the worker→master SPSC transport — one `MAP_SHARED` tail-chasing ring
+//! per worker, the worker's [`W2mWriter`], the master's [`W2mReceiver`], and the
+//! futex park/wake protocol between them.
+//!
+//! ## Layout
+//!
+//! A 128-byte [`W2mRingHeader`] followed by `DCAP = capacity - W2M_HEADER_SIZE`
+//! bytes of data. `write_cursor` (worker-written) and `release_cursor`
+//! (master-written) are monotonic **virtual** offsets, never physical positions;
+//! the master's read cursor sits between them — `release <= read <= write` — and
+//! never leaves this process. `phys(v) = HEADER + (v - HEADER) % DCAP`, memoized
+//! in a [`RingCursor`] so the modulo stays off both hot paths.
+//!
+//! When a message would not fit before `capacity`, the writer stamps
+//! `SKIP_MARKER` at the current physical position and publishes at the data
+//! head instead; the reader jumps the same way, so markers are transparent.
 //!
 //! ## The park rule
 //!
 //! Each side parks on the cursor whose advance is the condition it waits for:
 //! the worker on `release_cursor` (space freed), the master on `write_cursor`
-//! (a message published). Both halves below are locked read-modify-writes, and
-//! both are load-bearing:
+//! (a message published). [`ParkWord`] pairs each cursor with its own park flags
+//! and is the only way to reach either, so the read-modify-writes the protocol
+//! needs cannot be written any other way.
 //!
-//! - the **parker** publishes its flag with `fetch_or` and re-tests the cursor
-//!   after, so a peer that already acted is visible to the re-test;
-//! - the **peer** publishes its cursor with a `swap` before reading the flag,
-//!   so a flag it reads clear means its cursor store is already globally
-//!   visible.
-//!
-//! Drop either RMW and the store-buffer race is real: the peer reads a
-//! stale-clear flag and skips the wake while the parker reads a stale cursor
-//! and parks. A fence on one side does not help — it drains that side's store
-//! buffer, not the other's — and neither does the futex value-compare, which is
-//! a plain kernel read that a still-buffered store makes match spuriously.
+//! Who *clears* a flag differs by direction, and that asymmetry is load-bearing.
+//! [`wake_master`] takes the gate, so the publishes that follow until the master
+//! re-arms skip the syscall: a master parks only when the ring reads empty, so
+//! any publish after its snapshot fails the futex value-compare and returns
+//! without a wake. [`wake_writer`] must not — the writer waits for *enough
+//! room*, which a later retirement may be the first to give, so a bit cleared on
+//! its behalf is a wake nobody issues and a permanent hang.
 
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
@@ -26,12 +37,39 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use io_uring::types::FutexWaitV;
 
-use crate::runtime::posix;
-use crate::runtime::w2m_ring::{
-    self, ConsumedSlot, Reservation, RingCursor, W2mRingHeader, FLAG_MASTER_ANY, FLAG_MASTER_SYNC, FLAG_MASTER_WAITV,
-    FLAG_WRITER_PARKED,
-};
+use crate::runtime::posix::{self, read_u64_raw, write_u64_raw};
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg};
+use gnitz_wire::align8;
+
+// ---------------------------------------------------------------------------
+// Geometry
+// ---------------------------------------------------------------------------
+
+/// Fixed header size at the start of every W2M mmap region.
+const W2M_HEADER_SIZE: usize = 128;
+
+/// Upper bound on a single W2M wire message (256 MiB). Large enough for any
+/// real query response, small enough that `u64::MAX` is an unambiguous
+/// SKIP-marker sentinel in the size prefix.
+pub(crate) const MAX_W2M_MSG: u64 = 1 << 28;
+
+/// Capacity (header + data) of each per-worker W2M mmap region.
+///
+/// The region is a `memfd` mapped whole, so a ring that sweeps all of `DCAP`
+/// every lap holds ~1 GiB of resident shmem per worker for a transport whose
+/// live occupancy is a few KiB. The lever is `MAX_W2M_MSG`, which is this large
+/// because `worker/exchange.rs` publishes an exchange partition uncapped.
+pub(crate) const W2M_REGION_SIZE: usize = 1 << 30;
+// One maximum-size message must always fit past its own SKIP pad: the wrap
+// branch fires only when `total > room_to_end`, so `pad < total <= MAX + 8`.
+const _: () = assert!(
+    W2M_REGION_SIZE as u64 >= 2 * MAX_W2M_MSG + W2M_HEADER_SIZE as u64 + 16,
+    "the region must hold a maximum-size message plus its worst-case SKIP pad",
+);
+// A parked side value-compares a cursor's low 32 bits (see `futex_word`). One
+// advance is bounded by `DCAP`, so it always changes those bits and can never
+// alias a stale snapshot by `k * 2^32`.
+const _: () = assert!(W2M_REGION_SIZE < u32::MAX as usize);
 
 // `arm_park` builds a `futex_waitv` word list of at most `num_workers` entries.
 // The kernel's `FUTEX_WAITV_MAX` is 128; past it the syscall returns EINVAL,
@@ -39,10 +77,240 @@ use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg};
 // polling. Make a `MAX_WORKERS` bump that outgrows it a build error.
 const _: () = assert!(gnitz_wire::MAX_WORKERS <= 128);
 
-/// The 32-bit futex word aliasing a cursor's low half. One cursor advance is
-/// bounded by the ring's data capacity, which the ring module asserts is below
-/// `2^32`, so an advance always changes these bits and a parked side's
-/// value-compare cannot miss it.
+/// Bytes of the 8-byte slot prefix that carry the client's frame length prefix.
+const SLOT_LEN_PREFIX_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
+const _: () = assert!(
+    SLOT_LEN_PREFIX_BYTES == 4,
+    "the packed u64 slot prefix is two u32 halves"
+);
+const _: () = assert!(
+    MAX_W2M_MSG <= u32::MAX as u64,
+    "sz must survive the u32 half it is packed into"
+);
+const _: () = assert!(
+    cfg!(target_endian = "little"),
+    "the client's frame prefix is the u64's high half only on LE"
+);
+
+/// Size-prefix sentinel for "skip to the header, the real message is there".
+const SKIP_MARKER: u64 = u64::MAX;
+
+/// The 8-byte prefix stamped in front of every slot: `sz` in the high half,
+/// `internal_req_id` in the low. Written native-endian, so on LE the high half
+/// lands at `slot_ptr - 4` as `sz as u32 LE` — which is exactly the client's
+/// frame length prefix, and is why [`W2mSlot::frame_bytes`] needs no re-encode.
+#[inline]
+fn pack_prefix(sz: usize, internal_req_id: u32) -> u64 {
+    (internal_req_id as u64) | ((sz as u64) << 32)
+}
+
+/// The `(sz, internal_req_id)` [`pack_prefix`] stored.
+#[inline]
+fn unpack_prefix(prefix: u64) -> (u32, u32) {
+    ((prefix >> 32) as u32, prefix as u32)
+}
+
+/// Set by the worker while parked on `release_cursor`; cleared by the worker
+/// once its wait returns. The master reads it before spending a `FUTEX_WAKE`.
+const FLAG_WRITER_PARKED: u32 = 1 << 0;
+/// Set by the reactor while its `FUTEX_WAITV` SQE is armed on `write_cursor`.
+const FLAG_MASTER_WAITV: u32 = 1 << 1;
+/// Set by `W2mReceiver::wait_any` while it is synchronously parked. A bit of its
+/// own because both master parks can be armed at once from the same thread, so
+/// one bit would let whichever unparked first disarm the other's still-live gate.
+const FLAG_MASTER_SYNC: u32 = 1 << 2;
+/// Either master park — the worker's publish gate, taken by [`wake_master`].
+const FLAG_MASTER_ANY: u32 = FLAG_MASTER_WAITV | FLAG_MASTER_SYNC;
+
+// ---------------------------------------------------------------------------
+// Header layout (128 bytes, one cache line per writer)
+// ---------------------------------------------------------------------------
+
+/// One side's park: the cursor it sleeps on and the flags saying it is asleep.
+///
+/// Pairing them is what makes the protocol's ordering unwritable-wrong: nothing
+/// touches the flags except the three methods below, each of which does its
+/// locked read-modify-write *first*. [`Self::publish`] cannot hand back flags it
+/// did not read behind a `swap`, and [`Self::arm`] cannot hand back a cursor it
+/// did not read behind a `fetch_or`.
+///
+/// Both RMWs are load-bearing. Drop either and the store-buffer race is real:
+/// the peer reads a stale-clear flag and skips the wake while the parker reads a
+/// stale cursor and parks. A fence on one side does not help — it drains that
+/// side's store buffer, not the other's — and neither does the futex
+/// value-compare, which is a plain kernel read that a still-buffered store makes
+/// match spuriously.
+#[repr(C)]
+struct ParkWord {
+    cursor: AtomicU64,
+    flags: AtomicU32,
+    _pad: u32,
+}
+
+impl ParkWord {
+    /// Publish `virt` to the parked peer and report the flags behind that swap.
+    /// A flag read here as clear means this store is already globally visible,
+    /// so the peer cannot have parked on the old value.
+    #[inline]
+    fn publish(&self, virt: u64) -> u32 {
+        self.cursor.swap(virt, Ordering::AcqRel);
+        self.flags.load(Ordering::Acquire)
+    }
+
+    /// Arm `bit` and snapshot the cursor behind that RMW, so a peer that already
+    /// published is visible to the caller's re-test.
+    #[inline]
+    fn arm(&self, bit: u32) -> u64 {
+        self.flags.fetch_or(bit, Ordering::AcqRel);
+        self.cursor.load(Ordering::Acquire)
+    }
+
+    /// Drop `bits`. The result is deliberately unused: binding it would force a
+    /// `lock cmpxchg` retry loop where a discarded one lowers to a `lock and`.
+    #[inline]
+    fn disarm(&self, bits: u32) {
+        self.flags.fetch_and(!bits, Ordering::AcqRel);
+    }
+}
+
+/// Cross-process ring state, one cache line per writing side. Each [`ParkWord`]
+/// therefore sits on the line its own **clearer** already dirties, so taking or
+/// releasing a gate rides a coherence transaction that side was making anyway.
+///
+/// ```text
+/// line A — worker writes, master reads
+///    0   master_park.cursor   write_cursor: the message boundary
+///    8   master_park.flags    FLAG_MASTER_*, cleared by a publish
+/// line B — master writes, worker reads
+///   64   writer_park.cursor   release_cursor: the reusable-bytes boundary
+///   72   writer_park.flags    FLAG_WRITER_PARKED, cleared by the worker
+///   80   capacity             immutable after init_region
+/// ```
+#[repr(C, align(64))]
+struct W2mRingHeader {
+    master_park: ParkWord,
+    _pad_producer: [u8; 48],
+
+    writer_park: ParkWord,
+    capacity: AtomicU64,
+    _pad_consumer: [u8; 40],
+}
+
+const _: () = assert!(std::mem::size_of::<W2mRingHeader>() == W2M_HEADER_SIZE);
+const _: () = assert!(std::mem::align_of::<W2mRingHeader>() == 64);
+// The layout above, asserted rather than described: each park whole inside one
+// line, and nothing else sharing the producer's.
+const _: () = assert!(std::mem::offset_of!(W2mRingHeader, master_park.cursor) == 0);
+const _: () = assert!(std::mem::offset_of!(W2mRingHeader, master_park.flags) == 8);
+const _: () = assert!(std::mem::offset_of!(W2mRingHeader, writer_park.cursor) == 64);
+const _: () = assert!(std::mem::offset_of!(W2mRingHeader, writer_park.flags) == 72);
+const _: () = assert!(std::mem::offset_of!(W2mRingHeader, capacity) == 80);
+
+impl W2mRingHeader {
+    /// Reinterpret the start of a W2M mmap region as its header. The mapping is
+    /// created before `fork` and unmapped only at process exit, which is what
+    /// the `'static` rests on.
+    ///
+    /// # Safety
+    /// `ptr` must be a live W2M mmap pointer already initialized by
+    /// [`init_region`].
+    #[inline]
+    unsafe fn from_raw(ptr: *const u8) -> &'static Self {
+        &*(ptr as *const W2mRingHeader)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RingCursor — the virtual cursor and its memoized physical mirror
+// ---------------------------------------------------------------------------
+
+/// One side's cursor over one ring: the virtual monotonic offset, its physical
+/// mirror, and the mapping both index. Carrying the base is what lets every ring
+/// operation take a single argument, so no call can pair a cursor with the wrong
+/// region; [`Self::advance`] is the only way to move it, and keeps the two
+/// offsets in step without a division.
+#[derive(Clone, Copy)]
+struct RingCursor {
+    base: *mut u8,
+    virt: u64,
+    phys: u64,
+    cap: u64,
+}
+
+impl RingCursor {
+    /// The producer's cursor over the ring at `base`.
+    ///
+    /// # Safety
+    /// `base` must be a live region initialized by [`init_region`].
+    unsafe fn producer(base: *mut u8) -> Self {
+        Self::seed(
+            base,
+            W2mRingHeader::from_raw(base).master_park.cursor.load(Ordering::Acquire),
+        )
+    }
+
+    /// The master's read cursor over the ring at `base`, seeded from
+    /// `release_cursor`: a receiver is built with nothing in flight, and
+    /// `release == read` exactly then.
+    ///
+    /// # Safety
+    /// `base` must be a live region initialized by [`init_region`].
+    unsafe fn consumer(base: *mut u8) -> Self {
+        Self::seed(
+            base,
+            W2mRingHeader::from_raw(base).writer_park.cursor.load(Ordering::Acquire),
+        )
+    }
+
+    unsafe fn seed(base: *mut u8, virt: u64) -> Self {
+        let header = W2M_HEADER_SIZE as u64;
+        let cap = W2mRingHeader::from_raw(base).capacity.load(Ordering::Relaxed);
+        debug_assert!(cap > header, "capacity {cap} leaves no data region");
+        debug_assert!(virt >= header, "virtual cursor {virt} below HEADER");
+        RingCursor {
+            base,
+            virt,
+            phys: header + (virt - header) % (cap - header),
+            cap,
+        }
+    }
+
+    #[inline]
+    fn header(&self) -> &'static W2mRingHeader {
+        // SAFETY: a cursor only ever holds a base its constructors validated.
+        unsafe { W2mRingHeader::from_raw(self.base) }
+    }
+
+    /// Bytes from the physical position to the end of the region.
+    #[inline]
+    fn room_to_end(&self) -> u64 {
+        self.cap - self.phys
+    }
+
+    #[inline]
+    fn dcap(&self) -> u64 {
+        self.cap - W2M_HEADER_SIZE as u64
+    }
+
+    /// Move both forms forward by `delta` bytes. Every publish is gated on
+    /// `delta <= DCAP`, so one conditional subtract restores `phys < cap`.
+    #[inline]
+    fn advance(&mut self, delta: u64) {
+        debug_assert!(delta <= self.dcap(), "advance {delta} exceeds DCAP {}", self.dcap());
+        self.virt += delta;
+        self.phys += delta;
+        if self.phys >= self.cap {
+            self.phys -= self.dcap();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Futex park/wake
+// ---------------------------------------------------------------------------
+
+/// The 32-bit futex word aliasing a cursor's low half — see the `2^32` assert
+/// beside [`W2M_REGION_SIZE`] for why those bits always move.
 #[inline]
 fn futex_word(cursor: &AtomicU64) -> *const AtomicU32 {
     cursor as *const AtomicU64 as *const AtomicU32
@@ -57,18 +325,179 @@ fn futex_failed(site: &str, rc: i32) -> ! {
     gnitz_fatal_abort!("{}: futex failed: rc={} errno={}", site, rc, posix::errno());
 }
 
-/// Wake a peer parked on `word`, if one is. The caller must already have
-/// published `word` with an RMW — see the module docs.
+/// Master→worker, given the flags a retirement's [`ParkWord::publish`] returned.
+///
+/// Leaves `FLAG_WRITER_PARKED` set — see the module docs: only the writer may
+/// clear it.
 #[inline]
-fn wake_if_parked(word: &AtomicU64, flags: &AtomicU32, parked: u32, site: &str) {
-    if flags.load(Ordering::Acquire) & parked == 0 {
+fn wake_writer(park: &ParkWord, flags: u32) {
+    if flags & FLAG_WRITER_PARKED == 0 {
         return;
     }
-    let rc = posix::futex_wake_u32(futex_word(word), 1);
+    let rc = posix::futex_wake_u32(futex_word(&park.cursor), 1);
     if rc < 0 {
-        futex_failed(site, rc);
+        futex_failed("wake_writer", rc);
     }
 }
+
+/// Worker→master, given the flags a publish's [`ParkWord::publish`] returned.
+/// Takes the gate, so the publishes that follow until the master re-arms skip
+/// the syscall.
+#[inline]
+fn wake_master(park: &ParkWord, flags: u32) {
+    if flags & FLAG_MASTER_ANY == 0 {
+        return;
+    }
+    park.disarm(FLAG_MASTER_ANY);
+    // `count_ones()` folds to 2 — the number of master parks, and an upper bound
+    // on the waiters, since either may have unparked since the flags were read.
+    let rc = posix::futex_wake_u32(futex_word(&park.cursor), FLAG_MASTER_ANY.count_ones());
+    if rc < 0 {
+        futex_failed("wake_master", rc);
+    }
+}
+
+/// The mask naming workers `0..n`. Written here beside [`BitIter`] because the
+/// `n == 64` arm is a shift-overflow guard, not a policy: `1u64 << 64` is UB.
+#[inline]
+pub(crate) fn worker_mask(n: usize) -> u64 {
+    if n >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << n) - 1
+    }
+}
+
+/// Yields the set bit positions of a worker mask, lowest first.
+pub(crate) struct BitIter(pub(crate) u64);
+
+impl Iterator for BitIter {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if self.0 == 0 {
+            return None;
+        }
+        let w = self.0.trailing_zeros() as usize;
+        self.0 &= self.0 - 1;
+        Some(w)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// init / reserve / commit
+// ---------------------------------------------------------------------------
+
+/// Zero the header, seat both cursors at the start of the data area and record
+/// `capacity`. The asserts below are structural; the deployment's own sizing
+/// floor lives at [`W2M_REGION_SIZE`].
+///
+/// # Safety
+/// `ptr` must be a writable mapping of at least `capacity` bytes, with no other
+/// thread or process reading or writing the region.
+pub(crate) unsafe fn init_region(ptr: *mut u8, capacity: u64) {
+    assert!(
+        capacity >= W2M_HEADER_SIZE as u64 + 16,
+        "W2M capacity={capacity} leaves no room for a message past the {W2M_HEADER_SIZE}-byte header",
+    );
+    assert!(
+        capacity.is_multiple_of(8),
+        "W2M capacity={capacity} must be 8-byte aligned, or the SKIP path's 8-byte \
+         writes at the physical end cross the mapping",
+    );
+    // Zero first so re-init of a previously-live region clears every byte,
+    // padding included.
+    std::ptr::write_bytes(ptr, 0, W2M_HEADER_SIZE);
+    let hdr = W2mRingHeader::from_raw(ptr);
+    hdr.capacity.store(capacity, Ordering::Relaxed);
+    hdr.master_park.cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
+    hdr.writer_park.cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
+}
+
+/// Where a `total`-byte message goes: `Some((write_at, pad))`, a physical byte
+/// offset and the bytes skipped to reach it. `pad == 0` is a contiguous publish;
+/// `pad != 0` means stamp a SKIP marker at the current position and publish at
+/// the header instead. `None` when the publish would lap the reader.
+#[inline]
+fn publish_at(wc: &RingCursor, vrel: u64, total: u64) -> Option<(u64, u64)> {
+    debug_assert!(vrel <= wc.virt, "cursor inversion: vrel={vrel} vwc={}", wc.virt);
+    let used = wc.virt - vrel;
+    debug_assert!(used <= wc.dcap(), "used {used} exceeds DCAP {}", wc.dcap());
+    let room_to_end = wc.room_to_end();
+    if total <= room_to_end {
+        (used + total <= wc.dcap()).then_some((wc.phys, 0))
+    } else {
+        // `cap` is 8-aligned and every advance is a multiple of 8, so `phys` is
+        // 8-aligned and strictly below `cap` — the marker always fits without
+        // the contiguous test above reserving room for it.
+        debug_assert!(room_to_end >= 8, "no room for a SKIP marker at phys={}", wc.phys);
+        (used + room_to_end + total <= wc.dcap()).then_some((W2M_HEADER_SIZE as u64, room_to_end))
+    }
+}
+
+/// A claimed slot: encode into [`Self::slot`], then hand it to [`commit`], which
+/// is what publishes it. Dropping one instead loses the message and corrupts
+/// nothing — its bytes sit at or past `write_cursor`, which never advanced.
+#[must_use = "a Reservation must be committed or its message is dropped"]
+struct Reservation {
+    slot_ptr: *mut u8,
+    slot_len: usize,
+    /// Bytes to advance the write cursor by: `total`, or `pad + total` when
+    /// the message SKIP-wrapped.
+    delta: u64,
+}
+
+impl Reservation {
+    /// The bytes to encode the message into.
+    #[inline]
+    fn slot(&mut self) -> &mut [u8] {
+        // SAFETY: `try_reserve` sized this against the ring's free space, and
+        // nothing else touches those bytes until `commit` publishes them.
+        unsafe { std::slice::from_raw_parts_mut(self.slot_ptr, self.slot_len) }
+    }
+}
+
+/// Claim a slot for a `sz`-byte message tagged `internal_req_id`, stamping its
+/// [`pack_prefix`] header (and a SKIP marker first if it wraps). `None` means
+/// the ring is full: the caller parks and calls again — nothing is written on
+/// that path.
+///
+/// # Safety
+/// The caller must be the sole producer on `wc`'s ring.
+unsafe fn try_reserve(wc: &RingCursor, sz: usize, internal_req_id: u32) -> Option<Reservation> {
+    assert!(
+        sz > 0 && (sz as u64) <= MAX_W2M_MSG,
+        "w2m::try_reserve: sz={sz} outside (0, {MAX_W2M_MSG}]",
+    );
+    let total = (8 + align8(sz)) as u64;
+    let vrel = wc.header().writer_park.cursor.load(Ordering::Acquire);
+    let (write_at, pad) = publish_at(wc, vrel, total)?;
+
+    if pad != 0 {
+        write_u64_raw(wc.base, wc.phys as usize, SKIP_MARKER);
+    }
+    write_u64_raw(wc.base, write_at as usize, pack_prefix(sz, internal_req_id));
+    Some(Reservation {
+        slot_ptr: wc.base.add(write_at as usize + 8),
+        slot_len: sz,
+        delta: pad + total,
+    })
+}
+
+/// Publish a reservation and wake a parked master. [`ParkWord::publish`] carries
+/// the Release that makes the slot's bytes visible to the consumer.
+///
+/// # Safety
+/// `r` must come from a [`try_reserve`] against this cursor, with the slot fully
+/// written since.
+unsafe fn commit(wc: &mut RingCursor, r: Reservation) {
+    wc.advance(r.delta);
+    let park = &wc.header().master_park;
+    wake_master(park, park.publish(wc.virt));
+}
+
+// ---------------------------------------------------------------------------
+// W2mWriter — the worker's write side
+// ---------------------------------------------------------------------------
 
 /// The full-ring path: publish `FLAG_WRITER_PARKED`, re-test below that barrier,
 /// then sleep on `release_cursor` until the master retires a slot.
@@ -78,13 +507,12 @@ fn wake_if_parked(word: &AtomicU64, flags: &AtomicU32, parked: u32, site: &str) 
 #[cold]
 #[inline(never)]
 unsafe fn park_for_room(wc: &RingCursor, sz: usize, req: u32) -> Reservation {
-    let hdr = wc.header();
+    let park = &wc.header().writer_park;
     loop {
-        hdr.waiter_flags.fetch_or(FLAG_WRITER_PARKED, Ordering::AcqRel);
-        let vrel = hdr.release_cursor.load(Ordering::Acquire);
-        let reserved = w2m_ring::try_reserve(wc, sz, req);
+        let vrel = park.arm(FLAG_WRITER_PARKED);
+        let reserved = try_reserve(wc, sz, req);
         if reserved.is_none() {
-            let rc = posix::futex_wait_u32(futex_word(&hdr.release_cursor), vrel as u32, -1);
+            let rc = posix::futex_wait_u32(futex_word(&park.cursor), vrel as u32, -1);
             // `libc::syscall` returns -1 on error (not -errno), so read errno.
             // EINTR (a signal) and EAGAIN (the cursor already moved) both just
             // mean retry; anything else is a lost wake.
@@ -95,7 +523,7 @@ unsafe fn park_for_room(wc: &RingCursor, sz: usize, req: u32) -> Reservation {
                 }
             }
         }
-        hdr.waiter_flags.fetch_and(!FLAG_WRITER_PARKED, Ordering::AcqRel);
+        park.disarm(FLAG_WRITER_PARKED);
         if let Some(r) = reserved {
             return r;
         }
@@ -111,6 +539,10 @@ pub struct W2mWriter {
     cursor: Cell<RingCursor>,
 }
 
+// SAFETY: the raw `base` inside the cursor is a `MAP_SHARED` region valid in
+// every process for its whole life. `reactor::mod.rs` moves a writer into a
+// thread closure; sole-producer is what the type still requires, and moving does
+// not duplicate it.
 unsafe impl Send for W2mWriter {}
 
 impl W2mWriter {
@@ -142,13 +574,7 @@ impl W2mWriter {
     /// (chunked-train frames leave that field 0). `encode_ipc` writes no
     /// checksum: the ring is a trusted shared mapping, unlike the SAL.
     pub fn send_msg(&self, ring_req: u64, msg: &WireMsg<'_>) {
-        self.send_msg_sized(ring_req, msg, msg.size());
-    }
-
-    /// [`Self::send_msg`] for a caller that already sized the message (to check
-    /// it against a frame cap); `sz` must be `msg.size()`.
-    pub fn send_msg_sized(&self, ring_req: u64, msg: &WireMsg<'_>, sz: usize) {
-        self.send_encoded(sz, ring_req as u32, |buf| {
+        self.send_encoded(msg.size(), ring_req as u32, |buf| {
             msg.encode_ipc(buf, 0);
         });
     }
@@ -156,25 +582,17 @@ impl W2mWriter {
     /// Encode one message into the ring and publish it, blocking on
     /// `release_cursor` while the ring is full. `internal_req_id` rides the slot
     /// prefix so the master can route the reply without decoding the frame.
-    pub fn send_encoded(&self, sz: usize, internal_req_id: u32, encode_fn: impl FnOnce(&mut [u8])) {
+    fn send_encoded(&self, sz: usize, internal_req_id: u32, encode_fn: impl FnOnce(&mut [u8])) {
         // SAFETY: a worker process is the sole producer on its own ring.
         unsafe {
             let mut wc = self.cursor.get();
-            let hdr = wc.header();
-            let mut reservation = match w2m_ring::try_reserve(&wc, sz, internal_req_id) {
+            let mut reservation = match try_reserve(&wc, sz, internal_req_id) {
                 Some(r) => r,
                 None => park_for_room(&wc, sz, internal_req_id),
             };
             encode_fn(reservation.slot());
-            w2m_ring::commit(&mut wc, reservation);
+            commit(&mut wc, reservation);
             self.cursor.set(wc);
-
-            wake_if_parked(
-                &hdr.write_cursor,
-                &hdr.waiter_flags,
-                FLAG_MASTER_ANY,
-                "W2mWriter::send_encoded",
-            );
         }
     }
 }
@@ -183,22 +601,10 @@ impl W2mWriter {
 // InFlightState — the master's read cursor and its outstanding slots
 // ---------------------------------------------------------------------------
 
-/// Initial capacity hint for a per-worker ring's in-flight queue, and the soft
-/// high-water threshold at which the master warns once. The queue is a growable
-/// `VecDeque`, so this does not bound correctness: the real backpressure is the
-/// ring's byte capacity, which blocks the worker's `send_encoded` once the ring
-/// fills. Crossing this many simultaneously-parked slots on one ring means a
-/// client is draining unusually slowly, so `take_next` logs one warning to make
-/// the condition observable.
-const W2M_MAX_IN_FLIGHT: usize = 64;
-
-/// Capacity above which a fully-drained queue is shrunk, handing the heap it
-/// grew for a burst back to the allocator. A stalled client can park a ring's
-/// worth of tiny frames (millions of entries) before eviction retires them;
-/// without this the peak capacity would be retained for the process lifetime.
-/// 1024 entries (16 KiB) is far above the steady-state depth (a few), so the
-/// shrink fires only after a genuine burst, never on the hot path.
-const INFLIGHT_SHRINK_THRESHOLD: usize = 1024;
+/// Initial capacity of a ring's in-flight queue. Not a bound: the queue grows,
+/// and the real backpressure is the ring's byte capacity, which parks the worker
+/// in [`park_for_room`] once the ring fills.
+const INFLIGHT_INITIAL_CAP: usize = 64;
 
 /// The master's per-ring state: its read cursor, which never leaves this
 /// process, and the slots it has handed out but not yet released.
@@ -214,8 +620,6 @@ struct InFlightState {
     /// pops the front-consecutive released prefix and advances `release_cursor`
     /// to the last popped vrc.
     queue: VecDeque<(u64, bool)>,
-    /// One-shot latch for the high-water warning (see `W2M_MAX_IN_FLIGHT`).
-    warned: bool,
 }
 
 impl InFlightState {
@@ -223,64 +627,27 @@ impl InFlightState {
         InFlightState {
             read,
             front_idx: 0,
-            queue: VecDeque::with_capacity(W2M_MAX_IN_FLIGHT),
-            warned: false,
+            queue: VecDeque::with_capacity(INFLIGHT_INITIAL_CAP),
         }
-    }
-
-    /// Consume the next slot and register it as in-flight in one step, so the
-    /// read cursor and the retirement queue cannot disagree about what has been
-    /// handed out. Returns the slot and its `push_idx` — its handle for release.
-    ///
-    /// # Safety
-    /// The master must be the sole consumer on this ring.
-    unsafe fn take_next(&mut self) -> Option<(ConsumedSlot, u64)> {
-        let consumed = w2m_ring::try_consume(&mut self.read)?;
-        let push_idx = self.front_idx + self.queue.len() as u64;
-        self.queue.push_back((self.read.virt(), false));
-        if !self.warned && self.queue.len() > W2M_MAX_IN_FLIGHT {
-            self.warned = true;
-            gnitz_warn!(
-                "w2m: {} reply slots simultaneously in-flight on one ring (soft \
-                 threshold {}); a slow client is parking frames — backpressure is \
-                 the ring's {} MiB byte capacity",
-                self.queue.len(),
-                W2M_MAX_IN_FLIGHT,
-                w2m_ring::W2M_REGION_SIZE >> 20,
-            );
-        }
-        Some((consumed, push_idx))
     }
 
     /// Mark the slot identified by `push_idx` as released. Advances
     /// `release_cursor` through the front-consecutive released prefix and wakes
-    /// the writer if it advanced. A stale or double `push_idx` (below
-    /// `front_idx`, or past the queue tail) indexes out of bounds and panics.
+    /// the writer if it advanced.
     fn release(&mut self, push_idx: u64) {
         let pos = (push_idx - self.front_idx) as usize;
         self.queue[pos].1 = true;
 
         let mut last_vrc = None;
-        while self.queue.front().is_some_and(|&(_, released)| released) {
-            let (vrc, _) = self.queue.pop_front().expect("front just checked present");
+        while let Some(&(vrc, true)) = self.queue.front() {
+            self.queue.pop_front();
             self.front_idx += 1;
             last_vrc = Some(vrc);
         }
 
         if let Some(vrc) = last_vrc {
-            let hdr = self.read.header();
-            hdr.release_cursor.swap(vrc, Ordering::AcqRel);
-            wake_if_parked(
-                &hdr.release_cursor,
-                &hdr.waiter_flags,
-                FLAG_WRITER_PARKED,
-                "W2mSlot::drop",
-            );
-            // A burst that has fully drained can leave a large heap buffer
-            // behind (VecDeque never shrinks on its own); reclaim it.
-            if self.queue.is_empty() && self.queue.capacity() > INFLIGHT_SHRINK_THRESHOLD {
-                self.queue.shrink_to_fit();
-            }
+            let park = &self.read.header().writer_park;
+            wake_writer(park, park.publish(vrc));
         }
     }
 }
@@ -302,9 +669,10 @@ pub struct W2mSlot {
     /// `try_reserve`. Used by the master to route scan responses without
     /// decoding the wire frame.
     pub(crate) internal_req_id: u32,
-    /// The ring's boxed `InFlightState`, whose address is stable for the
-    /// receiver's life. The `W2mReceiver` must outlive every slot: its field is
-    /// declared last in `ReactorShared` so it drops after every slot holder.
+    /// The ring's `InFlightState`, which lives inside a `Box<[WorkerRing]>` that
+    /// has no `push`, so its address is stable for the receiver's life. The
+    /// `W2mReceiver` must outlive every slot; `ReactorShared::w2m` names who
+    /// holds it alive.
     state: *mut InFlightState,
 }
 
@@ -333,9 +701,7 @@ impl Drop for W2mSlot {
 /// both share one index and one bounds check, and can never drift apart.
 struct WorkerRing {
     hdr: &'static W2mRingHeader,
-    /// Boxed so the address a `W2mSlot` holds is stable no matter what happens
-    /// to the `Vec` around it.
-    in_flight: Box<UnsafeCell<InFlightState>>,
+    in_flight: UnsafeCell<InFlightState>,
 }
 
 impl WorkerRing {
@@ -343,16 +709,81 @@ impl WorkerRing {
     /// `InFlightState`, and this borrow does not outlive the call.
     #[inline]
     fn read_cursor(&self) -> u64 {
-        unsafe { (*self.in_flight.get()).read.virt() }
+        unsafe { (*self.in_flight.get()).read.virt }
+    }
+
+    /// Read the next message and register it as in-flight in one step, so the
+    /// read cursor and the retirement queue cannot disagree about what has been
+    /// handed out. `None` **iff** the ring is empty; every other departure from
+    /// the layout aborts. SKIP markers are transparent.
+    ///
+    /// No byte at or above `vwc` is ever touched, so a torn slot is unreachable
+    /// and nothing here guards against one — [`ParkWord::publish`] is what puts
+    /// a slot fully below `vwc` before the load below can see it.
+    ///
+    /// # Safety
+    /// The master must be the sole consumer on this ring.
+    #[inline]
+    unsafe fn take_next(&self) -> Option<W2mSlot> {
+        let state = self.in_flight.get();
+        let st = &mut *state;
+        let base: *const u8 = st.read.base;
+        let vwc = self.hdr.master_park.cursor.load(Ordering::Acquire);
+        debug_assert!(
+            st.read.virt <= vwc,
+            "read cursor {} ahead of write cursor {vwc}",
+            st.read.virt
+        );
+        if st.read.virt == vwc {
+            return None;
+        }
+        let mut prefix = read_u64_raw(base, st.read.phys as usize);
+        if prefix == SKIP_MARKER {
+            let pad = st.read.room_to_end();
+            st.read.advance(pad);
+            if st.read.virt == vwc {
+                gnitz_fatal_abort!(
+                    "w2m::take_next: SKIP marker at phys={} with no message past it — ring corrupt",
+                    st.read.phys,
+                );
+            }
+            prefix = read_u64_raw(base, st.read.phys as usize);
+        }
+        let (sz, internal_req_id) = unpack_prefix(prefix);
+        if sz == 0 || sz as u64 > MAX_W2M_MSG {
+            gnitz_fatal_abort!(
+                "w2m::take_next: size={} at phys={} outside (0, {}] — ring corrupt",
+                sz,
+                st.read.phys,
+                MAX_W2M_MSG,
+            );
+        }
+        let payload_at = st.read.phys as usize + 8;
+        let bytes = std::slice::from_raw_parts(base.add(payload_at), sz as usize);
+        let frame = std::slice::from_raw_parts(
+            base.add(payload_at - SLOT_LEN_PREFIX_BYTES),
+            sz as usize + SLOT_LEN_PREFIX_BYTES,
+        );
+        st.read.advance(8 + align8(sz as usize) as u64);
+
+        let push_idx = st.front_idx + st.queue.len() as u64;
+        st.queue.push_back((st.read.virt, false));
+        Some(W2mSlot {
+            bytes,
+            frame,
+            push_idx,
+            internal_req_id,
+            state,
+        })
     }
 }
 
 /// Master's read side of W2M.
 pub struct W2mReceiver {
-    rings: Vec<WorkerRing>,
+    /// A boxed slice has no `push`/`reserve`, so element addresses — which every
+    /// live `W2mSlot` holds — are stable by type rather than by convention.
+    rings: Box<[WorkerRing]>,
 }
-
-unsafe impl Send for W2mReceiver {}
 
 impl W2mReceiver {
     pub fn new(region_ptrs: Vec<*mut u8>) -> Self {
@@ -364,34 +795,19 @@ impl W2mReceiver {
                 let (hdr, read) = unsafe { (W2mRingHeader::from_raw(p), RingCursor::consumer(p)) };
                 WorkerRing {
                     hdr,
-                    in_flight: Box::new(UnsafeCell::new(InFlightState::new(read))),
+                    in_flight: UnsafeCell::new(InFlightState::new(read)),
                 }
             })
             .collect();
         W2mReceiver { rings }
     }
 
-    /// # Safety
-    /// `worker` must be < `num_workers`.
-    #[cfg(test)]
-    pub(crate) unsafe fn header(&self, worker: usize) -> &'static W2mRingHeader {
-        self.rings[worker].hdr
-    }
-
     /// Take a slot from the ring without freeing its space. `release_cursor`
     /// advances only when the returned `W2mSlot` is dropped, which is what tells
     /// the writer the bytes are reusable.
     pub fn try_read_slot(&self, worker: usize) -> Option<W2mSlot> {
-        let state = self.rings[worker].in_flight.get();
         // SAFETY: the master thread is the sole consumer of every ring.
-        let (consumed, push_idx) = unsafe { (*state).take_next() }?;
-        Some(W2mSlot {
-            bytes: consumed.payload,
-            frame: consumed.frame,
-            push_idx,
-            internal_req_id: consumed.internal_req_id,
-            state,
-        })
+        unsafe { self.rings[worker].take_next() }
     }
 
     pub fn try_read(&self, worker: usize) -> Option<DecodedWire> {
@@ -411,20 +827,16 @@ impl W2mReceiver {
     /// `None` means a ring already has unread data: drain and retry, never park.
     fn arm_park<'a>(&self, mask: u64, bit: u32, out: &'a mut [FutexWaitV]) -> Option<&'a [FutexWaitV]> {
         let mut n = 0;
-        let mut rest = mask;
-        while rest != 0 {
-            let w = rest.trailing_zeros() as usize;
-            rest &= rest - 1;
+        for w in BitIter(mask) {
             let ring = &self.rings[w];
-            let hdr = ring.hdr;
-            hdr.waiter_flags.fetch_or(bit, Ordering::AcqRel);
-            let vwc = hdr.write_cursor.load(Ordering::Acquire);
+            let park = &ring.hdr.master_park;
+            let vwc = park.arm(bit);
             if vwc != ring.read_cursor() {
                 return None;
             }
             out[n] = FutexWaitV::new()
                 .val(vwc as u32 as u64)
-                .uaddr(futex_word(&hdr.write_cursor) as u64)
+                .uaddr(futex_word(&park.cursor) as u64)
                 .flags(posix::FUTEX2_SIZE_U32);
             n += 1;
         }
@@ -432,21 +844,13 @@ impl W2mReceiver {
     }
 
     fn clear_park(&self, mask: u64, bit: u32) {
-        let mut rest = mask;
-        while rest != 0 {
-            let w = rest.trailing_zeros() as usize;
-            rest &= rest - 1;
-            self.rings[w].hdr.waiter_flags.fetch_and(!bit, Ordering::AcqRel);
+        for w in BitIter(mask) {
+            self.rings[w].hdr.master_park.disarm(bit);
         }
     }
 
     fn all_rings(&self) -> u64 {
-        let n = self.rings.len();
-        if n >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << n) - 1
-        }
+        worker_mask(self.rings.len())
     }
 
     /// Arm the reactor's persistent `FUTEX_WAITV` park on every ring, filling
@@ -455,25 +859,21 @@ impl W2mReceiver {
         self.arm_park(self.all_rings(), FLAG_MASTER_WAITV, out)
     }
 
-    /// Drop the reactor's park. The reactor clears before it drains and arms
-    /// after, so the flag is set only while it is genuinely blocked — which is
-    /// the only window where eliding a worker's wake saves anything.
+    /// Drop the reactor's park. The flag is also cleared by any worker's publish,
+    /// so this only has to cover the rings no publish reached.
     pub fn clear_waitv(&self) {
         self.clear_park(self.all_rings(), FLAG_MASTER_WAITV);
     }
 
-    /// Wait until any worker in the `workers` bit mask publishes, or
-    /// `timeout_ms` elapses — the synchronous analogue of the reactor's
-    /// `FUTEX_WAITV`. Returns immediately if any ring already has unread data.
-    ///
-    /// `workers` must be the caller's whole pending set: a wake reaches only the
-    /// rings this armed, so a narrower mask sleeps to the timeout whenever a
-    /// worker outside it carries the round.
+    /// Wait until any worker in `workers` publishes, or `timeout_ms` elapses —
+    /// the synchronous analogue of the reactor's `FUTEX_WAITV`. Returns at once
+    /// if any ring already has unread data. `workers` must be the caller's whole
+    /// pending set: only the rings this armed can wake it.
     pub fn wait_any(&self, workers: u64, timeout_ms: i32) -> i32 {
         let mut waiters = [FutexWaitV::new(); gnitz_wire::MAX_WORKERS];
         let rc = match self.arm_park(workers, FLAG_MASTER_SYNC, &mut waiters) {
-            Some(armed) if !armed.is_empty() => posix::futex_waitv_u32(armed, timeout_ms),
-            _ => 0,
+            Some(armed) => posix::futex_waitv_u32(armed, timeout_ms),
+            None => 0,
         };
         self.clear_park(workers, FLAG_MASTER_SYNC);
         rc
@@ -483,11 +883,78 @@ impl W2mReceiver {
         self.rings.len()
     }
 
+    #[cfg(test)]
+    fn header(&self, worker: usize) -> &'static W2mRingHeader {
+        self.rings[worker].hdr
+    }
+
+    /// The worker-visible free boundary: everything below it is reusable.
+    #[cfg(test)]
+    pub(crate) fn release_cursor(&self, worker: usize) -> u64 {
+        self.rings[worker].hdr.writer_park.cursor.load(Ordering::Acquire)
+    }
+
+    /// The worker's published boundary: everything below it is readable.
+    #[cfg(test)]
+    pub(crate) fn write_cursor(&self, worker: usize) -> u64 {
+        self.rings[worker].hdr.master_park.cursor.load(Ordering::Acquire)
+    }
+
     /// The master-local read cursor for `worker`.
     #[cfg(test)]
-    pub(crate) fn read_cursor(&self, worker: usize) -> u64 {
+    fn read_cursor(&self, worker: usize) -> u64 {
         self.rings[worker].read_cursor()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test fixtures — module level, so every `runtime` descendant's tests reach them
+// ---------------------------------------------------------------------------
+
+/// A `capacity`-byte ring, mapped and initialized.
+///
+/// # Safety
+/// The caller must keep the returned region alive for as long as anything reads
+/// or writes the ring.
+#[cfg(test)]
+pub(crate) unsafe fn test_ring(capacity: usize) -> gnitz_engine_testkit::SharedRegion {
+    let region = gnitz_engine_testkit::SharedRegion::new(capacity);
+    init_region(region.ptr(), capacity as u64);
+    region
+}
+
+/// A ring holding `n_msgs` messages of `msg_sz` bytes plus `slack` spare bytes.
+/// `slack` is what the wrap and backpressure tests differ in: it decides whether
+/// one more message fits before the physical end.
+///
+/// # Safety
+/// As [`test_ring`].
+#[cfg(test)]
+pub(crate) unsafe fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> gnitz_engine_testkit::SharedRegion {
+    let capacity = W2M_HEADER_SIZE as u64 + n_msgs as u64 * (8 + align8(msg_sz) as u64) + slack;
+    test_ring(capacity as usize)
+}
+
+/// Publish one message directly, without `W2mWriter`'s park loop. Returns the
+/// new write cursor and whether the publish SKIP-wrapped — a wrap is exactly a
+/// cursor advance longer than the message. `None` when the ring is full.
+///
+/// # Safety
+/// `base` must be a live ring from [`test_ring`], and the caller must be its
+/// sole producer.
+#[cfg(test)]
+pub(crate) unsafe fn publish(
+    base: *mut u8,
+    sz: usize,
+    internal_req_id: u32,
+    encode: impl FnOnce(&mut [u8]),
+) -> Option<(u64, bool)> {
+    let mut wc = RingCursor::producer(base);
+    let before = wc.virt;
+    let mut reservation = try_reserve(&wc, sz, internal_req_id)?;
+    encode(reservation.slot());
+    commit(&mut wc, reservation);
+    Some((wc.virt, wc.virt - before != (8 + align8(sz)) as u64))
 }
 
 // ---------------------------------------------------------------------------
@@ -497,85 +964,301 @@ impl W2mReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::tests::fixtures::{make_ring, publish};
-    use crate::runtime::w2m_ring::W2M_HEADER_SIZE;
     use gnitz_engine_testkit::SharedRegion;
 
-    fn release_cursor(recv: &W2mReceiver, w: usize) -> u64 {
-        unsafe { recv.header(w) }.release_cursor.load(Ordering::Acquire)
+    // -- ring layout ---------------------------------------------------------
+
+    /// Consume one message and release its space, as the master does when it
+    /// drops the slot. The `swap` — not a plain store — is the barrier the park
+    /// protocol needs, so these tests model the production retirement.
+    unsafe fn consume_one(recv: &W2mReceiver) -> Option<&'static [u8]> {
+        let slot = recv.try_read_slot(0)?;
+        let bytes = slot.bytes;
+        drop(slot);
+        Some(bytes)
     }
 
-    /// Slots released in push order: release_cursor advances one step at a time.
+    /// Round-trip: publish one message, consume it, verify contents and cursor
+    /// advance.
     #[test]
-    fn test_w2m_slot_in_order_release() {
+    fn test_w2m_ring_round_trip() {
+        unsafe {
+            let region = make_ring(128, 4, 8);
+            let ptr = region.ptr();
+            let recv = W2mReceiver::new(vec![ptr]);
+
+            let payload = [0xAAu8; 128];
+            let (new_wc, wrapped) = publish(ptr, payload.len(), 0, |slot| slot.copy_from_slice(&payload))
+                .expect("unexpected Full on empty ring");
+            assert!(!wrapped);
+            assert_eq!(new_wc, W2M_HEADER_SIZE as u64 + 8 + 128);
+            assert_eq!(recv.write_cursor(0), new_wc);
+
+            let data = consume_one(&recv).expect("message must be visible");
+            assert_eq!(data, &payload);
+            assert_eq!(recv.read_cursor(0), new_wc);
+            assert!(consume_one(&recv).is_none(), "ring must now read empty");
+        }
+    }
+
+    /// Three back-to-back publishes decode in FIFO order.
+    #[test]
+    fn test_w2m_ring_multiple_messages() {
         unsafe {
             let region = make_ring(64, 4, 8);
             let ptr = region.ptr();
-            let writer = W2mWriter::new(ptr);
-            let receiver = W2mReceiver::new(vec![ptr]);
+            let recv = W2mReceiver::new(vec![ptr]);
 
-            writer.send_encoded(64, 0, |s| s[0] = 1);
-            writer.send_encoded(64, 0, |s| s[0] = 2);
+            for tag in 0u8..3 {
+                publish(ptr, 64, 0, |slot| slot.fill(tag + 1)).expect("unexpected Full");
+            }
 
-            let slot_a = receiver.try_read_slot(0).expect("slot A");
-            let new_vrc_a = receiver.read_cursor(0);
+            for tag in 0u8..3 {
+                let data = consume_one(&recv).expect("message must be visible");
+                assert_eq!(data.len(), 64);
+                assert!(data.iter().all(|&b| b == tag + 1));
+            }
+            assert!(consume_one(&recv).is_none());
+        }
+    }
 
-            let slot_b = receiver.try_read_slot(0).expect("slot B");
-            let new_vrc_b = receiver.read_cursor(0);
+    /// A SKIP-wrap with the reader still behind: room for 3 messages + 16 bytes
+    /// of slack, the reader lagging by exactly one.
+    #[test]
+    fn test_w2m_skip_marker_strict_wrap() {
+        unsafe {
+            let big_sz = 1 << 16; // 64 KiB
+            let region = make_ring(big_sz, 3, 16);
+            let ptr = region.ptr();
+            let recv = W2mReceiver::new(vec![ptr]);
+
+            for _ in 0..3 {
+                publish(ptr, big_sz, 0, |_| {}).expect("initial big publish");
+            }
+            for _ in 0..2 {
+                consume_one(&recv).expect("consume");
+            }
+
+            // The 4th no longer fits before the physical end, and the reader is
+            // two messages ahead of the head, so the wrap has somewhere to land.
+            let (_, wrapped) = publish(ptr, big_sz, 0, |slot| slot[0] = 0xDE).expect("SKIP wrap must succeed");
+            assert!(wrapped, "the 4th publish must SKIP-wrap");
 
             assert_eq!(
-                release_cursor(&receiver, 0),
-                W2M_HEADER_SIZE as u64,
-                "release_cursor must not advance while slots are in-flight",
+                consume_one(&recv).expect("pre-SKIP big").len(),
+                big_sz,
+                "the third message still reads contiguously",
             );
+            let wrapped_msg = consume_one(&recv).expect("wrapped big via SKIP");
+            assert_eq!(wrapped_msg.len(), big_sz);
+            assert_eq!(wrapped_msg[0], 0xDE, "the SKIP jump must land on the wrapped payload");
+        }
+    }
 
-            drop(slot_a);
-            assert_eq!(
-                release_cursor(&receiver, 0),
-                new_vrc_a,
-                "release_cursor must advance to new_vrc_a after slot A drop",
-            );
+    /// A message that ends exactly at `capacity` publishes contiguously: the
+    /// next write position is the header, with no marker needed.
+    #[test]
+    fn test_w2m_exact_fit_publishes_contiguously() {
+        unsafe {
+            let msg_sz = 1 << 12;
+            const N: usize = 4;
+            // Zero slack: DCAP is exactly N messages, so the N-th ends on `cap`.
+            let region = make_ring(msg_sz, N, 0);
+            let ptr = region.ptr();
+            let total = 8 + align8(msg_sz) as u64;
+            let recv = W2mReceiver::new(vec![ptr]);
 
-            drop(slot_b);
-            assert_eq!(
-                release_cursor(&receiver, 0),
-                new_vrc_b,
-                "release_cursor must advance to new_vrc_b after slot B drop",
+            for i in 0..N {
+                let (new_wc, wrapped) = publish(ptr, msg_sz, 0, |_| {}).unwrap_or_else(|| panic!("publish #{i}"));
+                assert!(!wrapped, "publish #{i} must fit contiguously, not wrap");
+                assert_eq!(new_wc, W2M_HEADER_SIZE as u64 + (i as u64 + 1) * total);
+                consume_one(&recv).expect("consume");
+            }
+        }
+    }
+
+    /// With the ring exactly full and the reader at the head, the next publish
+    /// is refused — backpressure, not a wrap over unread data.
+    #[test]
+    fn test_w2m_full_blocks_writer() {
+        unsafe {
+            let msg_sz = 1 << 16; // 64 KiB
+            let region = make_ring(msg_sz, 2, 8);
+            let ptr = region.ptr();
+
+            for _ in 0..2 {
+                publish(ptr, msg_sz, 0, |_| {}).expect("fill publish");
+            }
+            assert!(
+                publish(ptr, msg_sz, 0, |_| {}).is_none(),
+                "an undrained ring must refuse the publish"
             );
         }
     }
 
-    /// Slots released out of push order: release_cursor only advances when the
-    /// contiguous prefix from the head is complete.
+    /// Publishing past `MAX_W2M_MSG` is a caller bug, and the ring says so
+    /// rather than reporting a full ring the caller would park on forever.
     #[test]
-    fn test_w2m_slot_out_of_order_release() {
+    #[should_panic(expected = "outside (0,")]
+    fn test_w2m_oversized_publish_panics() {
         unsafe {
             let region = make_ring(64, 4, 8);
+            let _ = publish(region.ptr(), (MAX_W2M_MSG + 1) as usize, 0, |_| {});
+        }
+    }
+
+    /// The payload handed back points into the mmap region — zero-copy into
+    /// `decode_wire`.
+    #[test]
+    fn test_w2m_decode_wire_zero_copy() {
+        unsafe {
+            let region = make_ring(256, 4, 8);
+            let ptr = region.ptr();
+            publish(ptr, 256, 0, |slot| slot.fill(0xCD)).expect("unexpected Full");
+
+            let recv = W2mReceiver::new(vec![ptr]);
+            let data = consume_one(&recv).expect("message must be visible");
+            assert_eq!(
+                data.as_ptr(),
+                ptr.add(W2M_HEADER_SIZE + 8) as *const u8,
+                "payload must be mmap-resident (zero copy)",
+            );
+        }
+    }
+
+    /// Regression: a writer that wraps must never land on a slot the reader has
+    /// not drained. Publish 4, consume 3, then publish 5..=9 — the sequence that
+    /// let a physical-cursor predicate overwrite message #4.
+    #[test]
+    fn test_writer_does_not_cross_reader_after_wrap() {
+        unsafe {
+            let msg_sz: usize = 64;
+            let region = make_ring(msg_sz, 5, 16);
+            let ptr = region.ptr();
+            let recv = W2mReceiver::new(vec![ptr]);
+
+            let publish_tag = |tag: u8| publish(ptr, msg_sz, 0, |slot| slot.fill(tag)).is_some();
+
+            for tag in 1u8..=4 {
+                assert!(publish_tag(tag), "publish #{tag}");
+            }
+
+            let mut received = Vec::new();
+            for _ in 0..3 {
+                received.push(consume_one(&recv).expect("consume")[0]);
+            }
+            assert_eq!(received, vec![1, 2, 3]);
+
+            // #5 fits contiguously, #6 forces the wrap, #7..=9 chase the reader.
+            for tag in 5u8..=9 {
+                if !publish_tag(tag) {
+                    received.push(consume_one(&recv).expect("drain to make room")[0]);
+                    assert!(publish_tag(tag), "publish #{tag} after drain");
+                }
+            }
+
+            while let Some(data) = consume_one(&recv) {
+                received.push(data[0]);
+            }
+            assert_eq!(
+                received,
+                vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+                "the writer must not overwrite unread data after a wrap",
+            );
+        }
+    }
+
+    /// An unaligned capacity would let the SKIP path's 8-byte writes cross the
+    /// end of the mapping.
+    #[test]
+    #[should_panic(expected = "8-byte aligned")]
+    fn init_region_rejects_unaligned_capacity() {
+        unsafe {
+            let cap = W2M_HEADER_SIZE + 17;
+            let region = SharedRegion::new(cap);
+            init_region(region.ptr(), cap as u64);
+        }
+    }
+
+    /// A capacity with no room for a message past the header is refused.
+    #[test]
+    #[should_panic(expected = "leaves no room")]
+    fn init_region_rejects_undersized_capacity() {
+        unsafe {
+            let cap = W2M_HEADER_SIZE + 8;
+            let region = SharedRegion::new(cap);
+            init_region(region.ptr(), cap as u64);
+        }
+    }
+
+    // -- slot retirement -----------------------------------------------------
+
+    unsafe fn in_flight_len(recv: &W2mReceiver, w: usize) -> usize {
+        (*recv.rings[w].in_flight.get()).queue.len()
+    }
+
+    /// Publish `order.len()` slots, take them all, then release in `order`,
+    /// asserting `release_cursor` tracks the front-consecutive released prefix
+    /// after every drop.
+    fn release_follows_front_consecutive_prefix(order: Vec<usize>) {
+        let n = order.len();
+        unsafe {
+            let region = make_ring(8, n, 8);
             let ptr = region.ptr();
             let writer = W2mWriter::new(ptr);
             let receiver = W2mReceiver::new(vec![ptr]);
 
-            writer.send_encoded(64, 0, |s| s[0] = 1);
-            writer.send_encoded(64, 0, |s| s[0] = 2);
-
-            let slot_a = receiver.try_read_slot(0).expect("slot A");
-            let slot_b = receiver.try_read_slot(0).expect("slot B");
-            let new_vrc_b = receiver.read_cursor(0);
-
-            drop(slot_b);
+            for i in 0..n {
+                writer.send_encoded(8, 0, |s| s[0] = i as u8);
+            }
+            let mut slots: Vec<Option<W2mSlot>> = Vec::with_capacity(n);
+            let mut vrcs = Vec::with_capacity(n);
+            for _ in 0..n {
+                slots.push(Some(receiver.try_read_slot(0).expect("slot")));
+                vrcs.push(receiver.read_cursor(0));
+            }
+            assert_eq!(in_flight_len(&receiver, 0), n, "all {n} slots tracked in-flight");
             assert_eq!(
-                release_cursor(&receiver, 0),
+                receiver.release_cursor(0),
                 W2M_HEADER_SIZE as u64,
-                "release_cursor must not advance when a non-head slot is released",
+                "release_cursor must not advance while every slot is in-flight",
             );
 
-            drop(slot_a);
-            assert_eq!(
-                release_cursor(&receiver, 0),
-                new_vrc_b,
-                "release_cursor must advance through both A and B on head release",
-            );
+            let mut released = vec![false; n];
+            for &idx in &order {
+                slots[idx] = None; // drop → release(push_idx = idx)
+                released[idx] = true;
+                let p = released.iter().position(|&r| !r).unwrap_or(n);
+                let expected = if p == 0 { W2M_HEADER_SIZE as u64 } else { vrcs[p - 1] };
+                assert_eq!(
+                    receiver.release_cursor(0),
+                    expected,
+                    "release_cursor must track the front-consecutive released prefix (p={p})",
+                );
+            }
+            assert_eq!(in_flight_len(&receiver, 0), 0, "queue fully drained");
         }
+    }
+
+    #[test]
+    fn release_in_push_order() {
+        release_follows_front_consecutive_prefix((0..200).collect());
+    }
+
+    /// Reverse order: nothing retires until the head releases last, and that one
+    /// drop must retire all 200 entries in a single drain.
+    #[test]
+    fn release_in_reverse_order() {
+        release_follows_front_consecutive_prefix((0..200).rev().collect());
+    }
+
+    /// A deterministic scramble past the queue's initial capacity, exercising
+    /// partial-prefix retirement at depth.
+    #[test]
+    fn release_out_of_order() {
+        let mut o: Vec<usize> = (0..200).collect();
+        o.sort_by_key(|&i| (i * 73 + 11) % 200); // 73 coprime to 200 → a permutation
+        release_follows_front_consecutive_prefix(o);
     }
 
     /// Dropping a slot advances release_cursor and unparks a blocked writer.
@@ -611,165 +1294,11 @@ mod tests {
         }
     }
 
-    /// Releasing every slot EXCEPT the head first (nothing retires while the
-    /// front stays in-flight), then the head, must retire the whole
-    /// front-consecutive prefix in a single drain.
-    #[test]
-    fn release_retires_full_64_prefix_in_one_drain() {
-        unsafe {
-            let region = make_ring(8, 64, 8);
-            let ptr = region.ptr();
-            let writer = W2mWriter::new(ptr);
-            let receiver = W2mReceiver::new(vec![ptr]);
+    // -- park / wake ---------------------------------------------------------
 
-            for i in 0..64u8 {
-                writer.send_encoded(8, 0, |s| s[0] = i);
-            }
-            let mut slots: Vec<_> = (0..64).map(|_| receiver.try_read_slot(0).expect("slot")).collect();
-            let last_vrc = receiver.read_cursor(0);
-
-            let head = slots.remove(0);
-            slots.clear(); // drops push_idx 1..63
-            assert_eq!(
-                release_cursor(&receiver, 0),
-                W2M_HEADER_SIZE as u64,
-                "no prefix may retire until the head releases",
-            );
-
-            drop(head);
-            assert_eq!(
-                release_cursor(&receiver, 0),
-                last_vrc,
-                "head release must retire the full 64-slot prefix to the last new_vrc",
-            );
-        }
-    }
-
-    unsafe fn in_flight_cap(recv: &W2mReceiver, w: usize) -> usize {
-        (*recv.rings[w].in_flight.get()).queue.capacity()
-    }
-    unsafe fn in_flight_len(recv: &W2mReceiver, w: usize) -> usize {
-        (*recv.rings[w].in_flight.get()).queue.len()
-    }
-
-    /// The in-flight queue must sail well past 64 slots: take 200 (all
-    /// in-flight at once), release them in a deterministic scramble, and assert
-    /// `release_cursor` always sits at the new_vrc of the longest
-    /// front-consecutive released prefix.
-    #[test]
-    fn release_past_64_in_flight_out_of_order() {
-        unsafe {
-            const N: usize = 200;
-            let region = make_ring(8, N, 8);
-            let ptr = region.ptr();
-            let writer = W2mWriter::new(ptr);
-            let receiver = W2mReceiver::new(vec![ptr]);
-
-            for i in 0..N {
-                writer.send_encoded(8, 0, |s| s[0] = i as u8);
-            }
-            let mut slots: Vec<Option<W2mSlot>> = Vec::with_capacity(N);
-            let mut vrcs = Vec::with_capacity(N);
-            for _ in 0..N {
-                slots.push(Some(receiver.try_read_slot(0).expect("slot")));
-                vrcs.push(receiver.read_cursor(0));
-            }
-            assert_eq!(in_flight_len(&receiver, 0), N, "all N slots tracked in-flight");
-            assert_eq!(
-                release_cursor(&receiver, 0),
-                W2M_HEADER_SIZE as u64,
-                "release_cursor must not advance while every slot is in-flight",
-            );
-
-            // Deterministic scramble (73 is coprime to 200, so this is a
-            // permutation): release order is out of push order, exercising the
-            // partial-prefix retirement at depth > 64.
-            let order: Vec<usize> = {
-                let mut o: Vec<usize> = (0..N).collect();
-                o.sort_by_key(|&i| (i * 73 + 11) % N);
-                o
-            };
-            let mut released = [false; N];
-            for &idx in &order {
-                slots[idx] = None; // drop → release(push_idx = idx)
-                released[idx] = true;
-                let mut p = 0;
-                while p < N && released[p] {
-                    p += 1;
-                }
-                let expected = if p == 0 { W2M_HEADER_SIZE as u64 } else { vrcs[p - 1] };
-                assert_eq!(
-                    release_cursor(&receiver, 0),
-                    expected,
-                    "release_cursor must track the front-consecutive released prefix (p={p})",
-                );
-            }
-            assert_eq!(in_flight_len(&receiver, 0), 0, "queue fully drained");
-        }
-    }
-
-    /// A burst grows the in-flight queue well past its initial capacity; once it
-    /// fully drains, `release` hands the grown buffer back to the allocator so a
-    /// single stalled-client burst does not permanently retain the peak.
-    #[test]
-    fn release_shrinks_queue_after_burst_drains() {
-        unsafe {
-            const N: usize = 4096; // comfortably above INFLIGHT_SHRINK_THRESHOLD
-            let region = make_ring(8, N, 8);
-            let ptr = region.ptr();
-            let writer = W2mWriter::new(ptr);
-            let receiver = W2mReceiver::new(vec![ptr]);
-
-            for i in 0..N {
-                writer.send_encoded(8, 0, |s| s[0] = i as u8);
-            }
-            let mut slots: Vec<W2mSlot> = (0..N).map(|_| receiver.try_read_slot(0).expect("slot")).collect();
-            assert!(
-                in_flight_cap(&receiver, 0) >= N,
-                "queue must grow to hold the whole burst",
-            );
-
-            for s in slots.drain(..) {
-                drop(s);
-            }
-            assert_eq!(in_flight_len(&receiver, 0), 0, "queue fully drained");
-            assert!(
-                in_flight_cap(&receiver, 0) <= INFLIGHT_SHRINK_THRESHOLD,
-                "drained queue must be shrunk back to/below the threshold, got cap {}",
-                in_flight_cap(&receiver, 0),
-            );
-        }
-    }
-
-    /// BUG: a mask naming one ring misses a wake on another. Parking on ring 0
-    /// alone arms the flag there only, so a publish to ring 3 (flag clear) issues
-    /// no wake and ring 0's word never changes — the wait sleeps the full ceiling
-    /// even though ring 3 carried the round. This is why every caller passes its
-    /// whole pending set.
-    #[test]
-    fn test_wait_any_on_one_ring_misses_publish_on_another() {
-        unsafe {
-            let rings: Vec<SharedRegion> = (0..4).map(|_| make_ring(64, 4, 8)).collect();
-            let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
-            let pub_ptr = rings[3].ptr() as usize;
-            let handle = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                W2mWriter::new(pub_ptr as *mut u8).send_encoded(64, 0, |s| s[0] = 7);
-            });
-            let start = std::time::Instant::now();
-            let _ = receiver.wait_any(1, 300); // parks on ring 0; ring 3's wake can't reach it
-            let elapsed = start.elapsed().as_millis();
-            handle.join().unwrap();
-            assert!(
-                elapsed >= 250,
-                "a ring-0-only mask must sleep the full ceiling, slept {elapsed}ms"
-            );
-            assert!(receiver.try_read_slot(3).is_some(), "ring 3 really did publish");
-        }
-    }
-
-    /// FIX: the same setup, but `wait_any(0b1111)` arms ring 3 too, so the
-    /// publish wakes the multi-word wait well before the ceiling.
+    /// `wait_any(0b1111)` arms every ring, so a publish on ring 3 wakes it well
+    /// before the ceiling. A narrower mask would not — which is why every caller
+    /// passes its whole pending set.
     #[test]
     fn test_wait_any_woken_by_publish_on_other_ring() {
         unsafe {
@@ -797,8 +1326,8 @@ mod tests {
     #[test]
     fn test_wait_any_times_out_with_no_publisher() {
         unsafe {
-            let rings: Vec<SharedRegion> = (0..1).map(|_| make_ring(64, 4, 8)).collect();
-            let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
+            let region = make_ring(64, 4, 8);
+            let receiver = W2mReceiver::new(vec![region.ptr()]);
             let start = std::time::Instant::now();
             let rc = receiver.wait_any(1, 200);
             let elapsed = start.elapsed().as_millis();
@@ -810,15 +1339,54 @@ mod tests {
         }
     }
 
-    /// Publish/drain throughput over one ring, and how often a publish finds a
-    /// master parked — the predicate the wake gate reads, and so the quantity
-    /// every change to the park protocol moves.
+    /// `wait_any` must leave no park flag behind: a stale bit would make every
+    /// later publish spend a `FUTEX_WAKE` on a word nobody is parked on.
+    #[test]
+    fn wait_any_clears_its_park_flag() {
+        unsafe {
+            let region = make_ring(64, 4, 8);
+            let receiver = W2mReceiver::new(vec![region.ptr()]);
+            let _ = receiver.wait_any(1, 50);
+            assert_eq!(
+                receiver.header(0).master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_SYNC,
+                0,
+                "wait_any must clear its own park flag on return",
+            );
+        }
+    }
+
+    /// A publish takes the master gate, so the next publish in the same window
+    /// finds it clear and spends no syscall.
+    #[test]
+    fn publish_takes_the_master_gate() {
+        unsafe {
+            let region = make_ring(64, 4, 8);
+            let ptr = region.ptr();
+            let receiver = W2mReceiver::new(vec![ptr]);
+            let hdr = receiver.header(0);
+
+            // Arm the reactor's park by hand; `arm_waitv` needs a quiet ring.
+            let mut out = [FutexWaitV::new(); 1];
+            assert!(receiver.arm_waitv(&mut out).is_some(), "an empty ring must arm");
+            assert_ne!(hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_WAITV, 0);
+
+            W2mWriter::new(ptr).send_encoded(64, 0, |s| s[0] = 1);
+            assert_eq!(
+                hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_ANY,
+                0,
+                "a publish must clear both master park bits",
+            );
+        }
+    }
+
+    /// Publish/drain throughput over one ring, and how many publishes spend a
+    /// `FUTEX_WAKE` — the quantity every change to the park protocol moves.
     ///
     /// A forked child publishes `N` control frames as fast as it can while the
     /// parent drains them, parking on the ring whenever it runs dry. Only the
-    /// ratios carry meaning: absolute rates swing with machine load. The park
-    /// rate is the gate's predicate sampled once per publish, not a syscall
-    /// count — for that, run `strace -f -c -e trace=futex` over the same test.
+    /// ratios carry meaning: absolute rates swing with machine load. The gate is
+    /// sampled just before each publish, which is the predicate that publish's
+    /// `wake_master` reads — so the count is a syscall count without `strace`.
     ///
     /// `cd crates && cargo test -p gnitz-server --release w2m_publish_drain_bench -- --ignored --nocapture --test-threads=1`
     #[test]
@@ -833,7 +1401,7 @@ mod tests {
 
         let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB, RING_FRAMES, 8) };
         let ptr = region.ptr();
-        // Two u64s the child fills before `_exit`: publishes that saw a master
+        // Two u64s the child fills before `_exit`: publishes that found a master
         // park armed, and the child's own elapsed nanos.
         let counters = SharedRegion::new(4096);
         let cptr = counters.ptr() as *mut u64;
@@ -845,15 +1413,15 @@ mod tests {
             let writer = W2mWriter::new(ptr);
             let hdr = unsafe { W2mRingHeader::from_raw(ptr) };
             let t = Instant::now();
-            let mut saw_parked = 0u64;
+            let mut woke_master = 0u64;
             for req in 1..=N {
-                writer.send_status(0, req, gnitz_wire::STATUS_OK, &[]);
-                if hdr.waiter_flags.load(Ordering::Relaxed) & FLAG_MASTER_ANY != 0 {
-                    saw_parked += 1;
+                if hdr.master_park.flags.load(Ordering::Relaxed) & FLAG_MASTER_ANY != 0 {
+                    woke_master += 1;
                 }
+                writer.send_status(0, req, gnitz_wire::STATUS_OK, &[]);
             }
             unsafe {
-                cptr.write(saw_parked);
+                cptr.write(woke_master);
                 cptr.add(1).write(t.elapsed().as_nanos() as u64);
                 libc::_exit(0);
             }
@@ -878,32 +1446,16 @@ mod tests {
 
         let mut status = 0;
         unsafe { libc::waitpid(pid, &mut status, 0) };
-        let (saw_parked, publish_ns) = unsafe { (cptr.read(), cptr.add(1).read()) };
+        let (woke_master, publish_ns) = unsafe { (cptr.read(), cptr.add(1).read()) };
 
         println!(
             "w2m publish/drain N={N} ring={RING_FRAMES} frames: \
              drain {:.2} Mmsg/s, publish {:.2} Mmsg/s, \
-             master parked at {:.1}% of publishes, {parks} drain parks ({:.1} per 1k msgs)",
+             {:.1}% of publishes spent a FUTEX_WAKE, {parks} drain parks ({:.1} per 1k msgs)",
             N as f64 * 1000.0 / drain_ns as f64,
             N as f64 * 1000.0 / publish_ns as f64,
-            saw_parked as f64 * 100.0 / N as f64,
+            woke_master as f64 * 100.0 / N as f64,
             parks as f64 * 1000.0 / N as f64,
         );
-    }
-
-    /// `wait_any` must leave no park flag behind: a stale bit would make every
-    /// later publish spend a `FUTEX_WAKE` on a word nobody is parked on.
-    #[test]
-    fn wait_any_clears_its_park_flag() {
-        unsafe {
-            let region = make_ring(64, 4, 8);
-            let receiver = W2mReceiver::new(vec![region.ptr()]);
-            let _ = receiver.wait_any(1, 50);
-            assert_eq!(
-                receiver.header(0).waiter_flags.load(Ordering::Acquire) & FLAG_MASTER_SYNC,
-                0,
-                "wait_any must clear its own park flag on return",
-            );
-        }
     }
 }

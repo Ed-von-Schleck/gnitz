@@ -1,9 +1,9 @@
 use rustc_hash::FxHashMap;
 
-use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::wire::DecodedWire;
 use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine::storage::Batch;
+use gnitz_wire::MAX_WORKERS;
 
 // ---------------------------------------------------------------------------
 // Chunked distributed-backfill exchange coordination

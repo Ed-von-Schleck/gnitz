@@ -36,10 +36,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use self::uring::{Cqe, IoUringRing, CQE_F_MORE};
 
 use crate::runtime::posix::FUTEX2_SIZE_U32;
-use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{self, DecodedWire};
 use gnitz_wire::FLAG_EXCHANGE;
+use gnitz_wire::MAX_WORKERS;
 
 /// High bit of `internal_req_id` (u32) marks scan-allocated request IDs.
 /// Regular IDs stay in [1, MAX_REGULAR_REQ_ID] (bit 31 clear).
@@ -602,15 +602,15 @@ impl Reactor {
             KIND_FUTEX_WAITV => {
                 // The wake index is not authoritative for FUTEX_WAITV — the
                 // kernel may wake us for any watched word — so every ring is
-                // drained. Clearing the park flag first is what makes the
-                // elision worth anything: from here until `tick` re-arms, the
-                // master is running, and a worker's publish should not spend a
-                // syscall waking it.
+                // drained. The flag drops first, and on the shutdown path too:
+                // from here until `tick` re-arms the master is running and a
+                // publish should not spend a syscall waking it, and a flag left
+                // set at shutdown outlives the park it describes for good.
                 self.inner.futex_waitv_armed.set(false);
+                if let Some(w2m) = self.inner.w2m.get() {
+                    w2m.clear_waitv();
+                }
                 if !self.inner.shutdown.get() {
-                    if let Some(w2m) = self.inner.w2m.get() {
-                        w2m.clear_waitv();
-                    }
                     self.drain_all_w2m();
                 }
             }
@@ -2626,7 +2626,7 @@ mod tests {
 
         const CAPACITY: usize = 64 * 1024;
 
-        let region = unsafe { crate::runtime::tests::fixtures::test_ring(CAPACITY) };
+        let region = unsafe { crate::runtime::w2m::test_ring(CAPACITY) };
         let ptr = region.ptr();
 
         let pid = unsafe { libc::fork() };
@@ -2724,7 +2724,7 @@ mod tests {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use gnitz_wire::STATUS_OK;
 
-        let region = unsafe { crate::runtime::tests::fixtures::test_ring(64 * 1024) };
+        let region = unsafe { crate::runtime::w2m::test_ring(64 * 1024) };
         let ptr = region.ptr();
         W2mWriter::new(ptr).send_status(0, 1u64, STATUS_OK, &[]);
 
@@ -3212,7 +3212,7 @@ mod tests {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::wire as ipc;
 
-        let region = crate::runtime::tests::fixtures::test_ring(64 * 1024);
+        let region = crate::runtime::w2m::test_ring(64 * 1024);
         let ptr = region.ptr();
 
         let writer = W2mWriter::new(ptr);
@@ -3223,9 +3223,7 @@ mod tests {
                 request_id: wire_req,
                 ..Default::default()
             };
-            writer.send_encoded(msg.size(), internal_req_id, |buf| {
-                msg.encode_ipc(buf, 0);
-            });
+            writer.send_msg(internal_req_id as u64, &msg);
         }
         (receiver, region)
     }
@@ -3319,7 +3317,6 @@ mod tests {
     /// `W2mSlot` advances `release_cursor`) and deregisters the active scan.
     #[test]
     fn scan_lease_drop_frees_queued_slots() {
-        use std::sync::atomic::Ordering;
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
         let (recv, _region) = unsafe { make_scan_ring(req_id, 1) };
@@ -3329,7 +3326,7 @@ mod tests {
         r.test_route_scan_slot(s0); // queued (active)
         assert!(r.inner.scans.borrow().contains_key(&req_id));
 
-        let cc_before = unsafe { recv.header(0) }.release_cursor.load(Ordering::Acquire);
+        let cc_before = recv.release_cursor(0);
         drop(lease); // purge parked queue → drop queued slot → advance release_cursor
         assert!(
             r.inner.scans.borrow().values().all(|s| s.queue.is_empty()),
@@ -3340,7 +3337,7 @@ mod tests {
             "lease drop purges wakers"
         );
         assert!(r.inner.scans.borrow().is_empty(), "lease drop deregisters active scan");
-        let cc_after = unsafe { recv.header(0) }.release_cursor.load(Ordering::Acquire);
+        let cc_after = recv.release_cursor(0);
         assert!(cc_after > cc_before, "dropped queued slot must advance release_cursor");
 
         drop(recv);
@@ -3351,20 +3348,19 @@ mod tests {
     /// wedges on a full ring.
     #[test]
     fn abandoned_scan_frame_is_discarded_not_parked() {
-        use std::sync::atomic::Ordering;
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
         let (recv, _region) = unsafe { make_scan_ring(req_id, 1) };
 
         // No lease held: route_scan_slot must drop the slot, not park it.
         let s0 = recv.try_read_slot(0).expect("frame 0");
-        let cc_before = unsafe { recv.header(0) }.release_cursor.load(Ordering::Acquire);
+        let cc_before = recv.release_cursor(0);
         r.test_route_scan_slot(s0); // dropped here (inactive)
         assert!(
             r.inner.scans.borrow().values().all(|s| s.queue.is_empty()),
             "abandoned-scan frame must be discarded, not parked"
         );
-        let cc_after = unsafe { recv.header(0) }.release_cursor.load(Ordering::Acquire);
+        let cc_after = recv.release_cursor(0);
         assert!(
             cc_after > cc_before,
             "discarded slot must advance release_cursor (ring freed)"
@@ -3377,13 +3373,12 @@ mod tests {
     /// ring holds; the master takes a lease, queues 2 (filling the ring and
     /// parking the writer), then drops the lease mid-train. The freed slots +
     /// the gate discarding every later frame must let the writer finish all its
-    /// writes instead of wedging in `send_encoded`.
+    /// writes instead of wedging in `W2mWriter::send_msg`.
     #[test]
     fn dropped_scan_lease_unblocks_streaming_writer() {
-        use crate::runtime::tests::fixtures::make_ring;
+        use crate::runtime::w2m::make_ring;
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::wire as ipc;
-        use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
 
         const TOTAL: usize = 8;
@@ -3401,9 +3396,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for _ in 0..TOTAL {
                 let msg = ipc::WireMsg::default();
-                writer.send_encoded(msg.size(), req_id, |buf| {
-                    msg.encode_ipc(buf, 0);
-                });
+                writer.send_msg(req_id as u64, &msg);
             }
             let _ = done_tx.send(());
         });
@@ -3444,10 +3437,9 @@ mod tests {
             .expect("writer thread must finish — never wedge on a full ring");
         handle.join().expect("writer thread panicked");
 
-        let hdr = unsafe { receiver.header(0) };
         assert_eq!(
-            hdr.release_cursor.load(Ordering::Acquire),
-            hdr.write_cursor.load(Ordering::Acquire),
+            receiver.release_cursor(0),
+            receiver.write_cursor(0),
             "every emitted slot must be freed (release_cursor reaches write_cursor)",
         );
 

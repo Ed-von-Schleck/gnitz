@@ -255,7 +255,7 @@ impl Reactor {
     /// the slot is dropped, advancing the cursor. That pin is why every slot
     /// send carries the deadline: a client that stops draining its socket
     /// pins the slot; with enough stalled frames the worker's W2M ring fills
-    /// and the single-threaded worker blocks synchronously in `send_encoded`'s
+    /// and the single-threaded worker blocks synchronously in `W2mWriter::send_msg`'s
     /// futex, starving every other client's SAL progress — a cluster-wide
     /// freeze. On expiry [`guard_client_egress`] releases the slot only AFTER
     /// the send's CQE, never while an SQE still references its buffer.

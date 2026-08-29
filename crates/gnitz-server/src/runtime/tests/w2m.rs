@@ -1,6 +1,4 @@
-use super::fixtures;
-use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-use crate::runtime::w2m_ring;
+use crate::runtime::w2m::{make_ring, W2mReceiver, W2mWriter};
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::STATUS_OK;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +10,7 @@ use std::time::{Duration, Instant};
 /// order, with its payload intact. The ring holds only `ring_frames` of them,
 /// so the run wraps it many times over.
 fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pad: &[u8]) {
-    let region = unsafe { fixtures::make_ring(CTRL_BLOCK_SIZE_NO_BLOB + pad.len(), ring_frames, 8) };
+    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB + pad.len(), ring_frames, 8) };
     let ptr = region.ptr();
 
     let region_addr = ptr as usize;
@@ -89,19 +87,9 @@ fn w2m_concurrent_large_frames_arrive_in_order() {
     concurrent_publish_drains_in_order("large frames", 4, 500, &[b'x'; 4000]);
 }
 
-/// An oversized `sz` is a caller bug, and the ring says so at the first
-/// statement of `try_reserve` — so it cannot degenerate into a park on a ring
-/// that will never have room.
-#[test]
-#[should_panic(expected = "outside (0,")]
-fn w2m_writer_rejects_oversized() {
-    let region = unsafe { fixtures::make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 4, 8) };
-    W2mWriter::new(region.ptr()).send_encoded((w2m_ring::MAX_W2M_MSG + 1) as usize, 0, |_| {});
-}
-
 #[test]
 fn w2m_control_only_reply_has_no_backing() {
-    let region = unsafe { fixtures::make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8) };
+    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8) };
     let ptr = region.ptr();
 
     let writer = W2mWriter::new(ptr);

@@ -4,22 +4,8 @@
 
 use super::*;
 use crate::runtime::sal::FLAG_ZONE_START;
+use crate::runtime::w2m::{worker_mask, BitIter};
 use gnitz_engine::foundation::fault::Seam;
-
-/// Yields the set bit positions of a worker mask, lowest first.
-struct BitIter(u64);
-
-impl Iterator for BitIter {
-    type Item = usize;
-    fn next(&mut self) -> Option<usize> {
-        if self.0 == 0 {
-            return None;
-        }
-        let w = self.0.trailing_zeros() as usize;
-        self.0 &= self.0 - 1;
-        Some(w)
-    }
-}
 
 /// Route a ScanSpec read, as the [`Fanout`] every fan-out helper speaks.
 ///
@@ -57,20 +43,10 @@ fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: &[u8]) -> Opti
     gnitz_engine::catalog::scan_spec_worker(&schema, &desc, disp.num_workers)
 }
 
-/// Timeout for the synchronous `W2mReceiver::wait_any` park in the
-/// reactor-driven-but-sometimes-parked collect loop below.
-///
-/// `wait_any` returns the instant a worker publishes *as long as the futex wake
-/// reaches it*. At boot (no reactor) and in the steady state nothing
-/// competes for that wake, so the loop is woken promptly and this value is just
-/// an unhit ceiling. But the reactor-parked CREATE-VIEW backfill runs the loop
-/// while the reactor's `FUTEX_WAITV` SQE is still armed on the same
-/// `write_cursor` words: the kernel can deliver a worker's wake to that op (whose
-/// CQE then sits unprocessed — the reactor is parked here) instead of to this
-/// `futex_waitv`, which would otherwise sleep the full timeout while the reply
-/// already sits in the ring. A short timeout caps that stolen-wake stall (the
-/// loop re-`try_read`s every iteration and finds the reply) at a few ms instead
-/// of ~1 s, with negligible extra polling on the never-stalled paths.
+/// Ceiling on the synchronous `W2mReceiver::wait_any` park in the collect loop
+/// below, and so also the loop's `fail_if_worker_dead` cadence: a worker that
+/// dies without publishing is noticed within this long. A publish wakes the loop
+/// directly, so on every live path the ceiling is unhit.
 const W2M_SYNC_WAIT_MS: i32 = 10;
 
 /// `GNITZ_INJECT_RELAY_SPACE_LOW` / `GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW`:
@@ -299,8 +275,8 @@ impl MasterDispatcher {
     /// `ctx` names the phase in a worker-fault or dead-worker error.
     fn collect_acks_and_relay(&self, checkpoint_allowed: bool, ctx: &str) -> Result<(), String> {
         let nw = self.num_workers;
-        // One bit per worker still owing its ACK; `MAX_WORKERS` is 64.
-        let mut pending_mask: u64 = if nw == 64 { u64::MAX } else { (1u64 << nw) - 1 };
+        // One bit per worker still owing its ACK.
+        let mut pending_mask: u64 = worker_mask(nw);
         let mut acc = crate::runtime::reactor::ExchangeAccumulator::new(nw);
         // Armed when a round is stamped CHECKPOINT; the actual SAL reset is
         // deferred to the next round barrier (see the decision block below).
@@ -900,7 +876,7 @@ impl MasterDispatcher {
     /// `forward_scan_slots` returns on the FIRST worker fault, decode error, or
     /// client disconnect: `_lease` drops on return and `route_scan_slot` discards
     /// every undrained frame at the ring boundary, advancing `release_cursor`, so
-    /// a still-streaming worker cannot wedge in `send_encoded` — draining the
+    /// a still-streaming worker cannot wedge in `W2mWriter::send_msg` — draining the
     /// doomed trains would be pure waste. The client may already have received
     /// earlier workers' data frames when the fault surfaces, so the fault frame
     /// `finish_scan_fanout` emits can arrive mid-stream: the client's reply
@@ -1418,7 +1394,7 @@ mod worker_liveness_tests {
         let nw = worker_pids.len();
         let mut rings = Vec::with_capacity(nw);
         for _ in 0..nw {
-            rings.push(unsafe { crate::runtime::tests::fixtures::test_ring(RING_CAP) });
+            rings.push(unsafe { crate::runtime::w2m::test_ring(RING_CAP) });
         }
         // `-1` eventfds: nothing parks on them here, and `eventfd_signal`
         // discards a failed write (the counter is only a wake hint).

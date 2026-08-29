@@ -81,7 +81,7 @@ fn parse_level(s: &str) -> u32 {
 /// returns 0 for every key, and only a `debug_assert!` catches it. No other
 /// entry point may bypass this check.
 fn parse_workers(val: &str) -> Result<u32, String> {
-    const MAX: u32 = runtime::MAX_WORKERS as u32;
+    const MAX: u32 = gnitz_wire::MAX_WORKERS as u32;
     match val.parse::<u32>() {
         Ok(n) if (1..=MAX).contains(&n) => Ok(n),
         Ok(n) => Err(format!("--workers must be between 1 and {MAX} (got {n})")),
@@ -206,7 +206,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::parse_workers;
-    use super::runtime::MAX_WORKERS;
+    use gnitz_wire::MAX_WORKERS;
 
     #[test]
     fn parse_workers_accepts_valid_range() {

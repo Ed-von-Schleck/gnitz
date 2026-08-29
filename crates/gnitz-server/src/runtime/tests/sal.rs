@@ -4,11 +4,12 @@ use crate::runtime::sal::{
     atomic_load_u64, effective_max, group_header_size, sal_begin_group, sal_probe_header, sal_read_group_header,
     sal_tail_slot_count, sal_write_group, EpochGate, GroupData, GroupTargets, SalMessage, SalReader, SalStep,
     SalWriter, CHECKPOINT_RESERVE, FLAG_DDL_SYNC, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_SHUTDOWN, FLAG_TXN_COMMIT,
-    MAX_WORKERS, MIN_SAL_BYTES, SENTINEL_SIZE,
+    MIN_SAL_BYTES, SENTINEL_SIZE,
 };
 use gnitz_engine_testkit::{sweep_bit_flips, SharedRegion};
 use gnitz_wire::align8;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
+use gnitz_wire::MAX_WORKERS;
 
 /// The group `worker` reads at `base` and the cursor past it, or a panic if the
 /// bytes are not a group.

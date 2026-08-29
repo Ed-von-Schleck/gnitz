@@ -15,7 +15,7 @@ use gnitz_wire::{wire_flags_get_schema_version, FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
 /// `MAX_W2M_MSG`, is deliberately the larger of the two — it is the right limit
 /// for a train the master consumes rather than forwards.
 pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
-const _: () = assert!(FRAME_CAP < super::w2m_ring::MAX_W2M_MSG as usize);
+const _: () = assert!(FRAME_CAP < super::w2m::MAX_W2M_MSG as usize);
 
 /// Set on the last (or only) scan chunk from a worker. `pub` in `gnitz_wire` so
 /// the bit is guarded against every other wire flag; narrowed to this crate
@@ -156,7 +156,7 @@ impl<'a> WireData<'a> {
 ///
 /// ```ignore
 /// let msg = ipc::WireMsg { request_id, status: STATUS_ERROR, error_msg: msg, ..Default::default() };
-/// writer.send_encoded(msg.size(), request_id as u32, |buf| { msg.encode_ipc(buf, 0); });
+/// writer.send_msg(request_id, &msg);
 /// ```
 #[derive(Clone, Copy, Default)]
 pub struct WireMsg<'a> {

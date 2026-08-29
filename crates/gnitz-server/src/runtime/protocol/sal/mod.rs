@@ -22,7 +22,7 @@ use gnitz_wire::align8;
 // Constants
 // ---------------------------------------------------------------------------
 
-pub use gnitz_wire::MAX_WORKERS;
+use gnitz_wire::MAX_WORKERS;
 
 /// Leading marker of every out-of-space refusal from `SalWriter::begin`. It is a
 /// **wire-text** contract, not a Rust one: no Rust caller matches it — they all

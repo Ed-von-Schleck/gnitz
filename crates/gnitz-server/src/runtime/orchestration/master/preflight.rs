@@ -368,7 +368,7 @@ impl PreflightAccumulator {
 /// without draining the remaining trains: the caller holds the `ScanLease` to
 /// end of scope, so on return or cancellation the lease drop deregisters the
 /// req_ids and `route_scan_slot` discards every undrained frame at the ring
-/// boundary — a still-streaming worker never wedges in `send_encoded`.
+/// boundary — a still-streaming worker never wedges in `W2mWriter::send_msg`.
 async fn merge_index_scan(
     slots: Vec<W2mSlot>,
     scan: &ScanDispatch,

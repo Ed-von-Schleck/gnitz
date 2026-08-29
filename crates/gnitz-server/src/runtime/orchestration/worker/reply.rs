@@ -145,7 +145,7 @@ impl WorkerProcess {
         if sz > FRAME_CAP {
             return Err(format!("reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}").into());
         }
-        self.w2m_writer.send_msg_sized(request_id, &msg, sz);
+        self.w2m_writer.send_msg(request_id, &msg);
         Ok(())
     }
 
@@ -188,7 +188,7 @@ impl WorkerProcess {
             FRAME_CAP
         };
         if sz <= frame_cap {
-            self.w2m_writer.send_msg_sized(request_id, &msg, sz);
+            self.w2m_writer.send_msg(request_id, &msg);
             return Ok(());
         }
         if !is_wire_safe {
@@ -257,7 +257,7 @@ impl WorkerProcess {
                 });
                 return Ok(());
             }
-            self.w2m_writer.send_msg_sized(request_id, &msg, wire_sz);
+            self.w2m_writer.send_msg(request_id, &msg);
             return Ok(());
         }
 
@@ -279,7 +279,7 @@ impl WorkerProcess {
         // would have sent.
         let sz = msg.size();
         if !force_fifo && sz <= self.reply_frame_budget {
-            self.w2m_writer.send_msg_sized(request_id, &msg, sz);
+            self.w2m_writer.send_msg(request_id, &msg);
         } else {
             self.enqueue_stream(batch, request_id, client_id, target_id, prebuilt_rc, server_version);
         }
@@ -524,7 +524,7 @@ fn oversized_string_reply(sz: usize) -> gnitz_wire::WireFault {
 /// chunking would require materialising all keys as one 32 B/row `Batch`. The
 /// synthetic schema's wire block is built one-off (the `ReplySchema::OneOff`
 /// pattern) and never written to the table-keyed schema-block cache, so the
-/// table's cached block is never poisoned. `send_encoded` blocks on a full ring
+/// table's cached block is never poisoned. `W2mWriter::send_msg` blocks on a full ring
 /// until the master's merge drains it — acceptable backpressure: the worker has
 /// nothing else to do during the DDL window.
 pub(crate) fn send_unique_preflight_keys(

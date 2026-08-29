@@ -216,7 +216,7 @@ pub struct WorkerProcess {
     /// request's train at a time, so an interleaved second train's frames
     /// would sit parked in the master's scan queue holding un-released ring slots;
     /// `release_cursor` (released in ring order, `w2m.rs`) could then never
-    /// pass them, the ring fills, the worker blocks in `send_encoded`, and the
+    /// pass them, the ring fills, the worker blocks in `W2mWriter::send_msg`, and the
     /// cluster deadlocks. FIFO is deadlock-free: every fan-out writes its
     /// group to all workers under `sal_writer_excl`, so all worker queues
     /// share one global request order; each master task drains workers in
@@ -227,7 +227,7 @@ pub struct WorkerProcess {
     /// `do_exchange_wait`'s inline dispatch loop. That loop can ENQUEUE trains
     /// (the Scan/seek/gather arms dispatch inline in both contexts); they must
     /// stay queued until the exchange completes. Emitting there would let
-    /// `send_encoded` block on a full W2M ring — full because the queued
+    /// `W2mWriter::send_msg` block on a full W2M ring — full because the queued
     /// train's master-side consumer paces a slow client TCP connection — while
     /// the `ExchangeRelay` this worker is waiting for sits unread in the SAL:
     /// the join would stall indefinitely on an unrelated slow client.
@@ -410,7 +410,7 @@ impl WorkerProcess {
     /// Process all pending SAL message groups. Shutdown `_exit`s inline.
     fn drain_sal(&mut self) {
         // Emit the next chunk of the FRONT pending train before draining new
-        // SAL messages. One chunk per drain_sal pass; send_encoded provides
+        // SAL messages. One chunk per drain_sal pass; `send_msg` provides
         // backpressure. Single-frame replies for other requests still go out
         // immediately between chunks (distinct ring-prefix request ids; the
         // master reactor routes per id).
@@ -1481,7 +1481,7 @@ fn unique_preflight_spill_bytes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::w2m_ring;
+    use crate::runtime::w2m::{self, W2mReceiver};
     use gnitz_engine::catalog::PUBLIC_SCHEMA_ID;
     use gnitz_engine::schema::SchemaDescriptor;
     use gnitz_engine_testkit::{col_def, CatalogTestExt};
@@ -1881,7 +1881,7 @@ mod tests {
     /// A production-sized ring and its writer. The mmap reservation is
     /// lazily populated, so the 1 GiB backing costs address space, not RAM.
     fn make_ring() -> (gnitz_engine_testkit::SharedRegion, W2mWriter) {
-        let region = unsafe { crate::runtime::tests::fixtures::test_ring(w2m_ring::W2M_REGION_SIZE) };
+        let region = unsafe { w2m::test_ring(w2m::W2M_REGION_SIZE) };
         let writer = W2mWriter::new(region.ptr());
         (region, writer)
     }
@@ -2260,10 +2260,10 @@ mod tests {
     /// Read every published message off a test ring in publish order,
     /// returning `(ring_prefix_req_id, frame_bytes)`.
     fn walk_frames(ptr: *mut u8) -> Vec<(u32, Vec<u8>)> {
-        let mut rc = unsafe { w2m_ring::RingCursor::consumer(ptr) };
+        let receiver = W2mReceiver::new(vec![ptr]);
         let mut out = Vec::new();
-        while let Some(slot) = unsafe { w2m_ring::try_consume(&mut rc) } {
-            out.push((slot.internal_req_id, slot.payload.to_vec()));
+        while let Some(slot) = receiver.try_read_slot(0) {
+            out.push((slot.internal_req_id, slot.bytes().to_vec()));
         }
         out
     }

@@ -10,7 +10,7 @@
 //! `parse_train_header` too.
 
 use super::*;
-use crate::runtime::sal::MAX_WORKERS;
+use gnitz_wire::MAX_WORKERS;
 
 pub(super) fn scan_decode_err(w: usize, e: &'static str) -> WorkerFault {
     format!("scan: worker {w}: decode error: {e}").into()
@@ -72,7 +72,7 @@ pub(super) fn expect_single_frame(slot: &W2mSlot, w: usize, what: &str) -> Resul
 /// `ScanLease` from `dispatch_scan_fanout`; when the early `Err` unwinds it, the
 /// lease drop frees every parked slot and `route_scan_slot` discards later
 /// frames at the ring boundary, advancing `release_cursor`, so a still-streaming
-/// worker cannot wedge in `send_encoded`.
+/// worker cannot wedge in `W2mWriter::send_msg`.
 ///
 /// `expected` guards each train's first schema-bearing frame. Worker reply
 /// schemas can lag the master's during DDL races (`run_tick` releases the
@@ -301,7 +301,7 @@ mod tests {
             let mut rings = Vec::with_capacity(n_workers);
             let mut writers = Vec::with_capacity(n_workers);
             for _ in 0..n_workers {
-                let region = unsafe { crate::runtime::tests::fixtures::make_ring(DRAIN_MSG_SZ, DRAIN_RING_MSGS, 16) };
+                let region = unsafe { crate::runtime::w2m::make_ring(DRAIN_MSG_SZ, DRAIN_RING_MSGS, 16) };
                 writers.push(W2mWriter::new(region.ptr()));
                 rings.push(region);
             }
@@ -641,7 +641,6 @@ mod tests {
     #[test]
     fn drain_scan_train_drops_a_frame_with_neither_data_nor_schema() {
         use gnitz_wire::STATUS_OK;
-        use std::sync::atomic::Ordering;
 
         let (fx, writers) = DrainFixture::new(1);
         let w0_req = fx.req(0);
@@ -658,13 +657,13 @@ mod tests {
         let mut slots = fx.initial_slots();
         let slot = slots.pop().expect("first frame");
 
-        let before = unsafe { fx.receiver.header(0) }.release_cursor.load(Ordering::Acquire);
+        let before = fx.receiver.release_cursor(0);
         let head = classify_head(&slot, 0).expect("healthy header");
         assert!(!head.observable, "a frame with neither rows nor a schema block");
         let drained = poll_once(drain_scan_train(&fx.reactor, &fx.peer, slot, head, w0_req, 0)).expect("healthy train");
         assert!(drained, "the train drained without a client disconnect");
         assert!(
-            unsafe { fx.receiver.header(0) }.release_cursor.load(Ordering::Acquire) > before,
+            fx.receiver.release_cursor(0) > before,
             "the dropped slot was released at the ring"
         );
 
@@ -684,7 +683,6 @@ mod tests {
     #[test]
     fn forward_scan_slots_coalesces_single_frame_heads() {
         use gnitz_wire::STATUS_OK;
-        use std::sync::atomic::Ordering;
 
         let schema = two_col_schema();
         let rows_a = make_row_batch(schema, &[(1, 1, 0, 10)]);
@@ -697,9 +695,7 @@ mod tests {
         write_test_frame(&writers[2], reqs[2], 0, STATUS_OK, b"", Some(&schema), Some(&rows_c));
 
         let slots = fx.initial_slots();
-        let before: Vec<u64> = (0..3)
-            .map(|w| unsafe { fx.receiver.header(w) }.release_cursor.load(Ordering::Acquire))
-            .collect();
+        let before: Vec<u64> = (0..3).map(|w| fx.receiver.release_cursor(w)).collect();
 
         // The fixture's peer has no reader, so the send parks and the forward
         // cannot finish in one poll — the cursors are what carry the verdict.
@@ -707,7 +703,7 @@ mod tests {
         assert!(done.is_none(), "the coalesced send parks on a peer nobody reads");
         for (w, &was) in before.iter().enumerate() {
             assert!(
-                unsafe { fx.receiver.header(w) }.release_cursor.load(Ordering::Acquire) > was,
+                fx.receiver.release_cursor(w) > was,
                 "worker {w}'s slot must be released before the send is submitted",
             );
         }
