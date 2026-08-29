@@ -1,3 +1,7 @@
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
+
 pub mod codec;
 pub mod error;
 pub mod message;

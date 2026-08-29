@@ -1,3 +1,10 @@
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
+//!
+//! `src/tests/` holds those; the crate-root `tests/` beside `src/` is the
+//! integration suite, gated on the `integration` feature.
+
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
 
@@ -7,6 +14,8 @@ pub mod connection;
 pub mod error;
 pub mod mirror;
 pub mod protocol;
+#[cfg(test)]
+mod test_support;
 pub mod types;
 
 // The crate prelude: the names a client of gnitz-core names by hand. Every

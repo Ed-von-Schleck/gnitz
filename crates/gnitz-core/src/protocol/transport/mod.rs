@@ -14,6 +14,10 @@
 //! emulate blocking, bounded by the transport's own [`ClientTransport::set_deadline`]
 //! rather than a socket option — the TLS connect arms it for the HELLO
 //! exchange and `mark_established` clears it.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 use std::collections::VecDeque;
 use std::io::{IoSlice, Write};
@@ -752,95 +756,6 @@ pub fn hello_handshake(t: &mut ClientTransport) -> Result<u64, ProtocolError> {
     Err(ProtocolError::DecodeError(err))
 }
 
-/// Both ends of a connected Unix socketpair — the loopback every framing test
-/// runs over. Lives here, beside `from_unix_fd`, so the transport and message
-/// test modules share one definition.
 #[cfg(test)]
-pub(crate) fn make_socketpair() -> (OwnedFd, OwnedFd) {
-    use std::os::fd::FromRawFd;
-    let mut fds = [0i32; 2];
-    // SAFETY: socketpair fills two fresh fds we take sole ownership of.
-    unsafe {
-        assert_eq!(
-            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()),
-            0
-        );
-        (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
-    }
-}
-
-/// A transport over `fd`, established under the client ceiling — the shape
-/// every post-handshake connection has.
-#[cfg(test)]
-pub(crate) fn established(fd: OwnedFd) -> ClientTransport {
-    let mut t = ClientTransport::from_unix_fd(fd);
-    t.mark_established(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
-    t
-}
-
-/// [`make_socketpair`] as a transport pair, both ends established; dropping
-/// them closes the fds.
-#[cfg(test)]
-pub(crate) fn make_transport_pair() -> (ClientTransport, ClientTransport) {
-    let (a, b) = make_socketpair();
-    (established(a), established(b))
-}
-
-/// `[u32 LE len][payload]`, what a peer writes.
-#[cfg(test)]
-pub(crate) fn framed(payload: &[u8]) -> Vec<u8> {
-    let mut v = frame_len_prefix(payload.len()).unwrap().to_vec();
-    v.extend_from_slice(payload);
-    v
-}
-
-/// Raw `send(2)` of all of `bytes` on `fd`: what a scripted peer writes.
-#[cfg(test)]
-pub(crate) fn raw_send(fd: &OwnedFd, bytes: &[u8]) {
-    let mut off = 0;
-    while off < bytes.len() {
-        // SAFETY: valid fd and buffer.
-        let n = unsafe {
-            libc::send(
-                fd.as_raw_fd(),
-                bytes[off..].as_ptr() as *const libc::c_void,
-                bytes.len() - off,
-                0,
-            )
-        };
-        assert!(n > 0, "send failed: {}", std::io::Error::last_os_error());
-        off += n as usize;
-    }
-}
-
-/// Raw `recv(2)` of exactly `buf.len()` bytes on `fd`.
-#[cfg(test)]
-pub(crate) fn raw_read_exact(fd: &OwnedFd, buf: &mut [u8]) {
-    let mut off = 0;
-    while off < buf.len() {
-        // SAFETY: valid fd and buffer.
-        let n = unsafe {
-            libc::recv(
-                fd.as_raw_fd(),
-                buf[off..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - off,
-                0,
-            )
-        };
-        assert!(n > 0, "recv failed: {}", std::io::Error::last_os_error());
-        off += n as usize;
-    }
-}
-
-/// One length-prefixed frame off `fd`, as a scripted peer reads a request.
-#[cfg(test)]
-pub(crate) fn raw_read_frame(fd: &OwnedFd) -> Vec<u8> {
-    let mut hdr = [0u8; 4];
-    raw_read_exact(fd, &mut hdr);
-    let mut payload = vec![0u8; u32::from_le_bytes(hdr) as usize];
-    raw_read_exact(fd, &mut payload);
-    payload
-}
-
-#[cfg(test)]
+#[path = "tests/transport.rs"]
 mod tests;

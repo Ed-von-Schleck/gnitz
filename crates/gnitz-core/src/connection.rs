@@ -1176,52 +1176,5 @@ fn control_parts(ctrl: Vec<u8>) -> MessageParts {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn error_msg(error_text: Option<String>) -> Message {
-        Message {
-            status: STATUS_ERROR,
-            target_id: 0,
-            flags: 0,
-            seek_pk: 0,
-            schema: None,
-            data_batch: None,
-            error_text,
-            seek_pk_extra: Vec::new(),
-        }
-    }
-
-    // `Message` does not implement Debug, so match the Result rather than
-    // calling unwrap_err (which would require the Ok variant to be Debug).
-    fn server_error_text(msg: Message) -> String {
-        match check_response(msg) {
-            Err(ClientError::ServerError(s)) => s,
-            Err(other) => panic!("expected ServerError, got {other:?}"),
-            Ok(_) => panic!("expected an error"),
-        }
-    }
-
-    #[test]
-    fn check_response_empty_error_text_falls_back_to_default() {
-        // A STATUS_ERROR with Some("") must surface the default text, not a
-        // blank ServerError — the warm-push guard's rejection must be legible.
-        assert_eq!(
-            server_error_text(error_msg(Some(String::new()))),
-            "unknown server error"
-        );
-    }
-
-    #[test]
-    fn check_response_none_error_text_falls_back_to_default() {
-        assert_eq!(server_error_text(error_msg(None)), "unknown server error");
-    }
-
-    #[test]
-    fn check_response_nonempty_error_text_preserved() {
-        assert_eq!(server_error_text(error_msg(Some("real error".into()))), "real error");
-    }
-}
-
-#[cfg(test)]
-mod spine_tests;
+#[path = "tests/connection.rs"]
+mod tests;
