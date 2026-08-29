@@ -494,10 +494,9 @@ fn test_drop_table_cascades_fk_index() {
 }
 
 // ── Regression: indices_by_owner cache drives cascade_retract_indices ──
-// drop_table must cascade-retract ALL owned indices. With the O(N) full-scan
-// implementation this always worked, but the cache-based implementation must
-// correctly track every idx_id under the same owner and emit one retraction
-// per index via retract_single_row.
+// drop_table must cascade-retract ALL owned indices. The cache is what names
+// them, so it must track every idx_id under the same owner — `retract_pk_list`
+// then emits one batch carrying a `-1` for each.
 
 #[test]
 fn test_drop_table_cascades_multiple_indices() {

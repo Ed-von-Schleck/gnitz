@@ -66,7 +66,7 @@ use sys_tables::*;
 // ── Catalog-internal re-exports — no out-of-catalog consumer (W8). These reach
 //    the submodules through their `use super::*` glob, so they stay re-exported
 //    but scoped to the catalog subtree rather than the crate-wide surface. ─────
-pub(in crate::catalog) use apply_context::ApplyContext;
+pub(in crate::catalog) use apply_context::{ApplyContext, ApplyMode};
 pub(in crate::catalog) use cache::CatalogCacheSet;
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
@@ -76,10 +76,11 @@ pub(in crate::catalog) use registry::raise_id_counter;
 pub(in crate::catalog) use crate::storage::{
     fsync_dir, peek_header, reclaim_retired_children, remove_child, state_child_manifests, subdir_names, ChildAddr,
 };
+#[cfg(test)]
+pub(in crate::catalog) use utils::cursor_read_string;
 pub(in crate::catalog) use utils::{
-    cursor_read_string, cursor_read_u64, ensure_dir, index_dir, is_table_dir_name, lock_data_dir, make_fk_index_name,
-    preflight_dir, relation_dir, retract_key_range, retract_single_row, schema_dir, sys_catalog_dir, sys_family_dir,
-    sys_opk,
+    cursor_read_u64, ensure_dir, index_dir, is_table_dir_name, lock_data_dir, make_fk_index_name, preflight_dir,
+    relation_dir, retract_key_range, retract_pk_list, schema_dir, sys_catalog_dir, sys_family_dir, sys_opk,
 };
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
 // for the catalog's row builders.
@@ -198,9 +199,8 @@ pub struct CatalogEngine {
     /// every worker has consumed past this DROP — hence finished the CREATE.
     pub(crate) checkpoint_gated_deletions: Vec<String>,
 
-    // The applier's current execution context: replay/live phase, the two
-    // transient sub-operation flags (rollback / cascade-drop), and the
-    // DDL-zone LSN. See `ApplyContext`.
+    // The applier's current execution context: the apply mode and the DDL-zone
+    // LSN. See `ApplyContext`.
     pub(crate) ctx: ApplyContext,
 
     /// Rows per `drain_chunk` call on every chunked scan the engine drives:

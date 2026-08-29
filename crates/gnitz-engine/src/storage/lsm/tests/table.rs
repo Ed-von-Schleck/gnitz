@@ -440,7 +440,7 @@ fn flush_prepare_non_durable_done_inline() {
 }
 
 /// Wide (`pk_stride = 24`) PK in every tier its rows can live in.
-/// `has_pk_bytes`/`retract_pk_bytes` must resolve prefix-twins — keys sharing
+/// `has_pk_bytes`/`live_row_at` must resolve prefix-twins — keys sharing
 /// their OPK 16-byte prefix and differing only in the trailing column —
 /// independently, so a retraction nets against the twin it names and no other.
 ///
@@ -494,14 +494,14 @@ fn wide_pk_membership_and_retract_resolve_twins_in_every_tier() {
         assert!(!t.has_pk_bytes(&twin_a));
         assert!(t.has_pk_bytes(&twin_b));
 
-        let (w, found) = t.retract_pk_bytes(&twin_b);
+        let (w, found) = t.live_row_at(&twin_b);
         assert_eq!(w, 1);
         assert_eq!(
             row_val(&found.expect("live twin is the found row")),
             20,
             "found row must be the surviving twin's payload"
         );
-        let (w2, found2) = t.retract_pk_bytes(&twin_a);
+        let (w2, found2) = t.live_row_at(&twin_a);
         assert_eq!(w2, 0, "net-zero twin reports absent");
         assert!(found2.is_none());
     }
@@ -560,7 +560,7 @@ fn signed_compound_pk_keeps_opk_order_in_every_tier() {
         );
 
         // A read-only probe reports the live (weight, row) for the signed key.
-        let (w, found) = t.retract_pk_bytes(&key(-5, 0, 0));
+        let (w, found) = t.live_row_at(&key(-5, 0, 0));
         assert_eq!(w, 1);
         assert_eq!(
             row_val(&found.expect("signed key is the found row")),
@@ -865,7 +865,7 @@ fn inmem_retract_multiple_payloads() {
 }
 
 /// The live row sits in RAM while the memtable holds a *negative*-weight
-/// entry for the same PK. `for_each_pk_candidate` + `retract_pk_bytes` must net
+/// entry for the same PK. `for_each_pk_candidate` + `live_row_at` must net
 /// memtable + RAM per candidate (killing the payload that cancels to zero) and
 /// return the globally-live payload from the RAM run.
 #[test]

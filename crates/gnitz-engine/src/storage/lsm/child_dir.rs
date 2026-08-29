@@ -229,6 +229,10 @@ pub(crate) fn remove_child(dir: &str) {
 }
 
 /// `fsync` a directory so its entries are durable.
+///
+/// Every catalog caller discards the result: a relation's own row is in the
+/// fsynced SAL and boot replay re-creates whatever directory it names, so a lost
+/// directory entry there costs a re-`mkdir` and never a row.
 pub(crate) fn fsync_dir(dir: &str) -> Result<(), StorageError> {
     fs::File::open(dir)
         .and_then(|d| d.sync_all())

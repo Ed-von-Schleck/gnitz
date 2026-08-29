@@ -9,11 +9,10 @@ use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
 
+use gnitz_expr::RowSource;
 use gnitz_wire::{
-    COLTAB_COL_FK_COL_IDX, COLTAB_COL_FK_TABLE_ID, COLTAB_COL_IS_HIDDEN, COLTAB_COL_IS_NULLABLE, COLTAB_COL_IS_SERIAL,
-    COLTAB_COL_NAME, COLTAB_COL_TYPE_CODE, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
-    COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_TYPE_CODE, IDXTAB_COL_IS_UNIQUE,
-    IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
+    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL,
+    COLTAB_PAY_NAME, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
     TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY,
     VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
 };
@@ -139,6 +138,9 @@ pub(super) fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) 
 /// a `SchemaDescriptor` (see `gnitz_wire::is_valid_type_code` for why an unknown
 /// code is not inert).
 pub(super) fn check_col_defs(col_defs: &[ColumnDef]) -> Result<(), String> {
+    // Reachable from a plain view as well as a wide CREATE TABLE: a compound-PK
+    // plain projection prepends the k source PK columns, so `SELECT *` over a wide
+    // compound-PK table can cross MAX_COLUMNS.
     if col_defs.len() > crate::schema::MAX_COLUMNS {
         return Err(format!(
             "has {} columns (max {})",
@@ -170,8 +172,8 @@ pub(super) fn validate_relation_defs(
     if col_defs.is_empty() {
         return Err(format!(
             "catalog invariant violated: {noun} '{name}' (id={id}) registered \
-             before its column records. COL_TAB writes must precede \
-             TABLE_TAB/VIEW_TAB writes (see hooks.rs dispatch doc)."
+             before its column records: the register hook reads them back \
+             through sys_columns storage, which held none for this id."
         ));
     }
     check_col_defs(col_defs).map_err(|e| format!("{noun} '{name}' (id={id}) {e}"))?;
@@ -183,78 +185,79 @@ pub(super) fn validate_relation_defs(
 // layout, shared by the precheck arms (`precheck_family`) and the register
 // hooks (which re-decode on the paths that skip precheck: boot replay and
 // worker ddl_sync).
+//
+// All four are generic over `RowSource`, so a wire `Batch`, a `StoredRow` a PK
+// probe located, and a positioned `ReadCursor`'s entry decode through one
+// reading each.
 // ---------------------------------------------------------------------------
 
-/// Decode TABLE_TAB row `i`: `(schema_id, name, pk_list, flags)`.
-pub(super) fn read_table_tab_row(batch: &Batch, i: usize) -> (i64, String, PkColList, u64) {
+/// Decode TABLE_TAB `row`: `(schema_id, name, pk_list, flags)`.
+pub(super) fn read_table_tab_row<S: RowSource>(src: &S, row: usize) -> (i64, String, PkColList, u64) {
     (
-        batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64,
-        batch.read_payload_string(i, TABTAB_PAY_NAME),
-        unpack_pk_cols(batch.read_payload_u64(i, TABTAB_PAY_PK_COL_IDX)),
-        batch.read_payload_u64(i, TABTAB_PAY_FLAGS),
+        sys_u64(src, row, TABTAB_PAY_SCHEMA_ID) as i64,
+        sys_string(src, row, TABTAB_PAY_NAME),
+        unpack_pk_cols(sys_u64(src, row, TABTAB_PAY_PK_COL_IDX)),
+        sys_u64(src, row, TABTAB_PAY_FLAGS),
     )
 }
 
-/// Decode VIEW_TAB row `i`: `(schema_id, name, pk_list, capacity_bytes,
-/// delta_bytes)`. The pk_list is the view's persisted leading-k column list; a
-/// bare `0` decodes back to `[0]`. `capacity_bytes` is `0` for an unbounded view
-/// and `delta_bytes` `0` for one with no delta feed.
-pub(super) fn read_view_tab_row(batch: &Batch, i: usize) -> (i64, String, PkColList, u64, u64) {
+/// Decode VIEW_TAB `row`: `(schema_id, name, pk_list, budgets)`. The pk_list is
+/// the view's persisted leading-k column list; a bare `0` decodes back to `[0]`.
+/// The two budget words carry `0` for "no clause", decoded to `None` here so no
+/// caller repeats the sentinel.
+pub(super) fn read_view_tab_row<S: RowSource>(
+    src: &S,
+    row: usize,
+) -> (i64, String, PkColList, crate::query::ViewBudgets) {
     (
-        batch.read_payload_u64(i, VIEWTAB_PAY_SCHEMA_ID) as i64,
-        batch.read_payload_string(i, VIEWTAB_PAY_NAME),
-        unpack_pk_cols(batch.read_payload_u64(i, VIEWTAB_PAY_PK_COL_IDX)),
-        batch.read_payload_u64(i, VIEWTAB_PAY_CAPACITY),
-        batch.read_payload_u64(i, VIEWTAB_PAY_DELTA),
+        sys_u64(src, row, VIEWTAB_PAY_SCHEMA_ID) as i64,
+        sys_string(src, row, VIEWTAB_PAY_NAME),
+        unpack_pk_cols(sys_u64(src, row, VIEWTAB_PAY_PK_COL_IDX)),
+        crate::query::ViewBudgets {
+            capacity_bytes: Some(sys_u64(src, row, VIEWTAB_PAY_CAPACITY)).filter(|&b| b != 0),
+            delta_bytes: Some(sys_u64(src, row, VIEWTAB_PAY_DELTA)).filter(|&b| b != 0),
+        },
     )
 }
 
-/// Decode IDX_TAB row `i`: `(owner_id, source_cols, is_unique)`. `source_cols`
+/// One row's fixed 8-byte payload slot `pi`, little-endian. `RowSource` is the
+/// whole surface a system row needs, which is what lets the decoders below read
+/// a wire `Batch`, a probed `StoredRow` and a positioned `ReadCursor` alike.
+fn sys_u64<S: RowSource>(src: &S, row: usize, pi: usize) -> u64 {
+    let cell = src.get_col_ptr(row, pi, 8);
+    u64::from_le_bytes(cell.try_into().unwrap_or([0; 8]))
+}
+
+/// One row's German-string payload slot `pi`, resolved through the source's own
+/// blob heap (so a value over 12 bytes reads back whole).
+fn sys_string<S: RowSource>(src: &S, row: usize, pi: usize) -> String {
+    let cell = src.get_col_ptr(row, pi, 16);
+    String::from_utf8(gnitz_wire::german_string_content(cell, src.blob()).to_vec()).unwrap_or_default()
+}
+
+/// Decode IDX_TAB `row`: `(owner_id, source_cols, is_unique)`. `source_cols`
 /// carries `pack_pk_cols(&col_indices)` (a single-column index is the
 /// 1-element degenerate case). The name column is deliberately not decoded —
-/// the hook path never reads it, and it would be a wasted allocation there.
-pub(super) fn read_idx_tab_row(batch: &Batch, i: usize) -> (i64, PkColList, bool) {
+/// no caller of this reads it, and it would be a wasted allocation.
+pub(super) fn read_idx_tab_row<S: RowSource>(src: &S, row: usize) -> (i64, PkColList, bool) {
     (
-        batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64,
-        unpack_pk_cols(batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS)),
-        batch.read_payload_u64(i, IDXTAB_PAY_IS_UNIQUE) != 0,
+        sys_u64(src, row, IDXTAB_PAY_OWNER_ID) as i64,
+        unpack_pk_cols(sys_u64(src, row, IDXTAB_PAY_SOURCE_COLS)),
+        sys_u64(src, row, IDXTAB_PAY_IS_UNIQUE) != 0,
     )
 }
 
-/// Decode COL_TAB row `i` into the `ColumnDef` the schema builder consumes.
-pub(super) fn read_col_tab_row(batch: &Batch, i: usize) -> ColumnDef {
+/// Decode COL_TAB `row` into the `ColumnDef` the schema builder consumes.
+pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> ColumnDef {
     ColumnDef {
-        name: batch.read_payload_string(i, COLTAB_PAY_NAME),
-        type_code: batch.read_payload_u64(i, COLTAB_PAY_TYPE_CODE) as u8,
-        is_nullable: batch.read_payload_u64(i, COLTAB_PAY_IS_NULLABLE) != 0,
-        fk_table_id: batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64,
-        fk_col_idx: batch.read_payload_u64(i, COLTAB_PAY_FK_COL_IDX) as u32,
-        is_serial: batch.read_payload_u64(i, COLTAB_PAY_IS_SERIAL) != 0,
-        is_hidden: batch.read_payload_u64(i, COLTAB_PAY_IS_HIDDEN) != 0,
+        name: sys_string(src, row, COLTAB_PAY_NAME),
+        type_code: sys_u64(src, row, COLTAB_PAY_TYPE_CODE) as u8,
+        is_nullable: sys_u64(src, row, COLTAB_PAY_IS_NULLABLE) != 0,
+        fk_table_id: sys_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
+        fk_col_idx: sys_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
+        is_serial: sys_u64(src, row, COLTAB_PAY_IS_SERIAL) != 0,
+        is_hidden: sys_u64(src, row, COLTAB_PAY_IS_HIDDEN) != 0,
     }
-}
-
-/// Cursor sibling of [`read_col_tab_row`].
-pub(super) fn read_col_tab_cursor_row(cursor: &crate::storage::ReadCursor) -> ColumnDef {
-    ColumnDef {
-        name: super::cursor_read_string(cursor, COLTAB_COL_NAME),
-        type_code: super::cursor_read_u64(cursor, COLTAB_COL_TYPE_CODE) as u8,
-        is_nullable: super::cursor_read_u64(cursor, COLTAB_COL_IS_NULLABLE) != 0,
-        fk_table_id: super::cursor_read_u64(cursor, COLTAB_COL_FK_TABLE_ID) as i64,
-        fk_col_idx: super::cursor_read_u64(cursor, COLTAB_COL_FK_COL_IDX) as u32,
-        is_serial: super::cursor_read_u64(cursor, COLTAB_COL_IS_SERIAL) != 0,
-        is_hidden: super::cursor_read_u64(cursor, COLTAB_COL_IS_HIDDEN) != 0,
-    }
-}
-
-/// Cursor sibling of [`read_idx_tab_row`]: `(owner_id, source_cols, is_unique)`
-/// of the row a cursor is positioned on.
-pub(super) fn read_idx_tab_cursor_row(cursor: &crate::storage::ReadCursor) -> (i64, PkColList, bool) {
-    (
-        super::cursor_read_u64(cursor, IDXTAB_COL_OWNER_ID) as i64,
-        unpack_pk_cols(super::cursor_read_u64(cursor, IDXTAB_COL_SOURCE_COLS)),
-        super::cursor_read_u64(cursor, IDXTAB_COL_IS_UNIQUE) != 0,
-    )
 }
 
 /// The `(owner_id, packed_source_cols, col_indices)` of every UNIQUE index this

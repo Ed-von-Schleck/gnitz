@@ -32,7 +32,7 @@ impl CatalogEngine {
     /// The drop cascade is the applier's reaction to that −1 (fired from
     /// `fire_hooks`), not the caller's concern. Reads through the immutable
     /// `sys_store` accessor; the `submit` move comes after.
-    /// `retract_single_row` returns an empty batch when the PK is absent
+    /// `retract_pk_list` returns an empty batch when the PK is absent
     /// or already retracted; emitters resolve the friendly "does not exist"
     /// message from the caches before calling, so the `count == 0` arm only
     /// fires on cache/storage divergence.
@@ -40,7 +40,7 @@ impl CatalogEngine {
     /// retractions arrive as wire deltas.
     pub(super) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
         let schema = family.schema();
-        let batch = retract_single_row(self.sys_store(family), &schema, pk);
+        let batch = retract_pk_list(self.sys_store(family), &schema, vec![pk]);
         if batch.count == 0 {
             return Err("Entity does not exist in catalog".into());
         }

@@ -89,6 +89,9 @@ pub(crate) fn cursor_read_u64(cursor: &ReadCursor, logical_col: usize) -> u64 {
 }
 
 /// Read a German string from a cursor column. `logical_col` is the schema column index.
+/// Test-only: every production sys-row read goes through the `RowSource` decoders
+/// in `sys_tables`.
+#[cfg(test)]
 pub(crate) fn cursor_read_string(cursor: &ReadCursor, logical_col: usize) -> String {
     String::from_utf8(cursor.read_german_bytes(logical_col)).unwrap_or_default()
 }
@@ -167,11 +170,10 @@ pub(crate) fn lock_data_dir(base_dir: &str) -> Result<fs::File, String> {
 // ---------------------------------------------------------------------------
 
 /// Emit a weight=−1 batch of every live row of `table` in the OPK key range
-/// `[start, end)` (`end` `None` = unbounded above). The one retraction
-/// primitive: the callers differ only in the bounds they encode — a single PK's
-/// point range, one owner's packed-column band, or one view's `(view_id, sub)`
-/// prefix — all produced through `schema::key`, so no call site re-derives the
-/// OPK layout.
+/// `[start, end)` (`end` `None` = unbounded above). The band-bounded half of the
+/// catalog's retraction pair — one owner's packed column ids, or one view's
+/// `(view_id, sub)` prefix; [`retract_pk_list`] is the key-list half. Both take
+/// their bounds through `schema::key`, so no call site re-derives the OPK layout.
 pub(crate) fn retract_key_range(table: &Table, schema: &SchemaDescriptor, start: &[u8], end: &[u8]) -> Batch {
     let mut cursor = table.open_cursor_in_range(start, Some(end));
     cursor.seek_range_bytes(start, Some(end));
@@ -194,14 +196,24 @@ pub(crate) fn sys_opk(schema: &SchemaDescriptor, pk: u128) -> crate::schema::key
     crate::schema::key::opk_key(schema, &pk.to_le_bytes())
 }
 
-/// Retract the single live row at `pk`, or return an empty batch when the PK is
-/// absent or already retracted.
-pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
-    let mut batch = Batch::with_capacity(*schema, 1);
-    let key = sys_opk(schema, pk);
-    let mut cursor = table.open_cursor_in_range(key.pk_bytes(), Some(key.pk_bytes()));
-    if cursor.advance_to_exact_live(key.pk_bytes()) {
-        cursor.copy_current_row_into(&mut batch, -1);
+/// Emit a weight=−1 batch of the live rows of `table` at `ids`; an id with no
+/// live row contributes nothing, so a one-element list is the "retract this row,
+/// or return an empty batch" case. Takes `ids` by value and sorts them, because
+/// the whole list rides one forward-only cursor.
+pub(crate) fn retract_pk_list(table: &Table, schema: &SchemaDescriptor, mut ids: Vec<u128>) -> Batch {
+    ids.sort_unstable();
+    ids.dedup();
+    let mut batch = Batch::with_capacity(*schema, ids.len());
+    let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
+        return batch;
+    };
+    let (lo, hi) = (sys_opk(schema, first), sys_opk(schema, last));
+    let mut cursor = table.open_cursor_in_range(lo.pk_bytes(), Some(hi.pk_bytes()));
+    for pk in ids {
+        let key = sys_opk(schema, pk);
+        if cursor.advance_to_exact_live(key.pk_bytes()) {
+            cursor.copy_current_row_into(&mut batch, -1);
+        }
     }
     batch
 }

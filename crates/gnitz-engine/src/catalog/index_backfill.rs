@@ -163,7 +163,7 @@ impl CatalogEngine {
     /// `seen` set (one `PkBuf` per scanned key).
     ///
     /// `check_dups` is a caller policy (hoisted out of this function): the live
-    /// CREATE-INDEX/promote paths pass `is_unique && ctx.is_live()` / `true`; the
+    /// CREATE-INDEX/promote paths pass `is_unique && mode == Live` / `true`; the
     /// worker/standalone boot rebuild passes `false`. A boot-replayed IDX_TAB
     /// `+1` was validated at original write time and every later INSERT went
     /// through the unique filter, so skipping the check at boot cannot admit a
@@ -221,16 +221,17 @@ impl CatalogEngine {
     /// uniqueness is folded into the incumbent — no second index table is built
     /// (`make_index_schema` does not depend on `is_unique`; uniqueness is the flag
     /// plus the duplicate check, not a different storage layout). Empty base table
-    /// → pure flag flip. Skips the scan outside the live phase (boot shard replay)
-    /// because data was validated at original write time (mirrors the same guard
-    /// in `hook_cascade_fk`). The flag flip below runs unconditionally.
+    /// → pure flag flip. The verification scan runs on a first apply only: replayed
+    /// and compensated data passed its duplicate check when originally written,
+    /// and under compensation a spurious `Err` is a fatal abort. The flag flip
+    /// below runs unconditionally.
     pub(crate) fn promote_index_to_unique(
         &mut self,
         owner_id: i64,
         owner_schema: &SchemaDescriptor,
         col_indices: &[u32],
     ) -> Result<(), String> {
-        if self.ctx.is_live() {
+        if self.ctx.mode() == ApplyMode::Live {
             let idx_schema = make_index_schema(col_indices, owner_schema)?;
             let target = IndexProjectionTarget {
                 cols: PkColList::from_slice(col_indices),

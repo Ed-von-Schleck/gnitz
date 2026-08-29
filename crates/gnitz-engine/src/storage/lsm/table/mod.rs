@@ -115,9 +115,10 @@ pub(in crate::storage) struct FlushWork {
 /// is the payload comparator the merge seats pick between, so this groups the way
 /// every other (PK, payload) grouping in storage does.
 ///
-/// "First" is a performance choice: the one production caller is a base table,
-/// whose per-PK accumulated weight is in {0, 1}, so at most one group is
-/// positive. *Which member* of it comes back is unspecified — two
+/// "First" is a performance choice: every production caller holds at most one
+/// positive group at a PK — a base table by `enforce_unique_pk`, a system table
+/// by the catalog precheck's per-PK CAS and `0..=1` net bound. *Which member* of
+/// the group comes back is unspecified — two
 /// `compare_rows`-equal long German strings can differ in their 16-byte cells,
 /// and the append relocates the content regardless.
 fn first_live_payload_group(
@@ -169,7 +170,7 @@ pub struct Table {
     /// legitimately empty index over a large owner.
     resumed_from_checkpoint: bool,
 
-    /// Reused candidate pool for `retract_pk_bytes`' grouping pass; taken out and
+    /// Reused candidate pool for `live_row_at`'s grouping pass; taken out and
     /// handed back per call (dropping its `Rc`s) with capacity retained, so the
     /// path stops allocating once warmed up. In a `Cell` so the probe that fills
     /// it is a read.
@@ -598,16 +599,17 @@ impl Table {
     /// Look up a PK for retraction.  Returns (net_weight, located row).
     ///
     /// Takes a **native** `u128` and `opk_key`s it; the DML retraction path
-    /// keys on verbatim OPK bytes via `retract_pk_bytes`, so this native entry
+    /// keys on verbatim OPK bytes via `live_row_at`, so this native entry
     /// point has no production caller and is retained only for unit tests.
     #[cfg(test)]
     pub(crate) fn retract_pk(&self, key: u128) -> (i64, Option<StoredRow>) {
         let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
-        self.retract_pk_bytes(opk.pk_bytes())
+        self.live_row_at(opk.pk_bytes())
     }
 
-    /// Look up a PK for retraction by its OPK `key` bytes. Returns the net
-    /// weight and, when it is positive, the live (PK, payload) row.
+    /// The net weight at OPK `key` and, when it is positive, the live
+    /// (PK, payload) row. The DML retraction probe and the catalog's CAS read
+    /// through the same entry point.
     ///
     /// Winner selection is one grouping pass over the cross-tier candidate pool
     /// in tier order (memtable first — the newest history). Groups form by
@@ -616,7 +618,7 @@ impl Table {
     /// single row's own weight is what makes the answer right: a candidate whose
     /// weight is positive but whose full group nets ≤ 0 has been retracted by a
     /// later tier and must not be returned.
-    pub(in crate::storage) fn retract_pk_bytes(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
+    pub(crate) fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
         let mut pool = self.retract_scratch.take();
 
         let mut total_w: i64 = 0;

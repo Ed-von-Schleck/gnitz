@@ -15,7 +15,7 @@ use rustc_hash::FxHashSet;
 
 use super::*;
 use crate::schema::make_index_schema;
-use crate::storage::{compare_rows, compare_rows_except};
+use crate::storage::{compare_rows, compare_rows_except, StoredRow};
 use gnitz_wire::{
     COLTAB_PAY_COL_IDX, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID,
     COLTAB_PAY_OWNER_KIND, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME,
@@ -194,22 +194,6 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Materialize the live (net-positive) row for the OPK `pk_bytes` in
-    /// `family`'s store into a 1-row batch, with its net weight. `None` if no
-    /// live row. Reads only — the `copy_current_row_into` precedent is
-    /// `retract_single_row`. `ReadCursor` is not a `ColumnarSource`, so the CAS
-    /// needs the row materialized into a `Batch` before `compare_rows`.
-    fn seek_live_sys_row(&self, family: SysFamily, pk_bytes: &[u8]) -> Option<(Batch, i64)> {
-        let mut cursor = self.sys_store(family).open_cursor_in_range(pk_bytes, Some(pk_bytes));
-        if !cursor.advance_to_exact_live(pk_bytes) {
-            return None;
-        }
-        let w = cursor.current_weight;
-        let mut b = Batch::with_capacity(family.schema(), 1);
-        cursor.copy_current_row_into(&mut b, w);
-        Some((b, w))
-    }
-
     /// The post-image retraction contract for a rewrite-pair-capable
     /// family (TABLE_TAB / VIEW_TAB / COL_TAB), per distinct PK:
     ///
@@ -226,17 +210,23 @@ impl CatalogEngine {
     /// Returns the live row (for the caller's pair-field comparison) and the net
     /// weight; the per-family guards on top of this live in
     /// `precheck_relation_family` / `precheck_column_family`.
+    ///
+    /// The probe is storage's own `live_row_at`: it groups the whole cross-tier
+    /// candidate pool by payload and returns the first positive group, which is
+    /// the winner selection the per-PK net bound below makes unique. A
+    /// `StoredRow` owns its backing through an `Rc` and is a `RowSource`, so both
+    /// comparisons read it in place with no row materialized.
     fn check_cas_and_net(
         &self,
         family: SysFamily,
         batch: &Batch,
         sig: &PkSignature,
-    ) -> Result<(Option<Batch>, i64), String> {
+    ) -> Result<(Option<StoredRow>, i64), String> {
         let noun = family.row_noun();
-        let live = self.seek_live_sys_row(family, batch.get_pk_bytes(sig.row));
+        let (live_weight, live) = self.sys_store(family).live_row_at(batch.get_pk_bytes(sig.row));
 
         if sig.neg.is_some() {
-            let Some((lb, _)) = live.as_ref() else {
+            let Some(sr) = live.as_ref() else {
                 return Err(format!(
                     "catalog changed concurrently: retracting a {noun} that no longer exists"
                 ));
@@ -245,7 +235,7 @@ impl CatalogEngine {
             for j in 0..batch.count {
                 if batch.get_pk(j) == sig.pk
                     && batch.get_weight(j) < 0
-                    && compare_rows(&schema, lb, 0, batch, j) != Ordering::Equal
+                    && compare_rows(&schema, &sr.run, sr.row, batch, j) != Ordering::Equal
                 {
                     return Err(format!(
                         "catalog changed concurrently: the retracted {noun} differs from the current one"
@@ -254,14 +244,14 @@ impl CatalogEngine {
             }
         }
 
-        let net = live.as_ref().map_or(0, |(_, w)| *w) + sig.sum;
+        let net = live_weight + sig.sum;
         if !(0..=1).contains(&net) {
             return Err(format!(
                 "system-catalog write would leave {noun} {} at net weight {net} (expected 0 or 1)",
                 sig.pk
             ));
         }
-        Ok((live.map(|(b, _)| b), net))
+        Ok((live, net))
     }
 
     /// The TABLE_TAB / VIEW_TAB precheck — the shared CAS + net contract plus
@@ -288,7 +278,8 @@ impl CatalogEngine {
                 for j in 0..batch.count {
                     if batch.get_pk(j) == sig.pk
                         && batch.get_weight(j) > 0
-                        && compare_rows_except(&schema, lb, 0, batch, j, 1 << TABTAB_PAY_NAME) != Ordering::Equal
+                        && compare_rows_except(&schema, &lb.run, lb.row, batch, j, 1 << TABTAB_PAY_NAME)
+                            != Ordering::Equal
                     {
                         return Err("a system-catalog rewrite pair may only change the name".into());
                     }
@@ -484,26 +475,88 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Visit every positive-weight `sys_indices` row whose owner and **exact
-    /// column list** match `(owner_id, cols)`, invoking `f(index_id, is_unique)`
-    /// for each. Centralises the IDX_TAB cursor walk shared by the DROP INDEX
-    /// uniqueness checks (the drop-time FK guard in `precheck_family` and the
-    /// post-retraction circuit demotion in `hook_index_register`). The persisted
-    /// `source_cols` field is the packed `u64` (flag bit 63 set for the packed
-    /// form), so decode it via `unpack_pk_cols` and compare ordered lists — a
-    /// bare compare would never match a packed row. Rows that have already netted
-    /// to zero weight are skipped by the cursor.
+    /// Visit every live `sys_indices` row whose owner and **exact column list**
+    /// match `(owner_id, cols)`, invoking `f(index_id, is_unique)` for each — the
+    /// shared probe behind the DROP INDEX FK guard and the circuit demotion in
+    /// `hook_index_register`.
+    ///
+    /// The cache names *which* ids to probe; storage stays authoritative for their
+    /// attributes, because both callers are correctness guards and a stale
+    /// `is_unique` would let a drop strip the last unique index off an FK target.
+    /// IDX_TAB's PK is the global `idx_id`, so there is no owner band to scan
+    /// instead.
     pub(super) fn for_each_index_on_cols(&self, owner_id: i64, cols: &[u32], mut f: impl FnMut(i64, bool)) {
-        let mut cursor = self.sys_store(SysFamily::Index).open_cursor();
-        while cursor.valid {
-            if cursor.current_weight > 0 {
-                let (row_owner, row_cols, is_uniq) = read_idx_tab_cursor_row(&cursor);
-                if row_owner == owner_id && row_cols.as_slice() == cols {
-                    f(cursor.current_key_narrow() as u64 as i64, is_uniq);
-                }
+        let Some(ids) = self.caches.indices_by_owner.get(&owner_id) else {
+            return;
+        };
+        let schema = SysFamily::Index.schema();
+        let store = self.sys_store(SysFamily::Index);
+        for &idx_id in ids {
+            let key = sys_opk(&schema, idx_id as u128);
+            let Some(sr) = store.live_row_at(key.pk_bytes()).1 else {
+                continue;
+            };
+            let (row_owner, row_cols, is_uniq) = read_idx_tab_row(&sr.run, sr.row);
+            if row_owner == owner_id && row_cols.as_slice() == cols {
+                f(idx_id, is_uniq);
             }
-            cursor.advance();
         }
+    }
+
+    /// The shared VIEW_TAB registration guards: what a `WITH (…)` option may be
+    /// declared on, and what a bounded view may read. `source_ids` is the view's
+    /// resolved `ScanDelta` sources.
+    ///
+    /// Run from the precheck, and again from `view_registration` for the paths
+    /// that skip it (boot replay, worker `ddl_sync`). A within-bundle hidden
+    /// segment is unresolvable at precheck time and never carries a `WITH`
+    /// option, which is what keeps the second run meaningful.
+    pub(crate) fn validate_view_options(
+        &self,
+        vid: i64,
+        name: &str,
+        budgets: crate::query::ViewBudgets,
+        source_ids: &[i64],
+    ) -> Result<(), String> {
+        // A hidden chain segment is an internal relation the planner mints, never
+        // something an option clause may name.
+        if (budgets.capacity_bytes.is_some() || budgets.delta_bytes.is_some())
+            && name.starts_with(gnitz_wire::HIDDEN_VIEW_PREFIX)
+        {
+            return Err(format!(
+                "catalog invariant violated: hidden segment '{name}' (vid={vid}) carries a WITH option."
+            ));
+        }
+        // A bounded view's `Delta(0)` cannot be a function of the tick round, and
+        // the whole feed contract is that it is: hydrating a skeleton key reads the
+        // source's live store, which `handle_push` advances outside any tick, so
+        // the bootstrap would carry a push the next poll delivers again.
+        if budgets.capacity_bytes.is_some() && budgets.delta_bytes.is_some() {
+            return Err(format!(
+                "view '{name}' (vid={vid}) declares both `capacity` and `delta`; \
+                 a capacity-bounded view cannot carry a delta feed"
+            ));
+        }
+        // Both rules trace to skeleton rows being recomputed from the *source*
+        // store: a bounded view's own store is skeletonized, and a stream's holds
+        // nothing to recompute from. `ScanDelta` is the only external-source
+        // opcode, so `source_ids` covers every circuit's every source.
+        for &src in source_ids {
+            let Some(e) = self.dag.tables.get(&src) else { continue };
+            if e.capacity_bytes.is_some() {
+                return Err(format!(
+                    "view '{name}' (vid={vid}) reads relation {src}, which is a \
+                     capacity-bounded view; views cannot be created over one"
+                ));
+            }
+            if budgets.capacity_bytes.is_some() && e.kind == RelationKind::Stream {
+                return Err(format!(
+                    "view '{name}' (vid={vid}) reads relation {src}, which is a stream; \
+                     a capacity-bounded view cannot be created over one"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The shared IDX_TAB registration guards: a well-formed column list and a
@@ -555,6 +608,12 @@ impl CatalogEngine {
     /// must decide here whether it carries precheck guards, rather than falling
     /// into a silent `_` arm.
     pub fn precheck_family(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
+        // A zero-weight row is not a Z-set element: `pk_signatures` skips it, so it
+        // would reach the appliers carrying neither the CAS nor the net bound, and
+        // every `weight > 0` dispatch below treats it as a retraction.
+        if (0..batch.count).any(|i| batch.get_weight(i) == 0) {
+            return Err("catalog delta carries a zero-weight row".into());
+        }
         match family {
             SysFamily::Schema => self.precheck_schema_family(batch),
             SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch),
@@ -656,9 +715,21 @@ impl CatalogEngine {
             let col_defs = self.scan_column_defs(id, true)?;
             let (sid, name, pk, kind) = if is_table {
                 let (sid, name, pk, flags) = read_table_tab_row(batch, i);
+                // The one value the store shape, the write scatter, the read
+                // routing and the co-partition analyzers all read back off the
+                // schema. An out-of-range prefix is clamped by
+                // `new_with_placement`; a conflicting pair is rejected here.
+                Placement::from_table_flags(flags)
+                    .map_err(|e| format!("catalog invariant violated: table '{name}' (tid={id}) is {e}."))?;
                 (sid, name, pk, RelationKind::from_table_flags(flags))
             } else {
-                let (sid, name, pk, _capacity, _delta) = read_view_tab_row(batch, i);
+                let (sid, name, pk, budgets) = read_view_tab_row(batch, i);
+                // `topo_priority` applies CircuitNodes (2) before View (6) in a
+                // creating bundle, so the view's sources resolve here; an
+                // all-negative bundle sorts descending but carries no `+1` VIEW_TAB
+                // row to validate.
+                let source_ids = self.dag.get_source_ids(id);
+                self.validate_view_options(id, &name, budgets, &source_ids)?;
                 (sid, name, pk, RelationKind::View)
             };
             validate_relation_defs(kind, id, &name, &col_defs, &pk)?;
@@ -788,20 +859,13 @@ impl CatalogEngine {
         drop_ids.sort_unstable();
         drop_ids.dedup();
 
-        let schema = SysFamily::Index.schema();
-        for &idx_id in &drop_ids {
-            // The CAS above already proved a live row exists at every dropped id.
-            let (owner_id, cols, name) = {
-                let key = sys_opk(&schema, idx_id as u128);
-                let mut cursor = self
-                    .sys_store(SysFamily::Index)
-                    .open_cursor_in_range(key.pk_bytes(), Some(key.pk_bytes()));
-                if !cursor.advance_to_exact_live(key.pk_bytes()) {
-                    continue;
-                }
-                let (owner_id, cols, _) = read_idx_tab_cursor_row(&cursor);
-                (owner_id, cols, cursor_read_string(&cursor, gnitz_wire::IDXTAB_COL_NAME))
-            };
+        // The CAS above proved more than "a live row exists at every dropped id":
+        // every `-1` must content-equal it across all payload columns, `name` and
+        // `source_cols` included. So the batch row is byte-identical to what a
+        // probe would return, and reading it here costs no cursor.
+        for i in (0..batch.count).filter(|&i| batch.get_weight(i) < 0) {
+            let (owner_id, cols, _) = read_idx_tab_row(batch, i);
+            let name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
             // An internal `__fk_` index backs the RESTRICT seek; dropping one
             // would silently disarm FK enforcement.
             if name.contains(FK_INDEX_INFIX) {

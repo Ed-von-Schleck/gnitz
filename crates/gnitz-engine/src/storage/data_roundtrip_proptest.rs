@@ -229,7 +229,7 @@ proptest! {
         prop_assert!(!table.has_pk_bytes(&absent));
     }
 
-    /// retract_pk_bytes is a read-only probe; physical retraction ingests a
+    /// live_row_at is a read-only probe; physical retraction ingests a
     /// negated batch. full_scan nets shard (+w) against memtable (-w) to zero.
     #[test]
     fn retract_then_scan(schema in arb_schema(), rows in 2usize..=64, seed in any::<u64>()) {
@@ -244,7 +244,7 @@ proptest! {
 
         // Read-only probe of the live shard rows.
         for i in 0..half {
-            let (w, found) = table.retract_pk_bytes(original.get_pk_bytes(i));
+            let (w, found) = table.live_row_at(original.get_pk_bytes(i));
             prop_assert_eq!(w, original.get_weight(i));
             prop_assert!(found.is_some());
         }

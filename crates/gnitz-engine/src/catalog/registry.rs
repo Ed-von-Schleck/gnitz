@@ -65,7 +65,8 @@ impl CatalogEngine {
                     }
                     expected += 1;
                 }
-                defs.push(read_col_tab_cursor_row(&cursor));
+                let (src, row) = cursor.current_row_source();
+                defs.push(read_col_tab_row(src, row));
             }
             cursor.advance();
         }
@@ -346,7 +347,7 @@ impl CatalogEngine {
     /// (returns it for the durable commit).
     fn build_seq_delta(&self, seq_id: i64, new_val: i64) -> Batch {
         let schema = SysFamily::Sequence.schema();
-        let mut batch = retract_single_row(self.sys_store(SysFamily::Sequence), &schema, seq_id as u128);
+        let mut batch = retract_pk_list(self.sys_store(SysFamily::Sequence), &schema, vec![seq_id as u128]);
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(seq_id as u128, 1);
         bb.put_u64(new_val as u64);

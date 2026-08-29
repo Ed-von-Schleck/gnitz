@@ -391,6 +391,20 @@ impl DagEngine {
             .collect()
     }
 
+    /// Where a view's rows live and how far above the bases it sits — the two
+    /// values `TableEntry` stamps, both folded from its `sources`' own stamped
+    /// entries, so the scheduling key is derived here rather than a second time
+    /// at the registering caller.
+    pub(crate) fn view_placement(&mut self, view_id: i64, sources: &[i64], pk_arity: usize) -> (Placement, i32) {
+        let depth = sources
+            .iter()
+            .filter_map(|id| self.tables.get(id))
+            .map(|e| e.depth + 1)
+            .max()
+            .unwrap_or(0);
+        (self.source_placement(view_id, sources, pk_arity), depth)
+    }
+
     /// Where a view's rows live, folded from its `sources`' **stamped**
     /// placements. `pk_arity` is the view's own declared PK column count (it is
     /// not registered yet, so the arity cannot be read back off `self.tables`).
@@ -405,7 +419,7 @@ impl DagEngine {
     /// direction is always safe (a replicated store holds every row; the read
     /// gathers all workers) and it avoids a second, subtler predicate for "does
     /// this exchange actually run at runtime".
-    pub(crate) fn view_placement(&mut self, view_id: i64, sources: &[i64], pk_arity: usize) -> Placement {
+    fn source_placement(&mut self, view_id: i64, sources: &[i64], pk_arity: usize) -> Placement {
         // An unregistered source cannot be proven replicated or local, so it reads
         // as the keyed default — the same answer the pre-fold `replicated` probe
         // gave for a missing entry. A sourceless view computes nothing from

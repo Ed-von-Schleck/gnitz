@@ -412,3 +412,50 @@ fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── The hook canonicalizer repairs a `+1`-first rewrite pair ────────────────
+// Every forward producer emits a rename pair `-1`-first; `compensate_stage_a`'s
+// in-place negation is what reverses one. The payload-keyed cache folds read the
+// *outgoing* name off `entity_by_id`, so an insert-first pair applied verbatim
+// would unmap the new name and leave the old one resolving.
+
+#[test]
+fn insert_first_rename_pair_lands_the_new_name() {
+    let dir = temp_dir("alter_insert_first_pair");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
+    let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
+
+    let row = live_table_row(&engine, tid);
+    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    for (weight, name) in [(1i64, "renamed"), (-1i64, row.name.as_str())] {
+        push_table_row(&mut bb, tid, &row, name, weight);
+    }
+    engine.ingest_to_family(TABLE_TAB_ID, &bb.finish()).unwrap();
+
+    assert!(
+        engine.caches.entity_by_qname.contains_key("public.renamed"),
+        "the new name must resolve"
+    );
+    assert!(
+        !engine.caches.entity_by_qname.contains_key("public.orig"),
+        "the outgoing name must be unmapped"
+    );
+    assert_eq!(
+        engine.caches.entity_by_id.get(&tid).map(|(_, n)| n.as_str()),
+        Some("renamed"),
+        "entity_by_id must carry the new name"
+    );
+    assert!(
+        engine.dag.tables.contains_key(&tid),
+        "a rename must not unregister the table, whatever the row order"
+    );
+    assert!(
+        engine.pending_dir_deletions.is_empty(),
+        "a rename queues no dir deletion"
+    );
+    assert_eq!(live_rows_for(&engine, tid), 1, "a rename leaves exactly one live row");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

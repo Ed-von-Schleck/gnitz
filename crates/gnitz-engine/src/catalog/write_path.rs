@@ -153,18 +153,26 @@ impl CatalogEngine {
         std::mem::take(&mut self.pending_broadcasts)
     }
 
-    /// Run `f` with `dir` staged for cleanup: on `Err` whatever `f` created on
-    /// disk is removed here, on `Ok` the directory is live and nothing happens.
+    /// Run `f`, and on `Err` remove `dir` — but only if `f` is what created it.
+    /// One that was already there holds an existing entity's rows (a boot replay
+    /// reopens one; so does compensation restoring what the bundle dropped), and
+    /// deciding that here is what stops a caller staging live shards.
+    ///
     /// The stage is a local, not an entry in `pending_dir_deletions`, so that
     /// queue keeps one meaning — directories of *dropped* entities, which a
     /// rollback must therefore keep. A queue holding both could not be drained
     /// or discarded as a whole.
     pub(super) fn with_staged_dir<T>(
         &mut self,
-        dir: String,
+        dir: &str,
         f: impl FnOnce(&mut Self) -> Result<T, String>,
     ) -> Result<T, String> {
-        f(self).inspect_err(|_| Self::remove_queued_dirs(vec![dir]))
+        let existed = std::path::Path::new(dir).exists();
+        f(self).inspect_err(|_| {
+            if !existed {
+                Self::remove_queued_dirs(vec![dir.to_string()]);
+            }
+        })
     }
 
     /// Physically remove a batch of queued directory paths. An existence guard
@@ -395,10 +403,10 @@ impl CatalogEngine {
         let mut undo_create: Vec<(SysFamily, Batch)> = Vec::new();
         let mut undo_drop: Vec<(SysFamily, Batch)> = Vec::new();
         for (family, batch) in rollback_list {
-            let mut net: FxHashMap<u128, i64> = FxHashMap::default();
-            for i in 0..batch.count {
-                *net.entry(batch.get_pk(i)).or_default() += batch.get_weight(i);
-            }
+            // Total over every row: `pk_signatures` skips zero-weight rows, and
+            // `precheck_family` rejects a delta carrying one before it can be
+            // applied — so no PK reaches here with a zero-weight row alone.
+            let net: FxHashMap<u128, i64> = pk_signatures(&batch).iter().map(|s| (s.pk, s.sum)).collect();
             let (created, dropped): (Vec<u32>, Vec<u32>) =
                 (0..batch.count as u32).partition(|&i| net[&batch.get_pk(i as usize)] >= 0);
             if dropped.is_empty() {
@@ -406,10 +414,13 @@ impl CatalogEngine {
             } else if created.is_empty() {
                 undo_drop.push((family, batch));
             } else {
+                // Both index lists are ascending (a `partition` over an ascending
+                // range), so each subset keeps the source's sorted/consolidated
+                // tag — which the sign-preserving `map_weights` negation below
+                // leaves in place.
                 let schema = family.schema();
-                let mem = batch.as_mem_batch();
-                undo_create.push((family, Batch::from_indexed_rows(&mem, &created, &schema)));
-                undo_drop.push((family, Batch::from_indexed_rows(&mem, &dropped, &schema)));
+                undo_create.push((family, batch.ascending_subset(&created, &schema)));
+                undo_drop.push((family, batch.ascending_subset(&dropped, &schema)));
             }
         }
 

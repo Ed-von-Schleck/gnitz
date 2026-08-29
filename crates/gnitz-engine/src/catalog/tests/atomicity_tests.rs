@@ -650,10 +650,11 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 /// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB passes precheck but
 /// fails **inside** apply_and_enqueue (a register-hook error) must reconstruct
 /// and negate the applied-not-enqueued TABLE_TAB row (net-zero sys_tables) and
-/// negate the drained COL_TAB exactly once (no double-retraction ghost). A
-/// REPLICATED table with a non-default distribution prefix is the trigger:
-/// precheck does not check the pair, but `hook_relation_register` rejects it after
-/// the row is applied.
+/// negate the drained COL_TAB exactly once (no double-retraction ghost).
+///
+/// The trigger is the class of failure that survives the precheck, which reads
+/// no path: an IO error opening the relation's store — here a plain file where
+/// its directory must go, which `ensure_dir` refuses.
 #[test]
 fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     let dir = temp_dir("ddl_txn_hook_rollback");
@@ -668,25 +669,27 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     engine.precheck_family(SysFamily::Column, &col_batch).unwrap();
     engine.apply_and_enqueue_family(SysFamily::Column, col_batch).unwrap();
 
-    // REPLICATED + dist_prefix = 1: passes precheck, rejected by hook_relation_register.
-    let flags = gnitz_wire::TableProps {
-        replicated: true,
-        dist_prefix_len: 1,
-        ..Default::default()
-    }
-    .pack();
-    let table_batch = build_table_tab_row_flags(new_tid, pack_pk_cols(&[0]), "hooktbl", flags);
+    let blocker = relation_dir(&dir, "public", RelationKind::BaseTable, new_tid);
+    fs::create_dir_all(schema_dir(&dir, "public")).unwrap();
+    fs::write(&blocker, b"not a directory").unwrap();
+
+    let table_batch = build_table_tab_row(new_tid, pack_pk_cols(&[0]), "hooktbl");
     engine
         .precheck_family(SysFamily::Table, &table_batch)
-        .expect("replicated + dist_prefix passes precheck (it is a hook-layer check)");
+        .expect("the precheck reads no path, so the blocker is invisible to it");
     // Marker set BEFORE apply; apply fails in the hook, so it stays Some.
     let mut marker: Option<(SysFamily, Batch)> = Some((SysFamily::Table, table_batch.clone()));
     let applied = engine.apply_and_enqueue_family(SysFamily::Table, table_batch);
     assert!(
         applied.is_err(),
-        "hook_relation_register must reject a REPLICATED table with a distribution prefix"
+        "register_relation must fail when the relation directory cannot be made"
     );
     engine.compensate_stage_a(marker.take()).unwrap();
+
+    assert!(
+        std::path::Path::new(&blocker).is_file(),
+        "a path this call did not create must survive the failed registration"
+    );
 
     assert_eq!(
         count_records(engine.sys_store_mut(SysFamily::Table)),
@@ -804,6 +807,105 @@ fn precheck_rejected_create_index_writes_no_ghost() {
         count_records(engine.sys_store_mut(SysFamily::Index)),
         init_rows,
         "and no +1 either"
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── Compensating a DROP must not stage the restored relation's directory ─────
+// `compensate_stage_a` negates a dropped relation's `-1` back to `+1`, so the
+// register hook runs on a directory that already holds live shards. Staging it
+// for crash-cleanup would let a failure inside the re-registration delete them,
+// and the next boot — replaying the same TABLE_TAB row, since the DDL never
+// reached the SAL — would bring the table back empty, with no error.
+
+#[test]
+fn compensating_a_drop_keeps_the_restored_relation_directory() {
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let (mut engine, tid, dir) = table_fixture("compensate_drop_keeps_dir", &cols);
+    let reldir = engine.dag.tables.get(&tid).unwrap().directory.clone();
+    // The fixture's own CREATE is a committed DDL; only the bundle below is the
+    // one being compensated.
+    engine.drain_pending_broadcasts();
+
+    // The failed bundle's DROP: applied and enqueued, so compensation drains it.
+    let schema = SysFamily::Table.schema();
+    let drop_batch = retract_pk_list(engine.sys_store(SysFamily::Table), &schema, vec![tid as u128]);
+    assert_eq!(
+        drop_batch.count, 1,
+        "the fixture table must have one live TABLE_TAB row"
+    );
+    engine.precheck_family(SysFamily::Table, &drop_batch).unwrap();
+    engine.apply_and_enqueue_family(SysFamily::Table, drop_batch).unwrap();
+    assert!(
+        !engine.dag.tables.contains_key(&tid),
+        "the drop must unregister the table"
+    );
+    assert!(
+        std::path::Path::new(&reldir).is_dir(),
+        "a drop only queues the directory, it does not remove it"
+    );
+
+    // Make the restoring `build_relation_store` fail: a plain file where the
+    // per-worker child directory belongs, which `Table::new` cannot open.
+    let child = format!("{reldir}/{}", subdir_names(&reldir).first().expect("one store child"));
+    fs::remove_dir_all(&child).unwrap();
+    fs::write(&child, b"not a directory").unwrap();
+
+    let err = engine.compensate_stage_a(None).unwrap_err();
+    assert!(
+        err.contains("Stage-A DDL compensation failed"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        std::path::Path::new(&reldir).is_dir(),
+        "the restored relation's directory must survive a failure inside its re-registration"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── A zero-weight catalog row is rejected at the precheck ───────────────────
+// It is not a Z-set element: `pk_signatures` skips it, so it carries neither the
+// CAS nor the per-PK net bound, while every applier's `if weight > 0 { … } else`
+// dispatch would act on it as a retraction — evicting a live relation or schema
+// from the caches while it stays live on disk and registered in the DAG.
+
+#[test]
+fn zero_weight_catalog_row_rejected() {
+    let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
+    let (mut engine, tid, dir) = table_fixture("zero_weight_row", &cols);
+    let sid = engine.schema_id("public").unwrap();
+
+    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t", pack_pk_cols(&[0]), 0, 0);
+    let err = engine.submit(SysFamily::Table, bb.finish()).unwrap_err();
+    assert!(err.contains("zero-weight row"), "unexpected error: {err}");
+
+    let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
+    bb.begin_row(sid as u128, 0);
+    bb.put_string("public");
+    bb.end_row();
+    let err = engine.submit(SysFamily::Schema, bb.finish()).unwrap_err();
+    assert!(err.contains("zero-weight row"), "unexpected error: {err}");
+
+    assert_eq!(
+        engine.caches.entity_by_qname.get("public.t").copied(),
+        Some(tid),
+        "the live relation must still resolve by name"
+    );
+    assert!(
+        engine.dag.tables.contains_key(&tid),
+        "the relation must stay registered"
+    );
+    assert!(
+        engine.caches.schema_by_name.contains_key("public"),
+        "the live schema must still resolve by name"
+    );
+    assert!(
+        engine.pending_dir_deletions.is_empty(),
+        "a rejected row must queue no directory for deletion"
     );
 
     engine.close();

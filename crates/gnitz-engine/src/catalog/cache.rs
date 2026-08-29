@@ -234,7 +234,13 @@ impl CatalogEngine {
 
             if weight > 0 {
                 self.caches.index_by_name.insert(name, idx_id);
-                self.caches.indices_by_owner.entry(owner_id).or_default().push(idx_id);
+                // Idempotent under a re-applied `+1`, like its two siblings: the
+                // SAL dedupe filter under-dedupes by design and `remove_where`
+                // drops only the first match, so a duplicate would be permanent.
+                let owned = self.caches.indices_by_owner.entry(owner_id).or_default();
+                if !owned.contains(&idx_id) {
+                    owned.push(idx_id);
+                }
             } else {
                 self.caches.index_by_name.remove(&name);
                 remove_where(&mut self.caches.indices_by_owner, owner_id, |&id| id == idx_id);

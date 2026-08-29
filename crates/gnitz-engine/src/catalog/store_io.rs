@@ -426,7 +426,7 @@ impl CatalogEngine {
             }
         };
         let schema = family.schema();
-        let batch = retract_single_row(self.sys_store(family), &schema, relation_id as u128);
+        let batch = retract_pk_list(self.sys_store(family), &schema, vec![relation_id as u128]);
         if batch.count > 0 {
             self.ddl_sync(family.id(), batch)?;
         }

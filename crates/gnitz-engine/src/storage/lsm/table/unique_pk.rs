@@ -102,11 +102,11 @@ pub(crate) fn enforce_unique_pk(store: &Table, schema: &SchemaDescriptor, mut ba
         }
         let pkb = batch.get_pk_bytes(row);
 
-        // Creating the entry *is* the probe. `retract_pk_bytes` mutates nothing
-        // and the store cannot change mid-batch, so one probe per PK is exact.
+        // Creating the entry *is* the probe. `live_row_at` mutates nothing and the
+        // store cannot change mid-batch, so one probe per PK is exact.
         let mut stored = None;
         let entry = probed.entry(pkb).or_insert_with(|| {
-            stored = store.retract_pk_bytes(pkb).1;
+            stored = store.live_row_at(pkb).1;
             None
         });
         // Superseded by this row, whichever sign it carries.

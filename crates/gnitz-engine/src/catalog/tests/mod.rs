@@ -161,11 +161,10 @@ fn build_table_tab_row(tid: i64, raw_pk_cols: u64, table_name: &str) -> Batch {
     build_table_tab_row_flags(tid, raw_pk_cols, table_name, 0)
 }
 
-/// Like `build_table_tab_row` but with an explicit packed `flags` word (so a test
-/// can build a row that passes precheck yet fails `hook_relation_register`, e.g. a
-/// REPLICATED table with a non-default distribution prefix). Writes through the
-/// production row builder, so a fixture cannot drift from the layout the engine
-/// registers tables with.
+/// Like `build_table_tab_row` but with an explicit packed `flags` word — the
+/// routing shapes `create_table` cannot make. Writes through the production row
+/// builder, so a fixture cannot drift from the layout the engine registers
+/// tables with.
 fn build_table_tab_row_flags(tid: i64, raw_pk_cols: u64, table_name: &str, flags: u64) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Table.schema());
     push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, table_name, raw_pk_cols, flags, 1);
