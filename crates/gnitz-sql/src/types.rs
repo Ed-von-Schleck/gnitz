@@ -81,16 +81,14 @@ pub(crate) fn is_integer_type(tc: TypeCode) -> bool {
 }
 
 /// Whether a value of this type fits the expression VM's 8-byte *scalar*
-/// register. Wide integer-ish types (U128/UUID/I128) have no i64 slot, and
-/// STRING/BLOB hold a 16-byte descriptor whose integer widening reads the prefix
-/// as a garbage signed int. Everything else — narrow and 64-bit ints, and floats
-/// — lands in a scalar register and so can be compared or accumulated there.
+/// register — [`gnitz_core::ScalarKind`], the same classification the engine's
+/// reduce kernel and aggregate-value index resolve their columns through, so the
+/// binder cannot admit an aggregate the engine then refuses.
 ///
 /// Not the same question as `register_image`, which is total over *both*
-/// register classes and maps STRING to itself. The one home for the scalar rule;
-/// MIN/MAX orderability (aggregate and scalar) is its user.
+/// register classes and maps STRING to itself.
 pub(crate) fn has_scalar_register(tc: TypeCode) -> bool {
-    !tc.is_wide_int() && !tc.is_german_string()
+    gnitz_core::ScalarKind::from_type_code(tc).is_some()
 }
 
 /// Whether `CAST(… AS tc)` has a form the VM can compute. STRING joins the

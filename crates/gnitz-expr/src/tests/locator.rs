@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use crate::test_support::{locator_fixture as fixture, TestView};
 use crate::ColumnLocator;
 use gnitz_wire::type_code as tc;
+use gnitz_wire::{FixedInt, ScalarKind};
 
 #[test]
 fn pk_locator_reads_decode_the_opk_sign_flip() {
@@ -178,4 +179,130 @@ fn is_null_reads_the_addressed_slot_bit() {
     assert!(!slot2.is_null(&v, 0));
     assert!(!slot0.is_null(&v, 1), "a set bit at slot 2 must not read as slot 0");
     assert!(!pk.is_null(&v, 1), "PK columns are never null");
+}
+
+/// `order_bits`' integer half against an independent oracle: the OPK promotion
+/// the rest of the engine keys on. `encode_pk_column_promoted` into the type's own
+/// index key type is the same total order in big-endian bytes and has its own
+/// tests, so this pins the AVI's stored byte format without restating it.
+#[test]
+fn order_bits_matches_the_opk_promotion_on_both_arms() {
+    fn oracle(native_le: &[u8], type_code: u8) -> u64 {
+        let mut key = [0u8; 8];
+        let target = gnitz_wire::index_key_type(type_code).unwrap();
+        gnitz_wire::encode_pk_column_promoted(native_le, type_code, target, &mut key);
+        u64::from_be_bytes(key)
+    }
+
+    // (FixedInt, type code, the values to check as raw native-LE u64s.)
+    let mut cases: Vec<(FixedInt, u8, Vec<u64>)> = vec![
+        (FixedInt::U8, tc::U8, (0..=u8::MAX).map(u64::from).collect()),
+        (FixedInt::I8, tc::I8, (0..=u8::MAX).map(u64::from).collect()),
+        (FixedInt::U16, tc::U16, (0..=u16::MAX).map(u64::from).collect()),
+        (FixedInt::I16, tc::I16, (0..=u16::MAX).map(u64::from).collect()),
+    ];
+    // Edges plus a deterministic sweep for the widths exhaustion cannot reach.
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for (fi, type_code) in [
+        (FixedInt::U32, tc::U32),
+        (FixedInt::I32, tc::I32),
+        (FixedInt::U64, tc::U64),
+        (FixedInt::I64, tc::I64),
+    ] {
+        let mask = u64::MAX >> (64 - 8 * fi.width());
+        let mut vals = vec![0, 1, mask, mask >> 1, (mask >> 1) + 1];
+        vals.extend((0..64).map(|_| next() & mask));
+        cases.push((fi, type_code, vals));
+    }
+
+    for (fi, type_code, vals) in cases {
+        let w = fi.width();
+        let mut v = TestView::new(vals.len(), w);
+        assert_eq!(v.push_col(w), 0);
+        for (row, &x) in vals.iter().enumerate() {
+            v.set_pk_col(row, 0, &x.to_le_bytes()[..w], type_code);
+            v.set_payload(row, 0, &x.to_le_bytes()[..w]);
+        }
+        let from_pk = ColumnLocator::Pk {
+            byte_off: 0,
+            size: w as u8,
+            type_code,
+        };
+        let from_payload = ColumnLocator::Payload {
+            slot: 0,
+            size: w as u8,
+            type_code,
+        };
+        let kind = ScalarKind::Int(fi);
+        for (row, &x) in vals.iter().enumerate() {
+            let want = oracle(&x.to_le_bytes()[..w], type_code);
+            assert_eq!(from_pk.order_bits(&v, row, kind), want, "{fi:?} pk arm, value {x:#x}");
+            assert_eq!(
+                from_payload.order_bits(&v, row, kind),
+                want,
+                "{fi:?} payload arm, value {x:#x}",
+            );
+        }
+    }
+}
+
+/// `order_bits`' float half round-trips through `ScalarKind::order_inverse` and
+/// orders by `total_cmp`, over the values only floats have: ±0.0, ±NaN and both
+/// infinities. A float is never a PK column, so only the payload arm exists.
+#[test]
+fn order_bits_gives_floats_the_total_order() {
+    const FLOATS: [f64; 9] = [
+        f64::NEG_INFINITY,
+        -1.5,
+        -0.0,
+        0.0,
+        f64::MIN_POSITIVE,
+        1.5,
+        f64::INFINITY,
+        f64::NAN,
+        -f64::NAN,
+    ];
+    for (kind, type_code, w) in [(ScalarKind::F32, tc::F32, 4), (ScalarKind::F64, tc::F64, 8)] {
+        let cells: Vec<[u8; 8]> = FLOATS
+            .iter()
+            .map(|&f| {
+                if w == 4 {
+                    ((f as f32).to_bits() as u64).to_le_bytes()
+                } else {
+                    f.to_bits().to_le_bytes()
+                }
+            })
+            .collect();
+        let mut v = TestView::new(cells.len(), 8);
+        assert_eq!(v.push_col(w), 0);
+        for (row, cell) in cells.iter().enumerate() {
+            v.set_payload(row, 0, &cell[..w]);
+        }
+        let loc = ColumnLocator::Payload {
+            slot: 0,
+            size: w as u8,
+            type_code,
+        };
+        for (a, ca) in cells.iter().enumerate() {
+            let enc = loc.order_bits(&v, a, kind);
+            assert_eq!(
+                &kind.order_inverse(enc).to_le_bytes()[..w],
+                &ca[..w],
+                "{kind:?}: order_inverse must recover the value's own bits",
+            );
+            for (b, cb) in cells.iter().enumerate() {
+                assert_eq!(
+                    enc.cmp(&loc.order_bits(&v, b, kind)),
+                    gnitz_wire::cmp_typed_le(&ca[..w], &cb[..w], type_code),
+                    "{kind:?}: order disagrees with cmp_typed_le for {ca:02x?} vs {cb:02x?}",
+                );
+            }
+        }
+    }
 }

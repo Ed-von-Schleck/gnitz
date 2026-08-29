@@ -119,8 +119,9 @@ impl ColumnLocator {
     ) -> &'a [u8] {
         match *self {
             ColumnLocator::Pk { size, type_code, .. } => {
-                *scratch = gnitz_wire::decode_pk_column_owned(self.bytes(mb, row), type_code);
-                &scratch[..size as usize]
+                let dst = &mut scratch[..size as usize];
+                gnitz_wire::decode_pk_column(self.bytes(mb, row), type_code, dst);
+                dst
             }
             ColumnLocator::Payload { .. } => self.bytes(mb, row),
         }
@@ -140,6 +141,25 @@ impl ColumnLocator {
         match *self {
             ColumnLocator::Pk { .. } => gnitz_wire::decode_opk_i64(self.bytes(mb, row), fi),
             ColumnLocator::Payload { .. } => fi.decode_le_i64(self.bytes(mb, row)),
+        }
+    }
+
+    /// The column's value in `row` as its order-preserving `u64` image: plain
+    /// unsigned order over it *is* `gnitz_wire::cmp_typed_le`'s order, with
+    /// `total_cmp`'s NaN and -0.0 positions for floats. `kind` pairs with the
+    /// column as [`Self::decode_i64`]'s `fi` does — every arm reads the whole
+    /// column window, so a mispairing panics on width.
+    #[inline(always)]
+    pub fn order_bits(&self, mb: &impl RowSource, row: usize, kind: gnitz_wire::ScalarKind) -> u64 {
+        match kind {
+            gnitz_wire::ScalarKind::Int(fi) => (self.decode_i64(mb, row, fi) as u64) ^ ((fi.is_signed() as u64) << 63),
+            // A float is never a PK column, so `bytes` is already the native image.
+            gnitz_wire::ScalarKind::F32 => {
+                gnitz_wire::ieee_order_bits_f32(u32::from_le_bytes(self.bytes(mb, row).try_into().unwrap()))
+            }
+            gnitz_wire::ScalarKind::F64 => {
+                gnitz_wire::ieee_order_bits(u64::from_le_bytes(self.bytes(mb, row).try_into().unwrap()))
+            }
         }
     }
 

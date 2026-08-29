@@ -229,11 +229,9 @@ fn fold_rejects_mismatched_reply_schema() {
     assert!(AdhocFold::new(&src, &wrong_type, &spec, 1000).is_err());
 }
 
-/// The spec is a trust boundary and the accumulator is not defensive: SUM
-/// over a STRING and MIN over a U128 have no ≤8-byte numeric image, and
-/// before `ReducePlan::new` owned that check both reached `Accumulator::new`
-/// and aborted the worker — the U128 MIN in release too, since
-/// `agg_output_type(Min, U128)` is I64 and the reply schema matched.
+/// The spec is a trust boundary and the accumulator is not defensive: SUM over a
+/// STRING and MIN over a U128 have no scalar register image, and a U128 MIN would
+/// slip past the reply-schema check too (`agg_output_type(Min, U128)` is I64).
 #[test]
 fn fold_rejects_aggregates_with_no_encoding() {
     // pk(U64), s(STRING), w(U128).
@@ -254,7 +252,7 @@ fn fold_rejects_aggregates_with_no_encoding() {
         let Err(err) = AdhocFold::new(&src, &reply, &spec, 1000) else {
             panic!("{op:#x} over column {col} must be rejected");
         };
-        assert!(err.contains("order-encodable"), "{err}");
+        assert!(err.contains("no scalar register image"), "{err}");
     }
     // COUNT reads no value, so the same columns are countable.
     for col in [1u16, 2] {

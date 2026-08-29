@@ -88,11 +88,6 @@ pub(crate) struct ReducePlan {
     /// order. `Some` iff some aggregate is non-linear, so this *is* the
     /// "needs history" bit — nothing re-derives it from the descriptor list.
     pub(crate) avi: Option<AviBake>,
-    /// Output width of each trailing agg column — the trace read-back stride.
-    pub(super) agg_col_widths: Vec<usize>,
-    /// First aggregate column's logical index (aggregates are the trailing
-    /// output columns, so this holds at any PK arity).
-    pub(super) cbase: usize,
 }
 
 impl ReducePlan {
@@ -109,40 +104,45 @@ impl ReducePlan {
         global_ground: bool,
         i_am_owner: bool,
     ) -> Result<Self, &'static str> {
-        // Building the accumulators *is* the eligibility test, so no caller can
-        // skip it: SUM must widen its source, MIN/MAX must order-encode it.
-        let acc_template: Vec<Accumulator> = agg_descs
-            .iter()
-            .map(|d| Accumulator::new(d.agg_op, input_schema.locate(d.col_idx as usize)))
-            .collect::<Option<Vec<_>>>()
-            .ok_or("reduce: aggregate column is not order-encodable")?;
-
         let output_schema = build_reduce_output_schema(input_schema, group_by_cols, agg_descs, out_key)
             .ok_or("reduce: output exceeds MAX_COLUMNS")?;
 
-        let num_aggs = agg_descs.len();
-        let cbase = output_schema.num_columns() - num_aggs;
+        // The aggregates are the trailing output columns, so aggregate `k` owns
+        // logical column `cbase + k` at any PK arity — pairing each accumulator
+        // with its own output column here is what leaves no index for a later
+        // caller to get wrong.
+        let cbase = output_schema.num_columns() - agg_descs.len();
+        // Building the accumulators *is* the eligibility test, so no caller can
+        // skip it: every value-reading aggregate needs a scalar register image.
+        let acc_template: Vec<Accumulator> = agg_descs
+            .iter()
+            .enumerate()
+            .map(|(k, d)| {
+                Accumulator::new(
+                    d.agg_op,
+                    input_schema.locate(d.col_idx as usize),
+                    output_schema.locate(cbase + k),
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or("reduce: aggregate column type has no scalar register image")?;
 
         // Every group set has a packed key and the accumulator build above
         // already rejected any aggregate the index could not encode, so a
         // non-linear reduce always gets one — there is no eligibility gate and
         // no trace-replay fallback.
-        let avi = agg_descs
+        let avi = acc_template
             .iter()
-            .any(|d| d.agg_op.uses_value_index())
-            .then(|| AviBake::new(input_schema, group_by_cols, agg_descs));
+            .any(|a| !a.is_linear())
+            .then(|| AviBake::new(input_schema, group_by_cols, &acc_template));
         // Read off the bake's own aggregate list, so the value-indexed set has one
         // walk rather than a second one that has to keep agreeing with it.
-        let track_nonlinear = avi.as_ref().is_some_and(AviBake::has_integer_extreme);
+        let track_nonlinear = avi.as_ref().is_some_and(AviBake::any_trace_foldable);
 
         let cardinality_idx: Option<u8> = agg_descs
             .iter()
             .position(|d| d.agg_op == AggFunc::Count)
             .map(|i| i as u8);
-
-        let agg_col_widths: Vec<usize> = (0..num_aggs)
-            .map(|k| output_schema.columns[cbase + k].size() as usize)
-            .collect();
 
         Ok(ReducePlan {
             input_schema: *input_schema,
@@ -155,8 +155,6 @@ impl ReducePlan {
             acc_template,
             group_key: GroupKeyCols::new(input_schema, group_by_cols),
             avi,
-            agg_col_widths,
-            cbase,
         })
     }
 

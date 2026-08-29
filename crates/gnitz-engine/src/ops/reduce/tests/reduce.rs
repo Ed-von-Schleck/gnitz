@@ -10,7 +10,8 @@ use crate::test_support::{make_batch_raw, make_schema_i64pk_i64, make_schema_u64
 use gnitz_wire::{encode_german_string, read_i64_le, read_u64_le};
 
 use super::super::group_key::GroupKeyCols;
-use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor};
+use super::agg::{Accumulator, AggDescriptor};
+use super::avi::AviBake;
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::plan::{build_reduce_output_schema, ReducePlan};
 use super::sort::{argsort_delta, compare_by_group_cols};
@@ -23,11 +24,10 @@ fn locate_cols(schema: &SchemaDescriptor, cols: &[u32]) -> Vec<ColumnLocator> {
     cols.iter().map(|&c| schema.locate(c as usize)).collect()
 }
 
-/// The AVI index schema for `(schema, group cols)` — the same one `AviBake::new`
-/// bakes onto the compiled reduce, reached without the aggregate list the bake
-/// also needs.
+/// The AVI index schema for `(schema, group cols)` — the same one the plan
+/// bakes onto a compiled reduce, reached without naming the aggregate list.
 fn avi_schema(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescriptor {
-    super::avi::AviBake::new(
+    make_bake(
         schema,
         group_by_cols,
         &[AggDescriptor {
@@ -90,10 +90,10 @@ struct Avi {
 
 impl Avi {
     fn new(in_schema: &SchemaDescriptor, group_cols: &[u32], agg_descs: &[AggDescriptor], history: &[&Batch]) -> Self {
-        use super::avi::{op_populate_avi, AviBake};
-        // `AviBake::new` applies the `uses_value_index` selection itself, so
-        // ordinal `j` is position `j` in that subset exactly as production has it.
-        let bake = AviBake::new(in_schema, group_cols, agg_descs);
+        use super::avi::op_populate_avi;
+        // The bake applies the value-index selection itself, so ordinal `j` is
+        // position `j` in that subset exactly as production has it.
+        let bake = make_bake(in_schema, group_cols, agg_descs);
         let dir = tempfile::tempdir().unwrap();
         let mut table = crate::storage::Table::with_memtable_budget(
             dir.path().to_str().unwrap(),
@@ -132,6 +132,28 @@ fn make_plan(
         i_am_owner,
     )
     .unwrap()
+}
+
+/// The baked AVI of a value-indexed reduce, reached through the plan that owns
+/// it — the only way production builds one.
+fn make_bake(in_schema: &SchemaDescriptor, group_cols: &[u32], agg_descs: &[AggDescriptor]) -> AviBake {
+    make_plan(in_schema, group_cols, agg_descs, false, false)
+        .avi
+        .expect("a value-indexed reduce has an AVI")
+}
+
+/// The single accumulator the plan bakes for `desc` — carrying the output
+/// column locator its emission and trace read-back go through.
+fn make_acc(in_schema: &SchemaDescriptor, group_cols: &[u32], desc: AggDescriptor) -> Accumulator {
+    let mut accs = make_plan(in_schema, group_cols, &[desc], false, false).acc_template;
+    accs.pop().unwrap()
+}
+
+/// The AVI value image of an I64 aggregate value, spelled out rather than taken
+/// from the code under test: `ColumnLocator::order_bits`' signed-integer half is
+/// the sign-bit flip that puts two's-complement negatives below non-negatives.
+fn i64_av(v: i64) -> u64 {
+    (v as u64) ^ (1u64 << 63)
 }
 
 /// The output schema the plan derives for `(schema, group cols, aggs)` — the
@@ -1789,9 +1811,9 @@ fn test_emit_reduce_row_compound_pk_bytes() {
         col_idx: 2,
         agg_op: AggFunc::Count,
     };
-    let accs: Vec<Accumulator> = vec![Accumulator::new(agg.agg_op, in_schema.locate(2)).unwrap()];
     // Natural-PK grouping passes the source row's PK bytes; they're copied verbatim.
     let plan = make_plan(&in_schema, &[0u32, 1u32], std::slice::from_ref(&agg), false, false);
+    let accs = plan.acc_template.clone();
     emit_reduce_row(&mut output, (&mb, 0), mb.get_pk_bytes(0), &accs, &plan);
 
     assert_eq!(output.count, 1);
@@ -2350,8 +2372,8 @@ fn test_reduce_max_u64_incremental() {
 
 #[test]
 fn test_avi_seed_u64_high_bit() {
-    // The AVI fast path seeds an Accumulator with a U64 bit pattern via
-    // `seed_from_raw_bits`, then folds in delta rows via `step_from_batch`.
+    // The AVI fast path seeds an Accumulator with a U64 order image via
+    // `seed_encoded_extreme`, then folds in delta rows via `step_from_batch`.
     // Validates that the U64 bit pattern preserved by the AVI seed
     // compares correctly under unsigned semantics against incoming
     // delta rows.
@@ -2361,10 +2383,11 @@ fn test_avi_seed_u64_high_bit() {
         col_idx: 1,
         agg_op: AggFunc::Min,
     };
-    let mut acc = Accumulator::new(desc.agg_op, in_schema.locate(1)).unwrap();
+    let mut acc = make_acc(&in_schema, &[0], desc);
 
-    // AVI seeds the accumulator with 1u64<<63 (high bit set).
-    acc.seed_from_raw_bits(1u64 << 63);
+    // AVI seeds the accumulator with 1u64<<63 (high bit set); a U64's order
+    // image is the value itself.
+    acc.seed_encoded_extreme(1u64 << 63);
     assert_eq!(acc.get_value_bits(), 1u64 << 63);
 
     // Build a batch with a single row val=10u64, pk=1.
@@ -2793,8 +2816,6 @@ fn avi_gcol(dst: &mut [u8], native_le: &[u8], tc: u8) {
 
 #[test]
 fn avi_two_groups_distinct_byte_form_keys() {
-    use super::avi::encode_ordered;
-
     // Input: pk(U64), a(U32), b(U32), val(I64); GROUP BY (a, b), MIN(val).
     let in_schema = SchemaDescriptor::new(
         &[
@@ -2842,7 +2863,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
             let mut key = [0u8; 17];
             avi_gcol(&mut key[0..4], &a.to_le_bytes(), type_code::U32);
             avi_gcol(&mut key[4..8], &bb.to_le_bytes(), type_code::U32);
-            let av = encode_ordered(&min.to_le_bytes(), TypeCode::I64, false);
+            let av = i64_av(min);
             key[8] = 0; // ordinal 0 (single MIN aggregate)
             key[9..17].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -2901,8 +2922,6 @@ fn avi_two_groups_distinct_byte_form_keys() {
 
 #[test]
 fn avi_retraction_returns_next_extremum() {
-    use super::avi::encode_ordered;
-
     // Input: pk(U64), a(U32), val(I64); GROUP BY a, MIN(val).
     let in_schema = SchemaDescriptor::new(
         &[
@@ -2943,7 +2962,7 @@ fn avi_retraction_returns_next_extremum() {
         for min in [10i64, 20] {
             let mut key = [0u8; 13];
             avi_gcol(&mut key[0..4], &1u32.to_le_bytes(), type_code::U32);
-            let av = encode_ordered(&min.to_le_bytes(), TypeCode::I64, false);
+            let av = i64_av(min);
             key[4] = 0; // ordinal 0 (single MIN aggregate)
             key[5..13].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -3017,8 +3036,6 @@ fn avi_retraction_returns_next_extremum() {
 
 #[test]
 fn avi_non_power_of_two_stride_drives_cursor() {
-    use super::avi::encode_ordered;
-
     for (gtc, gsize, stride) in [(type_code::U16, 2usize, 11usize), (type_code::U32, 4, 13)] {
         let in_schema = SchemaDescriptor::new(
             &[
@@ -3056,7 +3073,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             let mut b = Batch::with_capacity(avi_schema, 1);
             let mut key = vec![0u8; stride];
             avi_gcol(&mut key[..gsize], &gval.to_le_bytes()[..gsize], gtc);
-            let av = encode_ordered(&42i64.to_le_bytes(), TypeCode::I64, false);
+            let av = i64_av(42i64);
             key[gsize] = 0; // ordinal
             key[gsize + 1..gsize + 9].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -3263,8 +3280,6 @@ fn min_ignores_null_values() {
 
 #[test]
 fn avi_multi_col_retraction_returns_next_extremum() {
-    use super::avi::encode_ordered;
-
     // Input: pk(U64), a(U32), b(U32), val(I64); GROUP BY (a, b), MIN(val).
     let in_schema = SchemaDescriptor::new(
         &[
@@ -3309,7 +3324,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
             let mut key = [0u8; 17];
             avi_gcol(&mut key[0..4], &a.to_le_bytes(), type_code::U32);
             avi_gcol(&mut key[4..8], &bb.to_le_bytes(), type_code::U32);
-            let av = encode_ordered(&min.to_le_bytes(), TypeCode::I64, false);
+            let av = i64_av(min);
             key[8] = 0; // ordinal 0 (single MIN aggregate)
             key[9..17].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -3383,7 +3398,6 @@ fn avi_multi_col_retraction_returns_next_extremum() {
 // match it group-for-group. Composite key = a(8) ++ b(8) ++ av(8) = 24 bytes.
 #[test]
 fn avi_wide_two_u64_groups_match_reference() {
-    use super::avi::encode_ordered;
     use std::collections::BTreeMap;
 
     let in_schema = SchemaDescriptor::new(
@@ -3446,7 +3460,7 @@ fn avi_wide_two_u64_groups_match_reference() {
                 let mut key = [0u8; 25];
                 avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::U64);
                 avi_gcol(&mut key[8..16], &b.to_le_bytes(), type_code::U64);
-                let av = encode_ordered(&m.to_le_bytes(), TypeCode::I64, false);
+                let av = i64_av(m);
                 key[16] = 0; // ordinal 0 (single MIN aggregate)
                 key[17..25].copy_from_slice(&av.to_be_bytes());
                 key
@@ -3522,8 +3536,6 @@ fn avi_wide_two_u64_groups_match_reference() {
 // bucket.
 #[test]
 fn avi_wide_single_u128_group_distinct() {
-    use super::avi::encode_ordered;
-
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),  // pk
@@ -3569,7 +3581,7 @@ fn avi_wide_single_u128_group_distinct() {
         for &(g, m) in &groups {
             let mut key = [0u8; 25];
             avi_gcol(&mut key[0..16], &g.to_le_bytes(), type_code::U128);
-            let av = encode_ordered(&m.to_le_bytes(), TypeCode::I64, false);
+            let av = i64_av(m);
             key[16] = 0; // ordinal 0 (single MIN aggregate)
             key[17..25].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -3621,8 +3633,6 @@ fn avi_wide_single_u128_group_distinct() {
 // group. Guards that the AVI schema preserves each group column's type_code.
 #[test]
 fn avi_wide_mixed_signed_unsigned_key() {
-    use super::avi::encode_ordered;
-
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0), // pk
@@ -3673,7 +3683,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
                 let mut key = [0u8; 25];
                 avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::I64);
                 avi_gcol(&mut key[8..16], &bb.to_le_bytes(), type_code::U64);
-                let av = encode_ordered(&m.to_le_bytes(), TypeCode::I64, false);
+                let av = i64_av(m);
                 key[16] = 0; // ordinal 0 (single MIN aggregate)
                 key[17..25].copy_from_slice(&av.to_be_bytes());
                 key
@@ -3731,8 +3741,6 @@ fn avi_wide_mixed_signed_unsigned_key() {
 // (a, b, c) → composite a(8)++b(8)++c(8)++av(8) = 32 bytes.
 #[test]
 fn avi_wide_prefix_collision_distinct_groups() {
-    use super::avi::encode_ordered;
-
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0), // pk
@@ -3782,7 +3790,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
             avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::U64);
             avi_gcol(&mut key[8..16], &bb.to_le_bytes(), type_code::U64);
             avi_gcol(&mut key[16..24], &c.to_le_bytes(), type_code::U64);
-            let av = encode_ordered(&m.to_le_bytes(), TypeCode::I64, false);
+            let av = i64_av(m);
             key[24] = 0; // ordinal 0 (single MIN aggregate)
             key[25..33].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -3829,8 +3837,6 @@ fn avi_wide_prefix_collision_distinct_groups() {
 // group (sharing the first 16 bytes) must not be matched.
 #[test]
 fn avi_wide_retraction_returns_next_extremum() {
-    use super::avi::encode_ordered;
-
     // GROUP BY (a U64, b U64); composite a(8)++b(8)++av(8) = 24 bytes.
     let in_schema = SchemaDescriptor::new(
         &[
@@ -3878,7 +3884,7 @@ fn avi_wide_retraction_returns_next_extremum() {
             let mut key = [0u8; 25];
             avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::U64);
             avi_gcol(&mut key[8..16], &bb.to_le_bytes(), type_code::U64);
-            let av = encode_ordered(&m.to_le_bytes(), TypeCode::I64, false);
+            let av = i64_av(m);
             key[16] = 0; // ordinal 0 (single MIN aggregate)
             key[17..25].copy_from_slice(&av.to_be_bytes());
             b.extend_pk_bytes(&key);
@@ -3979,7 +3985,7 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
         col_idx: 0,
         agg_op: AggFunc::Count,
     };
-    let mut acc = Accumulator::new(desc.agg_op, schema.locate(0)).unwrap();
+    let mut acc = make_acc(&schema, &[0], desc);
     let mb = b.as_mem_batch();
     acc.step_from_batch(&mb, 0, 1);
     acc.step_from_batch(&mb, 1, 1);
@@ -3991,10 +3997,10 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
 }
 
 // Populate a fresh ephemeral AVI table from `deltas` through the production
-// `op_populate_avi`, then read the extreme of delta[0]-row-0's group
-// back through the production `apply_agg_from_value_index` seek. `col_idx` is
-// the aggregate source column (PK or payload). Shared by the AVI full-path
-// tests below.
+// `op_populate_avi`, then read the extreme of delta[0]-row-0's group back
+// through the production `AviBake::seed_extreme` seek. `col_idx` is the
+// aggregate source column (PK or payload). Shared by the AVI full-path tests
+// below.
 fn avi_read_extreme(
     in_schema: &SchemaDescriptor,
     group_by: &[u32],
@@ -4002,7 +4008,7 @@ fn avi_read_extreme(
     deltas: &[&Batch],
     for_max: bool,
 ) -> i64 {
-    use super::avi::{op_populate_avi, AviBake};
+    use super::avi::op_populate_avi;
     use crate::storage::Table;
 
     // The aggregate's type is the source column's type.
@@ -4020,8 +4026,7 @@ fn avi_read_extreme(
         col_idx,
         agg_op: if for_max { AggFunc::Max } else { AggFunc::Min },
     };
-    let aggs = [agg];
-    let bake = AviBake::new(in_schema, group_by, &aggs);
+    let bake = make_bake(in_schema, group_by, &[agg]);
 
     // Each op_populate_avi call is a separate AVI ingest; the cursor's
     // two-tier consolidation sums weights across ingests, so a retracted extreme
@@ -4033,12 +4038,10 @@ fn avi_read_extreme(
     let mut ch = avi_t.open_cursor();
     let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
     bake.pack_group(&mut gk, &deltas[0].as_mem_batch(), 0);
-    let mut acc = Accumulator::new(agg.agg_op, in_schema.locate(col_idx as usize)).unwrap();
-    assert!(
-        // Ordinal 0: the single aggregate.
-        apply_agg_from_value_index(&mut ch, bake.prefix(&mut gk, 0), for_max, &mut acc),
-        "AVI seek must find the probed group",
-    );
+    let mut acc = make_acc(in_schema, group_by, agg);
+    // Ordinal 0: the single aggregate.
+    bake.seed_extreme(&mut ch, &mut gk, 0, &mut acc);
+    assert!(!acc.is_untouched(), "AVI seek must find the probed group");
     acc.get_value_bits() as i64
 }
 
@@ -4180,14 +4183,19 @@ fn avi_full_path_pk_source_unsigned_high_byte() {
 // 32-bit IEEE bits, which an F64 reader interprets as a tiny denormal.
 #[test]
 fn avi_f32_seed_promotes_to_f64_bits() {
-    use super::avi::{decode_ordered, encode_ordered};
+    let in_schema = make_schema_with_type(type_code::F32);
+    let desc = AggDescriptor {
+        col_idx: 1,
+        agg_op: AggFunc::Min,
+    };
     for v in [1.5f32, -2.25, 0.0, 1.0e30] {
-        let enc = encode_ordered(&v.to_le_bytes(), TypeCode::F32, false);
-        let bits = decode_ordered(enc, TypeCode::F32);
+        let mut acc = make_acc(&in_schema, &[0], desc);
+        acc.seed_encoded_extreme(gnitz_wire::ieee_order_bits_f32(v.to_bits()));
+        let bits = acc.get_value_bits();
         assert_eq!(
             bits,
             f64::to_bits(v as f64),
-            "F32 AVI seed must be the F64 bits of (f32 as f64) for v={v}",
+            "F32 AVI seed must render as the F64 bits of (f32 as f64) for v={v}",
         );
         assert_eq!(f64::from_bits(bits), v as f64);
     }
@@ -5090,8 +5098,6 @@ fn global_lone_min_retract_to_next_best() {
 /// order — and a retraction advances to the next-best AVI post-state.
 #[test]
 fn global_lone_min_avi_empty_prefix() {
-    use super::avi::encode_ordered;
-
     let in_schema = g_src();
     let out_schema = SchemaDescriptor::new(
         &[
@@ -5106,7 +5112,7 @@ fn global_lone_min_avi_empty_prefix() {
     assert_eq!(avi_schema.pk_stride(), 9, "0 group + 1 ordinal + 8 av");
     let avi_with = |min: i64| {
         let mut b = Batch::with_capacity(avi_schema, 1);
-        let av = encode_ordered(&min.to_le_bytes(), TypeCode::I64, false);
+        let av = i64_av(min);
         let mut key = [0u8; 9];
         key[0] = 0; // ordinal 0 (single MIN, empty group prefix)
         key[1..9].copy_from_slice(&av.to_be_bytes());
@@ -5175,7 +5181,7 @@ fn sumzero_folds_like_sum_and_empty_renders_zero() {
         col_idx: 1,
         agg_op: AggFunc::SumZero,
     };
-    let mut acc = Accumulator::new(desc.agg_op, schema.locate(1)).unwrap();
+    let mut acc = make_acc(&schema, &[0], desc);
 
     // Fresh: untouched, and renders 0 (Count's identity) rather than NULL (Sum's).
     assert!(acc.is_untouched(), "fresh SumZero is untouched");
@@ -5207,7 +5213,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
         col_idx: 1,
         agg_op: AggFunc::CountNonNull,
     };
-    let mut acc = Accumulator::new(desc.agg_op, in_schema.locate(1)).unwrap();
+    let mut acc = make_acc(&in_schema, &[0], desc);
 
     // Two rows whose payload column (payload slot 0) is NULL.
     let mut batch = Batch::with_capacity(g_src(), 2);
@@ -5466,7 +5472,7 @@ fn build_combined_avi(
         crate::storage::RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
-    let bake = super::avi::AviBake::new(in_schema, group_cols, agg_descs);
+    let bake = make_bake(in_schema, group_cols, agg_descs);
     for d in deltas {
         op_populate_avi(d, &mut t, &bake).unwrap();
     }
@@ -6434,7 +6440,7 @@ fn run_minmax_epochs(
     epochs: &[Batch],
     global_ground: bool,
 ) -> Vec<std::rc::Rc<Batch>> {
-    use super::avi::{op_populate_avi, AviBake};
+    use super::avi::op_populate_avi;
     use crate::storage::{RecoverySource, Table};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -6458,7 +6464,7 @@ fn run_minmax_epochs(
     )
     .unwrap();
 
-    let avi_bake = AviBake::new(in_schema, group_by, aggs);
+    let avi_bake = make_bake(in_schema, group_by, aggs);
     let mut states = Vec::with_capacity(epochs.len());
     for d in epochs {
         // AVI Integrate precedes Reduce: post-delta `I(input)` before the read.

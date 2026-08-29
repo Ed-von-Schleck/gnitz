@@ -1,6 +1,6 @@
 use super::error::ProtocolError;
 
-pub use gnitz_wire::{FixedInt, ReduceOutKey, TypeCode};
+pub use gnitz_wire::{FixedInt, ReduceOutKey, ScalarKind, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
 
 /// Convert a u64 wire value to TypeCode, returning an error for unknown codes.

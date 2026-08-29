@@ -1,40 +1,27 @@
-//! Aggregate opcodes, descriptors, accumulator state, and AVI lookup.
+//! Aggregate descriptors and accumulator state.
 
 use crate::schema::{ColumnLocator, TypeCode};
-use crate::storage::{MemBatch, ReadCursor};
-use gnitz_wire::{AggFunc, FixedInt};
-
-use super::avi::AviBake;
-
-// ---------------------------------------------------------------------------
-// Aggregate opcodes
-// ---------------------------------------------------------------------------
-
-// The engine has no aggregate the wire format cannot name, so it keeps no
-// parallel enum: `gnitz_wire::AggFunc` carries the discriminants, the decode
-// ladder, and every classification predicate (`is_linear`, `uses_value_index`,
-// `empty_renders_zero`, `raw_output_nullable`, `merge_func`), and the reduce
-// operator reads them directly.
-//
-// `raw_output_nullable`'s `ungrouped` argument is `group_cols.is_empty()`, not
-// `global_ground`: the two extra shapes an empty group set covers — the
-// range-join threshold reduce and the two-phase phase-1 local partial — emit at
-// most one row per worker, so the `FixedIntNonnull` comparator class forfeited
-// there is worth nothing, and the schema stays a pure function of the
-// schema-level facts.
+use gnitz_expr::RowSource;
+use gnitz_wire::{AggFunc, ScalarKind};
 
 /// Descriptor for one aggregate function — exactly the `(AggFunc, u16)` spec the
-/// wire ships. Plain data, never transmuted or serialized.
-///
-/// It carries no column *type*: the type is `schema.columns[col_idx]`, and every
-/// consumer already holds either that schema or the column's resolved
-/// [`ColumnLocator`]. A stored copy was a second spelling nothing validated —
-/// hand-built descriptors wrote the type literally, and a mismatch mis-decoded
-/// silently in [`readback_agg_bits`] rather than failing.
+/// wire ships. It carries no column *type*: that is `schema.columns[col_idx]`,
+/// which every consumer already holds, resolved or not.
 #[derive(Clone, Copy)]
 pub(crate) struct AggDescriptor {
     pub col_idx: u32,
     pub agg_op: AggFunc,
+}
+
+/// The value-index parameters of one MIN/MAX aggregate: the column the index
+/// reads, how to encode it, and which end of the order the index puts first.
+/// Named fields rather than a positional triple — two of the three are scalars
+/// the compiler could not tell apart.
+#[derive(Clone, Copy)]
+pub(crate) struct ExtremeSpec {
+    pub loc: ColumnLocator,
+    pub kind: ScalarKind,
+    pub for_max: bool,
 }
 
 /// Accumulator: internal state for one aggregate column. Cloned per epoch (and,
@@ -44,27 +31,22 @@ pub(crate) struct AggDescriptor {
 #[derive(Clone)]
 pub(crate) struct Accumulator {
     acc: i64,
-    agg_op: AggFunc,
-    /// Where the aggregated column's value lives in a row (PK byte offset or
-    /// dense payload slot). Resolved once; the per-row value read goes through it.
-    loc: ColumnLocator,
-    /// The source column's type — `loc.type_code()` validated once at `new`.
-    tc: TypeCode,
-    /// What one row does to the slot, resolved from `(agg_op, tc)` at `new`.
-    kind: StepKind,
-    /// `agg_op.is_linear()`, resolved at `new` for the same reason [`StepKind`]
-    /// is: the group walk reads it once per row per aggregate.
-    linear: bool,
     has_value: bool,
+    /// [`AggFunc::is_linear`] as `kind` spells it, resolved in `new`: the group
+    /// walk reads it once per row per aggregate.
+    linear: bool,
+    /// The aggregated column in an input row.
+    src: ColumnLocator,
+    /// This aggregate's own column in a reduce **output** row — where
+    /// [`Self::fold_stored`] reads its previously-emitted value and
+    /// `emit_agg_col` writes the new one.
+    out: ColumnLocator,
+    kind: StepKind,
 }
 
-/// What [`Accumulator::step_from_batch`] does with one row, resolved once at
-/// construction so the per-row body dispatches on a discriminant instead of
-/// re-deriving the answer from `agg_op` and `tc`.
-///
-/// Resolving it in `new` makes the construction one exhaustive `match` over
-/// `AggFunc` — a new opcode cannot reach the row path unclassified — and moves
-/// SUM's non-numeric rejection from a per-row unwrap to a once-per-epoch one.
+/// What one row does to the slot, resolved once at construction so the per-row
+/// body dispatches on a discriminant instead of re-deriving the answer from an
+/// `AggFunc` and a `TypeCode`.
 #[derive(Clone, Copy)]
 enum StepKind {
     /// Value-independent: count the row before any column read, so a wide
@@ -72,72 +54,57 @@ enum StepKind {
     Count,
     /// Count the row after the NULL gate, still without reading its value.
     CountNonNull,
-    /// Widen the native bytes into the `i64` slot and add `value * weight`.
-    Sum(SumWiden),
-    /// Order-encode at the source type and keep the extreme; `max` picks the
-    /// direction (the encoding itself is always MIN-oriented).
-    Extreme { max: bool },
+    /// Add `value * weight` into the slot, reading the value as `ScalarKind`.
+    Sum(ScalarKind),
+    /// [`Self::Sum`]'s fold under Count's `0` empty-value; see
+    /// [`AggFunc::empty_renders_zero`].
+    SumZero(ScalarKind),
+    /// Keep the extreme as its MIN-oriented order image; `max` picks the
+    /// direction (the image itself is always MIN-oriented).
+    Extreme { max: bool, kind: ScalarKind },
 }
 
-/// How [`StepKind::Sum`] widens the source column's native bytes into the `i64`
-/// slot. A pure function of the column type — see [`SumWiden::for_type`].
-#[derive(Clone, Copy)]
-enum SumWiden {
-    /// A ≤8-byte integer. [`FixedInt`] *is* the domain on which "decode
-    /// little-endian bytes → i64" is total, and it carries its own width, so
-    /// holding one replaces the type code, the width and the signedness test.
-    /// It zero-extends unsigned sources (`U8` 0xFF → 255, never -1) and
-    /// reinterprets `U64`'s bit pattern as `i64` — SUM treats the slot as a bit
-    /// container, so wrap-around is unaffected by signedness.
-    Int(FixedInt),
-    F32,
-    F64,
-}
-
-impl SumWiden {
-    /// `None` for a type SUM cannot widen (STRING/BLOB/U128/UUID/I128) —
-    /// `FixedInt::from_type_code` is exhaustive over `TypeCode`, so a non-numeric
-    /// source lands there rather than silently widening as an integer.
-    fn for_type(tc: TypeCode) -> Option<SumWiden> {
-        match tc {
-            TypeCode::F32 => Some(SumWiden::F32),
-            TypeCode::F64 => Some(SumWiden::F64),
-            _ => FixedInt::from_type_code(tc).map(SumWiden::Int),
-        }
-    }
-}
+/// `AdhocFold` holds `groups × aggregates` of these, with `groups` bounded by
+/// `ADHOC_GROUP_CAP`.
+const _: () = assert!(std::mem::size_of::<Accumulator>() <= 24);
 
 impl Accumulator {
-    /// Build the accumulator for `agg_op` over the column at `loc`. What one row
-    /// does to the slot is resolved here, so the per-row body dispatches on
-    /// neither `agg_op` nor `TypeCode`.
+    /// Build the accumulator for `agg_op` over the input column at `src`, emitting
+    /// into the output column at `out`. What one row does to the slot is resolved
+    /// here, so the per-row body dispatches on neither `agg_op` nor `TypeCode`.
     ///
-    /// `None` iff the aggregate reads its argument's value and the source type
-    /// has no ≤8-byte numeric image. That is the whole aggregate-eligibility
-    /// rule; the COUNT family reads no value and takes any type.
-    pub(super) fn new(agg_op: AggFunc, loc: ColumnLocator) -> Option<Self> {
-        let tc = TypeCode::from_validated_u8(loc.type_code());
+    /// `None` iff the aggregate reads its argument's value and the source type has
+    /// no scalar register image — the whole aggregate-eligibility rule, the COUNT
+    /// family reading no value and taking any type.
+    pub(super) fn new(agg_op: AggFunc, src: ColumnLocator, out: ColumnLocator) -> Option<Self> {
+        let scalar = || ScalarKind::from_type_code(TypeCode::from_validated_u8(src.type_code()));
         // Exhaustive over `AggFunc`: a new opcode cannot reach the row path
         // unclassified.
         let kind = match agg_op {
             AggFunc::Count => StepKind::Count,
             AggFunc::CountNonNull => StepKind::CountNonNull,
-            AggFunc::Sum | AggFunc::SumZero => StepKind::Sum(SumWiden::for_type(tc)?),
-            // MIN/MAX hold the AVI's order-preserving encoding, whose domain
-            // (`agg_value_idx_eligible`) is the same ≤8-byte int/float set SUM
-            // widens — so `encode_ordered`'s unreachable arms stay unreachable.
-            AggFunc::Min | AggFunc::Max => super::avi::agg_value_idx_eligible(tc).then_some(StepKind::Extreme {
+            AggFunc::Sum => StepKind::Sum(scalar()?),
+            AggFunc::SumZero => StepKind::SumZero(scalar()?),
+            AggFunc::Min | AggFunc::Max => StepKind::Extreme {
                 max: agg_op == AggFunc::Max,
-            })?,
+                kind: scalar()?,
+            },
         };
+        let linear = !matches!(kind, StepKind::Extreme { .. });
+        // `fold_stored`'s linear arms read the whole slot as one `u64`, which
+        // `agg_output_type` guarantees: I64 for the count family and SumZero,
+        // the 8-byte register image for SUM.
+        debug_assert!(
+            !linear || out.size() == 8,
+            "a linear aggregate's output column is 8 bytes"
+        );
         Some(Accumulator {
             acc: 0,
             has_value: false,
-            agg_op,
-            loc,
-            tc,
+            linear,
+            src,
+            out,
             kind,
-            linear: agg_op.is_linear(),
         })
     }
 
@@ -152,25 +119,33 @@ impl Accumulator {
         self.linear
     }
 
-    /// True for a MAX accumulator — the extreme direction the AVI probe seeks
-    /// in. The same bit [`Self::extreme_replaces`] tests; meaningful only for
-    /// the MIN/MAX family.
+    /// Width of this aggregate's output column — the emitted value's truncation.
     #[inline(always)]
-    pub(super) fn is_max(&self) -> bool {
-        matches!(self.kind, StepKind::Extreme { max: true })
+    pub(super) fn out_size(&self) -> usize {
+        self.out.size()
     }
 
-    /// The aggregated column's source type, resolved from its locator at `new`.
+    /// This aggregate's value-index parameters, or `None` for a linear one.
     #[inline(always)]
-    pub(super) fn type_code(&self) -> TypeCode {
-        self.tc
+    pub(super) fn extreme_index_spec(&self) -> Option<ExtremeSpec> {
+        match self.kind {
+            StepKind::Extreme { max, kind } => Some(ExtremeSpec {
+                loc: self.src,
+                kind,
+                for_max: max,
+            }),
+            _ => None,
+        }
     }
 
-    /// Delegates to [`AggFunc::empty_renders_zero`] (the agg-op rationale lives
-    /// there); `emit_agg_col` reads it to render an untouched accumulator as `0`
-    /// rather than NULL without a per-op switch.
+    /// The zero-identity family, off the resolved kind — the same partition
+    /// [`AggFunc::empty_renders_zero`] names, and `tests/agg.rs` holds the two
+    /// answers equal for every opcode the wire can name.
     pub(super) fn empty_renders_zero(&self) -> bool {
-        self.agg_op.empty_renders_zero()
+        matches!(
+            self.kind,
+            StepKind::Count | StepKind::CountNonNull | StepKind::SumZero(_)
+        )
     }
 
     /// True iff the accumulator was never stepped (`has_value` is false) — "no
@@ -182,54 +157,56 @@ impl Accumulator {
     }
 
     /// Row count held by a COUNT/COUNT_NON_NULL accumulator — a group's net
-    /// cardinality, for the emission gate. Meaningful only for the count family.
+    /// cardinality, for the emission gate.
     #[inline(always)]
     pub(super) fn count_value(&self) -> i64 {
+        debug_assert!(matches!(self.kind, StepKind::Count | StepKind::CountNonNull));
         self.acc
     }
 
+    /// The emitted value's bits, truncated to the output column's width by the
+    /// caller. MIN/MAX invert the order image they hold; an `F32` extreme also
+    /// promotes to the `F64` output column `agg_output_type` declares for it.
     pub(super) fn get_value_bits(&self) -> u64 {
-        // MIN/MAX hold the MIN-oriented order-preserving encoding; decode back to
-        // native value bits for emit. Linear aggregates store the value verbatim.
-        if self.agg_op.uses_value_index() {
-            super::avi::decode_ordered(self.acc as u64, self.tc)
-        } else {
-            self.acc as u64
+        match self.kind {
+            StepKind::Extreme { kind, .. } => {
+                let bits = kind.order_inverse(self.acc as u64);
+                match kind {
+                    ScalarKind::F32 => f64::to_bits(f32::from_bits(bits as u32) as f64),
+                    _ => bits,
+                }
+            }
+            _ => self.acc as u64,
         }
     }
 
-    pub(super) fn seed_from_raw_bits(&mut self, bits: u64) {
-        self.acc = bits as i64;
+    /// Seed a MIN/MAX accumulator with a MIN-oriented order image — what the
+    /// AVI probe reads out of the index, never a raw value.
+    pub(super) fn seed_encoded_extreme(&mut self, enc: u64) {
+        debug_assert!(matches!(self.kind, StepKind::Extreme { .. }));
+        self.acc = enc as i64;
         self.has_value = true;
     }
 
-    /// Does the MIN-oriented encoding `enc` beat the current extreme? MAX keeps the
-    /// larger encoding, MIN the smaller — the single source of the extreme-direction
-    /// rule, shared by `step_from_batch` and `merge_encoded_extreme`. Reads `acc`
-    /// only, so callers gate on their own first/has_value state.
-    #[inline]
-    fn extreme_replaces(&self, enc: u64) -> bool {
-        if self.is_max() {
+    /// Does the MIN-oriented image `enc` beat the current extreme? MAX keeps the
+    /// larger image, MIN the smaller. Reads `acc` only, so callers gate on their
+    /// own first/has_value state.
+    #[inline(always)]
+    fn extreme_replaces(&self, max: bool, enc: u64) -> bool {
+        if max {
             enc > self.acc as u64
         } else {
             enc < self.acc as u64
         }
     }
 
-    /// Fold a pre-encoded MIN-oriented extreme into this MIN/MAX accumulator —
-    /// the same extreme compare as `step_from_batch`'s MIN/MAX arm. Used by the
-    /// AVI probe-skip path in `op_reduce` to fold the stored `old` extreme into an
-    /// accumulator already carrying the delta's positive-row extreme (`pos`).
-    pub(super) fn merge_encoded_extreme(&mut self, enc: u64) {
-        debug_assert!(matches!(self.kind, StepKind::Extreme { .. }));
-        if !self.has_value || self.extreme_replaces(enc) {
+    /// Take the extreme of `enc` and what the accumulator already holds.
+    #[inline(always)]
+    fn fold_extreme(&mut self, max: bool, enc: u64) {
+        if !self.has_value || self.extreme_replaces(max, enc) {
             self.acc = enc as i64;
             self.has_value = true;
         }
-    }
-
-    fn is_float(&self) -> bool {
-        self.tc.is_float()
     }
 
     /// Step: incorporate one input row into the accumulator.
@@ -237,88 +214,86 @@ impl Accumulator {
     /// Runs once per input row per aggregate, so it dispatches on the
     /// pre-resolved [`StepKind`] — no `AggFunc` compare, no `TypeCode` match.
     #[inline]
-    pub(super) fn step_from_batch(&mut self, mb: &MemBatch, row: usize, weight: i64) {
-        // COUNT is value-independent: count the row and return before any column
-        // read, so a wide PK column (cs = 16) never reaches the ≤8-byte value path.
-        if matches!(self.kind, StepKind::Count) {
-            self.count(weight);
+    pub(super) fn step_from_batch(&mut self, mb: &impl RowSource, row: usize, weight: i64) {
+        // COUNT is the only kind that counts a NULL row, so it is the only
+        // exemption from the gate — and counting before the read is what keeps a
+        // wide (>8-byte) source column off the value path entirely.
+        if !matches!(self.kind, StepKind::Count) && self.src.is_null(mb, row) {
             return;
         }
-
-        // Null gate for nullable payload columns. PK columns are never null
-        // (catalog rule), so `is_null` returns false for them.
-        if self.loc.is_null(mb, row) {
-            return;
-        }
-
-        // COUNT_NON_NULL: presence established (PK, or non-null payload above).
-        // Count the row without reading its value.
-        if matches!(self.kind, StepKind::CountNonNull) {
-            self.count(weight);
-            return;
-        }
-
-        let first = !self.has_value;
-        self.has_value = true;
-
-        // A PK-source column is at rest in OPK form, so every arm below reads it
-        // through the locator rather than off the region: the integer arm via
-        // `decode_i64` (the OPK inverse fused with the widening), the others via
-        // `native_le_bytes`, which materializes the native image into a scratch
-        // buffer. That buffer is declared per arm, not here: the integer arm
-        // never needs it, and at `-O0` a shared declaration is a 16-byte zero
-        // store per row on the hottest arm of the hottest aggregate.
         match self.kind {
-            // SumZero folds identically to Sum (it differs only in its identity /
-            // empty-render, handled by the seed and `emit_agg_col`). Every arm
-            // reads exactly the source column's width — `FixedInt::width()` and
-            // the float arms alike derive from the same schema column `loc` does.
-            StepKind::Sum(SumWiden::Int(fi)) => {
+            StepKind::Count | StepKind::CountNonNull => {
+                self.acc = self.acc.wrapping_add(weight);
+                self.has_value = true;
+            }
+            StepKind::Sum(ScalarKind::Int(fi)) | StepKind::SumZero(ScalarKind::Int(fi)) => {
                 self.acc = self
                     .acc
-                    .wrapping_add(self.loc.decode_i64(mb, row, fi).wrapping_mul(weight));
+                    .wrapping_add(self.src.decode_i64(mb, row, fi).wrapping_mul(weight));
+                self.has_value = true;
             }
-            StepKind::Sum(SumWiden::F32) => {
-                let mut scratch = [0u8; 16];
-                let bytes = self.loc.native_le_bytes(mb, row, &mut scratch);
+            StepKind::Sum(ScalarKind::F32) | StepKind::SumZero(ScalarKind::F32) => {
+                let bits = self.src.bytes(mb, row);
                 self.add_float(
-                    f32::from_bits(u32::from_le_bytes(bytes[..4].try_into().unwrap())) as f64,
+                    f32::from_bits(u32::from_le_bytes(bits.try_into().unwrap())) as f64,
                     weight,
                 );
             }
-            StepKind::Sum(SumWiden::F64) => {
-                let mut scratch = [0u8; 16];
-                let bytes = self.loc.native_le_bytes(mb, row, &mut scratch);
-                self.add_float(
-                    f64::from_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
-                    weight,
-                );
+            StepKind::Sum(ScalarKind::F64) | StepKind::SumZero(ScalarKind::F64) => {
+                let bits = self.src.bytes(mb, row);
+                self.add_float(f64::from_bits(u64::from_le_bytes(bits.try_into().unwrap())), weight);
             }
-            // MIN/MAX hold the AVI's MIN-oriented order-preserving encoding
-            // (`encode_ordered`, `for_max=false`), so the extreme test is one
-            // unsigned `u64` compare — the U64-unsigned and float-total-order
-            // rules live solely in the codec, never duplicated here. The encoded
-            // extreme is decoded back to native bits at emit (`get_value_bits`).
-            // Only order-encodable types reach here: `Accumulator::new` refuses
-            // to build an `Extreme` over anything else, so `encode_ordered`'s
-            // unreachable arm is genuinely unreachable.
-            StepKind::Extreme { .. } => {
-                let mut scratch = [0u8; 16];
-                let bytes = self.loc.native_le_bytes(mb, row, &mut scratch);
-                let enc = super::avi::encode_ordered(bytes, self.tc, false);
-                if first || self.extreme_replaces(enc) {
-                    self.acc = enc as i64;
-                }
+            StepKind::Extreme { max, kind } => {
+                // The arm ignores `weight` beyond its sign: an extreme is a
+                // property of which rows are present, and a retraction makes it
+                // recede in a way no compare can express — so both callers walk
+                // only positive rows and hand a receding extreme to the AVI.
+                debug_assert!(weight > 0, "an extreme accumulator must only see positive weights");
+                self.fold_extreme(max, self.src.order_bits(mb, row, kind));
             }
-            StepKind::Count | StepKind::CountNonNull => unreachable!("handled by early return above"),
         }
     }
 
-    /// Count one row at `weight` — the shared body of the two count arms.
+    /// Fold this aggregate's previously-emitted output value back in — the
+    /// `new = old + Σdelta` seed on a linear aggregate, and the `combine(old,
+    /// pos)` fold on the AVI probe-skip path. A NULL old value contributes
+    /// nothing: folding its zero bytes would decode NULL as 0.
+    pub(super) fn fold_stored(&mut self, out_row: &impl RowSource, row: usize) {
+        if self.out.is_null(out_row, row) {
+            return;
+        }
+        match self.kind {
+            // Branch on the *source* type, not the output column's: a float
+            // SumZero's column is labelled I64 while the accumulator holds `f64`
+            // bits, and both ends of this round trip read the source.
+            StepKind::Sum(k) | StepKind::SumZero(k) if k.is_float() => {
+                let cur = f64::from_bits(self.acc as u64);
+                self.acc = f64::to_bits(cur + f64::from_bits(self.stored_u64(out_row, row))) as i64;
+                self.has_value = true;
+            }
+            StepKind::Count | StepKind::CountNonNull | StepKind::Sum(_) | StepKind::SumZero(_) => {
+                self.acc = self.acc.wrapping_add(self.stored_u64(out_row, row) as i64);
+                self.has_value = true;
+            }
+            StepKind::Extreme { max, kind } => {
+                // `agg_output_type(Min|Max, src) == src` for every integer
+                // source, so the stored column is in the accumulator's own
+                // domain and re-encoding it is exact. A float source's output
+                // widens to F64 and always probes instead.
+                debug_assert!(
+                    !kind.is_float(),
+                    "a float extreme is never folded from its output column"
+                );
+                self.fold_extreme(max, self.out.order_bits(out_row, row, kind));
+            }
+        }
+    }
+
+    /// The stored output value as one 8-byte slot. Total for the linear kinds:
+    /// `Accumulator::new` asserts their output column's width.
     #[inline]
-    fn count(&mut self, weight: i64) {
-        self.acc = self.acc.wrapping_add(weight);
-        self.has_value = true;
+    fn stored_u64(&self, out_row: &impl RowSource, row: usize) -> u64 {
+        u64::from_le_bytes(self.out.bytes(out_row, row).try_into().unwrap())
     }
 
     /// Accumulate `v * weight` into the float slot (the accumulator holds
@@ -327,149 +302,8 @@ impl Accumulator {
     fn add_float(&mut self, v: f64, weight: i64) {
         let cur = f64::from_bits(self.acc as u64);
         self.acc = f64::to_bits(cur + v * weight as f64) as i64;
+        self.has_value = true;
     }
-
-    /// Fold a stored linear aggregate value (read back from `trace_out`) into
-    /// this accumulator at weight +1 — the `new = old + Σdelta` seed on
-    /// `op_reduce`'s linear paths. Only ever reached for the linear COUNT/SUM
-    /// family: `fold_old_aggs` skips the non-linear MIN/MAX (whose extreme the
-    /// AVI owns and overwrites), so those arms are unreachable. COUNT must
-    /// integer-fold even over a float source column, so the COUNT-vs-SUM split is
-    /// load-bearing — it cannot collapse to a single `is_float` branch.
-    pub(super) fn merge_accumulated(&mut self, value_bits: u64) {
-        match self.agg_op {
-            AggFunc::Count | AggFunc::CountNonNull => {
-                self.acc = self.acc.wrapping_add(value_bits as i64);
-                self.has_value = true;
-            }
-            AggFunc::Sum | AggFunc::SumZero => {
-                if self.is_float() {
-                    let cur_f = f64::from_bits(self.acc as u64);
-                    self.acc = f64::to_bits(cur_f + f64::from_bits(value_bits)) as i64;
-                } else {
-                    self.acc = self.acc.wrapping_add(value_bits as i64);
-                }
-                self.has_value = true;
-            }
-            AggFunc::Min | AggFunc::Max => {
-                unreachable!("fold_old_aggs folds only linear aggregates")
-            }
-        }
-    }
-}
-
-/// Reconstruct the 8-byte `i64` accumulator bits from an emitted agg column.
-///
-/// `bytes.len()` is the *output* column width. An 8-byte column (SUM, COUNT,
-/// `I64`/`U64`/`F64` — including a float MIN/MAX, which widens to `F64` and
-/// stores the `f64::to_bits` value even for an `F32` source) holds the raw
-/// accumulator bits verbatim. A narrow (<8-byte) column is only ever a
-/// narrow-integer MIN/MAX value; [`FixedInt::decode_le_i64`] sign/zero-extends
-/// it back into the slot exactly as the load path produced it — the same
-/// widening [`SumWiden::Int`] applies, so the two directions cannot drift.
-///
-/// Width-gating (not a source-type dispatch) is load-bearing: a float MIN/MAX
-/// stores `F64` bits under an `F32` source type, and COUNT can carry a
-/// non-integer source type (e.g. `COUNT(uuid_col)` → `UUID`) — either
-/// would mis-decode or trip the `expect` below if dispatched on the source type.
-/// The narrow branch is reached only for narrow integers, where the widening is
-/// exactly right.
-pub(super) fn readback_agg_bits(bytes: &[u8], src_tc: TypeCode) -> u64 {
-    if bytes.len() == 8 {
-        u64::from_le_bytes(bytes.try_into().unwrap())
-    } else {
-        FixedInt::from_type_code(src_tc)
-            .expect("a narrow agg output column is always a narrow-integer MIN/MAX")
-            .decode_le_i64(bytes) as u64
-    }
-}
-
-/// Fold the old aggregate values stored in `cursor`'s current row into `accs`
-/// at weight +1 — the `new = old + delta` step on `op_reduce`'s linear fast path,
-/// reused in the combined-index path to fold a mixed reduce's linear companions.
-///
-/// A NULL old aggregate contributes nothing: folding its zero bytes would
-/// saturate `has_value`, decoding NULL as 0. The aggregates are the trailing
-/// output columns (`build_reduce_output_schema` appends them last), so `cbase`
-/// (first agg column index) addresses each value and — via `col_is_null`'s
-/// logical→payload mapping — its null bit at any PK arity.
-///
-/// Non-linear (MIN/MAX) accumulators are skipped: the combined AVI owns each
-/// extreme and `apply_agg_from_value_index` *overwrites* the accumulator after
-/// this fold (or resets it on an empty seek), so folding the old extreme here
-/// would be discarded regardless. The skip just avoids a wasted `trace_out`
-/// read + fold per non-linear aggregate, and documents that the AVI —
-/// never the fold — owns the non-linear value. The all-linear caller never
-/// skips (every accumulator is linear).
-pub(super) fn fold_old_aggs(accs: &mut [Accumulator], cursor: &ReadCursor, agg_col_widths: &[usize], cbase: usize) {
-    for (k, acc) in accs.iter_mut().enumerate() {
-        // Linearity and the source type are already resolved on the
-        // accumulator; re-reading them off the descriptor would be a second
-        // derivation of the same two facts, per aggregate per group.
-        if !acc.is_linear() {
-            continue;
-        }
-        if cursor.col_is_null(cbase + k) {
-            continue;
-        }
-        if let Some(bytes) = cursor.col_bytes(cbase + k, agg_col_widths[k]) {
-            acc.merge_accumulated(readback_agg_bits(bytes, acc.type_code()));
-        }
-    }
-}
-
-/// The stored integer MIN/MAX value in the trace_out row's agg column as its
-/// MIN-oriented encoding, or `None` if the null bit is set (a previously all-NULL
-/// group). Integer sources only — a float MIN/MAX always probes — so the output
-/// slot is native-LE at the source width and `encode_ordered` is exact and
-/// bijective: no F32→F64 rescale, no NaN payload to lose. `c_idx` is the agg
-/// column's logical index (its null bit is resolved through `col_is_null`), `cw`
-/// its output width (= source width for integers).
-pub(super) fn read_old_minmax_encoded(cursor: &ReadCursor, c_idx: usize, cw: usize, src_tc: TypeCode) -> Option<u64> {
-    debug_assert!(
-        !src_tc.is_float(),
-        "read_old_minmax_encoded called on a float aggregate (float MIN/MAX always probes)",
-    );
-    if cursor.col_is_null(c_idx) {
-        return None;
-    }
-    let bytes = cursor.col_bytes(c_idx, cw)?;
-    Some(super::avi::encode_ordered(bytes, src_tc, false))
-}
-
-// ---------------------------------------------------------------------------
-// AVI lookup
-// ---------------------------------------------------------------------------
-
-/// Seek the AVI cursor to a group via its full byte-form seek prefix and seed the
-/// accumulator with the group's MIN-oriented order-encoded extreme (decoded back
-/// to a native value later, at emit, in `get_value_bits`).
-///
-/// `group_key` is the opaque seek prefix `group_cols ‖ ordinal` — the caller
-/// appends the one-byte per-aggregate ordinal so a single combined index can
-/// serve several MIN/MAX of the same group without collision. The full AVI PK is
-/// `group_cols ‖ ordinal ‖ av_encoded(8)`, ordered group-major, then by ordinal,
-/// then by value, so the first positive-weight entry whose key starts with
-/// `group_key` is the extremal value for that group+aggregate, and the prefix
-/// match confirms the row belongs to this exact group (no hash, so no collision).
-pub(super) fn apply_agg_from_value_index(
-    avi_cursor: &mut ReadCursor,
-    group_key: &[u8],
-    for_max: bool,
-    acc: &mut Accumulator,
-) -> bool {
-    if avi_cursor.seek_first_positive_with_prefix(group_key) {
-        // `current_pk_bytes` is the full AVI PK region; the bake laid the entry
-        // out and is what reads the value back out of it.
-        let av = AviBake::av_of(avi_cursor.current_pk_bytes(), group_key.len());
-        // The AVI stores `encode_ordered(v, for_max)`; the accumulator holds the
-        // MIN-oriented encoding, so undo the MAX inversion (no value decode — that
-        // happens once, at emit, in `get_value_bits`).
-        acc.seed_from_raw_bits(if for_max { !av } else { av });
-        return true;
-    }
-    acc.reset();
-    false
 }
 
 #[cfg(test)]

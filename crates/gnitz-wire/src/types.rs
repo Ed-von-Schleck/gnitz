@@ -696,14 +696,18 @@ impl FixedInt {
         (v as u128) & (u128::MAX >> (128 - 8 * self.width()))
     }
 
+    /// Whether this integer type is signed. The order-preserving encoders flip
+    /// the top bit for these, so two's-complement negatives sort below
+    /// non-negatives; [`ScalarKind::order_inverse`] flips it back.
+    #[inline(always)]
+    pub const fn is_signed(self) -> bool {
+        matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64)
+    }
+
     /// Decode the leading `width()` little-endian bytes of `b` as this integer,
     /// sign- or zero-extended into `i64`. Total: every arm is a real ≤8-byte
     /// integer with a pinned width, so `try_into` cannot fail.
-    ///
-    /// `#[inline]` so the MIR is exported: the sibling constructors/accessors are
-    /// `const fn` (implicitly exportable), this one is not, so without the hint it
-    /// is an out-of-line cross-crate call even for the engine's per-row SUM.
-    #[inline]
+    #[inline(always)]
     pub fn decode_le_i64(self, b: &[u8]) -> i64 {
         debug_assert!(b.len() >= self.width());
         match self {
@@ -718,6 +722,130 @@ impl FixedInt {
         }
     }
 }
+
+/// The ≤8-byte scalar register image of a column type: the domain on which
+/// "read these native-LE bytes as a number" is total. THE shared rule — the SQL
+/// binder's cast and aggregate gates and the engine's reduce kernel and value
+/// index all resolve a column through it, so they cannot disagree about one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarKind {
+    Int(FixedInt),
+    F32,
+    F64,
+}
+
+impl ScalarKind {
+    /// Exhaustive over `TypeCode` (no `_` arm), so a new variant is a compile
+    /// error here until someone decides whether it has a scalar image.
+    pub const fn from_type_code(tc: TypeCode) -> Option<Self> {
+        match tc {
+            TypeCode::F32 => Some(Self::F32),
+            TypeCode::F64 => Some(Self::F64),
+            TypeCode::U8 => Some(Self::Int(FixedInt::U8)),
+            TypeCode::I8 => Some(Self::Int(FixedInt::I8)),
+            TypeCode::U16 => Some(Self::Int(FixedInt::U16)),
+            TypeCode::I16 => Some(Self::Int(FixedInt::I16)),
+            TypeCode::U32 => Some(Self::Int(FixedInt::U32)),
+            TypeCode::I32 => Some(Self::Int(FixedInt::I32)),
+            TypeCode::U64 => Some(Self::Int(FixedInt::U64)),
+            TypeCode::I64 => Some(Self::Int(FixedInt::I64)),
+            TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128 => None,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn is_float(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
+    }
+
+    /// Inverse of `ColumnLocator::order_bits`: the value's own little-endian bits
+    /// back out of the order image — IEEE bits at the source's own width for a
+    /// float, the sign- or zero-extended integer otherwise.
+    #[inline(always)]
+    pub fn order_inverse(self, e: u64) -> u64 {
+        match self {
+            // The forward direction xors the same bit, so signed round-trips and
+            // unsigned is the identity.
+            Self::Int(fi) => e ^ ((fi.is_signed() as u64) << 63),
+            Self::F32 => ieee_order_bits_f32_reverse(e) as u64,
+            Self::F64 => ieee_order_bits_reverse(e),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Order-preserving float image: `ColumnLocator::order_bits` encodes a float
+// through the forward half, `ScalarKind::order_inverse` undoes it with the reverse.
+// ---------------------------------------------------------------------------
+
+/// IEEE 754 order-preserving encoding of an `f64`'s raw bits: negatives invert
+/// wholly, non-negatives flip the sign bit, so plain unsigned order over the
+/// result is `total_cmp` order.
+#[inline(always)]
+pub fn ieee_order_bits(raw_bits: u64) -> u64 {
+    if raw_bits >> 63 != 0 {
+        !raw_bits
+    } else {
+        raw_bits ^ (1u64 << 63)
+    }
+}
+
+/// [`ieee_order_bits`] for 32-bit floats, returning u64. Checks the F32 sign bit
+/// (bit 31), not bit 63.
+#[inline(always)]
+pub fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
+    (if raw_bits >> 31 != 0 {
+        !raw_bits
+    } else {
+        raw_bits ^ (1u32 << 31)
+    }) as u64
+}
+
+/// Reverse of [`ieee_order_bits`].
+#[inline(always)]
+fn ieee_order_bits_reverse(encoded: u64) -> u64 {
+    if encoded >> 63 != 0 {
+        encoded ^ (1u64 << 63)
+    } else {
+        !encoded
+    }
+}
+
+/// Reverse of [`ieee_order_bits_f32`].
+#[inline(always)]
+fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
+    let e = encoded as u32;
+    if e >> 31 != 0 {
+        e ^ (1u32 << 31)
+    } else {
+        !e
+    }
+}
+
+// `ScalarKind` and `FixedInt` each spell their own exhaustive `TypeCode` match,
+// so a new variant must be classified in both — this holds their answers equal
+// rather than leaving it to whoever adds one.
+const _: () = {
+    let mut i = 0;
+    while i < TypeCode::ALL.len() {
+        let tc = TypeCode::ALL[i];
+        let kind = ScalarKind::from_type_code(tc);
+        match FixedInt::from_type_code(tc) {
+            Some(fi) => {
+                assert!(matches!(kind, Some(ScalarKind::Int(_))), "a FixedInt has an Int image");
+                assert!(
+                    fi.is_signed() == is_signed_int(tc as u8),
+                    "FixedInt::is_signed must match the raw-code predicate"
+                );
+            }
+            None => assert!(
+                kind.is_some() == tc.is_float(),
+                "a non-FixedInt has a scalar image iff it is a float"
+            ),
+        }
+        i += 1;
+    }
+};
 
 /// The width policy behind [`TypeCode::reindex_output_type`] and
 /// [`resolve_reindex_type`], which are what every external consumer calls. See

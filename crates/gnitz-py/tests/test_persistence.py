@@ -1963,3 +1963,80 @@ def test_checkpoint_cut_plus_changed_count_tail(own_server):
     assert {r["pk"] for r in rows} == set(range(1, 11))
     assert all(r["val"] == r["pk"] * 10 for r in rows)
     conn.close()
+
+
+def test_min_max_view_survives_restart_across_source_types(own_server):
+    """MIN/MAX is the one aggregate whose value lives in a secondary index rather
+    than the output row: the AVI stores an order-preserving image, and a resumed
+    view must decode back to the same value it emitted before the restart. One
+    column per shape the image has an arm for — a signed narrow int (sign-flipped),
+    a full-width unsigned (identity), and both float widths (`total_cmp` order,
+    with F32 widening to an F64 output column)."""
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    conn.create_schema("mmr")
+    conn.execute_sql(
+        "CREATE TABLE t ("
+        "  pk BIGINT NOT NULL PRIMARY KEY,"
+        "  grp BIGINT NOT NULL,"
+        "  i32 INT NOT NULL,"
+        "  u64 BIGINT UNSIGNED NOT NULL,"
+        "  f32 REAL NOT NULL,"
+        "  f64 DOUBLE NOT NULL"
+        ")",
+        schema_name="mmr")
+    conn.execute_sql(
+        "CREATE VIEW v AS SELECT grp,"
+        "  MIN(i32) AS i32_lo, MAX(i32) AS i32_hi,"
+        "  MIN(u64) AS u64_lo, MAX(u64) AS u64_hi,"
+        "  MIN(f32) AS f32_lo, MAX(f32) AS f32_hi,"
+        "  MIN(f64) AS f64_lo, MAX(f64) AS f64_hi"
+        " FROM t GROUP BY grp",
+        schema_name="mmr")
+    # Values chosen so a byte-swap, a missing sign flip or a signed read of the
+    # unsigned column each move the extremum: the U64 high-bit value is the max
+    # only under unsigned order, and the negative I32 the min only under signed.
+    conn.execute_sql(
+        "INSERT INTO t VALUES"
+        "  (1, 7, -2147483648, 1, -2.25, -2.25),"
+        "  (2, 7, 256, 9223372036854775809, 1.5, 1.5),"
+        "  (3, 7, 100000, 256, 4.0, 4.0)",
+        schema_name="mmr")
+
+    expected = {
+        "i32_lo": -2147483648, "i32_hi": 100000,
+        "u64_lo": 1, "u64_hi": 9223372036854775809,
+        "f32_lo": -2.25, "f32_hi": 4.0,
+        "f64_lo": -2.25, "f64_hi": 4.0,
+    }
+
+    def check(rows, when):
+        assert len(rows) == 1, f"{when}: one group, got {len(rows)}"
+        for col, want in expected.items():
+            got = rows[0][col]
+            if isinstance(want, float):
+                assert abs(got - want) < 1e-6, f"{when}: {col} = {got}, want {want}"
+            else:
+                assert got == want, f"{when}: {col} = {got}, want {want}"
+
+    vid, _ = conn.resolve_table("mmr", "v")
+    check(list(conn.scan(vid)), "pre-restart")
+    conn.close()
+
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
+    vid2, _ = conn.resolve_table("mmr", "v")
+    check(list(conn.scan(vid2)), "post-restart")
+
+    # A retraction after the restart is what forces the resumed view back through
+    # the index: the extremum recedes to the next stored value rather than to the
+    # delta's own.
+    conn.execute_sql("DELETE FROM t WHERE pk = 1", schema_name="mmr")
+    rows = list(conn.scan(vid2))
+    assert len(rows) == 1
+    assert rows[0]["i32_lo"] == 256, f"MIN(i32) must recede to 256, got {rows[0]['i32_lo']}"
+    assert rows[0]["u64_lo"] == 256, f"MIN(u64) must recede to 256, got {rows[0]['u64_lo']}"
+    assert abs(rows[0]["f32_lo"] - 1.5) < 1e-6, f"MIN(f32) must recede to 1.5, got {rows[0]['f32_lo']}"
+    assert abs(rows[0]["f64_lo"] - 1.5) < 1e-6, f"MIN(f64) must recede to 1.5, got {rows[0]['f64_lo']}"
+    conn.close()

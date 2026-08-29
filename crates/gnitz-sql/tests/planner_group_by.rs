@@ -282,10 +282,10 @@ fn test_min_uuid_rejected() {
 }
 
 /// A GROUP BY over a cross-sign `U64 = I64` join view aggregates its `_join_pk`,
-/// which is the signed-128 type `I128`. A 16-byte value cannot be order-encoded
-/// into the AVI slot or accumulated in the 64-bit aggregate slot, so MIN/MAX/SUM/
-/// AVG over it must be rejected cleanly at bind time — this guards the engine's
-/// `SumWiden::for_type(I128)` / `encode_ordered(I128)` `unreachable!` panics.
+/// which is the signed-128 type `I128`. It has no scalar register image
+/// (`ScalarKind::from_type_code(I128)` is `None`), so MIN/MAX/SUM/AVG over it
+/// must be rejected cleanly at bind time rather than reaching the engine, where
+/// the reduce plan would refuse to compile.
 #[test]
 fn test_agg_i128_join_pk_rejected() {
     let srv = match ServerHandle::start() {

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use super::agg::AggDescriptor;
 use super::avi::{avi_batch, op_populate_avi, AviBake};
+use super::plan::ReducePlan;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
 use crate::storage::{Batch, RecoverySource, Table};
 use crate::test_support::{bench_time, bench_time_each};
@@ -64,6 +65,20 @@ fn build_input(schema: &SchemaDescriptor) -> Batch {
     b
 }
 
+/// The production bake for `MIN(val) GROUP BY grp`, reached the way the compiler
+/// reaches it — through the plan that owns the accumulators the bake reads.
+fn min_bake(schema: &SchemaDescriptor) -> AviBake {
+    let group = [1u32];
+    let aggs = [AggDescriptor {
+        col_idx: 2,
+        agg_op: AggFunc::Min,
+    }];
+    ReducePlan::new(schema, &group, &aggs, schema.reduce_out_key(&group), false, false)
+        .unwrap()
+        .avi
+        .expect("a MIN reduce is value-indexed")
+}
+
 fn ns_per_row(elapsed: Duration) -> f64 {
     elapsed.as_nanos() as f64 / (N_ROWS * ITERS) as f64
 }
@@ -87,14 +102,7 @@ fn report(index: &str, population: Duration, sort: Duration, full: Duration) {
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn secondary_index_bench_avi_decomposition() {
     let schema = src_schema();
-    let bake = AviBake::new(
-        &schema,
-        &[1u32],
-        &[AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Min,
-        }],
-    );
+    let bake = min_bake(&schema);
     let avi_schema = bake.schema;
     let input = build_input(&schema);
     let tmp = tempfile::tempdir().unwrap();

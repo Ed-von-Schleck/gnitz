@@ -6,81 +6,23 @@
 //! ingest — that batch's own sort-and-consolidate plus a memtable push — on top
 //! of the reduce's own group sort. `MIN(a), MAX(a), MIN(b)` triples it.
 
-use crate::schema::key::{
-    ieee_order_bits, ieee_order_bits_f32, ieee_order_bits_f32_reverse, ieee_order_bits_reverse, ReindexPacker,
-};
-use crate::schema::{type_code, ColumnLocator, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
-use crate::storage::{Batch, Table};
+use crate::schema::key::ReindexPacker;
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
+use crate::storage::{Batch, ReadCursor, Table};
 use gnitz_expr::RowSource;
-use gnitz_wire::AggFunc;
 
-use super::agg::AggDescriptor;
+use super::agg::{Accumulator, ExtremeSpec};
 
-// ---------------------------------------------------------------------------
-// Order-preserving aggregate-value codec
-// ---------------------------------------------------------------------------
-//
-// `encode_ordered` and `decode_ordered` are mutual inverses; `tests/avi.rs`
-// round-trips every encodable type against `gnitz_wire::cmp_typed_le`.
-
-/// The value set [`encode_ordered`] has an arm for: a narrow (<=8B) fixed int or
-/// float. Canonical predicates rather than a negative variant list, so a future
-/// `TypeCode` is ineligible by default until classified — and every producer of
-/// an order-encoded value asserts it, so the `unreachable!` arms below stay so.
-pub(super) fn agg_value_idx_eligible(tc: TypeCode) -> bool {
-    gnitz_wire::is_fixed_int(tc as u8) || tc.is_float()
-}
-
-/// Order-preserving u64 encoding of a fixed-width aggregate value held in
-/// `bytes` (native little-endian). A PK aggregate column's at-rest bytes are
-/// the OPK window (big-endian, sign-flipped) — callers read them through
-/// `ColumnLocator::native_le_bytes`, so a PK aggregate column encodes
-/// identically to the same value in a payload column. `for_max` inverts
-/// the order so the cursor's ascending walk yields the maximum first. Width is
-/// ≤ 8 (F32 is 4); U128/UUID/String/Blob are excluded upstream by
-/// [`agg_value_idx_eligible`].
+/// The index's value image for one aggregate's column in `row`: the column's
+/// order-preserving image, inverted for a MAX ordinal so the index's ascending
+/// walk yields that ordinal's extreme first.
 #[inline]
-pub(super) fn encode_ordered(bytes: &[u8], col_type_code: TypeCode, for_max: bool) -> u64 {
-    let val = match col_type_code {
-        TypeCode::F32 => ieee_order_bits_f32(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
-        TypeCode::F64 => ieee_order_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
-        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => gnitz_wire::read_unsigned_exact(bytes),
-        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-            (gnitz_wire::read_signed_exact(bytes) as u64).wrapping_add(1u64 << 63)
-        }
-        TypeCode::String | TypeCode::Blob | TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => unreachable!(
-            "AVI agg type {col_type_code:?} is not order-encodable (compile-rejected by \
-             agg_value_idx_eligible)"
-        ),
-    };
-    if for_max {
-        !val
+fn av_encode(spec: &ExtremeSpec, src: &impl RowSource, row: usize) -> u64 {
+    let v = spec.loc.order_bits(src, row, spec.kind);
+    if spec.for_max {
+        !v
     } else {
-        val
-    }
-}
-
-/// Inverse of [`encode_ordered`] at `for_max == false`: recover the original
-/// value's raw little-endian bits (IEEE bits for floats, two's-complement for
-/// signed, the value itself for unsigned). A `for_max` key is un-inverted by its
-/// reader before it gets here.
-#[inline]
-pub(super) fn decode_ordered(e: u64, col_type_code: TypeCode) -> u64 {
-    match col_type_code {
-        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => (e as i64).wrapping_sub(1i64 << 63) as u64,
-        TypeCode::F64 => ieee_order_bits_reverse(e),
-        TypeCode::F32 => {
-            // The accumulator and the reduce output column are F64; promote the
-            // recovered F32 to F64 bits so the AVI seed matches the
-            // step_from_batch path.
-            let f32_bits = ieee_order_bits_f32_reverse(e);
-            f64::to_bits(f32::from_bits(f32_bits) as f64)
-        }
-        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => e,
-        TypeCode::String | TypeCode::Blob | TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => unreachable!(
-            "AVI agg type {col_type_code:?} is not order-encodable (compile-rejected by \
-             agg_value_idx_eligible)"
-        ),
+        v
     }
 }
 
@@ -93,7 +35,7 @@ pub(super) fn decode_ordered(e: u64, col_type_code: TypeCode) -> u64 {
 /// `MIN(a)` and `MAX(a)` coexist with no collision, and within an ordinal the
 /// `for_max` encoding sorts the extreme first.
 const ORDINAL_COL: SchemaColumn = SchemaColumn::new(type_code::U8, 0);
-/// The order-encoded aggregate value: [`encode_ordered`] always emits a `u64`.
+/// The order-encoded aggregate value: [`av_encode`] always emits a `u64`.
 const VALUE_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
 /// What the AVI appends behind a group key. The schema pushes exactly this, and
 /// it is also the reservation `new_group_key` packs the group key inside — so
@@ -112,17 +54,17 @@ const _: () = assert!(ORDINAL_BYTES == 1 && VALUE_BYTES == 8);
 /// One value-indexed aggregate. Its position in [`AviBake::aggs`] is the ordinal
 /// written into the key, so the write loop and `op_reduce`'s probe walk index one
 /// list instead of each rebuilding the ordinal from a predicate.
-///
-/// `loc`, `tc` and `for_max` are write-side hoists — measured: LLVM lifts neither
-/// `TypeCode::from_validated_u8` nor the `AggFunc` compare out of the
-/// (row × aggregate) loop. They are reachable only from this file; the read side
-/// gets [`AviBake::acc_indices`] and reads direction and type off the accumulator.
 struct AviAgg {
     /// The reduce's own aggregate position — the accumulator this ordinal serves.
     acc_idx: u8,
-    loc: ColumnLocator,
-    tc: TypeCode,
-    for_max: bool,
+    /// Where and how this ordinal reads its value. A write-side hoist, measured:
+    /// LLVM lifts neither the type resolve nor the direction test out of the
+    /// (row × aggregate) loop.
+    spec: ExtremeSpec,
+    /// Whether this ordinal's extreme may be folded off the stored output column
+    /// instead of probed. Integer sources only — a float always probes, its
+    /// pre-step cost never having been weighed against the seek it would save.
+    trace_foldable: bool,
 }
 
 /// The AVI resources a reduce's `ReducePlan` carries, baked once at compile time.
@@ -132,15 +74,15 @@ pub(crate) struct AviBake {
     /// group set has a key and no reduce is left rescanning its trace.
     key_packer: ReindexPacker,
     pub(crate) schema: SchemaDescriptor,
-    /// The value-indexed aggregates in descriptor order; entry `j` is ordinal `j`.
+    /// The value-indexed aggregates in accumulator order; entry `j` is ordinal `j`.
     aggs: Vec<AviAgg>,
 }
 
 impl AviBake {
-    /// Takes the reduce's *whole* descriptor list and applies the value-index
-    /// selection itself, so the ordinal order has one spelling. The index schema
-    /// is the key packer's own key columns then [`SUFFIX`], all PK, no payload.
-    pub(super) fn new(src: &SchemaDescriptor, group_by_cols: &[u32], aggs: &[AggDescriptor]) -> Self {
+    /// Applies the value-index selection to the reduce's *whole* accumulator set
+    /// itself, so the ordinal order has one spelling. The index schema is the key
+    /// packer's own key columns then [`SUFFIX`], all PK, no payload.
+    pub(super) fn new(src: &SchemaDescriptor, group_by_cols: &[u32], accs: &[Accumulator]) -> Self {
         let key_packer = ReindexPacker::new_group_key(src, group_by_cols, &SUFFIX);
         let mut b = crate::schema::DerivedSchema::new();
         for c in key_packer.key_columns().chain(SUFFIX) {
@@ -150,39 +92,32 @@ impl AviBake {
         AviBake {
             schema: b.finish(),
             key_packer,
-            aggs: aggs
+            aggs: accs
                 .iter()
                 .enumerate()
-                .filter(|(_, d)| d.agg_op.uses_value_index())
-                .map(|(k, d)| {
-                    let loc = src.locate(d.col_idx as usize);
-                    let tc = TypeCode::from_validated_u8(loc.type_code());
-                    // Bound to this construction rather than to the caller having
-                    // built the accumulators first: an ineligible type would reach
-                    // `encode_ordered`'s unreachable arms one row into the tick.
-                    assert!(agg_value_idx_eligible(tc), "MIN/MAX over a non-order-encodable column");
-                    AviAgg {
+                .filter_map(|(k, acc)| {
+                    let spec = acc.extreme_index_spec()?;
+                    Some(AviAgg {
                         acc_idx: k as u8,
-                        loc,
-                        tc,
-                        for_max: d.agg_op == AggFunc::Max,
-                    }
+                        trace_foldable: !spec.kind.is_float(),
+                        spec,
+                    })
                 })
                 .collect(),
         }
     }
 
-    /// Whether any value-indexed aggregate reads an integer column — the only
-    /// kind the probe-skip path can pre-step, since a float extreme always
-    /// probes.
-    pub(super) fn has_integer_extreme(&self) -> bool {
-        self.aggs.iter().any(|a| !a.tc.is_float())
+    /// Whether any ordinal can take the probe-skip path — the gate on
+    /// pre-stepping MIN/MAX accumulators during the group walk.
+    pub(super) fn any_trace_foldable(&self) -> bool {
+        self.aggs.iter().any(|a| a.trace_foldable)
     }
 
-    /// The accumulator each ordinal serves, in ordinal order.
+    /// Each ordinal's accumulator index and its [`AviAgg::trace_foldable`] bit,
+    /// in ordinal order.
     #[inline]
-    pub(super) fn acc_indices(&self) -> impl Iterator<Item = usize> + '_ {
-        self.aggs.iter().map(|a| a.acc_idx as usize)
+    pub(super) fn acc_indices(&self) -> impl Iterator<Item = (usize, bool)> + '_ {
+        self.aggs.iter().map(|a| (a.acc_idx as usize, a.trace_foldable))
     }
 
     /// Pack `row`'s group columns into the leading bytes of `buf`. Split from
@@ -214,10 +149,27 @@ impl AviBake {
         &buf[..n + VALUE_BYTES]
     }
 
+    /// Seek ordinal `ord`'s group and seed `acc` with its extreme, or reset `acc`
+    /// on a miss. `key` is a buffer [`Self::pack_group`] has already filled.
+    pub(super) fn seed_extreme(&self, cur: &mut ReadCursor, key: &mut [u8], ord: usize, acc: &mut Accumulator) {
+        let spec = &self.aggs[ord].spec;
+        let prefix = self.prefix(key, ord as u8);
+        if cur.seek_first_positive_with_prefix(prefix) {
+            // Entries sort by (group, ordinal, av) and `av_encode` puts this
+            // ordinal's extreme first, so the first positive entry under the
+            // prefix is it — un-invert back to the MIN-oriented image the
+            // accumulator holds.
+            let av = Self::av_of(cur.current_pk_bytes(), prefix.len());
+            acc.seed_encoded_extreme(if spec.for_max { !av } else { av });
+        } else {
+            acc.reset();
+        }
+    }
+
     /// The encoded value out of a full entry PK, given the prefix length it was
     /// sought by — the read-back half of [`Self::entry`].
     #[inline]
-    pub(super) fn av_of(pk: &[u8], prefix_len: usize) -> u64 {
+    fn av_of(pk: &[u8], prefix_len: usize) -> u64 {
         debug_assert_eq!(
             pk.len(),
             prefix_len + VALUE_BYTES,
@@ -242,7 +194,6 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
     let mut out = Batch::with_capacity(bake.schema, (delta.count * bake.aggs.len()).max(1));
 
     let mut key = [0u8; MAX_PK_BYTES];
-    let mut scratch = [0u8; 16];
     for row in 0..delta.count {
         let weight = mb.get_weight(row);
         // A weight-0 row contributes nothing: consolidation drops the entry it
@@ -257,14 +208,10 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
             // The value column is a non-nullable PK, so a NULL has no encoding:
             // skip the ordinal and let the seek miss (→ MIN/MAX renders NULL).
             // Writing one anyway would key a zeroed value and corrupt the extreme.
-            if a.loc.is_null(&mb, row) {
+            if a.spec.loc.is_null(&mb, row) {
                 continue;
             }
-            // `native_le_bytes` OPK-decodes a PK-source aggregate, so it encodes
-            // identically to the same value in a payload column (and to the
-            // batch-walk accumulator's `step_from_batch`, which reads through the
-            // same accessor).
-            let av = encode_ordered(a.loc.native_le_bytes(&mb, row, &mut scratch), a.tc, a.for_max);
+            let av = av_encode(&a.spec, &mb, row);
             out.push_key_row(bake.entry(&mut key, j as u8, av), weight);
         }
     }

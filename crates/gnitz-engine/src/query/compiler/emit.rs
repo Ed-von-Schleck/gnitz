@@ -1703,12 +1703,10 @@ mod tests {
         );
     }
 
-    /// Every aggregate that decodes its column value needs an order-encodable
-    /// (≤8-byte int/float) scalar: SUM would abort in `SumWiden::for_type` on a
-    /// 16-byte source and silently mis-sum a string, and MIN/MAX would reach
-    /// `encode_ordered`'s `unreachable!` arm and abort a worker at execution. The
-    /// SQL binder rejects these upstream, so this covers the low-level
-    /// `CircuitBuilder` path that bypasses it.
+    /// Every aggregate that decodes its column value needs a scalar register
+    /// image (`ScalarKind`) — the ≤8-byte int/float set. The SQL binder rejects
+    /// the rest upstream, so this covers the low-level `CircuitBuilder` path
+    /// that bypasses it.
     #[test]
     fn test_value_reading_aggregate_over_non_encodable_column_rejected() {
         use crate::schema::ReduceOutKey;
@@ -1735,7 +1733,7 @@ mod tests {
             for tc in [type_code::U128, type_code::STRING] {
                 assert_eq!(
                     mid_node_rejection(schema(tc), reduce(func)),
-                    "reduce: aggregate column is not order-encodable",
+                    "reduce: aggregate column type has no scalar register image",
                     "{func:?} over type code {tc}",
                 );
             }

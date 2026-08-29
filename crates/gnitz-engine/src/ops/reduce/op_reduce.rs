@@ -5,7 +5,7 @@ use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ColumnLocator, ReduceOutKey};
 use crate::storage::{Batch, MemBatch, ReadCursor};
 
-use super::agg::{apply_agg_from_value_index, fold_old_aggs, read_old_minmax_encoded, Accumulator};
+use super::agg::Accumulator;
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::plan::ReducePlan;
 use super::sort::{argsort_delta, argsort_pk_canonical, compare_by_group_cols};
@@ -187,15 +187,6 @@ pub(crate) fn op_reduce(
     let mut raw_output = Batch::with_capacity(*output_schema, if ungrouped { 2 } else { n });
 
     let mut accs: Vec<Accumulator> = plan.acc_template.clone();
-    // Output width of each trailing agg column — the trace read-back offset
-    // stride and slice length before `readback_agg_bits` rebuilds the 8-byte
-    // accumulator (width-gated, so a float MIN/MAX widened to F64 is read
-    // verbatim).
-    let agg_col_widths = &plan.agg_col_widths[..];
-    // First aggregate column's logical index (the aggregates are the trailing
-    // output columns, so this holds at any PK arity). Each aggregate's null bit
-    // is resolved from this logical index via `ReadCursor::col_is_null`.
-    let cbase = plan.cbase;
 
     // A group exists iff its net cardinality (row weight) is positive; the unique
     // AggFunc::Count accumulator carries that signal (baked by `ReducePlan::new`;
@@ -288,13 +279,21 @@ pub(crate) fn op_reduce(
             trace_out_cursor.copy_current_row_into(&mut raw_output, -1);
         }
 
-        // New value calculation. `new = old + delta` for the linear
-        // accumulators: fold the old aggregates straight off the still-positioned
-        // trace cursor (a no-op for a new group). `fold_old_aggs` skips the
-        // non-linear ones — the value index owns each MIN/MAX and overwrites it
-        // below.
-        if has_old {
-            fold_old_aggs(&mut accs, trace_out_cursor, agg_col_widths, cbase);
+        // New value calculation. The group's stored row — this reduce's own last
+        // output for it — stays under the cursor the retraction seek positioned,
+        // so both folds below are column reads rather than seeks.
+        let stored = if has_old {
+            Some(trace_out_cursor.current_row_source())
+        } else {
+            None
+        };
+        // `new = old + delta` for the linear accumulators. The non-linear ones
+        // are skipped: the value index owns each MIN/MAX and the block below
+        // overwrites it, so folding the old extreme here would be discarded.
+        if let Some((stored_row, stored_idx)) = stored {
+            for acc in accs.iter_mut().filter(|a| a.is_linear()) {
+                acc.fold_stored(stored_row, stored_idx);
+            }
         }
         if let Some(bake) = avi {
             let cursor = history
@@ -302,30 +301,20 @@ pub(crate) fn op_reduce(
                 .expect("a value-indexed reduce is handed a cursor over the index its plan describes");
             // Pack the group key once; each ordinal then rewrites only the tail.
             bake.pack_group(&mut gk, &mb, group_start_idx);
-            for (j, k) in bake.acc_indices().enumerate() {
+            // An extreme only recedes on a retraction, so an all-insert group
+            // that stayed under the pre-step cap holds `pos` — its own positive
+            // rows' extreme — and needs no probe.
+            let group_holds_pos = !saw_negative && !capped;
+            for (j, (k, trace_foldable)) in bake.acc_indices().enumerate() {
                 let acc = &mut accs[k];
-                // The source type lives on the accumulator, resolved from the
-                // same locator the index write side read the value through.
-                let src_tc = acc.type_code();
-                // An all-insert integer group with a stored extreme needs no
-                // probe: an extreme only recedes on a retraction, so its new
-                // value is `combine(old, pos)` — `old` under the still-positioned
-                // trace cursor, `pos` pre-stepped in the walk. Everything else
-                // probes, the index being its own source of truth.
-                if saw_negative || src_tc.is_float() || capped || !has_old {
-                    apply_agg_from_value_index(cursor, bake.prefix(&mut gk, j as u8), acc.is_max(), acc);
-                } else if let Some(enc) = read_old_minmax_encoded(
-                    // The accumulator holds `pos` (or is untouched → NULL); fold
-                    // in `old`, read off the trace_out cursor already positioned
-                    // by the `has_old` seek and left in place by `fold_old_aggs`
-                    // above — a column read, not a seek. A NULL `old`
-                    // (previously all-NULL group) folds nothing, leaving `pos`.
-                    trace_out_cursor,
-                    cbase + k,
-                    agg_col_widths[k],
-                    src_tc,
-                ) {
-                    acc.merge_encoded_extreme(enc);
+                match stored {
+                    // `combine(old, pos)`, `old` folded off the stored row. A
+                    // NULL `old` folds nothing, leaving `pos`.
+                    Some((stored_row, stored_idx)) if trace_foldable && group_holds_pos => {
+                        acc.fold_stored(stored_row, stored_idx)
+                    }
+                    // Everything else probes, the index being its own source of truth.
+                    _ => bake.seed_extreme(cursor, &mut gk, j, acc),
                 }
             }
         }

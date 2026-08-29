@@ -17,7 +17,7 @@
 use std::cmp::Ordering;
 
 use gnitz_expr::RowSource;
-use gnitz_wire::{Cut, RangeDescriptor, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{Cut, RangeDescriptor, ScalarKind, NARROW_PK_MAX_BYTES};
 
 use crate::foundation::xxh::{self, RowHasher};
 use crate::schema::{
@@ -878,53 +878,6 @@ pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: us
 }
 
 // ---------------------------------------------------------------------------
-// Order-preserving float image — each pair must stay mutual inverses: the AVI
-// value codec (`ops::reduce::avi`) encodes through the forward half, decodes through
-// the reverse one.
-// ---------------------------------------------------------------------------
-
-#[inline]
-pub(crate) fn ieee_order_bits(raw_bits: u64) -> u64 {
-    if raw_bits >> 63 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u64 << 63)
-    }
-}
-
-/// IEEE 754 order-preserving encoding for 32-bit floats, returning u64.
-/// Checks the F32 sign bit (bit 31), not bit 63.
-#[inline]
-pub(crate) fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
-    (if raw_bits >> 31 != 0 {
-        !raw_bits
-    } else {
-        raw_bits ^ (1u32 << 31)
-    }) as u64
-}
-
-/// Reverse of [`ieee_order_bits`].
-#[inline]
-pub(crate) fn ieee_order_bits_reverse(encoded: u64) -> u64 {
-    if encoded >> 63 != 0 {
-        encoded ^ (1u64 << 63)
-    } else {
-        !encoded
-    }
-}
-
-/// Reverse of [`ieee_order_bits_f32`].
-#[inline]
-pub(crate) fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
-    let e = encoded as u32;
-    if e >> 31 != 0 {
-        e ^ (1u32 << 31)
-    } else {
-        !e
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Row-content key material — the hashed key bytes, for the slots no scalar OPK
 // encode can produce: a string column's content and the group key's fold slot.
 // ---------------------------------------------------------------------------
@@ -1128,10 +1081,11 @@ enum PromoteKind {
     /// packed column *i* is NULL. Written by `pack_into` after the slot loop,
     /// from the NULL tests that loop already performs.
     Bitmap,
-    /// Group-key float slot: the `ieee_order_bits` image, big-endian in a `U64`
-    /// slot. Order-preserving where the raw bits are not, and matching the
-    /// `total_cmp` order the group comparator uses.
-    Float(ColumnLocator),
+    /// Group-key float slot: the column's `order_bits` image, big-endian in a
+    /// `U64` slot — order-preserving where the raw bits are not, matching the
+    /// `total_cmp` order the group comparator uses. Carries the column's own
+    /// [`ScalarKind`] so the per-row pack re-derives nothing.
+    Float(ColumnLocator, ScalarKind),
     /// Group-key overflow fold (one trailing `U128` slot): the 128-bit hash of
     /// every group column past the packed prefix — [`ReindexPacker::folded`].
     Fold,
@@ -1313,10 +1267,9 @@ impl ReindexPacker {
         }
         for (i, &(tc, nullable)) in descs[..layout.n_packed].iter().enumerate() {
             let loc = schema.locate(group_cols[i] as usize);
-            let kind = if TypeCode::from_validated_u8(tc).is_float() {
-                PromoteKind::Float(loc)
-            } else {
-                classify_promote(loc)
+            let kind = match ScalarKind::from_type_code(TypeCode::from_validated_u8(tc)) {
+                Some(sk) if sk.is_float() => PromoteKind::Float(loc, sk),
+                _ => classify_promote(loc),
             };
             cols[slot] = ColPromoter::new(layout.slots[slot], nullable, kind);
             slot += 1;
@@ -1350,7 +1303,7 @@ impl ReindexPacker {
                 // A NULL packed column: zeroed slot, and its bit in the bitmap.
                 // `nullable` implies the bitmap exists and is slot 0, so this
                 // slot's packed index is `i - 1`.
-                PromoteKind::Col(loc) | PromoteKind::String(loc) | PromoteKind::Float(loc)
+                PromoteKind::Col(loc) | PromoteKind::String(loc) | PromoteKind::Float(loc, _)
                     if cp.nullable && loc.is_null_word(null_word) =>
                 {
                     null_bits |= 1 << (i - 1);
@@ -1362,15 +1315,8 @@ impl ReindexPacker {
                     slot.copy_from_slice(&h.to_be_bytes());
                 }
                 PromoteKind::Bitmap => {}
-                PromoteKind::Float(loc) => {
-                    let mut scratch = [0u8; 16];
-                    let src = loc.native_le_bytes(batch, row, &mut scratch);
-                    let enc = if loc.type_code() == type_code::F32 {
-                        ieee_order_bits_f32(u32::from_le_bytes(src[..4].try_into().unwrap()))
-                    } else {
-                        ieee_order_bits(u64::from_le_bytes(src[..8].try_into().unwrap()))
-                    };
-                    slot.copy_from_slice(&enc.to_be_bytes());
+                PromoteKind::Float(loc, sk) => {
+                    slot.copy_from_slice(&loc.order_bits(batch, row, sk).to_be_bytes());
                 }
                 PromoteKind::Fold => {
                     slot.copy_from_slice(&hash_fold(&self.folded, batch, row, null_word).to_be_bytes());

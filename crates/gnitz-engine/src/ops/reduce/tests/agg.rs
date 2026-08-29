@@ -28,7 +28,17 @@ fn f64_acc(agg_op: AggFunc) -> Accumulator {
         ],
         &[0],
     );
-    Accumulator::new(agg_op, schema.locate(1)).unwrap()
+    let mut accs = super::super::plan::ReducePlan::new(
+        &schema,
+        &[0],
+        &[AggDescriptor { col_idx: 1, agg_op }],
+        schema.reduce_out_key(&[0]),
+        false,
+        false,
+    )
+    .unwrap()
+    .acc_template;
+    accs.pop().unwrap()
 }
 
 // Item 19: a NaN seen first must not poison MIN. A subsequent finite value
@@ -56,4 +66,21 @@ fn max_uses_total_order_for_nan() {
     acc.step_from_batch(&nan.as_mem_batch(), 0, 1);
     let got = f64::from_bits(acc.get_value_bits());
     assert!(got.is_nan(), "MAX must adopt NaN as the greatest under total order");
+}
+
+/// `Accumulator` resolves the two `AggFunc` classifications the wire owns —
+/// linearity and the zero-identity empty render — off its own `StepKind` rather
+/// than a stored opcode, so both must still answer exactly as `AggFunc` does for
+/// every opcode the wire can name.
+#[test]
+fn step_kind_answers_the_wire_classifications() {
+    for &op in AggFunc::ALL {
+        let acc = f64_acc(op);
+        assert_eq!(acc.is_linear(), op.is_linear(), "{op:?}: linearity");
+        assert_eq!(
+            acc.empty_renders_zero(),
+            op.empty_renders_zero(),
+            "{op:?}: empty render",
+        );
+    }
 }

@@ -1,41 +1,50 @@
-//! AVI tests: the order-preserving value codec, and the equality of a PK-source
+//! AVI tests: the order-preserving value image, and the equality of a PK-source
 //! and a payload-source aggregate's encoded image.
 
 use super::*;
+use crate::schema::{ColumnLocator, TypeCode};
+use crate::storage::MemBatch;
+use gnitz_wire::ScalarKind;
 
-/// The value's native bits as `decode_ordered` recovers them: sign-extended for
-/// signed ints, zero-extended for unsigned, IEEE bits for F64, and the F64
-/// promotion for F32 (the accumulator's slot type).
-fn native_bits(le: &[u8], tc: TypeCode) -> u64 {
-    match tc {
-        TypeCode::F64 => u64::from_le_bytes(le.try_into().unwrap()),
-        TypeCode::F32 => f64::to_bits(f32::from_bits(u32::from_le_bytes(le[..4].try_into().unwrap())) as f64),
-        _ if gnitz_wire::is_signed_int(tc as u8) => gnitz_wire::read_signed_exact(le) as u64,
-        _ => gnitz_wire::read_unsigned_exact(le),
-    }
+/// One-row batch holding `le` (the value's native little-endian bytes) in a
+/// nullable payload column of type `tc`, plus the locator addressing it. The
+/// value image is read through the same accessor the AVI's write side uses.
+fn payload_row(tc: TypeCode, le: &[u8]) -> (Batch, ColumnLocator) {
+    let schema = SchemaDescriptor::new(
+        &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc as u8, 0)],
+        &[0],
+    );
+    let mut b = Batch::with_capacity(schema, 1);
+    b.extend_pk(1u128);
+    b.extend_weight(&1i64.to_le_bytes());
+    b.extend_null_bmp(&0u64.to_le_bytes());
+    b.extend_col(0, &le[..schema.columns[1].size() as usize]);
+    b.count += 1;
+    (b, schema.locate(1))
 }
 
-/// `encode_ordered` is the *encoding* form of the scalar total order whose
+/// `order_bits` is the *encoding* form of the scalar total order whose
 /// *comparison* form is `gnitz_wire::cmp_typed_le`; the AVI's correctness is
 /// their agreement, since an ascending cursor walk over encoded keys must yield
 /// the extremum `cmp_typed_le` would pick. Checked for every pair of every
-/// order-encodable type in both directions, together with the `for_max`
-/// inversion (which is what makes the ascending walk yield MAX first) and the
-/// `decode_ordered` round-trip both ways.
+/// scalar type in both directions, together with the `order_inverse` round-trip.
 fn assert_codec(tc: TypeCode, vals: &[[u8; 8]]) {
+    let kind = ScalarKind::from_type_code(tc).unwrap();
     let w = SchemaColumn::new(tc as u8, 0).size() as usize;
+    let bits = |v: &[u8; 8]| {
+        let (b, loc) = payload_row(tc, v);
+        loc.order_bits(&b.as_mem_batch(), 0, kind)
+    };
     for a in vals {
-        let (min, max) = (encode_ordered(&a[..w], tc, false), encode_ordered(&a[..w], tc, true));
-        assert_eq!(max, !min, "{tc:?}: for_max must invert the order");
-        assert_eq!(decode_ordered(min, tc), native_bits(&a[..w], tc), "{tc:?}: round-trip");
+        let enc = bits(a);
         assert_eq!(
-            decode_ordered(!max, tc),
-            native_bits(&a[..w], tc),
-            "{tc:?}: MAX round-trip"
+            kind.order_inverse(enc).to_le_bytes()[..w],
+            a[..w],
+            "{tc:?}: order_inverse must recover the value's own bytes",
         );
         for b in vals {
             assert_eq!(
-                min.cmp(&encode_ordered(&b[..w], tc, false)),
+                enc.cmp(&bits(b)),
                 gnitz_wire::cmp_typed_le(&a[..w], &b[..w], tc as u8),
                 "{tc:?}: encode order disagrees with cmp_typed_le for {a:02x?} vs {b:02x?}",
             );
@@ -87,11 +96,10 @@ fn order_codec_matches_cmp_typed_le_and_round_trips() {
 }
 
 /// A PK aggregate column's at-rest bytes are its OPK window (big-endian,
-/// sign-flipped), so the AVI population reads them through
-/// `ColumnLocator::native_le_bytes` before order-encoding. That read is what
-/// makes a PK-source aggregate encode identically to the same value in a
-/// payload column; without it the image is byte-swapped, and a byte-swap
-/// sensitive pair like 1/256 inverts.
+/// sign-flipped), so `order_bits` inverts that window rather than reading it
+/// raw. That inversion is what makes a PK-source aggregate encode identically to
+/// the same value in a payload column; without it the image is byte-swapped, and
+/// a byte-swap sensitive pair like 1/256 inverts.
 ///
 /// Schema `[U64 a (pk), <tc> b (pk), <tc> c (payload)]`, with the same native
 /// value in `b` and `c`, and `a` the row index so every PK stays distinct.
@@ -103,6 +111,7 @@ fn pk_source_and_payload_source_encode_identically() {
         (TypeCode::I32, vec![i32::MIN as i128, -100, -1, 0, 1_000_000]),
         (TypeCode::I64, vec![i64::MIN as i128, -1, 0, 1, i64::MAX as i128]),
     ] {
+        let kind = ScalarKind::from_type_code(tc).unwrap();
         let schema = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0),
@@ -126,19 +135,27 @@ fn pk_source_and_payload_source_encode_identically() {
         }
         let mb = batch.as_mem_batch();
 
-        // The AVI value image exactly as `avi_batch` builds it.
-        let encode_at = |col: usize, row: usize, for_max: bool| {
-            let mut scratch = [0u8; 16];
-            encode_ordered(schema.locate(col).native_le_bytes(&mb, row, &mut scratch), tc, for_max)
-        };
-        for for_max in [false, true] {
-            for (i, &v) in vals.iter().enumerate() {
-                assert_eq!(
-                    encode_at(1, i, for_max),
-                    encode_at(2, i, for_max),
-                    "{tc:?} v={v} for_max={for_max}",
-                );
-            }
+        for (i, &v) in vals.iter().enumerate() {
+            assert_eq!(
+                schema.locate(1).order_bits(&mb, i, kind),
+                schema.locate(2).order_bits(&mb, i, kind),
+                "{tc:?} v={v}",
+            );
         }
     }
+}
+
+/// The AVI's own convention on top of the value image: a MAX ordinal stores the
+/// bitwise complement, so the index's ascending walk yields that ordinal's
+/// extreme first. Checked against the MIN image of the same row.
+#[test]
+fn for_max_inverts_the_value_image() {
+    let (b, loc) = payload_row(TypeCode::I64, &(-7i64).to_le_bytes());
+    let mb: MemBatch = b.as_mem_batch();
+    let spec = |for_max| ExtremeSpec {
+        loc,
+        kind: ScalarKind::Int(gnitz_wire::FixedInt::I64),
+        for_max,
+    };
+    assert_eq!(av_encode(&spec(true), &mb, 0), !av_encode(&spec(false), &mb, 0));
 }

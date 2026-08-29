@@ -13,7 +13,8 @@ use super::plan::ReducePlan;
 /// `COUNT(col)` over an all-NULL group renders `0`, not NULL. Used by
 /// `emit_reduce_row`.
 #[inline]
-fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, cs: usize, null_word: &mut u64) {
+fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, null_word: &mut u64) {
+    let cs = acc.out_size();
     if acc.is_untouched() {
         // Never stepped: zero bytes either way. The zero-identity family (COUNT
         // family / SumZero) leaves the null bit clear so it renders a concrete
@@ -46,11 +47,9 @@ fn finish_row(output: &mut Batch, null_word: u64) {
 /// Emit the trailing aggregate columns, starting at payload index `pi_base`
 /// (= the plan's group-exemplar count).
 #[inline]
-fn emit_agg_cols(output: &mut Batch, accs: &[Accumulator], plan: &ReducePlan, pi_base: usize, null_word: &mut u64) {
-    // The declaration/emission agreement is pinned once per plan by
-    // `ReducePlan::new`, not per row.
+fn emit_agg_cols(output: &mut Batch, accs: &[Accumulator], pi_base: usize, null_word: &mut u64) {
     for (k, acc) in accs.iter().enumerate() {
-        emit_agg_col(output, acc, pi_base + k, plan.agg_col_widths[k], null_word);
+        emit_agg_col(output, acc, pi_base + k, null_word);
     }
 }
 
@@ -92,48 +91,33 @@ pub(super) fn emit_reduce_row(
             }
         }
     }
-    emit_agg_cols(output, accs, plan, plan.exemplar_locs().len(), &mut null_word);
+    emit_agg_cols(output, accs, plan.exemplar_locs().len(), &mut null_word);
 
     finish_row(output, null_word);
 }
 
 /// Emit the synthetic **ground row** of a global (ungrouped) aggregate at PK
-/// `out_pk_bytes` (= `V₀`): COUNT-family columns render `0`, SUM/MIN/MAX render
-/// NULL. This is the one row SQL scalar-aggregate semantics require over an empty
-/// or fully-retracted source (`COUNT(*)=0`, `SUM/MIN/MAX/AVG=NULL`); the
-/// post-reduce MAP turns a derived `(SUM=NULL, COUNT_NON_NULL=0)` into
-/// `AVG`/nullable-`SUM` = NULL with no special case.
-///
-/// Built from a **fresh** accumulator set in the empty-group state — never the
-/// reduce loop's computed `accs` — so the ground row's layout has a single home,
-/// shared by both emission sites (the `n>0` cardinality-zero branch and the
-/// `n==0` seed), and cannot drift from a computed row. Emitted at weight +1; the
-/// caller nets it to one row (the `has_old` retraction in `n>0`, the
-/// `!trace_out_has_V0` guard in `n==0`).
+/// `out_pk_bytes` (= `V₀`) — `COUNT(*)=0`, `SUM/MIN/MAX/AVG=NULL`, the one row SQL
+/// scalar-aggregate semantics require over an empty or fully-retracted source.
+/// Rendered from the plan's own untouched accumulator template, so it cannot drift
+/// from a computed row. Emitted at weight +1; the caller nets it to one row (the
+/// `has_old` retraction in `n>0`, the `!trace_out_has_V0` guard in `n==0`).
 pub(super) fn emit_global_ground(raw_output: &mut Batch, out_pk_bytes: &[u8], plan: &ReducePlan) {
-    // A global-aggregate output schema is `[_group_pk, aggs…]`: group-less, so
-    // `exemplar_locs()` is empty and the whole payload is aggregates. That is why
-    // this path emits the aggregate columns *directly* rather than through
-    // `emit_reduce_row` — with no exemplar column there is no source row to
-    // supply, so the empty-delta seed (which has no input batch at all) is
-    // structurally unable to read one.
+    // A global-aggregate output schema is `[_group_pk, aggs…]`: no exemplar column,
+    // so there is no source row to read — which is what lets the empty-delta seed,
+    // which has no input batch at all, emit the aggregate columns directly here
+    // rather than through `emit_reduce_row`.
     debug_assert!(
         plan.exemplar_locs().is_empty(),
         "global_ground output schema must have zero group-exemplar columns",
     );
 
     // The plan's template is exactly the empty-group state — every accumulator
-    // untouched (`has_value` false), never stepped, and the plan holds it behind
-    // `&` so the clone can never observe a mutated one.
-    // `emit_agg_col` renders each by `empty_renders_zero`: the
-    // COUNT family and SumZero ground to a concrete `0` (null bit clear), SUM/MIN/MAX
-    // to NULL. No COUNT seed is needed — an untouched Count / CountNonNull already
-    // renders `0` (byte-identical to a `seed_from_raw_bits(0)` value), so the ground
-    // row shares the one render path with a normal row.
-    let accs: Vec<Accumulator> = plan.acc_template.clone();
-
+    // untouched, never stepped — and `emit_agg_col` renders each by
+    // `empty_renders_zero`, so the ground row shares the one render path with a
+    // normal row.
     begin_row(raw_output, out_pk_bytes);
     let mut null_word: u64 = 0;
-    emit_agg_cols(raw_output, &accs, plan, 0, &mut null_word);
+    emit_agg_cols(raw_output, &plan.acc_template, 0, &mut null_word);
     finish_row(raw_output, null_word);
 }

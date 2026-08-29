@@ -179,10 +179,8 @@ impl AdhocFold {
         for row in ranges.iter().flat_map(|&(s, e)| s..e) {
             let w = mb.get_weight(row);
             // The scan cursor delivers consolidated, positive-net-weight rows
-            // (ghosts excluded). MIN/MAX correctness depends on stepping only
-            // positive weights (its arm never reads `weight`, and there is no
-            // weight-sign assert in the kernel); guard defensively — exactly as
-            // `op_reduce`'s group walk guards with `if w > 0`.
+            // (ghosts excluded); the kernel's extreme arm asserts the same, and
+            // `op_reduce`'s group walk guards with the same `w > 0`.
             debug_assert!(w > 0, "adhoc fold: scan cursor must deliver positive weights");
             if w <= 0 {
                 continue;
