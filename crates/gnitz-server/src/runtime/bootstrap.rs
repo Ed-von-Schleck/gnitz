@@ -20,7 +20,7 @@ use crate::runtime::executor::ServerExecutor;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::posix;
 use crate::runtime::sal::zone::CommittedTail;
-use crate::runtime::sal::{sal_mmap_size, sal_tail_slot_count, SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_PUSH};
+use crate::runtime::sal::{sal_mmap_size, EpochGate, SalLog, SalMessageKind, SalReader, SalStep, SalWriter};
 use crate::runtime::tls::{setup_tls_listener, TlsCli};
 use crate::runtime::w2m::{self, W2mReceiver, W2mWriter, W2M_REGION_SIZE};
 use crate::runtime::wire as ipc;
@@ -43,25 +43,29 @@ fn boot_log(msg: &str) {
 // ---------------------------------------------------------------------------
 
 /// Master pre-fork system-table replay. Builds the system-table family map from
-/// the flushed LSNs, then ingests every committed FLAG_DDL_SYNC batch addressed
+/// the flushed LSNs, then ingests every committed DdlSync batch addressed
 /// to a system table — orphan COL_TAB rows from a crashed DDL are skipped
 /// because their zone never closed.
 ///
 /// Returns the walk's epoch, which is the floor the next writer epoch and the
 /// workers' initial `expected_epoch` are taken from.
-fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngine) -> Result<u32, String> {
-    let sal_reader = SalReader::for_walk(sal_ptr, 0, sal_mmap_size());
+fn recover_system_tables_from_sal(
+    sal_ptr: *const u8,
+    catalog: &mut CatalogEngine,
+) -> Result<(u32, Option<u32>), String> {
+    let log = unsafe { SalLog::new(sal_ptr, sal_mmap_size()) };
     let family_lsns = catalog.system_flushed_lsns();
 
     // Derived once, before either pass: on a boot whose offset-0 header is
     // damaged this costs a full-ring sweep, and both passes must anchor on the
     // same answer anyway.
-    let epoch = sal_reader.walk_epoch();
-    let tail = CommittedTail::open(&sal_reader, epoch, FLAG_DDL_SYNC, &family_lsns)?;
+    let epoch = log.walk_epoch();
+    let tail = CommittedTail::open(log, epoch, SalMessageKind::DdlSync, &family_lsns)?;
 
     let mut replayed: u32 = 0;
     for msg in tail.groups() {
-        let Some(data) = msg.wire_data else { continue };
+        // A system family broadcasts, so slot 0 carries the whole batch.
+        let Some(data) = msg.slot(0) else { continue };
         // Pass 1 already demoted the last zone if it was torn, so anything that
         // fails here has a durable committed zone behind it — a hole, not a crash
         // artifact. Dropping it silently would lose an ACKed, fdatasync'd DDL.
@@ -91,7 +95,14 @@ fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngin
     if replayed > 0 {
         boot_log(&format!("SAL system table recovery: replayed {replayed} entries\n"));
     }
-    Ok(epoch)
+    // The tail's slot count comes back with the epoch because this walk has
+    // already read the first group's header; the boot log names it, and no
+    // separate probe re-reads it.
+    let tail_slots = match log.read_at(0, EpochGate::Walk(epoch)) {
+        SalStep::Group(msg, _) => Some(msg.slots()),
+        _ => None,
+    };
+    Ok((epoch, tail_slots))
 }
 
 /// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
@@ -121,7 +132,7 @@ fn swept_base_tables(catalog: &mut CatalogEngine) -> Vec<i64> {
 }
 
 /// Per-worker post-fork user-table replay for `rank` of `num_workers`. The apply
-/// closure decodes each FLAG_PUSH group's batch and applies it through the
+/// closure decodes each Push group's batch and applies it through the
 /// PK-enforcement path (`ingest_returning_effective`, the exact call
 /// `handle_push` makes) so retractions cancel correctly, and — for every base
 /// table feeding ≥1
@@ -150,23 +161,17 @@ fn recover_from_sal(
 
     let buffered_bases: HashSet<i64> = swept_base_tables(catalog).into_iter().collect();
 
-    // `unwrap_or` covers the two cases the probe answers `None` for, and neither
-    // can lose rows: a zero prefix at offset 0 (fresh or reset ring — the walk
-    // ends at its first step), and a corrupt first header (pass 1 has already
-    // either failed the boot or established that nothing committed lies behind
-    // it). Either way it picks a re-slice mode for a tail with nothing to replay.
-    let written = unsafe { sal_tail_slot_count(sal_ptr, sal_mmap_size() as u64) }.unwrap_or(num_workers);
-    let reslice = written != num_workers;
-    let slots = if reslice { 0..written } else { rank..rank + 1 };
-
-    // One walk per process, not one per slot: group headers are slot-independent,
-    // so a second walk would re-verify every header to reach the same groups.
-    let reader = SalReader::for_walk(sal_ptr, slots.start, sal_mmap_size());
-    let tail = CommittedTail::open(&reader, walk_epoch, FLAG_PUSH, &family_lsns)?;
+    let log = unsafe { SalLog::new(sal_ptr, sal_mmap_size()) };
+    let tail = CommittedTail::open(log, walk_epoch, SalMessageKind::Push, &family_lsns)?;
 
     let mut pending: HashMap<i64, Batch> = HashMap::new();
     let mut replayed: u32 = 0;
     for msg in tail.groups() {
+        // Each group's own slot count, off the header in hand and inside its
+        // digest. A tail-wide probe reads one header for all of them, and a torn
+        // one picks the wrong mode — losing every slot above `rank`.
+        let reslice = msg.slots() != num_workers;
+        let wanted = if reslice { 0..msg.slots() } else { rank..rank + 1 };
         let tid = msg.target_id as i64;
         // The catalog's schema, not the wire's: only the catalog stamps the
         // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`, so
@@ -178,14 +183,13 @@ fn recover_from_sal(
         // would re-ingest the same rows and add their weights again. Never re-sliced
         // either — this worker needs the full copy, not a share of it.
         let replicated = schema.placement().is_replicated();
-        for w in slots.clone() {
-            if replicated && w != slots.start {
+        for (w, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
+            // Keyed on the range, not on the first slot the iterator happens to
+            // yield, so a replicated group with an unwritten slot 0 cannot make
+            // this read a second copy.
+            if replicated && w != wanted.start {
                 continue;
             }
-            // Before the decode, which copies the whole batch out of the SAL.
-            let Some(data) = reader.slot_at(msg.base, w) else {
-                continue;
-            };
             // Pass 1 demoted the last zone if it was torn, so a failure here has a
             // durable committed zone behind it — a hole, not a crash artifact.
             // Dropping it silently would lose an ACKed, fdatasync'd transaction.
@@ -200,7 +204,7 @@ fn recover_from_sal(
                 _ => continue,
             };
             // The one place an old-width batch enters the engine. A pre-ALTER
-            // `FLAG_PUSH` frame decodes against its own embedded schema block, but the
+            // `Push` frame decodes against its own embedded schema block, but the
             // catalog is already at its final width here (the master applied every
             // catalog SAL entry pre-fork, and workers replay pushes only). Widen ahead
             // of the reslice, which rebuilds through `Batch::from_indexed_rows(&mb, …,
@@ -229,8 +233,8 @@ fn recover_from_sal(
                 continue;
             }
             // The error rides the startup ACK: the master fails boot BEFORE zeroing
-            // the SAL sentinel, so the replayed data's only durable copy survives. A
-            // swallowed error here would zero the sentinel and orphan the un-applied
+            // the SAL is rewound, so the replayed data's only durable copy survives.
+            // A swallowed error here would let the rewind orphan the un-applied
             // committed data.
             let effective = catalog.ingest_returning_effective(tid, owned).map_err(|e| {
                 format!(
@@ -261,14 +265,14 @@ fn recover_from_sal(
 ///    into each index exactly once (`ingest_store_and_indices`), so a rebuild
 ///    afterwards would double-count every replayed row.
 /// 2. Replay unflushed push data from the SAL.
-/// 3. Flush the replayed rows to shards before accepting requests: reset_sal()
-///    resets the write cursor to 0, so a second crash before a checkpoint would
+/// 3. Flush the replayed rows to shards before accepting requests: the boot rewind
+///    puts the write cursor back to 0, so a second crash before a checkpoint would
 ///    overwrite SAL entries and make replayed data unreachable (the SAL walk
 ///    stops at the first partially-overwritten group).
 ///
 /// The Err rides the startup ACK (see worker.run): a failed boot must abort
-/// before the master zeroes the SAL sentinel, or the replayed rows' only
-/// durable copy is destroyed.
+/// before the master rewinds the SAL, or the replayed rows' only durable copy is
+/// destroyed.
 fn worker_boot_recovery(
     catalog: &mut CatalogEngine,
     sal_ptr: *const u8,
@@ -415,6 +419,7 @@ fn run_worker_child(
     catalog_ptr: *mut CatalogEngine,
     ipc: &SharedIpc,
     walk_epoch: u32,
+    live_epoch: u32,
     placement: Option<&affinity::Placement>,
 ) -> ! {
     // Die immediately if the master exits for any reason.  The getppid() check
@@ -476,21 +481,21 @@ fn run_worker_child(
 
     let catalog = unsafe { &mut *catalog_ptr };
 
-    // One above the recovered floor is what the master's `boot_reset` will set,
-    // so the live drain accepts exactly the groups written after the reset.
-    let sal_reader = SalReader::new(
-        ipc.sal_ptr as *const u8,
-        w as u32,
-        sal_mmap_size(),
-        ipc.m2w_efds[w],
-        walk_epoch + 1,
-    );
+    let sal_reader = unsafe {
+        SalReader::new(
+            ipc.sal_ptr as *const u8,
+            w as u32,
+            sal_mmap_size(),
+            ipc.m2w_efds[w],
+            live_epoch,
+        )
+    };
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
 
     // Re-home every inherited store from the pre-fork master's `w0of{W}` to THIS
     // worker's own `w{w}of{W}` dir before any flush — all workers share the data
     // directory, so a fixed rank 0 would collide. The inherited store is empty;
-    // this rank's checkpointed shards under `w{w}of{W}` load on open and FLAG_PUSH
+    // this rank's checkpointed shards under `w{w}of{W}` load on open and Push
     // replay adds the SAL tail.
     //
     // Then recover: rebuild indexes, replay the SAL tail (buffering effective base
@@ -500,7 +505,7 @@ fn run_worker_child(
     // child-side view backfill.
     //
     // Either failure rides the startup ACK, which fails boot before the master
-    // zeroes the SAL sentinel.
+    // rewinds the SAL.
     let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) = match catalog
         .rehome_stores()
         .map_err(|e| format!("rehome stores failed: {e}"))
@@ -579,11 +584,14 @@ fn run_server(
 
     // --- System table SAL recovery (before forking workers) ---
     //
-    // The recovered walk epoch is the epoch floor for this boot: the master's
-    // `boot_reset` and every worker's initial `expected_epoch` start one above it,
-    // so a previous boot's leftover in the ring always carries a strictly lower
-    // epoch than anything this boot writes.
-    let walk_epoch = recover_system_tables_from_sal(ipc.sal_ptr as *const u8, &mut catalog)?;
+    // The recovered walk epoch is this boot's floor, so a previous boot's
+    // leftover always carries a strictly lower one than anything written now.
+    let (walk_epoch, tail_slots) = recover_system_tables_from_sal(ipc.sal_ptr as *const u8, &mut catalog)?;
+    // One above it: what the master rewinds to and what every worker's live drain
+    // accepts. Bound once — were the two ever to disagree, every group would park
+    // as another epoch, the drain would end silently, and the committer would wait
+    // forever on an ACK.
+    let live_epoch = walk_epoch + 1;
     {
         // Abort before forking workers and long before the SAL reset: the
         // replayed DDL lives only in master memory until this flush makes it
@@ -632,14 +640,11 @@ fn run_server(
 
     // Name the replay path the workers will take, so the boot record shows
     // whether the tail was re-sliced. Pre-fork, so this still reaches the
-    // master's own log (the children redirect fd 2 to their own), and read from
-    // the same place the workers read it.
-    if let Some(written) = unsafe { sal_tail_slot_count(ipc.sal_ptr as *const u8, sal_mmap_size() as u64) } {
-        if written != num_workers {
-            boot_log(&format!(
-                "SAL tail written by {written} workers, launching {num_workers}\n"
-            ));
-        }
+    // master's own log (the children redirect fd 2 to their own).
+    if let Some(written) = tail_slots.filter(|&n| n != num_workers) {
+        boot_log(&format!(
+            "SAL tail written by {written} workers, launching {num_workers}\n"
+        ));
     }
 
     // Log fd assignments
@@ -670,6 +675,7 @@ fn run_server(
                 catalog_ptr,
                 &ipc,
                 walk_epoch,
+                live_epoch,
                 placement.as_ref(),
             ),
             pid => worker_pids.push(pid),
@@ -711,9 +717,9 @@ fn run_server(
         .collect_acks("recovery sync")
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
 
-    // Reset SAL for fresh use (all workers have recovered), one epoch above the
-    // recovered floor, so a previous boot's leftover always reads as older.
-    dispatcher.reset_sal(walk_epoch + 1);
+    // Reset the SAL for fresh use, now that every worker has recovered. The same
+    // `live_epoch` the workers were launched with.
+    dispatcher.rewind_sal(live_epoch);
 
     inject_recovery_panic("reset");
 

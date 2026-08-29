@@ -79,7 +79,7 @@ pub fn encode_named_schema_block(schema: &SchemaDescriptor, defs: &[ColumnDef], 
 
 impl CatalogEngine {
     /// The cached schema wire entry for `tid` — the encoded block, the schema
-    /// version it was built at, and the schema's wire-safety. On a miss the
+    /// version it was built at. On a miss the
     /// block is built from the catalog's column defs and stored; it is
     /// invalidated alongside them whenever DDL modifies the table.
     ///
@@ -104,7 +104,6 @@ impl CatalogEngine {
         let entry = SchemaWireEntry {
             block,
             version: self.get_schema_version(tid),
-            wire_safe: crate::storage::schema_wire_safe(schema),
         };
         self.set_schema_wire_block(tid, entry.clone());
         entry

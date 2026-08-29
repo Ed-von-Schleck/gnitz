@@ -371,7 +371,7 @@ def test_error_paths(client):
 
 
 def _text_table(client, sn, name):
-    """(pk U64 PK, s TEXT) table — non-wire-safe reply (blob column)."""
+    """(pk U64 PK, s TEXT) table — a blob-bearing reply, which cannot split."""
     cols = [
         gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
         gnitz.ColumnDef("s", gnitz.TypeCode.STRING),
@@ -387,7 +387,7 @@ def test_fifo_ordering_big_then_small(reply_frame_budget_server):
     must stream in request order without wedging — the shape that deadlocks
     without FLAG_SCAN_FIFO_REPLY (the immediate-emit fast path would jump the
     tiny relations ahead of big's queued chunks). Both orderings, plus a
-    non-wire-safe (TEXT) sibling, must complete and be correct."""
+    blob-bearing (TEXT) sibling, must complete and be correct."""
     c = reply_frame_budget_server
     sn = "sm" + _uid()
     c.create_schema(sn)
@@ -418,7 +418,7 @@ def test_fifo_ordering_big_then_small(reply_frame_budget_server):
             assert _rows(res[j]) == exp
         assert _rows(res[-1]) == big_rows
 
-        # Non-wire-safe sibling: a TEXT dimension must FIFO behind big too.
+        # A blob-bearing sibling: a TEXT dimension must FIFO behind big too.
         dim, dim_sch = _text_table(c, sn, "dim_text")
         db = gnitz.ZSetBatch(dim_sch)
         for i in range(5):

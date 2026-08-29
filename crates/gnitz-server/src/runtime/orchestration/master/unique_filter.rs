@@ -299,11 +299,13 @@ impl MasterDispatcher {
                 },
                 GroupData::NONE,
                 0,
-                0,
+                SalMessageKind::Scan,
+                ZoneMark::Plain,
                 targets,
             )
         })
-        .await?;
+        .await
+        .map_err(|f| f.text)?;
 
         // Drain every worker's continuation-frame train into the cold filters.
         // `drain_index_scan` owns the early-return error contract (the lease

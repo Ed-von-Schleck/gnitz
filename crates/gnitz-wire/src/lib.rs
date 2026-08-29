@@ -289,11 +289,8 @@ pub fn merge_null_words(left: u64, right: u64, left_npc: usize) -> u64 {
     }
 }
 
-// `write_u32_le` has only in-crate callers (the WAL framer, the control-block
-// encoder, the handshake), so it stays crate-internal rather than widening the
-// public surface with a dead export.
 #[inline]
-pub(crate) fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
+pub fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
 }
 

@@ -42,7 +42,7 @@ fn make_simple_batch(pk: u64, val: u64) -> Batch {
 
 /// `n` rows over [`simple_schema`], each at a distinct weight and payload, so a
 /// region the encoder mis-slices reads back as a wrong row rather than a right one.
-fn make_wire_safe_batch(n: usize) -> Batch {
+fn make_blobless_batch(n: usize) -> Batch {
     let rows: Vec<(u64, i64, i64)> = (0..n).map(|i| (i as u64, i as i64 + 1, i as i64 * 10)).collect();
     make_batch_raw(&simple_schema(), &rows)
 }
@@ -423,7 +423,7 @@ fn decode_continuation<'a>(
 #[test]
 fn wire_size_range_matches_encoded_size() {
     let sd = simple_schema();
-    let batch = make_wire_safe_batch(8);
+    let batch = make_blobless_batch(8);
     let blk = sblock(&sd, 1);
 
     for count in [0usize, 1, 4, 8] {
@@ -458,7 +458,7 @@ fn wire_size_range_matches_encoded_size() {
 #[test]
 fn wire_size_range_positive_per_row_delta() {
     let sd = simple_schema();
-    let batch = make_wire_safe_batch(1);
+    let batch = make_blobless_batch(1);
     let blk = sblock(&sd, 0);
     let sz0 = WireMsg {
         schema_block: Some(&blk),
@@ -487,7 +487,7 @@ fn wire_size_range_positive_per_row_delta() {
 #[test]
 fn encode_range_roundtrip() {
     let sd = simple_schema();
-    let batch = make_wire_safe_batch(8);
+    let batch = make_blobless_batch(8);
     let blk = sblock(&sd, 1);
 
     // Encode rows [2, 5) into a wire frame with the schema block.
@@ -536,7 +536,7 @@ fn encode_range_roundtrip() {
 #[test]
 fn continuation_frame_decoded_with_schema_hint() {
     let sd = simple_schema();
-    let batch = make_wire_safe_batch(4);
+    let batch = make_blobless_batch(4);
 
     // Encode a continuation frame: no schema, FLAG_CONTINUATION set.
     // Embed server_version=7 in wire_flags bits 24-39.
@@ -690,6 +690,68 @@ fn validate_schema_match_names_each_mismatch_distinctly() {
                 msgs[i], msgs[j],
                 "{} vs {} report the same message",
                 cases[i].0, cases[j].0
+            );
+        }
+    }
+}
+
+/// A 4-byte PK and stride-4 payload columns: the wire block pads between
+/// regions, so the scatter encoder's destination carve and the block framer's
+/// sizing must agree offset for offset. Odd row counts are where they diverge if
+/// either walk drops the padding.
+#[test]
+fn scattered_roundtrips_over_a_padded_schema() {
+    let sd = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(type_code::I32, 0),
+            SchemaColumn::new(type_code::I16, 0),
+        ],
+        &[0],
+    );
+    let blk = sblock(&sd, 3);
+
+    let mut batch = Batch::with_capacity(sd, 8);
+    for i in 0..8u32 {
+        batch.extend_pk(i as u128);
+        batch.extend_weight(&((i as i64) + 1).to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.extend_col(0, &(i as i32 * 10).to_le_bytes());
+        batch.extend_col(1, &(i as i16 * 3).to_le_bytes());
+        batch.count += 1;
+    }
+
+    for count in [1usize, 3, 7] {
+        let indices: Vec<u32> = (0..count as u32).map(|i| i * 2 % 8).collect();
+        let msg = WireMsg {
+            target_id: 3,
+            schema_block: Some(&blk),
+            data: WireData::Scattered {
+                batch: &batch,
+                indices: &indices,
+                schema: &sd,
+            },
+            ..Default::default()
+        };
+        let sz = msg.size();
+        let mut buf = vec![0u8; sz];
+        assert_eq!(msg.encode(&mut buf, 0), sz, "{count} rows: size must size its encode");
+
+        let decoded = decode_wire(&buf).expect("a scattered block decodes");
+        let got = decoded.data_batch.expect("it carries rows");
+        assert_eq!(got.count, count);
+        for (j, &src) in indices.iter().enumerate() {
+            assert_eq!(got.get_pk(j), src as u128, "{count} rows: pk {j}");
+            assert_eq!(got.get_weight(j), src as i64 + 1, "{count} rows: weight {j}");
+            assert_eq!(
+                i32::from_le_bytes(got.col_data(0)[j * 4..j * 4 + 4].try_into().unwrap()),
+                src as i32 * 10,
+                "{count} rows: col 0 of row {j}"
+            );
+            assert_eq!(
+                i16::from_le_bytes(got.col_data(1)[j * 2..j * 2 + 2].try_into().unwrap()),
+                src as i16 * 3,
+                "{count} rows: col 1 of row {j}"
             );
         }
     }

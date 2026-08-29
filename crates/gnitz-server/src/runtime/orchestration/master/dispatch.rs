@@ -3,7 +3,6 @@
 //! (seek / scan / index / gather), checkpointing, and the scan-fanout helpers.
 
 use super::*;
-use crate::runtime::sal::FLAG_ZONE_START;
 use crate::runtime::w2m::{worker_mask, BitIter};
 use gnitz_engine::foundation::fault::Seam;
 
@@ -133,12 +132,11 @@ impl MasterDispatcher {
         &self.sal_writer_excl
     }
 
-    /// Boot-time SAL reset: sentinel prefix cleared, cursor 0, `epoch` (the
-    /// recovered walk epoch plus one, so epochs stay monotone across boots and a
-    /// previous boot's leftover can never be read as current). Sole caller is
-    /// `server_main` after all workers finish recovery.
-    pub fn reset_sal(&self, epoch: u32) {
-        self.sal.boot_reset(epoch);
+    /// The boot [`SalWriter::rewind`], to the same `live_epoch` the workers were
+    /// launched with. Sole caller is `server_main`, once every worker has
+    /// finished recovery.
+    pub fn rewind_sal(&self, epoch: u32) {
+        self.sal.rewind(epoch);
     }
 
     /// `target_id`'s wire identity, off the catalog's cache: the block is built
@@ -165,47 +163,67 @@ impl MasterDispatcher {
         template: wire::WireMsg<'_>,
         data: GroupData<'_>,
         lsn: u64,
-        sal_flags: u32,
+        kind: SalMessageKind,
+        mark: ZoneMark,
         targets: GroupTargets<'_>,
-    ) -> Result<(), String> {
-        self.sal.write_group_direct(
-            &DirectGroup {
-                template,
-                data,
-                targets,
-            },
-            lsn,
-            sal_flags,
-        )
+    ) -> Result<(), WorkerFault> {
+        self.sal
+            .write_group_direct(
+                &DirectGroup {
+                    template,
+                    data,
+                    targets,
+                },
+                lsn,
+                kind,
+                mark,
+            )
+            .map_err(|fit| fit.refusal(&format!("{kind:?} group")))
     }
 
     /// Write one group whose rows are PK-partitioned across the workers: each
     /// worker's slot carries only the rows it stores — the scatter sibling of a
     /// `GroupData::Same` broadcast.
-    ///
     pub(super) fn write_scatter_group(
         &self,
         batch: &Batch,
         relation: &wire::WireSchema,
-        sal_flags: u32,
+        kind: SalMessageKind,
         seek_col_idx: u64,
         targets: GroupTargets<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<(), WorkerFault> {
+        let nw = self.num_workers;
+        let template = wire::WireMsg {
+            seek_col_idx,
+            ..Default::default()
+        };
         // No reentrancy: the closure has no `.await`, so the SCATTER_INDICES
         // borrow is released before the next caller needs it.
-        with_worker_indices(batch, relation.descriptor(), self.num_workers, |worker_indices| {
-            self.sal.with_scatter_group(
-                batch,
-                worker_indices,
-                relation,
-                wire::WireMsg {
-                    seek_col_idx,
-                    ..Default::default()
-                },
-                targets,
-                |g| self.sal.write_group_direct(g, 0, sal_flags),
-            )
+        with_worker_indices(batch, relation.descriptor(), nw, |worker_indices| {
+            with_group(batch, worker_indices, relation, template, targets, nw, |g| {
+                self.sal.write_group_direct(g, 0, kind, ZoneMark::Plain)
+            })
         })
+        .map_err(|fit| fit.refusal(&format!("{kind:?} scatter group")))
+    }
+
+    // --- Deferred publication (see `SalWriter::defer_publication`) ---------
+    //
+    // A zone's groups are laid out invisibly and published together, so a
+    // family that runs out of space can be taken back. The caller must hold
+    // `sal_writer_excl` and must not suspend between these calls.
+
+    pub(crate) fn defer_publication(&self) {
+        self.sal.defer_publication();
+    }
+    pub(crate) fn savepoint(&self) -> crate::runtime::sal::Savepoint {
+        self.sal.savepoint()
+    }
+    pub(crate) fn roll_back(&self, sp: crate::runtime::sal::Savepoint) {
+        self.sal.roll_back(sp);
+    }
+    pub(crate) fn publish_pending(&self) {
+        self.sal.publish_pending();
     }
 
     /// Wake every worker: they see the SAL entry through the mapping's Acquire
@@ -303,7 +321,7 @@ impl MasterDispatcher {
                         // the SAL write side NOW, before writing this round, so
                         // this round lands at write_cursor 0 in the new epoch the
                         // workers already expect. Direct checkpoint_reset only —
-                        // never checkpoint_post_ack / FLAG_FLUSH, which a
+                        // never checkpoint_post_ack / Flush, which a
                         // mid-backfill flush would race, orphaning unconsumed
                         // backfill groups and hanging boot.
                         if pending_reset {
@@ -325,7 +343,7 @@ impl MasterDispatcher {
                         let decision = if all_pad {
                             BACKFILL_DECISION_STOP
                         } else if checkpoint_allowed
-                            && (!self.relay_fits(prep.footprint) || BACKFILL_RELAY_SPACE_LOW.armed())
+                            && (self.relay_fit_raw(prep.footprint) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
                         {
                             pending_reset = true;
                             BACKFILL_DECISION_CHECKPOINT
@@ -363,10 +381,10 @@ impl MasterDispatcher {
     /// is the only lever there is. An idle server past neither line pays
     /// nothing.
     fn checkpoint_before_backfill(&self) -> Result<(), String> {
-        // Reclaim unless the log is still nearly empty. `needs_checkpoint()` is
-        // not implied by the watermark: `GNITZ_CHECKPOINT_BYTES` is unclamped
-        // and may sit below `mmap/8`.
-        if self.sal.cursor() > self.sal.mmap_size() >> 3 || self.sal.needs_checkpoint() {
+        // More *used* than the margin — the opposite sense to `relay_fit_raw`,
+        // which asks for that much *free*. `needs_checkpoint()` is not implied by
+        // it: `GNITZ_CHECKPOINT_BYTES` is unclamped and may sit below the margin.
+        if self.sal.used_bytes() > self.sal.reclaim_margin() as u64 || self.sal.needs_checkpoint() {
             self.reclaim_base()?;
         }
         Ok(())
@@ -378,7 +396,7 @@ impl MasterDispatcher {
     /// holds the catalog write lock with the committer proven idle and the
     /// reactor parked, so no other SAL writer exists — the same exclusivity boot
     /// has). The *async* fan-out / tick / steady-state DDL paths must NOT call
-    /// this — a concurrent FLAG_FLUSH races the committer's own and orphans SAL
+    /// this — a concurrent Flush races the committer's own and orphans SAL
     /// writes straddling `sal.checkpoint_reset`.
     ///
     /// Publish every base table's shards and reset the SAL, invalidating
@@ -396,7 +414,7 @@ impl MasterDispatcher {
     /// in the same reactor-parked span.
     fn reclaim_base(&self) -> Result<u64, String> {
         let gen = self.bump_checkpoint_generation()?;
-        self.sync_round(0, FLAG_FLUSH)?;
+        self.sync_round(0, SalMessageKind::Flush)?;
         Ok(gen)
     }
 
@@ -416,15 +434,16 @@ impl MasterDispatcher {
         for &tid in pending {
             self.drain_tick_blocking(tid)?;
         }
-        self.sync_round(self.cat().durable_generation(), FLAG_FLUSH_EPH)
+        self.sync_round(self.cat().durable_generation(), SalMessageKind::FlushEph)
     }
 
     /// One synchronous round (pre-reactor W2M path, or a reactor-parked window):
     /// emit the flush group, block for every worker's ACK, finalize.
-    /// A `FLAG_FLUSH_EPH` round's `lsn` IS the checkpoint generation (workers
+    /// A `FlushEph` round's `lsn` IS the checkpoint generation (workers
     /// latch it via `set_resume_generation`); the base round passes 0.
-    fn sync_round(&self, lsn: u64, flags: u32) -> Result<(), String> {
-        self.write_checkpoint_group(lsn, flags, GroupTargets::AllSilent)?;
+    fn sync_round(&self, lsn: u64, kind: SalMessageKind) -> Result<(), String> {
+        self.write_checkpoint_group(lsn, kind, GroupTargets::AllSilent)
+            .map_err(|f| f.text)?;
         self.signal_all();
         self.collect_acks("recovery sync")?;
         self.checkpoint_post_ack()
@@ -441,9 +460,9 @@ impl MasterDispatcher {
     /// reclaim-only base round inside `await_servicing` rides step 0's bump
     /// without one of its own — that is the "no intervening ephemeral round"
     /// clause, encoded rather than excepted.
-    fn note_flush_round(&self, lsn: u64, flags: u32) {
+    fn note_flush_round(&self, lsn: u64, kind: SalMessageKind) {
         let durable = self.cat().durable_generation();
-        if flags & FLAG_FLUSH_EPH != 0 {
+        if kind == SalMessageKind::FlushEph {
             debug_assert_eq!(lsn, durable, "ephemeral round must stamp the durable generation");
             self.last_ephemeral_gen.set(lsn);
         } else {
@@ -466,23 +485,17 @@ impl MasterDispatcher {
         &ARMED
     }
 
-    /// Whether a relay of `need` bytes may be written: it must fit, and the SAL
-    /// must still be above the 1/8-of-the-mapping reclaim watermark.
+    /// Whether a relay of `need` bytes may be written, ignoring the `relay_loop`
+    /// test seam: it must fit, and the SAL must still be above the reclaim
+    /// margin — so a reclaim lands on a relay with room to spare rather than on
+    /// one that has run out. Asking for the larger of the two answers both, and
+    /// [`SalFit::Terminal`] survives the fold because the margin is strictly
+    /// under the capacity.
     ///
-    /// A relay is refused below the watermark even when its own group fits, so
-    /// the reclaim lands on a relay with room to spare rather than on one that
-    /// has run out. `fit(x) == Fits` is `x <= capacity - cursor`, so one query
-    /// of the larger requirement answers both.
-    fn relay_fits(&self, need: usize) -> bool {
-        self.sal.fit(need.max(self.sal.mmap_size() as usize >> 3)) == SalFit::Fits
-    }
-
-    /// The watermark alone, ignoring the `relay_loop` test seam. The boot
-    /// backfill relay and the watchdog's reclaim timer both need the real
-    /// verdict: the seam would spuriously fail an in-progress backfill, and
-    /// checkpoint the armed epoch away before `relay_loop` saw it.
-    pub(crate) fn sal_relay_space_ok_raw(&self) -> bool {
-        self.relay_fits(0)
+    /// The raw form is what the boot backfill relay and the watchdog's reclaim
+    /// timer need: the seam would spuriously fail an in-progress backfill.
+    pub(crate) fn relay_fit_raw(&self, need: usize) -> SalFit {
+        self.sal.fit(need.max(self.sal.reclaim_margin()))
     }
 
     /// Build the SAL group an exchange relay writes and hand it to `f`. Sizing
@@ -520,31 +533,26 @@ impl MasterDispatcher {
         }
     }
 
-    /// Whether a group of `need` bytes fits the SAL, and if not, whether a
-    /// checkpoint could make it fit.
-    pub(crate) fn sal_fit(&self, need: usize) -> SalFit {
-        self.sal.fit(need)
-    }
-
-    /// True when the SAL is above the reclaim watermark. Checked *before*
-    /// consuming a relay so a low-space condition can be resolved (checkpoint)
-    /// rather than silently discarding the relay and deadlocking blocked
-    /// workers. While the debug seam is armed, reports low until the next
-    /// checkpoint bumps the SAL epoch.
-    pub(crate) fn sal_has_relay_space(&self) -> bool {
-        if RELAY_SPACE_LOW.armed()
+    /// [`Self::relay_fit_raw`] with the `relay_loop` test seam folded in: while
+    /// the seam is armed at the live SAL epoch, a relay that would fit reports
+    /// [`SalFit::Transient`] instead, so a checkpoint runs and its epoch bump
+    /// disarms it. Checked *before* consuming a relay, so low space is resolved
+    /// rather than silently discarding the relay and deadlocking blocked workers.
+    pub(crate) fn relay_fit(&self, need: usize) -> SalFit {
+        let fit = self.relay_fit_raw(need);
+        if fit == SalFit::Fits
+            && RELAY_SPACE_LOW.armed()
             && Self::seam_armed_epoch().load(std::sync::atomic::Ordering::Relaxed) == self.sal.epoch()
         {
-            return false;
+            return SalFit::Transient;
         }
-        self.sal_relay_space_ok_raw()
+        fit
     }
 
-    /// relay_loop's variant: the first call arms the seam at the current epoch
-    /// (one-shot: the CAS from the u32::MAX sentinel succeeds once per process),
-    /// then defers to sal_has_relay_space() so relay_loop and the committer see
-    /// the same verdict until a checkpoint bumps the epoch and disarms it.
-    pub(crate) fn sal_has_relay_space_arming(&self) -> bool {
+    /// Arm the `relay_loop` space seam at the live SAL epoch, once per process.
+    /// Called by `relay_loop` before its own space check, so [`Self::relay_fit`]
+    /// stays a predicate rather than a predicate with a side effect.
+    pub(crate) fn arm_relay_space_seam(&self) {
         if RELAY_SPACE_LOW.armed() {
             let _ = Self::seam_armed_epoch().compare_exchange(
                 u32::MAX,
@@ -553,7 +561,6 @@ impl MasterDispatcher {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
-        self.sal_has_relay_space()
     }
 
     /// CPU-only first half of exchange relay: looks up shard columns via
@@ -634,7 +641,7 @@ impl MasterDispatcher {
         })
     }
 
-    /// Synchronous second half of a relay: writes the FLAG_EXCHANGE_RELAY group to
+    /// Synchronous second half of a relay: writes the ExchangeRelay group to
     /// SAL and signals workers, stamping the round `decision` (a
     /// `BACKFILL_DECISION_*`) onto the relay's `seek_col_idx`. No awaits inside.
     ///
@@ -649,8 +656,10 @@ impl MasterDispatcher {
     /// passes CONTINUE, which is 0.
     pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), String> {
         self.with_relay_group(&prep.view, prep.source_id, &prep.dest, decision, |g| {
-            self.sal.write_group_direct(g, 0, FLAG_EXCHANGE_RELAY)
-        })?;
+            self.sal
+                .write_group_direct(g, 0, SalMessageKind::ExchangeRelay, ZoneMark::Plain)
+        })
+        .map_err(|fit| fit.refusal("exchange relay").text)?;
         self.signal_all();
         Ok(())
     }
@@ -684,9 +693,11 @@ impl MasterDispatcher {
             }),
             GroupData::NONE,
             0,
-            FLAG_BACKFILL,
+            SalMessageKind::Backfill,
+            ZoneMark::Plain,
             GroupTargets::AllSilent,
-        )?;
+        )
+        .map_err(|f| f.text)?;
         self.signal_all();
         self.collect_acks_and_relay(true, "backfill relay")
     }
@@ -717,7 +728,7 @@ impl MasterDispatcher {
     }
 
     /// Synchronously drain one source's pending ticks during the reactor-parked
-    /// CREATE-VIEW window: emit a FLAG_TICK, signal, and collect each worker's
+    /// CREATE-VIEW window: emit a Tick, signal, and collect each worker's
     /// ACK while relaying its exchange dependents inline. The `handle_ddl_txn`
     /// caller holds the catalog write lock and the tick gate with the committer
     /// idle, so the async `relay_loop` cannot run (no deadlock) and no other tick
@@ -725,7 +736,8 @@ impl MasterDispatcher {
     /// so a CHECKPOINT verdict would advance only the master's epoch and wedge
     /// the cluster (see `collect_acks_and_relay`).
     pub(crate) fn drain_tick_blocking(&self, source_id: i64) -> Result<(), String> {
-        self.write_tick_group(source_id, GroupTargets::AllSilent)?;
+        self.write_tick_group(source_id, GroupTargets::AllSilent)
+            .map_err(|f| f.text)?;
         self.signal_all();
         self.collect_acks_and_relay(false, "backfill relay")
     }
@@ -740,7 +752,7 @@ impl MasterDispatcher {
         let num_workers = self.num_workers;
         let schema = self.cat().schema_or_err(target_id, "seek")?;
         // Decode the wire pair to the OPK bytes (width-universal), then route off
-        // the distribution prefix via the shared `worker_for_pk`. A FLAG_SEEK
+        // the distribution prefix via the shared `worker_for_pk`. A Seek
         // always carries the full PK and the prefix ⊆ the PK, so a full-PK seek
         // pins exactly one worker — no broadcast clause. Hashing the native value
         // instead of the OPK bytes would misroute signed and compound PKs.
@@ -757,11 +769,13 @@ impl MasterDispatcher {
                 },
                 GroupData::NONE,
                 0,
-                FLAG_SEEK,
+                SalMessageKind::Seek,
+                ZoneMark::Plain,
                 targets,
             )
         })
-        .await?;
+        .await
+        .map_err(|f| f.text)?;
         let slot = slots.pop().expect("unicast fan-out returns one slot");
         // A point seek's reply must fit one frame; a train would be forwarded
         // truncated, so reject it rather than silently drop the remainder.
@@ -820,11 +834,13 @@ impl MasterDispatcher {
                 },
                 GroupData::NONE,
                 0,
-                FLAG_SEEK_BY_INDEX,
+                SalMessageKind::SeekByIndex,
+                ZoneMark::Plain,
                 targets,
             )
         })
-        .await?;
+        .await
+        .map_err(|f| f.text)?;
         let expected = expected.expect("fan-out closure ran");
 
         let mut acc: Option<Batch> = None;
@@ -860,10 +876,10 @@ impl MasterDispatcher {
     /// `Ok(false)` if the client disconnects mid-stream, `Err` on a worker
     /// error.
     ///
-    /// `sal_flags`/`wire_flags`/`seek_pk_extra` select the read shape. A plain
+    /// `kind`/`wire_flags`/`seek_pk_extra` select the read shape. A plain
     /// scan passes the client's schema version in `wire_flags` so workers can
-    /// decide whether to include a schema block; a ScanSpec (`ReadSpec`) read
-    /// passes `FLAG_SCAN_SPEC` and the client's bundled spec + reply-schema blob
+    /// decide whether to include a schema block; a [`SalMessageKind::ScanSpec`]
+    /// (`ReadSpec`) read passes the client's bundled spec + reply-schema blob
     /// **verbatim** in `seek_pk_extra` with `wire_flags = 0`, negotiating no
     /// version (its reply carries no schema block — the client decodes against
     /// the schema it authored). The master reads only the bound header out of
@@ -909,7 +925,7 @@ impl MasterDispatcher {
         target_id: i64,
         client_id: u64,
         peer: &Peer,
-        sal_flags: u32,
+        kind: SalMessageKind,
         wire_flags: u64,
         seek_pk_extra: &[u8],
     ) -> Result<(bool, u64), WorkerFault> {
@@ -928,7 +944,8 @@ impl MasterDispatcher {
                 },
                 GroupData::NONE,
                 0,
-                sal_flags,
+                kind,
+                ZoneMark::Plain,
                 targets,
             )
         })
@@ -965,13 +982,14 @@ impl MasterDispatcher {
     /// LSN — one LSN across all broadcasts of a DDL so recovery can group
     /// them as an atomic zone. `zone_start` marks this as the zone's first group,
     /// which is what gives the zone a byte span recovery can attribute damage to.
-    pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64, zone_start: bool) -> Result<(), String> {
+    pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64, zone_start: bool) -> Result<(), WorkerFault> {
         let relation = self.wire_schema(target_id);
         self.write_group(
             relation.frame(wire::WireMsg::default()),
             GroupData::Same(wire::WireData::Whole(Some(batch))),
             lsn,
-            FLAG_DDL_SYNC | if zone_start { FLAG_ZONE_START } else { 0 },
+            SalMessageKind::DdlSync,
+            if zone_start { ZoneMark::Start } else { ZoneMark::Plain },
             GroupTargets::AllSilent,
         )?;
         self.signal_all();
@@ -983,8 +1001,10 @@ impl MasterDispatcher {
     /// and signal workers. All preceding groups at this LSN belong to
     /// the zone; recovery applies them only when this sentinel reaches
     /// disk before the crash.
-    pub fn commit_zone(&self, lsn: u64) -> Result<(), String> {
-        self.sal.write_commit_sentinel(lsn)?;
+    pub fn commit_zone(&self, lsn: u64) -> Result<(), WorkerFault> {
+        self.sal
+            .write_commit_sentinel(lsn)
+            .map_err(|fit| fit.refusal("commit sentinel"))?;
         self.signal_all();
         Ok(())
     }
@@ -1032,7 +1052,7 @@ impl MasterDispatcher {
         fires
     }
 
-    /// Write a FLAG_TICK group for `tid`. Does NOT signal: the caller writes
+    /// Write a Tick group for `tid`. Does NOT signal: the caller writes
     /// every group in the batch, then calls `signal_all` once — a signal is a
     /// wake, not framing, so batching it changes no outcome. No schema block:
     /// `handle_tick` looks the target's schema up in its own catalog.
@@ -1058,12 +1078,12 @@ impl MasterDispatcher {
     /// again under a later one. Recording a round that never reached a worker
     /// gates away nothing: no rows exist at it, and the re-tick raises the map
     /// past it, so a cursor sitting at the burnt round falls through again.
-    pub(crate) fn write_tick_group(&self, tid: i64, targets: GroupTargets<'_>) -> Result<(), String> {
+    pub(crate) fn write_tick_group(&self, tid: i64, targets: GroupTargets<'_>) -> Result<(), WorkerFault> {
         let round = self.tick_round.get() + 1;
         self.tick_round.set(round);
         self.record_delta_round(tid, round);
         if self.take_injected_tick_emit_error(tid) {
-            return Err(format!("injected tick emit error (tid={tid})"));
+            return Err(format!("injected tick emit error (tid={tid})").into());
         }
         self.write_group(
             wire::WireMsg {
@@ -1072,7 +1092,8 @@ impl MasterDispatcher {
             },
             GroupData::NONE,
             round,
-            FLAG_TICK,
+            SalMessageKind::Tick,
+            ZoneMark::Plain,
             targets,
         )
     }
@@ -1188,7 +1209,7 @@ impl MasterDispatcher {
         -1
     }
 
-    /// Broadcast `FLAG_SHUTDOWN` (each worker flushes + `_exit`s) and reap the
+    /// Broadcast `Shutdown` (each worker flushes + `_exit`s) and reap the
     /// worker processes.
     pub fn shutdown_workers(&self) {
         // No schema block: the worker's `Shutdown` arm takes no arguments.
@@ -1196,7 +1217,8 @@ impl MasterDispatcher {
             wire::WireMsg::default(),
             GroupData::NONE,
             0,
-            FLAG_SHUTDOWN,
+            SalMessageKind::Shutdown,
+            ZoneMark::Plain,
             GroupTargets::AllSilent,
         );
         self.signal_all();
@@ -1214,38 +1236,12 @@ impl MasterDispatcher {
         self.cat().drain_checkpoint_gated_deletions();
     }
 
-    /// Whether a transaction's family groups fit the SAL, and if not, whether a
-    /// checkpoint could make them fit. The committer's whole space question in
-    /// one call — it never sees the cursor or the capacity rule itself.
-    pub(crate) fn txn_fit(&self, families: &[(i64, &Batch)]) -> SalFit {
-        self.sal.fit(self.txn_zone_footprint(families))
-    }
-
-    /// The exact SAL footprint (bytes) of a transaction's family groups — the sum
-    /// over families of each family group, partitioned the way
-    /// `write_commit_group` will emit it (broadcast for a replicated schema, else
-    /// PK-partitioned).
-    ///
-    /// Each family is measured as the [`DirectGroup`] `with_scatter_group` builds
-    /// for it, so the fit check and the emission read one set of slot sizes. They
-    /// must not drift: the committer fail-stops the node when a family fails to
-    /// fit after an earlier family already wrote to the SAL.
-    fn txn_zone_footprint(&self, families: &[(i64, &Batch)]) -> usize {
-        let nw = self.num_workers;
-        let mut total = 0usize;
-        for &(tid, batch) in families {
-            let relation = self.wire_schema(tid);
-            let sal = &self.sal;
-            total += with_commit_indices(batch, relation.descriptor(), nw, |wi| {
-                sal.scatter_group_footprint(batch, wi, &relation)
-            });
-        }
-        total
-    }
-
-    /// Write one push batch as a SAL group at the caller's `lsn`, with a
+    /// Lay one push batch out as a SAL group at the caller's `lsn`, with a
     /// per-worker request id. Called from the committer task, which signals,
     /// closes the zone, and awaits fsync + the per-worker ACKs itself.
+    ///
+    /// `Err` carries the SAL's own verdict: the committer turns `Transient` into
+    /// a forced checkpoint, and rolls the transaction's earlier families back.
     pub(crate) fn write_commit_group(
         &self,
         target_id: i64,
@@ -1253,39 +1249,37 @@ impl MasterDispatcher {
         batch: &Batch,
         mode: WireConflictMode,
         req_ids: &[u64],
-        zone_start: bool,
-    ) -> Result<(), String> {
+        mark: ZoneMark,
+    ) -> Result<(), SalFit> {
         self.arm_injected_tick_emit_error(target_id, batch.count);
         let relation = self.wire_schema(target_id);
         let nw = self.num_workers;
-        let wire_flags = wire_flags_set_conflict_mode(0, mode);
         // Identical scatter for both routings; only the per-worker index fill
-        // differs (full broadcast vs PK-partitioned). One `with_scatter_group`
-        // call site keeps the atomic-zone framing, LSN, ACK accounting, and the
-        // committer's single `fdatasync` shared between them.
+        // differs (full broadcast vs PK-partitioned). One `with_group` call site
+        // keeps the atomic-zone framing, LSN, ACK accounting, and the committer's
+        // single `fdatasync` shared between them.
         let template = wire::WireMsg {
-            flags: wire_flags,
+            flags: wire_flags_set_conflict_mode(0, mode),
             ..Default::default()
         };
-        let sal_flags = FLAG_PUSH | if zone_start { FLAG_ZONE_START } else { 0 };
-        let scatter = |worker_indices: &[Vec<u32>]| {
-            self.sal.with_scatter_group(
+        // A replicated relation broadcasts: the whole batch lands in every
+        // worker's ingest + SAL slot, so each worker durably logs the full table
+        // and enforces uniqueness against its identical full copy.
+        with_commit_indices(batch, relation.descriptor(), nw, |worker_indices| {
+            with_group(
                 batch,
                 worker_indices,
                 &relation,
                 template,
                 GroupTargets::All(req_ids),
-                |g| self.sal.write_group_direct(g, lsn, sal_flags),
+                nw,
+                |g| self.sal.write_group_direct(g, lsn, SalMessageKind::Push, mark),
             )
-        };
-        // A replicated relation broadcasts: the whole batch lands in every
-        // worker's ingest + SAL slot, so each worker durably logs the full table
-        // and enforces uniqueness against its identical full copy.
-        with_commit_indices(batch, relation.descriptor(), nw, scatter)
+        })
     }
 
-    /// Write a checkpoint flush group (`FLAG_FLUSH` base round or
-    /// `FLAG_FLUSH_EPH` ephemeral round). Does NOT sync/signal. Caller signals,
+    /// Write a checkpoint flush group ([`SalMessageKind::Flush`] base round or
+    /// [`SalMessageKind::FlushEph`] ephemeral round). Does NOT sync/signal. Caller signals,
     /// then either awaits the replies `targets` names or reads the rings. `lsn` is supplied by the
     /// caller — the ephemeral round passes the checkpoint generation there, which
     /// workers read to stamp view manifests (the base round passes 0).
@@ -1293,15 +1287,27 @@ impl MasterDispatcher {
     /// Every worker gets a bare control block: `handle_flush_all` takes neither a
     /// schema nor a batch, and reads the generation the worker latched into its
     /// catalog off this round's header.
-    pub(crate) fn write_checkpoint_group(&self, lsn: u64, flags: u32, targets: GroupTargets<'_>) -> Result<(), String> {
-        self.note_flush_round(lsn, flags);
-        self.write_group(wire::WireMsg::default(), GroupData::NONE, lsn, flags, targets)
+    pub(crate) fn write_checkpoint_group(
+        &self,
+        lsn: u64,
+        kind: SalMessageKind,
+        targets: GroupTargets<'_>,
+    ) -> Result<(), WorkerFault> {
+        self.note_flush_round(lsn, kind);
+        self.write_group(
+            wire::WireMsg::default(),
+            GroupData::NONE,
+            lsn,
+            kind,
+            ZoneMark::Plain,
+            targets,
+        )
     }
 
     /// Post-ACK checkpoint cleanup: flush system tables before resetting
     /// the SAL cursor (their data lives in SAL entries about to be
     /// discarded), then advance the epoch. Called by both the synchronous
-    /// `sync_round` and the async committer after it collects FLAG_FLUSH ACKs.
+    /// `sync_round` and the async committer after it collects Flush ACKs.
     ///
     /// Finalizes **both** checkpoint rounds — base and ephemeral. The ephemeral
     /// round must flush too: a `commit_serial_range_durable` advance can land in
@@ -1607,7 +1613,7 @@ mod checkpoint_finalize_tests {
 
         // Epoch 0 is the empty-slot sentinel, so the region needs a boot reset
         // before any group is written — what `server_main` does after worker ACKs.
-        disp.reset_sal(1);
+        disp.rewind_sal(1);
 
         assert_eq!(disp.reclaim_base().unwrap(), 1, "the base round bumps G → G+1");
         assert_eq!(disp.cat().durable_generation(), 1);
@@ -1637,7 +1643,7 @@ mod checkpoint_finalize_tests {
 
         let sal_region = SharedRegion::new(SAL_SIZE);
         let disp = finalize_dispatcher(&mut engine as *mut CatalogEngine, &sal_region);
-        disp.reset_sal(1);
+        disp.rewind_sal(1);
 
         let gen = disp.reclaim_base().unwrap();
         assert_ne!(

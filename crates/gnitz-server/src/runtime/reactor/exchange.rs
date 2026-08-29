@@ -24,7 +24,7 @@ use gnitz_wire::MAX_WORKERS;
 /// across all workers for a round; an all-pad round is the final round.
 pub const BACKFILL_PAD_BIT: u64 = 1;
 
-/// Down-leg (master→worker, on `FLAG_EXCHANGE_RELAY`): the collective decision
+/// Down-leg (master→worker, on `ExchangeRelay`): the collective decision
 /// the master stamps onto a round's relay after ANDing the round's pad bits and
 /// checking SAL space. `CONTINUE` keeps the loop going; `STOP` ends every
 /// worker's loop on the same (all-pad) round; `CHECKPOINT` is a continue that

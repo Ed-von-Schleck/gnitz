@@ -27,11 +27,11 @@ use super::executor::{Shared, TickTrigger};
 use super::guard_panic;
 use crate::runtime::master::{await_worker_acks, first_worker_error_opt, TxnFamily};
 use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, Either, ReplyFuture};
-use crate::runtime::sal::{GroupTargets, SalFit, FLAG_FLUSH, FLAG_FLUSH_EPH};
+use crate::runtime::sal::{GroupTargets, SalFit, SalMessageKind, ZoneMark};
 use crate::runtime::wire::DecodedWire;
 use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::storage::Batch;
-use gnitz_wire::WireConflictMode;
+use gnitz_wire::{WireConflictMode, WireFault};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 
@@ -46,7 +46,7 @@ static PUSH_ABORT: Seam = Seam::new("GNITZ_INJECT_PUSH_ABORT");
 pub enum CommitRequest {
     /// Buffer one batch for group commit.
     Push(PendingPush),
-    /// An atomic user-table transaction: N families emitted as N `FLAG_PUSH`
+    /// An atomic user-table transaction: N families emitted as N `Push`
     /// groups inside one zone under one sentinel, with a single `done` for the
     /// whole bundle. Validated and lock-guarded by the executor before it
     /// reaches here.
@@ -65,7 +65,7 @@ pub enum CommitRequest {
 /// refuses a stream target — so a transaction always opens a zone.
 pub struct PendingTxn {
     pub families: Vec<TxnFamily>,
-    pub done: oneshot::Sender<Result<u64, String>>,
+    pub done: oneshot::Sender<Result<u64, WireFault>>,
 }
 
 /// Who issued a `CommitRequest::Barrier`, and therefore how the committer
@@ -103,7 +103,7 @@ pub struct PendingPush {
     /// stream. Decided by the executor, which has already resolved the target's kind,
     /// so the committer never asks the catalog what a relation *is*.
     pub recoverable: bool,
-    pub done: oneshot::Sender<Result<u64, String>>,
+    pub done: oneshot::Sender<Result<u64, WireFault>>,
 }
 
 /// The committer task loop. Returns when all senders drop (shutdown).
@@ -148,8 +148,8 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // threshold directly, covering GNITZ_CHECKPOINT_BYTES configs above
         // it. A Shutdown barrier forces the full sequence regardless of SAL
         // fullness. Must complete fully before commit groups go out: workers
-        // bump their expected_epoch on FLAG_FLUSH, so commit groups written
-        // AFTER FLAG_FLUSH in the same epoch would be silently skipped by
+        // bump their expected_epoch on Flush, so commit groups written
+        // AFTER Flush in the same epoch would be silently skipped by
         // workers.
         let has_barriers = !batch.barriers.is_empty();
         // A Shutdown barrier, or a relay that reported its own group does not
@@ -175,7 +175,7 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
             && (forced
                 || force_ckpt
                 || shared.disp().sal_needs_checkpoint()
-                || (has_barriers && !shared.disp().sal_has_relay_space()));
+                || (has_barriers && shared.disp().relay_fit(0) != SalFit::Fits));
 
         if checkpoint {
             // The full three-step sequence: gen bump → base round → drain →
@@ -276,8 +276,8 @@ fn drain_ready_batch(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitReques
 /// skipped, and the reset then orphans them permanently while their writers wait
 /// for ACKs that never arrive.
 ///
-/// `ephemeral_gen: None` — base/reclaim round: `FLAG_FLUSH` (lsn 0, unused).
-/// `Some(gen)` — ephemeral round: `FLAG_FLUSH_EPH` carrying the generation in
+/// `ephemeral_gen: None` — base/reclaim round: `Flush` (lsn 0, unused).
+/// `Some(gen)` — ephemeral round: `FlushEph` carrying the generation in
 /// the group header's `lsn` field (workers read it to stamp view manifests).
 /// Both rounds finalize identically via `checkpoint_post_ack` (system-table
 /// flush + gated-deletion drain + reset): a `commit_serial_range_durable`
@@ -300,11 +300,12 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<
         let disp = shared.disp();
         // FlushEph's lsn IS the checkpoint generation — workers latch it via
         // `set_resume_generation`. The base round's lsn is unread; pass 0.
-        let (lsn, flags) = match ephemeral_gen {
-            Some(gen) => (gen, FLAG_FLUSH_EPH),
-            None => (0, FLAG_FLUSH),
+        let (lsn, kind) = match ephemeral_gen {
+            Some(gen) => (gen, SalMessageKind::FlushEph),
+            None => (0, SalMessageKind::Flush),
         };
-        disp.write_checkpoint_group(lsn, flags, GroupTargets::All(&req_ids))?;
+        disp.write_checkpoint_group(lsn, kind, GroupTargets::All(&req_ids))
+            .map_err(|f| f.text)?;
         disp.signal_all();
     }
 
@@ -344,7 +345,7 @@ async fn run_checkpoint_sequence(
     };
 
     // Step 1: base round. A failure is unrecoverable in-process (workers
-    // already bumped their read epoch on FLAG_FLUSH but the master did not
+    // already bumped their read epoch on Flush but the master did not
     // reset the SAL, so the cluster is epoch-desynced). Abort so restart
     // replays the un-reset SAL and re-derives views from the durable base
     // tables.
@@ -440,7 +441,7 @@ async fn await_servicing<T>(
                 // broadcast + per-worker-ACK + system-table flush for nothing.
                 // A `forced` request states a requirement that predicate cannot
                 // see, so it runs the round regardless.
-                if forced || !shared.disp().sal_has_relay_space() {
+                if forced || shared.disp().relay_fit(0) != SalFit::Fits {
                     if let Err(e) = flush_round(shared, None).await {
                         gnitz_fatal_abort!("reclaim checkpoint failed, cluster epoch-desynced: {}", e);
                     }
@@ -464,7 +465,7 @@ struct GroupInfo {
     recoverable: bool,
     req_ids: Vec<u64>,
     merged: Batch,
-    write_err: Option<String>,
+    write_err: Option<WireFault>,
 }
 
 /// One client-visible commit unit — the span of `groups` it emits and the `done`
@@ -474,16 +475,15 @@ struct GroupInfo {
 /// emission order, so iterating units visits groups in group order.
 struct CommitUnit {
     groups: std::ops::Range<usize>,
-    dones: Vec<oneshot::Sender<Result<u64, String>>>,
+    dones: Vec<oneshot::Sender<Result<u64, WireFault>>>,
     /// Whether a worker-ACK error may downgrade this unit's verdict. Single
-    /// pushes degrade gracefully per group, so they do. A transaction is emitted
-    /// fail-stop under a pre-checked fit and its contract is "Err ⇒ nothing
-    /// committed", so once the zone's sentinel is durable a worker error must
-    /// never turn its `Ok` into an `Err`. Dropping the error instead is sound
-    /// only while no *graceful* worker push error can reach here: a real apply
-    /// error fail-stops the worker, and "table not registered" is excluded by the
-    /// DDL tick quiesce (`TickGate`) plus the catalog read lock held through the
-    /// ACK. `commit_pushes` aborts rather than trusting that in prose.
+    /// pushes degrade gracefully per group, so they do. A transaction's contract
+    /// is "Err ⇒ nothing committed", so once its sentinel is durable a worker
+    /// error must never turn its `Ok` into an `Err`. Dropping the error instead
+    /// is sound only while no *graceful* worker push error can reach here: a real
+    /// apply error fail-stops the worker, and "table not registered" is excluded
+    /// by the DDL tick quiesce (`TickGate`) plus the catalog read lock held
+    /// through the ACK. `commit_pushes` aborts rather than trusting that in prose.
     downgrade_on_worker_err: bool,
 }
 
@@ -589,7 +589,7 @@ async fn commit_pushes(
                     Ok(Batch::empty_with_schema(&shared.disp().schema_desc_for(tid)))
                 })
                 .unwrap_or_else(|_| Batch::empty_with_schema(&gnitz_engine::schema::SchemaDescriptor::minimal_u64()));
-                (placeholder, Some(panic_msg))
+                (placeholder, Some(WireFault::from(panic_msg)))
             }
         };
 
@@ -628,6 +628,12 @@ async fn commit_pushes(
         // user-table push pins no system-family counter, so the floor is 0.
         let zone_lsn = shared.lsn_alloc.reserve(0);
 
+        // Nothing laid out below is visible until `publish_pending`, so a
+        // transaction that runs out of SAL space part-way can take its earlier
+        // families back. Every write, the sentinel and the fsync submit are in
+        // this one synchronous block, so no reader ever observes the gap.
+        shared.disp().defer_publication();
+
         // Opened by the first recoverable group that reaches the SAL.
         let mut zone_opened = false;
 
@@ -635,51 +641,31 @@ async fn commit_pushes(
         for unit in &units {
             let span = unit.groups.clone();
             if unit.downgrade_on_worker_err {
-                // A single-push group degrades gracefully: a failed
-                // `sal_begin_group` writes zero bytes and simply skips it.
+                // A single-push group degrades gracefully: a refused group wrote
+                // zero bytes, and the batch simply skips it.
                 let g = &mut groups[span.start];
                 if g.write_err.is_none() {
-                    g.write_err = write_group(shared, g, zone_lsn, &mut zone_opened);
+                    g.write_err = lay_out_group(shared, g, zone_lsn, &mut zone_opened).err();
                 }
                 continue;
             }
 
-            // A transaction is fit-checked as a whole against the live SAL, then
-            // emitted fail-stop: once one family has hit the SAL, a later family
-            // failing is a "can't happen" logic fault (the fit check guarantees
-            // every family fits) that must crash the node rather than tear a
-            // committed zone. A failure on the FIRST family (nothing committed
-            // yet) fails the transaction cleanly.
-            let families: Vec<(i64, &Batch)> = groups[span.clone()].iter().map(|g| (g.tid, &g.merged)).collect();
-            let fail = match shared.disp().txn_fit(&families) {
-                SalFit::Terminal => Some("transaction exceeds SAL capacity".to_string()),
-                SalFit::Transient => {
-                    // Force a checkpoint before the next batch so the client's
-                    // retry finds a reclaimed SAL.
-                    shared.force_checkpoint.set(true);
-                    Some("transaction exceeds SAL space".to_string())
+            // A transaction is all-or-nothing: a family that does not fit rolls
+            // the whole bundle back to where it started, and the families before
+            // it were never published.
+            let savepoint = shared.disp().savepoint();
+            let zone_before = zone_opened;
+            let mut fail = None;
+            for gi in span.clone() {
+                let g = &mut groups[gi];
+                if let Err(e) = lay_out_group(shared, g, zone_lsn, &mut zone_opened) {
+                    fail = Some(e);
+                    break;
                 }
-                SalFit::Fits => {
-                    let mut committed_a_family = false;
-                    let mut first_fail = None;
-                    for gi in span.clone() {
-                        let g = &mut groups[gi];
-                        match write_group(shared, g, zone_lsn, &mut zone_opened) {
-                            None => committed_a_family = true,
-                            Some(e) if committed_a_family => gnitz_fatal_abort!(
-                                "txn family emission failed after an earlier family committed to the SAL: {}",
-                                e
-                            ),
-                            Some(e) => {
-                                first_fail = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                    first_fail
-                }
-            };
+            }
             if let Some(e) = fail {
+                shared.disp().roll_back(savepoint);
+                zone_opened = zone_before;
                 for g in groups[span].iter_mut() {
                     g.write_err.get_or_insert_with(|| e.clone());
                 }
@@ -689,11 +675,16 @@ async fn commit_pushes(
         let any_written = groups.iter().any(|g| g.write_err.is_none());
         if !any_written {
             // No group wrote → no sentinel; every unit resolves to its first error.
+            shared.disp().publish_pending();
             for unit in units {
                 unit.resolve(&groups, zone_lsn);
             }
             return;
         }
+
+        // Every laid-out group becomes visible here, before the sentinel — which
+        // is what the crash seam below cuts between.
+        shared.disp().publish_pending();
 
         // Abort after push groups but BEFORE the commit sentinel. SAL recovery
         // skips any zone whose sentinel is absent; workers that already flushed
@@ -707,7 +698,7 @@ async fn commit_pushes(
         }
 
         // Close the zone with the commit sentinel before fsync.  If this
-        // fails the zone has no FLAG_TXN_COMMIT and recovery would silently
+        // fails the zone has no commit sentinel and recovery would silently
         // drop all groups in the zone — that is unrecoverable data loss
         // after a restart while the client already received Ok.  Abort.
         // `commit_zone` signals the workers itself once the sentinel is published.
@@ -863,22 +854,32 @@ fn invalidate_filters(shared: &Rc<Shared>, tid: i64) {
     });
 }
 
-/// Emit one group into the open zone, returning the write error if any. Wrapped
-/// in `guard_panic` so a malformed batch fails the group instead of the node.
+/// Lay one group out into the open zone. Wrapped in `guard_panic` so a malformed
+/// batch fails the group instead of the node.
 ///
 /// The zone is opened by the first `recoverable` group that actually writes bytes —
-/// a refused `sal_begin_group` writes none.
-fn write_group(shared: &Rc<Shared>, g: &GroupInfo, zone_lsn: u64, zone_opened: &mut bool) -> Option<String> {
+/// a refused group writes none. A [`SalFit::Transient`] refusal arms the forced
+/// checkpoint here, where the verdict is observed, so a client's retry finds a
+/// reclaimed SAL whether the refusal cost it a single push or a transaction.
+fn lay_out_group(shared: &Rc<Shared>, g: &GroupInfo, zone_lsn: u64, zone_opened: &mut bool) -> Result<(), WireFault> {
     let zone_start = !*zone_opened && g.recoverable;
-    let err = guard_panic("commit_write", || {
+    let mark = if zone_start { ZoneMark::Start } else { ZoneMark::Plain };
+    // The guard covers the encode, which reads a client-supplied batch; the SAL's
+    // own verdict comes back out of it typed.
+    let refused = guard_panic("commit_write", || {
         Ok(shared
             .disp()
-            .write_commit_group(g.tid, zone_lsn, &g.merged, g.mode, &g.req_ids, zone_start)
+            .write_commit_group(g.tid, zone_lsn, &g.merged, g.mode, &g.req_ids, mark)
             .err())
-    })
-    .unwrap_or_else(Some);
-    if zone_start && err.is_none() {
+    })?;
+    if let Some(fit) = refused {
+        if fit == SalFit::Transient {
+            shared.force_checkpoint.set(true);
+        }
+        return Err(fit.refusal("commit group"));
+    }
+    if zone_start {
         *zone_opened = true;
     }
-    err
+    Ok(())
 }

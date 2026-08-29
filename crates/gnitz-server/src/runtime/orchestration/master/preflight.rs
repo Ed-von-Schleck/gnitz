@@ -27,14 +27,14 @@ pub(super) enum CheckRoute {
     /// partition.
     Broadcast,
     /// Partition by the schema PK and scatter, so each worker is sent only the
-    /// keys it stores. Delivered via `with_scatter_group` without materializing
+    /// keys it stores. Delivered via `scatter::with_group` without materializing
     /// intermediate per-worker `Batch`es — `execute_pipeline` computes the
     /// routing from the check schema's `pk_indices()` via `with_worker_indices`.
     ScatterByPk,
 }
 
 /// A single distributed has-pk check queued for pipelined execution
-/// (always dispatched under FLAG_HAS_PK). `col_hint` is the worker's
+/// (always dispatched under HasPk). `col_hint` is the worker's
 /// `seek_col_idx`: `pack_pk_cols(&[col…])` for an index check (the packed flag
 /// at bit 63 is always set, so it never collides with the PK sentinel) or 0 for
 /// a PK check, optionally OR'd with `HAS_PK_WANT_HOLDER`.
@@ -424,7 +424,7 @@ const TXN_RESTRICT_FETCH_LIMIT: usize = 1024;
 /// conflict `mode`, and the decoded batch. The family schema is resolved from
 /// the catalog by tid (every family of a tid shares one schema, checked at shape
 /// time). The executor decodes into these, the validator borrows them, and the
-/// committer takes them by value and emits each as one `FLAG_PUSH` group.
+/// committer takes them by value and emits each as one `Push` group.
 pub struct TxnFamily {
     pub tid: i64,
     pub mode: WireConflictMode,
@@ -1422,11 +1422,13 @@ impl MasterDispatcher {
                 },
                 GroupData::NONE,
                 0,
-                FLAG_UNIQUE_PREFLIGHT,
+                SalMessageKind::UniquePreflight,
+                ZoneMark::Plain,
                 targets,
             )
         })
-        .await?;
+        .await
+        .map_err(|f| f.text)?;
 
         let merged = merge_index_scan(slots, &scan, reactor, &frame_schema).await?;
         if merged.duplicate {
@@ -1471,23 +1473,28 @@ impl MasterDispatcher {
             for (idx, check) in checks.iter().enumerate() {
                 let req_slice = &rids[idx * nw..(idx + 1) * nw];
                 match check.route {
-                    CheckRoute::Broadcast => disp.write_group(
-                        check.schema.frame(wire::WireMsg {
-                            seek_col_idx: check.col_hint,
-                            ..Default::default()
-                        }),
-                        GroupData::Same(wire::WireData::Whole(Some(&check.batch))),
-                        0,
-                        FLAG_HAS_PK,
-                        GroupTargets::All(req_slice),
-                    )?,
-                    CheckRoute::ScatterByPk => disp.write_scatter_group(
-                        &check.batch,
-                        &check.schema,
-                        FLAG_HAS_PK,
-                        check.col_hint,
-                        GroupTargets::All(req_slice),
-                    )?,
+                    CheckRoute::Broadcast => disp
+                        .write_group(
+                            check.schema.frame(wire::WireMsg {
+                                seek_col_idx: check.col_hint,
+                                ..Default::default()
+                            }),
+                            GroupData::Same(wire::WireData::Whole(Some(&check.batch))),
+                            0,
+                            SalMessageKind::HasPk,
+                            ZoneMark::Plain,
+                            GroupTargets::All(req_slice),
+                        )
+                        .map_err(|f| f.text)?,
+                    CheckRoute::ScatterByPk => disp
+                        .write_scatter_group(
+                            &check.batch,
+                            &check.schema,
+                            SalMessageKind::HasPk,
+                            check.col_hint,
+                            GroupTargets::All(req_slice),
+                        )
+                        .map_err(|f| f.text)?,
                 }
             }
             disp.signal_all();
@@ -1559,7 +1566,7 @@ impl MasterDispatcher {
         }
         // Sort so each worker's sublist reaches `gather_family` ascending:
         // `removed`/updated PKs are extracted from an FxHashMap (arbitrary
-        // order) and `with_scatter_group` preserves per-worker relative order,
+        // order) and `scatter::with_group` preserves per-worker relative order,
         // so a globally sorted input yields per-worker-sorted sublists.
         pks.sort_unstable();
 
@@ -1577,13 +1584,14 @@ impl MasterDispatcher {
         let (slots, scan) = dispatch_scan_fanout(disp, reactor, Fanout::Broadcast, |targets| {
             let pooled = disp.pool_pop_batch((target_id, 0));
             let batch = build_check_batch_pk_bytes(&parent_schema, pks.iter().map(|p| p.pk_bytes()), pooled);
-            disp.write_scatter_group(&batch, &parent, FLAG_GATHER, ref_col as u64, targets)?;
+            disp.write_scatter_group(&batch, &parent, SalMessageKind::Gather, ref_col as u64, targets)?;
             // The scatter batch is fully consumed by the synchronous
-            // with_scatter_group above; return it to the pool.
+            // scatter above; return it to the pool.
             recycle_check_batch(disp, (target_id, 0), batch);
             Ok(())
         })
-        .await?;
+        .await
+        .map_err(|f| f.text)?;
 
         // The reply projects `ref_col` to payload column 0; read its type and
         // width off the parent schema once.

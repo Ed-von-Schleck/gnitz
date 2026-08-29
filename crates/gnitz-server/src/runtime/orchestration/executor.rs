@@ -5,10 +5,10 @@
 //! - all per-fd connection tasks (one per client),
 //! - the committer task (group commit + checkpoint + fsync),
 //! - the tick task (event-driven, coalesces triggers),
-//! - the relay task (writes FLAG_EXCHANGE_RELAY groups),
+//! - the relay task (writes ExchangeRelay groups),
 //! - the worker-crash watcher task.
 //!
-//! Ticks allocate per-worker req_ids, write one FLAG_TICK group per
+//! Ticks allocate per-worker req_ids, write one Tick group per
 //! pending tid, signal once, and `join_all` the ACKs through the
 //! reactor's reply routing. The reactor demuxes FLAG_EXCHANGE wires
 //! into an accumulator and hands completed views to the relay task.
@@ -38,7 +38,7 @@ use crate::runtime::reactor::BACKFILL_DECISION_CONTINUE;
 use crate::runtime::reactor::{
     mpsc, oneshot, select2, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard, ReplyFuture, WriteGuard,
 };
-use crate::runtime::sal::{GroupTargets, SalFit, FLAG_DELTA_SCAN, FLAG_SCAN_SPEC};
+use crate::runtime::sal::{GroupTargets, SalFit, SalMessageKind};
 use crate::runtime::wire::{self as ipc, validate_schema_match, SchemaWithVersion};
 use gnitz_engine::catalog::{
     family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, CatalogEngine, SysFamily, FIRST_USER_TABLE_ID,
@@ -47,7 +47,7 @@ use gnitz_engine::catalog::{
 use gnitz_engine::query::RelationKind;
 use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine::storage::Batch;
-use gnitz_wire::{STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH};
+use gnitz_wire::{WireFault, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
 const TICK_DEADLINE_MS: u64 = 20;
@@ -181,7 +181,7 @@ pub struct Shared {
     /// until the window closes.
     pub(super) force_checkpoint: Cell<bool>,
     /// Tables with a pending delta, each with the row count feeding the tick
-    /// threshold. `run_tick` writes one `FLAG_TICK` group per tid inside one
+    /// threshold. `run_tick` writes one `Tick` group per tid inside one
     /// `sal_writer_excl` window before awaiting any ACK, so the order the map
     /// yields them in only changes the order the workers see the groups in.
     pub(super) tick_rows: RefCell<FxHashMap<i64, usize>>,
@@ -645,10 +645,10 @@ fn install_shutdown_signal_handlers() {
 }
 
 /// One 100 ms reactor-timer poll loop with two terminal duties: worker-crash
-/// detection (broadcast FLAG_SHUTDOWN, stop the reactor) and graceful shutdown
+/// detection (broadcast Shutdown, stop the reactor) and graceful shutdown
 /// on SIGTERM/SIGINT — stop admitting pushes, run one final full checkpoint
 /// through the committer (drain + persist while the reactor is still live),
-/// then broadcast FLAG_SHUTDOWN and request reactor shutdown so `server_main`
+/// then broadcast Shutdown and request reactor shutdown so `server_main`
 /// exits cleanly. A signalfd fd-await would need new reactor machinery; the
 /// timer poll is the established pattern.
 async fn watchdog(shared: Rc<Shared>) {
@@ -706,7 +706,7 @@ async fn watchdog(shared: Rc<Shared>) {
         // On a write workload it is inert: the committer already checkpoints at
         // 3/4 on every push, well before this 7/8 line. Skipped inside a DDL
         // window, where the committer refuses every checkpoint anyway.
-        if shared.ddl_window.get() == 0 && !shared.disp().sal_relay_space_ok_raw() {
+        if shared.ddl_window.get() == 0 && shared.disp().relay_fit_raw(0) != SalFit::Fits {
             let (tx, done) = oneshot::channel();
             shared.committer_tx.send(CommitRequest::Barrier {
                 kind: BarrierKind::Reclaim { forced: false },
@@ -819,7 +819,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
     }
 }
 
-/// Emit FLAG_TICK groups for every `tid` and await the per-worker ACKs.
+/// Emit Tick groups for every `tid` and await the per-worker ACKs.
 ///
 /// The emit-and-await lock shape: req_ids allocated before any lock,
 /// `catalog_rwlock.read()` (so DDL cannot mutate schemas mid-emission) +
@@ -865,7 +865,7 @@ async fn run_tick(
         let mut result = Ok(());
         for (i, &tid) in tids.iter().enumerate() {
             if let Err(e) = disp.write_tick_group(tid, GroupTargets::All(&req_ids[i * nw..(i + 1) * nw])) {
-                result = Err(e);
+                result = Err(e.text);
                 break;
             }
             emitted.set(i + 1);
@@ -927,7 +927,7 @@ async fn hold_relay_for_ddl(shared: &Shared) {
 const HOLD_RELAY_MAX_POLLS: u32 = 10_000;
 
 /// Consume completed `PendingRelay`s from the reactor's exchange
-/// accumulator and write FLAG_EXCHANGE_RELAY groups back through the
+/// accumulator and write ExchangeRelay groups back through the
 /// dispatcher.  Lives in its own task so the SAL write happens outside
 /// the reactor's synchronous CQE handler — `prepare_relay` reads the
 /// catalog DAG (needs catalog_rwlock.read) and `emit_relay_with_decision`
@@ -946,6 +946,12 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
             Some(r) => r,
             None => return,
         };
+
+        // Arm the low-space test seam at the SAL epoch this first relay sees.
+        // One-shot per process, and here rather than inside the space predicate
+        // so the committer and this loop can both read that predicate without
+        // one of them arming it as a side effect.
+        shared.disp().arm_relay_space_seam();
 
         if RELAY_HOLD_FOR_DDL.take_once() {
             hold_relay_for_ddl(&shared).await;
@@ -969,38 +975,38 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
         loop {
             {
                 let _sal = shared.disp().sal_excl().lock().await;
-                let fit = shared.disp().sal_fit(prep.footprint);
-                // The relay is written whole — there is no chunked form — so a
-                // group over capacity is one no checkpoint can deliver.
-                if fit == SalFit::Terminal {
-                    gnitz_fatal_abort!("exchange relay exceeds the SAL outright; no checkpoint can deliver it");
-                }
-                // Both conditions: the group must fit at this cursor, and the
-                // SAL must be above the proactive reclaim watermark.
-                if fit == SalFit::Fits && shared.disp().sal_has_relay_space_arming() {
-                    // Always CONTINUE: only steady-state tick exchanges reach this
-                    // loop (both chunked-backfill drivers collect their relays
-                    // synchronously in `collect_acks_and_relay`, the sole
-                    // STOP/CHECKPOINT stamper), and a tick round never pads.
-                    if let Err(e) = guard_panic("emit_relay", || {
-                        shared
-                            .disp()
-                            .emit_relay_with_decision(&prep, BACKFILL_DECISION_CONTINUE)
-                    }) {
-                        gnitz_fatal_abort!(
-                            "emit_relay failed; a lost relay wedges workers \
-                             blocked in exchange wait: {}",
-                            e
-                        );
+                match shared.disp().relay_fit(prep.footprint) {
+                    // The relay is written whole — there is no chunked form — so
+                    // a group over capacity is one no checkpoint can deliver.
+                    SalFit::Terminal => {
+                        gnitz_fatal_abort!("exchange relay exceeds the SAL outright; no checkpoint can deliver it")
                     }
-                    break;
-                }
-                if reclaimed {
-                    gnitz_fatal_abort!(
-                        "SAL space exhausted even after forced checkpoint; \
-                         cannot deliver exchange relay — aborting to prevent \
-                         cluster deadlock"
-                    );
+                    SalFit::Fits => {
+                        // Always CONTINUE: only steady-state tick exchanges reach
+                        // this loop (both chunked-backfill drivers collect their
+                        // relays synchronously in `collect_acks_and_relay`, the
+                        // sole STOP/CHECKPOINT stamper), and a tick round never pads.
+                        if let Err(e) = guard_panic("emit_relay", || {
+                            shared
+                                .disp()
+                                .emit_relay_with_decision(&prep, BACKFILL_DECISION_CONTINUE)
+                        }) {
+                            gnitz_fatal_abort!(
+                                "emit_relay failed; a lost relay wedges workers \
+                                 blocked in exchange wait: {}",
+                                e
+                            );
+                        }
+                        break;
+                    }
+                    SalFit::Transient if reclaimed => {
+                        gnitz_fatal_abort!(
+                            "SAL space exhausted even after forced checkpoint; \
+                             cannot deliver exchange relay — aborting to prevent \
+                             cluster deadlock"
+                        )
+                    }
+                    SalFit::Transient => {}
                 }
             }
             gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
@@ -1297,7 +1303,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
     }
 
     // Route through the committer and wait for commit ACK.
-    let (tx, rx) = oneshot::channel::<Result<u64, String>>();
+    let (tx, rx) = oneshot::channel::<Result<u64, WireFault>>();
     let is_stream = kind == RelationKind::Stream;
     shared.committer_tx.send(CommitRequest::Push(PendingPush {
         tid: target_id,
@@ -1336,7 +1342,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
             )
             .await;
         }
-        Ok(Err(e)) => send_error(peer, target_id, client_id, e.as_bytes()).await,
+        Ok(Err(fault)) => send_fault(peer, target_id, client_id, &fault).await,
         Err(_) => send_error(peer, target_id, client_id, b"committer shut down").await,
     }
 }
@@ -1389,7 +1395,7 @@ enum PushTxnOutcome {
 
 /// Handle an atomic user-table transaction (`FLAG_PUSH_TXN`): decode + validate
 /// the bundle as a unit under the union of the involved table locks, run the OCC
-/// precondition check under those locks, then emit it as N `FLAG_PUSH` groups
+/// precondition check under those locks, then emit it as N `Push` groups
 /// inside one zone under one sentinel. Mirrors the plain-push arm's lock order
 /// (catalog read lock, then the per-table lock union ascending) and its late
 /// `draining` check; both locks are held through the committer ACK. Every
@@ -1416,7 +1422,7 @@ async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             });
             peer.send_buffer_or_close(buf).await;
         }
-        Err(e) => send_error(peer, 0, client_id, e.as_bytes()).await,
+        Err(fault) => send_fault(peer, 0, client_id, &fault).await,
     }
 }
 
@@ -1424,13 +1430,13 @@ async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
 /// caller above owns the single reply path. Returns `Committed(zone_lsn)` on a
 /// durable commit or `Conflict(fresh_basis)` when the OCC precondition check
 /// fails.
-async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcome, String> {
+async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcome, WireFault> {
     // 1. Decode + frame-local shape rules (no catalog access). The frame carries
     //    the families and the OCC preconditions (each `(tid, basis)`).
     let (raw, preconditions) =
         gnitz_wire::txn_frame::decode_push_txn(data).map_err(|e| format!("decode error: {e}"))?;
     if raw.is_empty() {
-        return Err("TXN: empty family bundle".to_string());
+        return Err("TXN: empty family bundle".into());
     }
 
     // 2. Catalog read lock (excludes a concurrent DROP/DDL), then the
@@ -1441,15 +1447,13 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         // The wire carries the tid as u32; the catalog addresses it as i64.
         let tid = fam.tid as i64;
         if tid < FIRST_USER_TABLE_ID {
-            return Err(format!("TXN: {tid} is not a user table"));
+            return Err(format!("TXN: {tid} is not a user table").into());
         }
         // Same existence + writability gate the plain-push arm applies, so a view
         // target is rejected identically. Refusing a stream keeps every transaction
         // family `recoverable`, so a transaction always opens a zone.
         if target_kind(shared, tid, Access::Write)? == RelationKind::Stream {
-            return Err(format!(
-                "table {tid} is a stream: a stream cannot be written inside a transaction"
-            ));
+            return Err(format!("table {tid} is a stream: a stream cannot be written inside a transaction").into());
         }
         // `target_kind` above already proved the relation exists.
         let catalog_schema = shared
@@ -1465,7 +1469,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         let batch = decode_client_batch(fam.wal_block, &catalog_schema)
             .map_err(|e| format!("TXN family {tid} decode error: {e}"))?;
         if batch.count == 0 {
-            return Err(format!("TXN: empty batch for table {tid}"));
+            return Err(format!("TXN: empty batch for table {tid}").into());
         }
         let mode = gnitz_wire::WireConflictMode::from_wire(fam.mode)
             .ok_or_else(|| format!("TXN family {tid}: unknown conflict mode {}", fam.mode))?;
@@ -1496,7 +1500,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
     for &(tid, basis) in &preconditions {
         let tid = tid as i64;
         if !family_tids.contains(&tid) {
-            return Err(format!("TXN: precondition on {tid}: not a written table"));
+            return Err(format!("TXN: precondition on {tid}: not a written table").into());
         }
         if shared.commit_lsn_of(tid) > basis {
             return Ok(PushTxnOutcome::Conflict(shared.lsn_alloc.published()));
@@ -1515,18 +1519,18 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
     //    transaction that observed `draining == false` enqueues before the
     //    watchdog's Shutdown barrier.
     if shared.draining.get() {
-        return Err("server shutting down".to_string());
+        return Err("server shutting down".into());
     }
 
     // 6. Route through the committer and wait for the zone ACK. `families` is
     //    moved here; `family_tids` was captured above for the bump.
-    let (tx, rx) = oneshot::channel::<Result<u64, String>>();
+    let (tx, rx) = oneshot::channel::<Result<u64, WireFault>>();
     shared
         .committer_tx
         .send(CommitRequest::Txn(PendingTxn { families, done: tx }));
     // Double `?`: the outer unwraps a channel cancel, the inner a committer
     // `Err` — so the bump below is reached ONLY on a successful commit.
-    let lsn = rx.await.map_err(|_| "committer shut down".to_string())??;
+    let lsn = rx.await.map_err(|_| "committer shut down")??;
 
     // 7. Record the commit LSN for every family tid while the table locks are
     //    still held (`_tlocks` in scope), so a later same-tid txn cannot pass its
@@ -2059,7 +2063,7 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
             target_id,
             client_id,
             peer,
-            0,
+            SalMessageKind::Scan,
             gnitz_wire::wire_flags_set_schema_version(0, server_version),
             &[],
         )
@@ -2102,7 +2106,7 @@ async fn finish_scan_fanout(
             peer.send_buffer_or_close(terminal).await;
         }
         Ok(false) => peer.close(),
-        Err(f) => send_status_frame(peer, target_id, client_id, f.status, f.text.as_bytes()).await,
+        Err(f) => send_fault(peer, target_id, client_id, &f).await,
     }
 }
 
@@ -2119,8 +2123,8 @@ async fn finish_scan_fanout(
 /// reach the same bytes.
 ///
 /// 1. It takes no drain ([`ReadFreshness::AsOfLastTick`]).
-/// 2. Its group carries `FLAG_DELTA_SCAN`, which is what makes the worker defer
-///    it out of an in-flight evaluation.
+/// 2. Its group is a `ScanSpec { delta: true }`, which is what makes the worker
+///    defer it out of an in-flight evaluation.
 /// 3. Its terminal frame reports `(cursor tag, T)` instead of the last-committed
 ///    LSN, and an up-to-date poll is answered here, master-locally.
 async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, seek_pk_extra: &[u8]) {
@@ -2182,7 +2186,9 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
     // each of which would carry its own copy of the spec blob under the exclusive
     // SAL mutex.
     let unicast = scan_spec_route(shared.disp(), target_id, spec);
-    let sal_flags = FLAG_SCAN_SPEC | if delta_cursor.is_some() { FLAG_DELTA_SCAN } else { 0 };
+    let kind = SalMessageKind::ScanSpec {
+        delta: delta_cursor.is_some(),
+    };
     let result = shared
         .disp()
         .fan_out_scan(
@@ -2191,7 +2197,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
             target_id,
             client_id,
             peer,
-            sal_flags,
+            kind,
             0,
             seek_pk_extra,
         )
@@ -2301,7 +2307,9 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             });
             fanout.push((tid, unicast, server_version));
         }
-        let dispatches = dispatch_scan_multi_fanout(shared.disp(), &shared.reactor, client_id, &fanout).await?;
+        let dispatches = dispatch_scan_multi_fanout(shared.disp(), &shared.reactor, client_id, &fanout)
+            .await
+            .map_err(|f| f.text)?;
         // Release the catalog read lock here: Phase 2 touches no catalog state
         // (the snapshot is worker-frozen and the schemas are captured), so
         // holding it across the whole bulk read would needlessly block DDL.
@@ -2444,6 +2452,13 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         .map(|b| family_pks_by_sign(b, true))
         .unwrap_or_default();
     let view_create = !new_view_ids.is_empty();
+
+    // No checkpoint runs inside a DDL window, and this bundle's emission comes
+    // after its in-memory catalog mutation, where a refusal is unrecoverable. So
+    // reclaim out here, where the space question still has an answer.
+    if shared.disp().relay_fit_raw(0) != SalFit::Fits {
+        await_barrier(shared, BarrierKind::Reclaim { forced: true }).await;
+    }
 
     // Drain the committer barrier BEFORE acquiring the catalog write lock. The
     // barrier flushes user-table WAL and waits for worker ACKs (tens of ms under
@@ -2608,7 +2623,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
 
         // SAL emission window: broadcast each drained family under the shared
         // zone_lsn, close the zone with the commit sentinel, then fsync. A failure
-        // here is unrecoverable — workers already applied the FLAG_DDL_SYNC groups in
+        // here is unrecoverable — workers already applied the DdlSync groups in
         // real time — so abort.
         let drained = shared.cat_mut().drain_pending_broadcasts();
         let fsync_fut = {
@@ -2752,14 +2767,9 @@ async fn send_control_only(peer: &Peer, target_id: i64, client_id: u64, status: 
     send_status_frame(peer, target_id, client_id, status, &[]).await
 }
 
-/// One control-only failure frame carrying `status` verbatim. No schema block:
-/// the client ignores both it and the schema version on a failure, so `flags`
-/// stays 0 and the cache lookup is skipped.
-///
-/// The one place a status a *worker* minted reaches the client: the scan-forward
-/// stack carries `(status, text)` from `worker_error` down to here, so a typed
-/// refusal (a delta cursor past its retention floor, say) arrives as itself
-/// rather than flattened to `STATUS_ERROR` plus prose.
+/// One control-only reply frame carrying `status` verbatim. No schema block: the
+/// client ignores both it and the schema version on a failure, so `flags` stays 0
+/// and the cache lookup is skipped.
 async fn send_status_frame(peer: &Peer, target_id: i64, client_id: u64, status: u32, error_msg: &[u8]) {
     let buf = encode_response_buffer(ipc::WireMsg {
         target_id: target_id as u64,
@@ -2771,7 +2781,16 @@ async fn send_status_frame(peer: &Peer, target_id: i64, client_id: u64, status: 
     peer.send_buffer_or_close(buf).await;
 }
 
-/// The master's own rejections, which are all `STATUS_ERROR`.
+/// Every failure that names its own status, master-minted or forwarded. A worker
+/// mints one too — the scan-forward stack carries `(status, text)` from
+/// `worker_error` down to here — so a typed refusal (a delta cursor past its
+/// retention floor; a full SAL a client should retry) arrives as itself rather
+/// than flattened to `STATUS_ERROR` plus prose.
+async fn send_fault(peer: &Peer, target_id: i64, client_id: u64, fault: &WireFault) {
+    send_status_frame(peer, target_id, client_id, fault.status, fault.text.as_bytes()).await
+}
+
+/// A rejection that carries no status of its own, and so is `STATUS_ERROR`.
 async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8]) {
     send_status_frame(peer, target_id, client_id, STATUS_ERROR, error_msg).await
 }
@@ -2810,33 +2829,43 @@ fn stream_push_error(target_id: i64, batch: &Batch, mode: gnitz_wire::WireConfli
 /// so abort.
 fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(SysFamily, Batch)], zone_lsn: u64) -> FsyncFuture {
     let disp = shared.disp();
-    if let Err(e) = guard_panic(op, || {
+    // Nothing below is visible until `publish_pending`, so a refused group leaves
+    // no half-written zone behind. The block is synchronous throughout, which is
+    // what the deferred scope requires.
+    disp.defer_publication();
+    let emitted = guard_panic(op, || {
         // The first family opens the zone; a failure here aborts the loop, so no
         // later family can become the first one recovery sees.
         // The wire carries the family as its tid; this is the one place the
         // typed family narrows.
         for (i, (family, bat)) in drained.iter().enumerate() {
-            disp.broadcast_ddl(family.id(), bat, zone_lsn, i == 0)?;
+            disp.broadcast_ddl(family.id(), bat, zone_lsn, i == 0)
+                .map_err(|f| f.text)?;
         }
-        // Abort after broadcasts but BEFORE the commit sentinel — exercises the
-        // recovery skip of a half-written zone.
-        if DDL_PANIC.at("after_broadcasts") {
-            // SAFETY: `libc::abort` is the whole reason this block is unsafe; it
-            // takes no argument and cannot violate an invariant.
-            unsafe { libc::abort() };
-        }
-        // An empty zone has no groups for recovery to gate, so its sentinel
-        // records nothing. Skipping it also makes "every sentinel follows an
-        // ordinary group" true by construction, which is what keeps a run of
-        // sentinels from reaching the checkpoint reserve.
-        // `apply_and_enqueue_family` drops empty batches, so a DDL bundle whose
-        // families all net to empty arrives here with `drained` empty.
-        if !drained.is_empty() {
-            disp.commit_zone(zone_lsn)?;
-        }
-        Ok::<(), String>(())
-    }) {
+        Ok(())
+    });
+    disp.publish_pending();
+    if let Err(e) = emitted {
         gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);
+    }
+    // Abort after the broadcasts are published but BEFORE the commit sentinel —
+    // exercises the recovery skip of a zone whose sentinel never landed. Before
+    // publication it would leave nothing at all, and the recovery tests would
+    // pass for a reason they were not written to check.
+    if DDL_PANIC.at("after_broadcasts") {
+        // SAFETY: `libc::abort` is the whole reason this block is unsafe; it
+        // takes no argument and cannot violate an invariant.
+        unsafe { libc::abort() };
+    }
+    // An empty zone has no groups for recovery to gate, so its sentinel records
+    // nothing. Skipping it also makes "every sentinel follows an ordinary group"
+    // true by construction, which is what keeps a run of sentinels from reaching
+    // the checkpoint reserve. `apply_and_enqueue_family` drops empty batches, so a
+    // DDL bundle whose families all net to empty arrives here with `drained` empty.
+    if !drained.is_empty() {
+        if let Err(e) = disp.commit_zone(zone_lsn) {
+            gnitz_fatal_abort!("{} commit sentinel failed after its zone was published: {}", op, e);
+        }
     }
     shared.reactor.fsync(shared.disp().sal_fd())
 }

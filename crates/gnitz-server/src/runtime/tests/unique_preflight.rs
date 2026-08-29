@@ -9,7 +9,6 @@
 //! byte-orderable at any width.
 
 use crate::runtime::master::PreflightAccumulator;
-use crate::runtime::sal::{SalMessageKind, FLAG_UNIQUE_PREFLIGHT};
 use crate::runtime::w2m::{make_ring, W2mReceiver, W2mWriter};
 use crate::runtime::wire::{self, unique_preflight_wire_schema, SchemaWithVersion, FLAG_SCAN_LAST};
 use crate::runtime::worker::send_unique_preflight_keys;
@@ -603,18 +602,4 @@ fn pkbuf_byte_order_is_lexicographic() {
     // A narrower span sorts before a wider one sharing its prefix (memcmp over
     // bytes[..len]).
     assert!(PkBuf::from_bytes(&[1u8, 2]) < PkBuf::from_bytes(&[1u8, 2, 0]));
-}
-
-// ---------------------------------------------------------------------------
-// SAL classification
-// ---------------------------------------------------------------------------
-
-#[test]
-fn unique_preflight_classifies_and_is_unicast() {
-    let kind = SalMessageKind::classify(FLAG_UNIQUE_PREFLIGHT);
-    assert_eq!(kind, SalMessageKind::UniquePreflight);
-    assert!(
-        !kind.is_broadcast(),
-        "pre-flight is unicast-shaped: per-worker req_id slots, like Scan",
-    );
 }

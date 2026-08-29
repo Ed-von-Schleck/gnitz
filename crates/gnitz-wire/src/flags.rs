@@ -5,9 +5,14 @@
 // Wire protocol flags
 // ---------------------------------------------------------------------------
 
-/// Bits 0-15: the SAL-level flags carried verbatim from the on-disk log into
-/// every control block. Bits 16+ are wire-level fields (conflict mode, schema
-/// version) encoded by the sender and decoded by the receiver.
+/// Bits 0-15: the range this crate and the engine's SAL group header
+/// **co-allocate**. Nothing is copied between the two words — a client's flags
+/// reach `ClientVerb::from_flags` and no further, and the group header's word
+/// never leaves the engine's `sal` module. One table reserves the range so
+/// neither allocator can pick a bit the other took.
+///
+/// Bits 16+ are wire-level fields (conflict mode, schema version) encoded by the
+/// sender and decoded by the receiver.
 ///
 /// Exported so the engine can assert its own group-header flags — which live in
 /// a `u32` above this block — stay clear of it.
@@ -26,22 +31,18 @@ pub const FLAG_SEEK: u64 = 128;
 pub const FLAG_SEEK_BY_INDEX: u64 = 256;
 /// SCAN_SPEC request flag. The client→master leg of a parameterized bounded
 /// read (`ReadSpec`). Unlike the high request bits (RESOLVE, DDL_TXN, …) this
-/// lives *inside* the SAL flag block (bits 0-15, `SAL_FLAGS_MASK`)
-/// so it is carried verbatim from the wire frame into the SAL group header — one
-/// allocation, no separate u32 dispatch flag. The engine mirrors it as a `u32`.
+/// bit is co-allocated with the engine's group-header block (bits 0-15,
+/// `SAL_FLAGS_MASK`), which the engine's own `ScanSpec` kind takes.
 pub const FLAG_SCAN_SPEC: u64 = 1 << 10;
 
 // ---------------------------------------------------------------------------
 // Engine-internal SAL group-header flags that nonetheless live in the shared
 // 0-15 block.
 //
-// The engine never sends these to a client, but it allocates them out of the
-// same sixteen bits the wire request flags above use, because a group header
-// carries the block verbatim. Two crates allocating one bit range needs one
-// table, or the second allocator has to read the first's source to find a gap.
-// So the *bit* is reserved here — covered by the disjointness guard below,
-// exactly as `FLAG_BATCH_SORTED` and friends are — while the engine keeps the
-// meaning and mirrors each as the `u32` its group header stores.
+// The engine never sends these to a client. They are reserved here only because
+// two crates allocating one bit range needs one table, or the second allocator
+// has to read the first's source to find a gap. The *bit* is reserved here —
+// covered by the disjointness guard below — while the engine keeps the meaning.
 //
 // Bits 16+ of the group header are a different word from the wire `u64` (the
 // header's flags field is `u32`, and the packed wire fields at bits 16-39 never
@@ -72,15 +73,14 @@ pub const FLAG_CONTINUATION: u64 = 1 << 52;
 /// (`target_id = 0`, the name in the control block's BLOB cell) or by id (empty
 /// blob, `target_id` = the relation).
 ///
-/// Client-only and never written to SAL, so it sits above the SAL mirror
-/// (bits 0-15) and the bit-16–39 packed fields rather than in the request-flag run at
-/// 4..256 — a flag placed there would be carried verbatim into every SAL group
-/// header, which is exactly what a client-only bit must not be.
+/// Client-only, so it sits above the co-allocated block (bits 0-15) and the
+/// bit-16–39 packed fields rather than in the request-flag run at 4..256 — where
+/// it would consume a bit of a range the engine also allocates from.
 pub const FLAG_RESOLVE: u64 = 1 << 54;
 
 /// ALLOCATE_SERIAL_RANGE request flag. The client→master leg of a user-table
 /// SERIAL sequence range reservation. Like the other high request bits it rides
-/// above the SAL mirror (bits 0-15) and the bit-16–39 packed fields. The request carries
+/// above the co-allocated block (bits 0-15) and the bit-16–39 packed fields. The request carries
 /// `target_id = table_id` (the sequence key) and the range `count` in
 /// `seek_col_idx`; this high bit is never written to the SAL group header.
 pub const FLAG_ALLOCATE_SERIAL_RANGE: u64 = 1 << 56;
@@ -90,8 +90,8 @@ pub const FLAG_ALLOCATE_SERIAL_RANGE: u64 = 1 << 56;
 /// table/view/index/schema, CREATE SCHEMA/INDEX). Purely a wire-level decode
 /// hint: it is consumed at `handle_message` routing and is NEVER written to the
 /// SAL — each family is broadcast under its own `FLAG_DDL_SYNC` group and the
-/// zone's `FLAG_TXN_COMMIT` sentinel is unrelated `sal.rs` state — so it takes a
-/// high client-only bit, above the SAL mirror at bits 0-15 and the bit-16–39
+/// zone's commit sentinel is unrelated engine state — so it takes a high
+/// client-only bit, above the co-allocated block at bits 0-15 and the bit-16–39
 /// packed fields. Disjoint from every other flag by the compile-time guard below.
 pub const FLAG_DDL_TXN: u64 = 1 << 57;
 
@@ -196,8 +196,8 @@ const _: () = {
     assert!(SAL_FLAGS_MASK & packed == 0);
     assert!(WIRE_CONFLICT_MODE_MASK & WIRE_SCHEMA_VERSION_MASK == 0);
 
-    // Bits 0-15: the block a SAL group header carries verbatim, co-allocated by
-    // the client request flags and the engine's group-header flags.
+    // Bits 0-15: the range co-allocated by the client request flags and the
+    // engine's group-header flags.
     let sal_block = [
         FLAG_SHUTDOWN,
         FLAG_DDL_SYNC,
@@ -418,6 +418,13 @@ pub const STATUS_TXN_CONFLICT: u32 = 4;
 /// `worker_error` carries the code to the client rather than flattening it into
 /// a string.
 pub const STATUS_DELTA_EXPIRED: u32 = 5;
+/// The SAL had no room for the group this request needed to write. Transient by
+/// construction: an ordinary group must leave the sentinel headroom and the
+/// checkpoint band untouched, so it is refused while the log is near full, and
+/// the watchdog's reclaim frees the whole mapping within one 100 ms tick. A
+/// refused read or push is therefore retryable, unlike every other server error
+/// — which is why it is a code rather than a phrase in a message.
+pub const STATUS_SAL_FULL: u32 = 6;
 
 /// A failure as the reply frame carries it: one of the `STATUS_*` words above
 /// plus its message. The decoded form of a control block's `(status, error_msg)`

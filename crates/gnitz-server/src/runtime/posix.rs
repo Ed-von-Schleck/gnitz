@@ -486,13 +486,11 @@ pub(crate) fn map_shared_sized(fd: c_int, size: usize, how: Backing) -> std::io:
 // Unaligned raw accessors
 // ---------------------------------------------------------------------------
 
-// The four `*_raw` accessors below read and write `u32`/`u64` at `base + offset`
-// for the SAL and W2M mmap paths. The SAL is the caller that needs
-// `read_unaligned`/`write_unaligned`: its offsets are record-relative and need
-// not meet a `*mut u{32,64}` dereference's alignment. W2M's slot prefixes are
-// always 8-aligned and use these for the shared contract, not the unalignment.
-// Each `# Safety` clause is that contract: `base + offset + N` must lie inside a
-// live allocation, writable for the writes and readable for the reads.
+// The two `*_raw` accessors below read and write a `u64` at `base + offset` for
+// the W2M mmap path, whose slot prefixes are 8-aligned; the unaligned access is
+// the shared contract, not a requirement. Each `# Safety` clause is that
+// contract: `base + offset + 8` must lie inside a live allocation, writable for
+// the write and readable for the read.
 
 /// # Safety
 /// `base + offset + 8` must lie inside a live, writable allocation.
@@ -506,20 +504,6 @@ pub(crate) unsafe fn write_u64_raw(base: *mut u8, offset: usize, val: u64) {
 #[inline]
 pub(crate) unsafe fn read_u64_raw(base: *const u8, offset: usize) -> u64 {
     (base.add(offset) as *const u64).read_unaligned()
-}
-
-/// # Safety
-/// `base + offset + 4` must lie inside a live, writable allocation.
-#[inline]
-pub(crate) unsafe fn write_u32_raw(base: *mut u8, offset: usize, val: u32) {
-    (base.add(offset) as *mut u32).write_unaligned(val);
-}
-
-/// # Safety
-/// `base + offset + 4` must lie inside a live, readable allocation.
-#[inline]
-pub(crate) unsafe fn read_u32_raw(base: *const u8, offset: usize) -> u32 {
-    (base.add(offset) as *const u32).read_unaligned()
 }
 
 #[cfg(test)]

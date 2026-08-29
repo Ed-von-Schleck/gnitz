@@ -41,6 +41,11 @@ pyo3::create_exception!(_native, GnitzConflictError, GnitzError);
 // `except GnitzError` still catches it while a subscriber can name it and
 // bootstrap again.
 pyo3::create_exception!(_native, GnitzDeltaExpiredError, GnitzError);
+// The server's shared log was full (STATUS_SAL_FULL). A subtype of GnitzError,
+// like the conflict and expiry errors, so `except GnitzError` still catches it
+// while a caller that wants to retry — this is the one server error that clears
+// itself — can name it.
+pyo3::create_exception!(_native, GnitzSalFullError, GnitzError);
 // A mirror store refused every further call that touches a copy, because a delta
 // did not reach it and the hole a cursor would step over is unrecoverable. A
 // subclass of GnitzError, like the conflict and expiry errors, so
@@ -82,6 +87,7 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
             Err(other) => gnitz_err(other),
         },
         ClientError::DeltaExpired => GnitzDeltaExpiredError::new_err(e.to_string()),
+        ClientError::SalFull(_) => GnitzSalFullError::new_err(e.to_string()),
         // The arm, and not a pre-call check on the client, is what raises the
         // poison class: refusing *every* method up front would take the
         // connection's own reads down with the copy, where only a read that would
@@ -191,6 +197,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("GnitzError", m.py().get_type::<GnitzError>())?;
     m.add("GnitzConflictError", m.py().get_type::<GnitzConflictError>())?;
     m.add("GnitzDeltaExpiredError", m.py().get_type::<GnitzDeltaExpiredError>())?;
+    m.add("GnitzSalFullError", m.py().get_type::<GnitzSalFullError>())?;
     m.add(
         "GnitzMirrorPoisonedError",
         m.py().get_type::<GnitzMirrorPoisonedError>(),

@@ -32,7 +32,7 @@ use crate::protocol::{
     ClientTransport, Message, PkTuple, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
     FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_PUSH,
     FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NO_INDEX,
-    STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    STATUS_OK, STATUS_SAL_FULL, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use gnitz_wire::RelDescriptorBlob;
 use lru::LruCache;
@@ -121,6 +121,12 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
         // `after_tick = 0` — the read it made on its first day — rather than by
         // matching on text.
         return Err(ClientError::DeltaExpired);
+    }
+    if msg.status == STATUS_SAL_FULL {
+        // Transient by construction: a reclaim frees the log within one watchdog
+        // tick, so a caller can retry. Structured for exactly that reason — the
+        // text is a message, not a contract.
+        return Err(ClientError::SalFull(msg.error_text.unwrap_or_default()));
     }
     if msg.status == STATUS_TXN_CONFLICT {
         // Control-only frame: the fresh basis rides in `seek_pk`. Left as a

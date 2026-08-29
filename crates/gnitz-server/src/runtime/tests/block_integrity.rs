@@ -247,13 +247,13 @@ fn the_control_blocks_size_field_is_exact() {
     }
 }
 
-/// The push fast path (`with_scatter_group`) stamps the control-block checksum
+/// The push fast path (`scatter::with_group`) stamps the control-block checksum
 /// too — the SAL's highest-volume writer, and the one every other fixture here
 /// misses.
 #[test]
 fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
-    use crate::runtime::master::scatter::with_commit_indices;
-    use crate::runtime::sal::{SalReader, SalWriter, FLAG_PUSH};
+    use crate::runtime::master::scatter::{with_commit_indices, with_group};
+    use crate::runtime::sal::{EpochGate, SalLog, SalMessageKind, SalStep, SalWriter, ZoneMark};
 
     let size = 1 << 20;
     let region = SharedRegion::new(size);
@@ -267,21 +267,23 @@ fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
     let relation = crate::runtime::wire::WireSchema::encoded(16, schema);
     let req_ids: Vec<u64> = (0..nw as u64).collect();
     with_commit_indices(&batch, &schema, nw, |wi| {
-        writer
-            .with_scatter_group(
-                &batch,
-                wi,
-                &relation,
-                WireMsg::default(),
-                GroupTargets::All(&req_ids),
-                |g| writer.write_group_direct(g, 5, FLAG_PUSH),
-            )
-            .expect("group fits")
+        with_group(
+            &batch,
+            wi,
+            &relation,
+            WireMsg::default(),
+            GroupTargets::All(&req_ids),
+            nw,
+            |g| writer.write_group_direct(g, 5, SalMessageKind::Push, ZoneMark::Plain),
+        )
+        .expect("group fits")
     });
 
-    let slot = SalReader::for_walk(ptr as *const u8, 0, size)
-        .slot_at(0, 0)
-        .expect("slot 0 carries bytes");
+    let log = unsafe { SalLog::new(ptr as *const u8, size) };
+    let SalStep::Group(msg, _) = log.read_at(0, EpochGate::Walk(1)) else {
+        panic!("the push group is published at offset 0");
+    };
+    let slot = msg.slot(0).expect("slot 0 carries bytes");
     crate::runtime::wire::decode_wire(slot).expect("the fast path's slot must verify");
 
     // A flipped control byte in that slot fails the same checksum.

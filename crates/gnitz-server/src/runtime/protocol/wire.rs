@@ -33,7 +33,6 @@ pub(crate) struct WireSchema {
     tid: i64,
     descriptor: SchemaDescriptor,
     block: Rc<Vec<u8>>,
-    wire_safe: bool,
 }
 
 impl WireSchema {
@@ -43,7 +42,6 @@ impl WireSchema {
         WireSchema {
             tid,
             block: Rc::new(gnitz_engine::catalog::encode_schema_block(&descriptor, tid as u32)),
-            wire_safe: gnitz_engine::storage::schema_wire_safe(&descriptor),
             descriptor,
         }
     }
@@ -60,18 +58,11 @@ impl WireSchema {
             tid,
             descriptor,
             block: entry.block,
-            wire_safe: entry.wire_safe,
         }
     }
 
     pub(crate) fn descriptor(&self) -> &SchemaDescriptor {
         &self.descriptor
-    }
-
-    /// True when every column has a fixed-width 8-aligned stride and no German
-    /// string: the scatter fast path's precondition.
-    pub(crate) fn wire_safe(&self) -> bool {
-        self.wire_safe
     }
 
     /// `rest` addressed to this relation: its target id and schema block, with
@@ -101,7 +92,7 @@ pub enum WireData<'a> {
     },
     /// The rows `indices` selects, in that order, encoded straight into the
     /// destination — no per-worker sub-`Batch` in between. Valid only for a
-    /// `schema_wire_safe` schema.
+    /// schema with no German-string column.
     ///
     /// The descriptor rides here because both halves read region strides off
     /// it — `wire_block_size` sizes the block, `encode_scattered_to_wire` carves

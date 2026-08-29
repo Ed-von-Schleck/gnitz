@@ -28,6 +28,11 @@ pub enum ClientError {
     /// local copy and bootstrap. Splitting it would make every caller catch
     /// several errors to take one branch.
     DeltaExpired,
+    /// `STATUS_SAL_FULL`: the server's shared log had no room for the group this
+    /// request needed to write. Its own variant because it is the one server
+    /// error that clears itself — a reclaim frees the whole log within a tick —
+    /// so a caller retries it where every other error must surface.
+    SalFull(String),
     /// A mirror store refused or failed. Kept as its own variant rather than
     /// flattened to a message so [`MirrorError::Poisoned`] stays a class a host
     /// can catch — a poisoned copy is recovered by
@@ -81,6 +86,7 @@ impl fmt::Display for ClientError {
                 "delta cursor is not honourable — its rounds were dropped, or it names a \
                  different boot or relation; re-read the feed from 0"
             ),
+            ClientError::SalFull(s) => write!(f, "server log full (retryable): {s}"),
             ClientError::Mirror(e) => write!(f, "{e}"),
             ClientError::Interrupted(e) => write!(f, "interrupted: {e}"),
         }

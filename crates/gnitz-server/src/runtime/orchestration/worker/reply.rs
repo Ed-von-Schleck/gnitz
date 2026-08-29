@@ -25,22 +25,16 @@ pub(super) struct PendingScan {
     pub(super) kind: PendingScanKind,
 }
 
-/// The two emission shapes of a `PendingScan`:
-///
-/// * `WireSafe` — a fixed-width columnar train (empty blob region) emitted as a
-///   [`WireData::Range`], chunked across frames when it exceeds
-///   `reply_frame_budget`. `next_row` tracks emission progress (`0` ⇒ the first
-///   chunk still owes the schema block; non-zero ⇒ a pure-data continuation).
-///   This is the only shape a plain scan or an oversized seek-by-index / gather
-///   reply produces.
-/// * `NonWireSafe` — a STRING/German-string (blob-bearing) result that cannot
-///   chunk: exactly one whole-batch frame. Reached only on the multi-scan FIFO
-///   path (`force_fifo`), where even an immediate-emit-eligible reply must queue
-///   so ring order equals request order; the plain scan path still emits such a
-///   reply inline.
+/// The two emission shapes of a `PendingScan`.
 pub(super) enum PendingScanKind {
-    WireSafe { next_row: usize },
-    NonWireSafe,
+    /// A row range emitted as a [`WireData::Range`] train, split across frames
+    /// at `reply_frame_budget`. `next_row` tracks progress: `0` ⇒ the first
+    /// chunk still owes the schema block; non-zero ⇒ a pure-data continuation.
+    Chunked { next_row: usize },
+    /// A blob-bearing result, which cannot split: exactly one whole-batch frame.
+    /// Queued only on the multi-scan FIFO path, where even a one-frame reply
+    /// must queue so ring order equals request order.
+    WholeBlob,
 }
 
 impl WorkerProcess {
@@ -70,9 +64,9 @@ impl WorkerProcess {
     /// Reply schema wire block: the table's cached block for `Table`, a
     /// one-off (never cached) block for `OneOff`, and none at all for
     /// `ClientAuthored` — the client wrote that schema and decodes against it.
-    /// Returns the block, the schema version, and the schema's wire-safety —
-    /// `Table` reads the cached wire-safe bit instead of recomputing it per
-    /// reply. This is the only reader of the descriptor: a `WireMsg` carries
+    /// Returns the block, the schema version, and whether the schema carries a
+    /// German string — the one thing that stops a reply from splitting across
+    /// frames. This is the only reader of the descriptor: a `WireMsg` carries
     /// schema *bytes*, so a variant that yields no block emits no schema.
     fn reply_schema_block(&mut self, tid_key: i64, schema: ReplySchema<'_>) -> (Option<Rc<Vec<u8>>>, u16, bool) {
         match schema {
@@ -81,13 +75,13 @@ impl WorkerProcess {
             // let a version-suppression path drop a block the reader still needs.
             ReplySchema::OneOff(s) => {
                 let block = Rc::new(gnitz_engine::catalog::encode_schema_block(s, tid_key as u32));
-                (Some(block), 0, schema_wire_safe(s))
+                (Some(block), 0, s.has_german_string())
             }
             ReplySchema::Table(s) => {
                 let e = self.cat().schema_wire_entry(tid_key, s);
-                (Some(e.block), e.version, e.wire_safe)
+                (Some(e.block), e.version, s.has_german_string())
             }
-            ReplySchema::ClientAuthored(s) => (None, 0, schema_wire_safe(s)),
+            ReplySchema::ClientAuthored(s) => (None, 0, s.has_german_string()),
         }
     }
 
@@ -168,7 +162,7 @@ impl WorkerProcess {
         let Some(batch) = result.filter(|b| b.count > 0) else {
             return self.send_response(target_id, None, schema, request_id, client_id, seek_pk);
         };
-        let (prebuilt_rc, server_version, is_wire_safe) = self.reply_schema_block(target_id as i64, schema);
+        let (prebuilt_rc, server_version, blobbed) = self.reply_schema_block(target_id as i64, schema);
         let msg = Self::whole_batch_msg(
             target_id,
             Some(&batch),
@@ -179,20 +173,16 @@ impl WorkerProcess {
             server_version,
         );
         let sz = msg.size();
-        // Non-wire-safe replies cannot chunk, so they single-frame up to the
-        // hard frame cap; wire-safe replies chunk past the (overridable, and
-        // never larger) frame budget.
-        let frame_cap = if is_wire_safe {
-            self.reply_frame_budget
-        } else {
-            FRAME_CAP
-        };
+        // A blob-bearing reply cannot split, so it single-frames up to the hard
+        // frame cap; everything else splits past the (overridable, and never
+        // larger) frame budget.
+        let frame_cap = if blobbed { FRAME_CAP } else { self.reply_frame_budget };
         if sz <= frame_cap {
             self.w2m_writer.send_msg(request_id, &msg);
             return Ok(());
         }
-        if !is_wire_safe {
-            return Err(oversized_string_reply(sz));
+        if blobbed {
+            return Err(oversized_blob_reply(sz));
         }
         self.enqueue_stream(
             Rc::new(batch),
@@ -205,11 +195,10 @@ impl WorkerProcess {
         Ok(())
     }
 
-    /// Send a SCAN response for `batch`. For wire-safe schemas, large batches
-    /// are split across multiple frames via `pending_streams`; the first chunk
-    /// is emitted at the top of the next `drain_sal` pass. For non-wire-safe
-    /// (STRING-column) schemas, a single frame is sent; returns an error message
-    /// if the batch exceeds [`FRAME_CAP`].
+    /// Send a SCAN response for `batch`. A large one is split across frames via
+    /// `pending_streams`, the first chunk emitted at the top of the next
+    /// `drain_sal` pass. A blob-bearing (STRING-column) schema cannot split, so
+    /// it sends a single frame and errors past [`FRAME_CAP`].
     #[allow(clippy::too_many_arguments)]
     pub(super) fn send_scan_response(
         &mut self,
@@ -224,12 +213,12 @@ impl WorkerProcess {
         // `include_schema` controls whether the first frame carries a schema
         // block; `server_version` is always embedded in the wire flags so the
         // client can cache/verify.
-        let (block_rc, server_version, is_wire_safe) = self.reply_schema_block(target_id as i64, schema);
+        let (block_rc, server_version, blobbed) = self.reply_schema_block(target_id as i64, schema);
         let prebuilt_rc = block_rc.filter(|_| gnitz_wire::wire_should_include_schema(client_version, server_version));
 
-        if !is_wire_safe {
-            // STRING-column tables: no chunking. Check size; error if too big.
-            let msg = Self::non_wire_safe_msg(
+        if blobbed {
+            // No splitting: one frame, or a refusal.
+            let msg = Self::whole_blob_msg(
                 target_id,
                 &batch,
                 client_id,
@@ -238,7 +227,7 @@ impl WorkerProcess {
             );
             let wire_sz = msg.size();
             if wire_sz > FRAME_CAP {
-                return Err(oversized_string_reply(wire_sz));
+                return Err(oversized_blob_reply(wire_sz));
             }
             if force_fifo {
                 // Multi-scan: queue the single blob frame so this relation
@@ -253,7 +242,7 @@ impl WorkerProcess {
                     target_id,
                     prebuilt_schema: prebuilt_rc,
                     server_version,
-                    kind: PendingScanKind::NonWireSafe,
+                    kind: PendingScanKind::WholeBlob,
                 });
                 return Ok(());
             }
@@ -261,9 +250,9 @@ impl WorkerProcess {
             return Ok(());
         }
 
-        // Wire-safe path: the range encoder supports chunking.
-        // FLAG_CONTINUATION keeps the client reading (a terminal frame signals
-        // scan end); FLAG_SCAN_LAST tells the master this worker's train is done.
+        // The range encoder splits. FLAG_CONTINUATION keeps the client reading
+        // (a terminal frame signals scan end); FLAG_SCAN_LAST tells the master
+        // this worker's train is done.
         let msg = Self::chunk_msg(
             target_id,
             &batch,
@@ -306,7 +295,7 @@ impl WorkerProcess {
             target_id,
             prebuilt_schema,
             server_version,
-            kind: PendingScanKind::WireSafe { next_row: 0 },
+            kind: PendingScanKind::Chunked { next_row: 0 },
         });
     }
 
@@ -315,23 +304,30 @@ impl WorkerProcess {
     /// while `pending_streams` is non-empty (see the field doc for why
     /// emission is FIFO and confined to `drain_sal` / `run`). Unit tests set
     /// a small `reply_frame_budget` to force multi-frame trains from small
-    /// batches. Dispatches on the front train's shape: a `WireSafe` train emits
-    /// its next columnar chunk; a `NonWireSafe` train emits its one blob frame
-    /// and always pops.
+    /// batches. Dispatches on the front train's shape: a `Chunked` train emits
+    /// its next row range; a `WholeBlob` train emits its one frame and pops.
     pub(super) fn emit_pending_scan_chunk(&mut self) {
         match self.pending_streams.front().map(|p| &p.kind) {
             None => (),
-            Some(PendingScanKind::WireSafe { .. }) => self.emit_wire_safe_chunk(),
-            Some(PendingScanKind::NonWireSafe) => self.emit_non_wire_safe_frame(),
+            Some(PendingScanKind::Chunked { .. }) => self.emit_chunk(),
+            Some(PendingScanKind::WholeBlob) => self.emit_whole_blob_frame(),
         }
     }
 
-    /// The one-frame message a non-wire-safe (STRING/blob) scan reply produces:
-    /// the whole batch, terminal train flags, and the schema block iff
-    /// `prebuilt` is `Some`. Shared by the immediate branch of
-    /// `send_scan_response` and the queued `emit_non_wire_safe_frame`
-    /// (multi-scan FIFO) so the two produce byte-identical frames.
-    fn non_wire_safe_msg<'a>(
+    /// The wire flags every frame of a reply train carries. FLAG_CONTINUATION is
+    /// always set so the client's "stop on no FLAG_CONTINUATION" loop still
+    /// terminates on the frame after the last one; FLAG_SCAN_LAST marks this
+    /// worker's terminal frame. Shared by the two frame shapes below, which
+    /// otherwise differ only in their data block.
+    fn train_flags(server_version: u16, is_last: bool) -> u64 {
+        let last = if is_last { FLAG_SCAN_LAST } else { 0 };
+        gnitz_wire::wire_flags_set_schema_version(FLAG_CONTINUATION | last, server_version)
+    }
+
+    /// The one frame a blob-bearing reply produces: it cannot split, so it is
+    /// always terminal. The payload `request_id` stays 0: reply routing rides
+    /// the W2M slot's ring prefix.
+    fn whole_blob_msg<'a>(
         target_id: u64,
         batch: &'a Batch,
         client_id: u64,
@@ -341,19 +337,16 @@ impl WorkerProcess {
         WireMsg {
             target_id,
             client_id,
-            flags: gnitz_wire::wire_flags_set_schema_version(FLAG_CONTINUATION | FLAG_SCAN_LAST, server_version),
+            flags: Self::train_flags(server_version, true),
             data: WireData::Whole(Some(batch)),
             schema_block: prebuilt,
             ..Default::default()
         }
     }
 
-    /// One columnar chunk of a wire-safe reply train: rows
-    /// `[start_row, start_row + count)`, the schema block iff `prebuilt` is
-    /// `Some`, and FLAG_SCAN_LAST iff `is_last`. FLAG_CONTINUATION is always set
-    /// so the client's "stop on no FLAG_CONTINUATION" loop still terminates on
-    /// the frame after the last one. The payload `request_id` stays 0: reply
-    /// routing rides the W2M slot's ring prefix.
+    /// One chunk of a splittable reply train: rows
+    /// `[start_row, start_row + count)`, with the schema block iff `prebuilt` is
+    /// `Some`.
     #[allow(clippy::too_many_arguments)]
     fn chunk_msg<'a>(
         target_id: u64,
@@ -368,10 +361,7 @@ impl WorkerProcess {
         WireMsg {
             target_id,
             client_id,
-            flags: gnitz_wire::wire_flags_set_schema_version(
-                FLAG_CONTINUATION | if is_last { FLAG_SCAN_LAST } else { 0 },
-                server_version,
-            ),
+            flags: Self::train_flags(server_version, is_last),
             data: WireData::Range {
                 batch,
                 start_row,
@@ -382,9 +372,9 @@ impl WorkerProcess {
         }
     }
 
-    /// Emit the single blob frame of a `NonWireSafe` front train and pop it. The
+    /// Emit the single frame of a `WholeBlob` front train and pop it. The
     /// oversize reject already fired at enqueue.
-    fn emit_non_wire_safe_frame(&mut self) {
+    fn emit_whole_blob_frame(&mut self) {
         // This train always emits exactly one frame and always pops, so pop it
         // up front and borrow its fields straight into the emit — no clone needed.
         let Some(p) = self.pending_streams.pop_front() else {
@@ -392,7 +382,7 @@ impl WorkerProcess {
         };
         self.w2m_writer.send_msg(
             p.request_id,
-            &Self::non_wire_safe_msg(
+            &Self::whole_blob_msg(
                 p.target_id,
                 &p.batch,
                 p.client_id,
@@ -402,19 +392,18 @@ impl WorkerProcess {
         );
     }
 
-    /// Emit the next columnar chunk of a `WireSafe` front train, updating its
+    /// Emit the next chunk of a `Chunked` front train, updating its
     /// `next_row` or popping it on the terminal chunk.
-    fn emit_wire_safe_chunk(&mut self) {
+    fn emit_chunk(&mut self) {
         let budget = self.reply_frame_budget;
         let (batch, next_row, request_id, client_id, target_id, prebuilt_schema, server_version) = {
             let Some(p) = self.pending_streams.front() else {
                 return;
             };
-            let PendingScanKind::WireSafe { next_row } = &p.kind else {
-                // `emit_pending_scan_chunk` only routes a WireSafe front here, and
-                // nothing mutates the queue in between — same invariant the
-                // has-more branch below asserts with `unreachable!`.
-                unreachable!("emit_wire_safe_chunk: front train is not WireSafe");
+            let PendingScanKind::Chunked { next_row } = &p.kind else {
+                // `emit_pending_scan_chunk` only routes a `Chunked` front here,
+                // and nothing mutates the queue in between.
+                unreachable!("emit_chunk: front train is not Chunked");
             };
             (
                 Rc::clone(&p.batch),
@@ -435,14 +424,9 @@ impl WorkerProcess {
         };
 
         let remaining = batch.count - next_row;
-        // Rows per chunk, exactly: a chunk costs `base` (ctrl block, plus the
-        // schema block on the first chunk) + the data block, and for a wire-safe
-        // schema the data block is affine in the row count — `hdr` (its own
-        // header and region directory) plus `per_row` per row, with no alignment
-        // padding. `base` is sized with a zero-row range, which carries no data
-        // block at all, so `hdr` must be added back explicitly; differencing two
-        // whole-message sizes across that discontinuity would fold `hdr` into
-        // the slope and charge it once per row.
+        // A chunk costs `base` — the control block, plus the schema block on the
+        // first chunk, sized with a zero-row range that carries no data block at
+        // all — plus its data block, which is `wire_byte_size_range(n)`.
         let base = Self::chunk_msg(
             target_id,
             &batch,
@@ -454,15 +438,23 @@ impl WorkerProcess {
             false,
         )
         .size();
-        let hdr = batch.wire_byte_size_range(0);
-        // The weight and null-bitmap regions alone are 8 bytes per row each, so
-        // this is never zero.
-        let per_row = batch.wire_byte_size_range(1) - hdr;
-        // `.max(1)` before the clamp to `remaining`: a chunk always carries at
-        // least one row (a budget too small for even one would otherwise stall
-        // the train), and a zero-row batch — which `force_fifo` can queue —
-        // still emits its one terminal frame rather than a row it does not have.
-        let max_rows = (budget.saturating_sub(base + hdr) / per_row).max(1).min(remaining);
+        // The largest `n` that fits, searched over the exact size: it is monotone
+        // in `n` but affine only while every region stride is a multiple of 8, so
+        // inverting a linear model overruns the budget on a padded schema.
+        let fits = |n: usize| base + batch.wire_byte_size_range(n) <= budget;
+        let (mut lo, mut hi) = (0usize, remaining);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        // A chunk always carries at least one row — a budget too small for even
+        // one would stall the train — except over a zero-row batch, which the
+        // multi-scan FIFO path can queue and which still owes one terminal frame.
+        let max_rows = lo.max(1).min(remaining);
         let has_more = next_row + max_rows < batch.count;
         self.w2m_writer.send_msg(
             request_id,
@@ -480,8 +472,8 @@ impl WorkerProcess {
 
         if has_more {
             match self.pending_streams.front_mut().map(|p| &mut p.kind) {
-                Some(PendingScanKind::WireSafe { next_row: nr, .. }) => *nr = next_row + max_rows,
-                _ => unreachable!("emit_wire_safe_chunk: front train changed shape mid-emit"),
+                Some(PendingScanKind::Chunked { next_row: nr, .. }) => *nr = next_row + max_rows,
+                _ => unreachable!("emit_chunk: front train changed shape mid-emit"),
             }
         } else {
             self.pending_streams.pop_front();
@@ -495,7 +487,7 @@ impl WorkerProcess {
 /// The remedy names a projection first because narrowing the row count is not
 /// always one: a join builds a row out of two that each fit, and no predicate or
 /// `LIMIT` makes that single row returnable.
-fn oversized_string_reply(sz: usize) -> gnitz_wire::WireFault {
+fn oversized_blob_reply(sz: usize) -> gnitz_wire::WireFault {
     gnitz_wire::WireFault::from(format!(
         "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}; a STRING-column \
          result cannot be chunked — project fewer STRING columns, or match fewer rows. \

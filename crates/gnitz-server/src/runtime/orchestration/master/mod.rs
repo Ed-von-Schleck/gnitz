@@ -17,11 +17,7 @@ use gnitz_wire::{PkColList, SpecBytes};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
 use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP};
-use crate::runtime::sal::{
-    DirectGroup, GroupData, GroupTargets, SalFit, SalWriter, FLAG_BACKFILL, FLAG_DDL_SYNC, FLAG_EXCHANGE_RELAY,
-    FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SHUTDOWN,
-    FLAG_TICK, FLAG_UNIQUE_PREFLIGHT,
-};
+use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalWriter, ZoneMark};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{self, unique_preflight_wire_schema, DecodedWire, SchemaWithVersion, FLAG_SCAN_LAST};
 use gnitz_engine::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
@@ -32,7 +28,7 @@ use gnitz_wire::control::peek_control_block_ipc;
 use gnitz_wire::{
     wire_flags_set_conflict_mode, WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
 };
-use scatter::{with_commit_indices, with_worker_indices};
+use scatter::{with_commit_indices, with_group, with_worker_indices};
 
 // ---------------------------------------------------------------------------
 // RelayPrepared — output of prepare_relay, input of emit_relay_with_decision
@@ -71,8 +67,8 @@ pub struct MasterDispatcher {
     sal: SalWriter,
     /// SAL-writer exclusivity, guarding `sal` above. The rule, not a roster of
     /// today's holders: hold it across the synchronous write + `signal_all`, drop
-    /// it before awaiting. Without it a `FLAG_FLUSH` landing between a `FLAG_TICK`
-    /// and its `FLAG_EXCHANGE_RELAY` bumps the worker epoch and the relay is
+    /// it before awaiting. Without it a `Flush` landing between a `Tick`
+    /// and its `ExchangeRelay` bumps the worker epoch and the relay is
     /// skipped with no error anywhere.
     ///
     /// **Non-reentrant**: never `.await` anything that re-acquires it.
@@ -211,14 +207,10 @@ pub(crate) fn worker_error(w: usize, op: &str, ctrl: &gnitz_wire::control::Decod
 /// The first worker error across a fan-out's replies, in worker-index order.
 /// Slots are `Some` once `join_into`'s future resolves; a `None` is a bug in
 /// the join driver.
-///
-/// Flattened to its text: these are the ACK-shaped fan-outs (push, tick, flush,
-/// relay), whose callers report a failure and have no typed status to forward.
-/// Only the scan-forward stack carries the whole [`WorkerFault`].
-pub(crate) fn first_worker_error_opt(op: &str, decoded: &[Option<DecodedWire>]) -> Option<String> {
+pub(crate) fn first_worker_error_opt(op: &str, decoded: &[Option<DecodedWire>]) -> Option<WorkerFault> {
     decoded.iter().enumerate().find_map(|(w, d)| {
         let d = d.as_ref().expect("join_into left a None slot — logic bug");
-        worker_error(w, op, &d.control).map(|f| f.text)
+        worker_error(w, op, &d.control)
     })
 }
 
@@ -238,7 +230,10 @@ pub(crate) async fn await_worker_acks(
     crate::runtime::reactor::join_into(futs, acks).await;
     let err = first_worker_error_opt(op, acks);
     acks.clear();
-    err.map_or(Ok(()), Err)
+    // Flattened: an ACK-shaped fan-out (push, tick, flush, relay) is reported by
+    // a caller with no typed status to forward. Only the scan-forward stack and
+    // the commit path carry the whole [`WorkerFault`].
+    err.map_or(Ok(()), |f| Err(f.text))
 }
 
 /// Which workers a scan-shaped dispatch goes to, before any request id exists.
@@ -341,7 +336,7 @@ impl ScanDispatch {
 ///
 /// `sal_excl` is held only for the synchronous write + signal phase and
 /// released before awaiting replies. This serialises the SAL write against
-/// concurrent checkpoint FLAG_FLUSH groups: without the lock a fan-out
+/// concurrent checkpoint Flush groups: without the lock a fan-out
 /// could write with the old epoch during the checkpoint window, workers
 /// would skip it, and the caller would hang waiting for an ACK.
 pub(crate) async fn dispatch_scan_fanout<F>(
@@ -349,9 +344,9 @@ pub(crate) async fn dispatch_scan_fanout<F>(
     reactor: &crate::runtime::reactor::Reactor,
     unicast: Fanout,
     submit: F,
-) -> Result<(Vec<W2mSlot>, ScanDispatch), String>
+) -> Result<(Vec<W2mSlot>, ScanDispatch), WorkerFault>
 where
-    F: FnOnce(GroupTargets<'_>) -> Result<(), String>,
+    F: FnOnce(GroupTargets<'_>) -> Result<(), WorkerFault>,
 {
     let scan = ScanDispatch::alloc(reactor, disp.num_workers, unicast);
 
@@ -390,7 +385,7 @@ pub(crate) async fn dispatch_scan_multi_fanout(
     reactor: &crate::runtime::reactor::Reactor,
     client_id: u64,
     relations: &[(i64, Fanout, u16)],
-) -> Result<Vec<ScanDispatch>, String> {
+) -> Result<Vec<ScanDispatch>, WorkerFault> {
     let nw = disp.num_workers;
     // Allocate ids + register every relation's lease BEFORE the lock (no await
     // between here and the write).
@@ -416,7 +411,8 @@ pub(crate) async fn dispatch_scan_multi_fanout(
                 },
                 GroupData::NONE,
                 0,
-                0,
+                SalMessageKind::Scan,
+                ZoneMark::Plain,
                 d.targets(),
             )?;
         }

@@ -20,19 +20,6 @@ use super::shard_file;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::wal;
 
-/// True when every column has a fixed-width 8-aligned stride and no German-string
-/// (STRING or BLOB) columns. Batches satisfying this can be scatter-encoded
-/// directly into SAL slots without intermediate per-worker Batch allocations,
-/// and their wire size is linear in the row count (no alignment padding).
-/// BLOB shares STRING's 16-byte struct with out-of-line heap bytes, so it must
-/// be excluded too.
-pub fn schema_wire_safe(schema: &SchemaDescriptor) -> bool {
-    (0..schema.num_columns()).all(|ci| {
-        let c = &schema.columns[ci];
-        !gnitz_wire::is_german_string(c.type_code) && c.size().is_multiple_of(8)
-    })
-}
-
 /// Region byte sizes of the WAL wire block for `count` rows of `schema`, in
 /// canonical order (pk, weight, null_bmp, payload…, blob = `blob_size`), plus
 /// the region count. The schema-level face of the writer↔reader region
@@ -100,10 +87,10 @@ impl Batch {
         self.wire_size_of(self.count, self.blob.len())
     }
 
-    /// Byte count of the WAL-block encoding for `count` rows from this batch.
-    /// Only valid for wire-safe schemas — all region strides are multiples of 8
-    /// so there is no alignment padding and the result is linear in `count`, and
-    /// the heap is empty because such a schema carries no long strings.
+    /// Byte count of the WAL-block encoding for `count` rows from this batch,
+    /// with an empty heap. Monotone non-decreasing in `count` — each region
+    /// grows with it and the block framer's `align8` walk is monotone in each
+    /// region size — which is what lets the reply chunker search it.
     pub fn wire_byte_size_range(&self, count: usize) -> usize {
         self.wire_size_of(count, 0)
     }
@@ -135,9 +122,9 @@ impl Batch {
     }
 
     /// Encode rows `[start_row, start_row + count)` into WAL V4 wire format at
-    /// `out[offset..]`. Returns bytes written. Only valid for wire-safe schemas
+    /// `out[offset..]`. Returns bytes written. Only valid for a schema with no
     /// (no STRING columns, all strides 8-aligned). The blob region is encoded
-    /// as empty since wire-safe batches carry no long strings.
+    /// German-string column, whose batches carry no heap for it to drop.
     pub fn encode_range_to_wire(
         &self,
         start_row: usize,
@@ -159,21 +146,21 @@ impl Batch {
             "encode_range_to_wire: range [{start_row}, {end}) out of bounds (batch count = {})",
             self.count,
         );
-        // Wire-safe precondition: a wire-safe schema carries no long strings, so
-        // the blob heap is empty and is intentionally dropped below. Callers gate
-        // this encoder on `schema_wire_safe`; a STRING/BLOB batch routes to the
-        // full-blob `encode_to_wire` path. Assert it so a future caller that
-        // mis-routes string data fails loudly here rather than shipping structs
-        // whose heap vanished.
+        // A schema with no German-string column carries an empty blob heap, which
+        // is intentionally dropped below. Callers gate this encoder on
+        // `has_german_string`; a STRING/BLOB batch routes to the full-blob
+        // `encode_to_wire` path. Assert it so a future caller that mis-routes
+        // string data fails loudly here rather than shipping structs whose heap
+        // vanished.
         debug_assert!(
             self.blob.is_empty(),
-            "encode_range_to_wire on a batch with a {}-byte blob: wire-safe schemas \
-             carry no long strings; the heap would be silently dropped",
+            "encode_range_to_wire on a batch with a {}-byte blob: this encoder takes only a \
+             schema with no German string; the heap would be silently dropped",
             self.blob.len(),
         );
         // The assert above bounds `start_row + count <= self.count`, so each
         // region sub-slice stays inside its `self.count * stride` bytes. The blob
-        // region is passed empty — wire-safe schemas carry no long strings.
+        // region is passed empty, as the schema's absent German string implies.
         self.encode_regions(start_row, count, &[], table_id, out, offset, checksum)
     }
 
@@ -198,9 +185,10 @@ impl Batch {
     /// caller must size the destination with [`wire_block_size`] over the same
     /// schema — those two are the writer↔reader region contract's two faces.
     ///
-    /// Only valid for a `schema_wire_safe` schema: no German-string columns and
-    /// every stride a multiple of 8, so the block's `align8` padding never fires
-    /// and the row scatter writes no heap bytes.
+    /// Only valid for a schema with no German-string column, so the row scatter
+    /// writes no heap bytes. Padded strides are fine: the destination is sized
+    /// by `wire_block_size` and carved by `compute_offsets`, and both walk the
+    /// same `align8` region layout.
     pub fn encode_scattered_to_wire(
         &self,
         indices: &[u32],
@@ -222,12 +210,15 @@ impl Batch {
         // slices: [pk | weight | null | col_0 | ...], each sized for `count` rows.
         let (_, rest) = block.split_at_mut(wire_header_dir_size(schema));
         let (pk, weight, null_bmp, col_slices) = carve_writer_slices(rest, schema, count);
-        // No German-string columns on a wire-safe schema; `DirectWriter` still
+        // No German-string columns here; `DirectWriter` still
         // wants a blob arena, so hand it a 0-cap stack local it must not grow.
         let mut empty_blob: Vec<u8> = Vec::new();
         let mut writer = DirectWriter::new(pk, weight, null_bmp, col_slices, &mut empty_blob, schema, 0);
         super::scatter::scatter_copy(&self.as_mem_batch(), indices, &mut writer);
-        debug_assert!(empty_blob.is_empty(), "a wire-safe schema must not scatter blob bytes");
+        debug_assert!(
+            empty_blob.is_empty(),
+            "a schema with no German string scatters no blob bytes"
+        );
 
         if checksum {
             wal::stamp_checksum(block, total_size);

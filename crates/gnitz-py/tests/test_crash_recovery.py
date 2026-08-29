@@ -885,7 +885,7 @@ def test_ingest_apply_error_aborts_and_replays(inject, with_index, own_server):
 
 def test_boot_replay_apply_error_aborts_boot(own_server):
     """A storage error while replaying a committed PUSH at boot must abort the
-    boot BEFORE the master zeroes the SAL sentinel, so the rows' only durable
+    boot BEFORE the master rewinds the SAL, so the rows' only durable
     copy (the SAL) survives for the next boot.
 
     Without the fix the worker swallows the replay error, acks readiness, and
@@ -915,7 +915,7 @@ def test_boot_replay_apply_error_aborts_boot(own_server):
     # ---- Phase 2: boot with the seam armed must FAIL during SAL replay. --
     # The worker aborts inside ingest_store_and_indices while replaying the
     # committed PUSH zone, before its readiness ACK, so the master fails
-    # wait_all_workers before zeroing the SAL sentinel.
+    # wait_all_workers before rewinding the SAL.
     rc = own_server.start_expecting_exit(extra_env={"GNITZ_INJECT_INGEST_APPLY_ERROR": "store"})
     assert rc != 0, f"boot should have aborted during SAL replay, got rc={rc}"
     assert not os.path.exists(sock_path), "failed boot must not accept requests"

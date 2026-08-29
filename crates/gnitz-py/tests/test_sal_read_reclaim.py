@@ -47,15 +47,13 @@ def _live_rows(client, tid):
     return {row[0]: row[2] for row in client.scan(tid)}
 
 
-# The server's marker for an out-of-space SAL refusal (`SAL_FULL`, engine-side).
-# An ordinary group must leave the sentinel headroom and the checkpoint band
-# alone, so once the readers below have driven the cursor past the watchdog's
-# line a scan can be refused until the next reclaim — by design, and the whole
-# point of the reserve. A real client retries; so does this loop.
-SAL_FULL = "SAL full"
+# An out-of-space SAL refusal (STATUS_SAL_FULL). An ordinary group must leave the
+# sentinel headroom and the checkpoint band alone, so once the readers below have
+# driven the cursor past the watchdog's line a scan can be refused until the next
+# reclaim — by design. A real client retries; so does this loop.
+SAL_FULL = gnitz.GnitzSalFullError
 
-# How long a reader tolerates an UNBROKEN run of `SAL full` before calling it a
-# wedge. The reclaim that clears it is at most one 100 ms watchdog tick away —
+# How long a reader tolerates an UNBROKEN run of those before calling it a wedge. The reclaim that clears it is at most one 100 ms watchdog tick away —
 # two if a DDL window is open, since the watchdog and the committer both refuse
 # to reclaim inside one. Anything past this is the failure these tests exist to
 # catch: with the watchdog removed the read loops never recover, and this is what
@@ -65,8 +63,9 @@ SAL_FULL_GRACE_S = 5.0
 
 def _read_loop(target, tid, expected, errors, keep_going):
     """Scan `tid` on its own connection while `keep_going()`, recording the first
-    mismatch or connection failure in `errors`. A transient `SAL full` refusal is
-    retried rather than recorded; one that never clears is recorded."""
+    mismatch or connection failure in `errors`. A transient SAL-full refusal is
+    retried rather than recorded; one that never clears is recorded. It is matched
+    by its exception class, not by the text of a message."""
     try:
         with gnitz.connect(target) as c:
             while keep_going():
@@ -84,7 +83,7 @@ def _read_loop(target, tid, expected, errors, keep_going):
                         got = _live_rows(c, tid)
                         break
                     except Exception as e:
-                        if SAL_FULL not in str(e):
+                        if not isinstance(e, SAL_FULL):
                             raise
                         now = time.monotonic()
                         if refused_since is None:

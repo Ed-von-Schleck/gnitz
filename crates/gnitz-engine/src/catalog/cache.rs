@@ -10,20 +10,15 @@ use std::collections::hash_map::Entry;
 // CatalogCacheSet — all typed caches for one CatalogEngine
 // ---------------------------------------------------------------------------
 
-/// Cached schema wire data for one table: the encoded block, the schema version
-/// it was built at, and its wire-safety. All three share one invalidation
-/// lifecycle (`clear_col_cache_no_bump` drops the entry whole, and the version
-/// bump that follows means a surviving entry always carries its build-time
-/// version).
+/// Cached schema wire data for one table: the encoded block and the schema
+/// version it was built at. Both share one invalidation lifecycle
+/// (`clear_col_cache_no_bump` drops the entry whole, and the version bump that
+/// follows means a surviving entry always carries its build-time version).
 #[derive(Clone)]
 pub struct SchemaWireEntry {
     pub block: Rc<Vec<u8>>,
     /// The owning table's schema version when the block was built.
     pub version: u16,
-    /// True when every column has a fixed-width 8-aligned stride and no
-    /// German-string (STRING or BLOB) columns. Drives the `with_scatter_group`
-    /// fast path.
-    pub wire_safe: bool,
 }
 
 #[derive(Default)]

@@ -10,6 +10,9 @@ use std::cell::RefCell;
 use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine::storage::Batch;
 
+use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets};
+use crate::runtime::wire::{WireData, WireMsg, WireSchema};
+
 // Reuse the index scratch across calls so a steady-state push allocates nothing
 // for its routing table.
 thread_local! {
@@ -58,11 +61,11 @@ where
 /// shape, so the SAL fit check and the emit that follows it cannot size the same
 /// batch differently.
 ///
-/// A replicated table broadcasts because the same `with_scatter_group(…
-/// FLAG_PUSH …)` machinery then lands the whole batch in every worker's ingest +
-/// SAL slot (inheriting the atomic zone, LSN, ACK accounting, and the
-/// committer's single `fdatasync`), so every worker holds an identical full copy.
-/// Same TLS-pool borrow contract as [`with_worker_indices`].
+/// A replicated table broadcasts because the same [`with_group`] machinery then
+/// lands the whole batch in every worker's ingest + SAL slot (inheriting the
+/// atomic zone, LSN, ACK accounting, and the committer's single `fdatasync`), so
+/// every worker holds an identical full copy. Same TLS-pool borrow contract as
+/// [`with_worker_indices`].
 pub(crate) fn with_commit_indices<F, R>(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, f: F) -> R
 where
     F: FnOnce(&[Vec<u32>]) -> R,
@@ -75,6 +78,61 @@ where
             fill_scatter(batch, schema, num_workers, &mut worker_indices);
         }
         f(&worker_indices[..num_workers])
+    })
+}
+
+/// Build the [`DirectGroup`] a scatter emission of `batch` under
+/// `worker_indices` produces, and hand it to `f`. Here rather than on the log
+/// writer, beside the two index fills it must be paired with.
+///
+/// A schema with no German-string column scatters straight into the destination
+/// slot ([`WireData::Scattered`]), skipping the intermediate `Batch`. One with a
+/// German string cannot: `encode_scattered_to_wire` writes the block header and
+/// directory before the scatter, so the blob region's size must be known up
+/// front, and it is data-dependent — two rows sharing a source span dedup to one
+/// copy. Those slots materialize a per-worker sub-`Batch` first.
+pub(crate) fn with_group<R>(
+    batch: &Batch,
+    worker_indices: &[Vec<u32>],
+    relation: &WireSchema,
+    template: WireMsg<'_>,
+    targets: GroupTargets<'_>,
+    num_workers: usize,
+    f: impl FnOnce(&DirectGroup) -> R,
+) -> R {
+    let schema = relation.descriptor();
+    // The sub-batches must outlive the group that borrows them, so they are
+    // built here rather than inside the slot fill.
+    let mb = batch.as_mem_batch();
+    let sub_batches: Vec<Batch> = if schema.has_german_string() {
+        worker_indices
+            .iter()
+            .take(num_workers)
+            .map(|indices| {
+                if indices.is_empty() {
+                    Batch::empty_with_schema(schema)
+                } else {
+                    Batch::from_indexed_rows(&mb, indices, schema)
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let worker_data: Vec<WireData> = if sub_batches.is_empty() {
+        worker_indices
+            .iter()
+            .take(num_workers)
+            .map(|indices| WireData::Scattered { batch, indices, schema })
+            .collect()
+    } else {
+        sub_batches.iter().map(|b| WireData::Whole(Some(b))).collect()
+    };
+
+    f(&DirectGroup {
+        template: relation.frame(template),
+        data: GroupData::PerWorker(&worker_data),
+        targets,
     })
 }
 

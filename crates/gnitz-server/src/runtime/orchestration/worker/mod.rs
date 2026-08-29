@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT};
-use crate::runtime::sal::{SalMessageKind, SalReader};
+use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{self as ipc, FLAG_SCAN_LAST};
 use gnitz_engine::catalog::{CatalogEngine, IngestError, FIRST_USER_TABLE_ID};
@@ -16,15 +16,15 @@ use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::query::{DagEngine, ExchangeCallback};
 use gnitz_engine::schema::key::PkBuf;
 use gnitz_engine::schema::SchemaDescriptor;
+use gnitz_engine::storage::Batch;
 use gnitz_engine::storage::BlobCacheGuard;
-use gnitz_engine::storage::{schema_wire_safe, Batch};
 use gnitz_wire::{FLAG_CONTINUATION, FLAG_EXCHANGE, STATUS_OK};
 
 // ---------------------------------------------------------------------------
 // WorkerExchangeHandler
 // ---------------------------------------------------------------------------
 
-/// Lookup target for FLAG_HAS_PK requests.
+/// Lookup target for HasPk requests.
 enum HasPkLookup {
     /// Check the table's primary-key store.
     PrimaryKey,
@@ -85,7 +85,7 @@ struct DeferredDdl {
 /// it had not.
 #[derive(Debug)]
 enum Deferred {
-    /// A `FLAG_TICK`. Replay needs the view id, the round that produced it, and
+    /// A `Tick`. Replay needs the view id, the round that produced it, and
     /// the original request id so the replayed ACK is routable.
     ///
     /// The round **travels with the message**: a latched "current round" would
@@ -155,7 +155,7 @@ struct WorkerExchangeHandler {
     /// `view_id` while an outer exchange for the same view is still awaiting its
     /// relay.
     deferred_replay: Vec<Deferred>,
-    /// FLAG_EXCHANGE_RELAY messages whose `(view_id, source_id)` doesn't
+    /// ExchangeRelay messages whose `(view_id, source_id)` doesn't
     /// match the active exchange wait. Keyed by the tuple so a stashed
     /// relay for one source never satisfies a wait for a different source
     /// of the same view (which would drive the inline DAG re-entry with
@@ -245,7 +245,7 @@ pub struct WorkerProcess {
     /// no per-train frame-count ceiling.
     ///
     /// This budgets only the chunk split point; single-frame paths that cannot
-    /// chunk (non-wire-safe STRING replies) check `FRAME_CAP` directly.
+    /// chunk (blob-bearing STRING replies) check `FRAME_CAP` directly.
     reply_frame_budget: usize,
 }
 
@@ -287,8 +287,8 @@ pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, 
 /// and caching them would poison the table's block. `ClientAuthored` is the
 /// ScanSpec reply schema the client built and shipped in `seek_pk_extra`: the
 /// client decodes the reply against its own copy, so no block is emitted, but
-/// the descriptor is still consulted for `schema_wire_safe`, which is what
-/// keeps a STRING projection off the immediate-emit path.
+/// the descriptor is still consulted for `has_german_string`, which is what
+/// keeps a STRING projection off the chunking path.
 #[derive(Clone, Copy)]
 enum ReplySchema<'a> {
     Table(&'a SchemaDescriptor),
@@ -378,8 +378,8 @@ impl WorkerProcess {
     pub fn run(&mut self, boot_error: Option<String>) -> i32 {
         if let Some(e) = boot_error {
             // Master's wait_all_workers turns this nonzero status into a boot
-            // abort BEFORE the SAL sentinel is zeroed — the replayed data's
-            // only durable copy survives for the next boot.
+            // abort BEFORE the SAL is rewound — the replayed data's only durable
+            // copy survives for the next boot.
             self.send_error(&e, 0);
             return 1;
         }
@@ -417,10 +417,11 @@ impl WorkerProcess {
         if !self.pending_streams.is_empty() {
             self.emit_pending_scan_chunk();
         }
-        while let Some((kind, target_id, lsn, wire)) = self.next_sal_message() {
+        while let Some(msg) = self.next_sal_message() {
+            let wire = self.sal_reader.my_slot(&msg);
             // Only an exchange wait can match a relay; the top-level dispatcher
             // classifies ExchangeRelay as a protocol bug and returns nothing.
-            let matched = self.dispatch(DispatchContext::TopLevel, kind, target_id, lsn, wire);
+            let matched = self.dispatch(DispatchContext::TopLevel, &msg, wire);
             debug_assert!(matched.is_none(), "relay matched at top-level drain_sal");
             // Replay whatever an exchange wait deferred — a tick or a delta read
             // — now that the outer tick's ACK has been sent. Pushes are handled
@@ -472,10 +473,10 @@ impl WorkerProcess {
     /// the top-level loop and the inside-exchange-wait loop funnel through here.
     ///
     /// The group header's `lsn` joins the tuple rather than being latched into the
-    /// catalog the way `FLAG_FLUSH_EPH`'s generation is: that latch is correct for
+    /// catalog the way `FlushEph`'s generation is: that latch is correct for
     /// a generation that governs the whole round, and wrong for a tick round one
     /// deferred message must carry to its replay.
-    fn next_sal_message(&mut self) -> Option<(SalMessageKind, i64, u64, Option<&'static [u8]>)> {
+    fn next_sal_message(&mut self) -> Option<SalMessage> {
         let msg = self.sal_reader.next()?;
         // The ephemeral flush round carries the checkpoint generation in the
         // group header's `lsn` field. Latch it before dispatch so
@@ -485,7 +486,7 @@ impl WorkerProcess {
         if msg.kind == SalMessageKind::FlushEph {
             self.cat().set_resume_generation(msg.lsn);
         }
-        Some((msg.kind, msg.target_id as i64, msg.lsn, msg.wire_data))
+        Some(msg)
     }
 
     /// The single source of truth for the inline-vs-defer matrix. Match
@@ -502,7 +503,7 @@ impl WorkerProcess {
     ///   tick's ACK so the master observes ACKs in SAL arrival order.
     ///   See `WorkerExchangeHandler::deferred_replay`.
     ///
-    /// * **DeltaScanSpec defers inside an evaluation, and a plain ScanSpec does
+    /// * **A delta ScanSpec defers inside an evaluation, and a plain one does
     ///   not.** A read answered while the worker is parked in `do_exchange_wait`
     ///   sees a half-ingested round — some of that round's views ingested, others
     ///   not, and a sibling tick group of the same round sitting deferred behind
@@ -532,18 +533,14 @@ impl WorkerProcess {
     ///   drive the inline DAG with the wrong sharding columns. Mismatched
     ///   relays are parked in `pending_relays` and picked up by the next
     ///   nested wait that asks for the right pair.
-    fn dispatch(
-        &mut self,
-        ctx: DispatchContext,
-        kind: SalMessageKind,
-        target_id: i64,
-        group_lsn: u64,
-        wire: Option<&'static [u8]>,
-    ) -> Option<Batch> {
-        // Unicast kinds without a per-worker payload aren't for us.
-        if wire.is_none() && !kind.is_broadcast() {
+    fn dispatch(&mut self, ctx: DispatchContext, msg: &SalMessage, wire: Option<&'static [u8]>) -> Option<Batch> {
+        // A slot exists but not ours — not for us. No slot for anyone — a
+        // control-only group (the commit sentinel, a checkpoint round), which
+        // every worker acts on.
+        if wire.is_none() && msg.slots() > 0 {
             return None;
         }
+        let (kind, target_id, group_lsn) = (msg.kind, msg.target_id as i64, msg.lsn);
 
         match (ctx, kind) {
             // ── Tick (maintenance): inline at top-level; defer inside an
@@ -569,16 +566,16 @@ impl WorkerProcess {
                 None
             }
 
-            // ── DeltaScanSpec: inline at top-level; defer inside an in-flight
+            // ── Delta ScanSpec: inline at top-level; defer inside an in-flight
             //    evaluation, where the answer would span a half-ingested round.
-            (DispatchContext::TopLevel, SalMessageKind::DeltaScanSpec) => {
+            (DispatchContext::TopLevel, SalMessageKind::ScanSpec { delta: true }) => {
                 self.run_via_dispatch_inner(kind, target_id, group_lsn, wire)
             }
-            (DispatchContext::InEval { .. }, SalMessageKind::DeltaScanSpec) => {
+            (DispatchContext::InEval { .. }, SalMessageKind::ScanSpec { delta: true }) => {
                 let Some(data) = wire else {
                     // Unicast-shaped, so the `wire.is_none()` guard above already
                     // filtered a slot that is not ours.
-                    unreachable!("DeltaScanSpec with no payload (filtered by dispatch's None guard)")
+                    unreachable!("a delta read with no payload (filtered by dispatch's None guard)")
                 };
                 match ipc::decode_wire(data) {
                     Ok(mut decoded) => self.exchange.deferred_replay.push(Deferred::DeltaRead {
@@ -683,7 +680,7 @@ impl WorkerProcess {
             | (_, SalMessageKind::Push)
             | (_, SalMessageKind::SeekByIndex)
             | (_, SalMessageKind::Seek)
-            | (_, SalMessageKind::ScanSpec)
+            | (_, SalMessageKind::ScanSpec { delta: false })
             | (_, SalMessageKind::Scan) => self.run_via_dispatch_inner(kind, target_id, group_lsn, wire),
         }
     }
@@ -754,7 +751,7 @@ impl WorkerProcess {
             SalMessageKind::Shutdown => self.shutdown(),
 
             SalMessageKind::Flush => {
-                self.sal_reader.checkpoint_reset();
+                self.sal_reader.rewind();
                 self.handle_flush_all()?;
                 self.send_ack(0, request_id);
                 Ok(())
@@ -764,7 +761,7 @@ impl WorkerProcess {
             // tables and output stores, stamped with the checkpoint generation this
             // round's header already latched into the catalog at the classify site.
             SalMessageKind::FlushEph => {
-                self.sal_reader.checkpoint_reset();
+                self.sal_reader.rewind();
                 self.cat().flush_ephemeral_round()?;
                 self.send_ack(0, request_id);
                 Ok(())
@@ -913,7 +910,7 @@ impl WorkerProcess {
                 )
             }
 
-            SalMessageKind::ScanSpec | SalMessageKind::DeltaScanSpec => {
+            SalMessageKind::ScanSpec { .. } => {
                 self.answer_scan_spec(target_id, request_id, client_id, seek_pk, &seek_pk_extra)
             }
 
@@ -939,7 +936,7 @@ impl WorkerProcess {
     // ── Request handlers ───────────────────────────────────────────────
 
     fn handle_push(&mut self, target_id: i64, batch: Batch) -> Result<(), String> {
-        // Master pre-partitions FLAG_PUSH rows in `with_scatter_group`,
+        // Master pre-partitions Push rows in `scatter::with_group`,
         // so every slot already contains only this worker's rows. A second
         // partition-hash filter here would be pure overhead.
         if batch.count == 0 {
@@ -947,10 +944,12 @@ impl WorkerProcess {
         }
         let row_count = batch.count;
         if target_id < FIRST_USER_TABLE_ID {
-            // Master never sends FLAG_PUSH for system tables; system-table
-            // changes arrive via FLAG_DDL_SYNC → ddl_sync. Reaching here
+            // Master never sends Push for system tables; system-table
+            // changes arrive via DdlSync → ddl_sync. Reaching here
             // means a protocol invariant was violated.
-            return Err(format!("FLAG_PUSH for system table_id={target_id}; expected DDL_SYNC"));
+            return Err(format!(
+                "a Push group named system table_id={target_id}; a system family arrives as DdlSync"
+            ));
         }
         // A storage fault here means committed data was not applied while the
         // client already holds a durability ACK, so this worker has diverged from
@@ -1171,12 +1170,12 @@ impl WorkerProcess {
         // SAL checkpoint inline: advance the read epoch so post-reset groups (the
         // master writes them at `write_cursor == 0` in the bumped epoch) are
         // accepted and any pre-reset group parks via `next_sal_message`'s epoch
-        // check. Deliberately NOT the FLAG_FLUSH arm — no `handle_flush_all`, no
+        // check. Deliberately NOT the Flush arm — no `handle_flush_all`, no
         // flush ACK; the master's consumption proof is the next round's
         // FLAG_EXCHANGE report, which a flush ACK would be misread as a
         // terminal ACK that retires the worker.
         if decision == BACKFILL_DECISION_CHECKPOINT {
-            self.sal_reader.checkpoint_reset();
+            self.sal_reader.rewind();
         }
         self.exchange.backfill_signal = Some(if decision == BACKFILL_DECISION_STOP {
             BackfillRound::Stop
@@ -1372,7 +1371,7 @@ impl WorkerProcess {
 
     /// Run multi-worker DAG evaluation with the exchange context.
     /// `request_id` is the master's request id of the message that
-    /// triggered this evaluation (FLAG_TICK / FLAG_PUSH / FLAG_BACKFILL);
+    /// triggered this evaluation (Tick / Push / Backfill);
     /// echoed by `do_exchange_wait` so the master accumulator's wakers
     /// stay routable. `tick_round` is the round that group carried, which stamps
     /// every fed view's captured delta.
@@ -1410,7 +1409,7 @@ impl WorkerProcess {
     /// `checkpoint_reset` can have discarded the SAL entries that are these rows'
     /// only other durable copy — but there may be no master left to bump the
     /// generation ahead of it, since the watchdog's crashed-worker path
-    /// broadcasts `FLAG_SHUTDOWN` with no barrier behind it. So the worker
+    /// broadcasts `Shutdown` with no barrier behind it. So the worker
     /// invalidates its own derived state instead, and unlinks before publishing
     /// so a crash between the two errs toward a rebuild.
     ///
@@ -1615,6 +1614,18 @@ mod tests {
         }
     }
 
+    /// One SAL group as the matrix tests hand it to `dispatch`: a kind, a
+    /// target and a round. `slots` stays 0, so the "not for us" guard never
+    /// fires and every arm is reached.
+    fn sal_msg(kind: SalMessageKind, target_id: u32, lsn: u64) -> SalMessage {
+        SalMessage {
+            kind,
+            target_id,
+            lsn,
+            ..Default::default()
+        }
+    }
+
     /// Build a worker that's safe for `dispatch` calls whose behavior
     /// does not enter the catalog (Tick/DdlSync/ExchangeRelay inside an
     /// exchange wait, plus ExchangeRelay at top-level which warns
@@ -1634,7 +1645,7 @@ mod tests {
         let mut wp = make_worker_for_matrix();
         let ctx = DispatchContext::InEval { relay_wait: (100, 5) };
         assert!(wp.exchange.deferred_replay.is_empty());
-        assert!(wp.dispatch(ctx, SalMessageKind::Tick, 999, 7, None).is_none());
+        assert!(wp.dispatch(ctx, &sal_msg(SalMessageKind::Tick, 999, 7), None).is_none());
         assert_eq!(wp.exchange.deferred_replay.len(), 1);
         assert!(
             matches!(
@@ -1671,9 +1682,13 @@ mod tests {
             .into_boxed_slice(),
         );
         // A tick first, so the shared FIFO's insertion order is observable.
-        assert!(wp.dispatch(ctx, SalMessageKind::Tick, 999, 3, None).is_none());
+        assert!(wp.dispatch(ctx, &sal_msg(SalMessageKind::Tick, 999, 3), None).is_none());
         assert!(wp
-            .dispatch(ctx, SalMessageKind::DeltaScanSpec, 77, 0, Some(frame))
+            .dispatch(
+                ctx,
+                &sal_msg(SalMessageKind::ScanSpec { delta: true }, 77, 0),
+                Some(frame)
+            )
             .is_none());
         assert_eq!(wp.exchange.deferred_replay.len(), 2, "one queue, in SAL order");
         assert!(matches!(wp.exchange.deferred_replay[0], Deferred::Tick { .. }));
@@ -1690,24 +1705,6 @@ mod tests {
             }
             other => panic!("a delta read must defer as a DeltaRead, got {other:?}"),
         }
-    }
-
-    /// A **plain** ScanSpec does not defer: it holds no cursor across calls, so
-    /// making an ad-hoc point read wait out an exchange round-trip it has no
-    /// stake in buys nothing. The classification is what separates the two, and
-    /// `FLAG_DELTA_SCAN` must outrank `FLAG_SCAN_SPEC` for it to survive — a
-    /// delta read's group carries both bits.
-    #[test]
-    fn test_delta_scan_outranks_plain_scan_spec_in_the_classifier() {
-        use crate::runtime::sal::{FLAG_DELTA_SCAN, FLAG_SCAN_SPEC};
-        assert_eq!(
-            SalMessageKind::classify(FLAG_SCAN_SPEC | FLAG_DELTA_SCAN),
-            SalMessageKind::DeltaScanSpec,
-        );
-        assert_eq!(SalMessageKind::classify(FLAG_SCAN_SPEC), SalMessageKind::ScanSpec);
-        // Unicast-shaped, like every other read: a replicated view's worker-0
-        // delta read must not be acted on by the workers that got no slot.
-        assert!(!SalMessageKind::DeltaScanSpec.is_broadcast());
     }
 
     /// Encode a header-only ExchangeRelay wire frame (schema, no data batch)
@@ -1755,7 +1752,7 @@ mod tests {
         // Mismatched view (target_id=200 ≠ want 100): parked under (200, 0).
         let frame = encode_relay_frame(200, 0, &schema);
         assert!(wp
-            .dispatch(ctx, SalMessageKind::ExchangeRelay, 200, 0, Some(frame))
+            .dispatch(ctx, &sal_msg(SalMessageKind::ExchangeRelay, 200, 0), Some(frame))
             .is_none());
         assert!(
             wp.exchange.pending_relays.contains_key(&(200, 0)),
@@ -1765,7 +1762,7 @@ mod tests {
         // Matching key (target_id=100, source_id=0 == want_key): returns the batch.
         let frame = encode_relay_frame(100, 0, &schema);
         assert!(
-            wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 100, 0, Some(frame))
+            wp.dispatch(ctx, &sal_msg(SalMessageKind::ExchangeRelay, 100, 0), Some(frame))
                 .is_some(),
             "a key-matching relay must short-circuit out of dispatch with its batch"
         );
@@ -1781,9 +1778,7 @@ mod tests {
         assert!(wp
             .dispatch(
                 DispatchContext::TopLevel,
-                SalMessageKind::ExchangeRelay,
-                100,
-                0,
+                &sal_msg(SalMessageKind::ExchangeRelay, 100, 0),
                 Some(empty)
             )
             .is_none());
@@ -1806,7 +1801,9 @@ mod tests {
         let ctx = DispatchContext::InEval { relay_wait: (0, 0) };
 
         let frame = encode_data_frame(42, &schema, &one_row_batch(&schema, 1, 10));
-        assert!(wp.dispatch(ctx, SalMessageKind::DdlSync, 42, 0, Some(frame)).is_none());
+        assert!(wp
+            .dispatch(ctx, &sal_msg(SalMessageKind::DdlSync, 42, 0), Some(frame))
+            .is_none());
         assert_eq!(
             wp.exchange.deferred.len(),
             1,
@@ -1826,54 +1823,50 @@ mod tests {
     /// 1. Groups in the expected epoch are consumed in order.
     /// 2. A group from a *later* epoch is rejected and stays parked — repeatedly,
     ///    so the cursor did not advance past it.
-    /// 3. `checkpoint_reset` rewinds to cursor 0 in the next epoch, which is
+    /// 3. `SalReader::rewind` moves to cursor 0 in the next epoch, which is
     ///    exactly where the master writes after its own reset.
     #[test]
     fn test_next_sal_message_epoch_gating() {
-        use crate::runtime::sal::{sal_write_group, SalReader, FLAG_DDL_SYNC, FLAG_PUSH};
+        use crate::runtime::sal::{SalReader, SalWriter, ZoneMark};
 
         const SAL_SIZE: usize = 1 << 20;
         let sal_region = gnitz_engine_testkit::SharedRegion::new(SAL_SIZE);
         let sal_ptr = sal_region.ptr();
 
         // Single worker; each group puts a one-byte payload at slot 0.
-        let payload = [0u8; 1];
-        let payloads: [&[u8]; 1] = [&payload];
-        let write = |cursor, target, lsn, flags, epoch| {
-            unsafe { sal_write_group(sal_ptr, cursor, target, lsn, flags, epoch, SAL_SIZE as u64, &payloads) }
-                .expect("group fits")
+        let writer = SalWriter::new(sal_ptr, -1, SAL_SIZE as u64, 1);
+        let write = |target, lsn, kind, epoch| {
+            writer.reset(writer.cursor(), epoch);
+            writer
+                .write_raw_slots(target, lsn, kind, ZoneMark::Plain, &[&[0u8; 1]])
+                .expect("group fits");
         };
 
-        let c1 = write(0, 42, 100, FLAG_PUSH, 1);
-        let c2 = write(c1, 43, 101, FLAG_DDL_SYNC, 1);
+        write(42, 100, SalMessageKind::Push, 1);
+        write(43, 101, SalMessageKind::DdlSync, 1);
         // A group from the next epoch, ahead of the reader.
-        write(c2, 44, 102, FLAG_PUSH, 2);
+        write(44, 102, SalMessageKind::Push, 2);
 
         let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
-        wp.sal_reader = SalReader::new(sal_ptr as *const u8, 0, SAL_SIZE, -1, 1);
+        wp.sal_reader = unsafe { SalReader::new(sal_ptr as *const u8, 0, SAL_SIZE, -1, 1) };
 
-        assert_eq!(
-            wp.next_sal_message().map(|(k, t, _, _)| (k, t)),
-            Some((SalMessageKind::Push, 42))
-        );
-        assert_eq!(
-            wp.next_sal_message().map(|(k, t, _, _)| (k, t)),
-            Some((SalMessageKind::DdlSync, 43))
-        );
+        let next = |wp: &mut WorkerProcess| wp.next_sal_message().map(|m| (m.kind, m.target_id));
+        assert_eq!(next(&mut wp), Some((SalMessageKind::Push, 42)));
+        assert_eq!(next(&mut wp), Some((SalMessageKind::DdlSync, 43)));
 
         // The epoch-2 group parks: rejected now, and still rejected on a retry —
         // the cursor did not slip past it.
         assert!(wp.next_sal_message().is_none(), "an epoch-ahead group must park");
         assert!(wp.next_sal_message().is_none(), "and stay parked");
 
-        // After the reset the reader is at cursor 0 in epoch 2, where the master
+        // After the rewind the reader is at cursor 0 in epoch 2, where the master
         // writes its first post-checkpoint group.
-        write(0, 77, 103, FLAG_PUSH, 2);
-        wp.sal_reader.checkpoint_reset();
-        assert_eq!(
-            wp.next_sal_message().map(|(k, t, _, _)| (k, t)),
-            Some((SalMessageKind::Push, 77))
-        );
+        writer.reset(0, 2);
+        writer
+            .write_raw_slots(77, 103, SalMessageKind::Push, ZoneMark::Plain, &[&[0u8; 1]])
+            .expect("group fits");
+        wp.sal_reader.rewind();
+        assert_eq!(next(&mut wp), Some((SalMessageKind::Push, 77)));
     }
 
     // -- pending stream chunking tests -----------------------------------------------
@@ -1884,6 +1877,33 @@ mod tests {
         let region = unsafe { w2m::test_ring(w2m::W2M_REGION_SIZE) };
         let writer = W2mWriter::new(region.ptr());
         (region, writer)
+    }
+
+    /// A U64 PK with a stride-4 payload column: the shape whose wire block pads
+    /// between regions, so its size is monotone in the row count but not affine.
+    fn padded_schema() -> SchemaDescriptor {
+        use gnitz_engine::schema::SchemaColumn;
+        use gnitz_wire::type_code;
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U32, 0),
+            ],
+            &[0],
+        )
+    }
+
+    fn make_padded_batch(n: usize) -> Batch {
+        let schema = padded_schema();
+        let mut b = Batch::with_capacity(schema, n.max(1));
+        for i in 0..n {
+            b.extend_pk(i as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &(i as u32).to_le_bytes());
+            b.count += 1;
+        }
+        b
     }
 
     fn make_n_row_batch(schema: SchemaDescriptor, n: usize) -> Batch {
@@ -1939,75 +1959,85 @@ mod tests {
         .size()
     }
 
-    /// The chunk sizing model `emit_wire_safe_chunk` inverts: a chunk's wire size
-    /// is `base + hdr + n * per_row`, affine in the row count with the data
-    /// block's own header charged exactly once. A zero-row chunk carries no data
-    /// block at all (`has_data()` is false), which is the discontinuity the
-    /// intercept must be read across rather than differenced through.
+    /// The property `emit_chunk`'s search rests on: a chunk's wire size is
+    /// `base + wire_byte_size_range(n)` for every `n >= 1`, and that function is
+    /// monotone non-decreasing in `n`. Affine only when every region stride is a
+    /// multiple of 8 — the padded schema below is exactly where it is not, and
+    /// where inverting a linear model overshoots the budget.
+    ///
+    /// A zero-row chunk carries no data block at all (`has_data()` is false), so
+    /// `base` is that message and the identity starts at one row.
     #[test]
-    fn test_chunk_wire_size_is_affine_in_the_row_count() {
-        let schema = test_schema();
-        let batch = make_n_row_batch(schema, 32);
-        let block = gnitz_engine::catalog::encode_schema_block(&schema, 1);
+    fn test_chunk_wire_size_is_monotone_and_exactly_measured() {
+        for (label, batch) in [
+            ("8-aligned", make_n_row_batch(test_schema(), 32)),
+            ("padded", make_padded_batch(32)),
+        ] {
+            let block = gnitz_engine::catalog::encode_schema_block(&batch.schema, 1);
+            let base = range_size(&batch, 0, Some(block.as_slice()));
 
-        let base = range_size(&batch, 0, Some(block.as_slice()));
-        let hdr = batch.wire_byte_size_range(0);
-        let per_row = batch.wire_byte_size_range(1) - hdr;
-        assert!(hdr > 0 && per_row >= 16, "data block header {hdr}, stride {per_row}");
-
-        for n in [1usize, 2, 17] {
-            assert_eq!(
-                range_size(&batch, n, Some(block.as_slice())),
-                base + hdr + n * per_row,
-                "{n}-row chunk"
-            );
+            let mut prev = 0;
+            for n in 1..=32usize {
+                let size = batch.wire_byte_size_range(n);
+                assert!(size >= prev, "{label}: wire size fell from {n} rows back");
+                prev = size;
+                assert_eq!(
+                    range_size(&batch, n, Some(block.as_slice())),
+                    base + size,
+                    "{label}: {n}-row chunk"
+                );
+            }
         }
-        // The zero-row message is the intercept-free one: it omits the data block.
-        assert_eq!(range_size(&batch, 0, Some(block.as_slice())), base);
     }
 
     /// Every non-terminal frame of a train fills its budget to within one row:
-    /// one more row would exceed it. Charging the data block's header per row
-    /// (rather than once) shrinks every frame to a fraction of the budget.
+    /// one more row would exceed it. Both an 8-aligned and a padded schema, since
+    /// a chunk sized by inverting a linear model overshoots on the padded one.
     #[test]
     fn test_train_frames_fill_the_budget_to_within_one_row() {
-        let schema = test_schema();
-        let batch = make_n_row_batch(schema, 40);
-        let block = Rc::new(gnitz_engine::catalog::encode_schema_block(&schema, 1));
-        let per_row = batch.wire_byte_size_range(1) - batch.wire_byte_size_range(0);
-        // Room for four rows beside the schema block on the first frame.
-        let budget = range_size(&batch, 4, Some(block.as_slice()));
+        for (label, batch) in [
+            ("8-aligned", make_n_row_batch(test_schema(), 40)),
+            ("padded", make_padded_batch(40)),
+        ] {
+            let block = Rc::new(gnitz_engine::catalog::encode_schema_block(&batch.schema, 1));
+            let per_row = batch.wire_byte_size_range(2) - batch.wire_byte_size_range(1);
+            // Room for four rows beside the schema block on the first frame.
+            let budget = range_size(&batch, 4, Some(block.as_slice()));
 
-        let (region, writer) = make_ring();
-        let ptr = region.ptr();
-        let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-        wp.reply_frame_budget = budget;
-        wp.pending_streams.push_back(PendingScan {
-            batch: Rc::new(batch),
-            request_id: 5,
-            client_id: 0,
-            target_id: 1,
-            prebuilt_schema: Some(block),
-            server_version: 0,
-            kind: PendingScanKind::WireSafe { next_row: 0 },
-        });
-        let mut passes = 0;
-        while !wp.pending_streams.is_empty() {
-            wp.emit_pending_scan_chunk();
-            passes += 1;
-            assert!(passes < 50, "the train must drain within a bounded pass count");
-        }
+            let (region, writer) = make_ring();
+            let ptr = region.ptr();
+            let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+            wp.reply_frame_budget = budget;
+            wp.pending_streams.push_back(PendingScan {
+                batch: Rc::new(batch),
+                request_id: 5,
+                client_id: 0,
+                target_id: 1,
+                prebuilt_schema: Some(block),
+                server_version: 0,
+                kind: PendingScanKind::Chunked { next_row: 0 },
+            });
+            let mut passes = 0;
+            while !wp.pending_streams.is_empty() {
+                wp.emit_pending_scan_chunk();
+                passes += 1;
+                assert!(passes < 50, "{label}: the train must drain within a bounded pass count");
+            }
 
-        let frames = walk_frames(ptr);
-        assert!(frames.len() >= 2, "40 rows at a 4-row budget must span several frames");
-        for (i, (_, bytes)) in frames.iter().enumerate() {
-            assert!(bytes.len() <= budget, "frame {i} of {} exceeds the budget", bytes.len());
-            if i + 1 < frames.len() {
-                assert!(
-                    bytes.len() + per_row > budget,
-                    "frame {i} is {} bytes of a {budget}-byte budget: another row would have fit",
-                    bytes.len()
-                );
+            let frames = walk_frames(ptr);
+            assert!(
+                frames.len() >= 2,
+                "{label}: 40 rows at a 4-row budget must span several frames"
+            );
+            for (i, (_, bytes)) in frames.iter().enumerate() {
+                assert!(bytes.len() <= budget, "{label}: frame {i} is {} bytes", bytes.len());
+                if i + 1 < frames.len() {
+                    assert!(
+                        bytes.len() + per_row > budget,
+                        "{label}: frame {i} is {} bytes of a {budget}-byte budget: another row fits",
+                        bytes.len()
+                    );
+                }
             }
         }
     }
@@ -2030,7 +2060,7 @@ mod tests {
             target_id: 1,
             prebuilt_schema: Some(schema_block),
             server_version: 0,
-            kind: PendingScanKind::WireSafe { next_row: 0 },
+            kind: PendingScanKind::Chunked { next_row: 0 },
         });
 
         wp.emit_pending_scan_chunk();
@@ -2077,7 +2107,7 @@ mod tests {
             target_id: 1,
             prebuilt_schema: None,
             server_version: 0,
-            kind: PendingScanKind::WireSafe { next_row: 5 },
+            kind: PendingScanKind::Chunked { next_row: 5 },
         });
 
         wp.emit_pending_scan_chunk();
@@ -2105,7 +2135,7 @@ mod tests {
     }
 
     /// send_scan_response with schema=None (avoids catalog) emits a single ring
-    /// message with FLAG_CONTINUATION | FLAG_SCAN_LAST for a small wire-safe batch,
+    /// message with FLAG_CONTINUATION | FLAG_SCAN_LAST for a small batch,
     /// and leaves the stream queue empty.
     #[test]
     fn test_send_scan_response_single_frame() {
@@ -2117,7 +2147,7 @@ mod tests {
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
         let err = wp.send_scan_response(1, Rc::new(batch), ReplySchema::ClientAuthored(&schema), 3, 0, 0, false);
-        assert!(err.is_ok(), "small wire-safe batch must not error");
+        assert!(err.is_ok(), "a small batch must not error");
         assert!(
             wp.pending_streams.is_empty(),
             "batch fits in one frame; send_scan_response must not enqueue a train"
@@ -2143,12 +2173,12 @@ mod tests {
     }
 
     /// FLAG_SCAN_FIFO_REPLY (force_fifo=true) routes even an immediate-emit-
-    /// eligible wire-safe reply through `pending_streams`, so a multi-scan's
+    /// eligible splittable reply through `pending_streams`, so a multi-scan's
     /// relations reach the ring in request order. Without the flag the identical
     /// reply emits inline (test_send_scan_response_single_frame). Its lone chunk
     /// is byte-shaped exactly like the single-frame path.
     #[test]
-    fn test_force_fifo_queues_wire_safe_single_frame() {
+    fn test_force_fifo_queues_splittable_single_frame() {
         let schema = test_schema();
         let batch = make_n_row_batch(schema, 5);
         let (region, writer) = make_ring();
@@ -2161,9 +2191,9 @@ mod tests {
         assert!(
             matches!(
                 wp.pending_streams.front().map(|p| &p.kind),
-                Some(PendingScanKind::WireSafe { .. })
+                Some(PendingScanKind::Chunked { .. })
             ),
-            "wire-safe reply queues as the WireSafe variant"
+            "a splittable reply queues as the Chunked variant"
         );
         assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
 
@@ -2176,13 +2206,13 @@ mod tests {
         assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
     }
 
-    /// The non-wire-safe (STRING/TEXT) reply must FIFO too: under force_fifo it
-    /// queues as `PendingScan::NonWireSafe` (not immediately emitted), and
-    /// `emit_pending_scan_chunk` emits its one blob-capable frame with
+    /// A blob-bearing (STRING/TEXT) reply must FIFO too: under force_fifo it
+    /// queues as `PendingScanKind::WholeBlob` (not immediately emitted), and
+    /// `emit_pending_scan_chunk` emits its one frame with
     /// FLAG_CONTINUATION | FLAG_SCAN_LAST, then pops. This is the mainline case a
     /// TEXT dimension table hits.
     #[test]
-    fn test_force_fifo_queues_non_wire_safe_single_frame() {
+    fn test_force_fifo_queues_whole_blob_single_frame() {
         use gnitz_wire::type_code;
 
         let dir = worker_temp_dir("force_fifo_text");
@@ -2193,7 +2223,7 @@ mod tests {
             .register_table(tid, PUBLIC_SCHEMA_ID, "tfifo", &cols, &[0])
             .unwrap();
         let schema = engine.get_schema_desc(tid).unwrap();
-        assert!(!schema_wire_safe(&schema), "STRING schema must be non-wire-safe");
+        assert!(schema.has_german_string(), "a STRING schema carries a German string");
 
         let (region, writer) = make_ring();
         let ptr = region.ptr();
@@ -2207,9 +2237,9 @@ mod tests {
         assert!(
             matches!(
                 wp.pending_streams.front().map(|p| &p.kind),
-                Some(PendingScanKind::NonWireSafe)
+                Some(PendingScanKind::WholeBlob)
             ),
-            "TEXT reply must queue as the NonWireSafe variant under force_fifo"
+            "a TEXT reply must queue as the WholeBlob variant under force_fifo"
         );
         assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
 
@@ -2222,7 +2252,7 @@ mod tests {
         assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
         assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
         // Decodes via the blob-capable path; the first frame carries the schema block.
-        let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("non-wire-safe frame decodes standalone");
+        let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("the blob frame decodes standalone");
         assert!(decoded.schema.is_some(), "the frame carries the schema block");
         assert_eq!(decoded.data_batch.map(|b| b.count).unwrap_or(0), 1);
 
@@ -2230,28 +2260,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// STRING-column schemas are not wire-safe: send_scan_response sends them as a
-    /// single frame without chunking (and returns an error past `ipc::FRAME_CAP`).
-    /// The full error path requires a CatalogEngine + an oversized batch; this test
-    /// verifies the predicate that gates that branch.
+    /// The one predicate that decides whether a reply can be split across
+    /// frames. A narrow fixed-width column does not stop it — only a German
+    /// string does, whose heap cannot be cut at a row boundary.
     #[test]
-    fn test_string_schema_not_wire_safe() {
+    fn test_only_a_german_string_blocks_chunking() {
         use gnitz_engine::schema::SchemaColumn;
         use gnitz_wire::type_code;
-        let sd = SchemaDescriptor::new(
+        let with_string = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0),
                 SchemaColumn::new(type_code::STRING, 0),
             ],
             &[0],
         );
+        assert!(with_string.has_german_string());
+        assert!(!test_schema().has_german_string());
         assert!(
-            !schema_wire_safe(&sd),
-            "STRING-column schema must not be wire-safe (no chunking)"
-        );
-        assert!(
-            schema_wire_safe(&test_schema()),
-            "U64-only schema must be wire-safe (chunking enabled)"
+            !padded_schema().has_german_string(),
+            "a stride-4 column must not block chunking"
         );
     }
 
@@ -2311,7 +2338,7 @@ mod tests {
             target_id: 1,
             prebuilt_schema: Some(block_a),
             server_version: 0,
-            kind: PendingScanKind::WireSafe { next_row: 0 },
+            kind: PendingScanKind::Chunked { next_row: 0 },
         });
         wp.pending_streams.push_back(PendingScan {
             batch: Rc::new(batch_b),
@@ -2320,7 +2347,7 @@ mod tests {
             target_id: 2,
             prebuilt_schema: Some(block_b),
             server_version: 0,
-            kind: PendingScanKind::WireSafe { next_row: 0 },
+            kind: PendingScanKind::Chunked { next_row: 0 },
         });
 
         // One chunk per pass, as drain_sal drives it.
@@ -2425,7 +2452,7 @@ mod tests {
         );
     }
 
-    /// An oversized wire-safe result enqueues a train instead of emitting a
+    /// An oversized splittable result enqueues a train instead of emitting a
     /// frame past `ipc::FRAME_CAP`; nothing is emitted until drain_sal.
     #[test]
     fn test_stream_batch_response_oversized_enqueues_train() {
@@ -2437,11 +2464,11 @@ mod tests {
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
         let err = wp.stream_batch_response(3, Some(batch), ReplySchema::ClientAuthored(&schema), 5, 9, 0);
-        assert!(err.is_ok(), "oversized wire-safe result must chunk, not error");
+        assert!(err.is_ok(), "an oversized splittable result must chunk, not error");
         assert_eq!(wp.pending_streams.len(), 1);
         let ps = wp.pending_streams.front().unwrap();
-        let PendingScanKind::WireSafe { next_row, .. } = &ps.kind else {
-            panic!("oversized wire-safe result must enqueue a WireSafe train");
+        let PendingScanKind::Chunked { next_row, .. } = &ps.kind else {
+            panic!("an oversized splittable result must enqueue a Chunked train");
         };
         assert_eq!(*next_row, 0);
         assert_eq!(ps.request_id, 5);
@@ -2456,8 +2483,8 @@ mod tests {
         gnitz_engine_testkit::scratch_dir("worker", name)
     }
 
-    /// An oversized non-wire-safe (STRING) result returns the clean error —
-    /// the variable-width streaming chunker is an explicit non-goal.
+    /// An oversized blob-bearing (STRING) result returns the clean error — the
+    /// variable-width streaming chunker is an explicit non-goal.
     #[test]
     fn test_stream_batch_response_oversized_string_errors() {
         use gnitz_wire::type_code;
@@ -2470,7 +2497,7 @@ mod tests {
             .register_table(tid, PUBLIC_SCHEMA_ID, "tstr", &cols, &[0])
             .unwrap();
         let schema = engine.get_schema_desc(tid).unwrap();
-        assert!(!schema_wire_safe(&schema));
+        assert!(schema.has_german_string());
 
         // 40 B/row (8 pk + 8 weight + 8 null + 16 string struct), empty blob.
         let rows = (ipc::FRAME_CAP / 40) + 4096;
@@ -2485,7 +2512,7 @@ mod tests {
             err.text.contains("cannot be chunked"),
             "error names the limitation: {err}"
         );
-        assert!(wp.pending_streams.is_empty(), "non-wire-safe results never enqueue");
+        assert!(wp.pending_streams.is_empty(), "a blob-bearing result never enqueues");
 
         engine.close();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2541,8 +2568,8 @@ mod tests {
         let expected_block = gnitz_engine::catalog::encode_schema_block(&projected, tid as u32);
         let ps = wp.pending_streams.front().unwrap();
         assert!(
-            matches!(ps.kind, PendingScanKind::WireSafe { .. }),
-            "oversized projected reply must enqueue a WireSafe train"
+            matches!(ps.kind, PendingScanKind::Chunked { .. }),
+            "an oversized projected reply must enqueue a Chunked train"
         );
         assert_eq!(
             ps.prebuilt_schema.as_deref().map(Vec::as_slice),

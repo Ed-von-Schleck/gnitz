@@ -619,12 +619,12 @@ impl SchemaDescriptor {
         (0..self.num_payload_cols()).map(move |pi| (pi, &self.columns[self.payload_to_ci[pi] as usize]))
     }
 
-    /// Whether the schema carries a STRING/BLOB (German-string) column. Such a
-    /// column is always payload — `is_pk_eligible` excludes them — so `new()`
-    /// scans every column without filtering. Callers use this to decide whether
-    /// a batch's blob region is live.
+    /// Whether the schema carries a STRING/BLOB (German-string) column, and so
+    /// whether a batch over it has a live blob region. Cached by `new()`, which
+    /// scans every column without filtering — such a column is always payload,
+    /// since `is_pk_eligible` excludes them.
     #[inline]
-    pub(crate) fn has_german_string(&self) -> bool {
+    pub fn has_german_string(&self) -> bool {
         self.has_german_string
     }
 

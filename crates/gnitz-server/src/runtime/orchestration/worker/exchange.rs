@@ -23,7 +23,7 @@ impl WorkerProcess {
         self.cat().discard_pending_dir_deletions();
     }
 
-    /// Send FLAG_EXCHANGE to the master and block until its FLAG_EXCHANGE_RELAY
+    /// Send FLAG_EXCHANGE to the master and block until its ExchangeRelay
     /// for `view_id` comes back on the SAL. Messages that arrive mid-wait are
     /// dispatched inline — handle_push, handle_tick — so ACKs flow back through
     /// the master reactor in their natural arrival order, routed by req_id.
@@ -84,8 +84,9 @@ impl WorkerProcess {
                 unsafe { libc::_exit(0) }
             }
 
-            while let Some((kind, target_id, lsn, wire)) = self.next_sal_message() {
-                if let Some(batch) = self.dispatch(ctx, kind, target_id, lsn, wire) {
+            while let Some(msg) = self.next_sal_message() {
+                let wire = self.sal_reader.my_slot(&msg);
+                if let Some(batch) = self.dispatch(ctx, &msg, wire) {
                     return batch;
                 }
             }

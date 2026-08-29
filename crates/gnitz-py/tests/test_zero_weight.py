@@ -24,7 +24,7 @@ def _int_cols():
 
 
 def _str_cols():
-    """A STRING column makes the schema non-wire-safe, so its SAL group is scattered."""
+    """A STRING column makes the SAL group take the sub-batch path, not the scatter."""
     return [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("s", gnitz.TypeCode.STRING, is_nullable=True)]
 
@@ -54,7 +54,7 @@ def test_zero_weight_push_is_dropped(client):
 
 
 def test_zero_weight_push_string_column(client):
-    """Same on a STRING-column table, whose group takes the scatter path."""
+    """Same on a STRING-column table, whose group takes the sub-batch path."""
     tid, schema, sn = _make_table(client, _str_cols())
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, s="ghost", _weight=0)

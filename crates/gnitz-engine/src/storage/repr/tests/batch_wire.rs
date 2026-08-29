@@ -41,11 +41,11 @@ fn decode_mem_batch_rejects_blob_region_past_block() {
 }
 
 #[test]
-#[should_panic(expected = "wire-safe schemas")]
+#[should_panic(expected = "no German string")]
 fn encode_range_to_wire_panics_on_nonempty_blob() {
     let schema = pk_i64_schema(type_code::U64);
     let mut b = make_batch_raw(&schema, &[(1, 1, 7)]);
-    // A non-empty heap on a wire-safe encode must fail loudly, not vanish.
+    // A non-empty heap on a range encode must fail loudly, not vanish.
     b.blob.push(0xAB);
     let mut out = vec![0u8; b.wire_byte_size() + 16];
     b.encode_range_to_wire(0, 1, 1, &mut out, 0, false);
