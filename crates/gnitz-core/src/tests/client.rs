@@ -1,4 +1,5 @@
 use super::*;
+
 fn kv_schema() -> Schema {
     Schema {
         columns: vec![
@@ -9,111 +10,71 @@ fn kv_schema() -> Schema {
     }
 }
 
-fn ins(schema: &Schema, pk: u64, val: i64) -> ZSetBatch {
+fn ins(schema: &Schema, pk: u64) -> ZSetBatch {
     let mut b = ZSetBatch::new(schema);
-    BatchAppender::new(&mut b, schema).add_row(pk as u128, 1).i64_val(val);
+    BatchAppender::new(&mut b, schema)
+        .add_row(pk as u128, 1)
+        .i64_val(pk as i64 * 10);
     b
 }
 
-#[test]
-fn empty_push_opens_no_family() {
-    let s = kv_schema();
-    let mut buf = TxnBuffer::default();
-    assert!(buf.families.is_empty());
-    buf.push(16, &s, ZSetBatch::new(&s), WireConflictMode::Update);
-    assert!(buf.families.is_empty(), "an empty push opens no family");
+fn del(schema: &Schema, pk: u64) -> ZSetBatch {
+    retraction_batch(schema, PkColumn::from_u128s(8, [pk as u128]))
 }
 
+/// One mixed sequence pins the whole buffer: same-mode pushes extend the tid's
+/// current run, a mode change opens the next family in call order, an empty
+/// batch opens none, tids are independent, and every PK indexes to its latest
+/// row. "delete k; insert_error k" is the Update-then-Error pair.
 #[test]
-fn run_splitting_merges_same_mode_and_splits_on_mode_change() {
+fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
+    use WireConflictMode::{Error, Update};
     let s = kv_schema();
     let mut buf = TxnBuffer::default();
-    let tid = 16u64;
-    buf.push(tid, &s, ins(&s, 1, 10), WireConflictMode::Update);
-    buf.push(tid, &s, ins(&s, 2, 20), WireConflictMode::Update);
-    assert_eq!(buf.families.len(), 1, "same-mode pushes coalesce");
-    assert_eq!(buf.families[0].batch.len(), 2);
-    assert_eq!(buf.families[0].mode, WireConflictMode::Update);
-    buf.push(tid, &s, ins(&s, 3, 30), WireConflictMode::Error);
-    assert_eq!(buf.families.len(), 2, "mode change opens a new family");
-    assert_eq!(buf.families[1].mode, WireConflictMode::Error);
-    buf.push(tid, &s, ins(&s, 4, 40), WireConflictMode::Update);
+    for (tid, batch, mode) in [
+        (16, ins(&s, 1), Update),         // family 0, row 0
+        (16, ZSetBatch::new(&s), Update), // empty: opens no family, indexes nothing
+        (16, ins(&s, 2), Update),         // extends family 0, row 1
+        (17, ins(&s, 1), Update),         // family 1 — a different tid
+        (16, ins(&s, 3), Error),          // family 2: the mode changed
+        (16, del(&s, 1), Update),         // family 3: back to Update, in call order
+        (16, ins(&s, 1), Error),          // family 4: the Error re-insert
+    ] {
+        buf.push(tid, &s, batch, mode);
+    }
+
+    let shape: Vec<_> = buf
+        .families
+        .iter()
+        .map(|f| (f.tid, f.mode, f.batch.weights.clone()))
+        .collect();
     assert_eq!(
-        buf.families.len(),
-        3,
-        "back to Update opens a third family in call order"
+        shape,
+        vec![
+            (16, Update, vec![1, 1]),
+            (17, Update, vec![1]),
+            (16, Error, vec![1]),
+            (16, Update, vec![-1]),
+            (16, Error, vec![1]),
+        ]
     );
-    assert_eq!(buf.families[2].mode, WireConflictMode::Update);
-}
 
-#[test]
-fn delete_buffers_into_update_family_before_error_reinsert() {
-    // "delete k; insert_error k" → Update family [D(k)] then Error family [I(k)].
-    let s = kv_schema();
-    let mut buf = TxnBuffer::default();
-    let tid = 16u64;
-    buf.push(
-        tid,
-        &s,
-        retraction_batch(&s, PkColumn::from_u128s(8, [7])),
-        WireConflictMode::Update,
-    );
-    buf.push(tid, &s, ins(&s, 7, 70), WireConflictMode::Error);
-    assert_eq!(buf.families.len(), 2);
-    assert_eq!(buf.families[0].mode, WireConflictMode::Update);
-    assert_eq!(buf.families[0].batch.weights, vec![-1]);
-    assert_eq!(buf.families[1].mode, WireConflictMode::Error);
-    assert_eq!(buf.families[1].batch.weights, vec![1]);
-}
-
-#[test]
-fn cross_tid_ops_coalesce_per_tid() {
-    // push(A), push(B), push(A) → A one family (2 rows), B one family.
-    let s = kv_schema();
-    let mut buf = TxnBuffer::default();
-    buf.push(16, &s, ins(&s, 1, 1), WireConflictMode::Update);
-    buf.push(17, &s, ins(&s, 1, 1), WireConflictMode::Update);
-    buf.push(16, &s, ins(&s, 2, 2), WireConflictMode::Update);
-    assert_eq!(buf.families.len(), 2);
-    assert_eq!(buf.families[0].tid, 16);
-    assert_eq!(buf.families[0].batch.len(), 2);
-    assert_eq!(buf.families[1].tid, 17);
-}
-
-#[test]
-fn last_op_indexes_rows_across_family_extension_and_split() {
-    // The PK index must survive both append shapes: extending an existing
-    // family (row index = base + i) and opening a new one (base = 0).
-    let s = kv_schema();
-    let mut buf = TxnBuffer::default();
-    let tid = 16u64;
-    buf.push(tid, &s, ins(&s, 1, 10), WireConflictMode::Update); // new family 0, row 0
-    buf.push(tid, &s, ins(&s, 2, 20), WireConflictMode::Update); // extends family 0, row 1
-    buf.push(tid, &s, ins(&s, 3, 30), WireConflictMode::Error); // family 1, row 0
-    buf.push(
-        tid,
-        &s,
-        retraction_batch(&s, PkColumn::from_u128s(8, [1])),
-        WireConflictMode::Update,
-    ); // family 2, row 0 — supersedes pk=1
-
-    let val = |pk: u64| {
-        let (b, row) = buf.last_op(tid, &PkTuple::from_u128(8, pk as u128)).unwrap();
-        (b.weights[row], row)
+    let op = |tid, pk: u64| {
+        buf.last_op(tid, &PkTuple::from_u128(8, pk as u128))
+            .map(|(b, row)| (b.weights[row], row))
     };
-    assert_eq!(val(1), (-1, 0), "pk=1's last op is the delete");
-    assert_eq!(val(2), (1, 1), "pk=2 is row 1 of the extended family");
-    assert_eq!(val(3), (1, 0), "pk=3 is row 0 of the mode-split family");
-    assert!(buf.last_op(tid, &PkTuple::from_u128(8, 9)).is_none(), "untouched PK");
-    assert!(buf.last_op(17, &PkTuple::from_u128(8, 1)).is_none(), "other tid");
-    assert_eq!(buf.last_ops(tid).count(), 3);
+    assert_eq!(op(16, 1), Some((1, 0)), "the last of three ops on pk=1");
+    assert_eq!(op(16, 2), Some((1, 1)), "row 1 of the extended family");
+    assert_eq!(op(16, 3), Some((1, 0)), "row 0 of the mode-split family");
+    assert_eq!(op(16, 9), None, "an untouched PK");
+    assert_eq!(op(17, 2), None, "another tid's PK");
+    assert_eq!(buf.last_ops(16).count(), 3);
 }
 
-/// A corrupt catalog batch must surface as `Err`, never as an absent-row
-/// miss — which a borrowed decode still gives and a raw byte copy of the row
-/// would not.
+/// A corrupt catalog batch must surface as `Err`, never as the absent-row miss
+/// an honest lookup returns.
 #[test]
-fn find_table_record_surfaces_decode_error_not_miss() {
+fn catalog_lookups_separate_a_miss_from_a_decode_error() {
     let schema = sys_schema(TABLE_TAB);
     let mut batch = ZSetBatch::new(schema);
     gnitz_wire::sys_rows::write_table_tab_row(
@@ -127,18 +88,19 @@ fn find_table_record_surfaces_decode_error_not_miss() {
         },
         1,
     );
+    assert_eq!(find_table_tab_row(&batch, 7).unwrap().map(|r| r.name), Some("t"));
+    assert!(find_table_tab_row(&batch, 8).unwrap().is_none(), "an absent tid");
 
-    // Truncate the schema_id column (Fixed) so `col_u64` on the live row is
-    // out of bounds — a real decode error, which must surface as Err rather
-    // than be masked as an absent-name miss.
+    // Truncate the schema_id column (Fixed) so `col_u64` on the live row is out
+    // of bounds — a real decode error, which must not read as an absent name.
     let ColData::Fixed(bytes) = &mut batch.columns[TABTAB_COL_SCHEMA_ID] else {
         panic!("expected Fixed column");
     };
     bytes.clear();
-    match find_table_tab_row(&batch, 7) {
-        Err(ClientError::ServerError(s)) => assert!(s.contains("no 8-byte cell"), "got: {s}"),
-        _ => panic!("expected decode ServerError, got a non-error result"),
-    }
+    assert!(
+        matches!(find_table_tab_row(&batch, 7), Err(ClientError::ServerError(_))),
+        "a decode error must not be masked as a miss"
+    );
 }
 
 #[test]

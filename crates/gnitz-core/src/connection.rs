@@ -70,6 +70,7 @@ pub type LocalScanReply = (Option<Arc<Schema>>, Option<ZSetBatch>, Option<u64>);
 
 /// One reply frame's data block, kept undecoded: the owned frame buffer and the
 /// block's extent within it. `block()` is the block itself.
+#[derive(Debug)]
 pub struct RawBlock {
     frame: Vec<u8>,
     block: std::ops::Range<usize>,
@@ -198,6 +199,10 @@ impl Interest {
         read: false,
         write: true,
     };
+    pub const BOTH: Interest = Interest {
+        read: true,
+        write: true,
+    };
 
     pub fn is_empty(self) -> bool {
         self == Interest::NONE
@@ -302,6 +307,7 @@ impl<'a> Request<'a> {
 /// One reassembled train: every frame's rows concatenated into `data`, the
 /// schema they decoded under, and the terminal frame whole — `target_id` and
 /// `seek_pk` are where the answers of [`Reply::Train`]'s verbs live.
+#[derive(Debug)]
 pub struct ReplyTrain {
     pub terminal: Message,
     /// The block the train carried, else the one it decoded under — a warm
@@ -320,6 +326,7 @@ impl ReplyTrain {
 
 /// What a slot's verb asked for. The spine resolves a reply against the request
 /// that opened its slot, so no driver re-attaches a relation id.
+#[derive(Debug)]
 pub enum Reply {
     /// SCAN / SEEK / SEEK_BY_INDEX.
     Scan(ScanReply),
@@ -446,11 +453,10 @@ impl Session {
         }
     }
 
-    /// A session over a transport that never ran the handshake, marked
-    /// established under the client ceiling. For the scripted-peer tests.
+    /// A session over an already-established transport, for the scripted-peer
+    /// tests. Keeps whatever frame ceiling the transport negotiated.
     #[cfg(test)]
-    pub(crate) fn from_transport(mut transport: ClientTransport) -> Self {
-        transport.mark_established(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
+    pub(crate) fn from_transport(transport: ClientTransport) -> Self {
         Self::over(transport)
     }
 

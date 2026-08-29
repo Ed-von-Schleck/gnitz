@@ -11,7 +11,7 @@ pub type Port = u8;
 pub type TableId = u64;
 
 /// In-memory circuit graph: typed `OpNode` per node + (dst,port) → src edges.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Circuit {
     pub view_id: u64,
     pub nodes: std::collections::BTreeMap<NodeId, OpNode>,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::connection::{Interest, Reply, Request, Session};
 use crate::protocol::transport::{hello_handshake, poll_fd};
-use crate::test_support::framed;
+use crate::test_support::{framed, reply_ctrl};
 use std::net::TcpListener;
 use std::sync::mpsc;
 
@@ -103,10 +103,6 @@ impl Loopback {
     }
 }
 
-fn ctrl_reply(tid: u64, lsn: u128) -> Vec<u8> {
-    crate::protocol::encode_control_frame(tid, 0, 0, lsn, 0, &[])
-}
-
 /// 0-RTT lock, client side: early data must stay off, so that once a
 /// future auth layer gives a session DML authority, replayable early data
 /// cannot become replayable DML. The server-side half is asserted by
@@ -139,13 +135,13 @@ fn loopback_one_record_two_frames_one_step_completes_both_slots() {
     let lb = Loopback::start(|mut end| {
         read_frame(&mut end);
         read_frame(&mut end);
-        let mut both = framed(&ctrl_reply(0, 1));
-        both.extend(framed(&ctrl_reply(0, 2)));
+        let mut both = framed(&reply_ctrl(0, 1));
+        both.extend(framed(&reply_ctrl(0, 2)));
         end.write_all(&both).unwrap();
         end.flush().unwrap();
     });
     let mut s = Session::from_transport(lb.connect());
-    let req = ctrl_reply(0, 0);
+    let req = reply_ctrl(0, 0);
     let a = s.submit(Request::Uncorrelated(req.clone())).unwrap();
     let b = s.submit(Request::Uncorrelated(req)).unwrap();
     assert!(s.step(Interest::WRITE).unwrap().is_empty());
@@ -178,11 +174,11 @@ fn loopback_two_back_to_back_records_come_out_of_one_step() {
         read_frame(&mut end);
         read_frame(&mut end);
         // Two records: one frame each, flushed separately.
-        write_frame(&mut end, &ctrl_reply(0, 1));
-        write_frame(&mut end, &ctrl_reply(0, 2));
+        write_frame(&mut end, &reply_ctrl(0, 1));
+        write_frame(&mut end, &reply_ctrl(0, 2));
     });
     let mut s = Session::from_transport(lb.connect());
-    let req = ctrl_reply(0, 0);
+    let req = reply_ctrl(0, 0);
     s.submit(Request::Uncorrelated(req.clone())).unwrap();
     s.submit(Request::Uncorrelated(req)).unwrap();
     s.step(Interest::WRITE).unwrap();
@@ -223,7 +219,7 @@ fn loopback_step_write_can_empty_the_queue_with_ciphertext_still_pending() {
     let lb = Loopback::start_with_rcvbuf(Some(8 * 1024), move |mut end| {
         rx.recv().unwrap();
         assert_eq!(read_frame(&mut end), expect);
-        write_frame(&mut end, &ctrl_reply(0, 9));
+        write_frame(&mut end, &reply_ctrl(0, 9));
     });
     let t = lb.connect();
     set_sockopt_int(t.as_raw_fd(), libc::SO_SNDBUF, 8 * 1024);

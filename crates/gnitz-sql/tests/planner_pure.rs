@@ -189,11 +189,7 @@ fn re_running_a_pass_emits_the_same_circuit() {
         assert_eq!(looped.len(), single.len(), "`{body}`: segment count");
         for (a, b) in looped.into_iter().zip(single) {
             assert_eq!(a.name, b.name, "`{body}`: segment name");
-            assert_eq!(
-                format!("{:?}", a.circuit.into_rows()),
-                format!("{:?}", b.circuit.into_rows()),
-                "`{body}`: circuit rows"
-            );
+            assert_eq!(a.circuit, b.circuit, "`{body}`: circuit");
         }
     }
 }

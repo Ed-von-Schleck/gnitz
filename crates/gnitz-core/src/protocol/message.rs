@@ -9,6 +9,7 @@ use super::{
 };
 use crate::types::sys_schema;
 
+#[derive(Debug, Default)]
 pub struct Message {
     pub status: u32,
     pub target_id: u64,

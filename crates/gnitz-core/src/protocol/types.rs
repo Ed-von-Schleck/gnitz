@@ -1133,6 +1133,11 @@ impl<'a> BatchAppender<'a> {
         self.fixed_val(&v.to_le_bytes())
     }
 
+    /// Append an f64 value to the next Fixed column.
+    pub fn f64_val(&mut self, v: f64) -> &mut Self {
+        self.fixed_val(&v.to_le_bytes())
+    }
+
     /// Append a u128 value to the next Fixed column: its 16 native LE bytes,
     /// which are the column's wire region (U128/UUID/I128).
     pub fn u128_val(&mut self, v: u128) -> &mut Self {

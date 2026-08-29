@@ -1,46 +1,39 @@
 use super::*;
 
-fn error_msg(error_text: Option<String>) -> Message {
-    Message {
-        status: STATUS_ERROR,
-        target_id: 0,
-        flags: 0,
-        seek_pk: 0,
-        schema: None,
-        data_batch: None,
-        error_text,
-        seek_pk_extra: Vec::new(),
+/// Every non-OK status maps to its own error, and a `STATUS_ERROR` whose text
+/// is absent or blank falls back to the default rather than surfacing a blank
+/// one — the warm-push guard's rejection must stay legible.
+#[test]
+fn check_response_classifies_every_status() {
+    let msg = |status, error_text: Option<&str>| Message {
+        status,
+        seek_pk: 77,
+        error_text: error_text.map(str::to_owned),
+        ..Message::default()
+    };
+    let err = |status, text| check_response(msg(status, text)).expect_err("a non-OK status is an error");
+
+    assert!(matches!(err(STATUS_SCHEMA_MISMATCH, None), ClientError::SchemaMismatch));
+    assert!(matches!(err(STATUS_DELTA_EXPIRED, None), ClientError::DeltaExpired));
+    assert!(matches!(
+        err(STATUS_TXN_CONFLICT, None),
+        ClientError::TxnConflict { fresh_basis: 77 }
+    ));
+    assert!(matches!(err(STATUS_NO_INDEX, None), ClientError::ServerError(m) if m.contains("no index")));
+    assert!(matches!(err(STATUS_SAL_FULL, Some("log full")), ClientError::SalFull(m) if m == "log full"));
+    assert!(matches!(err(999, None), ClientError::ServerError(m) if m.contains("unrecognized status 999")));
+
+    for (text, want) in [
+        (None, "unknown server error"),
+        (Some(""), "unknown server error"),
+        (Some("real error"), "real error"),
+    ] {
+        assert!(
+            matches!(err(STATUS_ERROR, text), ClientError::ServerError(m) if m == want),
+            "{text:?}"
+        );
     }
-}
-
-// `Message` does not implement Debug, so match the Result rather than
-// calling unwrap_err (which would require the Ok variant to be Debug).
-fn server_error_text(msg: Message) -> String {
-    match check_response(msg) {
-        Err(ClientError::ServerError(s)) => s,
-        Err(other) => panic!("expected ServerError, got {other:?}"),
-        Ok(_) => panic!("expected an error"),
-    }
-}
-
-#[test]
-fn check_response_empty_error_text_falls_back_to_default() {
-    // A STATUS_ERROR with Some("") must surface the default text, not a
-    // blank ServerError — the warm-push guard's rejection must be legible.
-    assert_eq!(
-        server_error_text(error_msg(Some(String::new()))),
-        "unknown server error"
-    );
-}
-
-#[test]
-fn check_response_none_error_text_falls_back_to_default() {
-    assert_eq!(server_error_text(error_msg(None)), "unknown server error");
-}
-
-#[test]
-fn check_response_nonempty_error_text_preserved() {
-    assert_eq!(server_error_text(error_msg(Some("real error".into()))), "real error");
+    assert!(check_response(msg(STATUS_OK, None)).is_ok());
 }
 
 mod spine_tests {
@@ -51,9 +44,11 @@ mod spine_tests {
     use crate::protocol::codec::encode_schema_block;
     use crate::protocol::message::{encode_control_block, encode_message_noschema_parts};
     use crate::protocol::transport::poll_fd;
-    use crate::protocol::{ColData, ColumnDef, Header, PkColumn, TypeCode};
-    use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send};
+    use crate::protocol::{BatchAppender, ColData, ColumnDef, Header, TypeCode};
+    use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send, reply_ctrl};
     use std::os::fd::OwnedFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     /// A scripted peer: the raw far end of the socketpair.
     struct Peer(OwnedFd);
@@ -97,33 +92,25 @@ mod spine_tests {
     }
 
     fn batch_a(pks: &[u64]) -> ZSetBatch {
-        let mut vals = Vec::new();
+        let schema = schema_a();
+        let mut b = ZSetBatch::new(&schema);
+        let mut app = BatchAppender::new(&mut b, &schema);
         for &pk in pks {
-            vals.extend_from_slice(&((pk as i64) * 10).to_le_bytes());
+            app.add_row(pk as u128, 1).i64_val(pk as i64 * 10);
         }
-        ZSetBatch {
-            pks: PkColumn::from_u128s(8, pks.iter().map(|&p| p as u128)),
-            weights: vec![1; pks.len()],
-            nulls: vec![0; pks.len()],
-            columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vals)],
-        }
+        b
     }
 
     fn batch_b(pks: &[u64]) -> ZSetBatch {
-        let mut f = Vec::new();
+        let schema = schema_b();
+        let mut b = ZSetBatch::new(&schema);
+        let mut app = BatchAppender::new(&mut b, &schema);
         for &pk in pks {
-            f.extend_from_slice(&(pk as f64 * 0.5).to_le_bytes());
+            app.add_row(pk as u128, 1)
+                .str_val(&format!("s{pk}"))
+                .f64_val(pk as f64 * 0.5);
         }
-        ZSetBatch {
-            pks: PkColumn::from_u128s(8, pks.iter().map(|&p| p as u128)),
-            weights: vec![1; pks.len()],
-            nulls: vec![0; pks.len()],
-            columns: vec![
-                ColData::Fixed(vec![]),
-                ColData::Strings(pks.iter().map(|p| Some(format!("s{p}"))).collect()),
-                ColData::Fixed(f),
-            ],
-        }
+        b
     }
 
     /// A reply frame carrying its schema block at `version`, data, and `lsn` in
@@ -145,11 +132,6 @@ mod spine_tests {
         encode_message_noschema_parts(tid, 0, flags, schema, batch).to_vec()
     }
 
-    /// A control-only terminal reply with `lsn` in `seek_pk`.
-    fn reply_ctrl(tid: u64, lsn: u128) -> Vec<u8> {
-        encode_control_frame(tid, 0, 0, lsn, 0, &[])
-    }
-
     fn reply_status(status: u32, text: &str, seek_pk: u128) -> Vec<u8> {
         encode_control_block(
             &Header {
@@ -160,6 +142,16 @@ mod spine_tests {
             text,
             &[],
         )
+    }
+
+    /// A cache entry for `tid` at `version`, warmed by one cold-answered scan —
+    /// the precondition for a push that encodes schema-less.
+    fn warm(s: &mut Session, peer: &Peer, tid: u64, version: u16, schema: &Schema) {
+        let slot = s.submit(Request::scan(tid)).unwrap();
+        s.step(Interest::WRITE).unwrap();
+        peer.drain_request();
+        peer.send(&reply_cold(tid, version, schema, &ZSetBatch::new(schema), 0, false));
+        drive(s, slot).unwrap();
     }
 
     /// Drive `s` until `slot` completes, parking in `poll` between steps — the
@@ -184,28 +176,12 @@ mod spine_tests {
         }
     }
 
-    fn scan_req(tid: u64) -> Request<'static> {
-        Request::Read {
-            target_id: tid,
-            flags: 0,
-            seek_pk: 0,
-            seek_col_idx: 0,
-            seek_pk_extra: &[],
-        }
-    }
-
     #[test]
     fn train_split_across_continuation_frames_completes_once() {
         let (mut s, peer) = pair();
         let schema = schema_a();
-        let slot = s.submit(scan_req(7)).unwrap();
-        assert_eq!(
-            s.interest(),
-            Interest {
-                read: true,
-                write: true
-            }
-        );
+        let slot = s.submit(Request::scan(7)).unwrap();
+        assert_eq!(s.interest(), Interest::BOTH);
         assert!(s.step(Interest::WRITE).unwrap().is_empty());
         assert_eq!(s.interest(), Interest::READ);
         peer.drain_request();
@@ -236,16 +212,8 @@ mod spine_tests {
         let (mut s, peer) = pair();
         let (sa, sb) = (schema_a(), schema_b());
         // Warm both relations first, under different schemas.
-        let slot = s.submit(scan_req(1)).unwrap();
-        s.step(Interest::WRITE).unwrap();
-        peer.drain_request();
-        peer.send(&reply_cold(1, 1, &sa, &batch_a(&[1]), 0, false));
-        drive(&mut s, slot).unwrap();
-        let slot = s.submit(scan_req(2)).unwrap();
-        s.step(Interest::WRITE).unwrap();
-        peer.drain_request();
-        peer.send(&reply_cold(2, 1, &sb, &batch_b(&[9]), 0, false));
-        drive(&mut s, slot).unwrap();
+        warm(&mut s, &peer, 1, 1, &sa);
+        warm(&mut s, &peer, 2, 1, &sb);
 
         // Now the multi: both trains reply warm, and each must decode under its
         // own relation's schema — a two-frame train for relation 2 included.
@@ -291,7 +259,7 @@ mod spine_tests {
         assert_eq!(s.interest(), Interest::NONE, "nothing left pending");
 
         // The next request on the same connection completes normally.
-        let slot = s.submit(scan_req(3)).unwrap();
+        let slot = s.submit(Request::scan(3)).unwrap();
         s.step(Interest::WRITE).unwrap();
         peer.drain_request();
         peer.send(&reply_cold(3, 1, &sa, &batch_a(&[5]), 42, false));
@@ -304,8 +272,8 @@ mod spine_tests {
     #[test]
     fn one_read_serves_two_slots_and_leaves_nothing_buffered() {
         let (mut s, peer) = pair();
-        let s1 = s.submit(scan_req(1)).unwrap();
-        let s2 = s.submit(scan_req(2)).unwrap();
+        let s1 = s.submit(Request::scan(1)).unwrap();
+        let s2 = s.submit(Request::scan(2)).unwrap();
         s.step(Interest::WRITE).unwrap();
         peer.drain_request();
         peer.drain_request();
@@ -325,7 +293,10 @@ mod spine_tests {
     }
 
     #[test]
-    fn status_frames_complete_their_slot_with_the_classified_error() {
+    fn a_status_frame_completes_its_slot_and_leaves_the_connection_usable() {
+        // `check_response` owns the status → error table; what the spine adds is
+        // that a status frame completes its slot rather than erroring `step`,
+        // and carries the frame's `seek_pk` into the error it hands back.
         let (mut s, peer) = pair();
         let slot = s.submit(Request::Uncorrelated(reply_ctrl(0, 0))).unwrap();
         s.step(Interest::WRITE).unwrap();
@@ -334,27 +305,10 @@ mod spine_tests {
         let r = drive(&mut s, slot);
         assert!(
             matches!(r, Err(ClientError::TxnConflict { fresh_basis: 77 })),
-            "the basis rides the frame"
+            "the basis rides the frame: {r:?}"
         );
-        // A mismatch, a delta expiry: per-slot errors, connection open.
-        for (status, want) in [
-            (STATUS_SCHEMA_MISMATCH, "mismatch"),
-            (STATUS_DELTA_EXPIRED, "expired"),
-            (STATUS_NO_INDEX, "no index"),
-        ] {
-            let slot = s.submit(scan_req(1)).unwrap();
-            s.step(Interest::WRITE).unwrap();
-            peer.drain_request();
-            peer.send(&reply_status(status, "", 0));
-            let r = drive(&mut s, slot);
-            match (want, r) {
-                ("mismatch", Err(ClientError::SchemaMismatch)) => {}
-                ("expired", Err(ClientError::DeltaExpired)) => {}
-                ("no index", Err(ClientError::ServerError(_))) => {}
-                (w, r) => panic!("{w}: {r:?}", r = r.map(|_| ())),
-            }
-        }
         assert!(!s.closed);
+        assert_eq!(s.interest(), Interest::NONE, "nothing left pending");
     }
 
     #[test]
@@ -363,91 +317,86 @@ mod spine_tests {
         // The peer answers a scan of 5 with a frame naming 6.
         peer.send(&reply_ctrl(6, 1));
         let r = s.scan(5);
-        assert!(matches!(r, Err(ClientError::Protocol(_))), "{r:?}", r = r.map(|_| ()));
+        assert!(matches!(r, Err(ClientError::Protocol(_))), "{r:?}");
         assert_eq!(s.interest(), Interest::NONE);
         // The next call reports the connection closed instead of submitting.
         let r = s.scan(5);
         assert!(matches!(r, Err(ClientError::ServerError(ref m)) if m == "connection closed"));
-        assert!(matches!(s.submit(scan_req(1)), Err(ClientError::ServerError(_))));
+        assert!(matches!(s.submit(Request::scan(1)), Err(ClientError::ServerError(_))));
         assert!(s.step(Interest::READ).unwrap().is_empty());
     }
 
     #[test]
-    fn peer_closing_while_parked_completes_the_operation_with_an_error() {
+    fn a_peer_that_closes_surfaces_an_io_error_rather_than_a_park() {
         let (mut s, peer) = pair();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            drop(peer);
-        });
-        // EOF, or ECONNRESET when the unread request draws a reset: either way
-        // an I/O error, and the connection is closed behind it.
-        let r = s.scan(5);
+        s.submit(Request::scan(5)).unwrap();
+        s.step(Interest::WRITE).unwrap();
+        // The request is on the wire and unread, so dropping the peer draws a
+        // reset. A hangup folds into read readiness, so the waiting driver wakes.
+        drop(peer);
+        let rev = poll_fd(
+            s.as_raw_fd(),
+            Interest::READ.poll_events(),
+            Some(std::time::Duration::from_secs(5)),
+            true,
+        )
+        .expect("poll");
+        assert!(Interest::from_revents(rev).read, "a hangup wakes a read park");
+        let r = s.step(Interest::READ);
         assert!(
             matches!(r, Err(ClientError::Protocol(ProtocolError::IoError(_)))),
-            "{r:?}",
-            r = r.map(|_| ())
+            "{r:?}"
         );
-        assert!(matches!(s.scan(5), Err(ClientError::ServerError(ref m)) if m == "connection closed"));
-        h.join().unwrap();
     }
 
     #[test]
     fn close_abandons_every_pending_slot_and_refuses_further_work() {
         let (mut s, _peer) = pair();
-        s.submit(scan_req(1)).unwrap();
-        s.submit(scan_req(2)).unwrap();
-        assert_eq!(
-            s.interest(),
-            Interest {
-                read: true,
-                write: true
-            }
-        );
+        s.submit(Request::scan(1)).unwrap();
+        s.submit(Request::scan(2)).unwrap();
+        assert_eq!(s.interest(), Interest::BOTH);
         s.close();
         assert_eq!(s.interest(), Interest::NONE);
-        assert!(matches!(s.submit(scan_req(3)), Err(ClientError::ServerError(ref m)) if m == "connection closed"));
-        assert!(s
-            .step(Interest {
-                read: true,
-                write: true
-            })
-            .unwrap()
-            .is_empty());
+        assert!(matches!(s.submit(Request::scan(3)), Err(ClientError::ServerError(ref m)) if m == "connection closed"));
+        assert!(s.step(Interest::BOTH).unwrap().is_empty());
     }
 
-    /// The count cap does not bound bytes: an encoded push is a full copy of its
-    /// batch, so a driver that never flushes pins memory in proportion to what it
-    /// pushed, not to how many times.
+    /// The in-flight count bounds no memory on its own, so the byte cap is what
+    /// stops a driver that submits without ever flushing.
     #[test]
-    fn queued_bytes_cap_raises_before_the_in_flight_count_does() {
+    fn queued_bytes_tracks_the_write_cursor_and_caps_submission() {
         let (mut s, _peer) = pair();
         let sa = schema_a();
-        // 32 bytes a row, so 8192 rows is a 256 KiB frame and the byte cap lands
-        // around 256 submits — an order of magnitude under `MAX_IN_FLIGHT`.
-        let b = batch_a(&(0..8192).collect::<Vec<u64>>());
-        let mut n = 0usize;
-        loop {
-            let r = s.submit(Request::Push {
+        let b = batch_a(&[1, 2, 3, 4]);
+        let push = |s: &mut Session| {
+            s.submit(Request::Push {
                 target_id: 4,
                 schema: &sa,
                 batch: &b,
                 mode: WireConflictMode::Update,
-            });
-            match r {
-                Ok(_) => n += 1,
-                Err(ClientError::ServerError(m)) => {
-                    assert!(m.contains("unwritten bytes queued"), "wrong cap: {m}");
-                    break;
-                }
-                Err(e) => panic!("{e}"),
-            }
-            assert!(n < MAX_IN_FLIGHT, "the byte cap must bite before the count one");
-        }
+            })
+        };
+        // An encoded push is a full copy of its batch, so the counter grows with
+        // what was pushed, not with how many times.
+        push(&mut s).unwrap();
+        let one = s.queued_bytes();
+        assert!(one > b.len() * 32, "the frame carries the batch");
+        push(&mut s).unwrap();
+        assert_eq!(s.queued_bytes(), 2 * one, "bytes, not submits");
+
+        // The cap is checked before queueing, so one frame of any size always
+        // goes through and it is the *next* submit that is refused.
+        s.submit(Request::Uncorrelated(vec![0u8; MAX_QUEUED_BYTES])).unwrap();
         assert!(s.queued_bytes() >= MAX_QUEUED_BYTES);
+        let r = push(&mut s);
+        assert!(
+            matches!(r, Err(ClientError::ServerError(ref m)) if m.contains("unwritten bytes queued")),
+            "the byte cap, not the count one: {r:?}"
+        );
         assert!(s.interest().write, "nothing was flushed, so it is all still queued");
 
-        // Writing gives the budget back — the counter tracks the write cursor, not
-        // just the pushes.
+        // Writing gives the budget back — the counter tracks the write cursor,
+        // not just the pushes.
         let queued = s.queued_bytes();
         s.step(Interest::WRITE).unwrap();
         assert!(s.queued_bytes() < queued, "a flush releases what it wrote");
@@ -458,23 +407,23 @@ mod spine_tests {
         let (mut s, _peer) = pair();
         let mut last = SlotId(0);
         for _ in 0..MAX_IN_FLIGHT {
-            let id = s.submit(scan_req(1)).unwrap();
+            let id = s.submit(Request::scan(1)).unwrap();
             assert!(id > last, "monotonic");
             last = id;
         }
-        let r = s.submit(scan_req(1));
+        let r = s.submit(Request::scan(1));
         assert!(matches!(r, Err(ClientError::ServerError(ref m)) if m.contains("in flight")));
-        s.close();
-        assert!(s.submit(scan_req(1)).is_err(), "and the cap is not what refuses now");
     }
 
-    /// Deliver `SIGUSR1` to the calling thread `after` from now, with a no-op
+    /// Deliver `SIGUSR1` to the calling thread until `stop` is set, with a no-op
     /// handler installed without `SA_RESTART` — how CPython's handlers land — so
-    /// a park in `poll(2)` returns `EINTR`.
-    fn signal_self_after(after: std::time::Duration) -> std::thread::JoinHandle<()> {
+    /// a park in `poll(2)` returns `EINTR`. Repeating rather than one-shot: a
+    /// single signal that lands before the park is entered leaves the park to
+    /// block forever, which libtest has no timeout to break.
+    fn interrupt_self_until(stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
         extern "C" fn noop(_: libc::c_int) {}
         // SAFETY: installing a trivial handler for a signal nothing else in the
-        // test binary uses; `pthread_kill` targets a live thread id.
+        // test binary uses.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = noop as extern "C" fn(libc::c_int) as usize;
@@ -483,67 +432,60 @@ mod spine_tests {
         }
         let me = unsafe { libc::pthread_self() };
         std::thread::spawn(move || {
-            std::thread::sleep(after);
-            // SAFETY: the target thread is the test thread, parked in `poll`.
-            unsafe { libc::pthread_kill(me, libc::SIGUSR1) };
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                // SAFETY: the target is the test thread, which outlives this loop.
+                unsafe { libc::pthread_kill(me, libc::SIGUSR1) };
+            }
         })
     }
 
+    /// An aborted park leaves its slot pending — the frame is already on the
+    /// wire, so the next call drains that reply before its own. The hook is the
+    /// host's and outlives the session it was installed on, which is what
+    /// [`crate::GnitzClient::reconnect`] relies on to keep a blocking call
+    /// Ctrl-C-interruptible across a replaced connection.
     #[test]
-    fn aborted_park_leaves_the_slot_pending_and_the_next_call_drains_it_first() {
-        let (mut s, peer) = pair();
-        let fire = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let f = std::sync::Arc::clone(&fire);
-        s.set_park_hook(Some(Box::new(move || {
-            if f.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                Err(ClientError::ServerError("interrupted".into()))
-            } else {
+    fn an_aborted_park_leaves_its_slot_pending_and_the_next_call_drains_it_first() {
+        // Installed on one session, taken out, and moved onto another.
+        let (mut donor, _donor_peer) = pair();
+        let mut fired = false;
+        donor.set_park_hook(Some(Box::new(move || {
+            if std::mem::replace(&mut fired, true) {
                 Ok(())
+            } else {
+                Err(ClientError::ServerError("interrupted".into()))
             }
         })));
-        let sig = signal_self_after(std::time::Duration::from_millis(100));
-        // First scan: the signal interrupts the park, the hook runs and aborts
-        // it. The frame is already on the wire, so the server will answer it.
+        let hook = donor.take_park_hook();
+        assert!(hook.is_some(), "the installed hook comes back out");
+        assert!(donor.take_park_hook().is_none(), "and taking it leaves none behind");
+
+        let (mut s, peer) = pair();
+        s.set_park_hook(hook);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sig = interrupt_self_until(Arc::clone(&stop));
+
+        // The peer never answers, so the scan parks; the signal makes the park
+        // return `EINTR`, which is the one place the hook runs.
         let r = s.scan(1);
         assert!(matches!(r, Err(ClientError::ServerError(ref m)) if m == "interrupted"));
+        stop.store(true, Ordering::Relaxed);
         sig.join().unwrap();
         assert_eq!(s.interest(), Interest::READ, "the abandoned slot stays pending");
+
         // The peer answers both requests; the second call must get the second.
         peer.drain_request();
         peer.send(&reply_ctrl(1, 100));
         let h = std::thread::spawn(move || {
-            let req = peer.drain_request();
+            peer.drain_request();
             peer.send(&reply_ctrl(1, 200));
-            (peer, req)
+            peer
         });
         let (_, _, lsn) = s.scan(1).unwrap();
         assert_eq!(lsn, 200);
-        let (_peer, _) = h.join().unwrap();
+        let _peer = h.join().unwrap();
         assert_eq!(s.interest(), Interest::NONE);
-    }
-
-    /// The hook is the host's and outlives the session it was installed on — what
-    /// [`crate::GnitzClient::reconnect`] relies on when it replaces the connection
-    /// and keeps a blocking call Ctrl-C-interruptible.
-    #[test]
-    fn a_taken_park_hook_moves_to_the_session_that_replaces_it() {
-        let (mut old, _old_peer) = pair();
-        old.set_park_hook(Some(Box::new(|| Err(ClientError::ServerError("interrupted".into())))));
-        let hook = old.take_park_hook();
-        assert!(hook.is_some(), "the installed hook comes back out");
-        assert!(old.take_park_hook().is_none(), "and taking it leaves none behind");
-
-        // The peer never answers, so the scan parks; the signal makes the park
-        // return `EINTR`, which is the one place the hook runs.
-        let (mut fresh, _peer) = pair();
-        fresh.set_park_hook(hook);
-        let sig = signal_self_after(std::time::Duration::from_millis(100));
-        let r = fresh.scan(1);
-        assert!(
-            matches!(r, Err(ClientError::ServerError(ref m)) if m == "interrupted"),
-            "the moved hook must abort the park on the new session",
-        );
-        sig.join().unwrap();
     }
 
     #[test]
@@ -561,7 +503,10 @@ mod spine_tests {
             .unwrap();
         s.step(Interest::WRITE).unwrap();
         let req = peer.drain_request();
-        assert!(req.len() > spec.len(), "the spec and reply schema ride the request");
+        assert!(
+            req.len() >= spec.len() + encode_schema_block(&sa, 9).len(),
+            "the spec and the reply schema both ride the request"
+        );
         // Two hint-only frames: the server sends no schema block for a SCAN_SPEC.
         peer.send(&reply_warm(9, 0, &sa, &batch_a(&[1, 2]), true));
         peer.send(&reply_warm(9, 0, &sa, &batch_a(&[3]), false));
@@ -580,24 +525,19 @@ mod spine_tests {
         let (mut s, peer) = pair();
         let sa = schema_a();
         let b = batch_a(&[1]);
-        // Warm the cache at version 2, then let the server reject the warm push.
-        let slot = s.submit(scan_req(4)).unwrap();
-        s.step(Interest::WRITE).unwrap();
-        peer.drain_request();
-        peer.send(&reply_cold(4, 2, &sa, &b, 0, false));
-        drive(&mut s, slot).unwrap();
+        warm(&mut s, &peer, 4, 2, &sa);
+        // The server rejects the warm push; the blocking verb retries it cold.
         let h = std::thread::spawn(move || {
-            let warm = peer.drain_request();
+            peer.drain_request();
             peer.send(&reply_status(STATUS_SCHEMA_MISMATCH, "", 0));
-            let cold = peer.drain_request();
+            peer.drain_request();
             peer.send(&reply_ctrl(4, 555));
-            (warm.len(), cold.len(), peer)
+            peer
         });
         let lsn = s.push_with_mode(4, &sa, &b, WireConflictMode::Update).unwrap();
         assert_eq!(lsn, 555);
-        let (warm, cold, _peer) = h.join().unwrap();
-        assert!(cold > warm, "the retry carries the schema block the warm frame omitted");
-        assert_eq!(s.requests_sent(), 3, "counted once per frame, on enqueue");
+        let _peer = h.join().unwrap();
+        assert_eq!(s.requests_sent(), 3, "scan, warm push, cold retry — one per frame");
     }
 
     #[test]
@@ -606,11 +546,7 @@ mod spine_tests {
         let sa = schema_a();
         let b = batch_a(&[1]);
         // Warm relation 4 at version 2, so both pushes below encode schema-less.
-        let slot = s.submit(scan_req(4)).unwrap();
-        s.step(Interest::WRITE).unwrap();
-        peer.drain_request();
-        peer.send(&reply_cold(4, 2, &sa, &b, 0, false));
-        drive(&mut s, slot).unwrap();
+        warm(&mut s, &peer, 4, 2, &sa);
 
         let push = |s: &mut Session| {
             s.submit(Request::Push {

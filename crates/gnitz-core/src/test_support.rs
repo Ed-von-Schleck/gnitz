@@ -37,6 +37,12 @@ pub(crate) fn make_transport_pair() -> (ClientTransport, ClientTransport) {
     (established(a), established(b))
 }
 
+/// A control-only reply frame carrying `lsn` in `seek_pk` — the terminal a
+/// scripted peer answers an uncorrelated request with.
+pub(crate) fn reply_ctrl(tid: u64, lsn: u128) -> Vec<u8> {
+    crate::protocol::encode_control_frame(tid, 0, 0, lsn, 0, &[])
+}
+
 /// `[u32 LE len][payload]`, what a peer writes.
 pub(crate) fn framed(payload: &[u8]) -> Vec<u8> {
     let mut v = frame_len_prefix(payload.len()).unwrap().to_vec();

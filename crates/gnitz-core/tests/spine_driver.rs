@@ -94,7 +94,7 @@ fn concurrent_pushes_and_scans(target: &str) {
         let batch = rows((i * per) as i64, per);
         let id = s.submit(push_req(tid, &schema, &batch)).unwrap();
         slots.push((id, true));
-        let id = s.submit(scan_req(tid)).unwrap();
+        let id = s.submit(Request::scan(tid)).unwrap();
         slots.push((id, false));
     }
     assert_eq!(s.requests_sent() - sent_before, 2 * n as u64, "counted on enqueue");
@@ -149,14 +149,17 @@ fn cap_raises_and_every_slot_below_it_completes() {
     let (mut s, _) = Session::connect(srv.sock_path()).unwrap();
     let mut ids = Vec::new();
     for _ in 0..MAX_IN_FLIGHT {
-        ids.push(s.submit(scan_req(tid)).unwrap());
+        ids.push(s.submit(Request::scan(tid)).unwrap());
     }
-    assert!(s.submit(scan_req(tid)).is_err(), "the cap raises rather than hanging");
+    assert!(
+        s.submit(Request::scan(tid)).is_err(),
+        "the cap raises rather than hanging"
+    );
     let (done, _) = drive_all(&mut s, MAX_IN_FLIGHT);
     for id in ids {
         assert!(done[&id].is_ok());
     }
-    assert!(s.submit(scan_req(tid)).is_ok(), "below the cap again");
+    assert!(s.submit(Request::scan(tid)).is_ok(), "below the cap again");
     let _ = drive_all(&mut s, 1);
 }
 
@@ -173,7 +176,7 @@ fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     s.step(Interest::WRITE).unwrap();
     // The next request's reply arrives behind the abandoned one's; the head
     // accumulator consumes that train first, so this one decodes correctly.
-    let scan = s.submit(scan_req(tid)).unwrap();
+    let scan = s.submit(Request::scan(tid)).unwrap();
     let (done, _) = drive_all(&mut s, 2);
     assert!(done[&abandoned].is_ok());
     let Reply::Scan((_, data, _)) = done[&scan].as_ref().unwrap() else {
@@ -182,24 +185,14 @@ fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     assert_eq!(data.as_ref().map_or(0, |b| b.len()), 10);
 
     // Now close with work pending.
-    s.submit(scan_req(tid)).unwrap();
-    s.submit(scan_req(tid)).unwrap();
+    s.submit(Request::scan(tid)).unwrap();
+    s.submit(Request::scan(tid)).unwrap();
     s.close();
     assert_eq!(s.interest(), Interest::NONE);
     assert!(matches!(
-        s.submit(scan_req(tid)),
+        s.submit(Request::scan(tid)),
         Err(gnitz_core::ClientError::ServerError(ref m)) if m == "connection closed"
     ));
-}
-
-fn scan_req(tid: u64) -> Request<'static> {
-    Request::Read {
-        target_id: tid,
-        flags: 0,
-        seek_pk: 0,
-        seek_col_idx: 0,
-        seek_pk_extra: &[],
-    }
 }
 
 fn push_req<'a>(tid: u64, schema: &'a Schema, batch: &'a ZSetBatch) -> Request<'a> {

@@ -288,13 +288,7 @@ impl PyAsyncTransport {
     /// submit a coroutine made earlier in this same loop turn ships here rather
     /// than arming a writer for one turn.
     fn on_readable(&mut self, py: Python<'_>) -> PyResult<()> {
-        self.drive(
-            py,
-            gnitz_core::Interest {
-                read: true,
-                write: true,
-            },
-        )
+        self.drive(py, gnitz_core::Interest::BOTH)
     }
 
     /// The writer callback: `step(WRITE)`.
