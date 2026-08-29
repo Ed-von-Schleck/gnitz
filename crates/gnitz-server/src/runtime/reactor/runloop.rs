@@ -50,30 +50,11 @@ impl Reactor {
     }
 
     /// Single iteration of the event loop:
-    ///   0. proactive W2M drain (lost-wake safety net)
     ///   1. drain CQEs (waking reply / timeout / fsync wakers)
     ///   2. poll all tasks in the run queue (each polled at most once)
-    ///   3. submit pending SQEs; if `block` and the run queue is now
-    ///      empty, sleep until the next CQE.
+    ///   3. re-arm the W2M park, then submit pending SQEs; if `block` and the
+    ///      run queue is now empty, sleep until the next CQE.
     pub(super) fn tick(&self, block: bool) {
-        // 0. Proactive W2M drain — safety net for lost FUTEX_WAITV wakes.
-        //
-        // A narrow race exists between refresh_futex_waitv_vals (which sets
-        // FLAG_MASTER_PARKED and snapshots reader_seq) and arm_futex_waitv
-        // (which registers the FUTEX_WAITV SQE with the kernel): a worker
-        // that publishes in that window calls FUTEX_WAKE against a waiter
-        // that does not exist yet. The kernel's mismatch-detection (it
-        // immediately completes a FUTEX_WAITV whose expected value is stale)
-        // covers the case where the arm precedes the publish; this drain
-        // covers the opposite case (publish beats the arm) in both the
-        // spinning path (no blocking) and the blocking path (before we sleep).
-        //
-        // Cost: one try_consume call per worker per tick — just two Acquire
-        // loads that return None when the ring is empty.
-        if self.inner.futex_waitv_armed.get() {
-            self.drain_all_w2m();
-        }
-
         // 1. CQEs (no syscall — reads memory-mapped CQ).
         self.drain_cqes_into_wakers();
         self.reap_closing_conns();
@@ -89,7 +70,16 @@ impl Reactor {
         }
         self.inner.tick_scratch.set(buf);
 
-        // 3. Submit pending SQEs and optionally block until the next event.
+        // 3. Re-arm the W2M park before deciding whether to sleep. This is
+        // where the master actually blocks, and `arm_futex_waitv` drains every
+        // ring first — so a reply that landed while the flag was clear wakes its
+        // task here, leaves the run queue non-empty, and costs one extra tick
+        // rather than a missed wake.
+        if !self.inner.futex_waitv_armed.get() {
+            self.arm_futex_waitv();
+        }
+
+        // Submit pending SQEs and optionally block until the next event.
         // Skip blocking when there is nothing to drive (slab empty) or when
         // a wake fired during this tick (run_queue non-empty); otherwise we
         // would sleep past the natural completion of the loop.

@@ -169,7 +169,7 @@ struct ReactorShared {
     /// Pointer-stable storage for the reactor's persistent
     /// `FUTEX_WAITV` SQE. The kernel dereferences this array
     /// asynchronously, so it must outlive the SQE. A single SQE covers
-    /// every worker's `reader_seq` word; we own it on the heap, and
+    /// every worker's `write_cursor` word; we own it on the heap, and
     /// tear it down only after cancelling the SQE in
     /// `request_shutdown` and awaiting the `-ECANCELED` CQE.
     futex_waitv_storage: RefCell<Option<Box<[FutexWaitV]>>>,
@@ -401,6 +401,11 @@ impl Reactor {
     ///
     /// If the CQE does not arrive within 2 s we abort rather than free storage
     /// the kernel still points at. A 2 s wait here is already pathological.
+    ///
+    /// `armed` is set at prep time, not submit time, so the cancel and its target
+    /// can leave in the same `io_uring_enter`. That is still ordered: io_uring
+    /// consumes SQEs in submission order within one enter, and neither is
+    /// `IOSQE_ASYNC`.
     fn cancel_futex_waitv_and_wait(&self) {
         if !self.inner.futex_waitv_armed.get() {
             return;
@@ -490,23 +495,18 @@ impl Reactor {
         ScanLease::new(Rc::clone(&self.inner), ids)
     }
 
-    /// Attach the `W2mReceiver` and arm a persistent `FUTEX_WAITV` SQE
-    /// that watches every worker's `reader_seq` word. On each CQE, the
-    /// reactor drains all rings (the wake index is not authoritative
-    /// for FutexWaitV), rebuilds the expected-values array, and
-    /// re-arms.
+    /// Attach the `W2mReceiver`. Replies published before the attach are already
+    /// in the rings, so drain them here; the `FUTEX_WAITV` SQE that watches
+    /// every worker's `write_cursor` is armed by the next `tick`.
     pub fn attach_w2m(&self, w2m: Rc<W2mReceiver>) {
         let nw = w2m.num_workers();
         *self.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(nw);
-        // Allocate a zeroed boxed slice — `refresh_futex_waitv_vals`
-        // fills the entries after MASTER_PARKED is published.
         let futexv: Vec<FutexWaitV> = (0..nw).map(|_| FutexWaitV::new()).collect();
-        let boxed: Box<[FutexWaitV]> = futexv.into_boxed_slice();
         if self.inner.w2m.set(w2m).is_err() {
             panic!("attach_w2m called twice");
         }
-        *self.inner.futex_waitv_storage.borrow_mut() = Some(boxed);
-        self.drain_refresh_and_arm();
+        *self.inner.futex_waitv_storage.borrow_mut() = Some(futexv.into_boxed_slice());
+        self.drain_all_w2m();
     }
 
     /// Drain every worker's ring.
@@ -516,60 +516,36 @@ impl Reactor {
         }
     }
 
-    /// The lost-wake protocol in one place: drain every ring, refresh the
-    /// expected `reader_seq` values (with MASTER_PARKED published first so
-    /// the wake window stays closed), loop until no ring has unread data,
-    /// then re-arm the FUTEX_WAITV SQE. Arming with a stale expected value
-    /// would block on a wake that already happened — the classic lost-wake
-    /// race. Used by `attach_w2m` (catches messages published between init
-    /// and attach) and by the KIND_FUTEX_WAITV CQE handler on every wake.
-    fn drain_refresh_and_arm(&self) {
-        loop {
-            self.drain_all_w2m();
-            if !self.refresh_futex_waitv_vals() {
-                break;
-            }
-        }
-        // (Re-)submit the SQE against the heap-owned `FutexWaitV` array.
-        let storage = self.inner.futex_waitv_storage.borrow();
-        let Some(boxed) = storage.as_ref() else {
+    /// Arm the persistent `FUTEX_WAITV` SQE, drained rings first.
+    ///
+    /// A ring with unread data cannot be armed — the SQE would wait for a wake
+    /// that already happened — so this loops until `arm_waitv` reports every
+    /// ring quiet. The SQE is left in the SQ for `tick`'s own
+    /// `submit_and_wait_timeout` rather than flushed here; that call follows
+    /// immediately, and a second `io_uring_enter` per wake buys nothing.
+    pub(super) fn arm_futex_waitv(&self) {
+        let Some(w2m) = self.inner.w2m.get() else {
             return;
         };
-        {
-            let mut ring = self.inner.ring.borrow_mut();
-            unsafe {
-                ring.prep_futex_waitv(boxed.as_ptr(), boxed.len() as u32, udata(KIND_FUTEX_WAITV, 0));
+        let (ptr, n) = loop {
+            self.drain_all_w2m();
+            let mut storage = self.inner.futex_waitv_storage.borrow_mut();
+            let Some(boxed) = storage.as_mut() else {
+                return;
+            };
+            if let Some(armed) = w2m.arm_waitv(boxed) {
+                break (armed.as_ptr(), armed.len() as u32);
             }
-            ring.flush_sqes("FUTEX_WAITV");
+        };
+        // SAFETY: the array lives in `futex_waitv_storage`, which is freed only
+        // after `cancel_futex_waitv_and_wait` sees the SQE's CQE.
+        unsafe {
+            self.inner
+                .ring
+                .borrow_mut()
+                .prep_futex_waitv(ptr, n, udata(KIND_FUTEX_WAITV, 0));
         }
         self.inner.futex_waitv_armed.set(true);
-    }
-
-    /// Arm the master-park protocol on every ring and snapshot each
-    /// `reader_seq` into its `FutexWaitV` entry. Returns `true` if any ring has
-    /// unread data, meaning the caller must drain before arming — otherwise the
-    /// SQE would block waiting for a wake that already happened.
-    ///
-    /// `W2mRingHeader::arm_master_park` owns the store ordering this depends on.
-    fn refresh_futex_waitv_vals(&self) -> bool {
-        let mut storage = self.inner.futex_waitv_storage.borrow_mut();
-        let Some(boxed) = storage.as_mut() else {
-            return false;
-        };
-        let Some(w2m) = self.inner.w2m.get() else {
-            return false;
-        };
-        let mut pending = false;
-        for (w, entry) in boxed.iter_mut().enumerate() {
-            let hdr = unsafe { w2m.header(w) };
-            let (expected, has_unread) = hdr.arm_master_park();
-            *entry = FutexWaitV::new()
-                .val(expected as u64)
-                .uaddr(hdr.reader_seq() as *const std::sync::atomic::AtomicU32 as u64)
-                .flags(FUTEX2_SIZE_U32);
-            pending |= has_unread;
-        }
-        pending
     }
 
     /// Submit an fdatasync and await its completion. Returns the CQE `res`
@@ -624,13 +600,18 @@ impl Reactor {
                 self.inner.timers.complete(id, ());
             }
             KIND_FUTEX_WAITV => {
-                // Wake index is not authoritative for FUTEX_WAITV: the
-                // kernel may wake us for any of the watched words, so
-                // `drain_refresh_and_arm` drains every worker's ring
-                // before re-arming.
+                // The wake index is not authoritative for FUTEX_WAITV — the
+                // kernel may wake us for any watched word — so every ring is
+                // drained. Clearing the park flag first is what makes the
+                // elision worth anything: from here until `tick` re-arms, the
+                // master is running, and a worker's publish should not spend a
+                // syscall waking it.
                 self.inner.futex_waitv_armed.set(false);
                 if !self.inner.shutdown.get() {
-                    self.drain_refresh_and_arm();
+                    if let Some(w2m) = self.inner.w2m.get() {
+                        w2m.clear_waitv();
+                    }
+                    self.drain_all_w2m();
                 }
             }
             KIND_FSYNC => {
@@ -665,7 +646,7 @@ impl Reactor {
     /// control-only — funnels through one zero-copy decode into
     /// `route_reply`, which demuxes FLAG_EXCHANGE into the accumulator.
     ///
-    /// The RAII `W2mSlot` advances `consume_cursor` on drop so the worker
+    /// The RAII `W2mSlot` advances `release_cursor` on drop so the worker
     /// can reuse the ring space immediately after decoding completes.
     fn drain_w2m_for_worker(&self, w: usize) {
         let w2m = self
@@ -694,7 +675,7 @@ impl Reactor {
             let mut scans = self.inner.scans.borrow_mut();
             let Some(route) = scans.get_mut(&slot.internal_req_id) else {
                 // Abandoned scan (no live ScanLease): dropping `slot` advances
-                // consume_cursor so the still-streaming worker never wedges on
+                // release_cursor so the still-streaming worker never wedges on
                 // a full ring.
                 return; // slot dropped here
             };
@@ -710,7 +691,7 @@ impl Reactor {
     /// control-only frames (`data_batch: None`). Zero-copy: borrows ring
     /// bytes via `MemBatch`, allocates exactly one owned `Batch` when the
     /// frame carries data (ring → run, single `copy_from_slice`), then
-    /// drops the slot so `consume_cursor` advances before any awaiter wakes.
+    /// drops the slot so `release_cursor` advances before any awaiter wakes.
     fn decode_slot_owned(&self, slot: W2mSlot, ctrl: gnitz_wire::control::DecodedControl) -> DecodedWire {
         let bytes = slot.bytes();
         let mut offsets = [0usize; gnitz_engine::storage::MAX_BATCH_REGIONS];
@@ -728,7 +709,7 @@ impl Reactor {
             owned.certify_layout(gnitz_engine::storage::Layout::from_wire_flags(flags), sch);
             owned
         });
-        drop(slot); // RAII: advance consume_cursor before waking awaiter
+        drop(slot); // RAII: advance release_cursor before waking awaiter
         DecodedWire {
             control,
             schema,
@@ -931,7 +912,6 @@ fn make_waker(key: usize) -> Waker {
 mod tests {
     use super::futures::{SendAlive, SendFuture};
     use super::*;
-    use crate::runtime::w2m_ring::park_order;
     use gnitz_engine::schema::SchemaDescriptor;
     use std::cell::Cell as StdCell;
     use std::time::Duration;
@@ -2626,9 +2606,9 @@ mod tests {
     /// `FUTEX_WAITV` + `W2mReceiver` pipeline.
     ///
     /// Regression guard for two distinct hazards:
-    /// 1. The lost-wake race in `refresh_futex_waitv_vals`: at this scale the
-    ///    master takes many `refresh → arm` cycles, each a potential lost-wake
-    ///    window. A missed wake hangs the test (caught by the timer guard).
+    /// 1. The lost-wake race in the master's park: at this scale the master
+    ///    takes many drain → arm cycles, each a potential lost-wake window. A
+    ///    missed wake hangs the test (caught by the timer guard).
     /// 2. The writer-crosses-reader data-loss bug in the SKIP-wrap path:
     ///    capacity is small enough (64 KiB) and the message count high enough
     ///    (500 × ~280 B ≈ 140 KiB) to force multiple SKIP-wraps. Truncated or
@@ -2641,17 +2621,13 @@ mod tests {
     fn w2m_cross_process_stress(n_messages: u64, timeout_secs: u64) {
         use crate::runtime::reactor::{join_all_unpin, select2, Either};
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-        use crate::runtime::w2m_ring;
         use gnitz_wire::STATUS_OK;
         use std::time::Duration;
 
         const CAPACITY: usize = 64 * 1024;
 
-        let region = gnitz_engine_testkit::SharedRegion::new(CAPACITY);
+        let region = unsafe { crate::runtime::tests::fixtures::test_ring(CAPACITY) };
         let ptr = region.ptr();
-        unsafe {
-            w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
-        }
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
@@ -2738,88 +2714,25 @@ mod tests {
         w2m_cross_process_stress(5_000, 60);
     }
 
-    /// This pin ISOLATES the refresh path: it drives
-    /// `refresh_futex_waitv_vals` directly, with NO `tick()` and NO safety-net
-    /// drain, so the store ordering is not masked, and asserts via a
-    /// `#[cfg(test)]` order-witness probe that the flag publish was stamped
-    /// strictly before the `reader_seq` snapshot.
+    /// An unread publish must make the arm refuse, so the reactor drains
+    /// instead of arming a `FUTEX_WAITV` for a wake that already happened.
     ///
-    /// Single-threaded on purpose: the property is a store order inside one
-    /// call, and a helper thread racing the refresh only made the *other* half
-    /// of this (the unread-data check) nondeterministic. That half is
-    /// [`refresh_reports_pending_when_data_is_unread`], where the publish
-    /// simply precedes the refresh.
-    ///
-    /// Teeth: reordering the two operations (snapshot before `fetch_or`) flips
-    /// the order stamps and fails the assert.
+    /// The publish lands before the arm, so there is no race to lose: the
+    /// unread-data check either runs or the code is wrong.
     #[test]
-    fn refresh_publishes_flag_before_snapshotting_reader_seq() {
-        use crate::runtime::w2m::W2mReceiver;
-        use crate::runtime::w2m_ring;
-
-        const CAPACITY: usize = 64 * 1024;
-
-        let region = gnitz_engine_testkit::SharedRegion::new(CAPACITY);
-        let ptr = region.ptr();
-        unsafe {
-            w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
-        }
-
-        // Only the state refresh needs — deliberately NOT `attach_w2m`, so no
-        // drain loop, no SQE arm, no tick().
-        let reactor = Reactor::new(16).expect("reactor");
-        reactor
-            .inner
-            .w2m
-            .set(Rc::new(W2mReceiver::new(vec![ptr])))
-            .ok()
-            .expect("w2m set");
-        *reactor.inner.futex_waitv_storage.borrow_mut() = Some(vec![FutexWaitV::new()].into_boxed_slice());
-
-        let _ = reactor.refresh_futex_waitv_vals();
-
-        assert_eq!(
-            park_order::step(),
-            2,
-            "FLAG_MASTER_PARKED must be published BEFORE reader_seq is \
-             snapshotted; reordering them opens the lost-wake window",
-        );
-    }
-
-    /// The other half of the park protocol: an unread publish must make
-    /// `refresh_futex_waitv_vals` report pending, so the caller drains instead
-    /// of arming a `FUTEX_WAITV` for a wake that already happened.
-    ///
-    /// The publish lands before the refresh, so there is no race to lose: the
-    /// `write_cursor != read_cursor` check either runs or the code is wrong.
-    #[test]
-    fn refresh_reports_pending_when_data_is_unread() {
+    fn arm_waitv_refuses_while_data_is_unread() {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-        use crate::runtime::w2m_ring;
         use gnitz_wire::STATUS_OK;
 
-        const CAPACITY: usize = 64 * 1024;
-
-        let region = gnitz_engine_testkit::SharedRegion::new(CAPACITY);
+        let region = unsafe { crate::runtime::tests::fixtures::test_ring(64 * 1024) };
         let ptr = region.ptr();
-        unsafe {
-            w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
-        }
         W2mWriter::new(ptr).send_status(0, 1u64, STATUS_OK, &[]);
 
-        let reactor = Reactor::new(16).expect("reactor");
-        reactor
-            .inner
-            .w2m
-            .set(Rc::new(W2mReceiver::new(vec![ptr])))
-            .ok()
-            .expect("w2m set");
-        *reactor.inner.futex_waitv_storage.borrow_mut() = Some(vec![FutexWaitV::new()].into_boxed_slice());
-
+        let receiver = W2mReceiver::new(vec![ptr]);
+        let mut out = [FutexWaitV::new(); 1];
         assert!(
-            reactor.refresh_futex_waitv_vals(),
-            "an unread publish must be reported as pending — the caller would \
-             otherwise arm a doomed wait (lost wake)",
+            receiver.arm_waitv(&mut out).is_none(),
+            "an unread publish must refuse the arm — arming it would be a lost wake",
         );
     }
 
@@ -3226,7 +3139,7 @@ mod tests {
             .scans
             .borrow_mut()
             .get_mut(&req_id)
-            .map(|s| std::mem::take(&mut s.queue)); // drop slot, advance consume_cursor
+            .map(|s| std::mem::take(&mut s.queue)); // drop slot, advance release_cursor
     }
 
     #[test]
@@ -3247,7 +3160,7 @@ mod tests {
             "first poll must return the pre-parked slot"
         );
 
-        drop(result); // advance consume_cursor before the region unmaps
+        drop(result); // advance release_cursor before the region unmaps
     }
 
     #[test]
@@ -3297,13 +3210,10 @@ mod tests {
         n: usize,
     ) -> (crate::runtime::w2m::W2mReceiver, gnitz_engine_testkit::SharedRegion) {
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-        use crate::runtime::w2m_ring;
         use crate::runtime::wire as ipc;
 
-        const CAPACITY: usize = 64 * 1024;
-        let region = gnitz_engine_testkit::SharedRegion::new(CAPACITY);
+        let region = crate::runtime::tests::fixtures::test_ring(64 * 1024);
         let ptr = region.ptr();
-        w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
 
         let writer = W2mWriter::new(ptr);
         let receiver = W2mReceiver::new(vec![ptr]);
@@ -3406,7 +3316,7 @@ mod tests {
     }
 
     /// Dropping the `ScanLease` purges the parked queue (dropping each queued
-    /// `W2mSlot` advances `consume_cursor`) and deregisters the active scan.
+    /// `W2mSlot` advances `release_cursor`) and deregisters the active scan.
     #[test]
     fn scan_lease_drop_frees_queued_slots() {
         use std::sync::atomic::Ordering;
@@ -3419,8 +3329,8 @@ mod tests {
         r.test_route_scan_slot(s0); // queued (active)
         assert!(r.inner.scans.borrow().contains_key(&req_id));
 
-        let cc_before = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
-        drop(lease); // purge parked queue → drop queued slot → advance consume_cursor
+        let cc_before = unsafe { recv.header(0) }.release_cursor.load(Ordering::Acquire);
+        drop(lease); // purge parked queue → drop queued slot → advance release_cursor
         assert!(
             r.inner.scans.borrow().values().all(|s| s.queue.is_empty()),
             "lease drop purges parked queue"
@@ -3430,8 +3340,8 @@ mod tests {
             "lease drop purges wakers"
         );
         assert!(r.inner.scans.borrow().is_empty(), "lease drop deregisters active scan");
-        let cc_after = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
-        assert!(cc_after > cc_before, "dropped queued slot must advance consume_cursor");
+        let cc_after = unsafe { recv.header(0) }.release_cursor.load(Ordering::Acquire);
+        assert!(cc_after > cc_before, "dropped queued slot must advance release_cursor");
 
         drop(recv);
     }
@@ -3448,16 +3358,16 @@ mod tests {
 
         // No lease held: route_scan_slot must drop the slot, not park it.
         let s0 = recv.try_read_slot(0).expect("frame 0");
-        let cc_before = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
+        let cc_before = unsafe { recv.header(0) }.release_cursor.load(Ordering::Acquire);
         r.test_route_scan_slot(s0); // dropped here (inactive)
         assert!(
             r.inner.scans.borrow().values().all(|s| s.queue.is_empty()),
             "abandoned-scan frame must be discarded, not parked"
         );
-        let cc_after = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
+        let cc_after = unsafe { recv.header(0) }.release_cursor.load(Ordering::Acquire);
         assert!(
             cc_after > cc_before,
-            "discarded slot must advance consume_cursor (ring freed)"
+            "discarded slot must advance release_cursor (ring freed)"
         );
 
         drop(recv);
@@ -3470,21 +3380,17 @@ mod tests {
     /// writes instead of wedging in `send_encoded`.
     #[test]
     fn dropped_scan_lease_unblocks_streaming_writer() {
+        use crate::runtime::tests::fixtures::make_ring;
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-        use crate::runtime::w2m_ring::{self, W2M_HEADER_SIZE};
         use crate::runtime::wire as ipc;
-        use gnitz_wire::align8;
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
 
         const TOTAL: usize = 8;
 
         // Ring sized for exactly 2 small frames.
-        let msg_total = 8 + align8(ipc::WireMsg::default().size()) as u64;
-        let capacity = W2M_HEADER_SIZE as u64 + 2 * msg_total + 8;
-        let region = gnitz_engine_testkit::SharedRegion::new(capacity as usize);
+        let region = unsafe { make_ring(ipc::WireMsg::default().size(), 2, 8) };
         let ptr = region.ptr();
-        unsafe { w2m_ring::init_region_for_tests(ptr, capacity) };
 
         let r = make_reactor();
         let req_id = r.alloc_scan_request_id() as u32;
@@ -3540,9 +3446,9 @@ mod tests {
 
         let hdr = unsafe { receiver.header(0) };
         assert_eq!(
-            hdr.consume_cursor().load(Ordering::Acquire),
-            hdr.write_cursor().load(Ordering::Acquire),
-            "every emitted slot must be freed (consume_cursor reaches write_cursor)",
+            hdr.release_cursor.load(Ordering::Acquire),
+            hdr.write_cursor.load(Ordering::Acquire),
+            "every emitted slot must be freed (release_cursor reaches write_cursor)",
         );
 
         drop(receiver);

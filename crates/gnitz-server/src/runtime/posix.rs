@@ -399,8 +399,8 @@ pub(crate) fn futex_wake_u32(ptr: *const AtomicU32, n_waiters: u32) -> i32 {
 /// synchronous analogue of the reactor's `IORING_OP_FUTEX_WAITV`, and built from
 /// the same [`io_uring::types::FutexWaitV`] so there is one declaration of the
 /// kernel struct rather than two that can drift. The master must wait on every
-/// still-pending worker's `reader_seq`, since a publish by ANY worker wakes only
-/// that worker's word and a single-word `futex_wait` would miss it.
+/// still-pending worker's `write_cursor`, since a publish by ANY worker wakes
+/// only that worker's word and a single-word `futex_wait` would miss it.
 ///
 /// `timeout_ms` becomes an ABSOLUTE `CLOCK_MONOTONIC` deadline — `futex_waitv`
 /// requires absolute timeouts, unlike the relative `futex_wait_u32` above; do
@@ -486,12 +486,13 @@ pub(crate) fn map_shared_sized(fd: c_int, size: usize, how: Backing) -> std::io:
 // Unaligned raw accessors
 // ---------------------------------------------------------------------------
 
-// The four `*_raw` accessors below do unaligned `u32`/`u64` reads and writes at
-// `base + offset` bytes for the SAL and W2M mmap paths, where the offset is
-// computed from a `*mut u8` base pointer that need not meet the alignment a
-// `*mut u{32,64}` dereference requires — hence `read_unaligned`/`write_unaligned`.
-// Each `# Safety` clause is the same contract: `base + offset + N` must lie
-// inside a live allocation, writable for the writes and readable for the reads.
+// The four `*_raw` accessors below read and write `u32`/`u64` at `base + offset`
+// for the SAL and W2M mmap paths. The SAL is the caller that needs
+// `read_unaligned`/`write_unaligned`: its offsets are record-relative and need
+// not meet a `*mut u{32,64}` dereference's alignment. W2M's slot prefixes are
+// always 8-aligned and use these for the shared contract, not the unalignment.
+// Each `# Safety` clause is that contract: `base + offset + N` must lie inside a
+// live allocation, writable for the writes and readable for the reads.
 
 /// # Safety
 /// `base + offset + 8` must lie inside a live, writable allocation.

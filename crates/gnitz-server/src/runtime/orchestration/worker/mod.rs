@@ -215,7 +215,7 @@ pub struct WorkerProcess {
     /// starts. Do NOT interleave streams round-robin: the master drains one
     /// request's train at a time, so an interleaved second train's frames
     /// would sit parked in the master's scan queue holding un-released ring slots;
-    /// `consume_cursor` (released in ring order, `w2m.rs`) could then never
+    /// `release_cursor` (released in ring order, `w2m.rs`) could then never
     /// pass them, the ring fills, the worker blocks in `send_encoded`, and the
     /// cluster deadlocks. FIFO is deadlock-free: every fan-out writes its
     /// group to all workers under `sal_writer_excl`, so all worker queues
@@ -1542,18 +1542,9 @@ mod tests {
     /// assert the ids round-trip.
     #[test]
     fn test_send_helpers_echo_request_id() {
-        use crate::runtime::w2m_ring;
         use crate::runtime::wire as ipc;
-        // Use the production-sized region — the mmap reservation is
-        // lazy-populated, so the 1 GiB backing is cheap.
-        let region_size = w2m_ring::W2M_REGION_SIZE;
-        let region = gnitz_engine_testkit::SharedRegion::new(region_size);
+        let (region, w2m_writer) = make_ring();
         let region_ptr = region.ptr();
-        unsafe {
-            w2m_ring::init_region(region_ptr, region_size as u64);
-        }
-
-        let w2m_writer = W2mWriter::new(region_ptr);
 
         let mut wp = make_test_worker(std::ptr::null_mut(), w2m_writer);
 
@@ -1569,18 +1560,10 @@ mod tests {
             .unwrap();
         wp.send_error("boom", req_err);
 
-        // Decode the three messages back from the ring via try_consume.
-        let hdr = unsafe { w2m_ring::W2mRingHeader::from_raw(region_ptr as *const u8) };
-        let mut rc = w2m_ring::W2M_HEADER_SIZE as u64;
-        let mut decoded_ids = Vec::new();
-        for _ in 0..3 {
-            let (data_ptr, sz, new_rc, _req_id) =
-                unsafe { w2m_ring::try_consume(hdr, region_ptr as *const u8, rc).expect("expected a message") };
-            let data = unsafe { std::slice::from_raw_parts(data_ptr, sz as usize) };
-            let decoded = ipc::decode_wire_ipc(data).expect("decode_wire_ipc");
-            decoded_ids.push(decoded.control.request_id);
-            rc = new_rc;
-        }
+        let decoded_ids: Vec<u64> = walk_frames(region_ptr)
+            .iter()
+            .map(|(_, frame)| ipc::decode_wire_ipc(frame).expect("decode_wire_ipc").control.request_id)
+            .collect();
         assert_eq!(decoded_ids, vec![req_ack, req_resp, req_err]);
     }
 
@@ -1895,14 +1878,11 @@ mod tests {
 
     // -- pending stream chunking tests -----------------------------------------------
 
+    /// A production-sized ring and its writer. The mmap reservation is
+    /// lazily populated, so the 1 GiB backing costs address space, not RAM.
     fn make_ring() -> (gnitz_engine_testkit::SharedRegion, W2mWriter) {
-        let size = w2m_ring::W2M_REGION_SIZE;
-        let region = gnitz_engine_testkit::SharedRegion::new(size);
-        let ptr = region.ptr();
-        unsafe {
-            w2m_ring::init_region(ptr, size as u64);
-        }
-        let writer = W2mWriter::new(ptr);
+        let region = unsafe { crate::runtime::tests::fixtures::test_ring(w2m_ring::W2M_REGION_SIZE) };
+        let writer = W2mWriter::new(region.ptr());
         (region, writer)
     }
 
@@ -2280,13 +2260,10 @@ mod tests {
     /// Read every published message off a test ring in publish order,
     /// returning `(ring_prefix_req_id, frame_bytes)`.
     fn walk_frames(ptr: *mut u8) -> Vec<(u32, Vec<u8>)> {
-        let hdr = unsafe { w2m_ring::W2mRingHeader::from_raw(ptr as *const u8) };
-        let mut rc = w2m_ring::W2M_HEADER_SIZE as u64;
+        let mut rc = unsafe { w2m_ring::RingCursor::consumer(ptr) };
         let mut out = Vec::new();
-        while let Some((data_ptr, sz, new_rc, req_id)) = unsafe { w2m_ring::try_consume(hdr, ptr as *const u8, rc) } {
-            let data = unsafe { std::slice::from_raw_parts(data_ptr, sz as usize) };
-            out.push((req_id, data.to_vec()));
-            rc = new_rc;
+        while let Some(slot) = unsafe { w2m_ring::try_consume(&mut rc) } {
+            out.push((slot.internal_req_id, slot.payload.to_vec()));
         }
         out
     }

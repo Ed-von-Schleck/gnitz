@@ -8,10 +8,10 @@
 //! Every key is the OPK leading-key span (`PkBuf`) — equality-correct and
 //! byte-orderable at any width.
 
+use super::fixtures;
 use crate::runtime::master::PreflightAccumulator;
 use crate::runtime::sal::{SalMessageKind, FLAG_UNIQUE_PREFLIGHT};
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-use crate::runtime::w2m_ring;
 use crate::runtime::wire::{self, unique_preflight_wire_schema, SchemaWithVersion, FLAG_SCAN_LAST};
 use crate::runtime::worker::send_unique_preflight_keys;
 use gnitz_engine::schema::key::PkBuf;
@@ -67,7 +67,7 @@ fn producer_of(keys: &[PkBuf]) -> KeyProducer {
 fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
     // Room for a whole pre-flight train at once, so a test drains it without
     // ever racing the writer against backpressure.
-    let region = unsafe { w2m_ring::make_ring(1 << 16, 16, 8) };
+    let region = unsafe { fixtures::make_ring(1 << 16, 16, 8) };
     let ptr = region.ptr();
     let writer = W2mWriter::new(ptr);
     let receiver = W2mReceiver::new(vec![ptr]);

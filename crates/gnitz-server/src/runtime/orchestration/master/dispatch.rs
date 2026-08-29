@@ -60,12 +60,12 @@ fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: &[u8]) -> Opti
 /// Timeout for the synchronous `W2mReceiver::wait_any` park in the
 /// reactor-driven-but-sometimes-parked collect loop below.
 ///
-/// `wait_any` returns the instant a worker bumps `reader_seq` *as long as the
-/// futex wake reaches it*. At boot (no reactor) and in the steady state nothing
+/// `wait_any` returns the instant a worker publishes *as long as the futex wake
+/// reaches it*. At boot (no reactor) and in the steady state nothing
 /// competes for that wake, so the loop is woken promptly and this value is just
 /// an unhit ceiling. But the reactor-parked CREATE-VIEW backfill runs the loop
 /// while the reactor's `FUTEX_WAITV` SQE is still armed on the same
-/// `reader_seq` words: the kernel can deliver a worker's wake to that op (whose
+/// `write_cursor` words: the kernel can deliver a worker's wake to that op (whose
 /// CQE then sits unprocessed — the reactor is parked here) instead of to this
 /// `futex_waitv`, which would otherwise sleep the full timeout while the reply
 /// already sits in the ring. A short timeout caps that stolen-wake stall (the
@@ -256,7 +256,7 @@ impl MasterDispatcher {
     }
 
     /// Liveness gate for the pre-reactor bootstrap wait loops. A crashed worker
-    /// (panic / OOM-kill / SIGKILL) leaves its `reader_seq` frozen, so the park
+    /// (panic / OOM-kill / SIGKILL) leaves its `write_cursor` frozen, so the park
     /// only ever times out and the wait loop would spin forever. Callers probe
     /// before parking and surface the dead worker as an error instead of hanging
     /// the master; `ctx` names the phase ("recovery sync", "backfill relay"). On
@@ -369,7 +369,7 @@ impl MasterDispatcher {
                 self.fail_if_worker_dead(ctx)?;
                 // Wait on ALL still-pending workers at once: any could be the next
                 // to publish, and a single-word wait would miss a wake on a
-                // different worker's reader_seq.
+                // different worker's ring.
                 let _ = self.w2m.wait_any(pending_mask, W2M_SYNC_WAIT_MS);
             }
         }
@@ -899,7 +899,7 @@ impl MasterDispatcher {
     ///
     /// `forward_scan_slots` returns on the FIRST worker fault, decode error, or
     /// client disconnect: `_lease` drops on return and `route_scan_slot` discards
-    /// every undrained frame at the ring boundary, advancing `consume_cursor`, so
+    /// every undrained frame at the ring boundary, advancing `release_cursor`, so
     /// a still-streaming worker cannot wedge in `send_encoded` — draining the
     /// doomed trains would be pure waste. The client may already have received
     /// earlier workers' data frames when the fault surfaces, so the fault frame
@@ -1404,7 +1404,6 @@ pub(crate) async fn await_scan_slots(reactor: &crate::runtime::reactor::Reactor,
 #[cfg(test)]
 mod worker_liveness_tests {
     use super::*;
-    use crate::runtime::w2m_ring;
     use gnitz_engine_testkit::SharedRegion;
 
     const RING_CAP: usize = 64 * 1024;
@@ -1419,9 +1418,7 @@ mod worker_liveness_tests {
         let nw = worker_pids.len();
         let mut rings = Vec::with_capacity(nw);
         for _ in 0..nw {
-            let region = SharedRegion::new(RING_CAP);
-            unsafe { w2m_ring::init_region_for_tests(region.ptr(), RING_CAP as u64) };
-            rings.push(region);
+            rings.push(unsafe { crate::runtime::tests::fixtures::test_ring(RING_CAP) });
         }
         // `-1` eventfds: nothing parks on them here, and `eventfd_signal`
         // discards a failed write (the counter is only a wake hint).

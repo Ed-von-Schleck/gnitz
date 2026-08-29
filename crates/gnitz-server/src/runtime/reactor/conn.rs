@@ -250,7 +250,7 @@ impl Reactor {
     /// Send the frame bytes of a W2M ring slot directly, without copying,
     /// under the per-frame client-egress deadline.
     ///
-    /// The slot is kept alive (consume_cursor stays fixed) until the io_uring
+    /// The slot is kept alive (release_cursor stays fixed) until the io_uring
     /// OP_SEND CQE fires, at which point the kernel has consumed the data and
     /// the slot is dropped, advancing the cursor. That pin is why every slot
     /// send carries the deadline: a client that stops draining its socket

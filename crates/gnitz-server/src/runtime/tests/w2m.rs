@@ -1,3 +1,4 @@
+use super::fixtures;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 /// order, with its payload intact. The ring holds only `ring_frames` of them,
 /// so the run wraps it many times over.
 fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pad: &[u8]) {
-    let region = unsafe { w2m_ring::make_ring(CTRL_BLOCK_SIZE_NO_BLOB + pad.len(), ring_frames, 8) };
+    let region = unsafe { fixtures::make_ring(CTRL_BLOCK_SIZE_NO_BLOB + pad.len(), ring_frames, 8) };
     let ptr = region.ptr();
 
     let region_addr = ptr as usize;
@@ -88,34 +89,19 @@ fn w2m_concurrent_large_frames_arrive_in_order() {
     concurrent_publish_drains_in_order("large frames", 4, 500, &[b'x'; 4000]);
 }
 
+/// An oversized `sz` is a caller bug, and the ring says so at the first
+/// statement of `try_reserve` — so it cannot degenerate into a park on a ring
+/// that will never have room.
 #[test]
+#[should_panic(expected = "outside (0,")]
 fn w2m_writer_rejects_oversized() {
-    let region = unsafe { w2m_ring::make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 4, 8) };
-    let region_addr = region.ptr() as usize;
-    let (tx, rx) = std::sync::mpsc::channel::<bool>();
-    let writer_thread = std::thread::spawn(move || {
-        let writer = W2mWriter::new(region_addr as *mut u8);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            writer.send_encoded((w2m_ring::MAX_W2M_MSG + 1) as usize, 0, |_| {});
-        }));
-        let _ = tx.send(result.is_err());
-    });
-
-    let verdict = rx.recv_timeout(Duration::from_secs(2));
-    writer_thread.join().expect("writer thread");
-    match verdict {
-        Ok(true) => {}
-        Ok(false) => panic!("send_encoded returned normally on oversized sz — expected panic"),
-        Err(_) => panic!(
-            "send_encoded deadlocked on oversized sz — it must panic instead of \
-             spinning on Full forever"
-        ),
-    }
+    let region = unsafe { fixtures::make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 4, 8) };
+    W2mWriter::new(region.ptr()).send_encoded((w2m_ring::MAX_W2M_MSG + 1) as usize, 0, |_| {});
 }
 
 #[test]
 fn w2m_control_only_reply_has_no_backing() {
-    let region = unsafe { w2m_ring::make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8) };
+    let region = unsafe { fixtures::make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8) };
     let ptr = region.ptr();
 
     let writer = W2mWriter::new(ptr);

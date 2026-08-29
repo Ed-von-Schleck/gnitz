@@ -71,7 +71,7 @@ pub(super) fn expect_single_frame(slot: &W2mSlot, w: usize, what: &str) -> Resul
 /// an `Err` from `on_batch` — without draining the rest. All callers hold the
 /// `ScanLease` from `dispatch_scan_fanout`; when the early `Err` unwinds it, the
 /// lease drop frees every parked slot and `route_scan_slot` discards later
-/// frames at the ring boundary, advancing `consume_cursor`, so a still-streaming
+/// frames at the ring boundary, advancing `release_cursor`, so a still-streaming
 /// worker cannot wedge in `send_encoded`.
 ///
 /// `expected` guards each train's first schema-bearing frame. Worker reply
@@ -236,7 +236,7 @@ pub(super) async fn forward_scan_slots(
 ///
 /// The send is deadline-guarded inside `send_slot`: a client that stops draining
 /// this zero-copy slot is evicted, rc goes negative, and the caller drops the
-/// `ScanLease`, discarding the rest of the train and advancing consume_cursor so
+/// `ScanLease`, discarding the rest of the train and advancing release_cursor so
 /// the worker unblocks.
 async fn drain_scan_train(
     reactor: &crate::runtime::reactor::Reactor,
@@ -298,11 +298,10 @@ mod tests {
     impl DrainFixture {
         fn new(n_workers: usize) -> (Self, Vec<crate::runtime::w2m::W2mWriter>) {
             use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-            use crate::runtime::w2m_ring;
             let mut rings = Vec::with_capacity(n_workers);
             let mut writers = Vec::with_capacity(n_workers);
             for _ in 0..n_workers {
-                let region = unsafe { w2m_ring::make_ring(DRAIN_MSG_SZ, DRAIN_RING_MSGS, 16) };
+                let region = unsafe { crate::runtime::tests::fixtures::make_ring(DRAIN_MSG_SZ, DRAIN_RING_MSGS, 16) };
                 writers.push(W2mWriter::new(region.ptr()));
                 rings.push(region);
             }
@@ -350,7 +349,7 @@ mod tests {
             // Drop purges the scan's queue, which would drop any still-queued
             // W2mSlot borrowing the soon-to-be-unmapped region. The Reactor goes
             // next, for the same reason — it owns the queued frames, and a slot
-            // dropped after the unmap writes `consume_cursor` into freed memory.
+            // dropped after the unmap writes `release_cursor` into freed memory.
             // The Peer holds an owning `Rc<Reactor>`, so it must go before the
             // Reactor.
             drop(self.scan);
@@ -659,18 +658,13 @@ mod tests {
         let mut slots = fx.initial_slots();
         let slot = slots.pop().expect("first frame");
 
-        let before = unsafe { fx.receiver.header(0) }
-            .consume_cursor()
-            .load(Ordering::Acquire);
+        let before = unsafe { fx.receiver.header(0) }.release_cursor.load(Ordering::Acquire);
         let head = classify_head(&slot, 0).expect("healthy header");
         assert!(!head.observable, "a frame with neither rows nor a schema block");
         let drained = poll_once(drain_scan_train(&fx.reactor, &fx.peer, slot, head, w0_req, 0)).expect("healthy train");
         assert!(drained, "the train drained without a client disconnect");
         assert!(
-            unsafe { fx.receiver.header(0) }
-                .consume_cursor()
-                .load(Ordering::Acquire)
-                > before,
+            unsafe { fx.receiver.header(0) }.release_cursor.load(Ordering::Acquire) > before,
             "the dropped slot was released at the ring"
         );
 
@@ -704,11 +698,7 @@ mod tests {
 
         let slots = fx.initial_slots();
         let before: Vec<u64> = (0..3)
-            .map(|w| {
-                unsafe { fx.receiver.header(w) }
-                    .consume_cursor()
-                    .load(Ordering::Acquire)
-            })
+            .map(|w| unsafe { fx.receiver.header(w) }.release_cursor.load(Ordering::Acquire))
             .collect();
 
         // The fixture's peer has no reader, so the send parks and the forward
@@ -717,10 +707,7 @@ mod tests {
         assert!(done.is_none(), "the coalesced send parks on a peer nobody reads");
         for (w, &was) in before.iter().enumerate() {
             assert!(
-                unsafe { fx.receiver.header(w) }
-                    .consume_cursor()
-                    .load(Ordering::Acquire)
-                    > was,
+                unsafe { fx.receiver.header(w) }.release_cursor.load(Ordering::Acquire) > was,
                 "worker {w}'s slot must be released before the send is submitted",
             );
         }

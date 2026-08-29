@@ -150,7 +150,7 @@ impl Drop for ScanSlotFuture {
 
 /// RAII guard owning the routing state of a whole scan operation. Registers its
 /// req_ids on construction; on drop deregisters them, which drops any frames
-/// they queued (dropping a `W2mSlot` advances `consume_cursor`, freeing ring
+/// they queued (dropping a `W2mSlot` advances `release_cursor`, freeing ring
 /// space) so `route_scan_slot` discards the scan's later frames. Ids are stored
 /// inline (at most `MAX_WORKERS` per fan-out) — no per-scan heap allocation.
 pub(crate) struct ScanLease {
