@@ -41,7 +41,7 @@ fn scripted_peer() -> (SockPath, std::thread::JoinHandle<UnixStream>) {
         s.read_exact(&mut payload).expect("hello payload");
         // `encode_hello_ack` frames the ACK itself. `u32::MAX` for the payload
         // ceiling: the client clamps it to its own hard maximum.
-        s.write_all(&gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, u32::MAX, 0))
+        s.write_all(&gnitz_wire::encode_hello_ack(u32::MAX, 0))
             .expect("hello ack");
         s
     });

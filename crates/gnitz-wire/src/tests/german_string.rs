@@ -1,75 +1,51 @@
 use super::*;
 use std::cmp::Ordering;
 
-fn roundtrip(s: &[u8]) {
-    let mut blob = Vec::new();
+/// Encode → decode at one length, out of an arena that already holds `prefix`
+/// bytes: a heap payload must be found at its own non-zero offset, not at 0.
+/// The two readers — the fallible `try_decode_german_string` and the infallible
+/// `german_string_content` — must agree on every class.
+fn roundtrip(s: &[u8], prefix: usize) {
+    let mut blob = vec![0xEEu8; prefix];
     let st = encode_german_string(s, &mut blob);
     assert_eq!(
         try_decode_german_string(&st, &blob).as_deref(),
         Some(s),
-        "try_decode roundtrip failed for len {}",
+        "try_decode roundtrip failed for len {} at prefix {prefix}",
         s.len(),
     );
+    assert_eq!(
+        german_string_content(&st, &blob),
+        s,
+        "the two readers disagree at len {} prefix {prefix}",
+        s.len(),
+    );
+    if s.len() > SHORT_STRING_THRESHOLD {
+        assert_eq!(
+            read_u64_le(&st, 8) as usize,
+            prefix,
+            "a heap payload must sit past the arena's existing bytes"
+        );
+        assert_eq!(blob.len(), prefix + s.len(), "the payload is appended whole");
+    } else {
+        assert_eq!(blob.len(), prefix, "an inline payload must not touch the arena");
+    }
 }
 
 #[test]
 fn roundtrip_across_length_boundaries() {
-    roundtrip(b""); // empty
-    roundtrip(b"a"); // 1 (prefix only)
-    roundtrip(b"abcd"); // 4 (prefix exactly full)
-    roundtrip(b"abcde"); // 5 (prefix + 1 suffix byte)
-    roundtrip(b"abcdefghijkl"); // 12 == SHORT_STRING_THRESHOLD (fully inline)
-    roundtrip(b"abcdefghijklm"); // 13 (first length that spills to blob)
-    roundtrip(&vec![0xABu8; 1000]); // long blob string
-}
-
-#[test]
-fn roundtrip_long_string_after_prefix_in_blob() {
-    // A non-empty blob prefix exercises the offset (not just offset 0).
-    let mut blob = vec![0u8; 7];
-    let payload = vec![0x5Au8; 40];
-    let st = encode_german_string(&payload, &mut blob);
-    assert_eq!(try_decode_german_string(&st, &blob).as_deref(), Some(&payload[..]));
-}
-
-#[test]
-fn try_decode_rejects_offset_plus_len_past_blob() {
-    // len > threshold so the decoder reads from the blob; offset 0 but the
-    // blob is shorter than len.
-    let mut st = [0u8; 16];
-    st[0..4].copy_from_slice(&100u32.to_le_bytes());
-    st[8..16].copy_from_slice(&0u64.to_le_bytes());
-    let blob = vec![0u8; 50];
-    assert_eq!(try_decode_german_string(&st, &blob), None);
-}
-
-#[test]
-fn try_decode_rejects_offset_at_blob_end() {
-    let mut st = [0u8; 16];
-    st[0..4].copy_from_slice(&13u32.to_le_bytes());
-    st[8..16].copy_from_slice(&50u64.to_le_bytes()); // offset == blob.len()
-    let blob = vec![0u8; 50];
-    assert_eq!(try_decode_german_string(&st, &blob), None);
-}
-
-#[test]
-fn try_decode_rejects_offset_overflow() {
-    // offset + len overflows u64; checked_add must catch it rather than
-    // wrapping to a small in-bounds value.
-    let mut st = [0u8; 16];
-    st[0..4].copy_from_slice(&20u32.to_le_bytes());
-    st[8..16].copy_from_slice(&(u64::MAX - 5).to_le_bytes());
-    let blob = vec![0u8; 50];
-    assert_eq!(try_decode_german_string(&st, &blob), None);
-}
-
-#[test]
-fn try_decode_long_string_exact_fit() {
-    let payload = vec![0x33u8; 30];
-    let mut blob = Vec::new();
-    let st = encode_german_string(&payload, &mut blob);
-    assert_eq!(blob.len(), 30, "exact-fit precondition");
-    assert_eq!(try_decode_german_string(&st, &blob).as_deref(), Some(&payload[..]));
+    // Both a fresh arena and one with bytes already in it, so an offset the
+    // encoder got wrong cannot coincide with 0.
+    for prefix in [0usize, 5] {
+        roundtrip(b"", prefix); // empty
+        roundtrip(b"a", prefix); // 1 (prefix only)
+        roundtrip(b"abcd", prefix); // 4 (prefix exactly full)
+        roundtrip(b"abcde", prefix); // 5 (prefix + 1 suffix byte)
+        roundtrip(b"abcdefghijkl", prefix); // 12 == SHORT_STRING_THRESHOLD (fully inline)
+        roundtrip(b"abcdefghijklm", prefix); // 13 (first length that spills to blob)
+        roundtrip(b"abcdefghijklmnopqrstuvwxyz", prefix); // 26
+        roundtrip(&vec![0xABu8; 1000], prefix); // long blob string
+    }
 }
 
 #[test]
@@ -93,11 +69,11 @@ fn compare_corrupt_long_cell_degrades_to_empty_without_panic() {
     // Two long-string cells with out-of-range heap offsets. Both contents
     // degrade to empty, so the comparison resolves rather than slicing OOB.
     let mut a = [0u8; 16];
-    a[0..4].copy_from_slice(&20u32.to_le_bytes());
+    crate::write_u32_le(&mut a, 0, 20);
     a[4..8].copy_from_slice(b"abcd");
-    a[8..16].copy_from_slice(&500u64.to_le_bytes());
+    crate::write_u64_le(&mut a, 8, 500);
     let mut b = a;
-    b[8..16].copy_from_slice(&900u64.to_le_bytes());
+    crate::write_u64_le(&mut b, 8, 900);
     let blob = vec![0u8; 4];
     assert_eq!(german_string_content(&a, &blob), &[] as &[u8]);
     assert_eq!(compare_german_strings(&a, &blob, &b, &blob), Ordering::Equal);
@@ -155,21 +131,6 @@ fn cell_ok_accepts_canonical_and_rejects_compare_visible_corruption() {
     assert!(!german_string_cell_ok(&skewed, &blob));
 }
 
-#[test]
-fn german_string_content_short_long_and_empty() {
-    let mut blob = vec![0xEEu8; 5]; // non-zero heap prefix, so offsets are non-zero
-    let empty = encode_german_string(b"", &mut blob);
-    assert_eq!(german_string_content(&empty, &blob), &[] as &[u8]);
-
-    let short = encode_german_string(b"abcdefghijkl", &mut blob); // 12 == threshold
-    assert_eq!(german_string_content(&short, &blob), b"abcdefghijkl");
-
-    let long_data = b"abcdefghijklmnopqrstuvwxyz";
-    let long = encode_german_string(long_data, &mut blob);
-    assert_eq!(read_u64_le(&long, 8), 5, "long payload must sit at a non-zero offset");
-    assert_eq!(german_string_content(&long, &blob), long_data);
-}
-
 /// `compare_german_strings` is plain `[u8]` lexicographic order. The inline
 /// and heap cells reach that verdict through different bytes — the prefix
 /// u32 fast path, then a content compare that resolves out of the cell or
@@ -205,6 +166,37 @@ fn compare_matches_byte_order_across_length_classes() {
                 compare_german_strings(&cells[i], &blob, &cells[j], &blob),
                 di.cmp(dj),
                 "compare mismatch for {di:?} vs {dj:?}",
+            );
+        }
+    }
+}
+
+/// The merge heap and the cursor-vs-exemplar compare always hold **two** blob
+/// arenas — one per run — so the comparator must resolve each side's payload out
+/// of its own heap. The two arenas here start at different lengths, so equal
+/// payloads land at different offsets and a comparator reading both sides from
+/// one arena reports the wrong order.
+#[test]
+fn compare_resolves_each_side_from_its_own_blob() {
+    let data: &[&[u8]] = &[
+        b"",
+        b"abcd",
+        b"abcdefghijkl",               // 12 — last inline length
+        b"abcdefghijklm",              // 13 — first heap length
+        b"abcdefghijklmnopqrst",       // 20, shares the 12-byte prefix
+        b"abcdefghijklmnopqrsu",       // 20, differs at the last byte
+        b"zyxwvutsrqponmlkjihgfedcba", // 26, differs at byte 0
+    ];
+    let (mut blob_a, mut blob_b) = (vec![0x11u8; 3], vec![0x22u8; 41]);
+    let cells_a: Vec<[u8; 16]> = data.iter().map(|d| encode_german_string(d, &mut blob_a)).collect();
+    let cells_b: Vec<[u8; 16]> = data.iter().map(|d| encode_german_string(d, &mut blob_b)).collect();
+
+    for (i, di) in data.iter().enumerate() {
+        for (j, dj) in data.iter().enumerate() {
+            assert_eq!(
+                compare_german_strings(&cells_a[i], &blob_a, &cells_b[j], &blob_b),
+                di.cmp(dj),
+                "cross-arena compare mismatch for {di:?} vs {dj:?}",
             );
         }
     }

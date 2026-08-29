@@ -122,8 +122,8 @@ pub enum AggClass {
 }
 
 impl AggFunc {
-    /// This aggregate's maintenance strategy — the single source of truth both
-    /// predicates below, and the reduce's index write and read sides, read.
+    /// This aggregate's maintenance strategy — the one classification both
+    /// predicates below read.
     pub const fn class(self) -> AggClass {
         match self {
             AggFunc::Count | AggFunc::Sum | AggFunc::CountNonNull | AggFunc::SumZero => AggClass::Linear,
@@ -361,33 +361,26 @@ pub enum JoinKind {
     DeltaTraceRange { n_eq: u8, rel: RangeRel },
 }
 
-/// What a reindex `Map` re-keys *for*. One scan can fan out into several reindex
-/// Maps (`t JOIN t1 ON t.a = t1.x JOIN t2 ON t.b = t2.y`) and can also carry
-/// re-keys that only move already-routed rows, so the two cannot be told apart by
-/// graph shape — the planner states which is which at the call site, where it knows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReindexRole {
-    /// The join/group key of this Map's source relation — the key the exchange
-    /// scatters that source's delta by.
-    ///
-    /// Not "an exchange is needed": a replicated or co-partitioned source is a
-    /// `ScatterKey` too, and whether the exchange runs stays the engine's call
-    /// (`compute_co_partitioned`). Naming only the scattered sides would move that
-    /// decision into the planner.
-    ScatterKey,
-    /// A re-key of rows a `ScatterKey` already placed — an outer join's null-fill
-    /// putting its preserved side back on that side's own PK so the set difference
-    /// stays partition-local, or any re-key of an operator's output.
-    Auxiliary,
-}
-
-impl ReindexRole {
-    fn from_wire(v: u64) -> ReindexRole {
-        if v == 0 {
-            ReindexRole::Auxiliary
-        } else {
-            ReindexRole::ScatterKey
-        }
+wire_enum! {
+    /// What a reindex `Map` re-keys *for*. One scan can fan out into several
+    /// reindex Maps (`t JOIN t1 ON t.a = t1.x JOIN t2 ON t.b = t2.y`) and can also
+    /// carry re-keys that only move already-routed rows, so the two cannot be told
+    /// apart by graph shape — the planner states which is which at the call site,
+    /// where it knows.
+    pub enum ReindexRole: u64 {
+        /// A re-key of rows a `ScatterKey` already placed — an outer join's
+        /// null-fill putting its preserved side back on that side's own PK so the
+        /// set difference stays partition-local, or any re-key of an operator's
+        /// output.
+        Auxiliary = 0,
+        /// The join/group key of this Map's source relation — the key the exchange
+        /// scatters that source's delta by.
+        ///
+        /// Not "an exchange is needed": a replicated or co-partitioned source is a
+        /// `ScatterKey` too, and whether the exchange runs stays the engine's call
+        /// (`compute_co_partitioned`). Naming only the scattered sides would move
+        /// that decision into the planner.
+        ScatterKey = 1,
     }
 }
 
@@ -608,15 +601,15 @@ where
 }
 
 /// Like [`encode_col_list`], but carries a per-column promoted target type code
-/// in `value2` (0 = keep/derive from the source type). `.get(i)...unwrap_or(0)`
-/// degrades a short/absent `target_tcs` to "no promotion" instead of panicking.
+/// in `value2` (0 = keep/derive from the source type). The two vectors are
+/// parallel: a caller with nothing to promote passes a zero vector of the same
+/// length, never an empty one. Padding a short one would make two unequal nodes
+/// encode to identical bytes.
 fn encode_col_list_with_tcs(kind: u64, cols: &[u32], target_tcs: &[u8]) -> Vec<NodeColumnPayload> {
+    debug_assert_eq!(cols.len(), target_tcs.len(), "promoted target tcs run parallel to cols");
     cols.iter()
         .enumerate()
-        .map(|(i, &col)| {
-            let v2 = target_tcs.get(i).copied().unwrap_or(0) as u64;
-            (kind, i as u16, col as u64, v2)
-        })
+        .map(|(i, &col)| (kind, i as u16, col as u64, target_tcs[i] as u64))
         .collect()
 }
 
@@ -653,16 +646,15 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         }) => {
             let mut kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_REINDEX, &reindex_cols, &reindex_target_tcs);
             // Written for both roles, unlike the sparse GLOBAL_GROUND /
-            // REDUCE_OUT_KEY rows, so an absent row stays decodable as "this
-            // circuit predates the role" — which the decode rejects.
-            let v = matches!(role, ReindexRole::ScatterKey) as u64;
-            kind_rows.push((NODE_COL_KIND_ROUTE_KEY, 0, v, 0));
+            // REDUCE_OUT_KEY rows: the decode rejects an absent row rather than
+            // guessing which side of the routing boundary the node sits on.
+            kind_rows.push((NODE_COL_KIND_ROUTE_KEY, 0, role.as_wire(), 0));
             ((OPCODE_MAP_EXPR, None, Some(program)), kind_rows)
         }
         OpNode::Map(MapKind::HashRow(cols, target_tcs, branch_id)) => {
             let mut kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_PROJ, &cols, &target_tcs);
-            // Always written, unlike the sparse GLOBAL_GROUND / REDUCE_OUT_KEY rows
-            // — the planner circuit snapshots pin this row's presence.
+            // Always written, unlike the sparse GLOBAL_GROUND / REDUCE_OUT_KEY
+            // rows: a branch id of 0 is a real branch, not an absence.
             kind_rows.push((NODE_COL_KIND_BRANCH_ID, 0, branch_id as u64, 0));
             ((OPCODE_MAP_HASH_ROW, None, None), kind_rows)
         }
@@ -799,12 +791,14 @@ pub fn decode_op_node(
             // An `Err` rather than a default, unlike SCAN_BOUND above: that bound
             // decides scan speed and never correctness, so one corrupt hint row
             // must not make a stored view unloadable. The role decides which
-            // worker a row lands on.
-            let role = cols
+            // worker a row lands on — so a missing row and an unreadable value are
+            // both refusals.
+            let role_row = cols
                 .iter()
                 .find(|c| c.kind == NODE_COL_KIND_ROUTE_KEY)
-                .map(|c| ReindexRole::from_wire(c.value1))
                 .ok_or_else(|| "MAP_EXPR missing its route-key row".to_string())?;
+            let role = ReindexRole::from_wire(role_row.value1)
+                .ok_or_else(|| format!("MAP_EXPR unknown route-key role {}", role_row.value1))?;
             OpNode::Map(MapKind::Reindex {
                 program,
                 reindex_cols,

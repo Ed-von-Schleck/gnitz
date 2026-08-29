@@ -12,7 +12,7 @@ use gnitz_engine::foundation::fault::Seam;
 /// A replicated relation is a full identical copy on every worker, so worker 0
 /// answers it alone; otherwise the read goes to the single worker owning its PK
 /// range when [`confined_worker`] can prove one, and is broadcast when it cannot.
-pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, spec: &[u8]) -> Fanout {
+pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, spec: SpecBytes<'_>) -> Fanout {
     match replicated_unicast(disp, target_id) {
         Fanout::One(w) => Fanout::One(w),
         Fanout::Broadcast => confined_worker(disp, target_id, spec).map_or(Fanout::Broadcast, Fanout::One),
@@ -31,7 +31,7 @@ pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, spec: &[u
 /// Only a key-routed relation names an owner, and the catalog — not the master's
 /// own stores — answers whether a relation is: the master holds no store at all
 /// after the fork, so its own handles cannot speak for the workers'.
-fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: &[u8]) -> Option<usize> {
+fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: SpecBytes<'_>) -> Option<usize> {
     let cat = disp.cat();
     let schema = cat.get_schema_desc(target_id)?;
     // For anything but `Keyed` no key names an owner, so nothing can be routed

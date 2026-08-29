@@ -1015,7 +1015,7 @@ impl WorkerProcess {
     ) -> Result<(), gnitz_wire::WireFault> {
         let (spec_bytes, reply_block) =
             gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
-        let spec = gnitz_wire::ReadSpec::decode(spec_bytes).map_err(|e| format!("scan_spec: {e}"))?;
+        let spec = gnitz_wire::ReadSpec::decode(spec_bytes.0).map_err(|e| format!("scan_spec: {e}"))?;
         let reply_schema = gnitz_engine::schema::decode_schema_block(reply_block, true)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self

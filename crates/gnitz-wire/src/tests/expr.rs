@@ -1,16 +1,6 @@
 use super::*;
 
 #[test]
-fn round_trip_empty_program() {
-    let blob = encode_expr_blob(0, 0, &[], &[]);
-    let dec = decode_expr_blob(&blob).unwrap();
-    assert_eq!(dec.num_regs, 0);
-    assert_eq!(dec.result_reg, 0);
-    assert!(dec.code.is_empty());
-    assert!(dec.const_strings.is_empty());
-}
-
-#[test]
 fn round_trip_program_with_strings() {
     let code = [1u32, 2, 3, 4, 5, 6, 7, 8];
     // Empty string, multi-byte UTF-8, and a non-UTF-8 byte string (byte-transparency).
@@ -27,94 +17,76 @@ fn round_trip_program_with_strings() {
         dec.const_strings,
         vec![s0.to_vec(), s1.to_vec(), s2.to_vec(), s3.to_vec()]
     );
+
+    // The degenerate program is a valid one, not an absence.
+    let dec = decode_expr_blob(&valid_empty()).expect("a valid empty program must decode");
+    assert_eq!((dec.num_regs, dec.result_reg), (0, 0));
+    assert!(dec.code.is_empty() && dec.const_strings.is_empty());
 }
 
-/// A valid empty program round-trips through `encode_expr_blob`; the reject
-/// tests below mutate a clone of this so each differs from a valid blob by
-/// exactly one flaw.
+/// A valid empty program; the rejection table mutates a clone of this, so each
+/// case differs from a decodable blob by exactly one flaw.
 fn valid_empty() -> Vec<u8> {
     encode_expr_blob(0, 0, &[], &[])
 }
 
+/// Every guard in `decode_expr_blob`, against the forgery that trips it. All of
+/// them answer `None` — the program blob is carried opaquely by the circuit
+/// codec, so a malformed one has no error text of its own to separate the cases;
+/// the table row is what names which guard is under test.
 #[test]
-fn rejects_bad_magic() {
-    let mut b = valid_empty();
-    b[0] ^= 0xFF;
-    assert!(decode_expr_blob(&b).is_none());
-}
-
-#[test]
-fn rejects_bad_version() {
-    let mut b = valid_empty();
-    b[4] = EXPR_BLOB_VERSION + 1;
-    assert!(decode_expr_blob(&b).is_none());
-}
-
-#[test]
-fn rejects_nonzero_reserved() {
-    for off in [5usize, 10, 11] {
+fn each_decode_guard_rejects_its_own_forgery() {
+    let poke = |off: usize, val: u8| {
         let mut b = valid_empty();
-        b[off] = 1;
-        assert!(decode_expr_blob(&b).is_none(), "reserved byte {off} must be zero");
+        b[off] = val;
+        b
+    };
+    // `n` (the code word count) lives at [12..16].
+    let code_len = |n: u32| {
+        let mut b = valid_empty();
+        crate::write_u32_le(&mut b, 12, n);
+        b
+    };
+    // The trailing string count is the last 4 bytes of an empty program.
+    let s_count = |n: u32| {
+        let mut b = valid_empty();
+        let len = b.len();
+        crate::write_u32_le(&mut b, len - 4, n);
+        b
+    };
+    let short_string = {
+        let mut b = s_count(1);
+        b.extend_from_slice(&5u32.to_le_bytes());
+        b.extend_from_slice(&[0xAA, 0xBB]); // only 2 of the 5 declared bytes
+        b
+    };
+    let trailing = {
+        let mut b = valid_empty();
+        b.push(0);
+        b
+    };
+
+    let cases: &[(&str, Vec<u8>)] = &[
+        ("bad magic", poke(0, valid_empty()[0] ^ 0xFF)),
+        ("bad version", poke(4, EXPR_BLOB_VERSION + 1)),
+        ("reserved byte 5", poke(5, 1)),
+        ("reserved byte 10", poke(10, 1)),
+        ("reserved byte 11", poke(11, 1)),
+        // 3 is not a multiple of 4, so the code section has no word boundary.
+        ("unaligned code length", code_len(3)),
+        // 4 words declared, no code bytes present.
+        ("truncated before code", code_len(4)),
+        // A corrupt count must not drive a huge `with_capacity`.
+        ("huge string count", s_count(u32::MAX)),
+        ("string count with no bytes", s_count(1)),
+        ("truncated mid string", short_string),
+        // The trailing-garbage guard: `expect_consumed`, which no truncation
+        // case reaches — those trip the reader first.
+        ("trailing bytes", trailing),
+    ];
+    for (what, blob) in cases {
+        assert!(decode_expr_blob(blob).is_none(), "{what} must be rejected");
     }
-}
-
-#[test]
-fn rejects_unaligned_code_length() {
-    let mut b = valid_empty();
-    // n lives at [12..16]; 3 is not a multiple of 4.
-    b[12..16].copy_from_slice(&3u32.to_le_bytes());
-    assert!(decode_expr_blob(&b).is_none());
-}
-
-#[test]
-fn rejects_truncation_before_code() {
-    // n = 4 words (16 bytes) declared, but no code bytes present.
-    let mut b = valid_empty();
-    b[12..16].copy_from_slice(&4u32.to_le_bytes());
-    assert!(decode_expr_blob(&b).is_none());
-}
-
-#[test]
-fn rejects_truncation_mid_string() {
-    // One string of length 5 declared, but fewer than 5 bytes follow.
-    let mut b = encode_expr_blob(0, 0, &[], &[]);
-    // Overwrite the trailing string count (last 4 bytes) to 1, then append a
-    // length prefix of 5 with no payload.
-    let len = b.len();
-    b[len - 4..len].copy_from_slice(&1u32.to_le_bytes());
-    b.extend_from_slice(&5u32.to_le_bytes());
-    b.extend_from_slice(&[0xAA, 0xBB]); // only 2 of 5 bytes
-    assert!(decode_expr_blob(&b).is_none());
-}
-
-#[test]
-fn rejects_huge_s_count() {
-    // s_count = u32::MAX with no string bytes must return None, not OOM.
-    let mut b = encode_expr_blob(0, 0, &[], &[]);
-    let len = b.len();
-    b[len - 4..len].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert!(decode_expr_blob(&b).is_none(), "huge s_count must be rejected");
-}
-
-#[test]
-fn rejects_s_count_with_no_remaining_bytes() {
-    // s_count = 1 but no string length prefix bytes remaining → None.
-    let mut b = encode_expr_blob(0, 0, &[], &[]);
-    let len = b.len();
-    b[len - 4..len].copy_from_slice(&1u32.to_le_bytes());
-    assert!(
-        decode_expr_blob(&b).is_none(),
-        "s_count with too few bytes must be rejected"
-    );
-}
-
-#[test]
-fn accepts_valid_empty_program() {
-    assert!(
-        decode_expr_blob(&valid_empty()).is_some(),
-        "valid empty program must decode"
-    );
 }
 
 #[test]

@@ -7,8 +7,8 @@ use crate::{
     COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND,
     COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID,
     IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, SCHEMA_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME,
-    TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX,
-    VIEWTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_SQL, VIEW_TAB_COLS,
+    TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME,
+    VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_SQL, VIEW_TAB_COLS,
 };
 
 /// A sink that records what a writer emitted, so the tests below read the
@@ -51,78 +51,17 @@ impl SysRowSink for Recorder {
     }
 }
 
-/// Every writer must emit exactly one value per payload column and close the
-/// row — an under-filled row desyncs a columnar builder and only surfaces
-/// later as an un-attributed length error.
-#[test]
-fn every_writer_fills_every_payload_column() {
-    let mut r = Recorder::default();
-    write_col_tab_row(
-        &mut r,
-        &ColTabRow {
-            owner_id: 16,
-            owner_kind: 0,
-            col_idx: 2,
-            name: "c",
-            type_code: 4,
-            is_nullable: true,
-            fk_table_id: 17,
-            fk_col_idx: 1,
-            is_serial: false,
-            is_hidden: true,
-        },
-        1,
-    )
-    .unwrap();
-    assert_eq!(r.vals.len(), COL_TAB_COLS.len() - 1);
-    assert!(r.closed);
-
-    let mut r = Recorder::default();
-    write_table_tab_row(
-        &mut r,
-        &TableTabRow {
-            table_id: 16,
-            schema_id: 3,
-            name: "t",
-            pk_col_idx: 0,
-            flags: 0,
-        },
-        1,
-    );
-    assert_eq!(r.vals.len(), TABLE_TAB_COLS.len() - 1);
-    assert!(r.closed);
-
-    let mut r = Recorder::default();
-    write_view_tab_row(
-        &mut r,
-        &ViewTabRow {
-            view_id: 20,
-            schema_id: 3,
-            name: "v",
-            sql_definition: "SELECT 1",
-            pk_col_idx: 0,
-            capacity_bytes: 0,
-            delta_bytes: 0,
-        },
-        1,
-    );
-    assert_eq!(r.vals.len(), VIEW_TAB_COLS.len() - 1);
-    assert!(r.closed);
-
-    let mut r = Recorder::default();
-    write_idx_tab_row(
-        &mut r,
-        &IdxTabRow {
-            index_id: 100,
-            owner_id: 16,
-            source_col_idx: 1,
-            name: "idx",
-            is_unique: 1,
-        },
-        1,
-    );
-    assert_eq!(r.vals.len(), IDX_TAB_COLS.len() - 1);
-    assert!(r.closed);
+impl Recorder {
+    /// The recorded payload slots, after the two halves every writer owes its
+    /// consumer: exactly one value per payload column of `cols` (a family with
+    /// `pk_cols` key columns), and a closed row. An under-filled row desyncs a
+    /// columnar builder and only surfaces later as an un-attributed length
+    /// error, so every family below reads its slots through here.
+    fn row(&self, cols: &[crate::WireSysCol], pk_cols: usize) -> &[Val] {
+        assert_eq!(self.vals.len(), cols.len() - pk_cols, "one value per payload column");
+        assert!(self.closed, "the writer must close the row");
+        &self.vals
+    }
 }
 
 /// Every `ColTabRow` field landed in its named payload slot. The expectation
@@ -132,16 +71,17 @@ fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
     write_col_tab_row(&mut rec, r, weight).unwrap();
     assert_eq!(rec.pk, pack_col_id(r.owner_id, r.col_idx).unwrap() as u128);
     assert_eq!(rec.weight, weight);
-    assert_eq!(rec.vals[COLTAB_PAY_OWNER_ID], Val::U64(r.owner_id));
-    assert_eq!(rec.vals[COLTAB_PAY_OWNER_KIND], Val::U64(r.owner_kind));
-    assert_eq!(rec.vals[COLTAB_PAY_COL_IDX], Val::U64(r.col_idx));
-    assert_eq!(rec.vals[COLTAB_PAY_NAME], Val::Str(r.name.into()));
-    assert_eq!(rec.vals[COLTAB_PAY_TYPE_CODE], Val::U64(r.type_code));
-    assert_eq!(rec.vals[COLTAB_PAY_IS_NULLABLE], Val::U64(r.is_nullable as u64));
-    assert_eq!(rec.vals[COLTAB_PAY_FK_TABLE_ID], Val::U64(r.fk_table_id));
-    assert_eq!(rec.vals[COLTAB_PAY_FK_COL_IDX], Val::U64(r.fk_col_idx));
-    assert_eq!(rec.vals[COLTAB_PAY_IS_SERIAL], Val::U64(r.is_serial as u64));
-    assert_eq!(rec.vals[COLTAB_PAY_IS_HIDDEN], Val::U64(r.is_hidden as u64));
+    let v = rec.row(COL_TAB_COLS, 1);
+    assert_eq!(v[COLTAB_PAY_OWNER_ID], Val::U64(r.owner_id));
+    assert_eq!(v[COLTAB_PAY_OWNER_KIND], Val::U64(r.owner_kind));
+    assert_eq!(v[COLTAB_PAY_COL_IDX], Val::U64(r.col_idx));
+    assert_eq!(v[COLTAB_PAY_NAME], Val::Str(r.name.into()));
+    assert_eq!(v[COLTAB_PAY_TYPE_CODE], Val::U64(r.type_code));
+    assert_eq!(v[COLTAB_PAY_IS_NULLABLE], Val::U64(r.is_nullable as u64));
+    assert_eq!(v[COLTAB_PAY_FK_TABLE_ID], Val::U64(r.fk_table_id));
+    assert_eq!(v[COLTAB_PAY_FK_COL_IDX], Val::U64(r.fk_col_idx));
+    assert_eq!(v[COLTAB_PAY_IS_SERIAL], Val::U64(r.is_serial as u64));
+    assert_eq!(v[COLTAB_PAY_IS_HIDDEN], Val::U64(r.is_hidden as u64));
 }
 
 /// Each value must land in the payload slot the readers look for it in.
@@ -188,10 +128,11 @@ fn values_land_in_their_named_payload_slots() {
         1,
     );
     assert_eq!(r.pk, 100);
-    assert_eq!(r.vals[IDXTAB_PAY_OWNER_ID], Val::U64(16));
-    assert_eq!(r.vals[IDXTAB_PAY_SOURCE_COLS], Val::U64(9));
-    assert_eq!(r.vals[IDXTAB_PAY_NAME], Val::Str("idx_t_b".into()));
-    assert_eq!(r.vals[IDXTAB_PAY_IS_UNIQUE], Val::U64(1));
+    let v = r.row(IDX_TAB_COLS, 1);
+    assert_eq!(v[IDXTAB_PAY_OWNER_ID], Val::U64(16));
+    assert_eq!(v[IDXTAB_PAY_SOURCE_COLS], Val::U64(9));
+    assert_eq!(v[IDXTAB_PAY_NAME], Val::Str("idx_t_b".into()));
+    assert_eq!(v[IDXTAB_PAY_IS_UNIQUE], Val::U64(1));
 
     // Distinct values per field, so a transposed pair in the writer body
     // fails here rather than round-tripping unnoticed.
@@ -208,10 +149,11 @@ fn values_land_in_their_named_payload_slots() {
         1,
     );
     assert_eq!(r.pk, 16);
-    assert_eq!(r.vals[TABTAB_PAY_SCHEMA_ID], Val::U64(3));
-    assert_eq!(r.vals[TABTAB_PAY_NAME], Val::Str("t".into()));
-    assert_eq!(r.vals[TABTAB_PAY_PK_COL_IDX], Val::U64(5));
-    assert_eq!(r.vals[TABTAB_PAY_FLAGS], Val::U64(9));
+    let v = r.row(TABLE_TAB_COLS, 1);
+    assert_eq!(v[TABTAB_PAY_SCHEMA_ID], Val::U64(3));
+    assert_eq!(v[TABTAB_PAY_NAME], Val::Str("t".into()));
+    assert_eq!(v[TABTAB_PAY_PK_COL_IDX], Val::U64(5));
+    assert_eq!(v[TABTAB_PAY_FLAGS], Val::U64(9));
 
     let mut r = Recorder::default();
     write_view_tab_row(
@@ -228,11 +170,13 @@ fn values_land_in_their_named_payload_slots() {
         1,
     );
     assert_eq!(r.pk, 20);
-    assert_eq!(r.vals[VIEWTAB_PAY_SCHEMA_ID], Val::U64(4));
-    assert_eq!(r.vals[VIEWTAB_PAY_NAME], Val::Str("v".into()));
-    assert_eq!(r.vals[VIEWTAB_PAY_SQL], Val::Str("SELECT 1".into()));
-    assert_eq!(r.vals[VIEWTAB_PAY_PK_COL_IDX], Val::U64(6));
-    assert_eq!(r.vals[VIEWTAB_PAY_CAPACITY], Val::U64(4096));
+    let v = r.row(VIEW_TAB_COLS, 1);
+    assert_eq!(v[VIEWTAB_PAY_SCHEMA_ID], Val::U64(4));
+    assert_eq!(v[VIEWTAB_PAY_NAME], Val::Str("v".into()));
+    assert_eq!(v[VIEWTAB_PAY_SQL], Val::Str("SELECT 1".into()));
+    assert_eq!(v[VIEWTAB_PAY_PK_COL_IDX], Val::U64(6));
+    assert_eq!(v[VIEWTAB_PAY_CAPACITY], Val::U64(4096));
+    assert_eq!(v[VIEWTAB_PAY_DELTA], Val::U64(1 << 20));
 
     let mut r = Recorder::default();
     write_schema_tab_row(
@@ -244,9 +188,7 @@ fn values_land_in_their_named_payload_slots() {
         1,
     );
     assert_eq!(r.pk, 3);
-    assert_eq!(r.vals.len(), SCHEMA_TAB_COLS.len() - 1);
-    assert_eq!(r.vals[0], Val::Str("public".into()));
-    assert!(r.closed);
+    assert_eq!(r.row(SCHEMA_TAB_COLS, 1)[0], Val::Str("public".into()));
 
     // The circuit families. `view_id` must occupy the LOW u128 half of the
     // compound key: the PK region OPK-encodes each column independently, low
@@ -266,15 +208,11 @@ fn values_land_in_their_named_payload_slots() {
     )
     .unwrap();
     assert_eq!(r.pk, 7 | (5u128 << 64));
-    assert_eq!(
-        r.vals.len(),
-        CIRCUIT_NODES_COLS.len() - 2,
-        "compound PK: two key columns"
-    );
-    assert_eq!(r.vals[CIRCNODES_PAY_NODE_ID], Val::U64(5));
-    assert_eq!(r.vals[CIRCNODES_PAY_OPCODE], Val::U64(9));
-    assert_eq!(r.vals[CIRCNODES_PAY_SOURCE_TABLE], Val::U64(31));
-    assert_eq!(r.vals[CIRCNODES_PAY_EXPR_PROGRAM], Val::Bytes(vec![0xAB, 0xCD]));
+    let v = r.row(CIRCUIT_NODES_COLS, 2); // compound PK: two key columns
+    assert_eq!(v[CIRCNODES_PAY_NODE_ID], Val::U64(5));
+    assert_eq!(v[CIRCNODES_PAY_OPCODE], Val::U64(9));
+    assert_eq!(v[CIRCNODES_PAY_SOURCE_TABLE], Val::U64(31));
+    assert_eq!(v[CIRCNODES_PAY_EXPR_PROGRAM], Val::Bytes(vec![0xAB, 0xCD]));
 
     // The two nullable columns still take their slots when absent, so an
     // omitted `put_null` would shift every later value.
@@ -291,8 +229,9 @@ fn values_land_in_their_named_payload_slots() {
         1,
     )
     .unwrap();
-    assert_eq!(r.vals[CIRCNODES_PAY_SOURCE_TABLE], Val::Null);
-    assert_eq!(r.vals[CIRCNODES_PAY_EXPR_PROGRAM], Val::Null);
+    let v = r.row(CIRCUIT_NODES_COLS, 2);
+    assert_eq!(v[CIRCNODES_PAY_SOURCE_TABLE], Val::Null);
+    assert_eq!(v[CIRCNODES_PAY_EXPR_PROGRAM], Val::Null);
 
     let mut r = Recorder::default();
     write_circuit_edge_row(
@@ -307,10 +246,10 @@ fn values_land_in_their_named_payload_slots() {
     )
     .unwrap();
     assert_eq!(r.pk, 7 | (((5u128 << 8) | 1) << 64));
-    assert_eq!(r.vals.len(), CIRCUIT_EDGES_COLS.len() - 2);
-    assert_eq!(r.vals[CIRCEDGES_PAY_DST_NODE], Val::U64(5));
-    assert_eq!(r.vals[CIRCEDGES_PAY_DST_PORT], Val::U64(1));
-    assert_eq!(r.vals[CIRCEDGES_PAY_SRC_NODE], Val::U64(4));
+    let v = r.row(CIRCUIT_EDGES_COLS, 2);
+    assert_eq!(v[CIRCEDGES_PAY_DST_NODE], Val::U64(5));
+    assert_eq!(v[CIRCEDGES_PAY_DST_PORT], Val::U64(1));
+    assert_eq!(v[CIRCEDGES_PAY_SRC_NODE], Val::U64(4));
 
     let mut r = Recorder::default();
     write_circuit_node_column_row(
@@ -327,12 +266,12 @@ fn values_land_in_their_named_payload_slots() {
     )
     .unwrap();
     assert_eq!(r.pk, 7 | (((5u128 << 24) | (3u128 << 16) | 2u128) << 64));
-    assert_eq!(r.vals.len(), CIRCUIT_NODE_COLUMNS_COLS.len() - 2);
-    assert_eq!(r.vals[CIRCNCOL_PAY_NODE_ID], Val::U64(5));
-    assert_eq!(r.vals[CIRCNCOL_PAY_KIND], Val::U64(3));
-    assert_eq!(r.vals[CIRCNCOL_PAY_POSITION], Val::U64(2));
-    assert_eq!(r.vals[CIRCNCOL_PAY_VALUE1], Val::U64(11));
-    assert_eq!(r.vals[CIRCNCOL_PAY_VALUE2], Val::U64(12));
+    let v = r.row(CIRCUIT_NODE_COLUMNS_COLS, 2);
+    assert_eq!(v[CIRCNCOL_PAY_NODE_ID], Val::U64(5));
+    assert_eq!(v[CIRCNCOL_PAY_KIND], Val::U64(3));
+    assert_eq!(v[CIRCNCOL_PAY_POSITION], Val::U64(2));
+    assert_eq!(v[CIRCNCOL_PAY_VALUE1], Val::U64(11));
+    assert_eq!(v[CIRCNCOL_PAY_VALUE2], Val::U64(12));
 }
 
 /// A `sub` field that overflows its bit range would alias another row's
@@ -355,8 +294,8 @@ fn a_circuit_sub_field_that_would_alias_another_record_is_rejected() {
     assert!(r.vals.is_empty(), "a rejected row must emit nothing");
 }
 
-/// A column index past the packed key's 9-bit field would alias another
-/// column's record, so the writer refuses it rather than emitting the row.
+/// A column index past the packed key's own field would alias another column's
+/// record, so the writer refuses it rather than emitting the row.
 #[test]
 fn a_col_idx_that_would_alias_another_record_is_rejected() {
     let mut r = Recorder::default();
@@ -365,7 +304,7 @@ fn a_col_idx_that_would_alias_another_record_is_rejected() {
         &ColTabRow {
             owner_id: 16,
             owner_kind: 0,
-            col_idx: 1 << 20,
+            col_idx: 1 << crate::COL_ID_IDX_BITS,
             name: "c",
             type_code: 4,
             is_nullable: false,

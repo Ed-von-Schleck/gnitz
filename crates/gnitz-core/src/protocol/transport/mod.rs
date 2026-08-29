@@ -741,12 +741,6 @@ pub fn hello_handshake(t: &mut ClientTransport) -> Result<u64, ProtocolError> {
         if ack.magic != gnitz_wire::HELLO_MAGIC {
             return Err(ProtocolError::DecodeError("HELLO ACK magic mismatch".into()));
         }
-        if ack.status != gnitz_wire::HELLO_STATUS_OK {
-            return Err(ProtocolError::DecodeError(format!(
-                "HELLO ACK reported status={}",
-                ack.status,
-            )));
-        }
         t.mark_established(ack.limit_bytes as usize);
         return Ok(ack.published_lsn);
     }

@@ -199,7 +199,7 @@ const CTRL_BLOCK_TEMPLATE: [u8; CTRL_BLOCK_SIZE_NO_BLOB] = {
 /// corresponding null bits, and append the blob spill.
 ///
 /// `checksum` stamps the header's checksum field over the encoded body, as
-/// `wal::encode` and `schema_block::encode_into` do for the blocks beside this
+/// `wal::encode` and `schema_block::encode` do for the blocks beside this
 /// one: `true` for what [`peek_control_block`] reads back, `false` for
 /// [`peek_control_block_ipc`].
 #[inline]
@@ -214,13 +214,13 @@ pub fn encode_ctrl_block(
     let total = ctrl_block_size(error_msg.len(), seek_pk_extra.len());
     let buf = &mut out[offset..offset + total];
     buf[..CTRL_BLOCK_SIZE_NO_BLOB].copy_from_slice(&CTRL_BLOCK_TEMPLATE);
-    buf[OFF_STATUS..OFF_STATUS + 8].copy_from_slice(&(hdr.status as u64).to_le_bytes());
-    buf[OFF_CLIENT_ID..OFF_CLIENT_ID + 8].copy_from_slice(&hdr.client_id.to_le_bytes());
-    buf[OFF_TARGET_ID..OFF_TARGET_ID + 8].copy_from_slice(&hdr.target_id.to_le_bytes());
-    buf[OFF_FLAGS..OFF_FLAGS + 8].copy_from_slice(&hdr.flags.to_le_bytes());
-    buf[OFF_SEEK_PK..OFF_SEEK_PK + 16].copy_from_slice(&hdr.seek_pk.to_le_bytes());
-    buf[OFF_SEEK_COL_IDX..OFF_SEEK_COL_IDX + 8].copy_from_slice(&hdr.seek_col_idx.to_le_bytes());
-    buf[OFF_REQUEST_ID..OFF_REQUEST_ID + 8].copy_from_slice(&hdr.request_id.to_le_bytes());
+    crate::write_u64_le(buf, OFF_STATUS, hdr.status as u64);
+    crate::write_u64_le(buf, OFF_CLIENT_ID, hdr.client_id);
+    crate::write_u64_le(buf, OFF_TARGET_ID, hdr.target_id);
+    crate::write_u64_le(buf, OFF_FLAGS, hdr.flags);
+    crate::write_u128_le(buf, OFF_SEEK_PK, hdr.seek_pk);
+    crate::write_u64_le(buf, OFF_SEEK_COL_IDX, hdr.seek_col_idx);
+    crate::write_u64_le(buf, OFF_REQUEST_ID, hdr.request_id);
 
     if error_msg.is_empty() && seek_pk_extra.is_empty() {
         if checksum {
@@ -249,7 +249,7 @@ pub fn encode_ctrl_block(
         null_word &= !NULL_BIT_SEEK_PK_EXTRA;
         write_cell(buf, OFF_SEEK_PK_EXTRA, seek_pk_extra);
     }
-    buf[OFF_NULL_BMP..OFF_NULL_BMP + 8].copy_from_slice(&null_word.to_le_bytes());
+    crate::write_u64_le(buf, OFF_NULL_BMP, null_word);
     crate::write_u32_le(buf, crate::wal::dir_entry_offset(REG_BLOB) + 4, heap as u32);
     crate::write_u32_le(buf, WAL_OFF_SIZE, total as u32);
     if checksum {
@@ -375,7 +375,7 @@ fn peek_control_block_impl(data: &[u8], verify_checksum: bool) -> Result<Decoded
     let client_id = read_u64_le(data, OFF_CLIENT_ID);
     let target_id = read_u64_le(data, OFF_TARGET_ID);
     let flags = read_u64_le(data, OFF_FLAGS);
-    let seek_pk = u128::from_le_bytes(data[OFF_SEEK_PK..OFF_SEEK_PK + 16].try_into().unwrap());
+    let seek_pk = crate::read_u128_le(data, OFF_SEEK_PK);
     let seek_col_idx = read_u64_le(data, OFF_SEEK_COL_IDX);
     let request_id = read_u64_le(data, OFF_REQUEST_ID);
 

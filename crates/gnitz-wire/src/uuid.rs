@@ -20,7 +20,8 @@ pub fn format_uuid(v: u128) -> String {
 
 /// Parse a UUID string: the canonical 36-char hyphenated form (hyphens at
 /// positions 8/13/18/23, all other chars hex) or exactly 32 plain hex digits.
-/// Surrounding ASCII whitespace is trimmed. Returns `None` for anything else
+/// Surrounding whitespace is trimmed (`str::trim`, so Unicode whitespace
+/// counts). Returns `None` for anything else
 /// — arbitrary hyphen placement and short hex are rejected.
 pub fn parse_uuid(s: &str) -> Option<u128> {
     let s = s.trim();

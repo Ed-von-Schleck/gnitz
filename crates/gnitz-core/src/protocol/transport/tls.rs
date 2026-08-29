@@ -618,11 +618,7 @@ mod tests {
                     let hello = read_frame(&mut end);
                     assert_eq!(hello.len(), gnitz_wire::HELLO_PAYLOAD_LEN as usize);
                     // `encode_hello_ack` frames the ACK itself.
-                    let ack = gnitz_wire::encode_hello_ack(
-                        gnitz_wire::HELLO_STATUS_OK,
-                        gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32,
-                        0,
-                    );
+                    let ack = gnitz_wire::encode_hello_ack(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32, 0);
                     end.write_all(&ack).unwrap();
                     end.flush().unwrap();
                 }

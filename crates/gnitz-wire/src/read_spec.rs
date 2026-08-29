@@ -204,14 +204,21 @@ pub fn pack_scan_spec_extra(spec: &[u8], reply_block: &[u8]) -> Vec<u8> {
     w.into_vec()
 }
 
+/// The bytes of one encoded [`ReadSpec`], distinct from the packed
+/// `seek_pk_extra` blob it travels inside — which at `spec.len() == 0x0103`
+/// opens with a length prefix that spells a valid `(VERSION, BOUND_PK_RANGE)`
+/// header. Both are `&[u8]`; only this one may be peeked.
+#[derive(Clone, Copy, Debug)]
+pub struct SpecBytes<'a>(pub &'a [u8]);
+
 /// Split a ScanSpec `seek_pk_extra` blob back into `(spec_bytes, reply_block)`
 /// at the trust boundary — rejecting a truncated / trailing-byte frame.
-pub fn unpack_scan_spec_extra(extra: &[u8]) -> Result<(&[u8], &[u8]), String> {
+pub fn unpack_scan_spec_extra(extra: &[u8]) -> Result<(SpecBytes<'_>, &[u8]), String> {
     let mut r = Reader::new(extra, "scan_spec extra");
     let spec = r.bytes32()?;
     let block = r.bytes32()?;
     r.expect_consumed()?;
-    Ok((spec, block))
+    Ok((SpecBytes(spec), block))
 }
 
 /// The `PkRange` descriptor of an encoded `ReadSpec`, or `None` for every other
@@ -222,21 +229,20 @@ pub fn unpack_scan_spec_extra(extra: &[u8]) -> Result<(&[u8], &[u8]), String> {
 /// projection / PkSet sections, so a `PkSet` spec at the key cap costs one byte
 /// compare rather than a megabyte-scale parse. [`ReadSpec::decode`] remains the
 /// worker's full validating parse.
-pub fn peek_pk_range(buf: &[u8]) -> Option<RangeDescriptor> {
-    read_range_descriptor(&mut peek_bound(buf, BOUND_PK_RANGE)?).ok()
+pub fn peek_pk_range(spec: SpecBytes<'_>) -> Option<RangeDescriptor> {
+    read_range_descriptor(&mut peek_bound(spec, BOUND_PK_RANGE)?).ok()
 }
 
 /// A reader positioned just past the fixed header of an encoded `ReadSpec`, if
 /// that spec carries a `kind` bound. `None` for every other bound kind, an
 /// unknown version, or a truncated prefix.
 ///
-/// Both peeks read the header through here rather than each spelling it out.
-/// They are the master's routing and gating inputs and their failure mode is
-/// silent — a header that grew a field would make one of two hand-written parses
-/// return `None`, which routes every read as a broadcast and gates no poll, with
-/// no error anywhere.
-fn peek_bound<'a>(buf: &'a [u8], kind: u8) -> Option<Reader<'a>> {
-    let mut r = Reader::new(buf, "read_spec");
+/// Both peeks read the header through here rather than each spelling it out:
+/// they are the master's routing and gating inputs, and a header that grew a
+/// field would make a second hand-written parse return `None` silently —
+/// broadcasting every read and gating no poll, with no error anywhere.
+fn peek_bound(spec: SpecBytes<'_>, kind: u8) -> Option<Reader<'_>> {
+    let mut r = Reader::new(spec.0, "read_spec");
     if r.u8().ok()? != VERSION || r.u8().ok()? != kind {
         return None;
     }
@@ -252,8 +258,8 @@ fn peek_bound<'a>(buf: &'a [u8], kind: u8) -> Option<Reader<'a>> {
 /// dispatch classification, the routing and the idle-poll gate, so the bound is
 /// decoded once rather than three times. [`ReadSpec::decode`] remains the
 /// worker's full validating parse and the sole trust boundary.
-pub fn peek_delta_bound(buf: &[u8]) -> Option<u64> {
-    peek_bound(buf, BOUND_DELTA)?.u64().ok()
+pub fn peek_delta_bound(spec: SpecBytes<'_>) -> Option<u64> {
+    peek_bound(spec, BOUND_DELTA)?.u64().ok()
 }
 
 /// Read an embedded `RangeDescriptor`: peek its `n_eq` to learn its span, slice

@@ -88,8 +88,8 @@ pub(crate) const fn payload_region_in(cols: &[WireSysCol], name: &str) -> usize 
 }
 
 // Every system table's column shape is defined once, here, and reached through
-// `SYS_FAMILIES` / `sys_family(id)`, which pairs each shape with the key that
-// goes with it: the engine builds its `SchemaDescriptor`s and the COL_TAB
+// `SYS_FAMILIES` (by `sys_family_index(id)`), which pairs each shape with the
+// key that goes with it: the engine builds its `SchemaDescriptor`s and the COL_TAB
 // self-description rows from a family, the client builds its `Schema`s. The two
 // must agree on both halves, and a disagreement on the key is a `pk_stride`
 // mismatch the wire decode rejects — so neither half is offered separately for a
@@ -266,12 +266,6 @@ pub const COLTAB_COL_OWNER_ID: usize = col_index_in(COL_TAB_COLS, "owner_id");
 pub const COLTAB_COL_OWNER_KIND: usize = col_index_in(COL_TAB_COLS, "owner_kind");
 pub const COLTAB_COL_COL_IDX: usize = col_index_in(COL_TAB_COLS, "col_idx");
 pub const COLTAB_COL_NAME: usize = col_index_in(COL_TAB_COLS, "name");
-pub const COLTAB_COL_TYPE_CODE: usize = col_index_in(COL_TAB_COLS, "type_code");
-pub const COLTAB_COL_IS_NULLABLE: usize = col_index_in(COL_TAB_COLS, "is_nullable");
-pub const COLTAB_COL_FK_TABLE_ID: usize = col_index_in(COL_TAB_COLS, "fk_table_id");
-pub const COLTAB_COL_FK_COL_IDX: usize = col_index_in(COL_TAB_COLS, "fk_col_idx");
-pub const COLTAB_COL_IS_SERIAL: usize = col_index_in(COL_TAB_COLS, "is_serial");
-pub const COLTAB_COL_IS_HIDDEN: usize = col_index_in(COL_TAB_COLS, "is_hidden");
 pub const COLTAB_PAY_OWNER_ID: usize = pay_index_in(COL_TAB_COLS, "owner_id");
 pub const COLTAB_PAY_OWNER_KIND: usize = pay_index_in(COL_TAB_COLS, "owner_kind");
 pub const COLTAB_PAY_COL_IDX: usize = pay_index_in(COL_TAB_COLS, "col_idx");
@@ -445,14 +439,6 @@ pub const fn sys_family_index(id: u64) -> Option<usize> {
         i += 1;
     }
     None
-}
-
-/// The [`WireSysFamily`] with table id `id`, or `None` for a non-family id.
-pub const fn sys_family(id: u64) -> Option<&'static WireSysFamily> {
-    match sys_family_index(id) {
-        Some(i) => Some(&SYS_FAMILIES[i]),
-        None => None,
-    }
 }
 
 pub const FIRST_USER_TABLE_ID: u64 = 16;

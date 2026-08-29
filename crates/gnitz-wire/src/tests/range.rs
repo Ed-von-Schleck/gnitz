@@ -13,14 +13,16 @@ fn roundtrips_every_shape() {
     for (eq, start, end) in shapes {
         let d = RangeDescriptor::new(eq, start, end);
         let bytes = d.encode();
+        assert_eq!(
+            bytes.len(),
+            RangeDescriptor::encoded_len(eq.len()),
+            "encode must write exactly what encoded_len promises"
+        );
         assert_eq!(RangeDescriptor::decode(&bytes), Ok(d), "{eq:?} {start:?} {end:?}");
     }
-}
-
-#[test]
-fn max_arity_encodes_to_82_bytes() {
-    let d = RangeDescriptor::new(&[1, 2, 3], After(10), Before(50));
-    assert_eq!(d.encode().len(), 82);
+    // The one literal the module's own doc reasons about, against the 64-byte
+    // `PkTuple` cap the descriptor rides a control-block blob to clear.
+    assert_eq!(RangeDescriptor::encoded_len(PK_LIST_MAX_COLS - 1), 82);
 }
 
 #[test]
@@ -42,4 +44,28 @@ fn decode_rejects_malformed() {
     let mut long = good.clone();
     long.push(0);
     assert!(RangeDescriptor::decode(&long).is_err());
+}
+
+/// `Cut::type_edges` answers "what does an unconstrained side of a range on this
+/// column widen to?", and is the module's whole type dispatch. The edges must be
+/// the type's own representable ends — a narrower pair would clip real index
+/// entries out of an unbounded scan. `U128` carries edges while `UUID` does not,
+/// though both are 16-byte unsigned: a UUID has no ordered arithmetic a planner
+/// could saturate a literal against.
+#[test]
+fn type_edges_are_the_representable_ends_of_an_orderable_column() {
+    for tc in TypeCode::ALL {
+        let edges = Cut::type_edges(tc);
+        let Some(fi) = FixedInt::from_type_code(tc) else {
+            let want = matches!(tc, TypeCode::U128).then_some((Before(0), After(u128::MAX)));
+            assert_eq!(edges, want, "{tc:?}");
+            continue;
+        };
+        let (min, max) = fi.range();
+        assert_eq!(
+            edges,
+            Some((Before(fi.pack(min)), After(fi.pack(max)))),
+            "{tc:?} must widen to its own representable ends"
+        );
+    }
 }

@@ -1467,7 +1467,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         if batch.count == 0 {
             return Err(format!("TXN: empty batch for table {tid}"));
         }
-        let mode = gnitz_wire::WireConflictMode::from_u8(fam.mode)
+        let mode = gnitz_wire::WireConflictMode::from_wire(fam.mode)
             .ok_or_else(|| format!("TXN family {tid}: unknown conflict mode {}", fam.mode))?;
         families.push(TxnFamily { tid, mode, batch });
     }
@@ -2131,7 +2131,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
     // names no PK range and so confines nothing.
     let spec = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra)
         .map(|(spec, _block)| spec)
-        .unwrap_or(&[]);
+        .unwrap_or(gnitz_wire::SpecBytes(&[]));
     let delta_cursor = gnitz_wire::peek_delta_bound(spec);
     let freshness = match delta_cursor {
         Some(_) => ReadFreshness::AsOfLastTick,

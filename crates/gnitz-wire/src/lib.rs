@@ -25,12 +25,12 @@ compile_error!("GnitzDB requires a little-endian target; the wire format is LE-o
 ///
 /// `ALL`, `as_wire` and `from_wire` are all generated from the one variant list,
 /// so a decode table cannot disagree with the discriminants it mirrors and a new
-/// variant is covered without a second edit. Hand-written `from_wire` tables
-/// needed a round-trip test to catch that drift; here it cannot happen.
+/// variant is covered without a second edit.
 ///
-/// `TypeCode` is deliberately not declared through this macro: it carries extra
-/// per-variant data (`wire_name`) and its 15-arm `try_from_u8` is a jump table
-/// on a hot path, which a linear `ALL` scan would replace with a walk.
+/// `TypeCode` stays hand-written: it carries extra per-variant data
+/// (`wire_name`), and its `ALL` is a fixed-size array — the shape `gnitz-py`
+/// builds its `TypeCode` IntEnum from — where this macro emits a slice. Moving
+/// it would rewrite call sites in three other crates to buy nothing.
 macro_rules! wire_enum {
     (
         $(#[$meta:meta])*
@@ -161,6 +161,11 @@ pub(crate) fn read_u16_le(buf: &[u8], off: usize) -> u16 {
 }
 
 #[inline]
+pub(crate) fn write_u16_le(buf: &mut [u8], off: usize, val: u16) {
+    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
+}
+
+#[inline]
 pub fn read_u32_le(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }
@@ -168,6 +173,11 @@ pub fn read_u32_le(buf: &[u8], off: usize) -> u32 {
 #[inline(always)]
 pub fn read_u64_le(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+#[inline]
+pub(crate) fn read_u128_le(buf: &[u8], off: usize) -> u128 {
+    u128::from_le_bytes(buf[off..off + 16].try_into().unwrap())
 }
 
 #[inline]
@@ -279,9 +289,9 @@ pub fn merge_null_words(left: u64, right: u64, left_npc: usize) -> u64 {
     }
 }
 
-// `write_u32_le` has only in-crate callers (the WAL framer and the control-block
-// encoder), so it stays crate-internal rather than widening the public surface
-// with a dead export.
+// `write_u32_le` has only in-crate callers (the WAL framer, the control-block
+// encoder, the handshake), so it stays crate-internal rather than widening the
+// public surface with a dead export.
 #[inline]
 pub(crate) fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
@@ -290,6 +300,11 @@ pub(crate) fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
 #[inline(always)]
 pub fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
     buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
+}
+
+#[inline]
+pub(crate) fn write_u128_le(buf: &mut [u8], off: usize, val: u128) {
+    buf[off..off + 16].copy_from_slice(&val.to_le_bytes());
 }
 
 #[cfg(test)]

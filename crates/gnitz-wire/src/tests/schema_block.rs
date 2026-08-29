@@ -46,7 +46,7 @@ fn roundtrips_shape_names_and_pk_order() {
 #[test]
 fn rejects_a_directory_that_overflows_the_buffer() {
     let mut block = simple();
-    block[crate::WAL_OFF_NUM_REGIONS..crate::WAL_OFF_NUM_REGIONS + 4].copy_from_slice(&100_000u32.to_le_bytes());
+    crate::write_u32_le(&mut block, crate::WAL_OFF_NUM_REGIONS, 100_000);
     assert_eq!(
         decode_err(&block, MAX_PK_COLUMNS),
         "schema block directory overflows buffer"
@@ -62,23 +62,6 @@ fn encoded_len_matches_what_encode_writes() {
     assert_eq!(encode(1, &cols).len(), encoded_len(&cols));
 }
 
-/// A type_code word whose low byte names a valid type but whose high bits
-/// are set. Truncating to `u8` accepts it; the peer's `u8`-typed decode
-/// rejects it — so the two ends would disagree on which blocks are legal.
-#[test]
-fn rejects_a_type_code_that_only_fits_after_truncation() {
-    let mut block = simple();
-    let mut offs = [0u64; wal::MAX_WIRE_REGIONS];
-    let mut sizes = [0u32; wal::MAX_WIRE_REGIONS];
-    wal::validate_and_parse(&block, &mut offs, &mut sizes, false).unwrap();
-    let tc_off = offs[REG_TYPE_CODE] as usize;
-    // Low byte 2 is a valid type code; the top 32 bits are not part of it.
-    write_u64_le(&mut block, tc_off, 0x0000_0001_0000_0002);
-    let n = block.len();
-    wal::stamp_checksum(&mut block, n);
-    assert_eq!(decode_err(&block, MAX_PK_COLUMNS), "schema: invalid type code");
-}
-
 /// A block with fewer regions than the meta-schema shape. Every region this
 /// decoder reads still fits, so a lower-bound check would accept it.
 #[test]
@@ -87,8 +70,6 @@ fn rejects_a_block_with_the_wrong_region_count() {
     let n = 5u32; // pk, weight, null, type_code, flags — no name, no blob
     let mut short = block.clone();
     crate::write_u32_le(&mut short, crate::WAL_OFF_NUM_REGIONS, n);
-    let n = short.len();
-    wal::stamp_checksum(&mut short, n);
     assert_eq!(decode_err(&short, MAX_PK_COLUMNS), "schema block region count mismatch");
 }
 
@@ -96,7 +77,7 @@ fn rejects_a_block_with_the_wrong_region_count() {
 /// engine (5) and not to the client (4).
 #[test]
 fn pk_arity_is_bounded_by_the_caller_not_a_shared_cap() {
-    let cols: Vec<SchemaBlockCol> = (0..5)
+    let cols: Vec<SchemaBlockCol> = (0..MAX_PK_COLUMNS)
         .map(|i| SchemaBlockCol {
             type_code: TypeCode::U64 as u8,
             flags: pack_col_meta_flags(false, false, false, Some(i as u8)),
@@ -109,43 +90,9 @@ fn pk_arity_is_bounded_by_the_caller_not_a_shared_cap() {
             .unwrap()
             .pk_indices()
             .len(),
-        5
+        MAX_PK_COLUMNS
     );
     assert_eq!(decode_err(&block, PK_LIST_MAX_COLS), "too many PK columns");
-}
-
-/// The block asserts no column field is null; a set bit would mean the
-/// type, flags or name of that column is absent from the cells the decoder
-/// nonetheless reads.
-#[test]
-fn rejects_a_row_claiming_a_null_column_field() {
-    let mut block = simple();
-    let mut offs = [0u64; wal::MAX_WIRE_REGIONS];
-    let mut sizes = [0u32; wal::MAX_WIRE_REGIONS];
-    wal::validate_and_parse(&block, &mut offs, &mut sizes, false).unwrap();
-    write_u64_le(&mut block, offs[REG_NULL_BMP] as usize, 1);
-    let n = block.len();
-    wal::stamp_checksum(&mut block, n);
-    assert_eq!(
-        decode_err(&block, MAX_PK_COLUMNS),
-        "schema block declares a null column field"
-    );
-}
-
-#[test]
-fn rejects_out_of_order_col_idx() {
-    let mut block = simple();
-    let mut offs = [0u64; wal::MAX_WIRE_REGIONS];
-    let mut sizes = [0u32; wal::MAX_WIRE_REGIONS];
-    wal::validate_and_parse(&block, &mut offs, &mut sizes, false).unwrap();
-    let pk_off = offs[REG_PK] as usize;
-    block[pk_off..pk_off + 8].copy_from_slice(&5u64.to_be_bytes());
-    let n = block.len();
-    wal::stamp_checksum(&mut block, n);
-    assert_eq!(
-        decode_err(&block, MAX_PK_COLUMNS),
-        "schema col_idx not in monotonic order"
-    );
 }
 
 #[test]
@@ -168,19 +115,53 @@ fn rejects_a_block_with_no_pk_column() {
     assert_eq!(decode_err(&encode(1, &cols), MAX_PK_COLUMNS), "no PK column");
 }
 
-#[test]
-fn rejects_a_name_cell_pointing_past_the_blob_heap() {
+/// One forgery: a mutation of a parsed block, given its region offsets.
+type Forge = fn(&mut [u8], &[u64]);
+
+/// [`simple`] with `mutate` applied against its parsed region offsets, then
+/// re-checksummed — every forgery in the table below lands inside the body
+/// `stamp_checksum` covers, so an un-stamped block would be rejected for its
+/// checksum instead of for the guard under test.
+fn forged(mutate: Forge) -> Vec<u8> {
     let mut block = simple();
     let mut offs = [0u64; wal::MAX_WIRE_REGIONS];
     let mut sizes = [0u32; wal::MAX_WIRE_REGIONS];
     wal::validate_and_parse(&block, &mut offs, &mut sizes, false).unwrap();
-    // Row 1's name is the long one; push its heap offset past the heap.
-    let cell = offs[REG_NAME] as usize + 16;
-    write_u64_le(&mut block, cell + 8, 1 << 20);
+    mutate(&mut block, &offs);
     let n = block.len();
     wal::stamp_checksum(&mut block, n);
-    assert_eq!(
-        decode_err(&block, MAX_PK_COLUMNS),
-        "schema name blob arena out of bounds"
-    );
+    block
+}
+
+/// Every guard that reads the checksummed body, against the forgery that trips
+/// it. The message is what separates them: a merged table asserting only "an
+/// error" would pass on the wrong guard.
+#[test]
+fn each_schema_guard_rejects_its_own_forgery() {
+    let cases: [(&str, Forge); 4] = [
+        // A type_code word whose low byte names a valid type but whose high
+        // bits are set. Truncating to `u8` accepts it; the peer's `u8`-typed
+        // decode rejects it — so the two ends would disagree on which blocks
+        // are legal.
+        ("schema: invalid type code", |b, offs| {
+            write_u64_le(b, offs[REG_TYPE_CODE] as usize, 0x0000_0001_0000_0002)
+        }),
+        // The block asserts no column field is null; a set bit would mean the
+        // type, flags or name of that column is absent from the cells the
+        // decoder nonetheless reads.
+        ("schema block declares a null column field", |b, offs| {
+            write_u64_le(b, offs[REG_NULL_BMP] as usize, 1)
+        }),
+        ("schema col_idx not in monotonic order", |b, offs| {
+            let pk_off = offs[REG_PK] as usize;
+            b[pk_off..pk_off + 8].copy_from_slice(&5u64.to_be_bytes());
+        }),
+        // Row 1's name is the long one; push its heap offset past the heap.
+        ("schema name blob arena out of bounds", |b, offs| {
+            write_u64_le(b, offs[REG_NAME] as usize + 16 + 8, 1 << 20)
+        }),
+    ];
+    for (want, forge) in cases {
+        assert_eq!(decode_err(&forged(forge), MAX_PK_COLUMNS), want);
+    }
 }

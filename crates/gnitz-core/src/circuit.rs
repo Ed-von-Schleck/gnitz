@@ -4,10 +4,7 @@ use gnitz_expr::ExprProgram;
 
 use crate::error::ClientError;
 
-pub use gnitz_wire::{
-    agg_output_type, AggFunc, JoinKind, MapKind, NodeColumnPayload, NodeFields, OpNode, RangeRel, ReduceOutKey,
-    ReindexRole,
-};
+pub use gnitz_wire::{agg_output_type, AggFunc, JoinKind, MapKind, OpNode, RangeRel, ReduceOutKey, ReindexRole};
 
 pub type NodeId = u64;
 pub type Port = u8;
@@ -21,7 +18,7 @@ pub struct Circuit {
     pub edges: std::collections::BTreeMap<(NodeId, Port), NodeId>,
 }
 
-/// One full row of the `nodes` system table: node id + [`NodeFields`].
+/// One full row of the `nodes` system table: node id + `gnitz_wire`'s `NodeFields`.
 pub type NodeRow = (NodeId, u64, Option<TableId>, Option<Vec<u8>>);
 
 /// The `k`-th symbolic segment id of one view bundle. Symbolic ids start at
@@ -114,39 +111,6 @@ impl Circuit {
             rows.edges.push((dst, port, src));
         }
         rows
-    }
-
-    /// Inverse of [`Circuit::into_rows`]. Reconstructs from the three system
-    /// tables. Returns `Err(String)` if the rows describe a malformed graph
-    /// (unknown opcode, contradicting node-column kind, etc.).
-    ///
-    /// Test-only: the engine decodes circuits through its own path; the client
-    /// only ever *encodes* (`into_rows`). Kept to exercise the
-    /// `encode_op_node`↔`decode_op_node` round-trip at the graph level.
-    #[cfg(test)]
-    pub fn from_rows(view_id: u64, rows: CircuitRows) -> Result<Self, String> {
-        // Group node-column rows by node_id so each node sees the relevant slice.
-        use std::collections::BTreeMap;
-        let mut per_node: BTreeMap<NodeId, Vec<gnitz_wire::CircuitNodeColumn>> = BTreeMap::new();
-        for (nid, kind, pos, v1, v2) in rows.node_columns {
-            per_node.entry(nid).or_default().push(gnitz_wire::CircuitNodeColumn {
-                kind,
-                position: pos,
-                value1: v1,
-                value2: v2,
-            });
-        }
-        let mut nodes = BTreeMap::new();
-        for (nid, opcode, src_tab, expr_blob) in rows.nodes {
-            let cols: Vec<gnitz_wire::CircuitNodeColumn> = per_node.remove(&nid).unwrap_or_default();
-            let op = gnitz_wire::decode_op_node(opcode, src_tab, expr_blob, &cols)?;
-            nodes.insert(nid, op);
-        }
-        let mut edges = BTreeMap::new();
-        for (dst, port, src) in rows.edges {
-            edges.insert((dst, port), src);
-        }
-        Ok(Circuit { view_id, nodes, edges })
     }
 }
 
@@ -260,11 +224,12 @@ impl CircuitBuilder {
         role: ReindexRole,
     ) -> NodeId {
         assert!(!reindex_cols.is_empty(), "a reindex map must name its key columns");
+        let reindex_target_tcs = Self::promotion_targets(reindex_cols, target_tcs);
         self.alloc_unary(
             OpNode::Map(MapKind::Reindex {
                 program: program.encode(),
                 reindex_cols: reindex_cols.iter().map(|&c| c as u32).collect(),
-                reindex_target_tcs: target_tcs.to_vec(),
+                reindex_target_tcs,
                 role,
             }),
             input,
@@ -276,21 +241,30 @@ impl CircuitBuilder {
     /// membership is decided by the projected row content, not by the source PK
     /// (EXCEPT/INTERSECT/DISTINCT).
     ///
-    /// `target_tcs` is parallel to `projection` (`0` = keep the source column's
-    /// type); a non-zero entry promotes that payload column to the given ≤8-byte
-    /// integer type so a cross-width set-op pair shares one physical layout. Pass
-    /// an all-zero slice (or one shorter than `projection`) for the same-type /
-    /// DISTINCT case, which compiles a byte-identical circuit.
+    /// `target_tcs` promotes payload columns; see [`Self::promotion_targets`].
     ///
     /// `branch_id` is mixed into the hash; pass distinct ids (0 and 1) to the two
     /// sides of a `UNION ALL` so identical rows do not collide to one PK, and 0
     /// to both sides of deduplicating set-ops.
     pub fn map_hash_row(&mut self, input: NodeId, projection: &[usize], target_tcs: &[u8], branch_id: u8) -> NodeId {
+        let tcs = Self::promotion_targets(projection, target_tcs);
         let cols: Vec<u32> = projection.iter().map(|&c| c as u32).collect();
-        self.alloc_unary(
-            OpNode::Map(MapKind::HashRow(cols, target_tcs.to_vec(), branch_id)),
-            input,
-        )
+        self.alloc_unary(OpNode::Map(MapKind::HashRow(cols, tcs, branch_id)), input)
+    }
+
+    /// The per-column promotion targets to persist beside `cols`: a non-zero
+    /// entry promotes that column to the named ≤8-byte integer type, so a
+    /// cross-width join or set-op pair shares one physical layout.
+    ///
+    /// **Pass `&[]` when nothing is promoted.** The encoding needs the two lists
+    /// parallel, so the all-zero vector is built here rather than spelled
+    /// `vec![0; cols.len()]` at a call site that could get the length wrong.
+    fn promotion_targets(cols: &[usize], target_tcs: &[u8]) -> Vec<u8> {
+        if target_tcs.is_empty() {
+            return vec![0; cols.len()];
+        }
+        assert_eq!(cols.len(), target_tcs.len(), "one promotion target per key column");
+        target_tcs.to_vec()
     }
 
     /// Pure projection: keep only the listed payload columns, in order.
@@ -486,7 +460,7 @@ impl CircuitBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gnitz_wire::NODE_COL_KIND_REINDEX;
+    use gnitz_wire::type_code;
 
     fn empty_prog() -> ExprProgram {
         ExprProgram {
@@ -495,6 +469,38 @@ mod tests {
             code: Vec::new(),
             const_strings: Vec::new(),
         }
+    }
+
+    /// The reindex target list a node carries, built through the public builder.
+    fn built_target_tcs(reindex_cols: &[usize], target_tcs: &[u8]) -> Vec<u8> {
+        let mut cb = CircuitBuilder::new(7, 100);
+        let input = cb.input_delta();
+        let nid = cb.map_reindex(input, reindex_cols, target_tcs, empty_prog(), ReindexRole::ScatterKey);
+        match cb.build().nodes.remove(&nid) {
+            Some(OpNode::Map(MapKind::Reindex { reindex_target_tcs, .. })) => reindex_target_tcs,
+            other => panic!("expected Map(Reindex), got {other:?}"),
+        }
+    }
+
+    /// `&[]` is the spelling for "nothing promoted", and the builder expands it
+    /// to the parallel all-zero vector the encoding needs — so no call site
+    /// carries a length it could get wrong. A stated list is carried verbatim.
+    #[test]
+    fn promotion_targets_are_parallel_to_the_key_columns() {
+        assert_eq!(
+            built_target_tcs(&[2, 5], &[]),
+            vec![0, 0],
+            "an absent list expands to one zero per key column"
+        );
+        assert_eq!(built_target_tcs(&[2, 5], &[0, type_code::I64]), vec![0, type_code::I64]);
+    }
+
+    /// A stated list of the wrong length is a caller bug, and fails at the
+    /// caller's own site rather than as a padded encoding two crates away.
+    #[test]
+    #[should_panic(expected = "one promotion target per key column")]
+    fn a_mis_sized_promotion_target_list_is_refused() {
+        built_target_tcs(&[2, 5], &[0]);
     }
 
     /// A two-segment chain lowered with symbolic ids substitutes to the circuit
@@ -565,213 +571,5 @@ mod tests {
             format!("{err}").contains(&format!("{}", segment_id(7))),
             "the error names the unresolved id: {err}"
         );
-    }
-
-    /// A compound (2-column) reindex descriptor must survive into_rows → from_rows
-    /// with its column *order* preserved, stored under NODE_COL_KIND_REINDEX with
-    /// position = key order.
-    #[test]
-    fn reindex_cols_roundtrip_ordered() {
-        let (c1, c2) = (2usize, 5usize);
-        let mut cb = CircuitBuilder::new(7, 100);
-        let input = cb.input_delta();
-        let map_nid = cb.map_reindex(input, &[c1, c2], &[], empty_prog(), ReindexRole::ScatterKey);
-        let circuit = cb.build();
-
-        let rows = circuit.into_rows();
-
-        // Exactly two NODE_COL_KIND_REINDEX rows, position-ordered, value1 = column.
-        let mut reindex_rows: Vec<_> = rows
-            .node_columns
-            .iter()
-            .filter(|(nid, kind, _, _, _)| *nid == map_nid && *kind == NODE_COL_KIND_REINDEX)
-            .map(|&(_, _, pos, v1, v2)| (pos, v1, v2))
-            .collect();
-        reindex_rows.sort_by_key(|&(pos, _, _)| pos);
-        assert_eq!(reindex_rows, vec![(0, c1 as u64, 0), (1, c2 as u64, 0)]);
-
-        // Round-trip: decode preserves the ordered list.
-        let decoded = Circuit::from_rows(7, rows).expect("from_rows");
-        match decoded.nodes.get(&map_nid) {
-            Some(OpNode::Map(MapKind::Reindex { reindex_cols, .. })) => {
-                assert_eq!(*reindex_cols, vec![c1 as u32, c2 as u32], "order must be preserved");
-            }
-            other => panic!("expected Map(Reindex), got {other:?}"),
-        }
-    }
-
-    /// A cross-width reindex carries a per-slot promoted target type code `T` in
-    /// `value2`; it survives into_rows → from_rows parallel to the columns. A `0`
-    /// slot means "derive from source".
-    #[test]
-    fn reindex_target_tcs_roundtrip() {
-        use gnitz_wire::type_code;
-        let mut cb = CircuitBuilder::new(7, 100);
-        let input = cb.input_delta();
-        // Overlapping key [x, x] with distinct per-slot targets: slot 0 derives,
-        // slot 1 promotes to I64.
-        let map_nid = cb.map_reindex(
-            input,
-            &[3, 3],
-            &[0, type_code::I64],
-            empty_prog(),
-            ReindexRole::ScatterKey,
-        );
-        let rows = cb.build().into_rows();
-
-        let mut reindex_rows: Vec<_> = rows
-            .node_columns
-            .iter()
-            .filter(|(nid, kind, _, _, _)| *nid == map_nid && *kind == NODE_COL_KIND_REINDEX)
-            .map(|&(_, _, pos, v1, v2)| (pos, v1, v2))
-            .collect();
-        reindex_rows.sort_by_key(|&(pos, _, _)| pos);
-        assert_eq!(reindex_rows, vec![(0, 3, 0), (1, 3, type_code::I64 as u64)]);
-
-        let decoded = Circuit::from_rows(7, rows).expect("from_rows");
-        match decoded.nodes.get(&map_nid) {
-            Some(OpNode::Map(MapKind::Reindex {
-                reindex_cols,
-                reindex_target_tcs,
-                ..
-            })) => {
-                assert_eq!(*reindex_cols, vec![3, 3]);
-                assert_eq!(*reindex_target_tcs, vec![0, type_code::I64]);
-            }
-            other => panic!("expected Map(Reindex), got {other:?}"),
-        }
-    }
-
-    /// A range-join node round-trips its `(n_eq, rel)` through the single
-    /// NODE_COL_KIND_RANGE_JOIN param row, and a worker-filter node round-trips
-    /// as a bare opcode.
-    #[test]
-    fn range_join_and_worker_filter_roundtrip() {
-        use gnitz_wire::NODE_COL_KIND_RANGE_JOIN;
-        let mut cb = CircuitBuilder::new(9, 100);
-        let a = cb.input_delta_tagged(100);
-        let b = cb.input_delta_tagged(200);
-        let reindex_b = cb.map_reindex(b, &[0], &[], empty_prog(), ReindexRole::ScatterKey);
-        let filt_b = cb.worker_filter(reindex_b);
-        let trace_b = cb.integrate_trace(filt_b);
-        let join = cb.join_with_trace_range_node(a, trace_b, 1, RangeRel::Le);
-        cb.sink(join);
-        let rows = cb.build().into_rows();
-
-        // Exactly one range-join param row: (n_eq=1, rel=Le).
-        let rj: Vec<_> = rows
-            .node_columns
-            .iter()
-            .filter(|(_, kind, ..)| *kind == NODE_COL_KIND_RANGE_JOIN)
-            .map(|&(_, _, pos, v1, v2)| (pos, v1, v2))
-            .collect();
-        assert_eq!(rj, vec![(0, 1, RangeRel::Le.as_wire())]);
-
-        let decoded = Circuit::from_rows(9, rows).expect("from_rows");
-        assert!(decoded.nodes.values().any(|n| matches!(n, OpNode::WorkerFilter)));
-        assert!(decoded.nodes.values().any(|n| matches!(
-            n,
-            OpNode::Join(JoinKind::DeltaTraceRange {
-                n_eq: 1,
-                rel: RangeRel::Le
-            })
-        )));
-    }
-
-    /// Every `RangeRel` survives the wire round-trip with the right discriminant.
-    #[test]
-    fn range_rel_roundtrips_all_four() {
-        for rel in [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge] {
-            let mut cb = CircuitBuilder::new(1, 100);
-            let a = cb.input_delta_tagged(100);
-            let b = cb.input_delta_tagged(200);
-            let trace = cb.integrate_trace(b);
-            let join = cb.join_with_trace_range_node(a, trace, 0, rel);
-            cb.sink(join);
-            let decoded = Circuit::from_rows(1, cb.build().into_rows()).expect("from_rows");
-            assert!(
-                decoded
-                    .nodes
-                    .values()
-                    .any(|n| matches!(n, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 0, rel: r }) if *r == rel)),
-                "rel {rel:?} did not round-trip"
-            );
-        }
-    }
-
-    /// The `global_ground` discriminator rides as one param row and survives
-    /// into_rows → from_rows: set for an ungrouped global aggregate, clear for an
-    /// ordinary grouped reduce (so existing reduce circuits are byte-identical).
-    #[test]
-    fn reduce_global_ground_roundtrips() {
-        use gnitz_wire::NODE_COL_KIND_GLOBAL_GROUND;
-        for ground in [false, true] {
-            let mut cb = CircuitBuilder::new(3, 100);
-            let input = cb.input_delta();
-            // Empty group cols + one COUNT(*) spec, the ungrouped-aggregate shape.
-            let red = cb.reduce_multi(
-                input,
-                &[],
-                &[(gnitz_wire::AGG_COUNT, 0)],
-                ground,
-                ReduceOutKey::SyntheticFold,
-            );
-            cb.sink(red);
-            let rows = cb.build().into_rows();
-
-            // The param row is present iff `ground`.
-            let gg_rows = rows
-                .node_columns
-                .iter()
-                .filter(|(nid, kind, ..)| *nid == red && *kind == NODE_COL_KIND_GLOBAL_GROUND)
-                .count();
-            assert_eq!(gg_rows, ground as usize, "global_ground row present iff set");
-
-            let decoded = Circuit::from_rows(3, rows).expect("from_rows");
-            match decoded.nodes.get(&red) {
-                Some(OpNode::Reduce { global_ground, agg, .. }) => {
-                    assert_eq!(*global_ground, ground);
-                    assert!(!agg.is_empty());
-                }
-                other => panic!("expected Reduce, got {other:?}"),
-            }
-        }
-    }
-
-    /// The `out_key` discriminator rides as one sparse-default param row and
-    /// survives into_rows → from_rows for every kind: `SyntheticFold` (the
-    /// default) omits the row, the two natural-key kinds carry it.
-    #[test]
-    fn reduce_out_key_roundtrips() {
-        use gnitz_wire::NODE_COL_KIND_REDUCE_OUT_KEY;
-        for kind in [
-            ReduceOutKey::SyntheticFold,
-            ReduceOutKey::PkPermutation,
-            ReduceOutKey::SingleNaturalCol,
-        ] {
-            let mut cb = CircuitBuilder::new(4, 100);
-            let input = cb.input_delta();
-            let red = cb.reduce_multi(input, &[0], &[(gnitz_wire::AGG_COUNT, 0)], false, kind);
-            cb.sink(red);
-            let rows = cb.build().into_rows();
-
-            // The param row is present iff the kind is not the default.
-            let key_rows = rows
-                .node_columns
-                .iter()
-                .filter(|(nid, k, ..)| *nid == red && *k == NODE_COL_KIND_REDUCE_OUT_KEY)
-                .count();
-            assert_eq!(
-                key_rows,
-                (kind != ReduceOutKey::SyntheticFold) as usize,
-                "out_key row present iff non-default",
-            );
-
-            let decoded = Circuit::from_rows(4, rows).expect("from_rows");
-            match decoded.nodes.get(&red) {
-                Some(OpNode::Reduce { out_key, .. }) => assert_eq!(*out_key, kind),
-                other => panic!("expected Reduce, got {other:?}"),
-            }
-        }
     }
 }

@@ -121,11 +121,10 @@ pub(crate) fn build_reindex_program_keep(keep: &[usize]) -> gnitz_expr::ExprProg
 /// `π_P(inner)` it is subtracted from — a drift there would be a silent weight bug.
 ///
 pub(crate) fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema) -> NodeId {
-    let zero = vec![0u8; schema.pk_cols.len()];
     cb.map_reindex(
         node,
         &schema.pk_cols,
-        &zero,
+        &[],
         build_reindex_program(schema.columns.len()),
         ReindexRole::Auxiliary,
     )

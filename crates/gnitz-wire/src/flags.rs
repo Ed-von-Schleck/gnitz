@@ -75,8 +75,7 @@ pub const FLAG_CONTINUATION: u64 = 1 << 52;
 /// Client-only and never written to SAL, so it sits above the SAL mirror
 /// (bits 0-15) and the bit-16–39 packed fields rather than in the request-flag run at
 /// 4..256 — a flag placed there would be carried verbatim into every SAL group
-/// header, which is exactly what a client-only bit must not be. (Bits 0, 1 and 13
-/// of that block are unallocated, so the placement is a rule, not a shortage.)
+/// header, which is exactly what a client-only bit must not be.
 pub const FLAG_RESOLVE: u64 = 1 << 54;
 
 /// ALLOCATE_SERIAL_RANGE request flag. The client→master leg of a user-table
@@ -257,98 +256,44 @@ const _: () = {
 // Client request verbs
 // ---------------------------------------------------------------------------
 
-/// The one verb a client request frame names.
-///
-/// A verb is a choice, but the wire spells it as independent bits, so one frame
-/// can set two — the disjointness guard above relates flag *definitions*, not the
-/// bits within a frame. [`ClientVerb::from_flags`] refuses that rather than
-/// letting branch order pick, as [`WireConflictMode::from_u8`] refuses an unknown
-/// byte rather than defaulting it.
-///
-/// A plain SCAN sets no verb bit, so absence *is* a verb: [`ClientVerb::Scan`]'s
-/// [`ClientVerb::bit`] is `0`, which names the case without spending one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientVerb {
-    /// No verb bit set: stream a whole relation.
-    Scan,
-    Push,
-    Seek,
-    SeekByIndex,
-    ScanSpec,
-    Resolve,
-    DdlTxn,
-    PushTxn,
-    ScanMulti,
-    AllocSerialRange,
-    AllocTableId,
-    AllocSchemaId,
-    AllocIndexId,
+wire_enum! {
+    /// The one verb a client request frame names. A plain SCAN sets no verb bit,
+    /// so absence *is* a verb: [`ClientVerb::Scan`] encodes as `0`.
+    pub enum ClientVerb: u64 {
+        /// No verb bit set: stream a whole relation.
+        Scan = 0,
+        Push = FLAG_PUSH,
+        Seek = FLAG_SEEK,
+        SeekByIndex = FLAG_SEEK_BY_INDEX,
+        ScanSpec = FLAG_SCAN_SPEC,
+        Resolve = FLAG_RESOLVE,
+        DdlTxn = FLAG_DDL_TXN,
+        PushTxn = FLAG_PUSH_TXN,
+        ScanMulti = FLAG_SCAN_MULTI,
+        AllocSerialRange = FLAG_ALLOCATE_SERIAL_RANGE,
+        AllocTableId = FLAG_ALLOCATE_TABLE_ID,
+        AllocSchemaId = FLAG_ALLOCATE_SCHEMA_ID,
+        AllocIndexId = FLAG_ALLOCATE_INDEX_ID,
+    }
 }
 
 impl ClientVerb {
-    /// Every verb. [`CLIENT_VERB_MASK`] and [`ClientVerb::from_flags`] both fold
-    /// over this, so the mask cannot drift from the routes: a verb added to the
-    /// enum and to [`ClientVerb::bit`] is covered by both without a third list to
-    /// keep in step.
-    pub const ALL: [ClientVerb; 13] = [
-        ClientVerb::Scan,
-        ClientVerb::Push,
-        ClientVerb::Seek,
-        ClientVerb::SeekByIndex,
-        ClientVerb::ScanSpec,
-        ClientVerb::Resolve,
-        ClientVerb::DdlTxn,
-        ClientVerb::PushTxn,
-        ClientVerb::ScanMulti,
-        ClientVerb::AllocSerialRange,
-        ClientVerb::AllocTableId,
-        ClientVerb::AllocSchemaId,
-        ClientVerb::AllocIndexId,
-    ];
-
-    /// The single flag bit naming this verb — `0` for [`ClientVerb::Scan`], which
-    /// is named by the absence of every other.
-    pub const fn bit(self) -> u64 {
-        match self {
-            ClientVerb::Scan => 0,
-            ClientVerb::Push => FLAG_PUSH,
-            ClientVerb::Seek => FLAG_SEEK,
-            ClientVerb::SeekByIndex => FLAG_SEEK_BY_INDEX,
-            ClientVerb::ScanSpec => FLAG_SCAN_SPEC,
-            ClientVerb::Resolve => FLAG_RESOLVE,
-            ClientVerb::DdlTxn => FLAG_DDL_TXN,
-            ClientVerb::PushTxn => FLAG_PUSH_TXN,
-            ClientVerb::ScanMulti => FLAG_SCAN_MULTI,
-            ClientVerb::AllocSerialRange => FLAG_ALLOCATE_SERIAL_RANGE,
-            ClientVerb::AllocTableId => FLAG_ALLOCATE_TABLE_ID,
-            ClientVerb::AllocSchemaId => FLAG_ALLOCATE_SCHEMA_ID,
-            ClientVerb::AllocIndexId => FLAG_ALLOCATE_INDEX_ID,
-        }
-    }
-
     /// The verb `flags` names, or an error for a frame no client can legitimately
-    /// have encoded: two verb bits, or a data block on any verb but PUSH.
-    ///
-    /// The second rule is what keeps [`ClientVerb::Scan`] safe. Only a push
-    /// carries rows, so a data-carrying frame that names no verb would otherwise
-    /// resolve to `Scan` and be answered with a streamed table dump — the desync
-    /// [`FLAG_PUSH`] exists to prevent.
+    /// have encoded: two verb bits (the wire spells a choice as independent bits,
+    /// so branch order must not get to pick), or a data block on any verb but
+    /// PUSH — only a push carries rows, so a data-carrying frame naming no verb
+    /// would otherwise resolve to `Scan` and be answered with a table dump.
     pub fn from_flags(flags: u64) -> Result<Self, &'static str> {
         let named = flags & CLIENT_VERB_MASK;
         if named.count_ones() > 1 {
             return Err("frame names more than one request verb");
         }
-        // `named` is now either zero (Scan) or exactly one verb's bit, so the
-        // scan below always terminates on the right variant.
-        let mut verb = ClientVerb::Scan;
-        let mut i = 0;
-        while i < Self::ALL.len() {
-            if named != 0 && Self::ALL[i].bit() == named {
-                verb = Self::ALL[i];
-                break;
-            }
-            i += 1;
-        }
+        // `named` is zero (Scan) or exactly one bit of `CLIENT_VERB_MASK`, which
+        // is the union of exactly the verbs' own bits, so the lookup is total.
+        // Refusing anyway keeps the trust boundary free of a panic path.
+        let Some(verb) = Self::from_wire(named) else {
+            return Err("frame names no request verb");
+        };
         if flags & FLAG_HAS_DATA != 0 && verb != ClientVerb::Push {
             return Err("frame carries a data block on a verb other than PUSH");
         }
@@ -362,7 +307,7 @@ const CLIENT_VERB_MASK: u64 = {
     let mut acc = 0u64;
     let mut i = 0;
     while i < ClientVerb::ALL.len() {
-        acc |= ClientVerb::ALL[i].bit();
+        acc |= ClientVerb::ALL[i].as_wire();
         i += 1;
     }
     acc
@@ -379,7 +324,7 @@ const _: () = {
     let mut acc = 0u64;
     let mut i = 0;
     while i < ClientVerb::ALL.len() {
-        let bit = ClientVerb::ALL[i].bit();
+        let bit = ClientVerb::ALL[i].as_wire();
         assert!(bit.count_ones() <= 1, "a verb names more than one bit");
         assert!(bit & acc == 0, "two verbs share a bit");
         acc |= bit;
@@ -395,7 +340,7 @@ pub fn wire_flags_set_conflict_mode(flags: u64, mode: WireConflictMode) -> u64 {
 /// mode — the caller is a trust boundary and must reject rather than default.
 #[inline]
 pub fn wire_flags_get_conflict_mode(flags: u64) -> Option<WireConflictMode> {
-    WireConflictMode::from_u8(((flags & WIRE_CONFLICT_MODE_MASK) >> WIRE_CONFLICT_MODE_SHIFT) as u8)
+    WireConflictMode::from_wire(((flags & WIRE_CONFLICT_MODE_MASK) >> WIRE_CONFLICT_MODE_SHIFT) as u8)
 }
 #[inline]
 pub fn wire_flags_set_schema_version(flags: u64, version: u16) -> u64 {
@@ -417,22 +362,21 @@ pub fn wire_should_include_schema(client_version: u16, server_version: u16) -> b
 // Wire-level conflict mode for INSERT / UPSERT semantics
 // ---------------------------------------------------------------------------
 
-/// Conflict-resolution mode packed into bits 16-23 of `wire_flags` on
-/// FLAG_PUSH messages. Discriminant 0 = Update (default), so zero-filled
-/// flags resolve to the upsert default without explicit encoding.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum WireConflictMode {
-    /// Retract-and-insert on PK conflict. Used for SQL `UPDATE`,
-    /// `INSERT ... ON CONFLICT ... DO UPDATE` (after client-side
-    /// merging), and explicit Python `push(conflict_mode="update")`.
-    #[default]
-    Update = 0,
-    /// Reject the batch on any PK conflict. The master runs both an
-    /// intra-batch duplicate check and an against-store PK existence
-    /// check, and returns a PG-style `duplicate key value violates
-    /// unique constraint` error.
-    Error = 1,
+wire_enum! {
+    /// Conflict-resolution mode packed into bits 16-23 of `wire_flags` on
+    /// FLAG_PUSH messages. Discriminant 0 = Update (default), so zero-filled
+    /// flags resolve to the upsert default without explicit encoding.
+    pub enum WireConflictMode: u8 {
+        /// Retract-and-insert on PK conflict. Used for SQL `UPDATE`,
+        /// `INSERT ... ON CONFLICT ... DO UPDATE` (after client-side
+        /// merging), and explicit Python `push(conflict_mode="update")`.
+        Update = 0,
+        /// Reject the batch on any PK conflict. The master runs both an
+        /// intra-batch duplicate check and an against-store PK existence
+        /// check, and returns a PG-style `duplicate key value violates
+        /// unique constraint` error.
+        Error = 1,
+    }
 }
 
 impl std::str::FromStr for WireConflictMode {
@@ -447,25 +391,6 @@ impl std::str::FromStr for WireConflictMode {
             "update" => Ok(WireConflictMode::Update),
             "error" => Ok(WireConflictMode::Error),
             other => Err(format!("invalid conflict mode '{other}', expected 'update' or 'error'")),
-        }
-    }
-}
-
-impl WireConflictMode {
-    #[inline]
-    pub const fn as_u8(self) -> u8 {
-        self as u8
-    }
-
-    /// `None` for a byte naming no mode, like every other wire enum's decode.
-    /// Coercing an unknown byte to a default would turn a mode the server does
-    /// not implement into a silent upsert.
-    #[inline]
-    pub const fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(WireConflictMode::Update),
-            1 => Some(WireConflictMode::Error),
-            _ => None,
         }
     }
 }

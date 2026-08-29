@@ -11,8 +11,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use gnitz_engine::catalog::CatalogEngine;
 use gnitz_engine::schema::{IndexKeySpec, SchemaDescriptor};
-use gnitz_wire::PkColList;
 use gnitz_wire::{payload_native_key, pk_native_key};
+use gnitz_wire::{PkColList, SpecBytes};
 
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};

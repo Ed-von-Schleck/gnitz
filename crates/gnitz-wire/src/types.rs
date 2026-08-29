@@ -254,7 +254,7 @@ impl TypeCode {
     /// the engine compiler (reindex Map output schema) and the SQL planner
     /// (`_join_pk` stamp) both derive their col-0 stride from this, and they MUST
     /// agree or every cross-process consumer re-derives a mismatched stride and
-    /// the exchange wire decode hard-rejects ("WAL block PK region size mismatch").
+    /// the exchange wire decode hard-rejects the block.
     #[inline]
     pub fn reindex_output_type(self) -> TypeCode {
         TypeCode::from_validated_u8(reindex_output_type_code(self as u8))
@@ -719,9 +719,9 @@ impl FixedInt {
     }
 }
 
-/// u8-based counterpart to [`TypeCode::reindex_output_type`] for callers holding
-/// a raw `type_code` (mirrors the free `is_fixed_int`/`wire_stride`). See that
-/// method for the width policy and the engine ↔ planner lockstep it anchors.
+/// The width policy behind [`TypeCode::reindex_output_type`] and
+/// [`resolve_reindex_type`], which are what every external consumer calls. See
+/// that method for the policy and the engine ↔ planner lockstep it anchors.
 pub const fn reindex_output_type_code(tc: u8) -> u8 {
     // ≤8-byte ints and the signed-128 join key keep their own width-and-sign slot;
     // every other wide/non-int type (U128/UUID, the STRING/BLOB hash, floats)
@@ -742,8 +742,7 @@ pub const fn reindex_output_type_code(tc: u8) -> u8 {
 /// the `ColPromoter`, and the `_join_pk` stamp all need.
 pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
     // Equal types: the reindex output type (identity for fixed ints; U128 for
-    // U128/UUID and STRING/BLOB content hashes). Keeps same-type joins
-    // byte-identical to the pre-promotion behaviour.
+    // U128/UUID and STRING/BLOB content hashes).
     if l == r {
         return Some(reindex_output_type_code(l));
     }
@@ -813,7 +812,7 @@ pub const fn resolve_reindex_type(src_tc: u8, carried_tc: u8) -> u8 {
 /// param row — else the carried `common_tc`. Co-located with `resolve_reindex_type` so the encode (planner)
 /// and decode (engine) ends of the rule round-trip:
 /// `resolve_reindex_type(src, carried_reindex_tc(src, t)) == t` for any `t` a key
-/// of `src` can be promoted to (see the round-trip test).
+/// of `src` can be promoted to.
 #[inline]
 pub(crate) const fn carried_reindex_tc(src_tc: u8, common_tc: u8) -> u8 {
     if reindex_output_type_code(src_tc) != common_tc {
@@ -834,10 +833,9 @@ pub const fn wire_stride(tc: u8) -> usize {
     }
 }
 
-// Pin the discriminant↔code round-trip so a `try_from_u8` typo (e.g. mapping a
-// code to the wrong-discriminant variant) can no longer silently mis-stride a
-// column via `wire_stride`. Width can no longer drift because
-// `TypeCode::wire_stride` is now the only width table.
+// Pin the discriminant↔code round-trip: a `try_from_u8` typo (e.g. mapping a
+// code to the wrong-discriminant variant) would otherwise silently mis-stride a
+// column via `wire_stride`.
 const _: () = {
     let mut v: u16 = 0; // u16 so `v += 1` cannot overflow at 255
     while v <= 255 {
@@ -863,11 +861,10 @@ const _: () = {
         } else {
             assert!(!in_all, "TypeCode::ALL carries a code try_from_u8 rejects");
         }
-        // `is_fixed_int` is the domain of `read_{signed,unsigned}_exact` AND the
-        // admission test for the engine's fixed-int fast-path row comparator,
-        // whose branchless sign-flip shifts by `size*8 - 1` into a u64. Widening
-        // `is_fixed_int` past 8 bytes would make that `1 << 127`; catching it
-        // here is what lets the comparator drop its per-comparison O(cols) walk.
+        // `is_fixed_int` is the domain of `read_{signed,unsigned}_exact` and of
+        // the engine's fixed-int fast-path row comparator, whose branchless
+        // sign-flip shifts by `size*8 - 1` into a u64 — so widening the
+        // predicate past 8 bytes must fail here rather than there.
         let w = wire_stride(v as u8);
         assert!(
             !is_fixed_int(v as u8) || (w == 1 || w == 2 || w == 4 || w == 8),

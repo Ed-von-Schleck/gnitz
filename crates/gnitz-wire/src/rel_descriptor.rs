@@ -158,8 +158,8 @@ impl RelDescriptorBlob {
         debug_assert!(self.fks.len() <= u16::MAX as usize && self.indexes.len() <= u16::MAX as usize);
         let mut w = Writer::with_capacity(HEADER_LEN + 16 * (self.fks.len() + self.indexes.len()));
         debug_assert!(
-            !self.delta || self.class.is_view(),
-            "only a view can carry a delta feed"
+            !self.delta || self.class == RelClass::View,
+            "only a plain view can carry a delta feed"
         );
         let flags = self.class.to_flags()
             | if self.replicated { DESC_FLAG_REPLICATED } else { 0 }

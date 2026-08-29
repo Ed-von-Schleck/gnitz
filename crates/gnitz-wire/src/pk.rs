@@ -173,8 +173,9 @@ pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mu
 /// value (sign-flipped) — use [`decode_pk_column`] to recover the true integer.
 ///
 /// Schema-free OPK byte primitive (sibling of [`encode_pk_column`]). A stride
-/// `> 16` is a wide region and a caller bug. Opposite alignment from a left-
-/// aligned sort-key packer; never conflate the two.
+/// `> 16` is a wide region and a caller bug. Right-aligned, unlike the engine's
+/// left-aligning `pack_pk_be`: this one recovers a value, that one builds a sort
+/// key. Never conflate them.
 ///
 /// Specialized on the scalar widths, like the left-aligned sort-key packer it
 /// mirrors: the general arm's `copy_from_slice` has a runtime length, so it
@@ -183,7 +184,6 @@ pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mu
 /// conversion — partition routing, shard PK-filter probes, the merge path. Compound widths
 /// 9..=15 (e.g. `(U32, U64)` = 12) get two overlapping loads for the same reason;
 /// only 3/5/6/7 still reach the buffer.
-/// `widen_pk_be_matches_the_general_form` pins every stride against it.
 #[inline(always)]
 pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
     debug_assert!(
@@ -202,9 +202,6 @@ pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
         // `pk_bytes[8..stride]`, since `stride - m == 8`. This is the routing hash
         // under `worker_for_pk_bytes` — per row on the exchange scatter and the
         // bloom build — and a compound `(U32, U64)` PK lands here at 12.
-        //
-        // Right-aligned, unlike the engine's left-aligning `pack_pk_be`: this one
-        // recovers a value, that one builds a sort key. Never conflate them.
         9..=15 => {
             let m = stride - 8;
             let hi = u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128;
@@ -228,8 +225,7 @@ pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
 /// which the engine's reduce path runs per row, and
 /// at `-O0` (the profile the E2E suite runs) that composition costs an
 /// out-of-line call plus a 16-byte stack materialization the fused form does not
-/// need. `decode_opk_i64_matches_the_two_branches_it_replaces` pins it against
-/// both. The assert carries a static message: an `#[inline(always)]` body
+/// need. The assert carries a static message: an `#[inline(always)]` body
 /// duplicates a formatted `Arguments` block into every call site.
 #[inline(always)]
 pub fn decode_opk_i64(opk: &[u8], fi: crate::FixedInt) -> i64 {

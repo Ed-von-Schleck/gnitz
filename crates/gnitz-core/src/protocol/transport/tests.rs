@@ -304,7 +304,7 @@ fn test_hello_handshake_clamps_server_limit() {
     // A server advertising an oversized limit (u32::MAX) must not raise the
     // client's negotiated ceiling above MAX_FRAME_PAYLOAD_CLIENT.
     let (a, b) = make_socketpair();
-    let ack = gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, u32::MAX, 0);
+    let ack = gnitz_wire::encode_hello_ack(u32::MAX, 0);
     raw_send(&b, &ack);
     let mut t = ClientTransport::from_unix_fd(a);
     assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
@@ -317,7 +317,7 @@ fn test_hello_handshake_preserves_smaller_limit() {
     // A server limit below the client ceiling passes through unchanged.
     let (a, b) = make_socketpair();
     let small: u32 = 16 * 1024 * 1024;
-    let ack = gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, small, 7);
+    let ack = gnitz_wire::encode_hello_ack(small, 7);
     raw_send(&b, &ack);
     let mut t = ClientTransport::from_unix_fd(a);
     let lsn = hello_handshake(&mut t).unwrap();

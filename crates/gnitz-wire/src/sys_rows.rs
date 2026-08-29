@@ -1,18 +1,12 @@
-//! The system-catalog **row codecs**: one writer per family, expressed against
-//! the same `*_PAY_*` payload positions the readers on both sides already use.
+//! The system-catalog **row codecs**: one writer per family, taking a struct of
+//! named fields and emitting against the same `*_PAY_*` payload positions the
+//! readers on both sides resolve by name. A family's column list can therefore
+//! be reordered without transposing a writer against its readers.
 //!
-//! A catalog row used to be written twice — once in the client, once in the
-//! engine — and both writers were positional while both readers were
-//! name-resolved. Reordering a family's column list therefore kept every reader
-//! correct and silently transposed both writers, in two crates. Here each row is
-//! a struct with named fields and there is one writer per family, checked by
-//! `values_land_in_their_named_payload_slots` — which sees both the column list
-//! and the emit sequence, so it catches a reorder of either.
-//!
-//! A `-1` row must reproduce its `+1`'s payload byte-for-byte — the engine's
-//! retraction CAS rejects a mismatch, and only byte-equal `(PK, payload)` rows
-//! cancel in the Z-set — which is the other reason each family has exactly one
-//! writer: a drop and its create cannot diverge if they are the same code.
+//! Exactly one writer per family, because a `-1` row must reproduce its `+1`'s
+//! payload byte-for-byte: the engine's retraction CAS rejects a mismatch, and
+//! only byte-equal `(PK, payload)` rows cancel in the Z-set. A drop and its
+//! create cannot diverge if they are the same code.
 
 use crate::pack_col_id;
 

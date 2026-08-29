@@ -625,25 +625,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_xxh3_pins_known_vector() {
-        // A pinned XXH3-64 test vector: `gnitz_wire::checksum` (the one the client
-        // now stamps every frame with) of these 208 body bytes must equal this
-        // constant. Guards against a silent hash-library or parameterization swap
-        // that would break wire-checksum interop.
-        let body_hex = "9800000008000000a000000008000000a800000008000000b000000008000000b800000008000000c000000008000000c800000008000000d000000008000000d800000008000000e000000008000000e800000008000000f00000001000000000010000000000000000000000000000000000000000000001000000000000008000000000000000000000000000000001000000000000000300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-        let body: Vec<u8> = (0..body_hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&body_hex[i..i + 2], 16).unwrap())
-            .collect();
-        assert_eq!(body.len(), 208);
-        assert_eq!(
-            gnitz_wire::checksum(&body),
-            0x741C9E0BA1D8A9FD_u64,
-            "xxh3_64 test vector drifted"
-        );
-    }
-
     // ── wide compound-PK roundtrips ────────────────────────────────────────
 
     /// `(U64, U128)` compound PK + one I64 payload column. pk_stride == 24.

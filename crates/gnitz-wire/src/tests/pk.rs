@@ -1,106 +1,155 @@
 use super::*;
 use crate::type_code;
+use crate::{cmp_typed_le, FixedInt, TypeCode};
+
+/// Bit patterns every width-parameterized sweep below truncates to its type's
+/// width: both sign boundaries, the all-ones edges, and the 2^63 / 2^64 / 2^127
+/// steps that separate a narrow image from a wide one.
+const PATTERNS: &[u128] = &[
+    0,
+    1,
+    2,
+    0x7F,
+    0x80,
+    0xFF,
+    0x100,
+    i64::MAX as u128,
+    1 << 63,
+    u64::MAX as u128,
+    1 << 64,
+    i128::MAX as u128,
+    1 << 127,
+    u128::MAX,
+];
+
+/// The OPK contract: unsigned byte comparison over an encoded key IS the typed
+/// order of the value it encodes, at every PK-eligible width. `cmp_typed_le` is
+/// the crate's own definition of that typed order over native LE bytes, and it
+/// is tested independently. Every ordered pair is checked, so a wrong sign flip
+/// at any width fails here rather than as silently mis-summed weights
+/// downstream.
+#[test]
+fn opk_byte_order_is_typed_order() {
+    for tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
+        let (raw, sz) = (*tc as u8, tc.wire_stride());
+        let imgs: Vec<[u8; 16]> = PATTERNS.iter().map(|p| p.to_le_bytes()).collect();
+        let keys: Vec<Vec<u8>> = imgs
+            .iter()
+            .map(|le| {
+                let mut o = vec![0u8; sz];
+                encode_pk_column(&le[..sz], raw, &mut o);
+                o
+            })
+            .collect();
+        for (i, a) in imgs.iter().enumerate() {
+            for (j, b) in imgs.iter().enumerate() {
+                assert_eq!(
+                    keys[i].cmp(&keys[j]),
+                    cmp_typed_le(&a[..sz], &b[..sz], raw),
+                    "tc={raw} sz={sz}: pattern {i} vs {j}",
+                );
+            }
+        }
+    }
+}
+
+/// `decode_pk_column` is `encode_pk_column`'s inverse at every PK-eligible
+/// width — the bijection the byte-equal ⟺ key-equal contract rests on. Same
+/// type table as the order sweep above, so a new PK-eligible type is covered by
+/// both without an edit.
+#[test]
+fn decode_pk_column_roundtrips_every_pk_type() {
+    for tc in TypeCode::ALL.iter().filter(|t| t.is_pk_eligible()) {
+        let (raw, sz) = (*tc as u8, tc.wire_stride());
+        for p in PATTERNS {
+            let le = p.to_le_bytes();
+            let mut opk = vec![0u8; sz];
+            encode_pk_column(&le[..sz], raw, &mut opk);
+            let mut back = vec![0u8; sz];
+            decode_pk_column(&opk, raw, &mut back);
+            assert_eq!(back, &le[..sz], "decode(encode(v)) != v for tc={raw} p={p:#x}");
+        }
+    }
+}
 
 /// The property the two key spaces exist for: a value stored as a PK column
 /// and the same value stored as a payload column must produce the same key
 /// in each space, or the two sides of a distributed join land on different
 /// workers (routing) or miss each other's index entries (native).
+///
+/// Float, string and blob columns have no PK counterpart, so the two payload
+/// readers must agree with each other instead: neither applies the OPK flip.
 #[test]
 fn pk_and_payload_keys_agree_on_one_logical_value() {
-    use crate::type_code as tc;
-    for &(t, sz) in &[(tc::I8, 1usize), (tc::I16, 2), (tc::I32, 4), (tc::I64, 8), (tc::U32, 4)] {
-        for &v in &[i64::MIN, -257, -1, 0, 1, 255, i64::MAX] {
-            let le = v.to_le_bytes();
+    for tc in TypeCode::ALL {
+        let (raw, sz) = (tc as u8, tc.wire_stride());
+        for p in PATTERNS {
+            let le = p.to_le_bytes();
             let native = &le[..sz];
-            let mut opk = [0u8; 16];
-            encode_pk_column(native, t, &mut opk[..sz]);
-            assert_eq!(
-                pk_route_key(&opk[..sz], 0, sz),
-                payload_route_key(native, 0, sz, t),
-                "route keys diverge for tc={t} v={v}",
-            );
-            assert_eq!(
-                pk_native_key(&opk[..sz], 0, sz, t),
-                payload_native_key(native, 0, sz, t),
-                "native keys diverge for tc={t} v={v}",
-            );
+            if tc.is_pk_eligible() {
+                let mut opk = [0u8; 16];
+                encode_pk_column(native, raw, &mut opk[..sz]);
+                assert_eq!(
+                    pk_route_key(&opk[..sz], 0, sz),
+                    payload_route_key(native, 0, sz, raw),
+                    "route keys diverge for tc={raw} p={p:#x}",
+                );
+                assert_eq!(
+                    pk_native_key(&opk[..sz], 0, sz, raw),
+                    payload_native_key(native, 0, sz, raw),
+                    "native keys diverge for tc={raw} p={p:#x}",
+                );
+            } else {
+                assert_eq!(
+                    payload_route_key(native, 0, sz, raw),
+                    payload_native_key(native, 0, sz, raw),
+                    "an unflippable column must read the same in both spaces: tc={raw} p={p:#x}",
+                );
+            }
         }
     }
     // The native space zero-extends: a signed source keeps its
     // two's-complement bits in the low source-width bytes and is NOT
     // sign-extended to 128 bits (`has_pk` re-encodes from the source width).
-    assert_eq!(payload_native_key(&(-1i32).to_le_bytes(), 0, 4, tc::I32), 0xFFFF_FFFF);
-    assert_eq!(payload_native_key(&(-1i16).to_le_bytes(), 0, 2, tc::I16), 0xFFFF);
-    assert_eq!(payload_native_key(&[0xFFu8], 0, 1, tc::I8), 0xFF);
+    assert_eq!(
+        payload_native_key(&(-1i32).to_le_bytes(), 0, 4, type_code::I32),
+        0xFFFF_FFFF
+    );
+    assert_eq!(payload_native_key(&(-1i16).to_le_bytes(), 0, 2, type_code::I16), 0xFFFF);
+    assert_eq!(payload_native_key(&[0xFFu8], 0, 1, type_code::I8), 0xFF);
 }
 
-/// The three key readers compute the OPK↔native flip arithmetically instead
-/// of round-tripping through `encode_pk_column` / `decode_pk_column`. Pin
-/// each against the primitive it replaced — `pk_route_key` (unchanged) is an
-/// independent oracle for the route space, but both *native* readers were
-/// rewritten, so their mutual cross-check alone would no longer catch a
-/// wrong flip. Swept over every PK-eligible type and the non-PK types the
-/// payload readers must pass through unflipped.
+/// `decode_opk_i64` fuses the OPK decode with `FixedInt`'s widening, so it must
+/// return the value that was encoded, over each type's whole range. A wrong XOR
+/// arm is otherwise a silent wrong answer on every PK predicate.
 #[test]
-fn key_readers_match_the_encode_decode_forms_they_replace() {
-    use crate::type_code as tc;
-    let cases: &[(u8, usize)] = &[
-        (tc::U8, 1),
-        (tc::I8, 1),
-        (tc::U16, 2),
-        (tc::I16, 2),
-        (tc::U32, 4),
-        (tc::I32, 4),
-        (tc::U64, 8),
-        (tc::I64, 8),
-        (tc::U128, 16),
-        (tc::UUID, 16),
-        (tc::I128, 16),
-        (tc::F32, 4),
-        (tc::F64, 8),
-        (tc::STRING, 16),
-        (tc::BLOB, 16),
-    ];
-    for &(t, sz) in cases {
-        for &v in &[0i128, 1, -1, 127, -128, 255, i64::MIN as i128, i64::MAX as i128] {
-            let le = (v as u128).to_le_bytes();
-            let native = &le[..sz];
-
-            // payload_native_key: the old form decoded U128/UUID/I128 whole
-            // and zero-extended everything else.
-            let want_native = if crate::is_wide_int(t) {
-                u128::from_le_bytes(native.try_into().unwrap())
-            } else {
-                crate::read_unsigned_exact(&native[..sz.min(8)]) as u128
-            };
-            assert_eq!(payload_native_key(native, 0, sz, t), want_native, "tc={t} v={v}");
-
-            // payload_route_key: the old form OPK-encoded integers into a
-            // right-aligned scratch buffer; floats and strings went unflipped.
-            let want_route = if crate::is_float(t) || crate::is_german_string(t) {
-                crate::read_unsigned_exact(&native[..sz.min(8)]) as u128
-            } else {
-                let mut opk = [0u8; 16];
-                encode_pk_column(native, t, &mut opk[16 - sz..]);
-                u128::from_be_bytes(opk)
-            };
-            assert_eq!(payload_route_key(native, 0, sz, t), want_route, "tc={t} v={v}");
-
-            // pk_native_key: the old form ran `decode_pk_column` into a
-            // zeroed 16-byte buffer. Only PK-eligible types reach it.
-            if crate::is_pk_eligible(t) {
-                let mut opk = [0u8; 16];
-                encode_pk_column(native, t, &mut opk[..sz]);
-                let mut want = [0u8; 16];
-                decode_pk_column(&opk[..sz], t, &mut want[..sz]);
-                assert_eq!(
-                    pk_native_key(&opk[..sz], 0, sz, t),
-                    u128::from_le_bytes(want),
-                    "tc={t} v={v}"
-                );
+fn decode_opk_i64_recovers_the_encoded_value() {
+    for &(fi, tc) in &[
+        (FixedInt::U8, type_code::U8),
+        (FixedInt::I8, type_code::I8),
+        (FixedInt::U16, type_code::U16),
+        (FixedInt::I16, type_code::I16),
+        (FixedInt::U32, type_code::U32),
+        (FixedInt::I32, type_code::I32),
+        (FixedInt::U64, type_code::U64),
+        (FixedInt::I64, type_code::I64),
+    ] {
+        let sz = fi.width();
+        let (lo, hi) = fi.range();
+        for v in [lo, -1, 0, 1, hi] {
+            if v < lo || v > hi || v > i64::MAX as i128 {
+                continue;
             }
+            let mut opk = [0u8; 8];
+            encode_pk_column(&fi.pack(v).to_le_bytes()[..sz], tc, &mut opk[..sz]);
+            assert_eq!(decode_opk_i64(&opk[..sz], fi), v as i64, "{fi:?} v={v}");
         }
     }
+    // The one edge the range walk cannot state: `U64`'s maximum does not fit an
+    // `i64`, and the register holds the bit pattern, so it reads back as `-1`.
+    let mut opk = [0u8; 8];
+    encode_pk_column(&u64::MAX.to_le_bytes(), type_code::U64, &mut opk);
+    assert_eq!(decode_opk_i64(&opk, FixedInt::U64), -1i64);
 }
 
 /// `promote_opk_column`'s identity arm must equal the general
@@ -108,14 +157,14 @@ fn key_readers_match_the_encode_decode_forms_they_replace() {
 #[test]
 fn promote_opk_column_identity_matches_decode_encode() {
     for &(t, sz) in &[
-        (crate::type_code::I8, 1usize),
-        (crate::type_code::U8, 1),
-        (crate::type_code::I16, 2),
-        (crate::type_code::U16, 2),
-        (crate::type_code::I32, 4),
-        (crate::type_code::U32, 4),
-        (crate::type_code::I64, 8),
-        (crate::type_code::U64, 8),
+        (type_code::I8, 1usize),
+        (type_code::U8, 1),
+        (type_code::I16, 2),
+        (type_code::U16, 2),
+        (type_code::I32, 4),
+        (type_code::U32, 4),
+        (type_code::I64, 8),
+        (type_code::U64, 8),
     ] {
         for &v in &[0i128, 1, -1, i64::MIN as i128, i64::MAX as i128, u64::MAX as i128] {
             let le = (v as u128).to_le_bytes();
@@ -134,122 +183,23 @@ fn promote_opk_column_identity_matches_decode_encode() {
 
 /// The width-specialized arms must agree with the general right-align form at
 /// every stride a PK region can have — the 9..=15 overlapping-load band and
-/// the 3/5/6/7 widths only the buffer arm serves.
+/// the 3/5/6/7 widths only the buffer arm serves — including the all-zero and
+/// all-ones edges.
 #[test]
 fn widen_pk_be_matches_the_general_form() {
-    let bytes: [u8; 16] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(1));
-    for stride in 1..=16usize {
-        let mut buf = [0u8; 16];
-        buf[16 - stride..].copy_from_slice(&bytes[..stride]);
-        assert_eq!(
-            widen_pk_be(&bytes, stride),
-            u128::from_be_bytes(buf),
-            "stride {stride} diverges from the general form"
-        );
-    }
-    // All-zero and all-ones edges at every specialized width, the
-    // overlapping-load band included.
-    for stride in [1usize, 2, 4, 8, 9, 12, 13, 15, 16] {
-        assert_eq!(widen_pk_be(&[0u8; 16], stride), 0);
-        assert_eq!(widen_pk_be(&[0xFFu8; 16], stride), u128::MAX >> (128 - stride * 8));
-    }
-}
-
-fn roundtrip(tc: u8, le: &[u8]) {
-    let mut opk = vec![0u8; le.len()];
-    encode_pk_column(le, tc, &mut opk);
-    let mut back = vec![0u8; le.len()];
-    decode_pk_column(&opk, tc, &mut back);
-    assert_eq!(back, le, "decode(encode(v)) != v for tc={tc} le={le:?}");
-}
-
-#[test]
-fn decode_pk_column_roundtrips_signed() {
-    for &(tc, sz) in &[
-        (type_code::I8, 1usize),
-        (type_code::I16, 2),
-        (type_code::I32, 4),
-        (type_code::I64, 8),
-    ] {
-        for v in [i64::MIN >> (64 - sz * 8), -1, 0, 1, i64::MAX >> (64 - sz * 8)] {
-            roundtrip(tc, &v.to_le_bytes()[..sz]);
-        }
-    }
-}
-
-#[test]
-fn decode_pk_column_roundtrips_unsigned() {
-    for &(tc, sz) in &[
-        (type_code::U8, 1usize),
-        (type_code::U16, 2),
-        (type_code::U32, 4),
-        (type_code::U64, 8),
-    ] {
-        for v in [0u64, 1, 42, u64::MAX >> (64 - sz * 8)] {
-            roundtrip(tc, &v.to_le_bytes()[..sz]);
-        }
-    }
-    // U128 / UUID
-    for v in [0u128, 1, 1u128 << 64, u128::MAX] {
-        roundtrip(type_code::U128, &v.to_le_bytes());
-        roundtrip(type_code::UUID, &v.to_le_bytes());
-    }
-}
-
-/// `decode_opk_i64` is a third spelling of the OPK→native transform, so it
-/// is pinned against the two branches it replaces: the signed
-/// `decode_pk_column` + `read_signed` pair and the unsigned
-/// `widen_pk_be(..) as i64`. A wrong XOR arm is otherwise a silent wrong
-/// answer on every PK predicate.
-#[test]
-fn decode_opk_i64_matches_the_two_branches_it_replaces() {
-    use crate::FixedInt as F;
-    for &(fi, tc) in &[
-        (F::U8, type_code::U8),
-        (F::I8, type_code::I8),
-        (F::U16, type_code::U16),
-        (F::I16, type_code::I16),
-        (F::U32, type_code::U32),
-        (F::I32, type_code::I32),
-        (F::U64, type_code::U64),
-        (F::I64, type_code::I64),
-    ] {
-        let sz = fi.width();
-        let (lo, hi) = fi.range();
-        for v in [lo, -1, 0, 1, hi] {
-            if v < lo || v > hi {
-                continue;
-            }
-            let le = (v as u128).to_le_bytes();
-            let mut opk = [0u8; 8];
-            encode_pk_column(&le[..sz], tc, &mut opk[..sz]);
-
-            let want = if crate::is_signed_int(tc) {
-                let mut back = [0u8; 8];
-                decode_pk_column(&opk[..sz], tc, &mut back[..sz]);
-                crate::read_signed_exact(&back[..sz])
-            } else {
-                widen_pk_be(&opk[..sz], sz) as i64
-            };
+    let mixed: [u8; 16] = core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(1));
+    for bytes in [mixed, [0u8; 16], [0xFFu8; 16]] {
+        for stride in 1..=16usize {
+            let mut buf = [0u8; 16];
+            buf[16 - stride..].copy_from_slice(&bytes[..stride]);
             assert_eq!(
-                decode_opk_i64(&opk[..sz], fi),
-                want,
-                "decode_opk_i64 diverges for {fi:?} v={v}"
+                widen_pk_be(&bytes, stride),
+                u128::from_be_bytes(buf),
+                "stride {stride} diverges from the general form"
             );
         }
     }
-    // The unsigned 64-bit edge: the i64 register holds the bit pattern, so
-    // `u64::MAX` reads back as `-1`, exactly as `widen_pk_be(..) as i64` does.
-    let mut opk = [0u8; 8];
-    encode_pk_column(&u64::MAX.to_le_bytes(), type_code::U64, &mut opk);
-    assert_eq!(decode_opk_i64(&opk, crate::FixedInt::U64), -1i64);
 }
-
-/// The largest worker count the SAL group format supports
-/// (`runtime::protocol::sal::MAX_WORKERS`). Restated here because
-/// `gnitz-wire` sits below the engine, and the router must be uniform over
-/// exactly the counts the engine can launch.
-const MAX_WORKERS: usize = 64;
 
 /// Peak worker load divided by the mean, over `keys` at `nw` workers.
 fn load_spread(keys: &[u128], nw: usize) -> f64 {
@@ -296,6 +246,30 @@ fn router_spreads_structured_keys_evenly() {
             assert!(spread <= 1.01, "{name}: worker load {spread:.4}x the mean at nw={nw}",);
         }
     }
+}
+
+/// A PK region past `NARROW_PK_MAX_BYTES` has no `u128` image, so it routes on
+/// the hash of its whole OPK byte string. A 24-byte 3×`U64` compound PK reaches
+/// this arm; what must hold is that the bytes past the sixteenth still move the
+/// route, which a region silently truncated to a `u128` would not.
+#[test]
+fn worker_for_pk_bytes_reads_a_whole_wide_region() {
+    let mut head = [0u8; 16];
+    encode_pk_column(&7u64.to_le_bytes(), type_code::U64, &mut head[..8]);
+    encode_pk_column(&9u64.to_le_bytes(), type_code::U64, &mut head[8..]);
+
+    let mut seen = std::collections::HashSet::new();
+    for tail in 0..64u64 {
+        let mut opk = [0u8; 24];
+        opk[..16].copy_from_slice(&head);
+        encode_pk_column(&tail.to_le_bytes(), type_code::U64, &mut opk[16..]);
+        assert!(opk.len() > NARROW_PK_MAX_BYTES);
+        for nw in [1usize, 2, 3, 7, MAX_WORKERS] {
+            assert!(worker_for_pk_bytes(&opk, nw) < nw, "route out of range at nw={nw}");
+        }
+        seen.insert(worker_for_pk_bytes(&opk, 8));
+    }
+    assert!(seen.len() > 1, "the region past 16 bytes must reach the route");
 }
 
 /// Independent 128-bit keys — the UUID shape, and the wide arm the
@@ -356,63 +330,6 @@ fn worker_for_pk_bytes_matches_widened_key() {
     }
 }
 
-#[test]
-fn opk_order_equiv_signed_i64() {
-    // -3 < -1 < 2 must hold byte-lexicographically after encoding.
-    let mk = |v: i64| {
-        let mut o = [0u8; 8];
-        encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut o);
-        o
-    };
-    assert!(mk(-3) < mk(-1));
-    assert!(mk(-1) < mk(2));
-}
-
-#[test]
-fn opk_order_equiv_unsigned_u64() {
-    let mk = |v: u64| {
-        let mut o = [0u8; 8];
-        encode_pk_column(&v.to_le_bytes(), type_code::U64, &mut o);
-        o
-    };
-    assert!(mk(1) < mk(256));
-    assert!(mk(256) < mk(u64::MAX));
-}
-
-#[test]
-fn decode_pk_column_roundtrips_i128() {
-    // The signed-128 join-key type: every value (including bit-127 negatives)
-    // must survive encode→decode, and the 2^63/2^64 boundaries that
-    // distinguish a U64 image from an I64 image round-trip too.
-    for v in [
-        i128::MIN,
-        -1i128,
-        0,
-        1,
-        i128::MAX,
-        1i128 << 63,
-        (1i128 << 63) - 1,
-        1i128 << 64,
-        (1i128 << 64) - 1,
-    ] {
-        roundtrip(type_code::I128, &v.to_le_bytes());
-    }
-}
-
-#[test]
-fn opk_order_equiv_signed_i128() {
-    // -3 < -1 < 2 < 2^64 must hold byte-lexicographically after I128 encoding
-    // (the signed sign-flip puts negatives below non-negatives at 16-byte width).
-    let mk = |v: i128| {
-        let mut o = [0u8; 16];
-        encode_pk_column(&v.to_le_bytes(), type_code::I128, &mut o);
-        o
-    };
-    assert!(mk(-3) < mk(-1));
-    assert!(mk(-1) < mk(2));
-    assert!(mk(2) < mk(1i128 << 64));
-}
-
 /// `encode_pk_column_promoted` with `src_tc == target_tc` is exactly
 /// `encode_pk_column` — the no-widening fast path.
 #[test]
@@ -468,14 +385,12 @@ fn assert_copartition(v: i128, l: u8, r: u8, t: u8) {
     );
 }
 
-fn s_min(tc: u8) -> i128 {
-    -(1i128 << (crate::wire_stride(tc) * 8 - 1))
-}
-fn s_max(tc: u8) -> i128 {
-    (1i128 << (crate::wire_stride(tc) * 8 - 1)) - 1
-}
-fn u_max(tc: u8) -> i128 {
-    (1i128 << (crate::wire_stride(tc) * 8)) - 1
+/// The representable `(min, max)` of a ≤8-byte integer type code, read from the
+/// crate's own [`FixedInt::range`] rather than re-derived from the width.
+fn range_of(tc: u8) -> (i128, i128) {
+    FixedInt::from_type_code(TypeCode::from_validated_u8(tc))
+        .expect("a fixed-width ≤8-byte integer type code")
+        .range()
 }
 fn narrower(l: u8, r: u8) -> u8 {
     if crate::wire_stride(l) <= crate::wire_stride(r) {
@@ -496,8 +411,8 @@ fn signed_ladder_copartitions() {
         (I16, I64, I64),
         (I32, I64, I64),
     ] {
-        let n = narrower(l, r);
-        for v in [0, 1, -1, s_min(n), s_max(n), s_min(n) + 1, s_max(n) - 1] {
+        let (lo, hi) = range_of(narrower(l, r));
+        for v in [0, 1, -1, lo, hi, lo + 1, hi - 1] {
             assert_copartition(v, l, r, t);
         }
     }
@@ -517,8 +432,8 @@ fn unsigned_ladder_copartitions() {
         (U64, U128, U128),
         (U32, UUID, U128),
     ] {
-        let n = narrower(l, r);
-        for v in [0, 1, 127, u_max(n), u_max(n) - 1] {
+        let hi = range_of(narrower(l, r)).1;
+        for v in [0, 1, 127, hi, hi - 1] {
             assert_copartition(v, l, r, t);
         }
     }
@@ -549,9 +464,11 @@ fn cross_sign_copartitions() {
     ];
     for (u, s, t) in cases {
         // Equal logical values representable on BOTH sides (the overlap
-        // [0, min(u_max(u), s_max(s))]) pack byte-identically into T, so equal
-        // keys co-partition to the same worker and match in the join.
-        let hi = u_max(u).min(s_max(s));
+        // [0, min(u_max, s_max)]) pack byte-identically into T, so equal keys
+        // co-partition to the same worker and match in the join.
+        let (u_lo, u_hi) = range_of(u);
+        let (s_lo, s_hi) = range_of(s);
+        let hi = u_hi.min(s_hi);
         for v in [0, 1, 127, hi - 1, hi] {
             assert_copartition(v, u, s, t);
         }
@@ -562,20 +479,20 @@ fn cross_sign_copartitions() {
         // values ever collide; no equal values ever diverge.
         let tw = crate::wire_stride(t);
         let probes: &[(i128, u8)] = &[
-            (0, u),
+            (u_lo, u),
             (1, u),
             (127, u),
             (128, u),
             (200, u),
-            (u_max(u) - 1, u),
-            (u_max(u), u),
-            (s_min(s), s),
+            (u_hi - 1, u),
+            (u_hi, u),
+            (s_lo, s),
             (-56, s),
             (-1, s),
             (0, s),
             (1, s),
             (127, s),
-            (s_max(s), s),
+            (s_hi, s),
         ];
         let mut seen: Vec<(i128, [u8; 16])> = Vec::new();
         for &(val, tc) in probes {

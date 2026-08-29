@@ -515,7 +515,7 @@ async fn commit_pushes(
     merge_pool: &mut FxHashMap<(i64, u8), Batch>,
 ) {
     // Sort by (tid, mode) so runs are homogeneous.
-    pushes.sort_by_key(|p| (p.tid, p.mode.as_u8()));
+    pushes.sort_by_key(|p| (p.tid, p.mode.as_wire()));
 
     let nw = shared.disp().num_workers();
     let mut groups: Vec<GroupInfo> = Vec::new();
@@ -572,7 +572,7 @@ async fn commit_pushes(
                 return Ok(batches.pop().expect("one batch in a single-push run"));
             }
             let schema = shared.disp().schema_desc_for(tid);
-            let mut m = match merge_pool.remove(&(tid, mode.as_u8())) {
+            let mut m = match merge_pool.remove(&(tid, mode.as_wire())) {
                 Some(pooled) if pooled.schema == schema => pooled,
                 _ => Batch::with_capacity(schema, total_rows.max(1)),
             };
@@ -849,7 +849,7 @@ async fn commit_pushes(
     // client's) are pooled too — the schema-staleness guard above discards them
     // on a DDL change.
     for g in groups {
-        merge_pool.insert((g.tid, g.mode.as_u8()), g.merged);
+        merge_pool.insert((g.tid, g.mode.as_wire()), g.merged);
     }
 }
 

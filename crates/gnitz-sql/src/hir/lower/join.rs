@@ -313,11 +313,10 @@ fn emit_range(
     for &b_pk in &right_schema.pk_cols {
         pair_pk_cols.push(k + left_n + b_pk);
     }
-    let zero_tcs = vec![0u8; pair_pk];
     let rekey = cb.map_reindex(
         merged,
         &pair_pk_cols,
-        &zero_tcs,
+        &[],
         build_reindex_program(union_schema.columns.len()),
         ReindexRole::Auxiliary,
     );
@@ -672,7 +671,6 @@ fn emit_range_null_fill_tail(
     let (left_n, right_n) = (left_schema.columns.len(), right_schema.columns.len());
     let (pa, pb) = (left_schema.pk_cols.len(), right_schema.pk_cols.len());
     let pair_pk = pa + pb;
-    let zero_tcs = vec![0u8; pair_pk];
 
     let (p_pk, p_n) = if preserved_is_left { (pa, left_n) } else { (pb, right_n) };
     let o_col_tcs = schema_type_codes(if preserved_is_left {
@@ -706,7 +704,7 @@ fn emit_range_null_fill_tail(
     let nf_rekey = cb.map_reindex(
         nullfill,
         &nf_pair_pk_cols,
-        &zero_tcs,
+        &[],
         build_reindex_program_keep(&keep),
         ReindexRole::Auxiliary,
     );
@@ -832,7 +830,7 @@ pub(crate) fn band_pi_preserved(
     let rekey = cb.map_reindex(
         merged,
         pk_slots,
-        &vec![0u8; p],
+        &[],
         build_reindex_program(union_n),
         ReindexRole::Auxiliary,
     );
@@ -1039,7 +1037,6 @@ pub(crate) fn build_pure_range_threshold(
     let left_n = left_schema.columns.len();
     let pa = left_schema.pk_cols.len();
     let k = 1usize; // pure range: no eq prefix, one range slot
-    let zero_a = vec![0u8; pa];
     let rel_ab = converse_rel(range_op);
     let rel_ba = range_op;
     let want_max = matches!(range_op, RangeRel::Lt | RangeRel::Le);
@@ -1087,7 +1084,7 @@ pub(crate) fn build_pure_range_threshold(
         let keyed = cb.map_reindex(
             input,
             &a_pk_in_raw,
-            &zero_a,
+            &[],
             nf_reindex_prog.clone(),
             ReindexRole::Auxiliary,
         );

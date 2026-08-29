@@ -200,7 +200,7 @@ pub fn encode_push_txn(
         .iter()
         .map(|(tid, schema, batch, mode)| {
             (
-                mode.as_u8(),
+                mode.as_wire(),
                 encode_schema_block(schema, *tid as u32),
                 encode_wal_block(schema, *tid as u32, batch),
             )
@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(decoded.len(), expected.len());
         for (fam, (exp_tid, exp_mode, exp_rows)) in decoded.iter().zip(expected) {
             assert_eq!(fam.tid, exp_tid);
-            assert_eq!(WireConflictMode::from_u8(fam.mode), Some(exp_mode));
+            assert_eq!(WireConflictMode::from_wire(fam.mode), Some(exp_mode));
             // The schema block is this family's, keyed under this family's tid.
             assert_eq!(
                 gnitz_wire::read_u32_le(fam.schema_block, gnitz_wire::WAL_OFF_TID),
