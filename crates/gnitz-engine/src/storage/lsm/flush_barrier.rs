@@ -260,19 +260,14 @@ fn new_ring() -> Result<Option<io_uring::IoUring>, StorageError> {
 fn blocking_sync(fds: &[libc::c_int], flags: io_uring::types::FsyncFlags) -> Result<(), StorageError> {
     let datasync = flags.contains(DATASYNC);
     for &fd in fds {
-        loop {
-            let rc = if datasync {
-                unsafe { libc::fdatasync(fd) }
+        let sync = || unsafe {
+            if datasync {
+                libc::fdatasync(fd)
             } else {
-                unsafe { libc::fsync(fd) }
-            };
-            if rc == 0 {
-                break;
+                libc::fsync(fd)
             }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
+        };
+        if let Err(err) = crate::foundation::posix_io::retry_eintr(sync) {
             gnitz_warn!("blocking fsync failed: {}", err);
             return Err(StorageError::from(err));
         }

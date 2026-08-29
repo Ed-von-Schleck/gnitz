@@ -6,6 +6,21 @@ use std::os::fd::{FromRawFd, OwnedFd};
 
 use libc::c_int;
 
+/// Retry a raw syscall until it succeeds (`>= 0`) or fails with an error other
+/// than EINTR. The success value is discarded, so this suits only calls whose
+/// outcome is "it happened" — never a short `write`.
+pub fn retry_eintr(mut f: impl FnMut() -> c_int) -> std::io::Result<()> {
+    loop {
+        if f() >= 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(err);
+        }
+    }
+}
+
 /// Write all bytes to a raw `fd`, handling partial writes and EINTR — the
 /// `File::write_all` of a descriptor nobody owns (stdout, a socketpair end).
 pub fn write_all_fd(fd: c_int, data: &[u8]) -> std::io::Result<()> {
@@ -137,6 +152,30 @@ pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
     }
 }
 
+/// mmap `size` bytes of `fd` `MAP_SHARED` read-write, `fallocate`ing the file to
+/// `size` first: `mmap` past the end of a file succeeds and the first store into
+/// the resulting hole raises `SIGBUS`, which nothing here handles. Reserving the
+/// blocks also means a later store cannot fail for want of disk space.
+pub fn map_file_reserved(fd: c_int, size: usize) -> std::io::Result<*mut u8> {
+    if fd_size(fd)? < size {
+        retry_eintr(|| unsafe { libc::fallocate(fd, 0, 0, size as libc::off_t) })?;
+    }
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ptr as *mut u8)
+}
+
 /// How a mapping will be read. `MADV_SEQUENTIAL` sets `VM_SEQ_READ`, so every
 /// fault issues a full forward window instead of faulting around: right for a
 /// single front-to-back pass, wasted I/O for a mapping probed at unpredictable
@@ -244,5 +283,20 @@ mod tests {
 
         let mapped = Mmap::from_fd(fd, data.len(), Advice::Sequential).expect("map the anonymous file back");
         assert_eq!(mapped.as_slice(), data, "round-trip through the anonymous file");
+    }
+
+    /// The file reaches `size` before the mapping exists, so the store lands on
+    /// a real page instead of raising SIGBUS.
+    #[test]
+    fn test_map_file_reserved() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let fd = tmp.as_file().as_raw_fd();
+        let ptr = map_file_reserved(fd, 8192).unwrap();
+        assert_eq!(fd_size(fd).unwrap(), 8192);
+        unsafe {
+            *ptr = 42;
+            assert_eq!(*ptr, 42);
+            libc::munmap(ptr as *mut libc::c_void, 8192);
+        }
     }
 }

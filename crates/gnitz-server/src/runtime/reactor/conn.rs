@@ -63,10 +63,18 @@ pub(crate) async fn guard_client_egress<F: Future<Output = i32>>(
                 what,
                 client_send_timeout(),
             );
-            crate::runtime::posix::shutdown(fd);
+            shutdown(fd);
             fut.await.min(-1)
         }
     }
+}
+
+/// Abort both directions of a connected socket, so a pending io_uring `OP_SEND`
+/// on `fd` errors out (`ECONNRESET`/`EPIPE`) and its CQE fires — which `close`
+/// alone does not do while data is queued. Never closes the fd. A peer already
+/// gone (`ENOTCONN`) is the goal state, so every failure but `EINTR` is dropped.
+pub(crate) fn shutdown(fd: i32) {
+    let _ = gnitz_engine::foundation::posix_io::retry_eintr(|| unsafe { libc::shutdown(fd, libc::SHUT_RDWR) });
 }
 
 /// Arm (or re-arm) `listener`'s multishot accept. The listener fd rides the
@@ -390,6 +398,42 @@ impl Reactor {
             unsafe {
                 libc::close(fd);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shutdown_aborts_connected_socket() {
+        // A send after the abort must fail rather than queue — the property
+        // `guard_client_egress` leans on. MSG_NOSIGNAL keeps the failing send
+        // from raising SIGPIPE and killing the test process.
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        let (a, b) = (fds[0], fds[1]);
+        shutdown(a);
+        let buf = [0u8; 4];
+        let n = unsafe { libc::send(a, buf.as_ptr() as *const libc::c_void, buf.len(), libc::MSG_NOSIGNAL) };
+        assert!(n < 0, "send after SHUT_RDWR must fail, got {n}");
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
+    #[test]
+    fn test_shutdown_tolerates_enotconn() {
+        // An unconnected socket → shutdown fails with ENOTCONN; the wrapper
+        // swallows it, since evicting an already-gone peer is not an error.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket() failed");
+        shutdown(fd);
+        unsafe {
+            libc::close(fd);
         }
     }
 }

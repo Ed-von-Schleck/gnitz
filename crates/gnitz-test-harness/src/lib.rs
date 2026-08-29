@@ -118,8 +118,8 @@ impl ServerHandle {
     /// exit within the startup budget (an unexpected successful boot). `None`
     /// if the server binary is absent.
     ///
-    /// This does NOT use the readiness probe: `server_create` binds+listens
-    /// the AF_UNIX socket BEFORE `setup_tls_listener` runs, so a probe connect
+    /// This does NOT use the readiness probe: the server binds+listens the
+    /// AF_UNIX socket BEFORE `setup_tls_listener` runs, so a probe connect
     /// can succeed in the window before a refusal aborts — waiting on the
     /// process itself is race-free.
     pub fn boot_expecting_exit(workers: usize, tls_args: &[&str]) -> Option<(bool, String)> {
@@ -423,8 +423,8 @@ fn spawn_and_wait_ready(
         .expect("failed to spawn server");
 
     // Readiness is "a client connect succeeds", NOT "the socket file
-    // exists". `server_create` creates the AF_UNIX file at `bind()` but
-    // only accepts connections after the later `listen()`; a client that
+    // exists". The AF_UNIX file appears at `bind()`, but connections are
+    // only accepted after the `listen()` that follows it; a client that
     // races into that window (widened by CPU starvation when dozens of
     // servers boot at once under a parallel `cargo test`) gets
     // ECONNREFUSED, and the test's real `connect().unwrap()` then flakes.

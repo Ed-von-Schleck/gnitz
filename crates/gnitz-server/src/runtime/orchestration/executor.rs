@@ -22,7 +22,6 @@ use gnitz_engine::storage::batch_pool::PooledSendBuf;
 use rustc_hash::FxHashMap;
 
 use super::guard_panic;
-use crate::runtime::posix;
 use crate::runtime::tls::{TlsListener, TlsShared};
 use gnitz_engine::foundation::fault::Seam;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -392,7 +391,7 @@ impl ServerExecutor {
         // collect (the reactor's `OnceCell` slot is stable for its lifetime).
         reactor.attach_listener(server_fd);
         if let Some(tl) = &tls {
-            reactor.attach_listener(tl.fd);
+            reactor.attach_listener(tl.fd());
         }
         let accept_ctx = AcceptCtx {
             unix_fd: server_fd,
@@ -480,7 +479,7 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
             continue;
         }
         match &ctx.tls {
-            Some(tl) if listener == tl.fd => {
+            Some(tl) if listener == tl.fd() => {
                 // Global connection cap: close the freshly-accepted fd before
                 // any TLS work when the live count is at the cap.
                 let Some(guard) = tl.admit() else {
@@ -489,8 +488,6 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
                     unsafe { libc::close(fd) };
                     continue;
                 };
-                posix::set_nodelay(fd);
-                posix::set_keepalive(fd);
                 match TlsShared::start(Rc::clone(&shared.reactor), fd, std::sync::Arc::clone(&tl.cfg), guard) {
                     Ok(conn) => {
                         let peer = Peer::tls(conn);

@@ -4,10 +4,11 @@
 //! half of the rule `config` states, where the CA becomes an mTLS verifier.
 
 use std::cell::Cell;
+use std::net::TcpListener;
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
 use super::ConnCountGuard;
-use crate::runtime::posix;
 
 /// TLS listener request from the CLI: the address to bind, optional operator
 /// cert/key PEM paths (a self-signed dev cert is minted when absent), the
@@ -22,18 +23,27 @@ pub(crate) struct TlsCli {
 }
 
 /// TLS listener runtime inputs, threaded into `ServerExecutor::run` (hence
-/// `pub(crate)`): the bound listen fd, the rustls config, and both halves of
+/// `pub(crate)`): the bound listener, the rustls config, and both halves of
 /// the "live TLS sessions ≤ `max_conns`" invariant. `Rc<Cell<..>>` also makes
 /// this `!Send`, so the single-reactor-thread assumption the count rests on is
 /// checked rather than assumed.
 pub(crate) struct TlsListener {
-    pub fd: i32,
+    /// Owned rather than a raw fd, so the descriptor is closed on every path
+    /// out of [`setup_tls_listener`] — the bound address is published across
+    /// two fallible steps after the bind.
+    listener: TcpListener,
     pub cfg: std::sync::Arc<rustls::ServerConfig>,
     pub max_conns: u32,
     live: Rc<Cell<u32>>,
 }
 
 impl TlsListener {
+    /// The listen fd, for the reactor's multishot accept and the accept loop's
+    /// which-listener test.
+    pub(crate) fn fd(&self) -> i32 {
+        self.listener.as_raw_fd()
+    }
+
     /// Admit one session, or `None` at the cap. Test and increment are one
     /// call, so there is no window between them and no other way to obtain a
     /// [`ConnCountGuard`]. The guard's `Drop` decrements.
@@ -76,9 +86,27 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsList
              public PEM at {path}"
         );
     }
-    let listen_fd =
-        posix::tcp_bind(&cli.listen).map_err(|e| format!("failed to bind TLS listener {}: {e}", cli.listen))?;
-    let bound = posix::tcp_local_addr(listen_fd).unwrap_or(cli.listen);
+    let listener =
+        TcpListener::bind(cli.listen).map_err(|e| format!("failed to bind TLS listener {}: {e}", cli.listen))?;
+    // std hardcodes backlog 128 for TCP; a second `listen` rewrites
+    // `sk_max_ack_backlog` in place, and a negative backlog means
+    // `net.core.somaxconn` — what std itself passes for AF_UNIX on Linux, and
+    // what the AF_UNIX listener therefore already gets.
+    if unsafe { libc::listen(listener.as_raw_fd(), -1) } < 0 {
+        return Err(format!(
+            "failed to widen the TLS listener backlog: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("failed to set the TLS listener non-blocking: {e}"))?;
+    // Propagated, not defaulted to `cli.listen`: with `--tls-listen …:0` the
+    // requested address is a literal `:0`, and publishing that would hand every
+    // client an unconnectable endpoint.
+    let bound = listener
+        .local_addr()
+        .map_err(|e| format!("failed to read the bound TLS address: {e}"))?;
     let endpoint_path = format!("{data_dir}/tls_endpoint");
     let tmp_path = format!("{endpoint_path}.tmp");
     std::fs::write(&tmp_path, format!("{bound}\n")).map_err(|e| format!("failed to write {tmp_path}: {e}"))?;
@@ -95,7 +123,7 @@ pub(crate) fn setup_tls_listener(data_dir: &str, cli: &TlsCli) -> Result<TlsList
         );
     }
     Ok(TlsListener {
-        fd: listen_fd,
+        listener,
         cfg: config,
         max_conns: cli.max_conns,
         live: Rc::new(Cell::new(0)),

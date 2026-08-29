@@ -230,11 +230,11 @@ impl MasterDispatcher {
     /// size prefix regardless, so this only ends a park.
     pub(crate) fn signal_all(&self) {
         for &efd in &self.m2w_efds {
-            crate::runtime::posix::eventfd_signal(efd);
+            crate::runtime::m2w::eventfd_signal(efd);
         }
     }
     pub(super) fn signal_one(&self, worker: usize) {
-        crate::runtime::posix::eventfd_signal(self.m2w_efds[worker]);
+        crate::runtime::m2w::eventfd_signal(self.m2w_efds[worker]);
     }
 
     pub(crate) fn sal_fd(&self) -> i32 {
@@ -364,7 +364,7 @@ impl MasterDispatcher {
                 // Wait on ALL still-pending workers at once: any could be the next
                 // to publish, and a single-word wait would miss a wake on a
                 // different worker's ring.
-                let _ = self.w2m.wait_any(pending_mask, W2M_SYNC_WAIT_MS);
+                self.w2m.wait_any(pending_mask, W2M_SYNC_WAIT_MS);
             }
         }
         Ok(())
@@ -1195,15 +1195,14 @@ impl MasterDispatcher {
                     break; // still running
                 }
                 // rpid == -1
-                let err = crate::runtime::posix::errno();
-                if err == libc::EINTR {
-                    continue; // signal, not death — retry
+                match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EINTR) => continue, // signal, not death — retry
+                    Some(libc::ECHILD) => {
+                        self.worker_pids.borrow_mut()[w] = 0; // already gone
+                        return w as i32;
+                    }
+                    _ => break, // unexpected errno: treat as alive
                 }
-                if err == libc::ECHILD {
-                    self.worker_pids.borrow_mut()[w] = 0; // already gone
-                    return w as i32;
-                }
-                break; // unexpected errno: treat as alive
             }
         }
         -1

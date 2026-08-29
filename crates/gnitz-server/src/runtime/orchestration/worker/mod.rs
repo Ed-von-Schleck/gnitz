@@ -7,6 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
+use crate::runtime::m2w::Wake;
 use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
@@ -391,15 +392,10 @@ impl WorkerProcess {
             // queued state drives the next drain_sal to emit the next chunk
             // immediately.
             if self.pending_streams.is_empty() {
-                let ready = self.sal_reader.wait(1000);
-                if ready == 0 {
-                    if self.master_is_gone() {
-                        self.shutdown();
-                    }
-                    continue;
-                }
-                if ready < 0 {
-                    continue;
+                match self.sal_reader.wait(1000) {
+                    Wake::Signalled => {}
+                    Wake::Idle if self.master_is_gone() => self.shutdown(),
+                    Wake::Idle | Wake::Failed => continue,
                 }
             }
 

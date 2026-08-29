@@ -17,12 +17,12 @@ use gnitz_engine::foundation::posix_io;
 
 use crate::runtime::affinity;
 use crate::runtime::executor::ServerExecutor;
+use crate::runtime::m2w;
 use crate::runtime::master::MasterDispatcher;
-use crate::runtime::posix;
 use crate::runtime::sal::zone::CommittedTail;
 use crate::runtime::sal::{sal_mmap_size, EpochGate, SalLog, SalMessageKind, SalReader, SalStep, SalWriter};
 use crate::runtime::tls::{setup_tls_listener, TlsCli};
-use crate::runtime::w2m::{self, W2mReceiver, W2mWriter, W2M_REGION_SIZE};
+use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
 use gnitz_engine::storage::Batch;
@@ -360,41 +360,19 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
             .map_err(|e| format!("failed to open SAL file: {e}"))?
     };
     posix_io::try_set_nocow(sal_fd);
-    // `Reserved`: the SAL is a real file, and reserving its blocks now is what
-    // keeps a later write from failing for want of disk space.
-    let sal_ptr = posix::map_shared_sized(sal_fd, sal_mmap_size(), posix::Backing::Reserved)
+    // The SAL is a real file, and reserving its blocks now is what keeps a later
+    // write from failing for want of disk space.
+    let sal_ptr = posix_io::map_file_reserved(sal_fd, sal_mmap_size())
         .map_err(|e| format!("failed to map SAL ({} bytes): {e}", sal_mmap_size()))?;
 
     let mut w2m_ptrs: Vec<*mut u8> = Vec::with_capacity(nw);
     let mut m2w_efds: Vec<i32> = Vec::with_capacity(nw);
     for w in 0..nw {
-        let wfd = posix::memfd_create(format!("w2m_{w}").as_bytes());
-        if wfd < 0 {
-            return Err(format!("memfd_create for W{w} failed"));
-        }
-        // `Sized`, not `Reserved`: a memfd's pages are RAM charged on first
-        // touch, so reserving would commit the whole region per worker.
-        let wptr = posix::map_shared_sized(wfd, W2M_REGION_SIZE, posix::Backing::Sized)
-            .map_err(|e| format!("failed to map W2M region for W{w}: {e}"))?;
-        // The mapping holds the only reference anything needs from here on, and
-        // closing pre-fork keeps `nw` strays out of every child.
-        unsafe { libc::close(wfd) };
-        // Hint THP backing for the W2M region (memfd/shmem backing).
-        // Requires: echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled
-        // If shmem_enabled remains "never", this call is silently inert — no harm.
-        posix_io::madvise_hugepage(wptr, W2M_REGION_SIZE);
-        // Initialize the SPSC ring header (cursors at HEADER_SIZE,
-        // capacity = full region).
-        unsafe {
-            w2m::init_region(wptr, W2M_REGION_SIZE as u64);
-        }
+        let wptr = w2m::create_region().map_err(|e| format!("failed to map W2M region for W{w}: {e}"))?;
         w2m_ptrs.push(wptr);
 
         // M2W eventfd (master→worker signaling; W2M wakes via futex).
-        let efd = posix::eventfd_create();
-        if efd < 0 {
-            return Err(format!("eventfd_create for W{w} failed"));
-        }
+        let efd = m2w::eventfd_create().map_err(|e| format!("failed to create the M2W eventfd for W{w}: {e}"))?;
         m2w_efds.push(efd);
     }
 
@@ -422,9 +400,9 @@ fn run_worker_child(
     live_epoch: u32,
     placement: Option<&affinity::Placement>,
 ) -> ! {
-    // Die immediately if the master exits for any reason.  The getppid() check
-    // in sal_reader.wait() is a belt-and-suspenders fallback; this closes the
-    // ~30s polling gap.
+    // Die immediately if the master exits for any reason. The `getppid` probe a
+    // worker runs after a timed-out `SalReader::wait` is a belt-and-suspenders
+    // fallback; this closes the ~30s polling gap.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
     // Re-check: parent may have died in the fork→prctl window.
     if unsafe { libc::getppid() } != master_pid {
@@ -549,7 +527,7 @@ fn run_server(
     gnitz_engine::foundation::worker_ctx::set_master_role();
 
     // Raise fd limit (child directories + shard files)
-    posix::raise_fd_limit(65536);
+    raise_fd_limit(65536);
 
     // Pin the master before `CatalogEngine::open`: the boot-time system-table
     // flush below creates the master's first io_uring ring, and an io-wq pool
@@ -759,12 +737,18 @@ fn run_server(
 
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);
-    let server_fd = posix::server_create(socket_path)
-        .map(std::os::fd::IntoRawFd::into_raw_fd)
+    // `UnixListener::bind` does not unlink; a socket left by an earlier run
+    // would be EADDRINUSE. Its backlog is `net.core.somaxconn` (std passes -1).
+    let _ = std::fs::remove_file(socket_path);
+    let server_fd = std::os::unix::net::UnixListener::bind(socket_path)
+        .and_then(|l| {
+            l.set_nonblocking(true)?;
+            Ok(std::os::fd::IntoRawFd::into_raw_fd(l))
+        })
         .map_err(|e| format!("failed to create server socket: {e}"))?;
 
     // Optional TLS listener — after the worker fork (same position as
-    // `server_create`), so no fd inheritance. TLS was explicitly requested
+    // the AF_UNIX bind), so no fd inheritance. TLS was explicitly requested
     // via --tls-listen, so any setup failure aborts boot loudly (silently
     // continuing AF_UNIX-only would be surprising).
     let tls_init = match tls_cli {
@@ -778,4 +762,46 @@ fn run_server(
         server_fd,
         tls_init,
     ))
+}
+
+/// Raise the `RLIMIT_NOFILE` soft limit towards `target`, capped by the hard
+/// limit. Best-effort: the engine opens far fewer descriptors than `target` on
+/// a small database, so a refusal only matters once the partition count grows,
+/// and then it surfaces as `EMFILE` at the open that could not be served.
+fn raise_fd_limit(target: u64) {
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 || rl.rlim_cur >= target as libc::rlim_t {
+            return;
+        }
+        rl.rlim_cur = (target as libc::rlim_t).min(rl.rlim_max);
+        libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In a forked child, because lowering the soft limit is process-wide and
+    /// would break every concurrently running test. In the parent the limit is
+    /// already above 1024, so `raise_fd_limit` early-returns and asserts nothing.
+    #[test]
+    fn test_raise_fd_limit() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+            rl.rlim_cur = 64;
+            let lowered = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) };
+            raise_fd_limit(1024);
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+            let raised = rl.rlim_cur >= 1024.min(rl.rlim_max);
+            unsafe { libc::_exit(i32::from(lowered != 0 || !raised)) };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(libc::WEXITSTATUS(status), 0, "soft limit not raised from 64 to 1024");
+    }
 }

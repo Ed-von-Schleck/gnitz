@@ -74,13 +74,11 @@ impl WorkerProcess {
         }
 
         loop {
-            self.sal_reader.wait(30000);
-
-            // The main run loop flushes before exiting; this path cannot — the
-            // DAG evaluation up the stack holds a live `&mut` to the engine that
-            // `handle_flush_all` would alias. Nothing is lost: the master's death
-            // aborts the cluster, and recovery replays the SAL tail.
-            if self.master_is_gone() {
+            // `_exit`, not `self.shutdown()`: the DAG evaluation up the stack
+            // holds a live `&mut` to the engine that its flush would alias.
+            // Nothing is lost — the master's death aborts the cluster, and
+            // recovery replays the SAL tail.
+            if self.sal_reader.wait(30_000) == Wake::Idle && self.master_is_gone() {
                 unsafe { libc::_exit(0) }
             }
 

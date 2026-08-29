@@ -1,4 +1,4 @@
-use crate::runtime::posix;
+use crate::runtime::m2w::{self, Wake};
 use crate::runtime::sal::{
     atomic_load_u64, effective_max, group_header_size, EpochGate, GroupData, GroupTargets, SalLog, SalMessage,
     SalMessageKind, SalStep, SalWriter, ZoneMark, CHECKPOINT_RESERVE, MIN_SAL_BYTES, SENTINEL_SIZE,
@@ -135,7 +135,7 @@ fn sal_full_error() {
 #[test]
 fn sal_cross_process() {
     let log = TestLog::new(1 << 20, 1);
-    let efd = posix::eventfd_create();
+    let efd = m2w::eventfd_create().unwrap();
     assert!(efd >= 0);
 
     // Built before the fork: the child inherits the bytes copy-on-write and
@@ -147,11 +147,11 @@ fn sal_cross_process() {
         log.writer
             .write_raw_slots(99, 555, SalMessageKind::Scan, ZoneMark::Plain, &[&buf])
             .expect("group fits");
-        posix::eventfd_signal(efd);
+        m2w::eventfd_signal(efd);
         unsafe { libc::_exit(0) };
     }
 
-    assert!(posix::eventfd_wait(efd, 5000) > 0, "child never signalled");
+    assert_eq!(m2w::eventfd_wait(efd, 5000), Wake::Signalled, "child never signalled");
 
     let msg = group_at(log.log(), 0);
     assert_eq!(msg.lsn, 555);
@@ -406,8 +406,8 @@ fn zone_two_groups_one_sentinel() {
 #[test]
 fn sal_cross_process_checkpoint() {
     let log = TestLog::new(1 << 20, 1);
-    let efd = posix::eventfd_create();
-    let efd2 = posix::eventfd_create();
+    let efd = m2w::eventfd_create().unwrap();
+    let efd2 = m2w::eventfd_create().unwrap();
     assert!(efd >= 0 && efd2 >= 0);
 
     // Both payloads exist before the fork, so the child allocates nothing.
@@ -419,11 +419,11 @@ fn sal_cross_process_checkpoint() {
         log.writer
             .write_raw_slots(0, 10, SalMessageKind::Scan, ZoneMark::Plain, &[&buf])
             .expect("group fits");
-        posix::eventfd_signal(efd);
+        m2w::eventfd_signal(efd);
 
         // Wait for the parent to finish reading round 1 before zeroing the
         // region under it.
-        if posix::eventfd_wait(efd2, 5000) <= 0 {
+        if m2w::eventfd_wait(efd2, 5000) != Wake::Signalled {
             unsafe { libc::_exit(1) };
         }
 
@@ -432,15 +432,15 @@ fn sal_cross_process_checkpoint() {
         log.writer
             .write_raw_slots(0, 20, SalMessageKind::Scan, ZoneMark::Plain, &[&buf2])
             .expect("group fits");
-        posix::eventfd_signal(efd);
+        m2w::eventfd_signal(efd);
         unsafe { libc::_exit(0) };
     }
 
-    assert!(posix::eventfd_wait(efd, 5000) > 0, "round 1 never signalled");
+    assert_eq!(m2w::eventfd_wait(efd, 5000), Wake::Signalled, "round 1 never signalled");
     assert_eq!(group_and_next(log.log(), 0, 1).0.lsn, 10);
-    posix::eventfd_signal(efd2);
+    m2w::eventfd_signal(efd2);
 
-    assert!(posix::eventfd_wait(efd, 5000) > 0, "round 2 never signalled");
+    assert_eq!(m2w::eventfd_wait(efd, 5000), Wake::Signalled, "round 2 never signalled");
     assert_eq!(group_and_next(log.log(), 0, 2).0.lsn, 20);
 
     unsafe { assert_child_exited_ok(pid) };

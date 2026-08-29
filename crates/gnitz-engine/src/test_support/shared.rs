@@ -193,10 +193,10 @@ pub fn scratch_dir(scope: &str, name: &str) -> String {
 }
 
 /// Anonymous `MAP_SHARED` region for IPC-shaped tests; unmapped on drop.
-/// Pages are kernel-zeroed and lazily populated (no explicit memset, so a
-/// huge reservation stays cheap). `MAP_SHARED` so a `fork()`ed child sees
-/// the same pages (a child that `_exit`s never runs drops, so only the
-/// parent unmaps).
+/// `MAP_SHARED` so a `fork()`ed child sees the same pages (a child that
+/// `_exit`s never runs drops, so only the parent unmaps). Pages are
+/// kernel-zeroed and lazily populated, and `MAP_NORESERVE` keeps even a
+/// ring-sized region off `Committed_AS`.
 pub struct SharedRegion {
     ptr: *mut u8,
     size: usize,
@@ -209,7 +209,7 @@ impl SharedRegion {
                 std::ptr::null_mut(),
                 size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED | libc::MAP_NORESERVE,
                 -1,
                 0,
             )

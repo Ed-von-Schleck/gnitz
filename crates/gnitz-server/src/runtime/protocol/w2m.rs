@@ -1,6 +1,7 @@
 //! W2M: the worker→master SPSC transport — one `MAP_SHARED` tail-chasing ring
-//! per worker, the worker's [`W2mWriter`], the master's [`W2mReceiver`], and the
-//! futex park/wake protocol between them.
+//! per worker, the worker's [`W2mWriter`], the master's [`W2mReceiver`], the
+//! futex park/wake protocol between them, and the anonymous shared mapping
+//! ([`create_region`]) they all live in.
 //!
 //! ## Layout
 //!
@@ -37,8 +38,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use io_uring::types::FutexWaitV;
 
-use crate::runtime::posix::{self, read_u64_raw, write_u64_raw};
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg};
+use gnitz_engine::foundation::posix_io;
 use gnitz_wire::align8;
 
 // ---------------------------------------------------------------------------
@@ -55,7 +56,7 @@ pub(crate) const MAX_W2M_MSG: u64 = 1 << 28;
 
 /// Capacity (header + data) of each per-worker W2M mmap region.
 ///
-/// The region is a `memfd` mapped whole, so a ring that sweeps all of `DCAP`
+/// The region is mapped whole, so a ring that sweeps all of `DCAP`
 /// every lap holds ~1 GiB of resident shmem per worker for a transport whose
 /// live occupancy is a few KiB. The lever is `MAX_W2M_MSG`, which is this large
 /// because `worker/exchange.rs` publishes an exchange partition uncapped.
@@ -275,6 +276,24 @@ impl RingCursor {
         }
     }
 
+    /// Store the 8-byte prefix word — [`pack_prefix`] or [`SKIP_MARKER`] — at `at`.
+    ///
+    /// # Safety
+    /// `at + 8` must lie within the ring, and the caller must be its producer.
+    #[inline]
+    unsafe fn store_prefix(&self, at: u64, val: u64) {
+        (self.base.add(at as usize) as *mut u64).write_unaligned(val);
+    }
+
+    /// Load the 8-byte prefix word at physical offset `at`.
+    ///
+    /// # Safety
+    /// `at + 8` must lie within the ring, below the published write cursor.
+    #[inline]
+    unsafe fn load_prefix(&self, at: u64) -> u64 {
+        (self.base.add(at as usize) as *const u64).read_unaligned()
+    }
+
     #[inline]
     fn header(&self) -> &'static W2mRingHeader {
         // SAFETY: a cursor only ever holds a base its constructors validated.
@@ -316,13 +335,133 @@ fn futex_word(cursor: &AtomicU64) -> *const AtomicU32 {
     cursor as *const AtomicU64 as *const AtomicU32
 }
 
-/// A failed futex syscall is a hang, not an error anyone would see: the peer
-/// stays blocked on a queue that has work in it. Outlined so `site` is not
-/// spilled onto the stack on the paths that never abort.
+/// `futex2(2)` flags byte for a 32-bit atomic. Matches the kernel constant
+/// `FUTEX2_SIZE_U32` (=2). No `FUTEX2_PRIVATE` bit — a W2M region is
+/// `MAP_SHARED` across `fork()`.
+pub(crate) const FUTEX2_SIZE_U32: u32 = 2;
+
+/// The errno of the most recent failed syscall. The futex wrappers go through
+/// `libc::syscall`, which returns `-1` rather than `-errno`.
+#[inline]
+fn errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+/// How a futex park ended. The wrappers below classify errno here, where it is
+/// still fresh, so no caller has to know which errnos the protocol tolerates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Parked {
+    /// Woken, the value had already moved, or a signal cut the wait short — all
+    /// the same instruction to the caller: re-read the ring, which is
+    /// authoritative.
+    Retry,
+    /// The timeout elapsed with no wake.
+    TimedOut,
+    /// A failure the protocol has no answer to. Carries the raw return code.
+    Failed(i32),
+}
+
+impl Parked {
+    #[inline]
+    fn from_rc(rc: i32) -> Parked {
+        if rc >= 0 {
+            return Parked::Retry;
+        }
+        match errno() {
+            libc::EAGAIN | libc::EINTR => Parked::Retry,
+            libc::ETIMEDOUT => Parked::TimedOut,
+            _ => Parked::Failed(rc),
+        }
+    }
+}
+
+/// Block on the futex at `ptr` until its value differs from `expected` or a wake
+/// arrives; `timeout_ms < 0` blocks forever. Not the `FUTEX_PRIVATE_FLAG`
+/// variant — a W2M region is `MAP_SHARED` across `fork()`.
+fn futex_wait_u32(ptr: *const AtomicU32, expected: u32, timeout_ms: i32) -> Parked {
+    let ts = libc::timespec {
+        tv_sec: (timeout_ms as i64) / 1000,
+        tv_nsec: ((timeout_ms as i64) % 1000) * 1_000_000,
+    };
+    let ts_ptr: *const libc::timespec = if timeout_ms < 0 { std::ptr::null() } else { &ts };
+    Parked::from_rc(unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            ptr as *const libc::c_void,
+            libc::FUTEX_WAIT,
+            expected as libc::c_int,
+            ts_ptr,
+            std::ptr::null::<u32>(),
+            0u32,
+        ) as i32
+    })
+}
+
+/// Wake at most `n_waiters` waiters parked on `ptr` (v1 `FUTEX_WAKE`, no
+/// `FUTEX_PRIVATE_FLAG` — W2M is shared). Aborts rather than reporting: a lost
+/// wake leaves the peer blocked on a queue that has work in it, so there is no
+/// caller-side answer to distinguish. `site` names the caller in the abort.
+#[inline]
+fn futex_wake_u32(ptr: *const AtomicU32, n_waiters: u32, site: &str) {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            ptr as *const libc::c_void,
+            libc::FUTEX_WAKE,
+            n_waiters as libc::c_int,
+            std::ptr::null::<libc::timespec>(),
+            std::ptr::null::<u32>(),
+            0u32,
+        ) as i32
+    };
+    if rc < 0 {
+        futex_failed(site, rc);
+    }
+}
+
+/// Wait on MULTIPLE futex words at once (`SYS_futex_waitv`), returning when ANY
+/// differs from its expected value or is woken — the synchronous analogue of the
+/// reactor's `IORING_OP_FUTEX_WAITV`, built from the same [`FutexWaitV`] so the
+/// kernel struct has one declaration rather than two that can drift.
+fn futex_waitv_u32(waiters: &[FutexWaitV], timeout_ms: i32) -> Parked {
+    if waiters.is_empty() {
+        return Parked::Retry;
+    }
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let ts_ptr: *const libc::timespec = if timeout_ms < 0 {
+        std::ptr::null()
+    } else {
+        // `futex_waitv` takes an ABSOLUTE `CLOCK_MONOTONIC` deadline, unlike the
+        // relative `futex_wait_u32` above; do not harmonize the two.
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        }
+        ts.tv_sec += (timeout_ms as i64) / 1000;
+        ts.tv_nsec += ((timeout_ms as i64) % 1000) * 1_000_000;
+        if ts.tv_nsec >= 1_000_000_000 {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1_000_000_000;
+        }
+        &ts
+    };
+    Parked::from_rc(unsafe {
+        libc::syscall(
+            libc::SYS_futex_waitv,
+            waiters.as_ptr(),
+            waiters.len() as libc::c_uint,
+            0u32, // flags
+            ts_ptr,
+            libc::CLOCK_MONOTONIC,
+        ) as i32
+    })
+}
+
+/// Outlined so `site` is not spilled onto the stack on the paths that never
+/// abort.
 #[cold]
 #[inline(never)]
 fn futex_failed(site: &str, rc: i32) -> ! {
-    gnitz_fatal_abort!("{}: futex failed: rc={} errno={}", site, rc, posix::errno());
+    gnitz_fatal_abort!("{}: futex failed: rc={} errno={}", site, rc, errno());
 }
 
 /// Master→worker, given the flags a retirement's [`ParkWord::publish`] returned.
@@ -334,10 +473,7 @@ fn wake_writer(park: &ParkWord, flags: u32) {
     if flags & FLAG_WRITER_PARKED == 0 {
         return;
     }
-    let rc = posix::futex_wake_u32(futex_word(&park.cursor), 1);
-    if rc < 0 {
-        futex_failed("wake_writer", rc);
-    }
+    futex_wake_u32(futex_word(&park.cursor), 1, "wake_writer");
 }
 
 /// Worker→master, given the flags a publish's [`ParkWord::publish`] returned.
@@ -351,10 +487,7 @@ fn wake_master(park: &ParkWord, flags: u32) {
     park.disarm(FLAG_MASTER_ANY);
     // `count_ones()` folds to 2 — the number of master parks, and an upper bound
     // on the waiters, since either may have unparked since the flags were read.
-    let rc = posix::futex_wake_u32(futex_word(&park.cursor), FLAG_MASTER_ANY.count_ones());
-    if rc < 0 {
-        futex_failed("wake_master", rc);
-    }
+    futex_wake_u32(futex_word(&park.cursor), FLAG_MASTER_ANY.count_ones(), "wake_master");
 }
 
 /// The mask naming workers `0..n`. Written here beside [`BitIter`] because the
@@ -387,6 +520,33 @@ impl Iterator for BitIter {
 // init / reserve / commit
 // ---------------------------------------------------------------------------
 
+/// One worker's ring region, initialized and never unmapped: `MAP_SHARED` so
+/// every forked child sees the same pages, `MAP_NORESERVE` so Linux does not
+/// commit-charge all `W2M_REGION_SIZE` of it per worker at boot — which fails
+/// outright under `vm.overcommit_memory=2`.
+pub(crate) fn create_region() -> std::io::Result<*mut u8> {
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            W2M_REGION_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    let base = ptr as *mut u8;
+    // An anonymous shared mapping is shmem-backed, so this follows
+    // `shmem_enabled` — see `madvise_hugepage`.
+    posix_io::madvise_hugepage(base, W2M_REGION_SIZE);
+    // SAFETY: a fresh mapping of exactly `W2M_REGION_SIZE` bytes, unshared.
+    unsafe { init_region(base, W2M_REGION_SIZE as u64) };
+    Ok(base)
+}
+
 /// Zero the header, seat both cursors at the start of the data area and record
 /// `capacity`. The asserts below are structural; the deployment's own sizing
 /// floor lives at [`W2M_REGION_SIZE`].
@@ -394,7 +554,7 @@ impl Iterator for BitIter {
 /// # Safety
 /// `ptr` must be a writable mapping of at least `capacity` bytes, with no other
 /// thread or process reading or writing the region.
-pub(crate) unsafe fn init_region(ptr: *mut u8, capacity: u64) {
+unsafe fn init_region(ptr: *mut u8, capacity: u64) {
     assert!(
         capacity >= W2M_HEADER_SIZE as u64 + 16,
         "W2M capacity={capacity} leaves no room for a message past the {W2M_HEADER_SIZE}-byte header",
@@ -473,9 +633,9 @@ unsafe fn try_reserve(wc: &RingCursor, sz: usize, internal_req_id: u32) -> Optio
     let (write_at, pad) = publish_at(wc, vrel, total)?;
 
     if pad != 0 {
-        write_u64_raw(wc.base, wc.phys as usize, SKIP_MARKER);
+        wc.store_prefix(wc.phys, SKIP_MARKER);
     }
-    write_u64_raw(wc.base, write_at as usize, pack_prefix(sz, internal_req_id));
+    wc.store_prefix(write_at, pack_prefix(sz, internal_req_id));
     Some(Reservation {
         slot_ptr: wc.base.add(write_at as usize + 8),
         slot_len: sz,
@@ -512,15 +672,8 @@ unsafe fn park_for_room(wc: &RingCursor, sz: usize, req: u32) -> Reservation {
         let vrel = park.arm(FLAG_WRITER_PARKED);
         let reserved = try_reserve(wc, sz, req);
         if reserved.is_none() {
-            let rc = posix::futex_wait_u32(futex_word(&park.cursor), vrel as u32, -1);
-            // `libc::syscall` returns -1 on error (not -errno), so read errno.
-            // EINTR (a signal) and EAGAIN (the cursor already moved) both just
-            // mean retry; anything else is a lost wake.
-            if rc < 0 {
-                let errno = posix::errno();
-                if errno != libc::EINTR && errno != libc::EAGAIN {
-                    futex_failed("W2mWriter::park_for_room", rc);
-                }
+            if let Parked::Failed(rc) = futex_wait_u32(futex_word(&park.cursor), vrel as u32, -1) {
+                futex_failed("W2mWriter::park_for_room", rc);
             }
         }
         park.disarm(FLAG_WRITER_PARKED);
@@ -737,7 +890,7 @@ impl WorkerRing {
         if st.read.virt == vwc {
             return None;
         }
-        let mut prefix = read_u64_raw(base, st.read.phys as usize);
+        let mut prefix = st.read.load_prefix(st.read.phys);
         if prefix == SKIP_MARKER {
             let pad = st.read.room_to_end();
             st.read.advance(pad);
@@ -747,7 +900,7 @@ impl WorkerRing {
                     st.read.phys,
                 );
             }
-            prefix = read_u64_raw(base, st.read.phys as usize);
+            prefix = st.read.load_prefix(st.read.phys);
         }
         let (sz, internal_req_id) = unpack_prefix(prefix);
         if sz == 0 || sz as u64 > MAX_W2M_MSG {
@@ -837,7 +990,7 @@ impl W2mReceiver {
             out[n] = FutexWaitV::new()
                 .val(vwc as u32 as u64)
                 .uaddr(futex_word(&park.cursor) as u64)
-                .flags(posix::FUTEX2_SIZE_U32);
+                .flags(FUTEX2_SIZE_U32);
             n += 1;
         }
         Some(&out[..n])
@@ -869,11 +1022,11 @@ impl W2mReceiver {
     /// the synchronous analogue of the reactor's `FUTEX_WAITV`. Returns at once
     /// if any ring already has unread data. `workers` must be the caller's whole
     /// pending set: only the rings this armed can wake it.
-    pub fn wait_any(&self, workers: u64, timeout_ms: i32) -> i32 {
+    pub fn wait_any(&self, workers: u64, timeout_ms: i32) -> Parked {
         let mut waiters = [FutexWaitV::new(); gnitz_wire::MAX_WORKERS];
         let rc = match self.arm_park(workers, FLAG_MASTER_SYNC, &mut waiters) {
-            Some(armed) => posix::futex_waitv_u32(armed, timeout_ms),
-            None => 0,
+            Some(armed) => futex_waitv_u32(armed, timeout_ms),
+            None => Parked::Retry,
         };
         self.clear_park(workers, FLAG_MASTER_SYNC);
         rc
@@ -965,6 +1118,84 @@ pub(crate) unsafe fn publish(
 mod tests {
     use super::*;
     use gnitz_engine_testkit::SharedRegion;
+
+    // -- futex primitives ----------------------------------------------------
+
+    /// Pins the absence of `FUTEX_PRIVATE_FLAG`: a private futex hashes the word
+    /// to a different key in each process, so the child's wake would never
+    /// arrive — which no in-process test can catch.
+    #[test]
+    fn test_cross_process_futex_on_mapshared() {
+        let region = SharedRegion::new(4096);
+        let atomic_ptr = region.ptr() as *mut AtomicU32;
+        unsafe {
+            (*atomic_ptr).store(7, Ordering::Release);
+        }
+
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // Child: bump the atomic, then wake the parent.
+            unsafe {
+                (*atomic_ptr).store(8, Ordering::Release);
+            }
+            futex_wake_u32(atomic_ptr as *const AtomicU32, 1, "test child");
+            unsafe {
+                libc::_exit(0);
+            }
+        }
+
+        // `Retry` covers both proofs: woken by the child, or the value had
+        // already moved. `TimedOut` is the failure this asserts against.
+        let rc = futex_wait_u32(atomic_ptr as *const AtomicU32, 7, 5000);
+        assert_eq!(rc, Parked::Retry, "the child's wake never reached the parent");
+        let final_val = unsafe { (*atomic_ptr).load(Ordering::Acquire) };
+        assert_eq!(final_val, 8);
+
+        let mut status: i32 = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+    }
+
+    /// The raw multi-word wrapper: a value mismatch fast-returns, no wake times
+    /// out, and a wake on a NON-FIRST word wakes the multi-word wait. The
+    /// timeout case bounds wall-clock only from below — an upper bound would be
+    /// asserting the machine is idle.
+    #[test]
+    fn test_futex_waitv_u32_wakes_on_any_word() {
+        use std::time::Instant;
+        let region = SharedRegion::new(4096);
+        let ptr = region.ptr();
+        let w0 = ptr as *const AtomicU32;
+        let w1 = unsafe { ptr.add(64) } as *const AtomicU32;
+        unsafe {
+            (*w0).store(0, Ordering::Release);
+            (*w1).store(0, Ordering::Release);
+        }
+        let word = |w: *const AtomicU32, val: u64| FutexWaitV::new().val(val).uaddr(w as u64).flags(FUTEX2_SIZE_U32);
+
+        let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 999)], 2000);
+        assert_eq!(rc, Parked::Retry, "value mismatch must fast-return");
+
+        let t = Instant::now();
+        let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 0)], 200);
+        assert_eq!(rc, Parked::TimedOut, "no wake must time out");
+        assert!(t.elapsed().as_millis() >= 150, "timed out before the deadline");
+
+        let pid = unsafe { libc::fork() }; // wake on the NON-FIRST word
+        if pid == 0 {
+            unsafe {
+                libc::usleep(50_000);
+                (*w1).fetch_add(1, Ordering::Release);
+            }
+            futex_wake_u32(w1, 1, "test child");
+            unsafe { libc::_exit(0) };
+        }
+        let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 0)], 5000);
+        assert_eq!(rc, Parked::Retry, "a wake on the non-first word must not time out");
+        unsafe {
+            let mut s = 0;
+            libc::waitpid(pid, &mut s, 0);
+        }
+    }
 
     // -- ring layout ---------------------------------------------------------
 
@@ -1310,7 +1541,7 @@ mod tests {
                 W2mWriter::new(pub_ptr as *mut u8).send_encoded(64, 0, |s| s[0] = 7);
             });
             let start = std::time::Instant::now();
-            let _ = receiver.wait_any(0b1111, 5000); // any ring's wake reaches it
+            receiver.wait_any(0b1111, 5000); // any ring's wake reaches it
             let elapsed = start.elapsed().as_millis();
             handle.join().unwrap();
             assert!(
@@ -1321,8 +1552,7 @@ mod tests {
         }
     }
 
-    /// NEGATIVE: with no publisher, `wait_any` sleeps to the deadline and returns
-    /// -1 (the timeout/error convention callers degrade to one extra poll on).
+    /// NEGATIVE: with no publisher, `wait_any` sleeps to the deadline.
     #[test]
     fn test_wait_any_times_out_with_no_publisher() {
         unsafe {
@@ -1331,7 +1561,7 @@ mod tests {
             let start = std::time::Instant::now();
             let rc = receiver.wait_any(1, 200);
             let elapsed = start.elapsed().as_millis();
-            assert_eq!(rc, -1, "no publisher → timeout returns -1");
+            assert_eq!(rc, Parked::TimedOut, "no publisher → the park must time out");
             assert!(
                 (150..1000).contains(&elapsed),
                 "wait_any should sleep ~200ms, slept {elapsed}ms"
@@ -1346,7 +1576,7 @@ mod tests {
         unsafe {
             let region = make_ring(64, 4, 8);
             let receiver = W2mReceiver::new(vec![region.ptr()]);
-            let _ = receiver.wait_any(1, 50);
+            receiver.wait_any(1, 50);
             assert_eq!(
                 receiver.header(0).master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_SYNC,
                 0,

@@ -10,26 +10,19 @@
 // `crate::runtime::X::…` / `super::X::…` — descendants can name a private
 // sibling module.
 //
-// `orchestration` (master/worker/executor/committer) and `protocol`
-// (wire/sal/w2m) group the submodules by layer; `posix` holds the
-// syscall tier that serves them — sockets, eventfd/futex/memfd and the
-// `MAP_SHARED` rings — which is why it is here and not in the engine's
-// `foundation::posix_io`. `affinity` is a peer rather than part of `posix`
-// because it carries the CPU placement policy, not just the syscalls that
-// apply it. The aliases below are the convention, not a
-// compatibility shim: every reference names `crate::runtime::<mod>`, and
-// nothing in the crate spells out the grouping directory — so the aliases are
-// what those paths resolve through.
+// `orchestration` and `protocol` group the submodules by layer, and the aliases
+// below are what `crate::runtime::<mod>` resolves through — no path names the
+// grouping directory. There is no syscall tier: every syscall lives in the
+// module holding the protocol or policy it serves.
 mod affinity;
 mod bootstrap;
 mod orchestration;
-mod posix;
 mod protocol;
 mod reactor;
 mod tls;
 
 use orchestration::{committer, executor, lsn, master, peer, worker};
-use protocol::{sal, w2m, wire};
+use protocol::{m2w, sal, w2m, wire};
 
 pub(crate) use bootstrap::server_main;
 pub(crate) use tls::TlsCli;

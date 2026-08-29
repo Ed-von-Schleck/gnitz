@@ -18,7 +18,7 @@ pub(crate) mod zone;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::runtime::posix;
+use crate::runtime::m2w::{self, Wake};
 use crate::runtime::wire::{WireData, WireMsg};
 use gnitz_wire::{align8, read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use gnitz_wire::{WireFault, STATUS_SAL_FULL};
@@ -1358,7 +1358,8 @@ impl SalReader {
         self.expected_epoch.set(self.expected_epoch.get() + 1);
     }
 
-    pub fn wait(&self, timeout_ms: i32) -> i32 {
-        posix::eventfd_wait(self.m2w_efd, timeout_ms)
+    /// Park until the master signals, or `timeout_ms` elapses.
+    pub fn wait(&self, timeout_ms: i32) -> Wake {
+        m2w::eventfd_wait(self.m2w_efd, timeout_ms)
     }
 }

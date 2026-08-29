@@ -35,8 +35,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::uring::{Cqe, IoUringRing, CQE_F_MORE};
 
-use crate::runtime::posix::FUTEX2_SIZE_U32;
-use crate::runtime::w2m::{W2mReceiver, W2mSlot};
+use crate::runtime::w2m::{W2mReceiver, W2mSlot, FUTEX2_SIZE_U32};
 use crate::runtime::wire::{self, DecodedWire};
 use gnitz_wire::FLAG_EXCHANGE;
 use gnitz_wire::MAX_WORKERS;
@@ -63,7 +62,7 @@ mod uring;
 
 #[cfg(test)]
 use conn::client_send_timeout;
-pub(crate) use conn::guard_client_egress;
+pub(crate) use conn::{guard_client_egress, shutdown};
 
 pub(crate) use futures::{FsyncFuture, PeerToken, ReplyFuture, ScanLease};
 use futures::{ScanRoute, ScanSlotFuture, SendCarry, TimerFuture};
@@ -195,7 +194,7 @@ struct ReactorShared {
     /// resizes — io_uring SQEs capture the pointer.
     conns: RefCell<FxHashMap<i32, Box<io::Conn>>>,
     /// The OOM guard shared by every connection; its ceiling is resolved once
-    /// at startup by `resolve_inbound_cap`. See [`io::InboundBudget`].
+    /// at startup by [`io::resolve_inbound_cap`]. See [`io::InboundBudget`].
     inbound: Rc<io::InboundBudget>,
     /// Accept queue: `(conn_fd, listener_fd)` pairs delivered by the kernel
     /// but not yet claimed by an `accept().await` caller. The listener fd
@@ -308,22 +307,6 @@ fn probe_futex_waitv_support() {
     });
 }
 
-/// Resolve the global inbound-memory ceiling once at startup.
-///
-/// `GNITZ_INBOUND_MEM_BYTES` is an operator override (floored so it can never
-/// bar a single max-size frame). Otherwise the default is a quarter of the
-/// process memory budget — cgroup `memory.max` if set, else physical RAM —
-/// clamped to `[INBOUND_CAP_FLOOR, INBOUND_CAP_CEIL]`. A fraction of the
-/// *actual* budget scales with the deployment; a flat constant would OOM a
-/// mid-size box yet never trip inside a small container.
-fn resolve_inbound_cap() -> usize {
-    let default =
-        (crate::runtime::posix::available_memory_bytes() / 4).clamp(io::INBOUND_CAP_FLOOR, io::INBOUND_CAP_CEIL);
-    // The operator override wins, floored so it can never bar a single
-    // max-size frame (the default is already within the floor).
-    gnitz_engine::foundation::env::env_num("GNITZ_INBOUND_MEM_BYTES", default).max(io::INBOUND_CAP_FLOOR)
-}
-
 impl Reactor {
     pub fn new(ring_capacity: u32) -> std::io::Result<Self> {
         probe_futex_waitv_support();
@@ -344,7 +327,7 @@ impl Reactor {
             next_scan_req_id: Cell::new(SCAN_REQ_ID_BASE),
             next_op_id: Cell::new(1),
             conns: RefCell::new(FxHashMap::default()),
-            inbound: Rc::new(io::InboundBudget::new(resolve_inbound_cap())),
+            inbound: Rc::new(io::InboundBudget::new(io::resolve_inbound_cap())),
             accept_queue: RefCell::new(VecDeque::new()),
             accept_waker: RefCell::new(None),
             sends: ParkMap::default(),
@@ -1528,7 +1511,7 @@ mod tests {
     #[test]
     fn fsync_future_roundtrip() {
         let r = make_reactor();
-        let fd = crate::runtime::posix::memfd_create(b"reactor_fsync_future");
+        let fd = unsafe { libc::memfd_create(c"reactor_fsync_future".as_ptr(), libc::MFD_CLOEXEC) };
         let rc: Rc<StdCell<i32>> = Rc::new(StdCell::new(1));
         let rc2 = Rc::clone(&rc);
         let fsync = r.fsync(fd);
@@ -1694,7 +1677,7 @@ mod tests {
     #[test]
     fn fsync_real_memfd_roundtrip() {
         let r = make_reactor();
-        let fd = crate::runtime::posix::memfd_create(b"reactor_fsync_ok");
+        let fd = unsafe { libc::memfd_create(c"reactor_fsync_ok".as_ptr(), libc::MFD_CLOEXEC) };
         let rc = r.block_on(r.fsync(fd));
         unsafe {
             libc::close(fd);
@@ -1724,7 +1707,7 @@ mod tests {
     #[test]
     fn fsync_submit_flushes_sqe_before_returning() {
         let r = make_reactor();
-        let fd = crate::runtime::posix::memfd_create(b"reactor_fsync_flush");
+        let fd = unsafe { libc::memfd_create(c"reactor_fsync_flush".as_ptr(), libc::MFD_CLOEXEC) };
         let fut = r.fsync(fd);
         let id = fut.id;
 

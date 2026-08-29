@@ -16,11 +16,64 @@ use std::task::{Context, Poll, Waker};
 pub(crate) const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN as usize;
 
 /// Lower/upper bounds on the global inbound-memory cap (see
-/// `resolve_inbound_cap`). The floor guarantees even a tiny memory budget
+/// [`resolve_inbound_cap`]). The floor guarantees even a tiny memory budget
 /// admits at least one max-size frame; the ceiling caps the default on a
 /// large box where a quarter of RAM would be an excessive inbound reserve.
-pub(super) const INBOUND_CAP_FLOOR: usize = 64 << 20; // 64 MiB
-pub(super) const INBOUND_CAP_CEIL: usize = 4usize << 30; // 4 GiB
+const INBOUND_CAP_FLOOR: usize = 64 << 20; // 64 MiB
+const INBOUND_CAP_CEIL: usize = 4usize << 30; // 4 GiB
+
+/// The global inbound-memory ceiling, resolved once at startup: a quarter of the
+/// process memory budget, or `GNITZ_INBOUND_MEM_BYTES`, never outside the bounds
+/// above. A fraction of the *actual* budget scales with the deployment where a
+/// flat constant would OOM a mid-size box yet never trip in a small container.
+pub(super) fn resolve_inbound_cap() -> usize {
+    let default = (available_memory_bytes() / 4).clamp(INBOUND_CAP_FLOOR, INBOUND_CAP_CEIL);
+    gnitz_engine::foundation::env::env_num("GNITZ_INBOUND_MEM_BYTES", default).max(INBOUND_CAP_FLOOR)
+}
+
+/// Best-effort memory budget for the process, in bytes: the cgroup v2 limit when
+/// there is one, else total physical RAM. `0` if every source fails, which the
+/// clamp above lifts to the floor. Cached — invariant for the process's
+/// lifetime, and the test suite builds many reactors.
+fn available_memory_bytes() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if let Some(v) = cgroup_v2_memory_max() {
+            return v;
+        }
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+        if pages > 0 && page_size > 0 {
+            (pages as usize).saturating_mul(page_size as usize)
+        } else {
+            0
+        }
+    })
+}
+
+/// The tightest finite cgroup v2 `memory.max` from this process's own cgroup up
+/// to the root; `None` when nothing on the path sets one — which is also what a
+/// v1/hybrid host yields, since it writes one line per controller rather than
+/// the unified `0::<path>` matched below.
+fn cgroup_v2_memory_max() -> Option<usize> {
+    // The path must come from here: `/sys/fs/cgroup` alone names the *root*
+    // cgroup, which sets no `memory.max` on a systemd host, so a `MemoryMax=`d
+    // unit would read as host RAM.
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    // The v2 path is absolute; `join` would discard the mount point.
+    let rel = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    std::path::Path::new("/sys/fs/cgroup")
+        .join(rel.trim_start_matches('/'))
+        .ancestors()
+        .take_while(|d| d.starts_with("/sys/fs/cgroup"))
+        // The literal `"max"` (unlimited at this level) fails the parse, as
+        // does an absent file; both are skipped.
+        .filter_map(|d| std::fs::read_to_string(d.join("memory.max")).ok())
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .min()
+}
 
 /// Accounted memory weight of one inbound payload buffer of `len` bytes.
 #[inline]

@@ -8,7 +8,7 @@
 //! - the **read pump**: raw recv → `read_tls` → `process_new_packets` →
 //!   plaintext fed into the shared `RecvQueue`. Never locks the send
 //!   mutex, never sends; on any recv-side death it issues the lock-free
-//!   `posix::shutdown` that aborts a parked writer.
+//!   `shutdown` that aborts a parked writer.
 //! - the **flusher**: serializes ciphertext extraction *and its send*
 //!   under `send_mutex` and issues the lock-free socket shutdown. The fd
 //!   itself is closed by `Drop for TlsShared`, when the last holder is gone.
@@ -22,7 +22,7 @@
 //! making it the "at most one `OP_SEND` in flight per fd" guarantee. That
 //! in turn means no TLS send may be unbounded: every client-bound send is
 //! wrapped in the per-frame eviction deadline (`guard_eviction`), whose
-//! expiry fires the lock-free `posix::shutdown` that aborts whichever
+//! expiry fires the lock-free `shutdown` that aborts whichever
 //! `send_raw` holds the mutex.
 //!
 //! The two siblings hold the rest of TLS: `config` builds the rustls
@@ -45,9 +45,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::runtime::posix;
 use crate::runtime::reactor::io::{self, RecvBuf};
-use crate::runtime::reactor::{guard_client_egress, mpsc, AsyncMutex, Reactor};
+use crate::runtime::reactor::{guard_client_egress, mpsc, shutdown, AsyncMutex, Reactor};
 use crate::runtime::w2m::W2mSlot;
 use gnitz_engine::storage::batch_pool::PooledSendBuf;
 
@@ -154,7 +153,7 @@ pub(crate) struct TlsShared {
     /// Serializes ciphertext extraction + its `send_raw` across the flusher
     /// and every `send_bytes` sender — the ≤1-`OP_SEND`-in-flight /
     /// record-order invariant. Teardown never *acquires* it (lock-free
-    /// `posix::shutdown` aborts a parked holder instead), so it can
+    /// `shutdown` aborts a parked holder instead), so it can
     /// never wedge teardown.
     send_mutex: Rc<AsyncMutex>,
     /// Ciphertext staging buffer reused across sends (capacity retained).
@@ -164,6 +163,25 @@ pub(crate) struct TlsShared {
     cipher_scratch: RefCell<Vec<u8>>,
     /// Wakes the flusher task.
     flush_tx: mpsc::Sender<()>,
+}
+
+/// What every accepted TLS socket wants, set here so the accept loop needs no
+/// socket-option knowledge. Best-effort: a socket that refuses either works on.
+fn set_socket_options(fd: i32) {
+    let on: libc::c_int = 1;
+    let len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    for (level, opt) in [
+        // Small control frames must not pay Nagle's 40 ms batching delay
+        // (AF_UNIX has none, so this restores latency parity).
+        (libc::IPPROTO_TCP, libc::TCP_NODELAY),
+        // Untuned: a silently half-open connection is reaped by the kernel
+        // default probing (~2 h) rather than parking a recv forever.
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+    ] {
+        unsafe {
+            libc::setsockopt(fd, level, opt, &on as *const _ as *const libc::c_void, len);
+        }
+    }
 }
 
 impl TlsShared {
@@ -182,6 +200,7 @@ impl TlsShared {
         // `conn_guard` drops here (decrement) as this frame unwinds; on
         // success it lives in the returned `TlsShared`.
         let sess = rustls::ServerConnection::new(cfg)?;
+        set_socket_options(fd);
         let (flush_tx, flush_rx) = mpsc::unbounded::<()>();
         let conn = Rc::new(TlsShared {
             state: RefCell::new(TlsConn::new(sess, Rc::clone(reactor.inbound()))),
@@ -378,12 +397,12 @@ async fn read_pump(conn: Rc<TlsShared>) {
     // client has stopped reading pins the mutex and the flusher can never
     // flush or close. Idempotent with the flusher's own shutdown on the
     // local-close path.
-    posix::shutdown(conn.fd());
+    shutdown(conn.fd());
     conn.notify_flusher(); // run teardown
 }
 
 /// The flusher — it and the senders serialize ciphertext extraction AND
-/// its send under `send_mutex`. Teardown (`posix::shutdown`) is lock-free: it
+/// its send under `send_mutex`. Teardown (`shutdown`) is lock-free: it
 /// never *acquires* the mutex, so a writer parked in `send_raw` can never
 /// wedge it.
 async fn flusher(conn: Rc<TlsShared>, mut rx: mpsc::Receiver<()>) {
@@ -424,7 +443,7 @@ async fn flusher(conn: Rc<TlsShared>, mut rx: mpsc::Receiver<()>) {
             (c.closed, c.q.recv_closed())
         };
         if closed || recv_closed {
-            posix::shutdown(conn.fd());
+            shutdown(conn.fd());
         }
         // The local close ran, so nothing more will ever be queued for this
         // connection: exit and release this task's `Rc<TlsShared>`. The fd is
