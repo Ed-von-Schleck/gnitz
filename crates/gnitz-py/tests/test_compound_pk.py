@@ -684,7 +684,7 @@ def test_index_on_stride24_pk_source_via_sql(client):
     """Secondary index on a stride-24 (three-U64) compound-PK table. The index
     PK is `indexed_col + source_pk` = 8 + 24 = 32 bytes, well past the 16-byte
     narrow cap, so the index table itself uses the wide byte-path accessors.
-    `ops/index.rs` sizes the composite key against MAX_PK_BYTES, so this is
+    The index schema sizes the composite key against MAX_PK_BYTES, so this is
     reachable once the gate is lifted; the lookup must round-trip correctly."""
     sn = "cpk" + _uid()
     client.create_schema(sn)

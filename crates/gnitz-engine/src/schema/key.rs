@@ -879,7 +879,7 @@ pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: us
 
 // ---------------------------------------------------------------------------
 // Order-preserving float image — each pair must stay mutual inverses: the AVI
-// value codec (`ops::util`) encodes through the forward half, decodes through
+// value codec (`ops::reduce::avi`) encodes through the forward half, decodes through
 // the reverse one.
 // ---------------------------------------------------------------------------
 
@@ -976,7 +976,7 @@ fn hash_group_col<R: RowSource>(hasher: &mut RowHasher, src: &R, row: usize, nul
 }
 
 /// The 128-bit XXH3 fold of `locs` over one row. The one body behind both folds
-/// — `ops::util::GroupKeyCols::key_row`'s non-canonical branch and the packed
+/// — `ops::group_key::GroupKeyCols::key_row`'s non-canonical branch and the packed
 /// group key's overflow slot — so the two cannot drift apart.
 #[inline]
 pub(crate) fn hash_fold<R: RowSource>(locs: &[ColumnLocator], src: &R, row: usize, null_word: u64) -> u128 {
@@ -1007,6 +1007,109 @@ pub(crate) fn german_string_promote_key(struct_bytes: &[u8], blob: &[u8]) -> u12
     // strings collide to one `_join_pk` and the join's OPK byte-compare silently
     // equijoins them.
     xxh::checksum_128(content)
+}
+
+// ---------------------------------------------------------------------------
+// Packed group key
+// ---------------------------------------------------------------------------
+
+/// The PK slot type one group column packs into.
+///
+/// A `≤8`-byte integer (and the signed 128-bit one) keeps its own width and sign,
+/// so its slot is the plain OPK image of the value. A float packs to `U64` — the
+/// `ieee_order_bits` image, which is order-preserving where the raw bits are not
+/// (±0.0 differ, NaN has no canonical pattern) and which agrees with the
+/// `total_cmp` order the group comparator uses. Everything else — `U128`/`UUID`
+/// verbatim, `STRING`/`BLOB` by content hash — packs to a 16-byte `U128`.
+const fn group_key_slot_type(tc: u8) -> u8 {
+    if gnitz_wire::is_fixed_int(tc) || tc == type_code::I128 {
+        tc
+    } else if tc == type_code::F32 || tc == type_code::F64 {
+        type_code::U64
+    } else {
+        type_code::U128
+    }
+}
+
+/// The layout of a packed group key: which slots its PK region carries, and how
+/// many of the group columns got a slot of their own.
+///
+/// Every grouped reduce has one, at any arity and over any column type — that
+/// universality is the point. Columns past the budget do not make the key
+/// unbuildable; they fold into the trailing hash slot.
+struct GroupKeyLayout {
+    /// A leading `U8` presence bitmap: bit *i* is set iff packed column *i* is
+    /// NULL. Present iff some group column is nullable. One byte total, not one
+    /// per column — without it a NULL group and a `0` group collide on one
+    /// output PK.
+    has_bitmap: bool,
+    /// How many leading group columns carry their own slot. The rest fold.
+    n_packed: usize,
+    /// Whether a trailing 16-byte hash slot folds the group columns past
+    /// `n_packed`. Equivalently `n_packed < group_cols.len()`.
+    has_fold: bool,
+    /// The PK slot type codes in order: the bitmap (if any), then one per packed
+    /// column, then the fold slot (if any).
+    slots: Vec<u8>,
+}
+
+impl GroupKeyLayout {
+    /// Total PK stride of the packed key.
+    fn stride(&self) -> usize {
+        self.slots.iter().map(|&t| gnitz_wire::wire_stride(t)).sum()
+    }
+}
+
+/// Resolve the packed group-key layout for `cols`, each given as its
+/// `(type_code, nullable)`, inside the PK budget the caller's `reserve` for its
+/// own trailing suffix columns leaves free.
+///
+/// Greedy: pack leading columns while the budget still leaves room for the fold
+/// slot the remaining columns would need. Total — every group set gets a layout,
+/// which is what lets the reduce drop its eligibility gate.
+fn group_key_layout(cols: &[(u8, bool)], reserve_cols: usize, reserve_bytes: usize) -> GroupKeyLayout {
+    let max_cols = MAX_PK_COLUMNS - reserve_cols;
+    let max_bytes = MAX_PK_BYTES - reserve_bytes;
+    // Both bounds are functions of the reservation alone, so they are checked
+    // here rather than left to each caller to assert for itself.
+    assert!(
+        max_cols >= 2 && max_bytes >= 17,
+        "group-key reservation must leave room for a bitmap byte and a 16-byte fold slot",
+    );
+    assert!(max_cols <= 9, "the one bitmap byte addresses at most 8 packed columns");
+    let has_bitmap = cols.iter().any(|&(_, nullable)| nullable);
+    let mut slots: Vec<u8> = Vec::with_capacity(cols.len() + 2);
+    let mut bytes = 0usize;
+    if has_bitmap {
+        slots.push(type_code::U8);
+        bytes += 1;
+    }
+    let mut n_packed = 0usize;
+    for (i, &(tc, _)) in cols.iter().enumerate() {
+        let slot = group_key_slot_type(tc);
+        let w = gnitz_wire::wire_stride(slot);
+        // Room this column needs, plus the fold slot the columns behind it would
+        // still require. Reserving it here is what keeps the greedy walk from
+        // packing a column it would have to give back.
+        let tail_cols = usize::from(i + 1 < cols.len());
+        let tail_bytes = tail_cols * 16;
+        if slots.len() + 1 + tail_cols > max_cols || bytes + w + tail_bytes > max_bytes {
+            break;
+        }
+        slots.push(slot);
+        bytes += w;
+        n_packed += 1;
+    }
+    let has_fold = n_packed < cols.len();
+    if has_fold {
+        slots.push(type_code::U128);
+    }
+    GroupKeyLayout {
+        has_bitmap,
+        n_packed,
+        has_fold,
+        slots,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1176,15 +1279,17 @@ impl ReindexPacker {
         Some(b.finish())
     }
 
-    /// Build the packer for a **group** key over `group_cols`. Every slot type
-    /// comes from [`gnitz_wire::group_key_layout`], read here and nowhere else:
-    /// every schema over this key goes through [`Self::key_columns`], so a group
-    /// key's slots and its bytes cannot disagree.
+    /// Build the packer for a **group** key over `group_cols`, leaving the PK
+    /// budget `reserve` needs for the suffix columns the caller appends behind
+    /// the key. Every slot type comes from [`group_key_layout`], read here and
+    /// nowhere else: every schema over this key goes through
+    /// [`Self::key_columns`], so a group key's slots and its bytes cannot
+    /// disagree.
     ///
     /// Unlike a join key this is total — columns past the budget fold into one
     /// trailing hash slot — which is what lets the reduce index every group set
     /// instead of rescanning the trace per epoch.
-    pub(crate) fn new_group_key(schema: &SchemaDescriptor, group_cols: &[u32]) -> Self {
+    pub(crate) fn new_group_key(schema: &SchemaDescriptor, group_cols: &[u32], reserve: &[SchemaColumn]) -> Self {
         let descs: Vec<(u8, bool)> = group_cols
             .iter()
             .map(|&c| {
@@ -1192,7 +1297,9 @@ impl ReindexPacker {
                 (col.type_code, col.nullable != 0)
             })
             .collect();
-        let layout = gnitz_wire::group_key_layout(&descs);
+        // The reservation is the suffix columns themselves, so their count and
+        // their width are one fact rather than two that can drift.
+        let layout = group_key_layout(&descs, reserve.len(), reserve.iter().map(|c| c.size() as usize).sum());
         let folded: Vec<ColumnLocator> = group_cols[layout.n_packed..]
             .iter()
             .map(|&c| schema.locate(c as usize))
@@ -2314,7 +2421,7 @@ mod tests {
         }
         let mb = b.as_mem_batch();
 
-        let packer = ReindexPacker::new_group_key(&schema, &[1, 2]);
+        let packer = ReindexPacker::new_group_key(&schema, &[1, 2], &[]);
         assert_eq!(packer.out_stride, 1 + 8 + 4, "bitmap ++ I64 slot ++ U32 slot");
 
         let mut null_row = [0u8; crate::schema::MAX_PK_BYTES];
@@ -2514,7 +2621,7 @@ mod tests {
             gb.count += 1;
         }
         let gmb = gb.as_mem_batch();
-        let grp_packer = ReindexPacker::new_group_key(&grp_schema, &[1, 2]);
+        let grp_packer = ReindexPacker::new_group_key(&grp_schema, &[1, 2], &[]);
 
         for (name, packer, mb) in [("join3", &join_packer, &jmb), ("group2-nullable", &grp_packer, &gmb)] {
             let stride = packer.out_stride;

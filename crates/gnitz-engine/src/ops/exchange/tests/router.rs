@@ -1,5 +1,5 @@
 use super::*;
-use crate::ops::util::GroupKeyCols;
+use crate::ops::group_key::GroupKeyCols;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_batch, make_schema_u64_i64};
 

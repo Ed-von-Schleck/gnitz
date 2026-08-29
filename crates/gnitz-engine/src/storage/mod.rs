@@ -42,7 +42,7 @@ pub(crate) use lsm::table::enforce_unique_pk;
 pub use lsm::table::{RecoverySource, Table};
 pub use merge::MemBatch;
 pub use scatter::route_rows_by_pk;
-pub(crate) use scatter::scatter_unified_sources;
+pub(crate) use scatter::{batch_project_index, scatter_unified_sources};
 
 // ── Operator hot-path types ──────────────────────────────────────────────────
 pub use batch::{BatchBuilder, Layout};

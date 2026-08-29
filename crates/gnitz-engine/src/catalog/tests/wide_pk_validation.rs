@@ -6,7 +6,7 @@
 //! enforcement over a wide PK runs distributed and is covered end-to-end.
 
 use super::*;
-use crate::query::{DagEngine, RelationKind, StoreHandle};
+use crate::query::{RelationKind, StoreHandle};
 use crate::schema::make_index_schema;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, RecoverySource, Table};
@@ -63,7 +63,7 @@ fn setup_wide_unique(
     .unwrap();
 
     let bb = wide_val_batch(&schema, base_rows);
-    let idx_batch = DagEngine::batch_project_index(
+    let idx_batch = crate::storage::batch_project_index(
         &bb,
         &crate::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
         &idx_schema,

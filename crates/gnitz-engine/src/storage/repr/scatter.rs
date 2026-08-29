@@ -1,5 +1,6 @@
 //! Exchange repartition: column-first scatter of selected (possibly reordered,
-//! multi-source) rows into a `DirectWriter`.
+//! multi-source) rows into a `DirectWriter`, plus the two per-row passes that
+//! share its shape — PK routing and secondary-index projection.
 //!
 //! The merge half of `merge.rs` consolidates sorted runs in place; this half
 //! *scatters* arbitrary row selections during exchange repartition, joins,
@@ -15,7 +16,7 @@
 //! fixed-region buffers are written directly, so `DirectWriter` keeps them
 //! `pub(super)`.
 
-use super::batch::FIXED_REGION_BYTES;
+use super::batch::{Batch, FIXED_REGION_BYTES};
 use super::merge::{ColPtr, DirectWriter, MemBatch, UnifiedSource};
 use gnitz_wire::is_german_string;
 
@@ -73,6 +74,46 @@ pub fn route_rows_by_pk(mb: &MemBatch, schema: &crate::schema::SchemaDescriptor,
         }
         slots[schema.worker_for_pk(mb.get_pk_bytes(i), num_workers)].push(i as u32);
     }
+}
+
+/// Project every live row of `src` into one secondary-index entry.
+///
+/// An index schema is all PK and no payload, so the entry *is* its key —
+/// `(indexed col(s) [promoted] ‖ source PK)`, composed by `spec.write_entry`,
+/// which also decides the SQL NULL-distinctness skip.
+///
+/// Retractions (weight < 0) project, so an index entry retracts with its source
+/// row; weight-0 rows are dropped for the reason [`route_rows_by_pk`] drops them.
+pub(crate) fn batch_project_index(
+    src: &Batch,
+    spec: &crate::schema::IndexKeySpec,
+    idx_schema: &crate::schema::SchemaDescriptor,
+) -> Batch {
+    let idx_stride = idx_schema.pk_stride() as usize;
+
+    let mut out = Batch::with_capacity(*idx_schema, src.count.max(1));
+    // MAX_PK_BYTES bounds every index schema's pk_stride (asserted in
+    // SchemaDescriptor::new), so the scratch PK buffer lives on the stack with no
+    // per-batch heap allocation. The used [..idx_stride] prefix is fully
+    // overwritten each row; the single zero-init covers the (currently empty) tail.
+    let mut idx_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
+
+    let mb = src.as_mem_batch();
+
+    for row in 0..src.count {
+        let weight = src.get_weight(row);
+        if weight == 0 {
+            continue;
+        }
+        if !spec.write_entry(&mb, row, &mut idx_pk_buf) {
+            continue;
+        }
+        out.push_key_row(&idx_pk_buf[..idx_stride], weight);
+    }
+
+    // `out` is `Raw` from `with_capacity`; the `extend_*` loop above never raises
+    // it, and the index-table ingest re-sorts/folds it.
+    out
 }
 
 /// Scatter-copy rows from a batch at the given indices, carrying each row's own

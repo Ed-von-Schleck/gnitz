@@ -9,22 +9,6 @@ use super::agg::{apply_agg_from_value_index, fold_old_aggs, read_old_minmax_enco
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::plan::ReducePlan;
 use super::sort::{argsort_delta, argsort_pk_canonical, compare_by_group_cols};
-use crate::schema::key::ReindexPacker;
-
-/// The history a non-linear (MIN/MAX) reduce consults: the combined
-/// aggregate-value index's cursor, together with the packer that spells a
-/// group's key into the prefix that cursor seeks.
-///
-/// The two arrive as one value because they are one fact. A cursor without its
-/// packer — or a `ReducePlan` flag claiming an index the caller did not open —
-/// is a state nothing produces, and the operator used to re-prove that at six
-/// sites. `None` *is* "every aggregate is linear": the two are the same bit
-/// (`AggFunc::is_linear` and `uses_value_index` are disjoint and exhaustive, and
-/// every group set is indexable), which the `debug_assert_eq!` below pins.
-pub(crate) struct AviHistory<'a> {
-    pub cursor: &'a mut ReadCursor,
-    pub packer: &'a ReindexPacker,
-}
 
 /// Per-group delta rows the AVI probe-skip path will pre-step into a MIN/MAX
 /// accumulator before giving up and probing. Pre-stepping is O(positive rows),
@@ -133,28 +117,22 @@ fn walk_group_rows(
 pub(crate) fn op_reduce(
     delta: &Batch,
     trace_out_cursor: &mut ReadCursor,
-    // The MIN/MAX history: the combined value index's cursor and the packer that
-    // keys it. `None` iff every aggregate is linear.
-    mut history: Option<AviHistory<'_>>,
+    // A cursor over the combined value index `plan.avi` describes, opened by the
+    // caller after this epoch's entries were populated into it. `Some` exactly
+    // when `plan.avi` is.
+    mut history: Option<&mut ReadCursor>,
     plan: &ReducePlan,
 ) -> Batch {
     let input_schema = &plan.input_schema;
     let output_schema = &plan.output_schema;
-    let all_linear = plan.all_linear;
     let global_ground = plan.global_ground;
-    // `AggFunc::is_linear` and `uses_value_index` are disjoint and exhaustive,
-    // and every group set has a packed key the value index can hold — so "some
-    // aggregate is non-linear" and "this reduce was handed a history" are the
-    // same bit. Everything below reads one or the other and never re-derives.
-    debug_assert_eq!(
-        all_linear,
-        history.is_none(),
-        "a non-linear reduce is served by its value index; a linear one is handed none",
-    );
+    // The plan's value index *is* the "some aggregate is non-linear" bit;
+    // everything below reads it and never re-derives linearity.
+    let avi = plan.avi.as_ref();
 
     // Consolidate only for non-linear aggregates; linear aggregates work on raw delta.
     // Fast path (linear or already consolidated): borrow delta directly — no allocation.
-    let cs = if all_linear {
+    let cs = if avi.is_none() {
         None
     } else {
         Batch::consolidate_if_needed(delta, input_schema)
@@ -225,9 +203,10 @@ pub(crate) fn op_reduce(
     let cardinality_idx: Option<usize> = plan.cardinality_idx.map(|i| i as usize);
 
     // The AVI seek prefix `group ‖ ordinal`, hoisted out of the group loop: each
-    // group's pack fully overwrites `gk[..gstride]` and each ordinal overwrites
-    // `gk[gstride]`, so reuse needs no inter-group clear — where a per-group
-    // declaration is an 80-byte zero store per group at `opt-level = 0`.
+    // group's pack fully overwrites the key's group span and each ordinal
+    // overwrites the byte behind it, so reuse needs no inter-group clear — where
+    // a per-group declaration is an 80-byte zero store per group at
+    // `opt-level = 0`.
     let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
     let mut idx = 0usize;
     let mut num_groups = 0usize;
@@ -317,14 +296,14 @@ pub(crate) fn op_reduce(
         if has_old {
             fold_old_aggs(&mut accs, trace_out_cursor, agg_col_widths, cbase);
         }
-        if let Some(h) = history.as_mut() {
-            // Pack the group key once, then per non-linear aggregate append its
-            // ordinal and prefix-seek `group ‖ ordinal` for the post-delta extreme.
-            let gstride = h.packer.out_stride;
-            h.packer.pack_into(&mut gk[..gstride], &mb, group_start_idx);
-            // `!is_linear()` is `uses_value_index()` over `AggFunc`, so this
-            // selects the same aggregates in the same order the index wrote them.
-            for (j, (k, acc)) in accs.iter_mut().enumerate().filter(|(_, a)| !a.is_linear()).enumerate() {
+        if let Some(bake) = avi {
+            let cursor = history
+                .as_deref_mut()
+                .expect("a value-indexed reduce is handed a cursor over the index its plan describes");
+            // Pack the group key once; each ordinal then rewrites only the tail.
+            bake.pack_group(&mut gk, &mb, group_start_idx);
+            for (j, k) in bake.acc_indices().enumerate() {
+                let acc = &mut accs[k];
                 // The source type lives on the accumulator, resolved from the
                 // same locator the index write side read the value through.
                 let src_tc = acc.type_code();
@@ -334,8 +313,7 @@ pub(crate) fn op_reduce(
                 // trace cursor, `pos` pre-stepped in the walk. Everything else
                 // probes, the index being its own source of truth.
                 if saw_negative || src_tc.is_float() || capped || !has_old {
-                    gk[gstride] = j as u8;
-                    apply_agg_from_value_index(h.cursor, &gk[..gstride + 1], acc.is_max(), acc);
+                    apply_agg_from_value_index(cursor, bake.prefix(&mut gk, j as u8), acc.is_max(), acc);
                 } else if let Some(enc) = read_old_minmax_encoded(
                     // The accumulator holds `pos` (or is untouched → NULL); fold
                     // in `old`, read off the trace_out cursor already positioned

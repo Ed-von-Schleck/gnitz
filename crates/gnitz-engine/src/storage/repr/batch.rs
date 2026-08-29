@@ -887,6 +887,26 @@ impl Batch {
         self.extend_region(REG_PK, bytes);
     }
 
+    /// Append one whole row of a **payload-free** schema — an index entry, whose
+    /// columns are all PK, so its key is the entire row.
+    ///
+    /// Every fixed region and `count` advance together here. Written out at the
+    /// call site instead, a dropped `extend_null_bmp` leaves that region's cursor
+    /// one row behind `count` for the rest of the batch, with no error: the null
+    /// words simply read as whatever the uninitialised arena held.
+    #[inline]
+    pub(crate) fn push_key_row(&mut self, pk: &[u8], weight: i64) {
+        debug_assert_eq!(
+            self.num_payload_cols(),
+            0,
+            "push_key_row writes no payload region; use the per-column extends",
+        );
+        self.extend_pk_bytes(pk);
+        self.extend_weight(&weight.to_le_bytes());
+        self.extend_null_bmp(&0u64.to_le_bytes());
+        self.count += 1;
+    }
+
     /// Append a row's PK from native per-column values, OPK-encoding them
     /// (big-endian, with the sign-bit flip for signed columns) before the
     /// bytes are written. `native_col_vals` holds one native value per PK

@@ -5,7 +5,7 @@ use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, MemBatch};
 use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 
-use super::super::util::GroupKeyCols;
+use super::super::group_key::GroupKeyCols;
 use crate::schema::key::ReindexPacker;
 
 /// Keep only the rows this worker owns, by packed-PK hash — the trace-side

@@ -1613,7 +1613,7 @@ fn test_seek_prefix_matches_projection() {
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        crate::query::DagEngine::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx), &idx)
+        crate::storage::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx), &idx)
     };
     assert_eq!(projected.count, 1);
 
@@ -1628,6 +1628,63 @@ fn test_seek_prefix_matches_projection() {
         proj_key,
         "seek prefix bytes must equal projected leading-key bytes"
     );
+}
+
+/// `IndexKeySpec::key_bytes` produces exactly the leading `idx_key_size` bytes
+/// that `batch_project_index` writes as the index PK prefix — so the in-memory
+/// key, the projected index entry, and the seek prefix all agree, across a
+/// signed / unsigned / U128 column mix.
+#[test]
+fn index_key_spec_equals_projected_leading_span() {
+    use crate::schema::key::PkBuf;
+    use crate::schema::{type_code as tc, IndexKeySpec, SchemaColumn, SchemaDescriptor};
+    // Owner: PK id U64; a I64 (signed payload), b U128 (payload).
+    let owner = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(tc::U64, 0),
+            SchemaColumn::new(tc::I64, 0),
+            SchemaColumn::new(tc::U128, 0),
+        ],
+        &[0],
+    );
+    // Composite unique on (a, b): promoted (I64→U64, U128→U128) = 8 + 16 = 24.
+    let cols = [1u32, 2];
+    let idx_schema = make_index_schema(&cols, &owner).unwrap();
+    let spec = IndexKeySpec::new(&cols, &owner, &idx_schema);
+    let idx_key_size = spec.key_size();
+    assert_eq!(idx_key_size, 8 + 16, "I64→U64 (8) + U128 (16)");
+
+    let mut batch = Batch::with_capacity(owner, 4);
+    let rows: [(u128, i64, u128); 3] = [(1, -3, 100), (2, 7, u128::MAX), (3, i64::MIN, 0)];
+    for &(id, a, b) in &rows {
+        unsafe {
+            batch.append_row_simple(
+                id,
+                1,
+                0,
+                &[a, b as u64 as i64],
+                &[0, (b >> 64) as u64],
+                &[std::ptr::null(), std::ptr::null()],
+                &[0, 0],
+            );
+        }
+    }
+
+    // Reference: the projected index entry's leading idx_key_size bytes.
+    let projected =
+        crate::storage::batch_project_index(&batch, &IndexKeySpec::new(&cols, &owner, &idx_schema), &idx_schema);
+    assert_eq!(projected.count, rows.len());
+
+    let mb = batch.as_mem_batch();
+    let mut keybuf = PkBuf::zeroed(0);
+    for row in 0..batch.count {
+        assert!(spec.key_bytes(&mb, row, &mut keybuf));
+        assert_eq!(
+            keybuf.pk_bytes(),
+            &projected.get_pk_bytes(row)[..idx_key_size],
+            "key_bytes must equal the projected entry's leading span (row {row})",
+        );
+    }
 }
 
 // ── Signed secondary-index ordering (order-preserving signed leading key) ────
@@ -1657,7 +1714,7 @@ fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        crate::query::DagEngine::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1], &src, idx), idx)
+        crate::storage::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1], &src, idx), idx)
     };
     let key_size = idx.columns[0].size() as usize;
     projected.get_pk_bytes(0)[..key_size].to_vec()
@@ -1876,11 +1933,7 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
         bb.end_row();
         let projected = {
             let b = bb.finish();
-            crate::query::DagEngine::batch_project_index(
-                &b,
-                &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx),
-                &idx,
-            )
+            crate::storage::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx), &idx)
         };
         spans.push(projected.get_pk_bytes(0)[..key_size].to_vec());
     }
@@ -2523,7 +2576,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // owned `Table`, the shape an index owner takes in production. The leading
     // PK column is distinct per row: the base flush orders the shard by the wide
     // PK, which the resolve's binary-search seek relies on.
-    use crate::query::{DagEngine, RelationKind, StoreHandle};
+    use crate::query::{RelationKind, StoreHandle};
     use crate::schema::SchemaDescriptor;
     use crate::storage::{RecoverySource, Table};
 
@@ -2549,7 +2602,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     }
     // Rows were appended out of PK order; the batch is `Raw` (the constructor
     // default), so the ingest's `into_consolidated` sorts the shard.
-    let idx_batch = DagEngine::batch_project_index(
+    let idx_batch = crate::storage::batch_project_index(
         &bb,
         &crate::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
         &idx_schema,

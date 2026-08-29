@@ -3,7 +3,7 @@
 //! match arms would break monomorphization of the dispatch loop.
 
 use super::*;
-use crate::ops::{self, OpsIntegrateTarget};
+use crate::ops;
 use crate::storage::{Batch, ReadCursor};
 
 // ---------------------------------------------------------------------------
@@ -298,25 +298,15 @@ pub(crate) fn execute_epoch_from(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::Integrate { in_reg, target } => {
+            Instr::Integrate { in_reg, table_idx } => {
                 if read_only {
                     continue;
                 }
-                let (table_idx, op_target) = match target {
-                    IntegrateTarget::Trace(idx) => (*idx, OpsIntegrateTarget::Trace(program.table_mut(*idx))),
-                    IntegrateTarget::Avi(a) => (
-                        a.table_idx,
-                        OpsIntegrateTarget::Avi(program.table_mut(a.table_idx), &program.avi_bakes[a.bake_idx.at()]),
-                    ),
-                };
-
-                gnitz_debug!(
-                    "vm: INTEGRATE in_count={} avi={}",
-                    reg!(*in_reg).batch.count,
-                    matches!(op_target, OpsIntegrateTarget::Avi(..)),
-                );
-                let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, op_target);
-                log_tick_ingest_err("integrate", table_idx, res)?;
+                gnitz_debug!("vm: INTEGRATE in_count={}", reg!(*in_reg).batch.count);
+                let res = program
+                    .table_mut(*table_idx)
+                    .ingest_borrowed_batch(&reg!(*in_reg).batch);
+                log_tick_ingest_err("integrate", *table_idx, res)?;
             }
 
             Instr::Reduce {
@@ -329,15 +319,20 @@ pub(crate) fn execute_epoch_from(
                 let plan = &program.reduce_plans[plan_idx.at()];
                 let to_cursor = cursor_mut!(*trace_out_reg);
 
-                // Combined AVI cursor — created fresh from the value-index table
-                // (not a register). Must be created AFTER INTEGRATE populates the
-                // table, so the prefix seek returns the post-delta extreme.
-                // Operator-state read; compact first (see compact_owned_traces).
-                let mut avi_handle: Option<(ReduceAvi, Box<ReadCursor>)> = match avi {
-                    Some(a) => {
-                        let avi_table = program.table_mut(a.table_idx);
-                        let _ = avi_table.compact_if_needed();
-                        Some((*a, Box::new(avi_table.open_cursor())))
+                // Opened last, so the prefix seek sees this epoch's own entries;
+                // compacted first, as `compact_owned_traces` does before any other
+                // operator-state read.
+                let mut avi_cursor: Option<Box<ReadCursor>> = match avi {
+                    Some(idx) => {
+                        let bake = plan
+                            .avi
+                            .as_ref()
+                            .expect("a Reduce naming a value-index table is emitted with the bake that keys it");
+                        let table = program.table_mut(*idx);
+                        let res = ops::op_populate_avi(&reg!(*in_reg).batch, table, bake);
+                        log_tick_ingest_err("avi", *idx, res)?;
+                        let _ = table.compact_if_needed();
+                        Some(Box::new(table.open_cursor()))
                     }
                     None => None,
                 };
@@ -345,20 +340,14 @@ pub(crate) fn execute_epoch_from(
                 gnitz_debug!(
                     "vm: REDUCE in_count={} avi={} aggs={}",
                     reg!(*in_reg).batch.count,
-                    avi_handle.is_some(),
+                    avi_cursor.is_some(),
                     plan.acc_template.len()
                 );
 
-                // The cursor and the packer that keys it arrive as one value, so
-                // the operator never re-derives which mode it is in.
-                let history = avi_handle.as_mut().map(|(a, cursor)| ops::AviHistory {
-                    cursor: cursor.as_mut(),
-                    packer: &program.avi_bakes[a.bake_idx.at()].key_packer,
-                });
-                let raw_out = ops::op_reduce(&reg!(*in_reg).batch, to_cursor, history, plan);
+                let raw_out = ops::op_reduce(&reg!(*in_reg).batch, to_cursor, avi_cursor.as_deref_mut(), plan);
 
                 // Drop temporary cursor handle (returned to pool)
-                drop(avi_handle);
+                drop(avi_cursor);
 
                 reg_mut!(*out_reg).batch = raw_out;
             }

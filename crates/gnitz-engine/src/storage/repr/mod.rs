@@ -1,8 +1,9 @@
 //! L2 storage representation — the pure in-memory batch repr and the operations
 //! that work directly on it: region layout (`batch`), wire/shard serialization
 //! (`batch_wire`), TLS buffer recycling (`batch_pool`), the columnar comparators
-//! (`columnar`), sort-merge consolidation (`merge`), exchange repartition
-//! (`scatter`), the fused k-way merge kernel (`heap`), the PK-probe filters
+//! (`columnar`), sort-merge consolidation (`merge`), the per-row row-selecting
+//! passes — exchange repartition, PK routing and secondary-index projection
+//! (`scatter`) —, the fused k-way merge kernel (`heap`), the PK-probe filters
 //! (`bloom`, `shard_filter`), the shard-image encoder and its atomic writer
 //! (`shard_file`), and the shard-format constants (`layout`). The low-level
 //! WAL-block framer lives in `gnitz_wire::wal` (the one definition client and

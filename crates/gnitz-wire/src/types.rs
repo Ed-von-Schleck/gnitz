@@ -2,8 +2,6 @@
 
 use core::cmp::Ordering;
 
-use crate::catalog::{MAX_PK_BYTES, MAX_PK_COLUMNS};
-
 pub mod type_code {
     pub const U8: u8 = 1;
     pub const I8: u8 = 2;
@@ -734,124 +732,6 @@ pub const fn reindex_output_type_code(tc: u8) -> u8 {
         type_code::U128
     }
 }
-
-// ---------------------------------------------------------------------------
-// Packed group key
-// ---------------------------------------------------------------------------
-
-/// Bytes the combined aggregate-value index appends after a group key:
-/// `ordinal(u8) ‖ av_encoded(u64)`.
-pub const GROUP_KEY_AVI_SUFFIX_BYTES: usize = 9;
-/// PK **columns** that same suffix occupies (`ordinal`, `av_encoded`).
-pub const GROUP_KEY_AVI_SUFFIX_COLUMNS: usize = 2;
-
-/// PK columns a packed group key may occupy. The AVI keys its entries
-/// `group ‖ ordinal ‖ av_encoded` in one PK region, so the group key must leave
-/// that suffix room — which is what makes *every* group set indexable and the
-/// trace-replay history unconstructible.
-pub const GROUP_KEY_MAX_COLUMNS: usize = MAX_PK_COLUMNS - GROUP_KEY_AVI_SUFFIX_COLUMNS;
-/// PK bytes a packed group key may occupy, reserved the same way.
-pub const GROUP_KEY_MAX_BYTES: usize = MAX_PK_BYTES - GROUP_KEY_AVI_SUFFIX_BYTES;
-
-/// The PK slot type one group column packs into.
-///
-/// A `≤8`-byte integer (and the signed 128-bit one) keeps its own width and sign,
-/// so its slot is the plain OPK image of the value. A float packs to `U64` — the
-/// `ieee_order_bits` image, which is order-preserving where the raw bits are not
-/// (±0.0 differ, NaN has no canonical pattern) and which agrees with the
-/// `total_cmp` order the group comparator uses. Everything else — `U128`/`UUID`
-/// verbatim, `STRING`/`BLOB` by content hash — packs to a 16-byte `U128`.
-pub const fn group_key_slot_type(tc: u8) -> u8 {
-    if is_fixed_int(tc) || tc == type_code::I128 {
-        tc
-    } else if tc == type_code::F32 || tc == type_code::F64 {
-        type_code::U64
-    } else {
-        type_code::U128
-    }
-}
-
-/// The layout of a packed group key: which slots its PK region carries, and how
-/// many of the group columns got a slot of their own.
-///
-/// Every grouped reduce has one, at any arity and over any column type — that
-/// universality is the point. Columns past the budget do not make the key
-/// unbuildable; they fold into the trailing hash slot.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GroupKeyLayout {
-    /// A leading `U8` presence bitmap: bit *i* is set iff packed column *i* is
-    /// NULL. Present iff some group column is nullable. One byte total, not one
-    /// per column — without it a NULL group and a `0` group collide on one
-    /// output PK.
-    pub has_bitmap: bool,
-    /// How many leading group columns carry their own slot. The rest fold.
-    pub n_packed: usize,
-    /// Whether a trailing 16-byte hash slot folds the group columns past
-    /// `n_packed`. Equivalently `n_packed < group_cols.len()`.
-    pub has_fold: bool,
-    /// The PK slot type codes in order: the bitmap (if any), then one per packed
-    /// column, then the fold slot (if any).
-    pub slots: Vec<u8>,
-}
-
-impl GroupKeyLayout {
-    /// Total PK stride of the packed key.
-    pub fn stride(&self) -> usize {
-        self.slots.iter().map(|&t| wire_stride(t)).sum()
-    }
-}
-
-/// Resolve the packed group-key layout for `cols`, each given as its
-/// `(type_code, nullable)`.
-///
-/// Greedy: pack leading columns while the budget still leaves room for the fold
-/// slot the remaining columns would need. `GROUP_KEY_MAX_COLUMNS >= 2` and the
-/// widest slot is 16 bytes, so a bitmap plus a fold slot always fits — the
-/// layout exists for every group set, which is what lets the reduce drop its
-/// eligibility gate.
-pub fn group_key_layout(cols: &[(u8, bool)]) -> GroupKeyLayout {
-    let has_bitmap = cols.iter().any(|&(_, nullable)| nullable);
-    let mut slots: Vec<u8> = Vec::with_capacity(cols.len() + 2);
-    let mut bytes = 0usize;
-    if has_bitmap {
-        slots.push(type_code::U8);
-        bytes += 1;
-    }
-    let mut n_packed = 0usize;
-    for (i, &(tc, _)) in cols.iter().enumerate() {
-        let slot = group_key_slot_type(tc);
-        let w = wire_stride(slot);
-        // Room this column needs, plus the fold slot the columns behind it would
-        // still require. Reserving it here is what keeps the greedy walk from
-        // packing a column it would have to give back.
-        let tail_cols = usize::from(i + 1 < cols.len());
-        let tail_bytes = tail_cols * 16;
-        if slots.len() + 1 + tail_cols > GROUP_KEY_MAX_COLUMNS || bytes + w + tail_bytes > GROUP_KEY_MAX_BYTES {
-            break;
-        }
-        slots.push(slot);
-        bytes += w;
-        n_packed += 1;
-    }
-    let has_fold = n_packed < cols.len();
-    if has_fold {
-        slots.push(type_code::U128);
-    }
-    GroupKeyLayout {
-        has_bitmap,
-        n_packed,
-        has_fold,
-        slots,
-    }
-}
-
-// A bitmap byte plus a 16-byte fold slot must fit whatever the AVI suffix leaves,
-// or `group_key_layout` would have no layout to return for a group set whose
-// first column is already too wide.
-const _: () = assert!(GROUP_KEY_MAX_COLUMNS >= 2);
-const _: () = assert!(GROUP_KEY_MAX_BYTES >= 17);
-// The bitmap is one byte, so it addresses at most 8 packed columns.
-const _: () = assert!(GROUP_KEY_MAX_COLUMNS - 1 <= 8);
 
 /// Common reindex output type code for an equijoin key pair, or `None` if the
 /// pair cannot co-partition under an existing type code. Floats and one-sided

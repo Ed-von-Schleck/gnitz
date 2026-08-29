@@ -1,4 +1,4 @@
-use super::super::super::util::GroupKeyCols;
+use super::super::super::group_key::GroupKeyCols;
 use super::{argsort_by_key, argsort_delta, argsort_pk_canonical};
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};

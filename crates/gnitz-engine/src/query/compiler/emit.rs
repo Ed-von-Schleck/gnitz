@@ -4,7 +4,7 @@
 use super::*;
 use crate::expr::PkSource;
 use crate::ops::{merge_schemas_for_join, JoinProbe, RangeProbe};
-use crate::query::vm::{consume_slots, reads_reg, Instr, IntegrateAvi, IntegrateTarget, ReduceAvi, TableIdx};
+use crate::query::vm::{consume_slots, reads_reg, Instr, TableIdx};
 use crate::schema::{DerivedSchema, SchemaColumn};
 
 // ---------------------------------------------------------------------------
@@ -197,21 +197,25 @@ impl EmitCtx<'_> {
             .map_err(|e| CompileError::StorageFailed("child table create failed", e))
     }
 
-    /// Create a child table, hand it to the program, and return its instruction
-    /// operand. When `trace_reg` is given, mark it a trace register backed by the
-    /// new table (`bind_trace_cursors` opens a cursor on it each epoch).
-    fn add_owned_trace_table(
+    /// Create a child table backing `trace_reg`, which becomes a trace register
+    /// (`bind_trace_cursors` opens a cursor on it each epoch).
+    fn add_trace_table(
         &mut self,
         child_name: &str,
         schema: SchemaDescriptor,
-        trace_reg: Option<u16>,
+        trace_reg: u16,
     ) -> Result<TableIdx, CompileError> {
-        let t = self.create_child_table(child_name, schema)?;
-        let idx = self.builder.push_table(t);
-        if let Some(reg) = trace_reg {
-            self.reg_meta[reg as usize] = RegisterMeta::trace(schema, idx);
-        }
+        let idx = self.add_registerless_table(child_name, schema)?;
+        self.reg_meta[trace_reg as usize] = RegisterMeta::trace(schema, idx);
         Ok(idx)
+    }
+
+    /// Create a child table that **no** register names: only the one instruction
+    /// holding the returned `TableIdx` can reach it, so nothing else in the
+    /// program can read or write it and no cursor is bound to it per epoch.
+    fn add_registerless_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<TableIdx, CompileError> {
+        let t = self.create_child_table(child_name, schema)?;
+        Ok(self.builder.push_table(t))
     }
 
     /// The register `src` produced. The one rejection left after `topo_sorted`
@@ -334,7 +338,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
                 (-1, 1)
             };
             let child_name = format!("_hist_{}_{nid}", ctx.site.id);
-            let hist_table_idx = ctx.add_owned_trace_table(&child_name, in_reg_schema, Some(reg_id))?;
+            let hist_table_idx = ctx.add_trace_table(&child_name, in_reg_schema, reg_id)?;
             let out_delta_id = ctx.push_delta_reg(in_reg_schema);
             ctx.out_reg_of.insert(nid, out_delta_id);
             ctx.builder.push(Instr::WeightClamp {
@@ -395,11 +399,8 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
             // Must fail the compile on a table-open error: emitting the view without
             // the Integrate would compile a view that never persists its differential
             // state, leaving its output permanently empty.
-            let table_idx = ctx.add_owned_trace_table(&child_name, in_reg_schema, Some(reg_id))?;
-            ctx.builder.push(Instr::Integrate {
-                in_reg,
-                target: IntegrateTarget::Trace(table_idx),
-            });
+            let table_idx = ctx.add_trace_table(&child_name, in_reg_schema, reg_id)?;
+            ctx.builder.push(Instr::Integrate { in_reg, table_idx });
         }
 
         gnitz_wire::OpNode::ExchangeShard { .. } => {
@@ -666,45 +667,19 @@ pub(super) fn emit_reduce(
     .map_err(CompileError::Rejected)?;
     let reduce_out_schema = plan.output_schema;
 
-    let trace_table_idx = ctx.add_owned_trace_table(
-        &format!("_reduce_{}_{nid}", ctx.site.id),
-        reduce_out_schema,
-        Some(reg_id),
-    )?;
+    let trace_table_idx = ctx.add_trace_table(&format!("_reduce_{}_{nid}", ctx.site.id), reduce_out_schema, reg_id)?;
 
     let raw_delta_id = ctx.push_delta_reg(reduce_out_schema);
     ctx.out_reg_of.insert(nid, raw_delta_id);
 
-    // A reduce carries a value index iff it has a non-linear aggregate: every
-    // group set has a packed key, and the plan above already rejected any
-    // aggregate the index could not encode — so there is no eligibility gate
-    // here, and no trace-replay history to fall back to.
-    //
-    // NULL aggregate values never reach the index: the accumulator skips NULL
-    // inputs and AVI population skips them before encoding a key whose value
-    // column is a non-nullable PK. Moving either filter would write a zeroed key
-    // and corrupt MIN/MAX.
-    let avi = if agg_descs.iter().any(|a| a.agg_op.uses_value_index()) {
-        // One table serving every MIN/MAX of this reduce, so per-aggregate
-        // entries share a table_id, scratch dir and compaction namespace and
-        // cannot collide on a memory-pressure flush. Take the index schema off
-        // the bake rather than deriving it a second time.
-        let bake = crate::ops::AviBake::new(&in_reg_schema, group_cols, &agg_descs)
-            .ok_or(CompileError::Rejected("reduce: value-index key exceeds the PK budget"))?;
-        // Not optional: a non-linear reduce has no other history, so a swallowed
-        // failure would compute MIN/MAX from the delta alone while still
-        // retracting the old row.
-        let table_idx = ctx.add_owned_trace_table(&format!("_avidx_{}_{nid}", ctx.site.id), bake.schema, None)?;
-        let bake_idx = ctx.builder.add_avi_bake(bake);
-        // Integrates BEFORE the reduce reads it, so a prefix seek returns the
-        // post-delta extreme. (The trace-in integrate below runs after.)
-        ctx.builder.push(Instr::Integrate {
-            in_reg: in_reg_id,
-            target: IntegrateTarget::Avi(IntegrateAvi { table_idx, bake_idx }),
-        });
-        Some(ReduceAvi { table_idx, bake_idx })
-    } else {
-        None
+    // One table per reduce, serving every MIN/MAX of it — so per-aggregate entries
+    // share a table_id, scratch dir and compaction namespace and cannot collide on
+    // a memory-pressure flush. `?`, not a swallowed failure: a non-linear reduce
+    // has no other history, and would otherwise compute MIN/MAX from the delta
+    // alone while still retracting the old row.
+    let avi = match &plan.avi {
+        Some(bake) => Some(ctx.add_registerless_table(&format!("_avidx_{}_{nid}", ctx.site.id), bake.schema)?),
+        None => None,
     };
 
     let plan_idx = ctx.builder.add_reduce_plan(plan);
@@ -719,7 +694,7 @@ pub(super) fn emit_reduce(
 
     ctx.builder.push(Instr::Integrate {
         in_reg: raw_delta_id,
-        target: IntegrateTarget::Trace(trace_table_idx),
+        table_idx: trace_table_idx,
     });
     Ok(())
 }

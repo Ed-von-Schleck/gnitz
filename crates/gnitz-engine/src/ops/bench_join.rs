@@ -18,12 +18,13 @@
 //! the emit, not a sort.
 
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::join::merge_schemas_for_join;
 use super::{op_join_delta_trace, JoinProbe, RangeProbe};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout, ReadCursor};
+use crate::test_support::bench_time;
 use gnitz_wire::RangeRel;
 
 /// Rows on the larger side of every fixture. Big enough that the per-call
@@ -135,16 +136,6 @@ fn cursor_over(schema: &SchemaDescriptor, p: Payload, rows: &[Row], n: usize) ->
 // Timing
 // ---------------------------------------------------------------------------
 
-/// Run `f` once as warmup, then `ITERS` times, returning the total elapsed.
-fn time<F: FnMut()>(mut f: F) -> Duration {
-    f();
-    let start = Instant::now();
-    for _ in 0..ITERS {
-        f();
-    }
-    start.elapsed()
-}
-
 /// Print one row of the result table. `rows` is the output row count of a
 /// single call — the emit-side work the timing has to be read against, since a
 /// fan-out shape emits far more rows than either input holds.
@@ -239,7 +230,7 @@ fn join_equi_dt_bench() {
             for srcs in SOURCE_COUNTS {
                 let mut cursor = cursor_over(&schema, p, &trace_rows, srcs);
                 let mut out_rows = 0;
-                let elapsed = time(|| {
+                let elapsed = bench_time(ITERS, || {
                     let out = op_join_delta_trace(&delta, &mut cursor, &schema, &schema, &out_schema, JoinProbe::Equi);
                     out_rows = out.count;
                     std::hint::black_box(&out);
@@ -370,7 +361,7 @@ fn join_range_dt_bench() {
                 for srcs in SOURCE_COUNTS {
                     let mut cursor = cursor_over(&schema, p, &trace_rows, srcs);
                     let mut out_rows = 0;
-                    let elapsed = time(|| {
+                    let elapsed = bench_time(ITERS, || {
                         let out = op_join_delta_trace(
                             &delta,
                             &mut cursor,

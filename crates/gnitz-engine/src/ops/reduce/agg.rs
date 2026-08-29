@@ -4,6 +4,8 @@ use crate::schema::{ColumnLocator, TypeCode};
 use crate::storage::{MemBatch, ReadCursor};
 use gnitz_wire::{AggFunc, FixedInt};
 
+use super::avi::AviBake;
+
 // ---------------------------------------------------------------------------
 // Aggregate opcodes
 // ---------------------------------------------------------------------------
@@ -124,11 +126,9 @@ impl Accumulator {
             // MIN/MAX hold the AVI's order-preserving encoding, whose domain
             // (`agg_value_idx_eligible`) is the same ≤8-byte int/float set SUM
             // widens — so `encode_ordered`'s unreachable arms stay unreachable.
-            AggFunc::Min | AggFunc::Max => {
-                super::super::util::agg_value_idx_eligible(tc).then_some(StepKind::Extreme {
-                    max: agg_op == AggFunc::Max,
-                })?
-            }
+            AggFunc::Min | AggFunc::Max => super::avi::agg_value_idx_eligible(tc).then_some(StepKind::Extreme {
+                max: agg_op == AggFunc::Max,
+            })?,
         };
         Some(Accumulator {
             acc: 0,
@@ -192,7 +192,7 @@ impl Accumulator {
         // MIN/MAX hold the MIN-oriented order-preserving encoding; decode back to
         // native value bits for emit. Linear aggregates store the value verbatim.
         if self.agg_op.uses_value_index() {
-            super::super::util::decode_ordered(self.acc as u64, self.tc)
+            super::avi::decode_ordered(self.acc as u64, self.tc)
         } else {
             self.acc as u64
         }
@@ -305,7 +305,7 @@ impl Accumulator {
             StepKind::Extreme { .. } => {
                 let mut scratch = [0u8; 16];
                 let bytes = self.loc.native_le_bytes(mb, row, &mut scratch);
-                let enc = super::super::util::encode_ordered(bytes, self.tc, false);
+                let enc = super::avi::encode_ordered(bytes, self.tc, false);
                 if first || self.extreme_replaces(enc) {
                     self.acc = enc as i64;
                 }
@@ -434,7 +434,7 @@ pub(super) fn read_old_minmax_encoded(cursor: &ReadCursor, c_idx: usize, cw: usi
         return None;
     }
     let bytes = cursor.col_bytes(c_idx, cw)?;
-    Some(super::super::util::encode_ordered(bytes, src_tc, false))
+    Some(super::avi::encode_ordered(bytes, src_tc, false))
 }
 
 // ---------------------------------------------------------------------------
@@ -458,20 +458,10 @@ pub(super) fn apply_agg_from_value_index(
     for_max: bool,
     acc: &mut Accumulator,
 ) -> bool {
-    use super::super::util::AVI_AV_BYTES;
     if avi_cursor.seek_first_positive_with_prefix(group_key) {
-        let k = avi_cursor.current_pk_bytes();
-        // current_pk_bytes() is the full AVI PK region; `AviBake::new` lays it
-        // out as `group ‖ ordinal ‖ av_encoded`, so the trailing av bytes are
-        // always in bounds for a seek prefix `group_key` of length
-        // `group_stride + 1` (group plus the ordinal byte).
-        debug_assert_eq!(
-            k.len(),
-            group_key.len() + AVI_AV_BYTES,
-            "AVI key = seek prefix (group ‖ ordinal) + AVI_AV_BYTES",
-        );
-        let av_start = group_key.len();
-        let av = u64::from_be_bytes(k[av_start..av_start + AVI_AV_BYTES].try_into().unwrap());
+        // `current_pk_bytes` is the full AVI PK region; the bake laid the entry
+        // out and is what reads the value back out of it.
+        let av = AviBake::av_of(avi_cursor.current_pk_bytes(), group_key.len());
         // The AVI stores `encode_ordered(v, for_max)`; the accumulator holds the
         // MIN-oriented encoding, so undo the MAX inversion (no value decode — that
         // happens once, at emit, in `get_value_bits`).

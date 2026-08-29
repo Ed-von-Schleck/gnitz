@@ -1,31 +1,29 @@
-//! Microbenchmarks for the reduce-time combined-AggValueIndex population hot
-//! path. Ignored by default; run with:
+//! Microbenchmarks for the reduce-time AVI population hot path. Ignored by
+//! default; run with:
 //!
 //! ```text
 //! cargo test -p gnitz-engine --release secondary_index_bench -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! Lives inside `ops` (not the crate root) so it can call the real internal
-//! key-composition helpers (`ReindexPacker::new_group_key`, `encode_ordered`) and decompose
-//! the per-row population cost into four cleanly-attributed layers:
+//! Lives inside `reduce` so the decomposition calls the production `avi_batch`
+//! rather than a hand-rolled twin. Every layer is timed directly and their sum is
+//! printed beside the independently timed full path, never substituted for it.
+//! The memtable upsert is not a layer: on a pre-consolidated batch
+//! `ingest_owned_batch` does no per-row work at all.
 //!
-//!   compose : build the index key into a stack buffer, discard
-//!   assembly: the `extend_*` calls that turn keys into a `Batch` (= build - compose)
-//!   sort    : `into_consolidated` (argsort + dedup of the unsorted batch)
-//!   upsert  : `ingest_owned_batch` of an *already-consolidated* batch
-//!             (its internal `into_consolidated` short-circuits, so this times
-//!             only the memtable upsert: per-row bloom population + run push)
-//!
-//! All four are measured directly (no full-minus-X subtraction). Throughput is
-//! computed at runtime; nothing here is a hard-coded result.
+//! The numbers describe one shape — a single 500k-row batch, one MIN over an I64
+//! payload grouped by a U32 payload (AVI stride 13, inside the `u128` sort-key
+//! arm), into a fresh table whose memtable never flushes mid-run. Production
+//! `GROUP BY <BIGINT>` is stride 17, one byte past that arm, and a view backfill
+//! chunks at ~16k rows per worker, where the sort's share is lower.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use super::index::{op_integrate_with_indexes, AviBake, IntegrateTarget};
-use super::util::{encode_ordered, AVI_AV_BYTES};
-use super::AggDescriptor;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
+use super::agg::AggDescriptor;
+use super::avi::{avi_batch, op_populate_avi, AviBake};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
 use crate::storage::{Batch, RecoverySource, Table};
+use crate::test_support::{bench_time, bench_time_each};
 use gnitz_wire::AggFunc;
 
 const N_ROWS: usize = 500_000;
@@ -70,154 +68,71 @@ fn ns_per_row(elapsed: Duration) -> f64 {
     elapsed.as_nanos() as f64 / (N_ROWS * ITERS) as f64
 }
 
-/// Run `f` for `ITERS` iterations (plus one warmup), returning total elapsed.
-fn time<F: FnMut()>(mut f: F) -> Duration {
-    f(); // warmup
-    let start = Instant::now();
-    for _ in 0..ITERS {
-        f();
-    }
-    start.elapsed()
-}
-
-fn report(index: &str, compose: Duration, build: Duration, sort: Duration, upsert: Duration) {
-    let (c, b, s, u) = (
-        ns_per_row(compose),
-        ns_per_row(build),
-        ns_per_row(sort),
-        ns_per_row(upsert),
-    );
-    let assembly = b - c;
-    let total = c + assembly + s + u;
+fn report(index: &str, population: Duration, sort: Duration, full: Duration) {
+    let (p, s, f) = (ns_per_row(population), ns_per_row(sort), ns_per_row(full));
     println!("\n{index} population — per-row cost decomposition ({ITERS}x{N_ROWS} rows):");
-    println!("  compose (key only)       {c:7.2} ns/row   {:5.1}%", 100.0 * c / total);
-    println!(
-        "  assembly (extend_*)      {assembly:7.2} ns/row   {:5.1}%",
-        100.0 * assembly / total
-    );
-    println!("  sort (into_consolidated) {s:7.2} ns/row   {:5.1}%", 100.0 * s / total);
-    println!("  upsert (memtable+bloom)  {u:7.2} ns/row   {:5.1}%", 100.0 * u / total);
+    println!("  population (avi_batch)   {p:7.2} ns/row   {:5.1}%", 100.0 * p / f);
+    println!("  sort (into_consolidated) {s:7.2} ns/row   {:5.1}%", 100.0 * s / f);
     println!("  -----");
+    // Both layers are timed independently of `full`, so their sum is a check on
+    // the decomposition rather than a restatement of it.
+    println!("  layer sum                {:7.2} ns/row", p + s);
     println!(
-        "  sum                      {total:7.2} ns/row   ({:.2} Mrows/s)",
-        1000.0 / total
+        "  op_populate_avi (full)   {f:7.2} ns/row   ({:.2} Mrows/s)",
+        1000.0 / f
     );
-}
-
-/// Time `ingest_owned_batch` alone: rebuild + pre-consolidate the index
-/// batch *outside* the timed region (so `into_consolidated` short-circuits
-/// inside ingest), and create the destination table outside it too.
-fn time_upsert(
-    tmp: &std::path::Path,
-    schema: SchemaDescriptor,
-    base_id: u32,
-    mut build_pre: impl FnMut() -> Batch,
-) -> Duration {
-    let mut total = Duration::ZERO;
-    for i in 0..=ITERS as u32 {
-        let pre = build_pre();
-        let mut t = Table::with_memtable_budget(
-            tmp.to_str().unwrap(),
-            schema,
-            base_id + i,
-            memtable_budget(),
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap();
-        let start = Instant::now();
-        t.ingest_owned_batch(pre).unwrap();
-        if i > 0 {
-            total += start.elapsed();
-        }
-        std::hint::black_box(&t);
-    }
-    total
 }
 
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn secondary_index_bench_avi_decomposition() {
     let schema = src_schema();
-    let group_by_cols = vec![1u32];
     let bake = AviBake::new(
         &schema,
-        &group_by_cols,
+        &[1u32],
         &[AggDescriptor {
             col_idx: 2,
             agg_op: AggFunc::Min,
         }],
-    )
-    .unwrap();
+    );
     let avi_schema = bake.schema;
     let input = build_input(&schema);
-    let mb = input.as_mem_batch();
     let tmp = tempfile::tempdir().unwrap();
-    let packer = &bake.key_packer;
-    let n = packer.out_stride;
-    let avi_pi = schema
-        .try_payload_idx(2)
-        .expect("AVI agg col is a payload column by construction");
-    let tc = TypeCode::I64;
 
-    // Combined AVI key = group_key_bytes ++ ordinal(1) ++ av_encoded(8). Single
-    // aggregate here, so ordinal 0.
-    let avi_key = |key: &mut [u8], row: usize| -> usize {
-        packer.pack_into(&mut key[..n], &mb, row);
-        key[n] = 0; // ordinal
-        let av_bytes = mb.get_col_ptr(row, avi_pi, 8);
-        let av = encode_ordered(av_bytes, tc, false);
-        // Big-endian, mirroring the production key layout in op_integrate_with_indexes.
-        key[n + 1..n + 1 + AVI_AV_BYTES].copy_from_slice(&av.to_be_bytes());
-        n + 1 + AVI_AV_BYTES
-    };
-    let build_batch = || {
-        let mut out = Batch::with_capacity(avi_schema, N_ROWS);
-        let mut key = [0u8; MAX_PK_BYTES];
-        for row in 0..N_ROWS {
-            let klen = avi_key(&mut key, row);
-            out.extend_pk_bytes(&key[..klen]);
-            out.extend_weight(&mb.get_weight(row).to_le_bytes());
-            out.extend_null_bmp(&0u64.to_le_bytes());
-            out.count += 1;
-        }
-        out
-    };
-
-    let compose = time(|| {
-        let mut key = [0u8; MAX_PK_BYTES];
-        for row in 0..N_ROWS {
-            let klen = avi_key(&mut key, row);
-            std::hint::black_box(&key[..klen]);
-        }
+    let population = bench_time(ITERS, || {
+        std::hint::black_box(avi_batch(&input, &bake));
     });
-    let build = time(|| {
-        std::hint::black_box(build_batch());
-    });
-    let sort = time(|| {
-        std::hint::black_box(build_batch().into_consolidated(&avi_schema));
-    });
-    let upsert = time_upsert(tmp.path(), avi_schema, 200, || {
-        build_batch().into_consolidated(&avi_schema)
-    });
-
+    let sort = bench_time_each(
+        ITERS,
+        || avi_batch(&input, &bake),
+        |b| {
+            std::hint::black_box(b.into_consolidated(&avi_schema));
+        },
+    );
+    // A fresh table per iteration, opened outside the clock: an ingest into a
+    // table already holding 500k entries would be measuring the memtable's
+    // growth, not the population.
     let mut id = 2000u32;
-    let full = time(|| {
-        let mut t = Table::with_memtable_budget(
-            tmp.path().to_str().unwrap(),
-            avi_schema,
-            id,
-            memtable_budget(),
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap();
-        id += 1;
-        let avi = IntegrateTarget::Avi(&mut t, &bake);
-        op_integrate_with_indexes(&input, avi).unwrap();
-        std::hint::black_box(&t);
-    });
+    let full = bench_time_each(
+        ITERS,
+        || {
+            id += 1;
+            Table::with_memtable_budget(
+                tmp.path().to_str().unwrap(),
+                avi_schema,
+                id,
+                memtable_budget(),
+                RecoverySource::Rederive { resume_at: None },
+            )
+            .unwrap()
+        },
+        |mut t| {
+            op_populate_avi(&input, &mut t, &bake).unwrap();
+            std::hint::black_box(&t);
+        },
+    );
 
-    report("AVI (U32 grp)", compose, build, sort, upsert);
-    println!("  (op_integrate full path: {:.2} ns/row)", ns_per_row(full));
+    report("AVI (U32 grp)", population, sort, full);
 }
 
 /// Time the `into_consolidated` sort layer for a single-column PK schema
@@ -236,7 +151,7 @@ fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: 
         }
         out
     };
-    let sort = time(|| {
+    let sort = bench_time(ITERS, || {
         std::hint::black_box(build().into_consolidated(&pk_schema));
     });
     let s = ns_per_row(sort);
@@ -267,8 +182,7 @@ fn secondary_index_bench_single_u64_pk_sort() {
 /// (`IndexKeySpec::write_entry` = leading-key span ‖ source-PK suffix) — the
 /// only bench that reaches the resolved-addressing free functions
 /// (`pk_native_key` / `payload_native_key`) and the `ColumnLocator` accessors
-/// they sit behind. `compose` in the AVI decomposition covers only the payload
-/// arm of `ColumnLocator::bytes`.
+/// they sit behind.
 ///
 /// Four shapes, chosen to separate the encode paths: a **U64 PK** source (no
 /// promotion — the span is a verbatim copy of the OPK bytes already in the PK
@@ -295,7 +209,7 @@ fn index_write_span_bench() {
     ] {
         let idx = make_index_schema(cols, &src).unwrap();
         let spec = IndexKeySpec::new(cols, &src, &idx);
-        let elapsed = time(|| {
+        let elapsed = bench_time(ITERS, || {
             let mut key = [0u8; MAX_PK_BYTES];
             for row in 0..N_ROWS {
                 std::hint::black_box(spec.write_entry(&mb, row, &mut key));
@@ -311,7 +225,7 @@ fn index_write_span_bench() {
     // this row the four numbers above have nothing to be compared against.
     let stride = src.pk_stride() as usize;
     for (label, identity) in [("identity (copy)   ", true), ("decode∘encode     ", false)] {
-        let elapsed = time(|| {
+        let elapsed = bench_time(ITERS, || {
             let mut key = [0u8; MAX_PK_BYTES];
             for row in 0..N_ROWS {
                 let s = &mb.get_pk_bytes(row)[..stride];

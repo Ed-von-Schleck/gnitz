@@ -183,7 +183,7 @@ impl DagEngine {
         let index_batches: Vec<Batch> = entry
             .index_circuits
             .iter()
-            .map(|ic| Self::batch_project_index(source, &ic.key_spec, &ic.index_schema))
+            .map(|ic| crate::storage::batch_project_index(source, &ic.key_spec, &ic.index_schema))
             .collect();
 
         inject_ingest_apply_error("store", entry.handle.ingest_borrowed_batch(source)).inspect_err(|e| {
@@ -311,61 +311,5 @@ impl DagEngine {
             .filter(|t| t.is_rederived())
             .collect();
         (traces, outputs)
-    }
-
-    /// Batch-level index projection.
-    ///
-    /// Compound-PK index schema layout:
-    ///   `(indexed_col [promoted], src_pk_0, src_pk_1, …)`
-    /// every column is in the PK, no payload columns. We hand-pack the index
-    /// PK bytes: the leading slot is the indexed column value (low bytes of
-    /// its LE form, zero-padded out to the index column's width), followed
-    /// by each source PK column laid out contiguously after it.
-    pub fn batch_project_index(
-        src: &Batch,
-        spec: &crate::schema::IndexKeySpec,
-        idx_schema: &SchemaDescriptor,
-    ) -> Batch {
-        let idx_stride = idx_schema.pk_stride() as usize;
-
-        let mut out = Batch::with_capacity(*idx_schema, src.count.max(1));
-        // MAX_PK_BYTES bounds every index schema's pk_stride (asserted in
-        // SchemaDescriptor::new), so the scratch PK buffer lives on the stack
-        // with no per-batch heap allocation. The used [..idx_stride] prefix is
-        // fully overwritten each row (the leading [..idx_key_size] OPK-encoded
-        // indexed value(s) and trailing source PK suffix); the single zero-init
-        // covers the (currently empty) tail.
-        let mut idx_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
-
-        let mb = src.as_mem_batch();
-
-        for row in 0..src.count {
-            let weight = src.get_weight(row);
-            if weight == 0 {
-                continue;
-            }
-            // The row's entry key `[span ‖ src_pk]`: each indexed value
-            // re-encoded OPK into its promoted slot, then the source PK region
-            // verbatim (laid out in pk_indices order, already OPK). The index
-            // table's PK region is order-preserving like any other; seeks
-            // (has_pk / seek_by_index) encode the same way. NULL in ANY indexed
-            // column ⇒ row not indexed; retractions (weight < 0) DO project, so
-            // the index entry retracts with its source row.
-            if !spec.write_entry(&mb, row, &mut idx_pk_buf) {
-                continue;
-            }
-            out.extend_pk_bytes(&idx_pk_buf[..idx_stride]);
-            out.extend_weight(&weight.to_le_bytes());
-            // Index schema has zero payload columns, but the null_bmp region
-            // is still part of the batch layout, and the arena is uninitialized
-            // — so the per-row null-bmp append both keeps the region cursors in
-            // lockstep with `count` and is what makes the word zero.
-            out.extend_null_bmp(&0u64.to_le_bytes());
-            out.count += 1;
-        }
-
-        // `out` is `Raw` from `with_capacity`; the `extend_*` loop above never raises
-        // it, and the index-table ingest re-sorts/folds it.
-        out
     }
 }

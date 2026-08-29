@@ -196,7 +196,7 @@ impl CatalogEngine {
         };
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
             for (ti, t) in targets.iter().enumerate() {
-                let projected = DagEngine::batch_project_index(&chunk, &t.spec, &t.idx_schema);
+                let projected = crate::storage::batch_project_index(&chunk, &t.spec, &t.idx_schema);
                 if projected.count == 0 {
                     continue;
                 }

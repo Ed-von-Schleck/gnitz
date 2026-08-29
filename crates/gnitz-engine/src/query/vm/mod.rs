@@ -20,9 +20,9 @@ pub(crate) use exec::execute_epoch_multi;
 // ---------------------------------------------------------------------------
 
 /// The resource pools a `Program` owns are unrelated index spaces, all naturally
-/// `u16`. `IntegrateAvi` builds two of them on adjacent lines, where a swap would
-/// mis-dispatch into a live table with no panic — so each gets its own type and
-/// the compiler does the checking.
+/// `u16`. An instruction can name two of them on adjacent lines, where a swap
+/// would mis-dispatch into a live table with no panic — so each gets its own type
+/// and the compiler does the checking.
 macro_rules! resource_idx {
     ($($name:ident => $pool:literal;)*) => {$(
         #[doc = concat!("Index into `Program::", $pool, "`.")]
@@ -43,7 +43,6 @@ resource_idx! {
     PredIdx => "predicates";
     MapIdx => "maps";
     PlanIdx => "reduce_plans";
-    BakeIdx => "avi_bakes";
 }
 
 /// One VM instruction with all operator-specific data pre-resolved.
@@ -116,7 +115,7 @@ pub(crate) enum Instr {
     },
     Integrate {
         in_reg: u16,
-        target: IntegrateTarget,
+        table_idx: TableIdx,
     },
     Reduce {
         in_reg: u16,
@@ -126,9 +125,10 @@ pub(crate) enum Instr {
         /// aggregate descriptors, and every derived gate (linearity, key kind,
         /// emission roles, ground flags).
         plan_idx: PlanIdx,
-        /// The MIN/MAX history. The cursor is created fresh from the table each
-        /// tick; `None` means every aggregate is linear.
-        avi: Option<ReduceAvi>,
+        /// The combined value index's table, populated and then read within this
+        /// instruction. `Some` exactly when the plan carries a bake — the two
+        /// come off the same `if` in the emitter.
+        avi: Option<TableIdx>,
     },
 }
 
@@ -194,7 +194,8 @@ pub(crate) fn consume_slots(instr: &mut Instr) -> [Option<(u16, &mut bool)>; 2] 
 pub(crate) fn writes_state(instr: &Instr) -> bool {
     match instr {
         // `Integrate` writes its trace, `WeightClamp` its history table, `Reduce`
-        // its output trace and optional value index.
+        // its value index. A `Reduce`'s output trace is written by the `Integrate`
+        // the emitter puts behind it, not here.
         Instr::Integrate { .. } | Instr::WeightClamp { .. } | Instr::Reduce { .. } => true,
         Instr::Filter { .. }
         | Instr::Map { .. }
@@ -205,39 +206,6 @@ pub(crate) fn writes_state(instr: &Instr) -> bool {
         | Instr::JoinDT { .. }
         | Instr::Halt => false,
     }
-}
-
-/// Combined-AVI descriptor embedded in an Integrate instruction. One table
-/// serves every MIN/MAX aggregate of the reduce; the baked resources — the
-/// composite index schema, the group-key gatherer, and the value-indexed
-/// subset of the reduce's descriptors (ordinal = position) with their resolved
-/// column locators — live in `Program::avi_bakes`. The population derives
-/// `for_max`/type from each baked descriptor, matching the read side.
-#[derive(Clone, Copy)]
-pub(crate) struct IntegrateAvi {
-    pub table_idx: TableIdx,
-    pub bake_idx: BakeIdx,
-}
-
-/// The value index an `Instr::Reduce` reads: the table to open a cursor against
-/// and the bake whose `key_packer` spells the seek prefix. The two travel
-/// together so the operator's history argument cannot be half-formed — a cursor
-/// with no packer is a state the emitter cannot express.
-#[derive(Clone, Copy)]
-pub(crate) struct ReduceAvi {
-    pub table_idx: TableIdx,
-    pub bake_idx: BakeIdx,
-}
-
-/// What an `Instr::Integrate` accumulates into. The two are exclusive by
-/// construction, so an enum is what the emitter can actually express, where a
-/// pair of `Option`s would admit two states nothing produces.
-#[derive(Clone, Copy)]
-pub(crate) enum IntegrateTarget {
-    /// A trace table.
-    Trace(TableIdx),
-    /// The combined aggregate value index; the delta lands nowhere else.
-    Avi(IntegrateAvi),
 }
 
 /// Opaque handle owning a compiled program and its register file.
@@ -361,10 +329,9 @@ pub(crate) struct Program {
     /// `UnsafeCell` because an operator mutates its table while the dispatch
     /// still holds `&program` for the instruction stream and `reg_meta`.
     pub tables: Vec<UnsafeCell<Box<Table>>>,
-    /// Baked per-`Instr::Reduce` plans (see `ops::ReducePlan`).
+    /// Baked per-`Instr::Reduce` plans (see `ops::ReducePlan`), the reduce's
+    /// value-index bake included.
     pub reduce_plans: Vec<crate::ops::ReducePlan>,
-    /// Baked AVI write-side resources, indexed by `IntegrateAvi::bake_idx`.
-    pub avi_bakes: Vec<crate::ops::AviBake>,
 }
 
 // SAFETY: Program is only accessed from a single thread (the worker thread
@@ -504,10 +471,7 @@ mod tests {
     /// A plain integrate of `in_reg` into `table` (no AVI) — the shape every
     /// test integrate uses.
     fn push_integrate(b: &mut ProgramBuilder, in_reg: u16, table_idx: TableIdx) {
-        b.push(Instr::Integrate {
-            in_reg,
-            target: IntegrateTarget::Trace(table_idx),
-        });
+        b.push(Instr::Integrate { in_reg, table_idx });
     }
 
     /// A reduce with no AVI — the shape every test reduce uses.

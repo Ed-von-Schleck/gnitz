@@ -314,3 +314,33 @@ pub fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> std::collections::Ha
     z.retain(|_, w| *w != 0);
     z
 }
+
+// ---------------------------------------------------------------------------
+// Micro-benchmark timing
+// ---------------------------------------------------------------------------
+
+/// Run `f` once as warmup, then `iters` times, returning the total elapsed.
+pub fn bench_time(iters: usize, mut f: impl FnMut()) -> std::time::Duration {
+    f();
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        f();
+    }
+    start.elapsed()
+}
+
+/// [`bench_time`] for a body that consumes per-iteration state the clock must
+/// not see — a batch to fold, a fresh table to write into. `setup` runs outside
+/// the timed region of every iteration, the warmup included.
+pub fn bench_time_each<S>(iters: usize, mut setup: impl FnMut() -> S, mut body: impl FnMut(S)) -> std::time::Duration {
+    let mut total = std::time::Duration::ZERO;
+    for i in 0..=iters {
+        let state = setup();
+        let start = std::time::Instant::now();
+        body(state);
+        if i > 0 {
+            total += start.elapsed();
+        }
+    }
+    total
+}

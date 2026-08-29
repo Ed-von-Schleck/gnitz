@@ -17,7 +17,6 @@ pub(crate) struct ProgramBuilder {
     maps: Vec<MapPlan>,
     tables: Vec<UnsafeCell<Box<Table>>>,
     reduce_plans: Vec<crate::ops::ReducePlan>,
-    avi_bakes: Vec<crate::ops::AviBake>,
 }
 
 // SAFETY: Same justification as Program — single-thread access.
@@ -31,7 +30,6 @@ impl ProgramBuilder {
             maps: Vec::new(),
             tables: Vec::new(),
             reduce_plans: Vec::new(),
-            avi_bakes: Vec::new(),
         }
     }
 
@@ -87,14 +85,6 @@ impl ProgramBuilder {
         idx
     }
 
-    /// Store the baked AVI write-side resources, returning
-    /// `IntegrateAvi::bake_idx`.
-    pub(crate) fn add_avi_bake(&mut self, bake: crate::ops::AviBake) -> BakeIdx {
-        let idx = BakeIdx(self.avi_bakes.len() as u16);
-        self.avi_bakes.push(bake);
-        idx
-    }
-
     // ── Build ────────────────────────────────────────────────────────────
 
     /// Consume the builder into a runnable `VmHandle`.
@@ -115,7 +105,6 @@ impl ProgramBuilder {
             maps: self.maps,
             tables: self.tables,
             reduce_plans: self.reduce_plans,
-            avi_bakes: self.avi_bakes,
         };
 
         Box::new(VmHandle {

@@ -9,13 +9,11 @@ use crate::storage::{Batch, Layout, ReadCursor};
 use crate::test_support::{make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64};
 use gnitz_wire::{encode_german_string, read_i64_le, read_u64_le};
 
-use super::super::util::GroupKeyCols;
+use super::super::group_key::GroupKeyCols;
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor};
 use super::emit::{emit_global_ground, emit_reduce_row};
-use super::op_reduce::AviHistory;
 use super::plan::{build_reduce_output_schema, ReducePlan};
 use super::sort::{argsort_delta, compare_by_group_cols};
-use crate::schema::key::ReindexPacker;
 use crate::schema::ColumnLocator;
 use gnitz_wire::AggFunc;
 
@@ -29,7 +27,7 @@ fn locate_cols(schema: &SchemaDescriptor, cols: &[u32]) -> Vec<ColumnLocator> {
 /// bakes onto the compiled reduce, reached without the aggregate list the bake
 /// also needs.
 fn avi_schema(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescriptor {
-    super::super::index::AviBake::new(
+    super::avi::AviBake::new(
         schema,
         group_by_cols,
         &[AggDescriptor {
@@ -37,7 +35,6 @@ fn avi_schema(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescrip
             agg_op: AggFunc::Min,
         }],
     )
-    .expect("AVI key fits the schema builder's bounds")
     .schema
 }
 
@@ -68,19 +65,13 @@ fn op_reduce(
     i_am_owner: bool,
 ) -> Batch {
     let plan = make_plan(input_schema, group_by_cols, agg_descs, global_ground, i_am_owner);
-    // The packer the compiler bakes onto the AVI, rebuilt here from the same
-    // (schema, group cols) so a test's history is keyed exactly as production's.
-    let packer = ReindexPacker::new_group_key(input_schema, group_by_cols);
     // A non-linear reduce always carries a value index. `None` from a caller
     // means "the index holds exactly this delta" — the single-tick shape — so
     // build it here; a caller with prior history passes its own cursor.
-    let mut owned = (avi_cursor.is_none() && agg_descs.iter().any(|d| d.agg_op.uses_value_index()))
+    let mut owned = (avi_cursor.is_none() && plan.avi.is_some())
         .then(|| Avi::new(input_schema, group_by_cols, agg_descs, &[delta]));
     let mut owned_cursor = owned.as_mut().map(|a| a.cursor());
-    let history = avi_cursor.or(owned_cursor.as_mut()).map(|cursor| AviHistory {
-        cursor,
-        packer: &packer,
-    });
+    let history = avi_cursor.or(owned_cursor.as_mut());
     super::op_reduce::op_reduce(delta, trace_out_cursor, history, &plan)
 }
 
@@ -99,10 +90,10 @@ struct Avi {
 
 impl Avi {
     fn new(in_schema: &SchemaDescriptor, group_cols: &[u32], agg_descs: &[AggDescriptor], history: &[&Batch]) -> Self {
-        use crate::ops::index::{op_integrate_with_indexes, AviBake, IntegrateTarget};
+        use super::avi::{op_populate_avi, AviBake};
         // `AviBake::new` applies the `uses_value_index` selection itself, so
         // ordinal `j` is position `j` in that subset exactly as production has it.
-        let bake = AviBake::new(in_schema, group_cols, agg_descs).unwrap();
+        let bake = AviBake::new(in_schema, group_cols, agg_descs);
         let dir = tempfile::tempdir().unwrap();
         let mut table = crate::storage::Table::with_memtable_budget(
             dir.path().to_str().unwrap(),
@@ -112,10 +103,8 @@ impl Avi {
             crate::storage::RecoverySource::Rederive { resume_at: None },
         )
         .unwrap();
-        {
-            for b in history {
-                op_integrate_with_indexes(b, IntegrateTarget::Avi(&mut table, &bake)).unwrap();
-            }
+        for b in history {
+            op_populate_avi(b, &mut table, &bake).unwrap();
         }
         Avi { _dir: dir, table }
     }
@@ -2795,7 +2784,7 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
 // -----------------------------------------------------------------------
 
 /// Write one AVI group-key column into `dst`, exactly as the production
-/// `avi_key_packer` does: the column's **OPK** image at its declared width. The
+/// the AVI key packer does: the column's **OPK** image at its declared width. The
 /// AVI schema declares each group column a PK column, so its region holds
 /// order-preserving big-endian bytes (sign-flipped when signed), not native LE.
 fn avi_gcol(dst: &mut [u8], native_le: &[u8], tc: u8) {
@@ -2804,7 +2793,7 @@ fn avi_gcol(dst: &mut [u8], native_le: &[u8], tc: u8) {
 
 #[test]
 fn avi_two_groups_distinct_byte_form_keys() {
-    use super::super::util::encode_ordered;
+    use super::avi::encode_ordered;
 
     // Input: pk(U64), a(U32), b(U32), val(I64); GROUP BY (a, b), MIN(val).
     let in_schema = SchemaDescriptor::new(
@@ -2912,7 +2901,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
 
 #[test]
 fn avi_retraction_returns_next_extremum() {
-    use super::super::util::encode_ordered;
+    use super::avi::encode_ordered;
 
     // Input: pk(U64), a(U32), val(I64); GROUP BY a, MIN(val).
     let in_schema = SchemaDescriptor::new(
@@ -3028,7 +3017,7 @@ fn avi_retraction_returns_next_extremum() {
 
 #[test]
 fn avi_non_power_of_two_stride_drives_cursor() {
-    use super::super::util::encode_ordered;
+    use super::avi::encode_ordered;
 
     for (gtc, gsize, stride) in [(type_code::U16, 2usize, 11usize), (type_code::U32, 4, 13)] {
         let in_schema = SchemaDescriptor::new(
@@ -3274,7 +3263,7 @@ fn min_ignores_null_values() {
 
 #[test]
 fn avi_multi_col_retraction_returns_next_extremum() {
-    use super::super::util::encode_ordered;
+    use super::avi::encode_ordered;
 
     // Input: pk(U64), a(U32), b(U32), val(I64); GROUP BY (a, b), MIN(val).
     let in_schema = SchemaDescriptor::new(
@@ -3394,7 +3383,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
 // match it group-for-group. Composite key = a(8) ++ b(8) ++ av(8) = 24 bytes.
 #[test]
 fn avi_wide_two_u64_groups_match_reference() {
-    use super::super::util::encode_ordered;
+    use super::avi::encode_ordered;
     use std::collections::BTreeMap;
 
     let in_schema = SchemaDescriptor::new(
@@ -3533,7 +3522,7 @@ fn avi_wide_two_u64_groups_match_reference() {
 // bucket.
 #[test]
 fn avi_wide_single_u128_group_distinct() {
-    use super::super::util::encode_ordered;
+    use super::avi::encode_ordered;
 
     let in_schema = SchemaDescriptor::new(
         &[
@@ -3632,7 +3621,7 @@ fn avi_wide_single_u128_group_distinct() {
 // group. Guards that the AVI schema preserves each group column's type_code.
 #[test]
 fn avi_wide_mixed_signed_unsigned_key() {
-    use super::super::util::encode_ordered;
+    use super::avi::encode_ordered;
 
     let in_schema = SchemaDescriptor::new(
         &[
@@ -3742,7 +3731,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
 // (a, b, c) → composite a(8)++b(8)++c(8)++av(8) = 32 bytes.
 #[test]
 fn avi_wide_prefix_collision_distinct_groups() {
-    use super::super::util::encode_ordered;
+    use super::avi::encode_ordered;
 
     let in_schema = SchemaDescriptor::new(
         &[
@@ -3840,7 +3829,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
 // group (sharing the first 16 bytes) must not be matched.
 #[test]
 fn avi_wide_retraction_returns_next_extremum() {
-    use super::super::util::encode_ordered;
+    use super::avi::encode_ordered;
 
     // GROUP BY (a U64, b U64); composite a(8)++b(8)++av(8) = 24 bytes.
     let in_schema = SchemaDescriptor::new(
@@ -4002,7 +3991,7 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
 }
 
 // Populate a fresh ephemeral AVI table from `deltas` through the production
-// `op_integrate_with_indexes`, then read the extreme of delta[0]-row-0's group
+// `op_populate_avi`, then read the extreme of delta[0]-row-0's group
 // back through the production `apply_agg_from_value_index` seek. `col_idx` is
 // the aggregate source column (PK or payload). Shared by the AVI full-path
 // tests below.
@@ -4013,7 +4002,7 @@ fn avi_read_extreme(
     deltas: &[&Batch],
     for_max: bool,
 ) -> i64 {
-    use crate::ops::index::{op_integrate_with_indexes, AviBake, IntegrateTarget};
+    use super::avi::{op_populate_avi, AviBake};
     use crate::storage::Table;
 
     // The aggregate's type is the source column's type.
@@ -4032,23 +4021,22 @@ fn avi_read_extreme(
         agg_op: if for_max { AggFunc::Max } else { AggFunc::Min },
     };
     let aggs = [agg];
-    let bake = AviBake::new(in_schema, group_by, &aggs).unwrap();
+    let bake = AviBake::new(in_schema, group_by, &aggs);
 
-    // Each op_integrate_with_indexes call is a separate AVI ingest; the cursor's
+    // Each op_populate_avi call is a separate AVI ingest; the cursor's
     // two-tier consolidation sums weights across ingests, so a retracted extreme
     // (net-zero) is skipped by seek_first_positive_with_prefix.
     for d in deltas {
-        op_integrate_with_indexes(d, IntegrateTarget::Avi(&mut avi_t, &bake)).unwrap();
+        op_populate_avi(d, &mut avi_t, &bake).unwrap();
     }
 
     let mut ch = avi_t.open_cursor();
     let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
-    bake.key_packer
-        .pack_into(&mut gk[..bake.key_packer.out_stride], &deltas[0].as_mem_batch(), 0);
-    gk[bake.key_packer.out_stride] = 0; // ordinal 0 (single aggregate)
+    bake.pack_group(&mut gk, &deltas[0].as_mem_batch(), 0);
     let mut acc = Accumulator::new(agg.agg_op, in_schema.locate(col_idx as usize)).unwrap();
     assert!(
-        apply_agg_from_value_index(&mut ch, &gk[..bake.key_packer.out_stride + 1], for_max, &mut acc),
+        // Ordinal 0: the single aggregate.
+        apply_agg_from_value_index(&mut ch, bake.prefix(&mut gk, 0), for_max, &mut acc),
         "AVI seek must find the probed group",
     );
     acc.get_value_bits() as i64
@@ -4192,7 +4180,7 @@ fn avi_full_path_pk_source_unsigned_high_byte() {
 // 32-bit IEEE bits, which an F64 reader interprets as a tiny denormal.
 #[test]
 fn avi_f32_seed_promotes_to_f64_bits() {
-    use super::super::util::{decode_ordered, encode_ordered};
+    use super::avi::{decode_ordered, encode_ordered};
     for v in [1.5f32, -2.25, 0.0, 1.0e30] {
         let enc = encode_ordered(&v.to_le_bytes(), TypeCode::F32, false);
         let bits = decode_ordered(enc, TypeCode::F32);
@@ -5102,7 +5090,7 @@ fn global_lone_min_retract_to_next_best() {
 /// order — and a retraction advances to the next-best AVI post-state.
 #[test]
 fn global_lone_min_avi_empty_prefix() {
-    use super::super::util::encode_ordered;
+    use super::avi::encode_ordered;
 
     let in_schema = g_src();
     let out_schema = SchemaDescriptor::new(
@@ -5453,13 +5441,13 @@ fn combine_full_retraction_sheds_to_ground() {
 // Combined AggValueIndex: one table per reduce, keyed `group ‖ ordinal ‖ av`,
 // serving every MIN/MAX aggregate (grouped or global). These drive op_reduce
 // through a real combined index populated by the production
-// `op_integrate_with_indexes` flow, so the per-ordinal write and read sides
+// `op_populate_avi` flow, so the per-ordinal write and read sides
 // agree with no hand-built keys.
 // ===========================================================================
 
 /// Create an ephemeral combined-AVI table and populate it by integrating each
 /// delta in `deltas` (the accumulated integral the index must reflect at read
-/// time) through the real `op_integrate_with_indexes`. The caller opens a cursor
+/// time) through the real `op_populate_avi`. The caller opens a cursor
 /// on the returned table.
 fn build_combined_avi(
     dir: &std::path::Path,
@@ -5468,7 +5456,7 @@ fn build_combined_avi(
     agg_descs: &[AggDescriptor],
     deltas: &[&Batch],
 ) -> crate::storage::Table {
-    use crate::ops::index::{op_integrate_with_indexes, IntegrateTarget};
+    use super::avi::op_populate_avi;
     let avi_schema = avi_schema(in_schema, group_cols);
     let mut t = crate::storage::Table::with_memtable_budget(
         dir.to_str().unwrap(),
@@ -5478,9 +5466,9 @@ fn build_combined_avi(
         crate::storage::RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
-    let bake = crate::ops::index::AviBake::new(in_schema, group_cols, agg_descs).unwrap();
+    let bake = super::avi::AviBake::new(in_schema, group_cols, agg_descs);
     for d in deltas {
-        op_integrate_with_indexes(d, IntegrateTarget::Avi(&mut t, &bake)).unwrap();
+        op_populate_avi(d, &mut t, &bake).unwrap();
     }
     t
 }
@@ -6329,7 +6317,7 @@ fn reduce_nullable_group_stays_absolute_seek() {
 // bug, not a perf one.
 #[test]
 fn single_col_canonical_group_key_predicate() {
-    use super::super::util::single_col_canonical_group_key;
+    use super::super::group_key::single_col_canonical_group_key;
     let u64c = SchemaColumn::new(type_code::U64, 0);
     let i64c = SchemaColumn::new(type_code::I64, 0);
     let i64_null = SchemaColumn::new(type_code::I64, 1);
@@ -6424,7 +6412,7 @@ fn reduce_monotone_probe_many_groups_multi_source() {
 // from the reduce's own accumulator and the stored trace_out extreme instead of
 // probing the value index; a group with any retraction (or a float source, or a
 // group past the pre-step cap) still probes. These tests drive the *real* AVI
-// path — the value index is populated per epoch by `op_integrate_with_indexes`
+// path — the value index is populated per epoch by `op_populate_avi`
 // (post-delta, as the compiler wires it: AVI Integrate precedes Reduce) and the
 // reduce reads it — and check the skip path against both the unchanged trace-scan
 // (`avi = None`) path and a from-scratch oracle.
@@ -6446,7 +6434,7 @@ fn run_minmax_epochs(
     epochs: &[Batch],
     global_ground: bool,
 ) -> Vec<std::rc::Rc<Batch>> {
-    use crate::ops::index::{op_integrate_with_indexes, AviBake, IntegrateTarget};
+    use super::avi::{op_populate_avi, AviBake};
     use crate::storage::{RecoverySource, Table};
 
     let tmp = tempfile::tempdir().unwrap();
@@ -6470,11 +6458,11 @@ fn run_minmax_epochs(
     )
     .unwrap();
 
-    let avi_bake = AviBake::new(in_schema, group_by, aggs).unwrap();
+    let avi_bake = AviBake::new(in_schema, group_by, aggs);
     let mut states = Vec::with_capacity(epochs.len());
     for d in epochs {
         // AVI Integrate precedes Reduce: post-delta `I(input)` before the read.
-        op_integrate_with_indexes(d, IntegrateTarget::Avi(&mut avi_t, &avi_bake)).unwrap();
+        op_populate_avi(d, &mut avi_t, &avi_bake).unwrap();
         let out = {
             let mut to_ch = trace_out.open_cursor();
             let mut avi_ch = avi_t.open_cursor();

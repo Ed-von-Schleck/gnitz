@@ -106,25 +106,41 @@ wire_enum! {
     }
 }
 
+/// How a reduce maintains one aggregate. The two predicates below are
+/// complementary because they read this one classification rather than each
+/// carrying its own whitelist, where a new opcode would be silently `false` at
+/// both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AggClass {
+    /// `Agg(A + B) == Agg(A) + Agg(B)`: a delta's contribution folds into the
+    /// running accumulator with no history replay.
+    Linear,
+    /// Maintained through the combined aggregate-value index. Retracting the
+    /// current extremum needs the next value out of the history, so the index —
+    /// not the delta — is the value's source of truth.
+    ValueIndexed,
+}
+
 impl AggFunc {
-    /// True iff `Agg(A + B) == Agg(A) + Agg(B)` — the aggregate is linear, so a
-    /// delta's contribution folds into the running accumulator with no history
-    /// replay. MIN/MAX are not: retracting the current extremum needs the next
-    /// value out of the trace.
-    pub const fn is_linear(self) -> bool {
-        matches!(
-            self,
-            AggFunc::Count | AggFunc::Sum | AggFunc::CountNonNull | AggFunc::SumZero
-        )
+    /// This aggregate's maintenance strategy — the single source of truth both
+    /// predicates below, and the reduce's index write and read sides, read.
+    pub const fn class(self) -> AggClass {
+        match self {
+            AggFunc::Count | AggFunc::Sum | AggFunc::CountNonNull | AggFunc::SumZero => AggClass::Linear,
+            AggFunc::Min | AggFunc::Max => AggClass::ValueIndexed,
+        }
     }
 
-    /// True iff this aggregate is maintained through the combined AggValueIndex —
-    /// the order-encodable extremes MIN/MAX. The single source of truth for
-    /// "which aggregates the value index serves, and in what ordinal order": the
-    /// engine's index write side and reduce read side both select and order
-    /// their entries by this predicate, so the two agree by construction.
+    /// True iff the aggregate folds a delta with no history replay.
+    pub const fn is_linear(self) -> bool {
+        matches!(self.class(), AggClass::Linear)
+    }
+
+    /// True iff this aggregate is maintained through the combined AggValueIndex.
+    /// Also fixes the ordinal order: the engine's index bake selects its entries
+    /// by this predicate, in descriptor order.
     pub const fn uses_value_index(self) -> bool {
-        matches!(self, AggFunc::Min | AggFunc::Max)
+        matches!(self.class(), AggClass::ValueIndexed)
     }
 
     /// True iff an untouched accumulator renders a concrete `0` rather than

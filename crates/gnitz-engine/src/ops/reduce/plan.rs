@@ -4,10 +4,11 @@
 //! coherence the old 13-parameter `op_reduce` signature spread across the
 //! instruction operands; the per-epoch call re-derives nothing.
 
-use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor};
 
-use super::super::util::GroupKeyCols;
+use super::super::group_key::GroupKeyCols;
 use super::agg::{Accumulator, AggDescriptor};
+use super::avi::AviBake;
 use gnitz_wire::AggFunc;
 
 /// Build the reduce output schema by **obeying** the planner's shipped
@@ -61,8 +62,6 @@ pub(crate) struct ReducePlan {
     /// conjunction of `global_ground` and per-worker V₀ ownership, so
     /// "owns V₀ but is not a ground reduce" is unrepresentable.
     pub(super) seeds_ground: bool,
-    /// Every aggregate is linear (COUNT/SUM family): no history replay.
-    pub(super) all_linear: bool,
     /// What the emitted row is keyed by, and — for `PkPermutation`, the one kind
     /// selected by "the group set *is* the PK" — that the input PK region is
     /// itself the group key.
@@ -84,6 +83,11 @@ pub(crate) struct ReducePlan {
     /// row's synthetic PK, the group sort key, the group-membership comparator,
     /// and (for `SyntheticFold`) the exemplar copies all read it.
     pub(super) group_key: GroupKeyCols,
+    /// The combined aggregate-value index this reduce is maintained through:
+    /// its schema, its key writers, and the value-indexed aggregates in ordinal
+    /// order. `Some` iff some aggregate is non-linear, so this *is* the
+    /// "needs history" bit — nothing re-derives it from the descriptor list.
+    pub(crate) avi: Option<AviBake>,
     /// Output width of each trailing agg column — the trace read-back stride.
     pub(super) agg_col_widths: Vec<usize>,
     /// First aggregate column's logical index (aggregates are the trailing
@@ -119,12 +123,17 @@ impl ReducePlan {
         let num_aggs = agg_descs.len();
         let cbase = output_schema.num_columns() - num_aggs;
 
-        let all_linear = agg_descs.iter().all(|d| d.agg_op.is_linear());
-        // A float extreme always probes, so it is never worth pre-stepping for.
-        let track_nonlinear = agg_descs.iter().any(|d| {
-            d.agg_op.uses_value_index()
-                && !TypeCode::from_validated_u8(input_schema.columns[d.col_idx as usize].type_code).is_float()
-        });
+        // Every group set has a packed key and the accumulator build above
+        // already rejected any aggregate the index could not encode, so a
+        // non-linear reduce always gets one — there is no eligibility gate and
+        // no trace-replay fallback.
+        let avi = agg_descs
+            .iter()
+            .any(|d| d.agg_op.uses_value_index())
+            .then(|| AviBake::new(input_schema, group_by_cols, agg_descs));
+        // Read off the bake's own aggregate list, so the value-indexed set has one
+        // walk rather than a second one that has to keep agreeing with it.
+        let track_nonlinear = avi.as_ref().is_some_and(AviBake::has_integer_extreme);
 
         let cardinality_idx: Option<u8> = agg_descs
             .iter()
@@ -140,12 +149,12 @@ impl ReducePlan {
             output_schema,
             global_ground,
             seeds_ground: global_ground && i_am_owner,
-            all_linear,
             out_key,
             track_nonlinear,
             cardinality_idx,
             acc_template,
             group_key: GroupKeyCols::new(input_schema, group_by_cols),
+            avi,
             agg_col_widths,
             cbase,
         })

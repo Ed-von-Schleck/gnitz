@@ -7,7 +7,7 @@ use crate::schema::{key::PkSortKey, ColumnLocator};
 use crate::storage::MemBatch;
 use gnitz_expr::RowSource;
 
-use super::super::util::GroupKeyCols;
+use super::super::group_key::GroupKeyCols;
 
 /// Compare two rows by group columns through pre-resolved [`ColumnLocator`]s
 /// (the reduce plan's baked `group_key.cols`). Generic over two

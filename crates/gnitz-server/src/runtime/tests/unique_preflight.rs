@@ -396,61 +396,6 @@ fn preflight_composite_projection_distinguishes_trailing_column() {
     assert!(!acc.duplicate);
 }
 
-/// `IndexKeySpec::key_bytes` produces exactly the leading `idx_key_size` bytes
-/// that `batch_project_index` writes as the index PK prefix — so the in-memory
-/// key, the projected index entry, and the seek prefix all agree, across a
-/// signed / unsigned / U128 column mix.
-#[test]
-fn index_key_spec_equals_projected_leading_span() {
-    use gnitz_engine::query::DagEngine;
-    // Owner: PK id U64; a I64 (signed payload), b U128 (payload).
-    let owner = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U128, 0),
-        ],
-        &[0],
-    );
-    // Composite unique on (a, b): promoted (I64→U64, U128→U128) = 8 + 16 = 24.
-    let cols = [1u32, 2];
-    let idx_schema = make_index_schema(&cols, &owner).unwrap();
-    let spec = IndexKeySpec::new(&cols, &owner, &idx_schema);
-    let idx_key_size = spec.key_size();
-    assert_eq!(idx_key_size, 8 + 16, "I64→U64 (8) + U128 (16)");
-
-    let mut batch = Batch::with_capacity(owner, 4);
-    let rows: [(u128, i64, u128); 3] = [(1, -3, 100), (2, 7, u128::MAX), (3, i64::MIN, 0)];
-    for &(id, a, b) in &rows {
-        unsafe {
-            batch.append_row_simple(
-                id,
-                1,
-                0,
-                &[a, b as u64 as i64],
-                &[0, (b >> 64) as u64],
-                &[std::ptr::null(), std::ptr::null()],
-                &[0, 0],
-            );
-        }
-    }
-
-    // Reference: the projected index entry's leading idx_key_size bytes.
-    let projected = DagEngine::batch_project_index(&batch, &IndexKeySpec::new(&cols, &owner, &idx_schema), &idx_schema);
-    assert_eq!(projected.count, rows.len());
-
-    let mb = batch.as_mem_batch();
-    let mut keybuf = PkBuf::zeroed(0);
-    for row in 0..batch.count {
-        assert!(spec.key_bytes(&mb, row, &mut keybuf));
-        assert_eq!(
-            keybuf.pk_bytes(),
-            &projected.get_pk_bytes(row)[..idx_key_size],
-            "key_bytes must equal the projected entry's leading span (row {row})",
-        );
-    }
-}
-
 /// A row NULL in ANY indexed column is skipped (`key_bytes` → false) —
 /// SQL NULL-distinctness, mirroring `batch_project_index`.
 #[test]
