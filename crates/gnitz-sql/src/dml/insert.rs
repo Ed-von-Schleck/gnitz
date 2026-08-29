@@ -287,10 +287,15 @@ pub(crate) fn execute_insert(
             } else {
                 WireConflictMode::Error
             };
-            client.push_with_mode(tid, schema, &batch, mode)?;
+            // The batch moves into the push, so a copy is kept only when
+            // RETURNING will project it — inside a transaction the push would
+            // otherwise deep-clone every buffered row for a projection the common
+            // case does not ask for.
+            let returned = proj.is_some().then(|| batch.clone());
+            client.push_owned(tid, schema, batch, mode)?;
             match proj {
                 Some(proj) => {
-                    let (proj_schema, proj_batch) = project(proj, schema, Some(batch));
+                    let (proj_schema, proj_batch) = project(proj, schema, returned);
                     Ok(SqlResult::Rows {
                         schema: proj_schema,
                         batch: proj_batch,

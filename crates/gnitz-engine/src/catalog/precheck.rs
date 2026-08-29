@@ -39,6 +39,39 @@ fn reject_system_id(sig: &PkSignature, family: SysFamily, first_user: i64) -> Re
     Ok(())
 }
 
+/// The name rules a relation or index row must satisfy to be *stored*: non-empty
+/// `[A-Za-z0-9_]` (a name is interpolated into index names), already canonical
+/// (every cache key here is compared byte-wise against the client's folded form),
+/// and free of the reserved `__fk_` infix.
+///
+/// Deliberately **not** `validate_user_identifier`, whose leading-`_` reservation
+/// is client-side *policy*: the engine must accept the `__h…` segment rows the
+/// client writes, and spelling a `__h` grammar here would give a forger a target.
+/// The residual — a raw bundle naming a relation `_foo` — is unreferenceable from
+/// SQL and lives in a `t_<id>` directory.
+fn reject_unstorable_name(name: &str, noun: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("{noun} name cannot be empty"));
+    }
+    if !name.bytes().all(gnitz_wire::is_valid_ident_char) {
+        return Err(format!("{noun} name contains invalid characters: {name}"));
+    }
+    reject_non_canonical(name, noun)?;
+    gnitz_wire::reject_reserved_infix(name)
+}
+
+/// Reject a name that is not already ASCII-lowercase. Every cache key and
+/// qualified name here is compared byte-wise against the folded form the client
+/// stores, so a mixed-case row would register a relation no lookup finds.
+fn reject_non_canonical(name: &str, noun: &str) -> Result<(), String> {
+    if name.bytes().any(|c| c.is_ascii_uppercase()) {
+        return Err(format!(
+            "{noun} name '{name}' is not canonical: catalog names are stored ASCII-lowercase"
+        ));
+    }
+    Ok(())
+}
+
 impl CatalogEngine {
     /// Check every FK-carrying column of a relation about to be registered.
     /// `pk` must already have passed `validate_relation_defs`, which is what
@@ -560,6 +593,12 @@ impl CatalogEngine {
         for i in 0..batch.count {
             if batch.get_weight(i) > 0 {
                 let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
+                // The full identifier rule, leading-`_` included: a schema name is
+                // the one the engine interpolates into a filesystem path
+                // (`hook_schema_dir` → `create_dir_all`, and `remove_dir_all` on
+                // the `-1` arm). Nothing synthesizes one, so no carve-out.
+                validate_user_identifier(&name)?;
+                reject_non_canonical(&name, "schema")?;
                 if self.has_schema(&name) {
                     return Err(format!("Schema already exists: {name}"));
                 }
@@ -623,6 +662,7 @@ impl CatalogEngine {
                 (sid, name, pk, RelationKind::View)
             };
             validate_relation_defs(kind, id, &name, &col_defs, &pk)?;
+            reject_unstorable_name(&name, family.row_noun())?;
 
             if is_table {
                 // A stream push must stay a pure append: SERIAL would draw from a
@@ -698,12 +738,20 @@ impl CatalogEngine {
     ///
     /// IDX_TAB carries no rewrite pair, so raw `weight < 0` is already net-dead.
     fn precheck_index_family(&mut self, batch: &Batch) -> Result<(), String> {
+        // The names this batch has already claimed, as `precheck_qname_unique`
+        // threads one for relations. Without it two rows under one name both pass
+        // the persisted-cache check and the second overwrites the first in
+        // `index_by_name`, leaving one index live and unreachable.
+        let mut claimed: FxHashSet<String> = FxHashSet::default();
         for i in 0..batch.count {
             if batch.get_weight(i) <= 0 {
                 continue;
             }
             let (owner_id, cols, _is_unique) = read_idx_tab_row(batch, i);
             let index_name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
+            // An internal FK index is minted by `create_fk_indices` and reaches
+            // this path only through `submit`, which runs no precheck for it.
+            reject_unstorable_name(&index_name, "index")?;
             let entry = self.validate_index_registration(owner_id, &cols)?;
 
             // Bounds, per-column eligibility (STRING/BLOB/float), and
@@ -721,6 +769,9 @@ impl CatalogEngine {
                 if existing != idx_id {
                     return Err(format!("Index already exists: {index_name}"));
                 }
+            }
+            if !claimed.insert(index_name.clone()) {
+                return Err(format!("Index already exists: {index_name}"));
             }
         }
 

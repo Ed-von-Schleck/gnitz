@@ -451,7 +451,7 @@ fn resolve_alter_base_table_with_schema(
 }
 
 /// Reject an ALTER of a system relation (id below the user band). The engine's
-/// §3.3 system-range precheck is the backstop; this is the friendly client error.
+/// own system-id precheck is the backstop; this is the friendly client error.
 fn reject_system_relation(id: u64) -> Result<(), GnitzSqlError> {
     if id < gnitz_core::FIRST_USER_TABLE_ID {
         return Err(GnitzSqlError::Unsupported(format!(

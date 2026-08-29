@@ -244,12 +244,13 @@ fn test_edge_cases() {
     assert!(engine.schema_is_empty("empty_test"));
     engine.drop_schema("empty_test").unwrap();
 
-    // 19. Case sensitivity
-    engine.create_table("public.CaseTest", &cols, &[0]).unwrap();
+    // 19. Names are stored canonically: a mixed-case relation name is refused,
+    // because every cache key and qualified name here is compared byte-wise
+    // against the folded form the client stores.
+    let err = engine.create_table("public.CaseTest", &cols, &[0]).unwrap_err();
+    assert!(err.contains("not canonical"), "{err}");
+    assert!(engine.get_by_name("public", "CaseTest").is_none());
     engine.create_table("public.casetest", &cols, &[0]).unwrap();
-    assert!(engine.get_by_name("public", "CaseTest").is_some());
-    assert!(engine.get_by_name("public", "casetest").is_some());
-    engine.drop_table("public.CaseTest").unwrap();
     engine.drop_table("public.casetest").unwrap();
 
     // 24. Invalid schema ID lookup

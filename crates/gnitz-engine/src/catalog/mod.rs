@@ -68,7 +68,6 @@ use sys_tables::*;
 //    but scoped to the catalog subtree rather than the crate-wide surface. ─────
 pub(in crate::catalog) use apply_context::ApplyContext;
 pub(in crate::catalog) use cache::CatalogCacheSet;
-#[cfg(test)]
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use registry::raise_id_counter;

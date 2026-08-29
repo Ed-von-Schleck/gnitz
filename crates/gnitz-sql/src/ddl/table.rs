@@ -6,7 +6,7 @@ use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
 use crate::validate::{
-    default_index_name, disambiguate_index_name, non_key_eligible_error, reject_duplicate_names,
+    canonical_user_name, default_index_name, disambiguate_index_name, non_key_eligible_error, reject_duplicate_names,
     reject_unhonored_column_options, reject_unhonored_table_constraints, reject_unindexable_columns,
     validate_user_index_name, validate_user_name, ColumnOptionSite,
 };
@@ -540,9 +540,14 @@ pub(crate) fn execute_create_table(
     // explicit constraint name.
     let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Explicit constraint names first — fixed points that auto-names route around.
+    // Two of them under one canonical name would write two IDX_TAB rows the
+    // catalog cannot both reach by name, so the collision is an error here rather
+    // than a silently-shadowed index.
     for (_, constraint_name) in &unique_cols {
         if let Some(n) = constraint_name {
-            taken.insert(n.to_ascii_lowercase());
+            if !taken.insert(canonical_user_name(n)?) {
+                return Err(GnitzSqlError::Plan(format!("duplicate constraint name '{n}'")));
+            }
         }
     }
     // Both `unique_cols` push sites reject a set already present, so an auto-name
@@ -550,7 +555,7 @@ pub(crate) fn execute_create_table(
     let mut index_names: Vec<String> = Vec::with_capacity(unique_cols.len());
     for (col_indices, constraint_name) in &unique_cols {
         let name = match constraint_name {
-            Some(n) => n.clone(),
+            Some(n) => canonical_user_name(n)?,
             None => {
                 let col_names: Vec<&str> = col_indices.iter().map(|&c| cols[c as usize].name.as_str()).collect();
                 let base = default_index_name(schema_name, &table_name, &col_names);
@@ -812,7 +817,7 @@ mod tests {
     fn self_fk_resolves_to_the_marker_not_a_table_id() {
         let cols = tree_cols();
         // `parent_id BIGINT REFERENCES tree(id)`. The table has no id yet, so
-        // the planner marks the column; `append_col_row` substitutes the owner
+        // the planner marks the column; `ColumnDef::col_tab_row` substitutes the owner
         // id. `0` would collide with the engine's "no FK" encoding.
         let (tid, ref_col, parent_type) = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 1).unwrap();
         assert_eq!(tid, ColumnDef::SELF_FK_TABLE_ID);

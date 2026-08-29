@@ -849,7 +849,16 @@ impl Session {
     }
 
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
-        self.alloc(0, FLAG_ALLOCATE_TABLE_ID, 0)
+        self.alloc_table_ids(1)
+    }
+
+    /// Reserve a contiguous run of `count` relation ids — one round trip and one
+    /// durable sequence advance for the whole run, which is how a multi-segment
+    /// view chain draws its ids. The caller owns `[base, base + count)`. The count
+    /// rides in `seek_col_idx`, the field `alloc_serial_range` already uses for
+    /// it, so the frame is unchanged.
+    pub fn alloc_table_ids(&mut self, count: u64) -> Result<u64, ClientError> {
+        self.alloc(0, FLAG_ALLOCATE_TABLE_ID, count)
     }
 
     pub fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
@@ -857,7 +866,13 @@ impl Session {
     }
 
     pub fn alloc_index_id(&mut self) -> Result<u64, ClientError> {
-        self.alloc(0, FLAG_ALLOCATE_INDEX_ID, 0)
+        self.alloc_index_ids(1)
+    }
+
+    /// [`Self::alloc_table_ids`] for index ids — what a `CREATE TABLE` with `n`
+    /// inline `UNIQUE` constraints draws in one round trip.
+    pub fn alloc_index_ids(&mut self, count: u64) -> Result<u64, ClientError> {
+        self.alloc(0, FLAG_ALLOCATE_INDEX_ID, count)
     }
 
     /// Reserve a contiguous range of `count` SERIAL ids for the sequence keyed
@@ -918,7 +933,20 @@ impl Session {
 
     /// Send a pre-encoded transaction frame and receive its uncorrelated
     /// zone-LSN ACK (`seek_pk`). Shared by `push_ddl_txn` and `push_txn`.
+    ///
+    /// The bounds check is here rather than at either caller because the caps are
+    /// asymmetric — 256 MB inbound, 64 MB outbound — so a bundle derived from a
+    /// reply the client legitimately accepted can still exceed what the server
+    /// will take. Without it that is an ingress rejection and a dropped
+    /// connection rather than an error the caller can act on.
     fn send_txn_frame(&mut self, payload: Vec<u8>) -> Result<u64, ClientError> {
+        if payload.len() > gnitz_wire::MAX_FRAME_PAYLOAD_SERVER {
+            return Err(ClientError::ServerError(format!(
+                "transaction frame is {} bytes, exceeding the {}-byte server ingress cap; split the transaction",
+                payload.len(),
+                gnitz_wire::MAX_FRAME_PAYLOAD_SERVER
+            )));
+        }
         let train = self.round_trip_train(Request::Uncorrelated(payload))?;
         Ok(train.terminal.seek_pk as u64)
     }
@@ -930,9 +958,9 @@ impl Session {
     /// zone LSN (echoed in the ACK's `seek_pk`, as `push` does).
     ///
     /// The reply is received uncorrelated, exactly as `push_ddl_txn` does. Each
-    /// family's batch is validated client-side before encoding, and the encoded
-    /// frame is bounds-checked against the server ingress cap so an oversized
-    /// bundle fails locally rather than being truncated on the wire.
+    /// family's batch is validated client-side before encoding, and
+    /// [`Self::send_txn_frame`] bounds-checks the frame against the server ingress
+    /// cap so an oversized bundle fails locally.
     ///
     /// `preconditions` carries the OCC `(tid, basis)` assertions ("`tid` not
     /// written since `basis`"); the server rejects the whole transaction with
@@ -947,13 +975,6 @@ impl Session {
             batch.validate(schema).map_err(ClientError::ServerError)?;
         }
         let payload = encode_push_txn(self.client_id, families, preconditions);
-        if payload.len() > gnitz_wire::MAX_FRAME_PAYLOAD_SERVER {
-            return Err(ClientError::ServerError(format!(
-                "transaction frame is {} bytes, exceeding the {}-byte server ingress cap; split the transaction",
-                payload.len(),
-                gnitz_wire::MAX_FRAME_PAYLOAD_SERVER
-            )));
-        }
         self.send_txn_frame(payload)
     }
 

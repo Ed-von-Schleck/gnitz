@@ -41,7 +41,7 @@ pub struct ColumnDef {
 
 impl ColumnDef {
     /// `fk_table_id` value meaning "this column references the table being
-    /// created", whose id the planner cannot name yet. `append_col_row`
+    /// created", whose id the planner cannot name yet. [`Self::col_tab_row`]
     /// rewrites it to the owner id, so no `COL_TAB` row carries it.
     ///
     /// `0` cannot serve, being the live "no FK" value. `u64::MAX` is
@@ -84,6 +84,36 @@ impl ColumnDef {
             nominal.register_image(),
             true,
         )
+    }
+
+    /// This column as the `COL_TAB` row recording it: column `col_idx` of
+    /// `owner_id`, whose kind is `owner_kind`.
+    ///
+    /// The FK fields are resolved against the owner rather than taken verbatim,
+    /// which is why this sits on the type that defines [`Self::SELF_FK_TABLE_ID`]:
+    /// the marker becomes `owner_id`, and a non-table owner writes no FK — a
+    /// view's defs are clones of the source columns, and the constraint belongs to
+    /// the base table.
+    pub fn col_tab_row(&self, owner_id: u64, owner_kind: u64, col_idx: usize) -> gnitz_wire::sys_rows::ColTabRow<'_> {
+        let (fk_table_id, fk_col_idx) = if owner_kind != gnitz_wire::OWNER_KIND_TABLE {
+            (0, 0)
+        } else if self.fk_table_id == ColumnDef::SELF_FK_TABLE_ID {
+            (owner_id, self.fk_col_idx)
+        } else {
+            (self.fk_table_id, self.fk_col_idx)
+        };
+        gnitz_wire::sys_rows::ColTabRow {
+            owner_id,
+            owner_kind,
+            col_idx: col_idx as u64,
+            name: &self.name,
+            type_code: self.type_code as u64,
+            is_nullable: self.is_nullable,
+            fk_table_id,
+            fk_col_idx,
+            is_serial: self.is_serial,
+            is_hidden: self.is_hidden,
+        }
     }
 
     /// Mark this column a SERIAL primary key — an auto-assigned, client-stamped

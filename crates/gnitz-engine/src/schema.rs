@@ -887,6 +887,10 @@ pub fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaD
 /// order. Derived rather than persisted, exactly as [`make_index_schema`] is —
 /// the delta store is registered and recovered the way a secondary index is.
 ///
+/// The order itself is `gnitz_wire::delta_schema_order`, which the client's
+/// `delta_reply_schema` applies to build the reply schema it ships; the two sides
+/// therefore cannot permute differently.
+///
 /// A `SchemaDescriptor` holds types, nullability and a PK-index list and **no
 /// column names at all**, so `_tick` is a position, not an identifier: there is
 /// nothing for a user column name to collide with.
@@ -908,11 +912,15 @@ pub fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaD
 /// is not a second line of defence; it is what keeps a future router from being
 /// told something false.
 pub fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
+    use gnitz_wire::DeltaCol;
+    let pk: Vec<usize> = view.pk_indices().iter().map(|&i| i as usize).collect();
     let mut b = DerivedSchema::new();
-    b.push_pk(SchemaColumn::new(type_code::U64, 0))?;
-    b.push_pk_of(view)?;
-    for (_, c) in view.payload_columns() {
-        b.push(*c)?;
+    for c in gnitz_wire::delta_schema_order(&pk, view.num_columns()) {
+        match c {
+            DeltaCol::Tick => b.push_pk(SchemaColumn::new(type_code::U64, 0))?,
+            DeltaCol::Key(i) => b.push_pk(view.columns[i])?,
+            DeltaCol::Payload(i) => b.push(view.columns[i])?,
+        }
     }
     Some(b.finish().with_placement(Placement::Local))
 }

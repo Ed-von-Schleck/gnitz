@@ -1067,10 +1067,17 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
 
         // An id allocation names no relation, so `target_id` is not read — and a
         // frame that sets one is still allocated, rather than falling through to
-        // a scan of that id.
-        ClientVerb::AllocTableId => reply_allocation(peer, client_id, shared.cat_mut().allocate_table_id()).await,
+        // a scan of that id. The run length rides in `seek_col_idx`, exactly as
+        // `AllocSerialRange`'s does; the reply is the run's base.
+        ClientVerb::AllocTableId => {
+            let alloc = shared.cat_mut().allocate_table_ids(ctrl.seek_col_idx);
+            reply_allocation(peer, client_id, alloc).await
+        }
         ClientVerb::AllocSchemaId => reply_allocation(peer, client_id, shared.cat_mut().allocate_schema_id()).await,
-        ClientVerb::AllocIndexId => reply_allocation(peer, client_id, shared.cat_mut().allocate_index_id()).await,
+        ClientVerb::AllocIndexId => {
+            let alloc = shared.cat_mut().allocate_index_ids(ctrl.seek_col_idx);
+            reply_allocation(peer, client_id, alloc).await
+        }
 
         ClientVerb::Seek => serve_seek(shared, peer, &ctrl, client_version).await,
         ClientVerb::SeekByIndex => handle_seek_by_index(shared, peer, &ctrl, client_version).await,
@@ -2352,12 +2359,6 @@ async fn handle_system_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
     }
 }
 
-/// The bundle's batch for system family `tid`, if it carries one. A DDL bundle
-/// holds at most one family per tid.
-fn bundle_family(families: &[(SysFamily, Batch)], family: SysFamily) -> Option<&Batch> {
-    families.iter().find(|(f, _)| *f == family).map(|(_, b)| b)
-}
-
 /// Resolve `tid`'s system-family schema and decode a client wal-block slice
 /// against it — the master's OWN registered layout, so a client cannot dictate
 /// how its bytes are read. `SysFamily::from_id` rejects a bogus family tid.
@@ -2406,10 +2407,14 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
 /// caller above owns the single reply path. Returns the durable zone LSN and the
 /// bundle's family count (which the caller's slow-DDL log line reports).
 ///
-/// Families are ingested in ascending topo order, so every register/index hook
-/// sees its dependencies already in the memtable; on any failure the applied
-/// families are negated in master memory before broadcast, so a crash *or* a
-/// precheck failure can never strand an orphan catalog row.
+/// Families are ingested in topo order — ascending for a bundle that creates, so
+/// every register/index hook sees its dependencies already in the memtable;
+/// descending for one that only drops, so a dependent is retired first. The loop
+/// prechecks and applies one family at a time, so a later family's precheck reads
+/// the caches an earlier family's apply updated — which is what lets one DROP
+/// SCHEMA bundle pass the empty-schema guard. On any failure the applied families
+/// are negated in master memory before broadcast, so neither a crash nor a
+/// precheck failure can strand an orphan row.
 async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), String> {
     // Decode the bundle and materialise each family's wal-block slice into an
     // owned Batch up front (before any lock) — see `decode_sys_family`.
@@ -2418,15 +2423,24 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         return Err("DDL_TXN: empty family bundle".to_string());
     }
     let family_count = raw_families.len();
-    let mut families: Vec<(SysFamily, Batch)> = Vec::with_capacity(family_count);
+    // Slotted by discriminant, so "at most one block per family" is a structural
+    // error at insert rather than an assumption: every derived list below reads
+    // one block per family, and a second VIEW_TAB block would register both sets
+    // of views while the new-view ids came from the first alone. The check belongs
+    // here and not in the decoder, as `validate_scan_multi_tids` does.
+    let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
     for &(tid, slice) in &raw_families {
-        families.push(decode_sys_family(tid as i64, slice).map_err(|e| format!("DDL_TXN: {e}"))?);
+        let (family, batch) = decode_sys_family(tid as i64, slice).map_err(|e| format!("DDL_TXN: {e}"))?;
+        if families[family.index()].replace(batch).is_some() {
+            return Err(format!("DDL_TXN: bundle carries two blocks for family {tid}"));
+        }
     }
 
     // A CREATE VIEW is a stop-the-world op (source drain + distributed backfill,
     // reactor parked). The VIEW_TAB family's +1 rows, if any, are the new views;
     // they alone need the lock-held barrier and the in-loop source drain below.
-    let new_view_ids: Vec<i64> = bundle_family(&families, SysFamily::View)
+    let new_view_ids: Vec<i64> = families[SysFamily::View.index()]
+        .as_ref()
         .map(|b| family_pks_by_sign(b, true))
         .unwrap_or_default();
     let view_create = !new_view_ids.is_empty();
@@ -2476,7 +2490,8 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
         // `create_index` and read identically by `hook_index_register`.
         let mut filter_seeds: Vec<(i64, u64, UniqueFilter)> = Vec::new();
-        for (owner_id, packed, cols) in bundle_family(&families, SysFamily::Index)
+        for (owner_id, packed, cols) in families[SysFamily::Index.index()]
+            .as_ref()
             .map(idx_tab_unique_creates)
             .unwrap_or_default()
         {
@@ -2508,13 +2523,16 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         // `families`, so extract those minimal lists now instead of cloning the whole
         // TABLE_TAB / VIEW_TAB / IDX_TAB batches. A bundle is one DDL, so at most one
         // family carries -1 rows; a CREATE bundle yields empty lists.
-        let dropped_tids: Vec<i64> = bundle_family(&families, SysFamily::Table)
+        let dropped_tids: Vec<i64> = families[SysFamily::Table.index()]
+            .as_ref()
             .map(|b| family_pks_by_sign(b, false))
             .unwrap_or_default();
-        let dropped_view_ids: Vec<i64> = bundle_family(&families, SysFamily::View)
+        let dropped_view_ids: Vec<i64> = families[SysFamily::View.index()]
+            .as_ref()
             .map(|b| family_pks_by_sign(b, false))
             .unwrap_or_default();
-        let dropped_indices: Vec<(i64, u64)> = bundle_family(&families, SysFamily::Index)
+        let dropped_indices: Vec<(i64, u64)> = families[SysFamily::Index.index()]
+            .as_ref()
             .map(idx_tab_drops)
             .unwrap_or_default();
 
@@ -2534,13 +2552,26 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         // The ingest loop writes nothing to the SAL (broadcasts are queued and emitted
         // only in the tail below), so the in-loop drain's tick precedes the zone's
         // broadcasts in SAL order.
-        families.sort_by_key(|(f, _)| f.topo_priority());
+        let mut ordered: Vec<(SysFamily, Batch)> = SysFamily::ALL
+            .iter()
+            .filter_map(|&f| families[f.index()].take().map(|b| (f, b)))
+            .collect();
+        // A bundle that only drops is ingested in the reverse of creation order —
+        // a view retired before the tables it reads, a schema after its members —
+        // which is what lets one DROP SCHEMA bundle carry
+        // `[VIEW_TAB, TABLE_TAB, SCHEMA_TAB]`. A mixed-sign bundle (an ALTER
+        // VIEW's retract-then-register) keeps the creation order.
+        if ordered.iter().all(|(_, b)| (0..b.count).all(|i| b.get_weight(i) < 0)) {
+            ordered.sort_by_key(|(f, _)| std::cmp::Reverse(f.topo_priority()));
+        } else {
+            ordered.sort_by_key(|(f, _)| f.topo_priority());
+        }
         let view_prio = SysFamily::View.topo_priority();
         let mut applied_not_enqueued: Option<(SysFamily, Batch)> = None;
         let mut drained_sources = false;
         let ingest_res = guard_panic("DDL", || {
             let cat = shared.cat_mut();
-            for (family, fbatch) in families {
+            for (family, fbatch) in ordered {
                 if view_create && !drained_sources && family.topo_priority() >= view_prio {
                     for src in cat.dag_mut().base_tables_reachable_from(new_view_ids.clone()) {
                         shared.disp().drain_tick_blocking(src)?;

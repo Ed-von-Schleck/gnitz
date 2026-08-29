@@ -1,6 +1,6 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::{GnitzClient, TableProps, TypeCode};
+use gnitz_core::{GnitzClient, PlannedView, TableProps, TypeCode, ViewName};
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
@@ -558,7 +558,19 @@ fn test_create_view_with_nullable_first_column_rejected() {
         ColumnDef::new("v", TypeCode::I64, false),
     ];
     let err = client
-        .create_view_with_circuit(&sn, "bad_view", "", circuit, &bad_out, &[0])
+        .create_view_chain(
+            &sn,
+            vec![PlannedView {
+                name: ViewName::Named("bad_view".to_string()),
+                sql_text: String::new(),
+                circuit,
+                output_columns: bad_out,
+                pk_cols: vec![0],
+                capacity_bytes: None,
+                delta_bytes: None,
+            }],
+            None,
+        )
         .unwrap_err();
     let msg = format!("{:?}", err);
     assert!(

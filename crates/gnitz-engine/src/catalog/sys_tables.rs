@@ -523,10 +523,11 @@ pub(super) fn pack_view_pk(view_id: i64, sub: u64) -> u128 {
 
 /// Topological creation priority per family, indexed by discriminant. Lower =
 /// earlier in the dependency chain (created first, destroyed last). Orders the
-/// `DDL_TXN` handler's ascending forward ingest — so every register/index hook
-/// sees its dependencies already in the memtable — and rollback's descending
-/// negate. Table and View differ so their relative order is stable; 99 is
-/// order-neutral.
+/// `DDL_TXN` handler's forward ingest — ascending for a bundle that creates, so
+/// every register/index hook sees its dependencies already in the memtable;
+/// descending for an all-negative one, where a dependent must be retired before
+/// what it depends on — and rollback's own two-phase negate. Table and View
+/// differ so their relative order is stable; 99 is order-neutral.
 const TOPO_PRIORITY: [u8; SysFamily::COUNT] = [
     0,  // Schema
     5,  // Table
@@ -559,10 +560,10 @@ pub enum SysFamily {
 }
 
 impl SysFamily {
-    pub(crate) const COUNT: usize = 9;
+    pub const COUNT: usize = 9;
 
     /// Every family in discriminant order, for the open/bootstrap/flush walks.
-    pub(crate) const ALL: [SysFamily; Self::COUNT] = [
+    pub const ALL: [SysFamily; Self::COUNT] = [
         SysFamily::Schema,
         SysFamily::Table,
         SysFamily::View,
@@ -576,7 +577,7 @@ impl SysFamily {
 
     /// Discriminant index into the per-family arrays.
     #[inline]
-    pub(crate) const fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         self as usize
     }
 

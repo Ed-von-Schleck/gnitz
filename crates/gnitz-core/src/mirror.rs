@@ -399,7 +399,7 @@ impl GnitzClient {
         // first sighting pays the SCHEMA_TAB scan every DDL path takes.
         let schema_id = match self.mirror_state()?.store.schema_id(schema_name) {
             Some(id) => id,
-            None => self.schema_id(schema_name)?,
+            None => self.lookup_schema_id(schema_name)?,
         };
         let retracted = self
             .mirror_state()?
@@ -410,7 +410,7 @@ impl GnitzClient {
             schema_name: schema_name.to_string(),
             name: name.to_string(),
             desc: rel,
-            delta_reply_schema: Arc::new(delta_reply_schema(&schema)),
+            delta_reply_schema: Arc::new(delta_reply_schema(&schema)?),
         };
         let m = self.mirror_state()?;
         for old in retracted {
@@ -561,11 +561,12 @@ impl GnitzClient {
     /// `Err`, so the outcome never carries [`PollResult::Failed`].
     pub fn mirror_view(&mut self, schema_name: &str, name: &str) -> Result<PollOutcome, ClientError> {
         self.refuse_poisoned_mirror()?;
-        // Identifiers are canonically lower-case: the rows the registration
-        // writes must carry the same spelling the server's do, or a later
-        // resolve of the local catalog would miss.
-        let schema_name = schema_name.to_ascii_lowercase();
-        let name = name.to_ascii_lowercase();
+        // The rows the registration writes must carry the same spelling the
+        // server's do, or a later resolve of the local catalog would miss — so
+        // the name takes the same validate-then-fold every catalog gateway
+        // applies, not a bare fold of its own.
+        let schema_name = gnitz_wire::canonical_identifier(schema_name).map_err(ClientError::ServerError)?;
+        let name = gnitz_wire::canonical_identifier(name).map_err(ClientError::ServerError)?;
 
         let tid = self.reconcile_registration(&schema_name, &name)?;
         // The line above is the resolve, which is what makes a direct bootstrap

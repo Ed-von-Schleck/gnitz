@@ -151,7 +151,7 @@ impl Circuit {
 }
 
 /// Fluent builder for DBSP circuit graphs, producing a typed [`Circuit`]
-/// for `GnitzClient::create_view_with_circuit`.
+/// for `GnitzClient::create_view_chain`.
 ///
 /// Sequential `node_id`s start at 1. `primary_source_id` is fixed at
 /// construction and becomes the source of every `input_delta()` node, so it is

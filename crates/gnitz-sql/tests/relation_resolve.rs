@@ -438,11 +438,12 @@ fn a_multi_segment_statement_resolves_once_per_relation() {
     assert!(two <= 4, "an extra segment adds no resolve: {two} requests");
 }
 
-/// `DROP SCHEMA` cascades over every member, each re-deriving the schema id and
-/// its own family row. The statement-scoped scan cache is what keeps that at its
-/// old request count; without it every member would re-scan SCHEMA_TAB.
+/// `DROP SCHEMA` is one bundle whatever the member count: the SCHEMA_TAB probe,
+/// one VIEW_TAB scan, one TABLE_TAB scan and one push. An equality, not a bound,
+/// so a regression to a per-member cascade fails here instead of fitting under a
+/// slack ceiling.
 #[test]
-fn drop_schema_cascade_does_not_rescan_per_member() {
+fn drop_schema_is_four_requests_whatever_the_member_count() {
     let Some(srv) = ServerHandle::start() else { return };
     let (mut client, sn) = make_planner(&srv);
     for i in 0..4 {
@@ -457,13 +458,10 @@ fn drop_schema_cascade_does_not_rescan_per_member() {
             &format!("CREATE VIEW vw{i} AS SELECT id, v FROM m{i}"),
         );
     }
-    // 4 tables + 4 views. With a per-member SCHEMA_TAB rescan each member would
-    // cost an extra request; the retained snapshot holds it to a small constant
-    // per member plus the schema row itself.
     let n = requests_for(&mut client, |c| c.drop_schema(&sn).unwrap());
-    assert!(
-        n <= 8 * 3 + 4,
-        "DROP SCHEMA over 8 members cost {n} requests — a per-member rescan crept back"
+    assert_eq!(
+        n, 4,
+        "DROP SCHEMA over 8 members must cost SCHEMA_TAB + VIEW_TAB + TABLE_TAB + one push"
     );
 }
 

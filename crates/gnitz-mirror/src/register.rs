@@ -29,7 +29,7 @@ use gnitz_engine::catalog::SysFamily;
 use gnitz_engine::schema::{make_delta_schema, SchemaDescriptor};
 use gnitz_engine::storage::BatchBuilder;
 use gnitz_wire::sys_rows::{write_col_tab_row, write_schema_tab_row, write_view_tab_row};
-use gnitz_wire::sys_rows::{ColTabRow, SchemaTabRow, ViewTabRow};
+use gnitz_wire::sys_rows::{SchemaTabRow, ViewTabRow};
 use gnitz_wire::OWNER_KIND_VIEW;
 
 use crate::handle::{Mirror, Shapes};
@@ -124,28 +124,13 @@ impl Mirror {
             );
         }
 
+        // Through `ColumnDef::col_tab_row`, the same mapping the upstream client
+        // registers a view's columns with — including `is_hidden`, which a view's
+        // synthetic PK carries and whose loss would leave the local schema a
+        // column narrower than the store it keys.
         let mut col_b = BatchBuilder::new(SysFamily::Column.schema());
         for (ci, cd) in schema.columns.iter().enumerate() {
-            write_col_tab_row(
-                &mut col_b,
-                &ColTabRow {
-                    owner_id: tid,
-                    owner_kind: OWNER_KIND_VIEW,
-                    col_idx: ci as u64,
-                    name: &cd.name,
-                    type_code: cd.type_code as u64,
-                    is_nullable: cd.is_nullable,
-                    // A view's column carries no FK.
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                    is_serial: cd.is_serial,
-                    // A view's physical PK is often a synthetic hidden column, and
-                    // dropping the flag would leave the local schema a column
-                    // narrower than the one the store is keyed by.
-                    is_hidden: cd.is_hidden,
-                },
-                1,
-            )?;
+            write_col_tab_row(&mut col_b, &cd.col_tab_row(tid, OWNER_KIND_VIEW, ci), 1)?;
         }
 
         let pk_cols: Vec<u32> = schema.pk_indices().iter().map(|&i| i as u32).collect();

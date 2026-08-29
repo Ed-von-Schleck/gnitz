@@ -142,21 +142,40 @@ impl CatalogEngine {
     /// caller-chosen ids the register hooks `raise_id_counter` from and which
     /// never pass through here.
     pub fn allocate_table_id(&mut self) -> Result<i64, StorageError> {
-        let tid = self.next_table_id;
+        self.allocate_table_ids(1)
+    }
+
+    /// Allocate a contiguous run of `count` relation ids, returning its base: the
+    /// caller owns `[base, base + count)`. One durable sequence advance for the
+    /// whole run, which is what lets a view chain draw every segment's id in one
+    /// round trip instead of one per segment.
+    ///
+    /// `count` is clamped to at least 1 — the run length is a client-supplied
+    /// wire field, and a `0` would move the durable sequence *backwards*.
+    pub fn allocate_table_ids(&mut self, count: u64) -> Result<i64, StorageError> {
+        let base = self.next_table_id;
+        let last = base + count.max(1) as i64 - 1;
         assert!(
-            tid < sys_tables::RELATION_ID_CEILING,
-            "durable relation ids exhausted: {tid} would reach the relation-id ceiling"
+            last < sys_tables::RELATION_ID_CEILING,
+            "durable relation ids exhausted: {last} would reach the relation-id ceiling"
         );
-        self.next_table_id += 1;
-        self.advance_sequence(SEQ_ID_TABLES, tid)?;
-        Ok(tid)
+        self.next_table_id = last + 1;
+        self.advance_sequence(SEQ_ID_TABLES, last)?;
+        Ok(base)
     }
 
     pub fn allocate_index_id(&mut self) -> Result<i64, StorageError> {
-        let iid = self.next_index_id;
-        self.next_index_id += 1;
-        self.advance_sequence(SEQ_ID_INDICES, iid)?;
-        Ok(iid)
+        self.allocate_index_ids(1)
+    }
+
+    /// [`Self::allocate_table_ids`] for the index-id counter, under the same
+    /// clamp.
+    pub fn allocate_index_ids(&mut self, count: u64) -> Result<i64, StorageError> {
+        let base = self.next_index_id;
+        let last = base + count.max(1) as i64 - 1;
+        self.next_index_id = last + 1;
+        self.advance_sequence(SEQ_ID_INDICES, last)?;
+        Ok(base)
     }
 
     pub fn get_qualified_name(&self, table_id: i64) -> Option<(&str, &str)> {

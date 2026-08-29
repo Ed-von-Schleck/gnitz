@@ -187,6 +187,11 @@ mod tests {
         b
     }
 
+    /// A one-PK retraction batch — what a buffered DELETE is.
+    fn del(schema: &Schema, pk: u128) -> ZSetBatch {
+        gnitz_core::retraction_batch(schema, PkColumn::from_u128s(8, [pk]))
+    }
+
     /// The full net map, straight off a buffer (the client-free half of
     /// `buffered_all`).
     fn net_of(buf: &TxnBuffer, tid: u64) -> Net<'_> {
@@ -230,16 +235,16 @@ mod tests {
         let tid = 7;
         let mut buf = TxnBuffer::default();
         // Insert pk=1 (v=10), pk=2 (v=20) [Error family].
-        buf.push_with_mode(
+        buf.push(
             tid,
             &schema,
-            &batch(&schema, &[(1, 10, 1), (2, 20, 1)]),
+            batch(&schema, &[(1, 10, 1), (2, 20, 1)]),
             WireConflictMode::Error,
         );
         // Update pk=1 → v=11 [Update family].
-        buf.push(tid, &schema, &batch(&schema, &[(1, 11, 1)]));
+        buf.push(tid, &schema, batch(&schema, &[(1, 11, 1)]), WireConflictMode::Update);
         // Delete pk=2 [coalesces with the Update family above].
-        buf.delete(tid, &schema, PkColumn::from_u128s(8, [2]));
+        buf.push(tid, &schema, del(&schema, 2), WireConflictMode::Update);
 
         let net = net_of(&buf, tid);
         assert_eq!(net.len(), 2);
@@ -252,9 +257,9 @@ mod tests {
         let schema = two_col(TypeCode::I64);
         let tid = 7;
         let mut buf = TxnBuffer::default();
-        buf.push_with_mode(tid, &schema, &batch(&schema, &[(5, 50, 1)]), WireConflictMode::Error);
-        buf.delete(tid, &schema, PkColumn::from_u128s(8, [5]));
-        buf.push_with_mode(tid, &schema, &batch(&schema, &[(5, 99, 1)]), WireConflictMode::Error);
+        buf.push(tid, &schema, batch(&schema, &[(5, 50, 1)]), WireConflictMode::Error);
+        buf.push(tid, &schema, del(&schema, 5), WireConflictMode::Update);
+        buf.push(tid, &schema, batch(&schema, &[(5, 99, 1)]), WireConflictMode::Error);
         let net = net_of(&buf, tid);
         assert_eq!(
             val_of(&net, 5),
@@ -267,9 +272,10 @@ mod tests {
     fn net_scopes_by_tid_and_skips_zero_weight() {
         let schema = two_col(TypeCode::I64);
         let mut buf = TxnBuffer::default();
-        buf.push_with_mode(1, &schema, &batch(&schema, &[(1, 10, 1)]), WireConflictMode::Error);
-        buf.push_with_mode(2, &schema, &batch(&schema, &[(2, 20, 1)]), WireConflictMode::Error);
-        buf.push(1, &schema, &batch(&schema, &[(3, 30, 0)])); // w=0 contributes nothing
+        buf.push(1, &schema, batch(&schema, &[(1, 10, 1)]), WireConflictMode::Error);
+        buf.push(2, &schema, batch(&schema, &[(2, 20, 1)]), WireConflictMode::Error);
+        // w=0 contributes nothing
+        buf.push(1, &schema, batch(&schema, &[(3, 30, 0)]), WireConflictMode::Update);
         let net1 = net_of(&buf, 1);
         assert_eq!(net1.len(), 1);
         assert_eq!(val_of(&net1, 1), Some(10));
@@ -290,9 +296,9 @@ mod tests {
         let schema = two_col(TypeCode::I64);
         let tid = 7;
         let mut buf = TxnBuffer::default();
-        buf.push(tid, &schema, &batch(&schema, &[(1, 99, 1)])); // override committed 1
-        buf.delete(tid, &schema, PkColumn::from_u128s(8, [2])); // delete committed 2
-        buf.push(tid, &schema, &batch(&schema, &[(5, 50, 1)])); // transaction-born
+        buf.push(tid, &schema, batch(&schema, &[(1, 99, 1)]), WireConflictMode::Update); // override committed 1
+        buf.push(tid, &schema, del(&schema, 2), WireConflictMode::Update); // delete committed 2
+        buf.push(tid, &schema, batch(&schema, &[(5, 50, 1)]), WireConflictMode::Update); // transaction-born
 
         let present = present_rows(&net_of(&buf, tid), &schema);
         assert_eq!(rows_of(&present), vec![(1, 99), (5, 50)]);
@@ -303,7 +309,12 @@ mod tests {
         let schema = two_col(TypeCode::I64);
         let tid = 7;
         let mut buf = TxnBuffer::default();
-        buf.push(tid, &schema, &batch(&schema, &[(1, 11, 1), (2, 22, 1)]));
+        buf.push(
+            tid,
+            &schema,
+            batch(&schema, &[(1, 11, 1), (2, 22, 1)]),
+            WireConflictMode::Update,
+        );
 
         // A key-pinned bound restricts the net to the keys it names: restricting
         // to [1] leaves pk=2's buffered row out of the candidates entirely.

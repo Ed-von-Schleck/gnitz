@@ -254,7 +254,7 @@ pub const VIEWTAB_PAY_CAPACITY: usize = pay_index_in(VIEW_TAB_COLS, "capacity_by
 pub const VIEWTAB_PAY_DELTA: usize = pay_index_in(VIEW_TAB_COLS, "delta_bytes");
 
 /// One code path decodes TABLE_TAB and VIEW_TAB on both sides — the engine's
-/// `apply_entity_caches`, the client's `collect_schema_member_names` — reading
+/// `apply_entity_caches`, the client's `schema_members` — reading
 /// either family through the `TABTAB_*` positions. That needs the two to agree
 /// on where `(schema_id, name)` sits.
 const _: () = {
@@ -517,7 +517,10 @@ pub const FK_INDEX_INFIX: &str = "__fk_";
 /// Unambiguous because `validate_user_identifier` rejects a leading `_`.
 pub const HIDDEN_VIEW_PREFIX: &str = "__h";
 
-fn is_valid_ident_char(ch: u8) -> bool {
+/// The character set every stored catalog name is drawn from. Public because the
+/// engine applies the same charset at its own trust boundary without taking the
+/// rest of [`validate_user_identifier`]'s client-side policy.
+pub fn is_valid_ident_char(ch: u8) -> bool {
     ch.is_ascii_alphanumeric() || ch == b'_'
 }
 
@@ -562,6 +565,49 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
         }
     }
     reject_reserved_infix(name)
+}
+
+/// [`validate_user_identifier`], then the canonical stored form: an ASCII
+/// lowercase fold. Validating first is what makes the fold safe — over
+/// `[A-Za-z0-9_]` it is injective on the classes SQL already considers equal,
+/// which it is not over arbitrary bytes.
+///
+/// The single definition of catalog-name case-insensitivity: every user-supplied
+/// relation, schema or index name crosses it on the way to a catalog row.
+pub fn canonical_identifier(name: &str) -> Result<String, String> {
+    validate_user_identifier(name)?;
+    Ok(name.to_ascii_lowercase())
+}
+
+/// One column of a view's delta-feed reply schema. The variant carries the
+/// key/payload split, so neither side re-derives it from a position.
+pub enum DeltaCol {
+    /// The synthesized `_tick` U64 stamp — a key column, and the first.
+    Tick,
+    /// The view's column at this index, as a key column.
+    Key(usize),
+    /// The view's column at this index, as payload.
+    Payload(usize),
+}
+
+/// The columns of a view's delta-feed reply schema in output order: the `_tick`
+/// stamp, then the view's PK columns in PK order, then its payload columns in
+/// schema order.
+///
+/// The permutation needs no type, name or nullability — only `(pk_indices,
+/// num_columns)` — so it is stated once here and applied by the client (building
+/// a `Schema`) and the engine (building a `SchemaDescriptor`) alike, each keeping
+/// its own overflow behaviour.
+pub fn delta_schema_order(pk_indices: &[usize], num_columns: usize) -> Vec<DeltaCol> {
+    let mut out = Vec::with_capacity(num_columns + 1);
+    out.push(DeltaCol::Tick);
+    out.extend(pk_indices.iter().map(|&i| DeltaCol::Key(i)));
+    out.extend(
+        (0..num_columns)
+            .filter(|i| !pk_indices.contains(i))
+            .map(DeltaCol::Payload),
+    );
+    out
 }
 
 // ---------------------------------------------------------------------------

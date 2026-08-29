@@ -33,10 +33,15 @@ pub(crate) fn reject_duplicate_names<'a>(
 
 /// Validate a user-supplied table/view/schema name: reject the empty string,
 /// a leading `_` (reserved for the system prefix and for synthesized hidden
-/// views, `__h{vid}_{i}`), and any character outside `[A-Za-z0-9_]`. This is the
-/// single production enforcement point for these names — the engine's own
-/// validators are `#[cfg(test)]`-only — so CREATE TABLE/VIEW and DROP TABLE/VIEW
-/// all funnel through it right after `extract_name`.
+/// views, `__h{vid}_{i}`), and any character outside `[A-Za-z0-9_]`. CREATE
+/// TABLE/VIEW and DROP TABLE/VIEW all funnel through it right after
+/// `extract_name`.
+///
+/// This is *policy*: the leading-`_` reservation keeps hidden segments
+/// distinguishable from user views, and the engine cannot enforce it — it must
+/// accept the `__h…` rows the client writes. Its precheck covers only the
+/// invariants that protect it, so a name it tolerates but no SQL surface will
+/// produce is the expected outcome.
 pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {
     gnitz_core::validate_user_identifier(name).map_err(GnitzSqlError::Plan)
 }
@@ -49,6 +54,13 @@ pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {
 /// all of them, not just for the names typed at this surface.
 pub(crate) fn validate_user_index_name(name: &str) -> Result<(), GnitzSqlError> {
     validate_user_name(name)
+}
+
+/// [`validate_user_name`] returning the canonical stored form. The one fold a
+/// user-supplied name gets in this crate; the catalog gateway applies the same
+/// one, so the two cannot spell canonicalization differently.
+pub(crate) fn canonical_user_name(name: &str) -> Result<String, GnitzSqlError> {
+    gnitz_wire::canonical_identifier(name).map_err(GnitzSqlError::Plan)
 }
 
 /// Catalog name for an auto-generated (unnamed) secondary index:

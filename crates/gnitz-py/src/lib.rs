@@ -155,7 +155,8 @@ fn delta_reply_schema(
     py: Python<'_>,
     #[pyo3(from_py_with = resolve_py_schema)] view_schema: Arc<Schema>,
 ) -> PyResult<Py<PySchema>> {
-    rust_schema_to_py(py, &Arc::new(gnitz_core::delta_reply_schema(&view_schema)))
+    let derived = to_py_err(gnitz_core::delta_reply_schema(&view_schema))?;
+    rust_schema_to_py(py, &Arc::new(derived))
 }
 
 /// The `(name, code)` column-type table, straight off `TypeCode::ALL`.
