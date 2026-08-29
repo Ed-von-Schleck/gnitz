@@ -4,8 +4,8 @@
 //! `Full` and `Bounded` must yield the same rows AND the same weights. These pin
 //! that, plus every fallback that degrades a bound to a full scan.
 
-use super::super::store_io::SourceCursor;
 use super::*;
+use crate::storage::SourceCursor;
 use gnitz_wire::{Cut, PkColList, RangeDescriptor, ScanBound};
 
 const NBASE: u64 = 200;
@@ -117,7 +117,7 @@ fn bounded_cursor_yields_in_range_rows_across_chunks() {
     // val ∈ [500, 900) ⇒ ids 50..90: 40 of 200 rows, inside the 1/16 gate? No —
     // 40/200 = 1/5. Narrow it to ids 50..60 (10/200 = 1/20).
     let (mut engine, tid, vid) = fixture("srccur_range", Some(val_bound(Cut::Before(500), Cut::Before(600))));
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(
         matches!(cur, SourceCursor::Bounded(_)),
         "a 1/20 range must take the index"
@@ -149,7 +149,7 @@ fn bounded_drain_is_chunk_size_invariant_and_ascending() {
     let (mut engine, tid, vid) = fixture("srccur_chunkinv", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     let want: Vec<(u128, i64)> = (50..60u128).map(|i| (i, 1)).collect();
     for chunk in [1usize, 3, 7, 64, usize::MAX] {
-        let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+        let mut cur = engine.open_source_cursor(vid, tid).unwrap();
         assert!(matches!(cur, SourceCursor::Bounded(_)), "chunk {chunk}");
         let mut got = Vec::new();
         while let Some(b) = cur.drain_chunk(chunk) {
@@ -210,7 +210,7 @@ fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
     drop(probe);
 
     // One chunk holds the whole range, so the absent PK sits in the middle of it.
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     let got = drain_all(&mut cur, 64);
     let want: Vec<(u128, i64)> = (50..60u128).filter(|&i| i != victim as u128).map(|i| (i, 1)).collect();
@@ -229,20 +229,14 @@ fn selectivity_gate_flips_at_one_sixteenth_of_the_base() {
     // val = id * 10, so [500, 620) is ids 50..62 (12 rows) and [500, 630) is 13.
     let (mut engine, tid, vid) = fixture("srccur_gate_at", Some(val_bound(Cut::Before(500), Cut::Before(620))));
     assert!(
-        matches!(
-            engine.open_source_cursor(vid, tid).unwrap().unwrap(),
-            SourceCursor::Bounded(_)
-        ),
+        matches!(engine.open_source_cursor(vid, tid).unwrap(), SourceCursor::Bounded(_)),
         "12 of 200 rows is exactly at the gate"
     );
     engine.close();
 
     let (mut engine, tid, vid) = fixture("srccur_gate_past", Some(val_bound(Cut::Before(500), Cut::Before(630))));
     assert!(
-        matches!(
-            engine.open_source_cursor(vid, tid).unwrap().unwrap(),
-            SourceCursor::Full(_)
-        ),
+        matches!(engine.open_source_cursor(vid, tid).unwrap(), SourceCursor::Full(_)),
         "13 of 200 rows is past it"
     );
     engine.close();
@@ -260,7 +254,7 @@ fn bounded_cursor_backward_probe_across_exhausted_chunk() {
     // 10/200 is inside the 1/16 gate, so the index is taken.
     let (mut engine, tid, vid) =
         anticorrelated_fixture("srccur_anticorr", Some(val_bound(Cut::Before(10), Cut::Before(110))));
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(
         matches!(cur, SourceCursor::Bounded(_)),
         "a 10/200 range must take the index"
@@ -297,7 +291,7 @@ fn bounded_and_full_agree_with_a_retracted_row_single_source() {
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
 
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     let got = drain_all(&mut cur, 4);
     let want: Vec<(u128, i64)> = (50..60u128).filter(|&i| i != 55).map(|i| (i, 1)).collect();
     assert_eq!(got, want, "a retracted row must be absent from the bounded scan");
@@ -328,7 +322,7 @@ fn updated_indexed_column_emits_the_row_once() {
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
 
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     let got = drain_all(&mut cur, 64);
     let mut want: Vec<(u128, i64)> = (50..60u128).map(|i| (i, 1)).collect();
     want.push((10, 1));
@@ -353,7 +347,7 @@ fn range_spanning_old_and_new_indexed_value_emits_once() {
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
 
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     let got = drain_all(&mut cur, 64);
     let want: Vec<(u128, i64)> = (50..60u128).map(|i| (i, 1)).collect();
     assert_eq!(
@@ -368,7 +362,7 @@ fn range_spanning_old_and_new_indexed_value_emits_once() {
 #[test]
 fn degenerate_point_range_returns_one_key_group() {
     let (mut engine, tid, vid) = fixture("srccur_point", Some(val_bound(Cut::Before(730), Cut::After(730))));
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     assert_eq!(drain_all(&mut cur, 64), vec![(73u128, 1)]);
     engine.close();
@@ -420,7 +414,7 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
 
     // Chunk of 1 puts the orphan in a chunk of its own: were its `None` to escape,
     // the drain would stop there and lose every later id.
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Bounded(_)));
     let got = drain_all(&mut cur, 1);
     let want: Vec<(u128, i64)> = (50..60u128).map(|i| (i, 1)).collect();
@@ -440,7 +434,7 @@ fn unselective_range_falls_back_to_full_scan() {
         "srccur_wide",
         Some(val_bound(Cut::Before(0), Cut::After(i64::MAX as u128))),
     );
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(
         matches!(cur, SourceCursor::Full(_)),
         "an unselective range must full-scan"
@@ -457,36 +451,34 @@ fn unselective_range_falls_back_to_full_scan() {
 fn dropped_index_falls_back_to_full_scan() {
     let (mut engine, tid, vid) = fixture("srccur_dropped", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     engine.drop_index("public__base__idx_val").unwrap();
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)));
     assert_eq!(drain_all(&mut cur, 64).len(), NBASE as usize);
     engine.close();
 }
 
-/// An inverted range is `Empty` — provably no rows — and NOT `None`, which
-/// `handle_backfill` treats as an unregistered source and fails stop on. An
-/// `Empty` cursor still feeds one empty epoch, which is what mints a global
-/// aggregate's ground row.
+/// An inverted range is `Empty` — provably no rows — and NOT an `Err`, which
+/// `handle_backfill` fails stop on. An `Empty` cursor still feeds one empty
+/// epoch, which is what mints a global aggregate's ground row.
 #[test]
-fn inverted_range_is_empty_not_none() {
+fn inverted_range_is_empty_not_err() {
     // start After(900) is above end Before(300): x > 900 AND x < 300.
     let (mut engine, tid, vid) = fixture("srccur_inverted", Some(val_bound(Cut::After(900), Cut::Before(300))));
     let mut cur = engine
         .open_source_cursor(vid, tid)
-        .unwrap()
-        .expect("an empty range is Some, never None");
+        .expect("an empty range is a cursor, never an error");
     assert!(matches!(cur, SourceCursor::Empty));
     assert!(cur.drain_chunk(64).is_none());
     engine.close();
 }
 
-/// An unregistered source is the ONLY `None` — byte-identical to
-/// `open_store_cursor`'s contract. `handle_backfill` never reaches it: it
-/// resolves the source's schema first and fails stop when that is absent.
+/// An unregistered source is an `Err`, matching the `schema_or_err`
+/// `handle_backfill` runs one line earlier — which is why nothing downstream
+/// ever sees this case.
 #[test]
-fn unregistered_source_is_none() {
+fn unregistered_source_is_err() {
     let (mut engine, _tid, vid) = fixture("srccur_unreg", None);
-    assert!(engine.open_source_cursor(vid, 999_999).unwrap().is_none());
+    assert!(engine.open_source_cursor(vid, 999_999).is_err());
     engine.close();
 }
 
@@ -503,7 +495,7 @@ fn cold_plan_cache_still_finds_the_bound() {
     // Exactly what a freshly-created view looks like at the moment
     // `handle_backfill` opens its source cursor.
     engine.dag.invalidate(vid);
-    let cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(
         matches!(cur, SourceCursor::Bounded(_)),
         "a cold plan cache must compile, not silently report 'no bound'"
@@ -515,7 +507,7 @@ fn cold_plan_cache_still_finds_the_bound() {
 #[test]
 fn unbounded_plan_full_scans() {
     let (mut engine, tid, vid) = fixture("srccur_unbounded", None);
-    let mut cur = engine.open_source_cursor(vid, tid).unwrap().unwrap();
+    let mut cur = engine.open_source_cursor(vid, tid).unwrap();
     assert!(matches!(cur, SourceCursor::Full(_)));
     assert_eq!(drain_all(&mut cur, 64).len(), NBASE as usize);
     engine.close();

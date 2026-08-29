@@ -39,7 +39,8 @@ impl CatalogEngine {
 
     /// Apply locally without enqueuing a broadcast. ONLY for rows the workers
     /// already produce themselves (FK indices auto-created from the same
-    /// `TABLE_TAB` delta) and for rollback compensation. Re-broadcasting these
+    /// `TABLE_TAB` delta), for rollback compensation, and for [`Self::ddl_sync`],
+    /// where the delta being applied IS the broadcast. Re-broadcasting these
     /// would deliver phantom deltas.
     ///
     /// No LSN pin: local applies own no zone's durability. `None` is deliberate
@@ -63,6 +64,47 @@ impl CatalogEngine {
             return self.submit_local(family, batch);
         }
         self.apply_and_enqueue_family(family, batch)
+    }
+
+    /// Worker DDL sync: apply a master-broadcast system-table delta. Workers
+    /// update their registry from these; durability is master-side (fsynced
+    /// SAL + the master's own system-table flush). The worker's inherited copy
+    /// lives in RAM (memtable + the RAM tier) and is never flushed by the
+    /// worker — only the master writes `_sys/` shards.
+    ///
+    /// Errors propagate into the worker's DdlSync-fatal path (dispatch treats a
+    /// DdlSync error as fatal: STATUS_ERROR + shutdown and _exit, which the
+    /// master's watchdog turns into a cluster abort) — a swallowed failure here
+    /// diverges this worker's catalog from the master.
+    pub fn ddl_sync(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
+        let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
+        self.submit_local(family, batch)
+    }
+
+    /// Drop `relation_id` from a catalog this process owns alone — [`Self::ddl_sync`]
+    /// in reverse, for the mirror. A production DROP arrives as a wire delta the
+    /// executor prechecks and broadcasts, and never comes through here.
+    ///
+    /// Builds only the relation's own row: its `-1` fires `hook_relation_register`,
+    /// whose cascade retracts the columns, indices and circuit rows and queues the
+    /// directory. Retracting a child here too would leave it at net `-1`, where the
+    /// next registration's `+1` sums to zero. The cascade's broadcast queue has no
+    /// worker to reach, so it is discarded rather than left to grow.
+    pub fn retract_relation_registration(&mut self, relation_id: i64) -> Result<(), String> {
+        let family = match self.table_entry(relation_id)?.kind {
+            RelationKind::View => SysFamily::View,
+            RelationKind::BaseTable | RelationKind::Stream => SysFamily::Table,
+            RelationKind::SystemCatalog => {
+                return Err(format!("table_id {relation_id} is a system table"));
+            }
+        };
+        let schema = family.schema();
+        let batch = retract_pk_list(self.sys_store(family), &schema, vec![relation_id as u128]);
+        if batch.count > 0 {
+            self.ddl_sync(family.id(), batch)?;
+        }
+        self.drain_pending_broadcasts();
+        Ok(())
     }
 
     // -- System table accessors ------------------------------------------------

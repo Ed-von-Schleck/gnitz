@@ -19,13 +19,13 @@ use std::cmp::Ordering;
 
 use gnitz_wire::{AggReadSpec, Cut, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec, WireFault};
 
-use super::store_io::{BoundedRead, SourceCursor};
+use super::store_io::BoundedRead;
 use super::*;
 use crate::expr::{MapPlan, PkSource};
 use crate::ops::AdhocFold;
 use crate::schema::key::{compare_pk_bytes, opk_key, PkBuf};
 use crate::schema::ColumnLocator;
-use crate::storage::{compare_rows, PkSetGather};
+use crate::storage::{compare_rows, PkSetGather, SourceCursor};
 use gnitz_expr::{Evaluator, LogicalProgram};
 
 /// `limit_k` above which the worker materializes instead of running the bounded
@@ -355,15 +355,7 @@ impl CatalogEngine {
         if !cols.is_well_formed() {
             return Err(format!("scan_spec: malformed index column list for table {source}"));
         }
-        if exact {
-            Ok(match self.open_index_range_cursor(source, cols.as_slice(), desc)? {
-                None => SourceCursor::Empty,
-                Some(c) => SourceCursor::Bounded(c),
-            })
-        } else {
-            self.open_bounded_source(source, cols.as_slice(), desc)
-                .ok_or_else(|| format!("scan_spec: source table {source} unregistered"))
-        }
+        self.open_index_source(source, cols.as_slice(), desc, !exact)
     }
 
     /// A `pk IN (…)` gather over an unbounded relation.

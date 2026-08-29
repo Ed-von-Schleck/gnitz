@@ -22,7 +22,7 @@ fn test_enforce_unique_pk() {
         bb.finish()
     };
     let live = |engine: &mut CatalogEngine| -> usize {
-        engine.flush_family(tid).unwrap();
+        engine.dag_mut().flush(tid).unwrap();
         engine.scan_family(tid).unwrap().0.count
     };
 
@@ -354,7 +354,7 @@ fn test_ingest_scan_seek_family() {
     bb.put_u64(300);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.flush_family(tid).unwrap();
+    engine.dag_mut().flush(tid).unwrap();
 
     // Scan
     let scan_batch = engine.scan_family(tid).unwrap().0;
@@ -422,7 +422,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     bb.put_u64(100);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.flush_family(tid).unwrap();
+    engine.dag_mut().flush(tid).unwrap();
 
     // Insert row with PK=1 again, val=200 (should retract old + insert new)
     let mut bb = BatchBuilder::new(schema);
@@ -430,7 +430,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     bb.put_u64(200);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.flush_family(tid).unwrap();
+    engine.dag_mut().flush(tid).unwrap();
 
     // Scan — should have exactly 1 row with val=200
     let scan = engine.scan_family(tid).unwrap().0;

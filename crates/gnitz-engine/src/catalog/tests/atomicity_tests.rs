@@ -382,7 +382,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     bb.put_u64(42u64);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.flush_family(tid).unwrap();
+    engine.dag_mut().flush(tid).unwrap();
 
     // Capture the expected index directory before create_index allocates the id.
     let expected_idx_id = engine.next_index_id;

@@ -54,7 +54,7 @@ fn seed_base(engine: &mut CatalogEngine, name: &str) -> (i64, Vec<ColumnDef>) {
 /// index on `val` that the live CREATE backfills. Returns the table id.
 fn base_with_index(engine: &mut CatalogEngine) -> i64 {
     let (tid, _) = seed_base(engine, "public.base");
-    engine.flush_family(tid).unwrap();
+    engine.dag_mut().flush(tid).unwrap();
     engine.create_index("public.base", &["val"], false).unwrap();
     tid
 }

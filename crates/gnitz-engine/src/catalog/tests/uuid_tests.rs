@@ -34,7 +34,7 @@ fn test_uuid_non_pk_column() {
     bb.put_u128(UUID_A);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.flush_family(tid).unwrap();
+    engine.dag_mut().flush(tid).unwrap();
 
     engine.drop_table("public.uuid_payload").unwrap();
     engine.close();
@@ -57,7 +57,7 @@ fn test_uuid_secondary_index() {
     bb.put_u128(UUID_A);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.flush_family(tid).unwrap();
+    engine.dag_mut().flush(tid).unwrap();
 
     engine.create_index("public.uuid_idxtab", &["uid"], false).unwrap();
     assert!(engine.has_index_by_name("public__uuid_idxtab__idx_uid"));

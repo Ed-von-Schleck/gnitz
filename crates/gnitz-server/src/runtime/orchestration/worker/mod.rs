@@ -1090,7 +1090,7 @@ impl WorkerProcess {
             // `None` ⇒ partition exhausted: this round is an empty PAD. The
             // master ANDs the pad bit across workers and stamps the collective
             // stop/continue/checkpoint decision back onto each relay.
-            let drained = handle.as_mut().and_then(|h| h.drain_chunk(chunk_rows));
+            let drained = handle.drain_chunk(chunk_rows);
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
             self.exchange.backfill_pad = Some(pad);

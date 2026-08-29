@@ -42,7 +42,10 @@ use crate::schema::key::compare_pk_bytes;
 /// order of the fixed-`stride` records of `flat` — the same `compare_pk_bytes`
 /// order every merge path uses. Indirect (index-permutation) so the records
 /// themselves never move.
-fn sort_indices(flat: &[u8], stride: usize, idx: &mut Vec<u32>) {
+///
+/// Shared with `index_gather`, whose per-chunk PK scratch is the same
+/// flat-record accumulator this module's header argues for.
+pub(crate) fn sort_indices(flat: &[u8], stride: usize, idx: &mut Vec<u32>) {
     let n = flat.len() / stride;
     // u32 indices bound each run (and the in-RAM fast path) to 2^32 records —
     // the same per-source bound the LoserTree merge asserts.

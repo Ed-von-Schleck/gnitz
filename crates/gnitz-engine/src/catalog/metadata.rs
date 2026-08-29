@@ -217,6 +217,15 @@ impl CatalogEngine {
             .is_some_and(|t| t.resumed_from_checkpoint())
     }
 
+    /// The registry entry for `table_id`, or the shared "Unknown table_id"
+    /// error every hard-resolving store path reports.
+    pub(crate) fn table_entry(&self, table_id: i64) -> Result<&crate::query::TableEntry, String> {
+        self.dag
+            .tables
+            .get(&table_id)
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))
+    }
+
     /// Get schema descriptor for a table. Registry-uniform: system tables are
     /// pre-registered before any caller can run, and an unknown id in the
     /// system range (the 8-10 gap) resolves to a graceful `None` instead of a

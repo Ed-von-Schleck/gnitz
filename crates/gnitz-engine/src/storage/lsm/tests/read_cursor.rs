@@ -211,19 +211,19 @@ fn col_bytes_answers_only_for_a_payload_column_of_a_valid_row() {
     assert!(exhausted.col_bytes(1, 8).is_none());
 }
 
-/// The remaining count excludes the row the cursor currently sits on: every
-/// drive consumes the group it emits, so a freshly-opened 3-row cursor has 2
-/// left.
+/// The bound counts the row the cursor sits on, so it is what a walk from here
+/// will emit — a freshly-opened 3-row cursor answers 3, even though the open's
+/// own drive already moved `position` past the first row.
 #[test]
-fn test_estimated_length_reflects_remaining() {
+fn test_estimated_length_counts_the_positioned_row() {
     let schema = make_schema_u128_i64();
     let batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let mut cursor = create_read_cursor(&[batch], &[], schema);
+    assert_eq!(cursor.estimated_length(), 3);
+    cursor.advance();
     assert_eq!(cursor.estimated_length(), 2);
     cursor.advance();
     assert_eq!(cursor.estimated_length(), 1);
-    cursor.advance();
-    assert_eq!(cursor.estimated_length(), 0);
     cursor.advance();
     assert!(!cursor.valid);
     assert_eq!(cursor.estimated_length(), 0);

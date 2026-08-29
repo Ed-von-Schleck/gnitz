@@ -14,8 +14,9 @@
 // Internal — not accessible outside storage/
 // L3 LSM lives under `lsm/`. The leaves that belong to no layer stay at storage
 // level: the `StorageError` type, and `spill` — a bounded external merge sort of
-// fixed-stride byte records that touches no batch, schema or shard, and whose one
-// consumer is the server's CREATE UNIQUE INDEX pre-flight.
+// fixed-stride byte records that touches no batch, schema or shard. `SpillSort`
+// serves the server's CREATE UNIQUE INDEX pre-flight; its `sort_indices` is the
+// shared indirect sort of a flat record buffer, which `index_gather` also drives.
 mod error;
 mod lsm;
 mod spill;
@@ -64,7 +65,7 @@ pub(crate) use columnar::{compare_rows, compare_rows_except};
 pub(crate) use lsm::child_dir::{
     fsync_dir, reclaim_retired_children, remove_child, state_child_manifests, subdir_names, ChildAddr,
 };
-pub(crate) use lsm::index_gather::BoundedIndexCursor;
+pub(crate) use lsm::index_gather::{BoundedIndexCursor, SourceCursor};
 pub(crate) use lsm::manifest::{peek_header, topology_word};
 pub(crate) use lsm::read_cursor::{empty as empty_cursor, key_list_range, PkSetGather, ReadCursor};
 pub(crate) use lsm::repartition::repartition_relation;

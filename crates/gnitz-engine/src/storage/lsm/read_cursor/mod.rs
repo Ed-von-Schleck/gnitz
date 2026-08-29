@@ -632,11 +632,13 @@ impl ReadCursor {
         self.commit_emitted(emitted);
     }
 
-    /// Approximate the number of rows remaining in this cursor (upper bound).
-    /// Counted off the per-source windows, so a range seek's clamp is already in
-    /// it — which makes it the right pre-size for a batch a walk fills.
+    /// Upper bound on the rows a walk from HERE emits — the pre-size a batch that
+    /// walk fills wants. The per-source windows (so a range seek's clamp is in
+    /// it) PLUS the row the cursor sits on: a drive CONSUMES the group it emits,
+    /// so `position` is already past a row still to be visited.
     pub fn estimated_length(&self) -> usize {
-        self.states.iter().map(|s| s.count.saturating_sub(s.position)).sum()
+        let ahead: usize = self.states.iter().map(|s| s.count.saturating_sub(s.position)).sum();
+        ahead + usize::from(self.valid)
     }
 
     /// The number of raw entries this cursor's runs hold in `[start, end)`
