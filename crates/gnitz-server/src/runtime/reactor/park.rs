@@ -5,9 +5,7 @@
 //! out per family. The entry is created when the op is submitted and removed
 //! when its result is collected or discarded, so **entry presence is op
 //! liveness**: a completion that finds no entry, or an abandoned one, has
-//! nothing to deliver and retires whatever the op carried. That is what a
-//! handler which parked results unconditionally would need a side tombstone set
-//! per family to know.
+//! nothing to deliver and retires whatever the op carried.
 
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
@@ -66,9 +64,16 @@ impl<T, A> ParkMap<T, A> {
         let Entry::Occupied(mut e) = ops.entry(id) else {
             panic!("reactor: park slot {id} polled but never opened");
         };
-        if e.get().result.is_some() {
-            let op = e.remove();
-            return Poll::Ready((op.result.unwrap(), op.carry));
+        // Take the payload out of the bucket before removing the entry: moving
+        // the whole `Op` to the stack first, then the payload out of it, moves a
+        // `DecodedWire` (~1.5 KB for a reply) twice over.
+        let ready = {
+            let op = e.get_mut();
+            op.result.take().map(|result| (result, op.carry.take()))
+        };
+        if let Some(ready) = ready {
+            e.remove();
+            return Poll::Ready(ready);
         }
         e.get_mut().waker = Some(cx.waker().clone());
         Poll::Pending
@@ -131,6 +136,13 @@ impl<T, A> ParkMap<T, A> {
         if let Some(carry) = self.ops.borrow().get(&id).and_then(|op| op.carry.as_ref()) {
             f(carry);
         }
+    }
+
+    /// Take what an outstanding op carries, leaving the entry open. For a
+    /// completion handler that recycles the carried memory (a timer's
+    /// `Timespec`) before delivering, or discarding, the result.
+    pub(super) fn take_carry(&self, id: u64) -> Option<A> {
+        self.ops.borrow_mut().get_mut(&id)?.carry.take()
     }
 
     #[cfg(test)]

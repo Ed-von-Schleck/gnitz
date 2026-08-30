@@ -1463,13 +1463,10 @@ impl MasterDispatcher {
             return Ok(Vec::new());
         }
 
-        let (nw, all_req_ids): (usize, Vec<u64>) = {
+        let (nw, all_req_ids) = {
             let _guard = disp.sal_excl().lock().await;
             let nw = disp.num_workers();
-            let mut rids: Vec<u64> = Vec::with_capacity(num_checks * nw);
-            for _ in 0..(num_checks * nw) {
-                rids.push(reactor.alloc_request_id());
-            }
+            let rids = reactor.alloc_replies(num_checks * nw);
             for (idx, check) in checks.iter().enumerate() {
                 let req_slice = &rids[idx * nw..(idx + 1) * nw];
                 match check.route {

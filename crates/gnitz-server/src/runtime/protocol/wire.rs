@@ -22,6 +22,33 @@ const _: () = assert!(FRAME_CAP < super::w2m::MAX_W2M_MSG as usize);
 /// here, because it is stripped before a frame reaches a client.
 pub(crate) use gnitz_wire::FLAG_SCAN_LAST;
 
+// ---------------------------------------------------------------------------
+// Chunked distributed-backfill coordination: the two overloads of `seek_col_idx`
+// ---------------------------------------------------------------------------
+//
+// A distributed CREATE-VIEW backfill runs one exchange round per source chunk,
+// and every worker must run the SAME number of rounds (short partitions pad),
+// so termination and SAL reclamation are decided collectively by the master and
+// stamped back on each relay. Both legs overload the otherwise-unused
+// `seek_col_idx`, whose `0` reads as "no backfill coordination" — which is what
+// a steady-state exchange already sends.
+
+/// Up-leg (worker→master, on `FLAG_EXCHANGE`): the per-chunk PAD bit. Set when
+/// this worker's `drain_chunk` returned `None` — its partition is exhausted and
+/// the chunk it is participating in is an empty pad. The master ANDs this bit
+/// across all workers for a round; an all-pad round is the final round.
+pub const BACKFILL_PAD_BIT: u64 = 1;
+
+/// Down-leg (master→worker, on `ExchangeRelay`): the collective decision the
+/// master stamps onto a round's relay after ANDing the round's pad bits and
+/// checking SAL space. `CONTINUE` keeps the loop going; `STOP` ends every
+/// worker's loop on the same (all-pad) round; `CHECKPOINT` is a continue that
+/// also tells the worker to advance its SAL read epoch + reset its read cursor
+/// inline (the master reclaims the SAL write side at the next round barrier).
+pub const BACKFILL_DECISION_CONTINUE: u64 = 0;
+pub const BACKFILL_DECISION_STOP: u64 = 1;
+pub const BACKFILL_DECISION_CHECKPOINT: u64 = 2;
+
 /// A relation's wire identity: the target id, the schema, and the encoded block
 /// describing that schema — one value, because the scatter writer needs all
 /// three and a slot sized from one shape but filled from another is corruption.
@@ -340,7 +367,7 @@ pub fn peek_frame_control(data: &[u8]) -> Result<DecodedControl, &'static str> {
 /// single-parse path). Full checksum verification on all three blocks — the
 /// control block's by the `peek_frame_control` that produced `control`.
 ///
-/// The batch comes back `Raw`: unlike `decode_wire_impl` this never installs the
+/// The batch comes back `Raw`: unlike [`decode_wire`] this never installs the
 /// frame's `FLAG_BATCH_SORTED` / `FLAG_BATCH_CONSOLIDATED` claim, which a client
 /// must not be trusted to make.
 pub fn decode_wire_with_ctrl(
@@ -352,25 +379,48 @@ pub fn decode_wire_with_ctrl(
     decode_wire_body(data, ctrl_size, control, schema_hint, true)
 }
 
-/// Decode a full IPC wire message from raw bytes.
-pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
-    decode_wire_impl(data, true)
-}
-
-/// Like `decode_wire` but skips WAL block checksum verification.  Use for
-/// trusted intra-process IPC (W2M ring).
+/// Decode one W2M ring frame into an owned `DecodedWire`. No checksum
+/// verification — the ring is a trusted intra-process mapping, unlike the SAL —
+/// and a control-only frame decodes fine (`data_batch: None`).
+///
+/// Built through the zero-copy decode, so `append_mem_batch` **relocates** the
+/// blob heap where `Batch::decode_from_wal_block` would copy it verbatim. That
+/// is the compaction point for an exchange frame's full unfiltered heap, and a
+/// cost (one cell rewrite per string cell, against one bulk `memcpy`) for a
+/// frame with no dead heap. One policy for the ring, not the cheaper of the two
+/// per frame.
 pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
-    decode_wire_impl(data, false)
+    let ctrl = gnitz_wire::wal::block_slice_at(data, 0)?;
+    let control = peek_control_block_ipc(ctrl)?;
+    let mut offsets = [0usize; MAX_BATCH_REGIONS];
+    let zc = decode_wire_ipc_zero_copy_with_ctrl(data, control, None, &mut offsets)?;
+    let flags = zc.control.flags;
+    let schema = zc.schema;
+    let data_batch = match zc.data_batch {
+        Some(mb) => {
+            let sch = schema.as_ref().ok_or("FLAG_HAS_DATA set but no schema")?;
+            let mut owned = Batch::with_capacity(*sch, mb.count);
+            owned.append_mem_batch(&mb);
+            // The wire flags are ground truth. `append_mem_batch` leaves `owned`
+            // `Raw`; raise it to the frame's claim, debug-verifying the data.
+            owned.certify_layout(Layout::from_wire_flags(flags), sch);
+            Some(owned)
+        }
+        None => None,
+    };
+    Ok(DecodedWire {
+        control: zc.control,
+        schema,
+        data_batch,
+    })
 }
 
-fn decode_wire_impl(data: &[u8], verify_checksum: bool) -> Result<DecodedWire, &'static str> {
+/// Decode a full checksum-verified wire message from raw bytes: the SAL, the
+/// boot replay and the worker's own SAL consumption all read frames this way.
+pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
     let ctrl = gnitz_wire::wal::block_slice_at(data, 0)?;
-    let control = if verify_checksum {
-        peek_control_block(ctrl)?
-    } else {
-        peek_control_block_ipc(ctrl)?
-    };
-    let mut decoded = decode_wire_body(data, ctrl.len(), control, None, verify_checksum)?;
+    let control = peek_control_block(ctrl)?;
+    let mut decoded = decode_wire_body(data, ctrl.len(), control, None, true)?;
     // An engine-authored frame (SAL consumption, W2M, boot replay): its layout
     // claim is real and skipping the re-sort is the point of sending it, so
     // raise the batch off `Raw`. `certify_layout` debug-verifies what it

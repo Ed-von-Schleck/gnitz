@@ -1,5 +1,10 @@
+//! The reactor's thin io_uring wrapper: SQE preparation, submit and CQE drain.
+//!
+//! Every `prep_*` is pure. A SQE whose memory the kernel reads after `submit`
+//! returns is `unsafe` to queue, and that memory is kept alive by a park slot's
+//! `carry`.
+
 use io_uring::{opcode, squeue, types, IoUring};
-use rustc_hash::FxHashMap;
 
 /// Completion queue entry — the reactor's owned copy of an io_uring CQE.
 #[derive(Clone, Copy, Debug, Default)]
@@ -18,27 +23,12 @@ pub(super) const CQE_F_MORE: u32 = 1 << 1;
 /// implementation auto-flushes pending SQEs to the kernel.
 pub(super) struct IoUringRing {
     ring: IoUring,
-    /// Owns Timespec values for outstanding `prep_timeout` SQEs. The
-    /// kernel reads these pointers when the timer fires (which can be
-    /// long after `submit()` returns), so the storage must outlive the
-    /// CQE. Keyed by the SQE's `user_data`; released (into `spec_pool`)
-    /// by `release_timer_spec` when the KIND_TIMEOUT CQE is dispatched.
-    timer_specs: FxHashMap<u64, Box<types::Timespec>>,
-    /// Recycled Timespec boxes: `prep_timeout` pops instead of
-    /// allocating — timers are armed per client egress frame, so the
-    /// alloc/free per frame is worth avoiding. Boxed (not inline) because
-    /// the kernel dereferences the stable heap address until the CQE.
-    #[allow(clippy::vec_box)]
-    spec_pool: Vec<Box<types::Timespec>>,
 }
 
 impl IoUringRing {
     pub(super) fn new(entries: u32) -> std::io::Result<Self> {
-        let ring = IoUring::new(entries)?;
         Ok(IoUringRing {
-            ring,
-            timer_specs: FxHashMap::default(),
-            spec_pool: Vec::new(),
+            ring: IoUring::new(entries)?,
         })
     }
 
@@ -52,7 +42,7 @@ impl IoUringRing {
             let _ = self.ring.submit();
         }
         // SAFETY: every caller keeps the memory an SQE points at alive until
-        // its CQE is drained — see the park slots' `carry` and `timer_specs`.
+        // its CQE is drained — see the park slots' `carry`.
         unsafe {
             self.ring.submission().push(&entry).expect("SQ full after flush");
         }
@@ -81,16 +71,13 @@ impl IoUringRing {
         );
     }
 
-    /// Submit a relative `Timeout` op firing after `timeout_ns`. One-shot: a
-    /// single CQE (`res = -ETIME` on natural expiry).
-    pub(super) fn prep_timeout(&mut self, timeout_ns: u64, user_data: u64) {
-        let mut ts = self.spec_pool.pop().unwrap_or_else(|| Box::new(types::Timespec::new()));
-        *ts = types::Timespec::new()
-            .sec(timeout_ns / 1_000_000_000)
-            .nsec((timeout_ns % 1_000_000_000) as u32);
-        let ts_ptr: *const types::Timespec = &*ts;
-        self.timer_specs.insert(user_data, ts);
-        self.push(opcode::Timeout::new(ts_ptr).build().user_data(user_data));
+    /// Submit a relative `Timeout` op against `ts`. One-shot: a single CQE
+    /// (`res = -ETIME` on natural expiry).
+    ///
+    /// # Safety
+    /// `ts` must live at this address until the CQE is drained.
+    pub(super) unsafe fn prep_timeout(&mut self, ts: &types::Timespec, user_data: u64) {
+        self.push(opcode::Timeout::new(ts).build().user_data(user_data));
     }
 
     /// Submit a `FUTEX_WAITV` op over `nr` pointer-stable `FutexWaitV` entries.
@@ -109,15 +96,6 @@ impl IoUringRing {
     /// `res = -ECANCELED`), the AsyncCancel's own CQE after it.
     pub(super) fn prep_async_cancel(&mut self, target_user_data: u64, user_data: u64) {
         self.push(opcode::AsyncCancel::new(target_user_data).build().user_data(user_data));
-    }
-
-    /// Release the Timespec owned for `user_data` back into the pool.
-    /// Called from the `KIND_TIMEOUT` CQE dispatch arm — the kernel is
-    /// done with the pointer once the Timeout's CQE has been drained.
-    pub(super) fn release_timer_spec(&mut self, user_data: u64) {
-        if let Some(ts) = self.timer_specs.remove(&user_data) {
-            self.spec_pool.push(ts);
-        }
     }
 
     /// Eagerly flush pending SQEs to the kernel (no wait). On failure the

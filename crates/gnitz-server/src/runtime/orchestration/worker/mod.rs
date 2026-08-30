@@ -8,10 +8,11 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::runtime::m2w::Wake;
-use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
-use crate::runtime::wire::{self as ipc, FLAG_SCAN_LAST};
+use crate::runtime::wire::{
+    self as ipc, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT, FLAG_SCAN_LAST,
+};
 use gnitz_engine::catalog::{CatalogEngine, IngestError, FIRST_USER_TABLE_ID};
 use gnitz_engine::foundation::fault::Seam;
 use gnitz_engine::query::{DagEngine, ExchangeCallback};
@@ -181,8 +182,10 @@ struct WorkerExchangeHandler {
 /// Holds a mutable reference to the worker so `do_exchange` can re-enter
 /// the worker's handlers (`handle_push`, `handle_tick`) inline when those
 /// messages arrive mid-wait. `tick_request_id` is the id of the message
-/// that kicked off this DAG evaluation; echoed on FLAG_EXCHANGE so the
-/// master's accumulator stays routable.
+/// that kicked off this DAG evaluation. Nothing routes on it: the master peels
+/// a FLAG_EXCHANGE frame off by flag, and keys its rounds on
+/// `target_id`/`seek_pk`. Carrying a live tick id is why that peel must happen
+/// before the id's awaiter is completed.
 struct WorkerExchangeCtx<'a> {
     worker: &'a mut WorkerProcess,
     tick_request_id: u64,

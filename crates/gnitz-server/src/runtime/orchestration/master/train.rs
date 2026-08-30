@@ -333,7 +333,7 @@ mod tests {
             for w in 0..n {
                 slots.push(self.receiver.try_read_slot(w).expect("first frame"));
                 while let Some(cont) = self.receiver.try_read_slot(w) {
-                    self.reactor.test_route_scan_slot(cont);
+                    self.reactor.route_scan_slot(cont);
                 }
             }
             slots

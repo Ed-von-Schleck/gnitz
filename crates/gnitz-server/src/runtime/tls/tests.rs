@@ -91,7 +91,7 @@ fn encrypt_frames(client: &mut rustls::ClientConnection, frames: &[&[u8]]) -> Ve
 }
 
 fn frame_payloads(conn: &TlsConn) -> Vec<Vec<u8>> {
-    conn.q.pending().iter().map(|b| b.as_slice().to_vec()).collect()
+    conn.q.queued_payloads()
 }
 
 #[test]

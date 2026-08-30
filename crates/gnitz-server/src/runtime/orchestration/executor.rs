@@ -29,16 +29,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
-    await_worker_acks, dispatch_scan_multi_fanout, replicated_unicast, scan_spec_route, Fanout, MasterDispatcher,
-    TxnFamily, UniqueFilter, WorkerFault,
+    await_worker_acks, dispatch_scan_multi_fanout, exchange::ExchangeAccumulator, replicated_unicast, scan_spec_route,
+    Fanout, MasterDispatcher, TxnFamily, UniqueFilter, WorkerFault,
 };
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::BACKFILL_DECISION_CONTINUE;
 use crate::runtime::reactor::{
-    mpsc, oneshot, select2, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReadGuard, ReplyFuture, WriteGuard,
+    mpsc, oneshot, select2, AsyncRwLock, Either, FsyncFuture, Reactor, ReadGuard, ReplyFuture, WriteGuard,
 };
 use crate::runtime::sal::{GroupTargets, SalFit, SalMessageKind};
-use crate::runtime::wire::{self as ipc, validate_schema_match, SchemaWithVersion};
+use crate::runtime::wire::{self as ipc, validate_schema_match, SchemaWithVersion, BACKFILL_DECISION_CONTINUE};
 use gnitz_engine::catalog::{
     family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, CatalogEngine, SysFamily, FIRST_USER_TABLE_ID,
     SEQ_TAB_ID,
@@ -405,11 +404,6 @@ impl ServerExecutor {
 
         let (committer_tx, committer_rx) = mpsc::unbounded::<CommitRequest>();
         let (tick_tx, tick_rx) = mpsc::unbounded::<TickTrigger>();
-        let (relay_tx, relay_rx) = mpsc::unbounded::<PendingRelay>();
-        // Wire the relay channel into the reactor so route_reply's
-        // FLAG_EXCHANGE accumulator can hand off completed views.
-        reactor.attach_relay_tx(relay_tx);
-
         let shared = Rc::new(Shared {
             reactor: Rc::clone(&reactor),
             dispatcher,
@@ -435,7 +429,7 @@ impl ServerExecutor {
         reactor.spawn(committer::run(committer_rx, Rc::clone(&shared)));
         reactor.spawn(accept_loop(Rc::clone(&shared), accept_ctx));
         reactor.spawn(tick_loop(Rc::clone(&shared), tick_rx));
-        reactor.spawn(relay_loop(Rc::clone(&shared), relay_rx));
+        reactor.spawn(relay_loop(Rc::clone(&shared)));
         reactor.spawn(watchdog(Rc::clone(&shared)));
 
         reactor.block_until_shutdown();
@@ -734,8 +728,11 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
     let nw = shared.disp().num_workers();
     let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
     let mut ack_slots: Vec<Option<ipc::DecodedWire>> = Vec::with_capacity(nw);
-    let mut req_ids: Vec<u64> = Vec::with_capacity(nw);
     let mut triggers: Vec<TickTrigger> = Vec::new();
+    // The non-`Quiesce` triggers of the current batch. A second vector rather
+    // than `mem::take` + push-back, which would free the batch's allocation and
+    // regrow it from zero every tick.
+    let mut kept: Vec<TickTrigger> = Vec::new();
     // Reused across every tick; `drain_tick_rows_into` clears it before
     // refilling so capacity is retained.
     let mut tids_scratch: Vec<i64> = Vec::new();
@@ -790,9 +787,10 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
         // Auto/Drain triggers in this batch run after release. No new triggers
         // arrive meanwhile: the DDL's write lock blocks every push, so the
         // committer fires no Auto.
-        for trigger in std::mem::take(&mut triggers) {
+        std::mem::swap(&mut triggers, &mut kept);
+        for trigger in kept.drain(..) {
             if let TickTrigger::Quiesce { acked, release } = trigger {
-                let _ = acked.send(());
+                acked.send(());
                 let _ = release.await;
             } else {
                 triggers.push(trigger);
@@ -804,13 +802,13 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
         // Run the tick. Errors are reported in logs AND handed to every Drain
         // trigger's `done`: the waiting reader's view is stale, so reporting
         // success would serve stale rows under STATUS_OK.
-        let tick_result = run_tick(&shared, &tids_scratch, nw, &mut req_ids, &mut fut_slots, &mut ack_slots).await;
+        let tick_result = run_tick(&shared, &tids_scratch, nw, &mut fut_slots, &mut ack_slots).await;
         if let Err(e) = &tick_result {
             gnitz_warn!("tick error: {}", e);
         }
         for t in triggers.drain(..) {
             if let TickTrigger::Drain { done, .. } = t {
-                let _ = done.send(tick_result.clone());
+                done.send(tick_result.clone());
             }
         }
     }
@@ -818,7 +816,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
 
 /// Emit Tick groups for every `tid` and await the per-worker ACKs.
 ///
-/// The emit-and-await lock shape: req_ids allocated before any lock,
+/// The emit-and-await lock shape: the reply lease taken before any lock,
 /// `catalog_rwlock.read()` (so DDL cannot mutate schemas mid-emission) +
 /// `sal_writer_excl` covering only the contiguous emission window, one
 /// `signal_all` inside it, both released before awaiting so other reactor work
@@ -827,7 +825,6 @@ async fn run_tick(
     shared: &Rc<Shared>,
     tids: &[i64],
     nw: usize,
-    req_ids: &mut Vec<u64>,
     fut_slots: &mut Vec<ReplyFuture>,
     ack_slots: &mut Vec<Option<ipc::DecodedWire>>,
 ) -> Result<(), String> {
@@ -847,8 +844,7 @@ async fn run_tick(
         return Ok(());
     }
 
-    req_ids.clear();
-    req_ids.extend((0..tids.len() * nw).map(|_| shared.reactor.alloc_request_id()));
+    let req_ids = shared.reactor.alloc_replies(tids.len() * nw);
 
     let _cat_read = shared.catalog_rwlock.read().await;
     let _sal_excl = shared.disp().sal_excl().lock().await;
@@ -923,13 +919,10 @@ async fn hold_relay_for_ddl(shared: &Shared) {
 
 const HOLD_RELAY_MAX_POLLS: u32 = 10_000;
 
-/// Consume completed `PendingRelay`s from the reactor's exchange
-/// accumulator and write ExchangeRelay groups back through the
-/// dispatcher.  Lives in its own task so the SAL write happens outside
-/// the reactor's synchronous CQE handler — `prepare_relay` reads the
-/// catalog DAG (needs catalog_rwlock.read) and `emit_relay_with_decision`
-/// writes a SAL group (needs sal_writer_excl), neither of which can
-/// block-acquire from inside the reactor's tick.
+/// Accumulate the reactor's `FLAG_EXCHANGE` frames into rounds and write each
+/// completed round back as an ExchangeRelay group. Its own task because the
+/// write needs `catalog_rwlock.read` and `sal_writer_excl`, neither of which a
+/// CQE handler can block-acquire.
 ///
 /// A lost relay wedges workers blocked in `do_exchange_wait` forever
 /// (they ACK neither tick nor relay and the master stays alive), so both
@@ -937,11 +930,12 @@ const HOLD_RELAY_MAX_POLLS: u32 = 10_000;
 /// checkpoint — `gnitz_fatal_abort!` rather than warn-and-drop: a loud,
 /// recoverable crash (workers self-exit via `getppid()`, operator
 /// restarts) beats a silent permanent cluster wedge.
-async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
+async fn relay_loop(shared: Rc<Shared>) {
+    let mut acc = ExchangeAccumulator::new(shared.disp().num_workers());
     loop {
-        let relay = match rx.recv().await {
-            Some(r) => r,
-            None => return,
+        let (w, frame) = shared.reactor.next_exchange().await;
+        let Some(relay) = acc.process(w, frame) else {
+            continue;
         };
 
         // Arm the low-space test seam at the SAL epoch this first relay sees.
@@ -1096,7 +1090,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
                 build_resolve_reply(shared, client_id, target_id, &ctrl.seek_pk_extra)
             };
             match reply {
-                Ok(buf) => peer.send_buffer_or_close(buf).await,
+                Ok(buf) => peer.send_or_close(buf).await,
                 Err(msg) => send_error(peer, target_id, client_id, msg.as_bytes()).await,
             }
         }
@@ -1374,7 +1368,7 @@ async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control
             .fan_out_seek(&shared.reactor, target_id, pk, seek_pk_extra)
             .await
         {
-            Ok(slot) => peer.send_slot_or_close(slot).await,
+            Ok(slot) => peer.send_or_close(slot).await,
             Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
         }
     }
@@ -1417,7 +1411,7 @@ async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
                 status,
                 ..Default::default()
             });
-            peer.send_buffer_or_close(buf).await;
+            peer.send_or_close(buf).await;
         }
         Err(fault) => send_fault(peer, 0, client_id, &fault).await,
     }
@@ -2100,7 +2094,7 @@ async fn finish_scan_fanout(
     match result {
         Ok(true) => {
             let terminal = make_terminal_scan_frame(target_id, client_id, seek_pk);
-            peer.send_buffer_or_close(terminal).await;
+            peer.send_or_close(terminal).await;
         }
         Ok(false) => peer.close(),
         Err(f) => send_fault(peer, target_id, client_id, &f).await,
@@ -2174,7 +2168,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
         if shared.cat().dag().relation_has_delta_feed(target_id) && after >= disp.last_delta_round(target_id) {
             let seek_pk = delta_terminal_seek_pk(disp, target_id, disp.last_tick_round());
             let frame = make_terminal_scan_frame(target_id, client_id, seek_pk);
-            peer.send_buffer_or_close(frame).await;
+            peer.send_or_close(frame).await;
             return;
         }
     }
@@ -2398,7 +2392,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
                 status: STATUS_OK,
                 ..Default::default()
             });
-            peer.send_buffer_or_close(buf).await;
+            peer.send_or_close(buf).await;
             let total = t_ddl_start.elapsed();
             if total > Duration::from_millis(20) {
                 gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
@@ -2751,7 +2745,7 @@ async fn send_ok_response(
         schema_block: schema_arg,
         ..Default::default()
     });
-    peer.send_buffer_or_close(buf).await;
+    peer.send_or_close(buf).await;
 }
 
 /// Control-only reply carrying just a status code and a target id: no schema,
@@ -2775,7 +2769,7 @@ async fn send_status_frame(peer: &Peer, target_id: i64, client_id: u64, status: 
         error_msg,
         ..Default::default()
     });
-    peer.send_buffer_or_close(buf).await;
+    peer.send_or_close(buf).await;
 }
 
 /// Every failure that names its own status, master-minted or forwarded. A worker

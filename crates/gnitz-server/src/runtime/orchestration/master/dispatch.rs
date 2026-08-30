@@ -295,7 +295,7 @@ impl MasterDispatcher {
         let nw = self.num_workers;
         // One bit per worker still owing its ACK.
         let mut pending_mask: u64 = worker_mask(nw);
-        let mut acc = crate::runtime::reactor::ExchangeAccumulator::new(nw);
+        let mut acc = super::exchange::ExchangeAccumulator::new(nw);
         // Armed when a round is stamped CHECKPOINT; the actual SAL reset is
         // deferred to the next round barrier (see the decision block below).
         let mut pending_reset = false;

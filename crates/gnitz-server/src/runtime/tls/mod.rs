@@ -1,5 +1,5 @@
 //! TLS 1.3 server transport: per-connection rustls session over the
-//! reactor's raw stream ops (`recv_raw`/`send_raw`), driving the fd path's
+//! reactor's raw stream ops (`recv_raw`/`send_owned`), driving the fd path's
 //! `io::RecvQueue` with *decrypted plaintext* (the reactor's CQE-level
 //! framing runs on socket bytes, which are ciphertext here).
 //! "ZSets over the wire" rides verbatim inside the TLS stream.
@@ -20,10 +20,12 @@
 //! and two independent `OP_SEND` SQEs on one fd can complete in either
 //! order — so `send_mutex` is held across extraction AND transmission,
 //! making it the "at most one `OP_SEND` in flight per fd" guarantee. That
-//! in turn means no TLS send may be unbounded: every client-bound send is
-//! wrapped in the per-frame eviction deadline (`guard_eviction`), whose
-//! expiry fires the lock-free `shutdown` that aborts whichever
-//! `send_raw` holds the mutex.
+//! in turn means no TLS send may be unbounded: `Peer::send` wraps the
+//! per-frame eviction deadline around [`TlsShared::send_bytes`], and the
+//! flusher wraps the same one around its own control-byte send. The deadline
+//! covers the `lock().await` too, so it fires even while merely blocked on a
+//! mutex a stalled peer is holding: its expiry runs the lock-free `shutdown`,
+//! which aborts whichever send holds the mutex.
 //!
 //! The two siblings hold the rest of TLS: `config` builds the rustls
 //! `ServerConfig` — operator PEM or minted dev cert, plus the client CA that
@@ -46,9 +48,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::runtime::reactor::io::{self, RecvBuf};
-use crate::runtime::reactor::{guard_client_egress, mpsc, shutdown, AsyncMutex, Reactor};
-use crate::runtime::w2m::W2mSlot;
-use gnitz_engine::storage::batch_pool::PooledSendBuf;
+use crate::runtime::reactor::{guard_egress_deadline, mpsc, shutdown, AsyncMutex, Reactor};
 
 /// Per-connection TLS state, behind `TlsShared::state`. Never borrowed
 /// across an await.
@@ -144,13 +144,13 @@ pub(crate) struct TlsShared {
     reactor: Rc<Reactor>,
     /// Owned, so the socket closes exactly when the last holder — `Peer`, read
     /// pump, flusher — is gone. Sound because each of those awaits its io_uring
-    /// op to completion (`guard_client_egress` awaits even after evicting), so
+    /// op to completion (`guard_egress_deadline` awaits even after evicting), so
     /// no SQE outlives the close.
     fd: OwnedFd,
     state: RefCell<TlsConn>,
     /// Decrements the reactor-thread live-connection counter on teardown.
     _conn_guard: ConnCountGuard,
-    /// Serializes ciphertext extraction + its `send_raw` across the flusher
+    /// Serializes ciphertext extraction + its send across the flusher
     /// and every `send_bytes` sender — the ≤1-`OP_SEND`-in-flight /
     /// record-order invariant. Teardown never *acquires* it (lock-free
     /// `shutdown` aborts a parked holder instead), so it can
@@ -218,8 +218,14 @@ impl TlsShared {
         Ok(conn)
     }
 
-    fn fd(&self) -> i32 {
+    pub(crate) fn fd(&self) -> i32 {
         self.fd.as_raw_fd()
+    }
+
+    /// The reactor this connection's ops run on. `Peer` needs it to apply the
+    /// egress deadline around both transports with one guard.
+    pub(crate) fn reactor(&self) -> &Reactor {
+        &self.reactor
     }
 
     fn notify_flusher(&self) {
@@ -255,12 +261,12 @@ impl TlsShared {
         }
     }
 
-    /// The shared send loop, holding `send_mutex` across ALL its `send_raw`s
-    /// (record order). Carries NO timer itself; the deadline is applied by
-    /// [`Self::guard_eviction`] around it. rustls does the chunking — it
-    /// truncates each write to what its bounded ciphertext queue still holds —
-    /// and the awaited `send_raw` is where socket backpressure lands.
-    async fn send_bytes(&self, bytes: &[u8]) -> i32 {
+    /// The shared send loop, holding `send_mutex` across ALL its sends
+    /// (record order). Carries NO timer itself; the deadline is `Peer::send`'s,
+    /// applied around the whole call. rustls does the chunking — it truncates
+    /// each write to what its bounded ciphertext queue still holds — and the
+    /// awaited send is where socket backpressure lands.
+    pub(crate) async fn send_bytes(&self, bytes: &[u8]) -> i32 {
         let _g = self.send_mutex.lock().await; // vs pump/flusher; held across all chunks
         let mut off = 0;
         while off < bytes.len() {
@@ -277,40 +283,13 @@ impl TlsShared {
                 }
                 Rc::new(self.extract_ciphertext(&mut c))
             }; // state borrow released before the await
-            let rc = self.reactor.send_raw(self.fd(), Rc::clone(&cipher)).await;
+            let rc = self.reactor.send_owned(self.fd(), Rc::clone(&cipher)).await;
             self.reclaim_scratch(cipher);
             if rc < 0 {
                 return -1;
             }
         }
         bytes.len() as i32
-    }
-
-    /// [`guard_client_egress`] for this connection. The deadline matters more
-    /// here than on the fd path: `send_bytes` holds `send_mutex` across its
-    /// sends, so a send parked forever on a non-reading client would hold the
-    /// mutex forever, wedging the flusher and every other sender. The timer
-    /// wraps the whole future including the `lock().await`, so it fires even
-    /// while merely blocked on a mutex a stalled peer is holding — the
-    /// `shutdown` aborts whichever `send_raw` holds the mutex, the holder drops
-    /// its guard, and this send proceeds (to also fail on the shut socket).
-    async fn guard_eviction<F: Future<Output = i32>>(&self, what: &str, fut: F) -> i32 {
-        guard_client_egress(&self.reactor, self.fd(), what, fut).await
-    }
-
-    pub(crate) async fn send_buffer(&self, buf: PooledSendBuf) -> i32 {
-        self.guard_eviction("egress", self.send_bytes(&buf.0)).await
-    }
-
-    /// The `slot` is owned here, so its frame bytes stay borrowed (slot
-    /// alive, worker W2M backpressure preserved) until the kernel accepts
-    /// the last ciphertext byte or the deadline evicts. This is the path
-    /// whose stall would otherwise fill the worker's W2M ring and
-    /// futex-block the single-threaded worker — a cluster-wide freeze — so
-    /// the deadline here protects a *shared* resource.
-    pub(crate) async fn send_slot(&self, slot: W2mSlot) -> i32 {
-        self.guard_eviction("ring-slot egress", self.send_bytes(slot.frame_bytes()))
-            .await
     }
 
     /// Elevate the per-frame inbound ceiling — the same cap the queue
@@ -391,7 +370,7 @@ async fn read_pump(conn: Rc<TlsShared>) {
     // Without this a parked `recv()` would never resolve to `None`.
     conn.state.borrow_mut().q.close();
     // Lock-free: half-close so any writer (a `connection_loop` sender or
-    // the flusher) parked in `send_raw` on a full sndbuf is aborted by its
+    // the flusher) parked in a send on a full sndbuf is aborted by its
     // error CQE and releases `send_mutex`. This is what makes teardown
     // deadlock-free — without it, a sender parked mid-scan-train while the
     // client has stopped reading pins the mutex and the flusher can never
@@ -403,7 +382,7 @@ async fn read_pump(conn: Rc<TlsShared>) {
 
 /// The flusher — it and the senders serialize ciphertext extraction AND
 /// its send under `send_mutex`. Teardown (`shutdown`) is lock-free: it
-/// never *acquires* the mutex, so a writer parked in `send_raw` can never
+/// never *acquires* the mutex, so a writer parked in a send can never
 /// wedge it.
 async fn flusher(conn: Rc<TlsShared>, mut rx: mpsc::Receiver<()>) {
     loop {
@@ -423,19 +402,20 @@ async fn flusher(conn: Rc<TlsShared>, mut rx: mpsc::Receiver<()>) {
                 // Guarded like every other send: a control-byte send to a
                 // non-reading peer must not park forever holding send_mutex.
                 let cipher = Rc::new(out);
-                let _ = conn
-                    .guard_eviction(
-                        "control-byte egress",
-                        conn.reactor.send_raw(conn.fd(), Rc::clone(&cipher)),
-                    )
-                    .await;
+                let _ = guard_egress_deadline(
+                    &conn.reactor,
+                    conn.fd(),
+                    "control-byte egress",
+                    conn.reactor.send_owned(conn.fd(), Rc::clone(&cipher)),
+                )
+                .await;
                 conn.reclaim_scratch(cipher);
             }
         } // _g released before the teardown checks and before parking on rx
 
         // Teardown, lock-free. Half-close once either side has begun it: on
         // a *local* close this drives the pump's parked recv to EOF; on any
-        // close it is the mechanism that aborts a parked `send_raw` so
+        // close it is the mechanism that aborts a parked send so
         // `send_mutex` is always eventually released (no teardown
         // deadlock). Idempotent with the pump's own shutdown.
         let (closed, recv_closed) = {

@@ -2,6 +2,7 @@
 //! via the shared append-only log (SAL) and collects responses via per-worker
 //! W2M regions. Eventfds provide cross-process signaling.
 
+pub(crate) mod exchange;
 pub(crate) mod scatter;
 
 use std::cell::{Cell, RefCell};
@@ -15,11 +16,14 @@ use gnitz_wire::{payload_native_key, pk_native_key};
 use gnitz_wire::{PkColList, SpecBytes};
 
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
-use crate::runtime::reactor::{BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP};
+use crate::runtime::reactor::{AsyncMutex, ScanLease};
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalWriter, ZoneMark};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
-use crate::runtime::wire::{self, unique_preflight_wire_schema, DecodedWire, SchemaWithVersion, FLAG_SCAN_LAST};
+use crate::runtime::wire::{
+    self, unique_preflight_wire_schema, DecodedWire, SchemaWithVersion, BACKFILL_DECISION_CHECKPOINT,
+    BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, FLAG_SCAN_LAST,
+};
+use exchange::PendingRelay;
 use gnitz_engine::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
 use gnitz_engine::query::RelayRoute;
 use gnitz_engine::schema::key::PkBuf;

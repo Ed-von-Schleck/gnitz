@@ -5,9 +5,12 @@
 //! io_uring recv CQE, or `rustls::Reader::read`.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
+
+use gnitz_wire::FRAME_LEN_PREFIX_BYTES;
+
+use super::wake_queue::WakeQueue;
 
 /// Pre-handshake limit applied to every newly registered connection.
 /// Equals the HELLO payload size in bytes; any first frame larger than
@@ -27,52 +30,9 @@ const INBOUND_CAP_CEIL: usize = 4usize << 30; // 4 GiB
 /// above. A fraction of the *actual* budget scales with the deployment where a
 /// flat constant would OOM a mid-size box yet never trip in a small container.
 pub(super) fn resolve_inbound_cap() -> usize {
-    let default = (available_memory_bytes() / 4).clamp(INBOUND_CAP_FLOOR, INBOUND_CAP_CEIL);
+    let host = gnitz_engine::foundation::host::available_memory_bytes();
+    let default = (host / 4).clamp(INBOUND_CAP_FLOOR, INBOUND_CAP_CEIL);
     gnitz_engine::foundation::env::env_num("GNITZ_INBOUND_MEM_BYTES", default).max(INBOUND_CAP_FLOOR)
-}
-
-/// Best-effort memory budget for the process, in bytes: the cgroup v2 limit when
-/// there is one, else total physical RAM. `0` if every source fails, which the
-/// clamp above lifts to the floor. Cached — invariant for the process's
-/// lifetime, and the test suite builds many reactors.
-fn available_memory_bytes() -> usize {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<usize> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        if let Some(v) = cgroup_v2_memory_max() {
-            return v;
-        }
-        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
-        if pages > 0 && page_size > 0 {
-            (pages as usize).saturating_mul(page_size as usize)
-        } else {
-            0
-        }
-    })
-}
-
-/// The tightest finite cgroup v2 `memory.max` from this process's own cgroup up
-/// to the root; `None` when nothing on the path sets one — which is also what a
-/// v1/hybrid host yields, since it writes one line per controller rather than
-/// the unified `0::<path>` matched below.
-fn cgroup_v2_memory_max() -> Option<usize> {
-    // The path must come from here: `/sys/fs/cgroup` alone names the *root*
-    // cgroup, which sets no `memory.max` on a systemd host, so a `MemoryMax=`d
-    // unit would read as host RAM.
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    // The v2 path is absolute; `join` would discard the mount point.
-    let rel = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
-    std::path::Path::new("/sys/fs/cgroup")
-        .join(rel.trim_start_matches('/'))
-        .ancestors()
-        .take_while(|d| d.starts_with("/sys/fs/cgroup"))
-        // The literal `"max"` (unlimited at this level) fails the parse, as
-        // does an absent file; both are skipped.
-        .filter_map(|d| std::fs::read_to_string(d.join("memory.max")).ok())
-        .filter_map(|s| s.trim().parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .min()
 }
 
 /// Accounted memory weight of one inbound payload buffer of `len` bytes.
@@ -104,14 +64,14 @@ impl InboundBudget {
 
     /// Bytes currently held (test observability).
     #[cfg(test)]
-    pub(crate) fn held(&self) -> usize {
+    pub(super) fn held(&self) -> usize {
         self.held.get()
     }
 
     /// Test-only: lower the ceiling so cap-trip paths can be exercised
     /// without allocating gigabytes.
     #[cfg(test)]
-    pub(crate) fn set_cap(&self, cap: usize) {
+    pub(super) fn set_cap(&self, cap: usize) {
         self.cap.set(cap);
     }
 
@@ -180,31 +140,31 @@ enum RecvPhase {
     Payload { buf: RecvBuf, pos: usize },
 }
 
-pub(crate) enum RecvAdvance {
+enum RecvAdvance {
     NeedMore,
     HeaderDone,
     MessageDone,
     Disconnect,
 }
 
-pub(crate) struct RecvState {
-    hdr_buf: [u8; 4],
+struct RecvState {
+    hdr_buf: [u8; FRAME_LEN_PREFIX_BYTES],
     phase: RecvPhase,
 }
 
 impl RecvState {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         RecvState {
-            hdr_buf: [0; 4],
+            hdr_buf: [0; FRAME_LEN_PREFIX_BYTES],
             phase: RecvPhase::Header { pos: 0 },
         }
     }
 
-    pub(crate) fn advance(&mut self, bytes_received: usize) -> RecvAdvance {
+    fn advance(&mut self, bytes_received: usize) -> RecvAdvance {
         match &mut self.phase {
             RecvPhase::Header { pos } => {
                 *pos += bytes_received;
-                if *pos < 4 {
+                if *pos < FRAME_LEN_PREFIX_BYTES {
                     return RecvAdvance::NeedMore;
                 }
                 if u32::from_le_bytes(self.hdr_buf) == 0 {
@@ -222,11 +182,11 @@ impl RecvState {
         }
     }
 
-    pub(crate) fn remaining(&mut self) -> (*mut u8, u32) {
+    fn remaining(&mut self) -> (*mut u8, u32) {
         match &mut self.phase {
             RecvPhase::Header { pos } => {
                 let ptr = unsafe { self.hdr_buf.as_mut_ptr().add(*pos) };
-                (ptr, (4 - *pos) as u32)
+                (ptr, (FRAME_LEN_PREFIX_BYTES - *pos) as u32)
             }
             RecvPhase::Payload { buf, pos } => {
                 let ptr = unsafe { buf.ptr.add(*pos) };
@@ -235,25 +195,25 @@ impl RecvState {
         }
     }
 
-    pub(crate) fn payload_len(&self) -> usize {
+    fn payload_len(&self) -> usize {
         u32::from_le_bytes(self.hdr_buf) as usize
     }
 
-    pub(crate) fn start_payload(&mut self, buf: RecvBuf) {
+    fn start_payload(&mut self, buf: RecvBuf) {
         self.phase = RecvPhase::Payload { buf, pos: 0 };
     }
 
-    pub(crate) fn take_message(&mut self) -> RecvBuf {
+    fn take_message(&mut self) -> RecvBuf {
         match std::mem::replace(&mut self.phase, RecvPhase::Header { pos: 0 }) {
             RecvPhase::Payload { buf, .. } => buf,
             _ => unreachable!("take_message called outside Payload phase"),
         }
     }
 
-    /// Seed the 4-byte length header as if it had just been received, so a
+    /// Seed the length prefix as if it had just been received, so a
     /// payload-phase test can start there.
     #[cfg(test)]
-    pub(crate) fn seed_header(&mut self, payload_len: u32) {
+    fn seed_header(&mut self, payload_len: u32) {
         self.hdr_buf = payload_len.to_le_bytes();
     }
 }
@@ -269,18 +229,11 @@ pub(crate) struct RecvQueue {
     /// message. Elevated to the negotiated transport limit after HELLO
     /// validation.
     max_payload_len: usize,
-    /// Complete messages awaiting pickup by `recv().await`. A queue, not a
-    /// single slot: with one slot a pipelined client deadlocks once the kernel
-    /// socket buffer fills, since the handler drains one message at a time
-    /// while the kernel blocks the client's send.
-    pending: VecDeque<RecvBuf>,
-    /// The one task awaiting a message on this connection. Per-connection FIFO
-    /// means there is never more than one.
-    waiter: Option<Waker>,
-    /// Set when the peer disconnected, the connection was forcibly closed, or
-    /// the recv side hit a protocol/cap failure; a subsequent `recv()` past the
-    /// drained queue resolves to `None`.
-    recv_closed: bool,
+    /// Complete messages awaiting pickup by `recv().await`, and the one task
+    /// awaiting them. A queue, not a slot: with one slot a pipelined client
+    /// deadlocks once the kernel socket buffer fills. Closed on disconnect,
+    /// forced close, or a protocol/cap failure.
+    frames: WakeQueue<RecvBuf>,
     budget: Rc<InboundBudget>,
 }
 
@@ -289,9 +242,7 @@ impl RecvQueue {
         RecvQueue {
             state: RecvState::new(),
             max_payload_len: HELLO_PRE_HANDSHAKE_LEN,
-            pending: VecDeque::new(),
-            waiter: None,
-            recv_closed: false,
+            frames: WakeQueue::default(),
             budget,
         }
     }
@@ -307,7 +258,7 @@ impl RecvQueue {
     }
 
     pub(crate) fn recv_closed(&self) -> bool {
-        self.recv_closed
+        self.frames.is_closed()
     }
 
     /// Advance by `n` bytes just written into the window, applying the per-frame
@@ -338,10 +289,7 @@ impl RecvQueue {
             RecvAdvance::MessageDone => {
                 // The charged `RecvBuf` moves from the deframer into the
                 // delivery queue; its accounting rides along untouched.
-                self.pending.push_back(self.state.take_message());
-                if let Some(w) = self.waiter.take() {
-                    w.wake();
-                }
+                self.frames.push(self.state.take_message());
             }
             RecvAdvance::Disconnect => return Err(()),
         }
@@ -353,34 +301,35 @@ impl RecvQueue {
     /// once the caller is done, so the buffer stays accounted for its full
     /// residency.
     pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<RecvBuf>> {
-        if let Some(buf) = self.pending.pop_front() {
-            return Poll::Ready(Some(buf));
-        }
-        if self.recv_closed {
-            return Poll::Ready(None);
-        }
-        self.waiter = Some(cx.waker().clone());
-        Poll::Pending
+        self.frames.poll(cx)
     }
 
-    /// Waker hygiene: the single slot must not hold a stale waker after the
-    /// awaiting task is cancelled.
+    /// Waker hygiene: the queue must not hold a stale waker after the awaiting
+    /// task is cancelled.
     pub(crate) fn clear_waiter(&mut self) {
-        self.waiter = None;
+        self.frames.clear_waiter();
     }
 
     /// Finish the recv side and wake the parked task, so its `recv().await`
     /// resolves to `None` once the queue drains. Idempotent.
     pub(crate) fn close(&mut self) {
-        self.recv_closed = true;
-        if let Some(w) = self.waiter.take() {
-            w.wake();
-        }
+        self.frames.close();
     }
 
     #[cfg(test)]
-    pub(crate) fn pending(&self) -> &VecDeque<RecvBuf> {
-        &self.pending
+    pub(super) fn queued(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// The payloads of every completed-but-undelivered frame, in order.
+    #[cfg(test)]
+    pub(crate) fn queued_payloads(&self) -> Vec<Vec<u8>> {
+        self.frames.iter().map(|b| b.as_slice().to_vec()).collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_waiter(&self) -> bool {
+        self.frames.has_waiter()
     }
 }
 
@@ -391,7 +340,6 @@ impl RecvQueue {
 pub(super) struct Conn {
     pub(super) q: RecvQueue,
     pub(super) recv_armed: bool,
-    pub(super) closing: bool,
     pub(super) send_inflight: usize,
     /// A `PeerToken` still hands out this fd number; see its docs.
     pub(super) peer_held: bool,
@@ -402,7 +350,6 @@ impl Conn {
         Conn {
             q: RecvQueue::new(budget),
             recv_armed: false,
-            closing: false,
             send_inflight: 0,
             peer_held: false,
         }
@@ -412,3 +359,7 @@ impl Conn {
         self.recv_armed || self.send_inflight > 0 || self.peer_held
     }
 }
+
+#[cfg(test)]
+#[path = "tests/io.rs"]
+mod tests;

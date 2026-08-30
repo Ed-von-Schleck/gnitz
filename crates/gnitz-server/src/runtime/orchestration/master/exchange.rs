@@ -1,54 +1,30 @@
+//! Exchange rounds: turning per-worker `FLAG_EXCHANGE` frames into the relays
+//! the master writes back.
+//!
+//! A **round** is one `(view_id, source_id)` pair's frames from every worker —
+//! keyed by the pair because a two-source view opens one round per source and a
+//! relay carries its own source's shard columns. It **completes** when every
+//! worker has reported into it, yielding a [`PendingRelay`].
+//!
+//! Two drivers accumulate rounds, which is why this sits with them rather than
+//! in the reactor that delivers the frames: `relay_loop` for the steady state,
+//! and `MasterDispatcher::collect_acks_and_relay` for a boot backfill, which
+//! runs before a reactor exists.
+
 use rustc_hash::FxHashMap;
 
-use crate::runtime::wire::DecodedWire;
+use crate::runtime::w2m::worker_mask;
+use crate::runtime::wire::{DecodedWire, BACKFILL_PAD_BIT};
 use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine::storage::Batch;
 use gnitz_wire::MAX_WORKERS;
 
-// ---------------------------------------------------------------------------
-// Chunked distributed-backfill exchange coordination
-// ---------------------------------------------------------------------------
-//
-// A distributed CREATE-VIEW backfill streams the source partition through the
-// incremental plan one chunk at a time, issuing one exchange round per chunk
-// per exchanging view. All workers must issue the SAME number of rounds (short
-// partitions pad with empty rounds), so termination and SAL reclamation are
-// decided collectively by the master and stamped back on each relay. Both legs
-// reuse the otherwise-unused `seek_col_idx` control field — no new SAL flag and
-// no wire-format change. The value `0` doubles as "no backfill coordination",
-// so steady-state exchanges (which already pass a literal `0`) are unaffected.
-
-/// Up-leg (worker→master, on `FLAG_EXCHANGE`): the per-chunk PAD bit. Set when
-/// this worker's `drain_chunk` returned `None` — its partition is exhausted and
-/// the chunk it is participating in is an empty pad. The master ANDs this bit
-/// across all workers for a round; an all-pad round is the final round.
-pub const BACKFILL_PAD_BIT: u64 = 1;
-
-/// Down-leg (master→worker, on `ExchangeRelay`): the collective decision
-/// the master stamps onto a round's relay after ANDing the round's pad bits and
-/// checking SAL space. `CONTINUE` keeps the loop going; `STOP` ends every
-/// worker's loop on the same (all-pad) round; `CHECKPOINT` is a continue that
-/// also tells the worker to advance its SAL read epoch + reset its read cursor
-/// inline (the master reclaims the SAL write side at the next round barrier).
-pub const BACKFILL_DECISION_CONTINUE: u64 = 0;
-pub const BACKFILL_DECISION_STOP: u64 = 1;
-pub const BACKFILL_DECISION_CHECKPOINT: u64 = 2;
-
-/// Per-view accumulator for FLAG_EXCHANGE replies. When the reactor's
-/// `route_reply` sees a FLAG_EXCHANGE wire on worker `w`, it calls
-/// `process` instead of consuming the waker; once every worker has
-/// reported for a given `(view_id, source_id)` pair, `process` returns a
-/// `PendingRelay` that the relay task picks up and writes back to SAL.
+/// Per-view accumulator for `FLAG_EXCHANGE` replies, keyed by
+/// `(view_id, source_id)`.
 ///
-/// Keyed by `(view_id, source_id)`. A view with multiple sources (e.g.
-/// `v_joined` on `v_filtered` + `dim`) opens two independent exchange
-/// rounds per tick, one per source — tupling the key keeps the payloads
-/// separated so each relay carries its matching shard columns.
-///
-/// Failure mode: if a worker dies mid-exchange, its entries stay in the
-/// accumulator and the tick's `join_all` parks forever. This is fine
-/// because `watchdog` (executor.rs) triggers reactor shutdown on
-/// any worker crash, tearing down all parked tasks.
+/// A worker dying mid-round leaves its entries here and the tick's `join_all`
+/// parked forever — survivable only because `watchdog` shuts the reactor down
+/// on any worker crash.
 pub struct ExchangeAccumulator {
     rounds: FxHashMap<(i64, i64), ExchangeRound>,
     nw: usize,
@@ -68,11 +44,11 @@ struct ExchangeRound {
     /// BACKFILL_PAD_BIT`). Starts `true`; a single non-pad worker clears it.
     /// True once the round completes ⇒ every worker is exhausted and this is the
     /// final (all-pad) round. Always `false` for steady-state exchanges (their
-    /// `seek_col_idx` is 0); the reactor relay path ignores it.
+    /// `seek_col_idx` is 0); the steady-state relay path ignores it.
     all_pad: bool,
 }
 
-/// One completed exchange ready for relay. The relay task owns this: it builds
+/// One completed exchange ready for relay. The relay driver owns this: it builds
 /// the group under the catalog read lock (`prepare_relay`), then emits it under
 /// `sal_writer_excl` (`emit_relay_with_decision`) — two separate holds, never
 /// one.
@@ -122,41 +98,38 @@ impl ExchangeAccumulator {
             round.schema = Some(schema);
         }
         // AND this worker's per-chunk backfill pad bit. 0 for steady-state
-        // exchanges, which clears all_pad harmlessly (the reactor ignores it).
+        // exchanges, which clears all_pad harmlessly (the relay path ignores it).
         round.all_pad &= (decoded.control.seek_col_idx & BACKFILL_PAD_BIT) != 0;
         round.reported |= 1 << w;
 
-        if round.reported.count_ones() as usize == nw {
-            let round = self.rounds.remove(&key).unwrap();
-            let schema = match round.schema {
-                Some(s) => s,
-                None => {
-                    gnitz_warn!(
-                        "exchange: no schema received for (view_id={}, source_id={})",
-                        vid,
-                        source_id
-                    );
-                    return None;
-                }
-            };
-            Some(PendingRelay {
-                view_id: vid,
-                payloads: round.payloads,
-                schema,
-                source_id,
-                all_pad: round.all_pad,
-            })
-        } else {
-            None
+        if round.reported != worker_mask(nw) {
+            return None;
         }
+        let round = self.rounds.remove(&key).unwrap();
+        let schema = match round.schema {
+            Some(s) => s,
+            None => {
+                gnitz_warn!(
+                    "exchange: no schema received for (view_id={}, source_id={})",
+                    vid,
+                    source_id
+                );
+                return None;
+            }
+        };
+        Some(PendingRelay {
+            view_id: vid,
+            payloads: round.payloads,
+            schema,
+            source_id,
+            all_pad: round.all_pad,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::wire::DecodedWire;
-    use gnitz_engine::schema::SchemaDescriptor;
     use gnitz_wire::control::DecodedControl;
     use gnitz_wire::FLAG_EXCHANGE;
 
@@ -237,5 +210,31 @@ mod tests {
         assert!(acc.process(0, make_wire(3, 0, true)).is_none());
         let relay = acc.process(1, make_wire(3, 0, false)).expect("round completes");
         assert!(!relay.all_pad, "steady-state (seek_col_idx==0) ⇒ all_pad false");
+    }
+
+    fn make_wire_src(view_id: i64, source_id: i64, req_id: u64) -> DecodedWire {
+        let mut w = make_wire(view_id, source_id, true);
+        w.control.request_id = req_id;
+        w
+    }
+
+    /// A view with two sources opens one round per source: worker 0 reporting
+    /// for source A and worker 1 for source B completes neither.
+    #[test]
+    fn accumulator_distinguishes_source_ids() {
+        let mut acc = ExchangeAccumulator::new(2);
+        assert!(
+            acc.process(0, make_wire_src(42, 100, 7)).is_none(),
+            "source 100 has heard from worker 0 only"
+        );
+        assert!(
+            acc.process(1, make_wire_src(42, 200, 8)).is_none(),
+            "source 200 has heard from worker 1 only — the rounds must not merge"
+        );
+        let relay = acc
+            .process(1, make_wire_src(42, 100, 9))
+            .expect("source 100's round completes on its second worker");
+        assert_eq!(relay.source_id, 100);
+        assert_eq!(acc.rounds.len(), 1, "source 200's round is still open");
     }
 }

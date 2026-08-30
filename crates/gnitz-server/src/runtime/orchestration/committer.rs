@@ -26,7 +26,7 @@
 use super::executor::{Shared, TickTrigger};
 use super::guard_panic;
 use crate::runtime::master::{await_worker_acks, first_worker_error_opt, TxnFamily};
-use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, Either, ReplyFuture};
+use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, Either, ReplyFuture, ReplyLease};
 use crate::runtime::sal::{GroupTargets, SalFit, SalMessageKind, ZoneMark};
 use crate::runtime::wire::DecodedWire;
 use gnitz_engine::foundation::fault::Seam;
@@ -199,7 +199,7 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
             merge_pool.clear();
         }
         for (_, b) in barriers {
-            let _ = b.send(());
+            b.send(());
         }
     }
 }
@@ -290,7 +290,7 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<
     // flush and a SAL reset, so it allocates its own scratch rather than
     // threading `run`'s through three frames; `req_ids` below is allocated per
     // round on the same grounds.
-    let req_ids: Vec<u64> = (0..nw).map(|_| shared.reactor.alloc_request_id()).collect();
+    let req_ids = shared.reactor.alloc_replies(nw);
     let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
     let mut ack_slots: Vec<Option<DecodedWire>> = Vec::with_capacity(nw);
 
@@ -363,7 +363,7 @@ async fn run_checkpoint_sequence(
         .partition(|(k, _)| matches!(k, BarrierKind::Reclaim { .. }));
     batch.barriers = deferred;
     for (_, b) in reclaim {
-        let _ = b.send(());
+        b.send(());
     }
 
     // Step 2 — DRAIN (lock released). One Drain suffices: the tick loop walks the
@@ -403,7 +403,7 @@ async fn run_checkpoint_sequence(
     if let Err(e) = flush_round(shared, Some(gen)).await {
         gnitz_fatal_abort!("ephemeral checkpoint round failed, cluster epoch-desynced: {}", e);
     }
-    let _ = release_tx.send(()); // resume the tick loop
+    release_tx.send(()); // resume the tick loop
 }
 
 /// Await `target_rx` (a Drain `done` or Quiesce `acked`) while keeping the
@@ -446,7 +446,7 @@ async fn await_servicing<T>(
                         gnitz_fatal_abort!("reclaim checkpoint failed, cluster epoch-desynced: {}", e);
                     }
                 }
-                let _ = done.send(());
+                done.send(());
             }
             Either::B(Some(CommitRequest::Barrier { kind, done })) => batch.barriers.push((kind, done)),
             Either::B(Some(CommitRequest::Push(p))) => batch.pushes.push(p),
@@ -463,7 +463,7 @@ struct GroupInfo {
     /// See `CommitRequest::Push::recoverable`. A merged run is homogeneous in
     /// `(tid, mode)`, so one flag per group is exact.
     recoverable: bool,
-    req_ids: Vec<u64>,
+    req_ids: ReplyLease,
     merged: Batch,
     write_err: Option<WireFault>,
 }
@@ -496,7 +496,7 @@ impl CommitUnit {
             None => Ok(zone_lsn),
         };
         for done in self.dones {
-            let _ = done.send(result.clone());
+            done.send(result.clone());
         }
     }
 }
@@ -520,7 +520,7 @@ async fn commit_pushes(
     let nw = shared.disp().num_workers();
     let mut groups: Vec<GroupInfo> = Vec::new();
     let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
-    let alloc_req_ids = || -> Vec<u64> { (0..nw).map(|_| shared.reactor.alloc_request_id()).collect() };
+    let alloc_req_ids = || shared.reactor.alloc_replies(nw);
 
     // ------------------------------------------------------------------
     // Phase A (no lock): build merged batches + req_id allocations.
@@ -707,10 +707,9 @@ async fn commit_pushes(
                 gnitz_fatal_abort!("commit_zone failed, durability lost: {}", e);
             }
             // Submit fsync SQE (synchronous — returns a future). The
-            // ReplyFutures are built into `fut_slots` outside the lock scope:
-            // await_reply only borrows reactor state, never the SAL writer,
-            // so populating the slots after dropping the lock is correct
-            // and lets concurrent tick/relay tasks make progress sooner.
+            // ReplyFutures are built into `fut_slots` outside the lock scope;
+            // the reply slots themselves were opened by `alloc_replies` in
+            // Phase A, so nothing is missed in between.
             Some(shared.reactor.fsync(shared.disp().sal_fd()))
         } else {
             // The signal `commit_zone` would have sent. Phase C awaits its ACKs.

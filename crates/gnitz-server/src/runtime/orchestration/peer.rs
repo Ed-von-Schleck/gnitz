@@ -10,10 +10,14 @@
 //! orchestration layer sits above both the reactor and the TLS engine, so
 //! the layering stays intact (the reactor keeps its fd-based API and learns
 //! nothing about peers).
+//!
+//! Every client-bound byte leaves through [`Peer::send`], which is where the
+//! per-frame egress deadline is applied — once, around both transport arms, so
+//! neither transport carries a copy of the policy.
 
 use std::rc::Rc;
 
-use crate::runtime::reactor::{PeerToken, Reactor, RecvBuf};
+use crate::runtime::reactor::{guard_egress_deadline, PeerToken, Reactor, RecvBuf, SendPayload};
 use crate::runtime::tls::TlsShared;
 use crate::runtime::w2m::W2mSlot;
 use gnitz_engine::storage::batch_pool::PooledSendBuf;
@@ -56,26 +60,40 @@ impl Peer {
         }
     }
 
-    /// Send an owned buffer to the client. Like every `Peer` egress method it
-    /// runs under the per-frame deadline both transports share
-    /// (`reactor::guard_client_egress`), so a stalled client is shut down rather
-    /// than parking this task. Returns the send rc (`< 0` — disconnect or
-    /// eviction — means the client is gone).
-    pub async fn send_buffer(&self, buf: PooledSendBuf) -> i32 {
+    /// The reactor driving this connection, and the fd it is on.
+    fn transport(&self) -> (&Reactor, i32) {
         match &self.inner {
-            PeerInner::Unix { conn, reactor } => reactor.send_buffer(conn.fd(), buf).await,
-            PeerInner::Tls(conn) => conn.send_buffer(buf).await,
+            PeerInner::Unix { conn, reactor } => (reactor, conn.fd()),
+            PeerInner::Tls(conn) => (conn.reactor(), conn.fd()),
         }
     }
 
-    /// Forward a worker W2M ring slot to the client. Same deadline as
-    /// [`Self::send_buffer`], and here it also frees the held ring slot — see
-    /// [`Reactor::send_slot`] for why that matters.
+    /// Send one owned payload to the client. The egress deadline wraps both
+    /// transport arms here, once, so neither can carry its own version of the
+    /// policy. Returns the send rc (`< 0` — disconnect or eviction — means the
+    /// client is gone).
+    async fn send<T: SendPayload + 'static>(&self, payload: Rc<T>) -> i32 {
+        let (reactor, fd) = self.transport();
+        let what = payload.what();
+        guard_egress_deadline(reactor, fd, what, async {
+            match &self.inner {
+                PeerInner::Unix { .. } => reactor.send_owned(fd, payload).await,
+                PeerInner::Tls(conn) => conn.send_bytes(payload.bytes()).await,
+            }
+        })
+        .await
+    }
+
+    /// Send an owned buffer to the client.
+    pub async fn send_buffer(&self, buf: PooledSendBuf) -> i32 {
+        self.send(Rc::new(buf)).await
+    }
+
+    /// Forward a worker W2M ring slot to the client. Holding the slot until the
+    /// send completes is what preserves the worker's W2M backpressure, and is
+    /// why the deadline matters most on this path — see [`Reactor::send_owned`].
     pub async fn send_slot(&self, slot: W2mSlot) -> i32 {
-        match &self.inner {
-            PeerInner::Unix { conn, reactor } => reactor.send_slot(conn.fd(), slot).await,
-            PeerInner::Tls(conn) => conn.send_slot(slot).await,
-        }
+        self.send(Rc::new(slot)).await
     }
 
     /// Send the OK HELLO ACK frame, seeding the client's OCC basis with
@@ -96,16 +114,8 @@ impl Peer {
     /// the reply is on the wire there is nothing left to do on the
     /// connection, so a negative send rc (peer gone / write error) simply
     /// schedules the close.
-    pub async fn send_buffer_or_close(&self, buf: PooledSendBuf) {
-        if self.send_buffer(buf).await < 0 {
-            self.close();
-        }
-    }
-
-    /// `send_slot` counterpart of [`Self::send_buffer_or_close`]: forward a
-    /// worker ring slot as the final reply, closing on transport failure.
-    pub async fn send_slot_or_close(&self, slot: W2mSlot) {
-        if self.send_slot(slot).await < 0 {
+    pub async fn send_or_close<T: SendPayload + 'static>(&self, payload: T) {
+        if self.send(Rc::new(payload)).await < 0 {
             self.close();
         }
     }

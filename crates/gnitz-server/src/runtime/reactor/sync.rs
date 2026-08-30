@@ -1,3 +1,10 @@
+//! Async primitives for the reactor's single thread: `oneshot`, `mpsc`,
+//! `AsyncMutex`, `AsyncRwLock`, `join_all_unpin` / `join_into` and `select2`.
+//!
+//! All `!Send` and `Rc<RefCell<_>>`-based on purpose: the reactor never leaves
+//! its thread, so a channel send costs no atomic and a waker registration no
+//! lock.
+
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -34,7 +41,6 @@ pub mod oneshot {
         value: Option<T>,
         waker: Option<Waker>,
         sender_alive: bool,
-        receiver_alive: bool,
     }
 
     pub struct Sender<T> {
@@ -49,24 +55,19 @@ pub mod oneshot {
             value: None,
             waker: None,
             sender_alive: true,
-            receiver_alive: true,
         }));
         (Sender { inner: Rc::clone(&s) }, Receiver { inner: s })
     }
 
     impl<T> Sender<T> {
-        /// Attempt to send. Returns `Err(v)` if the receiver has been
-        /// dropped (cancelled).
-        pub fn send(self, v: T) -> Result<(), T> {
+        /// Send the result. A cancelled receiver is not an error: the value is
+        /// parked in state nothing will read, and dropped with the `Rc`.
+        pub fn send(self, v: T) {
             let mut s = self.inner.borrow_mut();
-            if !s.receiver_alive {
-                return Err(v);
-            }
             s.value = Some(v);
             if let Some(w) = s.waker.take() {
                 w.wake();
             }
-            Ok(())
         }
     }
 
@@ -94,12 +95,6 @@ pub mod oneshot {
             Poll::Pending
         }
     }
-
-    impl<T> Drop for Receiver<T> {
-        fn drop(&mut self) {
-            self.inner.borrow_mut().receiver_alive = false;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -111,10 +106,10 @@ pub mod oneshot {
 
 pub mod mpsc {
     use super::*;
+    use crate::runtime::reactor::wake_queue::WakeQueue;
 
     struct State<T> {
-        queue: VecDeque<T>,
-        waker: Option<Waker>,
+        queue: WakeQueue<T>,
         senders: usize,
     }
 
@@ -127,8 +122,7 @@ pub mod mpsc {
 
     pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
         let s = Rc::new(RefCell::new(State {
-            queue: VecDeque::new(),
-            waker: None,
+            queue: WakeQueue::default(),
             senders: 1,
         }));
         (Sender { inner: Rc::clone(&s) }, Receiver { inner: s })
@@ -145,11 +139,7 @@ pub mod mpsc {
 
     impl<T> Sender<T> {
         pub fn send(&self, v: T) {
-            let mut s = self.inner.borrow_mut();
-            s.queue.push_back(v);
-            if let Some(w) = s.waker.take() {
-                w.wake();
-            }
+            self.inner.borrow_mut().queue.push(v);
         }
     }
 
@@ -158,9 +148,7 @@ pub mod mpsc {
             let mut s = self.inner.borrow_mut();
             s.senders -= 1;
             if s.senders == 0 {
-                if let Some(w) = s.waker.take() {
-                    w.wake();
-                }
+                s.queue.close();
             }
         }
     }
@@ -175,7 +163,7 @@ pub mod mpsc {
         /// to drain pipelined requests without paying the 1ms debounce
         /// timer when nothing more is available.
         pub fn try_recv(&mut self) -> Option<T> {
-            self.inner.borrow_mut().queue.pop_front()
+            self.inner.borrow_mut().queue.pop()
         }
     }
 
@@ -183,18 +171,10 @@ pub mod mpsc {
         inner: &'a Rc<RefCell<State<T>>>,
     }
 
-    impl<'a, T> Future for RecvOne<'a, T> {
+    impl<T> Future for RecvOne<'_, T> {
         type Output = Option<T>;
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-            let mut s = self.inner.borrow_mut();
-            if let Some(v) = s.queue.pop_front() {
-                return Poll::Ready(Some(v));
-            }
-            if s.senders == 0 {
-                return Poll::Ready(None);
-            }
-            s.waker = Some(cx.waker().clone());
-            Poll::Pending
+            self.inner.borrow_mut().queue.poll(cx)
         }
     }
 }
@@ -555,3 +535,7 @@ where
     })
     .await
 }
+
+#[cfg(test)]
+#[path = "tests/sync.rs"]
+mod tests;
