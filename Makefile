@@ -29,7 +29,7 @@ TARGET_CPU ?= x86-64-v3
 .PHONY: all help \
         test rust-engine-test fmt fmt-check clippy check verify \
         server release-server checked-server pyext pyext-release e2e e2e-tls e2e-release \
-        e2e-checked release-test \
+        e2e-checked e2e-debug release-test \
         clean distclean \
         bench bench-full bench-features bench-txn bench-sweep bench-sweep-dwarf \
         bench-perf bench-perf-dwarf bench-native bench-profile profiling-server profiling-server-dwarf
@@ -100,6 +100,14 @@ e2e-release: release-server pyext ## Run the E2E suite against the release serve
 	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release GNITZ_WORKERS=$(WORKERS) \
 		uv run pytest tests/ -v $(if $(K),-k '$(K)')
 
+# The debug-logging loop. It exists as a target so the documented way to chase a
+# failure still rebuilds first: run `uv run pytest` by hand and you test whatever
+# binary and extension happened to be installed last.
+e2e-debug: WORKERS = 4
+e2e-debug: server pyext ## Run the E2E suite with debug logging (W=4; use K= to narrow)
+	cd crates/gnitz-py && GNITZ_LOG_LEVEL=debug GNITZ_WORKERS=$(WORKERS) \
+		uv run pytest tests/ -x -v $(if $(K),-k '$(K)')
+
 # Release codegen with the layout verifiers live — the only build where the
 # kernels that ship and the checks that would catch them over-claiming both
 # exist. An over-claimed batch aborts the server here instead of silently
@@ -120,6 +128,13 @@ clean: ## Remove built binaries + per-run scratch data (keeps post-mortem logs)
 	@rm -f gnitz-server gnitz-server-release gnitz-server-checked gnitz-server-profiling
 	rm -f crates/gnitz-py/python/gnitz/_native*.so
 	@rm -rf tmp/pytest-of-* tmp/bench_*
+	@# Cargo hardlinks each workspace library into the profile root from `deps/`
+	@# and never removes one whose crate has left the workspace: `libgnitz_capi.*`
+	@# outlived `crates/gnitz-capi/` by 307 MB. The links cost nothing to recreate
+	@# — the next build re-links from `deps/` without recompiling — so deleting
+	@# every one is both complete and free, and needs no member list to go stale.
+	@rm -f crates/target/*/lib*.so crates/target/*/lib*.rlib \
+	       crates/target/*/lib*.a crates/target/*/lib*.d
 
 distclean: clean ## clean + cargo target cache + post-mortem logs
 	cd crates && cargo clean

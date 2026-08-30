@@ -320,6 +320,10 @@ list, this is not. The ones whose semantics are not obvious from the name:
   layout verifiers left in. Run it when the unsafe batch kernels changed or a
   bug is release-only — release compiles the layout verifiers out.
 
+The Python extension that ships is the one maturin installs at
+`crates/gnitz-py/python/gnitz/_native*.so`. `crates/target/*/libgnitz.so` is
+cargo's own output, linked by nothing and arbitrarily stale — never measure it.
+
 ## Project structure
 
 Two sides that meet at the wire protocol: the **SQL/client side** (a library,
@@ -409,8 +413,12 @@ The knobs a session usually reaches for. This is not the full set — every
 ## Debug logging
 
 ```bash
-cd crates/gnitz-py && GNITZ_WORKERS=4 GNITZ_LOG_LEVEL=debug uv run pytest -x <test-file>
+make e2e-debug K='<expr>'      # rebuilds first, then runs with GNITZ_LOG_LEVEL=debug at W=4
 ```
+
+The suite refuses to start on a server binary or extension older than the newest
+Rust source, so a bare `uv run pytest` cannot silently test the previous build.
+`GNITZ_ALLOW_STALE_BIN=1` overrides it.
 
 Log format: `<epoch>.<ms> <tag> <level> <message>` — tags: `M` (master), `W0`–`WN`.
 

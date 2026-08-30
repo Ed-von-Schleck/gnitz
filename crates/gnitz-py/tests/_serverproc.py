@@ -79,12 +79,50 @@ def is_debug_build():
     return os.environ.get("GNITZ_RELEASE", "0") == "0"
 
 
+_NEWEST_SOURCE = None
+
+
+def _newest_source_mtime():
+    """mtime of the newest `.rs` or manifest under `crates/`. Memoised: the walk
+    covers every crate source and runs once per server a suite spawns."""
+    global _NEWEST_SOURCE
+    if _NEWEST_SOURCE is None:
+        newest = 0.0
+        for root, dirs, files in os.walk(REPO_ROOT / "crates"):
+            dirs[:] = [d for d in dirs if d not in ("target", ".venv", "__pycache__")]
+            for name in files:
+                if name.endswith(".rs") or name in ("Cargo.toml", "Cargo.lock"):
+                    newest = max(newest, os.stat(os.path.join(root, name)).st_mtime)
+        _NEWEST_SOURCE = newest
+    return _NEWEST_SOURCE
+
+
 def server_binary():
-    """The server under test, skipping the test if it has not been built."""
+    """The server under test, skipping the test if it has not been built.
+
+    An artifact older than the newest Rust source is a **hard failure, not a
+    skip**: every `make` target that runs this suite rebuilds first, so getting
+    here stale means the run went around `make` — and a stale binary's failure
+    mode is a *passing* run of code that is not the code under edit. The
+    extension is checked alongside the binary because it carries the SQL planner
+    and is just as invisible when stale. `GNITZ_ALLOW_STALE_BIN=1` opts out, for
+    when an older binary is the point (bisecting, or a pinned `GNITZ_SERVER_BIN`).
+    """
     binary = os.environ.get("GNITZ_SERVER_BIN", str(REPO_ROOT / "gnitz-server"))
     binary = os.path.abspath(binary)
     if not os.path.isfile(binary):
         pytest.skip(f"Server binary not found: {binary}")
+    if os.environ.get("GNITZ_ALLOW_STALE_BIN", "0") == "0":
+        ext = (REPO_ROOT / "crates/gnitz-py/python/gnitz").glob("_native*.so")
+        newest = _newest_source_mtime()
+        stale = [str(f) for f in (binary, *ext) if os.stat(f).st_mtime < newest]
+        if stale:
+            raise RuntimeError(
+                "Build artifacts are older than the Rust sources:\n  "
+                + "\n  ".join(os.path.relpath(f, REPO_ROOT) for f in stale)
+                + "\nRun `make e2e` (or `make e2e-debug`), which rebuilds first; "
+                "GNITZ_ALLOW_STALE_BIN=1 to override."
+            )
     return binary
 
 
