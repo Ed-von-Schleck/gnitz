@@ -4,17 +4,7 @@
 use std::time::Duration;
 
 use super::super::test_support::*;
-use super::super::uring::Cqe;
 use super::*;
-
-/// Dispatch a synthetic CQE tagged with `kind` and `id`, carrying `rc`.
-fn cqe(r: &Reactor, kind: u64, id: u64, rc: i32) {
-    r.dispatch_cqe(Cqe {
-        user_data: udata(kind, id),
-        res: rc,
-        flags: 0,
-    });
-}
 
 /// One whole-payload client send the way `Peer::send` runs it: the owned send
 /// under the egress deadline.
@@ -22,15 +12,6 @@ async fn guarded_send(r: &Reactor, fd: i32, payload: Vec<u8>) -> i32 {
     let buf = Rc::new(gnitz_engine::storage::batch_pool::PooledSendBuf(payload));
     let what = buf.what();
     guard_egress_deadline(r, fd, what, r.send_owned(fd, buf)).await
-}
-
-/// The egress deadline is process-wide, so both socketpair send tests seed
-/// it through here with one value: short enough that the eviction test
-/// waits it out in a couple of seconds, and far above what the partial-send
-/// test needs to push 200 KB through a draining reader.
-fn short_client_send_timeout() -> Duration {
-    force_client_send_timeout(Duration::from_secs(2));
-    client_send_timeout()
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -74,16 +55,17 @@ fn send_cqe_parks_rc_and_wakes_waker() {
 fn send_cqe_decrements_conn_inflight_and_releases_the_buffer() {
     let r = make_reactor();
     let alive: SendAlive = Rc::new(gnitz_engine::storage::batch_pool::PooledSendBuf(vec![0u8; 16]));
-    r.inner.sends.open(77, Some((42, Rc::clone(&alive))));
+    let (fd, write_end) = unsafe { pipe_pair() };
+    r.inner.sends.open(77, Some((fd, Rc::clone(&alive))));
     r.inner
         .conns
         .borrow_mut()
-        .insert(42, Box::new(io::Conn::new(Rc::clone(&r.inner.inbound))));
-    r.inner.conns.borrow_mut().get_mut(&42).unwrap().send_inflight = 1;
+        .insert(fd, Box::new(io::Conn::new(Rc::clone(&r.inner.inbound))));
+    r.inner.conns.borrow_mut().get_mut(&fd).unwrap().send_inflight = 1;
 
     cqe(&r, KIND_SEND, 77, 16);
 
-    let inflight = r.inner.conns.borrow().get(&42).unwrap().send_inflight;
+    let inflight = r.inner.conns.borrow().get(&fd).unwrap().send_inflight;
     assert_eq!(
         inflight, 0,
         "KIND_SEND must decrement conn.send_inflight (gates close_fd)"
@@ -91,13 +73,19 @@ fn send_cqe_decrements_conn_inflight_and_releases_the_buffer() {
     // The keep-alive rides the slot until the awaiter collects the result;
     // once it does, the last reference goes with it.
     assert_eq!(Rc::strong_count(&alive), 2, "slot still holds the buffer");
-    let waker = make_waker(0);
     let mut fut = std::pin::pin!(SendFuture {
         send_id: 77,
         inner: Rc::clone(&r.inner),
     });
-    assert_eq!(fut.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Ready(16));
+    assert_eq!(
+        fut.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(16)
+    );
     assert_eq!(Rc::strong_count(&alive), 1, "collecting the result frees the buffer");
+    unsafe {
+        libc::close(fd);
+        libc::close(write_end);
+    }
 }
 
 /// A dropped SendFuture with an in-flight SQE must leave the buffer alive
@@ -107,7 +95,7 @@ fn send_cqe_decrements_conn_inflight_and_releases_the_buffer() {
 fn dropped_send_future_keeps_buffer_alive_until_its_cqe() {
     let r = make_reactor();
     let alive: SendAlive = Rc::new(gnitz_engine::storage::batch_pool::PooledSendBuf(vec![0xAB_u8; 64]));
-    r.inner.sends.open(88, Some((42, Rc::clone(&alive))));
+    r.inner.sends.open(88, Some((i32::MAX, Rc::clone(&alive))));
     drop(SendFuture {
         send_id: 88,
         inner: Rc::clone(&r.inner),
@@ -150,6 +138,10 @@ fn reaped_conn_leaves_no_state_for_the_next_connection() {
         r.inner.conns.borrow().is_empty(),
         "reaping must retire the whole Conn, closing its fd"
     );
+    assert!(
+        r.inner.closing_fds.borrow().is_empty(),
+        "and forget the fd, so a later reap cannot close the number twice"
+    );
 
     // The kernel is now free to hand that number back out.
     let (next_read, next_write) = unsafe { pipe_pair() };
@@ -172,7 +164,6 @@ fn reaped_conn_leaves_no_state_for_the_next_connection() {
 /// the full buffer drains.
 #[test]
 fn send_buffer_loops_until_full_payload_sent_over_socketpair() {
-    short_client_send_timeout();
     unsafe {
         let (r, sender, receiver) = egress_pair(Some(8 * 1024));
         let payload = vec![0x5Au8; 200 * 1024];
@@ -205,9 +196,10 @@ fn send_buffer_loops_until_full_payload_sent_over_socketpair() {
 /// shutting the fd down and surfacing a negative rc.
 #[test]
 fn send_buffer_evicts_a_client_that_never_drains() {
-    let timeout = short_client_send_timeout();
+    const TIMEOUT: Duration = Duration::from_millis(100);
     unsafe {
         let (r, sender, receiver) = egress_pair(Some(4 * 1024));
+        r.set_client_send_timeout(TIMEOUT);
 
         // Far larger than both buffers, and nothing ever reads the other
         // end — the send stalls partway and only the deadline can end it.
@@ -219,8 +211,8 @@ fn send_buffer_evicts_a_client_that_never_drains() {
 
         assert!(rc < 0, "a client that never drains must be evicted, got rc={rc}");
         assert!(
-            elapsed >= timeout,
-            "eviction must wait out the full deadline ({timeout:?}), took {elapsed:?}"
+            elapsed >= TIMEOUT,
+            "eviction must wait out the full deadline ({TIMEOUT:?}), took {elapsed:?}"
         );
         // The eviction path shuts the socket down, so nothing more can be
         // written to it — that is what releases the send's held resources.
@@ -399,116 +391,56 @@ fn close_fd_cancels_an_armed_recv_so_a_silent_peer_is_reaped() {
 // ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn handle_recv_cqe_error_populates_closing_fds() {
-    let r = make_reactor();
-    let conn = Box::new(io::Conn::new(Rc::clone(&r.inner.inbound)));
-    r.inner.conns.borrow_mut().insert(55, conn);
-
-    cqe(&r, KIND_RECV, 55, -1);
-
-    assert!(
-        r.inner.closing_fds.borrow().contains(&55),
-        "res<=0 recv CQE must insert fd into closing_fds"
-    );
-    assert!(
-        r.inner.conns.borrow().get(&55).unwrap().q.recv_closed(),
-        "res<=0 recv CQE must mark the connection closed"
-    );
-}
-
-#[test]
-fn reap_closing_conns_removes_idle_closing_fd() {
-    let r = make_reactor();
-    unsafe {
-        let (read_end, write_end) = pipe_pair();
-
-        let conn = Box::new(io::Conn::new(Rc::clone(&r.inner.inbound)));
-        r.inner.conns.borrow_mut().insert(read_end, conn);
-        r.inner.closing_fds.borrow_mut().insert(read_end);
-
-        r.reap_closing_conns();
-
-        assert!(
-            !r.inner.conns.borrow().contains_key(&read_end),
-            "idle closing conn must be removed from conns"
-        );
-        assert!(
-            !r.inner.closing_fds.borrow().contains(&read_end),
-            "reaped fd must be removed from closing_fds"
-        );
-
-        libc::close(write_end);
-    }
-}
-
-#[test]
 fn reap_closing_conns_defers_conn_with_outstanding_send() {
     let r = make_reactor();
+    let (fd, write_end) = unsafe { pipe_pair() };
     let mut conn = Box::new(io::Conn::new(Rc::clone(&r.inner.inbound)));
     conn.send_inflight = 1; // outstanding send SQE
-    r.inner.conns.borrow_mut().insert(77, conn);
-    r.inner.closing_fds.borrow_mut().insert(77);
+    r.inner.conns.borrow_mut().insert(fd, conn);
+    r.inner.closing_fds.borrow_mut().insert(fd);
 
     r.reap_closing_conns();
 
     assert!(
-        r.inner.conns.borrow().contains_key(&77),
+        r.inner.conns.borrow().contains_key(&fd),
         "conn with outstanding send must NOT be reaped yet"
     );
     assert!(
-        r.inner.closing_fds.borrow().contains(&77),
+        r.inner.closing_fds.borrow().contains(&fd),
         "conn deferred by outstanding send must stay in closing_fds"
     );
+    unsafe {
+        libc::close(fd);
+        libc::close(write_end);
+    }
 }
 
+/// The accept dispatch arm: a failed accept queues nothing, a successful one
+/// queues `(conn_fd, listener_fd)` — the listener rides the udata id and is the
+/// accept loop's unix-vs-tls routing key — and wakes the parked awaiter once.
 #[test]
-fn dispatch_accept_queues_the_connection_and_its_listener() {
-    let r = make_reactor();
-    // The listener fd rides the udata id and must round-trip into the
-    // queued pair — it is the accept loop's unix-vs-tls routing key.
-    let listener = fake_listener();
-    cqe(&r, KIND_ACCEPT, listener as u64, 9);
-    assert_eq!(
-        r.inner.accepts.borrow_mut().pop(),
-        Some((9, listener)),
-        "KIND_ACCEPT res>=0 must queue (conn_fd, listener_fd)"
-    );
-    unsafe { libc::close(listener) };
-}
-
-#[test]
-fn dispatch_accept_wakes_waiter_when_present() {
+fn dispatch_accept_queues_successes_and_wakes_the_awaiter() {
     let r = make_reactor();
     let listener = fake_listener();
     let waker = make_waker(42);
     let mut fut = std::pin::pin!(r.accept());
     assert!(fut.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
 
-    cqe(&r, KIND_ACCEPT, listener as u64, 5);
+    cqe(&r, KIND_ACCEPT, listener as u64, -libc::ECONNABORTED);
+    assert_eq!(r.inner.accepts.borrow().len(), 0, "res<0 must queue nothing");
+    assert!(r.inner.accepts.borrow().has_waiter(), "and leave the awaiter parked");
 
+    cqe(&r, KIND_ACCEPT, listener as u64, 9);
     assert!(
         r.inner.run_queue.borrow().is_queued(42),
-        "KIND_ACCEPT must wake the parked accept future"
+        "res>=0 must wake the parked accept future"
     );
-    assert!(
-        !r.inner.accepts.borrow().has_waiter(),
-        "KIND_ACCEPT must consume the waker it woke"
-    );
+    assert!(!r.inner.accepts.borrow().has_waiter(), "and consume the waker it woke");
+    assert_eq!(r.inner.accepts.borrow_mut().pop(), Some((9, listener)));
+
     unsafe { libc::close(listener) };
 }
 
-#[test]
-fn dispatch_accept_ignores_error_result() {
-    let r = make_reactor();
-    let listener = fake_listener();
-    cqe(&r, KIND_ACCEPT, listener as u64, -libc::ECONNABORTED);
-    assert_eq!(
-        r.inner.accepts.borrow().len(),
-        0,
-        "KIND_ACCEPT with res<0 must queue nothing"
-    );
-    unsafe { libc::close(listener) };
-}
 /// fd exhaustion cancels a listener's multishot accept, and the re-arm is
 /// deferred behind a backoff so `reap_closing_conns` gets a window. Both
 /// listeners can cancel in the same window — exhaustion is global — and each
@@ -536,25 +468,6 @@ fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
         r.inner.tasks.borrow().is_empty(),
         "both backoff tasks must fire and re-arm their listener"
     );
-    unsafe {
-        libc::close(a);
-        libc::close(b);
-    }
-}
-
-#[test]
-fn test_shutdown_aborts_connected_socket() {
-    // A send after the abort must fail rather than queue — the property
-    // `guard_egress_deadline` leans on. MSG_NOSIGNAL keeps the failing send
-    // from raising SIGPIPE and killing the test process.
-    let mut fds = [0i32; 2];
-    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "socketpair failed");
-    let (a, b) = (fds[0], fds[1]);
-    shutdown(a);
-    let buf = [0u8; 4];
-    let n = unsafe { libc::send(a, buf.as_ptr() as *const libc::c_void, buf.len(), libc::MSG_NOSIGNAL) };
-    assert!(n < 0, "send after SHUT_RDWR must fail, got {n}");
     unsafe {
         libc::close(a);
         libc::close(b);

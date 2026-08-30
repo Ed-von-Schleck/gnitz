@@ -177,6 +177,14 @@ pub mod mpsc {
             self.inner.borrow_mut().queue.poll(cx)
         }
     }
+
+    impl<T> Drop for RecvOne<'_, T> {
+        fn drop(&mut self) {
+            // Same hygiene every other `WakeQueue` awaiter owes: a `recv()` that
+            // loses a `select2` must not leave a waker for the next `send` to fire.
+            self.inner.borrow_mut().queue.clear_waiter();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

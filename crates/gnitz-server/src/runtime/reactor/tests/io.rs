@@ -4,40 +4,66 @@
 use super::super::test_support::*;
 use super::super::*;
 
-/// Cap trips: unconsumed frames whose cumulative weight passes the ceiling
-/// close the connection at the breaching header (before malloc), and reap
-/// returns the global counter to 0.
-#[test]
-fn inbound_cap_trips_and_reap_reconciles() {
+/// Drive `wire` into a fresh connection capped at `cap` and assert it is
+/// refused: the connection reaped, and the global counter back at 0 — a refused
+/// frame must never have been allocated, and a reaped one must be refunded.
+fn assert_refused(cap: usize, max_payload: Option<usize>, wire: &[u8], why: &str) {
     unsafe {
         let (read_fd, write_fd) = stream_pair();
         let r = make_reactor();
         r.register_conn(read_fd);
-        r.set_max_payload_len(read_fd, 1 << 20);
-        // frame_weight(100) = 100. Two frames = 200 held; the 3rd frame's
-        // header pushes 200 + 100 = 300 > 250 and is refused before malloc.
-        r.inbound().set_cap(250);
-        let payload = vec![0xABu8; 100];
-        let mut wire = Vec::new();
-        for _ in 0..3 {
-            wire.extend_from_slice(&framed(&payload));
+        if let Some(limit) = max_payload {
+            r.set_max_payload_len(read_fd, limit);
         }
-        gnitz_engine::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
+        r.inbound().set_cap(cap);
+        gnitz_engine::foundation::posix_io::write_all_fd(write_fd, wire).expect("write");
 
-        let reaped = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd));
-        assert!(reaped, "cap-trip connection was never reaped");
-        assert_eq!(
-            r.inbound().held(),
-            0,
-            "reap must subtract the reaped connection's undrained share"
+        assert!(
+            poll_until(&r, 20_000, || !r.inner.conns.borrow().contains_key(&read_fd)),
+            "{why}"
         );
+        assert_eq!(r.inbound().held(), 0, "{why}: budget must be reconciled");
         assert!(
             poll_recv_once(&r, read_fd).unwrap().is_none(),
-            "recv after a cap-trip close must yield None"
+            "{why}: recv after the close must yield None"
         );
-
         libc::close(write_fd); // read_fd was closed by reap
     }
+}
+
+/// The four ways an inbound frame is refused at its header, before any payload
+/// byte is allocated.
+#[test]
+fn inbound_frames_are_refused_at_the_header() {
+    let repeat = |payload: &[u8], n: usize| -> Vec<u8> { (0..n).flat_map(|_| framed(payload)).collect() };
+
+    // frame_weight(100) = 100. Two frames = 200 held; the 3rd pushes 300 > 250.
+    assert_refused(
+        250,
+        Some(1 << 20),
+        &repeat(&[0xAB; 100], 3),
+        "cumulative weight over cap",
+    );
+
+    // 1-byte payloads each weigh the 64-byte floor, so 64 frames = 4096 and the
+    // 65th breaches. Without the floor 65 frames would weigh 65 B and never trip.
+    assert_refused(
+        4096,
+        None,
+        &repeat(&[0xCD], 65),
+        "tiny-frame flood via the weight floor",
+    );
+
+    // No `set_max_payload_len`: the ceiling is still the 8-byte HELLO payload.
+    assert_refused(
+        usize::MAX,
+        None,
+        &framed(&[0u8; io::HELLO_PRE_HANDSHAKE_LEN + 1]),
+        "first frame over the pre-handshake ceiling",
+    );
+
+    // A zero-length frame is the close sentinel, not a frame.
+    assert_refused(usize::MAX, None, &0u32.to_le_bytes(), "the zero-length close sentinel");
 }
 
 /// In-flight (partial, un-completed) payloads are accounted, and a second
@@ -125,85 +151,6 @@ fn inbound_cap_accounting_balances_on_consume() {
     }
 }
 
-/// Tiny-frame floor: a flood of 1-byte payloads trips the cap after
-/// ~CAP/64 frames (each weighs the 64-byte floor), not CAP — without the
-/// floor, 65 one-byte frames weigh 65 B and would never trip.
-#[test]
-fn inbound_cap_tiny_frame_floor_trips_early() {
-    unsafe {
-        let (read_fd, write_fd) = stream_pair();
-        let r = make_reactor();
-        r.register_conn(read_fd);
-        // 1-byte payloads ≤ HELLO_PRE_HANDSHAKE_LEN (8), so no
-        // set_max_payload_len is needed.
-        r.inbound().set_cap(4096);
-        // 64 frames = 64 × 64 = 4096 held; the 65th frame's header would
-        // make 4160 > 4096 and is refused.
-        let mut wire = Vec::new();
-        for _ in 0..65 {
-            wire.extend_from_slice(&framed(&[0xCD]));
-        }
-        gnitz_engine::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
-
-        let reaped = poll_until(&r, 20_000, || !r.inner.conns.borrow().contains_key(&read_fd));
-        assert!(reaped, "tiny-frame flood must trip the cap via the frame_weight floor");
-        assert_eq!(
-            r.inbound().held(),
-            0,
-            "reap must reconcile the counter after a tiny-frame trip"
-        );
-
-        libc::close(write_fd); // read_fd was closed by reap
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Per-connection recv policy on the fd path: the pre-HELLO frame
-// ceiling and the zero-length close sentinel. Both live in
-// `RecvQueue::deliver`, shared with the TLS transport.
-// ─────────────────────────────────────────────────────────────────
-
-/// A first frame larger than the pre-handshake ceiling is refused at its
-/// header — before any payload byte is allocated — and the connection dies.
-#[test]
-fn oversize_first_frame_is_refused_at_the_header() {
-    unsafe {
-        let (read_fd, write_fd) = stream_pair();
-        let r = make_reactor();
-        r.register_conn(read_fd);
-        // No set_max_payload_len: the ceiling is still the 8-byte HELLO
-        // payload size, so a 9-byte frame must be refused.
-        let wire = framed(&[0u8; io::HELLO_PRE_HANDSHAKE_LEN + 1]);
-        gnitz_engine::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
-
-        let reaped = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd));
-        assert!(
-            reaped,
-            "a frame over the per-connection ceiling must close the connection"
-        );
-        assert_eq!(r.inbound().held(), 0, "a refused frame must never have been allocated");
-
-        libc::close(write_fd); // read_fd was closed by reap
-    }
-}
-
-/// A zero-length frame is the close sentinel, not a frame: it closes the
-/// connection instead of completing a message.
-#[test]
-fn zero_length_frame_closes_the_connection() {
-    unsafe {
-        let (read_fd, write_fd) = stream_pair();
-        let r = make_reactor();
-        r.register_conn(read_fd);
-        gnitz_engine::foundation::posix_io::write_all_fd(write_fd, &0u32.to_le_bytes()).expect("write");
-
-        let reaped = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd));
-        assert!(reaped, "the zero-length sentinel must close the connection");
-
-        libc::close(write_fd); // read_fd was closed by reap
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────
 // RecvState state-machine unit tests: its four transitions (NeedMore,
 // HeaderDone, MessageDone, Disconnect) driven directly, with no io_uring.
@@ -211,42 +158,27 @@ fn zero_length_frame_closes_the_connection() {
 // above.
 // ─────────────────────────────────────────────────────────────────
 
+/// One pass through the machine: a split header, a seeded header completing,
+/// a split payload, and the reset `take_message` leaves behind. The zero-length
+/// `Disconnect` transition is asserted at the observable layer above.
 #[test]
-fn recv_state_partial_header_accumulates() {
+fn recv_state_walks_header_then_payload() {
     let mut rs = io::RecvState::new();
-    // Feed 2 of 4 header bytes.
+
+    // 2 of 4 header bytes.
     assert!(matches!(rs.advance(2), io::RecvAdvance::NeedMore));
-    let (_, rem) = rs.remaining();
-    assert_eq!(rem, 2, "remaining must reflect the 2 consumed header bytes");
-}
+    assert_eq!(rs.remaining().1, 2, "remaining reflects the consumed header bytes");
 
-#[test]
-fn recv_state_zero_payload_len_disconnects() {
-    let mut rs = io::RecvState::new();
-    // hdr_buf is all-zeros → payload_len = 0 → protocol violation.
-    assert!(matches!(rs.advance(4), io::RecvAdvance::Disconnect));
-}
-
-#[test]
-fn recv_state_payload_accumulates_then_message_done() {
-    let mut rs = io::RecvState::new();
     rs.seed_header(8);
-    assert!(matches!(rs.advance(4), io::RecvAdvance::HeaderDone));
+    assert!(matches!(rs.advance(2), io::RecvAdvance::HeaderDone));
 
     let buf = unsafe { libc::malloc(8) as *mut u8 };
     rs.start_payload(io::RecvBuf::new(buf, 8, Rc::new(io::InboundBudget::new(usize::MAX))));
-
-    // Partial payload.
     assert!(matches!(rs.advance(5), io::RecvAdvance::NeedMore));
-    // Remaining 3 bytes complete the message.
     assert!(matches!(rs.advance(3), io::RecvAdvance::MessageDone));
 
-    // `take_message` yields the owning `RecvBuf` (frees on drop).
+    // `take_message` yields the owning `RecvBuf` (which frees on drop).
     let ret = rs.take_message();
-    assert_eq!(ret.ptr, buf);
-    assert_eq!(ret.len, 8);
-
-    // After take_message the state must be back in header phase.
-    let (_, rem) = rs.remaining();
-    assert_eq!(rem, 4, "take_message must reset to header phase");
+    assert_eq!((ret.ptr, ret.len), (buf, 8));
+    assert_eq!(rs.remaining().1, 4, "take_message must reset to header phase");
 }

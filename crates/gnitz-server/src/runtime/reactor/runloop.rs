@@ -60,9 +60,7 @@ impl Reactor {
         // published since the last tick is served in this tick rather than
         // waiting a full tick body for the next one.
         self.drain_cqes_into_wakers();
-        if self.inner.w2m.get().is_some() {
-            self.drain_all_w2m();
-        }
+        self.drain_all_w2m();
         self.reap_closing_conns();
 
         // 2. Drain the run queue. Swap into the scratch buffer so wakes during
@@ -97,11 +95,10 @@ impl Reactor {
         }
     }
 
-    /// Poll a single task. The future is removed from the map for the
-    /// duration of the poll (so the poll can re-enter the reactor to
-    /// spawn new tasks), then reinserted at the SAME key on Pending.
-    /// HashMap removal + same-key reinsertion is stable regardless of
-    /// what other keys are added/removed during poll.
+    /// Poll a single task. The future is taken out of the map for the duration
+    /// of the poll and reinserted at the same key on Pending: the poll may
+    /// re-enter the reactor and `spawn`, which can reallocate the map, so no
+    /// borrow of it may span the poll.
     fn poll_task(&self, key: usize) {
         let mut task = match self.inner.tasks.borrow_mut().remove(&key) {
             Some(t) => t,
@@ -123,11 +120,13 @@ impl Reactor {
         let mut buf = [Cqe::default(); 64];
         loop {
             let n = self.inner.ring().drain_cqes(&mut buf);
-            if n == 0 {
-                break;
-            }
             for cqe in &buf[..n] {
                 self.dispatch_cqe(*cqe);
+            }
+            // A short read proves the ring is empty, so the usual single-batch
+            // tick costs one `drain_cqes` rather than two.
+            if n < buf.len() {
+                break;
             }
         }
     }
@@ -184,7 +183,11 @@ impl Reactor {
                 // An AsyncCancel's own CQE. The cancellation's *effect* arrives
                 // separately as the target op's -ECANCELED under its own kind.
             }
-            _ => {}
+            _ => gnitz_error!(
+                "reactor: CQE with unknown kind={} (user_data={:#x})",
+                kind,
+                cqe.user_data
+            ),
         }
     }
 }

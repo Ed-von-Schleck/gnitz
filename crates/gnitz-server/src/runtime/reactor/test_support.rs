@@ -4,12 +4,20 @@
 //! attached to `conn`, `io` or `futures` reaches the same fixtures without any
 //! of them becoming crate API.
 
-use std::cell::Cell as StdCell;
-
 use super::*;
 
 pub(super) fn make_reactor() -> Reactor {
     Reactor::new(16).expect("reactor")
+}
+
+/// Drive `dispatch_cqe` with a synthetic completion tagged `kind`/`id`,
+/// carrying `rc` — the ring completions a test cannot make the kernel produce.
+pub(super) fn cqe(r: &Reactor, kind: u64, id: u64, rc: i32) {
+    r.dispatch_cqe(super::uring::Cqe {
+        user_data: udata(kind, id),
+        res: rc,
+        flags: 0,
+    });
 }
 
 /// Future that returns Pending exactly once, then Ready.
@@ -36,53 +44,6 @@ impl Future for YieldOnce {
     }
 }
 
-/// Wakes itself a few times, then completes. Mirrors a tight async
-/// loop that would burn the reactor if double-polled per wake.
-pub(super) struct DoublyWaking {
-    pub(super) polls: Rc<StdCell<u32>>,
-    pub(super) polled: u32,
-}
-
-impl Future for DoublyWaking {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let n = self.polled;
-        self.polls.set(self.polls.get() + 1);
-        if n >= 3 {
-            return Poll::Ready(());
-        }
-        self.polled = n + 1;
-        // Wake twice before returning Pending: must not get polled
-        // twice in the same tick, only once on the next tick.
-        cx.waker().wake_by_ref();
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    }
-}
-
-/// Race a timer and a reply future. Sets `flag` to true if the reply
-/// resolved first, leaves it false if the timer won. Polls both each
-/// tick; the first to return Ready wins.
-pub(super) async fn select_reply_or_timer<'a, T, R>(timer: T, reply: R, flag: &'a Rc<StdCell<bool>>)
-where
-    T: Future<Output = ()> + 'a,
-    R: Future<Output = DecodedWire> + 'a,
-{
-    let mut timer = Box::pin(timer);
-    let mut reply = Box::pin(reply);
-    std::future::poll_fn(move |cx| {
-        if timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(());
-        }
-        if reply.as_mut().poll(cx).is_ready() {
-            flag.set(true);
-            return Poll::Ready(());
-        }
-        Poll::Pending
-    })
-    .await
-}
-
 /// Build a minimal `DecodedWire` for tests — only `request_id` matters.
 pub(super) fn synthetic_decoded_wire(req_id: u64) -> DecodedWire {
     use gnitz_wire::control::DecodedControl;
@@ -96,19 +57,14 @@ pub(super) fn synthetic_decoded_wire(req_id: u64) -> DecodedWire {
     }
 }
 
-/// A socketpair set up for an egress test: the reactor, the sender fd, and
-/// the receiver end. The sender is registered in `conns` so `send_inflight`
-/// accounting has something to touch, as in real flow. `sndbuf` shrinks both
-/// socket buffers, so a payload larger than it is guaranteed to split across
-/// several OP_SEND CQEs. The caller closes both fds.
+/// A socketpair set up for an egress test: the reactor, the sender fd, and the
+/// receiver end. The `Conn` is inserted directly rather than via
+/// `register_conn`, which would also arm a recv these tests never complete;
+/// `send_inflight` accounting only needs the entry to exist. `sndbuf` shrinks
+/// both socket buffers, so a payload larger than it is guaranteed to split
+/// across several OP_SEND CQEs. The caller closes both fds.
 pub(super) unsafe fn egress_pair(sndbuf: Option<i32>) -> (Rc<Reactor>, i32, i32) {
-    let mut fds = [0i32; 2];
-    assert_eq!(
-        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()),
-        0,
-        "socketpair"
-    );
-    let (sender, receiver) = (fds[0], fds[1]);
+    let (sender, receiver) = stream_pair();
     if let Some(bytes) = sndbuf {
         for (fd, opt) in [(sender, libc::SO_SNDBUF), (receiver, libc::SO_RCVBUF)] {
             libc::setsockopt(
@@ -154,9 +110,9 @@ pub(super) fn framed(payload: &[u8]) -> Vec<u8> {
     v
 }
 
-/// AF_UNIX SOCK_STREAM pair. Returns `(server_read_fd, client_write_fd)`:
-/// the reactor `register_conn`s the first and recvs from it; the test
-/// `write_all`s framed bytes into the second.
+/// AF_UNIX SOCK_STREAM pair, as `(reactor_end, test_end)`. The reactor
+/// registers or sends on the first; the test writes framed bytes into, or
+/// drains, the second. Both directions work — a socketpair is symmetric.
 pub(super) unsafe fn stream_pair() -> (i32, i32) {
     let mut fds = [0i32; 2];
     let rc = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
@@ -178,9 +134,7 @@ pub(super) unsafe fn pipe_pair() -> (i32, i32) {
 /// still pending.
 pub(super) fn poll_recv_once(r: &Reactor, fd: i32) -> Option<Option<io::RecvBuf>> {
     let mut fut = Box::pin(r.recv(fd));
-    let waker = make_waker(usize::MAX);
-    let mut cx = Context::from_waker(&waker);
-    match fut.as_mut().poll(&mut cx) {
+    match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(v) => Some(v),
         Poll::Pending => None,
     }
@@ -195,10 +149,13 @@ pub(super) fn poll_until(r: &Reactor, max: usize, mut cond: impl FnMut() -> bool
     })
 }
 
-/// A real fd to stand in for a listener, so the `CQE_F_MORE == 0` re-arm
-/// these tests trigger targets something the kernel will accept.
+/// A real, owned fd to stand in for a listener. These tests only prep accept
+/// SQEs (never submitting them), so nothing but the caller touches the fd — it
+/// must merely be a number no parallel test owns.
 pub(super) fn fake_listener() -> i32 {
-    unsafe { pipe_pair().0 }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0, "socket");
+    fd
 }
 
 /// Build a minimal W2M ring and write one scan slot with `req_id`.

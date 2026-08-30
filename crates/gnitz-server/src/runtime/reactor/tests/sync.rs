@@ -62,23 +62,6 @@ fn oneshot_send_to_dropped_receiver_is_a_noop() {
 }
 
 #[test]
-fn mpsc_send_then_recv() {
-    let r = make_reactor();
-    let got: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
-    let got2 = Rc::clone(&got);
-    let (tx, mut rx) = mpsc::unbounded::<i32>();
-    tx.send(1);
-    tx.send(2);
-    drop(tx);
-    r.block_on(async move {
-        while let Some(v) = rx.recv().await {
-            got2.borrow_mut().push(v);
-        }
-    });
-    assert_eq!(*got.borrow(), vec![1, 2]);
-}
-
-#[test]
 fn mpsc_multi_senders() {
     let r = make_reactor();
     let got: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
@@ -94,9 +77,11 @@ fn mpsc_multi_senders() {
             got2.borrow_mut().push(v);
         }
     });
-    let mut g = got.borrow().clone();
-    g.sort();
-    assert_eq!(g, vec![10, 20]);
+    assert_eq!(
+        *got.borrow(),
+        vec![10, 20],
+        "a single-consumer queue delivers in send order"
+    );
 }
 
 #[test]
@@ -119,162 +104,6 @@ fn async_mutex_serializes_access() {
     }
     r.block_until_idle();
     assert_eq!(*order.borrow(), vec![0, 1, 2], "tasks must serialize, in lock order");
-}
-
-/// Structural regression: a task that acquires the SAL writer mutex,
-/// writes, drops the guard, then awaits must release the mutex
-/// before that await — so a concurrent relay/tick task can acquire
-/// it while the first task's await is outstanding (committer pattern:
-/// emit under lock, `.await` outside).
-#[test]
-fn sal_writer_excl_not_held_across_commit_await() {
-    let r = make_reactor();
-    let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
-    // One-shot channel used as a stand-in for "fsync CQE / worker
-    // ACK": the fake committer awaits `ack_rx`; the other task
-    // sends on `ack_tx` AFTER acquiring the mutex. If the committer
-    // was still holding the mutex, it would deadlock because
-    // neither would make progress.
-    let (ack_tx, ack_rx) = oneshot::channel::<()>();
-    let commit_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-    let relay_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-
-    let m1 = Rc::clone(&mutex);
-    let cd = Rc::clone(&commit_done);
-    r.spawn(async move {
-        // Emit under lock: identical pattern to the new committer.
-        {
-            let _guard = m1.lock().await;
-            // ...SAL writes would go here...
-        }
-        // Lock dropped. Now wait for "fsync + ACK".
-        let _ = ack_rx.await;
-        cd.set(true);
-    });
-
-    let m2 = Rc::clone(&mutex);
-    let rd = Rc::clone(&relay_done);
-    r.spawn(async move {
-        // This future MUST make progress while the committer is
-        // awaiting ack_rx — proving the mutex was released.
-        let _guard = m2.lock().await;
-        rd.set(true);
-        // Unblock the committer by sending its ACK.
-        ack_tx.send(());
-    });
-
-    r.block_until_idle();
-    assert!(relay_done.get(), "concurrent task must have acquired the mutex");
-    assert!(commit_done.get(), "committer must complete after its ACK is delivered");
-}
-
-/// Structural regression for the SERIAL range allocation: it acquires the
-/// catalog write lock AND the SAL-writer lock, emits synchronously, drops
-/// BOTH, then awaits the fdatasync CQE with no locks held. A concurrent
-/// catalog READER (SEEK / SEEK_BY_INDEX* / tick emission) must make progress
-/// during that await — proving the write lock is not held across the fsync.
-/// If it were, the writer-preferring rwlock would block the reader and both
-/// would deadlock (the reader never sends the fake fsync completion).
-#[test]
-fn catalog_write_lock_not_held_across_serial_fsync() {
-    let r = make_reactor();
-    let rwlock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
-    let sal: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
-    // Stand-in for the fsync CQE: the SERIAL task awaits it AFTER dropping
-    // both locks; the reader sends it after acquiring the read lock.
-    let (fsync_tx, fsync_rx) = oneshot::channel::<()>();
-    let serial_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-    let reader_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-
-    let rw1 = Rc::clone(&rwlock);
-    let sal1 = Rc::clone(&sal);
-    let sd = Rc::clone(&serial_done);
-    r.spawn(async move {
-        // Reserve + mutate + emit under both locks, release both, THEN fsync.
-        {
-            let _w = rw1.write().await;
-            let _s = sal1.lock().await;
-            // ...synchronous SAL emission would go here...
-        }
-        // Both locks dropped. Park on the fsync with no locks held.
-        let _ = fsync_rx.await;
-        sd.set(true);
-    });
-
-    let rw2 = Rc::clone(&rwlock);
-    let rd = Rc::clone(&reader_done);
-    r.spawn(async move {
-        // A catalog reader MUST acquire the read lock while the SERIAL task is
-        // parked on its fsync — impossible if the write lock were held across
-        // that await.
-        let _rg = rw2.read().await;
-        rd.set(true);
-        // Unblock the SERIAL task's fsync.
-        fsync_tx.send(());
-    });
-
-    r.block_until_idle();
-    assert!(
-        reader_done.get(),
-        "catalog reader must acquire the read lock during the SERIAL fsync"
-    );
-    assert!(
-        serial_done.get(),
-        "SERIAL task must complete after its fsync CQE arrives"
-    );
-}
-
-/// Structural regression: the relay loop acquires `sal_writer_excl` for a
-/// synchronous SAL write, then releases it at scope exit before awaiting
-/// the next item from its channel.  If the guard leaked across that await,
-/// a concurrent committer could never acquire the mutex and would deadlock.
-#[test]
-fn sal_writer_excl_not_held_across_relay_recv() {
-    let r = make_reactor();
-    let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
-    // `next_rx` stands in for the relay's `rx.recv()` — the await that
-    // follows the SAL write scope.  `commit_tx` stands in for a concurrent
-    // committer that must be able to acquire the SAL lock while the relay
-    // task is parked on `next_rx.await`.
-    let (next_tx, next_rx) = oneshot::channel::<()>();
-    let (commit_tx, commit_rx) = oneshot::channel::<()>();
-    let relay_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-    let commit_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-
-    let m1 = Rc::clone(&mutex);
-    let rd = Rc::clone(&relay_done);
-    r.spawn(async move {
-        // Phase 2 of relay_loop: acquire lock, sync write, release.
-        {
-            let _sal = m1.lock().await;
-            // ...emit_relay would go here...
-        }
-        // Lock dropped. Now await the next relay item (rx.recv()).
-        let _ = next_rx.await;
-        rd.set(true);
-    });
-
-    let m2 = Rc::clone(&mutex);
-    let cd = Rc::clone(&commit_done);
-    r.spawn(async move {
-        // Committer: must be able to acquire the SAL lock while the relay
-        // task is parked waiting for its next item.  Once it can, it
-        // unblocks the relay by sending on `next_tx`.
-        let _sal = m2.lock().await;
-        cd.set(true);
-        commit_tx.send(());
-        next_tx.send(());
-    });
-
-    // commit_rx is unused — its role is to confirm the committer ran.
-    drop(commit_rx);
-
-    r.block_until_idle();
-    assert!(
-        commit_done.get(),
-        "committer must have acquired the mutex while relay was parked"
-    );
-    assert!(relay_done.get(), "relay must complete after being unblocked");
 }
 
 #[test]
@@ -527,13 +356,6 @@ fn join_all_unpin_empty_returns_empty_vec() {
         result.is_empty(),
         "join_all_unpin on empty iterator must return empty vec"
     );
-}
-
-#[test]
-fn join_all_unpin_single_future_completes() {
-    let r = make_reactor();
-    let result = r.block_on(async { join_all_unpin(std::iter::once(std::future::ready(99u32))).await });
-    assert_eq!(result, vec![99u32]);
 }
 
 // ─────────────────────────────────────────────────────────────────

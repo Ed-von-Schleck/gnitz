@@ -154,15 +154,15 @@ impl IoUringRing {
         }
     }
 
-    /// Drain completed CQEs into `out`. Returns number of CQEs written.
-    /// This reads from the memory-mapped completion ring — no syscall.
+    /// Drain up to `out.len()` completed CQEs into `out`, returning how many
+    /// were written. Reads the memory-mapped completion ring — no syscall.
+    ///
+    /// `take` bounds the iterator rather than breaking inside the loop:
+    /// `CompletionQueue::next` pops the entry and advances the ring head, so a
+    /// break *after* it has yielded discards that completion permanently.
     pub(super) fn drain_cqes(&mut self, out: &mut [Cqe]) -> usize {
         let mut count = 0;
-        let cq = self.ring.completion();
-        for cqe in cq {
-            if count >= out.len() {
-                break;
-            }
+        for cqe in self.ring.completion().take(out.len()) {
             out[count] = Cqe {
                 user_data: cqe.user_data(),
                 res: cqe.result(),

@@ -138,11 +138,9 @@ struct ReactorShared {
     /// the whole of the reactor's life, and [`Self::ring`] is how every caller
     /// reaches it.
     ring: RefCell<Option<IoUringRing>>,
-    /// Live tasks keyed by a monotonically-increasing id. HashMap (not
-    /// `slab::Slab`) because same-key reinsertion is load-bearing: a
-    /// task's future may spawn new tasks during its poll, and we must
-    /// reinsert the running task at its original key so the waker hits
-    /// the right entry on the next wake.
+    /// Live tasks keyed by a monotonically-increasing id. A task's future may
+    /// spawn during its own poll, so `poll_task` takes the future out and puts
+    /// it back at the same key rather than holding a borrow across the poll.
     tasks: RefCell<FxHashMap<usize, Task>>,
     next_task_key: Cell<usize>,
     /// Tasks whose wakers fired; the reactor's main loop polls them on
@@ -194,6 +192,10 @@ struct ReactorShared {
     /// The OOM guard shared by every connection; its ceiling is resolved once
     /// at startup by [`io::resolve_inbound_cap`]. See [`io::InboundBudget`].
     inbound: Rc<io::InboundBudget>,
+    /// Per-frame client-egress deadline, resolved once by
+    /// [`conn::resolve_client_send_timeout`]. Per-reactor rather than global so
+    /// a test can shorten its own without reaching another's.
+    client_send_timeout: Cell<std::time::Duration>,
     /// Accepted `(conn_fd, listener_fd)` pairs the kernel has delivered but the
     /// accept loop has not claimed. The listener fd rides the multishot-accept
     /// SQE's udata `id` field, so the accept loop can route AF_UNIX vs TLS
@@ -248,10 +250,6 @@ impl ReactorShared {
     /// within `ID_MASK` so packing it into a CQE's `user_data` is lossless.
     fn alloc_op_id(&self) -> u64 {
         bump_id(&self.next_op_id, 1, ID_MASK)
-    }
-
-    fn num_workers(&self) -> usize {
-        self.w2m.get().expect("w2m not attached").num_workers()
     }
 }
 
@@ -352,6 +350,7 @@ impl Reactor {
             next_op_id: Cell::new(1),
             conns: RefCell::new(FxHashMap::default()),
             inbound: Rc::new(io::InboundBudget::new(io::resolve_inbound_cap())),
+            client_send_timeout: Cell::new(conn::resolve_client_send_timeout()),
             accepts: RefCell::new(WakeQueue::default()),
             sends: ParkMap::default(),
             raw_recvs: ParkMap::default(),
@@ -519,10 +518,14 @@ impl Reactor {
         self.drain_all_w2m();
     }
 
-    /// Drain every worker's ring.
+    /// Drain every worker's ring. A no-op before `attach_w2m`, so callers on
+    /// the tick path need no guard of their own.
     fn drain_all_w2m(&self) {
-        for w in 0..self.inner.num_workers() {
-            self.drain_w2m_for_worker(w);
+        let Some(w2m) = self.inner.w2m.get() else {
+            return;
+        };
+        for w in 0..w2m.num_workers() {
+            self.drain_w2m_for_worker(w2m, w);
         }
     }
 
@@ -581,18 +584,22 @@ impl Reactor {
         }
     }
 
-    /// Drive the reactor until the task slab is empty. Blocks.
+    /// Drive the reactor until the task slab is empty.
+    ///
+    /// Bounded: the tests that use this are the ones guarding against lost
+    /// wakes and lock deadlocks, and an unbounded loop would turn each of those
+    /// regressions into a wedged test run rather than a failure. Ticks
+    /// non-blocking, so a task waiting only on another task still progresses.
     #[cfg(test)]
     fn block_until_idle(&self) {
-        while !self.inner.tasks.borrow().is_empty() {
-            self.tick(true);
+        const MAX_TICKS: usize = 10_000;
+        for _ in 0..MAX_TICKS {
+            if self.inner.tasks.borrow().is_empty() {
+                return;
+            }
+            self.tick(false);
         }
-    }
-
-    /// True while at least one task is alive in the slab.
-    #[cfg(test)]
-    fn has_pending_tasks(&self) -> bool {
-        !self.inner.tasks.borrow().is_empty()
+        panic!("reactor: {MAX_TICKS} ticks without reaching idle — lost wake or deadlock");
     }
 
     /// Drain every unread W2M slot for worker `w` and route each reply:
@@ -602,12 +609,7 @@ impl Reactor {
     ///
     /// The RAII `W2mSlot` advances `release_cursor` on drop so the worker
     /// can reuse the ring space immediately after decoding completes.
-    fn drain_w2m_for_worker(&self, w: usize) {
-        let w2m = self
-            .inner
-            .w2m
-            .get()
-            .expect("drain_w2m_for_worker called before attach_w2m");
+    fn drain_w2m_for_worker(&self, w2m: &W2mReceiver, w: usize) {
         while let Some(slot) = w2m.try_read_slot(w) {
             // Scan-slot intercept on the raw ring prefix — see
             // `SCAN_REQ_ID_FLAG`: no decode, no `Batch`, no hash probe.
@@ -670,6 +672,13 @@ impl Reactor {
     /// every `RecvBuf` it charges.
     pub(crate) fn inbound(&self) -> &Rc<io::InboundBudget> {
         &self.inner.inbound
+    }
+
+    /// Shorten this reactor's client-egress deadline, for a test that has to
+    /// wait one out.
+    #[cfg(test)]
+    fn set_client_send_timeout(&self, d: std::time::Duration) {
+        self.inner.client_send_timeout.set(d);
     }
 }
 

@@ -49,32 +49,18 @@ impl SendPayload for Vec<u8> {
     }
 }
 
-/// Cached [`client_send_timeout`] in milliseconds; `0` = not yet read.
-static CLIENT_SEND_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Per-frame wall-clock deadline for client egress, read once from
-/// `GNITZ_CLIENT_SEND_TIMEOUT_MS` (default 30 s). The deadline is per-frame, so
-/// a client making steady progress across a large train is never penalised —
-/// only one that makes zero progress for the full window (a stalled or
-/// maliciously zero-window peer) is evicted. Generous by default so ordinary
-/// transient congestion never sheds a healthy client; e2e tests shrink it to
-/// bound the freeze window they assert on.
-fn client_send_timeout() -> std::time::Duration {
-    use std::sync::atomic::Ordering::Relaxed;
-    let mut ms = CLIENT_SEND_TIMEOUT_MS.load(Relaxed);
-    if ms == 0 {
-        ms = gnitz_engine::foundation::env::env_num("GNITZ_CLIENT_SEND_TIMEOUT_MS", 30_000);
-        CLIENT_SEND_TIMEOUT_MS.store(ms, Relaxed);
-    }
-    std::time::Duration::from_millis(ms)
-}
-
-/// Shorten the deadline for a test that has to wait one out. Overrides whatever
-/// an earlier send already cached, so it does not depend on test order; every
-/// caller sets the same value, so concurrent tests agree.
-#[cfg(test)]
-pub(super) fn force_client_send_timeout(d: std::time::Duration) {
-    CLIENT_SEND_TIMEOUT_MS.store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+/// Per-frame wall-clock deadline for client egress, read from
+/// `GNITZ_CLIENT_SEND_TIMEOUT_MS` (default 30 s) once per reactor. The deadline
+/// is per-frame, so a client making steady progress across a large train is
+/// never penalised — only one that makes zero progress for the full window (a
+/// stalled or maliciously zero-window peer) is evicted. Generous by default so
+/// ordinary transient congestion never sheds a healthy client; e2e tests shrink
+/// it to bound the freeze window they assert on.
+pub(super) fn resolve_client_send_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(gnitz_engine::foundation::env::env_num(
+        "GNITZ_CLIENT_SEND_TIMEOUT_MS",
+        30_000,
+    ))
 }
 
 /// Run one client-bound send under [`client_send_timeout`]. `Peer::send` applies
@@ -96,16 +82,11 @@ pub(crate) async fn guard_egress_deadline<F: Future<Output = i32>>(
     fut: F,
 ) -> i32 {
     let mut fut = std::pin::pin!(fut);
-    let deadline = Instant::now() + client_send_timeout();
-    match select2(fut.as_mut(), reactor.timer(deadline)).await {
+    let timeout = reactor.inner.client_send_timeout.get();
+    match select2(fut.as_mut(), reactor.timer(Instant::now() + timeout)).await {
         Either::A(rc) => rc,
         Either::B(()) => {
-            gnitz_warn!(
-                "client fd={} stalled {} past {:?}; evicting",
-                fd,
-                what,
-                client_send_timeout(),
-            );
+            gnitz_warn!("client fd={} stalled {} past {:?}; evicting", fd, what, timeout);
             shutdown(fd);
             fut.await.min(-1)
         }
@@ -364,8 +345,8 @@ impl Reactor {
         }
         // Copy the fd set into a local before the loop: the body re-borrows
         // `closing_fds` and `conns`, which would panic the RefCell if we
-        // iterated the set borrow live. The alloc only happens on a
-        // non-empty reap (rare — the `is_empty` gate above).
+        // iterated the set borrow live. An fd stays here until it is reapable,
+        // so this runs on every tick of that window, not once per close.
         let closing: Vec<i32> = self.inner.closing_fds.borrow().iter().copied().collect();
         for &fd in &closing {
             // Dropping the `Conn` frees every undrained `RecvBuf` — the

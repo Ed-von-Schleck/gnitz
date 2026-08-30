@@ -1,11 +1,16 @@
 //! Park slots: where a reactor future waits for a CQE-delivered result.
 //!
-//! Timer, reply, fsync, send and raw-recv are one machine — submit an op, park
+//! Timer, reply, fsync, send and raw-recv are one machine — start an op, park
 //! its result, wake the awaiter — so they share this map instead of spelling it
-//! out per family. The entry is created when the op is submitted and removed
-//! when its result is collected or discarded, so **entry presence is op
-//! liveness**: a completion that finds no entry, or an abandoned one, has
-//! nothing to deliver and retires whatever the op carried.
+//! out per family. An entry lives from the op's start until its result is
+//! collected or discarded, so **entry presence is op liveness**: a completion
+//! that finds no entry, or an abandoned one, has nothing to deliver and retires
+//! whatever the op carried.
+//!
+//! For the four kernel families the entry spans the SQE, and the CQE is what
+//! ends it. `replies` is the exception: a worker that dies never sends the reply
+//! that would retire its slot, so the entry spans the [`super::ReplyLease`]
+//! instead, which `close`s it rather than abandoning it.
 
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
@@ -153,13 +158,6 @@ impl<T, A> ParkMap<T, A> {
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.ops.borrow().len()
-    }
-
-    /// Take `id`'s parked result without resolving a future, leaving the slot
-    /// open. Lets a test drive a completion handler on its own.
-    #[cfg(test)]
-    pub(super) fn take_result(&self, id: u64) -> Option<T> {
-        self.ops.borrow_mut().get_mut(&id)?.result.take()
     }
 
     #[cfg(test)]
