@@ -2,7 +2,7 @@
 // of PI meant to be replaced with std::f64::consts::PI.
 #![allow(clippy::approx_constant)]
 
-use gnitz_wire::{type_code, ExprOp, TrimMode, TypeCode};
+use gnitz_wire::{type_code, ExprOp, FixedInt, TrimMode};
 use std::collections::BTreeSet;
 
 // `tests/program.rs` is `#[path]`-attached to `program.rs`, so `super` is that
@@ -14,6 +14,13 @@ use crate::test_support::{
     schema_pk_strings, TestSchema, TestView,
 };
 use crate::{CmpOp, Evaluator, ExprValidateErr, Instr, LogicalInstr, LogicalProgram, StrOp};
+
+/// The phrase a `ColKindMismatch` renders for `kind`, read from its one source
+/// rather than re-spelled here — so widening a kind's predicate without its
+/// wording fails these tests instead of passing them.
+fn type_phrase(kind: ColKind) -> &'static str {
+    kind.type_test().expect("a kind whose rejection has a sentence").1
+}
 
 /// Run `ev` at m=1 over `(mb, row)` and report
 /// `(result value or NULL, EMIT null mask, EMIT values)` — the map-side read,
@@ -626,10 +633,10 @@ fn from_wire_rejects_an_unknown_opcode() {
 }
 
 // The rendering the planner's `Unsupported` and the engine's `CREATE VIEW`
-// rejection both print: one wording for both. The register cap and the column
-// mismatch are the variants a working query can newly hit, so each gets a
-// sentence rather than a struct dump — `ColKind`'s fields are private, so its
-// `Debug` form would name them to a client who cannot act on either.
+// rejection both print: one wording for both. The register cap and the two
+// column rejections are the variants a working query can newly hit, so each gets
+// a sentence rather than a struct dump — a `Debug` dump would name internals to
+// a client who cannot act on any of them.
 #[test]
 fn validate_err_display_names_the_register_limit() {
     assert_eq!(
@@ -639,8 +646,9 @@ fn validate_err_display_names_the_register_limit() {
             crate::MAX_REGS
         )
     );
-    // Both axes of the requirement: its type, and — since a PK column is exactly
-    // what a client is likely to have named — whether a PK column is admissible.
+    // The type half of the requirement. The region half is its own variant, and
+    // its own sentence below — a PK column is exactly what a client is likely to
+    // have named.
     let mismatch = |want| {
         ExprValidateErr::ColKindMismatch {
             col: 2,
@@ -650,13 +658,16 @@ fn validate_err_display_names_the_register_limit() {
         .to_string()
     };
     assert_eq!(
-        mismatch(ColKind::FIXED_INT.describe()),
+        mismatch(type_phrase(ColKind::FixedIntCol)),
         "column 2 (type code 8) cannot be used here; this operator needs a fixed-width integer column"
     );
     assert_eq!(
-        mismatch(ColKind::FLOAT.describe()),
-        "column 2 (type code 8) cannot be used here; \
-         this operator needs a floating-point column that is not part of the primary key"
+        mismatch(type_phrase(ColKind::FloatPayload)),
+        "column 2 (type code 8) cannot be used here; this operator needs a floating-point column"
+    );
+    assert_eq!(
+        ExprValidateErr::ColNotPayload { col: 0 }.to_string(),
+        "column 0 is part of the primary key; this operator needs a payload column"
     );
     // Everything else is an internal-shape violation with no user action:
     // rendered as its Debug form.
@@ -716,7 +727,7 @@ fn validate_rejects_an_out_of_range_column() {
     let s3 = schema_pk_ints(2, true);
     let prog = LogicalProgram::from_wire(&[1, 0, 200, 0], 1, 0, vec![]).unwrap();
     assert_eq!(
-        prog.validate(Some(&s3), None),
+        prog.validate(&s3, None),
         Err(ExprValidateErr::ColOutOfRange {
             col: 200,
             num_columns: 3,
@@ -738,7 +749,7 @@ fn validate_rejects_a_pk_column_for_a_payload_only_opcode() {
     for (code, consts) in cases {
         let prog = LogicalProgram::from_wire(code, 1, 0, consts.clone()).unwrap();
         assert_eq!(
-            prog.validate(Some(&s_pk), None),
+            prog.validate(&s_pk, None),
             Err(ExprValidateErr::ColNotPayload { col: 0 }),
             "opcode {} must reject a PK source column",
             code[0]
@@ -753,11 +764,11 @@ fn validate_rejects_a_wide_column_register_load() {
     let schema = TestSchema::new(&[(type_code::U64, false), (type_code::U128, true)], &[0]);
     let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
     assert_eq!(
-        prog.validate(Some(&schema), None),
+        prog.validate(&schema, None),
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
             type_code: type_code::U128,
-            want: ColKind::FIXED_INT.describe(),
+            want: type_phrase(ColKind::FixedIntCol),
         })
     );
 }
@@ -772,11 +783,11 @@ fn load_col_int_requires_a_fixed_int_column() {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
         assert_eq!(
-            prog.validate(Some(&schema), None),
+            prog.validate(&schema, None),
             Err(ExprValidateErr::ColKindMismatch {
                 col: 1,
                 type_code: tc,
-                want: ColKind::FIXED_INT.describe(),
+                want: type_phrase(ColKind::FixedIntCol),
             }),
             "LOAD_COL_INT must reject type code {tc}"
         );
@@ -794,7 +805,7 @@ fn load_col_int_requires_a_fixed_int_column() {
     ] {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
-        assert_eq!(prog.validate(Some(&schema), None), Ok(0), "type code {tc}");
+        assert_eq!(prog.validate(&schema, None), Ok(()), "type code {tc}");
     }
 }
 
@@ -807,7 +818,7 @@ fn load_col_float_requires_a_float_column() {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         LogicalProgram::from_wire(&[2, 0, 1, 0], 1, 0, vec![])
             .unwrap()
-            .validate(Some(&schema), None)
+            .validate(&schema, None)
     };
     for tc in [type_code::U16, type_code::U64, type_code::STRING] {
         assert_eq!(
@@ -815,13 +826,13 @@ fn load_col_float_requires_a_float_column() {
             Err(ExprValidateErr::ColKindMismatch {
                 col: 1,
                 type_code: tc,
-                want: ColKind::FLOAT.describe(),
+                want: type_phrase(ColKind::FloatPayload),
             }),
             "LOAD_COL_FLOAT must reject type code {tc}"
         );
     }
-    assert_eq!(case(type_code::F32), Ok(0));
-    assert_eq!(case(type_code::F64), Ok(0));
+    assert_eq!(case(type_code::F32), Ok(()));
+    assert_eq!(case(type_code::F64), Ok(()));
 }
 
 /// The string compares read 16-byte German-string cells with `col_data(pi, 16)`,
@@ -833,31 +844,31 @@ fn str_opcodes_require_a_german_string_column() {
     let vs_const = |a: u8| {
         LogicalProgram::from_wire(&[40, 0, 1, 0], 1, 0, vec![b"x".to_vec()])
             .unwrap()
-            .validate(Some(&schema(a, type_code::STRING)), None)
+            .validate(&schema(a, type_code::STRING), None)
     };
     assert_eq!(
         vs_const(type_code::U64),
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
             type_code: type_code::U64,
-            want: ColKind::GERMAN_STRING.describe(),
+            want: type_phrase(ColKind::StringPayload),
         })
     );
-    assert_eq!(vs_const(type_code::STRING), Ok(0));
-    assert_eq!(vs_const(type_code::BLOB), Ok(0));
+    assert_eq!(vs_const(type_code::STRING), Ok(()));
+    assert_eq!(vs_const(type_code::BLOB), Ok(()));
 
     // STR_COL_EQ_COL (43) col_a=1 col_b=2 — both operands are checked.
     let vs_col = |a: u8, b: u8| {
         LogicalProgram::from_wire(&[43, 0, 1, 2], 1, 0, vec![])
             .unwrap()
-            .validate(Some(&schema(a, b)), None)
+            .validate(&schema(a, b), None)
     };
     assert_eq!(
         vs_col(type_code::U64, type_code::STRING),
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
             type_code: type_code::U64,
-            want: ColKind::GERMAN_STRING.describe(),
+            want: type_phrase(ColKind::StringPayload),
         })
     );
     assert_eq!(
@@ -865,10 +876,10 @@ fn str_opcodes_require_a_german_string_column() {
         Err(ExprValidateErr::ColKindMismatch {
             col: 2,
             type_code: type_code::U64,
-            want: ColKind::GERMAN_STRING.describe(),
+            want: type_phrase(ColKind::StringPayload),
         })
     );
-    assert_eq!(vs_col(type_code::STRING, type_code::BLOB), Ok(0));
+    assert_eq!(vs_col(type_code::STRING, type_code::BLOB), Ok(()));
 }
 
 /// `IsNull`/`IsNotNull` read the NULL bitmap and nothing else, so any payload
@@ -880,7 +891,7 @@ fn null_tests_accept_any_payload_column() {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         for op in [30u32, 31] {
             let prog = LogicalProgram::from_wire(&[op, 0, 1, 0], 1, 0, vec![]).unwrap();
-            assert_eq!(prog.validate(Some(&schema), None), Ok(0), "opcode {op} type {tc}");
+            assert_eq!(prog.validate(&schema, None), Ok(()), "opcode {op} type {tc}");
         }
     }
 }
@@ -897,7 +908,7 @@ fn copy_col_admits_only_a_widening_destination() {
         // COPY_COL (34) src_col=1 out=0.
         LogicalProgram::from_wire(&[34, 0, 1, 0], 0, 0, vec![])
             .unwrap()
-            .validate(Some(&in_schema), Some(&out_schema))
+            .validate(&in_schema, Some(&out_schema))
     };
     for (src, dst) in [
         (type_code::I64, type_code::I64),
@@ -909,7 +920,7 @@ fn copy_col_admits_only_a_widening_destination() {
         (type_code::U32, type_code::I64),
         (type_code::U8, type_code::I16),
     ] {
-        assert_eq!(pair(src, dst), Ok(0), "{src} -> {dst} must be accepted");
+        assert_eq!(pair(src, dst), Ok(()), "{src} -> {dst} must be accepted");
     }
     for (src, dst) in [
         (type_code::STRING, type_code::U64),
@@ -934,9 +945,9 @@ fn copy_col_admits_only_a_widening_destination() {
     let in_pk = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
     let out_pk = TestSchema::with_pk_at(0, &[type_code::I64, type_code::U64]);
     let prog = LogicalProgram::from_wire(&[34, 0, 0, 0], 0, 0, vec![]).unwrap();
-    assert_eq!(prog.validate(Some(&in_pk), Some(&out_pk)), Ok(0));
+    assert_eq!(prog.validate(&in_pk, Some(&out_pk)), Ok(()));
     // Both output-side checks are inert for a filter (`out_schema = None`).
-    assert_eq!(prog.validate(Some(&in_pk), None), Ok(0));
+    assert_eq!(prog.validate(&in_pk, None), Ok(()));
 }
 
 /// EMIT stores a whole 8-byte register image: a 16-byte slot panics on the first
@@ -950,10 +961,10 @@ fn an_emit_slot_must_be_eight_bytes() {
         // EMIT (32) src=0 out=0.
         LogicalProgram::from_wire(&[3, 0, 0, 0, 32, 0, 0, 0], 1, 0, vec![])
             .unwrap()
-            .validate(Some(&schema), Some(&schema))
+            .validate(&schema, Some(&schema))
     };
     for tc in [type_code::I64, type_code::U64, type_code::F64] {
-        assert_eq!(case(tc), Ok(0), "type code {tc}");
+        assert_eq!(case(tc), Ok(()), "type code {tc}");
     }
     for tc in [type_code::U128, type_code::F32] {
         assert_eq!(
@@ -981,14 +992,14 @@ fn output_indices_are_checked_only_for_a_map() {
     // COPY_COL (34) src_col=0 out=200: rejected as a MAP (out_schema Some).
     let prog = LogicalProgram::from_wire(&[34, 0, 0, 200], 0, 0, vec![]).unwrap();
     assert_eq!(
-        prog.validate(Some(&in_schema), Some(&out_schema)),
+        prog.validate(&in_schema, Some(&out_schema)),
         Err(ExprValidateErr::OutputIdxOutOfRange {
             out: 200,
             num_payload_cols: 1,
         })
     );
     // The same output opcode in a FILTER (out_schema None) is a harmless no-op.
-    assert_eq!(prog.validate(Some(&in_schema), None), Ok(0));
+    assert_eq!(prog.validate(&in_schema, None), Ok(()));
 }
 
 /// Output coverage: with an `out_schema`, every declared payload slot must be
@@ -1003,13 +1014,13 @@ fn validate_rejects_an_unwritten_output_slot() {
 
     // Both slots written — accepted.
     assert_eq!(
-        map(&[34, 0, 1, 0, 34, 0, 2, 1]).validate(Some(&schema), Some(&schema)),
-        Ok(0)
+        map(&[34, 0, 1, 0, 34, 0, 2, 1]).validate(&schema, Some(&schema)),
+        Ok(())
     );
 
     // Only slot 0 written.
     assert_eq!(
-        map(&[34, 0, 1, 0]).validate(Some(&schema), Some(&schema)),
+        map(&[34, 0, 1, 0]).validate(&schema, Some(&schema)),
         Err(ExprValidateErr::OutputSlotUnwritten {
             written: 0b01,
             num_payload_cols: 2,
@@ -1018,7 +1029,7 @@ fn validate_rejects_an_unwritten_output_slot() {
 
     // Two CopyCols, both onto slot 0: the count matches but slot 1 is unwritten.
     assert_eq!(
-        map(&[34, 0, 1, 0, 34, 0, 2, 0]).validate(Some(&schema), Some(&schema)),
+        map(&[34, 0, 1, 0, 34, 0, 2, 0]).validate(&schema, Some(&schema)),
         Err(ExprValidateErr::OutputSlotUnwritten {
             written: 0b01,
             num_payload_cols: 2,
@@ -1026,7 +1037,7 @@ fn validate_rejects_an_unwritten_output_slot() {
     );
 
     // A predicate over the same program is unaffected — no output plan.
-    assert_eq!(map(&[34, 0, 1, 0]).validate(Some(&schema), None), Ok(0));
+    assert_eq!(map(&[34, 0, 1, 0]).validate(&schema, None), Ok(()));
 }
 
 #[test]
@@ -1205,7 +1216,7 @@ fn classifier_pure_conjunction_filter() {
 /// there. It must be rejected before eval, where it would index a bounds table
 /// that has no arm for it.
 #[test]
-fn validate_rejects_a_forged_cast_target() {
+fn decode_rejects_a_forged_cast_target() {
     for op in [ExprOp::IntCast.as_wire(), ExprOp::FloatToInt.as_wire()] {
         for tc in [
             0u32,
@@ -1214,7 +1225,7 @@ fn validate_rejects_a_forged_cast_target() {
             type_code::F64 as u32,
             255,
             // A `>= 255` word must not be truncated into a valid code on the
-            // way in: the full u32 has to reach `validate`, or these would
+            // way in: the full u32 has to reach the narrowing, or these would
             // pass as I64.
             0x100u32 | type_code::I64 as u32,
             0x1_0000u32 | type_code::I64 as u32,
@@ -1321,12 +1332,12 @@ fn narrowing_casts_manufacture_null_but_pure_transforms_do_not() {
         LogicalInstr::IntCast {
             dst: 1,
             a: 0,
-            tc: type_code::I8 as u32,
+            fi: FixedInt::I8,
         },
         LogicalInstr::FloatToInt {
             dst: 1,
             a: 0,
-            tc: type_code::I8 as u32,
+            fi: FixedInt::I8,
         },
     ] {
         assert!(!with(instr), "a narrowing cast manufactures NULL");
@@ -1441,14 +1452,10 @@ fn min_max2_compare_domain_and_u64_propagation() {
 fn int_cast_reseeds_u64_tracking_from_its_target() {
     // pk(U64), col1 = I64 (signed-tracked), col2 = U64.
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64, type_code::U64]);
-    let cmp_signed_after = |tc: u8, src_col: u32| {
+    let cmp_signed_after = |fi: FixedInt, src_col: u32| {
         let instrs = vec![
             LogicalInstr::LoadColInt { dst: 0, col: src_col },
-            LogicalInstr::IntCast {
-                dst: 1,
-                a: 0,
-                tc: tc as u32,
-            },
+            LogicalInstr::IntCast { dst: 1, a: 0, fi },
             LogicalInstr::LoadConst { dst: 2, val: 0 },
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
@@ -1467,12 +1474,12 @@ fn int_cast_reseeds_u64_tracking_from_its_target() {
             })
             .expect("the compare survives")
     };
-    assert!(!cmp_signed_after(type_code::U64, 1), "U64 target taints the dst");
+    assert!(!cmp_signed_after(FixedInt::U64, 1), "U64 target taints the dst");
     assert!(
-        cmp_signed_after(type_code::I64, 2),
+        cmp_signed_after(FixedInt::I64, 2),
         "a signed target clears a U64 source's taint"
     );
-    assert!(cmp_signed_after(type_code::I32, 1));
+    assert!(cmp_signed_after(FixedInt::I32, 1));
 }
 
 /// `src_signed` is resolved from the OPERAND's tracking, not from the target —
@@ -1486,7 +1493,7 @@ fn int_cast_records_the_source_signedness() {
             LogicalInstr::IntCast {
                 dst: 1,
                 a: 0,
-                tc: type_code::I8 as u32,
+                fi: FixedInt::I8,
             },
         ];
         let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
@@ -1739,7 +1746,7 @@ fn emit_class_must_match_its_destination_column() {
     )
     .unwrap();
     assert_eq!(
-        scalar_src.validate(Some(&in_str), Some(&str_out)),
+        scalar_src.validate(&in_str, Some(&str_out)),
         Err(ExprValidateErr::EmitClassMismatch {
             out: 0,
             type_code: type_code::STRING
@@ -1754,15 +1761,18 @@ fn emit_class_must_match_its_destination_column() {
     )
     .unwrap();
     assert_eq!(
-        str_src.validate(Some(&in_str), Some(&int_out)),
+        str_src.validate(&in_str, Some(&int_out)),
         Err(ExprValidateErr::EmitClassMismatch {
             out: 0,
             type_code: type_code::I64
         })
     );
-    // The matching pairing is accepted, and reports reg 0 as a string.
-    assert_eq!(str_src.validate(Some(&in_str), Some(&str_out)), Ok(1));
-    assert_eq!(scalar_src.validate(Some(&in_str), Some(&int_out)), Ok(0));
+    // The matching pairing is accepted, and the class mask the check read holds
+    // reg 0 to be a string for one program and a scalar for the other.
+    assert_eq!(str_src.validate(&in_str, Some(&str_out)), Ok(()));
+    assert_eq!(str_src.str_class, 1);
+    assert_eq!(scalar_src.validate(&in_str, Some(&int_out)), Ok(()));
+    assert_eq!(scalar_src.str_class, 0);
 }
 
 /// EMIT's source is exempt from the class check — its class picks the
@@ -1795,11 +1805,11 @@ fn load_col_str_requires_a_german_string_column() {
     assert_eq!(
         LogicalProgram::from_wire(&[ExprOp::LoadColStr.as_wire(), 0, 1, 0], 1, 0, vec![])
             .unwrap()
-            .validate(Some(&schema), None),
+            .validate(&schema, None),
         Err(ExprValidateErr::ColKindMismatch {
             col: 1,
             type_code: type_code::I64,
-            want: ColKind::GERMAN_STRING.describe(),
+            want: type_phrase(ColKind::StringPayload),
         })
     );
 }
@@ -1928,7 +1938,7 @@ fn two_like_opcodes_over_one_pool_index_get_a_matcher_each() {
     let like = |dst, ci| LogicalInstr::StrLike {
         dst,
         src: 0,
-        escape: b'\\' as u32,
+        escape: Some(b'\\'),
         pat_idx: 0,
         ci,
     };
@@ -1975,7 +1985,7 @@ fn string_nullability_classification() {
         vec![LogicalInstr::StrToInt {
             dst: 1,
             a: 0,
-            tc: type_code::I64 as u32,
+            fi: FixedInt::I64,
         }],
         2,
         1
@@ -2109,12 +2119,12 @@ fn every_variant() -> Vec<LogicalInstr> {
         L::FloatToInt {
             dst: 37,
             a: 38,
-            tc: TypeCode::I16 as u32,
+            fi: FixedInt::I16,
         },
         L::IntCast {
             dst: 39,
             a: 40,
-            tc: TypeCode::I32 as u32,
+            fi: FixedInt::I32,
         },
         L::Select {
             dst: 41,
@@ -2168,20 +2178,20 @@ fn every_variant() -> Vec<LogicalInstr> {
         L::StrTrim {
             dst: 77,
             a: 78,
-            mode: TrimMode::Leading.as_wire(),
+            mode: TrimMode::Leading,
             set_idx: 79,
         },
         L::StrLike {
             dst: 80,
             src: 81,
-            escape: b'!' as u32,
+            escape: Some(b'!'),
             pat_idx: 82,
             ci: false,
         },
         L::StrLike {
             dst: 83,
             src: 84,
-            escape: 0,
+            escape: None,
             pat_idx: 85,
             ci: true,
         },
@@ -2190,7 +2200,7 @@ fn every_variant() -> Vec<LogicalInstr> {
         L::StrToInt {
             dst: 90,
             a: 91,
-            tc: TypeCode::I64 as u32,
+            fi: FixedInt::I64,
         },
         L::StrToFloat { dst: 92, a: 93 },
         L::CopyCol { src_col: 94, out: 95 },

@@ -651,6 +651,21 @@ impl FixedInt {
         }
     }
 
+    /// The type code this width names — the inverse of [`Self::from_type_code`],
+    /// so a narrowed target can be written back to the wire.
+    pub const fn type_code(self) -> TypeCode {
+        match self {
+            Self::U8 => TypeCode::U8,
+            Self::I8 => TypeCode::I8,
+            Self::U16 => TypeCode::U16,
+            Self::I16 => TypeCode::I16,
+            Self::U32 => TypeCode::U32,
+            Self::I32 => TypeCode::I32,
+            Self::U64 => TypeCode::U64,
+            Self::I64 => TypeCode::I64,
+        }
+    }
+
     /// Byte width (1/2/4/8).
     ///
     /// `#[inline(always)]`: a `const fn` returning one of four constants, on the
@@ -833,6 +848,10 @@ const _: () = {
         match FixedInt::from_type_code(tc) {
             Some(fi) => {
                 assert!(matches!(kind, Some(ScalarKind::Int(_))), "a FixedInt has an Int image");
+                assert!(
+                    fi.type_code() as u8 == tc as u8,
+                    "FixedInt::type_code must invert from_type_code"
+                );
                 assert!(
                     fi.is_signed() == is_signed_int(tc as u8),
                     "FixedInt::is_signed must match the raw-code predicate"

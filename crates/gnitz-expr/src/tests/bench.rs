@@ -12,7 +12,7 @@
 //! to the one shape named rather than to their sum. [`selected`] is what makes a
 //! misspelled selector fail loudly instead of differencing to a 0 % effect.
 
-use gnitz_wire::type_code;
+use gnitz_wire::{type_code, FixedInt};
 
 use crate::batch::MORSEL;
 use crate::test_support::{
@@ -533,7 +533,7 @@ fn expr_kernel_bench() {
             LogicalInstr::IntCast {
                 dst: 1,
                 a: 0,
-                tc: type_code::I32 as u32,
+                fi: FixedInt::I32,
             },
         ],
         2,
@@ -623,7 +623,7 @@ fn expr_kernel_bench() {
             LogicalInstr::StrLike {
                 dst: 1,
                 src: 0,
-                escape: 0,
+                escape: None,
                 pat_idx: 0,
                 ci: false,
             },

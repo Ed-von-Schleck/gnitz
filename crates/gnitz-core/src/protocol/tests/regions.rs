@@ -193,7 +193,7 @@ fn the_shared_evaluator_reads_a_client_batch() {
     let mut bufs = ViewBuffers::default();
     let view = bufs.view(&batch, &schema);
 
-    // ci3 is a PK column: `LoadColInt` accepts one (`ColKind::FIXED_INT` is
+    // ci3 is a PK column: `LoadColInt` accepts one (`ColKind::FixedIntCol` is
     // not payload-only) and lowers to `Instr::LoadPk`, so this exercises
     // `locate`'s PK arm, its payload arm and the region addressing together.
     let ev = LogicalProgram::new(

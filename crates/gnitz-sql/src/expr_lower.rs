@@ -7,6 +7,7 @@
 
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, NumFunc, StrFunc, TrimMode, UnaryOp};
+use crate::types::int_cast_target;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 use gnitz_expr::{Evaluator, ExprBuilder, ExprValidateErr, FloatUnaryOp, IntUnaryOp, LogicalProgram, StrOp};
 
@@ -420,6 +421,10 @@ impl OpcodeBackend<'_> {
     /// CAST, dispatched on the source kind first, then the target — each arm
     /// leaves only the pairings the next one has to consider, so the numeric
     /// elide test at the end sees two scalar sides and nothing else.
+    ///
+    /// The three integer-target emitters take the width itself, so every arm
+    /// that reaches one narrows `to` through
+    /// [`int_cast_target`](crate::types::int_cast_target) first.
     fn cast(&mut self, expr: &BoundExpr, to: TypeCode) -> Result<(u32, ExprKind), GnitzSqlError> {
         let (r, kind) = self.lower(expr)?;
         if kind == ExprKind::Str {
@@ -430,7 +435,7 @@ impl OpcodeBackend<'_> {
                     let f = self.eb.str_to_float(r);
                     (self.eb.float_to_f32(f), ExprKind::Float)
                 }
-                _ => (self.eb.str_to_int(r, to), ExprKind::Int),
+                _ => (self.eb.str_to_int(r, int_cast_target(to)?), ExprKind::Int),
             });
         }
         if to == TypeCode::String {
@@ -459,7 +464,7 @@ impl OpcodeBackend<'_> {
             return Ok((reg, ExprKind::Float));
         }
         if kind == ExprKind::Float {
-            return Ok((self.eb.float_to_int(r, to), ExprKind::Int));
+            return Ok((self.eb.float_to_int(r, int_cast_target(to)?), ExprKind::Int));
         }
         // Elide iff the register provably already holds a value inside `to`'s
         // domain *with* `to`'s register image. The image half matters because the
@@ -473,7 +478,7 @@ impl OpcodeBackend<'_> {
         if elide {
             Ok((r, ExprKind::Int))
         } else {
-            Ok((self.eb.int_cast(r, to), ExprKind::Int))
+            Ok((self.eb.int_cast(r, int_cast_target(to)?), ExprKind::Int))
         }
     }
 
@@ -599,7 +604,7 @@ impl OpcodeBackend<'_> {
         // against — source schema for a table filter, reduce-output schema for
         // HAVING — so the int gate is correct in both, and a HAVING large-IN
         // compiles here too. Use `is_fixed_int` — the same predicate the VM's
-        // `ColKind::FIXED_INT` check applies — not `is_pk_eligible`, which wrongly
+        // `ColKind::FixedIntCol` check applies — not `is_pk_eligible`, which wrongly
         // admits U128/UUID/I128.
         if gnitz_wire::is_fixed_int(inner.infer_type(self.cols) as u8) {
             if let Some(mut values) = items.iter().map(fold_int_literal).collect::<Option<Vec<i64>>>() {

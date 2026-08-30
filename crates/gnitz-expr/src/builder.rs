@@ -8,12 +8,14 @@
 //! once in `to_wire` and read back once in `LogicalProgram::decode_quad` — both
 //! in `program.rs`, where the drift tests that hold them together also live.
 //!
-//! Everything reachable from here is infallible: a program's *validity* is
-//! decided when it is assembled into a [`LogicalProgram`], so a caller can build
-//! first and be told what is unsupported afterwards.
+//! Every method here is infallible: an operand a wire word could forge — a cast
+//! target, TRIM's mode, LIKE's escape — is a typed parameter, so the builder
+//! cannot express one, and the structural rules are decided when the
+//! instructions are assembled into a [`LogicalProgram`]. A caller builds first
+//! and is told what is unsupported afterwards.
 
 use crate::{CmpOp, ExprValidateErr, LogicalInstr, LogicalInstr as L, LogicalProgram, StrOp};
-use gnitz_wire::{TrimMode, TypeCode};
+use gnitz_wire::{FixedInt, TrimMode};
 
 /// A compiled expression program: a flat list of 4-word instructions
 /// (opcode, dst_reg, arg1, arg2) plus metadata for embedding in filter params.
@@ -197,19 +199,19 @@ impl ExprBuilder {
         self.un(|dst, a| L::FloatToF32 { dst, a }, src)
     }
 
-    pub fn int_cast(&mut self, src: u32, to: TypeCode) -> u32 {
+    pub fn int_cast(&mut self, src: u32, to: FixedInt) -> u32 {
         self.push(|dst| L::IntCast {
             dst,
             a: src as u16,
-            tc: to as u32,
+            fi: to,
         })
     }
 
-    pub fn float_to_int(&mut self, src: u32, to: TypeCode) -> u32 {
+    pub fn float_to_int(&mut self, src: u32, to: FixedInt) -> u32 {
         self.push(|dst| L::FloatToInt {
             dst,
             a: src as u16,
-            tc: to as u32,
+            fi: to,
         })
     }
 
@@ -395,7 +397,7 @@ impl ExprBuilder {
         self.push(|dst| L::StrTrim {
             dst,
             a: src as u16,
-            mode: mode.as_wire(),
+            mode,
             set_idx,
         })
     }
@@ -408,7 +410,7 @@ impl ExprBuilder {
         self.push(|dst| L::StrLike {
             dst,
             src: src as u16,
-            escape: escape.unwrap_or(0) as u32,
+            escape,
             pat_idx,
             ci,
         })
@@ -429,11 +431,11 @@ impl ExprBuilder {
         self.un(|dst, a| L::FloatToStr { dst, a }, a)
     }
 
-    pub fn str_to_int(&mut self, a: u32, to: TypeCode) -> u32 {
+    pub fn str_to_int(&mut self, a: u32, to: FixedInt) -> u32 {
         self.push(|dst| L::StrToInt {
             dst,
             a: a as u16,
-            tc: to as u32,
+            fi: to,
         })
     }
 

@@ -47,8 +47,8 @@ impl LogicalProgram {
     /// own a result register. Resolved with `result_reg` eligible for the
     /// bit_only path, which [`Evaluator::filter`] reads as packed bits.
     pub fn resolve_filter(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
-        let str_class = self.validate_predicate(schema)?;
-        Ok(self.into_evaluator(schema, None, Role::Filter, str_class))
+        self.validate_predicate(schema)?;
+        Ok(self.into_evaluator(schema, None, Role::Filter))
     }
 
     /// A map: checked against both the schema it reads and the one it writes,
@@ -58,8 +58,8 @@ impl LogicalProgram {
         in_schema: &dyn SchemaFacts,
         out_schema: &dyn SchemaFacts,
     ) -> Result<Evaluator, ExprValidateErr> {
-        let str_class = self.validate(Some(in_schema), Some(out_schema))?;
-        Ok(self.into_evaluator(in_schema, Some(out_schema), Role::Map, str_class))
+        self.validate(in_schema, Some(out_schema))?;
+        Ok(self.into_evaluator(in_schema, Some(out_schema), Role::Map))
     }
 
     /// A scalar expression evaluated row at a time through
@@ -74,20 +74,14 @@ impl LogicalProgram {
     /// `bool_pack_mask` covers every bit_only register, so `row0_value` finds
     /// the packed bit.
     pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
-        let str_class = self.validate_result_reg(schema)?;
-        Ok(self.into_evaluator(schema, None, Role::Scalar, str_class))
+        self.validate_result_reg(schema)?;
+        Ok(self.into_evaluator(schema, None, Role::Scalar))
     }
 
     /// `out_schema` is `Some` only for a map; the other two roles write no
     /// output slots and so resolve no copy destination widths.
-    fn into_evaluator(
-        self,
-        schema: &dyn SchemaFacts,
-        out_schema: Option<&dyn SchemaFacts>,
-        role: Role,
-        str_class: u64,
-    ) -> Evaluator {
-        let prog = self.resolve_program(schema, out_schema, role, str_class);
+    fn into_evaluator(self, schema: &dyn SchemaFacts, out_schema: Option<&dyn SchemaFacts>, role: Role) -> Evaluator {
+        let prog = self.resolve_program(schema, out_schema, role);
         let scratch = RefCell::new(EvalScratch::new(&prog));
         Evaluator { prog, scratch }
     }

@@ -5,7 +5,7 @@
 
 use std::ops::Neg;
 
-use gnitz_wire::{type_code, FixedInt};
+use gnitz_wire::{type_code, FixedInt, TrimMode};
 
 use super::{
     decode_f64, encode_f64, eval_batch, with_str_bufs, EvalScratch, MAX_STR_COL_BUFS, MORSEL, NULL_WORDS_PER_REG,
@@ -515,7 +515,7 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
     let out = run_unary_rows(type_code::I64, &vals, &nulls, |dst, a| LogicalInstr::IntCast {
         dst,
         a,
-        tc: type_code::I8 as u32,
+        fi: FixedInt::I8,
     });
     assert!(out[0].1, "200 out of I8");
     assert_eq!(out[1], (-1, false));
@@ -527,7 +527,7 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
     let out = run_unary_rows(type_code::I64, &vals, &nulls, |dst, a| LogicalInstr::IntCast {
         dst,
         a,
-        tc: type_code::U64 as u32,
+        fi: FixedInt::U64,
     });
     assert_eq!(out[0], (200, false));
     assert!(out[1].1, "-1 has no U64 image");
@@ -539,7 +539,7 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
         LogicalInstr::IntCast {
             dst,
             a,
-            tc: type_code::I64 as u32,
+            fi: FixedInt::I64,
         }
     });
     assert_eq!(out[0], (5, false), "5 fits I64");
@@ -564,7 +564,7 @@ fn float_to_int_truncates_and_bounds_exclusively() {
     let out = run_unary_rows(type_code::I64, &vals, &nulls, |dst, a| LogicalInstr::FloatToInt {
         dst,
         a,
-        tc: type_code::I64 as u32,
+        fi: FixedInt::I64,
     });
     assert_eq!(out[0], (2, false), "truncate toward zero");
     assert_eq!(out[1], (-2, false), "truncate toward zero");
@@ -582,7 +582,7 @@ fn float_to_int_truncates_and_bounds_exclusively() {
     let out = run_unary_rows(type_code::I64, &vals, &[false; 4], |dst, a| LogicalInstr::FloatToInt {
         dst,
         a,
-        tc: type_code::I8 as u32,
+        fi: FixedInt::I8,
     });
     assert_eq!(out[0], (127, false));
     assert!(out[1].1);
@@ -1134,7 +1134,7 @@ fn substring_of_a_computed_string_is_a_sub_view_of_the_arena() {
 fn trim_strips_the_selected_ends_only() {
     let set = b"xy".to_vec();
     let vals: &[&[u8]] = &[b"xyaxybyx", b"xyxy", b"", b"abc"];
-    let run = |mode: u32| {
+    let run = |mode: TrimMode| {
         let (ev, view) = str_prog(vals, &[false; 4], vec![set.clone()], |a| {
             vec![LogicalInstr::StrTrim {
                 dst: 1,
@@ -1145,7 +1145,7 @@ fn trim_strips_the_selected_ends_only() {
         });
         (0..vals.len()).map(|i| row_str(&ev, &view, i).0).collect::<Vec<_>>()
     };
-    let (both, leading, trailing) = (run(0), run(1), run(2));
+    let (both, leading, trailing) = (run(TrimMode::Both), run(TrimMode::Leading), run(TrimMode::Trailing));
     assert_eq!(leading, [b"axybyx".to_vec(), b"".into(), b"".into(), b"abc".into()]);
     assert_eq!(trailing, [b"xyaxyb".to_vec(), b"".into(), b"".into(), b"abc".into()]);
     assert_eq!(both, [b"axyb".to_vec(), b"".into(), b"".into(), b"abc".into()]);
@@ -1171,7 +1171,7 @@ fn like_over_inline_and_heap_cells_with_a_null_row() {
             vec![LogicalInstr::StrLike {
                 dst: 1,
                 src: a,
-                escape: b'\\' as u32,
+                escape: Some(b'\\'),
                 pat_idx: 0,
                 ci,
             }]
@@ -1573,7 +1573,7 @@ fn text_to_int_accepts_only_plain_decimal_and_range_checks_the_target() {
         vec![LogicalInstr::StrToInt {
             dst: 1,
             a,
-            tc: type_code::I64 as u32,
+            fi: FixedInt::I64,
         }]
     });
     for (i, (s, want)) in cases.iter().enumerate() {
@@ -1588,7 +1588,7 @@ fn text_to_int_accepts_only_plain_decimal_and_range_checks_the_target() {
         vec![LogicalInstr::StrToInt {
             dst: 1,
             a,
-            tc: type_code::I8 as u32,
+            fi: FixedInt::I8,
         }]
     });
     assert_eq!(
@@ -1603,16 +1603,12 @@ fn text_to_int_accepts_only_plain_decimal_and_range_checks_the_target() {
 fn text_to_u64_seeds_the_unsigned_tracking() {
     let schema = schema_pk_strings(1, true);
     let view = make_string_view(&schema, &[&[u64::MAX.to_string().as_bytes()]]);
-    let cmp = |tc: u8| {
+    let cmp = |fi: FixedInt| {
         let ev = scalar_prog(
             &schema,
             vec![
                 LogicalInstr::LoadColStr { dst: 0, col: 1 },
-                LogicalInstr::StrToInt {
-                    dst: 1,
-                    a: 0,
-                    tc: tc as u32,
-                },
+                LogicalInstr::StrToInt { dst: 1, a: 0, fi },
                 LogicalInstr::LoadConst { dst: 2, val: 5 },
                 LogicalInstr::Cmp {
                     op: CmpOp::Gt,
@@ -1627,10 +1623,10 @@ fn text_to_u64_seeds_the_unsigned_tracking() {
         );
         ev.eval_row(&view, 0)
     };
-    assert_eq!(cmp(type_code::U64), Some(1), "u64::MAX > 5 under unsigned order");
+    assert_eq!(cmp(FixedInt::U64), Some(1), "u64::MAX > 5 under unsigned order");
     // The same text does not fit I64 at all, so the parse itself NULLs the row —
     // there is no signed reading of this value to compare wrongly.
-    assert!(cmp(type_code::I64).is_none());
+    assert!(cmp(FixedInt::I64).is_none());
 }
 
 #[test]
