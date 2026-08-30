@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import random
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid() -> str:
-    return str(random.randint(100000, 999999))
 
 
 def _scan_positive(client, tid):

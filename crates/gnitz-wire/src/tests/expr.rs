@@ -2,17 +2,18 @@ use super::*;
 
 #[test]
 fn round_trip_program_with_strings() {
-    let code = [1u32, 2, 3, 4, 5, 6, 7, 8];
+    let code = [1u32, 2, 3, 4, 5, 6];
+    let sinks = [0u32, 7, 1, 9];
     // Empty string, multi-byte UTF-8, and a non-UTF-8 byte string (byte-transparency).
     let s0: &[u8] = b"alpha";
     let s1: &[u8] = b"";
     let s2: &[u8] = "längre sträng".as_bytes();
     let s3: &[u8] = &[0xFF, 0x00, 0xFE, 0x80];
-    let blob = encode_expr_blob(5, 4, &code, &[s0, s1, s2, s3]);
+    let blob = encode_expr_blob(4, &code, &sinks, &[s0, s1, s2, s3]);
     let dec = decode_expr_blob(&blob).unwrap();
-    assert_eq!(dec.num_regs, 5);
     assert_eq!(dec.result_reg, 4);
     assert_eq!(dec.code, code);
+    assert_eq!(dec.sinks, sinks);
     assert_eq!(
         dec.const_strings,
         vec![s0.to_vec(), s1.to_vec(), s2.to_vec(), s3.to_vec()]
@@ -20,14 +21,14 @@ fn round_trip_program_with_strings() {
 
     // The degenerate program is a valid one, not an absence.
     let dec = decode_expr_blob(&valid_empty()).expect("a valid empty program must decode");
-    assert_eq!((dec.num_regs, dec.result_reg), (0, 0));
-    assert!(dec.code.is_empty() && dec.const_strings.is_empty());
+    assert_eq!(dec.result_reg, 0);
+    assert!(dec.code.is_empty() && dec.sinks.is_empty() && dec.const_strings.is_empty());
 }
 
 /// A valid empty program; the rejection table mutates a clone of this, so each
 /// case differs from a decodable blob by exactly one flaw.
 fn valid_empty() -> Vec<u8> {
-    encode_expr_blob(0, 0, &[], &[])
+    encode_expr_blob(0, &[], &[], &[] as &[&[u8]])
 }
 
 /// Every guard in `decode_expr_blob`, against the forgery that trips it. All of

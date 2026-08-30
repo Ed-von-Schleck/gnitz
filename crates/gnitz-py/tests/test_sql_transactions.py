@@ -9,13 +9,11 @@ Distinct from `test_transactions.py`, which exercises the lower-level
 `with client.transaction()` binding on the same core buffer.
 """
 
-import random
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _schema(client):

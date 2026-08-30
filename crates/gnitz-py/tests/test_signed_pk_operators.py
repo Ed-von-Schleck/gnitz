@@ -12,14 +12,12 @@ this file fills the negative-signed-key gap end to end.
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_signed_pk_operators.py -v --tb=short
 """
-import random
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100_000, 999_999))
 
 
 def _cleanup(client, sn, tables=None, views=None):

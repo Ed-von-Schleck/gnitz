@@ -484,7 +484,7 @@ fn linear_sum_only_emptied_group_eliminated() {
 #[test]
 fn linear_sum_only_new_all_null_group_present() {
     use crate::schema::{type_code, SchemaColumn};
-    use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
+    use gnitz_expr::{CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
 
     // Input: pk(U64), grp(I64), val(I64 nullable).
     let in_schema = SchemaDescriptor::new(
@@ -520,21 +520,24 @@ fn linear_sum_only_new_all_null_group_present() {
     // NullfillSum: grp → fin payload 0; sum(col 2) / (cnn(col 3) != 0) → fin
     // payload 1 (div-by-zero marks SUM NULL when the non-null count is 0).
     let instrs = vec![
-        LogicalInstr::CopyCol { src_col: 1, out: 0 },
-        LogicalInstr::LoadColInt { dst: 0, col: 3 }, // r0 = cnn
-        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::LoadColInt { col: 3 }, // r0 = cnn
+        LogicalInstr::LoadConst { val: 0 },
         LogicalInstr::Cmp {
             op: CmpOp::Ne,
-            dst: 2,
-            a: 0,
-            b: 1,
+            a: Reg(0),
+            b: Reg(1),
         }, // r2 = (cnn != 0)
-        LogicalInstr::LoadColInt { dst: 3, col: 2 }, // r3 = sum
-        LogicalInstr::IntDiv { dst: 4, a: 3, b: 2 }, // r4 = sum / gate
-        LogicalInstr::Emit { src: 4, out: 1 },       // emit r4 → fin payload 1 (sum)
+        LogicalInstr::LoadColInt { col: 2 }, // r3 = sum
+        LogicalInstr::IntArith {
+            op: IntArithOp::Div,
+            a: Reg(3),
+            b: Reg(2),
+        }, // r4 = sum / gate
     ];
+    // fin payload 0 = grp; fin payload 1 = the gated sum.
+    let sinks = vec![Sink::Col(1), Sink::Reg(Reg(4))];
     let fin_func = crate::expr::MapPlan::from_map(
-        LogicalProgram::new(instrs, 5, 0, vec![]),
+        LogicalProgram::new(instrs, sinks, None, vec![]),
         &out_schema,
         &fin_schema,
         PkSource::Inherit,
@@ -653,7 +656,7 @@ fn count_star_only_emptied_group_eliminated() {
 #[test]
 fn test_reduce_nullable_sum_retraction_becomes_null() {
     use crate::schema::{type_code, SchemaColumn};
-    use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
+    use gnitz_expr::{CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
 
     // Input: pk(U64), grp(I64), val(I64, NULLABLE).
     let in_schema = SchemaDescriptor::new(
@@ -694,22 +697,24 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     //   emit sum-gate = sum(col 3) / (cnn(col 4) != 0) → fin payload 2.
     // div-by-zero (cnn == 0) marks the SUM NULL; div-by-1 (cnn > 0) is exact.
     let instrs = vec![
-        LogicalInstr::CopyCol { src_col: 1, out: 0 }, // grp   → fin payload 0
-        LogicalInstr::CopyCol { src_col: 2, out: 1 }, // count → fin payload 1
-        LogicalInstr::LoadColInt { dst: 0, col: 4 },  // r0 = cnn (col 4)
-        LogicalInstr::LoadConst { dst: 1, val: 0 },   // r1 = 0
+        LogicalInstr::LoadColInt { col: 4 }, // r0 = cnn (col 4)
+        LogicalInstr::LoadConst { val: 0 },  // r1 = 0
         LogicalInstr::Cmp {
             op: CmpOp::Ne,
-            dst: 2,
-            a: 0,
-            b: 1,
+            a: Reg(0),
+            b: Reg(1),
         }, // r2 = (cnn != 0) → 1/0
-        LogicalInstr::LoadColInt { dst: 3, col: 3 },  // r3 = sum (col 3)
-        LogicalInstr::IntDiv { dst: 4, a: 3, b: 2 },  // r4 = sum / gate (NULL when gate == 0)
-        LogicalInstr::Emit { src: 4, out: 2 },        // emit r4 → fin payload 2 (sum)
+        LogicalInstr::LoadColInt { col: 3 }, // r3 = sum (col 3)
+        LogicalInstr::IntArith {
+            op: IntArithOp::Div,
+            a: Reg(3),
+            b: Reg(2),
+        }, // r4 = sum / gate (NULL when gate == 0)
     ];
+    // fin payload 0 = grp, 1 = count, 2 = the gated sum.
+    let sinks = vec![Sink::Col(1), Sink::Col(2), Sink::Reg(Reg(4))];
     let fin_func = crate::expr::MapPlan::from_map(
-        LogicalProgram::new(instrs, 5, 0, vec![]),
+        LogicalProgram::new(instrs, sinks, None, vec![]),
         &out_schema,
         &fin_schema,
         PkSource::Inherit,

@@ -19,7 +19,7 @@ use crate::test_support::{
     both_arms, filter_prog, is_null_op, make_n_col_view, map_prog, passing_rows, push_payload_cols, scalar_prog,
     schema_pk_ints, schema_pk_strings, set_row_pk, FilterShape, TestSchema, TestView,
 };
-use crate::{CmpOp, Evaluator, LogicalInstr, StrOp};
+use crate::{CmpOp, ConstIdx, Evaluator, IntArithOp, LogicalInstr, Reg, Sink, StrOp};
 
 /// Assert the `GNITZ_BENCH_*` selector matched at least one of the shapes the
 /// bench built. A misspelled selector would otherwise drive nothing and
@@ -101,23 +101,24 @@ fn str_const_filter_bench() {
                 &schema,
                 vec![LogicalInstr::StrColConst {
                     op,
-                    dst: 0,
                     col: 1,
-                    const_idx: 0,
+                    const_idx: ConstIdx(0),
                 }],
-                1,
-                0,
+                Reg(0),
                 consts.clone(),
             );
             let regs = filter_prog(
                 &schema,
                 vec![
-                    LogicalInstr::LoadColStr { dst: 0, col: 1 },
-                    LogicalInstr::LoadConstStr { dst: 1, const_idx: 0 },
-                    LogicalInstr::StrCmp { op, dst: 2, a: 0, b: 1 },
+                    LogicalInstr::LoadColStr { col: 1 },
+                    LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) },
+                    LogicalInstr::StrCmp {
+                        op,
+                        a: Reg(0),
+                        b: Reg(1),
+                    },
                 ],
-                3,
-                2,
+                Reg(2),
                 consts,
             );
 
@@ -183,20 +184,15 @@ fn filter_kernel_bench() {
     let pk_filter = filter_prog(
         &pk_schema,
         vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 0 },
-            LogicalInstr::LoadConst {
-                dst: 1,
-                val: (n / 2) as i64,
-            },
+            LogicalInstr::LoadColInt { col: 0 },
+            LogicalInstr::LoadConst { val: (n / 2) as i64 },
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             },
         ],
-        3,
-        2,
+        Reg(2),
         vec![],
     );
 
@@ -212,31 +208,31 @@ fn filter_kernel_bench() {
     let nn_filter = filter_prog(
         &nn_schema,
         vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 1 },
+            LogicalInstr::LoadColInt { col: 1 },
             LogicalInstr::IntUnary {
                 op: crate::program::IntUnaryOp::Neg,
-                dst: 1,
-                a: 0,
+                a: Reg(0),
             },
-            LogicalInstr::LoadConst { dst: 2, val: 0 },
+            LogicalInstr::LoadConst { val: 0 },
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 3,
-                a: 1,
-                b: 2,
+                a: Reg(1),
+                b: Reg(2),
             },
-            LogicalInstr::LoadColInt { dst: 4, col: 2 },
-            LogicalInstr::LoadConst { dst: 5, val: 80 },
+            LogicalInstr::LoadColInt { col: 2 },
+            LogicalInstr::LoadConst { val: 80 },
             LogicalInstr::Cmp {
                 op: CmpOp::Lt,
-                dst: 6,
-                a: 4,
-                b: 5,
+                a: Reg(4),
+                b: Reg(5),
             },
-            LogicalInstr::BoolAnd { dst: 7, a: 3, b: 6 },
+            LogicalInstr::BoolBinary {
+                is_or: false,
+                a: Reg(3),
+                b: Reg(6),
+            },
         ],
-        8,
-        7,
+        Reg(7),
         vec![],
     );
 
@@ -245,7 +241,7 @@ fn filter_kernel_bench() {
     // a per-morsel constant refill would show.
     let lit_schema = schema_pk_ints(1, false);
     let lit_view = make_n_col_view(&lit_schema, n, |row, _| (row % 1000) as i64, |_, _| false);
-    let mut lit_instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
+    let mut lit_instrs = vec![LogicalInstr::LoadColInt { col: 1 }];
     let mut acc_reg = None;
     for (i, (op, val)) in [
         (CmpOp::Gt, 1i64),
@@ -258,19 +254,27 @@ fn filter_kernel_bench() {
     .enumerate()
     {
         let (k, c) = (1 + 2 * i as u16, 2 + 2 * i as u16);
-        lit_instrs.push(LogicalInstr::LoadConst { dst: k, val });
-        lit_instrs.push(LogicalInstr::Cmp { op, dst: c, a: 0, b: k });
+        lit_instrs.push(LogicalInstr::LoadConst { val });
+        lit_instrs.push(LogicalInstr::Cmp {
+            op,
+            a: Reg(0),
+            b: Reg(k),
+        });
         acc_reg = Some(match acc_reg {
             None => c,
             Some(prev) => {
                 let d = 11 + i as u16;
-                lit_instrs.push(LogicalInstr::BoolAnd { dst: d, a: prev, b: c });
+                lit_instrs.push(LogicalInstr::BoolBinary {
+                    is_or: false,
+                    a: Reg(prev),
+                    b: Reg(c),
+                });
                 d
             }
         });
     }
     let lit_result = acc_reg.expect("the literal chain has at least one compare");
-    let lit_filter = filter_prog(&lit_schema, lit_instrs, 16, lit_result as u32, vec![]);
+    let lit_filter = filter_prog(&lit_schema, lit_instrs, Reg(lit_result), vec![]);
 
     let mut hits = 0usize;
     let mut n_selected = 0usize;
@@ -301,35 +305,30 @@ fn filter_kernel_bench() {
 /// still resolves `no_nulls`. `n_cmp` sets the chain depth, which is what scales
 /// the per-conjunct cost the arms are being compared on.
 fn is_null_chain(k: i64, n_cmp: u16) -> FilterShape {
-    let mut instrs = vec![is_null_op(0, 1)];
+    let mut instrs = vec![is_null_op(1)];
     if n_cmp == 0 {
         // No compare, so no constant to load — an unread `LoadConst` would still
         // cost a register write per morsel and blunt the bare shape's figure.
-        return (instrs, 1, 0);
+        return (instrs, Reg(0));
     }
-    instrs.push(LogicalInstr::LoadConst { dst: 1, val: k });
+    instrs.push(LogicalInstr::LoadConst { val: k });
     let mut acc = 0u16;
     for i in 0..n_cmp {
         let base = 2 + i * 3;
-        instrs.push(LogicalInstr::LoadColInt {
-            dst: base,
-            col: u32::from(i) + 2,
-        });
+        instrs.push(LogicalInstr::LoadColInt { col: u32::from(i) + 2 });
         instrs.push(LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: base + 1,
-            a: base,
-            b: 1,
+            a: Reg(base),
+            b: Reg(1),
         });
-        instrs.push(LogicalInstr::BoolAnd {
-            dst: base + 2,
-            a: acc,
-            b: base + 1,
+        instrs.push(LogicalInstr::BoolBinary {
+            is_or: false,
+            a: Reg(acc),
+            b: Reg(base + 1),
         });
         acc = base + 2;
     }
-    let num_regs = u32::from(2 + n_cmp * 3);
-    (instrs, num_regs, u32::from(acc))
+    (instrs, Reg(acc))
 }
 
 /// One nullable column (the null test's) plus four NOT NULL ones (the
@@ -417,10 +416,8 @@ fn is_null_arm_bench() {
     ];
 
     let mut n_selected = 0usize;
-    for (name, view, (instrs, num_regs, result_reg)) in &shapes {
-        let (fast, nullable) = both_arms(name, || {
-            filter_prog(&schema, instrs.clone(), *num_regs, *result_reg, vec![])
-        });
+    for (name, view, (instrs, result_reg)) in &shapes {
+        let (fast, nullable) = both_arms(name, || filter_prog(&schema, instrs.clone(), *result_reg, vec![]));
         // Also the warm-up, and outside the driven region.
         let passed = passing_rows(&fast, view);
         assert_eq!(passed, passing_rows(&nullable, view), "{name}: the arms disagree");
@@ -442,11 +439,17 @@ fn is_null_arm_bench() {
         println!("is_null_arm_bench {name}: passes={passes} n={n} hits={hits}");
     }
 
-    // The map drive, which leaves through EMIT's register rather than a bitmap.
+    // The map drive, which leaves through a register sink rather than a bitmap.
     let out_schema = schema_pk_ints(1, false);
-    let map_instrs = vec![is_null_op(0, 1), LogicalInstr::Emit { src: 0, out: 0 }];
+    let map_instrs = vec![is_null_op(1)];
     let (fast, nullable) = both_arms("map", || {
-        map_prog(&schema, &out_schema, map_instrs.clone(), 1, 0, vec![])
+        map_prog(
+            &schema,
+            &out_schema,
+            map_instrs.clone(),
+            vec![Sink::Reg(Reg(0))],
+            vec![],
+        )
     });
     // The warm-up doubles as the agreement check, as it does per filter shape.
     let emitted = |ev: &Evaluator| {
@@ -524,31 +527,32 @@ fn expr_kernel_bench() {
         |row, col| ((row * 7 + col) % 1000 + 1) as i64,
         |row, _| row % 32 == 0,
     );
-    let load2 = |c: u32, d: u16| LogicalInstr::LoadColInt { dst: d, col: c };
+    let load2 = |c: u32| LogicalInstr::LoadColInt { col: c };
 
     let int_cast = scalar_prog(
         &ints,
         vec![
-            load2(1, 0),
+            load2(1),
             LogicalInstr::IntCast {
-                dst: 1,
-                a: 0,
+                a: Reg(0),
                 fi: FixedInt::I32,
             },
         ],
-        2,
-        1,
+        Reg(1),
         vec![],
     );
     let int_div = scalar_prog(
         &ints,
         vec![
-            load2(1, 0),
-            LogicalInstr::LoadConst { dst: 1, val: 7 },
-            LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
+            load2(1),
+            LogicalInstr::LoadConst { val: 7 },
+            LogicalInstr::IntArith {
+                op: IntArithOp::Div,
+                a: Reg(0),
+                b: Reg(1),
+            },
         ],
-        3,
-        2,
+        Reg(2),
         vec![],
     );
     // `CASE WHEN a > b THEN a ELSE b END` over nullable columns — the blend's
@@ -556,117 +560,97 @@ fn expr_kernel_bench() {
     let select = scalar_prog(
         &ints,
         vec![
-            load2(1, 0),
-            load2(2, 1),
+            load2(1),
+            load2(2),
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             },
             LogicalInstr::Select {
-                dst: 3,
-                cond: 2,
-                a: 0,
-                b: 1,
+                cond: Reg(2),
+                a: Reg(0),
+                b: Reg(1),
             },
         ],
-        4,
-        3,
+        Reg(3),
         vec![],
     );
     let int_to_str = scalar_prog(
         &ints,
-        vec![load2(1, 0), LogicalInstr::IntToStr { dst: 1, a: 0 }],
-        2,
-        1,
+        vec![load2(1), LogicalInstr::IntToStr { a: Reg(0) }],
+        Reg(1),
         vec![],
     );
 
     // --- string shapes over two NOT NULL STRING columns ---
     let strs = schema_pk_strings(2, false);
     let str_view = str_bench_view(&strs, n, 2);
-    let load_str = |c: u32, d: u16| LogicalInstr::LoadColStr { dst: d, col: c };
+    let load_str = |c: u32| LogicalInstr::LoadColStr { col: c };
 
     let str_len = scalar_prog(
         &strs,
         vec![
-            load_str(1, 0),
+            load_str(1),
             LogicalInstr::StrLen {
-                dst: 1,
-                a: 0,
+                a: Reg(0),
                 chars: false,
             },
         ],
-        2,
-        1,
+        Reg(1),
         vec![],
     );
     let str_upper = scalar_prog(
         &strs,
-        vec![
-            load_str(1, 0),
-            LogicalInstr::StrCase {
-                dst: 1,
-                a: 0,
-                upper: true,
-            },
-        ],
-        2,
-        1,
+        vec![load_str(1), LogicalInstr::StrCase { a: Reg(0), upper: true }],
+        Reg(1),
         vec![],
     );
     let str_like = scalar_prog(
         &strs,
         vec![
-            load_str(1, 0),
+            load_str(1),
             LogicalInstr::StrLike {
-                dst: 1,
-                src: 0,
+                src: Reg(0),
                 escape: None,
-                pat_idx: 0,
+                pat_idx: ConstIdx(0),
                 ci: false,
             },
         ],
-        2,
-        1,
+        Reg(1),
         vec![b"%boundary".to_vec()],
     );
     let str_substr = scalar_prog(
         &strs,
         vec![
-            load_str(1, 0),
-            LogicalInstr::LoadConst { dst: 1, val: 2 },
-            LogicalInstr::LoadConst { dst: 2, val: 6 },
+            load_str(1),
+            LogicalInstr::LoadConst { val: 2 },
+            LogicalInstr::LoadConst { val: 6 },
             LogicalInstr::StrSubstr {
-                dst: 3,
-                src: 0,
-                start_reg: 1,
-                len_reg: Some(2),
+                src: Reg(0),
+                start_reg: Reg(1),
+                len_reg: Some(Reg(2)),
             },
         ],
-        4,
-        3,
+        Reg(3),
         vec![],
     );
     let str_concat = scalar_prog(
         &strs,
         vec![
-            load_str(1, 0),
-            load_str(2, 1),
+            load_str(1),
+            load_str(2),
             LogicalInstr::StrConcat {
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
                 skip_null: false,
             },
         ],
-        3,
-        2,
+        Reg(2),
         vec![],
     );
 
-    // --- a real map: six compute opcodes plus two EMITs, driven through
+    // --- a real map: six compute opcodes plus two register sinks, driven through
     //     `eval_morsels` the way a maintained view's projection is ---
     let map_in = schema_pk_ints(3, false);
     let map_out = schema_pk_ints(2, false);
@@ -675,22 +659,31 @@ fn expr_kernel_bench() {
         &map_in,
         &map_out,
         vec![
-            load2(1, 0),
-            load2(2, 1),
-            LogicalInstr::LoadColInt { dst: 2, col: 3 },
-            LogicalInstr::IntAdd { dst: 3, a: 0, b: 1 },
-            LogicalInstr::IntMul { dst: 4, a: 3, b: 2 },
-            LogicalInstr::IntSub { dst: 5, a: 4, b: 0 },
-            LogicalInstr::Emit { src: 5, out: 0 },
-            LogicalInstr::Emit { src: 3, out: 1 },
+            load2(1),
+            load2(2),
+            LogicalInstr::LoadColInt { col: 3 },
+            LogicalInstr::IntArith {
+                op: IntArithOp::Add,
+                a: Reg(0),
+                b: Reg(1),
+            },
+            LogicalInstr::IntArith {
+                op: IntArithOp::Mul,
+                a: Reg(3),
+                b: Reg(2),
+            },
+            LogicalInstr::IntArith {
+                op: IntArithOp::Sub,
+                a: Reg(4),
+                b: Reg(0),
+            },
         ],
-        6,
-        0,
+        vec![Sink::Reg(Reg(5)), Sink::Reg(Reg(3))],
         vec![],
     );
 
     let mut acc = 0i64;
-    // Scalar-result shapes: sum the result register, as an EMIT of an 8-byte
+    // Scalar-result shapes: sum the result register, as a register sink into an 8-byte
     // slot would read it.
     for (name, ev, view, reg) in [
         ("int_cast", &int_cast, &int_view, 1usize),
@@ -708,7 +701,7 @@ fn expr_kernel_bench() {
             ev.eval_morsels(view, 0, n, |_, out| acc += out.reg_values(reg).iter().sum::<i64>());
         }
     }
-    // String-result shapes: resolve every view, as an EMIT of a string slot does.
+    // String-result shapes: resolve every view, as a string sink does.
     for (name, ev, view, reg) in [
         ("int_to_str", &int_to_str, &int_view, 1usize),
         ("str_upper", &str_upper, &str_view, 1),

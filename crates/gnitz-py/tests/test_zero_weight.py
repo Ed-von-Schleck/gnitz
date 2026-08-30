@@ -1,12 +1,10 @@
 """E2E tests for weight-0 push rows: not Z-set elements, dropped before the SAL
 emission (so the workers never see them)."""
 
-import random
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _make_table(client, cols, name="t"):

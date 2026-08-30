@@ -130,7 +130,7 @@ pub(crate) fn lower_reduce(
 
     // Finalize map + output columns + output layout. The PK region is inherited
     // by the MAP (natural group cols renamed in place; the synthetic `_group_pk`
-    // carried verbatim); the payload is written by the ExprProgram.
+    // carried verbatim); the payload is written by the expression program.
     let mut out_cols: Vec<ColumnDef> = reduce_schema.columns[..pk_len].to_vec();
     let mut out_layout: Vec<ColId> = reduce_layout[..pk_len].to_vec();
     let mut pk_renamed = vec![false; pk_len];

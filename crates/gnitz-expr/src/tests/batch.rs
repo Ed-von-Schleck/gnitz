@@ -5,7 +5,9 @@
 
 use std::ops::Neg;
 
+use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg};
 use gnitz_wire::{type_code, FixedInt, TrimMode};
+use std::num::NonZeroU8;
 
 use super::{
     decode_f64, encode_f64, eval_batch, with_str_bufs, EvalScratch, MAX_STR_COL_BUFS, MORSEL, NULL_WORDS_PER_REG,
@@ -26,8 +28,8 @@ fn drive(prog: &ResolvedProgram, mb: &dyn crate::BatchView, start: usize, m: usi
 /// Resolve a test program down to the raw evaluable form the kernel tests drive
 /// `eval_batch` with. The `Evaluator` wrapper is the *caller's* surface; these
 /// tests are below it.
-fn resolved(schema: &TestSchema, instrs: Vec<LogicalInstr>, num_regs: u32, result_reg: u32) -> ResolvedProgram {
-    scalar_prog(schema, instrs, num_regs, result_reg, vec![]).prog
+fn resolved(schema: &TestSchema, instrs: Vec<LogicalInstr>, result_reg: Reg) -> ResolvedProgram {
+    scalar_prog(schema, instrs, result_reg, vec![]).prog
 }
 
 /// A PK column is the one operand that reaches arithmetic through `LoadPk`
@@ -38,11 +40,15 @@ fn arithmetic_reads_a_pk_operand_and_propagates_a_null_one() {
     let schema = schema_pk_ints(1, true);
     let mb = make_int_view(&schema, &[(1, 0, &[10]), (2, 0, &[20]), (3, 1, &[30])]);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 0 }, // the PK
-        LogicalInstr::LoadColInt { dst: 1, col: 1 },
-        LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
+        LogicalInstr::LoadColInt { col: 0 }, // the PK
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::IntArith {
+            op: IntArithOp::Add,
+            a: Reg(0),
+            b: Reg(1),
+        },
     ];
-    let prog = resolved(&schema, instrs, 3, 2);
+    let prog = resolved(&schema, instrs, Reg(2));
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, 3);
     drive(&prog, &mb, 0, 3, &mut scratch);
@@ -65,17 +71,16 @@ fn select_boundary_sweep() {
     // Schema: pk(u64), cond(i64 nullable), a(i64 nullable), b(i64 nullable).
     let schema = schema_pk_ints(3, true);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
-        LogicalInstr::LoadColInt { dst: 1, col: 2 }, // a
-        LogicalInstr::LoadColInt { dst: 2, col: 3 }, // b
+        LogicalInstr::LoadColInt { col: 1 }, // cond
+        LogicalInstr::LoadColInt { col: 2 }, // a
+        LogicalInstr::LoadColInt { col: 3 }, // b
         LogicalInstr::Select {
-            dst: 3,
-            cond: 0,
-            a: 1,
-            b: 2,
+            cond: Reg(0),
+            a: Reg(1),
+            b: Reg(2),
         },
     ];
-    let prog = resolved(&schema, instrs, 4, 3);
+    let prog = resolved(&schema, instrs, Reg(3));
 
     // Row-parameterized generators (must match the closures passed to make_n_col_view).
     let cond_val = |row: usize| (row as i64) % 3 - 1; // cycles -1, 0, 1
@@ -132,17 +137,16 @@ fn select_no_nulls_fast_arm() {
     // cond / a / b are all NOT NULL, which selects the no_nulls fast arm.
     let schema = schema_pk_ints(3, false);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadColInt { dst: 1, col: 2 },
-        LogicalInstr::LoadColInt { dst: 2, col: 3 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadColInt { col: 2 },
+        LogicalInstr::LoadColInt { col: 3 },
         LogicalInstr::Select {
-            dst: 3,
-            cond: 0,
-            a: 1,
-            b: 2,
+            cond: Reg(0),
+            a: Reg(1),
+            b: Reg(2),
         },
     ];
-    let prog = resolved(&schema, instrs, 4, 3);
+    let prog = resolved(&schema, instrs, Reg(3));
     assert!(prog.no_nulls, "NOT NULL branches must select the no_nulls fast arm");
 
     let n = 130usize; // crosses a 64-bit word and the MORSEL boundary isn't hit, but words are
@@ -183,26 +187,32 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
     let mb = make_int_view(&schema, &[(1, 0, &[2, 3])]);
 
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col1
-        LogicalInstr::LoadConst { dst: 1, val: 1 },  // r1 = 1
+        LogicalInstr::LoadColInt { col: 1 }, // r0 = col1
+        LogicalInstr::LoadConst { val: 1 },  // r1 = 1
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 2,
-            a: 0,
-            b: 1,
+            a: Reg(0),
+            b: Reg(1),
         }, // r2 = col1 > 1
-        LogicalInstr::LoadColInt { dst: 3, col: 2 }, // r3 = col2
+        LogicalInstr::LoadColInt { col: 2 }, // r3 = col2
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 4,
-            a: 3,
-            b: 1,
+            a: Reg(3),
+            b: Reg(1),
         }, // r4 = col2 > 1
-        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 }, // r5 = r2 AND r4    (consumed by ADD → not bit_only)
-        LogicalInstr::LoadConst { dst: 6, val: 0 },  // r6 = 0
-        LogicalInstr::IntAdd { dst: 7, a: 5, b: 6 }, // r7 = r5 + 0 = bool-as-int
+        LogicalInstr::BoolBinary {
+            is_or: false,
+            a: Reg(2),
+            b: Reg(4),
+        }, // r5 = r2 AND r4    (consumed by ADD → not bit_only)
+        LogicalInstr::LoadConst { val: 0 },  // r6 = 0
+        LogicalInstr::IntArith {
+            op: IntArithOp::Add,
+            a: Reg(5),
+            b: Reg(6),
+        }, // r7 = r5 + 0 = bool-as-int
     ];
-    let prog = resolved(&schema, instrs, 8, 7);
+    let prog = resolved(&schema, instrs, Reg(7));
     // r5 is bool-produced but consumed by INT_ADD (non-bool). Must be demoted.
     assert!(
         !prog.is_bit_only(5),
@@ -240,10 +250,10 @@ fn not_null_load_clears_a_previous_programs_null_bits() {
     let words = m / 64;
     let mb = make_n_col_view(&schema, m, |row, _| row as i64, |row, col| col == 0 && row % 2 == 0);
 
-    let nullable_load = resolved(&schema, vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }], 1, 0);
+    let nullable_load = resolved(&schema, vec![LogicalInstr::LoadColInt { col: 1 }], Reg(0));
     // The `NOT NULL` load classifies onto the fast arm on its own; forced onto
     // the nullable one it runs the kernel whose write is the subject here.
-    let mut not_null_load = resolved(&schema, vec![LogicalInstr::LoadColInt { dst: 0, col: 2 }], 1, 0);
+    let mut not_null_load = resolved(&schema, vec![LogicalInstr::LoadColInt { col: 2 }], Reg(0));
     assert!(not_null_load.no_nulls, "a NOT NULL load must classify as no_nulls");
     not_null_load.no_nulls = false;
 
@@ -316,12 +326,9 @@ fn int_loads_cover_every_width_and_both_pk_signednesses() {
     // directly — the image is what is under test, so nothing is interposed
     // between the load and the assertion.
     let instrs = (0..cols.len() as u32)
-        .map(|ci| LogicalInstr::LoadColInt {
-            dst: ci as u16,
-            col: ci,
-        })
+        .map(|ci| LogicalInstr::LoadColInt { col: ci })
         .collect();
-    let prog = resolved(&schema, instrs, cols.len() as u32, 0);
+    let prog = resolved(&schema, instrs, Reg(0));
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, ROWS);
     drive(&prog, &mb, 0, ROWS, &mut scratch);
@@ -350,17 +357,12 @@ fn int_loads_cover_every_width_and_both_pk_signednesses() {
 /// The type is a parameter for the same reason it is one on [`run_binary_rows`]:
 /// it is what `resolve` reads the register's signedness off, and `IntCast` /
 /// `IntToFloat` carry a `signed` flag that selects a different kernel arm.
-fn run_unary_rows(
-    payload_tc: u8,
-    vals: &[i64],
-    nulls: &[bool],
-    mk: impl Fn(u16, u16) -> LogicalInstr,
-) -> Vec<(i64, bool)> {
+fn run_unary_rows(payload_tc: u8, vals: &[i64], nulls: &[bool], mk: impl Fn(Reg) -> LogicalInstr) -> Vec<(i64, bool)> {
     let schema = TestSchema::new(&[(type_code::U64, false), (payload_tc, true)], &[0]);
     let n = vals.len();
     let view = make_n_col_view(&schema, n, |row, _| vals[row], |row, _| nulls[row]);
-    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }, mk(1, 0)];
-    let prog = resolved(&schema, instrs, 2, 1);
+    let instrs = vec![LogicalInstr::LoadColInt { col: 1 }, mk(Reg(0))];
+    let prog = resolved(&schema, instrs, Reg(1));
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, n);
     drive(&prog, &view, 0, n, &mut scratch);
@@ -384,7 +386,7 @@ fn run_binary_rows(
     b: &[i64],
     a_null: &[bool],
     b_null: &[bool],
-    mk: impl Fn(u16, u16, u16) -> LogicalInstr,
+    mk: impl Fn(Reg, Reg) -> LogicalInstr,
 ) -> Vec<(i64, bool)> {
     let schema = TestSchema::new(&[(type_code::U64, false), (payload_tc, true), (payload_tc, true)], &[0]);
     let n = a.len();
@@ -395,11 +397,11 @@ fn run_binary_rows(
         |row, col| if col == 0 { a_null[row] } else { b_null[row] },
     );
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadColInt { dst: 1, col: 2 },
-        mk(2, 0, 1),
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadColInt { col: 2 },
+        mk(Reg(0), Reg(1)),
     ];
-    let prog = resolved(&schema, instrs, 3, 2);
+    let prog = resolved(&schema, instrs, Reg(2));
     let mut scratch = EvalScratch::new(&prog);
     scratch.ensure_capacity(&prog, n);
     drive(&prog, &view, 0, n, &mut scratch);
@@ -412,17 +414,16 @@ fn run_binary_rows(
         .collect()
 }
 
-fn fu(op: FloatUnaryOp) -> impl Fn(u16, u16) -> LogicalInstr {
-    move |dst, a| LogicalInstr::FloatUnary { op, dst, a }
+fn fu(op: FloatUnaryOp) -> impl Fn(Reg) -> LogicalInstr {
+    move |a| LogicalInstr::FloatUnary { op, a }
 }
 
 #[test]
 fn int_abs_wraps_at_min_and_propagates_null() {
     let vals = [5i64, -5, 0, i64::MIN, 7];
     let nulls = [false, false, false, false, true];
-    let out = run_unary_rows(type_code::I64, &vals, &nulls, |dst, a| LogicalInstr::IntUnary {
+    let out = run_unary_rows(type_code::I64, &vals, &nulls, |a| LogicalInstr::IntUnary {
         op: IntUnaryOp::Abs,
-        dst,
         a,
     });
     assert_eq!(out[0], (5, false));
@@ -480,10 +481,7 @@ fn float_to_f32_nulls_only_on_finite_overflow() {
         .map(|&f| encode_f64(f))
         .collect();
     let nulls = vec![false; vals.len()];
-    let out = run_unary_rows(type_code::I64, &vals, &nulls, |dst, a| LogicalInstr::FloatToF32 {
-        dst,
-        a,
-    });
+    let out = run_unary_rows(type_code::I64, &vals, &nulls, |a| LogicalInstr::FloatToF32 { a });
     let get = |i: usize| decode_f64(out[i].0);
 
     assert_eq!(get(0), 0.1f32 as f64, "rounded through f32 precision");
@@ -498,10 +496,7 @@ fn float_to_f32_nulls_only_on_finite_overflow() {
     // The values just above f32::MAX that round DOWN to it must not be NULLed.
     let just_over = f32::MAX as f64 + 2.0f64.powi(102);
     let v = vec![encode_f64(just_over)];
-    let out = run_unary_rows(type_code::I64, &v, &[false], |dst, a| LogicalInstr::FloatToF32 {
-        dst,
-        a,
-    });
+    let out = run_unary_rows(type_code::I64, &v, &[false], |a| LogicalInstr::FloatToF32 { a });
     assert!(!out[0].1, "rounds down to f32::MAX, so not an overflow");
     assert_eq!(decode_f64(out[0].0), f32::MAX as f64);
 }
@@ -512,8 +507,7 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
     let nulls = vec![false; vals.len()];
 
     // Signed source -> I8: only -128..=127 survive.
-    let out = run_unary_rows(type_code::I64, &vals, &nulls, |dst, a| LogicalInstr::IntCast {
-        dst,
+    let out = run_unary_rows(type_code::I64, &vals, &nulls, |a| LogicalInstr::IntCast {
         a,
         fi: FixedInt::I8,
     });
@@ -524,8 +518,7 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
     assert!(out[4].1);
 
     // Signed source -> U64: the check degenerates to "not negative".
-    let out = run_unary_rows(type_code::I64, &vals, &nulls, |dst, a| LogicalInstr::IntCast {
-        dst,
+    let out = run_unary_rows(type_code::I64, &vals, &nulls, |a| LogicalInstr::IntCast {
         a,
         fi: FixedInt::U64,
     });
@@ -535,12 +528,8 @@ fn int_cast_range_checks_per_target_and_source_signedness() {
 
     // Unsigned source -> I64: values >= 2^63 fail. The U64 taint comes from the
     // column's own type, which is what makes `src_signed` false.
-    let out = run_unary_rows(type_code::U64, &[5, i64::MIN], &[false, false], |dst, a| {
-        LogicalInstr::IntCast {
-            dst,
-            a,
-            fi: FixedInt::I64,
-        }
+    let out = run_unary_rows(type_code::U64, &[5, i64::MIN], &[false, false], |a| {
+        LogicalInstr::IntCast { a, fi: FixedInt::I64 }
     });
     assert_eq!(out[0], (5, false), "5 fits I64");
     assert!(out[1].1, "2^63 read as u64 exceeds I64");
@@ -561,8 +550,7 @@ fn float_to_int_truncates_and_bounds_exclusively() {
     .map(|&f| encode_f64(f))
     .collect();
     let nulls = vec![false; vals.len()];
-    let out = run_unary_rows(type_code::I64, &vals, &nulls, |dst, a| LogicalInstr::FloatToInt {
-        dst,
+    let out = run_unary_rows(type_code::I64, &vals, &nulls, |a| LogicalInstr::FloatToInt {
         a,
         fi: FixedInt::I64,
     });
@@ -579,8 +567,7 @@ fn float_to_int_truncates_and_bounds_exclusively() {
         .iter()
         .map(|&f| encode_f64(f))
         .collect();
-    let out = run_unary_rows(type_code::I64, &vals, &[false; 4], |dst, a| LogicalInstr::FloatToInt {
-        dst,
+    let out = run_unary_rows(type_code::I64, &vals, &[false; 4], |a| LogicalInstr::FloatToInt {
         a,
         fi: FixedInt::I8,
     });
@@ -603,15 +590,15 @@ fn division_nulls_the_row_on_a_zero_or_null_divisor() {
 
     // Only the null flag is asserted on rows 1 and 2: a NULL row's value half is
     // deliberately undefined, which is why `eval_row` hands back an `Option`.
-    let quot = run_binary_rows(type_code::I64, &a, &b, &no, &b_null, |dst, a, b| LogicalInstr::IntDiv {
-        dst,
+    let quot = run_binary_rows(type_code::I64, &a, &b, &no, &b_null, |a, b| LogicalInstr::IntArith {
+        op: IntArithOp::Div,
         a,
         b,
     });
     assert_eq!((quot[0], quot[1].1, quot[2].1), ((3, false), true, true));
 
-    let rem = run_binary_rows(type_code::I64, &a, &b, &no, &b_null, |dst, a, b| LogicalInstr::IntMod {
-        dst,
+    let rem = run_binary_rows(type_code::I64, &a, &b, &no, &b_null, |a, b| LogicalInstr::IntArith {
+        op: IntArithOp::Mod,
         a,
         b,
     });
@@ -619,8 +606,12 @@ fn division_nulls_the_row_on_a_zero_or_null_divisor() {
 
     let fa = a.map(|x| encode_f64(x as f64));
     let fb = b.map(|x| encode_f64(x as f64));
-    let fdiv = run_binary_rows(type_code::I64, &fa, &fb, &no, &b_null, |dst, a, b| {
-        LogicalInstr::FloatDiv { dst, a, b }
+    let fdiv = run_binary_rows(type_code::I64, &fa, &fb, &no, &b_null, |a, b| {
+        LogicalInstr::FloatArith {
+            op: FloatArithOp::Div,
+            a,
+            b,
+        }
     });
     assert_eq!(decode_f64(fdiv[0].0), 10.0 / 3.0);
     assert!(fdiv[1].1 && fdiv[2].1, "a zero and a NULL divisor both null the row");
@@ -660,12 +651,7 @@ fn int_compare_agrees_with_the_rust_operator_at_both_signednesses() {
 
     for (payload_tc, signed) in [(type_code::I64, true), (type_code::U64, false)] {
         for op in CMP_OPS {
-            let got = run_binary_rows(payload_tc, &a, &b, &no, &no, |dst, a, b| LogicalInstr::Cmp {
-                op,
-                dst,
-                a,
-                b,
-            });
+            let got = run_binary_rows(payload_tc, &a, &b, &no, &no, |a, b| LogicalInstr::Cmp { op, a, b });
             for (i, &(x, y)) in pairs.iter().enumerate() {
                 let ord = if signed { x.cmp(&y) } else { (x as u64).cmp(&(y as u64)) };
                 let want = cmp_want(op, ord, x == y);
@@ -687,12 +673,7 @@ fn float_compare_is_ieee_so_every_nan_comparison_is_false() {
     let no = vec![false; pairs.len()];
 
     for op in CMP_OPS {
-        let got = run_binary_rows(type_code::I64, &a, &b, &no, &no, |dst, a, b| LogicalInstr::FCmp {
-            op,
-            dst,
-            a,
-            b,
-        });
+        let got = run_binary_rows(type_code::I64, &a, &b, &no, &no, |a, b| LogicalInstr::FCmp { op, a, b });
         for (i, &(x, y)) in pairs.iter().enumerate() {
             let want = match x.partial_cmp(&y) {
                 Some(ord) => cmp_want(op, ord, x == y),
@@ -711,8 +692,7 @@ fn minmax2_skips_nulls_and_is_null_only_when_both_are() {
     let an = [false, false, false, true, true];
     let bn = [false, false, true, false, true];
 
-    let max = run_binary_rows(type_code::I64, &a, &b, &an, &bn, |dst, a, b| LogicalInstr::IntMinMax2 {
-        dst,
+    let max = run_binary_rows(type_code::I64, &a, &b, &an, &bn, |a, b| LogicalInstr::IntMinMax2 {
         a,
         b,
         is_max: true,
@@ -723,8 +703,7 @@ fn minmax2_skips_nulls_and_is_null_only_when_both_are() {
     assert_eq!(max[3], (7, false), "a NULL -> b");
     assert!(max[4].1, "both NULL -> NULL");
 
-    let min = run_binary_rows(type_code::I64, &a, &b, &an, &bn, |dst, a, b| LogicalInstr::IntMinMax2 {
-        dst,
+    let min = run_binary_rows(type_code::I64, &a, &b, &an, &bn, |a, b| LogicalInstr::IntMinMax2 {
         a,
         b,
         is_max: false,
@@ -738,22 +717,12 @@ fn minmax2_skips_nulls_and_is_null_only_when_both_are() {
     // would come out the minimum. Only the column's type selects the arm.
     let (big, no) = ([u64::MAX as i64, u64::MAX as i64], [false, false]);
     let small = [1i64, 1];
-    let umax = run_binary_rows(type_code::U64, &big, &small, &no, &no, |dst, a, b| {
-        LogicalInstr::IntMinMax2 {
-            dst,
-            a,
-            b,
-            is_max: true,
-        }
+    let umax = run_binary_rows(type_code::U64, &big, &small, &no, &no, |a, b| {
+        LogicalInstr::IntMinMax2 { a, b, is_max: true }
     });
     assert_eq!(umax[0], (u64::MAX as i64, false), "unsigned MAX(u64::MAX, 1)");
-    let umin = run_binary_rows(type_code::U64, &big, &small, &no, &no, |dst, a, b| {
-        LogicalInstr::IntMinMax2 {
-            dst,
-            a,
-            b,
-            is_max: false,
-        }
+    let umin = run_binary_rows(type_code::U64, &big, &small, &no, &no, |a, b| {
+        LogicalInstr::IntMinMax2 { a, b, is_max: false }
     });
     assert_eq!(umin[0], (1, false), "unsigned MIN(u64::MAX, 1)");
 }
@@ -765,13 +734,10 @@ fn float_minmax2_uses_total_cmp_order() {
     let b = [f(f64::NAN), f(2.0), f(0.0), f(f64::NAN)];
     let no = [false; 4];
 
-    let max = run_binary_rows(type_code::I64, &a, &b, &no, &no, |dst, a, b| {
-        LogicalInstr::FloatMinMax2 {
-            dst,
-            a,
-            b,
-            is_max: true,
-        }
+    let max = run_binary_rows(type_code::I64, &a, &b, &no, &no, |a, b| LogicalInstr::FloatMinMax2 {
+        a,
+        b,
+        is_max: true,
     });
     assert!(decode_f64(max[0].0).is_nan(), "NaN is the total-order max");
     assert_eq!(decode_f64(max[1].0), 5.0);
@@ -781,13 +747,10 @@ fn float_minmax2_uses_total_cmp_order() {
     );
     assert!(decode_f64(max[3].0).is_nan(), "NaN outranks +inf");
 
-    let min = run_binary_rows(type_code::I64, &a, &b, &no, &no, |dst, a, b| {
-        LogicalInstr::FloatMinMax2 {
-            dst,
-            a,
-            b,
-            is_max: false,
-        }
+    let min = run_binary_rows(type_code::I64, &a, &b, &no, &no, |a, b| LogicalInstr::FloatMinMax2 {
+        a,
+        b,
+        is_max: false,
     });
     assert_eq!(decode_f64(min[0].0), 5.0, "NaN loses MIN");
     assert!(decode_f64(min[2].0).is_sign_negative(), "-0.0 wins MIN under total_cmp");
@@ -804,7 +767,7 @@ fn str_prog(
     vals: &[&[u8]],
     nulls: &[bool],
     consts: Vec<Vec<u8>>,
-    mk: impl Fn(u16) -> Vec<LogicalInstr>,
+    mk: impl Fn(Reg) -> Vec<LogicalInstr>,
 ) -> (Evaluator, TestView) {
     let schema = schema_pk_strings(1, true);
     let rows: Vec<&[&[u8]]> = vals.iter().map(std::slice::from_ref).collect();
@@ -814,21 +777,21 @@ fn str_prog(
             view.set_null(row, 0);
         }
     }
-    let mut instrs = vec![LogicalInstr::LoadColStr { dst: 0, col: 1 }];
-    instrs.extend(mk(0));
-    let result = instrs.len() as u32 - 1;
-    (scalar_prog(&schema, instrs, result + 1, result, consts), view)
+    let mut instrs = vec![LogicalInstr::LoadColStr { col: 1 }];
+    instrs.extend(mk(Reg(0)));
+    let result = Reg(instrs.len() as u16 - 1);
+    (scalar_prog(&schema, instrs, result, consts), view)
 }
 
 /// Read a *string* register back per row.
-fn run_str_rows(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(u16) -> Vec<LogicalInstr>) -> Vec<(Vec<u8>, bool)> {
+fn run_str_rows(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(Reg) -> Vec<LogicalInstr>) -> Vec<(Vec<u8>, bool)> {
     let (ev, view) = str_prog(vals, nulls, vec![], mk);
     (0..vals.len()).map(|i| row_str(&ev, &view, i)).collect()
 }
 
 /// The same, but reading a *scalar* register — LENGTH, LIKE, the compares, the
 /// text→number parses.
-fn run_str_to_scalar(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(u16) -> Vec<LogicalInstr>) -> Vec<Option<i64>> {
+fn run_str_to_scalar(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(Reg) -> Vec<LogicalInstr>) -> Vec<Option<i64>> {
     let (ev, view) = str_prog(vals, nulls, vec![], mk);
     (0..vals.len()).map(|i| ev.eval_row(&view, i)).collect()
 }
@@ -862,25 +825,19 @@ fn a_string_column_past_the_buffer_table_still_reads_its_own_bytes() {
     let cells: Vec<&[u8]> = vals.iter().map(Vec::as_slice).collect();
     let view = make_string_view(&schema, &[cells.as_slice()]);
 
-    let mut instrs: Vec<LogicalInstr> = (0..N)
-        .map(|c| LogicalInstr::LoadColStr {
-            dst: c as u16,
-            col: c as u32 + 1,
-        })
-        .collect();
+    let mut instrs: Vec<LogicalInstr> = (0..N).map(|c| LogicalInstr::LoadColStr { col: c as u32 + 1 }).collect();
     // Fold left, so every column's view is resolved into the result.
-    let mut acc = 0u16;
+    let mut acc = Reg(0);
     for c in 1..N {
-        let dst = (N + c - 1) as u16;
+        let dst = Reg(instrs.len() as u16);
         instrs.push(LogicalInstr::StrConcat {
-            dst,
             a: acc,
-            b: c as u16,
+            b: Reg(c as u16),
             skip_null: false,
         });
         acc = dst;
     }
-    let ev = scalar_prog(&schema, instrs, (2 * N - 1) as u32, acc as u32, vec![]);
+    let ev = scalar_prog(&schema, instrs, acc, vec![]);
 
     assert_eq!(
         ev.prog.str_cols.len(),
@@ -927,22 +884,14 @@ fn case_fold_is_ascii_only_and_leaves_other_bytes_alone() {
     // The ASCII boundary bytes on both sides of `a-z`/`A-Z`, a multibyte UTF-8
     // sequence, and a lone continuation byte.
     let vals: &[&[u8]] = &[b"`az{", b"@AZ[", "straße".as_bytes(), &[0xC3, 0x9F, 0x80]];
-    let up = run_str_rows(vals, &[false; 4], |a| {
-        vec![LogicalInstr::StrCase { dst: 1, a, upper: true }]
-    });
+    let up = run_str_rows(vals, &[false; 4], |a| vec![LogicalInstr::StrCase { a, upper: true }]);
     assert_eq!(up[0].0, b"`AZ{", "only a-z folds; the neighbours pass through");
     assert_eq!(up[1].0, b"@AZ[");
     // Documented deviation from PostgreSQL under a UTF-8 locale: ß is untouched.
     assert_eq!(up[2].0, "STRAßE".as_bytes());
     assert_eq!(up[3].0, &[0xC3, 0x9F, 0x80]);
 
-    let lo = run_str_rows(vals, &[false; 4], |a| {
-        vec![LogicalInstr::StrCase {
-            dst: 1,
-            a,
-            upper: false,
-        }]
-    });
+    let lo = run_str_rows(vals, &[false; 4], |a| vec![LogicalInstr::StrCase { a, upper: false }]);
     assert_eq!(lo[0].0, b"`az{");
     assert_eq!(lo[1].0, b"@az[");
 }
@@ -952,10 +901,9 @@ fn case_fold_round_trips_every_cell_class_and_propagates_null() {
     let nulls = [false, false, true, false, false];
     let got = run_str_rows(&CELL_CLASSES, &nulls, |a| {
         vec![
-            LogicalInstr::StrCase { dst: 1, a, upper: true },
+            LogicalInstr::StrCase { a, upper: true },
             LogicalInstr::StrCase {
-                dst: 2,
-                a: 1,
+                a: Reg(1),
                 upper: false,
             },
         ]
@@ -978,16 +926,8 @@ fn length_counts_characters_and_octets_separately() {
         "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".as_bytes(),
         &[0xFF, 0xFE, 0x41],
     ];
-    let chars = run_str_to_scalar(vals, &[false; 4], |a| {
-        vec![LogicalInstr::StrLen { dst: 1, a, chars: true }]
-    });
-    let bytes = run_str_to_scalar(vals, &[false; 4], |a| {
-        vec![LogicalInstr::StrLen {
-            dst: 1,
-            a,
-            chars: false,
-        }]
-    });
+    let chars = run_str_to_scalar(vals, &[false; 4], |a| vec![LogicalInstr::StrLen { a, chars: true }]);
+    let bytes = run_str_to_scalar(vals, &[false; 4], |a| vec![LogicalInstr::StrLen { a, chars: false }]);
     // The emoji is 5 codepoints (three faces joined by two ZWJs) in 18 bytes —
     // the byte/character distinction OCTET_LENGTH exists to expose.
     assert_eq!(chars, [Some(3), Some(2), Some(5), Some(3)]);
@@ -996,9 +936,7 @@ fn length_counts_characters_and_octets_separately() {
 
 #[test]
 fn length_of_null_is_null() {
-    let got = run_str_to_scalar(&[b"abc"], &[true], |a| {
-        vec![LogicalInstr::StrLen { dst: 1, a, chars: true }]
-    });
+    let got = run_str_to_scalar(&[b"abc"], &[true], |a| vec![LogicalInstr::StrLen { a, chars: true }]);
     assert!(got[0].is_none());
 }
 
@@ -1008,16 +946,14 @@ fn length_of_null_is_null() {
 #[test]
 fn substring_window_matches_postgres_and_is_total() {
     let subst = |start: i64, len: Option<i64>| {
-        let mut instrs = vec![LogicalInstr::LoadConst { dst: 1, val: start }];
+        let mut instrs = vec![LogicalInstr::LoadConst { val: start }];
         let len_reg = len.map(|l| {
-            instrs.push(LogicalInstr::LoadConst { dst: 2, val: l });
-            2u16
+            instrs.push(LogicalInstr::LoadConst { val: l });
+            Reg(2)
         });
-        let dst = if len_reg.is_some() { 3 } else { 2 };
         instrs.push(LogicalInstr::StrSubstr {
-            dst,
-            src: 0,
-            start_reg: 1,
+            src: Reg(0),
+            start_reg: Reg(1),
             len_reg,
         });
         instrs
@@ -1094,16 +1030,15 @@ fn substring_bounds_read_an_unsigned_register_as_unsigned() {
     view.set_payload(1, 1, &u64::MAX.to_le_bytes());
 
     let instrs = vec![
-        LogicalInstr::LoadColStr { dst: 0, col: 1 },
-        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::LoadColStr { col: 1 },
+        LogicalInstr::LoadColInt { col: 2 },
         LogicalInstr::StrSubstr {
-            dst: 2,
-            src: 0,
-            start_reg: 1,
+            src: Reg(0),
+            start_reg: Reg(1),
             len_reg: None,
         },
     ];
-    let ev = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
     assert_eq!(row_str(&ev, &view, 0).0, b"cdef");
     assert_eq!(
         row_str(&ev, &view, 1).0,
@@ -1116,14 +1051,13 @@ fn substring_bounds_read_an_unsigned_register_as_unsigned() {
 fn substring_of_a_computed_string_is_a_sub_view_of_the_arena() {
     let got = run_str_rows(&[b"abcdefghijklmnop"], &[false], |a| {
         vec![
-            LogicalInstr::StrCase { dst: 1, a, upper: true },
-            LogicalInstr::LoadConst { dst: 2, val: 3 },
-            LogicalInstr::LoadConst { dst: 3, val: 4 },
+            LogicalInstr::StrCase { a, upper: true },
+            LogicalInstr::LoadConst { val: 3 },
+            LogicalInstr::LoadConst { val: 4 },
             LogicalInstr::StrSubstr {
-                dst: 4,
-                src: 1,
-                start_reg: 2,
-                len_reg: Some(3),
+                src: Reg(1),
+                start_reg: Reg(2),
+                len_reg: Some(Reg(3)),
             },
         ]
     });
@@ -1137,10 +1071,9 @@ fn trim_strips_the_selected_ends_only() {
     let run = |mode: TrimMode| {
         let (ev, view) = str_prog(vals, &[false; 4], vec![set.clone()], |a| {
             vec![LogicalInstr::StrTrim {
-                dst: 1,
                 a,
                 mode,
-                set_idx: 0,
+                set_idx: ConstIdx(0),
             }]
         });
         (0..vals.len()).map(|i| row_str(&ev, &view, i).0).collect::<Vec<_>>()
@@ -1169,10 +1102,9 @@ fn like_over_inline_and_heap_cells_with_a_null_row() {
     let run = |pattern: &str, ci: bool| {
         let (ev, view) = str_prog(vals, &nulls, vec![pattern.as_bytes().to_vec()], |a| {
             vec![LogicalInstr::StrLike {
-                dst: 1,
                 src: a,
-                escape: Some(b'\\'),
-                pat_idx: 0,
+                escape: NonZeroU8::new(b'\\'),
+                pat_idx: ConstIdx(0),
                 ci,
             }]
         });
@@ -1200,16 +1132,15 @@ fn concat_null_rules_differ_by_operand_side() {
 
     let run = |skip_null: bool| {
         let instrs = vec![
-            LogicalInstr::LoadColStr { dst: 0, col: 1 },
-            LogicalInstr::LoadColStr { dst: 1, col: 2 },
+            LogicalInstr::LoadColStr { col: 1 },
+            LogicalInstr::LoadColStr { col: 2 },
             LogicalInstr::StrConcat {
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
                 skip_null,
             },
         ];
-        let ev = scalar_prog(&schema, instrs, 3, 2, vec![]);
+        let ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
         (0..3).map(|i| row_str(&ev, &view, i)).collect::<Vec<_>>()
     };
 
@@ -1232,17 +1163,15 @@ fn concat_is_classified_null_producing_so_the_no_nulls_arm_cannot_take_it() {
     let concat = scalar_prog(
         &schema,
         vec![
-            LogicalInstr::LoadColStr { dst: 0, col: 1 },
-            LogicalInstr::LoadColStr { dst: 1, col: 2 },
+            LogicalInstr::LoadColStr { col: 1 },
+            LogicalInstr::LoadColStr { col: 2 },
             LogicalInstr::StrConcat {
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
                 skip_null: false,
             },
         ],
-        3,
-        2,
+        Reg(2),
         vec![],
     );
     assert!(!concat.prog.no_nulls);
@@ -1250,15 +1179,10 @@ fn concat_is_classified_null_producing_so_the_no_nulls_arm_cannot_take_it() {
     let upper = scalar_prog(
         &schema,
         vec![
-            LogicalInstr::LoadColStr { dst: 0, col: 1 },
-            LogicalInstr::StrCase {
-                dst: 1,
-                a: 0,
-                upper: true,
-            },
+            LogicalInstr::LoadColStr { col: 1 },
+            LogicalInstr::StrCase { a: Reg(0), upper: true },
         ],
-        2,
-        1,
+        Reg(1),
         vec![],
     );
     assert!(upper.prog.no_nulls, "a pure transform keeps the no_nulls arm");
@@ -1313,26 +1237,23 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
             scalar_prog(
                 &schema,
                 vec![
-                    LogicalInstr::LoadColStr { dst: 0, col: 1 },
-                    LogicalInstr::LoadColStr { dst: 1, col: 2 },
-                    LogicalInstr::StrCmp { op, dst: 2, a: 0, b: 1 },
+                    LogicalInstr::LoadColStr { col: 1 },
+                    LogicalInstr::LoadColStr { col: 2 },
+                    LogicalInstr::StrCmp {
+                        op,
+                        a: Reg(0),
+                        b: Reg(1),
+                    },
                 ],
-                3,
-                2,
+                Reg(2),
                 vec![],
             )
         });
         let col_col = OPS.map(|op| {
             scalar_prog(
                 &schema,
-                vec![LogicalInstr::StrColCol {
-                    op,
-                    dst: 0,
-                    col_a: 1,
-                    col_b: 2,
-                }],
-                1,
-                0,
+                vec![LogicalInstr::StrColCol { op, col_a: 1, col_b: 2 }],
+                Reg(0),
                 vec![],
             )
         });
@@ -1345,12 +1266,10 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
                     &schema,
                     vec![LogicalInstr::StrColConst {
                         op,
-                        dst: 0,
                         col: 1,
-                        const_idx: 0,
+                        const_idx: ConstIdx(0),
                     }],
-                    1,
-                    0,
+                    Reg(0),
                     vec![b.to_vec()],
                 )
             });
@@ -1391,20 +1310,21 @@ fn heap_backed_constants_at_two_arena_offsets() {
         vec![
             LogicalInstr::StrColConst {
                 op: StrOp::Eq,
-                dst: 0,
                 col: 1,
-                const_idx: 0,
+                const_idx: ConstIdx(0),
             },
             LogicalInstr::StrColConst {
                 op: StrOp::Eq,
-                dst: 1,
                 col: 2,
-                const_idx: 1,
+                const_idx: ConstIdx(1),
             },
-            LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
+            LogicalInstr::BoolBinary {
+                is_or: false,
+                a: Reg(0),
+                b: Reg(1),
+            },
         ],
-        3,
-        2,
+        Reg(2),
         vec![a.to_vec(), b.to_vec()],
     );
     assert_eq!(passing_rows(&ev, &view), vec![false, true, false, false]);
@@ -1429,29 +1349,33 @@ fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
     let ev = filter_prog(
         &schema,
         vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 0 },
+            LogicalInstr::LoadColInt { col: 0 },
             LogicalInstr::IntInSet {
-                dst: 1,
-                value_reg: 0,
-                set_idx: 0,
+                value_reg: Reg(0),
+                set_idx: ConstIdx(0),
             },
             LogicalInstr::StrColConst {
                 op: StrOp::Eq,
-                dst: 2,
                 col: 2,
-                const_idx: 2,
+                const_idx: ConstIdx(2),
             },
             LogicalInstr::StrColConst {
                 op: StrOp::Eq,
-                dst: 3,
                 col: 1,
-                const_idx: 1,
+                const_idx: ConstIdx(1),
             },
-            LogicalInstr::BoolAnd { dst: 4, a: 2, b: 3 },
-            LogicalInstr::BoolAnd { dst: 5, a: 1, b: 4 },
+            LogicalInstr::BoolBinary {
+                is_or: false,
+                a: Reg(2),
+                b: Reg(3),
+            },
+            LogicalInstr::BoolBinary {
+                is_or: false,
+                a: Reg(1),
+                b: Reg(4),
+            },
         ],
-        6,
-        5,
+        Reg(5),
         vec![set, a.to_vec(), b.to_vec()],
     );
     assert_eq!(passing_rows(&ev, &view), vec![false, true, false, false]);
@@ -1471,12 +1395,8 @@ fn int_to_text_reads_the_source_signedness_from_the_register_tracking() {
     let text = |col: u32, row: usize| {
         let ev = scalar_prog(
             &schema,
-            vec![
-                LogicalInstr::LoadColInt { dst: 0, col },
-                LogicalInstr::IntToStr { dst: 1, a: 0 },
-            ],
-            2,
-            1,
+            vec![LogicalInstr::LoadColInt { col }, LogicalInstr::IntToStr { a: Reg(0) }],
+            Reg(1),
             vec![],
         );
         row_str(&ev, &view, row).0
@@ -1522,11 +1442,10 @@ fn float_to_text_is_bounded_and_round_trips() {
     let ev = scalar_prog(
         &schema,
         vec![
-            LogicalInstr::LoadColFloat { dst: 0, col: 1 },
-            LogicalInstr::FloatToStr { dst: 1, a: 0 },
+            LogicalInstr::LoadColFloat { col: 1 },
+            LogicalInstr::FloatToStr { a: Reg(0) },
         ],
-        2,
-        1,
+        Reg(1),
         vec![],
     );
     for (i, &f) in vals.iter().enumerate() {
@@ -1570,11 +1489,7 @@ fn text_to_int_accepts_only_plain_decimal_and_range_checks_the_target() {
     ];
     let vals: Vec<&[u8]> = cases.iter().map(|(s, _)| *s).collect();
     let got = run_str_to_scalar(&vals, &vec![false; cases.len()], |a| {
-        vec![LogicalInstr::StrToInt {
-            dst: 1,
-            a,
-            fi: FixedInt::I64,
-        }]
+        vec![LogicalInstr::StrToInt { a, fi: FixedInt::I64 }]
     });
     for (i, (s, want)) in cases.iter().enumerate() {
         match want {
@@ -1585,11 +1500,7 @@ fn text_to_int_accepts_only_plain_decimal_and_range_checks_the_target() {
 
     // Range-checked against the *target*, not i64.
     let narrow = run_str_to_scalar(&[b"127", b"128", b"-128", b"-129"], &[false; 4], |a| {
-        vec![LogicalInstr::StrToInt {
-            dst: 1,
-            a,
-            fi: FixedInt::I8,
-        }]
+        vec![LogicalInstr::StrToInt { a, fi: FixedInt::I8 }]
     });
     assert_eq!(
         narrow.iter().map(|r| r.is_none()).collect::<Vec<_>>(),
@@ -1607,18 +1518,16 @@ fn text_to_u64_seeds_the_unsigned_tracking() {
         let ev = scalar_prog(
             &schema,
             vec![
-                LogicalInstr::LoadColStr { dst: 0, col: 1 },
-                LogicalInstr::StrToInt { dst: 1, a: 0, fi },
-                LogicalInstr::LoadConst { dst: 2, val: 5 },
+                LogicalInstr::LoadColStr { col: 1 },
+                LogicalInstr::StrToInt { a: Reg(0), fi },
+                LogicalInstr::LoadConst { val: 5 },
                 LogicalInstr::Cmp {
                     op: CmpOp::Gt,
-                    dst: 3,
-                    a: 1,
-                    b: 2,
+                    a: Reg(1),
+                    b: Reg(2),
                 },
             ],
-            4,
-            3,
+            Reg(3),
             vec![],
         );
         ev.eval_row(&view, 0)
@@ -1641,7 +1550,7 @@ fn text_to_float_parses_or_nulls() {
     ];
     let vals: Vec<&[u8]> = cases.iter().map(|(s, _)| *s).collect();
     let got = run_str_to_scalar(&vals, &vec![false; cases.len()], |a| {
-        vec![LogicalInstr::StrToFloat { dst: 1, a }]
+        vec![LogicalInstr::StrToFloat { a }]
     });
     for (i, (s, want)) in cases.iter().enumerate() {
         match want {
@@ -1650,9 +1559,7 @@ fn text_to_float_parses_or_nulls() {
         }
     }
     // Invalid UTF-8 is NULL, not a panic: the engine is byte-transparent.
-    let bad = run_str_to_scalar(&[&[0xFF, 0xFE]], &[false], |a| {
-        vec![LogicalInstr::StrToFloat { dst: 1, a }]
-    });
+    let bad = run_str_to_scalar(&[&[0xFF, 0xFE]], &[false], |a| vec![LogicalInstr::StrToFloat { a }]);
     assert!(bad[0].is_none());
 }
 
@@ -1673,15 +1580,10 @@ fn computed_strings_do_not_leak_across_morsels() {
     let ev = scalar_prog(
         &schema,
         vec![
-            LogicalInstr::LoadColStr { dst: 0, col: 1 },
-            LogicalInstr::StrCase {
-                dst: 1,
-                a: 0,
-                upper: true,
-            },
+            LogicalInstr::LoadColStr { col: 1 },
+            LogicalInstr::StrCase { a: Reg(0), upper: true },
         ],
-        2,
-        1,
+        Reg(1),
         vec![],
     );
     let mut seen = Vec::new();
@@ -1705,9 +1607,8 @@ fn string_constants_survive_the_per_morsel_arena_reset() {
     let view = make_string_view(&schema, &vec![&[b"x".as_slice()][..]; n]);
     let ev = scalar_prog(
         &schema,
-        vec![LogicalInstr::LoadConstStr { dst: 0, const_idx: 0 }],
-        1,
-        0,
+        vec![LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) }],
+        Reg(0),
         vec![b"constant-value".to_vec()],
     );
     let mut rows = 0usize;
@@ -1735,25 +1636,22 @@ fn string_select_takes_the_chosen_branch_and_its_null_bit() {
     let ev = scalar_prog(
         &schema,
         vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 0 },
-            LogicalInstr::LoadConst { dst: 1, val: 2 },
+            LogicalInstr::LoadColInt { col: 0 },
+            LogicalInstr::LoadConst { val: 2 },
             LogicalInstr::Cmp {
                 op: CmpOp::Ne,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             },
-            LogicalInstr::LoadColStr { dst: 3, col: 1 },
-            LogicalInstr::LoadColStr { dst: 4, col: 2 },
+            LogicalInstr::LoadColStr { col: 1 },
+            LogicalInstr::LoadColStr { col: 2 },
             LogicalInstr::StrSelect {
-                dst: 5,
-                cond: 2,
-                a: 3,
-                b: 4,
+                cond: Reg(2),
+                a: Reg(3),
+                b: Reg(4),
             },
         ],
-        6,
-        5,
+        Reg(5),
         vec![],
     );
     let got: Vec<(Vec<u8>, bool)> = (0..3).map(|i| row_str(&ev, &view, i)).collect();
@@ -1776,7 +1674,7 @@ fn payload_loads_agree_with_the_wire_le_decoder() {
         let rows: Vec<(u64, u64, &[i64])> = vals.iter().map(|v| (0u64, 0u64, std::slice::from_ref(v))).collect();
         let view = make_int_view(&schema, &rows);
 
-        let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }], 1, 0, vec![]);
+        let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { col: 1 }], Reg(0), vec![]);
         for row in 0..vals.len() {
             let got = ev.eval_row(&view, row).expect("a non-nullable column is never null");
             let want = fi.decode_le_i64(view.get_col_ptr(row, 0, fi.width()));
@@ -1817,7 +1715,7 @@ fn pk_loads_agree_with_the_wire_opk_decoder() {
         let rows: Vec<(u64, u64, &[i64])> = vals.iter().map(|&v| (v, 0u64, &[0i64][..])).collect();
         let view = make_int_view(&schema, &rows);
 
-        let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }], 1, 0, vec![]);
+        let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { col: 0 }], Reg(0), vec![]);
         for row in 0..vals.len() {
             let got = ev.eval_row(&view, row).expect("a PK column is never null");
             let want = gnitz_wire::decode_opk_i64(&view.get_pk_bytes(row)[..fi.width()], fi);

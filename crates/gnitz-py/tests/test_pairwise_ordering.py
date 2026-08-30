@@ -7,14 +7,14 @@ creates its own schema, loads data, asserts, and drops the schema."""
 from __future__ import annotations
 
 import itertools
-import uuid
 
 import pytest
 import gnitz
+from _uid import uid
 
 
 def _unique_schema(client, prefix: str) -> str:
-    sn = f"{prefix}_{uuid.uuid4().hex[:8]}"
+    sn = f"{prefix}_{uid()}"
     client.create_schema(sn)
     return sn
 

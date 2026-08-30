@@ -11,7 +11,7 @@ fn reindex_of(node: OpNode) -> (Vec<u32>, Vec<u8>) {
     }
 }
 
-/// MAP_EXPR reindex columns decode from NODE_COL_KIND_REINDEX rows in position
+/// MAP_REINDEX key columns decode from NODE_COL_KIND_REINDEX rows in position
 /// order (value1 = source column), and a non-zero `value2` is the promoted key
 /// type code `T`, decoded parallel to them. A `value2 = 0` slot means "derive
 /// from source".
@@ -37,7 +37,7 @@ fn decode_reindex_cols_and_target_tcs() {
             value2: 0,
         },
     ];
-    let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1, 2, 3]), &cols).unwrap();
+    let node = decode_op_node(OPCODE_MAP_REINDEX, None, None, &cols).unwrap();
     assert_eq!(reindex_of(node), (vec![3, 3], vec![0, crate::type_code::I64]));
 }
 
@@ -102,7 +102,7 @@ fn decode_rejects_non_pk_eligible_target_tc() {
         value1: 3,
         value2: crate::type_code::F64 as u64,
     }];
-    let err = decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1, 2, 3]), &cols).unwrap_err();
+    let err = decode_op_node(OPCODE_MAP_REINDEX, None, None, &cols).unwrap_err();
     assert!(err.contains("not PK-eligible"), "got: {err}");
 }
 
@@ -168,13 +168,13 @@ fn a_global_ground_reduce_over_a_group_set_is_rejected() {
     assert!(decode(&[agg, ground, group]).unwrap_err().contains("global-ground"));
 }
 
-/// A `MAP_EXPR` whose role cannot be read decides nothing about routing, so it
-/// must fail the decode rather than default. (Contrast `SCAN_BOUND`, which
-/// decides only scan speed and therefore degrades instead of erroring.) A
-/// route-key row with no reindex columns cannot say anything: the columns are
-/// what discriminate a re-key from a computed projection.
+/// A `MAP_REINDEX` whose role cannot be read decides nothing about routing, so
+/// it must fail the decode rather than default. (Contrast `SCAN_BOUND`, which
+/// decides only scan speed and therefore degrades instead of erroring.) A node
+/// naming no key columns is refused for the same reason: it re-keys onto
+/// nothing.
 #[test]
-fn a_map_expr_whose_role_is_unreadable_is_rejected() {
+fn a_map_reindex_whose_role_is_unreadable_is_rejected() {
     let row = |kind, value1| {
         [CircuitNodeColumn {
             kind,
@@ -183,7 +183,7 @@ fn a_map_expr_whose_role_is_unreadable_is_rejected() {
             value2: 0,
         }]
     };
-    let decode = |cols: &[CircuitNodeColumn]| decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1]), cols);
+    let decode = |cols: &[CircuitNodeColumn]| decode_op_node(OPCODE_MAP_REINDEX, None, None, cols);
     assert!(decode(&row(NODE_COL_KIND_REINDEX, 3))
         .unwrap_err()
         .contains("missing its route-key row"));
@@ -197,10 +197,9 @@ fn a_map_expr_whose_role_is_unreadable_is_rejected() {
         value2: 0,
     });
     assert!(decode(&unknown_role).unwrap_err().contains("unknown route-key role"));
-    assert!(matches!(
-        decode(&row(NODE_COL_KIND_ROUTE_KEY, 1)),
-        Ok(OpNode::Map(MapKind::Compute { .. }))
-    ));
+    assert!(decode(&row(NODE_COL_KIND_ROUTE_KEY, 1))
+        .unwrap_err()
+        .contains("names no key columns"));
 }
 
 /// Every `OpNode` shape survives `encode_op_node` → `decode_op_node`. This is
@@ -257,7 +256,7 @@ fn every_op_node_variant_roundtrips() {
     ];
     for &role in ReindexRole::ALL {
         nodes.push(OpNode::Map(MapKind::Reindex {
-            program: vec![1],
+            keep: vec![0],
             reindex_cols: vec![2, 5],
             reindex_target_tcs: vec![0, crate::type_code::I64],
             role,

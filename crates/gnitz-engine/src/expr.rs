@@ -219,7 +219,7 @@ enum StringMoves {
     /// dead heap a shared blob would carry.
     DropsAString,
     /// Every input German-string column is carried by some copy, so a shared
-    /// blob has no dead heap. A string EMIT alongside is fine: the adopted blob
+    /// blob has no dead heap. A string emit alongside is fine: the adopted blob
     /// is the output's own buffer, so the emit appends past the prefix the
     /// copied cells address.
     KeepsEveryString,
@@ -360,7 +360,7 @@ pub(crate) struct MapPlan {
     out_schema: SchemaDescriptor,
 }
 
-/// The NULL half of an EMIT, shared by the scalar (`stride` 8) and string
+/// The NULL half of an emit, shared by the scalar (`stride` 8) and string
 /// (`stride` 16) loops: a NULL row's value slot reads as zero, and its bit is set
 /// in the output bitmap.
 ///
@@ -462,9 +462,9 @@ fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id
 
 impl MapPlan {
     /// Map plan from a logical expression program. A pure projection is the
-    /// special case where every instruction is a `CopyCol` (see
-    /// [`LogicalProgram::copy_cols`]): the program emits nothing and the plan
-    /// reduces to the copy list + `null_perm`.
+    /// special case where the program computes nothing and every sink is a
+    /// column copy (see [`LogicalProgram::copy_cols`]): the plan reduces to the
+    /// copy list + `null_perm`.
     pub(crate) fn from_map(
         logical: LogicalProgram,
         in_schema: &SchemaDescriptor,
@@ -653,7 +653,7 @@ impl MapPlan {
         output.weight_data_mut()[dst_base * 8..(dst_base + n) * 8]
             .copy_from_slice(&in_batch.weight_data()[src_start * 8..(src_start + n) * 8]);
 
-        // Null bitmap, written before the compute kernel: EMIT merges its null
+        // Null bitmap, written before the compute kernel: an emit merges its null
         // bits into the word with a read-modify-write `|=`. Split-borrow:
         // `in_batch` and `output` are distinct allocations.
         {
@@ -671,7 +671,7 @@ impl MapPlan {
             let in_mb = in_batch.as_mem_batch();
             self.ev.eval_morsels(&in_mb, src_start, n, |morsel_start, out| {
                 let m = out.rows();
-                // EMIT: write each computed register to its output column. One
+                // Emits: write each computed register to its output column. One
                 // `Iterator::next` per emit, against a `copy_from_slice` of up
                 // to 2 KiB — unlike `NullPerm`'s per-row loop, where the call
                 // would land per (row × pair).
@@ -691,7 +691,7 @@ impl MapPlan {
                     emit_null_rows(out, reg, win, nb, row0, out_payload, 8);
                 }
 
-                // String EMIT. Two passes like the scalar path rather than a
+                // String emits. Two passes like the scalar path rather than a
                 // per-row nullness branch, because `MorselOut` exposes nullness
                 // only through `for_each_null_row` — and under `no_nulls` there
                 // is no `null_bits` to index at all.
@@ -716,7 +716,7 @@ impl MapPlan {
 
 #[cfg(test)]
 mod tests {
-    use gnitz_expr::{ExprValidateErr, LogicalProgram};
+    use gnitz_expr::{ExprValidateErr, LogicalProgram, Reg, Sink};
 
     use super::{MapPlan, PkSource};
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
@@ -774,15 +774,18 @@ mod tests {
 
         let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20])]);
 
-        use gnitz_expr::LogicalInstr;
+        use gnitz_expr::{IntArithOp, LogicalInstr};
         let instrs = vec![
-            LogicalInstr::CopyCol { src_col: 1, out: 0 },
-            LogicalInstr::LoadColInt { dst: 0, col: 1 },
-            LogicalInstr::LoadColInt { dst: 1, col: 2 },
-            LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
-            LogicalInstr::Emit { src: 2, out: 1 },
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadColInt { col: 2 },
+            LogicalInstr::IntArith {
+                op: IntArithOp::Add,
+                a: Reg(0),
+                b: Reg(1),
+            },
         ];
-        let prog = LogicalProgram::new(instrs, 3, 2, vec![]);
+        let sinks = vec![Sink::Col(1), Sink::Reg(Reg(2))];
+        let prog = LogicalProgram::new(instrs, sinks, None, vec![]);
 
         let func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
         let result = func.evaluate_map_batch(&batch);
@@ -992,16 +995,16 @@ mod tests {
         assert_eq!(widened(3), c3 as i64, "U8 payload zero-extends");
     }
 
-    /// An empty wire program decodes to `num_regs = 0, result_reg = 0` — framing
-    /// accepts it, and `validate` cannot reject it outright because that is exactly
-    /// the shape every `copy_cols` map has. The *filter* and *scalar* roles are the
+    /// An instruction-free program has no result register — framing accepts it,
+    /// and `validate` cannot reject it outright because that is exactly the shape
+    /// every `copy_cols` map has. The *filter* and *scalar* roles are the
     /// ones that read a result register back, so each rejects it rather than letting
     /// it masquerade as a filter that passes nothing (which a client would read as
     /// an empty table).
     #[test]
     fn test_register_free_predicate_is_rejected() {
         let schema = make_schema(0, &[8, 9]);
-        let prog = LogicalProgram::from_wire(&[], 0, 0, vec![]).unwrap();
+        let prog = LogicalProgram::from_wire(&[], &[], None, vec![]).unwrap();
         assert_eq!(
             prog.resolve_filter(&schema).err(),
             Some(ExprValidateErr::ResultRegRequired)
@@ -1030,16 +1033,15 @@ mod tests {
         let batch = make_int_batch(&schema, &rows);
 
         let instrs = vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 1 },
-            LogicalInstr::LoadConst { dst: 1, val: 15 },
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadConst { val: 15 },
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             },
         ];
-        let func = LogicalProgram::new(instrs, 3, 2, vec![])
+        let func = LogicalProgram::new(instrs, Vec::new(), Some(Reg(2)), vec![])
             .resolve_filter(&schema)
             .unwrap();
 
@@ -1087,17 +1089,12 @@ mod tests {
         batch.count = 2;
 
         let instrs = vec![
-            LogicalInstr::CopyCol { src_col: 0, out: 0 },
-            LogicalInstr::LoadColStr { dst: 0, col: 1 },
-            LogicalInstr::StrCase {
-                dst: 1,
-                a: 0,
-                upper: true,
-            },
-            LogicalInstr::Emit { src: 1, out: 1 },
+            LogicalInstr::LoadColStr { col: 1 },
+            LogicalInstr::StrCase { a: Reg(0), upper: true },
         ];
+        let sinks = vec![Sink::Col(0), Sink::Reg(Reg(1))];
         let func = MapPlan::from_map(
-            LogicalProgram::new(instrs, 2, 1, vec![]),
+            LogicalProgram::new(instrs, sinks, None, vec![]),
             &in_schema,
             &out_schema,
             PkSource::Inherit,
@@ -1113,7 +1110,7 @@ mod tests {
         );
     }
 
-    /// A string EMIT alongside a passthrough of every input string column. The
+    /// A string emit alongside a passthrough of every input string column. The
     /// copied cells still resolve against the adopted blob after the emit has
     /// appended to it, and the output stops sharing once it has.
     #[test]
@@ -1125,17 +1122,12 @@ mod tests {
         let batch = make_string_batch(&in_schema, &[&[b"a-long-value-past-twelve"], &[b"short"]]);
 
         let instrs = vec![
-            LogicalInstr::CopyCol { src_col: 1, out: 0 },
-            LogicalInstr::LoadColStr { dst: 0, col: 1 },
-            LogicalInstr::StrCase {
-                dst: 1,
-                a: 0,
-                upper: true,
-            },
-            LogicalInstr::Emit { src: 1, out: 1 },
+            LogicalInstr::LoadColStr { col: 1 },
+            LogicalInstr::StrCase { a: Reg(0), upper: true },
         ];
+        let sinks = vec![Sink::Col(1), Sink::Reg(Reg(1))];
         let func = MapPlan::from_map(
-            LogicalProgram::new(instrs, 2, 1, vec![]),
+            LogicalProgram::new(instrs, sinks, None, vec![]),
             &in_schema,
             &out_schema,
             PkSource::Inherit,
@@ -1172,17 +1164,12 @@ mod tests {
         gnitz_wire::write_u64_le(batch.null_bmp_data_mut(), 8, 1);
 
         let instrs = vec![
-            LogicalInstr::CopyCol { src_col: 0, out: 0 },
-            LogicalInstr::LoadColStr { dst: 0, col: 1 },
-            LogicalInstr::StrCase {
-                dst: 1,
-                a: 0,
-                upper: true,
-            },
-            LogicalInstr::Emit { src: 1, out: 1 },
+            LogicalInstr::LoadColStr { col: 1 },
+            LogicalInstr::StrCase { a: Reg(0), upper: true },
         ];
+        let sinks = vec![Sink::Col(0), Sink::Reg(Reg(1))];
         let func = MapPlan::from_map(
-            LogicalProgram::new(instrs, 2, 1, vec![]),
+            LogicalProgram::new(instrs, sinks, None, vec![]),
             &in_schema,
             &out_schema,
             PkSource::Inherit,
@@ -1304,16 +1291,11 @@ mod tests {
         let se_plan = MapPlan::from_map(
             LogicalProgram::new(
                 vec![
-                    LogicalInstr::LoadColStr { dst: 0, col: 1 },
-                    LogicalInstr::StrCase {
-                        dst: 1,
-                        a: 0,
-                        upper: true,
-                    },
-                    LogicalInstr::Emit { src: 1, out: 0 },
+                    LogicalInstr::LoadColStr { col: 1 },
+                    LogicalInstr::StrCase { a: Reg(0), upper: true },
                 ],
-                2,
-                1,
+                vec![Sink::Reg(Reg(1))],
+                None,
                 vec![],
             ),
             &se_in,

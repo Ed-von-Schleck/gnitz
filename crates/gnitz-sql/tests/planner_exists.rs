@@ -7,7 +7,7 @@ use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{
     OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_FILTER, OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_RANGE,
-    OPCODE_MAP_EXPR, OPCODE_NEGATE, OPCODE_NULL_EXTEND, OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_UNION,
+    OPCODE_MAP_REINDEX, OPCODE_NEGATE, OPCODE_NULL_EXTEND, OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_UNION,
     OPCODE_WORKER_FILTER,
 };
 
@@ -67,7 +67,7 @@ fn test_equi_exists_circuit_shape() {
         assert_eq!(n(vid, OPCODE_DISTINCT), 0, "weight-exact — no distinct");
         assert_eq!(n(vid, OPCODE_NULL_EXTEND), 0, "no columns are null-filled");
         assert_eq!(
-            n(vid, OPCODE_MAP_EXPR),
+            n(vid, OPCODE_MAP_REINDEX),
             2,
             "reindex_a + reindex_b only (a_all aliases reindex_a on a NOT NULL key)"
         );
@@ -105,7 +105,7 @@ fn test_equi_exists_nullable_key_shape() {
     let vid = client.resolve_table_or_view_id(&sn, "nk_v").unwrap().0;
     let nodes = scan_circuit_nodes(&mut client);
     let n = |op: u64| opcode_node_count(nodes.as_ref(), vid, op);
-    assert_eq!(n(OPCODE_MAP_EXPR), 3, "reindex_a + reindex_b + separate a_all");
+    assert_eq!(n(OPCODE_MAP_REINDEX), 3, "reindex_a + reindex_b + separate a_all");
     assert_eq!(n(OPCODE_FILTER), 2, "one NULL gate per side");
 }
 
@@ -188,7 +188,7 @@ fn test_pure_range_exists_circuit_shape() {
     assert_eq!(n(anti, OPCODE_NEGATE), 1);
     assert_eq!(n(anti, OPCODE_UNION) - n(semi, OPCODE_UNION), 1);
     // Anti materializes the extra a_pass re-key.
-    assert_eq!(n(anti, OPCODE_MAP_EXPR) - n(semi, OPCODE_MAP_EXPR), 1);
+    assert_eq!(n(anti, OPCODE_MAP_REINDEX) - n(semi, OPCODE_MAP_REINDEX), 1);
 }
 
 // ── Rejections ───────────────────────────────────────────────────────────────

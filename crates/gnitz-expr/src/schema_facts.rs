@@ -39,7 +39,7 @@ pub trait SchemaFacts {
     ///
     /// Derived from [`Self::locate`] like the two above, so the two directions
     /// cannot disagree — and this is the direction that names the *output*
-    /// column a COPY_COL or EMIT is type-checked against, so a hand-written one
+    /// column a sink is type-checked against, so a hand-written one
     /// that is off by one approves the write against a neighbouring column's
     /// type. Override only to answer it in O(1) from a precomputed table.
     fn payload_col_idx(&self, pi: usize) -> usize {

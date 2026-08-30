@@ -6,14 +6,12 @@ and write paths, not just a single worker.
 
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_alter_drop.py -v --tb=short
 """
-import random
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100_000, 999_999))
 
 
 def _rows(client, sn, sql):

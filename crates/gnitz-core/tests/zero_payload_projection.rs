@@ -14,7 +14,7 @@
 
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{BatchAppender, ColData, GnitzClient, TableProps, ZSetBatch};
-use gnitz_expr::{CmpOp, ExprBuilder};
+use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 
@@ -34,10 +34,14 @@ fn pk_only_reply_schema(schema: &Schema) -> Schema {
 /// column indices.
 fn gt_predicate(col: usize, threshold: i64) -> Vec<u8> {
     let mut b = ExprBuilder::new();
-    let c = b.load_col_int(col);
-    let k = b.load_const(threshold);
-    let cond = b.cmp(CmpOp::Gt, c, k);
-    b.build(cond).encode()
+    let c = b.emit(L::LoadColInt { col: col as u32 });
+    let k = b.emit(L::LoadConst { val: threshold });
+    let cond = b.emit(L::Cmp {
+        op: CmpOp::Gt,
+        a: c,
+        b: k,
+    });
+    b.build(Some(cond)).expect("a well-formed program").to_blob_bytes()
 }
 
 /// No payload data crossed the wire. `ZSetBatch::new` keeps one `columns` slot
@@ -62,7 +66,10 @@ fn assert_no_payload(reply: &ZSetBatch, reply_schema: &Schema) {
 /// The keys-only rows sink: a zero-instruction projection, no ORDER BY, no limit.
 fn keys_only_sink() -> ReadSink {
     ReadSink::Rows {
-        projection: ExprBuilder::new().build(0).encode(),
+        projection: ExprBuilder::new()
+            .build(None)
+            .expect("a well-formed program")
+            .to_blob_bytes(),
         order: Vec::new(),
         limit_k: 0,
     }

@@ -1,50 +1,29 @@
 use super::*;
-use crate::{CmpOp, LogicalProgram};
+use crate::{CmpOp, LogicalInstr as L, LogicalProgram, StrOp};
 
-/// The builder's own output must decode back to the instructions it recorded,
-/// which is what makes [`ExprBuilder::build`] and
-/// [`ExprBuilder::build_logical`] two views of one program rather than two
-/// programs.
+/// The blob a built program encodes to must decode back to the instructions the
+/// builder recorded — which is what makes `to_blob_bytes` and the engine's
+/// `from_blob` two views of one program rather than two programs.
 #[test]
-fn build_and_build_logical_describe_the_same_program() {
-    // Built twice rather than cloned: the builder is consumed by both exits,
-    // and a `Clone` derive kept only for a test would be a use nothing in
-    // production has.
-    let build = || {
-        let mut b = ExprBuilder::new();
-        let c = b.load_const(1_234_567_890_123);
-        let col = b.load_col_int(0);
-        let cond = b.cmp(CmpOp::Gt, col, c);
-        let sel = b.select(cond, col, c);
-        (b, sel)
-    };
-    let (b, sel) = build();
-    let wire = b.build(sel);
-    let (b, sel) = build();
-    let logical = b.build_logical(sel).expect("a well-formed program");
-
-    let decoded = LogicalProgram::from_wire(&wire.code, wire.num_regs, wire.result_reg, wire.const_strings)
-        .expect("the builder must only emit decodable programs");
-    assert_eq!(decoded.instrs(), logical.instrs());
-}
-
-#[test]
-fn encode_round_trips_through_wire_decoder() {
+fn the_blob_round_trips_through_the_wire_decoder() {
     let mut b = ExprBuilder::new();
-    let c = b.load_const(1_234_567_890_123);
-    let col = b.load_col_int(0);
-    let cond = b.cmp(CmpOp::Gt, col, c);
+    let c = b.emit(L::LoadConst { val: 1_234_567_890_123 });
+    let col = b.emit(L::LoadColInt { col: 0 });
+    let cond = b.emit(L::Cmp {
+        op: CmpOp::Gt,
+        a: col,
+        b: c,
+    });
     let s_idx = b.add_const_string("längre sträng".to_string());
-    let _ = b.str_col_const(StrOp::Eq, 1, s_idx);
+    let _ = b.emit(L::StrColConst {
+        op: StrOp::Eq,
+        col: 1,
+        const_idx: s_idx,
+    });
     let _ = b.add_const_string(String::new());
-    let sel = b.select(cond, col, c);
-    let prog = b.build(sel);
+    let sel = b.emit(L::Select { cond, a: col, b: c });
+    let prog = b.build(Some(sel)).expect("a well-formed program");
 
-    let blob = prog.encode();
-    let dec = gnitz_wire::decode_expr_blob(&blob).unwrap();
-    assert_eq!(dec.num_regs, prog.num_regs);
-    assert_eq!(dec.result_reg, prog.result_reg);
-    assert_eq!(dec.code, prog.code);
-    // Both sides are now `Vec<Vec<u8>>` — compare the byte-transparent pool directly.
-    assert_eq!(dec.const_strings, prog.const_strings);
+    let decoded = LogicalProgram::from_blob(&prog.to_blob_bytes(), "test").expect("the blob must decode");
+    assert_eq!(decoded.instrs(), prog.instrs());
 }

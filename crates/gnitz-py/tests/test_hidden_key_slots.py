@@ -10,14 +10,12 @@ rows. The `include_hidden=True` scan surfaces them for debugging.
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_hidden_key_slots.py -v --tb=short
 """
-import random
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _live(client, vid, include_hidden=False):

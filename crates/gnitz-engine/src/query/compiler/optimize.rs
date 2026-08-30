@@ -336,7 +336,7 @@ pub(super) fn key_promotion_invalid(cols: &[u32], target_tcs: &[u8], schema: &Sc
 
 /// The **payload** copy domain: the ≤8-byte fixed-int widen, which is the only
 /// promotion the copy kernel supports. Identical to the rule `check_copy_types`
-/// holds a COPY_COL destination to — the HashRow payload widen is that same
+/// holds a column sink's destination to — the HashRow payload widen is that same
 /// kernel — so it is narrower than [`key_promotion_invalid`], not a mode of it.
 pub(super) fn payload_promotion_invalid(cols: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
     promotion_invalid(cols, target_tcs, schema, gnitz_wire::is_widening_promotion)
@@ -526,13 +526,12 @@ mod tests {
         // Minimal two-sided SQL join circuit skeleton:
         //   ScanDelta(left_tid=10) → Map(reindex_col=1) → Join → IntegrateSink
         //   ScanDelta(right_tid=20) → Map(reindex_col=0) → Join
-        let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(10));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob.clone(),
+                keep: vec![0],
                 reindex_cols: vec![1],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -542,7 +541,7 @@ mod tests {
         nodes.insert(
             3,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob,
+                keep: vec![0],
                 reindex_cols: vec![0],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -586,7 +585,7 @@ mod tests {
         nodes.insert(
             2,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob,
+                keep: vec![0],
                 reindex_cols: vec![1],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -623,10 +622,9 @@ mod tests {
     fn test_scatter_routing_two_keys_one_source_is_deterministic() {
         use gnitz_wire::{MapKind, OpNode};
 
-        let dummy_blob = dummy_expr_blob();
-        let reindex = |col: u32, blob| {
+        let reindex = |col: u32| {
             OpNode::Map(MapKind::Reindex {
-                program: blob,
+                keep: vec![0],
                 reindex_cols: vec![col],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -634,9 +632,9 @@ mod tests {
         };
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(10));
-        nodes.insert(1, reindex(1, dummy_blob.clone()));
+        nodes.insert(1, reindex(1));
         nodes.insert(2, scan_delta(10));
-        nodes.insert(3, reindex(2, dummy_blob));
+        nodes.insert(3, reindex(2));
         nodes.insert(4, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(5, OpNode::IntegrateSink);
         let edges = vec![
@@ -665,10 +663,9 @@ mod tests {
     fn test_scatter_routing_repeated_key_one_source_still_routes() {
         use gnitz_wire::{MapKind, OpNode};
 
-        let dummy_blob = dummy_expr_blob();
-        let reindex = |blob| {
+        let reindex = || {
             OpNode::Map(MapKind::Reindex {
-                program: blob,
+                keep: vec![0],
                 reindex_cols: vec![1],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -676,9 +673,9 @@ mod tests {
         };
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(10));
-        nodes.insert(1, reindex(dummy_blob.clone()));
+        nodes.insert(1, reindex());
         nodes.insert(2, scan_delta(10));
-        nodes.insert(3, reindex(dummy_blob));
+        nodes.insert(3, reindex());
         nodes.insert(4, OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
         nodes.insert(5, OpNode::IntegrateSink);
         let edges = vec![
@@ -703,14 +700,13 @@ mod tests {
     fn test_scatter_routing_unreindexed_trace_side_absent() {
         use gnitz_wire::{MapKind, OpNode};
 
-        let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(10));
         nodes.insert(1, scan_delta(20));
         nodes.insert(
             2,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob,
+                keep: vec![0],
                 reindex_cols: vec![2],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,

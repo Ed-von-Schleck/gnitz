@@ -330,7 +330,7 @@ fn test_projection_k1_collapse_pk_middle() {
 //
 // Drives data through the full server: the compound PK rides the PK region
 // while duplicate-PK copies (a2, b2) and a computed column (vp) are payload, so
-// reading the view back exposes the pass-through, the COPY_COL PK-decode, and
+// reading the view back exposes the pass-through, the column sink's PK-decode, and
 // the expr-map together. Each DML statement is its own epoch, so the assertions
 // after each one check the *incremental* result, not a one-shot recompute.
 

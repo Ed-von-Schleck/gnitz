@@ -17,10 +17,9 @@ Run with GNITZ_WORKERS=4 (the fold is per-worker; the client merges partials):
 import random
 
 import pytest
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _rows(client, sn, q):

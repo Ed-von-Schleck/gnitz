@@ -63,10 +63,10 @@ pub(crate) struct EvalScratch {
     /// has string instructions; a zero-length default view reads as `""`.
     str_views: Vec<StrView>,
     /// Whether this drive has already installed the program's constant
-    /// registers. `validate`'s single-assignment rule (`RegRewrite`) makes
-    /// `LoadConst`/`LoadConstStr` their register's only writer for the program's
-    /// life, so the second and later morsels of a drive would re-fill lanes that
-    /// already hold the value. Re-armed by [`Self::ensure_capacity`], which is
+    /// registers. A register *is* the index of the instruction that writes it,
+    /// so `LoadConst`/`LoadConstStr` is its register's only writer for the
+    /// program's life, and the second and later morsels of a drive would re-fill
+    /// lanes that already hold the value. Re-armed by [`Self::ensure_capacity`], which is
     /// also what keeps it from carrying across programs.
     consts_installed: bool,
     /// Computed string bytes — case folds, concatenations, numeric text —
@@ -310,7 +310,7 @@ impl MorselOut<'_> {
 
     /// Register `reg`'s values for this morsel's rows, in row order. Crate-local:
     /// consumers outside this crate read the same lanes as bytes, through
-    /// [`Self::reg_bytes`], which is what an 8-byte EMIT slot stores.
+    /// [`Self::reg_bytes`], which is what an 8-byte output slot stores.
     #[inline(always)]
     pub(crate) fn reg_values(&self, reg: usize) -> &[i64] {
         let base = reg * MORSEL;
@@ -318,7 +318,7 @@ impl MorselOut<'_> {
     }
 
     /// The same values as their little-endian byte image, 8 bytes per row —
-    /// what an 8-byte EMIT slot stores. `check_emit_slot` holds every EMIT
+    /// what an 8-byte output slot stores. `check_emit_slot` holds every register sink
     /// destination to such a slot, so a caller can blit this straight into one.
     #[inline(always)]
     pub fn reg_bytes(&self, reg: usize) -> &[u8] {
@@ -604,7 +604,7 @@ fn maybe_pack_bool_bits(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: usize) 
 
 /// Call `f(i)` for each row `i` of a morsel of `m` rows whose null bit is set in
 /// the register-major `null_bits` window starting at `base`. NULL rows are the
-/// exception, so every consumer — zeroing a register's null entries, EMIT's
+/// exception, so every consumer — zeroing a register's null entries, the emit's
 /// value-slot zero plus output-bitmap merge — scans the set bits rather than
 /// branching per row. Per instruction per morsel.
 pub(crate) fn for_each_null_row(null_bits: &[u64], base: usize, m: usize, mut f: impl FnMut(usize)) {
@@ -820,7 +820,7 @@ fn arena_push_span(arena: &mut Vec<u8>, bufs: StrBufs<'_>, src: u32, o: usize, l
 /// long cell points into the blob, a short one at its own inline bytes, which
 /// `german_string_inline` shows are the contiguous slice `cell[4..4 + len]`.
 /// `buf` must be the [`StrBufs`] index holding `cells`. The out-of-range clamp is
-/// applied here, so LENGTH, the compares, the transforms and EMIT all agree on
+/// applied here, so LENGTH, the compares, the transforms and the emits all agree on
 /// the degraded value.
 fn cell_to_view(cells: &[u8], row: usize, buf: u32, blob_len: usize) -> StrView {
     let o = row * 16;
@@ -1146,8 +1146,8 @@ fn eval_str_reg_cmp(
 ///
 /// `select_take_mask` returns its words *by value*, so it holds no borrow while
 /// this runs. The unsafe split is the one `regs`/`null_bits` already rely on,
-/// under the same `validate` anti-aliasing rule (`RegisterAliasing`), which
-/// covers `StrSelect` too.
+/// sound because an instruction's register is its own index and it can only read
+/// earlier ones — which covers `StrSelect` too.
 #[inline]
 fn blend_by_mask<T: Copy>(buf: &mut [T], srcs: [usize; 2], d: usize, take_a: &[u64], m: usize) {
     let ([ra, rb], rd) = split_windows(buf, MORSEL, srcs, d, m);

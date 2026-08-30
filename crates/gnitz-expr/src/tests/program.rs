@@ -4,16 +4,20 @@
 
 use gnitz_wire::{type_code, ExprOp, FixedInt, TrimMode};
 use std::collections::BTreeSet;
+use std::num::NonZeroU8;
 
 // `tests/program.rs` is `#[path]`-attached to `program.rs`, so `super` is that
 // module — one import line rather than three spellings of it.
 use super::{analyze, ColKind, FloatUnaryOp, IntUnaryOp, ProgramFacts};
 use crate::batch::{decode_f64, encode_f64};
 use crate::test_support::{
-    filter_prog, is_not_null_op, is_null_op, make_int_view, make_string_view, scalar_prog, schema_pk_ints,
-    schema_pk_strings, TestSchema, TestView,
+    filter_prog, is_not_null_op, is_null_op, make_int_view, make_string_view, scalar_prog, scalar_prog_with_sinks,
+    schema_pk_ints, schema_pk_strings, TestSchema, TestView,
 };
-use crate::{CmpOp, Evaluator, ExprValidateErr, Instr, LogicalInstr, LogicalProgram, StrOp};
+use crate::{
+    CmpOp, ConstIdx, Evaluator, ExprValidateErr, FloatArithOp, Instr, IntArithOp, LogicalInstr, LogicalProgram, Reg,
+    Sink, StrOp,
+};
 
 /// The phrase a `ColKindMismatch` renders for `kind`, read from its one source
 /// rather than re-spelled here — so widening a kind's predicate without its
@@ -23,8 +27,8 @@ fn type_phrase(kind: ColKind) -> &'static str {
 }
 
 /// Run `ev` at m=1 over `(mb, row)` and report
-/// `(result value or NULL, EMIT null mask, EMIT values)` — the map-side read,
-/// where each EMIT'd register lands in an output payload slot and a NULL
+/// `(result value or NULL, sink null mask, sink values)` — the map-side read,
+/// where each stored register lands in an output payload slot and a NULL
 /// register stores 0 with its output bit set.
 fn eval_with_emit(ev: &Evaluator, mb: &TestView, row: usize) -> (Option<i64>, u64, Vec<i64>) {
     let mut emit_vals: Vec<i64> = Vec::new();
@@ -51,24 +55,27 @@ fn int_add_and_negate() {
 
     // ADD: 10 + 3 = 13
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadColInt { dst: 1, col: 2 },
-        LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadColInt { col: 2 },
+        LogicalInstr::IntArith {
+            op: IntArithOp::Add,
+            a: Reg(0),
+            b: Reg(1),
+        },
     ];
-    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let prog = scalar_prog(&schema, instrs, Reg(2), vec![]);
     let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 13);
 
     // NEG: -10
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::IntUnary {
             op: IntUnaryOp::Neg,
-            dst: 1,
-            a: 0,
+            a: Reg(0),
         },
     ];
-    let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
+    let prog = scalar_prog(&schema, instrs, Reg(1), vec![]);
     let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, -10);
 }
@@ -83,11 +90,15 @@ fn float_add() {
 
     // FLOAT_ADD: 3.14 + 2.0
     let instrs = vec![
-        LogicalInstr::LoadColFloat { dst: 0, col: 1 },
-        LogicalInstr::LoadColFloat { dst: 1, col: 2 },
-        LogicalInstr::FloatAdd { dst: 2, a: 0, b: 1 },
+        LogicalInstr::LoadColFloat { col: 1 },
+        LogicalInstr::LoadColFloat { col: 2 },
+        LogicalInstr::FloatArith {
+            op: FloatArithOp::Add,
+            a: Reg(0),
+            b: Reg(1),
+        },
     ];
-    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let prog = scalar_prog(&schema, instrs, Reg(2), vec![]);
     let val = prog.eval_row(&mb, 0).expect("not NULL");
     let result = decode_f64(val);
     assert!((result - 5.14).abs() < 1e-10);
@@ -101,17 +112,16 @@ fn load_const_carries_a_full_width_i64() {
     // Test large constant: 0x00000001_00000002 = (1 << 32) | 2 = 4294967298
     // Wire form: lo 32 bits = 2, hi 32 bits = 1.
     let instrs = vec![LogicalInstr::LoadConst {
-        dst: 0,
         val: ((1i64) << 32) | (2i64 & 0xFFFF_FFFF),
     }];
-    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    let prog = scalar_prog(&schema, instrs, Reg(0), vec![]);
     let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, (1i64 << 32) | 2);
 
     // Test negative constant: -1 (the wire low/high split is reconstructed by
     // `from_wire`; the typed instruction carries the full i64 value directly).
-    let instrs = vec![LogicalInstr::LoadConst { dst: 0, val: -1 }];
-    let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+    let instrs = vec![LogicalInstr::LoadConst { val: -1 }];
+    let prog = scalar_prog(&schema, instrs, Reg(0), vec![]);
     let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, -1);
 }
@@ -122,10 +132,10 @@ fn int_to_float_widens_the_register() {
     let mb = make_int_view(&schema, &[(1, 0, &[42])]);
 
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::IntToFloat { dst: 1, a: 0 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::IntToFloat { a: Reg(0) },
     ];
-    let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
+    let prog = scalar_prog(&schema, instrs, Reg(1), vec![]);
     let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(decode_f64(val), 42.0);
 }
@@ -143,26 +153,48 @@ fn a_u64_column_selects_the_unsigned_arm_of_div_mod_and_the_float_cast() {
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::U64]);
     // u64::MAX is -1 as i64, so every signed reading below is a different number.
     let mb = make_int_view(&schema, &[(1, 0, &[u64::MAX as i64])]);
-    let run = |instrs: Vec<LogicalInstr>, num_regs, result| {
-        scalar_prog(&schema, instrs, num_regs, result, vec![])
+    let run = |instrs: Vec<LogicalInstr>, result: u16| {
+        scalar_prog(&schema, instrs, Reg(result), vec![])
             .eval_row(&mb, 0)
             .expect("not NULL")
     };
-    let load = LogicalInstr::LoadColInt { dst: 0, col: 1 };
-    let two = LogicalInstr::LoadConst { dst: 1, val: 2 };
+    let load = LogicalInstr::LoadColInt { col: 1 };
+    let two = LogicalInstr::LoadConst { val: 2 };
 
     assert_eq!(
-        run(vec![load, two, LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 }], 3, 2),
+        run(
+            vec![
+                load,
+                two,
+                LogicalInstr::IntArith {
+                    op: IntArithOp::Div,
+                    a: Reg(0),
+                    b: Reg(1)
+                }
+            ],
+            2
+        ),
         i64::MAX,
         "u64::MAX / 2 unsigned; signed -1/2 would be 0",
     );
     assert_eq!(
-        run(vec![load, two, LogicalInstr::IntMod { dst: 2, a: 0, b: 1 }], 3, 2),
+        run(
+            vec![
+                load,
+                two,
+                LogicalInstr::IntArith {
+                    op: IntArithOp::Mod,
+                    a: Reg(0),
+                    b: Reg(1)
+                }
+            ],
+            2
+        ),
         1,
         "u64::MAX % 2 unsigned; signed -1 % 2 would be -1",
     );
     assert_eq!(
-        decode_f64(run(vec![load, LogicalInstr::IntToFloat { dst: 1, a: 0 }], 2, 1)),
+        decode_f64(run(vec![load, LogicalInstr::IntToFloat { a: Reg(0) }], 1)),
         u64::MAX as f64,
         "unsigned cast is ~1.8e19; signed would be -1.0",
     );
@@ -173,14 +205,18 @@ fn emit_writes_each_named_output_slot() {
     let schema = schema_pk_ints(2, true);
     let mb = make_int_view(&schema, &[(1, 0, &[10, 20])]);
 
-    // Compute col1 + col2, EMIT to payload col 0
+    // Compute col1 + col2, store into payload col 0
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadColInt { dst: 1, col: 2 },
-        LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
-        LogicalInstr::Emit { src: 2, out: 0 }, // emit r2 to payload col 0
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadColInt { col: 2 },
+        LogicalInstr::IntArith {
+            op: IntArithOp::Add,
+            a: Reg(0),
+            b: Reg(1),
+        },
     ];
-    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    // Sink 0 stores r2 into payload col 0.
+    let prog = scalar_prog_with_sinks(&schema, instrs, vec![Sink::Reg(Reg(2))], Reg(2), vec![]);
 
     let (val, mask, emit_vals) = eval_with_emit(&prog, &mb, 0);
     assert_eq!(val, Some(30)); // 10 + 20
@@ -189,31 +225,33 @@ fn emit_writes_each_named_output_slot() {
 }
 
 /// `r5 = (col1 > 1) AND (col2 > 1)` over `schema_pk_ints(2, _)`, using registers
-/// 0-5. The classification tests below and the EMIT test share it.
+/// 0-5. The classification tests below and the sink test share it.
 fn conjunction_over_two_cols() -> Vec<LogicalInstr> {
     vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: 1 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadConst { val: 1 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 2,
-            a: 0,
-            b: 1,
+            a: Reg(0),
+            b: Reg(1),
         },
-        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::LoadColInt { col: 2 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 4,
-            a: 3,
-            b: 1,
+            a: Reg(3),
+            b: Reg(1),
         },
-        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
+        LogicalInstr::BoolBinary {
+            is_or: false,
+            a: Reg(2),
+            b: Reg(4),
+        },
     ]
 }
 
-/// EMIT counts as a non-bool read of its source, so a boolean it ships is not
+/// A sink counts as a non-bool read of its register, so a boolean it ships is not
 /// `bit_only` and its producer writes `regs`. Were the source missing from the
-/// operand table, BOOL_AND would skip the unpack and EMIT would read a stale
+/// operand table, BOOL_AND would skip the unpack and the sink would read a stale
 /// lane.
 #[test]
 fn an_emitted_boolean_lands_in_regs() {
@@ -221,19 +259,18 @@ fn an_emitted_boolean_lands_in_regs() {
     // whatever `bit_only` says, which would make the value assertion vacuous.
     let schema = schema_pk_ints(2, true);
     let mb = make_int_view(&schema, &[(1, 0, &[10, 20])]);
-    let mut instrs = conjunction_over_two_cols();
-    instrs.push(LogicalInstr::Emit { src: 5, out: 0 });
-    let prog = scalar_prog(&schema, instrs, 6, 5, vec![]);
+    let instrs = conjunction_over_two_cols();
+    let prog = scalar_prog_with_sinks(&schema, instrs, vec![Sink::Reg(Reg(5))], Reg(5), vec![]);
     assert!(
         !prog.prog.no_nulls,
         "nullable columns keep the test off the no_nulls arm"
     );
-    assert!(!prog.prog.is_bit_only(5), "a register read by EMIT is not bit_only");
+    assert!(!prog.prog.is_bit_only(5), "a register a sink stores is not bit_only");
     let (_, _, emit_vals) = eval_with_emit(&prog, &mb, 0);
-    assert_eq!(emit_vals[0], 1, "EMIT must ship the AND value, not a stale lane");
+    assert_eq!(emit_vals[0], 1, "the sink must ship the AND value, not a stale lane");
 }
 
-/// A NULL result reaching EMIT sets the output slot's null bit and stores 0 —
+/// A NULL result reaching a sink sets the output slot's null bit and stores 0 —
 /// the one place a NULL row's value half is defined, since the output column
 /// must hold something.
 #[test]
@@ -241,12 +278,15 @@ fn emit_of_a_null_result_sets_the_slot_bit_and_stores_zero() {
     let schema = schema_pk_ints(2, true);
     let mb = make_int_view(&schema, &[(1, 0, &[10, 3])]);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: 0 },
-        LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
-        LogicalInstr::Emit { src: 2, out: 0 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadConst { val: 0 },
+        LogicalInstr::IntArith {
+            op: IntArithOp::Div,
+            a: Reg(0),
+            b: Reg(1),
+        },
     ];
-    let prog = scalar_prog(&schema, instrs, 3, 2, vec![]);
+    let prog = scalar_prog_with_sinks(&schema, instrs, vec![Sink::Reg(Reg(2))], Reg(2), vec![]);
     let (_, mask, emit_vals) = eval_with_emit(&prog, &mb, 0);
     assert_eq!((mask & 1, emit_vals[0]), (1, 0));
 }
@@ -259,9 +299,8 @@ fn emit_of_a_null_result_sets_the_slot_bit_and_stores_zero() {
 #[test]
 fn a_register_free_program_is_rejected() {
     let schema = schema_pk_ints(1, true);
-    // One COPY_COL instruction: copy col 1 → payload 0 (source type derived in resolve)
-    let instrs = vec![LogicalInstr::CopyCol { src_col: 1, out: 0 }];
-    let prog = || LogicalProgram::new(instrs.clone(), 0, 0, vec![]);
+    // One column copy: input col 1 → payload slot 0 (source type derived in resolve)
+    let prog = || LogicalProgram::new(Vec::new(), vec![Sink::Col(1)], None, vec![]);
     assert_eq!(
         prog().resolve_scalar(&schema).err(),
         Some(ExprValidateErr::ResultRegRequired),
@@ -299,8 +338,8 @@ fn a_column_index_resolves_to_the_pk_or_to_its_dense_payload_slot() {
         let schema = TestSchema::with_pk_at(pk_index, cols);
         let mb = make_int_view(&schema, &[(pk_val, 0, payloads)]);
         for (ci, &(want_slot, want_val)) in want.iter().enumerate() {
-            let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: ci as u32 }];
-            let prog = scalar_prog(&schema, instrs, 1, 0, vec![]);
+            let instrs = vec![LogicalInstr::LoadColInt { col: ci as u32 }];
+            let prog = scalar_prog(&schema, instrs, Reg(0), vec![]);
             let got_slot = match prog.prog.instrs[0] {
                 Instr::LoadPk { .. } => None,
                 Instr::LoadPayloadInt { pi, .. } => Some(pi),
@@ -332,13 +371,12 @@ fn str_col_const_is_classified_never_null() {
     ] {
         let instrs = vec![LogicalInstr::StrColConst {
             op: *op,
-            dst: 0,
             col: 1,
-            const_idx: 0,
+            const_idx: ConstIdx(0),
         }];
-        let prog = scalar_prog(&nullable_schema, instrs.clone(), 1, 0, vec![b"x".to_vec()]);
+        let prog = scalar_prog(&nullable_schema, instrs.clone(), Reg(0), vec![b"x".to_vec()]);
         assert!(!prog.prog.no_nulls, "{_name}: nullable col1 must yield no_nulls=false");
-        let prog = scalar_prog(&nonnull_schema, instrs, 1, 0, vec![b"x".to_vec()]);
+        let prog = scalar_prog(&nonnull_schema, instrs, Reg(0), vec![b"x".to_vec()]);
         assert!(
             prog.prog.no_nulls,
             "{_name}: non-nullable col1 must yield no_nulls=true"
@@ -349,16 +387,15 @@ fn str_col_const_is_classified_never_null() {
     for (op, _name) in &[(StrOp::Eq, "EQ_COL"), (StrOp::Lt, "LT_COL"), (StrOp::Le, "LE_COL")] {
         let instrs = vec![LogicalInstr::StrColCol {
             op: *op,
-            dst: 0,
             col_a: 1,
             col_b: 2,
         }];
-        let prog = scalar_prog(&nullable_schema, instrs.clone(), 1, 0, vec![]);
+        let prog = scalar_prog(&nullable_schema, instrs.clone(), Reg(0), vec![]);
         assert!(
             !prog.prog.no_nulls,
             "{_name}: nullable operands must yield no_nulls=false"
         );
-        let prog = scalar_prog(&nonnull_schema, instrs, 1, 0, vec![]);
+        let prog = scalar_prog(&nonnull_schema, instrs, Reg(0), vec![]);
         assert!(
             prog.prog.no_nulls,
             "{_name}: non-nullable operands must yield no_nulls=true"
@@ -376,17 +413,16 @@ fn str_col_const_is_classified_never_null() {
 fn load_null_else_branch_eval() {
     let schema = schema_pk_ints(1, true);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
-        LogicalInstr::LoadConst { dst: 1, val: 42 }, // a
-        LogicalInstr::LoadNull { dst: 2 },           // else NULL
+        LogicalInstr::LoadColInt { col: 1 }, // cond
+        LogicalInstr::LoadConst { val: 42 }, // a
+        LogicalInstr::LoadNull,              // else NULL
         LogicalInstr::Select {
-            dst: 3,
-            cond: 0,
-            a: 1,
-            b: 2,
+            cond: Reg(0),
+            a: Reg(1),
+            b: Reg(2),
         },
     ];
-    let prog = scalar_prog(&schema, instrs, 4, 3, vec![]);
+    let prog = scalar_prog(&schema, instrs, Reg(3), vec![]);
 
     // cond truthy → 42.
     let batch = make_int_view(&schema, &[(1, 0, &[5])]);
@@ -412,16 +448,15 @@ fn load_null_forces_the_nullable_path() {
     let nonnull_schema = schema_pk_ints(1, false);
     // CASE WHEN col1 THEN col1 END: r0=col1, r1=load_null, r2=select(r0, r0, r1).
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadNull { dst: 1 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadNull,
         LogicalInstr::Select {
-            dst: 2,
-            cond: 0,
-            a: 0,
-            b: 1,
+            cond: Reg(0),
+            a: Reg(0),
+            b: Reg(1),
         },
     ];
-    let prog = scalar_prog(&nonnull_schema, instrs, 3, 2, vec![]);
+    let prog = scalar_prog(&nonnull_schema, instrs, Reg(2), vec![]);
     assert!(!prog.prog.no_nulls, "LoadNull must force the nullable path");
 }
 
@@ -431,17 +466,16 @@ fn load_null_forces_the_nullable_path() {
 fn select_is_non_nullable_when_both_branches_are() {
     let nonnull_schema = schema_pk_ints(3, false);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadColInt { dst: 1, col: 2 },
-        LogicalInstr::LoadColInt { dst: 2, col: 3 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadColInt { col: 2 },
+        LogicalInstr::LoadColInt { col: 3 },
         LogicalInstr::Select {
-            dst: 3,
-            cond: 0,
-            a: 1,
-            b: 2,
+            cond: Reg(0),
+            a: Reg(1),
+            b: Reg(2),
         },
     ];
-    let prog = scalar_prog(&nonnull_schema, instrs, 4, 3, vec![]);
+    let prog = scalar_prog(&nonnull_schema, instrs, Reg(3), vec![]);
     assert!(
         prog.prog.no_nulls,
         "Select over NOT NULL branches must stay strictly-non-nullable"
@@ -455,24 +489,22 @@ fn select_propagates_u64_tracking_to_its_reader() {
     // Schema: pk(u64), u64col(U64), i64col(I64).
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::U64, type_code::I64]);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 2 }, // cond (i64)
-        LogicalInstr::LoadColInt { dst: 1, col: 1 }, // a (U64)
-        LogicalInstr::LoadColInt { dst: 2, col: 2 }, // b (i64)
+        LogicalInstr::LoadColInt { col: 2 }, // cond (i64)
+        LogicalInstr::LoadColInt { col: 1 }, // a (U64)
+        LogicalInstr::LoadColInt { col: 2 }, // b (i64)
         LogicalInstr::Select {
-            dst: 3,
-            cond: 0,
-            a: 1,
-            b: 2,
+            cond: Reg(0),
+            a: Reg(1),
+            b: Reg(2),
         },
-        LogicalInstr::LoadConst { dst: 4, val: 100 },
+        LogicalInstr::LoadConst { val: 100 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 5,
-            a: 3,
-            b: 4,
+            a: Reg(3),
+            b: Reg(4),
         },
     ];
-    let prog = scalar_prog(&schema, instrs, 6, 5, vec![]);
+    let prog = scalar_prog(&schema, instrs, Reg(5), vec![]);
     // Found by shape, not by position: which index resolution lands the compare
     // at is an internal detail, and three sibling tests already read it this way.
     let cmp = prog.prog.instrs.iter().find_map(|i| match i {
@@ -492,23 +524,26 @@ fn select_propagates_u64_tracking_to_its_reader() {
 fn select_classification_of_cond_and_result() {
     let schema = schema_pk_ints(4, true);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
-        LogicalInstr::LoadColInt { dst: 1, col: 2 }, // a
-        LogicalInstr::LoadColInt { dst: 2, col: 3 }, // b
+        LogicalInstr::LoadColInt { col: 1 }, // cond
+        LogicalInstr::LoadColInt { col: 2 }, // a
+        LogicalInstr::LoadColInt { col: 3 }, // b
         LogicalInstr::Select {
-            dst: 3,
-            cond: 0,
-            a: 1,
-            b: 2,
+            cond: Reg(0),
+            a: Reg(1),
+            b: Reg(2),
         },
-        LogicalInstr::LoadColInt { dst: 4, col: 4 }, // other bool
-        LogicalInstr::BoolAnd { dst: 5, a: 3, b: 4 },
+        LogicalInstr::LoadColInt { col: 4 }, // other bool
+        LogicalInstr::BoolBinary {
+            is_or: false,
+            a: Reg(3),
+            b: Reg(4),
+        },
     ];
     let ProgramFacts {
         bit_only, bool_input, ..
-    } = analyze(&instrs, &schema, 5, true);
+    } = analyze(&instrs, &[], &schema, Some(Reg(5)), true);
     // The same program must also be a legal filter.
-    filter_prog(&schema, instrs, 6, 5, vec![]);
+    filter_prog(&schema, instrs, Reg(5), vec![]);
     assert_ne!(bool_input & (1 << 0), 0, "cond is read as a bool_input");
     assert_ne!(bool_input & (1 << 3), 0, "select result feeds BOOL_AND as bool_input");
     assert_eq!(bit_only & (1 << 3), 0, "select dst is a value register, never bit_only");
@@ -525,38 +560,19 @@ fn a_select_result_reads_back_as_a_value() {
     let schema = schema_pk_ints(1, true);
     let mb = make_int_view(&schema, &[(1, 0, &[1])]);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond, truthy
-        LogicalInstr::LoadConst { dst: 1, val: 5 },
-        LogicalInstr::LoadConst { dst: 2, val: 7 },
+        LogicalInstr::LoadColInt { col: 1 }, // cond, truthy
+        LogicalInstr::LoadConst { val: 5 },
+        LogicalInstr::LoadConst { val: 7 },
         LogicalInstr::Select {
-            dst: 3,
-            cond: 0,
-            a: 1,
-            b: 2,
+            cond: Reg(0),
+            a: Reg(1),
+            b: Reg(2),
         },
     ];
-    let prog = scalar_prog(&schema, instrs, 4, 3, vec![]);
+    let prog = scalar_prog(&schema, instrs, Reg(3), vec![]);
     assert!(!prog.prog.no_nulls, "the nullable load keeps this off the no_nulls arm");
     let val = prog.eval_row(&mb, 0).expect("not NULL");
     assert_eq!(val, 5, "SELECT returns the chosen branch value, not a truth bit");
-}
-
-/// `dst` aliasing any of `cond`/`a`/`b` violates the SELECT anti-alias rule that
-/// makes `regs_split`'s raw split borrows sound.
-#[test]
-#[should_panic(expected = "RegisterAliasing")]
-fn select_rejects_a_dst_aliasing_an_operand() {
-    // `LogicalProgram::new` validates aliasing before any schema is consulted.
-    let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::Select {
-            dst: 0,
-            cond: 0,
-            a: 0,
-            b: 0,
-        }, // dst == cond
-    ];
-    let _ = LogicalProgram::new(instrs, 1, 0, vec![]);
 }
 
 /// Nested SELECT — `CASE WHEN c1 THEN v1 WHEN c2 THEN v2 ELSE v3 END` lowered as
@@ -566,25 +582,23 @@ fn nested_selects_evaluate_inside_out() {
     // Schema: pk, c1, c2, v1, v2, v3.
     let schema = schema_pk_ints(5, true);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // c1
-        LogicalInstr::LoadColInt { dst: 1, col: 2 }, // c2
-        LogicalInstr::LoadColInt { dst: 2, col: 3 }, // v1
-        LogicalInstr::LoadColInt { dst: 3, col: 4 }, // v2
-        LogicalInstr::LoadColInt { dst: 4, col: 5 }, // v3
+        LogicalInstr::LoadColInt { col: 1 }, // c1
+        LogicalInstr::LoadColInt { col: 2 }, // c2
+        LogicalInstr::LoadColInt { col: 3 }, // v1
+        LogicalInstr::LoadColInt { col: 4 }, // v2
+        LogicalInstr::LoadColInt { col: 5 }, // v3
         LogicalInstr::Select {
-            dst: 5,
-            cond: 1,
-            a: 3,
-            b: 4,
+            cond: Reg(1),
+            a: Reg(3),
+            b: Reg(4),
         }, // inner = c2 ? v2 : v3
         LogicalInstr::Select {
-            dst: 6,
-            cond: 0,
-            a: 2,
-            b: 5,
+            cond: Reg(0),
+            a: Reg(2),
+            b: Reg(5),
         }, // outer = c1 ? v1 : inner
     ];
-    let prog = scalar_prog(&schema, instrs, 7, 6, vec![]);
+    let prog = scalar_prog(&schema, instrs, Reg(6), vec![]);
     // payload cols: c1, c2, v1=10, v2=20, v3=30.
     // c1 truthy → v1.
     let batch = make_int_view(&schema, &[(1, 0, &[1, 1, 10, 20, 30])]);
@@ -602,8 +616,8 @@ fn nested_selects_evaluate_inside_out() {
 
 // ---------------------------------------------------------------------------
 // Expr-program validation (ExprValidateErr): one crafted input per vector.
-// Wire code is flat u32 quads `[opcode, w1, w2, w3]`; several opcodes read
-// `w2`/`w3` as full u32 (col / const_idx / out), not the loop's truncated u16.
+// Wire code is flat u32 triples `[opcode, a1, a2]`; several opcodes read
+// `a1`/`a2` as full u32 (col / const_idx), not a register's truncated u16.
 // ---------------------------------------------------------------------------
 
 /// `from_wire`'s `Ok` value (`LogicalProgram`) is not `Debug`/`PartialEq`, so
@@ -621,15 +635,42 @@ fn from_wire_rejects_an_unknown_opcode() {
     // current maximum": that couples the test to every opcode addition while
     // adding no coverage a new opcode's own decode test does not already give.
     assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[0, 0, 0, 0], 1, 0, vec![])),
+        wire_err(LogicalProgram::from_wire(&[0, 0, 0], &[], None, vec![])),
         ExprValidateErr::UnknownOpcode(0)
     );
     assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[u32::MAX, 0, 0, 0], 1, 0, vec![])),
+        wire_err(LogicalProgram::from_wire(&[u32::MAX, 0, 0], &[], None, vec![])),
         ExprValidateErr::UnknownOpcode(u32::MAX)
     );
-    // A valid opcode lowers (control): LOAD_COL_INT dst0 col0.
-    assert!(LogicalProgram::from_wire(&[1, 0, 0, 0], 1, 0, vec![]).is_ok());
+    // A valid opcode lowers (control): LOAD_COL_INT col0.
+    assert!(LogicalProgram::from_wire(&[1, 0, 0], &[], None, vec![]).is_ok());
+}
+
+/// The region-shape forgeries the split into a code and a sink region makes
+/// possible. Each is a length the encoder cannot produce, so a decode that
+/// accepted one would read an instruction or a sink out of another's words.
+#[test]
+fn from_wire_rejects_a_malformed_region() {
+    // A code length that is not a whole number of triples.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[1, 0], &[], None, vec![])),
+        ExprValidateErr::CorruptBlob("expr region length")
+    );
+    // A sink length that is not a whole number of pairs.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[], &[0u32], None, vec![])),
+        ExprValidateErr::CorruptBlob("expr region length")
+    );
+    // A sink naming a register no instruction writes.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[], &[1u32, 3], None, vec![])),
+        ExprValidateErr::RegOutOfRange { reg: 3, num_regs: 0 }
+    );
+    // A sink kind outside the two the encoder writes.
+    assert_eq!(
+        wire_err(LogicalProgram::from_wire(&[], &[7u32, 0], None, vec![])),
+        ExprValidateErr::UnknownOpcode(7)
+    );
 }
 
 // The rendering the planner's `Unsupported` and the engine's `CREATE VIEW`
@@ -679,36 +720,38 @@ fn validate_err_display_names_the_register_limit() {
 
 #[test]
 fn from_wire_rejects_a_bad_register_file() {
-    // num_regs over the 64-register limit.
+    // One instruction past the 64-register limit: the register file *is* the
+    // instruction list, so a 65th instruction is what overflows it.
+    let over_cap: Vec<u32> = std::iter::repeat_n([3, 0, 0], crate::MAX_REGS + 1).flatten().collect();
     assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[], 65, 0, vec![])),
+        wire_err(LogicalProgram::from_wire(&over_cap, &[], None, vec![])),
         ExprValidateErr::TooManyRegs(65)
     );
-    // result_reg out of range (>= num_regs).
+    // A result register no instruction writes.
     assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[], 3, 3, vec![])),
+        wire_err(LogicalProgram::from_wire(&[3, 0, 0], &[], Some(Reg(3)), vec![])),
         ExprValidateErr::ResultRegOutOfRange {
             result_reg: 3,
-            num_regs: 3,
+            num_regs: 1,
         }
     );
 }
 
+/// A register is the index of the instruction that writes it, so reading one at
+/// or above the reader's own index is a forward reference into a lane the morsel
+/// has not filled. It is the one rejection that covers the out-of-range, the
+/// self-referencing and the not-yet-written operand alike.
 #[test]
-fn from_wire_rejects_an_out_of_range_register() {
-    // IntAdd dst0 a5 b1 with num_regs=2: operand `a=5` is out of range.
+fn from_wire_rejects_a_forward_register_reference() {
+    // IntAdd a5 b1 as the first instruction: no register exists yet.
     assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[4, 0, 5, 1], 2, 0, vec![])),
-        ExprValidateErr::RegOutOfRange { reg: 5, num_regs: 2 }
+        wire_err(LogicalProgram::from_wire(&[4, 5, 1], &[], None, vec![])),
+        ExprValidateErr::RegReadBeforeWrite { reg: 5 }
     );
-}
-
-#[test]
-fn from_wire_rejects_register_aliasing() {
-    // IntAdd dst0 a0 b1: dst aliases a source — breaks `regs_split`'s split borrows.
+    // LoadConst then IntAdd reading its own register.
     assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[4, 0, 0, 1], 2, 0, vec![])),
-        ExprValidateErr::RegisterAliasing { dst: 0, reg: 0 }
+        wire_err(LogicalProgram::from_wire(&[3, 0, 0, 4, 1, 0], &[], None, vec![])),
+        ExprValidateErr::RegReadBeforeWrite { reg: 1 }
     );
 }
 
@@ -716,7 +759,7 @@ fn from_wire_rejects_register_aliasing() {
 fn from_wire_rejects_an_out_of_range_const_idx() {
     // STR_COL_EQ_CONST (40) dst0 col0 const_idx9, pool of length 1.
     assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[40, 0, 0, 9], 1, 0, vec![b"x".to_vec()])),
+        wire_err(LogicalProgram::from_wire(&[40, 0, 9], &[], None, vec![b"x".to_vec()])),
         ExprValidateErr::ConstIdxOutOfRange { const_idx: 9, n: 1 }
     );
 }
@@ -725,7 +768,7 @@ fn from_wire_rejects_an_out_of_range_const_idx() {
 fn validate_rejects_an_out_of_range_column() {
     // LOAD_COL_INT (1) col=200 against a 3-column schema.
     let s3 = schema_pk_ints(2, true);
-    let prog = LogicalProgram::from_wire(&[1, 0, 200, 0], 1, 0, vec![]).unwrap();
+    let prog = LogicalProgram::from_wire(&[1, 200, 0], &[], None, vec![]).unwrap();
     assert_eq!(
         prog.validate(&s3, None),
         Err(ExprValidateErr::ColOutOfRange {
@@ -741,13 +784,13 @@ fn validate_rejects_a_pk_column_for_a_payload_only_opcode() {
     let s_pk = schema_pk_strings(1, true);
     // Each payload-only opcode that routes a PK column to the pi=255 sentinel.
     let cases: &[(&[u32], Vec<Vec<u8>>)] = &[
-        (&[2, 0, 0, 0], vec![]),               // LOAD_COL_FLOAT col0
-        (&[30, 0, 0, 0], vec![]),              // IS_NULL col0
-        (&[40, 0, 0, 0], vec![b"x".to_vec()]), // STR_COL_EQ_CONST col0
-        (&[43, 0, 0, 1], vec![]),              // STR_COL_EQ_COL col_a=0
+        (&[2, 0, 0], vec![]),               // LOAD_COL_FLOAT col0
+        (&[30, 0, 0], vec![]),              // IS_NULL col0
+        (&[40, 0, 0], vec![b"x".to_vec()]), // STR_COL_EQ_CONST col0
+        (&[43, 0, 1], vec![]),              // STR_COL_EQ_COL col_a=0
     ];
     for (code, consts) in cases {
-        let prog = LogicalProgram::from_wire(code, 1, 0, consts.clone()).unwrap();
+        let prog = LogicalProgram::from_wire(code, &[], None, consts.clone()).unwrap();
         assert_eq!(
             prog.validate(&s_pk, None),
             Err(ExprValidateErr::ColNotPayload { col: 0 }),
@@ -762,7 +805,7 @@ fn validate_rejects_a_wide_column_register_load() {
     // LOAD_COL_INT on a 16-byte U128 column: a register holds 8 bytes, so the
     // load is rejected at validation rather than silently truncating.
     let schema = TestSchema::new(&[(type_code::U64, false), (type_code::U128, true)], &[0]);
-    let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
+    let prog = LogicalProgram::from_wire(&[1, 1, 0], &[], None, vec![]).unwrap();
     assert_eq!(
         prog.validate(&schema, None),
         Err(ExprValidateErr::ColKindMismatch {
@@ -781,7 +824,7 @@ fn validate_rejects_a_wide_column_register_load() {
 fn load_col_int_requires_a_fixed_int_column() {
     for tc in [type_code::F64, type_code::F32, 200, type_code::STRING] {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
-        let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
+        let prog = LogicalProgram::from_wire(&[1, 1, 0], &[], None, vec![]).unwrap();
         assert_eq!(
             prog.validate(&schema, None),
             Err(ExprValidateErr::ColKindMismatch {
@@ -804,7 +847,7 @@ fn load_col_int_requires_a_fixed_int_column() {
         type_code::I64,
     ] {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
-        let prog = LogicalProgram::from_wire(&[1, 0, 1, 0], 1, 0, vec![]).unwrap();
+        let prog = LogicalProgram::from_wire(&[1, 1, 0], &[], None, vec![]).unwrap();
         assert_eq!(prog.validate(&schema, None), Ok(()), "type code {tc}");
     }
 }
@@ -816,7 +859,7 @@ fn load_col_int_requires_a_fixed_int_column() {
 fn load_col_float_requires_a_float_column() {
     let case = |tc: u8| {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
-        LogicalProgram::from_wire(&[2, 0, 1, 0], 1, 0, vec![])
+        LogicalProgram::from_wire(&[2, 1, 0], &[], None, vec![])
             .unwrap()
             .validate(&schema, None)
     };
@@ -842,7 +885,7 @@ fn str_opcodes_require_a_german_string_column() {
     let schema = |a: u8, b: u8| TestSchema::with_pk_at(0, &[type_code::U64, a, b]);
     // STR_COL_EQ_CONST (40) col=1.
     let vs_const = |a: u8| {
-        LogicalProgram::from_wire(&[40, 0, 1, 0], 1, 0, vec![b"x".to_vec()])
+        LogicalProgram::from_wire(&[40, 1, 0], &[], None, vec![b"x".to_vec()])
             .unwrap()
             .validate(&schema(a, type_code::STRING), None)
     };
@@ -859,7 +902,7 @@ fn str_opcodes_require_a_german_string_column() {
 
     // STR_COL_EQ_COL (43) col_a=1 col_b=2 — both operands are checked.
     let vs_col = |a: u8, b: u8| {
-        LogicalProgram::from_wire(&[43, 0, 1, 2], 1, 0, vec![])
+        LogicalProgram::from_wire(&[43, 1, 2], &[], None, vec![])
             .unwrap()
             .validate(&schema(a, b), None)
     };
@@ -890,7 +933,7 @@ fn null_tests_accept_any_payload_column() {
     for tc in [type_code::U128, type_code::STRING, type_code::F32] {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
         for op in [30u32, 31] {
-            let prog = LogicalProgram::from_wire(&[op, 0, 1, 0], 1, 0, vec![]).unwrap();
+            let prog = LogicalProgram::from_wire(&[op, 1, 0], &[], None, vec![]).unwrap();
             assert_eq!(prog.validate(&schema, None), Ok(()), "opcode {op} type {tc}");
         }
     }
@@ -905,10 +948,7 @@ fn copy_col_admits_only_a_widening_destination() {
     let pair = |src: u8, dst: u8| {
         let in_schema = TestSchema::with_pk_at(0, &[type_code::U64, src]);
         let out_schema = TestSchema::with_pk_at(0, &[type_code::U64, dst]);
-        // COPY_COL (34) src_col=1 out=0.
-        LogicalProgram::from_wire(&[34, 0, 1, 0], 0, 0, vec![])
-            .unwrap()
-            .validate(&in_schema, Some(&out_schema))
+        LogicalProgram::copy_cols(&[1]).validate(&in_schema, Some(&out_schema))
     };
     for (src, dst) in [
         (type_code::I64, type_code::I64),
@@ -944,22 +984,22 @@ fn copy_col_admits_only_a_widening_destination() {
     // A PK source into a payload slot of the same type is a copy, not a promotion.
     let in_pk = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
     let out_pk = TestSchema::with_pk_at(0, &[type_code::I64, type_code::U64]);
-    let prog = LogicalProgram::from_wire(&[34, 0, 0, 0], 0, 0, vec![]).unwrap();
+    let prog = LogicalProgram::copy_cols(&[0]);
     assert_eq!(prog.validate(&in_pk, Some(&out_pk)), Ok(()));
     // Both output-side checks are inert for a filter (`out_schema = None`).
     assert_eq!(prog.validate(&in_pk, None), Ok(()));
 }
 
-/// EMIT stores a whole 8-byte register image: a 16-byte slot panics on the first
-/// row and a narrower one truncates, so the destination stride is exactly 8.
+/// A register sink stores a whole 8-byte register image: a 16-byte slot panics
+/// on the first row and a narrower one truncates, so the destination stride is
+/// exactly 8.
 #[test]
-fn an_emit_slot_must_be_eight_bytes() {
-    // out: [U64 PK, <slot>] — one payload slot, written by the single EMIT.
+fn a_register_sink_slot_must_be_eight_bytes() {
+    // out: [U64 PK, <slot>] — one payload slot, written by the single sink.
     let case = |tc: u8| {
         let schema = TestSchema::with_pk_at(0, &[type_code::U64, tc]);
-        // LOAD_CONST (3) into reg 0 — EMIT's source must have a writer — then
-        // EMIT (32) src=0 out=0.
-        LogicalProgram::from_wire(&[3, 0, 0, 0, 32, 0, 0, 0], 1, 0, vec![])
+        // LOAD_CONST (3) into reg 0, stored into output slot 0.
+        LogicalProgram::from_wire(&[3, 0, 0], &[1, 0], None, vec![])
             .unwrap()
             .validate(&schema, Some(&schema))
     };
@@ -984,67 +1024,47 @@ fn an_emit_slot_must_be_eight_bytes() {
     }
 }
 
+/// Output coverage: with an `out_schema`, the sink list must be exactly as long
+/// as the declared payload. A sink writes the slot at its own position, so a
+/// permuted or duplicated destination cannot be expressed and a short list is
+/// the only failure left.
 #[test]
-fn output_indices_are_checked_only_for_a_map() {
-    // in: [U64 PK, I64]; out: [U64 PK, I64] — one output payload slot.
-    let in_schema = schema_pk_ints(1, false);
-    let out_schema = schema_pk_ints(1, false);
-    // COPY_COL (34) src_col=0 out=200: rejected as a MAP (out_schema Some).
-    let prog = LogicalProgram::from_wire(&[34, 0, 0, 200], 0, 0, vec![]).unwrap();
-    assert_eq!(
-        prog.validate(&in_schema, Some(&out_schema)),
-        Err(ExprValidateErr::OutputIdxOutOfRange {
-            out: 200,
-            num_payload_cols: 1,
-        })
-    );
-    // The same output opcode in a FILTER (out_schema None) is a harmless no-op.
-    assert_eq!(prog.validate(&in_schema, None), Ok(()));
-}
-
-/// Output coverage: with an `out_schema`, every declared payload slot must be
-/// written. Counted by popcount, so a duplicate destination — which leaves
-/// another slot unwritten while the instruction count still matches — is caught
-/// by the same rule.
-#[test]
-fn validate_rejects_an_unwritten_output_slot() {
+fn validate_rejects_a_sink_list_that_does_not_cover_the_output() {
     // in/out: [U64 PK, I64, I64] — two output payload slots.
     let schema = schema_pk_ints(2, false);
-    let map = |quads: &[u32]| LogicalProgram::from_wire(quads, 0, 0, vec![]).unwrap();
+    let map = |sinks: &[u32]| LogicalProgram::from_wire(&[], sinks, None, vec![]).unwrap();
 
     // Both slots written — accepted.
-    assert_eq!(
-        map(&[34, 0, 1, 0, 34, 0, 2, 1]).validate(&schema, Some(&schema)),
-        Ok(())
-    );
+    assert_eq!(map(&[0, 1, 0, 2]).validate(&schema, Some(&schema)), Ok(()));
 
     // Only slot 0 written.
     assert_eq!(
-        map(&[34, 0, 1, 0]).validate(&schema, Some(&schema)),
-        Err(ExprValidateErr::OutputSlotUnwritten {
-            written: 0b01,
-            num_payload_cols: 2,
-        })
-    );
-
-    // Two CopyCols, both onto slot 0: the count matches but slot 1 is unwritten.
-    assert_eq!(
-        map(&[34, 0, 1, 0, 34, 0, 2, 0]).validate(&schema, Some(&schema)),
-        Err(ExprValidateErr::OutputSlotUnwritten {
-            written: 0b01,
+        map(&[0, 1]).validate(&schema, Some(&schema)),
+        Err(ExprValidateErr::OutputSlotCountMismatch {
+            sinks: 1,
             num_payload_cols: 2,
         })
     );
 
     // A predicate over the same program is unaffected — no output plan.
-    assert_eq!(map(&[34, 0, 1, 0]).validate(&schema, None), Ok(()));
+    assert_eq!(map(&[0, 1]).validate(&schema, None), Ok(()));
 }
 
 #[test]
-#[should_panic(expected = "RegisterAliasing")]
-fn new_panics_on_an_aliased_register() {
-    // A compiler-built (trusted) aliased-register program still panics from `new`.
-    let _ = LogicalProgram::new(vec![LogicalInstr::IntAdd { dst: 0, a: 0, b: 1 }], 2, 0, vec![]);
+#[should_panic(expected = "RegReadBeforeWrite")]
+fn new_panics_on_a_forward_register_reference() {
+    // A compiler-built (trusted) program that reads an unwritten register still
+    // panics from `new`.
+    let _ = LogicalProgram::new(
+        vec![LogicalInstr::IntArith {
+            op: IntArithOp::Add,
+            a: Reg(0),
+            b: Reg(1),
+        }],
+        Vec::new(),
+        None,
+        vec![],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,14 +1076,13 @@ fn new_panics_on_an_aliased_register() {
 fn in_set_prog(col_tc: u8, set: &[i64]) -> (TestSchema, Evaluator) {
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, col_tc]);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::IntInSet {
-            dst: 1,
-            value_reg: 0,
-            set_idx: 0,
+            value_reg: Reg(0),
+            set_idx: ConstIdx(0),
         },
     ];
-    let prog = scalar_prog(&schema, instrs, 2, 1, vec![gnitz_wire::as_le_bytes(set).to_vec()]);
+    let prog = scalar_prog(&schema, instrs, Reg(1), vec![gnitz_wire::as_le_bytes(set).to_vec()]);
     (schema, prog)
 }
 
@@ -1120,19 +1139,17 @@ fn int_in_set_membership_over_every_pool_shape() {
 fn not_in_set_excludes_a_null_operand() {
     let schema = schema_pk_ints(1, true);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::IntInSet {
-            dst: 1,
-            value_reg: 0,
-            set_idx: 0,
+            value_reg: Reg(0),
+            set_idx: ConstIdx(0),
         },
-        LogicalInstr::BoolNot { dst: 2, a: 1 },
+        LogicalInstr::BoolNot { a: Reg(1) },
     ];
     let prog = scalar_prog(
         &schema,
         instrs,
-        3,
-        2,
+        Reg(2),
         vec![gnitz_wire::as_le_bytes(&[1i64, 2, 3]).to_vec()],
     );
     for (null_word, val, want) in [(0b1, 0, None), (0, 9, Some(1)), (0, 2, Some(0))] {
@@ -1168,7 +1185,7 @@ fn validate_rejects_a_misaligned_in_set_pool() {
     // structure-only validate, so it rejects here.
     // Quad: [INT_IN_SET=46, dst=1, value_reg=0, set_idx=0], pool of 5 bytes.
     assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[46, 1, 0, 0], 2, 1, vec![vec![0u8; 5]])),
+        wire_err(LogicalProgram::from_wire(&[46, 0, 0], &[], None, vec![vec![0u8; 5]])),
         ExprValidateErr::IntSetNotAligned { set_idx: 0, len: 5 }
     );
 }
@@ -1177,7 +1194,7 @@ fn validate_rejects_a_misaligned_in_set_pool() {
 fn validate_rejects_an_out_of_range_set_idx() {
     // set_idx = 9 against a pool of length 1 → ConstIdxOutOfRange.
     assert_eq!(
-        wire_err(LogicalProgram::from_wire(&[46, 1, 0, 9], 2, 1, vec![vec![0u8; 8]])),
+        wire_err(LogicalProgram::from_wire(&[46, 0, 9], &[], None, vec![vec![0u8; 8]])),
         ExprValidateErr::ConstIdxOutOfRange { const_idx: 9, n: 1 }
     );
 }
@@ -1190,9 +1207,9 @@ fn classifier_pure_conjunction_filter() {
     let instrs = conjunction_over_two_cols();
     let ProgramFacts {
         bit_only, bool_input, ..
-    } = analyze(&instrs, &schema, 5, true);
+    } = analyze(&instrs, &[], &schema, Some(Reg(5)), true);
     // The same program must also be a legal filter.
-    filter_prog(&schema, instrs, 6, 5, vec![]);
+    filter_prog(&schema, instrs, Reg(5), vec![]);
     // Bool producers: r2 (CMP_GT), r4 (CMP_GT), r5 (BOOL_AND).
     // Non-bool readers consume r0/r1/r3 (CMPs read them as i64), so those
     // never qualify for bit_only. r2/r4 are read only by BOOL_AND, and r5
@@ -1230,9 +1247,9 @@ fn decode_rejects_a_forged_cast_target() {
             0x100u32 | type_code::I64 as u32,
             0x1_0000u32 | type_code::I64 as u32,
         ] {
-            let code = [ExprOp::LoadColInt.as_wire(), 0, 1, 0, op, 1, 0, tc];
+            let code = [ExprOp::LoadColInt.as_wire(), 1, 0, op, 0, tc];
             assert_eq!(
-                wire_err(LogicalProgram::from_wire(&code, 2, 1, vec![])),
+                wire_err(LogicalProgram::from_wire(&code, &[], None, vec![])),
                 ExprValidateErr::BadCastTarget { tc },
                 "op {op} tc {tc}"
             );
@@ -1248,9 +1265,9 @@ fn decode_rejects_a_forged_cast_target() {
             type_code::I64,
             type_code::U64,
         ] {
-            let code = [ExprOp::LoadColInt.as_wire(), 0, 1, 0, op, 1, 0, tc as u32];
+            let code = [ExprOp::LoadColInt.as_wire(), 1, 0, op, 0, tc as u32];
             assert!(
-                LogicalProgram::from_wire(&code, 2, 1, vec![]).is_ok(),
+                LogicalProgram::from_wire(&code, &[], None, vec![]).is_ok(),
                 "op {op} tc {tc} must be accepted"
             );
         }
@@ -1269,14 +1286,15 @@ fn validate_bounds_checks_every_register_operand() {
         ExprOp::FloatToF32.as_wire(),
     ];
     for op in unary {
-        // dst out of range, then operand out of range.
+        // The operand names a register no earlier instruction wrote — the same
+        // rejection whether it is the opcode's own index or one past the end.
         assert!(matches!(
-            wire_err(LogicalProgram::from_wire(&[op, 9, 0, 0], 2, 0, vec![])),
-            ExprValidateErr::RegOutOfRange { .. }
+            wire_err(LogicalProgram::from_wire(&[op, 0, 0], &[], None, vec![])),
+            ExprValidateErr::RegReadBeforeWrite { .. }
         ));
         assert!(matches!(
-            wire_err(LogicalProgram::from_wire(&[op, 0, 9, 0], 2, 0, vec![])),
-            ExprValidateErr::RegOutOfRange { .. }
+            wire_err(LogicalProgram::from_wire(&[op, 9, 0], &[], None, vec![])),
+            ExprValidateErr::RegReadBeforeWrite { .. }
         ));
     }
     for op in [
@@ -1285,15 +1303,11 @@ fn validate_bounds_checks_every_register_operand() {
         ExprOp::FloatMax2.as_wire(),
         ExprOp::FloatMin2.as_wire(),
     ] {
+        // Both operand words are bounded, not just the first.
         assert!(matches!(
-            wire_err(LogicalProgram::from_wire(&[op, 0, 1, 9], 2, 0, vec![])),
-            ExprValidateErr::RegOutOfRange { .. }
+            wire_err(LogicalProgram::from_wire(&[3, 0, 0, op, 0, 9], &[], None, vec![])),
+            ExprValidateErr::RegReadBeforeWrite { reg: 9 }
         ));
-        // The binary ops are SSA anti-aliased: dst may not be an operand.
-        assert!(
-            LogicalProgram::from_wire(&[op, 0, 0, 1], 2, 0, vec![]).is_err(),
-            "op {op}: dst == a must be rejected"
-        );
     }
 }
 
@@ -1304,39 +1318,34 @@ fn validate_bounds_checks_every_register_operand() {
 fn narrowing_casts_manufacture_null_but_pure_transforms_do_not() {
     let nonnull = schema_pk_ints(1, false);
     let with = |instr: LogicalInstr| {
-        let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }, instr];
-        scalar_prog(&nonnull, instrs, 2, 1, vec![]).prog.no_nulls
+        let instrs = vec![LogicalInstr::LoadColInt { col: 1 }, instr];
+        scalar_prog(&nonnull, instrs, Reg(1), vec![]).prog.no_nulls
     };
     for instr in [
         LogicalInstr::IntUnary {
             op: IntUnaryOp::Abs,
-            dst: 1,
-            a: 0,
+            a: Reg(0),
         },
         LogicalInstr::FloatUnary {
             op: super::FloatUnaryOp::Round,
-            dst: 1,
-            a: 0,
+            a: Reg(0),
         },
         LogicalInstr::IntMinMax2 {
-            dst: 1,
-            a: 0,
-            b: 0,
+            a: Reg(0),
+            b: Reg(0),
             is_max: true,
         },
     ] {
         assert!(with(instr), "a propagating transform keeps no_nulls");
     }
     for instr in [
-        LogicalInstr::FloatToF32 { dst: 1, a: 0 },
+        LogicalInstr::FloatToF32 { a: Reg(0) },
         LogicalInstr::IntCast {
-            dst: 1,
-            a: 0,
+            a: Reg(0),
             fi: FixedInt::I8,
         },
         LogicalInstr::FloatToInt {
-            dst: 1,
-            a: 0,
+            a: Reg(0),
             fi: FixedInt::I8,
         },
     ] {
@@ -1352,13 +1361,12 @@ fn narrowing_casts_manufacture_null_but_pure_transforms_do_not() {
 #[test]
 fn a_null_test_alone_keeps_no_nulls_but_a_load_of_the_column_does_not() {
     let schema = schema_pk_ints(1, true);
-    let no_nulls = |instrs: Vec<LogicalInstr>, num_regs: u32, result: u32| {
-        scalar_prog(&schema, instrs, num_regs, result, vec![]).prog.no_nulls
-    };
+    let no_nulls =
+        |instrs: Vec<LogicalInstr>, result: u16| scalar_prog(&schema, instrs, Reg(result), vec![]).prog.no_nulls;
 
-    for instr in [is_null_op(0, 1), is_not_null_op(0, 1)] {
+    for instr in [is_null_op(1), is_not_null_op(1)] {
         assert!(
-            no_nulls(vec![instr], 1, 0),
+            no_nulls(vec![instr], 0),
             "a null test over a nullable column is definite"
         );
     }
@@ -1366,11 +1374,7 @@ fn a_null_test_alone_keeps_no_nulls_but_a_load_of_the_column_does_not() {
     // The same nullable column, now also loaded: the load is what carries the
     // NULL into a register, so the program belongs on the nullable arm.
     assert!(
-        !no_nulls(
-            vec![is_null_op(0, 1), LogicalInstr::LoadColInt { dst: 1, col: 1 },],
-            2,
-            0
-        ),
+        !no_nulls(vec![is_null_op(1), LogicalInstr::LoadColInt { col: 1 }], 0),
         "loading the tested column must force the nullable arm"
     );
 }
@@ -1382,8 +1386,8 @@ fn a_null_test_alone_keeps_no_nulls_but_a_load_of_the_column_does_not() {
 #[test]
 fn a_nullable_pk_column_load_keeps_no_nulls() {
     let schema = TestSchema::new(&[(type_code::U64, true), (type_code::I64, false)], &[0]);
-    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }];
-    assert!(scalar_prog(&schema, instrs, 1, 0, vec![]).prog.no_nulls);
+    let instrs = vec![LogicalInstr::LoadColInt { col: 0 }];
+    assert!(scalar_prog(&schema, instrs, Reg(0), vec![]).prog.no_nulls);
 }
 
 /// A float column load inherits its column's null bit, like every other typed
@@ -1395,8 +1399,8 @@ fn a_nullable_pk_column_load_keeps_no_nulls() {
 fn a_float_column_load_carries_its_null_bit() {
     let no_nulls_over = |nullable: bool| {
         let schema = TestSchema::new(&[(type_code::U64, false), (type_code::F64, nullable)], &[0]);
-        let instrs = vec![LogicalInstr::LoadColFloat { dst: 0, col: 1 }];
-        scalar_prog(&schema, instrs, 1, 0, vec![]).prog.no_nulls
+        let instrs = vec![LogicalInstr::LoadColFloat { col: 1 }];
+        scalar_prog(&schema, instrs, Reg(0), vec![]).prog.no_nulls
     };
     assert!(!no_nulls_over(true), "a nullable F64 column forces the nullable arm");
     assert!(no_nulls_over(false), "a non-nullable one does not");
@@ -1411,24 +1415,22 @@ fn min_max2_compare_domain_and_u64_propagation() {
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::U64, type_code::I64]);
     let signed_of = |a_col: u32, b_col: u32| {
         let instrs = vec![
-            LogicalInstr::LoadColInt { dst: 0, col: a_col },
-            LogicalInstr::LoadColInt { dst: 1, col: b_col },
+            LogicalInstr::LoadColInt { col: a_col },
+            LogicalInstr::LoadColInt { col: b_col },
             LogicalInstr::IntMinMax2 {
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
                 is_max: true,
             },
             // A second fold against the signed column reads dst's taint.
-            LogicalInstr::LoadColInt { dst: 3, col: 2 },
+            LogicalInstr::LoadColInt { col: 2 },
             LogicalInstr::IntMinMax2 {
-                dst: 4,
-                a: 2,
-                b: 3,
+                a: Reg(2),
+                b: Reg(3),
                 is_max: true,
             },
         ];
-        let prog = scalar_prog(&schema, instrs, 5, 4, vec![]);
+        let prog = scalar_prog(&schema, instrs, Reg(4), vec![]);
         prog.prog
             .instrs
             .iter()
@@ -1454,17 +1456,16 @@ fn int_cast_reseeds_u64_tracking_from_its_target() {
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64, type_code::U64]);
     let cmp_signed_after = |fi: FixedInt, src_col: u32| {
         let instrs = vec![
-            LogicalInstr::LoadColInt { dst: 0, col: src_col },
-            LogicalInstr::IntCast { dst: 1, a: 0, fi },
-            LogicalInstr::LoadConst { dst: 2, val: 0 },
+            LogicalInstr::LoadColInt { col: src_col },
+            LogicalInstr::IntCast { a: Reg(0), fi },
+            LogicalInstr::LoadConst { val: 0 },
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 3,
-                a: 1,
-                b: 2,
+                a: Reg(1),
+                b: Reg(2),
             },
         ];
-        let prog = scalar_prog(&schema, instrs, 4, 3, vec![]);
+        let prog = scalar_prog(&schema, instrs, Reg(3), vec![]);
         prog.prog
             .instrs
             .iter()
@@ -1489,14 +1490,13 @@ fn int_cast_records_the_source_signedness() {
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64, type_code::U64]);
     let src_signed_of = |src_col: u32| {
         let instrs = vec![
-            LogicalInstr::LoadColInt { dst: 0, col: src_col },
+            LogicalInstr::LoadColInt { col: src_col },
             LogicalInstr::IntCast {
-                dst: 1,
-                a: 0,
+                a: Reg(0),
                 fi: FixedInt::I8,
             },
         ];
-        let prog = scalar_prog(&schema, instrs, 2, 1, vec![]);
+        let prog = scalar_prog(&schema, instrs, Reg(1), vec![]);
         prog.prog
             .instrs
             .iter()
@@ -1511,18 +1511,14 @@ fn int_cast_records_the_source_signedness() {
 }
 
 // ---------------------------------------------------------------------------
-// Register classes and single-assignment
+// Register classes
 // ---------------------------------------------------------------------------
 
 /// Decode a wire program and keep only the verdict. The class rules are
 /// schema-free, so this is where a forged program meets them — before any schema
 /// is in hand.
-fn from_wire(code: &[u32], num_regs: u32) -> Result<(), ExprValidateErr> {
-    wire_verdict(code, num_regs, 0)
-}
-
-fn wire_verdict(code: &[u32], num_regs: u32, result_reg: u32) -> Result<(), ExprValidateErr> {
-    LogicalProgram::from_wire(code, num_regs, result_reg, vec![]).map(|_| ())
+fn from_wire(code: &[u32]) -> Result<(), ExprValidateErr> {
+    LogicalProgram::from_wire(code, &[], None, vec![]).map(|_| ())
 }
 
 /// A mixed-class register operand is refused whichever way round it goes: a
@@ -1533,65 +1529,32 @@ fn wire_verdict(code: &[u32], num_regs: u32, result_reg: u32) -> Result<(), Expr
 fn operand_class_is_enforced_in_both_directions() {
     // LOAD_COL_INT into reg 0, then UPPER of it.
     assert_eq!(
-        from_wire(
-            &[
-                ExprOp::LoadColInt.as_wire(),
-                0,
-                1,
-                0,
-                ExprOp::StrUpper.as_wire(),
-                1,
-                0,
-                0
-            ],
-            2
-        ),
+        from_wire(&[ExprOp::LoadColInt.as_wire(), 1, 0, ExprOp::StrUpper.as_wire(), 0, 0]),
         Err(ExprValidateErr::RegClassMismatch { reg: 0 })
     );
     // LOAD_COL_STR into reg 0, then integer ADD of it.
     assert_eq!(
-        from_wire(
-            &[ExprOp::LoadColStr.as_wire(), 0, 1, 0, ExprOp::IntAdd.as_wire(), 1, 0, 0],
-            2
-        ),
+        from_wire(&[ExprOp::LoadColStr.as_wire(), 1, 0, ExprOp::IntAdd.as_wire(), 0, 0]),
         Err(ExprValidateErr::RegClassMismatch { reg: 0 })
     );
     // The mixed-class opcodes police each half separately: SUBSTR's source must
     // be a string and its bounds must not be.
     assert_eq!(
-        from_wire(
-            &[
-                ExprOp::LoadConst.as_wire(),
-                0,
-                1,
-                0,
-                ExprOp::StrSubstr.as_wire(),
-                1,
-                0,
-                0
-            ],
-            2
-        ),
+        from_wire(&[ExprOp::LoadConst.as_wire(), 1, 0, ExprOp::StrSubstr.as_wire(), 0, 0]),
         Err(ExprValidateErr::RegClassMismatch { reg: 0 })
     );
     assert_eq!(
-        from_wire(
-            &[
-                ExprOp::LoadColStr.as_wire(),
-                0,
-                1,
-                0, //
-                ExprOp::LoadColStr.as_wire(),
-                1,
-                1,
-                0, //
-                ExprOp::StrSubstr.as_wire(),
-                2,
-                0,
-                1,
-            ],
-            3
-        ),
+        from_wire(&[
+            ExprOp::LoadColStr.as_wire(),
+            1,
+            0, //
+            ExprOp::LoadColStr.as_wire(),
+            1,
+            0, //
+            ExprOp::StrSubstr.as_wire(),
+            0,
+            1,
+        ]),
         Err(ExprValidateErr::RegClassMismatch { reg: 1 }),
         "a string register cannot be a window bound"
     );
@@ -1603,148 +1566,70 @@ fn operand_class_is_enforced_in_both_directions() {
 #[test]
 fn string_operand_read_before_its_writer_is_refused() {
     // UPPER of reg 1 at instruction 0; reg 1's only writer is instruction 1.
-    let code = [
-        ExprOp::StrUpper.as_wire(),
-        0,
-        1,
-        0,
-        ExprOp::LoadColStr.as_wire(),
-        1,
-        1,
-        0,
-    ];
-    assert_eq!(from_wire(&code, 2), Err(ExprValidateErr::RegReadBeforeWrite { reg: 1 }));
+    let code = [ExprOp::StrUpper.as_wire(), 1, 0, ExprOp::LoadColStr.as_wire(), 1, 0];
+    assert_eq!(from_wire(&code), Err(ExprValidateErr::RegReadBeforeWrite { reg: 1 }));
     // The same two instructions in the other order are legal, so the rejection
     // above is about ordering and not about the instructions themselves.
-    let ordered = [
-        ExprOp::LoadColStr.as_wire(),
-        0,
-        1,
-        0,
-        ExprOp::StrUpper.as_wire(),
-        1,
-        0,
-        0,
-    ];
-    assert!(from_wire(&ordered, 2).is_ok());
+    let ordered = [ExprOp::LoadColStr.as_wire(), 1, 0, ExprOp::StrUpper.as_wire(), 0, 0];
+    assert!(from_wire(&ordered).is_ok());
 }
 
-/// The multi-operand string opcodes join the existing SSA anti-aliasing arms:
-/// their kernels split `str_views` at `dst` while reading a source window, and
-/// `split_windows`' disjointness guard is a `debug_assert` release compiles out.
+/// A register names the instruction that writes it, so an instruction reading
+/// its own register is a forward reference into a lane the morsel has not
+/// filled. This is what used to be the anti-aliasing rule the string kernels'
+/// `split_windows` depends on; it is now the same one comparison as
+/// read-before-write.
 #[test]
-fn string_ops_are_anti_aliased_against_their_destination() {
-    let load_two = [
-        ExprOp::LoadColStr.as_wire(),
-        0,
-        1,
-        0,
-        ExprOp::LoadColStr.as_wire(),
-        1,
-        2,
-        0,
-    ];
-    let alias = |op: u32, dst: u32, a: u32, b: u32| {
+fn a_string_op_cannot_read_the_register_it_writes() {
+    let load_two = [ExprOp::LoadColStr.as_wire(), 1, 0, ExprOp::LoadColStr.as_wire(), 2, 0];
+    let self_read = |op: u32, a: u32, b: u32| {
         let mut code = load_two.to_vec();
-        code.extend_from_slice(&[op, dst, a, b]);
-        from_wire(&code, 3)
+        code.extend_from_slice(&[op, a, b]);
+        from_wire(&code)
     };
-    for (op, a, b) in [(ExprOp::StrCmpEq.as_wire(), 0, 1), (ExprOp::StrConcat.as_wire(), 0, 1)] {
-        assert!(
-            matches!(alias(op, 0, a, b), Err(ExprValidateErr::RegisterAliasing { .. })),
-            "opcode {op} must not write one of its own sources"
+    for op in [ExprOp::StrCmpEq.as_wire(), ExprOp::StrConcat.as_wire()] {
+        assert_eq!(
+            self_read(op, 2, 1),
+            Err(ExprValidateErr::RegReadBeforeWrite { reg: 2 }),
+            "opcode {op} must not read the register it writes"
         );
     }
-    // STR_SELECT packs `a | b << 16`, and SUBSTR `start | len << 16`.
-    let sel = |dst: u32, cond: u32, a: u32, b: u32| {
-        let mut code = load_two.to_vec();
-        code.extend_from_slice(&[
-            ExprOp::StrSelect.as_wire(),
-            dst,
-            cond,
-            gnitz_wire::pack_operand_pair(a, b),
-        ]);
-        from_wire(&code, 3)
-    };
-    assert!(matches!(sel(1, 2, 0, 1), Err(ExprValidateErr::RegisterAliasing { .. })));
-    // `dst == a` where the register was never written: only the aliasing arm
-    // catches this, since a never-written register also reads as class-clear.
-    let mut code = vec![ExprOp::LoadColStr.as_wire(), 0, 1, 0];
-    code.extend_from_slice(&[ExprOp::StrSubstr.as_wire(), 0, 0, 1]);
-    assert!(matches!(
-        from_wire(&code, 2),
-        Err(ExprValidateErr::RegisterAliasing { .. })
-    ));
+    // STR_SELECT packs `a | b << 16` and takes a *scalar* condition, so its
+    // program needs one more load before the self-reference is the only fault.
+    let code = [
+        ExprOp::LoadConst.as_wire(),
+        0,
+        0,
+        ExprOp::LoadColStr.as_wire(),
+        1,
+        0,
+        ExprOp::StrSelect.as_wire(),
+        0,
+        gnitz_wire::pack_operand_pair(2, 1),
+    ];
+    assert_eq!(from_wire(&code), Err(ExprValidateErr::RegReadBeforeWrite { reg: 2 }));
 }
 
-/// Single-assignment stops being a client convention and becomes a checked rule.
-/// Every planner-emitted program is already SSA (`ExprBuilder::push` is a monotonic
-/// counter), so nothing legitimate is refused.
+/// Single assignment is not a checked rule any more: a register *is* the index
+/// of the one instruction that writes it, so two writers cannot be spelled and a
+/// sink-only program has no register to collide over.
 #[test]
-fn a_register_may_have_only_one_writer() {
-    // Same class.
-    assert_eq!(
-        from_wire(
-            &[
-                ExprOp::LoadConst.as_wire(),
-                0,
-                1,
-                0,
-                ExprOp::LoadConst.as_wire(),
-                0,
-                2,
-                0
-            ],
-            1
-        ),
-        Err(ExprValidateErr::RegRewrite { reg: 0 })
-    );
-    // Across classes, which is what makes a register's class well-defined.
-    assert_eq!(
-        from_wire(
-            &[
-                ExprOp::LoadColStr.as_wire(),
-                0,
-                1,
-                0,
-                ExprOp::LoadConst.as_wire(),
-                0,
-                2,
-                0
-            ],
-            1
-        ),
-        Err(ExprValidateErr::RegRewrite { reg: 0 })
-    );
-    // The aliasing check keeps precedence, so the more specific diagnosis wins.
-    assert!(matches!(
-        from_wire(
-            &[ExprOp::LoadColInt.as_wire(), 0, 1, 0, ExprOp::CmpGt.as_wire(), 0, 0, 0],
-            1
-        ),
-        Err(ExprValidateErr::RegisterAliasing { .. })
-    ));
-    // A register-free `CopyCol` program has no `dst` to collide.
+fn a_sink_only_program_names_no_registers() {
     assert!(LogicalProgram::copy_cols(&[0, 1, 2]).payload_copy_srcs().is_some());
 }
 
-/// EMIT's destination must hold what its source register's class stores. A
-/// mismatch either way is caught before eval, where it would write an 8-byte
-/// register image into a 16-byte cell (or the reverse).
+/// A register sink's destination must hold what the source register's class
+/// stores. A mismatch either way is caught before eval, where it would write an
+/// 8-byte register image into a 16-byte cell (or the reverse).
 #[test]
-fn emit_class_must_match_its_destination_column() {
+fn a_register_sink_must_match_its_destination_column() {
     // out: [U64 PK, STRING].
     let str_out = TestSchema::with_pk_at(0, &[type_code::U64, type_code::STRING]);
     let int_out = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
     let in_str = TestSchema::with_pk_at(0, &[type_code::U64, type_code::STRING]);
+    let store_r0 = &[1u32, 0]; // Sink::Reg(0)
 
-    let scalar_src = LogicalProgram::from_wire(
-        &[ExprOp::LoadConst.as_wire(), 0, 7, 0, ExprOp::Emit.as_wire(), 0, 0, 0],
-        1,
-        0,
-        vec![],
-    )
-    .unwrap();
+    let scalar_src = LogicalProgram::from_wire(&[ExprOp::LoadConst.as_wire(), 7, 0], store_r0, None, vec![]).unwrap();
     assert_eq!(
         scalar_src.validate(&in_str, Some(&str_out)),
         Err(ExprValidateErr::EmitClassMismatch {
@@ -1753,13 +1638,7 @@ fn emit_class_must_match_its_destination_column() {
         })
     );
 
-    let str_src = LogicalProgram::from_wire(
-        &[ExprOp::LoadColStr.as_wire(), 0, 1, 0, ExprOp::Emit.as_wire(), 0, 0, 0],
-        1,
-        0,
-        vec![],
-    )
-    .unwrap();
+    let str_src = LogicalProgram::from_wire(&[ExprOp::LoadColStr.as_wire(), 1, 0], store_r0, None, vec![]).unwrap();
     assert_eq!(
         str_src.validate(&in_str, Some(&int_out)),
         Err(ExprValidateErr::EmitClassMismatch {
@@ -1775,23 +1654,13 @@ fn emit_class_must_match_its_destination_column() {
     assert_eq!(scalar_src.str_class, 0);
 }
 
-/// EMIT's source is exempt from the class check — its class picks the
-/// destination-column rule — but not from the bound every other read gets.
-#[test]
-fn emit_bounds_checks_its_source_register() {
-    assert_eq!(
-        from_wire(&[ExprOp::Emit.as_wire(), 0, 5, 0], 2),
-        Err(ExprValidateErr::RegOutOfRange { reg: 5, num_regs: 2 })
-    );
-}
-
 /// The result register's class splits the two resolvers that make the identical
 /// `validate` call: a filter reads its verdict out of the scalar file, while a
 /// SET right-hand side wants exactly a string back.
 #[test]
 fn a_string_result_register_resolves_as_a_scalar_but_not_as_a_filter() {
     let schema = schema_pk_strings(1, true);
-    let prog = || LogicalProgram::from_wire(&[ExprOp::LoadColStr.as_wire(), 0, 1, 0], 1, 0, vec![]).unwrap();
+    let prog = || LogicalProgram::from_wire(&[ExprOp::LoadColStr.as_wire(), 1, 0], &[], Some(Reg(0)), vec![]).unwrap();
     assert_eq!(
         prog().resolve_filter(&schema).err(),
         Some(ExprValidateErr::RegClassMismatch { reg: 0 })
@@ -1803,7 +1672,7 @@ fn a_string_result_register_resolves_as_a_scalar_but_not_as_a_filter() {
 fn load_col_str_requires_a_german_string_column() {
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, type_code::I64]);
     assert_eq!(
-        LogicalProgram::from_wire(&[ExprOp::LoadColStr.as_wire(), 0, 1, 0], 1, 0, vec![])
+        LogicalProgram::from_wire(&[ExprOp::LoadColStr.as_wire(), 1, 0], &[], None, vec![])
             .unwrap()
             .validate(&schema, None),
         Err(ExprValidateErr::ColKindMismatch {
@@ -1820,16 +1689,14 @@ fn trim_mode_and_cast_target_are_narrowed_at_decode() {
         LogicalProgram::from_wire(
             &[
                 ExprOp::LoadColStr.as_wire(),
-                0,
                 1,
                 0,
                 ExprOp::StrTrim.as_wire(),
-                1,
                 gnitz_wire::pack_operand_pair(0, mode),
                 0,
             ],
-            2,
-            1,
+            &[],
+            None,
             vec![b" ".to_vec()],
         )
         .map(|_| ())
@@ -1840,20 +1707,7 @@ fn trim_mode_and_cast_target_are_narrowed_at_decode() {
     assert_eq!(trim(3), Err(ExprValidateErr::BadTrimMode { mode: 3 }));
 
     assert_eq!(
-        wire_verdict(
-            &[
-                ExprOp::LoadColStr.as_wire(),
-                0,
-                1,
-                0,
-                ExprOp::StrToInt.as_wire(),
-                1,
-                0,
-                999
-            ],
-            2,
-            1
-        ),
+        from_wire(&[ExprOp::LoadColStr.as_wire(), 1, 0, ExprOp::StrToInt.as_wire(), 0, 999]),
         Err(ExprValidateErr::BadCastTarget { tc: 999 })
     );
 }
@@ -1865,17 +1719,15 @@ fn like_rejects_a_forged_escape_or_operand() {
     let load_like = |op, escape: u32, pat_idx| {
         [
             ExprOp::LoadColStr.as_wire(),
-            0,
             1,
             0,
             op,
-            1,
             gnitz_wire::pack_operand_pair(0, escape),
             pat_idx,
         ]
     };
     let pool = || vec![b"a%".to_vec()];
-    let decode = |code: [u32; 8], pool: Vec<Vec<u8>>| LogicalProgram::from_wire(&code, 2, 1, pool).map(|_| ());
+    let decode = |code: [u32; 6], pool: Vec<Vec<u8>>| LogicalProgram::from_wire(&code, &[], None, pool).map(|_| ());
 
     assert!(decode(load_like(ExprOp::StrLike.as_wire(), b'\\' as u32, 0), pool()).is_ok());
     // Escape 0 disables escaping, and an empty pool entry is the legal `LIKE ''`.
@@ -1891,42 +1743,13 @@ fn like_rejects_a_forged_escape_or_operand() {
         decode(load_like(ExprOp::StrLike.as_wire(), 0x1_5C, 0), pool()),
         Err(ExprValidateErr::BadLikeEscape { escape: 0x1_5C })
     );
-    // The source must be a string register …
+    // The source must be a string register.
     assert_eq!(
         decode(
-            [
-                ExprOp::LoadColInt.as_wire(),
-                0,
-                1,
-                0,
-                ExprOp::StrLike.as_wire(),
-                1,
-                0,
-                0
-            ],
+            [ExprOp::LoadColInt.as_wire(), 1, 0, ExprOp::StrLike.as_wire(), 0, 0],
             pool()
         ),
         Err(ExprValidateErr::RegClassMismatch { reg: 0 })
-    );
-    // … and the destination may not alias it.
-    assert_eq!(
-        LogicalProgram::from_wire(
-            &[
-                ExprOp::LoadColStr.as_wire(),
-                0,
-                1,
-                0,
-                ExprOp::StrLike.as_wire(),
-                0,
-                0,
-                0
-            ],
-            1,
-            0,
-            pool()
-        )
-        .map(|_| ()),
-        Err(ExprValidateErr::RegisterAliasing { dst: 0, reg: 0 })
     );
 }
 
@@ -1935,19 +1758,14 @@ fn like_rejects_a_forged_escape_or_operand() {
 #[test]
 fn two_like_opcodes_over_one_pool_index_get_a_matcher_each() {
     let schema = schema_pk_strings(1, false);
-    let like = |dst, ci| LogicalInstr::StrLike {
-        dst,
-        src: 0,
-        escape: Some(b'\\'),
-        pat_idx: 0,
+    let like = |ci| LogicalInstr::StrLike {
+        src: Reg(0),
+        escape: NonZeroU8::new(b'\\'),
+        pat_idx: ConstIdx(0),
         ci,
     };
-    let instrs = vec![
-        LogicalInstr::LoadColStr { dst: 0, col: 1 },
-        like(1, false),
-        like(2, true),
-    ];
-    let ev = scalar_prog(&schema, instrs, 3, 1, vec![b"abc".to_vec()]);
+    let instrs = vec![LogicalInstr::LoadColStr { col: 1 }, like(false), like(true)];
+    let ev = scalar_prog(&schema, instrs, Reg(1), vec![b"abc".to_vec()]);
     assert_eq!(ev.prog.like_matchers.len(), 2);
 
     let rows: Vec<&[&[u8]]> = vec![&[b"ABC"]];
@@ -1967,48 +1785,36 @@ fn two_like_opcodes_over_one_pool_index_get_a_matcher_each() {
 #[test]
 fn string_nullability_classification() {
     let schema = schema_pk_strings(1, false);
-    let no_nulls = |tail: Vec<LogicalInstr>, num_regs: u32, result: u32| {
-        let mut instrs = vec![LogicalInstr::LoadColStr { dst: 0, col: 1 }];
+    // The tail's last instruction is the result register; a column load takes
+    // index 0, so the result is `tail.len()`.
+    let no_nulls = |tail: Vec<LogicalInstr>| {
+        let result = Reg(tail.len() as u16);
+        let mut instrs = vec![LogicalInstr::LoadColStr { col: 1 }];
         instrs.extend(tail);
-        scalar_prog(&schema, instrs, num_regs, result, vec![]).prog.no_nulls
+        scalar_prog(&schema, instrs, result, vec![]).prog.no_nulls
     };
-    assert!(no_nulls(
-        vec![LogicalInstr::StrCase {
-            dst: 1,
-            a: 0,
-            upper: true
-        }],
-        2,
-        1
-    ));
-    assert!(!no_nulls(
-        vec![LogicalInstr::StrToInt {
-            dst: 1,
-            a: 0,
-            fi: FixedInt::I64,
-        }],
-        2,
-        1
-    ));
+    assert!(no_nulls(vec![LogicalInstr::StrCase { a: Reg(0), upper: true }]));
+    assert!(!no_nulls(vec![LogicalInstr::StrToInt {
+        a: Reg(0),
+        fi: FixedInt::I64
+    }]));
     // SUBSTR's only NULL is a negative length, so the two forms classify
     // differently: with a FOR clause it can produce one, without it cannot. The
     // window itself is total either way.
-    let substr = |len_reg: Option<u16>| {
-        let mut tail = vec![LogicalInstr::LoadConst { dst: 1, val: 1 }];
+    let substr = |len_reg: Option<Reg>| {
+        let mut tail = vec![LogicalInstr::LoadConst { val: 1 }];
         if len_reg.is_some() {
-            tail.push(LogicalInstr::LoadConst { dst: 2, val: 3 });
+            tail.push(LogicalInstr::LoadConst { val: 3 });
         }
-        let dst = if len_reg.is_some() { 3 } else { 2 };
         tail.push(LogicalInstr::StrSubstr {
-            dst,
-            src: 0,
-            start_reg: 1,
+            src: Reg(0),
+            start_reg: Reg(1),
             len_reg,
         });
-        no_nulls(tail, dst as u32 + 1, dst as u32)
+        no_nulls(tail)
     };
     assert!(substr(None), "no FOR clause writes no fail flag");
-    assert!(!substr(Some(2)), "a FOR clause can name a negative length");
+    assert!(!substr(Some(Reg(2))), "a FOR clause can name a negative length");
 }
 
 // ---------------------------------------------------------------------------
@@ -2025,7 +1831,7 @@ fn string_nullability_classification() {
 /// carries no per-variant data, so there is no index bookkeeping to keep dense;
 /// `mem::discriminant` does the counting.
 impl LogicalInstr {
-    pub(crate) const VARIANT_COUNT: usize = 48;
+    pub(crate) const VARIANT_COUNT: usize = 38;
 
     /// Exhaustive by construction — the compile error on a new variant is the
     /// whole point, so this must never gain a `_` arm.
@@ -2036,15 +1842,8 @@ impl LogicalInstr {
             L::LoadColInt { .. }
             | L::LoadColFloat { .. }
             | L::LoadConst { .. }
-            | L::IntAdd { .. }
-            | L::IntSub { .. }
-            | L::IntMul { .. }
-            | L::IntDiv { .. }
-            | L::IntMod { .. }
-            | L::FloatAdd { .. }
-            | L::FloatSub { .. }
-            | L::FloatMul { .. }
-            | L::FloatDiv { .. }
+            | L::IntArith { .. }
+            | L::FloatArith { .. }
             | L::Cmp { .. }
             | L::FCmp { .. }
             | L::IntToFloat { .. }
@@ -2056,9 +1855,8 @@ impl LogicalInstr {
             | L::IntMinMax2 { .. }
             | L::FloatMinMax2 { .. }
             | L::Select { .. }
-            | L::LoadNull { .. }
-            | L::BoolAnd { .. }
-            | L::BoolOr { .. }
+            | L::LoadNull
+            | L::BoolBinary { .. }
             | L::BoolNot { .. }
             | L::IsNull { .. }
             | L::StrColConst { .. }
@@ -2066,7 +1864,7 @@ impl LogicalInstr {
             | L::IntInSet { .. }
             | L::LoadColStr { .. }
             | L::LoadConstStr { .. }
-            | L::LoadNullStr { .. }
+            | L::LoadNullStr
             | L::StrSelect { .. }
             | L::StrCmp { .. }
             | L::StrLen { .. }
@@ -2078,18 +1876,11 @@ impl LogicalInstr {
             | L::IntToStr { .. }
             | L::FloatToStr { .. }
             | L::StrToInt { .. }
-            | L::StrToFloat { .. }
-            | L::CopyCol { .. }
-            | L::Emit { .. } => {}
+            | L::StrToFloat { .. } => {}
         }
     }
 }
 
-impl LogicalProgram {
-    pub(crate) fn instrs(&self) -> &[LogicalInstr] {
-        &self.instrs
-    }
-}
 /// One instance of every [`LogicalInstr`] variant, with a distinct value in
 /// every field so a swapped pair cannot round-trip by coincidence.
 ///
@@ -2099,150 +1890,177 @@ impl LogicalProgram {
 fn every_variant() -> Vec<LogicalInstr> {
     use LogicalInstr as L;
     let mut v = vec![
-        L::LoadColInt { dst: 1, col: 2 },
-        L::LoadColFloat { dst: 3, col: 4 },
+        L::LoadColInt { col: 2 },
+        L::LoadColFloat { col: 4 },
         L::LoadConst {
-            dst: 5,
             val: -1_234_567_890_123,
         },
-        L::IntAdd { dst: 6, a: 7, b: 8 },
-        L::IntSub { dst: 9, a: 10, b: 11 },
-        L::IntMul { dst: 12, a: 13, b: 14 },
-        L::IntDiv { dst: 15, a: 16, b: 17 },
-        L::IntMod { dst: 18, a: 19, b: 20 },
-        L::FloatAdd { dst: 21, a: 22, b: 23 },
-        L::FloatSub { dst: 24, a: 25, b: 26 },
-        L::FloatMul { dst: 27, a: 28, b: 29 },
-        L::FloatDiv { dst: 30, a: 31, b: 32 },
-        L::IntToFloat { dst: 33, a: 34 },
-        L::FloatToF32 { dst: 35, a: 36 },
+        L::IntArith {
+            op: IntArithOp::Add,
+            a: Reg(7),
+            b: Reg(8),
+        },
+        L::IntArith {
+            op: IntArithOp::Sub,
+            a: Reg(10),
+            b: Reg(11),
+        },
+        L::IntArith {
+            op: IntArithOp::Mul,
+            a: Reg(13),
+            b: Reg(14),
+        },
+        L::IntArith {
+            op: IntArithOp::Div,
+            a: Reg(16),
+            b: Reg(17),
+        },
+        L::IntArith {
+            op: IntArithOp::Mod,
+            a: Reg(19),
+            b: Reg(20),
+        },
+        L::FloatArith {
+            op: FloatArithOp::Add,
+            a: Reg(22),
+            b: Reg(23),
+        },
+        L::FloatArith {
+            op: FloatArithOp::Sub,
+            a: Reg(25),
+            b: Reg(26),
+        },
+        L::FloatArith {
+            op: FloatArithOp::Mul,
+            a: Reg(28),
+            b: Reg(29),
+        },
+        L::FloatArith {
+            op: FloatArithOp::Div,
+            a: Reg(31),
+            b: Reg(32),
+        },
+        L::IntToFloat { a: Reg(34) },
+        L::FloatToF32 { a: Reg(36) },
         L::FloatToInt {
-            dst: 37,
-            a: 38,
+            a: Reg(38),
             fi: FixedInt::I16,
         },
         L::IntCast {
-            dst: 39,
-            a: 40,
+            a: Reg(40),
             fi: FixedInt::I32,
         },
         L::Select {
-            dst: 41,
-            cond: 42,
-            a: 43,
-            b: 44,
+            cond: Reg(42),
+            a: Reg(43),
+            b: Reg(44),
         },
-        L::LoadNull { dst: 45 },
-        L::BoolAnd { dst: 46, a: 47, b: 48 },
-        L::BoolOr { dst: 49, a: 50, b: 51 },
-        L::BoolNot { dst: 52, a: 53 },
-        L::IsNull {
-            dst: 54,
-            col: 55,
-            invert: false,
+        L::LoadNull,
+        L::BoolBinary {
+            is_or: false,
+            a: Reg(47),
+            b: Reg(48),
         },
-        L::IsNull {
-            dst: 56,
-            col: 57,
-            invert: true,
+        L::BoolBinary {
+            is_or: true,
+            a: Reg(50),
+            b: Reg(51),
         },
+        L::BoolNot { a: Reg(53) },
+        L::IsNull { col: 55, invert: false },
+        L::IsNull { col: 57, invert: true },
         L::IntInSet {
-            dst: 58,
-            value_reg: 59,
-            set_idx: 60,
+            value_reg: Reg(59),
+            set_idx: ConstIdx(60),
         },
-        L::LoadColStr { dst: 61, col: 62 },
-        L::LoadConstStr { dst: 63, const_idx: 64 },
-        L::LoadNullStr { dst: 65 },
+        L::LoadColStr { col: 62 },
+        L::LoadConstStr {
+            const_idx: ConstIdx(64),
+        },
+        L::LoadNullStr,
         L::StrSelect {
-            dst: 66,
-            cond: 67,
-            a: 68,
-            b: 69,
+            cond: Reg(67),
+            a: Reg(68),
+            b: Reg(69),
         },
         // The two packed-pair families sit in *different* operand words —
         // SELECT/SUBSTR in a2, TRIM/LIKE in a1 — which is the single
         // per-opcode fact the encoder and decoder can silently disagree on.
         L::StrSubstr {
-            dst: 70,
-            src: 71,
-            start_reg: 72,
-            len_reg: Some(73),
+            src: Reg(71),
+            start_reg: Reg(72),
+            len_reg: Some(Reg(73)),
         },
         L::StrSubstr {
-            dst: 74,
-            src: 75,
-            start_reg: 76,
+            src: Reg(75),
+            start_reg: Reg(76),
             len_reg: None,
         },
         L::StrTrim {
-            dst: 77,
-            a: 78,
+            a: Reg(78),
             mode: TrimMode::Leading,
-            set_idx: 79,
+            set_idx: ConstIdx(79),
         },
         L::StrLike {
-            dst: 80,
-            src: 81,
-            escape: Some(b'!'),
-            pat_idx: 82,
+            src: Reg(81),
+            escape: NonZeroU8::new(b'!'),
+            pat_idx: ConstIdx(82),
             ci: false,
         },
         L::StrLike {
-            dst: 83,
-            src: 84,
+            src: Reg(84),
             escape: None,
-            pat_idx: 85,
+            pat_idx: ConstIdx(85),
             ci: true,
         },
-        L::IntToStr { dst: 86, a: 87 },
-        L::FloatToStr { dst: 88, a: 89 },
+        // Escape byte 1: the smallest escape the type admits, distinguishable
+        // from `None` only because it cannot be 0.
+        L::StrLike {
+            src: Reg(86),
+            escape: NonZeroU8::new(1),
+            pat_idx: ConstIdx(88),
+            ci: false,
+        },
+        L::IntToStr { a: Reg(87) },
+        L::FloatToStr { a: Reg(89) },
         L::StrToInt {
-            dst: 90,
-            a: 91,
+            a: Reg(91),
             fi: FixedInt::I64,
         },
-        L::StrToFloat { dst: 92, a: 93 },
-        L::CopyCol { src_col: 94, out: 95 },
-        L::Emit { src: 96, out: 97 },
+        L::StrToFloat { a: Reg(93) },
     ];
     // The operator- and flag-parameterized families, every value of each.
     for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Gt, CmpOp::Ge, CmpOp::Lt, CmpOp::Le] {
         v.push(L::Cmp {
             op,
-            dst: 100,
-            a: 101,
-            b: 102,
+            a: Reg(101),
+            b: Reg(102),
         });
         v.push(L::FCmp {
             op,
-            dst: 103,
-            a: 104,
-            b: 105,
+            a: Reg(104),
+            b: Reg(105),
         });
     }
     for op in [StrOp::Eq, StrOp::Lt, StrOp::Le] {
         v.push(L::StrColConst {
             op,
-            dst: 106,
             col: 107,
-            const_idx: 108,
+            const_idx: ConstIdx(108),
         });
         v.push(L::StrColCol {
             op,
-            dst: 109,
             col_a: 110,
             col_b: 111,
         });
         v.push(L::StrCmp {
             op,
-            dst: 112,
-            a: 113,
-            b: 114,
+            a: Reg(113),
+            b: Reg(114),
         });
     }
     for op in [IntUnaryOp::Neg, IntUnaryOp::Abs] {
-        v.push(L::IntUnary { op, dst: 115, a: 116 });
+        v.push(L::IntUnary { op, a: Reg(116) });
     }
     for op in [
         FloatUnaryOp::Neg,
@@ -2252,41 +2070,30 @@ fn every_variant() -> Vec<LogicalInstr> {
         FloatUnaryOp::Round,
         FloatUnaryOp::Trunc,
     ] {
-        v.push(L::FloatUnary { op, dst: 117, a: 118 });
+        v.push(L::FloatUnary { op, a: Reg(118) });
     }
     for is_max in [true, false] {
         v.push(L::IntMinMax2 {
-            dst: 119,
-            a: 120,
-            b: 121,
+            a: Reg(120),
+            b: Reg(121),
             is_max,
         });
         v.push(L::FloatMinMax2 {
-            dst: 122,
-            a: 123,
-            b: 124,
+            a: Reg(123),
+            b: Reg(124),
             is_max,
         });
     }
     for chars in [false, true] {
-        v.push(L::StrLen {
-            dst: 125,
-            a: 126,
-            chars,
-        });
+        v.push(L::StrLen { a: Reg(126), chars });
     }
     for upper in [true, false] {
-        v.push(L::StrCase {
-            dst: 127,
-            a: 128,
-            upper,
-        });
+        v.push(L::StrCase { a: Reg(128), upper });
     }
     for skip_null in [false, true] {
         v.push(L::StrConcat {
-            dst: 129,
-            a: 130,
-            b: 131,
+            a: Reg(130),
+            b: Reg(131),
             skip_null,
         });
     }
@@ -2302,10 +2109,10 @@ fn every_instruction_round_trips_through_the_wire_form() {
     let want = every_variant();
     let code: Vec<u32> = want.iter().copied().flat_map(LogicalInstr::to_wire).collect();
     // `from_wire` runs the structure-only validation, which this deliberately
-    // ill-formed fixture cannot pass — so decode the quads directly.
+    // ill-formed fixture cannot pass — so decode the triples directly.
     let got: Vec<LogicalInstr> = code
-        .chunks_exact(4)
-        .map(|q| LogicalProgram::decode_quad(q).expect("to_wire emits a decodable opcode"))
+        .chunks_exact(3)
+        .map(|t| LogicalProgram::decode_triple(t).expect("to_wire emits a decodable opcode"))
         .collect();
     assert_eq!(got, want);
 }
@@ -2314,7 +2121,7 @@ fn every_instruction_round_trips_through_the_wire_form() {
 /// every [`LogicalInstr`] variant must appear in [`every_variant`] so the
 /// round-trip above actually covers its operand layout.
 ///
-/// `decode_quad` matches [`ExprOp`] exhaustively, so "accepted" is `ExprOp::ALL`
+/// `decode_triple` matches [`ExprOp`] exhaustively, so "accepted" is `ExprOp::ALL`
 /// — an opcode with no decode arm no longer compiles, and one with no *encoder*
 /// arm fails here.
 #[test]
@@ -2338,23 +2145,20 @@ fn the_encoder_reaches_every_opcode_the_decoder_accepts() {
 
 #[test]
 fn sequential_copy_projection() {
-    // num_regs covers the largest register index in the synthetic programs
-    // below so LogicalProgram::new's register-bounds assert passes; this test
-    // exercises sequential_copy_base, not register limits.
-    let make = |instrs: Vec<LogicalInstr>| LogicalProgram::new(instrs, 16, 0, vec![]);
-    let copy = |src_col: u32, out: u32| LogicalInstr::CopyCol { src_col, out };
-    // src 1,2 → dst 0,1: base = 1.
-    assert_eq!(make(vec![copy(1, 0), copy(2, 1)]).sequential_copy_base(), Some(1));
-    // sources not sequential (2, then 1)
-    assert_eq!(make(vec![copy(2, 0), copy(1, 1)]).sequential_copy_base(), None);
-    // a non-COPY_COL instruction breaks the block copy
-    assert_eq!(
-        make(vec![copy(1, 0), LogicalInstr::LoadColInt { dst: 9, col: 2 }]).sequential_copy_base(),
-        None
+    let base = |srcs: &[u32]| LogicalProgram::copy_cols(srcs).sequential_copy_base();
+    // src 1,2 → slots 0,1: base = 1.
+    assert_eq!(base(&[1, 2]), Some(1));
+    // Sources not sequential (2, then 1).
+    assert_eq!(base(&[2, 1]), None);
+    assert_eq!(base(&[]), None); // empty
+                                 // Compound PK (k = 2): finalize copies columns 2, 3 into slots 0, 1.
+    assert_eq!(base(&[2, 3]), Some(2));
+    // One computed register breaks the block copy, whatever the copies do.
+    let computed = LogicalProgram::new(
+        vec![LogicalInstr::LoadColInt { col: 2 }],
+        vec![Sink::Col(1), Sink::Reg(Reg(0))],
+        None,
+        vec![],
     );
-    assert_eq!(make(vec![]).sequential_copy_base(), None); // empty
-                                                           // Sequential sources but destinations swapped (1, 0) — a permutation, not an identity.
-    assert_eq!(make(vec![copy(1, 1), copy(2, 0)]).sequential_copy_base(), None);
-    // Compound PK (k = 2): finalize copies columns 2, 3 → destinations 0, 1.
-    assert_eq!(make(vec![copy(2, 0), copy(3, 1)]).sequential_copy_base(), Some(2));
+    assert_eq!(computed.sequential_copy_base(), None);
 }

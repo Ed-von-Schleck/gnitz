@@ -6,6 +6,7 @@ import random
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
 _NEEDS_MULTI = pytest.mark.skipif(
@@ -13,8 +14,6 @@ _NEEDS_MULTI = pytest.mark.skipif(
 )
 
 
-def _uid():
-    return str(random.randint(100_000, 999_999))
 
 
 def _drop_all(client, sn, tables=(), views=()):

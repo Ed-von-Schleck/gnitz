@@ -503,6 +503,33 @@ impl BinOp {
         }
     }
 
+    /// The five integer arithmetic operators, mapped to the opcode operand that
+    /// computes them — [`Self::as_cmp`]'s shape and rationale.
+    pub(crate) fn as_int_arith(self) -> Option<gnitz_expr::IntArithOp> {
+        use gnitz_expr::IntArithOp;
+        match self {
+            BinOp::Add => Some(IntArithOp::Add),
+            BinOp::Sub => Some(IntArithOp::Sub),
+            BinOp::Mul => Some(IntArithOp::Mul),
+            BinOp::Div => Some(IntArithOp::Div),
+            BinOp::Mod => Some(IntArithOp::Mod),
+            _ => None,
+        }
+    }
+
+    /// [`Self::as_int_arith`]'s float twin. `Mod` is absent: SQL defines no
+    /// float modulo, and the float opcode space has none.
+    pub(crate) fn as_float_arith(self) -> Option<gnitz_expr::FloatArithOp> {
+        use gnitz_expr::FloatArithOp;
+        match self {
+            BinOp::Add => Some(FloatArithOp::Add),
+            BinOp::Sub => Some(FloatArithOp::Sub),
+            BinOp::Mul => Some(FloatArithOp::Mul),
+            BinOp::Div => Some(FloatArithOp::Div),
+            _ => None,
+        }
+    }
+
     /// The order-reversing converse: `x OP y` ⟺ `y OP.converse() x`. Only the
     /// four ordering operators flip; `Eq`/`Ne` are symmetric and every other
     /// operator (where operand order is not a comparison at all) passes through
@@ -634,7 +661,7 @@ mod tests {
 
     /// `infer_type` reports an expression's *nominal* type — `Neg` preserves its
     /// operand's. What a computed column is *declared* as is a separate rule
-    /// (`register_image`, applied where the column def is built), because EMIT
+    /// (`register_image`, applied where the column def is built), because a
     /// stores a whole 8-byte register: an F32 negation computes in f64, and
     /// declaring the column F32 shipped the low half of the double.
     #[test]

@@ -6,13 +6,7 @@ import pytest
 import pytest_asyncio
 import gnitz
 from gnitz import aio
-
-_uid_counter = 0
-
-def _uid():
-    global _uid_counter
-    _uid_counter += 1
-    return f"{os.getpid()}_{_uid_counter}"
+from _uid import uid as _uid
 
 
 # ---------------------------------------------------------------------------

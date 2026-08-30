@@ -7,13 +7,11 @@ pushdown, and PK-order-preserving projection with a hidden source PK.
 Run with GNITZ_WORKERS=4 (the union-gather + top-k merge across partitions):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_read_spec.py -v --tb=short
 """
-import random
 
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _rows(client, sn, q):

@@ -24,14 +24,12 @@ Run at GNITZ_WORKERS 1 and 4 (the exchange/fanout paths only engage at W>1):
 """
 import threading
 import time
-import random
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _cleanup(client, sn, tables=None, views=None):

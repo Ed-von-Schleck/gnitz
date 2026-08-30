@@ -639,7 +639,7 @@ impl Batch {
     /// Split borrow of payload column `pi`'s region, the NULL bitmap, and the
     /// blob heap. One call resolves all three, hoisting the region arithmetic out
     /// of the row loops that would otherwise reach for them one at a time — the
-    /// per-cell string relocators (column + blob), and EMIT, which writes a
+    /// per-cell string relocators (column + blob), and the map's emit, which writes a
     /// computed column's slots and sets that column's bit for the same rows
     /// (column + bitmap, plus the heap for a string register).
     ///

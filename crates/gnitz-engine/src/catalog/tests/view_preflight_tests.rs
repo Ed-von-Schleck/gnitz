@@ -12,18 +12,15 @@
 use super::*;
 
 /// A predicate blob whose register file exceeds `MAX_REGS`, so
-/// `LogicalProgram::from_wire` rejects it. Built through the client's own
-/// `ExprBuilder`, so it is byte-identical in shape to what the planner ships.
+/// `LogicalProgram::from_wire` rejects it. Forged word by word: the client's
+/// `ExprBuilder` refuses to build an over-cap program, so only a corrupt
+/// circuit can carry one — which is the input the pre-flight exists to catch.
 fn over_cap_pred_blob() -> Vec<u8> {
-    let mut eb = gnitz_expr::ExprBuilder::new();
-    let col = eb.load_col_int(0);
-    // Every `load_const` claims a fresh register; the cap is `MAX_REGS`.
-    let last = (0..gnitz_expr::MAX_REGS as i64)
-        .map(|i| eb.load_const(i))
-        .last()
-        .unwrap();
-    let r = eb.cmp(gnitz_expr::CmpOp::Lt, col, last);
-    eb.build(r).encode()
+    let n = gnitz_expr::MAX_REGS as u32 + 1;
+    let code: Vec<u32> = (0..n)
+        .flat_map(|dst| gnitz_expr::LogicalInstr::LoadConst { val: dst as i64 }.to_wire())
+        .collect();
+    gnitz_wire::encode_expr_blob(n - 1, &code, &[], &[] as &[&[u8]])
 }
 
 /// `ScanDelta(base_tid) → IntegrateTrace → Filter(pred) → Integrate` for `vid`.

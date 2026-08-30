@@ -33,7 +33,7 @@ use crate::dml::plan::{
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, FoldShape};
 use crate::exec::order::{read_spec_finish, resolve_out_schema_order, resolve_read_spec_order};
-use crate::expr_lower::compile_filter_evaluator;
+use crate::expr_lower::compile_conjuncts_evaluator;
 use crate::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
     HonoredClauses, HonoredQueryClauses,
@@ -665,7 +665,7 @@ fn build_fold_shape(select: &Select, schema: &Schema) -> Result<FoldShape, Gnitz
                 agg_mappings: &layout.agg_mappings,
                 agg_col_offset: layout.synthetic_agg_col_offset(),
             };
-            compile_filter_evaluator(&bind_having_expr(having_expr, &ctx)?, &partial_schema)?
+            compile_conjuncts_evaluator(&[&bind_having_expr(having_expr, &ctx)?], &partial_schema)?
         }
         None => None,
     };

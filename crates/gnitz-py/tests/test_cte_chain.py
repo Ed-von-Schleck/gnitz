@@ -9,11 +9,9 @@ view, with dependency-ordered backfill. Plain pass-through CTEs still alias.
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_cte_chain.py -v --tb=short
 """
-import random
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _cleanup(client, sn):

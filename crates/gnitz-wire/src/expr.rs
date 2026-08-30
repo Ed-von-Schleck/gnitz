@@ -3,13 +3,15 @@
 use crate::codec::Writer;
 
 wire_enum! {
-    /// The expression opcode space — every `[op, dst, a1, a2]` quad's first
-    /// word. Declared as a wire enum so `LogicalProgram::decode_quad` matches
+    /// The expression opcode space — every `[op, a1, a2]` triple's first
+    /// word. Declared as a wire enum so `LogicalProgram::decode_triple` matches
     /// exhaustively: adding an opcode here is a compile error there until it
     /// gets a decode arm, which a `pub const` space could never force.
     ///
-    /// Each variant's doc states its operand layout; codes are dense but not
-    /// in declaration order, since later additions filled earlier gaps.
+    /// Each variant's doc states its operand layout. Codes are neither dense nor
+    /// in declaration order: later additions filled earlier gaps, and 32 / 34
+    /// are the two output opcodes' graves — a program's output slots ride the
+    /// blob's own sink region, not this space.
     pub enum ExprOp: u32 {
         LoadColInt = 1,
         LoadColFloat = 2,
@@ -42,22 +44,15 @@ wire_enum! {
         BoolNot = 29,
         IsNull = 30,
         IsNotNull = 31,
-        Emit = 32,
         IntToFloat = 33,
-        /// Copy an input column verbatim into an output payload slot:
-        /// `[ExprOp::CopyCol, 0, src_col, out_payload]`. Word 1 is unused — the engine
-        /// resolves the source locator (PK byte window or dense payload slot) and both
-        /// widths from the schemas it validates the program against, so a restated type
-        /// code could only ever disagree with them.
-        CopyCol = 34,
-        /// Conditional select (SQL CASE blend): `[ExprOp::Select, dst, cond, a | (b << 16)]`.
+        /// Conditional select (SQL CASE blend): `[ExprOp::Select, cond, a | (b << 16)]`.
         /// Three register sources — `cond`, `a`, `b` — packed into two operand words:
         /// `cond` occupies word `a1` alone, while `a`/`b` are packed as the low/high 16
         /// bits of word `a2` by [`pack_operand_pair`]. Rows where `cond` is non-NULL and truthy
         /// take `a`'s value + null bit; all other rows (false **or NULL** cond) take
         /// `b`'s. Carries a value, never a boolean classification.
         Select = 35,
-        /// Materialize a NULL value: `[ExprOp::LoadNull, dst, 0, 0]` — value 0, null bit
+        /// Materialize a NULL value: `[ExprOp::LoadNull, 0, 0]` — value 0, null bit
         /// set for every row. Backs `CASE` without `ELSE` (→ `ELSE NULL`) and `NULLIF`.
         LoadNull = 36,
         StrColEqConst = 40,
@@ -66,9 +61,9 @@ wire_enum! {
         StrColEqCol = 43,
         StrColLtCol = 44,
         StrColLeCol = 45,
-        /// Integer set membership: `[ExprOp::IntInSet, dst, value_reg, set_idx]`. Tests
+        /// Integer set membership: `[ExprOp::IntInSet, value_reg, set_idx]`. Tests
         /// register `value_reg`'s i64 image for membership in the i64 pool at const
-        /// index `set_idx` (packed `N × 8-byte LE`), writing a 0/1 boolean into `dst`.
+        /// index `set_idx` (packed `N × 8-byte LE`), writing a 0/1 boolean.
         /// The pool's wire order is not a contract — the engine sorts it at resolve and
         /// binary-searches the sorted copy. NULL input propagates to NULL. `set_idx` is
         /// a const-pool index (full u32, like `ExprOp::StrCol*Const`), not a register.
@@ -78,10 +73,10 @@ wire_enum! {
         // compares left after LOAD_NULL; the rest continue past INT_IN_SET, keeping the
         // space dense.
 
-        /// `[ExprOp::IntAbs, dst, a, 0]` — `wrapping_abs` on the i64 register, so
+        /// `[ExprOp::IntAbs, a, 0]` — `wrapping_abs` on the i64 register, so
         /// `ABS(i64::MIN)` is `i64::MIN`. Same width in, same width out: no NULL.
         IntAbs = 37,
-        /// Pure float unary transforms: `[op, dst, a, 0]`. Each is its operand's IEEE
+        /// Pure float unary transforms: `[op, a, 0]`. Each is its operand's IEEE
         /// result and produces no NULL of its own. ROUND is `round_ties_even`.
         FloatAbs = 38,
         FloatFloor = 39,
@@ -89,21 +84,21 @@ wire_enum! {
         FloatRound = 48,
         FloatTrunc = 49,
         /// Truncate-toward-zero float→int cast with a target range check:
-        /// `[ExprOp::FloatToInt, dst, a, target_tc]`. NaN, ±∞ and an out-of-range
+        /// `[ExprOp::FloatToInt, a, target_tc]`. NaN, ±∞ and an out-of-range
         /// truncated value all produce NULL. `target_tc` is a `TypeCode` discriminant
         /// riding the `a2` word, not a register — the same one-word-payload convention
         /// `ExprOp::IntInSet` uses for its pool index.
         FloatToInt = 50,
-        /// Integer domain cast: `[ExprOp::IntCast, dst, a, target_tc]`. The register bits
+        /// Integer domain cast: `[ExprOp::IntCast, a, target_tc]`. The register bits
         /// pass through unchanged when the value is in the target's domain and the row
         /// is NULLed otherwise; the source is read as signed or unsigned according to
         /// the resolve-time U64 tracking of `a`. `target_tc` as for `ExprOp::FloatToInt`.
         IntCast = 51,
-        /// Round through f32 precision: `[ExprOp::FloatToF32, dst, a, 0]`. NULL iff the
+        /// Round through f32 precision: `[ExprOp::FloatToF32, a, 0]`. NULL iff the
         /// source is finite and the rounded result is not. NaN and ±∞ pass through
         /// (both representable); underflow to ±0 passes through.
         FloatToF32 = 52,
-        /// Null-skipping 2-ary extremum: `[op, dst, a, b]`. A NULL operand yields the
+        /// Null-skipping 2-ary extremum: `[op, a, b]`. A NULL operand yields the
         /// other operand; the result is NULL only when both are. The integer pair
         /// compares signed or unsigned per the U64 tracking of either operand; the
         /// float pair compares by `f64::total_cmp`, never `==` or `partial_cmp`.
@@ -117,50 +112,50 @@ wire_enum! {
         // register — a second class over the same register index space, so the null
         // bits and boolean masks address both classes unchanged.
 
-        /// `[ExprOp::LoadColStr, dst, col, 0]` — a German-string column; nulls come from
+        /// `[ExprOp::LoadColStr, col, 0]` — a German-string column; nulls come from
         /// the batch bitmap.
         LoadColStr = 57,
-        /// `[ExprOp::LoadConstStr, dst, const_idx, 0]` — a const-pool entry's raw bytes.
+        /// `[ExprOp::LoadConstStr, const_idx, 0]` — a const-pool entry's raw bytes.
         LoadConstStr = 58,
-        /// `[ExprOp::LoadNullStr, dst, 0, 0]` — the string-register twin of
+        /// `[ExprOp::LoadNullStr, 0, 0]` — the string-register twin of
         /// `ExprOp::LoadNull`: an empty view with the null bit set for every row.
         LoadNullStr = 59,
         /// String CASE blend; operand packing identical to `ExprOp::Select`
-        /// (`[op, dst, cond, a | b << 16]`, [`pack_operand_pair`]). `cond` is
-        /// a scalar register; `a`/`b` are string registers, as is `dst`.
+        /// (`[op, cond, a | b << 16]`, [`pack_operand_pair`]). `cond` is
+        /// a scalar register; `a`/`b` and the result are string registers.
         StrSelect = 60,
-        /// `[op, dst, a, b]` — compare two string registers, writing 0/1 into the
-        /// *scalar* register `dst`. Byte-lexicographic (`[u8]::cmp` over the content
+        /// `[op, a, b]` — compare two string registers, writing 0/1 into the
+        /// *scalar* register. Byte-lexicographic (`[u8]::cmp` over the content
         /// bytes), the same order `compare_german_strings` imposes on canonical cells.
         StrCmpEq = 61,
         StrCmpLt = 62,
         StrCmpLe = 63,
-        /// `[op, dst, a, 0]` — string length into the scalar register `dst`, in bytes
+        /// `[op, a, 0]` — string length into a scalar register, in bytes
         /// (`OCTET_LENGTH`) or characters (`LENGTH`: the count of non-continuation
         /// bytes, which on valid UTF-8 is the codepoint count).
         StrLenBytes = 64,
         StrLenChars = 65,
-        /// `[op, dst, a, 0]` — ASCII-only case fold (`a-z`/`A-Z`); every other byte
+        /// `[op, a, 0]` — ASCII-only case fold (`a-z`/`A-Z`); every other byte
         /// passes through, so a multibyte UTF-8 sequence is unchanged.
         StrUpper = 66,
         StrLower = 67,
-        /// `[ExprOp::StrSubstr, dst, src_reg, start_reg | len_reg << 16]`; `len_reg =
+        /// `[ExprOp::StrSubstr, src_reg, start_reg | len_reg << 16]`; `len_reg =
         /// 0xFFFF` ⇒ no FOR clause (to the end of the string). 0xFFFF is unreachable as
         /// a real register (`MAX_REGS = 64`). The window is a half-open character range
         /// `[start, start + len)`, 1-based, intersected with the string; a negative
         /// length is NULL.
         StrSubstr = 68,
-        /// `[ExprOp::StrTrim, dst, src_reg | mode << 16, set_const_idx]`, where `mode` is a
+        /// `[ExprOp::StrTrim, src_reg | mode << 16, set_const_idx]`, where `mode` is a
         /// [`TrimMode`]. The const-pool entry is the raw byte set to strip.
         StrTrim = 69,
 
-        /// `[ExprOp::StrConcat, dst, a, b]` — SQL `||`: NULL-propagating.
+        /// `[ExprOp::StrConcat, a, b]` — SQL `||`: NULL-propagating.
         StrConcat = 70,
         /// CONCAT fold step: a NULL `b` contributes the empty string; a NULL `a` (the
         /// accumulator) propagates — the asymmetry that carries the `u32::MAX`
         /// overflow-NULL through a left fold.
         StrConcatNn = 71,
-        /// `[op, dst, a, 0]` — numeric register to decimal text. The integer form reads
+        /// `[op, a, 0]` — numeric register to decimal text. The integer form reads
         /// its source signed or unsigned per the resolve-time U64 tracking; the float
         /// form is the shortest round-trip decimal, switched to scientific notation
         /// outside `[1e-4, 1e15)` so the output stays bounded (Rust's positional
@@ -168,16 +163,16 @@ wire_enum! {
         /// `Infinity` / `-Infinity` / `NaN` as PostgreSQL does.
         IntToStr = 72,
         FloatToStr = 73,
-        /// `[ExprOp::StrToInt, dst, a, target_tc]` — parse ASCII decimal (surrounding
+        /// `[ExprOp::StrToInt, a, target_tc]` — parse ASCII decimal (surrounding
         /// whitespace and an optional sign allowed, nothing else) into the scalar
-        /// register `dst`. An unparsable string or an out-of-range value is NULL, never
+        /// register. An unparsable string or an out-of-range value is NULL, never
         /// a wrap. `target_tc` rides the `a2` word as for `ExprOp::IntCast`.
         StrToInt = 74,
-        /// `[ExprOp::StrToFloat, dst, a, 0]` — parse into an f64 scalar register; any
+        /// `[ExprOp::StrToFloat, a, 0]` — parse into an f64 scalar register; any
         /// failure (including non-UTF-8 bytes) is NULL.
         StrToFloat = 75,
-        /// `[ExprOp::StrLike, dst, src_reg | escape << 16, pat_idx]` — SQL LIKE over a
-        /// string register, writing 0/1 into the *scalar* register `dst`, the
+        /// `[ExprOp::StrLike, src_reg | escape << 16, pat_idx]` — SQL LIKE over a
+        /// string register, writing 0/1 into a *scalar* register, the
         /// [`ExprOp::StrTrim`] shape. `escape` is the escape character, or 0 to disable
         /// escaping; the const-pool entry at `pat_idx` is the raw pattern bytes. The
         /// matcher is compiled at resolve, never per row.
@@ -224,7 +219,7 @@ impl TrimMode {
 /// Spelled out because a reader hexdumping a blob will not find "EXPR".
 const EXPR_BLOB_MAGIC: u32 = 0x5258_5045;
 /// Current wire-format version for expr blobs.
-const EXPR_BLOB_VERSION: u8 = 1;
+const EXPR_BLOB_VERSION: u8 = 2;
 /// Fixed header width, in bytes.
 const EXPR_BLOB_HEADER_SIZE: usize = 16;
 
@@ -254,12 +249,13 @@ pub const fn unpack_operand_pair(w: u32) -> (u16, u16) {
     ((w & 0xFFFF) as u16, (w >> 16) as u16)
 }
 
-/// A decoded expr blob. `code` and the string bytes are copied out of the input.
+/// A decoded expr blob. `code`, `sinks` and the string bytes are copied out of
+/// the input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprBlob {
-    pub num_regs: u32,
     pub result_reg: u32,
     pub code: Vec<u32>,
+    pub sinks: Vec<u32>,
     pub const_strings: Vec<Vec<u8>>,
 }
 
@@ -269,32 +265,49 @@ pub struct ExprBlob {
 /// 0   4   magic "EXPR" (u32)
 /// 4   1   version (u8)
 /// 5   1   reserved (must be 0)
-/// 6   2   num_regs (u16)
+/// 6   2   reserved (must be 0)
 /// 8   2   result_reg (u16)
 /// 10  2   reserved (must be 0)
-/// 12  4   code word count N (u32; multiple of 4)
+/// 12  4   code word count N (u32; multiple of 3)
 /// 16  4N  code words (u32 each)
+/// ..  4   sink word count M (u32; multiple of 2)
+/// ..  4M  sink words (u32 each)
 /// ..  4   string count S (u32)
 /// ..  S × { 4-byte length L, L bytes }
 /// ```
-pub fn encode_expr_blob(num_regs: u32, result_reg: u32, code: &[u32], const_strings: &[&[u8]]) -> Vec<u8> {
-    debug_assert!(code.len().is_multiple_of(4), "code length {} not 4-aligned", code.len());
+///
+/// The register count is not carried: a register is the index of the
+/// instruction that writes it, so the code region's length *is* the register
+/// file's size.
+pub fn encode_expr_blob(result_reg: u32, code: &[u32], sinks: &[u32], const_strings: &[impl AsRef<[u8]>]) -> Vec<u8> {
+    debug_assert!(code.len().is_multiple_of(3), "code length {} not 3-aligned", code.len());
+    debug_assert!(
+        sinks.len().is_multiple_of(2),
+        "sink length {} not 2-aligned",
+        sinks.len()
+    );
     let mut w = Writer::with_capacity(
-        EXPR_BLOB_HEADER_SIZE + code.len() * 4 + 4 + const_strings.iter().map(|s| 4 + s.len()).sum::<usize>(),
+        EXPR_BLOB_HEADER_SIZE
+            + (code.len() + sinks.len() + 2) * 4
+            + const_strings.iter().map(|s| 4 + s.as_ref().len()).sum::<usize>(),
     );
     w.u32(EXPR_BLOB_MAGIC)
         .u8(EXPR_BLOB_VERSION)
         .u8(0) // reserved
-        .u16(num_regs as u16)
+        .u16(0) // reserved
         .u16(result_reg as u16)
         .u16(0) // reserved
         .u32(code.len() as u32);
     for &word in code {
         w.u32(word);
     }
+    w.u32(sinks.len() as u32);
+    for &word in sinks {
+        w.u32(word);
+    }
     w.u32(const_strings.len() as u32);
-    for &s in const_strings {
-        w.bytes32(s);
+    for s in const_strings {
+        w.bytes32(s.as_ref());
     }
     w.into_vec()
 }
@@ -307,21 +320,29 @@ pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
     if r.u32().ok()? != EXPR_BLOB_MAGIC || r.u8().ok()? != EXPR_BLOB_VERSION || r.u8().ok()? != 0 {
         return None;
     }
-    let num_regs = r.u16().ok()? as u32;
+    if r.u16().ok()? != 0 {
+        return None; // reserved
+    }
     let result_reg = r.u16().ok()? as u32;
     if r.u16().ok()? != 0 {
         return None; // reserved
     }
-    let n = r.u32().ok()?;
-    if !n.is_multiple_of(4) {
-        return None;
-    }
-    let code: Vec<u32> = r
-        .take(n as usize * 4)
-        .ok()?
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    // One length-prefixed u32 region, its count held to `align` words per entry.
+    let mut words = |align: u32| -> Option<Vec<u32>> {
+        let n = r.u32().ok()?;
+        if !n.is_multiple_of(align) {
+            return None;
+        }
+        Some(
+            r.take(n as usize * 4)
+                .ok()?
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        )
+    };
+    let code = words(3)?;
+    let sinks = words(2)?;
     let s_count = r.u32().ok()? as usize;
     // Each string costs at least its 4-byte length prefix; bound s_count against the
     // remaining bytes before reserving, so a corrupt count can't drive a huge with_capacity.
@@ -334,9 +355,9 @@ pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
     }
     r.expect_consumed().ok()?;
     Some(ExprBlob {
-        num_regs,
         result_reg,
         code,
+        sinks,
         const_strings,
     })
 }

@@ -12,7 +12,7 @@ use super::join::{
     normalize_to_ab, pure_range_unmatched, range_prologue, resolve_eq_cols, side_target_tcs, EquiKeys, EquiSide,
     RangePrologue,
 };
-use super::prims::rekey_on_source_pk;
+use super::prims::{keep_all, rekey_on_source_pk};
 use super::{
     apply_projection, collect_live_cols, emit_filter, key_region_layout, resolve_collisions, resolve_input,
     resolve_projection, seginput_of_get, split_filter, CutMemo, SegInput,
@@ -218,8 +218,8 @@ impl ExistsCore<'_> {
         } = resolve_eq_cols(eq, left_in, right_in)?;
         let left_target_tcs = side_target_tcs(&left_cols, &left_in.schema.columns, &target_tcs);
         let right_target_tcs = side_target_tcs(&right_cols, &right_in.schema.columns, &target_tcs);
-        let keep_a: Vec<usize> = (0..a_n).collect();
-        let keep_b: Vec<usize> = (0..b_n).collect();
+        let keep_a = keep_all(a_n);
+        let keep_b = keep_all(b_n);
 
         let side_a = EquiSide {
             input: a_local,

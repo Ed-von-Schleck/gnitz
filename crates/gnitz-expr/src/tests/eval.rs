@@ -3,6 +3,7 @@
 //! visible at that surface, and the map-side accessors an engine consumer reads
 //! a resolved program through.
 
+use crate::{ConstIdx, Reg, Sink};
 use gnitz_wire::type_code;
 
 use crate::batch::MORSEL;
@@ -45,14 +46,9 @@ fn a_resolved_map_reports_its_copies_emits_and_nullable_slots() {
         ],
         &[0],
     );
-    let instrs = vec![
-        LogicalInstr::CopyCol { src_col: 1, out: 0 },
-        LogicalInstr::LoadConst { dst: 0, val: 7 },
-        LogicalInstr::Emit { src: 0, out: 1 },
-        LogicalInstr::LoadColStr { dst: 1, col: 2 },
-        LogicalInstr::Emit { src: 1, out: 2 },
-    ];
-    let ev = map_prog(&in_schema, &out_schema, instrs, 2, 0, vec![]);
+    let instrs = vec![LogicalInstr::LoadConst { val: 7 }, LogicalInstr::LoadColStr { col: 2 }];
+    let sinks = vec![Sink::Col(1), Sink::Reg(Reg(0)), Sink::Reg(Reg(1))];
+    let ev = map_prog(&in_schema, &out_schema, instrs, sinks, vec![]);
 
     assert!(ev.emits_anything(), "this map writes two slots out of the registers");
     // The scalar and string emits are two halves of one list, split by class.
@@ -72,9 +68,8 @@ fn a_resolved_map_reports_its_copies_emits_and_nullable_slots() {
     let projection = map_prog(
         &in_schema,
         &TestSchema::new(&[(type_code::U64, false), (type_code::I64, true)], &[0]),
-        vec![LogicalInstr::CopyCol { src_col: 1, out: 0 }],
-        0,
-        0,
+        Vec::new(),
+        vec![Sink::Col(1)],
         vec![],
     );
     assert!(!projection.emits_anything());
@@ -91,17 +86,15 @@ fn filter_ranges_collects_into_a_reused_buffer() {
     let ev = filter_prog(
         &schema,
         vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 1 },
-            LogicalInstr::LoadConst { dst: 1, val: 0 },
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadConst { val: 0 },
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             },
         ],
-        3,
-        2,
+        Reg(2),
         vec![],
     );
 
@@ -123,16 +116,15 @@ fn filter_agrees_with_eval_row() {
     let schema = schema_pk_ints(1, true);
     // Pass iff col[1] > 15.
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1] (payload[0])
-        LogicalInstr::LoadConst { dst: 1, val: 15 }, // r1 = 15
+        LogicalInstr::LoadColInt { col: 1 }, // r0 = col[1] (payload[0])
+        LogicalInstr::LoadConst { val: 15 }, // r1 = 15
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 2,
-            a: 0,
-            b: 1,
+            a: Reg(0),
+            b: Reg(1),
         }, // r2 = r0 > r1
     ];
-    let ev = filter_prog(&schema, instrs, 3, 2, vec![]);
+    let ev = filter_prog(&schema, instrs, Reg(2), vec![]);
 
     let rows: &[(u64, u64, &[i64])] = &[(1, 0, &[5]), (2, 0, &[15]), (3, 0, &[25]), (4, 0, &[0])];
     let mb = make_int_view(&schema, rows);
@@ -168,11 +160,10 @@ fn a_fused_string_compare_never_passes_a_null_row() {
     // Predicate: col1 = 'foo'. result_reg = 0.
     let instrs = vec![LogicalInstr::StrColConst {
         op: StrOp::Eq,
-        dst: 0,
         col: 1,
-        const_idx: 0,
+        const_idx: ConstIdx(0),
     }];
-    let kind = filter_prog(&schema, instrs, 1, 0, vec![b"foo".to_vec()]);
+    let kind = filter_prog(&schema, instrs, Reg(0), vec![b"foo".to_vec()]);
 
     // Drive the (multi-morsel) batch path through the filter and compare to
     // the m=1 read.
@@ -221,16 +212,15 @@ fn filter_range_case(schema: TestSchema) {
         |_, _| false,
     );
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadConst { val: 0 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 2,
-            a: 0,
-            b: 1,
+            a: Reg(0),
+            b: Reg(1),
         },
     ];
-    let ev = filter_prog(&schema, instrs, 3, 2, vec![]);
+    let ev = filter_prog(&schema, instrs, Reg(2), vec![]);
 
     assert_eq!(passing_ranges(&ev, &mb), vec![(1, 3), (4, MORSEL - 1), (MORSEL, n)]);
 
@@ -300,36 +290,41 @@ fn three_and_chain_boundary_sweep() {
 
     for (label, k0, value, null_at) in arrangements {
         let instrs = vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col0
-            LogicalInstr::LoadConst { dst: 1, val: k0 }, // r1 = k0
+            LogicalInstr::LoadColInt { col: 1 }, // r0 = col0
+            LogicalInstr::LoadConst { val: k0 }, // r1 = k0
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             }, // r2 = col0 > k0
-            LogicalInstr::LoadColInt { dst: 3, col: 2 }, // r3 = col1
-            LogicalInstr::LoadConst { dst: 4, val: 1 },  // r4 = 1
+            LogicalInstr::LoadColInt { col: 2 }, // r3 = col1
+            LogicalInstr::LoadConst { val: 1 },  // r4 = 1
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 5,
-                a: 3,
-                b: 4,
+                a: Reg(3),
+                b: Reg(4),
             }, // r5 = col1 > 1
-            LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 }, // r6 = r2 AND r5
-            LogicalInstr::LoadColInt { dst: 7, col: 3 }, // r7 = col2
+            LogicalInstr::BoolBinary {
+                is_or: false,
+                a: Reg(2),
+                b: Reg(5),
+            }, // r6 = r2 AND r5
+            LogicalInstr::LoadColInt { col: 3 }, // r7 = col2
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 8,
-                a: 7,
-                b: 4,
+                a: Reg(7),
+                b: Reg(4),
             }, // r8 = col2 > 1
-            LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 }, // r9 = r6 AND r8  (result_reg)
+            LogicalInstr::BoolBinary {
+                is_or: false,
+                a: Reg(6),
+                b: Reg(8),
+            }, // r9 = r6 AND r8  (result_reg)
         ];
 
         for &n in &[1, 7, 63, 64, 65, 127, 128, 255, 256, 257, 300] {
             let mb = make_n_col_view(&schema, n, value, null_at);
-            let ev = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
+            let ev = filter_prog(&schema, instrs.clone(), Reg(9), vec![]);
 
             for (row, &got) in passing_rows(&ev, &mb).iter().enumerate() {
                 // NULL column → unknown clause; otherwise the compare's verdict.
@@ -366,17 +361,16 @@ fn bit_only_not_3vl_truth_table() {
 
         // Filter: NOT(col1 != 0). result_reg = NOT result (bit_only eligible).
         let instrs = vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col1
-            LogicalInstr::LoadConst { dst: 1, val: 0 },  // r1 = 0
+            LogicalInstr::LoadColInt { col: 1 }, // r0 = col1
+            LogicalInstr::LoadConst { val: 0 },  // r1 = 0
             LogicalInstr::Cmp {
                 op: CmpOp::Ne,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             }, // r2 = bool(col1)
-            LogicalInstr::BoolNot { dst: 3, a: 2 },      // r3 = NOT r2
+            LogicalInstr::BoolNot { a: Reg(2) }, // r3 = NOT r2
         ];
-        let kind = filter_prog(&schema, instrs, 4, 3, vec![]);
+        let kind = filter_prog(&schema, instrs, Reg(3), vec![]);
         let mut passed = false;
         kind.filter(&mb, |_, _| {
             passed = true;
@@ -398,8 +392,8 @@ fn bit_only_not_3vl_truth_table() {
 fn classifier_filter_result_reg_non_bool_falls_back() {
     let schema = schema_pk_ints(1, true);
     // Predicate: WHERE col1 (treat int as truthy).
-    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
-    let kind = filter_prog(&schema, instrs, 1, 0, vec![]);
+    let instrs = vec![LogicalInstr::LoadColInt { col: 1 }];
+    let kind = filter_prog(&schema, instrs, Reg(0), vec![]);
 
     // Build 4 rows: non-null 1, non-null 0, null, non-null -5.
     let rows: &[(i64, bool)] = &[(1, false), (0, false), (0, true), (-5, false)];
@@ -432,11 +426,15 @@ fn is_not_null_and_over_partial_word() {
 
     // WHERE col1 IS NOT NULL AND col2 IS NOT NULL
     let instrs = vec![
-        is_not_null_op(0, 1),
-        is_not_null_op(1, 2),
-        LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
+        is_not_null_op(1),
+        is_not_null_op(2),
+        LogicalInstr::BoolBinary {
+            is_or: false,
+            a: Reg(0),
+            b: Reg(1),
+        },
     ];
-    let kind = filter_prog(&schema, instrs, 3, 2, vec![]);
+    let kind = filter_prog(&schema, instrs, Reg(2), vec![]);
 
     for (row, &got) in passing_rows(&kind, &mb).iter().enumerate() {
         let nn1 = row % 2 != 0;
@@ -469,17 +467,16 @@ fn bool_not_tail_mask() {
         // NOT (col1 >= 0), with col1 cycling -1, 0, 1 and NULL every 5th row.
         let mb = make_n_col_view(&schema, n, |row, _| (row % 3) as i64 - 1, |row, _| row % 5 == 0);
         let instrs = vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 1 },
-            LogicalInstr::LoadConst { dst: 1, val: 0 },
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadConst { val: 0 },
             LogicalInstr::Cmp {
                 op: CmpOp::Ge,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             },
-            LogicalInstr::BoolNot { dst: 3, a: 2 },
+            LogicalInstr::BoolNot { a: Reg(2) },
         ];
-        let ev = filter_prog(&schema, instrs, 4, 3, vec![]);
+        let ev = filter_prog(&schema, instrs, Reg(3), vec![]);
         assert!(
             !ev.prog.no_nulls,
             "the nullable column load must keep this on the nullable arm"
@@ -526,35 +523,41 @@ const ARM_SWEEP_NULLS: [NullArrangement; 4] = [
 /// Against `schema_pk_ints(3, true)`.
 fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
     vec![
-        ("is_null", (vec![is_null_op(0, 1)], 1, 0)),
-        ("is_not_null", (vec![is_not_null_op(0, 1)], 1, 0)),
+        ("is_null", (vec![is_null_op(1)], Reg(0))),
+        ("is_not_null", (vec![is_not_null_op(1)], Reg(0))),
         (
             "and",
             (
                 vec![
-                    is_null_op(0, 1),
-                    is_not_null_op(1, 2),
-                    LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
+                    is_null_op(1),
+                    is_not_null_op(2),
+                    LogicalInstr::BoolBinary {
+                        is_or: false,
+                        a: Reg(0),
+                        b: Reg(1),
+                    },
                 ],
-                3,
-                2,
+                Reg(2),
             ),
         ),
         (
             "or",
             (
                 vec![
-                    is_null_op(0, 1),
-                    is_null_op(1, 2),
-                    LogicalInstr::BoolOr { dst: 2, a: 0, b: 1 },
+                    is_null_op(1),
+                    is_null_op(2),
+                    LogicalInstr::BoolBinary {
+                        is_or: true,
+                        a: Reg(0),
+                        b: Reg(1),
+                    },
                 ],
-                3,
-                2,
+                Reg(2),
             ),
         ),
         (
             "not",
-            (vec![is_null_op(0, 1), LogicalInstr::BoolNot { dst: 1, a: 0 }], 2, 1),
+            (vec![is_null_op(1), LogicalInstr::BoolNot { a: Reg(0) }], Reg(1)),
         ),
         // Three conjuncts: the deepest chain in the set, so the accumulator
         // spine is two ANDs long and a null test feeds another AND rather than
@@ -563,14 +566,21 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
             "and_chain",
             (
                 vec![
-                    is_null_op(0, 1),
-                    is_null_op(1, 2),
-                    LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
-                    is_null_op(3, 3),
-                    LogicalInstr::BoolAnd { dst: 4, a: 2, b: 3 },
+                    is_null_op(1),
+                    is_null_op(2),
+                    LogicalInstr::BoolBinary {
+                        is_or: false,
+                        a: Reg(0),
+                        b: Reg(1),
+                    },
+                    is_null_op(3),
+                    LogicalInstr::BoolBinary {
+                        is_or: false,
+                        a: Reg(2),
+                        b: Reg(3),
+                    },
                 ],
-                5,
-                4,
+                Reg(4),
             ),
         ),
         // CASE WHEN col1 IS NULL THEN 1 ELSE 0 END — the null test as a SELECT
@@ -580,18 +590,16 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
             "case_cond",
             (
                 vec![
-                    is_null_op(0, 1),
-                    LogicalInstr::LoadConst { dst: 1, val: 1 },
-                    LogicalInstr::LoadConst { dst: 2, val: 0 },
+                    is_null_op(1),
+                    LogicalInstr::LoadConst { val: 1 },
+                    LogicalInstr::LoadConst { val: 0 },
                     LogicalInstr::Select {
-                        dst: 3,
-                        cond: 0,
-                        a: 1,
-                        b: 2,
+                        cond: Reg(0),
+                        a: Reg(1),
+                        b: Reg(2),
                     },
                 ],
-                4,
-                3,
+                Reg(3),
             ),
         ),
     ]
@@ -611,13 +619,11 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
 #[test]
 fn is_null_arms_agree() {
     let schema = schema_pk_ints(3, true);
-    for (name, (instrs, num_regs, result_reg)) in null_test_shapes() {
+    for (name, (instrs, result_reg)) in null_test_shapes() {
         // One evaluator per arm for the whole sweep: `ensure_capacity` never
         // shrinks, so reusing them across row counts is also how the engine
         // drives an evaluator.
-        let (fast, nullable) = both_arms(name, || {
-            filter_prog(&schema, instrs.clone(), num_regs, result_reg, vec![])
-        });
+        let (fast, nullable) = both_arms(name, || filter_prog(&schema, instrs.clone(), result_reg, vec![]));
 
         for &n in &ARM_SWEEP_ROWS {
             for (arrangement, null_pred) in ARM_SWEEP_NULLS {
@@ -639,9 +645,9 @@ fn is_null_arms_agree() {
 fn is_null_map_arms_agree() {
     let in_schema = schema_pk_ints(1, true);
     let out_schema = schema_pk_ints(1, false);
-    let instrs = vec![is_null_op(0, 1), LogicalInstr::Emit { src: 0, out: 0 }];
+    let instrs = vec![is_null_op(1)];
     let (fast, nullable) = both_arms("map", || {
-        map_prog(&in_schema, &out_schema, instrs.clone(), 1, 0, vec![])
+        map_prog(&in_schema, &out_schema, instrs.clone(), vec![Sink::Reg(Reg(0))], vec![])
     });
 
     // The emitted value per row. `eval_is_null` clears the result's null bit and
@@ -711,17 +717,15 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
             "load_payload_int",
             (
                 vec![
-                    LogicalInstr::LoadColInt { dst: 0, col: 1 },
-                    LogicalInstr::LoadConst { dst: 1, val: 0 },
+                    LogicalInstr::LoadColInt { col: 1 },
+                    LogicalInstr::LoadConst { val: 0 },
                     LogicalInstr::Cmp {
                         op: CmpOp::Gt,
-                        dst: 2,
-                        a: 0,
-                        b: 1,
+                        a: Reg(0),
+                        b: Reg(1),
                     },
                 ],
-                3,
-                2,
+                Reg(2),
             ),
             false,
         ),
@@ -729,18 +733,16 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
             "load_payload_f32",
             (
                 vec![
-                    LogicalInstr::LoadColFloat { dst: 0, col: 2 },
-                    LogicalInstr::LoadConst { dst: 1, val: 3 },
-                    LogicalInstr::IntToFloat { dst: 2, a: 1 },
+                    LogicalInstr::LoadColFloat { col: 2 },
+                    LogicalInstr::LoadConst { val: 3 },
+                    LogicalInstr::IntToFloat { a: Reg(1) },
                     LogicalInstr::FCmp {
                         op: CmpOp::Gt,
-                        dst: 3,
-                        a: 0,
-                        b: 2,
+                        a: Reg(0),
+                        b: Reg(2),
                     },
                 ],
-                4,
-                3,
+                Reg(3),
             ),
             false,
         ),
@@ -748,17 +750,15 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
             "load_col_str",
             (
                 vec![
-                    LogicalInstr::LoadColStr { dst: 0, col: 3 },
-                    LogicalInstr::LoadConstStr { dst: 1, const_idx: 0 },
+                    LogicalInstr::LoadColStr { col: 3 },
+                    LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) },
                     LogicalInstr::StrCmp {
                         op: StrOp::Lt,
-                        dst: 2,
-                        a: 0,
-                        b: 1,
+                        a: Reg(0),
+                        b: Reg(1),
                     },
                 ],
-                3,
-                2,
+                Reg(2),
             ),
             true,
         ),
@@ -767,12 +767,10 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
             (
                 vec![LogicalInstr::StrColConst {
                     op: StrOp::Lt,
-                    dst: 0,
                     col: 3,
-                    const_idx: 0,
+                    const_idx: ConstIdx(0),
                 }],
-                1,
-                0,
+                Reg(0),
             ),
             false,
         ),
@@ -781,12 +779,10 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
             (
                 vec![LogicalInstr::StrColCol {
                     op: StrOp::Lt,
-                    dst: 0,
                     col_a: 3,
                     col_b: 4,
                 }],
-                1,
-                0,
+                Reg(0),
             ),
             false,
         ),
@@ -810,25 +806,18 @@ fn not_null_load_arms_agree_and_report_no_null() {
     // Every shape loads into register 0 and, as a map, emits it.
     const LOAD_REG: u16 = 0;
 
-    for (name, (instrs, num_regs, result_reg), is_str) in not_null_load_shapes() {
+    for (name, (instrs, result_reg), is_str) in not_null_load_shapes() {
         let out_tc = if is_str { type_code::STRING } else { type_code::I64 };
         let out_schema = TestSchema::new(&[(type_code::U64, false), (out_tc, false)], &[0]);
 
-        let (fast_filter, nullable_filter) = both_arms(name, || {
-            filter_prog(&schema, instrs.clone(), num_regs, result_reg, consts())
-        });
-        let map_instrs: Vec<LogicalInstr> = instrs
-            .iter()
-            .copied()
-            .chain([LogicalInstr::Emit { src: LOAD_REG, out: 0 }])
-            .collect();
+        let (fast_filter, nullable_filter) =
+            both_arms(name, || filter_prog(&schema, instrs.clone(), result_reg, consts()));
         let (fast_map, nullable_map) = both_arms(name, || {
             map_prog(
                 &schema,
                 &out_schema,
-                map_instrs.clone(),
-                num_regs,
-                LOAD_REG as u32,
+                instrs.clone(),
+                vec![Sink::Reg(Reg(LOAD_REG))],
                 consts(),
             )
         });
@@ -923,26 +912,24 @@ fn nullable_and_not_null_columns_side_by_side() {
     }
 
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadColInt { dst: 1, col: 2 },
-        LogicalInstr::LoadColFloat { dst: 2, col: 5 },
-        LogicalInstr::LoadColFloat { dst: 3, col: 6 },
-        LogicalInstr::LoadColStr { dst: 4, col: 3 },
-        LogicalInstr::LoadColStr { dst: 5, col: 4 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadColInt { col: 2 },
+        LogicalInstr::LoadColFloat { col: 5 },
+        LogicalInstr::LoadColFloat { col: 6 },
+        LogicalInstr::LoadColStr { col: 3 },
+        LogicalInstr::LoadColStr { col: 4 },
         LogicalInstr::StrColConst {
             op: StrOp::Lt,
-            dst: 6,
             col: 4,
-            const_idx: 0,
+            const_idx: ConstIdx(0),
         },
         LogicalInstr::StrColCol {
             op: StrOp::Lt,
-            dst: 7,
             col_a: 3,
             col_b: 4,
         },
     ];
-    let ev = scalar_prog(&schema, instrs, 8, 0, vec![b"m".to_vec()]);
+    let ev = scalar_prog(&schema, instrs, Reg(0), vec![b"m".to_vec()]);
     assert!(
         !ev.prog.no_nulls,
         "a nullable column load must keep the program on the nullable arm",
@@ -982,9 +969,9 @@ fn is_null_and_is_not_null_are_complementary() {
     let null_row = |row: usize| row % 7 < 3;
     let n = 300;
     let mb = make_n_col_view(&schema, n, |row, _| row as i64, |row, _| null_row(row));
-    let run = |instr| passing_rows(&filter_prog(&schema, vec![instr], 1, 0, vec![]), &mb);
-    let is_null = run(is_null_op(0, 1));
-    let is_not_null = run(is_not_null_op(0, 1));
+    let run = |instr| passing_rows(&filter_prog(&schema, vec![instr], Reg(0), vec![]), &mb);
+    let is_null = run(is_null_op(1));
+    let is_not_null = run(is_not_null_op(1));
     for row in 0..n {
         assert_eq!(is_null[row], null_row(row), "row {row}: IS NULL");
         assert_ne!(is_null[row], is_not_null[row], "row {row}: not complementary");
@@ -1002,24 +989,26 @@ fn or_does_not_take_a_null_row_stored_value_as_definite_true() {
     let n = 1;
     let mb = make_n_col_view(&schema, n, |_, col| if col == 0 { 10 } else { 0 }, |_, col| col == 0);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: 5 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadConst { val: 5 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 2,
-            a: 0,
-            b: 1,
+            a: Reg(0),
+            b: Reg(1),
         },
-        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::LoadColInt { col: 2 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 4,
-            a: 3,
-            b: 1,
+            a: Reg(3),
+            b: Reg(1),
         },
-        LogicalInstr::BoolOr { dst: 5, a: 2, b: 4 },
+        LogicalInstr::BoolBinary {
+            is_or: true,
+            a: Reg(2),
+            b: Reg(4),
+        },
     ];
-    let ev = filter_prog(&schema, instrs, 6, 5, vec![]);
+    let ev = filter_prog(&schema, instrs, Reg(5), vec![]);
     assert_eq!(
         passing_rows(&ev, &mb),
         vec![false],
@@ -1049,32 +1038,37 @@ fn and_chain_null_and_false_through_eval_row() {
     };
     let mb = make_n_col_view(&schema, 2, value, |row, col| row == 0 && col == 1);
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadConst { val: 0 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 2,
-            a: 0,
-            b: 1,
+            a: Reg(0),
+            b: Reg(1),
         },
-        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::LoadColInt { col: 2 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 4,
-            a: 3,
-            b: 1,
+            a: Reg(3),
+            b: Reg(1),
         },
-        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
-        LogicalInstr::LoadColInt { dst: 6, col: 3 },
+        LogicalInstr::BoolBinary {
+            is_or: false,
+            a: Reg(2),
+            b: Reg(4),
+        },
+        LogicalInstr::LoadColInt { col: 3 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 7,
-            a: 6,
-            b: 1,
+            a: Reg(6),
+            b: Reg(1),
         },
-        LogicalInstr::BoolAnd { dst: 8, a: 5, b: 7 },
+        LogicalInstr::BoolBinary {
+            is_or: false,
+            a: Reg(5),
+            b: Reg(7),
+        },
     ];
-    let ev = filter_prog(&schema, instrs, 9, 8, vec![]);
+    let ev = filter_prog(&schema, instrs, Reg(8), vec![]);
 
     assert_eq!(ev.eval_row(&mb, 0), None, "TRUE AND NULL AND TRUE is NULL");
     assert_eq!(
@@ -1102,31 +1096,36 @@ fn and_chain_null_and_false_through_eval_row() {
 fn and_chain_survivors_agree_across_arms() {
     // col0 = -1 AND col1 > 0 AND col2 > 0  (const regs: -1 and 0)
     let instrs = vec![
-        LogicalInstr::LoadColInt { dst: 0, col: 1 },
-        LogicalInstr::LoadConst { dst: 1, val: -1 },
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadConst { val: -1 },
         LogicalInstr::Cmp {
             op: CmpOp::Eq,
-            dst: 2,
-            a: 0,
-            b: 1,
+            a: Reg(0),
+            b: Reg(1),
         },
-        LogicalInstr::LoadColInt { dst: 3, col: 2 },
-        LogicalInstr::LoadConst { dst: 4, val: 0 },
+        LogicalInstr::LoadColInt { col: 2 },
+        LogicalInstr::LoadConst { val: 0 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 5,
-            a: 3,
-            b: 4,
+            a: Reg(3),
+            b: Reg(4),
         },
-        LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 },
-        LogicalInstr::LoadColInt { dst: 7, col: 3 },
+        LogicalInstr::BoolBinary {
+            is_or: false,
+            a: Reg(2),
+            b: Reg(5),
+        },
+        LogicalInstr::LoadColInt { col: 3 },
         LogicalInstr::Cmp {
             op: CmpOp::Gt,
-            dst: 8,
-            a: 7,
-            b: 4,
+            a: Reg(7),
+            b: Reg(4),
         },
-        LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 },
+        LogicalInstr::BoolBinary {
+            is_or: false,
+            a: Reg(6),
+            b: Reg(8),
+        },
     ];
 
     // A survivor is `row % 4 == 0` in both; col1 = col2 = 5 always passes.
@@ -1146,7 +1145,7 @@ fn and_chain_survivors_agree_across_arms() {
                 },
                 |row, col| nullable && col == 0 && !survives(row),
             );
-            let ev = filter_prog(&schema, instrs.clone(), 10, 9, vec![]);
+            let ev = filter_prog(&schema, instrs.clone(), Reg(9), vec![]);
             assert_eq!(
                 ev.prog.no_nulls, !nullable,
                 "{label}: wrong arm — the drive proves nothing"
@@ -1164,7 +1163,7 @@ fn and_chain_survivors_agree_across_arms() {
     // word-at-a-time 3VL loop can treat differently from a mixed one, and it must
     // still reject every row.
     let schema = schema_pk_ints(3, true);
-    let ev = filter_prog(&schema, instrs, 10, 9, vec![]);
+    let ev = filter_prog(&schema, instrs, Reg(9), vec![]);
     for &n in &[64, 128, 257] {
         let mb = make_n_col_view(&schema, n, |_, _| 0, |_, _| true);
         assert!(
@@ -1222,17 +1221,17 @@ fn bool_and_or_cover_the_whole_three_valued_table() {
     for (name, mk, reference) in [
         (
             "AND",
-            (|dst, a, b| LogicalInstr::BoolAnd { dst, a, b }) as fn(u16, u16, u16) -> LogicalInstr,
+            (|a, b| LogicalInstr::BoolBinary { is_or: false, a, b }) as fn(Reg, Reg) -> LogicalInstr,
             ref_and as fn(Option<bool>, Option<bool>) -> (bool, bool),
         ),
-        ("OR", |dst, a, b| LogicalInstr::BoolOr { dst, a, b }, ref_or),
+        ("OR", |a, b| LogicalInstr::BoolBinary { is_or: true, a, b }, ref_or),
     ] {
         let instrs = vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 1 },
-            LogicalInstr::LoadColInt { dst: 1, col: 2 },
-            mk(2, 0, 1),
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadColInt { col: 2 },
+            mk(Reg(0), Reg(1)),
         ];
-        let ev = scalar_prog(&schema, instrs, 3, 2, vec![]);
+        let ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
         for (row, &(a, b)) in cells.iter().enumerate() {
             let (want_val, want_null) = reference(a, b);
             let want = (!want_null).then_some(i64::from(want_val));

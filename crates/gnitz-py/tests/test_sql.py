@@ -4,16 +4,14 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_sql.py -v --tb=short
 """
 import os
-import random
 import threading
 import time
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 _NEEDS_MULTI = pytest.mark.skipif(

@@ -21,10 +21,10 @@ workers, and a single-worker run skips the concatenation entirely.
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_dml_where_pushdown.py -v
 """
 
-import random
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
 # `ReadSpec`'s wire cap on a `pk IN (…)` gather; DML chunks past it.
@@ -36,8 +36,6 @@ UUID_A = "550e8400-e29b-41d4-a716-446655440000"
 UUID_B = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 
 
-def _uid():
-    return str(random.randint(100_000, 999_999))
 
 
 @pytest.fixture

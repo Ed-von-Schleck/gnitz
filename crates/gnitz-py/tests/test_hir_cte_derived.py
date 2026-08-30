@@ -7,11 +7,7 @@ CTE; and the pre-existing zero-payload COUNT(*) path (no floor added by the
 `as_body` pruning). Maintained under inserts *and* deletes and the
 data-before-view (backfill) order — asserted on **weights**, not row presence."""
 
-import uuid
-
-
-def _uid():
-    return uuid.uuid4().hex[:8]
+from _uid import uid as _uid
 
 
 def _weights(client, sn, view, keys):

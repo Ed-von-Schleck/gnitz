@@ -12,12 +12,12 @@ Run (both worker counts matter — the bug was deterministic at each):
     cd crates/gnitz-py && GNITZ_WORKERS=1 uv run pytest tests/test_shared_source_incremental.py -v --tb=short
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_shared_source_incremental.py -v --tb=short
 """
-import random
 
 import pytest
 
 import gnitz
 import _oracle as oracle
+from _uid import uid as _uid
 
 # A JOIN whose two operands both trace to the same base relation (transitive
 # self-join `t JOIN vt`, or `vt1 JOIN vt2` over one base) must settle correctly
@@ -28,8 +28,6 @@ import _oracle as oracle
 # WORKERS=1 and WORKERS>1.
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _cleanup(client, sn, tables=None, views=None):

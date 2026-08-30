@@ -10,8 +10,7 @@
 use super::super::guards::{converse_rel, reject_pair_pk_overflow, reject_pure_range_outer};
 use super::super::{slot_of, widen_if, ColId, EqPair, HirExpr, HirRange, JoinClass, JoinType, ProjEntry, RelExpr};
 use super::prims::{
-    build_reindex_program, build_reindex_program_keep, multi_null_filter_prog, null_gate, pure_range_m_output_cols,
-    rekey_on_source_pk, schema_type_codes,
+    keep_all, multi_null_filter_prog, null_gate, pure_range_m_output_cols, rekey_on_source_pk, schema_type_codes,
 };
 use super::{
     apply_projection, collect_live_cols, key_region_layout, resolve_collisions, resolve_input, resolve_projection,
@@ -161,8 +160,8 @@ fn emit_equi(
 
     // Reindex-payload keep set (equi_keep_combined + the ">= col 0" guard).
     let keep = keep_set(down, class, kind, left_in, right_in);
-    let keep_l: Vec<usize> = (0..left_n).filter(|&i| keep[i]).collect();
-    let keep_r: Vec<usize> = (0..right_n).filter(|&i| keep[left_n + i]).collect();
+    let keep_l: Vec<u32> = (0..left_n as u32).filter(|&i| keep[i as usize]).collect();
+    let keep_r: Vec<u32> = (0..right_n as u32).filter(|&i| keep[left_n + i as usize]).collect();
     let pl = keep_l.len();
     let pr = keep_r.len();
     let pruned_left = kept_coldefs(left_schema, &keep_l);
@@ -212,8 +211,8 @@ fn emit_equi(
     // payload ids — resolve_refs against it yields `k + pruned_index` for both the
     // residual filter and the output projection.
     let mut merged_layout = vec![ColId::NONE; k];
-    merged_layout.extend(keep_l.iter().map(|&i| left_in.layout[i]));
-    merged_layout.extend(keep_r.iter().map(|&i| right_in.layout[i]));
+    merged_layout.extend(keep_l.iter().map(|&i| left_in.layout[i as usize]));
+    merged_layout.extend(keep_r.iter().map(|&i| right_in.layout[i as usize]));
 
     // One residual/WHERE filter over the normalized output (at most one source is
     // non-empty — the rewrite folds the WHERE into the INNER residual and leaves an
@@ -317,7 +316,7 @@ fn emit_range(
         merged,
         &pair_pk_cols,
         &[],
-        build_reindex_program(union_schema.columns.len()),
+        &keep_all(union_schema.columns.len()),
         ReindexRole::Auxiliary,
     );
 
@@ -505,8 +504,8 @@ fn combined_payload_coldefs(left: &[ColumnDef], right: &[ColumnDef], join_type: 
 }
 
 /// This side's kept payload column defs, in ascending source order.
-fn kept_coldefs(schema: &Schema, keep: &[usize]) -> Vec<ColumnDef> {
-    keep.iter().map(|&i| schema.columns[i].clone()).collect()
+fn kept_coldefs(schema: &Schema, keep: &[u32]) -> Vec<ColumnDef> {
+    keep.iter().map(|&i| schema.columns[i as usize].clone()).collect()
 }
 
 /// Per-side carried reindex target type for each join key slot: `T_i` only when
@@ -557,16 +556,15 @@ pub(crate) fn normalize_to_ab(
 
 /// One side of the symmetric equi-join term emission: its (unfiltered) input
 /// node, the join key columns with their per-slot carried target types, the
-/// source schema, and the kept payload columns (`0..n` for the unpruned
-/// layout — `build_reindex_program_keep(0..n)` is byte-identical to
-/// `build_reindex_program`).
+/// source schema, and the kept payload columns (`keep_all(n)` for the unpruned
+/// layout).
 #[derive(Clone, Copy)]
 pub(crate) struct EquiSide<'a> {
     pub(crate) input: gnitz_core::NodeId,
     pub(crate) cols: &'a [usize],
     pub(crate) target_tcs: &'a [u8],
     pub(crate) coldefs: &'a [ColumnDef],
-    pub(crate) keep: &'a [usize],
+    pub(crate) keep: &'a [u32],
 }
 
 impl EquiSide<'_> {
@@ -580,11 +578,14 @@ impl EquiSide<'_> {
     /// `coldefs` so it cannot drift from the reindex program built from the same
     /// pair.
     fn kept_type_codes(&self) -> Vec<u64> {
-        self.keep.iter().map(|&i| self.coldefs[i].type_code as u64).collect()
+        self.keep
+            .iter()
+            .map(|&i| self.coldefs[i as usize].type_code as u64)
+            .collect()
     }
 
     /// `P_all`: this side's *unfiltered* input re-keyed onto the join key with the
-    /// same reindex program the join terms used — reusing the already-emitted
+    /// same kept-column list the join terms used — reusing the already-emitted
     /// reindex when the key is non-nullable (there the NULL gate was a no-op, so
     /// the gated and raw inputs are the same node).
     fn all(&self, cb: &mut CircuitBuilder, nullable: bool, reindex: gnitz_core::NodeId) -> gnitz_core::NodeId {
@@ -593,7 +594,7 @@ impl EquiSide<'_> {
                 self.input,
                 self.cols,
                 self.target_tcs,
-                build_reindex_program_keep(self.keep),
+                self.keep,
                 ReindexRole::ScatterKey,
             )
         } else {
@@ -700,14 +701,8 @@ fn emit_range_null_fill_tail(
     // `nf_pair_pk_cols` above, and nothing downstream reads them. The payload is
     // P's columns followed by O's, in input order — no reorder, since
     // map_reindex locks the output payload to input order.
-    let keep: Vec<usize> = (p_pk..p_pk + p_n + o_col_tcs.len()).collect();
-    let nf_rekey = cb.map_reindex(
-        nullfill,
-        &nf_pair_pk_cols,
-        &[],
-        build_reindex_program_keep(&keep),
-        ReindexRole::Auxiliary,
-    );
+    let keep: Vec<u32> = (p_pk as u32..(p_pk + p_n + o_col_tcs.len()) as u32).collect();
+    let nf_rekey = cb.map_reindex(nullfill, &nf_pair_pk_cols, &[], &keep, ReindexRole::Auxiliary);
 
     // nf_rekey output: [pair-PK, <[P, NULL-O] in input order>] — the payload sits
     // directly behind the pair-PK. Map EVERY combined column (canonical [A, B]
@@ -827,13 +822,7 @@ pub(crate) fn band_pi_preserved(
     payload_n: usize,
 ) -> NodeId {
     let p = pk_slots.len();
-    let rekey = cb.map_reindex(
-        merged,
-        pk_slots,
-        &[],
-        build_reindex_program(union_n),
-        ReindexRole::Auxiliary,
-    );
+    let rekey = cb.map_reindex(merged, pk_slots, &[], &keep_all(union_n), ReindexRole::Auxiliary);
     let base = p + k + payload_off;
     cb.map(rekey, &(base..base + payload_n).collect::<Vec<_>>())
 }
@@ -874,21 +863,9 @@ pub(crate) fn emit_equi_join_terms(
     b: EquiSide<'_>,
 ) -> Result<EquiTerms, GnitzSqlError> {
     let (b_gated, b_nullable) = null_gate(cb, b.input, b.cols, b.coldefs)?;
-    let reindex_b = cb.map_reindex(
-        b_gated,
-        b.cols,
-        b.target_tcs,
-        build_reindex_program_keep(b.keep),
-        ReindexRole::ScatterKey,
-    );
+    let reindex_b = cb.map_reindex(b_gated, b.cols, b.target_tcs, b.keep, ReindexRole::ScatterKey);
     let (a_gated, a_nullable) = null_gate(cb, a.input, a.cols, a.coldefs)?;
-    let reindex_a = cb.map_reindex(
-        a_gated,
-        a.cols,
-        a.target_tcs,
-        build_reindex_program_keep(a.keep),
-        ReindexRole::ScatterKey,
-    );
+    let reindex_a = cb.map_reindex(a_gated, a.cols, a.target_tcs, a.keep, ReindexRole::ScatterKey);
     let trace_a = cb.integrate_trace(reindex_a);
     let trace_b = cb.integrate_trace(reindex_b);
     let join_ab = cb.join_with_trace_node(reindex_a, trace_b); // ΔA ⋈ z^{-1}(I(B))
@@ -957,14 +934,14 @@ pub(crate) fn range_prologue(
         a_gated,
         &left_reindex_cols,
         &left_target_tcs,
-        build_reindex_program(left_coldefs.len()),
+        &keep_all(left_coldefs.len()),
         ReindexRole::ScatterKey,
     );
     let reindex_b = cb.map_reindex(
         b_gated,
         &right_reindex_cols,
         &right_target_tcs,
-        build_reindex_program(right_coldefs.len()),
+        &keep_all(right_coldefs.len()),
         ReindexRole::ScatterKey,
     );
     Ok(RangePrologue {
@@ -1055,7 +1032,7 @@ pub(crate) fn build_pure_range_threshold(
         red,
         &[1],
         &[carried_m],
-        build_reindex_program(m_schema.columns.len()),
+        &keep_all(m_schema.columns.len()),
         ReindexRole::Auxiliary,
     );
     let trace_m = cb.integrate_trace(reindex_m);
@@ -1077,17 +1054,11 @@ pub(crate) fn build_pure_range_threshold(
     };
     let a_pk_in_raw: Vec<usize> = left_schema.pk_cols.iter().map(|&p| 1 + p).collect();
     let a_cols: Vec<usize> = (pa + 1..pa + 1 + left_n).collect();
-    // One shared reindex program drives both re-keys, so the IDENTICAL encoding
+    // One shared kept-column list drives both re-keys, so the IDENTICAL encoding
     // is structural — `matched` and `a_pass` differ only in their input node.
-    let nf_reindex_prog = build_reindex_program(nf_raw_schema.columns.len());
+    let nf_keep = keep_all(nf_raw_schema.columns.len());
     let rekey_a = |cb: &mut CircuitBuilder, input: gnitz_core::NodeId| {
-        let keyed = cb.map_reindex(
-            input,
-            &a_pk_in_raw,
-            &[],
-            nf_reindex_prog.clone(),
-            ReindexRole::Auxiliary,
-        );
+        let keyed = cb.map_reindex(input, &a_pk_in_raw, &[], &nf_keep, ReindexRole::Auxiliary);
         cb.map(keyed, &a_cols) // [a.pk…, A]
     };
     let matched = rekey_a(cb, matched_raw);

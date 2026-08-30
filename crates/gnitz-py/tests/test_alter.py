@@ -4,13 +4,11 @@ Run with GNITZ_WORKERS=4 so the exchange/join-view rename and the FK/index
 paths exercise the distributed engine, not just a single worker.
 """
 
-import random
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100_000, 999_999))
 
 
 def _live(client, tid):

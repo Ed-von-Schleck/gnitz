@@ -1,11 +1,9 @@
 """E2E tests for base-table UPSERT/DELETE-by-PK enforcement."""
 
-import random
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _make_table(client):

@@ -8,13 +8,11 @@ Covers:
  - Unsupported ON CONFLICT variants return clear error messages.
 """
 
-import random
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _make_table(client):

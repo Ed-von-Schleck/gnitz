@@ -1,7 +1,7 @@
 use super::*;
 use crate::protocol::types::{ColumnDef, TypeCode};
 use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
-use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram, RowSource, SchemaFacts, StrOp};
+use gnitz_expr::{CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Reg, RowSource, SchemaFacts, StrOp};
 
 // ── Fixture A: permuted, non-contiguous compound PK ──────────────────────
 //
@@ -198,12 +198,16 @@ fn the_shared_evaluator_reads_a_client_batch() {
     // `locate`'s PK arm, its payload arm and the region addressing together.
     let ev = LogicalProgram::new(
         vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 3 },
-            LogicalInstr::LoadColInt { dst: 1, col: 1 },
-            LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
+            LogicalInstr::LoadColInt { col: 3 },
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::IntArith {
+                op: IntArithOp::Add,
+                a: Reg(0),
+                b: Reg(1),
+            },
         ],
-        3,
-        2,
+        Vec::new(),
+        Some(Reg(2)),
         vec![],
     )
     .resolve_scalar(&schema)
@@ -228,12 +232,16 @@ fn nullable_payload_null_bits_reach_the_evaluator() {
     // slot 1, nullable) is what forces `no_nulls` off.
     let ev = LogicalProgram::new(
         vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 3 },
-            LogicalInstr::LoadColInt { dst: 1, col: 2 },
-            LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
+            LogicalInstr::LoadColInt { col: 3 },
+            LogicalInstr::LoadColInt { col: 2 },
+            LogicalInstr::IntArith {
+                op: IntArithOp::Add,
+                a: Reg(0),
+                b: Reg(1),
+            },
         ],
-        3,
-        2,
+        Vec::new(),
+        Some(Reg(2)),
         vec![],
     )
     .resolve_scalar(&schema)
@@ -255,17 +263,16 @@ fn filter_over_the_region_path() {
     // `bool_bits & !null_bits`), row 2 fails (-3000).
     let ev = LogicalProgram::new(
         vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 2 },
-            LogicalInstr::LoadConst { dst: 1, val: 0 },
+            LogicalInstr::LoadColInt { col: 2 },
+            LogicalInstr::LoadConst { val: 0 },
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             },
         ],
-        3,
-        2,
+        Vec::new(),
+        Some(Reg(2)),
         vec![],
     )
     .resolve_filter(&schema)
@@ -287,12 +294,11 @@ fn string_columns_compare_through_the_shared_blob_heap() {
     let ev = LogicalProgram::new(
         vec![LogicalInstr::StrColCol {
             op: StrOp::Lt,
-            dst: 0,
             col_a: 4,
             col_b: 5,
         }],
-        1,
-        0,
+        Vec::new(),
+        Some(Reg(0)),
         vec![],
     )
     .resolve_scalar(&schema)

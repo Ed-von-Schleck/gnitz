@@ -9,16 +9,14 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_serial.py -v
 """
 
-import random
 import threading
 
 import pytest
 import gnitz
 from _serverproc import HANG_TIMEOUT, START_TIMEOUT
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _schema(client):

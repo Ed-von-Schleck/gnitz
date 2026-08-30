@@ -117,11 +117,18 @@ fn scan_spec_sinks_bench() {
     // before the morsel kernel is meant to earn its keep.
     let compute_proj = {
         let mut eb = gnitz_expr::ExprBuilder::new();
-        let (a, b) = (eb.load_col_int(3), eb.load_col_int(4));
-        let sum = eb.add(a, b);
-        eb.emit_col(sum, 0);
-        eb.copy_col(1, 1);
-        eb.build(0).encode()
+        let (a, b) = (
+            eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: 3 }),
+            eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: 4 }),
+        );
+        let sum = eb.emit(gnitz_expr::LogicalInstr::IntArith {
+            op: gnitz_expr::IntArithOp::Add,
+            a,
+            b,
+        });
+        eb.sink(gnitz_expr::Sink::Reg(sum));
+        eb.sink(gnitz_expr::Sink::Col(1));
+        eb.build(None).expect("a well-formed program").to_blob_bytes()
     };
     let spec = rows_spec(fragmented.clone(), compute_proj, vec![], 0);
     let reply2 = i64_reply(2);

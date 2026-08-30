@@ -5,11 +5,7 @@ same-relation INTERSECT/EXCEPT (the uniform collision wrapper). Maintained
 incrementally under inserts *and* deletes, and under the data-before-view
 (backfill) order — asserted on **weights**, not row presence."""
 
-import uuid
-
-
-def _uid():
-    return uuid.uuid4().hex[:8]
+from _uid import uid as _uid
 
 
 def _rows(client, sn, view, keys):

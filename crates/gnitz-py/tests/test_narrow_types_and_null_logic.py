@@ -8,13 +8,11 @@ Two gap areas covered:
   2. TestSqlThreeValuedLogic: NULL OR TRUE = TRUE and NULL AND FALSE = FALSE
      in WHERE clauses (SQL 3VL correctness for BOOL_OR / BOOL_AND).
 """
-import random
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _scan_map(client, tid):

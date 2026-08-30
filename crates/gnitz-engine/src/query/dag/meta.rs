@@ -540,8 +540,7 @@ mod tests {
         nodes.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                // An empty but decodable program; nothing here ever executes it.
-                program: gnitz_expr::ExprBuilder::new().build(0).encode(),
+                keep: vec![0],
                 reindex_cols: key_cols,
                 reindex_target_tcs: vec![],
                 role: ReindexRole::ScatterKey,

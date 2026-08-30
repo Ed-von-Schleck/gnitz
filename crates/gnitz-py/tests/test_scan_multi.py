@@ -9,15 +9,13 @@ of the atomic multi-table write story.
 Run with GNITZ_WORKERS=4 — the one-cut fan-out is a distributed path.
 """
 
-import random
 import threading
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _kv_table(client, sn, name):

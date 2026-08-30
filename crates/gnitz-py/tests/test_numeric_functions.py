@@ -9,15 +9,13 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_numeric_functions.py -v --tb=short
 """
 
-import random
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 U64_HIGH = 2**63 + 5  # crosses the signed boundary: negative read as an i64
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _cleanup(client, sn):

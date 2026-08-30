@@ -11,15 +11,13 @@ racing write with a retryable conflict. Autocommit statements retry internally
 Run with GNITZ_WORKERS=4 — the conflict window is a distributed commit path.
 """
 
-import random
 import threading
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _schema(client):

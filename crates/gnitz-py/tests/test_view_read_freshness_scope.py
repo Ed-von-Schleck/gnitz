@@ -21,9 +21,9 @@ enters through the same `read_lock`.
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_view_read_freshness_scope.py -v --tb=short
 """
-import random
 
 import gnitz
+from _uid import uid as _uid
 
 
 # 40k rows: 4x the 10 000-row coalesce threshold, so the push fires an auto-tick,
@@ -35,8 +35,6 @@ BIG_ROWS = 40_000
 SMALL_ROWS = 5_000
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _schema():

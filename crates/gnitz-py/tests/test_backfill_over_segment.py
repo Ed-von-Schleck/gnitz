@@ -19,16 +19,14 @@ Run at GNITZ_WORKERS=4 (the exchange/fanout paths only engage at W>1):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest \
         tests/test_backfill_over_segment.py -v --tb=short
 """
-import random
 
 import gnitz  # noqa: F401  (imported for parity with the sibling suites)
+from _uid import uid as _uid
 
 OPCODE_EXCHANGE_SHARD = 20
 CIRCUIT_NODES_TAB = 11
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _cleanup(client, sn, tables=None, views=None):

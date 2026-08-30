@@ -45,7 +45,7 @@ const HEADER_SIZE: usize = 56;
 /// schema; a mismatch (recorded in `_sequences` via `SEQ_ID_TOPOLOGY`) marks
 /// every Rederive view invalid at boot, so its state is rebuilt. Shard and
 /// manifest layout changes are carried by their own version words.
-pub(crate) const STATE_FORMAT: u32 = 7;
+pub(crate) const STATE_FORMAT: u32 = 8;
 
 /// The durable topology word recorded in `_sequences` (`SEQ_ID_TOPOLOGY`):
 /// `(worker_count << 32) | STATE_FORMAT`. The single packer shared by the

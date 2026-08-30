@@ -12,12 +12,12 @@ shrinks that ceiling for the server they start, so a few thousand rows spill,
 compact, and dehydrate.
 """
 import os
-import random
 import struct
 
 import pytest
 import gnitz
 from _serverproc import ServerProc
+from _uid import uid as _uid
 
 # A view's output store spills when its RAM tier crosses this ceiling — which
 # only happens at a memtable fold or a checkpoint's ephemeral round, not at every
@@ -32,8 +32,6 @@ _OFF_FILE_NPC = 32
 _SHARD_FLAG_SKELETON = 1 << 63
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 @pytest.fixture

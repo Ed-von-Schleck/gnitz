@@ -5,7 +5,7 @@ use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::{
     OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_FILTER, OPCODE_INTEGRATE_TRACE, OPCODE_JOIN_DELTA_TRACE,
-    OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR, OPCODE_MAP_PROJ, OPCODE_NEGATE, OPCODE_NULL_EXTEND,
+    OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_PROJ, OPCODE_MAP_REINDEX, OPCODE_NEGATE, OPCODE_NULL_EXTEND,
     OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_SCAN_DELTA, OPCODE_UNION, OPCODE_WORKER_FILTER,
 };
 
@@ -1436,7 +1436,7 @@ fn test_band_left_join_circuit_shape() {
 
     // The null-fill adds exactly this set-difference chain over the inner skeleton.
     assert_eq!(
-        n_left(OPCODE_MAP_EXPR) - n_inner(OPCODE_MAP_EXPR),
+        n_left(OPCODE_MAP_REINDEX) - n_inner(OPCODE_MAP_REINDEX),
         3,
         "rekey_a + a_all + nf_rekey"
     );

@@ -8,12 +8,10 @@ the outer-join null-fill (ν-coarsening) and the NULL-vs-real-key rule-3 split.
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_join_payload_pruning.py -v --tb=short
 """
-import random
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _cleanup(client, sn, tables=None, views=None):

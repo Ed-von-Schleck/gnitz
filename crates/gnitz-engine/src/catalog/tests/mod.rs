@@ -83,19 +83,26 @@ fn count_records(table: &mut Table) -> usize {
 /// so the test blobs are byte-identical to what the planner ships.
 fn pred_lt_blob(col: usize, lit: i64) -> Vec<u8> {
     let mut eb = gnitz_expr::ExprBuilder::new();
-    let (a, b) = (eb.load_col_int(col), eb.load_const(lit));
-    let r = eb.cmp(gnitz_expr::CmpOp::Lt, a, b);
-    eb.build(r).encode()
+    let (a, b) = (
+        eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: col as u32 }),
+        eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: lit }),
+    );
+    let r = eb.emit(gnitz_expr::LogicalInstr::Cmp {
+        op: gnitz_expr::CmpOp::Lt,
+        a,
+        b,
+    });
+    eb.build(Some(r)).expect("a well-formed program").to_blob_bytes()
 }
 
 /// A pure-gather projection blob: `(src_col, out_payload_slot)` CopyCols and
 /// nothing else.
 fn proj_blob(copies: &[(u32, u32)]) -> Vec<u8> {
     let mut eb = gnitz_expr::ExprBuilder::new();
-    for &(src, out) in copies {
-        eb.copy_col(src, out);
+    for &(src, _) in copies {
+        eb.sink(gnitz_expr::Sink::Col(src));
     }
-    eb.build(0).encode()
+    eb.build(None).expect("a well-formed program").to_blob_bytes()
 }
 
 /// A `ReadSink::Rows` spec over the whole table. Shared by the `scan_spec` tests

@@ -460,34 +460,11 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
 // MAP emission
 // ---------------------------------------------------------------------------
 
-/// Decode a MAP's expression blob and lower it. Rejected, not asserted: circuits
-/// are client-supplied catalog data, and skipping a corrupt blob would leave the
-/// output register at the default empty schema — silently wrong results downstream.
-fn decode_map_program(program: &[u8]) -> Result<LogicalProgram, CompileError> {
-    LogicalProgram::from_map_blob(program, "map").map_err(expr_reject("map: invalid program"))
-}
-
 /// True iff `prog` reproduces its input row unchanged under `out_schema`: same
 /// physical layout, and a block copy that skips exactly the inherited PK region
 /// and carries payload columns 1:1. Such a MAP is elided entirely.
 fn copies_input_verbatim(prog: &LogicalProgram, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> bool {
     in_schema.same_physical_layout(out_schema) && prog.sequential_copy_base() == Some(in_schema.pk_indices().len())
-}
-
-/// The in-range source columns of a program that is one `COPY_COL(src, out)` per
-/// payload column with dense outs `0..n` — the shape the planner's
-/// `build_reindex_program` is the sole producer of. Reading the kept-column list
-/// off the program keeps the program the single source of truth for the reindex
-/// output schema; deriving a schema the program does not fully write would leave
-/// uninitialized output slots.
-fn dense_copy_srcs(prog: &LogicalProgram, in_schema: &SchemaDescriptor) -> Result<Vec<u32>, CompileError> {
-    let srcs = prog
-        .payload_copy_srcs()
-        .ok_or(CompileError::Rejected("map: reindex program is not a dense copy list"))?;
-    if oob_cols(srcs.iter().copied(), in_schema) {
-        return Err(CompileError::Rejected("map: reindex payload column out of range"));
-    }
-    Ok(srcs)
 }
 
 /// The `MapKind`s differ only in how they derive `(output schema, map program,
@@ -504,20 +481,24 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             // program against them, which is what catches a false declaration.
             let node_schema = compute_map_output_schema(&in_reg_schema, out_cols)
                 .ok_or(CompileError::Rejected("compute map: output exceeds MAX_COLUMNS"))?;
-            (node_schema, decode_map_program(program)?, PkSource::Inherit)
+            // The only arm whose program is client bytes; the rest build theirs
+            // from a column list. Rejected, not asserted: skipping a corrupt blob
+            // would leave the output register at the default empty schema.
+            let prog = LogicalProgram::from_map_blob(program, "map").map_err(expr_reject("map: invalid program"))?;
+            (node_schema, prog, PkSource::Inherit)
         }
 
         gnitz_wire::MapKind::Reindex {
-            program,
+            keep,
             reindex_cols,
             reindex_target_tcs,
             ..
         } => {
-            // One decode serves the copy-list scan below and `from_map`; the scan
-            // never touches the const pool, but `from_map` does.
-            let prog = decode_map_program(program)?;
             if oob_cols(reindex_cols.iter().copied(), &in_reg_schema) {
                 return Err(CompileError::Rejected("map: reindex columns out of range"));
+            }
+            if oob_cols(keep.iter().copied(), &in_reg_schema) {
+                return Err(CompileError::Rejected("map: reindex payload column out of range"));
             }
             // Must follow the in-bounds check: it reads `columns[c]`.
             if key_promotion_invalid(reindex_cols, reindex_target_tcs, &in_reg_schema) {
@@ -530,9 +511,9 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             let packer = crate::schema::key::ReindexPacker::new(&in_reg_schema, reindex_cols, reindex_target_tcs)
                 .ok_or(CompileError::Rejected("map: invalid reindex key"))?;
             let node_schema = packer
-                .output_schema(&in_reg_schema, &dense_copy_srcs(&prog, &in_reg_schema)?)
+                .output_schema(&in_reg_schema, keep)
                 .ok_or(CompileError::Rejected("map: reindex output exceeds MAX_COLUMNS"))?;
-            (node_schema, prog, PkSource::Pack(packer))
+            (node_schema, LogicalProgram::copy_cols(keep), PkSource::Pack(packer))
         }
 
         gnitz_wire::MapKind::HashRow(proj_cols, target_tcs, branch_id) => {
@@ -1255,12 +1236,6 @@ mod tests {
     /// returns `Some` (the sink's output schema matches the reindex output).
     #[test]
     fn test_build_plan_compound_reindex_accepted() {
-        // Valid 2-col copy program so decode_expr_blob succeeds.
-        let mut eb = gnitz_expr::ExprBuilder::new();
-        eb.copy_col(0, 0);
-        eb.copy_col(1, 1);
-        let blob = eb.build(0).encode();
-
         let in_schema = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0),
@@ -1275,7 +1250,7 @@ mod tests {
             .output_schema(&in_schema, &[0, 1])
             .unwrap();
         let map = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
-            program: blob,
+            keep: vec![0, 1],
             reindex_cols: vec![0, 1],
             reindex_target_tcs: vec![],
             role: gnitz_wire::ReindexRole::ScatterKey,
@@ -1292,17 +1267,13 @@ mod tests {
     #[test]
     fn test_build_plan_reindex_exceeds_max_pk_columns_rejected() {
         // 6-column source, reindex on all 6 → pk_n (6) > MAX_PK_COLUMNS (5).
-        let mut eb = gnitz_expr::ExprBuilder::new();
-        eb.copy_col(0, 0);
-        let blob = eb.build(0).encode();
-
         let n_cols = crate::schema::MAX_PK_COLUMNS + 1;
         let cols: Vec<SchemaColumn> = (0..n_cols).map(|_| SchemaColumn::new(type_code::U64, 0)).collect();
         let in_schema = SchemaDescriptor::new(&cols, &[0]);
         let reindex_cols: Vec<u32> = (0..n_cols as u32).collect();
 
         let map = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
-            program: blob,
+            keep: vec![0],
             reindex_cols,
             reindex_target_tcs: vec![],
             role: gnitz_wire::ReindexRole::ScatterKey,
@@ -1313,16 +1284,13 @@ mod tests {
         );
     }
 
-    /// The reindex output payload schema is derived from the program's copy list:
-    /// a program that copies only a subset of the input columns compiles to the
-    /// pruned `[key slots ‖ kept columns]` layout end-to-end (`build_plan` returns
+    /// The reindex output payload schema is derived from its kept-column list:
+    /// a node keeping only a subset of the input columns compiles to the pruned
+    /// `[key slots ‖ kept columns]` layout end-to-end (`build_plan` returns
     /// `Some` against a sink schema built from the same kept list).
     #[test]
     fn test_build_plan_pruned_reindex_compiles() {
-        // 3-column source; reindex on col0, program keeps only col 2 as payload.
-        let mut eb = gnitz_expr::ExprBuilder::new();
-        eb.copy_col(2, 0);
-        let blob = eb.build(0).encode();
+        // 3-column source; reindex on col0, keeping only col 2 as payload.
         let in_schema = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0),
@@ -1336,7 +1304,7 @@ mod tests {
             .output_schema(&in_schema, &[2])
             .unwrap();
         let map = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
-            program: blob,
+            keep: vec![2],
             reindex_cols: vec![0],
             reindex_target_tcs: vec![],
             role: gnitz_wire::ReindexRole::ScatterKey,
@@ -1347,15 +1315,12 @@ mod tests {
         );
     }
 
-    /// A reindex program copying an out-of-range source column is a corrupt/forged
+    /// A reindex keeping an out-of-range source column is a corrupt/forged
     /// catalog; `emit_node` must fail the compile cleanly (`build_plan` returns
     /// None) rather than read a zeroed schema slot.
     #[test]
-    fn test_build_plan_reindex_program_oob_col_rejected() {
-        // reindex on col0, program copies col 9 on a 2-column source.
-        let mut eb = gnitz_expr::ExprBuilder::new();
-        eb.copy_col(9, 0);
-        let blob = eb.build(0).encode();
+    fn test_build_plan_reindex_keep_oob_col_rejected() {
+        // reindex on col0, keeping col 9 on a 2-column source.
         let in_schema = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0),
@@ -1364,14 +1329,14 @@ mod tests {
             &[0],
         );
         let map = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
-            program: blob,
+            keep: vec![9],
             reindex_cols: vec![0],
             reindex_target_tcs: vec![],
             role: gnitz_wire::ReindexRole::ScatterKey,
         });
         assert!(
             !MidCircuit::new(in_schema).compiles(map),
-            "out-of-range program copy must fail the compile"
+            "an out-of-range kept column must fail the compile"
         );
     }
 

@@ -6,16 +6,14 @@ the tick quiesce, so every test here reaches the race by ordering — no sleeps,
 elapsed-time assertions.
 """
 
-import random
 
 import gnitz
+from _uid import uid as _uid
 
 PARKED_ROWS = 20_000
 PARKED_GROUPS = 8
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _scalar(client, sn, q):

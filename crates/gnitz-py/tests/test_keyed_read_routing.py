@@ -10,14 +10,12 @@ that span every worker.
 Run with GNITZ_WORKERS=4 (routing is a no-op at a single worker):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_keyed_read_routing.py -v
 """
-import random
+from _uid import uid as _uid
 
 # Enough distinct keys that the set spans every worker at any worker count.
 NROWS = 400
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _rows(client, sn, q):

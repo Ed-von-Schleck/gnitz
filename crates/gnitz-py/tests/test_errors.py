@@ -1,12 +1,10 @@
-import random
 import threading
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _cleanup(client, sn, tables=()):

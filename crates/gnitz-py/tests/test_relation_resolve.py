@@ -12,14 +12,12 @@ Run with GNITZ_WORKERS=4 (a resolve is master-local, but every read and push it
 feeds fans out):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_relation_resolve.py -v
 """
-import random
 
 import gnitz
 import pytest
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _rows(conn, sn, q):

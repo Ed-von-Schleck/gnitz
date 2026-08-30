@@ -9,7 +9,7 @@
 
 use gnitz_wire::type_code as tc;
 
-use crate::{BatchView, ColumnLocator, Evaluator, LogicalInstr, LogicalProgram, RowSource, SchemaFacts};
+use crate::{BatchView, ColumnLocator, Evaluator, LogicalInstr, LogicalProgram, Reg, RowSource, SchemaFacts, Sink};
 
 /// A [`BatchView`] over owned buffers, laid out region-wise like the physical
 /// batch: one packed OPK PK region, one null-bitmap word per row, and one
@@ -314,28 +314,40 @@ pub fn make_n_col_view(
 pub fn scalar_prog(
     schema: &TestSchema,
     instrs: Vec<LogicalInstr>,
-    num_regs: u32,
-    result_reg: u32,
+    result_reg: Reg,
     const_strings: Vec<Vec<u8>>,
 ) -> Evaluator {
-    LogicalProgram::new(instrs, num_regs, result_reg, const_strings)
+    LogicalProgram::new(instrs, Vec::new(), Some(result_reg), const_strings)
         .resolve_scalar(schema)
         .expect("test program must validate")
 }
 
-/// A predicate as [`filter_prog`] takes it: `(instrs, num_regs, result_reg)`.
-pub type FilterShape = (Vec<LogicalInstr>, u32, u32);
+/// [`scalar_prog`] for a program that also writes output slots — the shape the
+/// sink tests drive, reading a result register *and* emitting.
+pub fn scalar_prog_with_sinks(
+    schema: &TestSchema,
+    instrs: Vec<LogicalInstr>,
+    sinks: Vec<Sink>,
+    result_reg: Reg,
+    const_strings: Vec<Vec<u8>>,
+) -> Evaluator {
+    LogicalProgram::new(instrs, sinks, Some(result_reg), const_strings)
+        .resolve_scalar(schema)
+        .expect("test program must validate")
+}
+
+/// A predicate as [`filter_prog`] takes it: `(instrs, result_reg)`.
+pub type FilterShape = (Vec<LogicalInstr>, Reg);
 
 /// Build and resolve a filter program — the arm where `result_reg` stays
 /// bit_only-eligible. Same unwrap rule as [`scalar_prog`].
 pub fn filter_prog(
     schema: &TestSchema,
     instrs: Vec<LogicalInstr>,
-    num_regs: u32,
-    result_reg: u32,
+    result_reg: Reg,
     const_strings: Vec<Vec<u8>>,
 ) -> Evaluator {
-    LogicalProgram::new(instrs, num_regs, result_reg, const_strings)
+    LogicalProgram::new(instrs, Vec::new(), Some(result_reg), const_strings)
         .resolve_filter(schema)
         .expect("test predicate must validate")
 }
@@ -346,11 +358,10 @@ pub fn map_prog(
     in_schema: &TestSchema,
     out_schema: &TestSchema,
     instrs: Vec<LogicalInstr>,
-    num_regs: u32,
-    result_reg: u32,
+    sinks: Vec<Sink>,
     const_strings: Vec<Vec<u8>>,
 ) -> Evaluator {
-    LogicalProgram::new(instrs, num_regs, result_reg, const_strings)
+    LogicalProgram::new(instrs, sinks, None, const_strings)
         .resolve_map(in_schema, out_schema)
         .expect("test map must validate")
 }
@@ -405,18 +416,14 @@ pub fn locator_fixture() -> TestView {
     v
 }
 
-/// `IS NULL` / `IS NOT NULL` over column `col` into register `dst`. The two read
-/// one null-bitmap bit at opposite polarity and share one instruction, so a
-/// fixture names the polarity rather than spelling the struct literal — which
-/// rustfmt would break across five lines at every call site.
-pub fn is_null_op(dst: u16, col: u32) -> LogicalInstr {
-    LogicalInstr::IsNull {
-        dst,
-        col,
-        invert: false,
-    }
+/// `IS NULL` / `IS NOT NULL` over column `col`. The two read one null-bitmap bit
+/// at opposite polarity and share one instruction, so a fixture names the
+/// polarity rather than spelling the struct literal — which rustfmt would break
+/// across four lines at every call site.
+pub fn is_null_op(col: u32) -> LogicalInstr {
+    LogicalInstr::IsNull { col, invert: false }
 }
 
-pub fn is_not_null_op(dst: u16, col: u32) -> LogicalInstr {
-    LogicalInstr::IsNull { dst, col, invert: true }
+pub fn is_not_null_op(col: u32) -> LogicalInstr {
+    LogicalInstr::IsNull { col, invert: true }
 }

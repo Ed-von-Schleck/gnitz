@@ -9,13 +9,11 @@ and ID-allocation sequence tests (allocate_table_id/schema_id not in gnitz-py
 API).
 """
 
-import random
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 # ===========================================================================

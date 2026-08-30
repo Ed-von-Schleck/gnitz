@@ -22,7 +22,7 @@ pub const OPCODE_NULL_EXTEND: u64 = 23;
 pub const OPCODE_INTEGRATE_TRACE: u64 = 25;
 /// MAP sub-variant: pure projection (column reorder/drop).
 pub const OPCODE_MAP_PROJ: u64 = 26;
-/// MAP sub-variant: expression program (compute) with optional PK reindex.
+/// MAP sub-variant: expression program (compute), inheriting the input PK.
 pub const OPCODE_MAP_EXPR: u64 = 27;
 /// MAP sub-variant: copy all columns to payload, set PK = hash of full row.
 pub const OPCODE_MAP_HASH_ROW: u64 = 29;
@@ -37,6 +37,12 @@ pub const OPCODE_WORKER_FILTER: u64 = 33;
 /// (PK, payload)'s net weight to `[0, i64::MAX]` (vs DISTINCT's `[-1, 1]`). The
 /// bag preset for EXCEPT ALL / INTERSECT ALL; shares DISTINCT's engine body.
 pub const OPCODE_POSITIVE_PART: u64 = 34;
+/// MAP sub-variant: re-key onto a synthetic PK built from the named source
+/// columns, keeping the named columns as payload. A separate opcode rather than
+/// a `MAP_EXPR` carrying an empty key list: the two share no payload shape —
+/// a compute map has a program blob and declared output columns, a reindex two
+/// column lists and no blob.
+pub const OPCODE_MAP_REINDEX: u64 = 35;
 
 // ---------------------------------------------------------------------------
 // Circuit-layer type aliases
@@ -63,16 +69,16 @@ pub const PORT_IN_B: u64 = 1;
 
 pub const NODE_COL_KIND_GROUP: u64 = 0; // REDUCE group-by columns
 pub const NODE_COL_KIND_SHARD: u64 = 1; // EXCHANGE_SHARD shard columns
-pub const NODE_COL_KIND_PROJ: u64 = 2; // MAP projection columns
+pub const NODE_COL_KIND_PROJ: u64 = 2; // MAP projection / MAP_REINDEX kept payload columns
 pub const NODE_COL_KIND_NULL_EXT: u64 = 3; // NULL_EXTEND payload type codes
 pub const NODE_COL_KIND_AGG_SPEC: u64 = 4; // REDUCE aggregate specs (value1=func_id, value2=col_idx)
 pub const NODE_COL_KIND_BRANCH_ID: u64 = 5; // MAP_HASH_ROW per-side branch discriminator (value1=branch_id)
-pub const NODE_COL_KIND_REINDEX: u64 = 6; // MAP_EXPR equijoin pre-index cols (value1=col_idx, position=key order)
+pub const NODE_COL_KIND_REINDEX: u64 = 6; // MAP_REINDEX equijoin pre-index cols (value1=col_idx, position=key order)
 pub const NODE_COL_KIND_RANGE_JOIN: u64 = 7; // JOIN_DELTA_TRACE_RANGE params (value1=n_eq, value2=rel)
 pub const NODE_COL_KIND_GLOBAL_GROUND: u64 = 8; // REDUCE global-aggregate ground discriminator (value1=bool)
 pub const NODE_COL_KIND_REDUCE_OUT_KEY: u64 = 9; // REDUCE output-key kind (value1=ReduceOutKey); absent ⇒ SyntheticFold
 pub const NODE_COL_KIND_SCAN_BOUND: u64 = 10; // SCAN_DELTA backfill-scan index column list (value1=col_idx, position=key order)
-pub const NODE_COL_KIND_ROUTE_KEY: u64 = 11; // MAP_EXPR reindex role (value1 = ReindexRole)
+pub const NODE_COL_KIND_ROUTE_KEY: u64 = 11; // MAP_REINDEX role (value1 = ReindexRole)
 pub const NODE_COL_KIND_MAP_OUT_COLS: u64 = 12; // MAP_EXPR compute payload columns (value1=type_code, value2=nullable)
 
 // ---------------------------------------------------------------------------
@@ -389,7 +395,7 @@ wire_enum! {
 pub enum MapKind {
     /// Pure projection/column-reorder. Carries payload column indices to keep.
     Projection(Vec<u32>),
-    /// Computed projection (`SELECT a + b`). `program` is an opaque `ExprProgram`
+    /// Computed projection (`SELECT a + b`). `program` is an opaque expression
     /// blob writing one payload slot each; `out_cols` declares those slots as
     /// `(type_code, nullable)` in payload order. The PK region is inherited from
     /// the input verbatim, so it is not listed.
@@ -402,16 +408,17 @@ pub enum MapKind {
         out_cols: Vec<(u8, bool)>,
     },
     /// Re-key: `reindex_cols` lists the source columns, in key order, that become
-    /// the synthetic PK for equijoin/group pre-indexing, and `program` is the copy
-    /// list placing the surviving payload behind them. Never empty — a map that
-    /// re-keys nothing is a [`MapKind::Compute`].
+    /// the synthetic PK for equijoin/group pre-indexing, and `keep` lists the
+    /// source columns that survive as payload behind them, in output order.
+    /// `reindex_cols` is never empty — a map that re-keys nothing is a
+    /// [`MapKind::Compute`].
     ///
     /// `reindex_target_tcs` is parallel to `reindex_cols`. Entry `i` is the
     /// promoted key type code `T` for slot `i` of a cross-width equijoin key, or
     /// `0` meaning "derive the slot type from the source column" (the same-type
     /// path, byte-identical to non-promoted circuits).
     Reindex {
-        program: Vec<u8>,
+        keep: Vec<u32>,
         reindex_cols: Vec<u32>,
         reindex_target_tcs: Vec<u8>,
         role: ReindexRole,
@@ -614,7 +621,7 @@ fn encode_col_list_with_tcs(kind: u64, cols: &[u32], target_tcs: &[u8]) -> Vec<N
 }
 
 /// Encode a typed `OpNode` into its `nodes`-row fields + `node_columns` payload
-/// rows — the inverse of [`decode_op_node`]. The `ExprProgram` blob is carried
+/// rows — the inverse of [`decode_op_node`]. The expression blob is carried
 /// opaquely (each crate encodes it with its own encoder before building the
 /// `OpNode`).
 pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
@@ -639,17 +646,18 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             ((OPCODE_MAP_EXPR, None, Some(program)), kind_rows)
         }
         OpNode::Map(MapKind::Reindex {
-            program,
+            keep,
             reindex_cols,
             reindex_target_tcs,
             role,
         }) => {
             let mut kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_REINDEX, &reindex_cols, &reindex_target_tcs);
+            kind_rows.extend(encode_col_list(NODE_COL_KIND_PROJ, keep));
             // Written for both roles, unlike the sparse GLOBAL_GROUND /
             // REDUCE_OUT_KEY rows: the decode rejects an absent row rather than
             // guessing which side of the routing boundary the node sits on.
             kind_rows.push((NODE_COL_KIND_ROUTE_KEY, 0, role.as_wire(), 0));
-            ((OPCODE_MAP_EXPR, None, Some(program)), kind_rows)
+            ((OPCODE_MAP_REINDEX, None, None), kind_rows)
         }
         OpNode::Map(MapKind::HashRow(cols, target_tcs, branch_id)) => {
             let mut kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_PROJ, &cols, &target_tcs);
@@ -708,7 +716,7 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
 ///
 /// `cols` is the sorted (kind, position, value1, value2) slice for this node,
 /// pre-filtered to the current `node_id`. `expr_blob` is stored as-is without
-/// any attempt to decode the `ExprProgram` — callers do that on their side of
+/// any attempt to decode the expression blob — callers do that on their side of
 /// the crate boundary.
 pub fn decode_op_node(
     opcode: u64,
@@ -765,28 +773,29 @@ pub fn decode_op_node(
         OPCODE_MAP_PROJ => OpNode::Map(MapKind::Projection(collect_cols(NODE_COL_KIND_PROJ))),
         OPCODE_MAP_EXPR => {
             let program = expr_blob.ok_or_else(|| "MAP_EXPR missing expr_program blob".to_string())?;
+            let out_cols = rows_of(cols, NODE_COL_KIND_MAP_OUT_COLS)
+                .iter()
+                .map(|c| {
+                    let tc = c.value1 as u8;
+                    match crate::is_valid_type_code(tc) {
+                        true => Ok((tc, c.value2 != 0)),
+                        false => Err(format!("MAP_EXPR output column type code {tc} is invalid")),
+                    }
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            OpNode::Map(MapKind::Compute { program, out_cols })
+        }
+        OPCODE_MAP_REINDEX => {
             // Reject a non-zero target that is not PK-eligible: the reindex
             // targets flow into the 16-byte-capable OPK promoter
             // (`encode_pk_column_promoted`), so its trust boundary admits exactly
             // that domain.
             let (reindex_cols, reindex_target_tcs) =
                 collect_cols_with_tcs(cols, NODE_COL_KIND_REINDEX, crate::is_pk_eligible, |tc| {
-                    format!("MAP_EXPR reindex target type code {tc} is not PK-eligible")
+                    format!("MAP_REINDEX target type code {tc} is not PK-eligible")
                 })?;
-            // The reindex columns are the discriminator: a map that re-keys nothing
-            // is a computed projection, which is why the two cannot be confused.
             if reindex_cols.is_empty() {
-                let out_cols = rows_of(cols, NODE_COL_KIND_MAP_OUT_COLS)
-                    .iter()
-                    .map(|c| {
-                        let tc = c.value1 as u8;
-                        match crate::is_valid_type_code(tc) {
-                            true => Ok((tc, c.value2 != 0)),
-                            false => Err(format!("MAP_EXPR output column type code {tc} is invalid")),
-                        }
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                return Ok(OpNode::Map(MapKind::Compute { program, out_cols }));
+                return Err("MAP_REINDEX names no key columns".to_string());
             }
             // An `Err` rather than a default, unlike SCAN_BOUND above: that bound
             // decides scan speed and never correctness, so one corrupt hint row
@@ -796,11 +805,11 @@ pub fn decode_op_node(
             let role_row = cols
                 .iter()
                 .find(|c| c.kind == NODE_COL_KIND_ROUTE_KEY)
-                .ok_or_else(|| "MAP_EXPR missing its route-key row".to_string())?;
+                .ok_or_else(|| "MAP_REINDEX missing its route-key row".to_string())?;
             let role = ReindexRole::from_wire(role_row.value1)
-                .ok_or_else(|| format!("MAP_EXPR unknown route-key role {}", role_row.value1))?;
+                .ok_or_else(|| format!("MAP_REINDEX unknown route-key role {}", role_row.value1))?;
             OpNode::Map(MapKind::Reindex {
-                program,
+                keep: collect_cols(NODE_COL_KIND_PROJ),
                 reindex_cols,
                 reindex_target_tcs,
                 role,

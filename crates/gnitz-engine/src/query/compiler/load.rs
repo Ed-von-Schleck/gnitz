@@ -662,7 +662,6 @@ mod tests {
     fn test_circuit_range_join_n_eq_discriminator() {
         use crate::schema::ReduceOutKey;
         use gnitz_wire::{AggFunc, JoinKind, MapKind, OpNode};
-        let dummy_blob = dummy_expr_blob();
 
         // A GROUP BY view: ScanDelta → Map(reindex) → ExchangeShard → Reduce →
         // IntegrateSink. It has BOTH a reindex Map (has_join_shard) AND an
@@ -674,7 +673,7 @@ mod tests {
         gb.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob.clone(),
+                keep: vec![0],
                 reindex_cols: vec![1],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -729,13 +728,12 @@ mod tests {
         // A route-key Map followed by a WorkerFilter: the walk reaches the Map and
         // returns its cols, then stops — a WorkerFilter is not a Filter, so it is
         // never stepped through. What the Map *feeds* does not enter into it.
-        let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(99));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob,
+                keep: vec![0],
                 reindex_cols: vec![2],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -765,7 +763,6 @@ mod tests {
     #[test]
     fn test_co_partition_keys_range_join_feeds_join_directly() {
         use gnitz_wire::{JoinKind, MapKind, OpNode};
-        let dummy_blob = dummy_expr_blob();
         // ScanDelta(99) ─► Map(reindex=[2]) ─┬─► Join(DeltaTraceRange)  [delta, PORT_IN_A]
         //                                     └─► WorkerFilter ─► IntegrateTrace ─► Join  [PORT_TRACE]
         let mut nodes = HashMap::new();
@@ -773,7 +770,7 @@ mod tests {
         nodes.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob,
+                keep: vec![0],
                 reindex_cols: vec![2],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -814,7 +811,7 @@ mod tests {
         nodes.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob.clone(),
+                keep: vec![0],
                 reindex_cols: vec![3],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -850,7 +847,7 @@ mod tests {
         nodes.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob.clone(),
+                keep: vec![0],
                 reindex_cols: vec![2],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -860,7 +857,7 @@ mod tests {
         nodes.insert(
             3,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob,
+                keep: vec![0],
                 reindex_cols: vec![5],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -880,13 +877,12 @@ mod tests {
     #[test]
     fn test_co_partition_keys_overlapping_key_verbatim() {
         use gnitz_wire::{MapKind, OpNode};
-        let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
         nodes.insert(0, scan_delta(42));
         nodes.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob,
+                keep: vec![0],
                 reindex_cols: vec![3, 3],
                 reindex_target_tcs: vec![0, type_code::I64],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -916,7 +912,7 @@ mod tests {
         nodes.insert(
             2,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob.clone(),
+                keep: vec![0],
                 reindex_cols: vec![2],
                 reindex_target_tcs: vec![0],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -926,7 +922,7 @@ mod tests {
         nodes.insert(
             4,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob,
+                keep: vec![0],
                 reindex_cols: vec![2],
                 reindex_target_tcs: vec![0],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -948,7 +944,6 @@ mod tests {
     #[test]
     fn test_co_partition_keys_ignores_aux_rekey_in_join_view() {
         use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel};
-        let dummy_blob = dummy_expr_blob();
         // ScanDelta(10) ──► Map(reindex [1,2]) ──► Join(DeltaTraceRange)
         //              │                       └─► IntegrateTrace
         //              └──► Map(reindex [0]) ──► Map(Projection) ──► Distinct   (a_all → proj_a → D)
@@ -957,7 +952,7 @@ mod tests {
         nodes.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob.clone(),
+                keep: vec![0],
                 reindex_cols: vec![1, 2],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -974,7 +969,7 @@ mod tests {
         nodes.insert(
             4,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob,
+                keep: vec![0],
                 reindex_cols: vec![0],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::Auxiliary,
@@ -1063,7 +1058,7 @@ mod tests {
         nodes.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob.clone(),
+                keep: vec![0],
                 reindex_cols: vec![2],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,
@@ -1084,7 +1079,7 @@ mod tests {
         nodes.insert(
             1,
             OpNode::Map(MapKind::Reindex {
-                program: dummy_blob.clone(),
+                keep: vec![0],
                 reindex_cols: vec![2],
                 reindex_target_tcs: vec![],
                 role: gnitz_wire::ReindexRole::ScatterKey,

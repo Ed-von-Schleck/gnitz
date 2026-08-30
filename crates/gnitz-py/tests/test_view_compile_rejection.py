@@ -18,13 +18,11 @@ the limit itself: the HAVING ladder costs 4 registers per conjunct, which is a
 register-allocator detail, not a contract.
 """
 
-import random
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100_000, 999_999))
 
 
 def _cap_error(exc) -> bool:

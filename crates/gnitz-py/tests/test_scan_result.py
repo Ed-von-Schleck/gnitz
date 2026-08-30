@@ -2,16 +2,14 @@
 they hand out — how a scanned batch is presented to Python, what each accessor
 promises on an empty result, and how a row addresses its fields.
 """
-import random
 import uuid
 
 import pytest
 
 from gnitz import TypeCode, ColumnDef, Schema, Row, ZSetBatch
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _cleanup(client, sn, *names):

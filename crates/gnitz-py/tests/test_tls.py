@@ -6,21 +6,13 @@ from the session server's pinned TLS port, independent of GNITZ_TRANSPORT.
 """
 
 import asyncio
-import os
 
 import pytest
 import pytest_asyncio
 
 import gnitz
 from gnitz import aio
-
-_uid_counter = 0
-
-
-def _uid():
-    global _uid_counter
-    _uid_counter += 1
-    return f"tls{os.getpid()}_{_uid_counter}"
+from _uid import uid as _uid
 
 
 COLS = [

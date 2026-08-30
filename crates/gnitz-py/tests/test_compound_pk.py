@@ -10,9 +10,9 @@ exercised here — the tests interact through SQL DDL/DML only.
 """
 
 import os
-import random
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 
 _NEEDS_MULTI = pytest.mark.skipif(
@@ -21,8 +21,6 @@ _NEEDS_MULTI = pytest.mark.skipif(
 )
 
 
-def _uid() -> str:
-    return str(random.randint(100_000, 999_999))
 
 
 def _cleanup(client, sn, *tables):

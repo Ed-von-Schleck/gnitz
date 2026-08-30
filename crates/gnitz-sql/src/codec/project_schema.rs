@@ -15,7 +15,7 @@ use crate::expr_lower::compile_bound_expr;
 use crate::ir::BoundExpr;
 use crate::validate::reject_duplicate_column_names;
 use gnitz_core::{ColumnDef, Schema};
-use gnitz_expr::{ExprBuilder, ExprProgram};
+use gnitz_expr::{ExprBuilder, LogicalProgram, Sink};
 use sqlparser::ast::SelectItem;
 
 /// One output column of a projection: a verbatim source column
@@ -79,24 +79,22 @@ pub(crate) fn declared_out_cols(cols: &[ColumnDef]) -> Vec<(u8, bool)> {
 
 /// Compile the *payload* slice of a projection (`items` must exclude the
 /// leading PK slots, which the engine carries verbatim) into one expr-map
-/// program: a COPY_COL per pass-through, a compiled expression + EMIT per
-/// computed slot. `payload_idx` is the dense output payload position. EMIT is
+/// program: one sink per output payload slot, in slot order. A register sink is
 /// class-agnostic here — the engine splits it by the source register's class,
 /// storing the raw 8-byte image for a scalar and a German-string cell for a
-/// string. The program's `result_reg` is unused (EMIT/COPY_COL write directly).
-pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Result<ExprProgram, GnitzSqlError> {
+/// string.
+pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Result<LogicalProgram, GnitzSqlError> {
     let mut eb = ExprBuilder::new();
-    for (payload_idx, item) in items.iter().enumerate() {
-        let payload_idx = payload_idx as u32;
+    for item in items {
         match item {
-            ProjItem::PassThrough { src_col } => eb.copy_col(*src_col as u32, payload_idx),
+            ProjItem::PassThrough { src_col } => eb.sink(Sink::Col(*src_col as u32)),
             ProjItem::Computed { bound_expr } => {
                 let reg = compile_bound_expr(bound_expr, &schema.columns, &mut eb)?;
-                eb.emit_col(reg, payload_idx);
+                eb.sink(Sink::Reg(reg));
             }
         }
     }
-    Ok(eb.build(0))
+    eb.build(None).map_err(|e| GnitzSqlError::Unsupported(e.to_string()))
 }
 
 /// Pin the full source PK to output slots `0..k` in `pk_indices()` order,
@@ -122,7 +120,7 @@ pub(crate) fn place_pk_front(
     for (target, &pk) in source_schema.pk_indices().iter().enumerate() {
         // First occurrence is the canonical physical-PK slot; any later
         // duplicate (SELECT pk, pk AS x) stays in the payload region and is
-        // materialized by the expr-map COPY_COL path.
+        // materialized by the expr-map column-copy path.
         let cur = items
             .iter()
             .position(|i| matches!(i, ProjItem::PassThrough { src_col } if *src_col == pk));
@@ -154,7 +152,8 @@ pub(crate) fn place_pk_front(
 /// Build the projected `(items, out_cols)` for the **ad-hoc read path**
 /// (the rows sink): the full source PK is **always hidden-prepended** to slots
 /// `0..k`, and every SELECT item — a projected PK column included — is a payload
-/// slot in SELECT order (materialized by a `COPY_COL` / computed `EMIT`). Unlike
+/// slot in SELECT order (materialized by a column sink / a computed register
+/// sink). Unlike
 /// the CREATE VIEW linear path's [`place_pk_front`] (which *promotes* a projected
 /// PK to the visible front), this preserves the user's column order (`SELECT a,
 /// id` stays `[a, id]`) and never rejects a PK-dropping projection — the physical
@@ -218,6 +217,6 @@ pub(crate) fn read_reply_shape(
         .map_err(|e| GnitzSqlError::Unsupported(format!("read-spec reply schema is invalid: {e}")))?;
     Ok((
         reply_schema,
-        compile_projection_map(&items[k..], source_schema)?.encode(),
+        compile_projection_map(&items[k..], source_schema)?.to_blob_bytes(),
     ))
 }

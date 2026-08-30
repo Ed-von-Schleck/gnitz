@@ -637,7 +637,7 @@ fn permuted_gather_with_string_and_nullable_across_chunks() {
 /// A compute-bearing projection (`val * 2` alongside a copied column) with a
 /// predicate, across ≥2 chunks: the survivors are compacted first, then the
 /// compute kernel writes onto the keeper's tail at a non-zero destination base.
-/// The nullable source makes the EMIT null-merge run, whose read-modify-write
+/// The nullable source makes the emit null-merge run, whose read-modify-write
 /// `|=` depends on the permuted word already being written for those rows.
 #[test]
 fn compute_projection_writes_at_keeper_tail_across_chunks() {
@@ -665,11 +665,18 @@ fn compute_projection_writes_at_keeper_tail_across_chunks() {
     );
     let projection = {
         let mut eb = gnitz_expr::ExprBuilder::new();
-        let (v, two) = (eb.load_col_int(1), eb.load_const(2));
-        let doubled = eb.mul(v, two);
-        eb.emit_col(doubled, 0);
-        eb.copy_col(2, 1);
-        eb.build(0).encode()
+        let (v, two) = (
+            eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: 1 }),
+            eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: 2 }),
+        );
+        let doubled = eb.emit(gnitz_expr::LogicalInstr::IntArith {
+            op: gnitz_expr::IntArithOp::Mul,
+            a: v,
+            b: two,
+        });
+        eb.sink(gnitz_expr::Sink::Reg(doubled));
+        eb.sink(gnitz_expr::Sink::Col(2));
+        eb.build(None).expect("a well-formed program").to_blob_bytes()
     };
     // `keep = id * 10 < 1000` keeps ids 0..99, interleaved with the chunking.
     let spec = rows_spec(pred_lt_blob(2, 1000), projection, vec![], 0);
@@ -712,7 +719,7 @@ fn projection_missing_an_output_slot_errs() {
     );
     let spec = rows_spec(vec![], proj_blob(&[(1, 0)]), vec![], 0);
     let err = e.scan_spec_family(tid, &spec, &reply, 0).err().unwrap();
-    assert!(err.text.contains("OutputSlotUnwritten"), "{err}");
+    assert!(err.text.contains("OutputSlotCountMismatch"), "{err}");
 }
 
 /// A gather + ORDER BY … LIMIT k over weight-3 rows, sized so

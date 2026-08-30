@@ -159,7 +159,10 @@ pub(super) fn scan_delta(source: u64) -> gnitz_wire::OpNode {
 /// byte literal, so it stays decodable when the blob header changes.
 #[cfg(test)]
 pub(super) fn dummy_expr_blob() -> Vec<u8> {
-    gnitz_expr::ExprBuilder::new().build(0).encode()
+    gnitz_expr::ExprBuilder::new()
+        .build(None)
+        .expect("a well-formed program")
+        .to_blob_bytes()
 }
 
 /// Handles for the three circuit system tables the compiler reads. No schemas

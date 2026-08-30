@@ -542,12 +542,12 @@ pub const fn is_valid_type_code(tc: u8) -> bool {
 /// The type of the register image the engine materializes for a computed value
 /// of source type `tc`: any float lands as `F64` (`LOAD_COL_FLOAT` widens `F32`
 /// on load), `U64` stays unsigned so a downstream compare re-seeds the unsigned
-/// variant, and every other integer normalizes to `I64`. EMIT stores that image
+/// variant, and every other integer normalizes to `I64`. A register sink stores that image
 /// whole, so a computed column typed any narrower would ship the low half of an
 /// `f64` or wrap a negative value into an unsigned slot.
 ///
 /// `STRING` maps to itself: the VM has a string register class beside the scalar
-/// one, and EMIT stores its 16-byte cell whole. Making the rule total over both
+/// one, and a string sink stores its 16-byte cell whole. Making the rule total over both
 /// classes is what lets expression typing read it unconditionally.
 ///
 /// `BLOB` has no register of either class and normalizes to `I64` with the rest;
@@ -575,7 +575,7 @@ pub(crate) const fn register_image_type(tc: u8) -> u8 {
 /// this reads back [`join_key_common_type`]'s contract: the promotion is
 /// idempotent, so `target` is a promotion of `src` iff resolving the pair
 /// `(src, target)` maps back to `target`. Shared by the engine compiler's
-/// carried-target validation and the expression validator's COPY_COL slot check
+/// carried-target validation and the expression validator's column-sink slot check
 /// so the two cannot drift.
 #[inline]
 pub fn is_widening_promotion(src: u8, target: u8) -> bool {

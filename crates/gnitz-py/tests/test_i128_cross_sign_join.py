@@ -22,15 +22,13 @@ Two surfaces are tested:
    matched key decoding back to its true non-negative value through the client
    (the wide-PK OPK sign round-trip).
 """
-import random
 
 import pytest
 import gnitz
 from gnitz import ColumnDef, Schema, TypeCode, ZSetBatch
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100_000, 999_999))
 
 
 # ---------------------------------------------------------------------------

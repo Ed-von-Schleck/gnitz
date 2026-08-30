@@ -10,13 +10,11 @@ single-worker run skips the fanout entirely.
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_like.py -v
 """
 
-import random
 
 import pytest
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100_000, 999_999))
 
 
 @pytest.fixture

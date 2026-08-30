@@ -3,12 +3,10 @@
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_left_join.py -v --tb=short
 """
-import random
 import gnitz
+from _uid import uid as _uid
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 class TestLeftJoin:

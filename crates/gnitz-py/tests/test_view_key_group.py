@@ -13,17 +13,15 @@ Run with GNITZ_WORKERS=4 and =1 (a hidden view key is only reachable through the
 binary client, so these drive `push`/`seek`, not SQL):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_view_key_group.py -v --tb=short
 """
-import random
 
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 NFACTS = 40
 NDIMS = 4
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _cleanup(client, sn, *names):

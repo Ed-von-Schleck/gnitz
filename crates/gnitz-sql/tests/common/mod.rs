@@ -329,6 +329,7 @@ fn opcode_name(op: u64) -> &'static str {
         gnitz_wire::OPCODE_MAP_PROJ => "MAP_PROJ",
         gnitz_wire::OPCODE_MAP_EXPR => "MAP_EXPR",
         gnitz_wire::OPCODE_MAP_HASH_ROW => "MAP_HASH_ROW",
+        gnitz_wire::OPCODE_MAP_REINDEX => "MAP_REINDEX",
         gnitz_wire::OPCODE_JOIN_DELTA_TRACE_RANGE => "JOIN_DELTA_TRACE_RANGE",
         gnitz_wire::OPCODE_WORKER_FILTER => "WORKER_FILTER",
         gnitz_wire::OPCODE_POSITIVE_PART => "POSITIVE_PART",

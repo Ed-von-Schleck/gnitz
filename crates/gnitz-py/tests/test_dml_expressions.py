@@ -7,15 +7,13 @@ that no client interpreter could serve) and what it costs (the VM's 64-register
 cap, now reachable from DML).
 """
 
-import random
 import pytest
 import gnitz
+from _uid import uid as _uid
 
 U64_HIGH = 2**63 + 5  # crosses the signed boundary: negative as an i64
 
 
-def _uid():
-    return str(random.randint(100000, 999999))
 
 
 def _scan_map(client, tid):

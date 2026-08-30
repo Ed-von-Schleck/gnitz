@@ -567,17 +567,17 @@ mod tests {
         let schema = schema_1i64();
 
         // Predicate: col[1] > 0  (col[1] is the I64 payload at logical index 1)
+        use gnitz_expr::Reg;
         let pred_instrs = vec![
-            gnitz_expr::LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1]
-            gnitz_expr::LogicalInstr::LoadConst { dst: 1, val: 0 },  // r1 = 0
+            gnitz_expr::LogicalInstr::LoadColInt { col: 1 }, // r0 = col[1]
+            gnitz_expr::LogicalInstr::LoadConst { val: 0 },  // r1 = 0
             gnitz_expr::LogicalInstr::Cmp {
                 op: gnitz_expr::CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             }, // r2 = r0 > r1
         ];
-        let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
+        let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, Vec::new(), Some(Reg(2)), vec![]);
         let mut builder = ProgramBuilder::new();
         let pred_idx = builder.push_predicate(pred_prog.resolve_filter(&schema).unwrap());
         builder.push(Instr::Filter {
@@ -1312,23 +1312,22 @@ mod tests {
     /// Filter with expression bytecode: col1 > 25 keeps rows with val 30, 40, 50.
     #[test]
     fn test_filter_with_expr() {
-        use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram};
+        use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram, Reg};
 
         let schema = schema_1i64();
 
         // Build expression: col1 > 25
         // col1 is schema column index 1 (the I64 payload column)
         let instrs = vec![
-            LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1]
-            LogicalInstr::LoadConst { dst: 1, val: 25 }, // r1 = 25
+            LogicalInstr::LoadColInt { col: 1 }, // r0 = col[1]
+            LogicalInstr::LoadConst { val: 25 }, // r1 = 25
             LogicalInstr::Cmp {
                 op: CmpOp::Gt,
-                dst: 2,
-                a: 0,
-                b: 1,
+                a: Reg(0),
+                b: Reg(1),
             }, // r2 = (r0 > r1)
         ];
-        let prog = LogicalProgram::new(instrs, 3, 2, vec![]);
+        let prog = LogicalProgram::new(instrs, Vec::new(), Some(Reg(2)), vec![]);
 
         let mut builder = ProgramBuilder::new();
         let pred_idx = builder.push_predicate(prog.resolve_filter(&schema).unwrap());

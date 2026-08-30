@@ -56,8 +56,8 @@ fn schema_facts_harness_accepts_a_faithful_impl() {
 }
 
 /// The harness must not be vacuous: an off-by-one `payload_col_idx` — the
-/// forwarder-reimplementation failure mode that silently type-checks a COPY_COL
-/// or EMIT against a neighbouring output column — has to fail it.
+/// forwarder-reimplementation failure mode that silently type-checks a column
+/// or register sink against a neighbouring output column — has to fail it.
 #[test]
 #[should_panic(expected = "payload_col_idx")]
 fn schema_facts_harness_rejects_an_off_by_one_payload_col_idx() {

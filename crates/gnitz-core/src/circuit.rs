@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use gnitz_expr::ExprProgram;
+use gnitz_expr::LogicalProgram;
 
 use crate::error::ClientError;
 
@@ -179,8 +179,8 @@ impl CircuitBuilder {
         })
     }
 
-    pub fn filter(&mut self, input: NodeId, expr: Option<ExprProgram>) -> NodeId {
-        self.alloc_unary(OpNode::Filter(expr.map(|e| e.encode())), input)
+    pub fn filter(&mut self, input: NodeId, expr: Option<LogicalProgram>) -> NodeId {
+        self.alloc_unary(OpNode::Filter(expr.map(|e| e.to_blob_bytes())), input)
     }
 
     /// A computed projection: `program` writes one payload slot each, and
@@ -188,10 +188,10 @@ impl CircuitBuilder {
     /// order. `SELECT a + b` has no copy list the engine could derive a schema
     /// from, so the declaration travels; the PK region is inherited from the input
     /// and is not listed.
-    pub fn map_expr(&mut self, input: NodeId, program: ExprProgram, out_cols: &[(u8, bool)]) -> NodeId {
+    pub fn map_expr(&mut self, input: NodeId, program: LogicalProgram, out_cols: &[(u8, bool)]) -> NodeId {
         self.alloc_unary(
             OpNode::Map(MapKind::Compute {
-                program: program.encode(),
+                program: program.to_blob_bytes(),
                 out_cols: out_cols.to_vec(),
             }),
             input,
@@ -208,26 +208,25 @@ impl CircuitBuilder {
     /// slice (or all-zero) for a non-promoted reindex; the result is byte-identical
     /// to the pre-promotion serialization.
     ///
-    /// The engine derives the node's output payload schema from `program`'s copy
-    /// list: a program that is one COPY_COL per payload column with dense outputs
-    /// `0..n` places exactly its source columns behind the key slots (so copying a
-    /// column subset prunes the payload).
+    /// `keep` lists the source columns that survive as payload behind the key
+    /// slots, in output order — so omitting a column the view never reads prunes
+    /// it out of the reindex MAP and out of the join trace behind it.
     ///
     /// Panics on an empty `reindex_cols`: a map that re-keys nothing is a
-    /// [`Self::map_expr`], and the wire tells the two apart by these columns.
+    /// [`Self::map_expr`], and the two carry different opcodes.
     pub fn map_reindex(
         &mut self,
         input: NodeId,
         reindex_cols: &[usize],
         target_tcs: &[u8],
-        program: ExprProgram,
+        keep: &[u32],
         role: ReindexRole,
     ) -> NodeId {
         assert!(!reindex_cols.is_empty(), "a reindex map must name its key columns");
         let reindex_target_tcs = Self::promotion_targets(reindex_cols, target_tcs);
         self.alloc_unary(
             OpNode::Map(MapKind::Reindex {
-                program: program.encode(),
+                keep: keep.to_vec(),
                 reindex_cols: reindex_cols.iter().map(|&c| c as u32).collect(),
                 reindex_target_tcs,
                 role,

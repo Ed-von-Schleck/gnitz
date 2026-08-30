@@ -11,14 +11,15 @@
 //! the crate root (`gnitz_expr::FOO`), matching `gnitz-wire`'s leaf-crate shape.
 //!
 //! What lives here is the whole path from a wire expression blob to evaluated
-//! values: [`ExprBuilder`] (which emits the blob), [`LogicalProgram`] (the
-//! wire-mirroring form it decodes back to), its resolution against a schema, and
+//! values: [`ExprBuilder`] (which assembles the program), [`LogicalProgram`]
+//! (the wire-mirroring form, which both encodes to a blob and decodes back from
+//! one), its resolution against a schema, and
 //! the morsel-oriented vectorized kernels that evaluate the resolved form — plus
 //! the two contracts they read through, [`ColumnLocator`] / [`RowSource`] /
 //! [`BatchView`] for *where a value physically sits* and [`SchemaFacts`] for
 //! *what the schema says about it*.
 //!
-//! `LogicalInstr::to_wire` and `LogicalProgram::decode_quad` are two tables over
+//! `LogicalInstr::to_wire` and `LogicalProgram::decode_triple` are two tables over
 //! `gnitz_wire::ExprOp`; both live in `program.rs`, and `tests/program.rs`'s
 //! drift tests are what check them against each other.
 //!
