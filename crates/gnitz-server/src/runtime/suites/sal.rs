@@ -897,7 +897,7 @@ fn the_live_path_parks_on_a_leftover_whose_prefix_epoch_was_raised() {
 fn the_live_path_aborts_on_a_damaged_header() {
     // The full path, not the bare name: `run_test_in_child` filters with
     // `--exact`.
-    let name = "runtime::tests::sal::the_live_path_aborts_on_a_damaged_header_internal";
+    let name = "runtime::suites::sal::the_live_path_aborts_on_a_damaged_header_internal";
     let out = gnitz_engine_testkit::run_test_in_child(name, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(

@@ -105,7 +105,7 @@ fn test_message_control_null_error_msg() {
 
 /// Round-trips a wide `seek_pk_extra` (32 bytes) through encode + decode
 /// and back. Mirrors the server-side `ctrl_block_seek_pk_extra_roundtrip`
-/// test in `runtime/tests/wire.rs`.
+/// test in `runtime/suites/wire.rs`.
 #[test]
 fn ctrl_block_seek_pk_extra_roundtrip() {
     let h = Header::default();

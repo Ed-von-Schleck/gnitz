@@ -10,6 +10,10 @@
 //!     socket tier is NOT here: it has no caller in this crate and lives beside
 //!     the rings it serves, in `gnitz-server`
 //!   - `worker_ctx` — per-process worker rank / count and fork role
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 #[macro_use]
 pub mod log;

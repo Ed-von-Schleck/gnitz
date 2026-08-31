@@ -126,7 +126,7 @@ fn flag_exchange_frames_queue_without_resolving_their_tick_id() {
 ///
 /// It says nothing about ordering, and cannot: `join_all_unpin` returns results
 /// in *input* order, so `received` is sorted by construction. Ring order is
-/// tested in `runtime/tests/w2m.rs`.
+/// tested in `runtime/suites/w2m.rs`.
 #[test]
 fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     use crate::runtime::w2m::{W2mReceiver, W2mWriter};

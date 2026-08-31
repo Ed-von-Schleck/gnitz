@@ -120,7 +120,7 @@ fn encode_decode_roundtrip_with_data() {
 /// Compound-PK order (including a non-identity `pk_indices` permutation) must
 /// survive the schema-block wire round-trip. The
 /// catalog-restart peer of this — `schema_roundtrip_catalog_preserves_pk_order`
-/// in `catalog/tests/compound_pk_smoke.rs` — exercises the same property through
+/// in `catalog/suites/compound_pk_smoke.rs` — exercises the same property through
 /// the catalog API.
 #[test]
 fn schema_roundtrip_wire_preserves_pk_order() {

@@ -10,6 +10,14 @@
 //! reachable without being nameable, which is how `ReadCursor` and
 //! `SourceCursor` are used from outside while re-exported `pub(crate)`. Their
 //! methods are API in practice; treat a change to one as a breaking change.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
+//!
+//! Tests no single module owns live in `suites/`, a declared `mod suites;` child
+//! of this module: they reach this subsystem's surface, not any one module's
+//! private items.
 
 // Internal — not accessible outside storage/
 // L3 LSM lives under `lsm/`. The leaves that belong to no layer stay at storage
@@ -30,7 +38,7 @@ pub use repr::batch_pool;
 use repr::{batch, batch_wire, columnar, merge, scatter};
 
 #[cfg(test)]
-mod data_roundtrip_proptest;
+mod suites;
 
 // ── Relations, batches and the flush path ───────────────────────────────────
 pub use batch::Batch;

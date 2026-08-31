@@ -16,6 +16,10 @@
 //! folded predicate, physicalized projection) and delegates to
 //! `linear::emit_linear` — one home for the emission strategy; only the
 //! scan-bound extraction and the `HirExpr → BoundExpr` resolution are HIR work.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 pub(crate) mod exists;
 pub(crate) mod join;

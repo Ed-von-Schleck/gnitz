@@ -1,5 +1,9 @@
 //! Circuit compiler: reads system tables, builds a DBSP circuit graph,
 //! runs annotation + optimization passes, and emits VM instructions.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 

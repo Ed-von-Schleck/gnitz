@@ -13,6 +13,10 @@
 //! macros, which have no other export site. Nothing this crate exports ends the
 //! calling process: every fallible path returns its error, and the decision to
 //! fail-stop belongs to the process that owns a restart contract.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");

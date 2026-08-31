@@ -381,6 +381,13 @@ only the engine's public API, `internal` is this crate's own. A helper goes in
 `internal` unless `gnitz-server` needs it — putting an engine-only helper in
 `shared` forces whatever it touches to become published API.
 
+A module's unit tests live in `<dir>/tests/<module>.rs`, attached back with
+`#[cfg(test)] #[path]` so they stay that module's own `tests` child and keep
+private access; `<dir>/mod.rs`'s own go to `<dir>/tests/<dir-name>.rs`. Tests no
+single module owns live in the subsystem's `suites/`, a declared `mod suites;`
+child that reaches only that subsystem's surface. `#[ignore]`d microbenchmarks
+are not suites and this does not govern them.
+
 ## Running E2E tests
 
 **Always run E2E with multiple workers.** Single-worker mode skips

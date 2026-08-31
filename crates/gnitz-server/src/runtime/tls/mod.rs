@@ -32,6 +32,10 @@
 //! becomes a required-mTLS verifier — and `listener` holds what `--tls-listen`
 //! asks for, the bind refusal guarding it, and the bound listener the executor
 //! accepts on. Only `listener`'s three items leave this module.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 mod config;
 mod listener;

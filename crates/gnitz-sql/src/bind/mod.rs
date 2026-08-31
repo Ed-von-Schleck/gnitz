@@ -6,6 +6,10 @@
 //! calls down for column lookup, and `bind_single_table` drives the recursion
 //! through the `SingleTable` leaf. Were `bind/` ever promoted to its own crate
 //! the two files would move together.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 mod resolve;
 pub(crate) mod structural;

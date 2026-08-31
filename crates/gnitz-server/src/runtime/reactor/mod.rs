@@ -26,6 +26,10 @@
 //!   56-bit id in the low bits, where id is a request/op id (not an fd,
 //!   except for accept and recv, which route on the fd itself). Safe from
 //!   collisions because the reactor owns its own ring.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 use std::cell::{Cell, OnceCell, RefCell, RefMut};
 use std::future::Future;

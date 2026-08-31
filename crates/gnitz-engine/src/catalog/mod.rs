@@ -18,6 +18,14 @@
 //!
 //! See `hooks.rs` for the cross-family ordering contract and where it is
 //! enforced.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
+//!
+//! Tests no single module owns live in `suites/`, a declared `mod suites;` child
+//! of this module: they reach this subsystem's surface, not any one module's
+//! private items.
 
 mod apply_context;
 mod bootstrap;
@@ -37,7 +45,7 @@ mod utils;
 mod write_path;
 
 #[cfg(test)]
-mod tests;
+mod suites;
 
 use std::fs;
 use std::rc::Rc;

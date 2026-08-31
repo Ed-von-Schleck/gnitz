@@ -1,4 +1,12 @@
 //! Runtime coordination subsystem: IPC channels, master/worker/executor/committer/bootstrap.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
+//!
+//! Tests no single module owns live in `suites/`, a declared `mod suites;` child
+//! of this module: they reach this subsystem's surface, not any one module's
+//! private items.
 
 // This module is the `runtime` rung, and this crate is nothing else: `main.rs`
 // parses argv and calls `server_main`. Everything below is therefore reachable
@@ -28,4 +36,4 @@ pub(crate) use bootstrap::server_main;
 pub(crate) use tls::TlsCli;
 
 #[cfg(test)]
-mod tests;
+mod suites;

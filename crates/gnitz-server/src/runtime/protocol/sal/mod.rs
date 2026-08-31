@@ -12,6 +12,10 @@
 //! A group's flag word is this module's alone: callers name a
 //! [`SalMessageKind`] and a [`ZoneMark`], and the encode/decode below is the
 //! only code entitled to know the word exists.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 pub(crate) mod zone;
 

@@ -13,6 +13,10 @@
 //! one is open, so the verbs just write; and they resolve UPDATE/DELETE/ON
 //! CONFLICT against a read-your-own-writes view of that buffer (the `overlay`
 //! module) which is empty — the identity — in autocommit.
+//!
+//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
+//! they cover, so each stays that module's own `tests` child and reaches its
+//! private items.
 
 mod explain;
 pub(crate) mod group_by;
