@@ -388,7 +388,7 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
     let idx_pk_stride = idx_schema.pk_stride() as usize;
     let idx_key_size = idx_schema.leading_key_size(1);
 
-    let mut probe = ic.table_mut().open_cursor();
+    let mut probe = ic.open_cursor();
     let mut orphan_key = Vec::new();
     while probe.valid {
         let k = probe.current_pk_bytes();
@@ -409,7 +409,7 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
     ob.extend_weight(&1i64.to_le_bytes());
     ob.extend_null_bmp(&0u64.to_le_bytes());
     ob.count += 1;
-    ic.table_mut().ingest_owned_batch(ob).unwrap();
+    ic.ingest_owned_batch(ob).unwrap();
 
     // Chunk of 1 puts the orphan in a chunk of its own: were its `None` to escape,
     // the drain would stop there and lose every later id.

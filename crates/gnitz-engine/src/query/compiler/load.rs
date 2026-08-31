@@ -12,22 +12,11 @@ use gnitz_wire::{
 // System table reading
 // ---------------------------------------------------------------------------
 
-/// Open a cursor for a system table. Returns None if the table handle is null.
-/// Positioning is done by the caller via `seek_first_positive_with_prefix` on
-/// the `view_id` prefix (the circuit tables use a compound `(view_id, sub)` PK).
-fn open_system_cursor(table: *mut Table) -> Option<ReadCursor> {
-    if table.is_null() {
-        return None;
-    }
-    let t = unsafe { &*table };
-    Some(t.open_cursor())
-}
-
 /// Visit every `(view_id, source_table)` scan edge in the CircuitNodes store —
 /// one call per `ScanDelta` node carrying a source, the same rows `load_circuit`
 /// turns into `OpNode::ScanDelta`. Repeats are not filtered; the caller dedups.
-pub(in crate::query) fn for_each_scan_edge(sys_nodes: *mut Table, mut f: impl FnMut(i64, i64)) {
-    let Some(mut cur) = open_system_cursor(sys_nodes) else {
+pub(in crate::query) fn for_each_scan_edge(host: &dyn SchemaSource, mut f: impl FnMut(i64, i64)) {
+    let Some(mut cur) = host.open_sys_cursor(gnitz_wire::CIRCUIT_NODES_TAB as i64) else {
         return;
     };
     // No prefix — every view's nodes, in view_id order.
@@ -64,11 +53,12 @@ fn node_id_i32(v: i64) -> Option<i32> {
 /// into a `LoadedCircuit`: the per-node column gather, the `decode_op_node`
 /// calls and the node-id `i32` reject. The edge set is then `topo_sorted`'s to
 /// validate.
-pub(in crate::query) fn load_circuit(sys: SysTableRefs, view_id: u64) -> Result<LoadedCircuit, CompileError> {
+pub(in crate::query) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<LoadedCircuit, CompileError> {
     let unopened = || CompileError::Rejected("circuit system tables are not open");
-    let mut nodes_cur = open_system_cursor(sys.nodes).ok_or_else(unopened)?;
-    let mut edges_cur = open_system_cursor(sys.edges).ok_or_else(unopened)?;
-    let mut node_cols_cur = open_system_cursor(sys.node_columns).ok_or_else(unopened)?;
+    let open = |tid: u64| host.open_sys_cursor(tid as i64).ok_or_else(unopened);
+    let mut nodes_cur = open(gnitz_wire::CIRCUIT_NODES_TAB)?;
+    let mut edges_cur = open(gnitz_wire::CIRCUIT_EDGES_TAB)?;
+    let mut node_cols_cur = open(gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB)?;
     let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
     let mut edges: Vec<(i32, i32, i32)> = Vec::new();
 

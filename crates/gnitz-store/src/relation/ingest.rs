@@ -49,34 +49,9 @@ fn inject_ingest_apply_error(
 impl RelationRegistry {
     // ── Ingestion ───────────────────────────────────────────────────────
 
-    /// Ingest a borrowed batch (no clone) for relations that run no PK
-    /// enforcement. A base table falls back to cloning + [`Self::apply`], since
-    /// enforcement rewrites the batch.
-    ///
-    /// An unregistered id is a warning and a no-op, not an error: the caller
-    /// routes by an id its own catalog resolved, so a miss here means the two
-    /// have diverged and the ingest has nowhere to land either way.
-    pub fn ingest_by_ref(&mut self, table_id: i64, batch: &Batch) -> Result<(), StorageError> {
-        let entry = match self.tables.get_mut(&table_id) {
-            Some(e) => e,
-            None => {
-                gnitz_warn!("relation: ingest_by_ref — table_id={} not registered", table_id);
-                return Ok(());
-            }
-        };
-        if entry.kind.is_base_table() {
-            Self::apply(table_id, entry, batch.clone_batch()).map(drop)
-        } else if batch.count > 0 {
-            Self::ingest_store_and_indices(table_id, entry, batch)
-        } else {
-            Ok(())
-        }
-    }
-
     /// Enforce this relation's PK rule, apply the result to its store and index
-    /// projections, and hand back the effective batch. The one body under both
-    /// public ingest entries, so neither can drift on what applying a batch to a
-    /// relation means.
+    /// projections, and hand back the effective batch — what applying a batch to
+    /// a relation means.
     fn apply(table_id: i64, entry: &mut TableEntry, batch: Batch) -> Result<Batch, StorageError> {
         let effective = if entry.kind.is_base_table() {
             entry.handle.enforce_unique_pk(&entry.schema, batch)
@@ -218,9 +193,8 @@ impl RelationRegistry {
         Self::apply(table_id, entry, batch).map_err(IngestError::Storage)
     }
 
-    /// Project all index batches from `source`, ingest a clone into the store,
-    /// then drain the projected index batches into their respective index tables.
-    /// Shared by `ingest_by_ref` and `ingest_returning_effective`.
+    /// Ingest `source` into this relation's store, then project and ingest one
+    /// index circuit at a time, so no index batch outlives its own ingest.
     ///
     /// A storage error here means committed (or SAL-replayed) data was not
     /// applied while the client already holds a durability ACK, so process state
@@ -230,13 +204,7 @@ impl RelationRegistry {
     /// a watchdog aborts on it and lets restart + SAL replay re-apply the batch
     /// (its WAL zone stays above the flushed-shard watermark, so it *will* be
     /// replayed); one that does not, poisons its handle.
-    fn ingest_store_and_indices(table_id: i64, entry: &mut TableEntry, source: &Batch) -> Result<(), StorageError> {
-        let index_batches: Vec<Batch> = entry
-            .index_circuits
-            .iter()
-            .map(|ic| crate::storage::batch_project_index(source, &ic.key_spec, &ic.index_schema))
-            .collect();
-
+    fn ingest_store_and_indices(table_id: i64, entry: &TableEntry, source: &Batch) -> Result<(), StorageError> {
         inject_ingest_apply_error("store", entry.handle.ingest_borrowed_batch(source)).inspect_err(|e| {
             gnitz_error!(
                 "relation: base-table ingest failed (table_id={}): {} — committed data \
@@ -246,10 +214,11 @@ impl RelationRegistry {
             );
         })?;
 
-        for (ic, idx_batch) in entry.index_circuits.iter_mut().zip(index_batches) {
+        for ic in entry.index_circuits.iter() {
+            let idx_batch = crate::storage::batch_project_index(source, &ic.key_spec, &ic.index_schema);
             if idx_batch.count > 0 {
                 let index_id = ic.index_id;
-                inject_ingest_apply_error("index", ic.table_mut().ingest_owned_batch(idx_batch)).inspect_err(|e| {
+                inject_ingest_apply_error("index", ic.ingest_owned_batch(idx_batch)).inspect_err(|e| {
                     gnitz_error!(
                         "relation: secondary-index ingest failed (table_id={}, index_id={}): {} \
                          — index diverged from base table",
@@ -275,7 +244,7 @@ impl RelationRegistry {
         };
         entry.handle.flush()?;
         for ic in &mut entry.index_circuits {
-            ic.table_mut().flush()?;
+            ic.handle.flush()?;
         }
         Ok(())
     }
@@ -298,18 +267,16 @@ impl RelationRegistry {
     /// touch" from the relation kind, so the two cannot drift apart.
     ///
     /// A `Vec` of `&mut Table` rather than a keyed lookup: an owned trace table is
-    /// not in `self.tables` at all. Both sources (`StoreHandle::as_owned_mut`,
-    /// `IndexCircuitEntry::table_mut`) hand a `&mut` out of an `UnsafeCell`, so
-    /// they own the disjointness argument, not the borrow checker.
+    /// not in `self.tables` at all. `StoreHandle::as_owned_mut` hands a `&mut` out
+    /// of an `UnsafeCell`, so it owns the disjointness argument, not the borrow
+    /// checker.
     pub fn collect_base_flush_tables(&mut self) -> Vec<&mut Table> {
         let mut out: Vec<&mut Table> = Vec::new();
         for entry in self.tables.values_mut() {
             if let Some(t) = entry.handle.as_owned_mut() {
                 out.push(t);
             }
-            for ic in &mut entry.index_circuits {
-                out.push(ic.table_mut());
-            }
+            out.extend(entry.index_circuits.iter().filter_map(|ic| ic.handle.as_owned_mut()));
         }
         out
     }

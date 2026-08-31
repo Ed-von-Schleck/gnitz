@@ -32,7 +32,7 @@ fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id:
         "the registry holds the rejected {noun} {id}"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(family)),
+        count_records(engine.sys_store_mut(family).open_cursor()),
         init_rows,
         "the {noun} family memtable holds an orphaned row"
     );
@@ -61,7 +61,7 @@ fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, c
 fn test_table_tab_no_cols_leaves_clean_state() {
     let dir = temp_dir("atomicity_no_cols");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
 
     let tid = engine.allocate_table_id().unwrap();
     // No column records written — TABLE_TAB ingestion must fail.
@@ -83,7 +83,7 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
     // must leave no cache entry behind.
     let dir = temp_dir("atomicity_bad_pk_type");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
 
     let tid = engine.allocate_table_id().unwrap();
     // STRING column is not pk-eligible.
@@ -114,7 +114,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let orig_tid = engine.create_table("public.dupname", &cols, &[0]).unwrap();
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
 
     let new_tid = engine.allocate_table_id().unwrap();
     engine.write_column_records(new_tid, OWNER_KIND_TABLE, &cols).unwrap();
@@ -136,7 +136,7 @@ fn test_table_tab_dup_name_leaves_clean_state() {
         "new_tid must not appear in the registry"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Table)),
+        count_records(engine.sys_store_mut(SysFamily::Table).open_cursor()),
         init_rows,
         "sys_tables must have no extra orphaned row"
     );
@@ -154,7 +154,7 @@ fn test_table_tab_col_contiguity_gap_rejected() {
     // and leaves no trace in the catalog.
     let dir = temp_dir("atomicity_col_gap");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
 
     let tid = engine.allocate_table_id().unwrap();
     // Insert columns at indices 0 and 2 — index 1 is absent (gap).
@@ -181,7 +181,7 @@ fn test_view_tab_no_cols_leaves_clean_state() {
     // apply_entity_caches has already written entity_by_qname.
     let dir = temp_dir("atomicity_view_no_cols");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::View));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::View).open_cursor());
 
     let vid = engine.allocate_table_id().unwrap();
     // No column records for vid.
@@ -206,7 +206,7 @@ fn test_view_tab_too_many_cols_rejected() {
     // create_view_chain.
     let dir = temp_dir("atomicity_view_too_many_cols");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::View));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::View).open_cursor());
 
     let vid = engine.allocate_table_id().unwrap();
     // MAX_COLUMNS + 1 contiguous column records (col 0 is a valid U64 PK).
@@ -235,7 +235,7 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
     // cache entry is inserted before the hook returns Err for missing owner.
     let dir = temp_dir("atomicity_idx_bad_owner");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
 
     let nonexistent_owner = engine.allocate_table_id().unwrap();
     let idx_id = engine.allocate_index_id().unwrap();
@@ -248,7 +248,7 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
         "index_by_name must not contain the rejected index"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index)),
+        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
         init_rows,
         "sys_indices memtable must have no orphaned row"
     );
@@ -282,7 +282,7 @@ fn test_idx_tab_view_owner_rejected() {
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
     assert!(engine.registry().has_id(vid), "view registered");
 
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
     let idx_id = engine.allocate_index_id().unwrap();
     let batch = idx_tab_batch(idx_id, vid, 0, "idx_on_view", false, 1);
     let err = engine
@@ -298,7 +298,7 @@ fn test_idx_tab_view_owner_rejected() {
         "index_by_name must not contain the rejected index"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index)),
+        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
         init_rows,
         "sys_indices must have no orphaned row"
     );
@@ -332,7 +332,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     ];
     let tid = engine.create_table("public.idxtest", &cols, &[0]).unwrap();
     let orig_idx_id = engine.create_index("public.idxtest", &["val"], false).unwrap();
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
 
     let orig_name = "public__idxtest__idx_val";
     let new_idx_id = engine.allocate_index_id().unwrap();
@@ -354,7 +354,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
         "the rejected index id must not appear under any owner"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index)),
+        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
         init_rows,
         "sys_indices must have no extra orphaned row"
     );
@@ -507,7 +507,7 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
     let vid = engine.allocate_table_id().unwrap();
     write_identity_circuit(&mut engine, vid, tid, None);
     assert_eq!(
-        engine.dag.get_dep_map().get(&tid),
+        engine.dag.get_dep_map(&engine.registry).get(&tid),
         Some(&vec![vid]),
         "precondition: dependency edge T -> V must be present"
     );
@@ -612,8 +612,8 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     // Occupy the qualified name "public.dupname".
     engine.create_table("public.dupname", &cols, &[0]).unwrap();
-    let cols_before = count_records(engine.sys_store_mut(SysFamily::Column));
-    let tables_before = count_records(engine.sys_store_mut(SysFamily::Table));
+    let cols_before = count_records(engine.sys_store_mut(SysFamily::Column).open_cursor());
+    let tables_before = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
     // Discard any queue entries the setup left behind, exactly as `handle_ddl_txn`
     // does before ingesting a new bundle — so compensation drains only this
     // bundle's families.
@@ -636,12 +636,12 @@ fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
 
     // The durable property: no orphan COL_TAB, no ghost -1 TABLE_TAB.
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Column)),
+        count_records(engine.sys_store_mut(SysFamily::Column).open_cursor()),
         cols_before,
         "orphan COL_TAB rows must be negated to zero"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Table)),
+        count_records(engine.sys_store_mut(SysFamily::Table).open_cursor()),
         tables_before,
         "no ghost -1 TABLE_TAB row"
     );
@@ -667,8 +667,8 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
-    let cols_before = count_records(engine.sys_store_mut(SysFamily::Column));
-    let tables_before = count_records(engine.sys_store_mut(SysFamily::Table));
+    let cols_before = count_records(engine.sys_store_mut(SysFamily::Column).open_cursor());
+    let tables_before = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
 
     let new_tid = engine.allocate_table_id().unwrap();
     let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
@@ -698,12 +698,12 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
     );
 
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Table)),
+        count_records(engine.sys_store_mut(SysFamily::Table).open_cursor()),
         tables_before,
         "applied-not-enqueued TABLE_TAB row must net to zero"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Column)),
+        count_records(engine.sys_store_mut(SysFamily::Column).open_cursor()),
         cols_before,
         "drained COL_TAB rows must net to zero (negated exactly once)"
     );
@@ -726,7 +726,7 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
 fn two_creates_of_one_name_in_one_batch_rejected() {
     let dir = temp_dir("atomicity_dup_name_in_batch");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
 
     let cols = vec![col_def("id", type_code::U64)];
     let (a, b) = (engine.allocate_table_id().unwrap(), engine.allocate_table_id().unwrap());
@@ -745,7 +745,7 @@ fn two_creates_of_one_name_in_one_batch_rejected() {
     assert!(!engine.registry().has_id(a));
     assert!(!engine.registry().has_id(b));
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Table)),
+        count_records(engine.sys_store_mut(SysFamily::Table).open_cursor()),
         init_rows,
         "the rejected batch must leave no TABLE_TAB row"
     );
@@ -778,7 +778,7 @@ fn sequence_advances_leave_no_negative_ghost() {
     engine.bump_checkpoint_generation().unwrap();
 
     assert_eq!(
-        count_negative_records(engine.sys_store_mut(SysFamily::Sequence)),
+        count_negative_records(engine.sys_store_mut(SysFamily::Sequence).open_cursor()),
         0,
         "_sequences must hold no net-negative row"
     );
@@ -796,7 +796,7 @@ fn sequence_advances_leave_no_negative_ghost() {
 fn precheck_rejected_create_index_writes_no_ghost() {
     let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
     let (mut engine, _tid, dir) = table_fixture("atomicity_idx_precheck_ghost", &cols);
-    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
+    let init_rows = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
 
     // A STRING column has no index key type — rejected inside `precheck_family`,
     // before anything is applied.
@@ -805,12 +805,12 @@ fn precheck_rejected_create_index_writes_no_ghost() {
         .expect_err("an index on a STRING column must be rejected");
 
     assert_eq!(
-        count_negative_records(engine.sys_store_mut(SysFamily::Index)),
+        count_negative_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
         0,
         "a precheck rejection must write no compensating -1"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index)),
+        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
         init_rows,
         "and no +1 either"
     );

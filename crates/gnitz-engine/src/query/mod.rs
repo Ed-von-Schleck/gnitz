@@ -10,5 +10,4 @@ mod compiler;
 mod dag;
 mod vm;
 
-pub(crate) use compiler::SysTableRefs;
 pub use dag::{DagEngine, ExchangeCallback, RelayRoute};

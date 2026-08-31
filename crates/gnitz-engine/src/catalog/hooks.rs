@@ -276,7 +276,7 @@ impl CatalogEngine {
         let ids: Vec<i64> = rows[first_live..].iter().map(|&i| batch.get_pk(i) as i64).collect();
         let rank: FxHashMap<i64, usize> = self
             .dag
-            .order_by_view_deps(&ids)
+            .order_by_view_deps(&self.registry, &ids)
             .into_iter()
             .enumerate()
             .map(|(r, vid)| (vid, r))
@@ -290,13 +290,9 @@ impl CatalogEngine {
     /// The registration values for TABLE_TAB row `i`: placement folded out of
     /// `TABLE_TAB.flags`, at depth 0, never capacity-bounded.
     fn table_registration(batch: &Batch, i: usize, tid: i64) -> Result<RelationRegistration, String> {
-        let (schema_id, name, pk, flags) = read_table_tab_row(batch, i);
-        // Re-check for the paths that skip the precheck (boot replay, worker
-        // `ddl_sync`); the precheck's table arm owns the live rejection.
-        let placement = Placement::from_table_flags(flags)
-            .map_err(|e| format!("catalog invariant violated: table '{name}' (tid={tid}) is {e}."))?;
+        let (schema_id, name, pk, kind, placement) = read_table_tab_row(batch, i, tid)?;
         Ok(RelationRegistration {
-            kind: RelationKind::from_table_flags(flags),
+            kind,
             id: tid,
             schema_id,
             name,
@@ -318,7 +314,7 @@ impl CatalogEngine {
         // The circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
         // so `get_source_ids` resolves here. Re-check for the paths that skip the
         // precheck (boot replay, worker `ddl_sync`).
-        let source_ids = self.dag.get_source_ids(vid);
+        let source_ids = self.dag.get_source_ids(&self.registry, vid);
         self.validate_view_options(vid, &name, budgets, &source_ids)?;
         // Stamping the fold is what makes placement transitive:
         // `relation_row_order` registers this view after its sources, so a view

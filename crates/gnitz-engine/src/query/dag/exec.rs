@@ -14,12 +14,9 @@ type Pending = BTreeMap<(i32, i64, i64), Batch>;
 impl DagEngine {
     // ── Epoch execution ─────────────────────────────────────────────────
 
-    /// Execute one view's epoch with no exchange IPC: every `Single`-shape
-    /// dispatch (arms 5 and 6 of `execute_multi_worker_step`, which never invoke
-    /// the relay at all — `PlanShape::Single` does not call it), and a replicated
-    /// view of any shape (arm 1), where the identity relay does run because the
-    /// shape is still `Exchanged` but every worker already holds every source in
-    /// full.
+    /// [`Self::run_view_epoch`] with the identity relay: no exchange IPC, because
+    /// either the shape has no relay to run or the view is replicated and every
+    /// worker already holds every source in full.
     fn execute_epoch(
         &mut self,
         registry: &RelationRegistry,
@@ -105,7 +102,7 @@ impl DagEngine {
                             .map_err(|e| e.to_string())?
                             .unwrap_or_else(|| Batch::empty_with_schema(&schema));
                         let relay_key = if unary { 0 } else { side.source_id };
-                        Self::consolidate_exchanged(relay(pre, relay_key), &schema)
+                        relay(pre, relay_key).into_consolidated(&schema)
                     } else {
                         Batch::empty_with_schema(&schema)
                     };
@@ -180,45 +177,16 @@ impl DagEngine {
         Self::execute_sub_plan_multi(sub, std::iter::once((in_reg, input)))
     }
 
-    /// Sort+weight-merge a post-exchange batch for the post phase's merge-walk
-    /// join/distinct operators (the mandatory consolidation). Every relay leg
-    /// stamps its layout claim truthfully, so `into_consolidated` can trust the
-    /// flags: the scatter/repartition/broadcast ops certify only what they can
-    /// prove (a multi-worker concatenation ships `Raw`), the wire encoders
-    /// derive the `FLAG_BATCH_*` bits from the batch's own layout
-    /// (`WireMsg::encode_impl`) and the decode re-certifies the claim against
-    /// the data (debug-verified), and the identity/skip-exchange legs pass the
-    /// VM's own claims through under the same `exchange_schema` descriptor they
-    /// were certified with. A `Raw` claim is re-sorted here; a verified
-    /// Sorted/Consolidated claim folds or passes through.
-    fn consolidate_exchanged(batch: Batch, schema: &SchemaDescriptor) -> Batch {
-        batch.into_consolidated(schema)
-    }
-
     // ── Multi-worker dispatch ───────────────────────────────────────────
 
     /// Run one multi-worker DAG step: ensure the view's circuit is compiled,
     /// then dispatch on the compiled shape + routing annotations and run the
     /// view's epoch, returning the output delta (`None` when a phase produced
-    /// nothing). The arms, in priority order:
-    /// 1. Replicated-output intercept (the view's own schema bit, stamped at
-    ///    registration from its source set): the view computes its full result
-    ///    locally — no exchange IPC at all.
-    /// 2. Range join — relay the source delta (eq-prefix scatter for a band
-    ///    join, broadcast for a pure range join, decided master-side in
-    ///    `prepare_relay`), then the exchanged pipeline. Checked before the
-    ///    shape match: a range join is `Exchanged` too (its output
-    ///    ExchangeShard) but needs its *input* relayed as well, and its output
-    ///    exchange is unconditional (no skip — a pure range probe needs the
-    ///    full delta even when the join key equals the source PK).
-    /// 3. Two-sided set-op — each side scattered by its hash PK, then combined.
-    /// 4. Unary exchange — the pipeline on the local delta, eliding the output
-    ///    IPC when the shuffle is a proven no-op (`skips_exchange`).
-    /// 5. Single + join-scatter source — scatter the delta by the join-shard
-    ///    cols before the (single) pipeline, unless the source is already
-    ///    co-partitioned on them. Per-(view, source), so it stays a per-source
-    ///    test inside the arm.
-    /// 6. Single — one-phase execute.
+    /// nothing). Each arm below states its own precondition; the two orderings
+    /// that are not free are that a replicated view is intercepted before
+    /// anything reads the shape, and that the range-join test precedes the shape
+    /// match — a range join is `Exchanged` too, but relays its *input* as well
+    /// and never elides its output exchange.
     fn execute_multi_worker_step<E: ExchangeCallback>(
         &mut self,
         registry: &RelationRegistry,
@@ -232,7 +200,7 @@ impl DagEngine {
             return Ok(None);
         }
 
-        // Arm 1. A view stamped replicated holds every source in full and receives
+        // A view stamped replicated holds every source in full and receives
         // the full (broadcast) delta on every worker, so it computes its entire
         // result locally and the worker-0 scan reads it whole. Every worker
         // evaluates this identically, so they skip the same exchange rounds and the
@@ -248,22 +216,21 @@ impl DagEngine {
         let meta = self.view_meta(registry, view_id);
         let plan = self.cache.get(&view_id).unwrap();
         let is_range_join = meta.range_join_n_eq.is_some();
-        let sides = match &plan.shape {
-            PlanShape::Exchanged { sides, .. } => sides.len(),
-            PlanShape::Single(_) => 0,
+        let exchanged = match &plan.shape {
+            PlanShape::Exchanged { sides, .. } => Some(sides.len()),
+            PlanShape::Single(_) => None,
         };
-        let skip_output_exchange = sides == 1 && !is_range_join && meta.skips_exchange;
-        let join_scatter = sides == 0 && meta.scatter_sources.contains(&src_id);
 
         if is_range_join {
-            // Arm 2 — relay the input delta first, then the exchanged pipeline.
+            // Range join — relay the input delta first, then the exchanged pipeline.
             let bc = exchange.do_exchange(view_id, &input, src_id);
             self.run_view_epoch(registry, view_id, bc, src_id, |pre, key| {
                 exchange.do_exchange(view_id, &pre, key)
             })
-        } else if sides > 0 {
-            // Arms 3 + 4 — the exchanged pipeline; the relay elides the IPC when
-            // the unary output shuffle is a proven no-op.
+        } else if let Some(n_sides) = exchanged {
+            // Exchanged — the relay elides the IPC when the unary output shuffle
+            // is a proven no-op.
+            let skip_output_exchange = n_sides == 1 && meta.skips_exchange;
             self.run_view_epoch(registry, view_id, input, src_id, |pre, key| {
                 if skip_output_exchange {
                     pre
@@ -271,12 +238,13 @@ impl DagEngine {
                     exchange.do_exchange(view_id, &pre, key)
                 }
             })
-        } else if join_scatter {
-            // Arm 5 — scatter the delta by the join-shard cols before the pipeline.
-            let exchanged = exchange.do_exchange(view_id, &input, src_id);
-            self.execute_epoch(registry, view_id, exchanged, src_id)
+        } else if meta.scatter_sources.contains(&src_id) {
+            // Single + join-scatter source — scatter the delta by the join-shard
+            // cols before the pipeline.
+            let scattered = exchange.do_exchange(view_id, &input, src_id);
+            self.execute_epoch(registry, view_id, scattered, src_id)
         } else {
-            // Arm 6 — single-phase execute.
+            // Single — one-phase execute.
             self.execute_epoch(registry, view_id, input, src_id)
         }
     }
@@ -346,12 +314,13 @@ impl DagEngine {
         tick_round: u64,
         exchange: &mut E,
     ) -> Result<(), String> {
-        self.get_dep_map();
+        self.get_dep_map(registry);
         let Some(view_ids) = self.dep.forward.get(&source_id).filter(|v| !v.is_empty()) else {
             return Ok(());
         };
 
-        let mut pending = Self::build_pending(registry, view_ids, source_id, delta);
+        let mut pending = Pending::new();
+        Self::queue_dependents(&mut pending, registry, view_ids, source_id, delta.schema, Some(delta));
         let mut dirty_views: FxHashSet<i64> = FxHashSet::default();
         let mut popped_depth = i32::MIN;
 
@@ -401,29 +370,9 @@ impl DagEngine {
         Ok(())
     }
 
-    /// Seed the pending queue from `source_id`'s direct dependents. The last live
-    /// one takes ownership of `delta`; the rest get clones.
-    fn build_pending(registry: &RelationRegistry, view_ids: &[i64], source_id: i64, delta: Batch) -> Pending {
-        let mut pending = Pending::new();
-        let Some(last_idx) = view_ids.iter().rposition(|&vid| registry.has_id(vid)) else {
-            return pending;
-        };
-        let mut delta = Some(delta);
-        for (i, &vid) in view_ids.iter().enumerate() {
-            let Some(depth) = registry.entry(vid).map(|e| e.depth) else {
-                continue;
-            };
-            let batch = if i == last_idx {
-                delta.take().unwrap()
-            } else {
-                delta.as_ref().unwrap().clone_batch()
-            };
-            pending.insert((depth, vid, source_id), batch);
-        }
-        pending
-    }
-
-    /// Queue `view_id`'s output onto each dependent's pending edge.
+    /// Queue `producer_id`'s output onto each dependent's pending edge. Also the
+    /// seed: against an empty queue every dependent takes the fill pass below, so
+    /// the traversal's first step is this call with the tick's source as producer.
     ///
     /// `delta` is the producer's output, or `None` when it fired with none —
     /// empty placeholders are still queued so exchange-dependent views run and
@@ -437,7 +386,7 @@ impl DagEngine {
         pending: &mut Pending,
         registry: &RelationRegistry,
         dep_view_ids: &[i64],
-        view_id: i64,
+        producer_id: i64,
         src_schema: SchemaDescriptor,
         mut delta: Option<Batch>,
     ) {
@@ -446,7 +395,7 @@ impl DagEngine {
         // placeholder takes a fill, because `op_union` against an empty operand
         // clones the other one whole — the copy this split exists to avoid.
         let takes_fill = |pending: &Pending, dep_id: i64, depth: i32| {
-            pending.get(&(depth, dep_id, view_id)).is_none_or(|b| b.count == 0)
+            pending.get(&(depth, dep_id, producer_id)).is_none_or(|b| b.count == 0)
         };
 
         // Merges first, so the fill pass below can MOVE the producer's batch into
@@ -454,7 +403,7 @@ impl DagEngine {
         if let Some(d) = delta.as_ref() {
             for &dep_id in dep_view_ids {
                 let Some(depth) = depth_of(dep_id) else { continue };
-                let Some(slot) = pending.get_mut(&(depth, dep_id, view_id)) else {
+                let Some(slot) = pending.get_mut(&(depth, dep_id, producer_id)) else {
                     continue;
                 };
                 if slot.count == 0 {
@@ -482,7 +431,7 @@ impl DagEngine {
                 Some(_) if i == last_fill => delta.take().expect("moved at most once"),
                 Some(d) => d.clone_batch(),
             };
-            pending.insert((depth, dep_id, view_id), batch);
+            pending.insert((depth, dep_id, producer_id), batch);
         }
     }
 }

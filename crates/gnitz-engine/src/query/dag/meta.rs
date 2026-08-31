@@ -36,7 +36,7 @@ pub enum RelayRoute {
     },
 }
 
-/// Per-view circuit metadata derived from one `load_meta_circuit` pass.
+/// Per-view circuit metadata derived from one circuit load.
 /// Everything a plan-free caller needs; eviction is one map `remove`.
 pub struct ViewMeta {
     /// The sink-nearest `ExchangeShard`'s shard columns — the routing key of
@@ -190,10 +190,10 @@ impl DepMap {
     /// through the same reader that builds the circuit, so the graph the
     /// scheduler walks names the sources the circuit actually scans.
     ///
-    /// `nodes` is passed in (a Copy raw pointer) because the table lives on
-    /// `DagEngine`; reading it through `self` here would double-borrow against
-    /// the `&mut self.dep`.
-    pub(super) fn get_or_rebuild(&mut self, nodes: *mut Table) -> &FxHashMap<i64, Vec<i64>> {
+    /// The registry is a disjoint parameter rather than a field of the engine, so
+    /// reading the circuit table through it does not double-borrow against
+    /// `&mut self.dep`.
+    pub(super) fn get_or_rebuild(&mut self, registry: &RelationRegistry) -> &FxHashMap<i64, Vec<i64>> {
         if self.valid {
             return &self.forward;
         }
@@ -203,7 +203,7 @@ impl DepMap {
         // forward entries interleave across views — dedup with a seen set
         // instead of a per-row `Vec::contains` scan.
         let mut seen: FxHashSet<(i64, i64)> = FxHashSet::default();
-        compiler::for_each_scan_edge(nodes, |v_id, dep_tid| {
+        compiler::for_each_scan_edge(registry, |v_id, dep_tid| {
             if seen.insert((v_id, dep_tid)) {
                 self.forward.entry(dep_tid).or_default().push(v_id);
                 self.reverse.entry(v_id).or_default().push(dep_tid);
@@ -236,13 +236,13 @@ impl DagEngine {
 
     /// Rebuild the dependency maps from the CircuitNodes system table if stale
     /// and return the forward (source → views) map.
-    pub fn get_dep_map(&mut self) -> &FxHashMap<i64, Vec<i64>> {
-        self.dep.get_or_rebuild(self.sys.nodes)
+    pub fn get_dep_map(&mut self, registry: &RelationRegistry) -> &FxHashMap<i64, Vec<i64>> {
+        self.dep.get_or_rebuild(registry)
     }
 
     /// Return all direct source table IDs for a view.
-    pub fn get_source_ids(&mut self, view_id: i64) -> Vec<i64> {
-        self.get_dep_map();
+    pub fn get_source_ids(&mut self, registry: &RelationRegistry, view_id: i64) -> Vec<i64> {
+        self.get_dep_map(registry);
         self.dep.reverse.get(&view_id).cloned().unwrap_or_default()
     }
 
@@ -253,8 +253,8 @@ impl DagEngine {
     /// Applies no `tables` kind filter, so a source absent from `tables` is still
     /// reported: the read-freshness test that drives this must not narrow its own
     /// input, or a dropped source would vanish from the closure and read as fresh.
-    pub fn source_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
-        self.get_dep_map();
+    pub fn source_closure(&mut self, registry: &RelationRegistry, seeds: Vec<i64>) -> FxHashSet<i64> {
+        self.get_dep_map(registry);
         DepMap::closure(&self.dep.reverse, seeds)
     }
 
@@ -265,8 +265,8 @@ impl DagEngine {
     /// Beside [`Self::source_closure`] rather than re-derived outside the crate
     /// off `get_dep_map`, because the two directions belong next to each other and
     /// only one of them was reachable from outside.
-    pub fn dependent_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
-        self.get_dep_map();
+    pub fn dependent_closure(&mut self, registry: &RelationRegistry, seeds: Vec<i64>) -> FxHashSet<i64> {
+        self.get_dep_map(registry);
         DepMap::closure(&self.dep.forward, seeds)
     }
 
@@ -278,7 +278,7 @@ impl DagEngine {
     /// is where the order is established. Acyclic by construction; the no-progress
     /// fallback appends the remainder so a malformed input terminates instead of
     /// spinning.
-    pub fn order_by_view_deps(&mut self, view_ids: &[i64]) -> Vec<i64> {
+    pub fn order_by_view_deps(&mut self, registry: &RelationRegistry, view_ids: &[i64]) -> Vec<i64> {
         let mut ids: Vec<i64> = Vec::with_capacity(view_ids.len());
         let mut bundle: FxHashSet<i64> = FxHashSet::default();
         for &vid in view_ids {
@@ -289,7 +289,7 @@ impl DagEngine {
         if ids.len() <= 1 {
             return ids;
         }
-        self.get_dep_map();
+        self.get_dep_map(registry);
         let reverse = &self.dep.reverse;
         let mut emitted: FxHashSet<i64> = FxHashSet::default();
         let mut order: Vec<i64> = Vec::with_capacity(ids.len());
@@ -328,7 +328,7 @@ impl DagEngine {
     /// CREATE lands in it therefore depends on whether its tick had already fired.
     pub fn base_tables_reachable_from(&mut self, registry: &RelationRegistry, seeds: Vec<i64>) -> Vec<i64> {
         let mut bases: Vec<i64> = self
-            .source_closure(seeds)
+            .source_closure(registry, seeds)
             .into_iter()
             .filter(|&s| registry.relation_kind(s).is_some_and(|k| k.is_base_table()))
             .collect();
@@ -435,16 +435,9 @@ impl DagEngine {
 
     // ── ViewMeta (plan-free circuit metadata) ───────────────────────────
 
-    /// Load typed circuit nodes/edges for metadata queries. Cheaper than full
-    /// compilation: no optimization passes, no code emission. `None` for a
-    /// circuit that cannot be read or is cyclic — one that cannot compile or
-    /// execute either (`compile_view` rejects it the same way).
-    pub(super) fn load_meta_circuit(&self, view_id: i64) -> Option<compiler::LoadedCircuit> {
-        compiler::load_circuit(self.sys, view_id as u64).ok()
-    }
-
-    /// The memoized per-view circuit metadata, computed from ONE
-    /// `load_meta_circuit` pass on first touch.
+    /// The memoized per-view circuit metadata, computed from ONE circuit load on
+    /// first touch. Cheaper than full compilation: no optimization passes, no
+    /// code emission.
     pub fn view_meta(&mut self, registry: &RelationRegistry, view_id: i64) -> Rc<ViewMeta> {
         if let Some(m) = self.meta.get(&view_id) {
             return m.clone();
@@ -452,8 +445,8 @@ impl DagEngine {
         // A circuit that cannot be read, is malformed, or carries an unscatterable
         // source takes the conservative branch — the same circuits `compile_view`
         // rejects, so no view that runs is metadata-less.
-        let facts = self
-            .load_meta_circuit(view_id)
+        let facts = compiler::load_circuit(registry, view_id as u64)
+            .ok()
             .and_then(|l| compiler::CircuitFacts::derive(&l, registry).ok());
         let meta = Rc::new(facts.map_or_else(ViewMeta::nothing_special, ViewMeta::from_facts));
         self.meta.insert(view_id, meta.clone());

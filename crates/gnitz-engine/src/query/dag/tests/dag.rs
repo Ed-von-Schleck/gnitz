@@ -44,11 +44,12 @@ fn test_view_meta_eviction() {
 
 #[test]
 fn test_dep_map_empty() {
+    let registry = gnitz_store::relation::RelationRegistry::new(1);
     let mut dag = DagEngine::new();
-    dag.get_dep_map();
+    dag.get_dep_map(&registry);
     assert!(dag.dep.forward.is_empty());
     assert!(dag.dep.valid);
-    assert!(dag.get_source_ids(42).is_empty());
+    assert!(dag.get_source_ids(&registry, 42).is_empty());
 }
 
 /// Install `edges` (source → view) into an already-valid dep map, the same
@@ -69,17 +70,21 @@ fn dag_with_deps(edges: &[(i64, i64)]) -> DagEngine {
 #[test]
 fn test_source_closure_walks_sources_transitively() {
     // chain 1 → 2 → 3, diamond 10 → {11,12} → 13, disconnected pair 20 → 21.
+    let registry = gnitz_store::relation::RelationRegistry::new(1);
     let mut dag = dag_with_deps(&[(1, 2), (2, 3), (10, 11), (10, 12), (11, 13), (12, 13), (20, 21)]);
 
-    assert!(dag.source_closure(vec![]).is_empty());
-    assert_eq!(dag.source_closure(vec![3]), [1i64, 2].into_iter().collect());
-    assert_eq!(dag.source_closure(vec![13]), [10i64, 11, 12].into_iter().collect());
-    assert_eq!(dag.source_closure(vec![21]), [20i64].into_iter().collect());
-    assert!(dag.source_closure(vec![1]).is_empty());
-    assert!(dag.source_closure(vec![99]).is_empty());
+    assert!(dag.source_closure(&registry, vec![]).is_empty());
+    assert_eq!(dag.source_closure(&registry, vec![3]), [1i64, 2].into_iter().collect());
+    assert_eq!(
+        dag.source_closure(&registry, vec![13]),
+        [10i64, 11, 12].into_iter().collect()
+    );
+    assert_eq!(dag.source_closure(&registry, vec![21]), [20i64].into_iter().collect());
+    assert!(dag.source_closure(&registry, vec![1]).is_empty());
+    assert!(dag.source_closure(&registry, vec![99]).is_empty());
     // The other direction over the same edges, so a walk that read the wrong
     // half of `DepMap` cannot pass both.
-    dag.get_dep_map();
+    dag.get_dep_map(&registry);
     assert_eq!(
         DepMap::closure(&dag.dep.forward, vec![1]),
         [2i64, 3].into_iter().collect::<rustc_hash::FxHashSet<i64>>()

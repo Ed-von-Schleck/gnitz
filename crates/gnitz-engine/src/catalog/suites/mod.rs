@@ -54,9 +54,8 @@ fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
 /// (system families included) must hold none. A `-1` that retracts a row nothing
 /// ever inserted never cancels, so it sits here forever.
-fn count_negative_records(table: &mut Table) -> usize {
+fn count_negative_records(mut c: ReadCursor) -> usize {
     let mut count = 0;
-    let mut c = table.open_cursor();
     while c.valid {
         if c.current_weight < 0 {
             count += 1;
@@ -66,9 +65,8 @@ fn count_negative_records(table: &mut Table) -> usize {
     count
 }
 
-fn count_records(table: &mut Table) -> usize {
+fn count_records(mut c: ReadCursor) -> usize {
     let mut count = 0;
-    let mut c = table.open_cursor();
     while c.valid {
         if c.current_weight > 0 {
             count += 1;

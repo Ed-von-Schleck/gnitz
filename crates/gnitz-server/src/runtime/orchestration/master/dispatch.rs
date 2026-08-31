@@ -583,8 +583,8 @@ impl MasterDispatcher {
         // The relay treats the per-worker payloads as disjoint slices of one
         // delta and scatters them together. A replicated source breaks that: its
         // delta is broadcast, so every worker returns the same rows, and
-        // scattering all W would route each row to its owner W times for
-        // `consolidate_exchanged` to sum into one row at weight W. Take worker
+        // scattering all W would route each row to its owner W times for the
+        // post-relay consolidate to sum into one row at weight W. Take worker
         // 0's payload alone — the same single-sourcing the read gather applies
         // (`replicated_unicast`). Dropping the copies rather than clamping keeps
         // a genuine multiplicity in the source intact. A unary side relays under
@@ -718,8 +718,9 @@ impl MasterDispatcher {
     /// each worker stops on its own drain exhaustion — which is why one driver
     /// serves every shape.
     pub fn backfill_views_in_dep_order(&self, view_ids: &[i64]) -> Result<(), String> {
-        for vid in self.cat().dag_mut().order_by_view_deps(view_ids) {
-            let sources = self.cat().dag_mut().get_source_ids(vid);
+        let (dag, registry) = self.cat().dag_and_registry_mut();
+        for vid in dag.order_by_view_deps(registry, view_ids) {
+            let sources = dag.get_source_ids(registry, vid);
             for src in sources {
                 self.fan_out_backfill(vid, src)
                     .map_err(|e| format!("view={vid} source={src}: {e}"))?;
@@ -1111,7 +1112,10 @@ impl MasterDispatcher {
         if !cat.registry().any_delta_feed() {
             return;
         }
-        let reached = cat.dag_mut().dependent_closure(vec![tid]);
+        let reached = {
+            let (dag, registry) = cat.dag_and_registry_mut();
+            dag.dependent_closure(registry, vec![tid])
+        };
         let mut map = self.last_delta_round.borrow_mut();
         for vid in reached {
             if cat.registry().relation_has_delta_feed(vid) {

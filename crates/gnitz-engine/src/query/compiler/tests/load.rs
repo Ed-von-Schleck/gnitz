@@ -93,14 +93,24 @@ impl CircuitTables {
     }
 
     fn load(&mut self) -> Result<LoadedCircuit, CompileError> {
-        load_circuit(
-            SysTableRefs {
-                nodes: &mut self.nodes,
-                edges: &mut self.edges,
-                node_columns: &mut self.cols,
-            },
-            Self::VIEW_ID,
-        )
+        load_circuit(self, Self::VIEW_ID)
+    }
+}
+
+/// The three circuit tables answer a load in place, the way the registry does
+/// for the engine. No relation schemas — nothing under test here resolves one.
+impl SchemaSource for CircuitTables {
+    fn schema_of(&self, _tid: i64) -> Option<SchemaDescriptor> {
+        None
+    }
+
+    fn open_sys_cursor(&self, tid: i64) -> Option<ReadCursor> {
+        Some(match tid as u64 {
+            gnitz_wire::CIRCUIT_NODES_TAB => self.nodes.open_cursor(),
+            gnitz_wire::CIRCUIT_EDGES_TAB => self.edges.open_cursor(),
+            gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB => self.cols.open_cursor(),
+            _ => return None,
+        })
     }
 }
 
@@ -171,14 +181,13 @@ fn the_load_takes_one_views_rows_and_keeps_a_damaged_blob_present() {
     );
 }
 
-/// Null system-table pointers must fail the load rather than yield a silently
-/// empty circuit. `DagEngine` starts with them null and only `set_sys_tables`
-/// fills them in, so a compile attempted before that is a caller error the load
-/// has to report.
+/// A host holding none of the circuit tables must fail the load rather than
+/// yield a silently empty circuit — a compile attempted against one is a caller
+/// error the load has to report.
 #[test]
 fn a_load_from_unopened_system_tables_fails() {
     assert!(matches!(
-        load_circuit(SysTableRefs::null(), 0),
+        load_circuit(&ExtTables::new(), 0),
         Err(CompileError::Rejected("circuit system tables are not open"))
     ));
 }

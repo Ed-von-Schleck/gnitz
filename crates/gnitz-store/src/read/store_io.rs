@@ -124,12 +124,8 @@ impl RelationRegistry {
                     cursor.for_each_pk_group_row(key, &mut visit);
                 }
             }
-            BoundedRead::All | BoundedRead::Range(..) => {
-                while cursor.valid {
-                    visit(&cursor);
-                    cursor.advance();
-                }
-            }
+            // To the cursor's own bound — the open above already restricted it.
+            BoundedRead::All | BoundedRead::Range(..) => cursor.for_each_row_while(|_| true, &mut visit),
         }
         // Not borrowck (a `ReadCursor` owns its runs by `Rc`): an early free, so
         // the merge tree is gone before `hydrate_keys` allocates its replay.
@@ -321,10 +317,10 @@ impl RelationRegistry {
         Ok((cur.drain_chunk(usize::MAX).filter(|b| b.count > 0), src_schema))
     }
 
-    /// Cursor-returning sibling of `scan_family` for callers that stream the
-    /// relation chunk-wise (`drain_chunk`) instead of materializing it whole.
-    /// `None` when the table is unregistered — callers treat that as empty.
-    /// User tables only; system tables keep `scan_family`.
+    /// Cursor-returning sibling of `scan_family` for callers that stream a
+    /// relation chunk-wise (`drain_chunk`), or seek into it, instead of
+    /// materializing it whole. `None` when the table is unregistered — callers
+    /// treat that as empty.
     ///
     /// The handle owns its sources via `Rc`, so it stays valid while the
     /// caller mutates OTHER relations (index table, view family) between
@@ -398,7 +394,7 @@ impl RelationRegistry {
             Err(e) => return IndexScan::Decline(e),
         };
         let end_bytes = end.as_ref().map(|e| e.pk_bytes());
-        let idx = ic.table_mut().open_cursor_in_range(start.pk_bytes(), end_bytes);
+        let idx = ic.open_cursor_in_range(start.pk_bytes(), end_bytes);
         let matches = idx.count_range_raw(start.pk_bytes(), end_bytes);
         if walk == IndexWalk::Optional {
             // Only user base tables own index circuits, so a resolved index

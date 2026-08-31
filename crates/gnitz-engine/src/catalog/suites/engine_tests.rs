@@ -659,13 +659,13 @@ fn test_dep_map_is_the_scan_delta_nodes() {
         ],
     );
 
-    let dep_map = engine.dag.get_dep_map().clone();
+    let dep_map = engine.dag.get_dep_map(&engine.registry).clone();
     assert_eq!(dep_map.get(&100), Some(&vec![7]), "the repeated source yields one edge");
     assert_eq!(dep_map.get(&200), Some(&vec![7]), "table 200 must feed view 7");
     assert_eq!(dep_map.get(&300), None, "a non-ScanDelta node contributes no edge");
     assert_eq!(dep_map.get(&0), None, "a non-positive source id contributes no edge");
 
-    let mut sources = engine.dag.get_source_ids(7);
+    let mut sources = engine.dag.get_source_ids(&engine.registry, 7);
     sources.sort_unstable();
     assert_eq!(sources, vec![100, 200], "both ScanDelta sources of view 7");
 
@@ -683,14 +683,14 @@ fn test_dep_map_view_on_view_chain() {
     write_identity_circuit(&mut engine, 7, 100, None);
     write_identity_circuit(&mut engine, 8, 7, None);
 
-    let dep_map = engine.dag.get_dep_map().clone();
+    let dep_map = engine.dag.get_dep_map(&engine.registry).clone();
     assert_eq!(dep_map.get(&100), Some(&vec![7]), "base 100 feeds view 7");
     assert_eq!(dep_map.get(&7), Some(&vec![8]), "view 7 feeds view 8");
-    assert_eq!(engine.dag.get_source_ids(7), vec![100]);
-    assert_eq!(engine.dag.get_source_ids(8), vec![7]);
+    assert_eq!(engine.dag.get_source_ids(&engine.registry, 7), vec![100]);
+    assert_eq!(engine.dag.get_source_ids(&engine.registry, 8), vec![7]);
     // The dependency order every cascade walks — `hook_relation_register`'s
     // registration order and `compute_invalid_views`' invalidity propagation.
-    assert_eq!(engine.dag.order_by_view_deps(&[8, 7]), vec![7, 8]);
+    assert_eq!(engine.dag.order_by_view_deps(&engine.registry, &[8, 7]), vec![7, 8]);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -708,7 +708,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     let v1 = register_identity_view(&mut engine, tid, "v1", &cols);
-    assert_eq!(engine.dag.get_dep_map().get(&tid), Some(&vec![v1]));
+    assert_eq!(engine.dag.get_dep_map(&engine.registry).get(&tid), Some(&vec![v1]));
 
     // ALTER VIEW: one VIEW_TAB batch retiring v1 and registering v2.
     let v2 = engine.allocate_table_id().unwrap();
@@ -719,7 +719,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     push_view_tab_row(&mut bb, 1, v2, "v1", "", 0);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
     assert_eq!(
-        engine.dag.get_dep_map().get(&tid),
+        engine.dag.get_dep_map(&engine.registry).get(&tid),
         Some(&vec![v2]),
         "the replaced view's edge is gone, the replacement's is present"
     );
@@ -727,7 +727,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     // DROP VIEW retires the last edge, so the base table is a dep-map orphan.
     engine.drop_view("public.v1").unwrap();
     engine.drain_pending_dir_deletions();
-    assert_eq!(engine.dag.get_dep_map().get(&tid), None);
+    assert_eq!(engine.dag.get_dep_map(&engine.registry).get(&tid), None);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

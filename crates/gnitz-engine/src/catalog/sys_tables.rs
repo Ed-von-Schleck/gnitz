@@ -5,7 +5,8 @@
 //! Pure data and stateless codecs — no state, no CatalogEngine dependency.
 
 use super::ColumnDef;
-use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::relation::RelationKind;
+use gnitz_store::schema::{Placement, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
 
@@ -186,14 +187,42 @@ pub(super) fn validate_relation_defs(
 // reading each.
 // ---------------------------------------------------------------------------
 
-/// Decode TABLE_TAB `row`: `(schema_id, name, pk_list, flags)`.
-pub(super) fn read_table_tab_row<S: RowSource>(src: &S, row: usize) -> (i64, String, PkColList, u64) {
-    (
+/// Decode TABLE_TAB `row`: `(schema_id, name, pk_list, kind, placement)`. The
+/// raw `flags` word does not escape — every registration crosses this reader, so
+/// decoding it here is what makes the rejection below unskippable on the paths
+/// that bypass the precheck. `id` names the row in that message.
+pub(super) fn read_table_tab_row<S: RowSource>(
+    src: &S,
+    row: usize,
+    id: i64,
+) -> Result<(i64, String, PkColList, RelationKind, Placement), String> {
+    let name = sys_string(src, row, TABTAB_PAY_NAME);
+    let props = gnitz_wire::TableProps::from_flags(sys_u64(src, row, TABTAB_PAY_FLAGS));
+    let placement = if props.replicated {
+        if props.dist_prefix_len != 0 {
+            return Err(format!(
+                "catalog invariant violated: table '{name}' (tid={id}) is replicated and carries \
+                 a non-default distribution prefix (k={}); these are mutually exclusive.",
+                props.dist_prefix_len
+            ));
+        }
+        Placement::Replicated
+    } else {
+        Placement::Keyed {
+            prefix_len: props.dist_prefix_len as u8,
+        }
+    };
+    Ok((
         sys_u64(src, row, TABTAB_PAY_SCHEMA_ID) as i64,
-        sys_string(src, row, TABTAB_PAY_NAME),
+        name,
         unpack_pk_cols(sys_u64(src, row, TABTAB_PAY_PK_COL_IDX)),
-        sys_u64(src, row, TABTAB_PAY_FLAGS),
-    )
+        if props.stream {
+            RelationKind::Stream
+        } else {
+            RelationKind::BaseTable
+        },
+        placement,
+    ))
 }
 
 /// Decode VIEW_TAB `row`: `(schema_id, name, pk_list, budgets)`. The pk_list is

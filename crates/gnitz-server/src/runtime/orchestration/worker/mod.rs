@@ -1327,7 +1327,7 @@ impl WorkerProcess {
                 // positive-weight match means the value is already in the index.
                 // `open_cursor` keeps a compaction Io/InvalidShard failure from
                 // silently turning a present key into "absent".
-                let mut cursor = ic.table_mut().open_cursor();
+                let mut cursor = ic.open_cursor();
                 // The check batch's PK is the OPK index composite
                 // `(indexed-value…, src_pk_cols)`; the leading `idx_key_size`
                 // bytes are the OPK-encoded indexed value(s). Prefix-match that

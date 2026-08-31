@@ -1,9 +1,14 @@
-//! `StoreHandle` — the storage adapter for a registered relation, reached only
-//! through its [`TableEntry`](super::TableEntry). `Owned` owns this worker's
-//! whole slice of the relation as one boxed `Table`; `Borrowed` is a non-owning
-//! pointer to a `Table` the host keeps owning (the system families); `Detached`
-//! is a relation this process holds no store for. There is no custom `Drop`: the `Owned` box
-//! is freed by the default drop glue when its registry entry is removed.
+//! `StoreHandle` — the storage adapter behind every `Table` the registry
+//! reaches: a relation's own ([`TableEntry`](super::TableEntry)), a fed view's
+//! delta store ([`DeltaFeed`](super::DeltaFeed)) and a secondary index's
+//! ([`IndexCircuitEntry`](super::IndexCircuitEntry)). Each owner pairs it with
+//! the schema a detached handle opens empty in and forwards through it, so no
+//! caller names the variant.
+//!
+//! `Owned` owns one boxed `Table`; `Borrowed` is a non-owning pointer to a
+//! `Table` the host keeps owning (the system families); `Detached` is a store
+//! this process does not hold. There is no custom `Drop`: the `Owned` box is
+//! freed by the default drop glue when its owner is removed.
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ReadCursor, StorageError, Table};
@@ -26,19 +31,23 @@ pub(crate) enum StoreHandle {
 }
 
 impl StoreHandle {
+    /// An `Owned` handle over `table`. The one spelling of the representation,
+    /// so no caller repeats the `UnsafeCell` the interior-mutable accessors below
+    /// depend on.
+    pub(crate) fn owned(table: Box<Table>) -> StoreHandle {
+        StoreHandle::Owned(UnsafeCell::new(table))
+    }
+
     // ------------------------------------------------------------------
     // Interior-mutable accessors
     //
-    // The registry is single-threaded (!Sync) and the
-    // HashMap<id, TableEntry> stores owning Boxes whose heap allocations have
-    // stable addresses, so the mutation is race-free. But the registry HashMap
-    // is read via immutable get(), which would normally prevent handing out
-    // &mut to the owned Table. These three encapsulate the raw-pointer re-borrow
-    // that reconciles the lookup API with the mutation need. The &mut is handed
-    // out under the contract below, not derived from &self by reborrow — so
-    // clippy's mut_from_ref does not apply.
+    // The registry is read through immutable `get()` but must mutate the owned
+    // `Table`; it is !Sync and its `Box`es have stable addresses, so the
+    // raw-pointer reborrows below are race-free. The &mut is handed out under the
+    // contract, not derived from &self by reborrow — so clippy's mut_from_ref
+    // does not apply.
     //
-    // SAFETY contract for every method below: no aliasing &mut into the same
+    // SAFETY contract for every method here: no aliasing &mut into the same
     // storage may be live across the call. `table` is the shared reborrow and
     // `table_mut` the unique one; routing a read through the latter would widen
     // that contract to "no reference at all live", silently.
@@ -88,17 +97,15 @@ impl StoreHandle {
     }
 
     /// True for a storeless handle — the post-fork master's, or a stream's.
-    /// Reached through [`TableEntry::is_storeless`](super::TableEntry::is_storeless);
-    /// nothing else branches on the variant.
+    /// Reached through [`TableEntry::is_storeless`](super::TableEntry::is_storeless).
     pub(crate) fn is_detached(&self) -> bool {
         matches!(self, StoreHandle::Detached)
     }
 
     /// Dispatched non-compacting `open_cursor` across all variants. A detached
-    /// relation opens an empty cursor of `schema` — the same answer a store
-    /// holding none of the requested rows gives. Infallible, non-mutating.
-    /// Callers reach this through [`TableEntry::open_cursor`], which supplies
-    /// the registry's own schema.
+    /// store opens an empty cursor of `schema` — the same answer a store holding
+    /// none of the requested rows gives. Infallible, non-mutating; the owner
+    /// supplies the schema.
     pub(crate) fn open_cursor(&self, schema: &SchemaDescriptor) -> ReadCursor {
         match self.table() {
             Some(t) => t.open_cursor(),
@@ -132,7 +139,7 @@ impl StoreHandle {
     pub(crate) fn full_scan(&self, schema: &SchemaDescriptor) -> std::rc::Rc<Batch> {
         match self.table() {
             Some(t) => t.full_scan(),
-            None => self.open_cursor(schema).materialize(),
+            None => std::rc::Rc::new(Batch::empty_with_schema(schema)),
         }
     }
 

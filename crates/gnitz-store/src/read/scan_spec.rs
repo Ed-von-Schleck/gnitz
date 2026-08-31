@@ -165,7 +165,7 @@ impl RelationRegistry {
         let ReadBound::Delta { after_tick } = bound else {
             return Ok(entry.schema);
         };
-        if entry.delta_bytes.is_none() {
+        if entry.budgets.delta_bytes.is_none() {
             return Err(format!(
                 "scan_spec: relation {target} carries no delta feed; \
                  create the view WITH (delta = '<size>') to subscribe to it"

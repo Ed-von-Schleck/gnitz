@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
@@ -29,7 +29,7 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 
 // Everything here is `pub(super)`: `dag` is the only module that names the
 // compiler, so a `pub(crate)` would publish it to the catalog and runtime rungs
-// too. `SysTableRefs` alone is `pub(crate)` — `catalog::bootstrap` builds one.
+// too.
 use load::scan_tid_through_filters;
 pub(super) use load::{for_each_scan_edge, load_circuit};
 pub(super) use optimize::CircuitFacts;
@@ -219,52 +219,47 @@ pub(super) fn dummy_expr_blob() -> Vec<u8> {
         .to_blob_bytes()
 }
 
-/// Handles for the three circuit system tables the compiler reads. No schemas
-/// are threaded — the cursor readers source each table's schema from the cursor
-/// itself (`ReadCursor::schema`).
-#[derive(Clone, Copy)]
-pub(crate) struct SysTableRefs {
-    // Table handles (DagEngine borrows them).
-    pub nodes: *mut Table,
-    pub edges: *mut Table,
-    pub node_columns: *mut Table,
-}
-
-impl SysTableRefs {
-    pub(crate) fn null() -> Self {
-        SysTableRefs {
-            nodes: std::ptr::null_mut(),
-            edges: std::ptr::null_mut(),
-            node_columns: std::ptr::null_mut(),
-        }
-    }
-}
-
 /// source table id → join/group reindex `(column, carried promotion tc)` pairs.
 type JoinShardMap = HashMap<i64, Vec<(u32, u8)>>;
 
-/// The registered relations visible to a compile, as a lookup rather than a map:
-/// a compile makes under ten of these calls, where an owned `HashMap` built per
-/// compile would copy every registered relation's schema to answer them.
+/// What a compile may read out of the host: the registered relations' schemas,
+/// and the circuit system tables the circuit itself is stored in. A lookup
+/// rather than an owned map, which would copy every relation's schema per
+/// compile to answer under ten calls.
 pub(super) trait SchemaSource {
     fn schema_of(&self, tid: i64) -> Option<SchemaDescriptor>;
+
+    /// A non-compacting cursor over system table `tid`, carrying its own schema.
+    /// `None` — the host does not hold that table — aborts the load rather than
+    /// yielding a silently empty circuit.
+    fn open_sys_cursor(&self, tid: i64) -> Option<ReadCursor>;
 }
 
-/// A standalone relation set — what the compiler's own tests build.
+/// A standalone relation set — what the compiler's own tests build. It holds no
+/// circuit tables, so every load against one is refused.
 pub(super) type ExtTables = HashMap<i64, SchemaDescriptor>;
 
 impl SchemaSource for ExtTables {
     fn schema_of(&self, tid: i64) -> Option<SchemaDescriptor> {
         self.get(&tid).copied()
     }
+
+    fn open_sys_cursor(&self, _tid: i64) -> Option<ReadCursor> {
+        None
+    }
 }
 
-/// The registry answers the compiler's schema lookups in place. The impl sits
-/// here, beside the trait, and not on the `relation` rung: `relation` is below
-/// `query`, so an impl over there would have to name the trait upward.
+/// The registry answers both lookups in place: the system families are entered
+/// in it as `Borrowed` handles, so a circuit read is the same entry lookup a
+/// user relation's schema is. The impl sits beside the trait because `relation`
+/// is below `query` and could only name the trait upward.
 impl SchemaSource for gnitz_store::relation::RelationRegistry {
     fn schema_of(&self, tid: i64) -> Option<SchemaDescriptor> {
         self.get_schema_desc(tid)
+    }
+
+    fn open_sys_cursor(&self, tid: i64) -> Option<ReadCursor> {
+        self.open_store_cursor(tid)
     }
 }
 
@@ -290,7 +285,7 @@ pub(super) struct SubPlan {
     pub pending_ground_row: bool,
     /// Maps a source table id to the input register that receives its delta.
     /// Empty for the post-combine phase (which has no source-level routing).
-    pub source_reg_map: HashMap<i64, u16>,
+    pub source_reg_map: FxHashMap<i64, u16>,
 }
 
 /// One exchanged side of a [`PlanShape::Exchanged`] plan: a sub-pipeline whose
@@ -388,7 +383,7 @@ impl CompileOutput {
 pub(super) struct PlanBuildResult {
     vm: Box<VmHandle>,
     in_reg: u16,
-    source_reg_map: HashMap<i64, u16>,
+    source_reg_map: FxHashMap<i64, u16>,
     pending_ground_row: bool,
     // The seed register of each exchange input this plan was built with, in the
     // order the input list named them — so `compile_view` reads a side's seed at
@@ -476,17 +471,13 @@ pub(super) struct ViewSite<'a> {
 
 /// Compile a circuit for a single view: read the circuit from the system
 /// tables, then annotate → optimize → `build_plan`.
-///
-/// # Safety
-/// All table handles must be valid pointers or null.
-pub(super) unsafe fn compile_view(
+pub(super) fn compile_view(
     site: ViewSite<'_>,
-    sys: SysTableRefs,
     view_schema: &SchemaDescriptor,
-    ext_tables: &dyn SchemaSource,
+    host: &dyn SchemaSource,
     bounded: bool,
 ) -> Result<CompiledView, CompileError> {
-    let loaded = load_circuit(sys, site.id)?;
+    let loaded = load_circuit(host, site.id)?;
     if loaded.nodes.is_empty() {
         return Err(CompileError::Rejected("circuit has no nodes"));
     }
@@ -494,7 +485,7 @@ pub(super) unsafe fn compile_view(
     // into `SubPlan`, never into `CompileOutput`, and an `Exchanged` shape runs
     // `build_plan` once per side plus post — so an emit-sourced fact would need a
     // cross-sub-plan merge.
-    let facts = CircuitFacts::derive(&loaded, ext_tables)?;
+    let facts = CircuitFacts::derive(&loaded, host)?;
 
     let exchanges: Vec<(i32, &[u32])> = loaded
         .ordered
@@ -546,7 +537,7 @@ pub(super) unsafe fn compile_view(
         let plan = build_plan(
             &loaded,
             &loaded.subgraph_ordered(carve.ex_in),
-            ext_tables,
+            host,
             site,
             view_schema.placement(),
             PlanTarget::Subgraph { out: carve.ex_in },
@@ -560,7 +551,7 @@ pub(super) unsafe fn compile_view(
     let post = build_plan(
         &loaded,
         &post_ordered,
-        ext_tables,
+        host,
         site,
         view_schema.placement(),
         PlanTarget::ViewOutput {

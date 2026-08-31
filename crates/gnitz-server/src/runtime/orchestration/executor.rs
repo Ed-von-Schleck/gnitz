@@ -1942,10 +1942,8 @@ fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
         return true;
     }
     let ticked = shared.last_tick_lsn.get();
-    shared
-        .cat_mut()
-        .dag_mut()
-        .source_closure(vec![target])
+    let (dag, registry) = shared.cat_mut().dag_and_registry_mut();
+    dag.source_closure(registry, vec![target])
         .into_iter()
         .all(|s| shared.commit_lsn_of(s) <= ticked)
 }

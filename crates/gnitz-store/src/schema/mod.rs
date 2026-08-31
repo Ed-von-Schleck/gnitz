@@ -255,27 +255,6 @@ impl Placement {
     /// `pk_count` for the default and `1..pk_count` for a `CLUSTER BY` prefix.
     pub const KEYED_DEFAULT: Placement = Placement::Keyed { prefix_len: 0 };
 
-    /// Decode a relation's placement out of a `TABLE_TAB.flags` word. The flags
-    /// cannot make the replicated/prefix combination unrepresentable
-    /// (`replicated` is a bit, `k` a byte), so the conflict is rejected here at
-    /// the catalog trust boundary rather than silently resolved in favour of one.
-    pub fn from_table_flags(flags: u64) -> Result<Placement, String> {
-        let props = gnitz_wire::TableProps::from_flags(flags);
-        let prefix_len = props.dist_prefix_len;
-        if props.replicated {
-            if prefix_len != 0 {
-                return Err(format!(
-                    "replicated and carries a non-default distribution prefix (k={prefix_len}); \
-                     these are mutually exclusive"
-                ));
-            }
-            return Ok(Placement::Replicated);
-        }
-        Ok(Placement::Keyed {
-            prefix_len: prefix_len as u8,
-        })
-    }
-
     /// True iff a row's owning worker is derived from its key. A relation that
     /// is not key-routed still holds one store per worker; what differs is which
     /// rows arrive there — a broadcast copy (`Replicated`) or whatever that

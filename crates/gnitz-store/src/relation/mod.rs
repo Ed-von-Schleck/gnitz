@@ -18,7 +18,6 @@
 //! they cover.
 
 use rustc_hash::FxHashMap;
-use std::cell::UnsafeCell;
 
 use crate::schema::SchemaDescriptor;
 
@@ -62,42 +61,34 @@ pub struct IndexCircuitEntry {
     /// new directory is created; this field identifies the actual on-disk path
     /// so the retraction branch queues the correct directory for deletion.
     pub index_id: i64,
-    pub(crate) index_table: UnsafeCell<Box<Table>>,
+    pub(crate) handle: StoreHandle,
     pub index_schema: SchemaDescriptor,
     /// Full-arity span-encode plan, precomputed at registration so the per-push
     /// consumers do no per-call spec rebuild. It survives every column ALTER of
-    /// the owner: an index schema folds all its columns into the PK, so it has
-    /// no payload columns, and a trailing append moves no existing column's OPK
-    /// offset or payload slot. Deliberately does NOT bake in `is_unique` (live
-    /// promotion/demotion via `set_index_circuit_uniqueness`); consumers filter
-    /// on the live flag.
+    /// the owner — the `debug_assert!` in
+    /// [`RelationRegistry::swap_table_schema`] is the tripwire on that.
+    /// Deliberately does NOT bake in `is_unique` (live promotion/demotion via
+    /// `set_index_circuit_uniqueness`); consumers filter on the live flag.
     pub key_spec: crate::schema::IndexKeySpec,
     pub is_unique: bool,
 }
 
 impl IndexCircuitEntry {
-    /// Interior-mutable access to the owned index Table.
-    ///
-    /// `index_table` is an `UnsafeCell`, so `get()` yields a `*mut` that is
-    /// legal to mutate through even via `&self`. Single-threaded; callers
-    /// must ensure no aliasing `&mut` into the same Table is live.
-    #[allow(clippy::mut_from_ref)]
-    pub fn table_mut(&self) -> &mut Table {
-        unsafe { &mut *self.index_table.get() }
+    /// Non-compacting cursor over this circuit's index table, in the index
+    /// schema — a detached circuit (the post-fork master's) opens empty.
+    pub fn open_cursor(&self) -> crate::storage::ReadCursor {
+        self.handle.open_cursor(&self.index_schema)
     }
 
-    /// The source column list of a unique circuit, `None` for a non-unique one
-    /// — the accessor DDL validation reads a unique circuit's columns through.
-    /// The returned slice has length ≥ 1: a
-    /// single-column unique index yields a 1-element list, a composite
-    /// `UNIQUE (a, b, …)` the full ordered list. Order is significant (it drives
-    /// the leading-key span encoding and prefix seeks).
-    #[inline]
-    pub fn unique_cols(&self) -> Option<&[u32]> {
-        if !self.is_unique {
-            return None;
-        }
-        Some(self.col_indices.as_slice())
+    /// [`Self::open_cursor`] over `[start, end]` only.
+    pub fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
+        self.handle.open_cursor_in_range(&self.index_schema, start, end)
+    }
+
+    /// Ingest an owned batch of index rows. The projection path drives this per
+    /// push; a detached circuit absorbs nothing.
+    pub fn ingest_owned_batch(&self, batch: Batch) -> Result<(), StorageError> {
+        self.handle.ingest_owned_batch(batch)
     }
 }
 
@@ -105,10 +96,7 @@ impl IndexCircuitEntry {
 // Relation kind — what a top-level relation *is*
 // ---------------------------------------------------------------------------
 
-/// What a top-level relation *is*. Bundling every per-kind property here is what
-/// makes the nonsense combinations unconstructable: a durable relation that also
-/// rebuilds from source (double count), an ephemeral one that never rebuilds
-/// (permanently empty).
+/// What a top-level relation *is*.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RelationKind {
     /// System catalog table: durable, single-partition, never rebuilt from
@@ -129,20 +117,6 @@ pub enum RelationKind {
 }
 
 impl RelationKind {
-    /// Which kind a `TABLE_TAB.flags` word describes — the one read of the
-    /// `stream` bit. `Placement::from_table_flags` is the peer decoder over the
-    /// same word, homed with `Placement` in `schema`; they stay apart because
-    /// only one of this one's two callers wants a placement. VIEW_TAB rows do
-    /// not come through here.
-    #[inline]
-    pub fn from_table_flags(flags: u64) -> RelationKind {
-        if gnitz_wire::TableProps::from_flags(flags).stream {
-            RelationKind::Stream
-        } else {
-            RelationKind::BaseTable
-        }
-    }
-
     /// What to call this relation in a message to the user.
     #[inline]
     pub fn noun(self) -> &'static str {
@@ -153,17 +127,7 @@ impl RelationKind {
         }
     }
 
-    /// True iff this kind has a store, and so a directory, on a process that owns
-    /// stores. A stream holds no rows: its definition rides on the system tables
-    /// like any other row, and there is nothing to recover.
-    #[inline]
-    pub(crate) fn owns_store(self) -> bool {
-        !matches!(self, RelationKind::Stream)
-    }
-
-    /// True iff this is a user base table. Gates what only base tables do:
-    /// run `enforce_unique_pk` on ingest, and own secondary index circuits
-    /// (index projection runs only on the base-table DML paths).
+    /// True iff this is a user base table.
     #[inline]
     pub fn is_base_table(self) -> bool {
         matches!(self, RelationKind::BaseTable)
@@ -176,11 +140,7 @@ impl RelationKind {
         matches!(self, RelationKind::BaseTable | RelationKind::Stream)
     }
 
-    /// True iff this is a materialised view. Gates the read-your-writes drain (a
-    /// view derives from source pushes through the DAG, so a read must flush
-    /// pending ticks first) and the ephemeral checkpoint round (only a view's
-    /// output store / operator traces are persisted there); base tables and the
-    /// system catalog do neither.
+    /// True iff this is a materialised view.
     #[inline]
     pub fn is_view(self) -> bool {
         matches!(self, RelationKind::View)
@@ -191,11 +151,9 @@ impl RelationKind {
 // Table entry — per-table metadata in the entity registry
 // ---------------------------------------------------------------------------
 
-/// The `WITH (…)` byte budgets a view can carry. They travel as one value
-/// because every path that opens a relation's store must carry both: a
-/// `delta_bytes` that reached the catalog but not the store builder would leave
-/// a view the catalog calls fed with no delta store on any worker, on every
-/// boot, with no error anywhere.
+/// The `WITH (…)` byte budgets a view can carry. One value rather than two
+/// arguments, so every path that opens a relation's store carries both or
+/// neither.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct ViewBudgets {
     /// `WITH (capacity = …)`, in bytes; `None` for every unbounded relation.
@@ -221,10 +179,9 @@ pub(crate) struct DeltaFeed {
 }
 
 impl DeltaFeed {
-    /// This feed's rows over `[start, end]`, in its own derived schema. There is
-    /// no unbounded spelling because every delta read is a `(after_tick, cut]`
-    /// range — and no caller-supplied schema, because the schema a cursor opens
-    /// under is never the caller's to choose.
+    /// This feed's rows over `[start, end]`, in its own derived schema — every
+    /// delta read is a `(after_tick, cut]` range, so there is no unbounded
+    /// spelling.
     pub(crate) fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
         self.handle.open_cursor_in_range(&self.schema, start, end)
     }
@@ -255,16 +212,10 @@ pub struct TableEntry {
     pub depth: i32,
     pub directory: String,
     pub index_circuits: Vec<IndexCircuitEntry>,
-    /// `CREATE VIEW … WITH (capacity = …)` in bytes; `None` for every other
-    /// relation. The registry's copy: the resolve reply's bounded flag and the
-    /// engine-side leaf rule run on the post-fork master, where every user
-    /// relation is `StoreHandle::Detached` and there is no `Table` to ask.
-    /// `build_relation_store` stamps it onto each store it opens.
-    pub capacity_bytes: Option<u64>,
-    /// `CREATE VIEW … WITH (delta = …)` in bytes; `None` for every other
-    /// relation. The registry's copy, for the same reason `capacity_bytes` keeps
-    /// one: the resolve reply's `delta` flag is answered on the post-fork master.
-    pub delta_bytes: Option<u64>,
+    /// The budgets this relation was registered with: what a rehome or a rebuild
+    /// hands back to `build_relation_store`, and the answer the post-fork master
+    /// gives when it has no `Table` to ask.
+    pub budgets: ViewBudgets,
 }
 
 impl TableEntry {
@@ -286,18 +237,7 @@ impl TableEntry {
             depth,
             directory,
             index_circuits: Vec::new(),
-            capacity_bytes: budgets.capacity_bytes,
-            delta_bytes: budgets.delta_bytes,
-        }
-    }
-
-    /// The budgets this relation was registered with — what a rehome or a rebuild
-    /// must hand back to `build_relation_store` so neither store comes back
-    /// unbounded or missing.
-    pub fn budgets(&self) -> ViewBudgets {
-        ViewBudgets {
-            capacity_bytes: self.capacity_bytes,
-            delta_bytes: self.delta_bytes,
+            budgets,
         }
     }
 
@@ -328,7 +268,7 @@ impl TableEntry {
         use gnitz_wire::RelClass;
         match self.kind {
             RelationKind::Stream => RelClass::Stream,
-            RelationKind::View if self.capacity_bytes.is_some() => RelClass::BoundedView,
+            RelationKind::View if self.budgets.capacity_bytes.is_some() => RelClass::BoundedView,
             RelationKind::View => RelClass::View,
             RelationKind::BaseTable | RelationKind::SystemCatalog => RelClass::Table,
         }
@@ -518,7 +458,7 @@ impl RelationRegistry {
             entry.index_circuits.push(IndexCircuitEntry {
                 col_indices: PkColList::from_slice(col_indices),
                 index_id,
-                index_table: UnsafeCell::new(index_table),
+                handle: StoreHandle::owned(index_table),
                 index_schema,
                 key_spec: crate::schema::IndexKeySpec::new(col_indices, &entry.schema, &index_schema),
                 is_unique,
@@ -543,8 +483,8 @@ impl RelationRegistry {
     /// request, and the swap runs before the worker serves anything.
     pub fn replace_index_table(&mut self, table_id: i64, col_indices: &[u32], t: Box<Table>) -> Option<*mut Table> {
         let ic = self.tables.get_mut(&table_id)?.index_circuit_on_mut(col_indices)?;
-        ic.index_table = UnsafeCell::new(t);
-        Some(ic.table_mut() as *mut Table)
+        ic.handle = StoreHandle::owned(t);
+        ic.handle.as_owned_mut().map(|t| t as *mut Table)
     }
 
     /// Set the uniqueness flag of the index circuit on `col_indices` in place
@@ -580,6 +520,18 @@ impl RelationRegistry {
             .tables
             .get_mut(&table_id)
             .expect("swap_table_schema: table must be registered");
+        // Tripwire on `IndexCircuitEntry.key_spec`, baked at index registration
+        // and never rebuilt: only a trailing append leaves every existing OPK
+        // offset and payload slot where it was. PK membership is compared because
+        // it moves payload slots too.
+        debug_assert!(
+            schema.pk_indices() == entry.schema.pk_indices()
+                && schema.num_columns() >= entry.schema.num_columns()
+                && (0..entry.schema.num_columns())
+                    .all(|i| schema.columns[i].type_code == entry.schema.columns[i].type_code),
+            "swap_table_schema: table {table_id}'s new descriptor is not a trailing append; \
+             every index circuit's baked key_spec is now stale",
+        );
         // A worker reaches its `Table`; the post-fork master has none.
         if let Some(store) = entry.handle.as_owned_mut() {
             store
@@ -670,14 +622,14 @@ impl RelationRegistry {
     /// it runs once per emitted tick group, against a relation count in the tens,
     /// beside a SAL write and an eventfd.
     pub fn any_delta_feed(&self) -> bool {
-        self.tables.values().any(|e| e.delta_bytes.is_some())
+        self.tables.values().any(|e| e.budgets.delta_bytes.is_some())
     }
 
     /// True iff `id` is a relation carrying a delta feed. Answered off the
     /// registry, so it is the same answer on the post-fork master — which holds no
     /// store — as on a worker.
     pub fn relation_has_delta_feed(&self, id: i64) -> bool {
-        self.entry(id).is_some_and(|e| e.delta_bytes.is_some())
+        self.entry(id).is_some_and(|e| e.budgets.delta_bytes.is_some())
     }
 
     /// Every registered view id.

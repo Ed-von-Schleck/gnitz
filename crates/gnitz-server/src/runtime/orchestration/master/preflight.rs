@@ -878,7 +878,7 @@ impl MasterDispatcher {
                 // catalog borrow ends before the `&mut` dispatcher calls below.
                 let (col_indices, idx_schema, spec) = {
                     let ic = &disp.cat().registry().index_circuits(tid)[ci];
-                    if ic.unique_cols().is_none() {
+                    if !ic.is_unique {
                         continue;
                     }
                     (ic.col_indices, ic.index_schema, ic.key_spec)

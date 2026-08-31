@@ -205,7 +205,7 @@ pub(super) struct EmitCtx<'a> {
     pub builder: ProgramBuilder,
     pub out_reg_of: HashMap<i32, u16>,
     pub reg_meta: Vec<RegisterMeta>,
-    pub source_reg_map: HashMap<i64, u16>,
+    pub source_reg_map: FxHashMap<i64, u16>,
     pub sink_reg_id: Option<u16>,
     /// Set by `emit_reduce` for a global-ground aggregate — the one operator that
     /// produces output from an empty input epoch. See `SubPlan::pending_ground_row`.
@@ -737,7 +737,7 @@ pub(super) fn build_plan(
         builder: ProgramBuilder::new(),
         out_reg_of,
         reg_meta,
-        source_reg_map: HashMap::new(),
+        source_reg_map: FxHashMap::default(),
         sink_reg_id: None,
         pending_ground_row: false,
         scratch: ScratchGuard::new(),

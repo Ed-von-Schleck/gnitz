@@ -35,9 +35,12 @@ impl RelationRegistry {
     }
 
     /// Build this process's store for a top-level relation: one `Table` under
-    /// `w{rank}of{num_workers}`. Recovery is derived from `kind`, so a relation
-    /// cannot be (e.g.) ephemeral but SAL-replayed. Only user relations are built
-    /// here — system catalog tables are plain single `Table`s built at bootstrap.
+    /// `w{rank}of{num_workers}`. Only user relations are built here — system
+    /// catalog tables are plain single `Table`s built at bootstrap.
+    ///
+    /// The `match kind` below is the one place a per-kind property is derived,
+    /// which is what makes the nonsense combinations — durable but rebuilt from
+    /// source, ephemeral but never rebuilt — unconstructable.
     ///
     /// The child is homed at THIS process's own worker rank, so a live CREATE on
     /// each worker post-fork builds a distinct dir directly. The post-fork master
@@ -112,7 +115,7 @@ impl RelationRegistry {
         // bounded view cannot come back unbounded from a rehome or a rebuild.
         table.set_capacity(budgets.capacity_bytes);
         Ok(RelationStores {
-            handle: StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(table))),
+            handle: StoreHandle::owned(Box::new(table)),
             delta: delta
                 .map(|(budget, s)| Self::build_delta_store(directory, id, s, budget))
                 .transpose()?,
@@ -143,7 +146,7 @@ impl RelationRegistry {
         table.set_delta_budget(budget);
         Ok(Box::new(DeltaFeed {
             schema: delta_schema,
-            handle: StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(table))),
+            handle: StoreHandle::owned(Box::new(table)),
         }))
     }
 }

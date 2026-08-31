@@ -71,11 +71,9 @@ impl CatalogEngine {
         let g = engine.durable_generation;
         engine.registry_mut().set_resume_generation(g);
 
-        // Register system table families
+        // Register system table families — including the three circuit families,
+        // which is what makes the compiler's circuit reads a registry lookup.
         engine.register_system_table_families();
-
-        // Set system table handles on DagEngine
-        engine.setup_dag_sys_tables();
 
         // Phase 2: Replay catalog through hooks
         engine.replay_catalog()?;
@@ -201,18 +199,6 @@ impl CatalogEngine {
                     .register_borrowed(family.id(), store, family.schema(), RelationKind::SystemCatalog, dir);
             }
         }
-    }
-
-    // -- Setup DagEngine system table references ---------------------------
-
-    fn setup_dag_sys_tables(&mut self) {
-        use crate::query::SysTableRefs;
-        let refs = SysTableRefs {
-            nodes: self.sys_store_ptr(SysFamily::CircuitNodes),
-            edges: self.sys_store_ptr(SysFamily::CircuitEdges),
-            node_columns: self.sys_store_ptr(SysFamily::CircuitNodeColumns),
-        };
-        self.dag.set_sys_tables(refs);
     }
 
     // -- Replay catalog (recovery) -----------------------------------------

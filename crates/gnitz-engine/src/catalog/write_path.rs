@@ -92,12 +92,6 @@ impl CatalogEngine {
         &mut self.sys_stores[family.index()]
     }
 
-    /// Raw pointer to this family's store — stable across engine moves (the
-    /// store is boxed), for the `Borrowed` DAG registrations.
-    pub(crate) fn sys_store_ptr(&mut self, family: SysFamily) -> *mut Table {
-        &mut *self.sys_stores[family.index()]
-    }
-
     /// Apply one delta to its family's storage and fire the reaction hooks —
     /// the shared tail of [`Self::submit`] / [`Self::submit_local`]. When
     /// `pin_lsn` is `Some(lsn)` it pins the family's `current_lsn` to `lsn.get()`
@@ -132,16 +126,19 @@ impl CatalogEngine {
 
     /// Ingest a batch into any relation, system or user: a system family goes
     /// through [`Self::submit`] (precheck → ingest → hooks → broadcast-queue), a
-    /// user table through `RelationRegistry::ingest_by_ref` (PK enforcement, store,
-    /// index projection). The `&Batch` entry serves callers that hold a borrow;
-    /// an emitter with an owned batch calls `submit` directly to skip the clone.
+    /// user table through [`RelationRegistry::ingest_returning_effective`] (PK
+    /// enforcement, store, index projection). The `&Batch` entry serves callers
+    /// that hold a borrow; an emitter with an owned batch calls `submit` directly
+    /// to skip the clone. Every production caller targets a system family, so the
+    /// user-table arm's clone is on a test-only path.
     pub fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
             let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
             self.submit(family, batch.clone())
         } else {
             self.registry
-                .ingest_by_ref(table_id, batch)
+                .ingest_returning_effective(table_id, batch.clone_batch())
+                .map(drop)
                 .map_err(|e| format!("ingest failed for table_id={table_id}: {e}"))
         }
     }
@@ -335,14 +332,16 @@ impl CatalogEngine {
     /// Compile a just-registered view's circuit and throw the result away, so a
     /// circuit the engine cannot run is rejected while the DDL is still undoable.
     /// The path is built here because `catalog::utils` owns every entity
-    /// directory's shape, and `query` sits below it.
+    /// directory's shape, and removed here because its creator is its remover.
     pub fn preflight_view_compile(&self, vid: i64) -> Result<(), String> {
         let Some((schema_name, _)) = self.caches.entity_by_id.get(&vid) else {
             return Err(format!("pre-flight: view {vid} is not registered"));
         };
         let root = preflight_dir(&self.base_dir, schema_name, vid);
         let CatalogEngine { registry, dag, .. } = self;
-        dag.preflight_compile(registry, vid, &root)
+        let verdict = dag.preflight_compile(registry, vid, &root);
+        Self::remove_queued_dirs(vec![root]);
+        verdict
     }
 
     // -----------------------------------------------------------------------

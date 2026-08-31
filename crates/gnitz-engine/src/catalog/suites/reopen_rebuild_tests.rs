@@ -63,7 +63,7 @@ fn base_with_index(engine: &mut CatalogEngine) -> i64 {
 fn index_weight(engine: &mut CatalogEngine, tid: i64) -> i64 {
     let entry = engine.registry().table_entry(tid).unwrap();
     assert_eq!(entry.index_circuits.len(), 1, "index circuit replayed");
-    sum_weights(entry.index_circuits[0].table_mut().open_cursor())
+    sum_weights(entry.index_circuits[0].open_cursor())
 }
 
 // ── index_rebuilds_once_view_defers_on_reopen ───────────────────────────
@@ -116,7 +116,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     let base_entry = engine.registry().table_entry(tid).unwrap();
     assert_eq!(base_entry.index_circuits.len(), 1);
     assert_eq!(
-        sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()),
+        sum_weights(base_entry.index_circuits[0].open_cursor()),
         N,
         "live CREATE INDEX must backfill the base rows exactly once"
     );
@@ -149,7 +149,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     let base_entry = engine2.registry().table_entry(tid).unwrap();
     assert_eq!(base_entry.index_circuits.len(), 1, "index circuit replayed");
     assert_eq!(
-        sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()),
+        sum_weights(base_entry.index_circuits[0].open_cursor()),
         N,
         "index must rebuild from source exactly once on reopen, not double"
     );
@@ -209,7 +209,7 @@ fn index_rebuilds_across_chunk_boundary() {
     let base_entry = engine2.registry().table_entry(tid).unwrap();
     assert_eq!(base_entry.index_circuits.len(), 1, "index circuit replayed");
     assert_eq!(
-        sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()),
+        sum_weights(base_entry.index_circuits[0].open_cursor()),
         n as i64,
         "index must rebuild across the chunk boundary exactly once"
     );
@@ -220,13 +220,13 @@ fn index_rebuilds_across_chunk_boundary() {
 
 // ── backfill_all_indexes_rebuilds_exactly_once ──────────────────────────
 // `backfill_all_indexes` is the worker-boot rebuild: it re-creates each index
-// Table (at this process's `index_table_dir` — the parent dir in a Standalone
+// Table (at this process's `index_dir` — the parent dir in a Standalone
 // unit test) and repopulates it from the base slice. Assert it is a *replace*
 // (single materialisation, never additive/doubled) and idempotent across
 // repeated calls, and that every key still resolves to its source PK afterward.
 //
 // This exercises the Standalone role path directly, without a fork: no unit
-// test sets a process role, so `index_table_dir` targets the parent dir and the
+// test sets a process role, so `index_dir` targets the parent dir and the
 // call is a legal idempotent re-create-and-rebuild.
 #[test]
 fn backfill_all_indexes_rebuilds_exactly_once() {
@@ -288,9 +288,9 @@ fn checkpointed_table_with_index(dir: &str) -> (i64, u64) {
     engine.record_topology(1).unwrap();
     let g = engine.bump_checkpoint_generation().unwrap();
 
-    let entry = engine.registry().table_entry(tid).unwrap();
-    let idx: &mut gnitz_store::storage::Table = entry.index_circuits[0].table_mut();
-    gnitz_store::storage::flush_barrier([idx], gnitz_store::storage::FlushRound::Ephemeral(g)).unwrap();
+    // The index is the only rederived store this table owns, so the ephemeral
+    // round publishes exactly it.
+    engine.registry_mut().flush_ephemeral_outputs(g).unwrap();
 
     engine.close();
     (tid, g)

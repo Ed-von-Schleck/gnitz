@@ -86,7 +86,7 @@ fn test_flush_includes_index_circuits() {
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
         batch.count += 1;
-        entry.index_circuits[0].table_mut().ingest_owned_batch(batch).unwrap();
+        entry.index_circuits[0].ingest_owned_batch(batch).unwrap();
     }
 
     registry.flush(70).unwrap();

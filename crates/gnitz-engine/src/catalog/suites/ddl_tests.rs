@@ -45,15 +45,21 @@ fn test_bootstrap() {
     assert_eq!(engine.next_table_id, FIRST_USER_TABLE_ID);
     assert_eq!(engine.next_schema_id, FIRST_USER_SCHEMA_ID);
 
-    let schemas_before = count_records(engine.sys_store_mut(SysFamily::Schema));
-    let tables_before = count_records(engine.sys_store_mut(SysFamily::Table));
+    let schemas_before = count_records(engine.sys_store_mut(SysFamily::Schema).open_cursor());
+    let tables_before = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
 
     engine.close();
 
     // Idempotent re-open: bootstrap must not duplicate records
     let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(count_records(engine2.sys_store_mut(SysFamily::Schema)), schemas_before);
-    assert_eq!(count_records(engine2.sys_store_mut(SysFamily::Table)), tables_before);
+    assert_eq!(
+        count_records(engine2.sys_store_mut(SysFamily::Schema).open_cursor()),
+        schemas_before
+    );
+    assert_eq!(
+        count_records(engine2.sys_store_mut(SysFamily::Table).open_cursor()),
+        tables_before
+    );
     engine2.close();
 
     let _ = fs::remove_dir_all(&dir);
@@ -117,28 +123,43 @@ fn test_ddl() {
     let dir = temp_dir("ddl");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let init_schemas = count_records(engine.sys_store_mut(SysFamily::Schema));
-    let init_tables = count_records(engine.sys_store_mut(SysFamily::Table));
-    let init_cols = count_records(engine.sys_store_mut(SysFamily::Column));
+    let init_schemas = count_records(engine.sys_store_mut(SysFamily::Schema).open_cursor());
+    let init_tables = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
+    let init_cols = count_records(engine.sys_store_mut(SysFamily::Column).open_cursor());
 
     // Schema creation
     engine.create_schema("sales").unwrap();
     assert!(engine.has_schema("sales"));
-    assert_eq!(count_records(engine.sys_store_mut(SysFamily::Schema)), init_schemas + 1);
+    assert_eq!(
+        count_records(engine.sys_store_mut(SysFamily::Schema).open_cursor()),
+        init_schemas + 1
+    );
     assert!(engine.create_schema("sales").is_err()); // duplicate
 
     // Table creation
     let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
     let tid = engine.create_table("sales.orders", &cols, &[0]).unwrap();
     assert!(engine.registry().has_id(tid));
-    assert_eq!(count_records(engine.sys_store_mut(SysFamily::Table)), init_tables + 1);
-    assert_eq!(count_records(engine.sys_store_mut(SysFamily::Column)), init_cols + 2);
+    assert_eq!(
+        count_records(engine.sys_store_mut(SysFamily::Table).open_cursor()),
+        init_tables + 1
+    );
+    assert_eq!(
+        count_records(engine.sys_store_mut(SysFamily::Column).open_cursor()),
+        init_cols + 2
+    );
 
     // Drop table (retractions)
     engine.drop_table("sales.orders").unwrap();
     assert!(!engine.registry().has_id(tid));
-    assert_eq!(count_records(engine.sys_store_mut(SysFamily::Table)), init_tables);
-    assert_eq!(count_records(engine.sys_store_mut(SysFamily::Column)), init_cols);
+    assert_eq!(
+        count_records(engine.sys_store_mut(SysFamily::Table).open_cursor()),
+        init_tables
+    );
+    assert_eq!(
+        count_records(engine.sys_store_mut(SysFamily::Column).open_cursor()),
+        init_cols
+    );
 
     // System table drop should fail (identifier starts with '_')
     assert!(engine.drop_table("_system._columns").is_err());
@@ -593,8 +614,8 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
         .unwrap();
 
     // Baseline: system + base-table column rows; no circuit rows yet.
-    let base_cols = count_records(engine.sys_store_mut(SysFamily::Column));
-    let base_nodes = count_records(engine.sys_store_mut(SysFamily::CircuitNodes));
+    let base_cols = count_records(engine.sys_store_mut(SysFamily::Column).open_cursor());
+    let base_nodes = count_records(engine.sys_store_mut(SysFamily::CircuitNodes).open_cursor());
 
     // Register a view (column and circuit records precede the VIEW_TAB row).
     let vid = engine.next_table_id;
@@ -606,11 +627,11 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
 
     assert!(
-        count_records(engine.sys_store_mut(SysFamily::Column)) > base_cols,
+        count_records(engine.sys_store_mut(SysFamily::Column).open_cursor()) > base_cols,
         "view column rows must be present before drop"
     );
     assert!(
-        count_records(engine.sys_store_mut(SysFamily::CircuitNodes)) > base_nodes,
+        count_records(engine.sys_store_mut(SysFamily::CircuitNodes).open_cursor()) > base_nodes,
         "circuit node rows must be present before drop"
     );
 
@@ -619,12 +640,12 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     engine.drain_pending_dir_deletions();
 
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Column)),
+        count_records(engine.sys_store_mut(SysFamily::Column).open_cursor()),
         base_cols,
         "sys_columns must return to baseline after drop_view (column cascade)"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::CircuitNodes)),
+        count_records(engine.sys_store_mut(SysFamily::CircuitNodes).open_cursor()),
         base_nodes,
         "circuit rows must return to baseline after drop_view (circuit cascade)"
     );

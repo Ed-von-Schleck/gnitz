@@ -318,9 +318,9 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
 
     // A DROP TABLE cascade (unpaired COL `-1`s with the full live payload) still
     // passes the Column arm — the drop succeeds and removes the columns.
-    let cols_before = count_records(engine.sys_store_mut(SysFamily::Column));
+    let cols_before = count_records(engine.sys_store_mut(SysFamily::Column).open_cursor());
     engine.drop_table("public.t").unwrap();
-    let cols_after = count_records(engine.sys_store_mut(SysFamily::Column));
+    let cols_after = count_records(engine.sys_store_mut(SysFamily::Column).open_cursor());
     assert_eq!(
         cols_after,
         cols_before - 2,
@@ -382,7 +382,7 @@ fn column_rename_on_pk_column_and_with_dependent_views_accepted() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     let vid = register_identity_view(&mut engine, tid, "v", &cols);
     assert_eq!(
-        engine.dag.get_dep_map().get(&tid),
+        engine.dag.get_dep_map(&engine.registry).get(&tid),
         Some(&vec![vid]),
         "precondition: the table has a dependent view"
     );

@@ -74,9 +74,11 @@ impl PkSetGather {
         }
     }
 
-    /// The key list this gather walks — the same buffer `new` was given.
-    pub fn keys(&self) -> &[u8] {
-        &self.keys
+    /// Consume the gather and hand back the key list it walked — the same buffer
+    /// `new` was given. By value, not by reference: a borrow would keep the
+    /// cursor's merge tree alive across whatever the caller does with the keys.
+    pub fn into_keys(self) -> Vec<u8> {
+        self.keys
     }
 
     /// The next non-empty chunk of source rows, or `None` once the key list is

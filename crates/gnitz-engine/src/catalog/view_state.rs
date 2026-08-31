@@ -105,7 +105,7 @@ impl CatalogEngine {
         for &vid in &view_ids {
             let stream_fed = self
                 .dag
-                .get_source_ids(vid)
+                .get_source_ids(&self.registry, vid)
                 .iter()
                 .any(|s| self.registry.relation_kind(*s) == Some(RelationKind::Stream));
             if stream_fed {
@@ -131,8 +131,14 @@ impl CatalogEngine {
         // pass — a stream's own dependents were caught in phase 1 instead. A
         // source view precedes every view scanning it in `order_by_view_deps`,
         // so a single pass carries invalidity down the whole chain.
-        for vid in self.dag.order_by_view_deps(&view_ids) {
-            if !invalid.contains(&vid) && self.dag.get_source_ids(vid).iter().any(|s| invalid.contains(s)) {
+        for vid in self.dag.order_by_view_deps(&self.registry, &view_ids) {
+            if !invalid.contains(&vid)
+                && self
+                    .dag
+                    .get_source_ids(&self.registry, vid)
+                    .iter()
+                    .any(|s| invalid.contains(s))
+            {
                 invalid.insert(vid);
             }
         }

@@ -2,7 +2,7 @@
 //! reclamation, invalid-view reset — and the flushed-LSN bookkeeping that
 //! recovery and the DDL zone allocator read.
 
-use super::{RelationKind, RelationRegistry, StoreHandle, FIRST_USER_TABLE_ID};
+use super::{RelationKind, RelationRegistry, StoreHandle};
 use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr};
 
 impl RelationRegistry {
@@ -23,6 +23,11 @@ impl RelationRegistry {
             // its own there — so leaving it would have two processes holding a live
             // `Table` on one directory, which is what this whole function prevents.
             entry.delta = None;
+            // And every index circuit, which the master would otherwise keep live
+            // and permanently empty — it reads only their metadata.
+            for ic in &mut entry.index_circuits {
+                ic.handle = StoreHandle::Detached;
+            }
         }
     }
 
@@ -84,7 +89,7 @@ impl RelationRegistry {
                 .tables
                 .get(&tid)
                 .ok_or_else(|| format!("{what}: relation {tid} not registered"))?;
-            (e.directory.clone(), e.schema, e.kind, e.budgets())
+            (e.directory.clone(), e.schema, e.kind, e.budgets)
         };
         let stores = self
             .build_relation_store(kind, &dir, tid, schema, budgets)
@@ -164,20 +169,23 @@ impl RelationRegistry {
     }
 
     /// The system families' `table id → max flushed LSN`: the dedup filter for the
-    /// master's pre-fork SAL walk. The id band excludes 0, which is "no target".
+    /// master's pre-fork SAL walk. Selected by the kind the iterator already
+    /// yields, not by an id band — every system family is registered
+    /// `SystemCatalog`, and nothing else is.
     pub fn system_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
         self.all_store_lsns()
-            .filter(|&(tid, _, _)| (1..FIRST_USER_TABLE_ID).contains(&tid))
+            .filter(|&(_, kind, _)| kind == RelationKind::SystemCatalog)
             .map(|(tid, _, lsn)| (tid, lsn))
             .collect()
     }
 
     /// The user relations' `table id → max flushed LSN`: the dedup filter for a
     /// worker's post-fork SAL walk. A storeless relation is absent rather than
-    /// present at 0 — there is nothing to recover into.
+    /// present at 0 — there is nothing to recover into, and a stream admitted at
+    /// LSN 0 would make the worker skip its own replay.
     pub fn user_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
         self.all_store_lsns()
-            .filter(|&(tid, kind, _)| tid >= FIRST_USER_TABLE_ID && kind.owns_store())
+            .filter(|&(_, kind, _)| matches!(kind, RelationKind::BaseTable | RelationKind::View))
             .map(|(tid, _, lsn)| (tid, lsn))
             .collect()
     }

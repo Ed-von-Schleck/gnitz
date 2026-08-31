@@ -70,8 +70,7 @@ fn test_index_live_fanout() {
     // Verify index has 6 entries via DagEngine's index circuit
     let entry = engine.registry().table_entry(tid).unwrap();
     assert_eq!(entry.index_circuits.len(), 1, "Expected 1 index circuit");
-    let idx_table = entry.index_circuits[0].table_mut();
-    let idx_count = count_records(idx_table);
+    let idx_count = count_records(entry.index_circuits[0].open_cursor());
     assert_eq!(idx_count, 6, "Index fanout: expected 6, got {idx_count}");
 
     engine.close();
@@ -444,7 +443,7 @@ fn test_drop_table_cascades_secondary_index() {
 
     let idx_name = make_secondary_index_name("public", "cascade_tbl", "val");
     assert!(engine.caches.index_by_name.contains_key(idx_name.as_str()));
-    let idx_records_before = count_records(engine.sys_store_mut(SysFamily::Index));
+    let idx_records_before = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
     assert!(idx_records_before >= 1);
 
     // Drop the table WITHOUT dropping the index first.
@@ -456,7 +455,7 @@ fn test_drop_table_cascades_secondary_index() {
     );
     assert!(!engine.registry().has_id(tid));
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index)),
+        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
         idx_records_before - 1,
         "sys_indices must retract exactly one record"
     );
@@ -539,7 +538,7 @@ fn test_drop_table_cascades_multiple_indices() {
     assert!(engine.has_index_by_name(&name1));
     assert!(engine.has_index_by_name(&name2));
 
-    let idx_count_before = count_records(engine.sys_store_mut(SysFamily::Index));
+    let idx_count_before = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
     assert!(idx_count_before >= 2);
 
     // Drop the table — cascade must retract both indices
@@ -564,7 +563,7 @@ fn test_drop_table_cascades_multiple_indices() {
         "indices_by_owner for dropped table must be empty"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index)),
+        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
         idx_count_before - 2,
         "sys_indices must retract exactly two records"
     );
@@ -718,7 +717,7 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
     engine.registry_mut().flush(tid).unwrap();
 
     let idx_name = make_secondary_index_name("public", "t", "val");
-    let idx_records_before = count_records(engine.sys_store_mut(SysFamily::Index));
+    let idx_records_before = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
 
     // Attempt should fail because of duplicate values.
     let result = engine.create_index("public.t", &["val"], true);
@@ -743,7 +742,7 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
         "DAG must not retain a half-built index circuit"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index)),
+        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
         idx_records_before,
         "sys_indices must net out to zero after rollback"
     );
@@ -794,13 +793,13 @@ fn test_seek_by_index_orphan_entry_terminates() {
     b.extend_null_bmp(&0u64.to_le_bytes());
     b.count += 1;
 
-    let idx_table = engine
+    engine
         .registry()
         .index_circuit_for_cols(tid, &[1])
         .expect("index circuit on col 1")
-        .table_mut();
-    idx_table.ingest_owned_batch(b).unwrap();
-    idx_table.flush().unwrap();
+        .ingest_owned_batch(b)
+        .unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // The indexed value resolves to an orphan whose source row is missing.
     // Must return None and, crucially, must not hang.
@@ -1001,11 +1000,11 @@ fn test_unique_index_over_fk_column_duplicate_data_rejected() {
     engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(child_tid).unwrap();
 
-    let before = count_records(engine.sys_store_mut(SysFamily::Index));
+    let before = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
     let r = engine.create_index("public.child", &["refc"], true);
     assert!(r.is_err(), "unique index over duplicate FK data must fail");
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index)),
+        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
         before,
         "the failed unique index row must net out of sys_indices"
     );
@@ -1221,11 +1220,11 @@ fn test_unique_index_duplicate_across_chunks_rejected() {
     engine.registry_mut().flush(tid).unwrap();
 
     engine.registry_mut().set_ddl_scan_chunk_rows(3);
-    let before = count_records(engine.sys_store_mut(SysFamily::Index));
+    let before = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
     let r = engine.create_index("public.t", &["val"], true);
     assert!(r.is_err(), "cross-chunk duplicate must fail the unique backfill");
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index)),
+        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
         before,
         "the failed unique index row must net out of sys_indices"
     );
@@ -1287,7 +1286,7 @@ fn test_unique_index_chunked_backfill_distinct_succeeds() {
     let entry = engine.registry().table_entry(tid).unwrap();
     assert_eq!(entry.index_circuits.len(), 1);
     assert_eq!(
-        count_records(entry.index_circuits[0].table_mut()),
+        count_records(entry.index_circuits[0].open_cursor()),
         10,
         "chunked backfill must project every row exactly once"
     );

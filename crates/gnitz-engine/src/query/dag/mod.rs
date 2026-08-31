@@ -14,7 +14,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
 
-use crate::query::compiler::{self, CompileOutput, SubPlan, SysTableRefs};
+use crate::query::compiler::{self, CompileOutput, SubPlan};
 use crate::query::vm;
 use gnitz_store::ops;
 use gnitz_store::relation::{RelationRegistry, TableEntry};
@@ -39,10 +39,9 @@ pub(crate) use meta::ViewMeta;
 /// worker owns once every worker's output has been repartitioned. The transport
 /// is entirely the implementor's: this crate computes, and never names a channel.
 ///
-/// That is what lets the whole exchange path sit below the process model —
+/// That is what lets the whole exchange path sit below the process model:
 /// `gnitz-server` realizes it by sending to the master over W2M and receiving
-/// the relay over the SAL, and a single-process embedder implements it as the
-/// identity.
+/// the relay over the SAL, and this rung names neither.
 pub trait ExchangeCallback {
     fn do_exchange(&mut self, view_id: i64, batch: &Batch, source_id: i64) -> Batch;
 }
@@ -56,7 +55,6 @@ pub struct DagEngine {
     dep: DepMap,
     /// Memoized plan-free per-view circuit metadata (see `meta::ViewMeta`).
     meta: FxHashMap<i64, Rc<ViewMeta>>,
-    sys: SysTableRefs,
 }
 
 impl DagEngine {
@@ -65,14 +63,7 @@ impl DagEngine {
             cache: FxHashMap::default(),
             dep: DepMap::default(),
             meta: FxHashMap::default(),
-            sys: SysTableRefs::null(),
         }
-    }
-
-    // ── System table setup ──────────────────────────────────────────────
-
-    pub(crate) fn set_sys_tables(&mut self, sys: SysTableRefs) {
-        self.sys = sys;
     }
 
     // ── Registry-coupled operations ─────────────────────────────────────
@@ -82,8 +73,7 @@ impl DagEngine {
     /// would hold the removed relation's stores open.
     pub fn unregister_table(&mut self, registry: &mut RelationRegistry, table_id: i64) {
         registry.unregister(table_id);
-        self.cache.remove(&table_id);
-        self.evict_meta(table_id);
+        self.invalidate(table_id);
         self.dep.invalidate();
     }
 
@@ -96,26 +86,26 @@ impl DagEngine {
         Ok(())
     }
 
-    /// [`RelationRegistry::swap_table_schema`] under the RESTRICT assertion,
-    /// which needs the dependency map this layer owns.
+    /// [`RelationRegistry::swap_table_schema`] under the RESTRICT check, which
+    /// needs the dependency map this layer owns and is what lets the swap leave
+    /// the plan cache alone.
+    ///
+    /// A real check, not a `debug_assert!`: `ddl_sync` and SAL replay reach the
+    /// alter hook with the precheck bypassed, and a violation there leaves a
+    /// cached VM scanning a store whose region count moved under it. Boot never
+    /// trips it, so the `Err` is a fail-stop taken over serving wrong reads.
     pub fn swap_table_schema(
         &mut self,
         registry: &mut RelationRegistry,
         table_id: i64,
         schema: SchemaDescriptor,
     ) -> Result<(), String> {
-        registry.swap_table_schema(table_id, schema)?;
-        // §1 RESTRICT invariant, made load-bearing: no compiled circuit scans an
-        // altered base table (dependent views are rejected at plan time and by
-        // the catalog precheck arm), so no plan-cache invalidation is required.
-        debug_assert!(
-            {
-                let deps = self.get_dep_map();
-                deps.get(&table_id).is_none_or(|v| v.is_empty())
-            },
-            "swap_table_schema: table {table_id} has dependent views; RESTRICT should have rejected the ALTER",
-        );
-        Ok(())
+        if self.get_dep_map(registry).get(&table_id).is_some_and(|v| !v.is_empty()) {
+            return Err(format!(
+                "swap_table_schema: table {table_id} has dependent views;                  RESTRICT should have rejected the ALTER"
+            ));
+        }
+        registry.swap_table_schema(table_id, schema)
     }
 
     // ── Cache management ────────────────────────────────────────────────
@@ -124,7 +114,7 @@ impl DagEngine {
     /// registered. The recovery output reset needs this: the next backfill must
     /// recompile the view against its freshly-emptied store and scratch, not
     /// against the plan that still holds the old ones open.
-    pub fn invalidate(&mut self, view_id: i64) {
+    pub(crate) fn invalidate(&mut self, view_id: i64) {
         self.cache.remove(&view_id);
         self.evict_meta(view_id);
     }
@@ -144,23 +134,36 @@ impl DagEngine {
     /// Ensure a view's plan is compiled. `Ok(false)` means `view_id` is not a
     /// registered relation; `Err` means a registered view did not compile.
     ///
+    /// Nothing re-pre-flights the circuit here, and this compile opens resumed
+    /// operator state the pre-flight's throwaway root never had. An `Err` is
+    /// therefore unrecoverable for a server — the alternative to aborting is a
+    /// view that has stopped integrating while still answering reads.
+    ///
     /// The error is `String` rather than `CompileError`, which is `pub(crate)`
     /// and so cannot appear in a `pub fn`'s signature.
     pub fn ensure_compiled(&mut self, registry: &RelationRegistry, view_id: i64) -> Result<bool, String> {
         if self.cache.contains_key(&view_id) {
             return Ok(true);
         }
-        match self.compile_view_internal(registry, view_id)? {
-            Some(compiler::CompiledView { output, facts }) => {
-                // The compile already walked this circuit, so seed the memo from
-                // what it derived rather than let the first metadata touch read
-                // the same three system tables again.
-                self.meta.insert(view_id, Rc::new(ViewMeta::from_facts(facts)));
-                self.cache.insert(view_id, output);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        let Ok(entry) = registry.table_entry(view_id) else {
+            return Ok(false);
+        };
+        let compiled = self
+            .compile_circuit(registry, view_id, &entry.directory, entry)
+            .map_err(|err| {
+                format!(
+                    "view_id={view_id} does not compile from its durable circuit — this build no \
+                     longer accepts that circuit or its expr blobs, its derived state is \
+                     corrupt or unreadable, or resources are exhausted: {err}"
+                )
+            })?;
+        gnitz_debug!("dag: compiled view_id={}", view_id);
+        // The compile already walked this circuit, so seed the memo from what it
+        // derived rather than let the first metadata touch read the same three
+        // system tables again.
+        self.meta.insert(view_id, Rc::new(ViewMeta::from_facts(compiled.facts)));
+        self.cache.insert(view_id, compiled.output);
+        Ok(true)
     }
 
     /// The backfill-scan bound for `source` under `view_id`, if the compiled plan
@@ -199,7 +202,7 @@ impl DagEngine {
         };
         // The compiler layer sees only the circuit system tables, never `VIEW_TAB`,
         // so it cannot derive whether the view is capacity-bounded.
-        unsafe { compiler::compile_view(site, self.sys, &entry.schema, registry, entry.capacity_bytes.is_some()) }
+        compiler::compile_view(site, &entry.schema, registry, entry.budgets.capacity_bytes.is_some())
     }
 
     /// Decide whether a just-registered view's circuit compiles, keeping nothing.
@@ -208,15 +211,15 @@ impl DagEngine {
     /// with the view never created. The worker-side compile that follows happens
     /// after the DDL is durable and has no channel back to the waiting client.
     ///
-    /// `root` is a throwaway directory, removed before this returns — see
-    /// `catalog::utils::preflight_dir` for why it is not the view's own.
+    /// `root` is a throwaway directory the caller creates the path for and
+    /// removes again — see `catalog::utils::preflight_dir` for why it is not the
+    /// view's own. The plan is dropped here, so the `Table`s it holds open under
+    /// `root` are closed before this returns.
     ///
-    /// The verdict is worker-independent: worker context reaches the compile only
-    /// as the scratch path component (which `root` overrides), as `WorkerFilter`
-    /// and `ReducePlan` operands baked into instructions nothing here executes,
-    /// and — since a `WorkerFilter` emits no instruction at `W == 1` — as
-    /// instruction *offsets*, which only a bounded view's hydration plan reads and
-    /// no rejection depends on.
+    /// The verdict is worker-independent: `root` overrides the one path component
+    /// worker context contributes, and no rejection reads anything else it
+    /// reaches — those are operands and offsets of instructions nothing here
+    /// executes.
     pub(crate) fn preflight_compile(
         &self,
         registry: &RelationRegistry,
@@ -230,49 +233,18 @@ impl DagEngine {
             return Err("pre-flight: view is not registered".to_string());
         };
         // `map(drop)` closes the plan — and the `Table`s it holds open under
-        // `root` — before the directory is removed.
-        let verdict = self.compile_circuit(registry, view_id, root, entry).map(drop);
-        let _ = std::fs::remove_dir_all(root);
-        verdict.map_err(|e| e.to_string())
+        // `root` — before the caller removes the directory.
+        self.compile_circuit(registry, view_id, root, entry)
+            .map(drop)
+            .map_err(|e| e.to_string())
     }
 
-    /// Compile a view by reading system tables and calling `compiler::compile_view`.
+    /// Close the DagEngine, dropping all cached plans. Reached from tests and
+    /// embedders through `CatalogEngine::close`; the server flushes durably per
+    /// zone and exits via abort or process teardown instead.
     ///
-    /// `Ok(None)` means only "not a registered relation". Nothing re-pre-flights
-    /// the circuit here — replay, fork inheritance, checkpoint resume, rebuild and
-    /// relayout all reach this with no pre-flight in the process, and this compile
-    /// additionally opens resumed operator state the master's throwaway root never
-    /// had. An `Err` is therefore unrecoverable for a server: the alternative to
-    /// aborting is a view that has stopped integrating while still answering reads
-    /// with stale rows. The message names the causes.
-    fn compile_view_internal(
-        &self,
-        registry: &RelationRegistry,
-        view_id: i64,
-    ) -> Result<Option<compiler::CompiledView>, String> {
-        let Ok(entry) = registry.table_entry(view_id) else {
-            return Ok(None);
-        };
-        match self.compile_circuit(registry, view_id, &entry.directory, entry) {
-            Ok(output) => {
-                gnitz_debug!("dag: compiled view_id={}", view_id);
-                Ok(Some(output))
-            }
-            Err(err) => Err(format!(
-                "view_id={view_id} does not compile from its durable circuit — this build no \
-                 longer accepts that circuit or its expr blobs, its derived state is \
-                 corrupt or unreadable, or resources are exhausted: {err}"
-            )),
-        }
-    }
-
-    /// Close the DagEngine, dropping all cached plans. Reached only through
-    /// `CatalogEngine::close`, which the server never calls — it flushes durably
-    /// per zone and exits via abort or process teardown.
     pub(crate) fn close(&mut self) {
-        self.cache.clear();
-        self.meta.clear();
-        self.dep = DepMap::default();
+        self.invalidate_all();
     }
 
     /// The operator-trace tables the ephemeral checkpoint round force-persists:

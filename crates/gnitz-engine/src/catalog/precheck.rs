@@ -129,7 +129,7 @@ impl CatalogEngine {
                 let has_unique = entry
                     .index_circuits
                     .iter()
-                    .any(|ic| ic.unique_cols() == Some(&[col.fk_col_idx][..]));
+                    .any(|ic| ic.is_unique && ic.col_indices.as_slice() == [col.fk_col_idx]);
                 if !has_unique {
                     return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
                 }
@@ -409,7 +409,12 @@ impl CatalogEngine {
     /// shape. Defense-in-depth; the friendly client-side reject is in
     /// `plan/alter.rs`.
     fn reject_if_dependent_views(&mut self, owner_id: i64, op: &str) -> Result<(), String> {
-        if self.dag.get_dep_map().get(&owner_id).is_some_and(|v| !v.is_empty()) {
+        if self
+            .dag
+            .get_dep_map(&self.registry)
+            .get(&owner_id)
+            .is_some_and(|v| !v.is_empty())
+        {
             return Err(format!(
                 "cannot {op} on table {owner_id}: it has dependent views (drop them first)"
             ));
@@ -546,7 +551,7 @@ impl CatalogEngine {
             let Some(e) = self.registry.entry(src) else {
                 continue;
             };
-            if e.capacity_bytes.is_some() {
+            if e.budgets.capacity_bytes.is_some() {
                 return Err(format!(
                     "view '{name}' (vid={vid}) reads relation {src}, which is a \
                      capacity-bounded view; views cannot be created over one"
@@ -717,21 +722,15 @@ impl CatalogEngine {
             // having held when the rows were first written.
             let col_defs = self.scan_column_defs(id, true)?;
             let (sid, name, pk, kind) = if is_table {
-                let (sid, name, pk, flags) = read_table_tab_row(batch, i);
-                // The one value the store shape, the write scatter, the read
-                // routing and the co-partition analyzers all read back off the
-                // schema. An out-of-range prefix is clamped by
-                // `new_with_placement`; a conflicting pair is rejected here.
-                Placement::from_table_flags(flags)
-                    .map_err(|e| format!("catalog invariant violated: table '{name}' (tid={id}) is {e}."))?;
-                (sid, name, pk, RelationKind::from_table_flags(flags))
+                let (sid, name, pk, kind, _placement) = read_table_tab_row(batch, i, id)?;
+                (sid, name, pk, kind)
             } else {
                 let (sid, name, pk, budgets) = read_view_tab_row(batch, i);
                 // `topo_priority` applies CircuitNodes (2) before View (6) in a
                 // creating bundle, so the view's sources resolve here; an
                 // all-negative bundle sorts descending but carries no `+1` VIEW_TAB
                 // row to validate.
-                let source_ids = self.dag.get_source_ids(id);
+                let source_ids = self.dag.get_source_ids(&self.registry, id);
                 self.validate_view_options(id, &name, budgets, &source_ids)?;
                 (sid, name, pk, RelationKind::View)
             };
@@ -783,7 +782,7 @@ impl CatalogEngine {
             }
         }
 
-        let dep_map = self.dag.get_dep_map();
+        let dep_map = self.dag.get_dep_map(&self.registry);
         for &id in &drop_ids {
             if let Some(dependents) = dep_map.get(&id) {
                 // A dependent that is itself being dropped in this same batch is
